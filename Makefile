@@ -1,4 +1,4 @@
-.PHONY: check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-reg-only memcheck-result-reg memcheck-result-reg-only leak-check-result-reg-only check-bootstrap-seed smoke-bootstrap-seed test clean
+.PHONY: check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean
 
 
 # prints a bounded account of a failed regression case: exit status, the
@@ -1260,6 +1260,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_empty_write_contract \
 	tests/cases/test_runtime_result_pairs \
 	tests/cases/test_result_forward_shapes \
+	tests/cases/test_result_forward_callee \
 	tests/cases/test_synthesized_error_messages \
 	tests/cases/test_json_fill_list_shapes \
 	tests/cases/test_json_fill_collection_shapes \
@@ -1418,22 +1419,23 @@ leak-check: build leak-check-only
 leak-check-only:
 	@bash tooling/leak_check.sh
 
-# --- the two-register result abi (PITH_RESULT_REG=1) ---
-# the abi is off by default, and nothing ran it between the day it landed and
-# #1164, when 2 of the 493 regression cases turned out to read freed memory
-# with it on. these run the regression corpus, the memcheck set and the leak
-# cases with it on, so it cannot go stale again before it becomes the default.
-# the emitter reads the variable, and `pith run` and `pith build` pass it on.
-run-regressions-result-reg-only:
-	@PITH_RESULT_REG=1 $(MAKE) --no-print-directory run-regressions-only
+# --- the box result abi (PITH_RESULT_REG=0) ---
+# the two-register result abi is the default. PITH_RESULT_REG=0 turns it off
+# and every `-> T!` function returns its three-slot box again, which is also
+# what generic functions, interface impls, `Float!` and multi-word payloads
+# always do. these run the regression corpus, the memcheck set and the leak
+# cases with it off, so the box path keeps its own coverage. the emitter
+# reads the variable, and `pith run` and `pith build` pass it on.
+run-regressions-result-box-only:
+	@PITH_RESULT_REG=0 $(MAKE) --no-print-directory run-regressions-only
 
-memcheck-result-reg: build memcheck-result-reg-only
+memcheck-result-box: build memcheck-result-box-only
 
-memcheck-result-reg-only:
-	@PITH_RESULT_REG=1 $(MAKE) --no-print-directory memcheck-only
+memcheck-result-box-only:
+	@PITH_RESULT_REG=0 $(MAKE) --no-print-directory memcheck-only
 
-leak-check-result-reg-only:
-	@PITH_RESULT_REG=1 bash tooling/leak_check.sh
+leak-check-result-box-only:
+	@PITH_RESULT_REG=0 bash tooling/leak_check.sh
 
 # --- IR contract over the corpus ---
 # every program with a main is emitted with --validate, which refuses a call

@@ -1,30 +1,30 @@
 -- valid forms --
-origin form: 200 GET /a q=x=1 host=h xa=[] body=[] keep-alive ; 200 after keep-alive
+origin form: 200 GET /a q=x=1 host=h xa=[] body=[] ; 200 after
 http/1.0 without host: 200 GET /old q= host= xa=[] body=[] close
-http/1.0 keep-alive: 200 GET /old q= host= xa=[] body=[] keep-alive ; 200 after keep-alive
-absolute form: 200 GET /abs q=q=1 host=example.com:8080 xa=[] body=[] keep-alive ; 200 after keep-alive
-absolute form no path: 200 GET / q= host=example.com xa=[] body=[] keep-alive ; 200 after keep-alive
-options asterisk: 200 OPTIONS * q= host=h xa=[] body=[] keep-alive ; 200 after keep-alive
-connect authority: 200 CONNECT  q= host=example.com:443 xa=[] body=[] keep-alive ; 200 after keep-alive
-leading empty line: 200 GET /lead q= host=h xa=[] body=[] keep-alive ; 200 after keep-alive
-leading bare lf: 200 GET /lead q= host=h xa=[] body=[] keep-alive ; 200 after keep-alive
-bare lf head: 200 GET /lf q= host=h xa=[v] body=[] keep-alive ; 200 after keep-alive
-mixed line endings: 200 GET /mix q= host=h xa=[] body=[] keep-alive ; 200 after keep-alive
-ows trimmed: 200 GET / q= host=h xa=[spaced value] body=[] keep-alive ; 200 after keep-alive
-empty value: 200 GET / q= host=h xa=[] body=[] keep-alive ; 200 after keep-alive
-names case-insensitive: 200 GET / q= host=h xa=[v] body=[] keep-alive ; 200 after keep-alive
-duplicates combined: 200 GET / q= host=h xa=[1, 2] body=[] keep-alive ; 200 after keep-alive
-host with port: 200 GET / q= host=h.example:8080 xa=[] body=[] keep-alive ; 200 after keep-alive
-host ipv6: 200 GET / q= host=[::1]:8080 xa=[] body=[] keep-alive ; 200 after keep-alive
-empty host: 200 GET / q= host= xa=[] body=[] keep-alive ; 200 after keep-alive
-content-length body: 200 POST /p q= host=h xa=[] body=[abc] keep-alive ; 200 after keep-alive
-identical content-length: 200 POST /p q= host=h xa=[] body=[abc] keep-alive ; 200 after keep-alive
-chunked body: 200 POST /c q= host=h xa=[] body=[abcde] keep-alive ; 200 after keep-alive
-chunked case: 200 POST /c q= host=h xa=[] body=[z] keep-alive ; 200 after keep-alive
-chunk extension: 200 POST /c q= host=h xa=[] body=[abc] keep-alive ; 200 after keep-alive
-chunk trailers: 200 POST /c q= host=h xa=[] body=[abc] keep-alive ; 200 after keep-alive
-chunk upper hex: 200 POST /c q= host=h xa=[] body=[0123456789] keep-alive ; 200 after keep-alive
-chunked bare lf: 200 POST /c q= host=h xa=[] body=[abc] keep-alive ; 200 after keep-alive
+http/1.0 keep-alive: 200 GET /old q= host= xa=[] body=[] keep-alive ; 200 after
+absolute form: 200 GET /abs q=q=1 host=example.com:8080 xa=[] body=[] ; 200 after
+absolute form no path: 200 GET / q= host=example.com xa=[] body=[] ; 200 after
+options asterisk: 200 OPTIONS * q= host=h xa=[] body=[] ; 200 after
+connect authority: 200 CONNECT  q= host=example.com:443 xa=[] body=[] ; 200 after
+leading empty line: 200 GET /lead q= host=h xa=[] body=[] ; 200 after
+leading bare lf: 200 GET /lead q= host=h xa=[] body=[] ; 200 after
+bare lf head: 200 GET /lf q= host=h xa=[v] body=[] ; 200 after
+mixed line endings: 200 GET /mix q= host=h xa=[] body=[] ; 200 after
+ows trimmed: 200 GET / q= host=h xa=[spaced value] body=[] ; 200 after
+empty value: 200 GET / q= host=h xa=[] body=[] ; 200 after
+names case-insensitive: 200 GET / q= host=h xa=[v] body=[] ; 200 after
+duplicates combined: 200 GET / q= host=h xa=[1, 2] body=[] ; 200 after
+host with port: 200 GET / q= host=h.example:8080 xa=[] body=[] ; 200 after
+host ipv6: 200 GET / q= host=[::1]:8080 xa=[] body=[] ; 200 after
+empty host: 200 GET / q= host= xa=[] body=[] ; 200 after
+content-length body: 200 POST /p q= host=h xa=[] body=[abc] ; 200 after
+identical content-length: 200 POST /p q= host=h xa=[] body=[abc] ; 200 after
+chunked body: 200 POST /c q= host=h xa=[] body=[abcde] ; 200 after
+chunked case: 200 POST /c q= host=h xa=[] body=[z] ; 200 after
+chunk extension: 200 POST /c q= host=h xa=[] body=[abc] ; 200 after
+chunk trailers: 200 POST /c q= host=h xa=[] body=[abc] ; 200 after
+chunk upper hex: 200 POST /c q= host=h xa=[] body=[0123456789] ; 200 after
+chunked bare lf: 200 POST /c q= host=h xa=[] body=[abc] ; 200 after
 -- request line --
 garbage: 400 close
 bad version: 400 close
@@ -67,7 +67,7 @@ two hosts: 400 close
 host with space: 400 close
 host with slash: 400 close
 host with userinfo: 400 close
-absolute form wins: 200 GET /x q= host=target.example xa=[] body=[] keep-alive ; 200 after keep-alive
+absolute form wins: 200 GET /x q= host=target.example xa=[] body=[] ; 200 after
 absolute form without host: 400 close
 -- framing --
 te and cl: 400 close

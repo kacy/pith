@@ -77,6 +77,11 @@ cases=(
   "tests/leaks/leak_result_forward SHAPE=7"
   "tests/leaks/leak_result_forward SHAPE=8"
   "tests/leaks/leak_result_forward SHAPE=9"
+  "tests/leaks/leak_result_forward_callee SHAPE=1"
+  "tests/leaks/leak_result_forward_callee SHAPE=2"
+  "tests/leaks/leak_result_forward_callee SHAPE=3"
+  "tests/leaks/leak_result_forward_callee SHAPE=4"
+  "tests/leaks/leak_result_forward_callee SHAPE=5"
   tests/leaks/leak_sort_engine
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_lambda_if_let
@@ -189,6 +194,7 @@ cases=(
   tests/leaks/leak_http_string_head_flood
   tests/leaks/leak_http_head_read
   tests/leaks/leak_http_request_parse
+  tests/leaks/leak_http_response_paths
   tests/leaks/leak_csv_encode
   tests/leaks/leak_path_clean_count
   tests/leaks/leak_metrics_scrape

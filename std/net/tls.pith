@@ -2928,9 +2928,10 @@ fn send_conn_fatal_alert(cs: NativeConnState, description: Int) -> Int!:
 
 # read one record on an established connection, answering an oversized or
 # structurally invalid one with the matching sealed fatal alert. truncation
-# and eof stay alert-free — the peer is gone.
-fn read_conn_record_alerting(cs: NativeConnState, stream: TcpStream) -> tls13.Record!:
-    header := stream.read_exact_bytes(5)!
+# and eof stay alert-free — the peer is gone. `lead` is the start of the
+# header when the caller already read it.
+fn read_conn_record_alerting(cs: NativeConnState, stream: TcpStream, lead: Bytes) -> tls13.Record!:
+    header := lead.concat(stream.read_exact_bytes(5 - lead.len())!)
     if header.len() != 5:
         fail "truncated tls record header"
     length := checked_read(binary.read_u16_be_at(header, 3))!
@@ -2963,7 +2964,6 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     # so full-duplex read/write is unaffected.
     cs.read_mu.lock()
     defer cs.read_mu.unlock()
-    errdefer cs.failed = true
     if cs.failed:
         fail "tls connection is unusable after an earlier record error"
     pending := cs.pending
@@ -2974,7 +2974,20 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
             return out
         cs.pending = bytes.empty()
         return pending
+    # a read that fails before the first byte of the next record, a socket
+    # deadline running out say, leaves the stream where it was, so the
+    # connection stays usable and can still send an answer. a failure once a
+    # record has started cannot be resumed and poisons it.
+    lead := tcp_read_bytes(cs.fd, 5)!
+    return read_conn_records(handle, cs, size, lead)
 
+# the record loop of native_conn_read_bytes, from a first record whose header
+# starts with `lead`. any failure here poisons the connection.
+fn read_conn_records(handle: Int, cs: NativeConnState, size: Int, lead: Bytes) -> Bytes!:
+    errdefer cs.failed = true
+    if lead.is_empty():
+        fail "unexpected eof"
+    mut next_lead := lead
     stream := TcpStream(cs.fd)
     cipher := cs.cipher
     # per-read DoS guards: a peer streaming empty records or warning alerts
@@ -2983,7 +2996,8 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     mut empty_records := 0
     mut warning_alerts := 0
     while true:
-        record := read_conn_record_alerting(cs, stream)!
+        record := read_conn_record_alerting(cs, stream, next_lead)!
+        next_lead = bytes.empty()
         # after the handshake every legitimate record is application_data (it
         # wraps the real content type, alerts and post-handshake messages
         # included). a middlebox-compatibility change_cipher_spec is the one
@@ -3556,6 +3570,14 @@ impl Conn:
 
     fn negotiated_protocol() -> String:
         return self.state().negotiated_protocol
+
+    # the tcp connection under the session, for socket-level settings such as
+    # tcp.set_read_deadline. 0 for a conn that is not open. reading or writing
+    # it directly would corrupt the session.
+    fn socket() -> Int:
+        if native_conn_has(self.handle):
+            return native_conn_get(self.handle).fd
+        return 0
 
     fn did_resume() -> Bool:
         return self.state().did_resume

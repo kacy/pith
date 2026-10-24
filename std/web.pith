@@ -55,9 +55,34 @@ import std.time as time_mod
 import std.log as log
 import std.shutdown as shutdown
 
-# how long a connection may sit idle before the server hangs up on it, in
-# milliseconds. keeps a stalled client from tying up a task forever.
+# the time limits a new App starts with, in milliseconds: the request head has
+# this long, and a keep-alive connection may sit idle this long between
+# requests. it is also the longest a read may wait for its next byte (see
+# set_read_bound), which keeps a body that stops arriving from tying up a task
+# forever.
 CONNECTION_TIMEOUT_MS := 5000
+
+# the ServerConfig a new App starts with: http.server_config() with
+# read_header_timeout_ms and idle_timeout_ms at CONNECTION_TIMEOUT_MS. net/http
+# leaves every timeout off by default, which lets a client that sends one byte
+# at a time hold a connection forever; std.web does not. read_timeout_ms and
+# write_timeout_ms stay off, so a large upload or a slow reader is not cut off
+# at a fixed total, but each read still has to make progress within
+# CONNECTION_TIMEOUT_MS. change any of it with App.with_config.
+pub fn server_config() -> http.ServerConfig:
+    return http.server_config().with_read_header_timeout(CONNECTION_TIMEOUT_MS).with_idle_timeout(CONNECTION_TIMEOUT_MS)
+
+# bound each read on a connection by itself: no read may wait longer than
+# CONNECTION_TIMEOUT_MS for its next byte, or the longest read timeout `config`
+# sets when that is longer, so this never cuts a configured timeout short. it
+# is what still frees a connection whose body stops arriving when
+# read_timeout_ms is off. a config with no read timeouts at all asked for none,
+# and gets none.
+fn set_read_bound(fd: Int, config: http.ServerConfig):
+    if not config.times_reads():
+        return
+    longest := max(config.read_timeout_ms, max(config.header_timeout(), config.idle_timeout()))
+    tcp_set_timeout(fd, max(CONNECTION_TIMEOUT_MS, longest))
 
 # the most connections listen() and listen_tls() serve at once. every connection
 # costs a task with a pooled stack plus its buffers, so an accept loop with no
@@ -319,6 +344,7 @@ pub struct App:
     routes: List[Route]
     middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
     scoped: List[Scoped]
+    config: http.ServerConfig
 
 # a batteries-included App: the default `GET /healthz`, the built-in
 # observability middleware wrapping every route (metrics + a per-request trace
@@ -337,7 +363,7 @@ pub fn new() -> App:
 # opinionated, observable default.
 pub fn bare() -> App:
     healthz := fn(req: Request) => http.text(200, "ok")
-    return App([Route("GET", "/healthz", healthz)], [], [])
+    return App([Route("GET", "/healthz", healthz)], [], [], server_config())
 
 # return a copy of `routes` with `route` appended. building a new list keeps the
 # App builder pure: adding a route never mutates an App someone else is holding.
@@ -512,12 +538,13 @@ fn chain_for(app: App, path: String) -> List[fn(fn(Request) -> http.HttpResponse
     return chain
 
 # the methods registered for a path, in registration order, as an `Allow`
-# header value. empty when no route matches the path at all.
-fn allowed_methods(app: App, req: http.HttpRequestBytes) -> String:
+# header value. empty when no route matches the path at all. `any_path` lists
+# the methods of every route, which is what `OPTIONS *` asks about.
+fn allowed_methods(app: App, req: http.HttpRequestBytes, any_path: Bool) -> String:
     mut out := ""
     mut seen: List[String] := []
     for route in app.routes:
-        matched := req.matches_path(route.pattern) catch false
+        matched := any_path or (req.matches_path(route.pattern) catch false)
         if not matched:
             continue
         mut already := false
@@ -554,6 +581,11 @@ struct Options:
 fn options_handler(options: Options) -> fn(Request) -> http.HttpResponse:
     return fn(req: Request) => http.no_content().header("Allow", options.allow)
 
+# what `OPTIONS *` is answered with: 200, the methods the app serves, and an
+# empty body, so the answer carries Content-Length: 0.
+fn asterisk_options_handler(options: Options) -> fn(Request) -> http.HttpResponse:
+    return fn(req: Request) => http.response(200).header("Allow", options.allow)
+
 # find the first route whose method and path match, wrap its handler in the
 # middleware onion, run it, and return the response. a request that matches
 # nothing gets a 404 and skips middleware entirely. this is the single place
@@ -572,8 +604,14 @@ fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
     # deserves an Allow header, or the preflight a browser sends before a
     # cross-origin call — and a preflight that 404s before the middleware runs
     # can never be answered by cors middleware at all.
+    # `OPTIONS *` asks about the server as a whole (rfc 9110 9.3.7). no route
+    # pattern names "*", so it is answered here with every method the app
+    # serves, before a pattern like "/:name" could claim it as a path.
+    if method == "OPTIONS" and path == "*":
+        handler := wrap_middleware(chain_for(app, path), asterisk_options_handler(Options(allowed_methods(app, req, true))))
+        return handler(Request(req, empty_values, "*", empty_values))
     if method == "OPTIONS":
-        allow := allowed_methods(app, req)
+        allow := allowed_methods(app, req, false)
         if allow.len() > 0:
             pattern := pattern_for_path(app, req)
             handler := wrap_middleware(chain_for(app, path), options_handler(Options(allow)))
@@ -595,8 +633,8 @@ fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
 fn handle_conn(app: App, fd: Int):
     defer shutdown.leave()
     defer release_connection_slot()
-    tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
-    http.serve_connection_fd(fd, fn(req: http.HttpRequestBytes) => dispatch(app, req)) catch 0
+    set_read_bound(fd, app.config)
+    http.serve_connection_fd_with(fd, fn(req: http.HttpRequestBytes) => dispatch(app, req), app.config) catch 0
 
 # hand an accepted socket to its own task, counted in the drain from the moment
 # it was accepted — or refuse it, if the server is already at MAX_CONNECTIONS.
@@ -635,7 +673,8 @@ fn handle_tls_conn(app: App, conn: tls.Conn):
     if conn.negotiated_protocol() == "h2":
         http2server.serve_h2_tls_connection(conn, fn(req: http.HttpRequestBytes) => dispatch(app, req))
         return
-    http.serve_connection_tls(conn, fn(req: http.HttpRequestBytes) => dispatch(app, req)) catch 0
+    set_read_bound(conn.socket(), app.config)
+    http.serve_connection_tls_with(conn, fn(req: http.HttpRequestBytes) => dispatch(app, req), app.config) catch 0
     conn.close()
 
 # handshake an accepted socket and serve it. spawned per connection by
@@ -677,19 +716,19 @@ impl App:
     # register a GET route. returns a new App, so calls chain:
     # `web.new().get("/", home).get("/users/:id", show)`.
     fn get(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("GET", pattern, handler)), self.middleware, self.scoped)
+        return App(with_route(self.routes, Route("GET", pattern, handler)), self.middleware, self.scoped, self.config)
 
     # register a POST route. returns a new App.
     fn post(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("POST", pattern, handler)), self.middleware, self.scoped)
+        return App(with_route(self.routes, Route("POST", pattern, handler)), self.middleware, self.scoped, self.config)
 
     # register a PUT route. returns a new App.
     fn put(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("PUT", pattern, handler)), self.middleware, self.scoped)
+        return App(with_route(self.routes, Route("PUT", pattern, handler)), self.middleware, self.scoped, self.config)
 
     # register a DELETE route. returns a new App.
     fn delete(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, Route("DELETE", pattern, handler)), self.middleware, self.scoped)
+        return App(with_route(self.routes, Route("DELETE", pattern, handler)), self.middleware, self.scoped, self.config)
 
     # register a middleware. returns a new App, so calls chain alongside routes.
     # the first middleware registered runs outermost: it sees the request first
@@ -701,7 +740,7 @@ impl App:
     #
     # here logging wraps auth wraps home.
     fn use_mw(mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse) -> App:
-        return App(self.routes, with_mw(self.middleware, mw), self.scoped)
+        return App(self.routes, with_mw(self.middleware, mw), self.scoped, self.config)
 
     # bind a middleware to a path prefix: it wraps only the routes that live
     # under that prefix, and runs after (inside) the app-wide middleware. the
@@ -719,7 +758,16 @@ impl App:
         for existing in self.scoped:
             out.push(existing)
         out.push(Scoped(prefix, mw))
-        return App(self.routes, self.middleware, out)
+        return App(self.routes, self.middleware, out, self.config)
+
+    # use `config` for the connections listen() and listen_tls() serve over
+    # http/1.1: their timeouts, request-size limits and keep-alive policy. the
+    # default is server_config(). returns a new App:
+    #
+    #   config := web.server_config().with_read_timeout(30000).with_max_body_bytes(1048576)
+    #   app := web.new().with_config(config).get("/", home)
+    fn with_config(config: http.ServerConfig) -> App:
+        return App(self.routes, self.middleware, self.scoped, config)
 
     # bind host:port and serve, one task per connection. this blocks, so it is
     # usually the last thing main does; spawn it if you need to keep going.
@@ -1158,6 +1206,16 @@ test "OPTIONS on a known path answers with the methods that path accepts":
     assert_eq(resp.status, 204)
     assert_eq(resp.header_value("Allow"), "GET, POST, OPTIONS")
 
+test "OPTIONS * answers with every method the app serves":
+    app := bare().get("/users/:id", show_user).post("/users", create_user).get("/about", show_user)
+    resp := dispatch(app, request_for("OPTIONS", "*"))
+
+    assert_eq(resp.status, 200)
+    assert_eq(resp.header_value("Allow"), "GET, POST, OPTIONS")
+    assert(resp.body.is_empty())
+    wire := resp.to_bytes()!.to_string_utf8()!
+    assert(wire.contains("Content-Length: 0"))
+
 test "OPTIONS on a path no route claims is still a 404":
     app := bare().get("/users/:id", show_user)
     resp := dispatch(app, request_for("OPTIONS", "/orders/42"))
@@ -1470,3 +1528,32 @@ test "a tls connection holds a slot through its handshake and is refused past th
     release_tls_listener(listener)
     config.close()
     shutdown.reset()
+
+test "a new app starts with the read-header and idle deadlines on":
+    config := new().config
+    assert_eq(config.read_header_timeout_ms, CONNECTION_TIMEOUT_MS)
+    assert_eq(config.idle_timeout_ms, CONNECTION_TIMEOUT_MS)
+    assert_eq(config.read_timeout_ms, 0)
+    assert_eq(config.max_body_bytes, http.MAX_REQUEST_BODY)
+
+test "an app serves with the config it carries":
+    handler := fn(req: Request) => http.text(200, "core")
+    config := server_config().with_max_body_bytes(4).with_keep_alives(false)
+    app := bare().with_config(config).post("/", handler).get("/", handler)
+    port := 18996
+    spawn serve_bg(app, port)
+    sleep(200)
+    crlf := chr(13) + chr(10)
+    fd := tcp.connect("127.0.0.1", port)!
+    tcp.set_timeout(fd, 2000)
+    tcp.write(fd, "POST / HTTP/1.1" + crlf + "Host: localhost" + crlf + "Content-Length: 10" + crlf + crlf + "0123456789")!
+    refused := tcp.read(fd, 65536) catch ""
+    tcp.close(fd)
+    assert(refused.starts_with("HTTP/1.1 413 "))
+    kept := tcp.connect("127.0.0.1", port)!
+    tcp.set_timeout(kept, 2000)
+    tcp.write(kept, "GET / HTTP/1.1" + crlf + "Host: localhost" + crlf + crlf)!
+    answered := tcp.read(kept, 65536) catch ""
+    tcp.close(kept)
+    assert(answered.starts_with("HTTP/1.1 200 "))
+    assert(answered.contains("Connection: close"))

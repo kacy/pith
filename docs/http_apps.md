@@ -253,7 +253,90 @@ buffered readers (`read_request_buffered_bytes`, the legacy string-form
 `read_request_buffered`), and the tls accept loop. a head that grows past the
 cap fails even when it arrives as a single line with no line break, so no reader
 accumulates an unbounded line before the total is checked. the serve loops turn
-those failures into `431` / `413` responses and close the connection.
+those failures into `431` / `413` responses and close the connection. a server
+can set its own caps with a `ServerConfig`.
+
+### server configuration
+
+`http.ServerConfig` holds what net/http's `Server` fields hold for one http/1.1
+server: its timeouts, its request-size limits and its keep-alive policy. the
+`_with` entry points take one:
+
+```pith
+config := http.server_config()
+    .with_read_header_timeout(5000)
+    .with_idle_timeout(60000)
+    .with_max_body_bytes(1048576)
+http.serve_connection_fd_with(client_fd, handler, config)!
+http.serve_connection_tls_with(conn, handler, config)!
+http.serve_connection_with(reader, writer, handler, config)!
+```
+
+| field | `server_config()` | meaning |
+| --- | --- | --- |
+| `read_header_timeout_ms` | 0 | how long the request head may take; 0 falls back to `read_timeout_ms` |
+| `read_timeout_ms` | 0 | how long the head and the body together may take |
+| `write_timeout_ms` | 0 | how long the response may take, from the end of the request head, so the handler counts |
+| `idle_timeout_ms` | 0 | how long a keep-alive connection may wait for its next request; 0 falls back to `read_timeout_ms` |
+| `max_header_bytes` | `MAX_HEADER_BYTES` | the request head, answered with `431` past it |
+| `max_body_bytes` | `MAX_REQUEST_BODY` | the request body, declared or chunked, answered with `413` past it |
+| `keep_alives` | true | false closes the connection after every response |
+| `max_requests_per_conn` | 0 | close after this many responses; 0 for no limit |
+
+a timeout of 0 means none, so `server_config()` matches what the plain entry
+points (`serve_connection_fd`, `serve_connection_tls`, `serve_connection`) have
+always done, and they use it. net/http has the same defaults, and they let a
+client that sends one byte at a time hold a connection open forever, so a server
+facing the internet should set at least `read_header_timeout_ms`. std.web does:
+see [web](web.md#timeouts-and-limits).
+
+the timeouts are deadlines on the socket. `tcp.set_timeout` bounds each read on
+its own, so a client that sends a byte just inside it keeps a read going
+indefinitely. a deadline is a fixed time, so the time left shrinks with every
+read. the clocks start here:
+
+- the first request's head has `read_header_timeout_ms` from when the connection
+  was handed to the server, the wait for its first byte included.
+- a later request first waits up to `idle_timeout_ms` for a byte, then has
+  `read_header_timeout_ms` from that byte.
+- `read_timeout_ms` counts from the same point as the head's time, and covers the
+  body too.
+
+a request that runs out of read time once its first byte has arrived is answered
+with `408 Request Timeout` and the connection closes. a connection that runs out
+of time with nothing sent, the first request's or an idle keep-alive's, is closed
+with no answer, as net/http does. a response that runs out of write time is cut
+off, and the connection closes. the deadlines are on the tcp connection, so they
+hold for tls too, and they work on both the green and the os-thread backend.
+`serve_connection_with` reads from memory, so only the limits and the keep-alive
+policy apply there.
+
+the deadlines are available on any socket as `tcp.set_read_deadline(fd, ms)` and
+`tcp.set_write_deadline(fd, ms)`. a deadline holds until it is set again or
+cleared with 0, and when the socket also has a `set_timeout`, a wait ends at
+whichever comes first.
+
+a handler cannot see that its client went away while it runs: the handler type
+carries no `Context`, and noticing a disconnect would take a second wait on the
+socket while the handler runs, which reads the next pipelined request if there
+is one. a handler has no way to fail either. it returns an `HttpResponse`, so an
+error becomes a response through `catch` as above, and a runtime error such as
+an index out of range stops the whole process, which net/http would turn into a
+`500` and a closed connection.
+
+### what the server adds to a response
+
+the serve loops (`serve_connection`, `serve_connection_fd`, `serve_connection_tls`, `serve_one`, `serve_fd`) frame a handler's response the way rfc 9110 and rfc 9112 ask:
+
+- every response carries a `Date` in IMF-fixdate form, formatted at most once a second per connection task. a `Date` the handler set is sent in its place. `http.http_date(seconds)` formats a unix time the same way, for `Last-Modified` or `Expires`.
+- the answer to `HEAD` has the headers the handler's `GET` answer would have, including its `Content-Length`, and no body. a handler that answers `HEAD` without building the body can set `Content-Length` itself.
+- `1xx`, `204` and `304` responses never carry a body. `1xx` and `204` carry no `Content-Length` or `Transfer-Encoding`, and a `304` keeps a `Content-Length` only when the handler set one.
+- in every other response `Content-Length` is the length of the body sent. a different value the handler set is replaced, and a `Transfer-Encoding` it set is dropped, so the two never go out together.
+- an http/1.1 connection stays open unless the request or the handler lists `close` in `Connection`. then the response says `Connection: close` and the connection closes. a response on a connection that stays open carries no `Connection` field. an http/1.0 connection closes unless the request asks for `keep-alive`, and when it does the response echoes `Connection: keep-alive`.
+- a request with `Expect: 100-continue` and a body gets `HTTP/1.1 100 Continue` just before the server reads the body. the server reads the body before the handler runs, so the interim response goes out even when the handler ignores the body. any other expectation gets `417`, and the connection closes without the body being read. expectations on http/1.0 requests are ignored.
+- a status with no standard reason phrase is sent with an empty one.
+
+the writer-level streaming helpers (`send_sized_response_head`, `send_chunked_response_head` and the helpers built on them) never see the request. they add no `Date` and cannot drop the body of a `HEAD` answer, so a caller streaming an answer to `HEAD` sends the head and skips the body itself. they do follow the status rules above for the framing fields.
 
 ## streaming responses
 

@@ -4104,31 +4104,49 @@ fn redirect_preserves_method(status: Int, method: String) -> Bool:
         return true
     return method == "GET" or method == "HEAD"
 
+# the target a relative Location names (rfc 3986 5.2), resolved against the
+# current request's target. a fragment is dropped, and dot segments are
+# removed as clean_path removes them.
 fn redirect_target_path(current_path: String, location: String) -> String:
-    if location == "":
-        return current_path
-    if location.starts_with("/"):
-        return location
-    if location.starts_with("?"):
-        current_query := current_path.index_of("?")
-        if current_query >= 0:
-            return current_path.substring(0, current_query) + location
-        return current_path + location
-    if location.starts_with("#"):
+    mut loc := location
+    hash := loc.index_of("#")
+    if hash >= 0:
+        loc = loc.substring(0, hash)
+    if loc == "":
         return current_path
     current_query := current_path.index_of("?")
     mut base_path := current_path
     if current_query >= 0:
         base_path = current_path.substring(0, current_query)
-    slash := base_path.last_index_of("/")
-    if slash < 0:
-        return "/" + location
-    return base_path.substring(0, slash + 1) + location
+    mut joined := loc
+    if loc.starts_with("?"):
+        joined = base_path + loc
+    elif not loc.starts_with("/"):
+        slash := base_path.last_index_of("/")
+        if slash < 0:
+            joined = "/" + loc
+        else:
+            joined = base_path.substring(0, slash + 1) + loc
+    query_at := joined.index_of("?")
+    mut joined_path := joined
+    mut rest := ""
+    if query_at >= 0:
+        joined_path = joined.substring(0, query_at)
+        rest = joined.substring(query_at, joined.len())
+    if path_is_clean(joined_path):
+        return joined
+    return clean_path(joined_path) + rest
 
 fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
-    location := resp.header_value("Location")
+    mut location := resp.header_value("Location")
     if location == "":
         fail "redirect response is missing location"
+    # a network-path reference keeps the current scheme (rfc 3986 4.2)
+    if location.starts_with("//"):
+        if req.use_tls:
+            location = "https:" + location
+        else:
+            location = "http:" + location
 
     mut next_use_tls := req.use_tls
     mut next_host := req.host

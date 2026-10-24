@@ -26,6 +26,10 @@ pub struct ListImpl {
     /// zero. Collections are shared handles by default in the language, so
     /// unlike strings they need real counting.
     pub rc: std::sync::atomic::AtomicU32,
+    /// `identity_tag(self)` while the list is live, 0 once it is freed. It
+    /// sits right after the magic so is_list_ptr reads only the first 16
+    /// bytes of a pointer that may be a string.
+    identity: u64,
     /// Size of each element in bytes
     pub elem_size: usize,
     /// Type tag for determining how to handle elements
@@ -42,9 +46,6 @@ pub struct ListImpl {
     /// Appended at the end so the `offset_of!` constants the codegen imports
     /// keep describing the same layout.
     pub(crate) cycle_flags: std::sync::atomic::AtomicU8,
-    /// `identity_tag(self)` while the list is live, 0 once it is freed. see
-    /// `is_list_ptr`.
-    identity: u64,
 }
 
 /// Magic number to identify ListImpl pointers
@@ -498,15 +499,17 @@ fn identity_tag(ptr: *const ()) -> u64 {
     (ptr as u64) ^ identity_key()
 }
 
-/// Whether a `ListImpl` at `ptr` would reach into the next page. A pointer
-/// that is really a C string is only known to be readable up to its NUL, but
-/// the page it starts on is mapped, so is_list_ptr reads the identity word
-/// only when the whole struct lies on that page. The few lists that cross a
-/// page boundary are recorded in the handle registry instead, which answers
-/// for them without reading anything.
+/// Whether the magic and identity words at `ptr` would reach into the next
+/// page. A pointer that is really a C string is only known to be readable up
+/// to its NUL, but the page it starts on is mapped, so is_list_ptr reads the
+/// identity word only when it lies on that page. A list that would cross is
+/// recorded in the handle registry instead, which answers for it without
+/// reading anything. The allocator hands out 16-aligned blocks, so in
+/// practice no list does.
 fn crosses_page(ptr: *const ()) -> bool {
     const PAGE: usize = 4096;
-    (ptr as usize) % PAGE > PAGE - std::mem::size_of::<ListImpl>()
+    const CHECKED: usize = std::mem::offset_of!(ListImpl, identity) + std::mem::size_of::<u64>();
+    (ptr as usize) % PAGE > PAGE - CHECKED
 }
 
 /// Forget a list that is being freed: clear the identity word and drop the
@@ -533,8 +536,8 @@ pub extern "C" fn pith_list_len(list: PithList) -> i64 {
 /// bytes, and this function is what keeps pith_auto_len from misreading one
 /// as a list, so a match is confirmed by the identity word: the address mixed
 /// with a random per-process key, which a string cannot be written to hold.
-/// A pointer whose struct would cross into the next page is answered by the
-/// registry, so that nothing past the page a string starts on is read.
+/// A pointer whose identity word would cross into the next page is answered
+/// by the registry, so that nothing past the page a string starts on is read.
 pub fn is_list_ptr(ptr: *const ()) -> bool {
     if !(unsafe { list_magic_ok(ptr) }) {
         return false;
@@ -543,7 +546,7 @@ pub fn is_list_ptr(ptr: *const ()) -> bool {
         return handle_registry::is_valid(ptr, HandleKind::List);
     }
     // SAFETY: the magic read showed `ptr` is aligned and readable, and the
-    // whole struct lies on the page it starts on.
+    // identity word lies on the page it starts on.
     unsafe { (*(ptr as *const ListImpl)).identity == identity_tag(ptr) }
 }
 
@@ -1534,9 +1537,9 @@ mod tests {
     }
 
     #[test]
-    fn a_struct_that_crosses_a_page_is_answered_by_the_registry() {
+    fn an_identity_word_across_a_page_is_answered_by_the_registry() {
         let mut buf = two_pages();
-        let at = unsafe { page_start(&mut buf).add(4096 - 16) };
+        let at = unsafe { page_start(&mut buf).add(4096 - 8) };
         assert!(crosses_page(at as *const ()));
         unsafe {
             (at as *mut u32).write(LIST_MAGIC);
@@ -1549,6 +1552,13 @@ mod tests {
         assert!(is_list_ptr(at as *const ()));
         handle_registry::unregister(at as *const (), HandleKind::List);
         assert!(!is_list_ptr(at as *const ()));
+    }
+
+    #[test]
+    fn a_sixteen_aligned_list_never_crosses_a_page() {
+        for offset in (0..4096usize).step_by(16) {
+            assert!(!crosses_page((0x10_0000 + offset) as *const ()));
+        }
     }
 
     #[test]

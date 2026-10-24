@@ -198,7 +198,18 @@ unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delt
 pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     if let Some(base) = cstring_base(s) {
         crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
-        let prev = cstring_refcount(base).fetch_sub(1, std::sync::atomic::Ordering::Release);
+        // a count of one is the caller's alone, so nobody can race the last
+        // release and it needs no read-modify-write. the acquire load pairs
+        // with the release decrements of the owners that went before.
+        let rc = cstring_refcount(base);
+        let prev = if rc.load(std::sync::atomic::Ordering::Acquire) == 1 {
+            // zeroed as the decrement would have left it, so a later
+            // over-release still reads as one under PITH_CSTRING_NOFREE.
+            rc.store(0, std::sync::atomic::Ordering::Relaxed);
+            1
+        } else {
+            rc.fetch_sub(1, std::sync::atomic::Ordering::Release)
+        };
         cstring_watch(base, s, "release", prev as i64, -1);
         if prev == 0 {
             // an over-release means the emitter's ownership accounting is
@@ -906,6 +917,24 @@ mod tests {
     }
 
     #[test]
+    fn integers_format_in_decimal() {
+        unsafe {
+            for n in [0, 7, -7, 10, 99, -100, 1234567890, i64::MAX, i64::MIN] {
+                let s = pith_int_to_cstr(n);
+                let text = std::ffi::CStr::from_ptr(s).to_str().unwrap().to_owned();
+                assert_eq!(text, n.to_string());
+                assert_eq!(cstring_header_len(s), Some(text.len() as i64));
+                pith_cstring_release(s);
+            }
+            for n in [0u64, 42, u64::MAX] {
+                let s = pith_uint_to_cstr(n as i64);
+                assert_eq!(std::ffi::CStr::from_ptr(s).to_str().unwrap(), n.to_string());
+                pith_cstring_release(s);
+            }
+        }
+    }
+
+    #[test]
     fn released_cstring_fails_the_header_check() {
         unsafe {
             let s = pith_copy_bytes_to_cstring(b"x");
@@ -1231,24 +1260,23 @@ pub unsafe extern "C" fn pith_cstring_eq(a: *const i8, b: *const i8) -> i64 {
     if std::ptr::eq(a, b) {
         return 1;
     }
-
-    let mut pa = a;
-    let mut pb = b;
-    loop {
-        let ca = *pa;
-        let cb = *pb;
-
-        if ca != cb {
-            return 0;
-        }
-
-        if ca == 0 {
-            return 1;
-        }
-
-        pa = pa.add(1);
-        pb = pb.add(1);
+    // most unequal pairs differ in the first byte, which settles it before
+    // either length is taken. an empty string's first byte is its zero
+    // terminator, so this holds for empty strings too.
+    if *a != *b {
+        return 0;
     }
+    // compare by length, then bytes. a heap string's length is one header
+    // read, and a string holding a zero byte compares in full rather than
+    // stopping at the zero.
+    let la = crate::string::pith_cstring_len(a) as usize;
+    let lb = crate::string::pith_cstring_len(b) as usize;
+    if la != lb {
+        return 0;
+    }
+    let sa = std::slice::from_raw_parts(a as *const u8, la);
+    let sb = std::slice::from_raw_parts(b as *const u8, lb);
+    (sa == sb) as i64
 }
 
 #[no_mangle]
@@ -2858,10 +2886,21 @@ unsafe fn struct_dead(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
 // weak reference funnel their final drop through here.
 unsafe fn struct_weak_drop(base: *mut u8) {
     let weak = struct_weak(base);
-    if weak.fetch_sub(1, std::sync::atomic::Ordering::Release) != 1 {
-        return;
+    // a count of one is ours alone: a new weak reference is made only from a
+    // strong or a weak one, and there is neither, so the drop needs no
+    // read-modify-write. the acquire load pairs with the release decrements
+    // of the holders that went before.
+    if weak.load(std::sync::atomic::Ordering::Acquire) != 1 {
+        if weak.fetch_sub(1, std::sync::atomic::Ordering::Release) != 1 {
+            return;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    struct_free_header(base);
+}
+
+/// Scrub and free (or pool) a struct header nothing references any more.
+unsafe fn struct_free_header(base: *mut u8) {
     let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
     // scrub the magic so any stale pointer fails the check
     (base as *mut u32).write(0);
@@ -2954,27 +2993,37 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
         return;
     };
     let strong = struct_strong(base);
-    // cycle-gc suspect hook, placed before our count is given up rather than
-    // in the prev > 1 arm below. the ordering is load-bearing: while we still
-    // hold a strong count the header cannot be freed, so the buffered bit and
-    // the buffer's weak retain land on live memory. after the fetch_sub a
-    // concurrent owner can finish the whole death path — including the weak
-    // drop that frees the header — under the hook's feet. if other owners
-    // release between this load and our decrement, the struct simply dies
-    // buffered, which the death path below already supports.
-    if crate::cycle::cycle_gc_enabled() && strong.load(std::sync::atomic::Ordering::Relaxed) > 1 {
-        maybe_suspect_struct(ptr, base);
+    // the sole owner of a struct that no weak reference holds is the only
+    // party that can reach it: no other thread can retain, release or
+    // upgrade it, so the last release skips the decrement. the acquire
+    // loads pair with the release decrements of the owners that went before.
+    let weak = struct_weak(base);
+    let sole = strong.load(std::sync::atomic::Ordering::Acquire) == 1
+        && weak.load(std::sync::atomic::Ordering::Acquire) == 1;
+    if !sole {
+        // cycle-gc suspect hook, placed before our count is given up rather
+        // than in the prev > 1 arm below. the ordering is load-bearing: while
+        // we still hold a strong count the header cannot be freed, so the
+        // buffered bit and the buffer's weak retain land on live memory.
+        // after the fetch_sub a concurrent owner can finish the whole death
+        // path — including the weak drop that frees the header — under the
+        // hook's feet. if other owners release between this load and our
+        // decrement, the struct simply dies buffered, which the death path
+        // below already supports.
+        if crate::cycle::cycle_gc_enabled() && strong.load(std::sync::atomic::Ordering::Relaxed) > 1 {
+            maybe_suspect_struct(ptr, base);
+        }
+        let prev = strong.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        if prev > 1 {
+            return;
+        }
+        if prev == 0 {
+            // over-release: restore and leave the object alone
+            strong.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     }
-    let prev = strong.fetch_sub(1, std::sync::atomic::Ordering::Release);
-    if prev > 1 {
-        return;
-    }
-    if prev == 0 {
-        // over-release: restore and leave the object alone
-        strong.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return;
-    }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
     let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
     if dtor != 0 {
         // a destructor may run user code: a `Drop` method that binds `self`
@@ -2992,6 +3041,13 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
         f(ptr);
     }
     crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+    // with only the implicit weak unit left, nothing can read the dead flag,
+    // so the header is freed without setting it. a destructor that made a
+    // weak reference, or a suspect buffer holding one, keeps the full path.
+    if weak.load(std::sync::atomic::Ordering::Acquire) == 1 {
+        struct_free_header(base);
+        return;
+    }
     // the value is now dead; a weak read after this returns none. the release
     // ordering publishes the destructor's writes to any thread whose weak load
     // sees the flag. fetch_or rather than a store so a concurrently-set

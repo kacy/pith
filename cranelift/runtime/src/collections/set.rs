@@ -523,16 +523,12 @@ pub unsafe extern "C" fn pith_set_to_list_int_handle(set_handle: i64) -> i64 {
 // Handle-based C-string variants for Cranelift codegen
 // ---------------------------------------------------------------------------
 
-/// Borrow a c-string element: walk it for its length and hand back the
-/// caller's own bytes. Nothing is copied, so the borrow is only good for the
-/// length of the call that took it.
+/// Borrow a c-string element: take its length (one header read for a heap
+/// string, a scan for a literal) and hand back the caller's own bytes.
+/// Nothing is copied, so the borrow is only good for the length of the call
+/// that took it.
 unsafe fn cstr_elem_ref<'a>(s: *const i8) -> ElemRef<'a> {
-    let mut len = 0usize;
-    let mut p = s;
-    while *p != 0 {
-        len += 1;
-        p = p.add(1);
-    }
+    let len = crate::string::pith_cstring_len(s) as usize;
     ElemRef::Str(std::slice::from_raw_parts(s as *const u8, len))
 }
 

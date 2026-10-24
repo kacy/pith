@@ -802,6 +802,20 @@ impl App:
     fn head(pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
         return self.handle("HEAD", pattern, handler)
 
+    # serve the files under the directory `root` at `prefix`, as net/http's
+    # FileServer does: `app.static("/assets", "public")` answers
+    # GET /assets/app.js with public/app.js. it is a GET route on
+    # `prefix + "/*path"`, so it answers HEAD too and runs inside the
+    # middleware like any route. see http.serve_dir for what it sends: the
+    # validators, conditional and range requests, index.html for a directory,
+    # and 404 for anything outside root.
+    fn static(prefix: String, root: String) -> App:
+        mut base := prefix
+        while base.ends_with("/"):
+            base = base.substring(0, base.len() - 1)
+        files := fn(req: Request) => http.serve_dir(req.raw, root, req.param("path"))
+        return self.get(base + "/*path", files)
+
     # answer one request as listen would, without a socket: routing, the
     # middleware and the 301, 404 and 405 answers all apply. it is what an
     # http.serve_* loop or a test hands requests to.

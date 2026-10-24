@@ -3330,6 +3330,362 @@ pub fn detect_content_type(data: Bytes) -> String:
         return MIME_JSON
     return "text/plain; charset=utf-8"
 
+# ===============================================================
+# Serving files and content
+# ===============================================================
+
+# how much of a file is read at a time when its content is served.
+FILE_READ_CHUNK := 65536
+
+# a Range header asking for more parts than this is ignored and the whole
+# content is sent, so a request cannot make the server assemble thousands of
+# tiny parts. a request whose parts add up to more than the content is
+# ignored the same way, as net/http does.
+MAX_RANGES := 32
+
+# what serve_content and serve_file send from: content held in memory, or a
+# file read one range at a time.
+struct ContentSource:
+    file_path: String
+    data: Bytes
+    size: Int
+
+# `length` bytes from `start` of a content source.
+fn source_range(src: ContentSource, start: Int, length: Int) -> Bytes!:
+    if src.file_path == "":
+        return src.data.slice(start, start + length)
+    return read_file_range(src.file_path, start, length)
+
+# read `length` bytes from `start` of a file. there is no seek, so the bytes
+# before `start` are read and dropped.
+fn read_file_range(file_path: String, start: Int, length: Int) -> Bytes!:
+    file := fs.open(file_path)!
+    defer file.close()
+    reader := file.buffered_bytes_reader_chunked(FILE_READ_CHUNK)
+    mut skipped := 0
+    while skipped < start:
+        chunk := reader.read_bytes(min(FILE_READ_CHUNK, start - skipped))!
+        if chunk.is_empty():
+            fail "file ended before the requested range: " + file_path
+        skipped = skipped + chunk.len()
+    out := bytes.buffer_with_capacity(length)
+    errdefer out.free()
+    mut got := 0
+    while got < length:
+        chunk := reader.read_bytes(min(FILE_READ_CHUNK, length - got))!
+        if chunk.is_empty():
+            fail "file ended before the requested range: " + file_path
+        out.write(chunk)!
+        got = got + chunk.len()
+    return out.take_bytes()
+
+# the value of `text` when it is one or more ascii digits and fits an Int
+# with room to spare, else -1.
+fn small_decimal(text: String) -> Int:
+    if text.len() == 0 or text.len() > 18 or not is_decimal_text(text):
+        return -1
+    return parse_int(text) catch -1
+
+fn month_number(name: String) -> Int:
+    months := ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    mut i := 0
+    while i < months.len():
+        if months[i] == name:
+            return i + 1
+        i = i + 1
+    return -1
+
+# unix seconds for a calendar date and an "hh:mm:ss" clock, or a failure when
+# any field is out of range.
+fn http_date_seconds(year: Int, month_name: String, day: Int, clock: String) -> Int!:
+    month := month_number(month_name)
+    if year < 1970 or month < 1 or day < 1 or day > datetime.days_in_month(year, month):
+        fail "invalid http date"
+    if clock.len() != 8 or clock[2] != ":" or clock[5] != ":":
+        fail "invalid http date"
+    hour := small_decimal(clock.substring(0, 2))
+    minute := small_decimal(clock.substring(3, 5))
+    second := small_decimal(clock.substring(6, 8))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 60:
+        fail "invalid http date"
+    days := datetime.to_timestamp(datetime.date(year, month, day)) / 1000
+    return days + hour * 3600 + minute * 60 + second
+
+# parse an http date (rfc 9110 5.6.7) into unix seconds. all three forms a
+# recipient must accept are read: IMF-fixdate ("Sun, 06 Nov 1994 08:49:37
+# GMT"), the obsolete rfc 850 form ("Sunday, 06-Nov-94 08:49:37 GMT", a
+# two-digit year from 69 meaning 19xx) and asctime ("Sun Nov  6 08:49:37
+# 1994").
+pub fn parse_http_date(text: String) -> Int!:
+    value := text.trim()
+    comma := value.index_of(",")
+    if comma == 3 and value.len() == 29 and value.ends_with(" GMT") and value[4] == " " and value[7] == " " and value[11] == " " and value[16] == " ":
+        return http_date_seconds(small_decimal(value.substring(12, 16)), value.substring(8, 11), small_decimal(value.substring(5, 7)), value.substring(17, 25))
+    if comma > 3:
+        rest := value.substring(comma + 1, value.len())
+        if rest.len() == 23 and rest[0] == " " and rest[3] == "-" and rest[7] == "-" and rest[10] == " " and rest.ends_with(" GMT"):
+            mut year := small_decimal(rest.substring(8, 10))
+            if year >= 0 and year < 69:
+                year = year + 2000
+            elif year >= 69:
+                year = year + 1900
+            return http_date_seconds(year, rest.substring(4, 7), small_decimal(rest.substring(1, 3)), rest.substring(11, 19))
+    if comma < 0 and value.len() == 24 and value[3] == " " and value[7] == " " and value[10] == " " and value[19] == " ":
+        return http_date_seconds(small_decimal(value.substring(20, 24)), value.substring(4, 7), small_decimal(value.substring(8, 10).trim()), value.substring(11, 19))
+    fail "invalid http date: " + value
+
+# true when the entity-tag list in an If-Match or If-None-Match value names
+# `etag`, or is "*". a weak tag ("W/...") matches only when `weak_ok`, which
+# is the weak comparison If-None-Match uses (rfc 9110 8.8.3.2). the list is
+# scanned rather than split on ",", since a quoted tag may hold a comma.
+fn etag_list_matches(list: String, etag: String, weak_ok: Bool) -> Bool:
+    if list.trim() == "*":
+        return etag != ""
+    mut i := 0
+    while i < list.len():
+        c := list[i]
+        if c == " " or c == "\t" or c == ",":
+            i = i + 1
+            continue
+        mut is_weak := false
+        if list.substring(i, min(i + 2, list.len())) == "W/":
+            is_weak = true
+            i = i + 2
+        if i >= list.len() or list[i] != "\"":
+            return false
+        close := list.substring(i + 1, list.len()).index_of("\"")
+        if close < 0:
+            return false
+        tag := list.substring(i, i + close + 2)
+        if tag == etag and (weak_ok or not is_weak):
+            return true
+        i = i + close + 2
+    return false
+
+# the outcome of a request's preconditions against a representation with the
+# entity tag `etag` and modification time `modified` (0 when unknown), in the
+# order rfc 9110 13.2.2 gives: 0 to go on, 412, or 304.
+fn precondition_status(req: HttpRequestBytes, etag: String, modified: Int) -> Int:
+    method := req.method_text
+    safe := method == "GET" or method == "HEAD"
+    if_match := req.header_or("If-Match", "")
+    if if_match != "":
+        if not etag_list_matches(if_match, etag, false):
+            return 412
+    elif modified > 0:
+        unmodified_since := parse_http_date(req.header_or("If-Unmodified-Since", "")) catch -1
+        if unmodified_since >= 0 and modified > unmodified_since:
+            return 412
+    if_none_match := req.header_or("If-None-Match", "")
+    if if_none_match != "":
+        if etag_list_matches(if_none_match, etag, true):
+            if safe:
+                return 304
+            return 412
+    elif safe and modified > 0:
+        modified_since := parse_http_date(req.header_or("If-Modified-Since", "")) catch -1
+        if modified_since >= 0 and modified <= modified_since:
+            return 304
+    return 0
+
+# true when an If-Range value still describes the representation, so a range
+# may be sent: a strong entity tag equal to `etag`, or a date equal to the
+# modification time. anything else means the client's copy is stale and gets
+# the whole content.
+fn if_range_holds(value: String, etag: String, modified: Int) -> Bool:
+    if value.starts_with("\"") or value.starts_with("W/"):
+        return etag != "" and value.trim() == etag
+    date := parse_http_date(value) catch -1
+    return modified > 0 and date == modified
+
+# the ranges a Range value asks for out of `size` bytes, as start, length
+# pairs. `status` is 206 with at least one satisfiable range, 416 when the
+# value is well formed and none of its ranges overlap the content, and 0 when
+# the header should be ignored: another unit, a malformed range, too many
+# ranges, or ranges that add up to more than the content.
+struct RangePlan:
+    status: Int
+    starts: List[Int]
+    lengths: List[Int]
+
+fn ignore_ranges() -> RangePlan:
+    return RangePlan(0, [], [])
+
+fn plan_ranges(value: String, size: Int) -> RangePlan:
+    eq := value.index_of("=")
+    if eq < 0 or value.substring(0, eq).trim().to_lower() != "bytes":
+        return ignore_ranges()
+    specs := value.substring(eq + 1, value.len()).split(",")
+    if specs.len() > MAX_RANGES:
+        return ignore_ranges()
+    mut starts: List[Int] := []
+    mut lengths: List[Int] := []
+    mut total := 0
+    mut any_spec := false
+    for raw in specs:
+        spec := raw.trim()
+        if spec == "":
+            continue
+        any_spec = true
+        dash := spec.index_of("-")
+        if dash < 0:
+            return ignore_ranges()
+        first := spec.substring(0, dash).trim()
+        last := spec.substring(dash + 1, spec.len()).trim()
+        if first == "":
+            suffix := small_decimal(last)
+            if suffix < 0:
+                return ignore_ranges()
+            if suffix == 0 or size == 0:
+                continue
+            length := min(suffix, size)
+            starts.push(size - length)
+            lengths.push(length)
+            total = total + length
+            continue
+        start := small_decimal(first)
+        if start < 0:
+            return ignore_ranges()
+        mut end := size - 1
+        if last != "":
+            end = small_decimal(last)
+            if end < start:
+                return ignore_ranges()
+            end = min(end, size - 1)
+        if start >= size:
+            continue
+        starts.push(start)
+        lengths.push(end - start + 1)
+        total = total + end - start + 1
+    if not any_spec:
+        return ignore_ranges()
+    if starts.len() == 0:
+        return RangePlan(416, [], [])
+    if total > size:
+        return ignore_ranges()
+    return RangePlan(206, starts, lengths)
+
+fn content_range(start: Int, length: Int, size: Int) -> String:
+    return "bytes " + start.to_string() + "-" + (start + length - 1).to_string() + "/" + size.to_string()
+
+# a multipart/byteranges body (rfc 9110 14.6) holding each planned range.
+fn byteranges_body(src: ContentSource, plan: RangePlan, content_type: String, boundary: String) -> Bytes!:
+    out := bytes.buffer()
+    errdefer out.free()
+    mut i := 0
+    while i < plan.starts.len():
+        out.write_string_utf8("--" + boundary + "\r\nContent-Type: " + content_type + "\r\nContent-Range: " + content_range(plan.starts[i], plan.lengths[i], src.size) + "\r\n\r\n")!
+        out.write(source_range(src, plan.starts[i], plan.lengths[i])!)!
+        out.write_string_utf8("\r\n")!
+        i = i + 1
+    out.write_string_utf8("--" + boundary + "--\r\n")!
+    return out.take_bytes()
+
+# the content type to send for `name`: from its extension, or sniffed from
+# the first bytes when the extension says nothing.
+fn served_content_type(name: String, src: ContentSource) -> String!:
+    by_name := content_type_for_path(name)
+    if by_name != MIME_BINARY:
+        return by_name
+    return detect_content_type(source_range(src, 0, min(src.size, SNIFF_LEN))!)
+
+# the strong entity tag serve_file and serve_content send: the modification
+# time and the size, in hex, as nginx and others derive one.
+fn content_etag(modified: Int, size: Int) -> String:
+    if modified <= 0:
+        return ""
+    return "\"" + lower_hex_int(modified) + "-" + lower_hex_int(size) + "\""
+
+# `resp` with its status replaced.
+fn with_status(resp: HttpResponse, status: Int) -> HttpResponse:
+    return HttpResponse(status, resp.content_type, resp.headers, resp.body, resp.set_cookie_headers, resp.trailers)
+
+# the answer to `req` for a representation: the validators, the
+# preconditions, then a single range, several ranges or the whole content.
+fn answer_content(req: HttpRequestBytes, name: String, modified: Int, src: ContentSource) -> HttpResponse!:
+    etag := content_etag(modified, src.size)
+    mut last_modified := ""
+    if modified > 0:
+        last_modified = http_date(modified)
+    precondition := precondition_status(req, etag, modified)
+    if precondition == 412:
+        return text(412, reason_phrase(412))
+    if precondition == 304:
+        # a 304 carries the validator the client compares against, and
+        # Last-Modified only when there is no ETag (rfc 9110 15.4.5).
+        if etag != "":
+            return response(304).header("ETag", etag)
+        return response(304).header("Last-Modified", last_modified)
+    mut base := response(200).header("Accept-Ranges", "bytes")
+    if etag != "":
+        base = base.header("ETag", etag).header("Last-Modified", last_modified)
+    content_type := served_content_type(name, src)!
+    method := req.method_text
+    range_value := req.header_or("Range", "")
+    mut plan := ignore_ranges()
+    if method == "GET" and range_value != "":
+        if_range := req.header_or("If-Range", "")
+        if if_range == "" or if_range_holds(if_range, etag, modified):
+            plan = plan_ranges(range_value, src.size)
+    if plan.status == 416:
+        return text(416, reason_phrase(416)).header("Content-Range", "bytes */" + src.size.to_string())
+    if plan.status == 206 and plan.starts.len() == 1:
+        start := plan.starts[0]
+        length := plan.lengths[0]
+        return with_status(base, 206).header("Content-Type", content_type).header("Content-Range", content_range(start, length, src.size)).with_body_bytes(source_range(src, start, length)!)
+    if plan.status == 206:
+        boundary := multipart_random_boundary()!
+        return with_status(base, 206).header("Content-Type", "multipart/byteranges; boundary=" + boundary).with_body_bytes(byteranges_body(src, plan, content_type, boundary)!)
+    full := base.header("Content-Type", content_type)
+    if method == "HEAD":
+        return full.header("Content-Length", src.size.to_string())
+    return full.with_body_bytes(source_range(src, 0, src.size)!)
+
+# answer `req` with `content`, as net/http's ServeContent does: the content
+# type from `name`'s extension, or sniffed from the content when it has none
+# the table knows; an ETag and a Last-Modified from `modified` (unix seconds,
+# or 0 when unknown, which sends neither); 304 and 412 for the conditional
+# headers (rfc 9110 13.2.2); and 206 for a Range request (rfc 9110 14), as
+# multipart/byteranges when it asks for several ranges. a Range the server
+# cannot honor sensibly is ignored and the whole content sent, and one that
+# no part of the content satisfies gets 416. a HEAD request gets the headers
+# with no body.
+pub fn serve_content(req: HttpRequestBytes, name: String, modified: Int, content: Bytes) -> HttpResponse:
+    return answer_content(req, name, modified, ContentSource("", content, content.len())) catch server_error_response()
+
+# answer `req` with the file at `file_path`, as serve_content does, using the
+# file's size and modification time. only the bytes a response carries are
+# read, so a 304, a HEAD or a small range never reads the whole file. a path
+# that does not name a regular file gets 404, and one holding a NUL byte 400.
+pub fn serve_file(req: HttpRequestBytes, file_path: String) -> HttpResponse:
+    if file_path.index_of(chr(0)) >= 0:
+        return bad_request_response()
+    meta := fs.info(file_path) catch:
+        return not_found_response()
+    if meta.is_dir:
+        return not_found_response()
+    modified := fs.modified(file_path) catch 0
+    return answer_content(req, file_path, modified, ContentSource(file_path, bytes.empty(), meta.size)) catch server_error_response()
+
+# answer `req` with the file `name` names under the directory `root`, as
+# net/http's FileServer does. `name` is a "/"-separated path relative to
+# root, already percent-decoded, such as a `*path` route parameter. a name
+# with a ".." segment gets 404 and one holding a NUL byte 400, so nothing
+# outside root is ever read. a directory is answered with its index.html, or
+# 404 when it has none; directories are never listed.
+pub fn serve_dir(req: HttpRequestBytes, root: String, name: String) -> HttpResponse:
+    if name.index_of(chr(0)) >= 0:
+        return bad_request_response()
+    for segment in name.split("/"):
+        if segment == "..":
+            return not_found_response()
+    mut target := root
+    if name.trim() != "":
+        target = path_mod.join(root, name)
+    if fs.is_dir(target):
+        target = path_mod.join(target, "index.html")
+    return serve_file(req, target)
+
 # sends a chunked response head so callers can stream chunks without buffering the whole body.
 pub fn send_chunked_response_head(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
     if not response.body.is_empty():
@@ -5041,3 +5397,42 @@ test "detect_content_type knows the common signatures":
     assert_eq(detect_content_type(bytes_of([0, 97, 115, 109, 1, 0, 0, 0])), MIME_WASM)
     assert_eq(detect_content_type(bytes_of([1, 2, 3])), MIME_BINARY)
     assert_eq(detect_content_type(bytes.empty()), "text/plain; charset=utf-8")
+
+test "parse_http_date reads all three date forms":
+    assert_eq(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")!, 784111777)
+    assert_eq(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT")!, 784111777)
+    assert_eq(parse_http_date("Sun Nov  6 08:49:37 1994")!, 784111777)
+    assert_eq(parse_http_date(http_date(1700000000))!, 1700000000)
+    assert(parse_http_date("yesterday").is_err)
+    assert(parse_http_date("Sun, 32 Nov 1994 08:49:37 GMT").is_err)
+    assert(parse_http_date("Sun, 06 Nov 1994 25:49:37 GMT").is_err)
+
+test "plan_ranges follows rfc 9110 14":
+    one := plan_ranges("bytes=0-4", 10)
+    assert_eq(one.status, 206)
+    assert_eq(one.starts[0], 0)
+    assert_eq(one.lengths[0], 5)
+    suffix := plan_ranges("bytes=-3", 10)
+    assert_eq(suffix.starts[0], 7)
+    assert_eq(suffix.lengths[0], 3)
+    assert_eq(plan_ranges("bytes=8-", 10).lengths[0], 2)
+    assert_eq(plan_ranges("bytes=5-100", 10).lengths[0], 5)
+    assert_eq(plan_ranges("Bytes=0-1, 4-5", 10).starts.len(), 2)
+    assert_eq(plan_ranges("bytes=20-30", 10).status, 416)
+    assert_eq(plan_ranges("bytes=-0", 10).status, 416)
+    assert_eq(plan_ranges("bytes=0-0", 0).status, 416)
+    # ignored: another unit, bad syntax, more than the content in total.
+    assert_eq(plan_ranges("items=0-1", 10).status, 0)
+    assert_eq(plan_ranges("bytes=5-1", 10).status, 0)
+    assert_eq(plan_ranges("bytes=a-b", 10).status, 0)
+    assert_eq(plan_ranges("bytes=", 10).status, 0)
+    assert_eq(plan_ranges("bytes=0-9,0-9", 10).status, 0)
+
+test "etag lists are scanned with strong and weak comparison":
+    tag := chr(34) + "a,b" + chr(34)
+    assert(etag_list_matches(tag, tag, false))
+    assert(etag_list_matches(chr(34) + "x" + chr(34) + ", " + tag, tag, false))
+    assert(etag_list_matches("W/" + tag, tag, true))
+    assert(not etag_list_matches("W/" + tag, tag, false))
+    assert(etag_list_matches("*", tag, false))
+    assert(not etag_list_matches(chr(34) + "a" + chr(34), tag, true))

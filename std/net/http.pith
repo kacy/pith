@@ -72,6 +72,9 @@ CHUNK_LINE_LIMIT := 8192
 # the connection's pending tail to be sliced off a byte at a time.
 TLS_READ_CHUNK := 16384
 
+# room for a typical response head, so writing one rarely grows its buffer.
+RESPONSE_HEAD_CAPACITY := 256
+
 # the messages the head and body readers fail with when a limit is exceeded. the
 # serve loops match on them to answer with the right status (431 / 413) and then
 # close the connection, so a rejected request never leaves unread body bytes to be
@@ -2370,18 +2373,6 @@ fn current_date_field() -> String:
         date_cache_second = now
     return date_cache_field
 
-fn ct_header(ct: String) -> String:
-    crlf := chr(13) + chr(10)
-    if ct == "text/html":
-        return "Content-Type: text/html" + crlf
-    if ct == "application/json":
-        return "Content-Type: application/json" + crlf
-    if ct == "text/plain":
-        return "Content-Type: text/plain" + crlf
-    mut h := "Content-Type: " + ct
-    h = h + crlf
-    return h
-
 # starts building an http response.
 pub fn response(status: Int) -> HttpResponse:
     mut headers: Map[String, String] := {}
@@ -2621,8 +2612,8 @@ fn is_decimal_text(text: String) -> Bool:
         i = i + 1
     return true
 
-# the field that frames a response body (rfc 9112 6.3), through its CRLF, or
-# an empty string when the response carries none:
+# write the field that frames a response body (rfc 9112 6.3), through its
+# CRLF, to `out`, or nothing when the response carries none:
 #   * 1xx and 204 never carry Content-Length or Transfer-Encoding (rfc 9110
 #     15.2, 15.3.5).
 #   * 304 carries the Content-Length the handler set, if any (rfc 9110 15.4.5).
@@ -2632,28 +2623,42 @@ fn is_decimal_text(text: String) -> Bool:
 #     set that disagrees is replaced, so the framing always matches the bytes
 #     on the wire, and a Transfer-Encoding the handler set is dropped, so the
 #     two are never sent together.
-fn framing_field(status: Int, body_length: Int, use_chunked: Bool, explicit_length: String, head_request: Bool) -> String:
+fn write_framing_field(out: ByteBuffer, status: Int, body_length: Int, use_chunked: Bool, explicit_length: String, head_request: Bool) -> Int!:
     if status < 200 or status == 204:
-        return ""
+        return 0
     if status == 304 or (head_request and body_length == 0 and not use_chunked):
         if is_decimal_text(explicit_length):
-            return "Content-Length: " + explicit_length + "\r\n"
-        return ""
+            return write_field(out, "Content-Length", explicit_length)
+        return 0
     if use_chunked:
-        return "Transfer-Encoding: chunked\r\n"
-    return "Content-Length: " + body_length.to_string() + "\r\n"
+        return out.write_string_utf8("Transfer-Encoding: chunked\r\n")
+    return write_field(out, "Content-Length", body_length.to_string())
+
+# write `name: value` and its CRLF to `out`.
+fn write_field(out: ByteBuffer, name: String, value: String) -> Int!:
+    out.write_string_utf8(name)!
+    out.write_string_utf8(": ")!
+    out.write_string_utf8(value)!
+    out.write_string_utf8("\r\n")!
+    return 1
 
 # serialize a response head. `body_length` is the length of the body that
 # follows, `connection` the Connection value to write, or empty for none, and
 # `date_field` the Date field to write through its CRLF, or empty for none; a
 # Date the handler set wins over it. `head_request` marks the answer to a HEAD
 # request. a Connection, Content-Length or Transfer-Encoding in the handler's
-# header map is never copied: `connection` and framing_field decide those.
+# header map is never copied: `connection` and write_framing_field decide those.
 fn build_response_head(response: HttpResponse, body_length: Int, use_chunked: Bool, connection: String, date_field: String, head_request: Bool) -> Bytes!:
-    crlf := "\r\n"
-    mut head := status_line(response.status)
+    buf := bytes.buffer_with_capacity(RESPONSE_HEAD_CAPACITY)
+    errdefer buf.free()
+    write_response_head(buf, response, body_length, use_chunked, connection, date_field, head_request)!
+    return buf.take_bytes()
+
+# write the head build_response_head serializes to `out`.
+fn write_response_head(out: ByteBuffer, response: HttpResponse, body_length: Int, use_chunked: Bool, connection: String, date_field: String, head_request: Bool) -> Int!:
+    out.write_string_utf8(status_line(response.status))!
     if response.content_type != "":
-        head = head + ct_header(strip_header_controls(response.content_type))
+        write_field(out, "Content-Type", strip_header_controls(response.content_type))!
     mut explicit_length := ""
     mut has_date := false
     for key in response.headers:
@@ -2664,27 +2669,29 @@ fn build_response_head(response: HttpResponse, body_length: Int, use_chunked: Bo
             continue
         if header_key_matches(key, "Date"):
             has_date = true
-        head = head + strip_header_controls(key) + ": " + strip_header_controls(response.headers[key]) + crlf
+        write_field(out, strip_header_controls(key), strip_header_controls(response.headers[key]))!
     for line in response.set_cookie_headers:
-        head = head + "Set-Cookie: " + strip_header_controls(line) + crlf
-    head = head + framing_field(response.status, body_length, use_chunked, explicit_length, head_request)
+        write_field(out, "Set-Cookie", strip_header_controls(line))!
+    write_framing_field(out, response.status, body_length, use_chunked, explicit_length, head_request)!
     if not has_date:
-        head = head + date_field
+        out.write_string_utf8(date_field)!
     if connection != "":
-        head = head + "Connection: " + strip_header_controls(connection) + crlf
-    return bytes.from_string_utf8(head + crlf)
+        write_field(out, "Connection", strip_header_controls(connection))!
+    return out.write_string_utf8("\r\n")
 
 # a whole response as the bytes to write: the head, then the body unless the
 # status (rfc 9110 15.2, 15.3.5, 15.4.5) or a HEAD request (rfc 9110 9.3.2)
 # rules one out. build_response_head has the other arguments.
 fn response_bytes(response: HttpResponse, connection: String, date_field: String, head_request: Bool) -> Bytes!:
-    head := build_response_head(response, response.body.len(), false, connection, date_field, head_request)!
-    if head_request or response_status_has_no_body(response.status) or response.body.is_empty():
-        return head
-    buf := bytes.buffer_with_capacity(head.len() + response.body.len())
+    with_body := not (head_request or response_status_has_no_body(response.status) or response.body.is_empty())
+    mut capacity := RESPONSE_HEAD_CAPACITY
+    if with_body:
+        capacity = capacity + response.body.len()
+    buf := bytes.buffer_with_capacity(capacity)
     errdefer buf.free()
-    buf.write(head)!
-    buf.write(response.body)!
+    write_response_head(buf, response, response.body.len(), false, connection, date_field, head_request)!
+    if with_body:
+        buf.write(response.body)!
     return buf.take_bytes()
 
 impl StreamedHttpResponse:

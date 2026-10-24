@@ -219,12 +219,11 @@ jobs:
             fi
           done
 
-  # the two-register result abi (PITH_RESULT_REG=1) is off by default. nothing
-  # ran it between the day it landed and #1164, when two regression cases
-  # turned out to read freed memory with it on, so this job runs the
-  # regression corpus, the leak cases and the memcheck set with it on until it
-  # becomes the default. it runs beside the build job, so it adds no wall time.
-  result-reg:
+  # the two-register result abi is the default, so every job above runs it.
+  # this one runs the regression corpus, the leak cases and the memcheck set
+  # with it off (PITH_RESULT_REG=0), the box abi every `-> T!` function used
+  # before. it runs beside the build job, so it adds no wall time.
+  result-box:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -233,14 +232,14 @@ jobs:
       - name: build
         run: cargo build --release
 
-      - name: regression corpus with the register result abi
-        run: make run-regressions-result-reg-only
+      - name: regression corpus with the box result abi
+        run: make run-regressions-result-box-only
 
-      - name: leak growth with the register result abi
-        run: make leak-check-result-reg-only
+      - name: leak growth with the box result abi
+        run: make leak-check-result-box-only
 
-      - name: memcheck with the register result abi
+      - name: memcheck with the box result abi
         timeout-minutes: 30
         run: |
           tooling/ci_install_valgrind.sh
-          make memcheck-result-reg
+          make memcheck-result-box

@@ -1,0 +1,16 @@
+# a string may hold a zero byte. equality, ordering and map and set keys
+# compare the whole string, not the bytes before the first zero.
+fn main():
+    a := "k" + chr(0) + "a"
+    b := "k" + chr(0) + "b"
+    print("eq {a == b} neq {a != b} self {a == a}")
+    print("prefix {a == "k"}")
+    mut m: Map[String, Int] := {}
+    m.insert(a, 1)
+    m.insert(b, 2)
+    print("map len {m.len()} a {m[a]} b {m[b]} k {m.contains_key("k")}")
+    mut s: Set[String] := {}
+    s.add(a)
+    s.add(b)
+    print("set len {s.len()} a {s.contains(a)} k {s.contains("k")}")
+    print("order lt {a < b} gt {a > b} lte {b <= a} gte {a >= a} prefix {"k" < a}")

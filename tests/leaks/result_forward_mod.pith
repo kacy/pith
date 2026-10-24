@@ -1,0 +1,26 @@
+# helper module for leak_result_forward_callee: result-forwarding callees in
+# another module, whose bodies the caller's emitter does not walk.
+
+## hand back the result parameter itself.
+pub fn fwd(x: String!) -> String!:
+    return x
+
+## hand back a local bound straight from the parameter.
+pub fn fwd_alias(x: String!) -> String!:
+    y := x
+    return y
+
+## hand back the parameter through a match binding.
+pub fn fwd_match(x: String!) -> String!:
+    match x:
+        v => v
+
+## hand back the parameter through another forwarder in this module.
+pub fn fwd_two(x: String!) -> String!:
+    return fwd(x)
+
+## read the flag in place and keep nothing.
+pub fn peek(x: String!) -> Int:
+    if x.is_err:
+        return 0
+    return 1

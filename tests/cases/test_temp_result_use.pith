@@ -1,0 +1,74 @@
+# values read straight off an owned temporary — a method or field on a catch,
+# a try, a parenthesized call, a field chain, or a slot of a fresh result box —
+# must come out right while the temporary is released after the read.
+
+struct Rec:
+    pub name: String
+    pub n: Int
+
+struct Outer:
+    pub inner: Rec
+    pub tag: String
+
+fn parts_of(s: String) -> List[String]!:
+    if s.len() == 0:
+        fail "empty"
+    return s.split("/")
+
+fn rec_of(i: Int) -> Rec!:
+    if i < 0:
+        fail "negative " + i.to_string()
+    return Rec("rec-" + i.to_string(), i)
+
+fn outer_of(i: Int) -> Outer:
+    return Outer(Rec("in-" + i.to_string(), i), "tag-" + i.to_string())
+
+fn pair_of(i: Int) -> (Rec, String):
+    return (Rec("pr-" + i.to_string(), i), "ps-" + i.to_string())
+
+fn int_of(i: Int) -> Int!:
+    if i < 0:
+        fail "bad " + i.to_string()
+    return i * 2
+
+fn try_name(i: Int) -> String!:
+    return rec_of(i)!.name
+
+fn try_grouped(i: Int) -> Int!:
+    return (rec_of(i)!).n
+
+fn main():
+    print("{(parts_of("/a/b/c") catch []).len()}")
+    print("{(parts_of("") catch []).len()}")
+    print((parts_of("x/y") catch []).first().unwrap_or("none"))
+    print((parts_of("") catch []).first().unwrap_or("none"))
+    print((parts_of("p/q") catch ["fb"]).join(","))
+    print((parts_of("") catch ["fb"]).join(","))
+    print((rec_of(3) catch Rec("fb", 0)).name)
+    print((rec_of(0 - 3) catch Rec("fb", 0)).name)
+    print("{(rec_of(4) catch Rec("fb", 0)).n}")
+    print(rec_of(5).ok.name)
+    print("{rec_of(6).ok.n}")
+    print((rec_of(7).ok).name)
+    print(rec_of(0 - 8).err)
+    print("{rec_of(9).is_ok}")
+    print("{rec_of(0 - 9).is_err}")
+    kept := rec_of(10).ok
+    print(kept.name)
+    print(outer_of(11).inner.name)
+    print((outer_of(12)).tag)
+    print(try_name(13) catch "fail")
+    print(try_name(0 - 13) catch "fail")
+    print("{try_grouped(14) catch 0}")
+    mut x := Rec("a", 1)
+    x = rec_of(15) catch Rec("fb", 0)
+    print(x.name)
+    x = rec_of(0 - 16) catch Rec("fb", 0)
+    print(x.name)
+    print(pair_of(17).0.name)
+    print(pair_of(18).1)
+    held := pair_of(19).0
+    print(held.name)
+    print("{int_of(20).ok}")
+    print(int_of(0 - 21).err)
+    print("{int_of(0 - 22).is_err}")

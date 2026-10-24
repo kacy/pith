@@ -44,7 +44,7 @@ pub static PERF_REACTOR_WAITS: AtomicUsize = AtomicUsize::new(0);
 // green wakes of parked tasks, by where the waker sat relative to the task's
 // worker: the same worker (a userspace handoff), a different worker (a
 // cross-thread enqueue and, if that worker is parked, a futex), or no worker
-// at all (the reactor thread or main). MIGRATIONS counts the cross-worker
+// at all (main or a blocking-pool thread). MIGRATIONS counts the cross-worker
 // wakes that moved the task to the waker's worker (`PITH_GREEN_MIGRATE=1`).
 pub static PERF_GREEN_WAKES_SAME: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_GREEN_WAKES_CROSS: AtomicUsize = AtomicUsize::new(0);

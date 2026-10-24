@@ -169,6 +169,16 @@ above); Pith is the stable arm. For a number that does not move with the
 host, use `bench/http_seq_latency.py`. The memory column is trustworthy only
 over a long window: run at least 60 seconds before calling an RSS line flat.
 
+On 2026-10-23 the same benchmarks ran on a 32-thread Ryzen 9 9950X, and the
+green server got slower as it got more cores. At 32 workers, the default on
+that machine, `wrk -t 8 -c 256` read 36k req/s for Pith against 140k at 4
+workers and 607k for Go. Three global locks and the scheduler's wake path
+caused it; "scaling to 32 hardware threads" below has the details. After the
+fixes the same run reads 884k req/s for Pith (p99 1.7 ms) against 615k for Go.
+The 60-second `http_bench.sh` run above reads 275k for Pith against 387k for
+Go, with the same ~2.6 bytes/request of RSS growth. `wrk` shares the machine's
+cores with the server in both runs, so neither figure is a ceiling.
+
 ## catalog service benchmark
 
 there is also a more realistic in-memory microservice benchmark:
@@ -1020,3 +1030,66 @@ Current standing and the optimization history live in
 `docs/performance.md`. The decoder has been through three optimization
 passes and the encoder one, so the encode column still has the more
 obvious headroom — the match finder is now its largest cost.
+
+## scaling to 32 hardware threads (2026-10-23)
+
+Every figure above this section came from a two-core box. On a 32-thread
+Ryzen 9 9950X the green backend starts 32 workers by default, and several
+benchmarks ran slower than they did with 4. These are the medians from one
+script, run the same way against `main` before and after the scaling fixes:
+
+| benchmark (32 workers unless noted) | before | after |
+|---|---:|---:|
+| `http_server`, `wrk -t 8 -c 256` | 36k req/s, p99 326 ms | 884k req/s, p99 1.7 ms |
+| `http_server_mt`, same load | 36k req/s | 876k req/s |
+| `web_hello`, same load | 30k req/s | 716k req/s |
+| `http_server_go`, same load | 607k req/s | 615k req/s |
+| `green_fanout 200000` | 9,484 ms | 146 ms |
+| `green_fanout 200000`, 1 worker | 86-319 ms | 94-361 ms |
+| `task_pingpong` | 538 ms | 57 ms |
+| `task_pingpong_trials 200 20000`, pairs split | 96% | 2% |
+| `chan_fanout 1000000` | 107-129 ms | 93-109 ms |
+| `cpu_parallel_sync 200 200000` | 269-380 ms | 351-380 ms |
+
+The single-threaded benchmarks (event ledger, std pipeline, catalog
+workload, generic sort, string buffer, zstd) did not move. `green_fanout`
+and `chan_fanout` swing by 2x or more between runs on this machine, so their
+rows are ranges or medians of interleaved runs, not single readings.
+
+Four problems caused the slowdown, and each fix was measured on its own:
+
+- A fresh spawn woke every worker. One took the task and the other 31
+  scanned all 32 queues under their locks and parked again, which cost about
+  28 park/wake round trips per spawned task. The scheduler now wakes a
+  single searching worker, which hands the search on when more work is
+  queued (Go's spinning-worker rule), and idle workers read queue lengths
+  from atomics instead of locking every queue.
+- Every list and map allocation and free took one global lock in the
+  runtime's handle registry. Sharding it 64 ways raised HTTP at 4 workers
+  from 141k to 350k req/s.
+- Every buffered read and write in `std.io` took one process-wide mutex,
+  although the state it guarded is per task. With it removed and the old
+  scheduler kept, HTTP at 32 workers reached 272k req/s on 6 cores, capped
+  by the next item.
+- One reactor thread served every socket, behind one registry lock that
+  every wait took. Each worker now has its own epoll poller and parks in it,
+  so a socket that becomes ready wakes the worker that owns its task.
+
+With only the two lock fixes, HTTP at 32 workers reads 272k req/s; with only
+the scheduler and poller changes, 57k.
+
+To check a change for this kind of regression, sweep the worker count. A
+benchmark that gets slower as workers are added has a shared bottleneck:
+
+```
+for w in 1 4 8 16 32; do PITH_GREEN_WORKERS=$w ./bench/green_fanout 200000; done
+PITH_GREEN_STATS=1 ./bench/green_fanout 50000   # worker-parks should be near the task count
+```
+
+One known gap remains. A task still pins to the worker that first runs it,
+so connections land on whichever workers are awake when they arrive: with 32
+connections on 32 workers, 13 workers did all the work. Letting idle
+workers take part of a busy worker's pinned backlog evened the spread but
+did not raise throughput here, because `wrk` ran on the same machine and
+used the cores the idle workers would have had. It needs a separate client
+machine to measure.

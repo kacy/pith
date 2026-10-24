@@ -1,8 +1,9 @@
 //! stand-in for the epoll reactor on platforms without epoll (macOS, the BSDs).
 //!
 //! the real reactor (`netpoll`) is built on `epoll` and `eventfd`, which are
-//! linux-only. this module presents the same two entry points so `network.rs`
-//! stays platform-agnostic — `lib.rs` picks one or the other at compile time.
+//! linux-only. this module presents the same entry points so `network.rs` and
+//! the green scheduler stay platform-agnostic — `lib.rs` picks one or the other
+//! at compile time.
 //!
 //! the tradeoff: there is no reactor here, so a green task that waits on a
 //! socket blocks its worker OS thread on `poll` for the duration of the wait,
@@ -17,7 +18,58 @@
 //! anyone who wants it. the fix is a kqueue reactor behind these same two
 //! functions; until then, ship green-thread workloads on linux.
 
+use crate::concurrency::green;
 use std::os::unix::io::RawFd;
+use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::Duration;
+
+/// one park spot per green worker: a pending-notify flag and the condvar the
+/// worker waits on. the flag outlives a notify that lands before the wait, so
+/// none is lost.
+struct Park {
+    notified: Mutex<bool>,
+    cv: Condvar,
+}
+
+static PARKS: OnceLock<Vec<Park>> = OnceLock::new();
+
+fn park_spot(index: usize) -> &'static Park {
+    &PARKS.get_or_init(|| {
+        (0..green::pool_size())
+            .map(|_| Park {
+                notified: Mutex::new(false),
+                cv: Condvar::new(),
+            })
+            .collect()
+    })[index]
+}
+
+/// wake worker `index` out of `idle_wait`.
+pub(crate) fn notify(index: usize) {
+    let park = park_spot(index);
+    *park.notified.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    park.cv.notify_one();
+}
+
+/// no sockets to poll here: a socket wait holds its worker (see the module
+/// comment), so nothing is ever ready to wake.
+pub(crate) fn poll_ready(_index: usize) -> bool {
+    false
+}
+
+/// park worker `index` until `notify` or `timeout`. returns true when the wait
+/// ran out without a notify.
+pub(crate) fn idle_wait(index: usize, timeout: Duration) -> bool {
+    let park = park_spot(index);
+    let guard = park.notified.lock().unwrap_or_else(|p| p.into_inner());
+    let (mut notified, _) = park
+        .cv
+        .wait_timeout_while(guard, timeout, |n| !*n)
+        .unwrap_or_else(|p| p.into_inner());
+    let was = *notified;
+    *notified = false;
+    !was
+}
 
 /// block until `fd` is ready for `read`/write, it times out, or an error is
 /// detected. returns the tri-state readiness contract: `1` ready, `0`

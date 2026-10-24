@@ -353,14 +353,17 @@ worker threads (`available_parallelism()` by default, `PITH_GREEN_WORKERS=n`
 to pin the count). channel, mutex, waitgroup, semaphore, and await operations
 that would block yield to the scheduler instead of parking their worker, so a
 handoff between two tasks on the same worker is a userspace switch with no
-kernel involved. socket i/o goes through an epoll reactor: a read or write
-that would block parks the task on the reactor and frees the worker to run
-something else, so the whole net stack — raw tcp, tls, http/2, grpc — yields
-the same way without any code of its own. sleeping parks there too: a
-`time.delay` from inside a task registers a timer on the reactor's deadline
+kernel involved. socket i/o goes through epoll, with one poller per worker: a
+read or write that would block registers the socket with the poller of the
+worker it runs on, parks the task, and frees the worker to run something else,
+so the whole net stack — raw tcp, tls, http/2, grpc — yields the same way
+without any code of its own. a worker that runs out of work parks in its own
+`epoll_wait`, so a socket becoming ready wakes the worker that owns the task
+directly, with no reactor thread in between. sleeping parks there too: a
+`time.delay` from inside a task registers a timer on its worker's deadline
 heap instead of blocking the worker, so a task sleeping out a backoff — or a
-`select` idling between probes — costs nothing but its own time. that reactor
-is also why the default is linux-only; see "which backend to use".
+`select` idling between probes — costs nothing but its own time. epoll is also
+why the default is linux-only; see "which backend to use".
 
 where a task runs is decided once, by default. a task pins to the worker that
 first runs it and stays there. that makes the placement a pair of communicating

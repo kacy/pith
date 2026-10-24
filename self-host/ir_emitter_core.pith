@@ -157,6 +157,15 @@ mut ir_tuple_borrow_walk_active: List[String] := []
 # nodes whose value the callee returns (see ir_tuple_call_arg_is_borrow).
 mut ir_tuple_walk_pair_callee := false
 mut ir_tuple_walk_pair_returns: List[Int] := []
+# the result and optional parameters the walk proved borrowed, judged in the
+# declaring module before any body is emitted (ir_record_borrow_params), for
+# the callees a caller cannot walk itself: an imported function and a method.
+# keyed "<symbol>/<position>", the value is "result" or "optional". the local
+# map holds this module's own symbols and is rebuilt per module; the exported
+# map holds the qualified symbols other modules call, and lives for the whole
+# build, since every module is emitted after the modules it imports.
+mut ir_borrow_param_local: Map[String, String] := {}
+mut ir_borrow_param_exported: Map[String, String] := {}
 
 # --- module globals collected during the prepass ---
 
@@ -1389,9 +1398,9 @@ fn ir_shell_producer_transfers(idx: Int) -> Bool:
 # the other three read.
 #
 # one whitelisted position lives in the walk instead of here: an argument of a
-# same-module call whose body provably only reads the parameter
-# (ir_tuple_call_uses_safe) — the parser wraps arguments in `arg` nodes, so
-# this per-parent check never sees the call they belong to.
+# call whose callee provably only reads the parameter (ir_tuple_call_uses_safe
+# and ir_tuple_method_call_uses_safe) — the parser wraps arguments in `arg`
+# nodes, so this per-parent check never sees the call they belong to.
 fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> Bool:
     if parent.kind == "method_call" and parent.children.len() > 0:
         recv := get_node(parent.children[0])
@@ -1495,13 +1504,14 @@ fn ir_tuple_call_uses_safe(node: Node, name: String, is_result: Bool) -> Bool:
 
 # true when handing the tracked tuple local to this call argument leaves the
 # caller the payload's sole owner at cleanup. that needs the callee's body:
-# only a function declared in the module being emitted qualifies, and its body
-# must pass this same walk for the receiving parameter — so a callee that
-# stores, returns, sends, or captures the parameter (any use the whitelist
-# does not cover) answers "not safe", and the local keeps shell-only cleanup.
-# everything unresolvable stays excluded the same way: an imported callee
-# (its body may be checked against another module's names, so it is not
-# walked), a struct or enum construction (stores every argument), a builtin
+# a function declared in the module being emitted has its body walked here
+# for the receiving parameter, and an imported one is answered by the record
+# its own module made with the same walk (ir_record_borrow_params), so a
+# callee that stores, returns, sends, or captures the parameter (any use the
+# whitelist does not cover) answers "not safe", and the local keeps
+# shell-only cleanup. everything unresolvable stays excluded the same way:
+# a named argument to an imported callee (the record is by position), a
+# struct or enum construction (stores every argument), a builtin
 # or closure-typed callee (no declaration to read), a `mut`/`ref` parameter,
 # and a recursive chain already being walked. erring that way keeps the leak
 # the cascade has always tolerated and can never free a live payload.
@@ -1513,10 +1523,15 @@ fn ir_tuple_call_uses_safe(node: Node, name: String, is_result: Bool) -> Bool:
 # subject always retains), so the caller stays the shell's sole owner. the
 # walk's `is_result` gate keeps `catch` and `!` result-only; unwrap_or is
 # open for both.
+#
+# an imported body is not walked from here because it names things the way
+# its own module does, and that module was emitted before this one.
 fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_result: Bool) -> Bool:
     callee := ir_resolve_static_callee(node.children[0])
-    if callee.imported or callee.name.len() == 0:
+    if callee.name.len() == 0:
         return false
+    if callee.imported:
+        return arg_name.len() == 0 and ir_borrow_param_recorded(callee.name, arg_pos, is_result)
     if ir_struct_names.contains_key(callee.name) or ir_boxed_enums.contains_key(callee.name):
         return false
     decl_idx := ir_tuple_walk_fn_decl(callee.name)
@@ -1528,13 +1543,19 @@ fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_re
     body_idx := ir_tuple_walk_fn_body(decl_idx)
     if body_idx < 0:
         return false
-    walk_key := callee.name + "/" + param
+    return ir_tuple_param_walk(callee.name, body_idx, param, is_result)
+
+# whether `param` of the function `fname` (its symbol in this module) with
+# body `body_idx` passes the walk, with the register-abi knowledge below
+# when `fname` returns the pair.
+fn ir_tuple_param_walk(fname: String, body_idx: Int, param: String, is_result: Bool) -> Bool:
+    walk_key := fname + "/" + param
     if ir_tuple_borrow_walk_active.contains(walk_key):
         return false
     ir_tuple_borrow_walk_active.push(walk_key)
     saved_pair_callee := ir_tuple_walk_pair_callee
     saved_pair_returns := ir_tuple_walk_pair_returns
-    ir_tuple_walk_pair_callee = is_result and ir_result_reg_funcs.contains_key(callee.name)
+    ir_tuple_walk_pair_callee = is_result and ir_result_reg_funcs.contains_key(fname)
     ir_tuple_walk_pair_returns = []
     if ir_tuple_walk_pair_callee:
         ir_collect_pair_returns(body_idx)
@@ -1546,6 +1567,123 @@ fn ir_tuple_call_arg_is_borrow(node: Node, arg_pos: Int, arg_name: String, is_re
     ir_tuple_walk_pair_returns = saved_pair_returns
     ir_tuple_borrow_walk_active.remove(ir_tuple_borrow_walk_active.len() - 1)
     return safe
+
+# the walk's view of a method call whose receiver is not the tracked name
+# (a receiver that is the name is judged by ir_tuple_use_is_whitelisted).
+# an argument that is exactly the name is a borrow only when the call
+# resolves to a function whose module recorded that parameter as borrowed:
+# a `mod.f(x)` call through an import alias, or a method of a user struct
+# or enum. a builtin, a generic, a closure field and anything else that
+# does not resolve answers "not safe".
+fn ir_tuple_method_call_uses_safe(idx: Int, node: Node, name: String, is_result: Bool) -> Bool:
+    if not ir_tuple_uses_all_safe(node.children[0], name, is_result):
+        return false
+    mut ai := 1
+    mut sym_known := false
+    mut sym := ""
+    while ai < node.children.len():
+        an := get_node(node.children[ai])
+        expr_idx := ir_method_call_arg_expr(node, ai - 1)
+        if expr_idx >= 0:
+            en := get_node(expr_idx)
+            if en.kind == "ident" and en.value == name:
+                if an.kind == "arg" and an.value.len() > 0:
+                    return false
+                if c_argument_widens_to_optional(expr_idx):
+                    return false
+                if not sym_known:
+                    sym = ir_tuple_method_call_symbol(idx, node)
+                    sym_known = true
+                if sym.len() == 0 or not ir_borrow_param_recorded(sym, ai - 1, is_result):
+                    return false
+            elif not ir_tuple_uses_all_safe(expr_idx, name, is_result):
+                return false
+        ai = ai + 1
+    return true
+
+# the symbol a method call lowers to, for the two shapes a borrow record can
+# cover, or "". this mirrors the dispatch order of ir_emit_method_call: an
+# import alias first, then an impl method on a user type.
+fn ir_tuple_method_call_symbol(idx: Int, node: Node) -> String:
+    alias_name := ir_resolve_module_alias_method_call_name(idx)
+    if alias_name.len() > 0:
+        return alias_name
+    recv_tid := c_get_expr_type(node.children[0])
+    if recv_tid < 0:
+        return ""
+    kind := get_type_info(recv_tid).kind
+    if kind != "struct" and kind != "enum":
+        return ""
+    mname := ir_plain_method_name(node.value)
+    obj_type := ir_method_receiver_type(node)
+    if ir_lookup_specialized_method(obj_type, mname).len() > 0:
+        return ""
+    impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, mname)
+    if impl_name.len() == 0 or ir_is_generic_method_name(impl_name):
+        return ""
+    return impl_name
+
+fn ir_borrow_param_recorded(sym: String, pos: Int, is_result: Bool) -> Bool:
+    key := sym + "/" + pos.to_string()
+    mut flavor := ""
+    if ir_borrow_param_local.contains_key(key):
+        flavor = ir_borrow_param_local[key]
+    elif ir_borrow_param_exported.contains_key(key):
+        flavor = ir_borrow_param_exported[key]
+    if is_result:
+        return flavor == "result"
+    return flavor == "optional"
+
+# record which result and optional parameters of this module's functions
+# and plain methods the walk proves borrowed, before any body is emitted, so
+# a call to one from anywhere in the build can read the answer without
+# walking a body it cannot name things in. generic functions and methods of
+# generic types are left out: their bodies re-emit per specialization under
+# other symbols, and a call to one finds no record. a callee whose own
+# record is not made yet when the walk reaches it answers "not safe", which
+# keeps the cascade off for that argument.
+fn ir_record_borrow_params(root_idx: Int):
+    ir_borrow_param_local = {}
+    saved_impl_type := ir_current_impl_type
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if ir_is_fn_decl_kind(node.kind):
+            if not ir_has_generic_params(node):
+                ir_current_impl_type = ""
+                ir_record_fn_borrow_params(item_idx, node.value)
+        elif node.kind == "impl_decl":
+            impl_type := ir_impl_identity_type(node, ir_current_module_path)
+            if impl_type.len() > 0 and not impl_type.contains("[") and not has_generic_declaration(impl_type):
+                ir_current_impl_type = impl_type
+                for child in node.children:
+                    method_idx := ir_unwrap_pub_child(child)
+                    method_node := get_node(method_idx)
+                    if method_node.kind == "fn_decl" and not ir_has_generic_params(method_node):
+                        ir_record_fn_borrow_params(method_idx, impl_type + "_" + method_node.value)
+    ir_current_impl_type = saved_impl_type
+
+fn ir_record_fn_borrow_params(decl_idx: Int, sym: String):
+    body_idx := ir_tuple_walk_fn_body(decl_idx)
+    if body_idx < 0:
+        return
+    mut pos := 0
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            mut flavor := ""
+            if cn.children.len() > 0:
+                type_kind := get_node(cn.children[0]).kind
+                if type_kind == "result_type":
+                    flavor = "result"
+                elif type_kind == "optional_type":
+                    flavor = "optional"
+            if flavor.len() > 0 and cn.value.split(" ").len() == 1:
+                if ir_tuple_param_walk(sym, body_idx, cn.value, flavor == "result"):
+                    key_tail := "/" + pos.to_string()
+                    ir_borrow_param_local.insert(sym + key_tail, flavor)
+                    if ir_current_module_path.len() > 0:
+                        ir_borrow_param_exported.insert(ir_import_target_name(ir_current_module_path, sym) + key_tail, flavor)
+            pos = pos + 1
 
 # a callee on the register abi never hands its caller the box it was given:
 # a returned result leaves as its payload, which takes a count of its own
@@ -1712,6 +1850,10 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     # generic loop below would hand ir_tuple_use_is_whitelisted.
     if node.kind == "call" and node.children.len() > 0:
         return ir_tuple_call_uses_safe(node, name, is_result)
+    if node.kind == "method_call" and node.children.len() > 0:
+        recv := get_node(node.children[0])
+        if not (recv.kind == "ident" and recv.value == name):
+            return ir_tuple_method_call_uses_safe(idx, node, name, is_result)
     # a match on an OPTIONAL local reads the shell's flag, and its payload
     # binding owns its own retained count (taken at bind, tracked by the
     # prepass, released by the exit cleanup) — so the local stays the last
@@ -11610,6 +11752,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # specialized version (e.g. MapIter[FilterIter[..], ..].next calling
     # FilterIter[Range, Int].next)
     ir_preregister_all_impl_specializations(root_idx, root)
+    ir_record_borrow_params(root_idx)
     ir_emit_top_level_items(root_idx, root)
     ir_emit_generic_specializations()
     # per-instance destructors for generic structs built via a backend

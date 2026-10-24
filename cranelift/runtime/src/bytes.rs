@@ -91,7 +91,7 @@ pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
     let Some(b) = pith_bytes_ref(handle) else {
         return;
     };
-    let prev = b.rc.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    let prev = crate::runtime_core::count_release(&b.rc);
     if prev > 1 {
         return;
     }

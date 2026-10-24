@@ -198,7 +198,7 @@ unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delt
 pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     if let Some(base) = cstring_base(s) {
         crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
-        let prev = cstring_refcount(base).fetch_sub(1, std::sync::atomic::Ordering::Release);
+        let prev = count_release(cstring_refcount(base));
         cstring_watch(base, s, "release", prev as i64, -1);
         if prev == 0 {
             // an over-release means the emitter's ownership accounting is
@@ -242,6 +242,22 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
             std::alloc::dealloc(base, cstring_layout(data_len));
         }
     }
+}
+
+/// Drop one count and return the count before, like `fetch_sub(1, Release)`.
+/// A count of one belongs to the caller alone: no other owner is left to
+/// retain or release concurrently, and the acquire load orders every earlier
+/// owner's release before it. So the last release, the common case for a
+/// temporary, is a load and a plain store instead of a locked
+/// read-modify-write.
+#[inline(always)]
+pub(crate) fn count_release(count: &std::sync::atomic::AtomicU32) -> u32 {
+    use std::sync::atomic::Ordering;
+    if count.load(Ordering::Acquire) == 1 {
+        count.store(0, Ordering::Relaxed);
+        return 1;
+    }
+    count.fetch_sub(1, Ordering::Release)
 }
 
 /// Debug switch: keep freed cstrings alive and report over-releases, so an
@@ -1005,6 +1021,56 @@ mod tests {
                 .join()
                 .expect("releasing thread panicked");
 
+            assert_eq!(pith_struct_weak_load(s), 0);
+            pith_struct_weak_release(s);
+        }
+    }
+
+    #[test]
+    fn count_release_returns_the_count_before() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let count = AtomicU32::new(3);
+        assert_eq!(count_release(&count), 3);
+        assert_eq!(count_release(&count), 2);
+        assert_eq!(count_release(&count), 1);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    static DTOR_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_dtor(_ptr: i64) {
+        DTOR_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// a destructor that keeps a weak reference to the value it tears down.
+    unsafe extern "C" fn weak_taking_dtor(ptr: i64) {
+        pith_struct_weak_retain(ptr);
+        WEAK_TAKEN.store(ptr, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    static WEAK_TAKEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    #[test]
+    fn a_sole_owner_release_runs_the_destructor_once() {
+        unsafe {
+            let before = DTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+            let s = pith_struct_alloc(2);
+            pith_struct_set_dtor(s, counting_dtor as usize as i64);
+            pith_struct_release(s);
+            assert_eq!(DTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+            assert_eq!(pith_struct_strong_count(s), 0); // freed: magic scrubbed
+        }
+    }
+
+    #[test]
+    fn a_weak_reference_taken_in_the_destructor_sees_the_value_dead() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_set_dtor(s, weak_taking_dtor as usize as i64);
+            pith_struct_release(s);
+            assert_eq!(WEAK_TAKEN.load(std::sync::atomic::Ordering::SeqCst), s);
+            // the header outlives the value for the weak reference
+            assert_eq!(struct_counts(s).1, 1);
             assert_eq!(pith_struct_weak_load(s), 0);
             pith_struct_weak_release(s);
         }
@@ -2868,6 +2934,11 @@ unsafe fn struct_weak_drop(base: *mut u8) {
         return;
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    struct_free_block(base);
+}
+
+/// free a struct header whose last weak unit is gone.
+unsafe fn struct_free_block(base: *mut u8) {
     let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
     // scrub the magic so any stale pointer fails the check
     (base as *mut u32).write(0);
@@ -2960,6 +3031,17 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
         return;
     };
     let strong = struct_strong(base);
+    let weak = struct_weak(base);
+    // the last strong owner of a struct with no weak references and no place
+    // in the suspect buffer (whose entry holds a weak unit) owns the header
+    // outright: nothing else can reach it to retain, upgrade or read the dead
+    // flag, so it skips the three locked updates the shared death path makes.
+    if strong.load(std::sync::atomic::Ordering::Acquire) == 1
+        && weak.load(std::sync::atomic::Ordering::Acquire) == 1
+    {
+        struct_release_unique(ptr, base);
+        return;
+    }
     // cycle-gc suspect hook, placed before our count is given up rather than
     // in the prev > 1 arm below. the ordering is load-bearing: while we still
     // hold a strong count the header cannot be freed, so the buffered bit and
@@ -3004,6 +3086,27 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     // buffered bit survives. then drop the implicit weak unit, which frees the
     // header if no weak refs remain — for a buffered struct the suspect
     // buffer's weak count keeps the header alive past this point.
+    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, std::sync::atomic::Ordering::Release);
+    struct_weak_drop(base);
+}
+
+/// the death of a struct whose caller is its only owner, strong or weak. the
+/// strong count stays at one while the destructor runs, which is the guard
+/// count the shared path sets for it. a destructor that hands out a weak
+/// reference to the value, or lets a release buffer it, raises the weak
+/// count, and the value then dies through the shared path's tail.
+unsafe fn struct_release_unique(ptr: i64, base: *mut u8) {
+    let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
+    if dtor != 0 {
+        // panic-guard: calling a compiler-emitted struct destructor from its header slot.
+        let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
+        f(ptr);
+    }
+    crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+    if struct_weak(base).load(std::sync::atomic::Ordering::Acquire) == 1 {
+        struct_free_block(base);
+        return;
+    }
     struct_dead(base).fetch_or(STRUCT_DEAD_BIT, std::sync::atomic::Ordering::Release);
     struct_weak_drop(base);
 }

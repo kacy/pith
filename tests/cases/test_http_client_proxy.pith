@@ -1,0 +1,130 @@
+# http.Client through a proxy: a plain request goes to the proxy with an
+# absolute-form target, and an https request goes through a CONNECT tunnel
+# with tls to the origin inside it. the proxy here is a raw tcp server that
+# reports what it was asked for; for CONNECT it answers 200 and then serves
+# the tls side itself, with the localhost test certificate.
+
+import std.net.http as http
+import std.net.tls as tls
+import std.os as os
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+struct Count:
+    mut n: Int
+    mu: Mutex
+
+fn bump(count: Count):
+    count.mu.lock()
+    count.n = count.n + 1
+    count.mu.unlock()
+
+fn accepted(count: Count) -> Int:
+    count.mu.lock()
+    n := count.n
+    count.mu.unlock()
+    return n
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn read_head(fd: Int) -> String:
+    mut seen := ""
+    while seen.index_of("\r\n\r\n") < 0:
+        chunk := tcp_read(fd, 1) catch ""
+        if chunk == "":
+            return ""
+        seen = seen + chunk
+    return seen
+
+fn header_of(head: String, name: String) -> String:
+    for line in head.split("\r\n"):
+        colon := line.index_of(":")
+        if colon > 0 and line.substring(0, colon).to_lower() == name:
+            return line.substring(colon + 1, line.len()).trim()
+    return ""
+
+# a host with its port replaced, since the port a run gets varies.
+fn masked(host: String) -> String:
+    if host.starts_with("127.0.0.1:"):
+        return "127.0.0.1:<port>"
+    return host
+
+fn tunneled(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.text(200, "tls inside the tunnel, Host {req.header("Host") catch "?"}, path {req.path() catch "?"}")
+
+# a plain request is answered with what the proxy saw. a CONNECT is answered
+# 200, then the connection becomes a tls server, unless the target is
+# refused.test, which is refused with 407.
+fn proxy_conn(listener_handle: Int, fd: Int) -> Int:
+    while true:
+        head := read_head(fd)
+        if head == "":
+            break
+        line := head.split("\r\n")[0]
+        if line.starts_with("CONNECT "):
+            if line.index_of("refused.test") >= 0:
+                tcp_write(fd, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n") catch 0
+                break
+            tcp_write(fd, "HTTP/1.1 200 Connection established\r\n\r\n") catch 0
+            conn := tls.handshake(tls.listener_from_handle(listener_handle), fd) catch tls.Conn(0)
+            if conn.handle != 0:
+                http.serve_connection_tls(conn, tunneled) catch 0
+                conn.close()
+            return 0
+        body := "proxy saw [{line}] Host [{masked(header_of(head, "host"))}]"
+        tcp_write(fd, "HTTP/1.1 200 OK\r\nContent-Length: {body.len()}\r\n\r\n{body}") catch 0
+    tcp_close(fd)
+    return 0
+
+fn proxy_loop(listener: tls.Listener, count: Count) -> Int:
+    handle := listener.handle
+    while true:
+        fd := tls.accept_socket(listener) catch 0
+        if fd > 0:
+            bump(count)
+            spawn proxy_conn(handle, fd)
+    return 0
+
+fn show(resp: http.HttpResponse!) -> String:
+    if resp.is_err:
+        return "error: " + resp.err
+    return "{resp.ok.status} {resp.ok.body_text() catch "?"}"
+
+fn main() -> String!:
+    count := Count(0, Mutex())
+    port := choose_port(21950)!
+    server_tls := tls.server_config(CERT_PATH, KEY_PATH)!
+    listener := tls.listen("127.0.0.1", port, server_tls)!
+    spawn proxy_loop(listener, count)
+    proxy := "http://127.0.0.1:{port}"
+
+    c := http.client().with_proxy(proxy)
+    print("plain through the proxy: " + show(c.get("http://example.test/path?q=1")))
+    print("another origin, same proxy: " + show(c.get("http://other.test:8080/")))
+    print("proxy connections so far: {accepted(count)}")
+
+    ca := tls.client_config_with_ca_file(CA_PATH)!
+    secure := http.client().with_proxy(proxy).with_tls_config(ca)
+    print("https through a CONNECT tunnel: " + show(secure.get("https://localhost/secure")))
+    print("again, on the pooled tunnel: " + show(secure.get("https://localhost/again")))
+    print("proxy connections so far: {accepted(count)}")
+    print("CONNECT refused: " + show(secure.get("https://refused.test/")))
+
+    # the environment's proxy, with the rules net/http applies to it
+    os.set_env("HTTP_PROXY", proxy)
+    os.set_env("NO_PROXY", "skipped.test")
+    from_env := http.client().with_env_proxy(true)
+    print("HTTP_PROXY: " + show(from_env.get("http://example.test/from-env")))
+    print("HTTP_PROXY, client without with_env_proxy: " + show(http.client().with_dial_timeout(500).get("http://127.0.0.1:{port}/direct")))
+    print("HTTP_PROXY, loopback origin goes direct: " + show(from_env.get("http://127.0.0.1:{port}/direct")))
+    return ""

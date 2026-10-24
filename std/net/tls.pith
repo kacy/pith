@@ -3571,6 +3571,14 @@ impl Conn:
     fn negotiated_protocol() -> String:
         return self.state().negotiated_protocol
 
+    # the tcp connection under the session, for socket-level settings such as
+    # tcp.set_read_deadline. 0 for a conn that is not open. reading or writing
+    # it directly would corrupt the session.
+    fn socket() -> Int:
+        if native_conn_has(self.handle):
+            return native_conn_get(self.handle).fd
+        return 0
+
     fn did_resume() -> Bool:
         return self.state().did_resume
 

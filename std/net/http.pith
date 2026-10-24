@@ -49,8 +49,8 @@ HTTP_FILE_STREAM_CHUNK_SIZE := 4096
 # request-size limits for the http/1.1 server paths (plaintext and tls). they
 # bound how much one request can make the server buffer, so a client cannot
 # exhaust memory with an endless head (slowloris) or a declared-enormous body
-# (a content-length DoS). these are conservative fixed defaults; a later revision
-# may make them per-server configurable.
+# (a content-length DoS). they are the defaults of a ServerConfig, which can
+# raise or lower them per server.
 #   * MAX_HEADER_BYTES caps the request head — the request line plus header fields.
 #   * MAX_REQUEST_BODY caps the request body, whether it is declared by
 #     content-length or streamed as chunked. shared with the http/2 server so both
@@ -1239,8 +1239,6 @@ fn parse_request_head(raw: Bytes, server: Bool) -> RequestHead!:
             fail bad_request("chunked must be the final transfer coding, applied once")
         if te_other:
             fail NOT_IMPLEMENTED_PREFIX + "unsupported transfer coding"
-    if content_length > MAX_REQUEST_BODY:
-        fail BODY_LIMIT_MESSAGE
     if content_length < 0:
         content_length = 0
     return RequestHead(head, method_end, target_end, path_start, path_end, query_start, authority_start, authority_end, minor, content_length, te_seen, expect, connection_closes(minor == 0, has_close, has_keep_alive))
@@ -1539,16 +1537,30 @@ fn transfer_encoding_is_chunked(te_value: String) -> Bool:
 # where a request or chunked body is read from: a buffered reader, or a tls
 # conn's own byte i/o. the plaintext and tls paths share one head reader, one
 # parser and one chunked decoder over it; only these few reads differ.
+#
+# `socket` is the tcp connection underneath, which a server sets its deadlines
+# on, or 0 when there is none (an in-memory reader, or a client read).
 struct ByteSource:
     reader: BufferedBytesReader
     conn: tls.Conn
     use_tls: Bool
+    socket: Int
 
 fn buffered_source(reader: BufferedBytesReader) -> ByteSource:
-    return ByteSource(reader, tls.Conn(0), false)
+    return ByteSource(reader, tls.Conn(0), false, 0)
 
 fn tls_source(conn: tls.Conn) -> ByteSource:
-    return ByteSource(BufferedBytesReader(0), conn, true)
+    return ByteSource(BufferedBytesReader(0), conn, true, 0)
+
+# how many bytes of the next request are available, reading once when none
+# are buffered yet, so it returns when the first byte arrives. 0 means end of
+# stream.
+fn source_wait_bytes(src: ByteSource) -> Int!:
+    if src.use_tls:
+        chunk := src.conn.read_bytes(TLS_READ_CHUNK)!
+        src.conn.unread_bytes(chunk)
+        return chunk.len()
+    return src.reader.wait_bytes()
 
 # the next line through its LF, at most `cap` bytes before it. at end of stream
 # it is whatever arrived, which then has no LF.
@@ -2508,6 +2520,128 @@ pub fn redirect(url: String) -> String:
 # Server Helpers
 # ===============================================================
 
+# how an http/1.1 server connection behaves, modeled on net/http's Server
+# fields. a timeout of 0 means none. server_config() gives the defaults the
+# plain entry points (serve_connection_fd, serve_connection_tls, ...) use:
+# no timeouts, the MAX_HEADER_BYTES and MAX_REQUEST_BODY limits, keep-alive
+# on, and no cap on requests per connection. std.web starts from
+# web.server_config() instead, which keeps read timeouts on.
+#
+#   * read_header_timeout_ms: how long the request head may take. on the
+#     first request it counts from when the connection was served, the wait
+#     for the first byte included; on a later one, from its first byte. this
+#     is what stops a slowloris client that sends a byte at a time. when it
+#     is 0, read_timeout_ms applies.
+#   * read_timeout_ms: how long the head and the body together may take,
+#     counted from the same point.
+#   * write_timeout_ms: how long the response may take, counted from when the
+#     request head has been read, so it covers the handler as well.
+#   * idle_timeout_ms: how long a keep-alive connection may wait for its next
+#     request to start. when it is 0, read_timeout_ms applies.
+#   * max_header_bytes, max_body_bytes: the request-size limits, answered with
+#     431 and 413.
+#   * keep_alives: false closes the connection after every response.
+#   * max_requests_per_conn: close the connection after this many responses,
+#     0 for no limit.
+#
+# a request that runs out of time once its first byte has arrived is answered
+# with 408 and the connection closes. a connection that times out with
+# nothing sent, or that runs out of write time, is closed with no answer.
+pub struct ServerConfig:
+    pub read_header_timeout_ms: Int
+    pub read_timeout_ms: Int
+    pub write_timeout_ms: Int
+    pub idle_timeout_ms: Int
+    pub max_header_bytes: Int
+    pub max_body_bytes: Int
+    pub keep_alives: Bool
+    pub max_requests_per_conn: Int
+
+# the default server configuration (see ServerConfig).
+pub fn server_config() -> ServerConfig:
+    return ServerConfig(0, 0, 0, 0, MAX_HEADER_BYTES, MAX_REQUEST_BODY, true, 0)
+
+impl ServerConfig:
+    fn with_read_header_timeout(ms: Int) -> ServerConfig:
+        return ServerConfig(ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+
+    fn with_read_timeout(ms: Int) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+
+    fn with_write_timeout(ms: Int) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+
+    fn with_idle_timeout(ms: Int) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+
+    fn with_max_header_bytes(limit: Int) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, limit, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+
+    fn with_max_body_bytes(limit: Int) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, limit, self.keep_alives, self.max_requests_per_conn)
+
+    fn with_keep_alives(enabled: Bool) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, enabled, self.max_requests_per_conn)
+
+    fn with_max_requests_per_conn(limit: Int) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, limit)
+
+    # the head's time limit after the read_timeout_ms fallback.
+    fn header_timeout() -> Int:
+        if self.read_header_timeout_ms > 0:
+            return self.read_header_timeout_ms
+        return self.read_timeout_ms
+
+    # the idle wait's time limit after the read_timeout_ms fallback.
+    fn idle_timeout() -> Int:
+        if self.idle_timeout_ms > 0:
+            return self.idle_timeout_ms
+        return self.read_timeout_ms
+
+    # whether any read on the connection has a time limit.
+    fn times_reads() -> Bool:
+        return self.read_header_timeout_ms > 0 or self.read_timeout_ms > 0 or self.idle_timeout_ms > 0
+
+# one http/1.1 server connection: where it reads and writes, the handler, its
+# config, and when it was first served on the mono_millis clock.
+struct ServerConn:
+    src: ByteSource
+    writer: BufferedBytesWriter
+    handler: fn(HttpRequestBytes) -> HttpResponse
+    config: ServerConfig
+    opened_ms: Int
+
+fn server_conn(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse, config: ServerConfig) -> ServerConn:
+    mut opened := 0
+    if config.times_reads():
+        opened = time_mod.mono_millis()
+    return ServerConn(src, writer, handler, config, opened)
+
+# set the read deadline of a server connection to `due` on the mono_millis
+# clock, or clear it when `due` is 0. a due time already past still waits 1
+# ms, since 0 would mean no deadline at all.
+fn arm_read_deadline_at(src: ByteSource, due: Int):
+    if due <= 0:
+        tcp_set_read_deadline(src.socket, 0)
+        return
+    left := due - time_mod.mono_millis()
+    if left < 1:
+        tcp_set_read_deadline(src.socket, 1)
+        return
+    tcp_set_read_deadline(src.socket, left)
+
+# the read deadline `ms` from now, or none for 0, and when it falls due on the
+# mono_millis clock (0 for none). the clock is read first, so the runtime's
+# deadline is never earlier than the returned time: a read that failed on it
+# always finds mono_millis() at or past that time.
+fn arm_read_deadline(src: ByteSource, ms: Int) -> Int:
+    if ms <= 0:
+        tcp_set_read_deadline(src.socket, 0)
+        return 0
+    due := time_mod.mono_millis() + ms
+    tcp_set_read_deadline(src.socket, ms)
+    return due
+
 # the response to a request the server refused while reading it (see
 # request_error_status): the status, its reason phrase as the body, and a
 # closed connection, so nothing left unread is taken for the next request.
@@ -2528,12 +2662,14 @@ fn source_write(src: ByteSource, writer: BufferedBytesWriter, data: Bytes) -> In
 fn server_response_bytes(response: HttpResponse, connection: String, head_request: Bool) -> Bytes!:
     return response_bytes(response, connection, current_date_field(), head_request)
 
-# answer a request-reading failure with its status, when it has one, and
-# return the bytes written.
-fn send_request_error(src: ByteSource, writer: BufferedBytesWriter, message: String) -> Int!:
-    status := request_error_status(message)
+# answer a request-reading failure with `status`, when it is not 0, and return
+# the bytes written. the write gets its own write deadline, since one armed for
+# an earlier request may have run out.
+fn send_request_error(src: ByteSource, writer: BufferedBytesWriter, status: Int, write_timeout_ms: Int) -> Int!:
     if status == 0:
         return 0
+    if write_timeout_ms > 0:
+        tcp_set_write_deadline(src.socket, write_timeout_ms)
     return source_write(src, writer, server_response_bytes(request_error_response(status), "close", false)!)
 
 fn request_prefers_close(req: HttpRequestBytes) -> Bool:
@@ -2586,49 +2722,54 @@ fn find_request_head_end_from(raw: Bytes, start: Int) -> Int:
 # reported as the head limit. the cap bounds an endless head (slowloris, memory
 # exhaustion). a head whose end sits inside the chunk that crossed the cap is
 # refused too.
-fn read_head_once(src: ByteSource) -> Bytes!:
-    head := source_read_head(src, MAX_HEADER_BYTES)
+fn read_head_once(src: ByteSource, cap: Int) -> Bytes!:
+    head := source_read_head(src, cap)
     if head.is_err:
         # any other failure, a dropped socket or a deadline, passes through
         if io.is_read_until_limit_error(head.err):
             fail HEADER_LIMIT_MESSAGE
         fail head.err
-    if head.ok.len() > MAX_HEADER_BYTES:
+    if head.ok.len() > cap:
         fail HEADER_LIMIT_MESSAGE
     return head.ok
 
-# the next request head. empty lines before it are skipped (rfc 9112 2.2), up
-# to the head limit; a head is read in one call either way, since the readers
-# find its end in what they already hold and keep the rest for the body. an
-# empty result means the peer closed with nothing pending.
-fn read_request_head(src: ByteSource) -> Bytes!:
-    mut head := read_head_once(src)!
+# the next request head, at most `cap` bytes. empty lines before it are
+# skipped (rfc 9112 2.2), up to the same cap; a head is read in one call
+# either way, since the readers find its end in what they already hold and
+# keep the rest for the body. an empty result means the peer closed with
+# nothing pending.
+fn read_request_head(src: ByteSource, cap: Int) -> Bytes!:
+    mut head := read_head_once(src, cap)!
     mut skipped := 0
     while only_empty_lines(head):
         skipped = skipped + head.len()
-        if skipped > MAX_HEADER_BYTES:
+        if skipped > cap:
             fail HEADER_LIMIT_MESSAGE
-        head = read_head_once(src)!
+        head = read_head_once(src, cap)!
     return head
 
 # read one request: the head, checked by parse_request_head, then the body it
 # frames. the stream is left at the start of the next request, so a keep-alive
 # loop never desyncs; on a failure the caller closes the connection.
 fn read_request_from(src: ByteSource) -> HttpRequestBytes!:
-    raw := read_request_head(src)!
+    raw := read_request_head(src, MAX_HEADER_BYTES)!
     if raw.is_empty():
         return empty_request()
     parsed := parse_request_head(raw, false)!
-    return request_from_head(parsed, read_request_body(src, parsed)!)
+    return request_from_head(parsed, read_request_body(src, parsed, MAX_REQUEST_BODY)!)
 
-# the body a checked head frames.
-fn read_request_body(src: ByteSource, parsed: RequestHead) -> Bytes!:
-    if parsed.chunked:
-        return read_chunked_from(src, MAX_REQUEST_BODY)
-    # refuse an over-large declared length before allocating for it, so a
-    # hostile "Content-Length: 10000000000" cannot force a giant allocation
-    if parsed.content_length > MAX_REQUEST_BODY:
+# refuse a declared length over `limit` before anything allocates for it, so
+# a hostile "Content-Length: 10000000000" cannot force a giant allocation.
+fn check_declared_length(parsed: RequestHead, limit: Int) -> Bool!:
+    if parsed.content_length > limit:
         fail BODY_LIMIT_MESSAGE
+    return true
+
+# the body a checked head frames, at most `limit` bytes.
+fn read_request_body(src: ByteSource, parsed: RequestHead, limit: Int) -> Bytes!:
+    if parsed.chunked:
+        return read_chunked_from(src, limit)
+    check_declared_length(parsed, limit)!
     if parsed.content_length == 0:
         return bytes.empty()
     return source_read_exact(src, parsed.content_length)
@@ -2642,7 +2783,13 @@ struct ServerRequest:
 CONTINUE_RESPONSE := "HTTP/1.1 100 Continue\r\n\r\n"
 
 # read one request as the server does: the head, checked with the Host rules,
-# then its body.
+# then its body, within the connection's limits. `body_due` is when the body
+# must have arrived on the mono_millis clock, or 0 for no deadline; the read
+# deadline is moved to it once the head is in, when a body follows.
+# `rearm` says whether a read deadline is armed at all, so a connection that
+# has none skips the call. the write deadline starts once the head is in, as
+# net/http's does, so it covers the 100 Continue, the handler and the
+# response.
 #
 # an http/1.1 request that expects 100-continue (rfc 9110 10.1.1) is sent the
 # interim response just before its body is read. the body is read before the
@@ -2651,25 +2798,35 @@ CONTINUE_RESPONSE := "HTTP/1.1 100 Continue\r\n\r\n"
 # 417 before the body is read, and the connection then closes, so the unread
 # body is never taken for the next request. an http/1.0 request's
 # expectations are ignored.
-fn read_server_request(src: ByteSource, writer: BufferedBytesWriter) -> ServerRequest!:
-    raw := read_request_head(src)!
+fn read_server_request(conn: ServerConn, body_due: Int, rearm: Bool) -> ServerRequest!:
+    src := conn.src
+    config := conn.config
+    raw := read_request_head(src, config.max_header_bytes)!
     if raw.is_empty():
         return ServerRequest(empty_request(), true)
     parsed := parse_request_head(raw, true)!
+    check_declared_length(parsed, config.max_body_bytes)!
+    if config.write_timeout_ms > 0:
+        tcp_set_write_deadline(src.socket, config.write_timeout_ms)
+    has_body := parsed.chunked or parsed.content_length > 0
     if parsed.minor >= 1 and parsed.expect != EXPECT_NONE:
         if parsed.expect != EXPECT_CONTINUE:
             fail EXPECTATION_MESSAGE
-        if parsed.chunked or parsed.content_length > 0:
-            source_write(src, writer, bytes.from_string_utf8(CONTINUE_RESPONSE))!
-    return ServerRequest(request_from_head(parsed, read_request_body(src, parsed)!)!, parsed.wants_close)
+        if has_body:
+            source_write(src, conn.writer, bytes.from_string_utf8(CONTINUE_RESPONSE))!
+    if rearm and has_body:
+        arm_read_deadline_at(src, body_due)
+    return ServerRequest(request_from_head(parsed, read_request_body(src, parsed, config.max_body_bytes)!)!, parsed.wants_close)
 
-# like read_request_from, but the body goes to `writer` as it arrives, with no
-# size cap, and the returned request has an empty body.
+# like read_request_from, but the body goes to `writer` as it arrives, and the
+# returned request has an empty body. a declared length is held to
+# MAX_REQUEST_BODY; a chunked body has no cap.
 fn read_request_into(src: ByteSource, writer: BufferedBytesWriter) -> StreamedHttpRequest!:
-    raw := read_request_head(src)!
+    raw := read_request_head(src, MAX_HEADER_BYTES)!
     if raw.is_empty():
         return StreamedHttpRequest(empty_request(), 0)
     parsed := parse_request_head(raw, false)!
+    check_declared_length(parsed, MAX_REQUEST_BODY)!
     mut body_size := 0
     if parsed.chunked:
         body_size = stream_chunked_from(src, writer)!
@@ -3728,43 +3885,100 @@ struct Exchange:
 fn write_server_response(src: ByteSource, writer: BufferedBytesWriter, req: HttpRequestBytes, resp: HttpResponse, connection: String) -> Int!:
     return source_write(src, writer, server_response_bytes(resp, connection, req.method_text == "HEAD")!)
 
-# serve one request from `src`, answering through `writer` or the tls conn. a
-# request the server refuses is answered with its status, and the connection
-# closes. `persistent` is false for the entry points that serve one request:
-# they send the Connection value the handler set, or close.
-fn serve_exchange(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse, persistent: Bool) -> Exchange!:
-    got := read_server_request(src, writer)
+# wait for the next request on `conn` to start and arm its head deadline.
+# returns when the head falls due on the mono_millis clock (0 for no
+# deadline), or -1 when the connection should close without an answer: the
+# peer closed, or the wait ran out with nothing sent.
+#
+# the first request's head is due read_header_timeout_ms after the connection
+# was served, the wait for its first byte included. a later request first
+# waits up to idle_timeout_ms for a byte, then gets read_header_timeout_ms from
+# that byte, so a client that sends a byte at a time still runs out of time,
+# and one that only sits idle is closed quietly, as net/http does.
+fn await_request(conn: ServerConn, served: Int) -> Int:
+    config := conn.config
+    mut due := 0
+    if served == 0:
+        if config.header_timeout() > 0:
+            due = conn.opened_ms + config.header_timeout()
+            arm_read_deadline_at(conn.src, due)
+    else:
+        arm_read_deadline(conn.src, config.idle_timeout())
+    arrived := source_wait_bytes(conn.src) catch 0
+    if arrived <= 0:
+        return -1
+    if served > 0:
+        due = arm_read_deadline(conn.src, config.header_timeout())
+    return due
+
+# serve one request on `conn`, answering through its writer or tls conn.
+# `served` is how many requests the connection has answered before this one.
+# a request the server refuses is answered with its status, and the
+# connection closes. `persistent` is false for the entry points that serve
+# one request: they send the Connection value the handler set, or close.
+fn serve_exchange(conn: ServerConn, served: Int, persistent: Bool) -> Exchange!:
+    config := conn.config
+    src := conn.src
+    timed := config.times_reads()
+    mut head_due := 0
+    mut body_due := 0
+    if timed:
+        head_due = await_request(conn, served)
+        if head_due < 0:
+            return Exchange(0, false, "")
+        if config.read_timeout_ms > 0:
+            # read_timeout_ms counts from where the head's time started
+            mut start := time_mod.mono_millis()
+            if served == 0:
+                start = conn.opened_ms
+            body_due = start + config.read_timeout_ms
+    got := read_server_request(conn, body_due, timed)
     if got.is_err:
-        # a refused request gets its status (see request_error_status); any
-        # other read failure, a dropped socket or eof inside a request, ends
-        # the connection without an answer. either way reading stops, so
-        # nothing desyncs.
-        return Exchange(send_request_error(src, writer, got.err)!, false, got.err)
+        # a refused request gets its status (see request_error_status). a
+        # read that ran out of time gets 408, since its first byte is in by
+        # now. any other read failure, a dropped socket or eof inside a
+        # request, ends the connection without an answer. either way reading
+        # stops, so nothing desyncs.
+        mut status := request_error_status(got.err)
+        if status == 0 and timed and read_ran_out(head_due, body_due):
+            status = 408
+        return Exchange(send_request_error(src, conn.writer, status, config.write_timeout_ms)!, false, got.err)
     req := got.ok.req
     if req.head.is_empty() and req.method_text == "":
         return Exchange(0, false, "")
-    resp := run_handler(handler, req)
+    resp := run_handler(conn.handler, req)
     mut connection := ""
     if persistent:
-        connection = connection_value(got.ok.wants_close, req.version_text == "HTTP/1.0", resp)
+        last := not config.keep_alives or (config.max_requests_per_conn > 0 and served + 1 >= config.max_requests_per_conn)
+        connection = connection_value(got.ok.wants_close or last, req.version_text == "HTTP/1.0", resp)
     else:
         connection = standalone_connection(resp, "")
-    written := write_server_response(src, writer, req, resp, connection)!
+    written := write_server_response(src, conn.writer, req, resp, connection)!
     return Exchange(written, persistent and connection != "close", "")
 
-# serve requests from `src` until either side asks to close.
-fn serve_requests(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+# whether a read deadline that was armed has passed: the head's, or the
+# body's when there is one. the runtime never gives up before a deadline (see
+# arm_read_deadline), so a read that failed on one finds the clock at or past
+# it; the extra millisecond only absorbs rounding.
+fn read_ran_out(head_due: Int, body_due: Int) -> Bool:
+    now := time_mod.mono_millis() + 1
+    return (head_due > 0 and now >= head_due) or (body_due > 0 and now >= body_due)
+
+# serve requests on `conn` until either side asks to close.
+fn serve_requests(conn: ServerConn) -> Int!:
     mut total := 0
+    mut served := 0
     while true:
-        exchange := serve_exchange(src, writer, handler, true)!
+        exchange := serve_exchange(conn, served, true)!
         total = total + exchange.written
+        served = served + 1
         if not exchange.keep_open:
             return total
     return total
 
 # serve a single request and fail with the read failure, if there was one.
-fn serve_single(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
-    exchange := serve_exchange(src, writer, handler, false)!
+fn serve_single(conn: ServerConn) -> Int!:
+    exchange := serve_exchange(conn, 0, false)!
     if exchange.error != "":
         fail exchange.error
     return exchange.written
@@ -3772,11 +3986,17 @@ fn serve_single(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpRe
 # serves one request using a bytes reader, writer, and handler. a request the
 # server refuses is answered with its status before the failure is returned.
 pub fn serve_one(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
-    return serve_single(buffered_source(reader), writer, handler)
+    return serve_single(server_conn(buffered_source(reader), writer, handler, server_config()))
 
 # serves requests on one connection until either side asks to close.
 pub fn serve_connection(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
-    return serve_requests(buffered_source(reader), writer, handler)
+    return serve_connection_with(reader, writer, handler, server_config())
+
+# serve_connection with a ServerConfig. the reader has no socket under it, so
+# the config's timeouts do nothing here; its limits, keep_alives and
+# max_requests_per_conn apply.
+pub fn serve_connection_with(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse, config: ServerConfig) -> Int!:
+    return serve_requests(server_conn(buffered_source(reader), writer, handler, config))
 
 # serves one request from a client fd and closes the connection after writing the response.
 pub fn serve_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
@@ -3787,14 +4007,19 @@ pub fn serve_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
     defer tcp_close(fd)
     defer writer.free()
     defer reader.free()
-    return serve_single(buffered_source(reader), writer, handler)
+    return serve_single(server_conn(ByteSource(reader, tls.Conn(0), false, fd), writer, handler, server_config()))
 
 # serves requests from one client fd until the connection closes.
 pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
+    return serve_connection_fd_with(fd, handler, server_config())
+
+# serve_connection_fd with a ServerConfig: its timeouts are deadlines on the
+# socket, so they hold however the client spaces its bytes.
+pub fn serve_connection_fd_with(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse, config: ServerConfig) -> Int!:
     stream := io.from_fd(fd)
     reader := stream.buffered_bytes_reader_chunked(512)
     writer := stream.buffered_bytes_writer()
-    written := serve_connection(reader, writer, handler) catch 0
+    written := serve_requests(server_conn(ByteSource(reader, tls.Conn(0), false, fd), writer, handler, config)) catch 0
     # the registry entries die with the connection, not the process
     reader.free()
     writer.free()
@@ -3807,7 +4032,13 @@ pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpRespons
 # here over the same tls session, by the same loop as serve_connection, reading
 # and writing through the tls conn's own byte i/o. the caller closes the conn.
 pub fn serve_connection_tls(conn: tls.Conn, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
-    return serve_requests(tls_source(conn), BufferedBytesWriter(0), handler)
+    return serve_connection_tls_with(conn, handler, server_config())
+
+# serve_connection_tls with a ServerConfig. the deadlines go on the tcp
+# connection under the session, so they bound the tls reads and writes too.
+pub fn serve_connection_tls_with(conn: tls.Conn, handler: fn(HttpRequestBytes) -> HttpResponse, config: ServerConfig) -> Int!:
+    src := ByteSource(BufferedBytesReader(0), conn, true, conn.socket())
+    return serve_requests(server_conn(src, BufferedBytesWriter(0), handler, config))
 
 # accepts one client from a listener fd and serves exactly one request.
 pub fn serve_listener_once(listener_fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
@@ -3821,10 +4052,10 @@ pub fn serve_listener_connection(listener_fd: Int, handler: fn(HttpRequestBytes)
 pub fn serve_one_ctx(reader: BufferedBytesReader, writer: BufferedBytesWriter, handler: fn(HttpRequestBytes) -> HttpResponse, ctx: Context) -> Int!BlockingError:
     if ctx.is_cancelled():
         fail ctx_blocking_error(ctx)
-    src := buffered_source(reader)
-    got := read_server_request(src, writer)
+    conn := server_conn(buffered_source(reader), writer, handler, server_config())
+    got := read_server_request(conn, 0, false)
     if got.is_err:
-        send_request_error(src, writer, got.err) catch 0
+        send_request_error(conn.src, writer, request_error_status(got.err), 0) catch 0
         fail blocking_failed(got.err)
     req := got.ok.req
     if req.head.is_empty() and req.method_text == "":
@@ -3834,7 +4065,7 @@ pub fn serve_one_ctx(reader: BufferedBytesReader, writer: BufferedBytesWriter, h
     resp := run_handler(handler, req)
     if ctx.is_cancelled():
         fail ctx_blocking_error(ctx)
-    sent := write_server_response(src, writer, req, resp, standalone_connection(resp, ""))
+    sent := write_server_response(conn.src, writer, req, resp, standalone_connection(resp, ""))
     if sent.is_err:
         fail blocking_failed(sent.err)
     return sent.ok

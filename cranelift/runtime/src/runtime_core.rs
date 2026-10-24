@@ -917,6 +917,24 @@ mod tests {
     }
 
     #[test]
+    fn integers_format_in_decimal() {
+        unsafe {
+            for n in [0, 7, -7, 10, 99, -100, 1234567890, i64::MAX, i64::MIN] {
+                let s = pith_int_to_cstr(n);
+                let text = std::ffi::CStr::from_ptr(s).to_str().unwrap().to_owned();
+                assert_eq!(text, n.to_string());
+                assert_eq!(cstring_header_len(s), Some(text.len() as i64));
+                pith_cstring_release(s);
+            }
+            for n in [0u64, 42, u64::MAX] {
+                let s = pith_uint_to_cstr(n as i64);
+                assert_eq!(std::ffi::CStr::from_ptr(s).to_str().unwrap(), n.to_string());
+                pith_cstring_release(s);
+            }
+        }
+    }
+
+    #[test]
     fn released_cstring_fails_the_header_check() {
         unsafe {
             let s = pith_copy_bytes_to_cstring(b"x");
@@ -1242,24 +1260,23 @@ pub unsafe extern "C" fn pith_cstring_eq(a: *const i8, b: *const i8) -> i64 {
     if std::ptr::eq(a, b) {
         return 1;
     }
-
-    let mut pa = a;
-    let mut pb = b;
-    loop {
-        let ca = *pa;
-        let cb = *pb;
-
-        if ca != cb {
-            return 0;
-        }
-
-        if ca == 0 {
-            return 1;
-        }
-
-        pa = pa.add(1);
-        pb = pb.add(1);
+    // most unequal pairs differ in the first byte, which settles it before
+    // either length is taken. an empty string's first byte is its zero
+    // terminator, so this holds for empty strings too.
+    if *a != *b {
+        return 0;
     }
+    // compare by length, then bytes. a heap string's length is one header
+    // read, and a string holding a zero byte compares in full rather than
+    // stopping at the zero.
+    let la = crate::string::pith_cstring_len(a) as usize;
+    let lb = crate::string::pith_cstring_len(b) as usize;
+    if la != lb {
+        return 0;
+    }
+    let sa = std::slice::from_raw_parts(a as *const u8, la);
+    let sb = std::slice::from_raw_parts(b as *const u8, lb);
+    (sa == sb) as i64
 }
 
 #[no_mangle]

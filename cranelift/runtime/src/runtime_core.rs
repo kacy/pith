@@ -2296,16 +2296,39 @@ pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_cstr(n: i64) -> *mut i8 {
-    let s = n.to_string();
-    let len = s.len();
-    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
+    let mut buf = [0u8; 20];
+    let start = decimal_digits(n.unsigned_abs(), &mut buf);
+    if n >= 0 {
+        return pith_copy_bytes_to_cstring(&buf[start..]);
+    }
+    let digits = buf.len() - start;
+    let ptr = pith_alloc_cstring(digits + 1);
+    *(ptr as *mut u8) = b'-';
+    std::ptr::copy_nonoverlapping(buf[start..].as_ptr(), (ptr as *mut u8).add(1), digits);
+    ptr
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_uint_to_cstr(n: i64) -> *mut i8 {
-    let s = (n as u64).to_string();
-    let len = s.len();
-    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
+    let mut buf = [0u8; 20];
+    let start = decimal_digits(n as u64, &mut buf);
+    pith_copy_bytes_to_cstring(&buf[start..])
+}
+
+/// Write `n` in decimal at the end of `buf` and return the index of its
+/// first digit. Formatting into a stack buffer leaves a number's text with
+/// one allocation, the string that holds it; `to_string` built a heap
+/// `String` first and copied out of it.
+fn decimal_digits(mut n: u64, buf: &mut [u8; 20]) -> usize {
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            return i;
+        }
+    }
 }
 
 #[no_mangle]

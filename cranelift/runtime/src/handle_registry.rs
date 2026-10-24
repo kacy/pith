@@ -22,11 +22,12 @@ pub(crate) enum HandleKind {
 }
 
 /// the live handle set, split into independently locked shards. every list
-/// allocation registers here and every free unregisters, so a single lock put
-/// all of a program's threads in one queue: an http server on 32 green workers
-/// spent about 90% of its cpu in the kernel waiting on it, and served a quarter
-/// of the requests it served on 4. a handle always hashes to the same shard,
-/// so each operation still takes exactly one lock.
+/// allocation used to register here and every free unregister (only the few
+/// lists that cross a page boundary do now; see `is_list_ptr`), and a single
+/// lock put all of a program's threads in one queue: an http server on 32
+/// green workers spent about 90% of its cpu in the kernel waiting on it, and
+/// served a quarter of the requests it served on 4. a handle always hashes to
+/// the same shard, so each operation still takes exactly one lock.
 ///
 /// 256 shards rather than 64: at 64, a `std.web` server on 32 workers still
 /// had a fifth of its thread samples waiting on a shard.

@@ -1768,26 +1768,6 @@ fn parse_decimal_bytes(raw: Bytes) -> Int!:
         pos = pos + 1
     return value
 
-fn transfer_encoding_value(raw_head: Bytes) -> String:
-    return (decode_utf8(header_value_bytes(raw_head, "Transfer-Encoding")) catch "").to_lower()
-
-fn uses_chunked_transfer_encoding(raw_head: Bytes) -> Bool:
-    return transfer_encoding_is_chunked(transfer_encoding_value(raw_head))
-
-# a Transfer-Encoding is chunked only when `chunked` is its FINAL coding
-# (RFC 9112 6.1). match it as a comma-separated token, not a substring — a
-# substring test also fires on `xchunked` or a `chunked` that some other
-# coding follows, both of which must NOT be read as a chunked body.
-fn transfer_encoding_is_chunked(te_value: String) -> Bool:
-    if te_value.len() == 0:
-        return false
-    mut last := ""
-    for part in te_value.split(","):
-        trimmed := part.trim()
-        if trimmed.len() > 0:
-            last = trimmed
-    return last == "chunked"
-
 # where a request or chunked body is read from: a buffered reader, or a tls
 # conn's own byte i/o. the plaintext and tls paths share one head reader, one
 # parser and one chunked decoder over it; only these few reads differ.
@@ -1891,35 +1871,40 @@ fn chunk_size_from_line(line: Bytes) -> Int!:
     return value
 
 # true at the empty line that ends a chunked body. a trailer field before it
-# must be a well-formed field line; its value is discarded.
-fn chunk_trailer_ends(line: Bytes) -> Bool!:
+# must be a well-formed field line, and it is added to `trailers`.
+fn chunk_trailer_ends(line: Bytes, trailers: Map[String, String]) -> Bool!:
     end := chunk_line_content_end(line)!
     if end == 0:
         return true
     mut pos := 0
     while pos < end and is_tchar(line[pos]):
         pos = pos + 1
+    name_end := pos
     if pos == 0 or pos >= end or line[pos] != 58:
         fail bad_request("malformed trailer field")
     while pos < end:
         if is_ctl(line[pos]):
             fail bad_request("control character in a trailer field")
         pos = pos + 1
+    value_start := trim_ascii_start(line, name_end + 1, end)
+    value_end := trim_ascii_end(line, value_start, end)
+    name := decode_utf8(line.slice(0, name_end)) catch ""
+    trailers[name] = decode_utf8(line.slice(value_start, value_end)) catch ""
     return false
 
 # decode a chunked body (rfc 9112 7.1) from `src`, into `out`, or into `writer`
 # when `streaming` is set. `limit` caps the decoded size, 0 for no cap: the
 # request readers pass MAX_REQUEST_BODY so a chunked upload is bounded like a
-# content-length one, and the client response readers pass 0. returns the
-# decoded size.
-fn decode_chunked(src: ByteSource, out: ByteBuffer, writer: BufferedBytesWriter, streaming: Bool, limit: Int) -> Int!:
+# content-length one, and the client response readers pass 0. trailer fields
+# go into `trailers`. returns the decoded size.
+fn decode_chunked(src: ByteSource, out: ByteBuffer, writer: BufferedBytesWriter, streaming: Bool, limit: Int, trailers: Map[String, String]) -> Int!:
     mut total := 0
     while true:
         size := chunk_size_from_line(source_read_line(src, CHUNK_LINE_LIMIT)!)!
         if size == 0:
             mut done := false
             while not done:
-                done = chunk_trailer_ends(source_read_line(src, CHUNK_LINE_LIMIT)!)!
+                done = chunk_trailer_ends(source_read_line(src, CHUNK_LINE_LIMIT)!, trailers)!
             if streaming:
                 writer.flush()!
             return total
@@ -1939,34 +1924,16 @@ fn decode_chunked(src: ByteSource, out: ByteBuffer, writer: BufferedBytesWriter,
 fn read_chunked_from(src: ByteSource, limit: Int) -> Bytes!:
     out := bytes.buffer()
     errdefer out.free()
-    decode_chunked(src, out, BufferedBytesWriter(0), false, limit)!
+    decode_chunked(src, out, BufferedBytesWriter(0), false, limit, {})!
     return out.take_bytes()
 
 fn read_chunked_body(reader: BufferedBytesReader, limit: Int) -> Bytes!:
     return read_chunked_from(buffered_source(reader), limit)
 
-fn read_chunked_body_tls(conn: tls.Conn, limit: Int) -> Bytes!:
-    return read_chunked_from(tls_source(conn), limit)
-
 fn stream_chunked_from(src: ByteSource, writer: BufferedBytesWriter) -> Int!:
     out := bytes.buffer()
     defer out.free()
-    return decode_chunked(src, out, writer, true, 0)
-
-fn stream_chunked_body_from_reader(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
-    return stream_chunked_from(buffered_source(reader), writer)
-
-fn stream_chunked_body_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
-    return stream_chunked_from(tls_source(conn), writer)
-
-fn decode_chunked_body(raw: Bytes) -> Bytes!:
-    # this runs once per chunked response, so the cursor and reader must give
-    # their registry entries back or a client accumulates two per body.
-    cursor := io.bytes_reader(raw)
-    defer cursor.close()
-    reader := cursor.buffered_chunked(64)
-    defer reader.free()
-    return read_chunked_body(reader, 0)!
+    return decode_chunked(src, out, writer, true, 0, {})
 
 fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
     if count <= 0:
@@ -2026,99 +1993,6 @@ fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes, cap: Int) -> Bytes!
         seen = seen.concat(chunk)
     return seen
 
-fn read_response_head_buffered(reader: BufferedBytesReader) -> Bytes!:
-    buf := bytes.buffer_with_capacity(1024)
-    defer buf.free()
-    mut head_end := -1
-    mut scan_start := 0
-    while head_end < 0:
-        chunk := reader.read_bytes(1)!
-        if chunk.is_empty():
-            if buf.bytes().is_empty():
-                fail "empty http response"
-            break
-        buf.write(chunk)!
-        head_end = find_request_head_end_from(buf.bytes(), scan_start)
-        scan_start = buf.bytes().len() - 3
-        if scan_start < 0:
-            scan_start = 0
-    if head_end < 0:
-        fail "invalid http response"
-    return buf.bytes()
-
-fn read_response_head_tls(conn: tls.Conn) -> Bytes!:
-    buf := bytes.buffer_with_capacity(1024)
-    defer buf.free()
-    mut head_end := -1
-    mut scan_start := 0
-    while head_end < 0:
-        chunk := conn.read_bytes(1)!
-        if chunk.is_empty():
-            if buf.bytes().is_empty():
-                fail "empty http response"
-            break
-        buf.write(chunk)!
-        head_end = find_request_head_end_from(buf.bytes(), scan_start)
-        scan_start = buf.bytes().len() - 3
-        if scan_start < 0:
-            scan_start = 0
-    if head_end < 0:
-        fail "invalid http response"
-    return buf.bytes()
-
-fn response_status_has_no_body(status: Int) -> Bool:
-    return status == 204 or status == 304 or (status >= 100 and status < 200)
-
-fn response_connection_closes(head: Bytes) -> Bool:
-    return (decode_utf8(header_value_bytes(head, "Connection")) catch "").to_lower() == "close"
-
-fn response_body_plan(head: Bytes) -> ResponseBodyPlan!:
-    if uses_chunked_transfer_encoding(head):
-        return ResponseBodyPlan(HTTP_RESPONSE_BODY_CHUNKED, 0)
-    content_length_raw := header_value_bytes(head, "Content-Length")
-    if not content_length_raw.is_empty():
-        return ResponseBodyPlan(HTTP_RESPONSE_BODY_EXACT, parse_decimal_bytes(content_length_raw)!)
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    if response_status_has_no_body(status):
-        return ResponseBodyPlan(HTTP_RESPONSE_BODY_NONE, 0)
-    if transfer_encoding_value(head) == "" and response_connection_closes(head):
-        return ResponseBodyPlan(HTTP_RESPONSE_BODY_UNTIL_CLOSE, 0)
-    return ResponseBodyPlan(HTTP_RESPONSE_BODY_NONE, 0)
-
-fn response_from_head_and_body(head: Bytes, body: Bytes) -> HttpResponse!:
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    headers := response_headers_map(head)
-    content_type := header_lookup(headers, "Content-Type")
-    set_cookie_headers := response_set_cookie_headers(head)
-    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers, {})
-
-fn streamed_response_from_head(head: Bytes, body_size: Int) -> StreamedHttpResponse!:
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    headers := response_headers_map(head)
-    content_type := header_lookup(headers, "Content-Type")
-    set_cookie_headers := response_set_cookie_headers(head)
-    return StreamedHttpResponse(status, content_type, header_without(headers, "Content-Type"), set_cookie_headers, body_size)
-
-fn read_response_body_buffered(head: Bytes, reader: BufferedBytesReader) -> Bytes!:
-    plan := response_body_plan(head)!
-    if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
-        return read_chunked_body(reader, 0)!
-    if plan.kind == HTTP_RESPONSE_BODY_EXACT:
-        return reader.read_exact_bytes(plan.content_length)!
-    if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
-        return reader.read_all_bytes()!
-    return bytes.empty()
-
-fn read_response_body_tls(head: Bytes, conn: tls.Conn) -> Bytes!:
-    plan := response_body_plan(head)!
-    if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
-        return read_chunked_body_tls(conn, 0)!
-    if plan.kind == HTTP_RESPONSE_BODY_EXACT:
-        return read_exact_from_tls(conn, plan.content_length)!
-    if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
-        return conn.read_all_bytes()!
-    return bytes.empty()
-
 fn stream_exact_bytes_from_reader(reader: BufferedBytesReader, writer: BufferedBytesWriter, count: Int) -> Int!:
     mut remaining := count
     mut total := 0
@@ -2147,43 +2021,206 @@ fn stream_exact_bytes_from_tls(conn: tls.Conn, writer: BufferedBytesWriter, coun
     writer.flush()!
     return total
 
-fn stream_until_close_from_reader(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
+# everything left on `src` until the peer closes, into `writer`. returns the
+# bytes written.
+fn source_stream_all(src: ByteSource, writer: BufferedBytesWriter) -> Int!:
     mut total := 0
     while true:
-        chunk := reader.read_bytes(4096)!
+        mut chunk := bytes.empty()
+        if src.use_tls:
+            chunk = src.conn.read_bytes(4096)!
+        else:
+            chunk = src.reader.read_bytes(4096)!
         if chunk.is_empty():
             writer.flush()!
             return total
         total = total + writer.write_all_bytes(chunk)!
+    return total
 
-fn stream_until_close_from_tls(conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
-    mut total := 0
+fn source_read_all(src: ByteSource) -> Bytes!:
+    if src.use_tls:
+        return src.conn.read_all_bytes()
+    return src.reader.read_all_bytes()
+
+# ===============================================================
+# Response Parsing
+# ===============================================================
+# the messages a client response read fails with. a response the parser
+# refuses fails with RESPONSE_PREFIX and the reason.
+RESPONSE_PREFIX := "http: malformed response: "
+RESPONSE_INCOMPLETE_MESSAGE := "http: response head ended early"
+RESPONSE_HEADER_LIMIT_MESSAGE := "http: response header fields exceed the maximum"
+RESPONSE_VERSION_MESSAGE := "http: unsupported http version in response"
+RESPONSE_CODING_MESSAGE := "http: unsupported transfer coding in response"
+# the peer closed before a byte of the response arrived. on a reused
+# connection this is the race of a server closing an idle connection just as
+# a request goes out, which the client retries.
+NO_RESPONSE_MESSAGE := "http: server closed the connection before responding"
+
+# the most a response head may hold before the client gives up on it, as
+# net/http's default MaxResponseHeaderBytes allows.
+MAX_RESPONSE_HEADER_BYTES := 1048576
+
+# a response head checked by parse_response_head, with the framing of its body
+# (rfc 9112 6.3): `kind` is one of the HTTP_RESPONSE_BODY_ codes and
+# `content_length` the length an EXACT body has. `wants_close` is whether the
+# connection cannot carry another exchange after this one: the response asks
+# to close, it is http/1.0 without keep-alive, or its body runs to the close.
+struct ResponseHead:
+    head: Bytes
+    status: Int
+    minor: Int
+    kind: Int
+    content_length: Int
+    wants_close: Bool
+
+# the failure a response read reports for a failure of the shared head scan.
+fn response_failure(message: String) -> String:
+    if message.starts_with(BAD_REQUEST_PREFIX):
+        return RESPONSE_PREFIX + message.substring(BAD_REQUEST_PREFIX.len(), message.len())
+    if message == INCOMPLETE_HEAD_MESSAGE:
+        return RESPONSE_INCOMPLETE_MESSAGE
+    if message == HEADER_LIMIT_MESSAGE:
+        return RESPONSE_HEADER_LIMIT_MESSAGE
+    return message
+
+# check a response head (rfc 9112 4, 5) and work out how its body is framed
+# (rfc 9112 6.3). `raw` runs through the empty line that ends the head, and
+# `method` is the method of the request it answers, since the answer to HEAD
+# never has a body.
+#
+# the status line is HTTP/1.x, a space, three digits, and an optional reason
+# after another space. the field lines get the checks a request's get. a
+# response that carries both Transfer-Encoding and Content-Length, or two
+# different Content-Length values, is refused: either is how one response is
+# made to read as two. a transfer coding other than chunked is refused as
+# net/http refuses it.
+fn parse_response_head(raw: Bytes, method: String) -> ResponseHead!:
+    skipped := skip_empty_lines(raw, 0)
+    mut head := raw
+    if skipped > 0:
+        head = raw.slice(skipped, raw.len())
+    n := head.len()
+    if not is_http_version(head, 0):
+        if n > 0 and head[n - 1] != 10:
+            fail RESPONSE_INCOMPLETE_MESSAGE
+        fail RESPONSE_PREFIX + "malformed status line"
+    if head[5] != 49:
+        fail RESPONSE_VERSION_MESSAGE
+    minor := head[7] - 48
+    if n < 12 or head[8] != 32 or not is_digit(head[9]) or not is_digit(head[10]) or not is_digit(head[11]):
+        fail RESPONSE_PREFIX + "malformed status line"
+    status := (head[9] - 48) * 100 + (head[10] - 48) * 10 + (head[11] - 48)
+    if status < 100:
+        fail RESPONSE_PREFIX + "malformed status code"
+    mut pos := 12
+    if pos < n and head[pos] == 32:
+        # the reason phrase: text, spaces and tabs (rfc 9112 4)
+        pos = pos + 1
+        while pos < n and head[pos] != 10 and head[pos] != 13:
+            if is_ctl(head[pos]):
+                fail RESPONSE_PREFIX + "control character in the reason phrase"
+            pos = pos + 1
+    if pos < n and head[pos] == 13:
+        pos = pos + 1
+    if pos >= n:
+        fail RESPONSE_INCOMPLETE_MESSAGE
+    if head[pos] != 10:
+        fail RESPONSE_PREFIX + "malformed status line"
+    scanned := scan_field_lines(head, pos + 1)
+    if scanned.is_err:
+        fail response_failure(scanned.err)
+    fields := scanned.ok
+    if fields.te_seen and fields.content_length >= 0:
+        fail RESPONSE_PREFIX + "both Transfer-Encoding and Content-Length"
+    mut kind := HTTP_RESPONSE_BODY_UNTIL_CLOSE
+    mut length := 0
+    mut closes := connection_closes(minor == 0, fields.has_close, fields.has_keep_alive)
+    if method == "HEAD" or response_status_has_no_body(status):
+        kind = HTTP_RESPONSE_BODY_NONE
+    elif fields.te_seen:
+        if not fields.te_last_chunked or fields.te_chunked_count > 1 or fields.te_other:
+            fail RESPONSE_CODING_MESSAGE
+        kind = HTTP_RESPONSE_BODY_CHUNKED
+        # rfc 9112 6.1: chunked framing on an http/1.0 message is faulty, so
+        # the connection is not trusted for another exchange
+        if minor == 0:
+            closes = true
+    elif fields.content_length >= 0:
+        kind = HTTP_RESPONSE_BODY_EXACT
+        length = fields.content_length
+    else:
+        closes = true
+    return ResponseHead(head, status, minor, kind, length, closes)
+
+fn response_status_has_no_body(status: Int) -> Bool:
+    return status == 204 or status == 304 or (status >= 100 and status < 200)
+
+# the next final response head on `src`, checked by parse_response_head.
+# interim 1xx responses before it are read and dropped (rfc 9110 15.2), except
+# 101, which ends the exchange as http/1.1 knows it.
+fn read_response_head_from(src: ByteSource, method: String) -> ResponseHead!:
     while true:
-        chunk := conn.read_bytes(4096)!
-        if chunk.is_empty():
-            writer.flush()!
-            return total
-        total = total + writer.write_all_bytes(chunk)!
+        got := read_request_head(src, MAX_RESPONSE_HEADER_BYTES)
+        if got.is_err:
+            fail response_failure(got.err)
+        if got.ok.is_empty():
+            fail NO_RESPONSE_MESSAGE
+        parsed := parse_response_head(got.ok, method)!
+        if parsed.status >= 200 or parsed.status == 101:
+            return parsed
+    fail NO_RESPONSE_MESSAGE
 
-fn stream_response_body_buffered(head: Bytes, reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
-    plan := response_body_plan(head)!
-    if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
-        return stream_chunked_body_from_reader(reader, writer)
-    if plan.kind == HTTP_RESPONSE_BODY_EXACT:
-        return stream_exact_bytes_from_reader(reader, writer, plan.content_length)
-    if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
-        return stream_until_close_from_reader(reader, writer)
+# the body a checked response head frames, read from `src`. trailer fields of
+# a chunked body go into `trailers`.
+fn read_response_body_from(src: ByteSource, parsed: ResponseHead, trailers: Map[String, String]) -> Bytes!:
+    if parsed.kind == HTTP_RESPONSE_BODY_CHUNKED:
+        out := bytes.buffer()
+        errdefer out.free()
+        decode_chunked(src, out, BufferedBytesWriter(0), false, 0, trailers)!
+        return out.take_bytes()
+    if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
+        return source_read_exact(src, parsed.content_length)
+    if parsed.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
+        return source_read_all(src)
+    return bytes.empty()
+
+# like read_response_body_from, but the body goes to `writer`. returns its
+# size.
+fn stream_response_body_from(src: ByteSource, parsed: ResponseHead, writer: BufferedBytesWriter, trailers: Map[String, String]) -> Int!:
+    if parsed.kind == HTTP_RESPONSE_BODY_CHUNKED:
+        out := bytes.buffer()
+        defer out.free()
+        return decode_chunked(src, out, writer, true, 0, trailers)
+    if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
+        return source_stream_exact(src, writer, parsed.content_length)
+    if parsed.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
+        return source_stream_all(src, writer)
+    writer.flush()!
     return 0
 
-fn stream_response_body_tls(head: Bytes, conn: tls.Conn, writer: BufferedBytesWriter) -> Int!:
-    plan := response_body_plan(head)!
-    if plan.kind == HTTP_RESPONSE_BODY_CHUNKED:
-        return stream_chunked_body_from_tls(conn, writer)
-    if plan.kind == HTTP_RESPONSE_BODY_EXACT:
-        return stream_exact_bytes_from_tls(conn, writer, plan.content_length)
-    if plan.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
-        return stream_until_close_from_tls(conn, writer)
-    return 0
+fn response_from_parsed(parsed: ResponseHead, body: Bytes, trailers: Map[String, String]) -> HttpResponse:
+    headers := response_headers_map(parsed.head)
+    content_type := header_lookup(headers, "Content-Type")
+    return HttpResponse(parsed.status, content_type, header_without(headers, "Content-Type"), body, response_set_cookie_headers(parsed.head), trailers)
+
+fn streamed_response_from_parsed(parsed: ResponseHead, body_size: Int) -> StreamedHttpResponse:
+    headers := response_headers_map(parsed.head)
+    content_type := header_lookup(headers, "Content-Type")
+    return StreamedHttpResponse(parsed.status, content_type, header_without(headers, "Content-Type"), response_set_cookie_headers(parsed.head), body_size)
+
+# read one whole response from `src`: the head and the body it frames.
+fn read_response_from(src: ByteSource, method: String) -> HttpResponse!:
+    parsed := read_response_head_from(src, method)!
+    trailers: Map[String, String] := {}
+    body := read_response_body_from(src, parsed, trailers)!
+    return response_from_parsed(parsed, body, trailers)
+
+# read one response from `src` and stream its body into `writer`.
+fn read_response_into_from(src: ByteSource, method: String, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+    parsed := read_response_head_from(src, method)!
+    body_size := stream_response_body_from(src, parsed, writer, {})!
+    return streamed_response_from_parsed(parsed, body_size)
 
 # ===============================================================
 # Request Accessors
@@ -3766,19 +3803,6 @@ pub fn send_response_bytes(fd: Int, response: Bytes) -> Int!:
 # sends a raw response string to a file descriptor.
 pub fn send_response(fd: Int, response: String) -> Int!:
     return send_response_bytes(fd, bytes.from_string_utf8(response))
-fn find_response_body_offset(raw: Bytes) -> Int:
-    mut i := 0
-    while i < raw.len() - 3:
-        if raw[i] == 13 and raw[i + 1] == 10 and raw[i + 2] == 13 and raw[i + 3] == 10:
-            return i + 4
-        i = i + 1
-    i = 0
-    while i < raw.len() - 1:
-        if raw[i] == 10 and raw[i + 1] == 10:
-            return i + 2
-        i = i + 1
-    return 0
-
 fn response_headers_map(raw_head: Bytes) -> Map[String, String]:
     mut result: Map[String, String] := {}
     hdrs := headers_bytes(raw_head)
@@ -3823,58 +3847,54 @@ fn response_set_cookie_headers(raw_head: Bytes) -> List[String]:
         pos = pos + 1
     return result
 
-# parses a raw http response payload into a structured response.
+# parses a raw http response payload into a structured response. the head is
+# checked as read_response_buffered_bytes checks it, and the body is framed by
+# it, so bytes past a declared length are ignored.
 pub fn parse_response_bytes(raw: Bytes) -> HttpResponse!:
     if raw.len() == 0:
         fail "empty http response"
-    body_start := find_response_body_offset(raw)
-    if body_start <= 0:
-        fail "invalid http response"
-    head := raw.slice(0, body_start)
-    status := parse_decimal_bytes(request_line_field_bytes(head, 1))!
-    headers := response_headers_map(head)
-    content_type := header_lookup(headers, "Content-Type")
-    set_cookie_headers := response_set_cookie_headers(head)
-    mut body := raw.slice(body_start, raw.len())
-    if uses_chunked_transfer_encoding(head):
-        body = decode_chunked_body(body)!
-    return HttpResponse(status, content_type, header_without(headers, "Content-Type"), body, set_cookie_headers, {})
+    # the cursor and reader give their registry entries back, or a client
+    # accumulates two per response.
+    cursor := io.bytes_reader(raw)
+    defer cursor.close()
+    reader := cursor.buffered_chunked(4096)
+    defer reader.free()
+    return read_response_from(buffered_source(reader), "GET")
 
 # parses a raw http response string into a structured response.
 pub fn parse_response(raw: String) -> HttpResponse!:
     return parse_response_bytes(bytes.from_string_utf8(raw))
 
-# reads one http response from a buffered bytes reader without waiting for connection close.
+# reads one http response from a buffered bytes reader without waiting for
+# connection close. the head is checked (see parse_response_head), interim 1xx
+# responses are skipped, and the body is read as the head frames it. a body
+# that runs to the close of the connection is read to the end of the reader.
 pub fn read_response_buffered_bytes(reader: BufferedBytesReader) -> HttpResponse!:
-    head := read_response_head_buffered(reader)!
-    body := read_response_body_buffered(head, reader)!
-    return response_from_head_and_body(head, body)
+    return read_response_from(buffered_source(reader), "GET")
 
 # reads one http response and streams the decoded body into a writer.
 pub fn read_response_buffered_bytes_into(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-    head := read_response_head_buffered(reader)!
-    body_size := stream_response_body_buffered(head, reader, writer)!
-    return streamed_response_from_head(head, body_size)
+    return read_response_into_from(buffered_source(reader), "GET", writer)
 
 # reads one http response from a tcp stream.
 pub fn read_response_stream(stream: TcpStream) -> HttpResponse!:
-    return read_response_buffered_bytes(stream.buffered_bytes_reader_chunked(512))
+    reader := stream.buffered_bytes_reader_chunked(4096)
+    defer reader.free()
+    return read_response_buffered_bytes(reader)
 
 # reads one http response from a tcp stream and streams the decoded body into a writer.
 pub fn read_response_stream_into(stream: TcpStream, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-    return read_response_buffered_bytes_into(stream.buffered_bytes_reader_chunked(512), writer)
+    reader := stream.buffered_bytes_reader_chunked(4096)
+    defer reader.free()
+    return read_response_buffered_bytes_into(reader, writer)
 
 # reads one http response from a tls connection.
 pub fn read_response_tls(conn: tls.Conn) -> HttpResponse!:
-    head := read_response_head_tls(conn)!
-    body := read_response_body_tls(head, conn)!
-    return response_from_head_and_body(head, body)
+    return read_response_from(tls_source(conn), "GET")
 
 # reads one http response from a tls connection and streams the decoded body into a writer.
 pub fn read_response_tls_into(conn: tls.Conn, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-    head := read_response_head_tls(conn)!
-    body_size := stream_response_body_tls(head, conn, writer)!
-    return streamed_response_from_head(head, body_size)
+    return read_response_into_from(tls_source(conn), "GET", writer)
 
 # ===============================================================
 # HTTP Client
@@ -4063,94 +4083,92 @@ fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
         next_headers = header_without(next_headers, "Cookie")
     return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit)
 
-fn send_request_plain(req: ClientRequest) -> HttpResponse!:
-    stream := io.connect(req.host, req.port)!
-    defer stream.close()
-    if req.timeout_ms >= 0:
-        stream.set_timeout(req.timeout_ms)
-    writer := stream.buffered_bytes_writer()
-    writer.write_all_bytes(req.to_bytes()!)!
-    writer.flush()!
-    raw := stream.read_all_bytes_chunked(4096)!
-    return parse_response_bytes(raw)
+# one http/1.1 client connection: a plain socket with its buffered reader and
+# writer, or a tls session over the socket. `key` names the origin it was
+# dialed for, `idle_since` is when it last went idle on the mono_millis clock,
+# and `reused` is whether it has carried an exchange before the current one.
+struct WireConn:
+    stream: TcpStream
+    reader: BufferedBytesReader
+    writer: BufferedBytesWriter
+    tls_conn: tls.Conn
+    use_tls: Bool
+    key: String
+    mut idle_since: Int
+    mut reused: Bool
 
-fn send_request_tls(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
-    stream := io.connect(req.host, req.port)!
-    if req.timeout_ms >= 0:
-        stream.set_timeout(req.timeout_ms)
-    conn := tls.client(stream, server_name, config)!
-    defer conn.close()
-    conn.write_all_bytes(req.to_bytes()!)!
-    raw := conn.read_all_bytes_chunked(4096)!
-    return parse_response_bytes(raw)
+fn plain_wire(stream: TcpStream, key: String) -> WireConn:
+    return WireConn(stream, stream.buffered_bytes_reader_chunked(4096), stream.buffered_bytes_writer(), tls.Conn(0), false, key, 0, false)
 
-fn send_request_plain_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-    stream := io.connect(req.host, req.port)!
-    defer stream.close()
-    if req.timeout_ms >= 0:
-        stream.set_timeout(req.timeout_ms)
-    req_writer := stream.buffered_bytes_writer()
-    req_writer.write_all_bytes(req.to_bytes()!)!
-    req_writer.flush()!
-    streamed := read_response_buffered_bytes_into(stream.buffered_bytes_reader_chunked(512), writer)!
-    return streamed
+# run the tls handshake over `stream`. the stream is closed when it fails.
+fn tls_wire(stream: TcpStream, server_name: String, config: tls.Config, key: String) -> WireConn!:
+    conn := tls.client(stream, server_name, config)
+    if conn.is_err:
+        stream.close()
+        fail conn.err
+    return WireConn(stream, BufferedBytesReader(0), BufferedBytesWriter(0), conn.ok, true, key, 0, false)
 
-fn send_request_tls_into(req: ClientRequest, server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-    stream := io.connect(req.host, req.port)!
-    if req.timeout_ms >= 0:
-        stream.set_timeout(req.timeout_ms)
-    conn := tls.client(stream, server_name, config)!
-    defer conn.close()
-    conn.write_all_bytes(req.to_bytes()!)!
-    streamed := read_response_tls_into(conn, writer)!
-    return streamed
+fn wire_source(c: WireConn) -> ByteSource:
+    return ByteSource(c.reader, c.tls_conn, c.use_tls, c.stream.fd)
 
-fn discard_response_writer() -> BufferedBytesWriter:
-    return bytes.buffer().buffered_chunked(512)
+fn wire_write(c: WireConn, data: Bytes) -> Int!:
+    if c.use_tls:
+        return c.tls_conn.write_all_bytes(data)
+    written := c.writer.write_all_bytes(data)!
+    c.writer.flush()!
+    return written
 
-fn send_request_plain_into_with_redirects(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-    stream := io.connect(req.host, req.port)!
-    defer stream.close()
-    if req.timeout_ms >= 0:
-        stream.set_timeout(req.timeout_ms)
-    req_writer := stream.buffered_bytes_writer()
-    req_writer.write_all_bytes(req.to_bytes()!)!
-    req_writer.flush()!
-    reader := stream.buffered_bytes_reader_chunked(512)
-    head := read_response_head_buffered(reader)!
-    resp := response_from_head_and_body(head, bytes.empty())!
-    if req.redirect_limit > 0 and redirect_status(resp.status):
-        stream_response_body_buffered(head, reader, discard_response_writer())!
-        return StreamedHttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), copy_string_list(resp.set_cookie_headers), 0)
-    body_size := stream_response_body_buffered(head, reader, writer)!
-    return streamed_response_from_head(head, body_size)
+# close the connection and give back the reader's and writer's registry
+# entries.
+fn wire_close(c: WireConn):
+    if c.use_tls:
+        c.tls_conn.close()
+        return
+    c.reader.free()
+    c.writer.free()
+    c.stream.close()
 
-fn send_request_tls_into_with_redirects(req: ClientRequest, server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
+# dial the request's origin for a single exchange. `with_timeout` on the
+# request is a per-read socket timeout here.
+fn open_wire(req: ClientRequest, server_name: String, config: tls.Config) -> WireConn!:
     stream := io.connect(req.host, req.port)!
     if req.timeout_ms >= 0:
         stream.set_timeout(req.timeout_ms)
-    conn := tls.client(stream, server_name, config)!
-    defer conn.close()
-    conn.write_all_bytes(req.to_bytes()!)!
-    head := read_response_head_tls(conn)!
-    resp := response_from_head_and_body(head, bytes.empty())!
-    if req.redirect_limit > 0 and redirect_status(resp.status):
-        stream_response_body_tls(head, conn, discard_response_writer())!
-        return StreamedHttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), copy_string_list(resp.set_cookie_headers), 0)
-    body_size := stream_response_body_tls(head, conn, writer)!
-    return streamed_response_from_head(head, body_size)
+    if req.use_tls:
+        return tls_wire(stream, server_name, config, "")
+    return plain_wire(stream, "")
+
+# send `req` on a connection of its own and read the response the head frames.
+fn send_request_wire(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
+    c := open_wire(req, server_name, config)!
+    defer wire_close(c)
+    wire_write(c, req.to_bytes()!)!
+    return read_response_from(wire_source(c), req.method)
+
+# like send_request_wire, but the body goes to `writer`. when `follow` is set,
+# the body of a redirect is read and dropped, since the caller follows it.
+fn send_request_wire_into(req: ClientRequest, server_name: String, config: tls.Config, writer: BufferedBytesWriter, follow: Bool) -> StreamedHttpResponse!:
+    c := open_wire(req, server_name, config)!
+    defer wire_close(c)
+    wire_write(c, req.to_bytes()!)!
+    src := wire_source(c)
+    parsed := read_response_head_from(src, req.method)!
+    if follow and redirect_status(parsed.status):
+        read_response_body_from(src, parsed, {})!
+        return streamed_response_from_parsed(parsed, 0)
+    return streamed_response_from_parsed(parsed, stream_response_body_from(src, parsed, writer, {})!)
 
 fn send_request_once(req: ClientRequest) -> HttpResponse!:
     if req.use_tls:
         config := tls.client_config()!
         defer config.close()
-        return send_request_tls(req, req.host, config)
-    return send_request_plain(req)
+        return send_request_wire(req, req.host, config)
+    return send_request_wire(req, req.host, tls.Config(0))
 
 fn send_request_once_with_tls_config(req: ClientRequest, tls_config: tls.Config) -> HttpResponse!:
     if req.use_tls:
-        return send_request_tls(req, req.host, tls_config)
-    return send_request_plain(req)
+        return send_request_wire(req, req.host, tls_config)
+    return send_request_wire(req, req.host, tls.Config(0))
 
 fn send_request_following_redirects(req: ClientRequest) -> HttpResponse!:
     mut current := req
@@ -4177,7 +4195,7 @@ fn send_request_following_redirects_with_tls_config(req: ClientRequest, tls_conf
 fn send_tls_request(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
     current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit)
     if server_name != req.host:
-        return send_request_tls(current, server_name, config)
+        return send_request_wire(current, server_name, config)
     return send_request_following_redirects_with_tls_config(current, config)
 
 # --- client-side tracing ----------------------------------------------------
@@ -4281,9 +4299,9 @@ fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedByt
             # would otherwise leave a registry slot behind for every hop.
             config := tls.client_config()!
             defer config.close()
-            resp = send_request_tls_into_with_redirects(current, current.host, config, writer)!
+            resp = send_request_wire_into(current, current.host, config, writer, current.redirect_limit > 0)!
         else:
-            resp = send_request_plain_into_with_redirects(current, writer)!
+            resp = send_request_wire_into(current, current.host, tls.Config(0), writer, current.redirect_limit > 0)!
         if redirects_left <= 0 or not redirect_status(resp.status):
             return resp
         current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
@@ -4295,14 +4313,14 @@ fn send_request_following_redirects_into_with_tls_config(req: ClientRequest, tls
     mut redirects_left := req.redirect_limit
     while true:
         if current.use_tls:
-            resp := send_request_tls_into_with_redirects(current, current.host, tls_config, writer)!
+            resp := send_request_wire_into(current, current.host, tls_config, writer, current.redirect_limit > 0)!
             if redirects_left <= 0 or not redirect_status(resp.status):
                 return resp
             current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
             redirects_left = redirects_left - 1
             current = ClientRequest(current.method, current.host, current.port, current.path, copy_headers_map(current.headers), current.body, current.use_tls, current.timeout_ms, redirects_left)
             continue
-        resp := send_request_plain_into_with_redirects(current, writer)!
+        resp := send_request_wire_into(current, current.host, tls.Config(0), writer, current.redirect_limit > 0)!
         if redirects_left <= 0 or not redirect_status(resp.status):
             return resp
         current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
@@ -4448,7 +4466,7 @@ impl ClientRequest:
         current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit)
         if server_name == self.host:
             return send_request_following_redirects_into_with_tls_config(current, config, writer)
-        return send_request_tls_into(current, server_name, config, writer)
+        return send_request_wire_into(current, server_name, config, writer, false)
 
     fn send_to_file(output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
@@ -4481,9 +4499,11 @@ impl ClientConn:
             self.stream.set_timeout(req.timeout_ms)
         self.writer.write_all_bytes(req.to_bytes()!)!
         self.writer.flush()!
-        return read_response_buffered_bytes(self.reader)
+        return read_response_from(buffered_source(self.reader), req.method)
 
     fn close():
+        self.reader.free()
+        self.writer.free()
         self.stream.close()
 
     fn send_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
@@ -4491,7 +4511,7 @@ impl ClientConn:
             self.stream.set_timeout(req.timeout_ms)
         self.writer.write_all_bytes(req.to_bytes()!)!
         self.writer.flush()!
-        return read_response_buffered_bytes_into(self.reader, writer)
+        return read_response_into_from(buffered_source(self.reader), req.method, writer)
 
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
@@ -4503,14 +4523,14 @@ impl ClientConn:
 impl TlsClientConn:
     fn send(req: ClientRequest) -> HttpResponse!:
         self.conn.write_all_bytes(req.to_bytes()!)!
-        return read_response_tls(self.conn)
+        return read_response_from(tls_source(self.conn), req.method)
 
     fn close():
         self.conn.close()
 
     fn send_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
         self.conn.write_all_bytes(req.to_bytes()!)!
-        return read_response_tls_into(self.conn, writer)
+        return read_response_into_from(tls_source(self.conn), req.method, writer)
 
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
@@ -5465,3 +5485,56 @@ test "etag lists are scanned with strong and weak comparison":
     assert(not etag_list_matches("W/" + tag, tag, false))
     assert(etag_list_matches("*", tag, false))
     assert(not etag_list_matches(chr(34) + "a" + chr(34), tag, true))
+
+fn response_head_of(text: String, method: String) -> ResponseHead!:
+    return parse_response_head(bytes.from_string_utf8(text), method)
+
+test "parse_response_head checks the status line":
+    assert_eq(response_head_of("HTTP/1.1 200 OK\r\n\r\n", "GET")!.status, 200)
+    assert_eq(response_head_of("HTTP/1.1 204\r\n\r\n", "GET")!.status, 204)
+    assert_eq(response_head_of("HTTP/1.1 404 \r\n\r\n", "GET")!.status, 404)
+    assert_eq(response_head_of("HTTP/1.0 200 OK\n\n", "GET")!.minor, 0)
+    assert(response_head_of("HTTP/1.1 20 OK\r\n\r\n", "GET").err.starts_with(RESPONSE_PREFIX))
+    assert(response_head_of("HTTP/1.1 2000 OK\r\n\r\n", "GET").err.starts_with(RESPONSE_PREFIX))
+    assert(response_head_of("HTTP/1.1  200 OK\r\n\r\n", "GET").err.starts_with(RESPONSE_PREFIX))
+    assert(response_head_of("ICY 200 OK\r\n\r\n", "GET").err.starts_with(RESPONSE_PREFIX))
+    assert(response_head_of("HTTP/1.1 099 Low\r\n\r\n", "GET").err.starts_with(RESPONSE_PREFIX))
+    assert_eq(response_head_of("HTTP/2.0 200 OK\r\n\r\n", "GET").err, RESPONSE_VERSION_MESSAGE)
+    assert(response_head_of("HTTP/1.1 200 O" + chr(1) + "K\r\n\r\n", "GET").err.starts_with(RESPONSE_PREFIX))
+    assert(response_head_of("HTTP/1.1 200 OK\r\nBad Name: x\r\n\r\n", "GET").err.starts_with(RESPONSE_PREFIX))
+    assert_eq(response_head_of("HTTP/1.1 200 OK\r\nA: b\r\n", "GET").err, RESPONSE_INCOMPLETE_MESSAGE)
+
+test "parse_response_head frames the body as rfc 9112 6.3 says":
+    exact := response_head_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "GET")!
+    assert_eq(exact.kind, HTTP_RESPONSE_BODY_EXACT)
+    assert_eq(exact.content_length, 5)
+    assert(not exact.wants_close)
+    chunked := response_head_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "GET")!
+    assert_eq(chunked.kind, HTTP_RESPONSE_BODY_CHUNKED)
+    until_close := response_head_of("HTTP/1.1 200 OK\r\n\r\n", "GET")!
+    assert_eq(until_close.kind, HTTP_RESPONSE_BODY_UNTIL_CLOSE)
+    assert(until_close.wants_close)
+    assert_eq(response_head_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "HEAD")!.kind, HTTP_RESPONSE_BODY_NONE)
+    assert_eq(response_head_of("HTTP/1.1 204 No Content\r\n\r\n", "GET")!.kind, HTTP_RESPONSE_BODY_NONE)
+    assert_eq(response_head_of("HTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\n", "GET")!.kind, HTTP_RESPONSE_BODY_NONE)
+    assert_eq(response_head_of("HTTP/1.1 100 Continue\r\n\r\n", "GET")!.kind, HTTP_RESPONSE_BODY_NONE)
+    assert(response_head_of("HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\n", "GET")!.wants_close)
+    assert(not response_head_of("HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\n", "GET")!.wants_close)
+    assert(response_head_of("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\n", "GET")!.wants_close)
+
+test "parse_response_head refuses ambiguous framing":
+    both := response_head_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n", "GET")
+    assert_eq(both.err, RESPONSE_PREFIX + "both Transfer-Encoding and Content-Length")
+    conflicting := response_head_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n", "GET")
+    assert_eq(conflicting.err, RESPONSE_PREFIX + "conflicting Content-Length")
+    assert_eq(response_head_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n", "GET")!.content_length, 5)
+    assert_eq(response_head_of("HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n", "GET").err, RESPONSE_PREFIX + "invalid Content-Length")
+    assert_eq(response_head_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", "GET").err, RESPONSE_CODING_MESSAGE)
+    assert_eq(response_head_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, chunked\r\n\r\n", "GET").err, RESPONSE_CODING_MESSAGE)
+
+test "a response read skips interim responses and keeps trailers":
+    wire := "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Sum: 42\r\n\r\n"
+    resp := parse_response(wire)!
+    assert_eq(resp.status, 200)
+    assert_eq(resp.body_text()!, "abc")
+    assert_eq(header_lookup(resp.trailers, "x-sum"), "42")

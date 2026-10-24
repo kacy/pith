@@ -761,10 +761,13 @@ fn next_timeout_ms(poller: &Poller, cap: Duration) -> libc::c_int {
 
 /// take all waiters for `(fd, interest)`, mark each ready, and queue it to wake.
 /// clearing the list disarms this interest until a still-blocked task re-registers
-/// (level-triggering means a genuinely-ready fd re-reports on the next arm).
+/// (level-triggering means a genuinely-ready fd re-reports on the next arm). the
+/// emptied list stays in the map, so the next wait on the fd, which on a
+/// keep-alive connection comes a request later, reuses its allocation; on_close
+/// removes it.
 fn take_ready(inner: &mut Inner, fd: RawFd, interest: Interest, to_wake: &mut Vec<usize>) {
-    if let Some(waiters) = inner.waiters.remove(&(fd, interest)) {
-        for w in waiters {
+    if let Some(waiters) = inner.waiters.get_mut(&(fd, interest)) {
+        for w in waiters.drain(..) {
             // flip PENDING->READY; if a timeout already claimed it, leave it be.
             if w
                 .outcome

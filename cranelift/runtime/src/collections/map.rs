@@ -949,8 +949,12 @@ fn map_trace_enabled() -> bool {
 /// own bytes. Nothing is copied, so the borrow is only good for the length of
 /// the call that took it.
 unsafe fn cstr_key_ref<'a>(key: *const i8) -> KeyRef<'a> {
-    // a heap string's length is one header read; only a literal is scanned
-    let len = crate::string::pith_cstring_len(key) as usize;
+    let mut len = 0usize;
+    let mut p = key;
+    while *p != 0 {
+        len += 1;
+        p = p.add(1);
+    }
     KeyRef::Str(std::slice::from_raw_parts(key as *const u8, len))
 }
 

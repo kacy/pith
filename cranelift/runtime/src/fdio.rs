@@ -21,6 +21,15 @@
 //! in the kernel — and the retry loops here read the same option back and hand
 //! it to the wait, so a read deadline means the same thing on either backend
 //! instead of being inert on the one that is the default.
+//!
+//! a socket can also carry a fixed deadline (`pith_tcp_set_read_deadline`,
+//! `pith_tcp_set_write_deadline`, kept in `fd_handle`). the socket option
+//! bounds each call on its own, so a peer that sends one byte just inside it
+//! keeps a read going forever; a deadline is an instant, so the time left
+//! shrinks across calls. a wait takes whichever of the two ends first. on the
+//! os-thread backend a socket with a deadline is driven by the same retry
+//! loops, one `MSG_DONTWAIT` call at a time, since a blocking call in the
+//! kernel knows only the socket option.
 
 use crate::concurrency::green;
 use crate::fd_handle::Guard;
@@ -231,6 +240,12 @@ enum Channel {
     Pipe,
     /// a connected socket, read and written with `recv`/`send`.
     Socket,
+    /// a socket left in blocking mode (the os-thread backend) that has a
+    /// deadline set. each call passes `MSG_DONTWAIT`, so a would-block comes
+    /// back to the retry loop, which waits in `poll` for no longer than the
+    /// deadline allows, where a plain blocking call would sit in the kernel
+    /// for as long as `SO_RCVTIMEO` lets it.
+    PolledSocket,
 }
 
 impl Channel {
@@ -240,6 +255,10 @@ impl Channel {
     /// program that arms SIGPIPE through `pith_signal_notify` is entitled to
     /// keep seeing it. no flags keeps this change to the non-socket check.
     const NO_FLAGS: libc::c_int = 0;
+
+    fn is_socket(self) -> bool {
+        !matches!(self, Channel::Pipe)
+    }
 
     /// one read into `buf`, returning the raw syscall result.
     ///
@@ -251,6 +270,7 @@ impl Channel {
         match self {
             Channel::Pipe => libc::read(fd, buf, size),
             Channel::Socket => libc::recv(fd, buf, size, Self::NO_FLAGS),
+            Channel::PolledSocket => libc::recv(fd, buf, size, libc::MSG_DONTWAIT),
         }
     }
 
@@ -264,6 +284,7 @@ impl Channel {
         match self {
             Channel::Pipe => libc::write(fd, data, size),
             Channel::Socket => libc::send(fd, data, size, Self::NO_FLAGS),
+            Channel::PolledSocket => libc::send(fd, data, size, libc::MSG_DONTWAIT),
         }
     }
 
@@ -288,7 +309,7 @@ impl Channel {
             // process's stdout in the first place. a pipe read waits for its
             // writer, as it always has.
             Channel::Pipe => -1,
-            Channel::Socket => socket_timeout_ms(
+            Channel::Socket | Channel::PolledSocket => socket_timeout_ms(
                 fd,
                 if read {
                     libc::SO_RCVTIMEO
@@ -302,7 +323,7 @@ impl Channel {
     /// stop the process if `err` says this fd is not a socket. a no-op for a
     /// pipe, which never asks the question.
     fn check(self, fd: i64, err: i32, operation: &str) {
-        if matches!(self, Channel::Socket) && err == libc::ENOTSOCK {
+        if self.is_socket() && err == libc::ENOTSOCK {
             report_not_a_socket(fd, operation);
         }
     }
@@ -339,11 +360,17 @@ impl WaitBudget {
     fn wait(&mut self, guard: &Guard, read: bool, channel: Channel) -> i64 {
         let resolved = match *self {
             WaitBudget::Unasked => {
-                let budget = match channel.timeout_ms(guard.fd() as i64, read) {
-                    ms if ms > 0 => {
-                        WaitBudget::Until(Instant::now() + Duration::from_millis(ms as u64))
-                    }
-                    _ => WaitBudget::Forever,
+                let per_call = match channel.timeout_ms(guard.fd() as i64, read) {
+                    ms if ms > 0 => Some(Instant::now() + Duration::from_millis(ms as u64)),
+                    _ => None,
+                };
+                // the socket's deadline, when it has one, is a fixed instant,
+                // so whichever of it and the per-call timeout comes first wins.
+                let deadline = crate::fd_handle::deadline(guard.fd(), !read);
+                let budget = match (per_call, deadline) {
+                    (Some(a), Some(b)) => WaitBudget::Until(a.min(b)),
+                    (Some(at), None) | (None, Some(at)) => WaitBudget::Until(at),
+                    (None, None) => WaitBudget::Forever,
                 };
                 *self = budget;
                 budget
@@ -425,7 +452,7 @@ fn read_channel(guard: &Guard, size: usize, channel: Channel) -> Option<Vec<u8>>
             if n == 0 && !guard.is_live() {
                 return None;
             }
-            if matches!(channel, Channel::Socket) {
+            if channel.is_socket() {
                 crate::perf_stats!(PERF_SOCK_READS += 1, PERF_SOCK_READ_BYTES += n as usize);
             }
             buf.truncate(n as usize);
@@ -502,7 +529,7 @@ fn write_channel(guard: &Guard, data: &[u8], channel: Channel) -> Result<usize, 
         // held open by `guard` for the duration of this call.
         let n = unsafe { channel.write(fd as i32, data.as_ptr(), data.len()) };
         if n > 0 {
-            if matches!(channel, Channel::Socket) {
+            if channel.is_socket() {
                 crate::perf_stats!(PERF_SOCK_WRITES += 1, PERF_SOCK_WRITE_BYTES += n as usize);
             }
             return Ok(n as usize);
@@ -538,7 +565,13 @@ fn write_channel(guard: &Guard, data: &[u8], channel: Channel) -> Result<usize, 
 /// a close from another task returns this call by shutting the socket down,
 /// which reads as end of stream; the handle being dead by then is what tells
 /// that apart from the peer finishing, and it is reported as an error.
+///
+/// a socket with a read deadline goes through the polled retry loop instead,
+/// so the wait ends at the deadline rather than at the next `SO_RCVTIMEO`.
 pub(crate) fn socket_read_blocking(guard: &Guard, size: usize) -> Option<Vec<u8>> {
+    if crate::fd_handle::deadline(guard.fd(), false).is_some() {
+        return read_channel(guard, size, Channel::PolledSocket);
+    }
     let fd = guard.fd() as i64;
     let mut buf = vec![0u8; size];
     // the syscall can sit in the kernel up to SO_RCVTIMEO — forever, with no
@@ -564,7 +597,12 @@ pub(crate) fn socket_read_blocking(guard: &Guard, size: usize) -> Option<Vec<u8>
 /// one write to a socket that blocks in the kernel, the counterpart of
 /// `socket_read_blocking`. returns the bytes accepted, or the reason for any
 /// error. an empty buffer is a zero-byte `send`, which succeeds with `Ok(0)`.
+/// a socket with a write deadline goes through the polled retry loop, as a
+/// read with a read deadline does.
 pub(crate) fn socket_write_blocking(guard: &Guard, data: &[u8]) -> Result<usize, WriteError> {
+    if crate::fd_handle::deadline(guard.fd(), true).is_some() {
+        return write_channel(guard, data, Channel::PolledSocket);
+    }
     let fd = guard.fd() as i64;
     // a full send buffer can hold this in the kernel indefinitely; like the
     // blocking read it touches only the borrowed buffer, so it is a native
@@ -926,6 +964,55 @@ mod tests {
 
         close(a);
         close(b);
+    }
+
+    /// a peer that sends a byte just inside the per-read timeout never trips
+    /// it, but a deadline is an instant, so a series of reads still ends there.
+    /// both paths: `a` is non-blocking (the yielding loop), `b` blocking (the
+    /// polled loop the os-thread backend takes once a deadline is set).
+    #[test]
+    fn a_drip_fed_read_gives_up_at_the_deadline_on_both_paths() {
+        for blocking in [false, true] {
+            let (a, b) = socket_pair();
+            if !blocking {
+                set_nonblocking(a);
+            }
+            let handle = fd_handle::open(a, FdKind::Socket);
+            crate::network::pith_tcp_set_timeout(handle, 200);
+            crate::network::pith_tcp_set_read_deadline(handle, 300);
+            let writer = std::thread::spawn(move || {
+                for _ in 0..40 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    // SAFETY: one byte from a static buffer to a socket this test owns.
+                    if unsafe { libc::send(b, b"x".as_ptr() as *const libc::c_void, 1, libc::MSG_NOSIGNAL) } != 1 {
+                        break;
+                    }
+                }
+                close(b);
+            });
+            let start = Instant::now();
+            let mut got = 0;
+            loop {
+                // `sock` would register the number afresh, which drops its
+                // deadline, so the reads hold the handle the deadline is on.
+                let guard = fd_handle::acquire(handle, FdKind::Socket).expect("live");
+                let read = if blocking {
+                    socket_read_blocking(&guard, 16)
+                } else {
+                    socket_read_yielding(&guard, 16)
+                };
+                match read {
+                    Some(bytes) if !bytes.is_empty() => got += bytes.len(),
+                    _ => break,
+                }
+            }
+            let waited = start.elapsed();
+            assert!(got >= 2, "read {got} bytes before the deadline");
+            assert!(waited >= Duration::from_millis(250), "gave up after {waited:?}");
+            assert!(waited < Duration::from_millis(1500), "waited {waited:?}");
+            assert!(fd_handle::close(handle));
+            writer.join().unwrap();
+        }
     }
 
     /// the budget is spent down across retries rather than reset by each one: a

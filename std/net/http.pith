@@ -2141,7 +2141,7 @@ fn parse_response_head(raw: Bytes, method: String) -> ResponseHead!:
     scanned := scan_field_lines(head, pos + 1)
     if scanned.is_err:
         fail response_failure(scanned.err)
-    fields := scanned.ok
+    fields := scanned!
     if fields.te_seen and fields.content_length >= 0:
         fail RESPONSE_PREFIX + "both Transfer-Encoding and Content-Length"
     mut kind := HTTP_RESPONSE_BODY_UNTIL_CLOSE
@@ -2175,9 +2175,10 @@ fn read_response_head_from(src: ByteSource, method: String) -> ResponseHead!:
         got := read_request_head(src, MAX_RESPONSE_HEADER_BYTES)
         if got.is_err:
             fail response_failure(got.err)
-        if got.ok.is_empty():
+        raw := got!
+        if raw.is_empty():
             fail NO_RESPONSE_MESSAGE
-        parsed := parse_response_head(got.ok, method)!
+        parsed := parse_response_head(raw, method)!
         if parsed.status >= 200 or parsed.status == 101:
             return parsed
     fail NO_RESPONSE_MESSAGE
@@ -2188,7 +2189,7 @@ fn read_response_body_from(src: ByteSource, parsed: ResponseHead, trailers: Map[
     got := read_response_body_raw(src, parsed, trailers)
     if got.is_err:
         fail response_failure(got.err)
-    return got.ok
+    return got!
 
 fn read_response_body_raw(src: ByteSource, parsed: ResponseHead, trailers: Map[String, String]) -> Bytes!:
     if parsed.kind == HTTP_RESPONSE_BODY_CHUNKED:
@@ -2208,7 +2209,7 @@ fn stream_response_body_from(src: ByteSource, parsed: ResponseHead, writer: Buff
     got := stream_response_body_raw(src, parsed, writer, trailers)
     if got.is_err:
         fail response_failure(got.err)
-    return got.ok
+    return got!
 
 fn stream_response_body_raw(src: ByteSource, parsed: ResponseHead, writer: BufferedBytesWriter, trailers: Map[String, String]) -> Int!:
     if parsed.kind == HTTP_RESPONSE_BODY_CHUNKED:
@@ -4233,7 +4234,7 @@ fn tls_wire(stream: TcpStream, server_name: String, config: tls.Config, key: Str
     if conn.is_err:
         stream.close()
         fail conn.err
-    return WireConn(stream, BufferedBytesReader(0), BufferedBytesWriter(0), conn.ok, true, key, 0, false)
+    return WireConn(stream, BufferedBytesReader(0), BufferedBytesWriter(0), conn!, true, key, 0, false)
 
 fn wire_source(c: WireConn) -> ByteSource:
     return ByteSource(c.reader, c.tls_conn, c.use_tls, c.stream.fd)
@@ -4660,11 +4661,10 @@ impl TlsClientConn:
 # Client
 # ===============================================================
 
-# the idle connections of a client, by origin, and how many it has dialed.
+# the idle connections of a client, by origin.
 struct ConnPool:
     mut idle: Map[String, List[WireConn]]
     mu: Mutex
-    mut dialed: Int
 
 # an http/1.1 client in the shape of net/http's Client and Transport: it keeps
 # connections alive and reuses them per origin, follows redirects, and bounds
@@ -4740,7 +4740,7 @@ DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS := 1000
 # origin kept for 90 seconds, up to 10 redirects, gzip asked for and decoded,
 # and a 1 second wait for 100 Continue.
 pub fn client() -> Client:
-    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, true, DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS, "", false, no_tls_config(), ConnPool({}, Mutex(), 0))
+    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, true, DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS, "", false, no_tls_config(), ConnPool({}, Mutex()))
 
 # a request for `method` and an absolute http or https url, as net/http's
 # NewRequest builds one.
@@ -4986,9 +4986,10 @@ impl Client:
         result := self.send_untraced(traced)
         if result.is_err:
             finish_http_client_span(span, req.method, -1, started)
-        else:
-            finish_http_client_span(span, req.method, result.ok.status, started)
-        return result!
+            fail result.err
+        resp := result!
+        finish_http_client_span(span, req.method, resp.status, started)
+        return resp
 
     # send `req` and stream the body of the final response into `writer`.
     fn send_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
@@ -5080,11 +5081,12 @@ impl Client:
             c := self.conn_for(req, route, deadline)!
             got := self.exchange(c, req, route, writer, streaming, deadline)
             if got.is_ok:
-                if got.ok.reusable:
+                result := got!
+                if result.reusable:
                     self.put_idle(c)
                 else:
                     wire_close(c)
-                return got.ok
+                return result
             wire_close(c)
             if retried or not c.reused or got.err != NO_RESPONSE_MESSAGE or not request_replayable(req):
                 fail got.err
@@ -5143,37 +5145,36 @@ impl Client:
                 fail CLIENT_TIMEOUT_MESSAGE
             if wait <= 0 or left < wait:
                 wait = left
-        stream := dial_tcp(route.host, route.port, wait)
-        if stream.is_err:
-            fail client_timeout_failure(stream.err, deadline, 0)
-        self.pool.mu.lock()
-        self.pool.dialed = self.pool.dialed + 1
-        self.pool.mu.unlock()
+        dialed := dial_tcp(route.host, route.port, wait)
+        if dialed.is_err:
+            fail client_timeout_failure(dialed.err, deadline, 0)
+        stream := dialed!
         if not req.use_tls:
-            return plain_wire(stream.ok, key)
-        arm_client_deadline(stream.ok.fd, deadline, true)
-        arm_client_deadline(stream.ok.fd, deadline, false)
+            return plain_wire(stream, key)
+        arm_client_deadline(stream.fd, deadline, true)
+        arm_client_deadline(stream.fd, deadline, false)
         if route.tunnel:
-            opened := open_tunnel(stream.ok, req)
+            opened := open_tunnel(stream, req)
             if opened.is_err:
-                stream.ok.close()
+                stream.close()
                 fail client_timeout_failure(opened.err, deadline, 0)
-        conn := self.handshake(stream.ok, req, key)
+        conn := self.handshake(stream, req, key)
         if conn.is_err:
             fail client_timeout_failure(conn.err, deadline, 0)
-        return conn.ok
+        return conn!
 
     # run the tls handshake over a new connection, with tls_config or the
     # default config. the stream is closed when it fails.
     fn handshake(stream: TcpStream, req: ClientRequest, key: String) -> WireConn!:
         if self.tls_config.handle >= 0:
             return tls_wire(stream, req.host, self.tls_config, key)
-        config := tls.client_config()
-        if config.is_err:
+        made := tls.client_config()
+        if made.is_err:
             stream.close()
-            fail config.err
-        defer config.ok.close()
-        return tls_wire(stream, req.host, config.ok, key)
+            fail made.err
+        config := made!
+        defer config.close()
+        return tls_wire(stream, req.host, config, key)
 
     # keep `c` for another request, or close it when its origin already has
     # max_idle_conns_per_host idle connections.
@@ -5220,28 +5221,34 @@ impl Client:
         arm_client_deadline(fd, deadline, false)
         client_write(c, wire, deadline)!
         src := wire_source(c)
-        mut body_sent := true
-        mut early := ResponseHead(bytes.empty(), 0, 1, HTTP_RESPONSE_BODY_NONE, 0, false)
         if expect:
-            early = self.await_continue(src, req, deadline)!
-            if early.status == 0:
-                client_write(c, request_body_bytes(req), deadline)!
-            else:
-                body_sent = false
-        mut parsed := early
-        if body_sent:
-            mut header_due := 0
-            if self.response_header_timeout_ms > 0:
-                header_due = time_mod.mono_millis() + self.response_header_timeout_ms
-            arm_client_deadline(fd, earliest_due(deadline, header_due), true)
-            arrived := source_wait_bytes(src)
-            if arrived.is_err or arrived.ok <= 0:
-                fail client_timeout_failure(NO_RESPONSE_MESSAGE, deadline, header_due)
-            head := read_response_head_from(src, req.method)
-            if head.is_err:
-                fail client_timeout_failure(head.err, deadline, header_due)
-            parsed = head.ok
-        arm_client_deadline(fd, deadline, true)
+            early := self.await_continue(src, req, deadline)!
+            if early.status != 0:
+                # the final response came before the body went out
+                return self.finish_exchange(src, req, early, writer, streaming, deadline, accept_gzip, false)
+            client_write(c, request_body_bytes(req), deadline)!
+        mut header_due := 0
+        if self.response_header_timeout_ms > 0:
+            header_due = time_mod.mono_millis() + self.response_header_timeout_ms
+        arm_client_deadline(fd, earliest_due(deadline, header_due), true)
+        arrived := source_wait_bytes(src) catch 0
+        if arrived <= 0:
+            fail client_timeout_failure(NO_RESPONSE_MESSAGE, deadline, header_due)
+        head := read_response_head_from(src, req.method)
+        if head.is_err:
+            fail client_timeout_failure(head.err, deadline, header_due)
+        parsed := head!
+        return self.finish_exchange(src, req, parsed, writer, streaming, deadline, accept_gzip, true)
+
+    # read the body `parsed` frames and decide whether the connection can be
+    # used again. `body_sent` is false when the request's body never went
+    # out, which leaves the server expecting it.
+    #
+    # each head reaches this as an argument rather than through a variable
+    # that is reassigned: a struct value copied into a mut binding and then
+    # replaced leaks a reference per exchange.
+    fn finish_exchange(src: ByteSource, req: ClientRequest, parsed: ResponseHead, writer: BufferedBytesWriter, streaming: Bool, deadline: Int, accept_gzip: Bool, body_sent: Bool) -> ClientResult!:
+        arm_client_deadline(src.socket, deadline, true)
         trailers: Map[String, String] := {}
         mut body := bytes.empty()
         mut body_size := 0
@@ -5250,21 +5257,19 @@ impl Client:
             streamed := stream_response_body_from(src, parsed, writer, trailers)
             if streamed.is_err:
                 fail client_timeout_failure(streamed.err, deadline, 0)
-            body_size = streamed.ok
+            body_size = streamed!
         else:
             got := read_response_body_from(src, parsed, trailers)
             if got.is_err:
                 fail client_timeout_failure(got.err, deadline, 0)
-            body = got.ok
+            body = got!
             if accept_gzip and not body.is_empty() and response_content_encoding(parsed.head) == "gzip":
                 unzipped := gzip.decompress(body)
                 if unzipped.is_err:
                     fail "http: gzip response body: " + unzipped.err
-                body = unzipped.ok
+                body = unzipped!
                 decoded = true
             body_size = body.len()
-        # a request whose body was never sent leaves the server expecting it,
-        # so the connection is not used again
         reusable := body_sent and self.keep_alives and not parsed.wants_close and parsed.status != 101 and not request_prefers_close_header(req)
         return ClientResult(parsed, body, trailers, body_size, reusable, decoded)
 
@@ -5284,16 +5289,17 @@ impl Client:
             if deadline_passed(due):
                 return send_body
             fail NO_RESPONSE_MESSAGE
-        if arrived.ok <= 0:
+        if (arrived!) <= 0:
             fail NO_RESPONSE_MESSAGE
         arm_client_deadline(src.socket, deadline, true)
         while true:
-            raw := read_request_head(src, MAX_RESPONSE_HEADER_BYTES)
-            if raw.is_err:
-                fail client_timeout_failure(response_failure(raw.err), deadline, 0)
-            if raw.ok.is_empty():
+            got := read_request_head(src, MAX_RESPONSE_HEADER_BYTES)
+            if got.is_err:
+                fail client_timeout_failure(response_failure(got.err), deadline, 0)
+            raw := got!
+            if raw.is_empty():
                 fail NO_RESPONSE_MESSAGE
-            parsed := parse_response_head(raw.ok, req.method)!
+            parsed := parse_response_head(raw, req.method)!
             if parsed.status == 100:
                 return send_body
             if parsed.status >= 200 or parsed.status == 101:
@@ -5311,7 +5317,7 @@ fn client_write(c: WireConn, data: Bytes, deadline: Int) -> Int!:
         if deadline_passed(deadline):
             fail CLIENT_TIMEOUT_MESSAGE
         fail NO_RESPONSE_MESSAGE
-    return written.ok
+    return written!
 
 # whether `due`, a time on the mono_millis clock, has come. 0 never does. the
 # runtime never fails a read before its deadline, so a read that failed on one

@@ -1,0 +1,194 @@
+import std.net.http as http
+import std.io as io
+import std.bytes as bytes
+
+# request-parsing conformance for the http/1.1 server (rfc 9110, rfc 9112).
+#
+# each case sends raw request bytes down one in-memory connection through
+# http.serve_connection, followed by a valid `GET /after` request. a case prints
+# the status and Connection value of every response it got, so a rejected
+# request that leaves the connection open shows up as a second response.
+#
+# every case runs twice, once with a reader that fills 4096 bytes at a time and
+# once with one that fills 3, so a head terminator or chunk line split across
+# reads takes the same path as one that arrives whole.
+#
+# in the case text `~` stands for a NUL byte and a backtick for 0x01.
+
+AFTER := "GET /after HTTP/1.1\r\nHost: h\r\n\r\n"
+
+fn echo(req: http.HttpRequestBytes) -> http.HttpResponse:
+    mut path := req.path() catch "?"
+    if path == "/after":
+        return http.text(200, "ok").header("x-echo", "after")
+    if path.len() > 24:
+        path = path.substring(0, 24) + "..."
+    method := req.method() catch "?"
+    query := req.query() catch "?"
+    body := req.body_text() catch "?"
+    line := method + " " + path + " q=" + query + " host=" + req.header_or("Host", "") + " xa=[" + req.header_or("X-A", "") + "] body=[" + body + "]"
+    return http.text(200, "ok").header("x-echo", line)
+
+fn wire(text: String) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < text.len():
+        b := ord(text[i])
+        if b == 126:
+            out.write_byte(0) catch 0
+        elif b == 96:
+            out.write_byte(1) catch 0
+        else:
+            out.write_byte(b) catch 0
+        i = i + 1
+    return out.take_bytes()
+
+fn summarize(response_text: String) -> String:
+    mut parts: List[String] := []
+    mut current := ""
+    for raw_line in response_text.split("\r\n"):
+        # a body has no line ending of its own, so the next status line can
+        # start in the middle of a line
+        status_at := raw_line.index_of("HTTP/1.1 ")
+        mut line := raw_line
+        if status_at >= 0:
+            line = raw_line.substring(status_at, raw_line.len())
+        if status_at >= 0:
+            if current != "":
+                parts.push(current)
+            current = line.substring(9, 12)
+        elif line.to_lower().starts_with("connection: "):
+            current = current + " " + line.substring(12, line.len())
+        elif line.starts_with("x-echo: "):
+            current = current + " " + line.substring(8, line.len())
+    if current != "":
+        parts.push(current)
+    if parts.len() == 0:
+        return "no response"
+    return parts.join(" ; ")
+
+fn run_once(raw: Bytes, chunk: Int) -> String:
+    reader := io.bytes_reader(raw.concat(bytes.from_string_utf8(AFTER))).buffered_chunked(chunk)
+    sink := bytes.buffer()
+    writer := sink.buffered()
+    http.serve_connection(reader, writer, echo) catch 0
+    writer.flush() catch 0
+    out := bytes.decode_utf8(sink.bytes())
+    reader.free()
+    writer.free()
+    sink.free()
+    if out.is_err:
+        return "non-utf8 response"
+    return summarize(out.ok)
+
+fn check(name: String, text: String):
+    raw := wire(text)
+    whole := run_once(raw, 4096)
+    split := run_once(raw, 3)
+    if whole != split:
+        print(name + ": " + whole + " (split reads: " + split + ")")
+    else:
+        print(name + ": " + whole)
+
+fn main() -> Int:
+    long_target := "/" + "a".repeat(9000)
+
+    print("-- valid forms --")
+    check("origin form", "GET /a?x=1 HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("http/1.0 without host", "GET /old HTTP/1.0\r\n\r\n")
+    check("http/1.0 keep-alive", "GET /old HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+    check("absolute form", "GET http://example.com:8080/abs?q=1 HTTP/1.1\r\nHost: other\r\n\r\n")
+    check("absolute form no path", "GET http://example.com HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    check("options asterisk", "OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("connect authority", "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+    check("leading empty line", "\r\nGET /lead HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("leading bare lf", "\nGET /lead HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("bare lf head", "GET /lf HTTP/1.1\nHost: h\nX-A: v\n\n")
+    check("mixed line endings", "GET /mix HTTP/1.1\r\nHost: h\n\r\n")
+    check("ows trimmed", "GET / HTTP/1.1\r\nHost: h\r\nX-A: \t spaced value \t\r\n\r\n")
+    check("empty value", "GET / HTTP/1.1\r\nHost: h\r\nX-A:\r\n\r\n")
+    check("names case-insensitive", "GET / HTTP/1.1\r\nhOsT: h\r\nx-a: v\r\n\r\n")
+    check("duplicates combined", "GET / HTTP/1.1\r\nHost: h\r\nX-A: 1\r\nx-a: 2\r\n\r\n")
+    check("host with port", "GET / HTTP/1.1\r\nHost: h.example:8080\r\n\r\n")
+    check("host ipv6", "GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n")
+    check("empty host", "GET / HTTP/1.1\r\nHost:\r\n\r\n")
+    check("content-length body", "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc")
+    check("identical content-length", "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc")
+    check("chunked body", "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")
+    check("chunked case", "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: Chunked\r\n\r\n1\r\nz\r\n0\r\n\r\n")
+    check("chunk extension", "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3;name=val\r\nabc\r\n0;last\r\n\r\n")
+    check("chunk trailers", "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\nX-Trailer: t\r\nX-Other: u\r\n\r\n")
+    check("chunk upper hex", "POST /c HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nA\r\n0123456789\r\n0\r\n\r\n")
+    check("chunked bare lf", "POST /c HTTP/1.1\nHost: h\nTransfer-Encoding: chunked\n\n3\nabc\n0\n\n")
+
+    print("-- request line --")
+    check("garbage", "GARBAGE\r\n\r\n")
+    check("bad version", "GET / HTTP/1.x\r\nHost: h\r\n\r\n")
+    check("lowercase version", "GET / http/1.1\r\nHost: h\r\n\r\n")
+    check("version without minor", "GET / HTTP/1\r\nHost: h\r\n\r\n")
+    check("version two digits", "GET / HTTP/1.10\r\nHost: h\r\n\r\n")
+    check("version 2.0", "GET / HTTP/2.0\r\nHost: h\r\n\r\n")
+    check("version 0.9", "GET / HTTP/0.9\r\nHost: h\r\n\r\n")
+    check("missing version", "GET /\r\nHost: h\r\n\r\n")
+    check("double space", "GET  / HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("trailing space", "GET / HTTP/1.1 \r\nHost: h\r\n\r\n")
+    check("tab separator", "GET\t/ HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("method not a token", "G(T / HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("empty method", " / HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("target not origin form", "GET foo HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("asterisk not options", "GET * HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("authority not connect", "GET example.com:80 HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("connect origin form", "CONNECT /x HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("target with space", "GET /a b HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("target with ctl", "GET /a`b HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("long target", "GET " + long_target + " HTTP/1.1\r\nHost: h\r\n\r\n")
+    check("bare cr in request line", "GET / HTTP/1.1\rHost: h\r\n\r\n")
+
+    print("-- header fields --")
+    check("no colon", "GET / HTTP/1.1\r\nHost: h\r\nNoColonHere\r\n\r\n")
+    check("space before colon", "GET / HTTP/1.1\r\nHost : h\r\n\r\n")
+    check("tab before colon", "GET / HTTP/1.1\r\nHost: h\r\nX-A\t: v\r\n\r\n")
+    check("empty name", "GET / HTTP/1.1\r\nHost: h\r\n: v\r\n\r\n")
+    check("name not a token", "GET / HTTP/1.1\r\nHost: h\r\nX(A): v\r\n\r\n")
+    check("obs-fold space", "GET / HTTP/1.1\r\nHost: h\r\nX-A: 1\r\n 2\r\n\r\n")
+    check("obs-fold tab", "GET / HTTP/1.1\r\nHost: h\r\nX-A: 1\r\n\t2\r\n\r\n")
+    check("leading whitespace header", "GET / HTTP/1.1\r\n Host: h\r\n\r\n")
+    check("nul in value", "GET / HTTP/1.1\r\nHost: h\r\nX-A: a~b\r\n\r\n")
+    check("ctl in value", "GET / HTTP/1.1\r\nHost: h\r\nX-A: a`b\r\n\r\n")
+    check("del in value", "GET / HTTP/1.1\r\nHost: h\r\nX-A: a" + chr(127) + "b\r\n\r\n")
+    check("bare cr in value", "GET / HTTP/1.1\r\nHost: h\r\nX-A: a\rb\r\n\r\n")
+    check("bare cr line end", "GET / HTTP/1.1\r\nHost: h\r\nX-A: a\r\r\n\r\n")
+
+    print("-- host --")
+    check("missing host", "GET / HTTP/1.1\r\n\r\n")
+    check("two hosts", "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n")
+    check("host with space", "GET / HTTP/1.1\r\nHost: a b\r\n\r\n")
+    check("host with slash", "GET / HTTP/1.1\r\nHost: a/b\r\n\r\n")
+    check("host with userinfo", "GET / HTTP/1.1\r\nHost: u@a\r\n\r\n")
+    check("absolute form wins", "GET http://target.example/x HTTP/1.1\r\nHost: header.example\r\n\r\n")
+    check("absolute form without host", "GET http://target.example/x HTTP/1.1\r\n\r\n")
+
+    print("-- framing --")
+    check("te and cl", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n0\r\n\r\n")
+    check("cl and te", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    check("differing content-length", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabcd")
+    check("content-length list", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3, 4\r\n\r\nabcd")
+    check("content-length non-digit", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 3a\r\n\r\nabc")
+    check("content-length negative", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: -1\r\n\r\n")
+    check("content-length plus", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: +3\r\n\r\nabc")
+    check("content-length empty", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length:\r\n\r\n")
+    check("content-length overflow", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 99999999999999999999\r\n\r\n")
+    check("content-length too large", "POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 20000000\r\n\r\n")
+    check("te final not chunked", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked, gzip\r\n\r\n0\r\n\r\n")
+    check("te gzip only", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\n\r\n")
+    check("te chunked twice", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked, chunked\r\n\r\n0\r\n\r\n")
+    check("te unknown coding", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: foo, chunked\r\n\r\n0\r\n\r\n")
+    check("te gzip then chunked", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    check("te on http/1.0", "POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    check("chunk size not hex", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n\r\n")
+    check("chunk size empty", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n\r\nabc\r\n0\r\n\r\n")
+    check("chunk size overflow", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n10000000000000001\r\nabc\r\n0\r\n\r\n")
+    check("chunk size too large", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\nffffff\r\nabc\r\n0\r\n\r\n")
+    check("chunk data missing crlf", "POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n0\r\n\r\n")
+    check("head too large", "GET / HTTP/1.1\r\nHost: h\r\nX-A: " + "b".repeat(70000) + "\r\n\r\n")
+    return 0

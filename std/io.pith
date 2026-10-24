@@ -319,6 +319,14 @@ impl BufferedBytesReader:
     fn read_until_bytes_including_bounded(sep: Bytes, cap: Int) -> Bytes!:
         return buffered_bytes_reader_read_until_with_sep_internal(self, sep, true, cap)
 
+    # reads through the empty line that ends an http-style head (see
+    # head_end), so a head whose lines end in LF alone is found as quickly as
+    # one whose lines end in CRLF. fails like read_until_bytes_including_bounded
+    # once more than `cap` bytes arrive without that line, and returns what
+    # arrived at end of stream.
+    fn read_head_bounded(cap: Int) -> Bytes!:
+        return buffered_bytes_reader_read_head_internal(self, cap)
+
     fn read_all_bytes() -> Bytes!:
         return read_all_buffered_bytes_reader(self)
 
@@ -1944,6 +1952,64 @@ fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReade
             if not cached.is_empty():
                 buf.write(cached)!
             buffered_bytes_reader_cache.insert(reader.handle, bytes.empty())
+            return buf.take_bytes()
+    return buf.take_bytes()
+
+## the offset just past the empty line that ends an http-style head in
+## `data`, or -1 when it holds no complete head yet. a line ends in LF or in
+## CRLF, so the head ends at the first LF that another LF or a CRLF follows.
+## the scan starts at `start`, which lets a caller skip bytes it has already
+## searched.
+pub fn head_end(data: Bytes, start: Int) -> Int:
+    n := data.len()
+    mut i := start
+    while i + 1 < n:
+        if data[i] == 10:
+            next := data[i + 1]
+            if next == 10:
+                return i + 2
+            if next == 13 and i + 2 < n and data[i + 2] == 10:
+                return i + 3
+        i = i + 1
+    return 0 - 1
+
+# the end of a head can start up to two bytes before the end of what has
+# arrived (an LF, then the CR of a CRLF), so those bytes stay cached for the
+# next scan.
+HEAD_END_OVERLAP := 2
+
+fn buffered_bytes_reader_read_head_internal(reader: BufferedBytesReader, cap: Int) -> Bytes!:
+    if not buffered_bytes_reader_source_handles.contains_key(reader.handle):
+        return bytes.empty()
+    # the common case: the whole head is already cached, so it comes back as
+    # one slice with no staging buffer
+    mut cached := buffered_bytes_reader_cache_get(reader.handle)
+    mut end := head_end(cached, 0)
+    if end >= 0:
+        buffered_bytes_reader_consume(reader.handle, end)
+        return cached.slice(0, end)
+    buf := bytes.buffer()
+    # as in the read_until loop, the buffer has no destructor
+    errdefer buf.free()
+    while true:
+        if cached.len() > HEAD_END_OVERLAP:
+            flush_len := cached.len() - HEAD_END_OVERLAP
+            buf.write(cached.slice(0, flush_len))!
+            buffered_bytes_reader_consume(reader.handle, flush_len)
+        if cap > 0 and buf.len() > cap:
+            fail READ_UNTIL_LIMIT_PREFIX + "{cap} bytes without the separator"
+        filled := buffered_bytes_reader_fill(reader.handle)!
+        if filled <= 0:
+            cached = buffered_bytes_reader_cache.take(reader.handle)
+            if not cached.is_empty():
+                buf.write(cached)!
+            buffered_bytes_reader_cache.insert(reader.handle, bytes.empty())
+            return buf.take_bytes()
+        cached = buffered_bytes_reader_cache_get(reader.handle)
+        end = head_end(cached, 0)
+        if end >= 0:
+            buf.write(cached.slice(0, end))!
+            buffered_bytes_reader_consume(reader.handle, end)
             return buf.take_bytes()
     return buf.take_bytes()
 

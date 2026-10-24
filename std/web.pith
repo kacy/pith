@@ -510,6 +510,19 @@ pub fn circuit(breaker: resilience.Breaker) -> fn(fn(Request) -> http.HttpRespon
             breaker.success()
         return resp
 
+# a middleware that answers 413 to a request whose body is longer than
+# `limit` bytes, the per-route counterpart of http.MaxBytesReader. the server
+# has already read the body by the time a middleware runs, bounded by the
+# app's ServerConfig.max_body_bytes, so that is what caps memory; this narrows
+# the limit for the routes it wraps, through use_mw or group:
+#
+#   app := web.new().group("/upload", web.max_body(1048576))
+pub fn max_body(limit: Int) -> fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse:
+    return fn(next: fn(Request) -> http.HttpResponse, req: Request):
+        if req.raw.body.len() > limit:
+            return http.text(413, http.reason_phrase(413))
+        return next(req)
+
 # the path parameters named in a route's pattern (its `:name` and `*name`
 # segments), pulled out of the request path's segments so a handler can read
 # them by name. each value is percent-decoded.

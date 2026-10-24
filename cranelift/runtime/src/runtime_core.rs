@@ -1066,6 +1066,28 @@ mod tests {
     }
 
     #[test]
+    fn concat_many_joins_its_parts_like_a_chain_of_concats() {
+        unsafe {
+            let a = crate::pith_copy_bytes_to_cstring(b"ab");
+            let b = crate::pith_copy_bytes_to_cstring(b"");
+            let c = crate::pith_copy_bytes_to_cstring(b"cde");
+            let null = std::ptr::null();
+            let joined = pith_concat_cstr_many(4, a, null, b, c, a, a, a, a);
+            assert_eq!(std::ffi::CStr::from_ptr(joined).to_bytes(), b"abcde");
+            assert_eq!(cstring_header_len(joined), Some(5));
+            assert_eq!(heap_refcount(joined), 1);
+            let all = pith_concat_cstr_many(8, a, a, a, a, a, a, a, c);
+            assert_eq!(std::ffi::CStr::from_ptr(all).to_bytes(), b"abababababababcde");
+            assert!(pith_concat_cstr_many(2, null, null, a, a, a, a, a, a).is_null());
+            // the parts keep their own counts
+            assert_eq!(heap_refcount(a), 1);
+            for s in [joined, all, a, b, c] {
+                pith_cstring_release(s);
+            }
+        }
+    }
+
+    #[test]
     fn count_release_returns_the_count_before() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let count = AtomicU32::new(3);
@@ -1254,6 +1276,52 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
 
     std::ptr::copy_nonoverlapping(a, result, len_a);
     std::ptr::copy_nonoverlapping(b, result.add(len_a), len_b);
+    result
+}
+
+/// The most strings one `pith_concat_cstr_many` call joins. The consumer
+/// splits a longer chain into calls of at most this many.
+pub const CONCAT_MANY_MAX: usize = 8;
+
+/// Join the first `count` of up to eight strings into one fresh string, the
+/// way a chain of `pith_concat_cstr` calls would, with one allocation and one
+/// copy of each part instead of one per step. A null part is empty; with
+/// every part null the result is null, as `pith_concat_cstr(null, null)` is.
+/// The consumer turns `a + b + c ...` into this.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pith_concat_cstr_many(
+    count: i64,
+    s0: *const i8,
+    s1: *const i8,
+    s2: *const i8,
+    s3: *const i8,
+    s4: *const i8,
+    s5: *const i8,
+    s6: *const i8,
+    s7: *const i8,
+) -> *mut i8 {
+    let all = [s0, s1, s2, s3, s4, s5, s6, s7];
+    let parts = &all[..(count.max(0) as usize).min(CONCAT_MANY_MAX)];
+    if parts.iter().all(|p| p.is_null()) {
+        return std::ptr::null_mut();
+    }
+    let mut lens = [0usize; CONCAT_MANY_MAX];
+    let mut total = 0usize;
+    for (i, &part) in parts.iter().enumerate() {
+        if !part.is_null() {
+            lens[i] = string::pith_cstring_len(part) as usize;
+            total += lens[i];
+        }
+    }
+    let result = pith_alloc_cstring(total);
+    let mut at = 0usize;
+    for (i, &part) in parts.iter().enumerate() {
+        if lens[i] > 0 {
+            std::ptr::copy_nonoverlapping(part, result.add(at), lens[i]);
+            at += lens[i];
+        }
+    }
     result
 }
 

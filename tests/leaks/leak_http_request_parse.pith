@@ -17,11 +17,7 @@ import std.net.http as http
 fn handle(req: http.HttpRequestBytes) -> http.HttpResponse:
     mut n := req.header_or("X-A", "").len()
     n = n + req.query_param_or("id", "").len()
-    # bound first: `(req.path_parts() catch []).len()` leaks the list on its
-    # own, whatever function returns it, which is not what this case measures
-    parts := req.path_parts() catch:
-        return http.text(500, "")
-    n = n + parts.len()
+    n = n + (req.path_parts() catch []).len()
     n = n + req.header_fields().len()
     n = n + (req.body_text() catch "").len()
     n = n + (req.headers() catch "").len()

@@ -383,10 +383,11 @@ impl WaitBudget {
                 if at <= now {
                     return 0;
                 }
-                // round any sub-millisecond remainder up: `0` would mean "do not
-                // wait", which is a timeout the deadline has not reached yet.
-                let left = at.duration_since(now).as_millis().min(i64::MAX as u128) as i64;
-                std::cmp::max(1, left)
+                // round the remainder up to whole milliseconds: rounding down
+                // would give up just before the deadline, and `0` would mean
+                // "do not wait", which is a timeout the deadline has not reached.
+                let nanos = at.duration_since(now).as_nanos();
+                nanos.div_ceil(1_000_000).min(i64::MAX as u128) as i64
             }
             _ => -1,
         };

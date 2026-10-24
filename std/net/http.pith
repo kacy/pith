@@ -4218,6 +4218,12 @@ struct WireConn:
     mut idle_since: Int
     mut reused: Bool
 
+# a tls config that names none. config handles start at 0 and a Config
+# closes its handle when dropped, so a placeholder must use a handle that is
+# never issued.
+fn no_tls_config() -> tls.Config:
+    return tls.Config(0 - 1)
+
 fn plain_wire(stream: TcpStream, key: String) -> WireConn:
     return WireConn(stream, stream.buffered_bytes_reader_chunked(4096), stream.buffered_bytes_writer(), tls.Conn(0), false, key, 0, false)
 
@@ -4284,12 +4290,12 @@ fn send_request_once(req: ClientRequest) -> HttpResponse!:
         config := tls.client_config()!
         defer config.close()
         return send_request_wire(req, req.host, config)
-    return send_request_wire(req, req.host, tls.Config(0))
+    return send_request_wire(req, req.host, no_tls_config())
 
 fn send_request_once_with_tls_config(req: ClientRequest, tls_config: tls.Config) -> HttpResponse!:
     if req.use_tls:
         return send_request_wire(req, req.host, tls_config)
-    return send_request_wire(req, req.host, tls.Config(0))
+    return send_request_wire(req, req.host, no_tls_config())
 
 fn send_request_following_redirects(req: ClientRequest) -> HttpResponse!:
     mut current := req
@@ -4422,7 +4428,7 @@ fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedByt
             defer config.close()
             resp = send_request_wire_into(current, current.host, config, writer, current.redirect_limit > 0)!
         else:
-            resp = send_request_wire_into(current, current.host, tls.Config(0), writer, current.redirect_limit > 0)!
+            resp = send_request_wire_into(current, current.host, no_tls_config(), writer, current.redirect_limit > 0)!
         if redirects_left <= 0 or not redirect_status(resp.status):
             return resp
         current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
@@ -4441,7 +4447,7 @@ fn send_request_following_redirects_into_with_tls_config(req: ClientRequest, tls
             redirects_left = redirects_left - 1
             current = ClientRequest(current.method, current.host, current.port, current.path, copy_headers_map(current.headers), current.body, current.use_tls, current.timeout_ms, redirects_left)
             continue
-        resp := send_request_wire_into(current, current.host, tls.Config(0), writer, current.redirect_limit > 0)!
+        resp := send_request_wire_into(current, current.host, no_tls_config(), writer, current.redirect_limit > 0)!
         if redirects_left <= 0 or not redirect_status(resp.status):
             return resp
         current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
@@ -4692,9 +4698,10 @@ struct ConnPool:
 #     the server's 100 Continue before the body is sent anyway. a final
 #     response that arrives first is returned without the body being sent.
 #     0 sends the body with the head, without waiting.
-#   * tls_config: the tls config for https origins, or a zero handle for the
-#     default one. the caller owns it and closes it after the client's last
-#     request.
+#   * tls_config: the tls config for https origins, set with
+#     with_tls_config. the caller owns it and closes it after the client's
+#     last request. without one, each new connection uses the default client
+#     config.
 #
 # a Client is safe to share between tasks: the idle connections are guarded
 # by a lock, and a connection is used by one request at a time.
@@ -4724,7 +4731,7 @@ DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS := 1000
 # origin kept for 90 seconds, up to 10 redirects, gzip asked for and decoded,
 # and a 1 second wait for 100 Continue.
 pub fn client() -> Client:
-    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, true, DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS, tls.Config(0), ConnPool({}, Mutex(), 0))
+    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, true, DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS, no_tls_config(), ConnPool({}, Mutex(), 0))
 
 # a request for `method` and an absolute http or https url, as net/http's
 # NewRequest builds one.
@@ -5005,7 +5012,7 @@ impl Client:
     # run the tls handshake over a new connection, with tls_config or the
     # default config. the stream is closed when it fails.
     fn handshake(stream: TcpStream, req: ClientRequest, key: String) -> WireConn!:
-        if self.tls_config.handle != 0:
+        if self.tls_config.handle >= 0:
             return tls_wire(stream, req.host, self.tls_config, key)
         config := tls.client_config()
         if config.is_err:

@@ -37,7 +37,7 @@ use crate::concurrency::green;
 use crate::concurrency::scheduler::{backend, Backend};
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -190,9 +190,19 @@ impl<T> Slot<T> {
 
     /// publish the result and wake the waiting task. the store happens first so
     /// the task cannot resume and find the slot still empty.
+    ///
+    /// the fence pairs with the one in `take`. `green::wake` drops a wake for a
+    /// task that is already `Ready`, on the grounds that the task will check
+    /// again when it runs. that check is the task's read of `ready`, after it
+    /// claims its scheduling word, while this side stores `ready` and then reads
+    /// the word: the store-buffer shape, where without a full fence on both
+    /// sides each can read the other's old value. the wake was then dropped
+    /// against a stale `Ready` and the task read a stale `false` and parked for
+    /// good. 32 tasks reading files on 32 workers hung in most runs.
     fn complete(&self, value: T) {
         *lock(&self.value) = Some(value);
         self.ready.store(true, Ordering::Release);
+        fence(Ordering::SeqCst);
         green::wake(self.task);
     }
 
@@ -201,8 +211,10 @@ impl<T> Slot<T> {
         self.ready.load(Ordering::Acquire)
     }
 
-    /// take the result if it has arrived.
+    /// take the result if it has arrived. the fence pairs with the one in
+    /// `complete`; see there.
     fn take(&self) -> Option<T> {
+        fence(Ordering::SeqCst);
         if !self.is_ready() {
             return None;
         }

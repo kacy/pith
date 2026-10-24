@@ -71,6 +71,10 @@ pub struct Event:
 # from emit_record on a Logger that already carries its own copy.
 mut settings_mu := Mutex()
 mut min_level: Int := LEVEL_DEBUG
+# min_level again, readable without the lock. a call below the level returns
+# before it builds a logger, so a service with debug logging off does not take
+# settings_mu once per debug line: 32 tasks doing that ran slower than one.
+mut min_level_cell := AtomicInt(LEVEL_DEBUG)
 mut sink_path: String := ""
 mut output_format: Int := FORMAT_CONSOLE
 
@@ -180,6 +184,7 @@ pub fn set_level(level: Int):
 fn log_set_level(level: Int):
     settings_mu.lock()
     min_level = level
+    min_level_cell.store(level)
     settings_mu.unlock()
 
 # set the global output format.
@@ -474,10 +479,16 @@ fn emit_record(logger: Logger, level: Int, msg: String, fields: List[Field]):
     emit_line_to(logger.sink_path, line)
 
 fn log_line(level: String, msg: String):
-    emit_record(root(), level_num(level), msg, [])
+    rank := level_num(level)
+    if rank < min_level_cell.load():
+        return
+    emit_record(root(), rank, msg, [])
 
 fn log_kv(level: String, msg: String, fields: String):
-    emit_record(root(), level_num(level), msg, [raw_fields(fields)])
+    rank := level_num(level)
+    if rank < min_level_cell.load():
+        return
+    emit_record(root(), rank, msg, [raw_fields(fields)])
 
 # log a trace message.
 pub fn trace(msg: String):

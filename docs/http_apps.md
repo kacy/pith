@@ -338,6 +338,20 @@ the serve loops (`serve_connection`, `serve_connection_fd`, `serve_connection_tl
 
 the writer-level streaming helpers (`send_sized_response_head`, `send_chunked_response_head` and the helpers built on them) never see the request. they add no `Date` and cannot drop the body of a `HEAD` answer, so a caller streaming an answer to `HEAD` sends the head and skips the body itself. they do follow the status rules above for the framing fields.
 
+### what the server adds to a response
+
+the serve loops (`serve_connection`, `serve_connection_fd`, `serve_connection_tls`, `serve_one`, `serve_fd`) frame a handler's response the way rfc 9110 and rfc 9112 ask:
+
+- every response carries a `Date` in IMF-fixdate form, formatted at most once a second per connection task. a `Date` the handler set is sent in its place. `http.http_date(seconds)` formats a unix time the same way, for `Last-Modified` or `Expires`.
+- the answer to `HEAD` has the headers the handler's `GET` answer would have, including its `Content-Length`, and no body. a handler that answers `HEAD` without building the body can set `Content-Length` itself.
+- `1xx`, `204` and `304` responses never carry a body. `1xx` and `204` carry no `Content-Length` or `Transfer-Encoding`, and a `304` keeps a `Content-Length` only when the handler set one.
+- in every other response `Content-Length` is the length of the body sent. a different value the handler set is replaced, and a `Transfer-Encoding` it set is dropped, so the two never go out together.
+- an http/1.1 connection stays open unless the request or the handler lists `close` in `Connection`. then the response says `Connection: close` and the connection closes. a response on a connection that stays open carries no `Connection` field. an http/1.0 connection closes unless the request asks for `keep-alive`, and when it does the response echoes `Connection: keep-alive`.
+- a request with `Expect: 100-continue` and a body gets `HTTP/1.1 100 Continue` just before the server reads the body. the server reads the body before the handler runs, so the interim response goes out even when the handler ignores the body. any other expectation gets `417`, and the connection closes without the body being read. expectations on http/1.0 requests are ignored.
+- a status with no standard reason phrase is sent with an empty one.
+
+the writer-level streaming helpers (`send_sized_response_head`, `send_chunked_response_head` and the helpers built on them) never see the request. they add no `Date` and cannot drop the body of a `HEAD` answer, so a caller streaming an answer to `HEAD` sends the head and skips the body itself. they do follow the status rules above for the framing fields.
+
 ## streaming responses
 
 for larger bodies, you can stream the response instead of building one big

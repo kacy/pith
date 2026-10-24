@@ -48,11 +48,13 @@
 //!   pollers; epoll allows one fd in several instances.
 //! - `fds`: for each fd currently in the epoll set, the event mask presently
 //!   armed. arming is always recomputed from the waiter lists (`reconcile_fd`):
-//!   the first registrant on an fd does `EPOLL_CTL_ADD`, a change in the desired
-//!   interest set (or re-arming after a oneshot fire) does `EPOLL_CTL_MOD`, and
-//!   the last waiter leaving does `EPOLL_CTL_DEL`. keeping epoll state a pure
-//!   function of the waiter lists is what makes the arm/disarm bookkeeping easy to
-//!   reason about.
+//!   the first registrant on an fd does `EPOLL_CTL_ADD`, and a change in the
+//!   desired interest set (or re-arming after a oneshot fire) does
+//!   `EPOLL_CTL_MOD`. an fd stays in the set, disarmed, once its last waiter
+//!   leaves, so a connection that waits once per request pays one `MOD` per
+//!   wait instead of an `ADD` and a `DEL`; only `on_close` removes it. keeping
+//!   the armed mask a function of the waiter lists is what makes the
+//!   arm/disarm bookkeeping easy to reason about.
 //! - `deadlines`: a min-heap of timestamped entries for waits that carry a
 //!   finite timeout. a parking worker caps its `epoll_wait` timeout at the nearest
 //!   deadline and, on expiry, wakes the task with a timeout result. an entry
@@ -171,7 +173,7 @@ impl PartialOrd for Deadline {
 }
 
 /// the arm state of one fd in the epoll set. an fd is present in `Inner::fds`
-/// exactly while it is in the epoll interest set. `armed` is the event mask epoll
+/// while it is in the epoll interest set. `armed` is the event mask epoll
 /// currently reports on; it drops to 0 when a oneshot fire disarms the fd, which
 /// tells `reconcile_fd` it must re-`MOD` to arm any remaining interest.
 struct FdReg {
@@ -182,6 +184,9 @@ struct FdReg {
 struct Inner {
     waiters: HashMap<(RawFd, Interest), Vec<Waiter>>,
     fds: HashMap<RawFd, FdReg>,
+    /// how many entries of `fds` are armed. a disarmed fd cannot report
+    /// anything, so only an armed one gives a poll something to find.
+    armed_fds: usize,
     deadlines: BinaryHeap<std::cmp::Reverse<Deadline>>,
     /// sleeping tasks, keyed by the seq of their heap entry. a timer has no
     /// (fd, interest) to key on, and giving it its own map keeps it out of
@@ -195,6 +200,7 @@ impl Inner {
         Inner {
             waiters: HashMap::new(),
             fds: HashMap::new(),
+            armed_fds: 0,
             deadlines: BinaryHeap::new(),
             timers: HashMap::new(),
             next_seq: 0,
@@ -204,8 +210,25 @@ impl Inner {
     /// record in `busy` whether this registry has anything a poll could find.
     /// called at the end of every locked change.
     fn publish(&self, busy: &AtomicBool) {
-        let any = !self.fds.is_empty() || !self.deadlines.is_empty() || !self.timers.is_empty();
+        let any = self.armed_fds > 0 || !self.deadlines.is_empty() || !self.timers.is_empty();
         busy.store(any, AtomicOrdering::SeqCst);
+    }
+
+    /// record that `fd` is in the epoll set armed for `mask` (0: disarmed).
+    fn set_armed(&mut self, fd: RawFd, mask: u32) {
+        let was = self.fds.insert(fd, FdReg { armed: mask }).map_or(0, |r| r.armed);
+        self.armed_fds = self.armed_fds + usize::from(mask != 0) - usize::from(was != 0);
+    }
+
+    /// forget `fd`; returns whether it was in the epoll set.
+    fn forget_fd(&mut self, fd: RawFd) -> bool {
+        match self.fds.remove(&fd) {
+            Some(reg) => {
+                self.armed_fds -= usize::from(reg.armed != 0);
+                true
+            }
+            None => false,
+        }
     }
 
     /// the event mask an fd should currently be armed for: the union of the
@@ -310,43 +333,50 @@ impl Poller {
     }
 }
 
-/// arm/re-arm/disarm epoll for `fd` so its armed mask matches the current waiter
-/// lists. called under `inner` after any change to `fd`'s waiters (register,
-/// fire, timeout, close). keeping epoll state a pure function of the waiter lists
-/// is the whole arm/disarm story:
+/// arm epoll for `fd` so it reports what the current waiter lists want. called
+/// under `inner` after any change to `fd`'s waiters (register, fire, timeout).
 ///
-/// - no waiters, fd in the set  -> `EPOLL_CTL_DEL`, forget the fd.
 /// - waiters, fd not in the set -> `EPOLL_CTL_ADD` with `EPOLLONESHOT | desired`.
 /// - waiters, fd in the set, mask changed (a new interest, or re-arming after a
 ///   oneshot fire dropped `armed` to 0) -> `EPOLL_CTL_MOD`.
 /// - waiters, fd in the set, mask unchanged -> nothing (a second waiter on an
 ///   already-armed interest just rode along on the existing arm).
+/// - no waiters -> nothing. a fired fd is already disarmed, and one whose last
+///   waiter timed out may fire once more with nobody to wake, which costs a
+///   spurious poll and is cheaper than a `DEL` now and an `ADD` on the next
+///   wait.
+///
+/// an fd closed without `on_close` leaves a stale entry here, and the kernel
+/// has already dropped it from the set. if its number comes back as a new fd,
+/// the `MOD` fails with `ENOENT` and is retried as an `ADD`; the reverse case
+/// retries an `ADD` that fails with `EEXIST` as a `MOD`.
 fn reconcile_fd(poller: &Poller, inner: &mut Inner, fd: RawFd) {
     let desired = inner.desired_mask(fd);
-    match inner.fds.get_mut(&fd) {
-        None => {
-            if desired != 0 {
-                epoll_apply(poller.epfd, libc::EPOLL_CTL_ADD, fd, desired);
-                inner.fds.insert(fd, FdReg { armed: desired });
-            }
-        }
-        Some(reg) => {
-            if desired == 0 {
-                epoll_apply(poller.epfd, libc::EPOLL_CTL_DEL, fd, 0);
-                inner.fds.remove(&fd);
-            } else if reg.armed != desired {
-                epoll_apply(poller.epfd, libc::EPOLL_CTL_MOD, fd, desired);
-                reg.armed = desired;
-            }
-        }
+    if desired == 0 {
+        return;
     }
+    match inner.fds.get(&fd).map(|reg| reg.armed) {
+        None => {
+            if epoll_apply(poller.epfd, libc::EPOLL_CTL_ADD, fd, desired) == libc::EEXIST {
+                epoll_apply(poller.epfd, libc::EPOLL_CTL_MOD, fd, desired);
+            }
+        }
+        Some(armed) if armed != desired => {
+            if epoll_apply(poller.epfd, libc::EPOLL_CTL_MOD, fd, desired) == libc::ENOENT {
+                epoll_apply(poller.epfd, libc::EPOLL_CTL_ADD, fd, desired);
+            }
+        }
+        Some(_) => return,
+    }
+    inner.set_armed(fd, desired);
 }
 
-/// run one `epoll_ctl` op. `DEL` ignores its mask. errors are swallowed: a `DEL`
-/// on an already-closed fd races `pith_tcp_close` (ENOENT/EBADF, expected), and
-/// an `ADD`/`MOD` failure just means the task falls back to a spurious retry when
+/// run one `epoll_ctl` op and return its errno, or 0 on success. `DEL` ignores
+/// its mask. the caller decides which errors matter: a `DEL` on an
+/// already-closed fd races `pith_tcp_close` (ENOENT/EBADF, expected), and an
+/// `ADD`/`MOD` failure just means the task falls back to a spurious retry when
 /// no wake ever comes — never a crash.
-fn epoll_apply(epfd: RawFd, op: libc::c_int, fd: RawFd, mask: u32) {
+fn epoll_apply(epfd: RawFd, op: libc::c_int, fd: RawFd, mask: u32) -> i32 {
     let mut ev = libc::epoll_event {
         // oneshot on every real fd: a fire disarms it until we re-arm, so two
         // readiness events never queue up for the same wait.
@@ -361,8 +391,11 @@ fn epoll_apply(epfd: RawFd, op: libc::c_int, fd: RawFd, mask: u32) {
     // SAFETY: `epfd` is a poller's epoll fd; `fd` is a socket fd owned by pith
     // for the duration of the wait; `ev` (when used) is a valid event on this
     // stack. DEL passes a null event as the kernel allows.
-    unsafe {
-        libc::epoll_ctl(epfd, op, fd, ev_ptr);
+    let rc = unsafe { libc::epoll_ctl(epfd, op, fd, ev_ptr) };
+    if rc == 0 {
+        0
+    } else {
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
     }
 }
 
@@ -596,8 +629,8 @@ fn poll(index: usize, timeout: Duration) -> bool {
 
             // the oneshot fire disarmed this fd in the kernel; record that so
             // reconcile_fd re-arms any interest that still has waiters.
-            if let Some(reg) = inner.fds.get_mut(&fd) {
-                reg.armed = 0;
+            if inner.fds.contains_key(&fd) {
+                inner.set_armed(fd, 0);
             }
 
             // an error/hangup wakes both directions so the pending syscall can
@@ -832,7 +865,7 @@ pub(crate) fn on_close(fd: RawFd) {
                 }
             }
         }
-        if inner.fds.remove(&fd).is_some() {
+        if inner.forget_fd(fd) {
             // fd was in the epoll set; remove it. errors (already gone) ignored.
             epoll_apply(poller.epfd, libc::EPOLL_CTL_DEL, fd, 0);
         }
@@ -927,7 +960,7 @@ mod tests {
                     seq,
                     outcome: outcome.clone(),
                 });
-            inner.fds.insert(fd, FdReg { armed: libc::EPOLLIN as u32 });
+            inner.set_armed(fd, libc::EPOLLIN as u32);
         }
 
         on_close(fd);
@@ -1010,5 +1043,78 @@ mod tests {
 
         // still READY: on_close's compare_exchange only fires on a PENDING waiter.
         assert_eq!(outcome.load(AtomicOrdering::Acquire), READY);
+    }
+
+    fn socket_pair() -> (RawFd, RawFd) {
+        let mut fds = [0; 2];
+        // SAFETY: socketpair writes two fds into the array we pass.
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        (fds[0], fds[1])
+    }
+
+    fn add_read_waiter(inner: &mut Inner, fd: RawFd) {
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        inner.waiters.entry((fd, Interest::Read)).or_default().push(Waiter {
+            task: usize::MAX,
+            seq,
+            outcome: Arc::new(AtomicI32::new(PENDING)),
+        });
+    }
+
+    // a fired fd stays in the set disarmed, and a later wait re-arms it. if the
+    // fd was closed without `on_close` and its number reused, the stale entry
+    // must not swallow the new fd's arm: the MOD fails and is retried as an ADD.
+    #[test]
+    fn rearm_survives_a_stale_fd_entry() {
+        let poller = Poller::new();
+        let ready = |poller: &Poller| {
+            let mut ev = [libc::epoll_event { events: 0, u64: 0 }; 4];
+            // SAFETY: a zero-timeout wait on our own epoll fd into a local buffer.
+            let n = unsafe { libc::epoll_wait(poller.epfd, ev.as_mut_ptr(), 4, 0) };
+            ev[..n.max(0) as usize].iter().map(|e| e.u64).collect::<Vec<u64>>()
+        };
+        let (a, b) = socket_pair();
+        // SAFETY: writing one byte to a socket we own.
+        unsafe { libc::write(b, b"x".as_ptr().cast(), 1) };
+        let mut inner = lock_inner(&poller);
+        add_read_waiter(&mut inner, a);
+        reconcile_fd(&poller, &mut inner, a);
+        assert_eq!(ready(&poller), vec![a as u64]);
+
+        // what a poll does with that fire: drop the waiters, mark it disarmed.
+        inner.waiters.clear();
+        inner.set_armed(a, 0);
+        reconcile_fd(&poller, &mut inner, a);
+        assert!(inner.fds.contains_key(&a), "a fired fd stays in the set");
+        assert_eq!(inner.armed_fds, 0);
+
+        // close both ends behind the registry's back and take the number again.
+        // SAFETY: closing fds this test opened.
+        unsafe {
+            libc::close(a);
+            libc::close(b);
+        }
+        let (c, d) = socket_pair();
+        if c != a {
+            // something else took the number; nothing to check.
+            unsafe {
+                libc::close(c);
+                libc::close(d);
+            }
+            return;
+        }
+        // SAFETY: as above.
+        unsafe { libc::write(d, b"x".as_ptr().cast(), 1) };
+        add_read_waiter(&mut inner, c);
+        reconcile_fd(&poller, &mut inner, c);
+        assert_eq!(inner.armed_fds, 1);
+        assert_eq!(ready(&poller), vec![c as u64], "the reused fd must be armed");
+        drop(inner);
+        unsafe {
+            libc::close(c);
+            libc::close(d);
+        }
     }
 }

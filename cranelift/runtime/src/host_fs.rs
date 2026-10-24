@@ -234,6 +234,25 @@ pub unsafe extern "C" fn pith_file_size(path: *const i8) -> i64 {
     -1
 }
 
+/// Read a file's modification time, in whole seconds since the unix epoch.
+/// Returns -1 when metadata cannot be read or the time is before the epoch.
+///
+/// # Safety
+/// path must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn pith_file_mtime(path: *const i8) -> i64 {
+    let Some(path_str) = cstr_str(path) else {
+        return -1;
+    };
+    let Ok(modified) = std::fs::metadata(path_str).and_then(|meta| meta.modified()) else {
+        return -1;
+    };
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since) => since.as_secs() as i64,
+        Err(_) => -1,
+    }
+}
+
 /// Remove a file
 ///
 /// # Safety
@@ -676,6 +695,7 @@ mod tests {
         unsafe {
             assert_eq!(pith_file_exists(ptr), 0);
             assert_eq!(pith_file_size(ptr), -1);
+            assert_eq!(pith_file_mtime(ptr), -1);
             assert_eq!(pith_write_file(ptr, b"x\0".as_ptr() as *const i8), 0);
             assert!(pith_read_file(ptr).is_null());
             assert_eq!(pith_os_chdir(ptr), 0);

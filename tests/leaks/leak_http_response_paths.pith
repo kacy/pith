@@ -1,0 +1,52 @@
+# the server's response paths: the cached Date, the answer to HEAD, the
+# bodiless statuses, a 100 Continue before a body, a 417 for an expectation
+# the server does not meet, and the Connection value decided per request.
+#
+# a round serves one in-memory connection: a GET, a HEAD, a 304 and a 204, an
+# http/1.0 keep-alive request, a POST that expects 100-continue, and a request
+# with an unknown expectation, which is answered with 417 and ends the
+# connection. a per-round leak in any of those paths moves the peak between the
+# two round counts.
+import leakprobe as probe
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+
+fn handle(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "?"
+    if path == "/304":
+        return http.response(304).header("ETag", "\"v\"").with_body_text("stale")
+    if path == "/204":
+        return http.response(204).header("Content-Length", "4")
+    return http.text(200, path + (req.body_text() catch ""))
+
+fn round(wire: Bytes) -> Int:
+    cursor := io.bytes_reader(wire)
+    defer cursor.close()
+    reader := cursor.buffered_chunked(256)
+    defer reader.free()
+    sink := bytes.buffer()
+    defer sink.free()
+    writer := sink.buffered()
+    defer writer.free()
+    return http.serve_connection(reader, writer, handle) catch 0
+
+fn main():
+    mut wire := "GET /a HTTP/1.1\r\nHost: h\r\n\r\n"
+    wire = wire + "HEAD /a HTTP/1.1\r\nHost: h\r\n\r\n"
+    wire = wire + "GET /304 HTTP/1.1\r\nHost: h\r\n\r\n"
+    wire = wire + "GET /204 HTTP/1.1\r\nHost: h\r\n\r\n"
+    wire = wire + "GET /old HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"
+    wire = wire + "POST /p HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\nContent-Length: 3\r\n\r\nabc"
+    wire = wire + "POST /p HTTP/1.1\r\nHost: h\r\nExpect: nope\r\nContent-Length: 3\r\n\r\nabc"
+    stream := bytes.from_string_utf8(wire)
+    # a round is seven requests, so a quarter of the round count keeps the
+    # case quick
+    n := probe.rounds() / 4
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + round(stream)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

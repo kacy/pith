@@ -882,6 +882,7 @@ NOT_IMPLEMENTED_PREFIX := "http: not implemented: "
 TARGET_LIMIT_MESSAGE := "http: request target exceeds the maximum"
 VERSION_MESSAGE := "http: http version not supported"
 INCOMPLETE_HEAD_MESSAGE := "http: request head ended early"
+EXPECTATION_MESSAGE := "http: expectation failed"
 
 fn bad_request(reason: String) -> String:
     return BAD_REQUEST_PREFIX + reason
@@ -901,6 +902,8 @@ fn request_error_status(message: String) -> Int:
         return 501
     if message == VERSION_MESSAGE:
         return 505
+    if message == EXPECTATION_MESSAGE:
+        return 417
     return 0
 
 # a request head checked by parse_request_head. `head` starts at the request
@@ -908,8 +911,8 @@ fn request_error_status(message: String) -> Int:
 # and its query query_start..target_end (query_start is -1 without a "?").
 # authority_start..authority_end is the authority of an absolute-form or
 # authority-form target, which replaces the Host field (rfc 9112 3.2.2), or -1.
-# `wants_close` is whether the Connection field asks to close after this
-# exchange (rfc 9112 9.3).
+# `expect` is one of the EXPECT_ codes, and `wants_close` is whether the
+# Connection field asks to close after this exchange (rfc 9112 9.3).
 struct RequestHead:
     head: Bytes
     method_end: Int
@@ -922,7 +925,14 @@ struct RequestHead:
     minor: Int
     content_length: Int
     chunked: Bool
+    expect: Int
     wants_close: Bool
+
+# what an Expect field asks for (rfc 9110 10.1.1): nothing, a 100 Continue
+# before the body, or something this server does not do.
+EXPECT_NONE := 0
+EXPECT_CONTINUE := 1
+EXPECT_OTHER := 2
 
 # whether the comma-separated list in data[start..end] holds `token`, compared
 # case-insensitively (rfc 9110 5.6.1). empty elements are skipped.
@@ -1129,6 +1139,7 @@ fn parse_request_head(raw: Bytes, server: Bool) -> RequestHead!:
     mut te_last_chunked := false
     mut te_chunked_count := 0
     mut te_other := false
+    mut expect := EXPECT_NONE
     mut has_close := false
     mut has_keep_alive := false
     while true:
@@ -1206,6 +1217,11 @@ fn parse_request_head(raw: Bytes, server: Bool) -> RequestHead!:
         elif name_len == 10 and header_name_matches(head, line_start, name_end, "connection"):
             has_close = has_close or list_has_token(head, value_start, value_end, "close")
             has_keep_alive = has_keep_alive or list_has_token(head, value_start, value_end, "keep-alive")
+        elif name_len == 6 and header_name_matches(head, line_start, name_end, "expect") and value_end > value_start:
+            if expect != EXPECT_OTHER and header_name_matches(head, value_start, value_end, "100-continue"):
+                expect = EXPECT_CONTINUE
+            else:
+                expect = EXPECT_OTHER
 
     if server:
         if host_count > 1:
@@ -1227,7 +1243,7 @@ fn parse_request_head(raw: Bytes, server: Bool) -> RequestHead!:
         fail BODY_LIMIT_MESSAGE
     if content_length < 0:
         content_length = 0
-    return RequestHead(head, method_end, target_end, path_start, path_end, query_start, authority_start, authority_end, minor, content_length, te_seen, connection_closes(minor == 0, has_close, has_keep_alive))
+    return RequestHead(head, method_end, target_end, path_start, path_end, query_start, authority_start, authority_end, minor, content_length, te_seen, expect, connection_closes(minor == 0, has_close, has_keep_alive))
 
 # decode part of a checked head as text. the request line holds no CTLs, but
 # it may hold bytes that are not utf-8, and that is a bad request.
@@ -2623,13 +2639,28 @@ struct ServerRequest:
     req: HttpRequestBytes
     wants_close: Bool
 
+CONTINUE_RESPONSE := "HTTP/1.1 100 Continue\r\n\r\n"
+
 # read one request as the server does: the head, checked with the Host rules,
 # then its body.
+#
+# an http/1.1 request that expects 100-continue (rfc 9110 10.1.1) is sent the
+# interim response just before its body is read. the body is read before the
+# handler runs, so that is as late as the server can send it; a handler that
+# never looks at the body still has it read. any other expectation fails with
+# 417 before the body is read, and the connection then closes, so the unread
+# body is never taken for the next request. an http/1.0 request's
+# expectations are ignored.
 fn read_server_request(src: ByteSource, writer: BufferedBytesWriter) -> ServerRequest!:
     raw := read_request_head(src)!
     if raw.is_empty():
         return ServerRequest(empty_request(), true)
     parsed := parse_request_head(raw, true)!
+    if parsed.minor >= 1 and parsed.expect != EXPECT_NONE:
+        if parsed.expect != EXPECT_CONTINUE:
+            fail EXPECTATION_MESSAGE
+        if parsed.chunked or parsed.content_length > 0:
+            source_write(src, writer, bytes.from_string_utf8(CONTINUE_RESPONSE))!
     return ServerRequest(request_from_head(parsed, read_request_body(src, parsed)!)!, parsed.wants_close)
 
 # like read_request_from, but the body goes to `writer` as it arrives, with no

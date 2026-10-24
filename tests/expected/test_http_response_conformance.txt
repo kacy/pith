@@ -20,13 +20,13 @@ get explicit length: HTTP/1.1 200 OK|Content-Length: 0|Date: <imf-fixdate>|HTTP/
 wrong explicit length: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
 handler transfer-encoding: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
 -- expect --
-100-continue: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
-100-continue case: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
-100-continue chunked: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+100-continue: HTTP/1.1 100 Continue|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+100-continue case: HTTP/1.1 100 Continue|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+100-continue chunked: HTTP/1.1 100 Continue|HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
 100-continue without body: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
 100-continue on http/1.0: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|Connection: keep-alive|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
-unknown expectation: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 3|Date: <imf-fixdate>|abcHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
-unknown expectation without body: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
+unknown expectation: HTTP/1.1 417 Expectation Failed|Content-Type: text/plain|Content-Length: 18|Date: <imf-fixdate>|Connection: close|Expectation Failed
+unknown expectation without body: HTTP/1.1 417 Expectation Failed|Content-Type: text/plain|Content-Length: 18|Date: <imf-fixdate>|Connection: close|Expectation Failed
 unknown expectation on http/1.0: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|Connection: keep-alive|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after
 -- connection --
 http/1.1 persistent: HTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|helloHTTP/1.1 200 OK|Content-Type: text/plain|Content-Length: 5|Date: <imf-fixdate>|after

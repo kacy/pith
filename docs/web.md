@@ -624,6 +624,10 @@ it through the middleware chain like any other request. cors middleware
 intercepts the preflight ones; the rest get the ordinary `Allow` answer. an
 `OPTIONS` to a path no route claims is still a 404.
 
+`OPTIONS *` asks about the server rather than a path (rfc 9110 9.3.7).
+`std.web` answers it with `200`, an empty body and an `Allow` header that
+lists every method the app's routes use, again through the app-wide middleware.
+
 ## observability
 
 a server built with `web.new()` is observable out of the box. every route is wrapped

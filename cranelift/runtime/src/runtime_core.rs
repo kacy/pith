@@ -1231,24 +1231,23 @@ pub unsafe extern "C" fn pith_cstring_eq(a: *const i8, b: *const i8) -> i64 {
     if std::ptr::eq(a, b) {
         return 1;
     }
-
-    let mut pa = a;
-    let mut pb = b;
-    loop {
-        let ca = *pa;
-        let cb = *pb;
-
-        if ca != cb {
-            return 0;
-        }
-
-        if ca == 0 {
-            return 1;
-        }
-
-        pa = pa.add(1);
-        pb = pb.add(1);
+    // most unequal pairs differ in the first byte, which settles it before
+    // either length is taken. an empty string's first byte is its zero
+    // terminator, so this holds for empty strings too.
+    if *a != *b {
+        return 0;
     }
+    // compare by length, then bytes. a heap string's length is one header
+    // read, and a string holding a zero byte compares in full rather than
+    // stopping at the zero.
+    let la = crate::string::pith_cstring_len(a) as usize;
+    let lb = crate::string::pith_cstring_len(b) as usize;
+    if la != lb {
+        return 0;
+    }
+    let sa = std::slice::from_raw_parts(a as *const u8, la);
+    let sb = std::slice::from_raw_parts(b as *const u8, lb);
+    (sa == sb) as i64
 }
 
 #[no_mangle]
@@ -2268,39 +2267,16 @@ pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_cstr(n: i64) -> *mut i8 {
-    let mut buf = [0u8; 20];
-    let start = decimal_digits(n.unsigned_abs(), &mut buf);
-    if n >= 0 {
-        return pith_copy_bytes_to_cstring(&buf[start..]);
-    }
-    let digits = buf.len() - start;
-    let ptr = pith_alloc_cstring(digits + 1);
-    *(ptr as *mut u8) = b'-';
-    std::ptr::copy_nonoverlapping(buf[start..].as_ptr(), (ptr as *mut u8).add(1), digits);
-    ptr
+    let s = n.to_string();
+    let len = s.len();
+    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_uint_to_cstr(n: i64) -> *mut i8 {
-    let mut buf = [0u8; 20];
-    let start = decimal_digits(n as u64, &mut buf);
-    pith_copy_bytes_to_cstring(&buf[start..])
-}
-
-/// Write `n` in decimal at the end of `buf` and return the index of its
-/// first digit. Formatting into a stack buffer leaves a number's text with
-/// one allocation, the string that holds it; `to_string` built a heap
-/// `String` first and copied out of it.
-fn decimal_digits(mut n: u64, buf: &mut [u8; 20]) -> usize {
-    let mut i = buf.len();
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            return i;
-        }
-    }
+    let s = (n as u64).to_string();
+    let len = s.len();
+    pith_copy_bytes_to_cstring(&s.as_bytes()[..len])
 }
 
 #[no_mangle]

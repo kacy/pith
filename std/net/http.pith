@@ -4002,6 +4002,83 @@ fn lower_hex_int(value: Int) -> String:
         n = n / 16
     return out
 
+# the Host value for an origin: the host, bracketed when it is an ipv6
+# literal, and the port when it is not the scheme's default (rfc 9110 7.2).
+fn host_header_value(host: String, port: Int, use_tls: Bool) -> String:
+    mut name := host
+    if host.index_of(":") >= 0 and not host.starts_with("["):
+        name = "[" + host + "]"
+    if port > 0 and port != request_default_port(use_tls):
+        return name + ":" + port.to_string()
+    return name
+
+# whether a request's body goes out chunked: it names a Transfer-Encoding of
+# chunked. any other Transfer-Encoding a request names is dropped, and the
+# body is sent with a Content-Length.
+fn request_sends_chunked(req: ClientRequest) -> Bool:
+    return header_lookup(req.headers, "Transfer-Encoding").trim().to_lower() == "chunked"
+
+# whether a request with an empty body still says Content-Length: 0. as in
+# net/http, only the methods that expect a body do.
+fn method_expects_body(method: String) -> Bool:
+    return method == "POST" or method == "PUT" or method == "PATCH"
+
+# the head of `req` for the request-target `target`. the request's own fields
+# are written with CR, LF and NUL stripped, then Host when the request names
+# none, `connection` when it is not empty and the request names no
+# Connection, Accept-Encoding: gzip when `accept_gzip` is set and the request
+# names none, and the framing of the body. a Content-Length or
+# Transfer-Encoding the request names is replaced by the framing that matches
+# the body.
+fn request_head_bytes(req: ClientRequest, target: String, connection: String, accept_gzip: Bool) -> Bytes:
+    crlf := chr(13) + chr(10)
+    out := bytes.buffer()
+    mut line := strip_header_controls(req.method) + " " + strip_header_controls(target) + " HTTP/1.1" + crlf
+    if header_lookup(req.headers, "Host") == "":
+        line = line + "Host: " + strip_header_controls(host_header_value(req.host, req.port, req.use_tls)) + crlf
+    out.write(bytes.from_string_utf8(line)) catch 0
+    for key in req.headers:
+        if header_key_matches(key, "Content-Length") or header_key_matches(key, "Transfer-Encoding"):
+            continue
+        # strip CR/LF/NUL so an untrusted value reflected into a header
+        # (.bearer, .cookie, .header with attacker input) cannot inject a
+        # second header or splice a whole request into the outbound
+        # stream — the same guard the response path applies.
+        out.write(bytes.from_string_utf8(strip_header_controls(key) + ": " + strip_header_controls(req.headers[key]) + crlf)) catch 0
+    mut tail := ""
+    if connection != "" and header_lookup(req.headers, "Connection") == "":
+        tail = tail + "Connection: " + connection + crlf
+    if accept_gzip and header_lookup(req.headers, "Accept-Encoding") == "":
+        tail = tail + "Accept-Encoding: gzip" + crlf
+    if request_sends_chunked(req):
+        tail = tail + "Transfer-Encoding: chunked" + crlf
+    elif not req.body.is_empty() or method_expects_body(req.method):
+        tail = tail + "Content-Length: " + req.body.len().to_string() + crlf
+    out.write(bytes.from_string_utf8(tail + crlf)) catch 0
+    return out.take_bytes()
+
+# the body of `req` as it goes on the wire: as it is, or as one chunk and the
+# last chunk when it goes out chunked.
+fn request_body_bytes(req: ClientRequest) -> Bytes:
+    if not request_sends_chunked(req):
+        return req.body
+    crlf := chr(13) + chr(10)
+    if req.body.is_empty():
+        return bytes.from_string_utf8("0" + crlf + crlf)
+    out := bytes.buffer_with_capacity(req.body.len() + 32)
+    out.write(bytes.from_string_utf8(lower_hex_int(req.body.len()) + crlf)) catch 0
+    out.write(req.body) catch 0
+    out.write(bytes.from_string_utf8(crlf + "0" + crlf + crlf)) catch 0
+    return out.take_bytes()
+
+# the whole request, head and body.
+fn request_wire_bytes(req: ClientRequest, target: String, connection: String, accept_gzip: Bool) -> Bytes!:
+    head := request_head_bytes(req, target, connection, accept_gzip)
+    body := request_body_bytes(req)
+    if body.is_empty():
+        return head
+    return head.concat(body)
+
 fn client_conn_from_stream(stream: TcpStream) -> ClientConn:
     return ClientConn(stream, stream.buffered_bytes_reader_chunked(512), stream.buffered_bytes_writer())
 
@@ -4397,28 +4474,11 @@ impl ClientRequest:
     fn cookie(name: String, value: String) -> ClientRequest:
         return self.header("Cookie", append_cookie_header(header_lookup(self.headers, "Cookie"), name, value))
 
+    # the request as it goes on the wire on a connection of its own: the head,
+    # with Connection: close unless the request names a Connection, then the
+    # body (see request_wire_bytes).
     fn to_bytes() -> Bytes!:
-        crlf := chr(13) + chr(10)
-        mut req := self.method + " " + normalize_path(self.path) + " HTTP/1.1" + crlf
-        if header_lookup(self.headers, "Host") == "":
-            req = req + "Host: " + self.host + crlf
-        for key in self.headers:
-            if header_key_matches(key, "Content-Length"):
-                continue
-            # strip CR/LF/NUL so an untrusted value reflected into a header
-            # (.bearer, .cookie, .header with attacker input) cannot inject a
-            # second header or splice a whole request into the outbound
-            # stream — the same guard the response path applies.
-            req = req + strip_header_controls(key) + ": " + strip_header_controls(self.headers[key]) + crlf
-        if header_lookup(self.headers, "Connection") == "":
-            req = req + "Connection: close" + crlf
-        req = req + "Content-Length: " + self.body.len().to_string() + crlf + crlf
-        head := bytes.from_string_utf8(req)
-        buf := bytes.buffer_with_capacity(head.len() + self.body.len())
-        defer buf.free()
-        buf.write(head)!
-        buf.write(self.body)!
-        return buf.bytes()
+        return request_wire_bytes(self, normalize_path(self.path), "close", false)
 
     fn send() -> HttpResponse!:
         if not trace.is_active():
@@ -5538,3 +5598,17 @@ test "a response read skips interim responses and keeps trailers":
     assert_eq(resp.status, 200)
     assert_eq(resp.body_text()!, "abc")
     assert_eq(header_lookup(resp.trailers, "x-sum"), "42")
+
+test "a client request head names the origin and frames the body":
+    get := request_wire_bytes(get_request("example.test", 8080, "/a"), "/a", "", false)!.to_string_utf8()!
+    assert_eq(get, "GET /a HTTP/1.1\r\nHost: example.test:8080\r\n\r\n")
+    https := request_wire_bytes(https_request("GET", "example.test", "/"), "/", "close", true)!.to_string_utf8()!
+    assert_eq(https, "GET / HTTP/1.1\r\nHost: example.test\r\nConnection: close\r\nAccept-Encoding: gzip\r\n\r\n")
+    v6 := request_wire_bytes(get_request("::1", 80, "/"), "/", "", false)!.to_string_utf8()!
+    assert_eq(v6, "GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n")
+    empty_post := request_wire_bytes(post_request("h", 80, "/p"), "/p", "", false)!.to_string_utf8()!
+    assert_eq(empty_post, "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n")
+    sized := request_wire_bytes(post_request("h", 80, "/p").body_text("hi").header("Content-Length", "9"), "/p", "", false)!.to_string_utf8()!
+    assert_eq(sized, "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nhi")
+    chunked := request_wire_bytes(post_request("h", 80, "/p").body_text("hello").header("Transfer-Encoding", "chunked"), "/p", "", false)!.to_string_utf8()!
+    assert_eq(chunked, "POST /p HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")

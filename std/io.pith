@@ -327,6 +327,15 @@ impl BufferedBytesReader:
     fn read_head_bounded(cap: Int) -> Bytes!:
         return buffered_bytes_reader_read_head_internal(self, cap)
 
+    # how many bytes are buffered, after one read from the source when none
+    # are: it waits for the first byte of whatever comes next. 0 means end of
+    # stream.
+    fn wait_bytes() -> Int!:
+        cached := buffered_bytes_reader_cache_get(self.handle).len()
+        if cached > 0:
+            return cached
+        return buffered_bytes_reader_fill(self.handle)
+
     fn read_all_bytes() -> Bytes!:
         return read_all_buffered_bytes_reader(self)
 

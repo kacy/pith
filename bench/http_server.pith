@@ -56,9 +56,15 @@ fn route(req: HttpRequestBytes) -> HttpResponse:
 # thing. serving inline instead serialized the whole benchmark on one
 # connection — throughput collapsed to 1/request-latency with a core idle,
 # and the pith-vs-go rows compared a serial server to a concurrent one.
+#
+# the connection gets the time limits std.web gives one by default: a 5 s
+# deadline on each request head and on each keep-alive wait, over a 5 s bound
+# on every read, so the run pays for the deadline bookkeeping a real server
+# does.
 fn serve_client(client: Int) -> Int:
     tcp_set_timeout(client, 5000)
-    return http.serve_connection_fd(client, route) catch 0
+    config := http.server_config().with_read_header_timeout(5000).with_idle_timeout(5000)
+    return http.serve_connection_fd_with(client, route, config) catch 0
 
 fn main() -> Int!:
     mut port := 8080

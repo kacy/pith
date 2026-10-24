@@ -253,7 +253,76 @@ buffered readers (`read_request_buffered_bytes`, the legacy string-form
 `read_request_buffered`), and the tls accept loop. a head that grows past the
 cap fails even when it arrives as a single line with no line break, so no reader
 accumulates an unbounded line before the total is checked. the serve loops turn
-those failures into `431` / `413` responses and close the connection.
+those failures into `431` / `413` responses and close the connection. a server
+can set its own caps with a `ServerConfig`.
+
+### server configuration
+
+`http.ServerConfig` holds what net/http's `Server` fields hold for one http/1.1
+server: its timeouts, its request-size limits and its keep-alive policy. the
+`_with` entry points take one:
+
+```pith
+config := http.server_config()
+    .with_read_header_timeout(5000)
+    .with_idle_timeout(60000)
+    .with_max_body_bytes(1048576)
+http.serve_connection_fd_with(client_fd, handler, config)!
+http.serve_connection_tls_with(conn, handler, config)!
+http.serve_connection_with(reader, writer, handler, config)!
+```
+
+| field | `server_config()` | meaning |
+| --- | --- | --- |
+| `read_header_timeout_ms` | 0 | how long the request head may take; 0 falls back to `read_timeout_ms` |
+| `read_timeout_ms` | 0 | how long the head and the body together may take |
+| `write_timeout_ms` | 0 | how long the response may take, from the end of the request head, so the handler counts |
+| `idle_timeout_ms` | 0 | how long a keep-alive connection may wait for its next request; 0 falls back to `read_timeout_ms` |
+| `max_header_bytes` | `MAX_HEADER_BYTES` | the request head, answered with `431` past it |
+| `max_body_bytes` | `MAX_REQUEST_BODY` | the request body, declared or chunked, answered with `413` past it |
+| `keep_alives` | true | false closes the connection after every response |
+| `max_requests_per_conn` | 0 | close after this many responses; 0 for no limit |
+
+a timeout of 0 means none, so `server_config()` matches what the plain entry
+points (`serve_connection_fd`, `serve_connection_tls`, `serve_connection`) have
+always done, and they use it. net/http has the same defaults, and they let a
+client that sends one byte at a time hold a connection open forever, so a server
+facing the internet should set at least `read_header_timeout_ms`. std.web does:
+see [web](web.md#timeouts-and-limits).
+
+the timeouts are deadlines on the socket. `tcp.set_timeout` bounds each read on
+its own, so a client that sends a byte just inside it keeps a read going
+indefinitely. a deadline is a fixed time, so the time left shrinks with every
+read. the clocks start here:
+
+- the first request's head has `read_header_timeout_ms` from when the connection
+  was handed to the server, the wait for its first byte included.
+- a later request first waits up to `idle_timeout_ms` for a byte, then has
+  `read_header_timeout_ms` from that byte.
+- `read_timeout_ms` counts from the same point as the head's time, and covers the
+  body too.
+
+a request that runs out of read time once its first byte has arrived is answered
+with `408 Request Timeout` and the connection closes. a connection that runs out
+of time with nothing sent, the first request's or an idle keep-alive's, is closed
+with no answer, as net/http does. a response that runs out of write time is cut
+off, and the connection closes. the deadlines are on the tcp connection, so they
+hold for tls too, and they work on both the green and the os-thread backend.
+`serve_connection_with` reads from memory, so only the limits and the keep-alive
+policy apply there.
+
+the deadlines are available on any socket as `tcp.set_read_deadline(fd, ms)` and
+`tcp.set_write_deadline(fd, ms)`. a deadline holds until it is set again or
+cleared with 0, and when the socket also has a `set_timeout`, a wait ends at
+whichever comes first.
+
+a handler cannot see that its client went away while it runs: the handler type
+carries no `Context`, and noticing a disconnect would take a second wait on the
+socket while the handler runs, which reads the next pipelined request if there
+is one. a handler has no way to fail either. it returns an `HttpResponse`, so an
+error becomes a response through `catch` as above, and a runtime error such as
+an index out of range stops the whole process, which net/http would turn into a
+`500` and a closed connection.
 
 ### what the server adds to a response
 

@@ -45,6 +45,17 @@
 //! at one. generations wrap at 2^31 and never collide in practice: a number
 //! would have to be opened two billion times while one stale handle was kept.
 //!
+//! ## deadlines
+//!
+//! a socket can also carry a read deadline and a write deadline: an instant
+//! after which a call that would wait gives up instead (see
+//! `fdio::WaitBudget`). they live in two more tables of the same shape, one
+//! word per number, allocated only when a deadline is first set near that
+//! number. `open` clears both, so a new connection never inherits the
+//! deadline of the one that held its number before, and a deadline is set
+//! through a guard, so the number cannot be recycled between the generation
+//! check and the store.
+//!
 //! regular files are not here. `host_fs` keys them by a counter that never
 //! recycles and holds the `File` itself, so a stale file handle already fails
 //! to resolve; and fd 0, 1 and 2 belong to the process for its whole life and
@@ -53,6 +64,8 @@
 use crate::netpoll;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 /// what an fd is, which is to say which syscalls are allowed on it. a handle
 /// of one kind handed to the other kind's entry point is refused as stale
@@ -84,13 +97,28 @@ const CHUNK: usize = 4096;
 /// `RLIMIT_NOFILE` a process here will see. an fd beyond it is refused at open.
 const CHUNKS: usize = 4096;
 
-static TABLE: [AtomicPtr<AtomicU64>; CHUNKS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
+type Table = [AtomicPtr<AtomicU64>; CHUNKS];
+
+static TABLE: Table = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
+static READ_DEADLINES: Table = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
+static WRITE_DEADLINES: Table = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
 
 /// the slot for `fd`, or `None` when it was never opened (a lookup does not
 /// allocate: a handle on a number that never had a chunk is stale by
 /// definition).
 fn slot(fd: usize) -> Option<&'static AtomicU64> {
-    let chunk = TABLE.get(fd / CHUNK)?.load(Ordering::Acquire);
+    slot_in(&TABLE, fd)
+}
+
+/// the slot for `fd`, allocating its chunk if this is the first open there.
+/// `None` only for a number past the table.
+fn slot_or_allocate(fd: usize) -> Option<&'static AtomicU64> {
+    slot_or_allocate_in(&TABLE, fd)
+}
+
+/// `fd`'s word in `table`, or `None` when its chunk was never allocated.
+fn slot_in(table: &'static Table, fd: usize) -> Option<&'static AtomicU64> {
+    let chunk = table.get(fd / CHUNK)?.load(Ordering::Acquire);
     if chunk.is_null() {
         return None;
     }
@@ -99,10 +127,10 @@ fn slot(fd: usize) -> Option<&'static AtomicU64> {
     Some(unsafe { &*chunk.add(fd % CHUNK) })
 }
 
-/// the slot for `fd`, allocating its chunk if this is the first open there.
-/// `None` only for a number past the table.
-fn slot_or_allocate(fd: usize) -> Option<&'static AtomicU64> {
-    let head = TABLE.get(fd / CHUNK)?;
+/// `fd`'s word in `table`, allocating its chunk on first use. `None` only for
+/// a number past the table.
+fn slot_or_allocate_in(table: &'static Table, fd: usize) -> Option<&'static AtomicU64> {
+    let head = table.get(fd / CHUNK)?;
     let mut chunk = head.load(Ordering::Acquire);
     if chunk.is_null() {
         let fresh: Box<[AtomicU64]> = (0..CHUNK).map(|_| AtomicU64::new(0)).collect();
@@ -172,6 +200,13 @@ pub(crate) fn open(fd: RawFd, kind: FdKind) -> i64 {
     let Some(slot) = slot_or_allocate(fd) else {
         return 0;
     };
+    // the previous handle on this number is dead, so nothing can set a
+    // deadline here again until the new handle is returned.
+    for table in [&READ_DEADLINES, &WRITE_DEADLINES] {
+        if let Some(deadline) = slot_in(table, fd) {
+            deadline.store(0, Ordering::Release);
+        }
+    }
     let mut word = slot.load(Ordering::Acquire);
     loop {
         let mut generation = if word & OPENED == 0 {
@@ -305,6 +340,48 @@ fn finish_close(fd: RawFd) {
     unsafe {
         libc::close(fd);
     }
+}
+
+/// the instant deadlines are stored relative to. a stored word is the
+/// nanoseconds since it plus one, so zero can mean no deadline.
+fn epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn deadline_table(write: bool) -> &'static Table {
+    if write {
+        &WRITE_DEADLINES
+    } else {
+        &READ_DEADLINES
+    }
+}
+
+/// set or clear the read or write deadline of the socket `guard` holds.
+pub(crate) fn set_deadline(guard: &Guard, write: bool, at: Option<Instant>) {
+    let fd = guard.fd() as usize;
+    let table = deadline_table(write);
+    let Some(at) = at else {
+        if let Some(slot) = slot_in(table, fd) {
+            slot.store(0, Ordering::Release);
+        }
+        return;
+    };
+    let since = at.saturating_duration_since(epoch()).as_nanos();
+    let word = since.min(u64::MAX as u128 - 1) as u64 + 1;
+    if let Some(slot) = slot_or_allocate_in(table, fd) {
+        slot.store(word, Ordering::Release);
+    }
+}
+
+/// the read or write deadline set on `fd`, if there is one: one load when no
+/// deadline was ever set near this number.
+pub(crate) fn deadline(fd: RawFd, write: bool) -> Option<Instant> {
+    let word = slot_in(deadline_table(write), fd as usize)?.load(Ordering::Acquire);
+    if word == 0 {
+        return None;
+    }
+    Some(epoch() + Duration::from_nanos(word - 1))
 }
 
 /// close `handle`. returns true when this call retired it; false for a handle
@@ -476,6 +553,30 @@ mod tests {
         assert!(acquire(handle, FdKind::Socket).is_none());
         assert!(acquire(handle, FdKind::Pipe).is_some());
         assert!(close(handle));
+    }
+
+    #[test]
+    fn a_deadline_is_kept_until_cleared_and_a_reopen_drops_it() {
+        let fd = socket_on(1206);
+        let handle = open(fd, FdKind::Socket);
+        assert_eq!(deadline(fd, false), None);
+        let at = Instant::now() + Duration::from_millis(500);
+        {
+            let guard = acquire(handle, FdKind::Socket).expect("live");
+            set_deadline(&guard, false, Some(at));
+            assert_eq!(deadline(fd, true), None);
+            let got = deadline(fd, false).expect("set");
+            assert!(got <= at && at.duration_since(got) < Duration::from_micros(1));
+            set_deadline(&guard, true, Some(at));
+            set_deadline(&guard, false, None);
+            assert_eq!(deadline(fd, false), None);
+            assert!(deadline(fd, true).is_some());
+        }
+        assert!(close(handle));
+        let again = socket_on(1206);
+        let new = open(again, FdKind::Socket);
+        assert_eq!(deadline(fd, true), None, "a new handle starts with no deadline");
+        assert!(close(new));
     }
 
     #[test]

@@ -451,6 +451,31 @@ pub extern "C" fn pith_tcp_set_timeout(conn: i64, ms: i64) {
     let _ = stream.into_raw_fd();
 }
 
+/// set or clear a connection's read or write deadline: `ms` milliseconds from
+/// now, or none for `ms <= 0`. a call that would wait past it fails as an
+/// expired socket timeout does. a stale handle is left alone.
+fn set_deadline(conn: i64, write: bool, ms: i64) {
+    let Some(guard) = socket(conn) else {
+        return;
+    };
+    let at = (ms > 0).then(|| std::time::Instant::now() + std::time::Duration::from_millis(ms as u64));
+    fd_handle::set_deadline(&guard, write, at);
+}
+
+/// the read deadline: every read on the connection, however many, must finish
+/// waiting by then. it composes with `pith_tcp_set_timeout`, which bounds each
+/// read on its own; a wait ends at whichever comes first.
+#[no_mangle]
+pub extern "C" fn pith_tcp_set_read_deadline(conn: i64, ms: i64) {
+    set_deadline(conn, false, ms);
+}
+
+/// the write deadline, the counterpart of `pith_tcp_set_read_deadline`.
+#[no_mangle]
+pub extern "C" fn pith_tcp_set_write_deadline(conn: i64, ms: i64) {
+    set_deadline(conn, true, ms);
+}
+
 /// TCP close — retire the handle and close its descriptor.
 ///
 /// the close is exactly once per handle: a second call, or a call on a handle

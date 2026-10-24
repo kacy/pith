@@ -776,12 +776,54 @@ than the request middleware, so a `web.bare()` app has them too:
 
 a refusal counter that is climbing is the cap shedding load, which is what it is
 for. a gauge pinned at 512 with no requests flowing is the other case: slots held
-by connections that are not going anywhere. under the green runtime that is worth
-knowing about, because the idle timeout that would otherwise reclaim them does not
-fire there — the green read path waits on the reactor with no deadline — so a
-client that connects and then says nothing holds its slot until it disconnects.
-the gauge is what tells you, and the server keeps answering every new connection
-either way, which it would not if the loop had blocked.
+by connections that are not going anywhere. the timeouts below reclaim such a
+slot within a few seconds, so a pinned gauge means clients are opening
+connections faster than that, and the server keeps answering every new
+connection either way, which it would not if the loop had blocked.
+
+### timeouts and limits
+
+an app carries an `http.ServerConfig` (see
+[http apps](http_apps.md#server-configuration)) that sets the time limits,
+request-size limits and keep-alive policy of every http/1.1 connection `listen`
+and `listen_tls` serve. `web.server_config()` is the default:
+
+| field | default | what it bounds |
+| --- | --- | --- |
+| `read_header_timeout_ms` | 5000 | the whole request head, from its first byte |
+| `idle_timeout_ms` | 5000 | a keep-alive connection's wait for its next request |
+| `read_timeout_ms` | off | the head and the body together |
+| `write_timeout_ms` | off | the response, from the end of the request head |
+| `max_header_bytes` | `http.MAX_HEADER_BYTES` (64 kb) | the request head |
+| `max_body_bytes` | `http.MAX_REQUEST_BODY` (10 mb) | the request body |
+| `keep_alives` | true | whether a connection serves more than one request |
+| `max_requests_per_conn` | 0, no limit | how many requests one connection serves |
+
+net/http turns every timeout off by default, and a server built that way can be
+held open by a client that sends one byte of its head every few seconds. the
+read-header timeout here is a deadline on the socket, so the head has 5 s in
+total however the bytes are spaced. the body has no total limit by
+default, so a large upload over a slow link still finishes, but every read must
+make progress within 5 s, or within the longest read timeout the config sets
+when that is longer. a config with no read timeouts at all turns that bound off
+too.
+
+change any of it with `with_config`:
+
+```pith
+config := web.server_config()
+    .with_read_timeout(30000)
+    .with_write_timeout(30000)
+    .with_max_body_bytes(1048576)
+app := web.new().with_config(config).get("/", home)
+```
+
+a request that runs out of time after its first byte gets `408 Request Timeout`
+and the connection closes. a connection that times out before sending anything,
+or that sits idle between requests, is closed with no response, as net/http
+does. a response that runs out of write time is cut off and the connection
+closes. the config does not apply to http/2 (`listen_h2c`, or a `listen_tls`
+client that negotiates h2), which keeps the http/2 server's own limits.
 
 ## http/2
 

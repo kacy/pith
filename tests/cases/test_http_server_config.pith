@@ -1,0 +1,277 @@
+# http.ServerConfig on the http/1.1 server: its deadlines over real sockets,
+# plain and tls, and its limits and keep-alive policy over in-memory streams.
+#
+# the deadlines are short (200-300 ms) so the run stays quick. a case checks
+# that the server gave up after at least most of its deadline and well before
+# several times it, so a loaded machine can be slow without failing it, and
+# none compares times for equality.
+
+import std.net.http as http
+import std.net.tls as tls
+import std.io as io
+import std.bytes as bytes
+import std.time as time_mod
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+# the longest any deadline case may take before it counts as a failure: well
+# past every deadline below, well short of the corpus's per-case timeout.
+GIVE_UP_MS := 2500
+
+fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "?"
+    if path == "/echo":
+        return http.text(200, req.body_text() catch "?")
+    if path == "/big":
+        return http.response(200).with_body_bytes(big_body())
+    return http.text(200, "ok")
+
+# 64 mb, more than a loopback socket's buffers hold, so a client that never
+# reads leaves the server's write waiting.
+fn big_body() -> Bytes:
+    mut body := bytes.from_string_utf8("0123456789abcdef")
+    while body.len() < 67108864:
+        body = body.concat(body)
+    return body
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+# accept forever, serving each connection with `config`. the process ends with
+# main, which reaps it.
+fn accept_loop(listener: Int, config: http.ServerConfig) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn serve_plain(fd, config)
+    return 0
+
+fn serve_plain(fd: Int, config: http.ServerConfig) -> Int:
+    return http.serve_connection_fd_with(fd, route, config) catch 0
+
+fn start_server(start: Int, config: http.ServerConfig) -> Int!:
+    port := choose_port(start)!
+    listener := tcp_listen("127.0.0.1", port)!
+    spawn accept_loop(listener, config)
+    return port
+
+# everything the server sends until it closes, or until GIVE_UP_MS. a server
+# that closes with dripped bytes still unread resets the connection, which the
+# wait reports as an error rather than as readable, so only a plain timeout
+# waits again.
+fn read_until_close(fd: Int) -> String:
+    mut out := bytes.empty()
+    started := time_mod.mono_millis()
+    while time_mod.mono_millis() - started < GIVE_UP_MS:
+        if tcp_wait_readable(fd, 100) == 0:
+            continue
+        chunk := tcp_read_bytes(fd, 65536) catch bytes.empty()
+        if chunk.is_empty():
+            break
+        out = out.concat(chunk)
+    return out.to_string_utf8() catch "?"
+
+fn status_line(wire: String) -> String:
+    if wire == "":
+        return "nothing"
+    return wire.split("\r\n")[0]
+
+fn within(elapsed: Int, low: Int) -> String:
+    if elapsed < low:
+        return "too soon ({elapsed} ms)"
+    if elapsed >= GIVE_UP_MS:
+        return "too late ({elapsed} ms)"
+    return "in time"
+
+# send `head`, then one more byte every 30 ms until the server answers or
+# closes, and report what it sent and when.
+fn drip(port: Int, head: String) -> String!:
+    fd := tcp_connect("127.0.0.1", port)!
+    started := time_mod.mono_millis()
+    tcp_write(fd, head)!
+    mut sent := 0
+    while time_mod.mono_millis() - started < GIVE_UP_MS:
+        if tcp_wait_readable(fd, 30) != 0:
+            break
+        if tcp_write(fd, "x").is_err:
+            break
+        sent = sent + 1
+    wire := read_until_close(fd)
+    elapsed := time_mod.mono_millis() - started
+    tcp_close(fd)
+    return "{status_line(wire)}, {within(elapsed, 200)}, more than one byte dripped: {sent > 2}"
+
+fn slowloris_case() -> Int!:
+    config := http.server_config().with_read_header_timeout(300).with_idle_timeout(200)
+    port := start_server(22610, config)!
+    print("slowloris head: " + drip(port, "GET / HTTP/1.1\r\nHost: h\r\nX-Slow: ")!)
+    return 0
+
+fn slow_body_case() -> Int!:
+    config := http.server_config().with_read_timeout(300)
+    port := start_server(22810, config)!
+    print("slow body: " + drip(port, "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\n")!)
+    return 0
+
+# a connection that never sends a byte is closed at the head deadline with no
+# answer, and a keep-alive connection that goes quiet after a response is
+# closed at the idle deadline with no answer either.
+fn idle_case() -> Int!:
+    config := http.server_config().with_read_header_timeout(300).with_idle_timeout(200)
+    port := start_server(23010, config)!
+    silent := tcp_connect("127.0.0.1", port)!
+    started := time_mod.mono_millis()
+    wire := read_until_close(silent)
+    print("silent connection: {status_line(wire)}, {within(time_mod.mono_millis() - started, 250)}")
+    tcp_close(silent)
+
+    fd := tcp_connect("127.0.0.1", port)!
+    tcp_write(fd, "GET / HTTP/1.1\r\nHost: h\r\n\r\n")!
+    began := time_mod.mono_millis()
+    session := read_until_close(fd)
+    mut responses := 0
+    for line in session.split("\r\n"):
+        if line.contains("HTTP/1.1 "):
+            responses = responses + 1
+    print("idle keep-alive: {responses} response, {status_line(session)}, closed {within(time_mod.mono_millis() - began, 150)}")
+    tcp_close(fd)
+    return 0
+
+# a client that stops reading a large response: the write deadline closes the
+# connection, which the serve call reports by returning.
+fn serve_timed_write(listener: Int) -> Int:
+    fd := tcp_accept(listener) catch 0
+    config := http.server_config().with_write_timeout(300)
+    http.serve_connection_fd_with(fd, route, config) catch 0
+    return 0
+
+fn write_timeout_case() -> Int!:
+    port := choose_port(23210)!
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn serve_timed_write(listener)
+    fd := tcp_connect("127.0.0.1", port)!
+    tcp_write(fd, "GET /big HTTP/1.1\r\nHost: h\r\n\r\n")!
+    started := time_mod.mono_millis()
+    await task
+    print("write timeout: server gave up {within(time_mod.mono_millis() - started, 250)}")
+    tcp_close(fd)
+    tcp_close(listener)
+    return 0
+
+fn tls_accept_loop(listener: tls.Listener, config: http.ServerConfig) -> Int:
+    while true:
+        conn := listener.accept() catch tls.Conn(0)
+        if conn.handle != 0:
+            spawn serve_tls(conn, config)
+    return 0
+
+fn serve_tls(conn: tls.Conn, config: http.ServerConfig) -> Int:
+    http.serve_connection_tls_with(conn, route, config) catch 0
+    conn.close()
+    return 0
+
+# the same slowloris head over tls: every dripped byte is its own record, and
+# the deadline on the socket underneath still ends the head.
+fn tls_case() -> Int!:
+    port := choose_port(23410)!
+    server_tls := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["http/1.1"])
+    listener := tls.listen("127.0.0.1", port, server_tls)!
+    config := http.server_config().with_read_header_timeout(300).with_idle_timeout(200)
+    spawn tls_accept_loop(listener, config)
+    client := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["http/1.1"])
+    conn := tls.dial_with_config("127.0.0.1", port, "localhost", client)!
+    started := time_mod.mono_millis()
+    conn.write_all_bytes(bytes.from_string_utf8("GET / HTTP/1.1\r\nHost: h\r\nX-Slow: "))!
+    mut sent := 0
+    while time_mod.mono_millis() - started < GIVE_UP_MS:
+        if tcp_wait_readable(conn.socket(), 100) != 0:
+            break
+        if conn.write_all_bytes(bytes.from_string_utf8("x")).is_err:
+            break
+        sent = sent + 1
+    mut wire := bytes.empty()
+    while time_mod.mono_millis() - started < GIVE_UP_MS:
+        chunk := conn.read_bytes(4096) catch bytes.empty()
+        if chunk.is_empty():
+            break
+        wire = wire.concat(chunk)
+    elapsed := time_mod.mono_millis() - started
+    print("tls slowloris head: {status_line(wire.to_string_utf8() catch "?")}, {within(elapsed, 200)}, more than one byte dripped: {sent > 2}")
+    conn.close()
+    return 0
+
+# serve `wire` on one in-memory connection with `config` and print each
+# response's status line and Connection field.
+fn exchange(label: String, wire: String, config: http.ServerConfig) -> Int!:
+    reader := io.bytes_reader(bytes.from_string_utf8(wire)).buffered_chunked(7)
+    sink := bytes.buffer()
+    writer := sink.buffered()
+    http.serve_connection_with(reader, writer, route, config) catch 0
+    writer.flush()!
+    out := sink.bytes().to_string_utf8()!
+    # a response's status line follows the previous body directly, so split
+    # on the status lines rather than on line ends
+    mut seen: List[String] := []
+    for response in out.split("HTTP/1.1 "):
+        if response == "":
+            continue
+        lines := response.split("\r\n")
+        mut summary := lines[0]
+        for line in lines:
+            if line.starts_with("Connection: "):
+                summary = summary + " (" + line + ")"
+        seen.push(summary)
+    print(label + ": " + seen.join(" | "))
+    reader.free()
+    writer.free()
+    sink.free()
+    return 0
+
+fn limits_case() -> Int!:
+    get := "GET / HTTP/1.1\r\nHost: h\r\n\r\n"
+    mut padding := ""
+    while padding.len() < 300:
+        padding = padding + "a"
+    small_head := http.server_config().with_max_header_bytes(256)
+    exchange("max_header_bytes, under", get + get, small_head)!
+    exchange("max_header_bytes, over", "GET / HTTP/1.1\r\nHost: h\r\nX-Pad: " + padding + "\r\n\r\n" + get, small_head)!
+    small_body := http.server_config().with_max_body_bytes(16)
+    exchange("max_body_bytes, under", "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 16\r\n\r\n0123456789abcdef" + get, small_body)!
+    exchange("max_body_bytes, declared over", "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 17\r\n\r\n0123456789abcdefg" + get, small_body)!
+    exchange("max_body_bytes, chunked over", "POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n10\r\n0123456789abcdef\r\n1\r\ng\r\n0\r\n\r\n" + get, small_body)!
+    # a limit above the default admits what the default refuses
+    big := http.MAX_REQUEST_BODY + 1
+    mut body := bytes.from_string_utf8("x")
+    while body.len() < big:
+        body = body.concat(body)
+    body = body.slice(0, big)
+    large_wire := "POST /size HTTP/1.1\r\nHost: h\r\nContent-Length: {big}\r\n\r\n" + body.to_string_utf8()!
+    exchange("max_body_bytes, default", large_wire, http.server_config())!
+    exchange("max_body_bytes, raised", large_wire, http.server_config().with_max_body_bytes(big))!
+    return 0
+
+fn keep_alive_case() -> Int!:
+    get := "GET / HTTP/1.1\r\nHost: h\r\n\r\n"
+    exchange("keep_alives on", get + get + get, http.server_config())!
+    exchange("keep_alives off", get + get, http.server_config().with_keep_alives(false))!
+    exchange("max_requests_per_conn 2", get + get + get, http.server_config().with_max_requests_per_conn(2))!
+    return 0
+
+fn main() -> Int!:
+    limits_case()!
+    keep_alive_case()!
+    slowloris_case()!
+    slow_body_case()!
+    idle_case()!
+    write_timeout_case()!
+    tls_case()!
+    return 0

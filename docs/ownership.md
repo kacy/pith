@@ -568,8 +568,8 @@ gaps, all bounded leaks rather than dangling pointers:
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a
   probe (`.is_ok`, `.is_err`, `== none`), a payload read (`.ok`, `.err`),
-  a `match` on an optional local, an argument of a same-module call whose
-  body provably only reads the parameter, or — for a result — an
+  a `match` on an optional local, an argument of a call whose callee
+  provably only reads the parameter, or — for a result — an
   extraction (`r.unwrap_or(d)`, `r catch d`, `r!`) releases its payload:
   a probe never touches it, a read borrows, a qualifying callee takes no
   count of its own (and retains anything a result extraction hands out),
@@ -582,15 +582,21 @@ gaps, all bounded leaks rather than dangling pointers:
   count of its own.
   the call-argument entry is judged by walking the callee's declaration
   with the same use rules as the local itself, transitively through
-  same-module forwarding — so a callee that stores, returns, sends, or
-  captures the parameter disqualifies the argument, and an imported,
-  builtin, constructor, or closure-typed callee (whose body cannot be
-  walked) is never a qualifying position. only a bare-name free-function
-  call qualifies; a method-call argument (`obj.foo(r)`) stays on the leak
-  side, since resolving the receiver's method to a body is a separate
-  question left unwalked. any other use leaks as before
-  — returned whole, bound by `if let`, passed across a module boundary,
-  or captured by a closure, which takes the shell and not the payload.
+  forwarding — so a callee that stores, returns, sends, or captures the
+  parameter disqualifies the argument, and a builtin, constructor, generic
+  or closure-typed callee is never a qualifying position. a same-module
+  free function is walked at the call. an imported function, a method of
+  a user struct or enum (`obj.foo(r)`) and a module-qualified call
+  (`mod.foo(r)`) are answered by a record their own module makes before
+  it emits any body: which result and optional parameters of each
+  non-generic function and plain method pass the walk
+  (`ir_record_borrow_params`). a module is emitted after everything it
+  imports, so the record is always there for an imported callee. while
+  a module's records are being made, a call to one of its own methods
+  whose record is not made yet answers "not safe". a named argument to one of these callees stays on
+  the leak side, since the record is by position. any other use leaks as
+  before — returned whole, bound by `if let`, or captured by a closure,
+  which takes the shell and not the payload.
   an extraction *inside* the callee (`o.unwrap_or(d)`, `o.value()`) does
   not disqualify the argument: on a parameter subject it retains what it
   hands out, so the caller stays the payload's owner. one more shape

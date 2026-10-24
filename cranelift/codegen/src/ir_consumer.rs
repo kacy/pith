@@ -48,6 +48,19 @@ fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Val
     builder.ins().jump(block, &[value]);
 }
 
+/// Runtime releases that return at once for a zero handle and return
+/// nothing, so a call site may test for zero and skip the call.
+fn is_null_safe_release(name: &str) -> bool {
+    matches!(
+        name,
+        "pith_struct_release"
+            | "pith_list_release_handle"
+            | "pith_map_release_handle"
+            | "pith_set_release_handle"
+            | "pith_bytes_release"
+    )
+}
+
 fn inline_list_get_value(
     builder: &mut FunctionBuilder<'_>,
     list: Value,
@@ -2760,7 +2773,29 @@ fn compile_ir_function(
                                 );
                             }
                         }
+                        // a release of a handle that is still zero, such as
+                        // the cleanup of a local an early return never
+                        // assigned, is a no-op in the runtime. the inline
+                        // test skips the call for it.
+                        let guard_null = runtime_call
+                            && typed_args.len() == 1
+                            && is_null_safe_release(fname);
+                        let done_block = if guard_null {
+                            let call_block = builder.create_block();
+                            let done_block = builder.create_block();
+                            builder.ins().brif(typed_args[0], call_block, &[], done_block, &[]);
+                            builder.switch_to_block(call_block);
+                            builder.seal_block(call_block);
+                            Some(done_block)
+                        } else {
+                            None
+                        };
                         let call = builder.ins().call(fref, &typed_args);
+                        if let Some(done_block) = done_block {
+                            builder.ins().jump(done_block, &[]);
+                            builder.switch_to_block(done_block);
+                            builder.seal_block(done_block);
+                        }
                         let mut returns_float = false;
                         if !builder.func.dfg.inst_results(call).is_empty() {
                             let result = builder.func.dfg.first_result(call);

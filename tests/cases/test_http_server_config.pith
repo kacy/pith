@@ -92,7 +92,7 @@ fn within(elapsed: Int, low: Int) -> String:
         return "too late ({elapsed} ms)"
     return "in time"
 
-# send `head`, then one more byte every 100 ms until the server answers or
+# send `head`, then one more byte every 30 ms until the server answers or
 # closes, and report what it sent and when.
 fn drip(port: Int, head: String) -> String!:
     fd := tcp_connect("127.0.0.1", port)!
@@ -100,7 +100,7 @@ fn drip(port: Int, head: String) -> String!:
     tcp_write(fd, head)!
     mut sent := 0
     while time_mod.mono_millis() - started < GIVE_UP_MS:
-        if tcp_wait_readable(fd, 100) != 0:
+        if tcp_wait_readable(fd, 30) != 0:
             break
         if tcp_write(fd, "x").is_err:
             break

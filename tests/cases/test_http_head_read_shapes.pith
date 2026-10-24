@@ -50,7 +50,8 @@ fn main() -> Int:
     read_all("straddle", get, get.len() - 1)
     read_all("straddle", get, get.len() - 2)
     read_all("straddle", get, get.len() - 3)
-    # a stream that ends inside the head yields what arrived
+    # a stream that ends inside the head is refused, since what arrived is not
+    # a whole request
     read_all("truncated", "GET /partial HTTP/1.1" + crlf() + "Host:", 8)
     # an empty stream yields the empty request that ends a connection
     read_all("empty", "", 8)

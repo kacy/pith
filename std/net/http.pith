@@ -2056,6 +2056,10 @@ RESPONSE_CODING_MESSAGE := "http: unsupported transfer coding in response"
 # connection this is the race of a server closing an idle connection just as
 # a request goes out, which the client retries.
 NO_RESPONSE_MESSAGE := "http: server closed the connection before responding"
+# a client request ran out of its time in all, or of the time it had to
+# wait for the response head.
+CLIENT_TIMEOUT_MESSAGE := "http: client timeout exceeded"
+HEADER_TIMEOUT_MESSAGE := "http: timeout awaiting response headers"
 
 # the most a response head may hold before the client gives up on it, as
 # net/http's default MaxResponseHeaderBytes allows.
@@ -4623,6 +4627,10 @@ struct ConnPool:
 #   * timeout_ms: how long a request may take in all, redirects included,
 #     until its body has been read. 0 for no limit. a request's own
 #     with_timeout replaces it for that request.
+#   * dial_timeout_ms: how long a connect may take. 0 for no limit but
+#     timeout_ms.
+#   * response_header_timeout_ms: how long to wait for the response head once
+#     the request has been written. 0 for no limit but timeout_ms.
 #   * max_idle_conns_per_host: how many idle connections are kept per origin.
 #   * idle_conn_timeout_ms: how long an idle connection is kept. 0 keeps it
 #     until the server closes it.
@@ -4638,6 +4646,8 @@ struct ConnPool:
 # by a lock, and a connection is used by one request at a time.
 pub struct Client:
     pub mut timeout_ms: Int
+    pub mut dial_timeout_ms: Int
+    pub mut response_header_timeout_ms: Int
     pub mut max_idle_conns_per_host: Int
     pub mut idle_conn_timeout_ms: Int
     pub mut max_redirects: Int
@@ -4655,7 +4665,7 @@ DEFAULT_MAX_REDIRECTS := 10
 # a client with net/http's defaults: no time limit, two idle connections per
 # origin kept for 90 seconds, and up to 10 redirects.
 pub fn client() -> Client:
-    return Client(0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, tls.Config(0), ConnPool({}, Mutex(), 0))
+    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, tls.Config(0), ConnPool({}, Mutex(), 0))
 
 # a request for `method` and an absolute http or https url, as net/http's
 # NewRequest builds one.
@@ -4719,6 +4729,16 @@ impl Client:
         next.timeout_ms = ms
         return next
 
+    fn with_dial_timeout(ms: Int) -> Client:
+        next := self.copy()
+        next.dial_timeout_ms = ms
+        return next
+
+    fn with_response_header_timeout(ms: Int) -> Client:
+        next := self.copy()
+        next.response_header_timeout_ms = ms
+        return next
+
     fn with_max_idle_conns_per_host(limit: Int) -> Client:
         next := self.copy()
         next.max_idle_conns_per_host = limit
@@ -4746,7 +4766,7 @@ impl Client:
 
     # the same settings and the same idle connections.
     fn copy() -> Client:
-        return Client(self.timeout_ms, self.max_idle_conns_per_host, self.idle_conn_timeout_ms, self.max_redirects, self.keep_alives, self.tls_config, self.pool)
+        return Client(self.timeout_ms, self.dial_timeout_ms, self.response_header_timeout_ms, self.max_idle_conns_per_host, self.idle_conn_timeout_ms, self.max_redirects, self.keep_alives, self.tls_config, self.pool)
 
     # send `req` and read the whole response, following redirects.
     fn send(req: ClientRequest) -> HttpResponse!:
@@ -4810,10 +4830,16 @@ impl Client:
     # send `req`, then each redirect it is answered with, up to max_redirects.
     # a redirect without a Location is the final response.
     fn follow(req: ClientRequest, writer: BufferedBytesWriter, streaming: Bool) -> ClientResult!:
+        mut limit := self.timeout_ms
+        if req.timeout_ms >= 0:
+            limit = req.timeout_ms
+        mut deadline := 0
+        if limit > 0:
+            deadline = time_mod.mono_millis() + limit
         mut current := req
         mut hops := 0
         while true:
-            result := self.round_trip(current, writer, streaming)!
+            result := self.round_trip(current, writer, streaming, deadline)!
             status := result.parsed.status
             if self.max_redirects <= 0 or not redirect_status(status):
                 return result
@@ -4836,12 +4862,12 @@ impl Client:
     # response arrives is sent once more on a new connection when it is
     # replayable (see request_replayable): the server may have closed the
     # connection just as the request went out.
-    fn round_trip(req: ClientRequest, writer: BufferedBytesWriter, streaming: Bool) -> ClientResult!:
+    fn round_trip(req: ClientRequest, writer: BufferedBytesWriter, streaming: Bool, deadline: Int) -> ClientResult!:
         key := origin_key(req.use_tls, req.host, req.port)
         mut retried := false
         while true:
-            c := self.conn_for(req, key)!
-            got := self.exchange(c, req, writer, streaming)
+            c := self.conn_for(req, key, deadline)!
+            got := self.exchange(c, req, writer, streaming, deadline)
             if got.is_ok:
                 if got.ok.reusable:
                     self.put_idle(c)
@@ -4855,7 +4881,7 @@ impl Client:
         fail NO_RESPONSE_MESSAGE
 
     # an idle connection to `key` that can carry a request, or a new one.
-    fn conn_for(req: ClientRequest, key: String) -> WireConn!:
+    fn conn_for(req: ClientRequest, key: String, deadline: Int) -> WireConn!:
         while true:
             self.pool.mu.lock()
             mut found := false
@@ -4869,30 +4895,56 @@ impl Client:
                     found = true
             self.pool.mu.unlock()
             if not found:
-                return self.dial(req, key)
+                return self.dial(req, key, deadline)
             if idle_conn_usable(c, self.idle_conn_timeout_ms):
                 c.reused = true
                 return c
             wire_close(c)
         fail "http: no connection"
 
-    # dial a new connection to the request's origin.
-    fn dial(req: ClientRequest, key: String) -> WireConn!:
-        stream := io.connect(req.host, req.port)!
+    # dial a new connection to the request's origin, within dial_timeout_ms
+    # and the request's deadline. the tls handshake runs within the deadline
+    # too.
+    fn dial(req: ClientRequest, key: String, deadline: Int) -> WireConn!:
+        mut wait := self.dial_timeout_ms
+        if deadline > 0:
+            left := deadline - time_mod.mono_millis()
+            if left <= 0:
+                fail CLIENT_TIMEOUT_MESSAGE
+            if wait <= 0 or left < wait:
+                wait = left
+        stream := dial_tcp(req.host, req.port, wait)
+        if stream.is_err:
+            fail client_timeout_failure(stream.err, deadline, 0)
         self.pool.mu.lock()
         self.pool.dialed = self.pool.dialed + 1
         self.pool.mu.unlock()
         if not req.use_tls:
-            return plain_wire(stream, key)
+            return plain_wire(stream.ok, key)
+        arm_client_deadline(stream.ok.fd, deadline, true)
+        arm_client_deadline(stream.ok.fd, deadline, false)
+        conn := self.handshake(stream.ok, req, key)
+        if conn.is_err:
+            fail client_timeout_failure(conn.err, deadline, 0)
+        return conn.ok
+
+    # run the tls handshake over a new connection, with tls_config or the
+    # default config. the stream is closed when it fails.
+    fn handshake(stream: TcpStream, req: ClientRequest, key: String) -> WireConn!:
         if self.tls_config.handle != 0:
             return tls_wire(stream, req.host, self.tls_config, key)
-        config := tls.client_config()!
-        defer config.close()
-        return tls_wire(stream, req.host, config, key)
+        config := tls.client_config()
+        if config.is_err:
+            stream.close()
+            fail config.err
+        defer config.ok.close()
+        return tls_wire(stream, req.host, config.ok, key)
 
     # keep `c` for another request, or close it when its origin already has
     # max_idle_conns_per_host idle connections.
     fn put_idle(c: WireConn):
+        tcp_set_read_deadline(c.stream.fd, 0)
+        tcp_set_write_deadline(c.stream.fd, 0)
         c.idle_since = time_mod.mono_millis()
         self.pool.mu.lock()
         mut list: List[WireConn] := []
@@ -4909,29 +4961,127 @@ impl Client:
     # write `req` on `c` and read its response. the body is streamed into
     # `writer` when `streaming` is set, except a redirect's, which the caller
     # follows. a failure before any of the response arrived is
-    # NO_RESPONSE_MESSAGE.
-    fn exchange(c: WireConn, req: ClientRequest, writer: BufferedBytesWriter, streaming: Bool) -> ClientResult!:
+    # NO_RESPONSE_MESSAGE, and one because a time limit ran out is a timeout
+    # message (see client_timeout_failure).
+    #
+    # the write gets the time left before `deadline`. the head gets that, or
+    # response_header_timeout_ms from the end of the write when it is sooner,
+    # and the body gets what is left before `deadline`.
+    fn exchange(c: WireConn, req: ClientRequest, writer: BufferedBytesWriter, streaming: Bool, deadline: Int) -> ClientResult!:
+        fd := c.stream.fd
         mut connection := ""
         if not self.keep_alives:
             connection = "close"
         wire := request_wire_bytes(req, normalize_path(req.path), connection, false)!
-        if wire_write(c, wire).is_err:
+        arm_client_deadline(fd, deadline, false)
+        written := wire_write(c, wire)
+        if written.is_err:
+            if deadline_passed(deadline):
+                fail CLIENT_TIMEOUT_MESSAGE
             fail NO_RESPONSE_MESSAGE
+        mut header_due := 0
+        if self.response_header_timeout_ms > 0:
+            header_due = time_mod.mono_millis() + self.response_header_timeout_ms
+        arm_client_deadline(fd, earliest_due(deadline, header_due), true)
         src := wire_source(c)
-        arrived := source_wait_bytes(src) catch 0
-        if arrived <= 0:
-            fail NO_RESPONSE_MESSAGE
-        parsed := read_response_head_from(src, req.method)!
+        arrived := source_wait_bytes(src)
+        if arrived.is_err or arrived.ok <= 0:
+            fail client_timeout_failure(NO_RESPONSE_MESSAGE, deadline, header_due)
+        head := read_response_head_from(src, req.method)
+        if head.is_err:
+            fail client_timeout_failure(head.err, deadline, header_due)
+        parsed := head.ok
+        arm_client_deadline(fd, deadline, true)
         trailers: Map[String, String] := {}
         mut body := bytes.empty()
         mut body_size := 0
         if streaming and not (self.max_redirects > 0 and redirect_status(parsed.status)):
-            body_size = stream_response_body_from(src, parsed, writer, trailers)!
+            streamed := stream_response_body_from(src, parsed, writer, trailers)
+            if streamed.is_err:
+                fail client_timeout_failure(streamed.err, deadline, 0)
+            body_size = streamed.ok
         else:
-            body = read_response_body_from(src, parsed, trailers)!
+            got := read_response_body_from(src, parsed, trailers)
+            if got.is_err:
+                fail client_timeout_failure(got.err, deadline, 0)
+            body = got.ok
             body_size = body.len()
         reusable := self.keep_alives and not parsed.wants_close and parsed.status != 101 and not request_prefers_close_header(req)
         return ClientResult(parsed, body, trailers, body_size, reusable)
+
+# whether `due`, a time on the mono_millis clock, has come. 0 never does. the
+# runtime never fails a read before its deadline, so a read that failed on one
+# finds the clock at or past it; the extra millisecond only absorbs rounding.
+fn deadline_passed(due: Int) -> Bool:
+    return due > 0 and time_mod.mono_millis() + 1 >= due
+
+# the sooner of two due times, where 0 is none.
+fn earliest_due(a: Int, b: Int) -> Int:
+    if a <= 0:
+        return b
+    if b <= 0 or a < b:
+        return a
+    return b
+
+# set the read (or write) deadline of `fd` to `due` on the mono_millis clock,
+# or clear it when `due` is 0. a due time already past still waits 1 ms, since
+# 0 would mean no deadline at all.
+fn arm_client_deadline(fd: Int, due: Int, read: Bool):
+    mut ms := 0
+    if due > 0:
+        ms = due - time_mod.mono_millis()
+        if ms < 1:
+            ms = 1
+    if read:
+        tcp_set_read_deadline(fd, ms)
+    else:
+        tcp_set_write_deadline(fd, ms)
+
+# the failure to report for `err`: the header timeout when `header_due` came
+# first and has passed, the client timeout when `deadline` has, else `err`.
+fn client_timeout_failure(err: String, deadline: Int, header_due: Int) -> String:
+    header_first := deadline <= 0 or (header_due > 0 and header_due < deadline)
+    if header_first and deadline_passed(header_due):
+        return HEADER_TIMEOUT_MESSAGE
+    if deadline_passed(deadline):
+        return CLIENT_TIMEOUT_MESSAGE
+    return err
+
+# the half of a dial with a timeout that runs as a task of its own: connect,
+# then hand the handle over, or close it when the dial was given up on.
+fn dial_worker(host: String, port: Int, out: Channel[Int]) -> Int:
+    fd := tcp_connect(host, port) catch 0
+    if not out.send(fd) and fd > 0:
+        tcp_close(fd)
+    return 0
+
+# connect to host:port, giving up after `timeout_ms` when it is above 0. the
+# runtime's connect takes no deadline, so the connect runs as a task of its
+# own and this waits for it with a timeout. a connect that completes after
+# the wait gave up is closed by its task: the channel is closed first, so
+# either the task's send fails and it closes the handle, or the handle is
+# already queued and is taken back here.
+fn dial_tcp(host: String, port: Int, timeout_ms: Int) -> TcpStream!:
+    if timeout_ms <= 0:
+        return io.connect(host, port)
+    out := Channel[Int](1)
+    spawn dial_worker(host, port, out)
+    picked := select:
+        value := out.recv() => (1, value)
+        timeout timeout_ms => (0, none)
+    if picked.0 == 0:
+        out.close()
+        late := out.try_recv()
+        if late != none:
+            if late? > 0:
+                tcp_close(late?)
+        fail "http: dial tcp {host}:{port}: timed out after {timeout_ms} ms"
+    mut fd := 0
+    if picked.1 != none:
+        fd = picked.1?
+    if fd <= 0:
+        fail "http: dial tcp {host}:{port}: connection failed"
+    return io.from_fd(fd)
 
 # whether a client request's own Connection field asks to close.
 fn request_prefers_close_header(req: ClientRequest) -> Bool:

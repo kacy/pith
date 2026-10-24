@@ -1088,6 +1088,24 @@ mod tests {
     }
 
     #[test]
+    fn chr_hands_out_a_static_one_byte_string() {
+        unsafe {
+            for n in [0i64, 10, 34, 65, 127, 200, 255, 256 + 65] {
+                let s = pith_chr_cstr(n);
+                assert_eq!(cstring_header_len(s), Some(1));
+                assert_eq!(*s as u8, n as u8);
+                assert_eq!(*s.add(1), 0);
+                assert!(cstring_base(s).is_none());
+                pith_cstring_retain(s);
+                pith_cstring_release(s);
+                pith_cstring_release(s);
+                assert_eq!(*s as u8, n as u8);
+            }
+            assert_eq!(pith_chr_cstr(65), pith_chr_cstr(65));
+        }
+    }
+
+    #[test]
     fn count_release_returns_the_count_before() {
         use std::sync::atomic::{AtomicU32, Ordering};
         let count = AtomicU32::new(3);
@@ -1434,10 +1452,38 @@ pub unsafe extern "C" fn pith_ord_cstr(s: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_chr_cstr(n: i64) -> *mut i8 {
-    let ptr = pith_alloc_cstring(1);
-    *ptr = (n as u8) as i8;
-    ptr
+    // the string is static and never written: retain and release leave a
+    // string with the literal magic alone.
+    STATIC_CHARS[(n as u8) as usize].bytes.as_ptr() as *mut i8
 }
+
+/// A one-byte string laid out like a compiled literal: the header
+/// `CSTRING_STATIC_MAGIC` marks, then the byte and its NUL.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct StaticChar {
+    magic: u32,
+    zero: u32,
+    len: u64,
+    bytes: [u8; 8],
+}
+
+/// One static string per byte value, so `chr` hands out a string instead of
+/// allocating one. http code builds CR, LF and quotes with it per request.
+static STATIC_CHARS: [StaticChar; 256] = {
+    let mut table = [StaticChar {
+        magic: CSTRING_STATIC_MAGIC,
+        zero: 0,
+        len: 1,
+        bytes: [0; 8],
+    }; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i].bytes[0] = i as u8;
+        i += 1;
+    }
+    table
+};
 
 // one verdict for the whole process. a built-in assertion ends the process at
 // the point it fails, so it never needs to consult this; std.testing's checks

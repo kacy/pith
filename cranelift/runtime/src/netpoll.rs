@@ -12,7 +12,7 @@
 //! registers its (fd, interest) with the poller of the worker it is running on
 //! and suspends its coroutine; the worker runs other tasks. the worker polls its
 //! own epoll when it runs out of work, and parks *in* `epoll_wait`, so readiness
-//! on one of its sockets wakes it directly. polling never resumes a coroutine —
+//! on one of its sockets wakes it directly. polling never resumes a coroutine:
 //! it only calls `green::wake(task)`, which re-enqueues the task onto its owner
 //! worker's pinned queue, so green's pinning discipline holds unchanged.
 //!
@@ -67,7 +67,7 @@
 //! oneshot). it is how the scheduler wakes a parked worker for new work (see
 //! `notify`): the write makes the worker's `epoll_wait` return even if it lands
 //! before the wait starts. a deadline never needs one, because only the worker
-//! itself registers on its poller, and it is running a task when it does — its
+//! itself registers on its poller, and it is running a task when it does. its
 //! next park reads the new deadline.
 //!
 //! ## lock discipline

@@ -848,25 +848,25 @@ fn inline_bytes_read_word(
     builder.block_params(done)[0]
 }
 
-// The magic word every heap cstring carries at `ptr - 16`. This mirrors
-// `runtime_core::CSTRING_MAGIC` and must stay in sync with it. A drift is not a
-// safety problem — the fast path below simply stops matching and every access
-// falls back to the FFI helper, which is correct but slow — so keep the two
-// definitions together.
-const CSTRING_MAGIC: i64 = 0x5043_5352;
+// The magic word every heap cstring carries at `ptr - 16`, and the one a
+// string literal carries, which differs from it only in the low bit.
+const CSTRING_MAGIC: i64 = pith_runtime::CSTRING_MAGIC as i64;
+const _: () = assert!(pith_runtime::CSTRING_STATIC_MAGIC == pith_runtime::CSTRING_MAGIC | 1);
 
 // The 16-byte header in front of heap cstring data: [magic: u32][rc: u32,
 // atomic][data_len: u64], so the length lives 8 bytes before the pointer.
 const CSTRING_LEN_OFFSET: i32 = -8;
 const CSTRING_MAGIC_OFFSET: i32 = -16;
 
-/// Narrow `s` to a confirmed heap cstring, branching to `slow` for anything
-/// else. This mirrors `runtime_core::cstring_base`: heap cstring data is at an
-/// address >= 16 (which also rejects null), is 8-aligned, and carries the magic
-/// word 16 bytes in front of it. Literals and the shared empty string fail one
-/// of these checks and take the slow path. On return the builder sits in a
-/// fresh block where `s` is known to be a heap cstring.
-fn branch_if_not_heap_cstring(builder: &mut FunctionBuilder<'_>, s: Value, slow: Block) {
+/// Narrow `s` to a string with a length header, a heap cstring or a literal,
+/// branching to `slow` for anything else. This mirrors
+/// `runtime_core::cstring_header_len`: the data is at an address >= 16 (which
+/// also rejects null), is 8-aligned, and carries either magic word 16 bytes in
+/// front of it. The shared empty string fails one of these checks and takes
+/// the slow path. On return the builder sits in a fresh block where `s` is
+/// known to have the header; only its length may be read, since a literal's
+/// count word is not a count.
+fn branch_if_no_cstring_header(builder: &mut FunctionBuilder<'_>, s: Value, slow: Block) {
     // addr >= 16, unsigned so null and any stray small pointer are rejected
     // before the header word is read.
     let too_small = builder.ins().icmp_imm(IntCC::UnsignedLessThan, s, 16);
@@ -881,13 +881,16 @@ fn branch_if_not_heap_cstring(builder: &mut FunctionBuilder<'_>, s: Value, slow:
     builder.ins().brif(unaligned, slow, &[], check_magic, &[]);
     builder.switch_to_block(check_magic);
 
-    // read the 4-byte magic in front of the data and compare. an aligned
-    // literal reads mapped binary data here and simply fails the compare, the
-    // same contract the runtime relies on for retain/release.
+    // read the 4-byte magic in front of the data and compare, folding the
+    // literal magic onto the heap one by setting the bit that tells them
+    // apart. an aligned pointer without a header reads mapped data here and
+    // simply fails the compare, the same contract the runtime relies on for
+    // retain/release.
     let magic = builder
         .ins()
         .load(types::I32, MemFlags::new(), s, CSTRING_MAGIC_OFFSET);
-    let not_magic = builder.ins().icmp_imm(IntCC::NotEqual, magic, CSTRING_MAGIC);
+    let folded = builder.ins().bor_imm(magic, 1);
+    let not_magic = builder.ins().icmp_imm(IntCC::NotEqual, folded, CSTRING_MAGIC | 1);
     let confirmed = builder.create_block();
     builder.ins().brif(not_magic, slow, &[], confirmed, &[]);
     builder.switch_to_block(confirmed);
@@ -908,7 +911,7 @@ fn inline_cstring_byte_at(
     builder.append_block_param(done, types::I64);
     let slow = builder.create_block();
 
-    branch_if_not_heap_cstring(builder, s, slow);
+    branch_if_no_cstring_header(builder, s, slow);
     let len = builder
         .ins()
         .load(types::I64, MemFlags::new(), s, CSTRING_LEN_OFFSET);
@@ -949,7 +952,7 @@ fn inline_cstring_len(
     builder.append_block_param(done, types::I64);
     let slow = builder.create_block();
 
-    branch_if_not_heap_cstring(builder, s, slow);
+    branch_if_no_cstring_header(builder, s, slow);
     let len = builder
         .ins()
         .load(types::I64, MemFlags::new(), s, CSTRING_LEN_OFFSET);

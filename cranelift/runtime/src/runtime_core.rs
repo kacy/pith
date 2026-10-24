@@ -64,7 +64,14 @@ pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
 // so the compiler can emit retain/release for every string register without
 // caring where the string came from.
 
-pub(crate) const CSTRING_MAGIC: u32 = 0x50435352; // "PCSR"
+pub const CSTRING_MAGIC: u32 = 0x50435352; // "PCSR"
+/// The magic of the header the compiler writes in front of a string literal:
+/// [magic: u32][0: u32][data_len: u64], laid out like a heap header so the
+/// length sits at the same offset. A literal is never freed or counted, so it
+/// carries a magic `cstring_base` rejects, and only `cstring_header_len`
+/// accepts it. It differs from the heap magic in the low bit alone, which
+/// lets the codegen test for either with one compare.
+pub const CSTRING_STATIC_MAGIC: u32 = CSTRING_MAGIC | 1;
 const CSTRING_HEADER_SIZE: usize = 16;
 const CSTRING_ALIGN: usize = 8;
 
@@ -293,9 +300,19 @@ pub(crate) unsafe fn cstring_refcount_for_tests(s: *const i8) -> Option<u32> {
     cstring_base(s).map(|base| cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// O(1) length for heap cstrings via the header; None for literals.
+/// O(1) length from the header of a heap cstring or a compiled literal; None
+/// for anything without one. The same practical guard as `cstring_base`.
 pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
-    cstring_base(s).map(|base| (base.add(8) as *const u64).read() as i64)
+    let addr = s as usize;
+    if addr < CSTRING_HEADER_SIZE || addr % CSTRING_ALIGN != 0 {
+        return None;
+    }
+    let base = (s as *const u8).sub(CSTRING_HEADER_SIZE);
+    let magic = (base as *const u32).read();
+    if magic != CSTRING_MAGIC && magic != CSTRING_STATIC_MAGIC {
+        return None;
+    }
+    Some((base.add(8) as *const u64).read() as i64)
 }
 
 /// Debug: release with an emission-site id; prints the site when the traced
@@ -1023,6 +1040,28 @@ mod tests {
 
             assert_eq!(pith_struct_weak_load(s), 0);
             pith_struct_weak_release(s);
+        }
+    }
+
+    /// a compiled literal's header gives its length, and retain and release
+    /// leave it alone.
+    #[test]
+    fn a_literal_header_gives_the_length_and_is_never_counted() {
+        let mut words = [0u64; 4];
+        let text = b"literal ";
+        unsafe {
+            let base = words.as_mut_ptr() as *mut u8;
+            (base as *mut u32).write(CSTRING_STATIC_MAGIC);
+            (base.add(8) as *mut u64).write(7);
+            std::ptr::copy_nonoverlapping(text.as_ptr(), base.add(16), text.len());
+            let s = base.add(16) as *const i8;
+            assert_eq!(cstring_header_len(s), Some(7));
+            assert_eq!(crate::string::pith_cstring_len(s), 7);
+            assert!(cstring_base(s).is_none());
+            pith_cstring_retain(s);
+            pith_cstring_release(s);
+            assert_eq!((base.add(4) as *const u32).read(), 0);
+            assert_eq!((base as *const u32).read(), CSTRING_STATIC_MAGIC);
         }
     }
 

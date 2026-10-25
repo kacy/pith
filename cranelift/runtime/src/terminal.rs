@@ -168,7 +168,7 @@ pub extern "C" fn pith_term_read(fd: i64, max: i64, timeout_ms: i64) -> i64 {
     if fd < 0 || max <= 0 {
         return 0;
     }
-    match fdio::wait_ready_unguarded(fd, true, timeout_ms) {
+    match fdio::wait_ready_level(fd, true, timeout_ms) {
         0 => return pith_bytes_from_vec(Vec::new()),
         1 => {}
         _ => return 0,

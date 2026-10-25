@@ -417,7 +417,7 @@ fn wait_handle(conn: i64, read: bool, timeout_ms: i64) -> i64 {
     let Some(guard) = socket(conn) else {
         return -1;
     };
-    fdio::wait_guarded(&guard, read, timeout_ms)
+    fdio::wait_guarded_level(&guard, read, timeout_ms)
 }
 
 #[no_mangle]

@@ -1,0 +1,41 @@
+import std.bytes as bytes
+
+# Bytes.len() and List.len() compile to an inline length read with the
+# runtime call as the fallback; these cover the cases that leave the fast path.
+struct Point:
+    x: Int
+    y: Int
+
+fn sum_bytes(data: Bytes) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < data.len():
+        total = total + data[i]
+        i = i + 1
+    return total
+
+fn main() -> String!:
+    empty := bytes.from_string_utf8("")
+    word := bytes.from_string_utf8("hello world")
+    part := word.slice(2, 7)
+    print(empty.len().to_string())
+    print(word.len().to_string())
+    print(part.len().to_string())
+    print(sum_bytes(part).to_string())
+
+    mut ints := [1]
+    ints.remove(0)
+    print(ints.len().to_string())
+    ints.push(4)
+    ints.push(5)
+    print(ints.len().to_string())
+
+    points := [Point(1, 2), Point(3, 4), Point(5, 6)]
+    print(points.len().to_string())
+    names := ["a", "b"]
+    print(names.len().to_string())
+    floats := [1.5, 2.5, 3.5, 4.5]
+    print(floats.len().to_string())
+    flags := [true, false, true, true, false]
+    print(flags.len().to_string())
+    return ""

@@ -383,6 +383,10 @@ fn bits_builtin_op(builtin: &str) -> Option<&'static str> {
         "bit_xor" => Some("bxor"),
         "bit_shl" => Some("shl"),
         "bit_shr" => Some("shr"),
+        "bit_rotl32" => Some("rotl32"),
+        "bit_rotr32" => Some("rotr32"),
+        "bit_rotl64" => Some("rotl64"),
+        "bit_rotr64" => Some("rotr64"),
         _ => None,
     }
 }
@@ -445,6 +449,19 @@ fn emit_bits_op(builder: &mut FunctionBuilder<'_>, op: &str, a: Value, b: Value)
         "bor" => builder.ins().bor(a, b),
         "bxor" => builder.ins().bxor(a, b),
         "shl" => builder.ins().ishl(a, b),
+        // a 32-bit rotate turns the low half of the value and zero-extends
+        // the result, as pith_bit_rotr32 does
+        "rotl32" | "rotr32" => {
+            let low = builder.ins().ireduce(types::I32, a);
+            let rotated = if op == "rotl32" {
+                builder.ins().rotl(low, b)
+            } else {
+                builder.ins().rotr(low, b)
+            };
+            builder.ins().uextend(types::I64, rotated)
+        }
+        "rotl64" => builder.ins().rotl(a, b),
+        "rotr64" => builder.ins().rotr(a, b),
         _ => builder.ins().ushr(a, b),
     }
 }

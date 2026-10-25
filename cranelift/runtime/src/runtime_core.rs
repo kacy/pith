@@ -2281,6 +2281,30 @@ pub extern "C" fn pith_bit_shr(a: i64, b: i64) -> i64 {
     ((a as u64) >> b) as i64
 }
 
+// the rotates work on the low 32 or all 64 bits of `a`, with the amount taken
+// mod the width; a 32-bit result is zero-extended. codegen lowers calls to
+// these to one rotate instruction, and these are the fallback with the same
+// result.
+#[no_mangle]
+pub extern "C" fn pith_bit_rotl32(a: i64, b: i64) -> i64 {
+    (a as u32).rotate_left(b as u32 & 31) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn pith_bit_rotr32(a: i64, b: i64) -> i64 {
+    (a as u32).rotate_right(b as u32 & 31) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn pith_bit_rotl64(a: i64, b: i64) -> i64 {
+    (a as u64).rotate_left(b as u32 & 63) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn pith_bit_rotr64(a: i64, b: i64) -> i64 {
+    (a as u64).rotate_right(b as u32 & 63) as i64
+}
+
 #[no_mangle]
 pub extern "C" fn pith_uint(n: i64) -> i64 {
     n

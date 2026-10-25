@@ -21,6 +21,18 @@
 //! scan then compares the needle at every position, exactly as the naive
 //! loop did. `memmem` has no such cliff, and it is the one that stays.
 //! docs/performance.md has the per-cell numbers.
+//!
+//! on x86_64 a haystack of 32 bytes or more now goes through a packed-pair
+//! prefilter first, the method Rust's own `str::find` and the memchr crate
+//! use: sixteen positions at a time are tested for the needle's first byte
+//! and, at the right distance, its last byte, with SSE2 (part of the x86_64
+//! baseline), and only positions where both match are compared in full.
+//! that tests the 7-byte needle whose first byte is common at sixteen
+//! positions per step instead of following each first byte, and the
+//! adversarial haystack of the needle's first byte produces no candidates
+//! at all, since its last byte differs. a haystack that does produce many
+//! false candidates hands the rest of the search to `memmem`, so the old
+//! cliff stays closed. a one-byte needle is `memchr`.
 
 use std::ffi::c_void;
 
@@ -41,21 +53,93 @@ pub fn find_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> 
         return None;
     }
     let rest = &haystack[start..];
+    if n_len == 1 {
+        // memchr reads only within the length it is given
+        let found =
+            unsafe { libc::memchr(rest.as_ptr() as *const c_void, needle[0] as i32, rest.len()) };
+        return if found.is_null() {
+            None
+        } else {
+            Some(start + (found as usize - rest.as_ptr() as usize))
+        };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if rest.len() >= PAIR_MIN_HAYSTACK {
+        return packed_pair(rest, needle).map(|at| start + at);
+    }
+    memmem(rest, needle).map(|at| start + at)
+}
+
+/// libc's `memmem` over two non-empty slices, as an offset into `haystack`.
+fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     // memmem reads only within the lengths it is given, which are exactly
-    // the two slices; neither is empty here.
+    // the two slices.
     let found = unsafe {
         libc::memmem(
-            rest.as_ptr() as *const c_void,
-            rest.len(),
+            haystack.as_ptr() as *const c_void,
+            haystack.len(),
             needle.as_ptr() as *const c_void,
-            n_len,
+            needle.len(),
         )
     };
     if found.is_null() {
         None
     } else {
-        Some(start + (found as usize - rest.as_ptr() as usize))
+        Some(found as usize - haystack.as_ptr() as usize)
     }
+}
+
+/// below this many bytes the prefilter's setup costs more than it saves
+#[cfg(target_arch = "x86_64")]
+const PAIR_MIN_HAYSTACK: usize = 32;
+
+/// the packed-pair prefilter described at the top of the module, for a
+/// needle of two bytes or more and a haystack at least as long. returns the
+/// first match as an offset into `haystack`.
+#[cfg(target_arch = "x86_64")]
+fn packed_pair(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+        _mm_set1_epi8,
+    };
+    let last = needle.len() - 1;
+    // a start position `at` is tested when its sixteen-byte window, read
+    // at `at` and at `at + last`, stays inside the haystack
+    let Some(end) = (haystack.len() - last).checked_sub(16) else {
+        return memmem(haystack, needle);
+    };
+    // every false candidate costs a compare. once they outnumber one per
+    // eight bytes scanned (after a small allowance), the haystack is the
+    // kind memmem handles better, and it takes over from where we are.
+    let mut misses = 0usize;
+    let mut at = 0usize;
+    // SAFETY: SSE2 is part of the x86_64 baseline. each load reads sixteen
+    // bytes at `at` or `at + last`, and `at <= end` keeps both windows
+    // within `haystack`.
+    unsafe {
+        let first_v = _mm_set1_epi8(needle[0] as i8);
+        let last_v = _mm_set1_epi8(needle[last] as i8);
+        while at <= end {
+            let a = _mm_loadu_si128(haystack.as_ptr().add(at) as *const __m128i);
+            let b = _mm_loadu_si128(haystack.as_ptr().add(at + last) as *const __m128i);
+            let both = _mm_and_si128(_mm_cmpeq_epi8(a, first_v), _mm_cmpeq_epi8(b, last_v));
+            let mut mask = _mm_movemask_epi8(both) as u32;
+            while mask != 0 {
+                let pos = at + mask.trailing_zeros() as usize;
+                if haystack[pos..pos + needle.len()] == *needle {
+                    return Some(pos);
+                }
+                misses += 1;
+                mask &= mask - 1;
+            }
+            at += 16;
+            if misses > 64 + at / 8 {
+                return memmem(&haystack[at..], needle).map(|found| at + found);
+            }
+        }
+    }
+    // the last positions, fewer than sixteen, go through memmem
+    memmem(&haystack[at..], needle).map(|found| at + found)
 }
 
 /// the first position where `needle` occurs in `haystack`.
@@ -157,6 +241,39 @@ mod tests {
     }
 
     #[test]
+    fn long_haystacks_through_the_prefilter() {
+        // every match position across a window boundary, and every needle
+        // length up to past one window, on a haystack long enough for the
+        // vector loop, its tail and the memmem fallback
+        let filler = b"lorem ipsum dolor sit amet consectetur s ".repeat(30);
+        for n_len in [2usize, 3, 7, 15, 16, 17, 33] {
+            let needle: Vec<u8> = (0..n_len).map(|i| b'A' + (i % 26) as u8).collect();
+            for at in 0..80 {
+                let mut hay = filler[..200].to_vec();
+                if at + n_len <= hay.len() {
+                    hay[at..at + n_len].copy_from_slice(&needle);
+                }
+                assert_eq!(find(&hay, &needle), naive(&hay, &needle, 0), "len {n_len} at {at}");
+                assert_eq!(find_from(&hay, &needle, 5), naive(&hay, &needle, 5));
+            }
+            assert_eq!(find(&filler, &needle), None);
+        }
+        // a common first byte with no match, and the repeated-byte haystack
+        // whose candidates all fail on the last byte
+        assert_eq!(find(&filler, b"sitting"), None);
+        let mut runs = vec![b'a'; 4000];
+        assert_eq!(find(&runs, b"aaaaaab"), None);
+        runs[3990] = b'b';
+        assert_eq!(find(&runs, b"aaaaaab"), Some(3984));
+        // many false candidates: every first and last byte matches, so the
+        // search falls back to memmem part way and must still find the end
+        let mut pairs = b"ab".repeat(2000);
+        pairs.extend_from_slice(b"aXb");
+        assert_eq!(find(&pairs, b"aXb"), Some(4000));
+        assert_eq!(find(&pairs, b"aab"), None);
+    }
+
+    #[test]
     fn matches_the_naive_search_on_generated_pairs() {
         // a small alphabet so repeats and shared prefixes are common, with
         // bytes above 0x7f in it so the search is exercised on non-ascii.
@@ -165,9 +282,9 @@ mod tests {
         let mut pairs = 0usize;
         let mut hits = 0usize;
         for _ in 0..4000 {
-            let h_len = rng.below(64);
+            let h_len = rng.below(160);
             let haystack: Vec<u8> = (0..h_len).map(|_| alphabet[rng.below(6)]).collect();
-            let n_len = rng.below(9);
+            let n_len = rng.below(20);
             // half the needles are cut from the haystack so most of them hit
             let needle: Vec<u8> = if rng.below(2) == 0 && n_len <= h_len && h_len > 0 {
                 let at = rng.below((h_len - n_len + 1) as u64);

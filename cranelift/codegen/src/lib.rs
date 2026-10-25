@@ -113,16 +113,24 @@ pub fn declare_string_data(
 ) -> Result<FuncId, CompileError> {
     use cranelift_module::DataDescription;
 
-    // Sixteen zero bytes precede the characters: a released string is
-    // identified by a magic word at ptr-16, and a literal must never
-    // accidentally match it through whatever the linker happens to place
-    // before its data. the returned address skips the pad.
-    let mut data = vec![0u8; 16];
+    // a sixteen-byte header precedes the characters, laid out like a heap
+    // cstring's: [magic: u32][0: u32][length: u64]. its magic is
+    // `runtime_core::CSTRING_STATIC_MAGIC`, never the heap one, so retain and
+    // release still leave a literal alone, but every reader of a string's
+    // length takes it from the header instead of scanning for the NUL. the
+    // data is 8-aligned so the address after the header passes the same
+    // alignment check a heap cstring does. the returned address skips the
+    // header.
+    let mut data = Vec::with_capacity(16 + content.len() + 1);
+    data.extend_from_slice(&pith_runtime::CSTRING_STATIC_MAGIC.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes());
+    data.extend_from_slice(&(content.len() as u64).to_le_bytes());
     data.extend_from_slice(content.as_bytes());
     data.push(0); // Null terminator
 
     let mut data_desc = DataDescription::new();
     data_desc.define(data.into_boxed_slice());
+    data_desc.set_align(8);
 
     let data_id = module
         .declare_data(name, cranelift_module::Linkage::Local, false, false)

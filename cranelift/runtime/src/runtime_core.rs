@@ -64,7 +64,14 @@ pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
 // so the compiler can emit retain/release for every string register without
 // caring where the string came from.
 
-pub(crate) const CSTRING_MAGIC: u32 = 0x50435352; // "PCSR"
+pub const CSTRING_MAGIC: u32 = 0x50435352; // "PCSR"
+/// The magic of the header the compiler writes in front of a string literal:
+/// [magic: u32][0: u32][data_len: u64], laid out like a heap header so the
+/// length sits at the same offset. A literal is never freed or counted, so it
+/// carries a magic `cstring_base` rejects, and only `cstring_header_len`
+/// accepts it. It differs from the heap magic in the low bit alone, which
+/// lets the codegen test for either with one compare.
+pub const CSTRING_STATIC_MAGIC: u32 = CSTRING_MAGIC | 1;
 const CSTRING_HEADER_SIZE: usize = 16;
 const CSTRING_ALIGN: usize = 8;
 
@@ -198,18 +205,7 @@ unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delt
 pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     if let Some(base) = cstring_base(s) {
         crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
-        // a count of one is the caller's alone, so nobody can race the last
-        // release and it needs no read-modify-write. the acquire load pairs
-        // with the release decrements of the owners that went before.
-        let rc = cstring_refcount(base);
-        let prev = if rc.load(std::sync::atomic::Ordering::Acquire) == 1 {
-            // zeroed as the decrement would have left it, so a later
-            // over-release still reads as one under PITH_CSTRING_NOFREE.
-            rc.store(0, std::sync::atomic::Ordering::Relaxed);
-            1
-        } else {
-            rc.fetch_sub(1, std::sync::atomic::Ordering::Release)
-        };
+        let prev = count_release(cstring_refcount(base));
         cstring_watch(base, s, "release", prev as i64, -1);
         if prev == 0 {
             // an over-release means the emitter's ownership accounting is
@@ -255,6 +251,22 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     }
 }
 
+/// Drop one count and return the count before, like `fetch_sub(1, Release)`.
+/// A count of one belongs to the caller alone: no other owner is left to
+/// retain or release concurrently, and the acquire load orders every earlier
+/// owner's release before it. So the last release, the common case for a
+/// temporary, is a load and a plain store instead of a locked
+/// read-modify-write.
+#[inline(always)]
+pub(crate) fn count_release(count: &std::sync::atomic::AtomicU32) -> u32 {
+    use std::sync::atomic::Ordering;
+    if count.load(Ordering::Acquire) == 1 {
+        count.store(0, Ordering::Relaxed);
+        return 1;
+    }
+    count.fetch_sub(1, Ordering::Release)
+}
+
 /// Debug switch: keep freed cstrings alive and report over-releases, so an
 /// accounting bug in emitted code shows up as a message, not corruption.
 #[inline(always)]
@@ -288,9 +300,19 @@ pub(crate) unsafe fn cstring_refcount_for_tests(s: *const i8) -> Option<u32> {
     cstring_base(s).map(|base| cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// O(1) length for heap cstrings via the header; None for literals.
+/// O(1) length from the header of a heap cstring or a compiled literal; None
+/// for anything without one. The same practical guard as `cstring_base`.
 pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
-    cstring_base(s).map(|base| (base.add(8) as *const u64).read() as i64)
+    let addr = s as usize;
+    if addr < CSTRING_HEADER_SIZE || addr % CSTRING_ALIGN != 0 {
+        return None;
+    }
+    let base = (s as *const u8).sub(CSTRING_HEADER_SIZE);
+    let magic = (base as *const u32).read();
+    if magic != CSTRING_MAGIC && magic != CSTRING_STATIC_MAGIC {
+        return None;
+    }
+    Some((base.add(8) as *const u64).read() as i64)
 }
 
 /// Debug: release with an emission-site id; prints the site when the traced
@@ -1039,6 +1061,118 @@ mod tests {
         }
     }
 
+    /// a compiled literal's header gives its length, and retain and release
+    /// leave it alone.
+    #[test]
+    fn a_literal_header_gives_the_length_and_is_never_counted() {
+        let mut words = [0u64; 4];
+        let text = b"literal\0";
+        unsafe {
+            let base = words.as_mut_ptr() as *mut u8;
+            (base as *mut u32).write(CSTRING_STATIC_MAGIC);
+            (base.add(8) as *mut u64).write(7);
+            std::ptr::copy_nonoverlapping(text.as_ptr(), base.add(16), text.len());
+            let s = base.add(16) as *const i8;
+            assert_eq!(cstring_header_len(s), Some(7));
+            assert_eq!(crate::string::pith_cstring_len(s), 7);
+            assert!(cstring_base(s).is_none());
+            pith_cstring_retain(s);
+            pith_cstring_release(s);
+            assert_eq!((base.add(4) as *const u32).read(), 0);
+            assert_eq!((base as *const u32).read(), CSTRING_STATIC_MAGIC);
+        }
+    }
+
+    #[test]
+    fn concat_many_joins_its_parts_like_a_chain_of_concats() {
+        unsafe {
+            let a = crate::pith_copy_bytes_to_cstring(b"ab");
+            let b = crate::pith_copy_bytes_to_cstring(b"");
+            let c = crate::pith_copy_bytes_to_cstring(b"cde");
+            let null = std::ptr::null();
+            let joined = pith_concat_cstr_many(4, a, null, b, c, a, a, a, a);
+            assert_eq!(std::ffi::CStr::from_ptr(joined).to_bytes(), b"abcde");
+            assert_eq!(cstring_header_len(joined), Some(5));
+            assert_eq!(heap_refcount(joined), 1);
+            let all = pith_concat_cstr_many(8, a, a, a, a, a, a, a, c);
+            assert_eq!(std::ffi::CStr::from_ptr(all).to_bytes(), b"abababababababcde");
+            assert!(pith_concat_cstr_many(2, null, null, a, a, a, a, a, a).is_null());
+            // the parts keep their own counts
+            assert_eq!(heap_refcount(a), 1);
+            for s in [joined, all, a, b, c] {
+                pith_cstring_release(s);
+            }
+        }
+    }
+
+    #[test]
+    fn chr_hands_out_a_static_one_byte_string() {
+        unsafe {
+            for n in [0i64, 10, 34, 65, 127, 200, 255, 256 + 65] {
+                let s = pith_chr_cstr(n);
+                assert_eq!(cstring_header_len(s), Some(1));
+                assert_eq!(*s as u8, n as u8);
+                assert_eq!(*s.add(1), 0);
+                assert!(cstring_base(s).is_none());
+                pith_cstring_retain(s);
+                pith_cstring_release(s);
+                pith_cstring_release(s);
+                assert_eq!(*s as u8, n as u8);
+            }
+            assert_eq!(pith_chr_cstr(65), pith_chr_cstr(65));
+        }
+    }
+
+    #[test]
+    fn count_release_returns_the_count_before() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let count = AtomicU32::new(3);
+        assert_eq!(count_release(&count), 3);
+        assert_eq!(count_release(&count), 2);
+        assert_eq!(count_release(&count), 1);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
+
+    static DTOR_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn counting_dtor(_ptr: i64) {
+        DTOR_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// a destructor that keeps a weak reference to the value it tears down.
+    unsafe extern "C" fn weak_taking_dtor(ptr: i64) {
+        pith_struct_weak_retain(ptr);
+        WEAK_TAKEN.store(ptr, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    static WEAK_TAKEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    #[test]
+    fn a_sole_owner_release_runs_the_destructor_once() {
+        unsafe {
+            let before = DTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+            let s = pith_struct_alloc(2);
+            pith_struct_set_dtor(s, counting_dtor as usize as i64);
+            pith_struct_release(s);
+            assert_eq!(DTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+            assert_eq!(pith_struct_strong_count(s), 0); // freed: magic scrubbed
+        }
+    }
+
+    #[test]
+    fn a_weak_reference_taken_in_the_destructor_sees_the_value_dead() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_set_dtor(s, weak_taking_dtor as usize as i64);
+            pith_struct_release(s);
+            assert_eq!(WEAK_TAKEN.load(std::sync::atomic::Ordering::SeqCst), s);
+            // the header outlives the value for the weak reference
+            assert_eq!(struct_counts(s).1, 1);
+            assert_eq!(pith_struct_weak_load(s), 0);
+            pith_struct_weak_release(s);
+        }
+    }
+
     #[test]
     fn strong_count_follows_retain_and_release() {
         unsafe {
@@ -1181,6 +1315,52 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
     result
 }
 
+/// The most strings one `pith_concat_cstr_many` call joins. The consumer
+/// splits a longer chain into calls of at most this many.
+pub const CONCAT_MANY_MAX: usize = 8;
+
+/// Join the first `count` of up to eight strings into one fresh string, the
+/// way a chain of `pith_concat_cstr` calls would, with one allocation and one
+/// copy of each part instead of one per step. A null part is empty; with
+/// every part null the result is null, as `pith_concat_cstr(null, null)` is.
+/// The consumer turns `a + b + c ...` into this.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pith_concat_cstr_many(
+    count: i64,
+    s0: *const i8,
+    s1: *const i8,
+    s2: *const i8,
+    s3: *const i8,
+    s4: *const i8,
+    s5: *const i8,
+    s6: *const i8,
+    s7: *const i8,
+) -> *mut i8 {
+    let all = [s0, s1, s2, s3, s4, s5, s6, s7];
+    let parts = &all[..(count.max(0) as usize).min(CONCAT_MANY_MAX)];
+    if parts.iter().all(|p| p.is_null()) {
+        return std::ptr::null_mut();
+    }
+    let mut lens = [0usize; CONCAT_MANY_MAX];
+    let mut total = 0usize;
+    for (i, &part) in parts.iter().enumerate() {
+        if !part.is_null() {
+            lens[i] = string::pith_cstring_len(part) as usize;
+            total += lens[i];
+        }
+    }
+    let result = pith_alloc_cstring(total);
+    let mut at = 0usize;
+    for (i, &part) in parts.iter().enumerate() {
+        if lens[i] > 0 {
+            std::ptr::copy_nonoverlapping(part, result.add(at), lens[i]);
+            at += lens[i];
+        }
+    }
+    result
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_strdup(ptr: *const i8) -> *mut i8 {
     if ptr.is_null() {
@@ -1289,10 +1469,38 @@ pub unsafe extern "C" fn pith_ord_cstr(s: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_chr_cstr(n: i64) -> *mut i8 {
-    let ptr = pith_alloc_cstring(1);
-    *ptr = (n as u8) as i8;
-    ptr
+    // the string is static and never written: retain and release leave a
+    // string with the literal magic alone.
+    STATIC_CHARS[(n as u8) as usize].bytes.as_ptr() as *mut i8
 }
+
+/// A one-byte string laid out like a compiled literal: the header
+/// `CSTRING_STATIC_MAGIC` marks, then the byte and its NUL.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct StaticChar {
+    magic: u32,
+    zero: u32,
+    len: u64,
+    bytes: [u8; 8],
+}
+
+/// One static string per byte value, so `chr` hands out a string instead of
+/// allocating one. http code builds CR, LF and quotes with it per request.
+static STATIC_CHARS: [StaticChar; 256] = {
+    let mut table = [StaticChar {
+        magic: CSTRING_STATIC_MAGIC,
+        zero: 0,
+        len: 1,
+        bytes: [0; 8],
+    }; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i].bytes[0] = i as u8;
+        i += 1;
+    }
+    table
+};
 
 // one verdict for the whole process. a built-in assertion ends the process at
 // the point it fails, so it never needs to consult this; std.testing's checks
@@ -2464,9 +2672,15 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 // initial value. A slot is materialized lazily the first time a thread touches
 // it. Entries are not reclaimed at thread exit — bounded by the number of
 // threadlocal globals, retained for the life of the process by design.
+//
+// The slots are small integers the compiler hands out, so the maps use the
+// runtime's integer hasher; with siphash, the lookups std.io and std.json make
+// on every buffered write and json scope cost an http server a few percent of
+// its cpu.
+pub(crate) type TlsMap = crate::int_hash::IntMap<i64, i64>;
+
 thread_local! {
-    static TLS_GLOBALS: std::cell::RefCell<std::collections::HashMap<i64, i64>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static TLS_GLOBALS: std::cell::RefCell<TlsMap> = std::cell::RefCell::new(TlsMap::default());
 }
 
 /// Under the green backend, the map backing the currently-running task's
@@ -2476,7 +2690,7 @@ thread_local! {
 /// untouched: one worker OS thread per task there means per-OS-thread already is
 /// per-task. Under green, one worker runs many tasks, so we must route to the
 /// task's own map instead of sharing the worker's.
-fn green_task_tls() -> Option<*mut std::collections::HashMap<i64, i64>> {
+fn green_task_tls() -> Option<*mut TlsMap> {
     use crate::concurrency::scheduler::{backend, Backend};
     if backend() != Backend::Green {
         return None;
@@ -2494,7 +2708,7 @@ fn green_task_tls() -> Option<*mut std::collections::HashMap<i64, i64>> {
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64 {
     if let Some(map) = green_task_tls() {
-        // SAFETY: `map` points into the `Box<HashMap>` owned by the green task
+        // SAFETY: `map` points into the `Box<TlsMap>` owned by the green task
         // currently running on this worker thread. `green` installs it around
         // `resume` and clears it after, so it is valid for the whole synchronous
         // duration of this pith call, and only this worker thread touches it. we

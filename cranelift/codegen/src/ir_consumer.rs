@@ -861,25 +861,25 @@ fn inline_bytes_read_word(
     builder.block_params(done)[0]
 }
 
-// The magic word every heap cstring carries at `ptr - 16`. This mirrors
-// `runtime_core::CSTRING_MAGIC` and must stay in sync with it. A drift is not a
-// safety problem — the fast path below simply stops matching and every access
-// falls back to the FFI helper, which is correct but slow — so keep the two
-// definitions together.
-const CSTRING_MAGIC: i64 = 0x5043_5352;
+// The magic word every heap cstring carries at `ptr - 16`, and the one a
+// string literal carries, which differs from it only in the low bit.
+const CSTRING_MAGIC: i64 = pith_runtime::CSTRING_MAGIC as i64;
+const _: () = assert!(pith_runtime::CSTRING_STATIC_MAGIC == pith_runtime::CSTRING_MAGIC | 1);
 
 // The 16-byte header in front of heap cstring data: [magic: u32][rc: u32,
 // atomic][data_len: u64], so the length lives 8 bytes before the pointer.
 const CSTRING_LEN_OFFSET: i32 = -8;
 const CSTRING_MAGIC_OFFSET: i32 = -16;
 
-/// Narrow `s` to a confirmed heap cstring, branching to `slow` for anything
-/// else. This mirrors `runtime_core::cstring_base`: heap cstring data is at an
-/// address >= 16 (which also rejects null), is 8-aligned, and carries the magic
-/// word 16 bytes in front of it. Literals and the shared empty string fail one
-/// of these checks and take the slow path. On return the builder sits in a
-/// fresh block where `s` is known to be a heap cstring.
-fn branch_if_not_heap_cstring(builder: &mut FunctionBuilder<'_>, s: Value, slow: Block) {
+/// Narrow `s` to a string with a length header, a heap cstring or a literal,
+/// branching to `slow` for anything else. This mirrors
+/// `runtime_core::cstring_header_len`: the data is at an address >= 16 (which
+/// also rejects null), is 8-aligned, and carries either magic word 16 bytes in
+/// front of it. The shared empty string fails one of these checks and takes
+/// the slow path. On return the builder sits in a fresh block where `s` is
+/// known to have the header; only its length may be read, since a literal's
+/// count word is not a count.
+fn branch_if_no_cstring_header(builder: &mut FunctionBuilder<'_>, s: Value, slow: Block) {
     // addr >= 16, unsigned so null and any stray small pointer are rejected
     // before the header word is read.
     let too_small = builder.ins().icmp_imm(IntCC::UnsignedLessThan, s, 16);
@@ -894,13 +894,16 @@ fn branch_if_not_heap_cstring(builder: &mut FunctionBuilder<'_>, s: Value, slow:
     builder.ins().brif(unaligned, slow, &[], check_magic, &[]);
     builder.switch_to_block(check_magic);
 
-    // read the 4-byte magic in front of the data and compare. an aligned
-    // literal reads mapped binary data here and simply fails the compare, the
-    // same contract the runtime relies on for retain/release.
+    // read the 4-byte magic in front of the data and compare, folding the
+    // literal magic onto the heap one by setting the bit that tells them
+    // apart. an aligned pointer without a header reads mapped data here and
+    // simply fails the compare, the same contract the runtime relies on for
+    // retain/release.
     let magic = builder
         .ins()
         .load(types::I32, MemFlags::new(), s, CSTRING_MAGIC_OFFSET);
-    let not_magic = builder.ins().icmp_imm(IntCC::NotEqual, magic, CSTRING_MAGIC);
+    let folded = builder.ins().bor_imm(magic, 1);
+    let not_magic = builder.ins().icmp_imm(IntCC::NotEqual, folded, CSTRING_MAGIC | 1);
     let confirmed = builder.create_block();
     builder.ins().brif(not_magic, slow, &[], confirmed, &[]);
     builder.switch_to_block(confirmed);
@@ -921,7 +924,7 @@ fn inline_cstring_byte_at(
     builder.append_block_param(done, types::I64);
     let slow = builder.create_block();
 
-    branch_if_not_heap_cstring(builder, s, slow);
+    branch_if_no_cstring_header(builder, s, slow);
     let len = builder
         .ins()
         .load(types::I64, MemFlags::new(), s, CSTRING_LEN_OFFSET);
@@ -962,7 +965,7 @@ fn inline_cstring_len(
     builder.append_block_param(done, types::I64);
     let slow = builder.create_block();
 
-    branch_if_not_heap_cstring(builder, s, slow);
+    branch_if_no_cstring_header(builder, s, slow);
     let len = builder
         .ins()
         .load(types::I64, MemFlags::new(), s, CSTRING_LEN_OFFSET);
@@ -1433,6 +1436,11 @@ pub fn compile_from_ir(
             continue;
         }
         compiled_funcs.insert(func_name.clone());
+        let fused = fuse_concat_chains(&body_lines);
+        let body_lines: Vec<&str> = match &fused {
+            Some(lines) => lines.iter().map(String::as_str).collect(),
+            None => body_lines,
+        };
         if let Some(&func_id) = declared_funcs.get(&func_name) {
             compile_ir_function(
                 codegen,
@@ -1455,6 +1463,168 @@ pub fn compile_from_ir(
     }
 
     Ok(declared_funcs)
+}
+
+/// Rewrite each chain of string concatenations in a function body into one
+/// `concatn dst count part...` instruction, or return `None` when the body has
+/// no chain. The emitter lowers `a + b + c + d` to a concat per `+`, each
+/// result released right after the next concat reads it, so a chain of n
+/// parts made n - 1 strings and copied the leading parts over and over;
+/// `concatn` makes one.
+///
+/// A concat continues a chain when its left operand is the result of an
+/// earlier concat that nothing else reads: the register appears once as a
+/// left operand, once in a `pith_cstring_release`, and nowhere else (a number
+/// that merely looks like it, an immediate, only makes the check refuse). No
+/// label, branch or return may come between the two. The chain's
+/// intermediate results and their releases go away, and a release of one of
+/// the chain's parts that sat inside the chain moves to just after the
+/// `concatn`, so every part is still alive when it is read. A string is
+/// immutable, so releasing it later changes nothing but when it is freed.
+fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
+    let parsed: Vec<Vec<&str>> = body.iter().map(|l| l.split_whitespace().collect()).collect();
+    if !parsed.iter().any(|p| p.first() == Some(&"concat")) {
+        return None;
+    }
+    let is_concat = |p: &[&str]| p.len() == 4 && p[0] == "concat";
+    let release_of = |p: &[&str]| -> Option<usize> {
+        if p.len() == 6 && p[0] == "call" && p[2] == "pith_cstring_release" && p[4] == "1" {
+            p[5].parse().ok()
+        } else {
+            None
+        }
+    };
+    let is_barrier = |p: &[&str]| matches!(p.first(), Some(&"label" | &"brif" | &"jmp" | &"ret"));
+
+    // every token after the opcode, counted. a register's own definition and
+    // its uses all show up here, and so does anything that looks like it.
+    let mut mentions: HashMap<&str, usize> = HashMap::new();
+    for p in &parsed {
+        for t in p.iter().skip(1) {
+            *mentions.entry(t).or_insert(0) += 1;
+        }
+    }
+    let mut concat_line: HashMap<usize, usize> = HashMap::new();
+    let mut release_lines: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, p) in parsed.iter().enumerate() {
+        if is_concat(p) {
+            if let Ok(dst) = p[1].parse::<usize>() {
+                concat_line.insert(dst, i);
+            }
+        }
+        if let Some(reg) = release_of(p) {
+            release_lines.entry(reg).or_default().push(i);
+        }
+    }
+
+    // prev[i] = the line of the concat whose result line i extends.
+    let mut prev: HashMap<usize, usize> = HashMap::new();
+    let mut barrier_before = vec![0usize; parsed.len() + 1];
+    for (i, p) in parsed.iter().enumerate() {
+        barrier_before[i + 1] = barrier_before[i] + usize::from(is_barrier(p));
+    }
+    for (i, p) in parsed.iter().enumerate() {
+        if !is_concat(p) {
+            continue;
+        }
+        let Ok(left) = p[2].parse::<usize>() else {
+            continue;
+        };
+        let Some(&j) = concat_line.get(&left) else {
+            continue;
+        };
+        let released_after = release_lines.get(&left).is_some_and(|r| r.len() == 1 && r[0] > i);
+        if j < i
+            && mentions.get(p[2]).copied() == Some(3)
+            && released_after
+            && barrier_before[i] == barrier_before[j + 1]
+        {
+            prev.insert(i, j);
+        }
+    }
+    if prev.is_empty() {
+        return None;
+    }
+
+    let extended: std::collections::HashSet<usize> = prev.values().copied().collect();
+    let mut chains: Vec<(Vec<usize>, Vec<&str>)> = Vec::new();
+    for &last in prev.keys() {
+        if extended.contains(&last) {
+            continue; // not the end of its chain
+        }
+        let mut members = vec![last];
+        let mut at = last;
+        while let Some(&j) = prev.get(&at) {
+            members.push(j);
+            at = j;
+        }
+        members.reverse();
+        let first = members[0];
+        let mut parts: Vec<&str> = vec![parsed[first][2], parsed[first][3]];
+        for &m in &members[1..] {
+            parts.push(parsed[m][3]);
+        }
+        chains.push((members, parts));
+    }
+    // a register that is a part of two chains would have its release moved
+    // by one and needed by the other, so neither of those chains is fused.
+    let mut chains_of_part: HashMap<&str, usize> = HashMap::new();
+    for (_, parts) in &chains {
+        let unique: std::collections::HashSet<&str> = parts.iter().copied().collect();
+        for part in unique {
+            *chains_of_part.entry(part).or_insert(0) += 1;
+        }
+    }
+    chains.retain(|(_, parts)| parts.iter().all(|part| chains_of_part[part] == 1));
+    if chains.is_empty() {
+        return None;
+    }
+
+    let mut dropped = vec![false; parsed.len()];
+    let mut replaced: HashMap<usize, String> = HashMap::new();
+    let mut moved_after: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (members, parts) in &chains {
+        let first = members[0];
+        let last = members[members.len() - 1];
+        for &m in &members[..members.len() - 1] {
+            dropped[m] = true;
+            if let Ok(dst) = parsed[m][1].parse::<usize>() {
+                for &r in &release_lines[&dst] {
+                    dropped[r] = true;
+                }
+            }
+        }
+        let part_regs: std::collections::HashSet<usize> =
+            parts.iter().filter_map(|t| t.parse().ok()).collect();
+        let mut moved = Vec::new();
+        for k in first + 1..last {
+            if dropped[k] {
+                continue;
+            }
+            if release_of(&parsed[k]).is_some_and(|r| part_regs.contains(&r)) {
+                dropped[k] = true;
+                moved.push(k);
+            }
+        }
+        moved_after.insert(last, moved);
+        replaced.insert(
+            last,
+            format!("concatn {} {} {}", parsed[last][1], parts.len(), parts.join(" ")),
+        );
+    }
+
+    let mut out = Vec::with_capacity(body.len());
+    for (i, line) in body.iter().enumerate() {
+        if let Some(fused) = replaced.get(&i) {
+            out.push(fused.clone());
+            for &k in &moved_after[&i] {
+                out.push(body[k].to_string());
+            }
+        } else if !dropped[i] {
+            out.push(line.to_string());
+        }
+    }
+    Some(out)
 }
 
 /// A `-> T!` function whose ok value fits one register returns two values
@@ -2052,6 +2222,63 @@ fn compile_ir_function(
                     regs.insert(reg, v);
                 }
                 string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
+                float_regs.remove(&reg);
+            }
+
+            // `concatn dst count part...`, made by fuse_concat_chains: one
+            // pith_concat_cstr_many call for up to eight parts. a longer chain
+            // joins eight at a time, each call's result leading the next and
+            // released once that one has copied it.
+            "concatn" if parts.len() >= 4 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let mut values = Vec::with_capacity(parts.len() - 3);
+                for t in &parts[3..] {
+                    values.push(get_reg(&regs, t)?);
+                }
+                let many = runtime_func_ref(
+                    codegen,
+                    &mut builder,
+                    &mut func_ref_cache,
+                    runtime_funcs,
+                    "pith_concat_cstr_many",
+                )?;
+                let release = runtime_func_ref(
+                    codegen,
+                    &mut builder,
+                    &mut func_ref_cache,
+                    runtime_funcs,
+                    "pith_cstring_release",
+                )?;
+                let max = pith_runtime::CONCAT_MANY_MAX;
+                let mut acc: Option<Value> = None;
+                let mut rest = &values[..];
+                let joined = loop {
+                    let room = if acc.is_some() { max - 1 } else { max };
+                    let take = rest.len().min(room);
+                    let mut group: Vec<Value> = acc.into_iter().collect();
+                    group.extend_from_slice(&rest[..take]);
+                    rest = &rest[take..];
+                    let count = builder.ins().iconst(types::I64, group.len() as i64);
+                    let mut args = vec![count];
+                    args.extend_from_slice(&group);
+                    while args.len() < max + 1 {
+                        args.push(builder.ins().iconst(types::I64, 0));
+                    }
+                    let call = builder.ins().call(many, &args);
+                    let joined = builder.func.dfg.first_result(call);
+                    if let Some(previous) = acc {
+                        builder.ins().call(release, &[previous]);
+                    }
+                    if rest.is_empty() {
+                        break joined;
+                    }
+                    acc = Some(joined);
+                };
+                regs.insert(reg, joined);
+                reg_source_vars.remove(&reg);
+                struct_regs.remove(&reg);
+                string_regs.insert(reg);
                 bytes_regs.remove(&reg);
                 float_regs.remove(&reg);
             }
@@ -3263,6 +3490,91 @@ fn get_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fuse(body: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        fuse_concat_chains(&lines)
+    }
+
+    /// `chr(123) + q + "id" + q`, as the emitter lowers it.
+    const CHAIN: &str = "
+        iconst 25 123
+        call 26 chr string 1 25
+        load 27 q
+        concat 28 26 27
+        call 29 pith_cstring_release void 1 26
+        strref 30 m0s1
+        concat 31 28 30
+        call 32 pith_cstring_release void 1 28
+        call 33 pith_cstring_release void 1 30
+        load 34 q
+        concat 35 31 34
+        call 36 pith_cstring_release void 1 31
+        store body 35
+    ";
+
+    #[test]
+    fn a_concat_chain_becomes_one_concatn() {
+        let fused = fuse(CHAIN).expect("the chain is fused");
+        assert_eq!(
+            fused,
+            vec![
+                "iconst 25 123",
+                "call 26 chr string 1 25",
+                "load 27 q",
+                "strref 30 m0s1",
+                "load 34 q",
+                "concatn 35 4 26 27 30 34",
+                "call 29 pith_cstring_release void 1 26",
+                "call 33 pith_cstring_release void 1 30",
+                "store body 35",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_intermediate_read_twice_ends_the_chain() {
+        // 28 is stored as well as extended, so it has to exist; the chain
+        // starts at it instead.
+        let body = CHAIN.replace("store body 35", "store body 35\nstore head 28");
+        let fused = fuse(&body).expect("the rest of the chain is fused");
+        assert!(fused.contains(&"concat 28 26 27".to_string()));
+        assert!(fused.contains(&"concatn 35 3 28 30 34".to_string()));
+        assert!(fused.contains(&"call 32 pith_cstring_release void 1 28".to_string()));
+    }
+
+    #[test]
+    fn a_branch_inside_a_chain_ends_it() {
+        let body = CHAIN.replace("load 34 q", "label L1\nload 34 q");
+        let fused = fuse(&body).expect("the part before the label is fused");
+        assert!(fused.contains(&"concatn 31 3 26 27 30".to_string()));
+        assert!(fused.contains(&"concat 35 31 34".to_string()));
+    }
+
+    #[test]
+    fn a_body_without_a_chain_is_left_alone() {
+        assert!(fuse("load 1 a\nload 2 b\nconcat 3 1 2\nret 3").is_none());
+        assert!(fuse("iconst 1 2\nret 1").is_none());
+    }
+
+    #[test]
+    fn a_part_shared_by_two_chains_keeps_both_unfused() {
+        // 2 is a part of both chains, and its release sits inside the second.
+        let body = "
+            load 1 a
+            load 2 b
+            load 3 c
+            concat 4 1 2
+            concat 5 4 3
+            call 6 pith_cstring_release void 1 4
+            concat 7 2 3
+            call 8 pith_cstring_release void 1 2
+            concat 9 7 1
+            call 10 pith_cstring_release void 1 7
+            ret 9
+        ";
+        assert!(fuse(body).is_none());
+    }
 
     #[test]
     fn safe_points_are_on_unless_the_build_asks_them_off() {

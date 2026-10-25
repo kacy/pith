@@ -91,7 +91,7 @@ pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
     let Some(b) = pith_bytes_ref(handle) else {
         return;
     };
-    let prev = b.rc.fetch_sub(1, std::sync::atomic::Ordering::Release);
+    let prev = crate::runtime_core::count_release(&b.rc);
     if prev > 1 {
         return;
     }
@@ -213,6 +213,11 @@ pub unsafe extern "C" fn pith_bytes_slice(handle: i64, start: i64, end: i64) -> 
     // see the note in pith_bytes_substring_utf8: an inverted range is empty.
     let start_idx = start.max(0).min(len);
     let end_idx = end.max(start_idx).min(len);
+    // bytes values are immutable, so the whole range can share the value
+    if start_idx == 0 && end_idx == len {
+        pith_bytes_retain(handle);
+        return handle;
+    }
     pith_bytes_from_vec(bytes.data[start_idx as usize..end_idx as usize].to_vec())
 }
 
@@ -224,6 +229,17 @@ pub unsafe extern "C" fn pith_bytes_concat(a: i64, b: i64) -> i64 {
     let Some(b_bytes) = pith_bytes_ref(b) else {
         return 0;
     };
+    // bytes values are immutable, so a concat with an empty side can share
+    // the other one. a buffered reader concatenates each read onto what it
+    // has cached, which is usually nothing.
+    if a_bytes.data.is_empty() {
+        pith_bytes_retain(b);
+        return b;
+    }
+    if b_bytes.data.is_empty() {
+        pith_bytes_retain(a);
+        return a;
+    }
     let mut out = Vec::with_capacity(a_bytes.data.len() + b_bytes.data.len());
     out.extend_from_slice(&a_bytes.data);
     out.extend_from_slice(&b_bytes.data);
@@ -669,6 +685,51 @@ mod tests {
             let short = pith_bytes_from_vec(vec![0u8; 16]);
             let long = pith_bytes_from_vec(vec![0u8; 272]);
             assert_eq!(pith_crypto_constant_time_eq(short, long), 0);
+        }
+    }
+
+    fn rc_of(handle: i64) -> u32 {
+        unsafe { pith_bytes_ref(handle).map(|b| b.rc.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) }
+    }
+
+    #[test]
+    fn a_concat_with_an_empty_side_shares_the_other_value() {
+        unsafe {
+            let data = pith_bytes_from_vec(b"abc".to_vec());
+            let empty = pith_bytes_from_vec(Vec::new());
+            let left = pith_bytes_concat(empty, data);
+            let right = pith_bytes_concat(data, empty);
+            assert_eq!((left, right), (data, data));
+            assert_eq!(rc_of(data), 3);
+            pith_bytes_release(left);
+            pith_bytes_release(right);
+            assert_eq!(rc_of(data), 1);
+            let both = pith_bytes_concat(data, data);
+            assert_ne!(both, data);
+            assert_eq!(pith_bytes_ref(both).map(|b| b.data.clone()), Some(b"abcabc".to_vec()));
+            pith_bytes_release(both);
+            pith_bytes_release(data);
+            pith_bytes_release(empty);
+        }
+    }
+
+    #[test]
+    fn a_slice_of_the_whole_value_shares_it_and_a_part_copies() {
+        unsafe {
+            let data = pith_bytes_from_vec(b"abcdef".to_vec());
+            let whole = pith_bytes_slice(data, 0, 6);
+            assert_eq!(whole, data);
+            assert_eq!(rc_of(data), 2);
+            pith_bytes_release(whole);
+            let clamped = pith_bytes_slice(data, -3, 99);
+            assert_eq!(clamped, data);
+            pith_bytes_release(clamped);
+            let part = pith_bytes_slice(data, 1, 3);
+            assert_ne!(part, data);
+            assert_eq!(pith_bytes_ref(part).map(|b| b.data.clone()), Some(b"bc".to_vec()));
+            pith_bytes_release(part);
+            assert_eq!(rc_of(data), 1);
+            pith_bytes_release(data);
         }
     }
 

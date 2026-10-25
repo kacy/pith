@@ -84,7 +84,8 @@
 
 use crate::concurrency::green;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use crate::int_hash::IntMap;
+use std::collections::BinaryHeap;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -180,10 +181,12 @@ struct FdReg {
     armed: u32,
 }
 
-/// one poller's registry, behind its mutex.
+/// one poller's registry, behind its mutex. the maps are keyed by fd numbers
+/// and sequence numbers, so they use the runtime's integer hasher; siphash
+/// would run inside the lock on every park and wake.
 struct Inner {
-    waiters: HashMap<(RawFd, Interest), Vec<Waiter>>,
-    fds: HashMap<RawFd, FdReg>,
+    waiters: IntMap<(RawFd, Interest), Vec<Waiter>>,
+    fds: IntMap<RawFd, FdReg>,
     /// how many entries of `fds` are armed. a disarmed fd cannot report
     /// anything, so only an armed one gives a poll something to find.
     armed_fds: usize,
@@ -191,20 +194,61 @@ struct Inner {
     /// sleeping tasks, keyed by the seq of their heap entry. a timer has no
     /// (fd, interest) to key on, and giving it its own map keeps it out of
     /// `waiters` — where everything is fd-shaped — entirely.
-    timers: HashMap<u64, Waiter>,
+    timers: IntMap<u64, Waiter>,
     next_seq: u64,
+    /// the heap size at which the next push first drops the entries whose
+    /// waits have ended. see `push_deadline`.
+    compact_at: usize,
 }
+
+/// the smallest heap `push_deadline` compacts: below it the stale entries
+/// cost less than the scan that would drop them.
+const DEADLINE_COMPACT_MIN: usize = 1024;
 
 impl Inner {
     fn new() -> Self {
         Inner {
-            waiters: HashMap::new(),
-            fds: HashMap::new(),
+            waiters: IntMap::default(),
+            fds: IntMap::default(),
             armed_fds: 0,
             deadlines: BinaryHeap::new(),
-            timers: HashMap::new(),
+            timers: IntMap::default(),
             next_seq: 0,
+            compact_at: DEADLINE_COMPACT_MIN,
         }
+    }
+
+    /// whether a deadline entry still has a wait to time out. a wait that
+    /// fired ready, or was closed, left its entry behind in the heap.
+    fn deadline_is_live(&self, deadline: &Deadline) -> bool {
+        match deadline.target {
+            DeadlineTarget::Timer => self.timers.contains_key(&deadline.seq),
+            DeadlineTarget::Io { fd, interest } => self
+                .waiters
+                .get(&(fd, interest))
+                .is_some_and(|waiters| waiters.iter().any(|w| w.seq == deadline.seq)),
+        }
+    }
+
+    /// add a deadline to the heap. a wait that ends before its deadline
+    /// leaves its entry in the heap until the deadline passes, so a server
+    /// that gives every read a 5 s timeout kept five seconds of requests
+    /// there: hundreds of megabytes across the workers, and a pop that walked
+    /// a heap far larger than the cache. so once the heap reaches
+    /// `compact_at`, the push first drops the stale entries and sets the next
+    /// threshold at twice what is left, which keeps the heap within a small
+    /// multiple of the live waits for a constant amortized cost per push.
+    fn push_deadline(&mut self, deadline: Deadline) {
+        if self.deadlines.len() >= self.compact_at {
+            let entries = std::mem::take(&mut self.deadlines).into_vec();
+            let live: Vec<_> = entries
+                .into_iter()
+                .filter(|entry| self.deadline_is_live(&entry.0))
+                .collect();
+            self.deadlines = BinaryHeap::from(live);
+            self.compact_at = (2 * self.deadlines.len()).max(DEADLINE_COMPACT_MIN);
+        }
+        self.deadlines.push(std::cmp::Reverse(deadline));
     }
 
     /// record in `busy` whether this registry has anything a poll could find.
@@ -490,11 +534,11 @@ pub(crate) fn wait_io(
                 outcome: outcome.clone(),
             });
         if let Some(at) = deadline {
-            inner.deadlines.push(std::cmp::Reverse(Deadline {
+            inner.push_deadline(Deadline {
                 at,
                 seq,
                 target: DeadlineTarget::Io { fd, interest },
-            }));
+            });
         }
         reconcile_fd(poller, &mut inner, fd);
         inner.publish(&poller.busy);
@@ -573,11 +617,11 @@ fn register_timer(poller: &Poller, at: Instant, task: usize, outcome: &Arc<Atomi
             outcome: outcome.clone(),
         },
     );
-    inner.deadlines.push(std::cmp::Reverse(Deadline {
+    inner.push_deadline(Deadline {
         at,
         seq,
         target: DeadlineTarget::Timer,
-    }));
+    });
     inner.publish(&poller.busy);
 }
 
@@ -717,10 +761,13 @@ fn next_timeout_ms(poller: &Poller, cap: Duration) -> libc::c_int {
 
 /// take all waiters for `(fd, interest)`, mark each ready, and queue it to wake.
 /// clearing the list disarms this interest until a still-blocked task re-registers
-/// (level-triggering means a genuinely-ready fd re-reports on the next arm).
+/// (level-triggering means a genuinely-ready fd re-reports on the next arm). the
+/// emptied list stays in the map, so the next wait on the fd, which on a
+/// keep-alive connection comes a request later, reuses its allocation; on_close
+/// removes it.
 fn take_ready(inner: &mut Inner, fd: RawFd, interest: Interest, to_wake: &mut Vec<usize>) {
-    if let Some(waiters) = inner.waiters.remove(&(fd, interest)) {
-        for w in waiters {
+    if let Some(waiters) = inner.waiters.get_mut(&(fd, interest)) {
+        for w in waiters.drain(..) {
             // flip PENDING->READY; if a timeout already claimed it, leave it be.
             if w
                 .outcome
@@ -1051,6 +1098,40 @@ mod tests {
         let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
         assert_eq!(rc, 0);
         (fds[0], fds[1])
+    }
+
+    #[test]
+    fn deadlines_of_finished_waits_do_not_pile_up() {
+        let mut inner = Inner::new();
+        let far = Instant::now() + Duration::from_secs(60);
+        let fd: RawFd = 424_250;
+        // one wait stays pending the whole time, so its deadline must survive
+        // every compaction.
+        let kept = inner.next_seq;
+        inner.next_seq += 1;
+        inner.waiters.entry((fd + 1, Interest::Read)).or_default().push(Waiter {
+            task: usize::MAX,
+            seq: kept,
+            outcome: Arc::new(AtomicI32::new(PENDING)),
+        });
+        inner.push_deadline(Deadline {
+            at: far,
+            seq: kept,
+            target: DeadlineTarget::Io { fd: fd + 1, interest: Interest::Read },
+        });
+        for _ in 0..20_000 {
+            // a wait that registers a deadline and then fires ready.
+            add_read_waiter(&mut inner, fd);
+            let seq = inner.next_seq - 1;
+            inner.push_deadline(Deadline {
+                at: far,
+                seq,
+                target: DeadlineTarget::Io { fd, interest: Interest::Read },
+            });
+            inner.waiters.remove(&(fd, Interest::Read));
+        }
+        assert!(inner.deadlines.len() <= DEADLINE_COMPACT_MIN, "{} entries", inner.deadlines.len());
+        assert!(inner.deadlines.iter().any(|entry| entry.0.seq == kept));
     }
 
     fn add_read_waiter(inner: &mut Inner, fd: RawFd) {

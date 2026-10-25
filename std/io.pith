@@ -40,17 +40,28 @@ threadlocal mut next_bytes_reader_handle: Int := 1
 threadlocal mut bytes_reader_data: Map[Int, Bytes] := {}
 threadlocal mut bytes_reader_offsets: Map[Int, Int] := {}
 
+# a buffered bytes reader's state: the source a fill reads from, how much it
+# asks for at a time, and what it has read and not handed out yet. a reader
+# keeps all of it in one entry, so an operation finds it with one lookup.
+struct BufferedBytesReaderState:
+    source_kind: Int
+    source_handle: Int
+    chunk_size: Int
+    cache: Bytes
+
+# a buffered bytes writer's state: its target, how much it holds before it
+# flushes, and what it holds.
+struct BufferedBytesWriterState:
+    target_kind: Int
+    target_handle: Int
+    chunk_size: Int
+    cache: Bytes
+
 threadlocal mut next_buffered_bytes_reader_handle: Int := 1
-threadlocal mut buffered_bytes_reader_source_kinds: Map[Int, Int] := {}
-threadlocal mut buffered_bytes_reader_source_handles: Map[Int, Int] := {}
-threadlocal mut buffered_bytes_reader_chunk_sizes: Map[Int, Int] := {}
-threadlocal mut buffered_bytes_reader_cache: Map[Int, Bytes] := {}
+threadlocal mut buffered_bytes_readers: Map[Int, BufferedBytesReaderState] := {}
 
 threadlocal mut next_buffered_bytes_writer_handle: Int := 1
-threadlocal mut buffered_bytes_writer_target_kinds: Map[Int, Int] := {}
-threadlocal mut buffered_bytes_writer_target_handles: Map[Int, Int] := {}
-threadlocal mut buffered_bytes_writer_chunk_sizes: Map[Int, Int] := {}
-threadlocal mut buffered_bytes_writer_cache: Map[Int, Bytes] := {}
+threadlocal mut buffered_bytes_writers: Map[Int, BufferedBytesWriterState] := {}
 
 # every buffered text reader — over a string, a socket, a file, or a child's
 # stdout or stderr — shares this one registry. the reader kind picks which
@@ -331,10 +342,13 @@ impl BufferedBytesReader:
     # are: it waits for the first byte of whatever comes next. 0 means end of
     # stream.
     fn wait_bytes() -> Int!:
-        cached := buffered_bytes_reader_cache_get(self.handle).len()
+        if not buffered_bytes_readers.contains_key(self.handle):
+            return 0
+        state := buffered_bytes_readers[self.handle]
+        cached := state.cache.len()
         if cached > 0:
             return cached
-        return buffered_bytes_reader_fill(self.handle)
+        return buffered_bytes_reader_fill(state)
 
     fn read_all_bytes() -> Bytes!:
         return read_all_buffered_bytes_reader(self)
@@ -355,6 +369,12 @@ impl BufferedBytesWriter:
 
     fn write_all_bytes(data: Bytes) -> Int!:
         return write_all_buffered_bytes_writer(self, data)
+
+    # write all of `data` and flush, returning the count written. the same
+    # bytes reach the target as write_all_bytes then flush send, but data
+    # written with nothing buffered ahead of it is not copied into the buffer.
+    fn write_all_and_flush(data: Bytes) -> Int!:
+        return buffered_bytes_writer_write_all_flush(self, data)
 
     fn flush() -> Int!:
         return buffered_bytes_writer_flush(self)
@@ -957,10 +977,7 @@ fn allocate_bytes_reader_handle(data: Bytes) -> Int:
 fn allocate_buffered_bytes_reader_handle(source_kind: Int, source_handle: Int, chunk_size: Int) -> Int:
     handle := next_buffered_bytes_reader_handle
     next_buffered_bytes_reader_handle = next_buffered_bytes_reader_handle + 1
-    buffered_bytes_reader_source_kinds.insert(handle, source_kind)
-    buffered_bytes_reader_source_handles.insert(handle, source_handle)
-    buffered_bytes_reader_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
-    buffered_bytes_reader_cache.insert(handle, bytes.empty())
+    buffered_bytes_readers.insert(handle, BufferedBytesReaderState(source_kind, source_handle, normalized_chunk_size(chunk_size), bytes.empty()))
     return handle
 
 fn make_buffered_bytes_reader(source_kind: Int, source_handle: Int, chunk_size: Int) -> BufferedBytesReader:
@@ -970,26 +987,17 @@ fn make_buffered_bytes_reader(source_kind: Int, source_handle: Int, chunk_size: 
 ## must free readers when the stream is done, or every request's
 ## buffers stay reachable forever.
 pub fn free_buffered_bytes_reader(reader: BufferedBytesReader):
-    buffered_bytes_reader_cache.remove(reader.handle)
-    buffered_bytes_reader_source_kinds.remove(reader.handle)
-    buffered_bytes_reader_source_handles.remove(reader.handle)
-    buffered_bytes_reader_chunk_sizes.remove(reader.handle)
+    buffered_bytes_readers.remove(reader.handle)
 
 ## drop a buffered writer's registry entries; the counterpart of
 ## free_buffered_bytes_reader for the write side.
 pub fn free_buffered_bytes_writer(writer: BufferedBytesWriter):
-    buffered_bytes_writer_cache.remove(writer.handle)
-    buffered_bytes_writer_target_kinds.remove(writer.handle)
-    buffered_bytes_writer_target_handles.remove(writer.handle)
-    buffered_bytes_writer_chunk_sizes.remove(writer.handle)
+    buffered_bytes_writers.remove(writer.handle)
 
 fn allocate_buffered_bytes_writer_handle(target_kind: Int, target_handle: Int, chunk_size: Int) -> Int:
     handle := next_buffered_bytes_writer_handle
     next_buffered_bytes_writer_handle = next_buffered_bytes_writer_handle + 1
-    buffered_bytes_writer_target_kinds.insert(handle, target_kind)
-    buffered_bytes_writer_target_handles.insert(handle, target_handle)
-    buffered_bytes_writer_chunk_sizes.insert(handle, normalized_chunk_size(chunk_size))
-    buffered_bytes_writer_cache.insert(handle, bytes.empty())
+    buffered_bytes_writers.insert(handle, BufferedBytesWriterState(target_kind, target_handle, normalized_chunk_size(chunk_size), bytes.empty()))
     return handle
 
 fn make_buffered_bytes_writer(target_kind: Int, target_handle: Int, chunk_size: Int) -> BufferedBytesWriter:
@@ -1889,22 +1897,22 @@ fn write_all_buffered_bytes_writer(writer: BufferedBytesWriter, data: Bytes) -> 
 fn buffered_bytes_reader_read_internal(reader: BufferedBytesReader, max_bytes: Int) -> Bytes!:
     if max_bytes <= 0:
         return bytes.empty()
-    if not buffered_bytes_reader_source_handles.contains_key(reader.handle):
+    if not buffered_bytes_readers.contains_key(reader.handle):
         return bytes.empty()
+    state := buffered_bytes_readers[reader.handle]
 
     buf := bytes.buffer_with_capacity(max_bytes)
     while buf.len() < max_bytes:
-        mut cached := buffered_bytes_reader_cache_get(reader.handle)
-        if cached.is_empty():
-            filled := buffered_bytes_reader_fill(reader.handle)!
+        if state.cache.is_empty():
+            filled := buffered_bytes_reader_fill(state)!
             if filled <= 0:
                 return buf.take_bytes()
-            cached = buffered_bytes_reader_cache_get(reader.handle)
+        cached := state.cache
         mut take := max_bytes - buf.len()
         if take > cached.len():
             take = cached.len()
         buf.write(cached.slice(0, take))!
-        buffered_bytes_reader_consume(reader.handle, take)
+        buffered_bytes_reader_consume(state, take)
     return buf.take_bytes()
 
 fn buffered_bytes_reader_read_until_internal(reader: BufferedBytesReader, sep: Bytes) -> Bytes!:
@@ -1931,8 +1939,9 @@ pub fn is_read_until_limit_error(message: String) -> Bool:
 fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReader, sep: Bytes, include_sep: Bool, cap: Int) -> Bytes!:
     if sep.is_empty():
         fail "empty separator"
-    if not buffered_bytes_reader_source_handles.contains_key(reader.handle):
+    if not buffered_bytes_readers.contains_key(reader.handle):
         return bytes.empty()
+    state := buffered_bytes_readers[reader.handle]
 
     buf := bytes.buffer()
     # the buffer is a handle with no destructor: the cap failure below and
@@ -1941,26 +1950,23 @@ fn buffered_bytes_reader_read_until_with_sep_internal(reader: BufferedBytesReade
     while true:
         if cap > 0 and buf.len() > cap:
             fail READ_UNTIL_LIMIT_PREFIX + "{cap} bytes without the separator"
-        mut cached := buffered_bytes_reader_cache_get(reader.handle)
+        cached := state.cache
         sep_pos := find_bytes_sep(cached, sep)
         if sep_pos >= 0:
             if sep_pos > 0:
                 buf.write(cached.slice(0, sep_pos))!
             if include_sep:
                 buf.write(sep)!
-            buffered_bytes_reader_consume(reader.handle, sep_pos + sep.len())
+            buffered_bytes_reader_consume(state, sep_pos + sep.len())
             return buf.take_bytes()
         keep := sep.len() - 1
         if cached.len() > keep:
             flush_len := cached.len() - keep
             buf.write(cached.slice(0, flush_len))!
-            buffered_bytes_reader_consume(reader.handle, flush_len)
-        filled := buffered_bytes_reader_fill(reader.handle)!
+            buffered_bytes_reader_consume(state, flush_len)
+        filled := buffered_bytes_reader_fill(state)!
         if filled <= 0:
-            cached = buffered_bytes_reader_cache.take(reader.handle)
-            if not cached.is_empty():
-                buf.write(cached)!
-            buffered_bytes_reader_cache.insert(reader.handle, bytes.empty())
+            buffered_bytes_reader_drain_into(state, buf)!
             return buf.take_bytes()
     return buf.take_bytes()
 
@@ -1988,14 +1994,15 @@ pub fn head_end(data: Bytes, start: Int) -> Int:
 HEAD_END_OVERLAP := 2
 
 fn buffered_bytes_reader_read_head_internal(reader: BufferedBytesReader, cap: Int) -> Bytes!:
-    if not buffered_bytes_reader_source_handles.contains_key(reader.handle):
+    if not buffered_bytes_readers.contains_key(reader.handle):
         return bytes.empty()
+    state := buffered_bytes_readers[reader.handle]
     # the common case: the whole head is already cached, so it comes back as
     # one slice with no staging buffer
-    mut cached := buffered_bytes_reader_cache_get(reader.handle)
+    mut cached := state.cache
     mut end := head_end(cached, 0)
     if end >= 0:
-        buffered_bytes_reader_consume(reader.handle, end)
+        buffered_bytes_reader_consume(state, end)
         return cached.slice(0, end)
     buf := bytes.buffer()
     # as in the read_until loop, the buffer has no destructor
@@ -2004,33 +2011,27 @@ fn buffered_bytes_reader_read_head_internal(reader: BufferedBytesReader, cap: In
         if cached.len() > HEAD_END_OVERLAP:
             flush_len := cached.len() - HEAD_END_OVERLAP
             buf.write(cached.slice(0, flush_len))!
-            buffered_bytes_reader_consume(reader.handle, flush_len)
+            buffered_bytes_reader_consume(state, flush_len)
         if cap > 0 and buf.len() > cap:
             fail READ_UNTIL_LIMIT_PREFIX + "{cap} bytes without the separator"
-        filled := buffered_bytes_reader_fill(reader.handle)!
+        filled := buffered_bytes_reader_fill(state)!
         if filled <= 0:
-            cached = buffered_bytes_reader_cache.take(reader.handle)
-            if not cached.is_empty():
-                buf.write(cached)!
-            buffered_bytes_reader_cache.insert(reader.handle, bytes.empty())
+            buffered_bytes_reader_drain_into(state, buf)!
             return buf.take_bytes()
-        cached = buffered_bytes_reader_cache_get(reader.handle)
+        cached = state.cache
         end = head_end(cached, 0)
         if end >= 0:
             buf.write(cached.slice(0, end))!
-            buffered_bytes_reader_consume(reader.handle, end)
+            buffered_bytes_reader_consume(state, end)
             return buf.take_bytes()
     return buf.take_bytes()
 
-fn buffered_bytes_reader_fill(handle: Int) -> Int!:
-    if not buffered_bytes_reader_source_handles.contains_key(handle):
-        return 0
-
-    source_kind := buffered_bytes_reader_source_kinds[handle]
-    source_handle := buffered_bytes_reader_source_handles[handle]
-    mut chunk_size := DEFAULT_CHUNK_SIZE
-    if buffered_bytes_reader_chunk_sizes.contains_key(handle):
-        chunk_size = buffered_bytes_reader_chunk_sizes[handle]
+# read one chunk from the reader's source onto what it has cached, returning
+# the count read; 0 at end of stream.
+fn buffered_bytes_reader_fill(state: BufferedBytesReaderState) -> Int!:
+    source_kind := state.source_kind
+    source_handle := state.source_handle
+    chunk_size := state.chunk_size
 
     mut chunk := bytes.empty()
     if source_kind == BUFFERED_BYTES_SOURCE_CURSOR:
@@ -2043,42 +2044,70 @@ fn buffered_bytes_reader_fill(handle: Int) -> Int!:
         chunk = process_stdout_read_bytes(ProcessStdout(source_handle), chunk_size)!
     elif source_kind == BUFFERED_BYTES_SOURCE_PROCESS_STDERR:
         chunk = process_stderr_read_bytes(ProcessStderr(source_handle), chunk_size)!
-    cached := buffered_bytes_reader_cache.take(handle)
-    buffered_bytes_reader_cache.insert(handle, cached.concat(chunk))
+    state.cache = state.cache.concat(chunk)
     return chunk.len()
 
-fn buffered_bytes_writer_write_internal(writer: BufferedBytesWriter, data: Bytes) -> Int!:
-    if not buffered_bytes_writer_target_handles.contains_key(writer.handle):
-        return 0
+# drop the first `consumed` cached bytes of a reader.
+fn buffered_bytes_reader_consume(state: BufferedBytesReaderState, consumed: Int):
+    state.cache = state.cache.slice(consumed, state.cache.len())
 
-    cached := buffered_bytes_writer_cache.take(writer.handle)
-    buffered_bytes_writer_cache.insert(writer.handle, cached.concat(data))
-    if buffered_bytes_writer_should_flush(writer.handle):
-        buffered_bytes_writer_flush_internal(writer)!
+# move whatever a reader has cached to `buf`, at end of stream.
+fn buffered_bytes_reader_drain_into(state: BufferedBytesReaderState, buf: ByteBuffer) -> Int!:
+    cached := state.cache
+    state.cache = bytes.empty()
+    if not cached.is_empty():
+        buf.write(cached)!
+    return cached.len()
+
+fn buffered_bytes_writer_write_internal(writer: BufferedBytesWriter, data: Bytes) -> Int!:
+    if not buffered_bytes_writers.contains_key(writer.handle):
+        return 0
+    state := buffered_bytes_writers[writer.handle]
+
+    state.cache = state.cache.concat(data)
+    if state.cache.len() >= state.chunk_size:
+        buffered_bytes_writer_flush_state(state)!
     return data.len()
 
 fn buffered_bytes_writer_flush_internal(writer: BufferedBytesWriter) -> Int!:
-    if not buffered_bytes_writer_target_handles.contains_key(writer.handle):
+    if not buffered_bytes_writers.contains_key(writer.handle):
         return 0
+    return buffered_bytes_writer_flush_state(buffered_bytes_writers[writer.handle])
 
-    cached := buffered_bytes_writer_cache.take(writer.handle)
+# send what a writer holds to its target. the held bytes are let go of
+# before the write, so a failed write does not leave them to go out again.
+fn buffered_bytes_writer_flush_state(state: BufferedBytesWriterState) -> Int!:
+    cached := state.cache
     if cached.is_empty():
-        buffered_bytes_writer_cache.insert(writer.handle, cached)
         return 0
+    state.cache = bytes.empty()
+    return buffered_bytes_writer_send(state, cached)!
 
-    target_kind := buffered_bytes_writer_target_kinds[writer.handle]
-    target_handle := buffered_bytes_writer_target_handles[writer.handle]
+# write all of `data` to a writer's target, bypassing its buffer.
+fn buffered_bytes_writer_send(state: BufferedBytesWriterState, data: Bytes) -> Int!:
+    target_kind := state.target_kind
+    target_handle := state.target_handle
     mut wrote := 0
     if target_kind == BUFFERED_BYTES_TARGET_BUFFER:
-        wrote = write_all_byte_buffer(ByteBuffer(target_handle), cached)!
+        wrote = write_all_byte_buffer(ByteBuffer(target_handle), data)!
     elif target_kind == BUFFERED_BYTES_TARGET_TCP:
-        wrote = write_all_tcp_stream_bytes(TcpStream(target_handle), cached)!
+        wrote = write_all_tcp_stream_bytes(TcpStream(target_handle), data)!
     elif target_kind == BUFFERED_BYTES_TARGET_FILE:
-        wrote = write_all_file_stream_bytes(FileStream(target_handle), cached)!
+        wrote = write_all_file_stream_bytes(FileStream(target_handle), data)!
     elif target_kind == BUFFERED_BYTES_TARGET_PROCESS_STDIN:
-        wrote = write_all_process_stdin_bytes(ProcessStdin(target_handle), cached)!
-    buffered_bytes_writer_cache.insert(writer.handle, bytes.empty())
+        wrote = write_all_process_stdin_bytes(ProcessStdin(target_handle), data)!
     return wrote
+
+# write_all_bytes followed by flush. with nothing buffered, the data goes
+# straight to the target instead of being copied into the buffer first.
+fn buffered_bytes_writer_write_all_flush(writer: BufferedBytesWriter, data: Bytes) -> Int!:
+    if buffered_bytes_writers.contains_key(writer.handle) and not data.is_empty():
+        state := buffered_bytes_writers[writer.handle]
+        if state.cache.is_empty():
+            return buffered_bytes_writer_send(state, data)!
+    written := write_all_buffered_bytes_writer(writer, data)!
+    buffered_bytes_writer_flush_internal(writer)!
+    return written
 
 # ---------------------------------------------------------------------------
 # buffered text readers
@@ -2669,32 +2698,10 @@ fn buffered_process_stderr_read_until_including_internal_ctx(reader: BufferedPro
 fn buffered_process_stderr_read_until_with_sep_internal_ctx(reader: BufferedProcessStderr, ctx: Context, sep: String, include_sep: Bool) -> String!BlockingError:
     return buffered_text_read_until_internal_ctx(reader.handle, ctx, sep, include_sep)
 
-fn buffered_bytes_reader_cache_get(handle: Int) -> Bytes:
-    mut result := bytes.empty()
-    if buffered_bytes_reader_cache.contains_key(handle):
-        result = buffered_bytes_reader_cache[handle]
-    return result
-
-fn buffered_bytes_reader_consume(handle: Int, consumed: Int):
-    cached := buffered_bytes_reader_cache.take(handle)
-    buffered_bytes_reader_cache.insert(handle, cached.slice(consumed, cached.len()))
-
 fn buffered_string_writer_cache_get(handle: Int) -> String:
     if buffered_string_writer_cache.contains_key(handle):
         return buffered_string_writer_cache[handle]
     return ""
-
-fn buffered_bytes_writer_cache_get(handle: Int) -> Bytes:
-    if buffered_bytes_writer_cache.contains_key(handle):
-        return buffered_bytes_writer_cache[handle]
-    return bytes.empty()
-
-fn buffered_bytes_writer_should_flush(handle: Int) -> Bool:
-    cached := buffered_bytes_writer_cache_get(handle)
-    mut chunk_size := DEFAULT_CHUNK_SIZE
-    if buffered_bytes_writer_chunk_sizes.contains_key(handle):
-        chunk_size = buffered_bytes_writer_chunk_sizes[handle]
-    return cached.len() >= chunk_size
 
 fn buffered_string_writer_should_flush(handle: Int) -> Bool:
     cached := buffered_string_writer_cache_get(handle)

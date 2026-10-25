@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{LazyLock, Mutex};
 
 /// Pre-check before reading a magic word: dereferencing an unverified handle
@@ -24,11 +22,12 @@ pub(crate) enum HandleKind {
 }
 
 /// the live handle set, split into independently locked shards. every list
-/// allocation registers here and every free unregisters, so a single lock put
-/// all of a program's threads in one queue: an http server on 32 green workers
-/// spent about 90% of its cpu in the kernel waiting on it, and served a quarter
-/// of the requests it served on 4. a handle always hashes to the same shard,
-/// so each operation still takes exactly one lock.
+/// allocation used to register here and every free unregister (only the few
+/// lists that cross a page boundary do now; see `is_list_ptr`), and a single
+/// lock put all of a program's threads in one queue: an http server on 32
+/// green workers spent about 90% of its cpu in the kernel waiting on it, and
+/// served a quarter of the requests it served on 4. a handle always hashes to
+/// the same shard, so each operation still takes exactly one lock.
 ///
 /// 256 shards rather than 64: at 64, a `std.web` server on 32 workers still
 /// had a fifth of its thread samples waiting on a shard.
@@ -38,39 +37,9 @@ const SHARDS: usize = 256;
 #[repr(align(64))]
 struct Shard(Mutex<HandleSet>);
 
-type HandleSet = HashSet<(usize, HandleKind), BuildHasherDefault<KeyHasher>>;
-
-/// a multiplicative hash for handle keys. the keys are addresses and small
-/// ids, so the default siphash spends time on protection the set does not
-/// need, inside the lock.
-#[derive(Default)]
-struct KeyHasher(u64);
-
-impl Hasher for KeyHasher {
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(b as u64);
-        }
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0 = (self.0 ^ n).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.write_u64(n as u64);
-    }
-
-    fn write_isize(&mut self, n: isize) {
-        self.write_u64(n as u64);
-    }
-
-    fn finish(&self) -> u64 {
-        // fold the high bits down: the product of an aligned address has
-        // zero low bits, and the table indexes buckets by the low bits.
-        self.0 ^ (self.0 >> 32)
-    }
-}
+/// the keys are addresses and small ids, hashed with the runtime's integer
+/// hasher: siphash would spend its time inside the lock.
+type HandleSet = crate::int_hash::IntSet<(usize, HandleKind)>;
 
 static HANDLES: LazyLock<[Shard; SHARDS]> =
     LazyLock::new(|| std::array::from_fn(|_| Shard(Mutex::new(HandleSet::default()))));

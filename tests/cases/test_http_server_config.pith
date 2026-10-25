@@ -193,7 +193,7 @@ fn tls_case() -> Int!:
     conn.write_all_bytes(bytes.from_string_utf8("GET / HTTP/1.1\r\nHost: h\r\nX-Slow: "))!
     mut sent := 0
     while time_mod.mono_millis() - started < GIVE_UP_MS:
-        if tcp_wait_readable(conn.socket(), 100) != 0:
+        if tcp_wait_readable(conn.socket(), 30) != 0:
             break
         if conn.write_all_bytes(bytes.from_string_utf8("x")).is_err:
             break

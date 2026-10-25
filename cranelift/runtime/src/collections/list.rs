@@ -26,6 +26,10 @@ pub struct ListImpl {
     /// zero. Collections are shared handles by default in the language, so
     /// unlike strings they need real counting.
     pub rc: std::sync::atomic::AtomicU32,
+    /// `identity_tag(self)` while the list is live, 0 once it is freed. It
+    /// sits right after the magic so is_list_ptr reads only the first 16
+    /// bytes of a pointer that may be a string.
+    identity: u64,
     /// Size of each element in bytes
     pub elem_size: usize,
     /// Type tag for determining how to handle elements
@@ -88,6 +92,7 @@ impl ListImpl {
             elem_size,
             type_tag,
             cycle_flags: std::sync::atomic::AtomicU8::new(0),
+            identity: 0,
         };
         list.sync_value_view();
         list
@@ -351,8 +356,8 @@ pub(crate) unsafe fn release_element(tag: ListTypeTag, raw: i64) {
 /// Fast validity check for the hot accessors: one memory read against the
 /// magic word instead of a global registry lock per access. Freed lists get
 /// their magic scrubbed in pith_list_free, so stale handles fail the compare.
-/// The registry still records every list so is_list_ptr can give an exact
-/// answer where a magic collision would be unacceptable (pith_auto_len).
+/// is_list_ptr adds a second check where a magic collision would be
+/// unacceptable (pith_auto_len).
 #[inline]
 unsafe fn list_magic_ok(ptr: *const ()) -> bool {
     handle_registry::plausibly_aligned::<ListImpl>(ptr)
@@ -470,9 +475,50 @@ pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithLis
     let list_impl = ListImpl::new(elem_size as usize, tag);
     let boxed = Box::new(list_impl);
     let ptr = Box::into_raw(boxed) as *mut ();
-    handle_registry::register(ptr as *const (), HandleKind::List);
+    (*(ptr as *mut ListImpl)).identity = identity_tag(ptr);
+    if crosses_page(ptr) {
+        handle_registry::register(ptr as *const (), HandleKind::List);
+    }
 
     PithList { ptr }
+}
+
+/// A per-process random key, so that no string can be written to pass for a
+/// list: the identity word is the list's own address mixed with it.
+fn identity_key() -> u64 {
+    static KEY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *KEY.get_or_init(|| {
+        use std::hash::BuildHasher;
+        std::collections::hash_map::RandomState::new().hash_one(0x4c49_5354u64) | 1
+    })
+}
+
+/// The identity word a live list at `ptr` carries. Never 0, because the key
+/// is odd and the address is aligned, so a freed list's 0 never matches.
+fn identity_tag(ptr: *const ()) -> u64 {
+    (ptr as u64) ^ identity_key()
+}
+
+/// Whether the magic and identity words at `ptr` would reach into the next
+/// page. A pointer that is really a C string is only known to be readable up
+/// to its NUL, but the page it starts on is mapped, so is_list_ptr reads the
+/// identity word only when it lies on that page. A list that would cross is
+/// recorded in the handle registry instead, which answers for it without
+/// reading anything. The allocator hands out 16-aligned blocks, so in
+/// practice no list does.
+fn crosses_page(ptr: *const ()) -> bool {
+    const PAGE: usize = 4096;
+    const CHECKED: usize = std::mem::offset_of!(ListImpl, identity) + std::mem::size_of::<u64>();
+    (ptr as usize) % PAGE > PAGE - CHECKED
+}
+
+/// Forget a list that is being freed: clear the identity word and drop the
+/// registry entry a page-crossing list has.
+unsafe fn retire_identity(ptr: *mut ()) {
+    (*(ptr as *mut ListImpl)).identity = 0;
+    if crosses_page(ptr) {
+        handle_registry::unregister(ptr as *const (), HandleKind::List);
+    }
 }
 
 /// Get list length
@@ -486,11 +532,22 @@ pub extern "C" fn pith_list_len(list: PithList) -> i64 {
 }
 
 /// Check if a raw pointer really is a ListImpl. The magic word rejects
-/// almost everything cheaply; the registry confirms the rare match, since a
-/// C string could start with the same four bytes and this function is what
-/// keeps pith_auto_len from misreading one as a list.
+/// almost everything cheaply. A C string could start with the same four
+/// bytes, and this function is what keeps pith_auto_len from misreading one
+/// as a list, so a match is confirmed by the identity word: the address mixed
+/// with a random per-process key, which a string cannot be written to hold.
+/// A pointer whose identity word would cross into the next page is answered
+/// by the registry, so that nothing past the page a string starts on is read.
 pub fn is_list_ptr(ptr: *const ()) -> bool {
-    (unsafe { list_magic_ok(ptr) }) && handle_registry::is_valid(ptr, HandleKind::List)
+    if !(unsafe { list_magic_ok(ptr) }) {
+        return false;
+    }
+    if crosses_page(ptr) {
+        return handle_registry::is_valid(ptr, HandleKind::List);
+    }
+    // SAFETY: the magic read showed `ptr` is aligned and readable, and the
+    // identity word lies on the page it starts on.
+    unsafe { (*(ptr as *const ListImpl)).identity == identity_tag(ptr) }
 }
 
 /// Auto-detect len: works on both lists and C strings
@@ -1245,7 +1302,7 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     // Scrub the magic first so any handle that outlives the list fails the
     // fast validity check.
     (*(list.ptr as *mut ListImpl)).magic = 0;
-    handle_registry::unregister(list.ptr as *const (), HandleKind::List);
+    retire_identity(list.ptr);
     crate::perf_count(&crate::PERF_LIST_FREES, 1);
     // a list that dies while the suspect buffer points at it keeps its shell:
     // the elements are already released and the handle no longer validates
@@ -1370,7 +1427,7 @@ pub(crate) unsafe fn cycle_list_free_dead(handle: i64) {
         & 1
         != 0;
     (*(handle as *mut ListImpl)).magic = 0;
-    handle_registry::unregister(handle as *const (), HandleKind::List);
+    retire_identity(handle as *mut ());
     crate::perf_count(&crate::PERF_LIST_FREES, 1);
     if buffered && crate::cycle::cycle_gc_enabled() {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_LIST);
@@ -1425,6 +1482,89 @@ mod tests {
     fn bogus_list() -> PithList {
         PithList {
             ptr: 12345usize as *mut (),
+        }
+    }
+
+    #[test]
+    fn a_live_list_is_a_list_and_a_freed_one_is_not() {
+        unsafe {
+            let list = pith_list_new(8, 0);
+            assert!(is_list_ptr(list.ptr));
+            pith_list_push_value(list, 7);
+            assert_eq!(pith_auto_len(list.ptr as i64), 1);
+            pith_list_release(list);
+            assert!(!is_list_ptr(list.ptr));
+        }
+    }
+
+    #[test]
+    fn a_string_that_starts_with_the_list_magic_is_measured_as_a_string() {
+        let mut text = LIST_MAGIC.to_le_bytes().to_vec();
+        text.resize(300, b'x');
+        unsafe {
+            let s = crate::pith_copy_bytes_to_cstring(&text);
+            assert_eq!(pith_auto_len(s as i64), 300);
+            crate::pith_cstring_release(s);
+        }
+    }
+
+    /// a page-aligned buffer to lay fake list structs out in, so a test can
+    /// choose whether one crosses a page boundary.
+    fn two_pages() -> Vec<u64> {
+        vec![0u64; 3 * 4096 / 8]
+    }
+
+    fn page_start(buf: &mut [u64]) -> *mut u8 {
+        let addr = buf.as_mut_ptr() as usize;
+        ((addr + 4095) & !4095) as *mut u8
+    }
+
+    #[test]
+    fn a_magic_match_without_the_identity_word_is_not_a_list() {
+        let mut buf = two_pages();
+        let base = page_start(&mut buf);
+        unsafe {
+            (base as *mut u32).write(LIST_MAGIC);
+            assert!(!crosses_page(base as *const ()));
+            assert!(!is_list_ptr(base as *const ()));
+            // the address alone is not the identity word either
+            let fake = base as *mut ListImpl;
+            std::ptr::addr_of_mut!((*fake).identity).write(base as u64);
+            assert!(!is_list_ptr(base as *const ()));
+            std::ptr::addr_of_mut!((*fake).identity).write(identity_tag(base as *const ()));
+            assert!(is_list_ptr(base as *const ()));
+        }
+    }
+
+    #[test]
+    fn an_identity_word_across_a_page_is_answered_by_the_registry() {
+        let mut buf = two_pages();
+        let at = unsafe { page_start(&mut buf).add(4096 - 8) };
+        assert!(crosses_page(at as *const ()));
+        unsafe {
+            (at as *mut u32).write(LIST_MAGIC);
+            let fake = at as *mut ListImpl;
+            std::ptr::addr_of_mut!((*fake).identity).write(identity_tag(at as *const ()));
+        }
+        // not registered, so not a list, whatever its words say
+        assert!(!is_list_ptr(at as *const ()));
+        handle_registry::register(at as *const (), HandleKind::List);
+        assert!(is_list_ptr(at as *const ()));
+        handle_registry::unregister(at as *const (), HandleKind::List);
+        assert!(!is_list_ptr(at as *const ()));
+    }
+
+    #[test]
+    fn a_sixteen_aligned_list_never_crosses_a_page() {
+        for offset in (0..4096usize).step_by(16) {
+            assert!(!crosses_page((0x10_0000 + offset) as *const ()));
+        }
+    }
+
+    #[test]
+    fn identity_tags_are_never_zero() {
+        for addr in [8usize, 4096, 0x7fff_ffff_f000] {
+            assert_ne!(identity_tag(addr as *const ()), 0);
         }
     }
 

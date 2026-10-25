@@ -102,6 +102,13 @@ type Table = [AtomicPtr<AtomicU64>; CHUNKS];
 static TABLE: Table = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
 static READ_DEADLINES: Table = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
 static WRITE_DEADLINES: Table = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
+/// the socket's `SO_RCVTIMEO` and `SO_SNDTIMEO` as last read from the kernel,
+/// so that a wait does not ask with a `getsockopt` each time. a word holds the
+/// generation of the handle it was read through in its high half, so a value
+/// is never taken for a later handle on the same number, and in its low half
+/// 0 when nothing is cached, 1 for no timeout, or the milliseconds plus one.
+static READ_TIMEOUTS: Table = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
+static WRITE_TIMEOUTS: Table = [const { AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
 
 /// the slot for `fd`, or `None` when it was never opened (a lookup does not
 /// allocate: a handle on a number that never had a chunk is stale by
@@ -374,6 +381,45 @@ pub(crate) fn set_deadline(guard: &Guard, write: bool, at: Option<Instant>) {
     }
 }
 
+fn timeout_table(write: bool) -> &'static Table {
+    if write {
+        &WRITE_TIMEOUTS
+    } else {
+        &READ_TIMEOUTS
+    }
+}
+
+/// the read or write timeout of the socket `guard` holds as cached, in
+/// milliseconds or -1 for none, or `None` when nothing is cached for it.
+pub(crate) fn cached_timeout(guard: &Guard, write: bool) -> Option<i64> {
+    let (fd, generation) = split(guard.handle)?;
+    let word = slot_in(timeout_table(write), fd)?.load(Ordering::Acquire);
+    if word >> 32 != generation {
+        return None;
+    }
+    match word & 0xffff_ffff {
+        0 => None,
+        1 => Some(-1),
+        code => Some(code as i64 - 1),
+    }
+}
+
+/// cache the read or write timeout of the socket `guard` holds: milliseconds,
+/// -1 for none, or `None` to forget it, so the next wait asks the kernel.
+pub(crate) fn cache_timeout(guard: &Guard, write: bool, ms: Option<i64>) {
+    let Some((fd, generation)) = split(guard.handle) else {
+        return;
+    };
+    let code = match ms {
+        None => 0,
+        Some(ms) if ms <= 0 => 1,
+        Some(ms) => (ms as u64).min(u32::MAX as u64 - 1) + 1,
+    };
+    if let Some(slot) = slot_or_allocate_in(timeout_table(write), fd) {
+        slot.store((generation << 32) | code, Ordering::Release);
+    }
+}
+
 /// the read or write deadline set on `fd`, if there is one: one load when no
 /// deadline was ever set near this number.
 pub(crate) fn deadline(fd: RawFd, write: bool) -> Option<Instant> {
@@ -473,6 +519,34 @@ mod tests {
         assert!(is_live(handle));
         assert!(close(handle));
         assert!(!fd_is_open(fd));
+    }
+
+    #[test]
+    fn a_cached_timeout_belongs_to_the_handle_it_was_read_through() {
+        let fd = socket_on(1207);
+        let first = open(fd, FdKind::Socket);
+        {
+            let guard = acquire(first, FdKind::Socket).expect("live handle");
+            assert_eq!(cached_timeout(&guard, false), None);
+            cache_timeout(&guard, false, Some(250));
+            assert_eq!(cached_timeout(&guard, false), Some(250));
+            assert_eq!(cached_timeout(&guard, true), None);
+            cache_timeout(&guard, true, Some(-1));
+            assert_eq!(cached_timeout(&guard, true), Some(-1));
+            cache_timeout(&guard, false, None);
+            assert_eq!(cached_timeout(&guard, false), None);
+            cache_timeout(&guard, false, Some(5000));
+        }
+        assert!(close(first));
+        // the next handle on the number does not see the old socket's values.
+        let fd = socket_on(1207);
+        let second = open(fd, FdKind::Socket);
+        {
+            let guard = acquire(second, FdKind::Socket).expect("live handle");
+            assert_eq!(cached_timeout(&guard, false), None);
+            assert_eq!(cached_timeout(&guard, true), None);
+        }
+        assert!(close(second));
     }
 
     #[test]

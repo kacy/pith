@@ -1,0 +1,302 @@
+import std.web as web
+import std.net.http as http
+import std.encoding as encoding
+import std.fs as fs
+import std.io as io
+import std.bytes as bytes
+
+# handler-level conformance for std.web and the std.net.http file helpers,
+# with net/http as the reference: automatic HEAD, 405 with Allow, path
+# cleaning, percent-decoded routing, file serving with validators,
+# conditional and range requests (rfc 9110 13 and 14), the body cap, forms
+# and basic auth.
+#
+# each case sends raw request bytes down one in-memory connection served by
+# web.App.serve, followed by a valid `GET /after`, and prints every byte the
+# server wrote with CRLF shown as `|`. a Date value is printed as its shape.
+# the validators of a file on disk change from run to run, so they are
+# printed as <file-etag> and <file-mtime>, and a multipart boundary as
+# BOUNDARY. every case runs twice, with reads of 4096 bytes and of 3.
+
+AFTER := "GET /after HTTP/1.1\r\nHost: h\r\n\r\n"
+
+# the content /content serves, with a fixed modification time so its
+# validators are the same on every run.
+CONTENT_MTIME := 784111777
+CONTENT_ETAG := "\"2ebc98a1-a\""
+
+fn text_of(body: String) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => http.text(200, body)
+
+fn echo_param(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "[" + req.param("name") + "]")
+
+fn explicit_head(req: web.Request) -> http.HttpResponse:
+    return http.response(200).header("X-Head", "explicit").header("Content-Length", "7")
+
+fn content(req: web.Request) -> http.HttpResponse:
+    return http.serve_content(req.raw, "digits.txt", CONTENT_MTIME, bytes.from_string_utf8("0123456789"))
+
+fn deny(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    return http.text(401, "guarded")
+
+fn form_echo(req: web.Request) -> http.HttpResponse:
+    values := req.raw.form()
+    mut count := 0
+    if values.contains_key("name"):
+        count = values["name"].len()
+    return http.text(200, req.form_value("name") + " of " + count.to_string())
+
+fn private(req: web.Request) -> http.HttpResponse:
+    creds := req.raw.basic_auth() catch:
+        return http.basic_auth_challenge("ops")
+    if creds.user != "ada" or creds.password != "lovelace":
+        return http.basic_auth_challenge("ops")
+    return http.text(200, "hi " + creds.user)
+
+fn build_app(root: String) -> web.App:
+    mut app := web.bare()
+    app = app.get("/after", text_of("after"))
+    app = app.get("/items", text_of("items"))
+    app = app.get("/users/:id", text_of("user"))
+    app = app.post("/users/:id", text_of("posted"))
+    app = app.head("/explicit", explicit_head)
+    app = app.get("/explicit", text_of("from get"))
+    app = app.get("/files/:name", echo_param)
+    app = app.get("/café", text_of("café"))
+    app = app.get("/content", content)
+    app = app.post("/content", content)
+    app = app.group("/admin", deny)
+    app = app.get("/admin/panel", text_of("panel"))
+    app = app.group("/small", web.max_body(4))
+    app = app.post("/small", text_of("accepted"))
+    app = app.post("/form", form_echo)
+    app = app.get("/form", form_echo)
+    app = app.get("/private", private)
+    app = app.static("/static", root)
+    return app
+
+fn to_hex(value: Int) -> String:
+    digits := "0123456789abcdef"
+    if value == 0:
+        return "0"
+    mut n := value
+    mut out := ""
+    while n > 0:
+        out = digits[n % 16] + out
+        n = n / 16
+    return out
+
+fn is_digit_at(s: String, i: Int) -> Bool:
+    b := ord(s[i])
+    return b >= 48 and b <= 57
+
+# the IMF-fixdate shape (rfc 9110 5.6.7): "Sun, 06 Nov 1994 08:49:37 GMT".
+fn is_imf_fixdate(value: String) -> Bool:
+    if value.len() != 29 or value.substring(25, 29) != " GMT":
+        return false
+    for i in [5, 6, 12, 13, 14, 15, 17, 18, 20, 21, 23, 24]:
+        if not is_digit_at(value, i):
+            return false
+    return true
+
+# the wire text with CRLF shown as `|`, a Date value replaced by its shape,
+# the validators of a file on disk by placeholders, and a multipart boundary
+# by BOUNDARY.
+fn render(wire: String) -> String:
+    mut text := wire
+    marker := "boundary="
+    at := text.index_of(marker)
+    if at >= 0:
+        rest := text.substring(at + marker.len(), text.len())
+        boundary := rest.substring(0, rest.index_of("\r\n"))
+        text = text.replace(boundary, "BOUNDARY")
+    mut lines: List[String] := []
+    for line in text.split("\r\n"):
+        if line.starts_with("Date: ") and is_imf_fixdate(line.substring(6, line.len())):
+            lines.push("Date: <imf-fixdate>")
+        elif line.starts_with("ETag: ") and line != "ETag: " + CONTENT_ETAG:
+            lines.push("ETag: <file-etag>")
+        elif line.starts_with("Last-Modified: ") and line != "Last-Modified: " + http.http_date(CONTENT_MTIME):
+            lines.push("Last-Modified: <file-mtime>")
+        else:
+            lines.push(line)
+    return lines.join("|")
+
+fn run_once(app: web.App, raw: Bytes, chunk: Int) -> String:
+    reader := io.bytes_reader(raw.concat(bytes.from_string_utf8(AFTER))).buffered_chunked(chunk)
+    sink := bytes.buffer()
+    writer := sink.buffered()
+    http.serve_connection(reader, writer, fn(req: http.HttpRequestBytes) => app.serve(req)) catch 0
+    writer.flush() catch 0
+    out := bytes.decode_utf8(sink.bytes())
+    reader.free()
+    writer.free()
+    sink.free()
+    if out.is_err:
+        return "non-utf8 response"
+    return render(out.ok)
+
+struct Harness:
+    app: web.App
+    file_etag: String
+
+fn check(h: Harness, name: String, text: String):
+    raw := bytes.from_string_utf8(text.replace("@ETAG@", h.file_etag))
+    whole := run_once(h.app, raw, 4096)
+    split := run_once(h.app, raw, 3)
+    if whole != split:
+        print(name + ": " + whole + " (split reads: " + split + ")")
+    else:
+        print(name + ": " + whole)
+
+fn get(h: Harness, name: String, target: String):
+    check(h, name, "GET " + target + " HTTP/1.1\r\nHost: h\r\n\r\n")
+
+fn get_with(h: Harness, name: String, target: String, field: String):
+    check(h, name, "GET " + target + " HTTP/1.1\r\nHost: h\r\n" + field + "\r\n\r\n")
+
+# a scratch tree: <dir>/secret.txt outside the served root, and the root
+# <dir>/public with a text file, an index, an empty directory, a file with no
+# extension that holds html and one with an unknown extension that is binary.
+fn make_tree() -> String!:
+    dir := fs.make_temp_dir("pith-web-conformance-")!
+    root := dir + "/public"
+    fs.make_dir(root)
+    fs.make_dir(root + "/empty")
+    fs.write(dir + "/secret.txt", "top secret")!
+    fs.write(root + "/hello.txt", "hello, file")!
+    fs.write(root + "/index.html", "<h1>index</h1>")!
+    fs.write(root + "/page", "<html><body>sniffed</body></html>")!
+    blob := bytes.buffer()
+    blob.write_byte(1)
+    blob.write_byte(2)
+    blob.write_byte(3)
+    fs.write_bytes(root + "/blob.dat", blob.take_bytes())!
+    return dir
+
+fn main() -> Int!:
+    dir := make_tree()!
+    root := dir + "/public"
+    file := root + "/hello.txt"
+    etag := "\"" + to_hex(fs.modified(file)!) + "-" + to_hex(fs.size(file)!) + "\""
+    h := Harness(build_app(root), etag)
+
+    print("-- automatic head --")
+    get(h, "get", "/items")
+    check(h, "head runs the get route", "HEAD /items HTTP/1.1\r\nHost: h\r\n\r\n")
+    check(h, "an explicit head route wins", "HEAD /explicit HTTP/1.1\r\nHost: h\r\n\r\n")
+    get(h, "get beside an explicit head", "/explicit")
+    check(h, "head on an unknown path", "HEAD /nowhere HTTP/1.1\r\nHost: h\r\n\r\n")
+
+    print("-- 405 and allow --")
+    check(h, "post to a get route", "POST /items HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n")
+    check(h, "delete to a get and post route", "DELETE /users/7 HTTP/1.1\r\nHost: h\r\n\r\n")
+    check(h, "options lists head", "OPTIONS /users/7 HTTP/1.1\r\nHost: h\r\n\r\n")
+    check(h, "options asterisk lists head", "OPTIONS * HTTP/1.1\r\nHost: h\r\n\r\n")
+    get(h, "unknown path", "/nowhere")
+
+    print("-- path cleaning --")
+    get(h, "repeated slashes keep the query", "/users//7?x=1&y=2")
+    get(h, "dot segment", "/./items")
+    get(h, "dot-dot segment", "/users/7/../../items")
+    get(h, "dot-dot cannot climb above the root", "/../../etc/passwd")
+    get(h, "encoded dot-dot", "/%2e%2E/items")
+    get(h, "encoded dot", "/users/%2e/7")
+    get(h, "a leading double slash is not another host", "//evil.example/")
+    get(h, "trailing dot keeps no slash", "/items/.")
+    get(h, "a trailing slash is not redirected", "/items/")
+    get(h, "a dotted name is not a dot segment", "/files/..x")
+
+    print("-- percent-decoding --")
+    get(h, "an encoded slash stays in its segment", "/files/a%2Fb")
+    get(h, "a plus stays a plus", "/files/a+b")
+    get(h, "an escape in a param", "/files/a%20b")
+    get(h, "an encoded literal segment", "/caf%C3%A9")
+    get(h, "an encoded group prefix is still guarded", "/%61dmin/panel")
+    get(h, "the group prefix itself", "/admin/panel")
+
+    print("-- serve_content --")
+    get(h, "full", "/content")
+    check(h, "head", "HEAD /content HTTP/1.1\r\nHost: h\r\n\r\n")
+    get_with(h, "if-none-match matches", "/content", "If-None-Match: \"2ebc98a1-a\"")
+    get_with(h, "if-none-match weak matches", "/content", "If-None-Match: W/\"2ebc98a1-a\"")
+    get_with(h, "if-none-match in a list", "/content", "If-None-Match: \"x\", \"2ebc98a1-a\"")
+    get_with(h, "if-none-match star", "/content", "If-None-Match: *")
+    get_with(h, "if-none-match other", "/content", "If-None-Match: \"other\"")
+    get_with(h, "if-modified-since same", "/content", "If-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT")
+    get_with(h, "if-modified-since later", "/content", "If-Modified-Since: Mon, 07 Nov 1994 08:49:37 GMT")
+    get_with(h, "if-modified-since earlier", "/content", "If-Modified-Since: Sat, 05 Nov 1994 08:49:37 GMT")
+    get_with(h, "if-modified-since rfc 850", "/content", "If-Modified-Since: Sunday, 06-Nov-94 08:49:37 GMT")
+    get_with(h, "if-modified-since asctime", "/content", "If-Modified-Since: Sun Nov  6 08:49:37 1994")
+    get_with(h, "if-modified-since invalid", "/content", "If-Modified-Since: yesterday")
+    get_with(h, "if-none-match wins over if-modified-since", "/content", "If-None-Match: \"other\"\r\nIf-Modified-Since: Sun, 06 Nov 1994 08:49:37 GMT")
+    get_with(h, "if-match other", "/content", "If-Match: \"other\"")
+    get_with(h, "if-match weak never matches", "/content", "If-Match: W/\"2ebc98a1-a\"")
+    get_with(h, "if-match matches", "/content", "If-Match: \"2ebc98a1-a\"")
+    get_with(h, "if-match star", "/content", "If-Match: *")
+    get_with(h, "if-unmodified-since earlier", "/content", "If-Unmodified-Since: Sat, 05 Nov 1994 08:49:37 GMT")
+    get_with(h, "if-unmodified-since same", "/content", "If-Unmodified-Since: Sun, 06 Nov 1994 08:49:37 GMT")
+    get_with(h, "if-match wins over if-unmodified-since", "/content", "If-Match: \"2ebc98a1-a\"\r\nIf-Unmodified-Since: Sat, 05 Nov 1994 08:49:37 GMT")
+    check(h, "if-none-match on a post", "POST /content HTTP/1.1\r\nHost: h\r\nIf-None-Match: \"2ebc98a1-a\"\r\nContent-Length: 0\r\n\r\n")
+
+    print("-- ranges --")
+    get_with(h, "first bytes", "/content", "Range: bytes=0-3")
+    get_with(h, "suffix", "/content", "Range: bytes=-2")
+    get_with(h, "open end", "/content", "Range: bytes=7-")
+    get_with(h, "end past the size", "/content", "Range: bytes=8-100")
+    get_with(h, "unsatisfiable", "/content", "Range: bytes=20-")
+    get_with(h, "unsatisfiable suffix", "/content", "Range: bytes=-0")
+    get_with(h, "several ranges", "/content", "Range: bytes=0-1, 5-6")
+    get_with(h, "one satisfiable of two", "/content", "Range: bytes=2-3, 50-60")
+    get_with(h, "ranges past the size in total", "/content", "Range: bytes=0-9, 0-9")
+    get_with(h, "malformed range", "/content", "Range: bytes=5-1")
+    get_with(h, "another unit", "/content", "Range: items=0-1")
+    get_with(h, "if-range etag matches", "/content", "Range: bytes=0-1\r\nIf-Range: \"2ebc98a1-a\"")
+    get_with(h, "if-range etag stale", "/content", "Range: bytes=0-1\r\nIf-Range: \"other\"")
+    get_with(h, "if-range weak etag", "/content", "Range: bytes=0-1\r\nIf-Range: W/\"2ebc98a1-a\"")
+    get_with(h, "if-range date matches", "/content", "Range: bytes=0-1\r\nIf-Range: Sun, 06 Nov 1994 08:49:37 GMT")
+    get_with(h, "if-range date stale", "/content", "Range: bytes=0-1\r\nIf-Range: Sat, 05 Nov 1994 08:49:37 GMT")
+    check(h, "a range on head is ignored", "HEAD /content HTTP/1.1\r\nHost: h\r\nRange: bytes=0-1\r\n\r\n")
+    get_with(h, "if-none-match wins over a range", "/content", "Range: bytes=0-1\r\nIf-None-Match: \"2ebc98a1-a\"")
+
+    print("-- static files --")
+    get(h, "a file", "/static/hello.txt")
+    check(h, "head on a file", "HEAD /static/hello.txt HTTP/1.1\r\nHost: h\r\n\r\n")
+    get_with(h, "a file revalidated", "/static/hello.txt", "If-None-Match: @ETAG@")
+    get_with(h, "a range of a file", "/static/hello.txt", "Range: bytes=7-10")
+    get(h, "a directory serves its index", "/static/")
+    get(h, "the root without a slash", "/static")
+    get(h, "a directory with no index", "/static/empty")
+    get(h, "a missing file", "/static/missing.txt")
+    get(h, "no extension is sniffed", "/static/page")
+    get(h, "an unknown extension is sniffed", "/static/blob.dat")
+    check(h, "a post is not a static route", "POST /static/hello.txt HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n")
+
+    print("-- traversal --")
+    get(h, "dot-dot is cleaned first", "/static/../secret.txt")
+    get(h, "encoded dot-dot is cleaned first", "/static/%2e%2e/secret.txt")
+    get(h, "dot-dot behind an encoded slash", "/static/..%2Fsecret.txt")
+    get(h, "encoded dot-dot behind an encoded slash", "/static/%2e%2e%2fsecret.txt")
+    get(h, "climbing inside one segment", "/static/a%2F..%2F..%2Fsecret.txt")
+    get(h, "an encoded nul", "/static/hello.txt%00.png")
+    get(h, "double encoding is a name", "/static/%252e%252e/secret.txt")
+    get(h, "a backslash is a name", "/static/..%5Csecret.txt")
+
+    print("-- body cap --")
+    check(h, "under the cap", "POST /small HTTP/1.1\r\nHost: h\r\nContent-Length: 3\r\n\r\nabc")
+    check(h, "over the cap", "POST /small HTTP/1.1\r\nHost: h\r\nContent-Length: 10\r\n\r\n0123456789")
+
+    print("-- forms --")
+    check(h, "urlencoded body before the query", "POST /form?name=query HTTP/1.1\r\nHost: h\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 19\r\n\r\nname=a+b%21&name=cd")
+    get(h, "query only", "/form?name=q%20v")
+    check(h, "a json body is not a form", "POST /form?name=q HTTP/1.1\r\nHost: h\r\nContent-Type: application/json\r\nContent-Length: 8\r\n\r\nname=abc")
+
+    print("-- basic auth --")
+    get(h, "no credentials", "/private")
+    get_with(h, "right credentials", "/private", "Authorization: Basic " + encoding.b64_encode_string("ada:lovelace"))
+    get_with(h, "wrong password", "/private", "Authorization: Basic " + encoding.b64_encode_string("ada:babbage"))
+    get_with(h, "another scheme", "/private", "Authorization: Bearer abc")
+
+    fs.remove_all(dir)
+    return 0

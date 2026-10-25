@@ -35,6 +35,7 @@ pub MIME_TEXT := "text/plain"
 pub MIME_HTML := "text/html"
 pub MIME_JSON := "application/json"
 pub MIME_MULTIPART_FORM := "multipart/form-data"
+pub MIME_FORM := "application/x-www-form-urlencoded"
 pub MIME_CSS := "text/css"
 pub MIME_JS := "application/javascript"
 pub MIME_SVG := "image/svg+xml"
@@ -513,7 +514,9 @@ fn form_encode_fields(fields: Map[String, String]) -> String:
 
 # Splits a request path into its non-empty segments, so "/a//b/" and "/a/b"
 # both yield ["a", "b"]. Route matching and group-scope checks share this, so
-# they agree on which routes a path reaches.
+# they agree on which routes a path reaches. the segments stay percent-encoded:
+# splitting happens on the raw "/" only, so an encoded slash ("%2F") stays
+# inside its segment, and segment_matches decodes a segment when it compares.
 pub fn path_segments(path: String) -> List[String]:
     mut parts: List[String] := []
     for part in normalize_path(path).split("/"):
@@ -521,36 +524,148 @@ pub fn path_segments(path: String) -> List[String]:
             parts.push(part)
     return parts
 
-fn route_match_path(path: String, pattern: String) -> Bool:
-    path_parts := path_segments(path)
-    pattern_parts := path_segments(pattern)
-    if path_parts.len() != pattern_parts.len():
+# true when the raw path segment `segment` names `literal` once
+# percent-decoded, so "caf%C3%A9" matches "café" and "%61pi" matches "api". a
+# segment with no escape is compared as it is, without decoding.
+pub fn segment_matches(segment: String, literal: String) -> Bool:
+    if segment.index_of("%") < 0:
+        return segment == literal
+    return url_mod.decode_path(segment) == literal
+
+# how many bytes of `path` from `at` spell one dot: 1 for ".", 3 for an
+# encoded "%2e" or "%2E", 0 for anything else.
+fn dot_width(path: String, at: Int, end: Int) -> Int:
+    if at >= end:
+        return 0
+    if path[at] == ".":
+        return 1
+    if at + 3 <= end and path[at] == "%" and path[at + 1] == "2" and (path[at + 2] == "e" or path[at + 2] == "E"):
+        return 3
+    return 0
+
+# how many dots the segment path[start:end] is made of, when it is a dot
+# segment ("." or "..", either dot possibly percent-encoded), or 0 when it is
+# not one. an encoded dot counts because a handler that decodes the segment
+# sees "..", and the router must not let that through as a name.
+fn dot_segment_dots(path: String, start: Int, end: Int) -> Int:
+    first := dot_width(path, start, end)
+    if first == 0:
+        return 0
+    if start + first == end:
+        return 1
+    second := dot_width(path, start + first, end)
+    if second > 0 and start + first + second == end:
+        return 2
+    return 0
+
+# true when clean_path would return `path` unchanged: it starts with "/", has
+# no empty segment but a trailing slash, and no "." or ".." segment, encoded
+# or not. it reads the path in place, so a clean path costs no allocation.
+pub fn path_is_clean(path: String) -> Bool:
+    n := path.len()
+    if n == 0 or path[0] != "/":
+        return false
+    mut start := 1
+    mut i := 1
+    while i <= n:
+        if i == n or path[i] == "/":
+            if i == start and i < n:
+                return false
+            if dot_segment_dots(path, start, i) > 0:
+                return false
+            start = i + 1
+        i = i + 1
+    return true
+
+# the canonical form of a request path, as net/http's ServeMux computes it: a
+# leading "/", repeated slashes collapsed, "." segments dropped and ".."
+# segments resolved against the segment before them. a ".." at the root stays
+# at the root, so the result never climbs above "/". a trailing slash is kept.
+# dot segments are recognized percent-encoded too ("%2e%2e"); every other
+# segment is kept as it arrived, escapes and all.
+pub fn clean_path(path: String) -> String:
+    if path_is_clean(path):
+        return path
+    # `kept` is a stack whose live part is its first `depth` entries, so a
+    # ".." pops by lowering depth and the next name overwrites the slot.
+    mut kept: List[String] := []
+    mut depth := 0
+    for part in path.split("/"):
+        if part == "":
+            continue
+        dots := dot_segment_dots(part, 0, part.len())
+        if dots == 1:
+            continue
+        if dots == 2:
+            if depth > 0:
+                depth = depth - 1
+            continue
+        if depth < kept.len():
+            kept[depth] = part
+        else:
+            kept.push(part)
+        depth = depth + 1
+    if depth == 0:
+        return "/"
+    mut out := ""
+    mut i := 0
+    while i < depth:
+        out = out + "/" + kept[i]
+        i = i + 1
+    if path.ends_with("/"):
+        out = out + "/"
+    return out
+
+# true when the segments of a request path match a route pattern's segments.
+# a ":name" pattern segment matches any one segment. a final "*name" segment
+# matches whatever is left, including nothing. every other pattern segment
+# must equal the path segment once that is percent-decoded.
+pub fn segments_match(path_parts: List[String], pattern_parts: List[String]) -> Bool:
+    mut fixed := pattern_parts.len()
+    if fixed > 0 and pattern_parts[fixed - 1].starts_with("*"):
+        fixed = fixed - 1
+        if path_parts.len() < fixed:
+            return false
+    elif path_parts.len() != fixed:
         return false
     mut i := 0
-    while i < path_parts.len():
+    while i < fixed:
         pat := pattern_parts[i]
-        if not pat.starts_with(":") and pat != path_parts[i]:
+        if not pat.starts_with(":") and not segment_matches(path_parts[i], pat):
             return false
         i = i + 1
     return true
 
+# the value of the parameter `name` in a path that segments_match accepted,
+# percent-decoded, or "" when the pattern has no such parameter. a "*name"
+# parameter is the rest of the path, each segment decoded and joined by "/",
+# so an encoded slash inside one segment reads as a "/" in the value.
+pub fn segment_param(path_parts: List[String], pattern_parts: List[String], name: String) -> String:
+    mut i := 0
+    while i < pattern_parts.len():
+        pat := pattern_parts[i]
+        if pat.len() == name.len() + 1 and pat.substring(1, pat.len()) == name:
+            if pat.starts_with(":") and i < path_parts.len():
+                return url_mod.decode_path(path_parts[i])
+            if pat.starts_with("*"):
+                mut rest: List[String] := []
+                mut j := i
+                while j < path_parts.len():
+                    rest.push(url_mod.decode_path(path_parts[j]))
+                    j = j + 1
+                return rest.join("/")
+        i = i + 1
+    return ""
+
+fn route_match_path(path: String, pattern: String) -> Bool:
+    return segments_match(path_segments(path), path_segments(pattern))
+
 fn route_param_from_path(path: String, pattern: String, name: String) -> String:
     path_parts := path_segments(path)
     pattern_parts := path_segments(pattern)
-    if path_parts.len() != pattern_parts.len():
+    if not segments_match(path_parts, pattern_parts):
         return ""
-    mut i := 0
-    while i < path_parts.len():
-        pat := pattern_parts[i]
-        if pat.starts_with(":"):
-            if pat.substring(1, pat.len()) == name:
-                # the value is one path segment; percent-decode it so a caller
-                # sees "a b", not the raw "a%20b" that arrived on the wire.
-                return url_mod.decode(path_parts[i])
-        elif pat != path_parts[i]:
-            return ""
-        i = i + 1
-    return ""
+    return segment_param(path_parts, pattern_parts, name)
 
 # splits a query string into decoded (key, value) pairs, first occurrence
 # winning, so every reader of a request's query agrees on one answer. keys and
@@ -575,6 +690,78 @@ fn query_params_map_from_string(qs: String) -> Map[String, String]:
         if not result.contains_key(key):
             result.insert(key, url_mod.decode(pair.substring(eq + 1, pair.len())))
     return result
+
+# the values of an application/x-www-form-urlencoded text, a form body or a
+# query string, as net/http's url.ParseQuery reads them: keys and values are
+# percent-decoded, "+" is a space, and a repeated key keeps every value in the
+# order it came. a pair with no "=" is a key with an empty value. splitting
+# happens on the raw "&" and "=" before decoding, so an encoded "%26" stays
+# inside its value.
+pub fn parse_form(text: String) -> Map[String, List[String]]:
+    mut values: Map[String, List[String]] := {}
+    if text.len() == 0:
+        return values
+    for pair in text.split("&"):
+        if pair.len() == 0:
+            continue
+        eq := pair.index_of("=")
+        mut key := ""
+        mut value := ""
+        if eq < 0:
+            key = url_mod.decode(pair)
+        else:
+            key = url_mod.decode(pair.substring(0, eq))
+            value = url_mod.decode(pair.substring(eq + 1, pair.len()))
+        add_form_value(values, key, value)
+    return values
+
+fn add_form_value(values: Map[String, List[String]], key: String, value: String):
+    if values.contains_key(key):
+        values[key].push(value)
+    else:
+        values.insert(key, [value])
+
+# the media type of a Content-Type value, lowercased, without its parameters.
+fn media_type(content_type: String) -> String:
+    semi := content_type.index_of(";")
+    if semi >= 0:
+        return content_type.substring(0, semi).trim().to_lower()
+    return content_type.trim().to_lower()
+
+# the form values a request's body carries, as net/http's PostForm holds
+# them: only for POST, PUT and PATCH, from an application/x-www-form-urlencoded
+# body or from the fields of a multipart/form-data one. a multipart part that
+# carries a file is not a value; read it with multipart_part.
+fn body_form_values(req: HttpRequestBytes) -> Map[String, List[String]]:
+    mut values: Map[String, List[String]] := {}
+    method := req.method_text
+    if method != "POST" and method != "PUT" and method != "PATCH":
+        return values
+    kind := media_type(req.header_or("Content-Type", ""))
+    if kind == MIME_FORM:
+        return parse_form(req.body_text() catch "")
+    if kind == MIME_MULTIPART_FORM:
+        parsed := req.multipart_parts()
+        if parsed.is_err:
+            return values
+        for part in parsed.ok:
+            if not part.is_file():
+                add_form_value(values, part.name, part.text_or(""))
+    return values
+
+# a user and password from an `Authorization: Basic` header (rfc 7617).
+pub struct BasicAuth:
+    pub user: String
+    pub password: String
+
+# `value` as an http quoted-string, with any quote or backslash escaped.
+fn quoted_string(value: String) -> String:
+    return chr(34) + value.replace(chr(92), chr(92) + chr(92)).replace(chr(34), chr(92) + chr(34)) + chr(34)
+
+# a 401 that asks for basic credentials for `realm` (rfc 7617), the answer a
+# handler gives when basic_auth fails or the credentials are wrong.
+pub fn basic_auth_challenge(realm: String) -> HttpResponse:
+    return unauthorized_response().header("WWW-Authenticate", "Basic realm=" + quoted_string(realm) + ", charset=" + chr(34) + "UTF-8" + chr(34))
 
 fn parse_json_or_fail(text: String) -> Int!:
     handle := json_mod.parse(text)
@@ -1366,6 +1553,44 @@ impl HttpRequestBytes:
     # the token from an `Authorization: Bearer <token>` header. fails when the
     # header is missing or names another scheme, which is the shape an auth
     # guard wants: `token := req.bearer_token() catch: return unauthorized`.
+    # every form value of the request, as net/http's Form holds them: the
+    # body's values (see post_form) first, then the query string's.
+    fn form() -> Map[String, List[String]]:
+        values := body_form_values(self)
+        query_values := parse_form(self.query_text)
+        for key in query_values:
+            for value in query_values[key]:
+                add_form_value(values, key, value)
+        return values
+    # the form values of the request body only: an urlencoded or multipart
+    # body of a POST, PUT or PATCH. empty for anything else.
+    fn post_form() -> Map[String, List[String]]:
+        return body_form_values(self)
+    # the first value of the form field `name`, from the body and then the
+    # query string, or "" when neither has one.
+    fn form_value(name: String) -> String:
+        values := self.form()
+        if values.contains_key(name):
+            return values[name][0]
+        return ""
+    # the first value of the body form field `name`, or "".
+    fn post_form_value(name: String) -> String:
+        values := body_form_values(self)
+        if values.contains_key(name):
+            return values[name][0]
+        return ""
+    # the user and password from an `Authorization: Basic` header. fails when
+    # the header is missing, names another scheme, or is not base64 of
+    # "user:password". the scheme name is matched without case.
+    fn basic_auth() -> BasicAuth!:
+        header := self.header_or("Authorization", "")
+        if header.len() < 6 or not header_key_matches(header.substring(0, 6), "Basic "):
+            fail "no basic credentials in the Authorization header"
+        decoded := encoding.b64_decode(header.substring(6, header.len()).trim())!.to_string_utf8()!
+        colon := decoded.index_of(":")
+        if colon < 0:
+            fail "basic credentials have no colon"
+        return BasicAuth(decoded.substring(0, colon), decoded.substring(colon + 1, decoded.len()))
     fn bearer_token() -> String!:
         header := self.header_or("Authorization", "")
         if not header.starts_with("Bearer "):
@@ -2992,6 +3217,475 @@ pub fn send_static_path(writer: BufferedBytesWriter, response: HttpResponse, fil
 pub fn send_download_path(writer: BufferedBytesWriter, response: HttpResponse, file_path: String, download_name: String) -> Int!:
     return send_file_path(writer, download_file_response(response, file_path, download_name), file_path)
 
+# ===============================================================
+# Content sniffing
+# ===============================================================
+
+# how much of a body detect_content_type looks at, as net/http's does.
+SNIFF_LEN := 512
+
+# the html tags that mark a body as html when it starts with one, after any
+# leading whitespace, followed by a space or ">". compared ignoring ascii case.
+HTML_SNIFF_TAGS := ["<!DOCTYPE HTML", "<HTML", "<HEAD", "<SCRIPT", "<IFRAME", "<H1", "<DIV", "<FONT", "<TABLE", "<A", "<STYLE", "<TITLE", "<B", "<BODY", "<BR", "<P", "<!--"]
+
+# true when `data` holds the ascii text `text` at `at`, comparing ascii
+# letters without case when `fold` is set.
+fn bytes_have_text(data: Bytes, at: Int, text: String, fold: Bool) -> Bool:
+    if at + text.len() > data.len():
+        return false
+    mut i := 0
+    while i < text.len():
+        mut want := ord(text[i])
+        mut got := data[at + i]
+        if fold:
+            want = ascii_lower(want)
+            got = ascii_lower(got)
+        if want != got:
+            return false
+        i = i + 1
+    return true
+
+# true when `data` starts with the byte values in `signature`.
+fn bytes_have_prefix(data: Bytes, signature: List[Int]) -> Bool:
+    if signature.len() > data.len():
+        return false
+    mut i := 0
+    while i < signature.len():
+        if data[i] != signature[i]:
+            return false
+        i = i + 1
+    return true
+
+fn is_sniff_space(b: Int) -> Bool:
+    return b == 9 or b == 10 or b == 12 or b == 13 or b == 32
+
+# net/http's definition of a byte that cannot appear in text.
+fn is_binary_byte(b: Int) -> Bool:
+    return b <= 8 or b == 11 or (b >= 14 and b <= 26) or (b >= 28 and b <= 31)
+
+# true when the text from `at` opens like a json document: an object that
+# starts with a key or ends at once, or an array whose first element starts
+# like a json value. it is deliberately narrow, so prose that happens to
+# begin with "[" stays text/plain.
+fn looks_like_json(data: Bytes, at: Int, end: Int) -> Bool:
+    first := data[at]
+    if first != 123 and first != 91:
+        return false
+    mut i := at + 1
+    while i < end and is_sniff_space(data[i]):
+        i = i + 1
+    if i >= end:
+        return false
+    next := data[i]
+    if first == 123:
+        return next == 34 or next == 125
+    if bytes_have_text(data, i, "true", false) or bytes_have_text(data, i, "false", false) or bytes_have_text(data, i, "null", false):
+        return true
+    return next == 123 or next == 91 or next == 93 or next == 34 or next == 45 or (next >= 48 and next <= 57)
+
+# the media type of `data` from its first bytes, in the spirit of net/http's
+# DetectContentType: html, xml, json, pdf, png, jpeg, gif, webp, zip, gzip and
+# wasm by their signatures, then "text/plain; charset=utf-8" when none of the
+# first 512 bytes is binary, and "application/octet-stream" otherwise.
+pub fn detect_content_type(data: Bytes) -> String:
+    end := min(data.len(), SNIFF_LEN)
+    if bytes_have_prefix(data, [254, 255]):
+        return "text/plain; charset=utf-16be"
+    if bytes_have_prefix(data, [255, 254]):
+        return "text/plain; charset=utf-16le"
+    if bytes_have_prefix(data, [239, 187, 191]):
+        return "text/plain; charset=utf-8"
+    mut at := 0
+    while at < end and is_sniff_space(data[at]):
+        at = at + 1
+    for tag in HTML_SNIFF_TAGS:
+        if bytes_have_text(data, at, tag, true) and at + tag.len() < end:
+            after := data[at + tag.len()]
+            if after == 32 or after == 62:
+                return "text/html; charset=utf-8"
+    if bytes_have_text(data, at, "<?xml", false):
+        return "text/xml; charset=utf-8"
+    if bytes_have_text(data, 0, "%PDF-", false):
+        return "application/pdf"
+    if bytes_have_prefix(data, [137, 80, 78, 71, 13, 10, 26, 10]):
+        return MIME_PNG
+    if bytes_have_prefix(data, [255, 216, 255]):
+        return MIME_JPEG
+    if bytes_have_text(data, 0, "GIF87a", false) or bytes_have_text(data, 0, "GIF89a", false):
+        return MIME_GIF
+    if bytes_have_text(data, 0, "RIFF", false) and bytes_have_text(data, 8, "WEBPVP", false):
+        return MIME_WEBP
+    if bytes_have_prefix(data, [80, 75, 3, 4]):
+        return "application/zip"
+    if bytes_have_prefix(data, [31, 139, 8]):
+        return "application/x-gzip"
+    if bytes_have_prefix(data, [0, 97, 115, 109]):
+        return MIME_WASM
+    mut i := 0
+    while i < end:
+        if is_binary_byte(data[i]):
+            return MIME_BINARY
+        i = i + 1
+    if at < end and looks_like_json(data, at, end):
+        return MIME_JSON
+    return "text/plain; charset=utf-8"
+
+# ===============================================================
+# Serving files and content
+# ===============================================================
+
+# how much of a file is read at a time when its content is served.
+FILE_READ_CHUNK := 65536
+
+# a Range header asking for more parts than this is ignored and the whole
+# content is sent, so a request cannot make the server assemble thousands of
+# tiny parts. a request whose parts add up to more than the content is
+# ignored the same way, as net/http does.
+MAX_RANGES := 32
+
+# what serve_content and serve_file send from: content held in memory, or a
+# file read one range at a time.
+struct ContentSource:
+    file_path: String
+    data: Bytes
+    size: Int
+
+# `length` bytes from `start` of a content source.
+fn source_range(src: ContentSource, start: Int, length: Int) -> Bytes!:
+    if src.file_path == "":
+        return src.data.slice(start, start + length)
+    return read_file_range(src.file_path, start, length)
+
+# read `length` bytes from `start` of a file. there is no seek, so the bytes
+# before `start` are read and dropped.
+fn read_file_range(file_path: String, start: Int, length: Int) -> Bytes!:
+    file := fs.open(file_path)!
+    defer file.close()
+    reader := file.buffered_bytes_reader_chunked(FILE_READ_CHUNK)
+    mut skipped := 0
+    while skipped < start:
+        chunk := reader.read_bytes(min(FILE_READ_CHUNK, start - skipped))!
+        if chunk.is_empty():
+            fail "file ended before the requested range: " + file_path
+        skipped = skipped + chunk.len()
+    out := bytes.buffer_with_capacity(length)
+    errdefer out.free()
+    mut got := 0
+    while got < length:
+        chunk := reader.read_bytes(min(FILE_READ_CHUNK, length - got))!
+        if chunk.is_empty():
+            fail "file ended before the requested range: " + file_path
+        out.write(chunk)!
+        got = got + chunk.len()
+    return out.take_bytes()
+
+# the value of `text` when it is one or more ascii digits and fits an Int
+# with room to spare, else -1.
+fn small_decimal(text: String) -> Int:
+    if text.len() == 0 or text.len() > 18 or not is_decimal_text(text):
+        return -1
+    return parse_int(text) catch -1
+
+fn month_number(name: String) -> Int:
+    months := ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    mut i := 0
+    while i < months.len():
+        if months[i] == name:
+            return i + 1
+        i = i + 1
+    return -1
+
+# unix seconds for a calendar date and an "hh:mm:ss" clock, or a failure when
+# any field is out of range.
+fn http_date_seconds(year: Int, month_name: String, day: Int, clock: String) -> Int!:
+    month := month_number(month_name)
+    if year < 1970 or month < 1 or day < 1 or day > datetime.days_in_month(year, month):
+        fail "invalid http date"
+    if clock.len() != 8 or clock[2] != ":" or clock[5] != ":":
+        fail "invalid http date"
+    hour := small_decimal(clock.substring(0, 2))
+    minute := small_decimal(clock.substring(3, 5))
+    second := small_decimal(clock.substring(6, 8))
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59 or second < 0 or second > 60:
+        fail "invalid http date"
+    days := datetime.to_timestamp(datetime.date(year, month, day)) / 1000
+    return days + hour * 3600 + minute * 60 + second
+
+# parse an http date (rfc 9110 5.6.7) into unix seconds. all three forms a
+# recipient must accept are read: IMF-fixdate ("Sun, 06 Nov 1994 08:49:37
+# GMT"), the obsolete rfc 850 form ("Sunday, 06-Nov-94 08:49:37 GMT", a
+# two-digit year from 69 meaning 19xx) and asctime ("Sun Nov  6 08:49:37
+# 1994").
+pub fn parse_http_date(text: String) -> Int!:
+    value := text.trim()
+    comma := value.index_of(",")
+    if comma == 3 and value.len() == 29 and value.ends_with(" GMT") and value[4] == " " and value[7] == " " and value[11] == " " and value[16] == " ":
+        return http_date_seconds(small_decimal(value.substring(12, 16)), value.substring(8, 11), small_decimal(value.substring(5, 7)), value.substring(17, 25))
+    if comma > 3:
+        rest := value.substring(comma + 1, value.len())
+        if rest.len() == 23 and rest[0] == " " and rest[3] == "-" and rest[7] == "-" and rest[10] == " " and rest.ends_with(" GMT"):
+            mut year := small_decimal(rest.substring(8, 10))
+            if year >= 0 and year < 69:
+                year = year + 2000
+            elif year >= 69:
+                year = year + 1900
+            return http_date_seconds(year, rest.substring(4, 7), small_decimal(rest.substring(1, 3)), rest.substring(11, 19))
+    if comma < 0 and value.len() == 24 and value[3] == " " and value[7] == " " and value[10] == " " and value[19] == " ":
+        return http_date_seconds(small_decimal(value.substring(20, 24)), value.substring(4, 7), small_decimal(value.substring(8, 10).trim()), value.substring(11, 19))
+    fail "invalid http date: " + value
+
+# true when the entity-tag list in an If-Match or If-None-Match value names
+# `etag`, or is "*". a weak tag ("W/...") matches only when `weak_ok`, which
+# is the weak comparison If-None-Match uses (rfc 9110 8.8.3.2). the list is
+# scanned rather than split on ",", since a quoted tag may hold a comma.
+fn etag_list_matches(list: String, etag: String, weak_ok: Bool) -> Bool:
+    if list.trim() == "*":
+        return etag != ""
+    mut i := 0
+    while i < list.len():
+        c := list[i]
+        if c == " " or c == "\t" or c == ",":
+            i = i + 1
+            continue
+        mut is_weak := false
+        if list.substring(i, min(i + 2, list.len())) == "W/":
+            is_weak = true
+            i = i + 2
+        if i >= list.len() or list[i] != "\"":
+            return false
+        close := list.substring(i + 1, list.len()).index_of("\"")
+        if close < 0:
+            return false
+        tag := list.substring(i, i + close + 2)
+        if tag == etag and (weak_ok or not is_weak):
+            return true
+        i = i + close + 2
+    return false
+
+# the outcome of a request's preconditions against a representation with the
+# entity tag `etag` and modification time `modified` (0 when unknown), in the
+# order rfc 9110 13.2.2 gives: 0 to go on, 412, or 304.
+fn precondition_status(req: HttpRequestBytes, etag: String, modified: Int) -> Int:
+    method := req.method_text
+    safe := method == "GET" or method == "HEAD"
+    if_match := req.header_or("If-Match", "")
+    if if_match != "":
+        if not etag_list_matches(if_match, etag, false):
+            return 412
+    elif modified > 0:
+        unmodified_since := parse_http_date(req.header_or("If-Unmodified-Since", "")) catch -1
+        if unmodified_since >= 0 and modified > unmodified_since:
+            return 412
+    if_none_match := req.header_or("If-None-Match", "")
+    if if_none_match != "":
+        if etag_list_matches(if_none_match, etag, true):
+            if safe:
+                return 304
+            return 412
+    elif safe and modified > 0:
+        modified_since := parse_http_date(req.header_or("If-Modified-Since", "")) catch -1
+        if modified_since >= 0 and modified <= modified_since:
+            return 304
+    return 0
+
+# true when an If-Range value still describes the representation, so a range
+# may be sent: a strong entity tag equal to `etag`, or a date equal to the
+# modification time. anything else means the client's copy is stale and gets
+# the whole content.
+fn if_range_holds(value: String, etag: String, modified: Int) -> Bool:
+    if value.starts_with("\"") or value.starts_with("W/"):
+        return etag != "" and value.trim() == etag
+    date := parse_http_date(value) catch -1
+    return modified > 0 and date == modified
+
+# the ranges a Range value asks for out of `size` bytes, as start, length
+# pairs. `status` is 206 with at least one satisfiable range, 416 when the
+# value is well formed and none of its ranges overlap the content, and 0 when
+# the header should be ignored: another unit, a malformed range, too many
+# ranges, or ranges that add up to more than the content.
+struct RangePlan:
+    status: Int
+    starts: List[Int]
+    lengths: List[Int]
+
+fn ignore_ranges() -> RangePlan:
+    return RangePlan(0, [], [])
+
+fn plan_ranges(value: String, size: Int) -> RangePlan:
+    eq := value.index_of("=")
+    if eq < 0 or value.substring(0, eq).trim().to_lower() != "bytes":
+        return ignore_ranges()
+    specs := value.substring(eq + 1, value.len()).split(",")
+    if specs.len() > MAX_RANGES:
+        return ignore_ranges()
+    mut starts: List[Int] := []
+    mut lengths: List[Int] := []
+    mut total := 0
+    mut any_spec := false
+    for raw in specs:
+        spec := raw.trim()
+        if spec == "":
+            continue
+        any_spec = true
+        dash := spec.index_of("-")
+        if dash < 0:
+            return ignore_ranges()
+        first := spec.substring(0, dash).trim()
+        last := spec.substring(dash + 1, spec.len()).trim()
+        if first == "":
+            suffix := small_decimal(last)
+            if suffix < 0:
+                return ignore_ranges()
+            if suffix == 0 or size == 0:
+                continue
+            length := min(suffix, size)
+            starts.push(size - length)
+            lengths.push(length)
+            total = total + length
+            continue
+        start := small_decimal(first)
+        if start < 0:
+            return ignore_ranges()
+        mut end := size - 1
+        if last != "":
+            end = small_decimal(last)
+            if end < start:
+                return ignore_ranges()
+            end = min(end, size - 1)
+        if start >= size:
+            continue
+        starts.push(start)
+        lengths.push(end - start + 1)
+        total = total + end - start + 1
+    if not any_spec:
+        return ignore_ranges()
+    if starts.len() == 0:
+        return RangePlan(416, [], [])
+    if total > size:
+        return ignore_ranges()
+    return RangePlan(206, starts, lengths)
+
+fn content_range(start: Int, length: Int, size: Int) -> String:
+    return "bytes " + start.to_string() + "-" + (start + length - 1).to_string() + "/" + size.to_string()
+
+# a multipart/byteranges body (rfc 9110 14.6) holding each planned range.
+fn byteranges_body(src: ContentSource, plan: RangePlan, content_type: String, boundary: String) -> Bytes!:
+    out := bytes.buffer()
+    errdefer out.free()
+    mut i := 0
+    while i < plan.starts.len():
+        out.write_string_utf8("--" + boundary + "\r\nContent-Type: " + content_type + "\r\nContent-Range: " + content_range(plan.starts[i], plan.lengths[i], src.size) + "\r\n\r\n")!
+        out.write(source_range(src, plan.starts[i], plan.lengths[i])!)!
+        out.write_string_utf8("\r\n")!
+        i = i + 1
+    out.write_string_utf8("--" + boundary + "--\r\n")!
+    return out.take_bytes()
+
+# the content type to send for `name`: from its extension, or sniffed from
+# the first bytes when the extension says nothing.
+fn served_content_type(name: String, src: ContentSource) -> String!:
+    by_name := content_type_for_path(name)
+    if by_name != MIME_BINARY:
+        return by_name
+    return detect_content_type(source_range(src, 0, min(src.size, SNIFF_LEN))!)
+
+# the strong entity tag serve_file and serve_content send: the modification
+# time and the size, in hex, as nginx and others derive one.
+fn content_etag(modified: Int, size: Int) -> String:
+    if modified <= 0:
+        return ""
+    return "\"" + lower_hex_int(modified) + "-" + lower_hex_int(size) + "\""
+
+# `resp` with its status replaced.
+fn with_status(resp: HttpResponse, status: Int) -> HttpResponse:
+    return HttpResponse(status, resp.content_type, resp.headers, resp.body, resp.set_cookie_headers, resp.trailers)
+
+# the answer to `req` for a representation: the validators, the
+# preconditions, then a single range, several ranges or the whole content.
+fn answer_content(req: HttpRequestBytes, name: String, modified: Int, src: ContentSource) -> HttpResponse!:
+    etag := content_etag(modified, src.size)
+    mut last_modified := ""
+    if modified > 0:
+        last_modified = http_date(modified)
+    precondition := precondition_status(req, etag, modified)
+    if precondition == 412:
+        return text(412, reason_phrase(412))
+    if precondition == 304:
+        # a 304 carries the validator the client compares against, and
+        # Last-Modified only when there is no ETag (rfc 9110 15.4.5).
+        if etag != "":
+            return response(304).header("ETag", etag)
+        return response(304).header("Last-Modified", last_modified)
+    mut base := response(200).header("Accept-Ranges", "bytes")
+    if etag != "":
+        base = base.header("ETag", etag).header("Last-Modified", last_modified)
+    content_type := served_content_type(name, src)!
+    method := req.method_text
+    range_value := req.header_or("Range", "")
+    mut plan := ignore_ranges()
+    if method == "GET" and range_value != "":
+        if_range := req.header_or("If-Range", "")
+        if if_range == "" or if_range_holds(if_range, etag, modified):
+            plan = plan_ranges(range_value, src.size)
+    if plan.status == 416:
+        return text(416, reason_phrase(416)).header("Content-Range", "bytes */" + src.size.to_string())
+    if plan.status == 206 and plan.starts.len() == 1:
+        start := plan.starts[0]
+        length := plan.lengths[0]
+        return with_status(base, 206).header("Content-Type", content_type).header("Content-Range", content_range(start, length, src.size)).with_body_bytes(source_range(src, start, length)!)
+    if plan.status == 206:
+        boundary := multipart_random_boundary()!
+        return with_status(base, 206).header("Content-Type", "multipart/byteranges; boundary=" + boundary).with_body_bytes(byteranges_body(src, plan, content_type, boundary)!)
+    full := base.header("Content-Type", content_type)
+    if method == "HEAD":
+        return full.header("Content-Length", src.size.to_string())
+    return full.with_body_bytes(source_range(src, 0, src.size)!)
+
+# answer `req` with `content`, as net/http's ServeContent does: the content
+# type from `name`'s extension, or sniffed from the content when it has none
+# the table knows; an ETag and a Last-Modified from `modified` (unix seconds,
+# or 0 when unknown, which sends neither); 304 and 412 for the conditional
+# headers (rfc 9110 13.2.2); and 206 for a Range request (rfc 9110 14), as
+# multipart/byteranges when it asks for several ranges. a Range the server
+# cannot honor sensibly is ignored and the whole content sent, and one that
+# no part of the content satisfies gets 416. a HEAD request gets the headers
+# with no body.
+pub fn serve_content(req: HttpRequestBytes, name: String, modified: Int, content: Bytes) -> HttpResponse:
+    return answer_content(req, name, modified, ContentSource("", content, content.len())) catch server_error_response()
+
+# answer `req` with the file at `file_path`, as serve_content does, using the
+# file's size and modification time. only the bytes a response carries are
+# read, so a 304, a HEAD or a small range never reads the whole file. a path
+# that does not name a regular file gets 404, and one holding a NUL byte 400.
+pub fn serve_file(req: HttpRequestBytes, file_path: String) -> HttpResponse:
+    if file_path.index_of(chr(0)) >= 0:
+        return bad_request_response()
+    meta := fs.info(file_path) catch:
+        return not_found_response()
+    if meta.is_dir:
+        return not_found_response()
+    modified := fs.modified(file_path) catch 0
+    return answer_content(req, file_path, modified, ContentSource(file_path, bytes.empty(), meta.size)) catch server_error_response()
+
+# answer `req` with the file `name` names under the directory `root`, as
+# net/http's FileServer does. `name` is a "/"-separated path relative to
+# root, already percent-decoded, such as a `*path` route parameter. a name
+# with a ".." segment gets 404 and one holding a NUL byte 400, so nothing
+# outside root is ever read. a directory is answered with its index.html, or
+# 404 when it has none; directories are never listed.
+pub fn serve_dir(req: HttpRequestBytes, root: String, name: String) -> HttpResponse:
+    if name.index_of(chr(0)) >= 0:
+        return bad_request_response()
+    for segment in name.split("/"):
+        if segment == "..":
+            return not_found_response()
+    mut target := root
+    if name.trim() != "":
+        target = path_mod.join(root, name)
+    if fs.is_dir(target):
+        target = path_mod.join(target, "index.html")
+    return serve_file(req, target)
+
 # sends a chunked response head so callers can stream chunks without buffering the whole body.
 pub fn send_chunked_response_head(writer: BufferedBytesWriter, response: HttpResponse) -> Int!:
     if not response.body.is_empty():
@@ -4570,3 +5264,175 @@ test "an encoded separator in a query value is not split":
 test "a route parameter is percent-decoded":
     req := build_http_request(bytes.from_string_utf8("GET /users/a%20b HTTP/1.1\r\n\r\n"), bytes.empty())!
     assert_eq(req.path_param("/users/:id", "id")!, "a b")
+
+test "a route parameter keeps a plus and an encoded slash stays in its segment":
+    req := build_http_request(bytes.from_string_utf8("GET /files/a+b%2Fc HTTP/1.1\r\n\r\n"), bytes.empty())!
+    assert_eq(req.path_param("/files/:name", "name")!, "a+b/c")
+    assert(not req.matches_path("/files/:dir/:name")!)
+
+test "a literal route segment matches its percent-encoded spelling":
+    assert(route_match_path("/caf%C3%A9/%61pi", "/café/api"))
+    assert(not route_match_path("/caf%C3%A9", "/cafe"))
+
+test "a trailing wildcard matches the rest of the path":
+    pattern := path_segments("/static/*path")
+    assert(segments_match(path_segments("/static"), pattern))
+    assert(segments_match(path_segments("/static/a/b%20c.txt"), pattern))
+    assert(not segments_match(path_segments("/other/a"), pattern))
+    assert_eq(segment_param(path_segments("/static/a/b%20c.txt"), pattern, "path"), "a/b c.txt")
+    assert_eq(segment_param(path_segments("/static"), pattern, "path"), "")
+
+test "clean_path follows net/http and never climbs above the root":
+    assert_eq(clean_path("/a/b"), "/a/b")
+    assert_eq(clean_path("/a/b/"), "/a/b/")
+    assert_eq(clean_path("/"), "/")
+    assert_eq(clean_path(""), "/")
+    assert_eq(clean_path("a/b"), "/a/b")
+    assert_eq(clean_path("//a///b//"), "/a/b/")
+    assert_eq(clean_path("/a/./b/."), "/a/b")
+    assert_eq(clean_path("/a/b/../c"), "/a/c")
+    assert_eq(clean_path("/a/b/../"), "/a/")
+    assert_eq(clean_path("/.."), "/")
+    assert_eq(clean_path("/../../etc/passwd"), "/etc/passwd")
+    assert_eq(clean_path("/a/%2e%2E/%2e/b"), "/b")
+    assert_eq(clean_path("/a/.%2e/b"), "/b")
+    assert_eq(clean_path("//evil.example/x"), "/evil.example/x")
+    # a name that only starts with dots, or an escape that is not a dot, stays.
+    assert_eq(clean_path("/.well-known/..x/%2ex"), "/.well-known/..x/%2ex")
+    assert_eq(clean_path("/a%2F..%2Fb"), "/a%2F..%2Fb")
+
+test "path_is_clean agrees with clean_path":
+    for p in ["/", "/a", "/a/", "/a/b.txt", "/..x", "//", "/a//b", "/./", "/a/..", "/%2e", "x", "", "/a%2Fb"]:
+        assert_eq(path_is_clean(p), clean_path(p) == p)
+
+fn form_request(method: String, target: String, content_type: String, body: String) -> HttpRequestBytes!:
+    head := method + " " + target + " HTTP/1.1\r\nHost: h\r\nContent-Type: " + content_type + "\r\n\r\n"
+    return build_http_request(bytes.from_string_utf8(head), bytes.from_string_utf8(body))!
+
+test "parse_form decodes plus and escapes and keeps repeated keys":
+    values := parse_form("a=1&b=x+y%21&a=2&flag&=v&c=%26")
+    assert_eq(values["a"].len(), 2)
+    assert_eq(values["a"][0], "1")
+    assert_eq(values["a"][1], "2")
+    assert_eq(values["b"][0], "x y!")
+    assert_eq(values["flag"][0], "")
+    assert_eq(values[""][0], "v")
+    assert_eq(values["c"][0], "&")
+    assert_eq(parse_form("").len(), 0)
+
+test "form values merge the body before the query":
+    req := form_request("POST", "/f?a=query&q=1", "application/x-www-form-urlencoded; charset=utf-8", "a=body&b=2")!
+    assert_eq(req.form_value("a"), "body")
+    assert_eq(req.form_value("q"), "1")
+    assert_eq(req.form()["a"].len(), 2)
+    assert_eq(req.form()["a"][1], "query")
+    assert_eq(req.post_form_value("q"), "")
+    assert_eq(req.post_form_value("b"), "2")
+    assert_eq(req.form_value("missing"), "")
+
+test "a GET body and a non-form body are not form values":
+    get := form_request("GET", "/f?a=1", "application/x-www-form-urlencoded", "a=body")!
+    assert_eq(get.form_value("a"), "1")
+    assert_eq(get.post_form().len(), 0)
+    json_post := form_request("POST", "/f", "application/json", "a=body")!
+    assert_eq(json_post.form_value("a"), "")
+
+test "multipart text fields are form values and files are not":
+    parts := [multipart_field("title", "hello"), multipart_file_text("upload", "a.txt", "text/plain", "file body")]
+    body := encode_multipart(parts, "XyZ")!.to_string_utf8()!
+    req := form_request("POST", "/up", "multipart/form-data; boundary=XyZ", body)!
+    assert_eq(req.form_value("title"), "hello")
+    assert_eq(req.form_value("upload"), "")
+    assert_eq(req.multipart_part("upload")!.filename, "a.txt")
+    assert_eq(req.multipart_part("upload")!.text()!, "file body")
+
+fn auth_request(value: String) -> HttpRequestBytes!:
+    head := "GET / HTTP/1.1\r\nHost: h\r\nAuthorization: " + value + "\r\n\r\n"
+    return build_http_request(bytes.from_string_utf8(head), bytes.empty())!
+
+test "basic_auth reads the user and password":
+    creds := auth_request("Basic " + encoding.b64_encode_string("ada:pa:ss"))!.basic_auth()!
+    assert_eq(creds.user, "ada")
+    assert_eq(creds.password, "pa:ss")
+    lower := auth_request("basic " + encoding.b64_encode_string("u:"))!.basic_auth()!
+    assert_eq(lower.user, "u")
+    assert_eq(lower.password, "")
+    assert(auth_request("Bearer abc")!.basic_auth().is_err)
+    assert(auth_request("Basic !!!")!.basic_auth().is_err)
+    assert(auth_request("Basic " + encoding.b64_encode_string("nocolon"))!.basic_auth().is_err)
+    no_header := build_http_request(bytes.from_string_utf8("GET / HTTP/1.1\r\nHost: h\r\n\r\n"), bytes.empty())!
+    assert(no_header.basic_auth().is_err)
+
+test "basic_auth_challenge asks for credentials with a quoted realm":
+    q := chr(34)
+    bs := chr(92)
+    resp := basic_auth_challenge("ops " + q + "x" + q)
+    assert_eq(resp.status, 401)
+    assert_eq(resp.header_value("WWW-Authenticate"), "Basic realm=" + q + "ops " + bs + q + "x" + bs + q + q + ", charset=" + q + "UTF-8" + q)
+
+fn bytes_of(values: List[Int]) -> Bytes:
+    buf := bytes.buffer()
+    for value in values:
+        buf.write_byte(value)
+    return buf.take_bytes()
+
+test "detect_content_type knows the common signatures":
+    q := chr(34)
+    assert_eq(detect_content_type(bytes.from_string_utf8("  <!doctype html><p>")), "text/html; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("<HTML>")), "text/html; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("<a href=x>")), "text/html; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("<?xml version=")), "text/xml; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("hello world")), "text/plain; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8(" " + chr(123) + q + "a" + q + ":1" + chr(125))), MIME_JSON)
+    assert_eq(detect_content_type(bytes.from_string_utf8(chr(123) + " note" + chr(125))), "text/plain; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("[1, 2]")), MIME_JSON)
+    assert_eq(detect_content_type(bytes.from_string_utf8("[note] not json")), "text/plain; charset=utf-8")
+    assert_eq(detect_content_type(bytes.from_string_utf8("%PDF-1.7")), "application/pdf")
+    assert_eq(detect_content_type(bytes_of([137, 80, 78, 71, 13, 10, 26, 10, 0])), MIME_PNG)
+    assert_eq(detect_content_type(bytes_of([255, 216, 255, 224])), MIME_JPEG)
+    assert_eq(detect_content_type(bytes.from_string_utf8("GIF89a....")), MIME_GIF)
+    assert_eq(detect_content_type(bytes.from_string_utf8("RIFF0000WEBPVP8 ")), MIME_WEBP)
+    assert_eq(detect_content_type(bytes_of([80, 75, 3, 4, 20])), "application/zip")
+    assert_eq(detect_content_type(bytes_of([31, 139, 8, 0])), "application/x-gzip")
+    assert_eq(detect_content_type(bytes_of([0, 97, 115, 109, 1, 0, 0, 0])), MIME_WASM)
+    assert_eq(detect_content_type(bytes_of([1, 2, 3])), MIME_BINARY)
+    assert_eq(detect_content_type(bytes.empty()), "text/plain; charset=utf-8")
+
+test "parse_http_date reads all three date forms":
+    assert_eq(parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT")!, 784111777)
+    assert_eq(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT")!, 784111777)
+    assert_eq(parse_http_date("Sun Nov  6 08:49:37 1994")!, 784111777)
+    assert_eq(parse_http_date(http_date(1700000000))!, 1700000000)
+    assert(parse_http_date("yesterday").is_err)
+    assert(parse_http_date("Sun, 32 Nov 1994 08:49:37 GMT").is_err)
+    assert(parse_http_date("Sun, 06 Nov 1994 25:49:37 GMT").is_err)
+
+test "plan_ranges follows rfc 9110 14":
+    one := plan_ranges("bytes=0-4", 10)
+    assert_eq(one.status, 206)
+    assert_eq(one.starts[0], 0)
+    assert_eq(one.lengths[0], 5)
+    suffix := plan_ranges("bytes=-3", 10)
+    assert_eq(suffix.starts[0], 7)
+    assert_eq(suffix.lengths[0], 3)
+    assert_eq(plan_ranges("bytes=8-", 10).lengths[0], 2)
+    assert_eq(plan_ranges("bytes=5-100", 10).lengths[0], 5)
+    assert_eq(plan_ranges("Bytes=0-1, 4-5", 10).starts.len(), 2)
+    assert_eq(plan_ranges("bytes=20-30", 10).status, 416)
+    assert_eq(plan_ranges("bytes=-0", 10).status, 416)
+    assert_eq(plan_ranges("bytes=0-0", 0).status, 416)
+    # ignored: another unit, bad syntax, more than the content in total.
+    assert_eq(plan_ranges("items=0-1", 10).status, 0)
+    assert_eq(plan_ranges("bytes=5-1", 10).status, 0)
+    assert_eq(plan_ranges("bytes=a-b", 10).status, 0)
+    assert_eq(plan_ranges("bytes=", 10).status, 0)
+    assert_eq(plan_ranges("bytes=0-9,0-9", 10).status, 0)
+
+test "etag lists are scanned with strong and weak comparison":
+    tag := chr(34) + "a,b" + chr(34)
+    assert(etag_list_matches(tag, tag, false))
+    assert(etag_list_matches(chr(34) + "x" + chr(34) + ", " + tag, tag, false))
+    assert(etag_list_matches("W/" + tag, tag, true))
+    assert(not etag_list_matches("W/" + tag, tag, false))
+    assert(etag_list_matches("*", tag, false))
+    assert(not etag_list_matches(chr(34) + "a" + chr(34), tag, true))

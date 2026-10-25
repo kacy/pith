@@ -22,8 +22,9 @@ binds the socket and serves forever.
 
 ## routes
 
-add routes with `get`, `post`, `put`, and `delete`. each one returns a new app, so
-calls chain:
+add routes with `get`, `post`, `put`, `patch`, `delete`, and `head`, or with
+`handle(method, pattern, handler)` for any other method. each one returns a new
+app, so calls chain:
 
 ```pith
 app := web.new().get("/", home).post("/users", create)
@@ -55,7 +56,54 @@ app := web.new().get("/users/:id", show)
 ```
 
 `GET /users/42` calls `show` with `req.param("id")` equal to `"42"`. a trailing slash
-is ignored, so `/users/42` and `/users/42/` hit the same route.
+is ignored, so `/users/42` and `/users/42/` hit the same route. net/http only
+redirects `/dir` to `/dir/` when a subtree pattern is registered. this router
+has no subtree patterns, so both spellings reach the route and neither is
+redirected.
+
+a last segment that starts with `*` matches the rest of the path, including
+nothing at all. `/files/*path` matches `/files`, `/files/a.txt` and
+`/files/docs/a.txt`, and `req.param("path")` is `""`, `"a.txt"` and
+`"docs/a.txt"`.
+
+### percent-encoding
+
+the router splits the path on its literal `/` characters first and decodes
+each segment after that. so:
+
+- a literal pattern segment matches the decoded segment: `/café` matches a
+  request for `/caf%C3%A9`, and `/api` matches `/%61pi`.
+- an encoded slash stays inside its segment. `/files/:name` matches
+  `/files/a%2Fb` with `name` equal to `"a/b"`, and `/files/:dir/:name` does
+  not match it.
+- a parameter is decoded the way a path is decoded, so `%20` is a space and
+  `+` stays a `+`. only a query string or a form body uses `+` for a space.
+- a `*` parameter is the remaining segments, each decoded and joined with
+  `/`, so an encoded slash in it looks like any other slash. a handler that
+  uses one as a file name has to check it, as `http.serve_dir` does.
+
+group prefixes are compared the same way, so `/%61pi/me` is inside
+`group("/api", guard)`.
+
+### canonical paths
+
+a request path that is not in canonical form gets a `301` to the one that is,
+with the query string kept. this is what net/http's `ServeMux` does, and it
+happens before any route or middleware sees the request:
+
+- repeated slashes collapse: `/a//b` goes to `/a/b`
+- `.` segments are dropped: `/a/./b` goes to `/a/b`
+- `..` segments remove the segment before them: `/a/b/../c` goes to `/a/c`.
+  a `..` at the root stays at the root, so `/../etc/passwd` goes to
+  `/etc/passwd` and a path never climbs above `/`
+- an encoded dot counts as a dot, so `/a/%2e%2e/b` goes to `/b`
+- a trailing slash is kept
+
+`http.clean_path(path)` computes the canonical form and
+`http.path_is_clean(path)` checks for it. the check reads the path in place
+and allocates nothing, so a request whose path is already clean costs one
+scan. because repeated slashes collapse, a `Location` never starts with `//`,
+which a browser would read as a different host.
 
 ## the request
 
@@ -248,6 +296,18 @@ http.not_found_response()
 ```
 
 a request that matches no route gets `http.not_found_response()` automatically.
+a request for a path some route serves, under a method none of those routes
+accepts, gets `405 Method Not Allowed` with an `Allow` header that lists the
+methods the path does accept. neither answer runs middleware.
+
+### HEAD
+
+a `GET` route answers `HEAD` as well, as net/http's `ServeMux` does. the
+router runs the `GET` handler and the server sends the headers without the
+body, including the `Content-Length` the body would have had. a `HEAD` route
+registered for the same path wins over the `GET` one, for a handler that can
+answer without building the body. `Allow` lists `HEAD` wherever it lists
+`GET`.
 
 ## middleware
 
@@ -627,6 +687,80 @@ intercepts the preflight ones; the rest get the ordinary `Allow` answer. an
 `OPTIONS *` asks about the server rather than a path (rfc 9110 9.3.7).
 `std.web` answers it with `200`, an empty body and an `Allow` header that
 lists every method the app's routes use, again through the app-wide middleware.
+
+## static files
+
+`static(prefix, root)` serves the files under a directory, as net/http's
+`FileServer` does:
+
+```pith
+app := web.new().static("/assets", "public")
+```
+
+`GET /assets/app.js` answers with `public/app.js`. the route is an ordinary
+`GET` on `/assets/*path`, so it also answers `HEAD` and runs inside the
+middleware. each answer comes from `http.serve_dir`, which adds:
+
+- `Content-Type` from the extension, or sniffed from the first 512 bytes
+  when the extension is unknown or missing (see `http.detect_content_type`)
+- `Last-Modified` from the file's modification time, and a strong `ETag`
+  built from the modification time and the size
+- `304` for `If-None-Match` and `If-Modified-Since`, and `412` for
+  `If-Match` and `If-Unmodified-Since`, evaluated in the order of rfc 9110
+  13.2.2
+- `Accept-Ranges: bytes` and range requests. one range gets `206` with
+  `Content-Range`, several get `206` with a `multipart/byteranges` body, and
+  a range no byte of the file satisfies gets `416` with
+  `Content-Range: bytes */size`. `If-Range` is honored. `HEAD` ignores
+  `Range`, as rfc 9110 14.2 requires
+- `index.html` for a directory, or `404` when there is none. directories are
+  never listed
+
+a `Range` header the server cannot honor is ignored and the whole file
+is sent, which rfc 9110 allows. that covers a malformed range, a unit other
+than `bytes`, more than 32 ranges, and ranges that add up to more than the
+file.
+
+nothing outside `root` is ever read. a `..` segment, plain or encoded, is
+redirected to the canonical path before the route runs (see [canonical
+paths](#canonical-paths)). a `..` that reaches the handler through an encoded
+slash, such as `..%2Fsecret`, gets `404`, and a NUL byte gets `400`. symbolic
+links under `root` are followed, as they are in net/http.
+
+## forms and basic auth
+
+`req.form_value(name)` reads one form field. it looks in an
+`application/x-www-form-urlencoded` or `multipart/form-data` body first and
+then in the query string, as net/http's `FormValue` does. `req.raw.form()`
+returns every value of every field, and `req.raw.post_form()` only the body's.
+a body counts only on `POST`, `PUT` and `PATCH`. see
+[http apps](http_apps.md#forms) for the parsing rules.
+
+`req.raw.basic_auth()` reads an `Authorization: Basic` header, and
+`http.basic_auth_challenge(realm)` is the `401` to send when it fails:
+
+```pith
+fn admin(req: web.Request) -> http.HttpResponse:
+    creds := req.raw.basic_auth() catch:
+        return http.basic_auth_challenge("admin")
+    if not subtle.equal(bytes.from_string_utf8(creds.password), expected):
+        return http.basic_auth_challenge("admin")
+    return http.text(200, "hello " + creds.user)
+```
+
+## request body limits
+
+the server reads a request body before the handler runs and refuses one
+longer than the app's `ServerConfig.max_body_bytes` with `413` (see
+[timeouts and limits](#timeouts-and-limits)). that is the limit that bounds
+memory. `web.max_body(limit)` is a middleware that narrows it for some
+routes, the way net/http's `MaxBytesReader` wraps one handler:
+
+```pith
+app := web.new().group("/avatars", web.max_body(262144)).post("/avatars", upload)
+```
+
+a request to those routes with a longer body gets `413 Content Too Large`.
 
 ## observability
 

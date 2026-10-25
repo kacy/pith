@@ -92,7 +92,7 @@
 //! adds the fd to epoll under it if this is the fd's first wait, drops it, then
 //! parks. a poll takes it only to drain fired events and expired deadlines into
 //! a local list, drops it, then wakes. so this lock never nests inside green's
-//! locks nor they inside it — no cross-module lock cycle is possible.
+//! locks nor they inside it, so no cross-module lock cycle is possible.
 
 use crate::concurrency::green;
 use std::cmp::Ordering;
@@ -151,8 +151,8 @@ struct Waiter {
 
 /// what a heap entry resolves when it expires: an fd wait that carried a
 /// timeout, or a pure timer with no fd at all (a green task sleeping). the two
-/// are distinct variants — rather than a sentinel fd smuggled through the io
-/// shape — so the fd code (`register_io`, `on_close`) can never be handed a
+/// are distinct variants, rather than a sentinel fd smuggled through the io
+/// shape, so the fd code (`register_io`, `on_close`) can never be handed a
 /// value that is not a real fd.
 enum DeadlineTarget {
     Io { fd: RawFd, interest: Interest },
@@ -620,8 +620,8 @@ fn register_timer(poller: &Poller, at: Instant, task: usize, outcome: &Arc<Atomi
 
 /// run worker `index`'s poller once: wait up to `timeout` (zero polls without
 /// blocking), and wake the tasks whose fds are ready or whose deadlines
-/// expired. returns whether anything happened — a readiness, an expired
-/// deadline or a notify — as opposed to the wait running out. never resumes a
+/// expired. returns whether anything happened (a readiness, an expired
+/// deadline or a notify) as opposed to the wait running out. never resumes a
 /// coroutine.
 ///
 /// the wait is capped at the poller's nearest deadline, so a parked worker

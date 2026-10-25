@@ -790,6 +790,58 @@ fn inline_list_get_value_strict(
     finish_strict_fast_path(builder, slow, done, fallback)
 }
 
+/// Inline `b.len()` (`pith_bytes_len`) and `xs.len()` (`pith_list_len`) as
+/// the same handle test the getters above use and one load of the length.
+/// A loop that tests `i < b.len()` makes this call once per pass, so the
+/// FFI call cost more than the loop body did. A list only keeps its length
+/// in the 8-byte storage when its elements are 8 bytes wide, so for a list
+/// `elem_size_offset` names the field to check first. Everything the fast
+/// path does not accept, null included, goes to `fallback`, which answers
+/// 0 for a bad handle as it always has.
+fn inline_handle_len(
+    builder: &mut FunctionBuilder<'_>,
+    handle: Value,
+    align: i64,
+    magic_offset: i32,
+    magic: u32,
+    elem_size_offset: Option<i32>,
+    len_offset: i32,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+    builder.append_block_param(slow, types::I64);
+    builder.append_block_param(slow, types::I64);
+    builder.set_cold_block(slow);
+
+    // the handle test passes two values to `slow`; a length has no index,
+    // so the handle fills both slots
+    branch_if_not_magic_handle(builder, handle, handle, align, magic_offset, magic, slow);
+    if let Some(offset) = elem_size_offset {
+        let elem_size = builder
+            .ins()
+            .load(types::I64, MemFlags::new(), handle, offset);
+        let not_eight = builder.ins().icmp_imm(IntCC::NotEqual, elem_size, 8);
+        let read = builder.create_block();
+        brif_with_two_i64_args(builder, not_eight, slow, handle, handle, read);
+        builder.switch_to_block(read);
+    }
+    let len = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), handle, len_offset);
+    jump_with_i64_arg(builder, done, len);
+
+    builder.switch_to_block(slow);
+    let arg = builder.block_params(slow)[0];
+    let call = builder.ins().call(fallback, &[arg]);
+    let fallback_result = builder.func.dfg.inst_results(call)[0];
+    jump_with_i64_arg(builder, done, fallback_result);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
 /// Inline bytes.read_word for the common case — a count of 1..=8 with a
 /// full 8-byte window inside the data — as one load and a mask, skipping
 /// the FFI call that dominates word-at-a-time scanners (the xxhash kernel,
@@ -2646,6 +2698,47 @@ fn compile_ir_function(
                         )?;
                         let inlined =
                             inline_cstring_byte_at(&mut builder, args[0], args[1], fallback);
+                        regs.insert(reg, inlined);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
+                    if (fname == "bytes_len" || fname == "pith_list_len")
+                        && args.len() == 1
+                        && !name_is_shadowed
+                    {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            fname,
+                        )?;
+                        let inlined = if fname == "bytes_len" {
+                            inline_handle_len(
+                                &mut builder,
+                                args[0],
+                                BYTES_HANDLE_ALIGN,
+                                BYTES_MAGIC_OFFSET,
+                                BYTES_MAGIC,
+                                None,
+                                BYTES_DATA_LEN_OFFSET,
+                                fallback,
+                            )
+                        } else {
+                            inline_handle_len(
+                                &mut builder,
+                                args[0],
+                                LIST_HANDLE_ALIGN,
+                                0,
+                                LIST_MAGIC,
+                                Some(LIST_IMPL_ELEM_SIZE_OFFSET),
+                                LIST_IMPL_VALUES8_LEN_OFFSET,
+                                fallback,
+                            )
+                        };
                         regs.insert(reg, inlined);
                         string_regs.remove(&reg);
                         bytes_regs.remove(&reg);

@@ -179,6 +179,25 @@ The 60-second `http_bench.sh` run above reads 275k for Pith against 387k for
 Go, with the same ~2.6 bytes/request of RSS growth. `wrk` shares the machine's
 cores with the server in both runs, so neither figure is a ceiling.
 
+### against a minimal go server (2026-10-25)
+
+`bench/http_sweep.sh` runs four servers on the same `/item?id=N` route and body: Pith's std.net.http (`bench/http_server.pith`), Go's net/http (`bench/http_server.go`), a minimal Go server on net and bufio (`bench/http_server_min.go`), and fasthttp (`bench/fasthttp`). The server runs on one CCD of the 9950X (CPUs 0-7,16-23, with 16 workers or GOMAXPROCS=16) and wrk runs on the other with 16 threads. The table has the median req/s and p99 of 3 interleaved 10-second runs on main at 2c531be4:
+
+| conns | pith | net/http | minimal go | fasthttp |
+|---:|---:|---:|---:|---:|
+| 32 | 1.19M, 51 µs | 746k, 302 µs | 1.33M, 314 µs | 1.33M, 315 µs |
+| 128 | 1.71M, 140 µs | 779k, 1.36 ms | 2.18M, 509 µs | 2.15M, 512 µs |
+| 256 | 1.77M, 235 µs | 987k, 1.92 ms | 2.20M, 823 µs | 2.18M, 880 µs |
+| 1024 | 1.75M, 1.14 ms | 1.16M, 4.11 ms | 2.26M, 1.67 ms | 2.18M, 2.11 ms |
+
+Pith serves about 80% as many requests as the minimal Go server from 128 connections up, and 90% at 32. It serves 1.5 to 2.2 times as many as net/http, and its p99 is the lowest of the four at every connection count.
+
+The sweep needs all 16 wrk threads. With 8, its old default, wrk held the minimal Go server and fasthttp near 1.65M req/s, with the minimal Go server's CPUs about 24% idle, and Pith read 5% ahead of them at 1024 connections. With 16, the minimal Go server is about 6.5% idle at 1024 connections and Pith about 0.5%, so both are close to CPU bound. The difference is user-space CPU: #1188 measured 3.2 µs per request for Pith against 1.5 µs for the minimal Go server, with about the same kernel time for both.
+
+```
+WRK=wrk PITH=./target/release/pith bench/http_sweep.sh
+```
+
 ## catalog service benchmark
 
 there is also a more realistic in-memory microservice benchmark:

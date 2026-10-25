@@ -26,6 +26,213 @@ So, two habits:
 Absolute times are only comparable within a run. Memory columns are far more
 stable than time columns and carry most of the signal here.
 
+## the full suite against go and rust (2026-10-25)
+
+Nearly every benchmark in this directory now has a Go and a Rust counterpart.
+Four do not. In `tls_head_read` the TLS stack costs more than the head reader it
+isolates. `web_hello`, `http_server_mt` and `tls_server` are variants of the
+HTTP server, which the net/http and hyper arms below cover. Each port
+runs the same algorithm on the same data with the same arguments and prints the
+same checksum, so equal output shows the arms did the same work. The ports are
+written the way a Go or Rust developer would write them. They use the standard
+library, plus a crate where Rust's standard library has no equivalent (serde_json,
+tokio, hyper, RustCrypto, crc32fast, ruzstd), or klauspost/compress for zstd in Go.
+
+`bench/compare.sh` builds every arm, checks its output against Pith's, and runs
+interleaved rounds. The benchmark list, with arguments and build commands, is
+`bench/compare.list`:
+
+```
+bench/compare.sh                    # everything, 5 rounds
+TRIALS=3 bench/compare.sh map_update json_decode_shapes
+```
+
+Setup: Ryzen 9 9950X, every run pinned to one CCD (cpus 0-7,16-23), 16 workers
+(`PITH_GREEN_WORKERS`, `GOMAXPROCS`, tokio worker threads), Go 1.27.3,
+Rust 1.99.1, Pith at `64245d29`. Times are the median wall time of 5
+interleaved rounds, process start included.
+
+### compute and std
+
+| benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |
+|---|---|---:|---:|---:|---:|---:|
+| event_ledger | `200000` | 77 | 97 | 51 | 0.80x | 1.51x |
+| std_pipeline | `50000` | 101 | 78 | 56 | 1.29x | 1.79x |
+| catalog_workload | `4000` | 3.1 | 3.4 | 2.1 | 0.91x | 1.48x |
+| closure_error | `2000000` | 602 | 183 | 164 | 3.30x | 3.67x |
+| tight_loop | `2000000000` | 747 | 354 | 1 | 2.11x | (a) |
+| closure_calls | `50000000` | 1097 | 72 | 26 | 15.2x | 42.2x |
+| substring_search | `20000` | 1046 | 220 | 208 | 4.75x | 5.04x |
+| substring_search/absent | `500 long-absent` | 12 | 4.0 | 3.4 | 3.00x | 3.53x |
+| string_buffer/build | `current build 100000 200 200` | 731 | 1698 | 265 | 0.43x | 2.76x |
+| string_buffer/snapshot | `current snapshot 10000 200 200` | 332 | 193 | 289 | 1.72x | 1.15x |
+| cyclic_graph | `10000000` | 468 | 125 | 146 | 3.74x | 3.20x |
+| cyclic_graph_strong | `10000000` | 1176 | 124 | 286 | 9.50x | 4.11x |
+| csv_encode | `5000 400` | 708 | 307 | 129 | 2.31x | 5.48x |
+| json_decode_shapes/small | `small 4 20000000` | 867 | 3504 | 1126 | 0.25x | 0.77x |
+| json_decode_shapes/wide | `wide 32 3000000` | 783 | 3192 | 1511 | 0.25x | 0.52x |
+| json_decode_shapes/nested | `nested 4 8000000` | 884 | 2201 | 788 | 0.40x | 1.12x |
+| json_decode_shapes/list | `list 32 400000` | 977 | 2079 | 913 | 0.47x | 1.07x |
+| json_decode_shapes/list_walk | `list_walk 32 5000` | 921 | 50 | 28 | 18.3x | 32.9x |
+| json_decode_shapes/map | `map 32 300000` | 843 | 1038 | 569 | 0.81x | 1.48x |
+| json_decode_shapes/float | `float 4 12000000` | 854 | 3522 | 966 | 0.24x | 0.88x |
+| path_clean_count | `2000000` | 868 | 747 | 179 | 1.16x | 4.86x |
+| map_update/string | `string 50000000 64` | 1005 | 494 | 471 | 2.03x | 2.13x |
+| map_update/bytes | `bytes 50000000 64` | 880 | 1259 | 487 | 0.70x | 1.81x |
+| map_update/int | `int 100000000 64` | 600 | 682 | 713 | 0.88x | 0.84x |
+| generic_sort/int | `current random int 100000 30` | 469 | 506 | 59 | 0.93x | 7.93x |
+| generic_sort/string | `current random string 100000 30` | 819 | 652 | 320 | 1.26x | 2.56x |
+| http_head_read | `1000000` | 811 | 494 | 115 | 1.64x | 7.07x |
+
+The hash kernels hash 256 MB. The rows below subtract the `none` arm (112 ms
+for Pith, 48 for Go, 47 for Rust), which only builds the input:
+
+| kernel | pith ms | go ms | rust ms | pith/go | pith/rust |
+|---|---:|---:|---:|---:|---:|
+| sha256 | 1828 | 95 | 96 | 19.2x | 19.0x |
+| sha512 | 943 | 189 | 253 | 5.0x | 3.7x |
+| fnv1a | 234 | 188 | 189 | 1.24x | 1.24x |
+| crc32 | 378 | 7 | 7 | 54x | 54x |
+
+### concurrency
+
+| benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |
+|---|---|---:|---:|---:|---:|---:|
+| chan_fanout | `1000000` | 114 | 49 | 468 | 2.32x | 0.24x |
+| task_churn | `200000` | 1119 | 672 | 2342 | 1.67x | 0.48x |
+| task_pingpong | `2000000` | 412 | 312 | 529 | 1.32x | 0.78x |
+| green_fanout | `2000000` | 977 | 243 | 395 | 4.03x | 2.47x |
+| cpu_parallel_sync | `200 1000000` | 1820 | 751 | 731 | 2.42x | 2.49x |
+| lock_sweep/log | `log 16 100000000` | 155 | 44 | 5 | 3.53x | (a) |
+| lock_sweep/spawn | `spawn 16 1600000` | 185 | 81 | 99 | 2.28x | 1.87x |
+| lock_sweep/labels | `labels 16 1600000` | 399 | 81 | 81 | 4.93x | 4.91x |
+| lock_sweep/breaker | `breaker 16 50000000` | 131 | 61 | 55 | 2.14x | 2.39x |
+| lock_sweep/readfile | `readfile 16 200000` | 96 | 103 | 237 | 0.94x | 0.41x |
+| metrics_contention/counter | `3 4000000 16 counter` | 635 | 517 | 344 | 1.23x | 1.85x |
+| metrics_contention/histogram | `3 4000000 16 histogram` | 593 | 673 | 499 | 0.88x | 1.19x |
+| metrics_contention/labels | `3 1000000 16 labels` | 772 | 107 | 185 | 7.23x | 4.16x |
+
+(a) LLVM removes the loop, so the Rust time is not a loop cost: `tight_loop`
+becomes a closed form, `lock_sweep/log` hoists the level check out of the loop,
+and the `call` and `direct` phases of `closure_calls` fold away.
+
+### what is and is not like for like
+
+- Closures: Go's escape analysis keeps the closures in `closure_calls` and
+  `closure_error` on the stack, and Rust closures are unboxed. Pith allocates
+  every closure on the heap. Most of those rows measure that difference.
+- Hashes and checksums: Go's standard library and the Rust crates use
+  SHA-NI and pclmulqdq. Pith's kernels are portable code. fnv1a is a serial
+  chain in every language, so it is the closest comparison of the four.
+- Cycles: Go has a tracing collector, so both cyclic graph files are the
+  same Go program. In the strong variant, Pith and Rust leak every ring:
+  Pith leaks about 375 bytes per ring and Rust about 125, which is most of
+  the time difference (peak RSS 3.75 GB and 1.25 GB).
+- JSON: Go uses encoding/json v1 and Rust uses serde_json with derive.
+  `list_walk` does not do the same work in each language: Rust decodes each
+  element from a parsed `Value`, and Go decodes each element from a
+  `json.RawMessage`, so it scans every element twice.
+- path_clean_count: Go calls `path.Clean` and counts the segments of the
+  result, which allocates. Rust runs the same single-pass count as Pith.
+- map_update/bytes: Go map keys cannot be `[]byte`, so each store converts
+  the key with `string(k)`, which allocates.
+- generic_sort: Go's `slices.SortStableFunc` is slow on int keys. Rust
+  sorts references with `sort_by_key`.
+- http_head_read: Go's `http.ReadRequest` does more per request than the
+  Pith reader: it builds a canonical header map and parses the URL. The Rust
+  arm uses httparse, which does less, so it is close to a lower bound.
+- Tasks: Rust uses tokio for task workloads. `chan_fanout` and `task_churn`
+  favor Pith over Rust because of tokio's channels and glibc malloc under
+  80M allocations. `cpu_parallel_sync` uses async-channel, because the shared
+  ack channel has several receivers.
+- Metrics and lock_sweep: Neither standard library has a metrics registry,
+  so each port carries a small one shaped like std.metrics: a map behind an
+  RWMutex with compare-and-swap cells. The `labels` modes do one lookup per
+  write and keep no per-task cache.
+
+### http server
+
+`bench/http_sweep.sh` now has two Rust arms: `hyper` (hyper 1.x on tokio, the
+counterpart to net/http) and `rustmin` (tokio with a hand-written keep-alive
+loop, the counterpart to the minimal Go server, byte-identical responses). Same
+setup as the sweep above (wrk -t16 on the other CCD, 10 s runs, median of 3):
+
+| conns | pith | net/http | min go | fasthttp | hyper | rustmin |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 1.22M | 743k | 1.33M | 1.33M | 1.08M | 1.07M |
+| 128 | 1.62M | 777k | 2.18M | 2.15M | 1.47M | 1.53M |
+| 256 | 1.83M | 984k | 2.20M | 2.18M | 1.75M | 1.81M |
+| 1024 | 1.81M | 1.15M | 2.25M | 2.17M | 2.22M | 2.27M |
+
+p99 latency in µs:
+
+| conns | pith | net/http | min go | fasthttp | hyper | rustmin |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 53 | 307 | 303 | 323 | 123 | 99 |
+| 128 | 186 | 1380 | 492 | 508 | 165 | 181 |
+| 256 | 231 | 1960 | 837 | 870 | 286 | 297 |
+| 1024 | 870 | 4560 | 1630 | 2100 | 1080 | 1340 |
+
+Pith leads both Rust servers up to 256 connections, and both Rust servers pass
+it at 1024. Pith has the lowest p99 at every connection count.
+
+### catalog service
+
+`bench/catalog_server_rust` is an axum counterpart to the Go catalog server,
+checked endpoint by endpoint against it. The client makes one request per
+connection, so connection setup dominates. Median p50 over two runs:
+
+| endpoint | go | pith | rust |
+|---|---:|---:|---:|
+| `GET /profile` | 104 µs | 126 µs | 121 µs |
+| `GET /search` hot | 105 µs | 128 µs | 123 µs |
+| `GET /search` wide | 103 µs | 129 µs | 120 µs |
+| `POST /batch-score` | 106 µs | 122 µs | 126 µs |
+
+The client measures its two servers in a fixed order. A Go-against-Go run read
+1.0x on every endpoint, so the order does not account for the gap.
+
+### zstd
+
+Single core. Pith's pure encoder sits between zstd levels 1 and 3, klauspost
+runs at `SpeedDefault` (about level 3), and ruzstd only implements its fastest
+level, so compare encode speed together with the output size. The `kernel`
+column is libzstd at level 3, which Pith and Rust both bind. MB/s:
+
+| corpus | pith decode | klauspost decode | ruzstd decode | pith encode | klauspost encode | ruzstd encode | libzstd decode / encode |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| prose 292 KB | 253 | 1671 | 372 | 38 | 192 | 105 | 1708 / 329 |
+| source 585 KB | 358 | 2150 | 500 | 51 | 281 | 126 | 2254 / 450 |
+| json 500 KB | 954 | 4923 | 1260 | 78 | 853 | 315 | 5605 / 1674 |
+
+Output size as a share of libzstd level 3: Pith 106-119%, klauspost 99-101%,
+ruzstd 132-147%.
+
+### grpc
+
+`bench/grpc/run.sh`, unary calls against one grpc-go server, median calls per
+second of three runs. The runner uses a fixed client order (see its header).
+
+| payload | concurrency | go (grpc-go) | rust (tonic) | pith |
+|---|---:|---:|---:|---:|
+| 16 B | 1 | 42.8k | 31.4k | 43.3k |
+| 1 KiB | 1 | 42.1k | 32.3k | 41.0k |
+| 16 B | 8 | 83.1k | 61.3k | 99.0k |
+| 1 KiB | 8 | 67.1k | 70.4k | 83.3k |
+
+### where pith stands
+
+Pith matches or beats Go on JSON decoding, the event ledger, the catalog
+workload, map updates with int and bytes keys, histogram metrics, file reads,
+gRPC, and HTTP latency. It trails Rust on most compute rows, often by 2x or
+more. The largest gaps come from four things:
+
+- heap-allocated closures (`closure_calls`, `closure_error`)
+- hash and checksum kernels without SIMD or CPU extensions
+- per-object refcount and allocation cost (`cyclic_graph`, `green_fanout`,
+  `task_churn`, the `labels` metrics paths)
+- the decoder in `json_decode_shapes/list_walk`, about 18x Go
+
 ## event ledger benchmark (json + collections + crypto)
 
 `bench/event_ledger.*` ingests a stream of newline-delimited JSON events,

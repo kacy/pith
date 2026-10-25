@@ -1553,8 +1553,10 @@ fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
             continue; // not the end of its chain
         }
         let mut members = vec![last];
-        while let Some(&j) = prev.get(members.last().unwrap()) {
+        let mut at = last;
+        while let Some(&j) = prev.get(&at) {
             members.push(j);
+            at = j;
         }
         members.reverse();
         let first = members[0];
@@ -1583,7 +1585,7 @@ fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
     let mut moved_after: HashMap<usize, Vec<usize>> = HashMap::new();
     for (members, parts) in &chains {
         let first = members[0];
-        let last = *members.last().unwrap();
+        let last = members[members.len() - 1];
         for &m in &members[..members.len() - 1] {
             dropped[m] = true;
             if let Ok(dst) = parsed[m][1].parse::<usize>() {
@@ -2251,7 +2253,7 @@ fn compile_ir_function(
                 let max = pith_runtime::CONCAT_MANY_MAX;
                 let mut acc: Option<Value> = None;
                 let mut rest = &values[..];
-                while acc.is_none() || !rest.is_empty() {
+                let joined = loop {
                     let room = if acc.is_some() { max - 1 } else { max };
                     let take = rest.len().min(room);
                     let mut group: Vec<Value> = acc.into_iter().collect();
@@ -2268,9 +2270,12 @@ fn compile_ir_function(
                     if let Some(previous) = acc {
                         builder.ins().call(release, &[previous]);
                     }
+                    if rest.is_empty() {
+                        break joined;
+                    }
                     acc = Some(joined);
-                }
-                regs.insert(reg, acc.expect("a concatn makes a string"));
+                };
+                regs.insert(reg, joined);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.insert(reg);

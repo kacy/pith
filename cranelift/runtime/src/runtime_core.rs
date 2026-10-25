@@ -361,7 +361,7 @@ pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
     CSTRING_EMPTY.as_ptr() as *mut i8
 }
 
-const PITH_CLOSURE_ENV_SLOTS: usize = 16;
+pub const PITH_CLOSURE_ENV_SLOTS: usize = 16;
 
 // release-kind tags for captured environment slots, so the closure can
 // drop the counts it took on its captures when it is itself freed. 0
@@ -387,7 +387,7 @@ const CLOSURE_TAG_CHANNEL: u8 = 9;
 // at the front of the allocation, read without a lock. `#[repr(C)]`
 // pins `magic` to offset 0 so a stale or garbage handle is rejected by
 // reading the first four bytes rather than by consulting a global set.
-const CLOSURE_MAGIC: u32 = 0x50434c53; // "PCLS"
+pub const CLOSURE_MAGIC: u32 = 0x50434c53; // "PCLS"
 
 // hard cap on capture slot indices, inline block included. codegen
 // bounds real closures far below this (a few hundred captures at the
@@ -449,6 +449,12 @@ impl EnvSlot {
         }
     }
 }
+
+/// Where codegen's inline read of a capture finds the magic word and the
+/// inline env slots, and the alignment `closure_base` requires of a handle.
+pub const CLOSURE_MAGIC_OFFSET: i32 = std::mem::offset_of!(PithClosure, magic) as i32;
+pub const CLOSURE_ENV_OFFSET: i32 = std::mem::offset_of!(PithClosure, env) as i32;
+pub const CLOSURE_HANDLE_ALIGN: i64 = 8;
 
 #[repr(C)]
 struct PithClosure {

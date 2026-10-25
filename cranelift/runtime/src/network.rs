@@ -202,6 +202,28 @@ fn close_raw(fd: RawFd) {
 // FFI surface
 // ---------------------------------------------------------------------------
 
+/// the accept queue length asked of the kernel. linux and the bsds clamp a
+/// larger value to the system maximum (`net.core.somaxconn`, 4096 on current
+/// linux), so this means "as long as the system allows", which is what go asks
+/// for too.
+const LISTEN_BACKLOG: libc::c_int = 65535;
+
+/// raise a listening socket's accept queue to `LISTEN_BACKLOG`. std's
+/// `TcpListener::bind` listens with a backlog of 128. when more connections
+/// than that arrive in one burst, linux drops the overflow: a client whose
+/// final handshake ack was dropped believes it is connected and sends its
+/// request, which is dropped too, so its first request waits out a 200 ms or
+/// longer retransmit timeout. a load test that opens 1024 connections at once
+/// hit this on every run. calling listen again on a listening socket only
+/// updates its backlog.
+fn widen_backlog(fd: RawFd) {
+    // SAFETY: `fd` is a listening socket this process just created. a failure
+    // leaves the original backlog in place, which still works.
+    unsafe {
+        libc::listen(fd, LISTEN_BACKLOG);
+    }
+}
+
 /// TCP listen — bind and listen on addr:port, return the listener's handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
@@ -219,6 +241,7 @@ pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
         Ok(listener) => {
             use std::os::unix::io::IntoRawFd;
             let fd = listener.into_raw_fd() as i64;
+            widen_backlog(fd as RawFd);
             // green mode: a non-blocking listener lets accept yield instead of
             // parking the worker.
             if is_green() {
@@ -547,5 +570,32 @@ mod tests {
             assert!(pith_dns_resolve(std::ptr::null()).is_null());
             assert!(pith_dns_resolve(invalid.as_ptr() as *const i8).is_null());
         }
+    }
+
+    // a burst of connections larger than std's default backlog of 128 must
+    // all complete their handshakes while nothing is accepting yet. with the
+    // default backlog the kernel drops the SYNs past the queue limit and the
+    // connects below time out.
+    #[test]
+    fn listener_queues_a_burst_past_the_default_backlog() {
+        use std::os::unix::io::AsRawFd;
+        const BURST: usize = 300;
+        let max = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        if max <= BURST {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        widen_backlog(listener.as_raw_fd());
+        let addr = listener.local_addr().unwrap();
+        let clients: Vec<_> = (0..BURST)
+            .map(|i| {
+                std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+                    .unwrap_or_else(|e| panic!("connect {i} of {BURST} failed: {e}"))
+            })
+            .collect();
+        assert_eq!(clients.len(), BURST);
     }
 }

@@ -361,7 +361,7 @@ pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
     CSTRING_EMPTY.as_ptr() as *mut i8
 }
 
-const PITH_CLOSURE_ENV_SLOTS: usize = 16;
+pub const PITH_CLOSURE_ENV_SLOTS: usize = 16;
 
 // release-kind tags for captured environment slots, so the closure can
 // drop the counts it took on its captures when it is itself freed. 0
@@ -387,7 +387,7 @@ const CLOSURE_TAG_CHANNEL: u8 = 9;
 // at the front of the allocation, read without a lock. `#[repr(C)]`
 // pins `magic` to offset 0 so a stale or garbage handle is rejected by
 // reading the first four bytes rather than by consulting a global set.
-const CLOSURE_MAGIC: u32 = 0x50434c53; // "PCLS"
+pub const CLOSURE_MAGIC: u32 = 0x50434c53; // "PCLS"
 
 // hard cap on capture slot indices, inline block included. codegen
 // bounds real closures far below this (a few hundred captures at the
@@ -449,6 +449,12 @@ impl EnvSlot {
         }
     }
 }
+
+/// Where codegen's inline read of a capture finds the magic word and the
+/// inline env slots, and the alignment `closure_base` requires of a handle.
+pub const CLOSURE_MAGIC_OFFSET: i32 = std::mem::offset_of!(PithClosure, magic) as i32;
+pub const CLOSURE_ENV_OFFSET: i32 = std::mem::offset_of!(PithClosure, env) as i32;
+pub const CLOSURE_HANDLE_ALIGN: i64 = 8;
 
 #[repr(C)]
 struct PithClosure {
@@ -515,6 +521,33 @@ impl PithClosure {
             .chain(self.overflow.iter().flat_map(|overflow| {
                 overflow.captures.iter().map(|c| (c.value, c.tag))
             }))
+    }
+
+    /// Drop the count each counted capture holds. This is the release walk
+    /// `captures` describes, written out for the hot path: a closure is
+    /// released once per construction, and walking all sixteen inline slots
+    /// through the chained iterator, with a call per slot, was most of the
+    /// cost of building and dropping a small closure. A slot whose tag is 0
+    /// holds a plain value, and the sixteen tags are read as one word, so a
+    /// closure that captured only plain values skips the walk.
+    fn release_captures(&self) {
+        if u128::from_ne_bytes(self.env_tags) != 0 {
+            for (value, tag) in self.env.iter().zip(self.env_tags.iter()) {
+                if *tag != 0 {
+                    // SAFETY: a nonzero tag marks a slot that holds one count
+                    // on a value of that kind, taken when it was captured.
+                    unsafe { release_captured_value(*value, *tag) };
+                }
+            }
+        }
+        if let Some(overflow) = &self.overflow {
+            for capture in &overflow.captures {
+                if capture.tag != 0 {
+                    // SAFETY: as above, for a spilled slot.
+                    unsafe { release_captured_value(capture.value, capture.tag) };
+                }
+            }
+        }
     }
 
     /// `captures`, but with the slots writable — the cycle env release
@@ -670,14 +703,26 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     // hold it the closure cannot die under the hook, which is what makes
     // marking it safe against a concurrent final release (see
     // `maybe_suspect_struct` for the full argument).
-    if crate::cycle::cycle_gc_enabled()
-        && closure.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 1
-    {
+    let gc = crate::cycle::cycle_gc_enabled();
+    if gc && closure.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 1 {
         maybe_suspect_closure(closure, handle);
     }
-    let prev = closure
-        .ref_count
-        .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    // a count of one is ours alone: no other owner is left to retain or
+    // release concurrently. so the last release of a closure that never
+    // escaped (the common case: built, called, dropped) is a load and a plain
+    // store, not a locked read-modify-write, which would first wait for the
+    // construction's stores to drain. the acquire load pairs with the release
+    // decrements of the owners before us. with the cycle collector on, the
+    // suspect buffer can reach the closure without a count, so it keeps the
+    // locked path.
+    let prev = if !gc && closure.ref_count.load(std::sync::atomic::Ordering::Acquire) == 1 {
+        closure.ref_count.store(0, std::sync::atomic::Ordering::Relaxed);
+        1
+    } else {
+        closure
+            .ref_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Release)
+    };
     if prev > 1 {
         return;
     }
@@ -689,9 +734,7 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
         return;
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
-    for (value, tag) in closure.captures() {
-        release_captured_value(value, tag);
-    }
+    closure.release_captures();
     let buffered = closure
         .cycle_flags
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -2273,6 +2316,30 @@ pub extern "C" fn pith_bit_shl(a: i64, b: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn pith_bit_shr(a: i64, b: i64) -> i64 {
     ((a as u64) >> b) as i64
+}
+
+// the rotates work on the low 32 or all 64 bits of `a`, with the amount taken
+// mod the width; a 32-bit result is zero-extended. codegen lowers calls to
+// these to one rotate instruction, and these are the fallback with the same
+// result.
+#[no_mangle]
+pub extern "C" fn pith_bit_rotl32(a: i64, b: i64) -> i64 {
+    (a as u32).rotate_left(b as u32 & 31) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn pith_bit_rotr32(a: i64, b: i64) -> i64 {
+    (a as u32).rotate_right(b as u32 & 31) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn pith_bit_rotl64(a: i64, b: i64) -> i64 {
+    (a as u64).rotate_left(b as u32 & 63) as i64
+}
+
+#[no_mangle]
+pub extern "C" fn pith_bit_rotr64(a: i64, b: i64) -> i64 {
+    (a as u64).rotate_right(b as u32 & 63) as i64
 }
 
 #[no_mangle]

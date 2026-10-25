@@ -229,16 +229,16 @@ fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
             sha_load_words32(w, input, block)
         else:
             sha_load_words32_tail(w, tail, block - full)
-        # a 32-bit rotate right by k is spelled band(bor(shr(x, k), shl(x,
-        # 32 - k)), 2^32 - 1): the two-argument bits.* forms lower to single
-        # instructions, where bits.rotr32 and mask32 are calls. the sums are
-        # masked once at the end, which is the same value modulo 2^32.
+        # bits.rotr32 and the two-argument bits.* forms each lower to one
+        # instruction. every word is below 2^32, so the rotates need no mask;
+        # the sums are masked once at the end, which is the same value
+        # modulo 2^32.
         mut i := 16
         while i < 64:
             x := w[i - 15]
-            s0 := bits.band(bits.xor(bits.xor(bits.bor(bits.shr(x, 7), bits.shl(x, 25)), bits.bor(bits.shr(x, 18), bits.shl(x, 14))), bits.shr(x, 3)), 4294967295)
+            s0 := bits.xor(bits.xor(bits.rotr32(x, 7), bits.rotr32(x, 18)), bits.shr(x, 3))
             y := w[i - 2]
-            s1 := bits.band(bits.xor(bits.xor(bits.bor(bits.shr(y, 17), bits.shl(y, 15)), bits.bor(bits.shr(y, 19), bits.shl(y, 13))), bits.shr(y, 10)), 4294967295)
+            s1 := bits.xor(bits.xor(bits.rotr32(y, 17), bits.rotr32(y, 19)), bits.shr(y, 10))
             w[i] = bits.band(w[i - 16] + s0 + w[i - 7] + s1, 4294967295)
             i = i + 1
 
@@ -253,10 +253,10 @@ fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
 
         i = 0
         while i < 64:
-            s1 := bits.band(bits.xor(bits.xor(bits.bor(bits.shr(e, 6), bits.shl(e, 26)), bits.bor(bits.shr(e, 11), bits.shl(e, 21))), bits.bor(bits.shr(e, 25), bits.shl(e, 7))), 4294967295)
+            s1 := bits.xor(bits.xor(bits.rotr32(e, 6), bits.rotr32(e, 11)), bits.rotr32(e, 25))
             ch := bits.xor(bits.band(e, f), bits.band(bits.xor(e, 4294967295), g))
             temp1 := bits.band(h + s1 + ch + sha256_round_constants[i] + w[i], 4294967295)
-            s0 := bits.band(bits.xor(bits.xor(bits.bor(bits.shr(a, 2), bits.shl(a, 30)), bits.bor(bits.shr(a, 13), bits.shl(a, 19))), bits.bor(bits.shr(a, 22), bits.shl(a, 10))), 4294967295)
+            s0 := bits.xor(bits.xor(bits.rotr32(a, 2), bits.rotr32(a, 13)), bits.rotr32(a, 22))
             maj := bits.xor(bits.xor(bits.band(a, b), bits.band(a, c)), bits.band(b, c))
             temp2 := bits.band(s0 + maj, 4294967295)
             h = g
@@ -309,16 +309,16 @@ fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
             sha_load_words64(w, input, block)
         else:
             sha_load_words64_tail(w, tail, block - full)
-        # a 64-bit rotate right by k is spelled bor(shr(x, k), shl(x, 64 -
-        # k)), for the reason given in sha2_32; bits.shr is a logical shift,
-        # so it is right on the negative half of the range too. Int addition
-        # wraps at 64 bits, which is what bits.add64 relied on as well.
+        # bits.rotr64 lowers to one instruction, as bits.rotr32 does in
+        # sha2_32. bits.shr is a logical shift, so it is right on the
+        # negative half of the range too. Int addition wraps at 64 bits,
+        # which is what bits.add64 relied on as well.
         mut i := 16
         while i < 80:
             x := w[i - 15]
-            s0 := bits.xor(bits.xor(bits.bor(bits.shr(x, 1), bits.shl(x, 63)), bits.bor(bits.shr(x, 8), bits.shl(x, 56))), bits.shr(x, 7))
+            s0 := bits.xor(bits.xor(bits.rotr64(x, 1), bits.rotr64(x, 8)), bits.shr(x, 7))
             y := w[i - 2]
-            s1 := bits.xor(bits.xor(bits.bor(bits.shr(y, 19), bits.shl(y, 45)), bits.bor(bits.shr(y, 61), bits.shl(y, 3))), bits.shr(y, 6))
+            s1 := bits.xor(bits.xor(bits.rotr64(y, 19), bits.rotr64(y, 61)), bits.shr(y, 6))
             w[i] = w[i - 16] + s0 + w[i - 7] + s1
             i = i + 1
 
@@ -333,10 +333,10 @@ fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
 
         i = 0
         while i < 80:
-            s1 := bits.xor(bits.xor(bits.bor(bits.shr(e, 14), bits.shl(e, 50)), bits.bor(bits.shr(e, 18), bits.shl(e, 46))), bits.bor(bits.shr(e, 41), bits.shl(e, 23)))
+            s1 := bits.xor(bits.xor(bits.rotr64(e, 14), bits.rotr64(e, 18)), bits.rotr64(e, 41))
             ch := bits.xor(bits.band(e, f), bits.band(bits.xor(e, -1), g))
             temp1 := h + s1 + ch + sha512_round_constants[i] + w[i]
-            s0 := bits.xor(bits.xor(bits.bor(bits.shr(a, 28), bits.shl(a, 36)), bits.bor(bits.shr(a, 34), bits.shl(a, 30))), bits.bor(bits.shr(a, 39), bits.shl(a, 25)))
+            s0 := bits.xor(bits.xor(bits.rotr64(a, 28), bits.rotr64(a, 34)), bits.rotr64(a, 39))
             maj := bits.xor(bits.xor(bits.band(a, b), bits.band(a, c)), bits.band(b, c))
             temp2 := s0 + maj
             h = g
@@ -684,9 +684,6 @@ K1 := 1859775393
 K2 := 2400959708
 K3 := 3395469782
 
-fn rotl32(x: Int, n: Int) -> Int:
-    return bits.rotl32(x, n)
-
 fn add32(a: Int, b: Int) -> Int:
     return bits.mask32(a + b)
 
@@ -714,12 +711,11 @@ pub fn sha1(input: Bytes) -> String:
         else:
             sha_load_words32_tail(w, tail, block - full)
 
-        # a 32-bit rotate left by k is spelled band(bor(shl(x, k), shr(x,
-        # 32 - k)), 2^32 - 1), for the reason given in sha2_32.
+        # bits.rotl32 lowers to one instruction, as in sha2_32.
         mut i := 16
         while i < 80:
             x := bits.xor(bits.xor(bits.xor(w[i - 3], w[i - 8]), w[i - 14]), w[i - 16])
-            w[i] = bits.band(bits.bor(bits.shl(x, 1), bits.shr(x, 31)), 4294967295)
+            w[i] = bits.rotl32(x, 1)
             i = i + 1
 
         mut a := h0
@@ -746,10 +742,10 @@ pub fn sha1(input: Bytes) -> String:
                 f = bits.xor(bits.xor(b, c), d)
                 k = K3
 
-            temp := bits.band(bits.band(bits.bor(bits.shl(a, 5), bits.shr(a, 27)), 4294967295) + f + e + k + w[i], 4294967295)
+            temp := bits.band(bits.rotl32(a, 5) + f + e + k + w[i], 4294967295)
             e = d
             d = c
-            c = bits.band(bits.bor(bits.shl(b, 30), bits.shr(b, 2)), 4294967295)
+            c = bits.rotl32(b, 30)
             b = a
             a = temp
             i = i + 1
@@ -804,7 +800,7 @@ fn sha1_reference(input: Bytes) -> String:
 
         i = 16
         while i < 80:
-            w.push(rotl32(bits.xor(bits.xor(bits.xor(w[i - 3], w[i - 8]), w[i - 14]), w[i - 16]), 1))
+            w.push(bits.rotl32(bits.xor(bits.xor(bits.xor(w[i - 3], w[i - 8]), w[i - 14]), w[i - 16]), 1))
             i = i + 1
 
         mut a := h0
@@ -831,10 +827,10 @@ fn sha1_reference(input: Bytes) -> String:
                 f = bits.xor(bits.xor(b, c), d)
                 k = K3
 
-            temp := add32(add32(add32(add32(rotl32(a, 5), f), e), k), w[i])
+            temp := add32(add32(add32(add32(bits.rotl32(a, 5), f), e), k), w[i])
             e = d
             d = c
-            c = rotl32(b, 30)
+            c = bits.rotl32(b, 30)
             b = a
             a = temp
             i = i + 1

@@ -54,33 +54,23 @@ pub fn add32(left: Int, right: Int) -> Int:
 pub fn add64(left: Int, right: Int) -> Int:
     return mask64(left + right)
 
-# rotate a 32-bit value left.
+# rotate the low 32 bits of a value left, with the amount taken mod 32. the
+# result is below 2^32. each rotate is a one-line wrapper, so a call to it
+# compiles to one rotate instruction.
 pub fn rotl32(value: Int, amount: Int) -> Int:
-    n := amount % 32
-    if n == 0:
-        return mask32(value)
-    return mask32(bit_or(bit_shl(value, n), bit_shr(value, 32 - n)))
+    return bit_rotl32(value, amount)
 
-# rotate a 32-bit value right.
+# rotate the low 32 bits of a value right, with the amount taken mod 32.
 pub fn rotr32(value: Int, amount: Int) -> Int:
-    n := amount % 32
-    if n == 0:
-        return mask32(value)
-    return mask32(bit_or(bit_shr(value, n), bit_shl(value, 32 - n)))
+    return bit_rotr32(value, amount)
 
-# rotate a 64-bit value left.
+# rotate a 64-bit value left, with the amount taken mod 64.
 pub fn rotl64(value: Int, amount: Int) -> Int:
-    n := amount % 64
-    if n == 0:
-        return mask64(value)
-    return mask64(bit_or(bit_shl(value, n), bit_shr(value, 64 - n)))
+    return bit_rotl64(value, amount)
 
-# rotate a 64-bit value right.
+# rotate a 64-bit value right, with the amount taken mod 64.
 pub fn rotr64(value: Int, amount: Int) -> Int:
-    n := amount % 64
-    if n == 0:
-        return mask64(value)
-    return mask64(bit_or(bit_shr(value, n), bit_shl(value, 64 - n)))
+    return bit_rotr64(value, amount)
 
 test "bit helpers wrap the bit builtins":
     assert_eq(band(6, 3), 2)
@@ -105,6 +95,11 @@ test "rotations stay inside 32 bits":
     assert_eq(rotl32(1, 8), 256)
     assert_eq(rotr32(256, 8), 1)
     assert_eq(rotl32(5, 0), 5)
+    assert_eq(rotr32(1, 1), 2147483648)
+    assert_eq(rotl32(2147483648, 1), 1)
+    assert_eq(rotr32(1, 33), 2147483648)
+    assert_eq(rotl32(305419896, 36), 591751041)
+    assert_eq(rotr32(4294967295, 7), 4294967295)
 
 test "rotations stay inside 64 bits":
     assert_eq(rotl64(1, 8), 256)
@@ -112,6 +107,8 @@ test "rotations stay inside 64 bits":
     assert_eq(UInt64(rotl64(1, 63)).to_string(), "9223372036854775808")
     assert_eq(UInt64(rotr64(1, 1)).to_string(), "9223372036854775808")
     assert_eq(UInt64(rotl64(-1, 17)).to_string(), "18446744073709551615")
+    assert_eq(rotl64(1, 64), 1)
+    assert_eq(rotr64(2, 65), 1)
 
 test "fixed width integer constructors wrap values":
     assert_eq(UInt8(257).to_string(), "1")

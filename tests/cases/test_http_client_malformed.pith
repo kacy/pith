@@ -1,0 +1,95 @@
+# http.Client refuses malformed responses instead of guessing at them. a raw
+# tcp server writes each response byte for byte and closes; the client
+# reports what was wrong with it.
+
+import std.net.http as http
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn read_head(fd: Int) -> String:
+    mut seen := ""
+    while seen.index_of("\r\n\r\n") < 0:
+        chunk := tcp_read(fd, 4096) catch ""
+        if chunk == "":
+            return ""
+        seen = seen + chunk
+    return seen
+
+fn big_header() -> String:
+    mut value := "x"
+    while value.len() < 1100000:
+        value = value + value
+    return "HTTP/1.1 200 OK\r\nX-Big: " + value + "\r\nContent-Length: 0\r\n\r\n"
+
+fn canned(path: String) -> String:
+    if path == "/bad-status-line":
+        return "HTTP/1.1 OK 200\r\nContent-Length: 0\r\n\r\n"
+    if path == "/not-http":
+        return "SSH-2.0-OpenSSH_9.6\r\n\r\n"
+    if path == "/version":
+        return "HTTP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n"
+    if path == "/conflicting-length":
+        return "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 7\r\n\r\nhello"
+    if path == "/te-and-cl":
+        return "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+    if path == "/unknown-coding":
+        return "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nxxxx"
+    if path == "/bad-length":
+        return "HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\nhello"
+    if path == "/short-body":
+        return "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nonly this much"
+    if path == "/bad-chunk":
+        return "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n"
+    if path == "/truncated-chunks":
+        return "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel"
+    if path == "/no-colon":
+        return "HTTP/1.1 200 OK\r\nNot a header\r\nContent-Length: 0\r\n\r\n"
+    if path == "/folded":
+        return "HTTP/1.1 200 OK\r\nX-A: one\r\n two\r\nContent-Length: 0\r\n\r\n"
+    if path == "/bare-cr":
+        return "HTTP/1.1 200 OK\r\nX-A: one\rtwo\r\nContent-Length: 0\r\n\r\n"
+    if path == "/head-cut":
+        return "HTTP/1.1 200 OK\r\nContent-Le"
+    if path == "/huge-head":
+        return big_header()
+    if path == "/nothing":
+        return ""
+    return "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+
+fn raw_conn(fd: Int) -> Int:
+    head := read_head(fd)
+    if head != "":
+        parts := head.split(" ")
+        if parts.len() > 1:
+            tcp_write(fd, canned(parts[1])) catch 0
+    tcp_close(fd)
+    return 0
+
+fn raw_loop(listener: Int) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn raw_conn(fd)
+    return 0
+
+fn main() -> String!:
+    port := choose_port(21900)!
+    listener := tcp_listen("127.0.0.1", port)!
+    spawn raw_loop(listener)
+    c := http.client()
+    for path in ["/bad-status-line", "/not-http", "/version", "/conflicting-length", "/te-and-cl", "/unknown-coding", "/bad-length", "/short-body", "/bad-chunk", "/truncated-chunks", "/no-colon", "/folded", "/bare-cr", "/head-cut", "/huge-head", "/nothing"]:
+        resp := c.get("http://127.0.0.1:{port}{path}")
+        if resp.is_err:
+            print("{path}: {resp.err}")
+        else:
+            print("{path}: accepted, status {resp.ok.status}")
+    print("idle connections after all that: {c.idle_connections()}")
+    return ""

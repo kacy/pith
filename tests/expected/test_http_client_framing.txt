@@ -1,0 +1,19 @@
+chunked: 200 [hello, world] trailer X-Checksum=abc123
+until close: 200 [read until the server closed]
+http/1.0 with a length: 200 [old ok]
+103 before the final response: 200 [final]
+HEAD with a Content-Length: 200, body 0 bytes, Content-Length 1234
+a GET on the same connection after HEAD: 200 [hello, world]
+204: 204 []
+304: 304, body 0 bytes, ETag "v1"
+HEAD from the std server: 200 []
+gzip: [decoded from gzip] Content-Encoding []
+gzip with compression off: 200 [plain, since gzip was not asked for]
+POST with a body: 200 [POST host=127.0.0.1:<port> te= len=5 body=hello]
+POST without a body: 200 [POST host=127.0.0.1:<port> te= len=0 body=]
+GET without a body: 200 [GET host=127.0.0.1:<port> te= len= body=]
+chunked request body: 200 [PUT host=127.0.0.1:<port> te=chunked len= body=in chunks]
+a Host the request names: 200 [GET host=example.test te= len= body=]
+expect 100-continue, std server: 200 [POST host=127.0.0.1:<port> te= len=14 body=after continue], before the 1 s wait ran out: true
+expect 100-continue, server answers 417 first: 417 [nope]
+expect 100-continue, no 100 from the server: 200 [sent anyway], waited at least 100 ms: true

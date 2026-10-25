@@ -619,3 +619,144 @@ req := http.post_request("example.com", 80, "/items") \
     .bearer("token") \
     .json_body(payload)
 ```
+
+## the pooled client
+
+`http.client()` returns an `http.Client`, the counterpart of net/http's
+`Client` and `Transport`. the request helpers above open one connection per
+request; a `Client` keeps connections open and reuses them.
+
+```pith
+c := http.client()
+    .with_timeout(5000)
+    .with_response_header_timeout(2000)
+    .with_max_idle_conns_per_host(4)
+
+resp := c.get("http://127.0.0.1:8080/health")!
+created := c.send(http.new_request("POST", "http://127.0.0.1:8080/items")!.json_body(payload))!
+```
+
+`http.new_request(method, url)` builds a `ClientRequest` from an absolute
+`http://` or `https://` url. every builder method on `ClientRequest` works on
+it. `Client` has `send`, `send_into`, `send_to_file`, `get`, `head` and
+`post`.
+
+### settings
+
+each `with_*` method returns a new `Client` that shares the idle connections
+of the one it came from.
+
+| method | default | what it does |
+| --- | --- | --- |
+| `with_timeout(ms)` | 0 (none) | limit on the whole request, redirects and body included |
+| `with_dial_timeout(ms)` | 0 (none) | limit on one connect |
+| `with_response_header_timeout(ms)` | 0 (none) | limit on the wait for the response head after the request is written |
+| `with_max_idle_conns_per_host(n)` | 2 | idle connections kept per origin |
+| `with_idle_conn_timeout(ms)` | 90000 | how long an idle connection is kept |
+| `with_max_redirects(n)` | 10 | redirects followed before the request fails; 0 returns the redirect |
+| `with_keep_alives(on)` | true | false sends `Connection: close` and reuses nothing |
+| `with_compression(on)` | true | ask for gzip and decode it |
+| `with_expect_continue_timeout(ms)` | 1000 | wait for `100 Continue` before sending the body |
+| `with_proxy(url)` | none | send every request through this http proxy |
+| `with_env_proxy(on)` | false | take the proxy from `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` |
+| `with_tls_config(config)` | default roots | tls config for https origins; the caller closes it |
+
+a request's own `with_timeout(ms)` replaces the client's `timeout_ms` for
+that request. a timeout fails with `http: client timeout exceeded`, or with
+`http: timeout awaiting response headers` when the header timeout ran out
+first. the timeouts are deadlines on the socket, so a server that sends one
+byte at a time still runs out of time.
+
+the runtime's connect has no deadline of its own. with a dial timeout, the
+connect runs in a separate task and the client stops waiting for it when the
+timeout passes. if the connect completes later, that task closes the
+connection.
+
+### connection reuse
+
+a connection goes back to the pool once its response body has been read,
+unless either side asked to close it or the body ran to the end of the
+connection. before an idle connection is reused, the client checks that it
+has not idled past `idle_conn_timeout_ms` and that nothing is waiting to be
+read on it. if bytes are waiting, the server has closed the connection, and
+the client dials a new one.
+
+the server can still close a connection just as a request goes out on it. if
+that happens before any of the response arrives, the request is sent once
+more on a new connection when it is safe to replay: `GET`, `HEAD`, `OPTIONS`
+and `TRACE`, or any request that carries an `Idempotency-Key` or
+`X-Idempotency-Key` header, as in net/http.
+
+`close_idle_connections()` closes every idle connection, and
+`idle_connections()` counts them.
+
+### responses
+
+the client checks the response head as strictly as the server checks a
+request: a malformed status line, a malformed header field, conflicting
+`Content-Length` values, `Transfer-Encoding` together with `Content-Length`,
+and transfer codings other than `chunked` all fail the request. the body is
+framed as rfc 9112 6.3 describes. the answers to `HEAD` and the `1xx`, `204`
+and `304` responses have no body. otherwise the body is chunked, has a
+`Content-Length`, or runs until the server closes the connection. interim
+`1xx` responses before the final one are skipped. trailer fields of a chunked
+body are returned in the response's `trailers`.
+
+when compression is on, a request that names no `Accept-Encoding` asks for
+gzip, and a gzip body is decoded before it is returned. the decoded response
+has no `Content-Encoding` or `Content-Length`. streamed bodies (`send_into`,
+`send_to_file`), `HEAD` requests and requests with a `Range` header are not
+compressed.
+
+### redirects
+
+the client follows `301`, `302`, `303`, `307` and `308` as net/http does.
+`307` and `308` resend the method and the body. `301`, `302` and `303` turn
+any method other than `GET` and `HEAD` into `GET` and drop the body. a
+relative `Location` is resolved against the current url. a redirect to
+another scheme, host or port drops `Authorization` and `Cookie`. net/http
+keeps them when only the port changes, or when the new host is a subdomain
+of the old one. a redirect without a `Location` is returned as the response.
+past `max_redirects`, the request fails with
+`http: stopped after 10 redirects`.
+
+### request bodies
+
+a body goes out with a `Content-Length`. a `POST`, `PUT` or `PATCH` with an
+empty body sends `Content-Length: 0`; other methods with no body send no
+length. naming `Transfer-Encoding: chunked` on the request sends the body
+chunked instead.
+
+`req.expect_continue()` adds `Expect: 100-continue`. the client then sends
+the head, waits up to `expect_continue_timeout_ms` for `100 Continue`, and
+then sends the body. if the server answers with a final status first, that
+answer is returned, the body is never sent, and the connection is closed.
+
+### proxies
+
+`with_proxy("http://proxy:3128")` sends every request through that proxy.
+a plain http request goes to the proxy with the full url as its target. an
+https request opens a `CONNECT` tunnel through the proxy, and tls to the
+origin runs inside the tunnel. only plain http proxies are supported, and
+the client does not send `Proxy-Authorization`.
+
+`with_env_proxy(true)` reads `HTTP_PROXY` for http urls and `HTTPS_PROXY`
+for https urls (or their lowercase forms) on each request, with net/http's
+rules for `NO_PROXY`:
+
+- `localhost` and loopback addresses always go direct.
+- `*` sends everything direct.
+- `example.com` matches that host and its subdomains, and `.example.com`
+  matches only its subdomains.
+- an entry with a port, such as `example.com:8080`, matches only that port.
+
+cidr ranges in `NO_PROXY` are not supported.
+
+### not covered
+
+compared with net/http, the client has no cookie jar, no http/2, no
+`CheckRedirect` hook, no limit on connections per host beyond the idle limit,
+no `Proxy-Authorization`, no socks or https proxies, and no streaming of a
+gzip body. a response body is read in full before `send` returns, or written
+in full to the writer for `send_into`, so the client has no body stream that
+the caller closes.

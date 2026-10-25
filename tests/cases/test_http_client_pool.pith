@@ -1,0 +1,207 @@
+# http.Client keeps connections alive and reuses them per origin. each case
+# counts the connections its server accepted, so reuse shows up as a count
+# rather than as timing.
+#
+# the servers are the repo's own http/1.1 server, or a raw tcp listener for
+# the cases where the server must misbehave on purpose: close an idle
+# connection, or read a request and close without answering it.
+
+import std.net.http as http
+import std.bytes as bytes
+
+# how many connections a server accepted, shared with its accept loop.
+struct Count:
+    mut n: Int
+    mu: Mutex
+
+fn bump(count: Count):
+    count.mu.lock()
+    count.n = count.n + 1
+    count.mu.unlock()
+
+fn accepted(count: Count) -> Int:
+    count.mu.lock()
+    n := count.n
+    count.mu.unlock()
+    return n
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "?"
+    if path == "/close":
+        return http.text(200, "closing").close_connection()
+    return http.text(200, "hello " + path)
+
+fn serve_one_conn(fd: Int) -> Int:
+    return http.serve_connection_fd(fd, route) catch 0
+
+fn http_accept_loop(listener: Int, count: Count) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            bump(count)
+            spawn serve_one_conn(fd)
+    return 0
+
+fn start_http(start: Int, count: Count) -> Int!:
+    port := choose_port(start)!
+    listener := tcp_listen("127.0.0.1", port)!
+    spawn http_accept_loop(listener, count)
+    return port
+
+# read one request head off `fd`, or "" when the peer closed first.
+fn read_head(fd: Int) -> String:
+    mut seen := ""
+    while seen.index_of("\r\n\r\n") < 0:
+        chunk := tcp_read(fd, 4096) catch ""
+        if chunk == "":
+            return ""
+        seen = seen + chunk
+    return seen
+
+KEEP_ALIVE_OK := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+
+# answers one request per connection with a keep-alive response, then closes
+# the connection at once, as a server whose idle timeout is zero would.
+fn closing_server(listener: Int, count: Count) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            bump(count)
+            if read_head(fd) != "":
+                tcp_write(fd, KEEP_ALIVE_OK) catch 0
+            tcp_close(fd)
+    return 0
+
+# answers the first request on a connection, reads the second, and closes
+# without answering it: the race of a server closing an idle connection just
+# as the client reuses it.
+fn racing_server(listener: Int, count: Count) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            bump(count)
+            if read_head(fd) != "":
+                tcp_write(fd, KEEP_ALIVE_OK) catch 0
+                read_head(fd)
+            tcp_close(fd)
+    return 0
+
+fn start_raw(start: Int, count: Count, racing: Bool) -> Int!:
+    port := choose_port(start)!
+    listener := tcp_listen("127.0.0.1", port)!
+    if racing:
+        spawn racing_server(listener, count)
+    else:
+        spawn closing_server(listener, count)
+    return port
+
+fn url(port: Int, path: String) -> String:
+    return "http://127.0.0.1:{port}{path}"
+
+fn get_text(c: http.Client, port: Int, path: String) -> String:
+    resp := c.get(url(port, path))
+    if resp.is_err:
+        return "error: " + resp.err
+    return "{resp.ok.status} " + (resp.ok.body_text() catch "?")
+
+fn reuse_case() -> Int!:
+    count := Count(0, Mutex())
+    port := start_http(21100, count)!
+    c := http.client()
+    a := get_text(c, port, "/a")
+    b := get_text(c, port, "/b")
+    d := get_text(c, port, "/c")
+    print("keep-alive: {a} | {b} | {d}; accepted {accepted(count)}, idle {c.idle_connections()}")
+    c.close_idle_connections()
+    print("after close_idle_connections: idle {c.idle_connections()}")
+    return 0
+
+fn no_keep_alive_case() -> Int!:
+    count := Count(0, Mutex())
+    port := start_http(21100, count)!
+    c := http.client().with_keep_alives(false)
+    get_text(c, port, "/a")
+    get_text(c, port, "/b")
+    get_text(c, port, "/c")
+    print("keep_alives off: accepted {accepted(count)}, idle {c.idle_connections()}")
+    return 0
+
+fn server_close_case() -> Int!:
+    count := Count(0, Mutex())
+    port := start_http(21100, count)!
+    c := http.client()
+    a := get_text(c, port, "/close")
+    b := get_text(c, port, "/close")
+    print("Connection: close from the server: {a} | {b}; accepted {accepted(count)}, idle {c.idle_connections()}")
+    return 0
+
+fn idle_limit_case() -> Int!:
+    count := Count(0, Mutex())
+    port := start_http(21100, count)!
+    c := http.client().with_max_idle_conns_per_host(0)
+    get_text(c, port, "/a")
+    get_text(c, port, "/b")
+    print("max_idle_conns_per_host 0: accepted {accepted(count)}, idle {c.idle_connections()}")
+    return 0
+
+fn idle_timeout_case() -> Int!:
+    count := Count(0, Mutex())
+    port := start_http(21100, count)!
+    c := http.client().with_idle_conn_timeout(50)
+    get_text(c, port, "/a")
+    sleep(150)
+    b := get_text(c, port, "/b")
+    print("idle_conn_timeout 50 ms, 150 ms idle: {b}; accepted {accepted(count)}")
+    return 0
+
+fn stale_case() -> Int!:
+    count := Count(0, Mutex())
+    port := start_raw(21100, count, false)!
+    c := http.client()
+    a := get_text(c, port, "/a")
+    # give the server's close time to arrive, so the pooled connection is
+    # readable (at end of stream) when the next request looks at it
+    sleep(100)
+    b := get_text(c, port, "/b")
+    print("idle connection closed by the server: {a} | {b}; accepted {accepted(count)}")
+    return 0
+
+fn retry_case() -> Int!:
+    count := Count(0, Mutex())
+    port := start_raw(21100, count, true)!
+    c := http.client()
+    a := get_text(c, port, "/a")
+    b := get_text(c, port, "/b")
+    print("GET on a connection closed mid-request: {a} | {b}; accepted {accepted(count)}")
+    post := c.post(url(port, "/p"), "text/plain", bytes.from_string_utf8("x"))
+    mut post_text := "ok"
+    if post.is_err:
+        post_text = "error: " + post.err
+    print("POST on a connection closed mid-request: {post_text}; accepted {accepted(count)}")
+    get_text(c, port, "/c")
+    keyed := c.send(http.new_request("POST", url(port, "/p"))!.header("Idempotency-Key", "k1").body_text("x"))
+    mut keyed_text := "error"
+    if keyed.is_ok:
+        keyed_text = "{keyed.ok.status}"
+    print("POST with an Idempotency-Key: {keyed_text}; accepted {accepted(count)}")
+    return 0
+
+fn main() -> String!:
+    reuse_case()!
+    no_keep_alive_case()!
+    server_close_case()!
+    idle_limit_case()!
+    idle_timeout_case()!
+    stale_case()!
+    retry_case()!
+    return ""

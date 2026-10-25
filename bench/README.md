@@ -49,68 +49,79 @@ TRIALS=3 bench/compare.sh map_update json_decode_shapes
 
 Setup: Ryzen 9 9950X, every run pinned to one CCD (cpus 0-7,16-23), 16 workers
 (`PITH_GREEN_WORKERS`, `GOMAXPROCS`, tokio worker threads), Go 1.27.3,
-Rust 1.99.1, Pith at `64245d29`. Times are the median wall time of 5
+Rust 1.99.1, Pith at `3a9aacf2` (Cranelift 0.130). Times are the median wall time of 5
 interleaved rounds, process start included.
+
+The first run of this suite, at `64245d29`, led to #1194 to #1201. Against
+that run: `substring_search` went from 1046 to 40 ms and is now faster than
+both ports, `closure_calls` from 1097 to 275, `cpu_parallel_sync` from 1820 to
+904, `crc32` from 490 to 288, `csv_encode` from 708 to 547, `closure_error`
+from 602 to 472 and `tight_loop` from 747 to 602. Most other rows are 3 to 8
+percent faster. The HTTP, catalog, zstd and gRPC tables below are from the
+first run.
 
 ### compute and std
 
 | benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---|---:|---:|---:|---:|---:|
-| event_ledger | `200000` | 77 | 97 | 51 | 0.80x | 1.51x |
-| std_pipeline | `50000` | 101 | 78 | 56 | 1.29x | 1.79x |
-| catalog_workload | `4000` | 3.1 | 3.4 | 2.1 | 0.91x | 1.48x |
-| closure_error | `2000000` | 602 | 183 | 164 | 3.30x | 3.67x |
-| tight_loop | `2000000000` | 747 | 354 | 1 | 2.11x | (a) |
-| closure_calls | `50000000` | 1097 | 72 | 26 | 15.2x | 42.2x |
-| substring_search | `20000` | 1046 | 220 | 208 | 4.75x | 5.04x |
-| substring_search/absent | `500 long-absent` | 12 | 4.0 | 3.4 | 3.00x | 3.53x |
-| string_buffer/build | `current build 100000 200 200` | 731 | 1698 | 265 | 0.43x | 2.76x |
-| string_buffer/snapshot | `current snapshot 10000 200 200` | 332 | 193 | 289 | 1.72x | 1.15x |
-| cyclic_graph | `10000000` | 468 | 125 | 146 | 3.74x | 3.20x |
-| cyclic_graph_strong | `10000000` | 1176 | 124 | 286 | 9.50x | 4.11x |
-| csv_encode | `5000 400` | 708 | 307 | 129 | 2.31x | 5.48x |
-| json_decode_shapes/small | `small 4 20000000` | 867 | 3504 | 1126 | 0.25x | 0.77x |
-| json_decode_shapes/wide | `wide 32 3000000` | 783 | 3192 | 1511 | 0.25x | 0.52x |
-| json_decode_shapes/nested | `nested 4 8000000` | 884 | 2201 | 788 | 0.40x | 1.12x |
-| json_decode_shapes/list | `list 32 400000` | 977 | 2079 | 913 | 0.47x | 1.07x |
-| json_decode_shapes/list_walk | `list_walk 32 5000` | 921 | 50 | 28 | 18.3x | 32.9x |
-| json_decode_shapes/map | `map 32 300000` | 843 | 1038 | 569 | 0.81x | 1.48x |
-| json_decode_shapes/float | `float 4 12000000` | 854 | 3522 | 966 | 0.24x | 0.88x |
-| path_clean_count | `2000000` | 868 | 747 | 179 | 1.16x | 4.86x |
-| map_update/string | `string 50000000 64` | 1005 | 494 | 471 | 2.03x | 2.13x |
-| map_update/bytes | `bytes 50000000 64` | 880 | 1259 | 487 | 0.70x | 1.81x |
-| map_update/int | `int 100000000 64` | 600 | 682 | 713 | 0.88x | 0.84x |
-| generic_sort/int | `current random int 100000 30` | 469 | 506 | 59 | 0.93x | 7.93x |
-| generic_sort/string | `current random string 100000 30` | 819 | 652 | 320 | 1.26x | 2.56x |
-| http_head_read | `1000000` | 811 | 494 | 115 | 1.64x | 7.07x |
+| event_ledger | `200000` | 73 | 96 | 51 | 0.76x | 1.45x |
+| std_pipeline | `50000` | 95 | 78 | 55 | 1.21x | 1.71x |
+| catalog_workload | `4000` | 3.1 | 3.6 | 2.1 | 0.86x | 1.48x |
+| closure_error | `2000000` | 472 | 182 | 162 | 2.59x | 2.92x |
+| tight_loop | `2000000000` | 602 | 355 | 1.4 | 1.69x | (a) |
+| closure_calls | `50000000` | 275 | 72 | 26 | 3.80x | 10.6x |
+| substring_search | `20000` | 40 | 221 | 207 | 0.18x | 0.20x |
+| substring_search/absent | `500 long-absent` | 1.9 | 4.0 | 3.3 | 0.47x | 0.58x |
+| string_buffer/build | `current build 100000 200 200` | 669 | 1679 | 263 | 0.40x | 2.55x |
+| string_buffer/snapshot | `current snapshot 10000 200 200` | 329 | 197 | 288 | 1.67x | 1.14x |
+| cyclic_graph | `10000000` | 464 | 124 | 146 | 3.74x | 3.18x |
+| cyclic_graph_strong | `10000000` | 1174 | 124 | 281 | 9.45x | 4.18x |
+| csv_encode | `5000 400` | 547 | 306 | 129 | 1.79x | 4.23x |
+| json_decode_shapes/small | `small 4 20000000` | 866 | 3498 | 1134 | 0.25x | 0.76x |
+| json_decode_shapes/wide | `wide 32 3000000` | 784 | 3172 | 1514 | 0.25x | 0.52x |
+| json_decode_shapes/nested | `nested 4 8000000` | 889 | 2214 | 801 | 0.40x | 1.11x |
+| json_decode_shapes/list | `list 32 400000` | 930 | 2078 | 926 | 0.45x | 1.01x |
+| json_decode_shapes/list_walk | `list_walk 32 5000` | 929 | 50 | 28 | 18.5x | 32.9x |
+| json_decode_shapes/map | `map 32 300000` | 845 | 1144 | 572 | 0.74x | 1.48x |
+| json_decode_shapes/float | `float 4 12000000` | 842 | 3537 | 972 | 0.24x | 0.87x |
+| path_clean_count | `2000000` | 810 | 740 | 180 | 1.09x | 4.51x |
+| map_update/string | `string 50000000 64` | 1004 | 510 | 470 | 1.97x | 2.14x |
+| map_update/bytes | `bytes 50000000 64` | 893 | 1261 | 488 | 0.71x | 1.83x |
+| map_update/int | `int 100000000 64` | 582 | 699 | 706 | 0.83x | 0.82x |
+| generic_sort/int | `current random int 100000 30` | 431 | 506 | 59 | 0.85x | 7.25x |
+| generic_sort/string | `current random string 100000 30` | 793 | 652 | 320 | 1.22x | 2.47x |
+| http_head_read | `1000000` | 753 | 490 | 113 | 1.54x | 6.69x |
 
-The hash kernels hash 256 MB. The rows below subtract the `none` arm (112 ms
-for Pith, 48 for Go, 47 for Rust), which only builds the input:
+The hash kernels hash 256 MB. The rows below subtract the `none` arm (103 ms
+for Pith, 49 for Go, 48 for Rust), which only builds the input:
 
 | kernel | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| sha256 | 1828 | 95 | 96 | 19.2x | 19.0x |
-| sha512 | 943 | 189 | 253 | 5.0x | 3.7x |
-| fnv1a | 234 | 188 | 189 | 1.24x | 1.24x |
-| crc32 | 378 | 7 | 7 | 54x | 54x |
+| sha256 | 1751 | 95 | 95 | 18.4x | 18.4x |
+| sha512 | 986 | 189 | 254 | 5.20x | 3.88x |
+| fnv1a | 234 | 188 | 188 | 1.25x | 1.25x |
+| crc32 | 184 | 7 | 7 | 28x | 27x |
 
 ### concurrency
 
 | benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---|---:|---:|---:|---:|---:|
-| chan_fanout | `1000000` | 114 | 49 | 468 | 2.32x | 0.24x |
-| task_churn | `200000` | 1119 | 672 | 2342 | 1.67x | 0.48x |
-| task_pingpong | `2000000` | 412 | 312 | 529 | 1.32x | 0.78x |
-| green_fanout | `2000000` | 977 | 243 | 395 | 4.03x | 2.47x |
-| cpu_parallel_sync | `200 1000000` | 1820 | 751 | 731 | 2.42x | 2.49x |
-| lock_sweep/log | `log 16 100000000` | 155 | 44 | 5 | 3.53x | (a) |
-| lock_sweep/spawn | `spawn 16 1600000` | 185 | 81 | 99 | 2.28x | 1.87x |
-| lock_sweep/labels | `labels 16 1600000` | 399 | 81 | 81 | 4.93x | 4.91x |
-| lock_sweep/breaker | `breaker 16 50000000` | 131 | 61 | 55 | 2.14x | 2.39x |
-| lock_sweep/readfile | `readfile 16 200000` | 96 | 103 | 237 | 0.94x | 0.41x |
-| metrics_contention/counter | `3 4000000 16 counter` | 635 | 517 | 344 | 1.23x | 1.85x |
-| metrics_contention/histogram | `3 4000000 16 histogram` | 593 | 673 | 499 | 0.88x | 1.19x |
-| metrics_contention/labels | `3 1000000 16 labels` | 772 | 107 | 185 | 7.23x | 4.16x |
+| chan_fanout | `1000000` | 107 | 50 | 475 | 2.16x | 0.23x |
+| task_churn | `200000` | 1055 | 684 | 2321 | 1.54x | 0.45x |
+| task_pingpong | `2000000` | 412 | 315 | 526 | 1.31x | 0.78x |
+| green_fanout | `2000000` | 997 | 241 | 394 | 4.13x | 2.53x |
+| cpu_parallel_sync | `200 1000000` | 904 | 752 | 721 | 1.20x | 1.25x |
+| lock_sweep/log | `log 16 100000000` | 138 | 44 | 5.4 | 3.14x | (a) |
+| lock_sweep/spawn | `spawn 16 1600000` | 176 | 83 | 100 | 2.12x | 1.76x |
+| lock_sweep/labels | `labels 16 1600000` | 399 | 81 | 82 | 4.94x | 4.86x |
+| lock_sweep/breaker | `breaker 16 50000000` | 147 | 61 | 55 | 2.40x | 2.67x |
+| lock_sweep/readfile | `readfile 16 200000` | 96 | 101 | 233 | 0.94x | 0.41x |
+| metrics_contention/counter | `3 4000000 16 counter` | 624 | 512 | 344 | 1.22x | 1.81x |
+| metrics_contention/histogram | `3 4000000 16 histogram` | 582 | 676 | 497 | 0.86x | 1.17x |
+| metrics_contention/labels | `3 1000000 16 labels` | 760 | 106 | 185 | 7.17x | 4.11x |
+
+`lock_sweep/breaker` is sixteen tasks contending on one mutex, and its Pith
+time varies by about 15 percent from run to run.
 
 (a) LLVM removes the loop, so the Rust time is not a loop cost: `tight_loop`
 becomes a closed form, `lock_sweep/log` hoists the level check out of the loop,
@@ -222,16 +233,20 @@ second of three runs. The runner uses a fixed client order (see its header).
 
 ### where pith stands
 
-Pith matches or beats Go on JSON decoding, the event ledger, the catalog
-workload, map updates with int and bytes keys, histogram metrics, file reads,
-gRPC, and HTTP latency. It trails Rust on most compute rows, often by 2x or
-more. The largest gaps come from four things:
+Pith matches or beats Go on JSON decoding, substring search, the event
+ledger, the catalog workload, generic sorting of ints, map updates with int
+and bytes keys, histogram metrics, file reads, gRPC, and HTTP latency. It
+trails Rust on most compute rows, often by 2x or more. The largest gaps come
+from these:
 
-- heap-allocated closures (`closure_calls`, `closure_error`)
-- hash and checksum kernels without SIMD or CPU extensions
-- per-object refcount and allocation cost (`cyclic_graph`, `green_fanout`,
-  `task_churn`, the `labels` metrics paths)
-- the decoder in `json_decode_shapes/list_walk`, about 18x Go
+- heap-allocated closures (`closure_calls`, `closure_error`): a closure is
+  still built on the heap even when it never escapes
+- hash and checksum kernels in portable Pith, against Go and Rust code that
+  uses SHA-NI and pclmulqdq; Cranelift exposes neither
+- per-object allocation and refcount cost (`cyclic_graph`, `green_fanout`,
+  `task_churn`, the `labels` metrics paths), including a heap shell for
+  every optional
+- the node pool behind `json_decode_shapes/list_walk`, about 18x Go
 
 ## event ledger benchmark (json + collections + crypto)
 

@@ -25,15 +25,30 @@
 //! use for i/o: the lock is only ever contended by a close from another thread,
 //! and a readiness costs no cross-thread hop.
 //!
-//! ## epoll mode: level-triggered + oneshot
+//! ## epoll mode: edge-triggered, registered once
 //!
-//! each fd is armed level-triggered with `EPOLLONESHOT`, so a fire auto-disarms
-//! the fd (it stays in the interest set but reports nothing more until re-armed).
-//! level-triggered closes the classic race where readiness arrives between a
-//! task's `EWOULDBLOCK` and its registration: the ADD itself re-reports the
-//! already-pending readiness, so the task is woken immediately rather than
-//! sleeping forever. a spurious wake is always safe — the task just re-runs its
-//! syscall, which is the real source of truth.
+//! the first wait on an fd adds it to the poller's epoll set for
+//! `EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET`, and it stays there, unchanged,
+//! until `on_close` removes it. a wait therefore costs no `epoll_ctl` call. the
+//! poller used to arm each fd level-triggered with `EPOLLONESHOT` and re-arm it
+//! with an `EPOLL_CTL_MOD` on every wait that parked, which was one syscall per
+//! request on a keep-alive connection. go's netpoller has the same shape as this
+//! one.
+//!
+//! an edge is reported once, when the fd's readiness changes. that is enough
+//! because a wait follows a syscall that returned `EWOULDBLOCK`: any data that
+//! arrives after that syscall is a new edge. the edge either finds the task's
+//! waiter and wakes it, or, if it is harvested while no waiter is registered for
+//! that direction, sets a readiness bit on the fd (`FdReg::ready`). the next wait
+//! in that direction consumes the bit and returns at once instead of parking, so
+//! an edge that comes before the task parks is not lost. the first wait on an fd
+//! is covered by the `EPOLL_CTL_ADD`, which reports readiness the fd already
+//! has. a stale bit costs one spurious retry, which is always safe: the task
+//! re-runs its syscall, and the syscall is the source of truth.
+//!
+//! a caller that waits without first seeing `EWOULDBLOCK` (`tcp_wait_readable`,
+//! a terminal read) asks the fd with a zero-timeout `poll` before it waits; see
+//! `fdio::wait_guarded_level`.
 //!
 //! ## the waiter registry
 //!
@@ -46,15 +61,12 @@
 //!   clears the list; each retries its syscall, one wins, the losers re-block.
 //!   tasks on different workers that wait on one fd register it in each of their
 //!   pollers; epoll allows one fd in several instances.
-//! - `fds`: for each fd currently in the epoll set, the event mask presently
-//!   armed. arming is always recomputed from the waiter lists (`reconcile_fd`):
-//!   the first registrant on an fd does `EPOLL_CTL_ADD`, and a change in the
-//!   desired interest set (or re-arming after a oneshot fire) does
-//!   `EPOLL_CTL_MOD`. an fd stays in the set, disarmed, once its last waiter
-//!   leaves, so a connection that waits once per request pays one `MOD` per
-//!   wait instead of an `ADD` and a `DEL`; only `on_close` removes it. keeping
-//!   the armed mask a function of the waiter lists is what makes the
-//!   arm/disarm bookkeeping easy to reason about.
+//! - `fds`: each fd in this poller's epoll set, with the readiness bits that
+//!   edges left behind while nobody waited. an fd closed without `on_close`
+//!   would leave a stale entry here, and a new fd that reused its number would
+//!   never be added to the set, so every path that closes an fd a task may have
+//!   waited on calls `on_close` first (`fd_handle::finish_close`,
+//!   `network::close_raw`, the pidfd wait in `process`).
 //! - `deadlines`: a min-heap of timestamped entries for waits that carry a
 //!   finite timeout. a parking worker caps its `epoll_wait` timeout at the nearest
 //!   deadline and, on expiry, wakes the task with a timeout result. an entry
@@ -77,10 +89,10 @@
 //! the only lock here is each poller's `Inner` mutex. it is never held across
 //! `epoll_wait` (which blocks) and never across `green::wake` (which takes green's
 //! own slab/queue locks). a worker registering a waiter takes its poller's lock,
-//! arms epoll under it, drops it, then parks. a poll takes it only to drain fired
-//! events and expired deadlines into a local list, drops it, then wakes. so this
-//! lock never nests inside green's locks nor they inside it — no cross-module lock
-//! cycle is possible.
+//! adds the fd to epoll under it if this is the fd's first wait, drops it, then
+//! parks. a poll takes it only to drain fired events and expired deadlines into
+//! a local list, drops it, then wakes. so this lock never nests inside green's
+//! locks nor they inside it — no cross-module lock cycle is possible.
 
 use crate::concurrency::green;
 use std::cmp::Ordering;
@@ -92,7 +104,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// which readiness a task waits for on an fd. one fd can carry a read waiter and
-/// a write waiter at once (both registered, epoll armed for `EPOLLIN|EPOLLOUT`).
+/// a write waiter at once.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Interest {
     Read,
@@ -100,7 +112,7 @@ enum Interest {
 }
 
 impl Interest {
-    /// the epoll event bit this interest arms.
+    /// the epoll event bit for this interest, also its bit in `FdReg::ready`.
     fn epoll_bit(self) -> u32 {
         match self {
             Interest::Read => libc::EPOLLIN as u32,
@@ -140,8 +152,8 @@ struct Waiter {
 /// what a heap entry resolves when it expires: an fd wait that carried a
 /// timeout, or a pure timer with no fd at all (a green task sleeping). the two
 /// are distinct variants — rather than a sentinel fd smuggled through the io
-/// shape — so the fd-arming code (`reconcile_fd`, `desired_mask`, `on_close`)
-/// can never be handed a value that is not a real fd.
+/// shape — so the fd code (`register_io`, `on_close`) can never be handed a
+/// value that is not a real fd.
 enum DeadlineTarget {
     Io { fd: RawFd, interest: Interest },
     Timer,
@@ -173,12 +185,16 @@ impl PartialOrd for Deadline {
     }
 }
 
-/// the arm state of one fd in the epoll set. an fd is present in `Inner::fds`
-/// while it is in the epoll interest set. `armed` is the event mask epoll
-/// currently reports on; it drops to 0 when a oneshot fire disarms the fd, which
-/// tells `reconcile_fd` it must re-`MOD` to arm any remaining interest.
+/// the events every fd is registered for, once, on its first wait: both
+/// directions and a peer hangup, edge-triggered.
+const FD_EVENTS: u32 = (libc::EPOLLIN | libc::EPOLLOUT | libc::EPOLLRDHUP | libc::EPOLLET) as u32;
+
+/// one fd in a poller's epoll set. an fd is present in `Inner::fds` while it is
+/// in the set. `ready` holds the interest bits (`Interest::epoll_bit`) of edges
+/// that arrived while no task waited in that direction; the next wait in that
+/// direction consumes its bit instead of parking.
 struct FdReg {
-    armed: u32,
+    ready: u32,
 }
 
 /// one poller's registry, behind its mutex. the maps are keyed by fd numbers
@@ -187,9 +203,10 @@ struct FdReg {
 struct Inner {
     waiters: IntMap<(RawFd, Interest), Vec<Waiter>>,
     fds: IntMap<RawFd, FdReg>,
-    /// how many entries of `fds` are armed. a disarmed fd cannot report
-    /// anything, so only an armed one gives a poll something to find.
-    armed_fds: usize,
+    /// how many tasks are in `waiters`. an fd with nobody waiting on it gives a
+    /// poll nothing to wake, so only a waiter makes the registry busy; an edge
+    /// on an idle fd stays queued in the kernel until a poll collects it.
+    waiting: usize,
     deadlines: BinaryHeap<std::cmp::Reverse<Deadline>>,
     /// sleeping tasks, keyed by the seq of their heap entry. a timer has no
     /// (fd, interest) to key on, and giving it its own map keeps it out of
@@ -210,7 +227,7 @@ impl Inner {
         Inner {
             waiters: IntMap::default(),
             fds: IntMap::default(),
-            armed_fds: 0,
+            waiting: 0,
             deadlines: BinaryHeap::new(),
             timers: IntMap::default(),
             next_seq: 0,
@@ -254,41 +271,14 @@ impl Inner {
     /// record in `busy` whether this registry has anything a poll could find.
     /// called at the end of every locked change.
     fn publish(&self, busy: &AtomicBool) {
-        let any = self.armed_fds > 0 || !self.deadlines.is_empty() || !self.timers.is_empty();
+        let any = self.waiting > 0 || !self.deadlines.is_empty() || !self.timers.is_empty();
         busy.store(any, AtomicOrdering::SeqCst);
     }
 
-    /// record that `fd` is in the epoll set armed for `mask` (0: disarmed).
-    fn set_armed(&mut self, fd: RawFd, mask: u32) {
-        let was = self.fds.insert(fd, FdReg { armed: mask }).map_or(0, |r| r.armed);
-        self.armed_fds = self.armed_fds + usize::from(mask != 0) - usize::from(was != 0);
-    }
-
-    /// forget `fd`; returns whether it was in the epoll set.
-    fn forget_fd(&mut self, fd: RawFd) -> bool {
-        match self.fds.remove(&fd) {
-            Some(reg) => {
-                self.armed_fds -= usize::from(reg.armed != 0);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// the event mask an fd should currently be armed for: the union of the
-    /// interests that still have at least one waiter.
-    fn desired_mask(&self, fd: RawFd) -> u32 {
-        let mut mask = 0;
-        for interest in [Interest::Read, Interest::Write] {
-            if self
-                .waiters
-                .get(&(fd, interest))
-                .is_some_and(|v| !v.is_empty())
-            {
-                mask |= interest.epoll_bit();
-            }
-        }
-        mask
+    /// add a waiter for `(fd, interest)`.
+    fn push_waiter(&mut self, fd: RawFd, interest: Interest, waiter: Waiter) {
+        self.waiters.entry((fd, interest)).or_default().push(waiter);
+        self.waiting += 1;
     }
 }
 
@@ -377,54 +367,72 @@ impl Poller {
     }
 }
 
-/// arm epoll for `fd` so it reports what the current waiter lists want. called
-/// under `inner` after any change to `fd`'s waiters (register, fire, timeout).
+/// register a task's wait on `(fd, interest)` under `inner`, or report that it
+/// need not wait. returns false when an edge in that direction arrived while
+/// nobody waited: the bit is consumed and the caller retries its syscall
+/// instead of parking. otherwise the waiter and its deadline are recorded and
+/// the caller parks.
 ///
-/// - waiters, fd not in the set -> `EPOLL_CTL_ADD` with `EPOLLONESHOT | desired`.
-/// - waiters, fd in the set, mask changed (a new interest, or re-arming after a
-///   oneshot fire dropped `armed` to 0) -> `EPOLL_CTL_MOD`.
-/// - waiters, fd in the set, mask unchanged -> nothing (a second waiter on an
-///   already-armed interest just rode along on the existing arm).
-/// - no waiters -> nothing. a fired fd is already disarmed, and one whose last
-///   waiter timed out may fire once more with nobody to wake, which costs a
-///   spurious poll and is cheaper than a `DEL` now and an `ADD` on the next
-///   wait.
-///
-/// an fd closed without `on_close` leaves a stale entry here, and the kernel
-/// has already dropped it from the set. if its number comes back as a new fd,
-/// the `MOD` fails with `ENOENT` and is retried as an `ADD`; the reverse case
-/// retries an `ADD` that fails with `EEXIST` as a `MOD`.
-fn reconcile_fd(poller: &Poller, inner: &mut Inner, fd: RawFd) {
-    let desired = inner.desired_mask(fd);
-    if desired == 0 {
-        return;
-    }
-    match inner.fds.get(&fd).map(|reg| reg.armed) {
+/// the first wait on an fd adds it to the epoll set. an `EEXIST` there means
+/// the kernel still holds an entry for this fd that the registry lost track
+/// of, so it is rewritten with a `MOD`. any other failure leaves the fd out of
+/// `fds`, so the next wait tries again; this one then ends only by its
+/// deadline or a close, as it always has.
+fn register_io(
+    poller: &Poller,
+    inner: &mut Inner,
+    fd: RawFd,
+    interest: Interest,
+    deadline: Option<Instant>,
+    task: usize,
+    outcome: &Arc<AtomicI32>,
+) -> bool {
+    match inner.fds.get_mut(&fd) {
+        Some(reg) => {
+            let bit = interest.epoll_bit();
+            if reg.ready & bit != 0 {
+                reg.ready &= !bit;
+                return false;
+            }
+        }
         None => {
-            if epoll_apply(poller.epfd, libc::EPOLL_CTL_ADD, fd, desired) == libc::EEXIST {
-                epoll_apply(poller.epfd, libc::EPOLL_CTL_MOD, fd, desired);
+            let mut err = epoll_apply(poller.epfd, libc::EPOLL_CTL_ADD, fd);
+            if err == libc::EEXIST {
+                err = epoll_apply(poller.epfd, libc::EPOLL_CTL_MOD, fd);
+            }
+            if err == 0 {
+                inner.fds.insert(fd, FdReg { ready: 0 });
             }
         }
-        Some(armed) if armed != desired => {
-            if epoll_apply(poller.epfd, libc::EPOLL_CTL_MOD, fd, desired) == libc::ENOENT {
-                epoll_apply(poller.epfd, libc::EPOLL_CTL_ADD, fd, desired);
-            }
-        }
-        Some(_) => return,
     }
-    inner.set_armed(fd, desired);
+    let seq = inner.next_seq;
+    inner.next_seq += 1;
+    inner.push_waiter(
+        fd,
+        interest,
+        Waiter {
+            task,
+            seq,
+            outcome: outcome.clone(),
+        },
+    );
+    if let Some(at) = deadline {
+        inner.push_deadline(Deadline {
+            at,
+            seq,
+            target: DeadlineTarget::Io { fd, interest },
+        });
+    }
+    true
 }
 
-/// run one `epoll_ctl` op and return its errno, or 0 on success. `DEL` ignores
-/// its mask. the caller decides which errors matter: a `DEL` on an
-/// already-closed fd races `pith_tcp_close` (ENOENT/EBADF, expected), and an
-/// `ADD`/`MOD` failure just means the task falls back to a spurious retry when
-/// no wake ever comes — never a crash.
-fn epoll_apply(epfd: RawFd, op: libc::c_int, fd: RawFd, mask: u32) -> i32 {
+/// run one `epoll_ctl` op and return its errno, or 0 on success. an `ADD` or
+/// `MOD` registers `FD_EVENTS`; `DEL` passes no event. the caller decides which
+/// errors matter: a `DEL` on an already-closed fd races `pith_tcp_close`
+/// (ENOENT/EBADF, expected), and a failed `ADD` leaves the fd unregistered.
+fn epoll_apply(epfd: RawFd, op: libc::c_int, fd: RawFd) -> i32 {
     let mut ev = libc::epoll_event {
-        // oneshot on every real fd: a fire disarms it until we re-arm, so two
-        // readiness events never queue up for the same wait.
-        events: mask | libc::EPOLLONESHOT as u32,
+        events: FD_EVENTS,
         u64: fd as u64,
     };
     let ev_ptr = if op == libc::EPOLL_CTL_DEL {
@@ -515,33 +523,18 @@ pub(crate) fn wait_io(
         Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
     };
 
-    // register under the lock: allocate a seq, push the waiter, record any
-    // deadline, and arm epoll. no notify is needed for the deadline: this
+    // register under the lock. no notify is needed for the deadline: this
     // worker is the one that polls this registry, and it reads the nearest
     // deadline when it next parks.
-    {
+    let parks = {
         let mut inner = lock_inner(poller);
-        let seq = inner.next_seq;
-        inner.next_seq += 1;
-
-        inner
-            .waiters
-            .entry((fd, interest))
-            .or_default()
-            .push(Waiter {
-                task,
-                seq,
-                outcome: outcome.clone(),
-            });
-        if let Some(at) = deadline {
-            inner.push_deadline(Deadline {
-                at,
-                seq,
-                target: DeadlineTarget::Io { fd, interest },
-            });
-        }
-        reconcile_fd(poller, &mut inner, fd);
+        let parks = register_io(poller, &mut inner, fd, interest, deadline, task, &outcome);
         inner.publish(&poller.busy);
+        parks
+    };
+    if !parks {
+        // an edge came while nobody waited; the caller's retry will see it.
+        return if live() { 1 } else { -1 };
     }
     if !live() {
         // every waiter on this fd waits on the same dead handle — the number
@@ -626,10 +619,10 @@ fn register_timer(poller: &Poller, at: Instant, task: usize, outcome: &Arc<Atomi
 }
 
 /// run worker `index`'s poller once: wait up to `timeout` (zero polls without
-/// blocking), wake the tasks whose fds are ready or whose deadlines expired,
-/// and re-arm what is left. returns whether anything happened — a readiness,
-/// an expired deadline or a notify — as opposed to the wait running out.
-/// never resumes a coroutine.
+/// blocking), and wake the tasks whose fds are ready or whose deadlines
+/// expired. returns whether anything happened — a readiness, an expired
+/// deadline or a notify — as opposed to the wait running out. never resumes a
+/// coroutine.
 ///
 /// the wait is capped at the poller's nearest deadline, so a parked worker
 /// wakes in time to expire it.
@@ -669,29 +662,12 @@ fn poll(index: usize, timeout: Duration) -> bool {
                 notified = true;
                 continue;
             }
-            let fd = token as RawFd;
-
-            // the oneshot fire disarmed this fd in the kernel; record that so
-            // reconcile_fd re-arms any interest that still has waiters.
-            if inner.fds.contains_key(&fd) {
-                inner.set_armed(fd, 0);
-            }
-
-            // an error/hangup wakes both directions so the pending syscall can
-            // observe the real error. otherwise wake the direction that fired.
-            let err = bits & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32);
-            if bits & (libc::EPOLLIN as u32 | libc::EPOLLRDHUP as u32) != 0 || err != 0 {
-                take_ready(&mut inner, fd, Interest::Read, &mut to_wake);
-            }
-            if bits & (libc::EPOLLOUT as u32) != 0 || err != 0 {
-                take_ready(&mut inner, fd, Interest::Write, &mut to_wake);
-            }
-            reconcile_fd(poller, &mut inner, fd);
+            take_event(&mut inner, token as RawFd, bits, &mut to_wake);
         }
 
         // service expired deadlines in the same lock hold.
         if !inner.deadlines.is_empty() {
-            collect_expired(poller, &mut inner, Instant::now(), &mut to_wake);
+            collect_expired(&mut inner, Instant::now(), &mut to_wake);
         }
         inner.publish(&poller.busy);
     }
@@ -759,39 +735,57 @@ fn next_timeout_ms(poller: &Poller, cap: Duration) -> libc::c_int {
     ms.min(libc::c_int::MAX as u128) as libc::c_int
 }
 
-/// take all waiters for `(fd, interest)`, mark each ready, and queue it to wake.
-/// clearing the list disarms this interest until a still-blocked task re-registers
-/// (level-triggering means a genuinely-ready fd re-reports on the next arm). the
-/// emptied list stays in the map, so the next wait on the fd, which on a
-/// keep-alive connection comes a request later, reuses its allocation; on_close
-/// removes it.
-fn take_ready(inner: &mut Inner, fd: RawFd, interest: Interest, to_wake: &mut Vec<usize>) {
-    if let Some(waiters) = inner.waiters.get_mut(&(fd, interest)) {
-        for w in waiters.drain(..) {
-            // flip PENDING->READY; if a timeout already claimed it, leave it be.
-            if w
-                .outcome
-                .compare_exchange(
-                    PENDING,
-                    READY,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                )
-                .is_ok()
-            {
-                to_wake.push(w.task);
-            }
+/// handle one epoll event for `fd`: wake the waiters of each direction it
+/// reports, or, for a direction nobody waits on, keep its readiness bit for the
+/// next wait. an error or hangup counts as both directions, so the pending
+/// syscall can observe the real error. an event for an fd this poller no longer
+/// tracks wakes nobody and is dropped.
+fn take_event(inner: &mut Inner, fd: RawFd, bits: u32, to_wake: &mut Vec<usize>) {
+    let err = bits & (libc::EPOLLERR as u32 | libc::EPOLLHUP as u32) != 0;
+    for interest in [Interest::Read, Interest::Write] {
+        let fired = match interest {
+            Interest::Read => bits & (libc::EPOLLIN as u32 | libc::EPOLLRDHUP as u32) != 0,
+            Interest::Write => bits & libc::EPOLLOUT as u32 != 0,
+        };
+        if !(fired || err) || take_ready(inner, fd, interest, to_wake) {
+            continue;
+        }
+        if let Some(reg) = inner.fds.get_mut(&fd) {
+            reg.ready |= interest.epoll_bit();
         }
     }
+}
+
+/// take all waiters for `(fd, interest)`, mark each ready, and queue it to wake.
+/// returns whether there were any. the emptied list stays in the map, so the
+/// next wait on the fd, which on a keep-alive connection comes a request later,
+/// reuses its allocation; on_close removes it.
+fn take_ready(inner: &mut Inner, fd: RawFd, interest: Interest, to_wake: &mut Vec<usize>) -> bool {
+    let Some(waiters) = inner.waiters.get_mut(&(fd, interest)) else {
+        return false;
+    };
+    if waiters.is_empty() {
+        return false;
+    }
+    inner.waiting -= waiters.len();
+    for w in waiters.drain(..) {
+        // flip PENDING->READY; if a timeout already claimed it, leave it be.
+        if w
+            .outcome
+            .compare_exchange(PENDING, READY, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+        {
+            to_wake.push(w.task);
+        }
+    }
+    true
 }
 
 /// pop every deadline at or before `now`, mark the matching still-pending waiter
 /// timed out, remove it, and queue it to wake. a stale heap entry (its waiter
 /// already fired ready and was removed) simply matches nothing. a timer entry
 /// has no fd, so it wakes its sleeper directly and never touches epoll.
-fn collect_expired(poller: &Poller, inner: &mut Inner, now: Instant, to_wake: &mut Vec<usize>) {
-    // track which fds we touch so we can re-arm/disarm them once at the end.
-    let mut touched: Vec<RawFd> = Vec::new();
+fn collect_expired(inner: &mut Inner, now: Instant, to_wake: &mut Vec<usize>) {
     while let Some(top) = inner.deadlines.peek() {
         if top.0.at > now {
             break;
@@ -823,6 +817,7 @@ fn collect_expired(poller: &Poller, inner: &mut Inner, now: Instant, to_wake: &m
                 if let Some(waiters) = inner.waiters.get_mut(&(fd, interest)) {
                     if let Some(pos) = waiters.iter().position(|w| w.seq == seq) {
                         let w = waiters.remove(pos);
+                        inner.waiting -= 1;
                         if w
                             .outcome
                             .compare_exchange(
@@ -838,16 +833,10 @@ fn collect_expired(poller: &Poller, inner: &mut Inner, now: Instant, to_wake: &m
                         if waiters.is_empty() {
                             inner.waiters.remove(&(fd, interest));
                         }
-                        if !touched.contains(&fd) {
-                            touched.push(fd);
-                        }
                     }
                 }
             }
         }
-    }
-    for fd in touched {
-        reconcile_fd(poller, inner, fd);
     }
 }
 
@@ -893,37 +882,39 @@ pub(crate) fn on_close(fd: RawFd) {
     // nest inside them (the module's lock discipline).
     let mut to_wake: Vec<usize> = Vec::new();
     for poller in pollers {
-        let mut inner = lock_inner(poller);
-        for interest in [Interest::Read, Interest::Write] {
-            if let Some(waiters) = inner.waiters.remove(&(fd, interest)) {
-                for w in waiters {
-                    if w
-                        .outcome
-                        .compare_exchange(
-                            PENDING,
-                            CLOSED,
-                            AtomicOrdering::AcqRel,
-                            AtomicOrdering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        to_wake.push(w.task);
-                    }
-                }
-            }
-        }
-        if inner.forget_fd(fd) {
-            // fd was in the epoll set; remove it. errors (already gone) ignored.
-            epoll_apply(poller.epfd, libc::EPOLL_CTL_DEL, fd, 0);
-        }
-        inner.publish(&poller.busy);
-        // any deadline heap entries for this fd are now stale; they match no
-        // waiter and are dropped when they surface (same as a fired waiter's).
+        close_in(poller, fd, &mut to_wake);
     }
 
     for task in to_wake {
         green::wake(task);
     }
+}
+
+/// `on_close` for one poller: resolve its waiters on `fd` as closed, queue
+/// them to wake, and take `fd` out of its epoll set.
+fn close_in(poller: &Poller, fd: RawFd, to_wake: &mut Vec<usize>) {
+    let mut inner = lock_inner(poller);
+    for interest in [Interest::Read, Interest::Write] {
+        if let Some(waiters) = inner.waiters.remove(&(fd, interest)) {
+            inner.waiting -= waiters.len();
+            for w in waiters {
+                if w
+                    .outcome
+                    .compare_exchange(PENDING, CLOSED, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+                    .is_ok()
+                {
+                    to_wake.push(w.task);
+                }
+            }
+        }
+    }
+    if inner.fds.remove(&fd).is_some() {
+        // fd was in the epoll set; remove it. errors (already gone) ignored.
+        epoll_apply(poller.epfd, libc::EPOLL_CTL_DEL, fd);
+    }
+    inner.publish(&poller.busy);
+    // any deadline heap entries for this fd are now stale; they match no
+    // waiter and are dropped when they surface (same as a fired waiter's).
 }
 
 #[cfg(test)]
@@ -952,35 +943,6 @@ mod tests {
         assert_eq!(heap.pop().unwrap().0.seq, 1);
     }
 
-    #[test]
-    fn desired_mask_unions_interests() {
-        let mut inner = Inner::new();
-        assert_eq!(inner.desired_mask(7), 0);
-        inner
-            .waiters
-            .entry((7, Interest::Read))
-            .or_default()
-            .push(Waiter {
-                task: 0,
-                seq: 0,
-                outcome: Arc::new(AtomicI32::new(PENDING)),
-            });
-        assert_eq!(inner.desired_mask(7), libc::EPOLLIN as u32);
-        inner
-            .waiters
-            .entry((7, Interest::Write))
-            .or_default()
-            .push(Waiter {
-                task: 1,
-                seq: 1,
-                outcome: Arc::new(AtomicI32::new(PENDING)),
-            });
-        assert_eq!(
-            inner.desired_mask(7),
-            libc::EPOLLIN as u32 | libc::EPOLLOUT as u32
-        );
-    }
-
     // close-during-wait: a task blocked reading an fd that another task closes
     // must be woken with a CLOSED outcome (so its wait_io returns an error and the
     // task unwinds and reclaims its stack/slot), not silently dropped and parked
@@ -996,18 +958,18 @@ mod tests {
             let mut inner = lock_inner(poller);
             let seq = inner.next_seq;
             inner.next_seq += 1;
-            inner
-                .waiters
-                .entry((fd, Interest::Read))
-                .or_default()
-                .push(Waiter {
+            inner.push_waiter(
+                fd,
+                Interest::Read,
+                Waiter {
                     // a slab id far beyond any real task: green::wake finds no such
                     // slot and no-ops, which is all we need to exercise on_close.
                     task: usize::MAX,
                     seq,
                     outcome: outcome.clone(),
-                });
-            inner.set_armed(fd, libc::EPOLLIN as u32);
+                },
+            );
+            inner.fds.insert(fd, FdReg { ready: 0 });
         }
 
         on_close(fd);
@@ -1051,12 +1013,12 @@ mod tests {
             assert!(ours(&inner));
 
             // not due yet: the sweep leaves it alone.
-            collect_expired(poller, &mut inner, at - Duration::from_millis(1), &mut to_wake);
+            collect_expired(&mut inner, at - Duration::from_millis(1), &mut to_wake);
             assert!(to_wake.is_empty());
             assert_eq!(outcome.load(AtomicOrdering::Acquire), PENDING);
 
             // due: it resolves to TIMED_OUT, queues the task, and cleans up.
-            collect_expired(poller, &mut inner, at, &mut to_wake);
+            collect_expired(&mut inner, at, &mut to_wake);
             assert!(!ours(&inner));
         }
         assert_eq!(to_wake, vec![usize::MAX]);
@@ -1075,15 +1037,15 @@ mod tests {
             let mut inner = lock_inner(poller);
             let seq = inner.next_seq;
             inner.next_seq += 1;
-            inner
-                .waiters
-                .entry((fd, Interest::Write))
-                .or_default()
-                .push(Waiter {
+            inner.push_waiter(
+                fd,
+                Interest::Write,
+                Waiter {
                     task: usize::MAX,
                     seq,
                     outcome: outcome.clone(),
-                });
+                },
+            );
         }
 
         on_close(fd);
@@ -1109,11 +1071,15 @@ mod tests {
         // every compaction.
         let kept = inner.next_seq;
         inner.next_seq += 1;
-        inner.waiters.entry((fd + 1, Interest::Read)).or_default().push(Waiter {
-            task: usize::MAX,
-            seq: kept,
-            outcome: Arc::new(AtomicI32::new(PENDING)),
-        });
+        inner.push_waiter(
+            fd + 1,
+            Interest::Read,
+            Waiter {
+                task: usize::MAX,
+                seq: kept,
+                outcome: Arc::new(AtomicI32::new(PENDING)),
+            },
+        );
         inner.push_deadline(Deadline {
             at: far,
             seq: kept,
@@ -1137,65 +1103,133 @@ mod tests {
     fn add_read_waiter(inner: &mut Inner, fd: RawFd) {
         let seq = inner.next_seq;
         inner.next_seq += 1;
-        inner.waiters.entry((fd, Interest::Read)).or_default().push(Waiter {
-            task: usize::MAX,
-            seq,
-            outcome: Arc::new(AtomicI32::new(PENDING)),
-        });
+        inner.push_waiter(
+            fd,
+            Interest::Read,
+            Waiter {
+                task: usize::MAX,
+                seq,
+                outcome: Arc::new(AtomicI32::new(PENDING)),
+            },
+        );
     }
 
-    // a fired fd stays in the set disarmed, and a later wait re-arms it. if the
-    // fd was closed without `on_close` and its number reused, the stale entry
-    // must not swallow the new fd's arm: the MOD fails and is retried as an ADD.
-    #[test]
-    fn rearm_survives_a_stale_fd_entry() {
-        let poller = Poller::new();
-        let ready = |poller: &Poller| {
-            let mut ev = [libc::epoll_event { events: 0, u64: 0 }; 4];
-            // SAFETY: a zero-timeout wait on our own epoll fd into a local buffer.
-            let n = unsafe { libc::epoll_wait(poller.epfd, ev.as_mut_ptr(), 4, 0) };
-            ev[..n.max(0) as usize].iter().map(|e| e.u64).collect::<Vec<u64>>()
-        };
-        let (a, b) = socket_pair();
-        // SAFETY: writing one byte to a socket we own.
-        unsafe { libc::write(b, b"x".as_ptr().cast(), 1) };
-        let mut inner = lock_inner(&poller);
-        add_read_waiter(&mut inner, a);
-        reconcile_fd(&poller, &mut inner, a);
-        assert_eq!(ready(&poller), vec![a as u64]);
-
-        // what a poll does with that fire: drop the waiters, mark it disarmed.
-        inner.waiters.clear();
-        inner.set_armed(a, 0);
-        reconcile_fd(&poller, &mut inner, a);
-        assert!(inner.fds.contains_key(&a), "a fired fd stays in the set");
-        assert_eq!(inner.armed_fds, 0);
-
-        // close both ends behind the registry's back and take the number again.
-        // SAFETY: closing fds this test opened.
-        unsafe {
-            libc::close(a);
-            libc::close(b);
-        }
-        let (c, d) = socket_pair();
-        if c != a {
-            // something else took the number; nothing to check.
-            unsafe {
-                libc::close(c);
-                libc::close(d);
+    /// what a poll does, minus the wait: collect the events queued on
+    /// `poller` and hand each fd's to `take_event`, returning the tasks to wake.
+    fn harvest(poller: &Poller, inner: &mut Inner) -> Vec<usize> {
+        let mut ev = [libc::epoll_event { events: 0, u64: 0 }; 8];
+        // SAFETY: a zero-timeout wait on our own epoll fd into a local buffer.
+        let n = unsafe { libc::epoll_wait(poller.epfd, ev.as_mut_ptr(), 8, 0) };
+        let mut to_wake = Vec::new();
+        for e in &ev[..n.max(0) as usize] {
+            if e.u64 != EVENTFD_TOKEN {
+                take_event(inner, e.u64 as RawFd, e.events, &mut to_wake);
             }
-            return;
         }
-        // SAFETY: as above.
-        unsafe { libc::write(d, b"x".as_ptr().cast(), 1) };
-        add_read_waiter(&mut inner, c);
-        reconcile_fd(&poller, &mut inner, c);
-        assert_eq!(inner.armed_fds, 1);
-        assert_eq!(ready(&poller), vec![c as u64], "the reused fd must be armed");
+        to_wake
+    }
+
+    /// register a wait by task id; returns whether the task would park.
+    fn wait(poller: &Poller, inner: &mut Inner, fd: RawFd, interest: Interest, task: usize) -> bool {
+        let outcome = Arc::new(AtomicI32::new(PENDING));
+        register_io(poller, inner, fd, interest, None, task, &outcome)
+    }
+
+    fn send_byte(fd: RawFd) {
+        // SAFETY: writing one byte to a socket the test owns.
+        assert_eq!(unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) }, 1);
+    }
+
+    fn close_fds(fds: &[RawFd]) {
+        for &fd in fds {
+            // SAFETY: closing fds the test opened.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    // an edge harvested while no task waits must not be lost: it leaves a
+    // readiness bit, the next wait consumes it instead of parking, and the
+    // wait after that parks again. the fd is added to epoll once, on its
+    // first wait, and never re-armed.
+    #[test]
+    fn an_edge_before_the_wait_is_not_lost() {
+        let poller = Poller::new();
+        let (a, b) = socket_pair();
+        let mut inner = lock_inner(&poller);
+        assert!(wait(&poller, &mut inner, a, Interest::Read, 1));
+        send_byte(b);
+        assert_eq!(harvest(&poller, &mut inner), vec![1]);
+        assert_eq!(inner.waiting, 0);
+
+        // data arrives while the task is running, not waiting.
+        send_byte(b);
+        assert!(harvest(&poller, &mut inner).is_empty());
+        assert!(!wait(&poller, &mut inner, a, Interest::Read, 1), "the bit ends the wait");
+        assert_eq!(inner.waiting, 0);
+        assert!(wait(&poller, &mut inner, a, Interest::Read, 1), "the bit is consumed");
+        assert_eq!(inner.waiting, 1);
+
+        // the fd stays registered: a new edge still reaches the waiter.
+        send_byte(b);
+        assert_eq!(harvest(&poller, &mut inner), vec![1]);
         drop(inner);
-        unsafe {
-            libc::close(c);
-            libc::close(d);
-        }
+        close_fds(&[a, b]);
+    }
+
+    // a reader and a writer on one fd: each edge wakes only the direction it
+    // reports, and a direction nobody waits on keeps its bit for later.
+    #[test]
+    fn a_reader_and_a_writer_share_an_fd() {
+        let poller = Poller::new();
+        let (a, b) = socket_pair();
+        let mut inner = lock_inner(&poller);
+        assert!(wait(&poller, &mut inner, a, Interest::Read, 1));
+        assert!(wait(&poller, &mut inner, a, Interest::Write, 2));
+        // the add reports the socket as already writable, which wakes the
+        // writer and leaves the reader parked.
+        assert_eq!(harvest(&poller, &mut inner), vec![2]);
+        assert_eq!(inner.waiting, 1);
+
+        send_byte(b);
+        assert_eq!(harvest(&poller, &mut inner), vec![1]);
+        // that edge also reported the socket writable, with no writer waiting.
+        let write_bit = Interest::Write.epoll_bit();
+        assert_eq!(inner.fds.get(&a).map(|reg| reg.ready & write_bit), Some(write_bit));
+        assert!(!wait(&poller, &mut inner, a, Interest::Write, 2));
+        drop(inner);
+        close_fds(&[a, b]);
+    }
+
+    // a close wakes the fd's waiters and takes it out of the set, with any
+    // readiness bits it had, so a new fd that reuses the number is added again
+    // on its first wait and reported.
+    #[test]
+    fn a_closed_fd_number_is_registered_again() {
+        let poller = Poller::new();
+        let (a, b) = socket_pair();
+        let outcome = Arc::new(AtomicI32::new(PENDING));
+        let mut inner = lock_inner(&poller);
+        assert!(register_io(&poller, &mut inner, a, Interest::Read, None, 1, &outcome));
+        // the add reports the socket writable: a write bit with no writer.
+        assert!(harvest(&poller, &mut inner).is_empty());
+        drop(inner);
+
+        let mut to_wake = Vec::new();
+        close_in(&poller, a, &mut to_wake);
+        assert_eq!(to_wake, vec![1]);
+        assert_eq!(outcome.load(AtomicOrdering::Acquire), CLOSED);
+        close_fds(&[a, b]);
+
+        let (c, d) = socket_pair();
+        let mut inner = lock_inner(&poller);
+        assert!(!inner.fds.contains_key(&c));
+        assert_eq!(inner.waiting, 0);
+        assert!(wait(&poller, &mut inner, c, Interest::Write, 3), "no bit survives the close");
+        assert_eq!(harvest(&poller, &mut inner), vec![3]);
+        assert!(wait(&poller, &mut inner, c, Interest::Read, 4));
+        send_byte(d);
+        assert_eq!(harvest(&poller, &mut inner), vec![4]);
+        drop(inner);
+        close_fds(&[c, d]);
     }
 }

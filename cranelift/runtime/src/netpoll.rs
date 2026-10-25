@@ -645,6 +645,11 @@ fn poll(index: usize, timeout: Duration) -> bool {
     };
     // EINTR (or any transient error) reads as an empty wait.
     let n = n.max(0) as usize;
+    // the worker is awake from here on and looks at its queues once this
+    // returns, so a `notify` now only needs to set the flag. that includes the
+    // one each wake below sends this worker for its own tasks, which used to
+    // cost an eventfd write and read per wake on a lightly loaded worker.
+    poller.mode.store(WAIT_NONE, AtomicOrdering::SeqCst);
 
     // collect every task to wake into a local list, then wake them AFTER
     // dropping the registry lock — `green::wake` takes green's own locks, and

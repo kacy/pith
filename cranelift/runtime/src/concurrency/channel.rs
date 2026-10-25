@@ -68,7 +68,8 @@
 //! waiter *under the channel lock* before releasing it, which we do.
 
 use crate::concurrency::green;
-use crate::runtime_core::optional_tuple;
+use crate::ffi_util::ResultPair;
+use crate::runtime_core::{optional_from, optional_pair};
 use crate::handle_registry;
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -782,13 +783,13 @@ unsafe fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, val
 /// the buffered recv, mirror of `buffered_send`: lock-free dequeue on the fast
 /// path; park under the mutex only when the ring is empty. a closed channel
 /// still drains — the dequeue try comes before the closed check.
-unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> i64 {
+unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> Option<i64> {
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
     loop {
         if let Some(value) = ring.try_dequeue() {
             wake_parked(inner, ring, Role::Sender);
-            return optional_tuple(true, value);
+            return Some(value);
         }
         if spins > 0 {
             spins -= 1;
@@ -799,9 +800,9 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
             // one more look: a value enqueued just before close must be drained.
             if let Some(value) = ring.try_dequeue() {
                 wake_parked(inner, ring, Role::Sender);
-                return optional_tuple(true, value);
+                return Some(value);
             }
-            return optional_tuple(false, 0);
+            return None;
         }
         let mut state = lock_state(&inner.state);
         inner.parked_receivers.fetch_add(1, Ordering::SeqCst);
@@ -810,11 +811,11 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
             inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
             drop(state);
             wake_parked(inner, ring, Role::Sender);
-            return optional_tuple(true, value);
+            return Some(value);
         }
         if inner.closed_flag.load(Ordering::SeqCst) {
             inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
-            return optional_tuple(false, 0);
+            return None;
         }
         state = block_on_channel(park, inner, state, green_task, Role::Receiver);
         drop(state);
@@ -825,7 +826,7 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
         // which task we are again — see the note on `green::park_current`.
         if let Some(id) = green_task {
             if let Some(value) = green::take_handoff(id) {
-                return optional_tuple(true, value);
+                return Some(value);
             }
         }
     }
@@ -918,12 +919,11 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
     1
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
+unsafe fn channel_recv(handle: i64) -> Option<i64> {
     // an unknown or freed handle yields the empty optional, exactly what a
     // closed and drained channel yields.
     let Some(t) = channel_ref(handle) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     let park = ParkCount::new(t);
     let inner = &t.inner;
@@ -939,11 +939,11 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
             // to be taken.
             state.deliveries += 1;
             wake_senders(inner, &mut state);
-            return optional_tuple(true, value);
+            return Some(value);
         }
 
         if state.closed {
-            return optional_tuple(false, 0);
+            return None;
         }
 
         // announce that a receiver is now waiting so a blocked sender can deposit
@@ -956,27 +956,48 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
+unsafe fn channel_try_recv(handle: i64) -> Option<i64> {
     let Some(t) = channel_ref(handle) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     let inner = &t.inner;
     if let Some(ring) = &inner.ring {
         if let Some(value) = ring.try_dequeue() {
             wake_parked(inner, ring, Role::Sender);
-            return optional_tuple(true, value);
+            return Some(value);
         }
         // the empty case is the one that can observe a closed, drained ring.
-        return optional_tuple(false, 0);
+        return None;
     }
     let mut state = lock_state(&inner.state);
     if let Some(value) = state.pending_value.take() {
         state.deliveries += 1;
         wake_senders(inner, &mut state);
-        return optional_tuple(true, value);
+        return Some(value);
     }
-    optional_tuple(false, 0)
+    None
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
+    optional_from(channel_recv(handle))
+}
+
+/// `pith_channel_recv` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_recv_pair(handle: i64) -> ResultPair {
+    optional_pair(channel_recv(handle))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
+    optional_from(channel_try_recv(handle))
+}
+
+/// `pith_channel_try_recv` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_try_recv_pair(handle: i64) -> ResultPair {
+    optional_pair(channel_try_recv(handle))
 }
 
 #[no_mangle]

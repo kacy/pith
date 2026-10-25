@@ -4,7 +4,8 @@
 //! but presents FFI-compatible interface matching the C runtime.
 
 use crate::handle_registry::{self, HandleKind};
-use crate::runtime_core::optional_tuple;
+use crate::ffi_util::ResultPair;
+use crate::runtime_core::{optional_from, optional_pair, optional_tuple};
 /// FFI-compatible list handle
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -928,16 +929,26 @@ pub unsafe extern "C" fn pith_list_get_opt(list: PithList, index: i64) -> i64 {
 ///
 /// # Safety
 /// * `list` must be a valid `PithList` handle or all-zero.
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_first_opt(list: PithList) -> i64 {
+unsafe fn list_first(list: PithList) -> Option<i64> {
     let Some(impl_ref) = list_ref(list) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
-        return optional_tuple(false, 0);
+        return None;
     }
     crate::perf_stats!(PERF_LIST_GETS += 1);
-    optional_tuple(true, impl_ref.get_value_unchecked(0))
+    Some(impl_ref.get_value_unchecked(0))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_first_opt(list: PithList) -> i64 {
+    optional_from(list_first(list))
+}
+
+/// `pith_list_first_opt` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_first_opt_pair(list: PithList) -> ResultPair {
+    optional_pair(list_first(list))
 }
 
 /// Return the last element of the list wrapped in an Optional tuple, or
@@ -945,16 +956,26 @@ pub unsafe extern "C" fn pith_list_first_opt(list: PithList) -> i64 {
 ///
 /// # Safety
 /// * `list` must be a valid `PithList` handle or all-zero.
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_last_opt(list: PithList) -> i64 {
+unsafe fn list_last(list: PithList) -> Option<i64> {
     let Some(impl_ref) = list_ref(list) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
-        return optional_tuple(false, 0);
+        return None;
     }
     crate::perf_stats!(PERF_LIST_GETS += 1);
-    optional_tuple(true, impl_ref.get_value_unchecked(impl_ref.len() - 1))
+    Some(impl_ref.get_value_unchecked(impl_ref.len() - 1))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_last_opt(list: PithList) -> i64 {
+    optional_from(list_last(list))
+}
+
+/// `pith_list_last_opt` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_last_opt_pair(list: PithList) -> ResultPair {
+    optional_pair(list_last(list))
 }
 
 /// Strict pointer-sized indexed access for `list[i]`. Aborts with a

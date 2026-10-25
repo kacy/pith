@@ -61,8 +61,23 @@ cargo build --release --manifest-path bench/event_ledger_rust/Cargo.toml
 zig build-exe -O ReleaseFast -femit-bin=bench/event_ledger_zig bench/event_ledger.zig
 ```
 
-Latest measured results on this machine, 200000 events, median of 5
-interleaved trials (2026-09-13, after the map work in #1126, #1128 and
+On 2026-10-25, on the 32-thread Ryzen 9 9950X pinned to CPUs 28-31, main at
+c935006c reads, for 200000 events and the median of 5 interleaved trials:
+
+| lang | gen | parse | analyze | sign | total |
+|---|---:|---:|---:|---:|---:|
+| pith | 27 | 34 | 9 | 0 | 70 |
+| go | 17 | 73 | 5 | 0 | 95 |
+| rust | 11 | 24 | 10 | 0 | 45 |
+| zig | 7 | 34 | 4 | 0 | 46 |
+
+Pith's total is 0.74x Go's and about 1.5x Rust's and Zig's. Its `parse` is
+under half of Go's and level with Zig's. `gen` is the largest gap: 27 ms
+against 17 for Go and 11 for Rust.
+
+The results below come from an older, slower machine, so compare their rows
+with each other and not with the table above. Earlier results, 200000 events,
+median of 5 interleaved trials (2026-09-13, after the map work in #1126, #1128 and
 #1129; the 2026-09-10 pith total was 259, the 2026-08-16 total 351, the
 2026-07-29 total 618):
 

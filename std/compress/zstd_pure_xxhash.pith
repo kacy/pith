@@ -66,17 +66,15 @@ pub fn xxh64(data: Bytes, seed: Int) -> Int:
         mut v3 := seed
         mut v4 := seed - p1
         while pos + 32 <= n:
-            # rotl64 spelled as shifts: the rotate amount is fixed at 31,
-            # and the shl/shr/bor calls collapse to native instructions
-            # where the rotl64 wrapper stays a call
+            # bits.rotl64 lowers to one rotate instruction
             a1 := v1 + bytes_read_word(data, pos, 8) * p2
-            v1 = bits.bor(bits.shl(a1, 31), bits.shr(a1, 33)) * p1
+            v1 = bits.rotl64(a1, 31) * p1
             a2 := v2 + bytes_read_word(data, pos + 8, 8) * p2
-            v2 = bits.bor(bits.shl(a2, 31), bits.shr(a2, 33)) * p1
+            v2 = bits.rotl64(a2, 31) * p1
             a3 := v3 + bytes_read_word(data, pos + 16, 8) * p2
-            v3 = bits.bor(bits.shl(a3, 31), bits.shr(a3, 33)) * p1
+            v3 = bits.rotl64(a3, 31) * p1
             a4 := v4 + bytes_read_word(data, pos + 24, 8) * p2
-            v4 = bits.bor(bits.shl(a4, 31), bits.shr(a4, 33)) * p1
+            v4 = bits.rotl64(a4, 31) * p1
             pos = pos + 32
         h = bits.rotl64(v1, 1) + bits.rotl64(v2, 7) + bits.rotl64(v3, 12) + bits.rotl64(v4, 18)
         h = merge_round(h, v1)

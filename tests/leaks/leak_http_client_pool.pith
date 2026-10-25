@@ -1,0 +1,81 @@
+# http.Client's pooled request path, one exchange per round, against the
+# repo's own server on loopback.
+#
+# most rounds reuse an idle connection, and some mix in a gzip body the
+# client decodes or a redirect it follows. every 1024th round asks the server
+# to close, so the next one dials a new connection and the closed one is
+# released. a per-round leak in the pool, the wire connection's reader and
+# writer, or the response parser moves the peak between the two round counts.
+#
+# a new connection is rarer than the rest because the server side costs about
+# 2kb per connection that it does not give back (a connection per round with
+# raw tcp on the client side grows the same way), and that would swamp what
+# this case measures.
+import leakprobe as probe
+import std.compress.gzip as gzip
+import std.net.http as http
+
+fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "?"
+    if path == "/close":
+        return http.text(200, "bye").close_connection()
+    if path == "/gzip":
+        return http.response(200).header("Content-Encoding", "gzip").with_body_bytes(gzip.compress_string("compressed body"))
+    if path == "/redirect":
+        return http.response(302).header("Location", "/plain")
+    return http.text(200, "plain body " + path)
+
+fn serve_conn(fd: Int) -> Int:
+    return http.serve_connection_fd(fd, route) catch 0
+
+fn accept_loop(listener: Int) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn serve_conn(fd)
+    return 0
+
+fn listen_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe_fd := tcp_listen("127.0.0.1", port)
+        if probe_fd.is_ok:
+            spawn accept_loop(probe_fd.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn round(c: http.Client, base: String, i: Int) -> Int:
+    mut path := "/plain"
+    which := i % 8
+    if i % 1024 == 0:
+        path = "/close"
+    elif which == 3:
+        path = "/gzip"
+    elif which == 5:
+        path = "/redirect"
+    # bound first: a struct read out of a result in an expression leaks on
+    # its own, which is not what this case measures
+    resp := c.get(base + path) catch:
+        return 0
+    return resp.body.len()
+
+fn main() -> Int!:
+    # a round is a loopback request and response, much heavier than the
+    # container churn most cases here do, so the harness round counts are
+    # scaled down by 25: 8000 rounds against 32000, keeping the one-to-four
+    # ratio the gate compares. a leak of 100 bytes a round still moves the
+    # peak past the gate's limit.
+    rounds := probe.rounds() / 25
+    port := listen_port(21980)!
+    base := "http://127.0.0.1:{port}"
+    c := http.client()
+    mut total := 0
+    mut i := 0
+    while i < rounds:
+        total = total + round(c, base, i)
+        i = i + 1
+    c.close_idle_connections()
+    kb := probe.peak_kb()
+    print("{kb}")
+    return 0

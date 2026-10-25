@@ -1,0 +1,104 @@
+# how http.Client follows redirects, as net/http's Client does: each redirect
+# status with its method and body rules, the limit of 10, a relative
+# Location, a redirect without one, and Authorization dropped when a
+# redirect leaves the host.
+
+import std.net.http as http
+import std.bytes as bytes
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn port_of(host: String) -> String:
+    colon := host.index_of(":")
+    if colon < 0:
+        return "80"
+    return host.substring(colon + 1, host.len())
+
+fn redirect(status: Int, location: String) -> http.HttpResponse:
+    return http.response(status).header("Location", location).with_body_text("moved")
+
+fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "?"
+    host := req.header("Host") catch "?"
+    if path == "/echo":
+        query := req.query() catch ""
+        return http.text(200, "{req.method_text} {path}?{query} body=[{req.body_text() catch "?"}] auth=[{req.header("Authorization") catch ""}] cookie=[{req.header("Cookie") catch ""}]")
+    if path.starts_with("/status/"):
+        return redirect(parse_int(path.substring(8, path.len())) catch 302, "/echo")
+    if path == "/relative/start":
+        return redirect(302, "../echo?from=relative")
+    if path == "/elsewhere":
+        return redirect(302, "http://localhost:{port_of(host)}/echo")
+    if path == "/network-path":
+        return redirect(302, "//localhost:{port_of(host)}/echo?from=network-path#frag")
+    if path == "/same-host":
+        return redirect(302, "http://127.0.0.1:{port_of(host)}/echo")
+    if path == "/no-location":
+        return http.response(302).with_body_text("no location here")
+    if path.starts_with("/chain/"):
+        left := parse_int(path.substring(7, path.len())) catch 0
+        if left <= 0:
+            return redirect(302, "/echo")
+        return redirect(302, "/chain/{left - 1}")
+    return http.text(404, "no route " + path)
+
+fn serve_conn(fd: Int) -> Int:
+    return http.serve_connection_fd(fd, route) catch 0
+
+fn http_loop(listener: Int) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn serve_conn(fd)
+    return 0
+
+fn show(resp: http.HttpResponse!) -> String:
+    if resp.is_err:
+        return "error: " + resp.err
+    return "{resp.ok.status} {resp.ok.body_text() catch "?"}"
+
+fn main() -> String!:
+    port := choose_port(21500)!
+    listener := tcp_listen("127.0.0.1", port)!
+    spawn http_loop(listener)
+    base := "http://127.0.0.1:{port}"
+    c := http.client()
+
+    for status in [301, 302, 303, 307, 308]:
+        post := c.send(http.new_request("POST", base + "/status/{status}")!.body_text("payload").header("Content-Type", "text/plain"))
+        print("POST, {status}: " + show(post))
+    for status in [301, 302, 303, 307, 308]:
+        print("GET, {status}: " + show(c.get(base + "/status/{status}")))
+    head := c.head(base + "/status/303")!
+    print("HEAD, 303: {head.status}, body {head.body.len()} bytes")
+    print("PUT, 303: " + show(c.send(http.new_request("PUT", base + "/status/303")!.body_text("payload"))))
+
+    print("relative Location: " + show(c.get(base + "/relative/start")))
+    print("network-path Location: " + show(c.get(base + "/network-path")))
+    print("redirect without a Location: " + show(c.get(base + "/no-location")))
+    print("max_redirects 0: " + show(http.client().with_max_redirects(0).get(base + "/status/301")))
+
+    print("10 redirects: " + show(c.get(base + "/chain/9")))
+    print("11 redirects: " + show(c.get(base + "/chain/10")))
+    print("11 redirects, max_redirects 11: " + show(http.client().with_max_redirects(11).get(base + "/chain/10")))
+
+    authed := http.new_request("GET", base + "/same-host")!.basic_auth("user", "secret").cookie("session", "s1")
+    print("same host, credentials kept: " + show(c.send(authed)))
+    elsewhere := http.new_request("GET", base + "/elsewhere")!.basic_auth("user", "secret").cookie("session", "s1")
+    print("another host, credentials dropped: " + show(c.send(elsewhere)))
+
+    sink := bytes.buffer()
+    writer := sink.buffered_chunked(64)
+    streamed := c.send_into(http.new_request("GET", base + "/status/302")!, writer)!
+    print("send_into through a redirect: {streamed.status} {sink.bytes().to_string_utf8()!}")
+    writer.free()
+    sink.free()
+    return ""

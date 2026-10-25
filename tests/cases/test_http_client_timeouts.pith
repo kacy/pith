@@ -1,0 +1,105 @@
+# the time limits of http.Client against servers that stall on purpose: one
+# that never answers, one that sends a head and then stops, and one that
+# drips its body a byte at a time, each byte well inside any per-read
+# timeout.
+#
+# the limits are short (200-300 ms) so the run stays quick. a case checks
+# that the client gave up after most of its limit and well before several
+# times it, so a loaded machine can be slow without failing it.
+
+import std.net.http as http
+import std.time as time_mod
+
+GIVE_UP_MS := 2500
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn read_head(fd: Int) -> String:
+    mut seen := ""
+    while seen.index_of("\r\n\r\n") < 0:
+        chunk := tcp_read(fd, 4096) catch ""
+        if chunk == "":
+            return ""
+        seen = seen + chunk
+    return seen
+
+# how the server behaves once it has read a request: 0 never answers, 1
+# sends a head and two bytes of a ten-byte body, 2 drips a 100-byte body one
+# byte every 40 ms.
+fn stall_conn(fd: Int, mode: Int) -> Int:
+    if read_head(fd) == "":
+        tcp_close(fd)
+        return 0
+    if mode == 1:
+        tcp_write(fd, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab") catch 0
+    if mode == 2:
+        tcp_write(fd, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n") catch 0
+        mut i := 0
+        while i < 100:
+            sleep(40)
+            if tcp_write(fd, "x").is_err:
+                break
+            i = i + 1
+    # hold the connection until the client gives up on it
+    tcp_read(fd, 4096) catch ""
+    tcp_close(fd)
+    return 0
+
+fn stall_loop(listener: Int, mode: Int) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn stall_conn(fd, mode)
+    return 0
+
+fn start_stall(start: Int, mode: Int) -> Int!:
+    port := choose_port(start)!
+    listener := tcp_listen("127.0.0.1", port)!
+    spawn stall_loop(listener, mode)
+    return port
+
+fn within(elapsed: Int, low: Int) -> String:
+    if elapsed < low:
+        return "too soon ({elapsed} ms)"
+    if elapsed >= GIVE_UP_MS:
+        return "too late ({elapsed} ms)"
+    return "in time"
+
+fn timed_get(c: http.Client, req: http.ClientRequest, low: Int) -> String:
+    started := time_mod.mono_millis()
+    resp := c.send(req)
+    elapsed := time_mod.mono_millis() - started
+    if resp.is_ok:
+        return "answered {resp.ok.status}, {within(elapsed, low)}"
+    return "{resp.err}, {within(elapsed, low)}"
+
+fn get_req(port: Int) -> http.ClientRequest:
+    return http.new_request("GET", "http://127.0.0.1:{port}/") catch http.get_request("127.0.0.1", port, "/")
+
+fn main() -> String!:
+    silent := start_stall(21700, 0)!
+    print("response_header_timeout 200, silent server: " + timed_get(http.client().with_response_header_timeout(200), get_req(silent), 150))
+    print("timeout 300, silent server: " + timed_get(http.client().with_timeout(300), get_req(silent), 250))
+    print("timeout 5000, request with_timeout 300, silent server: " + timed_get(http.client().with_timeout(5000), get_req(silent).with_timeout(300), 250))
+
+    short := start_stall(21700, 1)!
+    print("response_header_timeout 200, body stalls: " + timed_get(http.client().with_response_header_timeout(200).with_timeout(400), get_req(short), 350))
+
+    drip := start_stall(21700, 2)!
+    print("timeout 300, body dripped every 40 ms: " + timed_get(http.client().with_timeout(300), get_req(drip), 250))
+
+    # nothing answers on this address, or the network refuses it outright;
+    # either way the dial ends within its limit
+    started := time_mod.mono_millis()
+    dialed := http.client().with_dial_timeout(200).send(http.get_request("10.255.255.1", 21799, "/"))
+    elapsed := time_mod.mono_millis() - started
+    print("dial_timeout 200, unroutable address: failed {dialed.is_err}, {within(elapsed, 0)}")
+    return ""

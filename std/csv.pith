@@ -245,15 +245,11 @@ fn csv_write_escaped_field(out: ByteBuffer, field: String) -> Int!:
 # runtime search that compares slice by slice, and built two one-character
 # strings per field to search for; on a ten-column row that was two thirds
 # of the encoder's instructions (docs/performance.md, 2026-09-10).
+# a field is quoted when it holds a comma, a quote or a newline. each check
+# is the runtime's substring search, which takes a one-byte needle to memchr,
+# so a field is scanned a word at a time instead of one byte per loop pass.
 fn csv_field_needs_quoting(field: String) -> Bool:
-    n := field.len()
-    mut i := 0
-    while i < n:
-        b := ord(field[i])
-        if b == CSV_COMMA or b == CSV_QUOTE or b == CSV_LF:
-            return true
-        i = i + 1
-    return false
+    return field.contains(",") or field.contains("\"") or field.contains("\n")
 
 fn encode_row_bytes_to(out: ByteBuffer, row: List[String]) -> Int!:
     mut total := 0

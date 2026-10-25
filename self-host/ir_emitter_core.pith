@@ -59,7 +59,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name, ir_binding_has_collection_init
 from ir_capture import ir_capture_find_free_vars
 from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_encode_result_value, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_emit_json_field_ok, ir_emit_result_ok_field_typed_with_state, ir_result_field_kind
-from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read
+from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_optional_value_as, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_parse_field_index, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -722,9 +722,8 @@ fn ir_emit_weak_payload(val_idx: Int) -> Int:
     val_r := ir_expr(val_idx)
     mut payload_r := val_r
     if ir_rc_kind(ir_infer_type(val_idx)) == "tuple":
-        # already an optional tuple: the payload sits at offset 8 (0 when none)
-        payload_r = ir_reg()
-        ir_emit("field " + payload_r.to_string() + " " + val_r.to_string() + " 8 unknown value")
+        # already an optional: its payload, or 0 when it is none
+        payload_r = ir_optional_value_as(val_r, "unknown")
     retain_r := ir_reg()
     ir_emit("call " + retain_r.to_string() + " pith_struct_weak_retain void 1 " + payload_r.to_string())
     return payload_r
@@ -6993,8 +6992,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
         # the element, so the shell takes its own count on it first
         owned_getter_kind := ir_owned_receiver_getter_payload_kind(idx, emit_name)
         if owned_getter_kind.len() > 0:
-            payload_r := ir_reg()
-            ir_emit("field " + payload_r.to_string() + " " + r.to_string() + " 8 unknown value")
+            payload_r := ir_optional_value_as(r, "unknown")
             ir_rc_retain_reg(payload_r, owned_getter_kind)
             if owned_getter_kind == "tuple":
                 ir_optional_tuple_dtor_needed = true
@@ -9868,8 +9866,8 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
     ir_emit_label(end_l)
 
 # `for x in it` where `it` is an iterator (a struct with `next() -> T?`).
-# Drives the loop by calling next() each iteration: the result is an optional
-# tuple (is_some flag at field 0, value at field 8); stop when the flag is 0.
+# Drives the loop by calling next() each iteration and stops at the first
+# none; the value is read from the Some shell's slot 8 inside the loop.
 fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: String):
     iter_r := ir_expr(node.children[0])
     fid := ir_for_count
@@ -11132,9 +11130,8 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
 
 # one destructor per rc payload kind for owned optionals. an optional that owns
 # a struct/list/map/set/bytes/closure/string payload attaches the matching dtor,
-# which releases the payload (slot 1) when the optional tuple dies. release on a
-# null payload is a no-op, so no is_some guard is needed — none tuples never
-# carry a dtor anyway.
+# which releases the payload (slot 1) when the optional's shell dies. a none is
+# the null pointer and has no shell, so these only ever run on a Some.
 #
 # string joined the list late. an optional over a string used to borrow, which
 # is safe for a payload some local keeps a count for and wrong for a fresh one:
@@ -11151,8 +11148,8 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
 # exactly once. releasing the elements here as well released each of them
 # twice, which freed values the program was still using.
 #
-# a null payload is skipped rather than released: a none shell carries no
-# destructor, but a shell whose payload was moved out reaches here zeroed.
+# a null payload is skipped rather than released: a shell whose payload was
+# moved out reaches here zeroed.
 fn ir_emit_optional_tuple_walks():
     if ir_optional_tuple_dtor_needed == false:
         return

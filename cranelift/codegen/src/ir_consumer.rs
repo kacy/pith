@@ -15,6 +15,10 @@ use pith_runtime::bytes::{
     BYTES_DATA_LEN_OFFSET, BYTES_DATA_PTR_OFFSET, BYTES_HANDLE_ALIGN, BYTES_MAGIC,
     BYTES_MAGIC_OFFSET,
 };
+use pith_runtime::runtime_core::{
+    CLOSURE_ENV_OFFSET, CLOSURE_HANDLE_ALIGN, CLOSURE_MAGIC, CLOSURE_MAGIC_OFFSET,
+    PITH_CLOSURE_ENV_SLOTS,
+};
 use pith_runtime::collections::list::{
     LIST_HANDLE_ALIGN, LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_TYPE_TAG_OFFSET,
     LIST_IMPL_VALUES8_LEN_OFFSET, LIST_IMPL_VALUES8_PTR_OFFSET, LIST_MAGIC,
@@ -840,6 +844,54 @@ fn inline_handle_len(
 
     builder.switch_to_block(done);
     builder.block_params(done)[0]
+}
+
+/// Inline a closure body's read of one of its captures
+/// (`pith_closure_get_env`) as the handle test `closure_base` makes and one
+/// load from the inline env. Every call into a closure reads its captures
+/// this way, so the FFI call was most of the cost of a small closure. A slot
+/// past the inline block lives in the spill vec, and it and a bad handle go
+/// to `fallback`, which answers as it always has.
+fn inline_closure_get_env(
+    builder: &mut FunctionBuilder<'_>,
+    closure: Value,
+    slot: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+    builder.append_block_param(slow, types::I64);
+    builder.append_block_param(slow, types::I64);
+    builder.set_cold_block(slow);
+
+    branch_if_not_magic_handle(
+        builder,
+        closure,
+        slot,
+        CLOSURE_HANDLE_ALIGN,
+        CLOSURE_MAGIC_OFFSET,
+        CLOSURE_MAGIC,
+        slow,
+    );
+    // one unsigned compare rejects a negative slot and a spilled one
+    let spilled = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        slot,
+        PITH_CLOSURE_ENV_SLOTS as i64,
+    );
+    let read = builder.create_block();
+    brif_with_two_i64_args(builder, spilled, slow, closure, slot, read);
+    builder.switch_to_block(read);
+
+    let offset = builder.ins().ishl_imm(slot, 3);
+    let addr = builder.ins().iadd(closure, offset);
+    let value = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), addr, CLOSURE_ENV_OFFSET);
+    jump_with_i64_arg(builder, done, value);
+
+    finish_strict_fast_path(builder, slow, done, fallback)
 }
 
 /// Inline bytes.read_word for the common case — a count of 1..=8 with a
@@ -2624,6 +2676,23 @@ fn compile_ir_function(
                         );
                         let zero = builder.ins().iconst(types::I64, 0);
                         regs.insert(reg, zero);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
+                    if fname == "pith_closure_get_env" && args.len() == 2 && !name_is_shadowed {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "pith_closure_get_env",
+                        )?;
+                        let inlined =
+                            inline_closure_get_env(&mut builder, args[0], args[1], fallback);
+                        regs.insert(reg, inlined);
                         string_regs.remove(&reg);
                         bytes_regs.remove(&reg);
                         float_regs.remove(&reg);

@@ -3,9 +3,11 @@
 import std.bits as bits
 import std.bytes as bytes
 
-# the crc-32 lookup table: for each byte value, the remainder of shifting
-# it through the reflected polynomial 0xEDB88320 eight times. one entry
-# per byte value, so the per-byte step below is a table read and a shift.
+# the crc-32 lookup tables for slicing-by-8: eight tables of 256 entries in
+# one list, table k at offset 256 * k. table 0 is the classic one: for each
+# byte value, the remainder of shifting it through the reflected polynomial
+# 0xEDB88320 eight times. table k advances a table k - 1 entry by one more
+# zero byte, so table k is a byte's contribution with k bytes still to come.
 fn crc32_build_table() -> List[Int]:
     mut table: List[Int] := []
     mut value := 0
@@ -20,6 +22,11 @@ fn crc32_build_table() -> List[Int]:
             i = i + 1
         table.push(crc)
         value = value + 1
+    mut at := 256
+    while at < 2048:
+        prev := table[at - 256]
+        table.push(bits.xor(bits.shr(prev, 8), table[bits.band(prev, 255)]))
+        at = at + 1
     return table
 
 # built when the module loads. module initializers run on the main thread
@@ -30,16 +37,22 @@ crc32_table: List[Int] := crc32_build_table()
 pub fn crc32(data: Bytes) -> Int:
     mut crc := 4294967295
     n := data.len()
+    full := n - n % 8
     mut pos := 0
-    # table-driven: one lookup per byte instead of eight conditional shifts,
-    # which cost about 260 instructions per byte. the length is read once,
-    # and the byte comes through the bytes_get builtin: both it and the
-    # subscript lower to an inlined load, but the subscript also proves the
-    # handle (its alignment and magic word) before every read, four more
-    # instructions per byte here; the loop bound keeps the index in range,
-    # so the two never differ.
-    # crc32_reference below is the bit-at-a-time definition, kept as the
-    # oracle the randomized test compares against.
+    # slicing-by-8: eight bytes per step, read as one little-endian word
+    # through bytes_read_word, which lowers to one inlined load. the eight
+    # table reads depend only on the word and the crc going in, not on each
+    # other, so they overlap; the byte-at-a-time loop chained every lookup
+    # on the one before it. the low four bytes fold into the crc first.
+    while pos < full:
+        word := bytes_read_word(data, pos, 8)
+        x := bits.xor(crc, bits.band(word, 4294967295))
+        hi := bits.shr(word, 32)
+        crc = bits.xor(bits.xor(bits.xor(crc32_table[1792 + bits.band(x, 255)], crc32_table[1536 + bits.band(bits.shr(x, 8), 255)]), bits.xor(crc32_table[1280 + bits.band(bits.shr(x, 16), 255)], crc32_table[1024 + bits.shr(x, 24)])), bits.xor(bits.xor(crc32_table[768 + bits.band(hi, 255)], crc32_table[512 + bits.band(bits.shr(hi, 8), 255)]), bits.xor(crc32_table[256 + bits.band(bits.shr(hi, 16), 255)], crc32_table[bits.shr(hi, 24)])))
+        pos = pos + 8
+    # the last n % 8 bytes go one at a time through table 0. bytes_get is
+    # the subscript without the handle proof, and the loop bound keeps the
+    # index in range.
     while pos < n:
         crc = bits.xor(crc32_table[bits.band(bits.xor(crc, bytes_get(data, pos)), 255)], bits.shr(crc, 8))
         pos = pos + 1
@@ -143,7 +156,7 @@ test "adler32 matches common vectors":
 # random content at random lengths, checked against the bit-at-a-time
 # definition: every length from 0 to 40 several times over, plus a spread
 # of longer inputs.
-test "table-driven crc32 agrees with the bit-at-a-time definition":
+test "slicing-by-8 crc32 agrees with the bit-at-a-time definition":
     mut state := 88172645463325252
     mut trial := 0
     while trial < 3000:

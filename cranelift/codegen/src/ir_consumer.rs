@@ -1095,6 +1095,9 @@ fn emit_preempt_safepoint(
 
     let yield_block = builder.create_block();
     let cont_block = builder.create_block();
+    // the flag is almost never set, so the call goes out of line: placed
+    // after the loop and kept from shaping the loop's register assignment.
+    builder.set_cold_block(yield_block);
     // flag set -> slow path; clear -> straight to the continuation.
     builder
         .ins()

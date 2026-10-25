@@ -98,6 +98,18 @@ eq|neq|lt|gt|lte|gte REG A B     result is 0 or 1. dispatches on operand kind:
 concat REG A B              REG = A followed by B, as a fresh heap string.
 ```
 
+**optionals**
+
+```
+optflag REG OPT             1 when the optional OPT holds a value, 0 when it
+                            is none.
+optval REG OPT KIND NAME    the payload of OPT, typed by KIND, or 0 when OPT
+                            is none.
+```
+
+the emitter reads optionals through these two forms only, never with `field`,
+because a none has no shell to load from (see the optional encoding below).
+
 **calls**
 
 ```
@@ -226,6 +238,12 @@ taking the payload out of a box that someone else still holds, without a
 count of its own, left the caller's box and the returned payload sharing one
 count, and whichever was released first freed what the other still read
 (#1164).
+
+**optional encoding.** a `T?` is the null pointer when it is none. a Some is
+a two-slot struct allocation holding 1 at offset 0 and the payload at offset
+8, and it may carry a destructor that releases the payload. a none costs no
+allocation, and releasing one is a no-op. a runtime function that returns an
+optional builds it with `optional_tuple`, which returns 0 for none.
 
 **result encoding.** `result_int` and `result_bool` use a zero sentinel for the
 error case: a real value `v` is carried as `v + 1`, and `0` means "error". the

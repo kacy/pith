@@ -1,0 +1,16 @@
+# a loop holds its own count on the value it walks, so a body that
+# reassigns the walked variable leaves the loop reading the old value. it
+# used to borrow the variable's count, and the reassignment freed the string
+# or list under the loop.
+
+fn main() -> Int:
+    mut s := "abc".repeat(2)
+    for ch in s:
+        s = s + ch
+    print(s)
+
+    mut xs := [1, 2, 3]
+    for x in xs:
+        xs = [x * 10, x * 10 + 1]
+    print(xs.len().to_string() + " " + xs[0].to_string() + " " + xs[1].to_string())
+    return 0

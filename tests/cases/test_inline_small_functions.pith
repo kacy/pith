@@ -1,0 +1,51 @@
+# small functions are inlined into their callers by codegen. these cover the
+# shapes an inlined body has to get right: an error result in registers, a
+# float return, an optional, a string, branches, and mutual recursion, which
+# must keep its calls.
+fn add(a: Int, b: Int) -> Int:
+    return a + b
+
+fn half(x: Float) -> Float:
+    return x / 2.0
+
+fn checked(x: Int) -> Int!:
+    if x < 0:
+        fail "negative"
+    return x * 2
+
+fn first_even(a: Int, b: Int) -> Int?:
+    if a % 2 == 0:
+        return a
+    if b % 2 == 0:
+        return b
+    return none
+
+fn shout(s: String) -> String:
+    return s + "!"
+
+fn is_even(n: Int) -> Bool:
+    if n == 0:
+        return true
+    return is_odd(n - 1)
+
+fn is_odd(n: Int) -> Bool:
+    if n == 0:
+        return false
+    return is_even(n - 1)
+
+fn main() -> Int!:
+    mut total := 0
+    mut i := 0
+    while i < 1000:
+        total = add(total, i)
+        i = i + 1
+    print(total.to_string())
+    print(half(5.0).to_string())
+    print(checked(21)!.to_string())
+    print((checked(0 - 1) catch 0 - 7).to_string())
+    print(first_even(3, 8).unwrap_or(0).to_string())
+    print(first_even(3, 5).unwrap_or(0 - 1).to_string())
+    print(shout("hi"))
+    print(is_even(10).to_string())
+    print(is_odd(7).to_string())
+    return 0

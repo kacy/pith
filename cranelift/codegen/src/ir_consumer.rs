@@ -1525,6 +1525,7 @@ pub fn compile_from_ir(
 
     // Pass 2: compile function bodies (first definition wins for duplicates)
     let mut compiled_funcs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut built: Vec<(FuncId, String, cranelift::codegen::ir::Function)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let parts: Vec<&str> = lines[i].split_whitespace().collect();
@@ -1566,7 +1567,7 @@ pub fn compile_from_ir(
             None => body_lines,
         };
         if let Some(&func_id) = declared_funcs.get(&func_name) {
-            compile_ir_function(
+            let func = compile_ir_function(
                 codegen,
                 func_id,
                 &func_name,
@@ -1583,10 +1584,135 @@ pub fn compile_from_ir(
                 preempt_flag,
                 &bits_aliases,
             )?;
+            built.push((func_id, func_name.clone(), func));
         }
     }
 
+    define_with_inlining(codegen, built)?;
     Ok(declared_funcs)
+}
+
+/// Callees with more instructions than this keep their call. A Pith function
+/// this small is a helper (a predicate, an accessor, a one-line wrapper), for
+/// which the call costs about as much as the body.
+const INLINE_MAX_INSTS: usize = 24;
+
+/// Define every built function, first inlining the small functions it calls.
+/// The functions are all built before any is defined so that a caller can
+/// inline a callee that appears later in the IR. `PITH_INLINE=0` turns the
+/// inlining off, which is how to A/B it.
+fn define_with_inlining(
+    codegen: &mut CodeGen,
+    built: Vec<(FuncId, String, cranelift::codegen::ir::Function)>,
+) -> Result<(), CompileError> {
+    let enabled = std::env::var("PITH_INLINE").map_or(true, |v| v != "0");
+    // the inliner takes callee bodies in their legalized form, so each
+    // candidate is legalized once, on a copy, before any caller asks for it
+    let mut bodies: HashMap<FuncId, cranelift::codegen::ir::Function> = HashMap::new();
+    if enabled {
+        for (id, name, func) in &built {
+            if is_inline_candidate(name, func) {
+                let mut ctx = codegen.module.make_context();
+                ctx.func = func.clone();
+                if ctx.legalize(codegen.module.isa()).is_ok() && !names_data(&ctx.func) {
+                    bodies.insert(*id, ctx.func);
+                }
+            }
+        }
+    }
+    for (func_id, func_name, func) in &built {
+        let mut ctx = codegen.module.make_context();
+        ctx.func = func.clone();
+        if enabled {
+            let inliner = SmallFnInliner {
+                caller: *func_id,
+                bodies: &bodies,
+            };
+            ctx.inline(inliner).map_err(|e| {
+                CompileError::ModuleError(format!("IR consumer: inlining into {func_name}: {e}"))
+            })?;
+        }
+        define_built_function(codegen, *func_id, func_name, &mut ctx)?;
+    }
+    Ok(())
+}
+
+/// Whether the function refers to a global by symbol: a module global, a
+/// string constant, the preemption flag. Cranelift's inliner copies such a
+/// global value into the caller with its name reference unchanged, but that
+/// reference indexes the callee's own name table, so in the caller it names
+/// some other symbol. Function references are translated, so calls are fine;
+/// a callee that names data is not inlined.
+fn names_data(func: &cranelift::codegen::ir::Function) -> bool {
+    func.global_values.values().any(|gv| {
+        matches!(
+            gv,
+            cranelift::codegen::ir::GlobalValueData::Symbol {
+                name: cranelift::codegen::ir::ExternalName::User(_),
+                ..
+            }
+        )
+    })
+}
+
+/// Whether calls to this function may be inlined: small, and not one of the
+/// entry points the runtime calls by name.
+fn is_inline_candidate(name: &str, func: &cranelift::codegen::ir::Function) -> bool {
+    if name == "main" || name.starts_with("__init_globals") {
+        return false;
+    }
+    let mut insts = 0usize;
+    for block in func.layout.blocks() {
+        insts += func.layout.block_insts(block).count();
+        if insts > INLINE_MAX_INSTS {
+            return false;
+        }
+    }
+    true
+}
+
+/// Directs Cranelift's inliner: a direct call to a small Pith function is
+/// inlined, everything else keeps its call. Calls inside an inlined body are
+/// not inlined again, which bounds the growth and rules out recursion through
+/// a cycle; a function never inlines itself.
+struct SmallFnInliner<'a> {
+    caller: FuncId,
+    bodies: &'a HashMap<FuncId, cranelift::codegen::ir::Function>,
+}
+
+impl cranelift::codegen::inline::Inline for SmallFnInliner<'_> {
+    fn inline(
+        &mut self,
+        caller: &cranelift::codegen::ir::Function,
+        _call_inst: cranelift::codegen::ir::Inst,
+        _call_opcode: cranelift::codegen::ir::Opcode,
+        callee: cranelift::codegen::ir::FuncRef,
+        _call_args: &[Value],
+    ) -> cranelift::codegen::inline::InlineCommand<'_> {
+        use cranelift::codegen::inline::InlineCommand;
+        use cranelift::codegen::ir::ExternalName;
+        // cranelift_module names a function as user name (namespace 0,
+        // index = its FuncId); a runtime import is a function too, but the
+        // runtime is not in `bodies`, so it keeps its call.
+        let ExternalName::User(name_ref) = caller.dfg.ext_funcs[callee].name else {
+            return InlineCommand::KeepCall;
+        };
+        let name = &caller.params.user_named_funcs()[name_ref];
+        if name.namespace != 0 {
+            return InlineCommand::KeepCall;
+        }
+        let id = FuncId::from_u32(name.index);
+        if id == self.caller {
+            return InlineCommand::KeepCall;
+        }
+        match self.bodies.get(&id) {
+            Some(body) => InlineCommand::Inline {
+                callee: std::borrow::Cow::Borrowed(body),
+                visit_callee: false,
+            },
+            None => InlineCommand::KeepCall,
+        }
+    }
 }
 
 /// Rewrite each chain of string concatenations in a function body into one
@@ -1809,7 +1935,7 @@ fn compile_ir_function(
     string_global_names: &std::collections::HashSet<String>,
     preempt_flag: Option<cranelift_module::DataId>,
     bits_aliases: &HashMap<String, &'static str>,
-) -> Result<(), CompileError> {
+) -> Result<cranelift::codegen::ir::Function, CompileError> {
     let mut ctx = codegen.module.make_context();
 
     // Build signature
@@ -3555,9 +3681,21 @@ fn compile_ir_function(
     builder.seal_all_blocks();
     builder.finalize();
 
+    let _ = func_id;
+    Ok(ctx.func)
+}
+
+/// Define one built function, naming the failing instruction when the
+/// verifier rejects it.
+fn define_built_function(
+    codegen: &mut CodeGen,
+    func_id: FuncId,
+    func_name: &str,
+    ctx: &mut cranelift::codegen::Context,
+) -> Result<(), CompileError> {
     codegen
         .module
-        .define_function(func_id, &mut ctx)
+        .define_function(func_id, ctx)
         .map_err(|e| {
             // the wrapped Display collapses verifier failures to the
             // string "Verifier errors"; pull the actual list out so the

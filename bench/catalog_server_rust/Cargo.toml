@@ -1,0 +1,17 @@
+# rust counterpart to bench/catalog_server.go. a standalone workspace so cargo
+# does not fold this into the runtime workspace at the repo root.
+[workspace]
+
+[package]
+name = "catalog_server_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "query", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+
+[profile.release]
+opt-level = 3

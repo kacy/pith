@@ -1,0 +1,50 @@
+# benchmarks for bench/compare.sh, one per line:
+#   name | args | pith build | go build | rust build [| check]
+# build specs and the optional check (an awk program that picks out the
+# output to compare) are described in bench/compare.sh. the pith source is
+# bench/<name>.pith, or bench/<source>.pith for a name <source>/<label>.
+event_ledger     | 200000  | pith | go:bench/event_ledger.go     | cargo:bench/event_ledger_rust
+std_pipeline     | 50000   | pith | go:bench/std_pipeline.go     | cargo:bench/std_pipeline_rust
+catalog_workload | 4000    | pith | go:bench/catalog_workload.go | rustc:bench/catalog_workload.rs
+chan_fanout      | 1000000 | pith | go:bench/chan_fanout.go      | rustc:bench/chan_fanout.rs
+closure_error    | 2000000 | pith | go:bench/closure_error.go    | rustc:bench/closure_error.rs
+tight_loop               | 2000000000                       | pith | go:bench/tight_loop.go       | rustc:bench/tight_loop.rs
+closure_calls            | 50000000                         | pith | go:bench/closure_calls.go    | rustc:bench/closure_calls.rs
+substring_search         | 20000                            | pith | go:bench/substring_search.go | rustc:bench/substring_search.rs
+substring_search/absent  | 500 long-absent                  | pith | go:bench/substring_search.go | rustc:bench/substring_search.rs
+hash_kernels/none        | none 256                         | pith | go:bench/hash_kernels.go     | cargo:bench/hash_kernels_rust
+hash_kernels/sha256      | sha256 256                       | pith | go:bench/hash_kernels.go     | cargo:bench/hash_kernels_rust
+hash_kernels/sha512      | sha512 256                       | pith | go:bench/hash_kernels.go     | cargo:bench/hash_kernels_rust
+hash_kernels/fnv1a       | fnv1a 256                        | pith | go:bench/hash_kernels.go     | cargo:bench/hash_kernels_rust
+hash_kernels/crc32       | crc32 256                        | pith | go:bench/hash_kernels.go     | cargo:bench/hash_kernels_rust
+string_buffer/build      | current build 100000 200 200     | pith | go:bench/string_buffer.go    | rustc:bench/string_buffer.rs
+string_buffer/snapshot   | current snapshot 10000 200 200   | pith | go:bench/string_buffer.go    | rustc:bench/string_buffer.rs
+cyclic_graph             | 10000000                         | pith | go:bench/cyclic_graph.go        | rustc:bench/cyclic_graph.rs
+cyclic_graph_strong      | 10000000                         | pith | go:bench/cyclic_graph_strong.go | rustc:bench/cyclic_graph_strong.rs
+csv_encode               | 5000 400                         | pith | go:bench/csv_encode.go       | rustc:bench/csv_encode.rs
+json_decode_shapes/small | small 4 20000000                 | pith | go:bench/json_decode_shapes.go | cargo:bench/json_decode_shapes_rust
+json_decode_shapes/wide  | wide 32 3000000                  | pith | go:bench/json_decode_shapes.go | cargo:bench/json_decode_shapes_rust
+json_decode_shapes/nested | nested 4 8000000                | pith | go:bench/json_decode_shapes.go | cargo:bench/json_decode_shapes_rust
+json_decode_shapes/list  | list 32 400000                   | pith | go:bench/json_decode_shapes.go | cargo:bench/json_decode_shapes_rust
+json_decode_shapes/list_walk | list_walk 32 5000            | pith | go:bench/json_decode_shapes.go | cargo:bench/json_decode_shapes_rust
+json_decode_shapes/map   | map 32 300000                    | pith | go:bench/json_decode_shapes.go | cargo:bench/json_decode_shapes_rust
+json_decode_shapes/float | float 4 12000000                 | pith | go:bench/json_decode_shapes.go | cargo:bench/json_decode_shapes_rust
+path_clean_count         | 2000000                          | pith | go:bench/path_clean_count.go | rustc:bench/path_clean_count.rs
+map_update/string        | string 50000000 64               | pith | go:bench/map_update.go       | rustc:bench/map_update.rs
+map_update/bytes         | bytes 50000000 64                | pith | go:bench/map_update.go       | rustc:bench/map_update.rs
+map_update/int           | int 100000000 64                 | pith | go:bench/map_update.go       | rustc:bench/map_update.rs
+generic_sort/int         | current random int 100000 30     | pith | go:bench/generic_sort.go     | rustc:bench/generic_sort.rs
+generic_sort/string      | current random string 100000 30  | pith | go:bench/generic_sort.go     | rustc:bench/generic_sort.rs
+http_head_read           | 1000000                          | pith | go:bench/http_head_read.go   | cargo:bench/http_head_read_rust
+task_churn               | 200000                           | pith | go:bench/task_churn.go       | cargo:bench/task_churn_rust
+task_pingpong            | 2000000                          | pith | go:bench/task_pingpong.go    | cargo:bench/task_pingpong_rust:task_pingpong
+green_fanout             | 2000000                          | pith | go:bench/green_fanout.go     | cargo:bench/green_fanout_rust
+cpu_parallel_sync        | 200 1000000                      | pith | go:bench/cpu_parallel_sync.go | cargo:bench/cpu_parallel_sync_rust
+lock_sweep/log           | log 16 100000000                 | pith | go:bench/lock_sweep.go | cargo:bench/lock_sweep_rust
+lock_sweep/spawn         | spawn 16 1600000                 | pith | go:bench/lock_sweep.go | cargo:bench/lock_sweep_rust
+lock_sweep/labels        | labels 16 1600000                | pith | go:bench/lock_sweep.go | cargo:bench/lock_sweep_rust
+lock_sweep/breaker       | breaker 16 50000000              | pith | go:bench/lock_sweep.go | cargo:bench/lock_sweep_rust
+lock_sweep/readfile      | readfile 16 200000               | pith | go:bench/lock_sweep.go | cargo:bench/lock_sweep_rust
+metrics_contention/counter | 3 4000000 16 counter           | pith | go:bench/metrics_contention.go | cargo:bench/metrics_contention_rust | { print $NF }
+metrics_contention/histogram | 3 4000000 16 histogram       | pith | go:bench/metrics_contention.go | cargo:bench/metrics_contention_rust | { print $NF }
+metrics_contention/labels | 3 1000000 16 labels             | pith | go:bench/metrics_contention.go | cargo:bench/metrics_contention_rust | { print $NF }

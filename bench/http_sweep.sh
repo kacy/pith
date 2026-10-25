@@ -9,6 +9,8 @@
 #   nethttp   bench/http_server.go (net/http)
 #   min       bench/http_server_min.go (hand-rolled keep-alive loop on net and bufio)
 #   fasthttp  bench/fasthttp (github.com/valyala/fasthttp, its own module)
+#   hyper     bench/http_server_hyper (hyper 1.x on tokio, the rust counterpart to nethttp)
+#   rustmin   bench/http_server_rustmin (the min loop on tokio, hand-rolled like min)
 #
 # within a round every arm runs once, back to back, and the starting arm
 # rotates from one trial to the next. running all trials of one arm and then
@@ -20,7 +22,7 @@
 # settings, all from the environment:
 #   WRK          wrk binary (default: wrk)
 #   PITH         pith compiler (default: pith, else ./target/release/pith)
-#   ARMS         arms to run (default: "pith nethttp min fasthttp")
+#   ARMS         arms to run (default: "pith nethttp min fasthttp hyper rustmin")
 #   CONNS        connection counts (default: "32 128 256 1024")
 #   TRIALS       trials per arm and connection count; the median is reported (default: 3)
 #   DURATION     seconds per measured run (default: 10)
@@ -28,14 +30,18 @@
 #   THREADS      wrk threads (default: 16; with 8, wrk caps the go arms near 1.65M req/s)
 #   SERVER_CPUS  taskset cpu list for the server (default: 0-7,16-23)
 #   WRK_CPUS     taskset cpu list for wrk (default: 8-15,24-31)
-#   WORKERS      PITH_GREEN_WORKERS for pith and GOMAXPROCS for the go arms (default: 16)
+#   WORKERS      PITH_GREEN_WORKERS for pith, GOMAXPROCS for the go arms and
+#                TOKIO_WORKERS for the rust arms (default: 16)
 #
 # the cpu defaults give the server one ccd of a 9950x and wrk the other, with
 # each ccd's smt siblings, so the two never share a core or an l3. check
 # /sys/devices/system/cpu/cpu*/topology/thread_siblings_list on another machine.
 #   PORT         first port; each run takes the next one (default: 18080)
-#   PITH_SERVER, NETHTTP_SERVER, MIN_SERVER, FASTHTTP_SERVER
+#   PITH_SERVER, NETHTTP_SERVER, MIN_SERVER, FASTHTTP_SERVER, HYPER_SERVER,
+#   RUSTMIN_SERVER
 #                prebuilt server binaries; an arm without one is built here
+#   CARGO_TARGET_DIR
+#                where the rust arms build (default: the sweep's scratch directory)
 #
 # a short smoke run:
 #   TRIALS=1 DURATION=2 WARMUP=0 bench/http_sweep.sh
@@ -45,7 +51,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 
 wrk=${WRK:-wrk}
-arms=(${ARMS:-pith nethttp min fasthttp})
+arms=(${ARMS:-pith nethttp min fasthttp hyper rustmin})
 conns=(${CONNS:-32 128 256 1024})
 trials=${TRIALS:-3}
 duration=${DURATION:-10}
@@ -76,12 +82,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# build the arms that were not handed a binary. the go arms build into the
-# scratch directory so a sweep never rewrites a binary under bench/.
+# build the arms that were not handed a binary. the go and rust arms build
+# into the scratch directory so a sweep never rewrites a binary under bench/.
 pith_server=${PITH_SERVER:-}
 nethttp_server=${NETHTTP_SERVER:-}
 min_server=${MIN_SERVER:-}
 fasthttp_server=${FASTHTTP_SERVER:-}
+hyper_server=${HYPER_SERVER:-}
+rustmin_server=${RUSTMIN_SERVER:-}
+cargo_target=${CARGO_TARGET_DIR:-$work/cargo}
+# build_rust_arm <crate>: build bench/<crate> and print the binary's path
+build_rust_arm() {
+    cargo build --release --quiet --manifest-path "bench/$1/Cargo.toml" --target-dir "$cargo_target" >&2
+    echo "$cargo_target/release/$1"
+}
 for arm in "${arms[@]}"; do
     case $arm in
     pith)
@@ -116,6 +130,18 @@ for arm in "${arms[@]}"; do
             fasthttp_server=$work/http_server_fasthttp
         fi
         ;;
+    hyper)
+        if [ -z "$hyper_server" ]; then
+            echo "building hyper arm" >&2
+            hyper_server=$(build_rust_arm http_server_hyper)
+        fi
+        ;;
+    rustmin)
+        if [ -z "$rustmin_server" ]; then
+            echo "building rustmin arm" >&2
+            rustmin_server=$(build_rust_arm http_server_rustmin)
+        fi
+        ;;
     *)
         echo "unknown arm: $arm" >&2
         exit 1
@@ -131,6 +157,8 @@ start_server() {
     nethttp) env GOMAXPROCS="$workers" taskset -c "$server_cpus" "$nethttp_server" "$port" > /dev/null 2>&1 & ;;
     min) env GOMAXPROCS="$workers" taskset -c "$server_cpus" "$min_server" "$port" > /dev/null 2>&1 & ;;
     fasthttp) env GOMAXPROCS="$workers" taskset -c "$server_cpus" "$fasthttp_server" "$port" > /dev/null 2>&1 & ;;
+    hyper) env TOKIO_WORKERS="$workers" taskset -c "$server_cpus" "$hyper_server" "$port" > /dev/null 2>&1 & ;;
+    rustmin) env TOKIO_WORKERS="$workers" taskset -c "$server_cpus" "$rustmin_server" "$port" > /dev/null 2>&1 & ;;
     esac
     server_pid=$!
     for _ in $(seq 50); do

@@ -148,6 +148,37 @@ pub(crate) fn wait_guarded(guard: &Guard, read: bool, timeout_ms: i64) -> i64 {
     wait_with(guard.fd() as i64, read, timeout_ms, &|| guard.is_live())
 }
 
+/// `wait_guarded` for a caller that has not just seen its syscall would block,
+/// such as `tcp_wait_readable`. the reactor wakes a task when the fd's readiness
+/// changes, so a fd that is already ready would never wake it. a green caller
+/// therefore asks the fd first and waits only when it is not ready now.
+pub(crate) fn wait_guarded_level(guard: &Guard, read: bool, timeout_ms: i64) -> i64 {
+    match probe(guard.fd() as i64, read, timeout_ms) {
+        Some(1) if !guard.is_live() => -1,
+        Some(ready) => ready,
+        None => wait_guarded(guard, read, timeout_ms),
+    }
+}
+
+/// `wait_ready_unguarded` for a caller that has not just seen its syscall
+/// would block; see `wait_guarded_level`.
+pub(crate) fn wait_ready_level(fd: i64, read: bool, timeout_ms: i64) -> i64 {
+    probe(fd, read, timeout_ms).unwrap_or_else(|| wait_ready_unguarded(fd, read, timeout_ms))
+}
+
+/// a green task's answer without parking, when `poll` with no timeout gives
+/// one: the fd is ready or failed, or it is not ready and the caller asked not
+/// to wait. `None` means the caller must wait, which off a green task is
+/// always the case, since that wait is a `poll` already.
+fn probe(fd: i64, read: bool, timeout_ms: i64) -> Option<i64> {
+    green::current_task()?;
+    let events = if read { libc::POLLIN } else { libc::POLLOUT };
+    match poll_wait_any_fd(fd, events, 0) {
+        0 if timeout_ms != 0 => None,
+        ready => Some(ready),
+    }
+}
+
 /// `wait_ready` without the `fd <= 0` guard, for the one caller that
 /// legitimately waits on fd 0: the terminal builtins reading stdin. `0` is a
 /// "no handle" sentinel throughout the socket code, so the guard stays on

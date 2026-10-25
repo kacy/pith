@@ -1,0 +1,95 @@
+# green-thread socket waits that an edge-triggered reactor must not miss.
+#
+# the reactor wakes a task when a socket's readiness changes. two shapes can
+# go wrong under that model, and this test runs both:
+#
+# - a wait that does not follow a would-block. the client reads part of a
+#   reply and then asks tcp_wait_readable whether more is there. the rest
+#   arrived with the first part, so no new edge will come; the wait has to
+#   see the data already buffered.
+# - a reader and a writer on one socket. the client writes a payload far
+#   larger than the socket buffers while a second task reads the echo back,
+#   so both directions block and wake many times on the same fd, often from
+#   tasks on different workers.
+#
+# the output is input-determined, so it is byte-identical on either backend.
+import std.strings as strings
+
+fn write_all(conn: Int, data: String) -> Int!:
+    mut sent := 0
+    while sent < data.len():
+        sent = sent + tcp_write(conn, data.substring(sent, data.len()))!
+    return sent
+
+fn echo_server(listener: Int) -> Int!:
+    c := tcp_accept(listener)!
+    mut total := 0
+    while true:
+        data := tcp_read(c, 65536)!
+        if data.len() == 0:
+            break
+        total = total + write_all(c, data)!
+    tcp_close(c)
+    return total
+
+fn reply_server(listener: Int) -> Int!:
+    c := tcp_accept(listener)!
+    request := tcp_read(c, 64)!
+    write_all(c, "abcdefgh")!
+    # hold the connection open until the client is done with it.
+    done := tcp_read(c, 64)!
+    tcp_close(c)
+    return request.len() + done.len()
+
+fn read_exact(conn: Int, want: Int) -> Int!:
+    mut got := 0
+    while got < want:
+        data := tcp_read(conn, 65536)!
+        if data.len() == 0:
+            break
+        got = got + data.len()
+    return got
+
+fn buffered_data_is_readable(port: Int) -> String!:
+    conn := tcp_connect("127.0.0.1", port)!
+    write_all(conn, "go")!
+    first := tcp_read(conn, 2)!
+    # the rest of the reply is already in the socket buffer.
+    now := tcp_wait_readable(conn, 0)
+    later := tcp_wait_readable(conn, 2000)
+    rest := tcp_read(conn, 64)!
+    tcp_close(conn)
+    return "first {first}, ready now {now}, ready later {later}, rest {rest}"
+
+fn main() -> Int:
+    reply_port := 18571
+    echo_port := 18572
+    reply_listener := tcp_listen("127.0.0.1", reply_port) catch 0
+    echo_listener := tcp_listen("127.0.0.1", echo_port) catch 0
+    if reply_listener == 0 or echo_listener == 0:
+        print("listen failed")
+        return 1
+
+    reply := spawn reply_server(reply_listener)
+    buffered := spawn buffered_data_is_readable(reply_port)
+    print((await buffered).unwrap_or("buffered read failed"))
+    replied := await reply
+
+    echo := spawn echo_server(echo_listener)
+    conn := tcp_connect("127.0.0.1", echo_port) catch 0
+    chunk := strings.repeat("0123456789abcdef", 1024)
+    rounds := 256
+    want := chunk.len() * rounds
+    reader := spawn read_exact(conn, want)
+    mut sent := 0
+    mut i := 0
+    while i < rounds:
+        sent = sent + (write_all(conn, chunk) catch 0)
+        i = i + 1
+    got := (await reader).unwrap_or(-1)
+    tcp_close(conn)
+    echoed := (await echo).unwrap_or(-1)
+    print("sent {sent}, echoed {echoed}, read back {got}, reply server {replied.unwrap_or(-1)}")
+    tcp_close(reply_listener)
+    tcp_close(echo_listener)
+    return 0

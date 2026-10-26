@@ -2685,10 +2685,14 @@ fn compile_ir_function(
                 }
                 regs.insert(reg, acc);
                 reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.insert(reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                note_loaded_kind(
+                    reg,
+                    Some("string"),
+                    &mut string_regs,
+                    &mut bytes_regs,
+                    &mut float_regs,
+                    &mut struct_regs,
+                );
             }
 
             "concat" if parts.len() >= 4 => {

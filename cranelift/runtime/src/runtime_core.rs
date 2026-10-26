@@ -3230,6 +3230,30 @@ pub(crate) fn optional_tuple(is_some: bool, value: i64) -> i64 {
     }
 }
 
+/// An optional getter's answer as a `T?`: see `optional_tuple`.
+pub(crate) fn optional_from(found: Option<i64>) -> i64 {
+    match found {
+        Some(value) => optional_tuple(true, value),
+        None => 0,
+    }
+}
+
+/// An optional getter's answer as two registers, for a compiled caller that
+/// unpacks it on the spot and never needs the Some shell: (1, value) for
+/// Some and (0, 0) for none.
+pub(crate) fn optional_pair(found: Option<i64>) -> crate::ffi_util::ResultPair {
+    match found {
+        Some(value) => crate::ffi_util::ResultPair {
+            is_ok: 1,
+            payload: value,
+        },
+        None => crate::ffi_util::ResultPair {
+            is_ok: 0,
+            payload: 0,
+        },
+    }
+}
+
 unsafe fn struct_base(ptr: i64) -> Option<*mut u8> {
     if ptr == 0 || (ptr as u64) % 8 != 0 {
         return None;

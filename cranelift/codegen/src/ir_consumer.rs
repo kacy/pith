@@ -176,7 +176,7 @@ fn jump_with_two_i64_args(builder: &mut FunctionBuilder<'_>, block: Block, a: Va
 
 // `xs[i]` lowers to a call to pith_list_get_opt, which heap-allocates a
 // two-slot Optional tuple that the very next instructions unpack (flag at
-// offset 0, value at offset 8) and release. When scan_inline_list_get_opt_regs
+// offset 0, value at offset 8) and release. When scan_unpackable_opt_regs
 // proves a call's result is used only by that unpack pattern, the whole round
 // trip collapses to these loads and compares — no call, no allocation, no
 // release. The checks mirror the runtime path exactly: a null or stale handle
@@ -466,14 +466,33 @@ fn emit_bits_op(builder: &mut FunctionBuilder<'_>, op: &str, a: Value, b: Value)
     }
 }
 
-// the defining shape of an inlinable indexed read: call R pith_list_get_opt
-// tuple 2 LIST INDEX.
-fn is_list_get_opt_def(parts: &[&str]) -> bool {
-    parts.len() == 7
-        && parts[0] == "call"
-        && parts[2] == "pith_list_get_opt"
-        && parts[3] == "tuple"
-        && parts[4] == "2"
+// the runtime getters that also come as a register pair returning
+// (is_some, value), for an optional the caller unpacks on the spot.
+fn opt_getter_pair(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "pith_list_first_opt" => "pith_list_first_opt_pair",
+        "pith_list_last_opt" => "pith_list_last_opt_pair",
+        "map_get_opt" => "pith_map_get_cstr_opt_pair",
+        "map_get_ikey_opt" => "pith_map_get_ikey_opt_pair",
+        "map_get_bkey_opt" => "pith_map_get_bkey_opt_pair",
+        "pith_channel_recv" => "pith_channel_recv_pair",
+        "pith_channel_try_recv" => "pith_channel_try_recv_pair",
+        _ => return None,
+    })
+}
+
+// the defining shape of an optional the consumer can unpack without a shell:
+// call R pith_list_get_opt tuple 2 LIST INDEX, which is inlined, or a call to
+// a getter with a register-pair form.
+fn is_unpackable_opt_def(parts: &[&str]) -> bool {
+    if parts.len() < 5 || parts[0] != "call" || parts[3] != "tuple" {
+        return false;
+    }
+    let Ok(nargs) = parts[4].parse::<usize>() else {
+        return false;
+    };
+    parts.len() == 5 + nargs
+        && ((parts[2] == "pith_list_get_opt" && nargs == 2) || opt_getter_pair(parts[2]).is_some())
 }
 
 // a token occurrence (parts[i]) the inline unpack understands: the defining
@@ -482,7 +501,7 @@ fn is_list_get_opt_def(parts: &[&str]) -> bool {
 // throwaway tuple shell. anything else — a store, a return, an argument to
 // some other call — means the tuple escapes and must really exist.
 fn is_sanctioned_opt_use(parts: &[&str], i: usize) -> bool {
-    if is_list_get_opt_def(parts) {
+    if is_unpackable_opt_def(parts) {
         return i == 1;
     }
     if parts.len() == 6 && parts[0] == "field" && (parts[3] == "0" || parts[3] == "8") {
@@ -501,16 +520,16 @@ fn is_sanctioned_opt_use(parts: &[&str], i: usize) -> bool {
     false
 }
 
-// registers holding a pith_list_get_opt result whose every textual use is the
-// emitter's own unpack pattern. the scan is deliberately conservative: any
+// registers holding an unpackable optional (see is_unpackable_opt_def) whose
+// every textual use is the emitter's own unpack pattern. the scan is deliberately conservative: any
 // numeric token equal to a candidate register that sits outside a sanctioned
 // position disqualifies it, so an escaping optional (`.get(i)` stored in a
 // variable, passed on, returned) always takes the real runtime call.
-fn scan_inline_list_get_opt_regs(body_lines: &[&str]) -> HashSet<usize> {
+fn scan_unpackable_opt_regs(body_lines: &[&str]) -> HashSet<usize> {
     let mut candidates: HashMap<usize, u32> = HashMap::new();
     for line in body_lines {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if is_list_get_opt_def(&parts) {
+        if is_unpackable_opt_def(&parts) {
             if let Ok(r) = parts[1].parse::<usize>() {
                 *candidates.entry(r).or_insert(0) += 1;
             }
@@ -2123,7 +2142,7 @@ fn compile_ir_function(
     // calls compile to inline loads instead (see inline_list_get_opt). The map
     // carries each virtualized register's (is_some, value) pair for the field
     // reads that follow.
-    let inline_opt_regs = scan_inline_list_get_opt_regs(body_lines);
+    let inline_opt_regs = scan_unpackable_opt_regs(body_lines);
     let mut virtual_opts: HashMap<usize, (Value, Value)> = HashMap::new();
 
     // Older emitters briefly lowered `break` in `while true` loops through an
@@ -2742,6 +2761,36 @@ fn compile_ir_function(
                         bytes_regs.remove(&reg);
                         float_regs.remove(&reg);
                         continue;
+                    }
+                    // a getter's optional that never escapes: call its pair
+                    // form and keep (is_some, value) in registers, so no Some
+                    // shell is built.
+                    if let Some(pair_name) = opt_getter_pair(fname)
+                        .filter(|_| inline_opt_regs.contains(&reg))
+                        .filter(|_| !declared_funcs.contains_key(fname))
+                    {
+                        if let Some(&fid) = runtime_funcs.get(pair_name) {
+                            let mut args = Vec::with_capacity(nargs);
+                            for j in 0..nargs {
+                                args.push(get_reg(&regs, parts[arg_start + j])?);
+                            }
+                            let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
+                                codegen.module.declare_func_in_func(fid, builder.func)
+                            });
+                            let call = builder.ins().call(fref, &args);
+                            let &[flag, value] = builder.func.dfg.inst_results(call) else {
+                                return Err(CompileError::ModuleError(format!(
+                                    "ir consumer: {} does not return a register pair",
+                                    pair_name
+                                )));
+                            };
+                            virtual_opts.insert(reg, (flag, value));
+                            regs.remove(&reg);
+                            string_regs.remove(&reg);
+                            bytes_regs.remove(&reg);
+                            float_regs.remove(&reg);
+                            continue;
+                        }
                     }
                     // releasing a virtualized tuple: it was never allocated,
                     // so there is nothing to free.
@@ -4031,7 +4080,7 @@ mod tests {
             "ret 0",
             "label L3",
         ];
-        let regs = scan_inline_list_get_opt_regs(&body);
+        let regs = scan_unpackable_opt_regs(&body);
         assert!(regs.contains(&10));
 
         // an escaping optional (stored into a variable) must keep the call
@@ -4040,7 +4089,7 @@ mod tests {
             "store opt 10",
             "field 11 10 0 bool is_some",
         ];
-        assert!(scan_inline_list_get_opt_regs(&escaping).is_empty());
+        assert!(scan_unpackable_opt_regs(&escaping).is_empty());
 
         // passing the tuple to any other call disqualifies it too
         let passed = vec![
@@ -4048,7 +4097,34 @@ mod tests {
             "field 11 10 0 bool is_some",
             "call 12 some_fn int 1 10",
         ];
-        assert!(scan_inline_list_get_opt_regs(&passed).is_empty());
+        assert!(scan_unpackable_opt_regs(&passed).is_empty());
+    }
+
+    #[test]
+    fn a_pair_getter_unpacked_in_place_needs_no_shell() {
+        let body = vec![
+            "call 6 pith_channel_recv tuple 1 5",
+            "optflag 8 6",
+            "brif 8 L1 L2",
+            "label L1",
+            "optval 10 6 int value",
+            "call 11 pith_struct_release void 1 6",
+            "label L2",
+        ];
+        assert!(scan_unpackable_opt_regs(&body).contains(&6));
+
+        // a destructor attached to the shell means it owns the payload
+        let owned = vec![
+            "call 6 map_get_opt tuple 2 4 5",
+            "funcref 7 __opt_dtor_string",
+            "call 8 pith_struct_set_dtor void 2 6 7",
+            "optflag 9 6",
+        ];
+        assert!(scan_unpackable_opt_regs(&owned).is_empty());
+
+        // a getter with no pair form keeps its call
+        let other = vec!["call 6 env_opt tuple 1 5", "optflag 7 6"];
+        assert!(scan_unpackable_opt_regs(&other).is_empty());
     }
 
     #[test]

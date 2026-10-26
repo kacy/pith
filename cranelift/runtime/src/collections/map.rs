@@ -7,7 +7,8 @@ use crate::collections::list::{
     element_tag_from_code, release_element, retain_element, ListTypeTag,
 };
 use crate::handle_registry;
-use crate::runtime_core::optional_tuple;
+use crate::ffi_util::ResultPair;
+use crate::runtime_core::{optional_from, optional_pair};
 use hashbrown::hash_map::EntryRef;
 use hashbrown::{Equivalent, HashMap};
 use std::hash::{Hash, Hasher};
@@ -1228,20 +1229,27 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 /// * `key` must be a valid null-terminated C string.
-#[no_mangle]
-pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) -> i64 {
+unsafe fn map_get_cstr(map_handle: i64, key: *const i8) -> Option<i64> {
     if key.is_null() {
-        return optional_tuple(false, 0);
+        return None;
     }
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_opt");
     crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    match get_keyed(impl_ref, &cstr_key_ref(key)) {
-        Some(v) => optional_tuple(true, v),
-        None => optional_tuple(false, 0),
-    }
+    get_keyed(impl_ref, &cstr_key_ref(key))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) -> i64 {
+    optional_from(map_get_cstr(map_handle, key))
+}
+
+/// `pith_map_get_cstr_opt` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_cstr_opt_pair(map_handle: i64, key: *const i8) -> ResultPair {
+    optional_pair(map_get_cstr(map_handle, key))
 }
 
 /// Get an i64 value by C-string key. If the key is not present, prints a
@@ -1439,17 +1447,24 @@ pub unsafe extern "C" fn pith_map_get_bkey(map_handle: i64, key: i64) -> i64 {
 ///
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
-#[no_mangle]
-pub unsafe extern "C" fn pith_map_get_bkey_opt(map_handle: i64, key: i64) -> i64 {
+unsafe fn map_get_bkey(map_handle: i64, key: i64) -> Option<i64> {
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_opt");
     let found = bytes_key_ref(key).and_then(|map_key| get_keyed(impl_ref, &map_key));
-    match found {
-        Some(v) => optional_tuple(true, v),
-        None => optional_tuple(false, 0),
-    }
+    found
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_bkey_opt(map_handle: i64, key: i64) -> i64 {
+    optional_from(map_get_bkey(map_handle, key))
+}
+
+/// `pith_map_get_bkey_opt` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_bkey_opt_pair(map_handle: i64, key: i64) -> ResultPair {
+    optional_pair(map_get_bkey(map_handle, key))
 }
 
 /// Get a value by bytes key, exiting with a diagnostic on a miss — the
@@ -1646,25 +1661,29 @@ pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
 ///
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
-#[no_mangle]
-pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64 {
+unsafe fn map_get_ikey(map_handle: i64, key: i64) -> Option<i64> {
     let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     crate::perf_stats!(PERF_MAP_INT_GETS += 1);
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
-        match impl_ref.get_int_value(key) {
-            Some(v) => optional_tuple(true, v),
-            None => optional_tuple(false, 0),
-        }
+        impl_ref.get_int_value(key)
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        match get_keyed(impl_ref, &KeyRef::Int(key)) {
-            Some(v) => optional_tuple(true, v),
-            None => optional_tuple(false, 0),
-        }
+        get_keyed(impl_ref, &KeyRef::Int(key))
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64 {
+    optional_from(map_get_ikey(map_handle, key))
+}
+
+/// `pith_map_get_ikey_opt` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_get_ikey_opt_pair(map_handle: i64, key: i64) -> ResultPair {
+    optional_pair(map_get_ikey(map_handle, key))
 }
 
 /// Strict integer-key lookup for `map[k]`. Aborts with a structured
@@ -2503,11 +2522,12 @@ mod tests {
                 }),
                 0
             );
-            // `.get(k)` returns an Optional tuple, and that tuple is a heap
-            // allocation by construction. It is the caller's value, not a copy
+            // `.get(k)` returns an optional. A hit is a Some shell, a heap
+            // allocation by construction; it is the caller's value, not a copy
             // of the key, so the claim here is that it is the ONLY allocation:
             // one warm-up call to get the struct pool past its own setup, then
-            // exactly one per call, hit or miss.
+            // exactly one per hit. A miss is the null pointer and allocates
+            // nothing.
             pith_map_get_cstr_opt(map, key);
             assert_eq!(
                 allocations_during(|| {
@@ -2519,7 +2539,7 @@ mod tests {
                 allocations_during(|| {
                     pith_map_get_cstr_opt(map, absent);
                 }),
-                1
+                0
             );
             assert_eq!(
                 allocations_during(|| {
@@ -2604,8 +2624,9 @@ mod tests {
                 }),
                 0
             );
-            // as in the string test: the Optional tuple is the one allocation,
-            // and it is the returned value rather than a copy of the key
+            // as in the string test: a hit's Some shell is the one allocation,
+            // and it is the returned value rather than a copy of the key; a
+            // miss allocates nothing
             pith_map_get_bkey_opt(map, key);
             assert_eq!(
                 allocations_during(|| {
@@ -2617,7 +2638,7 @@ mod tests {
                 allocations_during(|| {
                     pith_map_get_bkey_opt(map, absent);
                 }),
-                1
+                0
             );
             assert_eq!(
                 allocations_during(|| {
@@ -2884,9 +2905,9 @@ mod tests {
             pith_map_insert_int(&mut map, 7, narrow.as_ptr(), 4);
             assert_eq!(pith_map_len(map), 1);
             assert_eq!(pith_map_get_ikey(handle, 7), 0);
-            // the Optional says absent rather than "present, zero"
-            let opt = pith_map_get_ikey_opt(handle, 7) as *const i64;
-            assert_eq!(*opt, 0);
+            // the Optional says absent (the null pointer) rather than
+            // "present, zero"
+            assert_eq!(pith_map_get_ikey_opt(handle, 7), 0);
             pith_map_release(map);
         }
     }

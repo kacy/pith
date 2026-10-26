@@ -3210,20 +3210,47 @@ unsafe fn struct_free_header(base: *mut u8) {
     }
 }
 
-/// Build a pith `T?` optional value in the on-heap tuple layout the codegen
-/// expects: field 0 is `is_some` (0 or 1), field 1 is the payload. Used by
-/// runtime accessors that want to hand back "not present" without collapsing
-/// it to a zero/empty sentinel.
+/// Build a pith `T?` optional value in the layout the codegen expects: none
+/// is the null pointer, and Some is a two-slot struct with 1 in field 0 and
+/// the payload in field 1. Used by runtime accessors that want to hand back
+/// "not present" without collapsing it to a zero/empty sentinel.
 pub(crate) fn optional_tuple(is_some: bool, value: i64) -> i64 {
+    if !is_some {
+        return 0;
+    }
     unsafe {
         let tuple = pith_struct_alloc(2);
         if tuple == 0 {
             return 0;
         }
         let ptr = tuple as *mut i64;
-        *ptr = if is_some { 1 } else { 0 };
+        *ptr = 1;
         *ptr.add(1) = value;
         tuple
+    }
+}
+
+/// An optional getter's answer as a `T?`: see `optional_tuple`.
+pub(crate) fn optional_from(found: Option<i64>) -> i64 {
+    match found {
+        Some(value) => optional_tuple(true, value),
+        None => 0,
+    }
+}
+
+/// An optional getter's answer as two registers, for a compiled caller that
+/// unpacks it on the spot and never needs the Some shell: (1, value) for
+/// Some and (0, 0) for none.
+pub(crate) fn optional_pair(found: Option<i64>) -> crate::ffi_util::ResultPair {
+    match found {
+        Some(value) => crate::ffi_util::ResultPair {
+            is_ok: 1,
+            payload: value,
+        },
+        None => crate::ffi_util::ResultPair {
+            is_ok: 0,
+            payload: 0,
+        },
     }
 }
 

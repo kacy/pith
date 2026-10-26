@@ -79,8 +79,26 @@ const CSTRING_ALIGN: usize = 8;
 /// which is exactly right for a value that is never freed.
 static CSTRING_EMPTY: &[u8] = b"\0";
 
+/// The allocation size for a string of `data_len` bytes: the header, the
+/// data and its NUL, rounded up to a size class. The size is a function of
+/// the length alone, so a free recomputes it from the header, and an append
+/// that stays inside the class writes in place (`pith_cstring_append_many`).
+/// Up to 136 bytes the classes are 16k + 8, the usable sizes of glibc's
+/// smallest chunks, so a short string wastes nothing the allocator would not
+/// already round away. Past that there are four classes per power of two,
+/// which wastes at most a quarter and keeps repeated appends amortized.
+fn cstring_alloc_size(data_len: usize) -> usize {
+    let total = CSTRING_HEADER_SIZE + data_len + 1;
+    if total <= 136 {
+        return (total + 7) / 16 * 16 + 8;
+    }
+    let top = usize::BITS - 1 - (total - 1).leading_zeros();
+    let step = 1usize << (top - 2);
+    total.div_ceil(step) * step
+}
+
 fn cstring_layout(data_len: usize) -> Layout {
-    pith_layout(CSTRING_HEADER_SIZE + data_len + 1, CSTRING_ALIGN)
+    pith_layout(cstring_alloc_size(data_len), CSTRING_ALIGN)
 }
 
 /// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
@@ -968,6 +986,87 @@ mod tests {
         (base.add(4) as *const u32).read()
     }
 
+    unsafe fn text(s: *const i8) -> String {
+        let len = string::pith_cstring_len(s) as usize;
+        String::from_utf8_lossy(std::slice::from_raw_parts(s as *const u8, len)).into_owned()
+    }
+
+    unsafe fn append(base: *const i8, parts: &[*const i8]) -> *mut i8 {
+        let mut p = [std::ptr::null(); APPEND_MANY_MAX];
+        p[..parts.len()].copy_from_slice(parts);
+        pith_cstring_append_many(parts.len() as i64, base, p[0], p[1], p[2], p[3], p[4], p[5], p[6])
+    }
+
+    #[test]
+    fn size_classes_cover_the_length_and_grow_geometrically() {
+        assert_eq!(cstring_alloc_size(0), 24);
+        assert_eq!(cstring_alloc_size(7), 24);
+        assert_eq!(cstring_alloc_size(8), 40);
+        assert_eq!(cstring_alloc_size(119), 136);
+        assert_eq!(cstring_alloc_size(120), 160);
+        for len in 0..5000 {
+            let size = cstring_alloc_size(len);
+            assert!(size >= CSTRING_HEADER_SIZE + len + 1);
+            if len > 200 {
+                assert!(size * 4 <= (CSTRING_HEADER_SIZE + len + 1) * 5);
+            }
+        }
+    }
+
+    #[test]
+    fn a_sole_owner_appends_in_place() {
+        unsafe {
+            let s = pith_copy_bytes_to_cstring(b"ab");
+            let tail = pith_copy_bytes_to_cstring(b"cd");
+            let grown = append(s, &[tail, std::ptr::null()]);
+            assert_eq!(grown, s, "still inside the size class");
+            assert_eq!(text(grown), "abcd");
+            assert_eq!(heap_refcount(grown), 1);
+            // past the class: a realloc, same contents, still one count
+            let mut acc = grown;
+            for _ in 0..100 {
+                acc = append(acc, &[tail]);
+            }
+            assert_eq!(text(acc).len(), 4 + 200);
+            assert!(text(acc).ends_with("cdcd"));
+            assert_eq!(heap_refcount(acc), 1);
+            pith_cstring_release(acc);
+            pith_cstring_release(tail);
+        }
+    }
+
+    #[test]
+    fn a_shared_or_literal_base_is_copied() {
+        unsafe {
+            let s = pith_copy_bytes_to_cstring(b"ab");
+            pith_cstring_retain(s); // a second owner
+            let tail = pith_copy_bytes_to_cstring(b"!");
+            let fresh = append(s, &[tail]);
+            assert_ne!(fresh, s as *mut i8);
+            assert_eq!(text(s), "ab", "the other owner's value is untouched");
+            assert_eq!(text(fresh), "ab!");
+            assert_eq!(heap_refcount(s), 1, "the caller's count moved to the result");
+            pith_cstring_release(s);
+            pith_cstring_release(fresh);
+
+            let literal = b"lit\0".as_ptr() as *const i8;
+            let from_literal = append(literal, &[tail]);
+            assert_eq!(text(from_literal), "lit!");
+            pith_cstring_release(from_literal);
+            pith_cstring_release(tail);
+        }
+    }
+
+    #[test]
+    fn appending_a_string_to_itself_copies() {
+        unsafe {
+            let s = pith_copy_bytes_to_cstring(b"xy");
+            let doubled = append(s, &[s]);
+            assert_eq!(text(doubled), "xyxy");
+            pith_cstring_release(doubled);
+        }
+    }
+
     #[test]
     fn heap_cstrings_carry_a_refcount() {
         unsafe {
@@ -1402,6 +1501,87 @@ pub unsafe extern "C" fn pith_concat_cstr_many(
         }
     }
     result
+}
+
+/// The most parts one `pith_cstring_append_many` call adds to its base.
+pub const APPEND_MANY_MAX: usize = CONCAT_MANY_MAX - 1;
+
+/// `base` followed by the first `count` of up to seven parts, for
+/// `s = s + a + b ...` where `s` owns `base`. The call takes over the
+/// caller's count on `base`: the result carries it, and `base` must not be
+/// released afterwards. When that count is the only one, nothing else can
+/// see the string, so the parts are written in place, reallocating only when
+/// the new length leaves the size class (see `cstring_alloc_size`). A shared
+/// or literal base, or a part that is the base itself, gets a fresh string
+/// and the base loses the caller's count. A null part is empty.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pith_cstring_append_many(
+    count: i64,
+    base: *const i8,
+    s0: *const i8,
+    s1: *const i8,
+    s2: *const i8,
+    s3: *const i8,
+    s4: *const i8,
+    s5: *const i8,
+    s6: *const i8,
+) -> *mut i8 {
+    let all = [s0, s1, s2, s3, s4, s5, s6];
+    let parts = &all[..(count.max(0) as usize).min(APPEND_MANY_MAX)];
+    let mut lens = [0usize; APPEND_MANY_MAX];
+    let mut added = 0usize;
+    for (i, &part) in parts.iter().enumerate() {
+        if !part.is_null() {
+            lens[i] = string::pith_cstring_len(part) as usize;
+            added += lens[i];
+        }
+    }
+    let header = cstring_base(base).filter(|&h| {
+        cstring_refcount(h).load(std::sync::atomic::Ordering::Acquire) == 1
+            && !parts.contains(&base)
+            && !cstring_debug_no_free()
+            && leak_scan_registry().is_none()
+    });
+    let Some(mut header) = header else {
+        let mut joined = [std::ptr::null(); CONCAT_MANY_MAX];
+        joined[0] = base;
+        joined[1..=parts.len()].copy_from_slice(parts);
+        let fresh = pith_concat_cstr_many(
+            (parts.len() + 1) as i64,
+            joined[0],
+            joined[1],
+            joined[2],
+            joined[3],
+            joined[4],
+            joined[5],
+            joined[6],
+            joined[7],
+        );
+        pith_cstring_release(base);
+        return fresh;
+    };
+    let len = (header.add(8) as *const u64).read() as usize;
+    let new_len = len + added;
+    if cstring_alloc_size(new_len) != cstring_alloc_size(len) {
+        header = std::alloc::realloc(header, cstring_layout(len), cstring_alloc_size(new_len));
+        if header.is_null() {
+            eprintln!("pith runtime error: allocation failed");
+            // panic-guard: out of memory.
+            std::process::exit(1);
+        }
+    }
+    let data = header.add(CSTRING_HEADER_SIZE) as *mut i8;
+    let mut at = len;
+    for (i, &part) in parts.iter().enumerate() {
+        if lens[i] > 0 {
+            std::ptr::copy_nonoverlapping(part, data.add(at), lens[i]);
+            at += lens[i];
+        }
+    }
+    *data.add(new_len) = 0;
+    (header.add(8) as *mut u64).write(new_len as u64);
+    data
 }
 
 #[no_mangle]

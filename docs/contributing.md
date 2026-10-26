@@ -86,8 +86,10 @@ make bootstrap
 
 `self-host/bootstrap/ir_driver.ir` is generated, not written. it exists so a
 machine with no `ir_driver` binary can build one, which is the only way a fresh
-clone gets off the ground. nothing you run in a working tree reads it, because
-your `ir_driver` is already there, so it goes stale quietly.
+clone gets off the ground. `pith` also rebuilds `self-host/ir_driver` from it
+when the seed is newer than the binary, as it is after a pull or checkout that
+moved the compiler, because the old binary still emits the old ir. apart from
+that, nothing in a working tree reads the seed, so it goes stale quietly.
 
 regenerate it whenever you change anything the compiler emits from. that is
 more than the emitter: `ir_driver.pith` imports the parser and the checker, so

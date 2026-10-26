@@ -1,36 +1,42 @@
 # ir_optionals.pith - low-level optional IR helpers
 
-from ir_builder import ir_emit, ir_reg
-from ir_call_emit import ir_emit_call2
+from ir_builder import ir_emit, ir_reg, ir_label, ir_new_temp_name
+from ir_call_emit import ir_emit_call2, ir_emit_label
 from ir_metadata import ir_runtime_call_name
 from ir_result_abi import ir_zero_reg
 from ir_struct_registry import ir_boxed_enums
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, get_type_name
 
-# load the is_some flag out of an optional's two-slot shell (offset 0):
-# 0 for none, 1 for Some. reading it is a pure probe — it never touches
-# the payload and takes no count — which is why `== none` counts as a
-# non-owning use of an optional local.
+# an optional is the null pointer when it is none and a two-slot shell
+# (flag 1 at offset 0, payload at offset 8) when it holds a value, so
+# `none` costs no allocation and the release of a none is a no-op.
+
+# the is_some flag of an optional: 0 for none, 1 for Some. it compares the
+# pointer against null and never touches the payload or takes a count,
+# which is why `== none` counts as a non-owning use of an optional local.
 pub fn ir_optional_flag_field(obj_r: Int) -> Int:
     r := ir_reg()
-    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 0 bool is_some")
+    ir_emit("optflag " + r.to_string() + " " + obj_r.to_string())
     return r
 
 # load the payload out of an optional's shell (offset 8), typed from
 # `opt_tid`'s inner type so the ir slot gets the right kind. the read
 # borrows: the optional still holds whatever count it had, so anything
-# keeping the payload past the optional's life must retain it. check
-# the flag first — the slot of a none holds 0 and this reads it anyway.
-# when `opt_tid` is not an optional type, or its inner type is unknown,
-# it emits no field load and hands back a register holding 0 rather
-# than reporting anything.
+# keeping the payload past the optional's life must retain it. a none
+# reads as 0, so an unchecked read never faults. when `opt_tid` is not
+# an optional type, or its inner type is unknown, it emits no load and
+# hands back a register holding 0 rather than reporting anything.
 pub fn ir_optional_value_field(obj_r: Int, opt_tid: Int) -> Int:
     info := get_type_info(opt_tid)
     if info.kind != "optional" or info.inner < 0:
         return ir_zero_reg()
+    return ir_optional_value_as(obj_r, ir_type_from_tid(info.inner))
+
+# the payload read above for a caller that already has the ir kind.
+pub fn ir_optional_value_as(obj_r: Int, kind: String) -> Int:
     r := ir_reg()
-    ir_emit("field " + r.to_string() + " " + obj_r.to_string() + " 8 " + ir_type_from_tid(info.inner) + " value")
+    ir_emit("optval " + r.to_string() + " " + obj_r.to_string() + " " + kind + " value")
     return r
 
 # emit `optional == none` (op "eq") or `!= none` (anything else) into
@@ -142,7 +148,10 @@ fn ir_emit_guarded_eq(result_reg: Int, op: String, guard_r: Int, val_eq_r: Int):
 fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
     ir_emit("call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " 1 " + arg0.to_string())
 
-fn ir_emit_optional_tuple(flag_r: Int, value_r: Int) -> Int:
+# a Some shell around `value_r`: flag 1 at offset 0, the payload at 8.
+fn ir_emit_some_shell(value_r: Int) -> Int:
+    flag_r := ir_reg()
+    ir_emit("iconst " + flag_r.to_string() + " 1")
     tuple_r := ir_reg()
     field_count_r := ir_reg()
     ir_emit("iconst " + field_count_r.to_string() + " 2")
@@ -151,17 +160,13 @@ fn ir_emit_optional_tuple(flag_r: Int, value_r: Int) -> Int:
     ir_emit("sstore " + tuple_r.to_string() + " 1 " + value_r.to_string())
     return tuple_r
 
-# build a fresh `none`: a two-slot shell with the flag and the value
-# slot both zero. this is what a `none` literal lowers to wherever an
-# optional is expected. the shell is a struct-header allocation the
-# caller owns outright, and it carries no destructor, since there is no
-# payload for one to release.
+# a `none`: the null pointer. this is what a `none` literal lowers to
+# wherever an optional is expected. nothing is allocated, and releasing
+# it is a no-op.
 pub fn ir_emit_optional_none_value() -> Int:
-    flag_r := ir_reg()
-    value_r := ir_reg()
-    ir_emit("iconst " + flag_r.to_string() + " 0")
-    ir_emit("iconst " + value_r.to_string() + " 0")
-    return ir_emit_optional_tuple(flag_r, value_r)
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
 
 # wrap `value_r` in a `Some` shell. the shell BORROWS its payload: no
 # destructor is attached, so releasing the optional frees the two slots
@@ -174,9 +179,7 @@ pub fn ir_emit_optional_none_value() -> Int:
 # the optional still points at it, or nothing ever releases it. the
 # shell itself is owned by the caller.
 pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
-    flag_r := ir_reg()
-    ir_emit("iconst " + flag_r.to_string() + " 1")
-    return ir_emit_optional_tuple(flag_r, value_r)
+    return ir_emit_some_shell(value_r)
 
 # read a weak optional field. the slot holds the target pointer directly
 # (0 = none) rather than an owning tuple, so liveness is resolved through
@@ -188,11 +191,19 @@ pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
 pub fn ir_emit_weak_read(raw_r: Int) -> Int:
     alive_r := ir_reg()
     ir_emit("call " + alive_r.to_string() + " pith_struct_weak_load int 1 " + raw_r.to_string())
-    zero_r := ir_reg()
-    ir_emit("iconst " + zero_r.to_string() + " 0")
-    flag_r := ir_reg()
-    ir_emit("neq " + flag_r.to_string() + " " + alive_r.to_string() + " " + zero_r.to_string())
-    return ir_emit_optional_tuple(flag_r, alive_r)
+    tmp := ir_new_temp_name("weak_read")
+    ir_emit("store " + tmp + " " + alive_r.to_string())
+    some_l := ir_label()
+    done_l := ir_label()
+    ir_emit("brif " + alive_r.to_string() + " " + some_l + " " + done_l)
+    ir_emit_label(some_l)
+    shell_r := ir_emit_some_shell(alive_r)
+    ir_emit("store " + tmp + " " + shell_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit_label(done_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + tmp)
+    return r
 
 # like ir_emit_optional_some_value, but the optional OWNS its rc payload: it
 # carries a destructor that releases the payload when the optional dies, so a
@@ -203,9 +214,7 @@ pub fn ir_emit_weak_read(raw_r: Int) -> Int:
 # matching __opt_dtor_<kind> is emitted once per module by
 # ir_emit_optional_walks.
 pub fn ir_emit_optional_owned_some(value_r: Int, payload_kind: String) -> Int:
-    flag_r := ir_reg()
-    ir_emit("iconst " + flag_r.to_string() + " 1")
-    tuple_r := ir_emit_optional_tuple(flag_r, value_r)
+    tuple_r := ir_emit_some_shell(value_r)
     ir_emit_optional_attach_dtor(tuple_r, payload_kind)
     return tuple_r
 
@@ -214,8 +223,8 @@ pub fn ir_emit_optional_owned_some(value_r: Int, payload_kind: String) -> Int:
 # is how a runtime-minted Some (`env_opt`, `s.get(i)`, a channel receive)
 # gets the same ownership a wrap-built one has: the runtime cannot name
 # this module's destructors, so the call site pins the right one on the
-# shell the moment it lands. safe on a none shell too — its payload slot
-# is zero and a release of null is a no-op.
+# shell the moment it lands. safe on a none too: the runtime ignores a
+# destructor set on the null pointer.
 pub fn ir_emit_optional_attach_dtor(tuple_r: Int, payload_kind: String):
     fr := ir_reg()
     ir_emit("funcref " + fr.to_string() + " __opt_dtor_" + payload_kind)

@@ -176,7 +176,7 @@ fn jump_with_two_i64_args(builder: &mut FunctionBuilder<'_>, block: Block, a: Va
 
 // `xs[i]` lowers to a call to pith_list_get_opt, which heap-allocates a
 // two-slot Optional tuple that the very next instructions unpack (flag at
-// offset 0, value at offset 8) and release. When scan_inline_list_get_opt_regs
+// offset 0, value at offset 8) and release. When scan_unpackable_opt_regs
 // proves a call's result is used only by that unpack pattern, the whole round
 // trip collapses to these loads and compares — no call, no allocation, no
 // release. The checks mirror the runtime path exactly: a null or stale handle
@@ -466,25 +466,48 @@ fn emit_bits_op(builder: &mut FunctionBuilder<'_>, op: &str, a: Value, b: Value)
     }
 }
 
-// the defining shape of an inlinable indexed read: call R pith_list_get_opt
-// tuple 2 LIST INDEX.
-fn is_list_get_opt_def(parts: &[&str]) -> bool {
-    parts.len() == 7
-        && parts[0] == "call"
-        && parts[2] == "pith_list_get_opt"
-        && parts[3] == "tuple"
-        && parts[4] == "2"
+// the runtime getters that also come as a register pair returning
+// (is_some, value), for an optional the caller unpacks on the spot.
+fn opt_getter_pair(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "pith_list_first_opt" => "pith_list_first_opt_pair",
+        "pith_list_last_opt" => "pith_list_last_opt_pair",
+        "map_get_opt" => "pith_map_get_cstr_opt_pair",
+        "map_get_ikey_opt" => "pith_map_get_ikey_opt_pair",
+        "map_get_bkey_opt" => "pith_map_get_bkey_opt_pair",
+        "pith_channel_recv" => "pith_channel_recv_pair",
+        "pith_channel_try_recv" => "pith_channel_try_recv_pair",
+        _ => return None,
+    })
+}
+
+// the defining shape of an optional the consumer can unpack without a shell:
+// call R pith_list_get_opt tuple 2 LIST INDEX, which is inlined, or a call to
+// a getter with a register-pair form.
+fn is_unpackable_opt_def(parts: &[&str]) -> bool {
+    if parts.len() < 5 || parts[0] != "call" || parts[3] != "tuple" {
+        return false;
+    }
+    let Ok(nargs) = parts[4].parse::<usize>() else {
+        return false;
+    };
+    parts.len() == 5 + nargs
+        && ((parts[2] == "pith_list_get_opt" && nargs == 2) || opt_getter_pair(parts[2]).is_some())
 }
 
 // a token occurrence (parts[i]) the inline unpack understands: the defining
-// call itself, a field read of tuple slot 0 or 8, or the release of the
+// call itself, a field read of tuple slot 0 or 8, an optflag or optval read,
+// or the release of the
 // throwaway tuple shell. anything else — a store, a return, an argument to
 // some other call — means the tuple escapes and must really exist.
 fn is_sanctioned_opt_use(parts: &[&str], i: usize) -> bool {
-    if is_list_get_opt_def(parts) {
+    if is_unpackable_opt_def(parts) {
         return i == 1;
     }
     if parts.len() == 6 && parts[0] == "field" && (parts[3] == "0" || parts[3] == "8") {
+        return i == 2;
+    }
+    if (parts.len() == 3 && parts[0] == "optflag") || (parts.len() == 5 && parts[0] == "optval") {
         return i == 2;
     }
     if parts.len() == 6
@@ -497,16 +520,16 @@ fn is_sanctioned_opt_use(parts: &[&str], i: usize) -> bool {
     false
 }
 
-// registers holding a pith_list_get_opt result whose every textual use is the
-// emitter's own unpack pattern. the scan is deliberately conservative: any
+// registers holding an unpackable optional (see is_unpackable_opt_def) whose
+// every textual use is the emitter's own unpack pattern. the scan is deliberately conservative: any
 // numeric token equal to a candidate register that sits outside a sanctioned
 // position disqualifies it, so an escaping optional (`.get(i)` stored in a
 // variable, passed on, returned) always takes the real runtime call.
-fn scan_inline_list_get_opt_regs(body_lines: &[&str]) -> HashSet<usize> {
+fn scan_unpackable_opt_regs(body_lines: &[&str]) -> HashSet<usize> {
     let mut candidates: HashMap<usize, u32> = HashMap::new();
     for line in body_lines {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if is_list_get_opt_def(&parts) {
+        if is_unpackable_opt_def(&parts) {
             if let Ok(r) = parts[1].parse::<usize>() {
                 *candidates.entry(r).or_insert(0) += 1;
             }
@@ -2217,7 +2240,7 @@ fn compile_ir_function(
     // calls compile to inline loads instead (see inline_list_get_opt). The map
     // carries each virtualized register's (is_some, value) pair for the field
     // reads that follow.
-    let inline_opt_regs = scan_inline_list_get_opt_regs(body_lines);
+    let inline_opt_regs = scan_unpackable_opt_regs(body_lines);
     let mut virtual_opts: HashMap<usize, (Value, Value)> = HashMap::new();
 
     // Older emitters briefly lowered `break` in `while true` loops through an
@@ -2874,6 +2897,36 @@ fn compile_ir_function(
                         float_regs.remove(&reg);
                         continue;
                     }
+                    // a getter's optional that never escapes: call its pair
+                    // form and keep (is_some, value) in registers, so no Some
+                    // shell is built.
+                    if let Some(pair_name) = opt_getter_pair(fname)
+                        .filter(|_| inline_opt_regs.contains(&reg))
+                        .filter(|_| !declared_funcs.contains_key(fname))
+                    {
+                        if let Some(&fid) = runtime_funcs.get(pair_name) {
+                            let mut args = Vec::with_capacity(nargs);
+                            for j in 0..nargs {
+                                args.push(get_reg(&regs, parts[arg_start + j])?);
+                            }
+                            let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
+                                codegen.module.declare_func_in_func(fid, builder.func)
+                            });
+                            let call = builder.ins().call(fref, &args);
+                            let &[flag, value] = builder.func.dfg.inst_results(call) else {
+                                return Err(CompileError::ModuleError(format!(
+                                    "ir consumer: {} does not return a register pair",
+                                    pair_name
+                                )));
+                            };
+                            virtual_opts.insert(reg, (flag, value));
+                            regs.remove(&reg);
+                            string_regs.remove(&reg);
+                            bytes_regs.remove(&reg);
+                            float_regs.remove(&reg);
+                            continue;
+                        }
+                    }
                     // releasing a virtualized tuple: it was never allocated,
                     // so there is nothing to free.
                     if fname == "pith_struct_release" && nargs == 1 && parts.len() > arg_start {
@@ -3508,6 +3561,66 @@ fn compile_ir_function(
                 }
             }
 
+            // `optflag R OPT`: 1 when the optional OPT holds a value. none is
+            // the null pointer, so this is a compare, not a load.
+            "optflag" if parts.len() == 3 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let obj_reg = parse_reg(parts[2], line, func_name)?;
+                let v = if let Some(&(flag, _)) = virtual_opts.get(&obj_reg) {
+                    flag
+                } else {
+                    let obj = get_reg(&regs, parts[2])?;
+                    let is_some = builder.ins().icmp_imm(IntCC::NotEqual, obj, 0);
+                    builder.ins().uextend(types::I64, is_some)
+                };
+                regs.insert(reg, v);
+                reg_source_vars.remove(&reg);
+                note_loaded_kind(
+                    reg,
+                    None,
+                    &mut string_regs,
+                    &mut bytes_regs,
+                    &mut float_regs,
+                    &mut struct_regs,
+                );
+            }
+
+            // `optval R OPT KIND NAME`: the payload of the optional OPT, or 0
+            // when OPT is none (the null pointer), so an unchecked read of a
+            // none still yields 0 instead of faulting.
+            "optval" if parts.len() == 5 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let obj_reg = parse_reg(parts[2], line, func_name)?;
+                let v = if let Some(&(_, value)) = virtual_opts.get(&obj_reg) {
+                    value
+                } else {
+                    let obj = get_reg(&regs, parts[2])?;
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let load_block = builder.create_block();
+                    let none_block = builder.create_block();
+                    let done = builder.create_block();
+                    builder.append_block_param(done, types::I64);
+                    builder.ins().brif(obj, load_block, &[], none_block, &[]);
+                    builder.switch_to_block(none_block);
+                    jump_with_i64_arg(&mut builder, done, zero);
+                    builder.switch_to_block(load_block);
+                    let payload = builder.ins().load(types::I64, MemFlags::new(), obj, 8);
+                    jump_with_i64_arg(&mut builder, done, payload);
+                    builder.switch_to_block(done);
+                    builder.block_params(done)[0]
+                };
+                regs.insert(reg, v);
+                reg_source_vars.remove(&reg);
+                note_loaded_kind(
+                    reg,
+                    Some(parts[3]),
+                    &mut string_regs,
+                    &mut bytes_regs,
+                    &mut float_regs,
+                    &mut struct_regs,
+                );
+            }
+
             "field" if parts.len() >= 4 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
                 // unpacking a virtualized pith_list_get_opt result: slot 0 is
@@ -3528,32 +3641,14 @@ fn compile_ir_function(
                         };
                         regs.insert(reg, v);
                         reg_source_vars.remove(&reg);
-                        struct_regs.remove(&reg);
-                        if parts.len() >= 6 {
-                            let retkind = parts[4];
-                            if retkind == "string" {
-                                string_regs.insert(reg);
-                            } else {
-                                string_regs.remove(&reg);
-                            }
-                            if retkind == "bytes" {
-                                bytes_regs.insert(reg);
-                            } else {
-                                bytes_regs.remove(&reg);
-                            }
-                            if retkind == "float" {
-                                float_regs.insert(reg);
-                            } else {
-                                float_regs.remove(&reg);
-                            }
-                            if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                                struct_regs.insert(reg, struct_name.to_string());
-                            }
-                        } else {
-                            string_regs.remove(&reg);
-                            bytes_regs.remove(&reg);
-                            float_regs.remove(&reg);
-                        }
+                        note_loaded_kind(
+                            reg,
+                            parts.get(4).copied().filter(|_| parts.len() >= 6),
+                            &mut string_regs,
+                            &mut bytes_regs,
+                            &mut float_regs,
+                            &mut struct_regs,
+                        );
                         continue;
                     }
                 }
@@ -3587,31 +3682,14 @@ fn compile_ir_function(
                 let v = builder.ins().iadd(raw, zero);
                 regs.insert(reg, v);
                 reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                if let Some(retkind) = field_retkind {
-                    if retkind == "string" {
-                        string_regs.insert(reg);
-                    } else {
-                        string_regs.remove(&reg);
-                    }
-                    if retkind == "bytes" {
-                        bytes_regs.insert(reg);
-                    } else {
-                        bytes_regs.remove(&reg);
-                    }
-                    if retkind == "float" {
-                        float_regs.insert(reg);
-                    } else {
-                        float_regs.remove(&reg);
-                    }
-                    if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                        struct_regs.insert(reg, struct_name.to_string());
-                    }
-                } else {
-                    string_regs.remove(&reg);
-                    bytes_regs.remove(&reg);
-                    float_regs.remove(&reg);
-                }
+                note_loaded_kind(
+                    reg,
+                    field_retkind,
+                    &mut string_regs,
+                    &mut bytes_regs,
+                    &mut float_regs,
+                    &mut struct_regs,
+                );
             }
 
             "funcref" if parts.len() >= 3 => {
@@ -3920,6 +3998,38 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
     None
 }
 
+// record what a loaded register holds, from the kind token a field-style
+// instruction carries; None (no token) clears every kind.
+fn note_loaded_kind(
+    reg: usize,
+    retkind: Option<&str>,
+    string_regs: &mut HashSet<usize>,
+    bytes_regs: &mut HashSet<usize>,
+    float_regs: &mut HashSet<usize>,
+    struct_regs: &mut HashMap<usize, String>,
+) {
+    let kind = retkind.unwrap_or("");
+    for (set, wanted) in [
+        (string_regs, "string"),
+        (bytes_regs, "bytes"),
+        (float_regs, "float"),
+    ] {
+        if kind == wanted {
+            set.insert(reg);
+        } else {
+            set.remove(&reg);
+        }
+    }
+    match explicit_struct_name_from_retkind(kind) {
+        Some(name) => {
+            struct_regs.insert(reg, name.to_string());
+        }
+        None => {
+            struct_regs.remove(&reg);
+        }
+    }
+}
+
 fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Result<Value, CompileError> {
     let reg = s.parse::<usize>().map_err(|_| {
         CompileError::ModuleError(format!("IR consumer: invalid register reference '{}'", s))
@@ -4143,7 +4253,7 @@ mod tests {
             "ret 0",
             "label L3",
         ];
-        let regs = scan_inline_list_get_opt_regs(&body);
+        let regs = scan_unpackable_opt_regs(&body);
         assert!(regs.contains(&10));
 
         // an escaping optional (stored into a variable) must keep the call
@@ -4152,7 +4262,7 @@ mod tests {
             "store opt 10",
             "field 11 10 0 bool is_some",
         ];
-        assert!(scan_inline_list_get_opt_regs(&escaping).is_empty());
+        assert!(scan_unpackable_opt_regs(&escaping).is_empty());
 
         // passing the tuple to any other call disqualifies it too
         let passed = vec![
@@ -4160,7 +4270,34 @@ mod tests {
             "field 11 10 0 bool is_some",
             "call 12 some_fn int 1 10",
         ];
-        assert!(scan_inline_list_get_opt_regs(&passed).is_empty());
+        assert!(scan_unpackable_opt_regs(&passed).is_empty());
+    }
+
+    #[test]
+    fn a_pair_getter_unpacked_in_place_needs_no_shell() {
+        let body = vec![
+            "call 6 pith_channel_recv tuple 1 5",
+            "optflag 8 6",
+            "brif 8 L1 L2",
+            "label L1",
+            "optval 10 6 int value",
+            "call 11 pith_struct_release void 1 6",
+            "label L2",
+        ];
+        assert!(scan_unpackable_opt_regs(&body).contains(&6));
+
+        // a destructor attached to the shell means it owns the payload
+        let owned = vec![
+            "call 6 map_get_opt tuple 2 4 5",
+            "funcref 7 __opt_dtor_string",
+            "call 8 pith_struct_set_dtor void 2 6 7",
+            "optflag 9 6",
+        ];
+        assert!(scan_unpackable_opt_regs(&owned).is_empty());
+
+        // a getter with no pair form keeps its call
+        let other = vec!["call 6 env_opt tuple 1 5", "optflag 7 6"];
+        assert!(scan_unpackable_opt_regs(&other).is_empty());
     }
 
     #[test]

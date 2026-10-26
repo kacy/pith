@@ -68,6 +68,8 @@
 //! waiter *under the channel lock* before releasing it, which we do.
 
 use crate::concurrency::green;
+use crate::ffi_util::ResultPair;
+use crate::runtime_core::{optional_from, optional_pair};
 use crate::handle_registry;
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -602,19 +604,6 @@ fn block_on_channel<'a>(
     }
 }
 
-fn optional_tuple(is_some: bool, value: i64) -> i64 {
-    unsafe {
-        let tuple = crate::pith_struct_alloc(2);
-        if tuple == 0 {
-            return 0;
-        }
-        let ptr = tuple as *mut i64;
-        *ptr = if is_some { 1 } else { 0 };
-        *ptr.add(1) = value;
-        tuple
-    }
-}
-
 #[no_mangle]
 pub extern "C" fn pith_channel_new(capacity: i64, payload_tag: i64) -> i64 {
     // the ring is allocated up front, so an absurd capacity would abort the
@@ -794,13 +783,13 @@ unsafe fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, val
 /// the buffered recv, mirror of `buffered_send`: lock-free dequeue on the fast
 /// path; park under the mutex only when the ring is empty. a closed channel
 /// still drains — the dequeue try comes before the closed check.
-unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> i64 {
+unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> Option<i64> {
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
     loop {
         if let Some(value) = ring.try_dequeue() {
             wake_parked(inner, ring, Role::Sender);
-            return optional_tuple(true, value);
+            return Some(value);
         }
         if spins > 0 {
             spins -= 1;
@@ -811,9 +800,9 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
             // one more look: a value enqueued just before close must be drained.
             if let Some(value) = ring.try_dequeue() {
                 wake_parked(inner, ring, Role::Sender);
-                return optional_tuple(true, value);
+                return Some(value);
             }
-            return optional_tuple(false, 0);
+            return None;
         }
         let mut state = lock_state(&inner.state);
         inner.parked_receivers.fetch_add(1, Ordering::SeqCst);
@@ -822,11 +811,11 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
             inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
             drop(state);
             wake_parked(inner, ring, Role::Sender);
-            return optional_tuple(true, value);
+            return Some(value);
         }
         if inner.closed_flag.load(Ordering::SeqCst) {
             inner.parked_receivers.fetch_sub(1, Ordering::SeqCst);
-            return optional_tuple(false, 0);
+            return None;
         }
         state = block_on_channel(park, inner, state, green_task, Role::Receiver);
         drop(state);
@@ -837,7 +826,7 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
         // which task we are again — see the note on `green::park_current`.
         if let Some(id) = green_task {
             if let Some(value) = green::take_handoff(id) {
-                return optional_tuple(true, value);
+                return Some(value);
             }
         }
     }
@@ -930,12 +919,11 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
     1
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
+unsafe fn channel_recv(handle: i64) -> Option<i64> {
     // an unknown or freed handle yields the empty optional, exactly what a
     // closed and drained channel yields.
     let Some(t) = channel_ref(handle) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     let park = ParkCount::new(t);
     let inner = &t.inner;
@@ -951,11 +939,11 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
             // to be taken.
             state.deliveries += 1;
             wake_senders(inner, &mut state);
-            return optional_tuple(true, value);
+            return Some(value);
         }
 
         if state.closed {
-            return optional_tuple(false, 0);
+            return None;
         }
 
         // announce that a receiver is now waiting so a blocked sender can deposit
@@ -968,27 +956,48 @@ pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
+unsafe fn channel_try_recv(handle: i64) -> Option<i64> {
     let Some(t) = channel_ref(handle) else {
-        return optional_tuple(false, 0);
+        return None;
     };
     let inner = &t.inner;
     if let Some(ring) = &inner.ring {
         if let Some(value) = ring.try_dequeue() {
             wake_parked(inner, ring, Role::Sender);
-            return optional_tuple(true, value);
+            return Some(value);
         }
         // the empty case is the one that can observe a closed, drained ring.
-        return optional_tuple(false, 0);
+        return None;
     }
     let mut state = lock_state(&inner.state);
     if let Some(value) = state.pending_value.take() {
         state.deliveries += 1;
         wake_senders(inner, &mut state);
-        return optional_tuple(true, value);
+        return Some(value);
     }
-    optional_tuple(false, 0)
+    None
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
+    optional_from(channel_recv(handle))
+}
+
+/// `pith_channel_recv` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_recv_pair(handle: i64) -> ResultPair {
+    optional_pair(channel_recv(handle))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
+    optional_from(channel_try_recv(handle))
+}
+
+/// `pith_channel_try_recv` as a register pair; see `optional_pair`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_try_recv_pair(handle: i64) -> ResultPair {
+    optional_pair(channel_try_recv(handle))
 }
 
 #[no_mangle]
@@ -1074,6 +1083,17 @@ pub extern "C" fn pith_select_next_index(count: i64) -> i64 {
 mod tests {
     use super::*;
 
+    // a received optional as a pointer to its two slots: a Some is its own
+    // shell, and a none (the null pointer) reads as a shell of zeros.
+    fn shell(opt: i64) -> *const i64 {
+        static NONE: [i64; 2] = [0, 0];
+        if opt == 0 {
+            NONE.as_ptr()
+        } else {
+            opt as *const i64
+        }
+    }
+
     // the creator drops its only count while three receivers are parked on
     // the channel. the channel must survive them: a parked operation holds a
     // count of its own, so the release frees nothing yet. a fourth holder,
@@ -1085,10 +1105,10 @@ mod tests {
         let ch = pith_channel_new(4, 0);
         unsafe { pith_channel_retain(ch) }; // the sender's own count
         let receivers: Vec<_> = (0..3)
-            // recv returns an optional shell: slot 0 is the presence flag, slot 1 the value
+            // recv returns an optional: slot 0 of shell() is the presence flag, slot 1 the value
             .map(|_| {
                 std::thread::spawn(move || unsafe {
-                    *((pith_channel_recv(ch) as *const i64).add(1))
+                    *(shell(pith_channel_recv(ch)).add(1))
                 })
             })
             .collect();
@@ -1125,7 +1145,7 @@ mod tests {
                 "alive while queued"
             );
             assert_eq!(
-                unsafe { *(pith_channel_try_recv(inner) as *const i64) },
+                unsafe { *shell(pith_channel_try_recv(inner)) },
                 1,
                 "present"
             );
@@ -1169,7 +1189,7 @@ mod tests {
             assert_eq!(pith_channel_len(handle), 0);
             assert_eq!(pith_channel_cap(handle), 0);
             assert_eq!(pith_channel_is_closed(handle), 1);
-            let recv = pith_channel_try_recv(handle) as *const i64;
+            let recv = shell(pith_channel_try_recv(handle));
             assert_eq!(*recv, 0);
             drop(Box::from_raw(handle as *mut [u64; 4]));
         }
@@ -1199,7 +1219,7 @@ mod tests {
             let ch = pith_channel_new(i64::MAX, 0);
             assert_eq!(pith_channel_cap(ch), MAX_CHANNEL_CAPACITY);
             assert_eq!(pith_channel_try_send(ch, 1), 1);
-            let t = pith_channel_try_recv(ch) as *const i64;
+            let t = shell(pith_channel_try_recv(ch));
             assert_eq!((*t, *t.add(1)), (1, 1));
         }
     }
@@ -1216,7 +1236,7 @@ mod tests {
             let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 42) });
 
             // take the value, then close while the sender is still parked
-            let t = pith_channel_recv(ch) as *const i64;
+            let t = shell(pith_channel_recv(ch));
             assert_eq!((*t, *t.add(1)), (1, 42));
             pith_channel_close(ch);
 
@@ -1258,7 +1278,7 @@ mod tests {
             let receivers: Vec<_> = (0..3)
                 .map(|_| {
                     std::thread::spawn(move || unsafe {
-                        let t = pith_channel_recv(ch) as *const i64;
+                        let t = shell(pith_channel_recv(ch));
                         *t
                     })
                 })
@@ -1272,7 +1292,7 @@ mod tests {
             assert_eq!(pith_channel_len(ch), 0);
             assert_eq!(pith_channel_send(ch, 1), 0);
             assert_eq!(pith_channel_cap(ch), 4);
-            let t = pith_channel_recv(ch) as *const i64;
+            let t = shell(pith_channel_recv(ch));
             assert_eq!(*t, 0);
             let before = frees();
             pith_channel_release(ch);
@@ -1323,7 +1343,7 @@ mod tests {
                     pith_channel_close(ch);
                     let mut drained = 0;
                     loop {
-                        let t = pith_channel_recv(ch) as *const i64;
+                        let t = shell(pith_channel_recv(ch));
                         if *t == 0 {
                             break;
                         }
@@ -1368,7 +1388,7 @@ mod tests {
                     let _ = pith_channel_try_recv(ch);
                     pith_channel_close(ch);
                     loop {
-                        let t = pith_channel_recv(ch) as *const i64;
+                        let t = shell(pith_channel_recv(ch));
                         if *t == 0 {
                             break;
                         }
@@ -1396,10 +1416,10 @@ mod tests {
             }
             pith_channel_close(ch);
             for v in 1..=5 {
-                let t = pith_channel_recv(ch) as *const i64;
+                let t = shell(pith_channel_recv(ch));
                 assert_eq!((*t, *t.add(1)), (1, v));
             }
-            let t = pith_channel_recv(ch) as *const i64;
+            let t = shell(pith_channel_recv(ch));
             assert_eq!(*t, 0);
             let before = frees();
             pith_channel_release(ch);
@@ -1417,7 +1437,7 @@ mod tests {
             assert_eq!(pith_channel_cap(12345), 0);
             assert_eq!(pith_channel_is_closed(12345), 1);
 
-            let recv = pith_channel_try_recv(12345) as *const i64;
+            let recv = shell(pith_channel_try_recv(12345));
             assert!(!recv.is_null());
             assert_eq!(*recv, 0);
         }
@@ -1440,7 +1460,7 @@ mod tests {
 
             let mut total = 0i64;
             for _ in 0..n {
-                let t = pith_channel_recv(ch) as *const i64;
+                let t = shell(pith_channel_recv(ch));
                 assert_eq!(*t, 1, "expected a value, not an empty optional");
                 total += *t.add(1);
             }
@@ -1462,7 +1482,7 @@ mod tests {
             assert_eq!(pith_channel_try_send(ch, 4), 1);
             assert_eq!(pith_channel_try_send(ch, 5), 0, "capacity 1 is full");
             assert_eq!(pith_channel_len(ch), 1);
-            let t = pith_channel_try_recv(ch) as *const i64;
+            let t = shell(pith_channel_try_recv(ch));
             assert_eq!((*t, *t.add(1)), (1, 4));
             assert_eq!(pith_channel_try_send(ch, 6), 1, "room again after recv");
         }
@@ -1483,11 +1503,11 @@ mod tests {
             assert_eq!(pith_channel_try_send(ch, 99), 0, "over capacity");
             assert_eq!(pith_channel_len(ch), 3);
             for v in 1..=3 {
-                let t = pith_channel_try_recv(ch) as *const i64;
+                let t = shell(pith_channel_try_recv(ch));
                 assert_eq!(*t, 1);
                 assert_eq!(*t.add(1), v);
             }
-            let t = pith_channel_try_recv(ch) as *const i64;
+            let t = shell(pith_channel_try_recv(ch));
             assert_eq!(*t, 0, "drained");
         }
     }
@@ -1502,11 +1522,11 @@ mod tests {
             assert_eq!(pith_channel_send(ch, 42), 1);
             pith_channel_close(ch);
             assert_eq!(pith_channel_send(ch, 43), 0, "send after close");
-            let a = pith_channel_recv(ch) as *const i64;
+            let a = shell(pith_channel_recv(ch));
             assert_eq!((*a, *a.add(1)), (1, 41));
-            let b = pith_channel_recv(ch) as *const i64;
+            let b = shell(pith_channel_recv(ch));
             assert_eq!((*b, *b.add(1)), (1, 42));
-            let c = pith_channel_recv(ch) as *const i64;
+            let c = shell(pith_channel_recv(ch));
             assert_eq!(*c, 0, "closed and drained");
             assert_eq!(pith_channel_is_closed(ch), 1);
         }
@@ -1533,7 +1553,7 @@ mod tests {
                     let sum = Arc::clone(&sum);
                     let count = Arc::clone(&count);
                     std::thread::spawn(move || loop {
-                        let t = pith_channel_recv(ch) as *const i64;
+                        let t = shell(pith_channel_recv(ch));
                         if *t == 0 {
                             break; // empty optional: channel closed and drained
                         }

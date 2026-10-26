@@ -1,0 +1,58 @@
+# none is the null pointer rather than an allocated shell, so every place
+# that reads an optional's payload has to cope with a none it has not checked
+# first. each block reaches one such read with a none: a getter on a
+# temporary list, a weak field stored from an optional holding nothing, and a
+# runtime miss from a map, a channel and the environment.
+
+struct Node:
+    value: Int
+    weak parent: Node?
+
+fn parts_of(s: String) -> List[String]!:
+    if s.len() == 0:
+        fail "empty"
+    return s.split("/")
+
+fn no_parent() -> Node?:
+    return none
+
+# point `child` at a parent that dies when this returns
+fn adopt(child: Node):
+    owner := Node(value: 3, parent: none)
+    child.parent = owner
+    if child.parent != none:
+        print("live: set")
+
+fn main() -> Int:
+    # a borrowing getter on a temporary takes a count on the payload before
+    # the list goes, and must skip that when the answer is none
+    print((parts_of("") catch []).first().unwrap_or("first: none"))
+    print((parts_of("a/b") catch []).last().unwrap_or("last: none"))
+
+    # a weak field stored from an optional local holding none
+    p := no_parent()
+    n := Node(value: 1, parent: none)
+    n.parent = p
+    if n.parent == none:
+        print("parent: none")
+
+    # a weak field whose target is gone reads back as none
+    child := Node(value: 2, parent: none)
+    adopt(child)
+    if child.parent == none:
+        print("dropped: none")
+
+    # runtime misses hand back none without building anything
+    mut m: Map[String, Int] := {"a": 1}
+    print(m.get("b").unwrap_or(0 - 1).to_string())
+    print(m.get("a").unwrap_or(0 - 1).to_string())
+    ch := Channel[String](1)
+    print(ch.try_recv().unwrap_or("recv: none"))
+    print(env_opt("PITH_TEST_SURELY_UNSET_VARIABLE").unwrap_or("env: none"))
+
+    # none compares equal to none, and an optional none prints as none
+    a: Int? := none
+    b: Int? := none
+    print((a == b).to_string())
+    print("{a}")
+    return 0

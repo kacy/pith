@@ -262,18 +262,43 @@ fn find_ir_driver() -> Option<String> {
         }
     }
 
-    for candidate in &["./self-host/ir_driver", "../self-host/ir_driver"] {
-        if Path::new(candidate).exists() {
-            return Some(candidate.to_string());
+    for dir in &["./self-host", "../self-host"] {
+        let candidate = format!("{}/ir_driver", dir);
+        if !Path::new(&candidate).exists() {
+            continue;
         }
+        if ir_driver_older_than_seed(dir, &candidate) {
+            eprintln!(
+                "{} is older than {}/bootstrap/ir_driver.ir; rebuilding it",
+                candidate, dir
+            );
+            return None;
+        }
+        return Some(candidate);
     }
     None
+}
+
+/// Every emitter change regenerates the seed, so a seed newer than the binary
+/// means a pull or checkout moved the compiler under it. The old binary still
+/// emits the old IR, which the current backend can miscompile (a none optional
+/// read as a heap shell, for one), so it is rebuilt from the seed instead.
+fn ir_driver_older_than_seed(dir: &str, driver: &str) -> bool {
+    let modified = |path: &str| fs::metadata(path).and_then(|m| m.modified()).ok();
+    match (
+        modified(&format!("{}/bootstrap/ir_driver.ir", dir)),
+        modified(driver),
+    ) {
+        (Some(seed), Some(binary)) => seed > binary,
+        _ => false,
+    }
 }
 
 /// The ir_driver binary is itself compiled pith, so a fresh clone has no way
 /// to build it — pith build needs ir_driver to get IR. The tracked IR seed
 /// breaks that cycle: build ir_driver once from the seed, then everything
-/// else builds from source as usual.
+/// else builds from source as usual. A binary older than the seed is rebuilt
+/// the same way (see ir_driver_older_than_seed).
 fn bootstrap_ir_driver_from_seed() -> Option<String> {
     use pith_codegen::linker::build_executable;
 
@@ -282,16 +307,24 @@ fn bootstrap_ir_driver_from_seed() -> Option<String> {
         if !Path::new(&seed).exists() {
             continue;
         }
-        eprintln!("no ir_driver binary found; building one from {}", seed);
+        eprintln!("building ir_driver from {}", seed);
         let ir_text = fs::read_to_string(&seed).ok()?;
         let (bytes, _) = object_from_ir(&ir_text)
             .map_err(|e| eprintln!("seed build failed: {}", e))
             .ok()?;
-        let obj_path = format!("{}/ir_driver.o", dir);
+        // link under a per-process name and rename into place, so parallel
+        // builds never run a half-written binary
+        let tmp = format!("{}/ir_driver.{}", dir, std::process::id());
+        let obj_path = format!("{}.o", tmp);
         let exe_path = format!("{}/ir_driver", dir);
         fs::write(&obj_path, &bytes).ok()?;
-        build_executable(&obj_path, &exe_path)
+        let linked = build_executable(&obj_path, &tmp);
+        let _ = fs::remove_file(&obj_path);
+        linked
             .map_err(|e| eprintln!("seed link failed: {}", e))
+            .ok()?;
+        fs::rename(&tmp, &exe_path)
+            .map_err(|e| eprintln!("seed install failed: {}", e))
             .ok()?;
         return Some(exe_path);
     }
@@ -569,7 +602,9 @@ fn test_file(path: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_combined_ir_contract;
+    use super::{ir_driver_older_than_seed, validate_combined_ir_contract};
+    use std::fs;
+    use std::time::{Duration, SystemTime};
 
     #[test]
     fn accepts_explicit_call_and_field_contracts() {
@@ -587,6 +622,33 @@ mod tests {
     fn rejects_field_without_offset() {
         let ir = "field 2 1 Point name\n";
         assert!(validate_combined_ir_contract(ir).is_err());
+    }
+
+    #[test]
+    fn a_driver_older_than_its_seed_is_stale() {
+        let dir = std::env::temp_dir().join(format!("pith-seed-age-{}", std::process::id()));
+        fs::create_dir_all(dir.join("bootstrap")).unwrap();
+        let seed = dir.join("bootstrap/ir_driver.ir");
+        let driver = dir.join("ir_driver");
+        fs::write(&seed, "").unwrap();
+        fs::write(&driver, "").unwrap();
+        let set = |path: &std::path::Path, secs: u64| {
+            let file = fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        let (d, b) = (dir.to_str().unwrap(), driver.to_str().unwrap());
+
+        set(&seed, 2_000);
+        set(&driver, 1_000);
+        assert!(ir_driver_older_than_seed(d, b));
+
+        set(&driver, 3_000);
+        assert!(!ir_driver_older_than_seed(d, b));
+
+        fs::remove_file(&seed).unwrap();
+        assert!(!ir_driver_older_than_seed(d, b));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
 

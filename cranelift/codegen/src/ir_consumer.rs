@@ -1566,6 +1566,11 @@ pub fn compile_from_ir(
             Some(lines) => lines.iter().map(String::as_str).collect(),
             None => body_lines,
         };
+        let appended = fuse_self_appends(&body_lines);
+        let body_lines: Vec<&str> = match &appended {
+            Some(lines) => lines.iter().map(String::as_str).collect(),
+            None => body_lines,
+        };
         if let Some(&func_id) = declared_funcs.get(&func_name) {
             let func = compile_ir_function(
                 codegen,
@@ -1870,6 +1875,99 @@ fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
             for &k in &moved_after[&i] {
                 out.push(body[k].to_string());
             }
+        } else if !dropped[i] {
+            out.push(line.to_string());
+        }
+    }
+    Some(out)
+}
+
+/// Rewrite `s = s + ...` on a local into `appendn dst count base part...`,
+/// so the string grows in place while the local holds its only count. The
+/// emitter lowers that assignment as a load of the old value (O), a second
+/// load as the concat's left operand (A), the concat or concatn into D, a
+/// release of O, and `store V D`. The release is the evidence that V owns a
+/// count; the rewrite hands that count to `pith_cstring_append_many` instead
+/// and drops the release. It applies only when, from the first of the two
+/// loads to the store, nothing else loads or stores V and no label, branch
+/// or return intervenes; O, A and D have no other use; and V is not a global
+/// (`__g_`), which another task may be reading.
+fn fuse_self_appends(body: &[&str]) -> Option<Vec<String>> {
+    let parsed: Vec<Vec<&str>> = body.iter().map(|l| l.split_whitespace().collect()).collect();
+    let is_join = |p: &[&str]| (p.len() == 4 && p[0] == "concat") || (p.len() >= 5 && p[0] == "concatn");
+    if !parsed.iter().any(|p| is_join(p)) {
+        return None;
+    }
+    let mut mentions: HashMap<&str, usize> = HashMap::new();
+    let mut load_of: HashMap<&str, (usize, &str)> = HashMap::new();
+    let mut join_line: HashMap<&str, usize> = HashMap::new();
+    let mut release_line: HashMap<&str, usize> = HashMap::new();
+    for (i, p) in parsed.iter().enumerate() {
+        for t in p.iter().skip(1) {
+            *mentions.entry(t).or_insert(0) += 1;
+        }
+        if p.len() == 3 && p[0] == "load" {
+            load_of.insert(p[1], (i, p[2]));
+        } else if is_join(p) {
+            join_line.insert(p[1], i);
+        } else if p.len() == 6 && p[0] == "call" && p[2] == "pith_cstring_release" && p[4] == "1" {
+            release_line.insert(p[5], i);
+        }
+    }
+    let once = |r: &str| mentions.get(r).copied() == Some(2);
+
+    let mut dropped = vec![false; parsed.len()];
+    let mut replaced: HashMap<usize, String> = HashMap::new();
+    for (k, p) in parsed.iter().enumerate() {
+        if p.len() != 3 || p[0] != "store" || p[1].starts_with("__g_") {
+            continue;
+        }
+        let (var, dst) = (p[1], p[2]);
+        let Some(&c) = join_line.get(dst) else { continue };
+        let join = &parsed[c];
+        let (base, rest) = if join[0] == "concat" {
+            (join[2], &join[3..])
+        } else {
+            (join[3], &join[4..])
+        };
+        let Some(&(a, a_var)) = load_of.get(base) else { continue };
+        if a_var != var || a > c || !once(dst) || !once(base) {
+            continue;
+        }
+        // the release of the old value, between the join and the store
+        let old = (c + 1..k).find_map(|r| {
+            let rp = &parsed[r];
+            let is_release = rp.len() == 6 && rp[0] == "call" && rp[2] == "pith_cstring_release";
+            let reg = if is_release { rp[5] } else { return None };
+            match load_of.get(reg) {
+                Some(&(o, v)) if v == var && once(reg) && release_line.get(reg) == Some(&r) => {
+                    Some((o, r))
+                }
+                _ => None,
+            }
+        });
+        let Some((o, r)) = old else { continue };
+        let start = o.min(a);
+        let clean = (start..=k).all(|i| {
+            let q = &parsed[i];
+            let barrier = matches!(q.first(), Some(&"label" | &"brif" | &"jmp" | &"ret"));
+            let stores_var = i != k && q.len() == 3 && q[0] == "store" && q[1] == var;
+            let loads_var = q.len() == 3 && q[0] == "load" && q[2] == var && i != o && i != a;
+            !barrier && !stores_var && !loads_var
+        });
+        if !clean {
+            continue;
+        }
+        dropped[r] = true;
+        replaced.insert(c, format!("appendn {} {} {} {}", dst, rest.len(), base, rest.join(" ")));
+    }
+    if replaced.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len());
+    for (i, line) in body.iter().enumerate() {
+        if let Some(rewritten) = replaced.get(&i) {
+            out.push(rewritten.clone());
         } else if !dropped[i] {
             out.push(line.to_string());
         }
@@ -2526,6 +2624,43 @@ fn compile_ir_function(
                     acc = Some(joined);
                 };
                 regs.insert(reg, joined);
+                reg_source_vars.remove(&reg);
+                struct_regs.remove(&reg);
+                string_regs.insert(reg);
+                bytes_regs.remove(&reg);
+                float_regs.remove(&reg);
+            }
+
+            // `appendn dst count base part...`, made by fuse_self_appends: the
+            // base's count passes to pith_cstring_append_many, which adds up
+            // to seven parts per call; a longer run chains calls, each taking
+            // the previous result's count, so nothing is released here.
+            "appendn" if parts.len() >= 5 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let mut acc = get_reg(&regs, parts[3])?;
+                let mut values = Vec::with_capacity(parts.len() - 4);
+                for t in &parts[4..] {
+                    values.push(get_reg(&regs, t)?);
+                }
+                let append = runtime_func_ref(
+                    codegen,
+                    &mut builder,
+                    &mut func_ref_cache,
+                    runtime_funcs,
+                    "pith_cstring_append_many",
+                )?;
+                let max = pith_runtime::APPEND_MANY_MAX;
+                for group in values.chunks(max) {
+                    let count = builder.ins().iconst(types::I64, group.len() as i64);
+                    let mut args = vec![count, acc];
+                    args.extend_from_slice(group);
+                    while args.len() < max + 2 {
+                        args.push(builder.ins().iconst(types::I64, 0));
+                    }
+                    let call = builder.ins().call(append, &args);
+                    acc = builder.func.dfg.first_result(call);
+                }
+                regs.insert(reg, acc);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.insert(reg);
@@ -3832,6 +3967,44 @@ mod tests {
         call 36 pith_cstring_release void 1 31
         store body 35
     ";
+
+    fn appends(body: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        fuse_self_appends(&lines)
+    }
+
+    /// `s = s + "ab"`, as the emitter lowers it.
+    const SELF_APPEND: &str = "
+        load 14 s
+        load 15 s
+        strref 16 m0s0
+        concat 17 15 16
+        call 18 pith_cstring_release void 1 16
+        call 24 pith_cstring_release void 1 14
+        store s 17
+    ";
+
+    #[test]
+    fn a_self_append_takes_the_locals_count() {
+        let rewritten = appends(SELF_APPEND).expect("the append is rewritten");
+        assert!(rewritten.contains(&"appendn 17 1 15 16".to_string()));
+        assert!(!rewritten.iter().any(|l| l == "call 24 pith_cstring_release void 1 14"));
+        let fused = appends(&SELF_APPEND.replace("concat 17 15 16", "concatn 17 3 15 16 20"))
+            .expect("a fused chain is rewritten too");
+        assert!(fused.contains(&"appendn 17 2 15 16 20".to_string()));
+    }
+
+    #[test]
+    fn a_self_append_that_is_not_plain_keeps_its_concat() {
+        // a global may be read by another task at the same time
+        assert!(appends(&SELF_APPEND.replace(" s", " __g_s")).is_none());
+        // another read of the local, a branch, or another use of the result
+        assert!(appends(&SELF_APPEND.replace("strref 16 m0s0", "load 16 s")).is_none());
+        assert!(appends(&SELF_APPEND.replace("strref 16 m0s0", "strref 16 m0s0\nlabel L1")).is_none());
+        assert!(appends(&SELF_APPEND.replace("store s 17", "store s 17\nstore t 17")).is_none());
+        // no release of the old value: the local does not own it
+        assert!(appends(&SELF_APPEND.replace("call 24 pith_cstring_release void 1 14\n", "")).is_none());
+    }
 
     #[test]
     fn a_concat_chain_becomes_one_concatn() {

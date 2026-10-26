@@ -1,0 +1,50 @@
+# `s = s + ...` on a local appends in place while the local holds the only
+# count on the string. every other holder must keep seeing the value it had:
+# a copy in another local, a list element, a map value, a captured value and
+# the iterable of a loop that reassigns it. a string appended to itself and a
+# long run of appends must come out whole.
+
+fn grow(n: Int) -> String:
+    mut s := ""
+    mut i := 0
+    while i < n:
+        s = s + "<" + i.to_string() + ">"
+        i = i + 1
+    return s
+
+fn main() -> Int:
+    mut a := "start"
+    copy := a
+    a = a + "-more"
+    print(copy + " | " + a)
+
+    mut b := "item"
+    mut held: List[String] := []
+    held.push(b)
+    b = b + "!"
+    print(held[0] + " | " + b)
+
+    mut c := "key"
+    mut m: Map[String, String] := {}
+    m.insert("k", c)
+    c = c + "?"
+    print(m.get("k").unwrap_or("") + " | " + c)
+
+    mut d := "cap"
+    f := fn() -> Int => d.len()
+    d = d + "tured"
+    print(f().to_string() + " | " + d)
+
+    mut e := "ab"
+    e = e + e
+    e = e + "-" + e
+    print(e)
+
+    mut w := "xyz"
+    for ch in w:
+        w = w + ch
+    print(w)
+
+    big := grow(20000)
+    print(big.len().to_string() + " " + big.substring(0, 12) + " " + big.substring(big.len() - 7, big.len()))
+    return 0

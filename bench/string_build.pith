@@ -1,0 +1,28 @@
+# string build benchmark: grow one string by many short appends.
+#
+# `s = s + ...` on a local that holds the only count appends in place, so the
+# loop is linear. the go and rust ports use their standard builders
+# (strings.Builder and String::push_str).
+#
+# usage: string_build <appends>
+
+fn main() -> Int!:
+    argv := args()
+    mut n := 1000
+    if argv.len() > 1:
+        parsed := parse_int(argv[1])
+        if parsed.is_ok and parsed.ok > 0:
+            n = parsed.ok
+
+    mut s := ""
+    mut i := 0
+    while i < n:
+        s = s + "item-" + i.to_string() + ","
+        i = i + 1
+    mut sum := 0
+    mut j := 0
+    while j < s.len():
+        sum = sum + ord(s[j])
+        j = j + 97
+    print("len: {s.len()} checksum: {sum}")
+    return 0

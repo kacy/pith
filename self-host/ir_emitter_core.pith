@@ -9671,6 +9671,37 @@ fn ir_emit_for_stmt(node: Node):
 # fresh container when the type needs it, then runs a counted loop over the
 # length using get-by-index. An owned iterable is released when the loop ends,
 # or at the function's exit edges if the body returns / fails early.
+# whether a loop over a borrowed iterable must hold its own count. a local
+# that the body never assigns keeps its count for the whole loop, so the
+# loop can skip the atomic retain and release. a field, a global, a loop
+# variable (its list can be replaced) or any other expression keeps the
+# count, since the body can drop it through another path.
+fn ir_for_iterable_needs_count(node: Node) -> Bool:
+    iter_node := get_node(node.children[0])
+    if iter_node.kind != "ident":
+        return true
+    name := iter_node.value
+    if not ir_name_is_func_local(name) or ir_loop_var_slot(name).len() > 0:
+        return true
+    return ir_subtree_assigns_name(node.children[1], name)
+
+# true when the subtree has an `=` or compound assignment whose target
+# mentions name, including an index or field write through it
+fn ir_subtree_assigns_name(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    if node.kind == "assign":
+        if node.value == name:
+            return true
+        if node.children.len() >= 2 and ir_subtree_mentions_ident(node.children[0], name):
+            return true
+    if node.kind == "assignment" and node.children.len() > 0:
+        if ir_subtree_mentions_ident(node.children[0], name):
+            return true
+    for child_idx in node.children:
+        if ir_subtree_assigns_name(child_idx, name):
+            return true
+    return false
+
 fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     iter_type := ir_infer_type(node.children[0])
     mut iter_r := ir_expr(node.children[0])
@@ -9692,9 +9723,9 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
             ir_rc_release_reg(iter_r, iter_release_kind)
         iter_r = converted_r
         iter_release_kind = ir_rc_kind(ir_for_iter_conversion_return_kind(keyed_type))
-    elif iter_release_kind.len() == 0 and iter_kind.len() > 0:
-        # a borrowed iterable (a local, a field) gets a count of its own for
-        # the loop. without it, a body that reassigns the variable it walks
+    elif iter_release_kind.len() == 0 and iter_kind.len() > 0 and ir_for_iterable_needs_count(node):
+        # a borrowed iterable gets a count of its own for the loop. without
+        # it, a body that reassigns the variable it walks
         # (`for ch in s: s = s + ch`) frees the value the loop still reads.
         ir_rc_retain_reg(iter_r, iter_kind)
         iter_release_kind = iter_kind

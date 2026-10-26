@@ -1,7 +1,8 @@
 # a loop holds its own count on the value it walks, so a body that
 # reassigns the walked variable leaves the loop reading the old value. it
 # used to borrow the variable's count, and the reassignment freed the string
-# or list under the loop.
+# or list under the loop. a local the body never assigns lends its count
+# instead, so the cases below cover each form of write the check must see.
 
 fn main() -> Int:
     mut s := "abc".repeat(2)
@@ -13,4 +14,34 @@ fn main() -> Int:
     for x in xs:
         xs = [x * 10, x * 10 + 1]
     print(xs.len().to_string() + " " + xs[0].to_string() + " " + xs[1].to_string())
+
+    # a write nested under an if
+    mut t := "xy"
+    for ch in t:
+        if ch == "x":
+            t = t + "zz"
+    print(t)
+
+    # a write in an inner loop
+    mut ys := [1, 2]
+    for y in ys:
+        for k in [0, 1]:
+            ys = [y + k]
+    print(ys.len().to_string() + " " + ys[0].to_string())
+
+    # an index write that replaces the list a loop variable walks
+    mut grid := [[1, 2, 3], [4, 5]]
+    mut total := 0
+    for row in grid:
+        for v in row:
+            grid[0] = [v * 100]
+            total = total + v
+    print(total.to_string() + " " + grid[0][0].to_string())
+
+    # a local nothing writes, read in full
+    words := "a b c".split(" ")
+    mut joined := ""
+    for w in words:
+        joined = joined + w
+    print(joined)
     return 0

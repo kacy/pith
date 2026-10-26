@@ -9680,9 +9680,10 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     item_kind := ir_for_iter_item_kind(keyed_type)
     # an owned iterable (a split result, a keys() list) dies when the
     # loop ends; a converted iterable is always a fresh container
+    iter_kind := ir_rc_kind(iter_type)
     mut iter_release_kind := ""
     if not ir_expr_is_borrowed(node.children[0]):
-        iter_release_kind = ir_rc_kind(iter_type)
+        iter_release_kind = iter_kind
     conversion_call := ir_for_iter_conversion_call(keyed_type)
     if conversion_call.len() > 0:
         converted_r := ir_reg()
@@ -9691,6 +9692,12 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
             ir_rc_release_reg(iter_r, iter_release_kind)
         iter_r = converted_r
         iter_release_kind = ir_rc_kind(ir_for_iter_conversion_return_kind(keyed_type))
+    elif iter_release_kind.len() == 0 and iter_kind.len() > 0:
+        # a borrowed iterable (a local, a field) gets a count of its own for
+        # the loop. without it, a body that reassigns the variable it walks
+        # (`for ch in s: s = s + ch`) frees the value the loop still reads.
+        ir_rc_retain_reg(iter_r, iter_kind)
+        iter_release_kind = iter_kind
     fid := ir_for_count
     ir_for_count = ir_for_count + 1
     fi := "__for_idx_" + fid.to_string()

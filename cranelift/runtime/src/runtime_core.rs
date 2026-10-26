@@ -3210,18 +3210,21 @@ unsafe fn struct_free_header(base: *mut u8) {
     }
 }
 
-/// Build a pith `T?` optional value in the on-heap tuple layout the codegen
-/// expects: field 0 is `is_some` (0 or 1), field 1 is the payload. Used by
-/// runtime accessors that want to hand back "not present" without collapsing
-/// it to a zero/empty sentinel.
+/// Build a pith `T?` optional value in the layout the codegen expects: none
+/// is the null pointer, and Some is a two-slot struct with 1 in field 0 and
+/// the payload in field 1. Used by runtime accessors that want to hand back
+/// "not present" without collapsing it to a zero/empty sentinel.
 pub(crate) fn optional_tuple(is_some: bool, value: i64) -> i64 {
+    if !is_some {
+        return 0;
+    }
     unsafe {
         let tuple = pith_struct_alloc(2);
         if tuple == 0 {
             return 0;
         }
         let ptr = tuple as *mut i64;
-        *ptr = if is_some { 1 } else { 0 };
+        *ptr = 1;
         *ptr.add(1) = value;
         tuple
     }

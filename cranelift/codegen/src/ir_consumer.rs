@@ -477,7 +477,8 @@ fn is_list_get_opt_def(parts: &[&str]) -> bool {
 }
 
 // a token occurrence (parts[i]) the inline unpack understands: the defining
-// call itself, a field read of tuple slot 0 or 8, or the release of the
+// call itself, a field read of tuple slot 0 or 8, an optflag or optval read,
+// or the release of the
 // throwaway tuple shell. anything else — a store, a return, an argument to
 // some other call — means the tuple escapes and must really exist.
 fn is_sanctioned_opt_use(parts: &[&str], i: usize) -> bool {
@@ -485,6 +486,9 @@ fn is_sanctioned_opt_use(parts: &[&str], i: usize) -> bool {
         return i == 1;
     }
     if parts.len() == 6 && parts[0] == "field" && (parts[3] == "0" || parts[3] == "8") {
+        return i == 2;
+    }
+    if (parts.len() == 3 && parts[0] == "optflag") || (parts.len() == 5 && parts[0] == "optval") {
         return i == 2;
     }
     if parts.len() == 6
@@ -3373,6 +3377,66 @@ fn compile_ir_function(
                 }
             }
 
+            // `optflag R OPT`: 1 when the optional OPT holds a value. none is
+            // the null pointer, so this is a compare, not a load.
+            "optflag" if parts.len() == 3 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let obj_reg = parse_reg(parts[2], line, func_name)?;
+                let v = if let Some(&(flag, _)) = virtual_opts.get(&obj_reg) {
+                    flag
+                } else {
+                    let obj = get_reg(&regs, parts[2])?;
+                    let is_some = builder.ins().icmp_imm(IntCC::NotEqual, obj, 0);
+                    builder.ins().uextend(types::I64, is_some)
+                };
+                regs.insert(reg, v);
+                reg_source_vars.remove(&reg);
+                note_loaded_kind(
+                    reg,
+                    None,
+                    &mut string_regs,
+                    &mut bytes_regs,
+                    &mut float_regs,
+                    &mut struct_regs,
+                );
+            }
+
+            // `optval R OPT KIND NAME`: the payload of the optional OPT, or 0
+            // when OPT is none (the null pointer), so an unchecked read of a
+            // none still yields 0 instead of faulting.
+            "optval" if parts.len() == 5 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let obj_reg = parse_reg(parts[2], line, func_name)?;
+                let v = if let Some(&(_, value)) = virtual_opts.get(&obj_reg) {
+                    value
+                } else {
+                    let obj = get_reg(&regs, parts[2])?;
+                    let zero = builder.ins().iconst(types::I64, 0);
+                    let load_block = builder.create_block();
+                    let none_block = builder.create_block();
+                    let done = builder.create_block();
+                    builder.append_block_param(done, types::I64);
+                    builder.ins().brif(obj, load_block, &[], none_block, &[]);
+                    builder.switch_to_block(none_block);
+                    jump_with_i64_arg(&mut builder, done, zero);
+                    builder.switch_to_block(load_block);
+                    let payload = builder.ins().load(types::I64, MemFlags::new(), obj, 8);
+                    jump_with_i64_arg(&mut builder, done, payload);
+                    builder.switch_to_block(done);
+                    builder.block_params(done)[0]
+                };
+                regs.insert(reg, v);
+                reg_source_vars.remove(&reg);
+                note_loaded_kind(
+                    reg,
+                    Some(parts[3]),
+                    &mut string_regs,
+                    &mut bytes_regs,
+                    &mut float_regs,
+                    &mut struct_regs,
+                );
+            }
+
             "field" if parts.len() >= 4 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
                 // unpacking a virtualized pith_list_get_opt result: slot 0 is
@@ -3393,32 +3457,14 @@ fn compile_ir_function(
                         };
                         regs.insert(reg, v);
                         reg_source_vars.remove(&reg);
-                        struct_regs.remove(&reg);
-                        if parts.len() >= 6 {
-                            let retkind = parts[4];
-                            if retkind == "string" {
-                                string_regs.insert(reg);
-                            } else {
-                                string_regs.remove(&reg);
-                            }
-                            if retkind == "bytes" {
-                                bytes_regs.insert(reg);
-                            } else {
-                                bytes_regs.remove(&reg);
-                            }
-                            if retkind == "float" {
-                                float_regs.insert(reg);
-                            } else {
-                                float_regs.remove(&reg);
-                            }
-                            if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                                struct_regs.insert(reg, struct_name.to_string());
-                            }
-                        } else {
-                            string_regs.remove(&reg);
-                            bytes_regs.remove(&reg);
-                            float_regs.remove(&reg);
-                        }
+                        note_loaded_kind(
+                            reg,
+                            parts.get(4).copied().filter(|_| parts.len() >= 6),
+                            &mut string_regs,
+                            &mut bytes_regs,
+                            &mut float_regs,
+                            &mut struct_regs,
+                        );
                         continue;
                     }
                 }
@@ -3452,31 +3498,14 @@ fn compile_ir_function(
                 let v = builder.ins().iadd(raw, zero);
                 regs.insert(reg, v);
                 reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                if let Some(retkind) = field_retkind {
-                    if retkind == "string" {
-                        string_regs.insert(reg);
-                    } else {
-                        string_regs.remove(&reg);
-                    }
-                    if retkind == "bytes" {
-                        bytes_regs.insert(reg);
-                    } else {
-                        bytes_regs.remove(&reg);
-                    }
-                    if retkind == "float" {
-                        float_regs.insert(reg);
-                    } else {
-                        float_regs.remove(&reg);
-                    }
-                    if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                        struct_regs.insert(reg, struct_name.to_string());
-                    }
-                } else {
-                    string_regs.remove(&reg);
-                    bytes_regs.remove(&reg);
-                    float_regs.remove(&reg);
-                }
+                note_loaded_kind(
+                    reg,
+                    field_retkind,
+                    &mut string_regs,
+                    &mut bytes_regs,
+                    &mut float_regs,
+                    &mut struct_regs,
+                );
             }
 
             "funcref" if parts.len() >= 3 => {
@@ -3783,6 +3812,38 @@ fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
         return Some(name);
     }
     None
+}
+
+// record what a loaded register holds, from the kind token a field-style
+// instruction carries; None (no token) clears every kind.
+fn note_loaded_kind(
+    reg: usize,
+    retkind: Option<&str>,
+    string_regs: &mut HashSet<usize>,
+    bytes_regs: &mut HashSet<usize>,
+    float_regs: &mut HashSet<usize>,
+    struct_regs: &mut HashMap<usize, String>,
+) {
+    let kind = retkind.unwrap_or("");
+    for (set, wanted) in [
+        (string_regs, "string"),
+        (bytes_regs, "bytes"),
+        (float_regs, "float"),
+    ] {
+        if kind == wanted {
+            set.insert(reg);
+        } else {
+            set.remove(&reg);
+        }
+    }
+    match explicit_struct_name_from_retkind(kind) {
+        Some(name) => {
+            struct_regs.insert(reg, name.to_string());
+        }
+        None => {
+            struct_regs.remove(&reg);
+        }
+    }
 }
 
 fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Result<Value, CompileError> {

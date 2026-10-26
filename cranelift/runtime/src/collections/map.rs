@@ -2503,11 +2503,12 @@ mod tests {
                 }),
                 0
             );
-            // `.get(k)` returns an Optional tuple, and that tuple is a heap
-            // allocation by construction. It is the caller's value, not a copy
+            // `.get(k)` returns an optional. A hit is a Some shell, a heap
+            // allocation by construction; it is the caller's value, not a copy
             // of the key, so the claim here is that it is the ONLY allocation:
             // one warm-up call to get the struct pool past its own setup, then
-            // exactly one per call, hit or miss.
+            // exactly one per hit. A miss is the null pointer and allocates
+            // nothing.
             pith_map_get_cstr_opt(map, key);
             assert_eq!(
                 allocations_during(|| {
@@ -2519,7 +2520,7 @@ mod tests {
                 allocations_during(|| {
                     pith_map_get_cstr_opt(map, absent);
                 }),
-                1
+                0
             );
             assert_eq!(
                 allocations_during(|| {
@@ -2604,8 +2605,9 @@ mod tests {
                 }),
                 0
             );
-            // as in the string test: the Optional tuple is the one allocation,
-            // and it is the returned value rather than a copy of the key
+            // as in the string test: a hit's Some shell is the one allocation,
+            // and it is the returned value rather than a copy of the key; a
+            // miss allocates nothing
             pith_map_get_bkey_opt(map, key);
             assert_eq!(
                 allocations_during(|| {
@@ -2617,7 +2619,7 @@ mod tests {
                 allocations_during(|| {
                     pith_map_get_bkey_opt(map, absent);
                 }),
-                1
+                0
             );
             assert_eq!(
                 allocations_during(|| {
@@ -2884,9 +2886,9 @@ mod tests {
             pith_map_insert_int(&mut map, 7, narrow.as_ptr(), 4);
             assert_eq!(pith_map_len(map), 1);
             assert_eq!(pith_map_get_ikey(handle, 7), 0);
-            // the Optional says absent rather than "present, zero"
-            let opt = pith_map_get_ikey_opt(handle, 7) as *const i64;
-            assert_eq!(*opt, 0);
+            // the Optional says absent (the null pointer) rather than
+            // "present, zero"
+            assert_eq!(pith_map_get_ikey_opt(handle, 7), 0);
             pith_map_release(map);
         }
     }

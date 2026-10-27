@@ -12,5 +12,10 @@
 # archive for exactly that, and `cranelift/runtime/tests/cross_thread_resume.rs`
 # forces the cross-thread resume against it. a `RUSTFLAGS` in the environment
 # replaces this setting rather than adding to it, which both checks catch.
+#
+# every function also starts on a 64-byte boundary. a pith program's own code
+# is linked ahead of the runtime, so without this a change to the generated
+# code shifts the runtime's hot loops across cache lines and moves unrelated
+# benchmarks by 5 to 10 percent.
 [build]
-rustflags = ["-C", "relocation-model=pie"]
+rustflags = ["-C", "relocation-model=pie", "-C", "llvm-args=-align-all-functions=6"]

@@ -16,7 +16,9 @@ use pith_runtime::bytes::{
     BYTES_MAGIC_OFFSET,
 };
 use pith_runtime::runtime_core::{
-    CLOSURE_ENV_OFFSET, CLOSURE_HANDLE_ALIGN, CLOSURE_MAGIC, CLOSURE_MAGIC_OFFSET,
+    CLOSURE_CYCLE_FLAGS_OFFSET, CLOSURE_ENV_OFFSET, CLOSURE_ENV_TAGS_OFFSET, CLOSURE_FUNC_PTR_OFFSET,
+    CLOSURE_HANDLE_ALIGN, CLOSURE_MAGIC, CLOSURE_MAGIC_OFFSET, CLOSURE_OVERFLOW_OFFSET,
+    CLOSURE_REF_COUNT_OFFSET, CLOSURE_SIZE,
     PITH_CLOSURE_ENV_SLOTS,
 };
 use pith_runtime::collections::list::{
@@ -932,6 +934,57 @@ fn inline_closure_get_env(
     jump_with_i64_arg(builder, done, value);
 
     finish_strict_fast_path(builder, slow, done, fallback)
+}
+
+/// Inline the store of one capture (`pith_closure_set_env`) the way
+/// `inline_closure_get_env` inlines the read: the handle test, then one store
+/// into the inline env. A closure is built with one of these per capture, so
+/// the FFI call was a large share of building a small one. A spilled slot and
+/// a bad handle go to `fallback`.
+fn inline_closure_set_env(
+    builder: &mut FunctionBuilder<'_>,
+    closure: Value,
+    slot: Value,
+    value: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) {
+    let done = builder.create_block();
+    let slow = builder.create_block();
+    builder.append_block_param(slow, types::I64);
+    builder.append_block_param(slow, types::I64);
+    builder.set_cold_block(slow);
+
+    branch_if_not_magic_handle(
+        builder,
+        closure,
+        slot,
+        CLOSURE_HANDLE_ALIGN,
+        CLOSURE_MAGIC_OFFSET,
+        CLOSURE_MAGIC,
+        slow,
+    );
+    let spilled = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        slot,
+        PITH_CLOSURE_ENV_SLOTS as i64,
+    );
+    let write = builder.create_block();
+    brif_with_two_i64_args(builder, spilled, slow, closure, slot, write);
+    builder.switch_to_block(write);
+    let offset = builder.ins().ishl_imm(slot, 3);
+    let addr = builder.ins().iadd(closure, offset);
+    builder
+        .ins()
+        .store(MemFlags::new(), value, addr, CLOSURE_ENV_OFFSET);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(slow);
+    let params = builder.block_params(slow);
+    let (handle, index) = (params[0], params[1]);
+    builder.ins().call(fallback, &[handle, index, value]);
+    builder.ins().jump(done, &[]);
+
+    builder.switch_to_block(done);
 }
 
 /// Inline bytes.read_word for the common case — a count of 1..=8 with a
@@ -3037,6 +3090,23 @@ fn compile_ir_function(
                         struct_regs.remove(&reg);
                         continue;
                     }
+                    if fname == "pith_closure_set_env" && args.len() == 3 && !name_is_shadowed {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "pith_closure_set_env",
+                        )?;
+                        inline_closure_set_env(&mut builder, args[0], args[1], args[2], fallback);
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        regs.insert(reg, zero);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
                     if fname == "bytes_get" && args.len() == 2 && !name_is_shadowed {
                         let inlined = inline_bytes_get(&mut builder, args[0], args[1]);
                         regs.insert(reg, inlined);
@@ -3744,6 +3814,50 @@ fn compile_ir_function(
                         fname, func_name
                     )));
                 }
+                reg_source_vars.remove(&reg);
+                struct_regs.remove(&reg);
+                string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
+                float_regs.remove(&reg);
+            }
+
+            // a closure the emitter proved never outlives this frame: the same
+            // object closure_ref builds, written into a stack slot of its own
+            // instead of the heap. each op gets its own slot, so a loop that
+            // rebuilds one writes over the previous, dead, copy. the header is
+            // written here rather than by a runtime call; see CLOSURE_SIZE.
+            "closure_stack" if parts.len() >= 3 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let fname = parts[2];
+                let Some(&fid) = declared_funcs.get(fname) else {
+                    return Err(CompileError::ModuleError(format!(
+                        "ir consumer: unknown closure reference '{}' in {}",
+                        fname, func_name
+                    )));
+                };
+                let fref = *func_ref_cache
+                    .entry(fid)
+                    .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func));
+                let addr = builder.ins().func_addr(types::I64, fref);
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    CLOSURE_SIZE,
+                    3,
+                ));
+                let at = builder.ins().stack_addr(types::I64, slot, 0);
+                let flags = MemFlags::trusted();
+                let magic = builder.ins().iconst(types::I32, CLOSURE_MAGIC as i64);
+                builder.ins().store(flags, magic, at, CLOSURE_MAGIC_OFFSET);
+                builder.ins().store(flags, addr, at, CLOSURE_FUNC_PTR_OFFSET);
+                let one = builder.ins().iconst(types::I64, 1);
+                builder.ins().store(flags, one, at, CLOSURE_REF_COUNT_OFFSET);
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder.ins().store(flags, zero, at, CLOSURE_ENV_TAGS_OFFSET);
+                builder.ins().store(flags, zero, at, CLOSURE_ENV_TAGS_OFFSET + 8);
+                let zero8 = builder.ins().iconst(types::I8, 0);
+                builder.ins().store(flags, zero8, at, CLOSURE_CYCLE_FLAGS_OFFSET);
+                builder.ins().store(flags, zero, at, CLOSURE_OVERFLOW_OFFSET);
+                regs.insert(reg, at);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);
                 string_regs.remove(&reg);

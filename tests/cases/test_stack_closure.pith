@@ -1,0 +1,51 @@
+# a closure that is only ever called by name, and reads nothing with a
+# count, is built in a stack slot. the cases below mix those with closures
+# that must stay on the heap (they capture a string, or are passed, returned
+# or stored) so a wrong call either way shows up in the output or under
+# valgrind.
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int:
+    return f(x)
+
+fn adder(n: Int) -> fn(Int) -> Int:
+    return fn(x: Int) => x + n
+
+fn main() -> Int:
+    # rebuilt on every pass, called directly
+    mut total := 0
+    mut i := 0
+    while i < 10:
+        base := i % 3
+        f := fn(x: Int) => base + x
+        total = total + f(i)
+        i = i + 1
+    print(total.to_string())
+
+    # float and bool captures, a string param, a block body
+    scale := 1.5
+    loud := true
+    g := fn(s: String) -> Int:
+        mut n := s.len()
+        if loud:
+            n = n * 2
+        return n + scale.to_int()
+    print(g("abc").to_string() + " " + g("").to_string())
+
+    # captures a string: stays on the heap
+    word := "hey".repeat(2)
+    h := fn(x: Int) => word.len() + x
+    print(h(1).to_string())
+
+    # passed, returned and stored closures stay on the heap
+    k := fn(x: Int) => x * 3
+    print(apply(k, 4).to_string() + " " + adder(5)(6).to_string())
+    fs := [fn(x: Int) => x - 1]
+    print(fs[0](10).to_string())
+
+    # a closure built inside a lambda's own body
+    outer := fn(n: Int) -> Int:
+        step := n + 1
+        inner := fn(x: Int) => x * step
+        return inner(2) + inner(3)
+    print(outer(1).to_string())
+    return 0

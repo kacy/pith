@@ -473,6 +473,17 @@ impl EnvSlot {
 pub const CLOSURE_MAGIC_OFFSET: i32 = std::mem::offset_of!(PithClosure, magic) as i32;
 pub const CLOSURE_ENV_OFFSET: i32 = std::mem::offset_of!(PithClosure, env) as i32;
 pub const CLOSURE_HANDLE_ALIGN: i64 = 8;
+/// The layout codegen writes when it builds a closure in a stack slot of its
+/// own frame (the ir's `closure_stack`). The env is left as it is: the closure
+/// reads only the slots its construction writes. `overflow` is None as a null
+/// pointer, which Rust guarantees for an `Option<Box<_>>`.
+pub const CLOSURE_SIZE: u32 = std::mem::size_of::<PithClosure>() as u32;
+pub const CLOSURE_FUNC_PTR_OFFSET: i32 = std::mem::offset_of!(PithClosure, func_ptr) as i32;
+pub const CLOSURE_REF_COUNT_OFFSET: i32 = std::mem::offset_of!(PithClosure, ref_count) as i32;
+pub const CLOSURE_ENV_TAGS_OFFSET: i32 = std::mem::offset_of!(PithClosure, env_tags) as i32;
+pub const CLOSURE_CYCLE_FLAGS_OFFSET: i32 = std::mem::offset_of!(PithClosure, cycle_flags) as i32;
+pub const CLOSURE_OVERFLOW_OFFSET: i32 = std::mem::offset_of!(PithClosure, overflow) as i32;
+const _: () = assert!(PITH_CLOSURE_ENV_SLOTS == 16);
 
 #[repr(C)]
 struct PithClosure {
@@ -632,20 +643,14 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
     let pooled = closure_pool_take();
     if !pooled.is_null() {
         let ptr = pooled as *mut PithClosure;
-        unsafe {
-            ptr.write(PithClosure {
-                magic: CLOSURE_MAGIC,
-                func_ptr,
-                ref_count: std::sync::atomic::AtomicI64::new(1),
-                env: [0; PITH_CLOSURE_ENV_SLOTS],
-                env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
-                cycle_flags: std::sync::atomic::AtomicU8::new(0),
-                overflow: None,
-            });
-        }
+        unsafe { ptr.write(fresh_closure(func_ptr)) };
         return ptr as i64;
     }
-    let ptr = Box::into_raw(Box::new(PithClosure {
+    Box::into_raw(Box::new(fresh_closure(func_ptr))) as i64
+}
+
+fn fresh_closure(func_ptr: i64) -> PithClosure {
+    PithClosure {
         magic: CLOSURE_MAGIC,
         func_ptr,
         ref_count: std::sync::atomic::AtomicI64::new(1),
@@ -653,8 +658,7 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
         env_tags: [0; PITH_CLOSURE_ENV_SLOTS],
         cycle_flags: std::sync::atomic::AtomicU8::new(0),
         overflow: None,
-    }));
-    ptr as i64
+    }
 }
 
 // A dead closure's block, kept for the next construction. Fixed size, so a

@@ -119,6 +119,11 @@ mut ir_rc_locals: List[String] := []
 # a lambda's captures while its prologue runs: loaded from the closure
 # environment, which owns them, so none of them may become a kinded local.
 mut ir_rc_prologue_captures: List[String] := []
+# closure locals of the function being emitted that live in a stack slot
+# (see ir_stack_closure_binds), and the request a bind of one hands to the
+# lambda it is about to emit.
+mut ir_stack_closure_names: List[String] := []
+mut ir_lambda_on_stack := false
 mut ir_rc_local_kinds: List[String] := []
 
 # tuple locals (a `T!`/`T?` bound to a name) release only their 3-slot shell at
@@ -2555,6 +2560,72 @@ fn ir_borrow_method_is_safe(idx: Int) -> Bool:
     if recv_type.starts_with("list"):
         return ["len", "contains", "is_empty"].contains(node.value)
     return false
+# closure bindings that can be built in a stack slot instead of on the heap.
+# `f := fn(x: Int) => base + x` allocates a closure, and a loop that rebinds
+# it allocates and frees one per pass, though all it ever does is call f. a
+# binding qualifies, and leaves this frame's tracking, when:
+#
+#   - f is bound only here, never assigned, and not mut
+#   - every other mention of f is the callee of a call outside any lambda, so
+#     f is never stored, passed, returned or captured
+#   - nothing the lambda reads carries a count (ir_lambda_reads_uncounted), so
+#     the closure owns nothing it would have to release
+fn ir_stack_closure_binds(body_idx: Int) -> List[String]:
+    mut names: List[String] := []
+    if body_idx >= 0:
+        ir_collect_stack_closure_binds(body_idx, body_idx, names)
+    return names
+
+fn ir_collect_stack_closure_binds(idx: Int, body_idx: Int, names: List[String]):
+    node := get_node(idx)
+    if ir_is_binding_kind(node.kind) and not node.value.contains(" "):
+        parts := ir_collect_bind_parts(node)
+        if parts.val_idx >= 0 and node_kind(parts.val_idx) == "lambda" and ir_rc_local_kind(parts.name) == "closure":
+            name := parts.name
+            if not ir_subtree_assigns_name(body_idx, name) and ir_count_name_nodes(body_idx, name) == 1 + ir_count_direct_calls(body_idx, name) and ir_lambda_reads_uncounted(parts.val_idx):
+                names.push(name)
+    for child in node.children:
+        ir_collect_stack_closure_binds(child, body_idx, names)
+
+# calls whose callee is the bare name, not counting any inside a lambda.
+fn ir_count_direct_calls(idx: Int, name: String) -> Int:
+    node := get_node(idx)
+    if node.kind == "lambda":
+        return 0
+    mut n := 0
+    if node.kind == "call" and node.children.len() > 0:
+        callee := get_node(node.children[0])
+        if callee.kind == "ident" and callee.value == name:
+            n = 1
+    for child in node.children:
+        n = n + ir_count_direct_calls(child, name)
+    return n
+
+# true when every name the lambda reads, other than its params and the
+# functions it calls, has a type without a count. a nested lambda is turned
+# away rather than walked.
+fn ir_lambda_reads_uncounted(lambda_idx: Int) -> Bool:
+    parts := ir_collect_lambda_parts(lambda_idx)
+    if parts.body_idx < 0:
+        return false
+    return ir_subtree_reads_uncounted(parts.body_idx, parts.params)
+
+fn ir_subtree_reads_uncounted(idx: Int, params: List[String]) -> Bool:
+    node := get_node(idx)
+    if node.kind == "lambda":
+        return false
+    if node.kind == "ident" and not params.contains(node.value):
+        tid := c_get_expr_type(idx)
+        if tid < 0 or ir_rc_kind(ir_type_from_tid(tid)).len() > 0:
+            return false
+    mut i := 0
+    while i < node.children.len():
+        # a call's callee is a function, not a value the closure holds
+        if not (node.kind == "call" and i == 0 and node_kind(node.children[0]) == "ident"):
+            if not ir_subtree_reads_uncounted(node.children[i], params):
+                return false
+        i = i + 1
+    return true
 
 fn ir_emit_rc_prologue(body_idx: Int):
     # before anything resolves a name: everything this body binds is this
@@ -2594,6 +2665,8 @@ fn ir_emit_rc_prologue(body_idx: Int):
     # with the final tracked set known, decide which tuple locals may cascade
     # their payload at cleanup (all uses provably safe); the rest stay shell-only
     ir_untrack_rc_locals(ir_borrowed_element_binds(body_idx))
+    ir_stack_closure_names = ir_stack_closure_binds(body_idx)
+    ir_untrack_rc_locals(ir_stack_closure_names)
     ir_tuple_cascade_scan(body_idx)
     mut i := 0
     while i < ir_rc_locals.len():
@@ -7302,6 +7375,8 @@ fn ir_finish_lambda_emit(saved_builder: IrBuilderSnapshot, saved_vars: Map[Strin
         ir_local_lambda_targets = ir_local_lambda_targets_saved[ir_local_lambda_targets_depth]
 
 fn ir_emit_lambda(idx: Int) -> Int:
+    on_stack := ir_lambda_on_stack
+    ir_lambda_on_stack = false
     # compile lambda body as a separate function
     lambda_name := "__lambda_" + ir_lambda_count.to_string()
     ir_lambda_count = ir_lambda_count + 1
@@ -7336,6 +7411,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # release decisions and made it load a name the ir had not declared.
     saved_untracked_binds := ir_untracked_rc_binds
     saved_kinded_binds := ir_kinded_rc_binds
+    saved_stack_closures := ir_stack_closure_names
     ir_rc_locals = []
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
@@ -7399,14 +7475,28 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_weak_capture_names = saved_weak_caps
     ir_untracked_rc_binds = saved_untracked_binds
     ir_kinded_rc_binds = saved_kinded_binds
-    # return closure handle and fill captures
+    ir_stack_closure_names = saved_stack_closures
+    # return closure handle and fill captures. the prologue's check on what the
+    # lambda reads stands in for the capture list, which is only known here;
+    # the two are compared again so a disagreement falls back to the heap.
     r := ir_reg()
-    ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
+    # past 16 captures the env spills into a heap block, which a stack closure
+    # would never free.
+    if on_stack and lambda_weak_caps.len() == 0 and parts.captures.len() <= 16 and ir_captures_uncounted(parts.captures):
+        ir_emit("closure_stack " + r.to_string() + " " + lambda_name)
+    else:
+        ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
     ir_emit_lambda_capture_setup(r, parts.captures)
     # set after the body, so a lambda nested inside this one cannot leave its
     # own symbol here for the enclosing bind to pick up
     ir_last_lambda_symbol = lambda_name
     return r
+
+fn ir_captures_uncounted(captures: List[String]) -> Bool:
+    for cap in captures:
+        if ir_rc_kind(ir_lookup_name_type(cap)).len() > 0:
+            return false
+    return true
 
 fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     wrapper_name := "__spawn_" + ir_lambda_count.to_string()
@@ -9081,7 +9171,9 @@ fn ir_emit_bind_stmt(node: Node):
             old_r = ir_reg()
             ir_emit_name_load(old_r, name)
         bind_target := ir_map_init_target(name, target_type)
+        ir_lambda_on_stack = ir_stack_closure_names.contains(name) and get_node(val_idx).kind == "lambda"
         r := ir_emit_value_for_target_inner(val_idx, bind_target, ir_optional_inner_type_of_node(type_idx))
+        ir_lambda_on_stack = false
         if tracked and bind_target != "tuple" and ir_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:

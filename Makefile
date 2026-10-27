@@ -826,7 +826,7 @@ protogen-check:
 	./target/release/pith test tools/protogen/protogen_test.pith && \
 	if command -v valgrind > /dev/null; then \
 		./target/release/pith build tools/protogen/protogen_memcheck.pith > /dev/null; \
-		PITH_STRUCT_FREELIST=0 valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q ./tools/protogen/protogen_memcheck > /dev/null && \
+		PITH_STRUCT_FREELIST=0 $(MEMCHECK_VALGRIND) ./tools/protogen/protogen_memcheck > /dev/null && \
 		echo "protogen output matches golden, tests pass, valgrind clean"; \
 	else \
 		echo "protogen output matches golden and tests pass (valgrind absent)"; \
@@ -1277,6 +1277,16 @@ verify-osthread-corpus-only:
 # os-thread task machinery (its slab reclaim, its join state, the ownership of
 # values handed across a real thread), so those run again with PITH_GREEN=0 —
 # otherwise the flip would quietly stop testing the code they were written for.
+#
+# MEMCHECK_VALGRIND caps the stack valgrind records for each allocation at eight
+# frames. valgrind 3.25 cannot follow the link from a green task's root frame to
+# the stack that resumed it (corosensei describes that link with a cfa
+# expression): it steps to a bad frame, and the step after that reads unmapped
+# memory and kills valgrind itself. test_tls_server_config_release reaches that
+# frame within the default depth of twelve. the valgrind 3.22 on the ci runners
+# passes it at that depth. error reports keep eight frames.
+MEMCHECK_VALGRIND := valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none --num-callers=8 -q
+
 MEMCHECK_OSTHREAD_CASES := \
 	tests/cases/test_os_thread_spawn_reclaim tests/cases/test_await_ownership \
 	tests/cases/test_env_overlay \
@@ -1427,7 +1437,7 @@ memcheck-only:
 	@fail=0; \
 	for base in $(MEMCHECK_CASES); do \
 		./target/release/pith build "$$base.pith" > /dev/null 2>&1 || { echo "FAIL build $$base"; fail=1; continue; }; \
-		if PITH_STRUCT_FREELIST=0 valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q "$$base" > /dev/null 2>/tmp/pith-memcheck.txt; then \
+		if PITH_STRUCT_FREELIST=0 $(MEMCHECK_VALGRIND) "$$base" > /dev/null 2>/tmp/pith-memcheck.txt; then \
 			echo "ok   $$base"; \
 		else \
 			echo "FAIL $$base (valgrind)"; head -6 /tmp/pith-memcheck.txt; fail=1; \
@@ -1435,7 +1445,7 @@ memcheck-only:
 	done; \
 	for base in $(MEMCHECK_OSTHREAD_CASES); do \
 		./target/release/pith build "$$base.pith" > /dev/null 2>&1 || { echo "FAIL build $$base"; fail=1; continue; }; \
-		if PITH_GREEN=0 PITH_STRUCT_FREELIST=0 valgrind --error-exitcode=99 --leak-check=no --errors-for-leak-kinds=none -q "$$base" > /dev/null 2>/tmp/pith-memcheck.txt; then \
+		if PITH_GREEN=0 PITH_STRUCT_FREELIST=0 $(MEMCHECK_VALGRIND) "$$base" > /dev/null 2>/tmp/pith-memcheck.txt; then \
 			echo "ok   $$base (os threads)"; \
 		else \
 			echo "FAIL $$base (valgrind, os threads)"; head -6 /tmp/pith-memcheck.txt; fail=1; \

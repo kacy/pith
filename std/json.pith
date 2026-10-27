@@ -217,11 +217,13 @@ threadlocal mut parser_depth: Int := 0
 # we have to stop before it happens rather than recover from it.
 MAX_PARSE_DEPTH := 128
 
-# Returns character at position or empty string if out of bounds
-fn get_char_at(position: Int) -> String:
-    if position >= parser_input.len():
-        return ""
-    return parser_input[position]
+# the byte at position, or -1 past the end. ord of an index reads the byte
+# without building a one-character string.
+fn byte_at(position: Int) -> Int:
+    input := parser_input
+    if position >= input.len():
+        return 0 - 1
+    return ord(input[position])
 
 # true when `word` sits at `at` in the input.
 #
@@ -258,8 +260,14 @@ fn handle_has_type(handle: Int, kind: String) -> Bool:
 
 # Skips whitespace characters (space, tab, newline, carriage return)
 fn skip_whitespace():
-    while parser_position < parser_input.len() and (get_char_at(parser_position) == " " or get_char_at(parser_position) == chr(9) or get_char_at(parser_position) == chr(10) or get_char_at(parser_position) == chr(13)):
-        parser_position = parser_position + 1
+    input := parser_input
+    mut pos := parser_position
+    while pos < input.len():
+        b := ord(input[pos])
+        if b != 32 and b != 9 and b != 10 and b != 13:
+            break
+        pos = pos + 1
+    parser_position = pos
 
 # Parses an integer from a string manually (handles negative numbers).
 # On overflow, sets parser_error so json_parse returns -1 instead of
@@ -285,14 +293,6 @@ fn parse_integer_manual(s: String) -> Int:
     if neg:
         return 0 - val
     return val
-
-# Returns true if character is valid in a number (digit, dot, e, E, +, -)
-fn is_number_char(c: String) -> Bool:
-    if c >= "0" and c <= "9":
-        return true
-    if c == "." or c == "e" or c == "E" or c == "+" or c == "-":
-        return true
-    return false
 
 fn scan_whitespace(c: String) -> Bool:
     return c == " " or c == chr(9) or c == chr(10) or c == chr(13)
@@ -835,15 +835,17 @@ fn json_scan_object_scalars_bytes(input: Bytes) -> JsonScalarObject:
 # Parses a JSON string value (double-quoted)
 fn parse_string_raw() -> String:
     # skip opening quote
-    parser_position = parser_position + 1
-    start := parser_position
+    input := parser_input
+    start := parser_position + 1
+    mut pos := start
     mut had_escape := false
-    while parser_position < parser_input.len() and get_char_at(parser_position) != chr(34):
-        if get_char_at(parser_position) == chr(92):
+    while pos < input.len() and ord(input[pos]) != 34:
+        if ord(input[pos]) == 92:
             had_escape = true
-            parser_position = parser_position + 1
-        parser_position = parser_position + 1
-    if parser_position >= parser_input.len():
+            pos = pos + 1
+        pos = pos + 1
+    parser_position = pos
+    if pos >= input.len():
         # ran off the end without a closing quote — a truncated body is not
         # valid json, so reject it rather than accept the partial string.
         parser_error = true
@@ -879,14 +881,14 @@ fn parse_value_node() -> Int:
     if parser_position >= parser_input.len():
         parser_error = true
         return 0 - 1
-    c := get_char_at(parser_position)
+    c := byte_at(parser_position)
 
     # string. the decoded text has its own name on purpose: `val` below is
     # an Int (a child node handle) in the array and object branches, and a
     # name bound to different kinds in sibling branches is one the emitter
     # cannot release at exit (ir_prepass_track_or_poison), so a `val` here
     # stranded every string value the parser ever read (#1108).
-    if c == chr(34):
+    if c == 34:
         text := parse_string_raw()
         idx := allocate_node("string")
         string_values.insert(idx, text)
@@ -912,20 +914,20 @@ fn parse_value_node() -> Int:
         return idx
 
     # array
-    if c == "[":
+    if c == 91:
         parser_position = parser_position + 1
         arr := allocate_node("array")
         skip_whitespace()
-        if parser_position < parser_input.len() and get_char_at(parser_position) == "]":
+        if parser_position < parser_input.len() and byte_at(parser_position) == 93:
             parser_position = parser_position + 1
             return arr
-        while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
+        while parser_position < parser_input.len() and byte_at(parser_position) != 93:
             val := parse_value()
             if parser_error:
                 return 0 - 1
             push_array_element(arr, val)
             skip_whitespace()
-            if parser_position < parser_input.len() and get_char_at(parser_position) == ",":
+            if parser_position < parser_input.len() and byte_at(parser_position) == 44:
                 parser_position = parser_position + 1
             skip_whitespace()
         if parser_position < parser_input.len():
@@ -933,49 +935,52 @@ fn parse_value_node() -> Int:
         return arr
 
     # object
-    if c == chr(123):
+    if c == 123:
         parser_position = parser_position + 1
         obj := allocate_node("object")
         skip_whitespace()
-        if parser_position < parser_input.len() and get_char_at(parser_position) == chr(125):
+        if parser_position < parser_input.len() and byte_at(parser_position) == 125:
             parser_position = parser_position + 1
             return obj
         mut done := false
         while parser_position < parser_input.len() and not done and not parser_error:
             skip_whitespace()
-            if parser_position >= parser_input.len() or get_char_at(parser_position) != chr(34):
+            if parser_position >= parser_input.len() or byte_at(parser_position) != 34:
                 parser_error = true
                 return 0 - 1
             key := parse_string_raw()
             skip_whitespace()
-            if parser_position < parser_input.len() and get_char_at(parser_position) == ":":
+            if parser_position < parser_input.len() and byte_at(parser_position) == 58:
                 parser_position = parser_position + 1
             val := parse_value()
             if parser_error:
                 return 0 - 1
             set_object_property(obj, key, val)
             skip_whitespace()
-            if parser_position < parser_input.len() and get_char_at(parser_position) == ",":
+            if parser_position < parser_input.len() and byte_at(parser_position) == 44:
                 parser_position = parser_position + 1
             skip_whitespace()
-            if parser_position < parser_input.len() and get_char_at(parser_position) == chr(125):
+            if parser_position < parser_input.len() and byte_at(parser_position) == 125:
                 done = true
-        if parser_position < parser_input.len() and get_char_at(parser_position) == chr(125):
+        if parser_position < parser_input.len() and byte_at(parser_position) == 125:
             parser_position = parser_position + 1
         return obj
 
     # number (int or float)
-    if (c >= "0" and c <= "9") or c == "-" or c == "+":
+    if (c >= 48 and c <= 57) or c == 45 or c == 43:
+        input := parser_input
         start := parser_position
+        mut pos := start
         mut is_float := false
-        if c == "-" or c == "+":
-            parser_position = parser_position + 1
-        while parser_position < parser_input.len() and is_number_char(get_char_at(parser_position)):
-            d := get_char_at(parser_position)
-            if d == "." or d == "e" or d == "E":
+        if c == 45 or c == 43:
+            pos = pos + 1
+        while pos < input.len() and json_byte_is_number_char(ord(input[pos])):
+            d := ord(input[pos])
+            if d == 46 or d == 101 or d == 69:
                 is_float = true
-            parser_position = parser_position + 1
-        num_str := parser_input.substring(start, parser_position)
+            pos = pos + 1
+        parser_position = pos
+        num_str := input.substring(start, pos)
         if is_float:
             # the runtime's conversion, so a float node holds the same
             # value the typed fillers write for the same text; a span that

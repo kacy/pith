@@ -218,6 +218,15 @@ fn normalize_label_name(name: String) -> String:
 
 # escape a label value for prometheus text: backslash, double-quote, newline.
 fn escape_label_value(value: String) -> String:
+    # most values have nothing to escape; hand those back as they are.
+    mut j := 0
+    while j < value.len():
+        b := ord(value[j])
+        if b == 92 or b == 34 or b == 10:
+            break
+        j = j + 1
+    if j == value.len():
+        return value
     # collect the pieces and join once at the end: appending each character
     # to the result string recopied everything accumulated so far, which
     # made escaping quadratic in the value.
@@ -308,9 +317,28 @@ fn metric_name_char(c: String) -> String:
         return c
     return "_"
 
+# true when every byte of name is [A-Za-z0-9_] and it does not start with a
+# digit, so normalizing would return it unchanged.
+fn metric_name_is_clean(name: String) -> Bool:
+    mut i := 0
+    while i < name.len():
+        b := ord(name[i])
+        if b >= 48 and b <= 57:
+            if i == 0:
+                return false
+        elif not ((b >= 97 and b <= 122) or (b >= 65 and b <= 90) or b == 95):
+            return false
+        i = i + 1
+    return true
+
 fn normalize_metric_name(name: String) -> String:
     if name == "":
         return "metric"
+    # names are almost always clean already, and a labeled write normalizes
+    # every label name on every call, so skip the rebuild when it changes
+    # nothing.
+    if metric_name_is_clean(name):
+        return name
     # collect the pieces and join once at the end: appending each character
     # to the result string recopied everything accumulated so far, which
     # made normalizing quadratic in the name.
@@ -949,6 +977,22 @@ test "labels create independent series and render with a shared TYPE line":
     # one TYPE line for the metric, one line per series with sorted labels
     assert(text.contains("# TYPE http_requests_total counter"))
     assert(text.contains("http_requests_total" + chr(123) + "method=" + chr(34) + "GET" + chr(34) + ",route=" + chr(34) + "/api" + chr(34) + chr(125) + " 3"))
+
+test "names and label values that need rewriting still get it":
+    assert_eq(normalize_metric_name("requests_total"), "requests_total")
+    assert_eq(normalize_metric_name("5xx"), "_5xx")
+    assert_eq(normalize_metric_name("a5"), "a5")
+    assert_eq(normalize_metric_name("dash-name"), "dash_name")
+    assert_eq(normalize_metric_name("caf" + chr(233)), "caf_")
+    assert_eq(escape_label_value("/api"), "/api")
+    assert_eq(escape_label_value(""), "")
+    assert_eq(escape_label_value("a" + chr(34) + "b"), "a" + chr(92) + chr(34) + "b")
+    assert_eq(escape_label_value("x" + chr(92)), "x" + chr(92) + chr(92))
+    assert_eq(escape_label_value("l1" + chr(10) + "l2"), "l1" + chr(92) + "nl2")
+    reset()
+    hits := counter("hits")
+    hits.labels(["bad-key", "v" + chr(34)]).inc()
+    assert(snapshot_text().contains("hits" + chr(123) + "bad_key=" + chr(34) + "v" + chr(92) + chr(34) + chr(34) + chr(125) + " 1"))
 
 test "structured snapshot reports typed samples with labels":
     reset()

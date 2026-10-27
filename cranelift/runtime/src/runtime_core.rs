@@ -2924,14 +2924,36 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 // it. Entries are not reclaimed at thread exit — bounded by the number of
 // threadlocal globals, retained for the life of the process by design.
 //
-// The slots are small integers the compiler hands out, so the maps use the
-// runtime's integer hasher; with siphash, the lookups std.io and std.json make
-// on every buffered write and json scope cost an http server a few percent of
-// its cpu.
-pub(crate) type TlsMap = crate::int_hash::IntMap<i64, i64>;
+// The compiler numbers the slots densely from zero, so a thread's values live
+// in a vector indexed by slot. std.json reads its parser state from
+// threadlocals on every byte, and a hash probe per read was a quarter of a
+// node-pool parse.
+#[derive(Default)]
+pub(crate) struct TlsMap {
+    values: Vec<Option<i64>>,
+}
+
+impl TlsMap {
+    pub(crate) const fn new() -> Self {
+        TlsMap { values: Vec::new() }
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, slot: &i64) -> Option<&i64> {
+        self.values.get(*slot as usize)?.as_ref()
+    }
+
+    pub(crate) fn insert(&mut self, slot: i64, value: i64) {
+        let i = slot as usize;
+        if i >= self.values.len() {
+            self.values.resize(i + 1, None);
+        }
+        self.values[i] = Some(value);
+    }
+}
 
 thread_local! {
-    static TLS_GLOBALS: std::cell::RefCell<TlsMap> = std::cell::RefCell::new(TlsMap::default());
+    static TLS_GLOBALS: std::cell::RefCell<TlsMap> = const { std::cell::RefCell::new(TlsMap::new()) };
 }
 
 /// Under the green backend, the map backing the currently-running task's

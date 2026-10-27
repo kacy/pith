@@ -2329,14 +2329,27 @@ fn compile_ir_function(
         }
     }
 
-    // Pre-scan for labels and create blocks
+    // Pre-scan for labels and create blocks. a label that a later jmp or brif
+    // targets heads a loop.
+    let mut loop_headers: HashSet<&str> = HashSet::new();
     for line in body_lines {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if !parts.is_empty() && parts[0] == "label" && parts.len() >= 2 {
             let block = builder.create_block();
             labels.insert(parts[1].to_string(), block);
         }
+        let targets = match parts.first() {
+            Some(&"jmp") => parts.get(1..2),
+            Some(&"brif") => parts.get(2..4),
+            _ => None,
+        };
+        for target in targets.unwrap_or_default() {
+            if labels.contains_key(*target) {
+                loop_headers.insert(target);
+            }
+        }
     }
+    let mut current_label: Option<&str> = None;
 
     // Pre-scan for indexed list reads whose Optional tuple never escapes; those
     // calls compile to inline loads instead (see inline_list_get_opt). The map
@@ -2364,6 +2377,7 @@ fn compile_ir_function(
         // already in this set is a back-edge (see `defined_labels`).
         if parts[0] == "label" && parts.len() >= 2 {
             defined_labels.insert(parts[1].to_string());
+            current_label = Some(parts[1]);
         }
 
         // If current block is terminated, skip until next label
@@ -3998,12 +4012,24 @@ fn compile_ir_function(
                         )?;
                     }
                 }
-                let cond_bool = builder.ins().icmp_imm(IntCC::NotEqual, cond, 0);
                 let then_block = get_label(&labels, then_label, func_name)?;
                 let else_block = get_label(&labels, else_label, func_name)?;
-                builder
-                    .ins()
-                    .brif(cond_bool, then_block, &[], else_block, &[]);
+                // cranelift lays out a branch's last successor right after the
+                // branch. in a loop header the then arm is the body, so test the
+                // inverse and name the body last: it falls through from the
+                // header, and only the back-edge is taken. other branches keep
+                // their order, which places the then arm out of line.
+                if current_label.is_some_and(|l| loop_headers.contains(l)) {
+                    let cond_bool = builder.ins().icmp_imm(IntCC::Equal, cond, 0);
+                    builder
+                        .ins()
+                        .brif(cond_bool, else_block, &[], then_block, &[]);
+                } else {
+                    let cond_bool = builder.ins().icmp_imm(IntCC::NotEqual, cond, 0);
+                    builder
+                        .ins()
+                        .brif(cond_bool, then_block, &[], else_block, &[]);
+                }
                 terminated = true;
             }
 

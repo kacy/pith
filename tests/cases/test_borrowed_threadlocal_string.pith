@@ -1,0 +1,63 @@
+# `s := current` on a threadlocal string borrows the value instead of
+# counting it when nothing in s's statements can replace it. each case below
+# keeps s somewhere (a return, a map) or replaces the threadlocal while s is
+# live, so a missing count frees the string while it is still reachable.
+
+threadlocal mut current: String := ""
+
+fn fresh(word: String) -> String:
+    return word.repeat(2)
+
+fn replace_current():
+    current = fresh("zz")
+
+# a loop over the borrowed value
+fn count_spaces() -> Int:
+    s := current
+    mut n := 0
+    mut i := 0
+    while i < s.len():
+        if ord(s[i]) == 32:
+            n = n + 1
+        i = i + 1
+    return n
+
+# returned: the caller gets its own count
+fn snapshot() -> String:
+    s := current
+    return s
+
+# replaced in the range: no borrow
+fn swap_then_read() -> String:
+    s := current
+    current = fresh("q")
+    return s
+
+# replaced by a call in the range: no borrow
+fn call_then_read() -> Int:
+    s := current
+    replace_current()
+    return s.len()
+
+# stored in a map, then the threadlocal is replaced
+fn keep_in_map() -> Map[String, Int]:
+    mut m: Map[String, Int] := {}
+    s := current
+    m.insert(s, s.len())
+    return m
+
+fn main() -> Int:
+    current = fresh("a b ")
+    print(count_spaces().to_string())
+    kept := snapshot()
+    current = fresh("other")
+    print(kept)
+    print(swap_then_read())
+    print(current)
+    print(call_then_read().to_string())
+    print(current)
+    m := keep_in_map()
+    current = fresh("gone")
+    for k in m.keys():
+        print(k + " " + m[k].to_string())
+    return 0

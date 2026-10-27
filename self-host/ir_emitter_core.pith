@@ -2441,6 +2441,121 @@ fn ir_untrack_rc_locals(names: List[String]):
     ir_rc_locals = kept
     ir_rc_local_kinds = kept_kinds
 
+# string bindings that can borrow a list element instead of counting it.
+# `k := keys[i]` normally retains the element and releases the previous k
+# on every pass. that pair is pure overhead when nothing can drop the
+# element while k is in use, so a binding qualifies, and leaves this frame's
+# tracking the way an unmodified string param does, when all of these hold:
+#
+#   - k is a string, bound only here, never assigned, and not mut
+#   - the value is xs[...] where xs is a list param or an owned list local
+#   - k is used only in the statements after the binding in its own block
+#   - those statements pass ir_borrow_range_is_safe: no user code, no loop
+#     (a back edge can yield to another task), no closure, and no write
+#     that could reach a list
+fn ir_borrowed_element_binds(body_idx: Int) -> List[String]:
+    mut names: List[String] := []
+    if body_idx >= 0:
+        ir_collect_borrowed_element_binds(body_idx, body_idx, names)
+    return names
+
+fn ir_collect_borrowed_element_binds(idx: Int, body_idx: Int, names: List[String]):
+    node := get_node(idx)
+    mut i := 0
+    while i < node.children.len():
+        child := node.children[i]
+        if ir_bind_can_borrow_element(node, i, body_idx):
+            names.push(ir_collect_bind_parts(get_node(child)).name)
+        ir_collect_borrowed_element_binds(child, body_idx, names)
+        i = i + 1
+
+fn ir_bind_can_borrow_element(block: Node, pos: Int, body_idx: Int) -> Bool:
+    bind := get_node(block.children[pos])
+    if not ir_is_binding_kind(bind.kind) or bind.value.contains(" "):
+        return false
+    parts := ir_collect_bind_parts(bind)
+    name := parts.name
+    if parts.val_idx < 0 or ir_rc_local_kind(name) != "string":
+        return false
+    val := get_node(parts.val_idx)
+    if val.kind != "index" or val.children.len() < 2 or ir_expr_is_fresh_string_index(parts.val_idx):
+        return false
+    base := get_node(val.children[0])
+    if base.kind != "ident" or not ir_infer_type(val.children[0]).starts_with("list"):
+        return false
+    src := base.value
+    if ir_loop_var_slot(src).len() > 0:
+        return false
+    if ir_rc_local_kind(src).len() == 0 and not ir_var_regs.contains_key(src):
+        return false
+    if ir_count_name_nodes(parts.val_idx, name) > 0:
+        return false
+    if ir_subtree_assigns_name(body_idx, name):
+        return false
+    mut in_range := 0
+    mut j := pos + 1
+    while j < block.children.len():
+        if not ir_borrow_range_is_safe(block.children[j], src):
+            return false
+        in_range = in_range + ir_count_name_nodes(block.children[j], name)
+        j = j + 1
+    return ir_count_name_nodes(body_idx, name) == ir_count_name_nodes(block.children[pos], name) + in_range
+
+# every node whose value is the name: idents, bindings, loop variables and
+# pattern bindings alike. a method that happens to share the name counts
+# too, which can only make the caller more cautious.
+fn ir_count_name_nodes(idx: Int, name: String) -> Int:
+    node := get_node(idx)
+    mut n := 0
+    if node.value == name:
+        n = 1
+    for child in node.children:
+        n = n + ir_count_name_nodes(child, name)
+    return n
+
+fn ir_borrow_range_is_safe(idx: Int, src: String) -> Bool:
+    node := get_node(idx)
+    kind := node.kind
+    if node.children.len() == 0:
+        return true
+    if kind == "method_call":
+        if not ir_borrow_method_is_safe(idx):
+            return false
+    elif kind == "call":
+        callee := get_node(node.children[0])
+        if callee.kind != "ident" or ir_is_declared_callable(callee.value):
+            return false
+        if not ["print", "ord", "chr"].contains(callee.value):
+            return false
+    elif kind == "assignment":
+        target := get_node(node.children[0])
+        if target.kind == "ident" and target.value == src:
+            return false
+        if target.kind == "index" and target.children.len() > 0 and ir_infer_type(target.children[0]).starts_with("list"):
+            return false
+    elif kind == "assign":
+        if node.value == src or node.children.len() >= 2:
+            return false
+    elif not ["binary", "unary", "grouped", "index", "field_access", "arg", "if_stmt", "then", "elif", "else", "block", "binding", "bind", "return", "if_expr", "elif_branch"].contains(kind):
+        return false
+    for child in node.children:
+        if not ir_borrow_range_is_safe(child, src):
+            return false
+    return true
+
+# a builtin method that cannot drop a list element: any method on a map, a
+# set or a string, and the read-only ones on a list.
+fn ir_borrow_method_is_safe(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.children.len() == 0 or ir_resolve_module_alias_method_call_name(idx).len() > 0:
+        return false
+    recv_type := ir_infer_type(node.children[0])
+    if recv_type.starts_with("map") or recv_type.starts_with("set") or recv_type == "string":
+        return ["contains_key", "contains", "insert", "get", "remove", "len", "add", "starts_with", "ends_with", "index_of", "is_empty"].contains(node.value)
+    if recv_type.starts_with("list"):
+        return ["len", "contains", "is_empty"].contains(node.value)
+    return false
+
 fn ir_emit_rc_prologue(body_idx: Int):
     # before anything resolves a name: everything this body binds is this
     # function's own storage, whatever a module global is spelled.
@@ -2478,6 +2593,7 @@ fn ir_emit_rc_prologue(body_idx: Int):
         ir_untracked_rc_binds = poisoned
     # with the final tracked set known, decide which tuple locals may cascade
     # their payload at cleanup (all uses provably safe); the rest stay shell-only
+    ir_untrack_rc_locals(ir_borrowed_element_binds(body_idx))
     ir_tuple_cascade_scan(body_idx)
     mut i := 0
     while i < ir_rc_locals.len():

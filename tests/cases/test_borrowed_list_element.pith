@@ -1,0 +1,75 @@
+# `k := xs[i]` borrows the element instead of counting it when nothing in
+# k's statements can drop it. each case below hands the borrowed string to
+# something that has to keep it (a return, a map, a field, another list) and
+# then drops or clears the list it came from, so a missing count frees the
+# string while it is still reachable.
+
+struct Holder:
+    name: String
+
+fn pick(words: List[String], i: Int) -> String:
+    w := words[i]
+    return w
+
+fn second_word() -> String:
+    words := "alpha beta gamma".split(" ")
+    w := words[1]
+    return w
+
+fn count_keys(keys: List[String], n: Int) -> Map[String, Int]:
+    mut m: Map[String, Int] := {}
+    mut i := 0
+    while i < n:
+        k := keys[i % keys.len()]
+        if m.contains_key(k):
+            m.insert(k, m[k] + 1)
+        else:
+            m.insert(k, 1)
+        i = i + 1
+    return m
+
+fn main() -> Int:
+    print(second_word())
+
+    mut src := "one two three".split(" ")
+    got := pick(src, 2)
+    src = []
+    print(got + " " + src.len().to_string())
+
+    mut keys := "x y x".split(" ")
+    m := count_keys(keys, 7)
+    keys.clear()
+    print(m["x"].to_string() + " " + m["y"].to_string())
+
+    mut names := "ann bob".split(" ")
+    mut h := Holder("")
+    mut i := 0
+    while i < names.len():
+        n := names[i]
+        if n.starts_with("b"):
+            h.name = n
+        i = i + 1
+    names = []
+    print(h.name)
+
+    mut parts := "p q r".split(" ")
+    mut kept: List[String] := []
+    i = 0
+    while i < parts.len():
+        p := parts[i]
+        kept.push(p)
+        i = i + 1
+    parts.clear()
+    print(kept.len().to_string() + " " + kept[2])
+
+    # copied into an outer local, which takes a count of its own
+    mut last := ""
+    mut tail := "u v w".split(" ")
+    i = 0
+    while i < tail.len():
+        t := tail[i]
+        last = t
+        i = i + 1
+    tail = []
+    print(last)
+    return 0

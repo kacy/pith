@@ -1376,6 +1376,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_argument_literal_ownership \
 	tests/cases/test_borrowed_operand_extraction \
 	tests/cases/test_unwrap_or_borrowed_fallback \
+	tests/cases/test_borrowed_list_element tests/cases/test_borrowed_threadlocal_string \
+	tests/cases/test_stack_closure \
 	tests/cases/test_task_result_payloads \
 	tests/cases/test_struct_closure_field tests/cases/test_generic_struct_field_dtor \
 	tests/cases/test_generic_instance_dtor \

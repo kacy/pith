@@ -445,6 +445,55 @@ fn detect_bits_wrapper(param_names: &[String], body_lines: &[&str]) -> Option<&'
     Some(op)
 }
 
+/// The address of a string literal's characters, just past the header that
+/// `declare_string_data` writes in front of them.
+fn string_lit_addr(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    lit: cranelift_module::DataId,
+) -> Value {
+    let gv = codegen.module.declare_data_in_func(lit, builder.func);
+    let base = builder.ins().global_value(types::I64, gv);
+    builder.ins().iadd_imm(base, 16)
+}
+
+/// Whether a one-argument call is a retain or release that the runtime would
+/// return from without touching anything: any of them on a constant zero
+/// (null), and a string retain or release on a literal, which has no count.
+fn is_noop_count_call(
+    fname: &str,
+    arg: Value,
+    literal_values: &HashSet<Value>,
+    func: &cranelift::codegen::ir::Function,
+) -> bool {
+    let string_count = matches!(fname, "pith_cstring_retain" | "pith_cstring_release");
+    let handle_release = matches!(
+        fname,
+        "pith_list_release_handle"
+            | "pith_map_release_handle"
+            | "pith_set_release_handle"
+            | "pith_struct_release"
+            | "pith_closure_release"
+            | "pith_bytes_release"
+    );
+    if !string_count && !handle_release {
+        return false;
+    }
+    if string_count && literal_values.contains(&arg) {
+        return true;
+    }
+    let cranelift::codegen::ir::ValueDef::Result(inst, _) = func.dfg.value_def(arg) else {
+        return false;
+    };
+    matches!(
+        func.dfg.insts[inst],
+        cranelift::codegen::ir::InstructionData::UnaryImm {
+            opcode: cranelift::codegen::ir::Opcode::Iconst,
+            imm,
+        } if imm.bits() == 0
+    )
+}
+
 fn emit_bits_op(builder: &mut FunctionBuilder<'_>, op: &str, a: Value, b: Value) -> Value {
     match op {
         "band" => builder.ins().band(a, b),
@@ -1552,14 +1601,14 @@ pub fn compile_from_ir(
         }
     }
 
-    // Declare string data functions
-    let mut string_funcs: HashMap<String, FuncId> = HashMap::new();
+    // Declare string literal data
+    let mut string_lits: HashMap<String, cranelift_module::DataId> = HashMap::new();
     for (idx, content) in &string_data {
-        if !string_funcs.contains_key(idx) {
+        if !string_lits.contains_key(idx) {
             let name = format!("__irstr_{}", idx);
-            let func_id = crate::declare_string_data(&mut codegen.module, &name, content)
+            let data_id = crate::declare_string_data(&mut codegen.module, &name, content)
                 .map_err(|e| CompileError::ModuleError(format!("string data: {:?}", e)))?;
-            string_funcs.insert(idx.clone(), func_id);
+            string_lits.insert(idx.clone(), data_id);
         }
     }
 
@@ -1657,7 +1706,7 @@ pub fn compile_from_ir(
                 &body_lines,
                 runtime_funcs,
                 &declared_funcs,
-                &string_funcs,
+                &string_lits,
                 &struct_layouts,
                 &global_data,
                 &str_globals,
@@ -2102,7 +2151,7 @@ fn compile_ir_function(
     body_lines: &[&str],
     runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
-    string_funcs: &HashMap<String, FuncId>,
+    string_lits: &HashMap<String, cranelift_module::DataId>,
     struct_layouts: &HashMap<String, Vec<String>>,
     global_data: &HashMap<String, cranelift_module::DataId>,
     str_globals: &[(String, String)],
@@ -2132,6 +2181,8 @@ fn compile_ir_function(
     let mut regs: HashMap<usize, Value> = HashMap::new();
     let mut string_regs: HashSet<usize> = HashSet::new();
     let mut string_vars: HashSet<String> = HashSet::new();
+    // the values that hold the address of a string literal
+    let mut literal_values: HashSet<Value> = HashSet::new();
     let mut bytes_regs: HashSet<usize> = HashSet::new();
     let mut bytes_vars: HashSet<String> = HashSet::new();
     let mut float_regs: HashSet<usize> = HashSet::new();
@@ -2166,13 +2217,11 @@ fn compile_ir_function(
         }
         // Initialize str: globals — call string function and store result
         for (gname, str_id) in str_globals.iter() {
-            if let (Some(&data_id), Some(&sfunc_id)) = (
+            if let (Some(&data_id), Some(&lit_id)) = (
                 global_data.get(gname.as_str()),
-                string_funcs.get(str_id.as_str()),
+                string_lits.get(str_id.as_str()),
             ) {
-                let sf_ref = codegen.module.declare_func_in_func(sfunc_id, builder.func);
-                let str_val = builder.ins().call(sf_ref, &[]);
-                let str_result = builder.func.dfg.first_result(str_val);
+                let str_result = string_lit_addr(codegen, &mut builder, lit_id);
                 let gv = codegen.module.declare_data_in_func(data_id, builder.func);
                 let addr = builder.ins().global_value(types::I64, gv);
                 builder
@@ -2364,10 +2413,9 @@ fn compile_ir_function(
             "strref" if parts.len() >= 3 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
                 let str_idx = parts[2].to_string();
-                if let Some(&sf_id) = string_funcs.get(&str_idx) {
-                    let sf_ref = codegen.module.declare_func_in_func(sf_id, builder.func);
-                    let call = builder.ins().call(sf_ref, &[]);
-                    let v = builder.func.dfg.first_result(call);
+                if let Some(&lit_id) = string_lits.get(&str_idx) {
+                    let v = string_lit_addr(codegen, &mut builder, lit_id);
+                    literal_values.insert(v);
                     regs.insert(reg, v);
                 } else {
                     // a strref may name a string defined in another compilation
@@ -3026,6 +3074,23 @@ fn compile_ir_function(
                     // the fast path only applies to the builtin it replaces.
                     let name_is_shadowed =
                         declared_funcs.contains_key(fname) || named_vars.contains_key(fname);
+
+                    // a count call on a string literal or a null handle does
+                    // nothing at run time, and the emitter makes many of them
+                    // (every owned local starts out null and is released
+                    // before its first store), so they are left out.
+                    if !name_is_shadowed
+                        && args.len() == 1
+                        && is_noop_count_call(fname, args[0], &literal_values, builder.func)
+                    {
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        regs.insert(reg, zero);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
 
                     // a call to a verified bit wrapper (or to a bit builtin
                     // directly) is one native instruction. a local variable
@@ -4515,6 +4580,29 @@ mod tests {
                   ret 3\n\
                   endfunc\n";
         compile_ok_for_ir(ir);
+    }
+
+    #[test]
+    fn count_calls_on_null_and_literals_are_noops() {
+        use cranelift::codegen::ir::{Function, UserFuncName};
+        let sig = Signature::new(cranelift::codegen::isa::CallConv::SystemV);
+        let mut func = Function::with_name_signature(UserFuncName::default(), sig);
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        let null = builder.ins().iconst(types::I64, 0);
+        let five = builder.ins().iconst(types::I64, 5);
+        let literal = builder.ins().iadd_imm(five, 16);
+        let literals: HashSet<Value> = [literal].into_iter().collect();
+        let f = &*builder.func;
+        assert!(is_noop_count_call("pith_cstring_release", null, &literals, f));
+        assert!(is_noop_count_call("pith_list_release_handle", null, &literals, f));
+        assert!(is_noop_count_call("pith_cstring_retain", literal, &literals, f));
+        // a literal is not a list, and a nonzero constant is not null
+        assert!(!is_noop_count_call("pith_list_release_handle", literal, &literals, f));
+        assert!(!is_noop_count_call("pith_cstring_release", five, &literals, f));
+        assert!(!is_noop_count_call("pith_list_retain", null, &literals, f));
     }
 
     #[test]

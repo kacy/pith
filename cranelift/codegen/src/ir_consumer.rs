@@ -4583,6 +4583,29 @@ mod tests {
     }
 
     #[test]
+    fn count_calls_on_null_and_literals_are_noops() {
+        use cranelift::codegen::ir::{Function, UserFuncName};
+        let sig = Signature::new(cranelift::codegen::isa::CallConv::SystemV);
+        let mut func = Function::with_name_signature(UserFuncName::default(), sig);
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+        let null = builder.ins().iconst(types::I64, 0);
+        let five = builder.ins().iconst(types::I64, 5);
+        let literal = builder.ins().iadd_imm(five, 16);
+        let literals: HashSet<Value> = [literal].into_iter().collect();
+        let f = &*builder.func;
+        assert!(is_noop_count_call("pith_cstring_release", null, &literals, f));
+        assert!(is_noop_count_call("pith_list_release_handle", null, &literals, f));
+        assert!(is_noop_count_call("pith_cstring_retain", literal, &literals, f));
+        // a literal is not a list, and a nonzero constant is not null
+        assert!(!is_noop_count_call("pith_list_release_handle", literal, &literals, f));
+        assert!(!is_noop_count_call("pith_cstring_release", five, &literals, f));
+        assert!(!is_noop_count_call("pith_list_retain", null, &literals, f));
+    }
+
+    #[test]
     fn rcall_reaches_a_runtime_pair_builtin() {
         // parse_int and parse_float return their (is_ok, payload) pair in two
         // registers; rcall resolves them from the runtime table, the float

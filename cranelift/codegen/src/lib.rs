@@ -3,7 +3,7 @@
 //! Pipeline: Pith IR text → ir_consumer → Cranelift → native object code
 
 use cranelift::prelude::*;
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift_module::Module;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -110,7 +110,7 @@ pub fn declare_string_data(
     module: &mut ObjectModule,
     name: &str,
     content: &str,
-) -> Result<FuncId, CompileError> {
+) -> Result<cranelift_module::DataId, CompileError> {
     use cranelift_module::DataDescription;
 
     // a sixteen-byte header precedes the characters, laid out like a heap
@@ -140,37 +140,7 @@ pub fn declare_string_data(
         .define_data(data_id, &data_desc)
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
 
-    // Create a function that returns the address of the string data
-    let mut ctx = module.make_context();
-    ctx.func.signature.returns.push(AbiParam::new(types::I64));
-
-    let func_name = format!("__str_{}", name);
-    let func_id = module
-        .declare_function(&func_name, Linkage::Local, &ctx.func.signature)
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    let mut builder_ctx = FunctionBuilderContext::new();
-    {
-        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
-        let entry_block = builder.create_block();
-        builder.switch_to_block(entry_block);
-        builder.seal_block(entry_block);
-
-        // Get address of data (skipping the 16-byte anti-magic pad)
-        let data_ref = module.declare_data_in_func(data_id, builder.func);
-        let base = builder.ins().global_value(types::I64, data_ref);
-        let addr = builder.ins().iadd_imm(base, 16);
-
-        builder.ins().return_(&[addr]);
-
-        builder.finalize();
-    }
-
-    module
-        .define_function(func_id, &mut ctx)
-        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
-
-    Ok(func_id)
+    Ok(data_id)
 }
 /// Finalize the module and return object bytes
 pub fn finalize_module(module: ObjectModule) -> Result<Vec<u8>, CompileError> {

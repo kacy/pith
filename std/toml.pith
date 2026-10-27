@@ -11,6 +11,7 @@
 
 import std.bytes as bytes
 import std.io as io
+import std.bits as bits
 
 TOML_FILE_CHUNK_SIZE := 4096
 
@@ -52,12 +53,12 @@ threadlocal mut boolean_values: Map[Int, Bool] := {}
 # `[a]\nx=1\n[b]\ny=2` lost table `b` entirely (get_table returned -1). Slot
 # keys (handle:index) keep each node's children addressable regardless of
 # parse order, the same scheme std.json uses for objects.
-threadlocal mut table_keys_by_slot: Map[String, String] := {}
-threadlocal mut table_values_by_slot: Map[String, Int] := {}
+threadlocal mut table_keys_by_slot: Map[Int, String] := {}
+threadlocal mut table_values_by_slot: Map[Int, Int] := {}
 threadlocal mut table_key_counts: Map[Int, Int] := {}
 
 # Array children: flat append-only storage with offset/count
-threadlocal mut array_values_by_slot: Map[String, Int] := {}
+threadlocal mut array_values_by_slot: Map[Int, Int] := {}
 threadlocal mut array_item_counts: Map[Int, Int] := {}
 
 # How many scopes open_scope() has handed out and not yet reclaimed.
@@ -76,12 +77,13 @@ fn allocate_node(kind: String) -> Int:
     array_item_counts.insert(idx, 0)
     return idx
 
-# Sets a key-value pair in a table
-fn table_slot_key(handle: Int, index: Int) -> String:
-    return handle.to_string() + ":" + index.to_string()
+# a slot key packs the handle into the high 32 bits and the index into the
+# low 32, as std.json's does.
+fn table_slot_key(handle: Int, index: Int) -> Int:
+    return bits.bor(bits.shl(handle, 32), index)
 
-fn array_slot_key(handle: Int, index: Int) -> String:
-    return handle.to_string() + ":" + index.to_string()
+fn array_slot_key(handle: Int, index: Int) -> Int:
+    return table_slot_key(handle, index)
 
 fn clear_table_entries(handle: Int):
     cnt := table_key_counts[handle]
@@ -99,6 +101,7 @@ fn clear_array_entries(handle: Int):
         array_values_by_slot.remove(array_slot_key(handle, i))
         i = i + 1
 
+# Sets a key-value pair in a table
 fn set_table_property(handle: Int, key: String, val: Int):
     cnt := table_key_counts[handle]
     slot := table_slot_key(handle, cnt)

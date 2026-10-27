@@ -13,6 +13,7 @@ import std.io as io
 import std.bytes as bytes
 import std.fs as fs
 import std.os.path as os_path
+import std.bits as bits
 from std.bytes import ByteBuffer
 
 JSON_FILE_CHUNK_SIZE := 4096
@@ -125,15 +126,15 @@ threadlocal mut boolean_values: Map[Int, Bool] := {}
 
 # Object children: per-object append-only storage keyed by object/id slot
 threadlocal mut object_key_counts: Map[Int, Int] := {}
-threadlocal mut object_keys_by_slot: Map[String, String] := {}
-threadlocal mut object_values_by_slot: Map[String, Int] := {}
+threadlocal mut object_keys_by_slot: Map[Int, String] := {}
+threadlocal mut object_values_by_slot: Map[Int, Int] := {}
 
 # Array children live under stable per-array slot keys, exactly like object
 # entries — a single flat append-only list broke on interleaving, since a
 # child array parsed between two parent pushes landed inside the parent's
 # window ([[1],[2]] read element 1 back as the int 2). the count is kept for
 # length and bounds; the values hang off (handle, index) slot keys.
-threadlocal mut array_values_by_slot: Map[String, Int] := {}
+threadlocal mut array_values_by_slot: Map[Int, Int] := {}
 threadlocal mut array_item_counts: Map[Int, Int] := {}
 
 # How many scopes open_scope() has handed out and not yet reclaimed. A scope
@@ -156,8 +157,11 @@ fn allocate_node(kind: String) -> Int:
 
 # object entries live under stable per-object slot keys so nested object parses
 # do not break parent lookups by interleaving child fields.
-fn object_slot_key(handle: Int, index: Int) -> String:
-    return handle.to_string() + ":" + index.to_string()
+# a slot key packs the handle into the high 32 bits and the index into the
+# low 32. two live handles never differ by 2^32, and no node has 2^32
+# children, so distinct slots get distinct keys.
+fn object_slot_key(handle: Int, index: Int) -> Int:
+    return bits.bor(bits.shl(handle, 32), index)
 
 fn object_slot_name(handle: Int, index: Int) -> String:
     return object_keys_by_slot[object_slot_key(handle, index)]
@@ -182,8 +186,8 @@ fn set_object_property(handle: Int, key: String, value: Int):
     object_values_by_slot.insert(slot, value)
     object_key_counts.insert(handle, count + 1)
 
-fn array_slot_key(handle: Int, index: Int) -> String:
-    return handle.to_string() + ":" + index.to_string()
+fn array_slot_key(handle: Int, index: Int) -> Int:
+    return object_slot_key(handle, index)
 
 fn array_slot_value(handle: Int, index: Int) -> Int:
     return array_values_by_slot[array_slot_key(handle, index)]

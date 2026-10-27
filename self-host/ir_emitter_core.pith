@@ -2458,6 +2458,10 @@ fn ir_untrack_rc_locals(names: List[String]):
 #   - those statements pass ir_borrow_range_is_safe: no user code, no loop
 #     (a back edge can yield to another task), no closure, and no write
 #     that could reach a list
+#
+# a binding of a threadlocal string global, `input := parser_input`, also
+# qualifies under the same rules, except that loops are allowed: the value
+# lives in this task's own slot, which nothing outside the range can reach.
 fn ir_borrowed_element_binds(body_idx: Int) -> List[String]:
     mut names: List[String] := []
     if body_idx >= 0:
@@ -2483,16 +2487,25 @@ fn ir_bind_can_borrow_element(block: Node, pos: Int, body_idx: Int) -> Bool:
     if parts.val_idx < 0 or ir_rc_local_kind(name) != "string":
         return false
     val := get_node(parts.val_idx)
-    if val.kind != "index" or val.children.len() < 2 or ir_expr_is_fresh_string_index(parts.val_idx):
-        return false
-    base := get_node(val.children[0])
-    if base.kind != "ident" or not ir_infer_type(val.children[0]).starts_with("list"):
-        return false
-    src := base.value
-    if ir_loop_var_slot(src).len() > 0:
-        return false
-    if ir_rc_local_kind(src).len() == 0 and not ir_var_regs.contains_key(src):
-        return false
+    mut src := ""
+    mut loops_ok := false
+    if val.kind == "ident" and ir_name_is_threadlocal(val.value) and ir_threadlocal_kinds[val.value] == "string":
+        # a threadlocal string: no other thread or task can reach this task's
+        # slot, so only code in the range below could replace the value, and
+        # a loop's back edge is safe as well
+        src = val.value
+        loops_ok = true
+    else:
+        if val.kind != "index" or val.children.len() < 2 or ir_expr_is_fresh_string_index(parts.val_idx):
+            return false
+        base := get_node(val.children[0])
+        if base.kind != "ident" or not ir_infer_type(val.children[0]).starts_with("list"):
+            return false
+        src = base.value
+        if ir_loop_var_slot(src).len() > 0:
+            return false
+        if ir_rc_local_kind(src).len() == 0 and not ir_var_regs.contains_key(src):
+            return false
     if ir_count_name_nodes(parts.val_idx, name) > 0:
         return false
     if ir_subtree_assigns_name(body_idx, name):
@@ -2500,7 +2513,7 @@ fn ir_bind_can_borrow_element(block: Node, pos: Int, body_idx: Int) -> Bool:
     mut in_range := 0
     mut j := pos + 1
     while j < block.children.len():
-        if not ir_borrow_range_is_safe(block.children[j], src):
+        if not ir_borrow_range_is_safe(block.children[j], src, loops_ok):
             return false
         in_range = in_range + ir_count_name_nodes(block.children[j], name)
         j = j + 1
@@ -2518,7 +2531,7 @@ fn ir_count_name_nodes(idx: Int, name: String) -> Int:
         n = n + ir_count_name_nodes(child, name)
     return n
 
-fn ir_borrow_range_is_safe(idx: Int, src: String) -> Bool:
+fn ir_borrow_range_is_safe(idx: Int, src: String, loops_ok: Bool) -> Bool:
     node := get_node(idx)
     kind := node.kind
     if node.children.len() == 0:
@@ -2542,9 +2555,10 @@ fn ir_borrow_range_is_safe(idx: Int, src: String) -> Bool:
         if node.value == src or node.children.len() >= 2:
             return false
     elif not ["binary", "unary", "grouped", "index", "field_access", "arg", "if_stmt", "then", "elif", "else", "block", "binding", "bind", "return", "if_expr", "elif_branch"].contains(kind):
-        return false
+        if not loops_ok or not ["while", "while_stmt", "break", "continue"].contains(kind):
+            return false
     for child in node.children:
-        if not ir_borrow_range_is_safe(child, src):
+        if not ir_borrow_range_is_safe(child, src, loops_ok):
             return false
     return true
 

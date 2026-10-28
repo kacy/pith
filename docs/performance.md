@@ -686,6 +686,14 @@ nothing. an instruction count cannot see a memory-ordering stall, so the two
 instruments answer different questions and a barrier's cost still needs the
 timing protocol — but with the null floor established first.
 
+`PITH_PERF_STATS=1` also counts the count operations. the `rc ops` line
+gives the retains and releases of each counted kind (strings keep their own
+line), the struct releases that took the sole-owner path, and the weak
+references taken and dropped. a second line counts struct allocations by
+field count. an optional shell has two fields and a result box three, so that
+line shows how much of a program's struct traffic is wrappers and how much is
+its own types.
+
 ## std profiling pass (2026-09-10)
 
 a pass over the standard library where every target came from a profile

@@ -1466,6 +1466,7 @@ pub(crate) unsafe fn cycle_drop_list_shell(ptr: usize) {
 /// Retain a list handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_retain_handle(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_LIST_RETAIN);
     if let Some(impl_ref) = list_mut_from_handle(handle) {
         impl_ref
             .rc
@@ -1476,6 +1477,7 @@ pub unsafe extern "C" fn pith_list_retain_handle(handle: i64) {
 /// Release a list handle; frees the list and its owned elements at zero.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_release_handle(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_LIST_RELEASE);
     pith_list_release(PithList {
         ptr: handle as *mut (),
     });

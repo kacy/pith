@@ -58,6 +58,7 @@ unsafe fn pith_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut PithByteBuffer
 
 pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
     crate::perf_stats!(PERF_BYTES_ALLOCS += 1, PERF_BYTES_ALLOC_BYTES += data.len());
+    crate::alloc_sites::record("bytes");
     let data_ptr = data.as_ptr();
     let data_len = data.len();
     let ptr = Box::into_raw(Box::new(PithBytes {
@@ -77,6 +78,7 @@ pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
 /// rejects garbage).
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_retain(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_BYTES_RETAIN);
     if let Some(b) = pith_bytes_ref(handle) {
         b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -88,6 +90,7 @@ pub unsafe extern "C" fn pith_bytes_retain(handle: i64) {
 /// handle must be a valid PithBytes handle or garbage.
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_BYTES_RELEASE);
     let Some(b) = pith_bytes_ref(handle) else {
         return;
     };

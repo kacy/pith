@@ -686,6 +686,29 @@ nothing. an instruction count cannot see a memory-ordering stall, so the two
 instruments answer different questions and a barrier's cost still needs the
 timing protocol — but with the null floor established first.
 
+`PITH_PERF_STATS=1` also counts the count operations. the `rc ops` line
+gives the retains and releases of each counted kind (strings keep their own
+line), the struct releases that took the sole-owner path, and the weak
+references taken and dropped. a second line counts struct allocations by
+field count. an optional shell has two fields and a result box three, so that
+line shows how much of a program's struct traffic is wrappers and how much is
+its own types.
+
+for where the time goes, `PITH_PROF=<file>` makes any pith program sample
+itself: every 250 us of cpu time it records the instruction that was running,
+and at exit it writes those addresses with the process's memory map.
+`tooling/prof_report.py <program> <file>` prints the flat profile by function.
+build the program with `PITH_KEEP_SYMBOLS=1` first. samples inside libc resolve
+to its nearest exported symbol, so the allocator's internals show under
+borrowed names such as `_dl_mcount_wrapper`; read those as malloc and free.
+
+`PITH_ALLOC_SITES=<n>` answers which code allocates. for one heap allocation
+in every n it walks the stack to the first compiled function, and at exit it
+prints the busiest functions by kind: string, list, map, bytes, closure, and
+struct by field count, so `struct/3` in a hot function is usually a result box
+and `struct/2` an optional shell. each sample costs a stack walk, so pick an n
+that keeps the run short, and build with `PITH_KEEP_SYMBOLS=1`.
+
 ## std profiling pass (2026-09-10)
 
 a pass over the standard library where every target came from a profile

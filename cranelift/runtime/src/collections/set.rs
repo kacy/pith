@@ -355,6 +355,7 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
 /// Retain a set handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_retain_handle(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_SET_RETAIN);
     if let Some(impl_ref) = set_mut_from_handle(handle) {
         impl_ref
             .rc
@@ -365,6 +366,7 @@ pub unsafe extern "C" fn pith_set_retain_handle(handle: i64) {
 /// Release a set handle; frees the set and its owned elements at zero.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_release_handle(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_SET_RELEASE);
     pith_set_release(PithSet {
         ptr: handle as *mut (),
     });

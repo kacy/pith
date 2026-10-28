@@ -247,6 +247,7 @@ fn require_key_flavor(actual: KeyType, wanted: KeyType, entry: &str) {
 
 impl MapImpl {
     fn new(key_type: KeyType, val_size: usize, val_tag: ListTypeTag) -> Self {
+        crate::alloc_sites::record("map");
         let val_is_heap = val_tag != ListTypeTag::Primitive;
         let int_values8 = if matches!(key_type, KeyType::Int) && val_size == 8 && !val_is_heap {
             Some(HashMap::new())
@@ -902,6 +903,7 @@ unsafe fn take_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> i64 {
 /// Retain a map handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_retain_handle(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_MAP_RETAIN);
     if let Some(impl_ref) = map_mut_from_handle(handle) {
         impl_ref
             .rc
@@ -912,6 +914,7 @@ pub unsafe extern "C" fn pith_map_retain_handle(handle: i64) {
 /// Release a map handle; frees the map and its owned values at zero.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_release_handle(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_MAP_RELEASE);
     pith_map_release(PithMap {
         ptr: handle as *mut (),
     });

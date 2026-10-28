@@ -72,7 +72,8 @@ variables:
   owns — `xs = []` over a global used to strand every element the old
   container held, which is how the compiler front end grew tens of
   megabytes per analysis by resetting its tables the obvious way. a
-  `threadlocal` global is the same rule per thread.
+  `threadlocal` global is the same rule per task (per thread on the
+  os-thread backend), and the runtime drops its count when the task ends.
   `ir_assign_targets_global_slot` decides this, and it excludes two
   spellings, both of which read storage of their own. a `for` variable
   reads the loop's slot, so releasing there would drop a count the loop

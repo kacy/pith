@@ -19,7 +19,8 @@ use pith_runtime::runtime_core::{
     CLOSURE_CYCLE_FLAGS_OFFSET, CLOSURE_ENV_OFFSET, CLOSURE_ENV_TAGS_OFFSET, CLOSURE_FUNC_PTR_OFFSET,
     CLOSURE_HANDLE_ALIGN, CLOSURE_MAGIC, CLOSURE_MAGIC_OFFSET, CLOSURE_OVERFLOW_OFFSET,
     CLOSURE_REF_COUNT_OFFSET, CLOSURE_SIZE,
-    PITH_CLOSURE_ENV_SLOTS,
+    PITH_CLOSURE_ENV_SLOTS, STRUCT_DEAD_OFFSET, STRUCT_DTOR_OFFSET, STRUCT_HEADER, STRUCT_MAGIC,
+    STRUCT_SIZE_OFFSET, STRUCT_STRONG_OFFSET, STRUCT_WEAK_OFFSET,
 };
 use pith_runtime::collections::list::{
     LIST_HANDLE_ALIGN, LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_TYPE_TAG_OFFSET,
@@ -3965,6 +3966,46 @@ fn compile_ir_function(
                 let zero8 = builder.ins().iconst(types::I8, 0);
                 builder.ins().store(flags, zero8, at, CLOSURE_CYCLE_FLAGS_OFFSET);
                 builder.ins().store(flags, zero, at, CLOSURE_OVERFLOW_OFFSET);
+                regs.insert(reg, at);
+                reg_source_vars.remove(&reg);
+                struct_regs.remove(&reg);
+                string_regs.remove(&reg);
+                bytes_regs.remove(&reg);
+                float_regs.remove(&reg);
+            }
+
+            // a result box the emitter proved only its own function reads
+            // (ir_stack_tuple_binds), built in a stack slot of this frame with
+            // the header pith_struct_alloc would write. nothing releases it;
+            // the function's cleanup drops the payload it holds.
+            "tuple_stack" if parts.len() >= 3 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let fields: u32 = parts[2].parse().map_err(|_| {
+                    CompileError::ModuleError(format!(
+                        "ir consumer: bad field count in '{}' in {}",
+                        line, func_name
+                    ))
+                })?;
+                let header = STRUCT_HEADER as u32;
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    header + fields * 8,
+                    3,
+                ));
+                let base = builder.ins().stack_addr(types::I64, slot, 0);
+                let flags = MemFlags::trusted();
+                let magic = builder.ins().iconst(types::I32, STRUCT_MAGIC as i64);
+                builder.ins().store(flags, magic, base, 0);
+                let one = builder.ins().iconst(types::I32, 1);
+                builder.ins().store(flags, one, base, STRUCT_STRONG_OFFSET);
+                builder.ins().store(flags, one, base, STRUCT_WEAK_OFFSET);
+                let zero32 = builder.ins().iconst(types::I32, 0);
+                builder.ins().store(flags, zero32, base, STRUCT_DEAD_OFFSET);
+                let size = builder.ins().iconst(types::I64, (fields * 8) as i64);
+                builder.ins().store(flags, size, base, STRUCT_SIZE_OFFSET);
+                let zero = builder.ins().iconst(types::I64, 0);
+                builder.ins().store(flags, zero, base, STRUCT_DTOR_OFFSET);
+                let at = builder.ins().iadd_imm(base, header as i64);
                 regs.insert(reg, at);
                 reg_source_vars.remove(&reg);
                 struct_regs.remove(&reg);

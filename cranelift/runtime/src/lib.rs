@@ -66,6 +66,8 @@ pub mod netpoll;
 pub mod netpoll;
 pub mod network;
 pub mod perf;
+pub mod sampler;
+pub mod alloc_sites;
 pub mod platform;
 pub mod process;
 pub mod process_io;

@@ -149,6 +149,7 @@ pub fn report_leaked_cstrings() {
 }
 
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
+    crate::alloc_sites::record("string");
     crate::perf_count(&crate::PERF_CSTRING_ALLOCS, 1);
     let base = pith_alloc(cstring_layout(data_len));
     (base as *mut u32).write(CSTRING_MAGIC);
@@ -634,6 +635,7 @@ unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
 
 #[no_mangle]
 pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
+    crate::alloc_sites::record("closure");
     // a closure is built and dropped once per construction, and a benchmark
     // that builds two per iteration spends about 56ns in each against a 7ns
     // call. almost none of that is the work; it is the allocator round-trip.
@@ -702,6 +704,7 @@ unsafe fn closure_free_shell(handle: i64) {
 /// handle must be a valid closure handle or garbage (registry-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RETAIN);
     if let Some(closure) = pith_closure_ref(handle) {
         closure
             .ref_count
@@ -718,6 +721,7 @@ pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
 /// handle must be a valid closure handle or garbage (registry-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_release(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RELEASE);
     let Some(closure) = pith_closure_ref(handle) else {
         return;
     };
@@ -2921,8 +2925,9 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 // own value per slot; the compiler assigns each threadlocal global a unique i64
 // slot and generates a `() -> i64` init thunk that builds the correctly-typed
 // initial value. A slot is materialized lazily the first time a thread touches
-// it. Entries are not reclaimed at thread exit — bounded by the number of
-// threadlocal globals, retained for the life of the process by design.
+// it. Each value carries the element tag of its type, so the counts a task's
+// or an os thread's values hold are dropped when that task or thread finishes
+// (release_finished_tls); the main thread's live for the process.
 //
 // The compiler numbers the slots densely from zero, so a thread's values live
 // in a vector indexed by slot. std.json reads its parser state from
@@ -2930,7 +2935,7 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 // node-pool parse.
 #[derive(Default)]
 pub(crate) struct TlsMap {
-    values: Vec<Option<i64>>,
+    values: Vec<Option<(i64, u8)>>,
 }
 
 impl TlsMap {
@@ -2939,17 +2944,41 @@ impl TlsMap {
     }
 
     #[inline]
-    pub(crate) fn get(&self, slot: &i64) -> Option<&i64> {
-        self.values.get(*slot as usize)?.as_ref()
+    pub(crate) fn get(&self, slot: &i64) -> Option<i64> {
+        self.values.get(*slot as usize)?.map(|(value, _)| value)
     }
 
-    pub(crate) fn insert(&mut self, slot: i64, value: i64) {
+    pub(crate) fn insert(&mut self, slot: i64, value: i64, tag: i64) {
         let i = slot as usize;
         if i >= self.values.len() {
             self.values.resize(i + 1, None);
         }
-        self.values[i] = Some(value);
+        self.values[i] = Some((value, tag.clamp(0, 255) as u8));
     }
+
+    /// Every value, with its tag, leaving the map empty.
+    pub(crate) fn take_values(&mut self) -> Vec<(i64, u8)> {
+        std::mem::take(&mut self.values).into_iter().flatten().collect()
+    }
+}
+
+/// Drop the counts a finished task's or thread's threadlocal values held. A
+/// destructor this runs sees no task of its own, so a threadlocal it reads
+/// resolves to the worker's map, as anything else running there would.
+pub(crate) fn release_finished_tls(values: Vec<(i64, u8)>) {
+    for (value, tag) in values {
+        let tag = crate::collections::list::element_tag_from_code(tag as i32);
+        unsafe { crate::collections::list::release_element(tag, value) };
+    }
+}
+
+/// The os-thread backend's half: a task's thread is about to exit, and its
+/// threadlocal map would be dropped with the counts still held.
+pub(crate) fn release_thread_tls() {
+    let values = TLS_GLOBALS
+        .try_with(|t| t.borrow_mut().take_values())
+        .unwrap_or_default();
+    release_finished_tls(values);
 }
 
 thread_local! {
@@ -2980,6 +3009,17 @@ fn green_task_tls() -> Option<*mut TlsMap> {
 /// `init_thunk` must be the address of a compiled `extern "C" fn() -> i64`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64 {
+    pith_tls_get_or_init_tagged(slot, init_thunk, 0)
+}
+
+/// `pith_tls_get_or_init` for a slot whose values carry counts: `tag` is the
+/// element tag of the global's type, kept with the value so a finished task's
+/// count can be dropped (0 for a plain value).
+///
+/// # Safety
+/// as `pith_tls_get_or_init`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_tls_get_or_init_tagged(slot: i64, init_thunk: i64, tag: i64) -> i64 {
     if let Some(map) = green_task_tls() {
         // SAFETY: `map` points into the `Box<TlsMap>` owned by the green task
         // currently running on this worker thread. `green` installs it around
@@ -2989,13 +3029,13 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
         // thunk, and the write borrow is created fresh afterward. that mirrors
         // the `TLS_GLOBALS` path — the thunk may itself touch other threadlocal
         // slots on the same map without a live borrow being held across it.
-        if let Some(v) = (*map).get(&slot).copied() {
+        if let Some(v) = (*map).get(&slot) {
             return v;
         }
         // panic-guard: calling a compiler-emitted threadlocal initializer thunk.
         let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
         let value = thunk();
-        (*map).insert(slot, value);
+        (*map).insert(slot, value, tag);
         return value;
     }
 
@@ -3007,7 +3047,7 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
     let value = thunk();
     // another access on this thread during the thunk can't have run (single
     // thread), so a plain insert is correct.
-    tls_globals_set(slot, value);
+    tls_globals_set(slot, value, tag);
     value
 }
 
@@ -3021,13 +3061,13 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
 /// load-bearing. see the accessor block in `concurrency/green.rs`.
 #[inline(never)]
 fn tls_globals_get(slot: i64) -> Option<i64> {
-    TLS_GLOBALS.with(|t| t.borrow().get(&slot).copied())
+    TLS_GLOBALS.with(|t| t.borrow().get(&slot))
 }
 
 #[inline(never)]
-fn tls_globals_set(slot: i64, value: i64) {
+fn tls_globals_set(slot: i64, value: i64, tag: i64) {
     TLS_GLOBALS.with(|t| {
-        t.borrow_mut().insert(slot, value);
+        t.borrow_mut().insert(slot, value, tag);
     });
 }
 
@@ -3036,14 +3076,24 @@ fn tls_globals_set(slot: i64, value: i64) {
 /// the same as a plain global assignment.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
+    pith_tls_set_tagged(slot, value, 0)
+}
+
+/// `pith_tls_set` with the value's element tag (see
+/// `pith_tls_get_or_init_tagged`).
+///
+/// # Safety
+/// as `pith_tls_set`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_tls_set_tagged(slot: i64, value: i64, tag: i64) {
     if let Some(map) = green_task_tls() {
         // SAFETY: same as `pith_tls_get_or_init` — the pointer targets the
         // running task's own map, valid and unaliased for this synchronous call
         // on this worker thread. a single short-lived write borrow.
-        (*map).insert(slot, value);
+        (*map).insert(slot, value, tag);
         return;
     }
-    tls_globals_set(slot, value);
+    tls_globals_set(slot, value, tag);
 }
 
 // Small structs are allocated and freed constantly — the result box built for
@@ -3313,7 +3363,11 @@ unsafe fn struct_pool_return(base: *mut u8, total: usize) -> bool {
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     use std::alloc::alloc_zeroed;
 
-    crate::perf_stats!(PERF_STRUCT_ALLOCS += 1);
+    if crate::perf_stats_enabled() {
+        let bucket = &crate::perf::PERF_STRUCT_FIELDS[num_fields.clamp(0, 16) as usize];
+        crate::perf_record2(&crate::PERF_STRUCT_ALLOCS, 1, bucket, 1);
+    }
+    crate::alloc_sites::record(crate::alloc_sites::STRUCT_KINDS[num_fields.clamp(0, 16) as usize]);
     let size = (num_fields.max(0) as usize) * 8;
     if size == 0 {
         return 0;
@@ -3350,8 +3404,17 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     base.add(STRUCT_HEADER) as i64
 }
 
-pub(crate) const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
-pub(crate) const STRUCT_HEADER: usize = 32;
+pub const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
+pub const STRUCT_HEADER: usize = 32;
+/// The header codegen writes for a box it builds in a stack slot (the ir's
+/// `tuple_stack`), the same words `pith_struct_alloc` writes: magic, one strong
+/// count, the implicit weak unit, the payload size, and no destructor. The
+/// box is never released; its function's cleanup drops what it holds.
+pub const STRUCT_STRONG_OFFSET: i32 = STRUCT_OFF_STRONG as i32;
+pub const STRUCT_WEAK_OFFSET: i32 = STRUCT_OFF_WEAK as i32;
+pub const STRUCT_DEAD_OFFSET: i32 = STRUCT_OFF_DEAD as i32;
+pub const STRUCT_SIZE_OFFSET: i32 = STRUCT_OFF_SIZE as i32;
+pub const STRUCT_DTOR_OFFSET: i32 = STRUCT_OFF_DTOR as i32;
 
 // header field offsets within the base allocation
 const STRUCT_OFF_STRONG: usize = 4;
@@ -3489,6 +3552,7 @@ pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_STRUCT_RETAIN);
     if let Some(base) = struct_base(ptr) {
         struct_strong(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3521,6 +3585,7 @@ pub unsafe extern "C" fn pith_struct_strong_count(ptr: i64) -> i64 {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_STRUCT_RELEASE);
     let Some(base) = struct_base(ptr) else {
         return;
     };
@@ -3532,6 +3597,9 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     let weak = struct_weak(base);
     let sole = strong.load(std::sync::atomic::Ordering::Acquire) == 1
         && weak.load(std::sync::atomic::Ordering::Acquire) == 1;
+    if sole {
+        crate::perf::perf_rc_op(crate::perf::RC_STRUCT_SOLE_RELEASE);
+    }
     if !sole {
         // cycle-gc suspect hook, placed before our count is given up rather
         // than in the prev > 1 arm below. the ordering is load-bearing: while
@@ -3706,6 +3774,7 @@ pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_WEAK_RETAIN);
     if let Some(base) = struct_base(ptr) {
         struct_weak(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3717,6 +3786,7 @@ pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_WEAK_RELEASE);
     if let Some(base) = struct_base(ptr) {
         struct_weak_drop(base);
     }

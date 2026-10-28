@@ -6836,8 +6836,23 @@ fn ir_emit_select_send_probe(send_idx: Int) -> Int:
     if arg_idx < 0:
         return ir_zero_reg()
     val_r := ir_expr(arg_idx)
+    # a send that lands hands the channel one count, the same as `ch.send(v)`:
+    # a borrowed value takes it here first. a probe that fails keeps the value,
+    # so that count, or an owned value's own, is dropped again; the probe is
+    # tried once per pass, and its value is evaluated afresh each time.
+    kind := ir_rc_kind(ir_infer_type(arg_idx))
+    if kind.len() > 0 and ir_expr_is_borrowed(arg_idx):
+        ir_rc_retain_reg(val_r, kind)
     r := ir_reg()
     ir_emit_call2(r, "pith_channel_try_send", "bool", ch_r, val_r)
+    if kind.len() > 0:
+        sent_l := ir_label()
+        failed_l := ir_label()
+        ir_emit("brif " + r.to_string() + " " + sent_l + " " + failed_l)
+        ir_emit_label(failed_l)
+        ir_rc_release_reg(val_r, kind)
+        ir_emit("jmp " + sent_l)
+        ir_emit_label(sent_l)
     return r
 
 fn ir_emit_select_arm_body(body_idx: Int, bind_name: String, bind_r: Int, bind_type: String) -> Int:

@@ -317,6 +317,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
         // moves the closure into `spawn` and never releases it). mirrors the green
         // backend's release in `finish_task`.
         crate::pith_closure_release(closure_handle);
+        crate::runtime_core::release_thread_tls();
         // publish completion to awaiters (condvar).
         {
             let (lock, cvar) = &*shared_clone;

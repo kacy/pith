@@ -2293,12 +2293,12 @@ fn finish_task(id: TaskId, result: i64) {
     if let Some(block) = sync_block(id) {
         block.word.store(S_DONE, AtomicOrdering::Release);
     }
-    let (join, closure_handle) = {
+    let (join, closure_handle, tls_values) = {
         let mut slab = lock_slab(id);
         if let Some(task) = slab.get_mut(id) {
             task.done = true;
             task.result = result;
-            (task.join.clone(), task.closure_handle)
+            (task.join.clone(), task.closure_handle, task.tls.take_values())
         } else {
             return;
         }
@@ -2315,6 +2315,9 @@ fn finish_task(id: TaskId, result: i64) {
             crate::pith_closure_release(closure_handle);
         }
     }
+    // the same for the task's threadlocal values: the body is done with them,
+    // and its map is never read again
+    crate::runtime_core::release_finished_tls(tls_values);
     let (lock, cvar) = &*join;
     // flip done + notify os-thread awaiters and take the green-waiter list under
     // the join lock; wake the green awaiters after releasing it, since

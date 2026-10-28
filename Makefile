@@ -1387,6 +1387,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_stack_closure \
 	tests/cases/test_stack_closure_arg \
 	tests/cases/test_fn_arg_specialization \
+	tests/cases/test_stack_result_box \
 	tests/cases/test_select_send_count \
 	tests/cases/test_shared_marking \
 	tests/cases/test_task_result_payloads \

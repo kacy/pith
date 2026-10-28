@@ -1,0 +1,56 @@
+# result locals whose box lives in a stack slot of the frame.
+#
+# `r := f(x)` keeps r's three-slot result box on the stack when f returns its
+# result in registers and r is only read, so the function's cleanup has to
+# drop the payload the box holds without freeing the box itself. a bind from
+# a call that builds its own heap box (a generic decode here) looks the same
+# in the source and must still free that box. each round goes through all
+# three shapes, on the ok path and the error path, with heap payloads, so a
+# cleanup that skips the payload or the heap box grows the peak.
+import leakprobe as probe
+import std.json as json
+
+struct Item:
+    pub name: String
+    pub n: Int
+
+fn checked(i: Int) -> String!:
+    if i % 3 == 0:
+        fail "bad-" + i.to_string()
+    return probe.fresh_string(i)
+
+fn via_register(i: Int) -> Int:
+    r := checked(i)
+    if r.is_err:
+        return r.err.len()
+    return r.ok.len()
+
+fn via_builtin(i: Int) -> Int:
+    raw := bytes_from_string_utf8(probe.fresh_string(i))
+    text := raw.to_string_utf8()
+    if text.is_err:
+        return 0
+    return text.ok.len()
+
+fn via_decode(i: Int) -> Int:
+    body := "\{\"name\": \"item-{i}\", \"n\": {i}\}"
+    if i % 4 == 0:
+        bad := json.decode[Item](bytes_from_string_utf8("not json"))
+        if bad.is_err:
+            return 1
+    decoded := json.decode[Item](bytes_from_string_utf8(body))
+    if decoded.is_err:
+        return 0 - 1
+    return decoded.ok.name.len() + decoded.ok.n
+
+fn main():
+    rounds := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        acc = acc + via_register(i) + via_builtin(i) + via_decode(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print(kb.to_string())

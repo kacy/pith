@@ -2939,8 +2939,9 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 // own value per slot; the compiler assigns each threadlocal global a unique i64
 // slot and generates a `() -> i64` init thunk that builds the correctly-typed
 // initial value. A slot is materialized lazily the first time a thread touches
-// it. Entries are not reclaimed at thread exit — bounded by the number of
-// threadlocal globals, retained for the life of the process by design.
+// it. Each value carries the element tag of its type, so the counts a task's
+// or an os thread's values hold are dropped when that task or thread finishes
+// (release_finished_tls); the main thread's live for the process.
 //
 // The compiler numbers the slots densely from zero, so a thread's values live
 // in a vector indexed by slot. std.json reads its parser state from
@@ -2948,7 +2949,7 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 // node-pool parse.
 #[derive(Default)]
 pub(crate) struct TlsMap {
-    values: Vec<Option<i64>>,
+    values: Vec<Option<(i64, u8)>>,
 }
 
 impl TlsMap {
@@ -2957,17 +2958,46 @@ impl TlsMap {
     }
 
     #[inline]
-    pub(crate) fn get(&self, slot: &i64) -> Option<&i64> {
-        self.values.get(*slot as usize)?.as_ref()
+    pub(crate) fn get(&self, slot: &i64) -> Option<i64> {
+        self.values.get(*slot as usize)?.map(|(value, _)| value)
     }
 
-    pub(crate) fn insert(&mut self, slot: i64, value: i64) {
+    pub(crate) fn insert(&mut self, slot: i64, value: i64, tag: i64) {
         let i = slot as usize;
         if i >= self.values.len() {
             self.values.resize(i + 1, None);
         }
-        self.values[i] = Some(value);
+        self.values[i] = Some((value, tag.clamp(0, 255) as u8));
     }
+
+    /// Every value, with its tag, leaving the map empty.
+    pub(crate) fn take_values(&mut self) -> Vec<(i64, u8)> {
+        std::mem::take(&mut self.values).into_iter().flatten().collect()
+    }
+}
+
+/// Drop the counts a finished task's or thread's threadlocal values held. A
+/// destructor this runs sees no task of its own, so a threadlocal it reads
+/// resolves to the worker's map, as anything else running there would.
+pub(crate) fn release_finished_tls(values: Vec<(i64, u8)>) {
+    for (value, tag) in values {
+        let tag = crate::collections::list::element_tag_from_code(tag as i32);
+        unsafe {
+            // the release runs after the task is gone, outside any task, so
+            // what it drops is no longer its builder's alone
+            crate::share::share_value(value, tag);
+            crate::collections::list::release_element(tag, value);
+        }
+    }
+}
+
+/// The os-thread backend's half: a task's thread is about to exit, and its
+/// threadlocal map would be dropped with the counts still held.
+pub(crate) fn release_thread_tls() {
+    let values = TLS_GLOBALS
+        .try_with(|t| t.borrow_mut().take_values())
+        .unwrap_or_default();
+    release_finished_tls(values);
 }
 
 thread_local! {
@@ -2998,6 +3028,17 @@ fn green_task_tls() -> Option<*mut TlsMap> {
 /// `init_thunk` must be the address of a compiled `extern "C" fn() -> i64`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64 {
+    pith_tls_get_or_init_tagged(slot, init_thunk, 0)
+}
+
+/// `pith_tls_get_or_init` for a slot whose values carry counts: `tag` is the
+/// element tag of the global's type, kept with the value so a finished task's
+/// count can be dropped (0 for a plain value).
+///
+/// # Safety
+/// as `pith_tls_get_or_init`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_tls_get_or_init_tagged(slot: i64, init_thunk: i64, tag: i64) -> i64 {
     if let Some(map) = green_task_tls() {
         // SAFETY: `map` points into the `Box<TlsMap>` owned by the green task
         // currently running on this worker thread. `green` installs it around
@@ -3007,13 +3048,13 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
         // thunk, and the write borrow is created fresh afterward. that mirrors
         // the `TLS_GLOBALS` path — the thunk may itself touch other threadlocal
         // slots on the same map without a live borrow being held across it.
-        if let Some(v) = (*map).get(&slot).copied() {
+        if let Some(v) = (*map).get(&slot) {
             return v;
         }
         // panic-guard: calling a compiler-emitted threadlocal initializer thunk.
         let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
         let value = thunk();
-        (*map).insert(slot, value);
+        (*map).insert(slot, value, tag);
         return value;
     }
 
@@ -3025,7 +3066,7 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
     let value = thunk();
     // another access on this thread during the thunk can't have run (single
     // thread), so a plain insert is correct.
-    tls_globals_set(slot, value);
+    tls_globals_set(slot, value, tag);
     value
 }
 
@@ -3039,13 +3080,13 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
 /// load-bearing. see the accessor block in `concurrency/green.rs`.
 #[inline(never)]
 fn tls_globals_get(slot: i64) -> Option<i64> {
-    TLS_GLOBALS.with(|t| t.borrow().get(&slot).copied())
+    TLS_GLOBALS.with(|t| t.borrow().get(&slot))
 }
 
 #[inline(never)]
-fn tls_globals_set(slot: i64, value: i64) {
+fn tls_globals_set(slot: i64, value: i64, tag: i64) {
     TLS_GLOBALS.with(|t| {
-        t.borrow_mut().insert(slot, value);
+        t.borrow_mut().insert(slot, value, tag);
     });
 }
 
@@ -3054,14 +3095,24 @@ fn tls_globals_set(slot: i64, value: i64) {
 /// the same as a plain global assignment.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
+    pith_tls_set_tagged(slot, value, 0)
+}
+
+/// `pith_tls_set` with the value's element tag (see
+/// `pith_tls_get_or_init_tagged`).
+///
+/// # Safety
+/// as `pith_tls_set`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_tls_set_tagged(slot: i64, value: i64, tag: i64) {
     if let Some(map) = green_task_tls() {
         // SAFETY: same as `pith_tls_get_or_init` — the pointer targets the
         // running task's own map, valid and unaliased for this synchronous call
         // on this worker thread. a single short-lived write borrow.
-        (*map).insert(slot, value);
+        (*map).insert(slot, value, tag);
         return;
     }
-    tls_globals_set(slot, value);
+    tls_globals_set(slot, value, tag);
 }
 
 // Small structs are allocated and freed constantly — the result box built for
@@ -3374,8 +3425,17 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     ptr
 }
 
-pub(crate) const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
-pub(crate) const STRUCT_HEADER: usize = 32;
+pub const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
+pub const STRUCT_HEADER: usize = 32;
+/// The header codegen writes for a box it builds in a stack slot (the ir's
+/// `tuple_stack`), the same words `pith_struct_alloc` writes: magic, one strong
+/// count, the implicit weak unit, the payload size, and no destructor. The
+/// box is never released; its function's cleanup drops what it holds.
+pub const STRUCT_STRONG_OFFSET: i32 = STRUCT_OFF_STRONG as i32;
+pub const STRUCT_WEAK_OFFSET: i32 = STRUCT_OFF_WEAK as i32;
+pub const STRUCT_DEAD_OFFSET: i32 = STRUCT_OFF_DEAD as i32;
+pub const STRUCT_SIZE_OFFSET: i32 = STRUCT_OFF_SIZE as i32;
+pub const STRUCT_DTOR_OFFSET: i32 = STRUCT_OFF_DTOR as i32;
 
 // header field offsets within the base allocation
 const STRUCT_OFF_STRONG: usize = 4;

@@ -4432,6 +4432,27 @@ fn ir_release_fresh_result_arg(expr_idx: Int, reg: Int):
 # the emission: a signature with a heap slot goes through the per-signature
 # helper that reads the strong count, and an all-scalar signature has nothing
 # to drop and takes the plain shell release.
+# drop the payload of a result that arrived as a (flag, payload) pair: the ok
+# value when the flag is set, the error otherwise
+fn ir_emit_pair_payload_release(flag_r: Int, val_r: Int, tid: Int):
+    ok_kind := ir_rc_kind(ir_result_field_kind(tid, "ok"))
+    err_kind := ir_rc_kind(ir_result_field_kind(tid, "err"))
+    if ok_kind.len() == 0 and err_kind.len() == 0:
+        return
+    ok_l := ir_label()
+    err_l := ir_label()
+    done_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    if ok_kind.len() > 0:
+        ir_rc_release_reg(val_r, ok_kind)
+    ir_emit("jmp " + done_l)
+    ir_emit_label(err_l)
+    if err_kind.len() > 0:
+        ir_rc_release_reg(val_r, err_kind)
+    ir_emit("jmp " + done_l)
+    ir_emit_label(done_l)
+
 fn ir_emit_result_box_release(reg: Int, tid: Int):
     sig := ir_tuple_cascade_signature(tid)
     if sig == "00":
@@ -9832,6 +9853,23 @@ fn ir_stmt(idx: Int):
         return
 
     if ir_stmt_is_expr(kind):
+        # a call that returns its result as a pair, thrown away at the
+        # statement: take the pair as `!` does instead of building a box only
+        # to free it, and drop whichever payload the flag says it holds.
+        if (kind == "call" or kind == "method_call") and ir_stmt_discards_owned_value(kind):
+            stmt_tid := c_get_expr_type(idx)
+            if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "result":
+                saved_defer := ir_rcall_defer_idx
+                ir_rcall_defer_idx = idx
+                ir_rcall_pair_ready = false
+                box_r := ir_expr(idx)
+                ir_rcall_defer_idx = saved_defer
+                if ir_rcall_pair_ready:
+                    ir_rcall_pair_ready = false
+                    ir_emit_pair_payload_release(ir_rcall_flag_reg, ir_rcall_val_reg, stmt_tid)
+                    return
+                ir_emit_result_box_release(box_r, stmt_tid)
+                return
         r := ir_expr(idx)
         # a fire-and-forget `spawn f()` whose handle is discarded at statement
         # position must be detached, or the runtime never reclaims the task's

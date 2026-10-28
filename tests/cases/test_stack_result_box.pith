@@ -3,7 +3,8 @@
 # cover the ok and error paths, a return before the bind (the slot is still
 # empty at cleanup), the payload handed on to a callee and returned, a bind
 # inside a loop and a reassigned local (both keep the heap box), and a value
-# read after the box's function returned.
+# read after the box's function returned. results thrown away at a statement
+# drop their payload, error or value, without a box.
 
 fn parse_pos(text: String) -> Int!:
     n := parse_int(text) catch -1
@@ -52,6 +53,16 @@ fn from_bytes(text: String) -> Int:
         return 0 - 1
     return t.ok.len()
 
+struct Sink:
+    mut count: Int
+
+impl Sink:
+    fn take(s: String) -> String!:
+        self.count = self.count + 1
+        if s.len() > 3:
+            fail "too long: " + s
+        return s + "!"
+
 fn main() -> Int:
     print(describe("12", false))
     print(describe("x", false))
@@ -63,4 +74,11 @@ fn main() -> Int:
         i = i + 1
     print(words.join(","))
     print(in_loop(6).to_string() + " " + reassigned(1) + " " + from_bytes("héllo").to_string())
+    sink := Sink(count: 0)
+    mut k := 0
+    while k < 6:
+        label(k)
+        sink.take("x".repeat(k))
+        k = k + 1
+    print(sink.count.to_string())
     return 0

@@ -694,6 +694,14 @@ field count. an optional shell has two fields and a result box three, so that
 line shows how much of a program's struct traffic is wrappers and how much is
 its own types.
 
+for where the time goes, `PITH_PROF=<file>` makes any pith program sample
+itself: every 250 us of cpu time it records the instruction that was running,
+and at exit it writes those addresses with the process's memory map.
+`tooling/prof_report.py <program> <file>` prints the flat profile by function.
+build the program with `PITH_KEEP_SYMBOLS=1` first. samples inside libc resolve
+to its nearest exported symbol, so the allocator's internals show under
+borrowed names such as `_dl_mcount_wrapper`; read those as malloc and free.
+
 ## std profiling pass (2026-09-10)
 
 a pass over the standard library where every target came from a profile

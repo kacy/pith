@@ -838,6 +838,20 @@ pub(crate) unsafe fn cycle_closure_guard_strong(handle: i64, delta: i64) {
 /// Report every captured value that carries a count, as (value, env tag).
 /// Weak captures (tag 8) are reported too — the caller filters; they hold no
 /// strong count and are not edges of the ownership graph.
+/// Mark the closure shared (see `share.rs`); true when this call set the mark.
+pub(crate) unsafe fn closure_mark_shared(handle: i64) -> bool {
+    match pith_closure_ref(handle) {
+        Some(closure) => {
+            closure
+                .cycle_flags
+                .fetch_or(crate::share::CONTAINER_SHARED_FLAG, std::sync::atomic::Ordering::Release)
+                & crate::share::CONTAINER_SHARED_FLAG
+                == 0
+        }
+        None => false,
+    }
+}
+
 pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
     let Some(closure) = pith_closure_ref(handle) else {
         return;
@@ -2968,7 +2982,12 @@ impl TlsMap {
 pub(crate) fn release_finished_tls(values: Vec<(i64, u8)>) {
     for (value, tag) in values {
         let tag = crate::collections::list::element_tag_from_code(tag as i32);
-        unsafe { crate::collections::list::release_element(tag, value) };
+        unsafe {
+            // the release runs after the task is gone, outside any task, so
+            // what it drops is no longer its builder's alone
+            crate::share::share_value(value, tag);
+            crate::collections::list::release_element(tag, value);
+        }
     }
 }
 
@@ -3401,7 +3420,9 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     (base.add(4) as *mut u32).write(1); // strong
     (base.add(8) as *mut u32).write(1); // weak: the implicit unit for strong refs
     (base.add(16) as *mut u64).write(size as u64);
-    base.add(STRUCT_HEADER) as i64
+    let ptr = base.add(STRUCT_HEADER) as i64;
+    crate::share::note_owner(ptr);
+    ptr
 }
 
 pub const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
@@ -3444,6 +3465,38 @@ unsafe fn struct_weak(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
 // never `!= 0`.
 pub(crate) const STRUCT_DEAD_BIT: u32 = 1;
 pub(crate) const STRUCT_BUFFERED_BIT: u32 = 2;
+/// Set once the struct can be reached from more than one task (see
+/// `share.rs`); until then its counts are updated with plain loads and stores.
+pub(crate) const STRUCT_SHARED_BIT: u32 = 4;
+/// Where codegen finds a struct's flag word, from the pointer it holds, and
+/// the shared mark in it: a field store's write barrier tests the holder's
+/// mark inline and calls `pith_share_into` only for a shared one.
+pub const STRUCT_FLAGS_FROM_DATA: i32 = STRUCT_OFF_DEAD as i32 - STRUCT_HEADER as i32;
+pub const STRUCT_SHARED_MASK: u32 = STRUCT_SHARED_BIT;
+
+#[inline(always)]
+unsafe fn struct_local(base: *mut u8) -> bool {
+    crate::share::local_counts() && struct_dead(base).load(std::sync::atomic::Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
+}
+
+/// Whether the struct at `ptr` is marked shared. False for anything that is
+/// not a live struct.
+pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
+    match struct_base(ptr) {
+        Some(base) => struct_dead(base).load(std::sync::atomic::Ordering::Relaxed) & STRUCT_SHARED_BIT != 0,
+        None => false,
+    }
+}
+
+/// Mark the struct at `ptr` shared; true when this call set the mark.
+pub(crate) unsafe fn struct_mark_shared(ptr: i64) -> bool {
+    match struct_base(ptr) {
+        Some(base) => {
+            struct_dead(base).fetch_or(STRUCT_SHARED_BIT, std::sync::atomic::Ordering::Release) & STRUCT_SHARED_BIT == 0
+        }
+        None => false,
+    }
+}
 
 unsafe fn struct_dead(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
     &*(base.add(STRUCT_OFF_DEAD) as *const std::sync::atomic::AtomicU32)
@@ -3454,6 +3507,16 @@ unsafe fn struct_dead(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
 // weak reference funnel their final drop through here.
 unsafe fn struct_weak_drop(base: *mut u8) {
     let weak = struct_weak(base);
+    if struct_local(base) {
+        crate::share::check_local(base.add(STRUCT_HEADER) as i64, "weak release");
+        let held = weak.load(std::sync::atomic::Ordering::Relaxed);
+        if held != 1 {
+            weak.store(held.wrapping_sub(1), std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+        struct_free_header(base);
+        return;
+    }
     // a count of one is ours alone: a new weak reference is made only from a
     // strong or a weak one, and there is neither, so the drop needs no
     // read-modify-write. the acquire load pairs with the release decrements
@@ -3469,6 +3532,7 @@ unsafe fn struct_weak_drop(base: *mut u8) {
 
 /// Scrub and free (or pool) a struct header nothing references any more.
 unsafe fn struct_free_header(base: *mut u8) {
+    crate::share::forget_owner(base.add(STRUCT_HEADER) as i64);
     let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
     // scrub the magic so any stale pointer fails the check
     (base as *mut u32).write(0);
@@ -3554,7 +3618,13 @@ pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
 pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_STRUCT_RETAIN);
     if let Some(base) = struct_base(ptr) {
-        struct_strong(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let strong = struct_strong(base);
+        if struct_local(base) {
+            crate::share::check_local(ptr, "retain");
+            strong.store(strong.load(std::sync::atomic::Ordering::Relaxed) + 1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            strong.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -3613,7 +3683,18 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
         if crate::cycle::cycle_gc_enabled() && strong.load(std::sync::atomic::Ordering::Relaxed) > 1 {
             maybe_suspect_struct(ptr, base);
         }
-        let prev = strong.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        // a struct no other task can reach: nothing races this update
+        let local = struct_local(base);
+        if local {
+            crate::share::check_local(ptr, "release");
+        }
+        let prev = if local {
+            let held = strong.load(std::sync::atomic::Ordering::Relaxed);
+            strong.store(held.wrapping_sub(1), std::sync::atomic::Ordering::Relaxed);
+            held
+        } else {
+            strong.fetch_sub(1, std::sync::atomic::Ordering::Release)
+        };
         if prev > 1 {
             return;
         }
@@ -3776,7 +3857,13 @@ pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
 pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_WEAK_RETAIN);
     if let Some(base) = struct_base(ptr) {
-        struct_weak(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let weak = struct_weak(base);
+        if struct_local(base) {
+            crate::share::check_local(ptr, "weak retain");
+            weak.store(weak.load(std::sync::atomic::Ordering::Relaxed) + 1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            weak.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

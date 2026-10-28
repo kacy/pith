@@ -19,8 +19,9 @@ use pith_runtime::runtime_core::{
     CLOSURE_CYCLE_FLAGS_OFFSET, CLOSURE_ENV_OFFSET, CLOSURE_ENV_TAGS_OFFSET, CLOSURE_FUNC_PTR_OFFSET,
     CLOSURE_HANDLE_ALIGN, CLOSURE_MAGIC, CLOSURE_MAGIC_OFFSET, CLOSURE_OVERFLOW_OFFSET,
     CLOSURE_REF_COUNT_OFFSET, CLOSURE_SIZE,
-    PITH_CLOSURE_ENV_SLOTS, STRUCT_DEAD_OFFSET, STRUCT_DTOR_OFFSET, STRUCT_HEADER, STRUCT_MAGIC,
-    STRUCT_SIZE_OFFSET, STRUCT_STRONG_OFFSET, STRUCT_WEAK_OFFSET,
+    PITH_CLOSURE_ENV_SLOTS, STRUCT_DEAD_OFFSET, STRUCT_DTOR_OFFSET, STRUCT_FLAGS_FROM_DATA,
+    STRUCT_HEADER, STRUCT_MAGIC, STRUCT_SHARED_MASK, STRUCT_SIZE_OFFSET, STRUCT_STRONG_OFFSET,
+    STRUCT_WEAK_OFFSET,
 };
 use pith_runtime::collections::list::{
     LIST_HANDLE_ALIGN, LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_TYPE_TAG_OFFSET,
@@ -2253,6 +2254,17 @@ fn compile_ir_function(
 
     // Call __init_globals (and module-specific __init_globals_N) at the start of main
     if func_name == "main" {
+        // every module's tracers are registered before any global is built:
+        // a global is marked shared as it is stored, and the marking walks a
+        // struct's fields through its tracer, so one registered later would
+        // leave what the global reaches unmarked. main's body registers them
+        // again, which only repeats the insert.
+        for (name, &fid) in declared_funcs.iter() {
+            if name.contains("__cc_register_tracers") {
+                let reg_ref = codegen.module.declare_func_in_func(fid, builder.func);
+                builder.ins().call(reg_ref, &[]);
+            }
+        }
         // Call module-specific initializers first (imported modules)
         for (name, &fid) in declared_funcs.iter() {
             if name.starts_with("__init_globals_") {
@@ -3188,6 +3200,36 @@ fn compile_ir_function(
                             args[2],
                             fallback,
                         );
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        regs.insert(reg, zero);
+                        string_regs.remove(&reg);
+                        bytes_regs.remove(&reg);
+                        float_regs.remove(&reg);
+                        struct_regs.remove(&reg);
+                        continue;
+                    }
+                    // a field store's write barrier: only a holder that is
+                    // already shared makes the call, so test its mark here.
+                    // the holder is a struct the emitter is storing into,
+                    // never null.
+                    if fname == "pith_share_into" && args.len() == 3 && !name_is_shadowed {
+                        let fallback = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "pith_share_into",
+                        )?;
+                        let word = builder.ins().load(types::I32, MemFlags::new(), args[0], STRUCT_FLAGS_FROM_DATA);
+                        let shared = builder.ins().band_imm(word, STRUCT_SHARED_MASK as i64);
+                        let call_block = builder.create_block();
+                        let done = builder.create_block();
+                        builder.set_cold_block(call_block);
+                        builder.ins().brif(shared, call_block, &[], done, &[]);
+                        builder.switch_to_block(call_block);
+                        builder.ins().call(fallback, &[args[0], args[1], args[2]]);
+                        builder.ins().jump(done, &[]);
+                        builder.switch_to_block(done);
                         let zero = builder.ins().iconst(types::I64, 0);
                         regs.insert(reg, zero);
                         string_regs.remove(&reg);

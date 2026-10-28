@@ -168,7 +168,19 @@ impl ListImpl {
         }
     }
 
+    /// The write barrier of a store: a value stored into a list other tasks
+    /// can reach becomes reachable from them too (see `share.rs`).
+    #[inline(always)]
+    fn share_stored(&self, value: i64) {
+        if self.cycle_flags.load(std::sync::atomic::Ordering::Relaxed) & crate::share::CONTAINER_SHARED_FLAG != 0
+            && !matches!(self.type_tag, ListTypeTag::Primitive)
+        {
+            unsafe { crate::share::share_value(value, self.type_tag) };
+        }
+    }
+
     fn insert_value_at(&mut self, index: usize, value: i64) {
+        self.share_stored(value);
         if self.uses_value_storage() {
             let idx = index.min(self.values8.len());
             self.values8.insert(idx, value);
@@ -182,6 +194,7 @@ impl ListImpl {
     }
 
     fn push_value(&mut self, value: i64) {
+        self.share_stored(value);
         if self.uses_value_storage() {
             self.values8.push(value);
             self.sync_value_view();
@@ -233,6 +246,7 @@ impl ListImpl {
     }
 
     fn set_value(&mut self, index: usize, value: i64) {
+        self.share_stored(value);
         if self.uses_value_storage() {
             if index < self.values8.len() {
                 self.values8[index] = value;
@@ -1380,6 +1394,20 @@ pub(crate) unsafe fn cycle_clear_list_buffered(handle: i64) {
 /// bytes are leaves the free-time cascade releases (they cannot sit in a
 /// cycle). The codes are the closure env tag codes, the one child-kind
 /// numbering the collector speaks.
+/// Mark the list shared (see `share.rs`); true when this call set the mark.
+pub(crate) unsafe fn list_mark_shared(handle: i64) -> bool {
+    match list_ref_from_handle(handle) {
+        Some(impl_ref) => {
+            impl_ref
+                .cycle_flags
+                .fetch_or(crate::share::CONTAINER_SHARED_FLAG, std::sync::atomic::Ordering::Release)
+                & crate::share::CONTAINER_SHARED_FLAG
+                == 0
+        }
+        None => false,
+    }
+}
+
 pub(crate) fn cycle_child_code(tag: ListTypeTag) -> Option<u8> {
     match tag {
         ListTypeTag::List => Some(2),

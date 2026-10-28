@@ -313,6 +313,15 @@ impl MapImpl {
     /// already holds allocates nothing for the key. An occupied entry keeps the
     /// key it already has, exactly as `HashMap::insert` does.
     fn insert(&mut self, key: &KeyRef<'_>, value: MapVal) -> Option<MapVal> {
+        // the write barrier of a store: a value stored into a map other tasks
+        // can reach becomes reachable from them too (see `share.rs`)
+        if self.cycle_flags.load(std::sync::atomic::Ordering::Relaxed) & crate::share::CONTAINER_SHARED_FLAG != 0
+            && !matches!(self.val_tag, ListTypeTag::Primitive)
+        {
+            if let Some(word) = value.word() {
+                unsafe { crate::share::share_value(word, self.val_tag) };
+            }
+        }
         match self.data.entry_ref(key) {
             EntryRef::Occupied(mut entry) => Some(entry.insert(value)),
             EntryRef::Vacant(entry) => {
@@ -790,6 +799,20 @@ pub(crate) unsafe fn cycle_map_guard_strong(handle: i64, delta: u32) {
 /// Report every value the map owns a count on, as (value, child code).
 /// Keys are copies (ints, byte strings), never counted handles, so only the
 /// value side has edges; the scalar fast path stores raw ints and owns none.
+/// Mark the map shared (see `share.rs`); true when this call set the mark.
+pub(crate) unsafe fn map_mark_shared(handle: i64) -> bool {
+    match map_ref_from_handle(handle) {
+        Some(impl_ref) => {
+            impl_ref
+                .cycle_flags
+                .fetch_or(crate::share::CONTAINER_SHARED_FLAG, std::sync::atomic::Ordering::Release)
+                & crate::share::CONTAINER_SHARED_FLAG
+                == 0
+        }
+        None => false,
+    }
+}
+
 pub(crate) unsafe fn cycle_map_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
     let Some(impl_ref) = map_ref_from_handle(handle) else {
         return;

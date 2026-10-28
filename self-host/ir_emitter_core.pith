@@ -795,6 +795,68 @@ fn ir_emit_func_header(name: String, param_count: Int, ret_type: String):
 fn ir_trace_kind_enabled(kind: String) -> Bool:
     return ir_kind_is_struct_header(kind) or kind == "list" or kind == "map" or kind == "set" or kind == "closure"
 
+# --- marking values another task can reach -------------------------------
+#
+# a struct's counts are plain loads and stores while only the task that built
+# it can reach it, and atomic once it is marked shared (cranelift/runtime/src/
+# share.rs). the runtime marks what a spawn captures; the emitter marks the
+# crossings only it can see the type of: a task's result, a channel send, a
+# store into a module global, and a store into a struct that is already
+# shared (pith_share_into checks the holder). everything reachable from the
+# value is marked with it.
+
+# mark the value in `r`, of the type expression `expr_idx` has, as shared. a
+# result box carries no destructor to walk, so its payload is marked on its
+# own, by the slot the flag says holds it.
+fn ir_emit_share_expr(r: Int, expr_idx: Int):
+    tid := c_get_expr_type(expr_idx)
+    if tid >= 0 and get_type_info(tid).kind == "result":
+        ir_emit_share_reg(r, "tuple")
+        ok_kind := ir_rc_kind(ir_result_field_kind(tid, "ok"))
+        err_kind := ir_rc_kind(ir_result_field_kind(tid, "err"))
+        if ok_kind.len() > 0:
+            ok_r := ir_reg()
+            ir_emit("field " + ok_r.to_string() + " " + r.to_string() + " 8 unknown ok")
+            ir_emit_share_reg(ok_r, ok_kind)
+        if err_kind.len() > 0:
+            err_r := ir_reg()
+            ir_emit("field " + err_r.to_string() + " " + r.to_string() + " 16 unknown err")
+            ir_emit_share_reg(err_r, err_kind)
+        return
+    # a function value is a closure handle, whose type has no rc kind
+    if tid >= 0 and get_type_info(tid).kind == "function":
+        ir_emit_share_reg(r, "closure")
+        return
+    # the checked type first: the syntactic guess reads an empty `{}` as a
+    # map whatever it was assigned to, and marking a set as a map reads past it
+    if tid >= 0:
+        checked := ir_rc_kind(ir_type_from_tid(tid))
+        if checked.len() > 0:
+            ir_emit_share_reg(r, checked)
+            return
+    ir_emit_share_reg(r, ir_rc_kind(ir_infer_type(expr_idx)))
+
+# mark a value of rc kind `kind` shared; strings, bytes and plain values hold
+# no struct, so they need nothing
+fn ir_emit_share_reg(r: Int, kind: String):
+    if not ir_kind_reaches_structs(kind):
+        return
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + ir_element_tag_code(kind).to_string())
+    ir_emit_call2(ir_reg(), "pith_share", "void", r, tag_r)
+
+# the write barrier of a field store: mark `value_r` shared when `obj_r`, the
+# struct it was stored into, is shared already
+fn ir_emit_share_into(obj_r: Int, value_r: Int, kind: String):
+    if not ir_kind_reaches_structs(kind):
+        return
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + ir_element_tag_code(kind).to_string())
+    ir_emit_call3(ir_reg(), "pith_share_into", "void", obj_r, value_r, tag_r)
+
+fn ir_kind_reaches_structs(kind: String) -> Bool:
+    return ir_kind_is_struct_header(kind) or kind == "list" or kind == "map" or kind == "closure"
+
 # --- shared destructor and tracer walk plumbing ----------------------------
 #
 # every destructor that walks traceable children gets a tracer twin: the same
@@ -891,9 +953,11 @@ fn ir_struct_needs_tracer(raw_name: String) -> Bool:
     while i < count:
         fname := ir_struct_field_name_at(sname, i)
         ftype := ir_struct_field_type_name(sname, fname)
-        if not ir_struct_field_is_weak(sname, fname):
-            if ir_trace_kind_enabled(ir_rc_field_kind(ftype)):
-                needs = true
+        # a weak field is walked too: not by the collector (no strong count,
+        # no ownership edge), but by the shared marking, since a task that can
+        # read the reference can upgrade it
+        if ir_struct_field_is_weak(sname, fname) or ir_trace_kind_enabled(ir_rc_field_kind(ftype)):
+            needs = true
         i = i + 1
     if needs:
         ir_tracer_memo.insert(sname, 1)
@@ -6988,6 +7052,7 @@ fn ir_emit_select_send_probe(send_idx: Int) -> Int:
     kind := ir_rc_kind(ir_infer_type(arg_idx))
     if kind.len() > 0 and ir_expr_is_borrowed(arg_idx):
         ir_rc_retain_reg(val_r, kind)
+    ir_emit_share_expr(val_r, arg_idx)
     r := ir_reg()
     ir_emit_call2(r, "pith_channel_try_send", "bool", ch_r, val_r)
     if kind.len() > 0:
@@ -7525,6 +7590,9 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                     owned_store := ir_owned_container_store_name(emit_name)
                     if owned_store.len() > 0:
                         call_name = owned_store
+                # whoever receives a sent value reads it from another task
+                if ir_is_channel_send_name(emit_name):
+                    ir_emit_share_expr(arg_regs[store_value_pos], value_expr)
     # a builtin method on a primitive receiver lowers to its runtime call
     # name here, not at ir_emit_call_text: that helper hands any name a user
     # function declares to that function, which is right for a free call and
@@ -7941,7 +8009,10 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     ir_emit_func_header(wrapper_name, 1, "unknown")
     ir_emit_lambda_hidden_param()
     ir_emit_lambda_capture_loads(captures)
-    ir_emit("ret " + ir_expr(call_idx).to_string())
+    # whoever awaits the task reads its result
+    result_r := ir_expr(call_idx)
+    ir_emit_share_expr(result_r, call_idx)
+    ir_emit("ret " + result_r.to_string())
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_loop_var_slots = saved_loop_var_slots
@@ -9642,6 +9713,14 @@ fn ir_emit_assign_stmt(node: Node):
                 ir_emit_name_load(old_r, name)
         legacy_target := ir_map_init_target(name, ir_lookup_name_type(name))
         r := ir_emit_value_for_target(node.children[0], legacy_target)
+        # any task can read a module global, so what it is given is marked
+        # shared, by the value's own type (a function value's type names no
+        # rc kind)
+        if ir_assign_targets_global_slot(name):
+            if legacy_kind.len() > 0:
+                ir_emit_share_reg(r, legacy_kind)
+            else:
+                ir_emit_share_expr(r, node.children[0])
         if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_expr_is_borrowed(node.children[0]):
             ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
@@ -9699,6 +9778,7 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
         old_w := ir_reg()
         ir_emit_named_field_access(old_w, obj_r, lookup_key, fname, value_type)
         new_w := ir_emit_weak_payload(value_idx)
+        ir_emit_share_into(obj_r, new_w, "struct")
         ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + new_w.to_string())
         rel_r := ir_reg()
         ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + old_w.to_string())
@@ -9717,6 +9797,9 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # its payload is freed via the optional's destructor.
     if fassign_kind.len() > 0 and fassign_kind != "tuple" and ir_expr_is_borrowed(value_idx):
         ir_rc_retain_reg(value_r, fassign_kind)
+    # mark before the store: once the value sits in a shared struct another
+    # task can read it, and its counts must already be atomic by then
+    ir_emit_share_into(obj_r, value_r, fassign_kind)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + value_r.to_string())
     if old_r >= 0:
         ir_rc_release_reg(old_r, fassign_kind)
@@ -9774,6 +9857,14 @@ fn ir_emit_compound_assignment(node: Node):
             ir_rc_retain_reg(r, assign_kind)
         if old_r >= 0:
             ir_rc_release_reg(old_r, assign_kind)
+        # any task can read a module global, so what it is given is marked
+        # shared, by the value's own type (a function value's type names no
+        # rc kind)
+        if ir_assign_targets_global_slot(name):
+            if assign_kind.len() > 0:
+                ir_emit_share_reg(r, assign_kind)
+            else:
+                ir_emit_share_expr(r, node.children[1])
         ir_emit_name_store(name, r)
         return
     compound_op := ir_compound_assignment_ir_op(op)
@@ -11935,9 +12026,11 @@ fn ir_emit_struct_walks(trace: Bool):
                 # drops its weak reference rather than a strong one
                 # (weak_release(0) is a no-op) and the tracer skips the field
                 # entirely: no strong count means no ownership edge.
-                if not trace:
-                    fr := ir_reg()
-                    ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
+                fr := ir_reg()
+                ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + fname)
+                if trace:
+                    ir_emit_weak_visit(fr)
+                else:
                     rel_r := ir_reg()
                     ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + fr.to_string())
             elif ir_rc_walk_covers(fkind, trace):
@@ -12005,9 +12098,16 @@ fn ir_generic_struct_field_label(base: String, index: Int) -> String:
 # everywhere else: they hold no strong count, so they are not ownership edges.
 fn ir_generic_struct_instance_needs_tracer(sym: String) -> Bool:
     for k in ir_generic_struct_dtor_kinds[sym].split(";"):
-        if k != "weak" and ir_trace_kind_enabled(k):
+        if k == "weak" or ir_trace_kind_enabled(k):
             return true
     return false
+
+# report a weak slot to a tracer's visitor under kind 8, which the collector
+# skips and the shared marking walks
+fn ir_emit_weak_visit(r: Int):
+    code_r := ir_reg()
+    ir_emit("iconst " + code_r.to_string() + " 8")
+    ir_emit_call2(ir_reg(), "pith_cc_visit", "void", r, code_r)
 
 # tracer twin of a generic struct instance destructor: the same slot walk,
 # visiting each traceable child instead of releasing it.
@@ -12020,10 +12120,13 @@ fn ir_emit_generic_struct_instance_tracers():
         pr := ir_emit_rc_walk_header("__cc_trace_" + sym)
         mut i := 0
         while i < kinds.len():
-            if kinds[i] != "weak" and ir_trace_kind_enabled(kinds[i]):
+            if kinds[i] == "weak" or ir_trace_kind_enabled(kinds[i]):
                 fr := ir_reg()
                 ir_emit("field " + fr.to_string() + " " + pr.to_string() + " " + (i * 8).to_string() + " unknown " + ir_generic_struct_field_label(base, i))
-                ir_rc_visit_reg(fr, kinds[i])
+                if kinds[i] == "weak":
+                    ir_emit_weak_visit(fr)
+                else:
+                    ir_rc_visit_reg(fr, kinds[i])
             i = i + 1
         ir_emit_zero_ret_endfunc()
 
@@ -12281,6 +12384,10 @@ fn ir_emit_init_globals(root: Node):
             gkind := ir_rc_kind(target)
             if gkind.len() > 0 and gtarget != "tuple" and ir_expr_is_borrowed(parts.val_idx):
                 ir_rc_retain_reg(r, gkind)
+            if gkind.len() > 0:
+                ir_emit_share_reg(r, gkind)
+            else:
+                ir_emit_share_expr(r, parts.val_idx)
             ir_emit("store " + ir_global_storage_symbol(gname) + " " + r.to_string())
     ir_emit_zero_ret_endfunc()
 

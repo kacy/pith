@@ -1,0 +1,179 @@
+# structs keep plain counts while only the task that built them can reach
+# them, and are marked shared when they can reach another task. each case
+# below hands a struct graph to other tasks through one of the crossings the
+# marking covers, and those tasks retain and release what they read. run
+# under PITH_RC_CHECK=1 a crossing the marking missed aborts; run normally,
+# the totals have to come out the same as with every count atomic.
+
+struct Leaf:
+    n: Int
+
+struct Node:
+    leaf: Leaf
+    mut next: Node?
+    weak back: Node?
+    items: List[Leaf]
+
+struct Box:
+    mut held: Node?
+    mut leaves: List[Leaf]
+    mut table: Map[String, Leaf]
+
+mut shared_box := Box(held: none, leaves: [], table: {})
+# containers and fields are not synchronized: tasks that write the shared box
+# take this lock, as any program sharing mutable state must
+mut box_mu := Mutex()
+
+fn make(n: Int) -> Node:
+    return Node(leaf: Leaf(n: n), next: none, back: none, items: [Leaf(n: n * 2)])
+
+fn walk(node: Node) -> Int:
+    mut total := node.leaf.n
+    for it in node.items:
+        total = total + it.n
+    if node.next != none:
+        total = total + node.next.value().leaf.n
+    return total
+
+# a spawn's captures, read and retained by the new task
+fn captured(node: Node) -> Int:
+    copy := node
+    kept := copy.leaf
+    return walk(copy) + kept.n
+
+fn producer(ch: Channel[Node], count: Int) -> Int:
+    mut i := 0
+    while i < count:
+        a := make(i)
+        b := make(i + 100)
+        a.next = b
+        b.back = a
+        ch.send(a)
+        i = i + 1
+    ch.close()
+    return count
+
+fn consumer(ch: Channel[Node]) -> Int:
+    mut total := 0
+    mut kept: List[Node] := []
+    while true:
+        got := ch.recv()
+        if got == none:
+            break
+        node := got.value()
+        kept.push(node)
+        total = total + walk(node)
+        if node.next != none:
+            back := node.next.value().back
+            if back != none:
+                total = total + back.value().leaf.n
+    return total + kept.len()
+
+# a task's result, read by its awaiter
+fn build(n: Int) -> Node:
+    root := make(n)
+    root.next = make(n + 1)
+    return root
+
+# writes through a module global and through a shared struct's fields and
+# containers, from many tasks. the struct each write stores is built here,
+# local to this task until the store makes it reachable from the others.
+fn publisher(n: Int) -> Int:
+    fresh := make(n)
+    leaf := Leaf(n: n)
+    entry := Leaf(n: n + 1)
+    box_mu.lock()
+    shared_box.held = fresh
+    shared_box.leaves.push(leaf)
+    shared_box.table.insert("k" + n.to_string(), entry)
+    box_mu.unlock()
+    # keep using what was published, from this task, while readers retain it
+    return walk(fresh) + leaf.n - n * 4 - 1
+
+fn reader(n: Int) -> Int:
+    mut total := 0
+    box_mu.lock()
+    held := shared_box.held
+    mut leaves: List[Leaf] := []
+    for leaf in shared_box.leaves:
+        leaves.push(leaf)
+    box_mu.unlock()
+    if held != none:
+        total = total + walk(held.value())
+    for leaf in leaves:
+        total = total + leaf.n
+    return total
+
+fn run_with(f: fn(Int) -> Int, x: Int) -> Int:
+    return f(x)
+
+# a module global holding a function value: the closure it is given captures
+# a struct, and other tasks call it
+fn plain(x: Int) -> Int:
+    return x
+
+mut handler: fn(Int) -> Int := plain
+
+fn install(n: Int):
+    captured_node := make(n)
+    handler = fn(x: Int) => x + walk(captured_node)
+
+fn call_handler(x: Int) -> Int:
+    return handler(x)
+
+fn main() -> Int:
+    root := build(1)
+    t1 := spawn captured(root)
+    t2 := spawn captured(root)
+    print("captured " + (await t1 + await t2).to_string())
+
+    ch := Channel[Node](4)
+    p := spawn producer(ch, 200)
+    c := spawn consumer(ch)
+    print("channel " + (await p).to_string() + " " + (await c).to_string())
+
+    mut results: List[Node] := []
+    mut i := 0
+    while i < 20:
+        t := spawn build(i)
+        results.push(await t)
+        i = i + 1
+    mut sum := 0
+    for r in results:
+        sum = sum + walk(r)
+    print("results " + sum.to_string())
+
+    mut pubs: List[Task[Int]] := []
+    i = 0
+    while i < 16:
+        pubs.push(spawn publisher(i))
+        pubs.push(spawn reader(i))
+        i = i + 1
+    for t in pubs:
+        await t
+    print("box " + shared_box.leaves.len().to_string() + " " + shared_box.table.len().to_string())
+
+    # a closure that captures a struct, run by other tasks
+    base := make(7)
+    adder := fn(x: Int) => x + base.leaf.n
+    mut adds: List[Task[Int]] := []
+    i = 0
+    while i < 8:
+        adds.push(spawn run_with(adder, i))
+        i = i + 1
+    mut asum := 0
+    for t in adds:
+        asum = asum + await t
+    print("closure " + asum.to_string())
+
+    install(5)
+    mut hs: List[Task[Int]] := []
+    i = 0
+    while i < 8:
+        hs.push(spawn call_handler(i))
+        i = i + 1
+    mut hsum := 0
+    for t in hs:
+        hsum = hsum + await t
+    print("handler " + hsum.to_string())
+    return 0

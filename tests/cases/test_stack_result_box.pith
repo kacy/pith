@@ -1,0 +1,84 @@
+# a result local whose box lives on the stack: bound once from a call that
+# returns its result in registers, outside any loop, and only read. the cases
+# cover the ok and error paths, a return before the bind (the slot is still
+# empty at cleanup), the payload handed on to a callee and returned, a bind
+# inside a loop and a reassigned local (both keep the heap box), and a value
+# read after the box's function returned. results thrown away at a statement
+# drop their payload, error or value, without a box.
+
+fn parse_pos(text: String) -> Int!:
+    n := parse_int(text) catch -1
+    if n < 0:
+        fail "not a position: " + text
+    return n
+
+fn label(i: Int) -> String!:
+    if i % 2 == 1:
+        fail "odd " + i.to_string()
+    return "even-" + i.to_string()
+
+fn describe(text: String, early: Bool) -> String:
+    if early:
+        return "early"
+    r := parse_pos(text)
+    if r.is_err:
+        return "err(" + r.err + ")"
+    return "ok(" + r.ok.to_string() + ")"
+
+fn keep(i: Int) -> String:
+    r := label(i)
+    if r.is_ok:
+        return r.ok
+    return r.err
+
+fn in_loop(n: Int) -> Int:
+    mut total := 0
+    mut i := 0
+    while i < n:
+        r := label(i)
+        if r.is_ok:
+            total = total + r.ok.len()
+        i = i + 1
+    return total
+
+fn reassigned(i: Int) -> String:
+    mut r := label(i)
+    if r.is_err:
+        r = label(i + 1)
+    return r.ok
+
+fn from_bytes(text: String) -> Int:
+    t := bytes_from_string_utf8(text).to_string_utf8()
+    if t.is_err:
+        return 0 - 1
+    return t.ok.len()
+
+struct Sink:
+    mut count: Int
+
+impl Sink:
+    fn take(s: String) -> String!:
+        self.count = self.count + 1
+        if s.len() > 3:
+            fail "too long: " + s
+        return s + "!"
+
+fn main() -> Int:
+    print(describe("12", false))
+    print(describe("x", false))
+    print(describe("12", true))
+    words: List[String] := []
+    mut i := 0
+    while i < 4:
+        words.push(keep(i))
+        i = i + 1
+    print(words.join(","))
+    print(in_loop(6).to_string() + " " + reassigned(1) + " " + from_bytes("héllo").to_string())
+    sink := Sink(count: 0)
+    mut k := 0
+    while k < 6:
+        label(k)
+        sink.take("x".repeat(k))
+        k = k + 1
+    print(sink.count.to_string())
+    return 0

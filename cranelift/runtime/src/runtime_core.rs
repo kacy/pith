@@ -3358,8 +3358,17 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     base.add(STRUCT_HEADER) as i64
 }
 
-pub(crate) const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
-pub(crate) const STRUCT_HEADER: usize = 32;
+pub const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
+pub const STRUCT_HEADER: usize = 32;
+/// The header codegen writes for a box it builds in a stack slot (the ir's
+/// `tuple_stack`), the same words `pith_struct_alloc` writes: magic, one strong
+/// count, the implicit weak unit, the payload size, and no destructor. The
+/// box is never released; its function's cleanup drops what it holds.
+pub const STRUCT_STRONG_OFFSET: i32 = STRUCT_OFF_STRONG as i32;
+pub const STRUCT_WEAK_OFFSET: i32 = STRUCT_OFF_WEAK as i32;
+pub const STRUCT_DEAD_OFFSET: i32 = STRUCT_OFF_DEAD as i32;
+pub const STRUCT_SIZE_OFFSET: i32 = STRUCT_OFF_SIZE as i32;
+pub const STRUCT_DTOR_OFFSET: i32 = STRUCT_OFF_DTOR as i32;
 
 // header field offsets within the base allocation
 const STRUCT_OFF_STRONG: usize = 4;

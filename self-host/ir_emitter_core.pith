@@ -154,6 +154,14 @@ mut ir_rc_local_kinds: List[String] := []
 # destructor-less shell, never a double free. see ir_tuple_use_is_whitelisted.
 mut ir_tuple_local_tid: Map[String, Int] := {} # tuple local name -> producing expr's type id
 mut ir_tuple_cascade_names: List[String] := [] # tuple locals whose payload is safe to cascade
+# cascade locals whose result box can live in a stack slot (ir_stack_tuple_binds),
+# and the call node whose register-pair result the bind being emitted boxes
+mut ir_stack_tuple_names: List[String] := []
+mut ir_stack_box_call_idx := 0 - 1
+# set when the call ir_stack_box_call_idx names did build its box on the stack.
+# a call that builds its own heap box (a generic decode, say) leaves it unset,
+# and the bind then takes the local off the list so cleanup frees that shell.
+mut ir_stack_box_built := false
 # every name the function currently being emitted binds for the whole body: a
 # local, an `if let` or `match` payload. parameters and lambda captures are
 # the same thing and live in ir_var_regs; a `for` variable is not, and is
@@ -194,6 +202,7 @@ mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_tracer_memo: Map[String, Int] := {} # 1 needs tracer, 2 no/undecided
 mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this module
 mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
+mut ir_tuple_stack_cascade_sigs: List[String] := [] # the same, for stack boxes: the shell is not freed
 mut ir_result_arg_release_sigs: List[String] := [] # (ok,err) payload signatures needing a result-argument release helper
 # set when some optional in this module wraps a genuine tuple, which needs the
 # shell to release its payload. one walk serves every such shell: the payload
@@ -438,6 +447,7 @@ fn ir_reset_type_state():
     ir_tuple_dtor_sigs = []
     ir_optional_tuple_dtor_needed = false
     ir_tuple_cascade_sigs = []
+    ir_tuple_stack_cascade_sigs = []
     ir_kinded_release_used = false
     ir_result_arg_release_sigs = []
     ir_struct_names.clear()
@@ -2109,6 +2119,9 @@ fn ir_optional_tuple_payload_kind(tid: Int) -> String:
 fn ir_tuple_cascade_helper_name(sig: String) -> String:
     return "__tuple_cascade_" + sig + "_m" + ir_module_count.to_string()
 
+fn ir_tuple_stack_cascade_helper_name(sig: String) -> String:
+    return "__tuple_stack_cascade_" + sig + "_m" + ir_module_count.to_string()
+
 fn ir_result_arg_release_helper_name(sig: String) -> String:
     return "__result_arg_release_" + sig + "_m" + ir_module_count.to_string()
 
@@ -2127,6 +2140,11 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
         info := get_type_info(tid)
         if info.kind == "result" or info.kind == "optional":
             sig := ir_tuple_cascade_signature(tid)
+            if ir_stack_tuple_names.contains(name):
+                if not ir_tuple_stack_cascade_sigs.contains(sig):
+                    ir_tuple_stack_cascade_sigs.push(sig)
+                ir_emit_call1(ir_reg(), ir_tuple_stack_cascade_helper_name(sig), "void", r)
+                return
             if not ir_tuple_cascade_sigs.contains(sig):
                 ir_tuple_cascade_sigs.push(sig)
             ir_emit_call1(ir_reg(), ir_tuple_cascade_helper_name(sig), "void", r)
@@ -2167,9 +2185,19 @@ fn ir_assign_targets_global_slot(name: String) -> Bool:
 # explicit release here does, and the null leaves the destructor a no-op.
 fn ir_emit_tuple_cascade_helpers():
     for sig in ir_tuple_cascade_sigs:
+        ir_emit_tuple_cascade_helper(sig, false)
+    for sig in ir_tuple_stack_cascade_sigs:
+        ir_emit_tuple_cascade_helper(sig, true)
+
+# a stack box (`tuple_stack`) is part of its function's frame: its helper drops
+# the payload the same way and leaves the shell where it is.
+fn ir_emit_tuple_cascade_helper(sig: String, on_stack: Bool):
         ok_kind := ir_tuple_dtor_code_kind(sig[0])
         err_kind := ir_tuple_dtor_code_kind(sig.substring(1, 2))
-        pr := ir_emit_rc_walk_header(ir_tuple_cascade_helper_name(sig))
+        mut helper := ir_tuple_cascade_helper_name(sig)
+        if on_stack:
+            helper = ir_tuple_stack_cascade_helper_name(sig)
+        pr := ir_emit_rc_walk_header(helper)
         zero_r := ir_reg()
         ir_emit("iconst " + zero_r.to_string() + " 0")
         live_r := ir_reg()
@@ -2199,7 +2227,8 @@ fn ir_emit_tuple_cascade_helpers():
             ir_emit("sstore " + pr.to_string() + " 2 " + zero_r.to_string())
         ir_emit("jmp " + rel_l)
         ir_emit_label(rel_l)
-        ir_emit_call1(ir_reg(), "pith_struct_release", "void", pr)
+        if not on_stack:
+            ir_emit_call1(ir_reg(), "pith_struct_release", "void", pr)
         ir_emit("jmp " + done_l)
         ir_emit_label(done_l)
         ir_emit_zero_ret_endfunc()
@@ -2799,6 +2828,7 @@ fn ir_emit_rc_prologue(body_idx: Int):
     ir_stack_closure_regs = []
     ir_fn_arg_lambda_symbols = {}
     ir_tuple_cascade_scan(body_idx)
+    ir_stack_tuple_names = ir_stack_tuple_binds(body_idx)
     mut i := 0
     while i < ir_rc_locals.len():
         name := ir_rc_locals[i]
@@ -5539,7 +5569,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         if ret_type != "float" and idx == ir_rcall_defer_idx:
             return ir_emit_wrapped_legacy_pair(r, ret_type, callee.name)
-        return ir_emit_wrapped_legacy_result(r, ret_type, callee.name)
+        return ir_emit_wrapped_legacy_result(r, ret_type, callee.name, idx)
     return r
 
 # store_name is the plain store for the literal's key flavor (map_insert,
@@ -6430,6 +6460,8 @@ fn ir_emit_result_reg_call(r: Int, fname: String, arg_count: Int, arg_text: Stri
 # path, so each arm stores it in its own slot. ownership transfers into the
 # box with no extra count, the same as a callee-built box.
 fn ir_emit_result_reg_box(flag_r: Int, val_r: Int) -> Int:
+    if ir_rcall_current_idx >= 0 and ir_rcall_current_idx == ir_stack_box_call_idx:
+        return ir_emit_stack_result_box(flag_r, val_r)
     temp_name := ir_new_temp_name("rreg_box")
     ir_var_types.insert(temp_name, "tuple")
     ok_l := ir_label()
@@ -6447,6 +6479,67 @@ fn ir_emit_result_reg_box(flag_r: Int, val_r: Int) -> Int:
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
+
+# the same three-slot box in a stack slot of the frame, for a local that only
+# reads it (ir_stack_tuple_binds). the flag picks which slot the payload goes
+# in, as the heap version's two arms do.
+fn ir_emit_stack_result_box(flag_r: Int, val_r: Int) -> Int:
+    ir_stack_box_built = true
+    box_r := ir_reg()
+    ir_emit("tuple_stack " + box_r.to_string() + " 3")
+    zero_r := ir_zero_reg()
+    ir_emit("sstore " + box_r.to_string() + " 0 " + flag_r.to_string())
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    ir_emit("sstore " + box_r.to_string() + " 1 " + val_r.to_string())
+    ir_emit("sstore " + box_r.to_string() + " 2 " + zero_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(err_l)
+    ir_emit("sstore " + box_r.to_string() + " 1 " + zero_r.to_string())
+    ir_emit("sstore " + box_r.to_string() + " 2 " + val_r.to_string())
+    ir_emit_label(merge_l)
+    return box_r
+
+# result locals whose box can be a stack slot of the frame instead of a heap
+# block: `r := f(...)` where f returns its result in registers, so the box is
+# built right here, and the local
+#
+#   - may cascade its payload at cleanup (ir_tuple_cascade_names), which
+#     already means every use only reads the box or borrows it
+#   - is bound once, from a call, and never assigned, so its slot is never
+#     rebuilt over a value still waiting for release
+#   - is not bound inside a loop, where one slot would be rebuilt every pass
+fn ir_stack_tuple_binds(body_idx: Int) -> List[String]:
+    mut names: List[String] := []
+    if body_idx < 0:
+        return names
+    for name in ir_tuple_cascade_names:
+        if ir_count_call_binds(body_idx, name, false) == 1 and not ir_subtree_assigns_name(body_idx, name):
+            names.push(name)
+    return names
+
+# the binds of `name` in this body: 1 for each call-valued bind outside any
+# loop, and 2 for any other (in a loop, or from something else), so a single
+# qualifying bind is exactly a count of one
+fn ir_count_call_binds(idx: Int, name: String, inside_loop: Bool) -> Int:
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return 0
+    in_loop := inside_loop or node.kind == "while_stmt" or node.kind == "while_let" or node.kind == "for_stmt"
+    mut n := 0
+    if ir_is_binding_kind(node.kind):
+        parts := ir_collect_bind_parts(node)
+        if parts.name == name:
+            if not in_loop and parts.val_idx >= 0 and (node_kind(parts.val_idx) == "call" or node_kind(parts.val_idx) == "method_call"):
+                n = 1
+            else:
+                n = 2
+    for child in node.children:
+        n = n + ir_count_call_binds(child, name, in_loop)
+    return n
 
 # hand a legacy single-register result straight to the pair handshake:
 # decode the sentinel into (flag, payload) registers with no box on either
@@ -6488,7 +6581,11 @@ fn ir_emit_wrapped_legacy_pair(raw_r: Int, legacy_kind: String, callee_name: Str
     ir_rcall_val_reg = val_r
     return raw_r
 
-fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
+# call_idx is the call the raw value came from; a bind that keeps its result
+# box on the stack (ir_stack_tuple_binds) marks that call.
+fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: String, call_idx: Int) -> Int:
+    if call_idx >= 0 and call_idx == ir_stack_box_call_idx and legacy_kind != "float":
+        return ir_emit_wrapped_legacy_stack_box(raw_r, legacy_kind, callee_name)
     temp_name := ir_new_temp_name("legacy_result")
     ir_var_types.insert(temp_name, "tuple")
     zero_r := ir_reg()
@@ -6516,6 +6613,33 @@ fn ir_emit_wrapped_legacy_result(raw_r: Int, legacy_kind: String, callee_name: S
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
+
+# the legacy sentinel decoded into a stack box: zero is the error, carrying
+# the same static message the heap box gets
+fn ir_emit_wrapped_legacy_stack_box(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
+    ir_stack_box_built = true
+    zero_r := ir_zero_reg()
+    flag_r := ir_reg()
+    ir_emit("neq " + flag_r.to_string() + " " + raw_r.to_string() + " " + zero_r.to_string())
+    box_r := ir_reg()
+    ir_emit("tuple_stack " + box_r.to_string() + " 3")
+    ir_emit("sstore " + box_r.to_string() + " 0 " + flag_r.to_string())
+    ok_l := ir_label()
+    err_l := ir_label()
+    merge_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit_label(ok_l)
+    mut ok_r := raw_r
+    if legacy_kind == "result_int" or legacy_kind == "result_bool":
+        ok_r = ir_decode_result_value(raw_r, legacy_kind)
+    ir_emit("sstore " + box_r.to_string() + " 1 " + ok_r.to_string())
+    ir_emit("sstore " + box_r.to_string() + " 2 " + zero_r.to_string())
+    ir_emit("jmp " + merge_l)
+    ir_emit_label(err_l)
+    ir_emit("sstore " + box_r.to_string() + " 1 " + zero_r.to_string())
+    ir_emit("sstore " + box_r.to_string() + " 2 " + ir_emit_result_error_message(callee_name).to_string())
+    ir_emit_label(merge_l)
+    return box_r
 
 fn ir_emit_result_field_access(idx: Int, obj_r: Int, fname: String) -> Int:
     obj_tid := c_get_expr_type(node_child(idx, 0))
@@ -6782,7 +6906,7 @@ fn ir_emit_named_handler_call(handler_idx: Int, arg_r: Int, ret_type: String) ->
             call_type = legacy_kind
         ir_emit_call_text(out_r, call_name, call_type, 1, " " + arg_r.to_string())
         if legacy_kind.len() > 0 and ret_type == "tuple":
-            return ir_emit_wrapped_legacy_result(out_r, legacy_kind, call_name)
+            return ir_emit_wrapped_legacy_result(out_r, legacy_kind, call_name, 0 - 1)
         return out_r
     handler_r := ir_expr(handler_idx)
     handler_name := ir_new_temp_name("handler")
@@ -7248,7 +7372,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
             if ret_type != "float" and idx == ir_rcall_defer_idx:
                 return ir_emit_wrapped_legacy_pair(r, ret_type, call_name)
-            return ir_emit_wrapped_legacy_result(r, ret_type, call_name)
+            return ir_emit_wrapped_legacy_result(r, ret_type, call_name, idx)
         return r
     return 0 - 1
 
@@ -7441,7 +7565,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         if ret_type != "float" and idx == ir_rcall_defer_idx:
             return ir_emit_wrapped_legacy_pair(r, ret_type, emit_name)
-        return ir_emit_wrapped_legacy_result(r, ret_type, emit_name)
+        return ir_emit_wrapped_legacy_result(r, ret_type, emit_name, idx)
     if ir_is_void_method(emit_name):
         return obj_r
     return r
@@ -7630,6 +7754,9 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_rc_kinds := ir_rc_local_kinds
     saved_tuple_tids := ir_tuple_local_tid
     saved_tuple_cascade := ir_tuple_cascade_names
+    saved_stack_tuples := ir_stack_tuple_names
+    saved_stack_box_call := ir_stack_box_call_idx
+    ir_stack_box_call_idx = 0 - 1
     saved_func_local_names := ir_func_local_names
     # the lambda body is its own function frame; open loops in the enclosing
     # function must not have their iterables released by a return inside it.
@@ -7650,6 +7777,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
+    ir_stack_tuple_names = []
     ir_loop_iter_vars = []
     ir_loop_iter_kinds = []
     ir_weak_capture_names = lambda_weak_caps
@@ -7700,6 +7828,8 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_rc_local_kinds = saved_rc_kinds
     ir_tuple_local_tid = saved_tuple_tids
     ir_tuple_cascade_names = saved_tuple_cascade
+    ir_stack_tuple_names = saved_stack_tuples
+    ir_stack_box_call_idx = saved_stack_box_call
     ir_func_local_names = saved_func_local_names
     ir_loop_iter_vars = saved_loop_iter_vars
     ir_loop_iter_kinds = saved_loop_iter_kinds
@@ -9428,8 +9558,15 @@ fn ir_emit_bind_stmt(node: Node):
             ir_emit_name_load(old_r, name)
         bind_target := ir_map_init_target(name, target_type)
         ir_lambda_on_stack = ir_stack_closure_names.contains(name) and get_node(val_idx).kind == "lambda"
+        stack_box := ir_stack_tuple_names.contains(name)
+        if stack_box:
+            ir_stack_box_call_idx = val_idx
+            ir_stack_box_built = false
         r := ir_emit_value_for_target_inner(val_idx, bind_target, ir_optional_inner_type_of_node(type_idx))
         ir_lambda_on_stack = false
+        ir_stack_box_call_idx = 0 - 1
+        if stack_box and not ir_stack_box_built:
+            ir_stack_tuple_names = ir_remove_string(ir_stack_tuple_names, name)
         if tracked and bind_target != "tuple" and ir_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
@@ -11108,6 +11245,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_kinded_rc_binds = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
+    ir_stack_tuple_names = []
     ir_func_local_names = {}
     # defers are function-scoped: start each function with empty scope stacks
     ir_defer_nodes = []
@@ -12429,3 +12567,10 @@ pub fn emit_ir(root_idx: Int) -> String:
     lines := ir_builder_lines()
     ir_finish_module_emit()
     return lines.join(chr(10))
+
+fn ir_remove_string(items: List[String], drop: String) -> List[String]:
+    mut out: List[String] := []
+    for item in items:
+        if item != drop:
+            out.push(item)
+    return out

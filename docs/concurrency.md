@@ -321,10 +321,12 @@ threadlocal mut arena: Map[Int, Node] := {}
 ```
 
 it reads and writes like any other global; only the storage is
-per-task. what a copy holds is not released when its owner exits, so keep the
-set of `threadlocal` globals small and the values scratch-sized. use it
-for state that is genuinely per-task; a value shared *across* tasks still
-belongs in a struct or behind a channel.
+per-task. when a task finishes (or its thread, on the os-thread backend),
+the values its copies hold are released, so a server that spawns a task per
+connection does not strand one set of copies per connection. main's copies
+live as long as the process. use `threadlocal` for state that is genuinely
+per-task; a value shared *across* tasks still belongs in a struct or behind
+a channel.
 
 this is what lets the std parsers and buffers be used from many tasks at
 once: `std.json` and `std.toml` keep their parse arena in `threadlocal`

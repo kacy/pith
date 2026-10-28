@@ -11647,13 +11647,22 @@ fn ir_emit_tls_load(dest_r: Int, name: String):
     ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[name].to_string())
     fr := ir_reg()
     ir_emit("funcref " + fr.to_string() + " __tlsinit_" + name)
-    ir_emit("call " + dest_r.to_string() + " pith_tls_get_or_init " + ir_threadlocal_kinds[name] + " 2 " + slot_r.to_string() + " " + fr.to_string())
+    tag_r := ir_emit_tls_tag(name)
+    ir_emit("call " + dest_r.to_string() + " pith_tls_get_or_init_tagged " + ir_threadlocal_kinds[name] + " 3 " + slot_r.to_string() + " " + fr.to_string() + " " + tag_r.to_string())
 
 # write val_r into a threadlocal global for this thread.
 fn ir_emit_tls_store(name: String, val_r: Int):
     slot_r := ir_reg()
     ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[name].to_string())
-    ir_emit("call " + ir_reg().to_string() + " pith_tls_set void 2 " + slot_r.to_string() + " " + val_r.to_string())
+    tag_r := ir_emit_tls_tag(name)
+    ir_emit("call " + ir_reg().to_string() + " pith_tls_set_tagged void 3 " + slot_r.to_string() + " " + val_r.to_string() + " " + tag_r.to_string())
+
+# the element tag of a threadlocal's type, which the runtime keeps with each
+# task's value so the count it holds is dropped when the task finishes
+fn ir_emit_tls_tag(name: String) -> Int:
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + ir_element_tag_code(ir_rc_kind(ir_threadlocal_kinds[name])).to_string())
+    return tag_r
 
 # a name refers to a threadlocal global only when it is a recorded threadlocal
 # and not shadowed by a local of the same name in the current function.

@@ -165,6 +165,7 @@ cases=(
   tests/leaks/leak_argument_literal
   tests/leaks/leak_widened_store
   tests/leaks/leak_arena_truncate
+  tests/leaks/leak_task_threadlocal
   tests/leaks/leak_stack_result_box
   tests/leaks/leak_json_decode_struct
   tests/leaks/leak_json_fill_struct

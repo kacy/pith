@@ -184,6 +184,48 @@ on this one. the way to have both is to let an idle worker take a `Ready`
 task off a peer's pinned queue, which the runtime is now built to allow;
 until that exists the default stays put.
 
+### stealing from a busy worker, and migration on by default (2026-10-28)
+
+an idle worker now takes a woken task off a peer's queue when that peer has
+been inside one task for 20us, and becomes the task's owner. it never takes the
+peer's affinity slot, which holds the other half of a handoff. with that,
+moving a woken task to its waker is the default (`PITH_GREEN_MIGRATE=0` turns
+it off). medians of 7 interleaved rounds against `b0cccee3`, 16 workers on
+cores 0-7,16-23 of a 9950X, ms. the right column also has the cache-line
+padding of #1232, which on its own took `lock_sweep/spawn` from 255 to 155 and
+`green_fanout` from 1085 to 885:
+
+| benchmark | b0cccee3 | this change |
+|---|---:|---:|
+| chan_fanout | 97 (70-130) | 38 |
+| cpu_parallel_sync, 200 x 1M | 921 | 658 |
+| lock_sweep/spawn | 280 | 63 |
+| green_fanout | 1088 | 869 |
+| task_pingpong | 397, or 2.2-2.9 s | 399 |
+
+the other concurrency rows and `http_head_read` moved by 3 percent or less.
+`task_pingpong` was bimodal before: a run whose two tasks started on
+different workers took 2.2-2.9 s, with all four million wakes crossing
+workers, and about one run in three did. on one worker the fan-out takes
+37 ms and the ping-pong 425 ms, so both now run at their one-worker speed on
+sixteen.
+
+migration alone, without stealing, gave the same fan-out and ping-pong
+numbers but took `cpu_parallel_sync` from 911 to 2.6-4.7 s, since every
+compute task ended up on the collector's worker.
+
+an idle worker does not count a peer's queue as work it could take when
+deciding whether to park. when it did, every idle worker kept spinning beside a
+busy pipeline: the fan-out took 0.75 s of CPU for a 49 ms run, against 0.037 s
+for the same run with them parked. an idle worker still checks its peers'
+queues each time it looks for work before parking.
+
+the HTTP server is unchanged within noise: 862k against 863k req/s at 32
+connections, 1173k against 1157k at 256 and 1486k against 1479k at 1024,
+`PITH_GREEN_MIGRATE=0` against the default, medians of three 5-second runs
+from a Go keep-alive client on the other CCD rather than wrk. the 256
+connection row was 1-2 percent lower with migration on in all three rounds.
+
 ### what preemption safe-points cost, now that they are on (2026-09-07)
 
 green tasks are preemptible in every build unless it says

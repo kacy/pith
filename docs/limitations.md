@@ -630,13 +630,12 @@ socket blocks its worker outright. green stays available on those platforms and
 stays correct, but it would be a regression as a default until there is a kqueue
 sibling.
 
-placement is left to luck. a task pins to the first worker that runs it, so
-whether two tasks that talk to each other land together is chance, and the
-fan-out benchmark is bimodal because of it: ~46 ms pinned to one worker with
-`PITH_GREEN_WORKERS=1`, ~60 ms when the pipeline happens to share a worker
-anyway, ~96-100 ms on the runs that split, which are the common case.
-cross-worker wakes are the whole remaining
-gap to go on coordination-heavy work.
+placement used to be left to luck. a task pinned to the first worker that ran
+it, so whether two tasks that talk to each other landed together was chance,
+and the fan-out benchmark was bimodal because of it. a woken task now moves to
+the worker that woke it, and an idle worker takes queued tasks off a worker
+stuck in a long one, which fixed both the fan-out and the ping-pong (see
+"the green backend" in `docs/concurrency.md`).
 
 the obvious fix is to move a parked task to whichever worker keeps waking it,
 and it does work: prototyped, it took the fan-out from a bimodal ~120 ms median
@@ -660,16 +659,13 @@ base for a frame to keep; the few cells whose address has to exist as a value
 globals off the green backend and the collector's mutator slot) are touched
 only inside functions the optimizer may not inline. `make check-tls-barriers`
 audits the built archive for both, and `cargo test` drives a forced
-cross-thread resume against the shipped archive to keep it that way. the move
-itself is in, behind `PITH_GREEN_MIGRATE=1`: a worker that wakes a task parked
-elsewhere takes it, which turns the fan-out's bimodal ~93 ms into a flat
-~43 ms at the default worker count (`docs/performance.md` has the table). it
-is off by default because the same rule pulls parallel work onto one worker
-when it synchronizes: eight compute tasks reporting to a collector run 259 ms
-on two workers without the flag and 337 ms with it, since a pinned task is
-never stolen and nothing spreads it back out. the default waits on an idle
-worker being allowed to take a ready task off a peer's queue. without the
-flag a task still pins to the first worker that runs it.
+cross-thread resume against the shipped archive to keep it that way. moving a
+woken task to the worker that wakes it is the default, and
+`PITH_GREEN_MIGRATE=0` turns it off. on its own that rule pulled parallel
+work onto one worker when it synchronized (`bench/cpu_parallel_sync`), so an
+idle worker may also take a queued task off a peer that has been inside one
+task for 20us. with both rules, `cpu_parallel_sync` runs in 655 ms on 16
+workers, against 911 ms with each task pinned to its first worker.
 `examples/grpc_chat` and `examples/grpc_reflect` are the two programs
 sensitive enough to catch a placement change going wrong; run them first.
 

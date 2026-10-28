@@ -163,9 +163,11 @@ funcref REG NAME            REG = a pointer to function NAME.
 closure_ref REG NAME        REG = a closure value wrapping NAME.
 closure_stack REG NAME      the same closure, built in a stack slot of the
                             current frame. never retained, released or
-                            stored; the emitter uses it only for a closure
-                            that is called directly and captures nothing
-                            with a count.
+                            stored; the emitter uses it for a closure that
+                            is only called directly and captures nothing
+                            with a count, and for a lambda passed to a
+                            parameter the callee only calls, which holds
+                            its counted captures without a count.
 ```
 
 **control flow**

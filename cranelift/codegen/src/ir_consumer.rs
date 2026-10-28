@@ -985,6 +985,55 @@ fn inline_closure_get_env(
     finish_strict_fast_path(builder, slow, done, fallback)
 }
 
+/// The function a call through a closure value jumps to: the handle test
+/// `closure_base` makes and one load of `func_ptr`, with a bad handle sent to
+/// `pith_closure_get_fn`, which answers as it always has. Every call through a
+/// closure value made that FFI call before the indirect call itself.
+fn closure_fn_ptr(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    closure: Value,
+) -> Value {
+    let Some(&fid) = runtime_funcs.get("pith_closure_get_fn") else {
+        return closure;
+    };
+    let fallback = *func_ref_cache
+        .entry(fid)
+        .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func));
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+    builder.append_block_param(slow, types::I64);
+    builder.append_block_param(slow, types::I64);
+    builder.set_cold_block(slow);
+
+    let zero = builder.ins().iconst(types::I64, 0);
+    branch_if_not_magic_handle(
+        builder,
+        closure,
+        zero,
+        CLOSURE_HANDLE_ALIGN,
+        CLOSURE_MAGIC_OFFSET,
+        CLOSURE_MAGIC,
+        slow,
+    );
+    let fn_ptr = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), closure, CLOSURE_FUNC_PTR_OFFSET);
+    jump_with_i64_arg(builder, done, fn_ptr);
+
+    builder.switch_to_block(slow);
+    let handle = builder.block_params(slow)[0];
+    let call = builder.ins().call(fallback, &[handle]);
+    let answer = builder.func.dfg.first_result(call);
+    jump_with_i64_arg(builder, done, answer);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
 /// Inline the store of one capture (`pith_closure_set_env`) the way
 /// `inline_closure_get_env` inlines the read: the handle test, then one store
 /// into the inline env. A closure is built with one of these per capture, so
@@ -3506,20 +3555,13 @@ fn compile_ir_function(
                     } else if let Some(&var) = named_vars.get(fname) {
                         // Indirect call through closure handle variable
                         let closure_handle = builder.use_var(var);
-                        let fn_ptr = if let Some(&closure_get_id) =
-                            runtime_funcs.get("pith_closure_get_fn")
-                        {
-                            let closure_get_ref =
-                                *func_ref_cache.entry(closure_get_id).or_insert_with(|| {
-                                    codegen
-                                        .module
-                                        .declare_func_in_func(closure_get_id, builder.func)
-                                });
-                            let call = builder.ins().call(closure_get_ref, &[closure_handle]);
-                            builder.func.dfg.first_result(call)
-                        } else {
-                            closure_handle
-                        };
+                        let fn_ptr = closure_fn_ptr(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            closure_handle,
+                        );
                         let mut sig = codegen.module.make_signature();
                         sig.params.push(AbiParam::new(types::I64));
                         for _ in &args {
@@ -3550,20 +3592,13 @@ fn compile_ir_function(
                             addr,
                             0,
                         );
-                        let fn_ptr = if let Some(&closure_get_id) =
-                            runtime_funcs.get("pith_closure_get_fn")
-                        {
-                            let closure_get_ref =
-                                *func_ref_cache.entry(closure_get_id).or_insert_with(|| {
-                                    codegen
-                                        .module
-                                        .declare_func_in_func(closure_get_id, builder.func)
-                                });
-                            let call = builder.ins().call(closure_get_ref, &[closure_handle]);
-                            builder.func.dfg.first_result(call)
-                        } else {
-                            closure_handle
-                        };
+                        let fn_ptr = closure_fn_ptr(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            closure_handle,
+                        );
                         let mut sig = codegen.module.make_signature();
                         sig.params.push(AbiParam::new(types::I64));
                         for _ in &args {

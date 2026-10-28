@@ -124,6 +124,13 @@ mut ir_rc_prologue_captures: List[String] := []
 # lambda it is about to emit.
 mut ir_stack_closure_names: List[String] := []
 mut ir_lambda_on_stack := false
+# set with ir_lambda_on_stack for a lambda that is a call argument: the frame
+# keeps whatever it captures alive until the call returns, so a stack closure
+# may hold counted captures without a count of its own.
+mut ir_lambda_borrows_captures := false
+# the registers of this function's closures that live in a stack slot, which
+# the release paths for call arguments must leave alone.
+mut ir_stack_closure_regs: List[Int] := []
 mut ir_rc_local_kinds: List[String] := []
 
 # tuple locals (a `T!`/`T?` bound to a name) release only their 3-slot shell at
@@ -1690,6 +1697,105 @@ fn ir_record_fn_borrow_params(decl_idx: Int, sym: String):
                         ir_borrow_param_exported.insert(ir_import_target_name(ir_current_module_path, sym) + key_tail, flavor)
             pos = pos + 1
 
+# parameters of function type that a function only ever calls, or hands to a
+# parameter of some other function recorded the same way. a closure passed to
+# one cannot outlive the call, so a caller may build a lambda literal for it
+# in a stack slot (ir_emit_local_fn_arg). recorded in ir_borrow_param_local
+# and ir_borrow_param_exported with the flavor "closure", in passes until
+# nothing changes, since a function's record can depend on one declared after
+# it. a parameter in a lambda or a spawn, stored, returned, or reassigned is
+# never recorded, and neither is one of a generic function, whose body is
+# emitted under other symbols.
+fn ir_record_closure_params(root_idx: Int):
+    saved_impl_type := ir_current_impl_type
+    mut changed := true
+    while changed:
+        changed = false
+        for item_idx in ir_root_items(root_idx):
+            node := get_node(item_idx)
+            if ir_is_fn_decl_kind(node.kind):
+                if not ir_has_generic_params(node):
+                    ir_current_impl_type = ""
+                    if ir_record_fn_closure_params(item_idx, node.value):
+                        changed = true
+            elif node.kind == "impl_decl":
+                impl_type := ir_impl_identity_type(node, ir_current_module_path)
+                if impl_type.len() > 0 and not impl_type.contains("[") and not has_generic_declaration(impl_type):
+                    ir_current_impl_type = impl_type
+                    for child in node.children:
+                        method_idx := ir_unwrap_pub_child(child)
+                        method_node := get_node(method_idx)
+                        if method_node.kind == "fn_decl" and not ir_has_generic_params(method_node):
+                            if ir_record_fn_closure_params(method_idx, impl_type + "_" + method_node.value):
+                                changed = true
+    ir_current_impl_type = saved_impl_type
+
+# true when this pass recorded a parameter that was not recorded before
+fn ir_record_fn_closure_params(decl_idx: Int, sym: String) -> Bool:
+    body_idx := ir_tuple_walk_fn_body(decl_idx)
+    if body_idx < 0:
+        return false
+    mut added := false
+    mut pos := 0
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            key_tail := "/" + pos.to_string()
+            is_fn := cn.children.len() > 0 and get_node(cn.children[0]).kind == "fn_type"
+            if is_fn and not ir_borrow_param_local.contains_key(sym + key_tail) and not cn.value.contains(" "):
+                name := cn.value
+                if not ir_subtree_assigns_name(body_idx, name) and ir_count_name_nodes(body_idx, name) == ir_count_local_closure_uses(body_idx, name):
+                    ir_borrow_param_local.insert(sym + key_tail, "closure")
+                    if ir_current_module_path.len() > 0:
+                        ir_borrow_param_exported.insert(ir_import_target_name(ir_current_module_path, sym) + key_tail, "closure")
+                    added = true
+            pos = pos + 1
+    return added
+
+# the mentions of `name` that keep a closure in this frame: the callee of a
+# call, or a positional argument to a recorded closure parameter. none inside
+# a lambda or a spawn counts.
+fn ir_count_local_closure_uses(idx: Int, name: String) -> Int:
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return 0
+    mut n := 0
+    if node.kind == "call" and node.children.len() > 0:
+        callee := get_node(node.children[0])
+        if callee.kind == "ident" and callee.value == name:
+            n = 1
+        elif callee.kind == "ident":
+            for pos in ir_local_closure_arg_positions(node, ir_resolve_static_callee(node.children[0]).name):
+                arg_idx := ir_call_arg_expr_index(node.children[pos + 1])
+                arg := get_node(arg_idx)
+                if arg.kind == "ident" and arg.value == name:
+                    n = n + 1
+    for child in node.children:
+        n = n + ir_count_local_closure_uses(child, name)
+    return n
+
+# the positional arguments of a static call that land in a recorded closure
+# parameter of `callee_name`. a named argument is left out: the record is by
+# position.
+fn ir_local_closure_arg_positions(node: Node, callee_name: String) -> List[Int]:
+    mut positions: List[Int] := []
+    if callee_name.len() == 0:
+        return positions
+    mut i := 1
+    while i < node.children.len():
+        arg := get_node(node.children[i])
+        if not (arg.kind == "arg" and arg.value.len() > 0):
+            key := callee_name + "/" + (i - 1).to_string()
+            mut flavor := ""
+            if ir_borrow_param_local.contains_key(key):
+                flavor = ir_borrow_param_local[key]
+            elif ir_borrow_param_exported.contains_key(key):
+                flavor = ir_borrow_param_exported[key]
+            if flavor == "closure":
+                positions.push(i - 1)
+        i = i + 1
+    return positions
+
 # a callee on the register abi never hands its caller the box it was given:
 # a returned result leaves as its payload, which takes a count of its own
 # when the box is borrowed (ir_emit_return_box_as_pair). so, walking such a
@@ -2522,10 +2628,12 @@ fn ir_bind_can_borrow_element(block: Node, pos: Int, body_idx: Int) -> Bool:
 # every node whose value is the name: idents, bindings, loop variables and
 # pattern bindings alike. a method that happens to share the name counts
 # too, which can only make the caller more cautious.
+# an operator node's value is the operator ("add", "mul", "and"), not a name,
+# so a local spelled like one is not counted at every operator.
 fn ir_count_name_nodes(idx: Int, name: String) -> Int:
     node := get_node(idx)
     mut n := 0
-    if node.value == name:
+    if node.value == name and node.kind != "binary" and node.kind != "unary":
         n = 1
     for child in node.children:
         n = n + ir_count_name_nodes(child, name)
@@ -2601,10 +2709,11 @@ fn ir_collect_stack_closure_binds(idx: Int, body_idx: Int, names: List[String]):
     for child in node.children:
         ir_collect_stack_closure_binds(child, body_idx, names)
 
-# calls whose callee is the bare name, not counting any inside a lambda.
+# calls whose callee is the bare name, not counting any inside a lambda or a
+# spawn, whose wrapper takes the closure along to another task.
 fn ir_count_direct_calls(idx: Int, name: String) -> Int:
     node := get_node(idx)
-    if node.kind == "lambda":
+    if node.kind == "lambda" or node.kind == "spawn":
         return 0
     mut n := 0
     if node.kind == "call" and node.children.len() > 0:
@@ -2681,6 +2790,7 @@ fn ir_emit_rc_prologue(body_idx: Int):
     ir_untrack_rc_locals(ir_borrowed_element_binds(body_idx))
     ir_stack_closure_names = ir_stack_closure_binds(body_idx)
     ir_untrack_rc_locals(ir_stack_closure_names)
+    ir_stack_closure_regs = []
     ir_tuple_cascade_scan(body_idx)
     mut i := 0
     while i < ir_rc_locals.len():
@@ -2758,18 +2868,23 @@ fn ir_emit_call_arg(expr_idx: Int) -> Int:
 fn ir_arg_release_is_skipped(expr_idx: Int) -> Bool:
     return expr_idx >= 0 and c_argument_widens_to_optional(expr_idx)
 
-fn ir_collect_call_arg_regs(node: Node, start_idx: Int) -> List[Int]:
+# local_fn_positions lists the arguments, counted from start_idx, that land in
+# a parameter the callee only calls (see ir_record_closure_params).
+fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int]) -> List[Int]:
     mut arg_regs: List[Int] := []
     for child, i in node.children:
         if i < start_idx:
             continue
-        child_kind := node_kind(child)
-        if child_kind == "arg":
+        mut expr_idx := child
+        if node_kind(child) == "arg":
             cn := get_node(child)
-            if cn.children.len() > 0:
-                arg_regs.push(ir_emit_call_arg(cn.children[0]))
+            if cn.children.len() == 0:
+                continue
+            expr_idx = cn.children[0]
+        if local_fn_positions.contains(i - start_idx):
+            arg_regs.push(ir_emit_local_fn_arg(expr_idx))
         else:
-            arg_regs.push(ir_emit_call_arg(child))
+            arg_regs.push(ir_emit_call_arg(expr_idx))
     return arg_regs
 
 # owned string arguments (fresh chars from s[i], concat results, fresh
@@ -2838,6 +2953,9 @@ fn ir_release_owned_args(node: Node, start_idx: Int, arg_regs: List[Int]):
             if cn.children.len() == 0:
                 continue
             expr_idx = cn.children[0]
+        if ir_stack_closure_regs.contains(arg_regs[reg_i]):
+            reg_i = reg_i + 1
+            continue
         if ir_arg_release_is_skipped(expr_idx) == false:
             ir_release_owned_operand(expr_idx, arg_regs[reg_i], ir_infer_type(expr_idx))
         # a widened argument's register is a wrapper the operand release must
@@ -4030,7 +4148,9 @@ fn ir_closure_capture_tag(kind: String) -> Int:
         return 9
     return 0
 
-fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
+# a stack closure is never released, so it takes no count on what it
+# captures: `borrowed` stores every capture untagged.
+fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String], borrowed: Bool):
     for capture_name, i in captures:
         cap_val := ir_reg()
         # this reads the enclosing scope, so a captured loop variable has to
@@ -4050,7 +4170,7 @@ fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String]):
         mut cap_kind := ir_rc_kind(ir_lookup_name_type(capture_name))
         if ir_name_is_weak_read(capture_name):
             cap_kind = "weak"
-        if cap_kind.len() > 0:
+        if cap_kind.len() > 0 and not borrowed:
             ir_rc_retain_reg(cap_val, cap_kind)
             tag_r := ir_reg()
             ir_emit("iconst " + tag_r.to_string() + " " + ir_closure_capture_tag(cap_kind).to_string())
@@ -4819,7 +4939,7 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int], want_equal: Bool) -> 
     return r
 
 fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node: Node) -> Int:
-    arg_regs := ir_collect_call_arg_regs(node, 1)
+    arg_regs := ir_collect_call_arg_regs(node, 1, [])
     if arg_regs.len() < 2:
         return ir_zero_reg()
 
@@ -4860,12 +4980,23 @@ fn ir_emit_list_map_call(idx: Int, node: Node) -> Int:
 # drop once the loop is done. a borrowed one (a local or a struct field
 # holding the closure) belongs to that owner and must be left alone.
 fn ir_release_higher_order_fn_arg(fn_idx: Int, fn_r: Int):
-    if not ir_expr_is_borrowed(fn_idx):
+    if not ir_expr_is_borrowed(fn_idx) and not ir_stack_closure_regs.contains(fn_r):
         ir_rc_release_reg(fn_r, "closure")
+
+# a lambda literal handed to a callee that only calls it (an open-coded map,
+# filter or reduce, or a parameter ir_record_closure_params proved local)
+# never outlives this call, so it can be built in a stack slot.
+fn ir_emit_local_fn_arg(fn_idx: Int) -> Int:
+    ir_lambda_on_stack = get_node(fn_idx).kind == "lambda"
+    ir_lambda_borrows_captures = ir_lambda_on_stack
+    r := ir_expr(fn_idx)
+    ir_lambda_on_stack = false
+    ir_lambda_borrows_captures = false
+    return r
 
 fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
     list_r := ir_expr(list_idx)
-    mapper_r := ir_expr(mapper_idx)
+    mapper_r := ir_emit_local_fn_arg(mapper_idx)
     mapper_name := ir_temp_name("__map_fn")
     ir_emit("store " + mapper_name + " " + mapper_r.to_string())
 
@@ -4895,7 +5026,7 @@ fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
 
 fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
     list_r := ir_expr(list_idx)
-    keep_r := ir_expr(keep_idx)
+    keep_r := ir_emit_local_fn_arg(keep_idx)
     keep_name := ir_temp_name("__filter_fn")
     ir_emit("store " + keep_name + " " + keep_r.to_string())
 
@@ -4923,7 +5054,7 @@ fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
 fn ir_emit_list_reduce_lowering(idx: Int, list_idx: Int, init_idx: Int, reducer_idx: Int) -> Int:
     list_r := ir_expr(list_idx)
     init_r := ir_expr(init_idx)
-    reducer_r := ir_expr(reducer_idx)
+    reducer_r := ir_emit_local_fn_arg(reducer_idx)
     reducer_name := ir_temp_name("__reduce_fn")
     acc_name := ir_temp_name("__reduce_acc")
     ir_emit("store " + reducer_name + " " + reducer_r.to_string())
@@ -5173,7 +5304,7 @@ fn ir_emit_indirect_expr_call(idx: Int, node: Node, callee_idx: Int) -> Int:
     callee_r := ir_expr(callee_idx)
     tmp := ir_new_temp_name("__callee")
     ir_emit("store " + tmp + " " + callee_r.to_string())
-    arg_regs := ir_collect_call_arg_regs(node, 1)
+    arg_regs := ir_collect_call_arg_regs(node, 1, [])
     mut ret_kind := ir_function_return_kind(callee_idx)
     if ret_kind == "unknown":
         ret_kind = "int"
@@ -5284,8 +5415,9 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     struct_r := ir_static_struct_init_call(idx, node, callee.name)
     if struct_r >= 0:
         return struct_r
+    local_fn_positions := ir_local_closure_arg_positions(node, callee.name)
     callee = ir_specialize_static_callee(idx, node, callee, explicit_generic_types)
-    arg_regs := ir_collect_call_arg_regs(node, 1)
+    arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions)
     if callee.name == "Channel":
         ir_push_channel_ctor_args(arg_regs, explicit_generic_types)
 
@@ -7017,7 +7149,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
                 generic_ret_type = ir_infer_type(idx)
             mut no_explicit_types: List[String] := []
             call_name = ir_queue_generic_call(call_name, idx, no_explicit_types, generic_ret_type)
-        arg_regs := ir_collect_call_arg_regs(node, 1)
+        arg_regs := ir_collect_call_arg_regs(node, 1, [])
         mut r := ir_reg()
         uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(call_name, true), idx)
         ret_type := ir_call_retkind_for_name(idx, uses_result_abi, call_name)
@@ -7390,7 +7522,9 @@ fn ir_finish_lambda_emit(saved_builder: IrBuilderSnapshot, saved_vars: Map[Strin
 
 fn ir_emit_lambda(idx: Int) -> Int:
     on_stack := ir_lambda_on_stack
+    borrows_captures := ir_lambda_borrows_captures
     ir_lambda_on_stack = false
+    ir_lambda_borrows_captures = false
     # compile lambda body as a separate function
     lambda_name := "__lambda_" + ir_lambda_count.to_string()
     ir_lambda_count = ir_lambda_count + 1
@@ -7426,6 +7560,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_untracked_binds := ir_untracked_rc_binds
     saved_kinded_binds := ir_kinded_rc_binds
     saved_stack_closures := ir_stack_closure_names
+    saved_stack_closure_regs := ir_stack_closure_regs
     ir_rc_locals = []
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
@@ -7490,21 +7625,35 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_untracked_rc_binds = saved_untracked_binds
     ir_kinded_rc_binds = saved_kinded_binds
     ir_stack_closure_names = saved_stack_closures
+    ir_stack_closure_regs = saved_stack_closure_regs
     # return closure handle and fill captures. the prologue's check on what the
     # lambda reads stands in for the capture list, which is only known here;
     # the two are compared again so a disagreement falls back to the heap.
     r := ir_reg()
     # past 16 captures the env spills into a heap block, which a stack closure
     # would never free.
-    if on_stack and lambda_weak_caps.len() == 0 and parts.captures.len() <= 16 and ir_captures_uncounted(parts.captures):
+    mut stack_ok := ir_captures_uncounted(parts.captures)
+    if borrows_captures and ir_captures_are_frame_locals(parts.captures):
+        stack_ok = true
+    if on_stack and lambda_weak_caps.len() == 0 and parts.captures.len() <= 16 and stack_ok:
         ir_emit("closure_stack " + r.to_string() + " " + lambda_name)
+        ir_stack_closure_regs.push(r)
+        ir_emit_lambda_capture_setup(r, parts.captures, true)
     else:
         ir_emit("closure_ref " + r.to_string() + " " + lambda_name)
-    ir_emit_lambda_capture_setup(r, parts.captures)
+        ir_emit_lambda_capture_setup(r, parts.captures, false)
     # set after the body, so a lambda nested inside this one cannot leave its
     # own symbol here for the enclosing bind to pick up
     ir_last_lambda_symbol = lambda_name
     return r
+
+# a global could be reassigned by the callee while a borrowing closure holds
+# its old value, so only this frame's own names qualify.
+fn ir_captures_are_frame_locals(captures: List[String]) -> Bool:
+    for cap in captures:
+        if not ir_name_is_func_local(cap):
+            return false
+    return true
 
 fn ir_captures_uncounted(captures: List[String]) -> Bool:
     for cap in captures:
@@ -7547,7 +7696,7 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
 
     closure_r := ir_reg()
     ir_emit("closure_ref " + closure_r.to_string() + " " + wrapper_name)
-    ir_emit_lambda_capture_setup(closure_r, captures)
+    ir_emit_lambda_capture_setup(closure_r, captures, false)
     return closure_r
 
 # file a name this function frame binds. an empty name is what a binding
@@ -12049,6 +12198,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # FilterIter[Range, Int].next)
     ir_preregister_all_impl_specializations(root_idx, root)
     ir_record_borrow_params(root_idx)
+    ir_record_closure_params(root_idx)
     ir_emit_top_level_items(root_idx, root)
     ir_emit_generic_specializations()
     # per-instance destructors for generic structs built via a backend

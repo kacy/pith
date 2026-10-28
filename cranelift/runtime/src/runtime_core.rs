@@ -856,6 +856,11 @@ pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, 
     let Some(closure) = pith_closure_ref(handle) else {
         return;
     };
+    // a closure over plain values only (every spawn of `f(i, n)`, say) has no
+    // tagged slot: two word reads answer that without walking all sixteen
+    if closure.overflow.is_none() && closure.env_tags.iter().all(|&tag| tag == 0) {
+        return;
+    }
     for (value, tag) in closure.captures() {
         if value != 0 && tag != 0 {
             f(value, tag);
@@ -3388,11 +3393,9 @@ unsafe fn struct_pool_return(base: *mut u8, total: usize) -> bool {
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     use std::alloc::alloc_zeroed;
 
-    if crate::perf_stats_enabled() {
-        let bucket = &crate::perf::PERF_STRUCT_FIELDS[num_fields.clamp(0, 16) as usize];
-        crate::perf_record2(&crate::PERF_STRUCT_ALLOCS, 1, bucket, 1);
+    if crate::alloc_sites::diagnostics_on() {
+        struct_alloc_diagnostics(num_fields);
     }
-    crate::alloc_sites::record(crate::alloc_sites::STRUCT_KINDS[num_fields.clamp(0, 16) as usize]);
     let size = (num_fields.max(0) as usize) * 8;
     if size == 0 {
         return 0;
@@ -3429,6 +3432,18 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     let ptr = base.add(STRUCT_HEADER) as i64;
     crate::share::note_owner(ptr);
     ptr
+}
+
+/// The counters and the allocation census for one struct allocation, kept
+/// off the allocation path, which runs once per struct.
+#[cold]
+#[inline(never)]
+fn struct_alloc_diagnostics(num_fields: i64) {
+    let bucket = num_fields.clamp(0, 16) as usize;
+    if crate::perf_stats_enabled() {
+        crate::perf_record2(&crate::PERF_STRUCT_ALLOCS, 1, &crate::perf::PERF_STRUCT_FIELDS[bucket], 1);
+    }
+    crate::alloc_sites::record(crate::alloc_sites::STRUCT_KINDS[bucket]);
 }
 
 pub const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"

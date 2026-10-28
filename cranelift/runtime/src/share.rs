@@ -207,17 +207,31 @@ fn lock_owners() -> std::sync::MutexGuard<'static, Option<HashMap<usize, u64>>> 
 #[inline(always)]
 pub(crate) fn note_owner(ptr: i64) {
     if check_on() {
-        lock_owners().get_or_insert_with(HashMap::new).insert(ptr as usize, current_owner());
+        note_owner_slow(ptr);
     }
+}
+
+// the check mode's bookkeeping stays out of line: inlined into the
+// allocation and free paths it made every call save registers it never uses
+#[cold]
+#[inline(never)]
+fn note_owner_slow(ptr: i64) {
+    lock_owners().get_or_insert_with(HashMap::new).insert(ptr as usize, current_owner());
 }
 
 /// A struct was shared or freed: any task may touch it now, or none.
 #[inline(always)]
 pub(crate) fn forget_owner(ptr: i64) {
     if check_on() {
-        if let Some(owners) = lock_owners().as_mut() {
-            owners.remove(&(ptr as usize));
-        }
+        forget_owner_slow(ptr);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn forget_owner_slow(ptr: i64) {
+    if let Some(owners) = lock_owners().as_mut() {
+        owners.remove(&(ptr as usize));
     }
 }
 

@@ -42,6 +42,36 @@ fn probe() -> bool {
     true
 }
 
+// whether PITH_PERF_STATS or PITH_ALLOC_SITES asked for anything: the struct
+// allocation path checks this one settled byte and keeps both off its hot path.
+// 0 = not settled yet, 1 = neither, 2 = at least one.
+static DIAGNOSTICS: AtomicU8 = AtomicU8::new(0);
+
+#[cold]
+fn settle_diagnostics() -> bool {
+    let on = crate::perf_stats_enabled() || record_enabled();
+    DIAGNOSTICS.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    on
+}
+
+/// Whether the counters or the census want to hear about allocations.
+#[inline(always)]
+pub fn diagnostics_on() -> bool {
+    match DIAGNOSTICS.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => settle_diagnostics(),
+    }
+}
+
+fn record_enabled() -> bool {
+    match STATE.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => probe(),
+    }
+}
+
 /// Note one allocation of `kind`.
 #[inline(always)]
 pub fn record(kind: &'static str) {

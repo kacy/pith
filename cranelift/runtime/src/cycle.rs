@@ -246,7 +246,7 @@ pub extern "C" fn pith_cc_visit(child: i64, kind: i64) {
     }
     // no collector listening: the caller is walking for `share.rs`, which
     // drains the same per-thread buffer the collector's hook fills
-    TRACED_CHILDREN.with(|buffer| buffer.borrow_mut().push((child, kind)));
+    traced_children_push(child, kind);
     if cycle_gc_enabled() {
         CYCLE_VISITS_UNHOOKED.fetch_add(1, Ordering::Relaxed);
     }
@@ -262,14 +262,26 @@ pub(crate) unsafe fn struct_children(ptr: i64, f: &mut dyn FnMut(i64, u8)) {
     let Some(tracer) = tracer_for_dtor(dtor as usize) else {
         return;
     };
-    TRACED_CHILDREN.with(|buffer| buffer.borrow_mut().clear());
+    traced_children_take();
     // panic-guard: calling a compiler-emitted tracer twin registered beside its destructor.
     let trace: extern "C" fn(i64) = std::mem::transmute(tracer);
     trace(ptr);
-    let reported = TRACED_CHILDREN.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
-    for (child, kind) in reported {
+    for (child, kind) in traced_children_take() {
         f(child, kind as u8);
     }
+}
+
+// the buffer's touches behind calls of their own: the walk above runs a
+// tracer between them, and no frame that runs pith code may hold a
+// thread-local's address (tooling/check_tls_barriers.sh)
+#[inline(never)]
+fn traced_children_push(child: i64, kind: i64) {
+    TRACED_CHILDREN.with(|buffer| buffer.borrow_mut().push((child, kind)));
+}
+
+#[inline(never)]
+fn traced_children_take() -> Vec<(i64, i64)> {
+    TRACED_CHILDREN.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()))
 }
 
 // --- stop-the-world rendezvous --------------------------------------------

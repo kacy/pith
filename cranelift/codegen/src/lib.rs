@@ -83,6 +83,14 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
     flag_builder
         .set("opt_level", "speed")
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+    // start every function on a cache line. unaligned, a function's hot loop
+    // lands wherever the code before it happens to end, so growing an
+    // unrelated function moved tight_loop's loop across a line boundary and
+    // made it 50% slower with identical machine code. the runtime is aligned
+    // the same way (.cargo/config.toml).
+    flag_builder
+        .set("log2_min_function_alignment", "6")
+        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
     // macos links everything position-independent and its ld rejects text
     // relocations outright, so absolute addressing in the text section — what
     // cranelift emits by default — fails to link. the gnu toolchain accepts

@@ -45,6 +45,10 @@ fi
 allowed='pith_runtime::runtime_core::pool_slot_slow
 pith_runtime::runtime_core::tls_globals_get
 pith_runtime::runtime_core::tls_globals_set
+pith_runtime::runtime_core::take_thread_tls
+pith_runtime::cycle::traced_children_push
+pith_runtime::cycle::traced_children_take
+pith_runtime::share::thread_mark
 pith_runtime::cycle::mutator_slot
 pith_runtime::cycle::existing_mutator_slot
 pith_runtime::cycle::adopt_mutator_slot

@@ -172,9 +172,15 @@ impl ListImpl {
     /// can reach becomes reachable from them too (see `share.rs`).
     #[inline(always)]
     fn share_stored(&self, value: i64) {
-        if self.cycle_flags.load(std::sync::atomic::Ordering::Relaxed) & crate::share::CONTAINER_SHARED_FLAG != 0
-            && !matches!(self.type_tag, ListTypeTag::Primitive)
-        {
+        if self.cycle_flags.load(std::sync::atomic::Ordering::Relaxed) & crate::share::CONTAINER_SHARED_FLAG != 0 {
+            self.share_stored_slow(value);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn share_stored_slow(&self, value: i64) {
+        if !matches!(self.type_tag, ListTypeTag::Primitive) {
             unsafe { crate::share::share_value(value, self.type_tag) };
         }
     }

@@ -55,6 +55,12 @@ jobs:
       - name: regression corpus under green
         run: make verify-green-corpus-only
 
+      # a struct keeps plain counts until it can reach another task; this
+      # aborts any case where a task touched a struct it did not build without
+      # the struct having been marked shared
+      - name: shared-count check over the green corpus
+        run: make rc-check-only
+
       # the runner is linux, so every other step above already runs green by
       # default. this is the only step that exercises the PITH_GREEN=0 opt-out
       # across the corpus.

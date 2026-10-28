@@ -1214,6 +1214,13 @@ GREEN_CORPUS_EXPECTED := $(filter-out $(addprefix tests/expected/,$(addsuffix .t
 
 verify-green-corpus: build verify-green-corpus-only
 
+# the shared-count check (cranelift/runtime/src/share.rs): the green corpus and
+# the green-thread tests with PITH_RC_CHECK=1, which aborts a run the moment a
+# task updates the plain counts of a struct another task built. a value that
+# crossed to another task without being marked shared shows up here.
+rc-check-only:
+	@PITH_RC_CHECK=1 $(MAKE) --no-print-directory verify-green-corpus-only green-tests
+
 verify-green-corpus-only:
 	@echo "--- regression corpus under the green backend (default + 1 worker) ---"
 	@pass=0; fail=0; skip=0; \
@@ -1381,6 +1388,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_stack_closure_arg \
 	tests/cases/test_fn_arg_specialization \
 	tests/cases/test_select_send_count \
+	tests/cases/test_shared_marking \
 	tests/cases/test_task_result_payloads \
 	tests/cases/test_struct_closure_field tests/cases/test_generic_struct_field_dtor \
 	tests/cases/test_generic_instance_dtor \

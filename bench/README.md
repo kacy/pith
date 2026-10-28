@@ -800,23 +800,25 @@ zig run with suspicion.
 here lacks: eight tasks do genuinely parallel arithmetic in chunks and,
 between chunks, report to one collector task and wait for its
 acknowledgement, so the work spreads across cores while every chunk still
-ends in a real handoff. it exists to measure `PITH_GREEN_MIGRATE=1`, which
-moves a woken task to the worker that woke it: on the fan-out and ping-pong
-benches that is a pure win, and on this one it pulls the compute tasks onto
-the collector's worker and gives part of the 2-worker speedup back. the
-checksum must match across arms.
+ends in a real handoff. it was written to measure moving a woken task to the
+worker that woke it: on the fan-out and ping-pong benches that is a pure win,
+and on this one it pulled the compute tasks onto the collector's worker and
+gave part of the speedup back, until idle workers could take queued tasks off
+a busy peer. the checksum must match across arms.
 
 ```
 pith build bench/cpu_parallel_sync.pith
 PITH_GREEN_WORKERS=1 ./bench/cpu_parallel_sync 200 20000
 PITH_GREEN_MIGRATE=0 ./bench/cpu_parallel_sync 200 20000
-PITH_GREEN_MIGRATE=1 ./bench/cpu_parallel_sync 200 20000
+./bench/cpu_parallel_sync 200 20000
 ```
 
-on 2026-09-06, medians of 5 interleaved rounds: 448 ms at 1 worker, 259 ms
-at 2 workers with the flag off (247-305), 337 ms with it on (230-402), with
-`PITH_PERF_STATS=1` showing ~280 migrations a run. that is why the flag was
-not made the default.
+on 2026-09-06, medians of 5 interleaved rounds on a 2-core box: 448 ms at 1
+worker, 259 ms at 2 workers with migration off (247-305), and 337 ms with it
+on (230-402). that is why migration was not made the default then. on
+2026-10-28, with idle workers taking queued tasks off a busy peer, 16 workers
+on a 9950X ran `200 1000000` in 911 ms with migration off and 655 ms with it
+on (5042 ms on one worker).
 
 on 2026-09-13 the ordering had reversed: 404 ms at 1 worker (403-405), 327
 with the flag off (228-364), **241 with it on** (223-370), nine rounds

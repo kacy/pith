@@ -48,18 +48,20 @@
 //! on afterwards (see the accessor block above `current_task`). so a
 //! suspended coroutine may, in principle, resume on any worker.
 //!
-//! what the scheduler does with that is a policy. by default a task
-//! **pins**: the first worker to resume it becomes its `owner`, it is never
-//! stealable again, and every wake re-enqueues it onto the owner's private
-//! `pinned` queue, so a coroutine carrying live stack is only ever touched by
-//! one worker. with `PITH_GREEN_MIGRATE=1` a worker that wakes a task parked
-//! on another worker takes it over in the same CAS that claims it (see
-//! `claim_parked`), so a pair of tasks that talk to each other converge onto
-//! one worker instead of paying a cross-thread wake per message. either way a
+//! what the scheduler does with that is a policy. the first worker to resume
+//! a task becomes its `owner`, and a wake enqueues it on the owner's `pinned`
+//! queue. a worker that wakes a task parked on another worker takes it over in
+//! the same CAS that claims it (see `claim_parked`), so a pair of tasks that
+//! talk to each other converge onto one worker instead of paying a
+//! cross-thread wake per message (`PITH_GREEN_MIGRATE=0` turns that off). an
+//! idle worker may also take a task off a peer's pinned queue when that peer
+//! has been inside one long task for a while (see `steal_pinned`), so work
+//! that converged onto one worker spreads out again. in every case a
 //! coroutine changes threads only while it is off-CPU and claimed by exactly
-//! one thread — fresh and stealable, or `Parked` and claimed by its waker —
-//! and that hand-over is what makes the `unsafe impl Send for SendCoroutine`
-//! sound; see the type doc.
+//! one thread: fresh and stealable, `Parked` and claimed by its waker, or
+//! `Ready` and popped from a pinned queue under its lock. that hand-over is
+//! what makes the `unsafe impl Send for SendCoroutine` sound; see the type
+//! doc.
 //!
 //! ## synchronization model
 //!
@@ -79,12 +81,14 @@
 //!   coroutine among them) from waker to worker without a lock — see the claim
 //!   protocol on `SyncBlock`.
 //! - each worker owns three run queues: a `local` queue of fresh, stealable
-//!   tasks; a `pinned` queue of woken started tasks that only the owner drains;
+//!   tasks; a `pinned` queue of woken started tasks that the owner drains and
+//!   an idle peer may steal from when the owner is stuck in one long task;
 //!   and a `deferred` queue of *preempted* started tasks (P5), also owner-only but
 //!   drained at the lowest priority. a global injector receives fresh spawns from
 //!   non-worker threads (e.g. `main`). an idle worker checks pinned, then local,
-//!   then injector, then steals from a random peer's *local* queue, and only if
-//!   all of that is empty does it resume a `deferred` (preempted) task — so a
+//!   then injector, then steals from a random peer's *local* queue, then from a
+//!   busy peer's *pinned* queue, and only if all of that is empty does it
+//!   resume a `deferred` (preempted) task — so a
 //!   compute hog that overran its quantum yields to every other ready task before
 //!   it runs again. a worker that never runs dry still serves one deferred task
 //!   every `POLL_EVERY` tasks, so a preempted task waits a bounded number of
@@ -1097,6 +1101,9 @@ struct Worker {
     /// slot before refilling it, so displacement alone never fires for it). one
     /// mutex covers both so the displace-and-push is a single atomic step.
     pinned: Mutex<PinnedQueue>,
+    /// the length of `pinned`'s fifo, mirrored so an idle peer can pass over a
+    /// worker with nothing to steal without taking its lock.
+    pinned_fifo: AtomicUsize,
     /// preempted started tasks pinned to this worker, drained at the *lowest*
     /// priority (after pinned, local, injector, and stealing). a compute task that
     /// overran its quantum lands here so it yields to every other ready task on the
@@ -1134,6 +1141,9 @@ struct Worker {
     /// task. the monitor and `pith_green_maybe_yield` compare it against the
     /// current epoch to detect a quantum overrun.
     running_since: AtomicU64,
+    /// how many tasks this worker has resumed. only the worker writes it; a
+    /// peer that sees it stand still knows the worker is inside one long task.
+    resumes: AtomicU64,
 }
 
 /// the whole green runtime: the task slab, the per-worker queues + park spots,
@@ -1153,9 +1163,9 @@ struct Scheduler {
     /// fan-out across the pool one worker at a time. this is go's spinning-M
     /// protocol.
     searching: CacheLine<AtomicUsize>,
-    /// `PITH_GREEN_MIGRATE=1`: a worker that wakes a task parked on another
-    /// worker takes it over (see `claim_parked`). read once, here, so the
-    /// wake path pays one load to consult it.
+    /// a worker that wakes a task parked on another worker takes it over (see
+    /// `claim_parked`); `PITH_GREEN_MIGRATE=0` turns that off. read once,
+    /// here, so the wake path pays one load to consult it.
     migrate: bool,
     /// either stats switch is on, so a claimed wake is categorized
     /// (`note_wake`). folded into one flag here for the same reason.
@@ -1393,16 +1403,16 @@ pub(crate) fn wake(id: TaskId) {
 /// task was not parked: still `Running` (the pending flag is set so the yield
 /// arm re-enqueues it), already `Ready`, or `Done`.
 ///
-/// by default the task goes back to its owner, the first worker that ran it.
-/// with migration on (`PITH_GREEN_MIGRATE=1`, read once into the scheduler),
-/// a worker that wakes a task pinned to a different worker takes it: the
+/// with migration on (the default, read once into the scheduler), a worker
+/// that wakes a task pinned to a different worker takes it: the
 /// owner bits are rewritten in the claiming CAS, so from the moment the task
 /// is `Ready` every reader of the word — the enqueue below, the resume that
 /// follows, the next wake — agrees on the new home. a pair of tasks that talk
 /// to each other converge onto one worker after the first exchange, and stay
 /// there: a wake from the same worker moves nothing. a waker that is not a
 /// worker (`main`, a blocking-pool thread) has nowhere to take the task and
-/// leaves the owner alone.
+/// leaves the owner alone. with `PITH_GREEN_MIGRATE=0` the task always goes
+/// back to its owner.
 ///
 /// this is only sound because nothing on the resumable path derives a value
 /// from the thread the task parked on — see the accessor block above
@@ -1640,12 +1650,14 @@ fn scheduler() -> &'static Scheduler {
             .map(|_| Worker {
                 local: StealQueue::default(),
                 pinned: Mutex::new(PinnedQueue::default()),
+                pinned_fifo: AtomicUsize::new(0),
                 deferred: Mutex::new(VecDeque::new()),
                 stacks: Mutex::new(Vec::new()),
                 parked: AtomicBool::new(false),
                 search_token: AtomicBool::new(false),
                 running_task: AtomicUsize::new(0),
                 running_since: AtomicU64::new(0),
+                resumes: AtomicU64::new(0),
             })
             .collect();
         Scheduler {
@@ -1660,14 +1672,13 @@ fn scheduler() -> &'static Scheduler {
     })
 }
 
-/// `PITH_GREEN_MIGRATE=1` moves a parked task to the worker that wakes it
-/// instead of sending it back to the worker that first ran it. off by
-/// default: see the placement note in `docs/concurrency.md` for what it does
-/// to a pipeline and why it is a flag rather than the default.
+/// whether a parked task moves to the worker that wakes it instead of going
+/// back to the worker that first ran it. on unless `PITH_GREEN_MIGRATE` is
+/// `0` or `false`; see the placement note in `docs/concurrency.md`.
 fn migration_on() -> bool {
     std::env::var("PITH_GREEN_MIGRATE")
-        .map(|v| v == "1" || v == "true")
-        .unwrap_or(false)
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true)
 }
 
 /// how many worker threads to run. defaults to `available_parallelism` (floor
@@ -1849,8 +1860,7 @@ fn any_stealable() -> bool {
 /// wake the pool. this is the only path a task that has already resumed takes
 /// back into scheduling, and it always targets the owner recorded in the
 /// task's word — which is the worker that first ran it, or, with migration
-/// on, the worker whose wake just claimed it (see `claim_parked`). the pinned
-/// queue is not stolen from.
+/// on, the worker whose wake just claimed it (see `claim_parked`).
 fn enqueue_woken(owner: usize, id: TaskId) {
     let sched = scheduler();
     {
@@ -1878,9 +1888,11 @@ fn enqueue_woken(owner: usize, id: TaskId) {
         } else {
             pinned.push(id);
         }
+        sched.workers[owner].pinned_fifo.store(pinned.queue.len(), AtomicOrdering::Relaxed);
     }
-    // a pinned task can only ever run on its owner, and only the owner drains its
-    // pinned queue — so nudge *only* the owner. if the owner is busy the notify is
+    // nudge *only* the owner. a peer steals from a pinned queue only once the
+    // owner has been stuck in one task, so waking one here would mostly find
+    // nothing to take. if the owner is busy the notify is
     // a cheap no-op (no waiter), and it never wakes an idle peer that has nothing
     // to run. that is the locality lever: on a single-connection pipeline whose
     // tasks all pin to one worker, the other worker now stays parked instead of
@@ -1954,7 +1966,7 @@ fn note_notify() {
 /// and compiled out in release.
 ///
 /// history worth keeping: re-homing a parked task to the worker that wakes it
-/// (now `PITH_GREEN_MIGRATE=1`) was first tried before the runtime's own rust
+/// (now the default, see `claim_parked`) was first tried before the runtime's own rust
 /// frames stopped holding thread-local addresses across a suspend, and it
 /// silently dropped channel messages. the coroutine stack was never the
 /// problem and neither was the pith compiler (a `threadlocal` global lowers
@@ -1996,13 +2008,13 @@ fn find_work(index: usize, deferred_first: bool) -> Option<TaskId> {
     }
 
     // pinned first: these are woken tasks this worker must resume itself.
-    if let Some(id) = sched.workers[index]
-        .pinned
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pop()
     {
-        return Some(id);
+        let worker = &sched.workers[index];
+        let mut pinned = worker.pinned.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(id) = pinned.pop() {
+            worker.pinned_fifo.store(pinned.queue.len(), AtomicOrdering::Relaxed);
+            return Some(id);
+        }
     }
 
     // own local queue (stealable): pop into a local so the queue lock is released
@@ -2039,11 +2051,75 @@ fn find_work(index: usize, deferred_first: bool) -> Option<TaskId> {
         }
     }
 
+    // then a started task waiting behind a peer that is busy with another.
+    for k in 0..n {
+        let victim = (start + k) % n;
+        if victim != index {
+            if let Some(id) = steal_pinned(victim, index) {
+                return Some(id);
+            }
+        }
+    }
+
     // deferred last: only resume a preempted compute task once there is genuinely
     // nothing else — no owned woken work, no fresh work anywhere to run or steal.
     // this is what lets the other tasks on this worker make progress before the
     // hog runs again.
     pop_deferred(index)
+}
+
+/// how long a thief watches a peer before taking a task off its pinned fifo.
+/// a peer that resumes anything in this window is getting through its queue,
+/// and taking from it would split a pipeline that runs best on one worker.
+const PIN_STEAL_WAIT: Duration = Duration::from_micros(20);
+
+/// take the oldest task off `victim`'s pinned fifo and make worker `thief` its
+/// owner, if the victim has been inside one task for `PIN_STEAL_WAIT`. the
+/// affinity slot is left alone: it holds the other half of a handoff the
+/// victim resumes next.
+///
+/// a task in a pinned queue is `Ready` and held by that queue alone (a waker
+/// that reads `Ready` changes nothing), so popping it under the victim's lock
+/// gives this thread the only right to rewrite its owner. that is the same
+/// hand-over a migrating wake makes in `claim_parked`.
+fn steal_pinned(victim: usize, thief: usize) -> Option<TaskId> {
+    let worker = &scheduler().workers[victim];
+    if worker.pinned_fifo.load(AtomicOrdering::Relaxed) == 0 {
+        return None;
+    }
+    let before = worker.resumes.load(AtomicOrdering::Relaxed);
+    let deadline = Instant::now() + PIN_STEAL_WAIT;
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
+        if worker.resumes.load(AtomicOrdering::Relaxed) != before {
+            return None;
+        }
+    }
+    if worker.running_task.load(AtomicOrdering::Relaxed) == 0 {
+        return None;
+    }
+    let id = {
+        let mut pinned = worker.pinned.lock().unwrap_or_else(|p| p.into_inner());
+        let id = pinned.queue.pop_front()?;
+        worker.pinned_fifo.store(pinned.queue.len(), AtomicOrdering::Relaxed);
+        id
+    };
+    if let Some(block) = sync_block(id) {
+        let mut word = block.word.load(AtomicOrdering::Acquire);
+        while word & S_STATE_MASK == S_READY {
+            let next = (word & !S_OWNER_MASK) | owner_bits(thief);
+            match block.word.compare_exchange_weak(
+                word,
+                next,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => word = current,
+            }
+        }
+    }
+    Some(id)
 }
 
 /// take the oldest preempted task off worker `index`'s deferred queue.
@@ -2152,11 +2228,12 @@ fn spin_for_work(index: usize) -> bool {
 /// must consider exactly the same sources: this worker's own pinned queue, its
 /// own local queue, the injector, and any peer's *local* (stealable) queue.
 ///
-/// it must NOT count a *peer's pinned* queue: a pinned task only ever runs on
-/// its owner, so peer-pinned work this worker can never reach would otherwise
-/// keep it falsely "busy" — spinning through `find_work` and re-checking here
-/// instead of parking. that false-busy spin (a worker kept awake by the other
-/// worker's pinned pipeline) was a large part of why two workers lost to one.
+/// it must NOT count a *peer's pinned* queue. `find_work` can steal from one,
+/// but only from a peer stuck in one long task; counting the queue here kept
+/// every idle worker spinning beside a busy pipeline instead of parking. on
+/// the channel fan-out benchmark that took 20 times the CPU for the same
+/// wall time. an idle worker still looks at peers' pinned queues on each
+/// pass through `find_work` before it parks.
 fn has_any_work(index: usize) -> bool {
     let sched = scheduler();
     // own pinned first — the woken work this worker must resume itself.
@@ -2449,6 +2526,8 @@ fn run_task(id: TaskId) {
         worker
             .running_task
             .store(id + 1, AtomicOrdering::Relaxed);
+        let resumes = worker.resumes.load(AtomicOrdering::Relaxed);
+        worker.resumes.store(resumes + 1, AtomicOrdering::Relaxed);
     }
 
     // run outside the lock. SAFETY of the transmute-and-call lives inside the
@@ -3449,6 +3528,54 @@ mod tests {
             S_DONE
         );
 
+        set_current_worker(None);
+    }
+
+    // a task woken onto a busy owner's pinned fifo can be taken by an idle
+    // peer, which becomes its owner. an owner that is not running anything is
+    // left alone, since it is about to drain the queue itself.
+    #[test]
+    fn idle_peer_steals_from_a_busy_owners_pinned_queue() {
+        let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        if scheduler().workers.len() < 2 {
+            return;
+        }
+        set_current_worker(Some(0));
+        let owner = &scheduler().workers[0];
+        while owner.pinned.lock().unwrap_or_else(|p| p.into_inner()).pop().is_some() {}
+
+        let coro = TaskCoroutine::with_stack(
+            corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+            move |yielder: &TaskYielder, _input: ()| -> i64 {
+                publish_yielder(yielder as *const TaskYielder);
+                park_current(current_task().expect("test body runs inside a task"));
+                34
+            },
+        );
+        let id = push_ready_task(coro, fresh_join());
+        run_task(id);
+
+        // a wake from outside the pool keeps the owner and goes on the fifo.
+        set_current_worker(None);
+        wake(id);
+        let block = sync_block(id).unwrap();
+        assert_eq!(word_owner(block.word.load(AtomicOrdering::Acquire)), Some(0));
+        assert_eq!(owner.pinned_fifo.load(AtomicOrdering::Relaxed), 1);
+
+        owner.running_task.store(0, AtomicOrdering::Relaxed);
+        assert_eq!(steal_pinned(0, 1), None, "an idle owner drains its own queue");
+
+        owner.running_task.store(usize::MAX, AtomicOrdering::Relaxed);
+        assert_eq!(steal_pinned(0, 1), Some(id));
+        owner.running_task.store(0, AtomicOrdering::Relaxed);
+        assert_eq!(owner.pinned_fifo.load(AtomicOrdering::Relaxed), 0);
+        let word = block.word.load(AtomicOrdering::Acquire);
+        assert_eq!(word & S_STATE_MASK, S_READY);
+        assert_eq!(word_owner(word), Some(1), "the thief owns the task now");
+
+        set_current_worker(Some(1));
+        run_task(id);
+        assert_eq!(lock_slab(id).get(id).unwrap().result, 34);
         set_current_worker(None);
     }
 }

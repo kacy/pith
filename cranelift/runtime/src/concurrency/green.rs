@@ -799,7 +799,8 @@ const STACK_SIZE: usize = 1024 * 1024;
 /// keep whatever pages the previous task dirtied — same-process memory, and the
 /// coroutine's setup overwrites what it uses, so stale bytes are inert.
 const STACK_POOL_MAX: usize = 64;
-static STACK_POOL: Mutex<Vec<corosensei::stack::DefaultStack>> = Mutex::new(Vec::new());
+static STACK_POOL: CacheLine<Mutex<Vec<corosensei::stack::DefaultStack>>> =
+    CacheLine(Mutex::new(Vec::new()));
 
 /// how many stacks each worker keeps for itself before returning them to the
 /// shared `STACK_POOL`. a spawn takes a stack and a finish returns one, so with
@@ -1077,6 +1078,10 @@ impl StealQueue {
     }
 }
 
+/// aligned so that two workers never share a cache line: peers lock a
+/// worker's queues to steal from it, and without the alignment each of those
+/// locks evicted the neighbouring worker's queues as well.
+#[repr(align(64))]
 struct Worker {
     /// fresh, never-resumed tasks. stealable by peers because a fresh coroutine
     /// carries no live stack (see the pinning note).
@@ -1139,7 +1144,7 @@ struct Scheduler {
     /// the scheduling-word section).
     sync: SyncArena,
     workers: Vec<Worker>,
-    injector: StealQueue,
+    injector: CacheLine<StealQueue>,
     /// workers looking for fresh work in other workers' queues. a fresh spawn
     /// wakes a parked worker only while this is zero, and the woken worker
     /// starts out counted here, so a burst of spawns wakes one worker rather
@@ -1147,7 +1152,7 @@ struct Scheduler {
     /// more worker if work is left (see `stop_searching`), which spreads a
     /// fan-out across the pool one worker at a time. this is go's spinning-M
     /// protocol.
-    searching: AtomicUsize,
+    searching: CacheLine<AtomicUsize>,
     /// `PITH_GREEN_MIGRATE=1`: a worker that wakes a task parked on another
     /// worker takes it over (see `claim_parked`). read once, here, so the
     /// wake path pays one load to consult it.
@@ -1159,7 +1164,21 @@ struct Scheduler {
 
 /// the scheduler is built lazily on the first green spawn so a process that
 /// never spawns pays nothing (and, importantly, does not start worker threads).
-static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
+static SCHEDULER: CacheLine<OnceLock<Scheduler>> = CacheLine(OnceLock::new());
+
+/// a static on a cache line of its own. the linker packs statics together, so
+/// without this a lock taken on every few spawns can share a line with a value
+/// every worker reads, and each lock then evicts that line from every core.
+#[repr(align(64))]
+#[derive(Default)]
+struct CacheLine<T>(T);
+
+impl<T> std::ops::Deref for CacheLine<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
 
 thread_local! {
     /// set to `Some(i)` on worker thread `i`; `None` on any other thread. green
@@ -1633,8 +1652,8 @@ fn scheduler() -> &'static Scheduler {
             slab: (0..SLAB_SHARDS).map(|i| SlabShard(Mutex::new(Slab::new(i)))).collect(),
             sync: SyncArena::new(),
             workers,
-            injector: StealQueue::default(),
-            searching: AtomicUsize::new(0),
+            injector: CacheLine::default(),
+            searching: CacheLine(AtomicUsize::new(0)),
             migrate: migration_on(),
             wake_stats: stats_on() || crate::perf_stats_enabled(),
         }

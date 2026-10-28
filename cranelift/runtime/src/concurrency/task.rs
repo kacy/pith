@@ -259,6 +259,8 @@ impl Slab {
 /// `PITH_GREEN` flag without the compiler ever caring which one runs.
 #[no_mangle]
 pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
+    // what the new task captured is reachable from two tasks from here on
+    crate::share::share_value(closure_handle, crate::collections::list::ListTypeTag::Closure);
     crate::concurrency::scheduler::spawn(closure_handle)
 }
 

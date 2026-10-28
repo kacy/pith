@@ -244,8 +244,31 @@ pub extern "C" fn pith_cc_visit(child: i64, kind: i64) {
         visit(child, kind);
         return;
     }
+    // no collector listening: the caller is walking for `share.rs`, which
+    // drains the same per-thread buffer the collector's hook fills
+    TRACED_CHILDREN.with(|buffer| buffer.borrow_mut().push((child, kind)));
     if cycle_gc_enabled() {
         CYCLE_VISITS_UNHOOKED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The children a struct's tracer reports, weak fields included (kind 8), for
+/// the shared-marking walk. A struct without a tracer reports none.
+pub(crate) unsafe fn struct_children(ptr: i64, f: &mut dyn FnMut(i64, u8)) {
+    let dtor = crate::runtime_core::cycle_struct_dtor_slot(ptr);
+    if dtor == 0 {
+        return;
+    }
+    let Some(tracer) = tracer_for_dtor(dtor as usize) else {
+        return;
+    };
+    TRACED_CHILDREN.with(|buffer| buffer.borrow_mut().clear());
+    // panic-guard: calling a compiler-emitted tracer twin registered beside its destructor.
+    let trace: extern "C" fn(i64) = std::mem::transmute(tracer);
+    trace(ptr);
+    let reported = TRACED_CHILDREN.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
+    for (child, kind) in reported {
+        f(child, kind as u8);
     }
 }
 
@@ -1350,6 +1373,7 @@ pub(crate) static CYCLE_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(test)]
 pub(crate) fn force_enabled_for_tests(enabled: bool) {
     CYCLE_GC_STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+    crate::share::reset_mode();
 }
 
 #[cfg(test)]

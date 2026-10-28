@@ -402,9 +402,30 @@ fn observed_total(buckets: List[AtomicInt], overflow: AtomicInt) -> Int:
 # which keeps the documented rule that a reset needs fresh instruments.
 mut registry_epoch := AtomicInt(0)
 threadlocal mut cache_epoch: Int := 0 - 1
-threadlocal mut counter_cache: Map[String, Series] := {}
-threadlocal mut gauge_cache: Map[String, Series] := {}
-threadlocal mut histogram_cache: Map[String, HistSeries] := {}
+# the caches hold the instruments themselves: an instrument never changes once
+# built, so every lookup can hand back the same one instead of a new struct.
+threadlocal mut counter_cache: Map[String, Counter] := {}
+threadlocal mut gauge_cache: Map[String, Gauge] := {}
+threadlocal mut histogram_cache: Map[String, Histogram] := {}
+# the same instruments again, by bare name and then by the label list exactly
+# as a caller wrote it (raw_label_key), so a repeat `labels(pairs)` call skips
+# building the canonical key: sorting the names, escaping the values and the
+# concatenation cost several allocations a write, where this key is one join.
+threadlocal mut counter_raw_cache: Map[String, Map[String, Counter]] := {}
+threadlocal mut gauge_raw_cache: Map[String, Map[String, Gauge]] := {}
+threadlocal mut histogram_raw_cache: Map[String, Map[String, Histogram]] := {}
+
+# the label list joined by a separator no label is expected to hold, or ""
+# when one does hold it: two different lists could then join to the same key,
+# so those calls take the canonical path every time.
+fn raw_label_key(pairs: List[String]) -> String:
+    sep := chr(1)
+    if pairs.len() == 0:
+        return sep
+    for p in pairs:
+        if p.contains(sep):
+            return ""
+    return pairs.join(sep)
 
 fn sync_cache():
     epoch := registry_epoch.load()
@@ -412,33 +433,38 @@ fn sync_cache():
         counter_cache.clear()
         gauge_cache.clear()
         histogram_cache.clear()
+        counter_raw_cache.clear()
+        gauge_raw_cache.clear()
+        histogram_raw_cache.clear()
         cache_epoch = epoch
 
 fn resolve_counter(key: String, bare: String, pairs: List[String]) -> Counter:
     sync_cache()
     if counter_cache.contains_key(key):
-        return counter_instrument(counter_cache[key])
+        return counter_cache[key]
     s := shard_of(key)
     shard_mu[s].lock()
     if not counter_series[s].contains_key(key):
         counter_series[s].insert(key, new_series(key, bare, pairs))
     found := counter_series[s][key]
     shard_mu[s].unlock()
-    counter_cache.insert(key, found)
-    return counter_instrument(found)
+    made := counter_instrument(found)
+    counter_cache.insert(key, made)
+    return made
 
 fn resolve_gauge(key: String, bare: String, pairs: List[String]) -> Gauge:
     sync_cache()
     if gauge_cache.contains_key(key):
-        return gauge_instrument(gauge_cache[key])
+        return gauge_cache[key]
     s := shard_of(key)
     shard_mu[s].lock()
     if not gauge_series[s].contains_key(key):
         gauge_series[s].insert(key, new_series(key, bare, pairs))
     found := gauge_series[s][key]
     shard_mu[s].unlock()
-    gauge_cache.insert(key, found)
-    return gauge_instrument(found)
+    made := gauge_instrument(found)
+    gauge_cache.insert(key, made)
+    return made
 
 # find or create a histogram series. a series that already exists is one lock
 # and two map reads; only the first sight of one needs the boundaries, which
@@ -449,15 +475,16 @@ fn resolve_gauge(key: String, bare: String, pairs: List[String]) -> Gauge:
 fn resolve_histogram(key: String, bare: String, pairs: List[String]) -> Histogram:
     sync_cache()
     if histogram_cache.contains_key(key):
-        return histogram_instrument(histogram_cache[key])
+        return histogram_cache[key]
     s := shard_of(key)
     shard_mu[s].lock()
     known := histogram_series[s].contains_key(key)
     if known:
         found := histogram_series[s][key]
         shard_mu[s].unlock()
-        histogram_cache.insert(key, found)
-        return histogram_instrument(found)
+        made := histogram_instrument(found)
+        histogram_cache.insert(key, made)
+        return made
     shard_mu[s].unlock()
     bounds := buckets_for(bare)
     shard_mu[s].lock()
@@ -465,8 +492,9 @@ fn resolve_histogram(key: String, bare: String, pairs: List[String]) -> Histogra
         histogram_series[s].insert(key, new_hist_series(key, bare, pairs, bounds))
     created := histogram_series[s][key]
     shard_mu[s].unlock()
-    histogram_cache.insert(key, created)
-    return histogram_instrument(created)
+    made := histogram_instrument(created)
+    histogram_cache.insert(key, made)
+    return made
 
 fn same_bounds(a: List[Float], b: List[Float]) -> Bool:
     if a.len() != b.len():
@@ -608,16 +636,31 @@ pub fn reset():
 # create or reopen a counter by name.
 pub fn counter(name: String) -> Counter:
     normalized := normalize_metric_name(name)
+    # a cached instrument needs no label list, so the empty one is only built
+    # on a miss
+    sync_cache()
+    if counter_cache.contains_key(normalized):
+        return counter_cache[normalized]
     return resolve_counter(normalized, normalized, [])
 
 # create or reopen a gauge by name.
 pub fn gauge(name: String) -> Gauge:
     normalized := normalize_metric_name(name)
+    # a cached instrument needs no label list, so the empty one is only built
+    # on a miss
+    sync_cache()
+    if gauge_cache.contains_key(normalized):
+        return gauge_cache[normalized]
     return resolve_gauge(normalized, normalized, [])
 
 # create or reopen a histogram by name.
 pub fn histogram(name: String) -> Histogram:
     normalized := normalize_metric_name(name)
+    # a cached instrument needs no label list, so the empty one is only built
+    # on a miss
+    sync_cache()
+    if histogram_cache.contains_key(normalized):
+        return histogram_cache[normalized]
     return resolve_histogram(normalized, normalized, [])
 
 impl Counter:
@@ -633,7 +676,17 @@ impl Counter:
     # a counter for this metric with the given label set. pairs is [k1,v1,k2,v2,
     # ...]; each distinct set is its own series. requests.labels(["route","/api"]).
     fn labels(pairs: List[String]) -> Counter:
-        return resolve_counter(make_series_key(self.bare, pairs), self.bare, pairs)
+        raw := raw_label_key(pairs)
+        if raw.len() > 0:
+            sync_cache()
+            if counter_raw_cache.contains_key(self.bare) and counter_raw_cache[self.bare].contains_key(raw):
+                return counter_raw_cache[self.bare][raw]
+        found := resolve_counter(make_series_key(self.bare, pairs), self.bare, pairs)
+        if raw.len() > 0:
+            if not counter_raw_cache.contains_key(self.bare):
+                counter_raw_cache.insert(self.bare, {})
+            counter_raw_cache[self.bare].insert(raw, found)
+        return found
 
     # attach help text and a unit to this metric (renders as a prometheus
     # `# HELP` line and fills OTLP description/unit). chainable; first call wins.
@@ -653,7 +706,17 @@ impl Gauge:
 
     # a gauge for this metric with the given label set (see Counter.labels).
     fn labels(pairs: List[String]) -> Gauge:
-        return resolve_gauge(make_series_key(self.bare, pairs), self.bare, pairs)
+        raw := raw_label_key(pairs)
+        if raw.len() > 0:
+            sync_cache()
+            if gauge_raw_cache.contains_key(self.bare) and gauge_raw_cache[self.bare].contains_key(raw):
+                return gauge_raw_cache[self.bare][raw]
+        found := resolve_gauge(make_series_key(self.bare, pairs), self.bare, pairs)
+        if raw.len() > 0:
+            if not gauge_raw_cache.contains_key(self.bare):
+                gauge_raw_cache.insert(self.bare, {})
+            gauge_raw_cache[self.bare].insert(raw, found)
+        return found
 
     # attach help text and a unit to this metric (see Counter.describe).
     fn describe(help: String, unit: String) -> Gauge:
@@ -729,7 +792,17 @@ impl Histogram:
 
     # a histogram for this metric with the given label set (see Counter.labels).
     fn labels(pairs: List[String]) -> Histogram:
-        return resolve_histogram(make_series_key(self.bare, pairs), self.bare, pairs)
+        raw := raw_label_key(pairs)
+        if raw.len() > 0:
+            sync_cache()
+            if histogram_raw_cache.contains_key(self.bare) and histogram_raw_cache[self.bare].contains_key(raw):
+                return histogram_raw_cache[self.bare][raw]
+        found := resolve_histogram(make_series_key(self.bare, pairs), self.bare, pairs)
+        if raw.len() > 0:
+            if not histogram_raw_cache.contains_key(self.bare):
+                histogram_raw_cache.insert(self.bare, {})
+            histogram_raw_cache[self.bare].insert(raw, found)
+        return found
 
     # attach help text and a unit to this metric (see Counter.describe).
     fn describe(help: String, unit: String) -> Histogram:
@@ -977,6 +1050,31 @@ test "labels create independent series and render with a shared TYPE line":
     # one TYPE line for the metric, one line per series with sorted labels
     assert(text.contains("# TYPE http_requests_total counter"))
     assert(text.contains("http_requests_total" + chr(123) + "method=" + chr(34) + "GET" + chr(34) + ",route=" + chr(34) + "/api" + chr(34) + chr(125) + " 3"))
+
+test "a repeated label list reuses its series, in any spelling":
+    reset()
+    reqs := counter("cached_requests")
+    mut i := 0
+    while i < 3:
+        reqs.labels(["route", "/api", "method", "GET"]).inc()
+        reqs.labels(["method", "GET", "route", "/api"]).inc()
+        i = i + 1
+    assert_eq(reqs.labels(["route", "/api", "method", "GET"]).value(), 6.0)
+    # a label holding the separator the cache keys on takes the canonical
+    # path, and still counts into its own series
+    odd := "a" + chr(1) + "b"
+    reqs.labels(["route", odd]).inc()
+    reqs.labels(["route", odd]).inc()
+    assert_eq(reqs.labels(["route", odd]).value(), 2.0)
+    assert_eq(reqs.labels(["route", "a", "b", ""]).value(), 0.0)
+    # a reset drops the cached series with the registry
+    reset()
+    assert_eq(counter("cached_requests").labels(["route", "/api", "method", "GET"]).value(), 0.0)
+    gauge("cached_pool").labels(["pool", "db"]).set(3.0)
+    assert_eq(gauge("cached_pool").labels(["pool", "db"]).value(), 3.0)
+    histogram("cached_ms").labels(["route", "/api"]).observe(5.0)
+    histogram("cached_ms").labels(["route", "/api"]).observe(5.0)
+    assert_eq(histogram("cached_ms").labels(["route", "/api"]).count(), 2)
 
 test "names and label values that need rewriting still get it":
     assert_eq(normalize_metric_name("requests_total"), "requests_total")

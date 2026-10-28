@@ -19,15 +19,17 @@
 //!
 //! ## the register/park race (why the re-check under the waiter lock)
 //!
-//! `state` is a lockless atomic, so — unlike the condvar primitives — the lock
-//! state and the waiter list are not guarded together. A naive "fail the CAS,
-//! then register and park" would race an `unlock` that clears `state` and drains
-//! the (still empty) list in between, parking the task forever. We close that by
-//! taking the `green_waiters` lock, re-checking the CAS under it, and only
-//! registering if the lock is still held. `unlock` clears `state` *before* it
-//! takes that same lock to drain, so the two critical sections serialize: either
-//! the waiter registers before the drain (and is woken) or it re-checks after
-//! the clear and re-acquires. This is the standard futex register-then-recheck.
+//! `state` is 0 when free, 1 when held, and 2 when held with green tasks
+//! registered to be woken. `unlock` swaps in 0 and only takes the waiter lock
+//! when the old state was 2, so an unlock nobody waits on is one atomic swap.
+//!
+//! A waiter takes the `green_waiters` lock, then moves the state from 1 to 2
+//! (or finds it already 2) before it registers. If the lock was released in
+//! between, that move fails on the 0 and the waiter retries the acquire
+//! instead of parking. An `unlock` that reads 2 takes the waiter lock to
+//! drain, which waits for a waiter that set the 2 to finish registering, so
+//! every registered waiter is woken. This is the standard futex
+//! register-then-recheck.
 //!
 //! ## lock order
 //!
@@ -38,7 +40,6 @@
 //! scheduler locks are never taken while probing for the mutex.
 
 use crate::concurrency::green;
-use crate::concurrency::scheduler::{backend, Backend};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
@@ -119,12 +120,13 @@ fn lock_green(m: &PithMutex, id: usize) {
         if try_acquire(m) {
             return;
         }
-        // contended: register under the waiter lock, but re-check the lock
-        // *under that lock* first, so we cannot park just after an unlock already
-        // cleared `state` and drained the list.
+        // contended: under the waiter lock, mark the mutex as having waiters.
+        // finding it free instead means an unlock came in between, so retry.
         let mut waiters = lock_waiters(m);
-        if try_acquire(m) {
-            return;
+        match m.state.compare_exchange(1, 2, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => {}
+            Err(2) => {}
+            Err(_) => continue,
         }
         waiters.push(id);
         drop(waiters);
@@ -171,13 +173,11 @@ pub unsafe extern "C" fn pith_mutex_unlock(handle: *mut PithMutexHandle) {
     let Some(m) = mutex_ref(handle) else {
         return;
     };
-    m.state.store(0, Ordering::Release);
-    // wake any green tasks parked on this lock so they retry their acquire. only
-    // meaningful under the green backend — an os-thread waiter spins and needs no
-    // signal — so we skip the waiter lock entirely when green is off, keeping the
-    // default unlock a single atomic store as before. the gate is process-wide
-    // and monotonic, so it introduces no per-unlock race.
-    if backend() == Backend::Green {
+    // wake any green tasks parked on this lock so they retry their acquire.
+    // only a parked green task sets state 2, so an unlock with no one waiting
+    // never takes the waiter lock. an os-thread waiter spins and needs no
+    // signal.
+    if m.state.swap(0, Ordering::Release) == 2 {
         let mut waiters = lock_waiters(m);
         for id in waiters.drain(..) {
             green::wake(id);

@@ -149,6 +149,7 @@ pub fn report_leaked_cstrings() {
 }
 
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
+    crate::alloc_sites::record("string");
     crate::perf_count(&crate::PERF_CSTRING_ALLOCS, 1);
     let base = pith_alloc(cstring_layout(data_len));
     (base as *mut u32).write(CSTRING_MAGIC);
@@ -634,6 +635,7 @@ unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
 
 #[no_mangle]
 pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
+    crate::alloc_sites::record("closure");
     // a closure is built and dropped once per construction, and a benchmark
     // that builds two per iteration spends about 56ns in each against a 7ns
     // call. almost none of that is the work; it is the allocator round-trip.
@@ -702,6 +704,7 @@ unsafe fn closure_free_shell(handle: i64) {
 /// handle must be a valid closure handle or garbage (registry-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RETAIN);
     if let Some(closure) = pith_closure_ref(handle) {
         closure
             .ref_count
@@ -718,6 +721,7 @@ pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
 /// handle must be a valid closure handle or garbage (registry-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_release(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RELEASE);
     let Some(closure) = pith_closure_ref(handle) else {
         return;
     };
@@ -3359,7 +3363,11 @@ unsafe fn struct_pool_return(base: *mut u8, total: usize) -> bool {
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     use std::alloc::alloc_zeroed;
 
-    crate::perf_stats!(PERF_STRUCT_ALLOCS += 1);
+    if crate::perf_stats_enabled() {
+        let bucket = &crate::perf::PERF_STRUCT_FIELDS[num_fields.clamp(0, 16) as usize];
+        crate::perf_record2(&crate::PERF_STRUCT_ALLOCS, 1, bucket, 1);
+    }
+    crate::alloc_sites::record(crate::alloc_sites::STRUCT_KINDS[num_fields.clamp(0, 16) as usize]);
     let size = (num_fields.max(0) as usize) * 8;
     if size == 0 {
         return 0;
@@ -3396,8 +3404,17 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     base.add(STRUCT_HEADER) as i64
 }
 
-pub(crate) const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
-pub(crate) const STRUCT_HEADER: usize = 32;
+pub const STRUCT_MAGIC: u32 = 0x50535452; // "PSTR"
+pub const STRUCT_HEADER: usize = 32;
+/// The header codegen writes for a box it builds in a stack slot (the ir's
+/// `tuple_stack`), the same words `pith_struct_alloc` writes: magic, one strong
+/// count, the implicit weak unit, the payload size, and no destructor. The
+/// box is never released; its function's cleanup drops what it holds.
+pub const STRUCT_STRONG_OFFSET: i32 = STRUCT_OFF_STRONG as i32;
+pub const STRUCT_WEAK_OFFSET: i32 = STRUCT_OFF_WEAK as i32;
+pub const STRUCT_DEAD_OFFSET: i32 = STRUCT_OFF_DEAD as i32;
+pub const STRUCT_SIZE_OFFSET: i32 = STRUCT_OFF_SIZE as i32;
+pub const STRUCT_DTOR_OFFSET: i32 = STRUCT_OFF_DTOR as i32;
 
 // header field offsets within the base allocation
 const STRUCT_OFF_STRONG: usize = 4;
@@ -3535,6 +3552,7 @@ pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_STRUCT_RETAIN);
     if let Some(base) = struct_base(ptr) {
         struct_strong(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3567,6 +3585,7 @@ pub unsafe extern "C" fn pith_struct_strong_count(ptr: i64) -> i64 {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_STRUCT_RELEASE);
     let Some(base) = struct_base(ptr) else {
         return;
     };
@@ -3578,6 +3597,9 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     let weak = struct_weak(base);
     let sole = strong.load(std::sync::atomic::Ordering::Acquire) == 1
         && weak.load(std::sync::atomic::Ordering::Acquire) == 1;
+    if sole {
+        crate::perf::perf_rc_op(crate::perf::RC_STRUCT_SOLE_RELEASE);
+    }
     if !sole {
         // cycle-gc suspect hook, placed before our count is given up rather
         // than in the prev > 1 arm below. the ordering is load-bearing: while
@@ -3752,6 +3774,7 @@ pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_WEAK_RETAIN);
     if let Some(base) = struct_base(ptr) {
         struct_weak(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3763,6 +3786,7 @@ pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_WEAK_RELEASE);
     if let Some(base) = struct_base(ptr) {
         struct_weak_drop(base);
     }

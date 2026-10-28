@@ -3,9 +3,46 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 /// Global statistics for debugging
 pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
-pub static PERF_RC_ALLOCS: AtomicUsize = AtomicUsize::new(0);
-pub static PERF_RC_RETAINS: AtomicUsize = AtomicUsize::new(0);
-pub static PERF_RC_RELEASES: AtomicUsize = AtomicUsize::new(0);
+// count operations by kind: the retains and releases of each counted kind
+// the strings do not already cover, the struct releases that took the
+// sole-owner path, and weak references. indexed by the RC_* constants.
+pub const RC_STRUCT_RETAIN: usize = 0;
+pub const RC_STRUCT_RELEASE: usize = 1;
+pub const RC_STRUCT_SOLE_RELEASE: usize = 2;
+pub const RC_WEAK_RETAIN: usize = 3;
+pub const RC_WEAK_RELEASE: usize = 4;
+pub const RC_LIST_RETAIN: usize = 5;
+pub const RC_LIST_RELEASE: usize = 6;
+pub const RC_MAP_RETAIN: usize = 7;
+pub const RC_MAP_RELEASE: usize = 8;
+pub const RC_SET_RETAIN: usize = 9;
+pub const RC_SET_RELEASE: usize = 10;
+pub const RC_CLOSURE_RETAIN: usize = 11;
+pub const RC_CLOSURE_RELEASE: usize = 12;
+pub const RC_BYTES_RETAIN: usize = 13;
+pub const RC_BYTES_RELEASE: usize = 14;
+const RC_OP_NAMES: [&str; 15] = [
+    "struct retain",
+    "struct release",
+    "struct sole-owner release",
+    "weak retain",
+    "weak release",
+    "list retain",
+    "list release",
+    "map retain",
+    "map release",
+    "set retain",
+    "set release",
+    "closure retain",
+    "closure release",
+    "bytes retain",
+    "bytes release",
+];
+pub static PERF_RC_OPS: [AtomicUsize; 15] = [const { AtomicUsize::new(0) }; 15];
+// struct allocations by field count, the last bucket holding 16 and up. an
+// optional shell has two fields and a result box three, so the small buckets
+// say how much of the struct traffic is wrappers rather than user types.
+pub static PERF_STRUCT_FIELDS: [AtomicUsize; 17] = [const { AtomicUsize::new(0) }; 17];
 pub static PERF_STRING_ALLOCS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_STRING_ALLOC_BYTES: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_CSTRING_ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -110,6 +147,14 @@ pub fn perf_stats_enabled() -> bool {
         1 => false,
         2 => true,
         _ => perf_stats_probe(),
+    }
+}
+
+/// Count one operation of the kind `op` names (an RC_* constant).
+#[inline(always)]
+pub fn perf_rc_op(op: usize) {
+    if perf_stats_enabled() {
+        perf_record1(&PERF_RC_OPS[op], 1);
     }
 }
 
@@ -219,12 +264,14 @@ pub fn dump_perf_stats() {
         return;
     }
     eprintln!("pith perf stats");
-    eprintln!("  rc allocs: {}", PERF_RC_ALLOCS.load(Ordering::Relaxed));
-    eprintln!("  rc retains: {}", PERF_RC_RETAINS.load(Ordering::Relaxed));
-    eprintln!(
-        "  rc releases: {}",
-        PERF_RC_RELEASES.load(Ordering::Relaxed)
-    );
+    let ops: Vec<String> = RC_OP_NAMES
+        .iter()
+        .zip(PERF_RC_OPS.iter())
+        .map(|(name, count)| (name, count.load(Ordering::Relaxed)))
+        .filter(|(_, count)| *count > 0)
+        .map(|(name, count)| format!("{name}={count}"))
+        .collect();
+    eprintln!("  rc ops: {}", ops.join(" "));
     eprintln!(
         "  cstrings: alloc={} free={} live={} retain={} release={}",
         PERF_CSTRING_ALLOCS.load(Ordering::Relaxed),
@@ -249,6 +296,14 @@ pub fn dump_perf_stats() {
         PERF_STRUCT_ALLOCS.load(Ordering::Relaxed),
         PERF_STRUCT_FREES.load(Ordering::Relaxed),
     );
+    let fields: Vec<String> = PERF_STRUCT_FIELDS
+        .iter()
+        .enumerate()
+        .map(|(n, count)| (n, count.load(Ordering::Relaxed)))
+        .filter(|(_, count)| *count > 0)
+        .map(|(n, count)| if n == 16 { format!("16+={count}") } else { format!("{n}={count}") })
+        .collect();
+    eprintln!("  struct allocs by field count: {}", fields.join(" "));
     eprintln!(
         "  bytes allocs: {} frees={} bytes={}",
         PERF_BYTES_ALLOCS.load(Ordering::Relaxed),

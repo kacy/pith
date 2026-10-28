@@ -168,6 +168,12 @@ closure_stack REG NAME      the same closure, built in a stack slot of the
                             with a count, and for a lambda passed to a
                             parameter the callee only calls, which holds
                             its counted captures without a count.
+tuple_stack REG N           REG = a struct of N fields in a stack slot of the
+                            current frame, with the header pith_struct_alloc
+                            writes. never released: the emitter uses it for
+                            a result local only read in its own function,
+                            whose cleanup drops the payload and leaves the
+                            shell.
 ```
 
 **control flow**

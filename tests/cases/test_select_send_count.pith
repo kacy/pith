@@ -1,0 +1,36 @@
+# a select arm that sends a counted value hands the channel one count, the
+# same as `ch.send(v)`: a borrowed value is retained first, and a probe that
+# fails (the channel is full) gives its count back. the sender keeps using
+# the borrowed value afterwards, and every sent value is received and
+# dropped, so a count off by one either way shows up under valgrind.
+
+fn main() -> Int:
+    ch := Channel[String](2)
+    word := "hello-".repeat(3)
+    mut sent := 0
+    mut skipped := 0
+    mut i := 0
+    while i < 4:
+        select:
+            ch.send(word) =>
+                sent = sent + 1
+            default =>
+                skipped = skipped + 1
+        i = i + 1
+    # an owned value built inside the arm
+    mut j := 0
+    while j < 3:
+        select:
+            ch.send("n-" + j.to_string()) =>
+                sent = sent + 1
+            default =>
+                skipped = skipped + 1
+        j = j + 1
+    mut got := 0
+    mut total := 0
+    while got < sent:
+        s := ch.recv().unwrap_or("")
+        total = total + s.len()
+        got = got + 1
+    print(word + " " + sent.to_string() + " " + skipped.to_string() + " " + total.to_string())
+    return 0

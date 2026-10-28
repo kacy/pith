@@ -783,11 +783,20 @@ end of the scope it was bound in.
 ## threads and tasks
 
 `spawn` runs a closure on a green task, which linux schedules across a
-pool of os threads (see [concurrency.md](concurrency.md)). reference
-counts are atomic, so retaining and releasing the same value from two
-of those threads is safe. the container *contents* are not synchronized, though: a list or
-map is a plain buffer behind a handle, so two tasks mutating the same
-collection race on that buffer.
+pool of os threads (see [concurrency.md](concurrency.md)). retaining and
+releasing the same value from two of those threads is safe. a struct's
+counts are plain loads and stores while only the task that built it can
+reach it, and atomic once it is marked shared. it is marked when it can
+reach another task: through a spawn's captures, a task's result, a channel
+send, a module global, or a store into a struct, list or map that is already
+shared, and everything it reaches is marked with it.
+`cranelift/runtime/src/share.rs` lists the crossings, and `PITH_RC_CHECK=1`
+aborts a run in which a task updates the plain counts of a struct it did not
+build. strings, bytes, lists, maps and closures keep atomic counts.
+
+the container *contents* are not synchronized, though: a list or map is a
+plain buffer behind a handle, so two tasks mutating the same collection race
+on that buffer.
 
 the rule, until a checker enforces it: **do not share a mutable
 collection across tasks — pass data through a channel instead.** a

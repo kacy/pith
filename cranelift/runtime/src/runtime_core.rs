@@ -2994,10 +2994,16 @@ pub(crate) fn release_finished_tls(values: Vec<(i64, u8)>) {
 /// The os-thread backend's half: a task's thread is about to exit, and its
 /// threadlocal map would be dropped with the counts still held.
 pub(crate) fn release_thread_tls() {
-    let values = TLS_GLOBALS
+    release_finished_tls(take_thread_tls());
+}
+
+/// the thread-local touch behind its own call, like `tls_globals_get`: no
+/// frame that runs pith code may hold the address of `TLS_GLOBALS`
+#[inline(never)]
+fn take_thread_tls() -> Vec<(i64, u8)> {
+    TLS_GLOBALS
         .try_with(|t| t.borrow_mut().take_values())
-        .unwrap_or_default();
-    release_finished_tls(values);
+        .unwrap_or_default()
 }
 
 thread_local! {

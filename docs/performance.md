@@ -702,6 +702,13 @@ build the program with `PITH_KEEP_SYMBOLS=1` first. samples inside libc resolve
 to its nearest exported symbol, so the allocator's internals show under
 borrowed names such as `_dl_mcount_wrapper`; read those as malloc and free.
 
+`PITH_ALLOC_SITES=<n>` answers which code allocates. for one heap allocation
+in every n it walks the stack to the first compiled function, and at exit it
+prints the busiest functions by kind: string, list, map, bytes, closure, and
+struct by field count, so `struct/3` in a hot function is usually a result box
+and `struct/2` an optional shell. each sample costs a stack walk, so pick an n
+that keeps the run short, and build with `PITH_KEEP_SYMBOLS=1`.
+
 ## std profiling pass (2026-09-10)
 
 a pass over the standard library where every target came from a profile

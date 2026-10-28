@@ -83,6 +83,7 @@ pub const LIST_HANDLE_ALIGN: i64 = std::mem::align_of::<ListImpl>() as i64;
 impl ListImpl {
     fn new(elem_size: usize, type_tag: ListTypeTag) -> Self {
         crate::perf_count(&crate::PERF_LIST_NEWS, 1);
+        crate::alloc_sites::record("list");
         let mut list = ListImpl {
             magic: LIST_MAGIC,
             rc: std::sync::atomic::AtomicU32::new(1),

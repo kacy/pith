@@ -149,6 +149,7 @@ pub fn report_leaked_cstrings() {
 }
 
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
+    crate::alloc_sites::record("string");
     crate::perf_count(&crate::PERF_CSTRING_ALLOCS, 1);
     let base = pith_alloc(cstring_layout(data_len));
     (base as *mut u32).write(CSTRING_MAGIC);
@@ -634,6 +635,7 @@ unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
 
 #[no_mangle]
 pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
+    crate::alloc_sites::record("closure");
     // a closure is built and dropped once per construction, and a benchmark
     // that builds two per iteration spends about 56ns in each against a 7ns
     // call. almost none of that is the work; it is the allocator round-trip.
@@ -3319,6 +3321,7 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
         let bucket = &crate::perf::PERF_STRUCT_FIELDS[num_fields.clamp(0, 16) as usize];
         crate::perf_record2(&crate::PERF_STRUCT_ALLOCS, 1, bucket, 1);
     }
+    crate::alloc_sites::record(crate::alloc_sites::STRUCT_KINDS[num_fields.clamp(0, 16) as usize]);
     let size = (num_fields.max(0) as usize) * 8;
     if size == 0 {
         return 0;

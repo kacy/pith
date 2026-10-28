@@ -247,6 +247,7 @@ fn require_key_flavor(actual: KeyType, wanted: KeyType, entry: &str) {
 
 impl MapImpl {
     fn new(key_type: KeyType, val_size: usize, val_tag: ListTypeTag) -> Self {
+        crate::alloc_sites::record("map");
         let val_is_heap = val_tag != ListTypeTag::Primitive;
         let int_values8 = if matches!(key_type, KeyType::Int) && val_size == 8 && !val_is_heap {
             Some(HashMap::new())

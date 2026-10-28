@@ -58,6 +58,7 @@ unsafe fn pith_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut PithByteBuffer
 
 pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
     crate::perf_stats!(PERF_BYTES_ALLOCS += 1, PERF_BYTES_ALLOC_BYTES += data.len());
+    crate::alloc_sites::record("bytes");
     let data_ptr = data.as_ptr();
     let data_len = data.len();
     let ptr = Box::into_raw(Box::new(PithBytes {

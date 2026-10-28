@@ -813,6 +813,10 @@ fn ir_emit_share_expr(r: Int, expr_idx: Int):
             ir_emit("field " + err_r.to_string() + " " + r.to_string() + " 16 unknown err")
             ir_emit_share_reg(err_r, err_kind)
         return
+    # a function value is a closure handle, whose type has no rc kind
+    if tid >= 0 and get_type_info(tid).kind == "function":
+        ir_emit_share_reg(r, "closure")
+        return
     ir_emit_share_reg(r, ir_rc_kind(ir_infer_type(expr_idx)))
 
 # mark a value of rc kind `kind` shared; strings, bytes and plain values hold
@@ -9544,6 +9548,11 @@ fn ir_emit_assign_stmt(node: Node):
                 ir_emit_name_load(old_r, name)
         legacy_target := ir_map_init_target(name, ir_lookup_name_type(name))
         r := ir_emit_value_for_target(node.children[0], legacy_target)
+        # any task can read a module global, so what it is given is marked
+        # shared, by the value's own type (a function value's type names no
+        # rc kind)
+        if ir_assign_targets_global_slot(name):
+            ir_emit_share_expr(r, node.children[0])
         if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_expr_is_borrowed(node.children[0]):
             ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
@@ -9680,6 +9689,11 @@ fn ir_emit_compound_assignment(node: Node):
             ir_rc_retain_reg(r, assign_kind)
         if old_r >= 0:
             ir_rc_release_reg(old_r, assign_kind)
+        # any task can read a module global, so what it is given is marked
+        # shared, by the value's own type (a function value's type names no
+        # rc kind)
+        if ir_assign_targets_global_slot(name):
+            ir_emit_share_expr(r, node.children[1])
         ir_emit_name_store(name, r)
         return
     compound_op := ir_compound_assignment_ir_op(op)
@@ -12176,7 +12190,10 @@ fn ir_emit_init_globals(root: Node):
             gkind := ir_rc_kind(target)
             if gkind.len() > 0 and gtarget != "tuple" and ir_expr_is_borrowed(parts.val_idx):
                 ir_rc_retain_reg(r, gkind)
-            ir_emit_share_reg(r, gkind)
+            if gkind.len() > 0:
+                ir_emit_share_reg(r, gkind)
+            else:
+                ir_emit_share_expr(r, parts.val_idx)
             ir_emit("store " + ir_global_storage_symbol(gname) + " " + r.to_string())
     ir_emit_zero_ret_endfunc()
 

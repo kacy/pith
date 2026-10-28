@@ -107,6 +107,20 @@ fn reader(n: Int) -> Int:
 fn run_with(f: fn(Int) -> Int, x: Int) -> Int:
     return f(x)
 
+# a module global holding a function value: the closure it is given captures
+# a struct, and other tasks call it
+fn plain(x: Int) -> Int:
+    return x
+
+mut handler: fn(Int) -> Int := plain
+
+fn install(n: Int):
+    captured_node := make(n)
+    handler = fn(x: Int) => x + walk(captured_node)
+
+fn call_handler(x: Int) -> Int:
+    return handler(x)
+
 fn main() -> Int:
     root := build(1)
     t1 := spawn captured(root)
@@ -151,4 +165,15 @@ fn main() -> Int:
     for t in adds:
         asum = asum + await t
     print("closure " + asum.to_string())
+
+    install(5)
+    mut hs: List[Task[Int]] := []
+    i = 0
+    while i < 8:
+        hs.push(spawn call_handler(i))
+        i = i + 1
+    mut hsum := 0
+    for t in hs:
+        hsum = hsum + await t
+    print("handler " + hsum.to_string())
     return 0

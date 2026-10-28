@@ -1,0 +1,84 @@
+# a lambda literal passed to a parameter the callee only calls, or hands on
+# to another such parameter, is built in a stack slot. the callees below mix
+# those with parameters that store, return, capture or spawn the closure, so
+# a wrong call either way shows up in the output or under valgrind.
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int:
+    return f(x)
+
+# hands f on to apply, declared before it
+fn apply_twice(f: fn(Int) -> Int, x: Int) -> Int:
+    return apply(f, apply(f, x))
+
+# calls a later function with f, so its record needs a second pass
+fn apply_later(f: fn(Int) -> Int, x: Int) -> Int:
+    return apply_last(f, x) + 1
+
+fn apply_last(f: fn(Int) -> Int, x: Int) -> Int:
+    return f(x) * 2
+
+fn keep(f: fn(Int) -> Int, xs: List[fn(Int) -> Int]) -> Int:
+    xs.push(f)
+    return xs.len()
+
+fn wrap(f: fn(Int) -> Int) -> fn(Int) -> Int:
+    return fn(x: Int) => f(x) + 100
+
+fn hand_back(f: fn(Int) -> Int) -> fn(Int) -> Int:
+    return f
+
+fn later(f: fn(Int) -> Int, x: Int) -> Int:
+    t := spawn apply(f, x)
+    return await t
+
+fn countdown(f: fn(Int) -> Int, n: Int) -> Int:
+    if n == 0:
+        return f(0)
+    return countdown(f, n - 1) + 1
+
+fn pick(a: fn(Int) -> Int, b: fn(Int) -> Int, x: Int) -> Int:
+    if x > 0:
+        return a(x)
+    return b(x)
+
+fn main() -> Int:
+    mut total := 0
+    mut i := 0
+    while i < 10:
+        base := i % 4
+        total = total + apply(fn(x: Int) => x + base, i)
+        total = total + apply_twice(fn(x: Int) => x * 2 + base, i)
+        total = total + apply_later(fn(x: Int) => x - base, i)
+        i = i + 1
+    print(total.to_string())
+
+    # both arguments local, named-argument call left on the heap
+    step := 3
+    print(pick(fn(x: Int) => x + step, fn(x: Int) => x - step, 5).to_string())
+    print(pick(a: fn(x: Int) => x * step, b: fn(x: Int) => 0, x: 2).to_string())
+
+    # escaping callees keep the heap closure alive past the call
+    fns: List[fn(Int) -> Int] := []
+    print(keep(fn(x: Int) => x + step, fns).to_string() + " " + fns[0](1).to_string())
+    w := wrap(fn(x: Int) => x * step)
+    print(w(2).to_string())
+    h := hand_back(fn(x: Int) => x + 7)
+    print(h(1).to_string())
+    print(later(fn(x: Int) => x * 5, 4).to_string())
+    print(countdown(fn(x: Int) => x + step, 3).to_string())
+
+    # a lambda that captures a string stays on the heap
+    word := "ab".repeat(3)
+    print(apply(fn(x: Int) => word.len() + x, 1).to_string())
+
+    # a local named like an operator ("mul") is still only called
+    mul := fn(x: Int) => x * step
+    print(mul(4).to_string())
+
+    # open-coded map, filter and reduce
+    xs := [1, 2, 3, 4, 5]
+    ys := xs.map(fn(x: Int) => x * step)
+    zs := xs.filter(fn(x: Int) => x % 2 == step % 2)
+    sum := xs.reduce(0, fn(acc: Int, x: Int) => acc + x * step)
+    print(ys.len().to_string() + " " + ys[4].to_string() + " " + zs.len().to_string() + " " + sum.to_string())
+    return 0

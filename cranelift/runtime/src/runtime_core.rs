@@ -2976,6 +2976,10 @@ impl TlsMap {
     }
 
     /// Every value, with its tag, leaving the map empty.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.values.iter().all(Option::is_none)
+    }
+
     pub(crate) fn take_values(&mut self) -> Vec<(i64, u8)> {
         std::mem::take(&mut self.values).into_iter().flatten().collect()
     }

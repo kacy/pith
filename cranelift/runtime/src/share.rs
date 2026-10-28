@@ -130,40 +130,50 @@ pub(crate) unsafe fn share_value(value: i64, tag: ListTypeTag) {
         // counts are atomic
         _ => return,
     };
-    let mut work: Vec<(i64, u8)> = vec![(value, child)];
+    // the common case is a value with nothing to walk: one already shared, or
+    // a spawn's closure over plain values. the work list stays empty, and so
+    // unallocated, until a child turns up.
+    let mut work: Vec<(i64, u8)> = Vec::new();
+    mark_one(value, child, &mut work);
     while let Some((v, kind)) = work.pop() {
-        if v == 0 {
-            continue;
+        mark_one(v, kind, &mut work);
+    }
+}
+
+/// Mark one value and queue the children it reaches, unless it was marked
+/// already, in which case everything it reaches was marked with it.
+unsafe fn mark_one(v: i64, kind: u8, work: &mut Vec<(i64, u8)>) {
+    if v == 0 {
+        return;
+    }
+    let mut push = |c: i64, k: u8| {
+        if c != 0 && matches!(k, CHILD_LIST | CHILD_MAP | CHILD_STRUCT | CHILD_CLOSURE | CHILD_WEAK) {
+            work.push((c, if k == CHILD_WEAK { CHILD_STRUCT } else { k }));
         }
-        let mut push = |c: i64, k: u8| {
-            if c != 0 && matches!(k, CHILD_LIST | CHILD_MAP | CHILD_STRUCT | CHILD_CLOSURE | CHILD_WEAK) {
-                work.push((c, if k == CHILD_WEAK { CHILD_STRUCT } else { k }));
+    };
+    match kind {
+        CHILD_STRUCT => {
+            if crate::runtime_core::struct_mark_shared(v) {
+                forget_owner(v);
+                crate::cycle::struct_children(v, &mut push);
             }
-        };
-        match kind {
-            CHILD_STRUCT => {
-                if crate::runtime_core::struct_mark_shared(v) {
-                    forget_owner(v);
-                    crate::cycle::struct_children(v, &mut push);
-                }
-            }
-            CHILD_CLOSURE => {
-                if crate::runtime_core::closure_mark_shared(v) {
-                    crate::runtime_core::cycle_closure_children(v, &mut push);
-                }
-            }
-            CHILD_LIST => {
-                if crate::collections::list::list_mark_shared(v) {
-                    crate::collections::list::cycle_list_children(v, &mut push);
-                }
-            }
-            CHILD_MAP => {
-                if crate::collections::map::map_mark_shared(v) {
-                    crate::collections::map::cycle_map_children(v, &mut push);
-                }
-            }
-            _ => {}
         }
+        CHILD_CLOSURE => {
+            if crate::runtime_core::closure_mark_shared(v) {
+                crate::runtime_core::cycle_closure_children(v, &mut push);
+            }
+        }
+        CHILD_LIST => {
+            if crate::collections::list::list_mark_shared(v) {
+                crate::collections::list::cycle_list_children(v, &mut push);
+            }
+        }
+        CHILD_MAP => {
+            if crate::collections::map::map_mark_shared(v) {
+                crate::collections::map::cycle_map_children(v, &mut push);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -180,6 +190,12 @@ fn current_owner() -> u64 {
     if let Some(task) = crate::concurrency::green::current_task() {
         return (task as u64) | (1 << 63);
     }
+    thread_mark()
+}
+
+// behind a call of its own, like the runtime's other thread-local accessors
+#[inline(never)]
+fn thread_mark() -> u64 {
     THREAD_MARK.with(|m| m as *const u8 as u64)
 }
 
@@ -223,7 +239,7 @@ fn check_local_slow(ptr: i64, op: &str) {
                 "pith rc check: {op} of a local struct at {ptr:#x} from a task that did not build it; a value reached another task without being marked shared"
             );
             eprintln!("{}", std::backtrace::Backtrace::force_capture());
-            // panic-guard: the check mode exists to stop at the first unmarked crossing.
+            // the check mode exists to stop at the first unmarked crossing
             std::process::abort();
         }
     }

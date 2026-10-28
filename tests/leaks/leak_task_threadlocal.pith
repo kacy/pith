@@ -1,0 +1,41 @@
+# a task's threadlocal values, dropped when the task finishes.
+#
+# under the green backend a threadlocal is per task, and under os threads per
+# thread, so a server that spawns a task per connection gives every task its
+# own copy of each threadlocal it touches: std.metrics keeps its per-task
+# instrument caches that way. the runtime used to keep those values when the
+# task ended, so every task stranded whatever its threadlocals held. each
+# round here runs a task that fills a string, a list, a map and a struct
+# threadlocal with heap values, so a value nothing releases grows the peak.
+import leakprobe as probe
+
+struct Note:
+    text: String
+
+threadlocal mut tl_text: String := ""
+threadlocal mut tl_list: List[String] := []
+threadlocal mut tl_map: Map[String, Int] := {}
+threadlocal mut tl_note: Note := Note(text: "")
+
+fn task_body(i: Int) -> Int:
+    tl_text = probe.fresh_string(i)
+    mut k := 0
+    while k < 8:
+        tl_list.push(probe.fresh_string(i + k))
+        tl_map.insert(probe.fresh_string(i + k + 100), k)
+        k = k + 1
+    tl_note = Note(text: probe.fresh_string(i + 3))
+    return tl_text.len() + tl_list.len() + tl_map.len() + tl_note.text.len()
+
+fn main():
+    rounds := probe.rounds() / 200
+    mut i := 0
+    mut acc := 0
+    while i < rounds:
+        t := spawn task_body(i)
+        acc = acc + await t
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -827,6 +827,13 @@ fn ir_emit_share_expr(r: Int, expr_idx: Int):
     if tid >= 0 and get_type_info(tid).kind == "function":
         ir_emit_share_reg(r, "closure")
         return
+    # the checked type first: the syntactic guess reads an empty `{}` as a
+    # map whatever it was assigned to, and marking a set as a map reads past it
+    if tid >= 0:
+        checked := ir_rc_kind(ir_type_from_tid(tid))
+        if checked.len() > 0:
+            ir_emit_share_reg(r, checked)
+            return
     ir_emit_share_reg(r, ir_rc_kind(ir_infer_type(expr_idx)))
 
 # mark a value of rc kind `kind` shared; strings, bytes and plain values hold
@@ -9710,7 +9717,10 @@ fn ir_emit_assign_stmt(node: Node):
         # shared, by the value's own type (a function value's type names no
         # rc kind)
         if ir_assign_targets_global_slot(name):
-            ir_emit_share_expr(r, node.children[0])
+            if legacy_kind.len() > 0:
+                ir_emit_share_reg(r, legacy_kind)
+            else:
+                ir_emit_share_expr(r, node.children[0])
         if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_expr_is_borrowed(node.children[0]):
             ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
@@ -9851,7 +9861,10 @@ fn ir_emit_compound_assignment(node: Node):
         # shared, by the value's own type (a function value's type names no
         # rc kind)
         if ir_assign_targets_global_slot(name):
-            ir_emit_share_expr(r, node.children[1])
+            if assign_kind.len() > 0:
+                ir_emit_share_reg(r, assign_kind)
+            else:
+                ir_emit_share_expr(r, node.children[1])
         ir_emit_name_store(name, r)
         return
     compound_op := ir_compound_assignment_ir_op(op)
@@ -11770,11 +11783,7 @@ fn ir_emit_name_store(name: String, val_r: Int):
     elif ir_name_is_threadlocal(name):
         ir_emit_tls_store(name, val_r)
     else:
-        storage := ir_resolve_storage_name(name)
-        # any task can read a module global
-        if storage != name:
-            ir_emit_share_reg(val_r, ir_rc_kind(ir_lookup_name_type(name)))
-        ir_emit("store " + storage + " " + val_r.to_string())
+        ir_emit("store " + ir_resolve_storage_name(name) + " " + val_r.to_string())
 
 # load a tracked local's own slot, ignoring any loop variable shadowing it. the
 # ARC cleanup addresses the function's storage directly: a `return` inside a

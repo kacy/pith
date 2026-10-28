@@ -1,0 +1,86 @@
+# a generic function whose closure parameter is only called gets a copy per
+# known argument (a lambda literal or a named function), and the calls in
+# that copy name the function directly. the cases mix bound and unbound
+# arguments, pass bindings on through other generics and through recursion,
+# and shadow a bound name inside a lambda, so a wrong target shows up in the
+# output or under valgrind.
+
+fn apply_all[T](xs: List[T], f: fn(T) -> T) -> List[T]:
+    mut out: List[T] := []
+    for x in xs:
+        out.push(f(x))
+    return out
+
+# hands f on to apply_all
+fn apply_twice_all[T](xs: List[T], f: fn(T) -> T) -> List[T]:
+    return apply_all(apply_all(xs, f), f)
+
+fn count_if[T](xs: List[T], keep: fn(T) -> Bool, i: Int) -> Int:
+    if i >= xs.len():
+        return 0
+    mut here := 0
+    if keep(xs[i]):
+        here = 1
+    return here + count_if(xs, keep, i + 1)
+
+# f is shadowed by a lambda parameter of the same name, which must call the
+# lambda's own argument
+fn shadowed[T](x: T, f: fn(T) -> T) -> T:
+    g := fn(f: Int) => f + 1
+    return f(x)
+
+fn stored[T](x: T, f: fn(T) -> T) -> T:
+    fs := [f]
+    return fs[0](x)
+
+fn double(x: Int) -> Int:
+    return x * 2
+
+fn shout(s: String) -> String:
+    return s + "!"
+
+fn checked(x: Int) -> Int!:
+    if x < 0:
+        fail "negative"
+    return x
+
+fn first_ok[T](x: T, f: fn(T) -> Int!) -> Int:
+    return f(x) catch -1
+
+fn main() -> Int:
+    xs := [1, 2, 3]
+    step := 10
+    r1 := apply_all(xs, fn(x: Int) => x + step)
+    print("{r1}")
+    r2 := apply_all(xs, double)
+    print("{r2}")
+    r3 := apply_twice_all(xs, double)
+    print("{r3}")
+    r4 := apply_twice_all(xs, fn(x: Int) => x - step)
+    print("{r4}")
+
+    # a counted capture in a bound lambda
+    suffix := "?".repeat(2)
+    words := ["a", "b"]
+    r5 := apply_all(words, fn(s: String) => s + suffix)
+    print("{r5}")
+    r6 := apply_all(words, shout)
+    print("{r6}")
+
+    print(count_if(xs, fn(x: Int) => x % 2 == 1, 0).to_string())
+    print(count_if(words, fn(s: String) => s == "b", 0).to_string())
+    print(shadowed(5, double).to_string())
+    print(stored(5, double).to_string())
+    print(first_ok(4, checked).to_string() + " " + first_ok(-4, checked).to_string())
+
+    # the same call site twice keeps one copy, an unbound argument none
+    mut total := 0
+    mut i := 0
+    while i < 3:
+        ys := apply_all(xs, fn(x: Int) => x * i)
+        total = total + ys[2]
+        i = i + 1
+    f := fn(x: Int) => x * total
+    rf := apply_all(xs, f)
+    print(total.to_string() + " " + "{rf}")
+    return 0

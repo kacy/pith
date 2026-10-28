@@ -128,6 +128,13 @@ mut ir_lambda_on_stack := false
 # keeps whatever it captures alive until the call returns, so a stack closure
 # may hold counted captures without a count of its own.
 mut ir_lambda_borrows_captures := false
+# the function each closure parameter of the generic specialization being
+# emitted is bound to, as "<lambda|fn>:<symbol>" by parameter name (see
+# ir_bind_fn_specialization), and the binding text of every keyed
+# specialization. a lambda argument's register maps to its symbol here.
+mut ir_active_fn_bindings: Map[String, String] := {}
+mut ir_generic_spec_fn_bindings: Map[String, String] := {}
+mut ir_fn_arg_lambda_symbols: Map[Int, String] := {}
 # the registers of this function's closures that live in a stack slot, which
 # the release paths for call arguments must leave alone.
 mut ir_stack_closure_regs: List[Int] := []
@@ -1704,8 +1711,8 @@ fn ir_record_fn_borrow_params(decl_idx: Int, sym: String):
 # and ir_borrow_param_exported with the flavor "closure", in passes until
 # nothing changes, since a function's record can depend on one declared after
 # it. a parameter in a lambda or a spawn, stored, returned, or reassigned is
-# never recorded, and neither is one of a generic function, whose body is
-# emitted under other symbols.
+# never recorded. a generic function is recorded under its own name, which is
+# the name a call site resolves before it asks for a specialization.
 fn ir_record_closure_params(root_idx: Int):
     saved_impl_type := ir_current_impl_type
     mut changed := true
@@ -1714,10 +1721,9 @@ fn ir_record_closure_params(root_idx: Int):
         for item_idx in ir_root_items(root_idx):
             node := get_node(item_idx)
             if ir_is_fn_decl_kind(node.kind):
-                if not ir_has_generic_params(node):
-                    ir_current_impl_type = ""
-                    if ir_record_fn_closure_params(item_idx, node.value):
-                        changed = true
+                ir_current_impl_type = ""
+                if ir_record_fn_closure_params(item_idx, node.value):
+                    changed = true
             elif node.kind == "impl_decl":
                 impl_type := ir_impl_identity_type(node, ir_current_module_path)
                 if impl_type.len() > 0 and not impl_type.contains("[") and not has_generic_declaration(impl_type):
@@ -2791,6 +2797,7 @@ fn ir_emit_rc_prologue(body_idx: Int):
     ir_stack_closure_names = ir_stack_closure_binds(body_idx)
     ir_untrack_rc_locals(ir_stack_closure_names)
     ir_stack_closure_regs = []
+    ir_fn_arg_lambda_symbols = {}
     ir_tuple_cascade_scan(body_idx)
     mut i := 0
     while i < ir_rc_locals.len():
@@ -4987,12 +4994,79 @@ fn ir_release_higher_order_fn_arg(fn_idx: Int, fn_r: Int):
 # filter or reduce, or a parameter ir_record_closure_params proved local)
 # never outlives this call, so it can be built in a stack slot.
 fn ir_emit_local_fn_arg(fn_idx: Int) -> Int:
-    ir_lambda_on_stack = get_node(fn_idx).kind == "lambda"
-    ir_lambda_borrows_captures = ir_lambda_on_stack
+    is_lambda := get_node(fn_idx).kind == "lambda"
+    ir_lambda_on_stack = is_lambda
+    ir_lambda_borrows_captures = is_lambda
     r := ir_expr(fn_idx)
     ir_lambda_on_stack = false
     ir_lambda_borrows_captures = false
+    if is_lambda:
+        ir_fn_arg_lambda_symbols.insert(r, ir_last_lambda_symbol)
     return r
+
+# what each argument in a closure position is known to be, for a call to a
+# generic function: "<pos>:lambda:<symbol>" for a lambda literal,
+# "<pos>:fn:<symbol>" for a named function, and a parameter already bound in
+# this specialization passes its binding on. empty when nothing is known.
+fn ir_fn_arg_bindings(node: Node, positions: List[Int], arg_regs: List[Int]) -> String:
+    mut parts: List[String] := []
+    for pos in positions:
+        if pos + 1 >= node.children.len() or pos >= arg_regs.len():
+            continue
+        expr_idx := ir_call_arg_expr_index(node.children[pos + 1])
+        en := get_node(expr_idx)
+        mut bound := ""
+        if en.kind == "lambda" and ir_fn_arg_lambda_symbols.contains_key(arg_regs[pos]):
+            bound = "lambda:" + ir_fn_arg_lambda_symbols[arg_regs[pos]]
+        elif en.kind == "ident" and ir_active_fn_bindings.contains_key(en.value) and ir_name_is_func_local(en.value):
+            bound = ir_active_fn_bindings[en.value]
+        elif en.kind == "ident" and not ir_name_is_func_local(en.value) and ir_expr_is_named_function_value(expr_idx):
+            target := ir_resolve_static_callee(expr_idx).name
+            if target.len() > 0 and not ir_is_generic_function_name(target) and not ir_call_returns_pair(target) and not ir_callee_uses_result_abi(ResolvedCallee(target, false), expr_idx):
+                bound = "fn:" + target
+        if bound.len() > 0:
+            parts.push(pos.to_string() + ":" + bound)
+    return parts.join(",")
+
+# a copy of the specialization spec_name whose closure parameters call the
+# functions `bindings` names directly (ir_bind_fn_specialization's format).
+# the closure value is still passed, so nothing but the calls changes.
+fn ir_bind_fn_specialization(spec_name: String, bindings: String) -> String:
+    if bindings.len() == 0 or not ir_generic_specialization_by_symbol.contains_key(spec_name):
+        return spec_name
+    key := ir_generic_specialization_by_symbol[spec_name]
+    bound_key := key + chr(9) + "fnb" + chr(9) + bindings
+    if ir_generic_specialization_names.contains_key(bound_key):
+        return ir_generic_specialization_names[bound_key]
+    bound_name := spec_name + "__fb" + ir_generic_spec_fn_bindings.len().to_string()
+    ir_generic_specialization_by_symbol.insert(bound_name, bound_key)
+    ir_generic_specialization_keys = ir_push_string(ir_generic_specialization_keys, bound_key)
+    ir_generic_specialization_names.insert(bound_key, bound_name)
+    ir_generic_specialization_type_lists.insert(bound_key, ir_generic_specialization_type_lists[key])
+    if ir_generic_specialization_subst_tids.contains_key(key):
+        ir_generic_specialization_subst_tids.insert(bound_key, ir_generic_specialization_subst_tids[key])
+    if ir_func_returns.contains_key(spec_name):
+        ir_func_returns.insert(bound_name, ir_func_returns[spec_name])
+    ir_generic_spec_fn_bindings.insert(bound_key, bindings)
+    return bound_name
+
+# the bindings of a keyed specialization, by the parameter names of its
+# declaration
+fn ir_fn_bindings_by_param(key: String, decl_idx: Int) -> Map[String, String]:
+    mut out: Map[String, String] := {}
+    if not ir_generic_spec_fn_bindings.contains_key(key):
+        return out
+    mut names: List[String] := []
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            names.push(cn.value)
+    for part in ir_generic_spec_fn_bindings[key].split(","):
+        colon := part.index_of(":")
+        pos := parse_int(part.substring(0, colon)) catch -1
+        if pos >= 0 and pos < names.len():
+            out.insert(names[pos], part.substring(colon + 1, part.len()))
+    return out
 
 fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
     list_r := ir_expr(list_idx)
@@ -5388,7 +5462,13 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         # only a name that is not a declared function can be a variable call,
         # which keeps a loop variable that shadows nothing extra out of this.
         callee_n := get_node(node.children[0])
-        if callee_n.kind == "ident" and not ir_is_declared_callable(callee.name):
+        bound := ir_bound_fn_target(callee.name)
+        if bound.starts_with("fn:"):
+            callee = ResolvedCallee(bound.substring(3, bound.len()), false)
+        elif bound.starts_with("lambda:"):
+            devirt_name = callee.name
+            callee = ResolvedCallee(bound.substring(7, bound.len()), false)
+        elif callee_n.kind == "ident" and not ir_is_declared_callable(callee.name):
             direct := ir_devirtualized_lambda_target(callee.name)
             if direct.len() > 0:
                 devirt_name = callee.name
@@ -5416,8 +5496,11 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     if struct_r >= 0:
         return struct_r
     local_fn_positions := ir_local_closure_arg_positions(node, callee.name)
+    is_generic_callee := ir_is_generic_function_name(callee.name)
     callee = ir_specialize_static_callee(idx, node, callee, explicit_generic_types)
     arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions)
+    if is_generic_callee and local_fn_positions.len() > 0:
+        callee = ResolvedCallee(ir_bind_fn_specialization(callee.name, ir_fn_arg_bindings(node, local_fn_positions, arg_regs)), callee.imported)
     if callee.name == "Channel":
         ir_push_channel_ctor_args(arg_regs, explicit_generic_types)
 
@@ -7561,6 +7644,8 @@ fn ir_emit_lambda(idx: Int) -> Int:
     saved_kinded_binds := ir_kinded_rc_binds
     saved_stack_closures := ir_stack_closure_names
     saved_stack_closure_regs := ir_stack_closure_regs
+    saved_fn_bindings := ir_active_fn_bindings
+    ir_active_fn_bindings = {}
     ir_rc_locals = []
     ir_rc_local_kinds = []
     ir_tuple_local_tid = {}
@@ -7626,6 +7711,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_kinded_rc_binds = saved_kinded_binds
     ir_stack_closure_names = saved_stack_closures
     ir_stack_closure_regs = saved_stack_closure_regs
+    ir_active_fn_bindings = saved_fn_bindings
     # return closure handle and fill captures. the prologue's check on what the
     # lambda reads stands in for the capture list, which is only known here;
     # the two are compared again so a disagreement falls back to the heap.
@@ -7718,6 +7804,13 @@ fn ir_record_lambda_binding(name: String, symbol: String):
     ir_local_lambda_targets.insert(name, symbol)
 
 # the lambda symbol a call through this name can target directly, or empty
+# a closure parameter of the specialization being emitted that its key binds
+# to one function (ir_fn_bindings_by_param), or ""
+fn ir_bound_fn_target(name: String) -> String:
+    if not ir_active_fn_bindings.contains_key(name) or not ir_name_is_func_local(name):
+        return ""
+    return ir_active_fn_bindings[name]
+
 fn ir_devirtualized_lambda_target(name: String) -> String:
     if not ir_name_is_func_local(name):
         return ""
@@ -10831,6 +10924,10 @@ fn ir_emit_generic_specialization(key: String):
     saved_types := ir_active_generic_concrete_types
     saved_module_path := ir_active_generic_module_path
     saved_decl_idx := ir_active_generic_decl_idx
+    saved_fn_bindings := ir_active_fn_bindings
+    ir_active_fn_bindings = {}
+    if owner_type.len() == 0:
+        ir_active_fn_bindings = ir_fn_bindings_by_param(key, decl_idx)
     ir_active_generic_params = generic_params
     ir_active_generic_concrete_types = concrete_types
     ir_active_generic_decl_idx = decl_idx
@@ -10901,6 +10998,7 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_concrete_types = saved_types
     ir_active_generic_module_path = saved_module_path
     ir_active_generic_decl_idx = saved_decl_idx
+    ir_active_fn_bindings = saved_fn_bindings
     ir_current_impl_type = saved_impl_type
     ir_current_impl_subst_params = saved_impl_params
     ir_current_impl_subst_args = saved_impl_args

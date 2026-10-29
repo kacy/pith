@@ -1,0 +1,63 @@
+# the codegen reads a list's length and data pointer once, before a loop,
+# when nothing in the loop can change them. these loops pin the cases where
+# something can: a store that drops a value whose `drop` grows the list the
+# loop is reading, and pushes. each has to see the list as it is now.
+mut log: List[Int] := [0]
+
+struct Entry:
+    pub id: Int
+
+impl Drop for Entry:
+    fn drop():
+        log.push(self.id)
+
+# replacing an entry drops the old one, whose drop grows `log`. the loop
+# reads log's length and last element on every pass, so it has to notice.
+fn replace_and_watch() -> Int:
+    mut entries: List[Entry] := []
+    mut i := 0
+    while i < 4:
+        entries.push(Entry(id: i + 1))
+        i = i + 1
+    mut seen := 0
+    i = 0
+    while i < entries.len():
+        entries[i] = Entry(id: 10 + i)
+        seen = seen + log.len() * 100 + log[log.len() - 1]
+        i = i + 1
+    return seen
+
+# a loop that pushes to the list it is reading
+fn grow_while_reading() -> Int:
+    mut xs: List[Int] := [1, 2, 3]
+    mut i := 0
+    mut total := 0
+    while i < xs.len() and i < 10:
+        total = total + xs[i]
+        if xs.len() < 8:
+            xs.push(xs[i] * 10)
+        i = i + 1
+    return total * 100 + xs.len()
+
+# a read-only scan with scalar stores, the loop the hoist is for: two reads
+# of `src` and a store into `dst` per pass
+fn scan_and_store() -> Int:
+    src := [5, 3, 8, 1, 9, 2]
+    mut dst: List[Int] := [0, 0, 0, 0, 0, 0]
+    mut i := 0
+    while i + 1 < src.len():
+        if src[i] < src[i + 1]:
+            dst[i] = src[i]
+        else:
+            dst[i] = src[i + 1]
+        i = i + 1
+    mut total := 0
+    for x in dst:
+        total = total * 10 + x
+    return total
+
+fn main():
+    print(replace_and_watch().to_string())
+    print(log.len().to_string())
+    print(grow_while_reading().to_string())
+    print(scan_and_store().to_string())

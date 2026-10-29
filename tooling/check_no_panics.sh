@@ -24,7 +24,9 @@
 # runtime, and an `.unwrap()` in a test is how a test reports failure. the skip
 # runs from the attribute line to the closing brace at the attribute's own
 # indentation, which is what rustfmt produces; an item whose brace never turns
-# up is reported rather than silently swallowing the rest of the file.
+# up is reported rather than silently swallowing the rest of the file. a file
+# named `tests.rs` is skipped whole: it holds a module declared as
+# `#[cfg(test)] mod tests;` next to it.
 #
 # `std::process::exit` is scanned only in the runtime and the codegen crate. the
 # cli and the build script are programs, and a program exiting non-zero after
@@ -70,7 +72,7 @@ for root in "${roots[@]}"; do
   fi
   while IFS= read -r file; do
     files+=("$file")
-  done < <(find "$root" -name '*.rs' -type f | sort)
+  done < <(find "$root" -name '*.rs' ! -name tests.rs -type f | sort)
 done
 for file in "${extra_files[@]}"; do
   if [ ! -f "$file" ]; then

@@ -14,7 +14,7 @@
 //!
 //! The lock order and wake/park race are handled exactly as in [`channel`]: the
 //! waiter registers under the waitgroup lock and releases it before suspending,
-//! and `wake_green_waiters` runs while holding the lock (waitgroup -> slab ->
+//! and `wake_green_waiters` runs while holding the lock (waitgroup ->
 //! queue). See the channel module header for the full reasoning.
 //!
 //! [`channel`]: crate::concurrency::channel
@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 /// WaitGroup state
 pub struct WaitGroupState {
     count: usize,
-    /// slab ids of green tasks suspended in `wait()`. woken when the counter
+    /// ids of green tasks suspended in `wait()`. woken when the counter
     /// reaches zero; empty (and free) whenever no green task is waiting, so the
     /// os-thread path is untouched.
     green_waiters: Vec<usize>,
@@ -63,7 +63,7 @@ fn wait_state<'a>(
 /// wake every green task parked in `wait()` so it re-checks the counter. paired
 /// with the `cvar.notify_all()` in `done()` so green and os-thread waiters are
 /// signaled together. called while holding the waitgroup lock; `green::wake`
-/// nests the slab and queue locks under it (waitgroup -> slab -> queue).
+/// takes a run-queue lock under it (waitgroup -> queue).
 fn wake_green_waiters(state: &mut WaitGroupState) {
     for id in std::mem::take(&mut state.green_waiters) {
         green::wake(id);

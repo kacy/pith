@@ -476,8 +476,8 @@ cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
 the machinery behind that: coroutine stacks are pooled and reused rather
 than mapped and unmapped per task, so a fan-out of short tasks costs
 allocations, not TLB shootdowns; each task's scheduling state lives in one
-atomic word, so waking a task or resuming it never takes the scheduler's
-slab lock; and a channel wake only signals a condvar when an os-thread
+atomic word, so waking a task or resuming it takes no scheduler lock beyond
+one run queue's; and a channel wake only signals a condvar when an os-thread
 waiter is actually parked in it, because green waiters suspend their
 coroutine instead and rust's condvar pays a futex syscall per notify
 regardless of waiters. `PITH_GREEN_STATS=1` prints the wake breakdown,

@@ -1,6 +1,7 @@
 use crate::collections::list::{pith_list_new, pith_list_push_value};
 use crate::string;
 use std::alloc::{alloc, Layout};
+use std::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     // the length is already known, so allocate the headered cstring directly.
@@ -130,7 +131,7 @@ pub fn report_leaked_cstrings() {
             let Some(base) = cstring_base(s as i64 as *const i8 as *const i8) else {
                 continue;
             };
-            let rc = cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed);
+            let rc = cstring_refcount(base).load(Ordering::Relaxed);
             if rc == 0 {
                 continue;
             }
@@ -213,8 +214,8 @@ pub(crate) unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
     Some(base)
 }
 
-unsafe fn cstring_refcount(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
-    &*(base.add(4) as *const std::sync::atomic::AtomicU32)
+unsafe fn cstring_refcount(base: *mut u8) -> &'static AtomicU32 {
+    &*(base.add(4) as *const AtomicU32)
 }
 
 /// Bump the refcount of a heap cstring. No-op for literals and null.
@@ -224,7 +225,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
         return cstring_retain_hooked(s);
     }
     if let Some(base) = cstring_base(s) {
-        cstring_refcount(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -233,7 +234,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
 unsafe fn cstring_retain_hooked(s: *const i8) {
     if let Some(base) = cstring_base(s) {
         crate::perf_count(&crate::PERF_CSTRING_RETAINS, 1);
-        let prev = cstring_refcount(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let prev = cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
         cstring_watch(base, s, "retain", prev as i64, 1);
     }
 }
@@ -297,11 +298,11 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
                     String::from_utf8_lossy(bytes)
                 );
             }
-            cstring_refcount(base).store(0, std::sync::atomic::Ordering::Relaxed);
+            cstring_refcount(base).store(0, Ordering::Relaxed);
             return;
         }
         if prev == 1 {
-            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            fence(Ordering::Acquire);
             let needle = if HOOKED { debug_trace_needle() } else { None };
             if let Some(needle) = needle {
                 let data_len = (base.add(8) as *const u64).read() as usize;
@@ -339,7 +340,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
 /// temporary, is a load and a plain store instead of a locked
 /// read-modify-write.
 #[inline(always)]
-pub(crate) fn count_release(count: &std::sync::atomic::AtomicU32) -> u32 {
+pub(crate) fn count_release(count: &AtomicU32) -> u32 {
     use std::sync::atomic::Ordering;
     if count.load(Ordering::Acquire) == 1 {
         count.store(0, Ordering::Relaxed);
@@ -378,7 +379,7 @@ fn cstring_debug_no_free() -> bool {
 /// Test-only view of a heap cstring's refcount (None for literals/null).
 #[cfg(test)]
 pub(crate) unsafe fn cstring_refcount_for_tests(s: *const i8) -> Option<u32> {
-    cstring_base(s).map(|base| cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed))
+    cstring_base(s).map(|base| cstring_refcount(base).load(Ordering::Relaxed))
 }
 
 /// O(1) length from the header of a heap cstring or a compiled literal; None
@@ -401,7 +402,7 @@ pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
     if let Some(base) = cstring_base(s) {
-        let rc = cstring_refcount(base).load(std::sync::atomic::Ordering::Relaxed);
+        let rc = cstring_refcount(base).load(Ordering::Relaxed);
         if rc == 1 {
             if let Some(needle) = debug_trace_needle() {
                 let data_len = (base.add(8) as *const u64).read() as usize;
@@ -587,7 +588,7 @@ impl PithClosure {
         // no other task can reach this closure; the single count from
         // pith_closure_new is a cheap proxy for "has not escaped yet".
         debug_assert_eq!(
-            self.ref_count.load(std::sync::atomic::Ordering::Relaxed),
+            self.ref_count.load(Ordering::Relaxed),
             1,
             "closure spill grew after construction"
         );
@@ -770,7 +771,7 @@ pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
     if let Some(closure) = pith_closure_ref(handle) {
         closure
             .ref_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -792,7 +793,7 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     // marking it safe against a concurrent final release (see
     // `maybe_suspect_struct` for the full argument).
     let gc = crate::cycle::cycle_gc_enabled();
-    if gc && closure.ref_count.load(std::sync::atomic::Ordering::Relaxed) > 1 {
+    if gc && closure.ref_count.load(Ordering::Relaxed) > 1 {
         maybe_suspect_closure(closure, handle);
     }
     // a count of one is ours alone: no other owner is left to retain or
@@ -803,13 +804,13 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     // decrements of the owners before us. with the cycle collector on, the
     // suspect buffer can reach the closure without a count, so it keeps the
     // locked path.
-    let prev = if !gc && closure.ref_count.load(std::sync::atomic::Ordering::Acquire) == 1 {
-        closure.ref_count.store(0, std::sync::atomic::Ordering::Relaxed);
+    let prev = if !gc && closure.ref_count.load(Ordering::Acquire) == 1 {
+        closure.ref_count.store(0, Ordering::Relaxed);
         1
     } else {
         closure
             .ref_count
-            .fetch_sub(1, std::sync::atomic::Ordering::Release)
+            .fetch_sub(1, Ordering::Release)
     };
     if prev > 1 {
         return;
@@ -818,14 +819,14 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
         // over-release: restore and leave it alone
         closure
             .ref_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(1, Ordering::Relaxed);
         return;
     }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    fence(Ordering::Acquire);
     closure.release_captures();
     let buffered = closure
         .cycle_flags
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(Ordering::Relaxed)
         & 1
         != 0;
     // scrub the magic so a stale handle fails closure_base before we
@@ -850,7 +851,7 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
 unsafe fn maybe_suspect_closure(closure: &PithClosure, handle: i64) {
     if closure
         .cycle_flags
-        .fetch_or(1, std::sync::atomic::Ordering::Relaxed)
+        .fetch_or(1, Ordering::Relaxed)
         & 1
         != 0
     {
@@ -865,7 +866,7 @@ pub(crate) unsafe fn cycle_clear_closure_buffered(handle: i64) {
     if let Some(closure) = pith_closure_ref(handle) {
         closure
             .cycle_flags
-            .fetch_and(!1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_and(!1, Ordering::Relaxed);
     }
 }
 
@@ -882,7 +883,7 @@ pub(crate) unsafe fn cycle_closure_strong_count(handle: i64) -> Option<i64> {
     pith_closure_ref(handle).map(|closure| {
         closure
             .ref_count
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(Ordering::Relaxed)
     })
 }
 
@@ -893,7 +894,7 @@ pub(crate) unsafe fn cycle_closure_guard_strong(handle: i64, delta: i64) {
     if let Some(closure) = pith_closure_ref(handle) {
         closure
             .ref_count
-            .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(delta, Ordering::Relaxed);
     }
 }
 
@@ -906,7 +907,7 @@ pub(crate) unsafe fn closure_mark_shared(handle: i64) -> bool {
         Some(closure) => {
             closure
                 .cycle_flags
-                .fetch_or(crate::share::CONTAINER_SHARED_FLAG, std::sync::atomic::Ordering::Release)
+                .fetch_or(crate::share::CONTAINER_SHARED_FLAG, Ordering::Release)
                 & crate::share::CONTAINER_SHARED_FLAG
                 == 0
         }
@@ -955,7 +956,7 @@ pub(crate) unsafe fn cycle_closure_free_dead(handle: i64) {
     };
     let buffered = closure
         .cycle_flags
-        .load(std::sync::atomic::Ordering::Relaxed)
+        .load(Ordering::Relaxed)
         & 1
         != 0;
     (handle as *mut u32).write(0);
@@ -977,7 +978,7 @@ pub(crate) unsafe fn closure_buffered_for_tests(handle: i64) -> bool {
     pith_closure_ref(handle).is_some_and(|closure| {
         closure
             .cycle_flags
-            .load(std::sync::atomic::Ordering::Relaxed)
+            .load(Ordering::Relaxed)
             & 1
             != 0
     })
@@ -1367,13 +1368,13 @@ mod tests {
     static DTOR_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     unsafe extern "C" fn counting_dtor(_ptr: i64) {
-        DTOR_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DTOR_RUNS.fetch_add(1, Ordering::SeqCst);
     }
 
     /// a destructor that keeps a weak reference to the value it tears down.
     unsafe extern "C" fn weak_taking_dtor(ptr: i64) {
         pith_struct_weak_retain(ptr);
-        WEAK_TAKEN.store(ptr, std::sync::atomic::Ordering::SeqCst);
+        WEAK_TAKEN.store(ptr, Ordering::SeqCst);
     }
 
     static WEAK_TAKEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
@@ -1381,11 +1382,11 @@ mod tests {
     #[test]
     fn a_sole_owner_release_runs_the_destructor_once() {
         unsafe {
-            let before = DTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst);
+            let before = DTOR_RUNS.load(Ordering::SeqCst);
             let s = pith_struct_alloc(2);
             pith_struct_set_dtor(s, counting_dtor as usize as i64);
             pith_struct_release(s);
-            assert_eq!(DTOR_RUNS.load(std::sync::atomic::Ordering::SeqCst), before + 1);
+            assert_eq!(DTOR_RUNS.load(Ordering::SeqCst), before + 1);
             assert_eq!(pith_struct_strong_count(s), 0); // freed: magic scrubbed
         }
     }
@@ -1396,7 +1397,7 @@ mod tests {
             let s = pith_struct_alloc(1);
             pith_struct_set_dtor(s, weak_taking_dtor as usize as i64);
             pith_struct_release(s);
-            assert_eq!(WEAK_TAKEN.load(std::sync::atomic::Ordering::SeqCst), s);
+            assert_eq!(WEAK_TAKEN.load(Ordering::SeqCst), s);
             // the header outlives the value for the weak reference
             assert_eq!(struct_counts(s).1, 1);
             assert_eq!(pith_struct_weak_load(s), 0);
@@ -1627,7 +1628,7 @@ pub unsafe extern "C" fn pith_cstring_append_many(
         }
     }
     let header = cstring_base(base).filter(|&h| {
-        cstring_refcount(h).load(std::sync::atomic::Ordering::Acquire) == 1
+        cstring_refcount(h).load(Ordering::Acquire) == 1
             && !parts.contains(&base)
             && !cstring_debug_no_free()
             && leak_scan_registry().is_none()
@@ -1824,7 +1825,7 @@ static TEST_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 #[no_mangle]
 pub extern "C" fn pith_assert(cond: i64) {
     if cond == 0 {
-        TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+        TEST_FAILED.store(true, Ordering::Relaxed);
         let message = "assertion failed";
         record_failure_detail(message);
         eprintln!("{}", message);
@@ -1836,7 +1837,7 @@ pub extern "C" fn pith_assert(cond: i64) {
 /// own tests, which provoke failures deliberately.
 #[no_mangle]
 pub extern "C" fn pith_test_set_failed(failed: i64) {
-    TEST_FAILED.store(failed != 0, std::sync::atomic::Ordering::Relaxed);
+    TEST_FAILED.store(failed != 0, Ordering::Relaxed);
 }
 
 // --- test value equality ----------------------------------------------------
@@ -1938,7 +1939,7 @@ unsafe fn assert_operand(v: i64, kind: i64) -> String {
 /// `a`/`b` must be valid values of the given `kind` for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_assert_eq_fail(a: i64, b: i64, kind: i64) {
-    TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    TEST_FAILED.store(true, Ordering::Relaxed);
     let message = format!(
         "assertion failed: {} != {}",
         assert_operand(a, kind),
@@ -1956,7 +1957,7 @@ pub unsafe extern "C" fn pith_assert_eq_fail(a: i64, b: i64, kind: i64) {
 /// `a`/`b` must be valid values of the given `kind` for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_assert_ne_fail(a: i64, b: i64, kind: i64) {
-    TEST_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    TEST_FAILED.store(true, Ordering::Relaxed);
     let message = format!(
         "assertion failed: {} == {}",
         assert_operand(a, kind),
@@ -1981,8 +1982,6 @@ pub unsafe extern "C" fn pith_assert_ne_fail(a: i64, b: i64, kind: i64) {
 // still leaves every record written before it. one json document could not be
 // closed by a process that died, and buffering the whole run to close it would
 // throw away the streaming the fork-per-test design is built on.
-
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 static TEST_PASS: AtomicUsize = AtomicUsize::new(0);
 static TEST_FAIL: AtomicUsize = AtomicUsize::new(0);
@@ -2454,7 +2453,7 @@ pub extern "C" fn pith_test_child_ok() -> i64 {
     use std::io::Write;
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    if TEST_FAILED.load(std::sync::atomic::Ordering::Relaxed) {
+    if TEST_FAILED.load(Ordering::Relaxed) {
         // panic-guard: a failing test child exits non-zero for the harness.
         std::process::exit(1);
     }
@@ -3232,14 +3231,14 @@ fn struct_pool_probe() -> bool {
     );
     STRUCT_POOL_STATE.store(
         if enabled { 2 } else { 1 },
-        std::sync::atomic::Ordering::Relaxed,
+        Ordering::Relaxed,
     );
     enabled
 }
 
 #[inline(always)]
 fn struct_pool_enabled() -> bool {
-    match STRUCT_POOL_STATE.load(std::sync::atomic::Ordering::Relaxed) {
+    match STRUCT_POOL_STATE.load(Ordering::Relaxed) {
         1 => false,
         2 => true,
         _ => struct_pool_probe(),
@@ -3300,7 +3299,7 @@ impl Drop for PoolHandle {
         unsafe {
             (*self.0)
                 .owned
-                .store(false, std::sync::atomic::Ordering::Release);
+                .store(false, Ordering::Release);
         }
     }
 }
@@ -3331,8 +3330,8 @@ fn adopt_pool_slot() -> *mut PoolSlot {
             .compare_exchange(
                 false,
                 true,
-                std::sync::atomic::Ordering::Acquire,
-                std::sync::atomic::Ordering::Relaxed,
+                Ordering::Acquire,
+                Ordering::Relaxed,
             )
             .is_ok()
         {
@@ -3531,12 +3530,12 @@ const STRUCT_OFF_DEAD: usize = 12;
 const STRUCT_OFF_SIZE: usize = 16;
 const STRUCT_OFF_DTOR: usize = 24;
 
-unsafe fn struct_strong(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
-    &*(base.add(STRUCT_OFF_STRONG) as *const std::sync::atomic::AtomicU32)
+unsafe fn struct_strong(base: *mut u8) -> &'static AtomicU32 {
+    &*(base.add(STRUCT_OFF_STRONG) as *const AtomicU32)
 }
 
-unsafe fn struct_weak(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
-    &*(base.add(STRUCT_OFF_WEAK) as *const std::sync::atomic::AtomicU32)
+unsafe fn struct_weak(base: *mut u8) -> &'static AtomicU32 {
+    &*(base.add(STRUCT_OFF_WEAK) as *const AtomicU32)
 }
 
 // the dead flag must be an atomic like its neighbors: structs cross task (and
@@ -3561,20 +3560,45 @@ pub(crate) const STRUCT_SHARED_BIT: u32 = 4;
 pub const STRUCT_FLAGS_FROM_DATA: i32 = STRUCT_OFF_DEAD as i32 - STRUCT_HEADER as i32;
 pub const STRUCT_SHARED_MASK: u32 = STRUCT_SHARED_BIT;
 
+/// Add one to a struct count. A struct only one task can reach needs no
+/// locked instruction.
+#[inline(always)]
+fn count_up(count: &AtomicU32, local: bool) {
+    if local {
+        count.store(count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+    } else {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Subtract one from a struct count and return what it held before. The
+/// shared form releases, so the owner that takes the count to zero sees
+/// every earlier owner's writes once it fences.
+#[inline(always)]
+fn count_down(count: &AtomicU32, local: bool) -> u32 {
+    if local {
+        let held = count.load(Ordering::Relaxed);
+        count.store(held.wrapping_sub(1), Ordering::Relaxed);
+        held
+    } else {
+        count.fetch_sub(1, Ordering::Release)
+    }
+}
+
 /// Whether this struct's counts are plain: local counts are on and nothing
 /// has marked the struct shared. `switches` is the caller's copy of
 /// `switches::get()`, so a count path reads the switch byte once.
 #[inline(always)]
 unsafe fn struct_local(base: *mut u8, switches: u8) -> bool {
     switches & crate::switches::LOCAL_COUNTS != 0
-        && struct_dead(base).load(std::sync::atomic::Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
+        && struct_dead(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
 }
 
 /// Whether the struct at `ptr` is marked shared. False for anything that is
 /// not a live struct.
 pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
     match struct_base(ptr) {
-        Some(base) => struct_dead(base).load(std::sync::atomic::Ordering::Relaxed) & STRUCT_SHARED_BIT != 0,
+        Some(base) => struct_dead(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT != 0,
         None => false,
     }
 }
@@ -3583,14 +3607,14 @@ pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
 pub(crate) unsafe fn struct_mark_shared(ptr: i64) -> bool {
     match struct_base(ptr) {
         Some(base) => {
-            struct_dead(base).fetch_or(STRUCT_SHARED_BIT, std::sync::atomic::Ordering::Release) & STRUCT_SHARED_BIT == 0
+            struct_dead(base).fetch_or(STRUCT_SHARED_BIT, Ordering::Release) & STRUCT_SHARED_BIT == 0
         }
         None => false,
     }
 }
 
-unsafe fn struct_dead(base: *mut u8) -> &'static std::sync::atomic::AtomicU32 {
-    &*(base.add(STRUCT_OFF_DEAD) as *const std::sync::atomic::AtomicU32)
+unsafe fn struct_dead(base: *mut u8) -> &'static AtomicU32 {
+    &*(base.add(STRUCT_OFF_DEAD) as *const AtomicU32)
 }
 
 // drop one unit of weak; free the allocation when it reaches zero. this is the
@@ -3600,23 +3624,20 @@ unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
     let weak = struct_weak(base);
     if struct_local(base, switches) {
         crate::share::check_local(switches, base.add(STRUCT_HEADER) as i64, "weak release");
-        let held = weak.load(std::sync::atomic::Ordering::Relaxed);
-        if held != 1 {
-            weak.store(held.wrapping_sub(1), std::sync::atomic::Ordering::Relaxed);
-            return;
+        if count_down(weak, true) == 1 {
+            struct_free_header(base);
         }
-        struct_free_header(base);
         return;
     }
     // a count of one is ours alone: a new weak reference is made only from a
     // strong or a weak one, and there is neither, so the drop needs no
     // read-modify-write. the acquire load pairs with the release decrements
     // of the holders that went before.
-    if weak.load(std::sync::atomic::Ordering::Acquire) != 1 {
-        if weak.fetch_sub(1, std::sync::atomic::Ordering::Release) != 1 {
+    if weak.load(Ordering::Acquire) != 1 {
+        if weak.fetch_sub(1, Ordering::Release) != 1 {
             return;
         }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        fence(Ordering::Acquire);
     }
     struct_free_header(base);
 }
@@ -3731,15 +3752,11 @@ unsafe fn struct_retain<const HOOKED: bool>(ptr: i64, switches: u8) {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RETAIN);
     }
     if let Some(base) = struct_base(ptr) {
-        let strong = struct_strong(base);
-        if struct_local(base, switches) {
-            if HOOKED {
-                crate::share::check_local(switches, ptr, "retain");
-            }
-            strong.store(strong.load(std::sync::atomic::Ordering::Relaxed) + 1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            strong.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let local = struct_local(base, switches);
+        if HOOKED && local {
+            crate::share::check_local(switches, ptr, "retain");
         }
+        count_up(struct_strong(base), local);
     }
 }
 
@@ -3757,7 +3774,7 @@ unsafe fn struct_retain<const HOOKED: bool>(ptr: i64, switches: u8) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_strong_count(ptr: i64) -> i64 {
     match struct_base(ptr) {
-        Some(base) => struct_strong(base).load(std::sync::atomic::Ordering::Acquire) as i64,
+        Some(base) => struct_strong(base).load(Ordering::Acquire) as i64,
         None => 0,
     }
 }
@@ -3802,8 +3819,8 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     // upgrade it, so the last release skips the decrement. the acquire
     // loads pair with the release decrements of the owners that went before.
     let weak = struct_weak(base);
-    let sole = strong.load(std::sync::atomic::Ordering::Acquire) == 1
-        && weak.load(std::sync::atomic::Ordering::Acquire) == 1;
+    let sole = strong.load(Ordering::Acquire) == 1
+        && weak.load(Ordering::Acquire) == 1;
     if HOOKED && sole {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_SOLE_RELEASE);
     }
@@ -3817,30 +3834,23 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
         // hook's feet. if other owners release between this load and our
         // decrement, the struct simply dies buffered, which the death path
         // below already supports.
-        if HOOKED && switches & crate::switches::CYCLE_GC != 0 && strong.load(std::sync::atomic::Ordering::Relaxed) > 1 {
+        if HOOKED && switches & crate::switches::CYCLE_GC != 0 && strong.load(Ordering::Relaxed) > 1 {
             maybe_suspect_struct(ptr, base);
         }
-        // a struct no other task can reach: nothing races this update
         let local = struct_local(base, switches);
         if HOOKED && local {
             crate::share::check_local(switches, ptr, "release");
         }
-        let prev = if local {
-            let held = strong.load(std::sync::atomic::Ordering::Relaxed);
-            strong.store(held.wrapping_sub(1), std::sync::atomic::Ordering::Relaxed);
-            held
-        } else {
-            strong.fetch_sub(1, std::sync::atomic::Ordering::Release)
-        };
+        let prev = count_down(strong, local);
         if prev > 1 {
             return;
         }
         if prev == 0 {
             // over-release: restore and leave the object alone
-            strong.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            strong.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        fence(Ordering::Acquire);
     }
     let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
     if dtor != 0 {
@@ -3853,7 +3863,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
         // inside can reach zero. the value is freed below whatever the count
         // reads afterwards; a `drop` that lets `self` escape leaves a
         // dangling reference, which is documented rather than guarded.
-        strong.store(1, std::sync::atomic::Ordering::Relaxed);
+        strong.store(1, Ordering::Relaxed);
         // panic-guard: calling a compiler-emitted struct destructor from its header slot.
         let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
         f(ptr);
@@ -3864,7 +3874,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     // with only the implicit weak unit left, nothing can read the dead flag,
     // so the header is freed without setting it. a destructor that made a
     // weak reference, or a suspect buffer holding one, keeps the full path.
-    if weak.load(std::sync::atomic::Ordering::Acquire) == 1 {
+    if weak.load(Ordering::Acquire) == 1 {
         struct_free_header(base);
         return;
     }
@@ -3874,7 +3884,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     // buffered bit survives. then drop the implicit weak unit, which frees the
     // header if no weak refs remain — for a buffered struct the suspect
     // buffer's weak count keeps the header alive past this point.
-    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, std::sync::atomic::Ordering::Release);
+    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
     struct_weak_drop(base, switches);
 }
 
@@ -3885,13 +3895,13 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
 #[cold]
 #[inline(never)]
 unsafe fn maybe_suspect_struct(ptr: i64, base: *mut u8) {
-    if struct_dead(base).fetch_or(STRUCT_BUFFERED_BIT, std::sync::atomic::Ordering::Relaxed)
+    if struct_dead(base).fetch_or(STRUCT_BUFFERED_BIT, Ordering::Relaxed)
         & STRUCT_BUFFERED_BIT
         != 0
     {
         return; // already buffered
     }
-    struct_weak(base).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    struct_weak(base).fetch_add(1, Ordering::Relaxed);
     crate::cycle::cycle_suspect(ptr as usize, crate::cycle::CYCLE_KIND_STRUCT);
 }
 
@@ -3900,7 +3910,7 @@ unsafe fn maybe_suspect_struct(ptr: i64, base: *mut u8) {
 /// header that is already gone is a no-op.
 pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
     if let Some(base) = struct_base(ptr) {
-        struct_dead(base).fetch_and(!STRUCT_BUFFERED_BIT, std::sync::atomic::Ordering::Relaxed);
+        struct_dead(base).fetch_and(!STRUCT_BUFFERED_BIT, Ordering::Relaxed);
     }
 }
 
@@ -3915,7 +3925,7 @@ pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
 /// a drained entry), `None` when the pointer is not a struct header at all.
 pub(crate) unsafe fn cycle_struct_alive(ptr: i64) -> Option<bool> {
     let base = struct_base(ptr)?;
-    Some(struct_dead(base).load(std::sync::atomic::Ordering::Relaxed) & STRUCT_DEAD_BIT == 0)
+    Some(struct_dead(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0)
 }
 
 /// The struct's current strong count, or `None` for a dead value or a
@@ -3923,10 +3933,10 @@ pub(crate) unsafe fn cycle_struct_alive(ptr: i64) -> Option<bool> {
 /// corpse.
 pub(crate) unsafe fn cycle_struct_strong_count(ptr: i64) -> Option<u32> {
     let base = struct_base(ptr)?;
-    if struct_dead(base).load(std::sync::atomic::Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
+    if struct_dead(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
         return None;
     }
-    Some(struct_strong(base).load(std::sync::atomic::Ordering::Relaxed))
+    Some(struct_strong(base).load(Ordering::Relaxed))
 }
 
 /// The compiled destructor in the header's dtor slot, or 0 for none (a
@@ -3941,7 +3951,7 @@ pub(crate) unsafe fn cycle_struct_dtor_slot(ptr: i64) -> u64 {
 /// Add `delta` to the strong count — the collector's teardown guard.
 pub(crate) unsafe fn cycle_struct_guard_strong(ptr: i64, delta: u32) {
     if let Some(base) = struct_base(ptr) {
-        struct_strong(base).fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+        struct_strong(base).fetch_add(delta, Ordering::Relaxed);
     }
 }
 
@@ -3969,21 +3979,21 @@ pub(crate) unsafe fn cycle_struct_free_dead(ptr: i64) {
         return;
     };
     crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
-    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, std::sync::atomic::Ordering::Release);
+    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
     struct_weak_drop(base, crate::switches::get());
 }
 
 #[cfg(test)]
 pub(crate) unsafe fn struct_dead_word_for_tests(ptr: i64) -> u32 {
     struct_base(ptr)
-        .map(|base| struct_dead(base).load(std::sync::atomic::Ordering::Relaxed))
+        .map(|base| struct_dead(base).load(Ordering::Relaxed))
         .unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
 pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
     struct_base(ptr)
-        .map(|base| struct_weak(base).load(std::sync::atomic::Ordering::Relaxed))
+        .map(|base| struct_weak(base).load(Ordering::Relaxed))
         .unwrap_or(u32::MAX)
 }
 
@@ -3997,13 +4007,11 @@ pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
     let switches = crate::switches::get();
     crate::perf::count_rc_op(switches, crate::perf::RC_WEAK_RETAIN);
     if let Some(base) = struct_base(ptr) {
-        let weak = struct_weak(base);
-        if struct_local(base, switches) {
+        let local = struct_local(base, switches);
+        if local {
             crate::share::check_local(switches, ptr, "weak retain");
-            weak.store(weak.load(std::sync::atomic::Ordering::Relaxed) + 1, std::sync::atomic::Ordering::Relaxed);
-        } else {
-            weak.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        count_up(struct_weak(base), local);
     }
 }
 
@@ -4036,7 +4044,7 @@ pub unsafe extern "C" fn pith_struct_weak_load(ptr: i64) -> i64 {
     // that sees the target dead also sees its destructor's effects. test the
     // death bit specifically — a live struct sitting in the cycle collector's
     // suspect buffer has bit 1 set and must still read as alive.
-    if struct_dead(base).load(std::sync::atomic::Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+    if struct_dead(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
         return 0;
     }
     ptr

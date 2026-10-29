@@ -96,11 +96,10 @@ struct TaskShared {
 // ---------------------------------------------------------------------------
 // generational slotmap
 //
-// the same shape as the green backend's `Slab`: `entries` grows on demand and
-// `free` holds the indices of reclaimed slots ready for the next spawn. without
-// reclamation this vector grew by one entry per task ever spawned and never
-// shrank — an unbounded leak on a long-running server that fans out one task per
-// connection. reusing a slot bumps its generation so a stale handle can never
+// `entries` grows on demand and `free` holds the indices of reclaimed slots
+// ready for the next spawn. without reclamation this vector grew by one entry
+// per task ever spawned and never shrank, an unbounded leak on a long-running
+// server that fans out one task per connection. reusing a slot bumps its generation so a stale handle can never
 // alias the task that takes its place.
 // ---------------------------------------------------------------------------
 

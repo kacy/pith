@@ -52,8 +52,8 @@
 //!
 //! when the channel lock and the scheduler's locks nest, the channel lock is
 //! always the outer one: `wake_green` runs while holding the channel lock
-//! and calls `green::wake`, which takes the slab lock and then a queue lock —
-//! channel -> slab -> queue. a parking green task does the reverse-free thing: it
+//! and calls `green::wake`, which takes a run-queue lock: channel -> queue.
+//! a parking green task does the reverse-free thing: it
 //! *releases* the channel lock before it suspends (see `block_on_channel`),
 //! because `suspend` hands control to the worker, which may re-enter this same
 //! channel. so we never hold the channel lock across a suspend, and never take
@@ -255,7 +255,7 @@ struct ChannelState {
     /// their scheduler instead, no syscall involved.
     os_receivers_waiting: usize,
     os_senders_waiting: usize,
-    /// slab ids of green *receivers* suspended on this channel, and of green
+    /// ids of green *receivers* suspended on this channel, and of green
     /// *senders*, kept apart. a notify only ever needs to wake the opposite role:
     /// a receiver becomes runnable when a sender makes room or deposits a value,
     /// and vice versa. waking a same-role sibling would only ever wake a task that
@@ -480,8 +480,8 @@ fn lock_state(lock: &Mutex<ChannelState>) -> MutexGuard<'_, ChannelState> {
 /// safe: a woken task re-evaluates under the channel lock and re-parks if it
 /// still cannot proceed, the same tolerance the condvar loops rely on.
 ///
-/// called while holding the channel lock; `green::wake` nests the slab and queue
-/// locks under it (see the lock-order note above).
+/// called while holding the channel lock; `green::wake` takes a run-queue lock
+/// under it (see the lock-order note above).
 fn wake_green(state: &mut ChannelState, role: Role) {
     // drain first: a woken task that re-parks will re-add itself, and draining
     // keeps a task from being enqueued twice for one notify.

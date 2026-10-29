@@ -28,7 +28,6 @@
 
 use crate::collections::list::ListTypeTag;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
 
 /// The mark a list, map or closure carries in its flag byte once shared.
@@ -40,60 +39,6 @@ const CHILD_MAP: u8 = 3;
 const CHILD_STRUCT: u8 = 6;
 const CHILD_CLOSURE: u8 = 7;
 const CHILD_WEAK: u8 = 8;
-
-// how counts are kept, settled once so the count paths read one byte:
-// 0 = not settled yet, 1 = every count atomic, 2 = local counts plain,
-// 3 = local counts plain and checked against their owner
-const MODE_UNSET: u8 = 0;
-const MODE_ATOMIC: u8 = 1;
-const MODE_LOCAL: u8 = 2;
-const MODE_CHECKED: u8 = 3;
-static MODE: AtomicU8 = AtomicU8::new(MODE_UNSET);
-
-#[cold]
-fn settle_mode() -> u8 {
-    let local = !matches!(
-        std::env::var("PITH_LOCAL_COUNTS").as_deref(),
-        Ok("0") | Ok("off") | Ok("false")
-    );
-    let check = matches!(std::env::var("PITH_RC_CHECK").as_deref(), Ok("1") | Ok("on") | Ok("true"));
-    // the cycle collector reaches structs through its suspect buffer with no
-    // count of its own, so with it on every count stays atomic
-    let mode = if !local || crate::cycle::cycle_gc_enabled() {
-        MODE_ATOMIC
-    } else if check {
-        MODE_CHECKED
-    } else {
-        MODE_LOCAL
-    };
-    MODE.store(mode, Ordering::Relaxed);
-    mode
-}
-
-#[inline(always)]
-fn mode() -> u8 {
-    match MODE.load(Ordering::Relaxed) {
-        MODE_UNSET => settle_mode(),
-        m => m,
-    }
-}
-
-/// Settle the mode again, after a test switched the cycle collector.
-pub(crate) fn reset_mode() {
-    MODE.store(MODE_UNSET, Ordering::Relaxed);
-}
-
-/// Whether a local struct's counts may be updated without atomics: on unless
-/// `PITH_LOCAL_COUNTS=0` or the cycle collector is on.
-#[inline(always)]
-pub(crate) fn local_counts() -> bool {
-    mode() >= MODE_LOCAL
-}
-
-#[inline(always)]
-fn check_on() -> bool {
-    mode() == MODE_CHECKED
-}
 
 /// Mark `value`, a heap value of the kind `tag` (an element tag code), and
 /// everything it reaches as shared.
@@ -235,11 +180,18 @@ fn forget_owner_slow(ptr: i64) {
     }
 }
 
-/// A plain count update on a local struct: in check mode, abort if a task
-/// other than the one that built it is making it.
+/// Whether `PITH_RC_CHECK` asked for owner checks on plain counts.
 #[inline(always)]
-pub(crate) fn check_local(ptr: i64, op: &str) {
-    if check_on() {
+fn check_on() -> bool {
+    crate::switches::any(crate::switches::RC_CHECK)
+}
+
+/// A plain count update on a local struct: in check mode, abort if a task
+/// other than the one that built it is making it. `switches` is the caller's
+/// copy of `switches::get()`.
+#[inline(always)]
+pub(crate) fn check_local(switches: u8, ptr: i64, op: &str) {
+    if switches & crate::switches::RC_CHECK != 0 {
         check_local_slow(ptr, op);
     }
 }

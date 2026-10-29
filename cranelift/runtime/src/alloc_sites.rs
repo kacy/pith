@@ -8,12 +8,9 @@
 //! `PITH_KEEP_SYMBOLS=1`, or every site prints as unknown.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-// 0 = not probed yet, 1 = off, 2 = on: the settled check on the allocation
-// paths is one relaxed load and a predictable branch
-static STATE: AtomicU8 = AtomicU8::new(0);
 static PERIOD: AtomicU64 = AtomicU64::new(1);
 static TICK: AtomicU64 = AtomicU64::new(0);
 static SITES: Mutex<Option<HashMap<(&'static str, String), u64>>> = Mutex::new(None);
@@ -24,63 +21,27 @@ pub const STRUCT_KINDS: [&str; 17] = [
     "struct/14", "struct/15", "struct/16+",
 ];
 
-#[cold]
-fn probe() -> bool {
+/// Read `PITH_ALLOC_SITES` and arm the census. Runs once before main, while
+/// the switches settle; returns whether the census is on.
+pub(crate) fn start() -> bool {
     let period = std::env::var("PITH_ALLOC_SITES")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(0);
     if period == 0 {
-        STATE.store(1, Ordering::Relaxed);
         return false;
     }
     PERIOD.store(period, Ordering::Relaxed);
-    STATE.store(2, Ordering::Relaxed);
     unsafe {
         libc::atexit(report);
     }
     true
 }
 
-// whether PITH_PERF_STATS or PITH_ALLOC_SITES asked for anything: the struct
-// allocation path checks this one settled byte and keeps both off its hot path.
-// 0 = not settled yet, 1 = neither, 2 = at least one.
-static DIAGNOSTICS: AtomicU8 = AtomicU8::new(0);
-
-#[cold]
-fn settle_diagnostics() -> bool {
-    let on = crate::perf_stats_enabled() || record_enabled();
-    DIAGNOSTICS.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-    on
-}
-
-/// Whether the counters or the census want to hear about allocations.
-#[inline(always)]
-pub fn diagnostics_on() -> bool {
-    match DIAGNOSTICS.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => settle_diagnostics(),
-    }
-}
-
-fn record_enabled() -> bool {
-    match STATE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => probe(),
-    }
-}
-
 /// Note one allocation of `kind`.
 #[inline(always)]
 pub fn record(kind: &'static str) {
-    let on = match STATE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => probe(),
-    };
-    if on {
+    if crate::switches::any(crate::switches::ALLOC_SITES) {
         record_slow(kind);
     }
 }

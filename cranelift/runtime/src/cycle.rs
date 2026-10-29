@@ -49,30 +49,10 @@ pub(crate) const CYCLE_KIND_MAP: u8 = 4;
 /// leaked, not collected, which is the acceptable direction to fail in.
 pub const CYCLE_SUSPECT_CAP: usize = 65536;
 
-// 0 = not probed yet, 1 = disabled, 2 = enabled. probed once from the env on
-// first use; the settled path is one relaxed load and a predictable branch,
-// same as the struct-pool and perf-stats gates.
-static CYCLE_GC_STATE: AtomicU8 = AtomicU8::new(0);
-
-#[cold]
-fn cycle_gc_probe() -> bool {
-    let enabled = matches!(
-        std::env::var("PITH_CYCLE_GC").as_deref(),
-        Ok("1") | Ok("on") | Ok("true")
-    );
-    CYCLE_GC_STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
-    enabled
-}
-
-/// Whether `PITH_CYCLE_GC` asked for suspect tracking. Cheap enough for the
-/// release fast paths: a relaxed load and a branch once the probe has run.
+/// Whether `PITH_CYCLE_GC` asked for suspect tracking.
 #[inline(always)]
 pub fn cycle_gc_enabled() -> bool {
-    match CYCLE_GC_STATE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => cycle_gc_probe(),
-    }
+    crate::switches::any(crate::switches::CYCLE_GC)
 }
 
 // the suspect buffer and the graveyard are plain locked vecs: both are
@@ -1377,15 +1357,13 @@ pub extern "C" fn pith_cycle_gc_stats() {
 
 // test support: the enable state and the buffers are process globals, so
 // every test that turns the flag on serializes on CYCLE_TEST_LOCK and puts
-// the world back before releasing it. the probe is bypassed by storing the
-// settled state directly.
+// the world back before releasing it.
 #[cfg(test)]
 pub(crate) static CYCLE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]
 pub(crate) fn force_enabled_for_tests(enabled: bool) {
-    CYCLE_GC_STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
-    crate::share::reset_mode();
+    crate::switches::set_cycle_gc_for_tests(enabled);
 }
 
 #[cfg(test)]

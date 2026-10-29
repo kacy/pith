@@ -149,15 +149,41 @@ pub fn report_leaked_cstrings() {
     }
 }
 
+// the switches that add work to a string allocation, retain or release.
+// with none of them on, those paths call nothing they do not need; the copies
+// that count, sample and debug live out of line.
+const CSTRING_HOOKS: u8 = crate::switches::PERF_STATS
+    | crate::switches::ALLOC_SITES
+    | crate::switches::CSTRING_DEBUG;
+
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
-    crate::alloc_sites::record("string");
-    crate::perf_count(&crate::PERF_CSTRING_ALLOCS, 1);
+    if crate::switches::any(CSTRING_HOOKS) {
+        return alloc_cstring_hooked(data_len);
+    }
+    alloc_cstring::<false>(data_len)
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn alloc_cstring_hooked(data_len: usize) -> *mut i8 {
+    alloc_cstring::<true>(data_len)
+}
+
+#[inline(always)]
+unsafe fn alloc_cstring<const HOOKED: bool>(data_len: usize) -> *mut i8 {
+    if HOOKED {
+        crate::alloc_sites::record("string");
+        crate::perf_count(&crate::PERF_CSTRING_ALLOCS, 1);
+    }
     let base = pith_alloc(cstring_layout(data_len));
     (base as *mut u32).write(CSTRING_MAGIC);
     (base.add(4) as *mut u32).write(1);
     (base.add(8) as *mut u64).write(data_len as u64);
     let data = base.add(CSTRING_HEADER_SIZE) as *mut i8;
     *data.add(data_len) = 0;
+    if !HOOKED {
+        return data;
+    }
     if let Some(reg) = leak_scan_registry() {
         reg.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -178,7 +204,11 @@ pub(crate) unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
         return None;
     }
     let base = (s as *const u8).sub(CSTRING_HEADER_SIZE) as *mut u8;
-    if (base as *const u32).read() != CSTRING_MAGIC {
+    // volatile, because for a literal this reads memory outside the literal.
+    // once the compiler can see the pointer (a runtime literal, inlined into
+    // a caller), a plain read lets it assume the magic matched and write a
+    // count into read-only data.
+    if std::ptr::read_volatile(base as *const u32) != CSTRING_MAGIC {
         return None;
     }
     Some(base)
@@ -191,6 +221,17 @@ unsafe fn cstring_refcount(base: *mut u8) -> &'static AtomicU32 {
 /// Bump the refcount of a heap cstring. No-op for literals and null.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
+    if crate::switches::any(CSTRING_HOOKS) {
+        return cstring_retain_hooked(s);
+    }
+    if let Some(base) = cstring_base(s) {
+        cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn cstring_retain_hooked(s: *const i8) {
     if let Some(base) = cstring_base(s) {
         crate::perf_count(&crate::PERF_CSTRING_RETAINS, 1);
         let prev = cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
@@ -223,15 +264,33 @@ unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delt
 /// instead of double-freeing. No-op for literals and null.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
+    if crate::switches::any(CSTRING_HOOKS) {
+        return cstring_release_hooked(s);
+    }
+    cstring_release::<false>(s);
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn cstring_release_hooked(s: *const i8) {
+    cstring_release::<true>(s);
+}
+
+#[inline(always)]
+unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
     if let Some(base) = cstring_base(s) {
-        crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
+        if HOOKED {
+            crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
+        }
         let prev = count_release(cstring_refcount(base));
-        cstring_watch(base, s, "release", prev as i64, -1);
+        if HOOKED {
+            cstring_watch(base, s, "release", prev as i64, -1);
+        }
         if prev == 0 {
             // an over-release means the emitter's ownership accounting is
             // wrong somewhere; report it loudly in debug runs instead of
             // corrupting the heap.
-            if cstring_debug_no_free() {
+            if HOOKED && cstring_debug_no_free() {
                 let data_len = (base.add(8) as *const u64).read() as usize;
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(60));
                 eprintln!(
@@ -244,7 +303,8 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
         }
         if prev == 1 {
             fence(Ordering::Acquire);
-            if let Some(needle) = debug_trace_needle() {
+            let needle = if HOOKED { debug_trace_needle() } else { None };
+            if let Some(needle) = needle {
                 let data_len = (base.add(8) as *const u64).read() as usize;
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
                 let content = String::from_utf8_lossy(bytes);
@@ -252,7 +312,7 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
                     eprintln!("pith trace: final release of {:?} at {:p}", content, s);
                 }
             }
-            if cstring_debug_no_free() {
+            if HOOKED && cstring_debug_no_free() {
                 // scrub instead of freeing: a read-after-release shows up
                 // as '!' runs in program output instead of silent reuse
                 let data_len = (base.add(8) as *const u64).read() as usize;
@@ -265,7 +325,9 @@ pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
             }
             let data_len = (base.add(8) as *const u64).read() as usize;
             (base as *mut u32).write(0);
-            crate::perf_count(&crate::PERF_CSTRING_FREES, 1);
+            if HOOKED {
+                crate::perf_count(&crate::PERF_CSTRING_FREES, 1);
+            }
             std::alloc::dealloc(base, cstring_layout(data_len));
         }
     }
@@ -3396,7 +3458,7 @@ unsafe fn struct_pool_return(base: *mut u8, total: usize) -> bool {
 pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     use std::alloc::alloc_zeroed;
 
-    if crate::alloc_sites::diagnostics_on() {
+    if crate::switches::any(crate::switches::PERF_STATS | crate::switches::ALLOC_SITES) {
         struct_alloc_diagnostics(num_fields);
     }
     let size = (num_fields.max(0) as usize) * 8;
@@ -3523,9 +3585,13 @@ fn count_down(count: &AtomicU32, local: bool) -> u32 {
     }
 }
 
+/// Whether this struct's counts are plain: local counts are on and nothing
+/// has marked the struct shared. `switches` is the caller's copy of
+/// `switches::get()`, so a count path reads the switch byte once.
 #[inline(always)]
-unsafe fn struct_local(base: *mut u8) -> bool {
-    crate::share::local_counts() && struct_dead(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
+unsafe fn struct_local(base: *mut u8, switches: u8) -> bool {
+    switches & crate::switches::LOCAL_COUNTS != 0
+        && struct_dead(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
 }
 
 /// Whether the struct at `ptr` is marked shared. False for anything that is
@@ -3554,10 +3620,10 @@ unsafe fn struct_dead(base: *mut u8) -> &'static AtomicU32 {
 // drop one unit of weak; free the allocation when it reaches zero. this is the
 // single place a struct header is deallocated, so the strong path and every
 // weak reference funnel their final drop through here.
-unsafe fn struct_weak_drop(base: *mut u8) {
+unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
     let weak = struct_weak(base);
-    if struct_local(base) {
-        crate::share::check_local(base.add(STRUCT_HEADER) as i64, "weak release");
+    if struct_local(base, switches) {
+        crate::share::check_local(switches, base.add(STRUCT_HEADER) as i64, "weak release");
         if count_down(weak, true) == 1 {
             struct_free_header(base);
         }
@@ -3662,11 +3728,33 @@ pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
-    crate::perf::perf_rc_op(crate::perf::RC_STRUCT_RETAIN);
+    let switches = crate::switches::get();
+    if switches & STRUCT_RETAIN_HOOKS != 0 {
+        return struct_retain_hooked(ptr, switches);
+    }
+    struct_retain::<false>(ptr, switches);
+}
+
+// the switches that add work to a struct retain. with none of them on, the
+// retain calls nothing and needs no stack frame; the copy that counts and
+// checks lives out of line, so its calls cost the plain path nothing.
+const STRUCT_RETAIN_HOOKS: u8 = crate::switches::PERF_STATS | crate::switches::RC_CHECK;
+
+#[cold]
+#[inline(never)]
+unsafe fn struct_retain_hooked(ptr: i64, switches: u8) {
+    struct_retain::<true>(ptr, switches);
+}
+
+#[inline(always)]
+unsafe fn struct_retain<const HOOKED: bool>(ptr: i64, switches: u8) {
+    if HOOKED {
+        crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RETAIN);
+    }
     if let Some(base) = struct_base(ptr) {
-        let local = struct_local(base);
-        if local {
-            crate::share::check_local(ptr, "retain");
+        let local = struct_local(base, switches);
+        if HOOKED && local {
+            crate::share::check_local(switches, ptr, "retain");
         }
         count_up(struct_strong(base), local);
     }
@@ -3699,7 +3787,29 @@ pub unsafe extern "C" fn pith_struct_strong_count(ptr: i64) -> i64 {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
-    crate::perf::perf_rc_op(crate::perf::RC_STRUCT_RELEASE);
+    let switches = crate::switches::get();
+    if switches & STRUCT_RELEASE_HOOKS != 0 {
+        return struct_release_hooked(ptr, switches);
+    }
+    struct_release::<false>(ptr, switches);
+}
+
+// the switches that add work to a struct release, kept out of line for the
+// same reason as the retain's
+const STRUCT_RELEASE_HOOKS: u8 =
+    crate::switches::PERF_STATS | crate::switches::RC_CHECK | crate::switches::CYCLE_GC;
+
+#[cold]
+#[inline(never)]
+unsafe fn struct_release_hooked(ptr: i64, switches: u8) {
+    struct_release::<true>(ptr, switches);
+}
+
+#[inline(always)]
+unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
+    if HOOKED {
+        crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RELEASE);
+    }
     let Some(base) = struct_base(ptr) else {
         return;
     };
@@ -3711,8 +3821,8 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     let weak = struct_weak(base);
     let sole = strong.load(Ordering::Acquire) == 1
         && weak.load(Ordering::Acquire) == 1;
-    if sole {
-        crate::perf::perf_rc_op(crate::perf::RC_STRUCT_SOLE_RELEASE);
+    if HOOKED && sole {
+        crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_SOLE_RELEASE);
     }
     if !sole {
         // cycle-gc suspect hook, placed before our count is given up rather
@@ -3724,12 +3834,12 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
         // hook's feet. if other owners release between this load and our
         // decrement, the struct simply dies buffered, which the death path
         // below already supports.
-        if crate::cycle::cycle_gc_enabled() && strong.load(Ordering::Relaxed) > 1 {
+        if HOOKED && switches & crate::switches::CYCLE_GC != 0 && strong.load(Ordering::Relaxed) > 1 {
             maybe_suspect_struct(ptr, base);
         }
-        let local = struct_local(base);
-        if local {
-            crate::share::check_local(ptr, "release");
+        let local = struct_local(base, switches);
+        if HOOKED && local {
+            crate::share::check_local(switches, ptr, "release");
         }
         let prev = count_down(strong, local);
         if prev > 1 {
@@ -3758,7 +3868,9 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
         let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
         f(ptr);
     }
-    crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+    if HOOKED {
+        crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+    }
     // with only the implicit weak unit left, nothing can read the dead flag,
     // so the header is freed without setting it. a destructor that made a
     // weak reference, or a suspect buffer holding one, keeps the full path.
@@ -3773,7 +3885,7 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     // header if no weak refs remain — for a buffered struct the suspect
     // buffer's weak count keeps the header alive past this point.
     struct_dead(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
-    struct_weak_drop(base);
+    struct_weak_drop(base, switches);
 }
 
 /// Mark a struct as a cycle suspect: set the buffered bit, take the weak
@@ -3868,7 +3980,7 @@ pub(crate) unsafe fn cycle_struct_free_dead(ptr: i64) {
     };
     crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
     struct_dead(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
-    struct_weak_drop(base);
+    struct_weak_drop(base, crate::switches::get());
 }
 
 #[cfg(test)]
@@ -3892,11 +4004,12 @@ pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
-    crate::perf::perf_rc_op(crate::perf::RC_WEAK_RETAIN);
+    let switches = crate::switches::get();
+    crate::perf::count_rc_op(switches, crate::perf::RC_WEAK_RETAIN);
     if let Some(base) = struct_base(ptr) {
-        let local = struct_local(base);
+        let local = struct_local(base, switches);
         if local {
-            crate::share::check_local(ptr, "weak retain");
+            crate::share::check_local(switches, ptr, "weak retain");
         }
         count_up(struct_weak(base), local);
     }
@@ -3908,9 +4021,10 @@ pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
-    crate::perf::perf_rc_op(crate::perf::RC_WEAK_RELEASE);
+    let switches = crate::switches::get();
+    crate::perf::count_rc_op(switches, crate::perf::RC_WEAK_RELEASE);
     if let Some(base) = struct_base(ptr) {
-        struct_weak_drop(base);
+        struct_weak_drop(base, switches);
     }
 }
 

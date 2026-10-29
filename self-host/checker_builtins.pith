@@ -25,6 +25,8 @@ pub fn register_builtin_types(scope_id: Int):
 
     intern_list_type(tid_string)
     list_string := lookup_type_id("List[String]")
+    intern_list_type(tid_int)
+    list_int := lookup_type_id("List[Int]")
 
     int_result := add_type_info(ti_result(tid_int, tid_string))
     float_result := add_type_info(ti_result(tid_float, tid_string))
@@ -223,6 +225,8 @@ pub fn register_builtin_types(scope_id: Int):
     define_builtin_function("byte_buffer_write_byte", create_function_type([TID_INT, TID_INT], int_result))
     define_builtin_function("byte_buffer_copy_within", create_function_type([TID_INT, TID_INT, TID_INT], TID_BOOL))
     define_builtin_function("bytes_read_word", create_function_type([tid_bytes, TID_INT, TID_INT], TID_INT))
+    define_builtin_function("crc32_fold", create_function_type([TID_INT, tid_bytes, TID_INT], TID_INT))
+    define_builtin_function("sha256_blocks", create_function_type([list_int, tid_bytes, TID_INT], TID_BOOL))
     define_builtin_function("byte_buffer_write_range", create_function_type([TID_INT, tid_bytes, TID_INT, TID_INT], TID_BOOL))
     define_builtin_function("byte_buffer_write_word", create_function_type([TID_INT, TID_INT, TID_INT], TID_BOOL))
     define_builtin_function("byte_buffer_bytes", create_function_type([TID_INT], tid_bytes))
@@ -427,6 +431,8 @@ pub fn register_builtin_types(scope_id: Int):
     fix_builtin_binding("byte_buffer_write_byte", [tid_int, tid_int], int_result)
     fix_builtin_binding("byte_buffer_copy_within", [tid_int, tid_int, tid_int], tid_bool)
     fix_builtin_binding("bytes_read_word", [tid_bytes, tid_int, tid_int], tid_int)
+    fix_builtin_binding("crc32_fold", [tid_int, tid_bytes, tid_int], tid_int)
+    fix_builtin_binding("sha256_blocks", [list_int, tid_bytes, tid_int], tid_bool)
     fix_builtin_binding("byte_buffer_write_range", [tid_int, tid_bytes, tid_int, tid_int], tid_bool)
     fix_builtin_binding("byte_buffer_write_word", [tid_int, tid_int, tid_int], tid_bool)
     fix_builtin_binding("byte_buffer_bytes", [tid_int], tid_bytes)

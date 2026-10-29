@@ -117,22 +117,36 @@ compiler in about five.
 
 ## the numbers
 
-measured on one two-core machine, 2026-08-23, comparators reproducing
-their published figures. the full tables, the methodology and the
-caveats are in [docs/performance.md](docs/performance.md); these four
-rows are the shape of it.
+measured 2026-10-29 on a ryzen 9 9950x, every language pinned to the same
+eight cores, against go 1.27 and rust 1.99 ports that do the same work and
+print the same checksums. the full tables, one row per benchmark, are in
+[bench/README.md](bench/README.md); the history and the profiling behind
+them are in [docs/performance.md](docs/performance.md).
 
 | workload | pith | go | rust |
 |---|---:|---:|---:|
-| catalog service, 200k requests | **92 ms** | 368 ms | 67 ms |
-| json ingest + hmac, 200k events | **344 ms** | 404 ms | 106 ms |
-| csv/url/gzip pipeline, 50k records | 448 ms | 250 ms | 134 ms |
-| http server under load, req/s | 14.4k | 21k–32k | — |
+| json decode, 20M small objects | **815 ms** | 3535 ms | 1120 ms |
+| substring search | **45 ms** | 220 ms | 207 ms |
+| channel fan-out, 1M messages | **38 ms** | 49 ms | 462 ms |
+| event ledger, 200k events (json, collections, crypto) | 70 ms | 95 ms | 51 ms |
+| sort 100k ints, 30 rounds | 301 ms | 502 ms | 59 ms |
+| csv encode | 418 ms | 308 ms | 130 ms |
+| error handling through closures | 353 ms | 183 ms | 160 ms |
+| sha256, 256 MB | 844 ms | 96 ms | 95 ms |
+| http server at 256 connections, req/s | 1.83M | 2.20M (minimal), 984k (net/http) | 1.81M (hyper) |
 
-ahead of go on service-shaped work, behind it on heavy string
-pipelines and raw http throughput, behind rust everywhere. the http
-comparison swings with the host's state; the per-request latency that
-does not swing is 135–162µs against go's 93.
+- pith is faster than go on json decoding, text search, the event ledger
+  and catalog workloads, int sorting, channels, spawning and grpc under
+  concurrency. it is faster than rust on half the json shapes, text search,
+  channels and task churn. its http server has a lower p99 latency than
+  every go and rust server measured, except at 128 connections.
+- go is ahead on closures, reference cycles, task scheduling, string
+  building, string-keyed maps and raw http throughput against a minimal
+  server.
+- rust is ahead on most single-threaded compute, mostly by 1.4x to 5.5x.
+  the outliers are walking decoded json (9.7x) and hashing (up to 41x),
+  where go and rust use cpu instructions (sha-ni, pclmulqdq) that pith's
+  kernels do not.
 
 ## what it does not do
 

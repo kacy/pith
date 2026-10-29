@@ -8,7 +8,7 @@
 //! specified in docs/ir-contract.md, which is authoritative. Update that file
 //! whenever the instruction set or the conventions in this consumer change.
 
-use crate::{CodeGen, CompileError};
+use crate::{loop_hoist, CodeGen, CompileError};
 use cranelift::prelude::*;
 use cranelift_module::{FuncId, Linkage, Module};
 use pith_runtime::bytes::{
@@ -298,71 +298,25 @@ fn inline_list_set_value(
     index: Value,
     value: Value,
     fallback: cranelift::codegen::ir::FuncRef,
+    anchor: cranelift::codegen::ir::FuncRef,
 ) {
+    let (live, base) = list_header(builder, list, anchor);
+    let tag = builder
+        .ins()
+        .load(types::I32, loop_hoist::HEADER_FLAGS, base, LIST_IMPL_TYPE_TAG_OFFSET);
+    let primitive = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, tag, LIST_TYPE_TAG_PRIMITIVE as i64);
+    let writable = builder.ins().band(live, primitive);
+    let (in_bounds, data_ptr) = list_index_in_bounds(builder, writable, base, index);
+
     let done = builder.create_block();
-    let slow = builder.create_block();
-
-    let list_is_null = builder.ins().icmp_imm(IntCC::Equal, list, 0);
-    let check_magic = builder.create_block();
-    builder.ins().brif(list_is_null, slow, &[], check_magic, &[]);
-    builder.switch_to_block(check_magic);
-
-    let magic = builder.ins().load(types::I32, MemFlags::new(), list, 0);
-    let magic_bad = builder
-        .ins()
-        .icmp_imm(IntCC::NotEqual, magic, LIST_MAGIC as i64);
-    let check_size = builder.create_block();
-    builder.ins().brif(magic_bad, slow, &[], check_size, &[]);
-    builder.switch_to_block(check_size);
-
-    let elem_size = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        list,
-        LIST_IMPL_ELEM_SIZE_OFFSET,
-    );
-    let not_eight = builder.ins().icmp_imm(IntCC::NotEqual, elem_size, 8);
-    let check_tag = builder.create_block();
-    builder.ins().brif(not_eight, slow, &[], check_tag, &[]);
-    builder.switch_to_block(check_tag);
-
-    let tag = builder.ins().load(
-        types::I32,
-        MemFlags::new(),
-        list,
-        LIST_IMPL_TYPE_TAG_OFFSET,
-    );
-    let not_primitive = builder
-        .ins()
-        .icmp_imm(IntCC::NotEqual, tag, LIST_TYPE_TAG_PRIMITIVE as i64);
-    let check_bounds = builder.create_block();
-    builder.ins().brif(not_primitive, slow, &[], check_bounds, &[]);
-    builder.switch_to_block(check_bounds);
-
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        list,
-        LIST_IMPL_VALUES8_LEN_OFFSET,
-    );
-    let out_of_bounds = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
-    let check_ptr = builder.create_block();
-    builder.ins().brif(out_of_bounds, slow, &[], check_ptr, &[]);
-    builder.switch_to_block(check_ptr);
-
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        list,
-        LIST_IMPL_VALUES8_PTR_OFFSET,
-    );
-    let data_is_null = builder.ins().icmp_imm(IntCC::Equal, data_ptr, 0);
     let store_block = builder.create_block();
-    builder.ins().brif(data_is_null, slow, &[], store_block, &[]);
-    builder.switch_to_block(store_block);
+    let slow = builder.create_block();
+    builder.set_cold_block(slow);
+    builder.ins().brif(in_bounds, store_block, &[], slow, &[]);
 
+    builder.switch_to_block(store_block);
     let byte_offset = builder.ins().ishl_imm(index, 3);
     let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
     builder
@@ -375,6 +329,55 @@ fn inline_list_set_value(
     builder.ins().jump(done, &[]);
 
     builder.switch_to_block(done);
+}
+
+/// Read a list's header without a branch: whether `list` is a live list,
+/// and the address its header fields are read from. A handle that is null
+/// or misaligned reads `anchor`'s code instead, which is always mapped, and
+/// the handle test masks out what it holds; a freed list fails the magic
+/// compare, since the runtime scrubs the magic. The reads carry
+/// `loop_hoist::HEADER_FLAGS`, so a loop that makes no calls reads each
+/// header once, before it starts.
+fn list_header(
+    builder: &mut FunctionBuilder<'_>,
+    list: Value,
+    anchor: cranelift::codegen::ir::FuncRef,
+) -> (Value, Value) {
+    let addressable = handle_is_addressable(builder, list, LIST_HANDLE_ALIGN);
+    let anchor_code = builder.ins().func_addr(types::I64, anchor);
+    let base = builder.ins().select(addressable, list, anchor_code);
+    let magic = builder
+        .ins()
+        .load(types::I32, loop_hoist::HEADER_FLAGS, base, 0);
+    let magic_ok = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, magic, LIST_MAGIC as i64);
+    (builder.ins().band(addressable, magic_ok), base)
+}
+
+/// Whether `index` is inside a list that passed `usable`, folding a
+/// negative index into the same unsigned compare, and the list's data
+/// pointer. A list that failed reads as empty, so the compare fails too.
+/// The length is the one the 8-byte storage keeps, which stays zero for a
+/// list of any other element size, so the compare also turns those away;
+/// and a non-empty list of 8-byte elements always has a data pointer.
+fn list_index_in_bounds(
+    builder: &mut FunctionBuilder<'_>,
+    usable: Value,
+    base: Value,
+    index: Value,
+) -> (Value, Value) {
+    let flags = loop_hoist::HEADER_FLAGS;
+    let len = builder
+        .ins()
+        .load(types::I64, flags, base, LIST_IMPL_VALUES8_LEN_OFFSET);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let limit = builder.ins().select(usable, len, zero);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, index, limit);
+    let data_ptr = builder
+        .ins()
+        .load(types::I64, flags, base, LIST_IMPL_VALUES8_PTR_OFFSET);
+    (in_bounds, data_ptr)
 }
 
 // the native instruction behind a bit builtin, or None for anything else.
@@ -695,6 +698,22 @@ fn brif_with_two_i64_args(
     builder.ins().brif(cond, taken, &[a, b], fallthrough, &[]);
 }
 
+/// Whether `handle` is non-null and `align`-aligned, in one compare:
+/// rotating the low s bits to the top (s = log2 align) turns an aligned
+/// non-null handle into a value in 1..2^(64-s), null into 0, and a
+/// misaligned handle into a value with a top bit set. Subtracting one then
+/// puts exactly the good handles below 2^(64-s) - 1 as unsigned values.
+fn handle_is_addressable(builder: &mut FunctionBuilder<'_>, handle: Value, align: i64) -> Value {
+    debug_assert!((align as u64).is_power_of_two());
+    let shift = align.trailing_zeros() as i64;
+    let rotated = builder.ins().rotr_imm(handle, shift);
+    let rotated_m1 = builder.ins().iadd_imm(rotated, -1);
+    let good_limit = ((1u64 << (64 - shift)) - 1) as i64;
+    builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedLessThan, rotated_m1, good_limit)
+}
+
 /// Branch to `slow(handle, index)` unless `handle` is a pointer the
 /// runtime's magic-checked accessor would accept: non-null, aligned as the
 /// runtime struct requires, and carrying `magic` at `magic_offset`. This is
@@ -711,21 +730,8 @@ fn branch_if_not_magic_handle(
     magic: u32,
     slow: Block,
 ) {
-    // null and misalignment in one compare: rotating the low s bits to the
-    // top (s = log2 align) turns an aligned non-null handle into a value in
-    // 1..2^(64-s), null into 0, and a misaligned handle into a value with a
-    // top bit set. Subtracting one then puts exactly the good handles below
-    // 2^(64-s) - 1 as unsigned values.
-    debug_assert!((align as u64).is_power_of_two());
-    let shift = align.trailing_zeros() as i64;
-    let rotated = builder.ins().rotr_imm(handle, shift);
-    let rotated_m1 = builder.ins().iadd_imm(rotated, -1);
-    let good_limit = ((1u64 << (64 - shift)) - 1) as i64;
-    let handle_bad = builder.ins().icmp_imm(
-        IntCC::UnsignedGreaterThanOrEqual,
-        rotated_m1,
-        good_limit,
-    );
+    let addressable = handle_is_addressable(builder, handle, align);
+    let handle_bad = builder.ins().icmp_imm(IntCC::Equal, addressable, 0);
     let check_magic = builder.create_block();
     brif_with_two_i64_args(builder, handle_bad, slow, handle, index, check_magic);
     builder.switch_to_block(check_magic);
@@ -837,46 +843,22 @@ fn inline_list_get_value_strict(
     list: Value,
     index: Value,
     fallback: cranelift::codegen::ir::FuncRef,
+    anchor: cranelift::codegen::ir::FuncRef,
 ) -> Value {
+    let (live, base) = list_header(builder, list, anchor);
+    let (in_bounds, data_ptr) = list_index_in_bounds(builder, live, base, index);
+
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
     let slow = builder.create_block();
     builder.append_block_param(slow, types::I64);
     builder.append_block_param(slow, types::I64);
     builder.set_cold_block(slow);
-
-    branch_if_not_magic_handle(builder, list, index, LIST_HANDLE_ALIGN, 0, LIST_MAGIC, slow);
-
-    let elem_size = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        list,
-        LIST_IMPL_ELEM_SIZE_OFFSET,
-    );
-    let not_eight = builder.ins().icmp_imm(IntCC::NotEqual, elem_size, 8);
-    let check_bounds = builder.create_block();
-    brif_with_two_i64_args(builder, not_eight, slow, list, index, check_bounds);
-    builder.switch_to_block(check_bounds);
-
-    let len = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        list,
-        LIST_IMPL_VALUES8_LEN_OFFSET,
-    );
-    let out_of_bounds = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
+    let out_of_bounds = builder.ins().icmp_imm(IntCC::Equal, in_bounds, 0);
     let read = builder.create_block();
     brif_with_two_i64_args(builder, out_of_bounds, slow, list, index, read);
     builder.switch_to_block(read);
 
-    let data_ptr = builder.ins().load(
-        types::I64,
-        MemFlags::new(),
-        list,
-        LIST_IMPL_VALUES8_PTR_OFFSET,
-    );
     let byte_offset = builder.ins().ishl_imm(index, 3);
     let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
     let value = builder
@@ -887,21 +869,60 @@ fn inline_list_get_value_strict(
     finish_strict_fast_path(builder, slow, done, fallback)
 }
 
-/// Inline `b.len()` (`pith_bytes_len`) and `xs.len()` (`pith_list_len`) as
-/// the same handle test the getters above use and one load of the length.
-/// A loop that tests `i < b.len()` makes this call once per pass, so the
-/// FFI call cost more than the loop body did. A list only keeps its length
-/// in the 8-byte storage when its elements are 8 bytes wide, so for a list
-/// `elem_size_offset` names the field to check first. Everything the fast
-/// path does not accept, null included, goes to `fallback`, which answers
-/// 0 for a bad handle as it always has.
+/// Inline `xs.len()` (`pith_list_len`) as the header read the getters use.
+/// A list only keeps its length in the 8-byte storage when its elements are
+/// 8 bytes wide; any other list, and a bad handle, goes to `fallback`,
+/// which answers 0 for a bad handle as it always has.
+fn inline_list_len(
+    builder: &mut FunctionBuilder<'_>,
+    list: Value,
+    fallback: cranelift::codegen::ir::FuncRef,
+) -> Value {
+    let (live, base) = list_header(builder, list, fallback);
+    let elem_size = builder.ins().load(
+        types::I64,
+        loop_hoist::HEADER_FLAGS,
+        base,
+        LIST_IMPL_ELEM_SIZE_OFFSET,
+    );
+    let eight = builder.ins().icmp_imm(IntCC::Equal, elem_size, 8);
+    let values8 = builder.ins().band(live, eight);
+    let len = builder.ins().load(
+        types::I64,
+        loop_hoist::HEADER_FLAGS,
+        base,
+        LIST_IMPL_VALUES8_LEN_OFFSET,
+    );
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let fast = builder.create_block();
+    let slow = builder.create_block();
+    builder.set_cold_block(slow);
+    builder.ins().brif(values8, fast, &[], slow, &[]);
+
+    builder.switch_to_block(fast);
+    jump_with_i64_arg(builder, done, len);
+
+    builder.switch_to_block(slow);
+    let call = builder.ins().call(fallback, &[list]);
+    let fallback_result = builder.func.dfg.inst_results(call)[0];
+    jump_with_i64_arg(builder, done, fallback_result);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
+/// Inline `b.len()` (`pith_bytes_len`) as the same handle test the getters
+/// above use and one load of the length. A loop that tests `i < b.len()`
+/// makes this call once per pass, so the FFI call cost more than the loop
+/// body did. Everything the fast path does not accept, null included, goes
+/// to `fallback`, which answers 0 for a bad handle as it always has.
 fn inline_handle_len(
     builder: &mut FunctionBuilder<'_>,
     handle: Value,
     align: i64,
     magic_offset: i32,
     magic: u32,
-    elem_size_offset: Option<i32>,
     len_offset: i32,
     fallback: cranelift::codegen::ir::FuncRef,
 ) -> Value {
@@ -915,15 +936,6 @@ fn inline_handle_len(
     // the handle test passes two values to `slow`; a length has no index,
     // so the handle fills both slots
     branch_if_not_magic_handle(builder, handle, handle, align, magic_offset, magic, slow);
-    if let Some(offset) = elem_size_offset {
-        let elem_size = builder
-            .ins()
-            .load(types::I64, MemFlags::new(), handle, offset);
-        let not_eight = builder.ins().icmp_imm(IntCC::NotEqual, elem_size, 8);
-        let read = builder.create_block();
-        brif_with_two_i64_args(builder, not_eight, slow, handle, handle, read);
-        builder.switch_to_block(read);
-    }
     let len = builder
         .ins()
         .load(types::I64, MemFlags::new(), handle, len_offset);
@@ -1770,7 +1782,12 @@ pub fn compile_from_ir(
         }
     }
 
-    define_with_inlining(codegen, built)?;
+    let keep_calls: Vec<u32> = LOOP_KEEP_CALLS
+        .iter()
+        .filter_map(|name| runtime_funcs.get(*name))
+        .map(|id| id.as_u32())
+        .collect();
+    define_with_inlining(codegen, built, &keep_calls)?;
     Ok(declared_funcs)
 }
 
@@ -1783,9 +1800,31 @@ const INLINE_MAX_INSTS: usize = 24;
 /// The functions are all built before any is defined so that a caller can
 /// inline a callee that appears later in the IR. `PITH_INLINE=0` turns the
 /// inlining off, which is how to A/B it.
+/// The runtime functions a loop may call and still have its list header
+/// reads hoisted: none of them changes a list's header, frees a list or runs
+/// user code. The getters, length reads and string comparisons only read;
+/// `pith_list_set_scalar` stores a word with no count to take or drop; the
+/// yield lets another task run, and a task that changes a list this loop
+/// reads without a lock races it under OS threads too.
+const LOOP_KEEP_CALLS: &[&str] = &[
+    "pith_green_maybe_yield",
+    "pith_list_get_value_strict",
+    "pith_list_len",
+    "pith_list_set_scalar",
+    "byte_at",
+    "string_len",
+    "pith_cstring_eq",
+    "pith_cstring_compare",
+    "pith_cstring_lt",
+    "pith_cstring_gt",
+    "pith_cstring_lte",
+    "pith_cstring_gte",
+];
+
 fn define_with_inlining(
     codegen: &mut CodeGen,
     built: Vec<(FuncId, String, cranelift::codegen::ir::Function)>,
+    keep_calls: &[u32],
 ) -> Result<(), CompileError> {
     let enabled = std::env::var("PITH_INLINE").map_or(true, |v| v != "0");
     // the inliner takes callee bodies in their legalized form, so each
@@ -1814,6 +1853,9 @@ fn define_with_inlining(
                 CompileError::ModuleError(format!("IR consumer: inlining into {func_name}: {e}"))
             })?;
         }
+        // after inlining, so a loop whose calls were all inlined counts as
+        // call-free
+        loop_hoist::hoist_list_headers(&mut ctx.func, keep_calls);
         define_built_function(codegen, *func_id, func_name, &mut ctx)?;
     }
     Ok(())
@@ -3184,7 +3226,9 @@ fn compile_ir_function(
                             continue;
                         }
                     }
-                    if (fname == "pith_list_set_value" || fname == "pith_list_set_value_owned")
+                    if (fname == "pith_list_set_value"
+                        || fname == "pith_list_set_value_owned"
+                        || fname == "pith_list_set_scalar")
                         && args.len() == 3
                     {
                         let fallback = runtime_func_ref(
@@ -3194,12 +3238,20 @@ fn compile_ir_function(
                             runtime_funcs,
                             fname,
                         )?;
+                        let anchor = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "pith_list_len",
+                        )?;
                         inline_list_set_value(
                             &mut builder,
                             args[0],
                             args[1],
                             args[2],
                             fallback,
+                            anchor,
                         );
                         let zero = builder.ins().iconst(types::I64, 0);
                         regs.insert(reg, zero);
@@ -3375,21 +3427,11 @@ fn compile_ir_function(
                                 BYTES_HANDLE_ALIGN,
                                 BYTES_MAGIC_OFFSET,
                                 BYTES_MAGIC,
-                                None,
                                 BYTES_DATA_LEN_OFFSET,
                                 fallback,
                             )
                         } else {
-                            inline_handle_len(
-                                &mut builder,
-                                args[0],
-                                LIST_HANDLE_ALIGN,
-                                0,
-                                LIST_MAGIC,
-                                Some(LIST_IMPL_ELEM_SIZE_OFFSET),
-                                LIST_IMPL_VALUES8_LEN_OFFSET,
-                                fallback,
-                            )
+                            inline_list_len(&mut builder, args[0], fallback)
                         };
                         regs.insert(reg, inlined);
                         string_regs.remove(&reg);
@@ -3431,8 +3473,20 @@ fn compile_ir_function(
                             runtime_funcs,
                             "pith_list_get_value_strict",
                         )?;
-                        let inlined =
-                            inline_list_get_value_strict(&mut builder, args[0], args[1], fallback);
+                        let anchor = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "pith_list_len",
+                        )?;
+                        let inlined = inline_list_get_value_strict(
+                            &mut builder,
+                            args[0],
+                            args[1],
+                            fallback,
+                            anchor,
+                        );
                         regs.insert(reg, inlined);
                         if retkind == "string" {
                             string_regs.insert(reg);

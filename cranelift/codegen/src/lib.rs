@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 
 pub mod ir_consumer;
 pub mod linker;
+mod loop_hoist;
 pub mod runtime_imports;
 
 pub use runtime_imports::declare_runtime_functions;

@@ -1168,76 +1168,77 @@ const _: () = assert!(pith_runtime::CSTRING_STATIC_MAGIC == pith_runtime::CSTRIN
 const CSTRING_LEN_OFFSET: i32 = -8;
 const CSTRING_MAGIC_OFFSET: i32 = -16;
 
-/// Narrow `s` to a string with a length header, a heap cstring or a literal,
-/// branching to `slow` for anything else. This mirrors
-/// `runtime_core::cstring_header_len`: the data is at an address >= 16 (which
-/// also rejects null), is 8-aligned, and carries either magic word 16 bytes in
-/// front of it. The shared empty string fails one of these checks and takes
-/// the slow path. On return the builder sits in a fresh block where `s` is
-/// known to have the header; only its length may be read, since a literal's
-/// count word is not a count.
-fn branch_if_no_cstring_header(builder: &mut FunctionBuilder<'_>, s: Value, slow: Block) {
-    // addr >= 16, unsigned so null and any stray small pointer are rejected
-    // before the header word is read.
-    let too_small = builder.ins().icmp_imm(IntCC::UnsignedLessThan, s, 16);
-    let check_align = builder.create_block();
-    builder.ins().brif(too_small, slow, &[], check_align, &[]);
-    builder.switch_to_block(check_align);
-
-    // heap cstring data is always 8-aligned; this rejects most literals cheaply.
+/// Read `s`'s length header without a branch, returning whether it has one
+/// and the length it holds. This mirrors `runtime_core::cstring_header_len`:
+/// the data is at an address >= 16 (which also rejects null), is 8-aligned,
+/// and carries either magic word 16 bytes in front of it. The shared empty
+/// string fails one of these checks. Only the length may be read, since a
+/// literal's count word is not a count.
+///
+/// An address that could not carry a header reads the first bytes of
+/// `anchor`'s code instead, which are always mapped, and the address test
+/// masks out whatever they hold. That makes both loads safe to run anywhere.
+/// Marked that way, and with a header that never changes while the string is
+/// alive, they depend on `s` alone: Cranelift hoists the whole check out of a
+/// loop that indexes the same string, and merges repeated checks of it. The
+/// anchor is a function rather than a data symbol because the inliner only
+/// translates function references.
+fn cstring_header(
+    builder: &mut FunctionBuilder<'_>,
+    s: Value,
+    anchor: cranelift::codegen::ir::FuncRef,
+) -> (Value, Value) {
+    let big_enough = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, s, 16);
     let low_bits = builder.ins().band_imm(s, 7);
-    let unaligned = builder.ins().icmp_imm(IntCC::NotEqual, low_bits, 0);
-    let check_magic = builder.create_block();
-    builder.ins().brif(unaligned, slow, &[], check_magic, &[]);
-    builder.switch_to_block(check_magic);
+    let aligned = builder.ins().icmp_imm(IntCC::Equal, low_bits, 0);
+    let addressable = builder.ins().band(big_enough, aligned);
+    let anchor_code = builder.ins().func_addr(types::I64, anchor);
+    let stand_in = builder.ins().iadd_imm(anchor_code, 16);
+    let data = builder.ins().select(addressable, s, stand_in);
 
-    // read the 4-byte magic in front of the data and compare, folding the
-    // literal magic onto the heap one by setting the bit that tells them
-    // apart. an aligned pointer without a header reads mapped data here and
-    // simply fails the compare, the same contract the runtime relies on for
-    // retain/release.
+    // the literal magic differs from the heap one only in the low bit, so
+    // setting that bit folds the two onto one compare.
+    let flags = MemFlags::trusted().with_readonly().with_can_move();
     let magic = builder
         .ins()
-        .load(types::I32, MemFlags::new(), s, CSTRING_MAGIC_OFFSET);
+        .load(types::I32, flags, data, CSTRING_MAGIC_OFFSET);
     let folded = builder.ins().bor_imm(magic, 1);
-    let not_magic = builder.ins().icmp_imm(IntCC::NotEqual, folded, CSTRING_MAGIC | 1);
-    let confirmed = builder.create_block();
-    builder.ins().brif(not_magic, slow, &[], confirmed, &[]);
-    builder.switch_to_block(confirmed);
+    let magic_ok = builder.ins().icmp_imm(IntCC::Equal, folded, CSTRING_MAGIC | 1);
+    let has_header = builder.ins().band(addressable, magic_ok);
+    let len = builder.ins().load(types::I64, flags, data, CSTRING_LEN_OFFSET);
+    (has_header, len)
 }
 
-/// Inline `s[i]` (byte_at) for heap cstrings: read the length from the header,
-/// bounds-check, and index the byte directly, skipping the FFI dispatch that
-/// dominates tight character-scanning loops. Literals and wild pointers fall
-/// back to `fallback` (pith_cstring_byte_at) for identical semantics — out of
-/// range returns -1.
+/// Inline `s[i]` (byte_at) for strings with a length header: bounds-check
+/// against the header and index the byte directly, skipping the FFI dispatch
+/// that dominates tight character-scanning loops. Anything else, including an
+/// index out of range, falls back to `fallback` (pith_cstring_byte_at) for
+/// identical semantics: out of range returns -1.
 fn inline_cstring_byte_at(
     builder: &mut FunctionBuilder<'_>,
     s: Value,
     index: Value,
     fallback: cranelift::codegen::ir::FuncRef,
+    anchor: cranelift::codegen::ir::FuncRef,
 ) -> Value {
+    let (has_header, len) = cstring_header(builder, s, anchor);
+    // a string without a header reads as empty here, so it always takes the
+    // fallback; one unsigned compare also sends a negative index there.
+    let zero = builder.ins().iconst(types::I64, 0);
+    let indexable = builder.ins().select(has_header, len, zero);
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, index, indexable);
+
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
-    let slow = builder.create_block();
-
-    branch_if_no_cstring_header(builder, s, slow);
-    let len = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), s, CSTRING_LEN_OFFSET);
-    // one unsigned compare catches both a negative index and one past the end.
-    let out_of_bounds = builder
-        .ins()
-        .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
-    let oob = builder.create_block();
     let read = builder.create_block();
-    builder.ins().brif(out_of_bounds, oob, &[], read, &[]);
-    builder.switch_to_block(oob);
-    let neg_one = builder.ins().iconst(types::I64, -1);
-    jump_with_i64_arg(builder, done, neg_one);
+    let slow = builder.create_block();
+    builder.ins().brif(in_bounds, read, &[], slow, &[]);
+
     builder.switch_to_block(read);
     let elem_addr = builder.ins().iadd(s, index);
-    let byte = builder.ins().load(types::I8, MemFlags::new(), elem_addr, 0);
+    let byte = builder.ins().load(types::I8, MemFlags::trusted(), elem_addr, 0);
     let value = builder.ins().uextend(types::I64, byte);
     jump_with_i64_arg(builder, done, value);
 
@@ -1250,22 +1251,22 @@ fn inline_cstring_byte_at(
     builder.block_params(done)[0]
 }
 
-/// Inline `s.len()` (string_len) for heap cstrings: one header read instead of
-/// an FFI call. Literals fall back to `fallback` (pith_cstring_len), which
-/// strlen-scans them.
+/// Inline `s.len()` (string_len) for strings with a length header: one header
+/// read instead of an FFI call. Anything else falls back to `fallback`
+/// (pith_cstring_len).
 fn inline_cstring_len(
     builder: &mut FunctionBuilder<'_>,
     s: Value,
     fallback: cranelift::codegen::ir::FuncRef,
 ) -> Value {
+    let (has_header, len) = cstring_header(builder, s, fallback);
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
+    let fast = builder.create_block();
     let slow = builder.create_block();
+    builder.ins().brif(has_header, fast, &[], slow, &[]);
 
-    branch_if_no_cstring_header(builder, s, slow);
-    let len = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), s, CSTRING_LEN_OFFSET);
+    builder.switch_to_block(fast);
     jump_with_i64_arg(builder, done, len);
 
     builder.switch_to_block(slow);
@@ -3338,8 +3339,17 @@ fn compile_ir_function(
                             runtime_funcs,
                             "byte_at",
                         )?;
+                        // the same anchor `s.len()` uses, so the two share
+                        // one header check
+                        let anchor = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "string_len",
+                        )?;
                         let inlined =
-                            inline_cstring_byte_at(&mut builder, args[0], args[1], fallback);
+                            inline_cstring_byte_at(&mut builder, args[0], args[1], fallback, anchor);
                         regs.insert(reg, inlined);
                         string_regs.remove(&reg);
                         bytes_regs.remove(&reg);

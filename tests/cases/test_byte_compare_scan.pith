@@ -35,6 +35,19 @@ fn digit_sum(s: String) -> Int:
         i = i + 1
     return total
 
+# a string appended to in a loop can grow in place, at the same address, so
+# its length has to be read again after every append rather than once.
+fn grow_and_scan() -> Int:
+    mut s := "a"
+    mut n := 0
+    mut i := 0
+    while i < 6:
+        s = s + ":"
+        if s[s.len() - 1] == ":":
+            n = n + 1
+        i = i + 1
+    return n * 100 + s.len()
+
 fn main():
     print(count_marks("a:b:c,d:e").to_string())
     print(count_marks("").to_string())
@@ -47,3 +60,7 @@ fn main():
     print(ord(s[1]).to_string())
     print(count_tabs("x\ty\tz\tw").to_string())
     print(digit_sum("a1b2c3d9").to_string())
+    built := "a:b" + ",c:" + "d"
+    print(count_marks(built).to_string())
+    print(count_marks(built.substring(1, 4)).to_string())
+    print(grow_and_scan().to_string())

@@ -5813,6 +5813,12 @@ fn ir_element_tag_code(kind: String) -> Int:
         return 8
     return 0
 
+# whether a value of this type is a plain machine word with no count: an
+# Int, a Float or a Bool. this names the types outright rather than taking
+# an empty ir_rc_kind, which also covers types the emitter could not infer.
+fn ir_type_is_scalar_word(type_hint: String) -> Bool:
+    return type_hint == "int" or type_hint == "float" or type_hint == "bool"
+
 # the value kinds a container learns from the store rather than from its
 # constructor.
 #
@@ -8866,6 +8872,10 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
         owned_store := ir_owned_container_store_name(set_name)
         if owned_store.len() > 0:
             set_name = owned_store
+    # a scalar into a list has no count to take or drop, and saying so lets
+    # the codegen keep a loop's list header reads out of the loop
+    if set_name == "pith_list_set_value" and ir_type_is_scalar_word(value_type):
+        set_name = "pith_list_set_scalar"
     ir_emit_call3(ir_reg(), set_name, "void", obj_r, idx_r, value_r)
     # a store reads its key the same way a lookup does: the runtime copies the
     # key bytes into the map's own storage rather than keeping the caller's

@@ -783,6 +783,28 @@ pub unsafe extern "C" fn pith_list_set_value_owned(list: PithList, index: i64, v
     set_value_inner(list, index, value, true);
 }
 
+/// Set an element the compiler knows is a scalar (an Int, Float, Bool or a
+/// plain enum tag). A list of scalars is primitive, so the word goes in as
+/// is, with nothing to retain or release: the call never frees anything or
+/// runs a `drop`. The codegen's loop pass relies on that to treat the call
+/// as leaving every list header alone. A list tagged for counted elements,
+/// which a scalar never goes into, would still take the counting path.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_scalar(list: PithList, index: i64, value: i64) {
+    let Some(impl_ref) = list_mut(list) else {
+        return;
+    };
+    if impl_ref.type_tag != ListTypeTag::Primitive {
+        set_value_inner(list, index, value, false);
+        return;
+    }
+    crate::perf_stats!(PERF_LIST_SETS += 1);
+    let idx = index as usize;
+    if idx < impl_ref.len() {
+        impl_ref.set_value(idx, value);
+    }
+}
+
 unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_count: bool) {
     let Some(impl_ref) = list_mut(list) else {
         return;

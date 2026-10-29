@@ -49,7 +49,7 @@ TRIALS=3 bench/compare.sh map_update json_decode_shapes
 
 Setup: Ryzen 9 9950X, every run pinned to one CCD (cpus 0-7,16-23), 16 workers
 (`PITH_GREEN_WORKERS`, `GOMAXPROCS`, tokio worker threads), Go 1.27.3,
-Rust 1.99.1, Pith at `15eb6601` with #1234 to #1236 merged in (Cranelift
+Rust 1.99.1, Pith at `15eb6601` with #1235 and #1236 merged in (Cranelift
 0.130). Times are the median wall time of 5 interleaved rounds, process start
 included.
 

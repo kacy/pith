@@ -132,7 +132,7 @@ them are in [docs/performance.md](docs/performance.md).
 | sort 100k ints, 30 rounds | 301 ms | 502 ms | 59 ms |
 | csv encode | 418 ms | 308 ms | 130 ms |
 | error handling through closures | 353 ms | 183 ms | 160 ms |
-| sha256, 256 MB | 844 ms | 96 ms | 95 ms |
+| sha256, 256 MB | 111 ms | 95 ms | 94 ms |
 | http server at 256 connections, req/s | 1.83M | 2.20M (minimal), 984k (net/http) | 1.81M (hyper) |
 
 - pith is faster than go on json decoding, text search, the event ledger
@@ -144,9 +144,7 @@ them are in [docs/performance.md](docs/performance.md).
   building, string-keyed maps and raw http throughput against a minimal
   server.
 - rust is ahead on most single-threaded compute, mostly by 1.4x to 5.5x.
-  the outliers are walking decoded json (9.7x) and hashing (up to 41x),
-  where go and rust use cpu instructions (sha-ni, pclmulqdq) that pith's
-  kernels do not.
+  the outlier is walking decoded json (9.7x).
 
 ## what it does not do
 

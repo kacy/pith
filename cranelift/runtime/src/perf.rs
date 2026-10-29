@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// Global statistics for debugging
 pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -124,36 +124,24 @@ pub static PERF_MAP_INT_FALLBACK_GETS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_MAP_INT_FALLBACK_CONTAINS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_MAP_INT_FALLBACK_REMOVES: AtomicUsize = AtomicUsize::new(0);
 
-// 0 = not probed yet, 1 = disabled, 2 = enabled. these hooks sit on the
-// hottest runtime entry points (list get, byte-buffer write, struct alloc),
-// so with stats off the check has to cost one relaxed load and a predictable
-// branch — a OnceLock here showed up as a measurable slice of a list index.
-static PERF_STATS_STATE: AtomicU8 = AtomicU8::new(0);
 static PERF_STATS_REGISTERED: AtomicBool = AtomicBool::new(false);
 
-#[cold]
-fn perf_stats_probe() -> bool {
-    let enabled = matches!(
-        std::env::var("PITH_PERF_STATS").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    );
-    PERF_STATS_STATE.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
-    enabled
-}
-
+/// Whether `PITH_PERF_STATS` asked for the counters.
 #[inline(always)]
 pub fn perf_stats_enabled() -> bool {
-    match PERF_STATS_STATE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => perf_stats_probe(),
-    }
+    crate::switches::any(crate::switches::PERF_STATS)
 }
 
 /// Count one operation of the kind `op` names (an RC_* constant).
 #[inline(always)]
 pub fn perf_rc_op(op: usize) {
-    if perf_stats_enabled() {
+    count_rc_op(crate::switches::get(), op);
+}
+
+/// `perf_rc_op` for a caller that already holds a copy of the switches.
+#[inline(always)]
+pub fn count_rc_op(switches: u8, op: usize) {
+    if switches & crate::switches::PERF_STATS != 0 {
         perf_record1(&PERF_RC_OPS[op], 1);
     }
 }

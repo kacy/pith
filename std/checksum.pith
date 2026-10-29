@@ -36,9 +36,28 @@ crc32_table: List[Int] := crc32_build_table()
 # compute the standard crc-32 checksum used by gzip and zip.
 pub fn crc32(data: Bytes) -> Int:
     mut crc := 4294967295
-    n := data.len()
-    full := n - n % 8
     mut pos := 0
+    # on cpus with a carry-less multiply, the runtime's crc32_fold takes
+    # the input in 16-byte blocks and returns the register as this loop
+    # would leave it, or -1 without the instruction. the rest of the input
+    # goes through crc32_update. below 128 bytes the call costs more than
+    # it saves.
+    n := data.len()
+    if n >= 128:
+        bulk := n - n % 16
+        folded := crc32_fold(crc, data, bulk)
+        if folded >= 0:
+            crc = folded
+            pos = bulk
+    return bits.xor(crc32_update(crc, data, pos), 4294967295)
+
+# run the crc-32 register `start_crc` over `data` from `start` to the end,
+# and return the register without the final inversion.
+fn crc32_update(start_crc: Int, data: Bytes, start: Int) -> Int:
+    mut crc := start_crc
+    n := data.len()
+    full := n - (n - start) % 8
+    mut pos := start
     # slicing-by-8: eight bytes per step, read as one little-endian word
     # through bytes_read_word, which lowers to one inlined load. the eight
     # table reads depend only on the word and the crc going in, not on each
@@ -56,7 +75,7 @@ pub fn crc32(data: Bytes) -> Int:
     while pos < n:
         crc = bits.xor(crc32_table[bits.band(bits.xor(crc, bytes_get(data, pos)), 255)], bits.shr(crc, 8))
         pos = pos + 1
-    return bits.xor(crc, 4294967295)
+    return crc
 
 # the bit-at-a-time crc-32 this module shipped before the table, kept
 # verbatim so the randomized test has an independent definition to agree
@@ -164,6 +183,8 @@ test "slicing-by-8 crc32 agrees with the bit-at-a-time definition":
         mut want := trial % 41
         if trial % 10 == 9:
             want = 41 + trial % 1000
+        if trial % 100 == 33:
+            want = 120 + trial % 40
         mut filled := 0
         while filled < want:
             # xorshift64: the low byte of each step is the next content byte
@@ -175,6 +196,9 @@ test "slicing-by-8 crc32 agrees with the bit-at-a-time definition":
         data := buf.take_bytes()
         assert_eq(data.len(), want)
         assert_eq(crc32(data), crc32_reference(data))
+        # the pith loop alone, which crc32 skips for long inputs on cpus
+        # where the runtime folds them
+        assert_eq(bits.xor(crc32_update(4294967295, data, 0), 4294967295), crc32_reference(data))
         trial = trial + 1
 
 # random content at random lengths, checked against the modulo-per-byte

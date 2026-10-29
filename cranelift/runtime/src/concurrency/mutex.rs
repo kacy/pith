@@ -8,8 +8,8 @@
 //! ## green tasks
 //!
 //! Unlike the channel/waitgroup/semaphore primitives, this lock is not built on
-//! a `Condvar` — an os-thread waiter never blocks, it spins-then-yields. That
-//! stays byte-for-byte under the green backend for os-thread callers. But a
+//! a `Condvar`: an os-thread waiter never blocks, it spins and then yields,
+//! whichever backend is active. A
 //! **green task** (under `PITH_GREEN`) must not spin forever: if it holds the
 //! lock and yields elsewhere, another green task hard-spinning to acquire the
 //! same lock would peg its worker and could starve the holder that needs that
@@ -33,9 +33,9 @@
 //!
 //! ## lock order
 //!
-//! `green_waiters` -> slab -> queue, matching the channel primitives: `unlock`
-//! holds `green_waiters` while calling `green::wake` (which nests the slab and
-//! queue locks), and a parking task *releases* `green_waiters` before it
+//! `green_waiters` -> scheduler queues, matching the channel primitives:
+//! `unlock` holds `green_waiters` while calling `green::wake` (which may take a
+//! queue lock), and a parking task *releases* `green_waiters` before it
 //! suspends. So the mutex's waiter lock is never held across a suspend, and the
 //! scheduler locks are never taken while probing for the mutex.
 
@@ -49,8 +49,8 @@ const MUTEX_MAGIC: u32 = 0x504d5458; // "PMTX"
 pub struct PithMutex {
     magic: u32,
     state: AtomicU32,
-    /// slab ids of green tasks parked in `lock` under contention. an os-thread
-    /// caller never registers here — it spins-then-yields as before — so this
+    /// ids of green tasks parked in `lock` under contention. an os-thread
+    /// caller never registers here (it spins and then yields), so this
     /// list and its lock are touched only when the green backend is active.
     /// drained and woken by `unlock`.
     green_waiters: Mutex<Vec<usize>>,
@@ -77,16 +77,16 @@ fn lock_waiters(m: &PithMutex) -> std::sync::MutexGuard<'_, Vec<usize>> {
 
 /// try to take the lock exactly once with a *strong* compare-exchange. strong
 /// (not `_weak`) matters on the green path: a spurious weak failure there would
-/// make a task register and park while the lock is actually free, with no future
-/// unlock to wake it. strong only fails when the lock is genuinely held.
+/// one strong compare-exchange. a weak one could fail spuriously and send a
+/// green task off to park while the lock is free, with no unlock coming to wake
+/// it.
 fn try_acquire(m: &PithMutex) -> bool {
     m.state
         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
         .is_ok()
 }
 
-/// os-thread lock path: spin briefly, then yield. unchanged from the original,
-/// byte-for-byte, so the default (flag off) behavior is exactly as before.
+/// os-thread lock path: spin briefly, then yield.
 fn lock_os(m: &PithMutex) {
     let mut spins = 0u32;
     loop {

@@ -22,7 +22,7 @@
 //!
 //! The lock order and wake/park race are handled as in [`channel`]: the waiter
 //! registers under the semaphore lock and releases it before suspending, and the
-//! wake runs while holding the lock (semaphore -> slab -> queue).
+//! wake runs while holding the lock (semaphore -> queue).
 //!
 //! [`channel`]: crate::concurrency::channel
 
@@ -35,7 +35,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 pub struct SemaphoreState {
     count: usize,
     max: usize,
-    /// slab ids of green tasks suspended in `acquire()`, in arrival order.
+    /// ids of green tasks suspended in `acquire()`, in arrival order.
     /// `release()` wakes the front one — one waiter per freed permit. empty (and
     /// free) whenever no green task is waiting, so the os-thread path is
     /// untouched.
@@ -73,7 +73,7 @@ fn wait_state<'a>(
 /// wake a single green task parked in `acquire()` so it re-checks the permit
 /// count. paired with the `cvar.notify_one()` in `release()` — one freed permit
 /// wakes one waiter. called while holding the semaphore lock; `green::wake`
-/// nests the slab and queue locks under it (semaphore -> slab -> queue).
+/// takes a run-queue lock under it (semaphore -> queue).
 fn wake_one_green_waiter(state: &mut SemaphoreState) {
     if let Some(id) = state.green_waiters.pop_front() {
         green::wake(id);

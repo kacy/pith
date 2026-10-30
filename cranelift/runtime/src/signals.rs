@@ -2,8 +2,8 @@
 //!
 //! a server that cannot hear SIGTERM cannot be deployed: every rolling update
 //! kills it mid-request. this module is the plumbing that lets pith code wait
-//! for a signal the same way it waits for a socket — which, under the green
-//! backend, means parking the task rather than its worker.
+//! for a signal the same way it waits for a socket, which under the green
+//! backend means parking the task rather than its worker.
 //!
 //! ## why a self-pipe
 //!
@@ -11,17 +11,17 @@
 //! instruction it was executing. only async-signal-safe functions may be called
 //! from one: no allocation, no locks, nothing that touches the pith runtime
 //! (which allocates and locks nearly everywhere). so the handler here does
-//! exactly one thing — `write()` a single byte, the signal number, into a pipe —
+//! exactly one thing (`write()` a single byte, the signal number, into a pipe),
 //! and every ounce of real work happens on the reading side, in normal code.
 //!
 //! `signalfd` would also work on linux, but it reads signals pending for the
 //! *calling thread* plus the process, which only behaves under an inherited
 //! `pthread_sigmask` in every thread. the green worker pool starts lazily, so
 //! there is no single point at which we could set that mask for all of its
-//! threads. a `sigaction` handler is process-wide by
-//! construction and has no such ordering requirement, and its read end is a
-//! plain pipe fd that works on every unix — so the fallback platforms get the
-//! same semantics rather than a second implementation.
+//! threads. a `sigaction` handler is process-wide by construction and has no
+//! such ordering requirement, and its read end is a plain pipe fd that works
+//! on every unix, so the fallback platforms get the same semantics rather than
+//! a second implementation.
 //!
 //! ## how a waiting task parks
 //!
@@ -34,7 +34,7 @@
 //! ## what the handler must not do
 //!
 //! besides the write, it saves and restores `errno`. a handler that returns
-//! with `errno` clobbered corrupts the interrupted code's error check — the
+//! with `errno` clobbered corrupts the interrupted code's error check: the
 //! classic version of this bug turns an unrelated `read` into a spurious
 //! failure. `SA_RESTART` is set so the runtime's in-flight blocking syscalls
 //! resume instead of failing with `EINTR`.
@@ -110,7 +110,7 @@ fn ensure_pipe() -> bool {
 /// stop SIGPIPE from killing this process, once, for the life of it.
 ///
 /// writing to a socket whose peer has gone raises SIGPIPE, whose default
-/// disposition is to terminate — so a server that answers a client which hung up
+/// disposition is to terminate, so a server that answers a client which hung up
 /// a moment early dies, silently, with no diagnostic and no chance to log. every
 /// server runtime turns this off (rust's own `lang_start` does it, and go and
 /// nginx do the equivalent); pith never saw that, because a pith binary's `main`
@@ -118,7 +118,7 @@ fn ensure_pipe() -> bool {
 /// rust's startup path.
 ///
 /// with the signal ignored the failing `write` returns `EPIPE` instead, which
-/// every caller in the runtime already treats as "the connection is gone" — the
+/// every caller in the runtime already treats as "the connection is gone", the
 /// same answer it gets from a reset. a process that genuinely wants to die on a
 /// broken pipe can still say so: arming SIGPIPE through `pith_signal_notify`
 /// replaces this disposition, since it runs later.
@@ -132,7 +132,7 @@ pub fn ignore_sigpipe() {
     static SIGPIPE_ONCE: Once = Once::new();
     SIGPIPE_ONCE.call_once(|| {
         // SAFETY: `signal` with SIG_IGN on a catchable signal, before any thread
-        // of ours can be writing to a socket — this runs on the path that
+        // of ours can be writing to a socket: this runs on the path that
         // creates the first one.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
@@ -141,7 +141,7 @@ pub fn ignore_sigpipe() {
 }
 
 /// install `handle_signal` as the disposition for `sig`. returns false if the
-/// kernel rejects it — SIGKILL and SIGSTOP cannot be caught, and a signal
+/// kernel rejects it: SIGKILL and SIGSTOP cannot be caught, and a signal
 /// number outside the platform's range is invalid.
 fn install_handler(sig: libc::c_int) -> bool {
     // SAFETY: `sigaction` is zero-initialized then filled with a valid handler,
@@ -158,7 +158,7 @@ fn install_handler(sig: libc::c_int) -> bool {
     }
 }
 
-/// start queueing the signals named by `mask` — a bitmask where bit N selects
+/// start queueing the signals named by `mask`: a bitmask where bit N selects
 /// signal N, so SIGTERM (15) is `1 << 15`. safe to call more than once and from
 /// more than one place; installing a handler twice is idempotent.
 ///
@@ -169,7 +169,7 @@ fn install_handler(sig: libc::c_int) -> bool {
 /// every request of its final deploy.
 ///
 /// arming a signal replaces its default disposition. after this call SIGTERM no
-/// longer terminates the process on its own — something must wait for it and
+/// longer terminates the process on its own: something must wait for it and
 /// act. that is the point, and it is also the footgun; `std.signal` documents it.
 #[no_mangle]
 pub extern "C" fn pith_signal_notify(mask: i64) -> i64 {
@@ -196,7 +196,7 @@ pub extern "C" fn pith_signal_notify(mask: i64) -> i64 {
 }
 
 /// return the next queued signal number, `0` if `timeout_ms` elapsed first, or
-/// `-1` on error (including a wait with nothing armed — waiting for a signal
+/// `-1` on error (including a wait with nothing armed: waiting for a signal
 /// that can never arrive is a bug worth reporting, not a silent forever-block).
 ///
 /// `timeout_ms < 0` waits indefinitely. inside a green task the wait parks the
@@ -231,7 +231,7 @@ pub extern "C" fn pith_signal_wait(timeout_ms: i64) -> i64 {
             return -1;
         }
         // nothing queued: park until the pipe is readable or the deadline
-        // passes. this is the same seam socket reads use — green tasks suspend
+        // passes. this is the same seam socket reads use: green tasks suspend
         // their coroutine here, os threads block on poll, neither spins.
         match fdio::wait_ready(fd as i64, true, timeout_ms) {
             1 => continue,
@@ -245,7 +245,7 @@ pub extern "C" fn pith_signal_wait(timeout_ms: i64) -> i64 {
 /// behaves exactly like the signal an orchestrator sends, rather than being
 /// pinned to the calling thread. returns 1 on success, 0 on failure.
 ///
-/// this exists so a signal path can be tested honestly: a test that signals
+/// this exists so a signal path can be tested end to end: a test that signals
 /// itself exercises the real handler, the real pipe, and the real wait.
 #[no_mangle]
 pub extern "C" fn pith_signal_raise(sig: i64) -> i64 {
@@ -316,12 +316,12 @@ mod tests {
     // the timeout case and the delivery case share one queue, so they are one
     // test rather than two. the self-pipe and the process's signal dispositions
     // are process-global by construction, while cargo runs each `#[test]` on its
-    // own thread of a single process — as two tests, the delivery test's SIGUSR1
+    // own thread of a single process. as two tests, the delivery test's SIGUSR1
     // was read by the timeout test's wait, and both failed. sequencing them here
     // is the only ordering the shared queue actually permits.
     #[test]
     fn a_wait_times_out_when_idle_and_reports_a_raised_signal() {
-        // nothing queued yet: the wait reports a timeout — distinct from a
+        // nothing queued yet: the wait reports a timeout, distinct from a
         // delivery (a positive signal number) and from an error (-1), so a drain
         // loop can tell "no signal yet" from "this wait will never work".
         assert_eq!(pith_signal_notify(1 << libc::SIGUSR2), 1);

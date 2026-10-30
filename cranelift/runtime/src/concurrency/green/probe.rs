@@ -6,7 +6,7 @@ use super::*;
 // the cross-thread resume probe.
 //
 // a task parked on one os thread and resumed on another must see the resuming
-// thread's identity — its worker index — and must still find its own task id
+// thread's identity (its worker index) and must still find its own task id
 // and tls map, which the resuming thread's `run_task` installs. that is the
 // resume a migration performs, and this probe forces it by hand: the calling
 // thread poses as worker 0 and runs a task until it parks; a second os thread,
@@ -15,7 +15,7 @@ use super::*;
 //
 // it lives in library code rather than in the test module for a reason that
 // is the whole point of the check. what makes a stale read possible is the
-// code shape of the *shipped* runtime — the tls model `libpith_runtime.a`
+// code shape of the *shipped* runtime: the tls model `libpith_runtime.a`
 // is compiled with (see the accessor block above `current_task`). a `cargo
 // test` binary is an executable in its own right, always gets the local-exec
 // model whatever the workspace is configured with, and so can never observe
@@ -81,8 +81,8 @@ pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
 
     // first resume, on this thread: the body parks. claim it the way a waker
     // does (Parked -> Ready) but hand it straight to the thread below instead
-    // of enqueueing it, so a real worker 0 — if the process has started the
-    // pool — cannot take it first.
+    // of enqueueing it, so a real worker 0 (if the process has started the
+    // pool) cannot take it first.
     run_task(id);
     set_current_worker(None);
     let Some(block) = sync_block(id) else {

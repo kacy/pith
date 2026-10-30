@@ -10,18 +10,18 @@
 //! what may cross to a pool thread.
 //!
 //! that rule is the reason these functions are shaped the way they are. the job
-//! that runs on the pool thread deals only in plain owned data — a `String`
-//! path, a `Vec<u8>`, a `std::fs::File` — and every pith-visible value (a
+//! that runs on the pool thread deals only in plain owned data (a `String`
+//! path, a `Vec<u8>`, a `std::fs::File`), and every pith-visible value (a
 //! `Bytes` handle, a C string, a list) is built afterwards, back on the task's
 //! own thread, where the thread-local freelists it comes from live.
 //!
-//! metadata and name operations — `exists`, `size`, `mkdir`, `rename`, the
-//! single-file `remove` — stay direct. each is one syscall that the kernel
+//! metadata and name operations (`exists`, `size`, `mkdir`, `rename`, the
+//! single-file `remove`) stay direct. each is one syscall that the kernel
 //! answers from its dentry cache in the overwhelmingly common case, which is
 //! the same order of cost as the handoff itself; paying a park to protect
 //! against a slow network mount would make the ordinary case worse for every
-//! program. `remove_tree` and `list_dir` do not get that argument — their cost
-//! grows with the tree — so those are offloaded.
+//! program. `remove_tree` and `list_dir` do not get that argument (their cost
+//! grows with the tree), so those are offloaded.
 
 use crate::blocking::{self, Pool};
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
@@ -39,6 +39,9 @@ use std::sync::OnceLock;
 /// write cannot queue in front of a dial, or the reverse.
 static POOL: Pool = Pool::new("pith-file", 4);
 
+/// open files by handle. a handle is a counter value that is never reused, so
+/// a closed handle can never name a later file (see `fd_handle` for why
+/// sockets need more than this).
 static FILE_HANDLES: OnceLock<Mutex<HashMap<i64, File>>> = OnceLock::new();
 static NEXT_FILE_HANDLE: AtomicI64 = AtomicI64::new(1);
 
@@ -74,7 +77,7 @@ fn register_file(file: File) -> i64 {
 /// lock is never held across a park. holding it there would deadlock at one
 /// worker: the parked task cannot resume to release the lock while its worker
 /// sits blocked on that same lock for another task. `try_clone` is `dup(2)`, so
-/// the clone shares the file description and therefore the offset — a
+/// the clone shares the file description and therefore the offset: a
 /// sequential read still picks up where the last one left off.
 fn clone_file(handle: i64) -> Option<File> {
     file_handles().lock().get(&handle)?.try_clone().ok()
@@ -91,16 +94,6 @@ fn read_chunk(file: &mut File, size: usize) -> Option<Vec<u8>> {
             Some(buf)
         }
         Err(_) => None,
-    }
-}
-
-/// the byte count a streaming write asks for, matching what the callers used to
-/// compute inline: a non-positive `max_bytes` means "a default chunk".
-fn chunk_size(max_bytes: i64) -> usize {
-    if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
     }
 }
 
@@ -128,7 +121,9 @@ impl Default for FileWrite {
 /// opened, or closed since.
 const UNKNOWN_FILE_HANDLE: &str = "invalid or closed file handle";
 
-unsafe fn pith_open_file_with(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
+/// open the file at `path` (a C string) and register it, returning its handle
+/// or 0 on failure. the shared body of the three `pith_file_open_*` exports.
+unsafe fn open_file_handle(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
     let Some(path_str) = cstr_str(path) else {
         return 0;
     };
@@ -347,7 +342,7 @@ pub unsafe extern "C" fn pith_write_file(path: *const i8, content: *const i8) ->
     };
     // handing the content to another thread means owning it, which for a write
     // means copying it. that copy is worth a syscall the worker would otherwise
-    // sit through, but only when there is a worker to protect — so ask first
+    // sit through, but only when there is a worker to protect, so ask first
     // and write straight out of the caller's buffer when there is not.
     if !blocking::offloads() {
         return write_file_at(path_str, content.as_bytes()) as i64;
@@ -405,24 +400,24 @@ pub unsafe extern "C" fn pith_append_file_bytes(path: *const i8, content: i64) -
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_read(path: *const i8) -> i64 {
-    pith_open_file_with(path, false, false, false)
+    open_file_handle(path, false, false, false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_write(path: *const i8) -> i64 {
-    pith_open_file_with(path, true, true, false)
+    open_file_handle(path, true, true, false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
-    pith_open_file_with(path, true, false, true)
+    open_file_handle(path, true, false, true)
 }
 
 /// read one chunk from an open handle, on a pool thread when there is a worker
 /// to protect. `None` covers both an unknown handle and a read error, which is
 /// what the callers already collapse them to.
 fn read_handle_chunk(handle: i64, max_bytes: i64) -> Option<Vec<u8>> {
-    let size = chunk_size(max_bytes);
+    let size = crate::fdio::chunk_size(max_bytes);
     if !blocking::offloads() {
         let mut handles = file_handles().lock();
         return read_chunk(handles.get_mut(&handle)?, size);
@@ -519,7 +514,7 @@ pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
 }
 
 /// Get environment variable value wrapped in an Optional tuple. Returns
-/// `Some(value)` when the variable is set and `None` otherwise — the
+/// `Some(value)` when the variable is set and `None` otherwise: the
 /// `pith_env` version collapses both to `""`, which is indistinguishable
 /// from a variable set to the empty string.
 ///
@@ -637,7 +632,7 @@ pub unsafe extern "C" fn pith_list_dir(path: *const i8) -> i64 {
         None => None,
     };
 
-    // an unreadable directory is an empty list, not an error, as before. the
+    // an unreadable directory is an empty list, not an error. the
     // list and its strings are pith objects, so they are built here rather than
     // on the pool thread.
     let list = pith_list_new(8, 1);

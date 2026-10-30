@@ -33,7 +33,7 @@ the Pith-side crypto helpers rather than in a Rust runtime module.
 1. **Delete Rust-side backend guessing.** The IR is self-describing and the
    consumer trusts it. Calls carry an explicit return kind
    (`call REG NAME RETKIND NARGS ...`) and `parse_call_shape` rejects the old
-   form; field loads carry `index kind name`. The metadata-inference block and
+   form; field loads carry `OFFSET KIND NAME`. The metadata-inference block and
    symbol-alias table are gone from `cranelift/codegen/src/ir_consumer.rs`. The
    bugs this guessing caused (cross-module float returns, cross-module map
    value reads, set codegen, negative float literals) are pinned by regression

@@ -16,8 +16,6 @@ from std.collections import copy_list
 import std.bytes as bytes
 import std.time as time
 
-PROCESS_IO_CHUNK_SIZE := 4096
-
 # a process command builder with argv, cwd, and env overrides.
 pub struct Command:
     pub program: String
@@ -220,18 +218,10 @@ impl Process:
     fn close():
         process_close(self.handle)
 
-# ProcessStdin's write family lives on the struct's home module: std.io
-# declares write/write_all (plus the ctx, bytes and buffered variants) and
-# they resolve from here too. this module used to re-declare write and
-# write_all with its own (behaviorally identical) bodies, which made
-# "which body answers" a module-order accident — the duplicate impl block
-# is gone and E263 now rejects the shape.
-
-# ProcessStdout and ProcessStderr read the same way: their read family
-# lives on the structs' home module, std.io, and resolves from here too.
-# the duplicate impl blocks that used to re-declare read/read_all with
-# their own (behaviorally identical) bodies are gone — see the
-# ProcessStdin note above.
+# the pipe methods (ProcessStdin's write family, and the read family of
+# ProcessStdout and ProcessStderr) are declared once in std.io, the
+# structs' home module, and resolve from here. a second impl block here
+# would make the answering body depend on module order, so E263 rejects it.
 
 impl Output:
     fn success() -> Bool:

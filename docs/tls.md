@@ -411,9 +411,10 @@ public; only the signature proves the client holds its key.
 both the client and server negotiate tls 1.3 and, when a peer cannot speak 1.3,
 fall back to tls 1.2 — the highest version a peer supports wins, and anything
 below 1.2 is refused. this matches go's crypto/tls and rustls. the fallback is
-deliberately narrow and forward-secret: only the four ecdhe-rsa/ecdhe-ecdsa
-aes-128-gcm and chacha20-poly1305 suites are offered or accepted, so static-rsa
-key exchange, cbc suites, rc4, 3des, dhe, and psk are refused by construction.
+deliberately narrow and forward-secret: only the six ecdhe-rsa/ecdhe-ecdsa
+aes-128-gcm, aes-256-gcm and chacha20-poly1305 suites are offered or accepted,
+so static-rsa key exchange, cbc suites, rc4, 3des, dhe, and psk are refused by
+construction.
 
 downgrade protection is built in: the client offers `supported_versions`
 {1.3, 1.2} plus extended master secret (rfc 7627) and renegotiation_info

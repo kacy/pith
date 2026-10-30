@@ -98,7 +98,7 @@ fn ir_match_subject_release_kind(node: Node, subj_type: String, subj_owned: Bool
         i = i + 1
     return kind
 
-# Lower a tail-position match: each matching arm returns its value. A no-match
+# lower a tail-position match: each matching arm returns its value. a no-match
 # fall-through lands on the function's default return.
 
 ## lower a function-tail match directly into returns. subj_owned reports
@@ -149,7 +149,7 @@ pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emi
     if subj_release.len() > 0:
         ir_rc_release_reg(subj_r, subj_release)
 
-# Emit a bool register that is 1 when subj_r matches pat, ignoring any bindings
+# emit a bool register that is 1 when subj_r matches pat, ignoring any bindings
 # (those are emitted separately, only in the branch where the pattern matched).
 
 ## the boolean register deciding whether an arm matches.
@@ -363,9 +363,9 @@ pub fn ir_resolved_variant_kinds_for_tid(tid: Int, variant_key: String, kinds: L
 fn ir_resolved_variant_kinds(pat_value: String, kinds: List[String]) -> List[String]:
     return ir_resolved_variant_kinds_for_tid(ir_match_subject_tid, pat_value, kinds)
 
-# Literal payload sub-patterns (Shape.Circle(0.0)) narrow the tag match:
+# literal payload sub-patterns (Shape.Circle(0.0)) narrow the tag match:
 # each one loads its slot and ANDs an equality into the arm condition.
-# Binding and wildcard sub-patterns always match here; bindings are stored
+# binding and wildcard sub-patterns always match here; bindings are stored
 # by ir_emit_match_bindings once the arm is taken.
 
 ## extend an arm condition with variant payload checks.
@@ -403,7 +403,7 @@ pub fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) ->
         acc_r = and_r
     return acc_r
 
-# Bind any names a pattern introduces, in the branch where it matched.
+# bind any names a pattern introduces, in the branch where it matched.
 
 ## give a match binding its own count on an rc payload: release whatever the
 ## name held before (zero on first reach, a stale payload when an arm rebinds
@@ -522,7 +522,7 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
                     ir_var_types.insert(sub.value, kind)
                 ir_emit("store " + sub.value + " " + slot_r.to_string())
 
-# Emit an arm body. A block body runs as statements (and may return); an
+# emit an arm body. a block body runs as statements (and may return); an
 # expression body produces a value stored into result_temp.
 
 ## emit one arm's body and jump to the merge label.

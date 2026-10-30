@@ -320,7 +320,7 @@ mut ir_current_func_returns_result := false
 # the impl block's target type, set while a method body is being emitted, so
 # `self.field = ...` knows what struct fields to look up
 mut ir_current_impl_type := ""
-# When a specialized impl method body is being emitted these hold the struct's
+# when a specialized impl method body is being emitted these hold the struct's
 # generic param names and the concrete type names for this instantiation, so
 # `self.field` references whose declared type is a struct param (`I`, `T`, `U`)
 # resolve to the right concrete type for dispatch (e.g., `Range` not `I`).
@@ -435,6 +435,10 @@ fn ir_reset_global_state():
     ir_global_bool_names = []
     ir_global_slot_names = []
 
+# clear the per-module type registries: struct and enum shapes, impl
+# methods, declared returns and result kinds, generic declarations and
+# specializations, the result-register registry, and the destructor and
+# tracer memos, so nothing one module declared is visible to the next.
 fn ir_reset_type_state():
     ir_local_struct_names = []
     ir_reset_dtor_memo()
@@ -543,8 +547,8 @@ fn ir_expr_result_kind(idx: Int) -> String:
         return ir_method_call_result_kind(idx, node)
     return ir_expr_legacy_result_kind(idx)
 
-# The ir result kind (how a Result is carried in the abi) of a plain call.
-# A call through a fn-value local forwards that local's recorded closure return
+# the ir result kind (how a Result is carried in the abi) of a plain call.
+# a call through a fn-value local forwards that local's recorded closure return
 # kind; a generic callee is specialized first; then the callee's declared kind
 # wins over the builtin table, with legacy inference as the fallback.
 fn ir_call_result_kind(idx: Int, node: Node) -> String:
@@ -573,7 +577,7 @@ fn ir_call_result_kind(idx: Int, node: Node) -> String:
             return builtin_kind
     return ir_expr_legacy_result_kind(idx)
 
-# The ir result kind of a method call. A module-qualified call (`mod.fn(...)`)
+# the ir result kind of a method call. a module-qualified call (`mod.fn(...)`)
 # resolves like a static call; otherwise dispatch to the impl method, then to a
 # `self.make()` closure field inside a generic impl, then the builtin table,
 # with legacy inference as the fallback.
@@ -640,6 +644,10 @@ fn ir_generic_result_ok_kind(name: String, concrete_types: List[String]) -> Stri
                     return ir_retkind(ir_resolve_type_node_with_subst(type_node.children[0], generic_params, concrete_types))
     return ""
 
+# the ir kind of the ok payload of the result `idx` evaluates to, or "" when
+# it cannot be resolved. the checker's recorded type answers first; failing
+# that, the callee's declaration (a generic one read under this call's type
+# arguments), then the builtin table.
 fn ir_result_ok_kind_for_expr(idx: Int) -> String:
     tid := c_get_expr_type(idx)
     if tid >= 0:
@@ -2681,6 +2689,10 @@ fn ir_collect_borrowed_element_binds(idx: Int, body_idx: Int, names: List[String
         ir_collect_borrowed_element_binds(child, body_idx, names)
         i = i + 1
 
+# true when the binding at `block.children[pos]` qualifies under the rules
+# listed at ir_borrowed_element_binds. the closing count is what proves the
+# name is used only in its own block's later statements: every mention of it
+# in the body is either the binding itself or inside that range.
 fn ir_bind_can_borrow_element(block: Node, pos: Int, body_idx: Int) -> Bool:
     bind := get_node(block.children[pos])
     if not ir_is_binding_kind(bind.kind) or bind.value.contains(" "):
@@ -3254,6 +3266,12 @@ fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
             if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
                 ir_impl_func_specialized(method_idx, impl_type, instance_type_name, inst_tid, struct_params, arg_names)
 
+# emit one method of a generic impl for a single instance (`MapIter[Range,
+# Int, Int].next` as `MapIter_Range_int_int_next`), once per emit pass. the
+# instance's symbol is also recorded in ir_impl_method_specializations, with
+# the module prefix the base method carries, so call sites in other modules
+# reach the same symbol. the body is re-checked against the instance first,
+# so its nodes carry concrete types while it emits.
 fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: String, inst_tid: Int, params: List[String], arg_names: List[String]):
     node := get_node(idx)
     orig_name := node.value
@@ -3752,12 +3770,12 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
     return ir_emit_value_for_target_inner(val_idx, target_type, "")
 
 # `target_inner` is the optional's inner type when the caller knows it, and ""
-# when it does not. It exists for one case: an optional lowers to the same
+# when it does not. it exists for one case: an optional lowers to the same
 # tuple-shaped allocation a tuple literal produces, so a genuine tuple payload
-# and an already-built shell are the same shape here. Without the target's own
+# and an already-built shell are the same shape here. without the target's own
 # word for which it wants, a `(Int, String)?` target takes the pass-through
 # path and stores the payload raw, and the extraction then reads the shell's
-# slots. The return site has always consulted the inner type for this reason.
+# slots. the return site has always consulted the inner type for this reason.
 ## the payload kinds an optional takes ownership of: it retains a borrowed one
 ## and attaches the destructor that releases it when the shell dies.
 ##
@@ -4705,10 +4723,10 @@ fn ir_try_emit_byte_compare(node: Node, op: String) -> Int:
         ir_emit("neq " + r.to_string() + " " + left_b.to_string() + " " + right_b.to_string())
     return r
 
-# Short-circuit `and` / `or`. Pith's other IR operators lower with both
+# short-circuit `and` / `or`. Pith's other IR operators lower with both
 # operands eagerly evaluated, but that means guards like
 # `if i == 0 or item != list[i-1]` still index `list[-1]` on the LHS-true
-# path. Emit a labeled branch instead so the RHS only runs when the LHS
+# path. emit a labeled branch instead so the RHS only runs when the LHS
 # doesn't decide the result.
 #
 #   or:  eval L; if L => merge (result = L); else => eval R (result = R)
@@ -4785,9 +4803,9 @@ fn ir_try_emit_none_to_none_compare(node: Node) -> Int:
         ir_emit("iconst " + r.to_string() + " 0")
     return r
 
-# `==` / `!=` where at least one operand is an Optional. A raw pointer eq would
+# `==` / `!=` where at least one operand is an Optional. a raw pointer eq would
 # compare heap addresses, so compare by (is_some, value) instead. Covers a none
-# literal against an optional and `T? == T?`. Returns -1 when neither operand
+# literal against an optional and `T? == T?`. returns -1 when neither operand
 # is an optional comparison, leaving the value-operator path to handle it.
 fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
     op := node.value
@@ -4819,7 +4837,7 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
             ir_release_owned_optional_operand(node.children[0], left_r)
             return r
         # T? == T?: raw pointer eq would compare heap addresses, not contents.
-        # Compare by (is_some, value) so callers can put an Optional inside
+        # compare by (is_some, value) so callers can put an Optional inside
         # assert_eq or a generic container without silently getting identity.
         # Optional type ids are not interned (add_type_info doesn't dedupe),
         # so match by inner type rather than by tid.
@@ -4830,7 +4848,7 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
             return r
         # T? == T, the widened mixed comparison: compare is_some and the
         # payload against the bare value. Deliberately the LAST arm: every
-        # both-sides-optional recovery above must get first refusal. A fresh
+        # both-sides-optional recovery above must get first refusal. a fresh
         # string on the plain side dies with the compare, the same rule the
         # value operator applies to its operands.
         if left_info.kind == "optional" and left_info.inner >= 0 and ir_plain_compare_operand_ok(right_tid, right_info):
@@ -4852,9 +4870,9 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
 fn ir_plain_compare_operand_ok(tid: Int, info: TypeInfo) -> Bool:
     return tid >= 0 and tid != TID_ERR and tid != TID_NONE and info.kind != "optional"
 
-# The scalar / string / bytes value operators: float arithmetic, string concat
+# the scalar / string / bytes value operators: float arithmetic, string concat
 # and ordered comparison (which call the runtime rather than compare pointers),
-# enum structural equality, and the plain integer binops. Emits into r (already
+# enum structural equality, and the plain integer binops. emits into r (already
 # allocated by the caller so register numbering is stable) and returns it.
 fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
     op := node.value
@@ -5344,8 +5362,8 @@ fn ir_emit_list_contains_method(node: Node, obj_type: String) -> Int:
     index_r := ir_emit_list_index_search(node, obj_type)
     return ir_emit_list_contains_from_index(index_r)
 
-# Wrap a raw index-search result (a valid index or -1) as an Optional[Int].
-# Emits: iconst 0; ge cmp raw 0; if cmp then Some(raw) else None. Reuses
+# wrap a raw index-search result (a valid index or -1) as an Optional[Int].
+# emits: iconst 0; ge cmp raw 0; if cmp then Some(raw) else None. reuses
 # the existing optional-tuple builders so the layout matches the rest of
 # the ABI.
 fn ir_emit_index_search_to_optional(raw_r: Int) -> Int:
@@ -5547,6 +5565,13 @@ fn ir_emit_devirtualized_call(r: Int, lambda_symbol: String, ret_type: String, h
     ir_emit_name_load(handle_r, handle_name)
     ir_emit_call_text(r, lambda_symbol, ret_type, arg_regs.len() + 1, " " + handle_r.to_string() + ir_join_arg_regs(arg_regs))
 
+# lower a call whose callee is written as a name. after the special forms
+# (an indexed decode call, a call through a function-valued expression) it
+# resolves the callee: a loop variable, a local bound to a known lambda, a
+# module global holding a fn value. then the builtin shortcuts (`ord` on a
+# byte, higher-order list calls, struct construction, the assertions) get
+# their chance before the plain call, which is followed by the release of
+# owned arguments and, for a legacy single-register result, its wrapping.
 fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     mut explicit_generic_types: List[String] := []
     if node.children.len() > 0:
@@ -7283,8 +7308,8 @@ fn ir_is_channel_send_name(emit_name: String) -> Bool:
 
 # --- method call dispatch ---
 fn ir_emit_method_call(idx: Int) -> Int:
-    # A method call is lowered by a handful of specialized emitters tried in
-    # order; each returns a register or -1 ("not my shape, keep looking"). The
+    # a method call is lowered by a handful of specialized emitters tried in
+    # order; each returns a register or -1 ("not my shape, keep looking"). the
     # order matters; an earlier shape shadows the ones after it:
     #   1. enum variant construction   Shape.Circle(2.5) / mod.Enum.Variant(..)
     #   2. type-directed builtins       Int.to_string, Result.*, Optional.*
@@ -7309,7 +7334,7 @@ fn ir_emit_method_call(idx: Int) -> Int:
 
 # `Shape.Circle(2.5)` parses as a method call on the enum type name but is
 # really a variant construction. Handles both the local form and the
-# module-qualified `mod.Enum.Variant(...)` form. Returns -1 when the receiver
+# module-qualified `mod.Enum.Variant(...)` form. returns -1 when the receiver
 # is not a (possibly aliased) boxed-enum name.
 fn ir_emit_variant_ctor_method(idx: Int) -> Int:
     node := get_node(idx)
@@ -7334,9 +7359,9 @@ fn ir_emit_variant_ctor_method(idx: Int) -> Int:
                     return ir_emit_variant_construction(idx, node, ctor_recv.value, qual_key)
     return 0 - 1
 
-# Methods whose lowering is chosen by the receiver's static type rather than by
+# methods whose lowering is chosen by the receiver's static type rather than by
 # name resolution: unsigned `to_string`, the `Result` combinators, and the
-# `Optional` accessors. Returns -1 when none apply.
+# `Optional` accessors. returns -1 when none apply.
 fn ir_emit_typed_receiver_method(idx: Int) -> Int:
     node := get_node(idx)
     mname := ir_plain_method_name(node_value(idx))
@@ -7418,10 +7443,10 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 return out_r
     return 0 - 1
 
-# A module-qualified call, `mod.member(...)`, where `mod` is an import alias.
-# Resolves to the target name and emits it, as an inline struct construction
+# a module-qualified call, `mod.member(...)`, where `mod` is an import alias.
+# resolves to the target name and emits it, as an inline struct construction
 # when the member is a struct type, otherwise as a plain (possibly generic)
-# static call. Returns -1 when the receiver is not a module alias.
+# static call. returns -1 when the receiver is not a module alias.
 fn ir_emit_module_alias_method(idx: Int) -> Int:
     node := get_node(idx)
     alias_fname := ir_resolve_module_alias_method_call_name(idx)
@@ -7479,7 +7504,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         return r
     return 0 - 1
 
-# The general method dispatch: self-hosted list builtins, a call through a
+# the general method dispatch: self-hosted list builtins, a call through a
 # closure-typed struct field, and finally an ordinary impl-method call with its
 # ARC bookkeeping (container-store retains, argument and receiver releases).
 fn ir_emit_general_method_call(idx: Int) -> Int:
@@ -7833,6 +7858,15 @@ fn ir_finish_lambda_emit(saved_builder: IrBuilderSnapshot, saved_vars: Map[Strin
         ir_local_lambda_targets_depth = ir_local_lambda_targets_depth - 1
         ir_local_lambda_targets = ir_local_lambda_targets_saved[ir_local_lambda_targets_depth]
 
+# lower a lambda literal: its body becomes a separate `__lambda_N` function,
+# emitted into its own buffer with the enclosing function's per-function
+# state saved around it and appended after the enclosing function, and the
+# expression's value is the closure handle with the captures filled in. the
+# closure lives in a stack slot only when the bind or call that owns it
+# asked for that (ir_lambda_on_stack) and its captures need no count of
+# their own, either because none is counted or because the frame keeps them
+# alive across the call the lambda is an argument of. otherwise it is a
+# counted heap closure.
 fn ir_emit_lambda(idx: Int) -> Int:
     on_stack := ir_lambda_on_stack
     borrows_captures := ir_lambda_borrows_captures
@@ -7983,6 +8017,9 @@ fn ir_captures_uncounted(captures: List[String]) -> Bool:
             return false
     return true
 
+# build the `__spawn_N` wrapper a `spawn f(args)` runs on the new task: the
+# free variables of the callee expression and of every argument become the
+# wrapper's captures, so the call is evaluated inside the task.
 fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     wrapper_name := "__spawn_" + ir_lambda_count.to_string()
     ir_lambda_count = ir_lambda_count + 1
@@ -8188,7 +8225,7 @@ fn ir_emit_ident_load(idx: Int, name: String) -> Int:
         return ir_emit_weak_read(r)
     return r
 
-# True when any argument carries a field name (named construction).
+# true when any argument carries a field name (named construction).
 fn ir_struct_args_have_names(arg_nodes: List[Int]) -> Bool:
     for an_idx in arg_nodes:
         an := get_node(an_idx)
@@ -8196,11 +8233,11 @@ fn ir_struct_args_have_names(arg_nodes: List[Int]) -> Bool:
             return true
     return false
 
-# Field metadata for a struct construction, resolved by the checker's type id
+# field metadata for a struct construction, resolved by the checker's type id
 # when it typed the expression. Two modules can each declare a struct with the
 # same name; the name-keyed registry (and the global type table it consults)
 # then collapse them, so a field given by name matches the wrong struct's
-# layout and silently stores its default. The construction's checked tid names
+# layout and silently stores its default. the construction's checked tid names
 # the exact struct, so we read its ordered fields directly, the same
 # authoritative path field reads already use (ir_try_checked_field_read). We
 # fall back to the name-keyed registry when the checker never assigned a plain
@@ -8239,10 +8276,10 @@ fn ir_ctor_field_type_name(sname: String, tid: Int, field_name: String) -> Strin
                     return ir_type_from_tid(info.field_types[i])
     return ir_struct_field_type_name(sname, field_name)
 
-# Emit a struct built with named fields (`Point(x: 3, y: 4)`). Fields can be
+# emit a struct built with named fields (`Point(x: 3, y: 4)`). fields can be
 # given in any order and any defaulted field may be omitted, so we walk the
 # struct's declaration order and pull each field's value by name, falling back
-# to its default. The checker has already validated names and required fields.
+# to its default. the checker has already validated names and required fields.
 # `tid` is the construction's checked type id (or -1), used to resolve the field
 # layout unambiguously across same-named structs.
 fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> Int:
@@ -8583,7 +8620,7 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
         value_type = ir_lookup_map_value_type_for_expr(node.children[0])
     if value_type.len() == 0:
         value_type = ir_infer_type(idx)
-    # In a T! function, propagate on miss instead of aborting. Callers
+    # in a T! function, propagate on miss instead of aborting. Callers
     # can `catch` or `unwrap_or` at their level. Outside T! context, the
     # strict variants keep aborting cleanly.
     # the runtime getter is picked by the key flavor as well as the kind: a
@@ -8618,7 +8655,7 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
 fn ir_release_owned_index_key(key_idx: Int, key_r: Int):
     ir_release_owned_operand(key_idx, key_r, ir_infer_type(key_idx))
 
-# True when obj_type has an `_opt` runtime we can dispatch to for
+# true when obj_type has an `_opt` runtime we can dispatch to for
 # fail-propagate. Maps and lists ship the opt variants; string, bytes,
 # and set fall through to the strict runtime (they don't have _opt
 # accessors yet).
@@ -8633,7 +8670,7 @@ fn ir_index_supports_propagate(obj_type: String) -> Bool:
         return true
     return false
 
-# Emit `map[k]` / `list[i]` as a fail-propagate: call the _opt runtime,
+# emit `map[k]` / `list[i]` as a fail-propagate: call the _opt runtime,
 # branch on is_some, on none return the fail result tuple, on some
 # continue with the unwrapped value. Mirrors ir_emit_optional_unwrap.
 fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: String, value_type: String) -> Int:
@@ -8690,22 +8727,22 @@ fn ir_index_get_opt_call_name(obj_type: String) -> String:
 #
 # `m[k] = m[k] + d` and `m.insert(k, m[k] + d)` are one update written as two
 # operations: a strict read of a slot and a store back into the same slot.
-# Each one hashes the key and probes the table for it, and the shape is
-# usually guarded by a `contains_key` that hashed it once more. The runtime
+# each one hashes the key and probes the table for it, and the shape is
+# usually guarded by a `contains_key` that hashed it once more. the runtime
 # has an entry point that reads and writes in a single probe, so recognizing
 # the shape here takes an update from three hashes to two.
 #
-# The rewrite is only safe under conditions the recognizer checks:
+# the rewrite is only safe under conditions the recognizer checks:
 #
 #   * both map expressions and both key expressions have to be the same
 #     side-effect-free expression, so evaluating each once rather than twice
-#     cannot change what the program does. A call anywhere inside either is
+#     cannot change what the program does. a call anywhere inside either is
 #     enough to say no.
-#   * the delta has to be side-effect-free too. The unfused form reads the
+#   * the delta has to be side-effect-free too. the unfused form reads the
 #     old value before evaluating the delta and the fused form reads it
 #     after, so a delta that could write the same slot would see one answer
 #     in one form and another in the other.
-#   * the map's values have to be integers. The runtime adds the stored word
+#   * the map's values have to be integers. the runtime adds the stored word
 #     with wrapping arithmetic, which is what the `add` instruction does, and
 #     an integer-valued map holds no reference counts, so no count changes
 #     hands on the fused path.
@@ -9138,16 +9175,16 @@ fn ir_emit_grouped_expr(node: Node) -> Int:
         return ir_expr(node.children[0])
     return ir_zero_reg()
 
-# A match compiles to a linear chain of pattern tests. The subject is evaluated
+# a match compiles to a linear chain of pattern tests. the subject is evaluated
 # once; each arm tests its pattern (and guard) and, on a match, runs its body
 # and jumps to the end. Arm bodies that are expressions store their value into a
 # result temp, so the whole match can be used as an expression. Bare enum values
 # lower to their integer variant index, so variant matching is an integer eq.
 
-# When a match sits in a function's tail position its value is the function's
-# implicit return. This holds that match node so its arms emit `ret` directly.
+# when a match sits in a function's tail position its value is the function's
+# implicit return. this holds that match node so its arms emit `ret` directly.
 
-# Emit an arm body that returns its value (tail-position match). Block bodies
+# emit an arm body that returns its value (tail-position match). Block bodies
 # run as statements (and return on their own).
 fn ir_expr_complex(idx: Int, node: Node) -> Int:
     kind := node_kind(idx)
@@ -9754,7 +9791,7 @@ fn ir_resolve_field_lookup_key(recv_idx: Int, fname: String) -> String:
             return base_key
     return ""
 
-# Assign to a struct field target: `obj.field = value`. Returns false if the
+# assign to a struct field target: `obj.field = value`. returns false if the
 # target is not a known struct field (so the caller falls back to other forms).
 fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
     target := get_node(target_idx)
@@ -9806,7 +9843,7 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
         ir_rc_release_reg(old_r, fassign_kind)
     return true
 
-# Compound assign to a struct field: `obj.field += value` (and -=, *=, /=).
+# compound assign to a struct field: `obj.field += value` (and -=, *=, /=).
 fn ir_emit_field_compound_assignment(target_idx: Int, value_idx: Int, compound_op: String) -> Bool:
     target := get_node(target_idx)
     if target.kind != "field_access" or target.children.len() == 0:
@@ -10415,7 +10452,7 @@ fn ir_emit_for_stmt(node: Node):
 # `for x in list` and other index-addressable iterables (the fallback when the
 # element is neither a range nor an iterator-protocol struct). Converts to a
 # fresh container when the type needs it, then runs a counted loop over the
-# length using get-by-index. An owned iterable is released when the loop ends,
+# length using get-by-index. an owned iterable is released when the loop ends,
 # or at the function's exit edges if the body returns / fails early.
 # whether a loop over a borrowed iterable must hold its own count. a local
 # that the body never assigns keeps its count for the whole loop, so the
@@ -10650,7 +10687,7 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
     ir_emit_label(end_l)
 
 # `for x in it` where `it` is an iterator (a struct with `next() -> T?`).
-# Drives the loop by calling next() each iteration and stops at the first
+# drives the loop by calling next() each iteration and stops at the first
 # none; the value is read from the Some shell's slot 8 inside the loop.
 fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: String):
     iter_r := ir_expr(node.children[0])
@@ -10738,7 +10775,7 @@ fn ir_stmt_control(idx: Int, node: Node):
 #
 # a block is statements plus the two loop-control jumps that need to
 # know their enclosing labels (break, continue).
-# Recursive block walker: unwrap block/body/then/else wrappers
+# recursive block walker: unwrap block/body/then/else wrappers
 # and emits statements in source order.
 # returns a throwaway 0 so it can travel as a fn value: void
 # functions are not yet recognized by the function-value path.
@@ -10887,8 +10924,8 @@ fn ir_extract_optional_inner_type(fn_idx: Int) -> String:
                     return ir_resolve_type_node(rn.children[0])
     return ""
 
-# True when the function declared at `fn_idx` returns a Result (T! or T!E).
-# Used to decide whether index-expression codegen should propagate a fail
+# true when the function declared at `fn_idx` returns a Result (T! or T!E).
+# used to decide whether index-expression codegen should propagate a fail
 # on miss.
 fn ir_fn_returns_result(fn_idx: Int) -> Bool:
     node := get_node(fn_idx)
@@ -11134,6 +11171,10 @@ fn ir_resolve_assoc_in_generic(type_name: String, params: List[String], concrete
         i = i + 1
     return type_name
 
+# emit the body of one queued generic specialization. `key` is the
+# tab-separated base name and type arguments ir_queue_generic_specialization
+# registered; the declaration is type-checked under those arguments and then
+# emitted under the specialized symbol with the substitution active.
 fn ir_emit_generic_specialization(key: String):
     if not ir_generic_specialization_names.contains_key(key):
         return
@@ -11405,11 +11446,11 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_set_pair_return(ret_type == "result_reg")
     ir_current_func_optional_inner_kind = ""
 
-# A value-returning function whose body ends in a bare match has no explicit
+# a value-returning function whose body ends in a bare match has no explicit
 # return, so the match is the implicit return value. (Such functions return 0
 # today, so handling this can only fix behavior.) Returns the tail match node
 # index, or -1.
-# Find a tail-position match: unwrap block/body wrappers to the last statement,
+# find a tail-position match: unwrap block/body wrappers to the last statement,
 # and report it if it is a match in a value-returning function. Such a function
 # returns 0 today (no implicit-return support), so honoring the tail match can
 # only fix behavior.
@@ -12464,6 +12505,11 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
             if ir_has_generic_params(node):
                 ir_record_generic_function_decl(item_idx, node, "")
 
+# the second metadata pass, run once names and generic declarations are
+# known from phase one: index interfaces and associated types across the
+# module graph, then register struct and enum shapes, drop impls and impl
+# method signatures from the imports and this module, so lowering can
+# resolve every field and method a body touches.
 fn ir_collect_root_phase_two_metadata(root_idx: Int):
     ir_local_struct_names = []
     ir_reset_dtor_memo()
@@ -12583,6 +12629,11 @@ fn ir_emit_cc_register_tracers():
         ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
     ir_emit_zero_ret_endfunc()
 
+# the emission phase of emit_ir for the module being lowered, in output
+# order: globals and their init, the walks for the types the module
+# declares, the top-level functions, impls and tests, the queued generic
+# specializations and lambda bodies, and last the per-instance and tuple
+# helpers, which those bodies register only as they emit.
 fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_enum_dtor_base = {}
     ir_generic_enum_dtor_kinds = {}
@@ -12637,9 +12688,9 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # list covers the tuple and generic-instance twins too.
     ir_emit_cc_register_tracers()
 
-# Walk every impl_decl in the current root and register specialization name
+# walk every impl_decl in the current root and register specialization name
 # entries into ir_impl_method_specializations without emitting bodies yet.
-# Then ir_emit_impl_methods's per-impl loop can emit bodies safely; any
+# then ir_emit_impl_methods's per-impl loop can emit bodies safely; any
 # cross-impl dispatch lookup will already find the right specialized symbol.
 fn ir_preregister_all_impl_specializations(root_idx: Int, root: Node):
     for item_idx in ir_root_items(root_idx):

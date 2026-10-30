@@ -86,10 +86,11 @@ fn parse_alt(c: Compiler):
         jmp_slots.push(c_emit(c, OP_JMP, 0 - 1, 0))
         branch_starts.push(c.insts.len())
         parse_concat(c)
-    # stitch: before each branch except the last, a split must have
-    # offered "this branch or the rest". we rebuild by inserting split
-    # instructions was avoided — instead we emitted linearly, so now
-    # thread the splits through the jmp placeholders.
+    # the branches were emitted one after another with no splits between
+    # them. insert them now: before each branch except the last, a split
+    # offers "this branch or the next one". every insertion shifts the
+    # instructions after it, which find_jmp_placeholder allows for when
+    # the jmp placeholders are patched to the end below.
     mut i := 0
     while i + 1 < branch_starts.len():
         insert_split(c, branch_starts[i], branch_starts[i + 1])

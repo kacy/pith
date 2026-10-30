@@ -4,10 +4,35 @@ live notes on where pith's time goes and what the sprint is doing about it.
 the april 2026 audit of the old c-transpiler era lives in
 `docs/history/performance_audit_2026_04.md`.
 
-numbers below are medians (5-7 trials) on one machine, july 2026. rerun with
-the helpers in `bench/` before trusting them on different hardware.
+every section below is dated, and its numbers hold for that date and
+machine. rerun with the helpers in `bench/` before trusting them on
+different hardware.
 
 ## where pith stands
+
+the current numbers are the 2026-10-30 suite run in
+[bench/README.md](../bench/README.md): every benchmark against go 1.27 and
+rust 1.99 ports on a ryzen 9 9950x, pinned to one ccd, with every runner on
+one build (main after #1260). a few rows from it, as median wall time:
+
+| workload | pith | go | rust |
+|---|---:|---:|---:|
+| json decode, 20M small objects | 817 ms | 3549 ms | 1105 ms |
+| event ledger, 200k events | 70 ms | 96 ms | 51 ms |
+| channel fan-out, 1M messages | 38 ms | 49 ms | 445 ms |
+| closure error handling, 2M calls | 353 ms | 183 ms | 160 ms |
+| green fan-out, 2M tasks from main | 621 ms | 242 ms | 389 ms |
+| sha512, 256 MB | 433 ms | 191 ms | 209 ms |
+| http server at 256 connections | 1.96M req/s, p99 191 µs | 1.01M (net/http), 2.24M (minimal) | 1.76M (hyper), p99 288 µs |
+
+pith is ahead of go on json decoding, substring search, the event ledger
+and catalog workloads, channels, spawning inside tasks and http latency. it
+is behind go on closures, reference cycles, spawning from main, sha512 and
+concurrent grpc calls, and behind rust on most single-threaded compute. the list of the
+largest gaps, with their causes, is under "where pith stands" in
+bench/README.md.
+
+### the 2-core machine (july to september 2026)
 
 the short version, all on the same 2-core machine, rerun 2026-08-08,
 reconfirmed 2026-08-11, rerun 2026-08-22, reconfirmed 2026-08-23 after the

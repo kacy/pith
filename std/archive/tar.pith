@@ -72,15 +72,19 @@ fn tar_push_octal_field(out: List[Int], value: Int, width: Int) -> Bool!:
     digits := tar_octal_digits(value)!
     if digits.len() + 1 > width:
         fail "tar octal field too small"
-    tar_push_zeroes(out, width - digits.len() - 1)
+    # posix wants the digits zero-filled to the field width, then a nul
     mut i := 0
+    while i < width - digits.len() - 1:
+        out.push(48)
+        i = i + 1
+    i = 0
     while i < digits.len():
         out.push(ord(digits[i]))
         i = i + 1
     out.push(0)
     return true
 
-# the checksum field is six octal digits, nul-padded on the left, then a
+# the checksum field is six octal digits, zero-filled on the left, then a
 # nul and a space. it overwrites the eight spaces the sum was taken over.
 fn tar_set_checksum_field(header: List[Int], value: Int) -> Bool!:
     digits := tar_octal_digits(value)!
@@ -89,7 +93,7 @@ fn tar_set_checksum_field(header: List[Int], value: Int) -> Bool!:
     mut at := TAR_CHECKSUM_OFFSET
     mut i := 0
     while i < 6 - digits.len():
-        header[at] = 0
+        header[at] = 48
         at = at + 1
         i = i + 1
     i = 0
@@ -171,7 +175,8 @@ fn tar_validate_header(data: Bytes, offset: Int) -> Bool!:
     if expected != actual:
         fail "tar checksum mismatch"
     magic := tar_read_string_field(data, offset + 257, 6)!
-    if magic != "ustar":
+    # posix writes "ustar" and a nul; gnu tar writes "ustar" and a space
+    if magic != "ustar" and magic != "ustar ":
         fail "unsupported tar format"
     return true
 
@@ -198,7 +203,11 @@ fn tar_archive_name(root_path: String, entry_path: String, is_dir: Bool) -> Stri
     return name
 
 fn tar_build_header(name: String, size: Int, is_dir: Bool) -> Bytes!:
-    clean_name := tar_safe_name(name)!
+    # cleaning drops a directory's trailing slash, which readers use to
+    # tell directories apart from files, so it goes back on
+    mut clean_name := tar_safe_name(name)!
+    if is_dir:
+        clean_name = clean_name + "/"
     if clean_name.len() > 100:
         fail "tar path too long"
     mut header: List[Int] := []
@@ -377,3 +386,40 @@ test "tar creates extracts and rejects unsafe paths":
     assert_eq(fs.read(path.join(path.join(out_dir2, "bundle"), "hello.txt"))!, "hello tar")
     assert(extract(tar_test_unsafe_archive()!, path.join(root, "unsafe")).is_err)
     assert(fs.remove_tree(root))
+
+fn tar_test_field(header: Bytes, offset: Int, width: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < width:
+        out = out + chr(header[offset + i])
+        i = i + 1
+    return out
+
+test "tar headers follow the posix layout":
+    header := tar_build_header("bundle", 0, true)!
+    assert_eq(tar_test_field(header, 0, 8), "bundle/" + chr(0))
+    assert_eq(tar_test_field(header, 100, 8), "0000755" + chr(0))
+    assert_eq(tar_test_field(header, 124, 12), "00000000000" + chr(0))
+    checksum := tar_test_field(header, TAR_CHECKSUM_OFFSET, 8)
+    for i in 0..6:
+        assert(checksum[i] >= "0" and checksum[i] <= "7")
+    assert_eq(checksum.substring(6, 8), chr(0) + " ")
+
+test "tar reads the gnu magic":
+    mut header: List[Int] := []
+    built := tar_build_header("notes.txt", 0, false)!
+    for i in 0..built.len():
+        header.push(built[i])
+    # gnu tar writes "ustar  " and a nul over the magic and version fields
+    magic := "ustar  " + chr(0)
+    for i in 0..8:
+        header[257 + i] = ord(magic[i])
+    for i in 0..8:
+        header[TAR_CHECKSUM_OFFSET + i] = 32
+    tar_set_checksum_field(header, tar_header_checksum(header))!
+    mut archive := header
+    for i in 0..BLOCK_SIZE * 2:
+        archive.push(0)
+    entries := list(tar_bytes_from_list(archive)!)!
+    assert_eq(entries.len(), 1)
+    assert_eq(entries[0].name, "notes.txt")

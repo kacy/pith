@@ -123,23 +123,20 @@ pub fn nested_ints(values: List[List[Int]]) -> String:
 # render a flat integer grid, row-major.
 pub fn int_grid(values: List[Int], rows: Int, cols: Int) -> String:
     mut row_parts: List[String] := []
-    mut r := 0
-    while r < rows:
+    mut row := 0
+    while row < rows:
         mut col_parts: List[String] := []
-        mut c := 0
-        while c < cols:
-            col_parts.push(values[r * cols + c].to_string())
-            c = c + 1
+        mut col := 0
+        while col < cols:
+            col_parts.push(values[row * cols + col].to_string())
+            col = col + 1
         row_parts.push(col_parts.join(" "))
-        r = r + 1
+        row = row + 1
     return row_parts.join("; ")
 
 # ===============================================================
 # String Formatting
 # ===============================================================
-
-fn append_format_segment(parts: List[String], value: String):
-    parts.push(value)
 
 fn left_brace() -> String:
     return chr(123)
@@ -175,17 +172,17 @@ fn format_values(pattern: String, values: List[String]) -> String:
     mut i := 0
     while i < pattern.len():
         if is_left_escape_at(pattern, i):
-            append_format_segment(parts, left_brace())
+            parts.push(left_brace())
             i = i + 2
         elif is_right_escape_at(pattern, i):
-            append_format_segment(parts, right_brace())
+            parts.push(right_brace())
             i = i + 2
         elif is_placeholder_at(pattern, i):
             if value_index < values.len():
-                append_format_segment(parts, values[value_index])
+                parts.push(values[value_index])
                 value_index = value_index + 1
             else:
-                append_format_segment(parts, left_brace() + right_brace())
+                parts.push(left_brace() + right_brace())
             i = i + 2
         else:
             # copy the whole run up to the next brace in one piece. the cut
@@ -197,10 +194,10 @@ fn format_values(pattern: String, values: List[String]) -> String:
             if run_end == i:
                 # a brace that paired with nothing: keep it as written, and
                 # step past it so the scan always makes progress
-                append_format_segment(parts, chr(pattern_byte(pattern, i)))
+                parts.push(chr(pattern_byte(pattern, i)))
                 i = i + 1
             else:
-                append_format_segment(parts, pattern.substring(i, run_end))
+                parts.push(pattern.substring(i, run_end))
                 i = run_end
     return parts.join("")
 

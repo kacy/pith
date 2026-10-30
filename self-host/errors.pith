@@ -47,6 +47,32 @@ pub fn render_diagnostics(diags: List[Diagnostic], source: String) -> String:
         rendered.push(render_single_diagnostic(d, source_lines))
     return rendered.join("")
 
+# render diagnostics that may span several modules. each run of
+# diagnostics from one file is rendered against that file's source, so a
+# snippet always quotes the file named in its header. a diagnostic with
+# no file belongs to the primary path.
+pub fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String, primary_source: String) -> String!:
+    mut output := ""
+    mut current_file := ""
+    mut group: List[Diagnostic] := []
+    for d in diags:
+        mut diag_file := d.file
+        if diag_file == "":
+            diag_file = primary_path
+        if group.len() > 0 and diag_file != current_file:
+            output = output + render_diagnostics(group, source_for_path(current_file, primary_path, primary_source)!)
+            group = []
+        current_file = diag_file
+        group.push(d)
+    if group.len() > 0:
+        output = output + render_diagnostics(group, source_for_path(current_file, primary_path, primary_source)!)
+    return output
+
+fn source_for_path(path: String, primary_path: String, primary_source: String) -> String!:
+    if path == primary_path:
+        return primary_source
+    return read_file(path)!
+
 # render a single diagnostic with source context and underline.
 fn render_single_diagnostic(d: Diagnostic, source_lines: List[String]) -> String:
     mut output := ""

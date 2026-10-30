@@ -10,7 +10,8 @@
 
 use crate::{loop_hoist, CodeGen, CompileError};
 use cranelift::prelude::*;
-use cranelift_module::{FuncId, Linkage, Module};
+use cranelift::codegen::ir::{FuncRef, Function};
+use cranelift_module::{DataId, FuncId, Linkage, Module};
 use pith_runtime::bytes::{
     BYTES_DATA_LEN_OFFSET, BYTES_DATA_PTR_OFFSET, BYTES_HANDLE_ALIGN, BYTES_MAGIC,
     BYTES_MAGIC_OFFSET,
@@ -297,8 +298,8 @@ fn inline_list_set_value(
     list: Value,
     index: Value,
     value: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
-    anchor: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
+    anchor: FuncRef,
 ) {
     let (live, base) = list_header(builder, list, anchor);
     let tag = builder
@@ -341,7 +342,7 @@ fn inline_list_set_value(
 fn list_header(
     builder: &mut FunctionBuilder<'_>,
     list: Value,
-    anchor: cranelift::codegen::ir::FuncRef,
+    anchor: FuncRef,
 ) -> (Value, Value) {
     let addressable = handle_is_addressable(builder, list, LIST_HANDLE_ALIGN);
     let anchor_code = builder.ins().func_addr(types::I64, anchor);
@@ -455,7 +456,7 @@ fn detect_bits_wrapper(param_names: &[String], body_lines: &[&str]) -> Option<&'
 fn string_lit_addr(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
-    lit: cranelift_module::DataId,
+    lit: DataId,
 ) -> Value {
     let gv = codegen.module.declare_data_in_func(lit, builder.func);
     let base = builder.ins().global_value(types::I64, gv);
@@ -469,7 +470,7 @@ fn is_noop_count_call(
     fname: &str,
     arg: Value,
     literal_values: &HashSet<Value>,
-    func: &cranelift::codegen::ir::Function,
+    func: &Function,
 ) -> bool {
     let string_count = matches!(fname, "pith_cstring_retain" | "pith_cstring_release");
     let handle_release = matches!(
@@ -754,7 +755,7 @@ fn finish_strict_fast_path(
     builder: &mut FunctionBuilder<'_>,
     slow: Block,
     done: Block,
-    fallback: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
 ) -> Value {
     builder.switch_to_block(slow);
     let params = builder.block_params(slow);
@@ -781,7 +782,7 @@ fn inline_bytes_get_strict(
     builder: &mut FunctionBuilder<'_>,
     bytes: Value,
     index: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
 ) -> Value {
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
@@ -842,8 +843,8 @@ fn inline_list_get_value_strict(
     builder: &mut FunctionBuilder<'_>,
     list: Value,
     index: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
-    anchor: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
+    anchor: FuncRef,
 ) -> Value {
     let (live, base) = list_header(builder, list, anchor);
     let (in_bounds, data_ptr) = list_index_in_bounds(builder, live, base, index);
@@ -876,7 +877,7 @@ fn inline_list_get_value_strict(
 fn inline_list_len(
     builder: &mut FunctionBuilder<'_>,
     list: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
 ) -> Value {
     let (live, base) = list_header(builder, list, fallback);
     let elem_size = builder.ins().load(
@@ -924,7 +925,7 @@ fn inline_handle_len(
     magic_offset: i32,
     magic: u32,
     len_offset: i32,
-    fallback: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
 ) -> Value {
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
@@ -961,7 +962,7 @@ fn inline_closure_get_env(
     builder: &mut FunctionBuilder<'_>,
     closure: Value,
     slot: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
 ) -> Value {
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
@@ -1006,16 +1007,14 @@ fn inline_closure_get_env(
 fn closure_fn_ptr(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
-    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
     runtime_funcs: &HashMap<String, FuncId>,
     closure: Value,
 ) -> Value {
     let Some(&fid) = runtime_funcs.get("pith_closure_get_fn") else {
         return closure;
     };
-    let fallback = *func_ref_cache
-        .entry(fid)
-        .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func));
+    let fallback = cached_func_ref(codegen, builder, func_ref_cache, fid);
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
     let slow = builder.create_block();
@@ -1048,6 +1047,31 @@ fn closure_fn_ptr(
     builder.block_params(done)[0]
 }
 
+/// Call the closure `closure` with `args`: its function takes the closure
+/// itself first, for its captures, then the arguments, all as i64, and
+/// returns one i64.
+fn emit_closure_call(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    closure: Value,
+    args: &[Value],
+) -> Value {
+    let fn_ptr = closure_fn_ptr(codegen, builder, func_ref_cache, runtime_funcs, closure);
+    let mut sig = codegen.module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    for _ in args {
+        sig.params.push(AbiParam::new(types::I64));
+    }
+    sig.returns.push(AbiParam::new(types::I64));
+    let sig_ref = builder.import_signature(sig);
+    let mut indirect_args = vec![closure];
+    indirect_args.extend_from_slice(args);
+    let call = builder.ins().call_indirect(sig_ref, fn_ptr, &indirect_args);
+    builder.func.dfg.first_result(call)
+}
+
 /// Inline the store of one capture (`pith_closure_set_env`) the way
 /// `inline_closure_get_env` inlines the read: the handle test, then one store
 /// into the inline env. A closure is built with one of these per capture, so
@@ -1058,7 +1082,7 @@ fn inline_closure_set_env(
     closure: Value,
     slot: Value,
     value: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
 ) {
     let done = builder.create_block();
     let slow = builder.create_block();
@@ -1112,7 +1136,7 @@ fn inline_bytes_read_word(
     bytes: Value,
     off: Value,
     count: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
 ) -> Value {
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
@@ -1198,7 +1222,7 @@ const CSTRING_MAGIC_OFFSET: i32 = -16;
 fn cstring_header(
     builder: &mut FunctionBuilder<'_>,
     s: Value,
-    anchor: cranelift::codegen::ir::FuncRef,
+    anchor: FuncRef,
 ) -> (Value, Value) {
     let big_enough = builder
         .ins()
@@ -1232,8 +1256,8 @@ fn inline_cstring_byte_at(
     builder: &mut FunctionBuilder<'_>,
     s: Value,
     index: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
-    anchor: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
+    anchor: FuncRef,
 ) -> Value {
     let (has_header, len) = cstring_header(builder, s, anchor);
     // a string without a header reads as empty here, so it always takes the
@@ -1269,7 +1293,7 @@ fn inline_cstring_byte_at(
 fn inline_cstring_len(
     builder: &mut FunctionBuilder<'_>,
     s: Value,
-    fallback: cranelift::codegen::ir::FuncRef,
+    fallback: FuncRef,
 ) -> Value {
     let (has_header, len) = cstring_header(builder, s, fallback);
     let done = builder.create_block();
@@ -1290,19 +1314,134 @@ fn inline_cstring_len(
     builder.block_params(done)[0]
 }
 
+/// The reference the function being built calls `fid` through, declared in
+/// it on first use. A `FuncRef` belongs to one function, so the cache lives
+/// as long as one body does.
+fn cached_func_ref(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
+    fid: FuncId,
+) -> FuncRef {
+    *func_ref_cache
+        .entry(fid)
+        .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func))
+}
+
+/// `cached_func_ref` for a runtime function named by its import key, which
+/// must exist.
 fn runtime_func_ref(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
-    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
     runtime_funcs: &HashMap<String, FuncId>,
     name: &str,
-) -> Result<cranelift::codegen::ir::FuncRef, CompileError> {
+) -> Result<FuncRef, CompileError> {
     let fid = runtime_funcs.get(name).copied().ok_or_else(|| {
         CompileError::ModuleError(format!("IR consumer: missing runtime function '{name}'"))
     })?;
-    Ok(*func_ref_cache
-        .entry(fid)
-        .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func)))
+    Ok(cached_func_ref(codegen, builder, func_ref_cache, fid))
+}
+
+/// Lower a call to a runtime builtin that has an inline fast path, or
+/// answer `None` and leave the call to the generic path. A builtin that
+/// returns nothing answers a zero for its destination register, as the
+/// generic path does. Most fast paths step aside when a user function or a
+/// local shares the builtin's name (`name_is_shadowed`): the user's
+/// definition always wins, and `fn byte_at(r: Reader, i: Int)` once read a
+/// byte out of its struct's own memory because it did not.
+fn inline_runtime_call(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    fname: &str,
+    args: &[Value],
+    name_is_shadowed: bool,
+) -> Result<Option<Value>, CompileError> {
+    let mut runtime_ref = |builder: &mut FunctionBuilder<'_>, name: &str| {
+        runtime_func_ref(codegen, builder, func_ref_cache, runtime_funcs, name)
+    };
+    let value = match (fname, args.len()) {
+        ("pith_list_set_value" | "pith_list_set_value_owned" | "pith_list_set_scalar", 3) => {
+            let fallback = runtime_ref(builder, fname)?;
+            let anchor = runtime_ref(builder, "pith_list_len")?;
+            inline_list_set_value(builder, args[0], args[1], args[2], fallback, anchor);
+            builder.ins().iconst(types::I64, 0)
+        }
+        // a field store's write barrier: only a holder that is already
+        // shared makes the call, so test its mark here. the holder is a
+        // struct the emitter is storing into, never null.
+        ("pith_share_into", 3) if !name_is_shadowed => {
+            let fallback = runtime_ref(builder, "pith_share_into")?;
+            let word = builder.ins().load(types::I32, MemFlags::new(), args[0], STRUCT_FLAGS_FROM_DATA);
+            let shared = builder.ins().band_imm(word, STRUCT_SHARED_MASK as i64);
+            let call_block = builder.create_block();
+            let done = builder.create_block();
+            builder.set_cold_block(call_block);
+            builder.ins().brif(shared, call_block, &[], done, &[]);
+            builder.switch_to_block(call_block);
+            builder.ins().call(fallback, &[args[0], args[1], args[2]]);
+            builder.ins().jump(done, &[]);
+            builder.switch_to_block(done);
+            builder.ins().iconst(types::I64, 0)
+        }
+        ("pith_closure_get_env", 2) if !name_is_shadowed => {
+            let fallback = runtime_ref(builder, "pith_closure_get_env")?;
+            inline_closure_get_env(builder, args[0], args[1], fallback)
+        }
+        ("pith_closure_set_env", 3) if !name_is_shadowed => {
+            let fallback = runtime_ref(builder, "pith_closure_set_env")?;
+            inline_closure_set_env(builder, args[0], args[1], args[2], fallback);
+            builder.ins().iconst(types::I64, 0)
+        }
+        ("bytes_get", 2) if !name_is_shadowed => inline_bytes_get(builder, args[0], args[1]),
+        // `bytes[i]`: the same fast path, with the runtime's strict getter as
+        // the fallback so a failing read still aborts with its diagnostic.
+        ("bytes_get_strict", 2) if !name_is_shadowed => {
+            let fallback = runtime_ref(builder, "bytes_get_strict")?;
+            inline_bytes_get_strict(builder, args[0], args[1], fallback)
+        }
+        ("bytes_read_word", 3) if !name_is_shadowed => {
+            let fallback = runtime_ref(builder, "bytes_read_word")?;
+            inline_bytes_read_word(builder, args[0], args[1], args[2], fallback)
+        }
+        // string indexing: a header read instead of an FFI call per
+        // character, with the runtime helper as the fallback for literals.
+        // these names are emitted only for strings (bytes use bytes_get).
+        ("byte_at" | "pith_cstring_byte_at", 2) if !name_is_shadowed => {
+            let fallback = runtime_ref(builder, "byte_at")?;
+            // the same anchor `s.len()` uses, so the two share one header
+            // check
+            let anchor = runtime_ref(builder, "string_len")?;
+            inline_cstring_byte_at(builder, args[0], args[1], fallback, anchor)
+        }
+        ("bytes_len", 1) if !name_is_shadowed => {
+            let fallback = runtime_ref(builder, fname)?;
+            inline_handle_len(
+                builder,
+                args[0],
+                BYTES_HANDLE_ALIGN,
+                BYTES_MAGIC_OFFSET,
+                BYTES_MAGIC,
+                BYTES_DATA_LEN_OFFSET,
+                fallback,
+            )
+        }
+        ("pith_list_len", 1) if !name_is_shadowed => {
+            let fallback = runtime_ref(builder, fname)?;
+            inline_list_len(builder, args[0], fallback)
+        }
+        ("string_len", 1) => {
+            let fallback = runtime_ref(builder, "string_len")?;
+            inline_cstring_len(builder, args[0], fallback)
+        }
+        ("pith_list_get_value" | "pith_list_get_value_unchecked", 2) => {
+            inline_list_get_value(builder, args[0], args[1], fname == "pith_list_get_value")
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(value))
 }
 
 /// Whether this build should emit green-preemption safe-points. On by default:
@@ -1339,9 +1478,9 @@ fn green_preempt_enabled() -> bool {
 fn emit_preempt_safepoint(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
-    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
     runtime_funcs: &HashMap<String, FuncId>,
-    preempt_flag: cranelift_module::DataId,
+    preempt_flag: DataId,
 ) -> Result<(), CompileError> {
     // Load the flag byte from the imported global.
     let gv = codegen.module.declare_data_in_func(preempt_flag, builder.func);
@@ -1382,7 +1521,7 @@ fn emit_preempt_safepoint(
 fn emit_runtime_error_value(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
-    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
     runtime_funcs: &HashMap<String, FuncId>,
     code: i64,
 ) -> Result<Value, CompileError> {
@@ -1401,7 +1540,7 @@ fn emit_runtime_error_value(
 fn emit_checked_int_div_or_mod(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
-    func_ref_cache: &mut HashMap<FuncId, cranelift::codegen::ir::FuncRef>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
     runtime_funcs: &HashMap<String, FuncId>,
     op: &str,
     a: Value,
@@ -1463,10 +1602,10 @@ pub fn compile_from_ir(
     let mut declared_funcs: HashMap<String, FuncId> = HashMap::new();
     let mut string_data: Vec<(String, String)> = Vec::new();
     let mut struct_layouts: HashMap<String, Vec<String>> = HashMap::new();
-    let mut global_data: HashMap<String, cranelift_module::DataId> = HashMap::new();
+    let mut global_data: HashMap<String, DataId> = HashMap::new();
     let mut str_globals: Vec<(String, String)> = Vec::new(); // (global_name, string_id)
-    let mut string_global_names: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut string_global_names: HashSet<String> =
+        HashSet::new();
 
     // green preemption safe-points are emitted by default. green is the default
     // backend, and a task that loops waiting on something another task must
@@ -1666,7 +1805,7 @@ pub fn compile_from_ir(
     }
 
     // Declare string literal data
-    let mut string_lits: HashMap<String, cranelift_module::DataId> = HashMap::new();
+    let mut string_lits: HashMap<String, DataId> = HashMap::new();
     for (idx, content) in &string_data {
         if !string_lits.contains_key(idx) {
             let name = format!("__irstr_{}", idx);
@@ -1713,8 +1852,8 @@ pub fn compile_from_ir(
     }
 
     // Pass 2: compile function bodies (first definition wins for duplicates)
-    let mut compiled_funcs: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut built: Vec<(FuncId, String, cranelift::codegen::ir::Function)> = Vec::new();
+    let mut compiled_funcs: HashSet<String> = HashSet::new();
+    let mut built: Vec<(FuncId, String, Function)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         let parts: Vec<&str> = lines[i].split_whitespace().collect();
@@ -1821,13 +1960,13 @@ const LOOP_KEEP_CALLS: &[&str] = &[
 
 fn define_with_inlining(
     codegen: &mut CodeGen,
-    built: Vec<(FuncId, String, cranelift::codegen::ir::Function)>,
+    built: Vec<(FuncId, String, Function)>,
     keep_calls: &[u32],
 ) -> Result<(), CompileError> {
     let enabled = std::env::var("PITH_INLINE").map_or(true, |v| v != "0");
     // the inliner takes callee bodies in their legalized form, so each
     // candidate is legalized once, on a copy, before any caller asks for it
-    let mut bodies: HashMap<FuncId, cranelift::codegen::ir::Function> = HashMap::new();
+    let mut bodies: HashMap<FuncId, Function> = HashMap::new();
     if enabled {
         for (id, name, func) in &built {
             if is_inline_candidate(name, func) {
@@ -1865,7 +2004,7 @@ fn define_with_inlining(
 /// reference indexes the callee's own name table, so in the caller it names
 /// some other symbol. Function references are translated, so calls are fine;
 /// a callee that names data is not inlined.
-fn names_data(func: &cranelift::codegen::ir::Function) -> bool {
+fn names_data(func: &Function) -> bool {
     func.global_values.values().any(|gv| {
         matches!(
             gv,
@@ -1879,7 +2018,7 @@ fn names_data(func: &cranelift::codegen::ir::Function) -> bool {
 
 /// Whether calls to this function may be inlined: small, and not one of the
 /// entry points the runtime calls by name.
-fn is_inline_candidate(name: &str, func: &cranelift::codegen::ir::Function) -> bool {
+fn is_inline_candidate(name: &str, func: &Function) -> bool {
     if name == "main" || name.starts_with("__init_globals") {
         return false;
     }
@@ -1899,16 +2038,16 @@ fn is_inline_candidate(name: &str, func: &cranelift::codegen::ir::Function) -> b
 /// a cycle; a function never inlines itself.
 struct SmallFnInliner<'a> {
     caller: FuncId,
-    bodies: &'a HashMap<FuncId, cranelift::codegen::ir::Function>,
+    bodies: &'a HashMap<FuncId, Function>,
 }
 
 impl cranelift::codegen::inline::Inline for SmallFnInliner<'_> {
     fn inline(
         &mut self,
-        caller: &cranelift::codegen::ir::Function,
+        caller: &Function,
         _call_inst: cranelift::codegen::ir::Inst,
         _call_opcode: cranelift::codegen::ir::Opcode,
-        callee: cranelift::codegen::ir::FuncRef,
+        callee: FuncRef,
         _call_args: &[Value],
     ) -> cranelift::codegen::inline::InlineCommand<'_> {
         use cranelift::codegen::inline::InlineCommand;
@@ -2018,7 +2157,7 @@ fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
         return None;
     }
 
-    let extended: std::collections::HashSet<usize> = prev.values().copied().collect();
+    let extended: HashSet<usize> = prev.values().copied().collect();
     let mut chains: Vec<(Vec<usize>, Vec<&str>)> = Vec::new();
     for &last in prev.keys() {
         if extended.contains(&last) {
@@ -2042,7 +2181,7 @@ fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
     // by one and needed by the other, so neither of those chains is fused.
     let mut chains_of_part: HashMap<&str, usize> = HashMap::new();
     for (_, parts) in &chains {
-        let unique: std::collections::HashSet<&str> = parts.iter().copied().collect();
+        let unique: HashSet<&str> = parts.iter().copied().collect();
         for part in unique {
             *chains_of_part.entry(part).or_insert(0) += 1;
         }
@@ -2066,7 +2205,7 @@ fn fuse_concat_chains(body: &[&str]) -> Option<Vec<String>> {
                 }
             }
         }
-        let part_regs: std::collections::HashSet<usize> =
+        let part_regs: HashSet<usize> =
             parts.iter().filter_map(|t| t.parse().ok()).collect();
         let mut moved = Vec::new();
         for k in first + 1..last {
@@ -2242,14 +2381,14 @@ fn compile_ir_function(
     body_lines: &[&str],
     runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
-    string_lits: &HashMap<String, cranelift_module::DataId>,
+    string_lits: &HashMap<String, DataId>,
     struct_layouts: &HashMap<String, Vec<String>>,
-    global_data: &HashMap<String, cranelift_module::DataId>,
+    global_data: &HashMap<String, DataId>,
     str_globals: &[(String, String)],
-    string_global_names: &std::collections::HashSet<String>,
-    preempt_flag: Option<cranelift_module::DataId>,
+    string_global_names: &HashSet<String>,
+    preempt_flag: Option<DataId>,
     bits_aliases: &HashMap<String, &'static str>,
-) -> Result<cranelift::codegen::ir::Function, CompileError> {
+) -> Result<Function, CompileError> {
     let mut ctx = codegen.module.make_context();
 
     // Build signature
@@ -2261,7 +2400,7 @@ fn compile_ir_function(
     let mut builder_ctx = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(&mut ctx.func, &mut builder_ctx);
     // Cache function references to avoid duplicate declarations
-    let mut func_ref_cache: HashMap<FuncId, cranelift::codegen::ir::FuncRef> = HashMap::new();
+    let mut func_ref_cache: HashMap<FuncId, FuncRef> = HashMap::new();
 
     let entry_block = builder.create_block();
     builder.append_block_params_for_function_params(entry_block);
@@ -2324,7 +2463,7 @@ fn compile_ir_function(
                 let addr = builder.ins().global_value(types::I64, gv);
                 builder
                     .ins()
-                    .store(cranelift::codegen::ir::MemFlags::new(), str_result, addr, 0);
+                    .store(MemFlags::new(), str_result, addr, 0);
             }
         }
     }
@@ -2344,8 +2483,8 @@ fn compile_ir_function(
     // Pre-scan: detect float-typed variables by finding `store VAR REG`
     // where REG was assigned by fconst/fmul/fadd/fsub/fdiv
     {
-        let mut float_source_regs: std::collections::HashSet<usize> =
-            std::collections::HashSet::new();
+        let mut float_source_regs: HashSet<usize> =
+            HashSet::new();
         for line in body_lines {
             let p: Vec<&str> = line.split_whitespace().collect();
             if p.is_empty() {
@@ -2497,7 +2636,7 @@ fn compile_ir_function(
                 let v =
                     builder
                         .ins()
-                        .bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
+                        .bitcast(types::I64, MemFlags::new(), fv);
                 regs.insert(reg, v);
                 kinds.set(reg, "float");
             }
@@ -2573,11 +2712,11 @@ fn compile_ir_function(
                 let fa =
                     builder
                         .ins()
-                        .bitcast(types::F64, cranelift::codegen::ir::MemFlags::new(), a);
+                        .bitcast(types::F64, MemFlags::new(), a);
                 let fb =
                     builder
                         .ins()
-                        .bitcast(types::F64, cranelift::codegen::ir::MemFlags::new(), b);
+                        .bitcast(types::F64, MemFlags::new(), b);
                 let fv = match parts[0] {
                     "fadd" => builder.ins().fadd(fa, fb),
                     "fsub" => builder.ins().fsub(fa, fb),
@@ -2594,7 +2733,7 @@ fn compile_ir_function(
                 let v =
                     builder
                         .ins()
-                        .bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
+                        .bitcast(types::I64, MemFlags::new(), fv);
                 regs.insert(reg, v);
                 kinds.set(reg, "float");
             }
@@ -2611,9 +2750,7 @@ fn compile_ir_function(
                     && kinds.is_string(parts[3])
                 {
                     if let Some(&concat_id) = runtime_funcs.get("pith_concat_cstr") {
-                        let concat_ref = *func_ref_cache.entry(concat_id).or_insert_with(|| {
-                            codegen.module.declare_func_in_func(concat_id, builder.func)
-                        });
+                        let concat_ref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, concat_id);
                         let call = builder.ins().call(concat_ref, &[a, b]);
                         if !builder.func.dfg.inst_results(call).is_empty() {
                             regs.insert(reg, builder.func.dfg.first_result(call));
@@ -2630,12 +2767,12 @@ fn compile_ir_function(
                 {
                     let fa = builder.ins().bitcast(
                         types::F64,
-                        cranelift::codegen::ir::MemFlags::new(),
+                        MemFlags::new(),
                         a,
                     );
                     let fb = builder.ins().bitcast(
                         types::F64,
-                        cranelift::codegen::ir::MemFlags::new(),
+                        MemFlags::new(),
                         b,
                     );
                     let fv = match parts[0] {
@@ -2652,7 +2789,7 @@ fn compile_ir_function(
                     };
                     let v = builder.ins().bitcast(
                         types::I64,
-                        cranelift::codegen::ir::MemFlags::new(),
+                        MemFlags::new(),
                         fv,
                     );
                     regs.insert(reg, v);
@@ -2699,9 +2836,7 @@ fn compile_ir_function(
                         _ => "pith_cstring_lt",
                     };
                     if let Some(&fid) = runtime_funcs.get(cmp_name) {
-                        let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
-                            codegen.module.declare_func_in_func(fid, builder.func)
-                        });
+                        let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
                         let call = builder.ins().call(fref, &[a, b]);
                         regs.insert(reg, builder.func.dfg.first_result(call));
                     } else {
@@ -2712,12 +2847,12 @@ fn compile_ir_function(
                     // Float comparison
                     let fa = builder.ins().bitcast(
                         types::F64,
-                        cranelift::codegen::ir::MemFlags::new(),
+                        MemFlags::new(),
                         a,
                     );
                     let fb = builder.ins().bitcast(
                         types::F64,
-                        cranelift::codegen::ir::MemFlags::new(),
+                        MemFlags::new(),
                         b,
                     );
                     use cranelift::codegen::ir::condcodes::FloatCC;
@@ -2841,9 +2976,7 @@ fn compile_ir_function(
                 let a = get_reg(&regs, parts[2])?;
                 let b = get_reg(&regs, parts[3])?;
                 if let Some(&concat_id) = runtime_funcs.get("pith_concat_cstr") {
-                    let concat_ref = *func_ref_cache.entry(concat_id).or_insert_with(|| {
-                        codegen.module.declare_func_in_func(concat_id, builder.func)
-                    });
+                    let concat_ref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, concat_id);
                     let call = builder.ins().call(concat_ref, &[a, b]);
                     if !builder.func.dfg.inst_results(call).is_empty() {
                         regs.insert(reg, builder.func.dfg.first_result(call));
@@ -2886,9 +3019,7 @@ fn compile_ir_function(
                             fname, func_name
                         ))
                     })?;
-                let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
-                    codegen.module.declare_func_in_func(fid, builder.func)
-                });
+                let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
                 // Bitcast any f64 params to match the callee signature.
                 let sig_ref = builder.func.dfg.ext_funcs[fref].signature;
                 let param_types: Vec<types::Type> = builder.func.dfg.signatures[sig_ref]
@@ -2900,7 +3031,7 @@ fn compile_ir_function(
                     if i < param_types.len() && param_types[i] == types::F64 {
                         *arg = builder.ins().bitcast(
                             types::F64,
-                            cranelift::codegen::ir::MemFlags::new(),
+                            MemFlags::new(),
                             *arg,
                         );
                     }
@@ -2928,7 +3059,7 @@ fn compile_ir_function(
                 } else if payload_kind == "float" {
                     let cast = builder.ins().bitcast(
                         types::I64,
-                        cranelift::codegen::ir::MemFlags::new(),
+                        MemFlags::new(),
                         payload_v,
                     );
                     regs.insert(val_reg, cast);
@@ -2962,9 +3093,7 @@ fn compile_ir_function(
                     }
                     // Allocate struct
                     if let Some(&alloc_id) = runtime_funcs.get("pith_struct_alloc") {
-                        let alloc_ref = *func_ref_cache.entry(alloc_id).or_insert_with(|| {
-                            codegen.module.declare_func_in_func(alloc_id, builder.func)
-                        });
+                        let alloc_ref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, alloc_id);
                         let nfields = builder.ins().iconst(types::I64, nargs as i64);
                         let alloc_call = builder.ins().call(alloc_ref, &[nfields]);
                         let ptr = builder.func.dfg.first_result(alloc_call);
@@ -2972,7 +3101,7 @@ fn compile_ir_function(
                         for (i, arg) in args.iter().enumerate() {
                             let offset = (i * 8) as i32;
                             builder.ins().store(
-                                cranelift::codegen::ir::MemFlags::new(),
+                                MemFlags::new(),
                                 *arg,
                                 ptr,
                                 offset,
@@ -3015,9 +3144,7 @@ fn compile_ir_function(
                             for j in 0..nargs {
                                 args.push(get_reg(&regs, parts[arg_start + j])?);
                             }
-                            let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
-                                codegen.module.declare_func_in_func(fid, builder.func)
-                            });
+                            let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
                             let call = builder.ins().call(fref, &args);
                             let &[flag, value] = builder.func.dfg.inst_results(call) else {
                                 return Err(CompileError::ModuleError(format!(
@@ -3060,17 +3187,10 @@ fn compile_ir_function(
                             args.push(get_reg(&regs, parts[j + arg_start])?);
                         }
                     }
-                    // the inline fast paths below stand in for a builtin, and
-                    // each one `continue`s before the name is resolved. so a
-                    // user-defined function -- or a local holding a closure --
-                    // that happens to share a builtin's short name would be
-                    // bypassed entirely and its arguments handed to the builtin
-                    // instead. that is silent: `fn byte_at(r: Reader, i: Int)`
-                    // was reading a byte out of the struct's own memory.
-                    //
-                    // the bit-operation path below already guarded against this;
-                    // the rest did not. the user's definition always wins, and
-                    // the fast path only applies to the builtin it replaces.
+                    // a fast path below stands in for a builtin and skips
+                    // name resolution, so it must not capture a call to a
+                    // user function or a closure local of the same name (see
+                    // inline_runtime_call).
                     let name_is_shadowed =
                         declared_funcs.contains_key(fname) || named_vars.contains_key(fname);
 
@@ -3106,210 +3226,23 @@ fn compile_ir_function(
                             continue;
                         }
                     }
-                    if (fname == "pith_list_set_value"
-                        || fname == "pith_list_set_value_owned"
-                        || fname == "pith_list_set_scalar")
-                        && args.len() == 3
-                    {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            fname,
-                        )?;
-                        let anchor = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "pith_list_len",
-                        )?;
-                        inline_list_set_value(
-                            &mut builder,
-                            args[0],
-                            args[1],
-                            args[2],
-                            fallback,
-                            anchor,
-                        );
-                        let zero = builder.ins().iconst(types::I64, 0);
-                        regs.insert(reg, zero);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    // a field store's write barrier: only a holder that is
-                    // already shared makes the call, so test its mark here.
-                    // the holder is a struct the emitter is storing into,
-                    // never null.
-                    if fname == "pith_share_into" && args.len() == 3 && !name_is_shadowed {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "pith_share_into",
-                        )?;
-                        let word = builder.ins().load(types::I32, MemFlags::new(), args[0], STRUCT_FLAGS_FROM_DATA);
-                        let shared = builder.ins().band_imm(word, STRUCT_SHARED_MASK as i64);
-                        let call_block = builder.create_block();
-                        let done = builder.create_block();
-                        builder.set_cold_block(call_block);
-                        builder.ins().brif(shared, call_block, &[], done, &[]);
-                        builder.switch_to_block(call_block);
-                        builder.ins().call(fallback, &[args[0], args[1], args[2]]);
-                        builder.ins().jump(done, &[]);
-                        builder.switch_to_block(done);
-                        let zero = builder.ins().iconst(types::I64, 0);
-                        regs.insert(reg, zero);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    if fname == "pith_closure_get_env" && args.len() == 2 && !name_is_shadowed {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "pith_closure_get_env",
-                        )?;
-                        let inlined =
-                            inline_closure_get_env(&mut builder, args[0], args[1], fallback);
-                        regs.insert(reg, inlined);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    if fname == "pith_closure_set_env" && args.len() == 3 && !name_is_shadowed {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "pith_closure_set_env",
-                        )?;
-                        inline_closure_set_env(&mut builder, args[0], args[1], args[2], fallback);
-                        let zero = builder.ins().iconst(types::I64, 0);
-                        regs.insert(reg, zero);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    if fname == "bytes_get" && args.len() == 2 && !name_is_shadowed {
-                        let inlined = inline_bytes_get(&mut builder, args[0], args[1]);
-                        regs.insert(reg, inlined);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    // `bytes[i]`: the same fast path, with the runtime's
-                    // strict getter as the fallback so a failing read still
-                    // aborts with its diagnostic.
-                    if fname == "bytes_get_strict" && args.len() == 2 && !name_is_shadowed {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "bytes_get_strict",
-                        )?;
-                        let inlined =
-                            inline_bytes_get_strict(&mut builder, args[0], args[1], fallback);
-                        regs.insert(reg, inlined);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    if fname == "bytes_read_word" && args.len() == 3 && !name_is_shadowed {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "bytes_read_word",
-                        )?;
-                        let inlined = inline_bytes_read_word(
-                            &mut builder,
-                            args[0],
-                            args[1],
-                            args[2],
-                            fallback,
-                        );
-                        regs.insert(reg, inlined);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    // string indexing and length: inline the heap-cstring fast
-                    // path (header read instead of an FFI call per character),
-                    // falling back to the runtime helper for literals. these
-                    // names are emitted only for strings (bytes use bytes_get).
-                    if (fname == "byte_at" || fname == "pith_cstring_byte_at")
-                        && args.len() == 2
-                        && !name_is_shadowed
-                    {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "byte_at",
-                        )?;
-                        // the same anchor `s.len()` uses, so the two share
-                        // one header check
-                        let anchor = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "string_len",
-                        )?;
-                        let inlined =
-                            inline_cstring_byte_at(&mut builder, args[0], args[1], fallback, anchor);
-                        regs.insert(reg, inlined);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    if (fname == "bytes_len" || fname == "pith_list_len")
-                        && args.len() == 1
-                        && !name_is_shadowed
-                    {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            fname,
-                        )?;
-                        let inlined = if fname == "bytes_len" {
-                            inline_handle_len(
-                                &mut builder,
-                                args[0],
-                                BYTES_HANDLE_ALIGN,
-                                BYTES_MAGIC_OFFSET,
-                                BYTES_MAGIC,
-                                BYTES_DATA_LEN_OFFSET,
-                                fallback,
-                            )
-                        } else {
-                            inline_list_len(&mut builder, args[0], fallback)
-                        };
-                        regs.insert(reg, inlined);
-                        kinds.clear(reg);
-                        continue;
-                    }
-                    if fname == "string_len" && args.len() == 1 {
-                        let fallback = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "string_len",
-                        )?;
-                        let inlined = inline_cstring_len(&mut builder, args[0], fallback);
-                        regs.insert(reg, inlined);
+                    if let Some(value) = inline_runtime_call(
+                        codegen,
+                        &mut builder,
+                        &mut func_ref_cache,
+                        runtime_funcs,
+                        fname,
+                        &args,
+                        name_is_shadowed,
+                    )? {
+                        regs.insert(reg, value);
                         kinds.clear(reg);
                         continue;
                     }
                     // `xs[i]`: inline the in-bounds read and leave every
-                    // failure to the runtime's strict getter. the register
-                    // bookkeeping below is the generic call path's, keyed on
-                    // the retkind, since the element can be of any kind.
+                    // failure to the runtime's strict getter. unlike the fast
+                    // paths above, the result takes the call's retkind, since
+                    // the element can be of any kind.
                     if fname == "pith_list_get_value_strict"
                         && args.len() == 2
                         && !name_is_shadowed
@@ -3341,19 +3274,6 @@ fn compile_ir_function(
                         kinds.set(reg, retkind);
                         continue;
                     }
-                    if (fname == "pith_list_get_value" || fname == "pith_list_get_value_unchecked")
-                        && args.len() == 2
-                    {
-                        let inlined = inline_list_get_value(
-                            &mut builder,
-                            args[0],
-                            args[1],
-                            fname == "pith_list_get_value",
-                        );
-                        regs.insert(reg, inlined);
-                        kinds.clear(reg);
-                        continue;
-                    }
                     // Look up function: user-defined first, then a direct runtime
                     // import key. A local variable shadows both — the checker
                     // guarantees a called local is closure-typed, and a bare
@@ -3372,9 +3292,7 @@ fn compile_ir_function(
                     };
 
                     if let Some(fid) = fid {
-                        let fref = *func_ref_cache.entry(fid).or_insert_with(|| {
-                            codegen.module.declare_func_in_func(fid, builder.func)
-                        });
+                        let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
                         // Check function signature for f64 params and bitcast as needed
                         let sig_ref = builder.func.dfg.ext_funcs[fref].signature;
                         let sig = &builder.func.dfg.signatures[sig_ref];
@@ -3396,7 +3314,7 @@ fn compile_ir_function(
                                 // Bitcast i64 → f64 for float params
                                 *arg = builder.ins().bitcast(
                                     types::F64,
-                                    cranelift::codegen::ir::MemFlags::new(),
+                                    MemFlags::new(),
                                     *arg,
                                 );
                             }
@@ -3432,7 +3350,7 @@ fn compile_ir_function(
                                 // Bitcast f64 → i64 for uniform handling
                                 let cast = builder.ins().bitcast(
                                     types::I64,
-                                    cranelift::codegen::ir::MemFlags::new(),
+                                    MemFlags::new(),
                                     result,
                                 );
                                 regs.insert(reg, cast);
@@ -3468,26 +3386,17 @@ fn compile_ir_function(
                             kinds.floats.insert(reg);
                         }
                     } else if let Some(&var) = named_vars.get(fname) {
-                        // Indirect call through closure handle variable
+                        // a local holding a closure value
                         let closure_handle = builder.use_var(var);
-                        let fn_ptr = closure_fn_ptr(
+                        let result = emit_closure_call(
                             codegen,
                             &mut builder,
                             &mut func_ref_cache,
                             runtime_funcs,
                             closure_handle,
+                            &args,
                         );
-                        let mut sig = codegen.module.make_signature();
-                        sig.params.push(AbiParam::new(types::I64));
-                        for _ in &args {
-                            sig.params.push(AbiParam::new(types::I64));
-                        }
-                        sig.returns.push(AbiParam::new(types::I64));
-                        let sig_ref = builder.import_signature(sig);
-                        let mut indirect_args = vec![closure_handle];
-                        indirect_args.extend(args.iter().copied());
-                        let call = builder.ins().call_indirect(sig_ref, fn_ptr, &indirect_args);
-                        regs.insert(reg, builder.func.dfg.first_result(call));
+                        regs.insert(reg, result);
                         kinds.clear(reg);
                     } else if let Some(&data_id) = global_data.get(fname) {
                         // a module-level global holding a closure value,
@@ -3500,28 +3409,19 @@ fn compile_ir_function(
                         let addr = builder.ins().global_value(types::I64, gv);
                         let closure_handle = builder.ins().load(
                             types::I64,
-                            cranelift::codegen::ir::MemFlags::new(),
+                            MemFlags::new(),
                             addr,
                             0,
                         );
-                        let fn_ptr = closure_fn_ptr(
+                        let result = emit_closure_call(
                             codegen,
                             &mut builder,
                             &mut func_ref_cache,
                             runtime_funcs,
                             closure_handle,
+                            &args,
                         );
-                        let mut sig = codegen.module.make_signature();
-                        sig.params.push(AbiParam::new(types::I64));
-                        for _ in &args {
-                            sig.params.push(AbiParam::new(types::I64));
-                        }
-                        sig.returns.push(AbiParam::new(types::I64));
-                        let sig_ref = builder.import_signature(sig);
-                        let mut indirect_args = vec![closure_handle];
-                        indirect_args.extend(args.iter().copied());
-                        let call = builder.ins().call_indirect(sig_ref, fn_ptr, &indirect_args);
-                        regs.insert(reg, builder.func.dfg.first_result(call));
+                        regs.insert(reg, result);
                         kinds.clear(reg);
                     } else if runtime_funcs.contains_key("pith_runtime_error") {
                         // a call that resolves to nothing is a compiler bug
@@ -3572,7 +3472,7 @@ fn compile_ir_function(
                     let addr = builder.ins().global_value(types::I64, gv);
                     builder
                         .ins()
-                        .store(cranelift::codegen::ir::MemFlags::new(), val, addr, 0);
+                        .store(MemFlags::new(), val, addr, 0);
                 } else {
                     let var = if let Some(&v) = named_vars.get(&name) {
                         v
@@ -3597,7 +3497,7 @@ fn compile_ir_function(
                     let addr = builder.ins().global_value(types::I64, gv);
                     let val = builder.ins().load(
                         types::I64,
-                        cranelift::codegen::ir::MemFlags::new(),
+                        MemFlags::new(),
                         addr,
                         0,
                     );
@@ -3713,7 +3613,7 @@ fn compile_ir_function(
                 };
                 let raw = builder.ins().load(
                     types::I64,
-                    cranelift::codegen::ir::MemFlags::new(),
+                    MemFlags::new(),
                     obj,
                     offset,
                 );
@@ -3727,9 +3627,7 @@ fn compile_ir_function(
                 let reg = parse_reg(parts[1], line, func_name)?;
                 let fname = parts[2];
                 if let Some(&fid) = declared_funcs.get(fname) {
-                    let fref = *func_ref_cache
-                        .entry(fid)
-                        .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func));
+                    let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
                     let addr = builder.ins().func_addr(types::I64, fref);
                     regs.insert(reg, addr);
                 } else {
@@ -3745,17 +3643,11 @@ fn compile_ir_function(
                 let reg = parse_reg(parts[1], line, func_name)?;
                 let fname = parts[2];
                 if let Some(&fid) = declared_funcs.get(fname) {
-                    let fref = *func_ref_cache
-                        .entry(fid)
-                        .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func));
+                    let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
                     let addr = builder.ins().func_addr(types::I64, fref);
                     if let Some(&closure_new_id) = runtime_funcs.get("pith_closure_new") {
                         let closure_new_ref =
-                            *func_ref_cache.entry(closure_new_id).or_insert_with(|| {
-                                codegen
-                                    .module
-                                    .declare_func_in_func(closure_new_id, builder.func)
-                            });
+                            cached_func_ref(codegen, &mut builder, &mut func_ref_cache, closure_new_id);
                         let call = builder.ins().call(closure_new_ref, &[addr]);
                         regs.insert(reg, builder.func.dfg.first_result(call));
                     } else {
@@ -3784,9 +3676,7 @@ fn compile_ir_function(
                         fname, func_name
                     )));
                 };
-                let fref = *func_ref_cache
-                    .entry(fid)
-                    .or_insert_with(|| codegen.module.declare_func_in_func(fid, builder.func));
+                let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
                 let addr = builder.ins().func_addr(types::I64, fref);
                 let slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
@@ -3858,7 +3748,7 @@ fn compile_ir_function(
                 let val = get_reg(&regs, parts[3])?;
                 let offset = field_idx * 8;
                 builder.ins().store(
-                    cranelift::codegen::ir::MemFlags::new(),
+                    MemFlags::new(),
                     val,
                     struct_val,
                     offset,
@@ -3887,7 +3777,7 @@ fn compile_ir_function(
                     // return is declared f64, so reinterpret before returning.
                     payload = builder.ins().bitcast(
                         types::F64,
-                        cranelift::codegen::ir::MemFlags::new(),
+                        MemFlags::new(),
                         payload,
                     );
                 }

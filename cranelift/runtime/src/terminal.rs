@@ -61,9 +61,9 @@ fn restore_saved() -> bool {
 /// `exit`, including the `exit(1)` inside runtime traps.
 extern "C" fn restore_at_exit() {
     if restore_saved() {
-        // only bother with the reset string when a session actually entered raw
-        // mode at some point: SAVED starts None and restore_saved() drains it,
-        // so reaching here always means the hook was armed by a raw enter.
+        // only a raw enter registers this hook, so a session did enter raw
+        // mode at some point; the reset string undoes whatever screen modes it
+        // turned on, unless putting the termios back failed.
         // SAFETY: one plain write to stdout at process exit.
         unsafe {
             libc::write(1, RESET_SEQ.as_ptr() as *const libc::c_void, RESET_SEQ.len());

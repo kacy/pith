@@ -39,6 +39,9 @@ use std::sync::OnceLock;
 /// write cannot queue in front of a dial, or the reverse.
 static POOL: Pool = Pool::new("pith-file", 4);
 
+/// open files by handle. a handle is a counter value that is never reused, so
+/// a closed handle can never name a later file (see `fd_handle` for why
+/// sockets need more than this).
 static FILE_HANDLES: OnceLock<Mutex<HashMap<i64, File>>> = OnceLock::new();
 static NEXT_FILE_HANDLE: AtomicI64 = AtomicI64::new(1);
 
@@ -118,7 +121,9 @@ impl Default for FileWrite {
 /// opened, or closed since.
 const UNKNOWN_FILE_HANDLE: &str = "invalid or closed file handle";
 
-unsafe fn pith_open_file_with(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
+/// open the file at `path` (a C string) and register it, returning its handle
+/// or 0 on failure. the shared body of the three `pith_file_open_*` exports.
+unsafe fn open_file_handle(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
     let Some(path_str) = cstr_str(path) else {
         return 0;
     };
@@ -395,17 +400,17 @@ pub unsafe extern "C" fn pith_append_file_bytes(path: *const i8, content: i64) -
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_read(path: *const i8) -> i64 {
-    pith_open_file_with(path, false, false, false)
+    open_file_handle(path, false, false, false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_write(path: *const i8) -> i64 {
-    pith_open_file_with(path, true, true, false)
+    open_file_handle(path, true, true, false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
-    pith_open_file_with(path, true, false, true)
+    open_file_handle(path, true, false, true)
 }
 
 /// read one chunk from an open handle, on a pool thread when there is a worker

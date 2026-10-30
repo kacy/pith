@@ -497,23 +497,6 @@ pub fn ir_struct_decode_field_tid(field_tid: Int) -> Int:
         return field_tid
     return 0 - 1
 
-# the numeric scalar code for a field tid — 0 String, 1 Int, 2 Bool,
-# 3 Float, -1 for anything else. the integer counterpart of
-# ir_json_field_type_char; nothing in the tree calls it today, so treat
-# the encoding as unpinned by any test.
-pub fn ir_json_field_type_tag(field_tid: Int) -> Int:
-    info := get_type_info(field_tid)
-    if info.kind == "primitive":
-        if info.name == "String":
-            return 0
-        if info.name == "Int":
-            return 1
-        if info.name == "Bool":
-            return 2
-        if info.name == "Float":
-            return 3
-    return 0 - 1
-
 # the tid inside an optional field, or -1 when the field is not
 # optional. this is the unwrap step every decode field loop starts with:
 # the helper tables key off the inner type, while the optional-ness is

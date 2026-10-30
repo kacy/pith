@@ -80,21 +80,6 @@ pub fn ir_emit_ret_known_err_box(result_r: Int):
     ir_emit("iconst " + zf_r.to_string() + " 0")
     ir_emit("ret2 " + zf_r.to_string() + " " + err_r.to_string())
 
-# apply the zero-sentinel bias: an ok value travels as `v + 1` so that a
-# real 0 or false is not read as the error case. box kinds need no bias,
-# so they get `value_reg` back untouched.
-# no emitter path calls this today — the consumer biases a runtime call's
-# return itself (normalize_runtime_result), and only the decode below is
-# needed on this side.
-pub fn ir_encode_result_value(value_reg: Int, result_kind: String) -> Int:
-    if ir_uses_result_abi(result_kind):
-        one := ir_reg()
-        ir_emit("iconst " + one.to_string() + " 1")
-        encoded := ir_reg()
-        ir_emit("add " + encoded.to_string() + " " + value_reg.to_string() + " " + one.to_string())
-        return encoded
-    return value_reg
-
 # recover the real ok value from the `v + 1` a single-register result
 # carries. only meaningful on the success arm: the caller must have
 # already branched on the raw register (0 is the error case), because

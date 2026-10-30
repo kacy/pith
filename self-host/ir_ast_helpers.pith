@@ -77,16 +77,3 @@ pub fn ir_binding_name(node: Node) -> String:
     elif name.contains(" "):
         name = name.split(" ")[0]
     return name
-
-# whether a binding is initialized from a written-out collection literal
-# — `[...]`, `{...}` or a set literal, the `list` / `map` / `set` node
-# kinds. only the binding's direct children are looked at and no `pub`
-# unwrapping happens, so a collection that arrives through a call or any
-# other expression answers false. nothing calls this today; it is
-# imported by ir_emitter_core but unused there.
-pub fn ir_binding_has_collection_init(node: Node) -> Bool:
-    for child in node.children:
-        kind := get_node(child).kind
-        if kind == "list" or kind == "map" or kind == "set":
-            return true
-    return false

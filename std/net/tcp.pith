@@ -1,6 +1,6 @@
 # std.net.tcp — TCP networking
 #
-# TCP client and server functionality. All I/O is blocking — use spawn for concurrency.
+# TCP client and server functionality. All I/O is blocking; use spawn for concurrency.
 # Connections are represented as Int handles: the socket's descriptor number
 # stamped with a generation, so a closed handle fails every later call rather
 # than reaching whatever socket the kernel gives that number to next.
@@ -19,13 +19,10 @@ import std.resilience as resilience
 # Client Operations
 # ===============================================================
 
-fn tcp_connect_checked(host: String, port: Int) -> Int!:
-    return tcp_connect(host, port)
-
 # Connects to a TCP server at the specified host and port.
 # Returns a file descriptor or fails if connection fails.
 pub fn connect(host: String, port: Int) -> Int!:
-    return tcp_connect_checked(host, port)
+    return tcp_connect(host, port)
 
 # ===============================================================
 # Server Operations
@@ -52,8 +49,8 @@ pub fn accept(server_fd: Int) -> Int!:
 # will, and both arrive as text. so a loop covers both cases at once. it backs
 # off after a failure, which costs a transient failure a few milliseconds and
 # keeps a permanent one from burning a core, and it gives up after a bounded run
-# of consecutive failures, which is the only honest reading of a listener that
-# has not produced a single connection in that many tries. one successful accept
+# of consecutive failures, since a listener that has not produced a single
+# connection in that many tries is taken to be broken. one successful accept
 # resets the run.
 #
 # the shape a caller writes:
@@ -102,15 +99,15 @@ test "an accept loop keeps going while the run is short":
 
 # Reads up to max_bytes from a connection.
 # Returns the data read or fails on error: the connection closed, a read
-# deadline reached, or fd closed by another task — before this call, which
-# fails at once, or during it, which returns it with the same failure.
+# deadline reached, or fd closed by another task. a close before this call
+# fails it at once; a close during it returns it with the same failure.
 pub fn read(fd: Int, max_bytes: Int) -> String!:
     return tcp_read(fd, max_bytes)
 
 # Writes data to a connection.
 #
 # this is one write syscall, and it returns the number of bytes the kernel
-# accepted — which may be fewer than were offered. a socket has a bounded send
+# accepted, which may be fewer than were offered. a socket has a bounded send
 # buffer, so a buffer larger than the space left in it is written in part and
 # the rest is not written at all. the count is the whole result: ignoring it
 # drops the tail silently, and the peer waits for bytes that will never come.
@@ -124,7 +121,7 @@ pub fn write(fd: Int, data: String) -> Int!:
 
 # Writes every byte of data to a connection, and returns how many that was.
 #
-# a short write is normal rather than an error — the send buffer filled — so
+# a short write is normal rather than an error (the send buffer filled), so
 # this resumes from where the last one stopped and keeps going until the buffer
 # is out. only a write that accepts nothing at all ends it, and that means the
 # reader is gone.
@@ -153,7 +150,7 @@ pub fn write_all_bytes(fd: Int, data: Bytes) -> Int!:
 # Set read timeout in milliseconds (0 = no timeout).
 #
 # a read that reaches the deadline with nothing to show for it fails, exactly as
-# a closed connection does — the error does not distinguish them. zero or less
+# a closed connection does; the error does not distinguish them. zero or less
 # clears the deadline, so the socket waits indefinitely again, which is what a
 # socket that was never given one does.
 #
@@ -191,8 +188,8 @@ pub fn set_write_deadline(fd: Int, ms: Int):
 # Closes a TCP connection.
 #
 # safe to call from any task, and safe to call twice: a second close is a no-op.
-# a task still inside a call on fd — parked in a read, an accept on a listener,
-# or a wait — is returned from it with an error, and every later call on the
+# a task still inside a call on fd (parked in a read, an accept on a listener,
+# or a wait) is returned from it with an error, and every later call on the
 # handle fails. the descriptor itself is released once no call is inside on it,
 # so its number is never handed to a new connection while one is; see "closing
 # a connection another task is using" in docs/concurrency.md.

@@ -48,6 +48,11 @@ MAX_MESSAGE_FRAGMENTS := 262144
 WS_CLOSE_MESSAGE_TOO_BIG := 1009
 WS_CLOSE_NONE := 0
 WS_CLOSE_TCP := 1
+# a WebSocket is only a handle; its state lives in these per-thread maps, one
+# entry per handle in each. register_websocket_state fills them and close_now
+# removes them all. a handle missing from websocket_closed_flags reads as
+# closed, so deregistering is what closes a session and the stored value stays
+# false while it is open.
 threadlocal mut next_websocket_handle: Int := 1
 threadlocal mut websocket_reader_handles: Map[Int, Int] := {}
 threadlocal mut websocket_writer_handles: Map[Int, Int] := {}
@@ -300,7 +305,7 @@ pub fn dial_with_headers(host: String, port: Int, path: String, headers: Map[Str
     key_text := encoding.b64_encode(key)
     request := client_request_with_key(default_host_header(host, port), path, headers, key)!
     # the handshake's buffered io is registry-backed and lives only for this
-    # call — the session registers a pair of its own on success — so give the
+    # call (the session registers a pair of its own on success), so give the
     # entries back on every exit, the failed handshake included.
     writer := conn.buffered_bytes_writer()
     defer writer.free()
@@ -442,6 +447,7 @@ fn frame_payload_length(data: Bytes) -> Int!:
         if value.is_err:
             fail value.err.message
         return value.ok
+    # length code 127 announces a 64-bit length, which this reader rejects.
     frame_extended_length_size(data[1])!
     return 0
 fn apply_mask(payload: Bytes, mask_key: Bytes) -> Bytes!:
@@ -555,8 +561,6 @@ pub fn text_frame_bytes(text: String) -> Bytes!:
 # builds one binary frame.
 pub fn binary_frame(payload: Bytes) -> Bytes!:
     return frame_bytes(OP_BINARY, payload)
-fn masked_payload(payload: Bytes, mask_key: Bytes) -> Bytes!:
-    return apply_mask(payload, mask_key)
 fn close_payload(code: Int, reason: String) -> Bytes!:
     payload := bytes.buffer_with_capacity(reason.len() + 2)
     defer payload.free()
@@ -583,7 +587,7 @@ fn masked_frame_bytes_with_fin(opcode: Int, payload: Bytes, mask_key: Bytes, fin
     buf.write_byte(first)!
     append_frame_length(buf, payload.len(), true)!
     buf.write(mask_key)!
-    buf.write(masked_payload(payload, mask_key)!)!
+    buf.write(apply_mask(payload, mask_key)!)!
     return buf.bytes()
 # builds one masked client text frame.
 pub fn client_text_frame_bytes(text: String, mask_key: Bytes) -> Bytes!:
@@ -822,8 +826,8 @@ test "websocket buffered frame reads consume full payloads":
 
 test "websocket receive rejects a message past the size cap":
     # a large-fragment message that never sets FIN, pushing the reassembly buffer
-    # past MAX_MESSAGE_BYTES. before the cap this buffers without bound; now the read
-    # aborts and the peer is closed with 1009.
+    # past MAX_MESSAGE_BYTES. the cap aborts the read and closes the peer with 1009
+    # instead of buffering without bound.
     mut chunk := bytes.from_string_utf8("a")
     while chunk.len() < 65536:
         chunk = bytes.concat(chunk, chunk)

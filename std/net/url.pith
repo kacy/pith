@@ -3,8 +3,8 @@
 # Parse URLs into components (scheme, host, port, path, query, fragment)
 # and perform percent-encoding/decoding per RFC 3986.
 #
-# Uses opaque Int handles into a node pool. Call parse() to get
-# a handle, then use accessor functions to read components.
+# parse() returns a URL struct; read its fields directly or through the
+# accessor functions.
 #
 #   from std.net.url import parse, host, path, encode, decode
 #   u := parse("https://example.com/api?q=1")
@@ -64,7 +64,7 @@ pub fn parse(input: String) -> URL:
     while i + 2 < input.len():
         if input[i] == ":" and input[i + 1] == "/" and input[i + 2] == "/":
             scheme_end = i
-            i = input.len()
+            break
         i = i + 1
     if scheme_end > 0:
         r_scheme = input.substring(0, scheme_end)
@@ -80,7 +80,7 @@ pub fn parse(input: String) -> URL:
     while i < host_end:
         if input[i] == ":":
             colon = i
-            i = host_end
+            break
         i = i + 1
     if colon >= 0:
         r_host = input.substring(host_start, colon)
@@ -114,15 +114,9 @@ pub fn parse(input: String) -> URL:
     # query: after ? before #
     if pos < input.len() and input[pos] == "?":
         pos = pos + 1
-        qstart := pos
-        mut qend := input.len()
-        i = pos
-        while i < input.len() and qend == input.len():
-            if input[i] == "#":
-                qend = i
-            i = i + 1
-        r_query = input.substring(qstart, qend)
-        pos = qend
+        query_end := first_delim_index(input, pos, input.len(), ord("#"), 0 - 1, 0 - 1)
+        r_query = input.substring(pos, query_end)
+        pos = query_end
 
     # fragment: after #
     if pos < input.len() and input[pos] == "#":
@@ -154,7 +148,7 @@ pub fn port(u: URL) -> Int:
 pub fn path(u: URL) -> String:
     return u.path
 
-# return the length of the path component without allocating a parsed url node.
+# return the length of the path component without building a URL.
 pub fn path_len(input: String) -> Int:
     # cache the length once: each input.len() is an out-of-line call, and this
     # scanner reads it in every loop condition.
@@ -164,7 +158,7 @@ pub fn path_len(input: String) -> Int:
     while i + 2 < n:
         if input[i] == ":" and input[i + 1] == "/" and input[i + 2] == "/":
             pos = i + 3
-            i = n
+            break
         i = i + 1
 
     host_end := first_delim_index(input, pos, n, ord("/"), ord("?"), ord("#"))
@@ -220,9 +214,8 @@ fn is_unreserved(c: String) -> Bool:
 # Unreserved characters are left as-is, all others become %XX.
 pub fn encode(input: String) -> String:
     hex_digits := bytes.from_string_utf8("0123456789abcdef")
-    # appending to the result string one character at a time recopied the whole
-    # accumulated string on every append, which made encoding quadratic in the
-    # input; a byte buffer keeps each append constant.
+    # a byte buffer keeps each append constant time; appending to a String
+    # recopies everything accumulated so far and makes encoding quadratic.
     out := bytes.buffer_with_capacity(input.len())
     defer out.free()
     mut position := 0
@@ -230,10 +223,10 @@ pub fn encode(input: String) -> String:
         character := input[position]
         if is_unreserved(character):
             out.write_byte(ord(character))
-        if not is_unreserved(character):
-            # a bare ord() sign-extends, so every byte above 0x7F came back
-            # negative and indexed off the front of the digit table. percent
-            # encoding is defined over bytes, so mask it back to 0-255.
+        else:
+            # a bare ord() sign-extends, so a byte above 0x7F comes back
+            # negative and would index off the front of the digit table.
+            # percent encoding is defined over bytes, so mask it to 0-255.
             char_value := bit_and(ord(character), 255)
             out.write_byte(37)
             out.write_byte(hex_digits[char_value / 16])
@@ -267,18 +260,16 @@ pub fn decode_path(input: String) -> String:
     return unescape(input, false)
 
 fn unescape(input: String, plus_is_space: Bool) -> String:
-    # collect the pieces and join once at the end: appending to the result
-    # string directly recopied everything accumulated so far on every append,
-    # which made decoding quadratic in the input. a list survives a decoded
-    # byte that is not valid utf-8 (say "%ff"), which a byte-buffer round-trip
-    # through utf-8 validation would not.
+    # collect the pieces and join once at the end: appending to a String
+    # recopies everything accumulated so far and makes decoding quadratic. a
+    # list survives a decoded byte that is not valid utf-8 (say "%ff"), which
+    # a byte-buffer round-trip through utf-8 validation would not.
     mut parts: List[String] := []
     mut position := 0
     while position < input.len():
-        # these were three sequential ifs. after the escape branch consumed a
-        # "%XX" that ended the string, the last one still read input[position]
-        # with position now past the end and took the process down -- so any
-        # query string or form body ending in an escape crashed the decoder.
+        # one branch per step: an escape that ends the string leaves position
+        # past the end, so no later check may read input[position] in the same
+        # iteration.
         if input[position] == "%" and position + 2 < input.len():
             high_nibble := hex_digit(input[position + 1])
             low_nibble := hex_digit(input[position + 2])

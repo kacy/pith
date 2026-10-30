@@ -1,0 +1,84 @@
+name: release
+# builds the toolchain on each supported os and chip, checks that the packed
+# toolchain works from outside a checkout, and attaches the tarballs and
+# install.sh to the release. a pull request that touches the packaging runs
+# the builds without publishing.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - tooling/package_release.sh
+      - tooling/smoke_release.sh
+      - install.sh
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag to build and attach binaries to
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # the oldest supported runner for each platform, so the linux
+        # binaries need no newer glibc than ubuntu 22.04's
+        runner: [ubuntu-22.04, ubuntu-22.04-arm, macos-14, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: rust toolchain
+        run: |
+          if ! command -v cargo >/dev/null; then
+            curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: package
+        run: sh tooling/package_release.sh
+
+      - name: smoke test the package
+        run: sh tooling/smoke_release.sh dist/pith-*.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pith-${{ matrix.runner }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "pith ${TAG#v}" --notes ""
+          fi
+          gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 install.sh --clobber

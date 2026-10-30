@@ -1205,7 +1205,7 @@ fn runtime_func_ref(
 /// Lower a call to a runtime builtin that has an inline fast path, or
 /// answer `None` and leave the call to the generic path. A builtin that
 /// returns nothing answers a zero for its destination register, as the
-/// generic path does. Most fast paths step aside when a user function or a
+/// generic path does. Every fast path steps aside when a user function or a
 /// local shares the builtin's name (`name_is_shadowed`): the user's
 /// definition always wins, and `fn byte_at(r: Reader, i: Int)` once read a
 /// byte out of its struct's own memory because it did not.
@@ -1218,6 +1218,9 @@ fn inline_runtime_call(
     args: &[Value],
     name_is_shadowed: bool,
 ) -> Result<Option<Value>, CompileError> {
+    if name_is_shadowed {
+        return Ok(None);
+    }
     let mut runtime_ref = |builder: &mut FunctionBuilder<'_>, name: &str| {
         runtime_func_ref(codegen, builder, func_ref_cache, runtime_funcs, name)
     };
@@ -1231,7 +1234,7 @@ fn inline_runtime_call(
         // a field store's write barrier: only a holder that is already
         // shared makes the call, so test its mark here. the holder is a
         // struct the emitter is storing into, never null.
-        ("pith_share_into", 3) if !name_is_shadowed => {
+        ("pith_share_into", 3) => {
             let fallback = runtime_ref(builder, "pith_share_into")?;
             let word = builder.ins().load(types::I32, MemFlags::new(), args[0], STRUCT_FLAGS_FROM_DATA);
             let shared = builder.ins().band_imm(word, STRUCT_SHARED_MASK as i64);
@@ -1245,37 +1248,37 @@ fn inline_runtime_call(
             builder.switch_to_block(done);
             builder.ins().iconst(types::I64, 0)
         }
-        ("pith_closure_get_env", 2) if !name_is_shadowed => {
+        ("pith_closure_get_env", 2) => {
             let fallback = runtime_ref(builder, "pith_closure_get_env")?;
             inline_closure_get_env(builder, args[0], args[1], fallback)
         }
-        ("pith_closure_set_env", 3) if !name_is_shadowed => {
+        ("pith_closure_set_env", 3) => {
             let fallback = runtime_ref(builder, "pith_closure_set_env")?;
             inline_closure_set_env(builder, args[0], args[1], args[2], fallback);
             builder.ins().iconst(types::I64, 0)
         }
-        ("bytes_get", 2) if !name_is_shadowed => inline_bytes_get(builder, args[0], args[1]),
+        ("bytes_get", 2) => inline_bytes_get(builder, args[0], args[1]),
         // `bytes[i]`: the same fast path, with the runtime's strict getter as
         // the fallback so a failing read still aborts with its diagnostic.
-        ("bytes_get_strict", 2) if !name_is_shadowed => {
+        ("bytes_get_strict", 2) => {
             let fallback = runtime_ref(builder, "bytes_get_strict")?;
             inline_bytes_get_strict(builder, args[0], args[1], fallback)
         }
-        ("bytes_read_word", 3) if !name_is_shadowed => {
+        ("bytes_read_word", 3) => {
             let fallback = runtime_ref(builder, "bytes_read_word")?;
             inline_bytes_read_word(builder, args[0], args[1], args[2], fallback)
         }
         // string indexing: a header read instead of an FFI call per
         // character, with the runtime helper as the fallback for literals.
         // these names are emitted only for strings (bytes use bytes_get).
-        ("byte_at" | "pith_cstring_byte_at", 2) if !name_is_shadowed => {
+        ("byte_at" | "pith_cstring_byte_at", 2) => {
             let fallback = runtime_ref(builder, "byte_at")?;
             // the same anchor `s.len()` uses, so the two share one header
             // check
             let anchor = runtime_ref(builder, "string_len")?;
             inline_cstring_byte_at(builder, args[0], args[1], fallback, anchor)
         }
-        ("bytes_len", 1) if !name_is_shadowed => {
+        ("bytes_len", 1) => {
             let fallback = runtime_ref(builder, fname)?;
             inline_handle_len(
                 builder,
@@ -1287,11 +1290,11 @@ fn inline_runtime_call(
                 fallback,
             )
         }
-        ("pith_list_len", 1) if !name_is_shadowed => {
+        ("pith_list_len", 1) => {
             let fallback = runtime_ref(builder, fname)?;
             inline_list_len(builder, args[0], fallback)
         }
-        ("string_len", 1) => {
+        ("string_len" | "pith_cstring_len", 1) => {
             let fallback = runtime_ref(builder, "string_len")?;
             inline_cstring_len(builder, args[0], fallback)
         }
@@ -1643,10 +1646,21 @@ pub fn compile_from_ir(
                     } else {
                         Linkage::Local
                     };
-                    if let Ok(func_id) = codegen.module.declare_function(name, linkage, &sig) {
-                        declared_funcs.insert(name.to_string(), func_id);
+                    // a function named after a runtime symbol shares its
+                    // declaration: with the same signature it replaces the
+                    // runtime function for every builtin that lowers to it, and
+                    // with another signature it cannot be declared, so its
+                    // callers would get the builtin.
+                    if codegen.module.get_name(name).is_some() {
+                        return Err(CompileError::ModuleError(format!(
+                            "function '{name}' has the name of a runtime symbol; rename it"
+                        )));
                     }
-                    // silently skip if name conflicts with runtime declaration
+                    let func_id = codegen
+                        .module
+                        .declare_function(name, linkage, &sig)
+                        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+                    declared_funcs.insert(name.to_string(), func_id);
                 }
             }
             _ => {}
@@ -4272,6 +4286,18 @@ mod tests {
         )
         .expect_err("an rcall to a single-return builtin must not compile");
         assert!(err.contains("does not return a register pair"), "{err}");
+    }
+
+    #[test]
+    fn a_function_named_after_a_runtime_symbol_is_an_error() {
+        // one signature matches the runtime's and one does not. without the
+        // check the first replaces the runtime function and the second is
+        // dropped in favour of it.
+        for decl in ["func pith_list_get_value 2 int", "func pith_list_set_value 3 int"] {
+            let err = compile_with_runtime_for_ir(&format!("{decl}\niconst 1 0\nret 1\nendfunc\n"))
+                .expect_err("a function named after a runtime symbol must not compile");
+            assert!(err.contains("has the name of a runtime symbol"), "{err}");
+        }
     }
 
     #[test]

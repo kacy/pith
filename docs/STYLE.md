@@ -107,7 +107,8 @@ condition adds a level rather than a line.
 ## comments
 
 every `pub` item needs a doc comment — a `#` comment on the line directly above
-it. this is enforced (E304), and it is what the documentation site renders.
+it. the linter checks it for public functions and methods (E304), and it is
+what the documentation site renders.
 
 ```pith
 # Read a whole file as text. Fails when the file is missing or unreadable.
@@ -263,7 +264,7 @@ import myapp.types as types
 - early returns instead of nesting
 - comments explain why
 
-`make fmt` and `make lint` check the mechanical half of this list. the rest is
+`pith fmt --check` and `pith lint` check the mechanical half of this list. the rest is
 what review is for.
 
 ## a worked example

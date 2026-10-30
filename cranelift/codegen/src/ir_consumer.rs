@@ -9,8 +9,8 @@
 //! whenever the instruction set or the conventions in this consumer change.
 
 use crate::{loop_hoist, CodeGen, CompileError};
-use cranelift::prelude::*;
 use cranelift::codegen::ir::{FuncRef, Function};
+use cranelift::prelude::*;
 use cranelift_module::{DataId, FuncId, Linkage, Module};
 use pith_runtime::bytes::{
     BYTES_DATA_LEN_OFFSET, BYTES_DATA_PTR_OFFSET, BYTES_HANDLE_ALIGN, BYTES_MAGIC,
@@ -345,11 +345,7 @@ fn inline_list_set_value(
 /// compare, since the runtime scrubs the magic. The reads carry
 /// `loop_hoist::HEADER_FLAGS`, so a loop that makes no calls reads each
 /// header once, before it starts.
-fn list_header(
-    builder: &mut FunctionBuilder<'_>,
-    list: Value,
-    anchor: FuncRef,
-) -> (Value, Value) {
+fn list_header(builder: &mut FunctionBuilder<'_>, list: Value, anchor: FuncRef) -> (Value, Value) {
     let addressable = handle_is_addressable(builder, list, LIST_HANDLE_ALIGN);
     let anchor_code = builder.ins().func_addr(types::I64, anchor);
     let base = builder.ins().select(addressable, list, anchor_code);
@@ -459,11 +455,7 @@ fn detect_bits_wrapper(param_names: &[String], body_lines: &[&str]) -> Option<&'
 
 /// The address of a string literal's characters, just past the header that
 /// `declare_string_data` writes in front of them.
-fn string_lit_addr(
-    codegen: &mut CodeGen,
-    builder: &mut FunctionBuilder<'_>,
-    lit: DataId,
-) -> Value {
+fn string_lit_addr(codegen: &mut CodeGen, builder: &mut FunctionBuilder<'_>, lit: DataId) -> Value {
     let gv = codegen.module.declare_data_in_func(lit, builder.func);
     let base = builder.ins().global_value(types::I64, gv);
     builder.ins().iadd_imm(base, 16)
@@ -804,11 +796,7 @@ fn inline_list_get_value_strict(
 /// A list only keeps its length in the 8-byte storage when its elements are
 /// 8 bytes wide; any other list, and a bad handle, goes to `fallback`,
 /// which answers 0 for a bad handle as it always has.
-fn inline_list_len(
-    builder: &mut FunctionBuilder<'_>,
-    list: Value,
-    fallback: FuncRef,
-) -> Value {
+fn inline_list_len(builder: &mut FunctionBuilder<'_>, list: Value, fallback: FuncRef) -> Value {
     let (live, base) = list_header(builder, list, fallback);
     let elem_size = builder.ins().load(
         types::I64,
@@ -1110,11 +1098,7 @@ const CSTRING_MAGIC_OFFSET: i32 = -16;
 /// loop that indexes the same string, and merges repeated checks of it. The
 /// anchor is a function rather than a data symbol because the inliner only
 /// translates function references.
-fn cstring_header(
-    builder: &mut FunctionBuilder<'_>,
-    s: Value,
-    anchor: FuncRef,
-) -> (Value, Value) {
+fn cstring_header(builder: &mut FunctionBuilder<'_>, s: Value, anchor: FuncRef) -> (Value, Value) {
     let big_enough = builder
         .ins()
         .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, s, 16);
@@ -1175,11 +1159,7 @@ fn inline_cstring_byte_at(
 /// Inline `s.len()` (string_len) for strings with a length header: one header
 /// read instead of an FFI call. Anything else falls back to `fallback`
 /// (pith_cstring_len).
-fn inline_cstring_len(
-    builder: &mut FunctionBuilder<'_>,
-    s: Value,
-    fallback: FuncRef,
-) -> Value {
+fn inline_cstring_len(builder: &mut FunctionBuilder<'_>, s: Value, fallback: FuncRef) -> Value {
     let (has_header, len) = cstring_header(builder, s, fallback);
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
@@ -1554,8 +1534,7 @@ pub fn compile_from_ir(
     let mut struct_layouts: HashMap<String, Vec<String>> = HashMap::new();
     let mut global_data: HashMap<String, DataId> = HashMap::new();
     let mut str_globals: Vec<(String, String)> = Vec::new(); // (global_name, string_id)
-    let mut string_global_names: HashSet<String> =
-        HashSet::new();
+    let mut string_global_names: HashSet<String> = HashSet::new();
 
     // green preemption safe-points are emitted by default. green is the default
     // backend, and a task that loops waiting on something another task must
@@ -2515,10 +2494,7 @@ fn compile_ir_function(
                     ))
                 })?;
                 let fv = builder.ins().f64const(fval);
-                let v =
-                    builder
-                        .ins()
-                        .bitcast(types::I64, MemFlags::new(), fv);
+                let v = builder.ins().bitcast(types::I64, MemFlags::new(), fv);
                 regs.insert(reg, v);
                 kinds.set(reg, "float");
             }
@@ -2591,14 +2567,8 @@ fn compile_ir_function(
                 let a = get_reg(&regs, parts[2])?;
                 let b = get_reg(&regs, parts[3])?;
                 // Bitcast i64 → f64
-                let fa =
-                    builder
-                        .ins()
-                        .bitcast(types::F64, MemFlags::new(), a);
-                let fb =
-                    builder
-                        .ins()
-                        .bitcast(types::F64, MemFlags::new(), b);
+                let fa = builder.ins().bitcast(types::F64, MemFlags::new(), a);
+                let fb = builder.ins().bitcast(types::F64, MemFlags::new(), b);
                 let fv = match parts[0] {
                     "fadd" => builder.ins().fadd(fa, fb),
                     "fsub" => builder.ins().fsub(fa, fb),
@@ -2612,10 +2582,7 @@ fn compile_ir_function(
                     }
                 };
                 // Bitcast f64 → i64
-                let v =
-                    builder
-                        .ins()
-                        .bitcast(types::I64, MemFlags::new(), fv);
+                let v = builder.ins().bitcast(types::I64, MemFlags::new(), fv);
                 regs.insert(reg, v);
                 kinds.set(reg, "float");
             }
@@ -2647,16 +2614,8 @@ fn compile_ir_function(
                 } else if matches!(parts[0], "add" | "sub" | "mul" | "div")
                     && (kinds.is_float(parts[2]) || kinds.is_float(parts[3]))
                 {
-                    let fa = builder.ins().bitcast(
-                        types::F64,
-                        MemFlags::new(),
-                        a,
-                    );
-                    let fb = builder.ins().bitcast(
-                        types::F64,
-                        MemFlags::new(),
-                        b,
-                    );
+                    let fa = builder.ins().bitcast(types::F64, MemFlags::new(), a);
+                    let fb = builder.ins().bitcast(types::F64, MemFlags::new(), b);
                     let fv = match parts[0] {
                         "add" => builder.ins().fadd(fa, fb),
                         "sub" => builder.ins().fsub(fa, fb),
@@ -2669,11 +2628,7 @@ fn compile_ir_function(
                             )))
                         }
                     };
-                    let v = builder.ins().bitcast(
-                        types::I64,
-                        MemFlags::new(),
-                        fv,
-                    );
+                    let v = builder.ins().bitcast(types::I64, MemFlags::new(), fv);
                     regs.insert(reg, v);
                     kinds.set(reg, "float");
                 } else {
@@ -2727,16 +2682,8 @@ fn compile_ir_function(
                     }
                 } else if kinds.is_float(parts[2]) || kinds.is_float(parts[3]) {
                     // Float comparison
-                    let fa = builder.ins().bitcast(
-                        types::F64,
-                        MemFlags::new(),
-                        a,
-                    );
-                    let fb = builder.ins().bitcast(
-                        types::F64,
-                        MemFlags::new(),
-                        b,
-                    );
+                    let fa = builder.ins().bitcast(types::F64, MemFlags::new(), a);
+                    let fb = builder.ins().bitcast(types::F64, MemFlags::new(), b);
                     use cranelift::codegen::ir::condcodes::FloatCC;
                     let fcc = match parts[0] {
                         "eq" => FloatCC::Equal,
@@ -2939,11 +2886,7 @@ fn compile_ir_function(
                 if payload_kind == "float" && !payload_is_f64 {
                     regs.insert(val_reg, payload_v);
                 } else if payload_kind == "float" {
-                    let cast = builder.ins().bitcast(
-                        types::I64,
-                        MemFlags::new(),
-                        payload_v,
-                    );
+                    let cast = builder.ins().bitcast(types::I64, MemFlags::new(), payload_v);
                     regs.insert(val_reg, cast);
                 } else {
                     let zero2 = builder.ins().iconst(types::I64, 0);
@@ -2982,12 +2925,7 @@ fn compile_ir_function(
                         // Store each field
                         for (i, arg) in args.iter().enumerate() {
                             let offset = (i * 8) as i32;
-                            builder.ins().store(
-                                MemFlags::new(),
-                                *arg,
-                                ptr,
-                                offset,
-                            );
+                            builder.ins().store(MemFlags::new(), *arg, ptr, offset);
                         }
                         regs.insert(reg, ptr);
                         kinds.clear(reg);
@@ -3352,9 +3290,7 @@ fn compile_ir_function(
                 if let Some(&data_id) = global_data.get(&name) {
                     let gv = codegen.module.declare_data_in_func(data_id, builder.func);
                     let addr = builder.ins().global_value(types::I64, gv);
-                    builder
-                        .ins()
-                        .store(MemFlags::new(), val, addr, 0);
+                    builder.ins().store(MemFlags::new(), val, addr, 0);
                 } else {
                     let var = if let Some(&v) = named_vars.get(&name) {
                         v
@@ -3377,12 +3313,7 @@ fn compile_ir_function(
                 if let Some(&data_id) = global_data.get(name) {
                     let gv = codegen.module.declare_data_in_func(data_id, builder.func);
                     let addr = builder.ins().global_value(types::I64, gv);
-                    let val = builder.ins().load(
-                        types::I64,
-                        MemFlags::new(),
-                        addr,
-                        0,
-                    );
+                    let val = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
                     regs.insert(reg, val);
                 } else if let Some(&var) = named_vars.get(name) {
                     let val = builder.use_var(var);
@@ -3493,12 +3424,7 @@ fn compile_ir_function(
                         func_name, line
                     )));
                 };
-                let raw = builder.ins().load(
-                    types::I64,
-                    MemFlags::new(),
-                    obj,
-                    offset,
-                );
+                let raw = builder.ins().load(types::I64, MemFlags::new(), obj, offset);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let v = builder.ins().iadd(raw, zero);
                 regs.insert(reg, v);
@@ -3629,12 +3555,7 @@ fn compile_ir_function(
                 })?;
                 let val = get_reg(&regs, parts[3])?;
                 let offset = field_idx * 8;
-                builder.ins().store(
-                    MemFlags::new(),
-                    val,
-                    struct_val,
-                    offset,
-                );
+                builder.ins().store(MemFlags::new(), val, struct_val, offset);
             }
 
             "ret" if parts.len() >= 2 => {
@@ -3905,12 +3826,16 @@ impl RegKinds {
 
     /// Whether the register an operand token names holds a string.
     fn is_string(&self, operand: &str) -> bool {
-        operand.parse::<usize>().is_ok_and(|r| self.strings.contains(&r))
+        operand
+            .parse::<usize>()
+            .is_ok_and(|r| self.strings.contains(&r))
     }
 
     /// Whether the register an operand token names holds a float.
     fn is_float(&self, operand: &str) -> bool {
-        operand.parse::<usize>().is_ok_and(|r| self.floats.contains(&r))
+        operand
+            .parse::<usize>()
+            .is_ok_and(|r| self.floats.contains(&r))
     }
 }
 
@@ -4047,7 +3972,10 @@ mod tests {
     #[test]
     fn string_literals_decode_their_escapes() {
         assert_eq!(decode_string_literal(r#"string m0s0 "a\nb\tc""#), "a\nb\tc");
-        assert_eq!(decode_string_literal(r#"string 1 "{{x}} \"q\" \\ \0""#), "{x} \"q\" \\ \0");
+        assert_eq!(
+            decode_string_literal(r#"string 1 "{{x}} \"q\" \\ \0""#),
+            "{x} \"q\" \\ \0"
+        );
         // a trailing escaped quote keeps its quote
         assert_eq!(decode_string_literal(r#"string 1 "say \"""#), "say \"");
         // an unknown escape and a lone brace stay as written

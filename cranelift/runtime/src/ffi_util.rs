@@ -43,14 +43,6 @@ pub unsafe fn cstr_string(ptr: *const i8) -> Option<String> {
     Some(cstr_str(ptr)?.to_string())
 }
 
-/// Convert a null-terminated C string pointer to a Rust `&str`.
-///
-/// # Safety
-/// Same requirements as [`cstr_bytes`].
-pub unsafe fn cstr_to_str<'a>(s: *const i8) -> &'a str {
-    cstr_str_or_empty(s)
-}
-
 /// Allocate a new null-terminated C string from a Rust `&str`.
 ///
 /// # Safety

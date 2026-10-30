@@ -2,22 +2,23 @@
 //!
 //! ARC alone cannot reclaim a reference cycle: every object in the ring keeps
 //! its neighbor's count above zero, so no release ever reaches the free path.
-//! A trial-deletion collector (Bacon-Rajan) starts from *suspects* — objects
+//! A trial-deletion collector (Bacon-Rajan) starts from *suspects*: objects
 //! whose count was decremented but stayed above zero, the only way a garbage
-//! cycle can form — trial-decrements the counts internal to the candidate
+//! cycle can form. It trial-decrements the counts internal to the candidate
 //! graph, and frees the members whose counts reach zero with the internal
-//! edges discounted. This module holds the suspect tracking — the buffer, the
-//! per-object buffered bit, and the graveyard — and the stop-the-world
-//! rendezvous the collection pass will run inside (see the mutator registry
-//! below). The collection pass itself lands separately.
+//! edges discounted. This module holds the suspect tracking (the buffer, the
+//! per-object buffered bit, and the graveyard), the stop-the-world
+//! rendezvous the collection pass runs inside (see the mutator registry
+//! below), the collection pass, and the collector thread that runs it.
 //!
 //! Invariants the buffer maintains, in force only when `PITH_CYCLE_GC` is on:
 //!
 //! - a buffered struct holds one weak count owned by the buffer, so the
 //!   32-byte header outlives the value and a buffer entry never dangles; a
-//!   struct that dies while buffered is identified by bit 0 of its dead word.
-//! - a buffered closure, list, or map that dies runs its normal death path —
-//!   children released, magic scrubbed, registry entry dropped — except the
+//!   struct that dies while buffered is identified by bit 0 of its header
+//!   flag word.
+//! - a buffered closure, list, or map that dies runs its normal death path
+//!   (children released, magic scrubbed, registry entry dropped) except the
 //!   final free of the impl shell, which is deferred to the graveyard for the
 //!   collector to reclaim. Everything inside the shell was already destructed,
 //!   so the deferred drop frees only the shell's own storage.
@@ -25,7 +26,7 @@
 //!   buffer's weak count is dropped: the failure mode is a leak, never a
 //!   dangle.
 //!
-//! With the flag off — the default — every release path pays one relaxed
+//! With the flag off, the default, every release path pays one relaxed
 //! atomic load and a predicted branch, the same shape as the perf-stats gate.
 
 use std::cell::{Cell, RefCell};
@@ -36,7 +37,7 @@ use std::time::{Duration, Instant};
 
 /// Kind codes for buffer and graveyard entries. These resemble the element
 /// tag codes in `collections::list::element_tag_from_code`, but they are an
-/// independent runtime-internal enum, not part of the ir contract — only the
+/// independent runtime-internal enum, not part of the ir contract: only the
 /// four kinds that can participate in a cycle appear here, and the numbering
 /// owes the wire codes nothing.
 pub(crate) const CYCLE_KIND_STRUCT: u8 = 1;
@@ -106,7 +107,7 @@ unsafe fn discard_suspect(ptr: usize, kind: u8) {
 
 /// Admit a suspect to the buffer, or turn it away at the cap. The caller has
 /// already won the object's buffered bit (and, for a struct, taken the
-/// buffer's weak count), so on overflow this undoes both — the object is
+/// buffer's weak count), so on overflow this undoes both: the object is
 /// simply not tracked, and the cycle it might root is leaked.
 ///
 /// # Safety
@@ -143,7 +144,7 @@ pub(crate) unsafe fn cycle_suspect(ptr: usize, kind: u8) {
 
 /// Park a dead closure/list/map shell for the collector to free. Called from
 /// the final-death arm after children are released, the magic is scrubbed,
-/// and the registry entry is gone — the shell no longer validates anywhere,
+/// and the registry entry is gone. The shell no longer validates anywhere;
 /// only its own allocation remains. Structs never come here: their header is
 /// kept alive by the buffer's weak count instead.
 #[cold]
@@ -158,7 +159,7 @@ pub(crate) fn graveyard_defer(ptr: usize, kind: u8) {
 // the emitter pairs every destructor that walks rc children with a tracer
 // twin: the same field walk, but each child is reported to `pith_cc_visit`
 // instead of released. keying the table by destructor address costs nothing
-// per instance — the destructor pointer every rc box already carries doubles
+// per instance: the destructor pointer every rc box already carries doubles
 // as the trace key, and a box with no destructor (or a destructor with no
 // tracer: only string/bytes/weak fields) falls out as a leaf the collector
 // never walks into.
@@ -310,7 +311,7 @@ const MUTATOR_EXITED: u8 = 3;
 /// seq-cst is what makes the rendezvous scan trustworthy: a mutator that
 /// loaded `GC_STOP` as clear and re-entered `running` did so before the
 /// stopper's store in the total order, so the stopper's later scan cannot
-/// still read the slot's older `native` — it never observes "stopped" for a
+/// still read the slot's older `native`; it never observes "stopped" for a
 /// thread that is running.
 pub(crate) struct MutatorSlot {
     state: AtomicU8,
@@ -324,8 +325,8 @@ impl MutatorSlot {
 }
 
 // the mutator slot registry, in registration order. slots are pushed under
-// the mutex and never popped — an exited thread's slot is marked and later
-// RESURRECTED by the next registration — so the vec plateaus at the peak
+// the mutex and never popped (an exited thread's slot is marked and later
+// RESURRECTED by the next registration), so the vec plateaus at the peak
 // number of concurrently live mutators and the stopper's scan holds the
 // lock only long enough to read the state words.
 static MUTATORS: Mutex<Vec<Arc<MutatorSlot>>> = Mutex::new(Vec::new());
@@ -348,7 +349,7 @@ static STOPPER: Mutex<()> = Mutex::new(());
 
 /// how long a stop request waits before giving up, in milliseconds. resolved
 /// once from `PITH_CYCLE_GC_STOP_MS`; 0 in the cell means not yet resolved
-/// (0 is not a valid timeout — it would abandon every stop unconditionally).
+/// (0 is not a valid timeout: it would abandon every stop unconditionally).
 static STOP_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
 const STOP_TIMEOUT_DEFAULT_MS: u64 = 25;
 
@@ -380,8 +381,8 @@ fn lock_gate() -> MutexGuard<'static, ()> {
     }
 }
 
-/// the calling thread's handle on its own slot. dropping it — which the
-/// thread-local machinery does as the thread exits — marks the slot exited,
+/// the calling thread's handle on its own slot. dropping it, which the
+/// thread-local machinery does as the thread exits, marks the slot exited,
 /// so a finished os-thread task (or any other thread that ever bracketed) is
 /// skipped by every later rendezvous rather than waited on forever.
 struct SlotOwner(Arc<MutatorSlot>);
@@ -428,7 +429,7 @@ fn register_new_slot() -> Arc<MutatorSlot> {
     slot
 }
 
-/// this thread's slot, created and registered on first use — how the main
+/// this thread's slot, created and registered on first use. this is how the main
 /// thread (and any other thread that reaches a gate or bracket) becomes a
 /// registered mutator without an explicit spawn seam. `None` only while
 /// thread-local storage is tearing down, where the thread is exiting and a
@@ -476,8 +477,8 @@ fn on_collector() -> bool {
 
 /// Create and register a mutator slot on behalf of a thread about to be
 /// spawned. The parent registers it *before* the thread exists: were the
-/// thread to register itself at entry, the rendezvous could scan — and
-/// declare the world stopped — in the window between the spawn returning and
+/// thread to register itself at entry, the rendezvous could scan (and
+/// declare the world stopped) in the window between the spawn returning and
 /// the child's first instruction, while the child mutates unobserved. `None`
 /// with the flag off, so spawn paths stay one relaxed load.
 pub(crate) fn mutator_slot_for_spawn() -> Option<Arc<MutatorSlot>> {
@@ -528,7 +529,7 @@ fn mutator_gate_slow() {
 }
 
 /// An RAII native bracket around one blocking wait. Enter marks the slot
-/// `native` — counted as stopped by the rendezvous — and the drop re-checks
+/// `native`, which the rendezvous counts as stopped, and the drop re-checks
 /// the stop request before the thread returns to code that may touch the
 /// heap, parking it if a stop landed while it was blocked. Between the two,
 /// the code inside the bracket must read no heap handle; keep it to the
@@ -634,8 +635,8 @@ fn release_the_world(own: Option<&MutatorSlot>) {
 
 /// Bring every registered mutator to a provable halt: set the stop request
 /// and wait until each non-exited slot reads `native` or `parked_for_gc`.
-/// Returns `false` — with the request already withdrawn and the world resumed
-/// — when some mutator did not stop within the timeout, or immediately when
+/// Returns `false`, with the request already withdrawn and the world
+/// resumed, when some mutator did not stop within the timeout, or immediately when
 /// the flag is off; the caller simply retries later. On `true` the world
 /// stays stopped until `pith_cycle_resume_the_world`.
 ///
@@ -696,7 +697,7 @@ pub(crate) fn pith_cycle_resume_the_world() {
 }
 
 /// Stop the world, run `f` on the calling thread, resume, and return `f`'s
-/// value — or `None` (with the world running) when the stop timed out or the
+/// value, or `None` (with the world running) when the stop timed out or the
 /// flag is off. Concurrent callers serialize on an internal lock; the resume
 /// runs even if `f` panics, so a bug in a collection pass cannot leave every
 /// mutator parked forever.
@@ -728,11 +729,11 @@ pub(crate) fn with_world_stopped<F: FnOnce() -> R, R>(f: F) -> Option<R> {
 // them, walks the ownership graph they reach, subtracts the edges internal to
 // that graph from each member's real count (MarkGray), restores the counts of
 // everything still owned from outside (Scan/ScanBlack), and frees what is
-// left (the white set) — the members of cycles no live reference reaches.
+// left (the white set): the members of cycles no live reference reaches.
 //
 // child kinds use the closure env tag codes, the one numbering the runtime,
 // the tracers, and `pith_cc_visit` already share: 2=list 3=map 4=set 6=struct
-// (and tuple boxes) 7=closure. strings and bytes never appear in the graph —
+// (and tuple boxes) 7=closure. strings and bytes never appear in the graph:
 // they hold no edges, so they cannot sit in a cycle, and the destruction of
 // their owner releases them the ordinary way. sets appear as nodes (they have
 // a count of their own, so a set owned only by garbage is garbage) but are
@@ -782,7 +783,7 @@ thread_local! {
     // the children one tracer call reports. `pith_cc_visit` has no context
     // argument, so the installed hook needs a side slot to deliver through;
     // a per-thread buffer the caller drains right after the tracer returns
-    // is the simplest shape that cannot dangle — no borrowed closure state
+    // is the simplest shape that cannot dangle: no borrowed closure state
     // survives past the call that set it up. tracer calls never nest (the
     // pass walks one object at a time and drains before descending).
     static TRACED_CHILDREN: RefCell<Vec<(i64, i64)>> = const { RefCell::new(Vec::new()) };
@@ -790,13 +791,13 @@ thread_local! {
 
 /// The hook installed for the span of a collection: buffer each reported
 /// child for the tracer caller to drain. Installing it process-wide is safe
-/// because the world is stopped — only the collector runs tracers.
+/// because the world is stopped, so only the collector runs tracers.
 extern "C" fn collector_visit(child: i64, kind: i64) {
     TRACED_CHILDREN.with(|buffer| buffer.borrow_mut().push((child, kind)));
 }
 
-/// The object's real, current strong count — the trial counts seed from
-/// this. `None` when the pointer does not validate as the claimed kind (a
+/// The object's real, current strong count, which the trial counts seed
+/// from. `None` when the pointer does not validate as the claimed kind (a
 /// corpse, or a miscarried edge), in which case it never joins the graph.
 unsafe fn real_strong_count(ptr: usize, kind: u8) -> Option<i64> {
     match kind {
@@ -883,7 +884,7 @@ unsafe fn children_of(ptr: usize, kind: u8) -> Vec<(usize, u8)> {
 /// mark-gray colors. every node starts `Fresh` when seeded; MarkGray turns
 /// the candidate graph gray while subtracting internal edges, Scan restores
 /// (black) what outside references still hold, and what stays with no
-/// external count comes out white — the garbage.
+/// external count comes out white: the garbage.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Color {
     Fresh,
@@ -903,7 +904,7 @@ struct Node {
 }
 
 /// Seed a node with its real count and its edges. `false` when the pointer
-/// does not validate, which keeps a miscarried edge out of the graph — its
+/// does not validate, which keeps a miscarried edge out of the graph. its
 /// trial count is then simply never decremented, the leak direction.
 unsafe fn seed_node(nodes: &mut HashMap<usize, Node>, ptr: usize, kind: u8) -> bool {
     if nodes.contains_key(&ptr) {
@@ -956,7 +957,7 @@ unsafe fn mark_gray(nodes: &mut HashMap<usize, Node>, root: usize) {
 }
 
 /// Scan: a gray node with a positive trial count is owned from outside the
-/// candidate graph — re-blacken it and everything it reaches, restoring the
+/// candidate graph: re-blacken it and everything it reaches, restoring the
 /// counts MarkGray subtracted. a gray node at zero or below goes white and
 /// its children are scanned in turn.
 unsafe fn scan(nodes: &mut HashMap<usize, Node>, root: usize) {
@@ -1033,7 +1034,7 @@ unsafe fn guard_white(ptr: usize, kind: u8) {
 /// A white's normal destruction body: release everything it owns. edges to
 /// other whites decrement guarded counts harmlessly; edges out of the
 /// garbage release for real, which can cascade ordinary frees and can push
-/// fresh suspects — both fine, because no buffer lock is held here.
+/// fresh suspects. both are fine, because no buffer lock is held here.
 unsafe fn destroy_white(ptr: usize, kind: u8) {
     match kind {
         CHILD_KIND_STRUCT => crate::runtime_core::cycle_struct_run_dtor(ptr as i64),
@@ -1162,7 +1163,7 @@ pub(crate) unsafe fn collect() {
 
     // 4. free the whites: guard every real count first so teardown can never
     // recursively free a member, then run every destruction body, then free
-    // every shell. three full passes, in that order — a destruction body may
+    // every shell. three full passes, in that order: a destruction body may
     // touch any other white, so no white's shell may go before the last
     // body has run.
     for &(ptr, kind) in &whites {
@@ -1247,8 +1248,8 @@ fn ensure_collector_thread() {
         .name("pith-cycle-gc".into())
         .spawn(collector_main);
     if spawned.is_err() {
-        // no thread means no collections — cycles leak, the acceptable
-        // direction — and a later suspect may try again.
+        // no thread means no collections (cycles leak, the acceptable
+        // direction), and a later suspect may try again.
         COLLECTOR_STARTED.store(false, Ordering::SeqCst);
     }
 }
@@ -1333,7 +1334,7 @@ pub extern "C" fn pith_cycle_gc_collect_now() -> i64 {
     let ok = ctrl.last_force_ok;
     // release the control lock before the bracket exits: the exit may park
     // this thread for a later stop, and the collector needs the lock to
-    // answer forced requests — parking while holding it would wedge both.
+    // answer forced requests; parking while holding it would wedge both.
     drop(ctrl);
     i64::from(ok)
 }
@@ -1380,11 +1381,6 @@ pub(crate) fn set_stop_timeout_for_tests(ms: u64) {
 }
 
 #[cfg(test)]
-pub(crate) fn mutators_len_for_tests() -> usize {
-    lock_mutators().len()
-}
-
-#[cfg(test)]
 pub(crate) fn tracer_count_for_tests() -> usize {
     lock_tracers().len()
 }
@@ -1400,7 +1396,7 @@ pub(crate) fn graveyard_count_for_tests(ptr: usize) -> usize {
 }
 
 /// Drain both buffers so the next test starts clean. Buffer entries are
-/// discarded properly (bit cleared, struct weak count dropped — which frees
+/// discarded properly (bit cleared, struct weak count dropped, which frees
 /// the header of a struct that died while buffered). Graveyard shells are
 /// deliberately leaked rather than dropped here: freeing them belongs to a
 /// collection pass, and a bounded leak inside the test process is harmless.
@@ -1440,7 +1436,7 @@ mod tests {
         // exited at teardown; a later registration must adopt an exited
         // slot instead of growing the registry. sequential joins make the
         // exited state visible to the next spawn, so the registry may only
-        // grow by a bounded handful over many short-lived threads — the
+        // grow by a bounded handful over many short-lived threads, the
         // os-thread backend's task-per-thread shape in miniature.
         let before = lock_mutators().len();
         for _ in 0..64 {
@@ -1454,7 +1450,7 @@ mod tests {
         // the sequential answer is before + 1: the first thread pushes at
         // most one fresh slot, marks it exited at join, and every later
         // thread's CAS adopts it. the extra unit of slack is for a thread
-        // OUTSIDE this test — the registry is process-global and cargo
+        // OUTSIDE this test: the registry is process-global and cargo
         // runs other tests' threads concurrently, so one of them gating
         // mid-loop legitimately pushes its own slot.
         assert!(
@@ -1839,7 +1835,7 @@ mod tests {
     // these force the flag on under CYCLE_TEST_LOCK, like the buffer tests.
     // the mutator registry is process-global, and while the flag is on *any*
     // test thread in this binary that crosses a bracket registers a slot that
-    // reads `running` until its thread exits — so tests that expect a stop to
+    // reads `running` until its thread exits, so tests that expect a stop to
     // SUCCEED retry the attempt for a while instead of asserting the first
     // one, which is exactly how the collector treats a `false` anyway.
 
@@ -1861,7 +1857,7 @@ mod tests {
     /// skips the test instead of hanging the suite. the pause between failed
     /// attempts is load-bearing: a failed attempt parks every gated thread in
     /// the process for the whole stop timeout, so back-to-back retries starve
-    /// unrelated tests sharing the binary — the gap hands them the core back.
+    /// unrelated tests sharing the binary; the gap hands them the core back.
     fn stop_eventually() -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -2127,7 +2123,7 @@ mod tests {
         force_enabled_for_tests(false);
 
         // the property is thread-local: this thread's gates and brackets
-        // must not register it. the global slot count is not stable here —
+        // must not register it. the global slot count is not stable here:
         // an unrelated test spawning the green workers registers theirs
         // concurrently, so counting the registry races.
         assert!(existing_mutator_slot().is_none(), "no slot before");

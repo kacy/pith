@@ -1,7 +1,8 @@
-//! Map[K,V] - hash-indexed key-value collection
+//! Map[K,V]: a hash-indexed, reference-counted key-value collection.
 //!
-//! Hybrid approach: Uses hashbrown::HashMap internally for O(1) lookups,
-//! but presents FFI-compatible interface matching the C runtime.
+//! The table is a `hashbrown::HashMap`, used directly rather than through
+//! `std` so lookups can probe with a borrowed key (`KeyRef`) and never build
+//! an owned one.
 
 use crate::collections::list::{
     element_tag_from_code, release_element, retain_element, ListTypeTag,
@@ -12,6 +13,7 @@ use crate::runtime_core::{optional_from, optional_pair};
 use hashbrown::hash_map::EntryRef;
 use hashbrown::{Equivalent, HashMap};
 use std::hash::{Hash, Hasher};
+
 /// FFI-compatible map handle
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -57,8 +59,8 @@ impl Hash for MapKey {
 /// A key the caller already holds the bytes of: the probe form of `MapKey`.
 ///
 /// Every lookup, membership test, removal and overwrite asks a question about
-/// content the caller is already holding — the c-string it passed, or the
-/// buffer inside its bytes object — so none of them needs the map's own copy.
+/// content the caller is already holding (the c-string it passed, or the
+/// buffer inside its bytes object), so none of them needs the map's own copy.
 /// Only an insert that misses does, and `From<&KeyRef> for MapKey` is the one
 /// place that copy is made.
 ///
@@ -204,6 +206,7 @@ pub struct MapImpl {
     /// same contract a tagged list has for its elements.
     val_tag: ListTypeTag,
     /// Bit 0: this map sits in the cycle collector's suspect buffer.
+    /// Bit 7: shared (`share::CONTAINER_SHARED_FLAG`).
     cycle_flags: std::sync::atomic::AtomicU8,
 }
 
@@ -274,8 +277,8 @@ impl MapImpl {
     /// map does not. Returns true when the map owns a count on values of that
     /// kind once this returns.
     ///
-    /// The constructor cannot always pick the flavor — an empty `{}` in a
-    /// position the checker could not type builds a plain map — so the store
+    /// The constructor cannot always pick the flavor (an empty `{}` in a
+    /// position the checker could not type builds a plain map), so the store
     /// is the second chance, and the only place the value's kind is known for
     /// certain. Adopting is count-neutral because it is gated on the map being
     /// empty: there are no already-stored values whose counts the new tag
@@ -431,7 +434,7 @@ impl MapImpl {
         }
     }
 
-    /// Drop the map's count on a value that has just left the map — removed,
+    /// Drop the map's count on a value that has just left the map: removed,
     /// overwritten, or cleared. A heap-valued map holds exactly one count per
     /// stored value, so anyone still reading it after this point must be
     /// holding a count of their own (the emitter retains borrowed values into
@@ -787,7 +790,7 @@ pub(crate) unsafe fn cycle_map_strong_count(handle: i64) -> Option<u32> {
         .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Add `delta` to the reference count — the collector's teardown guard.
+/// Add `delta` to the reference count: the collector's teardown guard.
 pub(crate) unsafe fn cycle_map_guard_strong(handle: i64, delta: u32) {
     if let Some(impl_ref) = map_ref_from_handle(handle) {
         impl_ref
@@ -861,12 +864,12 @@ pub(crate) unsafe fn cycle_map_free_dead(handle: i64) {
 }
 
 /// Drop a map shell the graveyard parked: values already released, magic
-/// already scrubbed, registry entry already gone — only the box remains.
+/// already scrubbed, registry entry already gone; only the box remains.
 pub(crate) unsafe fn cycle_drop_map_shell(ptr: usize) {
     drop(Box::from_raw(ptr as *mut MapImpl));
 }
 
-/// Remove an int-keyed entry and hand its value — count included — to the
+/// Remove an int-keyed entry and hand its value, count included, to the
 /// caller. The map neither retains nor releases: ownership transfers, so
 /// this is the reclaim-safe way to drop registry entries under the
 /// free-only-cascade rule.
@@ -1031,7 +1034,7 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
 /// caller's count instead of adding one of its own, so a value built
 /// straight into the store ends up with exactly one owner. A map that owns
 /// no value counts has nothing to take, and the caller's count stays
-/// outstanding there — see `pith_list_push_value_owned`.
+/// outstanding there; see `pith_list_push_value_owned`.
 ///
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
@@ -1042,8 +1045,8 @@ pub unsafe extern "C" fn pith_map_insert_cstr_owned(map_handle: i64, key: *const
 }
 
 /// Insert a borrowed value of a named heap kind. The map learns the kind
-/// here when its constructor could not supply one — see
-/// `MapImpl::adopt_value_tag` — which is what lets a container stored into a
+/// here when its constructor could not supply one (see
+/// `MapImpl::adopt_value_tag`), which is what lets a container stored into a
 /// map be owned by it. When the map cannot own the kind, the count the
 /// emitter would once have added at the call site is added here instead, so
 /// the value still outlives the caller's local: a leak, never a freed value.
@@ -1249,7 +1252,7 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
 }
 
 /// Get an i64 value by C-string key, wrapped in an Optional tuple. Returns
-/// `Some(value)` when the key is present and `None` otherwise — so callers
+/// `Some(value)` when the key is present and `None` otherwise, so callers
 /// can distinguish "not present" from a legitimately-stored `0`.
 ///
 /// # Safety
@@ -1279,7 +1282,7 @@ pub unsafe extern "C" fn pith_map_get_cstr_opt_pair(map_handle: i64, key: *const
 }
 
 /// Get an i64 value by C-string key. If the key is not present, prints a
-/// structured diagnostic to stderr and exits non-zero — the strict path
+/// structured diagnostic to stderr and exits non-zero: the strict path
 /// for `map[k]`, replacing the old silent-zero behavior. Callers that
 /// want fallback behavior have `.get_default(k, d)` and `.get(k)`.
 ///
@@ -1405,7 +1408,7 @@ pub unsafe extern "C" fn pith_map_insert_bkey(map_handle: i64, key: i64, value: 
     insert_bkey_inner(map_handle, key, value, false);
 }
 
-/// Insert a value the caller owns under a bytes key — see
+/// Insert a value the caller owns under a bytes key; see
 /// `pith_map_insert_cstr_owned`.
 ///
 /// # Safety
@@ -1416,7 +1419,7 @@ pub unsafe extern "C" fn pith_map_insert_bkey_owned(map_handle: i64, key: i64, v
     insert_bkey_inner(map_handle, key, value, true);
 }
 
-/// Insert a borrowed value of a named heap kind under a bytes key — see
+/// Insert a borrowed value of a named heap kind under a bytes key; see
 /// `pith_map_insert_cstr_kind`.
 ///
 /// # Safety
@@ -1436,7 +1439,7 @@ pub unsafe extern "C" fn pith_map_insert_bkey_kind(
     insert_bkey_inner(map_handle, key, value, false);
 }
 
-/// Insert an owned value of a named heap kind under a bytes key — see
+/// Insert an owned value of a named heap kind under a bytes key; see
 /// `pith_map_insert_cstr_owned_kind`.
 ///
 /// # Safety
@@ -1468,7 +1471,7 @@ pub unsafe extern "C" fn pith_map_get_bkey(map_handle: i64, key: i64) -> i64 {
         .unwrap_or(0)
 }
 
-/// Get a value by bytes key, wrapped in an Optional tuple — see
+/// Get a value by bytes key, wrapped in an Optional tuple; see
 /// `pith_map_get_cstr_opt`.
 ///
 /// # Safety
@@ -1493,7 +1496,7 @@ pub unsafe extern "C" fn pith_map_get_bkey_opt_pair(map_handle: i64, key: i64) -
     optional_pair(map_get_bkey(map_handle, key))
 }
 
-/// Get a value by bytes key, exiting with a diagnostic on a miss — the
+/// Get a value by bytes key, exiting with a diagnostic on a miss: the
 /// strict path for `m[k]`, see `pith_map_get_cstr_strict`.
 ///
 /// # Safety
@@ -1562,7 +1565,7 @@ pub unsafe extern "C" fn pith_map_remove_bkey(map_handle: i64, key: i64) {
 }
 
 /// Return all bytes keys as a bytes-tagged list of fresh bytes objects the
-/// list owns — the counterpart to `pith_map_keys_cstr`.
+/// list owns. The counterpart to `pith_map_keys_cstr`.
 ///
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
@@ -1598,7 +1601,7 @@ pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: 
 }
 
 /// Insert a value the caller owns under an integer key. The map takes the
-/// caller's count instead of adding one of its own — see
+/// caller's count instead of adding one of its own; see
 /// `pith_map_insert_cstr_owned`.
 ///
 /// # Safety
@@ -1608,7 +1611,7 @@ pub unsafe extern "C" fn pith_map_insert_ikey_owned(map_handle: i64, key: i64, v
     insert_ikey_inner(map_handle, key, value, true);
 }
 
-/// Int-keyed borrowed store of a named heap kind — see
+/// Int-keyed borrowed store of a named heap kind; see
 /// `pith_map_insert_cstr_kind`.
 ///
 /// # Safety
@@ -1627,7 +1630,7 @@ pub unsafe extern "C" fn pith_map_insert_ikey_kind(
     insert_ikey_inner(map_handle, key, value, false);
 }
 
-/// Int-keyed owned store of a named heap kind — see
+/// Int-keyed owned store of a named heap kind; see
 /// `pith_map_insert_cstr_owned_kind`.
 ///
 /// # Safety

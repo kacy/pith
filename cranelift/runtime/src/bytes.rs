@@ -33,9 +33,9 @@ pub(crate) struct PithByteBuffer {
 }
 
 /// Fast validity checks: one memory read against a magic word instead of a
-/// global registry lock per access. Bytes and buffers are currently never
-/// freed, so there is no scrub-on-free here yet; the field exists so stale
-/// or wild handles fail the compare instead of being dereferenced blindly.
+/// global registry lock per access. The free paths scrub the magic, so a
+/// stale or wild handle fails the compare instead of being dereferenced
+/// blindly.
 pub(crate) unsafe fn pith_bytes_ref<'a>(handle: i64) -> Option<&'a PithBytes> {
     let ptr = handle as *const ();
     if !crate::handle_registry::plausibly_aligned::<PithBytes>(ptr)
@@ -135,7 +135,7 @@ pub unsafe extern "C" fn pith_bytes_to_string_utf8(handle: i64) -> *mut i8 {
 /// Slice a byte range and decode it as UTF-8 in one step, returning a
 /// pith C-string (null on invalid UTF-8). This avoids the intermediate
 /// Bytes handle that `slice` then `to_string_utf8` would allocate and
-/// register — a real cost in tight scanning loops (json, csv).
+/// register, a real cost in tight scanning loops (json, csv).
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_substring_utf8(handle: i64, start: i64, end: i64) -> *mut i8 {
     let Some(bytes) = pith_bytes_ref(handle) else {
@@ -438,7 +438,7 @@ pub unsafe extern "C" fn pith_byte_buffer_write_byte(handle: i64, value: i64) ->
     1
 }
 
-/// Append `len` bytes copied from `src` within this same buffer — the
+/// Append `len` bytes copied from `src` within this same buffer: the
 /// back-reference every LZ-family decoder needs. The copy runs forward one
 /// byte at a time on purpose: when the source range overlaps the
 /// destination (offset < len), that repetition IS the encoding, which is
@@ -459,7 +459,7 @@ pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len
     // a non-overlapping range is a straight extend. an overlapping range
     // means the output repeats with period (len - src): each chunk copied
     // from src is a whole number of periods, so the region already written
-    // feeds the next chunk and the chunk size doubles — a byte-long run
+    // feeds the next chunk and the chunk size doubles. a byte-long run
     // costs a logarithmic number of memcpys instead of a byte loop.
     if src + len <= buffer.data.len() {
         buffer.data.extend_from_within(src..src + len);
@@ -475,10 +475,10 @@ pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len
     1
 }
 
-/// Read `count` bytes at `off` as one little-endian integer — the mirror
+/// Read `count` bytes at `off` as one little-endian integer, the mirror
 /// of `write_word`. A word-at-a-time consumer (the xxhash kernel, the
 /// bitstream refill) pays one call here instead of a byte loop. Returns 0
-/// on a bad handle, a count outside 1..=8, or a range outside the bytes —
+/// on a bad handle, a count outside 1..=8, or a range outside the bytes;
 /// callers needing the zero-past-the-end tolerance check bounds first.
 ///
 /// # Safety
@@ -504,7 +504,7 @@ pub unsafe extern "C" fn pith_bytes_read_word(handle: i64, off: i64, count: i64)
     u64::from_le_bytes(le) as i64
 }
 
-/// Append `len` bytes of `src` starting at `start` — a slice-then-write
+/// Append `len` bytes of `src` starting at `start`: a slice-then-write
 /// with the intermediate bytes allocation removed. The LZ execute loop
 /// appends one literal run per sequence; allocating a Bytes object per run
 /// just to feed `write` was a measurable share of decode. Returns 1, or 0
@@ -666,7 +666,7 @@ mod tests {
     #[test]
     fn constant_time_eq_fails_closed_on_invalid_handles() {
         unsafe {
-            // this gates every mac/tag/password compare — an invalid handle
+            // this gates every mac/tag/password compare: an invalid handle
             // must NOT read as equal. two invalid handles used to both degrade
             // to empty slices and compare equal.
             assert_eq!(pith_crypto_constant_time_eq(12345, 67890), 0);
@@ -748,7 +748,7 @@ mod tests {
     }
 
     // an inverted or negative range yields nothing. this used to swap the two
-    // ends, so slice(1, -5) on b"abc" came back as b"a" — a caller walking a
+    // ends, so slice(1, -5) on b"abc" came back as b"a", and a caller walking a
     // buffer got bytes it never asked for instead of an empty result.
     #[test]
     fn inverted_byte_ranges_are_empty() {

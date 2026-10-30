@@ -1,11 +1,12 @@
-//! List[T] - ordered collection with ARC
+//! List[T]: an ordered, reference-counted collection.
 //!
-//! Hybrid approach: Uses idiomatic Rust Vec internally for all operations,
-//! but presents FFI-compatible interface matching the C runtime.
+//! The storage is a Rust `Vec` behind a `#[repr(C)]` header whose field
+//! offsets the codegen reads directly for its inlined fast paths.
 
 use crate::handle_registry::{self, HandleKind};
 use crate::ffi_util::ResultPair;
 use crate::runtime_core::{optional_from, optional_pair, optional_tuple};
+
 /// FFI-compatible list handle
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -14,11 +15,12 @@ pub struct PithList {
     pub ptr: *mut (),
 }
 
-/// Internal list implementation using idiomatic Rust
+/// The list behind a handle.
 ///
-/// Stores elements as `Vec<Arc<[u8]>>` where each element is a byte slice.
-/// For primitive types (Int, Float), we store the raw bytes.
-/// For heap types (String, List, Map), we store references.
+/// Eight-byte elements (ints, floats, bools and every heap handle) live
+/// packed in `values8`; any other element size keeps one byte vector per
+/// element in `elements`. Heap elements are stored as handles, and
+/// `type_tag` says which retain/release pair they take.
 #[repr(C)]
 pub struct ListImpl {
     /// Magic number to identify ListImpl pointers (0x464F5247 = "FORG")
@@ -44,6 +46,7 @@ pub struct ListImpl {
     /// Cached length for 8-byte storage.
     pub values8_len: usize,
     /// Bit 0: this list sits in the cycle collector's suspect buffer.
+    /// Bit 7: shared (`share::CONTAINER_SHARED_FLAG`).
     /// Appended at the end so the `offset_of!` constants the codegen imports
     /// keep describing the same layout.
     pub(crate) cycle_flags: std::sync::atomic::AtomicU8,
@@ -109,8 +112,8 @@ impl ListImpl {
     ///
     /// A list normally picks its flavor at construction from the checked
     /// element type, and that is right nearly everywhere. It is not right
-    /// when the checker had no type to give — an empty literal in a position
-    /// that supplies none — and the store is the one place the kind is known
+    /// when the checker had no type to give (an empty literal in a position
+    /// that supplies none), and the store is the one place the kind is known
     /// for certain. Adoption is gated on the list being empty, which is what
     /// makes it count-neutral: there are no already-stored elements whose
     /// counts a new tag would start releasing. It is gated on 8-byte storage
@@ -119,7 +122,7 @@ impl ListImpl {
     /// A list that already owns some *other* heap kind does not adopt, even
     /// when empty. That would be the constructor and the store disagreeing
     /// about the element type, and there is no way to tell which of them is
-    /// right — retagging would make every later store of the original kind
+    /// right: retagging would make every later store of the original kind
     /// retain and release as the wrong one. Refusing leaves the caller on the
     /// fallback, which is a leak.
     fn adopt_element_tag(&mut self, tag: ListTypeTag) -> bool {
@@ -644,7 +647,7 @@ pub unsafe extern "C" fn pith_list_push_value(list: PithList, value: i64) {
     push_value_inner(list, value, false);
 }
 
-/// Push a value the caller owns and is about to stop tracking — a freshly
+/// Push a value the caller owns and is about to stop tracking: a freshly
 /// built string, a collection literal, a transferred call result. The list
 /// keeps the count the caller was holding instead of adding a second one,
 /// which is what leaves a directly stored temporary with exactly one owner.
@@ -727,7 +730,7 @@ pub unsafe extern "C" fn pith_list_set_value_kind(
 /// The counts a borrowed value needs before it is stored under `elem_tag`.
 ///
 /// The list takes its own count exactly as the plain store does. When it
-/// cannot own the kind — a non-empty list built for something else — the
+/// cannot own the kind (a non-empty list built for something else), the
 /// count the emitter used to add at the call site is added here instead, so
 /// the element still outlives the caller's local. That fallback is the leak
 /// this change removes everywhere else, and never a freed value.
@@ -761,7 +764,7 @@ pub unsafe extern "C" fn pith_list_insert_value(list: PithList, index: i64, valu
 
 /// Insert a value the caller owns and is about to stop tracking. The list
 /// keeps the count the caller was holding instead of adding a second one,
-/// the same transfer `pith_list_push_value_owned` performs — and, like it,
+/// the same transfer `pith_list_push_value_owned` performs, and, like it,
 /// takes nothing when the list is untagged, so the caller's count stays
 /// outstanding rather than leaving the list pointing at a freed element.
 #[no_mangle]
@@ -958,7 +961,7 @@ pub unsafe extern "C" fn pith_list_pop(list: *mut PithList, elem_size: i64, out:
 }
 
 /// Get element at index wrapped in an Optional tuple. Returns `Some(value)`
-/// when `0 <= index < len`, and `None` otherwise — so callers can
+/// when `0 <= index < len`, and `None` otherwise, so callers can
 /// distinguish an out-of-bounds miss from a legitimately stored `0`.
 ///
 /// # Safety
@@ -1040,8 +1043,8 @@ pub unsafe extern "C" fn pith_list_last_opt_pair(list: PithList) -> ResultPair {
 /// * `list` must be a valid `PithList` handle or all-zero.
 // The three ways `list[i]` can fail, each behind a `#[cold]` call that never
 // returns. Formatting a diagnostic needs stack for the format arguments, and
-// leaving that inline made every successful index — the overwhelming majority,
-// hundreds of millions per compiler run — build a stack frame for a message it
+// leaving that inline made every successful index (the overwhelming majority,
+// hundreds of millions per compiler run) build a stack frame for a message it
 // was never going to print.
 #[cold]
 #[inline(never)]
@@ -1272,7 +1275,9 @@ pub unsafe extern "C" fn pith_list_remove(list: *mut PithList, index: i64, elem_
     true
 }
 
-/// Remove element at index (by-value variant — works with internal pointer)
+/// Remove the element at `index`, with the list handle passed by value
+/// rather than through a pointer to it. Returns 1 when an element was
+/// removed and 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i64 {
     let Some(impl_ref) = list_mut(list) else {
@@ -1303,7 +1308,7 @@ pub unsafe extern "C" fn pith_list_clear_value(list: PithList) {
     impl_ref.clear();
 }
 
-/// Reverse list in-place (by-value variant — works with internal pointer)
+/// Reverse the list in place, with the handle passed by value.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_reverse_value(list: PithList) {
     let Some(impl_ref) = list_mut(list) else {
@@ -1465,7 +1470,7 @@ pub(crate) unsafe fn cycle_list_strong_count(handle: i64) -> Option<u32> {
         .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Add `delta` to the reference count — the collector's teardown guard.
+/// Add `delta` to the reference count: the collector's teardown guard.
 pub(crate) unsafe fn cycle_list_guard_strong(handle: i64, delta: u32) {
     if let Some(impl_ref) = list_ref_from_handle(handle) {
         impl_ref
@@ -1526,7 +1531,7 @@ pub(crate) unsafe fn cycle_list_free_dead(handle: i64) {
 }
 
 /// Drop a list shell the graveyard parked: elements already released, magic
-/// already scrubbed, registry entry already gone — only the box remains.
+/// already scrubbed, registry entry already gone; only the box remains.
 pub(crate) unsafe fn cycle_drop_list_shell(ptr: usize) {
     drop(Box::from_raw(ptr as *mut ListImpl));
 }

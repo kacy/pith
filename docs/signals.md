@@ -133,16 +133,18 @@ and several subsystems compose without knowing about each other.
 | `set_drain_deadline(ms)` | the grace period every std server uses |
 | `stream_deadline()` / `stream_deadline_passed()` | the midpoint of the period, where a stream stops being the handler's problem |
 
-`set_drain_deadline` is one knob rather than an argument on each of the nine
-listen entry points, because the right value is a property of the deployment —
-it has to fit inside the orchestrator's own grace period — not of one listener.
+`set_drain_deadline` is one knob rather than an argument on each of the
+fourteen listen entry points, because the right value is a property of the
+deployment — it has to fit inside the orchestrator's own grace period — not of
+one listener.
 it defaults to 15 seconds, comfortably inside kubernetes' 30.
 
 ## which servers drain
 
 all of them, and through the same coordinator:
 
-- `std.web` — `listen` and `listen_tls`.
+- `std.web` — `listen`, `listen_tls`, and `listen_h2c` (which runs on the
+  http/2 accept loop below).
 - `std.net.http2.server` — `listen_h2c`, `listen_h2_tls`, and both streaming
   twins.
 - `std.net.grpc` — `serve`, `serve_tls`, `serve_body`, `serve_body_tls`,

@@ -36,14 +36,6 @@ fn declare_i64_var(builder: &mut FunctionBuilder<'_>) -> Variable {
     builder.declare_var(types::I64)
 }
 
-#[cfg(pith_cranelift_new_api)]
-fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Value) {
-    builder.ins().jump(
-        block,
-        &[cranelift::codegen::ir::instructions::BlockArg::Value(value)],
-    );
-}
-
 #[cfg(not(pith_cranelift_new_api))]
 fn declare_i64_var(builder: &mut FunctionBuilder<'_>, next_var_id: &mut u32) -> Variable {
     let var = Variable::new((*next_var_id) as usize);
@@ -52,9 +44,109 @@ fn declare_i64_var(builder: &mut FunctionBuilder<'_>, next_var_id: &mut u32) -> 
     var
 }
 
+/// Block arguments in the form this Cranelift version's branch builders
+/// take: `BlockArg`s from 0.130 on, plain values before.
+#[cfg(pith_cranelift_new_api)]
+fn block_args<const N: usize>(
+    values: [Value; N],
+) -> [cranelift::codegen::ir::instructions::BlockArg; N] {
+    values.map(cranelift::codegen::ir::instructions::BlockArg::Value)
+}
+
 #[cfg(not(pith_cranelift_new_api))]
+fn block_args<const N: usize>(values: [Value; N]) -> [Value; N] {
+    values
+}
+
 fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Value) {
-    builder.ins().jump(block, &[value]);
+    builder.ins().jump(block, &block_args([value]));
+}
+
+fn jump_with_two_i64_args(builder: &mut FunctionBuilder<'_>, block: Block, a: Value, b: Value) {
+    builder.ins().jump(block, &block_args([a, b]));
+}
+
+/// `brif` that carries `a` and `b` to `taken` and nothing to `fallthrough`.
+/// The strict-index fast paths route every failed check to one slow block,
+/// marked cold, that receives the handle and index as block parameters: the
+/// runtime call's operands are then the slow block's own values, the moves
+/// that feed them sit in the cold edge blocks, and the fast path is laid out
+/// as one fall-through sequence.
+fn brif_with_two_i64_args(
+    builder: &mut FunctionBuilder<'_>,
+    cond: Value,
+    taken: Block,
+    a: Value,
+    b: Value,
+    fallthrough: Block,
+) {
+    builder
+        .ins()
+        .brif(cond, taken, &block_args([a, b]), fallthrough, &[]);
+}
+
+/// Leave for `exit` with `args` when `cond` is set, and otherwise go on in
+/// a fresh block, where the builder is left. The exit goes through an edge
+/// block of its own, created before the fresh one.
+fn exit_if<const N: usize>(
+    builder: &mut FunctionBuilder<'_>,
+    cond: Value,
+    exit: Block,
+    args: [Value; N],
+) {
+    let edge = builder.create_block();
+    let next = builder.create_block();
+    builder.ins().brif(cond, edge, &[], next, &[]);
+    builder.switch_to_block(edge);
+    builder.ins().jump(exit, &block_args(args));
+    builder.switch_to_block(next);
+}
+
+/// `exit_if` for a condition that is set when the path may go on.
+fn exit_unless<const N: usize>(
+    builder: &mut FunctionBuilder<'_>,
+    cond: Value,
+    exit: Block,
+    args: [Value; N],
+) {
+    let edge = builder.create_block();
+    let next = builder.create_block();
+    builder.ins().brif(cond, next, &[], edge, &[]);
+    builder.switch_to_block(edge);
+    builder.ins().jump(exit, &block_args(args));
+    builder.switch_to_block(next);
+}
+
+/// The slow side of a fast path: fill `slow` with a call to `fallback` on
+/// `args` that joins `done` with its result, and leave the builder in
+/// `done` on the merged value.
+fn join_with_fallback_call(
+    builder: &mut FunctionBuilder<'_>,
+    slow: Block,
+    done: Block,
+    fallback: FuncRef,
+    args: &[Value],
+) -> Value {
+    builder.switch_to_block(slow);
+    let call = builder.ins().call(fallback, args);
+    let fallback_result = builder.func.dfg.first_result(call);
+    jump_with_i64_arg(builder, done, fallback_result);
+
+    builder.switch_to_block(done);
+    builder.block_params(done)[0]
+}
+
+/// The blocks a strict fast path joins on: `done`, which takes the result,
+/// and `slow`, which is cold and takes the handle and index every failed
+/// check passes it (see `brif_with_two_i64_args`).
+fn strict_path_blocks(builder: &mut FunctionBuilder<'_>) -> (Block, Block) {
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I64);
+    let slow = builder.create_block();
+    builder.append_block_param(slow, types::I64);
+    builder.append_block_param(slow, types::I64);
+    builder.set_cold_block(slow);
+    (done, slow)
 }
 
 /// Runtime releases that return at once for a zero handle and return
@@ -81,24 +173,10 @@ fn inline_list_get_value(
     builder.append_block_param(done, types::I64);
 
     let list_is_null = builder.ins().icmp_imm(IntCC::Equal, list, 0);
-    let null_block = builder.create_block();
-    let after_null = builder.create_block();
-    builder
-        .ins()
-        .brif(list_is_null, null_block, &[], after_null, &[]);
-    builder.switch_to_block(null_block);
-    jump_with_i64_arg(builder, done, zero);
-    builder.switch_to_block(after_null);
+    exit_if(builder, list_is_null, done, [zero]);
 
     let index_is_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
-    let neg_block = builder.create_block();
-    let after_neg = builder.create_block();
-    builder
-        .ins()
-        .brif(index_is_negative, neg_block, &[], after_neg, &[]);
-    builder.switch_to_block(neg_block);
-    jump_with_i64_arg(builder, done, zero);
-    builder.switch_to_block(after_neg);
+    exit_if(builder, index_is_negative, done, [zero]);
 
     let elem_size = builder.ins().load(
         types::I64,
@@ -107,14 +185,7 @@ fn inline_list_get_value(
         LIST_IMPL_ELEM_SIZE_OFFSET,
     );
     let is_eight = builder.ins().icmp_imm(IntCC::Equal, elem_size, 8);
-    let size_fail = builder.create_block();
-    let after_size = builder.create_block();
-    builder
-        .ins()
-        .brif(is_eight, after_size, &[], size_fail, &[]);
-    builder.switch_to_block(size_fail);
-    jump_with_i64_arg(builder, done, zero);
-    builder.switch_to_block(after_size);
+    exit_unless(builder, is_eight, done, [zero]);
 
     if checked {
         let len = builder.ins().load(
@@ -126,14 +197,7 @@ fn inline_list_get_value(
         let out_of_bounds = builder
             .ins()
             .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
-        let bounds_fail = builder.create_block();
-        let after_bounds = builder.create_block();
-        builder
-            .ins()
-            .brif(out_of_bounds, bounds_fail, &[], after_bounds, &[]);
-        builder.switch_to_block(bounds_fail);
-        jump_with_i64_arg(builder, done, zero);
-        builder.switch_to_block(after_bounds);
+        exit_if(builder, out_of_bounds, done, [zero]);
     }
 
     let data_ptr = builder.ins().load(
@@ -143,14 +207,7 @@ fn inline_list_get_value(
         LIST_IMPL_VALUES8_PTR_OFFSET,
     );
     let data_is_null = builder.ins().icmp_imm(IntCC::Equal, data_ptr, 0);
-    let ptr_fail = builder.create_block();
-    let load_block = builder.create_block();
-    builder
-        .ins()
-        .brif(data_is_null, ptr_fail, &[], load_block, &[]);
-    builder.switch_to_block(ptr_fail);
-    jump_with_i64_arg(builder, done, zero);
-    builder.switch_to_block(load_block);
+    exit_if(builder, data_is_null, done, [zero]);
 
     let byte_offset = builder.ins().ishl_imm(index, 3);
     let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
@@ -161,22 +218,6 @@ fn inline_list_get_value(
 
     builder.switch_to_block(done);
     builder.block_params(done)[0]
-}
-
-#[cfg(pith_cranelift_new_api)]
-fn jump_with_two_i64_args(builder: &mut FunctionBuilder<'_>, block: Block, a: Value, b: Value) {
-    builder.ins().jump(
-        block,
-        &[
-            cranelift::codegen::ir::instructions::BlockArg::Value(a),
-            cranelift::codegen::ir::instructions::BlockArg::Value(b),
-        ],
-    );
-}
-
-#[cfg(not(pith_cranelift_new_api))]
-fn jump_with_two_i64_args(builder: &mut FunctionBuilder<'_>, block: Block, a: Value, b: Value) {
-    builder.ins().jump(block, &[a, b]);
 }
 
 // `xs[i]` lowers to a call to pith_list_get_opt, which heap-allocates a
@@ -199,14 +240,7 @@ fn inline_list_get_opt(
     builder.append_block_param(done, types::I64); // value
 
     let list_is_null = builder.ins().icmp_imm(IntCC::Equal, list, 0);
-    let null_block = builder.create_block();
-    let after_null = builder.create_block();
-    builder
-        .ins()
-        .brif(list_is_null, null_block, &[], after_null, &[]);
-    builder.switch_to_block(null_block);
-    jump_with_two_i64_args(builder, done, zero, zero);
-    builder.switch_to_block(after_null);
+    exit_if(builder, list_is_null, done, [zero, zero]);
 
     // the magic word is scrubbed when a list is freed, so this rejects stale
     // handles the same way list_ref does in the runtime.
@@ -214,14 +248,7 @@ fn inline_list_get_opt(
     let magic_bad = builder
         .ins()
         .icmp_imm(IntCC::NotEqual, magic, LIST_MAGIC as i64);
-    let magic_fail = builder.create_block();
-    let after_magic = builder.create_block();
-    builder
-        .ins()
-        .brif(magic_bad, magic_fail, &[], after_magic, &[]);
-    builder.switch_to_block(magic_fail);
-    jump_with_two_i64_args(builder, done, zero, zero);
-    builder.switch_to_block(after_magic);
+    exit_if(builder, magic_bad, done, [zero, zero]);
 
     let elem_size = builder.ins().load(
         types::I64,
@@ -230,14 +257,7 @@ fn inline_list_get_opt(
         LIST_IMPL_ELEM_SIZE_OFFSET,
     );
     let is_eight = builder.ins().icmp_imm(IntCC::Equal, elem_size, 8);
-    let size_fail = builder.create_block();
-    let after_size = builder.create_block();
-    builder
-        .ins()
-        .brif(is_eight, after_size, &[], size_fail, &[]);
-    builder.switch_to_block(size_fail);
-    jump_with_two_i64_args(builder, done, zero, zero);
-    builder.switch_to_block(after_size);
+    exit_unless(builder, is_eight, done, [zero, zero]);
 
     // one unsigned compare covers both `index < 0` and `index >= len`.
     let len = builder.ins().load(
@@ -249,14 +269,7 @@ fn inline_list_get_opt(
     let out_of_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
-    let bounds_fail = builder.create_block();
-    let after_bounds = builder.create_block();
-    builder
-        .ins()
-        .brif(out_of_bounds, bounds_fail, &[], after_bounds, &[]);
-    builder.switch_to_block(bounds_fail);
-    jump_with_two_i64_args(builder, done, zero, zero);
-    builder.switch_to_block(after_bounds);
+    exit_if(builder, out_of_bounds, done, [zero, zero]);
 
     let data_ptr = builder.ins().load(
         types::I64,
@@ -265,14 +278,7 @@ fn inline_list_get_opt(
         LIST_IMPL_VALUES8_PTR_OFFSET,
     );
     let data_is_null = builder.ins().icmp_imm(IntCC::Equal, data_ptr, 0);
-    let ptr_fail = builder.create_block();
-    let load_block = builder.create_block();
-    builder
-        .ins()
-        .brif(data_is_null, ptr_fail, &[], load_block, &[]);
-    builder.switch_to_block(ptr_fail);
-    jump_with_two_i64_args(builder, done, zero, zero);
-    builder.switch_to_block(load_block);
+    exit_if(builder, data_is_null, done, [zero, zero]);
 
     let byte_offset = builder.ins().ishl_imm(index, 3);
     let elem_addr = builder.ins().iadd(data_ptr, byte_offset);
@@ -618,38 +624,17 @@ fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Valu
     builder.append_block_param(done, types::I64);
 
     let bytes_is_null = builder.ins().icmp_imm(IntCC::Equal, bytes, 0);
-    let null_block = builder.create_block();
-    let after_null = builder.create_block();
-    builder
-        .ins()
-        .brif(bytes_is_null, null_block, &[], after_null, &[]);
-    builder.switch_to_block(null_block);
-    jump_with_i64_arg(builder, done, zero);
-    builder.switch_to_block(after_null);
+    exit_if(builder, bytes_is_null, done, [zero]);
 
     let index_is_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
-    let neg_block = builder.create_block();
-    let after_neg = builder.create_block();
-    builder
-        .ins()
-        .brif(index_is_negative, neg_block, &[], after_neg, &[]);
-    builder.switch_to_block(neg_block);
-    jump_with_i64_arg(builder, done, zero);
-    builder.switch_to_block(after_neg);
+    exit_if(builder, index_is_negative, done, [zero]);
 
     let data_ptr = builder.ins().load(types::I64, MemFlags::new(), bytes, 0);
     let len = builder.ins().load(types::I64, MemFlags::new(), bytes, 8);
     let out_of_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
-    let bounds_fail = builder.create_block();
-    let after_bounds = builder.create_block();
-    builder
-        .ins()
-        .brif(out_of_bounds, bounds_fail, &[], after_bounds, &[]);
-    builder.switch_to_block(bounds_fail);
-    jump_with_i64_arg(builder, done, zero);
-    builder.switch_to_block(after_bounds);
+    exit_if(builder, out_of_bounds, done, [zero]);
 
     let elem_addr = builder.ins().iadd(data_ptr, index);
     let byte = builder.ins().load(types::I8, MemFlags::new(), elem_addr, 0);
@@ -658,45 +643,6 @@ fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Valu
 
     builder.switch_to_block(done);
     builder.block_params(done)[0]
-}
-
-/// `brif` that carries `a` and `b` to `taken` and nothing to `fallthrough`.
-/// The strict-index fast paths route every failed check to one slow block,
-/// marked cold, that receives the handle and index as block parameters: the
-/// runtime call's operands are then the slow block's own values, the moves
-/// that feed them sit in the cold edge blocks, and the fast path is laid out
-/// as one fall-through sequence.
-#[cfg(pith_cranelift_new_api)]
-fn brif_with_two_i64_args(
-    builder: &mut FunctionBuilder<'_>,
-    cond: Value,
-    taken: Block,
-    a: Value,
-    b: Value,
-    fallthrough: Block,
-) {
-    builder.ins().brif(
-        cond,
-        taken,
-        &[
-            cranelift::codegen::ir::instructions::BlockArg::Value(a),
-            cranelift::codegen::ir::instructions::BlockArg::Value(b),
-        ],
-        fallthrough,
-        &[],
-    );
-}
-
-#[cfg(not(pith_cranelift_new_api))]
-fn brif_with_two_i64_args(
-    builder: &mut FunctionBuilder<'_>,
-    cond: Value,
-    taken: Block,
-    a: Value,
-    b: Value,
-    fallthrough: Block,
-) {
-    builder.ins().brif(cond, taken, &[a, b], fallthrough, &[]);
 }
 
 /// Whether `handle` is non-null and `align`-aligned, in one compare:
@@ -757,15 +703,9 @@ fn finish_strict_fast_path(
     done: Block,
     fallback: FuncRef,
 ) -> Value {
-    builder.switch_to_block(slow);
     let params = builder.block_params(slow);
     let (handle, index) = (params[0], params[1]);
-    let call = builder.ins().call(fallback, &[handle, index]);
-    let fallback_result = builder.func.dfg.inst_results(call)[0];
-    jump_with_i64_arg(builder, done, fallback_result);
-
-    builder.switch_to_block(done);
-    builder.block_params(done)[0]
+    join_with_fallback_call(builder, slow, done, fallback, &[handle, index])
 }
 
 /// Inline `bytes[i]`, the strict form that aborts instead of answering
@@ -784,12 +724,7 @@ fn inline_bytes_get_strict(
     index: Value,
     fallback: FuncRef,
 ) -> Value {
-    let done = builder.create_block();
-    builder.append_block_param(done, types::I64);
-    let slow = builder.create_block();
-    builder.append_block_param(slow, types::I64);
-    builder.append_block_param(slow, types::I64);
-    builder.set_cold_block(slow);
+    let (done, slow) = strict_path_blocks(builder);
 
     branch_if_not_magic_handle(
         builder,
@@ -834,10 +769,10 @@ fn inline_bytes_get_strict(
 /// runtime function, which produces the diagnostic. The checks are the
 /// handle test `list_ref` performs (non-null, aligned, magic intact; the
 /// magic is scrubbed when a list is freed, so a stale handle fails here),
-/// the element size the runtime insists on, and one unsigned compare
-/// against the 8-byte storage length for both `i < 0` and `i >= len`. A
-/// list whose elements are not 8 bytes wide keeps that length at zero, so
-/// the size check is also what keeps the compare honest for it. The data
+/// read without a branch by `list_header`, and one unsigned compare against
+/// the 8-byte storage length for both `i < 0` and `i >= len`. A list whose
+/// elements are not 8 bytes wide keeps that length at zero, so the same
+/// compare turns it away without a separate element-size check. The data
 /// pointer needs no null test: a non-empty 8-byte list always has one.
 fn inline_list_get_value_strict(
     builder: &mut FunctionBuilder<'_>,
@@ -849,12 +784,7 @@ fn inline_list_get_value_strict(
     let (live, base) = list_header(builder, list, anchor);
     let (in_bounds, data_ptr) = list_index_in_bounds(builder, live, base, index);
 
-    let done = builder.create_block();
-    builder.append_block_param(done, types::I64);
-    let slow = builder.create_block();
-    builder.append_block_param(slow, types::I64);
-    builder.append_block_param(slow, types::I64);
-    builder.set_cold_block(slow);
+    let (done, slow) = strict_path_blocks(builder);
     let out_of_bounds = builder.ins().icmp_imm(IntCC::Equal, in_bounds, 0);
     let read = builder.create_block();
     brif_with_two_i64_args(builder, out_of_bounds, slow, list, index, read);
@@ -904,13 +834,7 @@ fn inline_list_len(
     builder.switch_to_block(fast);
     jump_with_i64_arg(builder, done, len);
 
-    builder.switch_to_block(slow);
-    let call = builder.ins().call(fallback, &[list]);
-    let fallback_result = builder.func.dfg.inst_results(call)[0];
-    jump_with_i64_arg(builder, done, fallback_result);
-
-    builder.switch_to_block(done);
-    builder.block_params(done)[0]
+    join_with_fallback_call(builder, slow, done, fallback, &[list])
 }
 
 /// Inline `b.len()` (`pith_bytes_len`) as the same handle test the getters
@@ -927,12 +851,7 @@ fn inline_handle_len(
     len_offset: i32,
     fallback: FuncRef,
 ) -> Value {
-    let done = builder.create_block();
-    builder.append_block_param(done, types::I64);
-    let slow = builder.create_block();
-    builder.append_block_param(slow, types::I64);
-    builder.append_block_param(slow, types::I64);
-    builder.set_cold_block(slow);
+    let (done, slow) = strict_path_blocks(builder);
 
     // the handle test passes two values to `slow`; a length has no index,
     // so the handle fills both slots
@@ -942,14 +861,8 @@ fn inline_handle_len(
         .load(types::I64, MemFlags::new(), handle, len_offset);
     jump_with_i64_arg(builder, done, len);
 
-    builder.switch_to_block(slow);
-    let arg = builder.block_params(slow)[0];
-    let call = builder.ins().call(fallback, &[arg]);
-    let fallback_result = builder.func.dfg.inst_results(call)[0];
-    jump_with_i64_arg(builder, done, fallback_result);
-
-    builder.switch_to_block(done);
-    builder.block_params(done)[0]
+    let handle = builder.block_params(slow)[0];
+    join_with_fallback_call(builder, slow, done, fallback, &[handle])
 }
 
 /// Inline a closure body's read of one of its captures
@@ -964,12 +877,7 @@ fn inline_closure_get_env(
     slot: Value,
     fallback: FuncRef,
 ) -> Value {
-    let done = builder.create_block();
-    builder.append_block_param(done, types::I64);
-    let slow = builder.create_block();
-    builder.append_block_param(slow, types::I64);
-    builder.append_block_param(slow, types::I64);
-    builder.set_cold_block(slow);
+    let (done, slow) = strict_path_blocks(builder);
 
     branch_if_not_magic_handle(
         builder,
@@ -1015,12 +923,7 @@ fn closure_fn_ptr(
         return closure;
     };
     let fallback = cached_func_ref(codegen, builder, func_ref_cache, fid);
-    let done = builder.create_block();
-    builder.append_block_param(done, types::I64);
-    let slow = builder.create_block();
-    builder.append_block_param(slow, types::I64);
-    builder.append_block_param(slow, types::I64);
-    builder.set_cold_block(slow);
+    let (done, slow) = strict_path_blocks(builder);
 
     let zero = builder.ins().iconst(types::I64, 0);
     branch_if_not_magic_handle(
@@ -1037,14 +940,8 @@ fn closure_fn_ptr(
         .load(types::I64, MemFlags::new(), closure, CLOSURE_FUNC_PTR_OFFSET);
     jump_with_i64_arg(builder, done, fn_ptr);
 
-    builder.switch_to_block(slow);
     let handle = builder.block_params(slow)[0];
-    let call = builder.ins().call(fallback, &[handle]);
-    let answer = builder.func.dfg.first_result(call);
-    jump_with_i64_arg(builder, done, answer);
-
-    builder.switch_to_block(done);
-    builder.block_params(done)[0]
+    join_with_fallback_call(builder, slow, done, fallback, &[handle])
 }
 
 /// Call the closure `closure` with `args`: its function takes the closure
@@ -1185,13 +1082,7 @@ fn inline_bytes_read_word(
     let value = builder.ins().band(word, mask);
     jump_with_i64_arg(builder, done, value);
 
-    builder.switch_to_block(slow);
-    let call = builder.ins().call(fallback, &[bytes, off, count]);
-    let fallback_result = builder.func.dfg.inst_results(call)[0];
-    jump_with_i64_arg(builder, done, fallback_result);
-
-    builder.switch_to_block(done);
-    builder.block_params(done)[0]
+    join_with_fallback_call(builder, slow, done, fallback, &[bytes, off, count])
 }
 
 // The magic word every heap cstring carries at `ptr - 16`, and the one a
@@ -1278,13 +1169,7 @@ fn inline_cstring_byte_at(
     let value = builder.ins().uextend(types::I64, byte);
     jump_with_i64_arg(builder, done, value);
 
-    builder.switch_to_block(slow);
-    let call = builder.ins().call(fallback, &[s, index]);
-    let fallback_result = builder.func.dfg.inst_results(call)[0];
-    jump_with_i64_arg(builder, done, fallback_result);
-
-    builder.switch_to_block(done);
-    builder.block_params(done)[0]
+    join_with_fallback_call(builder, slow, done, fallback, &[s, index])
 }
 
 /// Inline `s.len()` (string_len) for strings with a length header: one header
@@ -1305,13 +1190,7 @@ fn inline_cstring_len(
     builder.switch_to_block(fast);
     jump_with_i64_arg(builder, done, len);
 
-    builder.switch_to_block(slow);
-    let call = builder.ins().call(fallback, &[s]);
-    let fallback_result = builder.func.dfg.inst_results(call)[0];
-    jump_with_i64_arg(builder, done, fallback_result);
-
-    builder.switch_to_block(done);
-    builder.block_params(done)[0]
+    join_with_fallback_call(builder, slow, done, fallback, &[s])
 }
 
 /// The reference the function being built calls `fid` through, declared in
@@ -1933,10 +1812,6 @@ pub fn compile_from_ir(
 /// which the call costs about as much as the body.
 const INLINE_MAX_INSTS: usize = 24;
 
-/// Define every built function, first inlining the small functions it calls.
-/// The functions are all built before any is defined so that a caller can
-/// inline a callee that appears later in the IR. `PITH_INLINE=0` turns the
-/// inlining off, which is how to A/B it.
 /// The runtime functions a loop may call and still have its list header
 /// reads hoisted: none of them changes a list's header, frees a list or runs
 /// user code. The getters, length reads and string comparisons only read;
@@ -1958,6 +1833,10 @@ const LOOP_KEEP_CALLS: &[&str] = &[
     "pith_cstring_gte",
 ];
 
+/// Define every built function, first inlining the small functions it calls.
+/// The functions are all built before any is defined so that a caller can
+/// inline a callee that appears later in the IR. `PITH_INLINE=0` turns the
+/// inlining off, which is how to A/B it.
 fn define_with_inlining(
     codegen: &mut CodeGen,
     built: Vec<(FuncId, String, Function)>,

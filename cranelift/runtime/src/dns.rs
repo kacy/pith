@@ -2,22 +2,22 @@
 //!
 //! `getaddrinfo` is synchronous and there is no portable way to poll it, so a
 //! lookup made from a green task holds the *worker* OS thread for its whole
-//! duration — every other task pinned to that worker stalls with it. sockets do
+//! duration, and every other task queued on that worker stalls with it. sockets do
 //! not have this problem (a would-block yields to the epoll reactor in
 //! `netpoll`), which leaves dns as one of the two blocking calls on the common
 //! client path: every grpc, http, and database dial starts with one.
 //!
 //! the fix is the usual one for a syscall that cannot be polled: keep the
 //! blocking call, but make some other thread do it. `blocking` owns that
-//! machinery — the pool, the park, the wake — and this module supplies the
+//! machinery (the pool, the park, the wake), and this module supplies the
 //! resolver pool and the work to run on it.
 //!
 //! dns gets its own pool rather than sharing one with file i/o so a slow
 //! multi-megabyte write cannot queue in front of a dial.
 //!
-//! under the os-thread backend none of this applies — blocking is what a thread
-//! is for, and the pool would only add a handoff — so `blocking::run` calls
-//! `to_socket_addrs` inline there, exactly as the callers used to.
+//! under the os-thread backend none of this applies (blocking is what a thread
+//! is for, and the pool would only add a handoff), so `blocking::run` calls
+//! `to_socket_addrs` inline there.
 
 use crate::blocking::{self, Pool};
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -43,17 +43,16 @@ pub(crate) fn resolve(host: &str, port: i64) -> Answer {
     let target = format!("{}:{}", host, port);
     // a numeric address never reaches a resolver: `to_socket_addrs` parses it
     // in place, with no syscall to block in, so offloading would buy nothing
-    // and cost a thread handoff. dialing a literal ip is common enough — tests,
-    // benchmarks, a sidecar on 127.0.0.1 — to check for first.
+    // and cost a thread handoff. dialing a literal ip is common enough (tests,
+    // benchmarks, a sidecar on 127.0.0.1) to check for first.
     if let Ok(addr) = target.parse::<SocketAddr>() {
         return vec![addr];
     }
     blocking::run(&POOL, move || resolve_inline(&target))
 }
 
-/// the blocking lookup itself, byte-for-byte what the call sites used to do
-/// inline. runs on the calling thread under the os-thread backend and on a pool
-/// thread under green.
+/// the blocking lookup itself. runs on the calling thread under the os-thread
+/// backend and on a pool thread under green.
 fn resolve_inline(target: &str) -> Answer {
     match target.to_socket_addrs() {
         Ok(addrs) => addrs.collect(),
@@ -98,7 +97,7 @@ mod tests {
     #[test]
     fn literal_addresses_skip_the_resolver() {
         // both families, and the answer must match what `to_socket_addrs`
-        // produces for the same string — the fast path is a shortcut, not a
+        // produces for the same string: the fast path is a shortcut, not a
         // second implementation.
         for (host, port) in [("127.0.0.1", 8080), ("[::1]", 443), ("::1", 443)] {
             let target = format!("{}:{}", host, port);

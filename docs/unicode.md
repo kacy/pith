@@ -19,13 +19,9 @@ text.is_valid(input)         # is this really utf-8?
 
 ## substring aborts rather than corrupt a character
 
-`substring` used to clamp its bounds and cut wherever it was told. on
-non-ascii text that produced a string containing half a character — a lead
-byte with its continuation missing — which no longer round-trips through
-utf-8. nothing reported it. the damage showed up later, in a database write
-or a rendered page.
-
-it now aborts:
+a cut inside a character would leave half of it, a lead byte with its
+continuation missing, which no longer round-trips through utf-8. so
+`substring` aborts instead:
 
 ```
 pith runtime error: substring(0, 1) would split the character 'Ä' at byte 1 (it occupies bytes 0..2)
@@ -39,9 +35,8 @@ this follows the strict accessors already in the runtime —
 `pith_list_get_value_strict`, `pith_bytes_get_strict`, and the strict map
 accessors — which all abort with a diagnostic rather than return a quietly
 wrong value. `substring`
-keeps its `String` return type; there is no new error to thread through the
-391-odd call sites, and code that was already cutting on boundaries is
-unaffected.
+keeps its `String` return type, and code that cuts on boundaries never
+reaches the abort.
 
 the check only fires when the cut lands strictly inside a *well-formed*
 multi-byte character. a `String` is a byte string, and code holding binary
@@ -305,10 +300,7 @@ pin — a generator that only parses the UCD files can confirm it read them
 consistently, not that it read them correctly.
 
 the tables are packed into string constants rather than list literals, and
-binary-searched in place. that is not premature cleverness: compiling a
-module-level pith list of N integers is superlinear in N — 500 entries take
-2s, 1000 take 33s, and 3000 do not finish in two minutes — while a 60KB string
-constant compiles in about a second and costs nothing at startup.
+binary-searched in place, so they cost nothing at startup.
 
 | table | records | size |
 | --- | --- | --- |

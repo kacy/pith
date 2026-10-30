@@ -49,7 +49,8 @@ mut count := 0
 while count < 10:
     total = total + 0.1
     count = count + 1
-print("{total}")          # 0.9999999999999999
+print("{total}")          # 1, printed to 15 significant digits
+print("{total == 1.0}")   # false
 ```
 
 the same loop over `Decimal` gives `1.00`, because a decimal fraction is what it

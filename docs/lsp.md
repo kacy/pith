@@ -19,7 +19,9 @@ what `pith check` reports.
   deduplicated by line and code, sorted by position. a document whose
   problems disappear gets one clearing publish.
 - **hover** — the checker's inferred type for the expression at the
-  cursor, as plaintext.
+  cursor, as plaintext. on an identifier the text is `name: Type`,
+  followed by the doc comment of the fn, struct, enum, or interface it
+  resolves to when that declaration has one.
 - **documentSymbol** — a flat list of top-level fn, struct, enum, and
   interface declarations.
 - **formatting** — one whole-document edit produced by the same
@@ -220,13 +222,11 @@ quiet run's absolute figures for scale:
 | self-host/lsp_state.pith       |      23 | 360 ms |      3 ms |  224 ms | 129 ms|
 | self-host/ir_emitter_core.pith |      50 |1300 ms |    137 ms |  299 ms | 864 ms|
 
-what the split says, including two corrections to what this section
-claimed before it existed:
+what the split says:
 
 - the checker's share tracks the size of the *edited file*, not the
   size of the closure. it is 36% of the mid-size run and 66% of the
-  worst-case one, not the 77-88% recorded here before the per-module
-  split existed. what changes between those two rows is the entry
+  worst-case one. what changes between those two rows is the entry
   file: 322 lines against 10,128.
 - for the worst case the largest single line item is checking the
   edited file itself: 560-585 ms of the 864 ms check phase, 43-45% of
@@ -292,45 +292,27 @@ described.
 
 ### memory over a session
 
-the server does not give an analysis's memory back. every run rebuilds
-the node arena and the checker's tables, and for a long time it also
-stranded them: an assignment over a global released nothing, so `xs =
-{}` kept every entry the old table held. twenty edits in the 23-module
-closure took a server to 679 mb that way, and to 1017 mb before
-`reset_arena` was changed to empty the node list in place rather than
-rebind it.
-
-the assignment releases the outgoing value now. the same twenty edits
-peak at 284 mb, measured interleaved against a server built from the
-same tree without that release, which came back at 672 mb. one edit
-costs 57 mb rather than 87, so the slope across the remaining nineteen
-is 12 mb an edit rather than 31. the thirty tables `initialize_checker`
-rebinds and the twenty-one the driver rebinds all reclaim.
-
-what was left per edit was one emitter defect, found by diffing a
-full valgrind leak check after five analyses against one after two: `for ch in s`
-binds a fresh one-byte string every iteration (`char_at` allocates it,
-where a list loop's get borrows the element) and nothing released it.
-the checker walks module paths that way in its name helpers on every
-lookup, and the driver in every path helper, so the closure leaked
-about 60,000 one-byte strings an analysis before the arena or a table
-was counted. the loop owns that string now (see the `for` rule in
-[ownership.md](ownership.md)), and `tests/leaks/leak_string_chars`
-pins every exit a string loop has.
+every run rebuilds the node arena and the checker's tables. assigning
+over a global releases the value it replaces (see
+[ownership.md](ownership.md)), so the thirty tables `initialize_checker`
+rebinds and the twenty-one the driver rebinds are reclaimed each run, and
+`reset_arena` empties the node list in place. a `for` loop over a string
+releases the one-byte string it binds each iteration, which the checker's
+name helpers and the driver's path helpers do on every lookup;
+`tests/leaks/leak_string_chars` pins every exit such a loop has.
 
 resident set after 1, 10 and 50 analyses, one server driven over stdio
 with the same one-line edit repeated, sampled from `/proc` after each
-publish:
+publish, without the closure cache below:
 
-| closure                       | modules | before (1 / 10 / 50)  | after (1 / 10 / 50)  |
-|-------------------------------|---------|-----------------------|----------------------|
-| self-host/pith_main.pith      |      53 |  65 / 116 / 317 mb    |  61 / 73 / 74 mb     |
-| examples/web_login.pith       |      54 |  88 / 191 / 649 mb    |  77 / 86 / 87 mb     |
+| closure                       | modules | 1 / 10 / 50 analyses |
+|-------------------------------|---------|----------------------|
+| self-host/pith_main.pith      |      53 |  61 / 73 / 74 mb     |
+| examples/web_login.pith       |      54 |  77 / 86 / 87 mb     |
 
-the slope was 5 mb an analysis on the first closure and 11.5 mb on the
-second; it is under 30 kb an analysis on both now, which is the
-allocator settling rather than a leak. what remains between the first
-analysis and the tenth is the working set reaching its size.
+growth past the tenth analysis is under 30 kb an analysis on both, which
+is the allocator settling rather than a leak. what remains between the
+first analysis and the tenth is the working set reaching its size.
 
 ### the closure cache
 
@@ -353,8 +335,8 @@ checker's whole state after the imports were checked is copied out
 (`CheckerSnapshot`): the type table, the scope arena, the diagnostics,
 the method and interface registries, and every one of the checker
 module's own tables, transients included. `initialize_checker` also
-now clears six associated-type tables it used to leave alone between
-runs; those held node indices from the previous arena.
+clears six associated-type tables between runs, since those hold node
+indices from the previous arena.
 
 what it keys on: the entry path, the entry's import list in order, and
 the walk itself. before a hit the driver resolves every recorded import

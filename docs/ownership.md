@@ -69,9 +69,7 @@ variables:
   global is not in any function's exit cleanup, and the store itself
   only overwrites the slot. that release is what frees a container's
   elements, since a container's last count cascades into everything it
-  owns — `xs = []` over a global used to strand every element the old
-  container held, which is how the compiler front end grew tens of
-  megabytes per analysis by resetting its tables the obvious way. a
+  owns. a
   `threadlocal` global is the same rule per task (per thread on the
   os-thread backend), and the runtime drops its count when the task ends.
   `ir_assign_targets_global_slot` decides this, and it excludes two
@@ -81,16 +79,7 @@ variables:
   the global reads the function's own storage: a global is emitted
   under a reserved symbol (`__g_<name>`), a binding keeps its written
   name, and the two no longer meet in the flat ir namespace. that split
-  is what lets the release be unconditional. before it, the consumer
-  resolved a bare name to a global's slot whenever one existed, so a
-  shadowing binding wrote the global's slot and dropped the count at
-  its own scope exit — releasing again at the next assignment would
-  have been a double free, and those globals kept an old leak instead.
-  the aliasing was the wider defect of the two: the binding read and
-  wrote the global's slot with no release anywhere in sight, so the
-  global's own next read came back as whatever the binding had left
-  there, and a container global reached `list indexing on invalid list
-  handle` once the binding's cleanup freed what the slot still named
+  is what lets the release be unconditional
 
 call arguments:
 
@@ -103,9 +92,7 @@ call arguments:
   straight into a call — `f([1, 2])`, `f({"k": v})`, `f(xs.map(g))` —
   is an allocation nothing else names, exactly like a struct literal, a
   lambda, or a fresh `Bytes`. `ir_owned_arg_kind_releases` is the list
-  of kinds this applies to. leaving the container kinds off it is what
-  made every such call strand its handle for the life of the process,
-  about 165 bytes per list argument and 400 per map
+  of kinds this applies to
 - `tuple` is deliberately not on that list, and is the one kind that
   has to stay off. an optional and a result both lower to a tuple
   shell, so the kind does not say whether a register holds a real tuple
@@ -187,10 +174,7 @@ lambdas and function values:
   of any rc kind (a string, a captured optional shell or result box, a
   struct, a container) is retained on the way out.
   `ir_closure_return_kinds` records what a closure returns so call sites
-  treat the result as owned. the expression-bodied form used to retain a
-  string only, so `fn() => x` over a captured shell handed the
-  environment's own count to a caller that released it, and the next
-  call read freed memory.
+  treat the result as owned.
 - naming a function as a value mints a closure. `f := shout` and
   `xs.map(shout)` both lower to `closure_ref`, which allocates with a
   count of one, so the expression is owned the same way a lambda
@@ -237,11 +221,7 @@ caller's handle.
 
 a map's values carry the same tag a list's elements do — the runtime
 shares one `ListTypeTag` and one retain/release pair between them — so a
-map owns a count on every heap value it holds, of every kind. that used
-to be cstring-only: a list, map, set, struct, bytes or closure written
-into a map got no count from the map and none released on eviction, and
-the emitter added a compensating count at the call site so the value
-would at least outlive the caller's local. nothing ever dropped it.
+map owns a count on every heap value it holds, of every kind.
 
 the tag comes from the *store* rather than only the constructor, which
 is what makes that sound. a container normally picks its flavor at
@@ -255,9 +235,8 @@ guessed right. `MapImpl::adopt_value_tag` only adopts into an *empty*
 map, which is what keeps the change count-neutral: there are no
 already-stored values whose counts a new tag would start releasing. a
 map that cannot adopt — one already holding values under a different
-tag — takes the compensating count in the runtime instead, exactly the
-one the emitter used to add, so the fallback is a leak and never a freed
-value. the constructor still picks the flavor where it can, because a
+tag — takes a compensating count in the runtime instead, so the
+fallback is a leak and never a freed value. the constructor still picks the flavor where it can, because a
 map that owns strings has always been built that way and an int-keyed
 map with primitive values keeps its scalar fast path; adoption drops out
 of that fast path the moment the map holds handles.
@@ -283,13 +262,9 @@ disagree — that last one falls to the leak instead.
 only the borrowed stores carry a kind; an owned value transfers its
 count through the `_owned_` variants instead of taking one.
 
-sets are a list element type too. the runtime's element tag had no
-`Set` variant, so a `List[Set]` was the one collection-of-collections
-that could not be tagged at all: `xs.push({1, 2})` stranded its element
-for the life of the process, and the value position of `xs.insert(i, v)`
-had to keep its count for want of anywhere to transfer it to. the
-variant exists now (`pith_list_new_set`), which is what let `insert`
-join the other stores on the transferring path.
+sets are a list element type too: a `List[Set]` is built by
+`pith_list_new_set`, so `xs.push({1, 2})` and `xs.insert(i, v)` transfer
+their counts like the other stores.
 
 the constructor a literal picks comes from the checked type of the
 literal node, so for a list it is only as good as what the checker
@@ -508,11 +483,7 @@ gaps, all bounded leaks rather than dangling pointers:
   out of a callee) owns nothing and frees only its box. the release is the
   plain shell release, never the payload cascade: the cascade drops the
   payload explicitly, which is wrong as soon as a second owner holds the
-  same shell. an earlier version walked the callee's body and cascaded
-  when the walk passed. it left every callee it could not read (another
-  module, a generic receiver, a closure) on the leak side, and it emptied
-  `v` in `show(forward(v))` and freed the list's element in
-  `show(xs.get(0))`, two shapes the walk read as safe.
+  same shell.
   `tests/cases/test_optional_arg_callee_spellings` reads back every keep
   and extract spelling, same-module, cross-module and through a generic
   receiver, under valgrind with the freelist off.
@@ -799,8 +770,10 @@ the container *contents* are not synchronized, though: a list or map is a
 plain buffer behind a handle, so two tasks mutating the same collection race
 on that buffer.
 
-the rule, until a checker enforces it: **do not share a mutable
-collection across tasks — pass data through a channel instead.** a
+the rule: **do not share a mutable collection across tasks — pass data
+through a channel instead.** the checker enforces it only at a `spawn`
+argument (E248); a collection reached through a global or a struct field
+is not checked. a
 channel hands the value over rather than aliasing it, which keeps each
 task's mutations to itself. immutable values and independent copies
 (`std.collections.copy_list` and friends) are also safe to hand off.

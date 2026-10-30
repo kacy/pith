@@ -13,11 +13,11 @@ test "scan maps rows into typed values":
 run the tests in a file with `pith test`:
 
 ```
-$ pith test std/sql.pith
+$ pith test std/sql.pith --filter scan
   scan maps rows into typed values ... ok
   scan_one maps the first row or none ... ok
 
-2 passed, 0 failed
+2 passed, 0 failed, 8 filtered out
 ```
 
 ## how the runner works
@@ -160,9 +160,7 @@ assertion failed
 ```
 
 `std.testing`'s record the failure instead, so the table finishes and `each`
-says which row it was. (a closure body cannot call the built-ins at all today —
-`assert` inside a `fn(x):` block fails to compile; they reach a case body only
-through a helper the body calls.)
+says which row it was.
 
 `pith fmt` closes a multi-line list at column zero, which is why the `]` above
 sits where it does — the same shape the tables in `std/crypto/password.pith` and
@@ -230,7 +228,7 @@ $ pith test std/mysql.pith --filter scramble
   mysql_native_password scramble matches a known vector ... ok
   caching_sha2_password scramble matches a known vector ... ok
 
-2 passed, 0 failed, 3 filtered out
+2 passed, 0 failed, 6 filtered out
 ```
 
 the filter also reads from the `PITH_TEST_FILTER` environment variable, which is
@@ -280,7 +278,7 @@ a run that names a tag no test in the file carries says so and fails:
 ```
 $ pith test std/sql.pith --tag databse
 
-0 passed, 0 failed, 12 filtered out
+0 passed, 0 failed, 10 filtered out
 no test carries the tag "databse"
 ```
 
@@ -430,10 +428,9 @@ it:
 std::process::exit(1);
 ```
 
-the marker moves with the code. the guard used to keep a list of regexes
-matching exact source lines instead, which went stale as soon as anything was
-reformatted or added, so the gate reports a marker whose next line is not a
-guarded site — a marker left behind by a deleted trap is a failure too.
+the marker moves with the code. the gate also reports a marker whose next line
+is not a guarded site, so a marker left behind by a deleted trap is a failure
+too.
 
 test code is skipped: `#[cfg(test)]` items are compiled out of the shipped
 runtime, and an `.unwrap()` in a test is how a test reports failure. the skip

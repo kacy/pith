@@ -96,7 +96,14 @@ eq|neq|lt|gt|lte|gte REG A B     result is 0 or 1. dispatches on operand kind:
 
 ```
 concat REG A B              REG = A followed by B, as a fresh heap string.
+concatn REG COUNT PART...   REG = the COUNT parts joined, as one fresh string.
+appendn REG COUNT BASE PART...   REG = BASE with the COUNT parts appended; the
+                                 result takes over BASE's count.
 ```
+
+the emitter writes only `concat`. `concatn` and `appendn` are made inside the
+consumer, by `fuse_concat_chains` and `fuse_self_appends`, from a chain of
+`concat`s whose intermediate results nothing else reads.
 
 **optionals**
 

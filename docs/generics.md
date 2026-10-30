@@ -26,7 +26,7 @@ The generic-body pass runs after it, once per module, over a work queue:
   reading `self.item.len()` is fine on a `Holder[List[Int]]` and would be a
   fault on a `Holder[Int?]` the program only ever builds;
 - a method with type parameters of its own on a generic struct
-  (`impl Box[T]: fn map[U](f: fn(T) -> U) -> Box[U]`) queues the triple
+  (`fn map[U](f: fn(T) -> U) -> Box[U]` in `impl Box:` for a `Box[T]`) queues the triple
   (declaration, receiver instance, method type arguments): `Box[Int].map` at
   `String` and `Box[String].map` at `String` are two entries, and each is
   walked with the owner's parameters resolving to the instance's arguments
@@ -46,7 +46,7 @@ A fault inside a generic body is reported at the line it sits on, with the
 specialization it was found at appended to the message:
 
 ```
-error[E209]: no method 'nonexistent' on 'Int' in first[Int]
+error[E209]: Int has no method 'nonexistent' in first[Int]
 ```
 
 The same fault at the same node reports once, named after the first type set

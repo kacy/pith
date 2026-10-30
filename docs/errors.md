@@ -97,7 +97,7 @@ error[E203]: duplicate definition of 'x'
       ^
 ```
 
-**not currently emitted.** rebinding a name in the same scope is accepted; there is no duplicate-definition check.
+**not currently emitted.** rebinding a name in the same scope is accepted; there is no duplicate-definition check. rebinding it inside a nested block reports `E262`.
 
 ### E204 — non-exhaustive match
 
@@ -115,7 +115,7 @@ error[E204]: non-exhaustive match: missing variant 'Circle'
 
 a match arm can never be reached because earlier arms already cover it.
 
-**not currently emitted.** a repeated match arm is rejected by the parser as `E240` instead.
+**not currently emitted.** a repeated match arm is accepted, and the later copy never runs.
 
 ### E206 — missing return type
 
@@ -167,7 +167,7 @@ associated type of a type parameter (`engine[A.Msg]()`).
 
 an enum variant pattern was used on a non-enum type.
 
-**not currently emitted.** matching an enum pattern against a non-enum is rejected by the parser as `E240` instead.
+**not currently emitted.** matching an enum pattern against a non-enum reports `E228` instead.
 
 ### E212 — unknown variant
 
@@ -425,7 +425,6 @@ every lexer error is reported, even one that lands between two otherwise
 valid tokens (`1 € + 2`), so an invalid character can never be silently
 dropped.
 
-
 ### E245 — invalid if let / while let pattern
 
 `if let` and `while let` take a variant pattern (which destructures like a
@@ -476,8 +475,6 @@ error[E248]: a spawned task cannot take a list this scope still holds; both thre
                             ^
 ```
 
----
-
 ### E249 — weak field must be an optional struct
 
 ```
@@ -504,6 +501,222 @@ error[E250]: 'Channel' is a builtin type name and cannot be used as a struct nam
   2 |     n: Int
                 ^
 ```
+
+### E251 — function is not public in that module
+
+a module function declared with a bare `fn` belongs to the module that declared
+it; only a `pub fn` can be called through an import. the two live in one shared
+name table, so before this check the lookup for `mod.helper` would fall through
+to a bare-name match and return something the caller had no business holding.
+
+mark the function `pub` if it is meant to be part of the module's surface, or
+call the public entry point that wraps it.
+
+```
+error[E251]: 'frame_message' is not public in module 'grpc'
+ 11 |     framed := grpc.frame_message(bytes.from_string_utf8("hi"))
+                                                                    ^
+```
+
+### E252 — this file has no main function
+
+`pith build` and `pith run` make an executable, and an executable needs an
+entry point. a file without a top-level `fn main` is a library: it can be
+imported, checked and linted, but not built on its own. before this check the
+build sailed through to the system linker, which answered with an
+undefined-reference dump instead of a diagnosis.
+
+```
+error[E252]: this file has no main function
+  fix: `pith build` and `pith run` make an executable. a module without main can be imported, checked and linted, but not built on its own
+```
+
+### E253 — catch block must leave
+
+the block form of `catch` runs on the error path and produces no value, so
+falling out of its end would leave the surrounding binding with nothing.
+end the block with `return`, `fail`, `continue` or `break`.
+
+```
+error[E253]: a catch block must end with return, fail, continue or break; it produces no value for the surrounding expression
+```
+
+### E254 — unhashable set element or map key
+
+a `Set` element or a `Map` key must hash, and a set and a map hash exactly
+three flavors: the int family, `String`, and `Bytes`, which is hashed and
+compared by content. every other type used to fall into the string flavor
+anyway and misbehave silently — an optional's shell and a list's allocation
+header were read as a c-string, collapsing distinct values into one entry; a
+struct compared raw memory bytes; a plain enum inserted nothing at all; a
+float crashed the process. the type is rejected wherever it is formed: a
+written annotation, an inferred literal, an empty literal's first typed
+store, and a generic instantiation. store `List[T?]` instead of `Set[T?]`,
+and key by a string, integer or bytes encoding of the value otherwise (an id
+field for a struct, a serialized form for a tuple). an optional map value
+stays legal; only the key is hashed.
+
+```
+error[E254]: an optional cannot be a set element type; store List[T?] or key by the payload instead
+error[E254]: a list cannot be a map key type; a set element and a map key hash int, string and bytes flavors only
+```
+
+### E260 — invalid defer or errdefer
+
+`defer` and `errdefer` appear outside a function, or the deferred statement is
+not a plain side effect. a deferred statement may not return, `fail`, `break`,
+`continue`, use `!` or `?`, bind a name, or nest another defer — move the
+control flow into a helper and defer the call to it. `errdefer` additionally
+requires a function that returns a result (`T!`), since there is no error case
+for it to run on otherwise.
+
+```
+error[E260]: errdefer is only meaningful in a function returning a result (`T!`)
+  fix: use `defer` for cleanup that must always run, or give the function a `T!` return type
+```
+
+see [defer.md](defer.md) for the full ordering rules.
+
+### E261 — invalid weak binding
+
+a `weak` binding broke one of its restrictions. a weak binding cannot be `mut`,
+cannot carry a type annotation (it takes its type from its value), must hold a
+struct value, cannot be declared inside a closure, and cannot reuse a name
+already bound in the same function.
+
+```
+error[E261]: a weak binding cannot be 'mut'
+```
+
+see [ownership.md](ownership.md) for why each restriction exists.
+
+### E262 — generic enum instance cannot be inferred
+
+a payload-free variant of a generic enum carries nothing to infer the type
+argument from. bound without an annotation, the value would have no concrete
+type — and a later match on it could not be checked. annotate the binding;
+a constructor with a payload argument (`Opt.Some(5)`) infers its instance
+and needs no annotation.
+
+```
+error[E262]: cannot infer the type arguments of generic enum 'Opt' from this constructor; annotate the binding
+```
+
+the same code reports a binding in a nested block that reuses a name an
+enclosing block of the same function already bound. a function has one slot
+per name, so the inner binding would overwrite the outer value instead of
+shadowing it. sibling blocks may reuse a name.
+
+```
+error[E262]: 'x' is already bound in this function; a nested binding overwrites it rather than shadowing it
+```
+
+### E263 — duplicate method across impl blocks
+
+two impl blocks gave the same declaration the same method name with the
+same kind of declaration, so one body would silently shadow the other and
+which one answered depended on module order. remove or rename one of the
+two. an interface impl re-declaring a method the inherent impl also has is
+not a duplicate — that pair is the conformance idiom std/io uses — and an
+impl in another module adding new method names to a type it can see stays
+legal too.
+
+```
+error[E263]: duplicate method 'read' on 'FileStream': another impl block already declares it
+```
+
+### E264 — where clause names an undeclared type parameter
+
+a `where` clause put a bound on a name that is not one of the function's
+declared type parameters. the clause form and the inline form
+(`[T: Display]`) are two spellings of the same bounds, so a clause can
+only constrain names the bracket list declares. declare the parameter,
+or fix the spelling.
+
+```
+error[E264]: where clause names 'U', which is not a type parameter of 'f'
+```
+
+### E265 — generic method reuses its owner's type parameter name
+
+a method of a generic type declared a type parameter with the same name as
+one of the type's own. the two lists compose by name — the type's parameters
+are fixed by the receiver's instance, the method's by the call — so a
+method parameter spelled `T` on a `Box[T]` would resolve to the box's `T`
+everywhere it is written, never to the call's type. give the method's
+parameter a name of its own.
+
+the code used to refuse every generic method on a generic type; that shape
+is supported now (docs/generics.md), and only the name clash is reported.
+
+```
+error[E265]: generic method 'describe' on generic type 'Box' reuses its owner's type parameter name 'T'; a method's own type parameters need names of their own
+```
+
+### E266 — module global read before a local of the same name
+
+a function's storage is flat: one slot per name for the whole body. a local, a
+parameter or a `match` / `if let` payload therefore takes its name for the
+entire function, and the module global of that name is unreachable from inside
+it. that is legal on its own (the linter mentions it as
+[E308](#e308--binding-shadows-a-module-global-warning)). what has no answer is a
+body that wants both — reads the global somewhere above and binds a local of the
+same name below.
+
+rename the binding, or move the reads of the global into a function that does
+not bind the name.
+
+```
+error[E266]: 'items' names a module global that is read earlier in this function, and this binding takes the name for the whole function
+ 10 |     mut items: List[Int] := [7]
+          ^
+  fix: rename the binding, or move the reads of the global into a function that does not bind the name
+```
+
+a `for` variable is exempt. it is the one binding whose storage is scoped to a
+block rather than the function, so the global is still reachable on either side
+of the loop and nothing is ambiguous.
+
+### E267 — a generic instantiated at more than 64 distinct type sets
+
+a generic body is checked once per distinct set of concrete types the program
+asks for (see docs/generics.md). a generic that calls itself at a larger type
+(`fn grow[T](x: T)` calling `grow([x])`) asks for `T`, then `List[T]`, then
+`List[List[T]]`, without end. the checker stops queueing the declaration after
+64 sets and reports it once.
+
+```
+error[E267]: 'grow' is instantiated at more than 64 distinct type sets; a generic that calls itself at a larger type never stops
+```
+
+not reported when the check is switched off (`PITH_CHECK_GENERIC_BODIES=off`
+or `silent`); the declaration is then left unchecked past the cap, as every
+generic body was before the check existed.
+
+### E268 — invalid Drop implementation
+
+`impl Drop for T` asks the compiler to call `T`'s `drop` method from the
+destructor it attaches to every `T` it builds, when the last value naming the
+struct goes away (see docs/ownership.md, "destructors"). the impl has to be a
+shape that destructor can call: `T` must be a struct, declared in the module
+the impl is written in, and not generic — the destructor is generated per
+declaration and spells the method symbol from the declaring module, and a
+generic struct's destructor is generated per instance with no place for the
+call. the impl must declare `fn drop()` with no parameters and no return
+value, since the runtime hands it the bare pointer and reads nothing back, and
+nothing else beside it.
+
+```
+error[E268]: impl Drop for Guard: a generic struct cannot implement Drop
+error[E268]: impl Drop for Shape: only a struct can implement Drop
+error[E268]: impl Drop for Slot: drop() takes no parameters
+error[E268]: impl Drop for Slot: the impl may only declare drop(), not 'close'
+error[E268]: impl Drop for Slot: the impl must declare fn drop()
+```
+
+`Drop` is a language-level interface: nothing declares it and nothing imports
+it. put the type's other methods in an `impl T:` block of their own, and have
+`drop` call the explicit closer so the two stay idempotent.
 
 ---
 
@@ -612,76 +825,6 @@ warning[E307]: 'config' is built by tls.client_config() and never closed; the re
   fix: close it on every exit -- `defer config.close()` next to the build; see docs/destructors_roadmap.md
 ```
 
-### E266 — module global read before a local of the same name
-
-a function's storage is flat: one slot per name for the whole body. a local, a
-parameter or a `match` / `if let` payload therefore takes its name for the
-entire function, and the module global of that name is unreachable from inside
-it. that is legal on its own (the linter mentions it as
-[E308](#e308--binding-shadows-a-module-global-warning)). what has no answer is a
-body that wants both — reads the global somewhere above and binds a local of the
-same name below.
-
-rename the binding, or move the reads of the global into a function that does
-not bind the name.
-
-a `for` variable is exempt. it is the one binding whose storage is scoped to a
-block rather than the function, so the global is still reachable on either side
-of the loop and nothing is ambiguous.
-
-### E267 — a generic instantiated at more than 64 distinct type sets
-
-a generic body is checked once per distinct set of concrete types the program
-asks for (see docs/generics.md). a generic that calls itself at a larger type
-(`fn grow[T](x: T)` calling `grow([x])`) asks for `T`, then `List[T]`, then
-`List[List[T]]`, without end. the checker stops queueing the declaration after
-64 sets and reports it once.
-
-```
-error[E267]: 'grow' is instantiated at more than 64 distinct type sets; a generic that calls itself at a larger type never stops
-```
-
-not reported when the check is switched off (`PITH_CHECK_GENERIC_BODIES=off`
-or `silent`); the declaration is then left unchecked past the cap, as every
-generic body was before the check existed.
-
-### E268 — invalid Drop implementation
-
-`impl Drop for T` asks the compiler to call `T`'s `drop` method from the
-destructor it attaches to every `T` it builds, when the last value naming the
-struct goes away (see docs/ownership.md, "destructors"). the impl has to be a
-shape that destructor can call: `T` must be a struct, declared in the module
-the impl is written in, and not generic — the destructor is generated per
-declaration and spells the method symbol from the declaring module, and a
-generic struct's destructor is generated per instance with no place for the
-call. the impl must declare `fn drop()` with no parameters and no return
-value, since the runtime hands it the bare pointer and reads nothing back, and
-nothing else beside it.
-
-```
-error[E268]: impl Drop for Guard: a generic struct cannot implement Drop
-error[E268]: impl Drop for Shape: only a struct can implement Drop
-error[E268]: impl Drop for Slot: drop() takes no parameters
-error[E268]: impl Drop for Slot: the impl may only declare drop(), not 'close'
-error[E268]: impl Drop for Slot: the impl must declare fn drop()
-```
-
-`Drop` is a language-level interface: nothing declares it and nothing imports
-it. put the type's other methods in an `impl T:` block of their own, and have
-`drop` call the explicit closer so the two stay idempotent.
-
-before globals were given a storage namespace of their own, this compiled and
-miscompiled: the binding wrote the GLOBAL's slot, so the local and the global
-were one value and the global's next reader anywhere in the program saw
-whatever the local had left there.
-
-```
-error[E266]: 'items' names a module global that is read earlier in this function, and this binding takes the name for the whole function
- 10 |     mut items: List[Int] := [7]
-          ^
-  fix: rename the binding, or move the reads of the global into a function that does not bind the name
-```
-
 ### E308 — binding shadows a module global (warning)
 
 a local, a parameter or a `match` / `if let` payload is spelled like one of the
@@ -709,150 +852,4 @@ warning[E308]: binding 'items' shadows the module global declared on line 1; the
   4 |     mut items: List[Int] := [7, 8, 9]
           ^
   fix: rename the binding, or drop the global if the binding is what you meant
-```
-
-### E251 — function is not public in that module
-
-a module function declared with a bare `fn` belongs to the module that declared
-it; only a `pub fn` can be called through an import. the two live in one shared
-name table, so before this check the lookup for `mod.helper` would fall through
-to a bare-name match and return something the caller had no business holding.
-
-mark the function `pub` if it is meant to be part of the module's surface, or
-call the public entry point that wraps it.
-
-```
-error[E251]: 'frame_message' is not public in module 'grpc'
- 11 |     framed := grpc.frame_message(bytes.from_string_utf8("hi"))
-                                                                    ^
-```
-
-### E252 — this file has no main function
-
-`pith build` and `pith run` make an executable, and an executable needs an
-entry point. a file without a top-level `fn main` is a library: it can be
-imported, checked and linted, but not built on its own. before this check the
-build sailed through to the system linker, which answered with an
-undefined-reference dump instead of a diagnosis.
-
-```
-error[E252]: this file has no main function
-  fix: `pith build` and `pith run` make an executable. a module without main can be imported, checked and linted, but not built on its own
-```
-
-
-### E253 — catch block must leave
-
-the block form of `catch` runs on the error path and produces no value, so
-falling out of its end would leave the surrounding binding with nothing.
-end the block with `return`, `fail`, `continue` or `break`.
-
-```
-error[E253]: a catch block must end with return, fail, continue or break; it produces no value for the surrounding expression
-```
-
-
-### E254 — unhashable set element or map key
-
-a `Set` element or a `Map` key must hash, and a set and a map hash exactly
-three flavors: the int family, `String`, and `Bytes`, which is hashed and
-compared by content. every other type used to fall into the string flavor
-anyway and misbehave silently — an optional's shell and a list's allocation
-header were read as a c-string, collapsing distinct values into one entry; a
-struct compared raw memory bytes; a plain enum inserted nothing at all; a
-float crashed the process. the type is rejected wherever it is formed: a
-written annotation, an inferred literal, an empty literal's first typed
-store, and a generic instantiation. store `List[T?]` instead of `Set[T?]`,
-and key by a string, integer or bytes encoding of the value otherwise (an id
-field for a struct, a serialized form for a tuple). an optional map value
-stays legal; only the key is hashed.
-
-```
-error[E254]: an optional cannot be a set element type; store List[T?] or key by the payload instead
-error[E254]: a list cannot be a map key type; a set element and a map key hash int, string and bytes flavors only
-```
-
-
-### E260 — invalid defer or errdefer
-
-`defer` and `errdefer` appear outside a function, or the deferred statement is
-not a plain side effect. a deferred statement may not return, `fail`, `break`,
-`continue`, use `!` or `?`, bind a name, or nest another defer — move the
-control flow into a helper and defer the call to it. `errdefer` additionally
-requires a function that returns a result (`T!`), since there is no error case
-for it to run on otherwise.
-
-```
-error[E260]: errdefer is only meaningful in a function returning a result (`T!`)
-  fix: use `defer` for cleanup that must always run, or give the function a `T!` return type
-```
-
-see [defer.md](defer.md) for the full ordering rules.
-
-### E261 — invalid weak binding
-
-a `weak` binding broke one of its restrictions. a weak binding cannot be `mut`,
-cannot carry a type annotation (it takes its type from its value), must hold a
-struct value, cannot be declared inside a closure, and cannot reuse a name
-already bound in the same function.
-
-```
-error[E261]: a weak binding cannot be 'mut'
-```
-
-see [ownership.md](ownership.md) for why each restriction exists.
-
-### E262 — generic enum instance cannot be inferred
-
-a payload-free variant of a generic enum carries nothing to infer the type
-argument from. bound without an annotation, the value would have no concrete
-type — and a later match on it could not be checked. annotate the binding;
-a constructor with a payload argument (`Opt.Some(5)`) infers its instance
-and needs no annotation.
-
-```
-error[E262]: cannot infer the type arguments of generic enum 'Opt' from this constructor; annotate the binding
-```
-
-
-### E263 — duplicate method across impl blocks
-
-two impl blocks gave the same declaration the same method name with the
-same kind of declaration, so one body would silently shadow the other and
-which one answered depended on module order. remove or rename one of the
-two. an interface impl re-declaring a method the inherent impl also has is
-not a duplicate — that pair is the conformance idiom std/io uses — and an
-impl in another module adding new method names to a type it can see stays
-legal too.
-
-```
-error[E263]: duplicate method 'read' on 'FileStream': another impl block already declares it
-```
-
-### E264 — where clause names an undeclared type parameter
-
-a `where` clause put a bound on a name that is not one of the function's
-declared type parameters. the clause form and the inline form
-(`[T: Display]`) are two spellings of the same bounds, so a clause can
-only constrain names the bracket list declares. declare the parameter,
-or fix the spelling.
-
-```
-error[E264]: where clause names 'U', which is not a type parameter of 'f'
-```
-
-### E265 — generic method reuses its owner's type parameter name
-
-a method of a generic type declared a type parameter with the same name as
-one of the type's own. the two lists compose by name — the type's parameters
-are fixed by the receiver's instance, the method's by the call — so a
-method parameter spelled `T` on a `Box[T]` would resolve to the box's `T`
-everywhere it is written, never to the call's type. give the method's
-parameter a name of its own.
-
-the code used to refuse every generic method on a generic type; that shape
-is supported now (docs/generics.md), and only the name clash is reported.
-
-```
-error[E265]: generic method 'describe' on generic type 'Box' reuses its owner's type parameter name 'T'; a method's own type parameters need names of their own
 ```

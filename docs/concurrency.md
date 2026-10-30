@@ -17,7 +17,7 @@ unbuffered channels are rendezvous channels. buffered channels queue up to their
 jobs := Channel[Int](1)
 jobs.send(7)
 value := jobs.recv()
-print("{value?}")
+print("{value}")
 ```
 
 the basic channel surface is:
@@ -34,12 +34,12 @@ the basic channel surface is:
 send on a closed channel returns `false`. recv on a closed and drained channel returns `none`.
 
 `close()` is not a free, and it does not need to be one: a channel handle is
-reference-counted like a string or a list, so the channel's memory — about 400
+reference-counted like a string or a list, so the channel's memory — 448
 bytes plus 16 per buffered slot, allocated eagerly at construction — returns
 when the last binding, field, element, or capture holding it is released, and
 any values still queued are released with it. `PITH_PERF_STATS=1` reports
-`new`, `freed`, and `use_after_zero` on the `channels:` line;
-docs/channel_ownership.md has the history and the design.
+`new`, `closed`, `freed`, `retained_bytes` and `freed_bytes` on the
+`channels:` line; docs/channel_ownership.md has the design.
 
 ## select
 
@@ -47,7 +47,7 @@ docs/channel_ownership.md has the history and the design.
 
 ```pith
 picked := select:
-    msg := jobs.recv() => msg?
+    msg := jobs.recv() => msg.unwrap_or(0)
     timeout 50 => -1
     default => 0
 ```
@@ -199,8 +199,9 @@ pass data between tasks through a channel rather than sharing a
 mutable collection. a channel hands the value over instead of aliasing
 it, so each task mutates its own. immutable values and independent
 copies (`std.collections.copy_list` and friends) are also safe to
-hand off. this rule is convention today, not yet enforced by the
-checker.
+hand off. the checker enforces this only for a `spawn` argument: passing
+a collection the current scope still holds reports E248. a collection
+reached through a global or a struct field is not checked.
 
 when a channel is the wrong shape — a registry every request reads and a
 few requests write, a counter, a cap on how many things run at once — reach
@@ -464,13 +465,8 @@ green backend cut internal context switches from about five per grpc call to
 well under one and raised throughput on a two-core box (see the grpc section
 of `docs/performance.md`). on the channel fan-out benchmark — eight tasks
 trading a million messages through one bounded channel — it runs well ahead of
-the os-thread backend and of zig, but behind go and rust at the default worker
-count (~95 ms median against their ~71 and ~69 on the 2026-08-22 rerun — and
-bimodal: 2 of 15 launches land at 59-66 ms, faster than either, when the task
-placement race goes well). pinned to one worker it turns the go comparison
-around at ~46 ms to ~71: the benchmark is pure handoff, which one worker does
-without crossing a core. see the coordination table in
-`docs/performance.md`. it does the least for tasks that are already
+the os-thread backend, and at 38 ms median it is ahead of go (49 ms) on the
+2026-10-30 suite run. see the headline table in `docs/performance.md`. it does the least for tasks that are already
 cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
 
 the machinery behind that: coroutine stacks are pooled and reused rather
@@ -490,9 +486,8 @@ server that spawns one task per request holds only the tasks running at once,
 not one record for every request it has ever served. this holds even for a
 fire-and-forget `spawn f()` whose handle you never keep: a discarded spawn is
 detached at the spawn site, so its slot is reclaimed when the body finishes
-rather than pinned until the process exits. a fan-out of 500k short tasks that
-used to climb to ~226 mb now holds around 3 mb, flat no matter how many run in
-total — see the green fan-out row in `docs/performance.md`. (an awaited task on
+rather than pinned until the process exits. a fan-out of 500k short tasks
+holds around 3 mb, flat no matter how many run in total — see the green fan-out row in `docs/performance.md`. (an awaited task on
 the os-thread backend still keeps its record until you read the result;
 teaching that path the same reclamation is the next step.)
 

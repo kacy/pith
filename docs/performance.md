@@ -226,6 +226,19 @@ connections, 1173k against 1157k at 256 and 1486k against 1479k at 1024,
 from a Go keep-alive client on the other CCD rather than wrk. the 256
 connection row was 1-2 percent lower with migration on in all three rounds.
 
+that check toggled migration, not stealing, so it missed what stealing cost
+the server. under wrk, the 2026-10-30 suite run read 876k req/s at 32
+connections and 1.45M at 256, against 1.22M and 1.83M before this change. a
+bisect over the 65 commits since the earlier run stopped here. the thief
+spun for up to 20us on every busy peer with a non-empty pinned fifo, each
+time it ran out of work. a loaded server always has such peers, so its idle
+workers spent their time spinning on them. with `steal_pinned` turned off,
+the server read 1.22M and 1.98M again. the thief now records each peer's resume count and the time it
+read it, and takes a task on a later pass if the count has not moved for
+20us. between passes it parks for 20us instead of spinning. a worker that
+waits in epoll rounds that park up to a millisecond. the server went back to
+1.21M and 1.97M req/s, and the concurrency rows above stayed within noise.
+
 ### what preemption safe-points cost, now that they are on (2026-09-07)
 
 green tasks are preemptible in every build unless it says

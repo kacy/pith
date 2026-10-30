@@ -1,4 +1,4 @@
-# std.checksum — small checksum helpers
+# std.checksum - small checksum helpers
 
 import std.bits as bits
 import std.bytes as bytes
@@ -22,11 +22,11 @@ fn crc32_build_table() -> List[Int]:
             i = i + 1
         table.push(crc)
         value = value + 1
-    mut at := 256
-    while at < 2048:
-        prev := table[at - 256]
-        table.push(bits.xor(bits.shr(prev, 8), table[bits.band(prev, 255)]))
-        at = at + 1
+    mut entry := 256
+    while entry < 2048:
+        previous := table[entry - 256]
+        table.push(bits.xor(bits.shr(previous, 8), table[bits.band(previous, 255)]))
+        entry = entry + 1
     return table
 
 # built when the module loads. module initializers run on the main thread
@@ -63,11 +63,14 @@ fn crc32_update(start_crc: Int, data: Bytes, start: Int) -> Int:
     # table reads depend only on the word and the crc going in, not on each
     # other, so they overlap; the byte-at-a-time loop chained every lookup
     # on the one before it. the low four bytes fold into the crc first.
+    # tables 7..4 take the four bytes of `low` and tables 3..0 the four
+    # bytes of `high`: the earlier a byte sits in the word, the more bytes
+    # still follow it.
     while pos < full:
         word := bytes_read_word(data, pos, 8)
-        x := bits.xor(crc, bits.band(word, 4294967295))
-        hi := bits.shr(word, 32)
-        crc = bits.xor(bits.xor(bits.xor(crc32_table[1792 + bits.band(x, 255)], crc32_table[1536 + bits.band(bits.shr(x, 8), 255)]), bits.xor(crc32_table[1280 + bits.band(bits.shr(x, 16), 255)], crc32_table[1024 + bits.shr(x, 24)])), bits.xor(bits.xor(crc32_table[768 + bits.band(hi, 255)], crc32_table[512 + bits.band(bits.shr(hi, 8), 255)]), bits.xor(crc32_table[256 + bits.band(bits.shr(hi, 16), 255)], crc32_table[bits.shr(hi, 24)])))
+        low := bits.xor(crc, bits.band(word, 4294967295))
+        high := bits.shr(word, 32)
+        crc = bits.xor(bits.xor(bits.xor(crc32_table[1792 + bits.band(low, 255)], crc32_table[1536 + bits.band(bits.shr(low, 8), 255)]), bits.xor(crc32_table[1280 + bits.band(bits.shr(low, 16), 255)], crc32_table[1024 + bits.shr(low, 24)])), bits.xor(bits.xor(crc32_table[768 + bits.band(high, 255)], crc32_table[512 + bits.band(bits.shr(high, 8), 255)]), bits.xor(crc32_table[256 + bits.band(bits.shr(high, 16), 255)], crc32_table[bits.shr(high, 24)])))
         pos = pos + 8
     # the last n % 8 bytes go one at a time through table 0. bytes_get is
     # the subscript without the handle proof, and the loop bound keeps the

@@ -138,14 +138,14 @@ client whose reads must be bounded sets one explicitly.
 
 ## why the adapters are handle-backed
 
-pith structs are value types right now. that means a tiny adapter struct cannot
-just mutate internal fields and expect the caller to observe that state after it
-gets passed around.
+when this layer was written, pith structs were value types, so a tiny adapter
+struct could not mutate its own fields and expect the caller to observe that
+state after it was passed around.
 
-the practical bridge is to keep mutable adapter state in module-level tables and
-pass around tiny structs that only hold handles into that state. it is not the
-final forever shape, but it gives pith stable buffered and stateful io today
-without waiting on a larger ownership model.
+the bridge was to keep mutable adapter state in module-level tables and pass
+around tiny structs that only hold handles into that state. structs are shared
+now (a field written through one copy is visible through every other), so the
+handle tables are no longer required, but the adapters still use them.
 
 ## the buffered text readers are one reader
 
@@ -220,7 +220,6 @@ the point of this work was not to stop at toy adapters.
 real stdlib consumers now use the shared layer:
 - `std.net.http`
 - `std.net.websocket`
-- `std.csv`
 - `std.toml`
 - `std.json`
 - `std.log`

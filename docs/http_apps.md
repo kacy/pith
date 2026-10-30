@@ -126,9 +126,12 @@ builder cases:
 the cookie builder keeps the common cases out of manual header strings:
 
 ```pith
-resp := http.text(200, "ok")
-    .set_cookie(http.cookie("session", "abc123").path("/").http_only())
+resp := (http.text(200, "ok")
+    .set_cookie(http.cookie("session", "abc123").path("/").http_only()))
 ```
+
+a chain that spans lines needs the parentheses: a line that starts with `.`
+does not continue the line before it.
 
 client requests can carry cookies the same way:
 
@@ -314,10 +317,10 @@ server: its timeouts, its request-size limits and its keep-alive policy. the
 `_with` entry points take one:
 
 ```pith
-config := http.server_config()
+config := (http.server_config()
     .with_read_header_timeout(5000)
     .with_idle_timeout(60000)
-    .with_max_body_bytes(1048576)
+    .with_max_body_bytes(1048576))
 http.serve_connection_fd_with(client_fd, handler, config)!
 http.serve_connection_tls_with(conn, handler, config)!
 http.serve_connection_with(reader, writer, handler, config)!
@@ -581,10 +584,10 @@ print(resp.body_text()!)
 for transport control, keep it on the request builder:
 
 ```pith
-resp := http.get_https_request("example.com", "/docs")
+resp := (http.get_https_request("example.com", "/docs")
     .with_timeout(1500)
     .follow_redirects(3)
-    .send()!
+    .send())!
 ```
 
 `follow_redirects(...)` handles:
@@ -614,10 +617,10 @@ module instead of splitting the work across app code.
 for common write-heavy client paths, prefer the request helpers:
 
 ```pith
-req := http.post_request("example.com", 80, "/items") \
-    .query_param("mode", "fast path") \
-    .bearer("token") \
-    .json_body(payload)
+req := (http.post_request("example.com", 80, "/items")
+    .query_param("mode", "fast path")
+    .bearer("token")
+    .json_body(payload))
 ```
 
 ## the pooled client
@@ -627,10 +630,10 @@ req := http.post_request("example.com", 80, "/items") \
 request; a `Client` keeps connections open and reuses them.
 
 ```pith
-c := http.client()
+c := (http.client()
     .with_timeout(5000)
     .with_response_header_timeout(2000)
-    .with_max_idle_conns_per_host(4)
+    .with_max_idle_conns_per_host(4))
 
 resp := c.get("http://127.0.0.1:8080/health")!
 created := c.send(http.new_request("POST", "http://127.0.0.1:8080/items")!.json_body(payload))!

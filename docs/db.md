@@ -39,8 +39,9 @@ mysql://user:password@host:port/dbname
 
 the scheme selects the driver: `postgres` (or `postgresql`) and `mysql`. the
 port defaults per driver — 5432 for postgres, 3306 for mysql — and the user,
-password, and `?pool=N` size are all optional. `pool` sets how many idle
-connections the pool keeps for reuse; it defaults to 8.
+password, and `?pool=N` size are all optional. `pool` caps how many connections
+the pool may have open at once; it defaults to 8. once the pool is at the cap, a
+query waits for a connection to come back rather than opening another.
 
 `std.db.parse_url` exposes the parsed parts as a `Dsn` if you want them directly.
 
@@ -235,7 +236,8 @@ connection out of protocol sync, so that connection is closed rather than
 returned to the pool.
 
 the pool is guarded by a mutex, so many green tasks can share one `Db` and call
-`query`/`exec` concurrently. `close` drains the pool, closing every idle
+`query`/`exec` concurrently. at most `pool` of them hold a connection at a time;
+the rest wait their turn. `close` drains the pool, closing every idle
 connection.
 
 ## observability

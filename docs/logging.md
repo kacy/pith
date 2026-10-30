@@ -70,8 +70,7 @@ simple export paths.
 
 ## otel-ready shape
 
-json logs intentionally keep stable mapping points for a future first-party
-otel package:
+json logs intentionally keep stable mapping points for otel log records:
 
 - `time` maps to otel `Timestamp`
 - `level` maps to `SeverityText`
@@ -80,5 +79,5 @@ otel package:
 - `fields` maps to `Attributes`
 - `trace_id` and `span_id` map to trace context fields
 
-this module does not export to otel yet. it only makes the record shape stable
-enough for that package to build on later.
+`std.otlp` exports traces and metrics but not log records, so nothing sends
+this shape to a collector yet. see [telemetry.md](telemetry.md).

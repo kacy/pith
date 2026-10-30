@@ -455,7 +455,7 @@ pub fn cmd_new(name: String) -> String!:
 
     mut toml := "[package]" + nl
     toml = toml + "name = " + chr(34) + name + chr(34) + nl
-    toml = toml + "version = " + chr(34) + "0.2.3" + chr(34) + nl
+    toml = toml + "version = " + chr(34) + "0.1.0" + chr(34) + nl
     toml = toml + "description = " + chr(34) + "a short description of " + name + chr(34) + nl
     toml = toml + "root = " + chr(34) + "lib.pith" + chr(34) + nl
     toml = toml + "license = " + chr(34) + "MIT" + chr(34) + nl
@@ -479,8 +479,8 @@ pub fn cmd_new(name: String) -> String!:
     agents = agents + nl
     agents = agents + "`pith lint` catches all of these, but here's the gist:" + nl
     agents = agents + nl
-    agents = agents + "- functions that can fail return `T!`. use `?` to propagate errors." + nl
-    agents = agents + "- no panics. every failure is a Result." + nl
+    agents = agents + "- functions that can fail return `T!`. use `!` to propagate errors." + nl
+    agents = agents + "- errors are values. `fail` makes one, `catch` supplies a fallback." + nl
     agents = agents + "- function names: snake_case (e.g., fetch_user, parse_command)" + nl
     agents = agents + "- types: PascalCase (e.g., HttpClient, ParseError)" + nl
     agents = agents + "- private by default. `pub` to export." + nl
@@ -492,29 +492,21 @@ pub fn cmd_new(name: String) -> String!:
     agents = agents + "    pith package inspect <package>          read a dependency package" + nl
     agents = agents + "    pith package inspect <package> --api    see just the public API" + nl
     agents = agents + "    pith package context <package>          compact context for agents" + nl
-    agents = agents + nl
-    agents = agents + "## publishing" + nl
-    agents = agents + nl
-    agents = agents + "`pith publish` enforces: type check, lint, tests, docs, coverage." + nl
-    agents = agents + "fix what it flags." + nl
     write_file(name + "/AGENTS.md", agents)!
 
     mut gi := ".pith-build/" + nl
-    gi = gi + "zig-out/" + nl
-    gi = gi + ".zig-cache/" + nl
     write_file(name + "/.gitignore", gi)!
 
-    mut mk := ".PHONY: build test check fmt lint doc" + nl
+    # the package is a library, so there is nothing to build on its own;
+    # a bare `make` type checks it
+    mut mk := ".PHONY: check test fmt lint doc" + nl
     mk = mk + "PITH ?= pith" + nl
-    mk = mk + nl
-    mk = mk + "build:" + nl
-    mk = mk + tab + "$(PITH) build lib.pith" + nl
-    mk = mk + nl
-    mk = mk + "test:" + nl
-    mk = mk + tab + "$(PITH) package test" + nl
     mk = mk + nl
     mk = mk + "check:" + nl
     mk = mk + tab + "$(PITH) package check" + nl
+    mk = mk + nl
+    mk = mk + "test:" + nl
+    mk = mk + tab + "$(PITH) package test" + nl
     mk = mk + nl
     mk = mk + "fmt:" + nl
     mk = mk + tab + "$(PITH) fmt lib.pith" + nl
@@ -525,11 +517,6 @@ pub fn cmd_new(name: String) -> String!:
     mk = mk + "doc:" + nl
     mk = mk + tab + "$(PITH) package doc" + nl
     write_file(name + "/Makefile", mk)!
-
-    mut df := "FROM ubuntu:latest" + nl
-    df = df + "COPY . /app" + nl
-    df = df + "WORKDIR /app" + nl
-    write_file(name + "/Dockerfile", df)!
 
     mut readme := "# " + name + nl
     readme = readme + nl

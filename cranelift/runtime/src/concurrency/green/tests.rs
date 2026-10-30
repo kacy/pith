@@ -448,11 +448,24 @@ fn idle_peer_steals_from_a_busy_owners_pinned_queue() {
     assert_eq!(word_owner(block.word.load(AtomicOrdering::Acquire)), Some(0));
     assert_eq!(owner.pinned_fifo.load(AtomicOrdering::Relaxed), 1);
 
+    let mut watch = PinWatch::new();
     owner.running_task.store(0, AtomicOrdering::Relaxed);
-    assert_eq!(steal_pinned(0, 1), None, "an idle owner drains its own queue");
+    assert_eq!(
+        steal_pinned(0, 1, &mut watch),
+        None,
+        "an idle owner drains its own queue"
+    );
 
+    // the first look at a busy owner only records its resume count; a later
+    // look that finds the count unchanged after `PIN_STEAL_WAIT` takes the task.
     owner.running_task.store(usize::MAX, AtomicOrdering::Relaxed);
-    assert_eq!(steal_pinned(0, 1), Some(id));
+    assert_eq!(
+        steal_pinned(0, 1, &mut watch),
+        None,
+        "a busy owner is watched before it is robbed"
+    );
+    std::thread::sleep(PIN_STEAL_WAIT * 2);
+    assert_eq!(steal_pinned(0, 1, &mut watch), Some(id));
     owner.running_task.store(0, AtomicOrdering::Relaxed);
     assert_eq!(owner.pinned_fifo.load(AtomicOrdering::Relaxed), 0);
     let word = block.word.load(AtomicOrdering::Acquire);

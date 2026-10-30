@@ -153,7 +153,11 @@ pub(super) fn debug_assert_stealable(_id: TaskId) {}
 /// with `deferred_first` the deferred queue goes first instead; the worker loop
 /// asks for that every `POLL_EVERY` tasks so a preempted task waits a bounded
 /// number of turns. returns `None` if the whole pool is momentarily empty.
-pub(super) fn find_work(index: usize, deferred_first: bool) -> Option<TaskId> {
+pub(super) fn find_work(
+    index: usize,
+    deferred_first: bool,
+    watch: &mut PinWatch,
+) -> Option<TaskId> {
     let sched = scheduler();
 
     if deferred_first {
@@ -207,10 +211,11 @@ pub(super) fn find_work(index: usize, deferred_first: bool) -> Option<TaskId> {
     }
 
     // then a started task waiting behind a peer that is busy with another.
+    watch.watching = false;
     for k in 0..n {
         let victim = (start + k) % n;
         if victim != index {
-            if let Some(id) = steal_pinned(victim, index) {
+            if let Some(id) = steal_pinned(victim, index, watch) {
                 return Some(id);
             }
         }
@@ -223,34 +228,66 @@ pub(super) fn find_work(index: usize, deferred_first: bool) -> Option<TaskId> {
     pop_deferred(index)
 }
 
-/// how long a thief watches a peer before taking a task off its pinned fifo.
-/// a peer that resumes anything in this window is getting through its queue,
-/// and taking from it would split a pipeline that runs best on one worker.
+/// how long a peer must stay inside one task before a thief takes a task off
+/// its pinned fifo. a peer that resumes anything in this window is getting
+/// through its queue, and taking from it would split a pipeline that runs
+/// best on one worker.
 pub(super) const PIN_STEAL_WAIT: Duration = Duration::from_micros(20);
 
+/// what a worker saw of each peer's pinned fifo the last time it looked: the
+/// peer's resume count and when it read it. `steal_pinned` compares against
+/// this record instead of spinning on the peer. a thief that spun up to
+/// `PIN_STEAL_WAIT` on every busy peer each time it ran out of work kept the
+/// idle workers of a loaded server spinning, and cost the http server about a
+/// quarter of its throughput. the worker loop owns it as a local, since a
+/// thread-local's address may not be held in a frame that resumes tasks.
+pub(super) struct PinWatch {
+    seen: Vec<(u64, Instant)>,
+    /// set when the last `find_work` passed over a busy peer with a non-empty
+    /// pinned fifo that it did not take from yet.
+    pub(super) watching: bool,
+}
+
+impl PinWatch {
+    pub(super) fn new() -> PinWatch {
+        PinWatch {
+            seen: Vec::new(),
+            watching: false,
+        }
+    }
+}
+
 /// take the oldest task off `victim`'s pinned fifo and make worker `thief` its
-/// owner, if the victim has been inside one task for `PIN_STEAL_WAIT`. the
-/// affinity slot is left alone: it holds the other half of a handoff the
-/// victim resumes next.
+/// owner, if the victim is running a task and has resumed nothing since this
+/// thief read its resume count at least `PIN_STEAL_WAIT` ago. the first pass
+/// over a busy victim only records the count. the affinity slot is left
+/// alone: it holds the other half of a handoff the victim resumes next.
 ///
 /// a task in a pinned queue is `Ready` and held by that queue alone (a waker
 /// that reads `Ready` changes nothing), so popping it under the victim's lock
 /// gives this thread the only right to rewrite its owner. that is the same
 /// hand-over a migrating wake makes in `claim_parked`.
-pub(super) fn steal_pinned(victim: usize, thief: usize) -> Option<TaskId> {
-    let worker = &scheduler().workers[victim];
-    if worker.pinned_fifo.load(AtomicOrdering::Relaxed) == 0 {
+pub(super) fn steal_pinned(victim: usize, thief: usize, watch: &mut PinWatch) -> Option<TaskId> {
+    let sched = scheduler();
+    let worker = &sched.workers[victim];
+    if worker.pinned_fifo.load(AtomicOrdering::Relaxed) == 0
+        || worker.running_task.load(AtomicOrdering::Relaxed) == 0
+    {
         return None;
     }
-    let before = worker.resumes.load(AtomicOrdering::Relaxed);
-    let deadline = Instant::now() + PIN_STEAL_WAIT;
-    while Instant::now() < deadline {
-        std::hint::spin_loop();
-        if worker.resumes.load(AtomicOrdering::Relaxed) != before {
-            return None;
-        }
+    let resumes = worker.resumes.load(AtomicOrdering::Relaxed);
+    let now = Instant::now();
+    if watch.seen.len() < sched.workers.len() {
+        watch.seen.resize(sched.workers.len(), (u64::MAX, now));
     }
-    if worker.running_task.load(AtomicOrdering::Relaxed) == 0 {
+    let (seen, since) = watch.seen[victim];
+    if seen != resumes {
+        watch.seen[victim] = (resumes, now);
+        watch.watching = true;
+        return None;
+    }
+    if now.duration_since(since) < PIN_STEAL_WAIT {
+        watch.watching = true;
         return None;
     }
     let id = {
@@ -438,6 +475,7 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
     // set on the same count as the socket poll: the next `find_work` serves
     // one preempted task ahead of everything else.
     let mut deferred_turn = false;
+    let mut watch = PinWatch::new();
     loop {
         if worker.search_token.swap(false, AtomicOrdering::SeqCst) {
             if searching {
@@ -446,7 +484,7 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
             }
             searching = true;
         }
-        match find_work(index, std::mem::take(&mut deferred_turn)) {
+        match find_work(index, std::mem::take(&mut deferred_turn), &mut watch) {
             Some(id) => {
                 idle_timeout = PARK_TIMEOUT_MIN;
                 if searching {
@@ -504,6 +542,15 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
                 searching = false;
                 scheduler().searching.fetch_sub(1, AtomicOrdering::SeqCst);
                 if any_stealable() {
+                    continue;
+                }
+                // a peer this worker is watching for a stuck task needs a
+                // second look once `PIN_STEAL_WAIT` has passed, so the worker
+                // sleeps for that long instead of its backed-off timeout. a
+                // worker that waits in epoll rounds it up to a millisecond.
+                if watch.watching {
+                    idle_timeout = PARK_TIMEOUT_MIN;
+                    park(index, PIN_STEAL_WAIT);
                     continue;
                 }
                 if park(index, idle_timeout) {

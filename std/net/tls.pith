@@ -3918,8 +3918,12 @@ test "a tls 1.2 certificate verify signature is bound to the transcript it signe
     # a signature over a different transcript is what a replayed or relayed
     # CertificateVerify looks like from the server's side.
     assert(not tls13.verify_certificate_signature(leaf.subject_public_key, TLS_SIG_RSA_PSS_RSAE_SHA256, other, signed)!)
-    # and a signature with one byte changed.
-    tampered := bytes.concat(bytes.slice(signed, 0, signed.len() - 1), bytes.from_string_utf8("!"))
+    # and a signature with one byte changed. pss signatures are randomized,
+    # so the replacement must differ from whatever the last byte is.
+    mut replacement := "!"
+    if signed[signed.len() - 1] == ord("!"):
+        replacement = "?"
+    tampered := bytes.concat(bytes.slice(signed, 0, signed.len() - 1), bytes.from_string_utf8(replacement))
     assert(not tls13.verify_certificate_signature(leaf.subject_public_key, TLS_SIG_RSA_PSS_RSAE_SHA256, transcript, tampered)!)
 
     # an rsa certificate cannot answer an ecdsa code point, whatever the

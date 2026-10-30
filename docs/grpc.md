@@ -118,9 +118,10 @@ fn search(req: cat.SearchRequest) -> cat.SearchResponse!grpc.GrpcError:
             hits.push(p)
     return cat.SearchResponse(products: hits, total: hits.len())
 
-fn main():
+fn main() -> Int!:
     seed()
     cat.serve_Catalog("0.0.0.0", 50051, get_product, search)!
+    return 0
 ```
 
 `serve_Catalog` blocks and serves connections concurrently on the green-thread
@@ -207,22 +208,29 @@ the generated client is a thin typed wrapper over a connection:
 import catalog_gen as cat
 import std.net.grpc as grpc
 
-fn main():
-    conn := grpc.dial_h2c("127.0.0.1", 50051)!     # plaintext http/2
-    client := cat.new_CatalogClient(conn)
-
+fn lookup(client: cat.CatalogClient) -> Int!grpc.GrpcError:
     product := client.GetProduct(cat.GetProductRequest(sku: "sku-1"))!
     print(product.name + " $" + product.price.to_string())
 
     results := client.Search(cat.SearchRequest(query: "usb", max_results: 10))!
     print(results.total.to_string() + " matches")
+    return 0
 
+fn main() -> Int!:
+    conn := grpc.dial_h2c("127.0.0.1", 50051)!     # plaintext http/2
+    client := cat.new_CatalogClient(conn)
+    looked := lookup(client)
+    if looked.is_err:
+        print(grpc.status_name(looked.err.status) + ": " + looked.err.message)
     conn.close()
+    return 0
 ```
 
 a call that returns a non-OK status fails with a `grpc.GrpcError` carrying the
 status code and message — the same `NOT_FOUND` your handler raised arrives here as
-`err.status == grpc.GRPC_NOT_FOUND`.
+`err.status == grpc.GRPC_NOT_FOUND`. the calls sit in their own function because
+`!` only propagates an error of the enclosing function's error type, and
+`dial_h2c` fails with a `String` rather than a `GrpcError`.
 
 ## tls
 
@@ -305,7 +313,7 @@ too low.
 | `grpc.MAX_STREAM_MESSAGES` | 65536 | `RESOURCE_EXHAUSTED` on a buffered request stream |
 | `protobuf.MAX_NESTING_DEPTH` | 100 | the decode fails; a self-referential message cannot recurse without bound |
 | `http.MAX_REQUEST_BODY` | 10 MiB | the stream is reset |
-| concurrent streams per connection | 100 | `REFUSED_STREAM` |
+| concurrent streams per connection | 128 | `REFUSED_STREAM` |
 | concurrent connections per listener | 512 | the accept loop waits for one to end |
 | idle socket | 2 minutes | the connection is dropped |
 

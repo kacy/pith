@@ -1,4 +1,4 @@
-//! IR Consumer — translates Pith text IR to Cranelift native code
+//! IR consumer: translates Pith text IR to Cranelift native code
 //!
 //! This module parses the simple text IR emitted by self-host/ir_emitter_core.pith
 //! and translates it to Cranelift API calls. This is the Rust-side half of
@@ -224,8 +224,8 @@ fn inline_list_get_value(
 // two-slot Optional tuple that the very next instructions unpack (flag at
 // offset 0, value at offset 8) and release. When scan_unpackable_opt_regs
 // proves a call's result is used only by that unpack pattern, the whole round
-// trip collapses to these loads and compares — no call, no allocation, no
-// release. The checks mirror the runtime path exactly: a null or stale handle
+// trip collapses to these loads and compares, with no call, no allocation
+// and no release. The checks mirror the runtime path exactly: a null or stale handle
 // (magic scrubbed on free), a non-8-byte-element list, or an out-of-range
 // index all yield is_some == 0, which the emitted IR turns into the same loud
 // "index out of bounds" failure the runtime call produced.
@@ -295,10 +295,10 @@ fn inline_list_get_opt(
 
 // `xs[i] = v` on a primitive-element list is an in-bounds store with no
 // retain/release choreography, so the common case inlines to a handful of
-// loads and one store. Anything the fast path cannot prove — a tagged list
-// (element counts to move), an out-of-bounds index (a silent no-op by the
-// runtime's contract), a stale or null handle — falls back to the real
-// runtime call, which keeps every semantic exactly as it was.
+// loads and one store. Anything the fast path cannot prove (a tagged list,
+// with element counts to move; an out-of-bounds index, a silent no-op by the
+// runtime's contract; a stale or null handle) falls back to the real runtime
+// call, which keeps every semantic exactly as it was.
 fn inline_list_set_value(
     builder: &mut FunctionBuilder<'_>,
     list: Value,
@@ -402,7 +402,7 @@ fn bits_builtin_op(builtin: &str) -> Option<&'static str> {
 }
 
 // std.bits wraps the bit builtins in one-line named functions, which made
-// every `bits.band` in a hot loop a pith call into an FFI call — two call
+// every `bits.band` in a hot loop a pith call into an FFI call: two call
 // layers for one machine instruction. When a two-parameter function's body is
 // verifiably just `return <bit builtin>(p0, p1)`, calls to it lower to that
 // single instruction instead. The body is matched structurally against the
@@ -552,9 +552,9 @@ fn is_unpackable_opt_def(parts: &[&str]) -> bool {
 
 // a token occurrence (parts[i]) the inline unpack understands: the defining
 // call itself, a field read of tuple slot 0 or 8, an optflag or optval read,
-// or the release of the
-// throwaway tuple shell. anything else — a store, a return, an argument to
-// some other call — means the tuple escapes and must really exist.
+// or the release of the throwaway tuple shell. anything else (a store, a
+// return, an argument to some other call) means the tuple escapes and must
+// really exist.
 fn is_sanctioned_opt_use(parts: &[&str], i: usize) -> bool {
     if is_unpackable_opt_def(parts) {
         return i == 1;
@@ -1008,8 +1008,8 @@ fn inline_closure_set_env(
     builder.switch_to_block(done);
 }
 
-/// Inline bytes.read_word for the common case — a count of 1..=8 with a
-/// full 8-byte window inside the data — as one load and a mask, skipping
+/// Inline bytes.read_word for the common case, a count of 1..=8 with a
+/// full 8-byte window inside the data, as one load and a mask, skipping
 /// the FFI call that dominates word-at-a-time scanners (the xxhash kernel,
 /// the bitstream refill). Everything else (null handle, reads within the
 /// last seven bytes, bad counts) falls back to pith_bytes_read_word for
@@ -1061,7 +1061,7 @@ fn inline_bytes_read_word(
     let addr = builder.ins().iadd(data_ptr, off);
     let word = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
     // keep the low `count` bytes: all-ones shifted down by (8 - count) * 8,
-    // which is 0 for a full word — no shift-by-64 edge case.
+    // which is 0 for a full word, so there is no shift-by-64 edge case.
     let eight = builder.ins().iconst(types::I64, 8);
     let spare = builder.ins().isub(eight, count);
     let shift_bits = builder.ins().ishl_imm(spare, 3);
@@ -1326,7 +1326,7 @@ fn green_preempt_enabled() -> bool {
 
 /// Emit a cooperative-preemption safe-point inline, just before a loop back-edge
 /// branch. Loads the process-global `PITH_PREEMPT_REQUESTED` flag (declared in
-/// the runtime, see `green.rs`); on the hot path — the flag clear — this is a
+/// the runtime, see `green.rs`); on the hot path, with the flag clear, this is a
 /// single i8 load and a predicted-not-taken branch, no call. Only when the green
 /// monitor has set the flag do we call `pith_green_maybe_yield`, which itself
 /// decides whether the running task must actually yield (and is a no-op off the
@@ -1531,14 +1531,16 @@ pub fn compile_from_ir(
     let lines: Vec<&str> = ir_text.lines().collect();
     let mut declared_funcs: HashMap<String, FuncId> = HashMap::new();
     let mut string_data: Vec<(String, String)> = Vec::new();
-    let mut struct_layouts: HashMap<String, Vec<String>> = HashMap::new();
+    // the struct names (and aliases) the IR declares: a call to one is its
+    // constructor, and a load of one is a zero
+    let mut struct_names: HashSet<String> = HashSet::new();
     let mut global_data: HashMap<String, DataId> = HashMap::new();
     let mut str_globals: Vec<(String, String)> = Vec::new(); // (global_name, string_id)
     let mut string_global_names: HashSet<String> = HashSet::new();
 
     // green preemption safe-points are emitted by default. green is the default
     // backend, and a task that loops waiting on something another task must
-    // publish holds its worker until it is preempted — without a safe-point it
+    // publish holds its worker until it is preempted; without a safe-point it
     // never is, so it starves the task it is waiting for. the check costs
     // +0.07% to +1.85% instructions across the benchmarks here and +0.52% on the
     // compiler compiling itself; a flat arithmetic loop is the outlier at +86%
@@ -1569,21 +1571,7 @@ pub fn compile_from_ir(
                 string_data.push((parts[1].to_string(), decode_string_literal(line)));
             }
             "struct" if parts.len() >= 2 => {
-                let name = parts[1].to_string();
-                if !struct_layouts.contains_key(&name) {
-                    // Filter out "pub" markers from field list
-                    let fields: Vec<String> = parts[2..]
-                        .iter()
-                        .filter(|s| **s != "pub")
-                        .map(|s| s.to_string())
-                        .collect();
-                    let field_pairs: Vec<(String, String)> = fields
-                        .iter()
-                        .map(|f| (f.clone(), "Int".to_string()))
-                        .collect();
-                    crate::register_struct_layout(&name, &field_pairs);
-                    struct_layouts.insert(name, fields);
-                }
+                struct_names.insert(parts[1].to_string());
             }
             "global" if parts.len() >= 3 => {
                 let gname = parts[1].to_string();
@@ -1632,11 +1620,8 @@ pub fn compile_from_ir(
                 }
             }
             "struct_alias" if parts.len() >= 3 => {
-                let alias = parts[1].to_string();
-                let target = parts[2].to_string();
-                crate::register_struct_alias(&alias, &target);
-                if let Some(fields) = struct_layouts.get(&target).cloned() {
-                    struct_layouts.insert(alias, fields);
+                if struct_names.contains(parts[2]) {
+                    struct_names.insert(parts[1].to_string());
                 }
             }
             "func" if parts.len() >= 4 => {
@@ -1742,7 +1727,7 @@ pub fn compile_from_ir(
                 runtime_funcs,
                 &declared_funcs,
                 &string_lits,
-                &struct_layouts,
+                &struct_names,
                 &global_data,
                 &str_globals,
                 &string_global_names,
@@ -2373,7 +2358,7 @@ fn compile_ir_function(
     runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
     string_lits: &HashMap<String, DataId>,
-    struct_layouts: &HashMap<String, Vec<String>>,
+    struct_names: &HashSet<String>,
     global_data: &HashMap<String, DataId>,
     str_globals: &[(String, String)],
     string_global_names: &HashSet<String>,
@@ -2410,7 +2395,7 @@ fn compile_ir_function(
     let mut named_vars: HashMap<String, Variable> = HashMap::new();
     // labels already emitted, in stream order, as we walk the instructions. a
     // jmp/brif whose target is in here is jumping *backward* to an earlier label
-    // — a loop back-edge — which is where we insert a preemption safe-point. a
+    // (a loop back-edge), which is where we insert a preemption safe-point. a
     // target not yet seen is a forward jump (if/else/result merge, break) and is
     // correctly excluded.
     let mut defined_labels: HashSet<String> = HashSet::new();
@@ -2909,7 +2894,7 @@ fn compile_ir_function(
 
                 // Struct constructor: call REG StructName N args...
                 // If fname is a known struct, emit __struct_alloc + sstore
-                if struct_layouts.contains_key(fname) {
+                if struct_names.contains(fname) {
                     let mut args: Vec<Value> = Vec::new();
                     for j in 0..nargs {
                         if j + arg_start < parts.len() {
@@ -2935,7 +2920,7 @@ fn compile_ir_function(
                     }
                 } else {
                     // an indexed read whose Optional tuple never escapes: no
-                    // call, no tuple — compute (is_some, value) inline and let
+                    // call, no tuple: compute (is_some, value) inline and let
                     // the field reads below pick them up.
                     if fname == "pith_list_get_opt"
                         && nargs == 2
@@ -3095,7 +3080,7 @@ fn compile_ir_function(
                         continue;
                     }
                     // Look up function: user-defined first, then a direct runtime
-                    // import key. A local variable shadows both — the checker
+                    // import key. A local variable shadows both: the checker
                     // guarantees a called local is closure-typed, and a bare
                     // runtime name like `second` must not capture a call to a
                     // local that happens to share it.
@@ -3190,7 +3175,7 @@ fn compile_ir_function(
                             // the callee returns nothing. the emitter and the
                             // runtime table are separate notions of what a call
                             // yields, so a retkind that promises a value here
-                            // means they disagree — `process.wait(p)` once went
+                            // means they disagree. `process.wait(p)` once went
                             // out as a bare `wait`, landed on the waitgroup
                             // intrinsic, and read back a zero nobody wrote.
                             if retkind_expects_a_value(retkind) {
@@ -3222,7 +3207,7 @@ fn compile_ir_function(
                         // a module-level global holding a closure value,
                         // called by name. the checker only allows calling a
                         // global that is closure-typed, so load the handle
-                        // and dispatch indirectly — the same path a local
+                        // and dispatch indirectly, the same path a local
                         // closure variable takes, sourced from the global
                         // slot instead of a named variable.
                         let gv = codegen.module.declare_data_in_func(data_id, builder.func);
@@ -3248,7 +3233,7 @@ fn compile_ir_function(
                         // upstream (a phantom import, a missed rename, an
                         // unlowered interface dispatch). generic template
                         // bodies keep dead unresolved calls, so this cannot
-                        // be a compile error yet — but a live path must fail
+                        // be a compile error yet, but a live path must fail
                         // loudly instead of silently returning zero.
                         let result = emit_runtime_error_value(
                             codegen,
@@ -3318,7 +3303,7 @@ fn compile_ir_function(
                 } else if let Some(&var) = named_vars.get(name) {
                     let val = builder.use_var(var);
                     regs.insert(reg, val);
-                } else if struct_layouts.contains_key(name) {
+                } else if struct_names.contains(name) {
                     regs.insert(reg, builder.ins().iconst(types::I64, 0));
                 } else {
                     return Err(CompileError::ModuleError(format!(
@@ -3384,7 +3369,7 @@ fn compile_ir_function(
                 let reg = parse_reg(parts[1], line, func_name)?;
                 // unpacking a virtualized pith_list_get_opt result: slot 0 is
                 // the is_some flag, slot 8 the element value, both already in
-                // registers — no tuple to load from.
+                // registers, so there is no tuple to load from.
                 if let Ok(obj_reg) = parts[2].parse::<usize>() {
                     if let Some(&(flag, value)) = virtual_opts.get(&obj_reg) {
                         let v = match parts[3] {
@@ -3595,7 +3580,7 @@ fn compile_ir_function(
                 // a brif with a back-edge arm closes a loop (e.g. a bottom-test
                 // `while cond` that branches back to the header). insert the
                 // preemption safe-point before the branch itself (only when this
-                // build opted into preemption — otherwise `preempt_flag` is None).
+                // build opted into preemption; otherwise `preempt_flag` is None).
                 if let Some(flag) = preempt_flag {
                     if defined_labels.contains(then_label) || defined_labels.contains(else_label) {
                         emit_preempt_safepoint(
@@ -4305,7 +4290,7 @@ mod tests {
     }
 
     // every IR-declared function returns i64, so only the runtime table can
-    // supply a callee that returns nothing — which is exactly where the
+    // supply a callee that returns nothing, which is exactly where the
     // emitter's idea of a call's result and the runtime's can drift apart.
     #[test]
     fn call_asking_a_value_of_a_void_runtime_function_returns_compile_error() {

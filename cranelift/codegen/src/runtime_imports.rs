@@ -52,30 +52,23 @@ fn declare_runtime_function(
     Ok(func_id)
 }
 
+/// Import every runtime function in the generated table, keyed by the name
+/// the IR calls it by. Several keys may name one symbol (a short key and
+/// its full-symbol spelling), so each symbol is declared once.
 pub fn declare_runtime_functions(
     module: &mut ObjectModule,
 ) -> Result<HashMap<String, FuncId>, CompileError> {
     let mut funcs = HashMap::new();
-    let mut declared: HashMap<String, FuncId> = HashMap::new();
+    let mut declared: HashMap<&str, FuncId> = HashMap::new();
 
-    for decl in ABI_RUNTIME_FUNCTIONS {
-        let fid = if let Some(&existing) = declared.get(decl.symbol) {
-            existing
-        } else {
-            let fid = declare_runtime_function(module, decl.symbol, decl.params, decl.returns)?;
-            declared.insert(decl.symbol.to_string(), fid);
-            fid
-        };
-        funcs.insert(decl.key.to_string(), fid);
-    }
-
-    for decl in COMPAT_RUNTIME_FUNCTIONS {
-        let fid = if let Some(&existing) = declared.get(decl.symbol) {
-            existing
-        } else {
-            let fid = declare_runtime_function(module, decl.symbol, decl.params, decl.returns)?;
-            declared.insert(decl.symbol.to_string(), fid);
-            fid
+    for decl in ABI_RUNTIME_FUNCTIONS.iter().chain(COMPAT_RUNTIME_FUNCTIONS) {
+        let fid = match declared.get(decl.symbol) {
+            Some(&existing) => existing,
+            None => {
+                let fid = declare_runtime_function(module, decl.symbol, decl.params, decl.returns)?;
+                declared.insert(decl.symbol, fid);
+                fid
+            }
         };
         funcs.insert(decl.key.to_string(), fid);
     }

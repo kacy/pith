@@ -35,8 +35,8 @@ ENTRY_OVERHEAD := 32
 STATIC_TABLE_LEN := 61
 
 # a decompression-bomb backstop for the decoder. hpack lets a small block of indexed
-# references expand into a much larger header list — a ~4 KB dynamic-table entry
-# referenced a thousand times materializes megabytes — so the decoder tracks the
+# references expand into a much larger header list (a ~4 KB dynamic-table entry
+# referenced a thousand times materializes megabytes), so the decoder tracks the
 # running decoded size and field count and fails the moment either budget is
 # crossed, before the whole list exists. these are deliberately generous absolute
 # ceilings, well above any legitimate header list; a server layers its own stricter
@@ -173,7 +173,7 @@ fn low_mask(n: Int) -> Int:
 
 # --- integer coding (RFC 7541 §5.1) ---
 
-# write an integer with an `prefix_bits`-bit prefix, OR-ing `high_bits` into
+# write an integer with a `prefix_bits`-bit prefix, OR-ing `high_bits` into
 # the first octet's unused top bits.
 fn write_integer(out: ByteBuffer, value: Int, prefix_bits: Int, high_bits: Int):
     limit := low_mask(prefix_bits)
@@ -285,8 +285,8 @@ impl DynamicTable:
         return self.entries[self.entries.len() - position]
 
     # the hpack index of an exact name/value match, or 0 if none. the (small)
-    # dynamic table is scanned first and the static table answers from its map
-    # — the order is observably identical to the old static-first scan, because
+    # dynamic table is scanned first and the static table answers from its map.
+    # the order is observably identical to a static-first scan, because
     # the two sets are disjoint: `add` runs only when find_full returned 0, so
     # a pair with a static full entry never enters the dynamic table. dynamic
     # first means the common steady-state hit never builds a key string.
@@ -389,6 +389,10 @@ impl Decoder:
         mut decoded_bytes := 0
         while binary.remaining(reader) > 0:
             first := read_u8(reader)!
+            # the leading bits of the first octet select the representation
+            # (RFC 7541 §6): 1xxxxxxx indexed field, 01xxxxxx literal with
+            # incremental indexing, 001xxxxx table size update, and 0000xxxx /
+            # 0001xxxx literal without indexing or never indexed.
             if bits.band(first, 128) != 0:
                 index := read_integer(reader, 7, first)!
                 if index == 0:

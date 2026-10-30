@@ -9,14 +9,11 @@
 #   r := connection.get("https://www.cloudflare.com/")!
 #   print("status {r.status}, {r.body.len()} bytes")
 #
-# this is the synchronous, single-stream core. it reads and writes frames in
-# lockstep on one caller, which trivially honors http/2's rule that one reader
-# hpack-decodes header blocks in receive order. the concurrent multiplexing
-# layer (a spawned reader loop and per-stream channels) sits on top of this in a
-# later phase and reuses the same codec.
-#
-# it coexists with the h2-crate-backed std.net.http2.get during the migration;
-# both target the same servers so they can be checked against each other.
+# Connection is the synchronous, single-stream core. it reads and writes frames
+# in lockstep on one caller, which trivially honors http/2's rule that one
+# reader hpack-decodes header blocks in receive order. Client, further down,
+# multiplexes many streams over one Connection with a reader task, a writer task
+# and per-stream channels, and reuses the same codec.
 
 # the http2 codec modules are imported before std.net.tls on purpose. the
 # self-hosted checker's module loader currently gives std.binary's Reader type
@@ -135,6 +132,25 @@ fn status_from(headers: List[hpack.HeaderField]) -> Int:
             return parse_int(header.value).unwrap_or(0)
     return 0
 
+# one shared empty field list. DATA, RESET, and the trailer slot of HEADERS
+# events carry no header fields, and neither does a GET's `extra`; they all use
+# this list rather than allocating a fresh one per frame (data events are the
+# response hot path). consumers only read the shared list, never mutate it. it
+# is defined above its first use because module globals resolve in source order.
+fn empty_fields() -> List[hpack.HeaderField]:
+    fields: List[hpack.HeaderField] := []
+    return fields
+
+NO_FIELDS := empty_fields()
+
+# a request's four pseudo-header fields (RFC 9113 §8.3.1), followed by the
+# regular fields in `extra`.
+fn request_fields(method: String, scheme: String, authority: String, path: String, extra: List[hpack.HeaderField]) -> List[hpack.HeaderField]:
+    mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", scheme), hpack.header_field(":authority", authority)]
+    for f in extra:
+        fields.push(f)
+    return fields
+
 impl Connection:
     # the request :scheme pseudo-header: "http" for an h2c connection, "https"
     # over tls.
@@ -168,8 +184,8 @@ impl Connection:
 
     # read one frame off the transport: the 9-byte header gives the payload
     # length, then the whole frame (header + payload) is sliced out in one piece
-    # and the cursor advanced — no separate head/payload slices, no concat to
-    # rejoin them. the codec's reader then parses and bounds-checks it.
+    # and the cursor advanced, so there are no separate head and payload slices
+    # and no concat to rejoin them. the codec's reader then parses and bounds-checks it.
     fn read_frame() -> frames.Frame!:
         self.fill(9)!
         length_res := binary.read_u24_be_at(self.buf, self.pos)
@@ -193,9 +209,7 @@ impl Connection:
 
     # serialize and send one frame.
     fn send_frame(frame: frames.Frame) -> Int!:
-        wire := frames.frame_bytes(frame)!
-        n := self.send(wire)!
-        return n
+        return self.send(frames.frame_bytes(frame)!)!
 
     # send the preface and the opening SETTINGS. the response read loop acks the
     # peer's SETTINGS when it arrives, so no separate wait is needed here.
@@ -228,8 +242,8 @@ impl Connection:
             done = cont.end_headers
         return out.bytes()
 
-    # send everything owed to the peer — queued acks plus WINDOW_UPDATE grants
-    # for `owed` consumed body bytes — as one write, so it all rides one tls
+    # send everything owed to the peer (queued acks plus WINDOW_UPDATE grants
+    # for `owed` consumed body bytes) as one write, so it all rides one tls
     # record and one syscall. the grant is always connection-level; the
     # stream-level grant is skipped once the stream is ending, since the peer
     # has nothing left to send on it. with nothing owed, nothing is written.
@@ -244,8 +258,8 @@ impl Connection:
         return true
 
     # read frames until `stream_id` ends, assembling the response. connection
-    # housekeeping — SETTINGS acks, PING answers, flow-control grants for
-    # consumed body bytes — is owed to the peer promptly but not instantly, so
+    # housekeeping (SETTINGS acks, PING answers, flow-control grants for
+    # consumed body bytes) is owed to the peer promptly but not instantly, so
     # instead of a write per frame it is queued and settled in one write: when
     # consumed-but-ungranted credit crosses REPLENISH_THRESHOLD (the peer must
     # never stall against an exhausted window), and when the response
@@ -315,8 +329,7 @@ impl Connection:
     fn request_get(authority: String, path: String) -> Response!:
         stream_id := self.next_stream_id
         self.next_stream_id = self.next_stream_id + 2
-        request := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", self.scheme()), hpack.header_field(":authority", authority)]
-        block := self.encoder.encode(request)
+        block := self.encoder.encode(request_fields("GET", self.scheme(), authority, path, NO_FIELDS))
         self.send_frame(frames.headers_frame(stream_id, block, true, true))!
         return self.read_response(stream_id)!
 
@@ -460,15 +473,6 @@ pub struct StreamEvent:
     pub end: Bool
     pub error_code: Int
 
-# DATA, RESET, and the trailer slot of HEADERS events carry no header fields; they
-# share one empty list rather than allocating a fresh one per frame (data events
-# are the response hot path). consumers only read the shared list, never mutate it.
-fn empty_fields() -> List[hpack.HeaderField]:
-    fields: List[hpack.HeaderField] := []
-    return fields
-
-NO_FIELDS := empty_fields()
-
 # build a HEADERS stream event (response headers, or trailers once the body has
 # begun); `end` marks it as the stream's final event.
 pub fn headers_event(fields: List[hpack.HeaderField], end: Bool) -> StreamEvent:
@@ -532,10 +536,9 @@ MODE_THREADED := 2
 # it. the mutex guards the stream table, the id counter, the closed/going-away
 # flags, and the last stream the peer promised to serve; the channels are
 # already safe to use across tasks. `active` mirrors the stream-table keys as an
-# ordered List[Int]. it once had to exist because Map[Int, _].keys() did not
-# enumerate int keys; that is fixed, but the explicit list is load-bearing in its
-# own right — a dozen call sites iterate it, and it keeps a deterministic order
-# keys() does not promise — so it stays until a switch to keys() is measured.
+# ordered List[Int]: many call sites iterate it, and it keeps a deterministic
+# order that keys() does not promise. replacing it with keys() has not been
+# measured.
 #
 # --- the inline fast-path ---
 #
@@ -549,8 +552,8 @@ MODE_THREADED := 2
 # the client promotes to the threaded pipeline, exactly once, the first time a
 # second stream wants the connection at the same time (a concurrent request, or
 # any streaming rpc). promotion is a one-way latch: a client that has ever seen
-# concurrency stays THREADED for the rest of its life, and concurrent behaviour
-# is then exactly what it was before this fast-path existed.
+# concurrency stays THREADED for the rest of its life, and every later request
+# goes through the reader/writer pipeline.
 #
 # both the reader and the writer tasks are spawned up front, but they stay parked
 # through the inline phase so they never touch the socket while an inline call
@@ -1381,16 +1384,17 @@ impl Client:
         return marked
 
     # remove a finished stream from the table and its flow-control state, then
-    # free a concurrency slot so a request queued behind the peer's limit can go.
     # record that the reader delivered `stream_id`'s terminal event, so a
     # later close() skips the wire reset. only a stream still in the table is
-    # marked — a late frame after forget() must not re-grow the map.
+    # marked, so a late frame after forget() cannot re-grow the map.
     fn mark_finished(stream_id: Int):
         self.mu.lock()
         if self.streams.contains_key(stream_id):
             self.finished.insert(stream_id, true)
         self.mu.unlock()
 
+    # remove a finished stream from the table and its flow-control state, then
+    # free a concurrency slot so a request queued behind the peer's limit can go.
     fn forget(stream_id: Int):
         self.mu.lock()
         if self.streams.contains_key(stream_id):
@@ -1506,9 +1510,7 @@ impl Client:
     # server-streaming request has no body); false to keep sending DATA with
     # Stream.send. safe to call from many tasks concurrently.
     pub fn open_stream(method: String, authority: String, path: String, extra: List[hpack.HeaderField], end_stream: Bool) -> Stream!:
-        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", self.conn.scheme()), hpack.header_field(":authority", authority)]
-        for f in extra:
-            fields.push(f)
+        fields := request_fields(method, self.conn.scheme(), authority, path, extra)
         # a stream is long-lived and its events flow through the reader, so it can
         # never run on the inline path: promote to the pipeline before opening it.
         self.ensure_threaded()
@@ -1574,11 +1576,10 @@ impl Client:
             # had consumed that request and re-granted the bytes with a
             # WINDOW_UPDATE(0); those grants were read and dropped by the inline
             # codec. sends and grants therefore net out, and the window is back at
-            # its initial value — exactly what conn_send_window still holds, since
-            # the inline path never debited it. (an earlier version subtracted the
-            # cumulative inline bytes here, which drove the window deeply negative
-            # after a long warmup and stalled the first thousands of concurrent
-            # sends.)
+            # its initial value, which is what conn_send_window still holds, since
+            # the inline path never debited it. subtracting the cumulative inline
+            # bytes here would drive the window deeply negative after a long
+            # warmup and stall the first thousands of concurrent sends.
             # the writer already runs and the reader is already spawned (parked
             # on promote_gate); release it to take over the socket now.
             self.promote_gate.send(1)
@@ -1596,14 +1597,14 @@ impl Client:
     fn inline_round_trip(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
         has_body := body.len() > 0
         # the inline lease makes this the sole user of the socket, the encoder,
-        # the decoder and next_stream_id (the reader/writer are not spawned until
-        # this call releases the lease), so no mutex is needed here.
+        # the decoder and next_stream_id (the reader and writer stay parked until
+        # the client promotes), so no mutex is needed here.
         stream_id := self.next_stream_id
         self.next_stream_id = self.next_stream_id + 2
         block := self.conn.encoder.encode(fields)
         mut wire := frames.frame_bytes(frames.headers_frame(stream_id, block, not has_body, true))!
         if has_body:
-            # HEADERS and DATA ride one write — one tls record, one syscall —
+            # HEADERS and DATA ride one write (one tls record, one syscall)
             # instead of a record each.
             wire = bytes.concat(wire, frames.frame_bytes(frames.data_frame(stream_id, body, true))!)
         self.conn.send(wire)!
@@ -1625,7 +1626,7 @@ impl Client:
                 fail result.err
             return result.ok
         # slow path: concurrency, or a body large enough to need flow control.
-        # bring up the pipeline (once) and multiplex exactly as before.
+        # bring up the pipeline (once) and multiplex.
         self.ensure_threaded()
         return self.threaded_request(fields, body)!
 
@@ -1673,9 +1674,7 @@ impl Client:
     # point for non-GET verbs and request bodies — a grpc unary call is a POST
     # whose body is a length-prefixed protobuf message.
     pub fn request(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes) -> Response!:
-        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", self.conn.scheme()), hpack.header_field(":authority", authority)]
-        for f in extra:
-            fields.push(f)
+        fields := request_fields(method, self.conn.scheme(), authority, path, extra)
         return self.do_request(fields, body)!
 
     # like request, but fail with REQUEST_DEADLINE_EXCEEDED once `timeout_ms`
@@ -1687,9 +1686,7 @@ impl Client:
     # timeout the stream is reset (CANCEL) and forgotten, so the connection
     # stays usable for later requests.
     pub fn request_with_timeout(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes, timeout_ms: Int) -> Response!:
-        mut fields := [hpack.header_field(":method", method), hpack.header_field(":path", path), hpack.header_field(":scheme", self.conn.scheme()), hpack.header_field(":authority", authority)]
-        for f in extra:
-            fields.push(f)
+        fields := request_fields(method, self.conn.scheme(), authority, path, extra)
         if timeout_ms <= 0:
             return self.do_request(fields, body)!
         self.ensure_threaded()
@@ -1733,7 +1730,7 @@ impl Client:
 
     # GET a path on the given authority over this client.
     pub fn get(authority: String, path: String) -> Response!:
-        fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", path), hpack.header_field(":scheme", self.conn.scheme()), hpack.header_field(":authority", authority)]
+        fields := request_fields("GET", self.conn.scheme(), authority, path, NO_FIELDS)
         return self.do_request(fields, bytes.empty())!
 
     # stop the client and close the connection. call it when no request is in
@@ -1744,8 +1741,8 @@ impl Client:
         self.mu.lock()
         self.going_away = true
         self.mu.unlock()
-        # mark closed first, so a concurrent promoter sees it and does not spawn a
-        # reader over a transport we are about to drop.
+        # mark closed first, so a concurrent promoter sees it and does not release
+        # the reader onto a transport we are about to drop.
         self.closed.store(1)
         # release the reader if it is still parked (client never promoted), so it
         # observes closed and exits instead of parking forever.
@@ -2009,7 +2006,7 @@ test "list_remove_int drops the target id":
     assert_eq(list_remove_int([1, 3, 5, 7], 5), [1, 3, 7])
     assert_eq(list_remove_int([1, 3], 9), [1, 3])
 
-# --- robustness tests (phase 4) ---
+# --- robustness tests ---
 
 test "read_response captures trailers after the body":
     # one shared encoder so the single decoder stays in step across both blocks.
@@ -2092,7 +2089,7 @@ test "a WINDOW_UPDATE with a zero increment is a protocol error":
     accums: Map[Int, UnaryAccum] := {}
     assert(handle_frame(client, frame, accums).is_err)
 
-# --- settings enforcement tests (phase 4) ---
+# --- settings enforcement tests ---
 
 test "header_list_size sums names, values, and per-field overhead":
     fields := [hpack.header_field(":method", "GET"), hpack.header_field("x", "yz")]
@@ -2140,7 +2137,7 @@ test "header_block_wire splits a large block into HEADERS + CONTINUATION":
     # the split frames reassemble to exactly the original block.
     assert_eq(hx(reassembled), hx(block))
 
-# --- send-side flow control tests (phase 5a) ---
+# --- send-side flow control tests ---
 
 # register a stream on an offline client with the given send windows, ready for
 # the flow-control helpers to act on it.

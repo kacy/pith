@@ -5,7 +5,7 @@
 //! instructions, the bulk of the input goes through one of the functions
 //! below instead. Each takes a whole run of blocks per call and reports
 //! when it cannot help, so the Pith loop then does the work. Cranelift has
-//! no carry-less multiply or SHA instructions, so Pith code cannot emit
+//! no carry-less multiply, CRC or SHA instructions, so Pith code cannot emit
 //! them itself.
 
 use crate::bytes::pith_bytes_ref;
@@ -24,17 +24,10 @@ pub unsafe extern "C" fn pith_crc32_fold(crc: i64, data: i64, len: i64) -> i64 {
     if len < 64 || len % 16 != 0 || len as u64 > bytes.data.len() as u64 {
         return -1;
     }
-    let input = &bytes.data[..len as usize];
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::arch::is_x86_feature_detected!("pclmulqdq")
-            && std::arch::is_x86_feature_detected!("sse4.1")
-        {
-            return x86::crc32_fold(crc as u32, input) as i64;
-        }
+    match crc32_hw(crc as u32, &bytes.data[..len as usize]) {
+        Some(folded) => folded as i64,
+        None => -1,
     }
-    let _ = (crc, input);
-    -1
 }
 
 /// Run the SHA-256 compression function over `blocks` 64-byte blocks from
@@ -53,29 +46,78 @@ pub unsafe extern "C" fn pith_sha256_blocks(state: i64, data: i64, blocks: i64) 
     if words.len() != 8 || blocks < 0 || (blocks as u64).saturating_mul(64) > bytes.data.len() as u64 {
         return 0;
     }
-    let input = &bytes.data[..blocks as usize * 64];
+    let mut h = [0u32; 8];
+    for (out, &word) in h.iter_mut().zip(words.iter()) {
+        *out = word as u32;
+    }
+    if !sha256_hw(&mut h, &bytes.data[..blocks as usize * 64]) {
+        return 0;
+    }
+    for (word, &out) in words.iter_mut().zip(h.iter()) {
+        *word = out as i64;
+    }
+    1
+}
+
+/// Fold `data` (a multiple of 16 bytes, at least 64) into the CRC-32
+/// register, or None when the CPU lacks the instructions.
+fn crc32_hw(crc: u32, data: &[u8]) -> Option<u32> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("pclmulqdq")
+            && std::arch::is_x86_feature_detected!("sse4.1")
+        {
+            return Some(x86::crc32_fold(crc, data));
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            return Some(arm::crc32_fold(crc, data));
+        }
+    }
+    let _ = (crc, data);
+    None
+}
+
+/// Compress the 64-byte blocks of `data` into `state`, or return false,
+/// with `state` untouched, when the CPU lacks the instructions.
+fn sha256_hw(state: &mut [u32; 8], data: &[u8]) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         if std::arch::is_x86_feature_detected!("sha")
             && std::arch::is_x86_feature_detected!("sse4.1")
         {
-            let mut h = [0u32; 8];
-            for (out, &word) in h.iter_mut().zip(words.iter()) {
-                *out = word as u32;
-            }
-            x86::sha256_blocks(&mut h, input);
-            for (word, &out) in words.iter_mut().zip(h.iter()) {
-                *word = out as i64;
-            }
-            return 1;
+            x86::sha256_blocks(state, data);
+            return true;
         }
     }
-    let _ = input;
-    0
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("sha2") {
+            arm::sha256_blocks(state, data);
+            return true;
+        }
+    }
+    let _ = (state, data);
+    false
 }
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const K256: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
+    use super::K256;
     use std::arch::x86_64::*;
 
     // CRC-32 folding constants for the reflected IEEE polynomial: x^n mod P
@@ -147,17 +189,6 @@ mod x86 {
         _mm_xor_si128(_mm_xor_si128(b, lo), hi)
     }
 
-    const K256: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ];
-
     /// Compress the 64-byte blocks of `data` into `state`. The caller has
     /// checked for sha and sse4.1.
     pub(super) fn sha256_blocks(state: &mut [u32; 8], data: &[u8]) {
@@ -213,86 +244,152 @@ mod x86 {
         _mm_storeu_si128(state.as_mut_ptr() as *mut __m128i, dcba);
         _mm_storeu_si128(state.as_mut_ptr().add(4) as *mut __m128i, hgef);
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+#[cfg(target_arch = "aarch64")]
+mod arm {
+    use super::K256;
+    use std::arch::aarch64::*;
 
-        fn crc32_bitwise(data: &[u8]) -> u32 {
-            let mut crc = !0u32;
-            for &b in data {
-                crc ^= b as u32;
-                for _ in 0..8 {
-                    crc = if crc & 1 == 1 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+    /// Run the CRC-32 register over `data` eight bytes at a time. The
+    /// caller has checked for the crc extension, whose crc32x instruction
+    /// uses the IEEE polynomial.
+    pub(super) fn crc32_fold(crc: u32, data: &[u8]) -> u32 {
+        // SAFETY: the caller checked the CPU feature.
+        unsafe { crc32_fold_impl(crc, data) }
+    }
+
+    #[target_feature(enable = "crc")]
+    unsafe fn crc32_fold_impl(mut crc: u32, data: &[u8]) -> u32 {
+        for word in data.chunks_exact(8) {
+            let mut le = [0u8; 8];
+            le.copy_from_slice(word);
+            crc = __crc32d(crc, u64::from_le_bytes(le));
+        }
+        crc
+    }
+
+    /// Compress the 64-byte blocks of `data` into `state`. The caller has
+    /// checked for the sha2 extension.
+    pub(super) fn sha256_blocks(state: &mut [u32; 8], data: &[u8]) {
+        // SAFETY: the caller checked the CPU feature.
+        unsafe { sha256_blocks_impl(state, data) }
+    }
+
+    #[target_feature(enable = "sha2")]
+    unsafe fn sha256_blocks_impl(state: &mut [u32; 8], data: &[u8]) {
+        let mut abcd = vld1q_u32(state.as_ptr());
+        let mut efgh = vld1q_u32(state.as_ptr().add(4));
+        for block in data.chunks_exact(64) {
+            let (abcd_in, efgh_in) = (abcd, efgh);
+            let at = block.as_ptr();
+            // big-endian words: reverse the bytes of each 32-bit lane
+            let mut w = [
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(at))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(at.add(16)))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(at.add(32)))),
+                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(at.add(48)))),
+            ];
+            for i in 0..16 {
+                // w[i % 4] holds words 4i - 16 .. 4i - 13 until it is replaced
+                // by words 4i .. 4i + 3
+                if i >= 4 {
+                    w[i % 4] = vsha256su1q_u32(
+                        vsha256su0q_u32(w[i % 4], w[(i + 1) % 4]),
+                        w[(i + 2) % 4],
+                        w[(i + 3) % 4],
+                    );
                 }
+                let wk = vaddq_u32(w[i % 4], vld1q_u32(K256.as_ptr().add(i * 4)));
+                let abcd_before = abcd;
+                abcd = vsha256hq_u32(abcd, efgh, wk);
+                efgh = vsha256h2q_u32(efgh, abcd_before, wk);
             }
-            !crc
+            abcd = vaddq_u32(abcd, abcd_in);
+            efgh = vaddq_u32(efgh, efgh_in);
         }
+        vst1q_u32(state.as_mut_ptr(), abcd);
+        vst1q_u32(state.as_mut_ptr().add(4), efgh);
+    }
+}
 
-        fn sample(len: usize, seed: u32) -> Vec<u8> {
-            let mut s = seed;
-            (0..len)
-                .map(|_| {
-                    s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
-                    (s >> 16) as u8
-                })
-                .collect()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn crc32_bitwise(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            }
         }
+        !crc
+    }
 
-        #[test]
-        fn crc32_fold_matches_the_bitwise_definition() {
-            if !is_x86_feature_detected!("pclmulqdq") || !is_x86_feature_detected!("sse4.1") {
+    fn sample(len: usize, seed: u32) -> Vec<u8> {
+        let mut s = seed;
+        (0..len)
+            .map(|_| {
+                s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                (s >> 16) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn crc32_fold_matches_the_bitwise_definition() {
+        for len in (64..=1024).step_by(16) {
+            let data = sample(len, len as u32);
+            let Some(folded) = crc32_hw(!0, &data) else {
                 return;
-            }
-            for len in (64..=1024).step_by(16) {
-                let data = sample(len, len as u32);
-                let folded = !crc32_fold(!0, &data);
-                assert_eq!(folded, crc32_bitwise(&data), "len {len}");
-            }
+            };
+            let folded = !folded;
+            assert_eq!(folded, crc32_bitwise(&data), "len {len}");
         }
+    }
 
-        #[test]
-        fn sha256_blocks_matches_the_known_digest() {
-            if !is_x86_feature_detected!("sha") || !is_x86_feature_detected!("sse4.1") {
-                return;
-            }
-            // "abc" padded to one block
-            let mut block = [0u8; 64];
-            block[..3].copy_from_slice(b"abc");
-            block[3] = 0x80;
-            block[63] = 24;
-            let mut state = [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ];
-            sha256_blocks(&mut state, &block);
-            assert_eq!(
-                state,
-                [
-                    0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223, 0xb00361a3, 0x96177a9c, 0xb410ff61,
-                    0xf20015ad
-                ]
-            );
-
-            // a 56-byte message, which pads to two blocks
-            let msg = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
-            let mut blocks = [0u8; 128];
-            blocks[..56].copy_from_slice(msg);
-            blocks[56] = 0x80;
-            blocks[126] = 0x01;
-            blocks[127] = 0xc0;
-            let mut state = [
-                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-                0x5be0cd19,
-            ];
-            sha256_blocks(&mut state, &blocks);
-            assert_eq!(
-                state,
-                [
-                    0x248d6a61, 0xd20638b8, 0xe5c02693, 0x0c3e6039, 0xa33ce459, 0x64ff2167, 0xf6ecedd4,
-                    0x19db06c1
-                ]
-            );
+    #[test]
+    fn sha256_blocks_matches_the_known_digest() {
+        // "abc" padded to one block
+        let mut block = [0u8; 64];
+        block[..3].copy_from_slice(b"abc");
+        block[3] = 0x80;
+        block[63] = 24;
+        let mut state = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        if !sha256_hw(&mut state, &block) {
+            return;
         }
+        assert_eq!(
+            state,
+            [
+                0xba7816bf, 0x8f01cfea, 0x414140de, 0x5dae2223, 0xb00361a3, 0x96177a9c, 0xb410ff61,
+                0xf20015ad
+            ]
+        );
+
+        // a 56-byte message, which pads to two blocks
+        let msg = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+        let mut blocks = [0u8; 128];
+        blocks[..56].copy_from_slice(msg);
+        blocks[56] = 0x80;
+        blocks[126] = 0x01;
+        blocks[127] = 0xc0;
+        let mut state = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        assert!(sha256_hw(&mut state, &blocks));
+        assert_eq!(
+            state,
+            [
+                0x248d6a61, 0xd20638b8, 0xe5c02693, 0x0c3e6039, 0xa33ce459, 0x64ff2167, 0xf6ecedd4,
+                0x19db06c1
+            ]
+        );
     }
 }

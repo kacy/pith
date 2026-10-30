@@ -6,10 +6,10 @@
 a small language for writing servers. python-shaped syntax, native
 binaries, result types instead of exceptions, reference counting
 instead of a garbage collector. the compiler is written in pith, and
-so is the standard library, all the way down: the tls 1.2 and 1.3
-stack, the http/2 client and server, the postgres and mysql wire
-protocols, the regex engine, gzip. when something goes wrong in the
-stack, you can read the code that did it.
+so is the standard library: the tls 1.2 and 1.3 protocol, the http/2
+client and server, the postgres and mysql wire protocols, the regex
+engine, gzip. when something goes wrong in the stack, you can read the
+code that did it.
 
 ```pith
 import std.web as web
@@ -30,8 +30,9 @@ every route is already wrapped in a trace span and red metrics; an
 inbound `traceparent` joins the caller's trace, `GET /metrics` serves
 prometheus text, and one `obs.init()` call ships spans and metrics to
 an opentelemetry collector. `listen_tls` negotiates http/2 or http/1.1
-over tls 1.2 and 1.3, a sigterm drains in-flight requests before the
-process exits, and rate limiting, circuit breaking, sessions, csrf and
+over tls 1.2 and 1.3, one `shutdown.on_signals()` call makes a sigterm
+drain in-flight requests before the process exits, and rate limiting,
+circuit breaking, sessions, csrf and
 cors are middleware you add one line at a time. no dependencies, one
 static binary, and all of it is standard library you can read
 ([docs/web.md](docs/web.md), [docs/telemetry.md](docs/telemetry.md)).
@@ -72,17 +73,22 @@ fn main() -> Int!:
 enums carry payloads and `match` takes them apart. errors are values:
 `T!` is a result, `fail` makes one, `!` passes it up, `catch` supplies
 a fallback. a function that cannot fail cannot pretend otherwise.
-interpolation takes format specs. there is no null, there are no
-exceptions, and safe code does not panic.
+interpolation takes format specs. there is no null and there are no
+exceptions. an out-of-range index or a missing map key propagates as
+an error inside a `T!` function and stops the process outside one.
 
 ## why you might want it
 
-**the whole stack is readable.** 126 standard library modules, 39,000
-lines, no c and no bindings: the tls implementation, http/1.1 and
-http/2, websockets, grpc, the database wire protocols, json, toml,
-yaml, compression, hashing, a linear-time regex engine. when the
-language could not express something well, that became a language
-feature to build rather than a foreign library to hide behind.
+**the whole stack is readable.** 126 standard library modules, 42,000
+lines of pith: the tls implementation, http/1.1 and http/2,
+websockets, grpc, the database wire protocols, json, toml, yaml,
+compression, hashing, a linear-time regex engine. when the language
+could not express something well, that became a language feature to
+build rather than a foreign library to hide behind. the exceptions
+live in the rust runtime: the cryptographic primitives (aead ciphers,
+key exchange, signatures) come from the `ring` crate, zstd links the
+reference libzstd, and a few hot loops such as the sha block functions
+have native versions.
 
 **it compiles itself, and ci proves it.** the lexer, parser, checker,
 formatter, linter, language server and ir emitter are pith. the build
@@ -111,9 +117,9 @@ one environment variable away.
 style, and `pith lsp` speaks the language server protocol to neovim or
 vs code ([docs/editors.md](docs/editors.md)).
 
-**builds are fast.** hello world compiles in a tenth of a second, the
-http benchmark server in about three, and the entire self-hosted
-compiler in about five.
+**builds are fast.** on the benchmark machine below, hello world
+compiles in about 40 ms, the http benchmark server in about 1.6
+seconds, and the entire self-hosted compiler in about 1.3.
 
 ## the numbers
 
@@ -161,11 +167,13 @@ open defects. the ones to know before you start:
   implementation, and `require_tls13()` refuses the fallback.
 - no package registry. dependencies are local paths in `pith.toml`,
   with `lock` and `install` but nothing that fetches.
-- no debugger. the language server answers a syntax error from the
-  edited file alone, but a full check still walks the whole import
-  closure.
+- no debugger, and a runtime error prints its message without a stack
+  trace.
+- `.value()` on an optional does not check for `none`; use `if let`,
+  `match` or `unwrap_or` unless you have already checked.
 - gzip compresses with fixed huffman only, and the regex engine skips
-  counted repeats, lazy quantifiers and lookaround on purpose.
+  counted repeats, backreferences, lazy quantifiers and lookaround on
+  purpose.
 
 ## quick start
 
@@ -236,7 +244,7 @@ non-trivial pith look like."
 | `pith doc <file>` | docs; `--check` requires every pub item documented |
 | `pith lsp` | language server over stdio |
 | `pith new <dir>` | scaffold a package |
-| `pith package <cmd>` | check, test, lint, doc, deps, lock, install, inspect |
+| `pith package <cmd>` | check, test, lint, doc, deps, lock, install, inspect, context |
 
 local packages resolve through `pith.toml`:
 
@@ -255,7 +263,7 @@ from greeter import greet
 make build            # native backend
 make self-host        # the compiler, compiled by itself
 make test             # the full suite
-make run-examples     # 129 example programs against snapshots
+make run-examples     # 131 example programs against snapshots
 make status-audit     # current corpus and size numbers
 ```
 
@@ -267,10 +275,10 @@ self-host/     the compiler, in pith: lexer, parser, checker,
 cranelift/     the native backend, in rust: ir consumer, codegen,
                runtime (arc, collections, net)
 std/           the standard library
-examples/      139 runnable programs, 132 with expected output
+examples/      141 runnable programs, 134 with expected output
 tests/         regression, invalid-program, leak, and golden fixtures
 tools/         real programs in pith: codegen, generators, fuzzers,
-               log and parquet readers
+               a log analyzer, a worker pool
 docs/          architecture, ownership, errors, grammar, limitations
 ```
 

@@ -3,14 +3,13 @@
 //! a pipe is pollable, so none of this needs a thread pool: the read and write
 //! loops in `fdio` yield a green task to the epoll reactor when the pipe is not
 //! ready and retry when it is. `process` puts the fds in non-blocking mode at
-//! spawn time under green; off a green task the same loops block, exactly as
-//! this file always did.
+//! spawn time under green; off a green task the same loops block.
 //!
 //! the one rule the shape here exists to keep is that the handle registry's
 //! lock is never held across that yield. each entry point takes the lock only
 //! long enough to look up the pipe's handle, then takes its own hold on that
 //! handle (`fd_handle::acquire`) and does its syscall outside the lock. holding
-//! it across a park would deadlock at one worker — the parked task cannot
+//! it across a park would deadlock at one worker: the parked task cannot
 //! resume to release the lock while its own worker sits blocked on that lock
 //! for another task. the hold is what keeps the pipe's descriptor from being
 //! closed and its number reused while the syscall is inside; a process handle
@@ -27,21 +26,10 @@ use crate::process::{process_handles, Pipe};
 enum PipeRead {
     /// the bytes read. empty means end of stream.
     Data(Vec<u8>),
-    /// the child has no such pipe, reported as end of stream — which is what
-    /// this file has always done with it.
+    /// the child has no such pipe, reported as end of stream.
     Absent,
     /// an unknown handle or a failed read.
     Failed,
-}
-
-/// the byte count one read asks for. a non-positive `max_bytes` means "a
-/// default chunk", as it always has.
-fn chunk_size(max_bytes: i64) -> usize {
-    if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    }
 }
 
 /// a hold on one of a child's pipes, taking the registry lock only for the
@@ -69,7 +57,7 @@ fn read_pipe(handle: i64, pipe: Pipe, max_bytes: i64) -> PipeRead {
         Some(None) => return PipeRead::Absent,
         None => return PipeRead::Failed,
     };
-    match fdio::read_yielding(&guard, chunk_size(max_bytes)) {
+    match fdio::read_yielding(&guard, fdio::chunk_size(max_bytes)) {
         Some(buf) => PipeRead::Data(buf),
         None => PipeRead::Failed,
     }
@@ -181,8 +169,8 @@ mod tests {
 
     #[test]
     fn a_non_positive_read_size_asks_for_the_default_chunk() {
-        assert_eq!(chunk_size(0), 4096);
-        assert_eq!(chunk_size(-1), 4096);
-        assert_eq!(chunk_size(7), 7);
+        assert_eq!(fdio::chunk_size(0), 4096);
+        assert_eq!(fdio::chunk_size(-1), 4096);
+        assert_eq!(fdio::chunk_size(7), 7);
     }
 }

@@ -94,16 +94,6 @@ fn read_chunk(file: &mut File, size: usize) -> Option<Vec<u8>> {
     }
 }
 
-/// the byte count a streaming write asks for, matching what the callers used to
-/// compute inline: a non-positive `max_bytes` means "a default chunk".
-fn chunk_size(max_bytes: i64) -> usize {
-    if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        4096
-    }
-}
-
 /// write once, returning the bytes accepted. a short write is reported as it
 /// happened; the caller loops. a failure is the os's description of it
 /// (`Bad file descriptor (os error 9)` for a handle opened for reading).
@@ -422,7 +412,7 @@ pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
 /// to protect. `None` covers both an unknown handle and a read error, which is
 /// what the callers already collapse them to.
 fn read_handle_chunk(handle: i64, max_bytes: i64) -> Option<Vec<u8>> {
-    let size = chunk_size(max_bytes);
+    let size = crate::fdio::chunk_size(max_bytes);
     if !blocking::offloads() {
         let mut handles = file_handles().lock();
         return read_chunk(handles.get_mut(&handle)?, size);
@@ -637,7 +627,7 @@ pub unsafe extern "C" fn pith_list_dir(path: *const i8) -> i64 {
         None => None,
     };
 
-    // an unreadable directory is an empty list, not an error, as before. the
+    // an unreadable directory is an empty list, not an error. the
     // list and its strings are pith objects, so they are built here rather than
     // on the pool thread.
     let list = pith_list_new(8, 1);

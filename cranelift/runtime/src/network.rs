@@ -346,19 +346,6 @@ pub extern "C" fn pith_tcp_accept(server: i64) -> i64 {
     result
 }
 
-/// how many bytes a read asks for when the caller gives no limit.
-const DEFAULT_READ_SIZE: usize = 4096;
-
-/// the size one read asks for. a non-positive `max_bytes` means the default
-/// chunk.
-fn read_size(max_bytes: i64) -> usize {
-    if max_bytes > 0 {
-        max_bytes as usize
-    } else {
-        DEFAULT_READ_SIZE
-    }
-}
-
 /// one read from a connection handle, whichever backend is running: the green
 /// path yields the task to the reactor on would-block, the os-thread path blocks
 /// in the kernel. `None` is a failure (a stale handle, a closed connection, or
@@ -393,11 +380,11 @@ fn socket_write(conn: i64, data: &[u8]) -> Result<usize, fdio::WriteError> {
     }
 }
 
-/// TCP read: read up to `DEFAULT_READ_SIZE` bytes from a connection, returned
+/// TCP read: read up to `fdio::DEFAULT_CHUNK` bytes from a connection, returned
 /// as a C string (lossy utf-8), or null on failure.
 #[no_mangle]
 pub extern "C" fn pith_tcp_read(conn_fd: i64) -> *mut i8 {
-    match socket_read(conn_fd, DEFAULT_READ_SIZE) {
+    match socket_read(conn_fd, fdio::DEFAULT_CHUNK) {
         Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
         None => std::ptr::null_mut(),
     }
@@ -406,7 +393,7 @@ pub extern "C" fn pith_tcp_read(conn_fd: i64) -> *mut i8 {
 /// TCP read with max bytes limit
 #[no_mangle]
 pub extern "C" fn pith_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
-    match socket_read(conn_fd, read_size(max_bytes)) {
+    match socket_read(conn_fd, fdio::chunk_size(max_bytes)) {
         Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
         None => std::ptr::null_mut(),
     }
@@ -414,7 +401,7 @@ pub extern "C" fn pith_tcp_read2(conn_fd: i64, max_bytes: i64) -> *mut i8 {
 
 #[no_mangle]
 pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
-    match socket_read(conn_fd, read_size(max_bytes)) {
+    match socket_read(conn_fd, fdio::chunk_size(max_bytes)) {
         Some(buf) => pith_bytes_from_vec(buf),
         None => 0,
     }

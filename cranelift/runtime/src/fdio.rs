@@ -59,6 +59,19 @@ pub(crate) fn set_nonblocking(fd: RawFd) {
     }
 }
 
+/// how many bytes a read asks for when the caller gives no limit.
+pub(crate) const DEFAULT_CHUNK: usize = 4096;
+
+/// the byte count one read asks for: `max_bytes`, or `DEFAULT_CHUNK` when it
+/// is not positive. shared by the socket, pipe and file reads.
+pub(crate) fn chunk_size(max_bytes: i64) -> usize {
+    if max_bytes > 0 {
+        max_bytes as usize
+    } else {
+        DEFAULT_CHUNK
+    }
+}
+
 /// the longest wait anything here asks for, in milliseconds: a shade under 25
 /// days.
 ///

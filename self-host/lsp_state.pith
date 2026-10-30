@@ -136,12 +136,11 @@ pub fn document_text(uri: String) -> String:
         return open_docs[uri]
     return ""
 
-## every uri the client holds open.
+## every uri the client holds open, sorted. map key order follows the
+## hash of the absolute uris, so publishing in that order would make the
+## sequence of messages depend on where the project is checked out.
 pub fn open_document_uris() -> List[String]:
-    mut uris: List[String] := []
-    for uri in open_docs.keys():
-        uris.push(uri)
-    return uris
+    return open_docs.keys().sort()
 
 ## the uri waiting for analysis, cleared by the caller; "" when clean.
 pub fn take_dirty() -> String:

@@ -1,10 +1,8 @@
 # lexer.pith — pith lexer written in pith
 #
-# the first self-hosted component. reads a .pith source file and prints
-# the token stream in the same format as `pith lex`.
-#
-# usage: pith run self-host/lexer.pith <file.pith>
-# import: from lexer import Token, init_lexer, lex_all
+# turns source text into a token stream. lex_all() is the entry point;
+# it also loads the stream into the token table the parser reads through
+# the tok_* accessors.
 
 # ---------------------------------------------------------------
 # token type
@@ -28,6 +26,9 @@ pub struct Token:
     pub offset: Int
     pub len: Int
 
+# the brace characters, set by init_lexer. a brace inside a string literal
+# starts an interpolation, so the lexer builds them with chr() instead of
+# writing them as literals.
 mut LBRACE := ""
 mut RBRACE := ""
 
@@ -172,9 +173,6 @@ fn source_char(pos: Int) -> String:
 fn advance() -> String:
     character := source_char(current_position)
     current_position = current_position + 1
-    # one character, one column — this used to also increment
-    # unconditionally above the branch, so every character consumed
-    # through advance() moved the column by two
     if is_newline_char(character):
         current_line = current_line + 1
         current_column = 0
@@ -230,8 +228,8 @@ fn skip_spaces():
         else:
             return
 
-# the main lexer function. returns (kind, value) by setting globals.
-# callers should read current_token_kind, current_token_value, current_token_line, current_token_column after calling.
+# the token next_token() produced last. next_token() returns nothing and
+# sets these instead, so a caller reads them straight after each call.
 mut current_token_kind := ""
 mut current_token_value := ""
 mut current_token_line := 0
@@ -240,9 +238,9 @@ mut current_token_offset := 0
 mut current_token_len := 0
 
 # where the token being scanned starts. captured before the scan consumes
-# anything, so emit() reports the position a reader would point at — the
-# token's first character — rather than wherever the scan finished, which
-# used to put every column off by roughly the token's own width.
+# anything, so emit() reports the token's first character instead of
+# wherever the scan finished, which would put every column off by roughly
+# the token's own width.
 mut token_start_line := 1
 mut token_start_column := 1
 mut token_start_offset := 0
@@ -1037,7 +1035,6 @@ fn scan_operator():
 # driving the scanner one token at a time. it does not clear the loaded
 # token table that tok_kind() and friends read.
 pub fn init_lexer(src: String):
-    # init brace characters via chr() since we can't write them as literals
     LBRACE = chr(123)
     RBRACE = chr(125)
     source = src
@@ -1181,7 +1178,3 @@ pub fn lex_all(src: String) -> List[Token]:
         if current_token_kind == "eof":
             keep_going = false
     return tokens
-
-# ---------------------------------------------------------------
-# main
-# ---------------------------------------------------------------

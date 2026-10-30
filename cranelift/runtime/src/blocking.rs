@@ -6,7 +6,7 @@
 //! polled at all: `getaddrinfo` has nothing to wait on, and a regular file is
 //! *always* reported ready by epoll no matter how slow the disk behind it is.
 //!
-//! for those there is only one shape that works — keep the blocking call, but
+//! for those there is only one shape that works: keep the blocking call, but
 //! make some other thread do it. this module is that shape: a pool of ordinary
 //! OS threads takes a job, the green task parks, and the pool thread wakes it
 //! when the result is ready. the worker is free the whole time.
@@ -18,9 +18,9 @@
 //!
 //! ## what may cross to a pool thread
 //!
-//! plain owned data, and nothing else. pith handles are not thread-agnostic —
-//! the struct pool is a thread-local freelist and there is other thread-local
-//! state besides — so a handle allocated on a pool thread and later freed by
+//! plain owned data, and nothing else. pith handles are not thread-agnostic
+//! (the struct pool is a thread-local freelist and there is other thread-local
+//! state besides), so a handle allocated on a pool thread and later freed by
 //! the task's worker would cross freelists, silently. jobs therefore return a
 //! `Vec<u8>`, an `i64`, a `bool`, a `std::fs::File`: things the OS or the
 //! global allocator owns. every pith-visible value is built afterwards, back on
@@ -43,8 +43,8 @@ use std::time::{Duration, Instant};
 
 /// is the caller a green task whose worker we should keep free?
 ///
-/// callers that would have to copy something to hand it over — the content of a
-/// write, say — check this first and take the direct path untouched when it is
+/// callers that would have to copy something to hand it over (the content of a
+/// write, say) check this first and take the direct path untouched when it is
 /// false, so the os-thread backend pays nothing for a facility it does not use.
 pub(crate) fn offloads() -> bool {
     offload_target().is_some()
@@ -78,8 +78,8 @@ where
         // report the default, which every caller already reads as failure: an
         // empty answer, a zero byte count, a `None`.
         //
-        // the closure is only unwind-safe in the sense that matters — nothing
-        // it captures outlives the job — so assert it rather than pushing the
+        // the closure is only unwind-safe in the sense that matters (nothing
+        // it captures outlives the job), so assert it rather than pushing the
         // bound onto every caller.
         let value = std::panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_default();
         publish.complete(value);
@@ -103,8 +103,8 @@ where
 
 /// how long a task waits on-CPU for its job before it gives up and parks.
 ///
-/// a park is two thread wakeups — the pool thread to start the job, this
-/// worker to resume afterwards — and on a small machine that costs far more
+/// a park is two thread wakeups (the pool thread to start the job, this
+/// worker to resume afterwards), and on a small machine that costs far more
 /// than a read the page cache answers. so wait a moment first: this is roughly
 /// what the same call would have held the worker for if it had run inline, and
 /// anything slower than it (a real disk, a network mount, a large transfer)
@@ -170,7 +170,7 @@ fn offload_target() -> Option<usize> {
 
 /// where a pool thread leaves the result for the task that asked for it.
 struct Slot<T> {
-    /// green slab id of the parked task, passed straight to `green::wake`.
+    /// green task id of the parked task, passed straight to `green::wake`.
     task: usize,
     /// set once the result is in `value`, so a waiter can check for it without
     /// touching the mutex the publisher needs.
@@ -222,8 +222,8 @@ impl<T> Slot<T> {
     }
 }
 
-/// one queued unit of work. the result type is erased here — the job already
-/// knows which slot to publish to — so a single queue serves every caller.
+/// one queued unit of work. the result type is erased here (the job already
+/// knows which slot to publish to), so a single queue serves every caller.
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// the queue the pool threads share, plus the bookkeeping `ensure_worker`
@@ -272,7 +272,7 @@ impl Pool {
     /// false means the pool has no thread at all and the OS refused to give us
     /// one; the caller then does the work itself rather than queueing it
     /// somewhere nothing will run it. asking before handing the job over keeps
-    /// the fallback trivial — there is no job to take back.
+    /// the fallback trivial: there is no job to take back.
     ///
     /// threads are never retired. the cap is small, an idle one costs a parked
     /// futex wait and its stack, and a program that blocked once is very likely
@@ -317,7 +317,7 @@ impl Pool {
     ///
     /// a thread stays hot for a moment before it goes to sleep. a program that
     /// made one blocking call usually makes another right behind it, and a
-    /// sleeping thread costs that next caller a wakeup — the same wakeup its
+    /// sleeping thread costs that next caller a wakeup, the same wakeup its
     /// own spin in `run` is trying to avoid. the two together are what make
     /// back-to-back small reads cheap.
     fn next_job(&self) -> Job {
@@ -471,7 +471,7 @@ mod tests {
         std::thread::spawn(move || publish.complete(9));
         // the spawn may lose the race on a busy machine, so accept either
         // outcome and only insist that a result seen in the wait is the right
-        // one — never a torn or missing value.
+        // one, never a torn or missing value.
         if let Some(value) = spin_briefly(&slot) {
             assert_eq!(value, 9);
         } else {
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn work_outside_a_green_task_runs_inline() {
         // nothing in a unit test runs on a green worker, so `run` must take the
-        // direct path — same thread, same answer.
+        // direct path: same thread, same answer.
         assert!(!offloads());
         let here = std::thread::current().id();
         assert!(run(&TEST_POOL, move || std::thread::current().id() == here));

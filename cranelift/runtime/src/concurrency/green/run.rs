@@ -68,10 +68,11 @@ pub(super) fn finish_task(id: TaskId, result: i64) {
 /// returned) or put back (the task suspended).
 pub(super) fn run_task(id: TaskId) {
     // claim the task on its scheduling word: Ready -> Running, pinning it to
-    // this worker on first resume (whoever runs it first owns it forever, and
-    // the owner rides in the word so a waker can read it lock-free). finding
-    // it not Ready (someone else already claimed a double-enqueued id, or it
-    // is gone) means there is nothing to do.
+    // this worker on first resume (whoever runs it first owns it until a
+    // migrating wake or `steal_pinned` moves it, and the owner rides in the
+    // word so a waker can read it lock-free). finding it not Ready (someone
+    // else already claimed a double-enqueued id, or it is gone) means there is
+    // nothing to do.
     let Some(block) = sync_block(id) else {
         return;
     };
@@ -131,7 +132,7 @@ pub(super) fn run_task(id: TaskId) {
         worker.resumes.store(resumes + 1, AtomicOrdering::Relaxed);
     }
 
-    // run outside the lock. SAFETY of the transmute-and-call lives inside the
+    // the SAFETY argument for the transmute-and-call lives inside the
     // coroutine body (see green_spawn); here we just drive the coroutine.
     //
     // wrap the resume in `catch_unwind` so a panic raised in pith JIT/FFI code
@@ -141,10 +142,10 @@ pub(super) fn run_task(id: TaskId) {
     // would silently retire a worker AND leave its `join.done` unset, hanging
     // every awaiter forever. corosensei re-raises a coroutine panic out of
     // `resume` (it has already unwound the coroutine's own stack, so `coro` is
-    // complete and must never be resumed again — the panic arm drops it).
+    // complete and must never be resumed again; the panic arm drops it).
     //
     // AssertUnwindSafe: `coro` (a `SendCoroutine`) is not `UnwindSafe`, but a
-    // caught panic here does not observe it in a broken state — we never resume
+    // caught panic here does not observe it in a broken state: we never resume
     // the coroutine after a panic, we drop it. no other captured state crosses
     // the boundary. so asserting unwind-safety is sound.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| coro.0.resume(())));
@@ -168,7 +169,7 @@ pub(super) fn run_task(id: TaskId) {
         }
         Err(_panic) => {
             // the coroutine's body panicked. corosensei already unwound the
-            // coroutine's own stack, so `coro` is complete — we drop it here and
+            // coroutine's own stack, so `coro` is complete; we drop it here and
             // never resume it again. the default panic hook has already printed
             // the message to stderr; our job is to make sure the task's awaiters
             // do not hang. mark the task done with a zero result (a failed task
@@ -186,8 +187,8 @@ pub(super) fn run_task(id: TaskId) {
             //
             // put the coroutine back BEFORE the word transition below makes the
             // task claimable: once the word reads Parked a waker may re-enqueue
-            // the task, and its next resume — always on this same worker, by
-            // pinning — must find the coroutine present. the transition CAS
+            // the task, and its next resume, on whichever worker claims it,
+            // must find the coroutine present. the transition CAS
             // releases this write to the next claimant (see the claim protocol
             // on `SyncBlock`). the yielder cell needs no write here: the body
             // published it on its first resume and the `Yielder` lives on the
@@ -204,7 +205,7 @@ pub(super) fn run_task(id: TaskId) {
             //   - the wake flag: a block-site wake landed while we were still
             //     Running (the wake/park race) -> `pinned`, resume promptly.
             //   - neither: a plain block -> Parked; the block site re-enqueues us.
-            // a wake can land between the load and the CAS — the retry sees its
+            // a wake can land between the load and the CAS; the retry sees its
             // flag, so it is never lost.
             let mut word = block.word.load(AtomicOrdering::Acquire);
             let requeue = loop {

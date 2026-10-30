@@ -1,8 +1,8 @@
 //! Atomic integer cell
 //!
 //! A single shared integer that any task can read and write safely. Used
-//! where a value must cross a task boundary without a lock or a channel —
-//! a cancellation code, a shared counter — so the value stays coherent
+//! where a value must cross a task boundary without a lock or a channel
+//! (a cancellation code, a shared counter), so the value stays coherent
 //! across threads while a plain collection would race.
 
 use crate::handle_registry;

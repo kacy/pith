@@ -5,7 +5,7 @@
 # the machine-readable output is a contract with whatever ci consumes it, so it
 # is pinned line for line rather than grepped: a record that quietly loses a
 # field, renames an outcome or reorders its keys still passes a grep and breaks
-# every reader. the prose runs are here for the same reason on the tag side —
+# every reader. the prose runs are here for the same reason on the tag side:
 # they pin which tests a selection runs and what the runner says when a tag
 # names nothing.
 #

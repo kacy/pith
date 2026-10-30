@@ -4,11 +4,11 @@
 //!
 //! Like [`channel`], a waitgroup serves two kinds of waiter at once. An
 //! **os-thread** caller (the main thread, or the whole os-thread task backend)
-//! that would block on `wait()` condvar-waits, exactly as it always has. A
-//! **green task** (under `PITH_GREEN`) must not park its worker OS thread — it
-//! registers itself on `green_waiters` under the waitgroup lock and suspends its
-//! coroutine back to the scheduler, freeing the worker to run other tasks; the
-//! `done()` that drains the counter to zero re-enqueues it. `done()` therefore
+//! that would block on `wait()` condvar-waits. A **green task** must not park
+//! its worker OS thread, so it registers itself on `green_waiters` under the
+//! waitgroup lock and suspends its coroutine back to the scheduler, freeing
+//! the worker to run other tasks; the `done()` that drains the counter to zero
+//! re-enqueues it. `done()` therefore
 //! wakes the green waiters alongside its `cvar.notify_all()`, so whichever kind
 //! is parked makes progress.
 //!
@@ -52,7 +52,7 @@ fn wait_state<'a>(
 ) -> MutexGuard<'a, WaitGroupState> {
     // the wait is a native window for the cycle collector: no heap handle is
     // read until the condvar hands the lock back. the bracket's exit runs
-    // holding the re-acquired waitgroup lock, which is safe — a stop that
+    // holding the re-acquired waitgroup lock, which is safe: a stop that
     // parks us there stops only mutators, and the collection pass itself
     // never takes a waitgroup lock.
     let _native = crate::cycle::native_bracket();
@@ -71,9 +71,9 @@ fn wake_green_waiters(state: &mut WaitGroupState) {
 }
 
 /// block the current `wait()` caller until the next `done()`. an os-thread
-/// caller condvar-waits as before; a green task registers on `green_waiters`
-/// under the lock, releases it, and suspends its coroutine (never holding the
-/// lock across the suspend — the worker may re-enter this waitgroup).
+/// caller condvar-waits; a green task registers on `green_waiters` under the
+/// lock, releases it, and suspends its coroutine (never holding the lock
+/// across the suspend, since the worker may re-enter this waitgroup).
 fn block_on_wait<'a>(
     lock: &'a Mutex<WaitGroupState>,
     cvar: &Condvar,
@@ -151,7 +151,7 @@ pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
     };
     let (lock, cvar) = &**wg;
     // computed once: whether we run inside a green task does not change across a
-    // suspend/resume. None => os-thread caller => condvar-wait as before.
+    // suspend/resume. None means an os-thread caller, which condvar-waits.
     let green_task = green::current_task();
     let mut guard = lock_state(lock);
     while guard.count > 0 {

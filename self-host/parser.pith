@@ -1,12 +1,11 @@
 # parser.pith — recursive descent parser for pith
 #
 # consumes a token list from the lexer and builds an arena-indexed AST.
-# self-hosted parser implementation.
-#
-# usage: import from parse_main.pith or call parse() directly
+# the entry points are parse_with_file() and parse(); parse_main.pith is
+# a small command-line wrapper around them.
 
 from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr
-from ast import Node, add_node, add_node_with_type_args, add_leaf, get_node
+from ast import add_node, add_node_with_type_args, add_leaf, get_node
 from errors import Diagnostic
 
 # ---------------------------------------------------------------
@@ -15,7 +14,7 @@ from errors import Diagnostic
 
 mut current_token_position := 0
 mut recursion_depth := 0
-mut max_depth := 256
+max_depth := 256
 mut parser_file_path := ""
 mut parser_diag_list: List[Diagnostic] := []
 # the module aliases this file's imports introduce (`import std.json` puts
@@ -83,10 +82,10 @@ fn _peek_ahead_value(offset: Int) -> String:
 # position-aware AST helpers (must come after state declarations)
 # -------------------------------------------------------------
 
-# Get line and column for the node being built. nodes are added after
-# their tokens are consumed, so the just-consumed token carries the
-# right position — the upcoming token often sits on the next line,
-# which used to shift every end-of-line construct's position down one.
+# line and column for the node being built. nodes are added after their
+# tokens are consumed, so the position comes from the just-consumed token:
+# the upcoming one often sits on the next line, which would shift every
+# end-of-line construct down a line.
 fn get_current_position() -> (Int, Int):
     tc := tok_count()
     if tc == 0:
@@ -134,12 +133,6 @@ fn parser_report_error_here(code: String, message: String, fix: String):
     pos := parser_error_position()
     parser_report_error_at(pos.0, pos.1, code, message, fix)
 
-# lexer error tokens are all reported up front by
-# report_lexer_error_tokens; the in-parse recovery paths still advance
-# past them but no longer re-report, so each error appears once.
-fn parser_report_lexer_error_here():
-    return
-
 # an error token's value is either a descriptive message the lexer
 # built (an unterminated string, a bad dedent) or the raw offending
 # character. a multi-word value is already a message; anything else is
@@ -182,12 +175,12 @@ pub fn parser_diagnostics() -> List[Diagnostic]:
 pub fn parser_has_errors() -> Bool:
     return parser_diag_list.len() > 0
 
-# Wrapper that adds node with current position
+# add a node at the position of the token just consumed
 fn add_node_with_position(kind: String, value: String, children: List[Int]) -> Int:
     mut pos := get_current_position()
     return add_node(kind, value, children, pos.0, pos.1)
 
-# Wrapper that adds leaf with current position
+# add a leaf at the position of the token just consumed
 fn add_leaf_with_position(kind: String, value: String) -> Int:
     mut pos := get_current_position()
     return add_leaf(kind, value, pos.0, pos.1)
@@ -284,7 +277,6 @@ fn snapshot_token_lens() -> List[Int]:
         i = i + 1
     return snapshot
 
-# safe EOF token for empty token list cases
 # ---------------------------------------------------------------
 # token navigation
 # ---------------------------------------------------------------
@@ -315,7 +307,6 @@ fn match_tok(kind: String) -> Bool:
     return false
 
 fn expect(kind: String) -> Token:
-    # token via _cur_tok_kind/_cur_tok_value
     cur_kind := _cur_tok_kind()
     if cur_kind == kind:
         return advance_token()
@@ -323,9 +314,9 @@ fn expect(kind: String) -> Token:
     if cur_kind == "eof":
         parser_report_error_at(pos.0, pos.1, "E241", "unexpected end of file, expected " + kind, "")
         return Token(kind, "", pos.0, pos.1, 0, 0)
-    if cur_kind == "err":
-        parser_report_lexer_error_here()
-    else:
+    # an err token was already reported by report_lexer_error_tokens before
+    # parsing began, so recovery skips it without a second diagnostic.
+    if cur_kind != "err":
         parser_report_error_at(pos.0, pos.1, "E240", "expected " + kind + " but found " + cur_kind, "")
     advance_token()
     return Token(kind, "", pos.0, pos.1, 0, 0)
@@ -875,12 +866,11 @@ fn parse_primary() -> Int:
     if _cur_tok_kind() == "kw_fn":
         return parse_lambda()
 
-    # unexpected token — skip it
-    if _cur_tok_kind() == "err":
-        parser_report_lexer_error_here()
-    elif _cur_tok_kind() == "eof":
+    # unexpected token: report it and skip it. an err token was already
+    # reported by report_lexer_error_tokens.
+    if _cur_tok_kind() == "eof":
         parser_report_error_here("E241", "unexpected end of file while parsing expression", "")
-    else:
+    elif _cur_tok_kind() != "err":
         parser_report_error_here("E242", "unexpected token in expression: " + _cur_tok_kind(), "")
     _tv := _cur_tok_value()
     advance_token()
@@ -1456,12 +1446,11 @@ fn parse_pattern() -> Int:
         expect("rparen")
         return add_node_from_mark("pat_tuple", "", patterns, mark)
 
-    # unexpected — advance to avoid infinite loop
-    if _cur_tok_kind() == "err":
-        parser_report_lexer_error_here()
-    elif _cur_tok_kind() == "eof":
+    # unexpected token: report it (an err token already was) and advance,
+    # so the caller's loop cannot spin on it
+    if _cur_tok_kind() == "eof":
         parser_report_error_here("E241", "unexpected end of file while parsing pattern", "")
-    else:
+    elif _cur_tok_kind() != "err":
         parser_report_error_here("E242", "unexpected token in pattern: " + _cur_tok_kind(), "")
     advance_token()
     return add_leaf_with_position("pat_wildcard", "_")
@@ -1903,9 +1892,8 @@ fn parse_top_level_decl() -> Int:
             advance_token()
             decl = add_leaf_with_position("error", "expected declaration")
     else:
-        if cur_kind == "err":
-            parser_report_lexer_error_here()
-        else:
+        # an err token was already reported by report_lexer_error_tokens
+        if cur_kind != "err":
             parser_report_error_here("E242", "expected declaration", "")
         advance_token()
         decl = add_leaf_with_position("error", "expected declaration")

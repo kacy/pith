@@ -8,7 +8,7 @@ use super::*;
 /// matters: it only covers the sliver where an enqueue's notify races our
 /// decision to sleep, and any enqueue that loses that race still wakes us
 /// through `wake_worker`. the maximum only bounds how long a worker can
-/// sleep through a wake that never arrives — nothing depends on it for
+/// sleep through a wake that never arrives. nothing depends on it for
 /// correctness, since both the enqueue path and the collector's stop
 /// request notify the pool explicitly.
 pub(super) const PARK_TIMEOUT_MIN: Duration = Duration::from_millis(1);
@@ -52,11 +52,12 @@ pub(super) fn with_own_cache<R>(f: impl FnOnce(&mut WorkerCache) -> R) -> Option
 #[repr(align(64))]
 pub(super) struct Worker {
     /// fresh, never-resumed tasks. stealable by peers because a fresh coroutine
-    /// carries no live stack (see the pinning note).
+    /// carries no live stack (see the placement note in the module doc).
     pub(super) local: StealQueue,
-    /// woken started tasks pinned to this worker. only this worker drains it, so
-    /// a suspended coroutine only ever resumes on the thread that first ran it.
-    /// `next` is the single task a same-worker wake asks to run first — the other
+    /// woken started tasks owned by this worker. this worker drains it; a peer
+    /// takes from the fifo only once this worker has been stuck in one task for
+    /// a while (`steal_pinned`), and then becomes the task's owner.
+    /// `next` is the single task a same-worker wake asks to run first: the other
     /// half of a handoff, still cache-hot. two things keep that preference from
     /// starving the fifo behind it: the slot holds exactly ONE task, so a second
     /// same-worker wake displaces the first to the BACK of the fifo instead of
@@ -72,15 +73,15 @@ pub(super) struct Worker {
     /// priority (after pinned, local, injector, and stealing). a compute task that
     /// overran its quantum lands here so it yields to every other ready task on the
     /// worker; without this it would sit at the front of `pinned` and simply be
-    /// re-selected, right back into the loop that got it preempted. also pinned to
-    /// the owner, so a suspended coroutine still never crosses a worker.
+    /// re-selected, right back into the loop that got it preempted. only the
+    /// owner drains it; `steal_pinned` never looks here.
     pub(super) deferred: Mutex<VecDeque<TaskId>>,
     /// free stacks and task ids for this worker's own use (see
     /// `with_own_cache`).
     pub(super) cache: OwnerOnly<WorkerCache>,
     /// whether this worker is currently parked in its poller (`netpoll::
     /// idle_wait`). each worker parks on its own spot, so a wake can target
-    /// exactly the worker that is able to run the task — crucially, a *pinned*
+    /// exactly the worker that is able to run the task. crucially, a *pinned*
     /// wake nudges only the task's owner instead of a pool-wide notify that also
     /// wakes idle peers which have nothing to run. the flag lets `wake_worker`
     /// skip the notify entirely when the target is busy running tasks, the
@@ -98,8 +99,8 @@ pub(super) struct Worker {
     /// the id (`id + 1`, 0 = none) of the task this worker is currently
     /// resuming. written right before `resume` and cleared right after, so the
     /// monitor thread can spot a task that has been on-CPU too long. the monitor
-    /// only ever reads this (and `running_since`) via atomics — it never touches a
-    /// queue or coroutine — so it cannot race the worker over shared structure.
+    /// only ever reads this (and `running_since`) via atomics and never touches
+    /// a queue or coroutine, so it cannot race the worker over shared structure.
     pub(super) running_task: AtomicUsize,
     /// the epoch (`PREEMPT_EPOCH`) at which this worker began resuming its current
     /// task. the monitor and `pith_green_maybe_yield` compare it against the
@@ -115,13 +116,13 @@ pub(super) struct Worker {
 /// steal. only fresh, never-resumed tasks travel those queues: a fresh task
 /// has no `owner` yet and sits `Ready`. if either were false here, a started
 /// task's coroutine would be about to resume from a queue that is not its
-/// owner's — outside the claim protocol that hands a suspended coroutine
+/// owner's, outside the claim protocol that hands a suspended coroutine
 /// between threads (a wake's Parked -> Ready CAS, see `claim_parked`). cheap,
 /// and compiled out in release.
 ///
 /// history worth keeping: re-homing a parked task to the worker that wakes it
-/// (now the default, see `claim_parked`) was first tried before the runtime's own rust
-/// frames stopped holding thread-local addresses across a suspend, and it
+/// (now the default, see `claim_parked`) was first tried before the runtime's
+/// own rust frames stopped holding thread-local addresses across a suspend, and it
 /// silently dropped channel messages. the coroutine stack was never the
 /// problem and neither was the pith compiler (a `threadlocal` global lowers
 /// to a call, and `CURRENT_TLS` is per-task); see the accessor block above
@@ -215,8 +216,8 @@ pub(super) fn find_work(index: usize, deferred_first: bool) -> Option<TaskId> {
         }
     }
 
-    // deferred last: only resume a preempted compute task once there is genuinely
-    // nothing else — no owned woken work, no fresh work anywhere to run or steal.
+    // deferred last: only resume a preempted compute task once there is
+    // nothing else: no owned woken work, no fresh work anywhere to run or steal.
     // this is what lets the other tasks on this worker make progress before the
     // hog runs again.
     pop_deferred(index)
@@ -285,8 +286,9 @@ pub(super) fn pop_deferred(index: usize) -> Option<TaskId> {
         .pop_front()
 }
 
-/// cheap per-thread rotating start index for steal victim selection. no strong
-/// randomness needed — just avoid every worker probing the same victim first.
+/// cheap per-thread rotating start index for steal victim selection. it needs
+/// no real randomness, only to keep every worker from probing the same victim
+/// first.
 pub(super) fn steal_start(n: usize) -> usize {
     thread_local! {
         static COUNTER: Cell<usize> = const { Cell::new(0) };
@@ -326,8 +328,6 @@ pub(super) fn park(index: usize, timeout: Duration) -> bool {
     // a real futex wake vs one absorbed by a busy pool.
     if stats_on() {
         PARKED_WORKERS.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-    if stats_on() {
         C_PARKS.fetch_add(1, AtomicOrdering::Relaxed);
     }
     let timed_out = crate::netpoll::idle_wait(index, timeout);
@@ -343,7 +343,7 @@ pub(super) fn park(index: usize, timeout: Duration) -> bool {
 /// different workers, each message hands off across threads, and without this
 /// the receiving worker parks and must be futex-woken every single time. a
 /// two-task ping-pong that lands split measured ~19us per round against ~0.2us
-/// colocated — a 90x cliff that a bounded spin closes, because the partner's
+/// colocated, a 90x cliff that a bounded spin closes, because the partner's
 /// reply is on its way already.
 ///
 /// it is only paid when the worker found work recently (`idle_timeout` still at
@@ -379,8 +379,9 @@ pub(super) fn spin_for_work(index: usize) -> bool {
 
 /// is there any work *this* worker could actually take? used only to avoid
 /// parking on a false-empty; the authoritative pop is still `find_work`, and it
-/// must consider exactly the same sources: this worker's own pinned queue, its
-/// own local queue, the injector, and any peer's *local* (stealable) queue.
+/// must consider the same sources: this worker's own pinned and deferred
+/// queues, its own local queue, the injector, and any peer's *local*
+/// (stealable) queue.
 ///
 /// it must NOT count a *peer's pinned* queue. `find_work` can steal from one,
 /// but only from a peer stuck in one long task; counting the queue here kept
@@ -390,7 +391,7 @@ pub(super) fn spin_for_work(index: usize) -> bool {
 /// pass through `find_work` before it parks.
 pub(super) fn has_any_work(index: usize) -> bool {
     let sched = scheduler();
-    // own pinned first — the woken work this worker must resume itself.
+    // own pinned first: the woken work this worker must resume itself.
     if !sched.workers[index]
         .pinned
         .lock()
@@ -404,7 +405,7 @@ pub(super) fn has_any_work(index: usize) -> bool {
     if any_stealable() {
         return true;
     }
-    // own deferred (preempted) work — reachable only by this worker, so like the
+    // own deferred (preempted) work is reachable only by this worker, so like the
     // pinned queue it must count here or the worker would park on a task it owns.
     !sched.workers[index]
         .deferred
@@ -476,7 +477,7 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
                 // idle worker answers a stop request within that bound. the
                 // collector raises the preemption flag and notifies the pool
                 // when it wants the world stopped, which cuts a long park
-                // short — the bound below is the fallback, not the mechanism.
+                // short. the bound below is the fallback, not the mechanism.
                 crate::cycle::mutator_gate();
                 // out of queued work: pick up whatever this worker's sockets
                 // have ready before searching or parking.
@@ -492,7 +493,7 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
                     scheduler().searching.fetch_add(1, AtomicOrdering::SeqCst);
                 }
                 // a worker still at the floor timeout was running a moment ago,
-                // so a handoff aimed at it is plausibly already in flight —
+                // so a handoff aimed at it is plausibly already in flight and
                 // worth a bounded look before paying a park/futex round trip.
                 if idle_timeout == PARK_TIMEOUT_MIN && spin_for_work(index) {
                     continue;

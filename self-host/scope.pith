@@ -236,17 +236,6 @@ pub fn binding_decl_node_at(index: Int) -> Int:
         return binding_decl_nodes[index]
     return -1
 
-## the arena index of the binding a lookup from this scope would find,
-## or -1. the checker uses it to retype a binding after the fact: an
-## empty collection literal has no element type at its declaration, so
-## the binding starts out untyped and takes its real type from the
-## first value stored into it.
-## true when this exact scope declares the name itself, rather than inheriting
-## it from an enclosing one. the difference matters where a redeclaration is
-## legal but shadowing is not.
-pub fn binding_declared_in_scope(scope_id: Int, name: String) -> Bool:
-    return binding_index.contains_key(binding_key(scope_id, name))
-
 ## true when an enclosing scope inside the SAME function already binds the
 ## name. the search stops at the function boundary, so shadowing a module-level
 ## name — which is ordinary, and everywhere — does not count, while shadowing
@@ -264,6 +253,10 @@ pub fn binding_shadows_enclosing_local(scope_id: Int, name: String) -> Bool:
     return false
 
 ## the index of the binding a name resolves to from this scope, or -1.
+## the checker uses it to retype a binding after the fact: an empty
+## collection literal has no element type at its declaration, so the
+## binding starts out untyped and takes its real type from the first
+## value stored into it.
 pub fn lookup_binding_index(scope_id: Int, name: String) -> Int:
     key := binding_key(scope_id, name)
     if binding_index.contains_key(key):

@@ -1,4 +1,4 @@
-# std.yaml — YAML parser for the configuration subset
+# std.yaml - YAML parser for the configuration subset
 #
 # parse YAML into a tree of nodes addressed by opaque Int handles, the same
 # shape std.json and std.toml use.
@@ -1566,18 +1566,18 @@ pub fn get_string(handle: Int, key: String) -> String:
 
 ## a required string field, or a typed decode error.
 pub fn require_string(handle: Int, key: String) -> String!YamlDecodeError:
-    v := map_lookup(handle, key)
-    if v < 0:
+    node := map_lookup(handle, key)
+    if node < 0:
         fail yaml_decode_fail("missing string field: " + key)
-    if node_kind(v) != "string":
+    if node_kind(node) != "string":
         fail yaml_decode_fail("expected string field: " + key)
-    return string_values[v]
+    return string_values[node]
 
 ## a string field with a fallback used when it is missing or holds another kind.
 pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
-    v := map_lookup(handle, key)
-    if node_kind(v) == "string":
-        return string_values[v]
+    node := map_lookup(handle, key)
+    if node_kind(node) == "string":
+        return string_values[node]
     return default_value
 
 ## an int field, or 0 when it is missing or holds another kind.
@@ -1586,18 +1586,18 @@ pub fn get_int(handle: Int, key: String) -> Int:
 
 ## a required int field, or a typed decode error.
 pub fn require_int(handle: Int, key: String) -> Int!YamlDecodeError:
-    v := map_lookup(handle, key)
-    if v < 0:
+    node := map_lookup(handle, key)
+    if node < 0:
         fail yaml_decode_fail("missing int field: " + key)
-    if node_kind(v) != "int":
+    if node_kind(node) != "int":
         fail yaml_decode_fail("expected int field: " + key)
-    return integer_values[v]
+    return integer_values[node]
 
 ## an int field with a fallback used when it is missing or holds another kind.
 pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
-    v := map_lookup(handle, key)
-    if node_kind(v) == "int":
-        return integer_values[v]
+    node := map_lookup(handle, key)
+    if node_kind(node) == "int":
+        return integer_values[node]
     return default_value
 
 ## a float field, or 0.0 when it is missing or holds another kind.
@@ -1606,9 +1606,9 @@ pub fn get_float(handle: Int, key: String) -> Float:
 
 ## a float field with a fallback used when it is missing or holds another kind.
 pub fn get_float_or(handle: Int, key: String, default_value: Float) -> Float:
-    v := map_lookup(handle, key)
-    if node_kind(v) == "float":
-        return float_values[v]
+    node := map_lookup(handle, key)
+    if node_kind(node) == "float":
+        return float_values[node]
     return default_value
 
 ## a bool field, or false when it is missing or holds another kind.
@@ -1617,25 +1617,25 @@ pub fn get_bool(handle: Int, key: String) -> Bool:
 
 ## a required bool field, or a typed decode error.
 pub fn require_bool(handle: Int, key: String) -> Bool!YamlDecodeError:
-    v := map_lookup(handle, key)
-    if v < 0:
+    node := map_lookup(handle, key)
+    if node < 0:
         fail yaml_decode_fail("missing bool field: " + key)
-    if node_kind(v) != "bool":
+    if node_kind(node) != "bool":
         fail yaml_decode_fail("expected bool field: " + key)
-    return boolean_values[v]
+    return boolean_values[node]
 
 ## a bool field with a fallback used when it is missing or holds another kind.
 pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
-    v := map_lookup(handle, key)
-    if node_kind(v) == "bool":
-        return boolean_values[v]
+    node := map_lookup(handle, key)
+    if node_kind(node) == "bool":
+        return boolean_values[node]
     return default_value
 
 ## a nested mapping by key, or -1 when it is missing or is not a mapping.
 pub fn get_map(handle: Int, key: String) -> Int:
-    v := map_lookup(handle, key)
-    if node_kind(v) == "map":
-        return v
+    node := map_lookup(handle, key)
+    if node_kind(node) == "map":
+        return node
     return 0 - 1
 
 ## a nested mapping by key. the same thing get_map returns, under the name
@@ -1646,9 +1646,9 @@ pub fn get_table(handle: Int, key: String) -> Int:
 
 ## a sequence by key, or -1 when it is missing or is not a sequence.
 pub fn get_array(handle: Int, key: String) -> Int:
-    v := map_lookup(handle, key)
-    if node_kind(v) == "seq":
-        return v
+    node := map_lookup(handle, key)
+    if node_kind(node) == "seq":
+        return node
     return 0 - 1
 
 ## the keys of a mapping in document order. empty for anything else.

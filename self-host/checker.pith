@@ -13,32 +13,27 @@
 # which participates in every comparison and satisfies exactly one kind of
 # target: an optional. see types_structurally_equal.
 #
-# all globals use c_ prefix to avoid collisions with lexer/parser
-# globals in the flat C namespace.
+# a few entry points (c_run_module, c_check_expr) and globals keep a c_
+# prefix from when every module shared one flat symbol namespace; newer
+# code does not follow it.
 
-from types import TypeInfo, ti_primitive, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_list, ti_map, ti_set, ti_task, ti_channel, add_type_info, set_type_info, get_type_count, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_UINT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_INT8, TID_INT16, TID_INT32, TID_INT64, TID_UINT8, TID_UINT16, TID_UINT32, TID_UINT64, TID_ERR, TID_NONE, TID_FIRST_USER
-from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, binding_visible_from, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
-from ast import Node, get_node, add_node, add_leaf
+from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_VOID, TID_ERR, TID_NONE
+from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
+from ast import Node, get_node
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types, builtin_scope_id, set_builtin_scope_id
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, report_warning_at, report_warning, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration, take_interfaces_snapshot, restore_interfaces_snapshot
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner, MethodsSnapshot, take_methods_snapshot, restore_methods_snapshot
 from std.collections import copy_list, copy_map
 
-# Module alias tracking - maps alias name to module path
+# import alias -> module path, for `import x` and `import x as y`
 mut module_aliases: Map[String, String] := {}
 
-# Module exports tracking - flat list of "module_path<TAB>export_name".
-# Qualified resolution currently uses scope bindings directly, so this is
-# retained only as lightweight bookkeeping for future module APIs.
-mut module_export_entries: List[String] := []
-
-# Wildcard import tracking - which modules have been wildcard imported
-# This enables from X import * functionality
-mut wildcard_imports: List[String] := []
+# the generic imports each module makes, as tab-separated entries: a named
+# one is "module<TAB>name<TAB>source", a wildcard one "module<TAB>source".
 mut generic_named_import_entries: List[String] := []
 mut generic_wildcard_import_entries: List[String] := []
 # the two entry lists above, indexed for resolve_generic_declaration_key:
@@ -111,12 +106,6 @@ mut checker_module_alias_lists: Map[String, String] := {}
 # corpus can be surveyed without a build turning red; "on" records errors.
 mut generic_body_check_mode := "off"
 
-fn copy_string_map(src: Map[String, String]) -> Map[String, String]:
-    mut dst: Map[String, String] := {}
-    for key in src.keys():
-        dst.insert(key, src[key])
-    return dst
-
 # ---------------------------------------------------------------
 # checker state
 # ---------------------------------------------------------------
@@ -128,16 +117,17 @@ pub mut method_type_map: Map[String, Int] := {}
 # duplicate; the inherent+interface pair is std/io's deliberate
 # conformance idiom, so the two kinds are tracked independently.
 mut method_declared_kinds: Map[String, Bool] := {}
-pub mut method_visibility_map: Map[String, Bool] := {}
 # whether each module function was declared `pub`, keyed by its module-qualified
 # symbol. a call through a module alias consults this so a module's private
 # helpers stay private; without it every function in the shared name table was
 # reachable from anywhere.
 pub mut function_visibility_map: Map[String, Bool] := {}
 mut struct_field_default_nodes: Map[String, Int] := {}
-# legacy map kept for probes; generic declaration lookup uses flat lists
+# generic declaration key -> its declaration node. the key is the
+# module-qualified name (see module_generic_target_name); a declaration
+# inside a module is also filed under its bare name when that name is
+# not already taken.
 pub mut generic_declaration_map: Map[String, Int] := {}
-mut generic_declaration_names: List[String] := []
 # the first module seen to declare a generic under each bare base name, and
 # the bare base names more than one module declares. a generic base has no
 # type id to key by, so every table that describes one keys by its name —
@@ -221,12 +211,10 @@ pub fn initialize_checker(file_path: String):
     checker_reset_diagnostics(file_path)
     method_type_map = {}
     method_declared_kinds = {}
-    method_visibility_map = {}
     function_visibility_map = {}
     checker_methods_reset()
     struct_field_default_nodes = {}
     generic_declaration_map = {}
-    generic_declaration_names = []
     generic_base_first_module = {}
     ambiguous_generic_bases = {}
     generic_identity_bare_names = {}
@@ -249,8 +237,6 @@ pub fn initialize_checker(file_path: String):
     optional_widened_arguments = {}
     open_empty_literal_bindings = {}
     module_aliases = {}
-    module_export_entries = []
-    wildcard_imports = []
     generic_named_import_entries = []
     generic_wildcard_import_entries = []
     generic_named_import_sources = {}
@@ -318,27 +304,14 @@ pub fn process_import_aliases(root_idx: Int):
                 kind = inner.kind
                 value = inner.value
         if kind == "import":
-            # Parse "path" or "path as alias"
-            mut path := value
-            mut has_alias := false
-            mut alias := ""
-            mut si := 0
-            while si < value.len() - 3:
-                if ord(value[si]) == 32:
-                    if ord(value[si + 1]) == 97:
-                        if ord(value[si + 2]) == 115:
-                            if ord(value[si + 3]) == 32:
-                                path = value.substring(0, si)
-                                alias = value.substring(si + 4, value.len())
-                                has_alias = true
-                                break
-                si = si + 1
-            if has_alias:
-                register_import_alias(alias, path)
+            # the node's value is "path" or "path as alias"
+            as_pos := value.index_of(" as ")
+            if as_pos >= 0:
+                register_import_alias(value.substring(as_pos + 4, value.len()), value.substring(0, as_pos))
             else:
-                register_import_alias(module_default_alias(path), path)
+                register_import_alias(module_default_alias(value), value)
         elif kind == "from_import":
-            # Parse "path name1 name2 ..." or "path *" for wildcard
+            # the node's value is "path name1 name2 ..." or "path *"
             mut parts: List[String] := []
             mut part_start := 0
             mut i := 0
@@ -356,10 +329,8 @@ pub fn process_import_aliases(root_idx: Int):
 
             if parts.len() > 0:
                 mod_path := parts[0]
-                # Check for wildcard import (second part is "*")
                 if parts.len() > 1:
                     if parts[1] == "*":
-                        wildcard_imports.push(mod_path)
                         generic_wildcard_import_entries.push(current_checker_module_path + chr(9) + mod_path)
                         if current_checker_module_path.len() > 0:
                             index_wildcard_import_source(current_checker_module_path, mod_path)
@@ -452,8 +423,8 @@ fn build_instantiated_type_name(base: String, type_args: List[Int]) -> String:
 
 mut type_resolve_depth := 0
 
-# resolve a type expression node, with optional generic substitution
-# subst_active: if true, subst_params/subst_args provide substitution
+# resolve a type expression node to its type id. an active generic
+# substitution (active_subst_params) applies through resolve_named_type.
 fn resolve_type_implementation(node_idx: Int) -> Int:
     if node_idx < 0:
         return TID_ERR
@@ -1147,14 +1118,12 @@ fn register_implementation_declaration(node_idx: Int, node: Node):
             continue
         mut cn := get_node(child)
         mut method_node_idx := child
-        mut method_is_pub := false
         if cn.kind == "pub":
-            method_is_pub = true
             method_node_idx = cn.children[0]
             cn = get_node(method_node_idx)
         if cn.kind == "fn_decl":
             method_params := suppress_method_type_params(concrete_name, cn)
-            register_method_declaration_aliased(concrete_name, generic_alias, method_node_idx, cn, method_is_pub, interface_name != "")
+            register_method_declaration(concrete_name, generic_alias, method_node_idx, cn, interface_name != "")
             release_method_type_params(method_params)
             impl_method_modules.insert(method_node_idx, current_checker_module_path)
     active_assoc_bindings = {}
@@ -1220,15 +1189,12 @@ fn method_owner_type_id(type_name: String) -> Int:
         return scoped
     return lookup_type_id(resolve_imported_type_name(type_name))
 
-fn register_method_declaration(type_name: String, node_idx: Int, node: Node, is_pub: Bool, from_interface: Bool):
-    register_method_declaration_aliased(type_name, "", node_idx, node, is_pub, from_interface)
-
 # register one impl method. `alias_name` is the declaring module's key for a
 # generic base (see generic_base_alias_key) or "": when it is set, the method
 # is filed under that key too, so a receiver whose generic base name is shared
 # with another module's finds the body its own module declared. pass "" for a
 # concrete type — those are told apart by the owner tid instead.
-fn register_method_declaration_aliased(type_name: String, alias_name: String, node_idx: Int, node: Node, is_pub: Bool, from_interface: Bool):
+fn register_method_declaration(type_name: String, alias_name: String, node_idx: Int, node: Node, from_interface: Bool):
     mut method_name := node.value
     fn_tid := resolve_function_signature(node)
     key := type_name + "." + method_name
@@ -1268,7 +1234,6 @@ fn register_method_declaration_aliased(type_name: String, alias_name: String, no
         report_error_at(node_idx, "E263", "duplicate method '" + method_name + "' on '" + type_name + "': another impl block already declares it")
     method_declared_kinds.insert(seen_key, true)
     method_type_map.insert(key, fn_tid)
-    method_visibility_map.insert(key, is_pub)
     register_method_signature(key, node_idx)
     # two modules can each declare a struct with this name, so the bare-name
     # key cannot say whose method this is. register a tid-keyed entry for the
@@ -1283,7 +1248,6 @@ fn register_method_declaration_aliased(type_name: String, alias_name: String, no
     if alias_name != "":
         alias_key := alias_name + "." + method_name
         method_type_map.insert(alias_key, fn_tid)
-        method_visibility_map.insert(alias_key, is_pub)
         register_method_signature(alias_key, node_idx)
         clear_method_owner(alias_key)
 
@@ -1333,7 +1297,7 @@ fn fill_impl_defaults(node: Node):
                 provides_own = has_method_declaration(method_tid_key(owner, mn.value))
             if provides_own == false:
                 default_params := suppress_method_type_params(concrete_name, mn)
-                register_method_declaration_aliased(concrete_name, generic_alias, member, mn, true, true)
+                register_method_declaration(concrete_name, generic_alias, member, mn, true)
                 release_method_type_params(default_params)
 
 fn check_type_implements_interface(type_name: String, iface_name: String) -> Bool:
@@ -1404,8 +1368,6 @@ pub fn collect_generic_parameter_names(node: Node) -> List[String]:
 
 fn register_generic_declaration(name: String, node_idx: Int):
     key := module_generic_target_name(current_checker_module_path, name)
-    if generic_declaration_map.contains_key(key) == false:
-        generic_declaration_names.push(key)
     generic_declaration_map.insert(key, node_idx)
     generic_declaration_modules.insert(node_idx, current_checker_module_path)
     if key != name:
@@ -1420,7 +1382,6 @@ fn register_generic_declaration(name: String, node_idx: Int):
     else:
         generic_base_first_module.insert(name, current_checker_module_path)
     if current_checker_module_path.len() > 0 and generic_declaration_map.contains_key(name) == false:
-        generic_declaration_names.push(name)
         generic_declaration_map.insert(name, node_idx)
 
 # the name every table keys a generic base by. a generic declaration has no
@@ -7549,7 +7510,7 @@ pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
 # run checker passes on a single module without re-initializing.
 # call initialize_checker() once, then c_run_module() for each module in order.
 pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
-    saved_aliases := copy_string_map(module_aliases)
+    saved_aliases := copy_map(module_aliases)
     process_import_aliases(root_idx)
     snapshot_module_context(root_idx)
     c_register_all(root_idx)
@@ -7929,8 +7890,6 @@ pub struct CheckerSnapshot:
     pub interfaces: List[String]
     pub builtin_scope: Int
     pub module_aliases: Map[String, String]
-    pub module_export_entries: List[String]
-    pub wildcard_imports: List[String]
     pub generic_named_import_entries: List[String]
     pub generic_wildcard_import_entries: List[String]
     pub current_checker_module_path: String
@@ -7953,11 +7912,9 @@ pub struct CheckerSnapshot:
     pub current_scope: Int
     pub method_type_map: Map[String, Int]
     pub method_declared_kinds: Map[String, Bool]
-    pub method_visibility_map: Map[String, Bool]
     pub function_visibility_map: Map[String, Bool]
     pub struct_field_default_nodes: Map[String, Int]
     pub generic_declaration_map: Map[String, Int]
-    pub generic_declaration_names: List[String]
     pub generic_base_first_module: Map[String, String]
     pub ambiguous_generic_bases: Map[String, Bool]
     pub generic_identity_bare_names: Map[String, String]
@@ -7998,8 +7955,6 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         interfaces: take_interfaces_snapshot(),
         builtin_scope: builtin_scope_id(),
         module_aliases: copy_map(module_aliases),
-        module_export_entries: copy_list(module_export_entries),
-        wildcard_imports: copy_list(wildcard_imports),
         generic_named_import_entries: copy_list(generic_named_import_entries),
         generic_wildcard_import_entries: copy_list(generic_wildcard_import_entries),
         current_checker_module_path: current_checker_module_path,
@@ -8022,11 +7977,9 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         current_scope: current_scope,
         method_type_map: copy_map(method_type_map),
         method_declared_kinds: copy_map(method_declared_kinds),
-        method_visibility_map: copy_map(method_visibility_map),
         function_visibility_map: copy_map(function_visibility_map),
         struct_field_default_nodes: copy_map(struct_field_default_nodes),
         generic_declaration_map: copy_map(generic_declaration_map),
-        generic_declaration_names: copy_list(generic_declaration_names),
         generic_base_first_module: copy_map(generic_base_first_module),
         ambiguous_generic_bases: copy_map(ambiguous_generic_bases),
         generic_identity_bare_names: copy_map(generic_identity_bare_names),
@@ -8066,8 +8019,6 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     restore_interfaces_snapshot(s.interfaces)
     set_builtin_scope_id(s.builtin_scope)
     module_aliases = copy_map(s.module_aliases)
-    module_export_entries = copy_list(s.module_export_entries)
-    wildcard_imports = copy_list(s.wildcard_imports)
     generic_named_import_entries = copy_list(s.generic_named_import_entries)
     generic_wildcard_import_entries = copy_list(s.generic_wildcard_import_entries)
     rebuild_generic_import_index()
@@ -8091,11 +8042,9 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     current_scope = s.current_scope
     method_type_map = copy_map(s.method_type_map)
     method_declared_kinds = copy_map(s.method_declared_kinds)
-    method_visibility_map = copy_map(s.method_visibility_map)
     function_visibility_map = copy_map(s.function_visibility_map)
     struct_field_default_nodes = copy_map(s.struct_field_default_nodes)
     generic_declaration_map = copy_map(s.generic_declaration_map)
-    generic_declaration_names = copy_list(s.generic_declaration_names)
     generic_base_first_module = copy_map(s.generic_base_first_module)
     ambiguous_generic_bases = copy_map(s.ambiguous_generic_bases)
     generic_identity_bare_names = copy_map(s.generic_identity_bare_names)

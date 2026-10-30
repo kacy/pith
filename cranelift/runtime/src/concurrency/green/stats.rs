@@ -5,13 +5,17 @@
 //! flag check, so a normal run pays nothing.
 
 use super::*;
+
 pub(super) static STATS_ON: OnceLock<bool> = OnceLock::new();
+// claimed wakes by where the waker ran (see `note_wake`), and whether a
+// notify found a parked worker (see `note_notify`).
 pub(super) static WAKE_SAME: AtomicU64 = AtomicU64::new(0);
 pub(super) static WAKE_CROSS: AtomicU64 = AtomicU64::new(0);
 pub(super) static WAKE_REACTOR: AtomicU64 = AtomicU64::new(0);
 pub(super) static WAKE_FUTEX: AtomicU64 = AtomicU64::new(0);
 pub(super) static WAKE_ABSORBED: AtomicU64 = AtomicU64::new(0);
 pub(super) static WAKE_MIGRATED: AtomicU64 = AtomicU64::new(0);
+/// workers inside `idle_wait` right now, kept only while stats are on.
 pub(super) static PARKED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 pub(super) fn stats_on() -> bool {
@@ -70,8 +74,8 @@ pub(super) fn note_wake(owner: Option<usize>, home: Option<usize>) {
 // lens as the wake breakdown above. a `try_lock` miss on a pinned queue is
 // one contended acquire; the channel-wake and park counters size the hot
 // paths those locks sit on.
-pub static C_PINNED: AtomicU64 = AtomicU64::new(0);
-pub static C_CH_WAKE: AtomicU64 = AtomicU64::new(0);
+pub(super) static C_PINNED: AtomicU64 = AtomicU64::new(0);
+pub(super) static C_CH_WAKE: AtomicU64 = AtomicU64::new(0);
 pub(super) static C_PARKS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn dump_contention() {

@@ -5,9 +5,6 @@
 use cranelift::prelude::*;
 use cranelift_module::Module;
 use cranelift_object::{ObjectBuilder, ObjectModule};
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::OnceLock;
 
 pub mod ir_consumer;
 pub mod linker;
@@ -15,44 +12,6 @@ mod loop_hoist;
 pub mod runtime_imports;
 
 pub use runtime_imports::declare_runtime_functions;
-
-// --- Struct layout registry (used by ir_consumer for field access) ---
-
-static STRUCT_LAYOUTS: OnceLock<Mutex<HashMap<String, Vec<(String, usize)>>>> = OnceLock::new();
-
-pub fn register_struct_layout(name: &str, fields: &[(String, String)]) {
-    let layouts = STRUCT_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
-    let field_info: Vec<_> = fields
-        .iter()
-        .enumerate()
-        .map(|(i, (fname, _))| {
-            let clean = fname.strip_suffix(" pub").unwrap_or(fname).to_string();
-            (clean, i * 8)
-        })
-        .collect();
-    if let Ok(mut map) = layouts.lock() {
-        map.insert(name.to_string(), field_info);
-    }
-}
-
-pub fn get_struct_layout(name: &str) -> Option<Vec<(String, usize)>> {
-    STRUCT_LAYOUTS
-        .get()
-        .and_then(|m| m.lock().ok())
-        .and_then(|map| map.get(name).cloned())
-}
-
-pub fn register_struct_alias(alias: &str, target: &str) {
-    let layouts = STRUCT_LAYOUTS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Ok(map) = layouts.lock() {
-        if let Some(layout) = map.get(target).cloned() {
-            drop(map);
-            if let Ok(mut map) = layouts.lock() {
-                map.insert(alias.to_string(), layout);
-            }
-        }
-    }
-}
 
 // --- CodeGen + errors ---
 
@@ -93,8 +52,8 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
         .set("log2_min_function_alignment", "6")
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
     // macos links everything position-independent and its ld rejects text
-    // relocations outright, so absolute addressing in the text section — what
-    // cranelift emits by default — fails to link. the gnu toolchain accepts
+    // relocations outright, so absolute addressing in the text section (what
+    // cranelift emits by default) fails to link. the gnu toolchain accepts
     // both, so we only pay the pic addressing cost where it is required.
     if cfg!(target_os = "macos") {
         flag_builder
@@ -114,7 +73,9 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
         module: ObjectModule::new(builder),
     })
 }
-/// Declare a string in the data section and return its address
+
+/// Declare a string literal in the data section, behind the header a heap
+/// cstring carries.
 pub fn declare_string_data(
     module: &mut ObjectModule,
     name: &str,
@@ -151,6 +112,7 @@ pub fn declare_string_data(
 
     Ok(data_id)
 }
+
 /// Finalize the module and return object bytes
 pub fn finalize_module(module: ObjectModule) -> Result<Vec<u8>, CompileError> {
     let object = module.finish();

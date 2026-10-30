@@ -12,30 +12,7 @@ use super::*;
 /// `green_is_done`, `green_detach`) needs the generation check.
 pub(super) type TaskId = usize;
 
-/// low 31 bits — the generation lives in bits 32..62 of the handle, leaving the
-/// sign bit clear so a handle is always a positive `i64` (0 stays "no task").
-pub(super) const GEN_MASK: u32 = 0x7fff_ffff;
-
-/// pack a task index and its generation into the pith-facing task handle. the
-/// low 32 bits hold `index + 1`, so 0 stays reserved for "no task", and the
-/// generation sits above. at generation 0 the handle is `index + 1`, the same
-/// encoding the os-thread backend uses.
-pub(super) fn make_handle(index: TaskId, generation: u32) -> i64 {
-    (((generation & GEN_MASK) as u64) << 32 | ((index as u64) + 1)) as i64
-}
-
-/// split a task handle back into `(index, generation)`, or `None` for 0/garbage.
-pub(super) fn split_handle(handle: i64) -> Option<(TaskId, u32)> {
-    if handle <= 0 {
-        return None;
-    }
-    let bits = handle as u64;
-    let low = bits & 0xffff_ffff;
-    if low == 0 {
-        return None;
-    }
-    Some(((low - 1) as TaskId, (bits >> 32) as u32 & GEN_MASK))
-}
+pub(super) use crate::concurrency::scheduler::{make_handle, split_handle, GEN_MASK};
 
 // ---------------------------------------------------------------------------
 // the scheduling word
@@ -119,8 +96,8 @@ pub(super) fn owner_bits(worker: usize) -> u64 {
 ///   whole resume: it takes the coroutine out, and (on a yield) writes it back
 ///   before the `Running -> Parked/Ready` CAS republishes the task.
 /// - a waker that wins the `Parked -> Ready` CAS owns the cells until its
-///   enqueue makes the task claimable again — that is the window `wake_with`
-///   uses to deposit a handoff value.
+///   enqueue makes the task claimable again. `wake_with` uses that window to
+///   deposit a handoff value.
 ///
 /// every hand-over goes through a CAS on `word` (release on publish, acquire
 /// on claim), so the cell writes of the previous holder are visible to the
@@ -208,10 +185,10 @@ impl SyncBlock {
 
 /// arena geometry: chunks of `ARENA_CHUNK` blocks hang off a fixed spine of
 /// `ARENA_SPINE` chunk pointers. chunks are allocated on demand and never
-/// freed or moved — the property that lets `wake` reach a block with index
-/// math and no lock. the spine bounds the live task count at 2M; every live
-/// green task also owns a 1 MiB coroutine stack, so real programs exhaust
-/// address space long before this bound, and hitting it is a loud panic
+/// freed or moved, which is what lets `wake` reach a block with index math
+/// and no lock. the spine bounds the live task count at 2M; every live green
+/// task also owns a 1 MiB coroutine stack, so real programs exhaust address
+/// space long before this bound, and hitting it is a fatal runtime error
 /// rather than a silent corruption.
 pub(super) const ARENA_CHUNK: usize = 256;
 pub(super) const ARENA_SPINE: usize = 8192;
@@ -232,8 +209,8 @@ impl SyncArena {
     }
 
     /// the sync block for `id`, or `None` when no task with that index has
-    /// ever existed. a garbage id — e.g. the reactor probing an id far beyond
-    /// any real task — must read as "no task", never allocate.
+    /// ever existed. a garbage id (the reactor probing an id far beyond any
+    /// real task, say) must read as "no task", never allocate.
     pub(super) fn get(&self, id: TaskId) -> Option<&SyncBlock> {
         let chunk = self.spine.get(id / ARENA_CHUNK)?.load(AtomicOrdering::Acquire);
         if chunk.is_null() {
@@ -380,10 +357,10 @@ pub(super) type TaskYielder = Yielder<(), ()>;
 pub(super) struct SendCoroutine(pub(super) TaskCoroutine);
 
 // SAFETY: a coroutine only ever changes threads while off-CPU and held by one
-// thread — fresh and stealable, or Parked and claimed by its waker through the
-// scheduling word's CAS — and nothing on a suspended stack is derived from the
-// thread it last ran on (see the type doc and the accessor block above
-// `current_task`).
+// thread (fresh and stealable, Parked and claimed by its waker through the
+// scheduling word's CAS, or Ready and popped off a pinned queue by a thief),
+// and nothing on a suspended stack is derived from the thread it last ran on
+// (see the type doc and the accessor block above `current_task`).
 unsafe impl Send for SendCoroutine {}
 
 /// a task's completion, shared between the worker that finishes it and

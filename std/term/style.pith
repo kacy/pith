@@ -82,6 +82,8 @@ pub struct Style:
 pub fn new() -> Style:
     return Style(fg_c: ansi.COLOR_DEFAULT, bg_c: ansi.COLOR_DEFAULT, attr_bits: 0, pad_t: 0, pad_r: 0, pad_b: 0, pad_l: 0, mar_t: 0, mar_r: 0, mar_b: 0, mar_l: 0, min_w: 0, min_h: 0, halign: LEFT, bord: BORDER_NONE, bord_fg: ansi.COLOR_DEFAULT)
 
+# builder methods copy before they change a field, so a base style can be
+# shared and extended without the extensions leaking back into it.
 fn dup(s: Style) -> Style:
     return Style(fg_c: s.fg_c, bg_c: s.bg_c, attr_bits: s.attr_bits, pad_t: s.pad_t, pad_r: s.pad_r, pad_b: s.pad_b, pad_l: s.pad_l, mar_t: s.mar_t, mar_r: s.mar_r, mar_b: s.mar_b, mar_l: s.mar_l, min_w: s.min_w, min_h: s.min_h, halign: s.halign, bord: s.bord, bord_fg: s.bord_fg)
 

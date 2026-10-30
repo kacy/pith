@@ -4,13 +4,11 @@
 # used by pith_main.pith and the IR driver.
 
 from lexer import lex_all
-from parser import parse, parse_with_file, parser_diagnostics, parser_has_errors
-from ast import get_node, node_count, reset_arena
-from checker import initialize_checker, c_run_module
+from parser import parse_with_file, parser_diagnostics, parser_has_errors
+from ast import get_node, node_count
 from errors import Diagnostic
 from std.collections import copy_list, copy_map
 import std.time as time
-# note: codegen removed — compilation handled by Cranelift native backend
 
 # extract directory from a file path.
 # "foo/bar/baz.pith" -> "foo/bar", "baz.pith" -> "."
@@ -23,9 +21,6 @@ pub fn get_directory(path: String) -> String:
         return "."
     return path.substring(0, last_slash)
 
-# scan an AST root for import declarations and return the module paths.
-# from_import values are "path name1 name2 ..." - we extract the path.
-# plain import values are "path" or "path as alias" - we extract the path.
 # the line and column of the import declaration for a module path, so
 # a resolution error points at the offending line. falls back to the
 # file start if the node can't be matched.
@@ -44,7 +39,9 @@ fn dr_import_position(root_idx: Int, mod_path: String) -> (Int, Int):
 # only the root's own children are scanned, so this is one level of the
 # import graph, not the transitive closure — resolve_imports recurses to
 # get the rest. the `pub` wrapper, a `from x import a, b` name list and
-# an `import x as y` alias are all stripped, leaving just "x".
+# an `import x as y` alias are all stripped, leaving just "x": a
+# from_import node's value is "path name1 name2 ...", and an import
+# node's is "path" or "path as alias".
 # duplicates are not removed; a caller that cares dedups (ir_driver
 # does).
 pub fn find_imports(root_idx: Int) -> List[String]:
@@ -59,24 +56,17 @@ pub fn find_imports(root_idx: Int) -> List[String]:
             kind = inner.kind
             value = inner.value
         if kind == "from_import":
-            mut space_pos := 0 - 1
-            for ch, si in value:
-                if ch == " ":
-                    space_pos = si
-                    break
-            mut mod_path := value
+            space_pos := value.index_of(" ")
             if space_pos >= 0:
-                mod_path = value.substring(0, space_pos)
-            imports.push(mod_path)
+                imports.push(value.substring(0, space_pos))
+            else:
+                imports.push(value)
         elif kind == "import":
-            mut path := value
-            for ch, si in value:
-                if si >= value.len() - 3:
-                    break
-                if ch == " " and value[si + 1] == "a" and value[si + 2] == "s" and value[si + 3] == " ":
-                    path = value.substring(0, si)
-                    break
-            imports.push(path)
+            as_pos := value.index_of(" as ")
+            if as_pos >= 0:
+                imports.push(value.substring(0, as_pos))
+            else:
+                imports.push(value)
     return imports
 
 # global visited map for diamond import dedup.
@@ -718,16 +708,3 @@ pub fn get_resolved_module_file(root_idx: Int) -> String:
     if resolved_module_files.contains_key(root_idx):
         return resolved_module_files[root_idx]
     return ""
-
-# run the frontend pipeline: lex, parse, resolve imports, and check.
-# native compilation is handled by the IR driver and Cranelift backend.
-# the self-hosted compiler provides the frontend: lex, parse, check, fmt, lint, doc.
-
-# Import alias tracking for module namespaces
-# Maps alias name -> (module_path, original_name) for from_import aliases
-# Maps alias name -> module_path for import aliases
-mut module_aliases: Map[String, String] := {}
-
-# Add a module alias mapping
-pub fn add_module_alias(alias: String, module_path: String):
-    module_aliases.insert(alias, module_path)

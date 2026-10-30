@@ -6,7 +6,7 @@ use std::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Or
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     // the length is already known, so allocate the headered cstring directly.
     // routing through pith_strdup would probe 16 bytes in front of the rust
-    // string's buffer looking for a header no rust allocation has — a read of
+    // string's buffer looking for a header no rust allocation has: a read of
     // memory this process does not own whenever the buffer starts its heap
     // block. pith_alloc_cstring writes the nul terminator itself.
     unsafe {
@@ -102,11 +102,15 @@ fn cstring_layout(data_len: usize) -> Layout {
     pith_layout(cstring_alloc_size(data_len), CSTRING_ALIGN)
 }
 
-/// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
-/// trailing NUL already written. The caller fills bytes 0..data_len.
+/// The length a heap cstring's header records.
+#[inline(always)]
+unsafe fn cstring_data_len(base: *const u8) -> usize {
+    (base.add(8) as *const u64).read() as usize
+}
+
 /// Debug: under PITH_CSTRING_NOFREE + PITH_LEAK_SCAN, every allocation is
 /// remembered and the exit hook prints the ones whose count never reached
-/// zero — the definitive leak list.
+/// zero, which is the definitive leak list.
 fn leak_scan_registry() -> Option<&'static std::sync::Mutex<Vec<usize>>> {
     static REG: std::sync::OnceLock<Option<std::sync::Mutex<Vec<usize>>>> = std::sync::OnceLock::new();
     REG.get_or_init(|| {
@@ -128,14 +132,14 @@ pub fn report_leaked_cstrings() {
     for &p in ptrs.iter() {
         unsafe {
             let s = p as *const i8;
-            let Some(base) = cstring_base(s as i64 as *const i8 as *const i8) else {
+            let Some(base) = cstring_base(s) else {
                 continue;
             };
             let rc = cstring_refcount(base).load(Ordering::Relaxed);
             if rc == 0 {
                 continue;
             }
-            let data_len = (base.add(8) as *const u64).read() as usize;
+            let data_len = cstring_data_len(base);
             let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
             let content = String::from_utf8_lossy(bytes).into_owned();
             *counts.entry(format!("rc={} {:?}", rc, content)).or_insert(0) += 1;
@@ -156,6 +160,8 @@ const CSTRING_HOOKS: u8 = crate::switches::PERF_STATS
     | crate::switches::ALLOC_SITES
     | crate::switches::CSTRING_DEBUG;
 
+/// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
+/// trailing NUL already written. The caller fills bytes 0..data_len.
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
     if crate::switches::any(CSTRING_HOOKS) {
         return alloc_cstring_hooked(data_len);
@@ -246,7 +252,7 @@ unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delt
     let Some(needle) = debug_watch_needle() else {
         return;
     };
-    let data_len = (base.add(8) as *const u64).read() as usize;
+    let data_len = cstring_data_len(base);
     let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
     let content = String::from_utf8_lossy(bytes);
     // a trailing '*' makes the needle a prefix match
@@ -291,7 +297,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
             // wrong somewhere; report it loudly in debug runs instead of
             // corrupting the heap.
             if HOOKED && cstring_debug_no_free() {
-                let data_len = (base.add(8) as *const u64).read() as usize;
+                let data_len = cstring_data_len(base);
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(60));
                 eprintln!(
                     "pith debug: cstring over-release: {:?}",
@@ -305,7 +311,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
             fence(Ordering::Acquire);
             let needle = if HOOKED { debug_trace_needle() } else { None };
             if let Some(needle) = needle {
-                let data_len = (base.add(8) as *const u64).read() as usize;
+                let data_len = cstring_data_len(base);
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
                 let content = String::from_utf8_lossy(bytes);
                 if content == needle {
@@ -315,7 +321,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
             if HOOKED && cstring_debug_no_free() {
                 // scrub instead of freeing: a read-after-release shows up
                 // as '!' runs in program output instead of silent reuse
-                let data_len = (base.add(8) as *const u64).read() as usize;
+                let data_len = cstring_data_len(base);
                 if debug_scrub_log() {
                     let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(24));
                     eprintln!("scrub {:p} len={} {:?}", s, data_len, String::from_utf8_lossy(bytes));
@@ -323,7 +329,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
                 std::ptr::write_bytes(s as *mut u8, b'!', data_len);
                 return;
             }
-            let data_len = (base.add(8) as *const u64).read() as usize;
+            let data_len = cstring_data_len(base);
             (base as *mut u32).write(0);
             if HOOKED {
                 crate::perf_count(&crate::PERF_CSTRING_FREES, 1);
@@ -349,8 +355,7 @@ pub(crate) fn count_release(count: &AtomicU32) -> u32 {
     count.fetch_sub(1, Ordering::Release)
 }
 
-/// Debug switch: keep freed cstrings alive and report over-releases, so an
-/// accounting bug in emitted code shows up as a message, not corruption.
+/// `PITH_CSTRING_WATCH`: the content whose rc operations `cstring_watch` logs.
 #[inline(always)]
 fn debug_watch_needle() -> Option<&'static str> {
     static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -359,6 +364,7 @@ fn debug_watch_needle() -> Option<&'static str> {
         .as_deref()
 }
 
+/// `PITH_CSTRING_TRACE`: the content whose final release is reported.
 fn debug_trace_needle() -> Option<&'static str> {
     static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     NEEDLE
@@ -371,6 +377,9 @@ fn debug_scrub_log() -> bool {
     *FLAG.get_or_init(|| std::env::var("PITH_SCRUB_LOG").is_ok())
 }
 
+/// `PITH_CSTRING_NOFREE`: keep freed cstrings alive (scrubbed) and report
+/// over-releases, so an accounting bug in emitted code shows up as a
+/// message, not corruption.
 fn cstring_debug_no_free() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("PITH_CSTRING_NOFREE").is_ok())
@@ -394,7 +403,7 @@ pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
     if magic != CSTRING_MAGIC && magic != CSTRING_STATIC_MAGIC {
         return None;
     }
-    Some((base.add(8) as *const u64).read() as i64)
+    Some(cstring_data_len(base) as i64)
 }
 
 /// Debug: release with an emission-site id; prints the site when the traced
@@ -405,7 +414,7 @@ pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
         let rc = cstring_refcount(base).load(Ordering::Relaxed);
         if rc == 1 {
             if let Some(needle) = debug_trace_needle() {
-                let data_len = (base.add(8) as *const u64).read() as usize;
+                let data_len = cstring_data_len(base);
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
                 let content = String::from_utf8_lossy(bytes);
                 if content == needle {
@@ -417,13 +426,13 @@ pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
     pith_cstring_release(s);
 }
 
-/// Debug: retain with an emission-site id, counted per site when
-/// PITH_RETAIN_SITES is set.
+/// Debug: retain with an emission-site id; prints the site when the
+/// retained string matches `PITH_CSTRING_WATCH`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_retain_traced(s: *const i8, site: i64) {
     if let Some(base) = cstring_base(s) {
         if debug_watch_needle().is_some() {
-            let data_len = (base.add(8) as *const u64).read() as usize;
+            let data_len = cstring_data_len(base);
             let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
             if Some(String::from_utf8_lossy(bytes).into_owned().as_str()) == debug_watch_needle() {
                 eprintln!("watch retain SITE {}", site);
@@ -457,7 +466,7 @@ const CLOSURE_TAG_BYTES: u8 = 5;
 const CLOSURE_TAG_STRUCT: u8 = 6;
 const CLOSURE_TAG_CLOSURE: u8 = 7;
 // a captured `weak` binding: the slot holds the bare target pointer and
-// the closure took a WEAK reference, never a strong count — that is what
+// the closure took a WEAK reference, never a strong count. that is what
 // lets a closure refer back to the state that owns it without forming a
 // strong cycle. dropping it releases only the weak count.
 const CLOSURE_TAG_WEAK: u8 = 8;
@@ -475,14 +484,14 @@ pub const CLOSURE_MAGIC: u32 = 0x50434c53; // "PCLS"
 // bounds real closures far below this (a few hundred captures at the
 // pathological extreme), so a slot at or past the cap can only come
 // from a corrupted or hostile caller and is ignored exactly like a
-// negative slot — the defensive posture every slot had before the
+// negative slot, the defensive posture every slot had before the
 // spill existed. without the cap, `set_env` with an absurd slot
 // (say 1<<40) attempted a multi-terabyte vec resize and aborted.
 const PITH_CLOSURE_MAX_ENV_SLOTS: usize = PITH_CLOSURE_ENV_SLOTS + 4096;
 
 /// One captured value together with its release-kind tag. Storing the
 /// pair as a unit is what keeps the spill's values and tags from ever
-/// falling out of lockstep — there is no second vec to forget to grow.
+/// falling out of lockstep: there is no second vec to forget to grow.
 #[derive(Clone, Copy)]
 struct Capture {
     value: i64,
@@ -494,7 +503,7 @@ struct Capture {
 /// nothing: the option stays None and every read of an inline slot
 /// never touches this. Allocated on the first spill store and grown to
 /// the highest slot written. Before this existed, the 17th capture was
-/// silently DROPPED — `set_env` bounds-checked and returned, `get_env`
+/// silently DROPPED: `set_env` bounds-checked and returned, `get_env`
 /// answered 0, and the program computed a wrong answer with no
 /// diagnostic anywhere. The VALUES here are released by the same paths
 /// that release the inline slots (pith_closure_release /
@@ -506,7 +515,7 @@ struct ClosureOverflow {
 /// Where a capture slot lives: the inline array or the heap spill,
 /// with the index already rebased into that storage. The 16-slot
 /// boundary test, the rebase past it, and the upper cap exist only in
-/// `classify` — every accessor matches on the result instead of
+/// `classify`; every accessor matches on the result instead of
 /// re-deriving the arithmetic.
 enum EnvSlot {
     Inline(usize),
@@ -549,6 +558,10 @@ pub const CLOSURE_CYCLE_FLAGS_OFFSET: i32 = std::mem::offset_of!(PithClosure, cy
 pub const CLOSURE_OVERFLOW_OFFSET: i32 = std::mem::offset_of!(PithClosure, overflow) as i32;
 const _: () = assert!(PITH_CLOSURE_ENV_SLOTS == 16);
 
+/// The bit in `cycle_flags` that says the closure sits in the cycle
+/// collector's suspect buffer.
+const CLOSURE_BUFFERED_FLAG: u8 = 1;
+
 #[repr(C)]
 struct PithClosure {
     magic: u32,
@@ -557,9 +570,9 @@ struct PithClosure {
     env: [i64; PITH_CLOSURE_ENV_SLOTS],
     env_tags: [u8; PITH_CLOSURE_ENV_SLOTS],
     // bit 0: this closure sits in the cycle collector's suspect buffer.
-    // appended at the end on purpose — the layout is #[repr(C)] and nothing
-    // outside the runtime reads past env_tags, so the early offsets the
-    // codegen could bake stay where they were.
+    // bit 7: shared (`share::CONTAINER_SHARED_FLAG`). codegen zeroes this
+    // byte when it builds a closure on the stack, through
+    // CLOSURE_CYCLE_FLAGS_OFFSET.
     cycle_flags: std::sync::atomic::AtomicU8,
     // spill storage for capture slots >= PITH_CLOSURE_ENV_SLOTS; None for
     // the overwhelmingly common closure that fits inline. the stakes here
@@ -567,22 +580,21 @@ struct PithClosure {
     // the inline block can grow the vec and move its buffer, so a racing
     // get_env would read through a freed allocation, not merely observe an
     // old value. it is still safe, for a structural reason rather than an
-    // atomicity one — codegen emits every set_env during construction,
+    // atomicity one: codegen emits every set_env during construction,
     // straight after pith_closure_new and before the handle escapes to any
     // other task, so no concurrent reader can exist while the vec may
     // still move; after construction the spill is read-only like the
     // inline env. the growth path debug_asserts the refcount is still the
-    // single count from pith_closure_new to keep that contract honest.
-    // appended at the end: the layout is #[repr(C)] and nothing outside
-    // the runtime reads past env_tags (handles cross the ABI as i64), so
-    // an Option<Box> here is fine and the early offsets stay put.
+    // single count from pith_closure_new, which catches a set_env after
+    // the closure escaped. codegen writes None here (a null pointer)
+    // through CLOSURE_OVERFLOW_OFFSET when it builds a stack closure.
     overflow: Option<Box<ClosureOverflow>>,
 }
 
 impl PithClosure {
     /// The spill capture for `idx` (already rebased past the inline
-    /// slots), growing the overflow storage to reach it. Construction-
-    /// time only — see the contract on the `overflow` field.
+    /// slots), growing the overflow storage to reach it. Construction
+    /// time only; see the contract on the `overflow` field.
     fn spill_capture(&mut self, idx: usize) -> &mut Capture {
         // growing the vec can move its buffer, which is only safe while
         // no other task can reach this closure; the single count from
@@ -601,8 +613,8 @@ impl PithClosure {
         &mut overflow.captures[idx]
     }
 
-    /// Every capture in walk order — inline slots 0..PITH_CLOSURE_ENV_SLOTS
-    /// first, then the spill in index order — as (value, tag) pairs. the
+    /// Every capture in walk order (inline slots 0..PITH_CLOSURE_ENV_SLOTS
+    /// first, then the spill in index order) as (value, tag) pairs. the
     /// three capture walkers (the release walk, the cycle child scan, and
     /// the cycle env release) all iterate through here, so none of them
     /// can disagree about the order or forget the spill.
@@ -643,7 +655,7 @@ impl PithClosure {
         }
     }
 
-    /// `captures`, but with the slots writable — the cycle env release
+    /// `captures`, but with the slots writable: the cycle env release
     /// blanks each slot after dropping its count so the later shell free
     /// can never release it a second time. Same walk order.
     fn captures_mut(&mut self) -> impl Iterator<Item = (&mut i64, &mut u8)> {
@@ -658,7 +670,7 @@ impl PithClosure {
 
 /// Validate a closure handle by its magic word. Returns the typed
 /// pointer only when the handle is non-null, aligned, and still carries
-/// the magic — the lock-free equivalent of the old registry lookup.
+/// the magic. This is the lock-free equivalent of the old registry lookup.
 /// Same practical-guard contract as the string and struct magic words:
 /// a stale pointer whose magic was scrubbed on free reads as invalid.
 unsafe fn closure_base<'a>(handle: i64) -> Option<&'a PithClosure> {
@@ -687,13 +699,10 @@ unsafe fn release_captured_value(value: i64, tag: u8) {
     }
 }
 
-unsafe fn pith_closure_mut<'a>(handle: i64) -> Option<&'a mut PithClosure> {
+/// `closure_base`, with the closure writable.
+unsafe fn closure_base_mut<'a>(handle: i64) -> Option<&'a mut PithClosure> {
     closure_base(handle)?;
     Some(&mut *(handle as *mut PithClosure))
-}
-
-unsafe fn pith_closure_ref<'a>(handle: i64) -> Option<&'a PithClosure> {
-    closure_base(handle)
 }
 
 #[no_mangle]
@@ -764,11 +773,11 @@ unsafe fn closure_free_shell(handle: i64) {
 /// One more owner of this closure.
 ///
 /// # Safety
-/// handle must be a valid closure handle or garbage (registry-checked).
+/// handle must be a valid closure handle or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RETAIN);
-    if let Some(closure) = pith_closure_ref(handle) {
+    if let Some(closure) = closure_base(handle) {
         closure
             .ref_count
             .fetch_add(1, Ordering::Relaxed);
@@ -776,16 +785,15 @@ pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
 }
 
 /// Drop one owner; the last release drops the counts the closure took
-/// on its captured values, then frees the closure. this is the fix for
-/// the closure-environment leak — closures used to allocate with no
-/// release path at all.
+/// on its captured values, then frees the closure. Closures once
+/// allocated with no release path at all, and leaked their environments.
 ///
 /// # Safety
-/// handle must be a valid closure handle or garbage (registry-checked).
+/// handle must be a valid closure handle or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RELEASE);
-    let Some(closure) = pith_closure_ref(handle) else {
+    let Some(closure) = closure_base(handle) else {
         return;
     };
     // cycle-gc suspect hook, before our count is given up: while we still
@@ -827,7 +835,7 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     let buffered = closure
         .cycle_flags
         .load(Ordering::Relaxed)
-        & 1
+        & CLOSURE_BUFFERED_FLAG
         != 0;
     // scrub the magic so a stale handle fails closure_base before we
     // hand the box back to the allocator.
@@ -851,8 +859,8 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
 unsafe fn maybe_suspect_closure(closure: &PithClosure, handle: i64) {
     if closure
         .cycle_flags
-        .fetch_or(1, Ordering::Relaxed)
-        & 1
+        .fetch_or(CLOSURE_BUFFERED_FLAG, Ordering::Relaxed)
+        & CLOSURE_BUFFERED_FLAG
         != 0
     {
         return; // already buffered
@@ -863,10 +871,10 @@ unsafe fn maybe_suspect_closure(closure: &PithClosure, handle: i64) {
 /// Drop a closure's buffered mark (overflow, or a collector drain). Magic-
 /// checked, so a closure that already died and was freed is a no-op.
 pub(crate) unsafe fn cycle_clear_closure_buffered(handle: i64) {
-    if let Some(closure) = pith_closure_ref(handle) {
+    if let Some(closure) = closure_base(handle) {
         closure
             .cycle_flags
-            .fetch_and(!1, Ordering::Relaxed);
+            .fetch_and(!CLOSURE_BUFFERED_FLAG, Ordering::Relaxed);
     }
 }
 
@@ -880,7 +888,7 @@ pub(crate) unsafe fn cycle_clear_closure_buffered(handle: i64) {
 /// The closure's current reference count, or `None` when the handle no longer
 /// validates (the closure died and its magic was scrubbed).
 pub(crate) unsafe fn cycle_closure_strong_count(handle: i64) -> Option<i64> {
-    pith_closure_ref(handle).map(|closure| {
+    closure_base(handle).map(|closure| {
         closure
             .ref_count
             .load(Ordering::Relaxed)
@@ -891,19 +899,16 @@ pub(crate) unsafe fn cycle_closure_strong_count(handle: i64) -> Option<i64> {
 /// guard: a huge bias keeps releases from other dying objects from ever
 /// reaching this closure's death path while the collector owns it.
 pub(crate) unsafe fn cycle_closure_guard_strong(handle: i64, delta: i64) {
-    if let Some(closure) = pith_closure_ref(handle) {
+    if let Some(closure) = closure_base(handle) {
         closure
             .ref_count
             .fetch_add(delta, Ordering::Relaxed);
     }
 }
 
-/// Report every captured value that carries a count, as (value, env tag).
-/// Weak captures (tag 8) are reported too — the caller filters; they hold no
-/// strong count and are not edges of the ownership graph.
 /// Mark the closure shared (see `share.rs`); true when this call set the mark.
 pub(crate) unsafe fn closure_mark_shared(handle: i64) -> bool {
-    match pith_closure_ref(handle) {
+    match closure_base(handle) {
         Some(closure) => {
             closure
                 .cycle_flags
@@ -915,8 +920,11 @@ pub(crate) unsafe fn closure_mark_shared(handle: i64) -> bool {
     }
 }
 
+/// Report every captured value that carries a count, as (value, env tag).
+/// Weak captures (tag 8) are reported too, and the caller filters them: they
+/// hold no strong count and are not edges of the ownership graph.
 pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
-    let Some(closure) = pith_closure_ref(handle) else {
+    let Some(closure) = closure_base(handle) else {
         return;
     };
     // a closure over plain values only (every spawn of `f(i, n)`, say) has no
@@ -935,7 +943,7 @@ pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, 
 /// captures, exactly as the last release would, then blank the slots so the
 /// shell free below can never release them a second time.
 pub(crate) unsafe fn cycle_closure_release_env(handle: i64) {
-    let Some(closure) = pith_closure_mut(handle) else {
+    let Some(closure) = closure_base_mut(handle) else {
         return;
     };
     for (value, tag) in closure.captures_mut() {
@@ -951,13 +959,13 @@ pub(crate) unsafe fn cycle_closure_release_env(handle: i64) {
 /// on the collector thread) parks in the graveyard so the fresh suspect
 /// entry never dangles; the next collection frees it.
 pub(crate) unsafe fn cycle_closure_free_dead(handle: i64) {
-    let Some(closure) = pith_closure_ref(handle) else {
+    let Some(closure) = closure_base(handle) else {
         return;
     };
     let buffered = closure
         .cycle_flags
         .load(Ordering::Relaxed)
-        & 1
+        & CLOSURE_BUFFERED_FLAG
         != 0;
     (handle as *mut u32).write(0);
     if buffered && crate::cycle::cycle_gc_enabled() {
@@ -975,18 +983,18 @@ pub(crate) unsafe fn cycle_drop_closure_shell(ptr: usize) {
 
 #[cfg(test)]
 pub(crate) unsafe fn closure_buffered_for_tests(handle: i64) -> bool {
-    pith_closure_ref(handle).is_some_and(|closure| {
+    closure_base(handle).is_some_and(|closure| {
         closure
             .cycle_flags
             .load(Ordering::Relaxed)
-            & 1
+            & CLOSURE_BUFFERED_FLAG
             != 0
     })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_get_fn(handle: i64) -> i64 {
-    if let Some(closure) = pith_closure_ref(handle) {
+    if let Some(closure) = closure_base(handle) {
         closure.func_ptr
     } else {
         0
@@ -998,7 +1006,7 @@ pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64
     let Some(slot) = EnvSlot::classify(slot) else {
         return;
     };
-    if let Some(closure) = pith_closure_mut(handle) {
+    if let Some(closure) = closure_base_mut(handle) {
         match slot {
             EnvSlot::Inline(idx) => closure.env[idx] = value,
             EnvSlot::Spill(idx) => closure.spill_capture(idx).value = value,
@@ -1011,13 +1019,13 @@ pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64
 /// has already retained the value into the closure.
 ///
 /// # Safety
-/// handle must be a valid closure handle or garbage (registry-checked).
+/// handle must be a valid closure handle or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_set_env_rc(handle: i64, slot: i64, value: i64, tag: i64) {
     let Some(slot) = EnvSlot::classify(slot) else {
         return;
     };
-    if let Some(closure) = pith_closure_mut(handle) {
+    if let Some(closure) = closure_base_mut(handle) {
         match slot {
             EnvSlot::Inline(idx) => {
                 closure.env[idx] = value;
@@ -1037,7 +1045,7 @@ pub unsafe extern "C" fn pith_closure_get_env(handle: i64, slot: i64) -> i64 {
     let Some(slot) = EnvSlot::classify(slot) else {
         return 0;
     };
-    let Some(closure) = pith_closure_ref(handle) else {
+    let Some(closure) = closure_base(handle) else {
         return 0;
     };
     match slot {
@@ -1464,7 +1472,7 @@ mod tests {
     }
 
     // slots past the inline block spill to the heap extension instead of
-    // being silently dropped — the old behavior ignored the store and
+    // being silently dropped. the old behavior ignored the store and
     // answered 0, which made a 17-capture closure compute a wrong answer
     // with no diagnostic. an unwritten spill slot still answers 0.
     #[test]
@@ -1486,7 +1494,7 @@ mod tests {
             assert_eq!(pith_closure_get_env(handle, first_spill + 1), 0);
             assert_eq!(pith_closure_get_env(handle, first_spill + 100), 0);
             // a slot at or past the hard cap is ignored like a negative
-            // one — before the cap, this store attempted a terabyte-scale
+            // one. before the cap, this store attempted a terabyte-scale
             // resize and aborted the process
             pith_closure_set_env(handle, PITH_CLOSURE_MAX_ENV_SLOTS as i64, 7);
             pith_closure_set_env(handle, 1 << 40, 7);
@@ -1651,7 +1659,7 @@ pub unsafe extern "C" fn pith_cstring_append_many(
         pith_cstring_release(base);
         return fresh;
     };
-    let len = (header.add(8) as *const u64).read() as usize;
+    let len = cstring_data_len(header);
     let new_len = len + added;
     if cstring_alloc_size(new_len) != cstring_alloc_size(len) {
         header = std::alloc::realloc(header, cstring_layout(len), cstring_alloc_size(new_len));
@@ -1721,7 +1729,7 @@ pub unsafe extern "C" fn pith_print_err(ptr: *const i8) {
 
 /// Report an error escaping `main` and exit nonzero. The emitter calls this on
 /// main's error-return paths, because the entry glue pins main's process exit
-/// code to 0 — without this, a program that failed out of main looked like it
+/// code to 0. Without this, a program that failed out of main looked like it
 /// succeeded. `is_string` says whether `err` is a string handle; a typed error
 /// gets a generic line rather than a read through a non-string pointer.
 #[no_mangle]
@@ -1972,7 +1980,7 @@ pub unsafe extern "C" fn pith_assert_ne_fail(a: i64, b: i64, kind: i64) {
 // each `test "..."` block compiles to a `__test_i` function; the generated main
 // is a pure dispatcher that forks once per test and records the outcome. running
 // each test in its own child means a failing assert's exit(1), or even a crash,
-// ends only that test — the others still run, and the parent reports every one.
+// ends only that test. the others still run, and the parent reports every one.
 //
 // a run reports in one of two shapes. the default is the prose a person reads in
 // a terminal. with PITH_TEST_JSON set (`pith test --json`) every result is one
@@ -1999,8 +2007,8 @@ static CURRENT_TAGS: std::sync::Mutex<String> = std::sync::Mutex::new(String::ne
 static TEST_FILE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 // every tag any test in this build carries. a run that selects or excludes a
-// tag no test has is a mistake in the invocation — a typo silently running
-// nothing is the failure mode a tagged suite invites — so the summary names it
+// tag no test has is a mistake in the invocation. a typo that silently runs
+// nothing is the failure mode a tagged suite invites, so the summary names it
 // and the run fails.
 static SEEN_TAGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -2168,7 +2176,7 @@ fn print_test_record(
 /// holds it, which is why it names that test and carries its file and tags: a
 /// reader grouping records by test needs no second lookup, and `name` alone
 /// would not say which test a row labeled `[3] gamma` came from. Outside a
-/// test — `std.testing` in a plain `main()` — the test name is empty.
+/// test (`std.testing` in a plain `main()`), the test name is empty.
 fn print_case_record(name: &str, ok: bool, detail: &str) {
     let outcome = if ok { "passed" } else { "failed" };
     let message = if ok { None } else { Some(detail) };
@@ -2214,7 +2222,7 @@ fn record_failure_detail(message: &str) {
 
 /// Parent side: the failure detail the child sent, if it sent one. Always
 /// called once per test, pass or fail, because it is also what closes the read
-/// end — a suite of a few hundred tests would otherwise run out of descriptors.
+/// end; a suite of a few hundred tests would otherwise run out of descriptors.
 fn read_failure_detail() -> Option<(String, Option<(String, i64, i64)>)> {
     let fd = DETAIL_READ_FD.swap(-1, Ordering::Relaxed);
     if fd < 0 {
@@ -2360,7 +2368,7 @@ fn filtered_out(name: &str) -> i64 {
 /// `PITH_TEST_FILTER`. With nothing selected every test runs; otherwise only
 /// names containing the substring do, and the rest are tallied as filtered out.
 ///
-/// A filter can also name one case inside a table-driven test — `"the test
+/// A filter can also name one case inside a table-driven test, as `"the test
 /// name / a case label"`. The test's own name does not contain that, so
 /// matching on the substring alone would filter the test out and the case
 /// would never get the chance to select itself. A filter that starts with this
@@ -3122,7 +3130,7 @@ pub unsafe extern "C" fn pith_tls_get_or_init_tagged(slot: i64, init_thunk: i64,
         // duration of this pith call, and only this worker thread touches it. we
         // take only short-lived borrows: the read borrow ends before we call the
         // thunk, and the write borrow is created fresh afterward. that mirrors
-        // the `TLS_GLOBALS` path — the thunk may itself touch other threadlocal
+        // the `TLS_GLOBALS` path: the thunk may itself touch other threadlocal
         // slots on the same map without a live borrow being held across it.
         if let Some(v) = (*map).get(&slot) {
             return v;
@@ -3149,7 +3157,7 @@ pub unsafe extern "C" fn pith_tls_get_or_init_tagged(slot: i64, init_thunk: i64,
 /// the two touches of the per-os-thread map, each behind a call the optimizer
 /// cannot inline. a `RefCell<HashMap>` has to be addressed as a value, and
 /// inlined into `pith_tls_get_or_init` that address was computed once and
-/// kept in a register across the initializer thunk — pith code. the branch
+/// kept in a register across the initializer thunk, which is pith code. the branch
 /// is only taken off a green task, where the thunk cannot suspend a
 /// coroutine, but the rule that no frame spanning pith code holds a
 /// thread-local address is kept without exceptions, so that coupling is not
@@ -3182,7 +3190,7 @@ pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_set_tagged(slot: i64, value: i64, tag: i64) {
     if let Some(map) = green_task_tls() {
-        // SAFETY: same as `pith_tls_get_or_init` — the pointer targets the
+        // SAFETY: same as `pith_tls_get_or_init`. the pointer targets the
         // running task's own map, valid and unaliased for this synchronous call
         // on this worker thread. a single short-lived write borrow.
         (*map).insert(slot, value, tag);
@@ -3191,8 +3199,8 @@ pub unsafe extern "C" fn pith_tls_set_tagged(slot: i64, value: i64, tag: i64) {
     tls_globals_set(slot, value, tag);
 }
 
-// Small structs are allocated and freed constantly — the result box built for
-// every `T!` return is the worst offender — and the malloc/free round-trip for
+// Small structs are allocated and freed constantly (the result box built for
+// every `T!` return is the worst offender), and the malloc/free round-trip for
 // each one shows up plainly in profiles. These keep a per-thread freelist of
 // dead blocks, bucketed by total byte size, so a fresh struct of a common size
 // reuses a recycled block instead of hitting the global allocator. A reused
@@ -3202,7 +3210,7 @@ pub unsafe extern "C" fn pith_tls_set_tagged(slot: i64, value: i64, tag: i64) {
 // block freed on another thread simply lands in that thread's pool.
 //
 // The pool is disabled when PITH_STRUCT_FREELIST=0 so `make memcheck` runs see
-// every real free — valgrind can only track use-after-free if the block is
+// every real free: valgrind can only track use-after-free if the block is
 // actually handed back to the allocator.
 const STRUCT_POOL_MAX_TOTAL: usize = 256; // total bytes incl the 32-byte header
 const STRUCT_POOL_CAP: usize = 512; // max retained blocks per size bucket
@@ -3253,9 +3261,9 @@ fn struct_pool_enabled() -> bool {
 /// never freed**. The blocks stay in it for the next thread to adopt. This is
 /// what makes the pool pay on the os-thread backend, where every spawned task
 /// is a fresh thread: deallocating the retained blocks in the thread's
-/// destructor cost more than the pool had saved — 8.1M of 33M instructions in
+/// destructor cost more than the pool had saved (8.1M of 33M instructions in
 /// a task-per-thread benchmark, a quarter of the run, with glibc consolidating
-/// on every one of the burst frees — and the next task then rebuilt the same
+/// on every one of the burst frees), and the next task then rebuilt the same
 /// pool from empty. An adopted slot arrives pre-grown and pre-filled, so a
 /// task's first allocation is a reuse. `channel.rs` and `cycle.rs` keep their
 /// per-thread slots the same way for the same reasons.
@@ -3312,7 +3320,7 @@ thread_local! {
         const { std::cell::Cell::new(std::ptr::null_mut()) };
 
     // the owning handle: created once per thread, releases at thread exit.
-    // touched only on the first use — every later access goes through the
+    // touched only on the first use; every later access goes through the
     // cache above.
     static POOL_SLOT: PoolHandle = PoolHandle(adopt_pool_slot());
 }
@@ -3349,8 +3357,8 @@ fn adopt_pool_slot() -> *mut PoolSlot {
 }
 
 /// this thread's pool slot: one tls load on every call after the first. null
-/// when the pool cannot be used — before the thread-local machinery is up, or
-/// after this thread released its slot — and the caller then goes to the
+/// when the pool cannot be used (before the thread-local machinery is up, or
+/// after this thread released its slot), and the caller then goes to the
 /// allocator, which is always correct.
 ///
 /// the fast path is a single `%fs:`-relative load of the cached pointer and
@@ -3358,8 +3366,8 @@ fn adopt_pool_slot() -> *mut PoolSlot {
 /// lives in, so the access carries no thread-local base a frame could keep
 /// across a park (see the accessor block in `concurrency/green.rs`). the
 /// first-use path is different: the lazily initialized handle's address has
-/// to exist as a value, and a struct release runs the value's destructor —
-/// pith code, which under the green backend can park — right before it
+/// to exist as a value, and a struct release runs the value's destructor
+/// (pith code, which under the green backend can park) right before it
 /// returns the block here. so that path stays behind a call the optimizer
 /// may not inline, where the address is computed and consumed on whichever
 /// thread is running, never hoisted above the destructor.
@@ -3491,9 +3499,10 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
         base
     };
     (base as *mut u32).write(STRUCT_MAGIC);
-    (base.add(4) as *mut u32).write(1); // strong
-    (base.add(8) as *mut u32).write(1); // weak: the implicit unit for strong refs
-    (base.add(16) as *mut u64).write(size as u64);
+    (base.add(STRUCT_OFF_STRONG) as *mut u32).write(1);
+    // the implicit weak unit the strong refs hold together
+    (base.add(STRUCT_OFF_WEAK) as *mut u32).write(1);
+    (base.add(STRUCT_OFF_SIZE) as *mut u64).write(size as u64);
     let ptr = base.add(STRUCT_HEADER) as i64;
     crate::share::note_owner(ptr);
     ptr
@@ -3591,14 +3600,14 @@ fn count_down(count: &AtomicU32, local: bool) -> u32 {
 #[inline(always)]
 unsafe fn struct_local(base: *mut u8, switches: u8) -> bool {
     switches & crate::switches::LOCAL_COUNTS != 0
-        && struct_dead(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
+        && struct_flags(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
 }
 
 /// Whether the struct at `ptr` is marked shared. False for anything that is
 /// not a live struct.
 pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
     match struct_base(ptr) {
-        Some(base) => struct_dead(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT != 0,
+        Some(base) => struct_flags(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT != 0,
         None => false,
     }
 }
@@ -3607,13 +3616,15 @@ pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
 pub(crate) unsafe fn struct_mark_shared(ptr: i64) -> bool {
     match struct_base(ptr) {
         Some(base) => {
-            struct_dead(base).fetch_or(STRUCT_SHARED_BIT, Ordering::Release) & STRUCT_SHARED_BIT == 0
+            struct_flags(base).fetch_or(STRUCT_SHARED_BIT, Ordering::Release) & STRUCT_SHARED_BIT == 0
         }
         None => false,
     }
 }
 
-unsafe fn struct_dead(base: *mut u8) -> &'static AtomicU32 {
+/// The header's flag word at STRUCT_OFF_DEAD: the dead, buffered and shared
+/// bits above.
+unsafe fn struct_flags(base: *mut u8) -> &'static AtomicU32 {
     &*(base.add(STRUCT_OFF_DEAD) as *const AtomicU32)
 }
 
@@ -3780,8 +3791,8 @@ pub unsafe extern "C" fn pith_struct_strong_count(ptr: i64) -> i64 {
 }
 
 /// Drop one owner; the last strong release runs the destructor (releasing the
-/// struct's rc fields), marks the value dead, and drops the implicit weak unit
-/// — which frees the allocation unless a weak reference is still holding it.
+/// struct's rc fields), marks the value dead, and drops the implicit weak
+/// unit, which frees the allocation unless a weak reference still holds it.
 ///
 /// # Safety
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
@@ -3830,7 +3841,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
         // we still hold a strong count the header cannot be freed, so the
         // buffered bit and the buffer's weak retain land on live memory.
         // after the fetch_sub a concurrent owner can finish the whole death
-        // path — including the weak drop that frees the header — under the
+        // path, including the weak drop that frees the header, under the
         // hook's feet. if other owners release between this load and our
         // decrement, the struct simply dies buffered, which the death path
         // below already supports.
@@ -3882,9 +3893,9 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     // ordering publishes the destructor's writes to any thread whose weak load
     // sees the flag. fetch_or rather than a store so a concurrently-set
     // buffered bit survives. then drop the implicit weak unit, which frees the
-    // header if no weak refs remain — for a buffered struct the suspect
+    // header if no weak refs remain. for a buffered struct the suspect
     // buffer's weak count keeps the header alive past this point.
-    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
+    struct_flags(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
     struct_weak_drop(base, switches);
 }
 
@@ -3895,7 +3906,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
 #[cold]
 #[inline(never)]
 unsafe fn maybe_suspect_struct(ptr: i64, base: *mut u8) {
-    if struct_dead(base).fetch_or(STRUCT_BUFFERED_BIT, Ordering::Relaxed)
+    if struct_flags(base).fetch_or(STRUCT_BUFFERED_BIT, Ordering::Relaxed)
         & STRUCT_BUFFERED_BIT
         != 0
     {
@@ -3910,7 +3921,7 @@ unsafe fn maybe_suspect_struct(ptr: i64, base: *mut u8) {
 /// header that is already gone is a no-op.
 pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
     if let Some(base) = struct_base(ptr) {
-        struct_dead(base).fetch_and(!STRUCT_BUFFERED_BIT, Ordering::Relaxed);
+        struct_flags(base).fetch_and(!STRUCT_BUFFERED_BIT, Ordering::Relaxed);
     }
 }
 
@@ -3921,19 +3932,20 @@ pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
 // pointer degrades to None or a no-op.
 
 /// `Some(true)` for a live struct, `Some(false)` for one whose value died
-/// but whose header is still held (a weak count — the suspect buffer's, for
-/// a drained entry), `None` when the pointer is not a struct header at all.
+/// but whose header is still held (by a weak count, such as the suspect
+/// buffer's for a drained entry), `None` when the pointer is not a struct
+/// header at all.
 pub(crate) unsafe fn cycle_struct_alive(ptr: i64) -> Option<bool> {
     let base = struct_base(ptr)?;
-    Some(struct_dead(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0)
+    Some(struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0)
 }
 
 /// The struct's current strong count, or `None` for a dead value or a
-/// non-struct pointer — the collector must never seed a graph node from a
-/// corpse.
+/// non-struct pointer. The collector must never seed a graph node from a
+/// dead value.
 pub(crate) unsafe fn cycle_struct_strong_count(ptr: i64) -> Option<u32> {
     let base = struct_base(ptr)?;
-    if struct_dead(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
+    if struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
         return None;
     }
     Some(struct_strong(base).load(Ordering::Relaxed))
@@ -3948,7 +3960,7 @@ pub(crate) unsafe fn cycle_struct_dtor_slot(ptr: i64) -> u64 {
     }
 }
 
-/// Add `delta` to the strong count — the collector's teardown guard.
+/// Add `delta` to the strong count: the collector's teardown guard.
 pub(crate) unsafe fn cycle_struct_guard_strong(ptr: i64, delta: u32) {
     if let Some(base) = struct_base(ptr) {
         struct_strong(base).fetch_add(delta, Ordering::Relaxed);
@@ -3979,14 +3991,14 @@ pub(crate) unsafe fn cycle_struct_free_dead(ptr: i64) {
         return;
     };
     crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
-    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
+    struct_flags(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
     struct_weak_drop(base, crate::switches::get());
 }
 
 #[cfg(test)]
 pub(crate) unsafe fn struct_dead_word_for_tests(ptr: i64) -> u32 {
     struct_base(ptr)
-        .map(|base| struct_dead(base).load(Ordering::Relaxed))
+        .map(|base| struct_flags(base).load(Ordering::Relaxed))
         .unwrap_or(u32::MAX)
 }
 
@@ -3998,7 +4010,7 @@ pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
 }
 
 /// One more weak (non-owning) reference to this struct. Does not affect the
-/// strong count, so it never keeps the value alive — only the header.
+/// strong count, so it keeps only the header alive, never the value.
 ///
 /// # Safety
 /// ptr must be a pith_struct_alloc result or garbage (magic-checked).
@@ -4029,7 +4041,7 @@ pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
 }
 
 /// Read a weak reference: returns the struct pointer if the target is still
-/// alive, or 0 if it has been released. Never dereferences dead field data —
+/// alive, or 0 if it has been released. Never dereferences dead field data:
 /// the header stays valid while any weak reference holds it, and the dead flag
 /// is set the instant the last strong owner goes away.
 ///
@@ -4042,9 +4054,9 @@ pub unsafe extern "C" fn pith_struct_weak_load(ptr: i64) -> i64 {
     };
     // acquire pairs with the release fetch_or in `pith_struct_release`: a load
     // that sees the target dead also sees its destructor's effects. test the
-    // death bit specifically — a live struct sitting in the cycle collector's
+    // death bit specifically: a live struct sitting in the cycle collector's
     // suspect buffer has bit 1 set and must still read as alive.
-    if struct_dead(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+    if struct_flags(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
         return 0;
     }
     ptr

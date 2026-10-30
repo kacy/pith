@@ -1,7 +1,7 @@
 //! terminal builtins: raw mode, window size, and byte-level i/o on a tty.
 //!
-//! everything above these six calls — escape parsing, cell rendering, the
-//! session object — is pure pith in `std/term/`. this file owns exactly the
+//! everything above these six calls (escape parsing, cell rendering, the
+//! session object) is pure pith in `std/term/`. this file owns exactly the
 //! parts that need a syscall: `isatty`, termios save/raw/restore, `TIOCGWINSZ`,
 //! a readiness-gated byte read, and a complete-write loop.
 //!
@@ -36,12 +36,12 @@ static ATEXIT_ARMED: AtomicBool = AtomicBool::new(false);
 /// leave the alternate screen, show the cursor, disable mouse/paste/focus
 /// reporting, and reset styling. every sequence here is a no-op on a terminal
 /// that never turned the feature on, so writing the whole string blind is
-/// safe — cheap insurance against a session that died between enter and
+/// safe: cheap insurance against a session that died between enter and
 /// restore.
 const RESET_SEQ: &[u8] = b"\x1b[?1049l\x1b[?25h\x1b[?1006l\x1b[?1002l\x1b[?2004l\x1b[?1004l\x1b[0m";
 
 /// put the saved termios back, if any. returns true when the terminal is in
-/// its original state afterwards — including the case where nothing was ever
+/// its original state afterwards, including the case where nothing was ever
 /// saved, which is already that state.
 fn restore_saved() -> bool {
     let mut saved = match SAVED.lock() {
@@ -61,9 +61,9 @@ fn restore_saved() -> bool {
 /// `exit`, including the `exit(1)` inside runtime traps.
 extern "C" fn restore_at_exit() {
     if restore_saved() {
-        // only bother with the reset string when a session actually entered raw
-        // mode at some point — SAVED starts None and restore_saved() drains it,
-        // so reaching here always means the hook was armed by a raw enter.
+        // only a raw enter registers this hook, so a session did enter raw
+        // mode at some point; the reset string undoes whatever screen modes it
+        // turned on, unless putting the termios back failed.
         // SAFETY: one plain write to stdout at process exit.
         unsafe {
             libc::write(1, RESET_SEQ.as_ptr() as *const libc::c_void, RESET_SEQ.len());
@@ -156,8 +156,8 @@ pub extern "C" fn pith_term_size(fd: i64) -> i64 {
 
 /// read up to `max` bytes from `fd`, waiting at most `timeout_ms` (-1 waits
 /// forever) for the first byte. returns a `Bytes` handle: non-empty on data,
-/// **empty on timeout** (normal — the escape-sequence parser uses short
-/// timeouts constantly), and `0` — the failure sentinel — on EOF or a hard
+/// **empty on timeout** (normal: the escape-sequence parser uses short
+/// timeouts constantly), and `0` (the failure sentinel) on EOF or a hard
 /// error, both of which mean the terminal session is over.
 ///
 /// the wait parks a green task on the reactor exactly like a socket read; the
@@ -197,7 +197,7 @@ pub extern "C" fn pith_term_read(fd: i64, max: i64, timeout_ms: i64) -> i64 {
 
 /// write all of a `Bytes` value to `fd`, looping over partial writes. returns
 /// the byte count on success, -1 on a bad handle or an error mid-write. no
-/// newline is appended — that is the point.
+/// newline is appended: that is the point.
 #[no_mangle]
 pub extern "C" fn pith_term_write(fd: i64, data: i64) -> i64 {
     if fd < 0 {
@@ -239,7 +239,7 @@ pub extern "C" fn pith_term_write(fd: i64, data: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
 
     /// tests that enter raw mode share the process-wide SAVED slot, so they
     /// take this lock to keep their save/restore pairs from interleaving.
@@ -253,12 +253,20 @@ mod tests {
             assert!(master >= 0, "posix_openpt failed");
             assert_eq!(libc::grantpt(master), 0);
             assert_eq!(libc::unlockpt(master), 0);
-            let name = libc::ptsname(master);
-            assert!(!name.is_null());
-            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            let name = pty_name(master);
+            let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
             assert!(slave >= 0, "open slave failed");
             (master, slave)
         }
+    }
+
+    /// the slave device path for a pty master. uses ptsname_r because
+    /// ptsname returns a static buffer that parallel tests overwrite.
+    fn pty_name(master: i32) -> CString {
+        let mut buf = [0 as libc::c_char; 128];
+        let rc = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(rc, 0, "ptsname_r failed");
+        unsafe { CStr::from_ptr(buf.as_ptr()) }.to_owned()
     }
 
     fn close_pair(master: i32, slave: i32) {
@@ -407,10 +415,9 @@ mod tests {
 
     #[test]
     fn ptsname_smoke() {
-        // keep CStr imported for future name-based assertions; also proves
-        // the pty path yields a real device name.
+        // proves the pty path yields a real device name.
         let (master, slave) = open_pty();
-        let name = unsafe { CStr::from_ptr(libc::ptsname(master)) };
+        let name = pty_name(master);
         assert!(name.to_string_lossy().starts_with("/dev/pts/"));
         close_pair(master, slave);
     }

@@ -4,9 +4,9 @@
 # a hash chain over 3-byte prefixes finds back-references (longest
 # match wins, up to 258 bytes within a 32k window); the token stream
 # encodes with the fixed huffman tables, so no tree serialization is
-# needed. dynamic huffman would shave a few more percent and is left
-# for later — this already produces real compression that any inflate
-# implementation reads.
+# needed. dynamic huffman would shave a few more percent; the fixed
+# tables already give real compression that any inflate implementation
+# reads.
 import std.bits as bits
 import std.bytes as bytes
 
@@ -94,6 +94,7 @@ fn write_match(w: BitWriter, length: Int, distance: Int):
     if dextra > 0:
         bw_write_bits(w, distance - distance_symbol_base(dsym), dextra)
 
+# hash a 3-byte prefix into one of the 32768 chain heads
 fn hash3(a: Int, b: Int, c: Int) -> Int:
     return bits.band(a * 2654435 + b * 40503 + c * 809, 32767)
 

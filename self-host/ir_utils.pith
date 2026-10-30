@@ -2,7 +2,7 @@
 
 # append to a list and hand it back, for the `xs = ir_push_string(xs, v)`
 # form the emitter's module-level stacks are written in. despite the
-# signature this is not a copy — the returned list is the one passed in,
+# signature this is not a copy: the returned list is the one passed in,
 # already mutated, so any other name bound to it also sees the new element.
 pub fn ir_push_string(items: List[String], value: String) -> List[String]:
     mut updated: List[String] := items
@@ -68,7 +68,7 @@ pub fn ir_decode_int_list(encoded: String) -> List[Int]:
 # a real element-by-element copy of the name-to-register map, for the
 # save/restore around emitting a nested scope (a lambda body, a select
 # arm). plain assignment only aliases the map, so a saved-off reference
-# would pick up every binding the nested scope inserted — exactly the
+# would pick up every binding the nested scope inserted, exactly the
 # bindings the restore exists to drop.
 pub fn ir_copy_var_regs(src: Map[String, Int]) -> Map[String, Int]:
     mut copy: Map[String, Int] := {}
@@ -87,7 +87,7 @@ pub fn ir_copy_var_types(src: Map[String, String]) -> Map[String, String]:
 # read back a field position from ir_struct_field_index_lookup, which
 # stores each "Struct.field" index as a decimal string. multiply the result
 # by 8 for the byte offset. unlike ir_parse_field_index this trusts its
-# input — the digits came from the emitter's own to_string, so there is no
+# input: the digits came from the emitter's own to_string, so there is no
 # not-a-number answer.
 pub fn ir_unpack_field_index(meta: String) -> Int:
     mut value := 0

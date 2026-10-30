@@ -1,29 +1,30 @@
-# ir_decode_emit.pith — emission of json, handle-pool, and config decode
+# ir_decode_emit.pith: emission of json, handle-pool, and config decode
 # calls: walking a target struct's fields and generating the
 # per-field fetch, convert, default, and merge sequences.
 #
 # the emitter's expression machinery stays in the core; where a field
 # default needs an expression emitted in place, these functions take
 # the emission hooks as explicit parameters (emit_expr, emit_value,
-# emit_default_ret) instead of importing the core back — that keeps
+# emit_default_ret) instead of importing the core back; that keeps
 # the module graph a dag.
 
 from ast import Node, get_node, node_kind
 from ir_ast_helpers import ir_unwrap_pub_node
-from ir_builder import ir_emit, ir_reg, ir_str, ir_str_interned, ir_label, ir_new_temp_name, ir_var_types
+from ir_builder import ir_emit, ir_reg, ir_str, ir_str_interned, ir_label, ir_new_temp_name, ir_var_types, ir_zero_reg
 from checker import c_get_expr_type
 from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_handle_require_full_name_for_type_name, ir_active_generic_params, ir_active_generic_concrete_types, ir_type_aliases
-from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_tag, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name, ir_json_struct_list_elem_tid, ir_json_list_elem_tid, ir_json_map_value_tid, ir_json_node_built_collection
+from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name, ir_json_struct_list_elem_tid, ir_json_list_elem_tid, ir_json_map_value_tid, ir_json_node_built_collection
 from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_state, ir_generic_preferred_name, ir_json_generic_name_with_state, ir_queue_generic_specialization, ir_resolve_generic_module_call_name, ir_handle_generic_name_with_state, ir_specialize_type_name_with_state
 from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
 from ir_ownership import ir_rc_release_reg, ir_string_release_reg
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
-from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_emit_result_flag_field, ir_zero_reg, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
+from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_emit_result_flag_field, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
 from ir_result_flow import ir_emit_result_return_error_branch, ir_emit_result_store_error_branch
 from ir_struct_registry import ir_struct_base_name, ir_struct_decl_nodes, ir_struct_field_count, ir_struct_field_default_node, ir_struct_field_name_at, ir_struct_has_default_fields, ir_struct_names, ir_struct_needs_dtor
 from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_result_tuple_raw, ir_emit_struct_result_return, ir_emit_struct_result_store
 from ir_tree_cache import ir_cached_decode_call_nodes, ir_root_items
 from ir_type_helpers import ir_type_from_tid
+from ir_names import ir_base_decl_name
 from types import get_type_info, lookup_type_id
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label
 
@@ -55,8 +56,8 @@ fn ir_emit_decode_result_call3(result_reg: Int, fname: String, arg0: Int, arg1: 
 #
 # at a plain call site (json.decode_text[User](...)) the checker already
 # knows the result is User!, so we take the struct straight from the
-# expression type. inside a generic wrapper body — parse[T] specialized as
-# parse__User — the checker only ever saw the abstract T, so the expression
+# expression type. inside a generic wrapper body (parse[T] specialized as
+# parse__User), the checker only ever saw the abstract T, so the expression
 # type is the type parameter, not the concrete struct. in that case we
 # recover the struct from the call's explicit type argument ([T]) by
 # substituting it through the active generic bindings (T -> User).
@@ -125,7 +126,7 @@ struct IrJsonPoolMark:
 # catch to consume (or returned it), and the success path abandons the
 # shell. result shells carry no destructor, so releasing one frees exactly
 # the three-slot allocation while the extracted payload keeps the count
-# the callee transferred — the same shape the catch lowering emits. every
+# the callee transferred, the same shape the catch lowering emits. every
 # require step of a typed decode leaked its shell before these.
 fn ir_take_json_ok(result_r: Int, field_tid: Int) -> Int:
     ok_r := ir_emit_json_field_ok(result_r, field_tid)
@@ -1564,7 +1565,7 @@ fn ir_json_required_mask(n: Int) -> Int:
     return mask
 
 # string is the only rc scalar, so the struct needs its destructor when
-# any field is a string — otherwise those field strings would leak.
+# any field is a string; otherwise those field strings would leak.
 fn ir_json_decode_has_string(target_info: TypeInfo) -> Bool:
     for field_name, i in target_info.fields:
         field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
@@ -1573,7 +1574,7 @@ fn ir_json_decode_has_string(target_info: TypeInfo) -> Bool:
     return false
 
 # the fast path: decode a flat scalar struct in a single pass. the
-# runtime fills a pre-allocated struct — destructor attached — in place,
+# runtime fills a pre-allocated struct, destructor attached, in place,
 # so there is no scalar-object, no per-field result tuple, and no leaked
 # field strings. a mask of the filled fields is checked against the
 # required set; any miss releases the struct and returns the decode error.
@@ -1665,11 +1666,6 @@ fn ir_json_nested_decl_index(type_name: String) -> Int:
 
 fn ir_json_is_struct_decl_kind(kind: String) -> Bool:
     return kind == "struct_decl" or kind == "struct"
-
-fn ir_json_bare_decl_name(node: Node) -> String:
-    if node.value.contains("["):
-        return node.value.substring(0, node.value.index_of("["))
-    return node.value
 
 # the structs whose destructor address the nested filler needs, in the
 # order the spec's `#<k>` indices name them: the element struct of every
@@ -1825,7 +1821,7 @@ pub fn ir_json_intern_nested_specs(roots: List[Int]):
             node := get_node(item_idx)
             if not ir_json_is_struct_decl_kind(node.kind):
                 continue
-            name := ir_json_bare_decl_name(node)
+            name := ir_base_decl_name(node.value)
             if ir_json_nested_decls.contains_key(name):
                 ambiguous.push(name)
             else:

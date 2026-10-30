@@ -1,11 +1,11 @@
 # ir_struct_result_helpers.pith - struct result packing IR helpers
 
-from ir_builder import ir_emit, ir_reg
-from ir_metadata import ir_runtime_call_name
+from ir_builder import ir_emit, ir_reg, ir_zero_reg
+from ir_call_helpers import ir_emit_call1_raw
 from ir_struct_registry import ir_struct_base_name, ir_struct_needs_dtor
 
 # a struct built here is handed to the caller as an owned value, so it
-# needs its type's destructor exactly like a literal-built one — without
+# needs its type's destructor exactly like a literal-built one; without
 # it, releasing the decoded struct freed the shell and stranded every rc
 # field. guarded by the same predicate the core emitter uses, because a
 # destructor only exists for types that need one.
@@ -19,14 +19,6 @@ fn ir_emit_attach_result_dtor(struct_r: Int, struct_kind: String):
     ir_emit("funcref " + fr.to_string() + " __dtor_" + ir_struct_base_name(raw_name))
     ir_emit("call " + ir_reg().to_string() + " pith_struct_set_dtor void 2 " + struct_r.to_string() + " " + fr.to_string())
 
-fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
-    ir_emit("call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " 1 " + arg0.to_string())
-
-fn ir_zero_reg_raw() -> Int:
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " 0")
-    return r
-
 fn ir_emit_result_tuple_raw(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
     count_r := ir_reg()
     ir_emit("iconst " + count_r.to_string() + " 3")
@@ -38,8 +30,8 @@ fn ir_emit_result_tuple_raw(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
     return result_r
 
 ## wrap `ok_r` in a success result box: three slots, is_ok set, the
-## payload in the ok slot and a zero error slot. no retain is emitted —
-## the payload's count moves into the box — and the shell gets no
+## payload in the ok slot and a zero error slot. no retain is emitted
+## (the payload's count moves into the box), and the shell gets no
 ## destructor, so releasing it later frees the three slots alone: the
 ## payload has to be taken out first or its count is stranded.
 ## "raw" means it is built on the registry-free call helper, so modules
@@ -47,16 +39,16 @@ fn ir_emit_result_tuple_raw(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
 pub fn ir_emit_ok_result_tuple_raw(ok_r: Int) -> Int:
     one := ir_reg()
     ir_emit("iconst " + one.to_string() + " 1")
-    return ir_emit_result_tuple_raw(one, ok_r, ir_zero_reg_raw())
+    return ir_emit_result_tuple_raw(one, ok_r, ir_zero_reg())
 
 ## build an error result box around `err_r`, mirroring the ok variant.
 pub fn ir_emit_err_result_tuple_raw(err_r: Int) -> Int:
-    zero := ir_zero_reg_raw()
+    zero := ir_zero_reg()
     return ir_emit_result_tuple_raw(zero, zero, err_r)
 
 ## the success tail of a generated decode that returns through a temp:
-## allocate the struct, fill it from `field_regs` — list position is the
-## field slot, so they must be in declaration order — give it its
+## allocate the struct, fill it from `field_regs` (list position is the
+## field slot, so they must be in declaration order), give it its
 ## destructor when the type needs one, and store the ok box into
 ## `temp_name`. the counts in `field_regs` transfer into the struct.
 ## `temp_name` is the same temp every fallible step of the decode stores
@@ -75,7 +67,7 @@ pub fn ir_emit_struct_result_store(field_regs: List[Int], struct_kind: String, t
 ## the same packing as ir_emit_struct_result_store, for a generated body
 ## that returns directly instead of routing through a temp: the ok box
 ## becomes the return value. it emits the `endfunc` itself, so this is
-## the last thing that may be emitted for that function — anything the
+## the last thing that may be emitted for that function; anything the
 ## caller adds afterwards lands outside the body.
 pub fn ir_emit_struct_result_return(field_regs: List[Int], struct_kind: String):
     struct_r := ir_reg()

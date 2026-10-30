@@ -1,7 +1,8 @@
 # std.compress.zlib — zlib helpers
 #
-# this writes portable zlib streams with stored deflate blocks. like the
-# gzip module, this first slice favors compatibility over smaller output.
+# a zlib stream is a two-byte header, a raw deflate stream from
+# std.compress.deflate, and a big-endian adler32 of the uncompressed data.
+# preset dictionaries are rejected on read and never written.
 
 import std.bytes as bytes
 import std.compress.inflate as inflate
@@ -13,7 +14,6 @@ import std.fs as fs
 import std.os.path as path
 from std.bytes import ByteBuffer
 
-ZLIB_STORED_BLOCK_SIZE := 65535
 ZLIB_COMPRESSION_METHOD_DEFLATE := 8
 ZLIB_FLAG_DICT := 32
 
@@ -22,12 +22,6 @@ fn zlib_invalid() -> String:
 
 fn zlib_read_u8_at(data: Bytes, offset: Int) -> Int!:
     value := binary.read_u8_at(data, offset)
-    if value.is_err:
-        fail zlib_invalid()
-    return value.ok
-
-fn zlib_read_u16_le_at(data: Bytes, offset: Int) -> Int!:
-    value := binary.read_u16_le_at(data, offset)
     if value.is_err:
         fail zlib_invalid()
     return value.ok
@@ -44,33 +38,17 @@ fn zlib_write_u8(out: ByteBuffer, value: Int) -> Int!:
         fail wrote.err.message
     return wrote.ok
 
-fn zlib_write_u16_le(out: ByteBuffer, value: Int) -> Int!:
-    wrote := binary.write_u16_le(out, value)
-    if wrote.is_err:
-        fail wrote.err.message
-    return wrote.ok
-
 fn zlib_write_u32_be(out: ByteBuffer, value: Int) -> Int!:
     wrote := binary.write_u32_be(out, value)
     if wrote.is_err:
         fail wrote.err.message
     return wrote.ok
 
+# cmf 0x78 is deflate with a 32k window; flg 0x01 makes cmf * 256 + flg a
+# multiple of 31, as the header check requires, and asks for no dictionary.
 fn zlib_write_header(out: ByteBuffer) -> Int!:
-    mut total := zlib_write_u8(out, 120)!
+    total := zlib_write_u8(out, 120)!
     return total + zlib_write_u8(out, 1)!
-
-fn zlib_write_stored_block(out: ByteBuffer, is_final: Bool, data: Bytes) -> Int!:
-    mut total := 0
-    if is_final:
-        total = total + zlib_write_u8(out, 1)!
-    else:
-        total = total + zlib_write_u8(out, 0)!
-    total = total + zlib_write_u16_le(out, data.len())!
-    total = total + zlib_write_u16_le(out, ZLIB_STORED_BLOCK_SIZE - data.len())!
-    if data.len() == 0:
-        return total
-    return total + out.write(data)!
 
 fn zlib_parse_header(data: Bytes) -> Int!:
     if data.len() < 6:
@@ -88,9 +66,6 @@ fn zlib_parse_header(data: Bytes) -> Int!:
     if (cmf * 256 + flg) % 31 != 0:
         fail zlib_invalid()
     return 2
-
-fn zlib_decompress_result(data: Bytes) -> Bytes!:
-    return zlib_decompress_bounded(data, inflate.DEFAULT_MAX_OUTPUT)!
 
 fn zlib_decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
     start := zlib_parse_header(data)!
@@ -114,10 +89,9 @@ fn zlib_compress_result(data: Bytes) -> Bytes!:
 pub fn compress(data: Bytes) -> Bytes:
     return zlib_compress_result(data) catch bytes.empty()
 
-# decompress a zlib stream created with stored deflate blocks.
 ## decompress a zlib stream; the adler32 trailer is verified.
 pub fn decompress(data: Bytes) -> Bytes!:
-    return zlib_decompress_result(data)
+    return zlib_decompress_bounded(data, inflate.DEFAULT_MAX_OUTPUT)
 
 ## decompress with an explicit ceiling on the decoded size; fails once the
 ## output would exceed `max_output`. use this on untrusted input to bound a
@@ -125,18 +99,15 @@ pub fn decompress(data: Bytes) -> Bytes!:
 pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
     return zlib_decompress_bounded(data, max_output)
 
-# true when the data is a zlib stream this module can read.
 ## true when the data is a zlib stream this module can read.
 pub fn is_valid(data: Bytes) -> Bool:
-    result := zlib_decompress_result(data)
+    result := decompress(data)
     return result.is_ok
 
-# compress utf-8 text into zlib bytes.
 ## compress utf-8 text into zlib bytes.
 pub fn compress_string(text: String) -> Bytes:
     return compress(bytes.from_string_utf8(text))
 
-# decompress zlib bytes and decode the result as utf-8 text.
 ## decompress zlib bytes and decode as utf-8 text.
 pub fn decompress_string(data: Bytes) -> String!:
     return decompress(data)!.to_string_utf8()!

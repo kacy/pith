@@ -10,7 +10,7 @@
 
 from ast import Node, get_node, node_kind
 from ir_ast_helpers import ir_unwrap_pub_node
-from ir_builder import ir_emit, ir_reg, ir_str, ir_str_interned, ir_label, ir_new_temp_name, ir_var_types
+from ir_builder import ir_emit, ir_reg, ir_str, ir_str_interned, ir_label, ir_new_temp_name, ir_var_types, ir_zero_reg
 from checker import c_get_expr_type
 from ir_alias_registry import ir_config_require_full_name_for_type_name, ir_emit_result_ok_field_typed, ir_is_config_decode_callee, ir_is_config_file_decode_callee, ir_resolve_config_call_name, ir_resolve_json_call_name, ir_resolve_handle_decode_call_name, ir_struct_field_tid_at, ir_handle_require_full_name_for_type_name, ir_active_generic_params, ir_active_generic_concrete_types, ir_type_aliases
 from ir_decode_calls import ir_json_field_helper_name, ir_config_require_helper_name, ir_json_field_type_char, ir_json_type_name_char, ir_json_object_helper_name, ir_json_require_helper_name, ir_json_scan_required_helper_name, ir_json_scalar_has_helper_name, ir_optional_inner_tid, ir_struct_decode_field_tid, ir_struct_has_nested_decode_fields, ir_struct_has_optional_fields, ir_handle_require_helper_name, ir_json_struct_list_elem_tid, ir_json_list_elem_tid, ir_json_map_value_tid, ir_json_node_built_collection
@@ -18,12 +18,13 @@ from ir_generics import ir_generic_decl_indices, ir_config_generic_name_with_sta
 from ir_optionals import ir_emit_optional_none_value, ir_emit_optional_some_value
 from ir_ownership import ir_rc_release_reg, ir_string_release_reg
 from ir_path_helpers import ir_emit_dotted_path_lookup, ir_emit_dotted_path_lookup_or_return
-from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_emit_result_flag_field, ir_zero_reg, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
+from ir_result_abi import ir_emit_json_field_ok, ir_emit_result_value_field, ir_emit_result_flag_field, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
 from ir_result_flow import ir_emit_result_return_error_branch, ir_emit_result_store_error_branch
 from ir_struct_registry import ir_struct_base_name, ir_struct_decl_nodes, ir_struct_field_count, ir_struct_field_default_node, ir_struct_field_name_at, ir_struct_has_default_fields, ir_struct_names, ir_struct_needs_dtor
 from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_result_tuple_raw, ir_emit_struct_result_return, ir_emit_struct_result_store
 from ir_tree_cache import ir_cached_decode_call_nodes, ir_root_items
 from ir_type_helpers import ir_type_from_tid
+from ir_names import ir_base_decl_name
 from types import get_type_info, lookup_type_id
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label
 
@@ -1666,11 +1667,6 @@ fn ir_json_nested_decl_index(type_name: String) -> Int:
 fn ir_json_is_struct_decl_kind(kind: String) -> Bool:
     return kind == "struct_decl" or kind == "struct"
 
-fn ir_json_bare_decl_name(node: Node) -> String:
-    if node.value.contains("["):
-        return node.value.substring(0, node.value.index_of("["))
-    return node.value
-
 # the structs whose destructor address the nested filler needs, in the
 # order the spec's `#<k>` indices name them: the element struct of every
 # list and every struct field under one, which the filler allocates
@@ -1825,7 +1821,7 @@ pub fn ir_json_intern_nested_specs(roots: List[Int]):
             node := get_node(item_idx)
             if not ir_json_is_struct_decl_kind(node.kind):
                 continue
-            name := ir_json_bare_decl_name(node)
+            name := ir_base_decl_name(node.value)
             if ir_json_nested_decls.contains_key(name):
                 ambiguous.push(name)
             else:

@@ -1,6 +1,6 @@
 # ir_result_abi.pith - low-level Result IR helpers
 
-from ir_builder import ir_emit, ir_reg, ir_str, ir_label, ir_new_temp_name, ir_var_types
+from ir_builder import ir_zero_reg, ir_emit, ir_reg, ir_str, ir_label, ir_new_temp_name, ir_var_types
 from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_result_tuple_raw
 from ir_type_helpers import ir_type_from_tid, ir_resolve_type_hint_with_state
 from types import get_type_info
@@ -105,16 +105,6 @@ pub fn ir_emit_result_flag_field(obj_r: Int, fname: String) -> Int:
     zero := ir_zero_reg()
     r := ir_reg()
     ir_emit("eq " + r.to_string() + " " + flag_r.to_string() + " " + zero.to_string())
-    return r
-
-# a fresh register holding the integer 0, for the many places an
-# emitter needs a literal zero as a register: an unused result slot, a
-# missing struct field default, the value an unsupported path falls back
-# to. every call emits its own `iconst`, so hold the register you get
-# rather than calling twice for the same zero.
-pub fn ir_zero_reg() -> Int:
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " 0")
     return r
 
 # the error payload to put in the err slot when a legacy single-register

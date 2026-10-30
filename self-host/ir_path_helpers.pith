@@ -1,20 +1,8 @@
 # ir_path_helpers.pith - dotted path traversal IR helpers
 
 from ir_builder import ir_emit, ir_reg, ir_label, ir_str
-from ir_metadata import ir_runtime_call_name
+from ir_call_helpers import ir_emit_call1_raw, ir_emit_call2_raw
 from ir_result_abi import ir_emit_result_flag_field, ir_emit_result_value_field, ir_emit_ret_known_err_box, ir_result_reg_funcs, ir_emit_registered_rcall_boxed_into
-
-fn ir_emit_call_text_raw(result_reg: Int, fname: String, ret_kind: String, arg_count: Int, arg_text: String):
-    mut call_line := "call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " " + arg_count.to_string()
-    if arg_text.len() > 0:
-        call_line = call_line + arg_text
-    ir_emit(call_line)
-
-fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
-    ir_emit_call_text_raw(result_reg, fname, ret_kind, 1, " " + arg0.to_string())
-
-fn ir_emit_call2_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int, arg1: Int):
-    ir_emit_call_text_raw(result_reg, fname, ret_kind, 2, " " + arg0.to_string() + " " + arg1.to_string())
 
 fn ir_emit_path_loop_step(idx_name: String, loop_l: String):
     step_idx_r := ir_reg()

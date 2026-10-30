@@ -1,4 +1,4 @@
-# ir_emitter_core.pith — the lowering engine
+# ir_emitter_core.pith: the lowering engine
 #
 # turns a checked ast into text ir. this module owns the parts of
 # lowering that are mutually recursive by nature and share the
@@ -20,7 +20,7 @@
 #
 # the satellites never import this module back. where one needs an
 # expression or a block emitted in place, it takes the emitter as an
-# explicit fn-value parameter (emit_expr, emit_block, ...) — grep for
+# explicit fn-value parameter (emit_expr, emit_block, ...); grep for
 # those names to see every seam.
 #
 # two type vocabularies meet here. the checker speaks tids (integer
@@ -54,11 +54,11 @@ from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emi
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg, ir_kinded_code, ir_kinded_code_kind, ir_kinded_code_count, ir_kinded_tag_slot, ir_kinded_release_slot, ir_kinded_rebind
 from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_handle_decode_callee, ir_declared_callable_return_type, ir_emit_result_ok_field_typed, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_drop_symbols, ir_struct_drop_symbol, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
-from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds, ir_kinded_rc_binds, ir_kinded_release_symbol, ir_kinded_release_used
+from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_zero_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds, ir_kinded_rc_binds, ir_kinded_release_symbol, ir_kinded_release_used
 # shared helpers: ast shapes, captures, results, optionals, literals
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name
 from ir_capture import ir_capture_find_free_vars
-from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_decode_result_value, ir_emit_result_flag_field, ir_zero_reg, ir_emit_result_error_message, ir_emit_result_value_field, ir_result_field_kind
+from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_decode_result_value, ir_emit_result_flag_field, ir_emit_result_error_message, ir_emit_result_value_field, ir_result_field_kind
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_optional_value_as, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
@@ -137,12 +137,12 @@ mut ir_stack_closure_regs: List[Int] := []
 # slot 16). these two lists track, per function, the tuple locals whose EVERY use
 # is a flag check (`.is_ok`/`.is_err`/`== none`), a borrowing `.ok`/`.err`
 # read, a result extraction, or an argument of a same-module call whose body
-# provably only reads the parameter — uses that leave the tuple holding the
+# provably only reads the parameter: uses that leave the tuple holding the
 # count it was built with, so the cleanup path is the payload's only releaser.
 # for those the cleanup releases the live payload before freeing the shell. a
 # local with any other use (returned, bound, matched, iterated, captured, ...)
 # is left out and keeps the plain shell release, which frees what the shell
-# owns through its destructor and nothing more — a bounded leak for a
+# owns through its destructor and nothing more: a bounded leak for a
 # destructor-less shell, never a double free. see ir_tuple_use_is_whitelisted.
 mut ir_tuple_local_tid: Map[String, Int] := {} # tuple local name -> producing expr's type id
 mut ir_tuple_cascade_names: List[String] := [] # tuple locals whose payload is safe to cascade
@@ -247,8 +247,8 @@ mut ir_for_count := 0
 mut ir_break_stack: List[String] := []
 mut ir_continue_stack: List[String] := []
 
-# a `for` loop's variables are scoped to the loop — the checker rejects reading
-# one after the loop ends — but the emitter's locals are a single flat namespace
+# a `for` loop's variables are scoped to the loop (the checker rejects reading
+# one after the loop ends), but the emitter's locals are a single flat namespace
 # per function, so `for root in roots` and a later `root := ...` used to land in
 # the same slot. the loop stores a *borrowed* element there, so the rebind's
 # release-the-old (and the exit cleanup, on an early return) dropped a count the
@@ -287,7 +287,7 @@ fn ir_loop_var_slot_name(fid: Int, name: String) -> String:
 # statements are re-emitted at every scope-exit edge in LIFO order, before the
 # ARC cleanup. ir_defer_nodes is a flat stack of the inner statement node
 # indices currently in scope; ir_defer_is_err is a parallel stack marking each
-# entry as an `errdefer` (1) or plain `defer` (0) — errdefers are skipped at
+# entry as an `errdefer` (1) or plain `defer` (0); errdefers are skipped at
 # success exits and emitted only at error exits. ir_defer_scope_starts marks
 # where each open block scope begins in the flat stack; ir_defer_loop_base_stack
 # records the flat-stack length at each loop entry so break/continue emit only
@@ -329,7 +329,7 @@ mut ir_current_impl_subst_args: List[String] := []
 
 # per-instance destructors for generic enums. a generic enum's declaration records its
 # type parameter names as payload kinds, so the shared `__dtor_<enum>` sees
-# no rc payload and is never generated — `Holder[String].Some(s)` freed its
+# no rc payload and is never generated. `Holder[String].Some(s)` freed its
 # box and stranded the string. a construction site knows its instance from
 # the checked type, resolves every variant's concrete kinds, and registers a
 # destructor keyed by that kind signature, so instances with the same rc
@@ -384,7 +384,7 @@ pub fn set_import_roots(roots: List[Int], paths: List[String]):
 # every module in the build, for impl-method and interface collection,
 # which must see the whole graph rather than one module's imports.
 # set once per build: emit_ir does not clear it. leaving it empty is
-# allowed — collection then falls back to the direct import roots, and
+# allowed; collection then falls back to the direct import roots, and
 # an impl block outside them lowers to a symbol nothing defines.
 pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
     ir_all_module_roots = roots
@@ -392,7 +392,7 @@ pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
 
 # the resolved path of the module about to be emitted; "" for the entry
 # file. emit_ir does not clear it, so it holds the previous module's
-# path until the next call — set it for every module, not only the ones
+# path until the next call. set it for every module, not only the ones
 # that need it.
 pub fn set_current_module_path(path: String):
     ir_current_module_path = path
@@ -492,9 +492,9 @@ fn ir_reset_control_flow_state():
 # sees the previous one's declarations; a caller only needs it to
 # discard a half-finished emit.
 #
-# what it deliberately keeps is the cross-module configuration — the
+# what it deliberately keeps is the cross-module configuration (the
 # import roots, the full module graph, the current module path, test
-# mode — and ir_module_count, whose per-emit bump is what makes
+# mode) and ir_module_count, whose per-emit bump is what makes
 # generated symbols unique across the modules of one build.
 pub fn ir_reset():
     ir_reset_local_state()
@@ -512,7 +512,7 @@ fn ir_lookup_map_value_type_for_expr(idx: Int) -> String:
 
 # the ir return kind of a struct's fn-value field (e.g. `make: fn() -> T!`),
 # or "" when the field isn't a fn_type. a `self.make()` call is a closure-field
-# call, not a method, so this lets its result kind be reported correctly — a
+# call, not a method, so this lets its result kind be reported correctly: a
 # Result-returning factory forwards its result instead of being re-wrapped.
 fn ir_struct_fn_field_return_kind(struct_name: String, field_name: String) -> String:
     if not ir_struct_decl_nodes.contains_key(struct_name):
@@ -598,7 +598,7 @@ fn ir_method_call_result_kind(idx: Int, node: Node) -> String:
     mut impl_name := ir_lookup_impl_method_for(node.children[0], obj_type, method_name)
     if impl_name.len() > 0:
         # a generic method's declared return kind lives on the specialization,
-        # not on the base name — the base's may still be a type parameter
+        # not on the base name; the base's may still be a type parameter
         if ir_is_generic_method_name(impl_name):
             impl_name = ir_queue_generic_method_call(idx, node, impl_name)
         declared_kind := ir_declared_callable_ir_retkind(impl_name)
@@ -736,7 +736,7 @@ fn ir_struct_field_is_weak(struct_name: String, field_name: String) -> Bool:
 # already-optional value is unwrapped to its payload (0 when none); a bare
 # struct value is the target directly. pith_struct_weak_retain(0) is a no-op,
 # so the null cases need no branch. the returned pointer is what the field
-# slot holds — no owning tuple, which is what keeps the ring from cycling.
+# slot holds: no owning tuple, which is what keeps the ring from cycling.
 fn ir_emit_weak_payload(val_idx: Int) -> Int:
     vnode := get_node(val_idx)
     if vnode.kind == "none_lit" or vnode.kind == "none":
@@ -785,7 +785,7 @@ fn ir_emit_func_header(name: String, param_count: Int, ret_type: String):
     ir_emit("func " + name + " " + param_count.to_string() + " " + ir_retkind(ret_type))
 
 # kinds a cycle tracer reports: children that can themselves hold
-# references. a string or bytes value is a leaf — it never points back —
+# references. a string or bytes value is a leaf (it never points back),
 # and a weak field holds no strong count, so none of those are visited.
 fn ir_trace_kind_enabled(kind: String) -> Bool:
     return ir_kind_is_struct_header(kind) or kind == "list" or kind == "map" or kind == "set" or kind == "closure"
@@ -859,7 +859,7 @@ fn ir_kind_reaches_structs(kind: String) -> Bool:
 # instead of released. __cc_register_tracers_m<N> pairs each destructor with
 # its twin in the runtime's side table, so a future collector can enumerate a
 # dead candidate's edges through the destructor pointer the box already
-# carries — no per-instance cost, and destructors without a twin (only
+# carries: no per-instance cost, and destructors without a twin (only
 # string, bytes or weak slots) correctly read as leaves. inert until a
 # collector installs a visitor: an unhooked pith_cc_visit returns
 # immediately.
@@ -868,7 +868,7 @@ fn ir_kind_reaches_structs(kind: String) -> Bool:
 # rather than two near-identical ones. that is safe because these emitters
 # make no ownership decision: what the walk covers was settled when the type
 # was registered, and the walk only serializes it. what stays separate is the
-# memo tables — ir_dtor_memo and ir_tracer_memo — because a struct can need a
+# memo tables (ir_dtor_memo and ir_tracer_memo), because a struct can need a
 # destructor and no tracer, a string or bytes slot being a leaf.
 
 # open a walk body: one pointer parameter, loaded into the register every
@@ -988,8 +988,8 @@ fn ir_rc_track_local(name: String, kind: String):
 # body emits (saved and restored around it, so nesting composes). reads of
 # these wrap in the weak liveness resolution exactly like a weak local's,
 # but the names are NOT tracked in ir_rc_locals: the closure environment
-# owns the single weak reference — dropped by its tag-8 slot when the
-# closure frees — so the lambda's per-call exit cleanup must leave the slot
+# owns the single weak reference (dropped by its tag-8 slot when the
+# closure frees), so the lambda's per-call exit cleanup must leave the slot
 # alone or the weak count underflows.
 mut ir_weak_capture_names: List[String] := []
 
@@ -1012,8 +1012,8 @@ fn ir_name_is_weak_read(name: String) -> Bool:
 #
 # borrowed is the answer for a read of storage another owner keeps alive: a
 # variable, a container element, a struct field, `self`. owned is the answer
-# for everything that mints a fresh value or carries a count out of somewhere
-# — a fresh string (a literal, a concatenation, an interpolation, a builtin
+# for everything that mints a fresh value or carries a count out of somewhere:
+# a fresh string (a literal, a concatenation, an interpolation, a builtin
 # known to build one), a call or method-call result of an rc kind, an await, a
 # catch, a lambda, a named function value, a list/map/set/tuple literal, a
 # struct init, a bare payload-free variant, and a field read off an owned
@@ -1022,16 +1022,16 @@ fn ir_name_is_weak_read(name: String) -> Bool:
 # us the shape and how much it cost.
 #
 # the two ways of being wrong are not symmetric. calling an owned value
-# borrowed makes the consumer take a second count nobody releases — a leak.
+# borrowed makes the consumer take a second count nobody releases: a leak.
 # calling a borrowed value owned skips the retain and lets the consumer
-# release a count it never took — a dangling pointer. so wherever the answer
+# release a count it never took: a dangling pointer. so wherever the answer
 # cannot be proved (a receiver that will not resolve, a call whose type the
 # checker did not record) the clause falls through to borrowed on purpose.
 #
 # the sequence of early returns below is the classification. they are ordered
 # so a specific shape answers before the general rule it would otherwise fall
-# into — a bare variant ahead of the field-access rule, a module-qualified
-# call ahead of the builtin fresh-string list — and reordering them changes
+# into (a bare variant ahead of the field-access rule, a module-qualified
+# call ahead of the builtin fresh-string list), and reordering them changes
 # what the emitter emits.
 fn ir_expr_is_borrowed(idx: Int) -> Bool:
     node := get_node(idx)
@@ -1059,7 +1059,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
             return false
         return ir_expr_is_borrowed(node.children[0])
     # a catch normalizes both arms to owned (the ok arm transfers the result
-    # payload out of the shell; the fallback arm retains a borrow — see
+    # payload out of the shell; the fallback arm retains a borrow; see
     # ir_emit_catch_expr), so the result arrives owned. treating it as borrowed
     # makes the binding retain again and leaks the payload.
     if node.kind == "catch_expr" or node.kind == "catch_block":
@@ -1067,7 +1067,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # awaiting a task transfers the result's count out to the single awaiter:
     # the task's thread produced the value with count 1 and stored it raw in the
     # result slot (no retain), and pith_await hands that count back. so the
-    # awaited value arrives owned, exactly like a fresh call result — treating it
+    # awaited value arrives owned, exactly like a fresh call result. treating it
     # as borrowed would add a compensating retain and leak the payload by one.
     # (scalar returns carry no count, so this classification is a no-op for them.)
     if node.kind == "await":
@@ -1091,7 +1091,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # naming a function as a value does the same thing: `shout` and
     # `hash.sha256_bytes` both lower to `closure_ref`, which allocates a
     # closure with a count of one. that count is the expression's to hand
-    # on — classifying it as a borrow made the binding retain a second one
+    # on. classifying it as a borrow made the binding retain a second one
     # and left the closure alive after its single release.
     if ir_expr_is_named_function_value(idx):
         return false
@@ -1113,14 +1113,14 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # and transfers a fresh value, so the result arrives owned. without
         # this check the string case fell through to the builtin fresh-name
         # list below, classified the result as borrowed, and the call site
-        # retained a count nobody released — one leaked string per
+        # retained a count nobody released: one leaked string per
         # `mod.fn(...) -> String` call, which url.decode turned into ~64
         # bytes per http request once #839 put it on the request path.
         if ir_resolve_module_alias_method_call_name(idx).len() > 0:
             return false
         # a user-defined method already settled its result's ownership on the
         # way out: it retains a returned borrow and transfers a fresh value, so
-        # the result arrives owned — the caller must not retain it again (that
+        # the result arrives owned. the caller must not retain it again (that
         # over-retain is a leak when the method returns a fresh string). only
         # builtin string methods, which don't route through that return path,
         # fall back to the known-fresh list.
@@ -1131,7 +1131,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # a builtin that takes the count on its own result hands back an owned
         # value whichever branch it ran (ir_method_result_retains_over_args).
         # keyed on the resolved builtin rather than the spelling, so a
-        # same-named method on another receiver keeps its own classification —
+        # same-named method on another receiver keeps its own classification,
         # and on the same rc kind the call site retains through, so "owned"
         # here can never outrun the count that backs it. where the kind is
         # unknown no retain is emitted, so the answer stays "borrowed" and the
@@ -1146,19 +1146,19 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
             # gone from the container and nobody else will release what it
             # held. the heap-container result kinds already answered owned
             # through the rc-kind check above, so this clause is what the
-            # String flavor rides on — without it a taken string fell to the
+            # String flavor rides on. without it a taken string fell to the
             # builtin fresh-name list below, classified borrowed, and the
             # bind retained a count nobody released: one stranded string per
             # `m.take(k)` on a string-valued map, whichever key flavor.
             if ir_method_result_transfers_count(resolved):
                 return false
-        # the optional extractions — `unwrap_or` and `.value()` — hand out an
+        # the optional extractions, `unwrap_or` and `.value()`, hand out an
         # owned count for every heap payload kind: either the freshly
         # retained one ir_extraction_retains asks for, or (for a shell-only
         # subject) the count the shell's cleanup never releases. the
         # struct/list/... kinds already answered owned through the rc-kind
         # check above; this covers the string payload, which would otherwise
-        # fall to the builtin fresh-name list below and classify borrowed —
+        # fall to the builtin fresh-name list below and classify borrowed,
         # making the escape site retain a second count on top of the one the
         # extraction carries. the RESULT unwrap_or is untouched: its
         # receiver's kind is "result", and its string payload keeps the
@@ -1169,8 +1169,8 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
                 if ir_rc_kind(ir_type_from_tid(get_type_info(extract_recv_tid).inner)).len() > 0:
                     return false
         return not ir_string_method_returns_fresh(mname)
-    # a payload-free variant written bare — `Holder.Empty`, or the alias-
-    # qualified `mod.Holder.Empty` — parses as a field access but mints a
+    # a payload-free variant written bare (`Holder.Empty`, or the alias-
+    # qualified `mod.Holder.Empty`) parses as a field access but mints a
     # fresh box (the field-access emitters route it to ir_emit_variant_alloc).
     # a field read is a borrow; this is not, and classifying it as one made
     # every return, bind and argument of a bare variant retain a count the
@@ -1179,7 +1179,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     if node.kind == "field_access" and ir_field_access_is_bare_variant(idx):
         return false
     # a field read off an owned temporary receiver hands back a retained value
-    # (ir_release_owned_field_receiver), so it is owned — but only when the
+    # (ir_release_owned_field_receiver), so it is owned, but only when the
     # field has a kind to retain; a plain-value field is not rc either way.
     if node.kind == "field_access" and node.children.len() > 0 and ir_field_receiver_is_owned_temp(node.children[0]):
         return false
@@ -1226,7 +1226,7 @@ fn ir_string_method_returns_fresh(mname: String) -> Bool:
 # the delicate invariant lives here: at every exit edge the deferred user
 # statements run (innermost scope first) BEFORE ir_emit_rc_cleanup, so a
 # deferred `conn.close()` still sees the locals ARC is about to release.
-# emitting one deferred entry is just ir_stmt on its stored node — fresh
+# emitting one deferred entry is just ir_stmt on its stored node: fresh
 # registers every time, so re-emitting at several exits is safe.
 
 # open a new block scope: remember where its defers will start.
@@ -1309,17 +1309,17 @@ fn ir_defer_emit_for_loop_jump():
 
 # record the producing result/optional type id for a tuple local. a rebind to a
 # tuple of a different type (tid) can't pick one payload shape, so it is marked
-# conflicting (-1) and never becomes cascade-eligible — a safe under-fix.
+# conflicting (-1) and never becomes cascade-eligible, a safe under-fix.
 #
 # a BORROWED producer is marked the same way. `v := xs[0]`, `v := s.field` and
 # `v := other` hand over a shell somebody else still owns: the bind retains the
 # shell and nothing at all takes a count on the payload behind it, so cascading
 # that payload frees a value the container or the struct is still holding. that
-# was a use-after-free wherever the container outlived the borrow — a callee
+# was a use-after-free wherever the container outlived the borrow (a callee
 # that binds `xs[0]` and returns left its caller's list pointing at a freed
-# string — and it becomes a double free the moment the shell owns its payload
+# string), and it becomes a double free the moment the shell owns its payload
 # through a destructor. only a producer that transfers (a call, an await, a
-# match) leaves this local the payload's sole owner — and a borrowing runtime
+# match) leaves this local the payload's sole owner, and a borrowing runtime
 # getter (`v := m.get(k)`, `v := xs.first()`) does not, even though the shell
 # it hands back is fresh enough that nothing else about the bind looks
 # borrowed. cascading one of those releases the container's own count on an
@@ -1341,9 +1341,9 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
 # NOT own a count on: the map's stored value, the list's element. the shell is
 # fresh and the caller frees it, but the payload's count stays with the
 # container, so a local bound to one is never the payload's last owner. the
-# other optional-returning builtins are the opposite — `env_opt` and
+# other optional-returning builtins are the opposite (`env_opt` and
 # `char_at` mint a fresh string, a channel receive hands the sent value's
-# count over — and those shells do transfer.
+# count over), and those shells do transfer.
 fn ir_runtime_getter_borrows_payload(emit_name: String) -> Bool:
     if emit_name == "map_get_opt" or emit_name == "map_get_ikey_opt" or emit_name == "map_get_bkey_opt":
         return true
@@ -1382,14 +1382,14 @@ fn ir_owned_receiver_getter_payload_kind(idx: Int, emit_name: String) -> String:
 # the rc payload kind of the optional shell a TRANSFERRING runtime getter
 # hands back, or "" for every other callee. `env_opt` and the string `get`
 # mint a fresh one-off string, and a channel receive hands the sent value's
-# count over — but the runtime builds each shell without a destructor,
+# count over, but the runtime builds each shell without a destructor,
 # because it cannot name this module's `__opt_dtor_<kind>` functions. so the
 # call site attaches the matching one the moment the shell lands, and the
 # shell owns its payload on the same terms a user function's returned Some
 # does: the extraction gate's retain balances against the shell's own
 # release instead of stranding one payload count per extraction. the
 # borrowing getters (ir_runtime_getter_borrows_payload) must never appear
-# here — their payload count stays with the container, and a destructor
+# here: their payload count stays with the container, and a destructor
 # there frees an element the container still holds. a channel whose element
 # is a tuple, an optional or a result is no exception: the shell the receive
 # hands back owns that element like any other, and releasing the shell
@@ -1418,7 +1418,7 @@ fn ir_runtime_opt_producer_payload_kind(emit_name: String, obj_type: String) -> 
 # with the container. and an extraction out of a doubly-wrapped optional
 # (`inner := outer.value()`, `inner := outer.unwrap_or(none)`, where the
 # payload is itself a `T?`) hands back a RETAINED count on a shell its owner
-# still holds — that shell keeps its own count on what it wraps, and releases
+# still holds. that shell keeps its own count on what it wraps, and releases
 # it through the `__opt_dtor_<kind>` it carries. so the local is one owner of
 # the shell and never the last owner of what is inside it.
 fn ir_shell_producer_transfers(idx: Int) -> Bool:
@@ -1456,8 +1456,8 @@ fn ir_shell_producer_transfers(idx: Int) -> Bool:
 #
 # `.ok` was excluded when the cascade first landed because whitelisting it made
 # tests/cases/test_http2_tls_roundtrip fail valgrind. that turned out to be a
-# separate ownership bug the leak had been hiding — a channel `try_send` handed
-# its value to another task without taking a count — and is fixed.
+# separate ownership bug the leak had been hiding (a channel `try_send` handed
+# its value to another task without taking a count) and is fixed.
 #
 # for a RESULT local the extraction forms qualify too. `name.unwrap_or(d)`,
 # `name catch d`, and `name!` all classify a named operand as borrowed and
@@ -1466,26 +1466,26 @@ fn ir_shell_producer_transfers(idx: Int) -> Bool:
 # escape site retains), and the err arm keeps the error in the shell. so the
 # cleanup path is still the payload's sole owner, exactly like a `.ok` read.
 # without these entries an extraction disqualified the local from the cascade
-# and the count the shell holds was never released — one heap payload leaked
+# and the count the shell holds was never released: one heap payload leaked
 # per extraction.
 #
 # the extraction entries are open for an OPTIONAL local too, for both
 # spellings: `name.unwrap_or(d)` and `name.value()` each retain the payload
 # they hand out for a cascade-eligible subject (ir_extraction_retains), so the
-# shell keeps the count it was built with and the cascade is its sole releaser
-# — the same contract as the result forms. `catch` and `!` stay result-only.
+# shell keeps the count it was built with and the cascade is its sole releaser,
+# the same contract as the result forms. `catch` and `!` stay result-only.
 #
 # `.value()` has to be on this list, not merely counted at the extraction
 # site. without it a local that only ever extracts falls off the cascade and
 # onto the shell-only path, where the extraction transfers the shell's single
-# count instead of taking its own — and a second extraction of the same local
+# count instead of taking its own, and a second extraction of the same local
 # then hands the same count out twice. `std.trace` reads four fields off one
 # parsed `SpanContext?` that way, and the first consumer's release freed what
 # the other three read.
 #
 # one whitelisted position lives in the walk instead of here: an argument of a
 # call whose callee provably only reads the parameter (ir_tuple_call_uses_safe
-# and ir_tuple_method_call_uses_safe) — the parser wraps arguments in `arg`
+# and ir_tuple_method_call_uses_safe); the parser wraps arguments in `arg`
 # nodes, so this per-parent check never sees the call they belong to.
 fn ir_tuple_use_is_whitelisted(parent: Node, name: String, is_result: Bool) -> Bool:
     if parent.kind == "method_call" and parent.children.len() > 0:
@@ -1605,7 +1605,7 @@ fn ir_tuple_call_uses_safe(node: Node, name: String, is_result: Bool) -> Bool:
 # the callee's own extractions are safe on a borrowed parameter: `!`,
 # `catch` and `unwrap_or` classify a named operand as borrowed and retain
 # the payload they hand out (see ir_emit_result_unwrap_or for results and
-# the Some arm in ir_emit_typed_receiver_method for optionals — a parameter
+# the Some arm in ir_emit_typed_receiver_method for optionals; a parameter
 # subject always retains), so the caller stays the shell's sole owner. the
 # walk's `is_result` gate keeps `catch` and `!` result-only; unwrap_or is
 # open for both.
@@ -2040,7 +2040,7 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
             return ir_tuple_method_call_uses_safe(idx, node, name, is_result)
     # a match on an OPTIONAL local reads the shell's flag, and its payload
     # binding owns its own retained count (taken at bind, tracked by the
-    # prepass, released by the exit cleanup) — so the local stays the last
+    # prepass, released by the exit cleanup), so the local stays the last
     # owner of the count the shell arrived with, the same contract as a
     # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT
     # match stays disqualifying: its binding path takes no count.
@@ -2056,7 +2056,7 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     # an `if let` / `while let` bare binding on an OPTIONAL local is the same
     # contract as the match above: the condition reads the shell's flag, and
     # the payload binding owns its own retained count (taken at bind, tracked
-    # by the prepass, released by the exit cleanup) — so the local stays the
+    # by the prepass, released by the exit cleanup), so the local stays the
     # last owner of the count the shell arrived with, and its cascade releases
     # the payload even on the path where the condition fails and the binding
     # never fires. bodies and the else block are judged by the ordinary
@@ -2112,8 +2112,8 @@ fn ir_tuple_cascade_scan(body_idx: Int):
         # retains the shell, so cascading one would over-release. skip anything
         # already in ir_var_regs, which at this point holds exactly the params.
         # a rejected local keeps the plain shell release. that used to make
-        # it "shell-only" — a name whose extraction transferred rather than
-        # retained, because a retained count would have had no release — but
+        # it "shell-only": a name whose extraction transferred rather than
+        # retained, because a retained count would have had no release. but
         # a returned Some owns its payload now, so the shell's release is
         # the balance and the extraction gate retains everywhere
         # (ir_extraction_retains).
@@ -2153,7 +2153,7 @@ fn ir_tuple_cascade_signature(tid: Int) -> String:
     return "00"
 
 # module-suffixed so each module carries its own copy, exactly like the tuple
-# and struct destructors — no cross-module references, no name clashes.
+# and struct destructors: no cross-module references, no name clashes.
 # the payload kind an optional over a genuine tuple attaches, or "" when the
 # inner type is not one. a `T??` inner reports kind "optional" rather than
 # "tuple" and is excluded here, which is what keeps the borrowing wrap it
@@ -2209,8 +2209,8 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
     ir_rc_release_reg(r, kind)
 
 # whether a bare-name assignment writes a module-level global's slot. that
-# slot owns a count on whatever it holds — nothing else releases it, not the
-# function's exit cleanup (globals are not locals) and not the store itself —
+# slot owns a count on whatever it holds. nothing else releases it, not the
+# function's exit cleanup (globals are not locals) and not the store itself,
 # so the assignment has to drop the outgoing value the way a local rebind
 # does, or every value the global ever held is stranded along with everything
 # it owned. a threadlocal global counts: its per-thread slot owns its value
@@ -2229,8 +2229,8 @@ fn ir_assign_targets_global_slot(name: String) -> Bool:
     return not ir_name_is_func_local(name)
 
 # one helper per (ok, err) payload signature used this module. each releases the
-# live payload of a result/optional tuple — slot 8 when the flag is set, slot 16
-# otherwise — and then frees the shell. a null shell short-circuits to a no-op,
+# live payload of a result/optional tuple (slot 8 when the flag is set, slot 16
+# otherwise) and then frees the shell. a null shell short-circuits to a no-op,
 # which is what an unassigned local (early return before its bind) or the first
 # loop iteration's zero-stored previous value hands in.
 #
@@ -2238,7 +2238,7 @@ fn ir_assign_targets_global_slot(name: String) -> Bool:
 # release the same slot: a function that wraps a fresh payload and returns the
 # shell hands its caller something the wrap made an owner, while the caller's
 # cascade signature is read off the type and says the payload is a transfer.
-# both are describing one count, so exactly one of them may drop it — the
+# both are describing one count, so exactly one of them may drop it: the
 # explicit release here does, and the null leaves the destructor a no-op.
 fn ir_emit_tuple_cascade_helpers():
     for sig in ir_tuple_cascade_sigs:
@@ -2499,7 +2499,7 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
         if parts.name.len() > 0:
             # a `weak` binding is tracked under its own kind: its slot holds a
             # bare target pointer counted on the header's WEAK count, so the
-            # cleanup must weak_release it — the type-derived kind ("struct")
+            # cleanup must weak_release it. the type-derived kind ("struct")
             # would strong-release a count the binding never took. the checker
             # rejects any reuse of a weak name in the same function, so the
             # kind-conflict poisoning below cannot silently untrack one.
@@ -2524,7 +2524,7 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
     # under the same name-conflict poisoning as every other owned local.
     # unlike the pat_variant hook below, this one keys on the match itself
     # (it needs the subject's tid) and so sees only each arm's top-level
-    # pattern — a binding nested under pat_or is not tracked here.
+    # pattern; a binding nested under pat_or is not tracked here.
     if node.kind == "match_expr" and node.children.len() > 1:
         subj_tid := c_get_expr_type(node.children[0])
         if subj_tid >= 0 and get_type_info(subj_tid).kind == "optional":
@@ -2554,8 +2554,8 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
                 # with its owner (a container element, an outer shell).
                 # tracking it would enroll the name in the tuple shell-only
                 # machinery and flip the downstream extraction gate to
-                # transfer semantics, stripping a count the owner still holds
-                # — a use-after-free on `if let v = m.get(k)` over optional
+                # transfer semantics, stripping a count the owner still holds:
+                # a use-after-free on `if let v = m.get(k)` over optional
                 # map values. poison the name instead: no exit release of any
                 # kind, and the binding stays the uncounted view it was.
                 if let_kind == "tuple":
@@ -2603,15 +2603,15 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
 # the symbol of the function whose body is being emitted, for the return
 # paths that need its declared result ok kind.
 mut ir_current_arc_func := ""
-# true while emitting main's own body — not a lambda defined inside it, and
-# not a test function. error returns emitted under this flag also report the
+# true while emitting main's own body (not a lambda defined inside it, and
+# not a test function). error returns emitted under this flag also report the
 # error and exit nonzero, because the entry glue pins main's exit code to 0
 # and a failing program must not look like a passing one.
 mut ir_emitting_main_body := false
 
 # params are borrows: the caller keeps its count alive for the whole call,
 # so an unmodified string param needs no rc traffic at all. a param the
-# body reassigns becomes an owned local — retained in the prologue so
+# body reassigns becomes an owned local, retained in the prologue so
 # release-on-reassign and exit cleanup stay balanced with the caller.
 fn ir_collect_reassigned_string_params(idx: Int, names: List[String]):
     node := get_node(idx)
@@ -2963,7 +2963,7 @@ fn ir_emit_call_arg(expr_idx: Int) -> Int:
     return ir_expr(expr_idx)
 
 # a widened argument's register is the optional wrapper, not the value the
-# release walkers were written against — releasing it as a string or an rc
+# release walkers were written against. releasing it as a string or an rc
 # payload would drop a count on the wrong object. the wrapper owns whatever it
 # holds (ir_emit_value_for_target attaches the destructor), so skipping the
 # caller-side release leaks the wrapper rather than freeing something twice.
@@ -3018,7 +3018,7 @@ fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
 # returns its fallback unchanged when the key is missing, and the map's own
 # value when the key is present, adding no count on either branch.
 #
-# neither branch hands back a count, so the caller has to take one — and one
+# neither branch hands back a count, so the caller has to take one, and one
 # retain of the result settles both. on a miss it lands on the fallback, which
 # the ordinary owned-argument release then drops back to the single count the
 # caller now holds; on a hit it lands on the map's value, which is the count
@@ -3028,7 +3028,7 @@ fn ir_release_owned_method_args(node: Node, arg_regs: List[Int], skip_pos: Int):
 #
 # the order is load-bearing: retain first. on the miss branch the register the
 # release drops is the very one the retain just counted, so releasing first
-# would free the value in between — that is the shape that made the first
+# would free the value in between. that is the shape that made the first
 # attempt at this hand back a recycled handle.
 fn ir_method_result_retains_over_args(emit_name: String) -> Bool:
     return emit_name == "map_get_default" or emit_name == "map_get_default_ikey" or emit_name == "map_get_default_bkey"
@@ -3036,7 +3036,7 @@ fn ir_method_result_retains_over_args(emit_name: String) -> Bool:
 # true for a builtin whose receiver relinquishes its own count into the
 # result: the value leaves the container and the container's count leaves
 # with it, so the caller owns what it gets for every value kind. `take` is
-# the only one — `remove` releases that count inside the runtime instead.
+# the only one; `remove` releases that count inside the runtime instead.
 # keyed on the resolved emit name, like the retains-over-args list, so a
 # same-named method on another receiver keeps its own classification.
 fn ir_method_result_transfers_count(emit_name: String) -> Bool:
@@ -3101,7 +3101,7 @@ fn ir_impl_target_type(node: Node) -> String:
             impl_type = child_node.value
     return impl_type
 
-# the impl target's identity name — ir_impl_target_type, with a generic base
+# the impl target's identity name: ir_impl_target_type, with a generic base
 # whose bare name a second module also declares replaced by its declaring
 # module's key. every table the emitter keys by an impl target goes through
 # this, so two modules' `impl Box:` never write over each other's methods,
@@ -3313,11 +3313,6 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     ir_current_impl_subst_params = []
     ir_current_impl_subst_args = []
 
-fn ir_declared_struct_name(node: Node) -> String:
-    if node.value.contains("["):
-        return node.value.substring(0, node.value.index_of("["))
-    return node.value
-
 fn ir_record_struct_field(struct_name: String, field_names: List[String], field_node: Node) -> List[String]:
     field_name := ir_struct_field_name(field_node)
     mut updated_fields := field_names
@@ -3335,7 +3330,7 @@ fn ir_record_struct_field(struct_name: String, field_names: List[String], field_
     return updated_fields
 
 fn ir_collect_struct_decl(node_idx: Int, node: Node, emit_decl: Bool, module_path: String):
-    bare := ir_declared_struct_name(node)
+    bare := ir_base_decl_name(node.value)
     # a generic base whose bare name a second module also declares is filed
     # under its declaring module's key as well, so an instance built from that
     # identity finds its own module's layout. the bare entry stays for the call
@@ -3415,7 +3410,7 @@ fn ir_collect_drop_impls(root_idx: Int, module_path: String):
 fn ir_root_struct_decl_index(root_idx: Int, name: String) -> Int:
     for item_idx in ir_root_items(root_idx):
         cn := get_node(item_idx)
-        if (cn.kind == "struct_decl" or cn.kind == "struct") and ir_declared_struct_name(cn) == name:
+        if (cn.kind == "struct_decl" or cn.kind == "struct") and ir_base_decl_name(cn.value) == name:
             return item_idx
     return 0 - 1
 
@@ -3546,7 +3541,7 @@ fn ir_field_receiver_type(recv_idx: Int) -> String:
 # position in the struct type gives the offset, its declared type gives the kind.
 # this is independent of module emission order, unlike the name-keyed lookup map
 # (which is filled as each module is emitted). a struct reached only through
-# another module's return type — one the current module never imports — is
+# another module's return type (one the current module never imports) is
 # emitted after its user, so it is absent from the map when the user's field
 # access is lowered, and the offset falls back to an unsound name-based guess: a
 # String field read lands on the wrong slot, silently corrupting the value.
@@ -3717,7 +3712,7 @@ fn ir_infer_type(idx: Int) -> String:
     literal_type := ir_literal_expr_type(node, kind)
     if literal_type.len() > 0:
         return literal_type
-    # identifiers — look up tracked type
+    # identifiers: look up tracked type
     if kind == "ident":
         return ir_lookup_name_type(node.value)
     if kind == "self":
@@ -3726,7 +3721,7 @@ fn ir_infer_type(idx: Int) -> String:
         if ir_current_impl_type.len() > 0:
             return ir_current_impl_type
         return "struct"
-    # grouped expression — infer inner
+    # grouped expression: infer inner
     if kind == "grouped" and node.children.len() > 0:
         return ir_infer_type(node.children[0])
     # binary ops
@@ -3745,7 +3740,7 @@ fn ir_infer_type(idx: Int) -> String:
         return ir_field_expr_type(node)
     if kind == "struct_init":
         return ir_resolve_type_hint(node.value)
-    # index — depends on collection type
+    # index: depends on collection type
     if kind == "index" and node.children.len() > 0:
         return ir_index_expr_type(idx, node)
     return ""
@@ -3794,7 +3789,7 @@ fn ir_emit_owned_some_taking(value_r: Int, val_idx: Int, payload_kind: String, d
 # the checker settles the question when it can: it records the values that need
 # a Some built, having excluded `none`, an already-optional value and the error
 # type. that record is authoritative because the shapes are otherwise
-# indistinguishable here — an optional lowers to the same tuple-shaped
+# indistinguishable here: an optional lowers to the same tuple-shaped
 # allocation a tuple literal produces, so a tuple payload and a built shell look
 # alike, and only the target's own inner type separates them.
 fn ir_value_is_already_the_optional(val_idx: Int, actual_info: TypeInfo, target_inner: String) -> Bool:
@@ -3805,8 +3800,8 @@ fn ir_value_is_already_the_optional(val_idx: Int, actual_info: TypeInfo, target_
     return actual_info.kind == "tuple" and target_inner != "tuple"
 
 # emit a value into a position whose target is an optional. `target_inner` is
-# the optional's inner type where the caller knows it, and "" where it does not
-# — the argument position has no target to consult and leans on the checker's
+# the optional's inner type where the caller knows it, and "" where it does not;
+# the argument position has no target to consult and leans on the checker's
 # record instead.
 fn ir_emit_optional_for_target(val_idx: Int, vn: Node, target_inner: String) -> Int:
     if vn.kind == "none_lit":
@@ -3878,7 +3873,7 @@ fn ir_method_receiver_type(node: Node) -> String:
         return ""
     # `self` is always the impl type currently being emitted. reading the
     # checker's recorded type would be wrong for a shared interface-default
-    # body, which is type-checked once per implementing type — the last one
+    # body, which is type-checked once per implementing type. the last one
     # wins and would misroute self.method() to that type.
     recv0 := get_node(node.children[0])
     if recv0.kind == "self" and ir_current_impl_type.len() > 0:
@@ -3918,7 +3913,7 @@ fn ir_method_receiver_type(node: Node) -> String:
     return ""
 
 # a read of a `weak` field or a `weak` local synthesizes a FRESH borrowing
-# optional shell each time (ir_emit_weak_read) — unlike a normal optional,
+# optional shell each time (ir_emit_weak_read), unlike a normal optional,
 # which reads the stored value in place. that shell has no destructor and
 # holds a borrowed pointer, so releasing it just frees the shell. this
 # predicate lets the optional consumers (`.value()`, `!= none`, `?`, and an
@@ -3926,8 +3921,8 @@ fn ir_method_receiver_type(node: Node) -> String:
 # leaking one per read.
 fn ir_node_is_weak_field_read(idx: Int) -> Bool:
     node := get_node(idx)
-    # a weak LOCAL read — or a read of a weak binding captured into the
-    # emitting lambda — mints the same throwaway shell as a weak field read
+    # a weak LOCAL read, or a read of a weak binding captured into the
+    # emitting lambda, mints the same throwaway shell as a weak field read
     # (see ir_emit_ident_load); a loop variable shadowing the name reads its
     # own slot plainly and must not have a shell freed out from under it.
     if node.kind == "ident":
@@ -3953,7 +3948,7 @@ fn ir_release_weak_shell(operand_idx: Int, shell_r: Int):
 
 # free the shell of an optional operand a comparison is the sole owner of.
 # `xs.index_of(v) != none` mints one shell to answer one flag read and nothing
-# else ever names it, so without this every search-against-none stranded it —
+# else ever names it, so without this every search-against-none stranded it,
 # on any list and any element type, since no optional has to be involved for
 # the search to build one. the same holds for every other fresh optional in
 # comparison position; a borrowed operand answers false here and is released
@@ -4235,7 +4230,7 @@ fn ir_closure_capture_tag(kind: String) -> Int:
     if kind == "struct":
         return 6
     # a tuple (an optional, result, or tuple literal) is a struct-header
-    # allocation, so the struct tag releases it correctly — through
+    # allocation, so the struct tag releases it correctly, through
     # pith_struct_release and the box's own attached dtor. without this
     # the capture retains the box (ir_rc_retain_reg handles "tuple") but
     # tags it 0, so the closure never lets go of it.
@@ -4257,8 +4252,8 @@ fn ir_emit_lambda_capture_setup(closure_r: Int, captures: List[String], borrowed
         cap_val := ir_reg()
         # this reads the enclosing scope, so a captured loop variable has to
         # come from the loop's own slot, not the function local it shadows.
-        # for a weak local this hands over the BARE target pointer — the
-        # slot's raw value, not a liveness-resolved optional — which is the
+        # for a weak local this hands over the BARE target pointer (the
+        # slot's raw value, not a liveness-resolved optional), which is the
         # whole point: the closure refers to the target without owning it.
         ir_emit_name_load(cap_val, capture_name)
         slot := ir_reg()
@@ -4375,13 +4370,13 @@ fn ir_release_owned_operand(expr_idx: Int, reg: Int, expr_type: String):
         # function the ident load wrapped into one.
         if arg_kind.len() == 0 and (arg_node.kind == "lambda" or ir_expr_is_named_function_value(expr_idx)):
             arg_kind = "closure"
-        # "tuple" stays off the general release list — an optional and a
+        # "tuple" stays off the general release list: an optional and a
         # result lower to the same shell, so the rc KIND cannot tell a real
         # tuple from a wrapper whose count an extraction still hands on. the
         # one unambiguous case is a SYNTACTIC tuple literal, judged by the
         # AST node kind (not the rc kind, which is also spelled "tuple"):
         # the node is `(a, b)` in the source, the register is a box only
-        # this call ever saw, and a storing callee took its own count — so
+        # this call ever saw, and a storing callee took its own count, so
         # `f((a, b))` no longer strands one box per call. any other
         # tuple-typed register keeps the old bounded leak rather than
         # risking a double free.
@@ -4394,7 +4389,7 @@ fn ir_release_owned_operand(expr_idx: Int, reg: Int, expr_type: String):
 # containers belong here for the same reason structs and closures do: a
 # `[1, 2]`, a `{"k": v}` or an `xs.map(f)` written straight into a call is an
 # allocation nothing else names, and a callee that keeps it adds a count of its
-# own — a parameter is a borrow, so a store retains and a returned parameter is
+# own: a parameter is a borrow, so a store retains and a returned parameter is
 # retained on the way out. leaving the container kinds off this list is what
 # made every such call strand its handle for the life of the process, about 165
 # bytes per list argument and 400 per map.
@@ -4402,7 +4397,7 @@ fn ir_release_owned_operand(expr_idx: Int, reg: Int, expr_type: String):
 # "tuple" is deliberately absent and has to stay off. an optional and a result
 # both lower to a tuple shell, so the kind does not say whether the register
 # holds a real tuple literal or a wrapper whose ownership the result and
-# optional extraction paths settle instead — ir_emit_struct_positional_init
+# optional extraction paths settle instead; ir_emit_struct_positional_init
 # excludes tuple from its field retain for the same reason. releasing one here
 # would drop a count those paths still hand on. the syntactic tuple-literal
 # case is handled by the caller, ir_release_owned_operand, which can
@@ -4426,7 +4421,7 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
 #
 # the release is the plain shell release, and it does not read the callee's
 # body. an optional parameter is a borrow of the shell: everything a callee
-# can do to keep it or its payload takes a count of its own — a struct
+# can do to keep it or its payload takes a count of its own. a struct
 # construction, a field assignment, a container store and a channel send
 # retain the shell, a lambda capture and a returned parameter retain it on
 # the way out, a bind retains it, and `unwrap_or`, `.value()`, `if let` and
@@ -4435,14 +4430,14 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
 # whatever the callee did: a shell the callee kept survives on the callee's
 # count, and a shell nobody kept dies here, taking with it whatever it owns
 # through its destructor (a wrap-built Some, a widened value, a transferring
-# runtime getter's shell). a shell that borrows its payload — a `xs.get(i)`
-# forwarded out of a callee — owns nothing and frees only its box.
+# runtime getter's shell). a shell that borrows its payload (a `xs.get(i)`
+# forwarded out of a callee) owns nothing and frees only its box.
 #
 # this used to walk the callee's body and, when the walk proved the caller
 # stayed the shell's sole owner, release through the cascade helper, which
 # drops the payload explicitly and nulls the slot before freeing the shell.
-# the walk left every callee it could not read on the leak side — one in
-# another module, a method on a generic receiver, a closure — and the cascade
+# the walk left every callee it could not read on the leak side (one in
+# another module, a method on a generic receiver, a closure), and the cascade
 # was wrong in two places the walk could not see: a callee that returned its
 # parameter retained the shell and handed it back, so `show(forward(v))`
 # nulled the payload `v` still owned, and a shell produced by a borrowing
@@ -4454,8 +4449,8 @@ fn ir_release_fresh_optional_arg(expr_idx: Int, reg: Int):
         return
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", reg)
 
-# a fresh result box written straight into a call argument — `take(r())`
-# against `fn take(x: Int!)` — dies with the call it fed on the same terms as
+# a fresh result box written straight into a call argument (`take(r())`
+# against `fn take(x: Int!)`) dies with the call it fed on the same terms as
 # the optional above: a result parameter is a borrow of the box, and every way
 # a callee can keep it or take its payload takes a count of its own. a struct
 # construction, a field assignment, a container store, a lambda capture, a
@@ -4472,8 +4467,8 @@ fn ir_release_fresh_optional_arg(expr_idx: Int, reg: Int):
 # (see ir_emit_result_tuple and the take-ok convention in ir_emit_try_expr):
 # its payload count is owned by the box and dropped by whoever frees the box.
 # a plain shell release would therefore reclaim the three slots and strand a
-# heap payload the callee only read, while the cascade helper — which drops
-# the payload unconditionally and nulls the slot — would empty a box the
+# heap payload the callee only read, while the cascade helper (which drops
+# the payload unconditionally and nulls the slot) would empty a box the
 # callee kept (`store(h, r())`, `show(forward(r()))`), the wrong answer the
 # optional release already had to give up. so an rc-payload signature goes
 # through ir_emit_result_arg_release_helpers: the helper drops the live
@@ -4492,7 +4487,7 @@ fn ir_release_fresh_result_arg(expr_idx: Int, reg: Int):
 
 # drop this frame's count on a result box, taking its payload with it only
 # when the count is the box's last. both places a frame holds a box it did not
-# bind — the argument release above and the statement-position discard — ask
+# bind (the argument release above and the statement-position discard) ask
 # the same question and cannot answer it from the callee's body, so they share
 # the emission: a signature with a heap slot goes through the per-signature
 # helper that reads the strong count, and an all-scalar signature has nothing
@@ -4551,19 +4546,19 @@ fn ir_expr_is_fresh_result_box(expr_idx: Int) -> Bool:
 # ir_expr_is_transferred_call_temp, ir_field_receiver_is_owned_temp,
 # ir_extraction_operand_class and ir_optional_subject_is_owned all ask some
 # version of "did this expression just produce the value, so whoever consumes
-# it here is its only owner?" — and they all answer it by looking at the node
+# it here is its only owner?", and they all answer it by looking at the node
 # kind. they are deliberately four functions, not one: each serves a different
 # consumer, and they differ on axes that are not accidental.
 #
 #   which node kinds count as a producer. a call and a method call count for
-#   all four. `await` counts for the two shell classifiers — an awaited task
-#   hands its count to the single awaiter — and not for the two payload ones,
+#   all four. `await` counts for the two shell classifiers (an awaited task
+#   hands its count to the single awaiter) and not for the two payload ones,
 #   which ask about a string or a struct header rather than a shell.
 #   `struct_init` counts only for the field receiver, which is the one
 #   consumer that can be handed a construction directly.
 #
-#   what they consult. three of them consult a type — an inferred string, an
-#   rc kind, a checked tid — and answer the same inside a generic body as in a
+#   what they consult. three of them consult a type (an inferred string, an
+#   rc kind, a checked tid) and answer the same inside a generic body as in a
 #   concrete one, since the body is typed before it is emitted.
 #   ir_extraction_operand_class is purely syntactic and reads the node kind
 #   and nothing else.
@@ -4598,7 +4593,7 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
     # a `.value()` the emitter could not count spells like a call and is a
     # field read: it hands back an uncounted view of the shell's payload (see
     # ir_value_extraction_is_uncounted). counting it as a transfer released a
-    # string the shell still owns — `xs[0].value() == "a"` freed the element's
+    # string the shell still owns: `xs[0].value() == "a"` freed the element's
     # string mid-comparison. a counted extraction is a transfer like any
     # other, and reaches the borrowed-classification branch above this one.
     if ir_value_extraction_is_uncounted(idx):
@@ -4610,8 +4605,8 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
 
 # the byte value (0-255) of a single-character string literal, or -1 if the
 # literal is empty, multi-character, or a non-ascii/unknown escape. `raw` is the
-# literal's source form *including its surrounding quotes* — e.g. `"/"` (three
-# chars) or `"\n"` (four) — so it must be unquoted and unescaped before its
+# literal's source form *including its surrounding quotes*, e.g. `"/"` (three
+# chars) or `"\n"` (four), so it must be unquoted and unescaped before its
 # length means anything. only the escapes a byte scanner actually compares
 # against are decoded; anything else falls back to the normal string path.
 fn ir_string_lit_single_byte(raw: String) -> Int:
@@ -4656,7 +4651,7 @@ fn ir_emit_byte_operand(idx: Int) -> Int:
             r := ir_reg()
             # by its runtime symbol, not the short `byte_at` key: this is the
             # emitter's own lowering of `ord(s[i])`, and a user function named
-            # `byte_at` must not be able to capture it — nor be captured by it.
+            # `byte_at` must not be able to capture it, nor be captured by it.
             ir_emit_call2(r, "pith_cstring_byte_at", "int", obj_r, idx_r)
             return r
         return 0 - 1
@@ -4678,7 +4673,7 @@ fn ir_emit_byte_operand(idx: Int) -> Int:
 
 # `s[i] == ":"` compares one byte against one byte: read both sides as
 # integers and skip the two string allocations plus their rc traffic.
-# at least one side must be an index — the scanner-loop shape this
+# at least one side must be an index: the scanner-loop shape this
 # exists for.
 fn ir_is_byte_operand(idx: Int) -> Bool:
     node := get_node(idx)
@@ -4766,12 +4761,12 @@ fn ir_emit_binary_expr(node: Node) -> Int:
 # emit one operand of a binary expression. a bare `none` under `==` / `!=` is
 # the exception: every comparison shape below reads the *other* side and only
 # needs the none operand to occupy a register, so building the optional tuple
-# for it would allocate one per comparison and drop it unread — `x != none` in
+# for it would allocate one per comparison and drop it unread. `x != none` in
 # a loop leaked an optional a round.
 fn ir_emit_binary_operand(idx: Int, op: String) -> Int:
     if op == "eq" or op == "neq":
         if node_kind(idx) == "none_lit":
-            return ir_emit_zero_value()
+            return ir_zero_reg()
     return ir_expr(idx)
 
 # `none == none` / `none != none`, answered as a constant. returns -1 when
@@ -4834,7 +4829,7 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
             ir_release_owned_optional_operand(node.children[1], right_r)
             return r
         # T? == T, the widened mixed comparison: compare is_some and the
-        # payload against the bare value. Deliberately the LAST arm — every
+        # payload against the bare value. Deliberately the LAST arm: every
         # both-sides-optional recovery above must get first refusal. A fresh
         # string on the plain side dies with the compare, the same rule the
         # value operator applies to its operands.
@@ -4887,7 +4882,7 @@ fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
             ir_emit_call2(r, "bytes_eq", "bool", left_r, right_r)
         elif ir_binary_enum_eq_name(node) != "":
             # boxed enum values are pointers; a raw eq is identity, not
-            # equality — call the per-enum structural helper
+            # equality; call the per-enum structural helper
             ir_emit_call2(r, "__enum_eq_" + ir_binary_enum_eq_name(node), "bool", left_r, right_r)
         else:
             ir_emit_simple_binary(r, "eq", left_r, right_r)
@@ -5098,8 +5093,8 @@ fn ir_emit_list_map_call(idx: Int, node: Node) -> Int:
 
 # map, filter and reduce open-code their loop instead of going through the
 # general method call, so the release that ordinarily reclaims an owned
-# argument never runs for the function they were handed. an owned one — a
-# lambda literal, a named function, a call that built a closure — is ours to
+# argument never runs for the function they were handed. an owned one (a
+# lambda literal, a named function, a call that built a closure) is ours to
 # drop once the loop is done. a borrowed one (a local or a struct field
 # holding the closure) belongs to that owner and must be left alone.
 fn ir_release_higher_order_fn_arg(fn_idx: Int, fn_r: Int):
@@ -5284,7 +5279,7 @@ fn ir_emit_list_is_empty_method(node: Node) -> Int:
 # the ways available to them: a call argument and a search read the shell
 # and keep nothing, so they release it once the call or scan is done rather
 # than stranding it once per call; a container store takes the caller's
-# count instead of adding one — a bare `none` written straight into a store
+# count instead of adding one. a bare `none` written straight into a store
 # (`xs.push(none)`, `m[k] = none`) otherwise stranded its shell, because a
 # none literal falls through to the borrowed classification and sent the
 # store down the retaining path.
@@ -5484,7 +5479,7 @@ fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, exp
         generic_ret_type = ir_infer_type(idx)
     return ResolvedCallee(ir_queue_generic_call(callee.name, idx, explicit_generic_types, generic_ret_type), false)
 
-# a call whose callee is an expression rather than a name — a function
+# a call whose callee is an expression rather than a name: a function
 # value fetched from a list, a field, or another call. emit the callee
 # to a register, stash it in a fresh temp so the consumer sees a named
 # closure handle, and dispatch through it. without this the callee's
@@ -5505,7 +5500,7 @@ fn ir_emit_indirect_expr_call(idx: Int, node: Node, callee_idx: Int) -> Int:
     # only consumer. a lambda literal, a named function, a call that built a
     # closure and a payload pulled out of an optional all arrive owned, so
     # without this release the whole environment allocation stranded per
-    # call — around 190 bytes a round for `mk(i)(1)`, and every extraction
+    # call, around 190 bytes a round for `mk(i)(1)`, and every extraction
     # spelling that calls what it pulled out. a borrowed callee (a local, a
     # struct field, a container element) belongs to its owner: left alone.
     if not ir_expr_is_borrowed(callee_idx):
@@ -5527,7 +5522,7 @@ fn ir_callee_is_function_expr(callee_idx: Int, callee_node: Node) -> Bool:
 # payload tag is the element-tag code of T, recorded on the channel because a
 # binding keeps only "channel" and this call is the one site that knows T; it is
 # what lets a free release values that were never received. a payload the tables
-# do not count — a plain value, or a type this body cannot resolve — is tag 0,
+# do not count (a plain value, or a type this body cannot resolve) is tag 0,
 # which frees nothing.
 fn ir_push_channel_ctor_args(arg_regs: List[Int], explicit_generic_types: List[String]):
     if arg_regs.len() == 0:
@@ -5544,7 +5539,7 @@ fn ir_push_channel_ctor_args(arg_regs: List[Int], explicit_generic_types: List[S
 # a call through a local that holds a known lambda, emitted as a direct call to
 # the lambda's symbol. the lambda's abi takes the closure as its first parameter
 # (that is where its captures live), so the handle goes in front of the written
-# arguments. the handle is a plain load — borrowed for the call — and arg_regs
+# arguments. the handle is a plain load, borrowed for the call, and arg_regs
 # is left alone so the caller's owned-argument release still lines up with the
 # written arguments.
 fn ir_emit_devirtualized_call(r: Int, lambda_symbol: String, ret_type: String, handle_name: String, arg_regs: List[Int]):
@@ -5624,7 +5619,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     # the test runner: a helper holding a table's assertions is compiled once
     # and may be reached from a test block or from ordinary code, and it has to
     # mean the same thing on both paths. a module that declares its own function
-    # by one of these names keeps it — ir_is_declared_callable is that check.
+    # by one of these names keeps it; ir_is_declared_callable is that check.
     if callee.name == "assert" and arg_regs.len() >= 1 and not ir_is_declared_callable("assert"):
         return ir_emit_test_assert(node, arg_regs)
     if callee.name == "assert_eq" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_eq"):
@@ -5645,7 +5640,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         ir_emit_call_text(r, callee.name, ret_type, arg_regs.len(), ir_join_arg_regs(arg_regs))
     # `env_opt` is the free-call spelling of a transferring runtime getter:
     # its shell arrives destructor-less, so attach the payload's destructor
-    # here exactly as the method path does. declaration wins — a user's own
+    # here exactly as the method path does. declaration wins: a user's own
     # `env_opt` routes through its declared return convention instead.
     if not ir_is_declared_callable(callee.name):
         free_opt_kind := ir_runtime_opt_producer_payload_kind(callee.name, "")
@@ -5666,7 +5661,7 @@ fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_tar
         return
     k_r := ir_expr(entry.children[0])
     # wrap the value to its declared kind so an optional value type
-    # stores Some(v), not the raw v — the same fix collection element
+    # stores Some(v), not the raw v, the same fix collection element
     # literals need (a map literal typed Map[K, Int?] otherwise stored
     # bare ints and a later .value() dereferenced one as a heap tuple).
     v_r := ir_emit_value_for_target_inner(entry.children[1], val_target, val_inner)
@@ -5710,7 +5705,7 @@ fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     # whose key is any other int expression ({i: 1}) looked string-keyed and
     # built a string-keyed map, then handed map_insert a raw integer where a
     # cstring pointer was expected. the checked type already knows the key
-    # kind, so let it decide — the same way ir_emit_set_literal does. the
+    # kind, so let it decide, the same way ir_emit_set_literal does. the
     # probe stays as the fallback for a literal the checker left untyped.
     mut has_int_keys := ir_map_uses_int_keys(node)
     if ir_checked_type(idx) == "map_int":
@@ -5825,13 +5820,13 @@ fn ir_type_is_scalar_word(type_hint: String) -> Bool:
 #
 # a container's flavor is normally picked at construction from the checked
 # type, but a map literal reads its value kind off the first entry, and an
-# empty `{}` has none — so `f({})` and every other empty map literal built a
+# empty `{}` has none, so `f({})` and every other empty map literal built a
 # map that owned nothing it held. carrying the kind on the store settles it
 # where the kind is known for certain: the container adopts it at the first
 # store (`MapImpl::adopt_value_tag`, `ListImpl::adopt_element_tag`), so the
 # count no longer depends on the constructor having guessed right, and a
 # container that cannot adopt takes the compensating count in the runtime
-# instead — the same leak the emitter used to add here.
+# instead, the same leak the emitter used to add here.
 #
 # it is also what stops a *tagged* container being counted twice, which is
 # what a list store did: the list retained in the runtime and the emitter
@@ -5883,7 +5878,7 @@ fn ir_map_kind_store_name(emit_name: String, owned: Bool) -> String:
 #
 # lists and maps used to be on this list too. both now carry the stored
 # value's kind (ir_list_kind_store_name, ir_map_kind_store_name), so the
-# runtime knows whether it owns the value and takes the count itself — the
+# runtime knows whether it owns the value and takes the count itself: the
 # one place that can answer the question the emitter was guessing at.
 fn ir_channel_send_needs_retain(emit_name: String, store_kind: String) -> Bool:
     return ir_is_channel_send_name(emit_name) and store_kind.len() > 0
@@ -5892,8 +5887,8 @@ fn ir_channel_send_needs_retain(emit_name: String, store_kind: String) -> Bool:
 #
 # struct values were the last holdout: a `for` loop variable used to write
 # its borrowed element into the same named slot a later `:=` of that name
-# reused, so the rebind released a count the loop never took —
-# `std.crypto.x509.verify_chain_issuers` had exactly that shape — and the
+# reused, so the rebind released a count the loop never took
+# (`std.crypto.x509.verify_chain_issuers` had exactly that shape), and the
 # second count a struct store took was what absorbed that over-release.
 # loop variables now get storage of their own, so the mask is gone and a
 # struct built straight into a container transfers like every other kind.
@@ -5909,8 +5904,8 @@ fn ir_container_store_takes_count(store_kind: String) -> Bool:
 # the variant of a container store that takes the caller's count instead of
 # adding one of its own, or "" for a store with no such variant.
 #
-# a value built straight into a container — `l.push("v-{i}")`, `m[k] = "v-{i}"`
-# — is an owned temporary the caller stops tracking at the store. the caller
+# a value built straight into a container (`l.push("v-{i}")`, `m[k] = "v-{i}"`)
+# is an owned temporary the caller stops tracking at the store. the caller
 # skips its release there (ownership transfers into the container), but the
 # runtime store also took a count of its own, so the value ended up with two
 # counts and one release. these entry points complete the transfer by not
@@ -5933,7 +5928,7 @@ fn ir_owned_container_store_name(emit_name: String) -> String:
         return "pith_map_insert_bkey_owned"
     # insert is push with an index, and was the one container store left
     # without a transferring variant. for want of it the caller had to keep its
-    # count on a fresh container — `xs.insert(0, {1, 2})` stranded the set,
+    # count on a fresh container. `xs.insert(0, {1, 2})` stranded the set,
     # because releasing it would have handed the list a freed handle.
     if emit_name == "list_insert":
         return "pith_list_insert_value_owned"
@@ -5952,7 +5947,7 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
         return "__list_new_bytes"
     # a route table or a middleware chain is a List of closures. untagged it
     # owned nothing, which made every closure that reached one live on a
-    # count somebody else was holding — and there is no somebody else once a
+    # count somebody else was holding, and there is no somebody else once a
     # fn value transfers its count at the call.
     if elem_kind == "closure":
         return "__list_new_closure"
@@ -5995,7 +5990,7 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     ir_emit_call0(list_r, ctor, "list")
     # a retaining ctor (string/list/map/struct) makes __list_push retain the
     # element, so a freshly built element carries a count the list now also
-    # holds — drop the fresh temp's count so the list owns exactly one, and the
+    # holds. drop the fresh temp's count so the list owns exactly one, and the
     # free-time cascade balances it. a borrow keeps its owner's count (released
     # at that owner's scope), so only release non-borrowed elements. untagged
     # (primitive) lists don't retain, so nothing to drop.
@@ -6005,7 +6000,7 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
         # an optional element's register is the wrapper ir_emit_value_for_target
         # built (or retained, for a passed-through optional), owned by this
-        # literal whatever the child expression was — so it is always dropped
+        # literal whatever the child expression was, so it is always dropped
         # once the list holds its own count.
         if retaining and (elem_kind == "tuple" or not ir_expr_is_borrowed(child)):
             ir_rc_release_reg(elem_r, elem_kind)
@@ -6074,7 +6069,7 @@ fn ir_tuple_dtor_signature(elem_nodes: List[Int]) -> String:
     return sig
 
 # module-suffixed so each module carries its own copy, exactly like the
-# struct destructors — no cross-module references, no name clashes.
+# struct destructors: no cross-module references, no name clashes.
 fn ir_tuple_dtor_name(sig: String) -> String:
     return "__tuple_dtor_" + sig + "_m" + ir_module_count.to_string()
 
@@ -6139,7 +6134,7 @@ fn ir_field_lookup_key(recv_idx: Int, field_name: String) -> String:
 # the widest payload across an enum's variants. every variant is boxed
 # at this size so a match arm can read a payload slot of a value that
 # turned out to be a different, narrower variant without running past
-# the allocation — the tag check still gates whether the comparison
+# the allocation. the tag check still gates whether the comparison
 # counts, but the read itself must stay in bounds and land on a zeroed
 # slot (Event.Ping carries no payload, yet a Code(0) arm reads slot 1).
 fn ir_enum_max_payload_count(enum_name: String) -> Int:
@@ -6205,7 +6200,7 @@ fn ir_generic_enum_instance_dtor(ename: String, tid: Int) -> String:
         # signature is stored as one string and read back with split, which
         # drops empty parts. a dropped part shifts every later variant's kinds
         # down one tag, so a destructor for `Nothing, Some(T)` released slot 1
-        # under tag 0 — the payload variant's own tag never matched and its
+        # under tag 0: the payload variant's own tag never matched and its
         # string was stranded. the tag a variant releases under is its position
         # in this list, so the list has to keep every position.
         if kinds.len() == 0:
@@ -6251,7 +6246,7 @@ fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant
             # other struct-shaped store. a widened payload's register is the
             # shell this construction just built rather than the value the
             # expression names, so it is already owned however the value
-            # arrived — retaining it there would strand the shell.
+            # arrived; retaining it there would strand the shell.
             payload_kind := ir_rc_kind(kinds[i])
             if payload_kind.len() > 0 and ir_expr_is_borrowed(arg_idx) and not c_argument_widens_to_optional(arg_idx):
                 ir_rc_retain_reg(arg_r, payload_kind)
@@ -6262,7 +6257,7 @@ fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant
 # `pre_obj_r` is the receiver register when the caller already evaluated it (the
 # ir_expr dispatch does, to check for result fields first); pass -1 to have this
 # evaluate the receiver itself. reusing it matters: evaluating a stateful
-# receiver twice — e.g. reader.read_tag() — would advance it and read the wrong
+# receiver twice (e.g. reader.read_tag()) would advance it and read the wrong
 # value, which is what a chained `reader.read_tag()!.field` used to do.
 fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
     fname := node_value(idx)
@@ -6313,8 +6308,8 @@ fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
     ir_release_owned_field_receiver(recv_idx, obj_r, r, ir_rc_kind(field_type))
     return r
 
-# a field read off an owned temporary — `make_pt(i).x`, `p.unwrap_or(Pt(0, "z")).x`
-# — used to strand the temporary: the method-call path releases an owned
+# a field read off an owned temporary (`make_pt(i).x`, `p.unwrap_or(Pt(0, "z")).x`)
+# used to strand the temporary: the method-call path releases an owned
 # receiver once the call returns, but the field path never did, and every
 # struct built only to have one field read leaked whole. now the field value
 # takes its own count first when it has a kind (so it outlives the receiver),
@@ -6334,12 +6329,12 @@ fn ir_release_owned_field_receiver(recv_idx: Int, obj_r: Int, field_r: Int, fiel
 # true for a `.value()` whose extraction the emitter could not count. a
 # provable optional receiver routes through the value arm of
 # ir_emit_typed_receiver_method, which hands the payload out with a count of
-# its own (ir_extraction_retains) — so those are ordinary owned temporaries and
+# its own (ir_extraction_retains), so those are ordinary owned temporaries and
 # an owned-receiver release balances the count the extract took. where the
 # receiver's type is unprovable that arm never fires, no retain is emitted, and
 # the value is still the uncounted view it always was: releasing it would drop
 # a count the read never took, which is what dropped a weak referent's count
-# and took test_weak_read_loop from 7000 to 7. refuse there — a refusal can
+# and took test_weak_read_loop from 7000 to 7. refuse there: a refusal can
 # only leak, never dangle.
 fn ir_value_extraction_is_uncounted(recv_idx: Int) -> Bool:
     recv := get_node(recv_idx)
@@ -6360,7 +6355,7 @@ fn ir_field_receiver_kind_can_own(kind: String) -> Bool:
 
 # true when a field access's receiver is a fresh value nothing else names: a
 # call or method result, a struct construction, or an unwrap that built its
-# answer — anything ir_expr_is_borrowed says is owned, of a struct or tuple
+# answer: anything ir_expr_is_borrowed says is owned, of a struct or tuple
 # kind.
 #
 # parens are transparent. a catch, a try (`f()!`) and a field read that is
@@ -6419,7 +6414,7 @@ fn ir_result_reg_enabled() -> Bool:
 # glue expects one return), and only ok payloads that fit one integer
 # register (ir_result_reg_ok_kind_fits: a Float! has no f64 pair yet, and an
 # optional or tuple payload is more than one word). the error payload is
-# whatever `fail` produced — always a single register, released by the
+# whatever `fail` produced, always a single register, released by the
 # consumer exactly as the box world's err slot is.
 fn ir_maybe_register_result_reg(name: String, node: Node, home_module: String):
     if not ir_result_reg_enabled():
@@ -6462,7 +6457,7 @@ fn ir_method_result_ok_kind(impl_type: String, method_idx: Int) -> String:
 # defaults are shared fn_decl nodes emitted once per conforming type, and
 # their methods back generic bounds whose bodies re-emit under specialized
 # names. a generic impl target is excluded the same way a generic function
-# is — its methods re-emit per specialization while this registry keys the
+# is: its methods re-emit per specialization while this registry keys the
 # base name. beyond that the gate matches the free-function one exactly,
 # including the lambda/spawn body exclusion (see ir_maybe_register_result_reg
 # for the rationale).
@@ -6501,13 +6496,13 @@ fn ir_node_contains_lambda_or_spawn(idx: Int) -> Bool:
 # lower a call to a pair-returning function. always emits rcall; then either
 # hands the raw pair to the consumer that asked for it (the try emitter, via
 # the defer handshake) or folds the pair into an ordinary result box so every
-# other context — bindings, field reads, argument position, forwarding —
+# other context (bindings, field reads, argument position, forwarding)
 # behaves exactly as the box world always has.
 # the ok payload kinds the register ABI carries. every entry is one i64
 # register: ints and bools by value, the reference-counted kinds as handles
 # whose count transfers through the register exactly as it transferred
 # through the box's ok slot. Float needs the f64 pair (result_reg_f) and
-# multi-word shapes (tuple, optional) have no single register — excluded.
+# multi-word shapes (tuple, optional) are excluded: they have no single register.
 fn ir_result_reg_ok_kind_fits(ok_kind: String) -> Bool:
     if ok_kind == "int" or ok_kind == "bool" or ok_kind == "string" or ok_kind == "bytes":
         return true
@@ -6637,7 +6632,7 @@ fn ir_count_call_binds(idx: Int, name: String, inside_loop: Bool) -> Int:
 # decode the sentinel into (flag, payload) registers with no box on either
 # arm. the err payload is the same static message string the box path
 # stores, so the consumer's release path sees nothing new. float stays on
-# the box path — its payload cannot travel an int-typed temp.
+# the box path; its payload cannot travel an int-typed temp.
 fn ir_emit_wrapped_legacy_pair(raw_r: Int, legacy_kind: String, callee_name: String) -> Int:
     flag_temp := ir_new_temp_name("lp_flag")
     val_temp := ir_new_temp_name("lp_val")
@@ -6746,7 +6741,7 @@ fn ir_emit_result_field_access(idx: Int, obj_r: Int, fname: String) -> Int:
                 return ir_emit_result_flag_field(obj_r, fname)
     return 0 - 1
 
-# a slot read off a result box nothing else names — `f().ok`, `f().is_ok` —
+# a slot read off a result box nothing else names (`f().ok`, `f().is_ok`)
 # used to strand the box and whatever the other slot held. the slot value
 # takes its own count first, so it outlives the box, then the box goes the way
 # a discarded result does, payload and all. reading `.ok` off a fresh box is
@@ -6774,24 +6769,24 @@ fn ir_method_call_arg_expr(node: Node, arg_index: Int) -> Int:
 
 # how `!`, `catch`, and `unwrap_or` should treat the shell of their result
 # or optional operand:
-#   "owned"    — a fresh shell this extraction is the sole owner of: a call
+#   "owned":     a fresh shell this extraction is the sole owner of: a call
 #                or method-call result (results and optionals always arrive
 #                owned from a call; user returns retain borrowed payloads on
 #                the way out, runtime producers mint new tuples), or an
 #                awaited task's value.
-#   "borrowed" — a shell some other owner will release: a parameter or a
+#   "borrowed":  a shell some other owner will release: a parameter or a
 #                named local (an ident), a struct field, a container
 #                element. the extraction must not free the shell, and must
-#                not hand out the shell's payload count as if it owned it —
+#                not hand out the shell's payload count as if it owned it;
 #                the owner releases the shell at its own scope exit, so
 #                either mistake is a double-free.
-#   "opaque"   — anything else (a match or if expression value, ...): kept
+#   "opaque":    anything else (a match or if expression value, ...): kept
 #                on the historical owned-style treatment, which can leak a
 #                shell but predates this classification.
 # parens are transparent. mirrors ir_optional_subject_is_owned, which makes
 # the same call-vs-borrow split for optional subjects. one of the four
 # fresh-temporary predicates; see the block above
-# ir_expr_is_transferred_call_temp — this is the one with no generic-body
+# ir_expr_is_transferred_call_temp. this is the one with no generic-body
 # guard, because it is purely syntactic and consults no types.
 fn ir_extraction_operand_class(idx: Int) -> String:
     node := get_node(idx)
@@ -6806,7 +6801,7 @@ fn ir_extraction_operand_class(idx: Int) -> String:
 # consume a pair at an unwrap_or site with no box on either path. the ok
 # payload arrives owned, exactly as the owned-shell box path hands it out;
 # the err arm evaluates the fallback under the same retain rule the box
-# path applies, then drops the error by its kind — the same order the box
+# path applies, then drops the error by its kind, the same order the box
 # path uses.
 fn ir_emit_unwrap_or_pair(idx: Int, node: Node, flag_r: Int, val_r: Int) -> Int:
     recv_tid := c_get_expr_type(node.children[0])
@@ -6875,7 +6870,7 @@ fn ir_emit_result_unwrap_or(idx: Int, node: Node) -> Int:
     fallback_r := ir_expr(arg_idx)
     # consumers treat a heap-kind unwrap_or value as owned and release it, so
     # a fallback that arrives borrowed (a named local, a field) needs a count
-    # of its own here — without one that release strips the owner's count and
+    # of its own here. without one that release strips the owner's count and
     # the owner's next use reads freed memory. a string fallback is excluded
     # because a string unwrap_or stays classified borrowed (the escape site
     # retains), mirroring the ok arm.
@@ -7279,7 +7274,7 @@ fn ir_emit_select_expr(node: Node) -> Int:
 # both need the same count: try_send used to be missing here, which let a
 # borrowed value (`ch.try_send(wire.ok)`) reach the receiver with no count of
 # its own and an owned temporary be released the moment the call returned.
-# a send that fails leaves the extra count behind — a bounded leak, and the
+# a send that fails leaves the extra count behind: a bounded leak, and the
 # same trade already accepted for the blocking form.
 fn ir_is_channel_send_name(emit_name: String) -> Bool:
     if emit_name == "send" or emit_name == "pith_channel_send":
@@ -7290,7 +7285,7 @@ fn ir_is_channel_send_name(emit_name: String) -> Bool:
 fn ir_emit_method_call(idx: Int) -> Int:
     # A method call is lowered by a handful of specialized emitters tried in
     # order; each returns a register or -1 ("not my shape, keep looking"). The
-    # order matters — an earlier shape shadows the ones after it:
+    # order matters; an earlier shape shadows the ones after it:
     #   1. enum variant construction   Shape.Circle(2.5) / mod.Enum.Variant(..)
     #   2. type-directed builtins       Int.to_string, Result.*, Optional.*
     #   3. module-qualified call        mod.Struct(..) / mod.some_fn(..)
@@ -7406,7 +7401,7 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 default_r := ir_expr(default_idx)
                 # consumers treat a heap-kind unwrap_or value as owned and
                 # release it, so a default that arrives borrowed (a named
-                # local, a field) needs its own count here — without one that
+                # local, a field) needs its own count here. without one that
                 # release strips the owner's count and the owner's next use
                 # reads freed memory. a fresh default already owns its single
                 # count and is stored as-is. string payloads classify owned
@@ -7424,7 +7419,7 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
     return 0 - 1
 
 # A module-qualified call, `mod.member(...)`, where `mod` is an import alias.
-# Resolves to the target name and emits it — as an inline struct construction
+# Resolves to the target name and emits it, as an inline struct construction
 # when the member is a struct type, otherwise as a plain (possibly generic)
 # static call. Returns -1 when the receiver is not a module alias.
 fn ir_emit_module_alias_method(idx: Int) -> Int:
@@ -7442,7 +7437,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         # a same-module construction so each field takes ownership and the struct
         # gets its destructor. the generic function-call path below would instead
         # emit a backend constructor call and then release the owned args the
-        # struct just stored — dropping a fresh heap value (e.g. `body: bytes...`).
+        # struct just stored, dropping a fresh heap value (e.g. `body: bytes...`).
         alias_expr_tid := c_get_expr_type(idx)
         mut ctor_tid := 0 - 1
         mut builds_struct := false
@@ -7497,7 +7492,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     # `recv.f(args)` where `f` is a closure-typed field of recv's struct (not a
     # method of it): there's no method named `f`, so a naive dispatch would emit
     # a literal `call f unknown ...`. Instead load the field into a named local
-    # and call it through the closure abi — the same lowering a local
+    # and call it through the closure abi, the same lowering a local
     # `f := fn(...) ...; f(x)` gets, routing through pith_closure_get_fn. Covers
     # `self.f()` inside a generic impl and `h.f(x)` on any struct value; the
     # checker only reaches emission here when `f` is genuinely a fn-value field.
@@ -7603,7 +7598,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     # a builtin method on a primitive receiver lowers to its runtime call
     # name here, not at ir_emit_call_text: that helper hands any name a user
     # function declares to that function, which is right for a free call and
-    # wrong for a method — the receiver's checked type already resolved the
+    # wrong for a method: the receiver's checked type already resolved the
     # builtin, and a free `fn to_int(text, fallback)` anywhere in the build
     # must not capture `(1.5).to_int()`. most names map to the same runtime
     # key they would have gotten there; the four whose short key is the
@@ -7651,7 +7646,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 ir_optional_tuple_dtor_needed = true
             ir_emit_optional_attach_dtor(r, owned_getter_kind)
     # a builtin that may hand an argument straight back out takes no count on
-    # either branch, so the caller takes one here — before the release below,
+    # either branch, so the caller takes one here, before the release below,
     # which on the hand-back branch drops the very register this just counted.
     # that makes the result owned whichever branch ran, which is what lets the
     # fallback be released like any other owned argument and what stops a
@@ -7665,7 +7660,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
         if recv_kind.len() > 0 and not ir_expr_is_borrowed(recv_idx):
             # a void method's value IS its receiver (see the return below), so
             # the receiver's count must survive the call and travel with that
-            # value — `sort_by_key(xs, key).reverse()` returns the reversed
+            # value. `sort_by_key(xs, key).reverse()` returns the reversed
             # list, and releasing the owned receiver here freed the very list
             # being returned. the count then belongs to whoever consumes the
             # chain: a bind takes it, and a discarded chain drops it at the
@@ -7785,8 +7780,8 @@ fn ir_reset_lambda_emit_state():
     ir_local_lambda_targets_depth = ir_local_lambda_targets_depth + 1
     ir_local_lambda_targets = {}
     # a lambda / wrapper is its own function with its own slots. an enclosing
-    # loop's variable slots do not exist in that frame — the capture prologue
-    # stores captured values under their plain names — so start it empty. each
+    # loop's variable slots do not exist in that frame (the capture prologue
+    # stores captured values under their plain names), so start it empty. each
     # caller saves the outer mapping first and puts it back afterwards.
     ir_loop_var_slots = {}
 
@@ -7849,7 +7844,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     parts := ir_collect_lambda_parts(idx)
 
     # decide which captures are weak while the ENCLOSING function's kind
-    # state is still in place — the body emission below clears it. these
+    # state is still in place; the body emission below clears it. these
     # names read through the weak liveness resolution inside the lambda,
     # and the capture setup at the bottom stores them under tag 8.
     mut lambda_weak_caps: List[String] := []
@@ -8095,7 +8090,7 @@ fn ir_ident_is_function_value(idx: Int, name: String) -> Bool:
 # there are two spellings, and both mint a closure: a bare `shout`
 # (ir_emit_ident_load) and a module member `hash.sha256_bytes`
 # (ir_emit_field_access_expr). the conditions below mirror those two emit
-# paths, because the ownership answer has to agree with what was emitted —
+# paths, because the ownership answer has to agree with what was emitted:
 # if this says "owned" where no closure was allocated, the caller releases
 # a count nobody took.
 fn ir_expr_is_named_function_value(idx: Int) -> Bool:
@@ -8184,8 +8179,8 @@ fn ir_emit_ident_load(idx: Int, name: String) -> Int:
     # normal variables and globals still load through storage; threadlocal
     # globals route through the tls runtime inside ir_emit_name_load.
     ir_emit_name_load(r, name)
-    # a weak local's slot — or a weak binding captured from the enclosing
-    # function — holds the bare target pointer, so every read resolves
+    # a weak local's slot (or a weak binding captured from the enclosing
+    # function) holds the bare target pointer, so every read resolves
     # liveness fresh through pith_struct_weak_load and hands back the
     # optional the checker typed it as: Some(target) while it is alive,
     # none once it has been reclaimed.
@@ -8206,7 +8201,7 @@ fn ir_struct_args_have_names(arg_nodes: List[Int]) -> Bool:
 # same name; the name-keyed registry (and the global type table it consults)
 # then collapse them, so a field given by name matches the wrong struct's
 # layout and silently stores its default. The construction's checked tid names
-# the exact struct, so we read its ordered fields directly — the same
+# the exact struct, so we read its ordered fields directly, the same
 # authoritative path field reads already use (ir_try_checked_field_read). We
 # fall back to the name-keyed registry when the checker never assigned a plain
 # struct tid (tuples and some emit-only constructions).
@@ -8385,11 +8380,11 @@ fn ir_emit_try_expr(node: Node) -> Int:
                 # a fresh shell: the extracted payload carries the count; the
                 # tuple shell has no destructor, so this frees only the
                 # three-slot allocation. the error path returns the same
-                # tuple upward instead — its consumer releases it there.
+                # tuple upward instead; its consumer releases it there.
                 ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
             # a borrowed operand (a parameter, a live named local) keeps its
             # shell and its payload count with its owner. the unwrapped value
-            # stays a borrow — a `!` over a non-call operand is classified
+            # stays a borrow: a `!` over a non-call operand is classified
             # borrowed, so bindings and returns retain at the escape site,
             # the same as a `.ok` read.
             ir_emit("jmp " + merge_l)
@@ -8611,7 +8606,7 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     ir_release_owned_index_key(node.children[1], idx_r)
     return r
 
-# an index key computed in place — `m[a.to_string() + ":" + b.to_string()]` —
+# an index key computed in place (`m[a.to_string() + ":" + b.to_string()]`)
 # arrives owned and nothing keeps it. a lookup reads the key and stores
 # nothing, and a store copies the key bytes into the map's own storage rather
 # than keeping the caller's string, so either way the count the caller holds
@@ -8661,7 +8656,7 @@ fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: 
     ir_emit("field " + unwrapped_r.to_string() + " " + opt_r.to_string() + " 8 " + val_kind + " value")
     # the _opt wrapper is a throwaway tuple shell; free it now that the value is
     # extracted. releasing it frees only the tuple's slots (no destructor), so
-    # the extracted value is untouched — without this every `list[i]` leaks it.
+    # the extracted value is untouched; without this every `list[i]` leaks it.
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
     ir_emit("jmp " + merge_l)
     ir_emit_label(none_l)
@@ -8670,7 +8665,7 @@ fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: 
         ir_test_assert_fail_return()
     else:
         # this early return skips the normal exit, so run the deferred
-        # statements and then release the function's owned locals here too —
+        # statements and then release the function's owned locals here too;
         # without the cleanup every owned local leaked on an index miss.
         ir_defer_emit_to_function_frame(true)
         ir_emit_rc_cleanup("")
@@ -8803,7 +8798,7 @@ fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int
     r := ir_reg()
     ir_emit_call3(r, call_name, "void", map_r, key_r, delta_r)
     # the key is read and copied by the runtime, never kept, so a key built on
-    # the spot would die here — the same release the plain store does. a pure
+    # the spot would die here, the same release the plain store does. a pure
     # read is never owned, so this is a no-op today and stays for the day the
     # recognizer admits a wider key.
     ir_release_owned_index_key(key_idx, key_r)
@@ -8846,14 +8841,14 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     value_r := ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # tagged containers retain stored elements in the runtime. a borrowed heap
     # value carries its kind with it, so the container adopts it where it has
-    # none and takes exactly one count either way — a list used to get a
+    # none and takes exactly one count either way. a list used to get a
     # compensating retain here on top of the one the runtime store took,
     # because nothing told a tagged list from an untagged one.
     idx_store_kind := ir_rc_kind(value_type)
     mut set_name := ir_index_set_call_name(ir_bytes_keyed_type(target.children[0], obj_type))
     mut idx_borrowed := ir_expr_is_borrowed(value_idx)
     # a fresh optional shell is built right here by ir_emit_value_for_target,
-    # so this frame is its only owner however the value itself classifies —
+    # so this frame is its only owner however the value itself classifies:
     # a bare `none` falls through to borrowed and sent the store down the
     # retaining path, stranding a shell per `m[k] = none`.
     if ir_expr_is_fresh_optional_shell(value_idx):
@@ -8881,7 +8876,7 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # a store reads its key the same way a lookup does: the runtime copies the
     # key bytes into the map's own storage rather than keeping the caller's
     # string, so an owned key temporary dies here too. the stored *value* is a
-    # different question — the container retains that, and it stays under the
+    # different question: the container retains that, and it stays under the
     # container-store exception in docs/ownership.md.
     ir_release_owned_index_key(target.children[1], idx_r)
     return true
@@ -8908,7 +8903,7 @@ fn ir_expr(idx: Int) -> Int:
         return ir_emit_bool_literal(node)
 
     # a bare `none` the checker let through is the empty case of an optional
-    # — nothing else typechecks there any more — so it lowers to the canonical
+    # (nothing else typechecks there any more), so it lowers to the canonical
     # optional tuple. the positions that know their target (return, bind,
     # tuple element, `== none`) still intercept above; this is what an
     # argument position gets, which used to fall through to the zero-value
@@ -8934,18 +8929,13 @@ fn ir_expr(idx: Int) -> Int:
     else:
         return ir_expr_complex(idx, node)
 
-fn ir_emit_zero_value() -> Int:
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " 0")
-    return r
-
 fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
     fname := node_value(idx)
     if node.children.len() > 0:
         # a module function used as a value: `hash.sha256_bytes` where `hash`
         # is a module alias and the member is a function. resolve it the way a
         # call would and wrap it into a closure value, the same as a bare
-        # function name. this must run before the receiver is evaluated — a
+        # function name. this must run before the receiver is evaluated: a
         # module alias is not a loadable value.
         recv_node := get_node(node.children[0])
         if recv_node.kind == "ident" and ir_module_aliases.contains_key(recv_node.value):
@@ -8959,7 +8949,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
                     return r
             # `frames.FRAME_DATA` where the member is a module-level constant,
             # not a function. a module alias is not a loadable value, so this
-            # can't fall through to a struct field access — resolve it to the
+            # can't fall through to a struct field access. resolve it to the
             # aliased module's qualified global and load it, the same as a
             # same-module global reference does.
             module_path := ir_module_aliases[recv_node.value]
@@ -8970,7 +8960,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         # an alias-qualified no-payload variant: `sh.Phase.Alpha` arrives here
         # with fname Alpha and a field_access receiver whose base is the module
         # alias. the receiver names a type, not a value, so it must not be
-        # evaluated — emit the same construction the bare Phase.Alpha path
+        # evaluated. emit the same construction the bare Phase.Alpha path
         # does. payload variants never reach here (they are calls).
         if recv_node.kind == "field_access" and recv_node.children.len() > 0:
             base_node := get_node(recv_node.children[0])
@@ -8984,7 +8974,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
                         r := ir_reg()
                         ir_emit("iconst " + r.to_string() + " " + ir_struct_field_index_lookup[variant_key])
                         return r
-        # a bare payload-free variant — `Holder.Empty` — names a type on the
+        # a bare payload-free variant (`Holder.Empty`) names a type on the
         # left, not a value; evaluating it loaded a variable that does not
         # exist. hand it straight to the construction path instead.
         if ir_field_access_is_bare_variant(idx):
@@ -9003,7 +8993,7 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
 
 fn ir_emit_await_expr(node: Node) -> Int:
     if node.children.len() == 0:
-        return ir_emit_zero_value()
+        return ir_zero_reg()
     task_r := ir_expr(node.children[0])
     r := ir_reg()
     ir_emit_call1(r, "await", "unknown", task_r)
@@ -9011,7 +9001,7 @@ fn ir_emit_await_expr(node: Node) -> Int:
 
 # release a result's error value when it is being discarded. the result
 # tuple is a shell with no destructor, so releasing the tuple frees only
-# its three slots — a heap error value (a string message, a struct error)
+# its three slots: a heap error value (a string message, a struct error)
 # would leak unless dropped here first.
 fn ir_emit_release_result_error(result_r: Int, result_tid: Int):
     err_kind := ir_rc_kind(ir_result_field_kind(result_tid, "err"))
@@ -9043,7 +9033,7 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     if operand_class == "borrowed":
         # the operand's owner keeps the shell and its payload count. a catch
         # value always arrives owned at its consumer (see the catch_expr case
-        # in ir_expr_is_borrowed), so give it a count of its own —
+        # in ir_expr_is_borrowed), so give it a count of its own;
         # handing out the shell's count, or freeing the shell here, would
         # double-free once the owner cleans up.
         ir_rc_retain_reg(ok_value_r, ir_rc_kind(ir_result_field_kind(result_tid, "ok")))
@@ -9052,7 +9042,7 @@ fn ir_emit_catch_expr(node: Node) -> Int:
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(fallback_l)
-    # the error is being thrown away for the fallback value; drop it first —
+    # the error is being thrown away for the fallback value; drop it first,
     # unless the operand is a borrow, in which case both the error and the
     # shell stay with their owner
     if operand_class != "borrowed":
@@ -9099,7 +9089,7 @@ fn ir_emit_catch_block_pair(node: Node, flag_r: Int, val_r: Int) -> Int:
 
 # catch performs; the error arm disposes of the failed result and then runs
 # the user's block, which the checker guarantees leaves (return, fail,
-# continue or break). the trailing jmp is dead code on every real path — it
+# continue or break). the trailing jmp is dead code on every real path; it
 # only keeps the ir well formed.
 fn ir_emit_catch_block(node: Node) -> Int:
     saved_defer := ir_rcall_defer_idx
@@ -9131,7 +9121,7 @@ fn ir_emit_catch_block(node: Node) -> Int:
     ir_emit("jmp " + merge_l)
     ir_emit_label(err_l)
     # the error is not consumed by the block (there is no binding for it in
-    # this form), so drop it before user code runs — unless the operand is a
+    # this form), so drop it before user code runs, unless the operand is a
     # borrow, in which case the error and the shell stay with their owner.
     if operand_class != "borrowed":
         ir_emit_release_result_error(result_r, result_tid)
@@ -9146,7 +9136,7 @@ fn ir_emit_catch_block(node: Node) -> Int:
 fn ir_emit_grouped_expr(node: Node) -> Int:
     if node.children.len() > 0:
         return ir_expr(node.children[0])
-    return ir_emit_zero_value()
+    return ir_zero_reg()
 
 # A match compiles to a linear chain of pattern tests. The subject is evaluated
 # once; each arm tests its pattern (and guard) and, on a match, runs its body
@@ -9163,7 +9153,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
     kind := node_kind(idx)
     if kind == "match_expr":
         # a call-produced subject arrives with a count nothing else claims,
-        # and the match emitters are where it can be released — a bound
+        # and the match emitters are where it can be released. a bound
         # local's count belongs to the local's own cleanup instead. the
         # classification is the extraction pair's: a fresh temporary per
         # ir_optional_subject_is_owned, refined by ir_expr_is_borrowed so a
@@ -9171,7 +9161,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         subj_owned := node.children.len() > 0 and ir_optional_subject_is_owned(node.children[0]) and not ir_expr_is_borrowed(node.children[0])
         if idx == ir_tail_match_node:
             ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block, subj_owned)
-            return ir_emit_zero_value()
+            return ir_zero_reg()
         # arm values go through the call-argument emitter: a plain value in
         # an arm the checker settled on an optional (`none => none; x => x`)
         # is recorded as widening, and the Some is built here rather than the
@@ -9242,7 +9232,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_index_expr(idx, node)
 
     # fallback
-    return ir_emit_zero_value()
+    return ir_zero_reg()
 
 fn ir_emit_return_stmt(node: Node):
     if node.children.len() > 0:
@@ -9266,16 +9256,16 @@ fn ir_emit_return_stmt(node: Node):
 # function's declared kind, defers, and the tracked-local cleanup (with the
 # returned local excluded so its count transfers to the caller). split out
 # of ir_emit_return_stmt so a tail-match arm's expression body returns
-# through the same machinery — the bare `ret` it used to emit skipped the
+# through the same machinery. the bare `ret` it used to emit skipped the
 # cleanup, so every count an arm binding had retained leaked per call.
 pub fn ir_emit_return_value(expr_child: Int):
     # `return none` builds its optional below, from the function's own
     # return kind. going through ir_expr for it would build one optional
-    # tuple here and a second one there, and strand the first — every
+    # tuple here and a second one there, and strand the first. every
     # `return none` in the tree leaked an optional per call.
     mut r := 0
     if node_kind(expr_child) == "none_lit":
-        r = ir_emit_zero_value()
+        r = ir_zero_reg()
     elif ir_current_func_return_kind == "result_reg":
         # forwarding handshake: a direct pair-returning call (an rcall or
         # a legacy-builtin wrap) hands its (flag, payload) registers
@@ -9334,12 +9324,12 @@ pub fn ir_emit_return_value(expr_child: Int):
         # or the inner value (so wrap in Some)? the checker knows in the
         # normal case; in a generic body a call like `c.maybe()` isn't
         # resolved to optional at declaration time, so also trust the
-        # emitter's own retkind — an optional lowers to a tuple, and a
+        # emitter's own retkind: an optional lowers to a tuple, and a
         # tuple retkind can only be the optional wrapper unless the inner
         # value is itself tuple-shaped.
         # a local tracked as a tuple already holds the optional wrapper, so
         # forwarding it (rather than wrapping in Some again) is the same
-        # signal as a tuple retkind — the guard against an Optional[Tuple]
+        # signal as a tuple retkind; the guard against an Optional[Tuple]
         # inner still applies.
         ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
         # the checker records a return of the payload type into an optional
@@ -9356,9 +9346,9 @@ pub fn ir_emit_return_value(expr_child: Int):
             # the returned Some OWNS a heap payload: attach the matching
             # __opt_dtor_<kind>, exactly as the widening wrap in
             # ir_emit_value_for_target does. the payload arrives here already
-            # owned — a fresh value carries its own count, a tracked local
+            # owned (a fresh value carries its own count, a tracked local
             # transferred its count through `exclude`, and a borrowed value was
-            # retained above — so the wrap takes that count over and the shell
+            # retained above), so the wrap takes that count over and the shell
             # becomes the payload's owner. without the destructor the shell
             # held the only count while freeing the shell dropped nothing, and
             # every extraction off a call subject stranded one payload: the
@@ -9439,7 +9429,7 @@ fn ir_emit_ret_err_value(err_r: Int):
 # box on either path. the ok payload arrives owned (the callee transferred
 # its count through the register), exactly what a catch value's consumer
 # expects; the err arm owns the error, drops it, and evaluates the fallback
-# in its place — the same ownership contract as the box path's arms.
+# in its place: the same ownership contract as the box path's arms.
 fn ir_emit_catch_pair(node: Node, flag_r: Int, val_r: Int) -> Int:
     result_tid := c_get_expr_type(node.children[0])
     temp_name := ir_new_temp_name("catch")
@@ -9551,7 +9541,7 @@ fn ir_emit_pair_ret(box_r: Int, release_shell: Bool, flag: String, val_r: Int):
 # the unresolved test has to be syntactic. ir_rc_kind resolves a dotted
 # name by its bare suffix against the struct registry, so any user
 # `struct Item` in scope makes an unresolved `I.Item` read back as
-# "struct" — and a gate that asks the kind instead of the shape then skips
+# "struct", and a gate that asks the kind instead of the shape then skips
 # the resolver and lowers over the wrong kind entirely (an Int-element
 # to_list built its rows as struct pointers and segfaulted at scale).
 fn ir_generic_name_unresolved(name: String) -> Bool:
@@ -9689,7 +9679,7 @@ fn ir_emit_bind_stmt(node: Node):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
             # a loop rebinding a cascade-eligible tuple local must cascade the
-            # OLD value's payload here, not just its shell — this is where the
+            # OLD value's payload here, not just its shell. this is where the
             # per-iteration leak lives.
             ir_rc_release_local(old_r, bind_kind, name)
         ir_var_regs.insert(name, r)
@@ -9938,7 +9928,7 @@ fn ir_stmt(idx: Int):
 
     # each statement speaks for itself: without this reset, a nested
     # `if x: return` leaves the flag stuck on true, and the statements
-    # after it lose their branch-merge jump — the code falls through
+    # after it lose their branch-merge jump; the code falls through
     # into the else arm
     ir_last_was_ret = false
 
@@ -9975,7 +9965,7 @@ fn ir_stmt(idx: Int):
         r := ir_expr(idx)
         # a fire-and-forget `spawn f()` whose handle is discarded at statement
         # position must be detached, or the runtime never reclaims the task's
-        # slab slot once it finishes — the slab reclaims only on await or
+        # slab slot once it finishes. the slab reclaims only on await or
         # detach. an accept loop doing `spawn handle_conn(fd)` per connection
         # would otherwise grow the slab (and, on the os-thread backend, pin a
         # JoinHandle) without bound. detaching hands the runtime permission to
@@ -10000,7 +9990,7 @@ fn ir_stmt(idx: Int):
             # destructor, so the payload is dropped explicitly or it leaks
             # (this is what a bare `buf.write_byte(x)` did before). the drop
             # is gated on the strong count for the same reason the argument
-            # release is — a callee that hands its parameter back
+            # release is: a callee that hands its parameter back
             # (`forward(r)` with `r` a live local) leaves two owners on one
             # box, and dropping the payload here emptied the local (#1075).
             if stmt_tid >= 0 and get_type_info(stmt_tid).kind == "result":
@@ -10010,7 +10000,7 @@ fn ir_stmt(idx: Int):
             # and the caller holds a count on it either way: the callee
             # retained a borrowed shell on the way out and transferred a fresh
             # one. so the shell goes back here, and what it owns through its
-            # destructor goes with it — a `List[X]?` handed straight back and
+            # destructor goes with it. a `List[X]?` handed straight back and
             # dropped left the caller's own local one count above zero, which
             # stranded the shell and the list inside it. the payload of a
             # destructor-less shell is the older leak docs/limitations.md
@@ -10025,7 +10015,7 @@ fn ir_stmt(idx: Int):
             # list/map/set (keys(), values(), to_list(), split(), the
             # slice/sort copies, args()) or a count taken over the call
             # (get_default, which the call site retains; take, which the
-            # map relinquishes) — the same classification every binding of
+            # map relinquishes), the same classification every binding of
             # these results already relies on. an optional shell that did not
             # answer the question above lands here as the "tuple" kind and is
             # settled on the ordinary ownership answer, which is how a shell
@@ -10041,7 +10031,7 @@ fn ir_stmt(idx: Int):
         # reading the chain root matters here as well: `xs.reverse()` shares
         # its name with String.reverse, the name-keyed inference calls the
         # chain's value a fresh string, and the release that used to be
-        # emitted was a cstring release aimed at a live list handle — an
+        # emitted was a cstring release aimed at a live list handle: an
         # invalid free on any discarded void-method statement whose name a
         # string method shares.
         if ir_infer_type(subject) == "string" and not ir_expr_is_borrowed(subject):
@@ -10109,7 +10099,7 @@ fn ir_discard_chain_root(idx: Int) -> Int:
 # classification says so, and so has to be released here. a call and a method
 # call transfer their result out. a `!` frees the box it opened and hands the
 # payload on with the box's count, and an `await` hands over the count the
-# task's thread produced — both are the transfer ir_expr_is_borrowed already
+# task's thread produced. both are the transfer ir_expr_is_borrowed already
 # reads them as, and both reached this discard without a release before.
 # `catch`, `select` and `match` are deliberately absent: they normalize their
 # arms to owned through paths of their own, and only the string release below
@@ -10123,7 +10113,7 @@ fn ir_stmt_discards_owned_value(kind: String) -> Bool:
 # containers, `bytes` and a struct or tuple header were the first set; a
 # closure and a channel are here on the same terms, because the only way
 # either reaches a discarded statement is a call that transferred its count
-# out — a returned lambda, a returned fn-value, a constructed channel — and
+# out (a returned lambda, a returned fn-value, a constructed channel), and
 # nothing else names what it left behind. a string has its own release, which
 # runs for statement kinds this set does not cover.
 fn ir_kind_discards_at_statement(kind: String) -> Bool:
@@ -10183,14 +10173,14 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
                 # spellings ask: the subject's shell or cascade can die while
                 # the binding lives on, and the exit cleanup (or a return's
                 # transfer) releases what the binding holds. the
-                # release-of-previous mirrors ir_bind_owned_rc_payload — zero
+                # release-of-previous mirrors ir_bind_owned_rc_payload (zero
                 # on first reach, a stale payload when a loop rebinds the
-                # name — and a name this frame does not track skips it,
+                # name), and a name this frame does not track skips it,
                 # keeping the retain as a bounded leak in the safe direction.
                 # the tracked test is the positive one ir_emit_bind_stmt asks,
                 # not the untracked list: that list is the ENCLOSING
-                # function's, and a lambda body — which is its own frame and
-                # tracks nothing — read it and emitted a load of a name the
+                # function's, and a lambda body (which is its own frame and
+                # tracks nothing) read it and emitted a load of a name the
                 # lambda has no slot for.
                 # a tuple payload (an inner optional shell) is skipped on
                 # the same terms the prepass poisons it: its count belongs to
@@ -10219,7 +10209,7 @@ fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
     ir_emit_match_bindings(pat_idx, subj_r, "")
 
 # true when an optional subject is a fresh shell the consumer owns and must
-# release after use — a call or method-call result mints one (map.get(k), f()),
+# release after use. a call or method-call result mints one (map.get(k), f()),
 # and so does an await: the task built the shell with a count of one and
 # pith_await hands that count to the single awaiter, the same transfer
 # ir_expr_is_borrowed and ir_extraction_operand_class already read it as.
@@ -10246,13 +10236,13 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
     # an uncounted `.value()` spells like a method call and is a field read:
     # on a doubly-wrapped optional it hands back the inner shell without
     # taking a count, so releasing it here would strip the count the outer
-    # shell still holds — the over-release shape this predicate's siblings
+    # shell still holds: the over-release shape this predicate's siblings
     # already carve out.
     return not ir_value_extraction_is_uncounted(idx)
 
 # whether an extraction out of the optional `subject_idx` must take its own
-# count on the payload it hands out. every extraction spelling — `.value()`,
-# `unwrap_or`, and an `if let` / `while let` binding — answers through here,
+# count on the payload it hands out. every extraction spelling (`.value()`,
+# `unwrap_or`, and an `if let` / `while let` binding) answers through here,
 # so a consumer that treats a heap-kind extraction as owned never strips a
 # count the subject still claims. a fresh subject's shell is freed right after the extract, so the
 # payload must outlive it; a parameter, field or element subject keeps its
@@ -10263,13 +10253,13 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
 #
 # a cascade-rejected local used to be the one subject that transferred: its
 # cleanup released the shell alone, so a retained count had no release. that
-# ended when a returned Some took ownership of its payload — the shell's own
+# ended when a returned Some took ownership of its payload. the shell's own
 # release now drops what it holds, so the retain balances there too, and the
 # transfer's two failure modes went with it (the double-extraction
 # unsoundness, and a rebind reading a Some-flagged shell whose payload the
 # transfer had walked off with). the residue is a shell a runtime call built
 # around a transferred count with no destructor bound to a rejected name:
-# its inner count now leaks — bounded, and in the safe direction.
+# its inner count now leaks: bounded, and in the safe direction.
 fn ir_extraction_retains(subject_idx: Int, inner_kind: String, owns_subject: Bool) -> Bool:
     return inner_kind.len() > 0
 
@@ -10292,7 +10282,7 @@ fn ir_emit_if_let_stmt(node: Node):
     subj_r := ir_expr(node.children[1])
     # a fresh optional (a call/method result) is an owned shell; the binding
     # below takes its own count on an rc payload, so the shell is released
-    # once at the merge — mirroring the for-each next() path — instead of
+    # once at the merge (mirroring the for-each next() path) instead of
     # leaking one shell per evaluation.
     owns_subject := ir_optional_subject_is_owned(node.children[1])
     cond_r := ir_emit_let_cond(node.children[0], subj_r)
@@ -10313,7 +10303,7 @@ fn ir_emit_if_let_stmt(node: Node):
     # a weak-field (or weak-local) subject minted a fresh borrowing shell for
     # this one test (ir_emit_weak_read); the binding above took its own count
     # on the payload, so the shell is dead the moment the bindings exist.
-    # freed here — before the body, which may return — and on the else path
+    # freed here (before the body, which may return) and on the else path
     # below, exactly once per path, the way the other optional consumers
     # (`.value()`, `!= none`, `?`) free it. the referent's strong count is
     # untouched: the shell has no destructor, so releasing it reclaims only
@@ -10358,7 +10348,7 @@ fn ir_emit_while_let_stmt(node: Node):
     # release this iteration's owned shell before looping (the body borrowed its
     # value); the shell that fails the condition is released after the loop.
     # a weak-read subject mints a throwaway shell per iteration on the same
-    # schedule, and the release sites mirror the owned pair exactly — the
+    # schedule, and the release sites mirror the owned pair exactly: the
     # body-exit one covers each looping iteration, the post-loop one covers
     # the shell that failed the condition (and a break's early exit, which
     # jumps here before the body-exit release runs).
@@ -10533,7 +10523,7 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     ir_defer_loop_enter()
     # an early return/fail/`!` inside the body skips end_l's release below, so
     # register this owned iterable for the exit edges to release. break and
-    # continue reach end_l, so they still release there — not here.
+    # continue reach end_l, so they still release there, not here.
     mut pushed_iter := false
     if iter_release_kind.len() > 0:
         ir_loop_iter_vars.push(ft)
@@ -10748,7 +10738,7 @@ fn ir_stmt_control(idx: Int, node: Node):
 #
 # a block is statements plus the two loop-control jumps that need to
 # know their enclosing labels (break, continue).
-# Recursive block walker — unwrap block/body/then/else wrappers
+# Recursive block walker: unwrap block/body/then/else wrappers
 # and emits statements in source order.
 # returns a throwaway 0 so it can travel as a fn value: void
 # functions are not yet recognized by the function-value path.
@@ -10930,7 +10920,7 @@ fn ir_lookup_impl_method_name(type_name: String, method_name: String) -> String:
     return ""
 
 # the receiver's checked declaration tid, or -1 when the checker did not type
-# the expression as a plain struct or enum — or typed it under a different
+# the expression as a plain struct or enum, or typed it under a different
 # name than emission sees: two type-argument lists that share an emission
 # kind share one specialization body, and that body was checked for the
 # first caller's types, so the tid is stale and must not steer dispatch
@@ -10955,7 +10945,7 @@ fn ir_checked_receiver_tid(recv_idx: Int, type_name: String) -> Int:
 
 # the impl method symbol for a call on this receiver expression. two modules
 # can each declare a struct with the receiver's name, and the name-keyed
-# table holds whichever registered last — only the receiver's checked tid
+# table holds whichever registered last. only the receiver's checked tid
 # names the right declaration, so the tid key is tried first, mirroring how
 # field reads resolve (ir_try_checked_field_read). when the receiver's tid is
 # known but the name-keyed entry belongs to a different declaration, the
@@ -11464,7 +11454,7 @@ fn ir_emit_test_func(idx: Int, ordinal: Int):
 # the generated test main is a pure dispatcher: for each test it forks, runs the
 # test in the child, and records the outcome in the parent. isolating each test
 # in its own process means a failing assert (which exits) or a crash ends only
-# that test — the rest still run and every result is reported. the parent never
+# that test; the rest still run and every result is reported. the parent never
 # runs a test body, so no test's state leaks into the next child.
 fn ir_emit_test_main(root_idx: Int):
     tests := ir_collect_test_decls(root_idx)
@@ -11564,10 +11554,10 @@ fn ir_impl_func(idx: Int, impl_type: String):
     body_idx := ir_find_body(idx)
     param_count := ir_param_count(idx) + 1
     # resolve an associated-type return (`-> Item`) to the impl's bound type so
-    # the function's return kind is right — critical for heap types and arc
+    # the function's return kind is right, critical for heap types and arc
     ret_type := ir_resolve_assoc_type(impl_type, ir_extract_return_type(idx))
     # a registered method emits the pair signature, but the recorded return
-    # below stays "tuple" — the same split ir_func keeps for free functions,
+    # below stays "tuple", the same split ir_func keeps for free functions,
     # so everything outside the rcall paths still sees the box world.
     mut emit_ret := ret_type
     if ir_result_reg_funcs.contains_key(full_name):
@@ -11643,7 +11633,7 @@ fn ir_record_returns_clause(name: String, returns_node: Node):
         # capture blocker is built from this table's keys, so a name missing
         # here is read as a free variable and the enclosing function emits a
         # `load` for it. `fn pick() -> fn(Int) -> Int` used to fail that way,
-        # with "unknown load source 'pick'" — merely naming it inside a lambda
+        # with "unknown load source 'pick'". merely naming it inside a lambda
         # was enough, no call required.
         if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "result_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type":
             ir_func_returns.insert(name, ir_resolve_type_node(type_idx))
@@ -11806,8 +11796,8 @@ fn ir_emit_local_slot_load(dest_r: Int, name: String):
     else:
         ir_emit("load " + dest_r.to_string() + " " + ir_resolve_storage_name(name))
 
-# collect every name a function body binds function-wide — a local, a
-# parameter, an `if let` or `match` payload — into the set that tells name
+# collect every name a function body binds function-wide (a local, a
+# parameter, an `if let` or `match` payload) into the set that tells name
 # resolution which bare names in this function are its own. a name in the set
 # keeps its written spelling; a name outside it that the module declares as a
 # global resolves to the global's storage symbol instead.
@@ -11827,7 +11817,7 @@ fn ir_collect_func_local_names(idx: Int):
     # with storage scoped to a block rather than the function: it lives in
     # the loop's own slot, ir_emit_name_load and ir_emit_name_store reach
     # that slot before they ever resolve a name, and outside the loop the
-    # name means whatever it meant before — a global included. collecting it
+    # name means whatever it meant before, a global included. collecting it
     # made a global read after the loop resolve to a local slot the ir never
     # declared.
     for child in node.children:
@@ -11945,7 +11935,7 @@ fn ir_emit_attach_dtor(struct_r: Int, raw_name: String):
 # string joined the list late. an optional over a string used to borrow, which
 # is safe for a payload some local keeps a count for and wrong for a fresh one:
 # nothing released the string a `List[String?]` element or a `String?` field
-# held, ~32 bytes per element. it is an rc kind like any other here — a release
+# held, ~32 bytes per element. it is an rc kind like any other here: a release
 # on a literal or a null is a no-op in the runtime, so the destructor is safe
 # on every shape a Some can hold.
 #
@@ -12008,7 +11998,7 @@ fn ir_emit_struct_walks(trace: Bool):
         if sname.index_of("[") >= 0:
             continue
         # boxed enums live in ir_struct_names too but their releasable slots
-        # are tagged payloads, not fields — the enum walk handles them.
+        # are tagged payloads, not fields; the enum walk handles them.
         if ir_boxed_enums.contains_key(sname):
             continue
         if not ir_struct_needs_dtor(sname):
@@ -12097,14 +12087,14 @@ fn ir_emit_generic_struct_instance_dtors():
 
 # the field name an instance destructor labels a slot with, falling back to the
 # slot number when the registry has no name for it. the label is documentation
-# only — the offset is what the release reads.
+# only; the offset is what the release reads.
 fn ir_generic_struct_field_label(base: String, index: Int) -> String:
     fname := ir_struct_field_name_at(base, index)
     if fname.len() > 0:
         return fname
     return "__f" + index.to_string()
 
-# true when a registered generic struct instance has a traceable field — the
+# true when a registered generic struct instance has a traceable field: the
 # per-instance answer to ir_struct_needs_tracer. weak fields are skipped like
 # everywhere else: they hold no strong count, so they are not ownership edges.
 fn ir_generic_struct_instance_needs_tracer(sym: String) -> Bool:
@@ -12142,7 +12132,7 @@ fn ir_emit_generic_struct_instance_tracers():
         ir_emit_zero_ret_endfunc()
 
 # the per-variant kinds of a registered generic instance, one entry per
-# variant in declaration order — the instance twin of ir_declared_variant_kinds.
+# variant in declaration order, the instance twin of ir_declared_variant_kinds.
 # unpacks the "-" a payload-free variant is stored as, so the list index a
 # variant sits at is still the tag its payloads release under.
 fn ir_generic_enum_variant_kinds(sym: String) -> List[String]:
@@ -12168,7 +12158,7 @@ fn ir_declared_variant_kinds(ename: String) -> List[String]:
     return out
 
 # one tag-aware walk body: switch on the variant tag, and under the variant
-# that matched release each rc payload slot — or, with `trace`, visit each
+# that matched release each rc payload slot, or, with `trace`, visit each
 # traceable one. shared by the declared enums and the generic instances,
 # which differ only in the kinds they are handed.
 fn ir_emit_enum_walk_body(symbol: String, variant_kinds: List[String], trace: Bool):
@@ -12278,7 +12268,7 @@ fn ir_emit_enum_eq_fns():
         ir_emit("brif " + same_r.to_string() + " " + true_l + " " + check_l)
         ir_emit_label(check_l)
         # a null on either side (identity above covered both-null) can never
-        # be equal, and dereferencing it for the tag would fault — a none
+        # be equal, and dereferencing it for the tag would fault: a none
         # optional's payload slot hands this helper a 0, and the widened
         # T? == T compare reads the slot without branching on the flag.
         zn_r := ir_reg()
@@ -12350,8 +12340,8 @@ fn ir_emit_enum_eq_fns():
         ir_emit("endfunc")
 
 # a global whose initializer is a bare literal that ir_emit_global_binding can
-# inline gets its value through the declaration; anything else — calls,
-# operators, interpolation, collection literals with elements — must run at
+# inline gets its value through the declaration; anything else (calls,
+# operators, interpolation, collection literals with elements) must run at
 # startup. only the literal kinds ir_emit_global_binding actually inlines (a
 # positive int, a string, a bool) count as inlined here. a float literal and a
 # negative/unary literal are NOT inlined there (the declaration would zero them),
@@ -12541,7 +12531,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
 # module-suffixed like ir_tuple_dtor_name so every module carries its own
 # copy for its own destructor copies. main's prelude calls the root
 # module's; the driver injects the imported modules' calls next to the
-# init-globals calls. always emitted — possibly empty — so that prelude
+# init-globals calls. always emitted (possibly empty) so that prelude
 # call never dangles.
 fn ir_cc_register_fn_name() -> String:
     return "__cc_register_tracers_m" + ir_module_count.to_string()
@@ -12633,7 +12623,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     # body that builds the tuple is emitted, and that includes specializations
     # and lambda bodies. these used to run before those two, so a tuple whose
     # shape appeared first inside a generic body or a lambda got no destructor
-    # and the program failed to compile — and whether it did depended on
+    # and the program failed to compile, and whether it did depended on
     # whether unrelated code elsewhere happened to register the same shape
     # first. the cascade helpers and the optional-over-tuple walks were always
     # here for this reason; the plain walks belong with them.
@@ -12719,7 +12709,7 @@ pub fn emit_ir(root_idx: Int) -> String:
     # body refers to
     _none_id := ir_str("none")
     # test names live on the test_decl node, not in a string literal the collector
-    # would see, so intern them here — before the table is emitted — for the test
+    # would see, so intern them here (before the table is emitted) for the test
     # main's per-test report line.
     if ir_emit_tests:
         _file_id := ir_str(ir_test_source_file)

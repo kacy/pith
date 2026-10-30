@@ -1,7 +1,7 @@
 # ir_struct_result_helpers.pith - struct result packing IR helpers
 
-from ir_builder import ir_emit, ir_reg
-from ir_metadata import ir_runtime_call_name
+from ir_builder import ir_emit, ir_reg, ir_zero_reg
+from ir_call_helpers import ir_emit_call1_raw
 from ir_struct_registry import ir_struct_base_name, ir_struct_needs_dtor
 
 # a struct built here is handed to the caller as an owned value, so it
@@ -18,14 +18,6 @@ fn ir_emit_attach_result_dtor(struct_r: Int, struct_kind: String):
     fr := ir_reg()
     ir_emit("funcref " + fr.to_string() + " __dtor_" + ir_struct_base_name(raw_name))
     ir_emit("call " + ir_reg().to_string() + " pith_struct_set_dtor void 2 " + struct_r.to_string() + " " + fr.to_string())
-
-fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
-    ir_emit("call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " 1 " + arg0.to_string())
-
-fn ir_zero_reg_raw() -> Int:
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " 0")
-    return r
 
 fn ir_emit_result_tuple_raw(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
     count_r := ir_reg()
@@ -47,11 +39,11 @@ fn ir_emit_result_tuple_raw(is_ok_r: Int, ok_r: Int, err_r: Int) -> Int:
 pub fn ir_emit_ok_result_tuple_raw(ok_r: Int) -> Int:
     one := ir_reg()
     ir_emit("iconst " + one.to_string() + " 1")
-    return ir_emit_result_tuple_raw(one, ok_r, ir_zero_reg_raw())
+    return ir_emit_result_tuple_raw(one, ok_r, ir_zero_reg())
 
 ## build an error result box around `err_r`, mirroring the ok variant.
 pub fn ir_emit_err_result_tuple_raw(err_r: Int) -> Int:
-    zero := ir_zero_reg_raw()
+    zero := ir_zero_reg()
     return ir_emit_result_tuple_raw(zero, zero, err_r)
 
 ## the success tail of a generated decode that returns through a temp:

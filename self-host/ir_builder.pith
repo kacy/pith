@@ -132,6 +132,16 @@ pub fn ir_reg() -> Int:
     ir_next_reg = ir_next_reg + 1
     return r
 
+# a fresh register holding the integer 0, for the many places an
+# emitter needs a literal zero as a register: an unused result slot, a
+# missing struct field default, the value an unsupported path falls back
+# to. every call emits its own `iconst`, so hold the register you get
+# rather than calling twice for the same zero.
+pub fn ir_zero_reg() -> Int:
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " 0")
+    return r
+
 ## label.
 pub fn ir_label() -> String:
     n := ir_next_label

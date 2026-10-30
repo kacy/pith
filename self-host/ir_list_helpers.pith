@@ -1,23 +1,8 @@
 # ir_list_helpers.pith - list method and higher-order list IR helpers
 
 from ir_builder import ir_emit, ir_reg, ir_label
-from ir_metadata import ir_runtime_call_name
+from ir_call_helpers import ir_emit_call_text_raw, ir_emit_call0_raw, ir_emit_call1_raw, ir_emit_call2_raw
 from ir_optionals import ir_emit_value_eq_for_tid
-
-fn ir_emit_call_text_raw(result_reg: Int, fname: String, ret_kind: String, arg_count: Int, arg_text: String):
-    mut call_line := "call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " " + arg_count.to_string()
-    if arg_text.len() > 0:
-        call_line = call_line + arg_text
-    ir_emit(call_line)
-
-fn ir_emit_call0_raw(result_reg: Int, fname: String, ret_kind: String):
-    ir_emit_call_text_raw(result_reg, fname, ret_kind, 0, "")
-
-fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
-    ir_emit_call_text_raw(result_reg, fname, ret_kind, 1, " " + arg0.to_string())
-
-fn ir_emit_call2_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int, arg1: Int):
-    ir_emit_call_text_raw(result_reg, fname, ret_kind, 2, " " + arg0.to_string() + " " + arg1.to_string())
 
 fn ir_emit_list_loop_step(idx_name: String, i_r: Int, loop_l: String):
     one_r := ir_reg()

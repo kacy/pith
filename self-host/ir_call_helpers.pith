@@ -69,6 +69,26 @@ pub fn ir_emit_call_text_with_state(result_reg: Int, fname: String, ret_type: St
         call_line = call_line + arg_text
     ir_emit(call_line)
 
+# the `_raw` call emitters: a call line for a runtime builtin, its name
+# mapped through the runtime name table unconditionally. the satellites
+# that only ever call builtins use these rather than ir_emit_call_text,
+# which consults the declaration registries so a user function of the
+# same name wins, and which they cannot import without a cycle.
+pub fn ir_emit_call_text_raw(result_reg: Int, fname: String, ret_kind: String, arg_count: Int, arg_text: String):
+    mut call_line := "call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " " + arg_count.to_string()
+    if arg_text.len() > 0:
+        call_line = call_line + arg_text
+    ir_emit(call_line)
+
+pub fn ir_emit_call0_raw(result_reg: Int, fname: String, ret_kind: String):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 0, "")
+
+pub fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 1, " " + arg0.to_string())
+
+pub fn ir_emit_call2_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int, arg1: Int):
+    ir_emit_call_text_raw(result_reg, fname, ret_kind, 2, " " + arg0.to_string() + " " + arg1.to_string())
+
 # the argument registers rendered as the tail of a call line. each one
 # is written with a leading space, so the result appends directly onto
 # a line that already ends with the argument count, and an empty list

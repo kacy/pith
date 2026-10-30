@@ -166,9 +166,7 @@ The key-taking sorts call the key function exactly once per element, in input
 order, before any comparison happens, and sort against the cached keys. That
 matters twice over. An expensive key, one that formats a string or hashes a
 field, is paid for n times instead of n log n. And a key function with a side
-effect now runs exactly n times: earlier versions called it once per element
-per pass over the remaining input, so an effect that looked like one per
-element was really O(n^2) of them.
+effect runs exactly n times.
 
 The comparator in `sorted_by` carries no such promise. It runs O(n log n) times
 and the exact count is not part of the contract. It must be a strict order,
@@ -245,7 +243,7 @@ Pith has two distinct shapes for "no value here". Pick by intent, not by mood:
   Examples: `fs.read`, `parse_port`, `tls.dial`.
 
 Rule of thumb: if the caller would write `if x == none: ...` more often than
-`!`, use `T?`. If they'd write `let v = x!` more often than `match`, use `T!`.
+`!`, use `T?`. If they'd write `v := x!` more often than `match`, use `T!`.
 Don't double-wrap (`T?!` or `T!?`) unless absence and failure are genuinely
 distinct outcomes — usually one or the other tells the whole story.
 
@@ -261,9 +259,9 @@ crash loudly, not flow through as a zero.
 Inside a `T!` function, `map[k]` and `list[i]` instead propagate the
 miss as an error, which the caller can `catch` or `unwrap_or`. So the
 same syntax means "assert" outside a Result context and "propagate"
-inside — no special operator required. (The propagated error currently
-arrives with an empty `.err` string; branch on `.is_err`, and supply
-your own message with an explicit `fail` when the caller needs one.)
+inside — no special operator required. (The propagated error carries a
+generic message, `index out of bounds`; supply your own with an explicit
+`fail` when the caller needs one.)
 
 ```pith
 fn config_value(cfg: Map[String, Int], key: String) -> Int!:
@@ -290,9 +288,6 @@ for line in lines:
         continue                       # skip the malformed row
 ```
 
-Before this form existed, that shape forced a helper function whose only job
-was to route the error — the block is that helper, inline.
-
 When you want to _observe_ the miss without crashing or propagating —
 distinguishing "not present" from "present with value 0" — reach for
 the `.get()` methods, which return `T?`:
@@ -309,8 +304,8 @@ letter := s.get(i)                               # String -> String?
 ```
 
 Prefer `.get(k).unwrap_or(d)` over `Map.get_default(k, d)`. Both work,
-but the composed form is more general (chains with `.map`, `.and_then`,
-etc.) and reads left-to-right.
+but the composed form reads left-to-right and is spelled the same on lists,
+maps and strings.
 
 `env.get(key)` returns `String?` — `Some(value)` when set (including
 empty string), `none` when unset.

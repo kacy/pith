@@ -14,7 +14,6 @@ import std.fs as fs
 import std.os.path as path
 from std.bytes import ByteBuffer
 
-GZIP_STORED_BLOCK_SIZE := 65535
 GZIP_FLAG_HEADER_CRC := 2
 GZIP_FLAG_EXTRA := 4
 GZIP_FLAG_NAME := 8
@@ -53,18 +52,14 @@ fn gzip_write_u8(out: ByteBuffer, value: Int) -> Int!:
         fail wrote.err.message
     return wrote.ok
 
-fn gzip_write_u16_le(out: ByteBuffer, value: Int) -> Int!:
-    wrote := binary.write_u16_le(out, value)
-    if wrote.is_err:
-        fail wrote.err.message
-    return wrote.ok
-
 fn gzip_write_u32_le(out: ByteBuffer, value: Int) -> Int!:
     wrote := binary.write_u32_le(out, value)
     if wrote.is_err:
         fail wrote.err.message
     return wrote.ok
 
+# the fixed 10-byte member header: magic 1f 8b, method 8 (deflate), no
+# flags, a zero mtime, no extra flags, and os 255 (unknown).
 fn gzip_write_header(out: ByteBuffer) -> Int!:
     mut total := gzip_write_u8(out, 31)!
     total = total + gzip_write_u8(out, 139)!
@@ -73,18 +68,6 @@ fn gzip_write_header(out: ByteBuffer) -> Int!:
     total = total + gzip_write_u32_le(out, 0)!
     total = total + gzip_write_u8(out, 0)!
     return total + gzip_write_u8(out, 255)!
-
-fn gzip_write_stored_block(out: ByteBuffer, is_final: Bool, data: Bytes) -> Int!:
-    mut total := 0
-    if is_final:
-        total = total + gzip_write_u8(out, 1)!
-    else:
-        total = total + gzip_write_u8(out, 0)!
-    total = total + gzip_write_u16_le(out, data.len())!
-    total = total + gzip_write_u16_le(out, GZIP_STORED_BLOCK_SIZE - data.len())!
-    if data.len() == 0:
-        return total
-    return total + out.write(data)!
 
 fn gzip_skip_zero_terminated(data: Bytes, pos: Int) -> Int!:
     mut cursor := pos

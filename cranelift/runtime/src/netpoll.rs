@@ -511,7 +511,7 @@ pub(crate) fn wait_io(
     let interest = if read { Interest::Read } else { Interest::Write };
     // a green task is always on a worker, so this is the poller of the worker
     // the task is running on: the one that will poll for it.
-    let Some(index) = green::worker_index() else {
+    let Some(index) = green::current_worker() else {
         return -1;
     };
     let poller = poller(index);
@@ -576,7 +576,7 @@ pub(crate) fn sleep_task(ms: i64, task: usize) {
     if ms <= 0 {
         return;
     }
-    let Some(index) = green::worker_index() else {
+    let Some(index) = green::current_worker() else {
         std::thread::sleep(Duration::from_millis(ms as u64));
         return;
     };

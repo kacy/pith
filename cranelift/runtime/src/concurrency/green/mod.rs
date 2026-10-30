@@ -82,7 +82,7 @@ use worker::*;
 
 pub use preempt::{pith_green_maybe_yield, PITH_PREEMPT_REQUESTED};
 pub use probe::{encode_probe, pith_green_cross_thread_probe};
-pub use stats::{note_channel_wake, C_CH_WAKE, C_PINNED};
+pub use stats::note_channel_wake;
 pub(crate) use wake::{park_current, take_handoff, wake, wake_pool, wake_with};
 
 /// the whole green runtime: the per-task sync blocks, the per-worker queues
@@ -182,9 +182,9 @@ thread_local! {
 //    compile to that shape, which is why the accessors below are ordinary
 //    inlinable functions and cost nothing on the hot path.
 //
-// 2. a cell whose *address* has to exist as a value — the lazily initialized
+// 2. a cell whose *address* has to exist as a value (the lazily initialized
 //    handle behind the pool slot, the `RefCell` maps `TLS_GLOBALS` and
-//    `MY_MUTATOR` — is touched only inside a `#[inline(never)]` function that
+//    `MY_MUTATOR`) is touched only inside a `#[inline(never)]` function that
 //    returns before anything can suspend. the optimizer may fold identical
 //    address computations within one function; it may not fold them across
 //    a call it cannot inline.
@@ -197,8 +197,8 @@ thread_local! {
 
 /// the id of the green task running on this worker thread, or `None` when
 /// no green task is active here (the main thread, a non-worker thread, or the
-/// os-thread backend — where nothing ever sets this). `channel.rs` uses it to
-/// choose between suspending the coroutine (green) and condvar-waiting (os).
+/// os-thread backend, where nothing ever sets this). every blocking primitive
+/// uses it to choose between parking the task and condvar-waiting.
 ///
 /// a task id is task-owned: reading it once at the top of a block site and
 /// carrying it across a park is right, and every block site does exactly that.
@@ -207,19 +207,13 @@ pub(crate) fn current_task() -> Option<TaskId> {
     CURRENT_TASK.with(|c| c.get())
 }
 
-/// the index of the worker this os thread is, or `None` off the pool. a
-/// worker index is thread-owned: it must not be carried across a park, and a
-/// caller that needs it after one calls this again.
+/// the index of the worker this os thread is, or `None` off the pool. the
+/// netpoller keys its per-worker pollers by it. a worker index is
+/// thread-owned: it must not be carried across a park, and a caller that
+/// needs it after one calls this again.
 #[inline]
-fn current_worker() -> Option<usize> {
+pub(crate) fn current_worker() -> Option<usize> {
     CURRENT_WORKER.with(|c| c.get())
-}
-
-/// the index of the worker this os thread is, for the netpoller, which keys
-/// its per-worker pollers by it. thread-owned, like `current_worker`.
-#[inline]
-pub(crate) fn worker_index() -> Option<usize> {
-    current_worker()
 }
 
 /// how many green workers the pool runs. builds the scheduler if needed, but
@@ -270,9 +264,9 @@ pub(crate) fn current_task_tls() -> Option<*mut TlsMap> {
     }
 }
 
-/// build (once) and return the scheduler struct. this only allocates the queues
-/// — it does NOT start worker threads (that would need a reentrant init, since
-/// workers call back into `scheduler()`). worker startup is a separate `Once`,
+/// build (once) and return the scheduler struct. this only allocates the
+/// queues. it does NOT start worker threads (that would need a reentrant init,
+/// since workers call back into `scheduler()`). worker startup is a separate `Once`,
 /// driven from the first green spawn. `available_parallelism` picks the worker
 /// count, with a floor of 1.
 fn scheduler() -> &'static Scheduler {
@@ -340,7 +334,7 @@ fn worker_count() -> usize {
 /// start the worker threads exactly once. called from the first green spawn, by
 /// which point `scheduler()` is initialized, so each worker can resolve the
 /// static safely inside its loop. also starts the preemption monitor (sysmon)
-/// thread, so the monitor exists exactly when — and only when — green workers do.
+/// thread, so the monitor exists exactly when green workers do.
 fn ensure_workers_started() {
     static WORKERS_STARTED: Once = Once::new();
     WORKERS_STARTED.call_once(|| {
@@ -383,8 +377,8 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             // publish this coroutine's yielder into the task's own sync block so
             // pith code running on this stack can suspend the task (via
-            // park_current). this runs once, on the first resume — the body's
-            // top does not run again after a suspend — and the pointer stays
+            // park_current). this runs once, on the first resume (the body's
+            // top does not run again after a suspend), and the pointer stays
             // valid for the whole life of the body, so once is enough.
             publish_yielder(yielder as *const TaskYielder);
             // SAFETY: closure_handle was non-zero at spawn and pith owns the

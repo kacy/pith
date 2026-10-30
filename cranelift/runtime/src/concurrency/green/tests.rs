@@ -48,7 +48,7 @@ fn a_displaced_slot_task_goes_to_the_back_of_the_fifo() {
     assert!(q.is_empty());
 }
 
-// a coroutine that returns a constant, driven straight through — no pith,
+// a coroutine that returns a constant, driven straight through: no pith,
 // no FFI. exercises the corosensei integration in isolation.
 #[test]
 fn coroutine_runs_to_completion() {
@@ -79,7 +79,7 @@ fn task_overrun_triggers_after_the_quantum() {
     assert!(!task_overrun(10, 3));
 }
 
-// off a green task (`current_task()` is None — the os-thread backend, main,
+// off a green task (`current_task()` is None: the os-thread backend, main,
 // or between tasks), the safe-point slow path must do nothing even with the
 // flag forced on. this is the invariant that makes emitting the check into
 // all code harmless off-green.
@@ -95,7 +95,7 @@ fn maybe_yield_is_noop_without_running_task() {
 }
 
 // full path: a green task that overruns its quantum hits a safe-point, parks,
-// and is re-enqueued onto its owner worker's pinned queue — then resumes there
+// and is re-enqueued onto its owner worker's pinned queue, then resumes there
 // and runs to completion. drives the real run_task/maybe_yield/park machinery
 // on the test thread (no worker threads started), pinning the task to worker 0.
 #[test]
@@ -185,7 +185,7 @@ fn returning(value: i64) -> TaskCoroutine {
 // panic surfaces exactly as a Rust panic unwinding out of the coroutine) must
 // NOT take the worker down with it. run_task's `catch_unwind` catches the
 // panic, marks the task done (so its awaiters unblock instead of hanging),
-// drops the dead coroutine, and returns normally — and the same worker goes on
+// drops the dead coroutine, and returns normally; the same worker then goes on
 // to run the next task. drives run_task directly on the test thread, standing
 // in for a worker, so a missing boundary would unwind this test and fail it.
 #[test]
@@ -316,7 +316,7 @@ fn scheduling_word_owner_round_trips() {
     );
 }
 
-// a wake against an id no task has ever had must be a harmless no-op — the
+// a wake against an id no task has ever had must be a harmless no-op: the
 // reactor can probe ids far beyond any real task (see netpoll.rs).
 #[test]
 fn wake_on_never_used_id_is_noop() {
@@ -330,7 +330,7 @@ const ARENA_BOUND_CHILD: &str = "PITH_GREEN_ARENA_BOUND";
 // arming a sync block past the end of the spine has to stop the process with
 // a diagnostic. it used to `panic!`, which on this path is far worse than a
 // crash: `ensure` runs on the spawn path, inside whatever task called spawn,
-// and `run_task` catches every panic a task raises — so the spawning task
+// and `run_task` catches every panic a task raises, so the spawning task
 // would die with `join.done` never set and its awaiters would block forever,
 // with nothing on stderr to say why.
 //

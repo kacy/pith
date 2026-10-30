@@ -16,7 +16,7 @@ use super::*;
 ///
 /// it is only ever set by the monitor thread, which runs only under the green
 /// backend. under the os-thread backend the monitor never starts, so the flag
-/// stays 0 and the inline safe-point branch is never taken — and even if it were,
+/// stays 0 and the inline safe-point branch is never taken. even if it were,
 /// `pith_green_maybe_yield` is a no-op off a green task (see there). that is what
 /// makes emitting the check into all code harmless off-green.
 #[no_mangle]
@@ -32,7 +32,7 @@ pub(super) static PREEMPT_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// how many monitor epochs a task may run before it is asked to yield. a task
 /// stamped with epoch `e` counts as overrun once the epoch reaches
 /// `e + QUANTUM_EPOCHS`, so with the ~10 ms monitor pass two epochs is a 10-20 ms
-/// slice — the same ballpark as go's 10 ms preemption quantum. small enough to
+/// slice, the same ballpark as go's 10 ms preemption quantum. small enough to
 /// keep a compute task from starving its peers, large enough that ordinary
 /// cooperative code (which yields far more often) never trips it.
 ///
@@ -76,7 +76,7 @@ pub(super) fn task_overrun(running_since: u64, now: u64) -> bool {
 pub extern "C" fn pith_green_maybe_yield() {
     // gate 0: a stop-the-world request from the cycle collector. checked before
     // the task gates so *any* thread frozen at a compiled safe-point parks for
-    // the collector, green task or not — the frame it holds is off-CPU for the
+    // the collector, green task or not: the frame it holds is off-CPU for the
     // whole park, never mutated. an accelerator for the worker-loop gate (which
     // alone is sufficient between tasks), not a replacement for it. one relaxed
     // load when the collector flag is off.
@@ -131,7 +131,7 @@ pub extern "C" fn pith_green_maybe_yield() {
 
 /// start the preemption monitor (sysmon) thread. it is the only thing that ever
 /// sets `PITH_PREEMPT_REQUESTED`, and it starts only here alongside the green
-/// workers — so under the os-thread backend it never runs and the flag stays 0.
+/// workers, so under the os-thread backend it never runs and the flag stays 0.
 pub(super) fn start_monitor() {
     if let Err(err) = std::thread::Builder::new()
         .name("pith-green-sysmon".to_string())
@@ -143,12 +143,13 @@ pub(super) fn start_monitor() {
 
 /// the monitor loop: every `MONITOR_INTERVAL`, bump the epoch and scan the
 /// workers. if any worker's running task has outrun its quantum, request a
-/// preemption; otherwise clear the request. it only ever reads/writes atomics —
-/// each worker's `running_task`/`running_since` and the global flag/epoch — and
-/// never touches a queue or a coroutine, so it cannot race the workers over
-/// shared structure. the request is coarse (one process-global flag): a set flag
-/// nudges *every* running task at its next back-edge, and each task's own
-/// `pith_green_maybe_yield` decides whether it is the one that must yield.
+/// preemption; otherwise clear the request. it only ever reads and writes
+/// atomics (each worker's `running_task`/`running_since` and the global
+/// flag/epoch) and never touches a queue or a coroutine, so it cannot race the
+/// workers over shared structure. the request is coarse (one process-global
+/// flag): a set flag nudges *every* running task at its next back-edge, and
+/// each task's own `pith_green_maybe_yield` decides whether it is the one that
+/// must yield.
 pub(super) fn monitor_loop() {
     let sched = scheduler();
     loop {

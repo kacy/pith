@@ -54,7 +54,7 @@ const fn platform_default() -> Backend {
 ///
 /// The off spellings are deliberately generous. `PITH_GREEN=0` is the escape
 /// hatch for anyone the linux default hurts, and someone reaching for it who
-/// writes `no` or `NO` must not silently get green instead — that is the one
+/// writes `no` or `NO` must not silently get green instead: that is the one
 /// misreading with a real cost. Values are trimmed and lowercased for the same
 /// reason.
 fn backend_from_env(value: Option<&str>) -> Backend {
@@ -91,8 +91,8 @@ pub(crate) unsafe fn spawn(closure_handle: i64) -> i64 {
 pub(crate) unsafe fn await_task(task_handle: i64) -> i64 {
     match backend() {
         Backend::OsThread => task::os_thread_await(task_handle),
-        // Stance (a): block the calling thread on the task's condvar until a
-        // worker completes it. Yielding the caller's coroutine instead is P2.
+        // an os-thread caller blocks on the task's condvar; a green task
+        // parks its coroutine instead (see `green_await`).
         Backend::Green => green::green_await(task_handle),
     }
 }

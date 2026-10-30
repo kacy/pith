@@ -38,7 +38,7 @@ impl PinnedQueue {
         }
         self.affinity_streak = 0;
         // with nothing queued there is no one to be fair to, so the slot still
-        // runs — the streak only ever costs a turn when someone is waiting.
+        // runs; the streak only ever costs a turn when someone is waiting.
         self.queue.pop_front().or_else(|| self.next.take())
     }
 

@@ -258,10 +258,11 @@ pub fn connect_tls(host: String, port: Int, user: String, password: String, data
     ssl.write(le_int(CAPS_BASE + CAP_SSL, 4)) catch 0
     ssl.write(le_int(16777216, 4)) catch 0
     ssl.write_byte(45) catch 0
-    mut z := 0
-    while z < 23:
+    # the 23 reserved filler bytes of a handshake response, all zero.
+    mut reserved := 0
+    while reserved < 23:
         ssl.write_byte(0) catch 0
-        z = z + 1
+        reserved = reserved + 1
     sent := conn.send_packet(1, ssl.bytes())
     if sent.is_err:
         conn.close()
@@ -300,10 +301,11 @@ impl Conn:
         out.write(le_int(caps, 4)) catch 0
         out.write(le_int(16777216, 4)) catch 0
         out.write_byte(45) catch 0
-        mut z := 0
-        while z < 23:
+        # the 23 reserved filler bytes of a handshake response, all zero.
+        mut reserved := 0
+        while reserved < 23:
             out.write_byte(0) catch 0
-            z = z + 1
+            reserved = reserved + 1
         out.write(cstring_bytes(user)) catch 0
         out.write_byte(bytes.len(scramble)) catch 0
         out.write(scramble) catch 0
@@ -706,15 +708,16 @@ fn run_stmt(conn: Conn, stmt: Stmt, params: List[String]) -> BinaryResult!:
         bitmap := bytes.slice(pkt, r.pos, r.pos + null_bytes)
         r.skip(null_bytes)
         mut values: List[sql.Value] := []
-        mut k := 0
-        while k < column_count:
-            slot := k + 2
+        # the binary row's null bitmap starts at bit 2, so column i is bit i + 2.
+        mut column := 0
+        while column < column_count:
+            slot := column + 2
             flag := bits.band(bits.shr(bytes.get(bitmap, slot / 8), slot % 8), 1)
             if flag == 1:
                 values.push(sql.null_value())
             else:
-                values.push(decode_binary(r, types[k])!)
-            k = k + 1
+                values.push(decode_binary(r, types[column])!)
+            column = column + 1
         rows.push(sql.row(values, names))
 
 # run a prepared statement, binding `params`, and collect its rows.

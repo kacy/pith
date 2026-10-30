@@ -393,11 +393,11 @@ fn run_from(re: Regex, input: String, start: Int) -> List[Int]:
         mut code := 0 - 1
         if pos < n:
             code = ord(input[pos])
-        mut t := 0
+        mut thread_index := 0
         mut matched_this_round := false
-        while t < cur_pcs.len() and not matched_this_round:
-            inst := re.insts[cur_pcs[t]]
-            slots := cur_slots[t]
+        while thread_index < cur_pcs.len() and not matched_this_round:
+            inst := re.insts[cur_pcs[thread_index]]
+            slots := cur_slots[thread_index]
             if inst.op == OP_MATCH:
                 # highest-priority thread that matched at this length;
                 # later threads are lower priority, stop scanning them
@@ -405,14 +405,14 @@ fn run_from(re: Regex, input: String, start: Int) -> List[Int]:
                 matched_this_round = true
             elif inst.op == OP_CHAR:
                 if code == inst.a:
-                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[t] + 1, slots, pos + 1, n)
+                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[thread_index] + 1, slots, pos + 1, n)
             elif inst.op == OP_ANY:
                 if code >= 0 and code != 10:
-                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[t] + 1, slots, pos + 1, n)
+                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[thread_index] + 1, slots, pos + 1, n)
             elif inst.op == OP_CLASS:
                 if code >= 0 and class_matches(re.classes[inst.a], code):
-                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[t] + 1, slots, pos + 1, n)
-            t = t + 1
+                    add_thread(re, next_pcs, next_slots, next_seen, cur_pcs[thread_index] + 1, slots, pos + 1, n)
+            thread_index = thread_index + 1
         cur_pcs = next_pcs
         cur_slots = next_slots
         pos = pos + 1

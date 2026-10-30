@@ -1,0 +1,12 @@
+# a global in the main file is built after the globals of the modules it
+# imports, so it can call into them: std.checksum builds its crc table in a
+# global, and `early` reads it.
+import std.checksum as checksum
+
+early := checksum.crc32(bytes_from_string_utf8("123456789"))
+label := "crc " + early.to_string()
+
+fn main():
+    print(early.to_string())
+    print(label)
+    print(checksum.crc32(bytes_from_string_utf8("hello")).to_string())

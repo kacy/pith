@@ -28,7 +28,7 @@
 # ("int", "string", "map_str_val", ...) that pick runtime calls and
 # retain/release behavior. ir_type_from_tid and ir_retkind translate.
 #
-# a function compiles in one pass: ir_emit_fn resets the per-function
+# a function compiles in one pass: ir_func resets the per-function
 # state, emits the header and parameters, walks the body once
 # (ir_block -> ir_stmt -> ir_expr), then closes with cleanup and a
 # default return. deferred lambda bodies emit after the function that
@@ -52,7 +52,7 @@ from ir_decode_emit import ir_json_decode_spec_from_decl, ir_json_intern_nested_
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg, ir_kinded_code, ir_kinded_code_kind, ir_kinded_code_count, ir_kinded_tag_slot, ir_kinded_release_slot, ir_kinded_rebind
-from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_active_generic_decl_idx, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_handle_decode_callee, ir_declared_callable_return_type, ir_emit_result_ok_field_typed, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
+from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_handle_decode_callee, ir_declared_callable_return_type, ir_emit_result_ok_field_typed, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_drop_symbols, ir_struct_drop_symbol, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_zero_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds, ir_kinded_rc_binds, ir_kinded_release_symbol, ir_kinded_release_used
 # shared helpers: ast shapes, captures, results, optionals, literals
@@ -3086,6 +3086,10 @@ fn ir_register_struct_layout(name: String, field_names: List[String], field_type
         ir_local_struct_names.push(name)
     ir_emit("struct " + name + " " + field_names.join(" "))
 
+# substitute a type-name string using the active impl substitution map. if the
+# name is one of the struct's generic parameters (ir_current_impl_subst_params)
+# the matching concrete type name is returned; otherwise the input comes back
+# unchanged. used when emitting specialized impl method bodies.
 fn ir_substitute_type_name(name: String) -> String:
     mut i := 0
     while i < ir_current_impl_subst_params.len():
@@ -6160,6 +6164,9 @@ fn ir_enum_max_payload_count(enum_name: String) -> Int:
                     max_count = count
     return max_count
 
+# allocate a boxed enum value: slot 0 is the variant tag, slots 1..n hold
+# the payload. every box of the enum gets room for its largest variant, and
+# payload_count (this variant's own arity) only matters if it is larger.
 fn ir_emit_variant_alloc(enum_name: String, variant_key: String, payload_count: Int, tid: Int) -> Int:
     mut slots := ir_enum_max_payload_count(enum_name)
     if payload_count > slots:
@@ -11227,14 +11234,12 @@ fn ir_emit_generic_specialization(key: String):
     saved_params := ir_active_generic_params
     saved_types := ir_active_generic_concrete_types
     saved_module_path := ir_active_generic_module_path
-    saved_decl_idx := ir_active_generic_decl_idx
     saved_fn_bindings := ir_active_fn_bindings
     ir_active_fn_bindings = {}
     if owner_type.len() == 0:
         ir_active_fn_bindings = ir_fn_bindings_by_param(key, decl_idx)
     ir_active_generic_params = generic_params
     ir_active_generic_concrete_types = concrete_types
-    ir_active_generic_decl_idx = decl_idx
     if owner_count > 0:
         ir_current_impl_subst_params = owner_params
         ir_current_impl_subst_args = owner_kinds
@@ -11301,7 +11306,6 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_params = saved_params
     ir_active_generic_concrete_types = saved_types
     ir_active_generic_module_path = saved_module_path
-    ir_active_generic_decl_idx = saved_decl_idx
     ir_active_fn_bindings = saved_fn_bindings
     ir_current_impl_type = saved_impl_type
     ir_current_impl_subst_params = saved_impl_params

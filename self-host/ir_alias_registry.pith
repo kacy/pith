@@ -65,19 +65,9 @@ pub fn ir_record_global_type(name: String, global_type: String):
     elif global_type == "bool":
         ir_global_bool_names = ir_push_string(ir_global_bool_names, name)
 
-# substitute a type-name string using the active impl substitution map. if the
-# name matches one of the struct's generic parameters (in ir_current_impl_subst_params)
-# the corresponding concrete type name is returned; otherwise the input is
-# returned unchanged. used when emitting specialized impl method bodies.
-
 pub mut ir_active_generic_params: List[String] := []
 pub mut ir_active_generic_concrete_types: List[String] := []
 pub mut ir_active_generic_module_path := ""
-# the declaration node of the generic function whose specialized body is
-# being emitted, or -1 outside one. a nested generic call in that body has
-# no checked arg types to infer from, so the caller's own param type nodes
-# are the fallback (see ir_fill_unknown_concretes_from_caller).
-pub mut ir_active_generic_decl_idx := 0 - 1
 
 ## resolve a type annotation node to an emission kind, honoring
 ## any active generic substitution.
@@ -245,9 +235,6 @@ pub fn ir_struct_field_tid_at(struct_name: String, field_index: Int, fallback_ti
 ## emit a field read on a named struct, alias-aware.
 pub fn ir_emit_named_field_access(result_reg: Int, obj_r: Int, lookup_key: String, field_name: String, field_kind_override: String):
     ir_emit_named_field_access_with_state(result_reg, obj_r, lookup_key, field_name, field_kind_override, ir_struct_field_index_lookup, ir_struct_field_lookup, ir_type_aliases, ir_struct_names)
-
-# allocate a boxed enum value: slot 0 is the variant tag, slots 1..n hold
-# the payload. payload_count is this variant's own arity.
 
 ## substitute generic parameters in a type name.
 pub fn ir_specialize_type_name(name: String, generic_params: List[String], concrete_types: List[String]) -> String:

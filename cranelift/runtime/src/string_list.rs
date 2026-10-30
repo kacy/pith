@@ -279,7 +279,7 @@ pub unsafe extern "C" fn pith_format_pad(handle: i64, width: i64, align: i64, fi
     let text = if handle == 0 {
         String::new()
     } else {
-        std::ffi::CStr::from_ptr(handle as *const i8)
+        std::ffi::CStr::from_ptr(handle as *const libc::c_char)
             .to_string_lossy()
             .into_owned()
     };

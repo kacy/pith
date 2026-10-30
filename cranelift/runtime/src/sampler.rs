@@ -19,7 +19,8 @@ static OUT_PATH: OnceLock<std::ffi::OsString> = OnceLock::new();
 // runs before main, the way a C constructor would, so the first sample can
 // land in the module initializers
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static START: extern "C" fn() = start;
 
 extern "C" fn start() {
@@ -69,17 +70,31 @@ extern "C" fn on_sample(_sig: libc::c_int, _info: *mut libc::siginfo_t, context:
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe fn interrupted_pc(context: *const libc::ucontext_t) -> u64 {
     (*context).uc_mcontext.gregs[libc::REG_RIP as usize] as u64
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 unsafe fn interrupted_pc(context: *const libc::ucontext_t) -> u64 {
     (*context).uc_mcontext.pc
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+// on macos uc_mcontext is a pointer to the saved thread state
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+unsafe fn interrupted_pc(context: *const libc::ucontext_t) -> u64 {
+    (*(*context).uc_mcontext).__ss.__rip
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+unsafe fn interrupted_pc(context: *const libc::ucontext_t) -> u64 {
+    (*(*context).uc_mcontext).__ss.__pc
+}
+
+#[cfg(not(any(
+    all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
+    all(target_os = "macos", any(target_arch = "x86_64", target_arch = "aarch64"))
+)))]
 unsafe fn interrupted_pc(_context: *const libc::ucontext_t) -> u64 {
     0
 }

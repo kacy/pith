@@ -33,7 +33,8 @@ static SWITCHES: AtomicU8 = AtomicU8::new(0);
 // runs before main, the way a C constructor would, so the first allocation
 // already sees the settled byte
 #[used]
-#[link_section = ".init_array"]
+#[cfg_attr(not(target_os = "macos"), link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
 static SETTLE: extern "C" fn() = settle;
 
 extern "C" fn settle() {

@@ -42,10 +42,7 @@ fn run_cli() {
 
     match args[1].as_str() {
         "build" => {
-            if args.len() < 3 {
-                eprintln!("Error: build requires a file argument");
-                std::process::exit(1);
-            }
+            require_file_arg(&args, "build");
             build_file(&args[2]);
         }
         "build-ir" => {
@@ -56,17 +53,11 @@ fn run_cli() {
             build_ir_file(&args[2], &args[3]);
         }
         "run" => {
-            if args.len() < 3 {
-                eprintln!("Error: run requires a file argument");
-                std::process::exit(1);
-            }
+            require_file_arg(&args, "run");
             run_file(&args[2]);
         }
         "test" => {
-            if args.len() < 3 {
-                eprintln!("Error: test requires a file argument");
-                std::process::exit(1);
-            }
+            require_file_arg(&args, "test");
             // `--filter <substr>` (or `--filter=<substr>`) runs only the tests
             // whose name contains the substring; `--tag`/`--exclude-tag` select
             // and exclude by the labels a `test` block carries, and repeat to
@@ -111,26 +102,17 @@ fn run_cli() {
             test_file(&args[2]);
         }
         "check" => {
-            if args.len() < 3 {
-                eprintln!("Error: check requires a file argument");
-                std::process::exit(1);
-            }
+            require_file_arg(&args, "check");
             // forward every argument, not just args[2]: `check --json <file>`
             // used to hand "--json" to the frontend as the path.
             delegate_to_frontend(&args[1..]);
         }
         "parse" => {
-            if args.len() < 3 {
-                eprintln!("Error: parse requires a file argument");
-                std::process::exit(1);
-            }
+            require_file_arg(&args, "parse");
             parse_file(&args[2]);
         }
         "lex" => {
-            if args.len() < 3 {
-                eprintln!("Error: lex requires a file argument");
-                std::process::exit(1);
-            }
+            require_file_arg(&args, "lex");
             lex_file(&args[2]);
         }
         "version" => {
@@ -148,6 +130,14 @@ fn run_cli() {
             print_usage();
             std::process::exit(1);
         }
+    }
+}
+
+/// Exit with a usage error unless `args` names a file after the command.
+fn require_file_arg(args: &[String], command: &str) {
+    if args.len() < 3 {
+        eprintln!("Error: {} requires a file argument", command);
+        std::process::exit(1);
     }
 }
 
@@ -225,9 +215,7 @@ fn get_ast_from_compiler(path: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to run compiler: {}", e))?;
 
     if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{}{}", stdout, stderr);
+        let combined = combined_output(&output);
         if combined.trim().is_empty() {
             return Err("Parse error".to_string());
         }
@@ -443,8 +431,6 @@ fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
 }
 
 fn build_file(path: &str) {
-    use pith_codegen::linker::build_executable;
-
     let (bytes, func_count) = match compile_to_object(path, false) {
         Ok(result) => result,
         Err(e) => {
@@ -456,11 +442,18 @@ fn build_file(path: &str) {
     eprintln!("Compiled {} functions", func_count);
     let obj_path = path.replace(".pith", ".o");
     let exe_path = path.replace(".pith", "");
-    if let Err(e) = fs::write(&obj_path, &bytes) {
+    write_and_link(&bytes, &obj_path, &exe_path);
+}
+
+/// Write an object file and link it into `exe_path`, exiting on failure.
+fn write_and_link(bytes: &[u8], obj_path: &str, exe_path: &str) {
+    use pith_codegen::linker::build_executable;
+
+    if let Err(e) = fs::write(obj_path, bytes) {
         eprintln!("Error writing object: {}", e);
         std::process::exit(1);
     }
-    match build_executable(&obj_path, &exe_path) {
+    match build_executable(obj_path, exe_path) {
         Ok(_) => eprintln!("Created: {}", exe_path),
         Err(e) => {
             eprintln!("Error linking: {}", e);
@@ -482,8 +475,6 @@ fn unique_run_artifact_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 /// Compile a combined IR text file straight to a native binary. Pairs with
 /// PITH_DUMP_IR (which writes such a file) and backs the bootstrap seed.
 fn build_ir_file(ir_path: &str, exe_path: &str) {
-    use pith_codegen::linker::build_executable;
-
     let ir_text = match fs::read_to_string(ir_path) {
         Ok(text) => text,
         Err(e) => {
@@ -500,67 +491,24 @@ fn build_ir_file(ir_path: &str, exe_path: &str) {
     };
 
     eprintln!("Compiled {} functions", func_count);
-    let obj_path = format!("{}.o", exe_path);
-    if let Err(e) = fs::write(&obj_path, &bytes) {
-        eprintln!("Error writing object: {}", e);
-        std::process::exit(1);
-    }
-    match build_executable(&obj_path, exe_path) {
-        Ok(_) => eprintln!("Created: {}", exe_path),
-        Err(e) => {
-            eprintln!("Error linking: {}", e);
-            std::process::exit(1);
-        }
-    }
+    write_and_link(&bytes, &format!("{}.o", exe_path), exe_path);
 }
 
 fn run_file(path: &str) {
-    use pith_codegen::linker::build_executable;
-
-    let (bytes, _) = match compile_to_object(path, false) {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!("{}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let (obj_path, exe_path) = unique_run_artifact_paths();
-    let keep_artifacts = std::env::var("PITH_KEEP_RUN_ARTIFACTS").is_ok();
-    if let Err(e) = fs::write(&obj_path, &bytes) {
-        eprintln!("Error writing object: {}", e);
-        std::process::exit(1);
-    }
-    match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
-        Ok(_) => {
-            let status = Command::new(&exe_path).status();
-            if !keep_artifacts {
-                let _ = fs::remove_file(&obj_path);
-                let _ = fs::remove_file(&exe_path);
-            }
-            match status {
-                Ok(s) => {
-                    if !s.success() {
-                        std::process::exit(s.code().unwrap_or(1));
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Error running {}: {}", exe_path.display(), e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!("Error linking {}: {}", exe_path.display(), e);
-            std::process::exit(1);
-        }
-    }
+    compile_and_run(path, false);
 }
 
 fn test_file(path: &str) {
+    compile_and_run(path, true);
+}
+
+/// Compile `path` (with its tests when `emit_tests`) to a temporary binary,
+/// run it, and exit with its status when it fails. The binary and object
+/// are removed afterwards unless PITH_KEEP_RUN_ARTIFACTS is set.
+fn compile_and_run(path: &str, emit_tests: bool) {
     use pith_codegen::linker::build_executable;
 
-    let (bytes, _) = match compile_to_object(path, true) {
+    let (bytes, _) = match compile_to_object(path, emit_tests) {
         Ok(result) => result,
         Err(e) => {
             eprintln!("{}", e);
@@ -597,58 +545,6 @@ fn test_file(path: &str) {
             eprintln!("Error linking {}: {}", exe_path.display(), e);
             std::process::exit(1);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{ir_driver_older_than_seed, validate_combined_ir_contract};
-    use std::fs;
-    use std::time::{Duration, SystemTime};
-
-    #[test]
-    fn accepts_explicit_call_and_field_contracts() {
-        let ir = "func main 0 unknown\ncall 1 greet string 1 0\nfield 2 1 0 Point name\n";
-        assert!(validate_combined_ir_contract(ir).is_ok());
-    }
-
-    #[test]
-    fn rejects_legacy_call_without_retkind() {
-        let ir = "call 1 greet 1 0\n";
-        assert!(validate_combined_ir_contract(ir).is_err());
-    }
-
-    #[test]
-    fn rejects_field_without_offset() {
-        let ir = "field 2 1 Point name\n";
-        assert!(validate_combined_ir_contract(ir).is_err());
-    }
-
-    #[test]
-    fn a_driver_older_than_its_seed_is_stale() {
-        let dir = std::env::temp_dir().join(format!("pith-seed-age-{}", std::process::id()));
-        fs::create_dir_all(dir.join("bootstrap")).unwrap();
-        let seed = dir.join("bootstrap/ir_driver.ir");
-        let driver = dir.join("ir_driver");
-        fs::write(&seed, "").unwrap();
-        fs::write(&driver, "").unwrap();
-        let set = |path: &std::path::Path, secs: u64| {
-            let file = fs::File::options().write(true).open(path).unwrap();
-            file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
-                .unwrap();
-        };
-        let (d, b) = (dir.to_str().unwrap(), driver.to_str().unwrap());
-
-        set(&seed, 2_000);
-        set(&driver, 1_000);
-        assert!(ir_driver_older_than_seed(d, b));
-
-        set(&driver, 3_000);
-        assert!(!ir_driver_older_than_seed(d, b));
-
-        fs::remove_file(&seed).unwrap();
-        assert!(!ir_driver_older_than_seed(d, b));
-        fs::remove_dir_all(&dir).unwrap();
     }
 }
 
@@ -705,5 +601,57 @@ fn delegate_to_frontend(args: &[String]) {
 
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ir_driver_older_than_seed, validate_combined_ir_contract};
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn accepts_explicit_call_and_field_contracts() {
+        let ir = "func main 0 unknown\ncall 1 greet string 1 0\nfield 2 1 0 Point name\n";
+        assert!(validate_combined_ir_contract(ir).is_ok());
+    }
+
+    #[test]
+    fn rejects_legacy_call_without_retkind() {
+        let ir = "call 1 greet 1 0\n";
+        assert!(validate_combined_ir_contract(ir).is_err());
+    }
+
+    #[test]
+    fn rejects_field_without_offset() {
+        let ir = "field 2 1 Point name\n";
+        assert!(validate_combined_ir_contract(ir).is_err());
+    }
+
+    #[test]
+    fn a_driver_older_than_its_seed_is_stale() {
+        let dir = std::env::temp_dir().join(format!("pith-seed-age-{}", std::process::id()));
+        fs::create_dir_all(dir.join("bootstrap")).unwrap();
+        let seed = dir.join("bootstrap/ir_driver.ir");
+        let driver = dir.join("ir_driver");
+        fs::write(&seed, "").unwrap();
+        fs::write(&driver, "").unwrap();
+        let set = |path: &std::path::Path, secs: u64| {
+            let file = fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(secs))
+                .unwrap();
+        };
+        let (d, b) = (dir.to_str().unwrap(), driver.to_str().unwrap());
+
+        set(&seed, 2_000);
+        set(&driver, 1_000);
+        assert!(ir_driver_older_than_seed(d, b));
+
+        set(&driver, 3_000);
+        assert!(!ir_driver_older_than_seed(d, b));
+
+        fs::remove_file(&seed).unwrap();
+        assert!(!ir_driver_older_than_seed(d, b));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

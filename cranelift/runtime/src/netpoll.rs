@@ -1,11 +1,12 @@
 //! epoll netpoller for the green-thread backend.
 //!
-//! under `PITH_GREEN` a small pool of worker OS threads runs many pith tasks as
-//! stackful coroutines (see `concurrency::green`). every blocking coordination op
-//! — channels, mutex, waitgroup, semaphore, await — already yields the coroutine
-//! back to its worker instead of parking the worker OS thread. socket I/O was the
-//! last hard park: a green task that read from a socket with no data ready blocked
-//! its whole worker on `poll`, starving every other task pinned to that worker.
+//! under the green backend a small pool of worker OS threads runs many pith
+//! tasks as stackful coroutines (see `concurrency::green`). every blocking
+//! coordination op (channels, mutex, waitgroup, semaphore, await) yields the
+//! coroutine back to its worker instead of parking the worker OS thread.
+//! without a reactor, socket I/O would be the one hard park: a green task that
+//! read from a socket with no data ready would block its whole worker on
+//! `poll`, starving every other task queued on that worker.
 //!
 //! this module closes that gap. every green worker owns a poller: its own epoll
 //! instance, eventfd and waiter registry. when a socket would block, the task
@@ -13,8 +14,8 @@
 //! and suspends its coroutine; the worker runs other tasks. the worker polls its
 //! own epoll when it runs out of work, and parks *in* `epoll_wait`, so readiness
 //! on one of its sockets wakes it directly. polling never resumes a coroutine:
-//! it only calls `green::wake(task)`, which re-enqueues the task onto its owner
-//! worker's pinned queue, so green's pinning discipline holds unchanged.
+//! it only calls `green::wake(task)`, which re-enqueues the task through the
+//! scheduler's ordinary wake path.
 //!
 //! this replaced one shared epoll instance, one registry lock and one dedicated
 //! reactor thread. every wait from every worker took that lock and made its
@@ -56,7 +57,7 @@
 //! share:
 //!
 //! - `waiters`: for each `(fd, interest)`, the list of tasks blocked on it.
-//!   multiple tasks may wait on one fd — e.g. several accept loops on a listener —
+//!   multiple tasks may wait on one fd (e.g. several accept loops on a listener),
 //!   so on readiness the poller wakes *all* waiters for that (fd, interest) and
 //!   clears the list; each retries its syscall, one wins, the losers re-block.
 //!   tasks on different workers that wait on one fd register it in each of their
@@ -87,16 +88,16 @@
 //! ## lock discipline
 //!
 //! the only lock here is each poller's `Inner` mutex. it is never held across
-//! `epoll_wait` (which blocks) and never across `green::wake` (which takes green's
-//! own slab/queue locks). a worker registering a waiter takes its poller's lock,
+//! `epoll_wait` (which blocks) and never across `green::wake` (which takes a
+//! green run-queue lock). a worker registering a waiter takes its poller's lock,
 //! adds the fd to epoll under it if this is the fd's first wait, drops it, then
 //! parks. a poll takes it only to drain fired events and expired deadlines into
 //! a local list, drops it, then wakes. so this lock never nests inside green's
 //! locks nor they inside it, so no cross-module lock cycle is possible.
 
 use crate::concurrency::green;
-use std::cmp::Ordering;
 use crate::int_hash::IntMap;
+use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering as AtomicOrdering};
@@ -139,14 +140,31 @@ const EVENTFD_TOKEN: u64 = u64::MAX;
 
 /// one blocked task waiting on an (fd, interest).
 struct Waiter {
-    /// green slab id, passed straight to `green::wake`.
+    /// green task id, passed straight to `green::wake`.
     task: usize,
     /// unique registration id, used to match a heap deadline entry back to the
     /// exact waiter (a stale heap entry whose waiter already fired finds nothing).
     seq: u64,
-    /// shared result cell; the poller writes `READY` or `TIMED_OUT` here before
-    /// waking the task, which reads it back after `park_current` returns.
+    /// shared result cell; the poller writes `READY`, `TIMED_OUT` or `CLOSED`
+    /// here before waking the task, which reads it back after `park_current`
+    /// returns.
     outcome: Arc<AtomicI32>,
+}
+
+impl Waiter {
+    /// flip the outcome from `PENDING` to `result` and queue the task to wake.
+    /// a waiter another path already resolved is left alone, so a readiness,
+    /// a timeout and a close racing on one waiter resolve it exactly once.
+    #[inline]
+    fn resolve(&self, result: i32, to_wake: &mut Vec<usize>) {
+        if self
+            .outcome
+            .compare_exchange(PENDING, result, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
+            .is_ok()
+        {
+            to_wake.push(self.task);
+        }
+    }
 }
 
 /// what a heap entry resolves when it expires: an fd wait that carried a
@@ -210,7 +228,7 @@ struct Inner {
     deadlines: BinaryHeap<std::cmp::Reverse<Deadline>>,
     /// sleeping tasks, keyed by the seq of their heap entry. a timer has no
     /// (fd, interest) to key on, and giving it its own map keeps it out of
-    /// `waiters` — where everything is fd-shaped — entirely.
+    /// `waiters`, where everything is fd-shaped.
     timers: IntMap<u64, Waiter>,
     next_seq: u64,
     /// the heap size at which the next push first drops the entries whose
@@ -273,6 +291,13 @@ impl Inner {
     fn publish(&self, busy: &AtomicBool) {
         let any = self.waiting > 0 || !self.deadlines.is_empty() || !self.timers.is_empty();
         busy.store(any, AtomicOrdering::SeqCst);
+    }
+
+    /// a fresh registration id for a waiter and its heap entry.
+    fn take_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
     }
 
     /// add a waiter for `(fd, interest)`.
@@ -377,7 +402,7 @@ impl Poller {
 /// the kernel still holds an entry for this fd that the registry lost track
 /// of, so it is rewritten with a `MOD`. any other failure leaves the fd out of
 /// `fds`, so the next wait tries again; this one then ends only by its
-/// deadline or a close, as it always has.
+/// deadline or a close.
 fn register_io(
     poller: &Poller,
     inner: &mut Inner,
@@ -405,8 +430,7 @@ fn register_io(
             }
         }
     }
-    let seq = inner.next_seq;
-    inner.next_seq += 1;
+    let seq = inner.take_seq();
     inner.push_waiter(
         fd,
         interest,
@@ -471,7 +495,7 @@ pub(crate) fn notify(index: usize) {
         WAIT_EPOLL => {
             let one: u64 = 1;
             // SAFETY: writing 8 bytes to our own eventfd; EAGAIN (counter
-            // saturated) is fine — the worker will still see a pending
+            // saturated) is fine, since the worker will still see a pending
             // readiness and wake.
             unsafe {
                 libc::write(
@@ -488,7 +512,7 @@ pub(crate) fn notify(index: usize) {
 /// block the current green task until `fd` is ready for `read`/write, it times
 /// out, or an error is detected. returns the tri-state readiness contract:
 /// `1` ready, `0` timed out, `-1` error. must be called only from inside a green
-/// task (the caller checks `green::current_task`); `task` is that task's slab id.
+/// task (the caller checks `green::current_task`); `task` is that task's id.
 ///
 /// `timeout_ms < 0` means wait forever (no deadline registered).
 ///
@@ -497,7 +521,7 @@ pub(crate) fn notify(index: usize) {
 /// gap in the close teardown: a close that lands before the registration runs
 /// `on_close` on an empty list and would leave this task parked with nobody to
 /// wake it. a closer marks the handle dead before it calls `on_close`, and the
-/// waiter registers before it asks, so one of the two always sees the other —
+/// waiter registers before it asks, so one of the two always sees the other:
 /// either `on_close` finds the waiter, or the waiter finds the handle dead and
 /// resolves itself here. a raw fd, which nothing closes underneath, answers
 /// true.
@@ -537,8 +561,8 @@ pub(crate) fn wait_io(
         return if live() { 1 } else { -1 };
     }
     if !live() {
-        // every waiter on this fd waits on the same dead handle — the number
-        // cannot have moved on while this call holds it — so the ordinary close
+        // every waiter on this fd waits on the same dead handle (the number
+        // cannot have moved on while this call holds it), so the ordinary close
         // teardown resolves them all, this one included; the wake it queues
         // for us is caught by the park below.
         on_close(fd);
@@ -566,11 +590,11 @@ pub(crate) fn wait_io(
 
 /// park the current green task for `ms` milliseconds without holding its worker.
 /// this is `wait_io` minus the fd: register a deadline on this worker's poller
-/// and suspend; the deadline sweep wakes us. must be
-/// called only from inside a green task (the caller checks
-/// `green::current_task`); `task` is that task's slab id.
+/// and suspend; the deadline sweep wakes us. must be called only from inside a
+/// green task (the caller checks `green::current_task`); `task` is that task's
+/// id.
 ///
-/// a zero or negative duration returns immediately — there is nothing to wait
+/// a zero or negative duration returns immediately: there is nothing to wait
 /// for, so nothing is registered.
 pub(crate) fn sleep_task(ms: i64, task: usize) {
     if ms <= 0 {
@@ -584,8 +608,8 @@ pub(crate) fn sleep_task(ms: i64, task: usize) {
     let at = Instant::now() + Duration::from_millis(ms as u64);
     register_timer(poller(index), at, task, &outcome);
 
-    // park until the sweep marks us done. unlike `wait_io` — where a spurious
-    // wake is safe because the task re-runs its syscall — a sleep has no
+    // park until the sweep marks us done. unlike `wait_io`, where a spurious
+    // wake is safe because the task re-runs its syscall, a sleep has no
     // syscall to act as the source of truth, so an early resume must go back
     // to sleep: our timer entry is still registered and the sweep will wake us
     // again. once the outcome is terminal the entry is gone and we return.
@@ -599,9 +623,7 @@ pub(crate) fn sleep_task(ms: i64, task: usize) {
 /// under the lock.
 fn register_timer(poller: &Poller, at: Instant, task: usize, outcome: &Arc<AtomicI32>) {
     let mut inner = lock_inner(poller);
-    let seq = inner.next_seq;
-    inner.next_seq += 1;
-
+    let seq = inner.take_seq();
     inner.timers.insert(
         seq,
         Waiter {
@@ -652,7 +674,7 @@ fn poll(index: usize, timeout: Duration) -> bool {
     poller.mode.store(WAIT_NONE, AtomicOrdering::SeqCst);
 
     // collect every task to wake into a local list, then wake them AFTER
-    // dropping the registry lock — `green::wake` takes green's own locks, and
+    // dropping the registry lock: `green::wake` takes green's own locks, and
     // keeping our lock out of that nest preserves the "netpoll lock never
     // holds across a green wake" discipline.
     let mut to_wake: Vec<usize> = Vec::new();
@@ -774,14 +796,7 @@ fn take_ready(inner: &mut Inner, fd: RawFd, interest: Interest, to_wake: &mut Ve
     }
     inner.waiting -= waiters.len();
     for w in waiters.drain(..) {
-        // flip PENDING->READY; if a timeout already claimed it, leave it be.
-        if w
-            .outcome
-            .compare_exchange(PENDING, READY, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
-            .is_ok()
-        {
-            to_wake.push(w.task);
-        }
+        w.resolve(READY, to_wake);
     }
     true
 }
@@ -800,22 +815,11 @@ fn collect_expired(inner: &mut Inner, now: Instant, to_wake: &mut Vec<usize>) {
 
         match target {
             DeadlineTarget::Timer => {
-                // a sleep expiring is its success case; the same PENDING->
-                // terminal compare-exchange keeps the resolve-once discipline
-                // even though nothing else currently races for a timer.
+                // a sleep expiring is its success case; resolving through the
+                // same compare-exchange keeps the resolve-once discipline even
+                // though nothing else currently races for a timer.
                 if let Some(w) = inner.timers.remove(&seq) {
-                    if w
-                        .outcome
-                        .compare_exchange(
-                            PENDING,
-                            TIMED_OUT,
-                            AtomicOrdering::AcqRel,
-                            AtomicOrdering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        to_wake.push(w.task);
-                    }
+                    w.resolve(TIMED_OUT, to_wake);
                 }
             }
             DeadlineTarget::Io { fd, interest } => {
@@ -823,18 +827,7 @@ fn collect_expired(inner: &mut Inner, now: Instant, to_wake: &mut Vec<usize>) {
                     if let Some(pos) = waiters.iter().position(|w| w.seq == seq) {
                         let w = waiters.remove(pos);
                         inner.waiting -= 1;
-                        if w
-                            .outcome
-                            .compare_exchange(
-                                PENDING,
-                                TIMED_OUT,
-                                AtomicOrdering::AcqRel,
-                                AtomicOrdering::Acquire,
-                            )
-                            .is_ok()
-                        {
-                            to_wake.push(w.task);
-                        }
+                        w.resolve(TIMED_OUT, to_wake);
                         if waiters.is_empty() {
                             inner.waiters.remove(&(fd, interest));
                         }
@@ -846,7 +839,7 @@ fn collect_expired(inner: &mut Inner, now: Instant, to_wake: &mut Vec<usize>) {
 }
 
 /// drain the eventfd's counter so its level-triggered readiness clears. the value
-/// is irrelevant — it is a pure wakeup.
+/// is irrelevant: it is a pure wakeup.
 fn drain_eventfd(eventfd: RawFd) {
     let mut buf: u64 = 0;
     // SAFETY: reading 8 bytes from our own nonblocking eventfd into a local; a
@@ -867,13 +860,12 @@ fn drain_eventfd(eventfd: RawFd) {
 ///
 /// waking the parked waiters is the point: the common server teardown pattern is
 /// one task closing a connection another task is blocked reading. dropping the
-/// reader's registration silently (the old behavior) left its coroutine parked
-/// forever — leaking its stack and slab slot and hanging anyone awaiting it. now
-/// each parked waiter's outcome is flipped to `CLOSED` and the task is woken, so
+/// reader's registration silently would leave its coroutine parked forever,
+/// leaking its stack and task id and hanging anyone awaiting it. instead each
+/// parked waiter's outcome is flipped to `CLOSED` and the task is woken, so
 /// its `wait_io` returns an error, its read/write unwinds, and its resources are
-/// reclaimed. a `compare_exchange` from `PENDING` means a readiness or timeout
-/// that already claimed the waiter still wins — we only close out a truly-pending
-/// wait, never double-resolve one.
+/// reclaimed. a readiness or timeout that already claimed the waiter still wins
+/// (see `Waiter::resolve`): we only close out a truly-pending wait.
 pub(crate) fn on_close(fd: RawFd) {
     // only touch the pollers if they were ever built; a process that never ran
     // a green worker has no registry to clean. any worker's poller may hold a
@@ -883,8 +875,8 @@ pub(crate) fn on_close(fd: RawFd) {
     };
 
     // collect the tasks to wake, then wake them AFTER dropping the registry lock:
-    // `green::wake` takes green's own slab/queue locks, and this lock must never
-    // nest inside them (the module's lock discipline).
+    // `green::wake` takes a green run-queue lock, and this lock must never nest
+    // with it (the module's lock discipline).
     let mut to_wake: Vec<usize> = Vec::new();
     for poller in pollers {
         close_in(poller, fd, &mut to_wake);
@@ -903,13 +895,7 @@ fn close_in(poller: &Poller, fd: RawFd, to_wake: &mut Vec<usize>) {
         if let Some(waiters) = inner.waiters.remove(&(fd, interest)) {
             inner.waiting -= waiters.len();
             for w in waiters {
-                if w
-                    .outcome
-                    .compare_exchange(PENDING, CLOSED, AtomicOrdering::AcqRel, AtomicOrdering::Acquire)
-                    .is_ok()
-                {
-                    to_wake.push(w.task);
-                }
+                w.resolve(CLOSED, to_wake);
             }
         }
     }
@@ -967,8 +953,9 @@ mod tests {
                 fd,
                 Interest::Read,
                 Waiter {
-                    // a slab id far beyond any real task: green::wake finds no such
-                    // slot and no-ops, which is all we need to exercise on_close.
+                    // a task id far beyond any real task: green::wake finds no
+                    // such block and no-ops, which is all we need to exercise
+                    // on_close.
                     task: usize::MAX,
                     seq,
                     outcome: outcome.clone(),
@@ -992,7 +979,7 @@ mod tests {
     static TIMER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // a timer registration must land in the timers map and the deadline heap,
-    // and — once the sweep runs past it — resolve to TIMED_OUT with the entry
+    // and, once the sweep runs past it, resolve to TIMED_OUT with the entry
     // gone and no fd touched. driven by hand (register_timer + collect_expired)
     // because a real sleep_task needs a live coroutine to suspend into.
     #[test]

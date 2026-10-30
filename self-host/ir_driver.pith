@@ -273,13 +273,25 @@ fn inject_imported_init_calls(out: List[String], imported_init_funcs: List[Strin
     for init_func, i in imported_init_funcs:
         with_inits.push("call " + (900000 + i).to_string() + " " + init_func + " int 0")
     return with_inits
+# put the startup calls at the top of main: each import's initializer in
+# import order, then the main module's own __init_globals, so a global in the
+# main file can use what its imports built. the consumer sees the call to
+# __init_globals in main's body and does not make it again.
 fn rewrite_main_ir(main_ir: String, imported_init_funcs: List[String]) -> String:
     main_lines := ir_lines(main_ir)
+    mut init_funcs: List[String] := []
+    for init_func in imported_init_funcs:
+        init_funcs.push(init_func)
+    if imported_init_funcs.len() > 0:
+        for line in main_lines:
+            if line.starts_with("func __init_globals "):
+                init_funcs.push("__init_globals")
+                break
     mut out: List[String] := []
     for line in main_lines:
         out.push(line)
         if line.starts_with("func main "):
-            out = inject_imported_init_calls(out, imported_init_funcs)
+            out = inject_imported_init_calls(out, init_funcs)
     return out.join(chr(10))
 
 # the ok payload kind of a builtin that returns its result as the

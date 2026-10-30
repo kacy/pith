@@ -295,7 +295,7 @@ fn ir_driver_older_than_seed(dir: &str, driver: &str) -> bool {
 }
 
 /// The ir_driver binary is itself compiled pith, so a fresh clone has no way
-/// to build it — pith build needs ir_driver to get IR. The tracked IR seed
+/// to build it: pith build needs ir_driver to get IR. The tracked IR seed
 /// breaks that cycle: build ir_driver once from the seed, then everything
 /// else builds from source as usual. A binary older than the seed is rebuilt
 /// the same way (see ir_driver_older_than_seed).
@@ -428,7 +428,7 @@ fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
     use pith_codegen::ir_consumer::compile_from_ir;
 
     // dump before validating: the dump exists to debug bad IR, so it must
-    // fire even when — especially when — the contract check rejects it
+    // fire even when (especially when) the contract check rejects it
     dump_ir_if_requested(ir_text);
 
     validate_combined_ir_contract(ir_text)?;

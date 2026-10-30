@@ -26,23 +26,32 @@ unsafe fn x25519_key_mut<'a>(handle: i64) -> Option<&'a mut PithX25519Key> {
     Some(&mut *(handle as *mut PithX25519Key))
 }
 
-fn seal_with(
+/// an AEAD key and nonce from raw bytes, or `None` for a key of the wrong
+/// length or a nonce that is not 12 bytes.
+fn aead_key_nonce(
     alg: &'static aead::Algorithm,
     key: &[u8],
     nonce: &[u8],
-    aad: &[u8],
-    plaintext: &[u8],
-) -> i64 {
+) -> Option<(aead::LessSafeKey, aead::Nonce)> {
     if nonce.len() != 12 {
-        return 0;
+        return None;
     }
-    let Ok(unbound) = aead::UnboundKey::new(alg, key) else {
+    let unbound = aead::UnboundKey::new(alg, key).ok()?;
+    let nonce = aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
+    Some((aead::LessSafeKey::new(unbound), nonce))
+}
+
+/// encrypt `plaintext` and append the tag. every argument is a bytes handle;
+/// the result is a bytes handle, or 0 when any input is invalid.
+unsafe fn seal(alg: &'static aead::Algorithm, key: i64, nonce: i64, aad: i64, plaintext: i64) -> i64 {
+    let (Some(key), Some(nonce), Some(aad), Some(plaintext)) =
+        (bytes_slice(key), bytes_slice(nonce), bytes_slice(aad), bytes_slice(plaintext))
+    else {
         return 0;
     };
-    let Ok(nonce) = aead::Nonce::try_assume_unique_for_key(nonce) else {
+    let Some((key, nonce)) = aead_key_nonce(alg, key, nonce) else {
         return 0;
     };
-    let key = aead::LessSafeKey::new(unbound);
     let mut out = plaintext.to_vec();
     if key
         .seal_in_place_append_tag(nonce, aead::Aad::from(aad), &mut out)
@@ -53,23 +62,18 @@ fn seal_with(
     pith_bytes_from_vec(out)
 }
 
-fn open_with(
-    alg: &'static aead::Algorithm,
-    key: &[u8],
-    nonce: &[u8],
-    aad: &[u8],
-    ciphertext: &[u8],
-) -> i64 {
-    if nonce.len() != 12 {
-        return 0;
-    }
-    let Ok(unbound) = aead::UnboundKey::new(alg, key) else {
+/// check the tag and decrypt `ciphertext`. every argument is a bytes handle;
+/// the result is a bytes handle, or 0 when any input is invalid or the tag
+/// does not match.
+unsafe fn open(alg: &'static aead::Algorithm, key: i64, nonce: i64, aad: i64, ciphertext: i64) -> i64 {
+    let (Some(key), Some(nonce), Some(aad), Some(ciphertext)) =
+        (bytes_slice(key), bytes_slice(nonce), bytes_slice(aad), bytes_slice(ciphertext))
+    else {
         return 0;
     };
-    let Ok(nonce) = aead::Nonce::try_assume_unique_for_key(nonce) else {
+    let Some((key, nonce)) = aead_key_nonce(alg, key, nonce) else {
         return 0;
     };
-    let key = aead::LessSafeKey::new(unbound);
     let mut in_out = ciphertext.to_vec();
     let Ok(plain) = key.open_in_place(nonce, aead::Aad::from(aad), &mut in_out) else {
         return 0;
@@ -77,12 +81,19 @@ fn open_with(
     pith_bytes_from_vec(plain.to_vec())
 }
 
-fn verify_with(
+/// 1 when `sig` is a valid signature of `message` under `public_key`, else 0.
+/// every argument is a bytes handle; an invalid one verifies nothing.
+unsafe fn verify(
     alg: &'static dyn signature::VerificationAlgorithm,
-    public_key: &[u8],
-    message: &[u8],
-    sig: &[u8],
+    public_key: i64,
+    message: i64,
+    sig: i64,
 ) -> i64 {
+    let (Some(public_key), Some(message), Some(sig)) =
+        (bytes_slice(public_key), bytes_slice(message), bytes_slice(sig))
+    else {
+        return 0;
+    };
     let key = signature::UnparsedPublicKey::new(alg, public_key);
     if key.verify(message, sig).is_ok() {
         1
@@ -91,11 +102,12 @@ fn verify_with(
     }
 }
 
-fn sign_rsa_with(
-    encoding: &'static dyn signature::RsaEncoding,
-    pkcs8: &[u8],
-    message: &[u8],
-) -> i64 {
+/// sign `message` with an RSA key in pkcs#8 form. both arguments are bytes
+/// handles; the result is a bytes handle, or 0 on an invalid input.
+unsafe fn sign_rsa(encoding: &'static dyn signature::RsaEncoding, pkcs8: i64, message: i64) -> i64 {
+    let (Some(pkcs8), Some(message)) = (bytes_slice(pkcs8), bytes_slice(message)) else {
+        return 0;
+    };
     let Ok(key_pair) = signature::RsaKeyPair::from_pkcs8(pkcs8) else {
         return 0;
     };
@@ -105,6 +117,25 @@ fn sign_rsa_with(
         return 0;
     }
     pith_bytes_from_vec(sig)
+}
+
+/// sign `message` with an ECDSA key in pkcs#8 form. both arguments are bytes
+/// handles; the result is a bytes handle, or 0 on an invalid input. the
+/// per-signature nonce comes from the system rng inside ring and is never
+/// chosen here, which is what keeps ecdsa keys from leaking through a
+/// repeated nonce.
+unsafe fn sign_ecdsa(alg: &'static signature::EcdsaSigningAlgorithm, pkcs8: i64, message: i64) -> i64 {
+    let (Some(pkcs8), Some(message)) = (bytes_slice(pkcs8), bytes_slice(message)) else {
+        return 0;
+    };
+    let rng = rand::SystemRandom::new();
+    let Ok(key_pair) = signature::EcdsaKeyPair::from_pkcs8(alg, pkcs8, &rng) else {
+        return 0;
+    };
+    let Ok(sig) = key_pair.sign(&rng, message) else {
+        return 0;
+    };
+    pith_bytes_from_vec(sig.as_ref().to_vec())
 }
 
 fn ecdh_keygen(alg: &'static agreement::Algorithm) -> i64 {
@@ -186,19 +217,7 @@ pub unsafe extern "C" fn pith_crypto_aes_256_gcm_seal(
     aad: i64,
     plaintext: i64,
 ) -> i64 {
-    let Some(key) = bytes_slice(key) else {
-        return 0;
-    };
-    let Some(nonce) = bytes_slice(nonce) else {
-        return 0;
-    };
-    let Some(aad) = bytes_slice(aad) else {
-        return 0;
-    };
-    let Some(plaintext) = bytes_slice(plaintext) else {
-        return 0;
-    };
-    seal_with(&aead::AES_256_GCM, key, nonce, aad, plaintext)
+    seal(&aead::AES_256_GCM, key, nonce, aad, plaintext)
 }
 
 #[no_mangle]
@@ -208,19 +227,7 @@ pub unsafe extern "C" fn pith_crypto_aes_256_gcm_open(
     aad: i64,
     ciphertext: i64,
 ) -> i64 {
-    let Some(key) = bytes_slice(key) else {
-        return 0;
-    };
-    let Some(nonce) = bytes_slice(nonce) else {
-        return 0;
-    };
-    let Some(aad) = bytes_slice(aad) else {
-        return 0;
-    };
-    let Some(ciphertext) = bytes_slice(ciphertext) else {
-        return 0;
-    };
-    open_with(&aead::AES_256_GCM, key, nonce, aad, ciphertext)
+    open(&aead::AES_256_GCM, key, nonce, aad, ciphertext)
 }
 
 #[no_mangle]
@@ -230,19 +237,7 @@ pub unsafe extern "C" fn pith_crypto_aes_128_gcm_seal(
     aad: i64,
     plaintext: i64,
 ) -> i64 {
-    let Some(key) = bytes_slice(key) else {
-        return 0;
-    };
-    let Some(nonce) = bytes_slice(nonce) else {
-        return 0;
-    };
-    let Some(aad) = bytes_slice(aad) else {
-        return 0;
-    };
-    let Some(plaintext) = bytes_slice(plaintext) else {
-        return 0;
-    };
-    seal_with(&aead::AES_128_GCM, key, nonce, aad, plaintext)
+    seal(&aead::AES_128_GCM, key, nonce, aad, plaintext)
 }
 
 #[no_mangle]
@@ -252,19 +247,7 @@ pub unsafe extern "C" fn pith_crypto_aes_128_gcm_open(
     aad: i64,
     ciphertext: i64,
 ) -> i64 {
-    let Some(key) = bytes_slice(key) else {
-        return 0;
-    };
-    let Some(nonce) = bytes_slice(nonce) else {
-        return 0;
-    };
-    let Some(aad) = bytes_slice(aad) else {
-        return 0;
-    };
-    let Some(ciphertext) = bytes_slice(ciphertext) else {
-        return 0;
-    };
-    open_with(&aead::AES_128_GCM, key, nonce, aad, ciphertext)
+    open(&aead::AES_128_GCM, key, nonce, aad, ciphertext)
 }
 
 #[no_mangle]
@@ -274,19 +257,7 @@ pub unsafe extern "C" fn pith_crypto_chacha20_poly1305_seal(
     aad: i64,
     plaintext: i64,
 ) -> i64 {
-    let Some(key) = bytes_slice(key) else {
-        return 0;
-    };
-    let Some(nonce) = bytes_slice(nonce) else {
-        return 0;
-    };
-    let Some(aad) = bytes_slice(aad) else {
-        return 0;
-    };
-    let Some(plaintext) = bytes_slice(plaintext) else {
-        return 0;
-    };
-    seal_with(&aead::CHACHA20_POLY1305, key, nonce, aad, plaintext)
+    seal(&aead::CHACHA20_POLY1305, key, nonce, aad, plaintext)
 }
 
 #[no_mangle]
@@ -296,19 +267,7 @@ pub unsafe extern "C" fn pith_crypto_chacha20_poly1305_open(
     aad: i64,
     ciphertext: i64,
 ) -> i64 {
-    let Some(key) = bytes_slice(key) else {
-        return 0;
-    };
-    let Some(nonce) = bytes_slice(nonce) else {
-        return 0;
-    };
-    let Some(aad) = bytes_slice(aad) else {
-        return 0;
-    };
-    let Some(ciphertext) = bytes_slice(ciphertext) else {
-        return 0;
-    };
-    open_with(&aead::CHACHA20_POLY1305, key, nonce, aad, ciphertext)
+    open(&aead::CHACHA20_POLY1305, key, nonce, aad, ciphertext)
 }
 
 #[no_mangle]
@@ -317,16 +276,7 @@ pub unsafe extern "C" fn pith_crypto_verify_ed25519(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(&signature::ED25519, public_key, message, sig)
+    verify(&signature::ED25519, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -335,16 +285,7 @@ pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p256_sha256_asn1(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(&signature::ECDSA_P256_SHA256_ASN1, public_key, message, sig)
+    verify(&signature::ECDSA_P256_SHA256_ASN1, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -353,16 +294,7 @@ pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p256_sha384_asn1(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(&signature::ECDSA_P256_SHA384_ASN1, public_key, message, sig)
+    verify(&signature::ECDSA_P256_SHA384_ASN1, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -371,16 +303,7 @@ pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p384_sha384_asn1(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(&signature::ECDSA_P384_SHA384_ASN1, public_key, message, sig)
+    verify(&signature::ECDSA_P384_SHA384_ASN1, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -389,21 +312,7 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha256(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(
-        &signature::RSA_PKCS1_2048_8192_SHA256,
-        public_key,
-        message,
-        sig,
-    )
+    verify(&signature::RSA_PKCS1_2048_8192_SHA256, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -412,21 +321,7 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha384(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(
-        &signature::RSA_PKCS1_2048_8192_SHA384,
-        public_key,
-        message,
-        sig,
-    )
+    verify(&signature::RSA_PKCS1_2048_8192_SHA384, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -435,21 +330,7 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha256(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(
-        &signature::RSA_PSS_2048_8192_SHA256,
-        public_key,
-        message,
-        sig,
-    )
+    verify(&signature::RSA_PSS_2048_8192_SHA256, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -458,21 +339,7 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha384(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(
-        &signature::RSA_PSS_2048_8192_SHA384,
-        public_key,
-        message,
-        sig,
-    )
+    verify(&signature::RSA_PSS_2048_8192_SHA384, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -481,21 +348,7 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha512(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(
-        &signature::RSA_PSS_2048_8192_SHA512,
-        public_key,
-        message,
-        sig,
-    )
+    verify(&signature::RSA_PSS_2048_8192_SHA512, public_key, message, sig)
 }
 
 #[no_mangle]
@@ -504,109 +357,42 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha512(
     message: i64,
     sig: i64,
 ) -> i64 {
-    let Some(public_key) = bytes_slice(public_key) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let Some(sig) = bytes_slice(sig) else {
-        return 0;
-    };
-    verify_with(
-        &signature::RSA_PKCS1_2048_8192_SHA512,
-        public_key,
-        message,
-        sig,
-    )
+    verify(&signature::RSA_PKCS1_2048_8192_SHA512, public_key, message, sig)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    sign_rsa_with(&signature::RSA_PSS_SHA256, pkcs8, message)
+    sign_rsa(&signature::RSA_PSS_SHA256, pkcs8, message)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha384_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    sign_rsa_with(&signature::RSA_PSS_SHA384, pkcs8, message)
+    sign_rsa(&signature::RSA_PSS_SHA384, pkcs8, message)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha512_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    sign_rsa_with(&signature::RSA_PSS_SHA512, pkcs8, message)
+    sign_rsa(&signature::RSA_PSS_SHA512, pkcs8, message)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha384_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    sign_rsa_with(&signature::RSA_PKCS1_SHA384, pkcs8, message)
+    sign_rsa(&signature::RSA_PKCS1_SHA384, pkcs8, message)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha512_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    sign_rsa_with(&signature::RSA_PKCS1_SHA512, pkcs8, message)
+    sign_rsa(&signature::RSA_PKCS1_SHA512, pkcs8, message)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p384_sha384_asn1_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let rng = rand::SystemRandom::new();
-    let Ok(key_pair) = signature::EcdsaKeyPair::from_pkcs8(
-        &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
-        pkcs8,
-        &rng,
-    ) else {
-        return 0;
-    };
-    let Ok(sig) = key_pair.sign(&rng, message) else {
-        return 0;
-    };
-    pith_bytes_from_vec(sig.as_ref().to_vec())
+    sign_ecdsa(&signature::ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8, message)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    sign_rsa_with(&signature::RSA_PKCS1_SHA256, pkcs8, message)
+    sign_rsa(&signature::RSA_PKCS1_SHA256, pkcs8, message)
 }
 
 /// Sign `message` with an ed25519 private key in pkcs#8 form. The
@@ -618,10 +404,7 @@ pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha256_pkcs8(pkcs8: i64, mes
 /// signature handle, or 0 on a malformed key.
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_ed25519_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
+    let (Some(pkcs8), Some(message)) = (bytes_slice(pkcs8), bytes_slice(message)) else {
         return 0;
     };
     let Ok(key_pair) = signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8) else {
@@ -632,57 +415,19 @@ pub unsafe extern "C" fn pith_crypto_sign_ed25519_pkcs8(pkcs8: i64, message: i64
 
 /// Sign `message` with a p-256 private key in pkcs#8 form. Uses the FIXED
 /// encoding, so the signature comes out as raw r‖s (64 bytes), the form jws
-/// carries, rather than asn.1 der. The per-signature nonce comes from the
-/// system rng inside ring; it is never chosen here, which is the property
-/// that keeps ecdsa keys from leaking through a repeated nonce. Returns 0 on
-/// a malformed key.
+/// carries, rather than asn.1 der. Returns 0 on a malformed key.
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let rng = rand::SystemRandom::new();
-    let Ok(key_pair) = signature::EcdsaKeyPair::from_pkcs8(
-        &signature::ECDSA_P256_SHA256_FIXED_SIGNING,
-        pkcs8,
-        &rng,
-    ) else {
-        return 0;
-    };
-    let Ok(sig) = key_pair.sign(&rng, message) else {
-        return 0;
-    };
-    pith_bytes_from_vec(sig.as_ref().to_vec())
+    sign_ecdsa(&signature::ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8, message)
 }
 
 /// Sign `message` with an ECDSA P-256 key (SHA-256), producing an ASN.1 DER
 /// signature, the form TLS carries in ServerKeyExchange and CertificateVerify,
-/// unlike the raw r||s of the FIXED variant above. The per-signature nonce
-/// comes from ring's system rng and is never chosen here. Returns 0 on a
-/// malformed key.
+/// unlike the raw r||s of the FIXED variant above. Returns 0 on a malformed
+/// key.
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_asn1_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let Some(pkcs8) = bytes_slice(pkcs8) else {
-        return 0;
-    };
-    let Some(message) = bytes_slice(message) else {
-        return 0;
-    };
-    let rng = rand::SystemRandom::new();
-    let Ok(key_pair) = signature::EcdsaKeyPair::from_pkcs8(
-        &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-        pkcs8,
-        &rng,
-    ) else {
-        return 0;
-    };
-    let Ok(sig) = key_pair.sign(&rng, message) else {
-        return 0;
-    };
-    pith_bytes_from_vec(sig.as_ref().to_vec())
+    sign_ecdsa(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, message)
 }
 
 /// BLAKE2b digest of `data`, keyed when `key` is non-empty. `out_len` selects

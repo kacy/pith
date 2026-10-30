@@ -21,9 +21,9 @@ MAX_CODE_LENGTH := 30
 EOS_SYMBOL := 256
 
 # the fixed RFC 7541 Appendix B table, indexed by symbol (0..255, EOS at 256).
-# built once at module load, exactly like decode_map below — encode(),
-# encoded_length(), and build_decode_map() all read it, so a per-call
-# rebuild here was several hundred struct allocations on the encode path.
+# built once at module load, like decode_map below. encode(),
+# encoded_length() and build_decode_map() all read it, and building it per
+# call would cost several hundred struct allocations on the encode path.
 huff_table: List[HuffEntry] := [
         HuffEntry(0x1ff8, 13),
         HuffEntry(0x7fffd8, 23),
@@ -286,8 +286,8 @@ huff_table: List[HuffEntry] := [
 
 # reverse lookup for decoding, keyed by the packed (length, code) integer.
 # the decoder consults this once per input BIT, so the key must cost nothing:
-# an int key stays on the map's integer fast path, where the string key this
-# replaces allocated two number strings and a concat per bit.
+# an int key stays on the map's integer fast path, where a string key would
+# allocate two number strings and a concat per bit.
 #
 # it is derived from the fixed table above, so it is built when the module loads
 # rather than on the first header block that needs it. module initializers run on
@@ -342,8 +342,8 @@ pub fn encode(input: Bytes) -> Bytes:
     out.free()
     return result
 
-# the number of bytes `encode` would produce for `input`, without encoding.
-# hpack uses this to choose the shorter of the raw and Huffman forms.
+# the number of bytes `encode` would produce for `input`, without encoding,
+# so a caller can choose the shorter of the raw and Huffman forms.
 pub fn encoded_length(input: Bytes) -> Int:
     table := huff_table
     mut total_bits := 0
@@ -442,7 +442,7 @@ test "huffman rejects an incomplete non-EOS padding":
     assert(result.is_err)
 
 test "huffman rejects padding longer than seven bits":
-    # 0xff is the 6-bit symbol '&' plus two 1 bits; a second 0xff pushes the
-    # pending run past a full byte of padding.
+    # sixteen 1 bits match no codeword (only the 30-bit EOS is all ones), so
+    # they are left pending as padding longer than seven bits.
     result := decode(encoding.from_hex("ffff")!)
     assert(result.is_err)

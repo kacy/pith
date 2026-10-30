@@ -63,10 +63,9 @@ import std.time as time
 # type must be an unqualified type name.
 from std.net.http2.connection import StreamEvent, headers_event, data_event, reset_event, SETTINGS_HEADER_TABLE_SIZE, SETTINGS_MAX_CONCURRENT_STREAMS, SETTINGS_INITIAL_WINDOW_SIZE, SETTINGS_MAX_FRAME_SIZE, DEFAULT_INITIAL_WINDOW
 
-# the 24-byte client connection preface, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-# (RFC 9113 §3.4), encoded as hex so the carriage returns and line feeds are
-# unambiguous in source. the client sends this before any frame; the server reads
-# and validates it before the SETTINGS exchange.
+# the 24-byte client connection preface (RFC 9113 §3.4). the client sends this
+# before any frame; the server reads and validates it before the SETTINGS
+# exchange.
 PREFACE := "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
 # the most streams the server will serve at once on one connection. advertised in
@@ -97,11 +96,9 @@ MAX_CONNECTIONS := 512
 # the in-flight permits, shared between the accept loops and the connection
 # tasks. a Semaphore is safe to share across threads; it lives as a module
 # global because the accept loops and every connection task share this one
-# instance. (it once had to be a global because a sync-primitive could not be
-# handed to a spawned task as an argument; that is fixed, but a single shared
-# instance is naturally a global.) it is `mut` only because that is how a
-# global holding a constructed value is declared — the binding itself is never
-# reassigned, and the permit count is the semaphore's own synchronized state.
+# instance. it is `mut` only because that is how a global holding a constructed
+# value is declared: the binding itself is never reassigned, and the permit
+# count is the semaphore's own synchronized state.
 mut connection_slots := Semaphore(MAX_CONNECTIONS)
 
 # how long a connection may sit without the socket making progress before the
@@ -153,7 +150,7 @@ CREDIT_POKE_CAP := 1
 # protocol path.
 #   * TRANSPORT_OFFLINE feeds a preloaded buffer and records writes in `sent`, so
 #     the frame tests drive the codec deterministically with no socket.
-#   * TRANSPORT_TCP is cleartext h2c over an accepted tcp fd (P3a).
+#   * TRANSPORT_TCP is cleartext h2c over an accepted tcp fd.
 #   * TRANSPORT_TLS is h2 over an accepted tls session that negotiated alpn "h2",
 #     using the same read_bytes/write_all_bytes the h2 client uses over tls.
 TRANSPORT_OFFLINE := 0
@@ -178,10 +175,7 @@ OUT_RESPONSE := 1
 # a response's headers are carried as (stream_id, header fields) rather than as a
 # whole http.HttpResponse on purpose: the handler flattens the response to plain
 # header fields before queuing, so the encoding happens on the writer and the
-# encoder stays single-owner. flattening also once sidestepped a bug where a
-# struct with a Map field was corrupted crossing a channel; that is fixed, but the
-# single-owner encoder is reason enough to keep the shape. the response
-# body is not carried here: the handler streams it as flow-controlled DATA frames
+# encoder stays single-owner. the response body is not carried here: the handler streams it as flow-controlled DATA frames
 # (OUT_RAW) after the headers, so the writer never blocks on a send window.
 struct Outbound:
     kind: Int
@@ -459,11 +453,8 @@ impl Server:
     # backpressure to the reader is the correct response anyway.
     #
     # this uses a blocking send rather than try_send on purpose: a full outbound
-    # queue means the writer has wedged, and blocking then applies the correct
-    # backpressure to the reader (see above). a try_send here once also miscopied a
-    # struct payload — successive try_sends aliased one slot, collapsing the
-    # Outbound items to the last enqueued — but that is fixed; the backpressure is
-    # the reason the blocking send stays.
+    # queue means the writer has wedged, and blocking then applies backpressure
+    # to the reader instead of silently dropping a control frame.
     fn enqueue_frame(frame: frames.Frame):
         wire := frames.frame_bytes(frame)
         if wire.is_err:
@@ -705,6 +696,11 @@ fn send_headers(conn: ServerConn, stream_id: Int, fields: List[hpack.HeaderField
     conn.send_frame(frames.headers_frame(stream_id, block, end_stream, true))!
     return 0
 
+# unused. it stays because the emitter compiles an impl method with whatever
+# ir_current_func_returns_result the function before it left behind: with this
+# plain function gone, the Server methods below would follow the fallible
+# send_headers and compile every map index as a propagating lookup. remove it
+# once ir_impl_func sets that flag itself.
 fn min_int(a: Int, b: Int) -> Int:
     if a < b:
         return a
@@ -858,7 +854,7 @@ fn writer_loop(conn: ServerConn, outbound: Channel[Outbound], closed: AtomicInt)
 # event carries the request headers, DATA events carry body chunks, and the
 # stream ends when an event has its end flag set. a RST_STREAM (reset event) or a
 # closed inbox abandons the request. a header block that arrives after the body
-# has begun is trailers, which this phase ignores.
+# has begun is trailers, which the buffered path ignores.
 fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
     body := bytes.buffer()
     defer body.free()
@@ -893,7 +889,7 @@ fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
 # reset the stream, or it dropped) just drops the stream; the handler runs on its
 # own task so a slow or failing request never blocks the reader or another stream.
 # a streaming server hands the stream to the streaming handler instead of
-# buffering (handle_streaming_stream); the buffered path below is unchanged.
+# buffering (handle_streaming_stream).
 fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
     # scope the json node pool to this one stream. a handler that parses the
     # request body allocates into per-task pool storage that nothing frees on
@@ -1166,19 +1162,25 @@ fn send_goaway(server: Server, error_code: Int):
 # broken client only ever affects its own connection. spawn this per accepted
 # socket, or call it directly to serve a single connection.
 pub fn serve_h2c_connection(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    serve_h2c_fd(fd, handler, false)
+
+# serve one accepted h2c socket on the buffered path, or on the streaming path
+# when `streaming` is set (see run_connection). the shared body of
+# serve_h2c_connection and serve_h2c_streaming_connection.
+fn serve_h2c_fd(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool):
     tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
     conn := new_live_server_conn(fd)
-    serve_connection(conn, handler) catch false
+    run_connection(conn, handler, streaming) catch false
     conn.close()
 
-# serve_h2c_connection with the accept loop's concurrency permit released when
-# the connection ends, however it ends, and the drain count it was handed
-# released with it. both were taken on the accept loop, in spawn_h2c_conn; this
-# `defer` is the other half of each, and runs on every exit the task has.
-fn serve_h2c_slot(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+# serve_h2c_fd with the accept loop's concurrency permit released when the
+# connection ends, however it ends, and the drain count it was handed released
+# with it. both were taken on the accept loop, in spawn_h2c_conn; this `defer`
+# is the other half of each, and runs on every exit the task has.
+fn serve_h2c_slot(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool):
     defer shutdown.leave()
     defer connection_slots.release()
-    serve_h2c_connection(fd, handler)
+    serve_h2c_fd(fd, handler, streaming)
 
 # hand an accepted h2c socket to its own task, having taken the two things a
 # connection holds for its whole life: the accept loop's concurrency permit and
@@ -1198,17 +1200,10 @@ fn serve_h2c_slot(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpRespon
 # reports it as work it abandoned — the same number a rolling deploy already
 # logs. counting too little loses a connection with no trace; counting too much
 # costs at most the grace period and says so.
-fn spawn_h2c_conn(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+fn spawn_h2c_conn(fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool):
     connection_slots.acquire()
     shutdown.enter()
-    spawn serve_h2c_slot(fd, handler)
-
-# the connection lifecycle, factored out so the offline tests can drive it over a
-# ServerConn without a socket. reads the preface, sends the server SETTINGS,
-# spawns the writer, and runs the reader loop on the calling task; when the reader
-# returns it waits for the writer to flush and stop.
-fn serve_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Bool!:
-    return run_connection(conn, handler, false)!
+    spawn serve_h2c_slot(fd, handler, streaming)
 
 # the share of the grace period the wind-down keeps back for its own last step:
 # cancelling the streams a drain caught mid-flight and letting the trailers those
@@ -1280,7 +1275,10 @@ fn drain_watch(server: Server):
     wait_for_flush(server, time.mono_millis() + flush_window_ms())
     server.shutdown_transport_if_live()
 
-# serve_connection with the streaming switch explicit: `streaming` true routes
+# the connection lifecycle, factored out so the offline tests can drive it over a
+# ServerConn without a socket. reads the preface, sends the server SETTINGS,
+# spawns the writer, and runs the reader loop on the calling task; when the reader
+# returns it waits for the writer to flush and stop. `streaming` true routes
 # every stream to the process-wide streaming handler instead of `handler`.
 fn run_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool) -> Bool!:
     conn.read_preface()!
@@ -1307,6 +1305,10 @@ fn run_connection(conn: ServerConn, handler: fn(http.HttpRequestBytes) -> http.H
 # does; spawn it if you need to keep going. mirrors std.web's listen and
 # std.prometheus's serve.
 pub fn listen_h2c(host: String, port: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
+    return listen_h2c_loop(host, port, handler, false)!
+
+# the accept loop behind listen_h2c and listen_h2c_streaming.
+fn listen_h2c_loop(host: String, port: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool) -> Int!:
     # registering transfers the close to std.shutdown, so a drain and a normal
     # teardown cannot both close the same fd number.
     fd := shutdown.register_listener(tcp_listen(host, port)!)
@@ -1327,7 +1329,7 @@ pub fn listen_h2c(host: String, port: Int, handler: fn(http.HttpRequestBytes) ->
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
-        spawn_h2c_conn(accepted.ok, handler)
+        spawn_h2c_conn(accepted.ok, handler, streaming)
     # free the port before draining, not after: the replacement instance of a
     # rolling deploy is waiting to bind it, and the drain can take the whole
     # grace period. the defer above is then a no-op — close_listener closes at
@@ -1339,15 +1341,20 @@ pub fn listen_h2c(host: String, port: Int, handler: fn(http.HttpRequestBytes) ->
 # (with its alpn negotiation) has already happened; this checks that the peer
 # negotiated "h2" and then runs the same reader/writer/handler loop as h2c, only
 # over the tls session instead of a plain socket. a peer that did not negotiate
-# "h2" is closed without serving — an http/1.1 fallback over the same listener is
-# std.web's concern (a later phase), not this native h2 server's. spawn this per
+# "h2" is closed without serving; an http/1.1 fallback over the same listener is
+# std.web's concern, not this native h2 server's. spawn this per
 # accepted tls connection, or call it directly to serve one.
 pub fn serve_h2_tls_connection(tls_conn: tls.Conn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+    serve_h2_tls_session(tls_conn, handler, false)
+
+# serve one tls session on the buffered or the streaming path. the shared body
+# of serve_h2_tls_connection and serve_h2_tls_streaming_connection.
+fn serve_h2_tls_session(tls_conn: tls.Conn, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool):
     if tls_conn.negotiated_protocol() != "h2":
         tls_conn.close()
         return
     conn := new_tls_server_conn(tls_conn.handle)
-    serve_connection(conn, handler) catch false
+    run_connection(conn, handler, streaming) catch false
     conn.close()
 
 # release a tls listener at the end of an accept loop, in the two halves a
@@ -1361,8 +1368,8 @@ fn release_tls_listener(listener: tls.Listener):
 # handshake an accepted socket and serve it. split out from serve_h2_tls_slot so
 # the failure path is a plain `!` — a handshake that fails closes the socket and
 # leaves nothing for the caller to clean up.
-fn handshake_and_serve_h2_tls(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Bool!:
-    serve_h2_tls_connection(tls.handshake(tls.listener_from_handle(listener_handle), fd)!, handler)
+fn handshake_and_serve_h2_tls(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool) -> Bool!:
+    serve_h2_tls_session(tls.handshake(tls.listener_from_handle(listener_handle), fd)!, handler, streaming)
     return true
 
 # handshake_and_serve_h2_tls with the accept loop's permit released at the end.
@@ -1371,19 +1378,19 @@ fn handshake_and_serve_h2_tls(listener_handle: Int, fd: Int, handler: fn(http.Ht
 # back on the handshake's failure path too. a client that can leak one permit per
 # connection stops the server accepting after MAX_CONNECTIONS attempts, which is
 # the same denial of service the accept loop was fixed for, only slower.
-fn serve_h2_tls_slot(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+fn serve_h2_tls_slot(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool):
     defer shutdown.leave()
     defer connection_slots.release()
-    handshake_and_serve_h2_tls(listener_handle, fd, handler) catch false
+    handshake_and_serve_h2_tls(listener_handle, fd, handler, streaming) catch false
 
 # hand an accepted tls socket to its own task, permit and drain count taken here
 # on the accept loop — see spawn_h2c_conn for why the count cannot wait for the
 # task to start. a connection still mid-handshake when a shutdown lands is a
 # client waiting for an answer, so it counts from the accept like any other.
-fn spawn_h2_tls_conn(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse):
+fn spawn_h2_tls_conn(listener_handle: Int, fd: Int, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool):
     connection_slots.acquire()
     shutdown.enter()
-    spawn serve_h2_tls_slot(listener_handle, fd, handler)
+    spawn serve_h2_tls_slot(listener_handle, fd, handler, streaming)
 
 # bind host:port for http/2 over tls and serve forever. it builds a tls server
 # config from the pem `cert`/`key` files, offers alpn "h2" (and "http/1.1", which
@@ -1397,6 +1404,10 @@ fn spawn_h2_tls_conn(listener_handle: Int, fd: Int, handler: fn(http.HttpRequest
 # client that never completes a handshake — a port scanner, a probe, a browser
 # racing connections — from taking the accept loop down with it.
 pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler: fn(http.HttpRequestBytes) -> http.HttpResponse) -> Int!:
+    return listen_h2_tls_loop(host, port, cert, key, handler, false)!
+
+# the accept loop behind listen_h2_tls and listen_h2_tls_streaming.
+fn listen_h2_tls_loop(host: String, port: Int, cert: String, key: String, handler: fn(http.HttpRequestBytes) -> http.HttpResponse, streaming: Bool) -> Int!:
     config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
     bound := tls.listen(host, port, config)
     if bound.is_err:
@@ -1420,7 +1431,7 @@ pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
-        spawn_h2_tls_conn(listener.handle, accepted.ok, handler)
+        spawn_h2_tls_conn(listener.handle, accepted.ok, handler, streaming)
     # free the port before draining (see listen_h2c above), but only the port.
     # the listener's binding to the tls config outlives the accept loop: a
     # connection accepted a moment before the shutdown has not necessarily
@@ -1440,132 +1451,43 @@ pub fn listen_h2_tls(host: String, port: Int, cert: String, key: String, handler
 # the streaming twins of the buffered entry points above. the handler receives a
 # live ServerStream per request instead of a buffered HttpRequestBytes; it is
 # stored in the process-wide slot (see stream_handler_fn), so one process runs
-# one streaming handler. the buffered listen paths are untouched.
+# one streaming handler. they reuse the buffered paths' accept loops and
+# connection plumbing, passing `streaming` = true.
 
-# the buffered-handler slot of a streaming server. never called — handle_stream
-# routes to the streaming path first — but the Server struct still carries one.
+# the buffered-handler slot of a streaming server. never called (handle_stream
+# routes to the streaming path first), but the Server struct still carries one.
 fn streaming_unused_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
     return http.response(500)
 
 # serve one accepted h2c connection on the streaming path. mirrors
 # serve_h2c_connection; the handler comes from the process-wide slot.
 pub fn serve_h2c_streaming_connection(fd: Int):
-    tcp_set_timeout(fd, CONNECTION_TIMEOUT_MS)
-    conn := new_live_server_conn(fd)
-    run_connection(conn, streaming_unused_handler, true) catch false
-    conn.close()
-
-# serve_h2c_streaming_connection with the accept loop's permit and drain count
-# released at the end. mirrors serve_h2c_slot.
-fn serve_h2c_streaming_slot(fd: Int):
-    defer shutdown.leave()
-    defer connection_slots.release()
-    serve_h2c_streaming_connection(fd)
-
-# hand an accepted h2c socket to its own streaming task, permit and drain count
-# taken here on the accept loop. mirrors spawn_h2c_conn.
-fn spawn_h2c_streaming_conn(fd: Int):
-    connection_slots.acquire()
-    shutdown.enter()
-    spawn serve_h2c_streaming_slot(fd)
+    serve_h2c_fd(fd, streaming_unused_handler, true)
 
 # bind host:port for cleartext h2c and serve forever, handing each request
 # stream to `handler` while it is still arriving. mirrors listen_h2c.
 pub fn listen_h2c_streaming(host: String, port: Int, handler: fn(ServerStream) -> Int) -> Int!:
     stream_handler_fn = handler
-    fd := shutdown.register_listener(tcp_listen(host, port)!)
-    defer shutdown.close_listener(fd)
-    mut failures := 0
-    while not shutdown.requested():
-        accepted := tcp.accept(fd)
-        if accepted.is_err:
-            if shutdown.requested():
-                break
-            failures = failures + 1
-            tcp.back_off_after_accept_failure(failures, accepted.err)!
-            continue
-        failures = 0
-        spawn_h2c_streaming_conn(accepted.ok)
-    # free the port before draining, not after: the replacement instance of a
-    # rolling deploy is waiting to bind it, and the drain can take the whole
-    # grace period. the defer above is then a no-op — close_listener closes at
-    # most once — and still covers the error exits.
-    shutdown.close_listener(fd)
-    return shutdown.drain_default()
+    return listen_h2c_loop(host, port, streaming_unused_handler, true)!
 
 # serve one accepted tls connection on the streaming path. mirrors
 # serve_h2_tls_connection, including the alpn "h2" check.
 pub fn serve_h2_tls_streaming_connection(tls_conn: tls.Conn):
-    if tls_conn.negotiated_protocol() != "h2":
-        tls_conn.close()
-        return
-    conn := new_tls_server_conn(tls_conn.handle)
-    run_connection(conn, streaming_unused_handler, true) catch false
-    conn.close()
-
-# handshake an accepted socket and serve it on the streaming path. mirrors
-# handshake_and_serve_h2_tls.
-fn handshake_and_serve_h2_tls_streaming(listener_handle: Int, fd: Int) -> Bool!:
-    serve_h2_tls_streaming_connection(tls.handshake(tls.listener_from_handle(listener_handle), fd)!)
-    return true
-
-# handshake_and_serve_h2_tls_streaming with the accept loop's permit released at
-# the end, on the failed-handshake path included. mirrors serve_h2_tls_slot.
-fn serve_h2_tls_streaming_slot(listener_handle: Int, fd: Int):
-    defer shutdown.leave()
-    defer connection_slots.release()
-    handshake_and_serve_h2_tls_streaming(listener_handle, fd) catch false
-
-# hand an accepted tls socket to its own streaming task, permit and drain count
-# taken here on the accept loop. mirrors spawn_h2_tls_conn.
-fn spawn_h2_tls_streaming_conn(listener_handle: Int, fd: Int):
-    connection_slots.acquire()
-    shutdown.enter()
-    spawn serve_h2_tls_streaming_slot(listener_handle, fd)
+    serve_h2_tls_session(tls_conn, streaming_unused_handler, true)
 
 # bind host:port for http/2 over tls and serve forever on the streaming path.
 # mirrors listen_h2_tls, handshake off the accept loop included.
 pub fn listen_h2_tls_streaming(host: String, port: Int, cert: String, key: String, handler: fn(ServerStream) -> Int) -> Int!:
     stream_handler_fn = handler
-    config := tls.server_config(cert, key)!.with_alpn(["h2", "http/1.1"])
-    bound := tls.listen(host, port, config)
-    if bound.is_err:
-        # the bind never happened, so nothing borrowed the config and it is
-        # still this call's to close.
-        config.close()
-        fail bound.err
-    listener := bound.ok
-    shutdown.register_listener(listener.handle)
-    defer release_tls_listener(listener)
-    mut failures := 0
-    while not shutdown.requested():
-        accepted := tls.accept_socket(listener)
-        if accepted.is_err:
-            if shutdown.requested():
-                break
-            failures = failures + 1
-            # a give-up here leaves the config open on purpose: nothing drains
-            # on this path, and a task already mid-handshake still reads the
-            # certificate and key out of the registry.
-            tcp.back_off_after_accept_failure(failures, accepted.err)!
-            continue
-        failures = 0
-        spawn_h2_tls_streaming_conn(listener.handle, accepted.ok)
-    # free the port before draining, and drop the listener's binding to the tls
-    # config only once the drain is over — see listen_h2_tls.
-    shutdown.close_listener(listener.handle)
-    drained := shutdown.drain_default()
-    release_tls_listener(listener)
-    config.close()
-    return drained
+    return listen_h2_tls_loop(host, port, cert, key, streaming_unused_handler, true)!
 
 # --- offline frame tests ---
 #
 # these drive the server's pieces over an offline ServerConn (no socket): the
 # preface check, the request bridge, the response encoder, and the control-frame
 # acks. they assert the exact wire frames, so they are deterministic and fit ci.
-# the concurrent reader/handler/writer round trip is exercised live against curl
-# and a real h2 client (see the phase report), which does not belong in ci.
+# the concurrent reader/handler/writer round trip needs a live client (curl or a
+# real h2 client), so it is not covered here.
 
 # hpack-encode a header list with a fresh encoder, so a fresh decoder (empty
 # dynamic table) decodes it in isolation.
@@ -2022,7 +1944,7 @@ test "an accepted h2c connection is in the drain count before its task runs":
     mut clients: List[Int] := []
     served := accepted_pairs(18871, 8, clients)
     for fd in served:
-        spawn_h2c_conn(fd, ok_handler)
+        spawn_h2c_conn(fd, ok_handler, false)
     # the count is taken on this task, so it is complete the instant the last
     # hand-off returns — it cannot depend on how many of the eight tasks the
     # runtime has got round to starting. with the count taken inside the task
@@ -2047,7 +1969,7 @@ test "an accepted h2c streaming connection is in the drain count before its task
     mut clients: List[Int] := []
     served := accepted_pairs(18872, 4, clients)
     for fd in served:
-        spawn_h2c_streaming_conn(fd)
+        spawn_h2c_conn(fd, streaming_unused_handler, true)
     assert_eq(shutdown.inflight(), 4)
     for c in clients:
         tcp_close(c)
@@ -2074,7 +1996,7 @@ test "an accepted tls connection is in the drain count before its handshake star
         served.push(accepted.ok)
         i = i + 1
     for fd in served:
-        spawn_h2_tls_conn(listener.handle, fd, ok_handler)
+        spawn_h2_tls_conn(listener.handle, fd, ok_handler, false)
     # a connection still mid-handshake is a client waiting for an answer, and it
     # counts from the accept — not from whenever the runtime starts its task.
     assert_eq(shutdown.inflight(), 4)

@@ -15,7 +15,8 @@
 #   +---------------------------------------------------------------+
 #
 # this module reads and writes raw frames and encodes/decodes each typed
-# frame's payload. it holds no connection state — that lives one layer up.
+# frame's payload. it holds no connection state; that lives one layer up,
+# in connection.pith.
 
 import std.bytes as bytes
 import std.bits as bits
@@ -24,38 +25,38 @@ import std.encoding as encoding
 
 # --- frame types (RFC 9113 §6) ---
 
-# DATA frame — carries request/response body octets.
+# DATA frame: carries request/response body octets.
 pub FRAME_DATA := 0
-# HEADERS frame — opens a stream and carries an hpack header block.
+# HEADERS frame: opens a stream and carries an hpack header block.
 pub FRAME_HEADERS := 1
-# PRIORITY frame — advises the peer on stream dependency and weight.
+# PRIORITY frame: advises the peer on stream dependency and weight.
 pub FRAME_PRIORITY := 2
-# RST_STREAM frame — abruptly terminates a stream with an error code.
+# RST_STREAM frame: abruptly terminates a stream with an error code.
 pub FRAME_RST_STREAM := 3
-# SETTINGS frame — negotiates connection-level parameters.
+# SETTINGS frame: negotiates connection-level parameters.
 pub FRAME_SETTINGS := 4
-# PUSH_PROMISE frame — reserves a stream for a server push.
+# PUSH_PROMISE frame: reserves a stream for a server push.
 pub FRAME_PUSH_PROMISE := 5
-# PING frame — measures round-trip time and checks liveness.
+# PING frame: measures round-trip time and checks liveness.
 pub FRAME_PING := 6
-# GOAWAY frame — begins connection shutdown.
+# GOAWAY frame: begins connection shutdown.
 pub FRAME_GOAWAY := 7
-# WINDOW_UPDATE frame — grants additional flow-control credit.
+# WINDOW_UPDATE frame: grants additional flow-control credit.
 pub FRAME_WINDOW_UPDATE := 8
-# CONTINUATION frame — continues a header block that spanned frames.
+# CONTINUATION frame: continues a header block that spanned frames.
 pub FRAME_CONTINUATION := 9
 
 # --- frame flags (RFC 9113 §6) ---
 
-# END_STREAM (DATA, HEADERS) — no more frames will arrive on this stream.
+# END_STREAM (DATA, HEADERS): no more frames will arrive on this stream.
 pub FLAG_END_STREAM := 1
-# ACK (SETTINGS, PING) — acknowledges a peer's frame.
+# ACK (SETTINGS, PING): acknowledges a peer's frame.
 pub FLAG_ACK := 1
-# END_HEADERS (HEADERS, PUSH_PROMISE, CONTINUATION) — header block is complete.
+# END_HEADERS (HEADERS, PUSH_PROMISE, CONTINUATION): header block is complete.
 pub FLAG_END_HEADERS := 4
-# PADDED (DATA, HEADERS, PUSH_PROMISE) — payload begins with a pad-length byte.
+# PADDED (DATA, HEADERS, PUSH_PROMISE): payload begins with a pad-length byte.
 pub FLAG_PADDED := 8
-# PRIORITY (HEADERS) — the header payload carries a priority section.
+# PRIORITY (HEADERS): the header payload carries a priority section.
 pub FLAG_PRIORITY := 32
 
 # --- error codes (RFC 9113 §7) ---
@@ -99,7 +100,7 @@ pub fn error_name(code: Int) -> String:
         return ERROR_NAMES[code]
     return "error {code}"
 
-# the default SETTINGS_MAX_FRAME_SIZE — the smallest a peer may advertise.
+# the default SETTINGS_MAX_FRAME_SIZE, which is also the smallest a peer may advertise.
 pub DEFAULT_MAX_FRAME_SIZE := 16384
 # the largest value SETTINGS_MAX_FRAME_SIZE may take (2^24 - 1).
 pub MAX_ALLOWED_FRAME_SIZE := 16777215
@@ -198,6 +199,8 @@ pub struct ContinuationFrame:
 
 # --- internal helpers ---
 
+# std.binary reports a typed BinaryError; these turn it into a plain failure
+# message so every codec function can keep a `T!` signature.
 fn checked_write(result: Int!binary.BinaryError) -> Int!:
     if result.is_err:
         fail result.err.message

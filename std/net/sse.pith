@@ -68,9 +68,13 @@ fn encode_comment(text: String) -> String:
         return ":" + chr(10) + chr(10)
     return ": " + text + chr(10) + chr(10)
 
+# a frame of only comments parses to an empty event, which parse_all drops.
 fn event_has_content(item: Event) -> Bool:
     return item.event != "" or item.data != "" or item.id != "" or item.retry_ms >= 0
 
+# split a "field: value" line into [field, value]. one space after the colon
+# is part of the separator, as the event-stream format defines; a line with
+# no colon is a field with an empty value.
 fn parse_line_value(line: String) -> List[String]:
     colon := line.index_of(":")
     if colon < 0:
@@ -109,8 +113,7 @@ pub fn parse(frame: String) -> Event!:
     mut id := ""
     mut retry_ms := -1
     mut data_lines: List[String] := []
-    for raw_line in strings.split_lines(frame):
-        line := raw_line
+    for line in strings.split_lines(frame):
         if line == "" or line.starts_with(":"):
             continue
         parts := parse_line_value(line)

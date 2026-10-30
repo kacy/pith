@@ -175,19 +175,6 @@ pub struct MultipartPart:
     pub headers: Map[String, String]
     pub body: Bytes
 
-struct ResponseBodyPlan:
-    kind: Int
-    content_length: Int
-
-fn str_eq(a: String, b: String) -> Bool:
-    if a.len() != b.len():
-        return false
-    mut i := 0
-    while i < a.len():
-        if ord(a[i]) != ord(b[i]):
-            return false
-        i = i + 1
-    return true
 fn char_eq(s: String, idx: Int, ch: String) -> Bool:
     return ord(s[idx]) == ord(ch)
 
@@ -1752,26 +1739,6 @@ impl MultipartPart:
     fn is_file() -> Bool:
         return self.filename != ""
 
-# http wire integers here are decimal and non-negative.
-fn parse_decimal_bytes(raw: Bytes) -> Int!:
-    start := trim_ascii_start(raw, 0, raw.len())
-    end := trim_ascii_end(raw, start, raw.len())
-    if start >= end:
-        fail "expected decimal digits"
-
-    mut value := 0
-    mut pos := start
-    while pos < end:
-        digit := raw[pos]
-        if digit < 48 or digit > 57:
-            fail "expected decimal digits"
-        digit_value := digit - 48
-        if value > DECIMAL_INT_MAX_DIV10 or (value == DECIMAL_INT_MAX_DIV10 and digit_value > DECIMAL_INT_MAX_LAST_DIGIT):
-            fail "integer overflow"
-        value = value * 10 + digit_value
-        pos = pos + 1
-    return value
-
 # where a request or chunked body is read from: a buffered reader, or a tls
 # conn's own byte i/o. the plaintext and tls paths share one head reader, one
 # parser and one chunked decoder over it; only these few reads differ.
@@ -2308,7 +2275,7 @@ pub fn get_header(req: String, name: String) -> String:
                 ci = ci + 1
             if colon > 0:
                 hname := line.substring(0, colon).trim().to_lower()
-                if str_eq(hname, target):
+                if hname == target:
                     if colon + 1 < line_len:
                         return line.substring(colon + 1, line_len).trim()
                     return ""
@@ -3028,23 +2995,6 @@ fn connection_value(wants_close: Bool, http10: Bool, resp: HttpResponse) -> Stri
 
 fn connection_value_for(req: HttpRequestBytes, resp: HttpResponse) -> String:
     return connection_value(request_prefers_close(req), req.version_text == "HTTP/1.0", resp)
-
-fn find_request_head_end_from(raw: Bytes, start: Int) -> Int:
-    mut i := start
-    if i < 0:
-        i = 0
-    while i < raw.len() - 3:
-        if raw[i] == 13 and raw[i + 1] == 10 and raw[i + 2] == 13 and raw[i + 3] == 10:
-            return i + 4
-        i = i + 1
-    i = start
-    if i < 0:
-        i = 0
-    while i < raw.len() - 1:
-        if raw[i] == 10 and raw[i + 1] == 10:
-            return i + 2
-        i = i + 1
-    return -1
 
 # one read through the end of a request head, with the reader's cap failure
 # reported as the head limit. the cap bounds an endless head (slowloris, memory

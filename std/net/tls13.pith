@@ -473,9 +473,6 @@ fn default_client_extensions_with_options(server_name: String, x25519_public_key
         out.write(pre_shared_key_client_extension(psk_identity, psk_obfuscated_ticket_age, psk_binder)!)!
     return out.bytes()
 
-fn default_client_extensions(server_name: String, x25519_public_key: Bytes) -> Bytes!:
-    return default_client_extensions_with_options(server_name, x25519_public_key, bytes.empty(), [], bytes.empty(), bytes.empty(), 0)
-
 fn default_client_extensions_partial_psk(server_name: String, x25519_public_key: Bytes, p256_public_key: Bytes, alpn_protocols: List[String], psk_identity: Bytes, psk_obfuscated_ticket_age: Int) -> Bytes!:
     out := bytes.buffer()
     defer out.free()
@@ -748,11 +745,6 @@ pub fn encode_client_hello_with_options(server_name: String, random: Bytes, sess
     write_u16_be(body, extensions.len())!
     body.write(extensions)!
     return encode_handshake(HANDSHAKE_CLIENT_HELLO, body.bytes())
-
-# The supported_versions extension offering both TLS 1.3 and 1.2, highest first,
-# for a combined ClientHello. The server picks the highest it supports.
-fn supported_versions_client_extension_both() -> Bytes!:
-    return supported_versions_client_extension_list([TLS13_VERSION, TLS_LEGACY_VERSION])!
 
 # a supported_versions client extension listing exactly `versions`, highest
 # first. Used to offer {1.3, 1.2} for the fallback or {1.2} for a max-version cap.

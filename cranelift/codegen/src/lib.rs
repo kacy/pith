@@ -53,9 +53,11 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
     // macos links everything position-independent and its ld rejects text
     // relocations outright, so absolute addressing in the text section (what
-    // cranelift emits by default) fails to link. the gnu toolchain accepts
-    // both, so we only pay the pic addressing cost where it is required.
-    if cfg!(target_os = "macos") {
+    // cranelift emits by default) fails to link. on aarch64 elf, cranelift's
+    // object writer has no support for the page-relative relocation that
+    // non-pic code uses. x86_64 linux accepts both, so only it skips the pic
+    // addressing cost.
+    if cfg!(any(target_os = "macos", target_arch = "aarch64")) {
         flag_builder
             .set("is_pic", "true")
             .map_err(|e| CompileError::ModuleError(e.to_string()))?;

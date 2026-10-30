@@ -4,7 +4,7 @@
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn main() {
@@ -34,6 +34,14 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 fn run_cli() {
     let args: Vec<String> = env::args().collect();
+
+    // the compiler and ir driver this spawns find std through PITH_HOME when
+    // the source file is outside a checkout
+    if env::var_os("PITH_HOME").is_none() {
+        if let Some(home) = install_home() {
+            env::set_var("PITH_HOME", home);
+        }
+    }
 
     if args.len() < 2 {
         print_usage();
@@ -115,9 +123,8 @@ fn run_cli() {
             require_file_arg(&args, "lex");
             lex_file(&args[2]);
         }
-        "version" => {
-            println!("Pith Cranelift Compiler v{}", env!("CARGO_PKG_VERSION"));
-            println!("Using IR path: source → ir_emitter.pith → ir_consumer.rs → native");
+        "version" | "--version" => {
+            println!("pith {}", env!("CARGO_PKG_VERSION"));
         }
         "fmt" | "lint" | "doc" | "new" | "package" | "lsp" => {
             delegate_to_frontend(&args[1..]);
@@ -163,6 +170,7 @@ fn print_usage() {
     println!("  help               Show this help message");
     println!();
     println!("Environment:");
+    println!("  PITH_HOME         Installed toolchain root (default: the directory above bin/pith)");
     println!("  PITH_SELF_HOST    Path to self-hosted compiler (default: ./self-host/pith_main)");
     println!("  PITH_DUMP_IR      Path to dump combined IR text (for debugging)");
 }
@@ -180,12 +188,35 @@ fn combined_output(output: &Output) -> String {
     format!("{}{}", stdout, stderr)
 }
 
+/// The root of an installed toolchain: `PITH_HOME` if set, otherwise the
+/// directory above this binary when it holds `lib/pith_main`, as in
+/// `<home>/bin/pith`. A cargo build inside a checkout has no such directory.
+fn install_home() -> Option<PathBuf> {
+    if let Some(home) = env::var_os("PITH_HOME").filter(|h| !h.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    let exe = fs::canonicalize(env::current_exe().ok()?).ok()?;
+    let home = exe.parent()?.parent()?;
+    home.join("lib/pith_main")
+        .exists()
+        .then(|| home.to_path_buf())
+}
+
+/// A file under the install's `lib/`, if there is an install and it has one.
+fn installed_lib(name: &str) -> Option<String> {
+    let path = install_home()?.join("lib").join(name);
+    path.exists().then(|| path.to_string_lossy().into_owned())
+}
+
 /// Find the self-hosted compiler executable
 fn find_self_hosted_compiler() -> Option<String> {
     if let Ok(path) = env::var("PITH_SELF_HOST") {
         if Path::new(&path).exists() {
             return Some(path);
         }
+    }
+    if let Some(path) = installed_lib("pith_main") {
+        return Some(path);
     }
 
     let candidates = [
@@ -248,6 +279,9 @@ fn find_ir_driver() -> Option<String> {
         if Path::new(&path).exists() {
             return Some(path);
         }
+    }
+    if let Some(path) = installed_lib("ir_driver") {
+        return Some(path);
     }
 
     for dir in &["./self-host", "../self-host"] {

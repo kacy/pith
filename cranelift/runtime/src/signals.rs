@@ -72,17 +72,52 @@ extern "C" fn handle_signal(sig: libc::c_int) {
     if fd < 0 {
         return;
     }
-    // SAFETY: `__errno_location` is async-signal-safe and the pointer it
-    // returns is valid for this thread for the length of the handler.
-    let saved_errno = unsafe { *libc::__errno_location() };
+    // SAFETY: the errno location is async-signal-safe to fetch and valid for
+    // this thread for the length of the handler.
+    let saved_errno = unsafe { *errno_location() };
     let byte = sig as u8;
     // SAFETY: a one-byte write to our own non-blocking pipe write end. `write`
     // is async-signal-safe; the return value is deliberately ignored (see the
     // doc comment on a full pipe).
     unsafe {
         libc::write(fd, &byte as *const u8 as *const libc::c_void, 1);
-        *libc::__errno_location() = saved_errno;
+        *errno_location() = saved_errno;
     }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__errno_location()
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn errno_location() -> *mut libc::c_int {
+    libc::__error()
+}
+
+/// a pipe with both ends close-on-exec and non-blocking. linux sets the flags
+/// as it creates the pipe; macos has no `pipe2`, so they are set after, which
+/// is safe here because the pipe is built before any thread can fork.
+#[cfg(target_os = "linux")]
+unsafe fn cloexec_nonblocking_pipe(fds: &mut [libc::c_int; 2]) -> libc::c_int {
+    libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK)
+}
+
+#[cfg(not(target_os = "linux"))]
+unsafe fn cloexec_nonblocking_pipe(fds: &mut [libc::c_int; 2]) -> libc::c_int {
+    if libc::pipe(fds.as_mut_ptr()) != 0 {
+        return -1;
+    }
+    for &fd in fds.iter() {
+        if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != 0
+            || libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) != 0
+        {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            return -1;
+        }
+    }
+    0
 }
 
 /// build the self-pipe exactly once. both ends are `O_CLOEXEC` (a child process
@@ -93,9 +128,9 @@ fn ensure_pipe() -> bool {
     static PIPE_ONCE: Once = Once::new();
     PIPE_ONCE.call_once(|| {
         let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `pipe2` fills the two-element array we own with the read and
-        // write ends; the return value is checked before either is published.
-        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        // SAFETY: fills the two-element array we own with the read and write
+        // ends; the return value is checked before either is published.
+        let rc = unsafe { cloexec_nonblocking_pipe(&mut fds) };
         if rc != 0 {
             return;
         }

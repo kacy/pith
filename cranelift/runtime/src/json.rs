@@ -257,7 +257,7 @@ fn read_key_end(input: &[u8], pos: usize) -> Option<usize> {
 /// Decode a flat object of scalar fields straight into a pre-allocated
 /// struct in a single pass. The caller allocates the struct (with its
 /// destructor attached) and passes its data pointer; this writes each
-/// matched field into its slot — ints and bools inline, floats as their
+/// matched field into its slot: ints and bools inline, floats as their
 /// f64 bit pattern, strings as fresh counted cstrings the struct then
 /// owns. A float slot takes any json number, an integer one included (`3`
 /// widens to `3.0`); an int slot takes only an integer, so a fraction or

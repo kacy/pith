@@ -4,9 +4,9 @@ use super::*;
 
 /// suspend the green task `id` back to its worker. must be called only from
 /// inside that task (every caller has just gone through a `current_task()`
-/// check, and passes the id it got from it), and only *after* releasing any
-/// channel lock — `suspend` returns control to the worker, which may run other
-/// pith code that touches the same channel.
+/// check, and passes the id it got from it), and only *after* releasing its
+/// block-site lock: `suspend` returns control to the worker, which may run
+/// other pith code that takes the same lock.
 ///
 /// returns when the task is resumed by a later `wake`.
 ///
@@ -28,14 +28,14 @@ pub(crate) fn park_current(id: TaskId) {
         None => ptr::null(),
     };
     // unreachable: a task cannot reach a block site before its body has run and
-    // published the yielder. panic rather than dereference null — `run_task`
+    // published the yielder. panic rather than dereference null: `run_task`
     // catches it, marks the task done and keeps the worker alive, where a null
     // deref would take the process with it.
     assert!(
         !yielder.is_null(),
         "park_current on a task with no running coroutine (id {id})"
     );
-    // SAFETY: as above — the `Yielder` is valid for as long as this coroutine is
+    // SAFETY: as above. the `Yielder` is valid for as long as this coroutine is
     // on-CPU, which is exactly the window in which pith code can reach this
     // call. the suspend is a stack switch back to the worker; nothing retains
     // the pointer across it.
@@ -44,7 +44,7 @@ pub(crate) fn park_current(id: TaskId) {
 
 /// record the running coroutine's `Yielder` in its own sync block, so
 /// `park_current` can find it later. called once, at the top of a task body on
-/// its first resume — before the task can possibly reach a block site.
+/// its first resume, before the task can possibly reach a block site.
 ///
 /// this is a task-entry read of `CURRENT_TASK`, which is the one place the
 /// `CURRENT_*` cells may be consulted: `run_task` has just installed them and
@@ -63,13 +63,14 @@ pub(super) fn publish_yielder(yielder: *const TaskYielder) {
 }
 
 /// wake a parked green task: move it back onto its owner worker's queue so it
-/// resumes and re-checks the channel condition it blocked on. called by
-/// `channel.rs` from a send/recv/close while holding the channel lock; it takes
-/// no scheduler lock itself beyond the owner's queue mutex (the state flip is a
-/// CAS on the task's scheduling word), so the nesting stays block-site -> queue.
-/// safe to call for a task in any state — it acts only when the task is actually
-/// parked, and defers via the wake-pending flag if the task is still mid-suspend,
-/// so a wake is never lost and never double-enqueued.
+/// resumes and re-checks the condition it blocked on. block sites call it
+/// while holding their own lock (a channel send/recv/close, a mutex unlock, a
+/// task finishing); it takes no scheduler lock itself beyond the owner's queue
+/// mutex (the state flip is a CAS on the task's scheduling word), so the
+/// nesting stays block-site -> queue. safe to call for a task in any state: it
+/// acts only when the task is actually parked, and defers via the wake-pending
+/// flag if the task is still mid-suspend, so a wake is never lost and never
+/// double-enqueued.
 pub(crate) fn wake(id: TaskId) {
     let Some(block) = sync_block(id) else {
         return;
@@ -94,8 +95,8 @@ pub(crate) fn wake(id: TaskId) {
 /// with migration on (the default, read once into the scheduler), a worker
 /// that wakes a task pinned to a different worker takes it: the
 /// owner bits are rewritten in the claiming CAS, so from the moment the task
-/// is `Ready` every reader of the word — the enqueue below, the resume that
-/// follows, the next wake — agrees on the new home. a pair of tasks that talk
+/// is `Ready` every reader of the word (the enqueue below, the resume that
+/// follows, the next wake) agrees on the new home. a pair of tasks that talk
 /// to each other converge onto one worker after the first exchange, and stay
 /// there: a wake from the same worker moves nothing. a waker that is not a
 /// worker (`main`, a blocking-pool thread) has nowhere to take the task and
@@ -103,8 +104,8 @@ pub(crate) fn wake(id: TaskId) {
 /// back to its owner.
 ///
 /// this is only sound because nothing on the resumable path derives a value
-/// from the thread the task parked on — see the accessor block above
-/// `current_task`, and the pinning section of the module doc.
+/// from the thread the task parked on. see the accessor block above
+/// `current_task`, and the placement section of the module doc.
 #[inline]
 pub(super) fn claim_parked(block: &SyncBlock) -> Option<Option<usize>> {
     let sched = scheduler();
@@ -161,13 +162,13 @@ pub(super) fn claim_parked(block: &SyncBlock) -> Option<Option<usize>> {
 /// wake a parked green task and, if it is truly parked, run `fetch` and hand it
 /// the result: a channel send that wakes a parked receiver dequeues on the
 /// receiver's behalf, so the receiver resumes with the value in hand instead of
-/// re-locking the channel and re-trying the ring — go-style direct handoff, but
-/// keeping the ring as the ordering source so fifo holds. `fetch` runs only
+/// re-locking the channel and re-trying the ring. this is go-style direct
+/// handoff, but the ring stays the ordering source so fifo holds. `fetch` runs only
 /// after the task is claimed (the Parked -> Ready CAS), which is what makes
 /// handing over safe: a task that is still `Running` might complete its own
 /// attempt, so it gets a plain pending-flag wake and the value stays in the
 /// ring. a `fetch` that comes back empty (a racing consumer drained the ring)
-/// still wakes the task valueless — it re-checks and re-parks, the usual
+/// still wakes the task valueless; it re-checks and re-parks, the usual
 /// tolerance.
 pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
     let Some(block) = sync_block(id) else {
@@ -197,8 +198,8 @@ pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
 pub(crate) fn take_handoff(id: TaskId) -> Option<i64> {
     let block = sync_block(id)?;
     // SAFETY: only the running task itself reads its handoff cell, and a
-    // claiming waker only writes it while the task is Parked — disjoint by the
-    // state machine (see `SyncBlock::handoff`).
+    // claiming waker only writes it while the task is Parked. the state
+    // machine keeps the two disjoint (see `SyncBlock::handoff`).
     unsafe { (*block.handoff.get()).take() }
 }
 
@@ -279,8 +280,8 @@ pub(super) fn any_stealable() -> bool {
 /// re-enqueue a *woken started* task onto its owner worker's pinned queue and
 /// wake the pool. this is the only path a task that has already resumed takes
 /// back into scheduling, and it always targets the owner recorded in the
-/// task's word — which is the worker that first ran it, or, with migration
-/// on, the worker whose wake just claimed it (see `claim_parked`).
+/// task's word: the worker that first ran it, or a worker that has since
+/// taken it over (a migrating wake in `claim_parked`, or `steal_pinned`).
 pub(super) fn enqueue_woken(owner: usize, id: TaskId) {
     let sched = scheduler();
     {
@@ -296,11 +297,11 @@ pub(super) fn enqueue_woken(owner: usize, id: TaskId) {
         };
         // wake affinity: when the waker is the owner worker itself, the woken
         // task is usually the other half of a handoff the current task just
-        // completed — ask to run it next, while its data is hot, instead of
+        // completed, so ask to run it next, while its data is hot, instead of
         // behind every earlier wake. it goes in the single `next` slot, so the
         // second such wake displaces the first to the back of the fifo: a
         // ping-ponging pair yields the slot on every exchange and cannot starve
-        // the tasks queued behind it (preemption cannot rescue that shape —
+        // the tasks queued behind it (preemption cannot rescue that shape:
         // each half re-parks long before it overruns a quantum). cross-worker
         // wakes are plain fifo.
         if current_worker() == Some(owner) {
@@ -319,12 +320,12 @@ pub(super) fn enqueue_woken(owner: usize, id: TaskId) {
 }
 
 /// re-enqueue a *preempted* started task onto its owner worker's `deferred`
-/// queue, the lowest-priority spot. like `enqueue_woken` it always targets the
-/// owner (pinning holds — the suspended coroutine resumes on the same worker) and
-/// nudges only the owner. the difference is purely priority: `find_work` drains
-/// this queue only when the worker has nothing else to do, so a preempted compute
-/// task cannot crowd out other ready work — that is what makes preemption
-/// actually relieve starvation rather than just re-select the same hog.
+/// queue, the lowest-priority spot. like `enqueue_woken` it targets the owner
+/// and nudges only the owner; no peer ever takes from a deferred queue. the
+/// difference is priority: `find_work` drains this queue last (or on the
+/// periodic deferred turn), so a preempted compute task cannot crowd out other
+/// ready work. that is what makes preemption relieve starvation rather than
+/// re-select the same hog.
 pub(super) fn enqueue_preempted(owner: usize, id: TaskId) {
     let sched = scheduler();
     sched.workers[owner]

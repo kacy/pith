@@ -4,7 +4,10 @@
 //! - Reference counting (ARC) with cycle collection
 //! - String operations
 //! - Collections (List, Map, Set)
-//! - Concurrency primitives
+//! - Concurrency: tasks (green threads by default on linux), channels and
+//!   locks
+//! - I/O: files, sockets on an epoll reactor, processes, terminals
+//! - Hashing, crypto and compression helpers
 //!
 //! The runtime is designed to be called from Cranelift-generated code
 //! via a C-compatible FFI boundary.
@@ -19,7 +22,7 @@
 /// - a panic raised anywhere the green spawn path reaches runs inside whatever
 ///   task called it, and `run_task` wraps every task resume in `catch_unwind`.
 ///   The task dies without ever setting `join.done`, so every awaiter blocks
-///   forever — a silent wedge rather than a crash.
+///   forever: a silent wedge rather than a crash.
 /// - a panic inside a `Once::call_once` (worker startup, reactor startup)
 ///   poisons the `Once`, so every later caller panics too.
 /// - neither cargo profile sets `panic = "abort"`, so nothing turns either of
@@ -36,6 +39,7 @@ macro_rules! runtime_fatal {
     }};
 }
 
+pub mod alloc_sites;
 pub mod argon2;
 pub mod blake2b;
 pub mod blocking;
@@ -52,14 +56,13 @@ pub mod fdio;
 pub mod ffi_util;
 pub mod handle_registry;
 pub mod hash_blocks;
-pub(crate) mod int_hash;
-pub mod zstd_codec;
 pub mod host_fs;
+pub(crate) mod int_hash;
 pub mod json;
 // the netpoller is epoll-based, so it only builds on linux. everywhere else a
-// fallback with the same two entry points keeps `network` compiling — at the
-// cost of green tasks parking their worker on socket i/o. see
-// `netpoll_fallback` for what that means in practice.
+// fallback with the same entry points keeps `network` compiling, at the cost
+// of green tasks parking their worker on socket i/o. see `netpoll_fallback`
+// for what that means in practice.
 #[cfg(target_os = "linux")]
 pub mod netpoll;
 #[cfg(not(target_os = "linux"))]
@@ -67,20 +70,20 @@ pub mod netpoll;
 pub mod netpoll;
 pub mod network;
 pub mod perf;
-pub mod sampler;
-pub mod alloc_sites;
-pub mod switches;
-pub mod share;
 pub mod platform;
 pub mod process;
 pub mod process_io;
-pub mod signals;
-pub mod terminal;
 pub mod runtime_core;
+pub mod sampler;
+pub mod share;
+pub mod signals;
 pub mod string;
 pub mod string_list;
 pub mod substring;
+pub mod switches;
+pub mod terminal;
 pub mod utility;
+pub mod zstd_codec;
 
 pub use encoding::*;
 pub use host_fs::*;

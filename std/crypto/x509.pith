@@ -261,13 +261,10 @@ fn parse_spki_public_key(data: Bytes, value: DerValue) -> Bytes!:
     key_bits := expect_tag(data, alg.next, TAG_BIT_STRING)!
     return read_bit_string(data, key_bits)!
 
-fn byte_to_decimal(value: Int) -> String:
-    return value.to_string()
-
 fn read_ip_address(data: Bytes, value: DerValue) -> String!:
     body := value_bytes(data, value)
     if body.len() == 4:
-        return byte_to_decimal(body[0]) + "." + byte_to_decimal(body[1]) + "." + byte_to_decimal(body[2]) + "." + byte_to_decimal(body[3])
+        return "{body[0]}.{body[1]}.{body[2]}.{body[3]}"
     return encoding.to_hex(body)
 
 fn parse_san(data: Bytes, extn_value: DerValue, dns_names: List[String], ip_addresses: List[String]) -> Bool!:

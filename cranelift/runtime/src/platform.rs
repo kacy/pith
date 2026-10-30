@@ -1,8 +1,13 @@
+//! process-level builtins: exit, sleep, clocks, reading a stdin line, `exec`,
+//! the shared random number generator, and float formatting.
+
 use crate::ffi_util::cstr_str;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
+/// the state of the process-wide LCG behind `pith_random_float`, reseeded by
+/// `pith_random_seed`.
 static RANDOM_SEED: AtomicU64 = AtomicU64::new(123456789);
 
 /// Process-start reference point for the monotonic clock.
@@ -22,14 +27,13 @@ pub extern "C" fn pith_exit(code: i64) {
 /// Sleep for given number of milliseconds.
 ///
 /// from inside a green task this parks the *task* on the reactor's timer heap
-/// and gives the worker back — a sleeping task must not stall every other task
-/// pinned to its worker (`select`'s idle probe sleeps in a loop, so before
-/// this two idle selects could occupy a whole two-worker pool). the guard is
-/// the same one `dns.rs` uses: `current_task()` is `None` on the main thread,
-/// on any plain OS thread, and on the whole os-thread backend, and there
-/// blocking the thread is exactly right, so that path is unchanged. on
-/// non-linux there is no reactor and `netpoll`'s fallback blocks the worker,
-/// consistent with how socket waits degrade there.
+/// and gives the worker back: a sleeping task must not stall every other task
+/// queued on its worker (`select`'s idle probe sleeps in a loop, so two idle
+/// selects blocking their workers could occupy a whole two-worker pool).
+/// `current_task()` is `None` on the main thread, on any plain OS thread, and
+/// on the whole os-thread backend, and there blocking the thread is exactly
+/// right. on non-linux there is no reactor and `netpoll`'s fallback blocks the
+/// worker, consistent with how socket waits degrade there.
 #[no_mangle]
 pub extern "C" fn pith_sleep(ms: i64) {
     // a negative duration is not a very long one: `ms as u64` turns -5 into
@@ -135,7 +139,7 @@ pub extern "C" fn pith_random_float() -> f64 {
     // step the seed with a compare-exchange rather than a load/store pair: two
     // tasks on different workers drawing at once must each claim a distinct
     // step of the sequence, not both advance from the same seed and return the
-    // identical "random" value. relaxed ordering is enough — the value itself
+    // identical "random" value. relaxed ordering is enough: the value itself
     // is the only payload, nothing else is published through it.
     let prev = RANDOM_SEED
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |s| Some(lcg_step(s)))

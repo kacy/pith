@@ -9,13 +9,12 @@
 //!
 //! Unlike the channel/waitgroup/semaphore primitives, this lock is not built on
 //! a `Condvar`: an os-thread waiter never blocks, it spins and then yields,
-//! whichever backend is active. A
-//! **green task** (under `PITH_GREEN`) must not spin forever: if it holds the
-//! lock and yields elsewhere, another green task hard-spinning to acquire the
-//! same lock would peg its worker and could starve the holder that needs that
-//! worker to resume and unlock. So a contended green task registers on
-//! `green_waiters` and suspends its coroutine back to the scheduler; `unlock`
-//! drains that list and wakes them to retry.
+//! whichever backend is active. A **green task** must not spin forever: if it
+//! holds the lock and yields elsewhere, another green task hard-spinning to
+//! acquire the same lock would peg its worker and could starve the holder
+//! that needs that worker to resume and unlock. So a contended green task
+//! registers on `green_waiters` and suspends its coroutine back to the
+//! scheduler; `unlock` drains that list and wakes them to retry.
 //!
 //! ## the register/park race (why the re-check under the waiter lock)
 //!
@@ -75,11 +74,9 @@ fn lock_waiters(m: &PithMutex) -> std::sync::MutexGuard<'_, Vec<usize>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// try to take the lock exactly once with a *strong* compare-exchange. strong
-/// (not `_weak`) matters on the green path: a spurious weak failure there would
-/// one strong compare-exchange. a weak one could fail spuriously and send a
-/// green task off to park while the lock is free, with no unlock coming to wake
-/// it.
+/// try to take the lock exactly once, with a *strong* compare-exchange. on the
+/// green path a weak one could fail spuriously and send a task off to park
+/// while the lock is free, with no unlock coming to wake it.
 fn try_acquire(m: &PithMutex) -> bool {
     m.state
         .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
@@ -156,8 +153,8 @@ pub unsafe extern "C" fn pith_mutex_lock(handle: *mut PithMutexHandle) {
     let Some(m) = mutex_ref(handle) else {
         return;
     };
-    // inside a green task? yield on contention. otherwise (main thread /
-    // os-thread backend) spin-then-yield exactly as before.
+    // inside a green task, park on contention. otherwise (main thread,
+    // os-thread backend) spin, then yield the thread.
     match green::current_task() {
         Some(id) => lock_green(m, id),
         None => lock_os(m),

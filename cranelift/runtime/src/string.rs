@@ -1,9 +1,10 @@
-//! String operations for the Pith runtime
+//! The `PithString` (pointer, length, heap flag) entry points, and
+//! `pith_cstring_len`, which every string length in compiled code goes
+//! through.
 //!
-//! Hybrid approach: Idiomatic Rust internally, C-compatible FFI boundary.
-//!
-//! The FFI layer uses `PithString` structs that are compatible with the C runtime.
-//! Internally, we use `std::string::String` for all operations.
+//! Compiled code passes most strings as headered cstrings (see the refcounted
+//! c strings section of `runtime_core.rs`); `PithString` is the by-value form
+//! a few older entry points still take.
 
 use std::alloc::dealloc;
 
@@ -116,20 +117,7 @@ pub unsafe extern "C" fn pith_string_from_cstr_ptr(cstr: *const i8, out_ptr: *mu
         return;
     }
 
-    let result = if cstr.is_null() {
-        EMPTY_STRING
-    } else {
-        // Manual strlen
-        let mut len = 0;
-        let mut p = cstr;
-        while *p != 0 {
-            len += 1;
-            p = p.add(1);
-        }
-        pith_string_new(cstr as *const u8, len)
-    };
-
-    *out_ptr = result;
+    *out_ptr = pith_string_from_cstr(cstr);
 }
 
 /// Retain a string.
@@ -141,7 +129,7 @@ pub unsafe extern "C" fn pith_string_from_cstr_ptr(cstr: *const i8, out_ptr: *mu
 /// no-op under the current model.
 ///
 /// The symbol is kept so the retain/release pair stays symmetric. If strings
-/// ever move to shared ownership, the count increment belongs here — and
+/// ever move to shared ownership, the count increment belongs here, and
 /// `pith_from_str` and `pith_string_release` would need a matching count
 /// header.
 #[no_mangle]
@@ -231,11 +219,8 @@ pub unsafe extern "C" fn pith_string_trim(s: PithString) -> PithString {
     pith_from_str(as_str(&s).trim())
 }
 
-// ============================================================================
-// Simple strlen-based length (for debugging ABI issues)
-// ============================================================================
-
-/// Simple strlen-based length for null-terminated strings
+/// The byte length of a cstring: read from the header when it has one,
+/// counted to the NUL otherwise.
 #[no_mangle]
 pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
     if cstr.is_null() {
@@ -243,8 +228,8 @@ pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
     }
     unsafe {
         // heap cstrings carry their length in the refcount header, which
-        // turns every s.len() — including loops over multi-megabyte
-        // strings — into one read instead of a strlen
+        // turns every s.len(), including loops over multi-megabyte
+        // strings, into one read instead of a strlen
         if let Some(len) = crate::cstring_header_len(cstr) {
             return len;
         }
@@ -356,7 +341,7 @@ mod tests {
 
     // a heap string owns its buffer; retain leaves it untouched and a single
     // release frees it. this is the retain/release contract under copy-on-derive
-    // ownership — one retain, one release, no double free.
+    // ownership: one retain, one release, no double free.
     #[test]
     fn retain_keeps_the_buffer_intact_then_release_frees() {
         unsafe {

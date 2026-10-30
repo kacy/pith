@@ -8,7 +8,7 @@
 //! cannot avoid having concurrent readers: `getaddrinfo` on the resolver pool
 //! consults `RES_OPTIONS`, `LOCALDOMAIN` and `HOSTALIASES`, `execvp` in a
 //! spawning child reads `PATH`, and any C library linked into the program may
-//! read whatever it likes. rust's own env lock does not help — it is private to
+//! read whatever it likes. rust's own env lock does not help: it is private to
 //! rust-side accesses and libc has never heard of it.
 //!
 //! so the runtime stops writing to libc's environment. `os.set_env` and
@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 /// what the program did to one name. `Some(value)` is a `set_env`, `None` an
-/// `unset_env` — the tombstone matters, because without it an unset name would
+/// `unset_env`: the tombstone matters, because without it an unset name would
 /// fall through to libc and read the value the process started with.
 type Entry = Option<String>;
 
@@ -46,18 +46,18 @@ fn table() -> &'static RwLock<BTreeMap<String, Entry>> {
     TABLE.get_or_init(|| RwLock::new(BTreeMap::new()))
 }
 
-/// false until the first write. a program that never calls `set_env` — nearly
-/// all of them — reads one relaxed atomic per lookup and never touches the lock.
+/// false until the first write. a program that never calls `set_env` (nearly
+/// all of them) reads one atomic per lookup and never touches the lock.
 static WRITTEN: AtomicBool = AtomicBool::new(false);
 
 /// read the lock, ignoring poisoning. a panic while the map was borrowed cannot
 /// leave it torn (every mutation is a single `insert`), so refusing to read
 /// afterwards would turn a survivable panic into a dead environment.
-fn read() -> std::sync::RwLockReadGuard<'static, BTreeMap<String, Entry>> {
+fn read_table() -> std::sync::RwLockReadGuard<'static, BTreeMap<String, Entry>> {
     table().read().unwrap_or_else(|err| err.into_inner())
 }
 
-fn write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<String, Entry>> {
+fn write_table() -> std::sync::RwLockWriteGuard<'static, BTreeMap<String, Entry>> {
     table().write().unwrap_or_else(|err| err.into_inner())
 }
 
@@ -65,7 +65,7 @@ fn write() -> std::sync::RwLockWriteGuard<'static, BTreeMap<String, Entry>> {
 /// written that name, and the process environment otherwise.
 pub fn get(name: &str) -> Option<String> {
     if WRITTEN.load(Ordering::Acquire) {
-        if let Some(entry) = read().get(name) {
+        if let Some(entry) = read_table().get(name) {
             return entry.clone();
         }
     }
@@ -74,26 +74,26 @@ pub fn get(name: &str) -> Option<String> {
 
 /// record `name = value`. deliberately does not call `setenv`.
 pub fn set(name: &str, value: &str) {
-    write().insert(name.to_string(), Some(value.to_string()));
+    write_table().insert(name.to_string(), Some(value.to_string()));
     WRITTEN.store(true, Ordering::Release);
 }
 
 /// record that `name` is unset. deliberately does not call `unsetenv`.
 pub fn unset(name: &str) {
-    write().insert(name.to_string(), None);
+    write_table().insert(name.to_string(), None);
     WRITTEN.store(true, Ordering::Release);
 }
 
 /// merge the overlay into a child's environment.
 ///
 /// call this before any per-command `env` override, so an override the caller
-/// asked for wins over what the program set process-wide — `Command` keeps the
+/// asked for wins over what the program set process-wide: `Command` keeps the
 /// last write for a name.
 pub fn apply(command: &mut Command) {
     if !WRITTEN.load(Ordering::Acquire) {
         return;
     }
-    for (name, entry) in read().iter() {
+    for (name, entry) in read_table().iter() {
         match entry {
             Some(value) => command.env(name, value),
             None => command.env_remove(name),
@@ -105,7 +105,7 @@ pub fn apply(command: &mut Command) {
 /// runtime callers reach for `get` and `apply`.
 #[cfg(test)]
 fn entries() -> Vec<(String, Entry)> {
-    read()
+    read_table()
         .iter()
         .map(|(name, entry)| (name.clone(), entry.clone()))
         .collect()

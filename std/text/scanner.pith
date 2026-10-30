@@ -1,11 +1,10 @@
 # std.text.scanner - small cursor helpers for source-like text
 #
-# the cursor is measured in characters, not in bytes. `pos` is a byte offset —
-# it has to be, since that is how a String is indexed — but it only ever lands
-# on a character boundary, and `col` counts characters. that distinction used to
-# exist only in this comment: peek read one byte, advance moved one byte, and
-# the first slice taken at a position inside a multi-byte character stopped the
-# process, which `take_until(new("é:"), ":")` did on its very first check.
+# the cursor is measured in characters, not bytes. `pos` is a byte offset,
+# since that is how a String is indexed, but every step moves by a whole
+# character, so `pos` only lands on a character boundary and `col` counts
+# characters. slicing a String inside a multi-byte character is a hard error,
+# so a scan over text with an accent in it must never stop between bytes.
 
 import std.text as text
 

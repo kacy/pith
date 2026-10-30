@@ -1,8 +1,7 @@
+//! The counters `PITH_PERF_STATS` turns on, and the report printed at exit.
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Global statistics for debugging
-pub static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
-pub static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
 // count operations by kind: the retains and releases of each counted kind
 // the strings do not already cover, the struct releases that took the
 // sole-owner path, and weak references. indexed by the RC_* constants.
@@ -88,8 +87,8 @@ pub static PERF_GREEN_WAKES_CROSS: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_GREEN_WAKES_REACTOR: AtomicUsize = AtomicUsize::new(0);
 pub static PERF_GREEN_MIGRATIONS: AtomicUsize = AtomicUsize::new(0);
 // preemption safe-points. CHECKS counts the safe-points that took the slow path
-// — the monitor had set the request flag, so the task called into the runtime to
-// find out whether it was the one overrunning — and PREEMPTIONS the calls that
+// (the monitor had set the request flag, so the task called into the runtime to
+// find out whether it was the one overrunning), and PREEMPTIONS the calls that
 // ended in a park. the gap between them is the cost of the flag being global:
 // one task overrunning wakes every running task at its next back-edge.
 pub static PERF_GREEN_PREEMPT_CHECKS: AtomicUsize = AtomicUsize::new(0);
@@ -158,21 +157,21 @@ pub fn perf_count(counter: &AtomicUsize, delta: usize) {
 /// These are `#[cold]` and never inlined on purpose. Folding the counter
 /// updates into the caller costs far more than the updates themselves: the
 /// address materialisation and the atomic add need callee-saved registers, so
-/// every hooked entry point — including ones that are otherwise leaf functions
-/// — was pushing registers and building a stack frame on every call, whether
-/// or not stats were on. Behind a call, the caller keeps its frameless fast
+/// every hooked entry point, including ones that are otherwise leaf
+/// functions, was pushing registers and building a stack frame on every
+/// call, whether or not stats were on. Behind a call, the caller keeps its frameless fast
 /// path and pays only the enabled-check.
 #[cold]
 #[inline(never)]
 pub fn perf_record1(a: &AtomicUsize, da: usize) {
-    ensure_perf_stats_registered_slow();
+    ensure_perf_report_registered();
     a.fetch_add(da, Ordering::Relaxed);
 }
 
 #[cold]
 #[inline(never)]
 pub fn perf_record2(a: &AtomicUsize, da: usize, b: &AtomicUsize, db: usize) {
-    ensure_perf_stats_registered_slow();
+    ensure_perf_report_registered();
     a.fetch_add(da, Ordering::Relaxed);
     b.fetch_add(db, Ordering::Relaxed);
 }
@@ -187,7 +186,7 @@ pub fn perf_record3(
     c: &AtomicUsize,
     dc: usize,
 ) {
-    ensure_perf_stats_registered_slow();
+    ensure_perf_report_registered();
     a.fetch_add(da, Ordering::Relaxed);
     b.fetch_add(db, Ordering::Relaxed);
     c.fetch_add(dc, Ordering::Relaxed);
@@ -200,7 +199,7 @@ pub fn perf_record3(
 /// used to pay for its own `perf_stats_enabled()` load: the registration hook
 /// plus one per counter, none of which LLVM can merge because they read a
 /// relaxed atomic. Grouping them behind a single check leaves the disabled
-/// path — every run that is not explicitly profiling — costing one relaxed
+/// path (every run that is not explicitly profiling) costing one relaxed
 /// load and a perfectly predicted branch for the whole group. That matters
 /// because of the volumes involved: type-checking the self-hosted compiler
 /// indexes lists over 185 million times in about a second, so a couple of
@@ -229,16 +228,9 @@ extern "C" fn pith_perf_dump_stats_at_exit() {
     dump_perf_stats();
 }
 
-#[inline(always)]
-pub fn ensure_perf_stats_registered() {
-    if !perf_stats_enabled() {
-        return;
-    }
-    ensure_perf_stats_registered_slow();
-}
-
+/// Arrange for the report to print at exit, on the first counter recorded.
 #[cold]
-fn ensure_perf_stats_registered_slow() {
+fn ensure_perf_report_registered() {
     if PERF_STATS_REGISTERED.swap(true, Ordering::Relaxed) {
         return;
     }

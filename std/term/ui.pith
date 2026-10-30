@@ -2,10 +2,10 @@
 #
 # widgets render application state as blocks of text: an App's view()
 # composes them with std.term.style and hands the result to the runtime.
-# display widgets are plain functions from state to string; the module
-# grows in layers, and this one carries text, boxes, and indicators —
-# wrapped paragraphs with styled spans, titled blocks, progress bars,
-# spinners, tab rows, and the help line built from an App's keybindings.
+# display widgets are plain functions from state to string. this module
+# carries text, boxes, and indicators: wrapped paragraphs with styled spans,
+# titled blocks, progress bars, spinners, tab rows, and the help line built
+# from an App's keybindings.
 #
 #   bar := ui.progress(20)
 #   frame := ui.block().with_title("sync").render(bar.view(0.4))
@@ -82,15 +82,12 @@ pub fn paragraph(spans: List[Span], cols: Int) -> String:
             needed = wcols
         if used > 0:
             line.push(" ")
-        line.push(render_word(spans, word_spans[i], w))
+        line.push(spans[word_spans[i]].st.render(w))
         used = used + needed
         i = i + 1
     if line.len() > 0:
         lines.push(line.join(""))
     return lines.join("\n")
-
-fn render_word(spans: List[Span], index: Int, w: String) -> String:
-    return spans[index].st.render(w)
 
 # split one word into pieces no wider than `cols`, never inside a cluster.
 fn split_to_fit(w: String, cols: Int) -> List[String]:

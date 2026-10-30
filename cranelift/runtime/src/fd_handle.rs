@@ -1,15 +1,15 @@
 //! fd-backed handles that carry liveness.
 //!
-//! a socket or a child's pipe used to reach the language as its raw descriptor
-//! number, and the number is the whole problem. the kernel hands a closed fd's
-//! number to the very next `open`, `accept` or `pipe` anywhere in the process,
-//! so a task still holding the old number talks to whatever took it: it reads
-//! another connection's bytes, or writes over them, with nothing to object.
-//! a close racing a read on the same connection is the ordinary way to get
-//! there, and every std type that wraps a socket coordinated around it by hand
+//! a raw descriptor number is not safe to hand to the language as a socket or
+//! pipe handle. the kernel hands a closed fd's number to the very next `open`,
+//! `accept` or `pipe` anywhere in the process, so a task still holding the old
+//! number talks to whatever took it: it reads another connection's bytes, or
+//! writes over them, with nothing to object. a close racing a read on the same
+//! connection is the ordinary way to get there, and without this module every
+//! std type that wraps a socket would have to coordinate around it by hand
 //! (`shutdown` first, wait for the reader, then close).
 //!
-//! the handle the language holds is now `(generation << 32) | fd`: the number
+//! the handle the language holds is `(generation << 32) | fd`: the number
 //! plus a per-number generation that changes every time the number is opened,
 //! the same shape task handles have. a stale handle names a generation that is
 //! gone, so a call on it fails with an ordinary error instead of reaching the
@@ -40,7 +40,7 @@
 //! guard, and one compare-exchange to drop it.
 //!
 //! a handle's generation starts at zero, so the first handle on a number is
-//! the number itself — the encoding task handles use for the same reason —
+//! the number itself (the encoding task handles use for the same reason),
 //! except on fd 0, whose handle would be the "no handle" value and so starts
 //! at one. generations wrap at 2^31 and never collide in practice: a number
 //! would have to be opened two billion times while one stale handle was kept.
@@ -78,7 +78,7 @@ pub(crate) enum FdKind {
 
 const GEN_SHIFT: u32 = 32;
 /// 31 bits of generation keep the handle's sign bit clear: every handle is a
-/// positive `i64`, and 0 stays "no handle" as it always was.
+/// positive `i64`, and 0 stays "no handle".
 const GEN_MASK: u64 = 0x7fff_ffff;
 const LIVE: u64 = 1 << 31;
 const PIPE: u64 = 1 << 30;
@@ -191,7 +191,7 @@ fn make_handle(fd: usize, generation: u64) -> i64 {
 }
 
 /// register a descriptor pith just opened and return its handle: the fd
-/// stamped with the next generation for that number. `0` — no handle — when the
+/// stamped with the next generation for that number. `0` (no handle) when the
 /// fd is out of range, in which case the caller still owns it and closes it.
 ///
 /// the number's previous handle, if it had one, is necessarily dead by now:
@@ -266,7 +266,7 @@ impl Drop for Guard {
 }
 
 /// take a hold on `handle` for a syscall of `kind`. `None` when the handle is
-/// stale — closed, never opened, of the other kind, or not a handle at all —
+/// stale (closed, never opened, of the other kind, or not a handle at all),
 /// which the caller reports as an ordinary failed call.
 pub(crate) fn acquire(handle: i64, kind: FdKind) -> Option<Guard> {
     let (fd, generation) = split(handle)?;
@@ -431,11 +431,11 @@ pub(crate) fn deadline(fd: RawFd, write: bool) -> Option<Instant> {
 }
 
 /// close `handle`. returns true when this call retired it; false for a handle
-/// that is stale — already closed, or never a handle — which makes a second
+/// that is stale (already closed, or never a handle), which makes a second
 /// close a no-op rather than a `close(2)` on whatever now holds the number.
 ///
 /// with no call in flight the fd is closed here. with users inside, the handle
-/// is marked dead — no new call can take a hold — and the users are woken: a
+/// is marked dead (no new call can take a hold) and the users are woken: a
 /// socket is shut down in both directions, which returns a blocked `recv`,
 /// `send`, `accept` or `poll` on it with nothing, and the reactor resolves
 /// every parked waiter with a closed outcome. each of those calls then sees the
@@ -603,7 +603,7 @@ mod tests {
     #[test]
     fn fd_zero_gets_a_handle_that_is_not_the_no_handle_value() {
         // stdin is closed in this test binary's children only, so stand in
-        // for it with a dup onto 0 here — nothing in cargo's test harness
+        // for it with a dup onto 0 here; nothing in cargo's test harness
         // reads it.
         let fd = socket_fd();
         // SAFETY: dup2 onto stdin, which this test process does not read.

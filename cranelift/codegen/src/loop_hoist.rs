@@ -200,6 +200,7 @@ fn calls_out(func: &Function, block: Block, keep_calls: &[u32]) -> bool {
     })
 }
 
+/// Whether `inst` is a list header read the codegen marked for this pass.
 fn is_header_read(func: &Function, inst: Inst) -> bool {
     matches!(
         func.dfg.insts[inst],
@@ -233,7 +234,7 @@ struct Hoist<'a> {
 
 impl Hoist<'_> {
     /// Move `inst` in front of the entry jump if its arguments are, or can
-    /// be made, available there.
+    /// be made, available there, and answer whether it moved.
     fn try_inst(&mut self, inst: Inst) -> bool {
         let args: Vec<Value> = self.func.dfg.inst_values(inst).map(|v| self.copy_of(v)).collect();
         if !args.into_iter().all(|arg| self.try_value(arg)) {
@@ -249,12 +250,14 @@ impl Hoist<'_> {
         true
     }
 
-    /// Whether `value` is available in front of the entry jump, moving the
-    /// pure instruction that defines it there if that is what it takes.
+    /// The value `value` stands for in the loop: the one value it holds when
+    /// it is a loop parameter that never changes, or else itself.
     fn copy_of(&self, value: Value) -> Value {
         self.copies.get(&value).copied().unwrap_or(value)
     }
 
+    /// Whether `value` is available in front of the entry jump, moving the
+    /// pure instruction that defines it there if that is what it takes.
     fn try_value(&mut self, value: Value) -> bool {
         let value = self.func.dfg.resolve_aliases(value);
         let (block, inst) = match self.func.dfg.value_def(value) {

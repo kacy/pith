@@ -185,13 +185,13 @@ fn atomic_max_float(cell: AtomicInt, value: Float):
 
 # record a metric's help text and/or unit (first non-empty value wins).
 fn register_description(bare: String, help: String, unit: String):
-    s := shard_of(bare)
-    shard_mu[s].lock()
-    if help != "" and not metric_descriptions[s].contains_key(bare):
-        metric_descriptions[s].insert(bare, help)
-    if unit != "" and not metric_units[s].contains_key(bare):
-        metric_units[s].insert(bare, unit)
-    shard_mu[s].unlock()
+    shard := shard_of(bare)
+    shard_mu[shard].lock()
+    if help != "" and not metric_descriptions[shard].contains_key(bare):
+        metric_descriptions[shard].insert(bare, help)
+    if unit != "" and not metric_units[shard].contains_key(bare):
+        metric_units[shard].insert(bare, unit)
+    shard_mu[shard].unlock()
 
 # escape help text for a prometheus `# HELP` line: backslash and newline only
 # (unlike a label value, a double-quote needs no escaping here).
@@ -250,24 +250,24 @@ fn escape_label_value(value: String) -> String:
 fn label_suffix(pairs: List[String]) -> String:
     if pairs.len() < 2:
         return ""
-    mut kv: Map[String, String] := {}
-    mut keys: List[String] := []
+    mut value_by_name: Map[String, String] := {}
+    mut names: List[String] := []
     mut i := 0
     while i + 1 < pairs.len():
-        k := normalize_label_name(pairs[i])
-        if not kv.contains_key(k):
-            keys.push(k)
-        kv.insert(k, pairs[i + 1])
+        name := normalize_label_name(pairs[i])
+        if not value_by_name.contains_key(name):
+            names.push(name)
+        value_by_name.insert(name, pairs[i + 1])
         i = i + 2
-    if keys.len() == 0:
+    if names.len() == 0:
         return ""
-    sorted := keys.sort()
+    sorted := names.sort()
     mut out := chr(123)
     mut first := true
-    for k in sorted:
+    for name in sorted:
         if not first:
             out = out + ","
-        out = out + k + "=" + chr(34) + escape_label_value(kv[k]) + chr(34)
+        out = out + name + "=" + chr(34) + escape_label_value(value_by_name[name]) + chr(34)
         first = false
     return out + chr(125)
 
@@ -281,12 +281,12 @@ fn default_histogram_buckets() -> List[Float]:
 # registered (Histogram.buckets), else the defaults. takes and releases the
 # bare name's shard, so it must be called before a series shard is held.
 fn buckets_for(bare: String) -> List[Float]:
-    s := shard_of(bare)
-    shard_mu[s].lock()
+    shard := shard_of(bare)
+    shard_mu[shard].lock()
     mut out := default_histogram_buckets()
-    if histogram_bucket_defs[s].contains_key(bare):
-        out = histogram_bucket_defs[s][bare]
-    shard_mu[s].unlock()
+    if histogram_bucket_defs[shard].contains_key(bare):
+        out = histogram_bucket_defs[shard][bare]
+    shard_mu[shard].unlock()
     return out
 
 # register custom bucket boundaries for a bare metric, first call wins so a
@@ -295,12 +295,12 @@ fn buckets_for(bare: String) -> List[Float]:
 # earlier one after that — so a caller does not need a second lock to find out
 # whether it won.
 fn register_buckets(bare: String, bounds: List[Float]) -> List[Float]:
-    s := shard_of(bare)
-    shard_mu[s].lock()
-    if not histogram_bucket_defs[s].contains_key(bare):
-        histogram_bucket_defs[s].insert(bare, bounds)
-    effective := histogram_bucket_defs[s][bare]
-    shard_mu[s].unlock()
+    shard := shard_of(bare)
+    shard_mu[shard].lock()
+    if not histogram_bucket_defs[shard].contains_key(bare):
+        histogram_bucket_defs[shard].insert(bare, bounds)
+    effective := histogram_bucket_defs[shard][bare]
+    shard_mu[shard].unlock()
     return effective
 
 # a stable, human-readable rendering of a float bound or value: whole numbers
@@ -442,12 +442,12 @@ fn resolve_counter(key: String, bare: String, pairs: List[String]) -> Counter:
     sync_cache()
     if counter_cache.contains_key(key):
         return counter_cache[key]
-    s := shard_of(key)
-    shard_mu[s].lock()
-    if not counter_series[s].contains_key(key):
-        counter_series[s].insert(key, new_series(key, bare, pairs))
-    found := counter_series[s][key]
-    shard_mu[s].unlock()
+    shard := shard_of(key)
+    shard_mu[shard].lock()
+    if not counter_series[shard].contains_key(key):
+        counter_series[shard].insert(key, new_series(key, bare, pairs))
+    found := counter_series[shard][key]
+    shard_mu[shard].unlock()
     made := counter_instrument(found)
     counter_cache.insert(key, made)
     return made
@@ -456,12 +456,12 @@ fn resolve_gauge(key: String, bare: String, pairs: List[String]) -> Gauge:
     sync_cache()
     if gauge_cache.contains_key(key):
         return gauge_cache[key]
-    s := shard_of(key)
-    shard_mu[s].lock()
-    if not gauge_series[s].contains_key(key):
-        gauge_series[s].insert(key, new_series(key, bare, pairs))
-    found := gauge_series[s][key]
-    shard_mu[s].unlock()
+    shard := shard_of(key)
+    shard_mu[shard].lock()
+    if not gauge_series[shard].contains_key(key):
+        gauge_series[shard].insert(key, new_series(key, bare, pairs))
+    found := gauge_series[shard][key]
+    shard_mu[shard].unlock()
     made := gauge_instrument(found)
     gauge_cache.insert(key, made)
     return made
@@ -476,22 +476,22 @@ fn resolve_histogram(key: String, bare: String, pairs: List[String]) -> Histogra
     sync_cache()
     if histogram_cache.contains_key(key):
         return histogram_cache[key]
-    s := shard_of(key)
-    shard_mu[s].lock()
-    known := histogram_series[s].contains_key(key)
+    shard := shard_of(key)
+    shard_mu[shard].lock()
+    known := histogram_series[shard].contains_key(key)
     if known:
-        found := histogram_series[s][key]
-        shard_mu[s].unlock()
+        found := histogram_series[shard][key]
+        shard_mu[shard].unlock()
         made := histogram_instrument(found)
         histogram_cache.insert(key, made)
         return made
-    shard_mu[s].unlock()
+    shard_mu[shard].unlock()
     bounds := buckets_for(bare)
-    shard_mu[s].lock()
-    if not histogram_series[s].contains_key(key):
-        histogram_series[s].insert(key, new_hist_series(key, bare, pairs, bounds))
-    created := histogram_series[s][key]
-    shard_mu[s].unlock()
+    shard_mu[shard].lock()
+    if not histogram_series[shard].contains_key(key):
+        histogram_series[shard].insert(key, new_hist_series(key, bare, pairs, bounds))
+    created := histogram_series[shard][key]
+    shard_mu[shard].unlock()
     made := histogram_instrument(created)
     histogram_cache.insert(key, made)
     return made
@@ -556,19 +556,19 @@ fn registry_view() -> RegistryView:
     mut descriptions: Map[String, String] := {}
     mut units: Map[String, String] := {}
     lock_all_shards()
-    mut s := 0
-    while s < REGISTRY_SHARDS:
-        for key in counter_series[s]:
-            counters.insert(key, counter_series[s][key])
-        for key in gauge_series[s]:
-            gauges.insert(key, gauge_series[s][key])
-        for key in histogram_series[s]:
-            histograms.insert(key, histogram_series[s][key])
-        for bare in metric_descriptions[s]:
-            descriptions.insert(bare, metric_descriptions[s][bare])
-        for bare in metric_units[s]:
-            units.insert(bare, metric_units[s][bare])
-        s = s + 1
+    mut shard := 0
+    while shard < REGISTRY_SHARDS:
+        for key in counter_series[shard]:
+            counters.insert(key, counter_series[shard][key])
+        for key in gauge_series[shard]:
+            gauges.insert(key, gauge_series[shard][key])
+        for key in histogram_series[shard]:
+            histograms.insert(key, histogram_series[shard][key])
+        for bare in metric_descriptions[shard]:
+            descriptions.insert(bare, metric_descriptions[shard][bare])
+        for bare in metric_units[shard]:
+            units.insert(bare, metric_units[shard][bare])
+        shard = shard + 1
     unlock_all_shards()
     mut view := RegistryView([], counters, gauges, histograms, descriptions, units)
     view.keys = collect_keys(view)
@@ -621,15 +621,15 @@ fn view_unit(view: RegistryView, bare: String) -> String:
 # a fresh instrument after a reset.
 pub fn reset():
     lock_all_shards()
-    mut s := 0
-    while s < REGISTRY_SHARDS:
-        counter_series[s].clear()
-        gauge_series[s].clear()
-        histogram_series[s].clear()
-        metric_descriptions[s].clear()
-        metric_units[s].clear()
-        histogram_bucket_defs[s].clear()
-        s = s + 1
+    mut shard := 0
+    while shard < REGISTRY_SHARDS:
+        counter_series[shard].clear()
+        gauge_series[shard].clear()
+        histogram_series[shard].clear()
+        metric_descriptions[shard].clear()
+        metric_units[shard].clear()
+        histogram_bucket_defs[shard].clear()
+        shard = shard + 1
     registry_epoch.store(registry_epoch.load() + 1)
     unlock_all_shards()
 
@@ -760,18 +760,18 @@ impl Histogram:
         effective := register_buckets(self.bare, bounds)
         if same_bounds(self.bounds, effective):
             return self
-        s := shard_of(self.name)
-        shard_mu[s].lock()
+        shard := shard_of(self.name)
+        shard_mu[shard].lock()
         mut found := new_hist_series(self.name, self.bare, self.pairs, effective)
-        if histogram_series[s].contains_key(self.name):
-            existing := histogram_series[s][self.name]
+        if histogram_series[shard].contains_key(self.name):
+            existing := histogram_series[shard][self.name]
             if same_bounds(existing.bounds, effective):
                 found = existing
             else:
-                histogram_series[s].insert(self.name, found)
+                histogram_series[shard].insert(self.name, found)
         else:
-            histogram_series[s].insert(self.name, found)
-        shard_mu[s].unlock()
+            histogram_series[shard].insert(self.name, found)
+        shard_mu[shard].unlock()
         return histogram_instrument(found)
 
     fn count() -> Int:

@@ -2,37 +2,37 @@
 //!
 //! a channel serves two kinds of blocked caller at once. an **os-thread** caller
 //! (the main thread, or the whole os-thread task backend) that would block waits
-//! on a channel `Condvar` *for its role*, exactly as it always has. a **green
-//! task** (under `PITH_GREEN`) must not park its worker OS thread — instead it
-//! registers itself on the channel's green-waiter list *for its role* (sender or
-//! receiver) and suspends its coroutine back to the scheduler, freeing the worker
-//! to run other tasks; a later send/recv re-enqueues it.
+//! on a channel `Condvar` *for its role*. a **green task** must not park its
+//! worker OS thread, so instead it registers itself on the channel's
+//! green-waiter list *for its role* (sender or receiver) and suspends its
+//! coroutine back to the scheduler, freeing the worker to run other tasks; a
+//! later send/recv re-enqueues it.
 //!
 //! ## role-split wakes (why two condvars)
 //!
 //! every state change wakes only the *opposite* role: a send wakes receivers, a
 //! recv wakes senders. two things fall out of this:
 //!
-//!  * os-thread waiters park on one of two condvars — `senders` or `receivers` —
+//!  * os-thread waiters park on one of two condvars (`senders` or `receivers`),
 //!    so a "value available" notify can target receivers alone. with a single
 //!    shared condvar a notify meant for a receiver could wake a parked sender,
 //!    which re-blocks while the receiver is never woken; splitting the condvars
 //!    makes that impossible. for a **buffered** channel one value unblocks exactly
-//!    one receiver, so we `notify_one` rather than `notify_all` — waking all N so
+//!    one receiver, so we `notify_one` rather than `notify_all`: waking all N so
 //!    N-1 find nothing and re-block is the thundering herd that dominated the
 //!    profile. an **unbuffered** channel is a rendezvous whose senders are not
 //!    interchangeable, so it broadcasts; see `notify_role`.
 //!  * green tasks are woken the same way: only the opposite role's list. waking a
-//!    same-role sibling would only ever wake a task that still cannot proceed —
-//!    harmless for a one-shot os-thread condvar wait, but under the green backend
-//!    that sibling re-parks and re-notifies, so with two+ same-role green tasks on
-//!    one worker they wake each other in a tight loop that starves everything else
-//!    (see the role note on `wake_green`).
+//!    same-role sibling would only ever wake a task that still cannot proceed.
+//!    that is harmless for a one-shot os-thread condvar wait, but under the
+//!    green backend that sibling re-parks and re-notifies, so with two+
+//!    same-role green tasks on one worker they wake each other in a tight loop
+//!    that starves everything else (see the role note on `wake_green`).
 //!
 //! notify is *skipped entirely* when the opposite role has no waiter
 //! (`receiver_waiting`/`sender_waiting` is 0): a running peer picks the value or
 //! slot up on its own next pass, no syscall needed. closing the channel is the one
-//! notify that legitimately targets both roles at once — it `notify_all`s both
+//! notify that legitimately targets both roles at once: it `notify_all`s both
 //! condvars and wakes both green lists so every parked caller resumes and observes
 //! `closed`.
 //!
@@ -53,7 +53,7 @@
 //! when the channel lock and the scheduler's locks nest, the channel lock is
 //! always the outer one: `wake_green` runs while holding the channel lock
 //! and calls `green::wake`, which takes a run-queue lock: channel -> queue.
-//! a parking green task does the reverse-free thing: it
+//! a parking green task never takes them in the other order: it
 //! *releases* the channel lock before it suspends (see `block_on_channel`),
 //! because `suspend` hands control to the worker, which may re-enter this same
 //! channel. so we never hold the channel lock across a suspend, and never take
@@ -75,6 +75,8 @@ use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
+/// round-robin start for `pith_select_next_index`, so a `select` over several
+/// ready channels does not always favor the first arm.
 static SELECT_COUNTER: AtomicI64 = AtomicI64::new(0);
 
 /// one slot of the lock-free buffered queue. `sequence` is the vyukov ticket:
@@ -88,24 +90,24 @@ struct Slot {
     cell: UnsafeCell<i64>,
 }
 
-/// the lock-free core of a buffered channel: a fixed ring of slots with two
-/// monotonically increasing positions. `try_enqueue`/`try_dequeue` are the
-/// classic vyukov bounded mpmc — pure cas, no lock — and they alone carry the
-/// throughput path. blocking, waking, green-task parking, and close all stay on
-/// the channel mutex, which an op only touches when the ring is actually full
-/// or empty (or when a gate says someone is parked).
 /// a cache-line padded atomic position. senders hammer `enqueue_pos` and
 /// receivers `dequeue_pos`; on one line they false-share and every CAS bounces
 /// the line between roles.
 #[repr(align(64))]
 struct PaddedPos(AtomicUsize);
 
+/// the lock-free core of a buffered channel: a fixed ring of slots with two
+/// monotonically increasing positions. `try_enqueue`/`try_dequeue` are the
+/// classic vyukov bounded mpmc (pure cas, no lock), and they alone carry the
+/// throughput path. blocking, waking, green-task parking, and close all stay on
+/// the channel mutex, which an op only touches when the ring is actually full
+/// or empty (or when a gate says someone is parked).
 struct Ring {
     buffer: Box<[Slot]>,
     mask: usize,
     /// true when the requested capacity is a power of two, i.e. the ring size
     /// equals the capacity exactly: fullness is then fully encoded in the slot
-    /// sequences and `try_enqueue` never needs to read `dequeue_pos` — which
+    /// sequences and `try_enqueue` never needs to read `dequeue_pos`, which
     /// keeps senders off the receivers' cache line entirely.
     exact: bool,
     enqueue_pos: PaddedPos,
@@ -246,25 +248,20 @@ struct ChannelState {
     receiver_waiting: usize,
     sender_waiting: usize,
     /// how many of the waiters counted above are *os-thread* waiters, parked in
-    /// `cvar.wait` — maintained by `block_on_channel` under this lock. a wake
+    /// `cvar.wait`, maintained by `block_on_channel` under this lock. a wake
     /// only signals a role's condvar when this says an os-thread waiter is
     /// actually parked there: std's futex-based condvar pays an unconditional
     /// `futex(FUTEX_WAKE)` syscall on every notify, even with nobody waiting,
-    /// and on an all-green channel that made every single wake a syscall — the
+    /// and on an all-green channel that made every single wake a syscall, the
     /// dominant cost of the whole pipeline. green waiters are woken through
     /// their scheduler instead, no syscall involved.
     os_receivers_waiting: usize,
     os_senders_waiting: usize,
     /// ids of green *receivers* suspended on this channel, and of green
-    /// *senders*, kept apart. a notify only ever needs to wake the opposite role:
-    /// a receiver becomes runnable when a sender makes room or deposits a value,
-    /// and vice versa. waking a same-role sibling would only ever wake a task that
-    /// still cannot proceed — harmless for a one-shot os-thread condvar wait, but
-    /// under the green backend that sibling re-parks and re-notifies, so with two+
-    /// same-role green tasks on one worker they wake each other in a tight loop
-    /// that starves everything else (see the role note on `wake_green`). closing
-    /// the channel wakes both lists. empty (and so free) whenever no green task is
-    /// parked here — the os-thread path is untouched.
+    /// *senders*, kept apart so a notify wakes only the opposite role (see the
+    /// role-split note in the module header and on `wake_green`). closing the
+    /// channel wakes both lists. empty (and so free) whenever no green task is
+    /// parked here.
     green_receivers: Vec<usize>,
     green_senders: Vec<usize>,
 }
@@ -281,13 +278,13 @@ enum Role {
 /// the channel behind a handle. a **buffered** channel carries its values in
 /// the lock-free `ring`; the mutex/condvars exist only for parking and waking,
 /// which an op touches only when the ring is full/empty or a `parked_*` gate
-/// says someone is waiting. an **unbuffered** channel (`ring` is None) is the
-/// original mutex rendezvous, untouched. `closed_flag` mirrors `state.closed`
-/// so the lock-free path can observe close without the lock. `parked_senders`/
-/// `parked_receivers` count every parked waiter of a role — os-thread and green
-/// alike — and are maintained under the mutex but read without it (the wake
-/// gate); the seq-cst fences in the fast paths close the park/wake race (see
-/// `buffered_send`).
+/// says someone is waiting. an **unbuffered** channel (`ring` is None) is a
+/// rendezvous carried entirely under the mutex. `closed_flag` mirrors
+/// `state.closed` so the lock-free path can observe close without the lock.
+/// `parked_senders`/`parked_receivers` count every parked waiter of a role
+/// (os-thread and green alike) and are maintained under the mutex but read
+/// without it (the wake gate); the seq-cst fences in the fast paths close the
+/// park/wake race (see `buffered_send`).
 struct ChannelInner {
     ring: Option<Ring>,
     /// the requested capacity, fixed at construction. kept here rather than read
@@ -305,13 +302,13 @@ struct ChannelInner {
 
 /// "PCHA": the magic word at the front of every channel allocation. a channel
 /// handle is validated by alignment + this tag rather than the global handle
-/// registry — the registry's mutex was two global lock round trips per message
+/// registry: the registry's mutex was two global lock round trips per message
 /// (send + recv), the hottest shared line left once the ring made the channel
 /// itself lock-free. the word is scrubbed when the channel is freed, so a
 /// stale handle fails the check with high probability and is answered like a
 /// garbage one. a live handle can only be stale if the language miscounted
-/// it, and that is the same practical guard every other counted kind — list,
-/// closure, struct — relies on.
+/// it, and that is the same practical guard every other counted kind (list,
+/// closure, struct) relies on.
 const CHANNEL_MAGIC: u32 = 0x50434841;
 
 /// the largest buffered capacity a channel will allocate (16Mi values, 128 MiB
@@ -324,14 +321,14 @@ const MAX_CHANNEL_CAPACITY: i64 = 1 << 24;
 /// handle on every copy and releases it at every scope exit, exactly as it does
 /// for a string or a list, and the channel is freed when the count reaches
 /// zero. an operation in flight is executed by a frame that holds a count for
-/// the handle it passed — a binding, a field of a live struct, an element of a
-/// live container, a capture of a live closure — so nothing can free the body
+/// the handle it passed (a binding, a field of a live struct, an element of a
+/// live container, a capture of a live closure), so nothing can free the body
 /// under it, and the fast path pays nothing: alignment check, magic check, and
 /// the operation.
 ///
 /// the one exception is a park. a caller may have borrowed its handle from a
-/// holder another task owns — a channel in a shared struct, the sanctioned way
-/// to share one — and if that task releases the holder while this one sleeps,
+/// holder another task owns (a channel in a shared struct, the sanctioned way
+/// to share one), and if that task releases the holder while this one sleeps,
 /// the last count could go while a suspended call still points into the body.
 /// so a parking operation takes a count of its own before it blocks and gives
 /// it back when the call completes (`ParkCount`), off the per-message path.
@@ -339,9 +336,8 @@ const MAX_CHANNEL_CAPACITY: i64 = 1 << 24;
 /// this replaced a permanent stub, per-thread hazard slots, and a limbo list
 /// that let the runtime discover for itself when a channel could be freed:
 /// measured at about 14% of os-thread channel throughput, all of it in the
-/// per-operation guard. the magic word is scrubbed at free so a stale handle
-/// fails validation with high probability — the same practical guard every
-/// other counted kind relies on.
+/// per-operation guard. stale handles are caught by the magic word (see
+/// `CHANNEL_MAGIC`).
 #[repr(C)]
 struct TaggedChannel {
     magic: u32,
@@ -383,7 +379,7 @@ static TEST_FREES: AtomicUsize = AtomicUsize::new(0);
 /// the count an operation takes for itself when it is about to park, so the
 /// body outlives the suspended call even if every language owner releases it
 /// meanwhile. declared as the FIRST local of every entry point that can block:
-/// rust drops locals in reverse order, so this releases last — after the state
+/// rust drops locals in reverse order, so this releases last: after the state
 /// guard, after the post-wake `parked_*` bookkeeping, after `take_handoff`, and
 /// after the return value has been built. that declaration order is what
 /// guarantees every post-wake read of the body happens before a free that this
@@ -436,7 +432,7 @@ unsafe fn release_count(t: &TaggedChannel) {
     free_channel(t as *const TaggedChannel as *mut TaggedChannel);
 }
 
-/// nothing names the body any more — no owner, no parked call — so the ring is
+/// nothing names the body any more (no owner, no parked call), so the ring is
 /// quiescent and the drain is exact. values a program never received are
 /// released by the payload tag; a payload that is itself a channel releases
 /// through this same path, which holds no lock, so that is fine.
@@ -474,7 +470,7 @@ fn lock_state(lock: &Mutex<ChannelState>) -> MutexGuard<'_, ChannelState> {
 /// `role` says which side to wake, and it is always the *opposite* of whoever is
 /// notifying: a send wakes receivers, a recv wakes senders, a close wakes both.
 /// waking only the opposite role is what keeps the green backend from live-
-/// locking — two receivers (or two senders) parked on one worker must never wake
+/// locking: two receivers (or two senders) parked on one worker must never wake
 /// each other, because the woken sibling cannot make progress and would just
 /// re-park and re-notify forever. over-waking *within* the opposite role is still
 /// safe: a woken task re-evaluates under the channel lock and re-parks if it
@@ -499,12 +495,12 @@ fn wake_green(state: &mut ChannelState, role: Role) {
 
 /// notify the os-thread waiters parked on one role's condvar, skipping the
 /// syscall entirely when none are parked (`waiting` is the role's *os-thread*
-/// waiter count — green waiters are woken through their scheduler and must not
-/// trigger a condvar futex; see `os_receivers_waiting`).
+/// waiter count; green waiters are woken through their scheduler and must not
+/// trigger a condvar futex, see `os_receivers_waiting`).
 ///
 /// a **buffered** channel hands off one value or one freed slot at a time, and
 /// any parked waiter of a role wants the same thing (a receiver wants a value, a
-/// sender wants room), so exactly one can proceed — `notify_one`. that is the
+/// sender wants room), so exactly one can proceed: `notify_one`. that is the
 /// thundering-herd fix: the old `notify_all` woke all N, N-1 of which re-blocked.
 ///
 /// an **unbuffered** channel is a rendezvous, and its senders are *not*
@@ -574,9 +570,10 @@ fn block_on_channel<'a>(
             };
             // the wait is a native window for the cycle collector: the thread
             // reads no heap handle until the condvar hands the lock back. the
-            // bracket's exit runs while holding the re-acquired channel lock —
-            // safe, because a stop that parks us there stops only mutators,
-            // and the collection pass itself never takes a channel lock.
+            // bracket's exit runs while holding the re-acquired channel lock.
+            // that is safe because a stop that parks us there stops only
+            // mutators, and the collection pass itself never takes a channel
+            // lock.
             let mut state = {
                 let _native = crate::cycle::native_bracket();
                 cvar.wait(state)
@@ -590,7 +587,7 @@ fn block_on_channel<'a>(
         }
         Some(id) => {
             // register under the lock so a concurrent notify cannot miss us, then
-            // release the lock *before* suspending — suspend returns control to
+            // release the lock *before* suspending: suspend returns control to
             // the worker, which may touch this same channel. registering under our
             // role lets the opposite side wake us without waking same-role peers.
             match role {
@@ -677,13 +674,13 @@ fn channel_bytes(capacity: usize) -> usize {
 /// after a successful ring op, wake one parked waiter of the opposite `role` if
 /// the gate says any exist. the seq-cst fence orders our ring release-store
 /// before the gate load, pairing with the fence a parking waiter issues between
-/// its gate increment and its ring re-try — so either we see its increment here,
+/// its gate increment and its ring re-try, so either we see its increment here,
 /// or its re-try sees our value (never both misses; see `buffered_send`).
 ///
 /// a parked green *receiver* gets a direct handoff: one is popped and the ring
 /// dequeued on its behalf under the claim (see `green::wake_with`), so it
 /// resumes with the value in hand instead of re-locking and re-trying. dequeuing
-/// through the ring — never bypassing it — is what keeps fifo order. everything
+/// through the ring, never around it, is what keeps fifo order. everything
 /// else (os-thread waiters, green senders) gets the plain wake-and-re-check.
 fn wake_parked(inner: &ChannelInner, ring: &Ring, role: Role) {
     std::sync::atomic::fence(Ordering::SeqCst);
@@ -710,7 +707,7 @@ fn wake_parked(inner: &ChannelInner, ring: &Ring, role: Role) {
     // signal the role's condvar only when an os-thread waiter is actually
     // parked in it: std's condvar pays a futex syscall per notify regardless
     // of waiters, and on an all-green channel every message would eat two of
-    // them. the count is exact under this lock — an os-thread waiter
+    // them. the count is exact under this lock: an os-thread waiter
     // increments it under the same lock before it waits (block_on_channel),
     // so it either sees our ring value on its pre-wait re-try or is counted
     // here. green waiters go through their scheduler below, no syscall.
@@ -724,25 +721,25 @@ fn wake_parked(inner: &ChannelInner, ring: &Ring, role: Role) {
     wake_green(&mut state, role);
 }
 
+/// how many failed ring attempts an os-thread caller burns before parking. a
+/// paired producer/consumer usually frees a slot within a few hundred cycles,
+/// and a park/unpark round trip through the kernel costs microseconds, so a
+/// short spin converts most would-parks into immediate retries. green tasks
+/// never spin: their park is a userspace suspend, already cheap.
+const SPIN_TRIES: usize = 64;
+
 /// the buffered send: lock-free enqueue on the fast path; park under the mutex
 /// only when the ring is full.
 ///
 /// ## the park/wake race
 /// a sender can find the ring full, then a receiver dequeues and checks the gate
-/// before the sender registers — a lost wake, and a hang. it is closed the
+/// before the sender registers: a lost wake, and a hang. it is closed the
 /// standard way: the parker increments its gate (under the mutex), issues a
 /// seq-cst fence, and *re-tries the ring op* before waiting; the waker issues a
 /// seq-cst fence between its ring op and its gate load. in the fence order,
-/// whichever fence comes second sees the other side's write — the waker sees the
+/// whichever fence comes second sees the other side's write: the waker sees the
 /// incremented gate (and notifies under the mutex, which the parker holds until
 /// it actually waits), or the parker's re-try sees the freed slot.
-/// how many failed ring attempts an os-thread caller burns before parking. a
-/// paired producer/consumer usually frees a slot within a few hundred cycles,
-/// and a park/unpark round trip through the kernel costs microseconds — a short
-/// spin converts most would-parks into immediate retries. green tasks never
-/// spin: their park is a userspace suspend, already cheap.
-const SPIN_TRIES: usize = 64;
-
 unsafe fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, value: i64) -> i64 {
     let capacity = inner.capacity;
     let green_task = green::current_task();
@@ -782,7 +779,7 @@ unsafe fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, val
 
 /// the buffered recv, mirror of `buffered_send`: lock-free dequeue on the fast
 /// path; park under the mutex only when the ring is empty. a closed channel
-/// still drains — the dequeue try comes before the closed check.
+/// still drains: the dequeue try comes before the closed check.
 unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> Option<i64> {
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
@@ -823,7 +820,7 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
         // a green task may have been handed its value by the waker (see
         // wake_parked): the send dequeued on our behalf, so take it and skip the
         // re-try entirely. pass the id read before the park rather than asking
-        // which task we are again — see the note on `green::park_current`.
+        // which task we are again (see the note on `green::park_current`).
         if let Some(id) = green_task {
             if let Some(value) = green::take_handoff(id) {
                 return Some(value);
@@ -842,14 +839,14 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
     let park = ParkCount::new(t);
     let inner = &t.inner;
     // a buffered channel's values live in the lock-free ring; the mutex is only
-    // the parking lot. the unbuffered rendezvous below is untouched.
+    // the parking lot. an unbuffered channel is the mutex rendezvous below.
     if let Some(ring) = &inner.ring {
         return buffered_send(&park, inner, ring, value);
     }
-    // is this send running inside a green task? if so it yields on a would-block
-    // instead of parking the worker; if not (main thread / os-thread backend) it
-    // condvar-waits exactly as before. computed once — the running task does not
-    // change under us across a suspend/resume.
+    // is this send running inside a green task? if so it parks the task on a
+    // would-block instead of blocking the worker; if not (main thread,
+    // os-thread backend) it condvar-waits. computed once: the running task
+    // does not change under us across a suspend/resume.
     let green_task = green::current_task();
     let mut state = lock_state(&inner.state);
 
@@ -947,7 +944,7 @@ unsafe fn channel_recv(handle: i64) -> Option<i64> {
         }
 
         // announce that a receiver is now waiting so a blocked sender can deposit
-        // (the unbuffered rendezvous handshake). only senders need this — waking a
+        // (the unbuffered rendezvous handshake). only senders need this; waking a
         // sibling receiver here is exactly what caused the single-worker livelock.
         state.receiver_waiting += 1;
         wake_senders(inner, &mut state);
@@ -1016,7 +1013,7 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
     // buffered waiter's re-check observes it.
     inner.closed_flag.store(true, Ordering::SeqCst);
     state.pending_value = None;
-    // wake every parked caller of both roles so they resume and observe `closed` —
+    // wake every parked caller of both roles so they resume and observe `closed`,
     // the one notify that legitimately targets both sides. notify_all rather than
     // notify_one because there is no bound on how many are parked.
     inner.senders.notify_all();
@@ -1128,7 +1125,7 @@ mod tests {
 
     // a channel whose payloads are channels: releasing the outer one to zero
     // drains its ring by the payload tag, which releases the inner channels'
-    // only counts through this same path — four frees for one release.
+    // only counts through this same path: four frees for one release.
     #[test]
     fn zero_drains_ring_by_tag() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -1175,7 +1172,7 @@ mod tests {
     // since alignment alone lets the pointer be dereferenced. the older
     // registry lookup rejected every unknown address; the tag scheme rejects
     // anything whose first word is not CHANNEL_MAGIC, which is what this pins.
-    // (a pointer into unmapped memory is out of contract either way — the same
+    // (a pointer into unmapped memory is out of contract either way: the same
     // practical guard strings, closures, and structs already use.)
     #[test]
     fn aligned_but_untagged_handle_is_rejected() {
@@ -1228,12 +1225,12 @@ mod tests {
     // if the channel closes before the sender wakes up. close() clears the
     // pending slot the same way a receiver taking it does, so a sender that
     // looked only at `closed` reported failure for a value that had already
-    // been delivered — and a caller that retries on failure sends it twice.
+    // been delivered, and a caller that retries on failure sends it twice.
     #[test]
     fn unbuffered_send_reports_delivery_not_closure() {
         unsafe {
             let ch = pith_channel_new(0, 0);
-            let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 42) });
+            let sender = std::thread::spawn(move || { pith_channel_send(ch, 42) });
 
             // take the value, then close while the sender is still parked
             let t = shell(pith_channel_recv(ch));
@@ -1255,7 +1252,7 @@ mod tests {
     fn unbuffered_send_fails_when_closed_undelivered() {
         unsafe {
             let ch = pith_channel_new(0, 0);
-            let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 7) });
+            let sender = std::thread::spawn(move || { pith_channel_send(ch, 7) });
             std::thread::sleep(std::time::Duration::from_millis(50));
             pith_channel_close(ch);
             assert_eq!(sender.join().unwrap(), 0);
@@ -1277,7 +1274,7 @@ mod tests {
             let ch = pith_channel_new(4, 0);
             let receivers: Vec<_> = (0..3)
                 .map(|_| {
-                    std::thread::spawn(move || unsafe {
+                    std::thread::spawn(move || {
                         let t = shell(pith_channel_recv(ch));
                         *t
                     })
@@ -1329,7 +1326,7 @@ mod tests {
                 let ch = pith_channel_new(8, 0);
                 pith_channel_retain(ch); // the sender's count
                 pith_channel_retain(ch); // the closer's count
-                let sender = std::thread::spawn(move || unsafe {
+                let sender = std::thread::spawn(move || {
                     let mut accepted = 0;
                     for v in 0..8 {
                         if pith_channel_send(ch, v + 1) != 0 {
@@ -1339,7 +1336,7 @@ mod tests {
                     pith_channel_release(ch);
                     accepted
                 });
-                let closer = std::thread::spawn(move || unsafe {
+                let closer = std::thread::spawn(move || {
                     pith_channel_close(ch);
                     let mut drained = 0;
                     loop {
@@ -1376,7 +1373,7 @@ mod tests {
             unsafe {
                 let ch = pith_channel_new(2, 0);
                 pith_channel_retain(ch);
-                let sender = std::thread::spawn(move || unsafe {
+                let sender = std::thread::spawn(move || {
                     for v in 0..8 {
                         if pith_channel_send(ch, v) == 0 {
                             break;
@@ -1384,7 +1381,7 @@ mod tests {
                     }
                     pith_channel_release(ch);
                 });
-                let closer = std::thread::spawn(move || unsafe {
+                let closer = std::thread::spawn(move || {
                     let _ = pith_channel_try_recv(ch);
                     pith_channel_close(ch);
                     loop {
@@ -1534,7 +1531,7 @@ mod tests {
 
     // the fanout shape: several producers and consumers over one bounded channel,
     // exactly what `bench/chan_fanout` measures. guards the buffered notify_one
-    // hand-off — a producer that enqueues a value wakes one consumer, and close
+    // hand-off: a producer that enqueues a value wakes one consumer, and close
     // wakes every blocked consumer so each observes the drained-and-closed state.
     #[test]
     fn buffered_fanout_many_producers_consumers() {

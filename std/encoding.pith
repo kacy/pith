@@ -241,20 +241,21 @@ fn b32_encode_with(input: Bytes, table: String, padded: Bool) -> String:
     alphabet := bytes.from_string_utf8(table)
     out := bytes.buffer_with_capacity((input.len() + 4) / 5 * 8)
     defer out.free()
-    mut buffer := 0
+    # the low `bits_left` bits of `pending_bits` are read but not yet written.
+    mut pending_bits := 0
     mut bits_left := 0
     mut i := 0
     while i < input.len():
-        buffer = buffer * 256 + input[i]
+        pending_bits = pending_bits * 256 + input[i]
         bits_left = bits_left + 8
         while bits_left >= 5:
-            index := buffer / pow2(bits_left - 5)
+            index := pending_bits / pow2(bits_left - 5)
             out.write_byte(alphabet[index % 32])
             bits_left = bits_left - 5
-            buffer = buffer % pow2(bits_left)
+            pending_bits = pending_bits % pow2(bits_left)
         i = i + 1
     if bits_left > 0:
-        index := buffer * pow2(5 - bits_left)
+        index := pending_bits * pow2(5 - bits_left)
         out.write_byte(alphabet[index % 32])
     if padded:
         while out.len() % 8 != 0:
@@ -276,7 +277,8 @@ fn b32_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) 
 
     buf := bytes.buffer_with_capacity(text.len())
     defer buf.free()
-    mut buffer := 0
+    # the low `bits_left` bits of `pending_bits` are read but not yet written.
+    mut pending_bits := 0
     mut bits_left := 0
     mut seen_pad := false
     mut i := 0
@@ -287,16 +289,16 @@ fn b32_decode_with(input: String, table: String, padded: Bool, ignore_ws: Bool) 
         else:
             if seen_pad:
                 fail "invalid base32 padding"
-            v := table_char_val(c.to_upper(), table)
-            if v < 0:
+            digit := table_char_val(c.to_upper(), table)
+            if digit < 0:
                 fail "invalid base32 character"
-            buffer = buffer * 32 + v
+            pending_bits = pending_bits * 32 + digit
             bits_left = bits_left + 5
             while bits_left >= 8:
-                byte_value := buffer / pow2(bits_left - 8)
+                byte_value := pending_bits / pow2(bits_left - 8)
                 buf.write_byte(byte_value % 256)!
                 bits_left = bits_left - 8
-                buffer = buffer % pow2(bits_left)
+                pending_bits = pending_bits % pow2(bits_left)
         i = i + 1
     return buf.bytes()
 

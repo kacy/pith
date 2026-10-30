@@ -6,7 +6,7 @@
 //! all of them. waiting on a child is the worst case of that: it is unbounded,
 //! since the child decides when it ends.
 //!
-//! child processes have a nice property here that files do not — everything
+//! child processes have a nice property here that files do not: everything
 //! worth waiting for is pollable. the pipes are pipes, and linux will hand out
 //! a `pidfd` that becomes readable exactly when the child exits. so both waits
 //! go to the epoll reactor that already serves sockets (`netpoll`), and no
@@ -15,7 +15,7 @@
 //! the run-to-completion calls (`process.output`, `exec`) cannot use the
 //! reactor: `Command::output` and `Command::status` spawn, drain, and wait in
 //! one opaque std call. those go to a small thread pool instead, the same
-//! shape dns and file i/o use — see `command_output`/`command_status` and the
+//! shape dns and file i/o use: see `command_output`/`command_status` and the
 //! rule in `blocking` about what may cross to a pool thread. the `Command`
 //! going in and the `Output` coming back are plain owned data; every handle,
 //! `Bytes`, and C string is still built on the calling task's thread.
@@ -37,18 +37,18 @@ use std::sync::OnceLock;
 
 /// the threads that run whole-child commands (`Command::output`/`status`) for
 /// green tasks. a child decides for itself when it exits, so one of these can
-/// be held for an unbounded time — its own small pool keeps that from queueing
+/// be held for an unbounded time: its own small pool keeps that from queueing
 /// behind (or in front of) file i/o or dns.
 static POOL: Pool = Pool::new("pith-proc", 4);
 
-/// run `command.output()` — spawn, drain both pipes, wait — without holding a
-/// green worker for the child's lifetime. off a green task it runs inline,
-/// exactly as the callers always did. `None` is any spawn/read failure.
+/// run `command.output()` (spawn, drain both pipes, wait) without holding a
+/// green worker for the child's lifetime. off a green task it runs inline.
+/// `None` is any spawn/read failure.
 pub(crate) fn command_output(mut command: Command) -> Option<std::process::Output> {
     blocking::run(&POOL, move || command.output().ok())
 }
 
-/// run `command.status()` — spawn and wait, stdio inherited — with the same
+/// run `command.status()` (spawn and wait, stdio inherited) with the same
 /// offload-or-inline split as `command_output`.
 pub(crate) fn command_status(mut command: Command) -> Option<std::process::ExitStatus> {
     blocking::run(&POOL, move || command.status().ok())
@@ -89,7 +89,7 @@ impl ProcessHandle {
 ///
 /// under green the pipes have to be non-blocking, or a read with nothing on
 /// the other end sleeps the worker instead of yielding to the reactor. this
-/// is our end of each pipe only — the child's end is a separate open file
+/// is our end of each pipe only: the child's end is a separate open file
 /// description and keeps the blocking semantics it expects. the os-thread
 /// backend leaves them alone: there is no worker to protect and a blocking
 /// read is exactly what it wants.
@@ -341,7 +341,7 @@ enum ExitState {
     Finished(i64),
     /// still running, and this fd becomes readable when that changes.
     Watch(RawFd),
-    /// still running with nothing to watch it by — the caller has to block.
+    /// still running with nothing to watch it by: the caller has to block.
     Unwatchable,
     /// the handle is not ours (closed under us, or never existed).
     Unknown,
@@ -351,7 +351,7 @@ enum ExitState {
 /// cannot get one.
 ///
 /// `pidfd_open` is linux 5.3 and newer. an older kernel answers ENOSYS and we
-/// fall back to blocking in `wait`, which is what every backend did before.
+/// fall back to blocking in `wait`.
 #[cfg(target_os = "linux")]
 fn watch_pid(pid: u32) -> Option<RawFd> {
     // SAFETY: pidfd_open takes a pid and a flags word and returns an fd or -1.
@@ -376,7 +376,7 @@ fn watch_pid(_pid: u32) -> Option<RawFd> {
 /// this is one lock hold on purpose: the pidfd has to be opened while the child
 /// is known to be unreaped, or the pid it names could already belong to someone
 /// else. the lock is released before the wait itself, which is the part that
-/// must not hold it — a task parked with the registry locked would wedge every
+/// must not hold it: a task parked with the registry locked would wedge every
 /// other process call on that worker, and at one worker that is a deadlock.
 fn exit_state(handle: i64) -> ExitState {
     let mut handles = process_handles().lock();
@@ -410,7 +410,7 @@ fn reap(handle: i64) -> i64 {
 
 /// Wait for a spawned process to finish, returns exit code
 ///
-/// Off a green task this is the plain blocking wait it always was. On one, the
+/// Off a green task this is a plain blocking wait. On one, the
 /// task parks on a pidfd in the epoll reactor and its worker runs everything
 /// else until the child exits.
 #[no_mangle]
@@ -472,7 +472,7 @@ pub extern "C" fn pith_process_close(handle: i64) {
     // `pith_tcp_close`: a task parked on it in the reactor is woken with a
     // closed outcome and its read reports an error, a read blocked in the
     // kernel keeps the number reserved until it returns, and the descriptor
-    // is closed once no call is inside — never while one is.
+    // is closed once no call is inside, never while one is.
     if let Some(entry) = &entry {
         for pipe in PIPES {
             if let Some(pipe_handle) = entry.pipe(pipe) {

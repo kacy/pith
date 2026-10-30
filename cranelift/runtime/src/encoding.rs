@@ -109,7 +109,7 @@ pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> ResultPair {
     result_ok(value.to_bits() as i64)
 }
 
-/// Base64 encode a C string — returns newly allocated C string
+/// Base64-encode a C string into a new C string.
 ///
 /// # Safety
 /// s must be a valid null-terminated C string
@@ -150,7 +150,7 @@ pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
     crate::pith_copy_bytes_to_cstring(&out[..out.len() - 1])
 }
 
-/// Hex encode a C string — returns newly allocated C string
+/// Hex-encode a C string into a new C string.
 ///
 /// # Safety
 /// s must be a valid null-terminated C string
@@ -239,7 +239,8 @@ pub unsafe extern "C" fn pith_int_to_bin(n: i64) -> *mut i8 {
     crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
-/// SHA-256 hash of a C string — returns hex-encoded C string
+/// The SHA-256 digest of a C string, as a new hex C string. A null input
+/// hashes to 64 zeros rather than to the digest of the empty string.
 ///
 /// # Safety
 /// s must be a valid null-terminated C string

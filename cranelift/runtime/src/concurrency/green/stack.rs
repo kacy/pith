@@ -11,14 +11,14 @@ pub(super) const STACK_SIZE: usize = 1024 * 1024;
 
 /// finished coroutines donate their stacks here and green_spawn reuses them.
 /// a fresh stack is an mmap + a guard-page mprotect, and freeing one is an
-/// munmap that costs a TLB shootdown across every core — per task, that made
+/// munmap that costs a TLB shootdown across every core. per task, that made
 /// spawn dominated by the kernel's address-space bookkeeping (a 20k spawn/join
 /// probe spent 22k page faults where go spends 1.7k). reuse skips all of it,
 /// and the already-faulted pages come back warm.
 ///
 /// the pool is capped so a burst cannot hoard address space forever: beyond
 /// STACK_POOL_MAX a returned stack just drops (one munmap, as before). stacks
-/// keep whatever pages the previous task dirtied — same-process memory, and the
+/// keep whatever pages the previous task dirtied: same-process memory, and the
 /// coroutine's setup overwrites what it uses, so stale bytes are inert.
 pub(super) const STACK_POOL_MAX: usize = 64;
 pub(super) static STACK_POOL: CacheLine<Mutex<Vec<corosensei::stack::DefaultStack>>> =

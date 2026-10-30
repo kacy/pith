@@ -3,22 +3,21 @@
 //! A counting semaphore for limiting concurrent access.
 //!
 //! Like [`channel`], a semaphore serves two kinds of waiter at once. An
-//! **os-thread** caller that would block in `acquire()` condvar-waits, exactly
-//! as it always has. A **green task** (under `PITH_GREEN`) must not park its
-//! worker OS thread — it registers on `green_waiters` under the semaphore lock
-//! and suspends its coroutine back to the scheduler; a later `release()`
-//! re-enqueues it.
+//! **os-thread** caller that would block in `acquire()` condvar-waits. A
+//! **green task** must not park its worker OS thread, so it registers on
+//! `green_waiters` under the semaphore lock and suspends its coroutine back to
+//! the scheduler; a later `release()` re-enqueues it.
 //!
 //! ## one waiter per permit
 //!
-//! `release()` frees exactly one permit, so it wakes exactly one waiter — the
+//! `release()` frees exactly one permit, so it wakes exactly one waiter: the
 //! os-thread side does `cvar.notify_one()` and the green side wakes a single
 //! parked task (FIFO, hence the `VecDeque`). This deliberately mirrors the
 //! condvar `notify_one` rather than the channel's wake-all: a thundering herd of
 //! green tasks all re-checking one permit would be wasteful, and semaphore
 //! fairness matters. Waking both an os-thread waiter and a green waiter for one
 //! permit is possible when both kinds are parked; that is a harmless spurious
-//! wakeup — the loser re-checks `count == 0` under the lock and re-parks.
+//! wakeup; the loser re-checks `count == 0` under the lock and re-parks.
 //!
 //! The lock order and wake/park race are handled as in [`channel`]: the waiter
 //! registers under the semaphore lock and releases it before suspending, and the
@@ -36,7 +35,7 @@ pub struct SemaphoreState {
     count: usize,
     max: usize,
     /// ids of green tasks suspended in `acquire()`, in arrival order.
-    /// `release()` wakes the front one — one waiter per freed permit. empty (and
+    /// `release()` wakes the front one, one waiter per freed permit. empty (and
     /// free) whenever no green task is waiting, so the os-thread path is
     /// untouched.
     green_waiters: VecDeque<usize>,
@@ -62,7 +61,7 @@ fn wait_state<'a>(
 ) -> MutexGuard<'a, SemaphoreState> {
     // the wait is a native window for the cycle collector: no heap handle is
     // read until the condvar hands the lock back. the bracket's exit runs
-    // holding the re-acquired semaphore lock, which is safe — a stop that
+    // holding the re-acquired semaphore lock, which is safe: a stop that
     // parks us there stops only mutators, and the collection pass itself
     // never takes a semaphore lock.
     let _native = crate::cycle::native_bracket();
@@ -71,7 +70,7 @@ fn wait_state<'a>(
 }
 
 /// wake a single green task parked in `acquire()` so it re-checks the permit
-/// count. paired with the `cvar.notify_one()` in `release()` — one freed permit
+/// count. paired with the `cvar.notify_one()` in `release()`: one freed permit
 /// wakes one waiter. called while holding the semaphore lock; `green::wake`
 /// takes a run-queue lock under it (semaphore -> queue).
 fn wake_one_green_waiter(state: &mut SemaphoreState) {
@@ -81,9 +80,9 @@ fn wake_one_green_waiter(state: &mut SemaphoreState) {
 }
 
 /// block the current `acquire()` caller until the next `release()`. an os-thread
-/// caller condvar-waits as before; a green task registers on `green_waiters`
-/// under the lock, releases it, and suspends its coroutine (never holding the
-/// lock across the suspend — the worker may re-enter this semaphore).
+/// caller condvar-waits; a green task registers on `green_waiters` under the
+/// lock, releases it, and suspends its coroutine (never holding the lock
+/// across the suspend, since the worker may re-enter this semaphore).
 fn block_on_acquire<'a>(
     lock: &'a Mutex<SemaphoreState>,
     cvar: &Condvar,
@@ -133,7 +132,7 @@ pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle
     };
     let (lock, cvar) = &**sem;
     // computed once: whether we run inside a green task does not change across a
-    // suspend/resume. None => os-thread caller => condvar-wait as before.
+    // suspend/resume. None means an os-thread caller, which condvar-waits.
     let green_task = green::current_task();
     let mut guard = lock_state(lock);
     while guard.count == 0 {

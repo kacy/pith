@@ -73,6 +73,34 @@ pub(crate) fn backend() -> Backend {
     *BACKEND.get_or_init(|| backend_from_env(std::env::var("PITH_GREEN").ok().as_deref()))
 }
 
+/// A generation keeps its low 31 bits. It lives in bits 32..62 of a task
+/// handle, leaving the sign bit clear so a handle is always a positive `i64`
+/// (0 stays "no task").
+pub(super) const GEN_MASK: u32 = 0x7fff_ffff;
+
+/// Pack a slot index and its generation into the pith-facing task handle, the
+/// encoding both backends share. The low 32 bits hold `index + 1`, so index 0
+/// still yields a nonzero handle and 0 stays reserved for "no task"; the
+/// generation sits above. Each backend bumps a slot's generation when it
+/// reuses the slot, so a stale handle stops resolving.
+pub(super) fn make_handle(index: usize, generation: u32) -> i64 {
+    (((generation & GEN_MASK) as u64) << 32 | ((index as u64) + 1)) as i64
+}
+
+/// Split a task handle back into `(index, generation)`, or `None` for 0 or
+/// garbage.
+pub(super) fn split_handle(handle: i64) -> Option<(usize, u32)> {
+    if handle <= 0 {
+        return None;
+    }
+    let bits = handle as u64;
+    let low = bits & 0xffff_ffff;
+    if low == 0 {
+        return None;
+    }
+    Some(((low - 1) as usize, (bits >> 32) as u32 & GEN_MASK))
+}
+
 /// Spawn a task running `closure_handle`, returning its task handle.
 ///
 /// # Safety
@@ -122,6 +150,27 @@ mod tests {
     // `backend()` caches in a `OnceLock` and reads the ambient process env, so
     // it cannot be exercised more than once per test binary. The parsing lives
     // in `backend_from_env`, which is pure, and that is what these cover.
+
+    // generation 0 is `index + 1`, a generation rides above, and the sign bit
+    // stays clear so 0 means "no task".
+    #[test]
+    fn handle_codec_round_trips() {
+        assert_eq!(make_handle(0, 0), 1);
+        assert_eq!(make_handle(41, 0), 42);
+        assert_eq!(split_handle(42), Some((41, 0)));
+
+        let h = make_handle(41, 7);
+        assert_eq!(split_handle(h), Some((41, 7)));
+        assert!(h > 0);
+
+        assert_eq!(split_handle(0), None);
+        assert_eq!(split_handle(-5), None);
+
+        // the top generation bit is masked off, so the handle never goes negative.
+        let hi = make_handle(3, GEN_MASK);
+        assert!(hi > 0);
+        assert_eq!(split_handle(hi), Some((3, GEN_MASK)));
+    }
 
     #[test]
     fn unset_falls_to_the_platform_default() {

@@ -229,28 +229,6 @@ fn panicking_task_marks_done_and_keeps_worker_alive() {
     set_current_worker(None);
 }
 
-
-// the handle encoding: generation 0 is exactly the old `id + 1`, a
-// generation rides above, and the sign bit stays clear so 0 means "no task".
-#[test]
-fn handle_codec_round_trips() {
-    assert_eq!(make_handle(0, 0), 1);
-    assert_eq!(make_handle(41, 0), 42);
-    assert_eq!(split_handle(42), Some((41, 0)));
-
-    let h = make_handle(41, 7);
-    assert_eq!(split_handle(h), Some((41, 7)));
-    assert!(h > 0);
-
-    assert_eq!(split_handle(0), None);
-    assert_eq!(split_handle(-5), None);
-
-    // the top generation bit is masked off, so the handle never goes negative.
-    let hi = make_handle(3, GEN_MASK);
-    assert!(hi > 0);
-    assert_eq!(split_handle(hi), Some((3, GEN_MASK)));
-}
-
 // awaiting a finished task returns its result and retires it: the handle
 // stops resolving, and the id comes back at a new generation, so the old
 // handle can never name the task that reuses the block.

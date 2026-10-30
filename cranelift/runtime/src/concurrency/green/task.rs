@@ -12,31 +12,7 @@ use super::*;
 /// `green_is_done`, `green_detach`) needs the generation check.
 pub(super) type TaskId = usize;
 
-/// a generation keeps its low 31 bits. it lives in bits 32..62 of the handle,
-/// leaving the sign bit clear so a handle is always a positive `i64` (0 stays
-/// "no task").
-pub(super) const GEN_MASK: u32 = 0x7fff_ffff;
-
-/// pack a task index and its generation into the pith-facing task handle. the
-/// low 32 bits hold `index + 1`, so 0 stays reserved for "no task", and the
-/// generation sits above. at generation 0 the handle is `index + 1`, the same
-/// encoding the os-thread backend uses.
-pub(super) fn make_handle(index: TaskId, generation: u32) -> i64 {
-    (((generation & GEN_MASK) as u64) << 32 | ((index as u64) + 1)) as i64
-}
-
-/// split a task handle back into `(index, generation)`, or `None` for 0/garbage.
-pub(super) fn split_handle(handle: i64) -> Option<(TaskId, u32)> {
-    if handle <= 0 {
-        return None;
-    }
-    let bits = handle as u64;
-    let low = bits & 0xffff_ffff;
-    if low == 0 {
-        return None;
-    }
-    Some(((low - 1) as TaskId, (bits >> 32) as u32 & GEN_MASK))
-}
+pub(super) use crate::concurrency::scheduler::{make_handle, split_handle, GEN_MASK};
 
 // ---------------------------------------------------------------------------
 // the scheduling word

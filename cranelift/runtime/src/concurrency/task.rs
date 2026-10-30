@@ -1,12 +1,14 @@
-//! task system for spawn/await
+//! spawn/await entry points, and the os-thread task backend
 //!
-//! the default backend runs one OS thread per task. the tasks live in a shared
-//! generational slotmap (`Slab`) so a spawn/await/detach cycle *reclaims* its
-//! slot instead of leaving a dead shell behind forever. the reclamation shape —
-//! a free list of reusable indices plus a per-slot generation stamped into the
-//! pith-facing handle — mirrors the green backend (`green.rs`), so a stale handle
-//! to a reused slot no longer resolves and the handle encoding stays identical
-//! across the two backends (generation 0 is exactly the old `id + 1`).
+//! the `pith_spawn`/`pith_await`/`pith_task_*` exports route through the
+//! scheduler seam (`scheduler.rs`), which picks green or os threads. this file
+//! also holds the os-thread backend: one OS thread per task. its tasks live in
+//! a shared generational slotmap (`Slab`) so a spawn/await/detach cycle
+//! *reclaims* its slot instead of leaving a dead shell behind forever. the
+//! reclamation shape (a free list of reusable indices plus a per-slot
+//! generation stamped into the pith-facing handle) mirrors the green backend,
+//! so a stale handle to a reused slot no longer resolves, and both backends
+//! share one handle encoding (`scheduler::make_handle`).
 //!
 //! ## when a slot is reclaimed
 //!
@@ -16,7 +18,7 @@
 //!   finished we reclaim right away; if it is still running we flag it
 //!   `reclaim_on_done` and the completing thread reclaims the slot as it exits.
 //!   this matches green's `green_detach` policy exactly, so the two backends
-//!   invalidate a detached handle at the same observable point — while the task
+//!   invalidate a detached handle at the same observable point: while the task
 //!   runs the handle stays valid (e.g. `is_done` still answers), and it is
 //!   reclaimed once the body completes.
 //!
@@ -27,7 +29,7 @@
 //! after it records the result and wakes awaiters, it calls back into the slab to
 //! either reclaim itself (if it was detached) or mark itself `finished` so a
 //! later detach can reclaim immediately. that callback is why `os_thread_spawn`
-//! reserves the slot up front — the thread needs its own `(index, generation)`.
+//! reserves the slot up front: the thread needs its own `(index, generation)`.
 //!
 //! ## why dropping a slot is memory-safe here
 //!
@@ -35,11 +37,12 @@
 //! `JoinHandle` and a clone of the `Arc<shared>` join channel. dropping the slot
 //! never touches a running body. dropping the `JoinHandle` merely detaches the
 //! thread (it runs to completion and the OS reclaims it), and the `Arc` clone is
-//! refcounted — the thread keeps its own clone. so reclaiming a slot is safe
+//! refcounted; the thread keeps its own clone. so reclaiming a slot is safe
 //! whether or not the body has finished; the `reclaim_on_done` deferral above is
 //! about *when the handle should stop resolving*, matching green, not about
 //! memory safety.
 
+use super::scheduler::{make_handle, split_handle, GEN_MASK};
 use crate::handle_registry::{self, HandleKind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -74,7 +77,7 @@ struct TaskState {
     /// set by `detach` on a task whose body is still running: no one will await
     /// it, so the completing thread reclaims its slot the moment it finishes
     /// rather than leaking it for the life of the process. mirrors the green
-    /// backend's `reclaim_on_done`.
+    /// backend's `Join::detached`.
     reclaim_on_done: bool,
     /// set by the completing thread (under the slab lock) once its body has
     /// returned. it is the os-thread analogue of green's `state == Done`: a later
@@ -87,7 +90,7 @@ struct TaskShared {
     done: bool,
     result: i64,
     /// awaiters currently blocked in `cvar.wait`. completion only signals the
-    /// condvar when this is non-zero — a detached or not-yet-awaited task then
+    /// condvar when this is non-zero: a detached or not-yet-awaited task then
     /// skips the notify entirely, and a later awaiter sees `done` before it
     /// ever waits.
     waiters: u32,
@@ -99,41 +102,13 @@ struct TaskShared {
 // `entries` grows on demand and `free` holds the indices of reclaimed slots
 // ready for the next spawn. without reclamation this vector grew by one entry
 // per task ever spawned and never shrank, an unbounded leak on a long-running
-// server that fans out one task per connection. reusing a slot bumps its generation so a stale handle can never
-// alias the task that takes its place.
+// server that fans out one task per connection. reusing a slot bumps its
+// generation so a stale handle can never alias the task that takes its place.
 // ---------------------------------------------------------------------------
 
-/// index into the task slab. the pith-facing handle is not the raw index — it
+/// index into the task slab. the pith-facing handle is not the raw index: it
 /// packs the index with the slot's generation (see `make_handle`).
 type TaskId = usize;
-
-/// low 31 bits — the generation lives in bits 32..62 of the handle, leaving the
-/// sign bit clear so a handle is always a positive `i64` (0 stays "no task").
-const GEN_MASK: u32 = 0x7fff_ffff;
-
-/// pack a slab index and its generation into the pith-facing task handle. the
-/// low 32 bits hold `index + 1` (so index 0 still yields a nonzero handle and 0
-/// stays reserved for "no task"); the generation sits above. for a slot's first
-/// use the generation is 0, so the handle is exactly `index + 1` — identical to
-/// the old encoding and to the green backend. the two backends never coexist in
-/// one process (they are chosen by the `PITH_GREEN` flag), so a shared encoding
-/// is not required, but keeping it identical avoids any surprise.
-fn make_handle(index: TaskId, generation: u32) -> i64 {
-    (((generation & GEN_MASK) as u64) << 32 | ((index as u64) + 1)) as i64
-}
-
-/// split a task handle back into `(index, generation)`, or `None` for 0/garbage.
-fn split_handle(handle: i64) -> Option<(TaskId, u32)> {
-    if handle <= 0 {
-        return None;
-    }
-    let bits = handle as u64;
-    let low = bits & 0xffff_ffff;
-    if low == 0 {
-        return None;
-    }
-    Some(((low - 1) as TaskId, (bits >> 32) as u32 & GEN_MASK))
-}
 
 /// one slab entry: a task plus the generation stamp that makes its handle unique
 /// across slot reuse. reclaiming a task drops the `TaskState` (dropping its
@@ -190,7 +165,7 @@ impl Slab {
     /// drop a slot: empty it, bump the generation (so the old handle no longer
     /// resolves), and queue the index for reuse. returns the pith-facing handle
     /// that named the slot so the caller can unregister it. the single place that
-    /// actually frees a slot — `reclaim`/`detach`/`mark_finished_and_maybe_reclaim`
+    /// actually frees a slot: `reclaim`/`detach`/`mark_finished_and_maybe_reclaim`
     /// all funnel through it after their own generation checks.
     fn free_slot(&mut self, id: TaskId) -> i64 {
         let slot = &mut self.entries[id];
@@ -220,7 +195,7 @@ impl Slab {
     /// while it ran (no one will await it), returning the handle to unregister;
     /// otherwise record that the body `finished` so a later detach can reclaim
     /// immediately. only acts on the slot that still carries `generation`. mirrors
-    /// green's `reclaim_if_detached`.
+    /// the detached-task retire in green's `finish_task`.
     fn mark_finished_and_maybe_reclaim(&mut self, id: TaskId, generation: u32) -> Option<i64> {
         let reclaim_now = {
             let task = self.get_checked(id, generation)?;
@@ -238,7 +213,7 @@ impl Slab {
     /// otherwise flag it so the completing thread reclaims it on the way out (see
     /// `mark_finished_and_maybe_reclaim`). only acts on the slot that still carries
     /// `generation`. returns the handle to unregister when it reclaimed right now,
-    /// else `None`. mirrors green's `detach`.
+    /// else `None`. mirrors `green_detach`.
     fn detach(&mut self, id: TaskId, generation: u32) -> Option<i64> {
         let reclaim_now = {
             let task = self.get_checked(id, generation)?;
@@ -254,8 +229,8 @@ impl Slab {
 }
 
 /// Codegen-facing spawn entrypoint. Routes through the scheduler seam so the
-/// task backend (os threads today, green threads later) is chosen behind the
-/// `PITH_GREEN` flag without the compiler ever caring which one runs.
+/// task backend (green or os threads, see `scheduler.rs`) is chosen without
+/// the compiler ever caring which one runs.
 #[no_mangle]
 pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
     // what the new task captured is reachable from two tasks from here on
@@ -263,8 +238,7 @@ pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
     crate::concurrency::scheduler::spawn(closure_handle)
 }
 
-/// One OS thread per task: the original, default spawn implementation. Kept
-/// as a named backend so the scheduler can pick it explicitly.
+/// Spawn for the os-thread backend: one OS thread per task.
 pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
     if closure_handle == 0 {
         return 0;
@@ -311,7 +285,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
             let func: extern "C" fn(i64) -> i64 = std::mem::transmute(func_ptr as *const ());
             func(closure_handle)
         };
-        // the body has run, so release the one closure reference the task owned —
+        // the body has run, so release the one closure reference the task owned.
         // otherwise every spawned task leaks its closure environment (the emitter
         // moves the closure into `spawn` and never releases it). mirrors the green
         // backend's release in `finish_task`.
@@ -330,7 +304,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
         // then run the slab-side completion, the os-thread analogue of green's
         // `finish_task` reclaim: reclaim our slot now if we were detached, else
         // record that we finished so a later detach reclaims immediately. done
-        // outside the shared lock — the slab lock is a separate, un-nested lock.
+        // outside the shared lock; the slab lock is a separate, un-nested lock.
         if let Some(handle) = lock_tasks().mark_finished_and_maybe_reclaim(index, generation) {
             handle_registry::unregister_id(handle, HandleKind::Task);
         }
@@ -357,10 +331,10 @@ pub unsafe extern "C" fn pith_await(task_handle: i64) -> i64 {
     crate::concurrency::scheduler::await_task(task_handle)
 }
 
-/// Join an os-thread task and return its result: the original, default await
-/// implementation. Awaiting consumes the handle (Rust-style), so once the result
-/// is read the slab slot is reclaimed and the handle unregistered — a second
-/// await of the same handle, or an await of a stale/garbage one, safely returns 0.
+/// Join an os-thread task and return its result. Awaiting consumes the handle
+/// (Rust-style), so once the result is read the slab slot is reclaimed and the
+/// handle unregistered; a second await of the same handle, or an await of a
+/// stale/garbage one, safely returns 0.
 pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
     if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return 0;
@@ -397,7 +371,7 @@ pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
             state.waiters += 1;
             // same shape as the channel wait: the condvar wait is a native
             // window, and the exit runs while holding the re-acquired task
-            // lock — safe, because the collection pass never takes one.
+            // lock. that is safe because the collection pass never takes one.
             state = {
                 let _native = crate::cycle::native_bracket();
                 wait_shared(cvar, state)
@@ -409,8 +383,8 @@ pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
 
     // the task is finished and we have consumed its result (we still hold `shared`
     // for the value), so this handle will not be observed again. reclaim the slot.
-    // the reclaim is generation-gated, so if the task was already reclaimed — it
-    // was detached, or another awaiter of the same handle beat us — this is a safe
+    // the reclaim is generation-gated, so if the task was already reclaimed (it
+    // was detached, or another awaiter of the same handle beat us) this is a safe
     // no-op and we skip the unregister.
     if lock_tasks().reclaim(index, generation) {
         handle_registry::unregister_id(task_handle, HandleKind::Task);
@@ -425,9 +399,8 @@ pub extern "C" fn pith_task_is_done(task_handle: i64) -> i64 {
     crate::concurrency::scheduler::task_is_done(task_handle)
 }
 
-/// Poll an os-thread task's done flag: the original, default implementation. A
-/// stale or garbage handle reports "not done" (0) rather than reading a reused
-/// slot.
+/// Poll an os-thread task's done flag. A stale or garbage handle reports "not
+/// done" (0) rather than reading a reused slot.
 pub(crate) fn os_thread_is_done(task_handle: i64) -> i64 {
     if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return 0;
@@ -494,28 +467,6 @@ mod tests {
             reclaim_on_done: false,
             finished,
         }
-    }
-
-    // the handle encoding: generation 0 is exactly the old `id + 1`, a generation
-    // rides above, and the sign bit stays clear so 0 means "no task". identical to
-    // the green backend's codec.
-    #[test]
-    fn handle_codec_round_trips() {
-        assert_eq!(make_handle(0, 0), 1);
-        assert_eq!(make_handle(41, 0), 42);
-        assert_eq!(split_handle(42), Some((41, 0)));
-
-        let h = make_handle(41, 7);
-        assert_eq!(split_handle(h), Some((41, 7)));
-        assert!(h > 0);
-
-        assert_eq!(split_handle(0), None);
-        assert_eq!(split_handle(-5), None);
-
-        // the top generation bit is masked off, so the handle never goes negative.
-        let hi = make_handle(3, GEN_MASK);
-        assert!(hi > 0);
-        assert_eq!(split_handle(hi), Some((3, GEN_MASK)));
     }
 
     // reclaiming a slot frees it; the next insert reuses the index at a bumped
@@ -604,7 +555,7 @@ mod tests {
         assert_eq!(slab.detach(id, generation), None);
     }
 
-    // a finished task nobody detached is left alone by the completion reclaim — it
+    // a finished task nobody detached is left alone by the completion reclaim: it
     // is the await path (not the thread) that reclaims it. mirrors green.
     #[test]
     fn slab_undetached_finish_does_not_reclaim() {
@@ -628,7 +579,7 @@ mod tests {
     // the FFI entrypoints must survive a garbage or stale handle: an unregistered
     // id fails the registry check and returns the safe default (0 / not-done /
     // no-op) without ever indexing the slab. these never spawn, so they touch no
-    // real task — they only prove the guard rejects a bogus i64 without panicking.
+    // real task; they only prove the guard rejects a bogus i64 without panicking.
     #[test]
     fn ffi_entrypoints_reject_garbage_handles() {
         for &bogus in &[0_i64, -1, i64::MAX, i64::MIN, 999_999_999] {

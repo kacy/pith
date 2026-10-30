@@ -335,8 +335,8 @@ checker's whole state after the imports were checked is copied out
 (`CheckerSnapshot`): the type table, the scope arena, the diagnostics,
 the method and interface registries, and every one of the checker
 module's own tables, transients included. `initialize_checker` also
-now clears six associated-type tables it used to leave alone between
-runs; those held node indices from the previous arena.
+clears six associated-type tables between runs, since those hold node
+indices from the previous arena.
 
 what it keys on: the entry path, the entry's import list in order, and
 the walk itself. before a hit the driver resolves every recorded import

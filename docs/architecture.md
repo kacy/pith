@@ -35,10 +35,6 @@ itself, and `make bootstrap-ir-checks` verifies the ir contract, its
 invariants, and that the emitted ir reaches a fixed point on the deterministic
 corpus.
 
-the older Zig bootstrap and C transpiler are historical implementation paths.
-they are useful context when reading old notes, but they are not tracked as the
-current build/run path.
-
 networking and protocol layers now live mostly in the Pith stdlib. that
 includes `std.net.http`, `std.net.websocket`, and the native TLS stack (1.3 with a 1.2 fallback) in
 `std.net.tls` / `std.net.tls13` / `std.net.tls12`. Rust stays on the lower-level runtime side for
@@ -79,7 +75,7 @@ if a change only affects object output or linking, it belongs in `cranelift/`.
 
 - lowering engine (expressions, statements, ownership, function
   lifecycle): `self-host/ir_emitter_core.pith`
-- its satellites, each owning one concern: `ir_builder` (output
+- its satellites, each owning one concern, include `ir_builder` (output
   buffer and per-function state), `ir_alias_registry` (aliases,
   import renames, global kinds), `ir_struct_registry` and
   `ir_method_tables` (shapes and symbols), `ir_generics`

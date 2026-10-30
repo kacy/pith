@@ -1471,6 +1471,77 @@ fn emit_checked_int_div_or_mod(
     Ok(builder.block_params(done)[0])
 }
 
+/// The text of a `string ID "..."` line: what lies between its first quote
+/// and the closing one, with the IR's escapes decoded. `{{` and `}}` stand
+/// for a literal brace; `\n`, `\t`, `\r`, `\0`, `\\` and `\"` for their
+/// characters; any other backslash is kept as written.
+fn decode_string_literal(line: &str) -> String {
+    let rest = &line[line.find('"').unwrap_or(0)..];
+    // strip exactly one quote at each end; trim_matches would also eat the
+    // quote of a trailing `\"`
+    let raw = if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
+        &rest[1..rest.len() - 1]
+    } else {
+        rest
+    };
+    // accumulated as bytes, not chars: `byte as char` maps a byte to the
+    // code point of the same value, so the two bytes of a utf8 character
+    // each got re-encoded and "café" came out as "cafÃ©". the escapes are
+    // all ascii, and `raw` is valid utf8, so the assembled bytes are too.
+    let bytes = raw.as_bytes();
+    let mut content: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut j = 0;
+    while j < bytes.len() {
+        let next = bytes.get(j + 1).copied();
+        let decoded = match (bytes[j], next) {
+            (b'{', Some(b'{')) => Some(b'{'),
+            (b'}', Some(b'}')) => Some(b'}'),
+            (b'\\', Some(b'n')) => Some(b'\n'),
+            (b'\\', Some(b't')) => Some(b'\t'),
+            (b'\\', Some(b'\\')) => Some(b'\\'),
+            (b'\\', Some(b'"')) => Some(b'"'),
+            (b'\\', Some(b'r')) => Some(b'\r'),
+            (b'\\', Some(b'0')) => Some(b'\0'),
+            _ => None,
+        };
+        match decoded {
+            Some(byte) => {
+                content.push(byte);
+                j += 2;
+            }
+            None => {
+                content.push(bytes[j]);
+                j += 1;
+            }
+        }
+    }
+    String::from_utf8(content)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// One `func ... endfunc` block of the IR: its parameter names, in order,
+/// and its other lines. `start` is the line after the `func` header; the
+/// answer also gives the line after `endfunc`.
+fn function_body<'a>(lines: &[&'a str], start: usize) -> (Vec<String>, Vec<&'a str>, usize) {
+    let mut params: Vec<String> = Vec::new();
+    let mut body: Vec<&'a str> = Vec::new();
+    let mut i = start;
+    while i < lines.len() {
+        let parts: Vec<&str> = lines[i].split_whitespace().collect();
+        if !parts.is_empty() && parts[0] == "endfunc" {
+            i += 1;
+            break;
+        }
+        if !parts.is_empty() && parts[0] == "param" && parts.len() >= 2 {
+            params.push(parts[1].to_string());
+        } else {
+            body.push(lines[i]);
+        }
+        i += 1;
+    }
+    (params, body, i)
+}
+
 /// Compile IR text to native code via Cranelift
 pub fn compile_from_ir(
     codegen: &mut CodeGen,
@@ -1516,72 +1587,7 @@ pub fn compile_from_ir(
         }
         match parts[0] {
             "string" if parts.len() >= 3 => {
-                let idx = parts[1].to_string();
-                // Extract quoted string content and process escape sequences
-                let rest = &line[line.find('"').unwrap_or(0)..];
-                // Strip exactly one leading and one trailing quote
-                // (trim_matches would eat escaped quotes like "\"")
-                let raw = if rest.len() >= 2 && rest.starts_with('"') && rest.ends_with('"') {
-                    &rest[1..rest.len() - 1]
-                } else {
-                    rest
-                };
-                // accumulated as bytes, not chars: `byte as char` maps a byte
-                // to the code point of the same value, so the two bytes of a
-                // utf8 character each got re-encoded and "café" came out as
-                // "cafÃ©". the escapes below are all ascii, and `raw` is valid
-                // utf8, so the assembled bytes are too.
-                let mut content: Vec<u8> = Vec::new();
-                let bytes = raw.as_bytes();
-                let mut j = 0;
-                while j < bytes.len() {
-                    if bytes[j] == b'{' && j + 1 < bytes.len() && bytes[j + 1] == b'{' {
-                        // `{{` is an escaped literal brace
-                        content.push(b'{');
-                        j += 2;
-                    } else if bytes[j] == b'}' && j + 1 < bytes.len() && bytes[j + 1] == b'}' {
-                        // `}}` is an escaped literal brace
-                        content.push(b'}');
-                        j += 2;
-                    } else if bytes[j] == b'\\' && j + 1 < bytes.len() {
-                        match bytes[j + 1] {
-                            b'n' => {
-                                content.push(b'\n');
-                                j += 2;
-                            }
-                            b't' => {
-                                content.push(b'\t');
-                                j += 2;
-                            }
-                            b'\\' => {
-                                content.push(b'\\');
-                                j += 2;
-                            }
-                            b'"' => {
-                                content.push(b'"');
-                                j += 2;
-                            }
-                            b'r' => {
-                                content.push(b'\r');
-                                j += 2;
-                            }
-                            b'0' => {
-                                content.push(b'\0');
-                                j += 2;
-                            }
-                            _ => {
-                                content.push(bytes[j]);
-                                j += 1;
-                            }
-                        }
-                    } else {
-                        content.push(bytes[j]);
-                        j += 1;
-                    }
-                }
-                let content = String::from_utf8(content)
-                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-                string_data.push((idx, content));
+                string_data.push((parts[1].to_string(), decode_string_literal(line)));
             }
             "struct" if parts.len() >= 2 => {
                 let name = parts[1].to_string();
@@ -1708,22 +1714,8 @@ pub fn compile_from_ir(
                 continue;
             }
             let fname = parts[1].to_string();
-            j += 1;
-            let mut body: Vec<&str> = Vec::new();
-            let mut params: Vec<String> = Vec::new();
-            while j < lines.len() {
-                let bparts: Vec<&str> = lines[j].split_whitespace().collect();
-                if !bparts.is_empty() && bparts[0] == "endfunc" {
-                    j += 1;
-                    break;
-                }
-                if !bparts.is_empty() && bparts[0] == "param" && bparts.len() >= 2 {
-                    params.push(bparts[1].to_string());
-                } else {
-                    body.push(lines[j]);
-                }
-                j += 1;
-            }
+            let (params, body, next) = function_body(&lines, j + 1);
+            j = next;
             if let Some(op) = detect_bits_wrapper(&params, &body) {
                 bits_aliases.entry(fname).or_insert(op);
             }
@@ -1743,24 +1735,8 @@ pub fn compile_from_ir(
 
         let func_name = parts[1].to_string();
         let func_retkind = parts.get(3).copied().unwrap_or("").to_string();
-        i += 1;
-
-        // Collect function body lines until endfunc
-        let mut body_lines: Vec<&str> = Vec::new();
-        let mut param_names: Vec<String> = Vec::new();
-        while i < lines.len() {
-            let bparts: Vec<&str> = lines[i].split_whitespace().collect();
-            if !bparts.is_empty() && bparts[0] == "endfunc" {
-                i += 1;
-                break;
-            }
-            if !bparts.is_empty() && bparts[0] == "param" && bparts.len() >= 2 {
-                param_names.push(bparts[1].to_string());
-            } else {
-                body_lines.push(lines[i]);
-            }
-            i += 1;
-        }
+        let (param_names, body_lines, next) = function_body(&lines, i + 1);
+        i = next;
 
         // Compile this function (skip if already compiled from an earlier module)
         if compiled_funcs.contains(&func_name) {
@@ -2252,6 +2228,163 @@ fn normalize_runtime_result(
     builder.ins().select(is_error, zero, encoded)
 }
 
+/// The start of `main`: every module's tracer registration, then each
+/// imported module's `__init_globals_N`, then the main module's
+/// `__init_globals`, then the string globals, which point at their literals.
+///
+/// The tracers come before any global is built: a global is marked shared
+/// as it is stored, and the marking walks a struct's fields through its
+/// tracer, so one registered later would leave what the global reaches
+/// unmarked. main's body registers them again, which only repeats the
+/// insert.
+fn emit_main_prologue(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    declared_funcs: &HashMap<String, FuncId>,
+    global_data: &HashMap<String, DataId>,
+    string_lits: &HashMap<String, DataId>,
+    str_globals: &[(String, String)],
+) {
+    for (name, &fid) in declared_funcs.iter() {
+        if name.contains("__cc_register_tracers") {
+            let reg_ref = codegen.module.declare_func_in_func(fid, builder.func);
+            builder.ins().call(reg_ref, &[]);
+        }
+    }
+    for (name, &fid) in declared_funcs.iter() {
+        if name.starts_with("__init_globals_") {
+            let init_ref = codegen.module.declare_func_in_func(fid, builder.func);
+            builder.ins().call(init_ref, &[]);
+        }
+    }
+    if let Some(&init_id) = declared_funcs.get("__init_globals") {
+        let init_ref = codegen.module.declare_func_in_func(init_id, builder.func);
+        builder.ins().call(init_ref, &[]);
+    }
+    for (gname, str_id) in str_globals.iter() {
+        if let (Some(&data_id), Some(&lit_id)) = (
+            global_data.get(gname.as_str()),
+            string_lits.get(str_id.as_str()),
+        ) {
+            let str_result = string_lit_addr(codegen, builder, lit_id);
+            let gv = codegen.module.declare_data_in_func(data_id, builder.func);
+            let addr = builder.ins().global_value(types::I64, gv);
+            builder.ins().store(MemFlags::new(), str_result, addr, 0);
+        }
+    }
+}
+
+/// The named variables of a function body that hold a float. The IR does
+/// not type its variables, so this infers them: a variable stored from the
+/// result of a float instruction is a float, and so, conservatively, is
+/// every parameter of a function that does any float arithmetic; then
+/// three rounds propagate the kind through loads, integer-spelled
+/// arithmetic on a float operand, and stores.
+fn scan_float_vars(param_names: &[String], body_lines: &[&str]) -> HashSet<String> {
+    let mut float_vars: HashSet<String> = HashSet::new();
+    let mut float_source_regs: HashSet<usize> = HashSet::new();
+    for line in body_lines {
+        let p: Vec<&str> = line.split_whitespace().collect();
+        if p.is_empty() {
+            continue;
+        }
+        match p[0] {
+            "fconst" | "fadd" | "fsub" | "fmul" | "fdiv" if p.len() >= 2 => {
+                if let Ok(r) = p[1].parse::<usize>() {
+                    float_source_regs.insert(r);
+                }
+            }
+            "store" if p.len() >= 3 => {
+                if let Ok(r) = p[2].parse::<usize>() {
+                    if float_source_regs.contains(&r) {
+                        float_vars.insert(p[1].to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // If function has any float operations, mark all params as float.
+    // This is conservative but correct for math functions.
+    let has_float_ops = body_lines.iter().any(|line| {
+        let p: Vec<&str> = line.split_whitespace().collect();
+        !p.is_empty() && matches!(p[0], "fconst" | "fmul" | "fadd" | "fsub" | "fdiv")
+    });
+    if has_float_ops {
+        for name in param_names {
+            float_vars.insert(name.clone());
+        }
+    }
+    for _ in 0..3 {
+        // a load of a float variable yields a float
+        for line in body_lines.iter() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 3 && p[0] == "load" {
+                if let Ok(r) = p[1].parse::<usize>() {
+                    if float_vars.contains(p[2]) {
+                        float_source_regs.insert(r);
+                    }
+                }
+            }
+        }
+        // Propagate: if mul/div/add/sub uses a float reg, its result is float
+        for line in body_lines.iter() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 4 && matches!(p[0], "mul" | "div" | "add" | "sub") {
+                let a_float = p[2]
+                    .parse::<usize>()
+                    .map_or(false, |r| float_source_regs.contains(&r));
+                let b_float = p[3]
+                    .parse::<usize>()
+                    .map_or(false, |r| float_source_regs.contains(&r));
+                if a_float || b_float {
+                    if let Ok(r) = p[1].parse::<usize>() {
+                        float_source_regs.insert(r);
+                    }
+                }
+            }
+        }
+        // Store propagation
+        for line in body_lines.iter() {
+            let p: Vec<&str> = line.split_whitespace().collect();
+            if p.len() >= 3 && p[0] == "store" {
+                if let Ok(r) = p[2].parse::<usize>() {
+                    if float_source_regs.contains(&r) {
+                        float_vars.insert(p[1].to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    float_vars
+}
+
+/// A block for each label of a function body, created in stream order, and
+/// the labels where a loop exits: the label right after a jmp back to an
+/// earlier label.
+fn create_label_blocks<'a>(
+    builder: &mut FunctionBuilder<'_>,
+    body_lines: &[&'a str],
+) -> (HashMap<String, Block>, HashSet<&'a str>) {
+    let mut labels: HashMap<String, Block> = HashMap::new();
+    let mut loop_exits: HashSet<&'a str> = HashSet::new();
+    let mut after_back_edge = false;
+    for line in body_lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if !parts.is_empty() && parts[0] == "label" && parts.len() >= 2 {
+            let block = builder.create_block();
+            labels.insert(parts[1].to_string(), block);
+            if after_back_edge {
+                loop_exits.insert(parts[1]);
+            }
+        }
+        after_back_edge = parts.first() == Some(&"jmp")
+            && parts.get(1).is_some_and(|target| labels.contains_key(*target));
+    }
+    (labels, loop_exits)
+}
+
 fn compile_ir_function(
     codegen: &mut CodeGen,
     func_name: &str,
@@ -2289,14 +2422,13 @@ fn compile_ir_function(
     let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
     let mut regs: HashMap<usize, Value> = HashMap::new();
     let mut kinds = RegKinds::default();
-    // the named variables that hold a string or a float; a store copies its
-    // register's kind here and a load copies it back
+    // the named variables that hold a string; a store copies its register's
+    // kind here and a load copies it back. float_vars, below, does the same
+    // for floats, starting from what scan_float_vars finds.
     let mut string_vars: HashSet<String> = HashSet::new();
-    let mut float_vars: HashSet<String> = HashSet::new();
     // the values that hold the address of a string literal
     let mut literal_values: HashSet<Value> = HashSet::new();
     let mut named_vars: HashMap<String, Variable> = HashMap::new();
-    let mut labels: HashMap<String, Block> = HashMap::new();
     // labels already emitted, in stream order, as we walk the instructions. a
     // jmp/brif whose target is in here is jumping *backward* to an earlier label
     // — a loop back-edge — which is where we insert a preemption safe-point. a
@@ -2306,45 +2438,15 @@ fn compile_ir_function(
     #[cfg(not(pith_cranelift_new_api))]
     let mut next_var_id: u32 = 0;
 
-    // Call __init_globals (and module-specific __init_globals_N) at the start of main
     if func_name == "main" {
-        // every module's tracers are registered before any global is built:
-        // a global is marked shared as it is stored, and the marking walks a
-        // struct's fields through its tracer, so one registered later would
-        // leave what the global reaches unmarked. main's body registers them
-        // again, which only repeats the insert.
-        for (name, &fid) in declared_funcs.iter() {
-            if name.contains("__cc_register_tracers") {
-                let reg_ref = codegen.module.declare_func_in_func(fid, builder.func);
-                builder.ins().call(reg_ref, &[]);
-            }
-        }
-        // Call module-specific initializers first (imported modules)
-        for (name, &fid) in declared_funcs.iter() {
-            if name.starts_with("__init_globals_") {
-                let init_ref = codegen.module.declare_func_in_func(fid, builder.func);
-                builder.ins().call(init_ref, &[]);
-            }
-        }
-        // Then the main module's __init_globals
-        if let Some(&init_id) = declared_funcs.get("__init_globals") {
-            let init_ref = codegen.module.declare_func_in_func(init_id, builder.func);
-            builder.ins().call(init_ref, &[]);
-        }
-        // Initialize str: globals — call string function and store result
-        for (gname, str_id) in str_globals.iter() {
-            if let (Some(&data_id), Some(&lit_id)) = (
-                global_data.get(gname.as_str()),
-                string_lits.get(str_id.as_str()),
-            ) {
-                let str_result = string_lit_addr(codegen, &mut builder, lit_id);
-                let gv = codegen.module.declare_data_in_func(data_id, builder.func);
-                let addr = builder.ins().global_value(types::I64, gv);
-                builder
-                    .ins()
-                    .store(MemFlags::new(), str_result, addr, 0);
-            }
-        }
+        emit_main_prologue(
+            codegen,
+            &mut builder,
+            declared_funcs,
+            global_data,
+            string_lits,
+            str_globals,
+        );
     }
 
     for (i, name) in param_names.iter().enumerate() {
@@ -2359,108 +2461,9 @@ fn compile_ir_function(
         }
     }
 
-    // Pre-scan: detect float-typed variables by finding `store VAR REG`
-    // where REG was assigned by fconst/fmul/fadd/fsub/fdiv
-    {
-        let mut float_source_regs: HashSet<usize> =
-            HashSet::new();
-        for line in body_lines {
-            let p: Vec<&str> = line.split_whitespace().collect();
-            if p.is_empty() {
-                continue;
-            }
-            match p[0] {
-                "fconst" | "fadd" | "fsub" | "fmul" | "fdiv" if p.len() >= 2 => {
-                    if let Ok(r) = p[1].parse::<usize>() {
-                        float_source_regs.insert(r);
-                    }
-                }
-                "store" if p.len() >= 3 => {
-                    if let Ok(r) = p[2].parse::<usize>() {
-                        if float_source_regs.contains(&r) {
-                            float_vars.insert(p[1].to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        // If function has any float operations, mark all params as float.
-        // This is conservative but correct for math functions.
-        let has_float_ops = body_lines.iter().any(|line| {
-            let p: Vec<&str> = line.split_whitespace().collect();
-            !p.is_empty() && matches!(p[0], "fconst" | "fmul" | "fadd" | "fsub" | "fdiv")
-        });
-        if has_float_ops {
-            for name in param_names {
-                float_vars.insert(name.clone());
-            }
-        }
-        // Iterative propagation: if a variable is stored from a register
-        // that was loaded from a float variable, mark it as float too.
-        // Also mark registers from loads of float vars.
-        for _ in 0..3 {
-            let mut new_float_regs: Vec<usize> = Vec::new();
-            for line in body_lines.iter() {
-                let p: Vec<&str> = line.split_whitespace().collect();
-                if p.len() >= 3 && p[0] == "load" {
-                    if let Ok(r) = p[1].parse::<usize>() {
-                        if float_vars.contains(p[2]) {
-                            new_float_regs.push(r);
-                        }
-                    }
-                }
-            }
-            for r in &new_float_regs {
-                float_source_regs.insert(*r);
-            }
-            // Propagate: if mul/div/add/sub uses a float reg, its result is float
-            for line in body_lines.iter() {
-                let p: Vec<&str> = line.split_whitespace().collect();
-                if p.len() >= 4 && matches!(p[0], "mul" | "div" | "add" | "sub") {
-                    let a_float = p[2]
-                        .parse::<usize>()
-                        .map_or(false, |r| float_source_regs.contains(&r));
-                    let b_float = p[3]
-                        .parse::<usize>()
-                        .map_or(false, |r| float_source_regs.contains(&r));
-                    if a_float || b_float {
-                        if let Ok(r) = p[1].parse::<usize>() {
-                            float_source_regs.insert(r);
-                        }
-                    }
-                }
-            }
-            // Store propagation
-            for line in body_lines.iter() {
-                let p: Vec<&str> = line.split_whitespace().collect();
-                if p.len() >= 3 && p[0] == "store" {
-                    if let Ok(r) = p[2].parse::<usize>() {
-                        if float_source_regs.contains(&r) {
-                            float_vars.insert(p[1].to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
+    let mut float_vars = scan_float_vars(param_names, body_lines);
 
-    // Pre-scan for labels and create blocks. the label right after a jmp back
-    // to an earlier label is where that loop exits.
-    let mut loop_exits: HashSet<&str> = HashSet::new();
-    let mut after_back_edge = false;
-    for line in body_lines {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if !parts.is_empty() && parts[0] == "label" && parts.len() >= 2 {
-            let block = builder.create_block();
-            labels.insert(parts[1].to_string(), block);
-            if after_back_edge {
-                loop_exits.insert(parts[1]);
-            }
-        }
-        after_back_edge = parts.first() == Some(&"jmp")
-            && parts.get(1).is_some_and(|target| labels.contains_key(*target));
-    }
+    let (labels, loop_exits) = create_label_blocks(&mut builder, body_lines);
 
     // Pre-scan for indexed list reads whose Optional tuple never escapes; those
     // calls compile to inline loads instead (see inline_list_get_opt). The map
@@ -4039,6 +4042,17 @@ mod tests {
     fn a_body_without_a_chain_is_left_alone() {
         assert!(fuse("load 1 a\nload 2 b\nconcat 3 1 2\nret 3").is_none());
         assert!(fuse("iconst 1 2\nret 1").is_none());
+    }
+
+    #[test]
+    fn string_literals_decode_their_escapes() {
+        assert_eq!(decode_string_literal(r#"string m0s0 "a\nb\tc""#), "a\nb\tc");
+        assert_eq!(decode_string_literal(r#"string 1 "{{x}} \"q\" \\ \0""#), "{x} \"q\" \\ \0");
+        // a trailing escaped quote keeps its quote
+        assert_eq!(decode_string_literal(r#"string 1 "say \"""#), "say \"");
+        // an unknown escape and a lone brace stay as written
+        assert_eq!(decode_string_literal(r#"string 1 "\q { }""#), "\\q { }");
+        assert_eq!(decode_string_literal("string 1 \"café\""), "café");
     }
 
     #[test]

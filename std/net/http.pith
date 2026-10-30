@@ -1,7 +1,10 @@
 # std.net.http — HTTP server and client
 #
-# pith still keeps the original packed-string request api, but the wire-facing
-# path now goes through bytes first so request bodies can stay raw when needed.
+# requests read off the wire are parsed as bytes into HttpRequestBytes, so a
+# body can stay raw. the older packed-string request api (parse_request,
+# read_request and the method/path/header accessors) is kept for existing
+# callers; its readers parse through the bytes path and pack the result.
+
 #
 #   import std.net.http as http
 #
@@ -53,7 +56,7 @@ HTTP_FILE_STREAM_CHUNK_SIZE := 4096
 # exhaust memory with an endless head (slowloris) or a declared-enormous body
 # (a content-length DoS). they are the defaults of a ServerConfig, which can
 # raise or lower them per server.
-#   * MAX_HEADER_BYTES caps the request head — the request line plus header fields.
+#   * MAX_HEADER_BYTES caps the request head: the request line plus header fields.
 #   * MAX_REQUEST_BODY caps the request body, whether it is declared by
 #     content-length or streamed as chunked. shared with the http/2 server so both
 #     front doors buffer at most the same amount.
@@ -64,8 +67,8 @@ pub MAX_REQUEST_BODY := 10485760
 # extensions) and a trailer line are both tiny in any real request. this
 # caps the bytes read while scanning for one line's terminating newline,
 # so a peer streaming a newline-less flood on the chunked path cannot grow
-# the buffer until the allocator aborts — the chunk-size *value* is already
-# checked against MAX_REQUEST_BODY, but the line's own length was not.
+# the buffer until the allocator aborts. the chunk-size *value* is checked
+# against MAX_REQUEST_BODY separately; this bounds the line itself.
 CHUNK_LINE_LIMIT := 8192
 
 # how much the tls head reader asks for at a time: one tls record's worth of
@@ -83,6 +86,9 @@ RESPONSE_HEAD_CAPACITY := 256
 HEADER_LIMIT_MESSAGE := "http: request header fields exceed the maximum"
 BODY_LIMIT_MESSAGE := "http: request body exceeds the maximum"
 
+# how a response's body is framed (rfc 9112 6.3), the `kind` of a ResponseHead:
+# no body, exactly Content-Length bytes, chunked, or everything until the
+# server closes the connection.
 HTTP_RESPONSE_BODY_NONE := 0
 HTTP_RESPONSE_BODY_EXACT := 1
 HTTP_RESPONSE_BODY_CHUNKED := 2
@@ -342,11 +348,14 @@ fn find_bytes(data: Bytes, start: Int, needle: Bytes) -> Int:
         pos = pos + 1
     return -1
 
+# where a part's header block ends: the first blank line from `start`, CRLF or
+# bare LF. answers [where the blank line starts, its length], or [] when the
+# headers never end.
 fn multipart_header_bounds(data: Bytes, start: Int) -> List[Int]:
-    crlf := bytes.from_string_utf8(chr(13) + chr(10) + chr(13) + chr(10))
-    lf := bytes.from_string_utf8(chr(10) + chr(10))
-    crlf_pos := find_bytes(data, start, crlf)
-    lf_pos := find_bytes(data, start, lf)
+    crlf_blank := bytes.from_string_utf8(chr(13) + chr(10) + chr(13) + chr(10))
+    lf_blank := bytes.from_string_utf8(chr(10) + chr(10))
+    crlf_pos := find_bytes(data, start, crlf_blank)
+    lf_pos := find_bytes(data, start, lf_blank)
     if crlf_pos >= 0 and (lf_pos < 0 or crlf_pos <= lf_pos):
         return [crlf_pos, 4]
     if lf_pos >= 0:
@@ -370,7 +379,12 @@ fn parse_header_text_map(text: String) -> Map[String, String]:
         result = header_with(result, name, value)
     return result
 
+# the next boundary delimiter from `start`, with the line ending before it,
+# which belongs to the delimiter rather than the part body (rfc 2046 5.1.1).
+# answers [where that line ending starts, its length], or [] when there is
+# none.
 fn multipart_find_next_boundary(data: Bytes, start: Int, boundary: String) -> List[Int]:
+
     crlf_marker := bytes.from_string_utf8(chr(13) + chr(10) + "--" + boundary)
     lf_marker := bytes.from_string_utf8(chr(10) + "--" + boundary)
     crlf_pos := find_bytes(data, start, crlf_marker)
@@ -662,7 +676,7 @@ fn route_param_from_path(path: String, pattern: String, name: String) -> String:
 # winning, so every reader of a request's query agrees on one answer. keys and
 # values are percent-decoded and "+" becomes a space, the same transform the
 # encode side applies in reverse; a pair with no "=" is a present key with an
-# empty value. splitting on the raw "&"/"=" before decoding is deliberate — a
+# empty value. splitting on the raw "&"/"=" before decoding is deliberate: a
 # "%26" in a value must not read as a separator.
 fn query_params_map_from_string(qs: String) -> Map[String, String]:
     mut result: Map[String, String] := {}
@@ -803,6 +817,9 @@ fn header_name_matches(data: Bytes, start: Int, end: Int, name: String) -> Bool:
 # ===============================================================
 # Parse a raw HTTP request. Returns a packed string (use accessors to read fields).
 # Pack format: method \x1f route \x1f query \x1f version \x1f headers \x1f body
+# this is the lenient string parser behind the packed api; it validates
+# nothing. requests read off the wire go through parse_request_head instead.
+
 pub fn parse_request(raw: String) -> String:
     nl := chr(10)
     cr := chr(13)
@@ -1091,6 +1108,8 @@ fn request_error_status(message: String) -> Int:
 # authority-form target, which replaces the Host field (rfc 9112 3.2.2), or -1.
 # `expect` is one of the EXPECT_ codes, and `wants_close` is whether the
 # Connection field asks to close after this exchange (rfc 9112 9.3).
+# `chunked` is set whenever Transfer-Encoding is present: parse_request_head
+# refuses every coding list that does not end in a single chunked.
 struct RequestHead:
     head: Bytes
     method_end: Int
@@ -1570,9 +1589,6 @@ impl HttpRequestBytes:
         return parse_json_or_fail(self.body_text()!)
     fn body_json_or(fallback: Int) -> Int:
         return self.body_json() catch fallback
-    # the token from an `Authorization: Bearer <token>` header. fails when the
-    # header is missing or names another scheme, which is the shape an auth
-    # guard wants: `token := req.bearer_token() catch: return unauthorized`.
     # every form value of the request, as net/http's Form holds them: the
     # body's values (see post_form) first, then the query string's.
     fn form() -> Map[String, List[String]]:
@@ -1611,6 +1627,9 @@ impl HttpRequestBytes:
         if colon < 0:
             fail "basic credentials have no colon"
         return BasicAuth(decoded.substring(0, colon), decoded.substring(colon + 1, decoded.len()))
+    # the token from an `Authorization: Bearer <token>` header. fails when the
+    # header is missing or names another scheme, which is the shape an auth
+    # guard wants: `token := req.bearer_token() catch: return unauthorized`.
     fn bearer_token() -> String!:
         header := self.header_or("Authorization", "")
         if not header.starts_with("Bearer "):
@@ -1935,9 +1954,9 @@ fn sep_end_from(data: Bytes, start: Int, sep: Bytes) -> Int:
 # the read is chunked rather than one byte at a time. a tls conn already holds
 # whatever it decrypted but was not asked for, and unread_bytes hands the tail
 # past the separator straight back to it, so reading ahead never takes a byte
-# out of what follows. the byte loop this replaces paid a lock, a record-loop
+# out of what follows. a byte-at-a-time loop would pay a lock, a record-loop
 # entry and two buffer copies for every byte of every head, and the second copy
-# made the cost quadratic in the size of the record the head arrived in.
+# makes the cost quadratic in the size of the record the head arrived in.
 fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes, cap: Int) -> Bytes!:
     # how far back from the end of what arrived a separator can start
     mut overlap := sep.len() - 1
@@ -1958,8 +1977,9 @@ fn read_until_including_from_tls(conn: tls.Conn, sep: Bytes, cap: Int) -> Bytes!
             fail "read_until exceeded {cap} bytes without the separator"
         chunk := conn.read_bytes(TLS_READ_CHUNK)!
         if chunk.is_empty():
-            # the peer stopped before the separator; hand back what arrived, the
-            # same value the byte loop produced.
+            # the peer stopped before the separator; hand back what arrived, as
+            # the buffered reader does at end of stream.
+
             return seen
         seen = seen.concat(chunk)
     return seen
@@ -2629,7 +2649,7 @@ impl HttpResponse:
 # that reflects untrusted input (a redirect Location, an echoed id, a request
 # header bounced back) could inject headers or split the response. strip them on
 # the way out so a crafted value degrades to a harmless single-line header. the
-# common case — no control bytes — returns the string untouched.
+# common case, a value with no control bytes, returns the string untouched.
 fn strip_header_controls(text: String) -> String:
     if text.index_of(chr(13)) < 0 and text.index_of(chr(10)) < 0 and text.index_of(chr(0)) < 0:
         return text
@@ -2647,7 +2667,7 @@ fn response_head_bytes(response: HttpResponse, content_length: Int, use_chunked:
 
 # serialize a response head with an explicit Connection value. `connection` is
 # how a keep-alive server names the disposition of the connection *without*
-# rebuilding the response to carry a Connection header — passing "keep-alive" or
+# rebuilding the response to carry a Connection header. passing "keep-alive" or
 # "close" here writes exactly that line and drops any Connection the response's
 # own header map holds, so the caller decides keep-alive per request with no
 # per-request `HttpResponse` copy. an empty `connection` keeps the standalone
@@ -3011,7 +3031,9 @@ fn read_head_once(src: ByteSource, cap: Int) -> Bytes!:
         fail HEADER_LIMIT_MESSAGE
     return head.ok
 
-# the next request head, at most `cap` bytes. empty lines before it are
+# the next message head, at most `cap` bytes: a request head on the server, a
+# response head when the client reads one. empty lines before it are
+
 # skipped (rfc 9112 2.2), up to the same cap; a head is read in one call
 # either way, since the readers find its end in what they already hold and
 # keep the rest for the body. an empty result means the peer closed with
@@ -3118,7 +3140,7 @@ fn read_request_into(src: ByteSource, writer: BufferedBytesWriter) -> StreamedHt
 # arrives, so a single CRLF-less line could grow far past MAX_HEADER_BYTES
 # before the caller's head-total check ever saw it. reading the line one
 # character at a time keeps a running count, so the flood fails at the limit
-# instead of buffering forever — and the buffered reader's cursor makes the
+# instead of buffering forever, and the buffered reader's cursor makes the
 # per-character reads linear, not quadratic. end of stream returns what
 # arrived, and a CR before the newline is dropped, exactly like `read_line`.
 fn read_head_line_bounded(reader: BufferedStringReader, cap: Int) -> String!:
@@ -3173,7 +3195,7 @@ fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpReques
     return request_from_head(parsed, body)
 # reads one request from a buffered string reader and packs it into the legacy
 # string form. the head is bounded by MAX_HEADER_BYTES like every other request
-# reader here — a head that exceeds it fails, even as one endless CRLF-less line.
+# reader here: a head that exceeds it fails, even as one endless CRLF-less line.
 pub fn read_request_buffered(reader: BufferedStringReader) -> String!:
     return pack_request(read_request_from_buffered_string(reader)!)
 # reads one request from a file descriptor and packs it into the legacy string form.
@@ -3210,7 +3232,7 @@ pub fn send_buffered(writer: BufferedBytesWriter, response: HttpResponse) -> Int
 
 # sends a response through a buffered writer with an explicit Connection value.
 # the keep-alive serve loops use this so they can keep or close a connection per
-# request without rebuilding the handler's response — an empty `connection`
+# request without rebuilding the handler's response. an empty `connection`
 # reproduces `send_buffered` exactly.
 pub fn send_buffered_conn(writer: BufferedBytesWriter, response: HttpResponse, connection: String) -> Int!:
     payload := response.to_bytes_conn(connection)!
@@ -3618,7 +3640,10 @@ fn plan_ranges(value: String, size: Int) -> RangePlan:
         return ignore_ranges()
     return RangePlan(206, starts, lengths)
 
+# the Content-Range value for `length` bytes from `start` of `size` (rfc 9110
+# 14.4).
 fn content_range(start: Int, length: Int, size: Int) -> String:
+
     return "bytes " + start.to_string() + "-" + (start + length - 1).to_string() + "/" + size.to_string()
 
 # a multipart/byteranges body (rfc 9110 14.6) holding each planned range.
@@ -3780,8 +3805,8 @@ pub fn send_response_bytes(fd: Int, response: Bytes) -> Int!:
     stream := io.from_fd(fd)
     writer := stream.buffered_bytes_writer()
     # close the fd and drop the writer's registry entry on every exit, so a failed
-    # write or flush cannot leak them. last-in-first-out runs the free before the
-    # close, matching the original order.
+    # write or flush cannot leak them. defers run last-in-first-out, so the
+    # writer is freed before the fd closes.
     defer tcp_close(fd)
     defer writer.free()
     written := writer.write_all_bytes(response)!
@@ -3790,6 +3815,9 @@ pub fn send_response_bytes(fd: Int, response: Bytes) -> Int!:
 # sends a raw response string to a file descriptor.
 pub fn send_response(fd: Int, response: String) -> Int!:
     return send_response_bytes(fd, bytes.from_string_utf8(response))
+# the header fields of a response head as a map. a repeated name keeps its last
+# value; Set-Cookie values, which cannot be combined, are read with
+# response_set_cookie_headers.
 fn response_headers_map(raw_head: Bytes) -> Map[String, String]:
     mut result: Map[String, String] := {}
     hdrs := headers_bytes(raw_head)
@@ -3811,6 +3839,7 @@ fn response_headers_map(raw_head: Bytes) -> Map[String, String]:
         pos = pos + 1
     return result
 
+# every Set-Cookie value in a response head, in the order they arrived.
 fn response_set_cookie_headers(raw_head: Bytes) -> List[String]:
     mut result: List[String] := []
     hdrs := headers_bytes(raw_head)
@@ -3979,6 +4008,8 @@ fn lower_hex_digit(value: Int) -> String:
     digits := "0123456789abcdef"
     return digits[value]
 
+# a non-negative Int in lowercase hex without leading zeros, as a chunk size
+# or an etag part is written.
 fn lower_hex_int(value: Int) -> String:
     if value == 0:
         return "0"
@@ -4030,7 +4061,7 @@ fn request_head_bytes(req: ClientRequest, target: String, connection: String, ac
         # strip CR/LF/NUL so an untrusted value reflected into a header
         # (.bearer, .cookie, .header with attacker input) cannot inject a
         # second header or splice a whole request into the outbound
-        # stream — the same guard the response path applies.
+        # stream. the response path applies the same guard.
         out.write(bytes.from_string_utf8(strip_header_controls(key) + ": " + strip_header_controls(req.headers[key]) + crlf)) catch 0
     mut tail := ""
     if connection != "" and header_lookup(req.headers, "Connection") == "":
@@ -4342,7 +4373,7 @@ pub fn begin_server_span(req: HttpRequestBytes) -> trace.Span:
     return span
 
 # close a server span opened by begin_server_span: tag it with the response
-# status, mark it an error on a 5xx, and end it. it records no metrics — a
+# status, mark it an error on a 5xx, and end it. it records no metrics: a
 # framework that keeps its own per-request metrics (std.web does) closes the span
 # with this and counts separately, so the RED series are not recorded twice. a
 # no-op when tracing is inactive.
@@ -4380,6 +4411,13 @@ pub fn end_server_span(span: trace.Span, status: Int):
     metrics.counter("http_server_requests_total").labels(["method", method, "route", route, "status", status_label]).inc()
     metrics.histogram("http_server_duration_ms").labels(["method", method, "route", route]).observe(elapsed_ms.to_float())
 
+# the request a streamed redirect leads to, with `redirects_left` as its
+# redirect limit. the redirect's body was already read and dropped, so the
+# response handed to redirect_request carries only its status and fields.
+fn streamed_redirect_request(current: ClientRequest, resp: StreamedHttpResponse, redirects_left: Int) -> ClientRequest!:
+    next := redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
+    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left)
+
 fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     mut current := req
     mut redirects_left := req.redirect_limit
@@ -4395,28 +4433,23 @@ fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedByt
             resp = send_request_wire_into(current, current.host, no_tls_config(), writer, current.redirect_limit > 0)!
         if redirects_left <= 0 or not redirect_status(resp.status):
             return resp
-        current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
         redirects_left = redirects_left - 1
-        current = ClientRequest(current.method, current.host, current.port, current.path, copy_headers_map(current.headers), current.body, current.use_tls, current.timeout_ms, redirects_left)
+        current = streamed_redirect_request(current, resp, redirects_left)!
 
 fn send_request_following_redirects_into_with_tls_config(req: ClientRequest, tls_config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     mut current := req
     mut redirects_left := req.redirect_limit
     while true:
+        mut resp := StreamedHttpResponse(0, "", {}, [], 0)
         if current.use_tls:
-            resp := send_request_wire_into(current, current.host, tls_config, writer, current.redirect_limit > 0)!
-            if redirects_left <= 0 or not redirect_status(resp.status):
-                return resp
-            current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
-            redirects_left = redirects_left - 1
-            current = ClientRequest(current.method, current.host, current.port, current.path, copy_headers_map(current.headers), current.body, current.use_tls, current.timeout_ms, redirects_left)
-            continue
-        resp := send_request_wire_into(current, current.host, no_tls_config(), writer, current.redirect_limit > 0)!
+            resp = send_request_wire_into(current, current.host, tls_config, writer, current.redirect_limit > 0)!
+        else:
+            resp = send_request_wire_into(current, current.host, no_tls_config(), writer, current.redirect_limit > 0)!
         if redirects_left <= 0 or not redirect_status(resp.status):
             return resp
-        current = redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
         redirects_left = redirects_left - 1
-        current = ClientRequest(current.method, current.host, current.port, current.path, copy_headers_map(current.headers), current.body, current.use_tls, current.timeout_ms, redirects_left)
+        current = streamed_redirect_request(current, resp, redirects_left)!
+
 
 impl ClientRequest:
     fn header(name: String, value: String) -> ClientRequest:
@@ -5401,6 +5434,8 @@ pub fn delete_route(req: HttpRequestBytes, pattern: String) -> Bool!:
 pub fn patch_route(req: HttpRequestBytes, pattern: String) -> Bool!:
     return match_route(req, "PATCH", pattern)
 
+# the logger an instrumented request logs through: a child span of `base`
+# under the "http" target, tagged with the method and path.
 fn instrumented_logger(base: log.Logger, req: HttpRequestBytes) -> log.Logger:
     child := base.target("http").child_span() catch base.target("http")
     return child.with([log.str("method", req.method_text), log.str("path", req.path_text)])
@@ -5408,7 +5443,10 @@ fn instrumented_logger(base: log.Logger, req: HttpRequestBytes) -> log.Logger:
 fn instrumentation_metric_name(prefix: String, suffix: String) -> String:
     return prefix + "_" + suffix
 
+# run `handler` on `req`, counting it under `metric_prefix` (requests,
+# in-flight, responses by status and duration) and logging its completion.
 fn instrument_request(handler: fn(HttpRequestBytes) -> HttpResponse, logger: log.Logger, metric_prefix: String, req: HttpRequestBytes) -> HttpResponse:
+
     started := time_mod.now()
     metrics.counter(instrumentation_metric_name(metric_prefix, "requests_total")).inc()
     inflight := metrics.gauge(instrumentation_metric_name(metric_prefix, "in_flight"))
@@ -5434,10 +5472,10 @@ pub fn wrap(handler: fn(HttpRequestBytes) -> HttpResponse, middleware: fn(fn(Htt
 # runs a handler with the json node pool scoped to this one request.
 #
 # json.parse() hands out handles into a per-task node pool that nothing frees
-# on its own, so on a keep-alive connection every request a handler parses used
-# to stay resident for the life of the connection. the scope closes as soon as
+# on its own, so without a scope every request a handler parses would stay
+# resident for the life of a keep-alive connection. the scope closes as soon as
 # the handler returns, which is safe because an HttpResponse carries bytes and
-# strings — nothing that still points into the pool. a handler that stashes a
+# strings, nothing that still points into the pool. a handler that stashes a
 # handle somewhere and reads it on a later request will find it invalid, which
 # was never a supported thing to do.
 fn run_handler(handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
@@ -5806,7 +5844,8 @@ test "http rejects a request head that exceeds the size limit":
     assert_eq(result.err, HEADER_LIMIT_MESSAGE)
 
 test "http string path rejects a single head line that exceeds the size limit":
-    # no CRLF ever arrives, so a per-line bound has to fire — a head-total check
+    # no CRLF ever arrives, so a per-line bound has to fire: a head-total check
+
     # alone would let the pending line grow without limit before it ran.
     mut big := "x"
     while big.len() < MAX_HEADER_BYTES + 16:

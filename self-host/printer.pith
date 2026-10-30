@@ -3,30 +3,21 @@
 # renders a parsed AST (arena-indexed nodes) as indented text,
 # matching the output format of `pith parse` exactly.
 
-from ast import get_node, Node
+from ast import get_node
 
 # ---------------------------------------------------------------
 # indentation helper
 # ---------------------------------------------------------------
 
-# we need a way to print without newline. pith's print() adds a newline.
-# use a buffer approach: build the full line then print it.
-mut line_buf := ""
-
-fn print_raw(s: String):
-    line_buf = line_buf + s
-
-fn flush_line():
-    print(line_buf)
-    line_buf = ""
-
+# print() always ends the line, so the indent and the text are joined
+# first and printed in one call.
 fn print_line(indent: Int, text: String):
+    mut line := ""
     mut i := 0
     while i < indent:
-        line_buf = line_buf + "  "
+        line = line + "  "
         i = i + 1
-    line_buf = line_buf + text
-    flush_line()
+    print(line + text)
 
 fn strip_generic_params(name: String) -> String:
     # "Pair[A, B]" -> "Pair"

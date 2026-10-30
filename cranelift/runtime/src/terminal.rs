@@ -1,7 +1,7 @@
 //! terminal builtins: raw mode, window size, and byte-level i/o on a tty.
 //!
-//! everything above these six calls — escape parsing, cell rendering, the
-//! session object — is pure pith in `std/term/`. this file owns exactly the
+//! everything above these six calls (escape parsing, cell rendering, the
+//! session object) is pure pith in `std/term/`. this file owns exactly the
 //! parts that need a syscall: `isatty`, termios save/raw/restore, `TIOCGWINSZ`,
 //! a readiness-gated byte read, and a complete-write loop.
 //!
@@ -36,12 +36,12 @@ static ATEXIT_ARMED: AtomicBool = AtomicBool::new(false);
 /// leave the alternate screen, show the cursor, disable mouse/paste/focus
 /// reporting, and reset styling. every sequence here is a no-op on a terminal
 /// that never turned the feature on, so writing the whole string blind is
-/// safe — cheap insurance against a session that died between enter and
+/// safe: cheap insurance against a session that died between enter and
 /// restore.
 const RESET_SEQ: &[u8] = b"\x1b[?1049l\x1b[?25h\x1b[?1006l\x1b[?1002l\x1b[?2004l\x1b[?1004l\x1b[0m";
 
 /// put the saved termios back, if any. returns true when the terminal is in
-/// its original state afterwards — including the case where nothing was ever
+/// its original state afterwards, including the case where nothing was ever
 /// saved, which is already that state.
 fn restore_saved() -> bool {
     let mut saved = match SAVED.lock() {
@@ -62,7 +62,7 @@ fn restore_saved() -> bool {
 extern "C" fn restore_at_exit() {
     if restore_saved() {
         // only bother with the reset string when a session actually entered raw
-        // mode at some point — SAVED starts None and restore_saved() drains it,
+        // mode at some point: SAVED starts None and restore_saved() drains it,
         // so reaching here always means the hook was armed by a raw enter.
         // SAFETY: one plain write to stdout at process exit.
         unsafe {
@@ -156,8 +156,8 @@ pub extern "C" fn pith_term_size(fd: i64) -> i64 {
 
 /// read up to `max` bytes from `fd`, waiting at most `timeout_ms` (-1 waits
 /// forever) for the first byte. returns a `Bytes` handle: non-empty on data,
-/// **empty on timeout** (normal — the escape-sequence parser uses short
-/// timeouts constantly), and `0` — the failure sentinel — on EOF or a hard
+/// **empty on timeout** (normal: the escape-sequence parser uses short
+/// timeouts constantly), and `0` (the failure sentinel) on EOF or a hard
 /// error, both of which mean the terminal session is over.
 ///
 /// the wait parks a green task on the reactor exactly like a socket read; the
@@ -197,7 +197,7 @@ pub extern "C" fn pith_term_read(fd: i64, max: i64, timeout_ms: i64) -> i64 {
 
 /// write all of a `Bytes` value to `fd`, looping over partial writes. returns
 /// the byte count on success, -1 on a bad handle or an error mid-write. no
-/// newline is appended — that is the point.
+/// newline is appended: that is the point.
 #[no_mangle]
 pub extern "C" fn pith_term_write(fd: i64, data: i64) -> i64 {
     if fd < 0 {

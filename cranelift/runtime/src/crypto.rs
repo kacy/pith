@@ -631,8 +631,8 @@ pub unsafe extern "C" fn pith_crypto_sign_ed25519_pkcs8(pkcs8: i64, message: i64
 }
 
 /// Sign `message` with a p-256 private key in pkcs#8 form. Uses the FIXED
-/// encoding, so the signature comes out as raw r‖s (64 bytes) — the form jws
-/// carries — rather than asn.1 der. The per-signature nonce comes from the
+/// encoding, so the signature comes out as raw r‖s (64 bytes), the form jws
+/// carries, rather than asn.1 der. The per-signature nonce comes from the
 /// system rng inside ring; it is never chosen here, which is the property
 /// that keeps ecdsa keys from leaking through a repeated nonce. Returns 0 on
 /// a malformed key.
@@ -659,7 +659,7 @@ pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_pkcs8(pkcs8: i64, me
 }
 
 /// Sign `message` with an ECDSA P-256 key (SHA-256), producing an ASN.1 DER
-/// signature — the form TLS carries in ServerKeyExchange and CertificateVerify,
+/// signature, the form TLS carries in ServerKeyExchange and CertificateVerify,
 /// unlike the raw r||s of the FIXED variant above. The per-signature nonce
 /// comes from ring's system rng and is never chosen here. Returns 0 on a
 /// malformed key.

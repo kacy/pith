@@ -8,7 +8,7 @@
 //! cannot avoid having concurrent readers: `getaddrinfo` on the resolver pool
 //! consults `RES_OPTIONS`, `LOCALDOMAIN` and `HOSTALIASES`, `execvp` in a
 //! spawning child reads `PATH`, and any C library linked into the program may
-//! read whatever it likes. rust's own env lock does not help — it is private to
+//! read whatever it likes. rust's own env lock does not help: it is private to
 //! rust-side accesses and libc has never heard of it.
 //!
 //! so the runtime stops writing to libc's environment. `os.set_env` and
@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{OnceLock, RwLock};
 
 /// what the program did to one name. `Some(value)` is a `set_env`, `None` an
-/// `unset_env` — the tombstone matters, because without it an unset name would
+/// `unset_env`: the tombstone matters, because without it an unset name would
 /// fall through to libc and read the value the process started with.
 type Entry = Option<String>;
 
@@ -46,8 +46,8 @@ fn table() -> &'static RwLock<BTreeMap<String, Entry>> {
     TABLE.get_or_init(|| RwLock::new(BTreeMap::new()))
 }
 
-/// false until the first write. a program that never calls `set_env` — nearly
-/// all of them — reads one relaxed atomic per lookup and never touches the lock.
+/// false until the first write. a program that never calls `set_env` (nearly
+/// all of them) reads one relaxed atomic per lookup and never touches the lock.
 static WRITTEN: AtomicBool = AtomicBool::new(false);
 
 /// read the lock, ignoring poisoning. a panic while the map was borrowed cannot
@@ -87,7 +87,7 @@ pub fn unset(name: &str) {
 /// merge the overlay into a child's environment.
 ///
 /// call this before any per-command `env` override, so an override the caller
-/// asked for wins over what the program set process-wide — `Command` keeps the
+/// asked for wins over what the program set process-wide: `Command` keeps the
 /// last write for a name.
 pub fn apply(command: &mut Command) {
     if !WRITTEN.load(Ordering::Acquire) {

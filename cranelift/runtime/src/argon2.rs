@@ -2,8 +2,8 @@
 //!
 //! Hand-written on top of the BLAKE2b module for the same reason BLAKE2b is:
 //! the runtime keeps its dependency set small, and `ring` offers neither
-//! primitive. Only Argon2id is exposed to pith — it is the variant RFC 9106
-//! recommends for password hashing — but the core supports all three
+//! primitive. Only Argon2id is exposed to pith (it is the variant RFC 9106
+//! recommends for password hashing), but the core supports all three
 //! variants so the official test vectors for each can pin down the indexing
 //! logic, which is where a subtly wrong implementation would still produce
 //! plausible-looking output.

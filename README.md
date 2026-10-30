@@ -167,7 +167,25 @@ open defects. the ones to know before you start:
 - gzip compresses with fixed huffman only, and the regex engine skips
   counted repeats, lazy quantifiers and lookaround on purpose.
 
-## quick start
+## install
+
+```
+curl -fsSL https://pithlang.com/install.sh | sh
+```
+
+the script installs the toolchain in `~/.pith` and prints the line to add
+to your `PATH`. set `PITH_HOME` to install somewhere else, or
+`PITH_VERSION` to pin a release such as `v0.2.12`. prebuilt toolchains
+cover linux and macos on x86_64 and arm64. pith links each program with
+the system c compiler, so you also need `cc`: the xcode command line tools
+on macos, gcc or clang on linux.
+
+```
+printf 'fn main():\n    print("hello")\n' > hello.pith
+pith run hello.pith
+```
+
+## build from source
 
 you need [rust and cargo](https://rustup.rs/) for the native backend.
 

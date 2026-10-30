@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # the crash guard. the rust runtime is linked into every pith program, so a
-# panic here is a crash — or worse, a silent wedge — in somebody's server. this
+# panic here is a crash (or worse, a silent wedge) in somebody's server. this
 # scans the rust sources for the constructs that stop a process (or reinterpret
 # memory) and fails on any that is not explicitly justified in place.
 #
@@ -13,7 +13,7 @@
 #     std::process::exit(1);
 #
 # the marker moves with the code, so it cannot rot the way a list of source-line
-# regexes in this file did — that list went stale, and every trap added after it
+# regexes in this file did: that list went stale, and every trap added after it
 # was written simply never got recorded. a marker whose next line does not match
 # the pattern is itself reported, so a marker left behind by a deleted site is
 # noticed too.
@@ -129,8 +129,8 @@ skip_brace != "" {
 }
 
 # the line a #[cfg(test)] attribute applies to. an item with a body is skipped
-# to its closing brace; an item without one — `#[cfg(test)] mod x;`, a `use`, a
-# `const` — has nothing to skip past, so the attribute covers that line alone.
+# to its closing brace; an item without one (`#[cfg(test)] mod x;`, a `use`, a
+# `const`) has nothing to skip past, so the attribute covers that line alone.
 # treating those as unclosed bodies used to swallow the rest of the file, and
 # reporting them as a failure kept a module declaration from being written that
 # way at all.

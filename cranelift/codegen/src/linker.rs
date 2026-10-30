@@ -8,11 +8,11 @@ use std::process::Command;
 /// Linker arguments that differ between the GNU toolchain and Apple's ld. Both
 /// lists express the same two intentions:
 ///
-/// - Drop runtime code the program never references — a hello world pulls in
+/// - Drop runtime code the program never references: a hello world pulls in
 ///   `print` but not the crypto/net/json it doesn't call. Runtime functions the
 ///   compiler emits are referenced by name, so anything a program actually uses
 ///   stays live; only genuinely dead sections go.
-/// - Strip symbols from the release binary. This is the bulk of the size — an
+/// - Strip symbols from the release binary. This is the bulk of the size: an
 ///   unstripped hello world is ~4x its stripped self.
 #[cfg(target_os = "macos")]
 const PLATFORM_LINK_ARGS: &[&str] = &[
@@ -82,7 +82,7 @@ pub fn get_runtime_lib_path() -> String {
     // compiler in use. it has to win: a repo checked out with more than one
     // cargo workspace can hold an older `target/release/libpith_runtime.a`
     // relative to the working directory, and picking by path order linked
-    // that stale archive instead — silently, since the link succeeds and the
+    // that stale archive instead, and silently, since the link succeeds and the
     // binary merely behaves like an older runtime. that cost real debugging
     // time (runtime changes appeared to have no effect at all) and could
     // ship a binary built from code nobody has.
@@ -127,7 +127,7 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
     // at <workspace>/target/release/pith), so the runtime sources sit at
     // <workspace>/runtime/src. joining "cranelift/runtime/src" looked right
     // but resolved one level too deep, so the directory never existed and
-    // this guard returned early on every build — leaving the staleness check
+    // this guard returned early on every build, leaving the staleness check
     // that is supposed to protect against linking old runtime code doing
     // nothing at all. the second candidate keeps a repo-root layout working.
     let runtime_src = [
@@ -147,7 +147,7 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
 
     let needs_rebuild = if let Some(lib_time) = lib_mtime {
         // Check if any .rs file in runtime/src is newer
-        walkdir_check_newer(&runtime_src, lib_time)
+        has_rust_source_newer_than(&runtime_src, lib_time)
     } else {
         true // lib doesn't exist, rebuild
     };
@@ -170,12 +170,13 @@ fn rebuild_runtime_if_stale(runtime_lib: &str) -> Result<(), CompileError> {
     Ok(())
 }
 
-fn walkdir_check_newer(dir: &std::path::Path, lib_time: std::time::SystemTime) -> bool {
+/// Whether any `.rs` file under `dir` was modified after `lib_time`.
+fn has_rust_source_newer_than(dir: &std::path::Path, lib_time: std::time::SystemTime) -> bool {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                if walkdir_check_newer(&path, lib_time) {
+                if has_rust_source_newer_than(&path, lib_time) {
                     return true;
                 }
             } else if path.extension().map(|e| e == "rs").unwrap_or(false) {

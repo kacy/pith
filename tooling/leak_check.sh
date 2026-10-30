@@ -2,8 +2,8 @@
 #
 # the leak growth gate. every case under tests/leaks/ runs one churn pattern
 # `PITH_LEAK_ROUNDS` times and prints its peak resident set in kilobytes. this
-# runs each case twice — once at a low round count and once at a multiple of
-# it — and fails when the peak grew between the two.
+# runs each case twice, once at a low round count and once at a multiple of
+# it, and fails when the peak grew between the two.
 #
 # growth rather than an absolute number because a program that leaks k bytes
 # per round moves its peak by k times the extra rounds, which is a signal that
@@ -285,7 +285,7 @@ for entry in "${cases[@]}"; do
 
   # a passing case is measured once. a failing one is measured again before it
   # is called a failure, so a single spike on a busy machine cannot turn the
-  # gate red — the retry only costs anything when something is already wrong.
+  # gate red; the retry only costs anything when something is already wrong.
   growth=""
   for _ in 1 2; do
     # $extra_env is deliberately unquoted: zero or more KEY=VALUE words.

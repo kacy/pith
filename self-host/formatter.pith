@@ -18,10 +18,10 @@
 pub fn fmt_source(source: String) -> String:
     lines := split_lines_preserve_empty(source)
     # each formatted line lands in its own slot and the file is joined
-    # once at the end. appending to a growing string instead rebuilt the
-    # whole file on every line, so formatting cost grew with the square
-    # of the source size — on the 9600-line emitter that was most of the
-    # run, and ci formats every self-hosted file on every push.
+    # once at the end. appending to one growing string would copy the
+    # whole file on every line, so formatting cost would grow with the
+    # square of the source size; ci formats every self-hosted file on
+    # every push, and the largest are thousands of lines.
     mut formatted_lines: List[String] := []
     mut consecutive_blank := 0
 
@@ -53,22 +53,18 @@ pub fn fmt_source(source: String) -> String:
         # end. trim again here so rule 4 holds for code lines too.
         formatted_lines.push(trim_right(format_code_line(line)))
 
-    # every slot above stood for a line the old loop terminated with a
-    # newline, so the joined file needs one more to match.
+    # every slot is a line that ends in a newline, so the join needs one
+    # more after the last slot.
     mut output := formatted_lines.join(chr(10)) + chr(10)
 
-    # ensure exactly one trailing newline
+    # end with exactly one newline. the output always ends in at least
+    # one, so only extra blank lines at the end need trimming.
     while output.len() > 1:
         if output[output.len() - 1] == chr(10):
             if output[output.len() - 2] == chr(10):
                 output = output.substring(0, output.len() - 1)
                 continue
         break
-
-    # ensure at least one trailing newline
-    if output.len() > 0:
-        if output[output.len() - 1] != chr(10):
-            output = output + chr(10)
 
     return output
 

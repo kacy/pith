@@ -33,9 +33,9 @@ pub(crate) struct PithByteBuffer {
 }
 
 /// Fast validity checks: one memory read against a magic word instead of a
-/// global registry lock per access. Bytes and buffers are currently never
-/// freed, so there is no scrub-on-free here yet; the field exists so stale
-/// or wild handles fail the compare instead of being dereferenced blindly.
+/// global registry lock per access. The free paths scrub the magic, so a
+/// stale or wild handle fails the compare instead of being dereferenced
+/// blindly.
 pub(crate) unsafe fn pith_bytes_ref<'a>(handle: i64) -> Option<&'a PithBytes> {
     let ptr = handle as *const ();
     if !crate::handle_registry::plausibly_aligned::<PithBytes>(ptr)

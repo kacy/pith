@@ -1,9 +1,10 @@
-//! String operations for the Pith runtime
+//! The `PithString` (pointer, length, heap flag) entry points, and
+//! `pith_cstring_len`, which every string length in compiled code goes
+//! through.
 //!
-//! Hybrid approach: Idiomatic Rust internally, C-compatible FFI boundary.
-//!
-//! The FFI layer uses `PithString` structs that are compatible with the C runtime.
-//! Internally, we use `std::string::String` for all operations.
+//! Compiled code passes most strings as headered cstrings (see the refcounted
+//! c strings section of `runtime_core.rs`); `PithString` is the by-value form
+//! a few older entry points still take.
 
 use std::alloc::dealloc;
 
@@ -116,20 +117,7 @@ pub unsafe extern "C" fn pith_string_from_cstr_ptr(cstr: *const i8, out_ptr: *mu
         return;
     }
 
-    let result = if cstr.is_null() {
-        EMPTY_STRING
-    } else {
-        // Manual strlen
-        let mut len = 0;
-        let mut p = cstr;
-        while *p != 0 {
-            len += 1;
-            p = p.add(1);
-        }
-        pith_string_new(cstr as *const u8, len)
-    };
-
-    *out_ptr = result;
+    *out_ptr = pith_string_from_cstr(cstr);
 }
 
 /// Retain a string.
@@ -231,11 +219,8 @@ pub unsafe extern "C" fn pith_string_trim(s: PithString) -> PithString {
     pith_from_str(as_str(&s).trim())
 }
 
-// ============================================================================
-// Simple strlen-based length (for debugging ABI issues)
-// ============================================================================
-
-/// Simple strlen-based length for null-terminated strings
+/// The byte length of a cstring: read from the header when it has one,
+/// counted to the NUL otherwise.
 #[no_mangle]
 pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
     if cstr.is_null() {

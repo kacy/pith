@@ -11,8 +11,7 @@ pub unsafe extern "C" fn pith_args() -> PithList {
     let list = pith_list_new(8, 1);
 
     for arg in env::args() {
-        let arg_len = arg.len();
-        let arg_ptr = crate::pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
+        let arg_ptr = crate::pith_copy_bytes_to_cstring(arg.as_bytes());
         pith_list_push_value(list, arg_ptr as i64);
         crate::pith_cstring_release(arg_ptr as *const i8);
     }

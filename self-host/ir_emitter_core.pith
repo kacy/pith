@@ -565,9 +565,7 @@ fn ir_call_result_kind(idx: Int, node: Node) -> String:
             callee_node := get_node(node.children[0])
             if callee_node.kind == "index":
                 explicit_generic_types = ir_explicit_generic_concrete_types(callee_node)
-            mut generic_ret_type := ir_checked_type(idx)
-            if generic_ret_type.len() == 0:
-                generic_ret_type = ir_infer_type(idx)
+            generic_ret_type := ir_infer_type(idx)
             callee = ResolvedCallee(ir_queue_generic_call(callee.name, idx, explicit_generic_types, generic_ret_type), false)
         declared_kind := ir_declared_callable_ir_retkind(callee.name)
         if declared_kind.len() > 0:
@@ -585,9 +583,7 @@ fn ir_method_call_result_kind(idx: Int, node: Node) -> String:
     mut call_name := ir_resolve_module_alias_method_call_name(idx)
     if call_name.len() > 0:
         if ir_is_generic_function_name(call_name):
-            mut generic_ret_type := ir_checked_type(idx)
-            if generic_ret_type.len() == 0:
-                generic_ret_type = ir_infer_type(idx)
+            generic_ret_type := ir_infer_type(idx)
             mut no_explicit_types: List[String] := []
             call_name = ir_queue_generic_call(call_name, idx, no_explicit_types, generic_ret_type)
         declared_kind := ir_declared_callable_ir_retkind(call_name)
@@ -4336,11 +4332,6 @@ fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Boo
         return
     ir_emit("neq " + result_reg.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
 
-# an owned string operand (a fresh char from s[i], a concat result, a
-# fresh method result) dies once the operation that consumed it emits.
-# this is the loop-condition reclaim: `while s[i] == ":"` builds a fresh
-# char every iteration, and the release lands in the same block as the
-# compare, so dominance is never in question.
 # true only for s[i] with a string receiver: that lowers to char_at,
 # which always mints a fresh one-char string. everything else keeps the
 # general borrowed-by-default classification.
@@ -4349,15 +4340,17 @@ fn ir_expr_is_fresh_string_index(idx: Int) -> Bool:
     if node.kind != "index" or node.children.len() == 0:
         return false
     # replicate ir_emit_index_expr's dispatch exactly: checked type first,
-    # inference as fallback.
-    mut obj_type := ir_checked_type(node.children[0])
-    if obj_type.len() == 0:
-        obj_type = ir_infer_type(node.children[0])
-    return obj_type == "string"
+    # inference as fallback (ir_infer_type asks the checker first).
+    return ir_infer_type(node.children[0]) == "string"
 
 fn ir_binary_op_is_comparison(simple_op: String) -> Bool:
     return simple_op == "lt" or simple_op == "gt" or simple_op == "lte" or simple_op == "gte"
 
+# an owned operand (a fresh char from s[i], a concat result, a fresh
+# method result, an owned container argument) dies once the operation that
+# consumed it emits. this is the loop-condition reclaim: `while s[i] == ":"` builds a fresh
+# char every iteration, and the release lands in the same block as the
+# compare, so dominance is never in question.
 fn ir_release_owned_operand(expr_idx: Int, reg: Int, expr_type: String):
     if expr_type == "string" and not ir_expr_is_borrowed(expr_idx):
         ir_string_release_reg(reg)
@@ -4616,9 +4609,7 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
     # other, and reaches the borrowed-classification branch above this one.
     if ir_value_extraction_is_uncounted(idx):
         return false
-    mut expr_type := ir_checked_type(idx)
-    if expr_type.len() == 0:
-        expr_type = ir_infer_type(idx)
+    expr_type := ir_infer_type(idx)
     return expr_type == "string"
 
 # the byte value (0-255) of a single-character string literal, or -1 if the
@@ -5089,9 +5080,7 @@ fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node:
     ir_emit_result_store_error_branch(parse_result_r, temp_name, done_l)
     root_r := ir_emit_result_ok_field_typed(parse_result_r, "Int")
 
-    mut generic_ret_type := ir_checked_type(idx)
-    if generic_ret_type.len() == 0:
-        generic_ret_type = ir_infer_type(idx)
+    generic_ret_type := ir_infer_type(idx)
     mut concrete_types := ir_explicit_generic_concrete_types(callee_node)
     if concrete_types.len() == 0:
         concrete_types = ir_generic_kinds_from_subst(idx)
@@ -5492,9 +5481,7 @@ fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
 fn ir_specialize_static_callee(idx: Int, node: Node, callee: ResolvedCallee, explicit_generic_types: List[String]) -> ResolvedCallee:
     if not ir_is_generic_function_name(callee.name):
         return callee
-    mut generic_ret_type := ir_checked_type(idx)
-    if generic_ret_type.len() == 0:
-        generic_ret_type = ir_infer_type(idx)
+    generic_ret_type := ir_infer_type(idx)
     return ResolvedCallee(ir_queue_generic_call(callee.name, idx, explicit_generic_types, generic_ret_type), false)
 
 # a call whose callee is an expression rather than a name: a function
@@ -7479,9 +7466,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
                 ctor_args.push(child)
             return ir_emit_struct_positional_init(call_name, ctor_args, ctor_tid)
         if ir_is_generic_function_name(call_name):
-            mut generic_ret_type := ir_checked_type(idx)
-            if generic_ret_type.len() == 0:
-                generic_ret_type = ir_infer_type(idx)
+            generic_ret_type := ir_infer_type(idx)
             mut no_explicit_types: List[String] := []
             call_name = ir_queue_generic_call(call_name, idx, no_explicit_types, generic_ret_type)
         arg_regs := ir_collect_call_arg_regs(node, 1, [])
@@ -8818,9 +8803,7 @@ fn ir_upsert_delta_idx(map_idx: Int, key_idx: Int, value_idx: Int) -> Int:
 fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int:
     if ir_current_func_returns_result:
         return 0 - 1
-    mut obj_type := ir_checked_type(map_idx)
-    if obj_type.len() == 0:
-        obj_type = ir_infer_type(map_idx)
+    obj_type := ir_infer_type(map_idx)
     if obj_type != "map" and obj_type != "map_int":
         return 0 - 1
     if not ir_pure_read_expr(map_idx) or not ir_pure_read_expr(key_idx):
@@ -11021,9 +11004,7 @@ fn ir_collect_generic_function_decls_from_root(root_idx: Int, module_path: Strin
 # self is never one of a method's declared parameters, so argument positions
 # line up with the declaration's parameter list without an offset.
 fn ir_queue_generic_method_call(idx: Int, node: Node, base_name: String) -> String:
-    mut ret_type := ir_checked_type(idx)
-    if ret_type.len() == 0:
-        ret_type = ir_infer_type(idx)
+    ret_type := ir_infer_type(idx)
     mut no_explicit_types: List[String] := []
     return ir_queue_generic_call(base_name, idx, no_explicit_types, ret_type)
 

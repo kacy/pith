@@ -46,7 +46,7 @@ have every benchmark, with arguments and caveats.
 | HTTP head parsing | `http_head_read` | 1.3x slower | 5.5x slower |
 | closures | `closure_calls`, `closure_error` | 1.5-1.9x slower | 2.2-4.3x slower |
 | reference cycles | `cyclic_graph`, `cyclic_graph_strong` | 2.1-6.2x slower | 1.8-2.6x slower |
-| hashing | sha256, sha512, fnv1a, crc32 | 1.25x to 33x slower | 1.25x to 41x slower |
+| hashing | sha256, sha512, fnv1a, crc32 | 1.16-2.3x slower | 1.17-2.8x slower |
 | channels, spawning, parallel work | `chan_fanout`, `lock_sweep/spawn`, `cpu_parallel_sync` | 1.1-2.1x faster | 1.1-12x faster |
 | task scheduling | `task_churn`, `task_pingpong`, `green_fanout` | 1.3-2.6x slower | 2.3x faster to 1.6x slower |
 | locks and metrics | `lock_sweep`, `metrics_contention` | 1.4x faster to 1.4x slower | 2.8x faster to 1.8x slower |
@@ -188,14 +188,17 @@ within 5 percent of the fourth run.
 | http_head_read | `1000000` | 615 | 487 | 112 | 1.26x | 5.51x |
 
 The hash kernels hash 256 MB. The rows below subtract the `none` arm (102 ms
-for Pith, 48 for Go, 47 for Rust), which only builds the input:
+for Pith, 47 for Go, 48 for Rust), which only builds the input. They come
+from a later interleaved run, after sha256 and crc32 started handing whole
+blocks to a runtime kernel that uses the CPU's SHA and carry-less multiply
+instructions. That took sha256 from 844 to 111 ms and crc32 from 226 to 13.
 
 | kernel | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| sha256 | 844 | 96 | 95 | 8.83x | 8.87x |
-| sha512 | 431 | 190 | 209 | 2.26x | 2.06x |
-| fnv1a | 234 | 188 | 187 | 1.25x | 1.25x |
-| crc32 | 226 | 6.8 | 5.5 | 33x | 41x |
+| sha256 | 111 | 95 | 94 | 1.16x | 1.17x |
+| sha512 | 432 | 190 | 208 | 2.27x | 2.08x |
+| fnv1a | 235 | 189 | 188 | 1.24x | 1.25x |
+| crc32 | 13 | 7.1 | 4.7 | 1.87x | 2.83x |
 
 ### concurrency
 
@@ -229,9 +232,13 @@ and the `call` and `direct` phases of `closure_calls` fold away.
   closure in a stack slot only when the function that makes it calls it by
   name. A closure passed to another function, as in `apply_twice`, is still
   allocated on the heap. Most of those rows measure that difference.
-- Hashes and checksums: Go's standard library and the Rust crates use
-  SHA-NI and pclmulqdq. Pith's kernels are portable code. fnv1a is a serial
-  chain in every language, so it is the closest comparison of the four.
+- Hashes and checksums: all three languages use SHA-NI for sha256 and
+  pclmulqdq for crc32. In Pith, the padding, the tail and a portable block
+  loop are Pith code, and only the loop over whole blocks is in the
+  runtime, which Pith code cannot write itself because Cranelift has
+  neither instruction. sha512 and fnv1a are portable code in Pith. fnv1a
+  is a serial chain in every language, so it is the closest comparison of
+  the four.
 - Cycles: Go has a tracing collector, so both cyclic graph files are the
   same Go program. In the strong variant, Pith and Rust leak every ring:
   Pith leaks about 245 bytes per ring and Rust about 125, which is most of
@@ -342,8 +349,7 @@ from these:
 - heap-allocated closures (`closure_calls`, `closure_error`): a closure
   passed to another function is built on the heap even when it never
   escapes
-- hash and checksum kernels in portable Pith, against Go and Rust code that
-  uses SHA-NI and pclmulqdq; Cranelift exposes neither
+- sha512 in portable Pith, about 2.3x Go
 - per-object allocation and refcount cost (`cyclic_graph`, `task_churn`); a
   some optional built outside a getter still gets a heap shell
 - spawning from the main thread (`green_fanout`, 2.6x Go): main is an OS

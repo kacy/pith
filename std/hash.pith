@@ -206,8 +206,10 @@ fn sha_load_words64_tail(w: List[Int], tail: List[Int], off: Int):
 # are hashed straight out of `input`; the final partial block and the
 # padding go through sha_padded_tail. sha2_32_reference below is the
 # copy-everything-into-a-list definition this replaced, kept as the
-# oracle the randomized test compares against.
-fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int) -> String:
+# oracle the randomized test compares against. with `hardware`, whole
+# blocks go to the runtime's sha256_blocks first; the test passes false to
+# check this loop on cpus where that call would take every block.
+fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int, hardware: Bool) -> String:
     mut h0 := ih0
     mut h1 := ih1
     mut h2 := ih2
@@ -225,6 +227,22 @@ fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
     k := sha256_round_constants
 
     mut block := 0
+    # sha256_blocks runs the compression function over whole blocks with
+    # the cpu's sha instructions and updates the state list in place. it
+    # returns false, with the list untouched, on a cpu without them, and
+    # the loop below then starts from the first block.
+    if hardware and full > 0:
+        state := [h0, h1, h2, h3, h4, h5, h6, h7]
+        if sha256_blocks(state, input, full / 64):
+            h0 = state[0]
+            h1 = state[1]
+            h2 = state[2]
+            h3 = state[3]
+            h4 = state[4]
+            h5 = state[5]
+            h6 = state[6]
+            h7 = state[7]
+            block = full
     while block < total:
         if block < full:
             sha_load_words32(w, input, block)
@@ -702,7 +720,7 @@ fn sha2_64_reference(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: 
 
 # compute a sha-256 digest and return it as lowercase hex.
 pub fn sha256(input: Bytes) -> String:
-    return sha2_32(input, 1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225, 8)
+    return sha2_32(input, 1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225, 8, true)
 
 fn hash_sha256(input: Bytes) -> String:
     return sha256(input)
@@ -724,7 +742,7 @@ fn hash_sha256_string(input: String) -> String:
 
 # compute a sha-224 digest and return it as lowercase hex.
 pub fn sha224(input: Bytes) -> String:
-    return sha2_32(input, 3238371032, 914150663, 812702999, 4144912697, 4290775857, 1750603025, 1694076839, 3204075428, 7)
+    return sha2_32(input, 3238371032, 914150663, 812702999, 4144912697, 4290775857, 1750603025, 1694076839, 3204075428, 7, true)
 
 # compute a sha-224 digest and return raw bytes.
 pub fn sha224_bytes(input: Bytes) -> Bytes:
@@ -1158,6 +1176,9 @@ test "sha2_32 agrees with the copy-into-a-list definition":
         assert_eq(data.len(), want)
         assert_eq(sha256(data), sha2_32_reference(data, 1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225, 8))
         assert_eq(sha224(data), sha2_32_reference(data, 3238371032, 914150663, 812702999, 4144912697, 4290775857, 1750603025, 1694076839, 3204075428, 7))
+        # the pith block loop alone, which sha256 skips on cpus with sha
+        # instructions
+        assert_eq(sha2_32(data, 1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225, 8, false), sha256(data))
         trial = trial + 1
 
 test "sha2_64 agrees with the copy-into-a-list definition":

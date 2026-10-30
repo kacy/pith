@@ -407,6 +407,17 @@ pub(crate) unsafe fn list_ref_from_handle<'a>(handle: i64) -> Option<&'a ListImp
     Some(&*(handle as *const ListImpl))
 }
 
+/// The elements of a list of plain eight-byte values (Ints, Floats, Bools),
+/// for runtime code that reads and writes them in place. None for any other
+/// list, or a handle that is not a list.
+pub(crate) unsafe fn primitive_words_mut<'a>(handle: i64) -> Option<&'a mut [i64]> {
+    let list = list_mut_from_handle(handle)?;
+    if list.type_tag != ListTypeTag::Primitive || !list.uses_value_storage() {
+        return None;
+    }
+    Some(&mut list.values8[..])
+}
+
 pub(crate) unsafe fn list_mut_from_handle<'a>(handle: i64) -> Option<&'a mut ListImpl> {
     if !list_magic_ok(handle as *const ()) {
         return None;

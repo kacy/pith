@@ -696,6 +696,16 @@ fn send_headers(conn: ServerConn, stream_id: Int, fields: List[hpack.HeaderField
     conn.send_frame(frames.headers_frame(stream_id, block, end_stream, true))!
     return 0
 
+# unused. it stays because the emitter compiles an impl method with whatever
+# ir_current_func_returns_result the function before it left behind: with this
+# plain function gone, the Server methods below would follow the fallible
+# send_headers and compile every map index as a propagating lookup. remove it
+# once ir_impl_func sets that flag itself.
+fn min_int(a: Int, b: Int) -> Int:
+    if a < b:
+        return a
+    return b
+
 # --- send-side flow control (RFC 9113 §6.9) ---
 #
 # a response body larger than the client's send window must be split into DATA

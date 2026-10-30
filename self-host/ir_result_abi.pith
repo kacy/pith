@@ -8,7 +8,7 @@ from types import get_type_info
 # true when a fallible call carries its outcome in ONE register with a
 # zero sentinel instead of the three-slot box: every non-empty result
 # kind except "tuple". "" means the call is not fallible at all.
-# careful — it also answers true for the string/bytes/float legacy
+# careful: it also answers true for the string/bytes/float legacy
 # kinds, which the consumer never biases, so it is a wider net than the
 # +1 encoding the encode/decode helpers below implement.
 pub fn ir_uses_result_abi(result_kind: String) -> Bool:
@@ -64,7 +64,7 @@ mut result_abi_pair_return := false
 pub fn ir_set_pair_return(active: Bool):
     result_abi_pair_return = active
 
-# return `result_r` — a fresh result box KNOWN to hold an error — from the
+# return `result_r` (a fresh result box KNOWN to hold an error) from the
 # current function. under the register ABI the error payload leaves in the
 # value register with its count and the destructor-less shell is freed;
 # otherwise the box itself is the return value, exactly as before.
@@ -96,7 +96,7 @@ pub fn ir_decode_result_value(value_reg: Int, result_kind: String) -> Int:
 
 # load a result box's is_ok flag (slot 0) into a register ready to feed
 # a `brif`. only the exact name "is_ok" gives the flag as stored; every
-# other name — "is_err" is the one that matters — comes back negated.
+# other name ("is_err" is the one that matters) comes back negated.
 pub fn ir_emit_result_flag_field(obj_r: Int, fname: String) -> Int:
     flag_r := ir_reg()
     ir_emit("field " + flag_r.to_string() + " " + obj_r.to_string() + " 0 bool is_ok")
@@ -128,7 +128,7 @@ pub fn ir_emit_result_error_message(callee_name: String) -> Int:
 
 # the ir kind to annotate one slot of a result box with: the payload
 # type for "ok", the error type for "err", and "bool" for the is_ok /
-# is_err flag. `obj_tid` must be the tid of the RESULT itself — hand it
+# is_err flag. `obj_tid` must be the tid of the RESULT itself; hand it
 # the payload's tid and it silently reports "unknown".
 # "unknown" is also the answer for a type the checker never recorded,
 # and it is an admission, not a kind: the consumer tracks nothing for
@@ -167,14 +167,14 @@ pub fn ir_emit_result_value_field(obj_r: Int, obj_tid: Int, fname: String) -> In
 # the same ok slot (8), for a box whose own type id nobody has: the json
 # decoders build their result boxes themselves, so the only tid to hand
 # over is the payload's. `field_tid` is therefore the ok value's type,
-# not the result's — the opposite of ir_emit_result_value_field.
+# not the result's, the opposite of ir_emit_result_value_field.
 pub fn ir_emit_json_field_ok(result_r: Int, field_tid: Int) -> Int:
     ok_r := ir_reg()
     ir_emit("field " + ok_r.to_string() + " " + result_r.to_string() + " 8 " + ir_type_from_tid(field_tid) + " ok")
     return ok_r
 
 # the ok slot once more, for a payload named by its source type text
-# ("List[String]", an alias, a struct name) rather than by tid — the
+# ("List[String]", an alias, a struct name) rather than by tid; the
 # generated decode bodies know the annotation they parsed, not a type id.
 # the alias and struct tables arrive as arguments because their registry
 # imports this module and not the other way round; call

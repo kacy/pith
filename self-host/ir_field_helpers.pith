@@ -35,7 +35,7 @@ pub fn ir_unique_field_offset_with_state(field_name: String, struct_field_index_
 # the emission kind for a field called field_name, on the same
 # unambiguous-across-the-whole-program basis as
 # ir_unique_field_offset_with_state, and normally called straight after
-# it. returns "unknown" — never "" — when no struct declares the name
+# it. returns "unknown" (never "") when no struct declares the name
 # and equally when two declare it with different kinds. degrading to
 # "unknown" matters: the kind is what tells the ir consumer whether the
 # loaded register holds a string, bytes, a float or a struct, so a
@@ -62,7 +62,7 @@ pub fn ir_unique_field_kind_with_state(field_name: String, struct_field_lookup: 
 # unambiguous across every struct in the program; the fixed result
 # layout for is_ok/ok/err/is_err; and finally the bare no-offset form.
 # that last tier only assembles when field_name is a numeric tuple
-# index — for a real field name the ir consumer rejects the program with
+# index; for a real field name the ir consumer rejects the program with
 # "field instruction requires an explicit offset", so falling all the
 # way through is a bug earlier in the pipeline rather than a graceful
 # degradation. field_kind_override, when non-empty, beats the kind
@@ -87,7 +87,7 @@ pub fn ir_emit_named_field_access_with_state(result_reg: Int, obj_r: Int, lookup
         elif field_name == "is_ok" or field_name == "is_err" or field_name == "ok" or field_name == "err":
             # a result field on a value whose payload type is a generic
             # parameter: the struct lookup knows nothing, but a result's
-            # layout is fixed regardless of what it carries — flag at 0,
+            # layout is fixed regardless of what it carries: flag at 0,
             # ok at 8, err at 16. without this the bare no-offset form went
             # out and the consumer rejected the program. is_err is the flag
             # negated, since only is_ok is stored.
@@ -110,14 +110,14 @@ pub fn ir_emit_named_field_access_with_state(result_reg: Int, obj_r: Int, lookup
         else:
             ir_emit("field " + result_reg.to_string() + " " + obj_r.to_string() + " " + field_name)
 
-# emit a tuple element read — `t.0`, `t.1` — and report whether it
+# emit a tuple element read (`t.0`, `t.1`) and report whether it
 # applied. false means nothing was emitted and the caller should fall
 # through to the named-struct path: that happens when the checker never
 # typed the receiver, typed it as something other than a tuple, or when
 # field_name is not a decimal index inside the tuple's arity. the
 # element's own type id gives the kind, and every element is one 8-byte
 # slot, so this path has none of the name ambiguity the struct path has
-# to guard against — which is why the caller tries it first.
+# to guard against, which is why the caller tries it first.
 pub fn ir_emit_tuple_field_access(result_reg: Int, obj_r: Int, recv_idx: Int, field_name: String) -> Bool:
     recv_tid := c_get_expr_type(recv_idx)
     if recv_tid < 0:

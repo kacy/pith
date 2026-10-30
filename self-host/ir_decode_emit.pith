@@ -1,11 +1,11 @@
-# ir_decode_emit.pith — emission of json, handle-pool, and config decode
+# ir_decode_emit.pith: emission of json, handle-pool, and config decode
 # calls: walking a target struct's fields and generating the
 # per-field fetch, convert, default, and merge sequences.
 #
 # the emitter's expression machinery stays in the core; where a field
 # default needs an expression emitted in place, these functions take
 # the emission hooks as explicit parameters (emit_expr, emit_value,
-# emit_default_ret) instead of importing the core back — that keeps
+# emit_default_ret) instead of importing the core back; that keeps
 # the module graph a dag.
 
 from ast import Node, get_node, node_kind
@@ -55,8 +55,8 @@ fn ir_emit_decode_result_call3(result_reg: Int, fname: String, arg0: Int, arg1: 
 #
 # at a plain call site (json.decode_text[User](...)) the checker already
 # knows the result is User!, so we take the struct straight from the
-# expression type. inside a generic wrapper body — parse[T] specialized as
-# parse__User — the checker only ever saw the abstract T, so the expression
+# expression type. inside a generic wrapper body (parse[T] specialized as
+# parse__User), the checker only ever saw the abstract T, so the expression
 # type is the type parameter, not the concrete struct. in that case we
 # recover the struct from the call's explicit type argument ([T]) by
 # substituting it through the active generic bindings (T -> User).
@@ -125,7 +125,7 @@ struct IrJsonPoolMark:
 # catch to consume (or returned it), and the success path abandons the
 # shell. result shells carry no destructor, so releasing one frees exactly
 # the three-slot allocation while the extracted payload keeps the count
-# the callee transferred — the same shape the catch lowering emits. every
+# the callee transferred, the same shape the catch lowering emits. every
 # require step of a typed decode leaked its shell before these.
 fn ir_take_json_ok(result_r: Int, field_tid: Int) -> Int:
     ok_r := ir_emit_json_field_ok(result_r, field_tid)
@@ -1564,7 +1564,7 @@ fn ir_json_required_mask(n: Int) -> Int:
     return mask
 
 # string is the only rc scalar, so the struct needs its destructor when
-# any field is a string — otherwise those field strings would leak.
+# any field is a string; otherwise those field strings would leak.
 fn ir_json_decode_has_string(target_info: TypeInfo) -> Bool:
     for field_name, i in target_info.fields:
         field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
@@ -1573,7 +1573,7 @@ fn ir_json_decode_has_string(target_info: TypeInfo) -> Bool:
     return false
 
 # the fast path: decode a flat scalar struct in a single pass. the
-# runtime fills a pre-allocated struct — destructor attached — in place,
+# runtime fills a pre-allocated struct, destructor attached, in place,
 # so there is no scalar-object, no per-field result tuple, and no leaked
 # field strings. a mask of the filled fields is checked against the
 # required set; any miss releases the struct and returns the decode error.

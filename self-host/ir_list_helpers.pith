@@ -111,7 +111,7 @@ pub fn ir_emit_list_filter_loop(list_r: Int, ctor: String, keep_name: String, re
 ## into acc_name and the reducer into reducer_name before calling; this
 ## walks the list front to back, replacing the accumulator each step, and
 ## returns a register holding the final load of acc_name. unlike map and
-## filter it builds no container, so no ownership question arises here —
+## filter it builds no container, so no ownership question arises here;
 ## whatever the reducer returns simply becomes the next accumulator.
 pub fn ir_emit_list_reduce_loop(list_r: Int, reducer_name: String, acc_name: String, elem_kind: String, result_kind: String, idx_name: String) -> Int:
     len_r := ir_reg()
@@ -158,7 +158,7 @@ pub fn ir_emit_list_is_empty(list_r: Int) -> Int:
 # the register holding "this element equals the search target". with the
 # element type in hand the comparison is the one `==` performs on that type,
 # so an optional element compares by tag and payload rather than by the
-# address of its shell — the shape that used to make `xs.contains(b)` answer
+# address of its shell, the shape that used to make `xs.contains(b)` answer
 # false for a b equal to an element the list holds. elem_tid is -1 only where
 # the checker left the list untyped, and there the old kind-driven pair is
 # all there is: a string by content, anything else by raw slot.

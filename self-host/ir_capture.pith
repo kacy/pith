@@ -14,7 +14,7 @@ fn ir_should_capture_name(name: String, bound: List[String], free: List[String],
     if ir_list_contains(bound, name) or ir_list_contains(free, name):
         return false
     # a real variable in the enclosing scope must be captured even if a global
-    # function or type shares its name — the local shadows the global (e.g. a
+    # function or type shares its name; the local shadows the global (e.g. a
     # parameter named `host` alongside std.net.url.host).
     if locals.contains_key(name):
         return true
@@ -55,7 +55,7 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
                 updated_free = ir_find_free_vars_walk(child, inner_bound, updated_free, blocked_names, locals)
         return updated_free
     # an `if let` / `while let` payload is bound by the construct itself, for
-    # its body only — the same relationship a lambda's parameters have to the
+    # its body only: the same relationship a lambda's parameters have to the
     # lambda body above. the subject is walked under the OUTER set, since the
     # payload name means nothing yet while it is evaluated, and so is an
     # `if let`'s else block, where the payload is not in scope at all.
@@ -118,8 +118,8 @@ fn ir_collect_pattern_names(idx: Int, names: List[String]):
 # in order as the closure's environment layout, so slot i belongs to
 # name i on both the capture side and the load side.
 #
-# `blocked_names` are names that are not variables at all — module
-# aliases, import renames, struct names, known functions — and are
+# `blocked_names` are names that are not variables at all (module
+# aliases, import renames, struct names, known functions) and are
 # skipped. `locals` is the enclosing scope's live variables, and it wins:
 # a name that is a real local is captured even when a global of the same
 # name is blocked, so a parameter named `host` shadows std.net.url.host.

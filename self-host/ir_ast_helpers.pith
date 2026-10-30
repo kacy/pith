@@ -4,7 +4,7 @@ from ast import get_node, Node
 
 # whether `value` appears in `items`, compared byte for byte with no
 # case folding. a linear scan, so it is sized for the short name lists
-# capture analysis carries around — bound names, free names, a lambda's
+# capture analysis carries around: bound names, free names, a lambda's
 # capture list. callers use it as the guard before pushing, which is what
 # keeps those lists free of duplicates.
 pub fn ir_list_contains(items: List[String], value: String) -> Bool:
@@ -27,8 +27,8 @@ pub fn ir_is_string_literal_kind(kind: String) -> Bool:
     return kind == "string_lit" or kind == "string" or kind == "str_lit" or kind == "lit" or kind == "pat_string"
 
 # the declaration behind a `pub` wrapper. the parser does not mark a
-# declaration public in place — it wraps it in a `pub` node holding the
-# real declaration as its only child — so a sweep that tests `.kind`
+# declaration public in place; it wraps it in a `pub` node holding the
+# real declaration as its only child, so a sweep that tests `.kind`
 # against "field" / "fn" / "struct" would skip every public one. call this
 # on each child first and public and private declarations look alike.
 # a node that is not a `pub` wrapper comes back unchanged, so this is safe
@@ -42,7 +42,7 @@ pub fn ir_unwrap_pub_node(idx: Int) -> Node:
 
 # the same `pub` unwrapping as ir_unwrap_pub_node, but keeping the node
 # index rather than the node. use this one when the result has to be
-# stored or walked further — ir_root_items caches the unwrapped indices of
+# stored or walked further; ir_root_items caches the unwrapped indices of
 # a module's top-level declarations this way. `idx` itself is returned
 # when it is not a `pub` wrapper, so the result is always a real node
 # index, never -1.

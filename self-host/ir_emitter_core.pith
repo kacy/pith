@@ -76,15 +76,9 @@ from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary, ir_is_f
 from ir_list_helpers import ir_is_list_runtime_type, ir_emit_list_map_loop, ir_emit_list_filter_loop, ir_emit_list_reduce_loop, ir_emit_list_is_empty, ir_emit_list_missing_index_result, ir_emit_list_index_search_loop, ir_emit_list_contains_from_index
 from ir_result_flow import ir_emit_result_store_error_branch
 
-# --- current function locals ---
+# --- per-function state: reset or rebuilt for every function emitted ---
 mut ir_map_value_types: Map[String, String] := {} # map variable name -> value type
 
-# enums with at least one payload-carrying variant are boxed: a value is a
-# heap struct with the tag in slot 0 and payload values in slots 1..n.
-# payload-free enums stay plain integer tags.
-
-# checked tid of the innermost match subject, for tuple-pattern element
-# types; set by the match emitters before lowering arms
 # declared return kinds of closure-typed parameters in the current
 # function: `key: fn(T) -> String` records "string" under "key", so a
 # call through the parameter infers its result kind without a checked type
@@ -98,7 +92,7 @@ mut ir_closure_return_kinds: Map[String, String] := {}
 # function is poisoned with an empty symbol and stays indirect. per function:
 # cleared where the other per-function maps are, and stacked around a lambda
 # body so the body sees an empty map and the enclosing function gets its own
-# back — a lambda's frame state leaking into its parent was #1013.
+# back. a lambda's frame state leaking into its parent was #1013.
 mut ir_local_lambda_targets: Map[String, String] := {}
 # the enclosing functions' maps while a lambda body is being emitted, keyed
 # by nesting depth (a list would do, but List has no pop)
@@ -114,6 +108,7 @@ mut ir_last_lambda_symbol := ""
 # is a no-op). lists, not maps, so cleanup order is deterministic and the
 # emitted ir stays bootstrap-stable.
 mut ir_rc_locals: List[String] := []
+mut ir_rc_local_kinds: List[String] := []
 # a lambda's captures while its prologue runs: loaded from the closure
 # environment, which owns them, so none of them may become a kinded local.
 mut ir_rc_prologue_captures: List[String] := []
@@ -136,7 +131,6 @@ mut ir_fn_arg_lambda_symbols: Map[Int, String] := {}
 # the registers of this function's closures that live in a stack slot, which
 # the release paths for call arguments must leave alone.
 mut ir_stack_closure_regs: List[Int] := []
-mut ir_rc_local_kinds: List[String] := []
 
 # tuple locals (a `T!`/`T?` bound to a name) release only their 3-slot shell at
 # cleanup by default, which leaks the owned payload at slot 8 (and the error at
@@ -192,9 +186,7 @@ mut ir_tuple_walk_pair_returns: List[Int] := []
 mut ir_borrow_param_local: Map[String, String] := {}
 mut ir_borrow_param_exported: Map[String, String] := {}
 
-# --- module globals collected during the prepass ---
-
-# --- type and symbol metadata copied from the checker ---
+# --- per-module state: type metadata and the helpers it calls for ---
 
 mut ir_local_struct_names: List[String] := [] # structs declared by this module
 mut ir_tracer_memo: Map[String, Int] := {} # 1 needs tracer, 2 no/undecided
@@ -209,12 +201,14 @@ mut ir_result_arg_release_sigs: List[String] := [] # (ok,err) payload signatures
 mut ir_optional_tuple_dtor_needed := false
 
 # `threadlocal` module globals: name -> a process-unique slot id, and name ->
-# the global's ir retkind (for the init thunk header + access typing). Reads and
+# the global's ir retkind (for the init thunk header + access typing). reads and
 # writes of these names route through pith_tls_get_or_init / pith_tls_set instead
-# of a shared data slot. Accumulated across modules; slots stay unique.
+# of a shared data slot. accumulated across modules; slots stay unique.
 mut ir_threadlocal_slots: Map[String, Int] := {}
 mut ir_threadlocal_kinds: Map[String, String] := {}
 mut ir_next_tls_slot := 0
+# named function -> the `__fnval_N` wrapper that lets it travel as a closure
+# value, so every use of one function as a value shares one wrapper.
 mut ir_named_fn_value_wrappers: Map[String, String] := {}
 
 # --- the two-register result ABI (on by default, PITH_RESULT_REG=0 for off) ---
@@ -235,15 +229,21 @@ mut ir_result_reg_flag := 0 - 1
 # the pair handshake: a consumer that can use (flag, payload) directly (the
 # `!` emitter) stores its operand node index here before emitting it; the
 # call emitter delivers the pair through the three registers below only when
-# the call it is lowering IS that node — an argument's nested call never
+# the call it is lowering IS that node. an argument's nested call never
 # matches, so it materializes a box like any other context.
 mut ir_rcall_defer_idx := 0 - 1
 mut ir_rcall_current_idx := 0 - 1
 mut ir_rcall_pair_ready := false
 mut ir_rcall_flag_reg := 0
 mut ir_rcall_val_reg := 0
+# counters behind generated names: lambda, spawn and fn-value wrappers share
+# ir_lambda_count, and each `for` loop takes the next ir_for_count for its
+# hidden index, length and loop-variable slots. neither resets between
+# modules, so the generated names stay unique across a build.
 mut ir_lambda_count := 0
 mut ir_for_count := 0
+# the labels `break` and `continue` jump to in each enclosing loop,
+# innermost last.
 mut ir_break_stack: List[String] := []
 mut ir_continue_stack: List[String] := []
 
@@ -307,16 +307,13 @@ mut ir_loop_iter_kinds: List[String] := []
 mut ir_lambda_bodies: List[String] := [] # deferred lambda function IR
 mut ir_module_count := 0 # increments per emit_ir call for unique naming
 
-# Per-instantiation specialized impl method names, kept separate from
-# ir_impl_methods because that map is reset between modules and would wipe
-# specializations registered during an earlier module's emission. Key is
-# "InstanceType.method" (e.g. "MapIter[Range,Int,Int].next") and value is the
-# specialized symbol name. Read via ir_lookup_specialized_method.
-
+# the ir kind inside the current function's `T?` return type, "" when it
+# does not return an optional; a return statement uses it to decide whether
+# its value still needs wrapping.
 mut ir_current_func_optional_inner_kind := ""
 
-# True while emitting the body of a function that returns a Result (T! or
-# T!E). Used by the index expression codegen to decide whether `map[k]` /
+# true while emitting the body of a function that returns a Result (T! or
+# T!E). used by the index expression codegen to decide whether `map[k]` /
 # `list[i]` should propagate a fail on miss (T! context) or fall through
 # to the loud-miss runtime (non-T! context).
 mut ir_current_func_returns_result := false
@@ -1224,9 +1221,6 @@ fn ir_string_method_returns_fresh(mname: String) -> Bool:
         return true
     return false
 
-# release every owned string local before a return, minus the one being
-# returned (its count transfers to the caller). the prologue zero-stores
-# each tracked name, so the loads are valid on every path.
 # --- defer scope machinery ---
 #
 # the delicate invariant lives here: at every exit edge the deferred user
@@ -1257,13 +1251,9 @@ fn ir_defer_emit_through(stop: Int, is_error_exit: Bool):
             ir_stmt(ir_defer_nodes[i])
         i = i - 1
 
-# emit every deferred statement still in scope, before the ARC cleanup. used at
-# the function-level exit edges: pass is_error_exit true at the error edges
-# (fail / `!` / `?` / index-miss) so errdefers run, false at the success edges
-# (return, default return) so they are skipped.
 # release every still-open loop's owned iterable at a function exit edge. the
 # loop's own end label releases it on the normal path, but return/fail/`!` leave
-# the function before that label, so release here — innermost loop first — to
+# the function before that label, so release here (innermost loop first) to
 # free what the end label would have. break/continue reach the end label and are
 # not function exits, so they never call this.
 fn ir_loop_iter_emit_releases():
@@ -1274,6 +1264,11 @@ fn ir_loop_iter_emit_releases():
         ir_rc_release_reg(r, ir_loop_iter_kinds[i])
         i = i - 1
 
+# emit every deferred statement still in scope, then release the open loop
+# iterables, all before the ARC cleanup. used at the function-level exit edges:
+# pass is_error_exit true at the error edges (fail / `!` / `?` / index-miss) so
+# errdefers run, false at the success edges (return, default return) so they
+# are skipped.
 fn ir_defer_emit_to_function_frame(is_error_exit: Bool):
     ir_defer_emit_through(0, is_error_exit)
     ir_loop_iter_emit_releases()
@@ -2392,6 +2387,9 @@ fn ir_emit_result_arg_release_helpers():
         ir_emit_label(done_l)
         ir_emit_zero_ret_endfunc()
 
+# release every rc local the function owns before a return, minus `exclude`,
+# the one being returned (its count transfers to the caller). the prologue
+# zero-stores each tracked name, so the loads are valid on every path.
 fn ir_emit_rc_cleanup(exclude: String):
     mut i := 0
     while i < ir_rc_locals.len():
@@ -2411,10 +2409,9 @@ fn ir_emit_rc_cleanup(exclude: String):
     for kname in ir_kinded_rc_binds:
         ir_kinded_release_slot(kname)
 
-# pre-pass: names of string-typed binds anywhere in the body. an
-# under-approximation is safe — a missed name is never released (a leak),
-# while emission-time classification only widens, never narrows, so every
-# collected name really does hold owned counts.
+# the type a binding gives its name for the owned-local pre-pass: the
+# annotation when there is one, otherwise what the checker or inference says
+# the value is, corrected for the shapes listed below.
 fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
     # a binding declared with a bare `none` and no annotation has the none type,
     # which is not an rc kind, so the name was poisoned and its shell released
@@ -2491,6 +2488,10 @@ fn ir_prepass_track_or_poison(name: String, kind: String, names: List[String], p
     elif not poisoned.contains(name):
         poisoned.push(name)
 
+# pre-pass: names of rc-typed binds anywhere in the body. an
+# under-approximation is safe (a missed name is never released, a leak),
+# while emission-time classification only widens, never narrows, so every
+# collected name really does hold owned counts.
 fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String]):
     node := get_node(idx)
     if ir_is_binding_kind(node.kind):
@@ -2599,6 +2600,8 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
     for child in node.children:
         ir_collect_rc_bind_names(child, names, poisoned)
 
+# the symbol of the function whose body is being emitted, for the return
+# paths that need its declared result ok kind.
 mut ir_current_arc_func := ""
 # true while emitting main's own body — not a lambda defined inside it, and
 # not a test function. error returns emitted under this flag also report the
@@ -2627,9 +2630,6 @@ fn ir_collect_reassigned_string_params(idx: Int, names: List[String]):
     for child in node.children:
         ir_collect_reassigned_string_params(child, names)
 
-# prologue for the collected names: zero-store each one and retain string
-# params (params are locals under the same rule, so the exit cleanup
-# releasing them stays balanced with the caller's count).
 # drop names from this frame's owned-local tracking. used for a lambda's
 # captures, which the closure environment owns.
 fn ir_untrack_rc_locals(names: List[String]):
@@ -2847,6 +2847,9 @@ fn ir_subtree_reads_uncounted(idx: Int, params: List[String]) -> Bool:
         i = i + 1
     return true
 
+# the owned-local prologue: collect the body's rc locals, zero-store each one
+# and retain reassigned params (params are locals under the same rule, so the
+# exit cleanup releasing them stays balanced with the caller's count).
 fn ir_emit_rc_prologue(body_idx: Int):
     # before anything resolves a name: everything this body binds is this
     # function's own storage, whatever a module global is spelled.

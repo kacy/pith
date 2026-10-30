@@ -1,8 +1,8 @@
-# ir_alias_registry.pith — the compiler's record of names that stand
+# ir_alias_registry.pith: the compiler's record of names that stand
 # for other names: type aliases, module aliases, import renames, and
-# what each import declares (functions, globals, and — after the
-# imported-kind fix — the globals' type kinds). filled while imports
-# resolve, consulted by every call and type lookup after.
+# what each import declares (functions, globals, and the globals' type
+# kinds). filled while imports resolve, consulted by every call and
+# type lookup after.
 
 from ast import Node, get_node
 from ir_call_helpers import ir_declared_callable_return_type_with_state
@@ -35,7 +35,7 @@ pub mut ir_global_bool_names: List[String] := []
 ## every module-level global this module declares, threadlocal or not, and
 ## whatever its type. the kind-specific lists above only hold the globals
 ## whose type the emitter recognises by name, so none of them can answer
-## "does this bare name write a global slot?" — a struct-typed global is in
+## "does this bare name write a global slot?"; a struct-typed global is in
 ## none of them. an assignment needs that answer to know whether it owns the
 ## value it is overwriting.
 pub mut ir_global_slot_names: List[String] := []
@@ -173,7 +173,7 @@ pub fn ir_collect_preloaded_root_metadata(root_idx: Int, module_path: String):
 # an imported global's type kind travels with the import: without it,
 # assigning a fresh {} to an imported Map[String, String] built the
 # untagged map flavor, its values went in without retains, and the
-# renames table came back as dangling pointers — the bug that sank
+# renames table came back as dangling pointers, the bug that sank
 # two attempts to split this file.
 
 ## record an imported global's type kind so empty literals

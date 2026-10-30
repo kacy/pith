@@ -1,4 +1,4 @@
-# ir_metadata.pith — static IR lowering metadata
+# ir_metadata.pith: static IR lowering metadata
 
 FLOAT_RETURNING_FUNCS := "pow,sqrt,floor,ceil,round,to_float,get_float,float_from_bits"
 BOOL_RETURNING_FUNCS := "term_is_tty,term_raw_enter,term_restore,file_exists,dir_exists,fs_remove_dir,fs_remove_tree,os_chdir,os_set_env,os_unset_env,get_bool,object_has,has,crypto_constant_time_eq,crypto_verify_ed25519,crypto_verify_ecdsa_p256_sha256_asn1,crypto_verify_ecdsa_p256_sha384_asn1,crypto_verify_ecdsa_p384_sha384_asn1,crypto_verify_rsa_pkcs1_sha256,crypto_verify_rsa_pkcs1_sha384,crypto_verify_rsa_pss_sha384,crypto_verify_rsa_pss_sha512,crypto_verify_rsa_pkcs1_sha512,crypto_verify_rsa_pss_sha256,byte_buffer_set"
@@ -102,14 +102,14 @@ pub fn ir_is_int_returning_func(fname: String) -> Bool:
 
 # the builtins the emitter types as returning a string. a few names are
 # also in RESULT_STRING_FUNCS (read_file, exec_output); those two tables do
-# different jobs — the fallible one decides how the result is carried, this
+# different jobs: the fallible one decides how the result is carried, this
 # one names the type of the value inside it.
 pub fn ir_is_string_returning_func(fname: String) -> Bool:
     ir_build_metadata_sets()
     return string_returning_funcs.contains_key(fname)
 
 # the builtins the emitter types as returning bytes. most entries are also
-# in RESULT_BYTES_FUNCS, so the call itself yields a result — what this
+# in RESULT_BYTES_FUNCS, so the call itself yields a result; what this
 # table describes is the payload type, not the shape of the return.
 pub fn ir_is_bytes_returning_func(fname: String) -> Bool:
     ir_build_metadata_sets()
@@ -124,7 +124,7 @@ pub fn ir_is_list_returning_func(fname: String) -> Bool:
     return list_returning_funcs.contains_key(fname)
 
 # the builtins whose result the emitter types as "list_string" rather than
-# plain "list" — the counterpart to ir_is_list_returning_func, which
+# plain "list", the counterpart to ir_is_list_returning_func, which
 # explains why the two are separate tables.
 pub fn ir_is_list_string_returning_func(fname: String) -> Bool:
     ir_build_metadata_sets()
@@ -193,8 +193,8 @@ pub fn ir_builtin_result_ok_kind(name: String) -> String:
 
 # whether a method call yields a bool. type inference answers "bool" for
 # these on any receiver, and the emitter records the same kind for the call
-# it is lowering. the table carries both spellings of a method — `contains`
-# and `string_contains`, `contains_key` and `map_contains_ikey` — because
+# it is lowering. the table carries both spellings of a method (`contains`
+# and `string_contains`, `contains_key` and `map_contains_ikey`) because
 # it is asked once with the source name and once with the lowered emit
 # name, and neither query rewrites the other's form.
 pub fn ir_is_bool_returning_method(meth: String) -> Bool:
@@ -205,7 +205,7 @@ pub fn ir_is_bool_returning_method(meth: String) -> Bool:
 # name. the emitter forces the call's retkind to "void" and then hands the
 # RECEIVER register back as the expression's value, so `xs.reverse()`
 # evaluates to xs and chains; for the same reason it skips the release of an
-# owned receiver, and the consumer of the chain drops that count instead —
+# owned receiver, and the consumer of the chain drops that count instead:
 # a discarded chain at statement position through the receiver's own
 # classification.
 pub fn ir_is_void_method(meth: String) -> Bool:
@@ -222,7 +222,7 @@ pub fn ir_is_string_returning_method(meth: String) -> Bool:
     return string_returning_methods.contains_key(meth)
 
 # the runtime symbol a builtin is emitted under, or `name` unchanged when
-# nothing here claims it — which is how a user function passes through. the
+# nothing here claims it, which is how a user function passes through. the
 # general call path applies this only after the declared-function table
 # misses, so a program that declares its own `trim` gets its own body; the
 # `_raw` emit helpers apply it unconditionally, because they are already
@@ -363,11 +363,11 @@ pub fn ir_obj_type_is_primitive(obj_type: String) -> Bool:
 ## consumer resolves a bare call name through the user function table first,
 ## so a free function sharing the name captured the method call: with
 ## `fn to_int(text: String, fallback: Int)` in the build, `(1.5).to_int()`
-## passed one argument to a two-argument function — and with a same-arity
+## passed one argument to a two-argument function, and with a same-arity
 ## `fn to_int(x: Float)` it silently ran the wrong body. the receiver's
 ## checked type already chose the builtin; naming the runtime symbol keeps
-## that choice closed. most names route through ir_runtime_call_name — the
-## same mapping an unshadowed call would get at emission — and the four
+## that choice closed. most names route through ir_runtime_call_name (the
+## same mapping an unshadowed call would get at emission), and the four
 ## whose short abi key IS the method name get their full symbol here.
 pub fn ir_primitive_method_call_name(emit_name: String) -> String:
     if emit_name == "to_int":
@@ -430,7 +430,7 @@ fn ir_method_list_emit_name(mname: String, obj_type: String) -> String:
 # the key-flavor suffix a map method's runtime name carries: the int and
 # bytes flavors have their own entry points ("_ikey", "_bkey"), the string
 # flavor is the unsuffixed default. obj_type is "map_int", "map_bytes" or
-# "map" — the bytes flavor is a call-selection detail the caller reads off
+# "map"; the bytes flavor is a call-selection detail the caller reads off
 # the checked type (ir_bytes_keyed_type), never a tracked kind.
 fn ir_map_key_suffix(obj_type: String) -> String:
     if obj_type == "map_int":
@@ -494,7 +494,7 @@ fn ir_method_set_emit_name(mname: String, obj_type: String) -> String:
 # name and the emitter's receiver-type string ("string", "list_string",
 # "map_int", "channel:T", "opaque:Mutex", and so on). a pair no branch
 # recognizes comes back as `mname` unchanged, leaving the consumer to
-# resolve it — that is the path a user-defined method takes. one result is
+# resolve it; that is the path a user-defined method takes. one result is
 # not a symbol at all: `to_string` on a string receiver returns "identity",
 # which tells the caller to emit no call and reuse the receiver register.
 pub fn ir_method_emit_name(mname: String, obj_type: String) -> String:
@@ -518,8 +518,8 @@ pub fn ir_method_emit_name(mname: String, obj_type: String) -> String:
         elif obj_is_int:
             emit_name = "int_to_string"
         elif obj_is_string:
-            # identity hands back the receiver register itself — no fresh
-            # buffer — so its result must never be given an rc kind (the
+            # identity hands back the receiver register itself (no fresh
+            # buffer), so its result must never be given an rc kind (the
             # known-return-kind tables deliberately skip string-receiver
             # to_string): a kinded identity result classifies owned, and the
             # consumer's release would strip a count the receiver's owner

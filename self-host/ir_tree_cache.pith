@@ -12,7 +12,7 @@ mut ir_decode_call_cache: Map[Int, List[Int]] := {}
 # a call whose callee is `recv.decode[T]` or `recv.decode_text[T]`: the
 # shape of a typed json decode, noted for the string prepass, which has to
 # intern a decode target's packed field spec before the table is emitted.
-# the receiver is not resolved here — the prepass resolves the call's type
+# the receiver is not resolved here; the prepass resolves the call's type
 # through the checker instead.
 fn ir_is_decode_call_node(node: Node) -> Bool:
     if node.kind != "call" or node.children.len() == 0:
@@ -51,7 +51,7 @@ pub fn ir_cached_decode_call_nodes(root_idx: Int) -> List[Int]:
 
 # every string-literal node under root_idx, so the string table can be
 # interned before any function body is emitted. the whole subtree is walked
-# on the first ask and the answer kept for later ones — every module being
+# on the first ask and the answer kept for later ones: every module being
 # emitted re-walks the same preloaded import roots, so the repeat is the
 # common case. the walk is stack-based rather than recursive (a deep tree
 # used to blow the stack), which means children are visited last-to-first:
@@ -67,7 +67,7 @@ pub fn ir_cached_string_nodes(root_idx: Int) -> List[Int]:
 
 # the top-level declarations of a module, with any `pub` wrapper stripped
 # so a public and a private declaration look alike to the caller. this is
-# the standard way to sweep a module — the emitter walks it a dozen times
+# the standard way to sweep a module; the emitter walks it a dozen times
 # over per compile for structs, impls, functions and so on, which is why
 # the unwrapped list is cached. the cached list is returned as-is, so treat
 # it as read-only.

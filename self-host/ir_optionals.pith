@@ -87,7 +87,7 @@ pub fn ir_emit_optional_optional_compare(result_reg: Int, op: String, left_r: In
 # none never equals a plain value, so eq is `is_some and value == v` and neq
 # is its negation. the payload comparison dispatches on the inner type in
 # ir_emit_inner_value_eq, the same as the optional-optional compare above.
-# reads only — the payload read borrows, so neither operand's count moves.
+# reads only: the payload read borrows, so neither operand's count moves.
 pub fn ir_emit_optional_plain_compare(result_reg: Int, op: String, opt_r: Int, plain_r: Int, opt_tid: Int):
     info := get_type_info(opt_tid)
     flag := ir_optional_flag_field(opt_r)
@@ -98,8 +98,8 @@ pub fn ir_emit_optional_plain_compare(result_reg: Int, op: String, opt_r: Int, p
 ## the equality register for two values of type `tid`, decided the way `==`
 ## decides it for that type: an optional structurally through the compare
 ## above, a string or a Bytes by content, a boxed enum through its per-enum
-## helper, and everything else — ints, floats, bools, and a struct, which
-## `==` gives pointer identity — as i64 equality. this is what a container
+## helper, and everything else (ints, floats, bools, and a struct, which
+## `==` gives pointer identity) as i64 equality. this is what a container
 ## searching for an element asks, so that `xs.contains(v)` and `xs[i] == v`
 ## cannot disagree. `tid` must name a type; callers with none of their own
 ## keep whatever fallback they had.
@@ -114,7 +114,7 @@ pub fn ir_emit_value_eq_for_tid(tid: Int, a_r: Int, b_r: Int) -> Int:
 # the payload-equality register for one inner type, shared by both optional
 # compares above. the dispatch mirrors ir_emit_value_binary's for the bare
 # type's `==`: strings compare by content through __str_eq, bytes through
-# bytes_eq, and a boxed enum through its per-enum structural helper — a
+# bytes_eq, and a boxed enum through its per-enum structural helper; a
 # boxed enum value is a pointer, so a raw eq would be identity, not
 # equality. everything else (ints, floats, bools) is i64 equality.
 fn ir_emit_inner_value_eq(inner_tid: Int, a_r: Int, b_r: Int) -> Int:
@@ -173,7 +173,7 @@ pub fn ir_emit_optional_none_value() -> Int:
 # and drops nothing else. that is right for a primitive, and for a
 # payload whose count is transferred into the slot and released by
 # whoever unwraps it (an index read, an inner `T??` shell). it is wrong
-# for a payload the shell is meant to own — use ir_emit_optional_owned_some
+# for a payload the shell is meant to own; use ir_emit_optional_owned_some
 # for a struct, list, map, set, bytes, closure or string payload (the
 # return path and the widening wrap both do), or the target dies while
 # the optional still points at it, or nothing ever releases it. the

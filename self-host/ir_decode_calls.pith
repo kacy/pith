@@ -1,4 +1,4 @@
-# ir_decode_calls.pith — recognizing decode calls
+# ir_decode_calls.pith: recognizing decode calls
 #
 # pure predicates and name builders for json/handle-pool/config decode
 # forms: is this call a decode, which helper implements it, what tid
@@ -107,7 +107,7 @@ pub fn ir_is_config_file_decode_callee_with_aliases(index_idx: Int, member_name:
 # specialization bodies need: they are emitted with no receiver
 # expression to resolve a bare member name against, so the symbol has to
 # arrive already qualified. type_name may be the annotation as written
-# (an alias, an `opaque:` kind) or an already-resolved kind — both land
+# (an alias, an `opaque:` kind) or an already-resolved kind; both land
 # on the same helper.
 pub fn ir_config_require_full_name_for_type_name_with_state(type_name: String, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
     resolved := ir_resolve_type_hint_with_state(type_name, type_aliases, struct_names)
@@ -142,7 +142,7 @@ pub fn ir_handle_require_full_name_for_type_name_with_state(type_name: String, m
 # run time rather than at compile time. the module_path arm accepts ""
 # (std.config compiling itself) or the literal "std/config", but the
 # paths recorded for generic declarations are dotted, so only the empty
-# case matches in practice — an imported std.config is caught by the
+# case matches in practice; an imported std.config is caught by the
 # already-prefixed `std_config_decode` name instead.
 pub fn ir_is_config_decode_specialization(base_name: String, prefixed: Bool, module_path: String, decl_idx: Int) -> Bool:
     local_std_config := module_path == "" or module_path == "std/config"
@@ -166,7 +166,7 @@ fn is_handle_pool_specialization_name(base_name: String, suffix: String) -> Bool
     return base_name == "std_toml_" + suffix or base_name == "std_yaml_" + suffix
 
 # true when the body being specialized is `decode[T](handle)` from
-# std.toml or std.yaml — the root form, taking an already-parsed table
+# std.toml or std.yaml: the root form, taking an already-parsed table
 # handle. its written source is a stub that fails with "requires
 # compiler support", so a false answer here does not stop the build; it
 # ships a binary that fails on the first decode. the parameter-name test
@@ -229,7 +229,7 @@ pub fn ir_is_json_decode_object_specialization(base_name: String, module_path: S
 # asks about `decode[T](input: Bytes)`, true about
 # `decode_text[T](input: String)`. both are `fail ... requires compiler
 # support` stubs in source, and both take a parameter spelled `input`,
-# so the emitter calls this twice — once per flag — rather than trying
+# so the emitter calls this twice, once per flag, rather than trying
 # to tell them apart from the declaration alone.
 pub fn ir_is_json_decode_specialization(base_name: String, module_path: String, decl_idx: Int, text_input: Bool) -> Bool:
     local_std_json := module_path == "" or module_path == "std.json"
@@ -266,7 +266,7 @@ fn ir_module_alias_member_name_with_state(alias: String, member: String, module_
     return member
 
 # the symbol to emit for `member_name` when a decode lowering needs a
-# sibling helper — `parse`, `object_has`, `pool_mark_node_id` — from
+# sibling helper (`parse`, `object_has`, `pool_mark_node_id`) from
 # whichever module the written call went through. index_idx is the
 # `mod.decode[T]` index node the lowering came from; the receiver on it
 # is the alias to resolve against, so the same lowering serves an
@@ -375,8 +375,8 @@ pub fn ir_json_node_built_collection(field_tid: Int) -> Bool:
     elem := get_type_info(elem_tid)
     return elem.kind == "list" or elem.kind == "map"
 
-# the scalar accessor for a field read out of a JsonScalarObject — the
-# three-map summary std_json_decode_scalars_bytes returns — rather than
+# the scalar accessor for a field read out of a JsonScalarObject (the
+# three-map summary std_json_decode_scalars_bytes returns) rather than
 # out of a node handle. already fully qualified, so the caller emits it
 # as-is. this is the general lowering's table: it is what a struct with
 # more than three fields, or with an optional or defaulted field, reads
@@ -428,7 +428,7 @@ pub fn ir_json_type_name_char(name: String) -> String:
 
 # the packed-spec type code for a field's tid, "" for a non-scalar. the
 # spec itself is built from the declaration's written type names, so
-# this is the tid-side twin used where only the tid is in hand — the
+# this is the tid-side twin used where only the tid is in hand: the
 # single-pass lowering asks it whether any field is a string, which is
 # what decides that the filled struct needs a destructor attached.
 pub fn ir_json_field_type_char(field_tid: Int) -> String:
@@ -488,7 +488,7 @@ pub fn ir_handle_require_helper_name(field_tid: Int) -> String:
 
 # field_tid back when the field is itself a struct, -1 otherwise. every
 # decode lowering asks this first, because a struct field is not read
-# with a scalar helper at all — it recurses into the decode_object
+# with a scalar helper at all; it recurses into the decode_object
 # specialization for that type. an out-of-range tid answers -1 too,
 # since get_type_info hands back a kind of "<error>" for one.
 pub fn ir_struct_decode_field_tid(field_tid: Int) -> Int:

@@ -1,4 +1,4 @@
-# ir_match_emit.pith — lowering of match expressions and statements:
+# ir_match_emit.pith: lowering of match expressions and statements:
 # subject evaluation, per-arm conditions (including variant payload
 # destructuring), binding setup, and arm bodies.
 #
@@ -25,7 +25,7 @@ pub mut ir_tail_match_node := 0 - 1
 ## goes through the full return contract (emit_ret is the emitter core's
 ## ir_emit_return_value): the bare `ret` this used to emit skipped the
 ## defers, the borrow retain, the optional/result wrap, and the tracked
-## local cleanup — so every count an arm's payload binding had retained
+## local cleanup, so every count an arm's payload binding had retained
 ## leaked once per call, and a borrowed return could dangle.
 fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int):
     body := get_node(body_idx)
@@ -42,7 +42,7 @@ fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int
 
 # whether one arm's pattern leaves the subject's count releasable once the
 # arm has bound its names. a bare binding on a non-optional subject IS the
-# subject — an uncounted alias the arm body may store or return — and a
+# subject (an uncounted alias the arm body may store or return), and a
 # tuple pattern binds element borrows the subject's cascade owns, so both
 # rule the release out; an or-pattern may hide either shape. a variant
 # pattern is safe only when every bound rc slot's kind resolved: an
@@ -70,7 +70,7 @@ fn ir_match_pattern_keeps_subject_free(pat: Node, subj_is_optional: Bool) -> Boo
 # the rc kind a match may release its subject with once an arm is taken, or
 # "" when the subject is not this match's to free. a subject the caller
 # proved to be an owned fresh temporary (a call, method call or await whose
-# count nothing else claims) dies inside the match — every arm binds its
+# count nothing else claims) dies inside the match: every arm binds its
 # payload with a count of its own, so once the taken arm's bindings exist
 # (or no arm matched) nothing reads the subject again. a result subject
 # stays out: its binding path takes no count (see docs/ownership.md), and
@@ -296,7 +296,7 @@ fn ir_variant_pattern_variant_name(variant_key: String) -> String:
         i = i + 1
     return variant_key
 
-## whether an emission kind is a leftover type-parameter name — not a
+## whether an emission kind is a leftover type-parameter name, not a
 ## builtin kind and not a registered struct or enum. a generic enum's
 ## declaration records its payload kinds this way ("T"), and such a kind
 ## says nothing about the slot's real type or its ownership.
@@ -317,7 +317,7 @@ fn ir_payload_kind_is_unresolved(kind: String) -> Bool:
 
 ## the concrete payload kinds an enum instance's checked type gives this
 ## variant, or an empty list. a generic enum erases to one IR struct, so
-## the declaration's payload kinds are bare parameter names — the instance
+## the declaration's payload kinds are bare parameter names; the instance
 ## (Opt[Int]) is what knows that slot 0 is an int.
 fn ir_variant_kinds_from_tid(tid: Int, variant_name: String) -> List[String]:
     mut out: List[String] := []
@@ -337,7 +337,7 @@ fn ir_variant_kinds_from_tid(tid: Int, variant_name: String) -> List[String]:
 
 ## merge a variant's declared payload kinds with the concrete ones its
 ## checked instance type carries: an unresolved parameter-name slot takes
-## the instance's kind, everything else keeps the declaration's — a
+## the instance's kind, everything else keeps the declaration's; a
 ## concrete declared kind (including an optional payload's "tuple") is
 ## already right and must stay untouched. the match path passes the
 ## subject's tid; the constructor path passes its own expression's.
@@ -407,7 +407,7 @@ pub fn ir_emit_variant_payload_conds(pat: Node, subj_r: Int, tag_cond_r: Int) ->
 
 ## give a match binding its own count on an rc payload: release whatever the
 ## name held before (zero on first reach, a stale payload when an arm rebinds
-## the name in a loop), then retain the new value — the reassign dance for
+## the name in a loop), then retain the new value, the reassign dance for
 ## ordinary locals. the subject's box or shell is released at scope exit,
 ## which frees the payload, so a plain borrow would dangle; the prepass
 ## tracks these names, so exit cleanup releases them (or a return transfers
@@ -487,7 +487,7 @@ pub fn ir_emit_match_bindings(pat_idx: Int, subj_r: Int, subj_type: String):
             inner_kind := ir_type_from_tid(subj_info.inner)
             if inner_kind.len() > 0:
                 ir_var_types.insert(pat.value, inner_kind)
-            # an rc payload is retained so the binding owns its own count —
+            # an rc payload is retained so the binding owns its own count:
             # the subject's shell (or its cascade-released payload) can die at
             # scope exit while the binding lives on. same contract as an enum
             # arm's payload binding below; rationale on ir_bind_owned_rc_payload.
@@ -539,7 +539,7 @@ pub fn ir_emit_match_arm_body(body_idx: Int, result_temp: String, emit_expr: fn(
     ir_last_was_ret = false
 
 ## lower an if used as an expression: evaluate the first branch whose condition
-## holds into a shared temp, so the whole chain produces one value — the same
+## holds into a shared temp, so the whole chain produces one value, the same
 ## temp-store shape ir_emit_match_expr uses. children are
 ## [condition, then_expr, elif_branch(cond, expr)..., else_expr].
 pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:

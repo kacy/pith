@@ -66,8 +66,8 @@
 # arrival is answered DEADLINE_EXCEEDED without running the handler. initial
 # (request) metadata only — trailing metadata is not supported.
 #
-# deferred: message compression, trailing metadata, mid-handler deadline
-# cancellation, and grpc-message percent-decoding.
+# deferred: message compression, trailing metadata, and mid-handler deadline
+# cancellation.
 
 import std.net.http2.hpack as hpack
 import std.net.http2.connection as http2
@@ -498,9 +498,8 @@ fn message_from(headers: List[hpack.HeaderField], trailers: List[hpack.HeaderFie
 # reject, which turns a readable error into a broken response.
 fn percent_encode(text: String) -> String:
     hex_digits := bytes.from_string_utf8("0123456789ABCDEF")
-    # appending to the result string one character at a time recopied the
-    # whole accumulated string on every append, which made encoding quadratic
-    # in the message; a byte buffer keeps each append constant.
+    # a byte buffer keeps each append constant time; appending to a String
+    # recopies everything accumulated so far and makes encoding quadratic.
     out := bytes.buffer_with_capacity(text.len())
     defer out.free()
     mut i := 0
@@ -524,11 +523,11 @@ fn percent_encode(text: String) -> String:
 # the inverse. a malformed escape is left as written rather than dropped, so a
 # server that never encoded its message still reads back as itself.
 fn percent_decode(text: String) -> String:
-    # collect the pieces and join once at the end: appending each character
-    # to the result string recopied everything accumulated so far, which made
-    # decoding quadratic in the message. a list survives a decoded byte that
-    # is not valid utf-8, which a byte-buffer round-trip through utf-8
-    # validation would not.
+    # collect the pieces and join once at the end: appending to a String
+    # recopies everything accumulated so far and makes decoding quadratic. a
+    # list survives a decoded byte that is not valid utf-8, which a
+    # byte-buffer round-trip through utf-8 validation would not.
+
     mut parts: List[String] := []
     mut i := 0
     while i < text.len():
@@ -719,7 +718,8 @@ impl StreamReader:
 # pull one message from an in-progress stream: hand back a buffered message if the
 # reader has one, else read stream events until a message completes or the stream
 # ends. a StreamMessage with `done` true (empty) marks the end; a non-OK terminal
-# grpc-status or a reset fails. shared by server-, and bidi-streaming recv.
+# grpc-status or a reset fails. shared by the server-, client- and
+# bidi-streaming receive paths.
 fn recv_stream_message(stream: http2.Stream, reader: StreamReader) -> StreamMessage!GrpcError:
     while true:
         if reader.ready():
@@ -745,6 +745,14 @@ fn send_framed_message(stream: http2.Stream, message: Bytes) -> Int:
 # server no more request messages follow.
 fn half_close_stream(stream: http2.Stream) -> Int:
     return stream.send(bytes.empty(), true)
+
+# open the http/2 stream for a streaming rpc on `conn`, request side left open.
+# the headers carry the current trace context and `extra_headers` as metadata.
+fn open_call_stream(conn: Conn, full_method: String, extra_headers: List[String]) -> http2.Stream!GrpcError:
+    opened := conn.client.open_stream("POST", conn.authority, full_method, with_metadata(stream_headers(), extra_headers), false)
+    if opened.is_err:
+        fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
+    return opened.ok
 
 # a server-streaming call in progress: one request was sent, and recv() pulls the
 # response messages as they arrive. `reader` decodes the responses from the
@@ -780,10 +788,7 @@ impl Conn:
     # like server_stream, but also sends `extra_headers` — a flat [k1, v1, ...]
     # list — as grpc metadata, the same shape unary_with_headers takes.
     pub fn server_stream_with_headers(full_method: String, request: Bytes, extra_headers: List[String]) -> ServerStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, with_metadata(stream_headers(), extra_headers), false)
-        if opened.is_err:
-            fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
-        stream := opened.ok
+        stream := open_call_stream(self, full_method, extra_headers)!
         stream.send(frame_message(request), true)
         return ServerStream(stream, new_stream_reader())
 
@@ -881,10 +886,7 @@ impl Conn:
 
     # like client_stream, but also sends `extra_headers` as grpc metadata.
     pub fn client_stream_with_headers(full_method: String, extra_headers: List[String]) -> ClientStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, with_metadata(stream_headers(), extra_headers), false)
-        if opened.is_err:
-            fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
-        return ClientStream(opened.ok, new_stream_reader())
+        return ClientStream(open_call_stream(self, full_method, extra_headers)!, new_stream_reader())
 
     # open a bidirectional-streaming rpc: send and receive message streams
     # independently. `full_method` is "/package.Service/Method". send()/close_send()
@@ -896,10 +898,7 @@ impl Conn:
 
     # like bidi_stream, but also sends `extra_headers` as grpc metadata.
     pub fn bidi_stream_with_headers(full_method: String, extra_headers: List[String]) -> BidiStream!GrpcError:
-        opened := self.client.open_stream("POST", self.authority, full_method, with_metadata(stream_headers(), extra_headers), false)
-        if opened.is_err:
-            fail GrpcError(GRPC_UNAVAILABLE, "grpc: cannot open stream: {opened.err}")
-        return BidiStream(opened.ok, new_stream_reader())
+        return BidiStream(open_call_stream(self, full_method, extra_headers)!, new_stream_reader())
 
 # ----------------------------------------------------------------------------
 
@@ -1316,9 +1315,15 @@ fn begin_request_context(req: http.HttpRequestBytes) -> Bool:
 # the message sent when a request arrives with its deadline already spent.
 EXPIRED_ON_ARRIVAL := "grpc: deadline expired before the handler ran"
 
-# the trailers-only DEADLINE_EXCEEDED response for the buffered serve paths.
+# a trailers-only error response for the buffered serve paths. grpc errors
+# still travel as http 200; the status is in the trailers.
+fn error_response(status: Int, message: String) -> http.HttpResponse:
+    return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(status, message))
+
+# the DEADLINE_EXCEEDED response for a request whose deadline passed before it
+# arrived.
 fn expired_response() -> http.HttpResponse:
-    return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(GRPC_DEADLINE_EXCEEDED, EXPIRED_ON_ARRIVAL))
+    return error_response(GRPC_DEADLINE_EXCEEDED, EXPIRED_ON_ARRIVAL)
 
 # the process-wide unary dispatch, and the same for the body-level and streaming
 # forms further down. all three are shared and unlocked, and safe because of
@@ -1335,9 +1340,7 @@ fn grpc_no_dispatch(path: String, request: Bytes) -> Bytes!GrpcError:
     fail GrpcError(GRPC_UNIMPLEMENTED, "no grpc dispatch registered")
 
 fn grpc_ok_trailers() -> Map[String, String]:
-    mut t: Map[String, String] := {}
-    t.insert("grpc-status", GRPC_OK.to_string())
-    return t
+    return grpc_status_trailers(GRPC_OK, "")
 
 fn grpc_status_trailers(status: Int, message: String) -> Map[String, String]:
     mut t: Map[String, String] := {}
@@ -1347,8 +1350,7 @@ fn grpc_status_trailers(status: Int, message: String) -> Map[String, String]:
     return t
 
 # extract the single request message from a unary request body (one
-# length-prefixed frame). an all-default proto3 message can arrive as an empty
-# body, which decodes to a default message.
+# length-prefixed frame).
 fn grpc_unframe_unary(body: Bytes) -> Bytes!GrpcError:
     # an all-default proto3 message encodes to no bytes, and a peer may send it
     # as an empty body: that is the one case where "nothing" is a valid message.
@@ -1376,12 +1378,12 @@ fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
     if request.is_err:
         # report the framing error's own status: a malformed frame is the
         # caller's fault (INVALID_ARGUMENT), not a server fault, and a
-        # compressed message is UNIMPLEMENTED. reporting INTERNAL for all of
-        # them told a client to retry a request that will never succeed.
-        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(request.err.status, request.err.message))
+        # compressed message is UNIMPLEMENTED. INTERNAL for all of them would
+        # tell a client to retry a request that will never succeed.
+        return error_response(request.err.status, request.err.message)
     result := grpc_dispatch_fn(path, request.ok)
     if result.is_err:
-        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
+        return error_response(result.err.status, result.err.message)
     framed := frame_message(result.ok)
     return http.response(200).content_type(GRPC_CONTENT_TYPE).with_body_bytes(framed).with_trailers(grpc_ok_trailers())
 
@@ -1574,7 +1576,7 @@ fn grpc_serve_body_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
         return expired_response()
     result := grpc_body_dispatch_fn(path, req.body_bytes())
     if result.is_err:
-        return http.response(200).content_type(GRPC_CONTENT_TYPE).with_trailers(grpc_status_trailers(result.err.status, result.err.message))
+        return error_response(result.err.status, result.err.message)
     return http.response(200).content_type(GRPC_CONTENT_TYPE).with_body_bytes(result.ok).with_trailers(grpc_ok_trailers())
 
 # the most messages a buffered request stream will hold. a 10 MiB body of
@@ -1762,6 +1764,8 @@ impl GrpcStream:
     pub fn finish(status: Int, message: String):
         if not self.finished.compare_set(0, 1):
             return
+        # headers already went out with a message, so the status follows in a
+        # trailing block.
         if not self.sent_headers.compare_set(0, 1):
             self.stream.send_trailers(grpc_status_fields(status, message))
             return
@@ -1890,9 +1894,8 @@ fn start_stream_drain_watch():
 
 # the stream dispatch lives in a module global for the same reason the unary
 # dispatch does: a pith closure cannot capture a fn-value, so there is one
-# streaming grpc server per process.
-# installed by the streaming serve calls; see grpc_dispatch_fn above for why
-# this needs no lock.
+# streaming grpc server per process. the streaming serve calls install it; see
+# grpc_dispatch_fn above for why it needs no lock.
 mut grpc_stream_dispatch_fn: fn(String, GrpcStream) -> Int!GrpcError := grpc_no_stream_dispatch
 
 fn grpc_no_stream_dispatch(path: String, call: GrpcStream) -> Int!GrpcError:

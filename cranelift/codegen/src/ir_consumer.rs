@@ -2193,14 +2193,22 @@ fn normalize_runtime_result(
 }
 
 /// The start of `main`: every module's tracer registration, then each
-/// imported module's `__init_globals_N`, then the main module's
-/// `__init_globals`, then the string globals, which point at their literals.
+/// unprefixed `__init_globals_N`, then the main module's `__init_globals`,
+/// then the string globals, which point at their literals.
 ///
 /// The tracers come before any global is built: a global is marked shared
 /// as it is stored, and the marking walks a struct's fields through its
 /// tracer, so one registered later would leave what the global reaches
 /// unmarked. main's body registers them again, which only repeats the
 /// insert.
+///
+/// When the driver combined imported modules, main's body starts with a
+/// call to each import's initializer, in import order, followed by a call
+/// to the main module's own `__init_globals`, so a global in the main file
+/// can use what its imports built. The prologue then leaves that call to
+/// the body.
+///
+/// Calls go out in name order, so the same IR gives the same binary.
 fn emit_main_prologue(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
@@ -2208,22 +2216,34 @@ fn emit_main_prologue(
     global_data: &HashMap<String, DataId>,
     string_lits: &HashMap<String, DataId>,
     str_globals: &[(String, String)],
+    body_lines: &[&str],
 ) {
-    for (name, &fid) in declared_funcs.iter() {
-        if name.contains("__cc_register_tracers") {
-            let reg_ref = codegen.module.declare_func_in_func(fid, builder.func);
-            builder.ins().call(reg_ref, &[]);
-        }
+    let mut startup: Vec<(&String, FuncId)> = declared_funcs
+        .iter()
+        .filter(|(name, _)| name.contains("__cc_register_tracers"))
+        .map(|(name, &fid)| (name, fid))
+        .collect();
+    startup.sort_by(|a, b| (a.0.len(), a.0).cmp(&(b.0.len(), b.0)));
+    let mut module_inits: Vec<(&String, FuncId)> = declared_funcs
+        .iter()
+        .filter(|(name, _)| name.starts_with("__init_globals_"))
+        .map(|(name, &fid)| (name, fid))
+        .collect();
+    module_inits.sort_by(|a, b| (a.0.len(), a.0).cmp(&(b.0.len(), b.0)));
+    startup.extend(module_inits);
+    for (_, fid) in startup {
+        let callee = codegen.module.declare_func_in_func(fid, builder.func);
+        builder.ins().call(callee, &[]);
     }
-    for (name, &fid) in declared_funcs.iter() {
-        if name.starts_with("__init_globals_") {
-            let init_ref = codegen.module.declare_func_in_func(fid, builder.func);
+    let body_runs_init = body_lines.iter().any(|line| {
+        let mut parts = line.split_whitespace();
+        parts.next() == Some("call") && parts.nth(1) == Some("__init_globals")
+    });
+    if !body_runs_init {
+        if let Some(&init_id) = declared_funcs.get("__init_globals") {
+            let init_ref = codegen.module.declare_func_in_func(init_id, builder.func);
             builder.ins().call(init_ref, &[]);
         }
-    }
-    if let Some(&init_id) = declared_funcs.get("__init_globals") {
-        let init_ref = codegen.module.declare_func_in_func(init_id, builder.func);
-        builder.ins().call(init_ref, &[]);
     }
     for (gname, str_id) in str_globals.iter() {
         if let (Some(&data_id), Some(&lit_id)) = (
@@ -2410,6 +2430,7 @@ fn compile_ir_function(
             global_data,
             string_lits,
             str_globals,
+            body_lines,
         );
     }
 

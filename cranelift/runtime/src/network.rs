@@ -1,3 +1,10 @@
+//! TCP sockets for the language: listen, connect, accept, read, write, wait,
+//! deadlines, close and shutdown, plus the `pith_dns_resolve` builtin.
+//!
+//! every entry point works on either task backend. under green, sockets are
+//! non-blocking and a would-block parks the task on the reactor (`netpoll`)
+//! through `fdio`; under os threads, sockets block in the kernel.
+
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
 use crate::concurrency::scheduler::{backend, Backend};
 use crate::fd_handle::{self, FdKind, Guard};
@@ -11,7 +18,7 @@ use std::os::unix::io::RawFd;
 //
 // what the language holds for a socket is a handle from `fd_handle`, not the
 // descriptor: the fd number stamped with a generation, so a connection that
-// was closed — and whose number the kernel has since handed to another — is a
+// was closed (and whose number the kernel has since handed to another) is a
 // stale handle that every entry point below refuses with an ordinary failure,
 // where the raw number would have reached the other connection's syscalls.
 // `socket()` takes the hold for one call; `open_socket()` registers a
@@ -37,12 +44,11 @@ fn open_socket(fd: RawFd) -> i64 {
 // ---------------------------------------------------------------------------
 // green-backend helpers
 //
-// under `PITH_GREEN` socket fds are non-blocking and a would-block syscall
-// yields the green task to the epoll reactor (see `netpoll`) instead of parking
-// the worker OS thread. every helper below is a no-op path when the flag is off:
-// `is_green()` is false, so `pith_tcp_*` take their original blocking branches
-// byte-for-byte, and a blocking fd never returns `WouldBlock` for the retry
-// loops to react to.
+// under the green backend socket fds are non-blocking and a would-block
+// syscall yields the green task to the epoll reactor (see `netpoll`) instead
+// of parking the worker OS thread. on the os-thread backend `is_green()` is
+// false, so `pith_tcp_*` take their blocking branches, and a blocking fd never
+// returns `WouldBlock` for the retry loops to react to.
 // ---------------------------------------------------------------------------
 
 /// true when the green backend is selected. gates non-blocking socket setup and
@@ -51,7 +57,7 @@ fn is_green() -> bool {
     backend() == Backend::Green
 }
 
-/// disable nagle on a raw fd — see the note in the blocking connect path for why
+/// disable nagle on a raw fd. see the note in the blocking connect path for why
 /// request/response protocols want this.
 fn set_nodelay_raw(fd: RawFd) {
     let one: libc::c_int = 1;
@@ -131,7 +137,7 @@ fn fill_sockaddr(
 /// `TcpStream::connect`: a name like `localhost` often resolves to `::1` before
 /// `127.0.0.1`, and a server bound only to IPv4 refuses the first before the
 /// second succeeds. no addresses (a resolver failure or an empty answer) falls
-/// through to `0`, as it always has.
+/// through to `0`.
 fn green_connect(host: &str, port: i64) -> i64 {
     for addr in crate::dns::resolve(host, port) {
         let fd = green_connect_addr(&addr);
@@ -224,7 +230,7 @@ fn widen_backlog(fd: RawFd) {
     }
 }
 
-/// TCP listen — bind and listen on addr:port, return the listener's handle
+/// TCP listen: bind and listen on addr:port, return the listener's handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpListener;
@@ -253,7 +259,7 @@ pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
     }
 }
 
-/// TCP connect — connect to addr:port, return the connection's handle
+/// TCP connect: connect to addr:port, return the connection's handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
     use std::net::TcpStream;
@@ -288,7 +294,7 @@ pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
     }
 }
 
-/// TCP accept — accept a connection on a listener handle, return the client's
+/// TCP accept: accept a connection on a listener handle, return the client's
 /// handle. a listener closed while this is parked on it returns a failure,
 /// which is how an accept loop learns the listener is gone.
 #[no_mangle]
@@ -340,20 +346,23 @@ pub extern "C" fn pith_tcp_accept(server: i64) -> i64 {
     result
 }
 
+/// how many bytes a read asks for when the caller gives no limit.
+const DEFAULT_READ_SIZE: usize = 4096;
+
 /// the size one read asks for. a non-positive `max_bytes` means the default
-/// chunk, as it always has.
+/// chunk.
 fn read_size(max_bytes: i64) -> usize {
     if max_bytes > 0 {
         max_bytes as usize
     } else {
-        4096
+        DEFAULT_READ_SIZE
     }
 }
 
 /// one read from a connection handle, whichever backend is running: the green
 /// path yields the task to the reactor on would-block, the os-thread path blocks
-/// in the kernel. `None` is a failure — a stale handle, a closed connection, or
-/// a handle closed by another task while this read was inside — and
+/// in the kernel. `None` is a failure (a stale handle, a closed connection, or
+/// a handle closed by another task while this read was inside), and
 /// `Some(empty)` is end of stream.
 fn socket_read(conn: i64, size: usize) -> Option<Vec<u8>> {
     let guard = socket(conn)?;
@@ -384,10 +393,11 @@ fn socket_write(conn: i64, data: &[u8]) -> Result<usize, fdio::WriteError> {
     }
 }
 
-/// TCP read — read up to 4096 bytes from connection fd, return as C string
+/// TCP read: read up to `DEFAULT_READ_SIZE` bytes from a connection, returned
+/// as a C string (lossy utf-8), or null on failure.
 #[no_mangle]
 pub extern "C" fn pith_tcp_read(conn_fd: i64) -> *mut i8 {
-    match socket_read(conn_fd, 4096) {
+    match socket_read(conn_fd, DEFAULT_READ_SIZE) {
         Some(buf) => crate::pith_strdup_string(&String::from_utf8_lossy(&buf)),
         None => std::ptr::null_mut(),
     }
@@ -411,7 +421,7 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
 }
 
 /// wait for a handle to become readable or writable, the tri-state contract of
-/// `fdio::wait_ready`: `1` ready, `0` timed out, `-1` an error — which covers
+/// `fdio::wait_ready`: `1` ready, `0` timed out, `-1` an error, which covers
 /// a stale handle and a handle closed while the wait was inside.
 fn wait_handle(conn: i64, read: bool, timeout_ms: i64) -> i64 {
     let Some(guard) = socket(conn) else {
@@ -501,12 +511,12 @@ pub extern "C" fn pith_tcp_set_write_deadline(conn: i64, ms: i64) {
     set_deadline(conn, true, ms);
 }
 
-/// TCP close — retire the handle and close its descriptor.
+/// TCP close: retire the handle and close its descriptor.
 ///
 /// the close is exactly once per handle: a second call, or a call on a handle
 /// that was never open, does nothing, where a raw `close(2)` would have landed
-/// on whatever now holds the number. a call still inside on this handle —
-/// parked in the reactor, or blocked in the kernel on the os-thread backend —
+/// on whatever now holds the number. a call still inside on this handle
+/// (parked in the reactor, or blocked in the kernel on the os-thread backend)
 /// is returned with an error, and the descriptor itself is closed once the last
 /// such call is out (see `fd_handle::close`).
 #[no_mangle]
@@ -514,7 +524,7 @@ pub extern "C" fn pith_tcp_close(conn: i64) {
     fd_handle::close(conn);
 }
 
-/// shut a socket down for both directions without closing it — the graceful
+/// shut a socket down for both directions without closing it: the graceful
 /// shutdown primitive for a *listening* socket. returns 1 on success, 0 if the
 /// kernel refuses (a stale handle, or a socket already shut down).
 ///
@@ -523,8 +533,8 @@ pub extern "C" fn pith_tcp_close(conn: i64) {
 /// blocked read returns end of stream, whichever backend and whichever thread
 /// the loop runs on; the handle stays open, so the loop that owns it closes it
 /// itself, once, on its own way out. closing from another task is safe as
-/// well — `pith_tcp_close` wakes a call still inside the same way and the
-/// handle refuses every call after — but a shutdown leaves the close where the
+/// well (`pith_tcp_close` wakes a call still inside the same way and the
+/// handle refuses every call after), but a shutdown leaves the close where the
 /// ownership is, and a reader told to stop can tell that apart from a
 /// connection that is gone.
 #[no_mangle]
@@ -534,7 +544,7 @@ pub extern "C" fn pith_tcp_shutdown(conn: i64) -> i64 {
     };
     // SAFETY: `shutdown` on an fd the guard holds open. it does not free the
     // descriptor, so it is safe to call while another task is blocked on the
-    // same fd — which is the entire point.
+    // same fd, which is the entire point.
     let rc = unsafe { libc::shutdown(guard.fd(), libc::SHUT_RDWR) };
     if rc == 0 {
         1
@@ -543,10 +553,10 @@ pub extern "C" fn pith_tcp_shutdown(conn: i64) -> i64 {
     }
 }
 
-/// DNS resolve — resolve hostname to IP address string
+/// DNS resolve: resolve hostname to IP address string
 ///
 /// under the green backend the lookup runs on the resolver pool and this task
-/// parks, so the worker stays free; under os threads it blocks here as before.
+/// parks, so the worker stays free; under os threads it blocks here.
 /// either way a failed lookup and one that returns no address both come back
 /// null, which is what the caller already treats as an error.
 #[no_mangle]

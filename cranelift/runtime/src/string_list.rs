@@ -242,7 +242,7 @@ pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -
 }
 
 /// Get a single character at index wrapped in an Optional tuple. Returns
-/// `Some(char_string)` when `0 <= index < len`, and `None` otherwise —
+/// `Some(char_string)` when `0 <= index < len`, and `None` otherwise, so
 /// callers of `s.get(i)` can distinguish an out-of-bounds miss from an
 /// intentional empty result.
 #[no_mangle]

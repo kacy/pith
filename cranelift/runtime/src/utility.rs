@@ -1,10 +1,10 @@
 use crate::ffi_util::{cstr_bytes, cstr_str};
 
-/// Format time as string — takes unix timestamp (ms) and format string
-/// Simple implementation: returns ISO-like date string
+/// The `format_time` builtin. It ignores the format string and returns the
+/// timestamp, given in milliseconds, as whole seconds in decimal.
 ///
 /// # Safety
-/// fmt must be a valid null-terminated C string (or null for default)
+/// fmt is never read.
 #[no_mangle]
 pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, _fmt: *const i8) -> *mut i8 {
     let secs = timestamp_ms / 1000;
@@ -44,7 +44,8 @@ pub unsafe extern "C" fn pith_log_error(msg: *const i8) {
     eprintln!("[ERROR] {}", cstr_str(msg).unwrap_or(""));
 }
 
-/// Execute command and capture output — returns stdout as C string
+/// Run a command, split on whitespace with no shell, and return its stdout
+/// as a C string, or null when it could not run.
 ///
 /// the child runs to completion via the process pool (see `process`), so a
 /// green worker is not held for however long the command takes.

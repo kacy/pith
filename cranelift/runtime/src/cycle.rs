@@ -1381,11 +1381,6 @@ pub(crate) fn set_stop_timeout_for_tests(ms: u64) {
 }
 
 #[cfg(test)]
-pub(crate) fn mutators_len_for_tests() -> usize {
-    lock_mutators().len()
-}
-
-#[cfg(test)]
 pub(crate) fn tracer_count_for_tests() -> usize {
     lock_tracers().len()
 }

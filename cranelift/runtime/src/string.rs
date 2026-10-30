@@ -141,7 +141,7 @@ pub unsafe extern "C" fn pith_string_from_cstr_ptr(cstr: *const i8, out_ptr: *mu
 /// no-op under the current model.
 ///
 /// The symbol is kept so the retain/release pair stays symmetric. If strings
-/// ever move to shared ownership, the count increment belongs here — and
+/// ever move to shared ownership, the count increment belongs here, and
 /// `pith_from_str` and `pith_string_release` would need a matching count
 /// header.
 #[no_mangle]
@@ -243,8 +243,8 @@ pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
     }
     unsafe {
         // heap cstrings carry their length in the refcount header, which
-        // turns every s.len() — including loops over multi-megabyte
-        // strings — into one read instead of a strlen
+        // turns every s.len(), including loops over multi-megabyte
+        // strings, into one read instead of a strlen
         if let Some(len) = crate::cstring_header_len(cstr) {
             return len;
         }
@@ -356,7 +356,7 @@ mod tests {
 
     // a heap string owns its buffer; retain leaves it untouched and a single
     // release frees it. this is the retain/release contract under copy-on-derive
-    // ownership — one retain, one release, no double free.
+    // ownership: one retain, one release, no double free.
     #[test]
     fn retain_keeps_the_buffer_intact_then_release_frees() {
         unsafe {

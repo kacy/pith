@@ -10,8 +10,8 @@
 //! the search is libc's `memmem`. two candidates were measured against the
 //! naive loop on `bench/substring_search.pith`, the std pipeline and the
 //! event ledger: `memchr` for the needle's first byte followed by a compare
-//! of the rest, and `memmem`. on the shapes the workloads have — a one-byte
-//! delimiter or quote in a field of a few dozen bytes — the two are within
+//! of the rest, and `memmem`. on the shapes the workloads have (a one-byte
+//! delimiter or quote in a field of a few dozen bytes) the two are within
 //! 40 instructions of each other per call and both are 3 to 20 times
 //! cheaper than the naive loop; on the std pipeline as a whole `memmem`
 //! reads 0.6 percent fewer instructions. where they part is the long

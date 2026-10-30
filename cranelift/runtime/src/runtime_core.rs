@@ -102,8 +102,12 @@ fn cstring_layout(data_len: usize) -> Layout {
     pith_layout(cstring_alloc_size(data_len), CSTRING_ALIGN)
 }
 
-/// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
-/// trailing NUL already written. The caller fills bytes 0..data_len.
+/// The length a heap cstring's header records.
+#[inline(always)]
+unsafe fn cstring_data_len(base: *const u8) -> usize {
+    (base.add(8) as *const u64).read() as usize
+}
+
 /// Debug: under PITH_CSTRING_NOFREE + PITH_LEAK_SCAN, every allocation is
 /// remembered and the exit hook prints the ones whose count never reached
 /// zero, which is the definitive leak list.
@@ -128,14 +132,14 @@ pub fn report_leaked_cstrings() {
     for &p in ptrs.iter() {
         unsafe {
             let s = p as *const i8;
-            let Some(base) = cstring_base(s as i64 as *const i8 as *const i8) else {
+            let Some(base) = cstring_base(s) else {
                 continue;
             };
             let rc = cstring_refcount(base).load(Ordering::Relaxed);
             if rc == 0 {
                 continue;
             }
-            let data_len = (base.add(8) as *const u64).read() as usize;
+            let data_len = cstring_data_len(base);
             let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
             let content = String::from_utf8_lossy(bytes).into_owned();
             *counts.entry(format!("rc={} {:?}", rc, content)).or_insert(0) += 1;
@@ -156,6 +160,8 @@ const CSTRING_HOOKS: u8 = crate::switches::PERF_STATS
     | crate::switches::ALLOC_SITES
     | crate::switches::CSTRING_DEBUG;
 
+/// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
+/// trailing NUL already written. The caller fills bytes 0..data_len.
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
     if crate::switches::any(CSTRING_HOOKS) {
         return alloc_cstring_hooked(data_len);
@@ -246,7 +252,7 @@ unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delt
     let Some(needle) = debug_watch_needle() else {
         return;
     };
-    let data_len = (base.add(8) as *const u64).read() as usize;
+    let data_len = cstring_data_len(base);
     let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
     let content = String::from_utf8_lossy(bytes);
     // a trailing '*' makes the needle a prefix match
@@ -291,7 +297,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
             // wrong somewhere; report it loudly in debug runs instead of
             // corrupting the heap.
             if HOOKED && cstring_debug_no_free() {
-                let data_len = (base.add(8) as *const u64).read() as usize;
+                let data_len = cstring_data_len(base);
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(60));
                 eprintln!(
                     "pith debug: cstring over-release: {:?}",
@@ -305,7 +311,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
             fence(Ordering::Acquire);
             let needle = if HOOKED { debug_trace_needle() } else { None };
             if let Some(needle) = needle {
-                let data_len = (base.add(8) as *const u64).read() as usize;
+                let data_len = cstring_data_len(base);
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
                 let content = String::from_utf8_lossy(bytes);
                 if content == needle {
@@ -315,7 +321,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
             if HOOKED && cstring_debug_no_free() {
                 // scrub instead of freeing: a read-after-release shows up
                 // as '!' runs in program output instead of silent reuse
-                let data_len = (base.add(8) as *const u64).read() as usize;
+                let data_len = cstring_data_len(base);
                 if debug_scrub_log() {
                     let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(24));
                     eprintln!("scrub {:p} len={} {:?}", s, data_len, String::from_utf8_lossy(bytes));
@@ -323,7 +329,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
                 std::ptr::write_bytes(s as *mut u8, b'!', data_len);
                 return;
             }
-            let data_len = (base.add(8) as *const u64).read() as usize;
+            let data_len = cstring_data_len(base);
             (base as *mut u32).write(0);
             if HOOKED {
                 crate::perf_count(&crate::PERF_CSTRING_FREES, 1);
@@ -349,8 +355,7 @@ pub(crate) fn count_release(count: &AtomicU32) -> u32 {
     count.fetch_sub(1, Ordering::Release)
 }
 
-/// Debug switch: keep freed cstrings alive and report over-releases, so an
-/// accounting bug in emitted code shows up as a message, not corruption.
+/// `PITH_CSTRING_WATCH`: the content whose rc operations `cstring_watch` logs.
 #[inline(always)]
 fn debug_watch_needle() -> Option<&'static str> {
     static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -359,6 +364,7 @@ fn debug_watch_needle() -> Option<&'static str> {
         .as_deref()
 }
 
+/// `PITH_CSTRING_TRACE`: the content whose final release is reported.
 fn debug_trace_needle() -> Option<&'static str> {
     static NEEDLE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     NEEDLE
@@ -371,6 +377,9 @@ fn debug_scrub_log() -> bool {
     *FLAG.get_or_init(|| std::env::var("PITH_SCRUB_LOG").is_ok())
 }
 
+/// `PITH_CSTRING_NOFREE`: keep freed cstrings alive (scrubbed) and report
+/// over-releases, so an accounting bug in emitted code shows up as a
+/// message, not corruption.
 fn cstring_debug_no_free() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("PITH_CSTRING_NOFREE").is_ok())
@@ -394,7 +403,7 @@ pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
     if magic != CSTRING_MAGIC && magic != CSTRING_STATIC_MAGIC {
         return None;
     }
-    Some((base.add(8) as *const u64).read() as i64)
+    Some(cstring_data_len(base) as i64)
 }
 
 /// Debug: release with an emission-site id; prints the site when the traced
@@ -405,7 +414,7 @@ pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
         let rc = cstring_refcount(base).load(Ordering::Relaxed);
         if rc == 1 {
             if let Some(needle) = debug_trace_needle() {
-                let data_len = (base.add(8) as *const u64).read() as usize;
+                let data_len = cstring_data_len(base);
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
                 let content = String::from_utf8_lossy(bytes);
                 if content == needle {
@@ -417,13 +426,13 @@ pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
     pith_cstring_release(s);
 }
 
-/// Debug: retain with an emission-site id, counted per site when
-/// PITH_RETAIN_SITES is set.
+/// Debug: retain with an emission-site id; prints the site when the
+/// retained string matches `PITH_CSTRING_WATCH`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_retain_traced(s: *const i8, site: i64) {
     if let Some(base) = cstring_base(s) {
         if debug_watch_needle().is_some() {
-            let data_len = (base.add(8) as *const u64).read() as usize;
+            let data_len = cstring_data_len(base);
             let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
             if Some(String::from_utf8_lossy(bytes).into_owned().as_str()) == debug_watch_needle() {
                 eprintln!("watch retain SITE {}", site);
@@ -1650,7 +1659,7 @@ pub unsafe extern "C" fn pith_cstring_append_many(
         pith_cstring_release(base);
         return fresh;
     };
-    let len = (header.add(8) as *const u64).read() as usize;
+    let len = cstring_data_len(header);
     let new_len = len + added;
     if cstring_alloc_size(new_len) != cstring_alloc_size(len) {
         header = std::alloc::realloc(header, cstring_layout(len), cstring_alloc_size(new_len));
@@ -3490,9 +3499,10 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
         base
     };
     (base as *mut u32).write(STRUCT_MAGIC);
-    (base.add(4) as *mut u32).write(1); // strong
-    (base.add(8) as *mut u32).write(1); // weak: the implicit unit for strong refs
-    (base.add(16) as *mut u64).write(size as u64);
+    (base.add(STRUCT_OFF_STRONG) as *mut u32).write(1);
+    // the implicit weak unit the strong refs hold together
+    (base.add(STRUCT_OFF_WEAK) as *mut u32).write(1);
+    (base.add(STRUCT_OFF_SIZE) as *mut u64).write(size as u64);
     let ptr = base.add(STRUCT_HEADER) as i64;
     crate::share::note_owner(ptr);
     ptr
@@ -3590,14 +3600,14 @@ fn count_down(count: &AtomicU32, local: bool) -> u32 {
 #[inline(always)]
 unsafe fn struct_local(base: *mut u8, switches: u8) -> bool {
     switches & crate::switches::LOCAL_COUNTS != 0
-        && struct_dead(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
+        && struct_flags(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
 }
 
 /// Whether the struct at `ptr` is marked shared. False for anything that is
 /// not a live struct.
 pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
     match struct_base(ptr) {
-        Some(base) => struct_dead(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT != 0,
+        Some(base) => struct_flags(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT != 0,
         None => false,
     }
 }
@@ -3606,13 +3616,15 @@ pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
 pub(crate) unsafe fn struct_mark_shared(ptr: i64) -> bool {
     match struct_base(ptr) {
         Some(base) => {
-            struct_dead(base).fetch_or(STRUCT_SHARED_BIT, Ordering::Release) & STRUCT_SHARED_BIT == 0
+            struct_flags(base).fetch_or(STRUCT_SHARED_BIT, Ordering::Release) & STRUCT_SHARED_BIT == 0
         }
         None => false,
     }
 }
 
-unsafe fn struct_dead(base: *mut u8) -> &'static AtomicU32 {
+/// The header's flag word at STRUCT_OFF_DEAD: the dead, buffered and shared
+/// bits above.
+unsafe fn struct_flags(base: *mut u8) -> &'static AtomicU32 {
     &*(base.add(STRUCT_OFF_DEAD) as *const AtomicU32)
 }
 
@@ -3883,7 +3895,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     // buffered bit survives. then drop the implicit weak unit, which frees the
     // header if no weak refs remain. for a buffered struct the suspect
     // buffer's weak count keeps the header alive past this point.
-    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
+    struct_flags(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
     struct_weak_drop(base, switches);
 }
 
@@ -3894,7 +3906,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
 #[cold]
 #[inline(never)]
 unsafe fn maybe_suspect_struct(ptr: i64, base: *mut u8) {
-    if struct_dead(base).fetch_or(STRUCT_BUFFERED_BIT, Ordering::Relaxed)
+    if struct_flags(base).fetch_or(STRUCT_BUFFERED_BIT, Ordering::Relaxed)
         & STRUCT_BUFFERED_BIT
         != 0
     {
@@ -3909,7 +3921,7 @@ unsafe fn maybe_suspect_struct(ptr: i64, base: *mut u8) {
 /// header that is already gone is a no-op.
 pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
     if let Some(base) = struct_base(ptr) {
-        struct_dead(base).fetch_and(!STRUCT_BUFFERED_BIT, Ordering::Relaxed);
+        struct_flags(base).fetch_and(!STRUCT_BUFFERED_BIT, Ordering::Relaxed);
     }
 }
 
@@ -3921,10 +3933,11 @@ pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
 
 /// `Some(true)` for a live struct, `Some(false)` for one whose value died
 /// but whose header is still held (by a weak count, such as the suspect
-/// buffer's for a drained entry), `None` when the pointer is not a struct header at all.
+/// buffer's for a drained entry), `None` when the pointer is not a struct
+/// header at all.
 pub(crate) unsafe fn cycle_struct_alive(ptr: i64) -> Option<bool> {
     let base = struct_base(ptr)?;
-    Some(struct_dead(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0)
+    Some(struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0)
 }
 
 /// The struct's current strong count, or `None` for a dead value or a
@@ -3932,7 +3945,7 @@ pub(crate) unsafe fn cycle_struct_alive(ptr: i64) -> Option<bool> {
 /// dead value.
 pub(crate) unsafe fn cycle_struct_strong_count(ptr: i64) -> Option<u32> {
     let base = struct_base(ptr)?;
-    if struct_dead(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
+    if struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
         return None;
     }
     Some(struct_strong(base).load(Ordering::Relaxed))
@@ -3978,14 +3991,14 @@ pub(crate) unsafe fn cycle_struct_free_dead(ptr: i64) {
         return;
     };
     crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
-    struct_dead(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
+    struct_flags(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
     struct_weak_drop(base, crate::switches::get());
 }
 
 #[cfg(test)]
 pub(crate) unsafe fn struct_dead_word_for_tests(ptr: i64) -> u32 {
     struct_base(ptr)
-        .map(|base| struct_dead(base).load(Ordering::Relaxed))
+        .map(|base| struct_flags(base).load(Ordering::Relaxed))
         .unwrap_or(u32::MAX)
 }
 
@@ -4043,7 +4056,7 @@ pub unsafe extern "C" fn pith_struct_weak_load(ptr: i64) -> i64 {
     // that sees the target dead also sees its destructor's effects. test the
     // death bit specifically: a live struct sitting in the cycle collector's
     // suspect buffer has bit 1 set and must still read as alive.
-    if struct_dead(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+    if struct_flags(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
         return 0;
     }
     ptr

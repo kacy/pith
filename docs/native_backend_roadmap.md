@@ -1,31 +1,16 @@
 # Native Backend Roadmap
 
-This document turns the current Cranelift backend analysis into an execution
-plan: what should stay Rust, what should move into Pith, and which language
-features would make the examples read like a finished language instead of
-backend demos.
-
-## Current Inventory
-
-Update: the first round of IR hardening has landed. Combined IR now carries
-explicit call return kinds and field metadata, and CI checks those contracts
-with `make bootstrap-ir-checks-only`. The remaining work is to make that
-validated path the only native build path and keep deleting Rust-side frontend
-policy.
-
-Since then the compiler reached a self-hosting fixed point (enforced by
-`make bootstrap-verify`), and the lazy iterator milestone shipped — the
-`Iterator[T]` protocol, range-for, list `.map`/`.filter`/`.reduce`, and the
-fusing `std.iter` adapters. That closes several of the ergonomics gaps noted
-further down; see `docs/limitations.md` for the current gap list.
+This document was the execution plan for the Cranelift backend: what should
+stay Rust, what should move into Pith, and which language features would make
+the examples read like a finished language instead of backend demos. The four
+migration phases and most of the ergonomics work have landed; this page records
+what was done and what is still open.
 
 Source totals are not written down here, because a copied number is wrong
 within a month and nothing catches it. Run `make status-audit` for the live
 figures: it reports library code and test code separately for `self-host/`,
-`std/`, and `cranelift/`, with comments and blank lines excluded.
-
-For the per-file Rust sizes this section used to list, `wc -l` over
-`cranelift/*/src` answers the question directly and cannot go stale.
+`std/`, and `cranelift/`, with comments and blank lines excluded. For per-file
+Rust sizes, `wc -l` over `cranelift/*/src` answers the question directly.
 
 ## Keep In Rust
 
@@ -40,431 +25,60 @@ These should remain Rust for the foreseeable future:
 
 The desired end state is not zero Rust. It is a thin Rust backend/runtime with
 the language, compiler policy, and most standard-library logic living in Pith.
-
-That line is even more true now that TLS has moved out of a Rust runtime module
-and into `std.net.tls`, `std.net.tls13`, and the Pith-side crypto helpers that
-support them.
-
-## Migration Targets
-
-### Phase 1: Delete Rust-side Backend Guessing — done
-
-Status: done (verified 2026-06-23). The IR is self-describing and the consumer
-trusts it:
-
-- calls carry an explicit return kind (`call REG NAME RETKIND NARGS ...`); the
-  consumer *requires* it. `parse_call_shape` rejects the old retkind-less form,
-  and the call handler branches on the kind rather than inferring it.
-- field loads carry `index kind name`; the consumer reads the kind directly and
-  CI rejects the 4-field legacy form.
-- the metadata-inference block and symbol-alias table that used to live in
-  `ir_consumer.rs` are gone. The file is now opcode handlers plus small helpers,
-  not a guessing engine.
-
-The four bugs this guessing used to cause — cross-module float returns,
-cross-module map value reads, set codegen, and negative float literals — were
-re-checked and all pass; they are pinned by regression tests
-(`tests/cases/test_xmod_float.pith` and friends).
-
-Remaining tidy, not blocking:
-
-- the `pith_string_retain` symbol is a documented no-op (strings use
-  copy-on-derive ownership, so there is no shared count to bump); real shared
-  ownership would reintroduce it. see `cranelift/runtime/src/string.rs`.
-- float typing in the consumer is per-register tracking driven by the explicit
-  `float` retkind, not a whole-function heuristic; fine as is.
-
-### Phase 2: Move CLI Orchestration Into Pith — done
-
-Target file:
-
-- `cranelift/cli/src/main.rs`
-
-Chunk sizes:
-
-- dispatch: 67 lines
-- usage/env handling: 28 lines
-- frontend lookup plus parse/lex delegation: 67 lines
-- IR-driver rename/import handling: 286 lines
-- build/run/check wrappers: 166 lines
-
-Why:
-
-The Rust CLI is doing frontend policy work:
-
-- finding `self-host/pith_main`
-- scanning `from ... import ...`
-- resolving module paths
-- maintaining a hardcoded builtin-module skip list
-- renaming globals and string IDs across imported IR
-
-That logic belongs with:
-
-- `self-host/pith_main.pith`
-- `self-host/driver.pith`
-- eventually a Pith-native backend driver layer
-
-Desired end state:
-
-Rust CLI becomes a thin shell around:
-
-- read IR
-- declare runtime imports
-- lower with Cranelift
-- link or run
-
-Acceptance criteria:
-
-- import graph walking lives in Pith
-- builtin-module policy is expressed in Pith, not Rust
-- `main.rs` shrinks toward a thin backend wrapper
-
-### Phase 3: Remove Duplicated High-level Runtime Logic — done
-
-Target files:
-
-- `cranelift/runtime/src/json.rs`
-- `cranelift/runtime/src/toml.rs`
-- `cranelift/runtime/src/lib.rs`
-
-Obvious duplication:
-
-- Pith JSON: `std/json.pith` (510 lines)
-- Rust JSON: `cranelift/runtime/src/json.rs` (488 lines)
-- Pith TOML: `std/toml.pith` (519 lines)
-- Rust TOML: `cranelift/runtime/src/toml.rs` (290 lines)
-- Pith URL/path:
-  - `std/net/url.pith` (260 lines)
-  - `std/os/path.pith` (81 lines)
-- Rust URL/path/smart glue:
-  - `cranelift/runtime/src/lib.rs:2163-3233` (1,071 lines)
-
-Why:
-
-The current split duplicates ownership and creates contract drift:
-
-- JSON exists in both Rust and Pith
-- TOML exists in both Rust and Pith
-- URL/path helpers exist in both Rust and Pith
-- “smart” helpers paper over representation mismatches rather than fixing them
-
-Recommended ownership model:
-
-- Rust runtime owns primitive FFI and storage
-- Pith stdlib owns parsing, formatting, and user-facing APIs
-
-Near-term deletion targets inside `runtime/src/lib.rs`:
-
-- `pith_json_parse` smart fallback behavior
-- `pith_smart_to_string`
-- `pith_smart_encode`
-- `pith_url_*` convenience layer, if Pith stdlib owns URL semantics
-- path helpers that are better modeled as stdlib wrappers over smaller intrinsics
-- obvious stubs like process/channel placeholders when they are not part of the
-  intended long-term contract
-
-Acceptance criteria:
-
-- one implementation per feature
-- no hidden “smart” type heuristics at runtime
-- runtime contracts become explicit and boring
-
-### Phase 4: Collapse Runtime Import Tables — done
-
-Target file:
-
-- `cranelift/codegen/src/lib.rs`
-
-Why:
-
-Once Phase 1 and Phase 3 land, the backend no longer needs a large pile of
-symbol aliases for high-level stdlib functions. The runtime import table should
-mostly describe real low-level intrinsics.
-
-Acceptance criteria:
-
-- fewer aliases
-- fewer Pith names with Rust-side special cases
-- more one-to-one mappings between emitted IR and imported runtime symbols
-
-## Recommended Execution Order
-
-Use this order. It minimizes churn and avoids deleting infrastructure before
-contracts are explicit.
-
-1. Make IR metadata explicit and delete Rust inference
-2. Move import graph and IR orchestration into Pith
-3. Remove duplicated JSON/TOML/URL/path ownership
-4. Shrink runtime import tables
-
-This order matters. Phases 2 and 3 are much easier once Rust no longer has to
-guess what the frontend meant.
-
-## Example Ergonomics: What To Add
-
-Note: items #3 (collection combinators) and #4 (iteration) below have largely
-shipped — list `.map`/`.filter`/`.reduce`, `for x, i in list`, range-for, and
-the lazy `std.iter` adapters all exist now. They are kept here for context; the
-still-open items are formatting, generic display, a string builder, and richer
-test ergonomics.
-
-The example corpus shows the biggest quality gaps directly.
-
-Observed frequency in `examples/*.pith`:
-
-- `print(...)`: 785
-- string concatenations with `+`: 653
-- `.to_string()`: 165
-- interpolation sites: 291
-- manual `while i < list.len()` loops: 20
-
-Several examples now import `std.fmt`, but many examples still build strings
-manually.
-
-### Highest-value language/library additions
-
-#### 1. Better Formatting
-
-Examples like `url_ops`, `data_pipeline`, and `strings_demo` are dominated by:
-
-- `"label: " + value`
-- `x.to_string()`
-- nested concatenation for mixed values
-
-Needed:
-
-- stronger interpolation
-- a real `format(...)`
-- or both
-
-Goal:
-
-- `print("port: {port(full_url)}")`
-- `print("overall best: {best.name} ({best.score})")`
-
-#### 2. Generic Display / Show
-
-update (july 2026): shipped for interpolation. `"{xs}"` renders lists,
-maps (sorted keys), sets (sorted), and structs — through a `show()` impl
-when one exists, else a synthesized `Name(field: value)` form. bespoke
-renderers below are only needed for custom layouts now.
-
-Examples still write bespoke renderers for common data:
-
-- matrix pretty-printers
-- list-to-string helpers
-- manual struct field formatting
-
-Needed:
-
-- built-in display for lists, maps, sets, tuples, and structs
-- or a trait/interface-based `show`
-
-Goal:
-
-- `print(matrix)`
-- `print(records)`
-- `print(counts)`
-
-#### 3. Better Collection Combinators
-
-The examples want `map`, `filter`, and `reduce`, but today that path is still
-a feature gap rather than a polished standard capability.
-
-Needed:
-
-- reliable higher-order collection operations
-- closure support that is pleasant on the hot path
-- consistent typing and backend lowering for generic collection transforms
-
-#### 4. Better Iteration
-
-Many examples still use:
-
-- `while i < list.len():`
-- explicit indexing
-- manual accumulation loops
-
-Needed:
-
-- `for i, x in list`
-- `for k, v in map`
-- better `enumerate`
-- cleaner range and slice iteration
-
-#### 5. Better Test Ergonomics
-
-The example suite leans heavily on golden stdout output. That is good for
-end-to-end coverage, but it is not the nicest surface for language examples.
-
-Needed:
-
-- `assert_eq`
-- `assert_ne`
-- maybe lightweight snapshot helpers
-
-This would make examples shorter and more semantic.
-
-#### 6. String Builder / Buffer
-
-Parsers, encoders, printers, and many examples would benefit from a mutable
-append-oriented string buffer instead of repeated concatenation.
-
-## Which Examples Improve First
-
-These would benefit immediately from the additions above:
-
-- `examples/url_ops.pith`
-- `examples/data_pipeline.pith`
-- `examples/strings_demo.pith`
-- `examples/matrix_math.pith`
-- `examples/json_ops.pith`
-- `examples/toml_ops.pith`
-
-The common pattern is not “missing power”. It is “too much ceremony”.
-
-## Immediate Next Steps
-
-All four migration phases are done. The CLI no longer resolves modules or
-renames globals, the duplicated JSON/TOML/URL runtime paths are deleted, and
-the runtime import table is generated by `cranelift/codegen/build.rs`. What is
-left from this document is the ergonomics work below, which is incremental
-rather than phased: keep adding the formatting, display, and collection helpers
-that let examples read like ordinary application code.
-
-## Proposed IR Contract For Phase 1
-
-The fastest way to delete Rust-side guessing is to make the self-hosted emitter
-tell the backend exactly what it already knows.
-
-### Current problem
-
-Today the Rust backend tries to recover facts like:
-
-- “does this call return a string?”
-- “does this function return a `TypeInfo`?”
-- “is this field load a string field?”
-- “which runtime symbol does this imported call really mean?”
-
-That creates duplicate logic and drift between:
-
-- `self-host/ir_emitter.pith`
-- `cranelift/codegen/src/ir_consumer.rs`
-- `cranelift/codegen/src/lib.rs`
-
-### Suggested changes
-
-#### 1. Calls should carry an exact lowered callee name
-
-Current shape:
-
-```text
-call REG NAME NARGS ARG...
-```
-
-Suggested direction:
-
-```text
-call REG NAME RETKIND NARGS ARG...
-```
-
-Where:
-
-- `NAME` is already fully lowered
-  - examples: `url_to_string`, `toml_get_int`, `pith_path_basename`
-- `RETKIND` is one of:
-  - `void`
-  - `int`
-  - `float`
-  - `bool`
-  - `string`
-  - `list`
-  - `list_string`
-  - `map`
-  - `map_int`
-  - `set`
-  - `struct:TypeName`
-  - `unknown`
-
-This removes the need for Rust to maintain:
-
-- string-return inference
-- struct-return inference
-- large portions of symbol remapping logic
-
-#### 2. Field loads should carry explicit type identity
-
-Current shape is effectively:
-
-```text
-field REG OBJ FIELD
-```
-
-Suggested direction:
-
-```text
-field REG OBJ STRUCT FIELD_INDEX FIELD_KIND FIELD_NAME
-```
-
-Example:
-
-```text
-field 12 4 TypeInfo 1 string name
-```
-
-Rust should not need to infer offsets by searching every known struct layout.
-
-#### 3. Function headers should carry return kind directly
-
-Current shape:
-
-```text
-func NAME NPARAM RETTYPE
-```
-
-That value is currently too weak because most real type knowledge is still
-re-inferred later. Keep the header, but make sure the emitter always writes the
-same return-kind vocabulary used by `call`.
-
-#### 4. Global declarations should carry concrete storage kind
-
-Current shape already hints at this, but it should be normalized.
-
-Suggested storage vocabulary:
-
-- `global NAME int`
-- `global NAME bool`
-- `global NAME string`
-- `global NAME list`
-- `global NAME list_string`
-- `global NAME map`
-- `global NAME map_int`
-- `global NAME set`
-- `global NAME struct:TypeName`
-
-That will make imported-global rewriting simpler and reduce backend fallback
-logic.
-
-### Expected Rust deletions after this contract lands
-
-Once the new IR contract is emitted consistently, these Rust helpers should
-shrink or disappear:
-
-- `call_returns_string`
-- `known_struct_returning_fn`
-- `field_offset_for_name`
-- `split_typed_field_name`
-- `collect_struct_returning_funcs`
-- `collect_string_returning_funcs`
-- large parts of `resolve_func_name`
-
-### Implementation order inside Phase 1
-
-1. Teach `self-host/ir_emitter.pith` to emit `RETKIND` and explicit field info
-2. Update `self-host/ir_driver` to preserve the new IR format
-3. Update `ir_consumer.rs` to trust emitted metadata
-4. Delete the old inference helpers
-5. Re-run deterministic examples and self-host rebuild
+TLS already follows that line: it lives in `std.net.tls`, `std.net.tls13`, and
+the Pith-side crypto helpers rather than in a Rust runtime module.
+
+## Migration Phases (done)
+
+1. **Delete Rust-side backend guessing.** The IR is self-describing and the
+   consumer trusts it. Calls carry an explicit return kind
+   (`call REG NAME RETKIND NARGS ...`) and `parse_call_shape` rejects the old
+   form; field loads carry `index kind name`. The metadata-inference block and
+   symbol-alias table are gone from `cranelift/codegen/src/ir_consumer.rs`. The
+   bugs this guessing caused (cross-module float returns, cross-module map
+   value reads, set codegen, negative float literals) are pinned by regression
+   tests such as `tests/cases/test_xmod_float.pith`. The contract itself is in
+   [ir-contract.md](ir-contract.md), and `make bootstrap-ir-checks-only` checks
+   it in CI.
+2. **Move CLI orchestration into Pith.** Finding modules, walking the import
+   graph, and renaming globals across imported IR live in the self-hosted
+   driver. `cranelift/cli/src/main.rs` reads IR, lowers it, and links or runs
+   the result.
+3. **Remove duplicated high-level runtime logic.** The Rust JSON, TOML, and
+   URL/path paths and the "smart" conversion helpers are deleted. Parsing,
+   formatting, and user-facing APIs live in std; the runtime owns primitive FFI
+   and storage.
+4. **Collapse runtime import tables.** The runtime import table is generated by
+   `cranelift/codegen/build.rs` from `cranelift/runtime-abi/runtime_functions.txt`.
+
+One tidy remains: the `pith_string_retain` symbol is a documented no-op for the
+`PithString` representation, whose operations each allocate their own buffer.
+See `cranelift/runtime/src/string.rs`.
+
+The compiler also reached a self-hosting fixed point, enforced by
+`make bootstrap-verify`.
+
+## Example Ergonomics
+
+The example corpus showed where the language read like ceremony. Status of each
+item:
+
+- **Formatting.** Interpolation accepts any expression
+  (`print("overall best: {best.name} ({best.score})")`), and `std.fmt` has
+  `format` and the collection helpers.
+- **Generic display.** `"{xs}"` renders lists, maps (sorted keys), sets
+  (sorted), and structs, through a `show()` impl when one exists or a
+  synthesized `Name(field: value)` form otherwise. Tuples do not interpolate
+  yet, and a list or map whose elements are structs prints the element handles
+  rather than the structs.
+- **Collection combinators.** List `.map`, `.filter`, and `.reduce`, and the
+  free functions in `std.collections`.
+- **Iteration.** `for x in list`, `for x, i in list`, range-for (`0..n`,
+  `0..=n`), and the lazy `std.iter` adapters. See
+  [iterators.md](iterators.md).
+- **Test ergonomics.** `test` blocks with the built-in `assert`, `assert_eq`
+  and `assert_ne`. See [testing.md](testing.md).
+- **String builder.** `std.io.string_buffer()`.
 
 ## Non-goals
 

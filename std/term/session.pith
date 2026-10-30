@@ -80,7 +80,7 @@ pub fn open_with(opts: Options) -> Terminal!:
     for s in opts.signals:
         armed.push(s)
     signal.notify(armed)!
-    t := Terminal(events: Channel[Event](64), cols: dims.0, rows: dims.1, running: true, closed: false, opts: opts, pending_out: [], reader: spawn zero(), waiter: spawn zero())
+    t := Terminal(events: Channel[Event](64), cols: dims.0, rows: dims.1, running: true, closed: false, opts: opts, pending_out: [], reader: spawn placeholder_task(), waiter: spawn placeholder_task())
     r := spawn reader_loop(t)
     w := spawn signal_loop(t)
     t.reader = r
@@ -89,7 +89,7 @@ pub fn open_with(opts: Options) -> Terminal!:
 
 # a placeholder task so the struct fields are never unset; it finishes
 # immediately and is replaced before open_with returns.
-fn zero() -> Int:
+fn placeholder_task() -> Int:
     return 0
 
 # the escape sequences a session's options turn on, in one write.

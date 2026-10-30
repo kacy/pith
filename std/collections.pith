@@ -524,10 +524,10 @@ pub fn sorted_positions[T](items: List[T], less: fn(T, T) -> Bool) -> List[Int]:
     # costs one comparison per run and keeps the scan free to give up without
     # having touched anything.
     mut count := runs.len()
-    mut r := 0
-    while r + 1 < count:
-        start := runs[r]
-        end := runs[r + 1]
+    mut run := 0
+    while run + 1 < count:
+        start := runs[run]
+        end := runs[run + 1]
         if end > start + 1 and less(items[start + 1], items[start]):
             mut left_end := start
             mut right_end := end - 1
@@ -537,7 +537,7 @@ pub fn sorted_positions[T](items: List[T], less: fn(T, T) -> Bool) -> List[Int]:
                 src[right_end] = held
                 left_end = left_end + 1
                 right_end = right_end - 1
-        r = r + 1
+        run = run + 1
     if count <= 2:
         # one run covers the whole input, so src is already the answer and the
         # sort was the scan
@@ -557,14 +557,14 @@ pub fn sorted_positions[T](items: List[T], less: fn(T, T) -> Bool) -> List[Int]:
     # their input order.
     while count > 2:
         mut merged := 0
-        mut b := 0
+        mut boundary := 0
         mut lo := 0
-        while b + 1 < count:
+        while boundary + 1 < count:
             runs[merged] = lo
             merged = merged + 1
-            if b + 2 < count:
-                mid := runs[b + 1]
-                hi := runs[b + 2]
+            if boundary + 2 < count:
+                mid := runs[boundary + 1]
+                hi := runs[boundary + 2]
                 mut left := lo
                 mut right := mid
                 mut out := lo
@@ -589,17 +589,17 @@ pub fn sorted_positions[T](items: List[T], less: fn(T, T) -> Bool) -> List[Int]:
                     right = right + 1
                     out = out + 1
                 lo = hi
-                b = b + 2
+                boundary = boundary + 2
             else:
                 # an odd run at the end has nothing to merge with this pass, but
                 # it still has to reach the buffer the next pass reads from.
-                tail := runs[b + 1]
+                tail := runs[boundary + 1]
                 mut k := lo
                 while k < tail:
                     dst[k] = src[k]
                     k = k + 1
                 lo = tail
-                b = b + 1
+                boundary = boundary + 1
         runs[merged] = n
         count = merged + 1
         # the pass just written becomes the next pass's input, and the buffer

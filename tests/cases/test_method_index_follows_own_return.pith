@@ -1,0 +1,41 @@
+# how a method reads `xs[i]` or `m[k]` depends on its own return type: a
+# fallible method hands a miss back to its caller, and any other method
+# aborts on one. the free function emitted last here is not fallible, and
+# the methods after it must not take their choice from it.
+
+struct Table:
+    pub items: List[Int]
+    pub names: Map[String, Int]
+
+fn fallible_first(n: Int) -> Int!:
+    if n < 0:
+        fail "negative"
+    return n
+
+fn plain_last(n: Int) -> Int:
+    return n + 1
+
+impl Table:
+    fn item_at(i: Int) -> Int!:
+        return self.items[i]
+
+    fn name_count(name: String) -> Int!:
+        return self.names[name]
+
+    fn count_of(name: String) -> Int:
+        return self.names[name]
+
+fn main():
+    t := Table([10, 20, 30], {"a": 1, "b": 2})
+    first := fallible_first(3) catch 0 - 1
+    print(first.to_string())
+    print(plain_last(4).to_string())
+    hit := t.item_at(1) catch 0 - 1
+    print(hit.to_string())
+    miss := t.item_at(7) catch 0 - 1
+    print(miss.to_string())
+    named := t.name_count("a") catch 0 - 1
+    print(named.to_string())
+    unnamed := t.name_count("zzz") catch 0 - 1
+    print(unnamed.to_string())
+    print(t.count_of("b").to_string())

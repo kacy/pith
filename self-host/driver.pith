@@ -535,6 +535,15 @@ fn dr_find_stdlib_root(source_path: String) -> String:
             break
         dir = parent
         depth = depth + 1
+    return installed_stdlib_root()
+
+# the stdlib of an installed toolchain. the `pith` command sets PITH_HOME
+# when it runs from an install, so a program outside any checkout still
+# finds std. a checkout's own std/ wins, because the walk above runs first.
+pub fn installed_stdlib_root() -> String:
+    home := env("PITH_HOME")
+    if home.len() > 0 and dir_exists(home + "/std"):
+        return home
     return ""
 
 # the line and column of each import declaration in `imports`, as two

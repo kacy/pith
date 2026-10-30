@@ -32,8 +32,13 @@ pub fn link_executable(
     runtime_lib: &str,
     output: &str,
 ) -> Result<(), CompileError> {
-    // Use gcc as the linker
-    let mut cmd = Command::new("gcc");
+    // the system c compiler drives the link: $CC when set, otherwise `cc`,
+    // which every linux toolchain and the xcode command line tools provide
+    let linker = std::env::var("CC")
+        .ok()
+        .filter(|cc| !cc.is_empty())
+        .unwrap_or_else(|| "cc".to_string());
+    let mut cmd = Command::new(&linker);
 
     cmd.arg("-o")
         .arg(output)
@@ -56,7 +61,12 @@ pub fn link_executable(
 
     let output_result = cmd
         .output()
-        .map_err(|e| CompileError::ModuleError(format!("Failed to run linker: {}", e)))?;
+        .map_err(|e| {
+            CompileError::ModuleError(format!(
+                "Failed to run linker `{}`: {} (install a c compiler, or set CC)",
+                linker, e
+            ))
+        })?;
 
     if !output_result.status.success() {
         let stderr = String::from_utf8_lossy(&output_result.stderr);
@@ -86,9 +96,16 @@ pub fn get_runtime_lib_path() -> String {
     // binary merely behaves like an older runtime. that cost real debugging
     // time (runtime changes appeared to have no effect at all) and could
     // ship a binary built from code nobody has.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let beside = dir.join("libpith_runtime.a");
+    // an install keeps it in <home>/lib, next to the <home>/bin holding pith
+    if let Some(dir) = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .ok()
+        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+    {
+        for beside in [
+            dir.join("libpith_runtime.a"),
+            dir.join("../lib/libpith_runtime.a"),
+        ] {
             if beside.exists() {
                 return beside.to_string_lossy().to_string();
             }

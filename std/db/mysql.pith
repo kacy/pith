@@ -35,14 +35,12 @@ import std.metrics as metrics
 import std.trace as trace
 import std.time as time
 
-# the open pools, indexed by the handle a Db carries, and a mutex guarding both
-# the list and each pool's idle set. the pool lives here rather than inside Db
-# for two reasons: a Db then carries only a plain handle, which sidesteps a
-# cross-module retain bug when a caller holds the handle; and one lock covers
-# every pool, so concurrent tasks borrow and return connections safely.
-# every read of `pools` — open, the three acquire/release/discard helpers, and
-# Db.close — takes registry_mu around the lookup and nothing else, so a slow
-# connect or close happens off the lock.
+# the open pools, indexed by the handle a Db carries, and the mutex that
+# guards the list. the pool lives here rather than inside Db so a Db carries
+# only a plain handle, which sidesteps a cross-module retain bug when a caller
+# holds the handle. each pool synchronizes its own idle set, so every read of
+# `pools` (open, pool_at, and Db.close) takes registry_mu around the lookup
+# and nothing else, and a slow connect or close happens off the lock.
 mut pools: List[mysql.Pool] := []
 mut registry_mu := Mutex()
 
@@ -66,31 +64,28 @@ pub fn open(url: String) -> Db!:
     registry_mu.unlock()
     return Db(handle: handle)
 
-# take a connection from pool `pool_handle`. the registry lock only covers
-# looking the pool up; the pool then caps and dials on its own, so a slow
-# connect never blocks other tasks' lookups (the pool is self-synchronizing).
-fn acquire_from_pool(pool_handle: Int) -> mysql.Conn!:
+# look up pool `pool_handle`. the registry lock only covers the lookup; the
+# pool is self-synchronizing, so its dials and closes happen off this lock and
+# a slow connect never blocks other tasks' lookups.
+fn pool_at(pool_handle: Int) -> mysql.Pool:
     registry_mu.lock()
     pool := pools[pool_handle]
     registry_mu.unlock()
-    return pool.acquire()!
+    return pool
 
-# return a connection to pool `pool_handle`. as with acquire, the lock only
-# covers the lookup; any close network i/o happens in the pool, off the lock.
+# take a connection from pool `pool_handle`; past the cap this waits.
+fn acquire_from_pool(pool_handle: Int) -> mysql.Conn!:
+    return pool_at(pool_handle).acquire()!
+
+# return a connection to pool `pool_handle` for reuse.
 fn release_to_pool(pool_handle: Int, conn: mysql.Conn):
-    registry_mu.lock()
-    pool := pools[pool_handle]
-    registry_mu.unlock()
-    pool.release(conn)
+    pool_at(pool_handle).release(conn)
 
 # discard a poisoned connection back to pool `pool_handle`: it is closed rather
 # than reused, but its slot still returns so the cap does not leak. use this on
 # every error path instead of closing the connection directly.
 fn discard_to_pool(pool_handle: Int, conn: mysql.Conn):
-    registry_mu.lock()
-    pool := pools[pool_handle]
-    registry_mu.unlock()
-    pool.discard(conn)
+    pool_at(pool_handle).discard(conn)
 
 # --- pinned connections (transactions and prepared statements) ---
 #
@@ -449,10 +444,7 @@ impl Db:
     # drain the pool, closing every idle connection. the lock only covers the
     # lookup; the connection close network i/o happens in the pool, off the lock.
     pub fn close():
-        registry_mu.lock()
-        pool := pools[self.handle]
-        registry_mu.unlock()
-        pool.close()
+        pool_at(self.handle).close()
 
 # prepare, run, and free a select on `conn`, collecting the rows into a list.
 fn gather(conn: mysql.Conn, text: String, params: List[String]) -> List[sql.Row]!:

@@ -177,8 +177,8 @@ cargo build --release
 ./target/release/pith new myapp
 ```
 
-`pith new` scaffolds a package with a `pith.toml`, a `Makefile` and a
-`Dockerfile`. to build the compiler with itself:
+`pith new` scaffolds a library package with a `pith.toml`, a `Makefile`,
+a test and an `AGENTS.md`. to build the compiler with itself:
 
 ```
 make self-host

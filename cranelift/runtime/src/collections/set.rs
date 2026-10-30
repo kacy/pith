@@ -1,7 +1,8 @@
-//! Set[T] - unique element collection
+//! Set[T]: a reference-counted collection of unique ints, strings or bytes.
 //!
-//! Hybrid approach: Uses hashbrown::HashSet internally for O(1) operations,
-//! but presents FFI-compatible interface matching the C runtime.
+//! The table is a `hashbrown::HashMap` with unit values, used directly rather
+//! than through `std` so membership tests can probe with a borrowed element
+//! (`ElemRef`) and never build an owned one.
 
 use crate::handle_registry;
 use hashbrown::hash_map::EntryRef;
@@ -110,7 +111,7 @@ impl From<&ElemRef<'_>> for SetElement {
     }
 }
 
-/// Internal set implementation using idiomatic Rust
+/// The set behind a handle.
 pub struct SetImpl {
     /// Magic word for the fast validity check (see set_magic_ok)
     magic: u32,
@@ -377,7 +378,7 @@ pub unsafe extern "C" fn pith_set_release_handle(handle: i64) {
 // a set stores only ints and byte strings, so it holds no edges into the
 // ownership graph and the collector never walks into one. it still has a
 // reference count of its own, though, so a set every one of whose owners is
-// garbage is garbage too — these let the collection pass count it and, when
+// garbage is garbage too. these let the collection pass count it and, when
 // it turns out white, tear it down. every entry point magic-checks so a bad
 // edge degrades to None or a no-op.
 
@@ -387,7 +388,7 @@ pub(crate) unsafe fn cycle_set_strong_count(handle: i64) -> Option<u32> {
         .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Add `delta` to the reference count — the collector's teardown guard.
+/// Add `delta` to the reference count: the collector's teardown guard.
 pub(crate) unsafe fn cycle_set_guard_strong(handle: i64, delta: u32) {
     if let Some(impl_ref) = set_ref_from_handle(handle) {
         impl_ref

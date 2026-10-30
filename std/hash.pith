@@ -13,6 +13,8 @@ import std.bytes as bytes
 import std.bits as bits
 import std.encoding as encoding
 
+# mask32, rotate_right and add32 serve the *_reference definitions, which
+# are kept as they shipped; the kernels call std.bits directly.
 fn mask32(value: Int) -> Int:
     return bits.mask32(value)
 
@@ -209,6 +211,11 @@ fn sha_load_words64_tail(w: List[Int], tail: List[Int], off: Int):
 # oracle the randomized test compares against. with `hardware`, whole
 # blocks go to the runtime's sha256_blocks first; the test passes false to
 # check this loop on cpus where that call would take every block.
+#
+# the kernels keep the spec's names (fips 180-4 section 6): h0..h7 are the
+# hash state, a..h the working variables, w the message schedule and k the
+# round constants. `ih0..ih7` are the initial hash value, and `words` is how
+# many state words the digest prints (7 for sha-224, 8 for sha-256).
 fn sha2_32(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: Int, ih6: Int, ih7: Int, words: Int, hardware: Bool) -> String:
     mut h0 := ih0
     mut h1 := ih1
@@ -845,6 +852,8 @@ pub fn fnv1a_string(input: String) -> Int:
 fn hash_fnv1a_string(input: String) -> Int:
     return fnv1a_string(input)
 
+# the sha-1 round constants, one per group of twenty rounds (fips 180-4
+# section 4.2.1).
 K0 := 1518500249
 K1 := 1859775393
 K2 := 2400959708

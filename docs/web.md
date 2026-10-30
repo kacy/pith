@@ -30,8 +30,9 @@ app, so calls chain:
 app := web.new().get("/", home).post("/users", create)
 ```
 
-a chain has to stay on one line. once you have more than a couple of routes, add them
-one per line instead:
+a line that starts with `.` does not continue the line before it, so a chain stays
+on one line unless it is wrapped in parentheses. once you have more than a couple of
+routes, it is often clearer to add them one per line:
 
 ```pith
 mut app := web.new()
@@ -359,10 +360,10 @@ and a protected rest. `group` binds a middleware to a path prefix, so the
 split is spelled at one site instead of as an allowlist inside the guard:
 
 ```pith
-app := web.new()
+app := (web.new()
     .post("/login", handle_login)
     .group("/api", require_token)
-    .get("/api/me", handle_me)
+    .get("/api/me", handle_me))
 ```
 
 `/login` and `/healthz` stay open; everything under `/api` runs through
@@ -945,10 +946,10 @@ too.
 change any of it with `with_config`:
 
 ```pith
-config := web.server_config()
+config := (web.server_config()
     .with_read_timeout(30000)
     .with_write_timeout(30000)
-    .with_max_body_bytes(1048576)
+    .with_max_body_bytes(1048576))
 app := web.new().with_config(config).get("/", home)
 ```
 

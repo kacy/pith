@@ -5,22 +5,18 @@ close a socket, give back a registry slot, put a terminal back in cooked mode,
 or roll back a transaction. those are side effects the compiler knows nothing
 about, so every one of them is a call somebody has to remember to write.
 
-`docs/limitations.md` records the sharpest case: a `std.net.tls` config the
-caller builds holds a registry slot until the process exits unless the caller
-closes it, and nothing in the language notices when one is not. the entry ends
-by naming the missing feature — "a destructor that runs when the last reference
-to a `Config` goes away, which is the same missing feature behind several
-entries here."
+the sharpest case was a `std.net.tls` config: one the caller built held a
+registry slot until the process exited unless the caller closed it, and
+nothing in the language noticed when one was not.
 
-this page is the survey behind that sentence, an assessment of how close the
-emitter was to running user cleanup, the recommendation made at the time, and
-the staged plan that came out of it. the hook exists now: a struct can
+this page is the survey of std's manual closers, an assessment of how close
+the emitter was to running user cleanup, the recommendation made at the time,
+and the staged plan that came out of it. the hook exists now: a struct can
 `impl Drop`, its `drop` runs from the destructor the compiler already
 attaches, and `std.net.tls.Config` is the first std type on it (the mechanism
 is described in docs/ownership.md, "destructors"). the survey and the stage
 plan below are kept current, because every other type in the survey still
-closes by hand and the plan says in what order that changes. issue #925
-tracks it.
+closes by hand and the plan says in what order that changes.
 
 ## the survey
 
@@ -32,7 +28,7 @@ skipped, and whether a second call is safe.
 | type | closer | lost when skipped | double close |
 |---|---|---|---|
 | `Config` | `close()`, or its destructor | nothing any more: `Config` implements `Drop`, so a config nobody closes gives its slots back when the last value naming it dies | safe |
-| `Conn` | `close()` | the `native_conn_states` entry (keys, ivs, transcript, sequence numbers), the handshake-pending flag, the socket fd, and the `close_notify` alert | safe |
+| `Conn` | `close()` | the `native_conn_shards` entry (keys, ivs, transcript, sequence numbers), the handshake-pending flag, the socket fd, and the `close_notify` alert | safe |
 | `Listener` | `close()` | the listener-config entry and the listening socket | safe |
 
 handles are never reissued, so the maps only grow for the two types that
@@ -55,11 +51,8 @@ registry holds the config itself now, and the hook result carries an optional.
 | `BufferedBytesReader` / `BufferedBytesWriter` | `free()` | four threadlocal map entries each, including the cached `Bytes` | safe |
 | `StringReader`, `StringBuffer`, `BytesCursor`, the five buffered *text* readers, and the three buffered writers | `close()` | the type's threadlocal registry entries — one to six map entries each, including any cached text; for `StringBuffer` also the runtime byte buffer the entry owns, which holds the accumulated text | safe |
 
-the last row used to read "none": those registries had no removal path at all,
-so a keep-alive server on the buffered text path accumulated entries for the
-life of the process, per os thread, with no call it could make to stop it.
-each of the types closes now (through `io.Closer`), a closed reader reads as
-end of input, and a closed writer reports nothing written rather than
+each of the types in the last row closes through `io.Closer`. a closed reader
+reads as end of input, and a closed writer reports nothing written rather than
 re-registering itself.
 
 ### sockets, listeners and admission slots
@@ -91,11 +84,8 @@ them owns the close, but the fd itself no longer depends on it.
 | `grpc.Conn`, `grpc.PoolConn` | `close()` | the whole underlying client | — |
 | `grpc.ServerStream` / `ClientStream` / `BidiStream` | `close()` (`close_send()` only half-closes the request stream) | the underlying `http2.Stream`: its event and credit channels, three map entries, and one `MAX_CONCURRENT_STREAMS` slot, retained for the connection's life | safe |
 
-the grpc row used to be the second finding: the stream types offered only
-`close_send()`, and `http2.Stream.close()` was not `pub`, so a caller could
-not release a stream even knowing it was needed. the stream types close now,
-the http/2 close is `pub`, and closing a completed rpc sends nothing — the
-reset only goes on the wire for a stream whose terminal event never arrived.
+closing a completed grpc rpc sends nothing; the reset only goes on the wire
+for a stream whose terminal event never arrived.
 
 ### databases
 
@@ -161,18 +151,15 @@ the last owner is.
 ### is std internally consistent
 
 unevenly, and the unevenness tracks the leaks. counting `defer` and `errdefer`
-per file: `tls13` 65, `http` 30, `tls` 29, `http2/server` 18, `tls12` 17,
-`websocket` 10, `db/postgres` 4, `db/mysql` 4 — against `io` 3 in 3265 lines,
+per file: `tls13` 65, `tls` 39, `http` 32, `tls12` 18, `websocket` 12,
+`http2/server` 10, `db/postgres` 4, `db/mysql` 4 — against `io` 5 in 3619 lines,
 `os/process` 2, `fs` 2, `grpc` 2, `redis` 1, `postgres` 1, `mysql` 1. the three
 modules this survey found real leaks in — `io`, `grpc`, `websocket` — are near
 the bottom of that list.
 
 the two rules std does hold to are worth keeping: whoever builds a resource
-closes it, and a closer is idempotent. the second one used to split cleanly:
-anything that reached `tcp_close(fd)` closed unconditionally, and the kernel
-may have reissued the number, so only the closers backed by a map lookup were
-safe to call twice. `tcp_close` now retires a generation-stamped handle rather
-than a number, so it is idempotent too, and the split is gone.
+closes it, and a closer is idempotent. `tcp_close` retires a
+generation-stamped handle rather than a number, so it is idempotent too.
 
 ## what the machinery already does
 
@@ -397,8 +384,8 @@ positive on a resource handed off elsewhere is worse than no lint.
 
 `ByteBuffer.take_bytes()` is the shape that proves the caution is needed: it
 consumes its receiver, so a rule that only looked for `close()` would report a
-correct program. the constructor list is the three `std.net.tls` config builders
-and nothing else, and every addition to it has to be audited the same way.
+correct program. every addition to the constructor list has to be audited the
+same way.
 
 extending it is cheap and is where the next increment of value is. the obvious
 next entries are the parser scopes, whose `open_scope` / `close_scope` pairing
@@ -441,9 +428,8 @@ settle:
 - `tls.Conn`, `tls.Listener`, `http.ClientConn`, `http2.Connection` and the
   database connections: each is rebuilt from a bare handle somewhere
   (`conn_from_handle`, `listener_from_handle`, the drivers' stored `Int`
-  fields), and each closes a socket, which is the one closer that is not
-  idempotent. these need the rebuild sites replaced with a held value first,
-  and a close that records whether it won.
+  fields), and each closes a socket. these need the rebuild sites replaced
+  with a held value first, and a close that records whether it won.
 - the types with no closer at all (`resilience.Limiter`, `Breaker`,
   `crypto.jwks.Cache`, `web.session.Store`): built once at startup, so a
   destructor buys little; they get a closer when something builds them per

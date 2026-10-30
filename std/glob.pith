@@ -30,6 +30,7 @@ fn glob_contains(items: List[String], value: String) -> Bool:
             return true
     return false
 
+# the non-empty segments of a cleaned path; "." has none.
 fn glob_segments(text: String) -> List[String]:
     cleaned := path.clean(text)
     if cleaned == ".":
@@ -40,6 +41,7 @@ fn glob_segments(text: String) -> List[String]:
             out.push(part)
     return out
 
+# how many segments `candidate` sits below `root`, for max_depth.
 fn glob_depth(root: String, candidate: String) -> Int:
     root_parts := glob_segments(root)
     candidate_parts := glob_segments(candidate)
@@ -48,40 +50,45 @@ fn glob_depth(root: String, candidate: String) -> Int:
         return 0
     return depth
 
-fn glob_char_match(pattern: String, text: String, pi: Int, ti: Int) -> Bool:
-    if pi >= pattern.len():
-        return ti >= text.len()
-    if pattern[pi] == "*":
-        if glob_char_match(pattern, text, pi + 1, ti):
+# match one path segment against one pattern segment, from the given
+# offsets on. `*` matches any run of characters and `?` exactly one; a `*`
+# tries the shortest run first and backtracks by recursion.
+fn glob_char_match(pattern: String, text: String, pattern_index: Int, text_index: Int) -> Bool:
+    if pattern_index >= pattern.len():
+        return text_index >= text.len()
+    if pattern[pattern_index] == "*":
+        if glob_char_match(pattern, text, pattern_index + 1, text_index):
             return true
-        if ti < text.len():
-            return glob_char_match(pattern, text, pi, ti + 1)
+        if text_index < text.len():
+            return glob_char_match(pattern, text, pattern_index, text_index + 1)
         return false
-    if pattern[pi] == "?":
-        if ti >= text.len():
+    if pattern[pattern_index] == "?":
+        if text_index >= text.len():
             return false
-        return glob_char_match(pattern, text, pi + 1, ti + 1)
-    if ti >= text.len():
+        return glob_char_match(pattern, text, pattern_index + 1, text_index + 1)
+    if text_index >= text.len():
         return false
-    if pattern[pi] != text[ti]:
+    if pattern[pattern_index] != text[text_index]:
         return false
-    return glob_char_match(pattern, text, pi + 1, ti + 1)
+    return glob_char_match(pattern, text, pattern_index + 1, text_index + 1)
 
-fn glob_match_parts(pattern_parts: List[String], path_parts: List[String], pi: Int, ti: Int) -> Bool:
-    if pi >= pattern_parts.len():
-        return ti >= path_parts.len()
-    part := pattern_parts[pi]
+# match whole segments, with `**` standing for any number of them (none
+# included). the other pattern segments go to glob_char_match.
+fn glob_match_parts(pattern_parts: List[String], path_parts: List[String], pattern_index: Int, path_index: Int) -> Bool:
+    if pattern_index >= pattern_parts.len():
+        return path_index >= path_parts.len()
+    part := pattern_parts[pattern_index]
     if part == "**":
-        if glob_match_parts(pattern_parts, path_parts, pi + 1, ti):
+        if glob_match_parts(pattern_parts, path_parts, pattern_index + 1, path_index):
             return true
-        if ti < path_parts.len():
-            return glob_match_parts(pattern_parts, path_parts, pi, ti + 1)
+        if path_index < path_parts.len():
+            return glob_match_parts(pattern_parts, path_parts, pattern_index, path_index + 1)
         return false
-    if ti >= path_parts.len():
+    if path_index >= path_parts.len():
         return false
-    if not glob_char_match(part, path_parts[ti], 0, 0):
+    if not glob_char_match(part, path_parts[path_index], 0, 0):
         return false
-    return glob_match_parts(pattern_parts, path_parts, pi + 1, ti + 1)
+    return glob_match_parts(pattern_parts, path_parts, pattern_index + 1, path_index + 1)
 
 # return true when path_text matches pattern.
 pub fn matches(pattern: String, path_text: String) -> Bool:
@@ -94,6 +101,7 @@ fn glob_should_skip(entry: fs.Entry, opts: GlobOptions) -> Bool:
         return true
     return false
 
+# the first pattern that matches `candidate`, or "" when none does.
 fn glob_any_match(patterns: List[String], candidate: String) -> String:
     for pattern in patterns:
         if matches(pattern, candidate):

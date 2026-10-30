@@ -10,19 +10,27 @@
 # produces, so a caret that moves to the wrong token passes every one of
 # them. this is the gate that sees it.
 #
+# each case also goes through ir_driver, the front end behind build, run
+# and test, which renders check errors on its own path. both renderings
+# must match the same expected file. a case can import a module from
+# cases/modules/, which is not itself a case.
+#
 # DIAG_CHECK_UPDATE=1 rewrites the expected files from the current output
 # instead of diffing; read every line before freezing one.
 set -u
 export LC_ALL=C
 
 checker="./self-host/pith_main"
+ir_driver="./self-host/ir_driver"
 update="${DIAG_CHECK_UPDATE:-0}"
 fail=0
 
-if [ ! -x "$checker" ]; then
-    echo "error: $checker not built; run make self-host first" >&2
-    exit 1
-fi
+for tool in "$checker" "$ir_driver"; do
+    if [ ! -x "$tool" ]; then
+        echo "error: $tool not built; run make self-host self-host-ir-driver first" >&2
+        exit 1
+    fi
+done
 
 # a glob that matched nothing would run no case and report a pass, which
 # is the one verdict this gate must never give
@@ -31,6 +39,17 @@ if [ "$count" -eq 0 ]; then
     echo "error: no cases under tests/diagnostics/cases; refusing to report a pass" >&2
     exit 1
 fi
+
+# compare <label> <expected file> <rendering>
+compare() {
+    if printf '%s\n' "$3" | diff -u "$2" - > /dev/null; then
+        echo "ok $1"
+    else
+        echo "FAIL $1"
+        printf '%s\n' "$3" | diff -u "$2" - || true
+        fail=1
+    fi
+}
 
 for case_file in tests/diagnostics/cases/*.pith; do
     name=$(basename "$case_file" .pith)
@@ -57,13 +76,8 @@ for case_file in tests/diagnostics/cases/*.pith; do
         continue
     fi
 
-    if printf '%s\n' "$got" | diff -u "$expected" - > /dev/null; then
-        echo "ok $name"
-    else
-        echo "FAIL $name"
-        printf '%s\n' "$got" | diff -u "$expected" - || true
-        fail=1
-    fi
+    compare "$name" "$expected" "$got"
+    compare "$name (ir_driver)" "$expected" "$("$ir_driver" "$case_file" 2>&1)"
 done
 
 if [ "$fail" -eq 0 ]; then

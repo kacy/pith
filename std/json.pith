@@ -273,31 +273,6 @@ fn skip_whitespace():
         pos = pos + 1
     parser_position = pos
 
-# Parses an integer from a string manually (handles negative numbers).
-# On overflow, sets parser_error so json_parse returns -1 instead of
-# silently aliasing the overflowed value with a legitimate 0.
-fn parse_integer_manual(s: String) -> Int:
-    mut val := 0
-    mut neg := false
-    mut i := 0
-    if s.len() > 0 and s[0] == "-":
-        neg = true
-        i = 1
-    if s.len() > 0 and s[0] == "+":
-        i = 1
-    while i < s.len():
-        c := s[i]
-        if c >= "0" and c <= "9":
-            digit := ord(c) - 48
-            if val > 922337203685477580 / 10:
-                parser_error = true
-                return 0
-            val = val * 10 + digit
-        i = i + 1
-    if neg:
-        return 0 - val
-    return val
-
 fn scan_whitespace(c: String) -> Bool:
     return c == " " or c == chr(9) or c == chr(10) or c == chr(13)
 
@@ -997,8 +972,11 @@ fn parse_value_node() -> Int:
             float_values.insert(idx, value.value)
             return idx
         if not is_float:
+            parsed := parse_int(num_str) catch:
+                parser_error = true
+                return 0 - 1
             idx := allocate_node("int")
-            integer_values.insert(idx, parse_integer_manual(num_str))
+            integer_values.insert(idx, parsed)
             return idx
 
     parser_error = true
@@ -2461,3 +2439,10 @@ test "encode_bytes matches encode on text that needs escaping":
     encoded := encode_bytes(node)!
     assert_eq(encoded.to_string_utf8()!, encode(node))
     assert_eq(get_string(parse(encode(node))), tricky)
+
+test "json integers cover the full Int range and reject overflow":
+    assert_eq(get_int(parse("1000000000000000000")), 1000000000000000000)
+    assert_eq(get_int(parse("9223372036854775807")), 9223372036854775807)
+    assert_eq(get_int(parse("-9223372036854775808")), 0 - 9223372036854775807 - 1)
+    assert_eq(parse("9223372036854775808"), 0 - 1)
+    assert_eq(parse("-9223372036854775809"), 0 - 1)

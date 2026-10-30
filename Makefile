@@ -750,7 +750,7 @@ lsp-check-only:
 # gates compare the set of error codes a file produces, so a caret that
 # moves to the wrong token passes every one of them and fails here.
 
-diag-check: build self-host
+diag-check: build self-host self-host-ir-driver
 	@$(MAKE) --no-print-directory diag-check-only
 
 diag-check-only:

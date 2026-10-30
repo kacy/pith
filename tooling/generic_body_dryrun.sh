@@ -4,8 +4,8 @@
 # a generic body was never type-checked before the per-specialization walk
 # existed, so the first time the walk runs over a body of code it may find
 # real faults and it may find checks that assumed a concrete declaration
-# site. this runs the self-hosted checker with the walk in count mode — its
-# findings come out as warnings and the exit code stays 0 — and tallies what
+# site. this runs the self-hosted checker with the walk in count mode (its
+# findings come out as warnings and the exit code stays 0) and tallies what
 # it finds by code and by file, so each finding can be triaged before the
 # walk's reports become errors.
 #

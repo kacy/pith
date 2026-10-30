@@ -14,14 +14,14 @@
 #    (`.cargo/config.toml`), so a plain cell access is one `%fs:`-relative
 #    instruction with no base register. a dynamic-model relocation
 #    (`TLSGD`, `TLSLD`, `DTPOFF32`) against one of the runtime's own cells
-#    means that setting was lost — a `RUSTFLAGS` in the environment replaces
-#    it — and the whole archive is back to caching bases.
+#    means that setting was lost (a `RUSTFLAGS` in the environment replaces
+#    it) and the whole archive is back to caching bases.
 #
 # 2. a cell whose address has to exist as a value (a lazily initialized
 #    handle, a `RefCell`) is touched only inside a function the optimizer may
-#    not inline, listed below. an address materialization — a `TPOFF32`
+#    not inline, listed below. an address materialization (a `TPOFF32`
 #    relocation on an instruction that is not itself `%fs:`-relative, or a
-#    `GOTTPOFF` one folded into an `add` — anywhere else is a frame that
+#    `GOTTPOFF` one folded into an `add`) anywhere else is a frame that
 #    holds a thread-local address, and fails the check.
 #
 # usage: tooling/check_tls_barriers.sh [path/to/libpith_runtime.a]

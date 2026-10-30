@@ -2,8 +2,8 @@
 # golden harness for diagnostic positions.
 #
 # each case in tests/diagnostics/cases/ is a file that fails `check`. the
-# harness renders its diagnostics with the human formatter — which prints
-# the offending source line and a caret under the column — and diffs the
+# harness renders its diagnostics with the human formatter, which prints
+# the offending source line and a caret under the column, and diffs the
 # whole rendering against tests/diagnostics/expected/.
 #
 # the invalid-example gates compare the set of error CODES a file

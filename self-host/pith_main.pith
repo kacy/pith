@@ -41,7 +41,7 @@ from check_pipeline import run_check_pipeline
 from printer import print_ast
 from formatter import fmt_source
 from linter import lint_module, source_is_generated
-from errors import Diagnostic, render_diagnostics, render_diagnostics_json, has_errors
+from errors import render_diagnostics, render_diagnostics_for_path, render_diagnostics_json, has_errors
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
 from package_cli import package_root_path, cmd_package_deps, cmd_package_lock, cmd_package_install, cmd_package_inspect, cmd_package_context, cmd_new
 from lsp_server import run_lsp_server
@@ -100,36 +100,6 @@ fn cmd_run(path: String) -> String!:
 # today it accepts through this path too.
 fn cmd_test(path: String, extra: List[String]) -> String!:
     return run_backend_command("test", path, extra)
-
-fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String, primary_source: String) -> String!:
-    mut output := ""
-    mut current_file := primary_path
-    mut current_source := primary_source
-    mut group: List[Diagnostic] := []
-
-    for d in diags:
-        mut diag_file := d.file
-        if diag_file == "":
-            diag_file = primary_path
-        if group.len() == 0:
-            current_file = diag_file
-            if current_file == primary_path:
-                current_source = primary_source
-            else:
-                current_source = read_file(current_file)!
-        elif diag_file != current_file:
-            output = output + render_diagnostics(group, current_source)
-            group = []
-            current_file = diag_file
-            if current_file == primary_path:
-                current_source = primary_source
-            else:
-                current_source = read_file(current_file)!
-        group.push(d)
-
-    if group.len() > 0:
-        output = output + render_diagnostics(group, current_source)
-    return output
 
 # ---------------------------------------------------------------
 # check command

@@ -96,6 +96,8 @@ the std clients register these on your behalf:
 | `http_server_duration_ms` | `method`, `route` | `begin/end_server_span` |
 | `rpc_client_requests_total` | `rpc_method`, `grpc_status` | grpc client calls |
 | `rpc_client_duration_ms` | `rpc_method` | grpc client calls |
+| `db_queries_total` | `driver`, `op`, `status` | postgres and mysql calls |
+| `db_query_duration_ms` | `driver`, `op` | postgres and mysql calls |
 
 ## exposing /metrics for prometheus
 
@@ -284,10 +286,10 @@ transports.
 `http/protobuf` (the default) POSTs protobuf to `/v1/traces` and `/v1/metrics`,
 optionally gzip-compressed. `grpc` makes a unary call to the collector's
 `TraceService`/`MetricsService` `Export` methods carrying the identical protobuf,
-with the auth headers as grpc metadata. the grpc transport is tls-only — pith's
-grpc client has no cleartext h2c — so a `grpc` target needs an `https://`
-endpoint; a plain `http://` grpc endpoint fails with a clear message rather than
-mis-dialing.
+with the auth headers as grpc metadata. the grpc transport is tls-only: the
+exporter dials with `grpc.dial` and never with `grpc.dial_h2c`, so a `grpc`
+target needs an `https://` endpoint; a plain `http://` grpc endpoint fails with
+a clear message rather than mis-dialing.
 
 ## flushing on exit
 
@@ -335,9 +337,10 @@ see [docs/signals.md](signals.md) for the drain itself.
   the active span: it has no dependency on `std.trace`, so a record emitted
   inside a `trace.start()` span carries no trace or span id of its own. to
   correlate logs with traces, pass the ids into the logger yourself with
-  `with([log.str("trace_id", ...)])`.
-- **grpc without tls** — the OTLP/grpc transport requires tls; there's no
-  cleartext h2c for a bare local collector on `:4317`. use `http/protobuf` or an
+  `logger.trace_context(trace_id, span_id)`.
+- **grpc without tls** — the OTLP/grpc transport requires tls. the grpc client
+  can speak cleartext h2c (`grpc.dial_h2c`), but the exporter does not use it,
+  so a bare local collector on `:4317` is unreachable. use `http/protobuf` or an
   `https` grpc endpoint.
 - **exemplars and delta temporality** — metrics export as cumulative (which
   matches how pith accumulates them); there are no exemplars or delta temporality.

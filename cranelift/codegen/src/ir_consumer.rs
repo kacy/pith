@@ -1724,7 +1724,6 @@ pub fn compile_from_ir(
         }
 
         let func_name = parts[1].to_string();
-        let _nparam: usize = parts[2].parse().unwrap_or(0);
         let func_retkind = parts.get(3).copied().unwrap_or("").to_string();
         i += 1;
 
@@ -1763,7 +1762,6 @@ pub fn compile_from_ir(
         if let Some(&func_id) = declared_funcs.get(&func_name) {
             let func = compile_ir_function(
                 codegen,
-                func_id,
                 &func_name,
                 &func_retkind,
                 &param_names,
@@ -2238,7 +2236,6 @@ fn normalize_runtime_result(
 
 fn compile_ir_function(
     codegen: &mut CodeGen,
-    func_id: FuncId,
     func_name: &str,
     func_retkind: &str,
     param_names: &[String],
@@ -2273,17 +2270,13 @@ fn compile_ir_function(
     // Map param names to block params
     let block_params: Vec<Value> = builder.block_params(entry_block).to_vec();
     let mut regs: HashMap<usize, Value> = HashMap::new();
-    let mut string_regs: HashSet<usize> = HashSet::new();
+    let mut kinds = RegKinds::default();
+    // the named variables that hold a string or a float; a store copies its
+    // register's kind here and a load copies it back
     let mut string_vars: HashSet<String> = HashSet::new();
+    let mut float_vars: HashSet<String> = HashSet::new();
     // the values that hold the address of a string literal
     let mut literal_values: HashSet<Value> = HashSet::new();
-    let mut bytes_regs: HashSet<usize> = HashSet::new();
-    let mut bytes_vars: HashSet<String> = HashSet::new();
-    let mut float_regs: HashSet<usize> = HashSet::new();
-    let mut float_vars: HashSet<String> = HashSet::new();
-    let mut reg_source_vars: HashMap<usize, String> = HashMap::new();
-    let mut struct_regs: HashMap<usize, String> = HashMap::new();
-    let mut struct_vars: HashMap<String, String> = HashMap::new();
     let mut named_vars: HashMap<String, Variable> = HashMap::new();
     let mut labels: HashMap<String, Block> = HashMap::new();
     // labels already emitted, in stream order, as we walk the instructions. a
@@ -2458,12 +2451,6 @@ fn compile_ir_function(
     let inline_opt_regs = scan_unpackable_opt_regs(body_lines);
     let mut virtual_opts: HashMap<usize, (Value, Value)> = HashMap::new();
 
-    // Older emitters briefly lowered `break` in `while true` loops through an
-    // extra join label. The current self-hosted emitter already jumps straight
-    // to the loop exit, so redirecting labels here now corrupts valid nested
-    // `if`/`result` joins into early loop exits.
-    let break_redirects: HashMap<String, String> = HashMap::new();
-
     // Compile instructions
     let mut terminated = false;
     for line in body_lines {
@@ -2495,11 +2482,7 @@ fn compile_ir_function(
                 let val = parse_i64_operand(parts[2], "integer constant", line, func_name)?;
                 let v = builder.ins().iconst(types::I64, val);
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             "fconst" if parts.len() >= 3 => {
@@ -2516,11 +2499,7 @@ fn compile_ir_function(
                         .ins()
                         .bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                float_regs.insert(reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
+                kinds.set(reg, "float");
             }
 
             "strref" if parts.len() >= 3 => {
@@ -2536,11 +2515,7 @@ fn compile_ir_function(
                     // resolves at link time, so a miss here is not malformed ir.
                     regs.insert(reg, builder.ins().iconst(types::I64, 0));
                 }
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.insert(reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.set(reg, "string");
             }
 
             "band" | "bor" | "bxor" | "shl" | "shr" if parts.len() >= 4 => {
@@ -2561,11 +2536,7 @@ fn compile_ir_function(
                     }
                 };
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             "bnot" if parts.len() >= 3 => {
@@ -2573,11 +2544,7 @@ fn compile_ir_function(
                 let a = get_reg(&regs, parts[2])?;
                 let v = builder.ins().bnot(a);
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             "and" | "or" if parts.len() >= 4 => {
@@ -2595,11 +2562,7 @@ fn compile_ir_function(
                     }
                 };
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             "fadd" | "fsub" | "fmul" | "fdiv" if parts.len() >= 4 => {
@@ -2633,27 +2596,19 @@ fn compile_ir_function(
                         .ins()
                         .bitcast(types::I64, cranelift::codegen::ir::MemFlags::new(), fv);
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                float_regs.insert(reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
+                kinds.set(reg, "float");
             }
 
             "add" | "sub" | "mul" | "div" | "mod" if parts.len() >= 4 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
-                let a_reg = parts[2].parse::<usize>().ok();
-                let b_reg = parts[3].parse::<usize>().ok();
                 let a = get_reg(&regs, parts[2])?;
                 let b = get_reg(&regs, parts[3])?;
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
                 // If `add` has a string operand, treat as concat (IR emitter
                 // sometimes emits `add` instead of `concat` when variable types
                 // aren't tracked across function boundaries)
                 if parts[0] == "add"
-                    && a_reg.is_some_and(|r| string_regs.contains(&r))
-                    && b_reg.is_some_and(|r| string_regs.contains(&r))
+                    && kinds.is_string(parts[2])
+                    && kinds.is_string(parts[3])
                 {
                     if let Some(&concat_id) = runtime_funcs.get("pith_concat_cstr") {
                         let concat_ref = *func_ref_cache.entry(concat_id).or_insert_with(|| {
@@ -2668,13 +2623,10 @@ fn compile_ir_function(
                     } else {
                         regs.insert(reg, builder.ins().iadd(a, b));
                     }
-                    string_regs.insert(reg);
-                    bytes_regs.remove(&reg);
-                    float_regs.remove(&reg);
+                    kinds.set(reg, "string");
                 // If operands are known floats, promote to float operation
                 } else if matches!(parts[0], "add" | "sub" | "mul" | "div")
-                    && (a_reg.is_some_and(|r| float_regs.contains(&r))
-                        || b_reg.is_some_and(|r| float_regs.contains(&r)))
+                    && (kinds.is_float(parts[2]) || kinds.is_float(parts[3]))
                 {
                     let fa = builder.ins().bitcast(
                         types::F64,
@@ -2704,9 +2656,7 @@ fn compile_ir_function(
                         fv,
                     );
                     regs.insert(reg, v);
-                    float_regs.insert(reg);
-                    string_regs.remove(&reg);
-                    bytes_regs.remove(&reg);
+                    kinds.set(reg, "float");
                 } else {
                     let v = match parts[0] {
                         "add" => builder.ins().iadd(a, b),
@@ -2729,24 +2679,17 @@ fn compile_ir_function(
                         }
                     };
                     regs.insert(reg, v);
-                    string_regs.remove(&reg);
-                    bytes_regs.remove(&reg);
-                    float_regs.remove(&reg);
+                    kinds.clear(reg);
                 }
             }
 
             "eq" | "neq" | "lt" | "gt" | "lte" | "gte" if parts.len() >= 4 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
-                let a_reg = parts[2].parse::<usize>().ok();
-                let b_reg = parts[3].parse::<usize>().ok();
                 let a = get_reg(&regs, parts[2])?;
                 let b = get_reg(&regs, parts[3])?;
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
                 // For lt/gt/lte/gte on strings, call runtime comparison
                 let is_str_cmp = matches!(parts[0], "lt" | "gt" | "lte" | "gte")
-                    && (a_reg.is_some_and(|r| string_regs.contains(&r))
-                        || b_reg.is_some_and(|r| string_regs.contains(&r)));
+                    && (kinds.is_string(parts[2]) || kinds.is_string(parts[3]));
                 if is_str_cmp {
                     let cmp_name = match parts[0] {
                         "lt" => "pith_cstring_lt",
@@ -2765,9 +2708,7 @@ fn compile_ir_function(
                         let cmp = builder.ins().icmp(IntCC::SignedLessThan, a, b);
                         regs.insert(reg, builder.ins().uextend(types::I64, cmp));
                     }
-                } else if a_reg.is_some_and(|r| float_regs.contains(&r))
-                    || b_reg.is_some_and(|r| float_regs.contains(&r))
-                {
+                } else if kinds.is_float(parts[2]) || kinds.is_float(parts[3]) {
                     // Float comparison
                     let fa = builder.ins().bitcast(
                         types::F64,
@@ -2806,9 +2747,7 @@ fn compile_ir_function(
                     let v = builder.ins().uextend(types::I64, cmp);
                     regs.insert(reg, v);
                 }
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             // `concatn dst count part...`, made by fuse_concat_chains: one
@@ -2861,11 +2800,7 @@ fn compile_ir_function(
                     acc = Some(joined);
                 };
                 regs.insert(reg, joined);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.insert(reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.set(reg, "string");
             }
 
             // `appendn dst count base part...`, made by fuse_self_appends: the
@@ -2898,23 +2833,13 @@ fn compile_ir_function(
                     acc = builder.func.dfg.first_result(call);
                 }
                 regs.insert(reg, acc);
-                reg_source_vars.remove(&reg);
-                note_loaded_kind(
-                    reg,
-                    Some("string"),
-                    &mut string_regs,
-                    &mut bytes_regs,
-                    &mut float_regs,
-                    &mut struct_regs,
-                );
+                kinds.set(reg, "string");
             }
 
             "concat" if parts.len() >= 4 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
                 let a = get_reg(&regs, parts[2])?;
                 let b = get_reg(&regs, parts[3])?;
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
                 if let Some(&concat_id) = runtime_funcs.get("pith_concat_cstr") {
                     let concat_ref = *func_ref_cache.entry(concat_id).or_insert_with(|| {
                         codegen.module.declare_func_in_func(concat_id, builder.func)
@@ -2922,16 +2847,13 @@ fn compile_ir_function(
                     let call = builder.ins().call(concat_ref, &[a, b]);
                     if !builder.func.dfg.inst_results(call).is_empty() {
                         regs.insert(reg, builder.func.dfg.first_result(call));
-                        string_regs.insert(reg);
                     } else {
                         regs.insert(reg, a);
                     }
                 } else {
                     regs.insert(reg, a);
                 }
-                string_regs.insert(reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.set(reg, "string");
             }
 
             // Register result ABI call: `rcall flag_reg val_reg fname payload_kind nargs args...`
@@ -3003,7 +2925,6 @@ fn compile_ir_function(
                 let payload_is_f64 = builder.func.dfg.value_type(payload_v) == types::F64;
                 if payload_kind == "float" && !payload_is_f64 {
                     regs.insert(val_reg, payload_v);
-                    float_regs.insert(val_reg);
                 } else if payload_kind == "float" {
                     let cast = builder.ins().bitcast(
                         types::I64,
@@ -3011,36 +2932,13 @@ fn compile_ir_function(
                         payload_v,
                     );
                     regs.insert(val_reg, cast);
-                    float_regs.insert(val_reg);
                 } else {
                     let zero2 = builder.ins().iconst(types::I64, 0);
                     let payload_norm = builder.ins().iadd(payload_v, zero2);
                     regs.insert(val_reg, payload_norm);
-                    float_regs.remove(&val_reg);
                 }
-                // Tag the payload register so downstream field/RC handling knows
-                // whether the ok value is a string, bytes, or struct handle.
-                struct_regs.remove(&flag_reg);
-                string_regs.remove(&flag_reg);
-                bytes_regs.remove(&flag_reg);
-                float_regs.remove(&flag_reg);
-                if payload_kind == "string" {
-                    string_regs.insert(val_reg);
-                } else {
-                    string_regs.remove(&val_reg);
-                }
-                if payload_kind == "bytes" {
-                    bytes_regs.insert(val_reg);
-                } else {
-                    bytes_regs.remove(&val_reg);
-                }
-                if let Some(struct_name) = explicit_struct_name_from_retkind(payload_kind) {
-                    struct_regs.insert(val_reg, struct_name.to_string());
-                } else {
-                    struct_regs.remove(&val_reg);
-                }
-                reg_source_vars.remove(&flag_reg);
-                reg_source_vars.remove(&val_reg);
+                kinds.clear(flag_reg);
+                kinds.set(val_reg, payload_kind);
             }
 
             "call" if parts.len() >= 4 => {
@@ -3052,8 +2950,6 @@ fn compile_ir_function(
                             func_name, line
                         ))
                     })?;
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
 
                 // Struct constructor: call REG StructName N args...
                 // If fname is a known struct, emit __struct_alloc + sstore
@@ -3083,16 +2979,10 @@ fn compile_ir_function(
                             );
                         }
                         regs.insert(reg, ptr);
-                        struct_regs.insert(reg, fname.to_string());
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
+                        kinds.clear(reg);
                     } else {
                         regs.insert(reg, builder.ins().iconst(types::I64, 0));
-                        struct_regs.remove(&reg);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
+                        kinds.clear(reg);
                     }
                 } else {
                     // an indexed read whose Optional tuple never escapes: no
@@ -3110,9 +3000,7 @@ fn compile_ir_function(
                         // deliberately not in regs: a use the pre-scan missed
                         // must fail loudly, not read a stale value.
                         regs.remove(&reg);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     // a getter's optional that never escapes: call its pair
@@ -3139,9 +3027,7 @@ fn compile_ir_function(
                             };
                             virtual_opts.insert(reg, (flag, value));
                             regs.remove(&reg);
-                            string_regs.remove(&reg);
-                            bytes_regs.remove(&reg);
-                            float_regs.remove(&reg);
+                            kinds.clear(reg);
                             continue;
                         }
                     }
@@ -3163,7 +3049,7 @@ fn compile_ir_function(
                         && parts.len() > arg_start
                     {
                         if let Ok(arg_reg) = parts[arg_start].parse::<usize>() {
-                            if string_regs.contains(&arg_reg) {
+                            if kinds.strings.contains(&arg_reg) {
                                 fname = "char_at";
                             }
                         }
@@ -3198,10 +3084,7 @@ fn compile_ir_function(
                     {
                         let zero = builder.ins().iconst(types::I64, 0);
                         regs.insert(reg, zero);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
 
@@ -3219,10 +3102,7 @@ fn compile_ir_function(
                         if let Some(op) = alias_op {
                             let v = emit_bits_op(&mut builder, op, args[0], args[1]);
                             regs.insert(reg, v);
-                            string_regs.remove(&reg);
-                            bytes_regs.remove(&reg);
-                            float_regs.remove(&reg);
-                            struct_regs.remove(&reg);
+                            kinds.clear(reg);
                             continue;
                         }
                     }
@@ -3255,10 +3135,7 @@ fn compile_ir_function(
                         );
                         let zero = builder.ins().iconst(types::I64, 0);
                         regs.insert(reg, zero);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     // a field store's write barrier: only a holder that is
@@ -3285,10 +3162,7 @@ fn compile_ir_function(
                         builder.switch_to_block(done);
                         let zero = builder.ins().iconst(types::I64, 0);
                         regs.insert(reg, zero);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     if fname == "pith_closure_get_env" && args.len() == 2 && !name_is_shadowed {
@@ -3302,10 +3176,7 @@ fn compile_ir_function(
                         let inlined =
                             inline_closure_get_env(&mut builder, args[0], args[1], fallback);
                         regs.insert(reg, inlined);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     if fname == "pith_closure_set_env" && args.len() == 3 && !name_is_shadowed {
@@ -3319,19 +3190,13 @@ fn compile_ir_function(
                         inline_closure_set_env(&mut builder, args[0], args[1], args[2], fallback);
                         let zero = builder.ins().iconst(types::I64, 0);
                         regs.insert(reg, zero);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     if fname == "bytes_get" && args.len() == 2 && !name_is_shadowed {
                         let inlined = inline_bytes_get(&mut builder, args[0], args[1]);
                         regs.insert(reg, inlined);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     // `bytes[i]`: the same fast path, with the runtime's
@@ -3348,10 +3213,7 @@ fn compile_ir_function(
                         let inlined =
                             inline_bytes_get_strict(&mut builder, args[0], args[1], fallback);
                         regs.insert(reg, inlined);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     if fname == "bytes_read_word" && args.len() == 3 && !name_is_shadowed {
@@ -3370,10 +3232,7 @@ fn compile_ir_function(
                             fallback,
                         );
                         regs.insert(reg, inlined);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     // string indexing and length: inline the heap-cstring fast
@@ -3403,10 +3262,7 @@ fn compile_ir_function(
                         let inlined =
                             inline_cstring_byte_at(&mut builder, args[0], args[1], fallback, anchor);
                         regs.insert(reg, inlined);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     if (fname == "bytes_len" || fname == "pith_list_len")
@@ -3434,10 +3290,7 @@ fn compile_ir_function(
                             inline_list_len(&mut builder, args[0], fallback)
                         };
                         regs.insert(reg, inlined);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     if fname == "string_len" && args.len() == 1 {
@@ -3450,10 +3303,7 @@ fn compile_ir_function(
                         )?;
                         let inlined = inline_cstring_len(&mut builder, args[0], fallback);
                         regs.insert(reg, inlined);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        struct_regs.remove(&reg);
+                        kinds.clear(reg);
                         continue;
                     }
                     // `xs[i]`: inline the in-bounds read and leave every
@@ -3488,26 +3338,7 @@ fn compile_ir_function(
                             anchor,
                         );
                         regs.insert(reg, inlined);
-                        if retkind == "string" {
-                            string_regs.insert(reg);
-                        } else {
-                            string_regs.remove(&reg);
-                        }
-                        if retkind == "bytes" {
-                            bytes_regs.insert(reg);
-                        } else {
-                            bytes_regs.remove(&reg);
-                        }
-                        if retkind == "float" {
-                            float_regs.insert(reg);
-                        } else {
-                            float_regs.remove(&reg);
-                        }
-                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                            struct_regs.insert(reg, struct_name.to_string());
-                        } else {
-                            struct_regs.remove(&reg);
-                        }
+                        kinds.set(reg, retkind);
                         continue;
                     }
                     if (fname == "pith_list_get_value" || fname == "pith_list_get_value_unchecked")
@@ -3520,17 +3351,10 @@ fn compile_ir_function(
                             fname == "pith_list_get_value",
                         );
                         regs.insert(reg, inlined);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
-                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                            struct_regs.insert(reg, struct_name.to_string());
-                        } else {
-                            struct_regs.remove(&reg);
-                        }
+                        kinds.clear(reg);
                         continue;
                     }
-    // Look up function: user-defined first, then a direct runtime
+                    // Look up function: user-defined first, then a direct runtime
                     // import key. A local variable shadows both — the checker
                     // guarantees a called local is closure-typed, and a bare
                     // runtime name like `second` must not capture a call to a
@@ -3639,25 +3463,9 @@ fn compile_ir_function(
                             }
                             regs.insert(reg, builder.ins().iconst(types::I64, 0));
                         }
-                        if retkind == "string" {
-                            string_regs.insert(reg);
-                        } else {
-                            string_regs.remove(&reg);
-                        }
-                        if retkind == "bytes" {
-                            bytes_regs.insert(reg);
-                        } else {
-                            bytes_regs.remove(&reg);
-                        }
-                        if retkind == "float" || returns_float {
-                            float_regs.insert(reg);
-                        } else {
-                            float_regs.remove(&reg);
-                        }
-                        if let Some(struct_name) = explicit_struct_name_from_retkind(retkind) {
-                            struct_regs.insert(reg, struct_name.to_string());
-                        } else {
-                            struct_regs.remove(&reg);
+                        kinds.set(reg, retkind);
+                        if returns_float {
+                            kinds.floats.insert(reg);
                         }
                     } else if let Some(&var) = named_vars.get(fname) {
                         // Indirect call through closure handle variable
@@ -3680,10 +3488,7 @@ fn compile_ir_function(
                         indirect_args.extend(args.iter().copied());
                         let call = builder.ins().call_indirect(sig_ref, fn_ptr, &indirect_args);
                         regs.insert(reg, builder.func.dfg.first_result(call));
-                        struct_regs.remove(&reg);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
+                        kinds.clear(reg);
                     } else if let Some(&data_id) = global_data.get(fname) {
                         // a module-level global holding a closure value,
                         // called by name. the checker only allows calling a
@@ -3717,10 +3522,7 @@ fn compile_ir_function(
                         indirect_args.extend(args.iter().copied());
                         let call = builder.ins().call_indirect(sig_ref, fn_ptr, &indirect_args);
                         regs.insert(reg, builder.func.dfg.first_result(call));
-                        struct_regs.remove(&reg);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
+                        kinds.clear(reg);
                     } else if runtime_funcs.contains_key("pith_runtime_error") {
                         // a call that resolves to nothing is a compiler bug
                         // upstream (a phantom import, a missed rename, an
@@ -3736,10 +3538,7 @@ fn compile_ir_function(
                             5,
                         )?;
                         regs.insert(reg, result);
-                        struct_regs.remove(&reg);
-                        string_regs.remove(&reg);
-                        bytes_regs.remove(&reg);
-                        float_regs.remove(&reg);
+                        kinds.clear(reg);
                     } else {
                         // no runtime registered (unit-test harness): keep the
                         // strict answer.
@@ -3756,22 +3555,12 @@ fn compile_ir_function(
                 let val = get_reg(&regs, parts[2])?;
                 // Propagate types through store
                 if let Ok(src_reg) = parts[2].parse::<usize>() {
-                    if let Some(struct_name) = struct_regs.get(&src_reg) {
-                        struct_vars.insert(name.clone(), struct_name.clone());
-                    } else {
-                        struct_vars.remove(&name);
-                    }
-                    if string_regs.contains(&src_reg) {
+                    if kinds.strings.contains(&src_reg) {
                         string_vars.insert(name.clone());
                     } else {
                         string_vars.remove(&name);
                     }
-                    if bytes_regs.contains(&src_reg) {
-                        bytes_vars.insert(name.clone());
-                    } else {
-                        bytes_vars.remove(&name);
-                    }
-                    if float_regs.contains(&src_reg) {
+                    if kinds.floats.contains(&src_reg) {
                         float_vars.insert(name.clone());
                     } else {
                         float_vars.remove(&name);
@@ -3802,14 +3591,6 @@ fn compile_ir_function(
             "load" if parts.len() >= 3 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
                 let name = parts[2];
-                reg_source_vars.insert(reg, name.to_string());
-                if let Some(struct_name) = struct_vars.get(name) {
-                    struct_regs.insert(reg, struct_name.clone());
-                } else if struct_layouts.contains_key(name) {
-                    struct_regs.insert(reg, name.to_string());
-                } else {
-                    struct_regs.remove(&reg);
-                }
                 // Check if this is a global variable
                 if let Some(&data_id) = global_data.get(name) {
                     let gv = codegen.module.declare_data_in_func(data_id, builder.func);
@@ -3833,20 +3614,12 @@ fn compile_ir_function(
                     )));
                 }
                 // Propagate types through load
+                kinds.clear(reg);
                 if string_vars.contains(name) || string_global_names.contains(name) {
-                    string_regs.insert(reg);
-                } else {
-                    string_regs.remove(&reg);
-                }
-                if bytes_vars.contains(name) {
-                    bytes_regs.insert(reg);
-                } else {
-                    bytes_regs.remove(&reg);
+                    kinds.strings.insert(reg);
                 }
                 if float_vars.contains(name) {
-                    float_regs.insert(reg);
-                } else {
-                    float_regs.remove(&reg);
+                    kinds.floats.insert(reg);
                 }
             }
 
@@ -3863,15 +3636,7 @@ fn compile_ir_function(
                     builder.ins().uextend(types::I64, is_some)
                 };
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                note_loaded_kind(
-                    reg,
-                    None,
-                    &mut string_regs,
-                    &mut bytes_regs,
-                    &mut float_regs,
-                    &mut struct_regs,
-                );
+                kinds.clear(reg);
             }
 
             // `optval R OPT KIND NAME`: the payload of the optional OPT, or 0
@@ -3899,15 +3664,7 @@ fn compile_ir_function(
                     builder.block_params(done)[0]
                 };
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                note_loaded_kind(
-                    reg,
-                    Some(parts[3]),
-                    &mut string_regs,
-                    &mut bytes_regs,
-                    &mut float_regs,
-                    &mut struct_regs,
-                );
+                kinds.set(reg, parts[3]);
             }
 
             "field" if parts.len() >= 4 => {
@@ -3929,26 +3686,19 @@ fn compile_ir_function(
                             }
                         };
                         regs.insert(reg, v);
-                        reg_source_vars.remove(&reg);
-                        note_loaded_kind(
-                            reg,
-                            parts.get(4).copied().filter(|_| parts.len() >= 6),
-                            &mut string_regs,
-                            &mut bytes_regs,
-                            &mut float_regs,
-                            &mut struct_regs,
-                        );
+                        let kind = if parts.len() >= 6 { parts[4] } else { "" };
+                        kinds.set(reg, kind);
                         continue;
                     }
                 }
                 let obj = get_reg(&regs, parts[2])?;
-                let (offset, field_retkind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok()
+                let (offset, field_kind) = if parts.len() >= 6 && parts[3].parse::<i32>().is_ok()
                 {
-                    (parts[3].parse::<i32>().unwrap_or(0), Some(parts[4]))
+                    (parts[3].parse::<i32>().unwrap_or(0), parts[4])
                 } else if parts.len() == 4 {
                     let field_name = parts[3];
                     if let Ok(idx) = field_name.parse::<usize>() {
-                        ((idx * 8) as i32, None)
+                        ((idx * 8) as i32, "")
                     } else {
                         return Err(CompileError::ModuleError(format!(
                             "ir consumer: field instruction requires an explicit offset in {}: {}",
@@ -3970,15 +3720,7 @@ fn compile_ir_function(
                 let zero = builder.ins().iconst(types::I64, 0);
                 let v = builder.ins().iadd(raw, zero);
                 regs.insert(reg, v);
-                reg_source_vars.remove(&reg);
-                note_loaded_kind(
-                    reg,
-                    field_retkind,
-                    &mut string_regs,
-                    &mut bytes_regs,
-                    &mut float_regs,
-                    &mut struct_regs,
-                );
+                kinds.set(reg, field_kind);
             }
 
             "funcref" if parts.len() >= 3 => {
@@ -3996,11 +3738,7 @@ fn compile_ir_function(
                         fname, func_name
                     )));
                 }
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             "closure_ref" if parts.len() >= 3 => {
@@ -4029,11 +3767,7 @@ fn compile_ir_function(
                         fname, func_name
                     )));
                 }
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             // a closure the emitter proved never outlives this frame: the same
@@ -4073,11 +3807,7 @@ fn compile_ir_function(
                 builder.ins().store(flags, zero8, at, CLOSURE_CYCLE_FLAGS_OFFSET);
                 builder.ins().store(flags, zero, at, CLOSURE_OVERFLOW_OFFSET);
                 regs.insert(reg, at);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             // a result box the emitter proved only its own function reads
@@ -4113,11 +3843,7 @@ fn compile_ir_function(
                 builder.ins().store(flags, zero, base, STRUCT_DTOR_OFFSET);
                 let at = builder.ins().iadd_imm(base, header as i64);
                 regs.insert(reg, at);
-                reg_source_vars.remove(&reg);
-                struct_regs.remove(&reg);
-                string_regs.remove(&reg);
-                bytes_regs.remove(&reg);
-                float_regs.remove(&reg);
+                kinds.clear(reg);
             }
 
             "sstore" if parts.len() >= 4 => {
@@ -4212,18 +3938,13 @@ fn compile_ir_function(
 
             "jmp" if parts.len() >= 2 => {
                 let target = parts[1];
-                // Redirect break targets that incorrectly loop back
-                let actual_target = break_redirects
-                    .get(target)
-                    .map(|s| s.as_str())
-                    .unwrap_or(target);
                 // a jump back to an already-defined label is a loop back-edge
                 // (`while`/`for`/`loop` tail, or `continue`). insert the
                 // preemption safe-point before the jump (only when this build
                 // opted into preemption). forward jumps (if/else merges, `break`)
                 // target not-yet-defined labels and are skipped either way.
                 if let Some(flag) = preempt_flag {
-                    if defined_labels.contains(actual_target) {
+                    if defined_labels.contains(target) {
                         emit_preempt_safepoint(
                             codegen,
                             &mut builder,
@@ -4233,7 +3954,7 @@ fn compile_ir_function(
                         )?;
                     }
                 }
-                let block = get_label(&labels, actual_target, func_name)?;
+                let block = get_label(&labels, target, func_name)?;
                 builder.ins().jump(block, &[]);
                 terminated = true;
             }
@@ -4280,7 +4001,6 @@ fn compile_ir_function(
     builder.seal_all_blocks();
     builder.finalize();
 
-    let _ = func_id;
     Ok(ctx.func)
 }
 
@@ -4377,42 +4097,48 @@ fn retkind_expects_a_value(retkind: &str) -> bool {
     retkind != "void" && retkind != "unknown"
 }
 
-fn explicit_struct_name_from_retkind(retkind: &str) -> Option<&str> {
-    if let Some(name) = retkind.strip_prefix("struct:") {
-        return Some(name);
-    }
-    None
+/// The registers known to hold a string or a float. The IR is untyped, and
+/// these two kinds change how an instruction lowers: a string operand turns
+/// `add` into a concatenation and an ordered compare into a runtime string
+/// compare, and a float operand (held as its i64 bit pattern) turns
+/// arithmetic and compares into their float forms. Every other value is a
+/// plain i64.
+#[derive(Default)]
+struct RegKinds {
+    strings: HashSet<usize>,
+    floats: HashSet<usize>,
 }
 
-// record what a loaded register holds, from the kind token a field-style
-// instruction carries; None (no token) clears every kind.
-fn note_loaded_kind(
-    reg: usize,
-    retkind: Option<&str>,
-    string_regs: &mut HashSet<usize>,
-    bytes_regs: &mut HashSet<usize>,
-    float_regs: &mut HashSet<usize>,
-    struct_regs: &mut HashMap<usize, String>,
-) {
-    let kind = retkind.unwrap_or("");
-    for (set, wanted) in [
-        (string_regs, "string"),
-        (bytes_regs, "bytes"),
-        (float_regs, "float"),
-    ] {
-        if kind == wanted {
-            set.insert(reg);
-        } else {
-            set.remove(&reg);
+impl RegKinds {
+    /// `reg` now holds a plain i64.
+    fn clear(&mut self, reg: usize) {
+        self.strings.remove(&reg);
+        self.floats.remove(&reg);
+    }
+
+    /// `reg` now holds a value of `kind`, a retkind or field-kind token such
+    /// as `string`, `float` or `struct:Name`; any other token clears it.
+    fn set(&mut self, reg: usize, kind: &str) {
+        self.clear(reg);
+        match kind {
+            "string" => {
+                self.strings.insert(reg);
+            }
+            "float" => {
+                self.floats.insert(reg);
+            }
+            _ => {}
         }
     }
-    match explicit_struct_name_from_retkind(kind) {
-        Some(name) => {
-            struct_regs.insert(reg, name.to_string());
-        }
-        None => {
-            struct_regs.remove(&reg);
-        }
+
+    /// Whether the register an operand token names holds a string.
+    fn is_string(&self, operand: &str) -> bool {
+        operand.parse::<usize>().is_ok_and(|r| self.strings.contains(&r))
+    }
+
+    /// Whether the register an operand token names holds a float.
+    fn is_float(&self, operand: &str) -> bool {
+        operand.parse::<usize>().is_ok_and(|r| self.floats.contains(&r))
     }
 }
 
@@ -4698,17 +4424,6 @@ mod tests {
             parse_call_shape(&imported_struct),
             Some(("advance_token", "struct:Token", 0, 5))
         );
-    }
-
-    #[test]
-    fn explicit_struct_name_from_retkind_requires_struct_prefix() {
-        assert_eq!(
-            explicit_struct_name_from_retkind("struct:Token"),
-            Some("Token")
-        );
-        assert_eq!(explicit_struct_name_from_retkind("Token"), None);
-        assert_eq!(explicit_struct_name_from_retkind("string"), None);
-        assert_eq!(explicit_struct_name_from_retkind("unknown"), None);
     }
 
     fn compile_err_for_ir(ir: &str) -> String {

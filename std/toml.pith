@@ -320,31 +320,6 @@ fn is_number_char(c: String) -> Bool:
         return true
     return false
 
-# Parses an integer from a string manually. Sets parser_error on overflow
-# instead of silently wrapping to a meaningless value.
-fn parse_integer_manual(s: String) -> Int:
-    mut val := 0
-    mut neg := false
-    mut i := 0
-    if s.len() > 0 and s[0] == "-":
-        neg = true
-        i = 1
-    if s.len() > 0 and s[0] == "+":
-        i = 1
-    while i < s.len():
-        c := s[i]
-        if c >= "0" and c <= "9":
-            digit := ord(c) - 48
-            if val > 922337203685477580 / 10:
-                parser_error = true
-                return 0
-            val = val * 10 + digit
-        i = i + 1
-    if neg:
-        return 0 - val
-    return val
-
-# Parses a float from a string manually
 fn parse_float_manual(s: String) -> Float:
     # split on decimal point, compute integer + fractional parts
     mut int_part := 0
@@ -483,8 +458,11 @@ fn parse_value_node() -> Int:
             float_values.insert(idx, parse_float_manual(num_str))
             return idx
         if not is_float:
+            parsed := parse_int(num_str.replace("_", "")) catch:
+                parser_error = true
+                return 0 - 1
             idx := allocate_node("int")
-            integer_values.insert(idx, parse_integer_manual(num_str))
+            integer_values.insert(idx, parsed)
             return idx
 
     parser_error = true
@@ -1188,3 +1166,10 @@ test "the scalar scanner and the tree parser agree on a flat document":
     assert_eq(cfg.require_string("host")!, require_string(root, "host")!)
     assert_eq(cfg.require_int("port")!, require_int(root, "port")!)
     assert_eq(cfg.require_bool("debug")!, require_bool(root, "debug")!)
+
+test "toml integers cover the full Int range and reject overflow":
+    root := parse("big = 1_000_000_000_000_000_000\nmax = 9223372036854775807\nmin = -9223372036854775808\n")
+    assert_eq(get_int(root, "big"), 1000000000000000000)
+    assert_eq(get_int(root, "max"), 9223372036854775807)
+    assert_eq(get_int(root, "min"), 0 - 9223372036854775807 - 1)
+    assert_eq(parse("over = 9223372036854775808\n"), 0 - 1)

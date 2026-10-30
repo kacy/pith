@@ -2,20 +2,19 @@
 //!
 //! the real reactor (`netpoll`) is built on `epoll` and `eventfd`, which are
 //! linux-only. this module presents the same entry points so `network.rs` and
-//! the green scheduler stay platform-agnostic — `lib.rs` picks one or the other
+//! the green scheduler stay platform-agnostic; `lib.rs` picks one or the other
 //! at compile time.
 //!
 //! the tradeoff: there is no reactor here, so a green task that waits on a
-//! socket blocks its worker OS thread on `poll` for the duration of the wait,
-//! exactly as every green task did before the reactor landed. correctness is
-//! unaffected — `wait_io` honors the same tri-state contract, and reads and
-//! writes still make progress — but a worker running several green tasks will
-//! stall the rest of them while one waits on i/o.
+//! socket blocks its worker OS thread on `poll` for the duration of the wait.
+//! correctness is unaffected (`wait_io` honors the same tri-state contract,
+//! and reads and writes still make progress), but a worker running several
+//! green tasks will stall the rest of them while one waits on i/o.
 //!
 //! that makes this good enough for local development on a mac and wrong for
 //! serving load, and it is why green is only the *default* backend on linux
 //! (see `concurrency::scheduler`). `PITH_GREEN=1` still turns it on here for
-//! anyone who wants it. the fix is a kqueue reactor behind these same two
+//! anyone who wants it. the fix is a kqueue reactor behind these same
 //! functions; until then, ship green-thread workloads on linux.
 
 use crate::concurrency::green;
@@ -75,7 +74,7 @@ pub(crate) fn idle_wait(index: usize, timeout: Duration) -> bool {
 /// detected. returns the tri-state readiness contract: `1` ready, `0`
 /// timed out, `-1` error.
 ///
-/// `task` is the caller's green slab id, unused here: with no reactor there is
+/// `task` is the caller's green task id, unused here: with no reactor there is
 /// nobody to hand the task to, so we park the worker on `poll` instead of
 /// suspending the coroutine. `live` is asked after the wait, as the linux
 /// `poll` branch asks it: a handle closed while the wait was inside reports an
@@ -95,9 +94,9 @@ pub(crate) fn wait_io(
     ready
 }
 
-/// sleep for `ms` milliseconds. `task` is the caller's green slab id, unused
+/// sleep for `ms` milliseconds. `task` is the caller's green task id, unused
 /// here: with no reactor there is no timer heap to park the task on, so the
-/// worker OS thread blocks for the duration — the same degradation socket
+/// worker OS thread blocks for the duration, the same degradation socket
 /// waits take on this platform (see the module comment). a zero or negative
 /// duration returns immediately, matching the linux reactor's contract.
 pub(crate) fn sleep_task(ms: i64, _task: usize) {

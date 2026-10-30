@@ -20,12 +20,9 @@ from std.io import TcpStream
 
 # the config registry: a config is a plain Int handle, and everything it holds
 # lives in these handle-keyed maps. handle allocators come first. valid handles
-# are non-negative (error paths fail with a
-# Result, they don't hand back a config); the two ranges are kept apart — configs
-# from 0, connections from a high base — so a handle reads unambiguously in a
-# trace. they count up so every handle stays non-negative. (these start values
-# used to be negative literals that a module-const compiler bug silently zeroed,
-# which is why the first handle landed at 0; now the intended values are honored.)
+# are non-negative (error paths fail with a Result rather than hand back a
+# config). the two ranges are kept apart, configs from 0 and connections from a
+# high base, so a handle reads unambiguously in a trace.
 mut next_native_config_handle := 0
 mut next_native_conn_handle := AtomicInt(1000000)
 mut native_config_roots_pem: Map[Int, String] := {}
@@ -128,10 +125,8 @@ fn next_config_handle() -> Int:
 # or a status endpoint and watch the rate. see server_handshake_failures().
 mut server_handshake_failure_count := AtomicInt(0)
 
-# per-connection tls state was 12 module-global maps keyed by conn handle,
-# raced by two connections doing i/o at once. it now lives in one
-# NativeConnState struct in a single mutex-guarded map (defined just after
-# ConnectionState below).
+# per-connection tls state lives in one NativeConnState struct per connection,
+# in the sharded, lock-guarded map defined after ConnectionState below.
 TLS_CONTENT_CHANGE_CIPHER_SPEC := 20
 TLS_CONTENT_ALERT := 21
 TLS_CONTENT_HANDSHAKE := 22
@@ -607,18 +602,23 @@ fn config_offers_tls12(config: Config) -> Bool:
 fn config_max_is_tls12(config: Config) -> Bool:
     return config_get(native_config_require_tls12, config.handle, false)
 
-fn native_config_client_cert_chain(config: Config) -> List[Bytes]!:
-    cert_pem := config_get(native_client_cert_pem, config.handle, "")
-    if cert_pem == "":
-        fail "native tls client certificate not found"
+# the der of every CERTIFICATE block in `cert_pem`, in order (leaf first).
+# `empty_message` is the failure when there are none.
+fn certificate_ders_from_pem(cert_pem: String, empty_message: String) -> List[Bytes]!:
     blocks := encoding.pem_decode_all(cert_pem)!
     certs: List[Bytes] := []
     for block in blocks:
         if block.kind == "CERTIFICATE":
             certs.push(block.body)
     if certs.len() == 0:
-        fail "tls client certificate chain is empty"
+        fail empty_message
     return certs
+
+fn native_config_client_cert_chain(config: Config) -> List[Bytes]!:
+    cert_pem := config_get(native_client_cert_pem, config.handle, "")
+    if cert_pem == "":
+        fail "native tls client certificate not found"
+    return certificate_ders_from_pem(cert_pem, "tls client certificate chain is empty")!
 
 fn native_client_private_key(config: Config) -> Bytes!:
     key := config_get(native_client_key_der, config.handle, bytes.empty())
@@ -645,14 +645,7 @@ fn native_server_certificate_chain(config: Config) -> List[Bytes]!:
     cert_pem := config_get(native_server_cert_pem, config.handle, "")
     if cert_pem == "":
         fail "native tls server config not found"
-    blocks := encoding.pem_decode_all(cert_pem)!
-    certs: List[Bytes] := []
-    for block in blocks:
-        if block.kind == "CERTIFICATE":
-            certs.push(block.body)
-    if certs.len() == 0:
-        fail "tls certificate chain is empty"
-    return certs
+    return certificate_ders_from_pem(cert_pem, "tls certificate chain is empty")!
 
 fn native_server_private_key(config: Config) -> Bytes!:
     key := config_get(native_server_key_der, config.handle, bytes.empty())
@@ -660,29 +653,25 @@ fn native_server_private_key(config: Config) -> Bytes!:
         fail "native tls server key not found"
     return key
 
-fn checked_read(result: Int!binary.BinaryError) -> Int!:
-    if result.is_err:
-        fail result.err.message
-    return result.ok
-
-fn checked_write(result: Int!binary.BinaryError) -> Int!:
+# turn a std.binary result into a plain failure carrying its message.
+fn checked_binary(result: Int!binary.BinaryError) -> Int!:
     if result.is_err:
         fail result.err.message
     return result.ok
 
 fn write_u8(out: ByteBuffer, value: Int) -> Bool!:
-    checked_write(binary.write_u8(out, value))!
+    checked_binary(binary.write_u8(out, value))!
     return true
 
 fn write_u16_be(out: ByteBuffer, value: Int) -> Bool!:
-    checked_write(binary.write_u16_be(out, value))!
+    checked_binary(binary.write_u16_be(out, value))!
     return true
 
 fn native_read_record(stream: TcpStream) -> tls13.Record!:
     header := stream.read_exact_bytes(5)!
     if header.len() != 5:
         fail "truncated tls record header"
-    length := checked_read(binary.read_u16_be_at(header, 3))!
+    length := checked_binary(binary.read_u16_be_at(header, 3))!
     # bound the record before reading its body so a hostile peer cannot make us
     # buffer up to 64 kib per record (rfc 8446 §5.2 caps ciphertext at 2^14+256).
     if length > tls13.MAX_CIPHERTEXT_RECORD:
@@ -739,6 +728,8 @@ pub fn cipher_suite_name(cipher: Int) -> String:
         return "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
     return "unknown"
 
+# the server's 1.3 cipher preference: the first of these the client offered,
+# or 0 when it offered none of them.
 fn select_cipher_from_list(offered: List[Int]) -> Int:
     if offered.contains(TLS_CIPHER_AES_128_GCM_SHA256):
         return TLS_CIPHER_AES_128_GCM_SHA256
@@ -749,13 +740,10 @@ fn select_cipher_from_list(offered: List[Int]) -> Int:
     return 0
 
 fn select_cipher(client: tls13.ClientHello) -> Int!:
-    if client.cipher_suites.contains(TLS_CIPHER_AES_128_GCM_SHA256):
-        return TLS_CIPHER_AES_128_GCM_SHA256
-    if client.cipher_suites.contains(TLS_CIPHER_AES_256_GCM_SHA384):
-        return TLS_CIPHER_AES_256_GCM_SHA384
-    if client.cipher_suites.contains(TLS_CIPHER_CHACHA20_POLY1305_SHA256):
-        return TLS_CIPHER_CHACHA20_POLY1305_SHA256
-    fail "client did not offer a supported tls cipher suite"
+    cipher := select_cipher_from_list(client.cipher_suites)
+    if cipher == 0:
+        fail "client did not offer a supported tls cipher suite"
+    return cipher
 
 fn open_record_for_cipher(cipher: Int, key: Bytes, iv: Bytes, sequence: Int, record: Bytes) -> tls13.Record!:
     if cipher == TLS_CIPHER_AES_128_GCM_SHA256:
@@ -1199,15 +1187,6 @@ fn send_fatal_alert(stream: TcpStream, description: Int) -> Int!:
     native_write_all(stream, tls13.encode_record(TLS_CONTENT_ALERT, payload.bytes())!)!
     return 0
 
-# read one record during the plaintext phase of a server handshake, answering a
-# malformed or oversized record with the matching fatal alert before failing.
-# the plain native_read_record below stays alert-free: it also serves
-# established connections, where a plaintext alert would be an injection.
-# seal a fatal alert with the sender's current traffic keys, for rejections
-# after this side's records have switched to an encrypted epoch — a plaintext
-# alert there would read as an injection to the peer. best-effort by contract,
-# like send_fatal_alert: callers discard a failed write with `catch 0` and let
-# the refusal already in flight stay the surfaced error.
 # Send a fatal alert, best-effort, and hand back the failure message: the
 # standard one-line refusal, `fail refuse_with(stream, alert, "why")`, usable
 # equally as the last statement of a catch block.
@@ -1228,6 +1207,11 @@ fn conn_refuse_with(cs: NativeConnState, alert: Int, message: String) -> String:
     send_conn_fatal_alert(cs, alert) catch 0
     return message
 
+# seal a fatal alert with the sender's current traffic keys, for rejections
+# after this side's records have switched to an encrypted epoch: a plaintext
+# alert there would read as an injection to the peer. best-effort by contract,
+# like send_fatal_alert: callers discard a failed write with `catch 0` and let
+# the refusal already in flight stay the surfaced error.
 fn send_fatal_alert_sealed(stream: TcpStream, version: Int, cipher: Int, key: Bytes, iv: Bytes, sequence: Int, description: Int) -> Int!:
     payload := bytes.buffer_with_capacity(2)
     defer payload.free()
@@ -1263,6 +1247,10 @@ fn write_plaintext_flight(stream: TcpStream, payload: Bytes) -> Int!:
         offset = chunk_end
     return 0
 
+# read one record during the plaintext phase of a handshake, answering a
+# malformed or oversized record with the matching fatal alert before failing.
+# native_read_record stays alert-free: it also serves established connections,
+# where a plaintext alert would be an injection.
 fn read_plaintext_handshake_record(stream: TcpStream) -> tls13.Record!:
     header := stream.read_exact_bytes(5)!
     if header.len() != 5:
@@ -1271,10 +1259,10 @@ fn read_plaintext_handshake_record(stream: TcpStream) -> tls13.Record!:
     # handshake record still carries a real tls version (0x03xx): the initial
     # ClientHello sends 0x0301 or 0x0303 (rfc 8446 §5.1), later plaintext 1.2
     # records 0x0303. a value outside 0x03xx is not a tls record at all.
-    record_version := checked_read(binary.read_u16_be_at(header, 1))!
+    record_version := checked_binary(binary.read_u16_be_at(header, 1))!
     if record_version < 768 or record_version > 1023:
         fail refuse_with(stream, ALERT_PROTOCOL_VERSION, "unexpected tls record version")
-    length := checked_read(binary.read_u16_be_at(header, 3))!
+    length := checked_binary(binary.read_u16_be_at(header, 3))!
     if length > tls13.MAX_CIPHERTEXT_RECORD:
         fail refuse_with(stream, ALERT_RECORD_OVERFLOW, "tls record overflow")
     payload := stream.read_exact_bytes(length)!
@@ -1295,12 +1283,14 @@ fn native_fail_alert(record: tls13.Record) -> Bool!:
         fail "tls alert " + tls13.alert_description_name(alert.ok.description)
     fail "tls alert"
 
-# whether the client offered a given extension type. this stack's client hello
-# is fixed except for server_name, which it sends only when it dialed with one.
-# a server response carrying anything outside this set is unsolicited
-# (rfc 8446 §4.1.3/§4.2, rfc 5246 §7.4.1.4).
-fn client_offered_server_hello_extension(extension_type: Int, offered_server_name: Bool) -> Bool:
-    # a 1.3 ServerHello may only carry these three (§4.1.3).
+# whether the client offered a given extension type, so a server response that
+# carries anything else can be refused as unsolicited (rfc 8446 §4.1.3/§4.2,
+# rfc 5246 §7.4.1.4). this stack's client hello is fixed except for
+# server_name, sent only when it dialed with one, and alpn, sent only when the
+# config lists protocols.
+#
+# a 1.3 ServerHello may only carry these three (rfc 8446 §4.1.3).
+fn client_offered_server_hello_extension(extension_type: Int) -> Bool:
     return extension_type == tls13.EXT_SUPPORTED_VERSIONS or extension_type == tls13.EXT_KEY_SHARE or extension_type == tls13.EXT_PRE_SHARED_KEY
 
 fn client_offered_encrypted_extension(extension_type: Int, offered_server_name: Bool, offered_alpn: Bool) -> Bool:
@@ -1388,9 +1378,6 @@ fn send_change_cipher_spec(stream: TcpStream) -> Bool!:
 fn tls12_finished_bytes(cipher: Int, master: Bytes, label: String, transcript: ByteBuffer) -> Bytes!:
     return tls12.finished_verify_data_for_suite(cipher, master, label, tls12.handshake_hash_for_suite(cipher, transcript.bytes()))!
 
-# read the peer's ChangeCipherSpec — skipping a plaintext NewSessionTicket it
-# may send first — and then its encrypted Finished, returning the verify_data
-# for the caller to compare against its own computation.
 # answer a 1.2 finished-stage rejection with a fatal alert in the caller's
 # write epoch: sealed with `alert_key`/`alert_iv` at `alert_seq` when a key is
 # given (the client, whose own Finished already switched its epoch), plaintext
@@ -1407,6 +1394,9 @@ struct Tls12PeerFinished:
     verify_data: Bytes
     records_read: Int
 
+# read the peer's ChangeCipherSpec and then its encrypted Finished, returning
+# the verify_data for the caller to compare against its own computation. any
+# handshake message before the ChangeCipherSpec is refused (see below).
 fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, peer_iv: Bytes, alert_key: Bytes, alert_iv: Bytes, alert_seq: Int) -> Tls12PeerFinished!:
     mut saw_ccs := false
     while not saw_ccs:
@@ -1471,12 +1461,6 @@ fn read_tls12_peer_finished(stream: TcpStream, cipher: Int, peer_key: Bytes, pee
         fail "expected a tls 1.2 finished message"
     return Tls12PeerFinished(messages[0].body, records_read)
 
-# The TLS 1.2 client handshake, reached from after_client_hello when the server
-# negotiated 1.2. The ClientHello (in `transcript`) and the ServerHello (in
-# `server_hello_message`) have already been exchanged; this drives the rest:
-# Certificate, ServerKeyExchange, an optional CertificateRequest,
-# ServerHelloDone → [Certificate,] ClientKeyExchange, [CertificateVerify,]
-# ChangeCipherSpec, Finished → server ChangeCipherSpec, Finished.
 # scan an accumulating 1.2 server flight: report whether ServerHelloDone has
 # arrived, and refuse any message type that has no place in the flight now
 # rather than after ServerHelloDone — a server that substitutes a foreign
@@ -1498,6 +1482,12 @@ fn scan_tls12_server_flight(stream: TcpStream, flight: Bytes) -> Bool!:
         fail refuse_with(stream, ALERT_UNEXPECTED_MESSAGE, "trailing tls handshake data after server hello done")
     return have_done
 
+# The TLS 1.2 client handshake, reached from after_client_hello when the server
+# negotiated 1.2. The ClientHello (in `transcript`) and the ServerHello (in
+# `server_hello_message`) have already been exchanged; this drives the rest:
+# Certificate, ServerKeyExchange, an optional CertificateRequest,
+# ServerHelloDone → [Certificate,] ClientKeyExchange, [CertificateVerify,]
+# ChangeCipherSpec, Finished → server ChangeCipherSpec, Finished.
 fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config: Config, client_random: Bytes, session_id: Bytes, keypair: ecdh.X25519KeyPair, p256pair: ecdh.X25519KeyPair, server_hello_message: tls13.HandshakeMessage, transcript: ByteBuffer, flight_prefix: Bytes, offered_tls13: Bool) -> Conn!:
     # the whole 1.2 server flight is plaintext, so every rejection below can
     # answer with a plaintext fatal alert before the socket closes, mirroring
@@ -1526,12 +1516,11 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     # and the id it sends is the 1.3 compatibility placeholder.
     if session_id.len() > 0 and bytes.eq(hello.session_id, session_id):
         fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls 1.2 server echoed the compatibility session id")
-    # downgrade protection: we offered 1.3, so a genuine 1.2-only server would
-    # not mark its random. the sentinel means a 1.3-capable server fell back to
-    # 1.2 — our 1.3 offer was stripped by an active attacker.
-    # a client that offered 1.3 and landed on 1.2 must reject the RFC 8446
-    # downgrade sentinel (our 1.3 offer was stripped). a client that offered only
-    # 1.2 never expected 1.3, so a marked random is legitimate there.
+    # downgrade protection (rfc 8446 §4.1.3): a genuine 1.2-only server does not
+    # mark its random, so when we offered 1.3 the sentinel means a 1.3-capable
+    # server was pushed to 1.2 by an attacker who stripped our offer. a client
+    # that offered only 1.2 never expected 1.3, so a marked random is
+    # legitimate there.
     if offered_tls13 and tls12.has_downgrade_sentinel(hello.random):
         fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "tls downgrade attack detected: server signalled 1.3 capability but negotiated 1.2")
     if not tls12.is_supported_suite(hello.cipher_suite):
@@ -1842,7 +1831,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             fail refuse_with(stream, ALERT_DECODE_ERROR, "server duplicated a tls server hello extension")
         seen_sh_extensions.push(sh_ext_type)
     for sh_ext_type in sh_extension_types:
-        if not client_offered_server_hello_extension(sh_ext_type, server_name != ""):
+        if not client_offered_server_hello_extension(sh_ext_type):
             fail refuse_with(stream, ALERT_UNSUPPORTED_EXTENSION, "server sent an unoffered tls server hello extension")
     server_hello := tls13.parse_server_hello(server_messages[0].body) catch:
         fail refuse_with(stream, ALERT_DECODE_ERROR, "malformed tls server hello")
@@ -1942,9 +1931,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_HANDSHAKE_FAILURE, "tls server flight is too large")
         messages := tls13.decode_handshakes_prefix(combined)
         server_flight_pending = combined.slice(tls13.handshakes_encoded_len(messages), combined.len())
-        mut message_index := 0
         for message in messages:
-            message_index = message_index + 1
             if server_finished:
                 fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "excess data after tls server finished")
             if message.message_type == TLS_HANDSHAKE_ENCRYPTED_EXTENSIONS:
@@ -2081,18 +2068,15 @@ fn server_key_is_ecdsa(config: Config) -> Bool!:
     leaf := x509.parse_der(chain[0])!
     return leaf.public_key_algorithm == OID_EC_PUBLIC_KEY
 
-# sign server handshake data with the certificate's key: ECDSA (asn.1 der) for
-# an EC certificate, otherwise RSA. `rsa_pss` selects RSA-PSS (tls 1.3
-# CertificateVerify) over RSA-PKCS1 (tls 1.2 ServerKeyExchange). Returns the
-# signature scheme id and the signature bytes.
+# a server handshake signature and the scheme that produced it.
 struct ServerSignature:
     scheme: Int
     signature: Bytes
 
 # the server's signature-scheme menu, in preference order, for a certificate
 # key type. an rsa key can produce any of the rsa schemes; a p-256 key only
-# ecdsa-p256-sha256. pss is preferred over pkcs1, stronger hash last only as a
-# tie-break the client's ordering doesn't already decide.
+# ecdsa-p256-sha256. pss is preferred over pkcs1, and within a family the
+# shorter hash comes first. the client's own ordering is not consulted.
 fn server_signature_menu(is_ecdsa: Bool, tls13: Bool) -> List[Int]:
     if is_ecdsa:
         return [TLS_SIG_ECDSA_SECP256R1_SHA256]
@@ -2115,8 +2099,9 @@ fn select_server_signature_scheme(is_ecdsa: Bool, tls13: Bool, offered: List[Int
             return scheme
     return 0
 
-fn sign_with_client_scheme(config: Config, scheme: Int, message: Bytes) -> Bytes!:
-    key := native_client_private_key(config)!
+# sign `message` with a pkcs#8 key under `scheme`, failing with
+# `unknown_message` for a scheme this stack cannot sign with.
+fn sign_for_scheme(key: Bytes, scheme: Int, message: Bytes, unknown_message: String) -> Bytes!:
     if scheme == TLS_SIG_ECDSA_SECP256R1_SHA256:
         return signature.sign_ecdsa_p256_sha256_asn1_pkcs8(key, message)!
     if scheme == TLS_SIG_RSA_PSS_RSAE_SHA256:
@@ -2131,25 +2116,13 @@ fn sign_with_client_scheme(config: Config, scheme: Int, message: Bytes) -> Bytes
         return signature.sign_rsa_pkcs1_sha384_pkcs8(key, message)!
     if scheme == TLS_SIG_RSA_PKCS1_SHA512:
         return signature.sign_rsa_pkcs1_sha512_pkcs8(key, message)!
-    fail "unsupported client signature scheme"
+    fail unknown_message
+
+fn sign_with_client_scheme(config: Config, scheme: Int, message: Bytes) -> Bytes!:
+    return sign_for_scheme(native_client_private_key(config)!, scheme, message, "unsupported client signature scheme")!
 
 fn sign_with_scheme(config: Config, scheme: Int, message: Bytes) -> ServerSignature!:
-    key := native_server_private_key(config)!
-    if scheme == TLS_SIG_ECDSA_SECP256R1_SHA256:
-        return ServerSignature(scheme, signature.sign_ecdsa_p256_sha256_asn1_pkcs8(key, message)!)
-    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA256:
-        return ServerSignature(scheme, signature.sign_rsa_pss_sha256_pkcs8(key, message)!)
-    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA384:
-        return ServerSignature(scheme, signature.sign_rsa_pss_sha384_pkcs8(key, message)!)
-    if scheme == TLS_SIG_RSA_PSS_RSAE_SHA512:
-        return ServerSignature(scheme, signature.sign_rsa_pss_sha512_pkcs8(key, message)!)
-    if scheme == TLS_SIG_RSA_PKCS1_SHA256:
-        return ServerSignature(scheme, signature.sign_rsa_pkcs1_sha256_pkcs8(key, message)!)
-    if scheme == TLS_SIG_RSA_PKCS1_SHA384:
-        return ServerSignature(scheme, signature.sign_rsa_pkcs1_sha384_pkcs8(key, message)!)
-    if scheme == TLS_SIG_RSA_PKCS1_SHA512:
-        return ServerSignature(scheme, signature.sign_rsa_pkcs1_sha512_pkcs8(key, message)!)
-    fail "unsupported server signature scheme"
+    return ServerSignature(scheme, sign_for_scheme(native_server_private_key(config)!, scheme, message, "unsupported server signature scheme")!)
 
 # pick a TLS 1.2 suite from what the client offered, in server preference order.
 # the eligible family follows the server certificate's key type: ECDHE-ECDSA
@@ -2175,12 +2148,12 @@ fn select_tls12_curve(groups: List[Int]) -> Int:
         return tls12.NAMED_CURVE_SECP384R1
     return 0
 
-# The signature schemes a 1.2 CertificateRequest advertises, in the same order
-# the 1.3 path offers them. RFC 5246 §7.4.8 binds the client's
+# The signature schemes a CertificateRequest advertises, for both the 1.2 and
+# the 1.3 handshake. On 1.2, RFC 5246 §7.4.8 binds the client's
 # CertificateVerify to this list, so it is also what the server accepts back.
 # Both families are offered because 1.2 takes either: RFC 8446 §4.2.3 applies
 # the PSS schemes to 1.2 signatures, and the PKCS#1 codes remain legal there.
-fn tls12_client_auth_schemes() -> List[Int]:
+fn client_auth_signature_schemes() -> List[Int]:
     return [TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_RSA_PKCS1_SHA256, TLS_SIG_RSA_PKCS1_SHA384, TLS_SIG_RSA_PKCS1_SHA512]
 
 # Report whether the client's 1.2 flight is complete. It ends at
@@ -2230,6 +2203,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     # ServerHello only advertises an EMS extension the client sent); a client
     # without it gets the rfc 5246 derivation — safe here, since this stack
     # refuses the 1.2 resumption and renegotiation the rfc 7627 attacks need.
+    #
     # select the certificate/config by server name first: the cert's key type
     # decides which suite family (ECDHE-RSA vs ECDHE-ECDSA) we can serve.
     handshake_config := select_server_config_for(config, lenient.server_name, lenient.alpn_protocols) catch:
@@ -2296,7 +2270,7 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     # require_client_ca_file asks and refuses one that does.
     client_cert_requested := config_requests_client_certificate(handshake_config)
     client_cert_required := config_requires_client_certificate(handshake_config)
-    request_schemes := tls12_client_auth_schemes()
+    request_schemes := client_auth_signature_schemes()
     mut certificate_request := bytes.empty()
     if client_cert_requested:
         certificate_request = tls13.encode_handshake(tls12.TLS12_CERTIFICATE_REQUEST, tls12.encode_certificate_request([tls12.TLS12_CERT_TYPE_ECDSA_SIGN, tls12.TLS12_CERT_TYPE_RSA_SIGN], request_schemes)!)!
@@ -2692,7 +2666,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
     client_cert_requested := config_requests_client_certificate(handshake_config)
     client_cert_required := config_requires_client_certificate(handshake_config)
     if client_cert_requested and not did_resume:
-        certificate_request := tls13.encode_certificate_request([TLS_SIG_ECDSA_SECP256R1_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA256, TLS_SIG_RSA_PSS_RSAE_SHA384, TLS_SIG_RSA_PSS_RSAE_SHA512, TLS_SIG_RSA_PKCS1_SHA256, TLS_SIG_RSA_PKCS1_SHA384, TLS_SIG_RSA_PKCS1_SHA512])!
+        certificate_request := tls13.encode_certificate_request(client_auth_signature_schemes())!
         transcript.write(certificate_request)!
         server_flight.write(certificate_request)!
     if not did_resume:
@@ -2793,9 +2767,7 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_HANDSHAKE_FAILURE, "tls client flight is too large")
         messages := tls13.decode_handshakes_prefix(combined)
         client_flight_pending = combined.slice(tls13.handshakes_encoded_len(messages), combined.len())
-        mut message_index := 0
         for message in messages:
-            message_index = message_index + 1
             if client_finished_seen:
                 fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "excess data after tls client finished")
             if message.message_type == TLS_HANDSHAKE_CERTIFICATE:
@@ -2846,10 +2818,10 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 # now includes the client Certificate and CertificateVerify
                 # appended above (RFC 8446 4.4.4). application_transcript is the
                 # snapshot taken at the server Finished and is deliberately kept
-                # for the application-secret derivation below, which is keyed on
-                # exactly that earlier point — using it here rejected every
-                # genuine mTLS client, since the client computes its Finished
-                # over the full transcript.
+                # for the application-secret derivation, which is keyed on
+                # exactly that earlier point. using the snapshot here would
+                # reject every genuine mTLS client, since the client computes
+                # its Finished over the full transcript.
                 if not (tls13.verify_finished_for_cipher(cipher, client_hs_secret, transcript.bytes(), verify_data) catch false):
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECRYPT_ERROR, "client finished verification failed")
                 transcript_append(transcript, message)!
@@ -2927,7 +2899,7 @@ fn read_conn_record_alerting(cs: NativeConnState, stream: TcpStream, lead: Bytes
     header := lead.concat(stream.read_exact_bytes(5 - lead.len())!)
     if header.len() != 5:
         fail "truncated tls record header"
-    length := checked_read(binary.read_u16_be_at(header, 3))!
+    length := checked_binary(binary.read_u16_be_at(header, 3))!
     if length > tls13.MAX_CIPHERTEXT_RECORD:
         fail conn_refuse_with(cs, ALERT_RECORD_OVERFLOW, "tls record overflow")
     payload := stream.read_exact_bytes(length)!
@@ -3076,10 +3048,12 @@ fn read_conn_records(handle: Int, cs: NativeConnState, size: Int, lead: Bytes) -
             continue
         if inner.content_type == TLS_CONTENT_APPLICATION_DATA:
             payload := inner.payload
+            # application data ends a run of KeyUpdates, so the flood guard in
+            # apply_peer_key_update counts from zero again.
+            cs.key_updates_received = 0
             # a zero-length application record is legal (padding / traffic
             # shaping); skip it rather than returning empty, which the caller
             # reads as a clean close_notify end-of-stream.
-            cs.key_updates_received = 0
             if payload.len() == 0:
                 empty_records = empty_records + 1
                 if empty_records > 32:
@@ -3239,9 +3213,8 @@ pub fn client_config() -> Config!:
 pub fn client_config_with_ca_file(path: String) -> Config!:
     return native_config_handle(read_file(path)!)
 
-# create a server config from pem certificate and private key files.
-# Build a server config from a PEM certificate chain and its private key. The
-# key must be a PKCS#8 "PRIVATE KEY" PEM; RSA (>=2048-bit) and ECDSA (P-256)
+# create a server config from a pem certificate chain file and its private key
+# file. The key must be a PKCS#8 "PRIVATE KEY" PEM; RSA (>=2048-bit) and ECDSA (P-256)
 # certificates are both supported. The chain is leaf-first.
 pub fn server_config(cert_path: String, key_path: String) -> Config!:
     return native_server_config_handle(read_file(cert_path)!, read_file(key_path)!)
@@ -3354,6 +3327,16 @@ pub fn open_server_configs() -> Int:
 pub fn server_handshake_failures() -> Int:
     return server_handshake_failure_count.load()
 
+# read a client ca bundle for require_client_ca_file or request_client_ca_file,
+# parsing it once so a bad or empty bundle fails when the config is built rather
+# than at the first handshake.
+fn read_client_ca_bundle(path: String) -> String!:
+    roots_pem := read_file(path)!
+    roots := x509.parse_pem_chain(roots_pem)!
+    if roots.len() == 0:
+        fail "tls client ca bundle is empty"
+    return roots_pem
+
 # count a failed handshake and close the socket it came in on.
 fn note_failed_handshake(fd: Int):
     mut counted := false
@@ -3388,19 +3371,13 @@ impl Config:
         return self
 
     fn require_client_ca_file(path: String) -> Config!:
-        roots_pem := read_file(path)!
-        roots := x509.parse_pem_chain(roots_pem)!
-        if roots.len() == 0:
-            fail "tls client ca bundle is empty"
+        roots_pem := read_client_ca_bundle(path)!
         config_put(native_server_client_ca_pem, self.handle, roots_pem)
         config_drop(native_server_client_ca_optional, self.handle)
         return self
 
     fn request_client_ca_file(path: String) -> Config!:
-        roots_pem := read_file(path)!
-        roots := x509.parse_pem_chain(roots_pem)!
-        if roots.len() == 0:
-            fail "tls client ca bundle is empty"
+        roots_pem := read_client_ca_bundle(path)!
         config_put(native_server_client_ca_pem, self.handle, roots_pem)
         config_put(native_server_client_ca_optional, self.handle, true)
         return self
@@ -3444,7 +3421,7 @@ impl Config:
     # give the config's registry slot back.
     #
     # the destructor calls this when the last value naming the config goes
-    # away, so a config nobody closes is not a leak any more. calling it by
+    # away, so a config nobody closes does not leak. calling it by
     # hand still says *when*: whoever built a config decides that, and the
     # destructor only says "no later than the last reference".
     #
@@ -3489,7 +3466,7 @@ impl Config:
 # destructor it attaches to every Config it builds (docs/ownership.md). close
 # is idempotent, so a caller that closes explicitly — which is still the way to
 # say *when* the slot goes back — costs nothing extra here, and a caller that
-# forgets no longer leaks a slot per request. what this does not change is the
+# forgets does not leak a slot per request. what this does not change is the
 # timing rule above: a config a listener or a connection still reads from is
 # held by that reader's own count and closes after it, not before.
 impl Drop for Config:
@@ -3512,10 +3489,9 @@ impl Listener:
 
     fn handshake(fd: Int) -> Conn!:
         # the listener's own config, held by the registry entry listen() made.
-        # this used to rebuild a Config over the entry's handle, which was fine
-        # while a Config was only a number; now that a Config closes itself when
-        # its last holder lets go, a second box over a live handle would close
-        # the listener's config at the end of the first handshake.
+        # it must not be rebuilt as Config(handle): a Config closes itself when
+        # its last holder lets go, so a second box over a live handle would
+        # close the listener's config at the end of the first handshake.
         config := listener_config(self.handle) catch:
             note_failed_handshake(fd)
             fail "native tls listener not found"
@@ -3953,8 +3929,8 @@ test "a tls 1.2 certificate verify signature is bound to the transcript it signe
     assert(scheme_matches_certificate_key(TLS_SIG_RSA_PSS_RSAE_SHA256, leaf.public_key_algorithm))
     # the schemes a 1.2 CertificateRequest advertises are the only ones the
     # server accepts back; secp384r1 is not among them.
-    assert(tls12_client_auth_schemes().contains(TLS_SIG_RSA_PSS_RSAE_SHA256))
-    assert(not tls12_client_auth_schemes().contains(tls13.SIG_ECDSA_SECP384R1_SHA384))
+    assert(client_auth_signature_schemes().contains(TLS_SIG_RSA_PSS_RSAE_SHA256))
+    assert(not client_auth_signature_schemes().contains(tls13.SIG_ECDSA_SECP384R1_SHA384))
     cfg.close()
 
 test "a tls 1.2 client answers only a certificate request its key can satisfy":
@@ -3966,12 +3942,12 @@ test "a tls 1.2 client answers only a certificate request its key can satisfy":
     bare_cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!
     both_types := [tls12.TLS12_CERT_TYPE_ECDSA_SIGN, tls12.TLS12_CERT_TYPE_RSA_SIGN]
 
-    assert(tls12_client_certificate_usable(rsa_cfg, both_types, tls12_client_auth_schemes()))
-    assert(tls12_client_certificate_usable(ec_cfg, both_types, tls12_client_auth_schemes()))
+    assert(tls12_client_certificate_usable(rsa_cfg, both_types, client_auth_signature_schemes()))
+    assert(tls12_client_certificate_usable(ec_cfg, both_types, client_auth_signature_schemes()))
     # no certificate at all.
-    assert(not tls12_client_certificate_usable(bare_cfg, both_types, tls12_client_auth_schemes()))
+    assert(not tls12_client_certificate_usable(bare_cfg, both_types, client_auth_signature_schemes()))
     # a request that takes ecdsa keys only, answered by an rsa client.
-    assert(not tls12_client_certificate_usable(rsa_cfg, [tls12.TLS12_CERT_TYPE_ECDSA_SIGN], tls12_client_auth_schemes()))
+    assert(not tls12_client_certificate_usable(rsa_cfg, [tls12.TLS12_CERT_TYPE_ECDSA_SIGN], client_auth_signature_schemes()))
     # the certificate type fits but no advertised scheme does.
     assert(not tls12_client_certificate_usable(ec_cfg, both_types, [TLS_SIG_RSA_PSS_RSAE_SHA256]))
     rsa_cfg.close()

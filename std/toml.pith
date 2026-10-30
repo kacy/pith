@@ -869,25 +869,25 @@ pub fn get_string(handle: Int, key: String) -> String:
     return toml_get_string(handle, key)
 
 fn toml_get_string(handle: Int, key: String) -> String:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "string":
-        return string_values[v]
+    node := table_lookup(handle, key)
+    if node_kind(node) == "string":
+        return string_values[node]
     return ""
 
 ## get a required string field or return a typed decode error.
 pub fn require_string(handle: Int, key: String) -> String!TomlDecodeError:
-    v := table_lookup(handle, key)
-    if v < 0:
+    node := table_lookup(handle, key)
+    if node < 0:
         fail toml_decode_fail("missing string field: " + key)
-    if node_kind(v) != "string":
+    if node_kind(node) != "string":
         fail toml_decode_fail("expected string field: " + key)
-    return string_values[v]
+    return string_values[node]
 
 # Gets a string value by key from a table with a fallback.
 pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "string":
-        return string_values[v]
+    node := table_lookup(handle, key)
+    if node_kind(node) == "string":
+        return string_values[node]
     return default_value
 
 # Gets an integer value by key from a table. Returns 0 if not found or wrong type.
@@ -895,25 +895,25 @@ pub fn get_int(handle: Int, key: String) -> Int:
     return toml_get_int(handle, key)
 
 fn toml_get_int(handle: Int, key: String) -> Int:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "int":
-        return integer_values[v]
+    node := table_lookup(handle, key)
+    if node_kind(node) == "int":
+        return integer_values[node]
     return 0
 
 ## get a required int field or return a typed decode error.
 pub fn require_int(handle: Int, key: String) -> Int!TomlDecodeError:
-    v := table_lookup(handle, key)
-    if v < 0:
+    node := table_lookup(handle, key)
+    if node < 0:
         fail toml_decode_fail("missing int field: " + key)
-    if node_kind(v) != "int":
+    if node_kind(node) != "int":
         fail toml_decode_fail("expected int field: " + key)
-    return integer_values[v]
+    return integer_values[node]
 
 # Gets an integer value by key from a table with a fallback.
 pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "int":
-        return integer_values[v]
+    node := table_lookup(handle, key)
+    if node_kind(node) == "int":
+        return integer_values[node]
     return default_value
 
 # Gets a float value by key from a table. Returns 0.0 if not found or wrong type.
@@ -921,16 +921,16 @@ pub fn get_float(handle: Int, key: String) -> Float:
     return toml_get_float(handle, key)
 
 fn toml_get_float(handle: Int, key: String) -> Float:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "float":
-        return float_values[v]
+    node := table_lookup(handle, key)
+    if node_kind(node) == "float":
+        return float_values[node]
     return 0.0
 
 # Gets a float value by key from a table with a fallback.
 pub fn get_float_or(handle: Int, key: String, default_value: Float) -> Float:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "float":
-        return float_values[v]
+    node := table_lookup(handle, key)
+    if node_kind(node) == "float":
+        return float_values[node]
     return default_value
 
 # Gets a boolean value by key from a table. Returns false if not found or wrong type.
@@ -938,25 +938,25 @@ pub fn get_bool(handle: Int, key: String) -> Bool:
     return toml_get_bool(handle, key)
 
 fn toml_get_bool(handle: Int, key: String) -> Bool:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "bool":
-        return boolean_values[v]
+    node := table_lookup(handle, key)
+    if node_kind(node) == "bool":
+        return boolean_values[node]
     return false
 
 ## get a required bool field or return a typed decode error.
 pub fn require_bool(handle: Int, key: String) -> Bool!TomlDecodeError:
-    v := table_lookup(handle, key)
-    if v < 0:
+    node := table_lookup(handle, key)
+    if node < 0:
         fail toml_decode_fail("missing bool field: " + key)
-    if node_kind(v) != "bool":
+    if node_kind(node) != "bool":
         fail toml_decode_fail("expected bool field: " + key)
-    return boolean_values[v]
+    return boolean_values[node]
 
 # Gets a boolean value by key from a table with a fallback.
 pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "bool":
-        return boolean_values[v]
+    node := table_lookup(handle, key)
+    if node_kind(node) == "bool":
+        return boolean_values[node]
     return default_value
 
 # Gets a sub-table handle by key. Returns -1 if not found or not a table.
@@ -964,9 +964,9 @@ pub fn get_table(handle: Int, key: String) -> Int:
     return toml_get_table(handle, key)
 
 fn toml_get_table(handle: Int, key: String) -> Int:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "table":
-        return v
+    node := table_lookup(handle, key)
+    if node_kind(node) == "table":
+        return node
     return 0 - 1
 
 # Gets an array handle by key. Returns -1 if not found or not an array.
@@ -974,9 +974,9 @@ pub fn get_array(handle: Int, key: String) -> Int:
     return toml_get_array(handle, key)
 
 fn toml_get_array(handle: Int, key: String) -> Int:
-    v := table_lookup(handle, key)
-    if node_kind(v) == "array":
-        return v
+    node := table_lookup(handle, key)
+    if node_kind(node) == "array":
+        return node
     return 0 - 1
 
 # ===============================================================

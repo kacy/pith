@@ -239,7 +239,7 @@ pub extern "C" fn pith_term_write(fd: i64, data: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
 
     /// tests that enter raw mode share the process-wide SAVED slot, so they
     /// take this lock to keep their save/restore pairs from interleaving.
@@ -253,12 +253,20 @@ mod tests {
             assert!(master >= 0, "posix_openpt failed");
             assert_eq!(libc::grantpt(master), 0);
             assert_eq!(libc::unlockpt(master), 0);
-            let name = libc::ptsname(master);
-            assert!(!name.is_null());
-            let slave = libc::open(name, libc::O_RDWR | libc::O_NOCTTY);
+            let name = pty_name(master);
+            let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
             assert!(slave >= 0, "open slave failed");
             (master, slave)
         }
+    }
+
+    /// the slave device path for a pty master. uses ptsname_r because
+    /// ptsname returns a static buffer that parallel tests overwrite.
+    fn pty_name(master: i32) -> CString {
+        let mut buf = [0 as libc::c_char; 128];
+        let rc = unsafe { libc::ptsname_r(master, buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(rc, 0, "ptsname_r failed");
+        unsafe { CStr::from_ptr(buf.as_ptr()) }.to_owned()
     }
 
     fn close_pair(master: i32, slave: i32) {
@@ -407,10 +415,9 @@ mod tests {
 
     #[test]
     fn ptsname_smoke() {
-        // keep CStr imported for future name-based assertions; also proves
-        // the pty path yields a real device name.
+        // proves the pty path yields a real device name.
         let (master, slave) = open_pty();
-        let name = unsafe { CStr::from_ptr(libc::ptsname(master)) };
+        let name = pty_name(master);
         assert!(name.to_string_lossy().starts_with("/dev/pts/"));
         close_pair(master, slave);
     }

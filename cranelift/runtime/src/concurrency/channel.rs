@@ -1230,7 +1230,7 @@ mod tests {
     fn unbuffered_send_reports_delivery_not_closure() {
         unsafe {
             let ch = pith_channel_new(0, 0);
-            let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 42) });
+            let sender = std::thread::spawn(move || { pith_channel_send(ch, 42) });
 
             // take the value, then close while the sender is still parked
             let t = shell(pith_channel_recv(ch));
@@ -1252,7 +1252,7 @@ mod tests {
     fn unbuffered_send_fails_when_closed_undelivered() {
         unsafe {
             let ch = pith_channel_new(0, 0);
-            let sender = std::thread::spawn(move || unsafe { pith_channel_send(ch, 7) });
+            let sender = std::thread::spawn(move || { pith_channel_send(ch, 7) });
             std::thread::sleep(std::time::Duration::from_millis(50));
             pith_channel_close(ch);
             assert_eq!(sender.join().unwrap(), 0);
@@ -1274,7 +1274,7 @@ mod tests {
             let ch = pith_channel_new(4, 0);
             let receivers: Vec<_> = (0..3)
                 .map(|_| {
-                    std::thread::spawn(move || unsafe {
+                    std::thread::spawn(move || {
                         let t = shell(pith_channel_recv(ch));
                         *t
                     })
@@ -1326,7 +1326,7 @@ mod tests {
                 let ch = pith_channel_new(8, 0);
                 pith_channel_retain(ch); // the sender's count
                 pith_channel_retain(ch); // the closer's count
-                let sender = std::thread::spawn(move || unsafe {
+                let sender = std::thread::spawn(move || {
                     let mut accepted = 0;
                     for v in 0..8 {
                         if pith_channel_send(ch, v + 1) != 0 {
@@ -1336,7 +1336,7 @@ mod tests {
                     pith_channel_release(ch);
                     accepted
                 });
-                let closer = std::thread::spawn(move || unsafe {
+                let closer = std::thread::spawn(move || {
                     pith_channel_close(ch);
                     let mut drained = 0;
                     loop {
@@ -1373,7 +1373,7 @@ mod tests {
             unsafe {
                 let ch = pith_channel_new(2, 0);
                 pith_channel_retain(ch);
-                let sender = std::thread::spawn(move || unsafe {
+                let sender = std::thread::spawn(move || {
                     for v in 0..8 {
                         if pith_channel_send(ch, v) == 0 {
                             break;
@@ -1381,7 +1381,7 @@ mod tests {
                     }
                     pith_channel_release(ch);
                 });
-                let closer = std::thread::spawn(move || unsafe {
+                let closer = std::thread::spawn(move || {
                     let _ = pith_channel_try_recv(ch);
                     pith_channel_close(ch);
                     loop {

@@ -1,10 +1,9 @@
 //! reading and writing a pollable fd without parking a green worker.
 //!
-//! this is the shape sockets have used since the epoll reactor landed: put the
-//! fd in non-blocking mode, run the syscall, and when it would block hand the
-//! green task to the reactor (`netpoll`) instead of sleeping the worker OS
-//! thread on it. the task resumes when the fd is ready and retries; the worker
-//! ran everything else in the meantime.
+//! put the fd in non-blocking mode, run the syscall, and when it would block
+//! hand the green task to the reactor (`netpoll`) instead of sleeping the
+//! worker OS thread on it. the task resumes when the fd is ready and retries;
+//! the worker ran everything else in the meantime.
 //!
 //! sockets and child-process pipes share the readiness machinery and the retry
 //! loops; they differ only in which syscall pair moves the bytes, which is what
@@ -13,12 +12,12 @@
 //! goes to a thread pool (`blocking`) instead.
 //!
 //! every function works whichever backend is running. off a green task there is
-//! no coroutine to suspend, so a would-block waits in `poll` — which is what
-//! the blocking fd these calls replaced did anyway.
+//! no coroutine to suspend, so a would-block waits in `poll`, which behaves
+//! like a blocking syscall would.
 //!
 //! a wait is bounded by the socket's own timeout option. the os-thread backend
-//! gets that for free — its fd is blocking, so `SO_RCVTIMEO` bounds the syscall
-//! in the kernel — and the retry loops here read the same option back and hand
+//! gets that for free (its fd is blocking, so `SO_RCVTIMEO` bounds the syscall
+//! in the kernel), and the retry loops here read the same option back and hand
 //! it to the wait, so a read deadline means the same thing on either backend
 //! instead of being inert on the one that is the default.
 //!
@@ -60,14 +59,14 @@ pub(crate) fn set_nonblocking(fd: RawFd) {
     }
 }
 
-/// the longest wait anything here asks for, in milliseconds — a shade under 25
+/// the longest wait anything here asks for, in milliseconds: a shade under 25
 /// days.
 ///
-/// `poll` takes its timeout as an `int` and has always been clamped to this, and
-/// the reactor turns its timeout into an `Instant` deadline, where a duration
-/// past what the clock can represent overflows the addition rather than
-/// expressing anything a caller meant. clamping is the honest reading either
-/// way: at this length a wait and a wait that never ends are the same wait.
+/// `poll` takes its timeout as an `int`, and the reactor turns its timeout
+/// into an `Instant` deadline, where a duration past what the clock can
+/// represent overflows the addition rather than expressing anything a caller
+/// meant. clamping is the right reading either way: at this length a wait and
+/// a wait that never ends are the same wait.
 const MAX_WAIT_MS: i64 = i32::MAX as i64;
 
 /// poll a single fd until it is ready, times out, or errors: the blocking wait
@@ -122,7 +121,7 @@ pub(crate) fn poll_wait_any_fd(fd: i64, events: i16, timeout_ms: i64) -> i64 {
 
 /// wait for `fd` to become readable (`read`) or writable, yielding to the epoll
 /// reactor when we are running inside a green task, or blocking on `poll` when we
-/// are not (the main thread, a non-green spawn, or the flag-off backend). returns
+/// are not (the main thread, or the os-thread backend). returns
 /// the tri-state readiness contract: `1` ready, `0` timed out, `-1` error.
 ///
 /// this is the seam: the green branch never parks the worker OS thread; the
@@ -141,8 +140,8 @@ pub(crate) fn wait_ready(fd: i64, read: bool, timeout_ms: i64) -> i64 {
 
 /// `wait_ready` on a handle's fd. a close that lands while the caller is parked
 /// ends the wait with an error rather than a readiness: the reactor resolves a
-/// parked waiter that way itself, and the `poll` branch — which the closer
-/// wakes by shutting the socket down — asks the handle on the way out.
+/// parked waiter that way itself, and the `poll` branch (which the closer
+/// wakes by shutting the socket down) asks the handle on the way out.
 pub(crate) fn wait_guarded(guard: &Guard, read: bool, timeout_ms: i64) -> i64 {
     crate::perf_stats!(PERF_REACTOR_WAITS += 1);
     wait_with(guard.fd() as i64, read, timeout_ms, &|| guard.is_live())
@@ -182,7 +181,7 @@ fn probe(fd: i64, read: bool, timeout_ms: i64) -> Option<i64> {
 /// `wait_ready` without the `fd <= 0` guard, for the one caller that
 /// legitimately waits on fd 0: the terminal builtins reading stdin. `0` is a
 /// "no handle" sentinel throughout the socket code, so the guard stays on
-/// `wait_ready` itself — this seam exists precisely so it never weakens.
+/// `wait_ready` itself; this seam exists precisely so it never weakens.
 pub(crate) fn wait_ready_unguarded(fd: i64, read: bool, timeout_ms: i64) -> i64 {
     wait_with(fd, read, timeout_ms, &|| true)
 }
@@ -214,10 +213,9 @@ fn wait_with(fd: i64, read: bool, timeout_ms: i64, live: &dyn Fn() -> bool) -> i
 }
 
 /// read one of the socket timeout options off `fd` as milliseconds, returning
-/// `-1` for "no deadline" — which covers the option being unset, the fd not
+/// `-1` for "no deadline". that covers the option being unset, the fd not
 /// being a socket, and the call failing for any other reason. `-1` is the safe
-/// answer to all three: it is what every caller that never set a timeout wants,
-/// and it is what this path did before it asked at all.
+/// answer to all three: it is what every caller that never set a timeout wants.
 ///
 /// a sub-millisecond timeout rounds up to 1 ms rather than down to 0, because
 /// `0` means "do not wait" to `wait_ready` and would turn a 500 µs deadline into
@@ -281,10 +279,11 @@ enum Channel {
 
 impl Channel {
     /// the flags argument for `recv`/`send`. always none: `MSG_NOSIGNAL` would
-    /// suppress the SIGPIPE a `write` to a dead peer raises today, and
-    /// `signals::ignore_sigpipe` documents that disposition as replaceable — a
+    /// suppress the SIGPIPE a `write` to a dead peer raises, and
+    /// `signals::ignore_sigpipe` documents that disposition as replaceable: a
     /// program that arms SIGPIPE through `pith_signal_notify` is entitled to
-    /// keep seeing it. no flags keeps this change to the non-socket check.
+    /// keep seeing it. with no flags, the only difference from `read`/`write`
+    /// is the non-socket check.
     const NO_FLAGS: libc::c_int = 0;
 
     fn is_socket(self) -> bool {
@@ -338,7 +337,7 @@ impl Channel {
             // `SO_RCVTIMEO` is a socket option and a pipe is not a socket:
             // there is nothing to read, and nothing sets a deadline on a child
             // process's stdout in the first place. a pipe read waits for its
-            // writer, as it always has.
+            // writer.
             Channel::Pipe => -1,
             Channel::Socket | Channel::PolledSocket => socket_timeout_ms(
                 fd,
@@ -388,14 +387,14 @@ fn cached_timeout_ms(guard: &Guard, read: bool, channel: Channel) -> i64 {
 ///
 /// and a wake with nothing behind it cannot restart the clock. the caller asked
 /// for one bounded read, not an unbounded series of bounded waits, so a retry
-/// gets what is left of the original budget rather than a fresh copy of it —
+/// gets what is left of the original budget rather than a fresh copy of it,
 /// which is also how `SO_RCVTIMEO` bounds the blocking read this mirrors.
 #[derive(Clone, Copy)]
 enum WaitBudget {
     /// the loop has not blocked yet, so nothing has been asked for.
     Unasked,
-    /// no deadline. a pipe, or a socket with no timeout set — which is most of
-    /// them, and everything that never calls `set_timeout`.
+    /// no deadline. a pipe, or a socket with no timeout set (most of them, and
+    /// everything that never calls `set_timeout`).
     Forever,
     /// give up once this instant passes.
     Until(Instant),
@@ -445,8 +444,8 @@ impl WaitBudget {
 
 /// abort with a diagnostic: an fd pith is using as a socket is not one.
 ///
-/// this is not a runtime condition a caller could handle — it is the process
-/// having lost track of one of its own descriptors — and handing it back as an
+/// this is not a runtime condition a caller could handle (it is the process
+/// having lost track of one of its own descriptors), and handing it back as an
 /// ordinary i/o error would put it straight back in the dark. every caller above
 /// treats a failed read or write as "the connection is gone", closes, and moves
 /// on, which is exactly the silence this check exists to break. so it stops
@@ -479,7 +478,7 @@ pub(crate) fn socket_read_yielding(guard: &Guard, size: usize) -> Option<Vec<u8>
 }
 
 /// read up to `size` bytes, yielding on would-block until data arrives, the
-/// socket's read deadline expires, the writer closes (returns an empty vec —
+/// socket's read deadline expires, the writer closes (returns an empty vec,
 /// real EOF), or a hard error (returns `None`). mirrors the blocking path's
 /// contract exactly: 0 bytes is EOF, not an error, and an expired deadline is
 /// `None`, which is what `socket_read_blocking` makes of the `EAGAIN` its
@@ -510,7 +509,7 @@ fn read_channel(guard: &Guard, size: usize, channel: Channel) -> Option<Vec<u8>>
         let err = errno();
         channel.check(fd, err, "read");
         if is_would_block(err) {
-            // nothing ready — yield to the reactor and retry when readable, or
+            // nothing ready: yield to the reactor and retry when readable, or
             // give up once the socket's read deadline runs out.
             if budget.wait(guard, true, channel) != 1 {
                 return None;
@@ -563,7 +562,7 @@ pub(crate) fn socket_write_yielding(guard: &Guard, data: &[u8]) -> Result<usize,
 /// one never comes back as `Ok(0)`: a would-block waits and retries until at
 /// least one byte goes out.
 ///
-/// nothing in pith sets `SO_SNDTIMEO` today, so this budget resolves to "wait
+/// nothing in pith sets `SO_SNDTIMEO`, so this budget resolves to "wait
 /// forever" on every socket the runtime has. it is read anyway so that the two
 /// directions stay the same shape: a send deadline, if one is ever set, must
 /// bound a green write exactly as it already bounds an os-thread one.
@@ -607,9 +606,9 @@ fn write_channel(guard: &Guard, data: &[u8], channel: Channel) -> Result<usize, 
 /// where there is no green task to suspend and no reactor to hand the fd to.
 ///
 /// a would-block is not a retry cue here. a blocking socket reports one only
-/// when `SO_RCVTIMEO` expired — the timeout `pith_tcp_set_timeout` installs — so
-/// it is a failure, which is what the `TcpStream::read` this replaced made of
-/// it. `None` covers every error alike, as that did.
+/// when `SO_RCVTIMEO` expired (the timeout `pith_tcp_set_timeout` installs), so
+/// it is a failure, the same as `TcpStream::read` would report. `None` covers
+/// every error alike.
 ///
 /// a close from another task returns this call by shutting the socket down,
 /// which reads as end of stream; the handle being dead by then is what tells
@@ -623,8 +622,8 @@ pub(crate) fn socket_read_blocking(guard: &Guard, size: usize) -> Option<Vec<u8>
     }
     let fd = guard.fd() as i64;
     let mut buf = vec![0u8; size];
-    // the syscall can sit in the kernel up to SO_RCVTIMEO — forever, with no
-    // timeout set — touching only this owned buffer, so it is a native window
+    // the syscall can sit in the kernel up to SO_RCVTIMEO (forever, with no
+    // timeout set) touching only this owned buffer, so it is a native window
     // for the cycle collector. the bracket is kept to the syscall itself.
     let n = {
         let _native = crate::cycle::native_bracket();
@@ -700,7 +699,7 @@ mod tests {
         (fds[0], fds[1])
     }
 
-    /// a connected stream socket pair — the shape every `Channel::Socket` call
+    /// a connected stream socket pair, the shape every `Channel::Socket` call
     /// site has. left blocking: these tests only read when something is there,
     /// and a would-block off a green task waits in `poll` forever.
     fn socket_pair() -> (RawFd, RawFd) {
@@ -711,7 +710,7 @@ mod tests {
         (fds[0], fds[1])
     }
 
-    /// open a read-only fd on a regular file — a stand-in for the descriptor the
+    /// open a read-only fd on a regular file, a stand-in for the descriptor the
     /// kernel hands to the next `open` after a socket number is freed.
     fn open_a_file() -> RawFd {
         let path = c"/etc/hostname";
@@ -768,8 +767,8 @@ mod tests {
         assert_eq!(wait_ready_unguarded(-1, true, 0), -1);
     }
 
-    /// a handle closed by another task while a read is parked on it — the
-    /// green case the reactor handles — has an os-thread twin: the closer
+    /// a handle closed by another task while a read is parked on it (the
+    /// green case the reactor handles) has an os-thread twin: the closer
     /// shuts the socket down to return the blocked read, which reads as end
     /// of stream, and the dead handle turns that into an error. a peer that
     /// really finished still reads as eof, because its handle is live.
@@ -861,7 +860,7 @@ mod tests {
     }
 
     /// the socket syscalls refuse a descriptor that is not a socket, where
-    /// `read`/`write` would have used it — the invariant check behind
+    /// `read`/`write` would have used it: the invariant check behind
     /// `report_not_a_socket`.
     #[test]
     fn the_socket_syscalls_reject_a_file_and_a_pipe_with_enotsock() {
@@ -903,7 +902,7 @@ mod tests {
     // -----------------------------------------------------------------------
     // read deadlines.
     //
-    // these run off a green task, so `wait_ready` takes its `poll` branch — the
+    // these run off a green task, so `wait_ready` takes its `poll` branch; the
     // deadline arithmetic is the same either way, and this keeps the tests free
     // of a reactor. the end-to-end green case lives in
     // tests/cases/test_socket_read_timeout.pith, which runs on both backends.
@@ -931,7 +930,7 @@ mod tests {
 
     /// the fact the whole fix rests on: `SO_RCVTIMEO` is still recorded on a
     /// non-blocking socket, and reads back. the option has no *effect* on a
-    /// non-blocking syscall — which is the bug — but the kernel keeps it, so it
+    /// non-blocking syscall (which is the bug), but the kernel keeps it, so it
     /// is a usable place to have put the deadline.
     ///
     /// it does not read back byte-identical to what was written: linux stores
@@ -960,8 +959,8 @@ mod tests {
 
     /// a sub-millisecond deadline must not round down to `0`, which `wait_ready`
     /// reads as "do not wait" and would answer with an instant timeout. the
-    /// kernel's own jiffy rounding usually settles this first — 500 µs comes
-    /// back as a whole tick — but the guard is what makes that a property
+    /// kernel's own jiffy rounding usually settles this first (500 µs comes
+    /// back as a whole tick), but the guard is what makes that a property
     /// rather than a coincidence of the host's HZ.
     #[test]
     fn a_sub_millisecond_deadline_rounds_up_rather_than_to_no_wait_at_all() {
@@ -973,8 +972,8 @@ mod tests {
         close(b);
     }
 
-    /// a pipe has no deadline to read — `SO_RCVTIMEO` is a socket option — so a
-    /// child process's stdout waits for its writer exactly as it always has.
+    /// a pipe has no deadline to read (`SO_RCVTIMEO` is a socket option), so a
+    /// child process's stdout waits for its writer.
     #[test]
     fn a_pipe_has_no_deadline_and_keeps_waiting_forever() {
         let (read_end, write_end) = pipe();
@@ -1123,7 +1122,7 @@ mod tests {
     /// through, so the value is a caller's to choose.
     ///
     /// off a green task this takes the `poll` branch, so what it pins is the
-    /// argument surviving the clamp — the reactor branch needs a green task and
+    /// argument surviving the clamp; the reactor branch needs a green task and
     /// is covered by the clamp being in `wait_ready` rather than in either arm.
     #[test]
     fn an_absurd_wait_is_clamped_rather_than_overflowing_a_deadline() {
@@ -1142,7 +1141,7 @@ mod tests {
         let (a, b) = socket_pair();
         set_nonblocking(a);
         let mut budget = WaitBudget::Unasked;
-        // ready immediately, so this does not actually block — what is being
+        // ready immediately, so this does not actually block; what is being
         // checked is which deadline it resolved before waiting.
         assert_eq!(socket_write_yielding(&sock(b), b"x"), Ok(1));
         assert_eq!(budget.wait(&sock(a), true, Channel::Socket), 1);
@@ -1178,7 +1177,7 @@ mod tests {
     }
 
     /// in the child, make the requested call on a file descriptor that is not a
-    /// socket. never returns — every arm is expected to abort.
+    /// socket. never returns: every arm is expected to abort.
     fn make_the_bad_call(call: &str) -> ! {
         // a socket handle over a regular file: the bookkeeping mistake the
         // check exists for, made deliberately.
@@ -1188,13 +1187,13 @@ mod tests {
                 socket_read_yielding(&file, 16);
             }
             "write_yielding" => {
-                socket_write_yielding(&file, b"x");
+                let _ = socket_write_yielding(&file, b"x");
             }
             "read_blocking" => {
                 socket_read_blocking(&file, 16);
             }
             "write_blocking" => {
-                socket_write_blocking(&file, b"x");
+                let _ = socket_write_blocking(&file, b"x");
             }
             other => panic!("unknown call {other}"),
         }

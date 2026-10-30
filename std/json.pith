@@ -80,16 +80,16 @@ fn json_byte_string_span(input: Bytes, pos: Int) -> JsonByteSpan:
         return JsonByteSpan(false, 0, 0, pos, false)
     mut i := pos + 1
     start := i
-    mut esc := false
+    mut after_backslash := false
     mut had_escape := false
     while i < input.len():
         b := input[i]
-        if esc:
-            esc = false
+        if after_backslash:
+            after_backslash = false
             i = i + 1
             continue
         if b == 92:
-            esc = true
+            after_backslash = true
             had_escape = true
             i = i + 1
             continue
@@ -302,8 +302,8 @@ fn scan_whitespace(c: String) -> Bool:
     return c == " " or c == chr(9) or c == chr(10) or c == chr(13)
 
 fn scan_object_key_matches(input: String, key: String, pos: Int) -> Bool:
-    dq := chr(34)
-    if pos < 0 or pos >= input.len() or input[pos] != dq:
+    quote := chr(34)
+    if pos < 0 or pos >= input.len() or input[pos] != quote:
         return false
     if pos + key.len() + 1 >= input.len():
         return false
@@ -312,7 +312,7 @@ fn scan_object_key_matches(input: String, key: String, pos: Int) -> Bool:
         if input[pos + 1 + i] != key[i]:
             return false
         i = i + 1
-    return input[pos + key.len() + 1] == dq
+    return input[pos + key.len() + 1] == quote
 
 fn scan_object_value_start(input: String, key: String) -> Int:
     mut key_pos := -1
@@ -438,13 +438,13 @@ fn json_byte_skip_whitespace(input: Bytes, pos: Int) -> Int:
     return i
 
 fn json_hex_digit_value(c: String) -> Int:
-    o := ord(c)
-    if o >= 48 and o <= 57:
-        return o - 48
-    if o >= 97 and o <= 102:
-        return o - 87
-    if o >= 65 and o <= 70:
-        return o - 55
+    code := ord(c)
+    if code >= 48 and code <= 57:
+        return code - 48
+    if code >= 97 and code <= 102:
+        return code - 87
+    if code >= 65 and code <= 70:
+        return code - 55
     return 0 - 1
 
 fn json_utf8_encode(code: Int) -> String:

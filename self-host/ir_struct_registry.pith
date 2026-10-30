@@ -1,4 +1,4 @@
-# ir_struct_registry.pith — the compiler's memory of struct and enum
+# ir_struct_registry.pith: the compiler's memory of struct and enum
 # shapes: which structs exist, their field layouts and defaults, and
 # which enums box payloads. the emitter fills these during collection
 # and reads them everywhere; keeping the state and its accessors in
@@ -90,7 +90,7 @@ pub fn ir_rc_kind(type_hint: String) -> String:
     base := ir_struct_base_name(type_hint)
     if ir_struct_names.contains_key(base):
         return "struct"
-    # a type named through its module — `decimal.Decimal` in an enum payload —
+    # a type named through its module (`decimal.Decimal` in an enum payload)
     # arrives qualified, and the registry keys structs by their bare name. the
     # only question here is whether the value is a heap struct that has to be
     # retained and released, and two modules with a same-named struct both
@@ -162,14 +162,14 @@ pub fn ir_struct_field_default_node(struct_name: String, field_name: String) -> 
 
 # ---------------------------------------------------------------------------
 # destructor need: whether a struct (or boxed enum) holds any rc field, so
-# every construction site — literals in the core emitter and the decode
-# lowering's result builders alike — answers from one predicate and one memo.
+# every construction site (literals in the core emitter and the decode
+# lowering's result builders alike) answers from one predicate and one memo.
 
 mut ir_dtor_memo: Map[String, Int] := {} # 1 needs dtor, 2 no/undecided
 
 # drop every cached ir_struct_needs_dtor answer. the memo is keyed by
 # bare struct name and derived from the registry's field tables, so it
-# has to be cleared whenever those tables are — the emitter does it in
+# has to be cleared whenever those tables are; the emitter does it in
 # the same breath as clearing the struct registry between modules.
 # leaving it would answer a new module's same-named struct from the
 # old one's fields, and a wrong "no dtor" is a struct whose rc fields
@@ -199,7 +199,7 @@ pub fn ir_enum_needs_dtor(ename: String) -> Bool:
 #
 # false is the answer for a struct the registry does not know, so a
 # caller that asks before the type is registered gets no destructor
-# and the fields it holds are never released — call it after the
+# and the fields it holds are never released; call it after the
 # metadata pass, and reset the memo when the registry changes.
 # a struct that reaches itself only through its own fields answers
 # false on the recursive visit, which is what stops the walk looping.

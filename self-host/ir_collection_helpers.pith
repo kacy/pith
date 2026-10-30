@@ -5,7 +5,7 @@ from ast import get_node, Node
 # true when a map literal's first entry is written with an int literal key.
 # a purely syntactic probe: it reads one entry and only recognizes a
 # literal, so `{i: 1}` looks string-keyed here. it survives as the fallback
-# for a literal the checker left untyped — wherever there is a checked type,
+# for a literal the checker left untyped; wherever there is a checked type,
 # that decides instead.
 pub fn ir_map_uses_int_keys(node: Node) -> Bool:
     if node.children.len() == 0:
@@ -17,7 +17,7 @@ pub fn ir_map_uses_int_keys(node: Node) -> Bool:
     return key_node.kind == "int_lit" or key_node.kind == "int"
 
 # the runtime constructor for a set literal of this type. three flavors
-# exist — int, bytes, and the string default — so anything that is neither
+# exist (int, bytes, and the string default), so anything that is neither
 # "set_int" nor "set_bytes" builds a string set. the constructor fixes the
 # element type for the set's whole life, which is why it has to be picked
 # from the same literal_type as ir_set_add_name.
@@ -41,7 +41,7 @@ pub fn ir_set_add_name(literal_type: String) -> String:
     return "set_add"
 
 # the recorded value type of the map a bare identifier names, or "" for
-# anything else — a field access, an index or a call expression is not
+# anything else: a field access, an index or a call expression is not
 # tracked, so a caller has to have another source of the value type. the
 # state map is a parameter rather than a global so this can live outside the
 # emitter core that owns it; ir_lookup_map_value_type_for_expr there is the
@@ -110,7 +110,7 @@ pub fn ir_for_loop_item_call_name(item_kind: String) -> String:
     return "__list_get"
 
 # the ir return kind of the element a `for` loop reads, "unknown" for an
-# element type this cannot name — a generic body whose element is `T`, for
+# element type this cannot name: a generic body whose element is `T`, for
 # one. "unknown" carries no rc kind, so the loop variable can still be
 # registered as a local under it without the scope cleanup trying to release
 # something it does not understand.
@@ -175,7 +175,7 @@ pub fn ir_for_iter_conversion_return_kind(iter_type: String) -> String:
     return ""
 
 # the length call that gives the counted loop its trip count. a string walk
-# ("char") uses string_len, which counts bytes — that is what makes
+# ("char") uses string_len, which counts bytes; that is what makes
 # `for c in s` a byte loop rather than a codepoint loop. everything else
 # goes through the generic len.
 pub fn ir_for_len_call_name(item_kind: String) -> String:
@@ -185,7 +185,7 @@ pub fn ir_for_len_call_name(item_kind: String) -> String:
 
 # the constructor for an *empty* collection literal being bound to a known
 # target, or "" when the literal has children or the target is not one of
-# the recognized kinds — the caller then lowers the literal the ordinary
+# the recognized kinds; the caller then lowers the literal the ordinary
 # way. the target decides, not the syntax: `{}` parses as a map literal but
 # builds a set when that is what the binding asked for, which is the only
 # thing that can tell the two apart when there are no elements to read.

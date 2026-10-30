@@ -91,6 +91,10 @@ fn drop_repeated_function_bodies(lines: List[String]) -> List[String]:
         out.push(line)
     return out
 
+# the globals and functions an imported module's ir defines, which are the
+# names the rewrite below prefixes, and the startup functions (globals init
+# and cycle-tracer registration) the combined main has to call, already
+# under their prefixed names.
 fn collect_declared_ir_names_from_lines(lines: List[String], prefix: String, init_prefix: String) -> DeclaredIrNames:
     mut global_set: Map[String, Bool] := {}
     mut function_set: Map[String, Bool] := {}
@@ -173,13 +177,18 @@ fn rewrite_declared_function_ref(line: String, declared: DeclaredIrNames, prefix
 # init-prefix rename; a global ref just takes the module prefix, matching the
 # global's own `global`/`store`/`load` lines. without the global fallback, a
 # global fn-value called from inside an imported module keeps its bare name and
-# the consumer — which looks up the prefixed global slot — can't resolve it.
+# the consumer, which looks up the prefixed global slot, can't resolve it.
 fn rewrite_call_callee(line: String, declared: DeclaredIrNames, prefix: String, init_prefix: String, callee_start: Int, callee_end: Int) -> String:
     name := line.substring(callee_start, callee_end)
     if declared.function_set.contains_key(name):
         return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
     return rewrite_declared_global_ref(line, declared, prefix, callee_start, callee_end)
 
+# rewrite one line of an imported module's ir so every symbol it defines or
+# names carries the module prefix: definitions (`func`, `global`), global
+# slot reads and writes, and each instruction that names a function. a name
+# the module does not declare (a runtime builtin, another module's symbol)
+# is left as it is.
 fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix: String, init_prefix: String) -> String:
     first_end := next_space(line, 0)
     if first_end >= line.len():
@@ -237,16 +246,7 @@ fn rewrite_prefixed_import_line(line: String, declared: DeclaredIrNames, prefix:
         callee_end := next_space(line, callee_start)
         return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
 
-    if op == "closure_ref" or op == "closure_stack":
-        reg_start := first_end + 1
-        reg_end := next_space(line, reg_start)
-        if reg_end >= line.len():
-            return line
-        callee_start := reg_end + 1
-        callee_end := next_space(line, callee_start)
-        return rewrite_declared_function_ref(line, declared, prefix, init_prefix, callee_start, callee_end)
-
-    if op == "funcref":
+    if op == "closure_ref" or op == "closure_stack" or op == "funcref":
         reg_start := first_end + 1
         reg_end := next_space(line, reg_start)
         if reg_end >= line.len():

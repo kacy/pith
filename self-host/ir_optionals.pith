@@ -1,9 +1,9 @@
 # ir_optionals.pith - low-level optional IR helpers
 
-from ir_builder import ir_emit, ir_reg, ir_label, ir_new_temp_name
+from ir_builder import ir_emit, ir_reg, ir_label, ir_new_temp_name, ir_zero_reg
+from ir_call_helpers import ir_emit_call1_raw
 from ir_call_emit import ir_emit_call2, ir_emit_label
 from ir_metadata import ir_runtime_call_name
-from ir_result_abi import ir_zero_reg
 from ir_struct_registry import ir_boxed_enums
 from ir_type_helpers import ir_type_from_tid
 from types import get_type_info, get_type_name
@@ -53,7 +53,7 @@ pub fn ir_emit_optional_none_compare(result_reg: Int, op: String, optional_r: In
     else:
         ir_emit("neq " + result_reg.to_string() + " " + flag_r.to_string() + " " + zero_r.to_string())
 
-# Structural equality between two Optionals of the same type. `opt_tid` is
+# structural equality between two Optionals of the same type. `opt_tid` is
 # the shared optional type id; the payload comparison dispatches on its
 # inner type in ir_emit_inner_value_eq below, matching the bare type's `==`.
 #
@@ -87,7 +87,7 @@ pub fn ir_emit_optional_optional_compare(result_reg: Int, op: String, left_r: In
 # none never equals a plain value, so eq is `is_some and value == v` and neq
 # is its negation. the payload comparison dispatches on the inner type in
 # ir_emit_inner_value_eq, the same as the optional-optional compare above.
-# reads only — the payload read borrows, so neither operand's count moves.
+# reads only: the payload read borrows, so neither operand's count moves.
 pub fn ir_emit_optional_plain_compare(result_reg: Int, op: String, opt_r: Int, plain_r: Int, opt_tid: Int):
     info := get_type_info(opt_tid)
     flag := ir_optional_flag_field(opt_r)
@@ -98,8 +98,8 @@ pub fn ir_emit_optional_plain_compare(result_reg: Int, op: String, opt_r: Int, p
 ## the equality register for two values of type `tid`, decided the way `==`
 ## decides it for that type: an optional structurally through the compare
 ## above, a string or a Bytes by content, a boxed enum through its per-enum
-## helper, and everything else — ints, floats, bools, and a struct, which
-## `==` gives pointer identity — as i64 equality. this is what a container
+## helper, and everything else (ints, floats, bools, and a struct, which
+## `==` gives pointer identity) as i64 equality. this is what a container
 ## searching for an element asks, so that `xs.contains(v)` and `xs[i] == v`
 ## cannot disagree. `tid` must name a type; callers with none of their own
 ## keep whatever fallback they had.
@@ -114,7 +114,7 @@ pub fn ir_emit_value_eq_for_tid(tid: Int, a_r: Int, b_r: Int) -> Int:
 # the payload-equality register for one inner type, shared by both optional
 # compares above. the dispatch mirrors ir_emit_value_binary's for the bare
 # type's `==`: strings compare by content through __str_eq, bytes through
-# bytes_eq, and a boxed enum through its per-enum structural helper — a
+# bytes_eq, and a boxed enum through its per-enum structural helper; a
 # boxed enum value is a pointer, so a raw eq would be identity, not
 # equality. everything else (ints, floats, bools) is i64 equality.
 fn ir_emit_inner_value_eq(inner_tid: Int, a_r: Int, b_r: Int) -> Int:
@@ -145,9 +145,6 @@ fn ir_emit_guarded_eq(result_reg: Int, op: String, guard_r: Int, val_eq_r: Int):
         ir_emit("iconst " + one_r.to_string() + " 1")
         ir_emit("neq " + result_reg.to_string() + " " + eq_result.to_string() + " " + one_r.to_string())
 
-fn ir_emit_call1_raw(result_reg: Int, fname: String, ret_kind: String, arg0: Int):
-    ir_emit("call " + result_reg.to_string() + " " + ir_runtime_call_name(fname) + " " + ret_kind + " 1 " + arg0.to_string())
-
 # a Some shell around `value_r`: flag 1 at offset 0, the payload at 8.
 fn ir_emit_some_shell(value_r: Int) -> Int:
     flag_r := ir_reg()
@@ -164,16 +161,14 @@ fn ir_emit_some_shell(value_r: Int) -> Int:
 # wherever an optional is expected. nothing is allocated, and releasing
 # it is a no-op.
 pub fn ir_emit_optional_none_value() -> Int:
-    r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " 0")
-    return r
+    return ir_zero_reg()
 
 # wrap `value_r` in a `Some` shell. the shell BORROWS its payload: no
 # destructor is attached, so releasing the optional frees the two slots
 # and drops nothing else. that is right for a primitive, and for a
 # payload whose count is transferred into the slot and released by
 # whoever unwraps it (an index read, an inner `T??` shell). it is wrong
-# for a payload the shell is meant to own — use ir_emit_optional_owned_some
+# for a payload the shell is meant to own; use ir_emit_optional_owned_some
 # for a struct, list, map, set, bytes, closure or string payload (the
 # return path and the widening wrap both do), or the target dies while
 # the optional still points at it, or nothing ever releases it. the

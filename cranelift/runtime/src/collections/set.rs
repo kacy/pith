@@ -220,8 +220,15 @@ const SET_MAGIC: u32 = 0x50534554;
 /// per access. Freed sets get their magic scrubbed in pith_set_free.
 #[inline]
 unsafe fn set_magic_ok(ptr: *const ()) -> bool {
+    set_magic_ok_for(ptr, crate::quarantine::Op::Use)
+}
+
+/// `set_magic_ok`, naming what the caller does with the set in a quarantine
+/// report.
+#[inline(always)]
+unsafe fn set_magic_ok_for(ptr: *const (), op: crate::quarantine::Op) -> bool {
     handle_registry::plausibly_aligned::<SetImpl>(ptr)
-        && (*(ptr as *const SetImpl)).magic == SET_MAGIC
+        && crate::quarantine::magic_is(std::ptr::addr_of!((*(ptr as *const SetImpl)).magic), SET_MAGIC, op)
 }
 
 unsafe fn set_ref<'a>(set: PithSet) -> Option<&'a SetImpl> {
@@ -332,9 +339,10 @@ pub unsafe extern "C" fn pith_set_clear(set: *mut PithSet) {
 /// Release set and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_release(set: PithSet) {
-    let Some(impl_ref) = set_mut(set) else {
+    if !set_magic_ok_for(set.ptr as *const (), crate::quarantine::Op::Release) {
         return;
-    };
+    }
+    let impl_ref = &mut *(set.ptr as *mut SetImpl);
     let prev = impl_ref
         .rc
         .fetch_sub(1, std::sync::atomic::Ordering::Release);
@@ -342,6 +350,7 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
         return;
     }
     if prev == 0 {
+        crate::quarantine::over_release(crate::quarantine::Kind::Set);
         impl_ref.rc.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
     }
@@ -350,15 +359,15 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
     // Free the set implementation. Scrub the magic first so any handle
     // that outlives the set fails the fast validity check.
     (*(set.ptr as *mut SetImpl)).magic = 0;
-    let _ = Box::from_raw(set.ptr as *mut SetImpl);
+    drop_set_shell(set.ptr as *mut SetImpl);
 }
 
 /// Retain a set handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_retain_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_SET_RETAIN);
-    if let Some(impl_ref) = set_mut_from_handle(handle) {
-        impl_ref
+    if set_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) {
+        (*(handle as *const SetImpl))
             .rc
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -415,7 +424,15 @@ pub(crate) unsafe fn cycle_set_free_dead(handle: i64) {
         return;
     }
     (*(handle as *mut SetImpl)).magic = 0;
-    drop(Box::from_raw(handle as *mut SetImpl));
+    drop_set_shell(handle as *mut SetImpl);
+}
+
+/// Free a dead set's box, or quarantine it.
+unsafe fn drop_set_shell(ptr: *mut SetImpl) {
+    let magic = std::ptr::addr_of_mut!((*ptr).magic);
+    if !crate::quarantine::bury_box(ptr, magic, crate::quarantine::Kind::Set) {
+        drop(Box::from_raw(ptr));
+    }
 }
 
 /// Convert set to list (for int elements)

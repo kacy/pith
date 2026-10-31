@@ -27,6 +27,9 @@ pub const RC_CHECK: u8 = 16;
 /// `PITH_LEAK_SCAN`. Each keeps its own setting; this bit only tells the
 /// string paths that one of them needs looking at.
 pub const CSTRING_DEBUG: u8 = 32;
+/// `PITH_QUARANTINE`: keep freed blocks poisoned and report a use after free
+/// (see `quarantine.rs`).
+pub const QUARANTINE: u8 = 64;
 
 static SWITCHES: AtomicU8 = AtomicU8::new(0);
 
@@ -70,6 +73,9 @@ fn from_env(var: impl Fn(&str) -> Option<String>) -> u8 {
     ];
     if cstring_debug.iter().any(|name| var(name).is_some()) {
         bits |= CSTRING_DEBUG;
+    }
+    if crate::quarantine::enabled_by(var("PITH_QUARANTINE").as_deref()) {
+        bits |= QUARANTINE;
     }
     bits
 }
@@ -125,5 +131,12 @@ mod tests {
         assert_eq!(bits(&[("PITH_LEAK_SCAN", "")]), LOCAL_COUNTS | CSTRING_DEBUG);
         assert_eq!(bits(&[("PITH_PERF_STATS", "yes")]), LOCAL_COUNTS | PERF_STATS);
         assert_eq!(bits(&[("PITH_PERF_STATS", "0")]), LOCAL_COUNTS);
+    }
+
+    #[test]
+    fn quarantine_takes_its_own_bit() {
+        assert_eq!(bits(&[("PITH_QUARANTINE", "1")]), LOCAL_COUNTS | QUARANTINE);
+        assert_eq!(bits(&[("PITH_QUARANTINE", "trace")]), LOCAL_COUNTS | QUARANTINE);
+        assert_eq!(bits(&[("PITH_QUARANTINE", "0")]), LOCAL_COUNTS);
     }
 }

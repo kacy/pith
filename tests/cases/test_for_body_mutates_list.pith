@@ -1,0 +1,72 @@
+# a loop variable borrows its element from the list, so a body that can drop
+# elements (here by clearing, removing, overwriting, or calling code that
+# does) has to give the variable its own count, and has to stop at the
+# list's current length instead of reading a slot the body emptied. each
+# loop refills the list with strings of the same size first, so a variable
+# read after its element was freed would print the filler instead.
+struct Person:
+    name: String
+    tags: List[String]
+
+fn refill(xs: List[String]):
+    mut i := 0
+    while i < 50:
+        xs.push("filler-{i}-xxxxxxxxxxxxxx")
+        i = i + 1
+
+fn wipe(xs: List[String]):
+    xs.clear()
+    refill(xs)
+
+fn main() -> Int:
+    mut xs := "hello-world-string-one hello-world-string-two".split(" ")
+    for s in xs:
+        xs.clear()
+        refill(xs)
+        print("clear: {s}")
+        break
+
+    xs = "hello-world-string-one hello-world-string-two".split(" ")
+    for s in xs:
+        xs.remove(0)
+        refill(xs)
+        print("remove: {s}")
+        break
+
+    xs = "hello-world-string-one hello-world-string-two".split(" ")
+    for s in xs:
+        xs[0] = "replacement-string-xxxx"
+        refill(xs)
+        print("set: {s}")
+        break
+
+    xs = "hello-world-string-one hello-world-string-two".split(" ")
+    for s in xs:
+        wipe(xs)
+        print("call: {s}")
+        break
+
+    # the walk stops at the shrunken length, and a push does not extend it
+    xs = "a b c d".split(" ")
+    mut seen := 0
+    for s in xs:
+        xs.remove(xs.len() - 1)
+        seen = seen + 1
+    print("removed while walking: saw {seen}, left {xs.len()}")
+    xs = "a b".split(" ")
+    seen = 0
+    for s in xs:
+        xs.push(s + s)
+        seen = seen + 1
+    print("pushed while walking: saw {seen}, now {xs.len()}")
+
+    mut people := [Person(name: "alice", tags: ["a", "b"]), Person(name: "bob", tags: ["c"])]
+    for p in people:
+        people.clear()
+        mut i := 0
+        while i < 50:
+            people.push(Person(name: "filler-{i}", tags: ["x{i}", "y", "z"]))
+            i = i + 1
+        print("struct: {p.name} {p.tags.len()} {p.tags[0]}")
+        break
+    return 0

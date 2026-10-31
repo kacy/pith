@@ -169,18 +169,17 @@ pub unsafe fn miss(word: u32, at: *const u32, op: Op) {
 /// `at` must be readable.
 #[inline(always)]
 pub unsafe fn magic_is(at: *const u32, want: u32, op: Op) -> bool {
-    let word = at.read();
-    if word == want {
+    if at.read() == want {
         return true;
     }
-    miss_out_of_line(word, at, op);
+    miss_out_of_line(at, op);
     false
 }
 
 #[cold]
 #[inline(never)]
-fn miss_out_of_line(word: u32, at: *const u32, op: Op) {
-    unsafe { miss(word, at, op) }
+fn miss_out_of_line(at: *const u32, op: Op) {
+    unsafe { miss(at.read(), at, op) }
 }
 
 /// The kind a quarantined block's magic word names, or None for any other

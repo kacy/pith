@@ -3780,20 +3780,23 @@ pub(crate) fn optional_pair(found: Option<i64>) -> crate::ffi_util::ResultPair {
 }
 
 unsafe fn struct_base(ptr: i64) -> Option<*mut u8> {
-    struct_base_for(ptr, crate::quarantine::Op::Use)
+    struct_base_for::<true>(ptr, crate::quarantine::Op::Use)
 }
 
 /// `struct_base`, naming what the caller does with the struct in a
-/// quarantine report.
+/// quarantine report. A count path that knows quarantine is off passes
+/// `REPORT = false` and skips the freed-magic test.
 #[inline(always)]
-unsafe fn struct_base_for(ptr: i64, op: crate::quarantine::Op) -> Option<*mut u8> {
+unsafe fn struct_base_for<const REPORT: bool>(ptr: i64, op: crate::quarantine::Op) -> Option<*mut u8> {
     if ptr == 0 || (ptr as u64) % 8 != 0 {
         return None;
     }
     let base = (ptr as usize).checked_sub(STRUCT_HEADER)? as *mut u8;
     let magic = (base as *const u32).read();
     if magic != STRUCT_MAGIC {
-        crate::quarantine::miss(magic, base as *const u32, op);
+        if REPORT {
+            crate::quarantine::miss(magic, base as *const u32, op);
+        }
         return None;
     }
     Some(base)
@@ -3861,7 +3864,7 @@ unsafe fn struct_retain<const HOOKED: bool>(ptr: i64, switches: u8) {
     if HOOKED {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RETAIN);
     }
-    if let Some(base) = struct_base_for(ptr, crate::quarantine::Op::Retain) {
+    if let Some(base) = struct_base_for::<HOOKED>(ptr, crate::quarantine::Op::Retain) {
         if HOOKED {
             quarantine_check_alive(base, crate::quarantine::Op::Retain);
         }
@@ -3925,7 +3928,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     if HOOKED {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RELEASE);
     }
-    let Some(base) = struct_base_for(ptr, crate::quarantine::Op::Release) else {
+    let Some(base) = struct_base_for::<HOOKED>(ptr, crate::quarantine::Op::Release) else {
         return;
     };
     if HOOKED {

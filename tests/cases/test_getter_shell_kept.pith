@@ -1,0 +1,49 @@
+# a borrowing getter's optional (`xs.get(i)`, `xs.first()`, `xs.last()`,
+# `m.get(k)`) bound to a local outlives the expression that made it. the
+# container is then emptied, so the local is the payload's only owner left;
+# the churn reuses freed memory, so a shell that still borrowed its payload
+# would read back filler.
+struct C:
+    name: String
+
+fn churn() -> List[C]:
+    mut junk: List[C] := []
+    mut i := 0
+    while i < 50:
+        junk.push(C(name: "filler-{i}-x"))
+        i = i + 1
+    return junk
+
+fn main() -> Int:
+    mut xs: List[C] := [C(name: "hello" + "-get")]
+    g := xs.get(0)
+    xs.clear()
+    j := churn()
+    if g != none:
+        print("get bound: {g.value().name}")
+    xs.push(C(name: "hello" + "-first"))
+    f := xs.first()
+    xs.clear()
+    j2 := churn()
+    if f != none:
+        print("first bound: {f.value().name}")
+    xs.push(C(name: "hello" + "-last"))
+    l := xs.last()
+    xs = []
+    j3 := churn()
+    if l != none:
+        print("last bound: {l.value().name}")
+    mut m: Map[String, C] := {}
+    m.insert("k", C(name: "hello" + "-mapget"))
+    mg := m.get("k")
+    m.remove("k")
+    j4 := churn()
+    if mg != none:
+        print("map get bound: {mg.value().name}")
+    mut ss: List[String] := ["hello" + "-str"]
+    sg := ss.get(0)
+    ss.clear()
+    j5 := churn()
+    if sg != none:
+        print("string get bound: {sg.value()}")
+    return 0

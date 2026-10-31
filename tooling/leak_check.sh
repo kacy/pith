@@ -162,6 +162,7 @@ cases=(
   tests/leaks/leak_weak_read_binding
   tests/leaks/leak_weak_read_consumers
   tests/leaks/leak_match_view_pin
+  tests/leaks/leak_getter_shell_consumers
   tests/leaks/leak_weak_capture_cycle
   tests/leaks/leak_closure_captured_optional
   tests/leaks/leak_optional_plain_compare

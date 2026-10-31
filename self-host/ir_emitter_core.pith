@@ -1005,6 +1005,10 @@ fn ir_rc_track_local(name: String, kind: String):
 # closure frees), so the lambda's per-call exit cleanup must leave the slot
 # alone or the weak count underflows.
 mut ir_weak_capture_names: List[String] := []
+# the optional subject an extraction is about to consume on the spot, so a
+# borrowing getter producing it can leave its shell borrowing
+# (ir_owned_receiver_getter_payload_kind)
+mut ir_getter_consumed_idx := 0 - 1
 
 # true when reading `name` must resolve liveness through
 # pith_struct_weak_load: a weak local of the emitting function, or a weak
@@ -1379,10 +1383,17 @@ fn ir_runtime_getter_borrows_payload(emit_name: String) -> Bool:
 # shell can keep borrowing. a receiver that is an owned temporary
 # (`make_list().get(0)`, `load_map().get(k)`) is released right after the
 # call, and when that release frees the container it frees the element too,
-# before anything reads it. in that case the call site retains the payload
-# and attaches the destructor, so the shell owns the payload the same way a
-# transferring getter's shell does. a `T??` element is skipped: its inner
-# shell goes through the extraction rules in ir_shell_producer_transfers.
+# before anything reads it. a shell that is kept is no safer: bound, stored,
+# returned or passed on (`first := xs.first()`), it outlives the expression,
+# and a later `xs.clear()` freed the element under it. in either case the
+# call site retains the payload and attaches the destructor, so the shell
+# owns the payload the same way a transferring getter's shell does. a
+# borrowed receiver whose shell an extraction consumes on the spot (an
+# `if let`, a `while let` or a match subject, `.value()`, `unwrap_or`, a test
+# against `none`) keeps borrowing, which is what keeps a loop of
+# `if let x = xs.get(i)` free of counts; that consumer marks the subject in
+# ir_getter_consumed_idx. a `T??` element is skipped: its inner shell goes
+# through the extraction rules in ir_shell_producer_transfers.
 fn ir_owned_receiver_getter_payload_kind(idx: Int, emit_name: String) -> String:
     if not ir_runtime_getter_borrows_payload(emit_name):
         return ""
@@ -1390,7 +1401,9 @@ fn ir_owned_receiver_getter_payload_kind(idx: Int, emit_name: String) -> String:
     if node.children.len() == 0:
         return ""
     recv_idx := node.children[0]
-    if ir_rc_kind(ir_infer_type(recv_idx)).len() == 0 or ir_expr_is_borrowed(recv_idx):
+    if ir_rc_kind(ir_infer_type(recv_idx)).len() == 0:
+        return ""
+    if idx == ir_getter_consumed_idx and ir_expr_is_borrowed(recv_idx):
         return ""
     opt_tid := c_get_expr_type(idx)
     if opt_tid < 0 or get_type_info(opt_tid).kind != "optional":
@@ -4436,6 +4449,8 @@ fn ir_emit_interp_spec_part(node: Node) -> Int:
     return padded_r
 
 fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
+    # an optional part is read once by the conversion below
+    ir_getter_consumed_idx = expr_idx
     mut part_r := ir_expr(expr_idx)
     part_tid := c_get_expr_type(expr_idx)
     part_type := ir_infer_type(expr_idx)
@@ -5111,6 +5126,8 @@ fn ir_emit_binary_operand(idx: Int, op: String) -> Int:
     if op == "eq" or op == "neq":
         if node_kind(idx) == "none_lit":
             return ir_zero_reg()
+        # a shell tested against none is read once and released
+        ir_getter_consumed_idx = idx
     return ir_expr(idx)
 
 # `none == none` / `none != none`, answered as a constant. returns -1 when
@@ -7751,6 +7768,7 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 # the payload leaves with a count of its own, so a bind, an
                 # argument position or an owned receiver may release it
                 # without touching the count its owner still needs.
+                ir_getter_consumed_idx = node.children[0]
                 obj_r := ir_expr(node.children[0])
                 val_r := ir_optional_value_field(obj_r, recv_tid)
                 inner_kind := ir_rc_kind(ir_type_from_tid(recv_info.inner))
@@ -7764,6 +7782,7 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 return val_r
             if recv_info.kind == "optional" and mname == "unwrap_or":
                 # some(v) -> v, none -> the default argument
+                ir_getter_consumed_idx = node.children[0]
                 obj_r := ir_expr(node.children[0])
                 # a fresh optional (a call/method result) is an owned shell that
                 # would otherwise leak; release it once at the merge below.
@@ -9600,6 +9619,8 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         # ir_optional_subject_is_owned, refined by ir_expr_is_borrowed so a
         # builtin that hands back a borrow stays untouched.
         subj_owned := node.children.len() > 0 and ir_optional_subject_is_owned(node.children[0]) and not ir_expr_is_borrowed(node.children[0])
+        if node.children.len() > 0:
+            ir_getter_consumed_idx = node.children[0]
         pin_name := ir_match_pin_name(idx)
         pin_kind := ir_rc_local_kind(pin_name)
         if pin_kind.len() > 0:
@@ -10738,6 +10759,7 @@ fn ir_let_subject_releases_early(subj_idx: Int) -> Bool:
 fn ir_emit_if_let_stmt(node: Node):
     if node.children.len() < 3:
         return
+    ir_getter_consumed_idx = node.children[1]
     subj_r := ir_expr(node.children[1])
     # a fresh optional (a call/method result) is an owned shell; the binding
     # below takes its own count on an rc payload, so the shell is released
@@ -10780,6 +10802,7 @@ fn ir_emit_while_let_stmt(node: Node):
     body_label := ir_label()
     end_label := ir_label()
     ir_emit_label(head_label)
+    ir_getter_consumed_idx = node.children[1]
     subj_r := ir_expr(node.children[1])
     owns_subject := ir_optional_subject_is_owned(node.children[1])
     cond_r := ir_emit_let_cond(node.children[0], subj_r)

@@ -103,13 +103,16 @@ to recover. the oracles:
   green on).
 
 ```
-make pithgen-sanitize CC=/path/to/cc-asan \
-    PITH_RUNTIME_LIB=/path/to/asan/libpith_runtime.a PITHGEN_SEEDS=0..2000
+make pithgen-sanitize PITHGEN_CC=/path/to/cc-asan \
+    PITHGEN_RUNTIME_LIB=/path/to/asan/libpith_runtime.a PITHGEN_SEEDS=0..2000
 ```
 
 build the asan runtime with `RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zsanitizer=address
 -Zsanitizer-recover=address -Cforce-frame-pointers=yes" cargo build --release
--p pith-runtime --target x86_64-unknown-linux-gnu`. the `CC` wrapper has to
+-p pith-runtime --target x86_64-unknown-linux-gnu`. the make target hands
+`PITHGEN_CC` and `PITHGEN_RUNTIME_LIB` to the run as `CC` and
+`PITH_RUNTIME_LIB`, so the compiler it builds first stays uninstrumented. the
+wrapper has to
 add rustc's `librustc-stable_rt.asan.a` to the link. `pithgen reduce
 --sanitize` reduces a sanitizer or nondeterministic finding under the same
 matrix. there is no leak oracle yet: the generated programs run once, and a

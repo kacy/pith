@@ -871,17 +871,21 @@ pithgen-check: build self-host self-host-ir-driver
 # across the freelist-on/off and green-on/off matrix with an asan-built
 # runtime, so a stale read surfaces as a sanitizer report (the known-benign
 # cstring header probe aside), a crash, or a divergence between the settings.
-# CC and PITH_RUNTIME_LIB come from the environment: point them at a linker
-# wrapper that adds the sanitizer runtime and at an asan-built libpith_runtime.a
-# (see tooling/pithgen/README.md). this is not part of the
+# PITHGEN_CC names a linker wrapper that adds the sanitizer runtime and
+# PITHGEN_RUNTIME_LIB an asan-built libpith_runtime.a (see
+# tooling/pithgen/README.md); they reach the generated programs' builds as CC
+# and PITH_RUNTIME_LIB. they have their own names because a plain CC or
+# PITH_RUNTIME_LIB would also reach the prerequisite builds here and link the
+# compiler itself against the asan runtime. this is not part of the
 # deterministic gate; it needs the asan runtime and finds, not asserts.
 # PITHGEN_SEEDS overrides the range (default a quick 0..200 smoke).
 pithgen-sanitize: build self-host self-host-ir-driver
-	@echo "--- pithgen sanitize (asan matrix; CC + PITH_RUNTIME_LIB from env) ---"
-	@test -n "$(PITH_RUNTIME_LIB)" || { echo "set PITH_RUNTIME_LIB to an asan-built libpith_runtime.a"; exit 2; }
+	@echo "--- pithgen sanitize (asan matrix over freelist and green) ---"
+	@test -n "$(PITHGEN_CC)" -a -n "$(PITHGEN_RUNTIME_LIB)" || { echo "set PITHGEN_CC to an asan linker wrapper and PITHGEN_RUNTIME_LIB to an asan-built libpith_runtime.a"; exit 2; }
 	@cargo build --release --quiet --manifest-path tooling/pithgen/Cargo.toml
 	@rm -rf .pith-build/pithgen-sanitize
-	@PITH_KEEP_SYMBOLS=1 tooling/pithgen/target/release/pithgen run \
+	@CC="$(PITHGEN_CC)" PITH_RUNTIME_LIB="$(PITHGEN_RUNTIME_LIB)" PITH_KEEP_SYMBOLS=1 \
+		tooling/pithgen/target/release/pithgen run \
 		--sanitize --seeds $${PITHGEN_SEEDS:-0..200} \
 		--pith ./target/release/pith --out "$(CURDIR)/.pith-build/pithgen-sanitize"
 

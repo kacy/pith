@@ -5461,6 +5461,39 @@ fn ir_release_higher_order_fn_arg(fn_idx: Int, fn_r: Int):
     if not ir_expr_is_borrowed(fn_idx) and not ir_stack_closure_regs.contains(fn_r):
         ir_rc_release_reg(fn_r, "closure")
 
+# the open-coded loops call their function once per element while holding
+# only borrows: of the list, of each element and, for a function read out of a
+# field, of the function too. a function that can drop any of them
+# (`o.items.map(f)` where f replaces o.items) freed the list mid-walk. such a
+# loop walks a copy of the list instead, which holds a count on every element
+# for the length of the walk, and pins the function. a lambda whose body keeps
+# storage (ir_subtree_keeps_storage) and a named function recorded as a
+# storage keeper cannot drop anything, and their loops stay as they were.
+fn ir_higher_order_fn_may_drop(fn_idx: Int) -> Bool:
+    fn_node := get_node(fn_idx)
+    if fn_node.kind == "lambda":
+        parts := ir_collect_lambda_parts(fn_idx)
+        return parts.body_idx < 0 or not ir_subtree_keeps_storage(parts.body_idx, fn_idx, parts.body_idx)
+    if fn_node.kind == "ident" and not ir_name_is_func_local(fn_node.value) and ir_expr_is_named_function_value(fn_idx):
+        return not ir_is_storage_keeper(ir_resolve_static_callee(fn_idx).name)
+    return true
+
+# the list an open-coded loop walks: the list itself, or a copy when the
+# function may drop it (above)
+fn ir_higher_order_walk_list(list_r: Int, may_drop: Bool) -> Int:
+    if not may_drop:
+        return list_r
+    len_r := ir_reg()
+    ir_emit_call1(len_r, "pith_list_len", "int", list_r)
+    copy_r := ir_reg()
+    ir_emit_call3(copy_r, "list_slice_copy", "list", list_r, ir_zero_reg(), len_r)
+    return copy_r
+
+fn ir_higher_order_walk_done(walk_r: Int, may_drop: Bool, fn_idx: Int, fn_r: Int, fn_pin: String):
+    if may_drop:
+        ir_rc_release_reg(walk_r, "list")
+    ir_unpin_operand(fn_r, fn_pin)
+
 # a lambda literal handed to a callee that only calls it (an open-coded map,
 # filter or reduce, or a parameter ir_record_closure_params proved local)
 # never outlives this call, so it can be built in a stack slot.
@@ -5540,8 +5573,10 @@ fn ir_fn_bindings_by_param(key: String, decl_idx: Int) -> Map[String, String]:
     return out
 
 fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
-    list_r := ir_expr(list_idx)
+    may_drop := ir_higher_order_fn_may_drop(mapper_idx)
+    list_r := ir_higher_order_walk_list(ir_expr(list_idx), may_drop)
     mapper_r := ir_emit_local_fn_arg(mapper_idx)
+    mapper_pin := ir_pin_operand(mapper_idx, mapper_r, may_drop)
     mapper_name := ir_temp_name("__map_fn")
     ir_emit("store " + mapper_name + " " + mapper_r.to_string())
 
@@ -5561,6 +5596,7 @@ fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
     ctor := ir_list_ctor_for_elem_kind(result_elem_kind)
 
     out_r := ir_emit_list_map_loop(list_r, ctor, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
+    ir_higher_order_walk_done(list_r, may_drop, mapper_idx, mapper_r, mapper_pin)
     ir_release_higher_order_fn_arg(mapper_idx, mapper_r)
     return out_r
 
@@ -5570,8 +5606,10 @@ fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
     return ir_emit_list_filter_lowering(idx, ir_call_arg_expr_index(node.children[1]), ir_call_arg_expr_index(node.children[2]))
 
 fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
-    list_r := ir_expr(list_idx)
+    may_drop := ir_higher_order_fn_may_drop(keep_idx)
+    list_r := ir_higher_order_walk_list(ir_expr(list_idx), may_drop)
     keep_r := ir_emit_local_fn_arg(keep_idx)
+    keep_pin := ir_pin_operand(keep_idx, keep_r, may_drop)
     keep_name := ir_temp_name("__filter_fn")
     ir_emit("store " + keep_name + " " + keep_r.to_string())
 
@@ -5588,6 +5626,7 @@ fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
     ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem_kind))
 
     out_r := ir_emit_list_filter_loop(list_r, ctor, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
+    ir_higher_order_walk_done(list_r, may_drop, keep_idx, keep_r, keep_pin)
     ir_release_higher_order_fn_arg(keep_idx, keep_r)
     return out_r
 
@@ -5597,9 +5636,11 @@ fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
     return ir_emit_list_reduce_lowering(idx, ir_call_arg_expr_index(node.children[1]), ir_call_arg_expr_index(node.children[2]), ir_call_arg_expr_index(node.children[3]))
 
 fn ir_emit_list_reduce_lowering(idx: Int, list_idx: Int, init_idx: Int, reducer_idx: Int) -> Int:
-    list_r := ir_expr(list_idx)
+    may_drop := ir_higher_order_fn_may_drop(reducer_idx)
+    list_r := ir_higher_order_walk_list(ir_expr(list_idx), may_drop)
     init_r := ir_expr(init_idx)
     reducer_r := ir_emit_local_fn_arg(reducer_idx)
+    reducer_pin := ir_pin_operand(reducer_idx, reducer_r, may_drop)
     reducer_name := ir_temp_name("__reduce_fn")
     acc_name := ir_temp_name("__reduce_acc")
     ir_emit("store " + reducer_name + " " + reducer_r.to_string())
@@ -5613,6 +5654,7 @@ fn ir_emit_list_reduce_lowering(idx: Int, list_idx: Int, init_idx: Int, reducer_
         result_kind = "unknown"
 
     out_r := ir_emit_list_reduce_loop(list_r, reducer_name, acc_name, ir_retkind(elem_kind), ir_retkind(result_kind), ir_temp_name("__reduce_i"))
+    ir_higher_order_walk_done(list_r, may_drop, reducer_idx, reducer_r, reducer_pin)
     ir_release_higher_order_fn_arg(reducer_idx, reducer_r)
     return out_r
 
@@ -6041,6 +6083,7 @@ fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_tar
     if entry.kind != "entry" or entry.children.len() < 2:
         return
     k_r := ir_expr(entry.children[0])
+    k_pin := ir_pin_operand(entry.children[0], k_r, not ir_subtree_keeps_storage(entry.children[1], 0 - 1, 0 - 1))
     # wrap the value to its declared kind so an optional value type
     # stores Some(v), not the raw v, the same fix collection element
     # literals need (a map literal typed Map[K, Int?] otherwise stored
@@ -6064,6 +6107,7 @@ fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_tar
         tag_r := ir_emit_element_tag_const(entry_kind)
         ir_emit_call4(ir_reg(), kind_store, "void", map_r, k_r, v_r, tag_r)
         ir_release_owned_index_key(entry.children[0], k_r)
+        ir_unpin_operand(k_r, k_pin)
         return
     # both halves of a literal entry follow the rules `m[k] = v` already
     # follows. the runtime copies the key bytes into the map's own storage, so
@@ -6079,6 +6123,7 @@ fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_tar
             plain_store = owned_store
     ir_emit_call3(ir_reg(), plain_store, "void", map_r, k_r, v_r)
     ir_release_owned_index_key(entry.children[0], k_r)
+    ir_unpin_operand(k_r, k_pin)
 
 fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
     map_r := ir_reg()

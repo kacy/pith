@@ -1,0 +1,45 @@
+# map, filter and reduce call their function once per element while the
+# loop holds only borrows of the list, the elements and the function. here
+# the function replaces the list it walks and the field it was read from,
+# so the loop must walk a copy and pin the function. a map literal's key
+# read out of a field must also outlive a value that overwrites the field.
+struct O:
+    mut items: List[String]
+    mut f: fn(String) -> String
+    mut name: String
+
+fn churn() -> List[String]:
+    mut junk: List[String] := []
+    mut i := 0
+    while i < 50:
+        junk.push("filler-{i}-x")
+        i = i + 1
+    return junk
+
+fn plain(s: String) -> String:
+    return s
+
+fn install(o: O):
+    o.f = fn(s: String) -> String:
+        o.f = plain
+        o.items = ["other" + "-list"]
+        j := churn()
+        return s + "!"
+
+fn main() -> Int:
+    o := O(items: ["a" + "-1", "a" + "-2", "a" + "-3"], f: plain, name: "hello" + "-name")
+    install(o)
+    ys := o.items.map(o.f)
+    print("map: {ys.join(",")}")
+    o.items = ["b" + "-1", "b" + "-2"]
+    install(o)
+    zs := o.items.filter(fn(s: String) => o.f(s).len() > 0)
+    print("filter: {zs.join(",")}")
+    mut m: Map[String, String] := {o.name: rename(o)}
+    print("map literal key: {m.keys()[0]}")
+    return 0
+
+fn rename(o: O) -> String:
+    o.name = "replaced" + "-x"
+    j := churn()
+    return "v"

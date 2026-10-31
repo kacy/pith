@@ -19,8 +19,8 @@
 //! corosensei frames between a hook and the real switch push onto whichever
 //! fiber is current. with both switches on the worker side, those frames push
 //! and pop on the task's fiber on every resume, so both shadow stacks stay
-//! balanced; a switch in `suspend` as well left the worker's stack short by
-//! the difference in depth on every round, until it underflowed. the switches
+//! balanced. switching in `suspend` too would leave the worker's stack short
+//! by the difference in depth on every round until it underflowed. the switches
 //! synchronize (flag 0): control passing between a worker and its task is
 //! sequential, and the cross-thread order comes from the scheduling word's
 //! atomics, which tsan sees.

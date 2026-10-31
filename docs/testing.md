@@ -395,6 +395,15 @@ other kinds of test, all wired through the `Makefile`:
 - **invalid access** — `make memcheck` runs a curated set under valgrind, so an
   arc regression that double-frees or reads freed memory is caught before it
   lands.
+- **sanitizers** — `make sanitize-asan` links the whole regression corpus and
+  every std test file against a runtime built with AddressSanitizer and runs
+  them on both backends with the struct freelist off; `make sanitize-tsan`
+  does the same with ThreadSanitizer on os threads. valgrind misses a freed
+  struct the freelist hands straight back out, which is how a double free in
+  a weak field read went unseen, and these do not. the nightly `sanitizers`
+  workflow runs the asan gate. the code the compiler emits is not
+  instrumented, so a read that generated code does inline is only caught once
+  runtime code touches the same block. details are in `tooling/sanitize.sh`.
 - **leak growth** — `make leak-check` runs the cases under `tests/leaks/` at two
   round counts and fails when memory grew between them. this is the other half
   of `memcheck`, which has its leak check switched off on purpose.

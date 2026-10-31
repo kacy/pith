@@ -1,0 +1,29 @@
+name: sanitizers
+# the regression corpus and the std tests against a sanitized runtime. too
+# slow for every push, so this runs nightly and on demand; see
+# tooling/sanitize.sh for what it covers.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: build
+        run: cargo build --release
+
+      - name: build the ir driver from the seed
+        run: ./target/release/pith run examples/hello.pith > /dev/null
+
+      - name: corpus and std tests under asan
+        run: make sanitize-asan-only

@@ -332,7 +332,10 @@ pub fn render_module(module: Module) -> String:
         out = out + "<p class=" + quoted("module-summary") + ">" + render_inline(module.summary) + "</p>"
     out = out + "<div class=" + quoted("module-meta") + ">"
     out = out + "<span><code>" + escape_html(module.path) + "</code></span>"
-    out = out + "<span>" + module.items.len().to_string() + " documented items</span>"
+    mut noun := " documented items"
+    if module.items.len() == 1:
+        noun = " documented item"
+    out = out + "<span>" + module.items.len().to_string() + noun + "</span>"
     out = out + "<span><code>import " + escape_html(module.name) + "</code></span>"
     out = out + "</div>"
     if module.overview.len() > 0:
@@ -361,8 +364,8 @@ pub fn render_module(module: Module) -> String:
 
 # --- navigation and landing --------------------------------------------
 
-# render the sidebar, one heading per namespace. modules arrive sorted, so a
-# change of group is the only signal needed to start a new list.
+# render the sidebar, one heading per namespace. modules arrive sorted by
+# group, so a change of group is the only signal needed to start a new list.
 pub fn render_nav(modules: List[Module]) -> String:
     mut out := ""
     mut current_group := ""

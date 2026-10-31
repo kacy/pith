@@ -33,6 +33,9 @@ page has room where a terminal listing does not:
 - methods from `impl` blocks, with the trait recorded for trait impls so an
   inherent `read` and the `read` satisfying `Reader` stay separate items
 
+Modules are listed by group, `std` first and then each sub-package such as
+`std.net`, and by name within a group.
+
 The renderer emits every module as a real `<section>`. The page is a complete
 document before any script runs: with JavaScript off, every module is
 visible, browser find searches the whole stdlib, and anchor links work. The
@@ -51,4 +54,6 @@ Two rules the extractor depends on:
 - a module's first line reads `# std.name — one-line summary`, with an em dash
   or a plain hyphen
 - a declaration's docs are the comment lines immediately above it, with no
-  blank line between
+  blank line between. A divider comment (a run of `=` or `-`) ends them the
+  way a blank line does, so a section heading above a doc comment stays out
+  of it.

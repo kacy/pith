@@ -328,6 +328,10 @@ fn signature(text: String) -> String:
     limit := min(text.len(), 80)
     while i < limit:
         ch := text[i]
+        # a colon past the message's own prefix usually introduces a quote
+        # of the input, which would make every input its own outcome
+        if ch == ":" and i >= 24:
+            return out
         if ch < "0" or ch > "9":
             out = out + ch
         i = i + 1

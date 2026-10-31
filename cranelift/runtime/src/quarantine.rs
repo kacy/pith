@@ -126,9 +126,13 @@ pub unsafe fn bury_box<T>(ptr: *mut T, magic: *mut u32, kind: Kind) -> bool {
     true
 }
 
+/// `bury` without the switch test, for a caller that has already made it.
+///
+/// # Safety
+/// As for `bury`.
 #[cold]
 #[inline(never)]
-unsafe fn bury_now(block: *mut u8, len: usize, magic: *mut u32, kind: Kind) {
+pub(crate) unsafe fn bury_now(block: *mut u8, len: usize, magic: *mut u32, kind: Kind) {
     std::ptr::write_bytes(block, POISON, len);
     std::ptr::write_volatile(magic, FREED_MAGIC | kind as u32);
     if let Some(sites) = free_sites() {
@@ -137,21 +141,29 @@ unsafe fn bury_now(block: *mut u8, len: usize, magic: *mut u32, kind: Kind) {
     }
 }
 
-/// A validator's magic compare failed on the word `word`, read at `at`.
-/// Under quarantine a freed magic there is reported; anything else is left
-/// to the caller, which treats the handle as invalid as it always has.
+/// A validator's magic compare failed on the word `word`, read at `at`. A
+/// freed magic there is reported; anything else is left to the caller, which
+/// treats the handle as invalid as it always has. The word already in hand
+/// is tested first, so a miss reads the switch only when the word looks
+/// freed, and a live value whose bytes happen to match is not reported
+/// with the mode off.
 ///
 /// # Safety
 /// `at` is only used to look up the free site, never read.
 #[inline(always)]
 pub unsafe fn miss(word: u32, at: *const u32, op: Op) {
-    if on() {
+    if word & FREED_MASK == FREED_MAGIC && on() {
+        // without the hint the compiler tests for a freed magic before the
+        // caller's own magic compare, which costs every valid handle
+        std::hint::cold_path();
         miss_now(word, at, op);
     }
 }
 
 /// Whether the magic word at `at` is `want`, sending a mismatch to `miss`.
-/// The validators of the boxed kinds are built on this.
+/// The validators of the boxed kinds are built on this. A boxed handle
+/// rarely fails its check, so the whole miss is out of line and a valid
+/// handle's path is the compare alone.
 ///
 /// # Safety
 /// `at` must be readable.
@@ -161,8 +173,14 @@ pub unsafe fn magic_is(at: *const u32, want: u32, op: Op) -> bool {
     if word == want {
         return true;
     }
-    miss(word, at, op);
+    miss_out_of_line(word, at, op);
     false
+}
+
+#[cold]
+#[inline(never)]
+fn miss_out_of_line(word: u32, at: *const u32, op: Op) {
+    unsafe { miss(word, at, op) }
 }
 
 /// The kind a quarantined block's magic word names, or None for any other

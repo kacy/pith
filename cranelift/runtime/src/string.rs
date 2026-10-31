@@ -233,6 +233,7 @@ pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
         if let Some(len) = crate::cstring_header_len(cstr) {
             return len;
         }
+        crate::runtime_core::cstring_check_freed(cstr);
         let mut len = 0i64;
         let mut p = cstr;
         while *p != 0 {

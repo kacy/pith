@@ -206,13 +206,14 @@ unsafe fn alloc_cstring<const HOOKED: bool>(data_len: usize) -> *mut i8 {
 /// of the 16 bytes in front of it (mapped binary data) and fails the magic
 /// compare. Same practical-guard contract as the collection magic words.
 pub(crate) unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
-    cstring_base_for(s, crate::quarantine::Op::Use)
+    cstring_base_for::<true>(s, crate::quarantine::Op::Use)
 }
 
 /// `cstring_base`, naming what the caller does with the string in a
-/// quarantine report.
+/// quarantine report. A count path that already knows quarantine is off
+/// passes `REPORT = false` and skips the freed-magic test.
 #[inline(always)]
-unsafe fn cstring_base_for(s: *const i8, op: crate::quarantine::Op) -> Option<*mut u8> {
+unsafe fn cstring_base_for<const REPORT: bool>(s: *const i8, op: crate::quarantine::Op) -> Option<*mut u8> {
     let addr = s as usize;
     if addr < CSTRING_HEADER_SIZE || addr % CSTRING_ALIGN != 0 {
         return None;
@@ -224,7 +225,9 @@ unsafe fn cstring_base_for(s: *const i8, op: crate::quarantine::Op) -> Option<*m
     // count into read-only data.
     let magic = std::ptr::read_volatile(base as *const u32);
     if magic != CSTRING_MAGIC {
-        crate::quarantine::miss(magic, base as *const u32, op);
+        if REPORT {
+            crate::quarantine::miss(magic, base as *const u32, op);
+        }
         return None;
     }
     Some(base)
@@ -240,7 +243,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
     if crate::switches::any(CSTRING_HOOKS) {
         return cstring_retain_hooked(s);
     }
-    if let Some(base) = cstring_base(s) {
+    if let Some(base) = cstring_base_for::<false>(s, crate::quarantine::Op::Retain) {
         cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -248,7 +251,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
 #[cold]
 #[inline(never)]
 unsafe fn cstring_retain_hooked(s: *const i8) {
-    if let Some(base) = cstring_base_for(s, crate::quarantine::Op::Retain) {
+    if let Some(base) = cstring_base_for::<true>(s, crate::quarantine::Op::Retain) {
         crate::perf_count(&crate::PERF_CSTRING_RETAINS, 1);
         let prev = cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
         cstring_watch(base, s, "retain", prev as i64, 1);
@@ -294,7 +297,7 @@ unsafe fn cstring_release_hooked(s: *const i8) {
 
 #[inline(always)]
 unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
-    if let Some(base) = cstring_base_for(s, crate::quarantine::Op::Release) {
+    if let Some(base) = cstring_base_for::<HOOKED>(s, crate::quarantine::Op::Release) {
         if HOOKED {
             crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
         }
@@ -418,10 +421,20 @@ pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
     let base = (s as *const u8).sub(CSTRING_HEADER_SIZE);
     let magic = (base as *const u32).read();
     if magic != CSTRING_MAGIC && magic != CSTRING_STATIC_MAGIC {
-        crate::quarantine::miss(magic, base as *const u32, crate::quarantine::Op::Use);
         return None;
     }
     Some(cstring_data_len(base) as i64)
+}
+
+/// Under quarantine, report `s` if it is a freed heap string. A reader whose
+/// header lookup failed calls this before it falls back to counting bytes,
+/// which keeps the test off the header path every heap string takes.
+#[cold]
+#[inline(never)]
+pub(crate) unsafe fn cstring_check_freed(s: *const i8) {
+    if crate::quarantine::on() {
+        cstring_base(s);
+    }
 }
 
 /// Debug: release with an emission-site id; prints the site when the traced
@@ -3677,7 +3690,7 @@ unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
     if struct_local(base, switches) {
         crate::share::check_local(switches, base.add(STRUCT_HEADER) as i64, "weak release");
         if count_down(weak, true) == 1 {
-            struct_free_header(base);
+            struct_free_header_for(base, switches);
         }
         return;
     }
@@ -3691,15 +3704,27 @@ unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
         }
         fence(Ordering::Acquire);
     }
-    struct_free_header(base);
+    struct_free_header_for(base, switches);
 }
 
-/// Scrub and free (or pool) a struct header nothing references any more.
-unsafe fn struct_free_header(base: *mut u8) {
+/// `struct_free_header` with quarantine read from `switches`.
+unsafe fn struct_free_header_for(base: *mut u8, switches: u8) {
+    if switches & crate::switches::QUARANTINE != 0 {
+        struct_free_header::<true>(base);
+    } else {
+        struct_free_header::<false>(base);
+    }
+}
+
+/// Scrub and free (or pool) a struct header nothing references any more, or
+/// keep it poisoned under quarantine. A release that knows quarantine is off
+/// takes the `false` copy and pays nothing for it.
+unsafe fn struct_free_header<const QUARANTINE: bool>(base: *mut u8) {
     crate::share::forget_owner(base.add(STRUCT_HEADER) as i64);
     let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
     let total = size + STRUCT_HEADER;
-    if crate::quarantine::bury(base, total, base as *mut u32, crate::quarantine::Kind::Struct) {
+    if QUARANTINE {
+        crate::quarantine::bury_now(base, total, base as *mut u32, crate::quarantine::Kind::Struct);
         return;
     }
     // scrub the magic so any stale pointer fails the check
@@ -3971,7 +3996,11 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     // so the header is freed without setting it. a destructor that made a
     // weak reference, or a suspect buffer holding one, keeps the full path.
     if weak.load(Ordering::Acquire) == 1 {
-        struct_free_header(base);
+        if HOOKED {
+            struct_free_header_for(base, switches);
+        } else {
+            struct_free_header::<false>(base);
+        }
         return;
     }
     // the value is now dead; a weak read after this returns none. the release

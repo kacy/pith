@@ -762,7 +762,8 @@ fn run_target(target: String, input: Bytes) -> Outcome:
 # buffers between the feeder and the server).
 fn read_budget(target: String) -> Int:
     if target == "http1":
-        return http.MAX_HEADER_BYTES + http.MAX_REQUEST_BODY + 1048576
+        # chunk framing may legitimately double the bytes behind a body
+        return http.MAX_HEADER_BYTES + 2 * http.MAX_REQUEST_BODY + 1048576
     if target == "websocket":
         return 16777216 + 1048576
     if target == "h2server":

@@ -131,6 +131,9 @@ pub(super) struct SyncBlock {
     pub(super) join: Mutex<Join>,
     /// os-thread awaiters wait here for `finish_task` to record the result.
     pub(super) joined: Condvar,
+    /// what the sanitizers need to follow the task's stack switches; empty
+    /// in a build without one.
+    pub(super) fiber: Fiber,
 }
 
 // SAFETY: `word` is an atomic; the cells are guarded by the claim protocol
@@ -152,6 +155,7 @@ impl SyncBlock {
             handoff: UnsafeCell::new(None),
             join: Mutex::new(Join::default()),
             joined: Condvar::new(),
+            fiber: Fiber::new(),
         }
     }
 
@@ -160,7 +164,7 @@ impl SyncBlock {
     /// the caller enqueues the task after that, so nothing sees a half-armed
     /// block. the previous task was retired, so a wake aimed at it reads
     /// `Done` until the store below and no-ops.
-    pub(super) fn arm(&self, coro: SendCoroutine, closure: i64) -> u32 {
+    pub(super) fn arm(&self, coro: SendCoroutine, stack: StackBounds, closure: i64) -> u32 {
         // SAFETY: the id came off a free pool, so no task owns this block and
         // no thread touches its cells until the task is enqueued below.
         unsafe {
@@ -170,6 +174,7 @@ impl SyncBlock {
             *self.handoff.get() = None;
             debug_assert!((*self.tls.get()).is_empty(), "a retired task left threadlocals");
         }
+        self.fiber.arm(stack);
         let generation = {
             let mut join = lock_join(&self.join);
             join.live = true;

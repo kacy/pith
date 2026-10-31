@@ -704,7 +704,8 @@ fn hits_known_bug(target: String, input: Bytes) -> Bool:
         return long_exponent(input)
     return false
 
-# an e or E, an optional sign, then seven or more digits
+# an e or E, an optional sign, then seven or more digits (dots included:
+# 1e9.99999999999 hangs the same loop)
 fn long_exponent(input: Bytes) -> Bool:
     mut i := 0
     while i < input.len():
@@ -713,7 +714,7 @@ fn long_exponent(input: Bytes) -> Bool:
             if j < input.len() and (input[j] == 43 or input[j] == 45):
                 j = j + 1
             mut digits := 0
-            while j < input.len() and input[j] >= 48 and input[j] <= 57:
+            while j < input.len() and ((input[j] >= 48 and input[j] <= 57) or input[j] == 46):
                 digits = digits + 1
                 j = j + 1
             if digits >= 7:

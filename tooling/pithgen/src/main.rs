@@ -37,7 +37,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: pithgen gen --seed N [--out DIR] | pithgen run --seeds A..B --pith PATH --out DIR [--valgrind] [--keep-all] [--fail-on-findings] | pithgen reduce --seed N --pith PATH --out DIR [--class CLASS]"
+            "usage: pithgen gen --seed N [--out DIR] | pithgen run --seeds A..B --pith PATH --out DIR [--valgrind] [--sanitize] [--keep-all] [--fail-on-findings] | pithgen reduce --seed N --pith PATH --out DIR [--class CLASS]"
         );
         std::process::exit(2);
     }
@@ -116,7 +116,13 @@ fn cmd_run(args: &[String]) {
     let pith = flag_value(args, "--pith").expect("--pith PATH required");
     let out_dir = PathBuf::from(flag_value(args, "--out").expect("--out DIR required"));
     let valgrind = args.iter().any(|a| a == "--valgrind");
+    let sanitize = args.iter().any(|a| a == "--sanitize");
     let keep_all = args.iter().any(|a| a == "--keep-all");
+    let mode = if sanitize {
+        oracle::RunMode::Sanitize
+    } else {
+        oracle::RunMode::Plain { valgrind_mem: valgrind }
+    };
     // gate mode: any finding is a failure. the ci smoke runs a fixed seed
     // range that is known clean, so a nonzero exit means a regression.
     let fail_on_findings = args.iter().any(|a| a == "--fail-on-findings");
@@ -145,7 +151,7 @@ fn cmd_run(args: &[String]) {
         expected_lines += prog.expected.len() as u64;
         wildcard_lines += prog.expected.iter().filter(|l| l.wildcard).count() as u64;
 
-        let outcome = oracle::run_case(seed, &prog.files, Some(&prog.expected), &tc, &case_dir, valgrind);
+        let outcome = oracle::run_case(seed, &prog.files, Some(&prog.expected), &tc, &case_dir, mode);
         if let Some(what) = outcome.hang {
             hangs.push((seed, what));
         }

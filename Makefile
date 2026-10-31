@@ -873,7 +873,7 @@ pithgen-check: build self-host self-host-ir-driver
 # cstring header probe aside), a crash, or a divergence between the settings.
 # CC and PITH_RUNTIME_LIB come from the environment: point them at a linker
 # wrapper that adds the sanitizer runtime and at an asan-built libpith_runtime.a
-# (see docs/testing.md and tooling/pithgen/README.md). this is NOT part of the
+# (see tooling/pithgen/README.md). this is not part of the
 # deterministic gate; it needs the asan runtime and finds, not asserts.
 # PITHGEN_SEEDS overrides the range (default a quick 0..200 smoke).
 pithgen-sanitize: build self-host self-host-ir-driver

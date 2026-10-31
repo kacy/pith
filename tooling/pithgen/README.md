@@ -71,6 +71,50 @@ the expected-vs-actual pair with digit runs collapsed; finding.txt
 carries the surrounding context, plus expected.txt and stdout.txt for
 a straight diff.
 
+## ownership shapes and the sanitize oracle
+
+most programs (85%) also get an ownership block: fixed helper declarations
+(`ONode` with a strong `next` and a weak `back`, `OHolder`, `OSlot`, a
+global list, churn and refill helpers) and a random subset of 23 shapes aimed
+at the emitter's borrow-or-own decision. these are the shapes that have
+broken before, plus their neighbors: a `for` loop whose body clears, removes,
+overwrites or pushes onto the list it walks, directly or through a call, a
+global or a closure; a field, element or optional passed alongside its owner
+to a callee that overwrites it; weak fields read off a live owner, off a
+temporary and through `if let`; optionals and payloads bound from a field
+that is then cleared or rebound; early return, `continue` and nested loops
+over mutated lists. every value they print is a fresh heap string the
+generator computes, so a stale read shows up as filler.
+
+on the plain toolchain these run clean, because the struct freelist recycles
+a freed block before anything reads it. `--sanitize` changes how the built
+binary runs. it links against whatever runtime `PITH_RUNTIME_LIB` names,
+through the `CC` linker wrapper (both inherited from the environment), and
+runs four times: freelist off and on, green backend on and off, with asan set
+to recover. the oracles:
+
+- **sanitizer**: an AddressSanitizer report other than the known-benign
+  cstring header probe (a global-buffer-overflow just before an `alloc_`
+  runtime static). the signature is the error kind plus the innermost
+  generated frame of the access, the free and the allocation, so one bug is
+  one bucket, and every distinct report in a program is recorded.
+- **nondeterministic**: stdout differs between the four settings.
+- run-crash and wrong-output as usual, on the canonical run (freelist off,
+  green on).
+
+```
+make pithgen-sanitize CC=/path/to/cc-asan \
+    PITH_RUNTIME_LIB=/path/to/asan/libpith_runtime.a PITHGEN_SEEDS=0..2000
+```
+
+build the asan runtime with `RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zsanitizer=address
+-Zsanitizer-recover=address -Cforce-frame-pointers=yes" cargo build --release
+-p pith-runtime --target x86_64-unknown-linux-gnu`. the `CC` wrapper has to
+add rustc's `librustc-stable_rt.asan.a` to the link. `pithgen reduce
+--sanitize` reduces a sanitizer or nondeterministic finding under the same
+matrix. there is no leak oracle yet: the generated programs run once, and a
+growth check needs a repeated-round mode they do not have.
+
 ## reducing a finding
 
 ```

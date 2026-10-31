@@ -7345,6 +7345,16 @@ fn ir_emit_stringify_value(value_r: Int, value_tid: Int) -> Int:
             return ir_emit_result_value_to_string(value_r, value_tid)
         if value_info.kind == "optional":
             return ir_emit_optional_value_to_string(value_r, value_tid)
+        # a payload under an optional or a result renders the way the same
+        # value does as an interpolation part. handing the value itself back
+        # made `"{xs.get(0)}"` on a struct element release the struct as if it
+        # were the string
+        if value_info.kind == "list":
+            return ir_emit_display_list(value_r, ir_type_from_tid(value_info.inner), false)
+        if value_info.kind == "map":
+            return ir_emit_display_map(value_r, ir_type_from_tid(value_info.key_type), ir_type_from_tid(value_info.value_type))
+    if value_type.len() > 0 and ir_struct_names.contains_key(value_type) and not ir_boxed_enums.contains_key(value_type):
+        return ir_emit_display_struct(value_r, value_type)
     return value_r
 
 fn ir_emit_result_to_string(node: Node) -> Int:

@@ -13,6 +13,7 @@
 # filtering, and the command palette on top of that markup.
 import std.algo as algo
 import std.fs as fs
+import std.strings as strings
 
 # a single documented declaration.
 #
@@ -64,6 +65,21 @@ fn strip_comment_marker(line: String) -> String:
 
 fn is_comment_line(line: String) -> Bool:
     return line.trim().starts_with("#")
+
+# a section divider: a comment that is nothing but a run of `=` or `-`. a
+# module that heads each section with one sometimes puts its next doc comment
+# directly under it, so a divider ends a doc comment the way a blank line does.
+fn is_divider_line(line: String) -> Bool:
+    text := strip_comment_marker(line).trim()
+    if text.len() < 5:
+        return false
+    first := text[0]
+    if first != "=" and first != "-":
+        return false
+    for c in text:
+        if c != first:
+            return false
+    return true
 
 # the header's first line reads "std.math — pure Pith math library". the
 # separator is either an em dash (three bytes in utf-8) or a plain hyphen.
@@ -150,7 +166,7 @@ fn doc_above(lines: List[String], index: Int, floor: Int) -> String:
     mut collected: List[String] := []
     mut back := index - 1
     while back >= floor:
-        if not is_comment_line(lines[back]):
+        if not is_comment_line(lines[back]) or is_divider_line(lines[back]):
             break
         collected.push(strip_comment_marker(lines[back]))
         back = back - 1
@@ -184,7 +200,9 @@ fn indented_block(lines: List[String], start: Int) -> List[String]:
 
 # read one module's documentation out of its source text.
 pub fn extract_module(source: String, module_name: String, rel_path: String) -> Module:
-    lines := source.split(chr(10))
+    # `split` drops empty parts, and a blank line is what ends a doc comment,
+    # so the lines have to come from a splitter that keeps them.
+    lines := strings.lines(source)
     mut summary := ""
     mut overview: List[String] := []
     mut cursor := 0
@@ -256,7 +274,9 @@ fn path_to_module(rel_path: String) -> String:
         name = name.substring(0, name.len() - 5)
     return name.replace("/", ".")
 
-# find every stdlib module under `root`, in a stable sorted order.
+# find every stdlib module under `root`, sorted by group and then by name, so
+# each group's modules are adjacent. sorting by name alone splits a group:
+# `std.data.table` lands between `std.cli` and `std.datetime`.
 pub fn load_modules(root: String) -> List[Module]!:
     mut modules: List[Module] := []
     for entry in fs.walk(root + "/std")!:
@@ -265,4 +285,5 @@ pub fn load_modules(root: String) -> List[Module]!:
         rel := entry.path.substring(root.len() + 1, entry.path.len())
         source := fs.read(entry.path)!
         modules.push(extract_module(source, path_to_module(rel), rel))
-    return algo.sort_by_key(modules, fn(m: Module) => m.name)
+    # a space sorts before a dot, so the `std` group comes before `std.data`.
+    return algo.sort_by_key(modules, fn(m: Module) => m.group + " " + m.name)

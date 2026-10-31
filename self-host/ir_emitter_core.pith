@@ -3220,13 +3220,64 @@ fn ir_arg_pin_kind(expr_idx: Int) -> String:
         return ""
     return kind
 
-# pin the argument just evaluated into `reg` when it needs it, and record the
-# kind (or "") so ir_unpin_args can release it after the call.
-fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String]):
-    kind := ir_arg_pin_kind(expr_idx)
+# pin the argument just evaluated into `reg` when pin is set and it needs it,
+# and record the kind (or "") so ir_unpin_args can release it after the call.
+fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String], pin: Bool):
+    mut kind := ""
+    if pin:
+        kind = ir_arg_pin_kind(expr_idx)
     if kind.len() > 0:
         ir_rc_retain_reg(reg, kind)
     pins.push(kind)
+
+# the same hazard without a user callee: an operand read out of storage is
+# still only a borrow when an operand evaluated after it runs code that can
+# drop its owner, and the operation reads it after that. `o.name +
+# rename(o)` and `m.insert(o.name, rename(o))` freed the read before the
+# concat or the insert used it. for each operand, whether a later one can
+# drop a value a field, an element or a global holds
+# (ir_subtree_keeps_storage); such an operand is pinned like an argument.
+fn ir_later_operands_drop(exprs: List[Int]) -> List[Bool]:
+    mut out: List[Bool] := []
+    for e in exprs:
+        out.push(false)
+    mut drops := false
+    mut i := exprs.len() - 1
+    while i >= 0:
+        out[i] = drops
+        if not drops and exprs[i] >= 0 and not ir_subtree_keeps_storage(exprs[i], 0 - 1, 0 - 1):
+            drops = true
+        i = i - 1
+    return out
+
+# pin one operand when a later one can drop it; the kind to unpin, or ""
+fn ir_pin_operand(expr_idx: Int, reg: Int, later_drops: Bool) -> String:
+    if not later_drops:
+        return ""
+    kind := ir_arg_pin_kind(expr_idx)
+    if kind.len() > 0:
+        ir_rc_retain_reg(reg, kind)
+    return kind
+
+fn ir_unpin_operand(reg: Int, kind: String):
+    if kind.len() > 0:
+        ir_rc_release_reg(reg, kind)
+
+# the argument expressions of a call or method node from start_idx on, in the
+# order the collectors below evaluate them
+fn ir_call_operand_exprs(node: Node, start_idx: Int) -> List[Int]:
+    mut exprs: List[Int] := []
+    for child, i in node.children:
+        if i < start_idx:
+            continue
+        mut expr_idx := child
+        if node_kind(child) == "arg":
+            cn := get_node(child)
+            if cn.children.len() == 0:
+                continue
+            expr_idx = cn.children[0]
+        exprs.push(expr_idx)
+    return exprs
 
 # release what ir_pin_arg retained. pins is aligned with regs.
 fn ir_unpin_args(regs: List[Int], pins: List[String]):
@@ -3245,8 +3296,10 @@ fn ir_callee_runs_user_code(callee_idx: Int) -> Bool:
 
 # local_fn_positions lists the arguments, counted from start_idx, that land in
 # a parameter the callee only calls (see ir_record_closure_params). with pin
-# set, arguments are pinned as above and pins receives one entry per register.
+# set, arguments are pinned as above; an argument a later one can drop is
+# pinned either way. pins receives one entry per register.
 fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int], pin: Bool, pins: List[String]) -> List[Int]:
+    later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, start_idx))
     mut arg_regs: List[Int] := []
     for child, i in node.children:
         if i < start_idx:
@@ -3259,13 +3312,11 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List
             expr_idx = cn.children[0]
         if local_fn_positions.contains(i - start_idx):
             arg_regs.push(ir_emit_local_fn_arg(expr_idx))
-            if pin:
-                pins.push("")
+            pins.push("")
         else:
             arg_r := ir_emit_call_arg(expr_idx)
+            ir_pin_arg(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
             arg_regs.push(arg_r)
-            if pin:
-                ir_pin_arg(expr_idx, arg_r, pins)
     return arg_regs
 
 # owned string arguments (fresh chars from s[i], concat results, fresh
@@ -4282,6 +4333,7 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
 # method, which is user code) the receiver and the arguments are pinned the
 # way ir_collect_call_arg_regs pins, one pins entry per register.
 fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> List[Int]:
+    later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, 0))
     mut regs: List[Int] := []
     for child, i in node.children:
         mut expr_idx := child
@@ -4295,9 +4347,8 @@ fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> Lis
             r = ir_expr(expr_idx)
         else:
             r = ir_emit_call_arg(expr_idx)
+        ir_pin_arg(expr_idx, r, pins, pin or later_drops[regs.len()])
         regs.push(r)
-        if pin:
-            ir_pin_arg(expr_idx, r, pins)
     return regs
 
 # {x:8.2}-style parts: convert with precision when asked, then pad.
@@ -5040,14 +5091,16 @@ fn ir_emit_binary_expr(node: Node) -> Int:
     if node.value == "and" or node.value == "or":
         return ir_emit_short_circuit_logic(node)
     left_r := ir_emit_binary_operand(node.children[0], node.value)
+    left_pin := ir_pin_operand(node.children[0], left_r, not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1))
     right_r := ir_emit_binary_operand(node.children[1], node.value)
     r := ir_reg()
     # Optional-typed `==` / `!=` compares by (is_some, value), not by pointer
     # identity, and has several shapes; try it before the value operators.
-    opt_r := ir_emit_optional_binary_compare(node, r, left_r, right_r)
-    if opt_r >= 0:
-        return opt_r
-    return ir_emit_value_binary(node, r, left_r, right_r)
+    mut out_r := ir_emit_optional_binary_compare(node, r, left_r, right_r)
+    if out_r < 0:
+        out_r = ir_emit_value_binary(node, r, left_r, right_r)
+    ir_unpin_operand(left_r, left_pin)
+    return out_r
 
 # emit one operand of a binary expression. a bare `none` under `==` / `!=` is
 # the exception: every comparison shape below reads the *other* side and only
@@ -5346,8 +5399,10 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int], want_equal: Bool) -> 
     return r
 
 fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node: Node) -> Int:
-    arg_regs := ir_collect_call_arg_regs(node, 1, [], false, [])
+    mut arg_pins: List[String] := []
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], false, arg_pins)
     if arg_regs.len() < 2:
+        ir_unpin_args(arg_regs, arg_pins)
         return ir_zero_reg()
 
     input_r := arg_regs[0]
@@ -5369,6 +5424,7 @@ fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node:
     ir_emit_call2(path_result_r, decode_path_name, "tuple", root_r, dotted_path_r)
     ir_emit("store " + temp_name + " " + path_result_r.to_string())
     ir_emit_label(done_l)
+    ir_unpin_args(arg_regs, arg_pins)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
@@ -6418,21 +6474,28 @@ fn ir_emit_attach_tuple_dtor(tuple_r: Int, elem_nodes: List[Int]):
 fn ir_emit_tuple_literal(node: Node) -> Int:
     mut elem_regs: List[Int] := []
     mut elem_nodes: List[Int] := []
-    for child in node.children:
+    # every element is evaluated before the stores take their counts
+    later_drops := ir_later_operands_drop(node.children)
+    mut elem_pins: List[String] := []
+    for child, ci in node.children:
         cn := get_node(child)
         if cn.kind == "none_lit":
             # a none element can only be an optional; build the canonical
             # optional none rather than a bare zero, so element reads go
             # through the optional machinery.
             elem_regs.push(ir_emit_optional_none_value())
+            elem_pins.push("")
         else:
-            elem_regs.push(ir_expr(child))
+            elem_r := ir_expr(child)
+            elem_regs.push(elem_r)
+            elem_pins.push(ir_pin_operand(child, elem_r, later_drops[ci]))
         elem_nodes.push(child)
     r := ir_reg()
     nf := ir_reg()
     ir_emit("iconst " + nf.to_string() + " " + elem_regs.len().to_string())
     ir_emit_call1(r, "__struct_alloc", "struct:tuple", nf)
     ir_emit_tuple_literal_stores(r, elem_regs, elem_nodes)
+    ir_unpin_args(elem_regs, elem_pins)
     ir_emit_attach_tuple_dtor(r, elem_nodes)
     return r
 
@@ -7832,7 +7895,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 arg_idx := ir_method_call_arg_expr(node, ai)
                 arg_r := ir_emit_call_arg(arg_idx)
                 arg_regs.push(arg_r)
-                ir_pin_arg(arg_idx, arg_r, arg_pins)
+                ir_pin_arg(arg_idx, arg_r, arg_pins, true)
                 ai = ai + 1
             r := ir_reg()
             ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
@@ -8038,10 +8101,18 @@ fn ir_emit_string_interp(idx: Int) -> Int:
     mut result_owned := false
     mut _fi4 := 0
     kids4_children := node.children
+    # a borrowed part is read by the concat that follows the next part, so a
+    # later part that can drop it pins it until the fold is done
+    later_drops := ir_later_operands_drop(kids4_children)
+    mut pinned_regs: List[Int] := []
+    mut pinned_kinds: List[String] := []
     while _fi4 < kids4_children.len():
         child := kids4_children[_fi4]
         part_r := ir_string_interp_part_reg(child)
         part_owned := ir_string_interp_part_owned(child)
+        if not part_owned:
+            pinned_regs.push(part_r)
+            pinned_kinds.push(ir_pin_operand(child, part_r, later_drops[_fi4]))
         if result_r < 0:
             result_r = part_r
             result_owned = part_owned
@@ -8063,6 +8134,7 @@ fn ir_emit_string_interp(idx: Int) -> Int:
         # single borrowed part ("{s}"): callers treat interpolation results
         # as owned, so give this one its own count
         ir_string_retain_reg(result_r)
+    ir_unpin_args(pinned_regs, pinned_kinds)
     return result_r
 
 # --- lambda compilation ---
@@ -8913,6 +8985,20 @@ fn ir_emit_fail_expr(node: Node) -> Int:
 
 fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     obj_r := ir_expr(node.children[0])
+    # `o.items[shrink(o)]`: a key that can drop the container read before it
+    # pins the container for the read. the element then takes a count of its
+    # own before the pin goes, since the pin may have been the container's
+    # last; a consumer that retains it as well leaks it, which is the safe
+    # side for a shape this rare.
+    obj_pin := ir_pin_operand(node.children[0], obj_r, not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1))
+    if obj_pin.len() > 0:
+        read_r := ir_emit_index_read(idx, node, obj_r)
+        ir_rc_retain_reg(read_r, ir_rc_kind(ir_infer_type(idx)))
+        ir_unpin_operand(obj_r, obj_pin)
+        return read_r
+    return ir_emit_index_read(idx, node, obj_r)
+
+fn ir_emit_index_read(idx: Int, node: Node, obj_r: Int) -> Int:
     idx_r := ir_expr(node.children[1])
     r := ir_reg()
     mut obj_type := ir_checked_type(node.children[0])
@@ -9166,8 +9252,11 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     if ir_try_emit_map_upsert_add(target.children[0], target.children[1], value_idx) >= 0:
         return true
 
+    later_drops := ir_later_operands_drop([target.children[0], target.children[1], value_idx])
     obj_r := ir_expr(target.children[0])
+    obj_pin := ir_pin_operand(target.children[0], obj_r, later_drops[0])
     idx_r := ir_expr(target.children[1])
+    idx_pin := ir_pin_operand(target.children[1], idx_r, later_drops[1])
     mut obj_type := ir_checked_type(target.children[0])
     mut value_type := ir_checked_index_type(target_idx)
     if obj_type.len() == 0:
@@ -9198,6 +9287,8 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
         tag_r := ir_emit_element_tag_const(idx_store_kind)
         ir_emit_call4(ir_reg(), idx_kind_store, "void", obj_r, idx_r, value_r, tag_r)
         ir_release_owned_index_key(target.children[1], idx_r)
+        ir_unpin_operand(obj_r, obj_pin)
+        ir_unpin_operand(idx_r, idx_pin)
         return true
     if not idx_borrowed and ir_container_store_takes_count(idx_store_kind):
         # `m[k] = "v-{i}"` builds a value nobody else tracks. the store takes
@@ -9217,6 +9308,8 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # different question: the container retains that, and it stays under the
     # container-store exception in docs/ownership.md.
     ir_release_owned_index_key(target.children[1], idx_r)
+    ir_unpin_operand(obj_r, obj_pin)
+    ir_unpin_operand(idx_r, idx_pin)
     return true
 
 # --- expression lowering ---
@@ -10049,13 +10142,15 @@ fn ir_emit_assign_stmt(node: Node):
         # retain/release pair too but are never in the exit cleanup.
         legacy_kind := ir_rc_kind(ir_lookup_name_type(name))
         tracked := ir_rc_local_kind(name).len() > 0
+        legacy_target := ir_map_init_target(name, ir_lookup_name_type(name))
+        r := ir_emit_value_for_target(node.children[0], legacy_target)
+        # the old value is read after the new one, for the reason
+        # ir_emit_field_assignment gives: a global the value overwrote
         mut old_r := 0 - 1
         if legacy_kind.len() > 0 and ir_rc_release_enabled(legacy_kind):
             if tracked or (legacy_kind == "string" and ir_global_string_names.contains(name)) or ir_assign_targets_global_slot(name):
                 old_r = ir_reg()
                 ir_emit_name_load(old_r, name)
-        legacy_target := ir_map_init_target(name, ir_lookup_name_type(name))
-        r := ir_emit_value_for_target(node.children[0], legacy_target)
         # any task can read a module global, so what it is given is marked
         # shared, by the value's own type (a function value's type names no
         # rc kind)
@@ -10109,6 +10204,9 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
         return false
     field_index := ir_unpack_field_index(ir_struct_field_index_lookup[lookup_key])
     obj_r := ir_expr(recv_idx)
+    # the receiver read out of storage (`h.o.name = v`) has to outlive a
+    # value that can drop it
+    recv_pin := ir_pin_operand(recv_idx, obj_r, not ir_subtree_keeps_storage(value_idx, 0 - 1, 0 - 1))
     mut value_type := ir_checked_struct_field_type(recv_idx, fname)
     if value_type.len() == 0:
         value_type = ir_infer_type(value_idx)
@@ -10116,36 +10214,41 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # a weak field stores the bare target pointer: drop the old weak reference,
     # take a new one, and never touch the strong count. no owning tuple is
     # involved, so the strong release/retain dance below is skipped entirely.
+    # the old reference is read after the new value, as below.
     weak_struct := lookup_key.substring(0, lookup_key.len() - fname.len() - 1)
     if ir_struct_field_is_weak(weak_struct, fname):
+        new_w := ir_emit_weak_payload(value_idx)
         old_w := ir_reg()
         ir_emit_named_field_access(old_w, obj_r, lookup_key, fname, value_type)
-        new_w := ir_emit_weak_payload(value_idx)
         ir_emit_share_into(obj_r, new_w, "struct")
         ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + new_w.to_string())
         rel_r := ir_reg()
         ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + old_w.to_string())
+        ir_unpin_operand(obj_r, recv_pin)
         return true
-    # release the value already in the field before overwriting it, the same
-    # ownership dance local and global assignment do. load the old value first
-    # so a self-referential rhs (obj.f = obj.f...) still sees it, then release
-    # after the store.
-    mut old_r := 0 - 1
-    if fassign_kind.len() > 0 and ir_rc_release_enabled(fassign_kind):
-        old_r = ir_reg()
-        ir_emit_named_field_access(old_r, obj_r, lookup_key, fname, value_type)
     value_r := ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # a tuple-typed (optional) rhs is already owned from ir_emit_value_for_target,
     # so it must not be retained again; the old value is still released below, so
     # its payload is freed via the optional's destructor.
     if fassign_kind.len() > 0 and fassign_kind != "tuple" and ir_expr_is_borrowed(value_idx):
         ir_rc_retain_reg(value_r, fassign_kind)
+    # release the value already in the field once the new one is stored, the
+    # same ownership dance local and global assignment do. it is read only
+    # now, after the value: `o.name = rename(o)` overwrote the field while the
+    # value ran, and the release of a copy read beforehand freed it twice. a
+    # self-referential rhs (`obj.f = obj.f`) still works, because the value
+    # took its count above before this read.
+    mut old_r := 0 - 1
+    if fassign_kind.len() > 0 and ir_rc_release_enabled(fassign_kind):
+        old_r = ir_reg()
+        ir_emit_named_field_access(old_r, obj_r, lookup_key, fname, value_type)
     # mark before the store: once the value sits in a shared struct another
     # task can read it, and its counts must already be atomic by then
     ir_emit_share_into(obj_r, value_r, fassign_kind)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + value_r.to_string())
     if old_r >= 0:
         ir_rc_release_reg(old_r, fassign_kind)
+    ir_unpin_operand(obj_r, recv_pin)
     return true
 
 # compound assign to a struct field: `obj.field += value` (and -=, *=, /=).
@@ -10188,16 +10291,19 @@ fn ir_emit_compound_assignment(node: Node):
         if assign_kind.len() == 0:
             assign_kind = ir_rc_kind(ir_lookup_name_type(name))
         tracked := ir_rc_local_kind(name).len() > 0
-        mut old_r := 0 - 1
-        if assign_kind.len() > 0 and ir_rc_release_enabled(assign_kind):
-            if tracked or (assign_kind == "string" and ir_global_string_names.contains(name)) or ir_assign_targets_global_slot(name):
-                old_r = ir_reg()
-                ir_emit_name_load(old_r, name)
         assign_target := ir_map_init_target(name, target_type)
         r := ir_emit_value_for_target_inner(node.children[1], assign_target, ir_optional_inner_type_of_tid(c_get_expr_type(node.children[0])))
         # a tuple (optional) rhs is owned from ir_emit_value_for_target; don't retain.
         if assign_kind.len() > 0 and assign_target != "tuple" and ir_expr_is_borrowed(node.children[1]):
             ir_rc_retain_reg(r, assign_kind)
+        # the old value is read after the new one took its count. a call in
+        # the value can assign the same global (`g = rebuild()` where rebuild
+        # sets g), and a copy read beforehand was then released twice.
+        mut old_r := 0 - 1
+        if assign_kind.len() > 0 and ir_rc_release_enabled(assign_kind):
+            if tracked or (assign_kind == "string" and ir_global_string_names.contains(name)) or ir_assign_targets_global_slot(name):
+                old_r = ir_reg()
+                ir_emit_name_load(old_r, name)
         if old_r >= 0:
             ir_rc_release_reg(old_r, assign_kind)
         # any task can read a module global, so what it is given is marked

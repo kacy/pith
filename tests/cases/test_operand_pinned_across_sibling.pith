@@ -1,0 +1,76 @@
+# an operand read out of a field or an element, and then a sibling operand
+# that runs code dropping that field or element before the read is used: the
+# left side of a concat, an interpolation part, a tuple element, a map key, an
+# argument of a function that itself keeps storage, an index store's container
+# and an assignment's receiver. an assignment that overwrites a field or a
+# global while its own value runs must not release the old value twice. each
+# dropping call allocates strings of the same size afterwards, so a freed
+# read comes back as filler.
+struct O:
+    mut name: String
+    mut items: List[String]
+
+struct H:
+    mut o: O
+
+mut g_name := "start"
+
+fn churn() -> List[String]:
+    mut junk: List[String] := []
+    mut i := 0
+    while i < 50:
+        junk.push("filler-{i}-x")
+        i = i + 1
+    return junk
+
+fn rename(o: O) -> String:
+    o.name = "replaced" + "-name"
+    j := churn()
+    return "!"
+
+fn two(a: String, b: String) -> String:
+    return a + b
+
+fn swap_items(o: O) -> Int:
+    o.items = ["other" + "-list"]
+    j := churn()
+    return 0
+
+fn swap_o(h: H) -> String:
+    h.o = O(name: "other", items: [])
+    j := churn()
+    return "v" + "-x"
+
+fn set_global() -> String:
+    g_name = "inner" + "-global"
+    j := churn()
+    return "outer" + "-global"
+
+fn main() -> Int:
+    o := O(name: "hello" + "-world", items: [])
+    print("concat: {o.name + rename(o)}")
+    o.name = "hello" + "-world"
+    print("interp: {o.name}{rename(o)}")
+    o.name = "hello" + "-world"
+    t := (o.name, rename(o))
+    print("tuple: {t.0}")
+    o.name = "hello" + "-world"
+    mut m: Map[String, String] := {}
+    m.insert(o.name, rename(o))
+    print("map key: {m.keys()[0]}")
+    o.name = "hello" + "-world"
+    print("argument: {two(o.name, rename(o))}")
+    o.name = rename(o)
+    print("field assign: {o.name}")
+    o.items = ["a" + "-item"]
+    o.items[swap_items(o)] = "b" + "-item"
+    print("index store: {o.items[0]}")
+    o.items = ["c" + "-item"]
+    v := o.items[swap_items(o)]
+    print("index read: {v}")
+    h := H(o: O(name: "inner", items: []))
+    h.o.name = swap_o(h)
+    print("receiver: {h.o.name}")
+    g_name = set_global()
+    print("global assign: {g_name}")
+    return 0

@@ -342,49 +342,91 @@ pub struct CaseOutcome {
 
 /// run one generated case through every oracle. `expected` gates the
 /// wrong-output comparison; None skips it (the reducer compares on its own).
-/// the first non-benign AddressSanitizer report in a log, as its ERROR line.
-/// the one known-benign pattern is the cstring header probe reading a few
-/// bytes before a headerless runtime static: a global-buffer-overflow naming a
-/// global variable whose name starts with `alloc_`. that is fixed separately,
-/// so it is not a finding here. this mirrors san/real_reports.sh.
-pub fn asan_real_report(stderr: &str) -> Option<String> {
+/// every non-benign AddressSanitizer report in a log, as (signature, report
+/// text). the one known-benign pattern is the cstring header probe reading a
+/// few bytes before a headerless runtime static: a global-buffer-overflow
+/// naming a global variable whose name starts with `alloc_`. that is fixed
+/// separately, so it is not a finding here (this mirrors san/real_reports.sh).
+///
+/// the signature is the error kind plus the innermost generated-code frame of
+/// the access, of the free and of the allocation, with digit runs collapsed.
+/// runtime frames above them (pith_struct_release, free) say little about
+/// which program shape went wrong, and per-run addresses are dropped, so
+/// every instance of one bug lands in one bucket and two bugs that both end
+/// in pith_struct_release do not.
+pub fn asan_real_reports(stderr: &str) -> Vec<(String, String)> {
     let marker = "ERROR: AddressSanitizer:";
     let positions: Vec<usize> = stderr.match_indices(marker).map(|(i, _)| i).collect();
+    let mut out = Vec::new();
     for (n, &p) in positions.iter().enumerate() {
         let end = positions.get(n + 1).copied().unwrap_or(stderr.len());
         let report = &stderr[p..end];
         let benign = report.contains("global-buffer-overflow")
             && (report.contains("before global variable 'alloc_")
                 || report.contains("after global variable 'alloc_"));
-        if !benign {
-            // the error line, trimmed of the ==pid== prefix and the per-run
-            // addresses after "on address", so every instance of one bug
-            // shares a signature
-            let line = report.lines().next().unwrap_or("").trim();
-            let line = match line.find(marker) {
-                Some(i) => &line[i..],
-                None => line,
-            };
-            let line = match line.find(" on address") {
-                Some(i) => &line[..i],
-                None => line,
-            };
-            return Some(line.to_string());
+        if benign {
+            continue;
         }
+        let first = report.lines().next().unwrap_or("");
+        let kind = first
+            .trim_start_matches(marker)
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
+        // a report's sections: the access, then "freed by", then
+        // "previously allocated by"
+        let mut sections = vec![String::new(), String::new(), String::new()];
+        let mut sec = 0;
+        for line in report.lines() {
+            if line.contains("freed by thread") {
+                sec = 1;
+            } else if line.contains("previously allocated by thread") {
+                sec = 2;
+            } else if line.starts_with("SUMMARY:") {
+                break;
+            }
+            if sections[sec].is_empty() {
+                if let Some(f) = generated_frame(line) {
+                    sections[sec] = f;
+                }
+            }
+        }
+        let sig = format!(
+            "{} use:{} free:{} alloc:{}",
+            kind,
+            or_dash(&sections[0]),
+            or_dash(&sections[1]),
+            or_dash(&sections[2])
+        );
+        let text: Vec<&str> = report.lines().take(24).collect();
+        out.push((normalize_digits(&sig, false), text.join("\n")));
     }
-    None
+    out
 }
 
-/// the first AddressSanitizer report in a log, from its marker, capped to
-/// `n` lines, for a finding's detail.
-pub fn asan_report_head(stderr: &str, n: usize) -> String {
-    let marker = "ERROR: AddressSanitizer:";
-    match stderr.find(marker) {
-        Some(p) => {
-            let rest = &stderr[p..];
-            rest.lines().take(n).collect::<Vec<_>>().join("\n")
-        }
-        None => tail(stderr, n),
+fn or_dash(s: &str) -> &str {
+    if s.is_empty() {
+        "-"
+    } else {
+        s
+    }
+}
+
+/// the function name of a stack frame in generated code. a pith function's
+/// frame reads `#N 0x... in NAME pith_module`; `main` carries no module tag
+/// but is generated too.
+fn generated_frame(line: &str) -> Option<String> {
+    let t = line.trim();
+    if !t.starts_with('#') {
+        return None;
+    }
+    let after = &t[t.find(" in ")? + 4..];
+    let name = after.split_whitespace().next()?;
+    if after.contains("pith_module") || name == "main" {
+        Some(name.to_string())
+    } else {
+        None
     }
 }
 
@@ -408,7 +450,7 @@ fn run_sanitize_matrix(
     // (freelist, green); the canonical run is index 0 (freelist off, green on)
     let combos = [("0", "1"), ("1", "1"), ("0", "0"), ("1", "0")];
     let mut outputs: Vec<(String, String, String)> = Vec::new(); // (label, stdout, stderr)
-    let mut reported_asan = false;
+    let mut seen_asan: Vec<String> = Vec::new();
     for (fl, green) in combos {
         let label = format!("FREELIST={} GREEN={}", fl, green);
         let mut envs = base_envs.to_vec();
@@ -432,17 +474,18 @@ fn run_sanitize_matrix(
                 wo_pair: None,
             });
         }
-        if !reported_asan {
-            if let Some(line) = asan_real_report(&run.stderr) {
-                reported_asan = true;
-                findings.push(Finding {
-                    seed,
-                    class: "sanitizer".into(),
-                    signature: signature_of(&line),
-                    detail: format!("{}\n{}", label, asan_report_head(&run.stderr, 22)),
-                    wo_pair: None,
-                });
+        for (sig, text) in asan_real_reports(&run.stderr) {
+            if seen_asan.contains(&sig) {
+                continue;
             }
+            seen_asan.push(sig.clone());
+            findings.push(Finding {
+                seed,
+                class: "sanitizer".into(),
+                signature: sig,
+                detail: format!("{}\n{}", label, text),
+                wo_pair: None,
+            });
         }
         outputs.push((label, run.stdout, run.stderr));
     }
@@ -778,14 +821,13 @@ mod tests {
     }
 
     #[test]
-    fn asan_filter_skips_the_benign_probe_and_catches_a_uaf() {
+    fn asan_filter_skips_the_benign_probe_and_buckets_by_frame() {
         let benign = "==1==ERROR: AddressSanitizer: global-buffer-overflow on address 0x55 at pc 0x66\nREAD of size 16\n  0x55 is located 0 bytes before global variable 'alloc_pool' defined in ...\n";
-        assert_eq!(asan_real_report(benign), None);
-        let uaf = "==1==ERROR: AddressSanitizer: heap-use-after-free on address 0x7b at pc 0x55 bp 0x7f sp 0x7f\nREAD of size 4 at 0x7b thread T0\n";
-        assert_eq!(
-            asan_real_report(uaf).as_deref(),
-            Some("ERROR: AddressSanitizer: heap-use-after-free")
-        );
+        assert!(asan_real_reports(benign).is_empty());
+        let uaf = "==1==ERROR: AddressSanitizer: heap-use-after-free on address 0x7b at pc 0x55 bp 0x7f sp 0x7f\nREAD of size 4 at 0x7b thread T0\n    #0 0x55 in pith_struct_release (/x/main+0xac)\n    #1 0x56 in __tuple_cascade_u0_m1 pith_module\nfreed by thread T0 here:\n    #0 0x57 in free (/x/main+0x1)\n    #1 0x58 in main (/x/main+0x2)\npreviously allocated by thread T0 here:\n    #1 0x59 in pith_struct_alloc (/x/main+0x3)\n    #2 0x5a in opair pith_module\nSUMMARY: AddressSanitizer: heap-use-after-free\n";
+        let got = asan_real_reports(uaf);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "heap-use-after-free use:__tuple_cascade_uN_mN free:main alloc:opair");
     }
 
     #[test]

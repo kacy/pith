@@ -1190,7 +1190,11 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # a field read off an owned temporary receiver hands back a retained value
     # (ir_release_owned_field_receiver), so it is owned, but only when the
     # field has a kind to retain; a plain-value field is not rc either way.
-    if node.kind == "field_access" and node.children.len() > 0 and ir_field_receiver_is_owned_temp(node.children[0]):
+    # a weak field is the exception: every weak read mints a borrowing shell
+    # with no count on its target, whatever it was read off. called owned,
+    # `back := a.next.value().back` bound that shell as an owning optional,
+    # and the binding's cleanup released a target the read never counted.
+    if node.kind == "field_access" and node.children.len() > 0 and ir_field_receiver_is_owned_temp(node.children[0]) and not ir_node_is_weak_field_read(idx):
         return false
     return true
 
@@ -6531,7 +6535,9 @@ fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
         weak_struct := lk.substring(0, lk.len() - fname.len() - 1)
         if ir_struct_field_is_weak(weak_struct, fname):
             weak_r := ir_emit_weak_read(r)
-            ir_release_owned_field_receiver(recv_idx, obj_r, weak_r, "tuple")
+            # the shell is fresh and borrows its target, so it needs no count
+            # to outlive the receiver; only the receiver's count is dropped
+            ir_release_owned_field_receiver(recv_idx, obj_r, weak_r, "")
             return weak_r
     ir_release_owned_field_receiver(recv_idx, obj_r, r, ir_rc_kind(field_type))
     return r

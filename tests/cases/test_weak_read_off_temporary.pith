@@ -1,0 +1,34 @@
+# reading a weak field off a temporary and binding the result: the read takes
+# no strong count on its target, so the binding must not release one. it once
+# bound as an owning optional, and the target was freed twice at scope exit;
+# inside a loop the second pass read through the freed node and summed wrong.
+struct Node:
+    n: Int
+    mut next: Node?
+    weak back: Node?
+
+fn second(a: Node) -> Node:
+    return a.next.value()
+
+fn pair() -> Node:
+    a := Node(n: 1, next: none, back: none)
+    b := Node(n: 2, next: none, back: none)
+    a.next = b
+    b.back = a
+    return a
+
+fn main() -> Int:
+    a := pair()
+    back := a.next.value().back
+    if back != none:
+        print("off value(): {back.value().n}")
+    via_call := second(a).back
+    if via_call != none:
+        print("off a call: {via_call.value().n}")
+    mut total := 0
+    for i in 0..3:
+        again := a.next.value().back
+        if again != none:
+            total = total + again.value().n
+    print("in a loop: {total}")
+    return 0

@@ -158,6 +158,24 @@ code, pre { font-family: var(--mono); font-size: 0.86em; }
 .search-trigger:hover { border-color: var(--line-strong); color: var(--fg-muted); }
 .search-trigger kbd { margin-left: auto; }
 
+/* the sidebar filter sits under the search trigger, so it takes the same box
+   with a quieter fill. */
+.nav-filter {
+  width: 100%;
+  padding: 0.38rem 0.6rem;
+  font: inherit;
+  font-size: 0.82rem;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.nav-filter::placeholder { color: var(--fg-faint); }
+.nav-filter:focus { border-color: var(--accent); }
+
 kbd {
   font-family: var(--sans);
   font-size: 0.72rem;
@@ -392,6 +410,9 @@ kbd {
 .item-head { display: flex; align-items: baseline; gap: 0.6rem; }
 
 .sig {
+  /* a flex item is as wide as its content by default; a long signature has
+     to wrap inside the row instead of widening the page. */
+  min-width: 0;
   font-size: 0.885rem;
   line-height: 1.5;
   overflow-x: auto;
@@ -413,6 +434,14 @@ kbd {
 .anchor:hover { color: var(--accent); }
 
 .doc { margin: 0.5rem 0 0; color: var(--fg-muted); max-width: 46rem; }
+
+/* a long path or identifier has no break point of its own, and on a phone it
+   would push the page sideways. module names such as
+   std.compress.zstd_pure_sequences are the longest. */
+.module-head h1,
+.module-meta code,
+.overview p,
+.doc p { overflow-wrap: anywhere; }
 .doc p { margin: 0 0 0.55rem; }
 .doc p:last-child { margin-bottom: 0; }
 
@@ -547,6 +576,7 @@ kbd {
   .sidebar { position: static; height: auto; border-right: none; border-bottom: 1px solid var(--line); }
   .nav { max-height: 15rem; }
   .main { padding: 2rem 1.25rem 5rem; }
+  .module-head h1 { font-size: 1.45rem; }
 }
 
 /* one module at a time once the script is running. with scripting off the

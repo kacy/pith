@@ -499,9 +499,10 @@ fn run_sanitize_matrix(
                 findings.push(Finding {
                     seed,
                     class: "nondeterministic".into(),
+                    // no line index: it moves with whatever the program
+                    // printed first, and would split one bug into many buckets
                     signature: format!(
-                        "output differs between settings at line {}: '{}' vs '{}'",
-                        mm.0,
+                        "output differs between settings: '{}' vs '{}'",
                         normalize_digits(&mm.1, false),
                         normalize_digits(&mm.2, false)
                     ),

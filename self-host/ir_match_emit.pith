@@ -18,6 +18,43 @@ from ir_ownership import ir_rc_retain_reg, ir_rc_release_reg, ir_kinded_code, ir
 from ir_type_helpers import ir_checked_type, ir_type_from_tid
 
 pub mut ir_match_subject_tid := 0 - 1
+# the hidden slot and kind the next match pins its subject in, or "" (see
+# ir_match_pin_kind in ir_emitter_core). taken by the match emitter as soon
+# as its subject is evaluated, so a match nested in an arm starts clear.
+mut ir_match_pin_slot := ""
+mut ir_match_pin_slot_kind := ""
+
+pub fn ir_set_match_pin(slot: String, kind: String):
+    ir_match_pin_slot = slot
+    ir_match_pin_slot_kind = kind
+
+# pin the subject just evaluated, when the caller asked for it: drop what the
+# slot still holds from an earlier pass (a loop, or an arm that left by break
+# or continue), then take a count on this subject. returns the slot, or "".
+fn ir_take_match_pin(subj_r: Int) -> String:
+    slot := ir_match_pin_slot
+    kind := ir_match_pin_slot_kind
+    ir_match_pin_slot = ""
+    if slot.len() == 0:
+        return ""
+    old_r := ir_reg()
+    ir_emit("load " + old_r.to_string() + " " + slot)
+    ir_rc_release_reg(old_r, kind)
+    ir_rc_retain_reg(subj_r, kind)
+    ir_emit("store " + slot + " " + subj_r.to_string())
+    return slot
+
+# drop the pin at the match's merge and clear the slot, so the exit cleanup
+# finds nothing left to release on this path
+fn ir_release_match_pin(slot: String, kind: String):
+    if slot.len() == 0:
+        return
+    held_r := ir_reg()
+    ir_emit("load " + held_r.to_string() + " " + slot)
+    ir_rc_release_reg(held_r, kind)
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("store " + slot + " " + zero_r.to_string())
 
 pub mut ir_tail_match_node := 0 - 1
 
@@ -106,6 +143,8 @@ fn ir_match_subject_release_kind(node: Node, subj_type: String, subj_owned: Bool
 ## this match must release (the caller classifies; see ir_expr_complex).
 pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int, subj_owned: Bool):
     subj_r := emit_expr(node.children[0])
+    # every arm returns, so the exit cleanup is what releases a pin here
+    ir_take_match_pin(subj_r)
     subj_type := ir_checked_type(node.children[0])
     ir_match_subject_tid = c_get_expr_type(node.children[0])
     subj_release := ir_match_subject_release_kind(node, subj_type, subj_owned)
@@ -579,6 +618,8 @@ pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:
 ## must release (the caller classifies; see ir_expr_complex).
 pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int, subj_owned: Bool) -> Int:
     subj_r := emit_expr(node.children[0])
+    pin_kind := ir_match_pin_slot_kind
+    pin_slot := ir_take_match_pin(subj_r)
     subj_type := ir_checked_type(node.children[0])
     ir_match_subject_tid = c_get_expr_type(node.children[0])
     subj_release := ir_match_subject_release_kind(node, subj_type, subj_owned)
@@ -629,6 +670,7 @@ pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_
     ir_emit("iconst " + zero_r.to_string() + " 0")
     ir_emit("store " + result_temp + " " + zero_r.to_string())
     ir_emit_label(end_l)
+    ir_release_match_pin(pin_slot, pin_kind)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r

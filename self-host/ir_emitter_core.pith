@@ -47,7 +47,7 @@ from ir_names import ir_import_target_name, ir_global_storage_symbol, ir_base_de
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_by_symbol, ir_queue_generic_specialization_for_tids, ir_generic_specialization_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_generic_method_owner_param_counts, ir_generic_owner_param_count, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
-from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
+from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_set_match_pin, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
 from ir_decode_emit import ir_json_decode_spec_from_decl, ir_json_intern_nested_specs, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
@@ -2753,6 +2753,12 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
                 # Beta(Int, _) sharing x0), and releasing the rc kind at exit
                 # would dereference whatever integer the last-run arm stored.
                 ir_prepass_track_or_poison(sub.value, payload_kind, names, poisoned)
+    # a match whose arms bind uncounted views of a borrowed subject owns a
+    # hidden slot that pins the subject (ir_match_pin_kind)
+    if node.kind == "match_expr" and node.children.len() > 1:
+        pin_kind := ir_match_pin_kind(idx)
+        if pin_kind.len() > 0:
+            ir_prepass_track_or_poison(ir_match_pin_name(idx), pin_kind, names, poisoned)
     # remember the subject under a match so nested variant patterns can
     # resolve a generic enum's payload kinds against the instance (above)
     if node.kind == "match_expr" and node.children.len() > 1:
@@ -2763,6 +2769,59 @@ fn ir_collect_rc_bind_names(idx: Int, names: List[String], poisoned: List[String
         return
     for child in node.children:
         ir_collect_rc_bind_names(child, names, poisoned)
+
+# a catch-all binding (`x => ...`) and a tuple pattern's elements are views
+# of the match subject that take no count of their own. that is safe while
+# the subject outlives the arm, but a borrowed subject (a field, an element,
+# a local) can be dropped by the arm itself: `match h.c: x => h.c = other`
+# freed `x` under the arm still reading it. such a match pins the subject in
+# a hidden local for the length of the match, tracked like any owned local so
+# a return or an error exit releases it too. the rc kind to pin under, or ""
+# when no arm can drop the subject: an optional subject binds counted
+# payloads, an owned subject is the match's own, `self` outlives the call,
+# and an arm that keeps storage (ir_subtree_keeps_storage) and does not
+# rebind a local subject cannot drop it.
+fn ir_match_pin_kind(match_idx: Int) -> String:
+    node := get_node(match_idx)
+    subj_idx := node.children[0]
+    tid := c_get_expr_type(subj_idx)
+    if tid < 0 or get_type_info(tid).kind == "optional":
+        return ""
+    kind := ir_rc_kind(ir_type_from_tid(tid))
+    if kind.len() == 0 or node_kind(subj_idx) == "self" or not ir_expr_is_borrowed(subj_idx):
+        return ""
+    mut i := 1
+    while i < node.children.len():
+        arm := get_node(node.children[i])
+        if arm.children.len() > 0 and ir_pattern_binds_view(arm.children[0]):
+            mut j := 1
+            while j < arm.children.len():
+                if ir_match_arm_part_may_drop(arm.children[j], subj_idx):
+                    return kind
+                j = j + 1
+        i = i + 1
+    return ""
+
+fn ir_match_pin_name(match_idx: Int) -> String:
+    return "__match_pin_" + match_idx.to_string()
+
+# true for a pattern that binds a name to the subject itself or to a tuple
+# element, which ir_emit_match_bindings binds without a count
+fn ir_pattern_binds_view(pat_idx: Int) -> Bool:
+    pat := get_node(pat_idx)
+    if pat.kind == "pat_binding":
+        return true
+    if pat.kind == "pat_tuple" or pat.kind == "pat_or":
+        for child in pat.children:
+            if ir_pattern_binds_view(child):
+                return true
+    return false
+
+fn ir_match_arm_part_may_drop(part_idx: Int, subj_idx: Int) -> Bool:
+    subj := get_node(subj_idx)
+    if subj.kind == "ident":
+        return ir_subtree_assigns_name(part_idx, subj.value) or ir_subtree_binds_name(part_idx, subj.value)
+    return not ir_subtree_keeps_storage(part_idx, 0 - 1, 0 - 1)
 
 # the symbol of the function whose body is being emitted, for the return
 # paths that need its declared result ok kind.
@@ -9438,6 +9497,10 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         # ir_optional_subject_is_owned, refined by ir_expr_is_borrowed so a
         # builtin that hands back a borrow stays untouched.
         subj_owned := node.children.len() > 0 and ir_optional_subject_is_owned(node.children[0]) and not ir_expr_is_borrowed(node.children[0])
+        pin_name := ir_match_pin_name(idx)
+        pin_kind := ir_rc_local_kind(pin_name)
+        if pin_kind.len() > 0:
+            ir_set_match_pin(pin_name, pin_kind)
         if idx == ir_tail_match_node:
             ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block, subj_owned)
             return ir_zero_reg()

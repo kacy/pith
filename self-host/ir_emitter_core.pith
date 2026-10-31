@@ -185,6 +185,11 @@ mut ir_tuple_walk_pair_returns: List[Int] := []
 # build, since every module is emitted after the modules it imports.
 mut ir_borrow_param_local: Map[String, String] := {}
 mut ir_borrow_param_exported: Map[String, String] := {}
+# the functions proven to leave every field, element and global as they found
+# them (ir_record_storage_keepers), so a call to one needs no argument pins.
+# local names this module's own calls use, exported names other modules use.
+mut ir_storage_keepers_local: Map[String, Bool] := {}
+mut ir_storage_keepers_exported: Map[String, Bool] := {}
 
 # --- per-module state: type metadata and the helpers it calls for ---
 
@@ -1873,6 +1878,146 @@ fn ir_local_closure_arg_positions(node: Node, callee_name: String) -> List[Int]:
         i = i + 1
     return positions
 
+# functions and plain methods that never drop a value some other owner
+# holds (ir_subtree_keeps_storage). a call to one cannot free a pinned
+# argument, so its arguments need no pin, which keeps comparators and
+# accessors (`less(xs[i], xs[j])`) free. recorded in passes until nothing
+# changes, since a function can depend on one declared after it; a recursive
+# function is never recorded, which only costs pins. generic functions and
+# methods of generic types are left out, as in ir_record_borrow_params.
+fn ir_record_storage_keepers(root_idx: Int):
+    ir_storage_keepers_local = {}
+    saved_impl_type := ir_current_impl_type
+    mut changed := true
+    while changed:
+        changed = false
+        for item_idx in ir_root_items(root_idx):
+            node := get_node(item_idx)
+            if ir_is_fn_decl_kind(node.kind) and not ir_has_generic_params(node):
+                ir_current_impl_type = ""
+                if ir_record_storage_keeper(item_idx, node.value):
+                    changed = true
+            elif node.kind == "impl_decl":
+                impl_type := ir_impl_identity_type(node, ir_current_module_path)
+                if impl_type.len() > 0 and not impl_type.contains("[") and not has_generic_declaration(impl_type):
+                    ir_current_impl_type = impl_type
+                    for child in node.children:
+                        method_idx := ir_unwrap_pub_child(child)
+                        method_node := get_node(method_idx)
+                        if method_node.kind == "fn_decl" and not ir_has_generic_params(method_node):
+                            if ir_record_storage_keeper(method_idx, impl_type + "_" + method_node.value):
+                                changed = true
+    ir_current_impl_type = saved_impl_type
+
+# record one function when its body keeps storage and it is not recorded yet.
+# true when this call added it.
+fn ir_record_storage_keeper(decl_idx: Int, sym: String) -> Bool:
+    if ir_storage_keepers_local.contains_key(sym):
+        return false
+    body_idx := ir_tuple_walk_fn_body(decl_idx)
+    if body_idx < 0 or not ir_subtree_keeps_storage(body_idx, decl_idx, body_idx):
+        return false
+    ir_storage_keepers_local.insert(sym, true)
+    if ir_current_module_path.len() > 0:
+        ir_storage_keepers_exported.insert(ir_import_target_name(ir_current_module_path, sym), true)
+    return true
+
+fn ir_is_storage_keeper(name: String) -> Bool:
+    return ir_storage_keepers_local.contains_key(name) or ir_storage_keepers_exported.contains_key(name)
+
+# the free builtins that touch no counted value and no other task. a byte
+# buffer holds raw bytes, so writing to one cannot release anything.
+fn ir_is_pure_builtin(name: String) -> Bool:
+    if name.starts_with("byte_buffer_"):
+        return true
+    return ["print", "print_err", "ord", "chr", "abs", "min", "max", "clamp", "sqrt", "floor", "ceil", "round", "pow", "fmt_float", "parse_int", "parse_float", "float_to_bits", "float_from_bits", "bit_not", "bit_and", "bit_or", "bit_xor", "bit_shl", "bit_shr", "bit_rotl32", "bit_rotr32", "bit_rotl64", "bit_rotr64", "bytes_eq", "bytes_len", "bytes_is_empty", "bytes_get", "bytes_slice", "bytes_concat", "bytes_to_string_utf8", "bytes_substring_utf8", "bytes_from_string_utf8", "crypto_constant_time_eq"].contains(name)
+
+# true when nothing in the subtree can drop a value that a field, a container
+# element or a global holds: no write to any of them, no container method that
+# evicts an element, no spawn, await or select, and calls only to pure
+# builtins and recorded keepers. a loop is allowed even though its back edge
+# can yield, because another task can only reach the same value if the two
+# share it without a lock, which docs/ownership.md leaves to the program.
+#
+# decl_idx and body_idx name the function, to tell its locals from globals
+# when assigned; a decl_idx below 0 asks the emitter's live locals instead.
+fn ir_subtree_keeps_storage(idx: Int, decl_idx: Int, body_idx: Int) -> Bool:
+    node := get_node(idx)
+    kind := node.kind
+    if kind == "lambda":
+        # a closure built here runs only if something calls it, and a call
+        # through a function value is refused below
+        return true
+    if kind == "spawn" or kind == "await" or kind == "select":
+        return false
+    if kind == "assignment":
+        target := get_node(node.children[0])
+        if target.kind != "ident" or not ir_name_is_bound_in(target.value, decl_idx, body_idx):
+            return false
+    elif kind == "assign":
+        if node.children.len() >= 2 or not ir_name_is_bound_in(node.value, decl_idx, body_idx):
+            return false
+    elif kind == "call":
+        callee := get_node(node.children[0])
+        if callee.kind != "ident":
+            return false
+        if ir_is_declared_callable(callee.value):
+            if not ir_is_storage_keeper(ir_resolve_static_callee(node.children[0]).name):
+                return false
+        elif not ir_is_pure_builtin(callee.value):
+            return false
+    elif kind == "method_call":
+        callee_sym := ir_tuple_method_call_symbol(idx, node)
+        if callee_sym.len() > 0:
+            if not ir_is_storage_keeper(callee_sym):
+                return false
+        elif not ir_method_keeps_storage(idx):
+            return false
+    for child in node.children:
+        if not ir_subtree_keeps_storage(child, decl_idx, body_idx):
+            return false
+    return true
+
+# a builtin method that releases nothing: anything on a string, a number or a
+# bool (none of them can be changed in place), the reading methods of the
+# containers, and the list methods that only add or reorder. a method that
+# takes a function is left out, since it runs that function.
+fn ir_method_keeps_storage(idx: Int) -> Bool:
+    node := get_node(idx)
+    recv_type := ir_infer_type(node.children[0])
+    name := ir_plain_method_name(node.value)
+    if recv_type == "string" or recv_type == "int" or recv_type == "float" or recv_type == "bool":
+        return true
+    if recv_type.starts_with("list"):
+        return ["len", "is_empty", "contains", "get", "index_of", "first", "last", "slice", "join", "push", "insert", "reverse", "sort"].contains(name)
+    if recv_type.starts_with("map"):
+        return ["len", "is_empty", "contains_key", "get", "get_default", "keys", "values"].contains(name)
+    if recv_type.starts_with("set"):
+        return ["len", "is_empty", "contains"].contains(name)
+    if recv_type == "bytes":
+        return ["len", "is_empty", "get", "slice"].contains(name)
+    return false
+
+# true when `name` is a parameter of the function or bound inside its body,
+# so assigning it rebinds a local rather than a global
+fn ir_name_is_bound_in(name: String, decl_idx: Int, body_idx: Int) -> Bool:
+    if decl_idx < 0:
+        return ir_name_is_func_local(name) or ir_loop_var_slot(name).len() > 0
+    for child in get_node(decl_idx).children:
+        cn := get_node(child)
+        if cn.kind == "param" and cn.value.split(" ")[0] == name:
+            return true
+    return ir_subtree_binds_name(body_idx, name)
+
+fn ir_subtree_binds_name(idx: Int, name: String) -> Bool:
+    node := get_node(idx)
+    if ir_is_binding_kind(node.kind) and ir_collect_bind_parts(node).name == name:
+        return true
+    for child in node.children:
+        if ir_subtree_binds_name(child, name):
+            return true
+    return false
+
 # a callee on the register abi never hands its caller the box it was given:
 # a returned result leaves as its payload, which takes a count of its own
 # when the box is borrowed (ir_emit_return_box_as_pair). so, walking such a
@@ -2978,9 +3123,56 @@ fn ir_emit_call_arg(expr_idx: Int) -> Int:
 fn ir_arg_release_is_skipped(expr_idx: Int) -> Bool:
     return expr_idx >= 0 and c_argument_widens_to_optional(expr_idx)
 
+# a struct field or a container element read as an argument hands the callee
+# the owner's count and none of its own. that is enough for a builtin, but a
+# callee that runs user code can overwrite that field or evict that element,
+# directly or through a global, a capture or another argument, and the value
+# then dies under the parameter that still names it. so an argument like that
+# is pinned for the call: retained as soon as it is evaluated, and released
+# once the call returns. a local or a parameter needs no pin, since only this
+# frame can rebind it.
+#
+# the rc kind to pin the argument at expr_idx as, or "" for none.
+fn ir_arg_pin_kind(expr_idx: Int) -> String:
+    if c_argument_widens_to_optional(expr_idx) or not ir_expr_is_borrowed(expr_idx):
+        return ""
+    mut read_idx := expr_idx
+    while node_kind(read_idx) == "grouped" and get_node(read_idx).children.len() > 0:
+        read_idx = get_node(read_idx).children[0]
+    if node_kind(read_idx) != "field_access" and node_kind(read_idx) != "index":
+        return ""
+    kind := ir_rc_kind(ir_infer_type(read_idx))
+    if kind == "weak":
+        return ""
+    return kind
+
+# pin the argument just evaluated into `reg` when it needs it, and record the
+# kind (or "") so ir_unpin_args can release it after the call.
+fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String]):
+    kind := ir_arg_pin_kind(expr_idx)
+    if kind.len() > 0:
+        ir_rc_retain_reg(reg, kind)
+    pins.push(kind)
+
+# release what ir_pin_arg retained. pins is aligned with regs.
+fn ir_unpin_args(regs: List[Int], pins: List[String]):
+    for kind, i in pins:
+        if kind.len() > 0:
+            ir_rc_release_reg(regs[i], kind)
+
+# true when calling the callee at callee_idx can run user code. a bare name
+# that is neither declared nor a variable holding a function is a builtin.
+fn ir_callee_runs_user_code(callee_idx: Int) -> Bool:
+    callee := get_node(callee_idx)
+    if callee.kind != "ident":
+        return true
+    name := callee.value
+    return ir_is_declared_callable(name) or ir_name_is_func_local(name) or ir_loop_var_slot(name).len() > 0 or ir_global_slot_names.contains(name)
+
 # local_fn_positions lists the arguments, counted from start_idx, that land in
-# a parameter the callee only calls (see ir_record_closure_params).
-fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int]) -> List[Int]:
+# a parameter the callee only calls (see ir_record_closure_params). with pin
+# set, arguments are pinned as above and pins receives one entry per register.
+fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int], pin: Bool, pins: List[String]) -> List[Int]:
     mut arg_regs: List[Int] := []
     for child, i in node.children:
         if i < start_idx:
@@ -2993,8 +3185,13 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List
             expr_idx = cn.children[0]
         if local_fn_positions.contains(i - start_idx):
             arg_regs.push(ir_emit_local_fn_arg(expr_idx))
+            if pin:
+                pins.push("")
         else:
-            arg_regs.push(ir_emit_call_arg(expr_idx))
+            arg_r := ir_emit_call_arg(expr_idx)
+            arg_regs.push(arg_r)
+            if pin:
+                ir_pin_arg(expr_idx, arg_r, pins)
     return arg_regs
 
 # owned string arguments (fresh chars from s[i], concat results, fresh
@@ -4010,19 +4207,26 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
     ir_emit_label(merge_l)
     return decoded_r
 
-fn ir_collect_method_call_regs(node: Node) -> List[Int]:
+# the receiver's register first, then each argument's. with pin set (an impl
+# method, which is user code) the receiver and the arguments are pinned the
+# way ir_collect_call_arg_regs pins, one pins entry per register.
+fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> List[Int]:
     mut regs: List[Int] := []
     for child, i in node.children:
+        mut expr_idx := child
+        if i > 0 and node_kind(child) == "arg":
+            cn := get_node(child)
+            if cn.children.len() == 0:
+                continue
+            expr_idx = cn.children[0]
+        mut r := 0
         if i == 0:
-            regs.push(ir_expr(child))
+            r = ir_expr(expr_idx)
         else:
-            child_kind := node_kind(child)
-            if child_kind == "arg":
-                cn := get_node(child)
-                if cn.children.len() > 0:
-                    regs.push(ir_emit_call_arg(cn.children[0]))
-            else:
-                regs.push(ir_emit_call_arg(child))
+            r = ir_emit_call_arg(expr_idx)
+        regs.push(r)
+        if pin:
+            ir_pin_arg(expr_idx, r, pins)
     return regs
 
 # {x:8.2}-style parts: convert with precision when asked, then pad.
@@ -5070,7 +5274,7 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int], want_equal: Bool) -> 
     return r
 
 fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node: Node) -> Int:
-    arg_regs := ir_collect_call_arg_regs(node, 1, [])
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], false, [])
     if arg_regs.len() < 2:
         return ir_zero_reg()
 
@@ -5498,13 +5702,15 @@ fn ir_emit_indirect_expr_call(idx: Int, node: Node, callee_idx: Int) -> Int:
     callee_r := ir_expr(callee_idx)
     tmp := ir_new_temp_name("__callee")
     ir_emit("store " + tmp + " " + callee_r.to_string())
-    arg_regs := ir_collect_call_arg_regs(node, 1, [])
+    mut arg_pins: List[String] := []
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], true, arg_pins)
     mut ret_kind := ir_function_return_kind(callee_idx)
     if ret_kind == "unknown":
         ret_kind = "int"
     r := ir_reg()
     ir_emit_call_text(r, tmp, ret_kind, arg_regs.len(), ir_join_arg_regs(arg_regs))
     ir_release_owned_args(node, 1, arg_regs)
+    ir_unpin_args(arg_regs, arg_pins)
     # the callee expression is a value like any other, and this call is its
     # only consumer. a lambda literal, a named function, a call that built a
     # closure and a payload pulled out of an optional all arrive owned, so
@@ -5625,7 +5831,9 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     local_fn_positions := ir_local_closure_arg_positions(node, callee.name)
     is_generic_callee := ir_is_generic_function_name(callee.name)
     callee = ir_specialize_static_callee(idx, node, callee, explicit_generic_types)
-    arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions)
+    mut arg_pins: List[String] := []
+    pins_args := ir_callee_runs_user_code(node.children[0]) and not ir_is_storage_keeper(callee.name)
+    arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions, pins_args, arg_pins)
     if is_generic_callee and local_fn_positions.len() > 0:
         callee = ResolvedCallee(ir_bind_fn_specialization(callee.name, ir_fn_arg_bindings(node, local_fn_positions, arg_regs)), callee.imported)
     if callee.name == "Channel":
@@ -5663,6 +5871,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
         if free_opt_kind.len() > 0:
             ir_emit_optional_attach_dtor(r, free_opt_kind)
     ir_release_owned_args(node, 1, arg_regs)
+    ir_unpin_args(arg_regs, arg_pins)
     if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
         if ret_type != "float" and idx == ir_rcall_defer_idx:
             return ir_emit_wrapped_legacy_pair(r, ret_type, callee.name)
@@ -7476,7 +7685,8 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
             generic_ret_type := ir_infer_type(idx)
             mut no_explicit_types: List[String] := []
             call_name = ir_queue_generic_call(call_name, idx, no_explicit_types, generic_ret_type)
-        arg_regs := ir_collect_call_arg_regs(node, 1, [])
+        mut arg_pins: List[String] := []
+        arg_regs := ir_collect_call_arg_regs(node, 1, [], not ir_is_storage_keeper(call_name), arg_pins)
         mut r := ir_reg()
         uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(call_name, true), idx)
         ret_type := ir_call_retkind_for_name(idx, uses_result_abi, call_name)
@@ -7489,6 +7699,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         # module-qualified calls take the same transfer convention as
         # plain static calls: owned string temps die with the call
         ir_release_owned_args(node, 1, arg_regs)
+        ir_unpin_args(arg_regs, arg_pins)
         if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
             if ret_type != "float" and idx == ir_rcall_defer_idx:
                 return ir_emit_wrapped_legacy_pair(r, ret_type, call_name)
@@ -7552,7 +7763,8 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
         if ir_is_generic_method_name(impl_name):
             emit_name = ir_queue_generic_method_call(idx, node, impl_name)
 
-    call_regs := ir_collect_method_call_regs(node)
+    mut call_pins: List[String] := []
+    call_regs := ir_collect_method_call_regs(node, impl_dispatch and not ir_is_storage_keeper(impl_name), call_pins)
     obj_r := call_regs[0]
     mut arg_regs: List[Int] := []
     mut ci := 0
@@ -7671,6 +7883,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     if not impl_dispatch and ir_method_result_retains_over_args(emit_name):
         ir_rc_retain_reg(r, ir_rc_kind(ir_infer_type(idx)))
     ir_release_owned_method_args(node, arg_regs, store_value_pos)
+    ir_unpin_args(call_regs, call_pins)
     if node.children.len() > 0:
         recv_idx := node.children[0]
         recv_kind := ir_rc_kind(ir_infer_type(recv_idx))
@@ -10523,7 +10736,26 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     # early return leaves through the exit edges, which release it like the
     # loop's iterable. before this every `for ch in s` leaked one string per
     # byte walked, a megabyte an analysis in the checker's own name helpers.
-    owns_value := item_kind == "char" and names.value_name.len() > 0
+    #
+    # a list loop's variable borrows the element, which costs nothing while
+    # the body cannot drop it. ir_subtree_keeps_storage proves that for most
+    # loops: no write to a field, an element or a global, no evicting
+    # container method, and calls only to code that keeps storage too. any
+    # other body could free the element under the variable
+    # (`for s in xs: xs.clear(); print(s)`), so there the variable takes a
+    # count of its own on each element, held and released exactly like the
+    # char's. the head then also stops at the list's current length, so an
+    # element the body removed is never read back out of a stale slot, while
+    # the length taken at the start still caps the walk and a body that
+    # pushes does not loop forever. a converted iterable is a fresh list only
+    # the loop can reach, so it needs neither.
+    may_drop := conversion_call.len() == 0 and item_kind != "char" and not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1)
+    mut value_kind := ""
+    if item_kind == "char":
+        value_kind = "string"
+    elif may_drop:
+        value_kind = ir_rc_kind(ir_substitute_type_name(ir_list_element_kind(node.children[0])))
+    owns_value := value_kind.len() > 0 and names.value_name.len() > 0
     value_slot := ir_loop_var_slot_name(fid, names.value_name)
     if owns_value:
         null_r := ir_reg()
@@ -10540,11 +10772,26 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     ir_emit("load " + cl.to_string() + " " + fl)
     cmp_r := ir_reg()
     ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + cl.to_string())
+    if may_drop:
+        live_l := ir_label()
+        ir_emit("brif " + cmp_r.to_string() + " " + live_l + " " + end_l)
+        ir_emit_label(live_l)
+        live_iter_r := ir_reg()
+        ir_emit("load " + live_iter_r.to_string() + " " + ft)
+        live_len_r := ir_reg()
+        ir_emit_call1(live_len_r, ir_for_len_call_name(item_kind), "int", live_iter_r)
+        ir_emit("lt " + cmp_r.to_string() + " " + ci.to_string() + " " + live_len_r.to_string())
     ir_emit("brif " + cmp_r.to_string() + " " + body_l + " " + end_l)
     ir_emit_label(body_l)
     prev_value_slot := ir_loop_var_push(names.value_name, ir_loop_var_slot_name(fid, names.value_name))
     prev_index_slot := ir_loop_var_push(names.index_name, ir_loop_var_slot_name(fid, names.index_name))
     ir_emit_for_loop_value_binding(names.value_name, names.index_name, item_kind, ft, fi)
+    if owns_value and item_kind != "char":
+        # char_at already handed back a fresh char, but a list element is
+        # only borrowed, so this is where the variable takes its count
+        held_r := ir_reg()
+        ir_emit("load " + held_r.to_string() + " " + value_slot)
+        ir_rc_retain_reg(held_r, value_kind)
     ir_break_stack = ir_push_string(ir_break_stack, end_l)
     ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
     ir_defer_loop_enter()
@@ -10558,7 +10805,7 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
         pushed_iter = true
     if owns_value:
         ir_loop_iter_vars.push(value_slot)
-        ir_loop_iter_kinds.push("string")
+        ir_loop_iter_kinds.push(value_kind)
     ir_block(node.children[1])
     if owns_value:
         ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
@@ -10573,7 +10820,7 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
     if owns_value:
-        ir_emit_for_char_release(value_slot)
+        ir_emit_for_value_release(value_slot, value_kind)
         null_again := ir_reg()
         ir_emit("iconst " + null_again.to_string() + " 0")
         ir_emit("store " + value_slot + " " + null_again.to_string())
@@ -10587,19 +10834,18 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     ir_emit("jmp " + head_l)
     ir_emit_label(end_l)
     if owns_value:
-        ir_emit_for_char_release(value_slot)
+        ir_emit_for_value_release(value_slot, value_kind)
     if iter_release_kind.len() > 0:
         fin_r := ir_reg()
         ir_emit("load " + fin_r.to_string() + " " + ft)
         ir_rc_release_reg(fin_r, iter_release_kind)
 
-# release the one-byte string a string loop's variable slot holds; a null
-# slot (before the first iteration, or after the step label cleared it)
-# releases as a no-op.
-fn ir_emit_for_char_release(value_slot: String):
+# release the count a loop variable's slot holds; a null slot (before the
+# first iteration, or after the step label cleared it) releases as a no-op.
+fn ir_emit_for_value_release(value_slot: String, kind: String):
     held_r := ir_reg()
     ir_emit("load " + held_r.to_string() + " " + value_slot)
-    ir_string_release_reg(held_r)
+    ir_rc_release_reg(held_r, kind)
 
 # `for i in lo..hi` lowers to a counted loop over an Int counter, with no
 # intermediate list allocation. exclusive (`..`) stops at hi, inclusive
@@ -12642,6 +12888,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_preregister_all_impl_specializations(root_idx, root)
     ir_record_borrow_params(root_idx)
     ir_record_closure_params(root_idx)
+    ir_record_storage_keepers(root_idx)
     ir_emit_top_level_items(root_idx, root)
     ir_emit_generic_specializations()
     # per-instance destructors for generic structs built via a backend

@@ -266,6 +266,16 @@ struct ChannelState {
     green_senders: Vec<usize>,
 }
 
+impl ChannelState {
+    /// the green waiter list for `role`.
+    fn green_waiters(&mut self, role: Role) -> &mut Vec<usize> {
+        match role {
+            Role::Receiver => &mut self.green_receivers,
+            Role::Sender => &mut self.green_senders,
+        }
+    }
+}
+
 /// which side of the channel a green task is blocked on. a parking task registers
 /// under its role so a later notify can wake only the opposite role (see
 /// `green_receivers`/`green_senders`).
@@ -481,10 +491,7 @@ fn lock_state(lock: &Mutex<ChannelState>) -> MutexGuard<'_, ChannelState> {
 fn wake_green(state: &mut ChannelState, role: Role) {
     // drain first: a woken task that re-parks will re-add itself, and draining
     // keeps a task from being enqueued twice for one notify.
-    let list = match role {
-        Role::Receiver => &mut state.green_receivers,
-        Role::Sender => &mut state.green_senders,
-    };
+    let list = state.green_waiters(role);
     if list.is_empty() {
         return;
     }
@@ -590,13 +597,20 @@ fn block_on_channel<'a>(
             // release the lock *before* suspending: suspend returns control to
             // the worker, which may touch this same channel. registering under our
             // role lets the opposite side wake us without waking same-role peers.
-            match role {
-                Role::Receiver => state.green_receivers.push(id),
-                Role::Sender => state.green_senders.push(id),
-            }
+            state.green_waiters(role).push(id);
             drop(state);
             green::park_current(id);
-            lock_state(&inner.state)
+            let mut state = lock_state(&inner.state);
+            // a waker that meant us took our entry off the list. one that is
+            // still there means this wake came from elsewhere, and the caller
+            // is about to re-check and maybe register again. a stale entry
+            // would let a later send claim us while we are parked on some
+            // other channel and hand us this channel's value.
+            let list = state.green_waiters(role);
+            if let Some(pos) = list.iter().rposition(|&waiter| waiter == id) {
+                list.remove(pos);
+            }
+            state
         }
     }
 }

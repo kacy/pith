@@ -64,6 +64,15 @@ variables:
   still bound), and at the function's exit edges alongside the loop's
   owned iterable. the body still sees a borrow, so `return ch` and
   `x := ch` retain as they always did
+- a list loop owns its variable the same way when the body could drop
+  an element: when it writes a field, an element or a global, calls a
+  container method that evicts an element, or calls code not proven to
+  avoid all of those (`ir_subtree_keeps_storage`). without the count,
+  `for s in xs: xs.clear()` freed `s` while the body still read it. such
+  a loop also stops at the list's current length, so an element the body
+  removed is never read from an emptied slot, while the length taken at
+  the start still caps the walk. a body that keeps storage, which covers
+  most loops, borrows as before and pays nothing
 - a module-level global's slot owns its value the same way a local
   does, so assigning one releases what it held. nothing else would: a
   global is not in any function's exit cleanup, and the store itself
@@ -85,6 +94,14 @@ call arguments:
 
 - callees borrow their parameters; a callee that stores an argument
   adds its own count
+- an argument read out of a field or a container element (`f(o, o.name)`,
+  `g(xs, xs[0])`) is pinned for the call: retained when it is evaluated
+  and released when the call returns. the borrow alone left the owner's
+  count as the only one, and a callee that overwrote the field or evicted
+  the element freed its own parameter. a builtin, or a function recorded
+  by `ir_record_storage_keepers` as writing no field, element or global,
+  cannot do that, so its arguments are not pinned. a local or a parameter
+  is never pinned, since only the calling frame can rebind it
 - so an *owned* argument (a fresh `s[i]` char, a concat result, a
   fresh method result) dies once the call it fed returns — the caller
   releases it

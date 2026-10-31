@@ -1,0 +1,42 @@
+# a file read that finishes while its task is still spinning must not leave a
+# wake behind. the stale wake made the task's next channel receive return
+# early and register twice, and a later send on the first channel claimed the
+# leftover entry while the task was parked on the second: a value sent on `a`
+# came back from `b.recv()`. the two channels carry disjoint ranges, so a
+# crossed value is counted instead of passing silently, and the count is 0.
+import std.fs as fs
+
+fn worker(a: Channel[Int], b: Channel[Int], rounds: Int) -> Int:
+    mut crossed := 0
+    mut i := 0
+    while i < rounds:
+        text := fs.read("tests/cases/test_blocking_wake_channel.pith") catch ""
+        va := a.recv().unwrap_or(-1)
+        vb := b.recv().unwrap_or(-1)
+        if va >= 1000000 or vb < 1000000:
+            crossed = crossed + 1
+        i = i + 1
+    return crossed
+
+fn main() -> Int:
+    rounds := 20000
+    workers := 4
+    a := Channel[Int](1)
+    b := Channel[Int](1)
+    mut tasks: List[Task[Int]] := []
+    mut w := 0
+    while w < workers:
+        tasks.push(spawn worker(a, b, rounds))
+        w = w + 1
+    mut i := 0
+    while i < rounds * workers:
+        a.send(i)
+        a.send(i + 1)
+        b.send(1000000 + i)
+        b.send(1000000 + i + 1)
+        i = i + 2
+    mut crossed := 0
+    for t in tasks:
+        crossed = crossed + await t
+    print("crossed {crossed}")
+    return 0

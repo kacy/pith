@@ -11,10 +11,14 @@
 //! OS threads takes a job, the green task parks, and the pool thread wakes it
 //! when the result is ready. the worker is free the whole time.
 //!
-//! the park/wake handshake is the one `netpoll` uses for socket readiness, for
-//! the same reason: a wake that lands before the task finishes suspending must
-//! not be lost. green records it as pending and the yield arm re-enqueues, so a
-//! block site only has to re-check its condition and park again.
+//! the task and the pool thread agree through one state word on the slot
+//! whether a wake is owed. the task only parks after claiming the word, and
+//! the pool thread only wakes a task that claimed it. a task that gets its
+//! result while spinning is never woken at all. that matters for more than
+//! the saved wake: green keeps a wake aimed at a running task as pending, and
+//! a pending wake makes the task's *next* park, at some unrelated block site,
+//! return at once. a channel receive woken that way registered itself twice,
+//! and the stale entry later handed it a value sent on a different channel.
 //!
 //! ## what may cross to a pool thread
 //!
@@ -37,7 +41,7 @@ use crate::concurrency::green;
 use crate::concurrency::scheduler::{backend, Backend};
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{fence, AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -85,19 +89,18 @@ where
         publish.complete(value);
     }));
 
-    if let Some(value) = spin_briefly(&slot) {
-        return value;
+    if spin_briefly(&slot) || !slot.claim_park() {
+        return slot.take();
     }
 
-    // a wake that lands before we finish suspending is not lost: green flags it
-    // as pending and the yield arm re-enqueues us instead of parking. a
-    // spurious wake just sends us round to park again, the tolerance every
-    // green block site has.
+    // the claim obliges the pool thread to wake us. a wake that lands before
+    // we finish suspending is not lost (green flags it as pending and the yield
+    // arm re-enqueues us), and any other wake just sends us round to park again.
     loop {
-        if let Some(value) = slot.take() {
-            return value;
-        }
         green::park_current(task);
+        if slot.is_ready() {
+            return slot.take();
+        }
     }
 }
 
@@ -135,23 +138,22 @@ fn spinning_helps() -> bool {
     })
 }
 
-/// wait out `SPIN_BEFORE_PARK` for the job to finish, returning its result if
-/// it does.
+/// wait out `SPIN_BEFORE_PARK` for the job to finish, and say whether it did.
 ///
-/// the wait polls a flag rather than the result mutex: the pool thread has to
-/// take that mutex to publish, and a spinner hammering it is a spinner slowing
-/// down the very thing it is waiting for.
-fn spin_briefly<T>(slot: &Slot<T>) -> Option<T> {
+/// the wait polls the state word rather than the result mutex: the pool thread
+/// has to take that mutex to publish, and a spinner hammering it is a spinner
+/// slowing down the very thing it is waiting for.
+fn spin_briefly<T: Default>(slot: &Slot<T>) -> bool {
     if !spinning_helps() {
-        return None;
+        return false;
     }
     let deadline = Instant::now() + SPIN_BEFORE_PARK;
     loop {
         if slot.is_ready() {
-            return slot.take();
+            return true;
         }
         if Instant::now() >= deadline {
-            return None;
+            return false;
         }
         for _ in 0..SPINS_PER_CLOCK_READ {
             std::hint::spin_loop();
@@ -168,57 +170,68 @@ fn offload_target() -> Option<usize> {
     green::current_task()
 }
 
+/// the task has not decided to park yet: a result published now needs no wake.
+const SLOT_WAITING: u8 = 0;
+/// the task has committed to parking, so the publisher must wake it.
+const SLOT_PARKING: u8 = 1;
+/// the result is in the slot.
+const SLOT_DONE: u8 = 2;
+
 /// where a pool thread leaves the result for the task that asked for it.
 struct Slot<T> {
-    /// green task id of the parked task, passed straight to `green::wake`.
+    /// green task id of the waiting task, passed straight to `green::wake`.
     task: usize,
-    /// set once the result is in `value`, so a waiter can check for it without
-    /// touching the mutex the publisher needs.
-    ready: AtomicBool,
+    /// one of the `SLOT_*` states. the task's claim and the publisher's swap
+    /// are read-modify-writes on this one word, so exactly one of them sees
+    /// the other: either the task finds the result and never parks, or the
+    /// publisher finds the claim and wakes it.
+    state: AtomicU8,
     /// `None` until the job finishes, `Some` after.
     value: Mutex<Option<T>>,
 }
 
-impl<T> Slot<T> {
+impl<T: Default> Slot<T> {
     fn new(task: usize) -> Self {
         Slot {
             task,
-            ready: AtomicBool::new(false),
+            state: AtomicU8::new(SLOT_WAITING),
             value: Mutex::new(None),
         }
     }
 
-    /// publish the result and wake the waiting task. the store happens first so
-    /// the task cannot resume and find the slot still empty.
-    ///
-    /// the fence pairs with the one in `take`. `green::wake` drops a wake for a
-    /// task that is already `Ready`, on the grounds that the task will check
-    /// again when it runs. that check is the task's read of `ready`, after it
-    /// claims its scheduling word, while this side stores `ready` and then reads
-    /// the word: the store-buffer shape, where without a full fence on both
-    /// sides each can read the other's old value. the wake was then dropped
-    /// against a stale `Ready` and the task read a stale `false` and parked for
-    /// good. 32 tasks reading files on 32 workers hung in most runs.
+    /// publish the result, and wake the task only if it claimed a park. the
+    /// value is stored before the swap, so a task that sees `SLOT_DONE` finds
+    /// it.
     fn complete(&self, value: T) {
         *lock(&self.value) = Some(value);
-        self.ready.store(true, Ordering::Release);
-        fence(Ordering::SeqCst);
-        green::wake(self.task);
-    }
-
-    /// has the result landed? pairs with the release store in `complete`.
-    fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
-    }
-
-    /// take the result if it has arrived. the fence pairs with the one in
-    /// `complete`; see there.
-    fn take(&self) -> Option<T> {
-        fence(Ordering::SeqCst);
-        if !self.is_ready() {
-            return None;
+        if self.state.swap(SLOT_DONE, Ordering::AcqRel) == SLOT_PARKING {
+            green::wake(self.task);
         }
-        lock(&self.value).take()
+    }
+
+    /// commit the task to parking. false means the result already landed and
+    /// the task must not park, since no wake is coming.
+    fn claim_park(&self) -> bool {
+        self.state
+            .compare_exchange(
+                SLOT_WAITING,
+                SLOT_PARKING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// has the result landed? pairs with the swap in `complete`.
+    fn is_ready(&self) -> bool {
+        self.state.load(Ordering::Acquire) == SLOT_DONE
+    }
+
+    /// take the result. only called once `is_ready` or a failed `claim_park`
+    /// has seen `SLOT_DONE`, so it is always there; the default is a guard,
+    /// and every caller already reads it as failure.
+    fn take(&self) -> T {
+        lock(&self.value).take().unwrap_or_default()
     }
 }
 
@@ -393,11 +406,11 @@ mod tests {
 
     /// spin until a slot fills, with a generous ceiling so a hung job fails the
     /// test instead of hanging the suite.
-    fn await_slot<T>(slot: &Slot<T>) -> T {
+    fn await_slot<T: Default>(slot: &Slot<T>) -> T {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(value) = slot.take() {
-                return value;
+            if slot.is_ready() {
+                return slot.take();
             }
             assert!(Instant::now() < deadline, "pool never answered");
             std::thread::sleep(Duration::from_millis(1));
@@ -453,7 +466,7 @@ mod tests {
     fn the_short_wait_gives_up_when_nothing_answers() {
         let slot = Slot::<i64>::new(usize::MAX);
         let started = Instant::now();
-        assert!(spin_briefly(&slot).is_none());
+        assert!(!spin_briefly(&slot));
         // it must not return early either, or a result that was one microsecond
         // away would still cost a park.
         if spinning_helps() {
@@ -472,11 +485,31 @@ mod tests {
         // the spawn may lose the race on a busy machine, so accept either
         // outcome and only insist that a result seen in the wait is the right
         // one, never a torn or missing value.
-        if let Some(value) = spin_briefly(&slot) {
-            assert_eq!(value, 9);
+        if spin_briefly(&slot) {
+            assert_eq!(slot.take(), 9);
         } else {
             assert_eq!(await_slot(&slot), 9);
         }
+    }
+
+    #[test]
+    fn a_result_published_first_refuses_the_park() {
+        // the task found the result between its spin and its park: it must not
+        // park, because the publisher saw no claim and sent no wake.
+        let slot = Slot::<i64>::new(usize::MAX);
+        slot.complete(5);
+        assert!(!slot.claim_park());
+        assert_eq!(slot.take(), 5);
+    }
+
+    #[test]
+    fn a_claimed_park_still_sees_the_result() {
+        let slot = Slot::<i64>::new(usize::MAX);
+        assert!(slot.claim_park());
+        assert!(!slot.is_ready());
+        slot.complete(8);
+        assert!(slot.is_ready());
+        assert_eq!(slot.take(), 8);
     }
 
     #[test]

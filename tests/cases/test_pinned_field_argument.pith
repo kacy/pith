@@ -1,0 +1,76 @@
+# a field or an element passed to a function borrows the owner's count, and
+# each callee here overwrites that very field or element before it reads its
+# parameter. the call site has to hold a count of its own for the call, or
+# the parameter names freed memory. the callees allocate strings of the same
+# size after the overwrite, so a freed parameter would read back as filler.
+struct Obj:
+    mut name: String
+
+struct Child:
+    name: String
+
+struct Holder:
+    mut child: Child?
+
+fn churn() -> List[String]:
+    mut junk: List[String] := []
+    mut i := 0
+    while i < 50:
+        junk.push("filler-{i}-x")
+        i = i + 1
+    return junk
+
+impl Obj:
+    fn rename_and_read(s: String) -> String:
+        self.name = "renamed"
+        junk := churn()
+        return s
+
+fn overwrite_field(o: Obj, s: String) -> String:
+    o.name = "replaced"
+    junk := churn()
+    return s
+
+fn clear_list(xs: List[String], s: String) -> String:
+    xs.clear()
+    junk := churn()
+    return s
+
+fn drop_child(h: Holder, c: Child?) -> String:
+    h.child = none
+    mut junk: List[Child] := []
+    mut i := 0
+    while i < 50:
+        junk.push(Child(name: "filler-{i}-x"))
+        i = i + 1
+    return c.value().name
+
+# these two read like pure helpers, but one runs a function value and the
+# other reaches a field write through a call, so neither may skip the pin.
+fn run_then_read(f: fn(), s: String) -> String:
+    f()
+    junk := churn()
+    return s
+
+fn rename_via(o: Obj, s: String) -> String:
+    overwrite_field(o, "x")
+    junk := churn()
+    return s
+
+fn main() -> Int:
+    o := Obj(name: "hello" + "-world")
+    print("field: {overwrite_field(o, o.name)} {o.name}")
+    o2 := Obj(name: "hello" + "-world")
+    print("method: {o2.rename_and_read(o2.name)} {o2.name}")
+    mut xs: List[String] := []
+    xs.push("hello" + "-world")
+    print("element: {clear_list(xs, xs[0])} {xs.len()}")
+    h := Holder(child: Child(name: "hello" + "-world"))
+    print("optional: {drop_child(h, h.child)}")
+    o3 := Obj(name: "hello" + "-world")
+    rename := fn():
+        o3.name = "renamed"
+    print("function value: {run_then_read(rename, o3.name)} {o3.name}")
+    o4 := Obj(name: "hello" + "-world")
+    print("through a call: {rename_via(o4, o4.name)} {o4.name}")
+    return 0

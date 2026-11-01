@@ -188,7 +188,8 @@ pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
 # is the null pointer. owning it is what makes the read safe when another
 # task can drop the target: a borrowed pointer that was retained later, at
 # `.value()`, could be revived after its last owner had already destroyed it.
-# every consumer that frees the shell (ir_release_weak_shell) takes its own
+# every consumer frees the shell as the fresh optional it is
+# (ir_optional_subject_is_owned in the emitter) and takes its own
 # count on the payload first, or drops the payload with the shell.
 pub fn ir_emit_weak_read(raw_r: Int) -> Int:
     alive_r := ir_reg()

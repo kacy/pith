@@ -759,6 +759,10 @@ fn ir_emit_weak_payload(val_idx: Int) -> Int:
         payload_r = ir_optional_value_as(val_r, "unknown")
     retain_r := ir_reg()
     ir_emit("call " + retain_r.to_string() + " pith_struct_weak_retain void 1 " + payload_r.to_string())
+    # a fresh optional (a call result, another weak read) has no other owner.
+    # the weak count above keeps the header readable after its release.
+    if ir_rc_kind(ir_infer_type(val_idx)) == "tuple" and ir_optional_subject_is_owned(val_idx):
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
     return payload_r
 
 fn ir_collect_struct_field_strings(root_idx: Int):
@@ -4169,13 +4173,6 @@ fn ir_node_is_weak_field_read(idx: Int) -> Bool:
         return false
     return ir_struct_field_is_weak(recv_info.name, node_value(idx))
 
-# free a fresh weak-read optional shell after its value has been extracted; the
-# shell has no destructor so this reclaims only the 3-slot allocation, leaving the
-# borrowed target untouched.
-fn ir_release_weak_shell(operand_idx: Int, shell_r: Int):
-    if ir_node_is_weak_field_read(operand_idx):
-        ir_emit_call1(ir_reg(), "pith_struct_release", "void", shell_r)
-
 # free the shell of an optional operand a comparison is the sole owner of.
 # `xs.index_of(v) != none` mints one shell to answer one flag read and nothing
 # else ever names it, so without this every search-against-none stranded it,
@@ -4351,7 +4348,10 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
         if part_info.kind == "result":
             return ir_emit_result_value_to_string(part_r, part_tid)
         if part_info.kind == "optional":
-            return ir_emit_optional_value_to_string(part_r, part_tid)
+            text_r := ir_emit_optional_value_to_string(part_r, part_tid)
+            # a fresh shell (a call result, a weak read) is the part's own
+            ir_release_owned_optional_operand(expr_idx, part_r)
+            return text_r
         if part_info.kind == "list":
             return ir_emit_display_list(part_r, ir_type_from_tid(part_info.inner), false)
         if part_info.kind == "map":
@@ -5042,12 +5042,10 @@ fn ir_emit_optional_binary_compare(node: Node, r: Int, left_r: Int, right_r: Int
     if op == "eq" or op == "neq":
         if left_node.kind == "none_lit" and right_holds_shell:
             ir_emit_optional_none_compare(r, op, right_r)
-            ir_release_weak_shell(node.children[1], right_r)
             ir_release_owned_optional_operand(node.children[1], right_r)
             return r
         if right_node.kind == "none_lit" and left_holds_shell:
             ir_emit_optional_none_compare(r, op, left_r)
-            ir_release_weak_shell(node.children[0], left_r)
             ir_release_owned_optional_operand(node.children[0], left_r)
             return r
         # T? == T?: raw pointer eq would compare heap addresses, not contents.
@@ -7627,8 +7625,6 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 owns_subject := ir_optional_subject_is_owned(node.children[0])
                 if ir_extraction_retains(node.children[0], inner_kind, owns_subject):
                     ir_rc_retain_reg(val_r, inner_kind)
-                # free a fresh weak-read shell once its value is extracted
-                ir_release_weak_shell(node.children[0], obj_r)
                 # a fresh shell (a call or method result) is this expression's
                 # to free; the retain above kept its payload alive past it.
                 if owns_subject:
@@ -10512,7 +10508,8 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
     if node.kind == "grouped" and node.children.len() > 0:
         return ir_optional_subject_is_owned(node.children[0])
     kind := node.kind
-    if kind == "await":
+    # a weak read's shell owns the count its upgrade took (ir_emit_weak_read)
+    if kind == "await" or ir_node_is_weak_field_read(idx):
         return true
     if kind != "call" and kind != "method_call":
         return false
@@ -10583,21 +10580,11 @@ fn ir_emit_if_let_stmt(node: Node):
     early_release := owns_subject and ir_let_subject_releases_early(node.children[1])
     if early_release:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
-    # a weak-field (or weak-local) subject minted a fresh borrowing shell for
-    # this one test (ir_emit_weak_read); the binding above took its own count
-    # on the payload, so the shell is dead the moment the bindings exist.
-    # freed here (before the body, which may return) and on the else path
-    # below, exactly once per path, the way the other optional consumers
-    # (`.value()`, `!= none`, `?`) free it. the referent's strong count is
-    # untouched: the shell has no destructor, so releasing it reclaims only
-    # the 3-slot allocation.
-    ir_release_weak_shell(node.children[1], subj_r)
     ir_block(node.children[2])
     if not ir_last_was_ret:
         ir_emit("jmp " + end_l)
     ir_emit_label(else_l)
     ir_last_was_ret = false
-    ir_release_weak_shell(node.children[1], subj_r)
     if early_release:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     if node.children.len() > 3:
@@ -10630,19 +10617,13 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     # release this iteration's owned shell before looping (the body borrowed its
     # value); the shell that fails the condition is released after the loop.
-    # a weak-read subject mints a throwaway shell per iteration on the same
-    # schedule, and the release sites mirror the owned pair exactly: the
-    # body-exit one covers each looping iteration, the post-loop one covers
-    # the shell that failed the condition (and a break's early exit, which
-    # jumps here before the body-exit release runs).
+    # a weak-read subject is one of these, a fresh shell per iteration.
     if owns_subject:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
-    ir_release_weak_shell(node.children[1], subj_r)
     ir_emit("jmp " + head_label)
     ir_emit_label(end_label)
     if owns_subject:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
-    ir_release_weak_shell(node.children[1], subj_r)
     ir_last_was_ret = false
 
 fn ir_emit_while_stmt(node: Node):

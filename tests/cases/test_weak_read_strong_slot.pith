@@ -1,0 +1,87 @@
+# a weak read kept in a strong slot: a local, a field, a struct construction,
+# a list, a map, a return. the slot is strong, so it has to keep the target
+# alive after the target's only other owner lets go. the read once handed
+# back an optional that borrowed its target, and each slot here then named a
+# freed node, which read back as filler once the churn reused its memory.
+struct Node:
+    name: String
+    mut next: Node?
+    weak back: Node?
+
+struct Keeper:
+    mut held: Node?
+
+struct Owner:
+    mut a: Node?
+
+fn churn() -> List[Node]:
+    mut junk: List[Node] := []
+    mut i := 0
+    while i < 50:
+        junk.push(Node(name: "filler-{i}-x", next: none, back: none))
+        i = i + 1
+    return junk
+
+# b.back points at a node only `o` owns
+fn link(o: Owner) -> Node:
+    a := Node(name: "hello" + "-a", next: none, back: none)
+    b := Node(name: "hello" + "-b", next: none, back: none)
+    b.back = a
+    o.a = a
+    return b
+
+fn back_of(b: Node) -> Node?:
+    return b.back
+
+fn show(label: String, n: Node?):
+    if n != none:
+        print("{label}: {n.value().name}")
+    else:
+        print("{label}: none")
+
+fn main() -> Int:
+    o := Owner(a: none)
+    b := link(o)
+    held := b.back
+    o.a = none
+    junk := churn()
+    show("local", held)
+    mut assigned: Node? := none
+    b2 := link(o)
+    assigned = b2.back
+    o.a = none
+    junk2 := churn()
+    show("assigned", assigned)
+    k := Keeper(held: none)
+    b3 := link(o)
+    k.held = b3.back
+    o.a = none
+    junk3 := churn()
+    show("field", k.held)
+    b4 := link(o)
+    k2 := Keeper(held: b4.back)
+    o.a = none
+    junk4 := churn()
+    show("construction", k2.held)
+    mut xs: List[Node?] := []
+    b5 := link(o)
+    xs.push(b5.back)
+    o.a = none
+    junk5 := churn()
+    show("list", xs[0])
+    mut m: Map[String, Node?] := {}
+    b6 := link(o)
+    m.insert("k", b6.back)
+    o.a = none
+    junk6 := churn()
+    show("map", m["k"])
+    b7 := link(o)
+    r := back_of(b7)
+    o.a = none
+    junk7 := churn()
+    show("returned", r)
+    # a target nothing strong holds any more still reads back as none
+    b8 := link(o)
+    o.a = none
+    show("dead", b8.back)
+    return 0

@@ -7,8 +7,9 @@ stale and a fix to it is welcome.
 
 ## language
 
-- **a bare name in a pattern is a binding**. write `Color.Red`, not `Red`, to
-  match a variant. `Red => ...` compiles and matches everything. `==` on enums
+- **a variant pattern must be qualified**. write `Color.Red`, not `Red`. a bare
+  name in a pattern is a binding that matches every value, so one that names a
+  variant of the matched enum is rejected (E228). `==` on enums
   with payloads compares tags and then payloads, strings by content and nested
   enums recursively, but a struct payload compares by identity:
   `Box.Holds(P(1)) == Box.Holds(P(1))` is false.

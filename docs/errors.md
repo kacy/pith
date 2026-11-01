@@ -102,7 +102,10 @@ error[E203]: duplicate definition of 'x'
 ### E204 — non-exhaustive match
 
 a match expression doesn't cover all possible values. includes a fix
-suggestion listing the missing patterns.
+suggestion listing the missing patterns. a guarded arm never counts toward
+coverage, since its guard can be false: `_ if n > 0 => ...` alone is not
+exhaustive. a binding on an optional subject covers the present values only,
+so the match also needs a `none` arm.
 
 ```
 error[E204]: non-exhaustive match: missing variant 'Circle'
@@ -113,9 +116,17 @@ error[E204]: non-exhaustive match: missing variant 'Circle'
 
 ### E205 — unreachable pattern
 
-a match arm can never be reached because earlier arms already cover it.
+a match arm can never be reached because an earlier arm without a guard is a
+wildcard, a binding, or a tuple of those, and matches every value. a binding
+on an optional subject matches only present values, so a `none` arm after it
+is still reachable. a repeated arm that is not a catch-all is not reported.
 
-**not currently emitted.** a repeated match arm is accepted, and the later copy never runs.
+```
+error[E205]: unreachable match arm: an earlier arm without a guard matches every value
+  4 |         1 => 1
+              ^
+  fix: remove this arm, or move it above the catch-all arm
+```
 
 ### E206 — missing return type
 
@@ -312,7 +323,16 @@ a method call references a method that doesn't exist on the type.
 
 ### E228 — pattern type mismatch
 
-a pattern in a match arm doesn't match the type being matched on.
+a pattern in a match arm doesn't match the type being matched on. a bare
+name that equals a variant of the matched enum is also E228: a bare name is a
+binding that matches every value, so the variant has to be written qualified.
+
+```
+error[E228]: 'Red' is a variant of Color, but a bare name in a pattern is a binding that matches every value
+  8 |         Red => 1
+              ^
+  fix: write Color.Red to match the variant
+```
 
 ### E229 — invalid self usage
 

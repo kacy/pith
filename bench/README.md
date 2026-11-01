@@ -939,9 +939,9 @@ box in a way the medians alone do not). the arm that used to cost a third of
 the two-worker speedup is now the fastest of the three. the 2026-09-06 run
 predates preemption safe points becoming the default (#1088), which changes
 when a task yields and so how placement settles, but that is a hypothesis
-and not an attribution. tracked in #1131; until it is settled, the paragraph
-in `docs/performance.md` explaining why the flag is off rests on the old
-numbers.
+and not an attribution. #1131 tracked it until #1233 turned migration on by
+default; the 2026-10-28 section of `docs/performance.md` has the numbers that
+decided it.
 
 ## task churn benchmark (per-thread pools)
 

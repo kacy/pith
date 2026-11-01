@@ -1,0 +1,39 @@
+# `xs[i] = v` with a bad index inside a fallible function fails the function,
+# and an owned temporary built for the store was never handed to the list: the
+# store reports the miss and leaves the value with the caller, which releases
+# it before failing. this misses with a string, a list and a struct, past the
+# end, at a negative index and into an empty list, so a miss arm that kept the
+# value, or a store that also released it, shows up here or as a crash.
+import leakprobe as probe
+
+struct Point:
+    x: Int
+    label: String
+
+fn miss(names: List[String], rows: List[List[Int]], points: List[Point], empty: List[String], i: Int) -> Int!String:
+    if i % 4 == 0:
+        names[5] = "name-{i}"
+    elif i % 4 == 1:
+        rows[0 - 1] = [i, i + 1]
+    elif i % 4 == 2:
+        points[3] = Point(i, "p-{i}")
+    else:
+        empty[0] = "e-{i}"
+    return 0
+
+fn main():
+    n := probe.rounds()
+    names := ["a", "b"]
+    rows := [[1], [2]]
+    points := [Point(0, "zero")]
+    empty: List[String] := []
+    mut failed := 0
+    mut i := 0
+    while i < n:
+        r := miss(names, rows, points, empty, i)
+        if r.is_err:
+            failed = failed + 1
+        i = i + 1
+    if failed != n:
+        print("unexpected store")
+    print("{probe.peak_kb()}")

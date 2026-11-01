@@ -398,12 +398,12 @@ other kinds of test, all wired through the `Makefile`:
 - **sanitizers** — `make sanitize-asan` links the whole regression corpus and
   every std test file against a runtime built with AddressSanitizer and runs
   them on both backends with the struct freelist off; `make sanitize-tsan`
-  does the same with ThreadSanitizer on os threads. valgrind misses a freed
+  does the same with ThreadSanitizer. valgrind misses a freed
   struct the freelist hands straight back out, which is how a double free in
   a weak field read went unseen, and these do not. the nightly `sanitizers`
-  workflow runs the asan gate. the code the compiler emits is not
-  instrumented, so a read that generated code does inline is only caught once
-  runtime code touches the same block. details are in `tooling/sanitize.sh`.
+  workflow runs the asan gate. the gate builds with `PITH_SANITIZE`, so the
+  field and global accesses generated code makes are checked too. details are
+  in `tooling/sanitize.sh`.
 - **leak growth** — `make leak-check` runs the cases under `tests/leaks/` at two
   round counts and fails when memory grew between them. this is the other half
   of `memcheck`, which has its leak check switched off on purpose.
@@ -494,7 +494,9 @@ that keeps filling up looks exactly like a leak.
 ## sanitizers
 
 threadsanitizer and addresssanitizer both run pith programs on either backend.
-neither is part of the gate. they need a runtime built with the sanitizer, and
+the nightly `sanitizers` workflow runs the asan gate over the corpus and the
+std tests (`make sanitize-asan`, above); this section is the recipe for one
+program by hand. they need a runtime built with the sanitizer, and
 the stable toolchain accepts `-Zsanitizer` only with `RUSTC_BOOTSTRAP=1`:
 
 ```sh

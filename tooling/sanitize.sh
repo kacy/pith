@@ -7,10 +7,10 @@
 #   tooling/sanitize.sh asan            # corpus and std tests, both backends
 #   tooling/sanitize.sh tsan corpus     # corpus only, os threads
 #
-# what it can and cannot see: the runtime is instrumented, the code the
-# compiler emits is not. a use after free is reported once runtime code
-# touches the freed block, which covers every count operation and every
-# container access, but not a field load that generated code does inline.
+# what it sees: the runtime is instrumented, and with PITH_SANITIZE set the
+# compiler reports each field, optional payload and global that generated
+# code reads or writes to the sanitizer, and routes its inline fast paths
+# through the runtime, so a freed block is caught wherever it is touched.
 #
 # the struct freelist is turned off for every run. with it on, a freed struct
 # is handed to the next allocation of its size and nothing ever looks freed:
@@ -29,13 +29,9 @@ pith="./target/release/pith"
 case "$kind" in
   asan)
     sanitizer=address
-    # green threads switch stacks without telling the sanitizer, so asan
-    # still runs there (its checks are per access) but tsan cannot yet
-    backends="${PITH_SANITIZE_BACKENDS:-os green}"
     ;;
   tsan)
     sanitizer=thread
-    backends="${PITH_SANITIZE_BACKENDS:-os}"
     ;;
   *)
     echo "usage: tooling/sanitize.sh asan|tsan [corpus|std|all]" >&2
@@ -43,6 +39,10 @@ case "$kind" in
     ;;
 esac
 
+# green task stack switches carry the sanitizers' fiber annotations, so both
+# backends run under either one
+backends="${PITH_SANITIZE_BACKENDS:-os green}"
+export PITH_SANITIZE="$sanitizer"
 target_dir="target/sanitize-$kind"
 triple="x86_64-unknown-linux-gnu"
 runtime_lib="$target_dir/$triple/release/libpith_runtime.a"

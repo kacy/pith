@@ -1,0 +1,60 @@
+# an http/2 connection must finish after its socket stops taking writes, even
+# when the client queued more control frames than the outbound queue holds.
+#
+# the client sends the preface, a SETTINGS frame and 300 PINGs in one burst,
+# then shuts its socket down in both directions. the server reads the burst
+# out of its receive buffer and queues a PING ACK per frame, but its writes now
+# fail. the writer used to return on the first failed write, so once the
+# reader had queued a full queue's worth of ACKs (256) it parked on the queue
+# forever and serve_h2c_connection never returned.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.net.http2.frames as frames
+import std.net.http2.server as server
+
+PINGS := 300
+
+fn hello(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.text(200, "hello")
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn serve_one(lfd: Int) -> Int:
+    accepted := tcp_accept(lfd)
+    if accepted.is_err:
+        return 1
+    server.serve_h2c_connection(accepted.ok, hello)
+    return 0
+
+fn burst() -> Bytes!:
+    out := bytes.buffer()
+    defer out.free()
+    out.write(bytes.from_string_utf8("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"))!
+    out.write(frames.frame_bytes(frames.settings_frame([])!)!)!
+    ping := frames.frame_bytes(frames.ping_frame(bytes.from_string_utf8("12345678"))!)!
+    mut i := 0
+    while i < PINGS:
+        out.write(ping)!
+        i = i + 1
+    return out.bytes()
+
+fn main() -> Int!:
+    port := choose_port(19760)!
+    lfd := tcp_listen("127.0.0.1", port)!
+    task := spawn serve_one(lfd)
+    client := tcp_connect("127.0.0.1", port)!
+    tcp_write_bytes(client, burst()!)!
+    tcp_shutdown(client)
+    print("served: " + (await task).to_string())
+    tcp_close(client)
+    tcp_close(lfd)
+    return 0

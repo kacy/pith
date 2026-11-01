@@ -832,26 +832,32 @@ fn send_stream_data(server: Server, stream_id: Int, data: Bytes, end_stream: Boo
 # direction — the socket and the hpack encoder — so no other task ever writes a
 # byte or encodes a header. a closed queue (connection winding down) ends the
 # loop after its buffered items flush, so a final GOAWAY still goes out. a write
-# failure marks the connection closed and stops.
+# failure marks the connection closed, and from then on the loop discards what
+# it receives: the reader and the handlers send into the bounded queue with a
+# blocking send, so a writer that stopped receiving would leave them parked on
+# a full queue for good.
 fn writer_loop(conn: ServerConn, outbound: Channel[Outbound], closed: AtomicInt) -> Int:
+    mut failed := false
     while true:
         opt := outbound.recv()
         if opt == none:
             return 0
         # already handled none above; the default is never reached.
         item := opt.unwrap_or(raw_item(bytes.empty()))
+        if failed:
+            continue
         if item.kind == OUT_RAW:
             sent := conn.send(item.raw)
             if sent.is_err:
                 closed.store(1)
-                return 0
+                failed = true
         else:
             # OUT_RESPONSE is headers only; the body follows as OUT_RAW DATA frames
             # the handler already gated against the client's send window.
             sent := send_headers(conn, item.stream_id, item.fields, item.end_stream)
             if sent.is_err:
                 closed.store(1)
-                return 0
+                failed = true
 
 # --- the handler task (one per stream) ---
 

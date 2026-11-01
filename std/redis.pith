@@ -158,6 +158,18 @@ impl Client:
             data := self.text(self.pos, self.pos + count)!
             self.pos = self.pos + need
             return data
+        gathered := self.read_payload_bytes(count)!
+        payload := bytes.substring_utf8(gathered, 0, count)
+        if payload.is_err:
+            fail "redis: reply is not valid utf-8"
+        return payload.ok
+
+    # read a `count`-byte payload and its line ending that did not fit the read
+    # buffer. the gathering buffer is freed on every way out of here; the utf-8
+    # check stays in read_payload, because a failure after take_bytes() would
+    # run the errdefer on a buffer take_bytes() had already freed.
+    fn read_payload_bytes(count: Int) -> Bytes!:
+        need := count + 2
         # the length is known, so the rest of the payload is read straight into
         # a buffer that grows: the payload is copied once on the way in and
         # once on the way out, however many reads it takes to arrive.
@@ -186,11 +198,7 @@ impl Client:
             got = got + chunk.len()
         # nothing is read past the payload, so the buffer is empty afterwards
         # and the gathered bytes are released as soon as the text is out.
-        gathered := out.take_bytes()
-        payload := bytes.substring_utf8(gathered, 0, count)
-        if payload.is_err:
-            fail "redis: reply is not valid utf-8"
-        return payload.ok
+        return out.take_bytes()
 
     # parse one reply off the wire, recursing for arrays.
     fn read_reply() -> Reply!:

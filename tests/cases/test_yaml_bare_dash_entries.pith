@@ -1,0 +1,39 @@
+# a bare `-` followed by another `-` at the same indentation is two entries
+# of one sequence, not a sequence nested in the first entry.
+#
+# the parser read the second line as the first entry's nested value, so
+# `-\n-\n-` came back as [[[null]]], and a long run of bare entries recursed
+# once per entry until the stack ran out (a segfault at about 70k entries).
+
+import std.yaml as yaml
+
+fn describe(text: String) -> String:
+    root := yaml.parse(text)
+    if root < 0:
+        return "error: " + yaml.last_error()
+    kind := yaml.type_of(root)
+    if kind != "seq":
+        return kind
+    mut out := "seq of " + yaml.array_len(root).to_string() + ":"
+    mut i := 0
+    while i < yaml.array_len(root) and i < 4:
+        out = out + " " + yaml.type_of(yaml.array_get(root, i))
+        i = i + 1
+    return out
+
+fn main() -> Int:
+    print(describe("-\n-\n- 3\n"))
+    print(describe("- \n- a\n"))
+    # a deeper `-` is still a nested sequence
+    print(describe("-\n  - a\n  - b\n- c\n"))
+    # and a sequence may still sit at its key's indentation
+    root := yaml.parse("ports:\n- 80\n- 443\n")
+    print(yaml.array_len(yaml.get_array(root, "ports")).to_string())
+
+    mut long := ""
+    mut i := 0
+    while i < 60000:
+        long = long + "-\n"
+        i = i + 1
+    print(describe(long))
+    return 0

@@ -85,6 +85,10 @@ pub MAX_RESPONSE_BODY := 67108864
 # against MAX_REQUEST_BODY separately; this bounds the line itself.
 CHUNK_LINE_LIMIT := 8192
 
+# how far a chunked body's framing may run ahead of its data; see
+# decode_chunked.
+CHUNK_EXCESS_LIMIT := 16384
+
 # how much the tls head reader asks for at a time: one tls record's worth of
 # plaintext, so a read takes a whole record rather than leaving most of it on
 # the connection's pending tail to be sliced off a byte at a time.
@@ -1903,17 +1907,37 @@ fn chunk_trailer_ends(line: Bytes, trailers: Map[String, String]) -> Bool!:
 # request readers pass MAX_REQUEST_BODY so a chunked upload is bounded like a
 # content-length one, and the client response readers pass 0. trailer fields
 # go into `trailers`. returns the decoded size.
+#
+# the bytes that are not data are bounded too. the trailer section may hold
+# MAX_HEADER_BYTES, like a request head. chunk framing (size lines, their
+# extensions and the line ends) is charged against the data it carries, as
+# go's net/http does: each chunk earns 16 bytes plus twice its size, and a
+# body whose unearned framing passes CHUNK_EXCESS_LIMIT fails. without that,
+# one-byte chunks with 8 KB extensions made a reader take in 8 KB per byte
+# of the body limit.
 fn decode_chunked(src: ByteSource, out: ByteBuffer, writer: BufferedBytesWriter, streaming: Bool, limit: Int, trailers: Map[String, String]) -> Int!:
     mut total := 0
+    mut excess := 0
     while true:
-        size := chunk_size_from_line(source_read_line(src, CHUNK_LINE_LIMIT)!)!
+        size_line := source_read_line(src, CHUNK_LINE_LIMIT)!
+        size := chunk_size_from_line(size_line)!
         if size == 0:
+            mut trailer_bytes := 0
             mut done := false
             while not done:
-                done = chunk_trailer_ends(source_read_line(src, CHUNK_LINE_LIMIT)!, trailers)!
+                line := source_read_line(src, CHUNK_LINE_LIMIT)!
+                trailer_bytes = trailer_bytes + line.len()
+                if trailer_bytes > MAX_HEADER_BYTES:
+                    fail HEADER_LIMIT_MESSAGE
+                done = chunk_trailer_ends(line, trailers)!
             if streaming:
                 writer.flush()!
             return total
+        excess = excess + size_line.len() + 2 - 16 - 2 * size
+        if excess < 0:
+            excess = 0
+        if excess > CHUNK_EXCESS_LIMIT:
+            fail bad_request("chunked body has too much framing for its data")
         # check the declared size before reading it, so a bogus chunk-size line
         # (e.g. 7fffffff) cannot force a huge allocation ahead of the cap
         if limit > 0 and size > limit - total:

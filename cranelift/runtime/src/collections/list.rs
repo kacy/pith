@@ -833,6 +833,11 @@ unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_c
     crate::perf_stats!(PERF_LIST_SETS += 1);
     let idx = index as usize;
     if idx >= impl_ref.len() {
+        // an index outside the list stores nothing, so an owned value the
+        // caller handed over has nobody else to release it.
+        if takes_caller_count {
+            release_element(impl_ref.type_tag, value);
+        }
         return;
     }
     // retain the incoming element before dropping the count on what it
@@ -1809,6 +1814,30 @@ mod tests {
             pith_list_release(list);
             assert_eq!(crate::cstring_refcount_for_tests(t), Some(1));
             crate::pith_cstring_release(t);
+        }
+    }
+
+    #[test]
+    fn owned_set_outside_the_list_releases_the_value() {
+        unsafe {
+            let list = pith_list_new(8, 1); // ListTypeTag::String
+            let kept = crate::pith_copy_bytes_to_cstring(b"kept");
+            pith_list_push_value_owned(list, kept as i64);
+
+            // past the end and negative: nothing is stored, and the count
+            // the caller handed over is dropped instead of stranded
+            for index in [1, 7, -1] {
+                let s = crate::pith_copy_bytes_to_cstring(b"dropped");
+                crate::pith_cstring_retain(s);
+                pith_list_set_value_owned(list, index, s as i64);
+                assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+                crate::pith_cstring_release(s);
+            }
+            assert_eq!(pith_list_len(list), 1);
+            assert_eq!(pith_list_get_value(list, 0), kept as i64);
+
+            pith_list_release(list);
+            assert_eq!(crate::cstring_refcount_for_tests(kept), None);
         }
     }
 

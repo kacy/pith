@@ -1648,14 +1648,16 @@ fn native_client_handshake_tls12(stream: TcpStream, server_name: String, config:
     p256pair.close()
 
     # the client flight: the Certificate the server asked for (ours, or an empty
-    # one when we have nothing it will take), ClientKeyExchange, and — when we
-    # presented a certificate — the CertificateVerify that proves we hold its
-    # key. then derive the keys over the transcript so far.
+    # one when we have none), ClientKeyExchange, and — when we presented a
+    # certificate — the CertificateVerify that proves we hold its key. then
+    # derive the keys over the transcript so far.
     client_flight := bytes.buffer()
     defer client_flight.free()
     mut presenting_certificate := false
     if client_cert_requested:
-        presenting_certificate = tls12_client_certificate_usable(config, cert_request_types, cert_request_schemes)
+        presenting_certificate = config_has_client_certificate(config)
+        if presenting_certificate and not tls12_client_certificate_usable(config, cert_request_types, cert_request_schemes):
+            fail refuse_with(stream, ALERT_HANDSHAKE_FAILURE, "the configured client certificate does not match the server's certificate request")
         mut client_certificate_body := tls12.encode_certificate_message([])!
         if presenting_certificate:
             client_certificate_body = tls12.encode_certificate_message(native_config_client_cert_chain(config)!)!
@@ -2181,9 +2183,11 @@ fn tls12_client_flight_complete(messages: List[tls13.HandshakeMessage]) -> Bool:
 
 # Whether this client can answer a 1.2 CertificateRequest: it must hold a
 # certificate, the request must accept that key's certificate type, and it must
-# advertise a signature scheme the key can produce. A client that fails any of
-# the three sends an empty Certificate and declines (rfc 5246 §7.4.6) rather
-# than aborting or signing with an algorithm the server never asked for.
+# advertise a signature scheme the key can produce. A client with no
+# certificate sends an empty Certificate (rfc 5246 §7.4.6). A client whose
+# configured certificate fails either of the other checks aborts with
+# handshake_failure, as BoringSSL does, so a misconfigured certificate fails
+# the handshake instead of the connection silently going unauthenticated.
 fn tls12_client_certificate_usable(config: Config, certificate_types: List[Int], schemes: List[Int]) -> Bool:
     if not config_has_client_certificate(config):
         return false
@@ -3938,9 +3942,9 @@ test "a tls 1.2 certificate verify signature is bound to the transcript it signe
     cfg.close()
 
 test "a tls 1.2 client answers only a certificate request its key can satisfy":
-    # declining is a message, not an error: a client that cannot satisfy the
-    # request sends an empty certificate (rfc 5246 §7.4.6) instead of aborting
-    # or signing with something the server never asked for.
+    # a client with no certificate declines with an empty one (rfc 5246
+    # §7.4.6); one whose configured certificate fails a check aborts the
+    # handshake rather than signing with something the server never asked for.
     rsa_cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!.with_client_certificate("tests/live/fixtures/clientcert-rsa.crt", "tests/live/fixtures/clientcert-rsa.key")!
     ec_cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!.with_client_certificate("tests/live/fixtures/clientcert-ecdsa.crt", "tests/live/fixtures/clientcert-ecdsa.key")!
     bare_cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!

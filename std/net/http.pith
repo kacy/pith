@@ -63,6 +63,20 @@ HTTP_FILE_STREAM_CHUNK_SIZE := 4096
 pub MAX_HEADER_BYTES := 65536
 pub MAX_REQUEST_BODY := 10485760
 
+# response-size limits for the http/1.1 client, the counterpart of the request
+# limits above: they bound how much one response can make a client buffer, so a
+# hostile or broken server cannot exhaust its memory. they are the defaults of a
+# Client, which can raise or lower them, and a ClientRequest can set its own body
+# limit. a body streamed with send_into or send_to_file is not buffered and has
+# no limit.
+#   * MAX_RESPONSE_HEADER_BYTES caps the response head, as net/http's default
+#     MaxResponseHeaderBytes does.
+#   * MAX_RESPONSE_BODY caps a buffered response body, whether it is declared by
+#     content-length, chunked, or runs until the server closes, and the body a
+#     gzip response decodes to.
+pub MAX_RESPONSE_HEADER_BYTES := 1048576
+pub MAX_RESPONSE_BODY := 67108864
+
 # a chunked-transfer chunk-size line (a hex length plus optional
 # extensions) and a trailer line are both tiny in any real request. this
 # caps the bytes read while scanning for one line's terminating newline,
@@ -150,6 +164,9 @@ pub struct ClientRequest:
     pub use_tls: Bool
     pub timeout_ms: Int
     pub redirect_limit: Int
+    # the most a buffered response body may hold, or 0 for the client's limit
+    # (MAX_RESPONSE_BODY outside a Client). set with with_max_response_body_bytes.
+    pub max_response_body_bytes: Int
 
 # a reusable plain http client connection.
 pub struct ClientConn:
@@ -2027,10 +2044,22 @@ fn source_stream_all(src: ByteSource, writer: BufferedBytesWriter) -> Int!:
         total = total + writer.write_all_bytes(chunk)!
     return total
 
-fn source_read_all(src: ByteSource) -> Bytes!:
-    if src.use_tls:
-        return src.conn.read_all_bytes()
-    return src.reader.read_all_bytes()
+# everything up to end of stream, failing once it passes `limit` bytes.
+fn source_read_all_bounded(src: ByteSource, limit: Int) -> Bytes!:
+    out := bytes.buffer()
+    errdefer out.free()
+    while true:
+        mut chunk := bytes.empty()
+        if src.use_tls:
+            chunk = src.conn.read_bytes(TLS_READ_CHUNK)!
+        else:
+            chunk = src.reader.read_bytes(TLS_READ_CHUNK)!
+        if chunk.is_empty():
+            return out.take_bytes()
+        if chunk.len() > limit - out.len():
+            fail BODY_LIMIT_MESSAGE
+        out.write(chunk)!
+    return out.take_bytes()
 
 # ===============================================================
 # Response Parsing
@@ -2043,6 +2072,7 @@ RESPONSE_HEADER_LIMIT_MESSAGE := "http: response header fields exceed the maximu
 RESPONSE_VERSION_MESSAGE := "http: unsupported http version in response"
 RESPONSE_CODING_MESSAGE := "http: unsupported transfer coding in response"
 RESPONSE_BODY_EOF_MESSAGE := "http: response body ended early"
+RESPONSE_BODY_LIMIT_MESSAGE := "http: response body exceeds the maximum"
 # the peer closed before a byte of the response arrived. on a reused
 # connection this is the race of a server closing an idle connection just as
 # a request goes out, which the client retries.
@@ -2051,10 +2081,6 @@ NO_RESPONSE_MESSAGE := "http: server closed the connection before responding"
 # wait for the response head.
 CLIENT_TIMEOUT_MESSAGE := "http: client timeout exceeded"
 HEADER_TIMEOUT_MESSAGE := "http: timeout awaiting response headers"
-
-# the most a response head may hold before the client gives up on it, as
-# net/http's default MaxResponseHeaderBytes allows.
-MAX_RESPONSE_HEADER_BYTES := 1048576
 
 # a response head checked by parse_response_head, with the framing of its body
 # (rfc 9112 6.3): `kind` is one of the HTTP_RESPONSE_BODY_ codes and
@@ -2080,6 +2106,8 @@ fn response_failure(message: String) -> String:
         return RESPONSE_INCOMPLETE_MESSAGE
     if message == HEADER_LIMIT_MESSAGE:
         return RESPONSE_HEADER_LIMIT_MESSAGE
+    if message == BODY_LIMIT_MESSAGE:
+        return RESPONSE_BODY_LIMIT_MESSAGE
     return message
 
 # check a response head (rfc 9112 4, 5) and work out how its body is framed
@@ -2159,9 +2187,9 @@ fn response_status_has_no_body(status: Int) -> Bool:
 # the next final response head on `src`, checked by parse_response_head.
 # interim 1xx responses before it are read and dropped (rfc 9110 15.2), except
 # 101, which ends the exchange as http/1.1 knows it.
-fn read_response_head_from(src: ByteSource, method: String) -> ResponseHead!:
+fn read_response_head_from(src: ByteSource, method: String, head_limit: Int) -> ResponseHead!:
     while true:
-        got := read_request_head(src, MAX_RESPONSE_HEADER_BYTES)
+        got := read_request_head(src, head_limit)
         if got.is_err:
             fail response_failure(got.err)
         raw := got!
@@ -2172,24 +2200,28 @@ fn read_response_head_from(src: ByteSource, method: String) -> ResponseHead!:
             return parsed
     fail NO_RESPONSE_MESSAGE
 
-# the body a checked response head frames, read from `src`. trailer fields of
-# a chunked body go into `trailers`.
-fn read_response_body_from(src: ByteSource, parsed: ResponseHead, trailers: Map[String, String]) -> Bytes!:
-    got := read_response_body_raw(src, parsed, trailers)
+# the body a checked response head frames, read from `src`, at most `limit`
+# bytes. trailer fields of a chunked body go into `trailers`.
+fn read_response_body_from(src: ByteSource, parsed: ResponseHead, trailers: Map[String, String], limit: Int) -> Bytes!:
+    got := read_response_body_raw(src, parsed, trailers, limit)
     if got.is_err:
         fail response_failure(got.err)
     return got!
 
-fn read_response_body_raw(src: ByteSource, parsed: ResponseHead, trailers: Map[String, String]) -> Bytes!:
+# a declared length is refused before any of it is read, and a chunked or
+# read-until-close body as soon as it passes the limit.
+fn read_response_body_raw(src: ByteSource, parsed: ResponseHead, trailers: Map[String, String], limit: Int) -> Bytes!:
     if parsed.kind == HTTP_RESPONSE_BODY_CHUNKED:
         out := bytes.buffer()
         errdefer out.free()
-        decode_chunked(src, out, BufferedBytesWriter(0), false, 0, trailers)!
+        decode_chunked(src, out, BufferedBytesWriter(0), false, limit, trailers)!
         return out.take_bytes()
     if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
+        if parsed.content_length > limit:
+            fail BODY_LIMIT_MESSAGE
         return source_read_exact(src, parsed.content_length)
     if parsed.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
-        return source_read_all(src)
+        return source_read_all_bounded(src, limit)
     return bytes.empty()
 
 # like read_response_body_from, but the body goes to `writer`. returns its
@@ -2222,16 +2254,17 @@ fn streamed_response_from_parsed(parsed: ResponseHead, body_size: Int) -> Stream
     content_type := header_lookup(headers, "Content-Type")
     return StreamedHttpResponse(parsed.status, content_type, header_without(headers, "Content-Type"), response_set_cookie_headers(parsed.head), body_size)
 
-# read one whole response from `src`: the head and the body it frames.
-fn read_response_from(src: ByteSource, method: String) -> HttpResponse!:
-    parsed := read_response_head_from(src, method)!
+# read one whole response from `src`: the head and the body it frames, the body
+# at most `limit` bytes.
+fn read_response_from(src: ByteSource, method: String, limit: Int) -> HttpResponse!:
+    parsed := read_response_head_from(src, method, MAX_RESPONSE_HEADER_BYTES)!
     trailers: Map[String, String] := {}
-    body := read_response_body_from(src, parsed, trailers)!
+    body := read_response_body_from(src, parsed, trailers, limit)!
     return response_from_parsed(parsed, body, trailers)
 
 # read one response from `src` and stream its body into `writer`.
 fn read_response_into_from(src: ByteSource, method: String, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-    parsed := read_response_head_from(src, method)!
+    parsed := read_response_head_from(src, method, MAX_RESPONSE_HEADER_BYTES)!
     body_size := stream_response_body_from(src, parsed, writer, {})!
     return streamed_response_from_parsed(parsed, body_size)
 
@@ -3874,7 +3907,7 @@ pub fn parse_response_bytes(raw: Bytes) -> HttpResponse!:
     defer cursor.close()
     reader := cursor.buffered_chunked(4096)
     defer reader.free()
-    return read_response_from(buffered_source(reader), "GET")
+    return read_response_from(buffered_source(reader), "GET", MAX_RESPONSE_BODY)
 
 # parses a raw http response string into a structured response.
 pub fn parse_response(raw: String) -> HttpResponse!:
@@ -3885,7 +3918,7 @@ pub fn parse_response(raw: String) -> HttpResponse!:
 # responses are skipped, and the body is read as the head frames it. a body
 # that runs to the close of the connection is read to the end of the reader.
 pub fn read_response_buffered_bytes(reader: BufferedBytesReader) -> HttpResponse!:
-    return read_response_from(buffered_source(reader), "GET")
+    return read_response_from(buffered_source(reader), "GET", MAX_RESPONSE_BODY)
 
 # reads one http response and streams the decoded body into a writer.
 pub fn read_response_buffered_bytes_into(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
@@ -3905,7 +3938,7 @@ pub fn read_response_stream_into(stream: TcpStream, writer: BufferedBytesWriter)
 
 # reads one http response from a tls connection.
 pub fn read_response_tls(conn: tls.Conn) -> HttpResponse!:
-    return read_response_from(tls_source(conn), "GET")
+    return read_response_from(tls_source(conn), "GET", MAX_RESPONSE_BODY)
 
 # reads one http response from a tls connection and streams the decoded body into a writer.
 pub fn read_response_tls_into(conn: tls.Conn, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
@@ -3918,7 +3951,7 @@ pub fn read_response_tls_into(conn: tls.Conn, writer: BufferedBytesWriter) -> St
 # starts building an outbound request.
 pub fn request(method: String, host: String, port: Int, url_path: String) -> ClientRequest:
     mut headers: Map[String, String] := {}
-    return ClientRequest(method, host, port, normalize_path(url_path), headers, bytes.empty(), false, -1, 0)
+    return ClientRequest(method, host, port, normalize_path(url_path), headers, bytes.empty(), false, -1, 0, 0)
 
 # starts a get request builder.
 pub fn get_request(host: String, port: Int, url_path: String) -> ClientRequest:
@@ -3938,11 +3971,11 @@ pub fn delete_request(host: String, port: Int, url_path: String) -> ClientReques
 
 # starts building an outbound https request on port 443.
 pub fn https_request(method: String, host: String, url_path: String) -> ClientRequest:
-    return ClientRequest(method, host, 443, normalize_path(url_path), {}, bytes.empty(), true, -1, 0)
+    return ClientRequest(method, host, 443, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0)
 
 # starts building an outbound https request on an explicit port.
 pub fn https_request_port(method: String, host: String, port: Int, url_path: String) -> ClientRequest:
-    return ClientRequest(method, host, port, normalize_path(url_path), {}, bytes.empty(), true, -1, 0)
+    return ClientRequest(method, host, port, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0)
 
 # starts a get https request builder.
 pub fn get_https_request(host: String, url_path: String) -> ClientRequest:
@@ -4196,7 +4229,7 @@ fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
     if request_origin_changed(req, next_use_tls, next_host, next_port):
         next_headers = header_without(next_headers, "Authorization")
         next_headers = header_without(next_headers, "Cookie")
-    return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit)
+    return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes)
 
 # one http/1.1 client connection: a plain socket with its buffered reader and
 # writer, or a tls session over the socket. `key` names the origin it was
@@ -4264,7 +4297,7 @@ fn send_request_wire(req: ClientRequest, server_name: String, config: tls.Config
     c := open_wire(req, server_name, config)!
     defer wire_close(c)
     wire_write(c, req.to_bytes()!)!
-    return read_response_from(wire_source(c), req.method)
+    return read_response_from(wire_source(c), req.method, request_body_limit(req, MAX_RESPONSE_BODY))
 
 # like send_request_wire, but the body goes to `writer`. when `follow` is set,
 # the body of a redirect is read and dropped, since the caller follows it.
@@ -4273,9 +4306,9 @@ fn send_request_wire_into(req: ClientRequest, server_name: String, config: tls.C
     defer wire_close(c)
     wire_write(c, req.to_bytes()!)!
     src := wire_source(c)
-    parsed := read_response_head_from(src, req.method)!
+    parsed := read_response_head_from(src, req.method, MAX_RESPONSE_HEADER_BYTES)!
     if follow and redirect_status(parsed.status):
-        read_response_body_from(src, parsed, {})!
+        read_response_body_from(src, parsed, {}, request_body_limit(req, MAX_RESPONSE_BODY))!
         return streamed_response_from_parsed(parsed, 0)
     return streamed_response_from_parsed(parsed, stream_response_body_from(src, parsed, writer, {})!)
 
@@ -4314,7 +4347,7 @@ fn send_request_following_redirects_with_tls_config(req: ClientRequest, tls_conf
 # the tls send path shared by send_tls_with_config and its traced wrapper: force
 # tls on, then dispatch to the plain-host redirect path or a single sni request.
 fn send_tls_request(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
-    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit)
+    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes)
     if server_name != req.host:
         return send_request_wire(current, server_name, config)
     return send_request_following_redirects_with_tls_config(current, config)
@@ -4415,7 +4448,7 @@ pub fn end_server_span(span: trace.Span, status: Int):
 # response handed to redirect_request carries only its status and fields.
 fn streamed_redirect_request(current: ClientRequest, resp: StreamedHttpResponse, redirects_left: Int) -> ClientRequest!:
     next := redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
-    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left)
+    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left, next.max_response_body_bytes)
 
 fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     mut current := req
@@ -4451,7 +4484,7 @@ fn send_request_following_redirects_into_with_tls_config(req: ClientRequest, tls
 
 impl ClientRequest:
     fn header(name: String, value: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body, self.use_tls, self.timeout_ms, self.redirect_limit)
+        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
 
     fn keep_alive() -> ClientRequest:
         return self.header("Connection", "keep-alive")
@@ -4460,19 +4493,24 @@ impl ClientRequest:
         return self.header("Connection", "close")
 
     fn with_timeout(ms: Int) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, ms, self.redirect_limit)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, ms, self.redirect_limit, self.max_response_body_bytes)
 
     fn follow_redirects(limit: Int) -> ClientRequest:
         mut next_limit := limit
         if next_limit < 0:
             next_limit = 0
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, next_limit)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, next_limit, self.max_response_body_bytes)
 
     fn no_redirects() -> ClientRequest:
         return self.follow_redirects(0)
 
+    # the most this request's buffered response body may hold, in place of the
+    # client's limit or MAX_RESPONSE_BODY.
+    fn with_max_response_body_bytes(limit: Int) -> ClientRequest:
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, limit)
+
     fn query_param(name: String, value: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit)
+        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
 
     fn query_params(values: Map[String, String]) -> ClientRequest:
         mut next := self
@@ -4481,10 +4519,10 @@ impl ClientRequest:
         return next
 
     fn body_text(text: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text), self.use_tls, self.timeout_ms, self.redirect_limit)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text), self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
 
     fn body_bytes(data: Bytes) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data, self.use_tls, self.timeout_ms, self.redirect_limit)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
 
     fn text_body(text: String) -> ClientRequest:
         return self.body_text(text)
@@ -4575,7 +4613,7 @@ impl ClientRequest:
         return self.send_tls_into_with_config(self.host, config, writer)
 
     fn send_tls_into_with_config(server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit)
+        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
         if server_name == self.host:
             return send_request_following_redirects_into_with_tls_config(current, config, writer)
         return send_request_wire_into(current, server_name, config, writer, false)
@@ -4605,13 +4643,19 @@ impl ClientRequest:
     fn send_tls_bytes() -> Bytes!:
         return self.send_tls()!.body_bytes()
 
+# the response body limit for `req`: its own when it set one, else `fallback`.
+fn request_body_limit(req: ClientRequest, fallback: Int) -> Int:
+    if req.max_response_body_bytes > 0:
+        return req.max_response_body_bytes
+    return fallback
+
 impl ClientConn:
     fn send(req: ClientRequest) -> HttpResponse!:
         if req.timeout_ms >= 0:
             self.stream.set_timeout(req.timeout_ms)
         self.writer.write_all_bytes(req.to_bytes()!)!
         self.writer.flush()!
-        return read_response_from(buffered_source(self.reader), req.method)
+        return read_response_from(buffered_source(self.reader), req.method, request_body_limit(req, MAX_RESPONSE_BODY))
 
     fn close():
         self.reader.free()
@@ -4635,7 +4679,7 @@ impl ClientConn:
 impl TlsClientConn:
     fn send(req: ClientRequest) -> HttpResponse!:
         self.conn.write_all_bytes(req.to_bytes()!)!
-        return read_response_from(tls_source(self.conn), req.method)
+        return read_response_from(tls_source(self.conn), req.method, request_body_limit(req, MAX_RESPONSE_BODY))
 
     fn close():
         self.conn.close()
@@ -4703,6 +4747,14 @@ struct ConnPool:
 #     with_tls_config. the caller owns it and closes it after the client's
 #     last request. without one, each new connection uses the default client
 #     config.
+#   * max_response_header_bytes: the most a response head may hold. a longer
+#     one fails the request. MAX_RESPONSE_HEADER_BYTES by default.
+#   * max_response_body_bytes: the most a buffered response body may hold,
+#     after gzip decoding. a declared length past it fails before any of the
+#     body is read, and a chunked or read-until-close body as soon as it passes
+#     it. MAX_RESPONSE_BODY by default; a request's own
+#     with_max_response_body_bytes replaces it for that request. a streamed
+#     body (send_into, send_to_file) is not limited.
 #
 # a Client is safe to share between tasks: the idle connections are guarded
 # by a lock, and a connection is used by one request at a time.
@@ -4719,6 +4771,8 @@ pub struct Client:
     pub mut proxy_url: String
     pub mut env_proxy: Bool
     pub mut tls_config: tls.Config
+    pub mut max_response_header_bytes: Int
+    pub mut max_response_body_bytes: Int
     pool: ConnPool
 
 # net/http's DefaultMaxIdleConnsPerHost and the idle timeout of its
@@ -4734,7 +4788,7 @@ DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS := 1000
 # origin kept for 90 seconds, up to 10 redirects, gzip asked for and decoded,
 # and a 1 second wait for 100 Continue.
 pub fn client() -> Client:
-    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, true, DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS, "", false, no_tls_config(), ConnPool({}, Mutex()))
+    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, true, DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS, "", false, no_tls_config(), MAX_RESPONSE_HEADER_BYTES, MAX_RESPONSE_BODY, ConnPool({}, Mutex()))
 
 # a request for `method` and an absolute http or https url, as net/http's
 # NewRequest builds one.
@@ -4756,7 +4810,7 @@ pub fn new_request(method: String, raw_url: String) -> ClientRequest!:
     query_text := url_mod.query(parsed)
     if query_text != "":
         target = target + "?" + query_text
-    return ClientRequest(method, host, port, normalize_path(target), {}, bytes.empty(), use_tls, -1, 0)
+    return ClientRequest(method, host, port, normalize_path(target), {}, bytes.empty(), use_tls, -1, 0, 0)
 
 # the pool key of an origin.
 fn origin_key(use_tls: Bool, host: String, port: Int) -> String:
@@ -4966,9 +5020,19 @@ impl Client:
         next.tls_config = config
         return next
 
+    fn with_max_response_header_bytes(limit: Int) -> Client:
+        next := self.copy()
+        next.max_response_header_bytes = limit
+        return next
+
+    fn with_max_response_body_bytes(limit: Int) -> Client:
+        next := self.copy()
+        next.max_response_body_bytes = limit
+        return next
+
     # the same settings and the same idle connections.
     fn copy() -> Client:
-        return Client(self.timeout_ms, self.dial_timeout_ms, self.response_header_timeout_ms, self.max_idle_conns_per_host, self.idle_conn_timeout_ms, self.max_redirects, self.keep_alives, self.compression, self.expect_continue_timeout_ms, self.proxy_url, self.env_proxy, self.tls_config, self.pool)
+        return Client(self.timeout_ms, self.dial_timeout_ms, self.response_header_timeout_ms, self.max_idle_conns_per_host, self.idle_conn_timeout_ms, self.max_redirects, self.keep_alives, self.compression, self.expect_continue_timeout_ms, self.proxy_url, self.env_proxy, self.tls_config, self.max_response_header_bytes, self.max_response_body_bytes, self.pool)
 
     # send `req` and read the whole response, following redirects.
     fn send(req: ClientRequest) -> HttpResponse!:
@@ -5228,7 +5292,7 @@ impl Client:
         arrived := source_wait_bytes(src) catch 0
         if arrived <= 0:
             fail client_timeout_failure(NO_RESPONSE_MESSAGE, deadline, header_due)
-        head := read_response_head_from(src, req.method)
+        head := read_response_head_from(src, req.method, self.max_response_header_bytes)
         if head.is_err:
             fail client_timeout_failure(head.err, deadline, header_due)
         parsed := head!
@@ -5253,12 +5317,13 @@ impl Client:
                 fail client_timeout_failure(streamed.err, deadline, 0)
             body_size = streamed!
         else:
-            got := read_response_body_from(src, parsed, trailers)
+            limit := request_body_limit(req, self.max_response_body_bytes)
+            got := read_response_body_from(src, parsed, trailers, limit)
             if got.is_err:
                 fail client_timeout_failure(got.err, deadline, 0)
             body = got!
             if accept_gzip and not body.is_empty() and response_content_encoding(parsed.head) == "gzip":
-                unzipped := gzip.decompress(body)
+                unzipped := gzip.decompress_bounded(body, limit)
                 if unzipped.is_err:
                     fail "http: gzip response body: " + unzipped.err
                 body = unzipped!
@@ -5287,7 +5352,7 @@ impl Client:
             fail NO_RESPONSE_MESSAGE
         arm_client_deadline(src.socket, deadline, true)
         while true:
-            got := read_request_head(src, MAX_RESPONSE_HEADER_BYTES)
+            got := read_request_head(src, self.max_response_header_bytes)
             if got.is_err:
                 fail client_timeout_failure(response_failure(got.err), deadline, 0)
             raw := got!

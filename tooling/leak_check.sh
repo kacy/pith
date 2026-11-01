@@ -159,6 +159,7 @@ cases=(
   tests/leaks/leak_weak_field
   tests/leaks/leak_weak_read_off_temp
   tests/leaks/leak_weak_local
+  tests/leaks/leak_weak_read_binding
   tests/leaks/leak_weak_capture_cycle
   tests/leaks/leak_closure_captured_optional
   tests/leaks/leak_optional_plain_compare

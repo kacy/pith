@@ -87,6 +87,17 @@ pub use probe::{encode_probe, pith_green_cross_thread_probe};
 pub use stats::note_channel_wake;
 pub(crate) use wake::{park_current, take_handoff, wake, wake_pool, wake_with};
 
+/// the pieces of the scheduling word the loom models drive: its states and
+/// flags, and the pure transitions a wake and a suspend make on it.
+#[cfg(all(test, loom))]
+pub(crate) mod word {
+    pub(crate) use super::run::{after_yield, Requeue};
+    pub(crate) use super::task::{
+        owner_bits, S_READY, S_RUNNING, S_STATE_MASK, S_WAKE_PENDING,
+    };
+    pub(crate) use super::wake::{wake_step, WakeStep};
+}
+
 /// the whole green runtime: the per-task sync blocks, the per-worker queues
 /// and park spots, and the injector for off-worker spawns.
 struct Scheduler {

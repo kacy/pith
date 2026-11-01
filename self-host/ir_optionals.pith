@@ -176,23 +176,30 @@ pub fn ir_emit_optional_none_value() -> Int:
 pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
     return ir_emit_some_shell(value_r)
 
-# read a weak optional field. the slot holds the target pointer directly
-# (0 = none) rather than an owning tuple, so liveness is resolved through
-# pith_struct_weak_load: it returns the pointer while the target is still
-# alive and 0 once the target has been reclaimed. that lets a dropped target
-# read back as none instead of dangling. the caller gets a fresh, borrowing
-# optional tuple (Some(ptr) when alive, none otherwise) that behaves like any
-# other `T?` for `.value()` and `!= none`.
+# read a weak optional field (or a weak local). the slot holds the target
+# pointer directly (0 = none) rather than an owning tuple, so the read
+# upgrades it through pith_struct_weak_upgrade: one more strong count on the
+# target while it is still alive, taken in a single atomic step, and 0 once
+# the target has been reclaimed. that lets a dropped target read back as none
+# instead of dangling.
+#
+# the caller gets a fresh optional that OWNS that count: Some(ptr) carries the
+# struct payload destructor, so releasing the shell drops the count, and none
+# is the null pointer. owning it is what makes the read safe when another
+# task can drop the target: a borrowed pointer that was retained later, at
+# `.value()`, could be revived after its last owner had already destroyed it.
+# every consumer that frees the shell (ir_release_weak_shell) takes its own
+# count on the payload first, or drops the payload with the shell.
 pub fn ir_emit_weak_read(raw_r: Int) -> Int:
     alive_r := ir_reg()
-    ir_emit("call " + alive_r.to_string() + " pith_struct_weak_load int 1 " + raw_r.to_string())
+    ir_emit("call " + alive_r.to_string() + " pith_struct_weak_upgrade int 1 " + raw_r.to_string())
     tmp := ir_new_temp_name("weak_read")
     ir_emit("store " + tmp + " " + alive_r.to_string())
     some_l := ir_label()
     done_l := ir_label()
     ir_emit("brif " + alive_r.to_string() + " " + some_l + " " + done_l)
     ir_emit_label(some_l)
-    shell_r := ir_emit_some_shell(alive_r)
+    shell_r := ir_emit_optional_owned_some(alive_r, "struct")
     ir_emit("store " + tmp + " " + shell_r.to_string())
     ir_emit("jmp " + done_l)
     ir_emit_label(done_l)

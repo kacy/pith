@@ -1,7 +1,7 @@
 use crate::collections::list::{pith_list_new, pith_list_push_value};
 use crate::string;
 use std::alloc::{alloc, Layout};
-use std::sync::atomic::{fence, AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
 
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     // the length is already known, so allocate the headered cstring directly.
@@ -316,7 +316,7 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
             return;
         }
         if prev == 1 {
-            fence(Ordering::Acquire);
+            acquire_last_count!(cstring_refcount(base));
             let needle = if HOOKED { debug_trace_needle() } else { None };
             if let Some(needle) = needle {
                 let data_len = cstring_data_len(base);
@@ -838,7 +838,7 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
             .fetch_add(1, Ordering::Relaxed);
         return;
     }
-    fence(Ordering::Acquire);
+    acquire_last_count!(closure.ref_count);
     closure.release_captures();
     let buffered = closure
         .cycle_flags
@@ -3668,7 +3668,7 @@ unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
         if weak.fetch_sub(1, Ordering::Release) != 1 {
             return;
         }
-        fence(Ordering::Acquire);
+        acquire_last_count!(weak);
     }
     struct_free_header(base);
 }
@@ -3881,7 +3881,7 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
             strong.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        fence(Ordering::Acquire);
+        acquire_last_count!(strong);
     }
     let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
     if dtor != 0 {

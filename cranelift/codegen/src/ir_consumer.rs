@@ -1327,6 +1327,68 @@ fn green_preempt_enabled() -> bool {
     preempt_from_env(std::env::var("PITH_GREEN_PREEMPT").ok().as_deref())
 }
 
+/// The sanitizer's checks for one 8-byte read and one 8-byte write, for a
+/// build linked against a sanitized runtime.
+#[derive(Clone, Copy)]
+struct SanitizeHooks {
+    read: FuncId,
+    write: FuncId,
+}
+
+/// The hook symbols `PITH_SANITIZE` names: `thread` or `address`. Unset,
+/// empty or `0` means none.
+fn sanitize_hook_names(value: Option<&str>) -> Result<Option<(&'static str, &'static str)>, String> {
+    match value.map(str::trim) {
+        None | Some("") | Some("0") => Ok(None),
+        Some("thread") => Ok(Some(("__tsan_read8", "__tsan_write8"))),
+        Some("address") => Ok(Some(("__asan_load8", "__asan_store8"))),
+        Some(other) => Err(format!("PITH_SANITIZE={other}: expected thread or address")),
+    }
+}
+
+/// `PITH_SANITIZE`, for a build linked against a sanitized runtime. The
+/// sanitizer only sees memory the runtime touches, so with it set the
+/// emitted code calls the runtime instead of taking an inline fast path, and
+/// reports each struct field, optional payload and global it reads or writes
+/// to the sanitizer's check. Every retain and release is a runtime call in
+/// any build, so the counts need nothing here.
+fn sanitize_hooks(codegen: &mut CodeGen) -> Result<Option<SanitizeHooks>, CompileError> {
+    let names = sanitize_hook_names(std::env::var("PITH_SANITIZE").ok().as_deref())
+        .map_err(CompileError::ModuleError)?;
+    let Some((read, write)) = names else {
+        return Ok(None);
+    };
+    let mut sig = codegen.module.make_signature();
+    sig.params.push(AbiParam::new(types::I64));
+    let mut declare = |name: &str| {
+        codegen
+            .module
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| CompileError::ModuleError(e.to_string()))
+    };
+    Ok(Some(SanitizeHooks { read: declare(read)?, write: declare(write)? }))
+}
+
+/// Report an 8-byte access at `addr + offset` to the sanitizer, when the
+/// build has one.
+fn emit_sanitize_check(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
+    hooks: Option<SanitizeHooks>,
+    write: bool,
+    addr: Value,
+    offset: i32,
+) {
+    let Some(hooks) = hooks else {
+        return;
+    };
+    let hook = if write { hooks.write } else { hooks.read };
+    let fref = cached_func_ref(codegen, builder, func_ref_cache, hook);
+    let at = builder.ins().iadd_imm(addr, offset as i64);
+    builder.ins().call(fref, &[at]);
+}
+
 /// Emit a cooperative-preemption safe-point inline, just before a loop back-edge
 /// branch. Loads the process-global `PITH_PREEMPT_REQUESTED` flag (declared in
 /// the runtime, see `green.rs`); on the hot path, with the flag clear, this is a
@@ -1562,6 +1624,7 @@ pub fn compile_from_ir(
     } else {
         None
     };
+    let sanitize = sanitize_hooks(codegen)?;
 
     // Pass 1: collect string data and declare functions
     for line in &lines {
@@ -1746,6 +1809,7 @@ pub fn compile_from_ir(
                 &str_globals,
                 &string_global_names,
                 preempt_flag,
+                sanitize,
                 &bits_aliases,
             )?;
             built.push((func_id, func_name.clone(), func));
@@ -2397,6 +2461,7 @@ fn compile_ir_function(
     str_globals: &[(String, String)],
     string_global_names: &HashSet<String>,
     preempt_flag: Option<DataId>,
+    sanitize: Option<SanitizeHooks>,
     bits_aliases: &HashMap<String, &'static str>,
 ) -> Result<Function, CompileError> {
     let mut ctx = codegen.module.make_context();
@@ -2468,7 +2533,9 @@ fn compile_ir_function(
     // calls compile to inline loads instead (see inline_list_get_opt). The map
     // carries each virtualized register's (is_some, value) pair for the field
     // reads that follow.
-    let inline_opt_regs = scan_unpackable_opt_regs(body_lines);
+    // a sanitized build takes the runtime calls the fast paths stand in for
+    let fast_paths = sanitize.is_none();
+    let inline_opt_regs = if fast_paths { scan_unpackable_opt_regs(body_lines) } else { HashSet::new() };
     let mut virtual_opts: HashMap<usize, (Value, Value)> = HashMap::new();
 
     // Compile instructions
@@ -3073,7 +3140,7 @@ fn compile_ir_function(
                         runtime_funcs,
                         fname,
                         &args,
-                        name_is_shadowed,
+                        name_is_shadowed || !fast_paths,
                     )? {
                         regs.insert(reg, value);
                         kinds.clear(reg);
@@ -3085,6 +3152,7 @@ fn compile_ir_function(
                     // the element can be of any kind.
                     if fname == "pith_list_get_value_strict"
                         && args.len() == 2
+                        && fast_paths
                         && !name_is_shadowed
                         && retkind != "result_int"
                         && retkind != "result_bool"
@@ -3310,6 +3378,7 @@ fn compile_ir_function(
                 if let Some(&data_id) = global_data.get(&name) {
                     let gv = codegen.module.declare_data_in_func(data_id, builder.func);
                     let addr = builder.ins().global_value(types::I64, gv);
+                    emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, true, addr, 0);
                     builder.ins().store(MemFlags::new(), val, addr, 0);
                 } else {
                     let var = if let Some(&v) = named_vars.get(&name) {
@@ -3333,6 +3402,7 @@ fn compile_ir_function(
                 if let Some(&data_id) = global_data.get(name) {
                     let gv = codegen.module.declare_data_in_func(data_id, builder.func);
                     let addr = builder.ins().global_value(types::I64, gv);
+                    emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, false, addr, 0);
                     let val = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
                     regs.insert(reg, val);
                 } else if let Some(&var) = named_vars.get(name) {
@@ -3391,6 +3461,7 @@ fn compile_ir_function(
                     builder.switch_to_block(none_block);
                     jump_with_i64_arg(&mut builder, done, zero);
                     builder.switch_to_block(load_block);
+                    emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, false, obj, 8);
                     let payload = builder.ins().load(types::I64, MemFlags::new(), obj, 8);
                     jump_with_i64_arg(&mut builder, done, payload);
                     builder.switch_to_block(done);
@@ -3444,6 +3515,7 @@ fn compile_ir_function(
                         func_name, line
                     )));
                 };
+                emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, false, obj, offset);
                 let raw = builder.ins().load(types::I64, MemFlags::new(), obj, offset);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let v = builder.ins().iadd(raw, zero);
@@ -3575,6 +3647,7 @@ fn compile_ir_function(
                 })?;
                 let val = get_reg(&regs, parts[3])?;
                 let offset = field_idx * 8;
+                emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, true, struct_val, offset);
                 builder.ins().store(MemFlags::new(), val, struct_val, offset);
             }
 
@@ -4035,6 +4108,75 @@ mod tests {
         for off in ["0", "off", "false", "no", "n", " OFF ", "False"] {
             assert!(!preempt_from_env(Some(off)), "{off} should turn them off");
         }
+    }
+
+    #[test]
+    fn sanitize_names_its_checks_and_rejects_unknown_values() {
+        for off in [None, Some(""), Some("0")] {
+            assert_eq!(sanitize_hook_names(off), Ok(None));
+        }
+        assert_eq!(
+            sanitize_hook_names(Some("thread")),
+            Ok(Some(("__tsan_read8", "__tsan_write8")))
+        );
+        assert_eq!(
+            sanitize_hook_names(Some(" address ")),
+            Ok(Some(("__asan_load8", "__asan_store8")))
+        );
+        // a typo must not quietly build without the checks
+        assert!(sanitize_hook_names(Some("1")).is_err());
+        assert!(sanitize_hook_names(Some("tsan")).is_err());
+    }
+
+    // with a sanitizer named, field reads and writes report to its checks
+    // and the inline fast paths give way to their runtime calls.
+    #[test]
+    fn sanitized_build_checks_fields_and_calls_the_runtime() {
+        let ir = "func main 0 int\niconst 1 0\ncall 2 pith_struct_alloc int 1 1\n\
+                  sstore 2 0 1\nfield 3 2 0\ncall 4 pith_list_len int 1 1\nret 3\nendfunc\n";
+        let compiled = |sanitize: bool| {
+            let mut codegen = crate::create_codegen().expect("create codegen");
+            let runtime_funcs = crate::runtime_imports::declare_runtime_functions(&mut codegen.module)
+                .expect("declare runtime functions");
+            let hooks = if sanitize {
+                let mut sig = codegen.module.make_signature();
+                sig.params.push(AbiParam::new(types::I64));
+                let mut declare = |name: &str| {
+                    codegen.module.declare_function(name, Linkage::Import, &sig).expect("declare")
+                };
+                Some(SanitizeHooks { read: declare("__tsan_read8"), write: declare("__tsan_write8") })
+            } else {
+                None
+            };
+            let lines: Vec<&str> = ir.lines().skip(1).take_while(|l| *l != "endfunc").collect();
+            let func = compile_ir_function(
+                &mut codegen,
+                "main",
+                "int",
+                &[],
+                &lines,
+                &runtime_funcs,
+                &HashMap::new(),
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+                &[],
+                &HashSet::new(),
+                None,
+                hooks,
+                &HashMap::new(),
+            )
+            .expect("compile");
+            func.display().to_string()
+        };
+        let plain = compiled(false);
+        let sanitized = compiled(true);
+        let calls = |text: &str| text.matches(" call ").count();
+        // the alloc and the fast path's cold fallback, against the alloc,
+        // the two checks and a plain list_len call
+        assert_eq!(calls(&plain), 2, "{plain}");
+        assert_eq!(calls(&sanitized), 4, "{sanitized}");
+        assert!(!sanitized.contains("can_move"), "{sanitized}");
     }
 
     #[test]

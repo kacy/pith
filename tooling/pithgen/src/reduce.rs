@@ -237,6 +237,13 @@ pub fn cmd_reduce(args: &[String]) {
     let pith = flag("--pith").expect("--pith PATH required");
     let out_dir = PathBuf::from(flag("--out").expect("--out DIR required"));
     let want_class = flag("--class").map(|s| s.to_string());
+    // a sanitizer / nondeterministic finding only reproduces under the
+    // asan matrix, so reduce it there too
+    let mode = if args.iter().any(|a| a == "--sanitize") {
+        oracle::RunMode::Sanitize
+    } else {
+        oracle::RunMode::Plain { valgrind_mem: false }
+    };
 
     let tc = oracle::locate_toolchain(Path::new(pith));
     fs::create_dir_all(&out_dir).expect("create out dir");
@@ -244,7 +251,7 @@ pub fn cmd_reduce(args: &[String]) {
 
     // confirm the finding on the full program first
     let prog = gen::generate(seed);
-    let outcome = oracle::run_case(seed, &prog.files, Some(&prog.expected), &tc, &work, false);
+    let outcome = oracle::run_case(seed, &prog.files, Some(&prog.expected), &tc, &work, mode);
     let finding = match &want_class {
         Some(c) => outcome.findings.iter().find(|f| &f.class == c),
         None => outcome.findings.first(),
@@ -286,7 +293,7 @@ pub fn cmd_reduce(args: &[String]) {
     // one attempt at collapsing the helper modules into main
     let mut files = prog.files.clone();
     if let Some(inlined) = inline_modules(&files) {
-        let oc = oracle::run_case(seed, &inlined, None, &tc, &work, false);
+        let oc = oracle::run_case(seed, &inlined, None, &tc, &work, mode);
         if still_has_target(&oc, &target) {
             println!("helper modules inlined into main");
             files = inlined;
@@ -304,7 +311,7 @@ pub fn cmd_reduce(args: &[String]) {
         &mut |mask| {
             probe_runs += 1;
             let candidate = assemble(&names, &chunks, mask);
-            let oc = oracle::run_case(seed, &candidate, None, &tc, &work, false);
+            let oc = oracle::run_case(seed, &candidate, None, &tc, &work, mode);
             still_has_target(&oc, &target)
         },
     );

@@ -119,6 +119,7 @@ pub struct Feats {
     pub weakrefs: bool,
     pub results: bool,
     pub cross_generic: bool,
+    pub ownership: bool,
 }
 
 struct Scope {
@@ -158,6 +159,8 @@ const ENUM_POOL: &[&str] = &["Phase", "Route", "Verdict", "Pulse", "Grade", "Sta
 const IFACE_POOL: &[&str] = &["Source", "Gauge", "Sink"];
 const FN_POOL: &[&str] = &["blend", "carry", "weigh", "stamp", "tally", "probe", "gather", "settle"];
 const FIELD_POOL: &[&str] = &["label", "weight", "count", "tag", "note", "rank", "extra", "inner"];
+/// how many shapes block_ownership draws from
+const OWN_SHAPES: u32 = 23;
 const VARIANT_POOL: &[&str] = &["Alpha", "Beta", "Gamma", "Delta", "Omega", "Zed"];
 
 pub struct Program {
@@ -172,6 +175,9 @@ pub fn generate(seed: u64) -> Program {
         g.gen_module_decls(m);
     }
     g.gen_module_decls(0);
+    if g.feats.ownership {
+        g.emit_ownership_decls();
+    }
     let main_body = g.gen_main();
     g.render(main_body)
 }
@@ -477,6 +483,9 @@ impl Gen {
         }
         f.weakrefs = r.chance(25);
         f.results = r.chance(30);
+        // the ownership shapes are the whole point of the sanitize hunt, so
+        // they land in the large majority of programs
+        f.ownership = r.chance(85);
         // keep every program exercising something
         let majors = [f.generic_structs, f.enums, f.interfaces, f.generic_fns, f.collections, f.concurrency]
             .iter()
@@ -1820,7 +1829,7 @@ impl Gen {
         let mut sc = Scope::new(0);
         let mut blocks: Vec<String> = Vec::new();
 
-        let mut order: Vec<u32> = (0..12).collect();
+        let mut order: Vec<u32> = (0..13).collect();
         // fisher-yates over the feature blocks so ordering varies by seed
         for i in (1..order.len()).rev() {
             let j = self.rng.below(i + 1);
@@ -1880,9 +1889,14 @@ impl Gen {
                         self.block_weak(&mut b, &mut sc)
                     }
                 }
-                _ => {
+                11 => {
                     if self.feats.results {
                         self.block_results(&mut b, &mut sc)
+                    }
+                }
+                _ => {
+                    if self.feats.ownership {
+                        self.block_ownership(&mut b, &mut sc)
                     }
                 }
             }
@@ -2787,6 +2801,430 @@ impl Gen {
                 "rr",
             );
             self.emit_print(out, 1, &bad, &Ty::Int, &Val::I(-9), true);
+        }
+    }
+
+    // ---------- ownership shapes (the sanitize hunt) ----------
+    //
+    // these target the emitter's borrow-vs-own decision: whether a value
+    // carries its own count. the three shapes that broke in #1270 were a loop
+    // whose body drops the element it walks, an argument read out of a field
+    // or an element that the callee overwrites, and a weak field read off a
+    // temporary bound to a name. the runtime toolchain runs these clean; the
+    // sanitize oracle links an asan runtime and runs them with the struct
+    // freelist off, where a stale read is a use-after-free. each printed value
+    // is computed here, so the differential oracle also catches a silent wrong
+    // answer when a slot is recycled with new contents.
+
+    /// a fresh, distinctive heap string. an over-release that frees it would
+    /// read back as filler of a similar size, never this.
+    fn olit(&mut self, tag: char) -> String {
+        let n = self.counter;
+        self.counter += 1;
+        format!("{}-{}-ownpayload-xxxxxxxx", tag, n)
+    }
+
+    /// the fixed helper declarations the ownership block leans on, appended to
+    /// module 0 once per program. unused helpers are harmless.
+    fn emit_ownership_decls(&mut self) {
+        let decls = r#"
+struct ONode:
+    mut name: String
+    mut val: Int
+    mut tags: List[String]
+    mut next: ONode?
+    weak back: ONode?
+
+struct OHolder:
+    mut child: ONode?
+
+enum OSlot:
+    Empty
+    Holds(ONode)
+
+mut og_xs: List[String] := []
+
+fn ofirst_after_clear(xs: List[String]) -> String:
+    for s in xs:
+        xs.clear()
+        ochurn()
+        return s
+    return "empty"
+
+fn ochurn():
+    mut junk: List[String] := []
+    mut i := 0
+    while i < 40:
+        junk.push("ofiller-{i}-ownpayload-x")
+        i = i + 1
+
+fn orefill(xs: List[String]):
+    mut i := 0
+    while i < 40:
+        xs.push("ofiller-{i}-ownpayload-x")
+        i = i + 1
+
+fn orefill_nodes(xs: List[ONode]):
+    mut i := 0
+    while i < 40:
+        xs.push(ONode(name: "ofiller-{i}-ownpayload-x", val: i, tags: ["oft-{i}-ownpayload-x"], next: none, back: none))
+        i = i + 1
+
+fn owipe(xs: List[String]):
+    xs.clear()
+    orefill(xs)
+
+fn oclear_global():
+    og_xs.clear()
+    orefill(og_xs)
+
+fn opair(an: String, bn: String) -> ONode:
+    a := ONode(name: an, val: 1, tags: [], next: none, back: none)
+    b := ONode(name: bn, val: 2, tags: [], next: none, back: none)
+    a.next = b
+    b.back = a
+    return a
+
+fn ooverwrite_field(o: ONode, s: String) -> String:
+    o.name = "oreplaced-ownpayload-xx"
+    ochurn()
+    return s
+
+fn oclear_list(xs: List[String], s: String) -> String:
+    xs.clear()
+    ochurn()
+    return s
+
+fn odrop_child(h: OHolder, c: ONode?) -> String:
+    h.child = none
+    ochurn()
+    return c.value().name
+
+fn orun_then_read(f: fn(), s: String) -> String:
+    f()
+    ochurn()
+    return s
+
+impl ONode:
+    fn rename_and_read(s: String) -> String:
+        self.name = "orenamed-ownpayload-xx"
+        ochurn()
+        return s
+"#;
+        self.decl_text[0].push_str(decls);
+    }
+
+    fn block_ownership(&mut self, out: &mut String, _sc: &mut Scope) {
+        // pick a varied subset so programs differ by seed, but keep the odds
+        // high that any given shape appears across a batch
+        let mut ids: Vec<u32> = (0..OWN_SHAPES).collect();
+        for i in (1..ids.len()).rev() {
+            let j = self.rng.below(i + 1);
+            ids.swap(i, j);
+        }
+        let mut emitted = 0;
+        for k in ids {
+            // force the first couple regardless so the block is never empty
+            if emitted >= 2 && !self.rng.chance(60) {
+                continue;
+            }
+            self.emit_ownership_shape(out, k);
+            emitted += 1;
+        }
+    }
+
+    fn emit_ownership_shape(&mut self, out: &mut String, k: u32) {
+        let v = format!("ow{}", self.counter);
+        self.counter += 1;
+        match k {
+            0 => {
+                // for loop, body clears the iterable directly then refills
+                let a = self.olit('a');
+                let b = self.olit('b');
+                out.push_str(&format!("    mut {}: List[String] := [\"{}\", \"{}\"]\n", v, a, b));
+                out.push_str(&format!("    for s in {}:\n", v));
+                out.push_str(&format!("        {}.clear()\n", v));
+                out.push_str(&format!("        orefill({})\n", v));
+                out.push_str("        print(\"own-clear: {s}\")\n");
+                out.push_str("        break\n");
+                self.expect(format!("own-clear: {}", a));
+            }
+            1 => {
+                // for loop, body removes the walked element then refills
+                let a = self.olit('a');
+                let b = self.olit('b');
+                out.push_str(&format!("    mut {}: List[String] := [\"{}\", \"{}\"]\n", v, a, b));
+                out.push_str(&format!("    for s in {}:\n", v));
+                out.push_str(&format!("        {}.remove(0)\n", v));
+                out.push_str(&format!("        orefill({})\n", v));
+                out.push_str("        print(\"own-remove: {s}\")\n");
+                out.push_str("        break\n");
+                self.expect(format!("own-remove: {}", a));
+            }
+            2 => {
+                // for loop, body overwrites the walked slot then refills
+                let a = self.olit('a');
+                let b = self.olit('b');
+                out.push_str(&format!("    mut {}: List[String] := [\"{}\", \"{}\"]\n", v, a, b));
+                out.push_str(&format!("    for s in {}:\n", v));
+                out.push_str(&format!("        {}[0] = \"oset-ownpayload-xxxxxx\"\n", v));
+                out.push_str(&format!("        orefill({})\n", v));
+                out.push_str("        print(\"own-set: {s}\")\n");
+                out.push_str("        break\n");
+                self.expect(format!("own-set: {}", a));
+            }
+            3 => {
+                // for loop, the mutation reaches the iterable through a call
+                let a = self.olit('a');
+                let b = self.olit('b');
+                out.push_str(&format!("    mut {}: List[String] := [\"{}\", \"{}\"]\n", v, a, b));
+                out.push_str(&format!("    for s in {}:\n", v));
+                out.push_str(&format!("        owipe({})\n", v));
+                out.push_str("        print(\"own-call: {s}\")\n");
+                out.push_str("        break\n");
+                self.expect(format!("own-call: {}", a));
+            }
+            4 => {
+                // for loop over structs, body clears and refills the list
+                let a = self.olit('a');
+                let t = self.olit('t');
+                out.push_str(&format!(
+                    "    mut {}: List[ONode] := [ONode(name: \"{}\", val: 1, tags: [\"{}\"], next: none, back: none)]\n",
+                    v, a, t
+                ));
+                out.push_str(&format!("    for p in {}:\n", v));
+                out.push_str(&format!("        {}.clear()\n", v));
+                out.push_str(&format!("        orefill_nodes({})\n", v));
+                out.push_str("        print(\"own-struct: {p.name} {p.tags.len()} {p.tags[0]}\")\n");
+                out.push_str("        break\n");
+                self.expect(format!("own-struct: {} 1 {}", a, t));
+            }
+            5 => {
+                // a global list mutated through a call inside the loop
+                let a = self.olit('g');
+                let b = self.olit('g');
+                out.push_str(&format!("    og_xs = [\"{}\", \"{}\"]\n", a, b));
+                out.push_str("    for s in og_xs:\n");
+                out.push_str("        oclear_global()\n");
+                out.push_str("        print(\"own-global: {s}\")\n");
+                out.push_str("        break\n");
+                self.expect(format!("own-global: {}", a));
+            }
+            6 => {
+                // a field passed alongside its owner, overwritten in the callee
+                let a = self.olit('o');
+                out.push_str(&format!(
+                    "    {} := ONode(name: \"{}\", val: 3, tags: [], next: none, back: none)\n",
+                    v, a
+                ));
+                out.push_str(&format!("    print(\"own-field: {{ooverwrite_field({}, {}.name)}} {{{}.name}}\")\n", v, v, v));
+                self.expect(format!("own-field: {} oreplaced-ownpayload-xx", a));
+            }
+            7 => {
+                // the same through a method that overwrites self's field
+                let a = self.olit('o');
+                out.push_str(&format!(
+                    "    {} := ONode(name: \"{}\", val: 3, tags: [], next: none, back: none)\n",
+                    v, a
+                ));
+                out.push_str(&format!("    print(\"own-method: {{{}.rename_and_read({}.name)}} {{{}.name}}\")\n", v, v, v));
+                self.expect(format!("own-method: {} orenamed-ownpayload-xx", a));
+            }
+            8 => {
+                // a list element passed alongside its owner, evicted in the callee
+                let a = self.olit('e');
+                out.push_str(&format!("    mut {}: List[String] := [\"{}\"]\n", v, a));
+                out.push_str(&format!("    print(\"own-element: {{oclear_list({}, {}[0])}} {{{}.len()}}\")\n", v, v, v));
+                self.expect(format!("own-element: {} 0", a));
+            }
+            9 => {
+                // an optional field passed alongside its owner, dropped in the callee
+                let a = self.olit('c');
+                out.push_str(&format!(
+                    "    {} := OHolder(child: ONode(name: \"{}\", val: 4, tags: [], next: none, back: none))\n",
+                    v, a
+                ));
+                out.push_str(&format!("    print(\"own-optional: {{odrop_child({}, {}.child)}}\")\n", v, v));
+                self.expect(format!("own-optional: {}", a));
+            }
+            10 => {
+                // a weak field read off a temporary bound to a name: the
+                // temporary owner is gone by the next statement, so the weak
+                // edge must read none rather than dangle
+                let a = self.olit('a');
+                let b = self.olit('b');
+                out.push_str(&format!("    {} := opair(\"{}\", \"{}\").next.value().back\n", v, a, b));
+                out.push_str("    ochurn()\n");
+                out.push_str(&format!("    print(\"own-weaktmp: {{{} == none}}\")\n", v));
+                self.expect("own-weaktmp: true".to_string());
+            }
+            11 => {
+                // a weak field read off a live owner bound to a name
+                let a = self.olit('a');
+                let b = self.olit('b');
+                let p = format!("ow{}", self.counter);
+                self.counter += 1;
+                out.push_str(&format!("    {} := opair(\"{}\", \"{}\")\n", p, a, b));
+                out.push_str(&format!("    {} := {}.next.value().back\n", v, p));
+                out.push_str("    ochurn()\n");
+                out.push_str(&format!("    print(\"own-weaklive: {{{}.value().name}}\")\n", v));
+                self.expect(format!("own-weaklive: {}", a));
+            }
+            12 => {
+                // an if-let payload binding off a call result's weak edge
+                let a = self.olit('a');
+                let b = self.olit('b');
+                out.push_str(&format!("    {} := opair(\"{}\", \"{}\")\n", v, a, b));
+                out.push_str(&format!("    if let z = {}.next.value().back:\n", v));
+                out.push_str("        ochurn()\n");
+                out.push_str("        print(\"own-iflet: {z.name}\")\n");
+                self.expect(format!("own-iflet: {}", a));
+            }
+            14 => {
+                // an optional bound from a field, then the field cleared
+                let a = self.olit('c');
+                let c = format!("ow{}", self.counter);
+                self.counter += 1;
+                out.push_str(&format!(
+                    "    {} := OHolder(child: ONode(name: \"{}\", val: 4, tags: [], next: none, back: none))\n",
+                    v, a
+                ));
+                out.push_str(&format!("    {} := {}.child\n", c, v));
+                out.push_str(&format!("    {}.child = none\n", v));
+                out.push_str("    ochurn()\n");
+                out.push_str(&format!("    print(\"own-optbind: {{{}.value().name}}\")\n", c));
+                self.expect(format!("own-optbind: {}", a));
+            }
+            15 => {
+                // an if-let payload whose source field is cleared in the body
+                let a = self.olit('c');
+                out.push_str(&format!(
+                    "    {} := OHolder(child: ONode(name: \"{}\", val: 4, tags: [], next: none, back: none))\n",
+                    v, a
+                ));
+                out.push_str(&format!("    if let c = {}.child:\n", v));
+                out.push_str(&format!("        {}.child = none\n", v));
+                out.push_str("        ochurn()\n");
+                out.push_str("        print(\"own-ifletclear: {c.name}\")\n");
+                self.expect(format!("own-ifletclear: {}", a));
+            }
+            16 => {
+                // a match payload whose subject is rebound inside the arm
+                let a = self.olit('m');
+                out.push_str(&format!(
+                    "    mut {}: OSlot := OSlot.Holds(ONode(name: \"{}\", val: 5, tags: [], next: none, back: none))\n",
+                    v, a
+                ));
+                out.push_str(&format!("    match {}:\n", v));
+                out.push_str("        OSlot.Holds(n) =>\n");
+                out.push_str(&format!("            {} = OSlot.Empty\n", v));
+                out.push_str("            ochurn()\n");
+                out.push_str("            print(\"own-match: {n.name}\")\n");
+                out.push_str("        OSlot.Empty =>\n");
+                out.push_str("            print(\"own-match: empty\")\n");
+                self.expect(format!("own-match: {}", a));
+            }
+            17 => {
+                // early return of a loop variable after the body cleared the list
+                let a = self.olit('r');
+                let b = self.olit('r');
+                out.push_str(&format!("    mut {}: List[String] := [\"{}\", \"{}\"]\n", v, a, b));
+                out.push_str(&format!("    print(\"own-return: {{ofirst_after_clear({})}} {{{}.len()}}\")\n", v, v));
+                self.expect(format!("own-return: {} 0", a));
+            }
+            18 => {
+                // remove and push while walking, with no break: the walk stops
+                // at the shrunken length and a push does not extend it
+                let names: Vec<String> = (0..4).map(|_| self.olit('w')).collect();
+                let quoted: Vec<String> = names.iter().map(|s| format!("\"{}\"", s)).collect();
+                let n = format!("ow{}", self.counter);
+                self.counter += 1;
+                if self.rng.chance(50) {
+                    out.push_str(&format!("    mut {}: List[String] := [{}]\n", v, quoted.join(", ")));
+                    out.push_str(&format!("    mut {} := 0\n", n));
+                    out.push_str(&format!("    for s in {}:\n", v));
+                    out.push_str(&format!("        {}.remove({}.len() - 1)\n", v, v));
+                    out.push_str(&format!("        {} = {} + 1\n", n, n));
+                    out.push_str("        if s.len() == 0:\n            continue\n");
+                    out.push_str(&format!("    print(\"own-shrink: {{{}}} {{{}.len()}}\")\n", n, v));
+                    self.expect("own-shrink: 2 2".to_string());
+                } else {
+                    out.push_str(&format!("    mut {}: List[String] := [{}, {}]\n", v, quoted[0], quoted[1]));
+                    out.push_str(&format!("    mut {} := 0\n", n));
+                    out.push_str(&format!("    for s in {}:\n", v));
+                    out.push_str(&format!("        {}.push(s + s)\n", v));
+                    out.push_str(&format!("        {} = {} + 1\n", n, n));
+                    out.push_str(&format!("    print(\"own-grow: {{{}}} {{{}.len()}} {{{}[3]}}\")\n", n, v, v));
+                    self.expect(format!("own-grow: 2 4 {}{}", names[1], names[1]));
+                }
+            }
+            19 => {
+                // a strong field read off a call result's chain, bound to a name
+                let a = self.olit('a');
+                let b = self.olit('b');
+                out.push_str(&format!("    {} := opair(\"{}\", \"{}\").next.value().name\n", v, a, b));
+                out.push_str("    ochurn()\n");
+                out.push_str(&format!("    print(\"own-tmpfield: {{{}}}\")\n", v));
+                self.expect(format!("own-tmpfield: {}", b));
+            }
+            20 => {
+                // a closure overwrites a field that is passed alongside it
+                let a = self.olit('o');
+                let cl = format!("ow{}", self.counter);
+                self.counter += 1;
+                out.push_str(&format!(
+                    "    {} := ONode(name: \"{}\", val: 3, tags: [], next: none, back: none)\n",
+                    v, a
+                ));
+                out.push_str(&format!("    {} := fn():\n        {}.name = \"oclosure-ownpayload-xx\"\n", cl, v));
+                out.push_str(&format!("    print(\"own-closurefield: {{orun_then_read({}, {}.name)}} {{{}.name}}\")\n", cl, v, v));
+                self.expect(format!("own-closurefield: {} oclosure-ownpayload-xx", a));
+            }
+            21 => {
+                // a nested loop whose inner body clears the outer element's list
+                let a = self.olit('n');
+                let t = self.olit('t');
+                out.push_str(&format!(
+                    "    {}: List[ONode] := [ONode(name: \"{}\", val: 1, tags: [\"{}\"], next: none, back: none)]\n",
+                    v, a, t
+                ));
+                out.push_str(&format!("    for p in {}:\n", v));
+                out.push_str("        for t in p.tags:\n");
+                out.push_str("            p.tags.clear()\n");
+                out.push_str("            orefill(p.tags)\n");
+                out.push_str("            print(\"own-nested: {p.name} {t}\")\n");
+                out.push_str("            break\n");
+                out.push_str("        break\n");
+                self.expect(format!("own-nested: {} {}", a, t));
+            }
+            22 => {
+                // the next node bound by name, then cut off from its owner
+                let a = self.olit('a');
+                let b = self.olit('b');
+                let p = format!("ow{}", self.counter);
+                self.counter += 1;
+                out.push_str(&format!("    {} := opair(\"{}\", \"{}\")\n", p, a, b));
+                out.push_str(&format!("    {} := {}.next.value()\n", v, p));
+                out.push_str(&format!("    {}.next = none\n", p));
+                out.push_str("    ochurn()\n");
+                out.push_str(&format!("    print(\"own-cut: {{{}.name}} {{{}.back.value().name}}\")\n", v, v));
+                self.expect(format!("own-cut: {} {}", b, a));
+            }
+            13 => {
+                // a closure captures a mutable list and clears it inside the loop
+                let a = self.olit('c');
+                let b = self.olit('c');
+                let cl = format!("ow{}", self.counter);
+                self.counter += 1;
+                out.push_str(&format!("    mut {}: List[String] := [\"{}\", \"{}\"]\n", v, a, b));
+                out.push_str(&format!("    {} := fn():\n        {}.clear()\n", cl, v));
+                out.push_str(&format!("    for s in {}:\n", v));
+                out.push_str(&format!("        orun_then_read({}, s)\n", cl));
+                out.push_str("        print(\"own-closure: {s}\")\n");
+                out.push_str("        break\n");
+                self.expect(format!("own-closure: {}", a));
+            }
+            _ => unreachable!("ownership shape {} out of range", k),
         }
     }
 

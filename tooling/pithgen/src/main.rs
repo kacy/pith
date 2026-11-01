@@ -6,6 +6,11 @@
 //               [--fail-on-findings]
 //   pithgen reduce --seed N --pith PATH --out DIR [--class CLASS]
 //
+// all three take the generation options: --pending-shapes adds the
+// ownership shapes whose fixes have not landed, --shapes LIST emits exactly
+// those shapes (names, ids, or a..b), and --leak runs each shape in rounds
+// for the leak oracle.
+//
 // oracle classes:
 //   check-crash     pith check dies by signal, or fails with no diagnostic
 //   build-fail      pith check accepts but pith build fails (always a bug)
@@ -19,6 +24,8 @@
 //                   lines the generator predicted while building the program
 //   run-hang        the binary outlives its timeout (recorded, not fatal)
 //   valgrind        optional: memcheck on the built binary
+//   leak            with --leak: an ownership shape's peak resident set grows
+//                   with its round count
 
 mod eval;
 mod gen;
@@ -37,7 +44,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: pithgen gen --seed N [--out DIR] | pithgen run --seeds A..B --pith PATH --out DIR [--valgrind] [--sanitize] [--keep-all] [--fail-on-findings] | pithgen reduce --seed N --pith PATH --out DIR [--class CLASS]"
+            "usage: pithgen gen --seed N [--out DIR] | pithgen run --seeds A..B --pith PATH --out DIR [--valgrind] [--sanitize] [--keep-all] [--fail-on-findings] | pithgen reduce --seed N --pith PATH --out DIR [--class CLASS]; generation options: [--pending-shapes] [--shapes LIST] [--leak]"
         );
         std::process::exit(2);
     }
@@ -77,7 +84,7 @@ fn cmd_gen(args: &[String]) {
         .unwrap_or("0")
         .parse()
         .expect("--seed must be a u64");
-    let prog = gen::generate(seed);
+    let prog = gen::generate(seed, &gen::GenOpts::from_args(args));
     if let Some(out) = flag_value(args, "--out") {
         let dir = PathBuf::from(out);
         fs::create_dir_all(&dir).expect("create out dir");
@@ -118,10 +125,16 @@ fn cmd_run(args: &[String]) {
     let valgrind = args.iter().any(|a| a == "--valgrind");
     let sanitize = args.iter().any(|a| a == "--sanitize");
     let keep_all = args.iter().any(|a| a == "--keep-all");
+    let opts = gen::GenOpts::from_args(args);
+    if sanitize && opts.rounds {
+        // asan's shadow memory and quarantine swamp a resident-set reading
+        eprintln!("--leak runs on the plain toolchain, not with --sanitize");
+        std::process::exit(2);
+    }
     let mode = if sanitize {
         oracle::RunMode::Sanitize
     } else {
-        oracle::RunMode::Plain { valgrind_mem: valgrind }
+        oracle::RunMode::Plain { valgrind_mem: valgrind, leak: opts.rounds }
     };
     // gate mode: any finding is a failure. the ci smoke runs a fixed seed
     // range that is known clean, so a nonzero exit means a regression.
@@ -147,7 +160,7 @@ fn cmd_run(args: &[String]) {
     for seed in a..b {
         total += 1;
         let case_dir = cases_dir.join(format!("case_{}", seed));
-        let prog = gen::generate(seed);
+        let prog = gen::generate(seed, &opts);
         expected_lines += prog.expected.len() as u64;
         wildcard_lines += prog.expected.iter().filter(|l| l.wildcard).count() as u64;
 

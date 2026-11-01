@@ -209,6 +209,23 @@ pub(crate) fn current_task() -> Option<TaskId> {
     CURRENT_TASK.with(|c| c.get())
 }
 
+/// the green task running on this thread and the lowest address of its stack
+/// mapping, where the guard page starts, or `None` when no task runs here.
+/// the stack overflow handler calls this from a signal, so it only reads a
+/// thread-local cell, the scheduler's `OnceLock` and the lock-free arena.
+#[cfg(not(any(pith_asan, pith_tsan)))]
+pub(crate) fn running_task_stack() -> Option<(TaskId, usize)> {
+    let id = current_task()?;
+    let block = SCHEDULER.get()?.sync.get(id)?;
+    Some((id, block.stack_bottom.load(AtomicOrdering::Relaxed)))
+}
+
+/// the size of every green task's stack, in bytes.
+#[cfg(not(any(pith_asan, pith_tsan)))]
+pub(crate) fn task_stack_size() -> usize {
+    stack::stack_size()
+}
+
 /// the index of the worker this os thread is, or `None` off the pool. the
 /// netpoller keys its per-worker pollers by it. a worker index is
 /// thread-owned: it must not be carried across a park, and a caller that

@@ -134,6 +134,10 @@ pub(super) struct SyncBlock {
     /// what the sanitizers need to follow the task's stack switches; empty
     /// in a build without one.
     pub(super) fiber: Fiber,
+    /// the lowest address of the task's stack mapping, where its guard page
+    /// starts. written at spawn and read by the stack overflow handler on the
+    /// thread running the task, which the claim protocol already orders.
+    pub(super) stack_bottom: AtomicUsize,
 }
 
 // SAFETY: `word` is an atomic; the cells are guarded by the claim protocol
@@ -156,6 +160,7 @@ impl SyncBlock {
             join: Mutex::new(Join::default()),
             joined: Condvar::new(),
             fiber: Fiber::new(),
+            stack_bottom: AtomicUsize::new(0),
         }
     }
 
@@ -174,6 +179,7 @@ impl SyncBlock {
             *self.handoff.get() = None;
             debug_assert!((*self.tls.get()).is_empty(), "a retired task left threadlocals");
         }
+        self.stack_bottom.store(stack.bottom, AtomicOrdering::Relaxed);
         self.fiber.arm(stack);
         let generation = {
             let mut join = lock_join(&self.join);

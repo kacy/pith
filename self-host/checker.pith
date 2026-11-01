@@ -846,6 +846,18 @@ fn module_function_is_visible(module_path: String, name: String) -> Bool:
         return true
     return function_visibility_map[key]
 
+# the type of the unqualified binding `alias.name` reaches inside the aliased
+# module, or -1. a builtin of the same name does not count: builtins have no
+# declaration node, and std.os has no `args`, so `os.args()` used to check as
+# the builtin `args()` and then had no function to call at run time. the
+# modules whose functions are builtins under a prefix (`json.parse` is
+# `json_parse`) resolve through module_import_target_name before this.
+fn module_owned_binding_type(scope_id: Int, name: String, module_path: String) -> Int:
+    idx := lookup_binding_index_preferring(scope_id, name, module_path, [])
+    if idx < 0 or binding_decl_node_at(idx) < 0:
+        return -1
+    return binding_type_at(idx)
+
 fn register_function_declaration(node_idx: Int, node: Node, is_pub: Bool):
     name := node.value
     if current_checker_module_path.len() > 0:
@@ -5338,10 +5350,10 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             # they have to stay inside the aliased module, or an untagged
             # lookup happily answers `a.helper()` with the `helper` that
             # module b declared.
-            if callee_type < 0:
+            if callee_type < 0 and qualified_name != method_name:
                 callee_type = lookup_binding_owned_by(scope_id, qualified_name, module_path)
             if callee_type < 0:
-                callee_type = lookup_binding_owned_by(scope_id, method_name, module_path)
+                callee_type = module_owned_binding_type(scope_id, method_name, module_path)
             if callee_type < 0:
                 generic_name := module_generic_target_name(module_path, method_name)
                 if has_generic_declaration(generic_name):
@@ -6173,10 +6185,11 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
                 return func_tid
             # the same unqualified lookups as the call path, under the same
             # restriction: neither may answer with a name another module owns.
-            func_tid = lookup_binding_owned_by(scope_id, qualified_name, module_path)
-            if func_tid >= 0:
-                return func_tid
-            func_tid = lookup_binding_owned_by(scope_id, field_name, module_path)
+            if qualified_name != field_name:
+                func_tid = lookup_binding_owned_by(scope_id, qualified_name, module_path)
+                if func_tid >= 0:
+                    return func_tid
+            func_tid = module_owned_binding_type(scope_id, field_name, module_path)
             if func_tid >= 0:
                 return func_tid
             report_error("E209", "module '" + obj_name + "' has no function '" + field_name + "'")

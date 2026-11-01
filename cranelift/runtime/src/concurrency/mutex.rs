@@ -125,10 +125,15 @@ fn lock_green(m: &PithMutex, id: usize) {
             Err(2) => {}
             Err(_) => continue,
         }
-        waiters.push(id);
+        // a wake from elsewhere can bring the task back here while its entry
+        // is still listed, since only an unlock removes entries. it is never
+        // listed twice, so the drain wakes it once.
+        if !waiters.contains(&id) {
+            waiters.push(id);
+        }
         drop(waiters);
         green::park_current(id);
-        // resumed by an unlock; loop and retry the acquire.
+        // resumed by an unlock, or by a stray wake; loop and retry the acquire.
     }
 }
 
@@ -180,6 +185,12 @@ pub unsafe extern "C" fn pith_mutex_unlock(handle: *mut PithMutexHandle) {
             green::wake(id);
         }
     }
+}
+
+/// how many green waiter entries the mutex lists.
+#[cfg(test)]
+pub(crate) unsafe fn green_waiters_for_tests(handle: *mut PithMutexHandle) -> usize {
+    mutex_ref(handle).map_or(0, |m| lock_waiters(m).len())
 }
 
 #[cfg(test)]

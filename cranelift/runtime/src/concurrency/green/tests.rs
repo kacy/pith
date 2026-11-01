@@ -477,3 +477,131 @@ fn idle_peer_steals_from_a_busy_owners_pinned_queue() {
     assert_eq!(completion(id), Some(34));
     set_current_worker(None);
 }
+
+// the run queue entry a wake left on worker 0's pinned queue, which the tests
+// below take off by hand before they resume the task.
+fn take_pinned_on_0() -> Option<TaskId> {
+    scheduler().workers[0]
+        .pinned
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop()
+}
+
+fn state_of(id: TaskId) -> u64 {
+    sync_block(id).unwrap().word.load(AtomicOrdering::Acquire) & S_STATE_MASK
+}
+
+// a task body that runs `body` and returns `value`.
+fn task_running(value: i64, body: impl FnOnce() + 'static) -> TaskCoroutine {
+    TaskCoroutine::with_stack(
+        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+        move |yielder: &TaskYielder, _input: ()| -> i64 {
+            let _finish = publish_yielder(yielder as *const TaskYielder);
+            body();
+            value
+        },
+    )
+}
+
+// a wake from elsewhere reaches a task parked in a semaphore acquire. the
+// task re-checks, parks again, and must not stay listed twice: the stale
+// entry would take the next release's wake from a task that is really
+// waiting, which then sits parked with a permit free.
+#[test]
+fn a_stray_wake_leaves_no_stale_semaphore_waiter() {
+    use crate::concurrency::semaphore::*;
+    let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_current_worker(Some(0));
+    while take_pinned_on_0().is_some() {}
+
+    let sem = pith_semaphore_new(1);
+    unsafe { pith_semaphore_acquire(sem) }; // no permits left
+    let sem_addr = sem as usize;
+    let a = push_ready_task(task_running(1, move || {
+        unsafe { pith_semaphore_acquire(sem_addr as *mut PithSemaphoreHandle) };
+        // then wait somewhere else, as a task does after its acquire.
+        park_current(current_task().expect("inside a task"));
+    }));
+    run_task(a);
+    assert_eq!(state_of(a), S_PARKED, "a waits for a permit");
+
+    // the stray wake: a resumes, finds no permit, parks on the semaphore again.
+    wake(a);
+    assert_eq!(take_pinned_on_0(), Some(a));
+    run_task(a);
+    assert_eq!(state_of(a), S_PARKED);
+
+    // a release for a: it takes the permit and parks elsewhere.
+    unsafe { pith_semaphore_release(sem) };
+    assert_eq!(take_pinned_on_0(), Some(a));
+    run_task(a);
+    assert_eq!(state_of(a), S_PARKED, "a parked past its acquire");
+
+    let b = push_ready_task(task_running(2, move || {
+        unsafe { pith_semaphore_acquire(sem_addr as *mut PithSemaphoreHandle) };
+    }));
+    run_task(b);
+    assert_eq!(state_of(b), S_PARKED, "b waits for a permit");
+
+    unsafe { pith_semaphore_release(sem) };
+    assert_eq!(state_of(b), S_READY, "the release must wake b, the real waiter");
+    assert_eq!(state_of(a), S_PARKED, "and leave a where it waits");
+    assert_eq!(take_pinned_on_0(), Some(b));
+    run_task(b);
+    assert_eq!(completion(b), Some(2));
+
+    wake(a);
+    assert_eq!(take_pinned_on_0(), Some(a));
+    run_task(a);
+    assert_eq!(completion(a), Some(1));
+    set_current_worker(None);
+}
+
+// the same stray wake on a wait group or mutex waiter. both wake every listed
+// waiter, so a duplicate entry is a second wake for one task, which can land
+// after it resumed and cut its next park short.
+#[test]
+fn a_stray_wake_leaves_no_duplicate_waitgroup_or_mutex_waiter() {
+    use crate::concurrency::mutex::*;
+    use crate::concurrency::waitgroup::*;
+    let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_current_worker(Some(0));
+    while take_pinned_on_0().is_some() {}
+
+    let wg = pith_waitgroup_new();
+    unsafe { pith_waitgroup_add(wg, 1) };
+    let wg_addr = wg as usize;
+    let a = push_ready_task(task_running(3, move || unsafe {
+        pith_waitgroup_wait(wg_addr as *mut PithWaitGroupHandle)
+    }));
+    run_task(a);
+    wake(a);
+    assert_eq!(take_pinned_on_0(), Some(a));
+    run_task(a);
+    assert_eq!(state_of(a), S_PARKED);
+    assert_eq!(unsafe { crate::concurrency::waitgroup::green_waiters_for_tests(wg) }, 1);
+    unsafe { pith_waitgroup_done(wg) };
+    assert_eq!(take_pinned_on_0(), Some(a));
+    run_task(a);
+    assert_eq!(completion(a), Some(3));
+
+    let m = pith_mutex_new();
+    unsafe { pith_mutex_lock(m) }; // held by this thread
+    let m_addr = m as usize;
+    let b = push_ready_task(task_running(4, move || unsafe {
+        pith_mutex_lock(m_addr as *mut PithMutexHandle);
+        pith_mutex_unlock(m_addr as *mut PithMutexHandle);
+    }));
+    run_task(b);
+    wake(b);
+    assert_eq!(take_pinned_on_0(), Some(b));
+    run_task(b);
+    assert_eq!(state_of(b), S_PARKED);
+    assert_eq!(unsafe { crate::concurrency::mutex::green_waiters_for_tests(m) }, 1);
+    unsafe { pith_mutex_unlock(m) };
+    assert_eq!(take_pinned_on_0(), Some(b));
+    run_task(b);
+    assert_eq!(completion(b), Some(4));
+    set_current_worker(None);
+}

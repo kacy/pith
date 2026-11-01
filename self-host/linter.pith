@@ -11,11 +11,14 @@
 #   E306 — a strong reference cycle between structs
 #   E307 — a resource built locally and never closed
 #   E308 — a binding shadows a module global
+#   E270 — a path falls off the end of a body that returns a value (also
+#          a checker error)
 
 from ast import Node, get_node
 from ir_ast_helpers import ir_is_binding_kind
 from errors import Diagnostic
 from std.strings import lines_keep_empty
+from return_paths import missing_return_sites
 
 # ---------------------------------------------------------------
 # diagnostics
@@ -136,6 +139,9 @@ fn lint_top_level(node_idx: Int, source: String):
     elif inner.kind == "test_decl":
         lint_block_depth(inner, 1)
         lint_shadowed_globals(inner_idx)
+    for site in missing_return_sites(inner_idx):
+        at := get_node(site.node)
+        report_linter_warning("E270", site.message, at.line, at.col)
 
 fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
     name := node.value

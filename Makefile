@@ -1804,6 +1804,37 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -eq 0 ] && echo "$$out" | grep -q "skips ... skipped (not today)" && echo "$$out" | grep -q "1 passed, 0 failed, 1 skipped"; then pass=$$((pass+1)); echo "ok   skip_test skips a test without failing the run"; else echo "FAIL skip_test"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'func main 0 int\ncall 1 helper int 0\nret 1\nendfunc\nfunc helper 0 int\ncall 1 pith_no_such_runtime_fn int 0\nret 1\nendfunc\n' > "$$tmpdir/unknown_call.ir"; \
+	set +e; \
+	out=$$(./target/release/pith build-ir "$$tmpdir/unknown_call.ir" "$$tmpdir/unknown_call" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "call to unknown function 'pith_no_such_runtime_fn' in helper" && [ ! -e "$$tmpdir/unknown_call" ]; then pass=$$((pass+1)); echo "ok   unknown runtime call fails the build"; else echo "FAIL unknown runtime call"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'func main 0 int\niconst 1 0\nret 1\nendfunc\nfunc unused 0 int\ncall 1 pith_no_such_runtime_fn int 0\nret 1\nendfunc\n' > "$$tmpdir/dead_call.ir"; \
+	set +e; \
+	out=$$(./target/release/pith build-ir "$$tmpdir/dead_call.ir" "$$tmpdir/dead_call" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ -x "$$tmpdir/dead_call" ]; then pass=$$((pass+1)); echo "ok   unreachable unknown call builds"; else echo "FAIL unreachable unknown call"; echo "$$out"; fail=$$((fail+1)); fi; \
+	mkdir -p "$$tmpdir/abi/self-host/bootstrap"; \
+	printf 'runtime_abi 0000000000000000\nfunc main 0 int\niconst 1 0\nret 1\nendfunc\n' > "$$tmpdir/abi/self-host/bootstrap/ir_driver.ir"; \
+	printf 'fn main():\n    print("hi")\n' > "$$tmpdir/abi/prog.pith"; \
+	set +e; \
+	out=$$(cd "$$tmpdir/abi" && $(CURDIR)/target/release/pith build prog.pith 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "ir_driver.ir was generated against runtime ABI 0000000000000000" && [ ! -e "$$tmpdir/abi/self-host/ir_driver" ]; then pass=$$((pass+1)); echo "ok   seed for another runtime abi is refused"; else echo "FAIL seed runtime abi"; echo "$$out"; fail=$$((fail+1)); fi; \
+	cp self-host/ir_driver "$$tmpdir/abi/self-host/ir_driver"; \
+	set +e; \
+	out=$$(cd "$$tmpdir/abi" && $(CURDIR)/target/release/pith build prog.pith 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "self-host/ir_driver has no runtime ABI record" && [ ! -e "$$tmpdir/abi/prog" ]; then pass=$$((pass+1)); echo "ok   unrecorded driver is not trusted"; else echo "FAIL unrecorded driver"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith build-ir "$$tmpdir/abi/self-host/bootstrap/ir_driver.ir" "$$tmpdir/abi/out" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "compiled against runtime ABI 0000000000000000"; then pass=$$((pass+1)); echo "ok   ir for another runtime abi is refused"; else echo "FAIL ir runtime abi"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

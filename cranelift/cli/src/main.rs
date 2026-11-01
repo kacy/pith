@@ -7,6 +7,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use pith_codegen::runtime_imports::RUNTIME_ABI;
+
 fn main() {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -177,6 +179,13 @@ fn print_usage() {
 
 fn dump_ir_if_requested(ir_text: &str) {
     if let Ok(dump_path) = env::var("PITH_DUMP_IR") {
+        let stamped;
+        let ir_text = if ir_runtime_abi(ir_text).is_some() {
+            ir_text
+        } else {
+            stamped = format!("{}{}\n{}", IR_ABI_PREFIX, RUNTIME_ABI, ir_text);
+            &stamped
+        };
         let _ = fs::write(&dump_path, ir_text);
         eprintln!("IR dumped to {} ({} bytes)", dump_path, ir_text.len());
     }
@@ -273,15 +282,91 @@ fn get_tokens_from_compiler(path: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Find the pre-compiled IR driver binary
-fn find_ir_driver() -> Option<String> {
+/// The first line of the IR the cli dumps, and so of the bootstrap seed:
+/// `runtime_abi <hash>`, the runtime function table it was compiled against.
+/// The consumer skips the line like any other it does not know.
+const IR_ABI_PREFIX: &str = "runtime_abi ";
+
+/// The runtime ABI an IR text says it was compiled against, if it says.
+fn ir_runtime_abi(ir_text: &str) -> Option<&str> {
+    ir_text.lines().next()?.strip_prefix(IR_ABI_PREFIX).map(str::trim)
+}
+
+/// The runtime ABI of the seed under `dir`, read from its first line only.
+fn seed_runtime_abi(dir: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = fs::File::open(format!("{}/bootstrap/ir_driver.ir", dir)).ok()?;
+    let mut first = String::new();
+    std::io::BufReader::new(file).read_line(&mut first).ok()?;
+    ir_runtime_abi(&first).map(str::to_string)
+}
+
+/// Where the runtime ABI a driver binary was built against is recorded.
+fn driver_abi_path(driver: &str) -> String {
+    format!("{}.abi", driver)
+}
+
+/// Record that a freshly built ir_driver matches this cli's runtime table.
+/// Any other executable is left alone.
+fn stamp_if_ir_driver(exe_path: &str) {
+    if Path::new(exe_path).file_name().and_then(|n| n.to_str()) == Some("ir_driver") {
+        if let Err(e) = fs::write(driver_abi_path(exe_path), RUNTIME_ABI) {
+            eprintln!("warning: could not record the runtime ABI of {}: {}", exe_path, e);
+        }
+    }
+}
+
+/// Why a driver under `dir` must not be used as it is, or None when it can.
+/// A driver built against another runtime table emits calls this cli may
+/// lower to the wrong function or not at all, and a driver older than the
+/// seed predates the emitter the checkout holds.
+fn ir_driver_staleness(dir: &str, driver: &str) -> Option<String> {
+    match fs::read_to_string(driver_abi_path(driver)) {
+        Ok(abi) if abi.trim() == RUNTIME_ABI => {}
+        Ok(abi) => {
+            return Some(format!(
+                "{} was built against runtime ABI {}, and this pith has {}",
+                driver,
+                abi.trim(),
+                RUNTIME_ABI
+            ))
+        }
+        Err(_) => return Some(format!("{} has no runtime ABI record", driver)),
+    }
+    if ir_driver_older_than_seed(dir, driver) {
+        return Some(format!(
+            "{} is older than {}/bootstrap/ir_driver.ir",
+            driver, dir
+        ));
+    }
+    None
+}
+
+/// The refusal for a seed made against another runtime table: building it
+/// would bake calls this cli cannot resolve, or resolves differently, into
+/// the driver that compiles everything else.
+fn seed_abi_mismatch(dir: &str, seed_abi: Option<&str>) -> String {
+    format!(
+        "{}/bootstrap/ir_driver.ir was generated against runtime ABI {}, and this pith was built against {}. \
+         rebuild pith from this checkout (cargo build --release). after changing \
+         cranelift/runtime-abi/runtime_functions.txt, rebuild the driver from source \
+         (pith build self-host/ir_driver.pith) and run make refresh-bootstrap-seed",
+        dir,
+        seed_abi.unwrap_or("(none recorded)"),
+        RUNTIME_ABI
+    )
+}
+
+/// Find the IR driver to compile `source` with. Ok(None) means none was
+/// found and the seed should build one.
+fn find_ir_driver(source: &str) -> Result<Option<String>, String> {
     if let Ok(path) = env::var("PITH_IR_DRIVER") {
         if Path::new(&path).exists() {
-            return Some(path);
+            return Ok(Some(path));
         }
     }
     if let Some(path) = installed_lib("ir_driver") {
-        return Some(path);
+        return Ok(Some(path));
     }
 
     for dir in &["./self-host", "../self-host"] {
@@ -289,16 +374,24 @@ fn find_ir_driver() -> Option<String> {
         if !Path::new(&candidate).exists() {
             continue;
         }
-        if ir_driver_older_than_seed(dir, &candidate) {
-            eprintln!(
-                "{} is older than {}/bootstrap/ir_driver.ir; rebuilding it",
-                candidate, dir
-            );
-            return None;
+        let Some(reason) = ir_driver_staleness(dir, &candidate) else {
+            return Ok(Some(candidate));
+        };
+        let seed_abi = seed_runtime_abi(dir);
+        if seed_abi.as_deref() == Some(RUNTIME_ABI) {
+            eprintln!("{}; rebuilding it from the seed", reason);
+            return Ok(None);
         }
-        return Some(candidate);
+        // building the driver from source is how a changed runtime table
+        // reaches a new driver and then the seed, so the old driver may do
+        // that one job
+        if Path::new(source).file_name().and_then(|n| n.to_str()) == Some("ir_driver.pith") {
+            eprintln!("{}; using it to build the new driver", reason);
+            return Ok(Some(candidate));
+        }
+        return Err(format!("{}. {}", reason, seed_abi_mismatch(dir, seed_abi.as_deref())));
     }
-    None
+    Ok(None)
 }
 
 /// Every emitter change regenerates the seed, so a seed newer than the binary
@@ -319,9 +412,10 @@ fn ir_driver_older_than_seed(dir: &str, driver: &str) -> bool {
 /// The ir_driver binary is itself compiled pith, so a fresh clone has no way
 /// to build it: pith build needs ir_driver to get IR. The tracked IR seed
 /// breaks that cycle: build ir_driver once from the seed, then everything
-/// else builds from source as usual. A binary older than the seed is rebuilt
-/// the same way (see ir_driver_older_than_seed).
-fn bootstrap_ir_driver_from_seed() -> Option<String> {
+/// else builds from source as usual. A stale binary is rebuilt the same way
+/// (see ir_driver_staleness), and a seed made against another runtime table
+/// is refused.
+fn bootstrap_ir_driver_from_seed() -> Result<String, String> {
     use pith_codegen::linker::build_executable;
 
     for dir in &["./self-host", "../self-host"] {
@@ -329,28 +423,27 @@ fn bootstrap_ir_driver_from_seed() -> Option<String> {
         if !Path::new(&seed).exists() {
             continue;
         }
+        let seed_abi = seed_runtime_abi(dir);
+        if seed_abi.as_deref() != Some(RUNTIME_ABI) {
+            return Err(seed_abi_mismatch(dir, seed_abi.as_deref()));
+        }
         eprintln!("building ir_driver from {}", seed);
-        let ir_text = fs::read_to_string(&seed).ok()?;
-        let (bytes, _) = object_from_ir(&ir_text)
-            .map_err(|e| eprintln!("seed build failed: {}", e))
-            .ok()?;
+        let ir_text = fs::read_to_string(&seed).map_err(|e| format!("read {}: {}", seed, e))?;
+        let (bytes, _) = object_from_ir(&ir_text).map_err(|e| format!("seed build failed: {}", e))?;
         // link under a per-process name and rename into place, so parallel
         // builds never run a half-written binary
         let tmp = format!("{}/ir_driver.{}", dir, std::process::id());
         let obj_path = format!("{}.o", tmp);
         let exe_path = format!("{}/ir_driver", dir);
-        fs::write(&obj_path, &bytes).ok()?;
+        fs::write(&obj_path, &bytes).map_err(|e| format!("seed object: {}", e))?;
         let linked = build_executable(&obj_path, &tmp);
         let _ = fs::remove_file(&obj_path);
-        linked
-            .map_err(|e| eprintln!("seed link failed: {}", e))
-            .ok()?;
-        fs::rename(&tmp, &exe_path)
-            .map_err(|e| eprintln!("seed install failed: {}", e))
-            .ok()?;
-        return Some(exe_path);
+        linked.map_err(|e| format!("seed link failed: {}", e))?;
+        fs::rename(&tmp, &exe_path).map_err(|e| format!("seed install failed: {}", e))?;
+        stamp_if_ir_driver(&exe_path);
+        return Ok(exe_path);
     }
-    None
+    Err("No IR driver found. Ensure ./self-host/ir_driver exists.".to_string())
 }
 
 fn describe_exit(status: &std::process::ExitStatus) -> String {
@@ -390,9 +483,10 @@ fn child_exit_code(path: &str, status: &std::process::ExitStatus) -> i32 {
 }
 
 fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> {
-    let driver = find_ir_driver()
-        .or_else(bootstrap_ir_driver_from_seed)
-        .ok_or("No IR driver found. Ensure ./self-host/ir_driver exists.")?;
+    let driver = match find_ir_driver(path)? {
+        Some(driver) => driver,
+        None => bootstrap_ir_driver_from_seed()?,
+    };
     let mut command = Command::new(&driver);
     command.arg("--combined");
     if emit_tests {
@@ -472,6 +566,15 @@ fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
     // fire even when (especially when) the contract check rejects it
     dump_ir_if_requested(ir_text);
 
+    if let Some(abi) = ir_runtime_abi(ir_text) {
+        if abi != RUNTIME_ABI {
+            return Err(format!(
+                "this IR was compiled against runtime ABI {}, and this pith was built against {}: \
+                 rebuild pith from the checkout the IR came from (cargo build --release)",
+                abi, RUNTIME_ABI
+            ));
+        }
+    }
     validate_combined_ir_contract(ir_text)?;
 
     let mut codegen = create_codegen().map_err(|e| format!("Error creating codegen: {}", e))?;
@@ -496,6 +599,7 @@ fn build_file(path: &str) {
     let obj_path = path.replace(".pith", ".o");
     let exe_path = path.replace(".pith", "");
     write_and_link(&bytes, &obj_path, &exe_path);
+    stamp_if_ir_driver(&exe_path);
 }
 
 /// Write an object file and link it into `exe_path`, exiting on failure.
@@ -659,7 +763,10 @@ fn delegate_to_frontend(args: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ir_driver_older_than_seed, validate_combined_ir_contract};
+    use super::{
+        driver_abi_path, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
+        object_from_ir, seed_runtime_abi, validate_combined_ir_contract, RUNTIME_ABI,
+    };
     use std::fs;
     use std::time::{Duration, SystemTime};
 
@@ -706,5 +813,48 @@ mod tests {
         fs::remove_file(&seed).unwrap();
         assert!(!ir_driver_older_than_seed(d, b));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_driver_is_stale_without_a_matching_abi_record() {
+        let dir = std::env::temp_dir().join(format!("pith-driver-abi-{}", std::process::id()));
+        fs::create_dir_all(dir.join("bootstrap")).unwrap();
+        let driver = dir.join("ir_driver");
+        fs::write(&driver, "").unwrap();
+        let (d, b) = (dir.to_str().unwrap(), driver.to_str().unwrap());
+
+        let reason = ir_driver_staleness(d, b).expect("no record is stale");
+        assert!(reason.contains("has no runtime ABI record"), "{reason}");
+
+        fs::write(driver_abi_path(b), "0123456789abcdef").unwrap();
+        let reason = ir_driver_staleness(d, b).expect("another table is stale");
+        assert!(reason.contains("built against runtime ABI 0123456789abcdef"), "{reason}");
+
+        fs::write(driver_abi_path(b), RUNTIME_ABI).unwrap();
+        assert_eq!(ir_driver_staleness(d, b), None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_seed_records_its_runtime_abi_on_its_first_line() {
+        let dir = std::env::temp_dir().join(format!("pith-seed-abi-{}", std::process::id()));
+        fs::create_dir_all(dir.join("bootstrap")).unwrap();
+        let seed = dir.join("bootstrap/ir_driver.ir");
+        let d = dir.to_str().unwrap();
+        fs::write(&seed, "runtime_abi feedface00000000\nfunc main 0 int\n").unwrap();
+        assert_eq!(seed_runtime_abi(d).as_deref(), Some("feedface00000000"));
+        fs::write(&seed, "func main 0 int\nruntime_abi feedface00000000\n").unwrap();
+        assert_eq!(seed_runtime_abi(d), None);
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(ir_runtime_abi(""), None);
+    }
+
+    #[test]
+    fn ir_for_another_runtime_abi_is_refused() {
+        let ir = "runtime_abi 0000000000000000\nfunc main 0 int\niconst 1 0\nret 1\nendfunc\n";
+        let err = object_from_ir(ir).expect_err("another table must be refused");
+        assert!(err.contains("compiled against runtime ABI 0000000000000000"), "{err}");
+        let ir = format!("runtime_abi {}\nfunc main 0 int\niconst 1 0\nret 1\nendfunc\n", RUNTIME_ABI);
+        assert!(object_from_ir(&ir).is_ok());
     }
 }

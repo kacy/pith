@@ -8,7 +8,6 @@
 
 import std.bytes as bytes
 import std.fs as fs
-import std.strings as strings
 
 fn make(i: Int) -> Bytes!:
     if i < 0:
@@ -16,11 +15,11 @@ fn make(i: Int) -> Bytes!:
     return bytes.from_string_utf8("a payload wide enough to notice if it leaks")
 
 fn hwm_kb() -> Int:
-    status := fs.read_file("/proc/self/status") catch ""
+    status := fs.read("/proc/self/status") catch ""
     for line in status.split(chr(10)):
         if line.starts_with("VmHWM"):
             for part in line.split(" "):
-                v := strings.parse_int(part).unwrap_or(0 - 1)
+                v := parse_int(part).unwrap_or(0 - 1)
                 if v > 0:
                     return v
     return 0

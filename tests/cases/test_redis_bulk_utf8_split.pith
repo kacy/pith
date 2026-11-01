@@ -1,0 +1,58 @@
+# a large bulk reply whose declared length ends inside a utf-8 character is
+# rejected cleanly.
+#
+# a bulk too large for the read buffer is gathered into a byte buffer that an
+# errdefer frees. the utf-8 check ran after take_bytes() had already freed
+# that buffer, so the failure freed it a second time (asan: use after free in
+# pith_byte_buffer_free).
+
+import std.net.tcp as tcp
+import std.redis as redis
+
+fn repeat(text: String, times: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < times:
+        out = out + text
+        i = i + 1
+    return out
+
+fn serve(listener: Int, reply: String, rounds: Int) -> Int!:
+    conn := tcp_accept(listener)!
+    mut i := 0
+    while i < rounds:
+        request := tcp_read(conn, 4096)!
+        if request.len() == 0:
+            i = rounds
+        else:
+            tcp.write_all(conn, reply)!
+            i = i + 1
+    tcp_close(conn)
+    return 0
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn main() -> Int!:
+    # 300000 x's and then the first byte of a two-byte character
+    reply := "$300001\r\n" + repeat("x", 300000) + "é\r\n"
+    port := choose_port(19820)!
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn serve(listener, reply, 1)
+    client := redis.connect("127.0.0.1", port)!
+    got := client.command(["GET", "k"])
+    if got.is_err:
+        print("failed: " + got.err)
+    else:
+        print("ok")
+    client.close()
+    await task
+    tcp_close(listener)
+    return 0

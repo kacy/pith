@@ -51,7 +51,9 @@ fn check_login(guard: auth.Guard, req: web.Request) -> http.HttpResponse:
     # two it was is not the caller's business.
     if user != USERNAME or not password.verify(attempt, stored_hash):
         return http.unauthorized_response()
-    guard.sign_in(req, USERNAME)
+    # false when the session store is full, which is not a signed-in caller
+    if not guard.sign_in(req, USERNAME):
+        return http.text(503, "try again shortly")
     return http.text(200, "signed in")
 
 fn login(guard: auth.Guard) -> fn(web.Request) -> http.HttpResponse:

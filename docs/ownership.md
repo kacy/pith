@@ -73,6 +73,16 @@ variables:
   removed is never read from an emptied slot, while the length taken at
   the start still caps the walk. a body that keeps storage, which covers
   most loops, borrows as before and pays nothing
+- a catch-all arm (`x => ...`) and the names in a tuple pattern are views
+  of the match subject and take no count of their own. when the subject is
+  borrowed and an arm could drop it, the match pins the subject in a hidden
+  local for its length (`ir_match_pin_kind`). an arm can drop it when it
+  writes a field, an element or a global, calls code not proven to keep
+  storage, or rebinds the local the subject was read from. the merge
+  releases the pin. a return leaves it to the exit cleanup, and a break or
+  a continue leaves it to the next pass through the match. without the pin,
+  `match h.c: x => h.c = other` freed `x` while the arm still read it. a
+  match whose arms keep storage pays nothing
 - a module-level global's slot owns its value the same way a local
   does, so assigning one releases what it held. nothing else would: a
   global is not in any function's exit cleanup, and the store itself
@@ -102,6 +112,25 @@ call arguments:
   by `ir_record_storage_keepers` as writing no field, element or global,
   cannot do that, so its arguments are not pinned. a local or a parameter
   is never pinned, since only the calling frame can rebind it
+- a read out of a field or an element is pinned the same way, whatever
+  the callee, when an operand evaluated after it can drop storage
+  (`ir_later_operands_drop`). this covers the left side of a concat, an
+  interpolation part, a tuple element, a map key, a builtin's argument or
+  receiver, and the container, key and receiver of a store. for example,
+  `o.name + rename(o)`, `m.insert(o.name, rename(o))` and
+  `h.o.name = swap(h)` each freed the read before it was used
+- an assignment reads the value it replaces only after the new value has
+  been evaluated and has taken its count. `o.name = rename(o)` used to read
+  the old name first, and `rename` had already released it, so the store
+  released it a second time. the same order applies to a global
+- `xs.get(i)`, `xs.first()`, `xs.last()` and `m.get(k)` return a fresh
+  optional around an element the container still owns. when the optional
+  is kept (bound, stored, returned or passed on), the call site retains the
+  element and gives the optional its destructor, so a later `xs.clear()`
+  cannot free the element under the local. an extraction that uses the
+  optional on the spot (`if let`, `while let`, a match subject, `.value()`,
+  `unwrap_or`, a test against `none`, an interpolation part) leaves it
+  borrowing, so a loop of `if let x = xs.get(i)` takes no counts
 - so an *owned* argument (a fresh `s[i]` char, a concat result, a
   fresh method result) dies once the call it fed returns — the caller
   releases it
@@ -209,12 +238,24 @@ lambdas and function values:
   a borrowed callee — a local, a struct field, a container element —
   belongs to its owner and is left alone; a plain name never reaches
   this path at all, because it lowers to a direct call
+- a closure called out of a struct field or a list element (`h.f(h.name)`,
+  `fs[0](x)`) is pinned for the call, along with any field or element
+  arguments, the same way an argument read from one is pinned. the body is
+  user code and can overwrite the field or empty the list. without the pin,
+  `h.f = g` inside the closure freed the environment it was running in
 - `map`, `filter` and `reduce` open-code their loop rather than going
   through the general method call, so the release that reclaims an
   owned argument does not run for them. each releases the function it
   was handed once the loop is done, and only when that function
   arrived owned — a local or a struct field holding the closure
   belongs to its owner
+- those loops hold only borrows while they call the function: of the
+  list, of each element, and of a function read out of a field. when the
+  function can drop storage (a lambda whose body does not keep storage, a
+  function not recorded as a keeper, or any closure value), the loop walks
+  a copy of the list, which counts every element, and pins the function.
+  without the copy, `o.items.map(f)` where `f` replaces `o.items` freed the
+  list in the middle of the walk
 
 ## container flavors
 
@@ -708,13 +749,24 @@ weak reads to observe that the value is gone and return `none`. the
 rings: with the back edge `weak` peak memory stays flat (about 2 MB),
 and with a strong back edge the same run leaks every ring (about 730 MB).
 
-each read builds a fresh optional that borrows the target and takes no
-count on it, whatever it is read off. so a plain binding of a weak read
-(`back := node.next.value().back`) owns that optional and releases it at
-scope exit, but never releases the target. classifying a read off a
-temporary as owned once gave that binding the target's release as well,
-which freed the target twice; retaining the fresh optional on top of that
-leaked one per bound read.
+each read upgrades the reference in one atomic step: it takes a strong
+count on the target while it is still alive, or reads back `none` once it
+is gone, and returns a fresh optional that owns that count. so a binding of
+a weak read (`back := node.next.value().back`) owns its optional like any
+call result and releases the count at scope exit. a check followed by a
+later retain could revive a target another task had just destroyed, and
+classifying the read as borrowed once freed the target twice or leaked one
+optional per bound read.
+
+every consumer treats the read as that fresh optional. a local, a field, a
+struct construction, a list or map store and a return keep the count for as
+long as they hold the optional. a test against `none`, an extraction
+(`.value()`, `unwrap_or`, `?`), an `if let`, a `while let`, a match, a call
+argument, an interpolation and a discarded read release it when they are
+done, and a store into another weak slot takes its weak count and then
+releases the optional. `tests/cases/test_weak_read_strong_slot` pins the
+strong slots, and `tests/leaks/leak_weak_read_consumers` pins that each
+consumer drops the count it was handed.
 
 a local binding can be weak too. `weak name := expr` holds a struct value
 without keeping it alive, and every read yields the same optional a weak
@@ -802,3 +854,51 @@ is not checked. a
 channel hands the value over rather than aliasing it, which keeps each
 task's mutations to itself. immutable values and independent copies
 (`std.collections.copy_list` and friends) are also safe to hand off.
+
+## finding a use after free
+
+a count bug in emitted code shows up as a value read after its last
+release, and the runtime cannot see most of these. generated code reads a
+struct field, an optional's payload or a list element with plain loads, and
+with the struct and closure pools on, the freed block usually already holds
+another value. a sanitizer build sees only the reads the runtime makes,
+because generated code is not instrumented.
+
+`PITH_QUARANTINE=1` turns those reads into a report. it has to be set when
+the program is built and when it runs; `pith run` and `pith test` see it in
+both steps:
+
+    PITH_QUARANTINE=1 pith run prog.pith
+
+at run time, the last release of a struct (optional and result shells
+included), list, map, set, bytes, byte buffer, closure, string or channel
+releases what the value owns and keeps the block. the block is filled with
+0xde bytes, its magic word becomes a freed magic that names the kind, and it
+is never reused, so the pools stay empty. a later retain, release or runtime
+operation on the handle stops the program with exit status 1:
+
+    pith quarantine: use after free of struct
+    pith quarantine: release of a freed list (a double release)
+
+a release that finds the count already at zero, which the runtime otherwise
+ignores, is reported as an over-release. a count operation or field read on
+a struct whose value died while a weak reference still holds its header is
+reported as well.
+
+at build time the variable makes the compiler leave out its inline fast
+paths for list, bytes, string and closure reads, so each of them calls the
+runtime, which checks the handle. the compiler also tests a struct's header
+before each field read or write. a build without the variable emits none of
+this, and the runtime pays one predicted branch per free and per failed
+magic check.
+
+`PITH_QUARANTINE=trace` also records a backtrace at each free and prints it
+next to the backtrace of the bad use (build with `PITH_KEEP_SYMBOLS=1` to
+name generated functions). nothing is freed in either mode, so memory grows
+with every allocation.
+
+the older switches still apply. `PITH_STRUCT_FREELIST=0` hands struct and
+closure blocks back to the allocator so valgrind or a sanitizer can see the
+free, `PITH_CSTRING_NOFREE=1` keeps freed strings filled with `!` and reports
+string over-releases, and `PITH_RC_CHECK=1` is described under threads and
+tasks above.

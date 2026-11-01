@@ -484,8 +484,15 @@ const MAP_MAGIC: u32 = 0x504d4150;
 /// per access. Freed maps get their magic scrubbed in pith_map_free.
 #[inline]
 unsafe fn map_magic_ok(ptr: *const ()) -> bool {
+    map_magic_ok_for(ptr, crate::quarantine::Op::Use)
+}
+
+/// `map_magic_ok`, naming what the caller does with the map in a quarantine
+/// report.
+#[inline(always)]
+unsafe fn map_magic_ok_for(ptr: *const (), op: crate::quarantine::Op) -> bool {
     handle_registry::plausibly_aligned::<MapImpl>(ptr)
-        && (*(ptr as *const MapImpl)).magic == MAP_MAGIC
+        && crate::quarantine::magic_is(std::ptr::addr_of!((*(ptr as *const MapImpl)).magic), MAP_MAGIC, op)
 }
 
 unsafe fn map_ref<'a>(map: PithMap) -> Option<&'a MapImpl> {
@@ -706,9 +713,10 @@ pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
 /// Release map and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_release(map: PithMap) {
-    let Some(impl_ref) = map_mut(map) else {
+    if !map_magic_ok_for(map.ptr as *const (), crate::quarantine::Op::Release) {
         return;
-    };
+    }
+    let impl_ref = &mut *(map.ptr as *mut MapImpl);
     // cycle-gc suspect hook, before our count is given up: while we still
     // hold it the map cannot die under the hook (see `maybe_suspect_struct`
     // in runtime_core for why the ordering matters).
@@ -724,6 +732,7 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
         return;
     }
     if prev == 0 {
+        crate::quarantine::over_release(crate::quarantine::Kind::Map);
         impl_ref.rc.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
     }
@@ -748,7 +757,7 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
         crate::cycle::graveyard_defer(map.ptr as usize, crate::cycle::CYCLE_KIND_MAP);
         return;
     }
-    let _ = Box::from_raw(map.ptr as *mut MapImpl);
+    drop_map_shell(map.ptr as *mut MapImpl);
 }
 
 /// Mark a map as a cycle suspect and hand it to the buffer. Cold and
@@ -860,13 +869,21 @@ pub(crate) unsafe fn cycle_map_free_dead(handle: i64) {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_MAP);
         return;
     }
-    drop(Box::from_raw(handle as *mut MapImpl));
+    drop_map_shell(handle as *mut MapImpl);
 }
 
 /// Drop a map shell the graveyard parked: values already released, magic
 /// already scrubbed, registry entry already gone; only the box remains.
 pub(crate) unsafe fn cycle_drop_map_shell(ptr: usize) {
-    drop(Box::from_raw(ptr as *mut MapImpl));
+    drop_map_shell(ptr as *mut MapImpl);
+}
+
+/// Free a dead map's box, or quarantine it.
+unsafe fn drop_map_shell(ptr: *mut MapImpl) {
+    let magic = std::ptr::addr_of_mut!((*ptr).magic);
+    if !crate::quarantine::bury_box(ptr, magic, crate::quarantine::Kind::Map) {
+        drop(Box::from_raw(ptr));
+    }
 }
 
 /// Remove an int-keyed entry and hand its value, count included, to the
@@ -930,8 +947,8 @@ unsafe fn take_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_retain_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_MAP_RETAIN);
-    if let Some(impl_ref) = map_mut_from_handle(handle) {
-        impl_ref
+    if map_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) {
+        (*(handle as *const MapImpl))
             .rc
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2270,7 +2287,8 @@ mod tests {
             let handle = map.ptr as i64;
             pith_map_insert_ikey(handle, 1, value); // map retains
             crate::runtime_core::pith_struct_release(value); // map holds the only count
-            assert_eq!(crate::runtime_core::pith_struct_weak_load(value), value);
+            assert_eq!(crate::runtime_core::pith_struct_weak_upgrade(value), value);
+            crate::runtime_core::pith_struct_release(value); // the upgrade's count
 
             pith_map_retain_handle(handle);
             pith_map_release(map); // 2 -> 1: buffered
@@ -2279,7 +2297,7 @@ mod tests {
 
             assert_eq!(crate::cycle::graveyard_count_for_tests(handle as usize), 1);
             assert_eq!(
-                crate::runtime_core::pith_struct_weak_load(value),
+                crate::runtime_core::pith_struct_weak_upgrade(value),
                 0,
                 "value was released"
             );

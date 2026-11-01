@@ -37,23 +37,34 @@ pub(crate) struct PithByteBuffer {
 /// stale or wild handle fails the compare instead of being dereferenced
 /// blindly.
 pub(crate) unsafe fn pith_bytes_ref<'a>(handle: i64) -> Option<&'a PithBytes> {
-    let ptr = handle as *const ();
-    if !crate::handle_registry::plausibly_aligned::<PithBytes>(ptr)
-        || (*(handle as *const PithBytes)).magic != BYTES_MAGIC
+    bytes_ref_for(handle, crate::quarantine::Op::Use)
+}
+
+/// `pith_bytes_ref`, naming what the caller does with the bytes in a
+/// quarantine report.
+#[inline(always)]
+unsafe fn bytes_ref_for<'a>(handle: i64, op: crate::quarantine::Op) -> Option<&'a PithBytes> {
+    let ptr = handle as *const PithBytes;
+    if !crate::handle_registry::plausibly_aligned::<PithBytes>(ptr as *const ())
+        || !crate::quarantine::magic_is(std::ptr::addr_of!((*ptr).magic), BYTES_MAGIC, op)
     {
         return None;
     }
-    Some(&*(handle as *const PithBytes))
+    Some(&*ptr)
 }
 
 unsafe fn pith_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut PithByteBuffer> {
-    let ptr = handle as *const ();
-    if !crate::handle_registry::plausibly_aligned::<PithByteBuffer>(ptr)
-        || (*(handle as *const PithByteBuffer)).magic != BYTE_BUFFER_MAGIC
+    let ptr = handle as *mut PithByteBuffer;
+    if !crate::handle_registry::plausibly_aligned::<PithByteBuffer>(ptr as *const ())
+        || !crate::quarantine::magic_is(
+            std::ptr::addr_of!((*ptr).magic),
+            BYTE_BUFFER_MAGIC,
+            crate::quarantine::Op::Use,
+        )
     {
         return None;
     }
-    Some(&mut *(handle as *mut PithByteBuffer))
+    Some(&mut *ptr)
 }
 
 pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
@@ -79,7 +90,7 @@ pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_retain(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_BYTES_RETAIN);
-    if let Some(b) = pith_bytes_ref(handle) {
+    if let Some(b) = bytes_ref_for(handle, crate::quarantine::Op::Retain) {
         b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -91,7 +102,7 @@ pub unsafe extern "C" fn pith_bytes_retain(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_BYTES_RELEASE);
-    let Some(b) = pith_bytes_ref(handle) else {
+    let Some(b) = bytes_ref_for(handle, crate::quarantine::Op::Release) else {
         return;
     };
     let prev = crate::runtime_core::count_release(&b.rc);
@@ -99,6 +110,7 @@ pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
         return;
     }
     if prev == 0 {
+        crate::quarantine::over_release(crate::quarantine::Kind::Bytes);
         // over-release: put the count back and leave the object alone
         // rather than double-freeing
         b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -108,7 +120,10 @@ pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
     crate::perf_count(&crate::PERF_BYTES_FREES, 1);
     // scrub the magic so stale handles fail the validity check
     (*(handle as *mut PithBytes)).magic = 0;
-    let _ = Box::from_raw(handle as *mut PithBytes);
+    let ptr = handle as *mut PithBytes;
+    if !crate::quarantine::bury_box(ptr, std::ptr::addr_of_mut!((*ptr).magic), crate::quarantine::Kind::Bytes) {
+        drop(Box::from_raw(ptr));
+    }
 }
 
 #[no_mangle]
@@ -369,7 +384,11 @@ pub unsafe extern "C" fn pith_byte_buffer_free(handle: i64) {
     // scrub the magic so a stale handle fails the validity check instead
     // of touching freed memory
     (*(handle as *mut PithByteBuffer)).magic = 0;
-    let _ = Box::from_raw(handle as *mut PithByteBuffer);
+    let ptr = handle as *mut PithByteBuffer;
+    let magic = std::ptr::addr_of_mut!((*ptr).magic);
+    if !crate::quarantine::bury_box(ptr, magic, crate::quarantine::Kind::ByteBuffer) {
+        drop(Box::from_raw(ptr));
+    }
 }
 
 /// Allocate a fresh byte buffer.

@@ -213,6 +213,31 @@ pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
     if max_output <= 0:
         fail "zstd: max_output must be positive"
     header := parse_header(data)!
+    frame := decode_blocks(data, header, max_output)!
+    result := frame.content
+
+    if header.content_size >= 0 and result.len() != header.content_size:
+        fail "zstd: decoded size does not match the frame's declared content size"
+
+    if header.has_checksum:
+        if frame.end + 4 > data.len():
+            fail "zstd: truncated content checksum"
+        stated := read_le(data, frame.end, 4)
+        if xxhash.frame_checksum(result) != stated:
+            fail "zstd: content checksum mismatch"
+
+    return result
+
+# a frame's decoded blocks, and the offset just past the last one.
+struct DecodedBlocks:
+    content: Bytes
+    end: Int
+
+# decode every block of the frame into one buffer. the buffer is freed on
+# every way out of this function, including a failure, and only here: the
+# checks that follow in decompress_bounded can fail too, and an errdefer
+# there would free a buffer this function had already freed.
+fn decode_blocks(data: Bytes, header: FrameHeader, max_output: Int) -> DecodedBlocks!:
     mut out := bytes.buffer()
     errdefer out.free()
     mut pos := header.header_len
@@ -256,20 +281,7 @@ pub fn decompress_bounded(data: Bytes, max_output: Int) -> Bytes!:
             pos = block.body_start + block.size
         done = block.last
 
-    result := out.bytes()
-    out.free()
-
-    if header.content_size >= 0 and result.len() != header.content_size:
-        fail "zstd: decoded size does not match the frame's declared content size"
-
-    if header.has_checksum:
-        if pos + 4 > data.len():
-            fail "zstd: truncated content checksum"
-        stated := read_le(data, pos, 4)
-        if xxhash.frame_checksum(result) != stated:
-            fail "zstd: content checksum mismatch"
-
-    return result
+    return DecodedBlocks(out.take_bytes(), pos)
 
 test "the magic is recognized and rejected":
     mut buf := bytes.buffer()

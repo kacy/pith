@@ -41,7 +41,8 @@ use crate::concurrency::green;
 use crate::concurrency::scheduler::{backend, Backend};
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU8, Ordering};
+use crate::sync::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -75,7 +76,7 @@ where
         return work();
     }
 
-    let slot = Arc::new(Slot::<T>::new(task));
+    let slot = Arc::new(Slot::<T>::new());
     let publish = Arc::clone(&slot);
     pool.enqueue(Box::new(move || {
         // a panic here would strand the parked task forever. contain it and
@@ -86,7 +87,9 @@ where
         // it captures outlives the job), so assert it rather than pushing the
         // bound onto every caller.
         let value = std::panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_default();
-        publish.complete(value);
+        if publish.complete(value) {
+            green::wake(task);
+        }
     }));
 
     if spin_briefly(&slot) || !slot.claim_park() {
@@ -178,40 +181,40 @@ const SLOT_PARKING: u8 = 1;
 const SLOT_DONE: u8 = 2;
 
 /// where a pool thread leaves the result for the task that asked for it.
-struct Slot<T> {
-    /// green task id of the waiting task, passed straight to `green::wake`.
-    task: usize,
+///
+/// built on `crate::sync`, so the loom model of the handshake
+/// (`loom_models::blocking_wake`) runs this type itself.
+pub(crate) struct Slot<T> {
     /// one of the `SLOT_*` states. the task's claim and the publisher's swap
     /// are read-modify-writes on this one word, so exactly one of them sees
     /// the other: either the task finds the result and never parks, or the
     /// publisher finds the claim and wakes it.
     state: AtomicU8,
     /// `None` until the job finishes, `Some` after.
-    value: Mutex<Option<T>>,
+    value: crate::sync::Mutex<Option<T>>,
 }
 
 impl<T: Default> Slot<T> {
-    fn new(task: usize) -> Self {
+    pub(crate) fn new() -> Self {
         Slot {
-            task,
             state: AtomicU8::new(SLOT_WAITING),
-            value: Mutex::new(None),
+            value: crate::sync::Mutex::new(None),
         }
     }
 
-    /// publish the result, and wake the task only if it claimed a park. the
+    /// publish the result, and say whether the task claimed a park, in which
+    /// case the caller must wake it (and must not wake it otherwise). the
     /// value is stored before the swap, so a task that sees `SLOT_DONE` finds
     /// it.
-    fn complete(&self, value: T) {
-        *lock(&self.value) = Some(value);
-        if self.state.swap(SLOT_DONE, Ordering::AcqRel) == SLOT_PARKING {
-            green::wake(self.task);
-        }
+    #[must_use]
+    pub(crate) fn complete(&self, value: T) -> bool {
+        *self.value.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(value);
+        self.state.swap(SLOT_DONE, Ordering::AcqRel) == SLOT_PARKING
     }
 
     /// commit the task to parking. false means the result already landed and
     /// the task must not park, since no wake is coming.
-    fn claim_park(&self) -> bool {
+    pub(crate) fn claim_park(&self) -> bool {
         self.state
             .compare_exchange(
                 SLOT_WAITING,
@@ -223,15 +226,19 @@ impl<T: Default> Slot<T> {
     }
 
     /// has the result landed? pairs with the swap in `complete`.
-    fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.state.load(Ordering::Acquire) == SLOT_DONE
     }
 
     /// take the result. only called once `is_ready` or a failed `claim_park`
     /// has seen `SLOT_DONE`, so it is always there; the default is a guard,
     /// and every caller already reads it as failure.
-    fn take(&self) -> T {
-        lock(&self.value).take().unwrap_or_default()
+    pub(crate) fn take(&self) -> T {
+        self.value
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .unwrap_or_default()
     }
 }
 
@@ -386,20 +393,20 @@ mod tests {
 
     /// submit one job from a plain test thread and wait for its result.
     ///
-    /// the slot names a task id no green task will ever have; `green::wake`
-    /// against an unknown id is a documented no-op, so this exercises the
-    /// queue, the threads, and the slot without needing a live green task.
+    /// no green task is waiting, so the wake `complete` may ask for is
+    /// dropped; this exercises the queue, the threads, and the slot without
+    /// needing a live green task.
     fn via_pool<T, F>(work: F) -> T
     where
         T: Default + Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let slot = Arc::new(Slot::<T>::new(usize::MAX));
+        let slot = Arc::new(Slot::<T>::new());
         let publish = Arc::clone(&slot);
         assert!(TEST_POOL.ensure_worker());
         TEST_POOL.enqueue(Box::new(move || {
             let value = std::panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_default();
-            publish.complete(value);
+            let _ = publish.complete(value);
         }));
         await_slot(&slot)
     }
@@ -444,12 +451,12 @@ mod tests {
         static STARTED: AtomicUsize = AtomicUsize::new(0);
         let slots: Vec<Arc<Slot<i64>>> = (0..TEST_POOL.max_threads * 4)
             .map(|_| {
-                let slot = Arc::new(Slot::<i64>::new(usize::MAX));
+                let slot = Arc::new(Slot::<i64>::new());
                 let publish = Arc::clone(&slot);
                 assert!(TEST_POOL.ensure_worker());
                 TEST_POOL.enqueue(Box::new(move || {
                     STARTED.fetch_add(1, Ordering::Relaxed);
-                    publish.complete(1);
+                    let _ = publish.complete(1);
                 }));
                 slot
             })
@@ -464,7 +471,7 @@ mod tests {
 
     #[test]
     fn the_short_wait_gives_up_when_nothing_answers() {
-        let slot = Slot::<i64>::new(usize::MAX);
+        let slot = Slot::<i64>::new();
         let started = Instant::now();
         assert!(!spin_briefly(&slot));
         // it must not return early either, or a result that was one microsecond
@@ -479,9 +486,11 @@ mod tests {
         if !spinning_helps() {
             return;
         }
-        let slot = Arc::new(Slot::<i64>::new(usize::MAX));
+        let slot = Arc::new(Slot::<i64>::new());
         let publish = Arc::clone(&slot);
-        std::thread::spawn(move || publish.complete(9));
+        std::thread::spawn(move || {
+            let _ = publish.complete(9);
+        });
         // the spawn may lose the race on a busy machine, so accept either
         // outcome and only insist that a result seen in the wait is the right
         // one, never a torn or missing value.
@@ -496,18 +505,18 @@ mod tests {
     fn a_result_published_first_refuses_the_park() {
         // the task found the result between its spin and its park: it must not
         // park, because the publisher saw no claim and sent no wake.
-        let slot = Slot::<i64>::new(usize::MAX);
-        slot.complete(5);
+        let slot = Slot::<i64>::new();
+        assert!(!slot.complete(5), "nobody claimed a park, so no wake is owed");
         assert!(!slot.claim_park());
         assert_eq!(slot.take(), 5);
     }
 
     #[test]
     fn a_claimed_park_still_sees_the_result() {
-        let slot = Slot::<i64>::new(usize::MAX);
+        let slot = Slot::<i64>::new();
         assert!(slot.claim_park());
         assert!(!slot.is_ready());
-        slot.complete(8);
+        assert!(slot.complete(8), "the claimed park is owed a wake");
         assert!(slot.is_ready());
         assert_eq!(slot.take(), 8);
     }

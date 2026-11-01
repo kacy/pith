@@ -1,0 +1,37 @@
+# bind a weak field read to a plain local, test it and extract it, every
+# round. the read hands back a fresh optional that owns a count on the target
+# (the count that keeps it alive while the reader uses it), so the binding
+# must take that shell over rather than retain it again: an extra count here
+# leaks the shell every round, and with it a count that keeps the target alive
+# forever. the run ends by dropping the target's only strong owner and checks
+# that the weak field then reads none.
+import leakprobe as probe
+
+struct Child:
+    n: Int
+
+struct Holder:
+    mut child: Child?
+    weak w: Child?
+
+fn round(h: Holder) -> Int:
+    w := h.w
+    if w == none:
+        return 0
+    c := w.value()
+    return c.n
+
+fn main():
+    n := probe.rounds()
+    h := Holder(child: Child(n: 3), w: none)
+    h.w = h.child
+    mut i := 0
+    mut total := 0
+    while i < n:
+        total = total + round(h)
+        i = i + 1
+    h.child = none
+    if h.w != none or total != 3 * n:
+        print("the target outlived its last owner")
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -88,17 +88,23 @@ pub mod perf;
 pub mod platform;
 pub mod process;
 pub mod process_io;
+pub mod quarantine;
 pub mod runtime_core;
 pub mod sampler;
 pub mod share;
 pub mod signals;
+pub mod stack_guard;
 pub mod string;
 pub mod string_list;
 pub mod substring;
 pub mod switches;
+pub(crate) mod sync;
 pub mod terminal;
 pub mod utility;
 pub mod zstd_codec;
+
+#[cfg(all(test, loom))]
+mod loom_models;
 
 pub use encoding::*;
 pub use host_fs::*;

@@ -208,6 +208,11 @@ stale and a fix to it is welcome.
   on the worker, so on a slow network mount they hold every task on it until
   they return. a file call from inside a task pays a thread handoff that a call
   from `main` does not.
+- **a green task's stack does not grow**. it is 1 MiB unless
+  `PITH_GREEN_STACK_KB` sets another size, and recursion that needs more
+  stops the process with a stack overflow report. generated code does not
+  probe the stack, so a single frame larger than the 4 KiB guard page could
+  step over it.
 - **preemption costs a check per loop back-edge**. compute-bound tasks are
   preempted at safe-points so a spinning loop cannot starve the tasks that
   share its worker. building with `PITH_GREEN_PREEMPT=0` removes the check,

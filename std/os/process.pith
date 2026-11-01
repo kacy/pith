@@ -28,7 +28,8 @@ pub struct Command:
 pub struct Process:
     pub handle: Int
 
-# captured process output.
+# captured process output. status is the exit code, or 128 plus the signal
+# number when a signal ended the child, as a shell reports it.
 pub struct Output:
     pub status: Int
     pub stdout: String
@@ -138,16 +139,11 @@ pub fn start(cmd: Command) -> Process!:
 pub fn run(cmd: Command) -> Int!:
     return output(cmd)!.status
 
-# runs a command with cancellation and deadline support.
+# runs a command with cancellation and deadline support and returns its exit
+# status. like run, it reads and discards the child's stdout and stderr: a
+# child whose output filled an undrained pipe would never exit.
 pub fn run_ctx(cmd: Command, ctx: Context) -> Int!BlockingError:
-    process := start_or_fail(cmd)!
-    defer process.close()
-    wait_result := process.wait_ctx(ctx)
-    if wait_result.is_err:
-        process.kill()
-        process.wait()
-        fail blocking_from_wait(wait_result.err)
-    return wait_result.ok
+    return output_ctx(cmd, ctx)!.status
 
 # runs a command and captures its stdout and stderr.
 pub fn output(cmd: Command) -> Output!:
@@ -245,11 +241,13 @@ impl Output:
 pub fn start_shell(command_text: String) -> Process!:
     return Process(process_spawn(command_text)!)
 
-# runs a shell command and returns its exit status.
+# runs a shell command and returns its exit status, or 128 plus the signal
+# number when a signal ended it.
 pub fn run_shell(command_text: String) -> Int:
     return exec(command_text)
 
-# runs a shell command and returns stdout.
+# runs a shell command and returns stdout. fails when the command cannot
+# start or a signal ends it; a nonzero exit still returns its stdout.
 pub fn output_shell(command_text: String) -> String!:
     return exec_output(command_text)
 

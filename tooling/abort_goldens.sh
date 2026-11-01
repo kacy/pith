@@ -15,6 +15,13 @@
 # the consumer adds for the common case is proved to abort exactly as the
 # runtime call it replaced did.
 #
+# a case whose name starts with `quarantine_` is built and run with
+# PITH_QUARANTINE=1. those cases free a value and then read it from generated
+# code alone, which no sanitizer sees; the golden pins the report. a case
+# whose name starts with `osthread_` runs on the os-thread backend
+# (PITH_GREEN=0), and one starting with `small_stack_` gives green tasks
+# 64 KiB stacks (PITH_GREEN_STACK_KB=64).
+#
 # regenerate with PITH_ABORT_GOLDEN_UPDATE=1 and read the diff before
 # committing: a golden that changes is a behaviour change.
 
@@ -29,6 +36,11 @@ if [ ! -x "$PITH" ]; then
   echo "no pith binary at $PITH; run 'make build' first"
   exit 1
 fi
+
+# some cases die by a signal on purpose. they should leave no core file, and
+# whether timeout says it saw one depends on the machine, so that line is
+# dropped from what the golden compares.
+ulimit -c 0
 
 tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pith-abort-goldens-XXXXXX")
 trap 'rm -rf "$tmpdir"' EXIT
@@ -60,10 +72,20 @@ compare() {
   fi
 }
 
+# the environment a case is built and run in
+case_env() {
+  case "$1" in
+    quarantine_*) echo "PITH_QUARANTINE=1" ;;
+    osthread_*) echo "PITH_GREEN=0" ;;
+    small_stack_*) echo "PITH_GREEN_STACK_KB=64" ;;
+    *) echo "PITH_QUARANTINE=0" ;;
+  esac
+}
+
 for f in "$CASES"/*.pith; do
   [ -e "$f" ] || continue
   name=$(basename "$f" .pith)
-  output=$(timeout 60 "$PITH" run "$f" 2>&1)
+  output=$(env "$(case_env "$name")" timeout 60 "$PITH" run "$f" 2>&1)
   status=$?
   compare "$name" "$(printf '%s\nexit: %d' "$output" "$status")"
 done
@@ -72,14 +94,15 @@ for f in "$CASES"/*.ir; do
   [ -e "$f" ] || continue
   name=$(basename "$f" .ir)
   exe="$tmpdir/$name"
-  if ! timeout 60 "$PITH" build-ir "$f" "$exe" > "$tmpdir/build.log" 2>&1; then
+  if ! env "$(case_env "$name")" timeout 60 "$PITH" build-ir "$f" "$exe" > "$tmpdir/build.log" 2>&1; then
     echo "FAIL $name (build-ir)"
     sed -e 's/^/  /' "$tmpdir/build.log" | head -n 20
     fail=$((fail + 1))
     continue
   fi
-  output=$(timeout 15 "$exe" 2>&1)
+  output=$(env "$(case_env "$name")" timeout 15 "$exe" 2>&1)
   status=$?
+  output=$(printf '%s\n' "$output" | grep -v '^timeout: the monitored command dumped core$')
   compare "$name" "$(printf '%s\nexit: %d' "$output" "$status")"
 done
 

@@ -1,0 +1,78 @@
+# a store that replaces a value with a value read out of the same slot:
+# `m.insert(k, m[k])`, `xs[i] = xs[j]` with i == j, `m[k] = m.get_default(k, d)`,
+# `o.f = o.f`. every store entry point takes the new value's count before it
+# drops the displaced one, so the value survives its own replacement. the
+# churn after each store reuses freed memory, so a release-first store would
+# print filler.
+struct P:
+    name: String
+
+struct O:
+    mut name: String
+    mut child: P?
+    mut items: List[String]
+    mut p: P
+
+fn churn() -> List[String]:
+    mut junk: List[String] := []
+    mut i := 0
+    while i < 50:
+        junk.push("filler-{i}-xxxxxxxxxxxxxxxx")
+        i = i + 1
+    return junk
+
+fn main() -> Int:
+    mut m: Map[String, String] := {}
+    m.insert("k", "hello" + "-map-value-long-enough")
+    m.insert("k", m["k"])
+    m["k"] = m["k"]
+    m.insert("k", m.get_default("k", "d"))
+    m["k"] = m.get_default("k", "d")
+    j1 := churn()
+    print(m["k"])
+    mut mp: Map[String, P] := {}
+    mp.insert("k", P(name: "hello" + "-struct"))
+    mp.insert("k", mp["k"])
+    mp["k"] = mp["k"]
+    mp.insert("k", mp.get_default("k", P(name: "d")))
+    j2 := churn()
+    print(mp["k"].name)
+    mut mi: Map[Int, List[String]] := {}
+    mi.insert(1, ["hello" + "-ikey"])
+    mi.insert(1, mi[1])
+    mi[1] = mi[1]
+    mi.insert(1, mi.get_default(1, []))
+    j3 := churn()
+    print(mi[1][0])
+    mut xs: List[String] := ["hello" + "-list"]
+    i := 0
+    jj := 0
+    xs[i] = xs[jj]
+    xs[i] = xs[0]
+    xs[0] = xs[0]
+    j4 := churn()
+    print(xs[0])
+    mut ll: List[List[String]] := [["hello" + "-nested"]]
+    ll[0] = ll[0]
+    ll[i] = ll[0]
+    j5 := churn()
+    print(ll[0][0])
+    o := O(name: "hello" + "-field", child: P(name: "hello" + "-child"), items: ["hello" + "-items"], p: P(name: "hello" + "-p"))
+    o.name = o.name
+    o.child = o.child
+    o.items = o.items
+    o.p = o.p
+    o.items[0] = o.items[0]
+    j6 := churn()
+    print("{o.name} {o.child.value().name} {o.items[0]} {o.p.name}")
+    mut ps: List[P] := [P(name: "hello" + "-plist")]
+    ps[0] = ps[0]
+    ps.insert(0, ps[0])
+    ps.remove(1)
+    j7 := churn()
+    print(ps[0].name)
+    mut os: List[P?] := [P(name: "hello" + "-optlist")]
+    os[0] = os[0]
+    j8 := churn()
+    print(os[0].value().name)
+    return 0

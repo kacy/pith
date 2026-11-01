@@ -1,0 +1,99 @@
+# the http/1.1 client bounds how much of a response body it buffers. a raw tcp
+# server answers each path with a canned response; the client refuses a body
+# past its limit however it is framed, and a request can raise the limit.
+
+import std.net.http as http
+import std.net.tcp as tcp
+import std.bytes as bytes
+import std.compress.gzip as gzip
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn read_head(fd: Int) -> String:
+    mut seen := ""
+    while seen.index_of("\r\n\r\n") < 0:
+        chunk := tcp_read(fd, 4096) catch ""
+        if chunk == "":
+            return ""
+        seen = seen + chunk
+    return seen
+
+fn repeat(text: String, count: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < count:
+        out = out + text
+        i = i + 1
+    return out
+
+fn canned(path: String) -> Bytes:
+    if path == "/small":
+        return bytes.from_string_utf8("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello")
+    if path == "/declared":
+        return bytes.from_string_utf8("HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\nonly this much")
+    if path == "/declared-huge":
+        # far past the default limit; the client must refuse it from the head
+        # rather than wait for 100 mb that never comes
+        return bytes.from_string_utf8("HTTP/1.1 200 OK\r\nContent-Length: 104857600\r\n\r\nonly this much")
+    if path == "/chunked":
+        chunk := "28\r\n" + repeat("x", 40) + "\r\n"
+        return bytes.from_string_utf8("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + repeat(chunk, 4) + "0\r\n\r\n")
+    if path == "/until-close":
+        return bytes.from_string_utf8("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n" + repeat("y", 300))
+    if path == "/gzip":
+        packed := gzip.compress(bytes.from_string_utf8(repeat("z", 5000)))
+        head := bytes.from_string_utf8("HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {packed.len()}\r\n\r\n")
+        return bytes.concat(head, packed)
+    return bytes.from_string_utf8("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+
+fn raw_conn(fd: Int) -> Int:
+    head := read_head(fd)
+    if head != "":
+        parts := head.split(" ")
+        if parts.len() > 1:
+            tcp.write_all_bytes(fd, canned(parts[1])) catch 0
+    tcp_close(fd)
+    return 0
+
+fn raw_loop(listener: Int) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn raw_conn(fd)
+    return 0
+
+fn report(label: String, resp: http.HttpResponse!):
+    if resp.is_err:
+        print("{label}: {resp.err}")
+    else:
+        print("{label}: status {resp.ok.status}, {resp.ok.body.len()} bytes")
+
+fn main() -> String!:
+    port := choose_port(22100)!
+    listener := tcp_listen("127.0.0.1", port)!
+    spawn raw_loop(listener)
+    base := "http://127.0.0.1:{port}"
+    print("default limit: {http.MAX_RESPONSE_BODY}")
+    c := http.client().with_max_response_body_bytes(100)
+    for path in ["/small", "/declared", "/chunked", "/until-close", "/gzip"]:
+        report(path, c.get(base + path))
+    # a request's own limit replaces the client's
+    raised := http.new_request("GET", base + "/chunked")!.with_max_response_body_bytes(1000)
+    report("/chunked raised", c.send(raised))
+    # the default limit applies without any configuration, on the pooled
+    # client, a one-shot request, and a reused connection alike
+    report("/declared-huge pooled", http.client().get(base + "/declared-huge"))
+    report("/declared-huge one-shot", http.get_request("127.0.0.1", port, "/declared-huge").send())
+    conn := http.connect_client("127.0.0.1", port)!
+    report("/declared-huge conn", conn.send(http.get_request("127.0.0.1", port, "/declared-huge")))
+    conn.close()
+    report("/until-close one-shot", http.get_request("127.0.0.1", port, "/until-close").with_max_response_body_bytes(100).send())
+    return ""

@@ -1,0 +1,55 @@
+# a flood of cookieless visitors fetching a login form fills the session table
+# with csrf-token sessions. those are provisional, so sign-in still gets a
+# session afterwards, both for a fresh caller and for one who loaded the form
+# first, instead of silently doing nothing until the flood's sessions expire.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.web as web
+import std.web.session as session
+import std.web.csrf as csrf
+import std.web.auth as auth
+
+fn request_of(method: String, cookie: String) -> web.Request:
+    mut headers: Map[String, String] := {}
+    if cookie.len() > 0:
+        headers.insert("Cookie", cookie)
+    raw := http.HttpRequestBytes(bytes.empty(), bytes.empty(), method, "/login", "", "HTTP/1.1", "", "", headers, {}, [])
+    return web.Request(raw, {}, "/login", {})
+
+# the name=value pair a browser sends back for a Set-Cookie line.
+fn session_pair(resp: http.HttpResponse) -> String:
+    for line in resp.cookies():
+        if line.starts_with("pith_session="):
+            return line.substring(0, line.index_of(";"))
+    return ""
+
+fn main() -> Int!:
+    secret := bytes.from_string_utf8("a session secret of at least thirty-two bytes")
+    sessions := session.store(secret)!
+    protection := csrf.guard(sessions)
+    guard := auth.guard(sessions)
+    mw := session.middleware(sessions)
+    form := fn(req: web.Request) => http.text(200, protection.token(req))
+    login := fn(req: web.Request):
+        if not guard.sign_in(req, "ada"):
+            return http.text(503, "try again shortly")
+        return http.text(200, "signed in")
+    me := fn(req: web.Request) => http.text(200, guard.user(req))
+
+    mut i := 0
+    while i < 100000:
+        mw(form, request_of("GET", ""))
+        i = i + 1
+    print("sessions after the flood: {sessions.count()}")
+
+    fresh := mw(login, request_of("POST", ""))
+    print("cookieless sign-in: {fresh.status}, cookie set: {session_pair(fresh).len() > 0}")
+    print("signed in as: {mw(me, request_of("GET", session_pair(fresh))).body_text()!}")
+
+    # a visitor who loaded the form during the flood and then signs in
+    page := mw(form, request_of("GET", ""))
+    after := mw(login, request_of("POST", session_pair(page)))
+    print("sign-in after the form: {after.status}, signed in as: {mw(me, request_of("GET", session_pair(after))).body_text()!}")
+    print("sessions at the end: {sessions.count()}")
+    return 0

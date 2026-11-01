@@ -122,53 +122,68 @@ pub(crate) fn wake(id: TaskId) {
 #[inline]
 pub(super) fn claim_parked(block: &SyncBlock) -> Option<Option<usize>> {
     let sched = scheduler();
+    let home_for = |owner: Option<usize>| {
+        if sched.migrate {
+            match (owner, current_worker()) {
+                (Some(o), Some(w)) if w != o => Some(w),
+                _ => owner,
+            }
+        } else {
+            owner
+        }
+    };
     let mut word = block.word.load(AtomicOrdering::Acquire);
     loop {
-        match word & S_STATE_MASK {
-            // parked with its coroutine put back: claim it, naming its home.
-            S_PARKED => {
-                let owner = word_owner(word);
-                let home = if sched.migrate {
-                    match (owner, current_worker()) {
-                        (Some(o), Some(w)) if w != o => Some(w),
-                        _ => owner,
+        let (next, claimed) = match wake_step(word, home_for) {
+            WakeStep::Claim(next, home) => (next, Some(home)),
+            WakeStep::Pend(next) => (next, None),
+            WakeStep::Skip => return None,
+        };
+        match block.word.compare_exchange_weak(
+            word,
+            next,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        ) {
+            Ok(_) => {
+                if let Some(home) = claimed {
+                    if sched.wake_stats {
+                        note_wake(word_owner(word), home);
                     }
-                } else {
-                    owner
-                };
-                let next = home.map_or(S_READY, |w| owner_bits(w) | S_READY);
-                match block.word.compare_exchange_weak(
-                    word,
-                    next,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                ) {
-                    Ok(_) => {
-                        if sched.wake_stats {
-                            note_wake(owner, home);
-                        }
-                        return Some(home);
-                    }
-                    Err(current) => word = current,
                 }
+                return claimed;
             }
-            // still resuming/suspending: it has not yet recorded itself as
-            // Parked, so set the pending flag; the yield arm in `run_task` will
-            // see it and re-enqueue instead of parking.
-            S_RUNNING => {
-                match block.word.compare_exchange_weak(
-                    word,
-                    word | S_WAKE_PENDING,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                ) {
-                    Ok(_) => return None,
-                    Err(current) => word = current,
-                }
-            }
-            // already queued to re-check, or finished: nothing to do.
-            _ => return None,
+            Err(current) => word = current,
         }
+    }
+}
+
+/// what a wake does to a task whose word reads `word`.
+#[cfg_attr(all(test, loom), derive(Debug))]
+pub(crate) enum WakeStep {
+    /// parked with its coroutine put back: claim it (CAS to the word given)
+    /// and enqueue it on the worker given, its home from then on.
+    Claim(u64, Option<usize>),
+    /// still resuming or suspending: it has not yet recorded itself as
+    /// Parked, so set the pending flag (CAS to the word given); the yield
+    /// arm in `run_task` will see it and re-enqueue instead of parking.
+    Pend(u64),
+    /// already queued to re-check, or finished: nothing to do.
+    Skip,
+}
+
+/// the transition a wake makes on `word`. `home_for` maps a parked task's
+/// owner to the worker that should take it (see `claim_parked`). pure, so the
+/// loom model of the park/wake word runs this same decision.
+#[inline]
+pub(crate) fn wake_step(word: u64, home_for: impl FnOnce(Option<usize>) -> Option<usize>) -> WakeStep {
+    match word & S_STATE_MASK {
+        S_PARKED => {
+            let home = home_for(word_owner(word));
+            WakeStep::Claim(home.map_or(S_READY, |w| owner_bits(w) | S_READY), home)
+        }
+        S_RUNNING => WakeStep::Pend(word | S_WAKE_PENDING),
+        _ => WakeStep::Skip,
     }
 }
 

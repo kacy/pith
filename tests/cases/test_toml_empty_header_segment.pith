@@ -1,0 +1,22 @@
+# a table header with an empty segment is rejected.
+#
+# `[a..b]` and `[.]` are not valid toml, but the parser made a table for each
+# empty segment, so a header of 200k dots built 200k nested tables (about
+# 90 MB from a 200 kB document).
+
+import std.toml as toml
+
+fn main() -> Int:
+    print(toml.parse("[a..b]\nx = 1\n").to_string())
+    print(toml.parse("[.]\n").to_string())
+    print(toml.parse("[]\n").to_string())
+    ok := toml.parse("[a.b]\nx = 1\n")
+    print(toml.get_int(toml.get_table(toml.get_table(ok, "a"), "b"), "x").to_string())
+
+    mut dots := "[a"
+    mut i := 0
+    while i < 200000:
+        dots = dots + "."
+        i = i + 1
+    print(toml.parse(dots + "]\n").to_string())
+    return 0

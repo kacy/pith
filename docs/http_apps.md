@@ -663,6 +663,8 @@ of the one it came from.
 | `with_proxy(url)` | none | send every request through this http proxy |
 | `with_env_proxy(on)` | false | take the proxy from `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` |
 | `with_tls_config(config)` | default roots | tls config for https origins; the caller closes it |
+| `with_max_response_header_bytes(n)` | `http.MAX_RESPONSE_HEADER_BYTES` (1 MiB) | the most a response head may hold |
+| `with_max_response_body_bytes(n)` | `http.MAX_RESPONSE_BODY` (64 MiB) | the most a buffered response body may hold, after gzip decoding |
 
 a request's own `with_timeout(ms)` replaces the client's `timeout_ms` for
 that request. a timeout fails with `http: client timeout exceeded`, or with
@@ -704,6 +706,18 @@ and `304` responses have no body. otherwise the body is chunked, has a
 `Content-Length`, or runs until the server closes the connection. interim
 `1xx` responses before the final one are skipped. trailer fields of a chunked
 body are returned in the response's `trailers`.
+
+a buffered response is bounded the way the server bounds a request. the head
+may hold `http.MAX_RESPONSE_HEADER_BYTES` (1 MiB, net/http's default) and the
+body `http.MAX_RESPONSE_BODY` (64 MiB), counted after gzip decoding. a
+`Content-Length` past the limit fails the request before any of the body is
+read. a chunked body, or one that runs until the server closes, fails as soon
+as it passes the limit. both fail with `http: response body exceeds the
+maximum`. `with_max_response_body_bytes(n)` sets the body limit for a client,
+and the same method on a `ClientRequest` sets it for one request; that is also
+how the one-shot helpers and `ClientConn` accept a larger body. a body
+streamed with `send_into` or `send_to_file` is written out as it arrives and
+has no limit.
 
 when compression is on, a request that names no `Accept-Encoding` asks for
 gzip, and a gzip body is decoded before it is returned. the decoded response
@@ -760,6 +774,6 @@ cidr ranges in `NO_PROXY` are not supported.
 compared with net/http, the client has no cookie jar, no http/2, no
 `CheckRedirect` hook, no limit on connections per host beyond the idle limit,
 no `Proxy-Authorization`, no socks or https proxies, and no streaming of a
-gzip body. a response body is read in full before `send` returns, or written
+gzip body. a response body is read in full (up to the body limit) before `send` returns, or written
 in full to the writer for `send_into`, so the client has no body stream that
 the caller closes.

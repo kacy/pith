@@ -385,8 +385,15 @@ pub(crate) unsafe fn release_element(tag: ListTypeTag, raw: i64) {
 /// unacceptable (pith_auto_len).
 #[inline]
 unsafe fn list_magic_ok(ptr: *const ()) -> bool {
+    list_magic_ok_for(ptr, crate::quarantine::Op::Use)
+}
+
+/// `list_magic_ok`, naming what the caller does with the list in a
+/// quarantine report.
+#[inline(always)]
+unsafe fn list_magic_ok_for(ptr: *const (), op: crate::quarantine::Op) -> bool {
     handle_registry::plausibly_aligned::<ListImpl>(ptr)
-        && (*(ptr as *const ListImpl)).magic == LIST_MAGIC
+        && crate::quarantine::magic_is(std::ptr::addr_of!((*(ptr as *const ListImpl)).magic), LIST_MAGIC, op)
 }
 
 unsafe fn list_ref<'a>(list: PithList) -> Option<&'a ListImpl> {
@@ -1411,9 +1418,10 @@ pub unsafe extern "C" fn pith_list_reverse(list: PithList) {
 /// Release list and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_release(list: PithList) {
-    let Some(impl_ref) = list_mut(list) else {
+    if !list_magic_ok_for(list.ptr as *const (), crate::quarantine::Op::Release) {
         return;
-    };
+    }
+    let impl_ref = &mut *(list.ptr as *mut ListImpl);
     // cycle-gc suspect hook, before our count is given up: while we still
     // hold it the list cannot die under the hook (see `maybe_suspect_struct`
     // in runtime_core for why the ordering matters).
@@ -1429,6 +1437,7 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
         return;
     }
     if prev == 0 {
+        crate::quarantine::over_release(crate::quarantine::Kind::List);
         // over-release: put the count back and refuse to double-free
         impl_ref.rc.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
@@ -1457,7 +1466,7 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
         crate::cycle::graveyard_defer(list.ptr as usize, crate::cycle::CYCLE_KIND_LIST);
         return;
     }
-    let _ = Box::from_raw(list.ptr as *mut ListImpl);
+    drop_list_shell(list.ptr as *mut ListImpl);
 }
 
 /// Mark a list as a cycle suspect and hand it to the buffer. Cold and
@@ -1586,21 +1595,29 @@ pub(crate) unsafe fn cycle_list_free_dead(handle: i64) {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_LIST);
         return;
     }
-    drop(Box::from_raw(handle as *mut ListImpl));
+    drop_list_shell(handle as *mut ListImpl);
 }
 
 /// Drop a list shell the graveyard parked: elements already released, magic
 /// already scrubbed, registry entry already gone; only the box remains.
 pub(crate) unsafe fn cycle_drop_list_shell(ptr: usize) {
-    drop(Box::from_raw(ptr as *mut ListImpl));
+    drop_list_shell(ptr as *mut ListImpl);
+}
+
+/// Free a dead list's box, or quarantine it.
+unsafe fn drop_list_shell(ptr: *mut ListImpl) {
+    let magic = std::ptr::addr_of_mut!((*ptr).magic);
+    if !crate::quarantine::bury_box(ptr, magic, crate::quarantine::Kind::List) {
+        drop(Box::from_raw(ptr));
+    }
 }
 
 /// Retain a list handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_retain_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_LIST_RETAIN);
-    if let Some(impl_ref) = list_mut_from_handle(handle) {
-        impl_ref
+    if list_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) {
+        (*(handle as *const ListImpl))
             .rc
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }

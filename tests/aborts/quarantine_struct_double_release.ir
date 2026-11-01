@@ -1,0 +1,16 @@
+; a second release of a struct whose last count is already gone, under
+; PITH_QUARANTINE=1. without quarantine the first release hands the block
+; to the struct pool, and the second lands on whatever value takes it next.
+string m0s0 "released once"
+func main 0 void
+iconst 1 5
+iconst 2 1
+call 3 pith_struct_alloc struct:Cell 1 2
+sstore 3 0 1
+call 4 pith_struct_release void 1 3
+strref 5 m0s0
+call 6 pith_print_cstr unknown 1 5
+call 7 pith_struct_release void 1 3
+iconst 8 0
+ret 8
+endfunc

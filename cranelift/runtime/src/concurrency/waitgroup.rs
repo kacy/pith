@@ -86,7 +86,15 @@ fn block_on_wait<'a>(
             state.green_waiters.push(id);
             drop(state);
             green::park_current(id);
-            lock_state(lock)
+            let mut state = lock_state(lock);
+            // the `done()` that meant us drained our entry. one that is still
+            // there means this wake came from elsewhere; left behind, the
+            // re-park would register the task twice and the drain would wake
+            // it twice.
+            if let Some(pos) = state.green_waiters.iter().rposition(|&waiter| waiter == id) {
+                state.green_waiters.remove(pos);
+            }
+            state
         }
     }
 }
@@ -157,6 +165,12 @@ pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
     while guard.count > 0 {
         guard = block_on_wait(lock, cvar, guard, green_task);
     }
+}
+
+/// how many green waiter entries the waitgroup lists.
+#[cfg(test)]
+pub(crate) unsafe fn green_waiters_for_tests(handle: *mut PithWaitGroupHandle) -> usize {
+    waitgroup_ref(handle).map_or(0, |wg| lock_state(&wg.0).green_waiters.len())
 }
 
 #[cfg(test)]

@@ -367,24 +367,42 @@ fn add_thread(re: Regex, list_pcs: List[Int], list_slots: List[List[Int]], seen:
     list_pcs.push(pc)
     list_slots.push(slots)
 
-# run the vm from one starting offset. returns capture slots or an
-# empty list when no match starts here.
+# run the vm once from `start` to the end of the input. a fresh thread
+# enters at pc 0 at every character boundary until a match is recorded,
+# with lower priority than every thread already running, so the threads
+# from an earlier start always win. this is the unanchored search that
+# re2 and go use: one pass over the input instead of one pass per start
+# offset. returns the capture slots of the leftmost-first match, or an
+# empty list.
+#
+# a start inside a multi-byte character is skipped: its match would fail
+# slots_aligned anyway.
 fn run_from(re: Regex, input: String, start: Int) -> List[Int]:
     mut cur_pcs: List[Int] := []
     mut cur_slots: List[List[Int]] := []
     mut seen: Set[Int] := {}
-    mut init: List[Int] := []
     n := input.len()
-    add_thread(re, cur_pcs, cur_slots, seen, 0, init, start, n)
+    entry := entry_pcs(re)
     mut best: List[Int] := []
     mut pos := start
-    while cur_pcs.len() > 0:
-        mut next_pcs: List[Int] := []
-        mut next_slots: List[List[Int]] := []
-        mut next_seen: Set[Int] := {}
+    while pos <= n:
         mut code := 0 - 1
         if pos < n:
             code = ord(input[pos])
+        # a continuation byte (0x80-0xbf) is not a character boundary
+        if best.len() == 0 and (code < 128 or code >= 192) and not all_seen(seen, entry):
+            mut init: List[Int] := []
+            add_thread(re, cur_pcs, cur_slots, seen, 0, init, pos, n)
+        if cur_pcs.len() == 0:
+            if best.len() > 0:
+                return best
+            # no thread survived: move on without building empty lists
+            seen.clear()
+            pos = pos + 1
+            continue
+        mut next_pcs: List[Int] := []
+        mut next_slots: List[List[Int]] := []
+        mut next_seen: Set[Int] := {}
         mut thread_index := 0
         mut matched_this_round := false
         while thread_index < cur_pcs.len() and not matched_this_round:
@@ -407,10 +425,54 @@ fn run_from(re: Regex, input: String, start: Int) -> List[Int]:
             thread_index = thread_index + 1
         cur_pcs = next_pcs
         cur_slots = next_slots
+        seen = next_seen
         pos = pos + 1
-        if pos > n and cur_pcs.len() == 0:
-            return best
     return best
+
+# the instructions that consume input or match, reachable from pc 0
+# through control instructions. a new start whose every one of these
+# already holds a thread would only be dropped as a duplicate.
+fn entry_pcs(re: Regex) -> List[Int]:
+    mut out: List[Int] := []
+    mut visited: Set[Int] := {}
+    collect_entry(re, 0, visited, out)
+    return out
+
+fn collect_entry(re: Regex, pc: Int, visited: Set[Int], out: List[Int]):
+    if visited.contains(pc):
+        return
+    visited.add(pc)
+    inst := re.insts[pc]
+    if inst.op == OP_JMP:
+        collect_entry(re, inst.a, visited, out)
+    elif inst.op == OP_SPLIT:
+        collect_entry(re, inst.a, visited, out)
+        collect_entry(re, inst.b, visited, out)
+    elif inst.op == OP_SAVE or inst.op == OP_BOL or inst.op == OP_EOL:
+        collect_entry(re, pc + 1, visited, out)
+    else:
+        out.push(pc)
+
+fn all_seen(seen: Set[Int], pcs: List[Int]) -> Bool:
+    for pc in pcs:
+        if not seen.contains(pc):
+            return false
+    return true
+
+# the leftmost match at or after `start` whose offsets all fall on
+# character boundaries. a match that cuts a character is rejected and the
+# search resumes one byte past its start, which is what trying each start
+# offset in turn would have found.
+fn search(re: Regex, input: String, start: Int) -> List[Int]:
+    mut at := start
+    while at <= input.len():
+        slots := run_from(re, input, at)
+        if slots.len() < 2:
+            return []
+        if slots_aligned(input, slots):
+            return slots
+        at = slots[0] + 1
+    return []
 
 # true when `at` is where a character starts.
 fn on_boundary(input: String, at: Int) -> Bool:
@@ -448,50 +510,43 @@ impl Regex:
 
     ## the leftmost match, or none.
     pub fn find(input: String) -> Match?:
-        mut start := 0
-        while start <= input.len():
-            slots := run_from(self, input, start)
-            if slots.len() >= 2 and slots_aligned(input, slots):
-                return Match(slots[0], slots[1], input.substring(slots[0], slots[1]))
-            start = start + 1
-        return none
+        slots := search(self, input, 0)
+        if slots.len() < 2:
+            return none
+        return Match(slots[0], slots[1], input.substring(slots[0], slots[1]))
 
     ## capture groups of the leftmost match: index 0 is the whole
     ## match, then one entry per group (empty string when unmatched).
     pub fn captures(input: String) -> List[String]?:
-        mut start := 0
-        while start <= input.len():
-            slots := run_from(self, input, start)
-            if slots.len() >= 2 and slots_aligned(input, slots):
-                mut out: List[String] := []
-                mut g := 0
-                while g < self.ngroups:
-                    lo_i := g * 2
-                    hi_i := g * 2 + 1
-                    if hi_i < slots.len() and slots[lo_i] >= 0 and slots[hi_i] >= slots[lo_i]:
-                        out.push(input.substring(slots[lo_i], slots[hi_i]))
-                    else:
-                        out.push("")
-                    g = g + 1
-                return out
-            start = start + 1
-        return none
+        slots := search(self, input, 0)
+        if slots.len() < 2:
+            return none
+        mut out: List[String] := []
+        mut g := 0
+        while g < self.ngroups:
+            lo_i := g * 2
+            hi_i := g * 2 + 1
+            if hi_i < slots.len() and slots[lo_i] >= 0 and slots[hi_i] >= slots[lo_i]:
+                out.push(input.substring(slots[lo_i], slots[hi_i]))
+            else:
+                out.push("")
+            g = g + 1
+        return out
 
     ## every non-overlapping match, left to right.
     pub fn find_all(input: String) -> List[Match]:
         mut out: List[Match] := []
         mut start := 0
         while start <= input.len():
-            slots := run_from(self, input, start)
-            if slots.len() >= 2 and slots_aligned(input, slots):
-                stop := slots[1]
-                out.push(Match(slots[0], stop, input.substring(slots[0], stop)))
-                if stop == slots[0]:
-                    start = stop + 1
-                else:
-                    start = stop
+            slots := search(self, input, start)
+            if slots.len() < 2:
+                return out
+            stop := slots[1]
+            out.push(Match(slots[0], stop, input.substring(slots[0], stop)))
+            if stop == slots[0]:
+                start = stop + 1
             else:
-                start = start + 1
+                start = stop
         return out
 
     ## replace every match with the replacement text.

@@ -77,9 +77,17 @@ pub const CSTRING_STATIC_MAGIC: u32 = CSTRING_MAGIC | 1;
 const CSTRING_HEADER_SIZE: usize = 16;
 const CSTRING_ALIGN: usize = 8;
 
-/// One shared empty string. It has no header, so retain/release skip it,
-/// which is exactly right for a value that is never freed.
-static CSTRING_EMPTY: &[u8] = b"\0";
+/// One shared empty string, laid out like a compiled literal so that every
+/// header probe finds the literal magic and leaves it alone. Without a header
+/// the probe read the 16 bytes in front of it, which belong to whatever static
+/// the linker put there: harmless only while those bytes did not happen to
+/// spell a heap magic, at which point a retain would have written into rodata.
+static CSTRING_EMPTY: StaticChar = StaticChar {
+    magic: CSTRING_STATIC_MAGIC,
+    zero: 0,
+    len: 0,
+    bytes: [0; 8],
+};
 
 /// The allocation size for a string of `data_len` bytes: the header, the
 /// data and its NUL, rounded up to a size class. The size is a function of
@@ -159,7 +167,8 @@ pub fn report_leaked_cstrings() {
 // that count, sample and debug live out of line.
 const CSTRING_HOOKS: u8 = crate::switches::PERF_STATS
     | crate::switches::ALLOC_SITES
-    | crate::switches::CSTRING_DEBUG;
+    | crate::switches::CSTRING_DEBUG
+    | crate::switches::QUARANTINE;
 
 /// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
 /// trailing NUL already written. The caller fills bytes 0..data_len.
@@ -206,6 +215,14 @@ unsafe fn alloc_cstring<const HOOKED: bool>(data_len: usize) -> *mut i8 {
 /// of the 16 bytes in front of it (mapped binary data) and fails the magic
 /// compare. Same practical-guard contract as the collection magic words.
 pub(crate) unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
+    cstring_base_for::<true>(s, crate::quarantine::Op::Use)
+}
+
+/// `cstring_base`, naming what the caller does with the string in a
+/// quarantine report. A count path that already knows quarantine is off
+/// passes `REPORT = false` and skips the freed-magic test.
+#[inline(always)]
+unsafe fn cstring_base_for<const REPORT: bool>(s: *const i8, op: crate::quarantine::Op) -> Option<*mut u8> {
     let addr = s as usize;
     if addr < CSTRING_HEADER_SIZE || addr % CSTRING_ALIGN != 0 {
         return None;
@@ -215,7 +232,11 @@ pub(crate) unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
     // once the compiler can see the pointer (a runtime literal, inlined into
     // a caller), a plain read lets it assume the magic matched and write a
     // count into read-only data.
-    if std::ptr::read_volatile(base as *const u32) != CSTRING_MAGIC {
+    let magic = std::ptr::read_volatile(base as *const u32);
+    if magic != CSTRING_MAGIC {
+        if REPORT {
+            crate::quarantine::miss(magic, base as *const u32, op);
+        }
         return None;
     }
     Some(base)
@@ -231,7 +252,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
     if crate::switches::any(CSTRING_HOOKS) {
         return cstring_retain_hooked(s);
     }
-    if let Some(base) = cstring_base(s) {
+    if let Some(base) = cstring_base_for::<false>(s, crate::quarantine::Op::Retain) {
         cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -239,7 +260,7 @@ pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
 #[cold]
 #[inline(never)]
 unsafe fn cstring_retain_hooked(s: *const i8) {
-    if let Some(base) = cstring_base(s) {
+    if let Some(base) = cstring_base_for::<true>(s, crate::quarantine::Op::Retain) {
         crate::perf_count(&crate::PERF_CSTRING_RETAINS, 1);
         let prev = cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
         cstring_watch(base, s, "retain", prev as i64, 1);
@@ -285,7 +306,7 @@ unsafe fn cstring_release_hooked(s: *const i8) {
 
 #[inline(always)]
 unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
-    if let Some(base) = cstring_base(s) {
+    if let Some(base) = cstring_base_for::<HOOKED>(s, crate::quarantine::Op::Release) {
         if HOOKED {
             crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
         }
@@ -297,6 +318,9 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
             // an over-release means the emitter's ownership accounting is
             // wrong somewhere; report it loudly in debug runs instead of
             // corrupting the heap.
+            if HOOKED {
+                crate::quarantine::over_release(crate::quarantine::Kind::String);
+            }
             if HOOKED && cstring_debug_no_free() {
                 let data_len = cstring_data_len(base);
                 let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(60));
@@ -331,10 +355,14 @@ unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
                 return;
             }
             let data_len = cstring_data_len(base);
-            (base as *mut u32).write(0);
             if HOOKED {
                 crate::perf_count(&crate::PERF_CSTRING_FREES, 1);
+                let size = cstring_alloc_size(data_len);
+                if crate::quarantine::bury(base, size, base as *mut u32, crate::quarantine::Kind::String) {
+                    return;
+                }
             }
+            (base as *mut u32).write(0);
             std::alloc::dealloc(base, cstring_layout(data_len));
         }
     }
@@ -407,6 +435,17 @@ pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
     Some(cstring_data_len(base) as i64)
 }
 
+/// Under quarantine, report `s` if it is a freed heap string. A reader whose
+/// header lookup failed calls this before it falls back to counting bytes,
+/// which keeps the test off the header path every heap string takes.
+#[cold]
+#[inline(never)]
+pub(crate) unsafe fn cstring_check_freed(s: *const i8) {
+    if crate::quarantine::on() {
+        cstring_base(s);
+    }
+}
+
 /// Debug: release with an emission-site id; prints the site when the traced
 /// string takes its final release.
 #[no_mangle]
@@ -450,7 +489,7 @@ pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
 }
 
 pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
-    CSTRING_EMPTY.as_ptr() as *mut i8
+    CSTRING_EMPTY.bytes.as_ptr() as *mut i8
 }
 
 pub const PITH_CLOSURE_ENV_SLOTS: usize = 16;
@@ -675,11 +714,20 @@ impl PithClosure {
 /// Same practical-guard contract as the string and struct magic words:
 /// a stale pointer whose magic was scrubbed on free reads as invalid.
 unsafe fn closure_base<'a>(handle: i64) -> Option<&'a PithClosure> {
+    closure_base_for(handle, crate::quarantine::Op::Use)
+}
+
+/// `closure_base`, naming what the caller does with the closure in a
+/// quarantine report.
+#[inline(always)]
+unsafe fn closure_base_for<'a>(handle: i64, op: crate::quarantine::Op) -> Option<&'a PithClosure> {
     if handle == 0 || (handle as u64) % 8 != 0 {
         return None;
     }
     let ptr = handle as *const PithClosure;
-    if (ptr as *const u32).read() != CLOSURE_MAGIC {
+    let magic = (ptr as *const u32).read();
+    if magic != CLOSURE_MAGIC {
+        crate::quarantine::miss(magic, ptr as *const u32, op);
         return None;
     }
     Some(&*ptr)
@@ -761,6 +809,10 @@ fn closure_pool_take() -> *mut u8 {
 unsafe fn closure_free_shell(handle: i64) {
     let ptr = handle as *mut PithClosure;
     std::ptr::drop_in_place(&mut (*ptr).overflow);
+    let size = std::mem::size_of::<PithClosure>();
+    if crate::quarantine::bury(ptr as *mut u8, size, ptr as *mut u32, crate::quarantine::Kind::Closure) {
+        return;
+    }
     if struct_pool_enabled() {
         let slot = pool_slot();
         if !slot.is_null() && (*slot).closures.len() < CLOSURE_POOL_CAP {
@@ -778,7 +830,7 @@ unsafe fn closure_free_shell(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RETAIN);
-    if let Some(closure) = closure_base(handle) {
+    if let Some(closure) = closure_base_for(handle, crate::quarantine::Op::Retain) {
         closure
             .ref_count
             .fetch_add(1, Ordering::Relaxed);
@@ -794,7 +846,7 @@ pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RELEASE);
-    let Some(closure) = closure_base(handle) else {
+    let Some(closure) = closure_base_for(handle, crate::quarantine::Op::Release) else {
         return;
     };
     // cycle-gc suspect hook, before our count is given up: while we still
@@ -825,6 +877,7 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
         return;
     }
     if prev <= 0 {
+        crate::quarantine::over_release(crate::quarantine::Kind::Closure);
         // over-release: restore and leave it alone
         closure
             .ref_count
@@ -979,7 +1032,10 @@ pub(crate) unsafe fn cycle_closure_free_dead(handle: i64) {
 /// Drop a closure shell the graveyard parked. The magic is already scrubbed
 /// and the captures already released, so only the box itself remains.
 pub(crate) unsafe fn cycle_drop_closure_shell(ptr: usize) {
-    drop(Box::from_raw(ptr as *mut PithClosure));
+    let closure = ptr as *mut PithClosure;
+    if !crate::quarantine::bury_box(closure, closure as *mut u32, crate::quarantine::Kind::Closure) {
+        drop(Box::from_raw(closure));
+    }
 }
 
 #[cfg(test)]
@@ -1157,6 +1213,18 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_empty_string_carries_a_literal_header() {
+        unsafe {
+            let empty = pith_cstring_empty();
+            assert_eq!(cstring_header_len(empty), Some(0));
+            assert!(cstring_base(empty).is_none(), "never counted or freed");
+            pith_cstring_retain(empty);
+            pith_cstring_release(empty);
+            assert_eq!(crate::string::pith_cstring_len(empty), 0);
+        }
+    }
+
+    #[test]
     fn appending_a_string_to_itself_copies() {
         unsafe {
             let s = pith_copy_bytes_to_cstring(b"xy");
@@ -1270,12 +1338,15 @@ mod tests {
             pith_struct_weak_retain(s);
             assert_eq!(struct_counts(s), (1, 2)); // implicit + one weak
 
-            // the target is alive: a weak read returns the pointer
-            assert_eq!(pith_struct_weak_load(s), s);
+            // the target is alive: an upgrade returns the pointer with a
+            // count of its own
+            assert_eq!(pith_struct_weak_upgrade(s), s);
+            assert_eq!(struct_counts(s), (2, 2));
+            pith_struct_release(s);
 
             // drop the only strong owner: value dies, header stays (weak > 0)
             pith_struct_release(s);
-            assert_eq!(pith_struct_weak_load(s), 0); // dead -> none
+            assert_eq!(pith_struct_weak_upgrade(s), 0); // dead -> none
 
             // dropping the last weak frees the header
             pith_struct_weak_release(s);
@@ -1287,17 +1358,18 @@ mod tests {
     // on. the dead flag is an atomic for exactly this shape; the join gives the
     // load a happens-after edge, so it must observe the death.
     #[test]
-    fn weak_load_sees_a_release_from_another_thread() {
+    fn weak_upgrade_sees_a_release_from_another_thread() {
         unsafe {
             let s = pith_struct_alloc(1);
             pith_struct_weak_retain(s);
-            assert_eq!(pith_struct_weak_load(s), s);
+            assert_eq!(pith_struct_weak_upgrade(s), s);
+            pith_struct_release(s);
 
             std::thread::spawn(move || pith_struct_release(s))
                 .join()
                 .expect("releasing thread panicked");
 
-            assert_eq!(pith_struct_weak_load(s), 0);
+            assert_eq!(pith_struct_weak_upgrade(s), 0);
             pith_struct_weak_release(s);
         }
     }
@@ -1388,6 +1460,42 @@ mod tests {
 
     static WEAK_TAKEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+    /// a destructor that tries to upgrade a weak reference to its own value.
+    unsafe extern "C" fn self_upgrading_dtor(ptr: i64) {
+        SELF_UPGRADE.store(pith_struct_weak_upgrade(ptr), Ordering::SeqCst);
+    }
+
+    static SELF_UPGRADE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+    #[test]
+    fn an_upgrade_during_the_destructor_reads_none() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_weak_retain(s);
+            pith_struct_set_dtor(s, self_upgrading_dtor as usize as i64);
+            pith_struct_release(s);
+            assert_eq!(SELF_UPGRADE.load(Ordering::SeqCst), 0, "a dying value is not revived");
+            assert_eq!(pith_struct_weak_upgrade(s), 0);
+            pith_struct_weak_release(s);
+        }
+    }
+
+    #[test]
+    fn a_retain_of_a_dead_struct_is_refused() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_weak_retain(s);
+            pith_struct_release(s); // dead; the weak reference keeps the header
+            let counts = struct_counts(s);
+            pith_struct_retain(s);
+            assert_eq!(struct_counts(s), counts, "no count taken on a dead value");
+            // the stray retain's release lands on the over-release guard
+            pith_struct_release(s);
+            assert_eq!(struct_counts(s), counts);
+            pith_struct_weak_release(s);
+        }
+    }
+
     #[test]
     fn a_sole_owner_release_runs_the_destructor_once() {
         unsafe {
@@ -1409,7 +1517,7 @@ mod tests {
             assert_eq!(WEAK_TAKEN.load(Ordering::SeqCst), s);
             // the header outlives the value for the weak reference
             assert_eq!(struct_counts(s).1, 1);
-            assert_eq!(pith_struct_weak_load(s), 0);
+            assert_eq!(pith_struct_weak_upgrade(s), 0);
             pith_struct_weak_release(s);
         }
     }
@@ -1431,13 +1539,13 @@ mod tests {
     }
 
     #[test]
-    fn weak_load_on_a_dead_or_invalid_pointer_is_none() {
+    fn weak_upgrade_on_a_dead_or_invalid_pointer_is_none() {
         unsafe {
-            assert_eq!(pith_struct_weak_load(0), 0);
-            assert_eq!(pith_struct_weak_load(12345), 0);
+            assert_eq!(pith_struct_weak_upgrade(0), 0);
+            assert_eq!(pith_struct_weak_upgrade(12345), 0);
             let s = pith_struct_alloc(1);
             pith_struct_release(s); // fully freed, no weak refs
-            assert_eq!(pith_struct_weak_load(s), 0); // magic scrubbed -> none
+            assert_eq!(pith_struct_weak_upgrade(s), 0); // magic scrubbed -> none
         }
     }
 
@@ -3234,10 +3342,13 @@ static STRUCT_POOL_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::Atomi
 
 #[cold]
 fn struct_pool_probe() -> bool {
-    let enabled = !matches!(
-        std::env::var("PITH_STRUCT_FREELIST").as_deref(),
-        Ok("0") | Ok("off") | Ok("false")
-    );
+    // quarantine never hands a block back, so the pools would only ever be
+    // empty; turning them off says so
+    let enabled = !crate::quarantine::on()
+        && !matches!(
+            std::env::var("PITH_STRUCT_FREELIST").as_deref(),
+            Ok("0") | Ok("off") | Ok("false")
+        );
     STRUCT_POOL_STATE.store(
         if enabled { 2 } else { 1 },
         Ordering::Relaxed,
@@ -3560,6 +3671,10 @@ unsafe fn struct_weak(base: *mut u8) -> &'static AtomicU32 {
 // cannot erase a concurrent buffering; the alive test is `& STRUCT_DEAD_BIT`,
 // never `!= 0`.
 pub(crate) const STRUCT_DEAD_BIT: u32 = 1;
+/// the strong count a struct's destructor runs under (see `struct_release`).
+/// far above any real count, so `weak_upgrade` reads it as dying: the
+/// destructor's own balanced retains and releases move it by a few at most.
+pub(crate) const STRUCT_DTOR_GUARD: u32 = 1 << 31;
 pub(crate) const STRUCT_BUFFERED_BIT: u32 = 2;
 /// Set once the struct can be reached from more than one task (see
 /// `share.rs`); until then its counts are updated with plain loads and stores.
@@ -3569,6 +3684,9 @@ pub(crate) const STRUCT_SHARED_BIT: u32 = 4;
 /// mark inline and calls `pith_share_into` only for a shared one.
 pub const STRUCT_FLAGS_FROM_DATA: i32 = STRUCT_OFF_DEAD as i32 - STRUCT_HEADER as i32;
 pub const STRUCT_SHARED_MASK: u32 = STRUCT_SHARED_BIT;
+/// The dead bit in the same word, which a quarantine build tests before a
+/// field read (see `quarantine.rs`).
+pub const STRUCT_DEAD_MASK: u32 = STRUCT_DEAD_BIT;
 
 /// Add one to a struct count. A struct only one task can reach needs no
 /// locked instruction.
@@ -3637,7 +3755,7 @@ unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
     if struct_local(base, switches) {
         crate::share::check_local(switches, base.add(STRUCT_HEADER) as i64, "weak release");
         if count_down(weak, true) == 1 {
-            struct_free_header(base);
+            struct_free_header_for(base, switches);
         }
         return;
     }
@@ -3651,16 +3769,31 @@ unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
         }
         acquire_last_count!(weak);
     }
-    struct_free_header(base);
+    struct_free_header_for(base, switches);
 }
 
-/// Scrub and free (or pool) a struct header nothing references any more.
-unsafe fn struct_free_header(base: *mut u8) {
+/// `struct_free_header` with quarantine read from `switches`.
+unsafe fn struct_free_header_for(base: *mut u8, switches: u8) {
+    if switches & crate::switches::QUARANTINE != 0 {
+        struct_free_header::<true>(base);
+    } else {
+        struct_free_header::<false>(base);
+    }
+}
+
+/// Scrub and free (or pool) a struct header nothing references any more, or
+/// keep it poisoned under quarantine. A release that knows quarantine is off
+/// takes the `false` copy and pays nothing for it.
+unsafe fn struct_free_header<const QUARANTINE: bool>(base: *mut u8) {
     crate::share::forget_owner(base.add(STRUCT_HEADER) as i64);
     let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
+    let total = size + STRUCT_HEADER;
+    if QUARANTINE {
+        crate::quarantine::bury_now(base, total, base as *mut u32, crate::quarantine::Kind::Struct);
+        return;
+    }
     // scrub the magic so any stale pointer fails the check
     (base as *mut u32).write(0);
-    let total = size + STRUCT_HEADER;
     // keep the block on the per-thread freelist when it fits; otherwise free it.
     if !struct_pool_return(base, total) {
         std::alloc::dealloc(base, pith_layout(total, 8));
@@ -3712,14 +3845,46 @@ pub(crate) fn optional_pair(found: Option<i64>) -> crate::ffi_util::ResultPair {
 }
 
 unsafe fn struct_base(ptr: i64) -> Option<*mut u8> {
+    struct_base_for::<true>(ptr, crate::quarantine::Op::Use)
+}
+
+/// `struct_base`, naming what the caller does with the struct in a
+/// quarantine report. A count path that knows quarantine is off passes
+/// `REPORT = false` and skips the freed-magic test.
+#[inline(always)]
+unsafe fn struct_base_for<const REPORT: bool>(ptr: i64, op: crate::quarantine::Op) -> Option<*mut u8> {
     if ptr == 0 || (ptr as u64) % 8 != 0 {
         return None;
     }
     let base = (ptr as usize).checked_sub(STRUCT_HEADER)? as *mut u8;
-    if (base as *const u32).read() != STRUCT_MAGIC {
+    let magic = (base as *const u32).read();
+    if magic != STRUCT_MAGIC {
+        if REPORT {
+            crate::quarantine::miss(magic, base as *const u32, op);
+        }
         return None;
     }
     Some(base)
+}
+
+/// The struct check generated code makes under quarantine before it touches
+/// a field (see `quarantine::pith_quarantine_check_struct`).
+pub(crate) unsafe fn quarantine_check_struct(ptr: i64) {
+    let Some(base) = struct_base(ptr) else {
+        return;
+    };
+    if struct_flags(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+        crate::quarantine::dead_struct(crate::quarantine::Op::Use);
+    }
+}
+
+/// Under quarantine, a count operation on a struct whose value already died
+/// is reported, the same as one on a freed struct.
+#[inline(always)]
+unsafe fn quarantine_check_alive(base: *mut u8, op: crate::quarantine::Op) {
+    if crate::quarantine::on() && struct_flags(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+        crate::quarantine::dead_struct(op);
+    }
 }
 
 /// Attach a compiled destructor to a struct: called with the struct
@@ -3750,7 +3915,8 @@ pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
 // the switches that add work to a struct retain. with none of them on, the
 // retain calls nothing and needs no stack frame; the copy that counts and
 // checks lives out of line, so its calls cost the plain path nothing.
-const STRUCT_RETAIN_HOOKS: u8 = crate::switches::PERF_STATS | crate::switches::RC_CHECK;
+const STRUCT_RETAIN_HOOKS: u8 =
+    crate::switches::PERF_STATS | crate::switches::RC_CHECK | crate::switches::QUARANTINE;
 
 #[cold]
 #[inline(never)]
@@ -3763,8 +3929,19 @@ unsafe fn struct_retain<const HOOKED: bool>(ptr: i64, switches: u8) {
     if HOOKED {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RETAIN);
     }
-    if let Some(base) = struct_base(ptr) {
-        let local = struct_local(base, switches);
+    if let Some(base) = struct_base_for::<HOOKED>(ptr, crate::quarantine::Op::Retain) {
+        if HOOKED {
+            quarantine_check_alive(base, crate::quarantine::Op::Retain);
+        }
+        let flags = struct_flags(base).load(Ordering::Relaxed);
+        // a backstop: a value already destroyed is never revived. every weak
+        // read takes its count through `weak_upgrade`, so nothing should
+        // retain a dead struct; one that does gets no count, and its matching
+        // release lands on the over-release guard in `struct_release`.
+        if flags & STRUCT_DEAD_BIT != 0 {
+            return;
+        }
+        let local = switches & crate::switches::LOCAL_COUNTS != 0 && flags & STRUCT_SHARED_BIT == 0;
         if HOOKED && local {
             crate::share::check_local(switches, ptr, "retain");
         }
@@ -3808,8 +3985,10 @@ pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
 
 // the switches that add work to a struct release, kept out of line for the
 // same reason as the retain's
-const STRUCT_RELEASE_HOOKS: u8 =
-    crate::switches::PERF_STATS | crate::switches::RC_CHECK | crate::switches::CYCLE_GC;
+const STRUCT_RELEASE_HOOKS: u8 = crate::switches::PERF_STATS
+    | crate::switches::RC_CHECK
+    | crate::switches::CYCLE_GC
+    | crate::switches::QUARANTINE;
 
 #[cold]
 #[inline(never)]
@@ -3822,9 +4001,12 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     if HOOKED {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RELEASE);
     }
-    let Some(base) = struct_base(ptr) else {
+    let Some(base) = struct_base_for::<HOOKED>(ptr, crate::quarantine::Op::Release) else {
         return;
     };
+    if HOOKED {
+        quarantine_check_alive(base, crate::quarantine::Op::Release);
+    }
     let strong = struct_strong(base);
     // the sole owner of a struct that no weak reference holds is the only
     // party that can reach it: no other thread can retain, release or
@@ -3858,6 +4040,9 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
             return;
         }
         if prev == 0 {
+            if HOOKED {
+                crate::quarantine::over_release(crate::quarantine::Kind::Struct);
+            }
             // over-release: restore and leave the object alone
             strong.fetch_add(1, Ordering::Relaxed);
             return;
@@ -3870,12 +4055,16 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
         // or passes it along, which retains and releases the value. with the
         // count sitting at zero, that release would come back through here
         // and run the destructor a second time. so the body runs under a
-        // guard count of one, the same guard the cycle collector's teardown
-        // applies: every pair inside it balances back to one, and no release
-        // inside can reach zero. the value is freed below whatever the count
-        // reads afterwards; a `drop` that lets `self` escape leaves a
-        // dangling reference, which is documented rather than guarded.
-        strong.store(1, Ordering::Relaxed);
+        // guard count, as the cycle collector's teardown does: every pair
+        // inside it balances back to the guard, and no release inside can
+        // reach zero. the value is freed below whatever the count reads
+        // afterwards; a `drop` that lets `self` escape leaves a dangling
+        // reference, which is documented rather than guarded.
+        //
+        // the guard is `STRUCT_DTOR_GUARD` rather than one, so a weak upgrade
+        // racing the destructor can tell it from a live count and refuse it.
+        // the release store pairs with the acquire loads in `weak_upgrade`.
+        strong.store(STRUCT_DTOR_GUARD, Ordering::Release);
         // panic-guard: calling a compiler-emitted struct destructor from its header slot.
         let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
         f(ptr);
@@ -3887,7 +4076,11 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     // so the header is freed without setting it. a destructor that made a
     // weak reference, or a suspect buffer holding one, keeps the full path.
     if weak.load(Ordering::Acquire) == 1 {
-        struct_free_header(base);
+        if HOOKED {
+            struct_free_header_for(base, switches);
+        } else {
+            struct_free_header::<false>(base);
+        }
         return;
     }
     // the value is now dead; a weak read after this returns none. the release
@@ -3896,6 +4089,12 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     // buffered bit survives. then drop the implicit weak unit, which frees the
     // header if no weak refs remain. for a buffered struct the suspect
     // buffer's weak count keeps the header alive past this point.
+    if HOOKED && crate::quarantine::on() {
+        // a weak reference keeps the header, but the fields were released:
+        // poison them so a read through a stale pointer cannot pass for data
+        let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
+        std::ptr::write_bytes(base.add(STRUCT_HEADER), crate::quarantine::POISON, size);
+    }
     struct_flags(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
     struct_weak_drop(base, switches);
 }
@@ -4041,26 +4240,72 @@ pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
     }
 }
 
-/// Read a weak reference: returns the struct pointer if the target is still
-/// alive, or 0 if it has been released. Never dereferences dead field data:
-/// the header stays valid while any weak reference holds it, and the dead flag
-/// is set the instant the last strong owner goes away.
+/// Upgrade a weak reference: one more strong owner of the struct if it is
+/// still alive, returned to the caller, or 0 once its last owner is gone.
+/// The count is the caller's to release. Never dereferences dead field data:
+/// the header stays valid while any weak reference holds it.
+///
+/// Taking the count is what makes the read safe on a struct other threads
+/// can release. Checking liveness and retaining later left a window in which
+/// the last owner could drop it, and the reader then revived a value whose
+/// destructor had already run.
 ///
 /// # Safety
 /// ptr must be a pith_struct_alloc result, 0, or garbage (magic-checked).
 #[no_mangle]
-pub unsafe extern "C" fn pith_struct_weak_load(ptr: i64) -> i64 {
+pub unsafe extern "C" fn pith_struct_weak_upgrade(ptr: i64) -> i64 {
     let Some(base) = struct_base(ptr) else {
         return 0;
     };
-    // acquire pairs with the release fetch_or in `pith_struct_release`: a load
-    // that sees the target dead also sees its destructor's effects. test the
-    // death bit specifically: a live struct sitting in the cycle collector's
-    // suspect buffer has bit 1 set and must still read as alive.
-    if struct_flags(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
-        return 0;
+    let switches = crate::switches::get();
+    let upgraded = if struct_local(base, switches) {
+        // only the task that built it can reach a local struct, so nothing
+        // can release it between this check and the increment.
+        let strong = struct_strong(base);
+        let count = strong.load(Ordering::Relaxed);
+        let live = struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0
+            && count != 0
+            && count < STRUCT_DTOR_GUARD;
+        if live {
+            strong.store(count + 1, Ordering::Relaxed);
+        }
+        live
+    } else {
+        weak_upgrade(struct_strong(base), struct_flags(base))
+    };
+    if upgraded {
+        ptr
+    } else {
+        0
     }
-    ptr
+}
+
+/// The upgrade itself, on a struct's strong count and flag word: add one to
+/// the count only while it is a live one, in a single compare-and-swap, so a
+/// last release cannot slip between the check and the increment. 0 means the
+/// last owner is gone, `STRUCT_DTOR_GUARD` and above that the destructor is
+/// running, and the dead bit that the value is destroyed (the cycle
+/// collector frees a value whose count never reached 0). Generic over the
+/// atomic so the loom model runs this same function.
+#[inline]
+pub(crate) fn weak_upgrade<C: crate::sync::Count32>(strong: &C, flags: &C) -> bool {
+    // acquire on both: a load that sees the guard or the dead bit also sees
+    // the release that set it, and the struct's fields as its last owner
+    // left them. test the death bit specifically: a live struct sitting in
+    // the cycle collector's suspect buffer has bit 1 set and stays alive.
+    if flags.load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+        return false;
+    }
+    let mut count = strong.load(Ordering::Acquire);
+    loop {
+        if count == 0 || count >= STRUCT_DTOR_GUARD {
+            return false;
+        }
+        match strong.compare_exchange_weak(count, count + 1, Ordering::Acquire, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => count = current,
+        }
+    }
 }
 
 #[no_mangle]

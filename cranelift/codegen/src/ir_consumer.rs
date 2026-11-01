@@ -20,9 +20,9 @@ use pith_runtime::runtime_core::{
     CLOSURE_CYCLE_FLAGS_OFFSET, CLOSURE_ENV_OFFSET, CLOSURE_ENV_TAGS_OFFSET, CLOSURE_FUNC_PTR_OFFSET,
     CLOSURE_HANDLE_ALIGN, CLOSURE_MAGIC, CLOSURE_MAGIC_OFFSET, CLOSURE_OVERFLOW_OFFSET,
     CLOSURE_REF_COUNT_OFFSET, CLOSURE_SIZE,
-    PITH_CLOSURE_ENV_SLOTS, STRUCT_DEAD_OFFSET, STRUCT_DTOR_OFFSET, STRUCT_FLAGS_FROM_DATA,
-    STRUCT_HEADER, STRUCT_MAGIC, STRUCT_SHARED_MASK, STRUCT_SIZE_OFFSET, STRUCT_STRONG_OFFSET,
-    STRUCT_WEAK_OFFSET,
+    PITH_CLOSURE_ENV_SLOTS, STRUCT_DEAD_MASK, STRUCT_DEAD_OFFSET, STRUCT_DTOR_OFFSET,
+    STRUCT_FLAGS_FROM_DATA, STRUCT_HEADER, STRUCT_MAGIC, STRUCT_SHARED_MASK, STRUCT_SIZE_OFFSET,
+    STRUCT_STRONG_OFFSET, STRUCT_WEAK_OFFSET,
 };
 use pith_runtime::collections::list::{
     LIST_HANDLE_ALIGN, LIST_IMPL_ELEM_SIZE_OFFSET, LIST_IMPL_TYPE_TAG_OFFSET,
@@ -1327,6 +1327,43 @@ fn green_preempt_enabled() -> bool {
     preempt_from_env(std::env::var("PITH_GREEN_PREEMPT").ok().as_deref())
 }
 
+/// Whether this build checks generated code for a use after free, read from
+/// `PITH_QUARANTINE` when the program is compiled (the runtime reads the same
+/// variable when it runs; see its quarantine.rs). Such a build leaves out the
+/// inline fast paths, so every list, map, bytes and string read is a runtime
+/// call that validates its handle, and it tests the header of a struct before
+/// each field read or write. A default build emits none of this.
+fn quarantine_build() -> bool {
+    pith_runtime::quarantine::enabled_by(std::env::var("PITH_QUARANTINE").ok().as_deref())
+}
+
+/// The struct test a quarantine build makes before generated code touches a
+/// field of `obj`: a header that is not a live struct's (another magic, or
+/// the dead bit set) goes to the runtime, which reports a freed or dead
+/// struct and lets any other pointer through.
+fn emit_quarantine_struct_check(builder: &mut FunctionBuilder<'_>, check: FuncRef, obj: Value) {
+    let magic = builder
+        .ins()
+        .load(types::I32, MemFlags::new(), obj, -(STRUCT_HEADER as i32));
+    let flags = builder
+        .ins()
+        .load(types::I32, MemFlags::new(), obj, STRUCT_FLAGS_FROM_DATA);
+    let foreign = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, magic, STRUCT_MAGIC as i64);
+    let dead_bit = builder.ins().band_imm(flags, STRUCT_DEAD_MASK as i64);
+    let dead = builder.ins().icmp_imm(IntCC::NotEqual, dead_bit, 0);
+    let bad = builder.ins().bor(foreign, dead);
+    let slow = builder.create_block();
+    let done = builder.create_block();
+    builder.set_cold_block(slow);
+    builder.ins().brif(bad, slow, &[], done, &[]);
+    builder.switch_to_block(slow);
+    builder.ins().call(check, &[obj]);
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+}
+
 /// The sanitizer's checks for one 8-byte read and one 8-byte write, for a
 /// build linked against a sanitized runtime.
 #[derive(Clone, Copy)]
@@ -2533,8 +2570,10 @@ fn compile_ir_function(
     // calls compile to inline loads instead (see inline_list_get_opt). The map
     // carries each virtualized register's (is_some, value) pair for the field
     // reads that follow.
-    // a sanitized build takes the runtime calls the fast paths stand in for
-    let fast_paths = sanitize.is_none();
+    let quarantine = quarantine_build();
+    // a sanitized or a quarantine build takes the runtime calls the fast
+    // paths stand in for, so every read goes through a checked entry point
+    let fast_paths = sanitize.is_none() && !quarantine;
     let inline_opt_regs = if fast_paths { scan_unpackable_opt_regs(body_lines) } else { HashSet::new() };
     let mut virtual_opts: HashMap<usize, (Value, Value)> = HashMap::new();
 
@@ -3461,6 +3500,16 @@ fn compile_ir_function(
                     builder.switch_to_block(none_block);
                     jump_with_i64_arg(&mut builder, done, zero);
                     builder.switch_to_block(load_block);
+                    if quarantine {
+                        let check = runtime_func_ref(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            "pith_quarantine_check_struct",
+                        )?;
+                        emit_quarantine_struct_check(&mut builder, check, obj);
+                    }
                     emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, false, obj, 8);
                     let payload = builder.ins().load(types::I64, MemFlags::new(), obj, 8);
                     jump_with_i64_arg(&mut builder, done, payload);
@@ -3515,6 +3564,16 @@ fn compile_ir_function(
                         func_name, line
                     )));
                 };
+                if quarantine {
+                    let check = runtime_func_ref(
+                        codegen,
+                        &mut builder,
+                        &mut func_ref_cache,
+                        runtime_funcs,
+                        "pith_quarantine_check_struct",
+                    )?;
+                    emit_quarantine_struct_check(&mut builder, check, obj);
+                }
                 emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, false, obj, offset);
                 let raw = builder.ins().load(types::I64, MemFlags::new(), obj, offset);
                 let zero = builder.ins().iconst(types::I64, 0);
@@ -3647,6 +3706,16 @@ fn compile_ir_function(
                 })?;
                 let val = get_reg(&regs, parts[3])?;
                 let offset = field_idx * 8;
+                if quarantine {
+                    let check = runtime_func_ref(
+                        codegen,
+                        &mut builder,
+                        &mut func_ref_cache,
+                        runtime_funcs,
+                        "pith_quarantine_check_struct",
+                    )?;
+                    emit_quarantine_struct_check(&mut builder, check, struct_val);
+                }
                 emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, true, struct_val, offset);
                 builder.ins().store(MemFlags::new(), val, struct_val, offset);
             }

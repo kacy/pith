@@ -1,0 +1,23 @@
+; a list element read after the list's last release, under
+; PITH_QUARANTINE=1. a default build inlines `pith_list_get_value` as loads
+; of the list header with no magic check and no runtime call, so the read
+; goes through freed memory unseen. a quarantine build calls the runtime,
+; which finds the freed magic.
+string m0s0 "before:"
+func main 0 void
+call 1 pith_list_new_default list 0
+iconst 2 7
+call 3 pith_list_push_value void 2 1 2
+iconst 4 0
+call 5 pith_list_get_value int 2 1 4
+strref 6 m0s0
+call 7 int_to_string string 1 5
+concat 8 6 7
+call 9 pith_print_cstr unknown 1 8
+call 10 pith_list_release_handle void 1 1
+call 11 pith_list_get_value int 2 1 4
+call 12 int_to_string string 1 11
+call 13 pith_print_cstr unknown 1 12
+iconst 14 0
+ret 14
+endfunc

@@ -24,6 +24,7 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
         3 => "allocation failed",
         4 => "invalid allocation layout",
         5 => "call to a function the compiler could not resolve — a compiler bug, not a problem in your program",
+        6 => "value() on none",
         _ => "runtime error",
     };
     eprintln!("pith runtime error: {message}");

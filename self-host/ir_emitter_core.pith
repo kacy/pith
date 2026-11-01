@@ -7592,13 +7592,14 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 if mname == "to_string":
                     return ir_emit_result_to_string(node)
             if recv_info.kind == "optional" and mname == "value":
-                # unchecked extraction of the inner value (caller has verified
-                # the optional is Some); used by iterator adapters in std.iter.
+                # extraction of the inner value, for a caller that has checked
+                # the optional is Some; used by iterator adapters in std.iter.
                 # counted on exactly the terms the unwrap_or arm below uses:
                 # the payload leaves with a count of its own, so a bind, an
                 # argument position or an owned receiver may release it
                 # without touching the count its owner still needs.
                 obj_r := ir_expr(node.children[0])
+                ir_emit_optional_value_check(obj_r)
                 val_r := ir_optional_value_field(obj_r, recv_tid)
                 inner_kind := ir_rc_kind(ir_type_from_tid(recv_info.inner))
                 owns_subject := ir_optional_subject_is_owned(node.children[0])
@@ -8909,13 +8910,13 @@ fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: 
     ir_emit("jmp " + merge_l)
     ir_emit_label(none_l)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
-    ir_emit_index_miss_return()
+    ir_emit_miss_return("index out of bounds")
     ir_emit_label(merge_l)
     return unwrapped_r
 
-# the miss arm of an index inside a fallible function: fail the function with
-# "index out of bounds", or fail the test that is running.
-fn ir_emit_index_miss_return():
+# the miss arm of a check inside a fallible function: fail the function with
+# `message`, or fail the test that is running.
+fn ir_emit_miss_return(message: String):
     if ir_emit_tests and ir_emitting_test_func:
         ir_test_assert_fail_return()
     else:
@@ -8924,11 +8925,31 @@ fn ir_emit_index_miss_return():
         # without the cleanup every owned local leaked on an index miss.
         ir_defer_emit_to_function_frame(true)
         ir_emit_rc_cleanup("")
-        msg := ir_str("index out of bounds")
+        msg := ir_str(message)
         err_r := ir_reg()
         ir_emit("strref " + err_r.to_string() + " " + msg)
         ir_emit_main_error_report(err_r, true)
         ir_emit_ret_err_value(err_r)
+
+# `.value()` on a none stops with a runtime error, or fails a fallible
+# function the way an index miss does. a none is the null pointer, so there
+# is no shell to free on that path. the payload read used to run
+# unconditionally, handing back 0, "" or a null struct handle that faulted on
+# its first field read.
+fn ir_emit_optional_value_check(obj_r: Int):
+    flag_r := ir_optional_flag_field(obj_r)
+    some_l := ir_label()
+    none_l := ir_label()
+    ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
+    ir_emit_label(none_l)
+    if ir_current_func_returns_result:
+        ir_emit_miss_return("value() on none")
+    else:
+        code_r := ir_reg()
+        ir_emit("iconst " + code_r.to_string() + " 6")
+        ir_emit_call1(ir_reg(), "pith_runtime_error", "int", code_r)
+        ir_emit("jmp " + some_l)
+    ir_emit_label(some_l)
 
 # `xs[i] = v` inside a fallible function fails the function on a bad index,
 # the way `xs[i]` does. `owned_kind` is the kind of a value the store would
@@ -8952,7 +8973,7 @@ fn ir_emit_list_store_bounds_check(key_idx: Int, obj_r: Int, idx_r: Int, value_r
     if owned_kind.len() > 0:
         ir_rc_release_reg(value_r, owned_kind)
     ir_release_owned_index_key(key_idx, idx_r)
-    ir_emit_index_miss_return()
+    ir_emit_miss_return("index out of bounds")
     ir_emit_label(store_l)
 
 fn ir_index_get_opt_call_name(obj_type: String) -> String:
@@ -12748,7 +12769,8 @@ fn ir_append_lambda_bodies():
 
 # the text of every error a body synthesizes rather than reads from the
 # source: the "<name> failed" message of a sentinel builtin's wrapped
-# result, and the messages an index miss and a `?` on none propagate. no
+# result, and the messages an index miss, a `?` on none and a `.value()` on
+# none propagate. no
 # literal holds them, so the collector cannot see them, and a body that
 # interned one itself would add it after the table was written, where the
 # consumer reads it as a null string (#1147, #1109).
@@ -12757,6 +12779,7 @@ fn ir_preseed_synthesized_error_strings():
         ir_str(builtin_name + " failed")
     _index_id := ir_str("index out of bounds")
     _unwrap_id := ir_str("unwrap of none")
+    _value_id := ir_str("value() on none")
 
 fn ir_collect_root_import_metadata(root_idx: Int):
     ir_import_renames = {}

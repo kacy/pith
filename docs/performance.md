@@ -675,14 +675,16 @@ ledger 263 ms (go 384, rust 105, zig 131), channel fan-out green 72 ms
 sequential p50 134 µs. the grpc sweep's medians did not move (222 µs
 sequential against go's 234; 710 µs at 8 concurrent against 452), as
 expected for a steady-state client; five sweeps now show the pith client's
-8-concurrent throughput bimodal at an unchanged median (#1122).
+8-concurrent throughput bimodal at an unchanged median (#1122, later closed
+as specific to that two-core host).
 
 one harness finding, worth more than the numbers it spoiled: for about
 twenty seconds after the full `bench/generic_sort_bench.sh` sweep, the go
 and rust comparator binaries read 2× and 2.8× their quiet figures while
 the pith binary in the same probe reads its normal one. inside a chained
 run that inverts the catalog, pipeline and wrk ratios, and it did so on
-both passes before it was isolated (#1123). the rule in bench/README.md
+both passes before it was isolated (#1123, which did not reproduce on a later
+host and was closed as host-specific). the rule in bench/README.md
 stands: a comparator that does not reproduce its published figure means
 the run is discarded, whatever pith reads.
 

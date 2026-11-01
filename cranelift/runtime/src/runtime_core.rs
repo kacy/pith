@@ -3750,6 +3750,7 @@ unsafe fn struct_flags(base: *mut u8) -> &'static AtomicU32 {
 // drop one unit of weak; free the allocation when it reaches zero. this is the
 // single place a struct header is deallocated, so the strong path and every
 // weak reference funnel their final drop through here.
+#[inline]
 unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
     let weak = struct_weak(base);
     if struct_local(base, switches) {
@@ -3772,13 +3773,21 @@ unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
     struct_free_header_for(base, switches);
 }
 
-/// `struct_free_header` with quarantine read from `switches`.
+/// `struct_free_header` with quarantine read from `switches`. The quarantine
+/// copy stays out of line, so the free path keeps `struct_weak_drop` small
+/// enough to inline into its callers.
 unsafe fn struct_free_header_for(base: *mut u8, switches: u8) {
     if switches & crate::switches::QUARANTINE != 0 {
-        struct_free_header::<true>(base);
+        struct_free_header_quarantined(base);
     } else {
         struct_free_header::<false>(base);
     }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn struct_free_header_quarantined(base: *mut u8) {
+    struct_free_header::<true>(base);
 }
 
 /// Scrub and free (or pool) a struct header nothing references any more, or
@@ -3894,7 +3903,11 @@ unsafe fn quarantine_check_alive(base: *mut u8, op: crate::quarantine::Op) {
 /// ptr must be a pith_struct_alloc result; dtor a compiled fn(i64).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
-    if let Some(base) = struct_base(ptr) {
+    // generated code sets the destructor on a struct it has just allocated,
+    // or on an optional shell a runtime call has just returned, so the struct
+    // cannot have been freed yet. skipping the quarantine report keeps this
+    // path free of a stack frame.
+    if let Some(base) = struct_base_for::<false>(ptr, crate::quarantine::Op::Use) {
         (base.add(STRUCT_OFF_DTOR) as *mut u64).write(dtor as u64);
     }
 }

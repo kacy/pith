@@ -1624,6 +1624,55 @@ fn function_body<'a>(lines: &[&'a str], start: usize) -> (Vec<String>, Vec<&'a s
     (params, body, i)
 }
 
+/// The functions a program can run: those reachable from main and the
+/// startup functions its prologue calls, through any token of a body that
+/// names another function (a call, an rcall, a funcref, a closure). Only
+/// main is exported, so nothing else can reach the rest. The emitter writes
+/// bodies nobody calls: the unspecialized template of a generic method and
+/// the copy of a method for an instance that never calls it. Those may call
+/// what does not exist for their types, so they are not compiled at all.
+/// IR without a main (a consumer unit test) keeps every function.
+fn live_functions(lines: &[&str]) -> Option<HashSet<String>> {
+    let mut bodies: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let parts: Vec<&str> = lines[i].split_whitespace().collect();
+        if parts.len() < 2 || parts[0] != "func" {
+            i += 1;
+            continue;
+        }
+        let (_, body, next) = function_body(lines, i + 1);
+        // the first definition is the one compiled
+        bodies.entry(parts[1]).or_insert(body);
+        i = next;
+    }
+    if !bodies.contains_key("main") {
+        return None;
+    }
+    let mut work: Vec<&str> = bodies
+        .keys()
+        .copied()
+        .filter(|name| {
+            *name == "main"
+                || name.starts_with("__init_globals")
+                || name.contains("__cc_register_tracers")
+        })
+        .collect();
+    let mut live: HashSet<String> = work.iter().map(|name| name.to_string()).collect();
+    while let Some(name) = work.pop() {
+        for line in &bodies[name] {
+            for token in line.split_whitespace().skip(1) {
+                if let Some((&callee, _)) = bodies.get_key_value(token) {
+                    if live.insert(callee.to_string()) {
+                        work.push(callee);
+                    }
+                }
+            }
+        }
+    }
+    Some(live)
+}
+
 /// Compile IR text to native code via Cranelift
 pub fn compile_from_ir(
     codegen: &mut CodeGen,
@@ -1631,6 +1680,8 @@ pub fn compile_from_ir(
     runtime_funcs: &HashMap<String, FuncId>,
 ) -> Result<HashMap<String, FuncId>, CompileError> {
     let lines: Vec<&str> = ir_text.lines().collect();
+    let live = live_functions(&lines);
+    let is_live = |name: &str| live.as_ref().map_or(true, |set| set.contains(name));
     let mut declared_funcs: HashMap<String, FuncId> = HashMap::new();
     let mut string_data: Vec<(String, String)> = Vec::new();
     // the struct names (and aliases) the IR declares: a call to one is its
@@ -1729,7 +1780,7 @@ pub fn compile_from_ir(
             }
             "func" if parts.len() >= 4 => {
                 let name = parts[1];
-                if !declared_funcs.contains_key(name) {
+                if !declared_funcs.contains_key(name) && is_live(name) {
                     let nparam: usize = parts[2].parse().map_err(|_| {
                         CompileError::ModuleError(format!(
                             "IR consumer: invalid parameter count '{}' in function '{}'",
@@ -3370,25 +3421,13 @@ fn compile_ir_function(
                         );
                         regs.insert(reg, result);
                         kinds.clear(reg);
-                    } else if runtime_funcs.contains_key("pith_runtime_error") {
+                    } else {
                         // a call that resolves to nothing is a compiler bug
                         // upstream (a phantom import, a missed rename, an
-                        // unlowered interface dispatch). generic template
-                        // bodies keep dead unresolved calls, so this cannot
-                        // be a compile error yet, but a live path must fail
-                        // loudly instead of silently returning zero.
-                        let result = emit_runtime_error_value(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            5,
-                        )?;
-                        regs.insert(reg, result);
-                        kinds.clear(reg);
-                    } else {
-                        // no runtime registered (unit-test harness): keep the
-                        // strict answer.
+                        // unlowered interface dispatch, a driver built against
+                        // another runtime table). only functions main can reach
+                        // are compiled (see live_functions), so this call can
+                        // run and must not build.
                         return Err(CompileError::ModuleError(format!(
                             "ir consumer: call to unknown function '{}' in {}",
                             fname, func_name
@@ -4545,6 +4584,56 @@ mod tests {
     fn call_to_unknown_function_returns_compile_error() {
         let err = compile_err_for_ir("func main 0 int\ncall 1 vanished int 0\nendfunc\n");
         assert!(err.contains("call to unknown function 'vanished'"));
+    }
+
+    // with the runtime declared, a call nothing resolves used to compile to
+    // a runtime error trap. a function main reaches fails the build, naming
+    // the callee and the caller.
+    #[test]
+    fn live_unknown_call_with_runtime_is_a_compile_error() {
+        let err = compile_with_runtime_for_ir(
+            "func main 0 int\ncall 1 helper int 0\nret 1\nendfunc\n\
+             func helper 0 int\ncall 1 pith_no_such_runtime_fn int 0\nret 1\nendfunc\n",
+        )
+        .expect_err("a live unknown call must not build");
+        assert!(
+            err.contains("call to unknown function 'pith_no_such_runtime_fn' in helper"),
+            "{err}"
+        );
+    }
+
+    // a body nothing reaches, like the unspecialized template of a generic
+    // method, is not compiled, so what it calls does not matter.
+    #[test]
+    fn unreachable_function_with_unknown_call_is_skipped() {
+        compile_with_runtime_for_ir(
+            "func main 0 int\niconst 1 0\nret 1\nendfunc\n\
+             func Box__show 1 string\nparam self\nload 1 self\n\
+             call 2 to_string string 1 1\nret 2\nendfunc\n",
+        )
+        .expect("an unreachable body must not fail the build");
+    }
+
+    // reachability follows every name a body mentions, a funcref included,
+    // and starts from the startup functions main's prologue calls.
+    #[test]
+    fn functions_reached_by_reference_and_startup_stay_live() {
+        let ir = "func main 0 int\nfuncref 1 cb\nret 1\nendfunc\n\
+                  func cb 0 int\ncall 1 deep int 0\nret 1\nendfunc\n\
+                  func deep 0 int\niconst 1 0\nret 1\nendfunc\n\
+                  func __init_globals 0 int\niconst 1 0\nret 1\nendfunc\n\
+                  func m___cc_register_tracers_m0 0 int\niconst 1 0\nret 1\nendfunc\n\
+                  func dead 0 int\ncall 1 deader int 0\nret 1\nendfunc\n\
+                  func deader 0 int\niconst 1 0\nret 1\nendfunc\n";
+        let lines: Vec<&str> = ir.lines().collect();
+        let live = live_functions(&lines).expect("main is present");
+        let mut names: Vec<&str> = live.iter().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["__init_globals", "cb", "deep", "m___cc_register_tracers_m0", "main"]
+        );
+        assert!(live_functions(&["func helper 0 int", "endfunc"]).is_none());
     }
 
     // every IR-declared function returns i64, so only the runtime table can

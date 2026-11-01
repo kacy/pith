@@ -1767,6 +1767,18 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -eq 0 ] && echo "$$out" | grep -q "skips ... skipped (not today)" && echo "$$out" | grep -q "1 passed, 0 failed, 1 skipped"; then pass=$$((pass+1)); echo "ok   skip_test skips a test without failing the run"; else echo "FAIL skip_test"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'func main 0 int\ncall 1 helper int 0\nret 1\nendfunc\nfunc helper 0 int\ncall 1 pith_no_such_runtime_fn int 0\nret 1\nendfunc\n' > "$$tmpdir/unknown_call.ir"; \
+	set +e; \
+	out=$$(./target/release/pith build-ir "$$tmpdir/unknown_call.ir" "$$tmpdir/unknown_call" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "call to unknown function 'pith_no_such_runtime_fn' in helper" && [ ! -e "$$tmpdir/unknown_call" ]; then pass=$$((pass+1)); echo "ok   unknown runtime call fails the build"; else echo "FAIL unknown runtime call"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'func main 0 int\niconst 1 0\nret 1\nendfunc\nfunc unused 0 int\ncall 1 pith_no_such_runtime_fn int 0\nret 1\nendfunc\n' > "$$tmpdir/dead_call.ir"; \
+	set +e; \
+	out=$$(./target/release/pith build-ir "$$tmpdir/dead_call.ir" "$$tmpdir/dead_call" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ -x "$$tmpdir/dead_call" ]; then pass=$$((pass+1)); echo "ok   unreachable unknown call builds"; else echo "FAIL unreachable unknown call"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

@@ -1869,6 +1869,13 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unknown option '--fliter' for test"; then pass=$$((pass+1)); echo "ok   test refuses an unknown option"; else echo "FAIL test unknown option"; echo "$$out"; fail=$$((fail+1)); fi; \
+	for cmd in run build check; do \
+		set +e; \
+		out=$$(./target/release/pith $$cmd "$$tmpdir/missing.pith" 2>&1); \
+		status=$$?; \
+		set -e; \
+		if [ $$status -ne 0 ] && echo "$$out" | grep -qi "error.*read.*$$tmpdir/missing.pith" && ! echo "$$out" | grep -q "compiler bug"; then pass=$$((pass+1)); echo "ok   $$cmd names a missing file"; else echo "FAIL $$cmd missing file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	done; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

@@ -107,7 +107,11 @@ fn cmd_test(path: String, extra: List[String]) -> String!:
 # ---------------------------------------------------------------
 
 fn cmd_check(path: String, json_mode: Bool) -> String!:
-    source := read_file(path)!
+    # read_file's error does not name the file
+    source := read_file(path) catch:
+        print_err("error: cannot read " + path)
+        exit(1)
+        return ""
     outcome := run_check_pipeline(path)!
 
     if not outcome.parse_ok:
@@ -485,5 +489,10 @@ fn run_cli() -> String!:
 
     return ""
 
+# an error that nothing below handled fails the command with a message
+# and status 1
 fn main():
-    run_cli()
+    result := run_cli()
+    if result.is_err:
+        print_err("error: " + result.err)
+        exit(1)

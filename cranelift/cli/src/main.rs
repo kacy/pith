@@ -609,9 +609,20 @@ fn validate_combined_ir_contract(ir_text: &str) -> Result<(), String> {
 }
 
 fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), String> {
+    // the ir driver says nothing when it cannot read its input, which would
+    // be reported as a compiler bug, so a missing file is caught here
+    check_readable_file(path).map_err(|e| format!("Error reading {}: {}", path, e))?;
     let ir_text =
         get_ir_from_compiler(path, emit_tests).map_err(|e| format!("Error getting IR: {}", e))?;
     object_from_ir(&ir_text)
+}
+
+/// Ok when `path` is a regular file this process can open for reading.
+fn check_readable_file(path: &str) -> std::io::Result<()> {
+    if fs::File::open(path)?.metadata()?.is_dir() {
+        return Err(std::io::ErrorKind::IsADirectory.into());
+    }
+    Ok(())
 }
 
 fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
@@ -839,7 +850,7 @@ fn delegate_to_frontend(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_exe_path, driver_abi_path, file_args, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
+        check_readable_file, default_exe_path, driver_abi_path, file_args, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
         object_from_ir, seed_runtime_abi, validate_combined_ir_contract, RUNTIME_ABI,
     };
     use std::fs;
@@ -962,5 +973,19 @@ mod tests {
         assert_eq!(err(&["a.pith", "--release"], true), "unknown option '--release' for build");
         assert_eq!(err(&["a.pith", "-o", "x"], false), "unknown option '-o' for build");
         assert_eq!(err(&["a.pith", "b.pith"], true), "build takes one file, and 'b.pith' is a second one");
+    }
+
+    #[test]
+    fn a_missing_or_directory_source_is_not_readable() {
+        let dir = std::env::temp_dir().join(format!("pith-source-read-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.pith");
+        fs::write(&file, "fn main():\n    return\n").unwrap();
+        assert!(check_readable_file(file.to_str().unwrap()).is_ok());
+        let missing = check_readable_file(dir.join("none.pith").to_str().unwrap()).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let is_dir = check_readable_file(dir.to_str().unwrap()).unwrap_err();
+        assert_eq!(is_dir.kind(), std::io::ErrorKind::IsADirectory);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

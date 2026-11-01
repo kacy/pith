@@ -15,6 +15,7 @@ mod blocking_wake;
 mod channel;
 mod green_word;
 mod primitives;
+mod task_await;
 
 /// run a model of three or more threads with loom's preemption bound at 3
 /// (unless `LOOM_MAX_PREEMPTIONS` sets one). unbounded, the channel's stray

@@ -1305,6 +1305,7 @@ MEMCHECK_VALGRIND := valgrind --error-exitcode=99 --leak-check=no --errors-for-l
 
 MEMCHECK_OSTHREAD_CASES := \
 	tests/cases/test_os_thread_spawn_reclaim tests/cases/test_await_ownership \
+	tests/cases/test_concurrent_await_one_result \
 	tests/cases/test_env_overlay \
 	tests/cases/test_channel_fanout_ownership \
 	tests/cases/test_channel_try_send_ownership \

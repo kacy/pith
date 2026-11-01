@@ -1,0 +1,62 @@
+# sync_unlock_handoff_pin with the lock built from an AtomicInt: a spin on
+# compare_set(0, 1) takes it and store(0) gives it back. an atomic store can
+# hand guarded storage to another task the way unlock does, so a function that
+# stores and then reads a String argument the caller read under the lock still
+# needs that argument pinned. only a sync handle argument may go unpinned.
+struct Holder:
+    pub flag: AtomicInt
+    pub mut msg: String
+
+fn take(flag: AtomicInt) -> Int:
+    mut spins := 0
+    while not flag.compare_set(0, 1):
+        spins = spins + 1
+    return spins
+
+fn finish(flag: AtomicInt, msg: String) -> Int:
+    flag.store(0)
+    mut n := 0
+    mut k := 0
+    while k < 200:
+        n = n + msg.len()
+        k = k + 1
+    return n
+
+fn reader(h: Holder, rounds: Int, out: Channel[Int]):
+    mut total := 0
+    mut i := 0
+    while i < rounds:
+        take(h.flag)
+        total = total + finish(h.flag, h.msg)
+        i = i + 1
+    out.send(total)
+
+fn writer(h: Holder, rounds: Int, out: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        take(h.flag)
+        # every message is five bytes, so the reader's total is fixed
+        h.msg = "msg-" + (i % 10).to_string()
+        h.flag.store(0)
+        i = i + 1
+    out.send(i)
+
+fn main():
+    h := Holder(flag: AtomicInt(0), msg: "msg-0")
+    rounds := 20000
+    out := Channel[Int](4)
+    r1 := spawn reader(h, rounds, out)
+    r2 := spawn reader(h, rounds, out)
+    w1 := spawn writer(h, rounds, out)
+    w2 := spawn writer(h, rounds, out)
+    mut sum := 0
+    mut got := 0
+    while got < 4:
+        if let v = out.recv():
+            sum = sum + v
+        got = got + 1
+    await r1
+    await r2
+    await w1
+    await w2
+    print("sum {sum}")

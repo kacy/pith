@@ -614,8 +614,21 @@ fn a_stray_wake_leaves_no_duplicate_waitgroup_or_mutex_waiter() {
 fn a_green_wait_without_a_pidfd_keeps_the_process_lock_free() {
     use crate::process::*;
     let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    set_current_worker(Some(0));
-    while take_pinned_on_0().is_some() {}
+    // the last worker, so the timers this sweeps are not worker 0's, which
+    // the netpoll tests drive by hand.
+    let worker = scheduler().workers.len() - 1;
+    if worker == 0 {
+        return;
+    }
+    let take_pinned = || {
+        scheduler().workers[worker]
+            .pinned
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pop()
+    };
+    set_current_worker(Some(worker));
+    while take_pinned().is_some() {}
     NO_PIDFD_FOR_TESTS.store(true, AtomicOrdering::Relaxed);
 
     let cmd = std::ffi::CString::new("sleep 3").unwrap();
@@ -635,12 +648,12 @@ fn a_green_wait_without_a_pidfd_keeps_the_process_lock_free() {
     run_task(a);
     let deadline = Instant::now() + Duration::from_secs(10);
     while completion(a).is_none() {
-        match take_pinned_on_0() {
+        match take_pinned() {
             Some(id) => run_task(id),
             None => {
                 assert!(Instant::now() < deadline, "the wait never finished");
-                // as worker 0 between tasks: sweep its timers.
-                crate::netpoll::idle_wait(0, Duration::from_millis(5));
+                // as that worker between tasks: sweep its timers.
+                crate::netpoll::idle_wait(worker, Duration::from_millis(5));
             }
         }
     }

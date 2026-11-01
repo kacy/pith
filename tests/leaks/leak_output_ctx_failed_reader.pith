@@ -1,0 +1,23 @@
+# process.output_ctx reads the child's stdout and stderr on two tasks. when
+# the stdout read failed, it returned before awaiting the stderr task, so that
+# task's slot and the 16 kB it read were never released: one of each per
+# call. the child here writes a byte that is not utf-8 to stdout, which fails
+# the stdout read, and a 16 kB line to stderr. the round count is divided down
+# because every round spawns a process.
+import leakprobe as probe
+import std.concurrent as concurrent
+import std.os.process as process
+
+fn main():
+    rounds := probe.rounds() / 250
+    bg := concurrent.background()
+    mut failed := 0
+    mut i := 0
+    while i < rounds:
+        r := process.command("sh").args(["-c", "printf '\\377'; printf '%16384s' x >&2"]).output_ctx(bg)
+        if r.is_err:
+            failed = failed + 1
+        i = i + 1
+    if failed != rounds:
+        print("unexpected success")
+    print("{probe.peak_kb()}")

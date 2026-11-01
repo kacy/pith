@@ -52,8 +52,8 @@ fn run_cli() {
 
     match args[1].as_str() {
         "build" => {
-            require_file_arg(&args, "build");
-            build_file(&args[2]);
+            let (path, output) = parse_file_args("build", &args[2..], true);
+            build_file(&path, output.as_deref());
         }
         "build-ir" => {
             if args.len() < 4 {
@@ -63,8 +63,8 @@ fn run_cli() {
             build_ir_file(&args[2], &args[3]);
         }
         "run" => {
-            require_file_arg(&args, "run");
-            run_file(&args[2]);
+            let (path, _) = parse_file_args("run", &args[2..], false);
+            run_file(&path);
         }
         "test" => {
             require_file_arg(&args, "test");
@@ -99,8 +99,10 @@ fn run_cli() {
                 } else if args[i] == "--json" {
                     env::set_var("PITH_TEST_JSON", "1");
                     i += 1;
+                } else if ["--filter", "--tag", "--exclude-tag"].contains(&args[i].as_str()) {
+                    usage_error(&format!("{} needs a value", args[i]));
                 } else {
-                    i += 1;
+                    usage_error(&unexpected_arg("test", &args[i]));
                 }
             }
             if !selected_tags.is_empty() {
@@ -145,16 +147,71 @@ fn run_cli() {
 /// Exit with a usage error unless `args` names a file after the command.
 fn require_file_arg(args: &[String], command: &str) {
     if args.len() < 3 {
-        eprintln!("Error: {} requires a file argument", command);
-        std::process::exit(1);
+        usage_error(&format!("{} requires a file argument", command));
     }
+}
+
+/// Print a usage error and exit with status 1.
+fn usage_error(message: &str) -> ! {
+    eprintln!("Error: {}", message);
+    eprintln!("Run 'pith help' for usage.");
+    std::process::exit(1);
+}
+
+/// The error for an argument a command does not take: an unknown option,
+/// or a second file.
+fn unexpected_arg(command: &str, arg: &str) -> String {
+    if arg.starts_with('-') && arg.len() > 1 {
+        format!("unknown option '{}' for {}", arg, command)
+    } else {
+        format!("{} takes one file, and '{}' is a second one", command, arg)
+    }
+}
+
+/// The source file and the `-o` output path of `command`, whose arguments
+/// after the command name are `args`. `-o <path>` is accepted before or after
+/// the file when `takes_output` is set. Anything else exits with a usage
+/// error, so a misspelled option is reported rather than ignored.
+fn parse_file_args(command: &str, args: &[String], takes_output: bool) -> (String, Option<String>) {
+    match file_args(command, args, takes_output) {
+        Ok(parsed) => parsed,
+        Err(message) => usage_error(&message),
+    }
+}
+
+fn file_args(
+    command: &str,
+    args: &[String],
+    takes_output: bool,
+) -> Result<(String, Option<String>), String> {
+    let mut path = None;
+    let mut output = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if takes_output && arg == "-o" {
+            let value = args.get(i + 1).ok_or("-o needs an output path")?;
+            if output.replace(value.clone()).is_some() {
+                return Err("-o is given more than once".to_string());
+            }
+            i += 2;
+            continue;
+        }
+        if path.is_some() || (arg.starts_with('-') && arg.len() > 1) {
+            return Err(unexpected_arg(command, arg));
+        }
+        path = Some(arg.clone());
+        i += 1;
+    }
+    let path = path.ok_or_else(|| format!("{} requires a file argument", command))?;
+    Ok((path, output))
 }
 
 fn print_usage() {
     println!("Usage: pith <command> [args...]");
     println!();
     println!("Commands:");
-    println!("  build <file.pith>    Compile .pith file to native binary");
+    println!("  build <file.pith> [-o <out>]  Compile .pith file to native binary");
     println!("  build-ir <file.ir> <out>  Compile combined IR text to a native binary");
     println!("  run <file.pith>      Compile and run immediately");
     println!("  test <file.pith>     Compile and run tests");
@@ -552,9 +609,20 @@ fn validate_combined_ir_contract(ir_text: &str) -> Result<(), String> {
 }
 
 fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), String> {
+    // the ir driver says nothing when it cannot read its input, which would
+    // be reported as a compiler bug, so a missing file is caught here
+    check_readable_file(path).map_err(|e| format!("Error reading {}: {}", path, e))?;
     let ir_text =
         get_ir_from_compiler(path, emit_tests).map_err(|e| format!("Error getting IR: {}", e))?;
     object_from_ir(&ir_text)
+}
+
+/// Ok when `path` is a regular file this process can open for reading.
+fn check_readable_file(path: &str) -> std::io::Result<()> {
+    if fs::File::open(path)?.metadata()?.is_dir() {
+        return Err(std::io::ErrorKind::IsADirectory.into());
+    }
+    Ok(())
 }
 
 fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
@@ -586,7 +654,17 @@ fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
     Ok((bytes, funcs.len()))
 }
 
-fn build_file(path: &str) {
+/// Compile `path` to an executable at `output`, or next to the source
+/// without its `.pith` when no output is given. The object file is written
+/// beside the executable as `<exe>.o`.
+fn build_file(path: &str, output: Option<&str>) {
+    let Some(exe_path) = output.or_else(|| default_exe_path(path)) else {
+        eprintln!(
+            "Error: {} does not end in .pith, so there is no default output name; pass -o <out>",
+            path
+        );
+        std::process::exit(1);
+    };
     let (bytes, func_count) = match compile_to_object(path, false) {
         Ok(result) => result,
         Err(e) => {
@@ -596,10 +674,18 @@ fn build_file(path: &str) {
     };
 
     eprintln!("Compiled {} functions", func_count);
-    let obj_path = path.replace(".pith", ".o");
-    let exe_path = path.replace(".pith", "");
-    write_and_link(&bytes, &obj_path, &exe_path);
-    stamp_if_ir_driver(&exe_path);
+    write_and_link(&bytes, &format!("{}.o", exe_path), exe_path);
+    stamp_if_ir_driver(exe_path);
+}
+
+/// The executable `pith build` writes for `path`: the path without its
+/// trailing `.pith`. Only the last extension goes, so a directory named
+/// `foo.pith` keeps its name. None when nothing would be left of the file
+/// name, or when there is no `.pith` to strip and the output would
+/// overwrite the source.
+fn default_exe_path(path: &str) -> Option<&str> {
+    path.strip_suffix(".pith")
+        .filter(|stem| !stem.is_empty() && !stem.ends_with('/'))
 }
 
 /// Write an object file and link it into `exe_path`, exiting on failure.
@@ -619,14 +705,32 @@ fn write_and_link(bytes: &[u8], obj_path: &str, exe_path: &str) {
     }
 }
 
-fn unique_run_artifact_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_nanos();
-    let exe_path = env::temp_dir().join(format!("pith_ir_{}_{}", std::process::id(), stamp));
-    let obj_path = env::temp_dir().join(format!("pith_ir_{}_{}.o", std::process::id(), stamp));
-    (obj_path, exe_path)
+/// A new directory under `parent` that only this user can enter, for
+/// `pith run` and `pith test` to build in. The name carries a random part,
+/// and creating the directory fails when anything exists at the path, a
+/// symlink included, so nothing planted in a shared temp directory is
+/// followed or overwritten, and other users cannot reach the object and
+/// binary inside it.
+fn create_private_dir(parent: &Path) -> std::io::Result<PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut attempts = 0;
+    loop {
+        // every RandomState is seeded from the OS, so this is a fresh
+        // random number without a dependency
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let dir = parent.join(format!("pith_run_{}_{:016x}", std::process::id(), random));
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 16 => {
+                attempts += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Compile a combined IR text file straight to a native binary. Pairs with
@@ -661,7 +765,8 @@ fn test_file(path: &str) {
 
 /// Compile `path` (with its tests when `emit_tests`) to a temporary binary,
 /// run it, and exit with its status when it fails. The binary and object
-/// are removed afterwards unless PITH_KEEP_RUN_ARTIFACTS is set.
+/// are built in a private directory, which is removed afterwards unless
+/// PITH_KEEP_RUN_ARTIFACTS is set.
 fn compile_and_run(path: &str, emit_tests: bool) {
     use pith_codegen::linker::build_executable;
 
@@ -673,19 +778,28 @@ fn compile_and_run(path: &str, emit_tests: bool) {
         }
     };
 
-    let (obj_path, exe_path) = unique_run_artifact_paths();
+    let dir = create_private_dir(&env::temp_dir()).unwrap_or_else(|e| {
+        eprintln!("Error creating a build directory in {}: {}", env::temp_dir().display(), e);
+        std::process::exit(1);
+    });
     let keep_artifacts = std::env::var("PITH_KEEP_RUN_ARTIFACTS").is_ok();
+    let clean_up = || {
+        if !keep_artifacts {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    };
+    let stem = Path::new(path).file_stem().unwrap_or("main".as_ref());
+    let exe_path = dir.join(stem);
+    let obj_path = exe_path.with_extension("o");
     if let Err(e) = fs::write(&obj_path, &bytes) {
         eprintln!("Error writing object: {}", e);
+        clean_up();
         std::process::exit(1);
     }
     match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
         Ok(_) => {
             let status = Command::new(&exe_path).status();
-            if !keep_artifacts {
-                let _ = fs::remove_file(&obj_path);
-                let _ = fs::remove_file(&exe_path);
-            }
+            clean_up();
             match status {
                 Ok(s) => {
                     if !s.success() {
@@ -700,6 +814,7 @@ fn compile_and_run(path: &str, emit_tests: bool) {
         }
         Err(e) => {
             eprintln!("Error linking {}: {}", exe_path.display(), e);
+            clean_up();
             std::process::exit(1);
         }
     }
@@ -764,7 +879,7 @@ fn delegate_to_frontend(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        driver_abi_path, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
+        check_readable_file, create_private_dir, default_exe_path, driver_abi_path, file_args, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
         object_from_ir, seed_runtime_abi, validate_combined_ir_contract, RUNTIME_ABI,
     };
     use std::fs;
@@ -856,5 +971,62 @@ mod tests {
         assert!(err.contains("compiled against runtime ABI 0000000000000000"), "{err}");
         let ir = format!("runtime_abi {}\nfunc main 0 int\niconst 1 0\nret 1\nendfunc\n", RUNTIME_ABI);
         assert!(object_from_ir(&ir).is_ok());
+    }
+
+    #[test]
+    fn the_default_output_strips_only_the_trailing_extension() {
+        assert_eq!(default_exe_path("hello.pith"), Some("hello"));
+        assert_eq!(default_exe_path("foo.pith/hello.pith"), Some("foo.pith/hello"));
+        assert_eq!(default_exe_path("a.pith.pith"), Some("a.pith"));
+        assert_eq!(default_exe_path("hello"), None);
+        assert_eq!(default_exe_path("foo.pith/hello"), None);
+        assert_eq!(default_exe_path(".pith"), None);
+        assert_eq!(default_exe_path("dir/.pith"), None);
+    }
+
+    #[test]
+    fn build_takes_one_file_and_an_output_path() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let parsed = |list: &[&str], output: bool| file_args("build", &args(list), output);
+        let ok = |path: &str, out: Option<&str>| Ok((path.to_string(), out.map(str::to_string)));
+
+        assert_eq!(parsed(&["a.pith"], true), ok("a.pith", None));
+        assert_eq!(parsed(&["a.pith", "-o", "out"], true), ok("a.pith", Some("out")));
+        assert_eq!(parsed(&["-o", "out", "a.pith"], true), ok("a.pith", Some("out")));
+        assert_eq!(parsed(&["-"], true), ok("-", None));
+
+        let err = |list: &[&str], output: bool| parsed(list, output).unwrap_err();
+        assert_eq!(err(&[], true), "build requires a file argument");
+        assert_eq!(err(&["a.pith", "-o"], true), "-o needs an output path");
+        assert_eq!(err(&["a.pith", "-o", "x", "-o", "y"], true), "-o is given more than once");
+        assert_eq!(err(&["a.pith", "--release"], true), "unknown option '--release' for build");
+        assert_eq!(err(&["a.pith", "-o", "x"], false), "unknown option '-o' for build");
+        assert_eq!(err(&["a.pith", "b.pith"], true), "build takes one file, and 'b.pith' is a second one");
+    }
+
+    #[test]
+    fn a_missing_or_directory_source_is_not_readable() {
+        let dir = std::env::temp_dir().join(format!("pith-source-read-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.pith");
+        fs::write(&file, "fn main():\n    return\n").unwrap();
+        assert!(check_readable_file(file.to_str().unwrap()).is_ok());
+        let missing = check_readable_file(dir.join("none.pith").to_str().unwrap()).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        let is_dir = check_readable_file(dir.to_str().unwrap()).unwrap_err();
+        assert_eq!(is_dir.kind(), std::io::ErrorKind::IsADirectory);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn each_run_directory_is_new_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = std::env::temp_dir().join(format!("pith-run-dir-{}", std::process::id()));
+        fs::create_dir_all(&parent).unwrap();
+        let a = create_private_dir(&parent).unwrap();
+        let b = create_private_dir(&parent).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(fs::metadata(&a).unwrap().permissions().mode() & 0o077, 0);
+        fs::remove_dir_all(&parent).unwrap();
     }
 }

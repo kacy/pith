@@ -1,0 +1,52 @@
+# the paths of `xs[i] = v` inside a fallible function. the store itself
+# answers whether the index was inside the list, and the function fails on a
+# miss. the inline fast path covers an in-bounds store into a list of scalars;
+# everything else (a list of counted elements, a borrowed value carrying its
+# kind, an empty list, a negative index) goes through the runtime, and each
+# has to fail or store exactly as the check in front of it used to decide.
+fn fill(xs: List[Int], n: Int) -> Int!String:
+    mut i := 0
+    while i < n:
+        xs[i] = i * 10
+        i = i + 1
+    return xs[xs.len() - 1]
+
+fn put_borrowed(xs: List[String], i: Int, v: String) -> Int!String:
+    xs[i] = v
+    return xs.len()
+
+fn put_owned(xs: List[String], i: Int, v: Int) -> Int!String:
+    xs[i] = "v-{v}"
+    return xs.len()
+
+fn put_row(rows: List[List[Int]], i: Int) -> Int!String:
+    rows[i] = [i, i]
+    return rows[i].len()
+
+fn report(r: Int!String) -> String:
+    if r.is_err:
+        return "err {r.err}"
+    return "ok {r.ok}"
+
+fn main():
+    xs := [0, 0, 0, 0]
+    print(report(fill(xs, 4)))
+    print(report(fill(xs, 5)))
+    print("{xs[0]} {xs[1]} {xs[2]} {xs[3]}")
+
+    names := ["a", "b"]
+    given := "given"
+    print(report(put_borrowed(names, 1, given)))
+    print(report(put_borrowed(names, 2, given)))
+    print(report(put_owned(names, 0, 7)))
+    print(report(put_owned(names, 0 - 1, 8)))
+    print("{names[0]} {names[1]} {given}")
+
+    empty: List[String] := []
+    print(report(put_owned(empty, 0, 9)))
+    print(empty.len().to_string())
+
+    rows := [[1], [2]]
+    print(report(put_row(rows, 1)))
+    print(report(put_row(rows, 2)))
+    print("{rows[0].len()} {rows[1].len()}")

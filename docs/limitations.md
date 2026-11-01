@@ -182,15 +182,15 @@ stale and a fix to it is welcome.
 - **known leaks**. each of these strands memory on every occurrence:
   - a discarded `catch`, `select` or `match` expression releases only a string
     result (#1091).
-  - a `T!` stored in a struct field or a list element (#1167), and a result
-    local forwarded straight into another call's argument (#1168).
+  - a `T!` stored in a struct field or a list element (#1167).
   - a fresh `String` result passed straight to `assert_eq` (#1118).
   - returning a `match` expression with a fresh string arm (#1151), and a match
     on a result local with a tuple payload (#1150).
   - some `json.decode` shapes: a present optional `String` field (#1144), a
     nested struct on the node-pool path (#1142), and a decode that fails
     partway (#1145).
-  - about 1.6 kb per tls connection (#1079).
+  - a `Mutex` is never freed, which leaves about 40 bytes per mutex and about
+    200 bytes per tls connection (#1291).
 - **closing a channel can race a send**. a send that passes its closed check
   as another task closes the channel can enqueue a value nobody reads, and the
   send reports success. a channel costs about 416 bytes plus 16 bytes per

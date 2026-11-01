@@ -844,6 +844,11 @@ unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_c
     crate::perf_stats!(PERF_LIST_SETS += 1);
     let idx = index as usize;
     if idx >= impl_ref.len() {
+        // an index outside the list stores nothing, so an owned value the
+        // caller handed over has nobody else to release it.
+        if takes_caller_count {
+            release_element(impl_ref.type_tag, value);
+        }
         return;
     }
     // retain the incoming element before dropping the count on what it
@@ -904,6 +909,50 @@ pub unsafe extern "C" fn pith_list_set_value_owned_strict(list: PithList, index:
 pub unsafe extern "C" fn pith_list_set_scalar_strict(list: PithList, index: i64, value: i64) {
     check_store_index(list, index);
     pith_list_set_scalar(list, index, value);
+}
+
+// The checked stores behind `xs[i] = v` inside a fallible function, where a
+// bad index fails the function instead of stopping the process. Each returns
+// 1 when it stored and 0 for an index outside the list (or a dead handle),
+// and on 0 it leaves the value with the caller, whose miss arm releases an
+// owned one before it fails. The codegen inlines the in-bounds store of a
+// primitive list and hands back its own bounds test as the flag, so the store
+// and the check are one compare.
+
+/// Whether `index` is inside the list behind `list`; false for a dead handle.
+unsafe fn store_index_in_bounds(list: PithList, index: i64) -> bool {
+    list_ref(list).is_some_and(|impl_ref| index >= 0 && (index as usize) < impl_ref.len())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_value_checked(list: PithList, index: i64, value: i64) -> i64 {
+    if !store_index_in_bounds(list, index) {
+        return 0;
+    }
+    set_value_inner(list, index, value, false);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_value_owned_checked(
+    list: PithList,
+    index: i64,
+    value: i64,
+) -> i64 {
+    if !store_index_in_bounds(list, index) {
+        return 0;
+    }
+    set_value_inner(list, index, value, true);
+    1
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_scalar_checked(list: PithList, index: i64, value: i64) -> i64 {
+    if !store_index_in_bounds(list, index) {
+        return 0;
+    }
+    pith_list_set_scalar(list, index, value);
+    1
 }
 
 /// # Safety
@@ -1820,6 +1869,56 @@ mod tests {
             pith_list_release(list);
             assert_eq!(crate::cstring_refcount_for_tests(t), Some(1));
             crate::pith_cstring_release(t);
+        }
+    }
+
+    #[test]
+    fn owned_set_outside_the_list_releases_the_value() {
+        unsafe {
+            let list = pith_list_new(8, 1); // ListTypeTag::String
+            let kept = crate::pith_copy_bytes_to_cstring(b"kept");
+            pith_list_push_value_owned(list, kept as i64);
+
+            // past the end and negative: nothing is stored, and the count
+            // the caller handed over is dropped instead of stranded
+            for index in [1, 7, -1] {
+                let s = crate::pith_copy_bytes_to_cstring(b"dropped");
+                crate::pith_cstring_retain(s);
+                pith_list_set_value_owned(list, index, s as i64);
+                assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+                crate::pith_cstring_release(s);
+            }
+            assert_eq!(pith_list_len(list), 1);
+            assert_eq!(pith_list_get_value(list, 0), kept as i64);
+
+            // the checked store reports a miss and leaves the value alone,
+            // since the caller's miss arm releases it
+            let s = crate::pith_copy_bytes_to_cstring(b"caller");
+            assert_eq!(pith_list_set_value_owned_checked(list, 1, s as i64), 0);
+            assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+            assert_eq!(pith_list_set_value_owned_checked(list, 0, s as i64), 1);
+            assert_eq!(crate::cstring_refcount_for_tests(kept), None);
+            assert_eq!(pith_list_get_value(list, 0), s as i64);
+            pith_list_release(list);
+            assert_eq!(crate::cstring_refcount_for_tests(s), None);
+        }
+    }
+
+    #[test]
+    fn checked_scalar_store_reports_the_bounds() {
+        unsafe {
+            let list = pith_list_new(8, 0);
+            pith_list_push_value(list, 1);
+            pith_list_push_value(list, 2);
+            assert_eq!(pith_list_set_scalar_checked(list, 1, 9), 1);
+            assert_eq!(pith_list_set_scalar_checked(list, 2, 9), 0);
+            assert_eq!(pith_list_set_scalar_checked(list, -1, 9), 0);
+            assert_eq!(pith_list_set_value_checked(list, 0, 8), 1);
+            assert_eq!(pith_list_get_value(list, 0), 8);
+            assert_eq!(pith_list_get_value(list, 1), 9);
+            pith_list_release(list);
+            // a dead handle is a miss, not a crash
+            assert_eq!(pith_list_set_scalar_checked(list, 0, 1), 0);
         }
     }
 

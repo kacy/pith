@@ -190,6 +190,14 @@ cases=(
   "tests/leaks/leak_crosskind_binding SHAPE=6"
   "tests/leaks/leak_crosskind_binding SHAPE=7"
   "tests/leaks/leak_crosskind_binding SHAPE=8"
+  "tests/leaks/leak_match_if_expr SHAPE=1"
+  "tests/leaks/leak_match_if_expr SHAPE=2"
+  "tests/leaks/leak_match_if_expr SHAPE=3"
+  "tests/leaks/leak_match_if_expr SHAPE=4"
+  "tests/leaks/leak_match_if_expr SHAPE=5"
+  "tests/leaks/leak_match_if_expr SHAPE=6"
+  "tests/leaks/leak_match_if_expr SHAPE=7"
+  "tests/leaks/leak_match_if_expr SHAPE=8"
   tests/leaks/leak_grpc_route_crosskind
   tests/leaks/leak_json_fill_float
   tests/leaks/leak_json_fill_list
@@ -233,6 +241,10 @@ cases=(
   "tests/leaks/leak_temp_result_use SHAPE=12"
   tests/leaks/leak_task_handle_drop
   "tests/leaks/leak_task_handle_drop PITH_GREEN=0"
+  tests/leaks/leak_read_all_buffer
+  tests/leaks/leak_output_ctx_failed_reader
+  "tests/leaks/leak_output_ctx_failed_reader PITH_GREEN=0"
+  tests/leaks/leak_list_store_miss
   "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
   "tests/leaks/leak_map_value_cycle PITH_CYCLE_GC=1"
 )

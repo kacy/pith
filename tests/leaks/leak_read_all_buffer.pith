@@ -1,0 +1,31 @@
+# read_all drains a text source (a string reader, a socket, a child's pipe)
+# into a byte buffer and decodes it at the end. the buffer has no destructor,
+# and the decode copied out of it, so every read_all left its buffer behind:
+# the 4 kB chunk capacity and the bytes it held. this churns read_all on a
+# string reader, the source that needs no socket or child process, plus one
+# whose bytes are not utf-8, which fails the decode after the drain.
+import leakprobe as probe
+import std.io as io
+
+fn round(i: Int) -> Int:
+    reader := io.string_reader("abcdef-{i}")
+    text := reader.read_all() catch ""
+    reader.close()
+
+    bad := io.string_reader(chr(255))
+    decoded := bad.read_all()
+    bad.close()
+    if decoded.is_err:
+        return text.len()
+    return 0
+
+fn main():
+    n := probe.rounds()
+    mut acc := 0
+    mut i := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

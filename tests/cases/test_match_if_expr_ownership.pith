@@ -1,0 +1,158 @@
+# a match or if expression lands each branch's value in one temp without a
+# retain, so the expression owns its value only when every branch hands over
+# an owned one. the classifier used to call every such expression borrowed,
+# and each consumer retained a value that was already owned: one string, list
+# or struct leaked per evaluation (#1151). a branch that is a borrow (a
+# parameter, a local, a field read) keeps the whole expression a borrow, and
+# those values must outlive every consumer below. each shape runs in a loop
+# and the borrowed values are printed at the end, so a count dropped too many
+# times shows up under the sanitizer and valgrind.
+
+struct Holder:
+    label: String
+
+struct Pack:
+    name: String
+    items: List[Int]
+    holder: Holder
+
+fn mkl(i: Int) -> List[Int]:
+    return [i, i + 1]
+
+fn fresh(i: Int) -> String:
+    return "f" + i.to_string()
+
+fn take_s(s: String) -> Int:
+    return s.len()
+
+fn take_l(l: List[Int]) -> Int:
+    return l.len()
+
+# return: fresh arms, then a borrowed arm beside a fresh one
+fn ret_match(i: Int) -> String:
+    return match i % 3:
+        0 => "a-" + i.to_string()
+        1 => fresh(i)
+        _ => "lit"
+
+fn ret_if(i: Int) -> String:
+    return if i % 2 == 0: "a-" + i.to_string() else: fresh(i)
+
+fn ret_mixed(i: Int, p: String) -> String:
+    return match i % 2:
+        0 => "a-" + i.to_string()
+        _ => p
+
+fn ret_borrowed_list(i: Int, a: List[Int], b: List[Int]) -> List[Int]:
+    return if i % 2 == 0: a else: b
+
+# binding: strings, lists and structs, fresh and mixed
+fn bind_shapes(i: Int, p: String, l: List[Int], h: Holder, pk: Pack) -> Int:
+    s1 := match i % 3:
+        0 => "a-" + i.to_string()
+        _ => "b-" + i.to_string()
+    s2 := if i % 2 == 0: "x" + pk.name else: pk.name
+    s3 := if i % 3 == 0: p elif i % 3 == 1: fresh(i) else: "e" + i.to_string()
+    l1 := match i % 2:
+        0 => mkl(i)
+        _ => [i]
+    l2 := if i % 2 == 0: mkl(i) else: l
+    l3 := match i % 2:
+        0 => pk.items
+        _ => mkl(i)
+    h1 := if i % 2 == 0: Holder(label: "n" + i.to_string()) else: Holder(label: fresh(i))
+    h2 := match i % 2:
+        0 => Holder(label: "m" + i.to_string())
+        _ => h
+    h3 := if i % 2 == 0: pk.holder else: Holder(label: "k")
+    return s1.len() + s2.len() + s3.len() + l1.len() + l2.len() + l3.len() + h1.label.len() + h2.label.len() + h3.label.len()
+
+# function argument
+fn arg_shapes(i: Int, p: String, l: List[Int]) -> Int:
+    a := take_s(if i % 2 == 0: "a" + i.to_string() else: fresh(i))
+    b := take_l(if i % 2 == 0: mkl(i) else: [i])
+    c := take_s(if i % 2 == 0: p else: "c" + i.to_string())
+    d := take_l(if i % 2 == 0: l else: mkl(i))
+    return a + b + c + d
+
+# struct field initializer
+fn field_shapes(i: Int, p: String, h: Holder) -> Int:
+    pk := Pack(name: if i % 2 == 0: "a" + i.to_string() else: p, items: if i % 3 == 0: mkl(i) else: [i], holder: if i % 2 == 0: h else: Holder(label: fresh(i)))
+    q := Pack(name: if i % 2 == 0: "a" + i.to_string() else: fresh(i), items: [i], holder: Holder(label: "z"))
+    return pk.name.len() + pk.items.len() + pk.holder.label.len() + q.name.len()
+
+# list element
+fn elem_shapes(i: Int, p: String) -> Int:
+    l := [if i % 2 == 0: "a" + i.to_string() else: fresh(i), if i % 2 == 0: p else: "c" + i.to_string()]
+    ll := [if i % 2 == 0: mkl(i) else: [i]]
+    return l.len() + l[0].len() + l[1].len() + ll[0].len()
+
+# interpolation
+fn interp_shapes(i: Int, p: String) -> Int:
+    s := "<{if i % 2 == 0: "a" + i.to_string() else: fresh(i)}|{if i % 2 == 0: p else: "q" + i.to_string()}>"
+    return s.len()
+
+# a field read off the whole, and a method call on it
+fn receiver_shapes(i: Int, h: Holder) -> Int:
+    a := (if i % 2 == 0: Holder(label: "x" + i.to_string()) else: Holder(label: fresh(i))).label.len()
+    b := (if i % 2 == 0: h else: Holder(label: fresh(i))).label.len()
+    c := (if i % 2 == 0: "x" + i.to_string() else: fresh(i)).len()
+    return a + b + c
+
+# an operand of a concatenation or a comparison, a loop's iterable, and a
+# reassignment over a live value
+fn operand_shapes(i: Int, p: String, l: List[Int]) -> Int:
+    s := "<" + (if i % 2 == 0: p else: fresh(i)) + ">"
+    mut n := s.len()
+    if (if i % 2 == 0: p else: fresh(i)) == "f3":
+        n = n + 1
+    for x in (if i % 2 == 0: l else: mkl(i)):
+        n = n + x
+    n = n + (if i % 2 == 0: l else: mkl(i)).len()
+    mut r := "start" + i.to_string()
+    r = if i % 2 == 0: p else: fresh(i)
+    r = match i % 3:
+        0 => fresh(i)
+        _ => p
+    return n + r.len()
+
+# an expression nested in another
+fn nested_shapes(i: Int, p: String) -> Int:
+    q := match i % 2:
+        0 => if i % 3 == 0: "a" + i.to_string() else: fresh(i)
+        _ => "c" + i.to_string()
+    r := if i % 2 == 0: (if i % 3 == 0: "a" + i.to_string() else: p) else: "c" + i.to_string()
+    t := match i % 2:
+        0 => if i % 3 == 0: p else: fresh(i)
+        _ => fresh(i)
+    return q.len() + r.len() + t.len()
+
+# a guard, and a block arm that leaves the function
+fn guard_and_leave(i: Int) -> Int:
+    a := match i % 4:
+        k if k == 1 => "one-" + i.to_string()
+        2 =>
+            return 2
+        _ => "other-" + i.to_string()
+    return a.len()
+
+fn main():
+    p := "param-" + "string"
+    l := [7, 8, 9]
+    l2 := [4, 5]
+    h := Holder(label: "he" + "ld")
+    pk := Pack(name: "pa" + "ck", items: [1, 2, 3], holder: Holder(label: "in" + "ner"))
+    mut i := 0
+    mut total := 0
+    while i < 300:
+        total = total + ret_match(i).len() + ret_if(i).len() + ret_mixed(i, p).len()
+        total = total + ret_borrowed_list(i, l, l2).len()
+        total = total + bind_shapes(i, p, l, h, pk) + arg_shapes(i, p, l) + field_shapes(i, p, h)
+        total = total + elem_shapes(i, p) + interp_shapes(i, p) + receiver_shapes(i, h)
+        total = total + operand_shapes(i, p, l) + nested_shapes(i, p) + guard_and_leave(i)
+        i = i + 1
+    print(total.to_string())
+    print(ret_match(0) + " " + ret_match(1) + " " + ret_match(2))
+    print(ret_if(4) + " " + ret_if(5) + " " + ret_mixed(1, p))
+    print(p + " " + l.len().to_string() + " " + l2.len().to_string() + " " + h.label)
+    print(pk.name + " " + pk.items.len().to_string() + " " + pk.holder.label)

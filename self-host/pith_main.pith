@@ -2,6 +2,7 @@
 #
 # usage:
 #   pith build <file.pith>      compile to native binary
+#   pith build <file> -o <out>  compile to the given output path
 #   pith run <file.pith>        compile and run
 #   pith test <file.pith>       run test declarations
 #   pith test <file> [--filter <substr>] [--tag <name>] [--exclude-tag <name>]
@@ -88,16 +89,16 @@ fn run_backend_command(command: String, path: String, extra: List[String]) -> St
         exit(status)
     return ""
 
-fn cmd_build(path: String) -> String!:
-    return run_backend_command("build", path, [])
+# every argument after the path goes to the backend untouched, so `-o` on
+# build and `--filter`, `--tag`, `--exclude-tag` and `--json` on test mean the
+# same thing here as they do on the native cli, and an option the backend does
+# not take is refused there. the wrapper does not read them.
+fn cmd_build(path: String, extra: List[String]) -> String!:
+    return run_backend_command("build", path, extra)
 
-fn cmd_run(path: String) -> String!:
-    return run_backend_command("run", path, [])
+fn cmd_run(path: String, extra: List[String]) -> String!:
+    return run_backend_command("run", path, extra)
 
-# every argument after the path goes to the runner untouched, so `--filter`,
-# `--tag`, `--exclude-tag` and `--json` mean the same thing here as they do on
-# the native cli. the wrapper does not read them: whatever the runner accepts
-# today it accepts through this path too.
 fn cmd_test(path: String, extra: List[String]) -> String!:
     return run_backend_command("test", path, extra)
 
@@ -318,6 +319,7 @@ fn print_help():
     print("")
     print("commands:")
     print("  build <file.pith>        compile to native binary")
+    print("    [-o <out>]             write the executable to <out>")
     print("  run <file.pith>          compile and run")
     print("  test <file.pith>         run test declarations")
     print("    [--filter <substr>] [--tag <name>] [--exclude-tag <name>] [--json]")
@@ -465,10 +467,10 @@ fn run_cli() -> String!:
         _result := cmd_lex(path)!
 
     elif command == "build":
-        _result := cmd_build(path)!
+        _result := cmd_build(path, a.slice(3, a.len()))!
 
     elif command == "run":
-        _result := cmd_run(path)!
+        _result := cmd_run(path, a.slice(3, a.len()))!
 
     elif command == "test":
         _result := cmd_test(path, a.slice(3, a.len()))!

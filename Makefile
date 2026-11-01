@@ -1848,6 +1848,27 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "does not end in .pith" && grep -q 'print("x")' "$$tmpdir/noext"; then pass=$$((pass+1)); echo "ok   build keeps a source without .pith"; else echo "FAIL build without .pith"; echo "$$out"; fail=$$((fail+1)); fi; \
+	mkdir -p "$$tmpdir/out"; \
+	set +e; \
+	out=$$(./target/release/pith build "$$tmpdir/dir.pith/hello.pith" -o "$$tmpdir/out/named" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/out/named")" = "nested" ]; then pass=$$((pass+1)); echo "ok   build -o names the executable"; else echo "FAIL build -o"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith build "$$tmpdir/dir.pith/hello.pith" --release 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unknown option '--release' for build"; then pass=$$((pass+1)); echo "ok   build refuses an unknown option"; else echo "FAIL build unknown option"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith run "$$tmpdir/dir.pith/hello.pith" -o x 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unknown option '-o' for run"; then pass=$$((pass+1)); echo "ok   run refuses an unknown option"; else echo "FAIL run unknown option"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith test "$$tmpdir/harness.pith" --fliter first 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unknown option '--fliter' for test"; then pass=$$((pass+1)); echo "ok   test refuses an unknown option"; else echo "FAIL test unknown option"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"
@@ -1888,6 +1909,12 @@ cli-regressions-self-only:
 	else \
 		echo "FAIL fmt preserves doc comments"; fail=$$((fail+1)); \
 	fi; \
+	printf 'fn main():\n    print("wrapped")\n' > "$$tmpdir/wrapped.pith"; \
+	set +e; \
+	out=$$(./self-host/pith_main build "$$tmpdir/wrapped.pith" -o "$$tmpdir/wrapped_out" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/wrapped_out")" = "wrapped" ]; then pass=$$((pass+1)); echo "ok   build forwards -o"; else echo "FAIL build forwards -o"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host cli regressions passed"

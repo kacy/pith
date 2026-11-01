@@ -52,8 +52,8 @@ fn run_cli() {
 
     match args[1].as_str() {
         "build" => {
-            require_file_arg(&args, "build");
-            build_file(&args[2]);
+            let (path, output) = parse_file_args("build", &args[2..], true);
+            build_file(&path, output.as_deref());
         }
         "build-ir" => {
             if args.len() < 4 {
@@ -63,8 +63,8 @@ fn run_cli() {
             build_ir_file(&args[2], &args[3]);
         }
         "run" => {
-            require_file_arg(&args, "run");
-            run_file(&args[2]);
+            let (path, _) = parse_file_args("run", &args[2..], false);
+            run_file(&path);
         }
         "test" => {
             require_file_arg(&args, "test");
@@ -99,8 +99,10 @@ fn run_cli() {
                 } else if args[i] == "--json" {
                     env::set_var("PITH_TEST_JSON", "1");
                     i += 1;
+                } else if ["--filter", "--tag", "--exclude-tag"].contains(&args[i].as_str()) {
+                    usage_error(&format!("{} needs a value", args[i]));
                 } else {
-                    i += 1;
+                    usage_error(&unexpected_arg("test", &args[i]));
                 }
             }
             if !selected_tags.is_empty() {
@@ -145,16 +147,71 @@ fn run_cli() {
 /// Exit with a usage error unless `args` names a file after the command.
 fn require_file_arg(args: &[String], command: &str) {
     if args.len() < 3 {
-        eprintln!("Error: {} requires a file argument", command);
-        std::process::exit(1);
+        usage_error(&format!("{} requires a file argument", command));
     }
+}
+
+/// Print a usage error and exit with status 1.
+fn usage_error(message: &str) -> ! {
+    eprintln!("Error: {}", message);
+    eprintln!("Run 'pith help' for usage.");
+    std::process::exit(1);
+}
+
+/// The error for an argument a command does not take: an unknown option,
+/// or a second file.
+fn unexpected_arg(command: &str, arg: &str) -> String {
+    if arg.starts_with('-') && arg.len() > 1 {
+        format!("unknown option '{}' for {}", arg, command)
+    } else {
+        format!("{} takes one file, and '{}' is a second one", command, arg)
+    }
+}
+
+/// The source file and the `-o` output path of `command`, whose arguments
+/// after the command name are `args`. `-o <path>` is accepted before or after
+/// the file when `takes_output` is set. Anything else exits with a usage
+/// error, so a misspelled option is reported rather than ignored.
+fn parse_file_args(command: &str, args: &[String], takes_output: bool) -> (String, Option<String>) {
+    match file_args(command, args, takes_output) {
+        Ok(parsed) => parsed,
+        Err(message) => usage_error(&message),
+    }
+}
+
+fn file_args(
+    command: &str,
+    args: &[String],
+    takes_output: bool,
+) -> Result<(String, Option<String>), String> {
+    let mut path = None;
+    let mut output = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if takes_output && arg == "-o" {
+            let value = args.get(i + 1).ok_or("-o needs an output path")?;
+            if output.replace(value.clone()).is_some() {
+                return Err("-o is given more than once".to_string());
+            }
+            i += 2;
+            continue;
+        }
+        if path.is_some() || (arg.starts_with('-') && arg.len() > 1) {
+            return Err(unexpected_arg(command, arg));
+        }
+        path = Some(arg.clone());
+        i += 1;
+    }
+    let path = path.ok_or_else(|| format!("{} requires a file argument", command))?;
+    Ok((path, output))
 }
 
 fn print_usage() {
     println!("Usage: pith <command> [args...]");
     println!();
     println!("Commands:");
-    println!("  build <file.pith>    Compile .pith file to native binary");
+    println!("  build <file.pith> [-o <out>]  Compile .pith file to native binary");
     println!("  build-ir <file.ir> <out>  Compile combined IR text to a native binary");
     println!("  run <file.pith>      Compile and run immediately");
     println!("  test <file.pith>     Compile and run tests");
@@ -586,9 +643,15 @@ fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
     Ok((bytes, funcs.len()))
 }
 
-fn build_file(path: &str) {
-    let Some(exe_path) = default_exe_path(path) else {
-        eprintln!("Error: {} does not end in .pith, so there is no default output name", path);
+/// Compile `path` to an executable at `output`, or next to the source
+/// without its `.pith` when no output is given. The object file is written
+/// beside the executable as `<exe>.o`.
+fn build_file(path: &str, output: Option<&str>) {
+    let Some(exe_path) = output.or_else(|| default_exe_path(path)) else {
+        eprintln!(
+            "Error: {} does not end in .pith, so there is no default output name; pass -o <out>",
+            path
+        );
         std::process::exit(1);
     };
     let (bytes, func_count) = match compile_to_object(path, false) {
@@ -776,7 +839,7 @@ fn delegate_to_frontend(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        default_exe_path, driver_abi_path, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
+        default_exe_path, driver_abi_path, file_args, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
         object_from_ir, seed_runtime_abi, validate_combined_ir_contract, RUNTIME_ABI,
     };
     use std::fs;
@@ -879,5 +942,25 @@ mod tests {
         assert_eq!(default_exe_path("foo.pith/hello"), None);
         assert_eq!(default_exe_path(".pith"), None);
         assert_eq!(default_exe_path("dir/.pith"), None);
+    }
+
+    #[test]
+    fn build_takes_one_file_and_an_output_path() {
+        let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let parsed = |list: &[&str], output: bool| file_args("build", &args(list), output);
+        let ok = |path: &str, out: Option<&str>| Ok((path.to_string(), out.map(str::to_string)));
+
+        assert_eq!(parsed(&["a.pith"], true), ok("a.pith", None));
+        assert_eq!(parsed(&["a.pith", "-o", "out"], true), ok("a.pith", Some("out")));
+        assert_eq!(parsed(&["-o", "out", "a.pith"], true), ok("a.pith", Some("out")));
+        assert_eq!(parsed(&["-"], true), ok("-", None));
+
+        let err = |list: &[&str], output: bool| parsed(list, output).unwrap_err();
+        assert_eq!(err(&[], true), "build requires a file argument");
+        assert_eq!(err(&["a.pith", "-o"], true), "-o needs an output path");
+        assert_eq!(err(&["a.pith", "-o", "x", "-o", "y"], true), "-o is given more than once");
+        assert_eq!(err(&["a.pith", "--release"], true), "unknown option '--release' for build");
+        assert_eq!(err(&["a.pith", "-o", "x"], false), "unknown option '-o' for build");
+        assert_eq!(err(&["a.pith", "b.pith"], true), "build takes one file, and 'b.pith' is a second one");
     }
 }

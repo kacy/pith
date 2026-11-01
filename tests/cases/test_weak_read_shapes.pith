@@ -1,0 +1,31 @@
+# a weak read hands back an optional that owns a count on its target, so
+# every spelling that consumes one must release it: a plain bind, a value
+# extraction, and a parenthesized read. one that kept the count would keep
+# the target alive after its last strong owner let go, and the final line
+# would read false.
+struct Child:
+    name: String
+
+struct Holder:
+    mut child: Child?
+    weak w: Child?
+
+fn name_of(h: Holder) -> String?:
+    w := h.w
+    if w == none:
+        return none
+    return w.value().name
+
+fn grouped(h: Holder) -> Int:
+    return (h.w).value().name.len()
+
+fn main():
+    h := Holder(child: Child(name: "kid"), w: none)
+    h.w = h.child
+    mut i := 0
+    mut total := 0
+    while i < 1000:
+        total = total + name_of(h).unwrap_or("").len() + grouped(h)
+        i = i + 1
+    h.child = none
+    print("{total} {h.w == none} {name_of(h) == none}")

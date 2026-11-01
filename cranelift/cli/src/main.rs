@@ -587,6 +587,10 @@ fn object_from_ir(ir_text: &str) -> Result<(Vec<u8>, usize), String> {
 }
 
 fn build_file(path: &str) {
+    let Some(exe_path) = default_exe_path(path) else {
+        eprintln!("Error: {} does not end in .pith, so there is no default output name", path);
+        std::process::exit(1);
+    };
     let (bytes, func_count) = match compile_to_object(path, false) {
         Ok(result) => result,
         Err(e) => {
@@ -596,10 +600,18 @@ fn build_file(path: &str) {
     };
 
     eprintln!("Compiled {} functions", func_count);
-    let obj_path = path.replace(".pith", ".o");
-    let exe_path = path.replace(".pith", "");
-    write_and_link(&bytes, &obj_path, &exe_path);
-    stamp_if_ir_driver(&exe_path);
+    write_and_link(&bytes, &format!("{}.o", exe_path), exe_path);
+    stamp_if_ir_driver(exe_path);
+}
+
+/// The executable `pith build` writes for `path`: the path without its
+/// trailing `.pith`. Only the last extension goes, so a directory named
+/// `foo.pith` keeps its name. None when nothing would be left of the file
+/// name, or when there is no `.pith` to strip and the output would
+/// overwrite the source.
+fn default_exe_path(path: &str) -> Option<&str> {
+    path.strip_suffix(".pith")
+        .filter(|stem| !stem.is_empty() && !stem.ends_with('/'))
 }
 
 /// Write an object file and link it into `exe_path`, exiting on failure.
@@ -764,7 +776,7 @@ fn delegate_to_frontend(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        driver_abi_path, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
+        default_exe_path, driver_abi_path, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
         object_from_ir, seed_runtime_abi, validate_combined_ir_contract, RUNTIME_ABI,
     };
     use std::fs;
@@ -856,5 +868,16 @@ mod tests {
         assert!(err.contains("compiled against runtime ABI 0000000000000000"), "{err}");
         let ir = format!("runtime_abi {}\nfunc main 0 int\niconst 1 0\nret 1\nendfunc\n", RUNTIME_ABI);
         assert!(object_from_ir(&ir).is_ok());
+    }
+
+    #[test]
+    fn the_default_output_strips_only_the_trailing_extension() {
+        assert_eq!(default_exe_path("hello.pith"), Some("hello"));
+        assert_eq!(default_exe_path("foo.pith/hello.pith"), Some("foo.pith/hello"));
+        assert_eq!(default_exe_path("a.pith.pith"), Some("a.pith"));
+        assert_eq!(default_exe_path("hello"), None);
+        assert_eq!(default_exe_path("foo.pith/hello"), None);
+        assert_eq!(default_exe_path(".pith"), None);
+        assert_eq!(default_exe_path("dir/.pith"), None);
     }
 }

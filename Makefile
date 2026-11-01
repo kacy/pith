@@ -1835,6 +1835,19 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "compiled against runtime ABI 0000000000000000"; then pass=$$((pass+1)); echo "ok   ir for another runtime abi is refused"; else echo "FAIL ir runtime abi"; echo "$$out"; fail=$$((fail+1)); fi; \
+	mkdir -p "$$tmpdir/dir.pith"; \
+	printf 'fn main():\n    print("nested")\n' > "$$tmpdir/dir.pith/hello.pith"; \
+	set +e; \
+	out=$$(./target/release/pith build "$$tmpdir/dir.pith/hello.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/dir.pith/hello")" = "nested" ]; then pass=$$((pass+1)); echo "ok   build strips only the trailing .pith"; else echo "FAIL build in a .pith directory"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'fn main():\n    print("x")\n' > "$$tmpdir/noext"; \
+	set +e; \
+	out=$$(./target/release/pith build "$$tmpdir/noext" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "does not end in .pith" && grep -q 'print("x")' "$$tmpdir/noext"; then pass=$$((pass+1)); echo "ok   build keeps a source without .pith"; else echo "FAIL build without .pith"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

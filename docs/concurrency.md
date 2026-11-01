@@ -130,6 +130,8 @@ tasks stay simple:
 
 if you intentionally do not plan to join a task later, call `detach()`.
 
+a handle bound to a local is detached for you when the function leaves it unawaited: at a return, at a failure, or when the next `spawn` is stored in the same name, so an early exit that skips the await still lets the task's record go. this applies only to a local that is just awaited, polled with `is_done()` or detached. a handle that is passed on, returned, stored or copied belongs to whoever holds it, and awaiting or detaching it is up to them.
+
 ## timers
 
 `after(ms)` gives you a channel that fires once.
@@ -496,7 +498,8 @@ backend reclaims its slot and releases the closure it was spawned with, so a
 server that spawns one task per request holds only the tasks running at once,
 not one record for every request it has ever served. this holds even for a
 fire-and-forget `spawn f()` whose handle you never keep: a discarded spawn is
-detached at the spawn site, so its slot is reclaimed when the body finishes
+detached at the spawn site, and a handle a function leaves unawaited in a
+local is detached when the function returns, so its slot is reclaimed when the body finishes
 rather than pinned until the process exits. a fan-out of 500k short tasks
 holds around 3 mb, flat no matter how many run in total — see the green fan-out row in `docs/performance.md`. (an awaited task on
 the os-thread backend still keeps its record until you read the result;

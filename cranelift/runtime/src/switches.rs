@@ -46,6 +46,7 @@ extern "C" fn settle() {
         bits |= ALLOC_SITES;
     }
     SWITCHES.store(bits, Ordering::Relaxed);
+    crate::cycle::register_main_mutator();
 }
 
 /// Every switch but `ALLOC_SITES`, whose census also has to be armed, read

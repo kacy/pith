@@ -1,0 +1,47 @@
+# a task whose handle is bound to a local and never awaited must still be
+# reclaimed when it finishes. only an await or a detach frees its slot (and on
+# the os-thread backend joins or detaches its thread), and a bound handle used
+# to get neither when it went out of scope: one leaked slot per call. this is
+# the shape of process.wait_ctx failing on a cancel.
+#
+# three ways a handle goes unawaited: dropped at return, dropped at a failure
+# after polling it, and overwritten by the next spawn in a loop. each task
+# reports on a channel, so at most a few run at once and the peak measures
+# what is left behind, not how many ran together. the round count is divided
+# down because the gate also runs this with a thread per task.
+import leakprobe as probe
+
+fn work(done: Channel[Int], seed: Int) -> Int:
+    done.send(1)
+    return seed
+
+fn drop_at_return(done: Channel[Int], seed: Int) -> Int:
+    task := spawn work(done, seed)
+    return done.recv().unwrap_or(0)
+
+fn drop_at_failure(done: Channel[Int], seed: Int) -> Int!:
+    task := spawn work(done, seed)
+    got := done.recv().unwrap_or(0)
+    if not task.is_done() or got > 0:
+        fail "gave up"
+    return await task
+
+fn main():
+    rounds := probe.rounds() / 10
+    done := Channel[Int](4)
+    mut acc := 0
+    mut i := 0
+    while i < rounds:
+        acc = acc + drop_at_return(done, i)
+        r := drop_at_failure(done, i)
+        if r.is_err:
+            acc = acc + 1
+        i = i + 1
+    mut j := 0
+    while j < rounds:
+        task := spawn work(done, j)
+        acc = acc + done.recv().unwrap_or(0)
+        j = j + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

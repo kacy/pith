@@ -1,0 +1,98 @@
+# a task handle bound to a local is detached when the function leaves it
+# behind unawaited. a handle that leaves the function some other way (passed
+# on, returned, stored, copied) is not, so whoever holds it can still await
+# it, and an awaited or explicitly detached handle is unaffected.
+#
+# the escaping tasks finish before their function returns. a detach at that
+# point would retire them at once, and the later await would read a handle
+# that names nothing.
+import std.time as time
+
+fn quick(n: Int) -> Int:
+    return n * 2
+
+fn slow(n: Int) -> Int:
+    time.delay(5)
+    return n * 2
+
+fn await_it(t: Task[Int]) -> Int:
+    return await t
+
+fn passed_on() -> Int:
+    t := spawn slow(1)
+    return await_it(t)
+
+fn start(n: Int) -> Task[Int]:
+    t := spawn quick(n)
+    time.delay(10)
+    return t
+
+fn stash(tasks: List[Task[Int]], n: Int):
+    t := spawn quick(n)
+    tasks.push(t)
+    time.delay(10)
+
+fn hand_off(n: Int) -> Task[Int]:
+    t := spawn quick(n)
+    u := t
+    time.delay(10)
+    return u
+
+fn stored() -> Int:
+    mut tasks: List[Task[Int]] := []
+    stash(tasks, 3)
+    mut sum := 0
+    for each in tasks:
+        sum = sum + await each
+    return sum
+
+fn awaited_in_a_loop() -> Int:
+    mut sum := 0
+    mut i := 0
+    while i < 5:
+        t := spawn quick(i)
+        sum = sum + await t
+        i = i + 1
+    return sum
+
+fn polled_then_awaited() -> Int:
+    t := spawn slow(5)
+    while not t.is_done():
+        time.delay(1)
+    return await t
+
+fn detached_by_hand() -> Int:
+    t := spawn quick(6)
+    t.detach()
+    time.delay(10)
+    return 0
+
+fn dropped() -> Int:
+    t := spawn slow(7)
+    return 1
+
+fn dropped_on_failure(stop: Bool) -> Int!:
+    t := spawn slow(8)
+    if stop:
+        fail "stopped"
+    return await t
+
+fn rebound() -> Int:
+    mut t := spawn slow(9)
+    t = spawn quick(10)
+    return await t
+
+fn main():
+    print(passed_on().to_string())
+    print((await start(2)).to_string())
+    print(stored().to_string())
+    print((await hand_off(4)).to_string())
+    print(awaited_in_a_loop().to_string())
+    print(polled_then_awaited().to_string())
+    print(detached_by_hand().to_string())
+    print(dropped().to_string())
+    print((dropped_on_failure(true).is_err).to_string())
+    print((dropped_on_failure(false).ok).to_string())
+    print(rebound().to_string())
+    time.delay(20)
+    print("done")

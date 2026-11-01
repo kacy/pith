@@ -109,6 +109,10 @@ mut ir_last_lambda_symbol := ""
 # emitted ir stays bootstrap-stable.
 mut ir_rc_locals: List[String] := []
 mut ir_rc_local_kinds: List[String] := []
+# locals of the current function that own the task a `spawn` gave them (see
+# ir_collect_task_owners). zero-stored in the prologue like the rc locals, and
+# detached at every exit edge and before every rebind.
+mut ir_task_owner_locals: List[String] := []
 # a lambda's captures while its prologue runs: loaded from the closure
 # environment, which owns them, so none of them may become a kinded local.
 mut ir_rc_prologue_captures: List[String] := []
@@ -2585,6 +2589,10 @@ fn ir_emit_rc_cleanup(exclude: String):
     # retains its value like any borrow), so no exclusion applies.
     for kname in ir_kinded_rc_binds:
         ir_kinded_release_slot(kname)
+    for tname in ir_task_owner_locals:
+        tr := ir_reg()
+        ir_emit_local_slot_load(tr, tname)
+        ir_emit_task_owner_detach(tr)
 
 # the type a binding gives its name for the owned-local pre-pass: the
 # annotation when there is one, otherwise what the checker or inference says
@@ -3166,6 +3174,92 @@ fn ir_emit_rc_prologue(body_idx: Int):
         code_r := ir_reg()
         ir_emit("iconst " + code_r.to_string() + " " + code.to_string())
         ir_emit("store " + ir_kinded_tag_slot(kname) + " " + code_r.to_string())
+    ir_task_owner_locals = ir_collect_task_owners(body_idx)
+    for tname in ir_task_owner_locals:
+        z := ir_reg()
+        ir_emit("iconst " + z.to_string() + " 0")
+        ir_emit_name_store(tname, z)
+
+# the locals of a function body that own their task: each is bound to a
+# `spawn` at every site that binds it, and otherwise only awaited, polled
+# with is_done or detached. an exit edge or a rebind detaches whatever handle
+# the slot still holds, so a task nobody awaits gives back its slot (and on
+# the os-thread backend its thread) once it ends. detaching a handle an await already retired
+# is a no-op, so no path has to know whether it awaited. any other use (an
+# argument, a return, a store, a capture, another variable of the same
+# name) lets the handle out of the function, which then leaves it alone.
+fn ir_collect_task_owners(body_idx: Int) -> List[String]:
+    mut owners: List[String] := []
+    if body_idx < 0:
+        return owners
+    mut candidates: List[String] := []
+    ir_task_owner_candidates(body_idx, candidates)
+    if candidates.len() == 0:
+        return owners
+    mut escaped: List[String] := []
+    ir_task_owner_escapes(body_idx, 0 - 1, candidates, escaped, false)
+    for name in candidates:
+        if not escaped.contains(name) and not ir_var_regs.contains_key(name) and not ir_rc_locals.contains(name) and not ir_kinded_rc_binds.contains(name):
+            owners.push(name)
+    return owners
+
+# every name a binding outside any lambda gives a `spawn`.
+fn ir_task_owner_candidates(idx: Int, names: List[String]):
+    node := get_node(idx)
+    if node.kind == "lambda":
+        return
+    if ir_is_binding_kind(node.kind):
+        parts := ir_collect_bind_parts(node)
+        if parts.val_idx >= 0 and node_kind(parts.val_idx) == "spawn" and not names.contains(parts.name):
+            names.push(parts.name)
+    for child in node.children:
+        ir_task_owner_candidates(child, names)
+
+# the candidates some node uses in a way that lets the handle escape.
+fn ir_task_owner_escapes(idx: Int, parent_idx: Int, names: List[String], escaped: List[String], in_lambda: Bool):
+    node := get_node(idx)
+    if node.kind == "ident":
+        if names.contains(node.value) and (in_lambda or not ir_task_owner_use_is_safe(idx, parent_idx)):
+            escaped.push(node.value)
+        return
+    if ir_is_binding_kind(node.kind):
+        parts := ir_collect_bind_parts(node)
+        if names.contains(parts.name) and (in_lambda or parts.val_idx < 0 or node_kind(parts.val_idx) != "spawn"):
+            escaped.push(parts.name)
+    elif node.kind == "assign":
+        if names.contains(node.value) and (in_lambda or node.children.len() != 1 or node_kind(node.children[0]) != "spawn"):
+            escaped.push(node.value)
+    elif node.kind != "method_call" and node.kind != "field_access" and node.value.len() > 0:
+        # a loop, pattern or parameter binding of the same name is another
+        # variable, and the slot cannot tell the two apart.
+        for name in names:
+            if ir_value_mentions_name(node.value, name):
+                escaped.push(name)
+    for child in node.children:
+        ir_task_owner_escapes(child, idx, names, escaped, in_lambda or node.kind == "lambda")
+
+# true for the uses that keep a task handle in its local: the operand of an
+# await, and the receiver of is_done or detach.
+fn ir_task_owner_use_is_safe(idx: Int, parent_idx: Int) -> Bool:
+    if parent_idx < 0:
+        return false
+    parent := get_node(parent_idx)
+    if parent.kind == "await":
+        return true
+    if parent.kind == "method_call" and parent.children.len() > 0 and parent.children[0] == idx:
+        return parent.value == "is_done" or parent.value == "detach"
+    return false
+
+# true when a node's packed value string ("item, i", "x mut") names `name`.
+fn ir_value_mentions_name(value: String, name: String) -> Bool:
+    for part in value.replace(",", " ").split(" "):
+        if part.trim() == name:
+            return true
+    return false
+
+# detach the task a task-owning local holds, read into `r`.
+fn ir_emit_task_owner_detach(r: Int):
+    ir_emit_call1(ir_reg(), "pith_task_detach", "void", r)
 
 fn ir_ident_callee(name: String) -> ResolvedCallee:
     return ir_ident_callee_with_state(name, ir_import_renames, ir_active_generic_module_path, ir_import_declared_functions)
@@ -8358,6 +8452,8 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # release decisions and made it load a name the ir had not declared.
     saved_untracked_binds := ir_untracked_rc_binds
     saved_kinded_binds := ir_kinded_rc_binds
+    saved_task_owners := ir_task_owner_locals
+    ir_task_owner_locals = []
     saved_stack_closures := ir_stack_closure_names
     saved_stack_closure_regs := ir_stack_closure_regs
     saved_fn_bindings := ir_active_fn_bindings
@@ -8428,6 +8524,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_weak_capture_names = saved_weak_caps
     ir_untracked_rc_binds = saved_untracked_binds
     ir_kinded_rc_binds = saved_kinded_binds
+    ir_task_owner_locals = saved_task_owners
     ir_stack_closure_names = saved_stack_closures
     ir_stack_closure_regs = saved_stack_closure_regs
     ir_active_fn_bindings = saved_fn_bindings
@@ -10164,6 +10261,9 @@ fn ir_emit_bind_stmt(node: Node):
             elif ir_var_types.contains_key(name):
                 ir_var_types.remove(name)
         return
+    if val_idx >= 0 and ir_task_owner_locals.contains(name):
+        ir_emit_task_owner_rebind(name, val_idx)
+        return
     if val_idx >= 0:
         # a tracked string local that is bound again (a loop body re-entering
         # the binding) owns a count on its previous value; capture it before
@@ -10213,6 +10313,9 @@ fn ir_emit_assign_stmt(node: Node):
     if node.children.len() > 0 and ir_name_is_kinded(name):
         ir_emit_kinded_assign(name, node.children[0], ir_infer_type(node.children[0]), "")
         return
+    if node.children.len() > 0 and ir_task_owner_locals.contains(name):
+        ir_emit_task_owner_rebind(name, node.children[0])
+        return
     if node.children.len() > 0:
         # same ownership dance as rebinding; string globals get the
         # retain/release pair too but are never in the exit cleanup.
@@ -10241,6 +10344,20 @@ fn ir_emit_assign_stmt(node: Node):
             ir_rc_release_local(old_r, legacy_kind, name)
         ir_var_regs.insert(name, r)
         ir_emit_name_store(name, r)
+
+# a task-owning local takes a new `spawn`: the task it held until now has no
+# other name, so it is detached once the new handle is stored.
+fn ir_emit_task_owner_rebind(name: String, val_idx: Int):
+    old_r := ir_reg()
+    ir_emit_name_load(old_r, name)
+    r := ir_expr(val_idx)
+    ir_var_regs.insert(name, r)
+    ir_emit_name_store(name, r)
+    ir_emit_task_owner_detach(old_r)
+    if not ir_var_types.contains_key(name):
+        inferred := ir_infer_type(val_idx)
+        if inferred.len() > 0:
+            ir_var_types.insert(name, inferred)
 
 # `name = value` on a kinded local: the value is of the type the binding in
 # effect gave the name, so it takes its count under that type's kind, and the
@@ -11931,6 +12048,7 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_rc_local_kinds = []
     ir_untracked_rc_binds = []
     ir_kinded_rc_binds = []
+    ir_task_owner_locals = []
     ir_tuple_local_tid = {}
     ir_tuple_cascade_names = []
     ir_stack_tuple_names = []

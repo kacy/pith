@@ -86,6 +86,9 @@ pub mod terminal;
 pub mod utility;
 pub mod zstd_codec;
 
+#[cfg(all(test, loom))]
+mod loom_models;
+
 pub use encoding::*;
 pub use host_fs::*;
 pub use network::*;

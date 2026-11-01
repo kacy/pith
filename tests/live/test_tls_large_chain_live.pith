@@ -16,9 +16,9 @@ CA := "tests/live/fixtures/keyusage-root.crt"
 fn choose_port(start: Int) -> Int!:
     mut port := start
     while port < start + 40:
-        probe := tcp.tcp_listen("127.0.0.1", port)
+        probe := tcp.listen("127.0.0.1", port)
         if probe.is_ok:
-            tcp.tcp_close(probe.ok)
+            tcp.close(probe.ok)
             return port
         port = port + 1
     fail "no free port"

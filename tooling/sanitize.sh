@@ -67,13 +67,29 @@ export TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=0:report_signal_unsafe=0:hist
 export PITH_STRUCT_FREELIST=0
 
 # --- one case, run by the parallel pass below and again by the retry ---
-# prints "ok", "FAIL <why>" or "REPORT" followed by the case and backend.
+# a sanitized binary keeps its symbols and runs to tens of megabytes, so each
+# case is built, run on every backend and deleted before the next one starts:
+# building the whole corpus first needs more disk than a runner has.
+# prints one "ok", "FAIL" or "REPORT" line per backend.
+check_case() {
+  local work="$1" name="$2" backends="$3" exe="$1/tests/cases/$2"
+  if ! CC="$wrapper" PITH_KEEP_SYMBOLS=1 PITH_RUNTIME_LIB="$runtime_lib"       timeout 300 "$pith" build "$exe.pith" >/dev/null 2>&1; then
+    echo "FAIL $name build"
+    rm -f "$exe" "$exe.o"
+    return
+  fi
+  for backend in $backends; do
+    run_case "$work" "$name" "$backend"
+  done
+  rm -f "$exe" "$exe.o"
+}
+
 run_case() {
   local work="$1" name="$2" backend="$3" green=1 out log
   [ "$backend" = os ] && green=0
   out="$work/$name.$backend.out"
   log="$work/$name.$backend.log"
-  if ! PITH_GREEN="$green" timeout 600 "$work/cases/$name" >"$out" 2>"$log"; then
+  if ! PITH_GREEN="$green" timeout 600 "$work/tests/cases/$name" >"$out" 2>"$log"; then
     :  # the exit code is judged by the expected output below
   fi
   if grep -q -E '^==[0-9]+==ERROR: (Address|Thread)Sanitizer|^WARNING: ThreadSanitizer' "$log"; then
@@ -111,7 +127,7 @@ run_std() {
 # the parallel pass calls back into this script for each item
 if [ "$scope" = "--case" ] || [ "$scope" = "--std" ]; then
   work="$3" item="$4" backend="$5"
-  if [ "$scope" = "--case" ]; then run_case "$work" "$item" "$backend"; else run_std "$work" "$item" "$backend"; fi
+  if [ "$scope" = "--case" ]; then check_case "$work" "$item" "$backend"; else run_std "$work" "$item" "$backend"; fi
   exit 0
 fi
 
@@ -140,21 +156,13 @@ results="$work/results"
 
 if [ "$scope" = all ] || [ "$scope" = corpus ]; then
   echo "--- regression corpus ($backends) ---"
-  # a copy of the whole tree, so cases that import sibling modules find them
-  cp -r tests/cases "$work/cases"
-  names=()
+  # a copy of the tracked tree, so cases that import sibling modules or read a
+  # fixture beside them find it; local build output stays behind
+  git ls-files -z tests/cases | xargs -0 cp --parents -t "$work"
   for expected in tests/expected/*.txt; do
     name="$(basename "$expected" .txt)"
-    [ -f "tests/cases/$name.pith" ] && names+=("$name")
-  done
-  printf '%s\n' "${names[@]}" | xargs -P "$jobs" -I{} sh -c \
-    'CC="$1" PITH_KEEP_SYMBOLS=1 PITH_RUNTIME_LIB="$2" timeout 300 "$3" build "$4/cases/$5.pith" >/dev/null 2>&1 || echo "FAIL $5 build"' \
-    _ "$wrapper" "$runtime_lib" "$pith" "$work" {} >>"$results"
-  for backend in $backends; do
-    printf '%s\n' "${names[@]}" | while read -r name; do
-      [ -x "$work/cases/$name" ] && echo "$name"
-    done | xargs -P "$jobs" -I{} "$0" "$kind" --case "$work" {} "$backend" >>"$results"
-  done
+    [ -f "tests/cases/$name.pith" ] && echo "$name"
+  done | xargs -P "$jobs" -I{} "$0" "$kind" --case "$work" {} "$backends" >>"$results"
 fi
 
 if [ "$scope" = all ] || [ "$scope" = std ]; then
@@ -185,7 +193,7 @@ while read -r status item backend; do
         failed=1
         continue
       fi
-      if [[ "$item" == std/* ]]; then again="$(run_std "$work" "$item" "$backend")"; else again="$(run_case "$work" "$item" "$backend")"; fi
+      if [[ "$item" == std/* ]]; then again="$(run_std "$work" "$item" "$backend")"; else again="$(check_case "$work" "$item" "$backend")"; fi
       if [[ "$again" != ok* ]]; then
         echo "$again"
         failed=1

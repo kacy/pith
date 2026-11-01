@@ -49,6 +49,15 @@ pub fn ir_unboxed_enum_hint(type_hint: String) -> Bool:
         return false
     return ir_enum_variant_lists.contains_key(name) and not ir_boxed_enums.contains_key(name)
 
+## whether a type hint names one of the four sync primitives, in the bare
+## form a checked type gives or the `opaque:` form a call's return kind
+## carries.
+pub fn ir_sync_type_hint(type_hint: String) -> Bool:
+    mut name := type_hint
+    if name.starts_with("opaque:"):
+        name = name.substring(7, name.len())
+    return name == "Mutex" or name == "WaitGroup" or name == "Semaphore" or name == "AtomicInt"
+
 ## the reference-counting kind for an emission type hint, or ""
 ## for kinds that never own heap memory.
 pub fn ir_rc_kind(type_hint: String) -> String:
@@ -59,6 +68,11 @@ pub fn ir_rc_kind(type_hint: String) -> String:
     # carries the payload type as a suffix, the binding form does not.
     if type_hint == "channel" or type_hint.starts_with("channel:"):
         return "channel"
+    # Mutex, WaitGroup, Semaphore and AtomicInt handles are counted the same
+    # way, under one kind: the runtime's retain and release read the
+    # primitive's magic word to pick the free.
+    if ir_sync_type_hint(type_hint):
+        return "sync"
     if type_hint == "list" or type_hint == "list_string":
         return "list"
     if type_hint == "map" or type_hint == "map_int":

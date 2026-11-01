@@ -1,0 +1,86 @@
+# the less common places a Mutex, WaitGroup, Semaphore or AtomicInt handle
+# can sit, beside sync_primitive_ownership: an enum payload, a generic
+# struct field and a generic function's argument and result, an optional and
+# a result return, a map literal, a rebind of a mutable local, and a value
+# discarded at statement level. each takes and drops its counts like a
+# channel would.
+enum Slot:
+    Held(Mutex)
+    Count(AtomicInt, Int)
+    Empty
+
+struct Box[T]:
+    pub value: T
+
+fn ident[T](x: T) -> T:
+    return x
+
+fn pick(i: Int) -> Slot:
+    if i == 0:
+        return Slot.Held(Mutex())
+    if i == 1:
+        return Slot.Count(AtomicInt(i), i)
+    return Slot.Empty
+
+fn maybe_mutex(i: Int) -> Mutex?:
+    if i % 2 == 0:
+        return Mutex()
+    return none
+
+fn fallible(i: Int) -> Semaphore!:
+    if i < 0:
+        fail "neg"
+    return Semaphore(1)
+
+fn use_slot(s: Slot) -> Int:
+    match s:
+        Slot.Held(m) =>
+            m.lock()
+            m.unlock()
+            return 1
+        Slot.Count(c, n) =>
+            return c.load() + n
+        Slot.Empty =>
+            return 0
+
+fn kinds(i: Int) -> Int:
+    mut x := Mutex()
+    if i % 2 == 0:
+        x = Mutex()
+    y := x
+    y.lock()
+    y.unlock()
+    return 1
+
+fn main() -> Int!:
+    mut total := 0
+    mut i := 0
+    while i < 30:
+        total = total + use_slot(pick(i % 3))
+        s := pick(i % 3)
+        total = total + use_slot(s)
+        if let m = maybe_mutex(i):
+            m.lock()
+            m.unlock()
+            total = total + 1
+        sem := fallible(i)!
+        sem.acquire()
+        sem.release()
+        b := Box[WaitGroup](value: WaitGroup())
+        b.value.add(1)
+        b.value.done()
+        b.value.wait()
+        w := ident(b.value)
+        w.wait()
+        m2 := ident(Mutex())
+        m2.lock()
+        m2.unlock()
+        cells: Map[Int, AtomicInt] := {1: AtomicInt(5), 2: AtomicInt(6)}
+        cells[1] = AtomicInt(7)
+        if let c = cells.get(1):
+            total = total + c.load()
+        total = total + kinds(i)
+        Mutex()
+        i = i + 1
+    print("total {total}")
+    return 0

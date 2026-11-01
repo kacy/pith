@@ -42,6 +42,7 @@ pub enum Kind {
     Closure = 7,
     String = 8,
     Channel = 9,
+    Sync = 10,
 }
 
 impl Kind {
@@ -56,6 +57,7 @@ impl Kind {
             7 => Kind::Closure,
             8 => Kind::String,
             9 => Kind::Channel,
+            10 => Kind::Sync,
             _ => return None,
         })
     }
@@ -71,6 +73,7 @@ impl Kind {
             Kind::Closure => "closure",
             Kind::String => "string",
             Kind::Channel => "channel",
+            Kind::Sync => "sync primitive",
         }
     }
 }

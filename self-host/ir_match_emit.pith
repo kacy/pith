@@ -13,7 +13,7 @@ from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_var_regs,
 from ir_call_emit import ir_emit_call2, ir_emit_label, ir_last_was_ret
 from ir_literals import ir_emit_bool_literal, ir_emit_float_literal, ir_emit_int_literal, ir_emit_string_literal
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field
-from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_struct_field_index_lookup, ir_rc_kind, ir_struct_names, ir_struct_base_name
+from ir_struct_registry import ir_boxed_enums, ir_enum_payload_kinds, ir_struct_field_index_lookup, ir_rc_kind, ir_struct_names, ir_struct_base_name, ir_sync_type_hint
 from ir_ownership import ir_rc_retain_reg, ir_rc_release_reg, ir_kinded_code, ir_kinded_rebind
 from ir_type_helpers import ir_checked_type, ir_type_from_tid
 
@@ -346,6 +346,8 @@ fn ir_payload_kind_is_unresolved(kind: String) -> Bool:
     if kind == "int" or kind == "float" or kind == "bool" or kind == "string" or kind == "bytes":
         return false
     if kind == "tuple" or kind == "closure" or kind == "channel" or kind == "task":
+        return false
+    if ir_sync_type_hint(kind):
         return false
     if kind == "list" or kind == "list_string" or kind == "map" or kind == "map_int" or kind == "set" or kind == "set_int":
         return false

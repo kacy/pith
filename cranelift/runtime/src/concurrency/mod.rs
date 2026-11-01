@@ -6,6 +6,7 @@ pub mod green;
 pub mod mutex;
 pub mod scheduler;
 pub mod semaphore;
+pub mod sync_handle;
 pub mod task;
 pub mod waitgroup;
 
@@ -20,6 +21,7 @@ pub use channel::{
 };
 pub use mutex::{pith_mutex_lock, pith_mutex_new, pith_mutex_unlock};
 pub use semaphore::{pith_semaphore_acquire, pith_semaphore_new, pith_semaphore_release};
+pub use sync_handle::{pith_sync_release, pith_sync_retain};
 pub use waitgroup::{
     pith_waitgroup_add, pith_waitgroup_done, pith_waitgroup_new, pith_waitgroup_wait,
 };

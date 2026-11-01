@@ -39,14 +39,15 @@
 //! scheduler locks are never taken while probing for the mutex.
 
 use crate::concurrency::green;
+use crate::concurrency::sync_handle::{self, BlockCount, SyncHeader, MUTEX_MAGIC};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
-const MUTEX_MAGIC: u32 = 0x504d5458; // "PMTX"
-
+/// a mutex is one allocation owned by its count (see `sync_handle`), freed at
+/// the last release.
 #[repr(C)]
 pub struct PithMutex {
-    magic: u32,
+    header: SyncHeader,
     state: AtomicU32,
     /// ids of green tasks parked in `lock` under contention. an os-thread
     /// caller never registers here (it spins and then yields), so this
@@ -58,14 +59,14 @@ pub struct PithMutex {
 pub type PithMutexHandle = PithMutex;
 
 unsafe fn mutex_ref<'a>(handle: *mut PithMutexHandle) -> Option<&'a PithMutex> {
-    if handle.is_null() || (handle as usize) % 4 != 0 {
-        return None;
-    }
-    let m = &*(handle as *const PithMutex);
-    if m.magic != MUTEX_MAGIC {
-        return None;
-    }
-    Some(m)
+    sync_handle::header_of(handle as *const (), MUTEX_MAGIC, crate::quarantine::Op::Use)?;
+    Some(&*(handle as *const PithMutex))
+}
+
+/// the last count is gone: nothing can be parked on the lock, since a parked
+/// task holds a count of its own.
+pub(crate) unsafe fn free_mutex(p: *mut PithMutex) {
+    sync_handle::free_box(p);
 }
 
 fn lock_waiters(m: &PithMutex) -> std::sync::MutexGuard<'_, Vec<usize>> {
@@ -83,8 +84,11 @@ fn try_acquire(m: &PithMutex) -> bool {
         .is_ok()
 }
 
-/// os-thread lock path: spin briefly, then yield.
+/// os-thread lock path: spin briefly, then yield. a waiter that has spun
+/// long enough to yield takes a count for the rest of its wait (see
+/// `sync_handle`); the spin itself takes none.
 fn lock_os(m: &PithMutex) {
+    let block = BlockCount::new(&m.header);
     let mut spins = 0u32;
     loop {
         if m
@@ -103,6 +107,7 @@ fn lock_os(m: &PithMutex) {
             // touches no reference count while it waits, holds no lock, and
             // its own frames are frozen for the length of the park. one
             // relaxed load when the collector flag is off.
+            block.take();
             crate::cycle::mutator_gate();
             std::thread::yield_now();
         }
@@ -113,6 +118,7 @@ fn lock_os(m: &PithMutex) {
 /// spin, so the worker is freed to run the holder. see the register/park race
 /// note in the module header for why the re-check happens under the waiter lock.
 fn lock_green(m: &PithMutex, id: usize) {
+    let block = BlockCount::new(&m.header);
     loop {
         if try_acquire(m) {
             return;
@@ -132,6 +138,7 @@ fn lock_green(m: &PithMutex, id: usize) {
             waiters.push(id);
         }
         drop(waiters);
+        block.take();
         green::park_current(id);
         // resumed by an unlock, or by a stray wake; loop and retry the acquire.
     }
@@ -143,7 +150,7 @@ fn lock_green(m: &PithMutex, id: usize) {
 #[no_mangle]
 pub extern "C" fn pith_mutex_new() -> *mut PithMutexHandle {
     Box::into_raw(Box::new(PithMutex {
-        magic: MUTEX_MAGIC,
+        header: SyncHeader::new(MUTEX_MAGIC),
         state: AtomicU32::new(0),
         green_waiters: Mutex::new(Vec::new()),
     }))

@@ -218,6 +218,12 @@ these four are language builtins, available in any pith program without an
 import. `std.log`, `std.metrics`, `std.trace`, `std.io`, `std.uuid`,
 `std.net.tls`, and both database drivers are built on them.
 
+each of the four is a counted handle, like a channel. a copy in a binding,
+a field, a list or a capture refers to the same primitive, and its memory is
+freed when the last holder is released. a task started with `spawn` holds
+its own count on each one it receives, so it can keep using it after the
+function that created it returns.
+
 `Mutex()` guards a section that must not run twice at once:
 
 ```pith

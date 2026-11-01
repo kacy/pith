@@ -195,6 +195,14 @@ mut ir_borrow_param_exported: Map[String, String] := {}
 # local names this module's own calls use, exported names other modules use.
 mut ir_storage_keepers_local: Map[String, Bool] := {}
 mut ir_storage_keepers_exported: Map[String, Bool] := {}
+# the functions that keep storage once atomic cell methods are allowed too
+# (a superset of the above). an atomic store can hand guarded storage to
+# another task as an unlock does, so a call to one of these still pins every
+# argument except a sync handle; see ir_pin_arg.
+mut ir_atomic_keepers_local: Map[String, Bool] := {}
+mut ir_atomic_keepers_exported: Map[String, Bool] := {}
+# set while ir_record_storage_keepers fills the atomic maps
+mut ir_keeper_pass_atomic := false
 
 # --- per-module state: type metadata and the helpers it calls for ---
 
@@ -1137,7 +1145,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # and a function returning a channel retains a borrowed one on the
         # way out. classified as a borrow, the bind retained a second count
         # and every channel outlived its single release.
-        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure" or expr_kind == "tuple" or expr_kind == "channel":
+        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure" or expr_kind == "tuple" or expr_kind == "channel" or expr_kind == "sync":
             return false
     if node.kind == "method_call":
         # a module-qualified call (`mod.helper(...)`) parses as a method call
@@ -1259,7 +1267,7 @@ fn ir_branch_retain_kind(idx: Int) -> String:
     kind := ir_rc_kind(ir_infer_type(idx))
     if kind == "string" or kind == "list" or kind == "map" or kind == "set" or kind == "bytes":
         return kind
-    if kind == "struct" or kind == "closure" or kind == "channel":
+    if kind == "struct" or kind == "closure" or kind == "channel" or kind == "sync":
         return kind
     return ""
 
@@ -2025,6 +2033,16 @@ fn ir_local_closure_arg_positions(node: Node, callee_name: String) -> List[Int]:
 # methods of generic types are left out, as in ir_record_borrow_params.
 fn ir_record_storage_keepers(root_idx: Int):
     ir_storage_keepers_local = {}
+    ir_atomic_keepers_local = {}
+    ir_keeper_pass_atomic = false
+    ir_record_keeper_passes(root_idx)
+    ir_keeper_pass_atomic = true
+    ir_record_keeper_passes(root_idx)
+    ir_keeper_pass_atomic = false
+
+# one fixed-point walk over the module's functions, filling the maps the
+# current pass names.
+fn ir_record_keeper_passes(root_idx: Int):
     saved_impl_type := ir_current_impl_type
     mut changed := true
     while changed:
@@ -2050,18 +2068,41 @@ fn ir_record_storage_keepers(root_idx: Int):
 # record one function when its body keeps storage and it is not recorded yet.
 # true when this call added it.
 fn ir_record_storage_keeper(decl_idx: Int, sym: String) -> Bool:
-    if ir_storage_keepers_local.contains_key(sym):
+    if ir_keeper_pass_atomic:
+        if ir_atomic_keepers_local.contains_key(sym):
+            return false
+    elif ir_storage_keepers_local.contains_key(sym):
         return false
     body_idx := ir_tuple_walk_fn_body(decl_idx)
     if body_idx < 0 or not ir_subtree_keeps_storage(body_idx, decl_idx, body_idx):
         return false
-    ir_storage_keepers_local.insert(sym, true)
+    mut exported := ""
     if ir_current_module_path.len() > 0:
-        ir_storage_keepers_exported.insert(ir_import_target_name(ir_current_module_path, sym), true)
+        exported = ir_import_target_name(ir_current_module_path, sym)
+    if ir_keeper_pass_atomic:
+        ir_atomic_keepers_local.insert(sym, true)
+        if exported.len() > 0:
+            ir_atomic_keepers_exported.insert(exported, true)
+    else:
+        ir_storage_keepers_local.insert(sym, true)
+        if exported.len() > 0:
+            ir_storage_keepers_exported.insert(exported, true)
     return true
 
 fn ir_is_storage_keeper(name: String) -> Bool:
     return ir_storage_keepers_local.contains_key(name) or ir_storage_keepers_exported.contains_key(name)
+
+# a function that keeps storage apart from atomic cell methods. a call to one
+# pins its arguments except the sync handles.
+fn ir_is_atomic_keeper(name: String) -> Bool:
+    return ir_atomic_keepers_local.contains_key(name) or ir_atomic_keepers_exported.contains_key(name)
+
+# the keeper test ir_subtree_keeps_storage applies to a callee: the strict
+# one, or during the atomic pass either kind.
+fn ir_callee_keeps_storage(name: String) -> Bool:
+    if ir_is_storage_keeper(name):
+        return true
+    return ir_keeper_pass_atomic and ir_is_atomic_keeper(name)
 
 # the free builtins that touch no counted value and no other task. a byte
 # buffer holds raw bytes, so writing to one cannot release anything.
@@ -2100,14 +2141,14 @@ fn ir_subtree_keeps_storage(idx: Int, decl_idx: Int, body_idx: Int) -> Bool:
         if callee.kind != "ident":
             return false
         if ir_is_declared_callable(callee.value):
-            if not ir_is_storage_keeper(ir_resolve_static_callee(node.children[0]).name):
+            if not ir_callee_keeps_storage(ir_resolve_static_callee(node.children[0]).name):
                 return false
         elif not ir_is_pure_builtin(callee.value):
             return false
     elif kind == "method_call":
         callee_sym := ir_tuple_method_call_symbol(idx, node)
         if callee_sym.len() > 0:
-            if not ir_is_storage_keeper(callee_sym):
+            if not ir_callee_keeps_storage(callee_sym):
                 return false
         elif not ir_method_keeps_storage(idx):
             return false
@@ -2134,6 +2175,13 @@ fn ir_method_keeps_storage(idx: Int) -> Bool:
         return ["len", "is_empty", "contains"].contains(name)
     if recv_type == "bytes":
         return ["len", "is_empty", "get", "slice"].contains(name)
+    # an atomic cell's methods hold no counted value and never wait, but a
+    # store or a compare_set can release a lock a program built from the cell,
+    # handing guarded storage to another task, as unlock, done and release do.
+    # so they count only in the atomic pass, whose keepers still pin every
+    # argument but a sync handle. the other sync methods never count.
+    if ir_keeper_pass_atomic and (recv_type == "AtomicInt" or recv_type == "opaque:AtomicInt"):
+        return ["load", "store", "compare_set"].contains(name)
     return false
 
 # true when `name` is a parameter of the function or bound inside its body,
@@ -3435,10 +3483,14 @@ fn ir_arg_pin_kind(expr_idx: Int) -> String:
 
 # pin the argument just evaluated into `reg` when pin is set and it needs it,
 # and record the kind (or "") so ir_unpin_args can release it after the call.
-fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String], pin: Bool):
+fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String], pin: Bool, skip_sync: Bool):
     mut kind := ""
     if pin:
         kind = ir_arg_pin_kind(expr_idx)
+    # an atomic keeper (ir_is_atomic_keeper) can hand storage to another task
+    # but cannot drop a sync handle, so only those go unpinned
+    if skip_sync and kind == "sync":
+        kind = ""
     if kind.len() > 0:
         ir_rc_retain_reg(reg, kind)
     pins.push(kind)
@@ -3511,7 +3563,7 @@ fn ir_callee_runs_user_code(callee_idx: Int) -> Bool:
 # a parameter the callee only calls (see ir_record_closure_params). with pin
 # set, arguments are pinned as above; an argument a later one can drop is
 # pinned either way. pins receives one entry per register.
-fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int], pin: Bool, pins: List[String]) -> List[Int]:
+fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int], pin: Bool, skip_sync: Bool, pins: List[String]) -> List[Int]:
     later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, start_idx))
     mut arg_regs: List[Int] := []
     for child, i in node.children:
@@ -3528,7 +3580,8 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List
             pins.push("")
         else:
             arg_r := ir_emit_call_arg(expr_idx)
-            ir_pin_arg(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
+            later := later_drops[arg_regs.len()]
+            ir_pin_arg(expr_idx, arg_r, pins, pin or later, skip_sync and not later)
             arg_regs.push(arg_r)
     return arg_regs
 
@@ -4326,7 +4379,7 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
 fn ir_kind_is_owned_optional_payload(kind: String) -> Bool:
     if kind == "struct" or kind == "list" or kind == "map" or kind == "set":
         return true
-    return kind == "bytes" or kind == "closure" or kind == "string" or kind == "channel"
+    return kind == "bytes" or kind == "closure" or kind == "string" or kind == "channel" or kind == "sync"
 
 # build a Some that owns its payload. the payload arrives owned either way: a
 # fresh value carries its own count, and a borrowed one is retained here to pair
@@ -4545,7 +4598,7 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
 # the receiver's register first, then each argument's. with pin set (an impl
 # method, which is user code) the receiver and the arguments are pinned the
 # way ir_collect_call_arg_regs pins, one pins entry per register.
-fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> List[Int]:
+fn ir_collect_method_call_regs(node: Node, pin: Bool, skip_sync: Bool, pins: List[String]) -> List[Int]:
     later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, 0))
     mut regs: List[Int] := []
     for child, i in node.children:
@@ -4560,7 +4613,8 @@ fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> Lis
             r = ir_expr(expr_idx)
         else:
             r = ir_emit_call_arg(expr_idx)
-        ir_pin_arg(expr_idx, r, pins, pin or later_drops[regs.len()])
+        later := later_drops[regs.len()]
+        ir_pin_arg(expr_idx, r, pins, pin or later, skip_sync and not later)
         regs.push(r)
     return regs
 
@@ -4805,6 +4859,9 @@ fn ir_closure_capture_tag(kind: String) -> Int:
     # a captured channel handle: the closure holds one owner count
     if kind == "channel":
         return 9
+    # a captured Mutex, WaitGroup, Semaphore or AtomicInt: one owner count
+    if kind == "sync":
+        return 10
     return 0
 
 # a stack closure is never released, so it takes no count on what it
@@ -4966,7 +5023,7 @@ fn ir_release_owned_operand(expr_idx: Int, reg: Int, expr_type: String):
 # because a fresh string has shapes (an s[i] char, a concat) that no rc kind
 # describes.
 fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
-    if arg_kind == "struct" or arg_kind == "closure" or arg_kind == "channel":
+    if arg_kind == "struct" or arg_kind == "closure" or arg_kind == "channel" or arg_kind == "sync":
         return true
     return arg_kind == "list" or arg_kind == "map" or arg_kind == "set"
 
@@ -5617,7 +5674,7 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int], want_equal: Bool) -> 
 
 fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node: Node) -> Int:
     mut arg_pins: List[String] := []
-    arg_regs := ir_collect_call_arg_regs(node, 1, [], false, arg_pins)
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], false, false, arg_pins)
     if arg_regs.len() < 2:
         ir_unpin_args(arg_regs, arg_pins)
         return ir_zero_reg()
@@ -6099,7 +6156,7 @@ fn ir_emit_indirect_expr_call(idx: Int, node: Node, callee_idx: Int) -> Int:
     if callee_pin.len() > 0:
         ir_rc_retain_reg(callee_r, callee_pin)
     mut arg_pins: List[String] := []
-    arg_regs := ir_collect_call_arg_regs(node, 1, [], true, arg_pins)
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], true, false, arg_pins)
     mut ret_kind := ir_function_return_kind(callee_idx)
     if ret_kind == "unknown":
         ret_kind = "int"
@@ -6231,7 +6288,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     callee = ir_specialize_static_callee(idx, node, callee, explicit_generic_types)
     mut arg_pins: List[String] := []
     pins_args := ir_callee_runs_user_code(node.children[0]) and not ir_is_storage_keeper(callee.name)
-    arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions, pins_args, arg_pins)
+    arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions, pins_args, ir_is_atomic_keeper(callee.name), arg_pins)
     if is_generic_callee and local_fn_positions.len() > 0:
         callee = ResolvedCallee(ir_bind_fn_specialization(callee.name, ir_fn_arg_bindings(node, local_fn_positions, arg_regs)), callee.imported)
     if callee.name == "Channel":
@@ -6433,6 +6490,8 @@ fn ir_element_tag_code(kind: String) -> Int:
         return 7
     if kind == "channel":
         return 8
+    if kind == "sync":
+        return 9
     return 0
 
 # whether a value of this type is a plain machine word with no count: an
@@ -6469,7 +6528,7 @@ fn ir_store_learns_kind(store_kind: String) -> Bool:
         return true
     if ir_kind_is_struct_header(store_kind):
         return true
-    return store_kind == "bytes" or store_kind == "closure" or store_kind == "channel"
+    return store_kind == "bytes" or store_kind == "closure" or store_kind == "channel" or store_kind == "sync"
 
 # materialize an element-tag code into a register, for the store to carry.
 fn ir_emit_element_tag_const(kind: String) -> Int:
@@ -6523,7 +6582,7 @@ fn ir_container_store_takes_count(store_kind: String) -> Bool:
         return true
     if ir_kind_is_struct_header(store_kind):
         return true
-    if store_kind == "channel":
+    if store_kind == "channel" or store_kind == "sync":
         return true
     return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "closure"
 
@@ -6587,6 +6646,8 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
     # a channel handle is counted, so a List[Channel[T]] owns its elements
     if elem_kind == "channel":
         return "__list_new_channel"
+    if elem_kind == "sync":
+        return "__list_new_sync"
     return "__list_new"
 
 fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
@@ -6665,6 +6726,8 @@ fn ir_tuple_elem_code(kind: String) -> String:
         return "p"
     if kind == "channel":
         return "h"
+    if kind == "sync":
+        return "y"
     return "0"
 
 fn ir_tuple_dtor_code_kind(code: String) -> String:
@@ -6686,6 +6749,8 @@ fn ir_tuple_dtor_code_kind(code: String) -> String:
         return "tuple"
     if code == "h":
         return "channel"
+    if code == "y":
+        return "sync"
     return ""
 
 fn ir_tuple_dtor_signature(elem_nodes: List[Int]) -> String:
@@ -8110,7 +8175,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
             mut no_explicit_types: List[String] := []
             call_name = ir_queue_generic_call(call_name, idx, no_explicit_types, generic_ret_type)
         mut arg_pins: List[String] := []
-        arg_regs := ir_collect_call_arg_regs(node, 1, [], not ir_is_storage_keeper(call_name), arg_pins)
+        arg_regs := ir_collect_call_arg_regs(node, 1, [], not ir_is_storage_keeper(call_name), ir_is_atomic_keeper(call_name), arg_pins)
         mut r := ir_reg()
         uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(call_name, true), idx)
         ret_type := ir_call_retkind_for_name(idx, uses_result_abi, call_name)
@@ -8172,7 +8237,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 arg_idx := ir_method_call_arg_expr(node, ai)
                 arg_r := ir_emit_call_arg(arg_idx)
                 arg_regs.push(arg_r)
-                ir_pin_arg(arg_idx, arg_r, arg_pins, true)
+                ir_pin_arg(arg_idx, arg_r, arg_pins, true, false)
                 ai = ai + 1
             r := ir_reg()
             ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
@@ -8202,7 +8267,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             emit_name = ir_queue_generic_method_call(idx, node, impl_name)
 
     mut call_pins: List[String] := []
-    call_regs := ir_collect_method_call_regs(node, impl_dispatch and not ir_is_storage_keeper(impl_name), call_pins)
+    call_regs := ir_collect_method_call_regs(node, impl_dispatch and not ir_is_storage_keeper(impl_name), impl_dispatch and ir_is_atomic_keeper(impl_name), call_pins)
     obj_r := call_regs[0]
     mut arg_regs: List[Int] := []
     mut ci := 0
@@ -10949,7 +11014,7 @@ fn ir_stmt_discards_owned_value(kind: String) -> Bool:
 fn ir_kind_discards_at_statement(kind: String) -> Bool:
     if kind == "list" or kind == "map" or kind == "set":
         return true
-    if kind == "bytes" or kind == "closure" or kind == "channel":
+    if kind == "bytes" or kind == "closure" or kind == "channel" or kind == "sync":
         return true
     return ir_kind_is_struct_header(kind)
 
@@ -12819,7 +12884,7 @@ fn ir_emit_optional_tuple_walks():
     ir_emit_zero_ret_endfunc()
 
 fn ir_emit_optional_walks(trace: Bool):
-    mut kinds: List[String] := ["struct", "list", "map", "set", "bytes", "closure", "string", "channel"]
+    mut kinds: List[String] := ["struct", "list", "map", "set", "bytes", "closure", "string", "channel", "sync"]
     mut prefix := "__opt_dtor_"
     if trace:
         kinds = ["struct", "list", "map", "set", "closure"]

@@ -76,9 +76,17 @@ pub const CSTRING_STATIC_MAGIC: u32 = CSTRING_MAGIC | 1;
 const CSTRING_HEADER_SIZE: usize = 16;
 const CSTRING_ALIGN: usize = 8;
 
-/// One shared empty string. It has no header, so retain/release skip it,
-/// which is exactly right for a value that is never freed.
-static CSTRING_EMPTY: &[u8] = b"\0";
+/// One shared empty string, laid out like a compiled literal so that every
+/// header probe finds the literal magic and leaves it alone. Without a header
+/// the probe read the 16 bytes in front of it, which belong to whatever static
+/// the linker put there: harmless only while those bytes did not happen to
+/// spell a heap magic, at which point a retain would have written into rodata.
+static CSTRING_EMPTY: StaticChar = StaticChar {
+    magic: CSTRING_STATIC_MAGIC,
+    zero: 0,
+    len: 0,
+    bytes: [0; 8],
+};
 
 /// The allocation size for a string of `data_len` bytes: the header, the
 /// data and its NUL, rounded up to a size class. The size is a function of
@@ -480,7 +488,7 @@ pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
 }
 
 pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
-    CSTRING_EMPTY.as_ptr() as *mut i8
+    CSTRING_EMPTY.bytes.as_ptr() as *mut i8
 }
 
 pub const PITH_CLOSURE_ENV_SLOTS: usize = 16;
@@ -1200,6 +1208,18 @@ mod tests {
             assert_eq!(text(from_literal), "lit!");
             pith_cstring_release(from_literal);
             pith_cstring_release(tail);
+        }
+    }
+
+    #[test]
+    fn the_shared_empty_string_carries_a_literal_header() {
+        unsafe {
+            let empty = pith_cstring_empty();
+            assert_eq!(cstring_header_len(empty), Some(0));
+            assert!(cstring_base(empty).is_none(), "never counted or freed");
+            pith_cstring_retain(empty);
+            pith_cstring_release(empty);
+            assert_eq!(crate::string::pith_cstring_len(empty), 0);
         }
     }
 

@@ -708,13 +708,14 @@ weak reads to observe that the value is gone and return `none`. the
 rings: with the back edge `weak` peak memory stays flat (about 2 MB),
 and with a strong back edge the same run leaks every ring (about 730 MB).
 
-each read builds a fresh optional that borrows the target and takes no
-count on it, whatever it is read off. so a plain binding of a weak read
-(`back := node.next.value().back`) owns that optional and releases it at
-scope exit, but never releases the target. classifying a read off a
-temporary as owned once gave that binding the target's release as well,
-which freed the target twice; retaining the fresh optional on top of that
-leaked one per bound read.
+each read upgrades the reference in one atomic step: it takes a strong
+count on the target while it is still alive, or reads back `none` once it
+is gone, and returns a fresh optional that owns that count. so a binding of
+a weak read (`back := node.next.value().back`) owns its optional like any
+call result and releases the count at scope exit. a check followed by a
+later retain could revive a target another task had just destroyed, and
+classifying the read as borrowed once freed the target twice or leaked one
+optional per bound read.
 
 a local binding can be weak too. `weak name := expr` holds a struct value
 without keeping it alive, and every read yields the same optional a weak

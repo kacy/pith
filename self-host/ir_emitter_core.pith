@@ -1201,11 +1201,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # a field read off an owned temporary receiver hands back a retained value
     # (ir_release_owned_field_receiver), so it is owned, but only when the
     # field has a kind to retain; a plain-value field is not rc either way.
-    # a weak field is the exception: every weak read mints a borrowing shell
-    # with no count on its target, whatever it was read off. called owned,
-    # `back := a.next.value().back` bound that shell as an owning optional,
-    # and the binding's cleanup released a target the read never counted.
-    if node.kind == "field_access" and node.children.len() > 0 and ir_field_receiver_is_owned_temp(node.children[0]) and not ir_node_is_weak_field_read(idx):
+    if node.kind == "field_access" and node.children.len() > 0 and ir_field_receiver_is_owned_temp(node.children[0]):
         return false
     return true
 
@@ -6554,8 +6550,9 @@ fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
         weak_struct := lk.substring(0, lk.len() - fname.len() - 1)
         if ir_struct_field_is_weak(weak_struct, fname):
             weak_r := ir_emit_weak_read(r)
-            # the shell is fresh and borrows its target, so it needs no count
-            # to outlive the receiver; only the receiver's count is dropped
+            # the shell is fresh and owns the count its upgrade took, so it
+            # needs no count to outlive the receiver; only the receiver's
+            # count is dropped
             ir_release_owned_field_receiver(recv_idx, obj_r, weak_r, "")
             return weak_r
     ir_release_owned_field_receiver(recv_idx, obj_r, r, ir_rc_kind(field_type))
@@ -9836,15 +9833,6 @@ fn ir_kinded_site_kind(rc_kind: String) -> String:
         return ""
     return rc_kind
 
-# whether a local binding or assignment takes a count of its own on the
-# value it stores: yes for a borrow, so the local outlives the owner it was
-# read from. a weak read is the exception. it classifies as borrowed, since
-# its target carries no count, but the optional shell it returns is fresh and
-# nothing else holds it, so the local owns that shell as it stands, the way it
-# owns a bare `none`. retaining it as well stranded one shell per bound read.
-fn ir_local_store_retains(val_idx: Int) -> Bool:
-    return ir_expr_is_borrowed(val_idx) and not ir_node_is_weak_field_read(val_idx)
-
 fn ir_emit_bind_stmt(node: Node):
     parts := ir_collect_bind_parts(node)
     name := parts.name
@@ -9912,7 +9900,7 @@ fn ir_emit_bind_stmt(node: Node):
         site_kind := ir_kinded_site_kind(ir_rc_kind(ir_substitute_type_name(ir_prepass_bind_type(parts, ir_rc_locals))))
         bind_target := ir_map_init_target(name, target_type)
         r := ir_emit_value_for_target_inner(val_idx, bind_target, ir_optional_inner_type_of_node(type_idx))
-        if site_kind.len() > 0 and bind_target != "tuple" and ir_local_store_retains(val_idx):
+        if site_kind.len() > 0 and bind_target != "tuple" and ir_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, site_kind)
         ir_kinded_rebind(name, site_kind)
         ir_var_regs.insert(name, r)
@@ -9949,7 +9937,7 @@ fn ir_emit_bind_stmt(node: Node):
         ir_stack_box_call_idx = 0 - 1
         if stack_box and not ir_stack_box_built:
             ir_stack_tuple_names = ir_remove_string(ir_stack_tuple_names, name)
-        if tracked and bind_target != "tuple" and ir_local_store_retains(val_idx):
+        if tracked and bind_target != "tuple" and ir_expr_is_borrowed(val_idx):
             ir_rc_retain_reg(r, bind_kind)
         if old_r >= 0:
             # a loop rebinding a cascade-eligible tuple local must cascade the
@@ -9996,7 +9984,7 @@ fn ir_emit_assign_stmt(node: Node):
                 ir_emit_share_reg(r, legacy_kind)
             else:
                 ir_emit_share_expr(r, node.children[0])
-        if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_local_store_retains(node.children[0]):
+        if legacy_kind.len() > 0 and legacy_target != "tuple" and ir_expr_is_borrowed(node.children[0]):
             ir_rc_retain_reg(r, legacy_kind)
         if old_r >= 0:
             ir_rc_release_local(old_r, legacy_kind, name)
@@ -10010,7 +9998,7 @@ fn ir_emit_kinded_assign(name: String, value_idx: Int, target_type: String, targ
     site_kind := ir_kinded_site_kind(ir_rc_kind(target_type))
     assign_target := ir_map_init_target(name, target_type)
     r := ir_emit_value_for_target_inner(value_idx, assign_target, target_inner)
-    if site_kind.len() > 0 and assign_target != "tuple" and ir_local_store_retains(value_idx):
+    if site_kind.len() > 0 and assign_target != "tuple" and ir_expr_is_borrowed(value_idx):
         ir_rc_retain_reg(r, site_kind)
     ir_kinded_rebind(name, site_kind)
     ir_var_regs.insert(name, r)

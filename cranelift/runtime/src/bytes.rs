@@ -116,7 +116,7 @@ pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
         b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return;
     }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    acquire_last_count!(b.rc);
     crate::perf_count(&crate::PERF_BYTES_FREES, 1);
     // scrub the magic so stale handles fail the validity check
     (*(handle as *mut PithBytes)).magic = 0;

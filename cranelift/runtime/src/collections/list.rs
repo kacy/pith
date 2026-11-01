@@ -1383,7 +1383,7 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
         impl_ref.rc.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
     }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    acquire_last_count!(impl_ref.rc);
 
     // Last count: release the elements this list owns, then free.
     release_all_elements(impl_ref);

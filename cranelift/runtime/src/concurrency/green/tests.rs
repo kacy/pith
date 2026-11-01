@@ -110,7 +110,7 @@ fn maybe_yield_parks_and_requeues_on_owner() {
     let coro = TaskCoroutine::with_stack(
         corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
-            publish_yielder(yielder as *const TaskYielder);
+            let _finish = publish_yielder(yielder as *const TaskYielder);
             PREEMPT_EPOCH.fetch_add(QUANTUM_EPOCHS + 1, AtomicOrdering::Relaxed);
             pith_green_maybe_yield();
             99
@@ -160,7 +160,7 @@ fn push_ready_task(coro: TaskCoroutine) -> TaskId {
 
 fn spawn_unqueued(coro: TaskCoroutine) -> (TaskId, i64) {
     let id = alloc_id();
-    let generation = scheduler().sync.ensure(id).arm(SendCoroutine(coro), 0);
+    let generation = scheduler().sync.ensure(id).arm(SendCoroutine(coro), StackBounds::UNKNOWN, 0);
     (id, make_handle(id, generation))
 }
 
@@ -175,7 +175,7 @@ fn returning(value: i64) -> TaskCoroutine {
     TaskCoroutine::with_stack(
         corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
-            publish_yielder(yielder as *const TaskYielder);
+            let _finish = publish_yielder(yielder as *const TaskYielder);
             value
         },
     )
@@ -196,7 +196,7 @@ fn panicking_task_marks_done_and_keeps_worker_alive() {
     let coro = TaskCoroutine::with_stack(
         corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
-            publish_yielder(yielder as *const TaskYielder);
+            let _finish = publish_yielder(yielder as *const TaskYielder);
             panic!("boom from a green task");
         },
     );
@@ -371,7 +371,7 @@ fn parked_task_wakes_once_onto_owner_pinned_queue() {
     let coro = TaskCoroutine::with_stack(
         corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
-            publish_yielder(yielder as *const TaskYielder);
+            let _finish = publish_yielder(yielder as *const TaskYielder);
             park_current(current_task().expect("test body runs inside a task"));
             21
         },
@@ -433,7 +433,7 @@ fn idle_peer_steals_from_a_busy_owners_pinned_queue() {
     let coro = TaskCoroutine::with_stack(
         corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
-            publish_yielder(yielder as *const TaskYielder);
+            let _finish = publish_yielder(yielder as *const TaskYielder);
             park_current(current_task().expect("test body runs inside a task"));
             34
         },

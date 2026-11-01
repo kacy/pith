@@ -736,7 +736,7 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
         impl_ref.rc.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
     }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    acquire_last_count!(impl_ref.rc);
 
     impl_ref.release_all_values();
 

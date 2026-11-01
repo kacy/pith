@@ -342,13 +342,228 @@ pub struct CaseOutcome {
 
 /// run one generated case through every oracle. `expected` gates the
 /// wrong-output comparison; None skips it (the reducer compares on its own).
+/// every non-benign AddressSanitizer report in a log, as (signature, report
+/// text). the one known-benign pattern is the cstring header probe reading a
+/// few bytes before a headerless runtime static: a global-buffer-overflow
+/// naming a global variable whose name starts with `alloc_`. that is fixed
+/// separately, so it is not a finding here (this mirrors san/real_reports.sh).
+///
+/// the signature is the error kind plus the innermost generated-code frame of
+/// the access, of the free and of the allocation, with digit runs collapsed.
+/// runtime frames above them (pith_struct_release, free) say little about
+/// which program shape went wrong, and per-run addresses are dropped, so
+/// every instance of one bug lands in one bucket and two bugs that both end
+/// in pith_struct_release do not.
+pub fn asan_real_reports(stderr: &str) -> Vec<(String, String)> {
+    let marker = "ERROR: AddressSanitizer:";
+    let positions: Vec<usize> = stderr.match_indices(marker).map(|(i, _)| i).collect();
+    let mut out = Vec::new();
+    for (n, &p) in positions.iter().enumerate() {
+        let end = positions.get(n + 1).copied().unwrap_or(stderr.len());
+        let report = &stderr[p..end];
+        let benign = report.contains("global-buffer-overflow")
+            && (report.contains("before global variable 'alloc_")
+                || report.contains("after global variable 'alloc_"));
+        if benign {
+            continue;
+        }
+        let first = report.lines().next().unwrap_or("");
+        let kind = first
+            .trim_start_matches(marker)
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string();
+        // a report's sections: the access, then "freed by", then
+        // "previously allocated by"
+        let mut sections = vec![String::new(), String::new(), String::new()];
+        let mut sec = 0;
+        for line in report.lines() {
+            if line.contains("freed by thread") {
+                sec = 1;
+            } else if line.contains("previously allocated by thread") {
+                sec = 2;
+            } else if line.starts_with("SUMMARY:") {
+                break;
+            }
+            if sections[sec].is_empty() {
+                if let Some(f) = generated_frame(line) {
+                    sections[sec] = f;
+                }
+            }
+        }
+        let sig = format!(
+            "{} use:{} free:{} alloc:{}",
+            kind,
+            or_dash(&sections[0]),
+            or_dash(&sections[1]),
+            or_dash(&sections[2])
+        );
+        let text: Vec<&str> = report.lines().take(24).collect();
+        out.push((normalize_digits(&sig, false), text.join("\n")));
+    }
+    out
+}
+
+fn or_dash(s: &str) -> &str {
+    if s.is_empty() {
+        "-"
+    } else {
+        s
+    }
+}
+
+/// the function name of a stack frame in generated code. a pith function's
+/// frame reads `#N 0x... in NAME pith_module`; `main` carries no module tag
+/// but is generated too.
+fn generated_frame(line: &str) -> Option<String> {
+    let t = line.trim();
+    if !t.starts_with('#') {
+        return None;
+    }
+    let after = &t[t.find(" in ")? + 4..];
+    let name = after.split_whitespace().next()?;
+    if after.contains("pith_module") || name == "main" {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// run the sanitized binary across the freelist-on/off and green-on/off
+/// matrix. with the freelist off a freed struct block is not recycled, so a
+/// stale read lands in asan's poisoned region. the oracles: any asan report
+/// (other than the known-benign one), any signal death, and any divergence of
+/// stdout between the settings. returns the canonical (freelist off, green on)
+/// stdout for the caller's differential check against the prediction.
+fn run_sanitize_matrix(
+    seed: u64,
+    exe_s: &str,
+    case_dir: &Path,
+    base_envs: &[(String, String)],
+    expected: Option<&[ExpLine]>,
+    findings: &mut Vec<Finding>,
+    hang: &mut Option<String>,
+) -> Option<String> {
+    let asan_opts =
+        "detect_leaks=0:detect_stack_use_after_return=0:allocator_may_return_null=1:halt_on_error=0";
+    // (freelist, green); the canonical run is index 0 (freelist off, green on)
+    let combos = [("0", "1"), ("1", "1"), ("0", "0"), ("1", "0")];
+    let mut outputs: Vec<(String, String, String)> = Vec::new(); // (label, stdout, stderr)
+    let mut seen_asan: Vec<String> = Vec::new();
+    for (fl, green) in combos {
+        let label = format!("FREELIST={} GREEN={}", fl, green);
+        let mut envs = base_envs.to_vec();
+        envs.push(("PITH_STRUCT_FREELIST".into(), fl.into()));
+        envs.push(("PITH_GREEN".into(), green.into()));
+        envs.push(("ASAN_OPTIONS".into(), asan_opts.into()));
+        let run = match run_with_timeout(exe_s, &[], case_dir, &envs, Duration::from_secs(30)) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if run.timed_out {
+            *hang = Some(format!("run timeout under {}", label));
+            continue;
+        }
+        if let Some(sig) = run.signal {
+            findings.push(Finding {
+                seed,
+                class: "run-crash".into(),
+                signature: format!("binary died: {} (freelist/green matrix)", signal_name(sig)),
+                detail: format!("{}\n{}", label, tail(&run.stderr, 8)),
+                wo_pair: None,
+            });
+        }
+        for (sig, text) in asan_real_reports(&run.stderr) {
+            if seen_asan.contains(&sig) {
+                continue;
+            }
+            seen_asan.push(sig.clone());
+            findings.push(Finding {
+                seed,
+                class: "sanitizer".into(),
+                signature: sig,
+                detail: format!("{}\n{}", label, text),
+                wo_pair: None,
+            });
+        }
+        outputs.push((label, run.stdout, run.stderr));
+    }
+
+    // oracle: output must not depend on the freelist or the backend
+    if outputs.len() > 1 {
+        let (clabel, cstdout, _) = &outputs[0];
+        for (label, stdout, _) in &outputs[1..] {
+            if stdout != cstdout {
+                let mm = first_line_diff(cstdout, stdout);
+                findings.push(Finding {
+                    seed,
+                    class: "nondeterministic".into(),
+                    // no line index: it moves with whatever the program
+                    // printed first, and would split one bug into many buckets
+                    signature: format!(
+                        "output differs between settings: '{}' vs '{}'",
+                        normalize_digits(&mm.1, false),
+                        normalize_digits(&mm.2, false)
+                    ),
+                    detail: format!("{} vs {}\nline {}: '{}' vs '{}'", clabel, label, mm.0, mm.1, mm.2),
+                    wo_pair: None,
+                });
+                break;
+            }
+        }
+    }
+
+    let canonical = outputs.first().map(|(_, s, _)| s.clone());
+    // oracle: differential output against the prediction, on the canonical run
+    if let (Some(exp), Some(stdout)) = (expected, canonical.as_ref()) {
+        if let Some(mm) = compare_output(stdout, exp) {
+            let ne = normalize_digits(&mm.expected, false);
+            let na = normalize_digits(&mm.actual, false);
+            findings.push(Finding {
+                seed,
+                class: "wrong-output".into(),
+                signature: format!("wrong-output at line {}: expected '{}' got '{}'", mm.idx, ne, na),
+                detail: mismatch_context(stdout, exp, mm.idx),
+                wo_pair: Some((mm.expected, mm.actual)),
+            });
+        }
+    }
+    canonical
+}
+
+/// the first differing line between two stdout blobs: (index, a, b)
+fn first_line_diff(a: &str, b: &str) -> (usize, String, String) {
+    let al: Vec<&str> = a.lines().collect();
+    let bl: Vec<&str> = b.lines().collect();
+    for i in 0..al.len().max(bl.len()) {
+        let x = al.get(i).copied().unwrap_or("<end>");
+        let y = bl.get(i).copied().unwrap_or("<end>");
+        if x != y {
+            return (i, x.to_string(), y.to_string());
+        }
+    }
+    (0, String::new(), String::new())
+}
+
+/// how the per-case oracle runs the built binary. `Plain` is the single run
+/// the gate uses; `Sanitize` links an asan-built runtime (through CC and
+/// PITH_RUNTIME_LIB inherited from the environment) and runs the binary across
+/// the freelist and green-backend matrix, so a stale read surfaces as an asan
+/// report, a crash, or a divergence between settings.
+#[derive(Clone, Copy, PartialEq)]
+pub enum RunMode {
+    Plain { valgrind_mem: bool },
+    Sanitize,
+}
+
 pub fn run_case(
     seed: u64,
     files: &[(String, String)],
     expected: Option<&[ExpLine]>,
     tc: &Toolchain,
     case_dir: &Path,
-    valgrind_mem: bool,
+    mode: RunMode,
 ) -> CaseOutcome {
     let _ = fs::remove_dir_all(case_dir);
     fs::create_dir_all(case_dir).expect("create case dir");
@@ -452,7 +667,14 @@ pub fn run_case(
     }
 
     // oracle: run the produced binary
-    if built {
+    if built && mode == RunMode::Sanitize {
+        let exe = case_dir.join("main");
+        if exe.exists() {
+            let exe_s = exe.to_string_lossy().to_string();
+            run_stdout = run_sanitize_matrix(seed, &exe_s, case_dir, &tc.envs, expected, &mut findings, &mut hang);
+        }
+    } else if built {
+        let valgrind_mem = matches!(mode, RunMode::Plain { valgrind_mem: true });
         let exe = case_dir.join("main");
         if exe.exists() {
             let exe_s = exe.to_string_lossy().to_string();
@@ -597,6 +819,16 @@ mod tests {
         let b = "==1==  Access not within mapped region at address 0x4F22A8\n";
         assert_eq!(parse_fault_addr(b), Some(0x4F22A8));
         assert_eq!(parse_fault_addr("nothing here"), None);
+    }
+
+    #[test]
+    fn asan_filter_skips_the_benign_probe_and_buckets_by_frame() {
+        let benign = "==1==ERROR: AddressSanitizer: global-buffer-overflow on address 0x55 at pc 0x66\nREAD of size 16\n  0x55 is located 0 bytes before global variable 'alloc_pool' defined in ...\n";
+        assert!(asan_real_reports(benign).is_empty());
+        let uaf = "==1==ERROR: AddressSanitizer: heap-use-after-free on address 0x7b at pc 0x55 bp 0x7f sp 0x7f\nREAD of size 4 at 0x7b thread T0\n    #0 0x55 in pith_struct_release (/x/main+0xac)\n    #1 0x56 in __tuple_cascade_u0_m1 pith_module\nfreed by thread T0 here:\n    #0 0x57 in free (/x/main+0x1)\n    #1 0x58 in main (/x/main+0x2)\npreviously allocated by thread T0 here:\n    #1 0x59 in pith_struct_alloc (/x/main+0x3)\n    #2 0x5a in opair pith_module\nSUMMARY: AddressSanitizer: heap-use-after-free\n";
+        let got = asan_real_reports(uaf);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, "heap-use-after-free use:__tuple_cascade_uN_mN free:main alloc:opair");
     }
 
     #[test]

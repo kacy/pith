@@ -354,7 +354,7 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
         impl_ref.rc.store(0, std::sync::atomic::Ordering::Relaxed);
         return;
     }
-    std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+    acquire_last_count!(impl_ref.rc);
 
     // Free the set implementation. Scrub the magic first so any handle
     // that outlives the set fails the fast validity check.

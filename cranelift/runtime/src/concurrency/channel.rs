@@ -450,7 +450,7 @@ unsafe fn release_count(t: &TaggedChannel) {
         t.refs.fetch_add(1, Ordering::Relaxed);
         return;
     }
-    std::sync::atomic::fence(Ordering::Acquire);
+    acquire_last_count!(t.refs);
     free_channel(t as *const TaggedChannel as *mut TaggedChannel);
 }
 

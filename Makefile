@@ -1885,6 +1885,28 @@ cli-regressions-only:
 	entries=$$(find "$$tmpdir/runtmp" -mindepth 1 -maxdepth 1 | wc -l); \
 	private=$$(find "$$tmpdir/runtmp" -mindepth 1 -maxdepth 1 -type d -name 'pith_run_*' -perm 700 | wc -l); \
 	if [ $$status -eq 0 ] && [ "$$out" = "nested" ] && [ $$entries -eq 1 ] && [ $$private -eq 1 ]; then pass=$$((pass+1)); echo "ok   run builds in a private directory"; else echo "FAIL run private directory"; echo "$$out"; ls -la "$$tmpdir/runtmp"; fail=$$((fail+1)); fi; \
+	printf 'fn main():\n    print("ok")\n' > "$$tmpdir/clean.pith"; \
+	printf '#regular\nfn main():\n    print("x")\n' > "$$tmpdir/unformatted.pith"; \
+	set +e; \
+	out=$$(./target/release/pith lint "$$tmpdir/clean.pith" "$$tmpdir/lint_pos.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "E300"; then pass=$$((pass+1)); echo "ok   lint checks every file"; else echo "FAIL lint every file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith fmt --check "$$tmpdir/clean.pith" "$$tmpdir/unformatted.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unformatted.pith needs formatting"; then pass=$$((pass+1)); echo "ok   fmt --check checks every file"; else echo "FAIL fmt --check every file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith lint "$$tmpdir/clean.pith" "$$tmpdir/clean.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ]; then pass=$$((pass+1)); echo "ok   lint passes when every file passes"; else echo "FAIL lint all clean"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith lint "$$tmpdir/clean.pith" "$$tmpdir/missing.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "cannot read $$tmpdir/missing.pith"; then pass=$$((pass+1)); echo "ok   lint names a missing file"; else echo "FAIL lint missing file"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

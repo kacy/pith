@@ -9,10 +9,10 @@
 #                    [--json]          flags are forwarded to the runner
 #   pith check <file.pith>      type check (human-readable output)
 #   pith check --json <file>  machine-readable diagnostics
-#   pith fmt <file.pith>        format source code
-#   pith fmt --check <file>   check if already formatted
-#   pith lint <file.pith>       lint for convention violations
-#   pith lint --json <file>   lint with JSON output
+#   pith fmt <file.pith>...     format source code
+#   pith fmt --check <file>...  check if already formatted
+#   pith lint <file.pith>...    lint for convention violations
+#   pith lint --json <file>...  lint with JSON output
 #   pith doc <file.pith>        generate documentation
 #   pith doc --json <file>    documentation as JSON
 #   pith doc --check <file>   check all pub items documented
@@ -144,42 +144,54 @@ fn cmd_check(path: String, json_mode: Bool) -> String!:
 # fmt command
 # ---------------------------------------------------------------
 
-fn cmd_fmt(path: String, check_mode: Bool) -> String!:
-    source := read_file(path)!
+# false when the file could not be read or written, or needs formatting
+# under --check
+fn cmd_fmt(path: String, check_mode: Bool) -> Bool:
+    source := read_file(path) catch:
+        print_err("error: cannot read " + path)
+        return false
     formatted := fmt_source(source)
 
     if check_mode:
         if source != formatted:
             print(path + " needs formatting")
-            exit(1)
-        return ""
+            return false
+        return true
 
     if source != formatted:
-        write_file(path, formatted)!
+        _written := write_file(path, formatted) catch:
+            print_err("error: cannot write " + path)
+            return false
         print("formatted " + path)
-    return ""
+    return true
 
 # ---------------------------------------------------------------
 # lint command
 # ---------------------------------------------------------------
 
-fn cmd_lint(path: String, json_mode: Bool) -> String!:
-    source := read_file(path)!
-    outcome := run_check_pipeline(path)!
+# false when the file could not be read, does not parse or resolve its
+# imports, or has a lint diagnostic
+fn cmd_lint(path: String, json_mode: Bool) -> Bool:
+    source := read_file(path) catch:
+        print_err("error: cannot read " + path)
+        return false
+    outcome := run_check_pipeline(path) catch:
+        print_err("error: cannot check " + path)
+        return false
 
     if not outcome.parse_ok:
         if json_mode:
             print(render_diagnostics_json(outcome.diags))
         else:
             print(render_diagnostics(outcome.diags, source))
-        exit(1)
+        return false
 
     if not outcome.import_ok:
         if json_mode:
             print(render_diagnostics_json(outcome.diags))
         else:
-            print(render_diagnostics_for_path(outcome.diags, path, source)!)
-        exit(1)
+            print(render_diagnostics_for_path(outcome.diags, path, source) catch render_diagnostics(outcome.diags, source))
+        return false
 
     # a generated file is skipped AFTER parsing and import resolution, so
     # one that does not parse still fails here — only the convention rules
@@ -187,25 +199,21 @@ fn cmd_lint(path: String, json_mode: Bool) -> String!:
     if source_is_generated(source):
         if not json_mode:
             print("ok (generated)")
-        return ""
+        return true
 
     diags := lint_module(outcome.root, source, path)
 
     if json_mode:
         print(render_diagnostics_json(diags))
-        if diags.len() > 0:
-            exit(1)
+    elif diags.len() > 0:
+        print(render_diagnostics(diags, source))
     else:
-        if diags.len() > 0:
-            print(render_diagnostics(diags, source))
-            # a warning fails too. every lint rule is a convention this
-            # tree already follows everywhere, so a new warning means new
-            # drift rather than a pre-existing debt to triage — and a
-            # warning nobody has to act on is one nobody reads.
-            exit(1)
-        else:
-            print("ok")
-    return ""
+        print("ok")
+    # a warning fails too. every lint rule is a convention this
+    # tree already follows everywhere, so a new warning means new
+    # drift rather than a pre-existing debt to triage — and a
+    # warning nobody has to act on is one nobody reads.
+    return diags.len() == 0
 
 # ---------------------------------------------------------------
 # doc command
@@ -245,7 +253,9 @@ fn cmd_package(action: String, args_list: List[String]) -> String!:
     if action == "test":
         return cmd_test(root, args_list.slice(3, args_list.len()))
     if action == "lint":
-        return cmd_lint(root, false)
+        if not cmd_lint(root, false):
+            exit(1)
+        return ""
     if action == "doc":
         return cmd_doc(root, false, false)
     if action == "deps":
@@ -329,10 +339,10 @@ fn print_help():
     print("    [--filter <substr>] [--tag <name>] [--exclude-tag <name>] [--json]")
     print("  check <file.pith>        type check (human-readable)")
     print("  check --json <file>    type check (JSON output)")
-    print("  fmt <file.pith>          format source code")
-    print("  fmt --check <file>     check formatting")
-    print("  lint <file.pith>         lint for conventions")
-    print("  lint --json <file>     lint (JSON output)")
+    print("  fmt <file.pith>...       format source code")
+    print("  fmt --check <file>...  check formatting")
+    print("  lint <file.pith>...      lint for conventions")
+    print("  lint --json <file>...  lint (JSON output)")
     print("  doc <file.pith>          generate documentation")
     print("  doc --json <file>      documentation (JSON output)")
     print("  doc --check <file>     check all pub items documented")
@@ -358,6 +368,22 @@ fn print_help():
 # CLI entry point
 # ---------------------------------------------------------------
 
+# the files after `pith <command>`, past `flag` when it comes first. any
+# other option is refused rather than read as a file name.
+fn file_operands(a: List[String], command: String, flag: String) -> List[String]:
+    mut start := 2
+    if a.len() > 2 and a[2] == flag:
+        start = 3
+    files := a.slice(start, a.len())
+    if files.len() == 0:
+        print("usage: pith " + command + " [" + flag + "] <file.pith>")
+        exit(1)
+    for f in files:
+        if f.starts_with("-"):
+            print_err("error: unknown option '" + f + "' for " + command)
+            exit(1)
+    return files
+
 fn run_cli() -> String!:
     a := args()
     if a.len() < 2:
@@ -380,42 +406,30 @@ fn run_cli() -> String!:
         return ""
 
     if command == "check":
-        if a.len() < 3:
-            print("usage: pith check [--json] <file.pith>")
+        files := file_operands(a, "check", "--json")
+        if files.len() > 1:
+            print_err("error: check takes one file, and '" + files[1] + "' is a second one")
             exit(1)
-        if a[2] == "--json":
-            if a.len() < 4:
-                print("usage: pith check --json <file.pith>")
-                exit(1)
-            _result := cmd_check(a[3], true)!
-        else:
-            _result := cmd_check(a[2], false)!
+        _result := cmd_check(files[0], a[2] == "--json")!
         return ""
 
+    # fmt and lint check every file given and fail when any of them fails
     if command == "fmt":
-        if a.len() < 3:
-            print("usage: pith fmt [--check] <file.pith>")
+        mut ok := true
+        for path in file_operands(a, "fmt", "--check"):
+            if not cmd_fmt(path, a[2] == "--check"):
+                ok = false
+        if not ok:
             exit(1)
-        if a[2] == "--check":
-            if a.len() < 4:
-                print("usage: pith fmt --check <file.pith>")
-                exit(1)
-            _result := cmd_fmt(a[3], true)!
-        else:
-            _result := cmd_fmt(a[2], false)!
         return ""
 
     if command == "lint":
-        if a.len() < 3:
-            print("usage: pith lint [--json] <file.pith>")
+        mut ok := true
+        for path in file_operands(a, "lint", "--json"):
+            if not cmd_lint(path, a[2] == "--json"):
+                ok = false
+        if not ok:
             exit(1)
-        if a[2] == "--json":
-            if a.len() < 4:
-                print("usage: pith lint --json <file.pith>")
-                exit(1)
-            _result := cmd_lint(a[3], true)!
-        else:
-            _result := cmd_lint(a[2], false)!
         return ""
 
     if command == "doc":

@@ -1,0 +1,27 @@
+# a child that a signal ends reports 128 plus the signal number on every
+# path that returns a status, and output_shell fails rather than reading as
+# a clean exit.
+import std.fs as fs
+import std.os.process as process
+
+fn main() -> Int!:
+    dir := fs.make_temp_dir("pith-signal-status-")!
+    script := dir + "/die.sh"
+    fs.write(script, "kill -9 $$\n")!
+
+    out := process.command("sh").arg(script).output()!
+    print("output:{out.status}")
+    print("output-failed:{out.failed()}")
+
+    child := process.command("sh").arg(script).start()!
+    print("wait:{child.wait()}")
+    child.close()
+
+    print("run:{process.command("sh").arg(script).run()!}")
+    print("run-shell:{process.run_shell("sh " + script)}")
+    print("output-shell-err:{process.output_shell("sh " + script).is_err}")
+    print("run-shell-exit:{process.run_shell("sh -c exit")}")
+    print("output-shell-ok:{process.output_shell("printf still-ok")!}")
+
+    fs.remove_tree(dir)
+    return 0

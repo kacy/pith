@@ -61,9 +61,15 @@ pub unsafe extern "C" fn pith_exec_output(cmd: *const i8) -> *mut i8 {
     let mut command = std::process::Command::new(parts[0]);
     crate::env_overlay::apply(&mut command);
     command.args(&parts[1..]);
+    // only stdout comes back, so there is no status to carry a signal death
+    // in. a child that a signal ended fails the call rather than handing back
+    // whatever it wrote before it died as if it had finished. an ordinary
+    // nonzero exit still returns its stdout, as it always has.
     match crate::process::command_output(command) {
-        Some(output) => crate::pith_copy_bytes_to_cstring(&output.stdout),
-        None => std::ptr::null_mut(),
+        Some(output) if output.status.code().is_some() => {
+            crate::pith_copy_bytes_to_cstring(&output.stdout)
+        }
+        _ => std::ptr::null_mut(),
     }
 }
 

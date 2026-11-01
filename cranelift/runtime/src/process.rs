@@ -54,6 +54,21 @@ pub(crate) fn command_status(mut command: Command) -> Option<std::process::ExitS
     blocking::run(&POOL, move || command.status().ok())
 }
 
+/// a child's exit status as one number: its exit code, or 128 plus the signal
+/// number when a signal ended it, which is what a shell reports. a child that
+/// was killed (sigkill from the oom killer, a segfault) must not read as a
+/// clean exit, and every path that reports a status goes through this so they
+/// agree.
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> i64 {
+    use std::os::unix::process::ExitStatusExt;
+
+    match (status.code(), status.signal()) {
+        (Some(code), _) => code as i64,
+        (None, Some(signal)) => 128 + signal as i64,
+        (None, None) => -1,
+    }
+}
+
 /// which of a child's three pipes a caller wants. the discriminant indexes
 /// `ProcessHandle::pipes`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -284,7 +299,7 @@ pub unsafe extern "C" fn pith_process_output_argv(
     // pith-visible handle is built here either way.
     match command_output(command) {
         Some(output) => {
-            let status = output.status.code().unwrap_or(-1) as i64;
+            let status = exit_code(output.status);
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             pith_store_process_output(status, stdout, stderr)
@@ -386,7 +401,7 @@ fn exit_state(handle: i64) -> ExitState {
     match entry.child.try_wait() {
         // already exited, or already waited for once: `try_wait` remembers the
         // status, so a second wait on the same handle costs nothing.
-        Ok(Some(status)) => ExitState::Finished(status.code().unwrap_or(-1) as i64),
+        Ok(Some(status)) => ExitState::Finished(exit_code(status)),
         Ok(None) => match watch_pid(entry.child.id()) {
             Some(fd) => ExitState::Watch(fd),
             None => ExitState::Unwatchable,
@@ -403,7 +418,7 @@ fn reap(handle: i64) -> i64 {
         return -1;
     };
     match entry.child.wait() {
-        Ok(status) => status.code().unwrap_or(-1) as i64,
+        Ok(status) => exit_code(status),
         Err(_) => -1,
     }
 }
@@ -504,6 +519,16 @@ mod tests {
         cmd.args(["-c", "exit 5"]);
         assert_eq!(command_status(cmd).expect("sh should run").code(), Some(5));
         assert!(command_status(Command::new("/nonexistent-program")).is_none());
+    }
+
+    #[test]
+    fn exit_code_reports_a_signal_death_as_128_plus_the_signal() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "kill -9 $$"]);
+        assert_eq!(exit_code(command_status(cmd).expect("sh should run")), 137);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 4"]);
+        assert_eq!(exit_code(command_status(cmd).expect("sh should run")), 4);
     }
 
     #[test]

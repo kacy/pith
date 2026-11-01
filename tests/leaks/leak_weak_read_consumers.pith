@@ -1,0 +1,79 @@
+# a weak read hands back a fresh optional that owns the strong count its
+# upgrade took, so every consumer has to end up dropping that count: a test
+# against none, an extraction, an `if let`, a `while let`, a match, a call
+# argument, and every store that keeps the value (a local,
+# a field, a struct construction, a list, a map, a return, another weak
+# slot). each round builds a fresh pair and feeds the weak edge through all
+# of them, so a consumer that strands the count strands the pair with it.
+import leakprobe as probe
+
+struct Node:
+    value: Int
+    mut next: Node?
+    weak back: Node?
+
+struct Keeper:
+    mut held: Node?
+    weak seen: Node?
+
+fn peek(n: Node?) -> Int:
+    if n != none:
+        return n.value().value
+    return 0
+
+fn back_of(n: Node) -> Node?:
+    return n.back
+
+fn first_back(n: Node) -> Int!:
+    a := n.back?
+    return a.value
+
+fn round(seed: Int) -> Int:
+    a := Node(value: seed, next: none, back: none)
+    b := Node(value: seed + 1, next: none, back: none)
+    a.next = b
+    b.back = a
+    mut total := 0
+    if b.back != none:
+        total = total + b.back.value().value
+    total = total + b.back.unwrap_or(b).value
+    if let p = b.back:
+        total = total + p.value
+    mut spins := 0
+    while let q = b.back:
+        total = total + q.value
+        spins = spins + 1
+        if spins > 1:
+            break
+    total = total + match b.back:
+        none => 0
+        m => m.value
+    total = total + peek(b.back)
+    total = total + first_back(b).unwrap_or(0)
+    held := b.back
+    total = total + peek(held)
+    k := Keeper(held: b.back, seen: b.back)
+    k.held = b.back
+    k.seen = b.back
+    mut xs: List[Node?] := []
+    xs.push(b.back)
+    mut m: Map[String, Node?] := {}
+    m.insert("k", b.back)
+    m["j"] = b.back
+    r := back_of(b)
+    total = total + peek(r)
+    weak w := a
+    total = total + peek(w)
+    return total + xs.len() + m.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 1:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

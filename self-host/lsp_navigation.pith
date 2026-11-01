@@ -17,7 +17,7 @@
 
 from checker import get_definition_of, c_get_expr_type
 from checker_methods import all_method_keys
-from scope import all_binding_names, all_binding_types
+from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 from driver import file_for_node, dr_read_source
 from types import get_type_name, get_type_info, TID_ERR
 from ast import get_node, node_count
@@ -386,16 +386,25 @@ fn is_receiver_byte(c: Int) -> Bool:
         return true
     return c == 41 or c == 93
 
-# a candidate entry packs "label<TAB>kind" so lists of candidates sort
-# by label with a plain string sort.
-fn item_entry(label: String, kind: Int) -> String:
-    return label + chr(9) + kind.to_string()
+# how close a candidate is to the code being edited, best first: a name
+# declared in the open file, one declared in another source file (std, an
+# import), a keyword, then a builtin. a capped list keeps the best tiers, so
+# a local is never crowded out by the builtins that sort before it.
+RANK_THIS_FILE := 0
+RANK_OTHER_FILE := 1
+RANK_KEYWORD := 2
+RANK_BUILTIN := 3
+
+# a candidate entry packs "<rank digit>label<TAB>kind" so lists of
+# candidates sort by rank and then by label with a plain string sort.
+fn item_entry(rank: Int, label: String, kind: Int) -> String:
+    return rank.to_string() + label + chr(9) + kind.to_string()
 
 fn entry_label(entry: String) -> String:
     tab := entry.index_of(chr(9))
     if tab < 0:
-        return entry
-    return entry.substring(0, tab)
+        return entry.substring(1, entry.len())
+    return entry.substring(1, tab)
 
 fn entry_kind(entry: String) -> Int:
     tab := entry.index_of(chr(9))
@@ -447,39 +456,47 @@ fn member_entries(path: String, line1: Int, line_text: String, dot_off: Int) -> 
         info := get_type_info(tid)
         if info.kind == "struct":
             for field in info.fields:
-                entries.push(item_entry(field, 5))
+                entries.push(item_entry(RANK_THIS_FILE, field, 5))
         prefix := bare_symbol_name(get_type_name(tid)) + "."
         for key in all_method_keys():
             if key.starts_with(prefix):
-                entries.push(item_entry(method_name_of(key), 3))
+                entries.push(item_entry(RANK_THIS_FILE, method_name_of(key), 3))
         return entries
     for key in all_method_keys():
-        entries.push(item_entry(method_name_of(key), 3))
+        entries.push(item_entry(RANK_THIS_FILE, method_name_of(key), 3))
     return entries
 
 fn completion_keywords() -> List[String]:
     return ["fn", "struct", "enum", "interface", "impl", "if", "elif", "else", "while", "for", "in", "match", "return", "spawn", "await", "select", "defer", "errdefer", "test", "pub", "mut", "import", "from", "catch", "fail", "break", "continue", "true", "false", "none", "and", "or", "not", "timeout", "default"]
 
 # identifier completion: every binding name the last run defined
-# (module aliases and builtins included), then the keywords. bindings
-# whose type is a function complete as functions.
-fn identifier_entries() -> List[String]:
+# (module aliases and builtins included), then the keywords, each ranked by
+# where it was declared. bindings whose type is a function complete as
+# functions.
+fn identifier_entries(path: String) -> List[String]:
     mut entries: List[String] := []
     names := all_binding_names()
     tids := all_binding_types()
+    decls := all_binding_decl_nodes()
     for name, i in names:
         mut kind := 6
         if i < tids.len() and get_type_info(tids[i]).kind == "function":
             kind = 3
-        entries.push(item_entry(name, kind))
+        mut rank := RANK_BUILTIN
+        if i < decls.len() and decls[i] >= 0:
+            rank = RANK_OTHER_FILE
+            if file_for_node(decls[i]) == path:
+                rank = RANK_THIS_FILE
+        entries.push(item_entry(rank, name, kind))
     for keyword in completion_keywords():
-        entries.push(item_entry(keyword, 14))
+        entries.push(item_entry(RANK_KEYWORD, keyword, 14))
     return entries
 
 ## completion items for a position as a json array of CompletionItem
 ## {label, kind}: member completion when the word under the cursor
 ## follows a '.', identifier completion otherwise. items filter by the
-## word's byte prefix, dedupe by label, sort, and cap at 200.
+## word's byte prefix, sort by rank (this file, other files, keywords,
+## builtins) and then label, dedupe by label, and cap at 200.
 pub fn completion_items(uri: String, line0: Int, character: Int) -> Int:
     arr := json.make_array()
     path := uri_to_path(uri)
@@ -497,21 +514,20 @@ pub fn completion_items(uri: String, line0: Int, character: Int) -> Int:
     if word_start > 0 and ord(line_text[word_start - 1]) == 46:
         entries = member_entries(path, pos.line, line_text, word_start - 1)
     else:
-        entries = identifier_entries()
+        entries = identifier_entries(path)
+    # sorted before deduping, so a name declared in two places keeps its
+    # best-ranked entry
     mut seen: Map[String, Bool] := {}
-    mut kept: List[String] := []
-    for entry in entries:
+    mut emitted := 0
+    for entry in entries.sort():
+        if emitted >= MAX_COMPLETION_ITEMS:
+            break
         label := entry_label(entry)
         if not label.starts_with(word):
             continue
         if seen.contains_key(label):
             continue
         seen.insert(label, true)
-        kept.push(entry)
-    mut emitted := 0
-    for entry in kept.sort():
-        if emitted >= MAX_COMPLETION_ITEMS:
-            break
         item := json.make_object()
         json.object_set(item, "label", json.make_string(entry_label(entry)))
         json.object_set(item, "kind", json.make_int(entry_kind(entry)))

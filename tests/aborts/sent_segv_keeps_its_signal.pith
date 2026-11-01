@@ -1,0 +1,11 @@
+# a SIGSEGV sent to the process, rather than raised by a fault, reaches the
+# stack overflow handler too. it is not an overflow, so the process must
+# still die by SIGSEGV, and `pith run` must name the signal instead of
+# exiting 1 with nothing said.
+import std.signal as signal
+
+fn main() -> Int!:
+    print("before")
+    signal.raise_self(11)
+    print("after")
+    return 0

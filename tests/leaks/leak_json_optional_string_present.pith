@@ -1,0 +1,23 @@
+# typed json.decode of a flat struct with an optional String field that is
+# present in the document, the scalar-object path. the present optional's
+# payload once kept a count past the struct's destructor, about 32 bytes per
+# decode, while the absent case stayed flat (#1144).
+import std.json as json
+import leakprobe as probe
+
+pub struct Plain:
+    pub id: Int
+    pub note: String?
+    pub name: String
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut total := 0
+    while i < n:
+        doc := "\{\"id\":{i},\"note\":\"n\",\"name\":\"p{i}\"\}"
+        r := json.decode_text[Plain](doc)
+        if r.is_ok:
+            total = total + r.ok.name.len()
+        i = i + 1
+    print("{probe.peak_kb()}")

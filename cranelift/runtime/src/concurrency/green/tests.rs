@@ -108,7 +108,7 @@ fn maybe_yield_parks_and_requeues_on_owner() {
     // time pass (bumps the epoch past the quantum) and then hits a safe-point;
     // after it is resumed the second time it runs to completion.
     let coro = TaskCoroutine::with_stack(
-        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+        corosensei::stack::DefaultStack::new(DEFAULT_STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             let _finish = publish_yielder(yielder as *const TaskYielder);
             PREEMPT_EPOCH.fetch_add(QUANTUM_EPOCHS + 1, AtomicOrdering::Relaxed);
@@ -173,7 +173,7 @@ fn completion(id: TaskId) -> Option<i64> {
 // a task whose body returns `value` straight away.
 fn returning(value: i64) -> TaskCoroutine {
     TaskCoroutine::with_stack(
-        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+        corosensei::stack::DefaultStack::new(DEFAULT_STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             let _finish = publish_yielder(yielder as *const TaskYielder);
             value
@@ -194,7 +194,7 @@ fn panicking_task_marks_done_and_keeps_worker_alive() {
     set_current_worker(Some(0));
 
     let coro = TaskCoroutine::with_stack(
-        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+        corosensei::stack::DefaultStack::new(DEFAULT_STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             let _finish = publish_yielder(yielder as *const TaskYielder);
             panic!("boom from a green task");
@@ -369,7 +369,7 @@ fn parked_task_wakes_once_onto_owner_pinned_queue() {
     {}
 
     let coro = TaskCoroutine::with_stack(
-        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+        corosensei::stack::DefaultStack::new(DEFAULT_STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             let _finish = publish_yielder(yielder as *const TaskYielder);
             park_current(current_task().expect("test body runs inside a task"));
@@ -431,7 +431,7 @@ fn idle_peer_steals_from_a_busy_owners_pinned_queue() {
     while owner.pinned.lock().unwrap_or_else(|p| p.into_inner()).pop().is_some() {}
 
     let coro = TaskCoroutine::with_stack(
-        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+        corosensei::stack::DefaultStack::new(DEFAULT_STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             let _finish = publish_yielder(yielder as *const TaskYielder);
             park_current(current_task().expect("test body runs inside a task"));

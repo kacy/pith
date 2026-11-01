@@ -20,3 +20,11 @@ zstd = "0.13.3"
 [lib]
 name = "pith_runtime"
 crate-type = ["staticlib", "rlib"]
+
+# model checking for the runtime's park/wake and count protocols, only under
+# `RUSTFLAGS="--cfg loom"` (`make loom-check`). a normal build never sees it.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

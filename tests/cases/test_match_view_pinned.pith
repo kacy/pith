@@ -1,0 +1,97 @@
+# a catch-all arm (`x => ...`) and a tuple pattern bind views of the match
+# subject that take no count of their own. each arm here drops the count that
+# kept its subject alive: it overwrites the field, empties the list, or
+# rebinds the local the subject was read from. the match has to pin the
+# subject for its length, and the pin has to be released on every way out
+# of an arm: the merge, a return, a break and a continue. after the drop each
+# arm allocates nodes of the same size, so a freed view reads back as filler.
+struct C:
+    name: String
+
+enum Shape:
+    Named(String)
+    Empty
+
+struct H:
+    mut c: C
+    mut s: String
+    mut shape: Shape
+    mut cs: List[C]
+    mut pair: (String, C)
+
+fn churn() -> List[C]:
+    mut junk: List[C] := []
+    mut i := 0
+    while i < 50:
+        junk.push(C(name: "filler-{i}-x"))
+        i = i + 1
+    return junk
+
+fn shape_name(s: Shape) -> String:
+    return match s:
+        Shape.Named(n) => n
+        Shape.Empty => "empty"
+
+# a tail match: every arm returns, and the exit cleanup drops the pin
+fn take_name(h: H) -> String:
+    match h.c:
+        x =>
+            h.c = C(name: "other")
+            j := churn()
+            return x.name
+
+fn main() -> Int:
+    h := H(c: C(name: "hello" + "-c"), s: "hello" + "-s", shape: Shape.Named("hello" + "-shape"), cs: [C(name: "hello" + "-cs")], pair: ("hello" + "-pa", C(name: "hello" + "-pb")))
+    match h.c:
+        x =>
+            h.c = C(name: "other")
+            j := churn()
+            print("struct: {x.name}")
+    match h.s:
+        "nope" =>
+            print("nope")
+        x =>
+            h.s = "other" + "-x"
+            j := churn()
+            print("string: {x}")
+    match h.shape:
+        Shape.Empty =>
+            print("empty")
+        x =>
+            h.shape = Shape.Empty
+            j := churn()
+            print("enum: {shape_name(x)}")
+    match h.cs[0]:
+        x =>
+            h.cs.clear()
+            j := churn()
+            print("element: {x.name}")
+    match h.pair:
+        (a, b) =>
+            h.pair = ("x", C(name: "y"))
+            j := churn()
+            print("tuple: {a} {b.name}")
+    mut local := C(name: "hello" + "-local")
+    match local:
+        x =>
+            local = C(name: "other")
+            j := churn()
+            print("local: {x.name}")
+    h.c = C(name: "hello" + "-tail")
+    print("tail: {take_name(h)}")
+    mut seen: List[String] := []
+    mut i := 0
+    while i < 4:
+        h.c = C(name: "hello" + "-loop{i}")
+        i = i + 1
+        match h.c:
+            x =>
+                h.c = C(name: "other")
+                j := churn()
+                seen.push(x.name)
+                if i == 2:
+                    continue
+                if i == 3:
+                    break
+    print("loop: {seen.join(" ")}")
+    return 0

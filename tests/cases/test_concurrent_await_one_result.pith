@@ -1,0 +1,39 @@
+# two tasks await one handle at the same time. the result carries the task's
+# count on the value it returned, so exactly one awaiter receives it and the
+# other reads the zero value, on both backends. the os-thread backend used to
+# hand it to both, and each released it: a double free. the task holds off
+# until both awaiters have had time to block, so they really wait together.
+#
+# runs under `make memcheck` with PITH_GREEN=0, where valgrind flags the
+# double free; the printed line flags a second awaiter that got the value.
+
+fn build(go: Channel[Int], n: Int) -> String:
+    go.recv()
+    mut s := "value"
+    mut i := 0
+    while i < n:
+        s = s + "x"
+        i = i + 1
+    return s
+
+fn waiter(t: Task[String]) -> Int:
+    s := await t
+    return s.len()
+
+fn main():
+    mut received := 0
+    mut both := 0
+    mut round := 0
+    while round < 8:
+        go := Channel[Int](1)
+        t := spawn build(go, round)
+        a := spawn waiter(t)
+        b := spawn waiter(t)
+        sleep(20)
+        go.send(1)
+        x := await a
+        y := await b
+        received = received + x + y
+        both = both + x * y
+        round = round + 1
+    print("received {received} chars, both awaiters had it {both} times")

@@ -53,15 +53,15 @@ pub(super) use crate::concurrency::scheduler::{make_handle, split_handle, GEN_MA
 ///   task in no queue, and the block site it parked on owns re-enqueueing it.
 /// - `S_DONE`: coroutine returned, or the block holds no task at all (a fresh
 ///   arena chunk reads `Done`, so a wake against a never-used index no-ops).
-pub(super) const S_STATE_MASK: u64 = 0b11;
-pub(super) const S_READY: u64 = 0;
-pub(super) const S_RUNNING: u64 = 1;
-pub(super) const S_PARKED: u64 = 2;
-pub(super) const S_DONE: u64 = 3;
+pub(crate) const S_STATE_MASK: u64 = 0b11;
+pub(crate) const S_READY: u64 = 0;
+pub(crate) const S_RUNNING: u64 = 1;
+pub(crate) const S_PARKED: u64 = 2;
+pub(crate) const S_DONE: u64 = 3;
 /// a wake landed while the task was still `Running` (mid-suspend, before the
 /// yield arm recorded it as `Parked`): the yield arm re-enqueues instead of
 /// parking, closing the wake/park race so a wake in that window is never lost.
-pub(super) const S_WAKE_PENDING: u64 = 1 << 2;
+pub(crate) const S_WAKE_PENDING: u64 = 1 << 2;
 /// set by `pith_green_maybe_yield` right before it parks a task that overran
 /// its quantum: the yield arm routes it onto the owner's lowest-priority
 /// `deferred` queue instead of the prompt `pinned` queue.
@@ -78,7 +78,7 @@ pub(super) fn word_owner(word: u64) -> Option<usize> {
 }
 
 /// the owner bits for a worker index (stored as `worker + 1`, 0 = unpinned).
-pub(super) fn owner_bits(worker: usize) -> u64 {
+pub(crate) fn owner_bits(worker: usize) -> u64 {
     ((worker as u64) + 1) << S_OWNER_SHIFT
 }
 

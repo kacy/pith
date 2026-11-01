@@ -124,6 +124,8 @@ tasks stay simple:
 - `task.is_done()`
 - `task.detach()`
 
+`await` consumes the task. the first `await` of a handle gets the result, and any other `await` of the same handle gets a zero result (`0` for an `Int`, an empty `String`), whether it runs after the first or at the same time in another task. both backends behave this way, so a task's result is handed out once.
+
 `await_ctx(task, ctx)` returns `T!WaitError`. if the context is cancelled or reaches its deadline, the wait stops and returns an error. the task can keep running unless the task body is also checking a cancelled context.
 
 if you intentionally do not plan to join a task later, call `detach()`.

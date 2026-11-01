@@ -1,0 +1,56 @@
+# a function that unlocks and then reads an argument the caller read under the
+# lock. the unlock hands the guarded field to another task, which may replace
+# it at once and drop the old value, so the call has to keep its own count on
+# the argument. unlock is therefore not a storage keeper: if it were, the call
+# below would skip that count and `finish` would read a freed string.
+struct Holder:
+    pub mu: Mutex
+    pub mut msg: String
+
+fn finish(mu: Mutex, msg: String) -> Int:
+    mu.unlock()
+    mut n := 0
+    mut k := 0
+    while k < 200:
+        n = n + msg.len()
+        k = k + 1
+    return n
+
+fn reader(h: Holder, rounds: Int, out: Channel[Int]):
+    mut total := 0
+    mut i := 0
+    while i < rounds:
+        h.mu.lock()
+        total = total + finish(h.mu, h.msg)
+        i = i + 1
+    out.send(total)
+
+fn writer(h: Holder, rounds: Int, out: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        h.mu.lock()
+        # every message is five bytes, so the reader's total is fixed
+        h.msg = "msg-" + (i % 10).to_string()
+        h.mu.unlock()
+        i = i + 1
+    out.send(i)
+
+fn main():
+    h := Holder(mu: Mutex(), msg: "msg-0")
+    rounds := 20000
+    out := Channel[Int](4)
+    r1 := spawn reader(h, rounds, out)
+    r2 := spawn reader(h, rounds, out)
+    w1 := spawn writer(h, rounds, out)
+    w2 := spawn writer(h, rounds, out)
+    mut sum := 0
+    mut got := 0
+    while got < 4:
+        if let v = out.recv():
+            sum = sum + v
+        got = got + 1
+    await r1
+    await r2
+    await w1
+    await w2
+    print("sum {sum}")

@@ -18,8 +18,12 @@ on:
         description: release tag to build and attach binaries to
         required: true
 
+# the build job runs every crate's build.rs and the repo's own scripts, so
+# only the publish job gets a token that can write. no checkout keeps its
+# token in .git/config: nothing here pushes, and publish talks to the api
+# through GH_TOKEN.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -34,9 +38,10 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "12.0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: rust toolchain
         run: |
@@ -51,7 +56,7 @@ jobs:
       - name: smoke test the package
         run: sh tooling/smoke_release.sh dist/pith-*.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: pith-${{ matrix.runner }}
           path: |
@@ -63,12 +68,15 @@ jobs:
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true

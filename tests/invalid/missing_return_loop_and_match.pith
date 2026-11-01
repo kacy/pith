@@ -1,0 +1,39 @@
+# a loop that can stop, a `while true` that breaks, and a match with an arm
+# that does not leave all fall off the end. a match that is not the last
+# statement does not return its arms' values.
+enum Color:
+    Red
+    Green
+
+fn first_even(xs: List[Int]) -> Int:
+    for x in xs:
+        if x % 2 == 0:
+            return x
+
+fn until_big(start: Int) -> Int:
+    mut n := start
+    while true:
+        if n > 100:
+            break
+        n = n * 2
+        if n == 64:
+            return n
+
+fn name(c: Color) -> String:
+    match c:
+        Color.Red => "red"
+        Color.Green =>
+            print("green")
+    print("after")
+
+fn tail_block(c: Color) -> String:
+    match c:
+        Color.Red => "red"
+        Color.Green =>
+            print("no return here")
+
+fn main():
+    print(first_even([1, 2]).to_string())
+    print(until_big(1).to_string())
+    print(name(Color.Red))
+    print(tail_block(Color.Red))

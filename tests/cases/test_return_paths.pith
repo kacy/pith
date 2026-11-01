@@ -1,0 +1,76 @@
+# the shapes that return on every path pass the missing-return check
+# (E270): an if whose branches all leave, a match whose arms all do, a
+# tail match whose inline arms are the value, a `while true` that only
+# leaves by return, fail at the end, and a call to exit.
+enum Color:
+    Red
+    Green
+    Blue
+
+fn both(flag: Bool) -> Int:
+    if flag:
+        return 1
+    else:
+        return 2
+
+fn chain(n: Int) -> String:
+    if n < 0:
+        return "neg"
+    elif n == 0:
+        return "zero"
+    else:
+        if n > 9:
+            return "big"
+        return "small"
+
+fn arms(c: Color) -> Int:
+    match c:
+        Color.Red =>
+            return 1
+        Color.Green =>
+            return 2
+        Color.Blue =>
+            return 3
+
+fn tail(c: Color) -> String:
+    print("tail")
+    match c:
+        Color.Red => "red"
+        Color.Green => "green"
+        Color.Blue =>
+            return "blue"
+
+fn forever(start: Int) -> Int:
+    mut n := start
+    while true:
+        n = n + 1
+        for i in [1, 2]:
+            if i == n:
+                break
+        if n > 3:
+            return n
+
+fn must(flag: Bool) -> Int!:
+    if flag:
+        return 7
+    fail "no"
+
+fn unwrap_or_exit(x: Int?) -> Int:
+    if let v = x:
+        return v
+    else:
+        exit(3)
+
+fn main():
+    print(both(true).to_string() + " " + both(false).to_string())
+    print(chain(-1) + " " + chain(0) + " " + chain(5) + " " + chain(50))
+    print(arms(Color.Green).to_string())
+    print(tail(Color.Red) + " " + tail(Color.Blue))
+    print(forever(0).to_string())
+    print((must(true) catch 0).to_string() + " " + (must(false) catch 0).to_string())
+    print(unwrap_or_exit(5).to_string())
+    pick := fn(x: Int) -> Int:
+        if x > 0:
+            return x
+        return 0 - x
+    print(pick(0 - 4).to_string())

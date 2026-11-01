@@ -124,9 +124,13 @@ tasks stay simple:
 - `task.is_done()`
 - `task.detach()`
 
+`await` consumes the task. the first `await` of a handle gets the result, and any other `await` of the same handle gets a zero result (`0` for an `Int`, an empty `String`), whether it runs after the first or at the same time in another task. both backends behave this way, so a task's result is handed out once.
+
 `await_ctx(task, ctx)` returns `T!WaitError`. if the context is cancelled or reaches its deadline, the wait stops and returns an error. the task can keep running unless the task body is also checking a cancelled context.
 
 if you intentionally do not plan to join a task later, call `detach()`.
+
+a handle bound to a local is detached for you when the function leaves it unawaited: at a return, at a failure, or when the next `spawn` is stored in the same name, so an early exit that skips the await still lets the task's record go. this applies only to a local that is just awaited, polled with `is_done()` or detached. a handle that is passed on, returned, stored or copied belongs to whoever holds it, and awaiting or detaching it is up to them.
 
 ## timers
 
@@ -480,12 +484,22 @@ regardless of waiters. `PITH_GREEN_STATS=1` prints the wake breakdown,
 contended-lock counts, and hot-path counters at exit if you want to see
 where a workload's handoffs actually go.
 
+each green task runs on a 1 MiB stack that does not grow. the size is
+reserved address space, and memory backs only the pages a task touches.
+recursion that runs past the end of the stack hits its guard page, and the
+runtime stops the process with `pith runtime error: stack overflow in task N`
+and exit status 2. an overflow on the main thread or in an os-thread task is
+reported the same way. `PITH_GREEN_STACK_KB=n` sets the stack size of every
+task in KiB, clamped to the range 64 to 1048576 (1 GiB). the runtime reads it
+once, when it makes the first stack.
+
 it also keeps memory flat under fan-out. when a task finishes, the green
 backend reclaims its slot and releases the closure it was spawned with, so a
 server that spawns one task per request holds only the tasks running at once,
 not one record for every request it has ever served. this holds even for a
 fire-and-forget `spawn f()` whose handle you never keep: a discarded spawn is
-detached at the spawn site, so its slot is reclaimed when the body finishes
+detached at the spawn site, and a handle a function leaves unawaited in a
+local is detached when the function returns, so its slot is reclaimed when the body finishes
 rather than pinned until the process exits. a fan-out of 500k short tasks
 holds around 3 mb, flat no matter how many run in total — see the green fan-out row in `docs/performance.md`. (an awaited task on
 the os-thread backend still keeps its record until you read the result;

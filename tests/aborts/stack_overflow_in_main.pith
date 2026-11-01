@@ -1,0 +1,12 @@
+# unbounded recursion on the main thread runs into the guard gap below the
+# process stack, which is reported like a task's overflow.
+
+fn depth(n: Int) -> Int:
+    if n == 0:
+        return 0
+    return depth(n - 1) + 1
+
+fn main() -> Int!:
+    print("before")
+    print(depth(100000000).to_string())
+    return 0

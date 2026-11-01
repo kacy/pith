@@ -1,0 +1,27 @@
+# an if with no else leaves the false path to fall off the end. the
+# emitter closes every body with a zero return, so mk(false) used to hand
+# back a null struct whose first field read crashed, and the Int and List
+# versions quietly returned 0 and [].
+struct P:
+    pub x: Int
+
+fn mk(flag: Bool) -> P:
+    if flag:
+        return P(1)
+
+fn count(flag: Bool) -> Int:
+    if flag:
+        return 1
+    elif flag == false:
+        return 2
+
+fn names(flag: Bool) -> List[String]:
+    if flag:
+        return ["a"]
+    else:
+        print("no names")
+
+fn main():
+    print(mk(true).x.to_string())
+    print(count(true).to_string())
+    print(names(true).len().to_string())

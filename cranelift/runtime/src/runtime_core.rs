@@ -24,6 +24,7 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
         3 => "allocation failed",
         4 => "invalid allocation layout",
         5 => "call to a function the compiler could not resolve — a compiler bug, not a problem in your program",
+        6 => "value() on none",
         _ => "runtime error",
     };
     eprintln!("pith runtime error: {message}");
@@ -1337,12 +1338,15 @@ mod tests {
             pith_struct_weak_retain(s);
             assert_eq!(struct_counts(s), (1, 2)); // implicit + one weak
 
-            // the target is alive: a weak read returns the pointer
-            assert_eq!(pith_struct_weak_load(s), s);
+            // the target is alive: an upgrade returns the pointer with a
+            // count of its own
+            assert_eq!(pith_struct_weak_upgrade(s), s);
+            assert_eq!(struct_counts(s), (2, 2));
+            pith_struct_release(s);
 
             // drop the only strong owner: value dies, header stays (weak > 0)
             pith_struct_release(s);
-            assert_eq!(pith_struct_weak_load(s), 0); // dead -> none
+            assert_eq!(pith_struct_weak_upgrade(s), 0); // dead -> none
 
             // dropping the last weak frees the header
             pith_struct_weak_release(s);
@@ -1354,17 +1358,18 @@ mod tests {
     // on. the dead flag is an atomic for exactly this shape; the join gives the
     // load a happens-after edge, so it must observe the death.
     #[test]
-    fn weak_load_sees_a_release_from_another_thread() {
+    fn weak_upgrade_sees_a_release_from_another_thread() {
         unsafe {
             let s = pith_struct_alloc(1);
             pith_struct_weak_retain(s);
-            assert_eq!(pith_struct_weak_load(s), s);
+            assert_eq!(pith_struct_weak_upgrade(s), s);
+            pith_struct_release(s);
 
             std::thread::spawn(move || pith_struct_release(s))
                 .join()
                 .expect("releasing thread panicked");
 
-            assert_eq!(pith_struct_weak_load(s), 0);
+            assert_eq!(pith_struct_weak_upgrade(s), 0);
             pith_struct_weak_release(s);
         }
     }
@@ -1455,6 +1460,42 @@ mod tests {
 
     static WEAK_TAKEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
+    /// a destructor that tries to upgrade a weak reference to its own value.
+    unsafe extern "C" fn self_upgrading_dtor(ptr: i64) {
+        SELF_UPGRADE.store(pith_struct_weak_upgrade(ptr), Ordering::SeqCst);
+    }
+
+    static SELF_UPGRADE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+    #[test]
+    fn an_upgrade_during_the_destructor_reads_none() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_weak_retain(s);
+            pith_struct_set_dtor(s, self_upgrading_dtor as usize as i64);
+            pith_struct_release(s);
+            assert_eq!(SELF_UPGRADE.load(Ordering::SeqCst), 0, "a dying value is not revived");
+            assert_eq!(pith_struct_weak_upgrade(s), 0);
+            pith_struct_weak_release(s);
+        }
+    }
+
+    #[test]
+    fn a_retain_of_a_dead_struct_is_refused() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            pith_struct_weak_retain(s);
+            pith_struct_release(s); // dead; the weak reference keeps the header
+            let counts = struct_counts(s);
+            pith_struct_retain(s);
+            assert_eq!(struct_counts(s), counts, "no count taken on a dead value");
+            // the stray retain's release lands on the over-release guard
+            pith_struct_release(s);
+            assert_eq!(struct_counts(s), counts);
+            pith_struct_weak_release(s);
+        }
+    }
+
     #[test]
     fn a_sole_owner_release_runs_the_destructor_once() {
         unsafe {
@@ -1476,7 +1517,7 @@ mod tests {
             assert_eq!(WEAK_TAKEN.load(Ordering::SeqCst), s);
             // the header outlives the value for the weak reference
             assert_eq!(struct_counts(s).1, 1);
-            assert_eq!(pith_struct_weak_load(s), 0);
+            assert_eq!(pith_struct_weak_upgrade(s), 0);
             pith_struct_weak_release(s);
         }
     }
@@ -1498,13 +1539,13 @@ mod tests {
     }
 
     #[test]
-    fn weak_load_on_a_dead_or_invalid_pointer_is_none() {
+    fn weak_upgrade_on_a_dead_or_invalid_pointer_is_none() {
         unsafe {
-            assert_eq!(pith_struct_weak_load(0), 0);
-            assert_eq!(pith_struct_weak_load(12345), 0);
+            assert_eq!(pith_struct_weak_upgrade(0), 0);
+            assert_eq!(pith_struct_weak_upgrade(12345), 0);
             let s = pith_struct_alloc(1);
             pith_struct_release(s); // fully freed, no weak refs
-            assert_eq!(pith_struct_weak_load(s), 0); // magic scrubbed -> none
+            assert_eq!(pith_struct_weak_upgrade(s), 0); // magic scrubbed -> none
         }
     }
 
@@ -3630,6 +3671,10 @@ unsafe fn struct_weak(base: *mut u8) -> &'static AtomicU32 {
 // cannot erase a concurrent buffering; the alive test is `& STRUCT_DEAD_BIT`,
 // never `!= 0`.
 pub(crate) const STRUCT_DEAD_BIT: u32 = 1;
+/// the strong count a struct's destructor runs under (see `struct_release`).
+/// far above any real count, so `weak_upgrade` reads it as dying: the
+/// destructor's own balanced retains and releases move it by a few at most.
+pub(crate) const STRUCT_DTOR_GUARD: u32 = 1 << 31;
 pub(crate) const STRUCT_BUFFERED_BIT: u32 = 2;
 /// Set once the struct can be reached from more than one task (see
 /// `share.rs`); until then its counts are updated with plain loads and stores.
@@ -3888,7 +3933,15 @@ unsafe fn struct_retain<const HOOKED: bool>(ptr: i64, switches: u8) {
         if HOOKED {
             quarantine_check_alive(base, crate::quarantine::Op::Retain);
         }
-        let local = struct_local(base, switches);
+        let flags = struct_flags(base).load(Ordering::Relaxed);
+        // a backstop: a value already destroyed is never revived. every weak
+        // read takes its count through `weak_upgrade`, so nothing should
+        // retain a dead struct; one that does gets no count, and its matching
+        // release lands on the over-release guard in `struct_release`.
+        if flags & STRUCT_DEAD_BIT != 0 {
+            return;
+        }
+        let local = switches & crate::switches::LOCAL_COUNTS != 0 && flags & STRUCT_SHARED_BIT == 0;
         if HOOKED && local {
             crate::share::check_local(switches, ptr, "retain");
         }
@@ -4002,12 +4055,16 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
         // or passes it along, which retains and releases the value. with the
         // count sitting at zero, that release would come back through here
         // and run the destructor a second time. so the body runs under a
-        // guard count of one, the same guard the cycle collector's teardown
-        // applies: every pair inside it balances back to one, and no release
-        // inside can reach zero. the value is freed below whatever the count
-        // reads afterwards; a `drop` that lets `self` escape leaves a
-        // dangling reference, which is documented rather than guarded.
-        strong.store(1, Ordering::Relaxed);
+        // guard count, as the cycle collector's teardown does: every pair
+        // inside it balances back to the guard, and no release inside can
+        // reach zero. the value is freed below whatever the count reads
+        // afterwards; a `drop` that lets `self` escape leaves a dangling
+        // reference, which is documented rather than guarded.
+        //
+        // the guard is `STRUCT_DTOR_GUARD` rather than one, so a weak upgrade
+        // racing the destructor can tell it from a live count and refuse it.
+        // the release store pairs with the acquire loads in `weak_upgrade`.
+        strong.store(STRUCT_DTOR_GUARD, Ordering::Release);
         // panic-guard: calling a compiler-emitted struct destructor from its header slot.
         let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
         f(ptr);
@@ -4183,26 +4240,72 @@ pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
     }
 }
 
-/// Read a weak reference: returns the struct pointer if the target is still
-/// alive, or 0 if it has been released. Never dereferences dead field data:
-/// the header stays valid while any weak reference holds it, and the dead flag
-/// is set the instant the last strong owner goes away.
+/// Upgrade a weak reference: one more strong owner of the struct if it is
+/// still alive, returned to the caller, or 0 once its last owner is gone.
+/// The count is the caller's to release. Never dereferences dead field data:
+/// the header stays valid while any weak reference holds it.
+///
+/// Taking the count is what makes the read safe on a struct other threads
+/// can release. Checking liveness and retaining later left a window in which
+/// the last owner could drop it, and the reader then revived a value whose
+/// destructor had already run.
 ///
 /// # Safety
 /// ptr must be a pith_struct_alloc result, 0, or garbage (magic-checked).
 #[no_mangle]
-pub unsafe extern "C" fn pith_struct_weak_load(ptr: i64) -> i64 {
+pub unsafe extern "C" fn pith_struct_weak_upgrade(ptr: i64) -> i64 {
     let Some(base) = struct_base(ptr) else {
         return 0;
     };
-    // acquire pairs with the release fetch_or in `pith_struct_release`: a load
-    // that sees the target dead also sees its destructor's effects. test the
-    // death bit specifically: a live struct sitting in the cycle collector's
-    // suspect buffer has bit 1 set and must still read as alive.
-    if struct_flags(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
-        return 0;
+    let switches = crate::switches::get();
+    let upgraded = if struct_local(base, switches) {
+        // only the task that built it can reach a local struct, so nothing
+        // can release it between this check and the increment.
+        let strong = struct_strong(base);
+        let count = strong.load(Ordering::Relaxed);
+        let live = struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0
+            && count != 0
+            && count < STRUCT_DTOR_GUARD;
+        if live {
+            strong.store(count + 1, Ordering::Relaxed);
+        }
+        live
+    } else {
+        weak_upgrade(struct_strong(base), struct_flags(base))
+    };
+    if upgraded {
+        ptr
+    } else {
+        0
     }
-    ptr
+}
+
+/// The upgrade itself, on a struct's strong count and flag word: add one to
+/// the count only while it is a live one, in a single compare-and-swap, so a
+/// last release cannot slip between the check and the increment. 0 means the
+/// last owner is gone, `STRUCT_DTOR_GUARD` and above that the destructor is
+/// running, and the dead bit that the value is destroyed (the cycle
+/// collector frees a value whose count never reached 0). Generic over the
+/// atomic so the loom model runs this same function.
+#[inline]
+pub(crate) fn weak_upgrade<C: crate::sync::Count32>(strong: &C, flags: &C) -> bool {
+    // acquire on both: a load that sees the guard or the dead bit also sees
+    // the release that set it, and the struct's fields as its last owner
+    // left them. test the death bit specifically: a live struct sitting in
+    // the cycle collector's suspect buffer has bit 1 set and stays alive.
+    if flags.load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+        return false;
+    }
+    let mut count = strong.load(Ordering::Acquire);
+    loop {
+        if count == 0 || count >= STRUCT_DTOR_GUARD {
+            return false;
+        }
+        match strong.compare_exchange_weak(count, count + 1, Ordering::Acquire, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(current) => count = current,
+        }
+    }
 }
 
 #[no_mangle]

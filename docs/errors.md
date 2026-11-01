@@ -738,6 +738,45 @@ error[E268]: impl Drop for Slot: the impl must declare fn drop()
 it. put the type's other methods in an `impl T:` block of their own, and have
 `drop` call the explicit closer so the two stay idempotent.
 
+### E269 — assignment to a captured variable
+
+a closure captures the outer variables it uses by value, when it is created.
+an assignment to one inside the closure would change only the closure's copy:
+`mut n := 0; c := fn() -> Int: n = n + 1; return n` returned 1 on every call
+and `n` never changed. the checker rejects the assignment. return the new
+value from the closure and assign it outside, or keep the state in a struct
+field or a collection, whose handle the closure shares with the caller. a
+module global is not captured, and a closure can assign its own locals.
+
+```
+error[E269]: cannot assign to 'n' inside a closure: a closure captures a copy, so the variable outside would not change
+  fix: return the new value from the closure, or keep the state in a struct field or a collection the closure can update
+```
+
+### E270 — missing return
+
+a function that declares a return type reaches the end of its body on some
+path without returning a value. that path used to return a zero: 0 for an
+`Int`, `[]` for a list, `none` for an optional, a failed result with no
+message for `T!`, and a null struct that crashed on its first field read.
+there is no implicit `none` or ok, so `-> T?` and `-> T!` follow the same
+rule.
+
+a path returns when it ends in `return` or `fail`, in a call to `exit`, or in
+a `while true` loop with no `break` for it. an `if` returns when it has an
+`else` and every branch returns, and a `match` when every arm does. a `match`
+that is the last statement of the body returns its value: an inline arm
+(`Color.Red => "red"`) returns its expression, and a block arm has to return
+on its own. a closure with a block body follows the same rule when it
+declares a return type or returns a value on some path. `pith lint` reports
+the same code as a warning.
+
+```
+error[E270]: 'mk' declares a return type, but a path through its body reaches the end without returning a value
+  fix: end every path with return or fail
+error[E270]: this closure returns a value, but a path through its body reaches the end without returning one
+```
+
 ---
 
 ## lint errors (E3xx)

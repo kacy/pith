@@ -51,44 +51,59 @@ fn glob_depth(root: String, candidate: String) -> Int:
     return depth
 
 # match one path segment against one pattern segment, from the given
-# offsets on. `*` matches any run of characters and `?` exactly one; a `*`
-# tries the shortest run first and backtracks by recursion.
+# offsets on. `*` matches any run of characters and `?` exactly one. a `*`
+# starts with the shortest run, and on a mismatch only the latest `*` takes
+# one more character: earlier ones never need to retry, so this is
+# O(pattern x text), where backtracking into every `*` was exponential in
+# their number.
 fn glob_char_match(pattern: String, text: String, pattern_index: Int, text_index: Int) -> Bool:
-    if pattern_index >= pattern.len():
-        return text_index >= text.len()
-    if pattern[pattern_index] == "*":
-        if glob_char_match(pattern, text, pattern_index + 1, text_index):
-            return true
-        if text_index < text.len():
-            return glob_char_match(pattern, text, pattern_index, text_index + 1)
-        return false
-    if pattern[pattern_index] == "?":
-        if text_index >= text.len():
+    mut p := pattern_index
+    mut t := text_index
+    mut star := 0 - 1
+    mut star_text := 0
+    while t < text.len():
+        if p < pattern.len() and pattern[p] == "*":
+            star = p
+            star_text = t
+            p = p + 1
+        elif p < pattern.len() and (pattern[p] == "?" or pattern[p] == text[t]):
+            p = p + 1
+            t = t + 1
+        elif star >= 0:
+            star_text = star_text + 1
+            t = star_text
+            p = star + 1
+        else:
             return false
-        return glob_char_match(pattern, text, pattern_index + 1, text_index + 1)
-    if text_index >= text.len():
-        return false
-    if pattern[pattern_index] != text[text_index]:
-        return false
-    return glob_char_match(pattern, text, pattern_index + 1, text_index + 1)
+    while p < pattern.len() and pattern[p] == "*":
+        p = p + 1
+    return p >= pattern.len()
 
 # match whole segments, with `**` standing for any number of them (none
-# included). the other pattern segments go to glob_char_match.
+# included). the other pattern segments go to glob_char_match. `**` is
+# handled the way glob_char_match handles `*`, one segment at a time.
 fn glob_match_parts(pattern_parts: List[String], path_parts: List[String], pattern_index: Int, path_index: Int) -> Bool:
-    if pattern_index >= pattern_parts.len():
-        return path_index >= path_parts.len()
-    part := pattern_parts[pattern_index]
-    if part == "**":
-        if glob_match_parts(pattern_parts, path_parts, pattern_index + 1, path_index):
-            return true
-        if path_index < path_parts.len():
-            return glob_match_parts(pattern_parts, path_parts, pattern_index, path_index + 1)
-        return false
-    if path_index >= path_parts.len():
-        return false
-    if not glob_char_match(part, path_parts[path_index], 0, 0):
-        return false
-    return glob_match_parts(pattern_parts, path_parts, pattern_index + 1, path_index + 1)
+    mut p := pattern_index
+    mut t := path_index
+    mut star := 0 - 1
+    mut star_path := 0
+    while t < path_parts.len():
+        if p < pattern_parts.len() and pattern_parts[p] == "**":
+            star = p
+            star_path = t
+            p = p + 1
+        elif p < pattern_parts.len() and glob_char_match(pattern_parts[p], path_parts[t], 0, 0):
+            p = p + 1
+            t = t + 1
+        elif star >= 0:
+            star_path = star_path + 1
+            t = star_path
+            p = star + 1
+        else:
+            return false
+    while p < pattern_parts.len() and pattern_parts[p] == "**":
+        p = p + 1
+    return p >= pattern_parts.len()
 
 # return true when path_text matches pattern.
 pub fn matches(pattern: String, path_text: String) -> Bool:

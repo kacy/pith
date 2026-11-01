@@ -1042,9 +1042,9 @@ fn parse_block_inner(indent: Int) -> Int:
     line_pos = line_pos + 1
     return scalar_node(text)
 
-# the value of `key:` when the rest of the line is empty: a nested block, or
-# null when nothing deeper follows.
-fn parse_nested_value(parent_indent: Int) -> Int:
+# the value of `key:` (`after_key`) or of a bare `-` when the rest of the line
+# is empty: a nested block, or null when nothing deeper follows.
+fn parse_nested_value(parent_indent: Int, after_key: Bool) -> Int:
     skip_blank_lines()
     if at_end() or at_document_boundary():
         return null_node()
@@ -1055,7 +1055,10 @@ fn parse_nested_value(parent_indent: Int) -> Int:
     #     ports:
     #     - 80
     #     - 443
-    if indent == parent_indent and starts_sequence_entry(line_text[line_pos]):
+    # after a bare `-` the same line shape is the next entry of the same
+    # sequence. reading it as a nested one turned `-\n-\n-` into [[[null]]]
+    # and recursed once per entry, past the nesting limit and off the stack.
+    if after_key and indent == parent_indent and starts_sequence_entry(line_text[line_pos]):
         return parse_seq(indent)
     return null_node()
 
@@ -1072,7 +1075,7 @@ fn reject_deeper_continuation(parent_indent: Int):
 # the value for `key: <rest>` where the key sits at `parent_indent`.
 fn parse_value_after_key(parent_indent: Int, rest: String) -> Int:
     if rest.len() == 0:
-        return parse_nested_value(parent_indent)
+        return parse_nested_value(parent_indent, true)
     if rest.starts_with("|") or rest.starts_with(">"):
         return parse_block_scalar(parent_indent, rest)
     value := parse_inline_value(rest)
@@ -1140,7 +1143,7 @@ fn parse_seq(indent: Int) -> Int:
         mut item := 0 - 1
         if text == "-":
             line_pos = line_pos + 1
-            item = parse_nested_value(indent)
+            item = parse_nested_value(indent, false)
         else:
             offset := dash_content_offset(text)
             rest := text.substring(offset, text.len())

@@ -1,0 +1,42 @@
+# a chunked request body bounds the bytes that are not data: the trailer
+# section, and the chunk framing measured against the data it carries.
+#
+# the body limit counted decoded bytes only, so a client could send one-byte
+# chunks with 8 kB extensions (8 kB read per byte of the limit) or an endless
+# trailer section, and the reader kept reading.
+
+import std.bytes as bytes
+import std.io as io
+import std.net.http as http
+
+fn request(body: String) -> Bytes:
+    crlf := "\r\n"
+    return bytes.from_string_utf8("POST /up HTTP/1.1" + crlf + "Host: h" + crlf + "Transfer-Encoding: chunked" + crlf + crlf + body)
+
+fn attempt(label: String, body: String):
+    got := http.read_request_buffered_bytes(io.bytes_reader(request(body)).buffered_chunked(4096))
+    if got.is_err:
+        print(label + ": " + got.err)
+    else:
+        print(label + ": ok " + got.ok.body_bytes().len().to_string() + " bytes")
+
+fn repeat(unit: String, count: Int) -> String:
+    mut out := ""
+    mut i := 0
+    while i < count:
+        out = out + unit
+        i = i + 1
+    return out
+
+fn main() -> Int:
+    crlf := "\r\n"
+    # ordinary chunks, a short extension and a trailer still parse
+    attempt("plain", "5;name=v" + crlf + "hello" + crlf + "1" + crlf + "!" + crlf + "0" + crlf + "X-Sum: 6" + crlf + crlf)
+    # small chunks are fine: their framing is paid for
+    attempt("small chunks", repeat("1" + crlf + "a" + crlf, 5000) + "0" + crlf + crlf)
+    # one-byte chunks with 8 kB extensions are not
+    ext := repeat("x", 8000)
+    attempt("extension flood", repeat("1;" + ext + crlf + "a" + crlf, 8) + "0" + crlf + crlf)
+    # nor is a trailer section past the header limit
+    attempt("trailer flood", "1" + crlf + "a" + crlf + "0" + crlf + repeat("X-Pad: " + repeat("p", 1000) + crlf, 80) + crlf)
+    return 0

@@ -76,12 +76,19 @@ fn generate_runtime_table() -> Result<(), String> {
 
     let mut abi = String::new();
     let mut compat = String::new();
+    // FNV-1a over the entry lines, comments and blank lines left out. the
+    // bootstrap seed and a built ir_driver carry it, so the cli can tell
+    // when they were made against another table.
+    let mut abi_hash: u64 = 0xcbf2_9ce4_8422_2325;
     abi.push_str("const ABI_RUNTIME_FUNCTIONS: &[RuntimeDecl] = &[\n");
     compat.push_str("const COMPAT_RUNTIME_FUNCTIONS: &[RuntimeDecl] = &[\n");
     for (line_no, raw_line) in contents.lines().enumerate() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
+        }
+        for byte in line.bytes().chain(std::iter::once(b'\n')) {
+            abi_hash = (abi_hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
         }
         let parts: Vec<&str> = line.split('|').collect();
         if parts.len() != 4 && parts.len() != 5 {
@@ -131,7 +138,11 @@ fn generate_runtime_table() -> Result<(), String> {
     }
     abi.push_str("];\n");
     compat.push_str("];\n");
-    let out = abi + &compat;
+    let out = format!(
+        "{abi}{compat}\n/// identifies the runtime function table this compiler was built\n\
+         /// against: a hash of cranelift/runtime-abi/runtime_functions.txt.\n\
+         pub const RUNTIME_ABI: &str = \"{abi_hash:016x}\";\n"
+    );
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
     fs::write(out_dir.join("runtime_table.rs"), out).map_err(|e| e.to_string())

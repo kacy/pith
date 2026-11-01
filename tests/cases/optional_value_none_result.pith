@@ -1,0 +1,18 @@
+# inside a fallible function, `.value()` on a none fails the function with
+# "value() on none", the way an index miss does. outside one it stops the
+# process (tests/aborts/optional_value_none_*).
+struct Point:
+    x: Int
+
+fn first_x(points: List[Point]) -> Int!String:
+    p: Point? := points.get(0)
+    return p.value().x
+
+fn name_len(name: String?) -> Int!String:
+    return name.value().len()
+
+fn main():
+    print((first_x([Point(x: 7)]) catch -1).to_string())
+    print((first_x([]) catch -1).to_string())
+    print((name_len("abc") catch -1).to_string())
+    print((name_len(none) catch -1).to_string())

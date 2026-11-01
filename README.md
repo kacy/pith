@@ -169,8 +169,8 @@ open defects. the ones to know before you start:
   with `lock` and `install` but nothing that fetches.
 - no debugger, and a runtime error prints its message without a stack
   trace.
-- `.value()` on an optional does not check for `none`; use `if let`,
-  `match` or `unwrap_or` unless you have already checked.
+- `.value()` on a `none` stops the program with a runtime error; use
+  `if let`, `match` or `unwrap_or` when the optional can be empty.
 - gzip compresses with fixed huffman only, and the regex engine skips
   counted repeats, backreferences, lazy quantifiers and lookaround on
   purpose.

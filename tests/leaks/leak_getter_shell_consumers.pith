@@ -1,0 +1,72 @@
+# a borrowing getter (`xs.get(i)`, `xs.first()`, `xs.last()`, `m.get(k)`)
+# whose shell is kept takes a count on its payload, so every consumer that
+# keeps or drops such a shell has to drop that count again: a local, a field,
+# a list, a return, a call argument, a discarded statement, an interpolation.
+# the consumers that extract on the spot keep the shell borrowing and must not
+# strand anything either. each round feeds one fresh node through all of
+# them, so a consumer that strands the payload strands a node per round.
+import leakprobe as probe
+
+struct Node:
+    value: Int
+
+struct Keeper:
+    mut held: Node?
+
+fn peek(n: Node?) -> Int:
+    if n != none:
+        return n.value().value
+    return 0
+
+fn first_of(xs: List[Node]) -> Node?:
+    return xs.first()
+
+fn round(seed: Int) -> Int:
+    mut xs: List[Node] := [Node(value: seed), Node(value: seed + 1)]
+    mut m: Map[String, Node] := {}
+    m.insert("k", Node(value: seed + 2))
+    mut total := 0
+    g := xs.get(0)
+    total = total + peek(g)
+    f := xs.first()
+    l := xs.last()
+    total = total + peek(f) + peek(l)
+    mg := m.get("k")
+    total = total + peek(mg)
+    k := Keeper(held: xs.get(1))
+    k.held = xs.last()
+    mut ys: List[Node?] := []
+    ys.push(xs.get(0))
+    total = total + peek(first_of(xs))
+    total = total + peek(xs.get(1))
+    xs.get(0)
+    s := "{xs.get(0)}"
+    total = total + s.len()
+    if xs.get(0) != none:
+        total = total + 1
+    if let a = xs.get(1):
+        total = total + a.value
+    total = total + xs.get(0).value().value
+    total = total + xs.get(5).unwrap_or(Node(value: 1)).value
+    mut i := 0
+    while let w = xs.get(i):
+        total = total + w.value
+        i = i + 1
+    total = total + match m.get("k"):
+        none => 0
+        n => n.value
+    xs.clear()
+    m.remove("k")
+    return total + peek(g) + peek(f) + peek(mg) + ys.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 1:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

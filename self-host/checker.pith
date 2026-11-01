@@ -55,6 +55,9 @@ mut generic_inference_subst: Map[String, Int] := {}
 # after each arm, so a branch can be recorded as widening into the optional
 # the arms settle on (see mark_widened_branches).
 mut last_branch_value_expr := 0 - 1
+# set when a pattern binding is refused for naming a variant, so the match
+# that holds it does not also call the arms after it unreachable.
+mut variant_binding_rejected := false
 
 # --- generic bodies walked per specialization --------------------------
 # the substitution in force while a generic body is walked against one set
@@ -2831,6 +2834,7 @@ fn check_let_pattern(pat_idx: Int, subj_idx: Int, branch_scope: Int, outer_scope
         return
     if pat.kind == "pat_binding":
         note_fn_binding_name(pat.value, pat_idx)
+        reject_variant_named_binding(pat_idx, pat.value, subj_type)
         info := get_type_info(subj_type)
         if info.kind == "optional":
             define_binding_at(branch_scope, pat.value, info.inner, false, pat_idx)
@@ -6730,6 +6734,8 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
     mut arm_values: List[String] := []
     mut branch_exprs: List[Int] := []
     mut branch_types: List[Int] := []
+    subject_is_optional := get_type_info(subject_type).kind == "optional"
+    mut catch_all_seen := false
     mut skip_subj := 1
     for child in node.children:
         if skip_subj > 0:
@@ -6737,12 +6743,16 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
             continue
         arm_node := get_node(child)
         if arm_node.kind == "arm":
+            if catch_all_seen:
+                report_error_with_fix_at(child, "E205", "unreachable match arm: an earlier arm without a guard matches every value", "remove this arm, or move it above the catch-all arm")
+            variant_binding_rejected = false
             arm_type := check_match_arm(arm_node, subject_type, scope_id)
             branch_exprs.push(last_branch_value_expr)
             branch_types.push(arm_type)
             # collect pattern values for exhaustiveness; an or-pattern covers
-            # each of its alternatives.
-            if arm_node.children.len() > 0:
+            # each of its alternatives. a guarded arm covers nothing, since
+            # its guard can be false.
+            if arm_node.children.len() > 0 and not match_arm_has_guard(arm_node):
                 pat := get_node(arm_node.children[0])
                 if pat.kind == "pat_or":
                     for alt in pat.children:
@@ -6750,7 +6760,16 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
                         if av.len() > 0:
                             arm_values.push(av)
                 else:
-                    pv := collect_arm_pattern_bindings(pat)
+                    mut pv := collect_arm_pattern_bindings(pat)
+                    # a binding on an optional subject unwraps, so it
+                    # matches every present value but not none.
+                    if subject_is_optional and pat.kind == "pat_binding":
+                        pv = "Some"
+                    # a binding named like a variant is already an error
+                    # of its own; calling the arms after it unreachable too
+                    # only repeats it.
+                    if pv == "_" and not variant_binding_rejected:
+                        catch_all_seen = true
                     if pv.len() > 0:
                         arm_values.push(pv)
             if is_error_type(result_type):
@@ -6768,6 +6787,11 @@ fn check_match_expression(node_idx: Int, scope_id: Int) -> Int:
     # exhaustiveness checking
     check_match_exhaustiveness(subject_type, arm_values, node_idx)
     return result_type
+
+fn match_arm_has_guard(arm: Node) -> Bool:
+    if arm.children.len() < 3:
+        return false
+    return get_node(arm.children[1]).kind == "guard"
 
 fn check_match_arm(arm: Node, subject_type: Int, scope_id: Int) -> Int:
     # children: [pattern, guard?, body]
@@ -6815,6 +6839,7 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
         return
     if pat.kind == "pat_binding":
         note_fn_binding_name(pat.value, pat_idx)
+        reject_variant_named_binding(pat_idx, pat.value, expected_type)
         # a binding on an optional subject unwraps, mirroring if let
         info := get_type_info(expected_type)
         if info.kind == "optional":
@@ -6853,6 +6878,24 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     if pat.kind == "pat_tuple":
         check_tuple_pattern_match(pat, expected_type, scope_id)
         return
+
+# a bare name in a pattern is a binding, and a binding matches every value.
+# one spelled like a variant of the enum it binds was meant as that variant,
+# so it is refused. an optional
+# subject unwraps first, so its inner enum is the one that counts.
+fn reject_variant_named_binding(pat_idx: Int, name: String, subject_type: Int):
+    if subject_type < 0:
+        return
+    mut tid := subject_type
+    outer := get_type_info(tid)
+    if outer.kind == "optional":
+        tid = outer.inner
+    info := get_type_info(tid)
+    if info.kind != "enum" or not info.variants.contains(name):
+        return
+    enum_name := extract_base_type_name(info.name)
+    variant_binding_rejected = true
+    report_error_with_fix_at(pat_idx, "E228", "'" + name + "' is a variant of " + enum_name + ", but a bare name in a pattern is a binding that matches every value", "write " + enum_name + "." + name + " to match the variant")
 
 # Each alternative of an or-pattern must match the same type. Alternatives may
 # not bind names (the arms can't tell which alternative matched), so a binding
@@ -6922,6 +6965,7 @@ fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
                             # typed the box as its inner and interpolating
                             # the binding printed a heap address.
                             note_fn_binding_name(sub.value, sub_pat)
+                            reject_variant_named_binding(sub_pat, sub.value, variant_fields[fidx])
                             define_binding_at(scope_id, sub.value, variant_fields[fidx], false, sub_pat)
                         else:
                             check_pattern_match(sub_pat, variant_fields[fidx], scope_id)

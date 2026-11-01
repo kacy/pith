@@ -1,0 +1,16 @@
+# a guard can be false, so a guarded wildcard or binding does not make a match
+# exhaustive, and a binding on an optional subject does not cover none.
+fn guarded_wildcard(n: Int) -> Int:
+    return match n:
+        _ if n > 5 => 1
+
+fn guarded_binding(n: Int) -> Int:
+    return match n:
+        m if m > 5 => m
+
+fn optional_binding(x: Int?) -> Int:
+    return match x:
+        v => v
+
+fn main():
+    print("{guarded_wildcard(1)} {guarded_binding(1)} {optional_binding(none)}")

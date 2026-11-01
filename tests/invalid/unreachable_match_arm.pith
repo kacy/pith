@@ -1,0 +1,18 @@
+# an arm after an unguarded wildcard or binding can never run.
+fn after_wildcard(n: Int) -> Int:
+    return match n:
+        _ => 0
+        1 => 1
+
+fn after_binding(n: Int) -> Int:
+    return match n:
+        other => other
+        2 => 2
+
+fn after_tuple_of_bindings(a: Int, b: Int) -> Int:
+    return match (a, b):
+        (x, _) => x
+        (1, 2) => 3
+
+fn main():
+    print("{after_wildcard(1)} {after_binding(2)} {after_tuple_of_bindings(1, 2)}")

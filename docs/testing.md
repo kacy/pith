@@ -395,6 +395,22 @@ other kinds of test, all wired through the `Makefile`:
 - **invalid access** — `make memcheck` runs a curated set under valgrind, so an
   arc regression that double-frees or reads freed memory is caught before it
   lands.
+- **sanitizers** — `make sanitize-asan` links the whole regression corpus and
+  every std test file against a runtime built with AddressSanitizer and runs
+  them on both backends with the struct freelist off; `make sanitize-tsan`
+  does the same with ThreadSanitizer. valgrind misses a freed
+  struct the freelist hands straight back out, which is how a double free in
+  a weak field read went unseen, and these do not. the nightly `sanitizers`
+  workflow runs the asan gate. the gate builds with `PITH_SANITIZE`, so the
+  field and global accesses generated code makes are checked too. details are
+  in `tooling/sanitize.sh`.
+- **the nightly hunt** — the same workflow spends about two hours generating
+  programs with pithgen from a fresh seed range each night and running them
+  against the asan runtime (`tooling/pithgen_hunt.sh`). each distinct
+  signature it finds is filed as an issue labelled `pithgen`, with the seed
+  that reproduces it, the report and the program; a signature that already
+  has an open issue gets a comment instead. the findings are also kept as a
+  workflow artifact for 30 days.
 - **leak growth** — `make leak-check` runs the cases under `tests/leaks/` at two
   round counts and fails when memory grew between them. this is the other half
   of `memcheck`, which has its leak check switched off on purpose.
@@ -481,6 +497,63 @@ runs its churn `probe.rounds()` times, and prints `probe.peak_kb()` and nothing
 else. then list it in the `cases` array in `tooling/leak_check.sh`. keep the round
 body allocation-heavy and free of anything that is supposed to grow: a collection
 that keeps filling up looks exactly like a leak.
+
+## sanitizers
+
+threadsanitizer and addresssanitizer both run pith programs on either backend.
+the nightly `sanitizers` workflow runs the asan gate over the corpus and the
+std tests (`make sanitize-asan`, above); this section is the recipe for one
+program by hand. they need a runtime built with the sanitizer, and
+the stable toolchain accepts `-Zsanitizer` only with `RUSTC_BOOTSTRAP=1`:
+
+```sh
+RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zsanitizer=thread -Cforce-frame-pointers=yes" \
+  cargo build --release -p pith-runtime -Zbuild-std \
+  --target x86_64-unknown-linux-gnu --target-dir target/tsan
+```
+
+for asan, use `-Zsanitizer=address` and leave out `-Zbuild-std`. a program
+is then built against that archive, linked through a `CC` that appends
+rustc's own sanitizer runtime (`librustc-stable_rt.tsan.a` or `.asan.a` from
+the toolchain's `lib/rustlib/<target>/lib`, inside `--whole-archive`, plus
+`-lpthread -ldl -lm -lrt -lstdc++`):
+
+```sh
+CC=cc-tsan PITH_RUNTIME_LIB=target/tsan/x86_64-unknown-linux-gnu/release/libpith_runtime.a \
+  PITH_SANITIZE=thread PITH_KEEP_SYMBOLS=1 ./target/release/pith build prog.pith
+PITH_STRUCT_FREELIST=0 ./prog
+```
+
+`pith test` honors the same variables. `PITH_STRUCT_FREELIST=0` matters for
+asan: a freed struct goes back on the freelist instead of to `free`, so a
+use after free reads a recycled struct and asan sees nothing.
+
+a sanitized build differs from a plain one in three places:
+
+- the runtime's build script turns `-Zsanitizer=thread` into `cfg(pith_tsan)`
+  and `address` into `cfg(pith_asan)`, because `cfg(sanitize)` itself is
+  unstable even with `RUSTC_BOOTSTRAP`. under `pith_tsan`, a last release
+  pairs with the earlier releases through an acquire load of the count rather
+  than `fence(Acquire)`, which tsan does not model. without it, every free on
+  one thread of an object last used on another came out as a data race.
+- the green backend tells both sanitizers about each coroutine stack switch
+  (`concurrency/green/fiber.rs`): asan through
+  `__sanitizer_start_switch_fiber` / `__sanitizer_finish_switch_fiber` on both
+  sides of a switch, tsan through one fiber per task that the worker switches
+  to before a resume and away from after it. a plain build compiles none of
+  this.
+- `PITH_SANITIZE=thread` or `address` makes the compiler report every struct
+  field, optional payload and global that generated code reads or writes to
+  the sanitizer (`__tsan_read8` / `__tsan_write8`, `__asan_load8` /
+  `__asan_store8`), and drops the inline fast paths for list, bytes and string
+  reads in favor of the runtime calls they stand in for. without it, a race or
+  a freed read in generated code is invisible. retains and releases are always
+  runtime calls, so the counts need nothing extra.
+
+tsan reports a `thread leak` for a task on the os-thread backend whose handle
+is still bound and never awaited when the process exits: only a discarded
+`spawn` is detached by itself. `TSAN_OPTIONS=report_thread_leaks=0` turns those
+off.
 
 ## on the roadmap
 

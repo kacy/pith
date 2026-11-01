@@ -1,0 +1,24 @@
+; the payload of an optional read after its Some shell was released, under
+; PITH_QUARANTINE=1. a shell is a two-field struct (the flag, then the
+; payload) and `optval` reads the payload inline, so this is the same unseen
+; load as a field read.
+string m0s0 "before:"
+func main 0 void
+iconst 1 1
+iconst 2 42
+iconst 3 2
+call 4 pith_struct_alloc struct:Some 1 3
+sstore 4 0 1
+sstore 4 1 2
+optval 5 4 int value
+strref 6 m0s0
+call 7 int_to_string string 1 5
+concat 8 6 7
+call 9 pith_print_cstr unknown 1 8
+call 10 pith_struct_release void 1 4
+optval 11 4 int value
+call 12 int_to_string string 1 11
+call 13 pith_print_cstr unknown 1 12
+iconst 14 0
+ret 14
+endfunc

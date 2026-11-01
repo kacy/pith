@@ -23,7 +23,8 @@ pub(crate) fn park_current(id: TaskId) {
     // `SyncBlock`), so reading the cell is exclusive. the pointer was published
     // by the coroutine body on its first resume and names the `Yielder` living
     // on that coroutine's own stack, which is the stack we are executing on.
-    let yielder = match sync_block(id) {
+    let block = sync_block(id);
+    let yielder = match block {
         Some(block) => unsafe { *block.yielder.get() },
         None => ptr::null(),
     };
@@ -39,7 +40,14 @@ pub(crate) fn park_current(id: TaskId) {
     // on-CPU, which is exactly the window in which pith code can reach this
     // call. the suspend is a stack switch back to the worker; nothing retains
     // the pointer across it.
+    let fiber = block.map(|block| &block.fiber);
+    if let Some(fiber) = fiber {
+        fiber.suspend();
+    }
     unsafe { &*yielder }.suspend(());
+    if let Some(fiber) = fiber {
+        fiber.resumed();
+    }
 }
 
 /// record the running coroutine's `Yielder` in its own sync block, so
@@ -49,17 +57,22 @@ pub(crate) fn park_current(id: TaskId) {
 /// this is a task-entry read of `CURRENT_TASK`, which is the one place the
 /// `CURRENT_*` cells may be consulted: `run_task` has just installed them and
 /// no suspension has happened yet.
-pub(super) fn publish_yielder(yielder: *const TaskYielder) {
+///
+/// the body keeps the returned guard alive to its end, which tells the
+/// sanitizers the task is leaving its stack (see `fiber`).
+pub(super) fn publish_yielder(yielder: *const TaskYielder) -> FinishGuard {
     let Some(id) = current_task() else {
-        return;
+        return FinishGuard(None);
     };
-    if let Some(block) = sync_block(id) {
-        // SAFETY: this worker holds the Running claim on the block for the whole
-        // resume (see the claim protocol on `SyncBlock`), so the write is
-        // exclusive. the yield arm of `run_task` releases it to the next
-        // claimant through the transition CAS.
-        unsafe { *block.yielder.get() = yielder }
-    }
+    let Some(block) = sync_block(id) else {
+        return FinishGuard(None);
+    };
+    // SAFETY: this worker holds the Running claim on the block for the whole
+    // resume (see the claim protocol on `SyncBlock`), so the write is
+    // exclusive. the yield arm of `run_task` releases it to the next
+    // claimant through the transition CAS.
+    unsafe { *block.yielder.get() = yielder }
+    block.fiber.started()
 }
 
 /// wake a parked green task: move it back onto its owner worker's queue so it

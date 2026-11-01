@@ -1,0 +1,55 @@
+# json.parse keeps a node in a few list slots instead of an entry in seven
+# maps, and refuses a document past json.MAX_NODES.
+#
+# a 2 MB `[1,1,1,...]` used to raise peak memory by about 440 MB. it now
+# stays within a small multiple of the input, so the bound below sits far
+# from both sides.
+
+import std.fs as fs
+import std.json as json
+
+fn peak_rss_kb() -> Int:
+    status := fs.read("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            digits := line.replace("VmHWM:", "").replace("kB", "").trim()
+            parsed := parse_int(digits)
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+
+# an array of `count` ones.
+fn ones(count: Int) -> String:
+    return "[" + "1,".repeat(count - 1) + "1]"
+
+fn main() -> Int:
+    doc := ones(1000000)
+    before := peak_rss_kb()
+    scope := json.open_scope()
+    root := json.parse(doc)
+    growth_kb := peak_rss_kb() - before
+    print("parsed: {json.array_len(root)}")
+    print("sum of ends: {json.get_int(json.array_get(root, 0)) + json.get_int(json.array_get(root, 999999))}")
+    print("memory bounded: {growth_kb < 120000}")
+    json.close_scope(scope)
+    print("live after scope: {json.pool_live_nodes()}")
+
+    # the array node plus MAX_NODES - 1 elements is exactly the cap
+    at_cap := json.parse(ones(json.MAX_NODES - 1))
+    print("at cap: {json.array_len(at_cap)}")
+    json.pool_restore(json.pool_mark_node_id() - json.MAX_NODES, 0)
+    print("live after restore: {json.pool_live_nodes()}")
+
+    # one more is refused, and the partial parse gives its nodes back
+    over := json.parse(ones(json.MAX_NODES))
+    print("over cap: {over}")
+    print("live after refusal: {json.pool_live_nodes()}")
+
+    # nested containers count too
+    nested := json.parse("[" + "[1],".repeat(json.MAX_NODES / 2) + "[1]]")
+    print("nested over cap: {nested}")
+
+    # the pool still works afterwards
+    small := json.parse(chr(123) + "\"a\": [1, 2.5, \"x\", true, null]" + chr(125))
+    print("small: {json.encode(small)}")
+    return 0

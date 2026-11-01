@@ -854,3 +854,51 @@ is not checked. a
 channel hands the value over rather than aliasing it, which keeps each
 task's mutations to itself. immutable values and independent copies
 (`std.collections.copy_list` and friends) are also safe to hand off.
+
+## finding a use after free
+
+a count bug in emitted code shows up as a value read after its last
+release, and the runtime cannot see most of these. generated code reads a
+struct field, an optional's payload or a list element with plain loads, and
+with the struct and closure pools on, the freed block usually already holds
+another value. a sanitizer build sees only the reads the runtime makes,
+because generated code is not instrumented.
+
+`PITH_QUARANTINE=1` turns those reads into a report. it has to be set when
+the program is built and when it runs; `pith run` and `pith test` see it in
+both steps:
+
+    PITH_QUARANTINE=1 pith run prog.pith
+
+at run time, the last release of a struct (optional and result shells
+included), list, map, set, bytes, byte buffer, closure, string or channel
+releases what the value owns and keeps the block. the block is filled with
+0xde bytes, its magic word becomes a freed magic that names the kind, and it
+is never reused, so the pools stay empty. a later retain, release or runtime
+operation on the handle stops the program with exit status 1:
+
+    pith quarantine: use after free of struct
+    pith quarantine: release of a freed list (a double release)
+
+a release that finds the count already at zero, which the runtime otherwise
+ignores, is reported as an over-release. a count operation or field read on
+a struct whose value died while a weak reference still holds its header is
+reported as well.
+
+at build time the variable makes the compiler leave out its inline fast
+paths for list, bytes, string and closure reads, so each of them calls the
+runtime, which checks the handle. the compiler also tests a struct's header
+before each field read or write. a build without the variable emits none of
+this, and the runtime pays one predicted branch per free and per failed
+magic check.
+
+`PITH_QUARANTINE=trace` also records a backtrace at each free and prints it
+next to the backtrace of the bad use (build with `PITH_KEEP_SYMBOLS=1` to
+name generated functions). nothing is freed in either mode, so memory grows
+with every allocation.
+
+the older switches still apply. `PITH_STRUCT_FREELIST=0` hands struct and
+closure blocks back to the allocator so valgrind or a sanitizer can see the
+free, `PITH_CSTRING_NOFREE=1` keeps freed strings filled with `!` and reports
+string over-releases, and `PITH_RC_CHECK=1` is described under threads and
+tasks above.

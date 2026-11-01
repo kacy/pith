@@ -1,0 +1,24 @@
+; a field read from a struct whose last strong count is gone while a weak
+; reference still holds its header, under PITH_QUARANTINE=1. the memory is
+; never freed, so no sanitizer can see this one at all; the fields were
+; released by the destructor and read as stale values. quarantine poisons
+; them, and the build's struct check finds the dead bit.
+string m0s0 "before:"
+func main 0 void
+iconst 1 3
+iconst 2 1
+call 3 pith_struct_alloc struct:Cell 1 2
+sstore 3 0 1
+call 4 pith_struct_weak_retain void 1 3
+field 5 3 0 int n
+strref 6 m0s0
+call 7 int_to_string string 1 5
+concat 8 6 7
+call 9 pith_print_cstr unknown 1 8
+call 10 pith_struct_release void 1 3
+field 11 3 0 int n
+call 12 int_to_string string 1 11
+call 13 pith_print_cstr unknown 1 12
+iconst 14 0
+ret 14
+endfunc

@@ -169,7 +169,9 @@ pub(super) fn run_task(id: TaskId) {
     // caught panic here does not observe it in a broken state: we never resume
     // the coroutine after a panic, we drop it. no other captured state crosses
     // the boundary. so asserting unwind-safety is sound.
+    let resume = block.fiber.enter();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| coro.0.resume(())));
+    block.fiber.back(resume);
 
     // no task running on this worker until it picks up the next one.
     if let Some(w) = worker_index {
@@ -185,6 +187,7 @@ pub(super) fn run_task(id: TaskId) {
             // clean return: record the result, flip done, wake awaiters of both
             // kinds, and hand the stack back to the pool. see `finish_task` for
             // the join-lock / wake ordering.
+            block.fiber.retire();
             recycle_stack(coro);
             finish_task(id, result);
         }
@@ -198,6 +201,7 @@ pub(super) fn run_task(id: TaskId) {
             // and wake every awaiter so they unblock with a defined outcome. the
             // worker itself is unharmed and goes on to run the next task. the
             // unwound coroutine is complete, so its stack is reusable too.
+            block.fiber.retire();
             recycle_stack(coro);
             finish_task(id, 0);
         }

@@ -581,8 +581,10 @@ pub fn ir_emit_match_arm_body(body_idx: Int, result_temp: String, emit_expr: fn(
 ## lower an if used as an expression: evaluate the first branch whose condition
 ## holds into a shared temp, so the whole chain produces one value, the same
 ## temp-store shape ir_emit_match_expr uses. children are
-## [condition, then_expr, elif_branch(cond, expr)..., else_expr].
-pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:
+## [condition, then_expr, elif_branch(cond, expr)..., else_expr]. emit_value
+## emits a branch value and emit_expr everything else, so the caller can have
+## a borrowed branch take a count on its way into the temp.
+pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int, emit_value: fn(Int) -> Int) -> Int:
     result_temp := ir_new_temp_name("ifexpr")
     end_l := ir_label()
     cond_r := emit_expr(node.children[0])
@@ -590,7 +592,7 @@ pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:
     mut next_l := ir_label()
     ir_emit("brif " + cond_r.to_string() + " " + then_l + " " + next_l)
     ir_emit_label(then_l)
-    then_r := emit_expr(node.children[1])
+    then_r := emit_value(node.children[1])
     ir_emit("store " + result_temp + " " + then_r.to_string())
     ir_emit("jmp " + end_l)
     ir_emit_label(next_l)
@@ -602,12 +604,12 @@ pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:
         after_l := ir_label()
         ir_emit("brif " + branch_cond_r.to_string() + " " + body_l + " " + after_l)
         ir_emit_label(body_l)
-        branch_r := emit_expr(branch.children[1])
+        branch_r := emit_value(branch.children[1])
         ir_emit("store " + result_temp + " " + branch_r.to_string())
         ir_emit("jmp " + end_l)
         ir_emit_label(after_l)
         i = i + 1
-    else_r := emit_expr(node.children[node.children.len() - 1])
+    else_r := emit_value(node.children[node.children.len() - 1])
     ir_emit("store " + result_temp + " " + else_r.to_string())
     ir_emit_label(end_l)
     r := ir_reg()
@@ -616,8 +618,10 @@ pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int) -> Int:
 
 ## lower a match used as an expression. subj_owned reports whether the
 ## subject expression is an owned fresh temporary whose count this match
-## must release (the caller classifies; see ir_expr_complex).
-pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_block: fn(Int) -> Int, subj_owned: Bool) -> Int:
+## must release (the caller classifies; see ir_expr_complex). emit_value emits
+## an arm's value and emit_expr the subject and the guards, as in
+## ir_emit_if_expr.
+pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_value: fn(Int) -> Int, emit_block: fn(Int) -> Int, subj_owned: Bool) -> Int:
     subj_r := emit_expr(node.children[0])
     pin_kind := ir_match_pin_slot_kind
     pin_slot := ir_take_match_pin(subj_r)
@@ -658,7 +662,7 @@ pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_
         # guard so a failing guard still hands a live subject onward.
         if subj_release.len() > 0:
             ir_rc_release_reg(subj_r, subj_release)
-        ir_emit_match_arm_body(body_idx, result_temp, emit_expr, emit_block)
+        ir_emit_match_arm_body(body_idx, result_temp, emit_value, emit_block)
         if not ir_last_was_ret:
             ir_emit("jmp " + end_l)
         ir_emit_label(next_l)

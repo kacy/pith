@@ -705,14 +705,32 @@ fn write_and_link(bytes: &[u8], obj_path: &str, exe_path: &str) {
     }
 }
 
-fn unique_run_artifact_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
-        .as_nanos();
-    let exe_path = env::temp_dir().join(format!("pith_ir_{}_{}", std::process::id(), stamp));
-    let obj_path = env::temp_dir().join(format!("pith_ir_{}_{}.o", std::process::id(), stamp));
-    (obj_path, exe_path)
+/// A new directory under `parent` that only this user can enter, for
+/// `pith run` and `pith test` to build in. The name carries a random part,
+/// and creating the directory fails when anything exists at the path, a
+/// symlink included, so nothing planted in a shared temp directory is
+/// followed or overwritten, and other users cannot reach the object and
+/// binary inside it.
+fn create_private_dir(parent: &Path) -> std::io::Result<PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    use std::os::unix::fs::DirBuilderExt;
+
+    let mut attempts = 0;
+    loop {
+        // every RandomState is seeded from the OS, so this is a fresh
+        // random number without a dependency
+        let random = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let dir = parent.join(format!("pith_run_{}_{:016x}", std::process::id(), random));
+        match fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempts < 16 => {
+                attempts += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Compile a combined IR text file straight to a native binary. Pairs with
@@ -747,7 +765,8 @@ fn test_file(path: &str) {
 
 /// Compile `path` (with its tests when `emit_tests`) to a temporary binary,
 /// run it, and exit with its status when it fails. The binary and object
-/// are removed afterwards unless PITH_KEEP_RUN_ARTIFACTS is set.
+/// are built in a private directory, which is removed afterwards unless
+/// PITH_KEEP_RUN_ARTIFACTS is set.
 fn compile_and_run(path: &str, emit_tests: bool) {
     use pith_codegen::linker::build_executable;
 
@@ -759,19 +778,28 @@ fn compile_and_run(path: &str, emit_tests: bool) {
         }
     };
 
-    let (obj_path, exe_path) = unique_run_artifact_paths();
+    let dir = create_private_dir(&env::temp_dir()).unwrap_or_else(|e| {
+        eprintln!("Error creating a build directory in {}: {}", env::temp_dir().display(), e);
+        std::process::exit(1);
+    });
     let keep_artifacts = std::env::var("PITH_KEEP_RUN_ARTIFACTS").is_ok();
+    let clean_up = || {
+        if !keep_artifacts {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    };
+    let stem = Path::new(path).file_stem().unwrap_or("main".as_ref());
+    let exe_path = dir.join(stem);
+    let obj_path = exe_path.with_extension("o");
     if let Err(e) = fs::write(&obj_path, &bytes) {
         eprintln!("Error writing object: {}", e);
+        clean_up();
         std::process::exit(1);
     }
     match build_executable(&obj_path.to_string_lossy(), &exe_path.to_string_lossy()) {
         Ok(_) => {
             let status = Command::new(&exe_path).status();
-            if !keep_artifacts {
-                let _ = fs::remove_file(&obj_path);
-                let _ = fs::remove_file(&exe_path);
-            }
+            clean_up();
             match status {
                 Ok(s) => {
                     if !s.success() {
@@ -786,6 +814,7 @@ fn compile_and_run(path: &str, emit_tests: bool) {
         }
         Err(e) => {
             eprintln!("Error linking {}: {}", exe_path.display(), e);
+            clean_up();
             std::process::exit(1);
         }
     }
@@ -850,7 +879,7 @@ fn delegate_to_frontend(args: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_readable_file, default_exe_path, driver_abi_path, file_args, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
+        check_readable_file, create_private_dir, default_exe_path, driver_abi_path, file_args, ir_driver_older_than_seed, ir_driver_staleness, ir_runtime_abi,
         object_from_ir, seed_runtime_abi, validate_combined_ir_contract, RUNTIME_ABI,
     };
     use std::fs;
@@ -987,5 +1016,17 @@ mod tests {
         let is_dir = check_readable_file(dir.to_str().unwrap()).unwrap_err();
         assert_eq!(is_dir.kind(), std::io::ErrorKind::IsADirectory);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn each_run_directory_is_new_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = std::env::temp_dir().join(format!("pith-run-dir-{}", std::process::id()));
+        fs::create_dir_all(&parent).unwrap();
+        let a = create_private_dir(&parent).unwrap();
+        let b = create_private_dir(&parent).unwrap();
+        assert_ne!(a, b);
+        assert_eq!(fs::metadata(&a).unwrap().permissions().mode() & 0o077, 0);
+        fs::remove_dir_all(&parent).unwrap();
     }
 }

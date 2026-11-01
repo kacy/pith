@@ -1876,6 +1876,15 @@ cli-regressions-only:
 		set -e; \
 		if [ $$status -ne 0 ] && echo "$$out" | grep -qi "error.*read.*$$tmpdir/missing.pith" && ! echo "$$out" | grep -q "compiler bug"; then pass=$$((pass+1)); echo "ok   $$cmd names a missing file"; else echo "FAIL $$cmd missing file"; echo "$$out"; fail=$$((fail+1)); fi; \
 	done; \
+	mkdir -p "$$tmpdir/runtmp"; \
+	set +e; \
+	out=$$(TMPDIR="$$tmpdir/runtmp" ./target/release/pith run "$$tmpdir/dir.pith/hello.pith" 2>&1); \
+	status=$$?; \
+	TMPDIR="$$tmpdir/runtmp" PITH_KEEP_RUN_ARTIFACTS=1 ./target/release/pith run "$$tmpdir/dir.pith/hello.pith" >/dev/null 2>&1; \
+	set -e; \
+	entries=$$(find "$$tmpdir/runtmp" -mindepth 1 -maxdepth 1 | wc -l); \
+	private=$$(find "$$tmpdir/runtmp" -mindepth 1 -maxdepth 1 -type d -name 'pith_run_*' -perm 700 | wc -l); \
+	if [ $$status -eq 0 ] && [ "$$out" = "nested" ] && [ $$entries -eq 1 ] && [ $$private -eq 1 ]; then pass=$$((pass+1)); echo "ok   run builds in a private directory"; else echo "FAIL run private directory"; echo "$$out"; ls -la "$$tmpdir/runtmp"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"

@@ -480,6 +480,15 @@ regardless of waiters. `PITH_GREEN_STATS=1` prints the wake breakdown,
 contended-lock counts, and hot-path counters at exit if you want to see
 where a workload's handoffs actually go.
 
+each green task runs on a 1 MiB stack that does not grow. the size is
+reserved address space, and memory backs only the pages a task touches.
+recursion that runs past the end of the stack hits its guard page, and the
+runtime stops the process with `pith runtime error: stack overflow in task N`
+and exit status 2. an overflow on the main thread or in an os-thread task is
+reported the same way. `PITH_GREEN_STACK_KB=n` sets the stack size of every
+task in KiB, clamped to the range 64 to 1048576 (1 GiB). the runtime reads it
+once, when it makes the first stack.
+
 it also keeps memory flat under fan-out. when a task finishes, the green
 backend reclaims its slot and releases the closure it was spawned with, so a
 server that spawns one task per request holds only the tasks running at once,

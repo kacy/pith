@@ -186,6 +186,14 @@ cases=(
   "tests/leaks/leak_crosskind_binding SHAPE=6"
   "tests/leaks/leak_crosskind_binding SHAPE=7"
   "tests/leaks/leak_crosskind_binding SHAPE=8"
+  "tests/leaks/leak_match_if_expr SHAPE=1"
+  "tests/leaks/leak_match_if_expr SHAPE=2"
+  "tests/leaks/leak_match_if_expr SHAPE=3"
+  "tests/leaks/leak_match_if_expr SHAPE=4"
+  "tests/leaks/leak_match_if_expr SHAPE=5"
+  "tests/leaks/leak_match_if_expr SHAPE=6"
+  "tests/leaks/leak_match_if_expr SHAPE=7"
+  "tests/leaks/leak_match_if_expr SHAPE=8"
   tests/leaks/leak_grpc_route_crosskind
   tests/leaks/leak_json_fill_float
   tests/leaks/leak_json_fill_list

@@ -126,6 +126,14 @@ pub fn ir_capture_blocked_names() -> Map[String, Bool]:
         blocked.insert(name, true)
     for name in ir_func_returns.keys():
         blocked.insert(name, true)
+    # a module global lives in its own storage, which a closure body reaches
+    # like any function does. capturing it copied the value into the
+    # environment, so the closure read the global as it was when the closure
+    # was made, and an assignment to it inside the closure was lost. a local
+    # spelled like the global is still captured: ir_should_capture_name checks
+    # the enclosing locals before this list.
+    for name in ir_global_slot_names:
+        blocked.insert(name, true)
     # the built-in assertions are lowered by name at the call site, so a body
     # that calls one is not reading a variable and has nothing to capture. a
     # closure that did capture the name made its enclosing function load a

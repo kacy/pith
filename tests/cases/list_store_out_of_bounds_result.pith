@@ -1,0 +1,40 @@
+# inside a fallible function, `xs[i] = v` with a bad index fails the
+# function with "index out of bounds", the way `xs[i]` does. it used to
+# write nothing and report success.
+struct Point:
+    x: Int
+
+fn put(xs: List[Int], i: Int, v: Int) -> Int!String:
+    xs[i] = v
+    return xs.len()
+
+fn put_name(xs: List[String], i: Int, v: String) -> Int!String:
+    xs[i] = "{v}!"
+    return xs.len()
+
+fn put_point(xs: List[Point], i: Int, x: Int) -> Int!String:
+    xs[i] = Point(x: x)
+    return xs[i].x
+
+fn main():
+    xs := [1, 2, 3]
+    print((put(xs, 1, 7) catch -1).to_string())
+    print((put(xs, 3, 7) catch -1).to_string())
+    print((put(xs, 0 - 1, 7) catch -1).to_string())
+    print("{xs[0]} {xs[1]} {xs[2]}")
+    names := ["a", "b"]
+    print((put_name(names, 0, "x") catch -1).to_string())
+    print((put_name(names, 2, "y") catch -1).to_string())
+    print("{names[0]} {names[1]}")
+    points := [Point(x: 1)]
+    print((put_point(points, 0, 5) catch -1).to_string())
+    print((put_point(points, 1, 6) catch -1).to_string())
+    # a map store still inserts a missing key
+    mut m: Map[String, Int] := {}
+    m["k"] = 1
+    m["k"] = 2
+    m["j"] = 3
+    print("{m.len()} {m["k"]} {m["j"]}")
+    mut mi: Map[Int, String] := {}
+    mi[5] = "five"
+    print(mi[5])

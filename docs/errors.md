@@ -718,6 +718,21 @@ error[E268]: impl Drop for Slot: the impl must declare fn drop()
 it. put the type's other methods in an `impl T:` block of their own, and have
 `drop` call the explicit closer so the two stay idempotent.
 
+### E269 — assignment to a captured variable
+
+a closure captures the outer variables it uses by value, when it is created.
+an assignment to one inside the closure would change only the closure's copy:
+`mut n := 0; c := fn() -> Int: n = n + 1; return n` returned 1 on every call
+and `n` never changed. the checker rejects the assignment. return the new
+value from the closure and assign it outside, or keep the state in a struct
+field or a collection, whose handle the closure shares with the caller. a
+module global is not captured, and a closure can assign its own locals.
+
+```
+error[E269]: cannot assign to 'n' inside a closure: a closure captures a copy, so the variable outside would not change
+  fix: return the new value from the closure, or keep the state in a struct field or a collection the closure can update
+```
+
 ---
 
 ## lint errors (E3xx)

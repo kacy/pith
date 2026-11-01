@@ -1,0 +1,35 @@
+# the closure shapes that carry state out legally, beside E269 (assigning a
+# captured variable, tests/invalid/closure_assign_capture). a struct field
+# and a collection are shared through the captured handle; a closure's own
+# locals and a module global are not captures. a global used to be copied
+# into the environment too, so a closure read it as it was when the closure
+# was made and its writes to it were lost.
+struct Acc:
+    total: Int
+
+mut calls := 0
+
+fn main():
+    mut n := 0
+    bump := fn() => n + 1
+    n = bump()
+    n = bump()
+    print("n {n}")
+    acc := Acc(total: 0)
+    seen: List[Int] := []
+    add := fn(x: Int):
+        acc.total += x
+        seen.push(x)
+        calls = calls + 1
+    add(3)
+    add(4)
+    print("total {acc.total} seen {seen.len()} calls {calls}")
+    read_calls := fn() => calls
+    calls = 10
+    print("read {read_calls()}")
+    count := fn(limit: Int) -> Int:
+        mut k := 0
+        for i in 0..limit:
+            k = k + i
+        return k
+    print("count {count(5)}")

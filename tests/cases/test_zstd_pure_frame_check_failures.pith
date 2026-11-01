@@ -1,0 +1,33 @@
+# zstd_pure frames that decode but then fail the frame's own checks.
+#
+# decompress_bounded freed its output buffer before checking the declared
+# content size and the checksum, and an errdefer freed it again when either
+# check failed: a double free, which asan reported as a use after free in
+# pith_byte_buffer_free. run under asan to see the old failure.
+
+import std.compress.zstd as zstd
+import std.compress.zstd_pure_frame as frame
+import std.encoding as encoding
+
+fn attempt(label: String, data: Bytes):
+    got := frame.decompress_bounded(data, 1048576)
+    if got.is_err:
+        print(label + ": " + got.err)
+    else:
+        print(label + ": ok " + got.ok.len().to_string() + " bytes")
+
+fn main() -> Int!:
+    # a raw block of 13 bytes in a frame that declares 123
+    attempt("size", encoding.from_hex("28b52ffd207b226b223a5b31002c322c335d7d")!)
+    good := zstd.compress(encoding.from_hex("68656c6c6f2068656c6c6f2068656c6c6f")!)
+    attempt("good", good)
+    # repeat the failing frame so a freed buffer gets reused
+    bad := encoding.from_hex("28b52ffd207b226b223a5b31002c322c335d7d")!
+    mut failures := 0
+    mut i := 0
+    while i < 1000:
+        if frame.decompress_bounded(bad, 1048576).is_err:
+            failures = failures + 1
+        i = i + 1
+    print("failures: " + failures.to_string())
+    return 0

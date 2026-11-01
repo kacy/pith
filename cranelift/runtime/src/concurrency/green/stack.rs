@@ -2,12 +2,33 @@
 
 use super::*;
 
-/// coroutine stack size. pith programs default to 8 MiB OS-thread stacks; a
-/// green task gets 1 MiB, which is generous for typical task bodies and keeps
-/// a large fan-out affordable. a deeply recursive task could overflow it, and
-/// corosensei's guard page makes that fault loudly rather than corrupt
-/// memory.
-pub(super) const STACK_SIZE: usize = 1024 * 1024;
+/// the default coroutine stack size. a green task gets 1 MiB, which is
+/// generous for typical task bodies and keeps a large fan-out affordable: the
+/// size is reserved address space, and only the pages a task touches are
+/// faulted in. a deeply recursive task can still overflow it. the guard page
+/// below the stack then faults, and `stack_guard` reports a stack overflow in
+/// the task. `PITH_GREEN_STACK_KB` changes the size (see `stack_size`).
+pub(super) const DEFAULT_STACK_SIZE: usize = 1024 * 1024;
+
+/// the bounds `PITH_GREEN_STACK_KB` is clamped to: 64 KiB, below which the
+/// runtime's own frames leave a task little room, and 1 GiB, past which a
+/// few thousand tasks exhaust the address space.
+const MIN_STACK_KB: usize = 64;
+const MAX_STACK_KB: usize = 1024 * 1024;
+
+/// the coroutine stack size for this process: `PITH_GREEN_STACK_KB` in KiB,
+/// clamped to the bounds above, or `DEFAULT_STACK_SIZE` when it is unset or
+/// not a number. read once, so every stack the pools hold has this size.
+pub(super) fn stack_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("PITH_GREEN_STACK_KB")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .map(|kb| kb.clamp(MIN_STACK_KB, MAX_STACK_KB) * 1024)
+            .unwrap_or(DEFAULT_STACK_SIZE)
+    })
+}
 
 /// finished coroutines donate their stacks here and green_spawn reuses them.
 /// a fresh stack is an mmap + a guard-page mprotect, and freeing one is an
@@ -39,10 +60,11 @@ pub(super) fn take_stack() -> corosensei::stack::DefaultStack {
     if let Some(stack) = STACK_POOL.lock().unwrap_or_else(|p| p.into_inner()).pop() {
         return stack;
     }
-    match corosensei::stack::DefaultStack::new(STACK_SIZE) {
+    let size = stack_size();
+    match corosensei::stack::DefaultStack::new(size) {
         Ok(stack) => stack,
         Err(err) => {
-            runtime_fatal!("could not allocate a {STACK_SIZE}-byte green task stack: {err}")
+            runtime_fatal!("could not allocate a {size}-byte green task stack: {err}")
         }
     }
 }

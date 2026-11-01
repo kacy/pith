@@ -1,0 +1,12 @@
+# run_ctx drains the child's stdout and stderr while it waits. a child that
+# writes more than a pipe buffer holds before exiting used to block on the
+# full pipe forever; the deadline here only bounds the old hang.
+import std.concurrent as concurrent
+import std.os.process as process
+
+fn main():
+    pair := concurrent.with_timeout(concurrent.background(), 30000)
+    result := process.command("sh").args(["-c", "head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2; exit 3"]).run_ctx(pair.0)
+    print("run-ok:{result.is_ok}")
+    if result.is_ok:
+        print("run-status:{result.ok}")

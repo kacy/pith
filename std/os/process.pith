@@ -139,16 +139,11 @@ pub fn start(cmd: Command) -> Process!:
 pub fn run(cmd: Command) -> Int!:
     return output(cmd)!.status
 
-# runs a command with cancellation and deadline support.
+# runs a command with cancellation and deadline support and returns its exit
+# status. like run, it reads and discards the child's stdout and stderr: a
+# child whose output filled an undrained pipe would never exit.
 pub fn run_ctx(cmd: Command, ctx: Context) -> Int!BlockingError:
-    process := start_or_fail(cmd)!
-    defer process.close()
-    wait_result := process.wait_ctx(ctx)
-    if wait_result.is_err:
-        process.kill()
-        process.wait()
-        fail blocking_from_wait(wait_result.err)
-    return wait_result.ok
+    return output_ctx(cmd, ctx)!.status
 
 # runs a command and captures its stdout and stderr.
 pub fn output(cmd: Command) -> Output!:

@@ -484,6 +484,11 @@ fn ensure_table_path(root: Int, path: String) -> Int:
             is_sep = true
         if is_sep:
             key := path.substring(start, i)
+            # an empty segment (`[a..b]`, `[.]`) is not a key. accepting them
+            # let a header of dots alone build one table per dot.
+            if key == "":
+                parser_error = true
+                return 0 - 1
             # look up existing child in current table
             mut found := table_key_index.get_default(table_index_key(current, key), 0 - 1)
             if found < 0:
@@ -534,6 +539,8 @@ fn toml_parse(input: String) -> Int:
             if parser_position < parser_input.len():
                 parser_position = parser_position + 1
             current_table = ensure_table_path(root, section)
+            if parser_error:
+                return 0 - 1
             skip_line()
         # key = value
         if c != chr(10) and c != "#" and c != "[":

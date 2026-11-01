@@ -1840,6 +1840,78 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "compiled against runtime ABI 0000000000000000"; then pass=$$((pass+1)); echo "ok   ir for another runtime abi is refused"; else echo "FAIL ir runtime abi"; echo "$$out"; fail=$$((fail+1)); fi; \
+	mkdir -p "$$tmpdir/dir.pith"; \
+	printf 'fn main():\n    print("nested")\n' > "$$tmpdir/dir.pith/hello.pith"; \
+	set +e; \
+	out=$$(./target/release/pith build "$$tmpdir/dir.pith/hello.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/dir.pith/hello")" = "nested" ]; then pass=$$((pass+1)); echo "ok   build strips only the trailing .pith"; else echo "FAIL build in a .pith directory"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'fn main():\n    print("x")\n' > "$$tmpdir/noext"; \
+	set +e; \
+	out=$$(./target/release/pith build "$$tmpdir/noext" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "does not end in .pith" && grep -q 'print("x")' "$$tmpdir/noext"; then pass=$$((pass+1)); echo "ok   build keeps a source without .pith"; else echo "FAIL build without .pith"; echo "$$out"; fail=$$((fail+1)); fi; \
+	mkdir -p "$$tmpdir/out"; \
+	set +e; \
+	out=$$(./target/release/pith build "$$tmpdir/dir.pith/hello.pith" -o "$$tmpdir/out/named" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/out/named")" = "nested" ]; then pass=$$((pass+1)); echo "ok   build -o names the executable"; else echo "FAIL build -o"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith build "$$tmpdir/dir.pith/hello.pith" --release 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unknown option '--release' for build"; then pass=$$((pass+1)); echo "ok   build refuses an unknown option"; else echo "FAIL build unknown option"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith run "$$tmpdir/dir.pith/hello.pith" -o x 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unknown option '-o' for run"; then pass=$$((pass+1)); echo "ok   run refuses an unknown option"; else echo "FAIL run unknown option"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith test "$$tmpdir/harness.pith" --fliter first 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unknown option '--fliter' for test"; then pass=$$((pass+1)); echo "ok   test refuses an unknown option"; else echo "FAIL test unknown option"; echo "$$out"; fail=$$((fail+1)); fi; \
+	for cmd in run build check; do \
+		set +e; \
+		out=$$(./target/release/pith $$cmd "$$tmpdir/missing.pith" 2>&1); \
+		status=$$?; \
+		set -e; \
+		if [ $$status -ne 0 ] && echo "$$out" | grep -qi "error.*read.*$$tmpdir/missing.pith" && ! echo "$$out" | grep -q "compiler bug"; then pass=$$((pass+1)); echo "ok   $$cmd names a missing file"; else echo "FAIL $$cmd missing file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	done; \
+	mkdir -p "$$tmpdir/runtmp"; \
+	set +e; \
+	out=$$(TMPDIR="$$tmpdir/runtmp" ./target/release/pith run "$$tmpdir/dir.pith/hello.pith" 2>&1); \
+	status=$$?; \
+	TMPDIR="$$tmpdir/runtmp" PITH_KEEP_RUN_ARTIFACTS=1 ./target/release/pith run "$$tmpdir/dir.pith/hello.pith" >/dev/null 2>&1; \
+	set -e; \
+	entries=$$(find "$$tmpdir/runtmp" -mindepth 1 -maxdepth 1 | wc -l); \
+	private=$$(find "$$tmpdir/runtmp" -mindepth 1 -maxdepth 1 -type d -name 'pith_run_*' -perm 700 | wc -l); \
+	if [ $$status -eq 0 ] && [ "$$out" = "nested" ] && [ $$entries -eq 1 ] && [ $$private -eq 1 ]; then pass=$$((pass+1)); echo "ok   run builds in a private directory"; else echo "FAIL run private directory"; echo "$$out"; ls -la "$$tmpdir/runtmp"; fail=$$((fail+1)); fi; \
+	printf 'fn main():\n    print("ok")\n' > "$$tmpdir/clean.pith"; \
+	printf '#regular\nfn main():\n    print("x")\n' > "$$tmpdir/unformatted.pith"; \
+	set +e; \
+	out=$$(./target/release/pith lint "$$tmpdir/clean.pith" "$$tmpdir/lint_pos.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "E300"; then pass=$$((pass+1)); echo "ok   lint checks every file"; else echo "FAIL lint every file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith fmt --check "$$tmpdir/clean.pith" "$$tmpdir/unformatted.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unformatted.pith needs formatting"; then pass=$$((pass+1)); echo "ok   fmt --check checks every file"; else echo "FAIL fmt --check every file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith lint "$$tmpdir/clean.pith" "$$tmpdir/clean.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ]; then pass=$$((pass+1)); echo "ok   lint passes when every file passes"; else echo "FAIL lint all clean"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith lint "$$tmpdir/clean.pith" "$$tmpdir/missing.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "cannot read $$tmpdir/missing.pith"; then pass=$$((pass+1)); echo "ok   lint names a missing file"; else echo "FAIL lint missing file"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"
@@ -1880,6 +1952,12 @@ cli-regressions-self-only:
 	else \
 		echo "FAIL fmt preserves doc comments"; fail=$$((fail+1)); \
 	fi; \
+	printf 'fn main():\n    print("wrapped")\n' > "$$tmpdir/wrapped.pith"; \
+	set +e; \
+	out=$$(./self-host/pith_main build "$$tmpdir/wrapped.pith" -o "$$tmpdir/wrapped_out" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/wrapped_out")" = "wrapped" ]; then pass=$$((pass+1)); echo "ok   build forwards -o"; else echo "FAIL build forwards -o"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host cli regressions passed"

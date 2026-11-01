@@ -1258,28 +1258,38 @@ fn text_source_read_bytes_ctx(kind: Int, source: Int, ctx: Context, size: Int) -
 # the accent straddled the boundary. a character split across two chunks is not
 # a decode error, it is two chunks.
 fn read_all_text_source(kind: Int, source: Int, chunk_size: Int) -> String!:
-    size := normalized_chunk_size(chunk_size)
+    return drain_text_source(kind, source, normalized_chunk_size(chunk_size))!.to_string_utf8()!
+
+# the bytes of a source up to end-of-stream. the buffer has no destructor, so
+# it is taken on success and freed on a failed read.
+fn drain_text_source(kind: Int, source: Int, size: Int) -> Bytes!:
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := text_source_read_bytes(kind, source, size)!
     while not chunk.is_empty():
         buf.write(chunk)!
         chunk = text_source_read_bytes(kind, source, size)!
-    return buf.bytes().to_string_utf8()!
+    return buf.take_bytes()
 
 # the deadline-aware twin of `read_all_text_source`.
 fn read_all_text_source_ctx(kind: Int, source: Int, ctx: Context, chunk_size: Int) -> String!BlockingError:
-    size := normalized_chunk_size(chunk_size)
+    drained := drain_text_source_ctx(kind, source, ctx, normalized_chunk_size(chunk_size))!
+    decoded := drained.to_string_utf8()
+    if decoded.is_err:
+        fail blocking_failed(decoded.err)
+    return decoded.ok
+
+# the deadline-aware twin of `drain_text_source`.
+fn drain_text_source_ctx(kind: Int, source: Int, ctx: Context, size: Int) -> Bytes!BlockingError:
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := text_source_read_bytes_ctx(kind, source, ctx, size)!
     while not chunk.is_empty():
         written := buf.write(chunk)
         if written.is_err:
             fail blocking_failed(written.err)
         chunk = text_source_read_bytes_ctx(kind, source, ctx, size)!
-    decoded := buf.bytes().to_string_utf8()
-    if decoded.is_err:
-        fail blocking_failed(decoded.err)
-    return decoded.ok
+    return buf.take_bytes()
 
 fn read_all_string(reader: StringReader) -> String!:
     return read_all_string_chunked(reader, DEFAULT_CHUNK_SIZE)

@@ -3100,9 +3100,8 @@ fn ir_emit_rc_prologue(body_idx: Int):
 # the locals of a function body that own their task: each is bound to a
 # `spawn` at every site that binds it, and otherwise only awaited, polled
 # with is_done or detached. an exit edge or a rebind detaches whatever handle
-# the slot still holds, so a task nobody awaits is reclaimed once it ends
-# rather than holding its slot (and on the os-thread backend its thread)
-# for the life of the process. detaching a handle an await already retired
+# the slot still holds, so a task nobody awaits gives back its slot (and on
+# the os-thread backend its thread) once it ends. detaching a handle an await already retired
 # is a no-op, so no path has to know whether it awaited. any other use (an
 # argument, a return, a store, a capture, another variable of the same
 # name) lets the handle out of the function, which then leaves it alone.

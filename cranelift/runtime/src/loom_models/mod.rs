@@ -4,7 +4,7 @@
 //! each model is a small state machine of one protocol, explored by loom over
 //! every interleaving and every weak-memory outcome the orderings allow. a
 //! model uses the real code where it runs under loom (the blocking pool's
-//! `Slot`, the green word's `wake_step` and
+//! `Slot`, `runtime_core::weak_upgrade`, the green word's `wake_step` and
 //! `after_yield`) and mirrors the rest step for step; each file says which.
 //!
 //! next to each model sits a `pre_fix` twin that runs the protocol as it was
@@ -16,6 +16,7 @@ mod channel;
 mod green_word;
 mod primitives;
 mod task_await;
+mod weak;
 
 /// run a model of three or more threads with loom's preemption bound at 3
 /// (unless `LOOM_MAX_PREEMPTIONS` sets one). unbounded, the channel's stray

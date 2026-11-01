@@ -2270,7 +2270,8 @@ mod tests {
             let handle = map.ptr as i64;
             pith_map_insert_ikey(handle, 1, value); // map retains
             crate::runtime_core::pith_struct_release(value); // map holds the only count
-            assert_eq!(crate::runtime_core::pith_struct_weak_load(value), value);
+            assert_eq!(crate::runtime_core::pith_struct_weak_upgrade(value), value);
+            crate::runtime_core::pith_struct_release(value); // the upgrade's count
 
             pith_map_retain_handle(handle);
             pith_map_release(map); // 2 -> 1: buffered
@@ -2279,7 +2280,7 @@ mod tests {
 
             assert_eq!(crate::cycle::graveyard_count_for_tests(handle as usize), 1);
             assert_eq!(
-                crate::runtime_core::pith_struct_weak_load(value),
+                crate::runtime_core::pith_struct_weak_upgrade(value),
                 0,
                 "value was released"
             );

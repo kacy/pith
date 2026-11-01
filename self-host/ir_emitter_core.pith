@@ -1048,6 +1048,13 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # a no-op anyway.
     if node.kind == "string_lit" or node.kind == "string" or node.kind == "str_lit":
         return false
+    # a weak read (a weak field, a weak local, a weak capture) mints a fresh
+    # shell that owns the count its upgrade took (ir_emit_weak_read), so the
+    # consumer inherits it the way it inherits a call result's. classified as
+    # a borrow, a bind or an argument retained the shell and never released
+    # it, and with it the target's count.
+    if ir_node_is_weak_field_read(idx):
+        return false
     if node.kind == "index" and node.children.len() > 0:
         # s[i] on a string mints a fresh char (char_at); container indexing
         # borrows the element. mirrors ir_emit_index_expr's dispatch.
@@ -1066,6 +1073,10 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
             # the unwrapped ok value is a transfer: result returns route
             # through the same retain-borrowed-returns convention
             return false
+        # `?` on a weak read frees the shell, and the count it owns, once the
+        # payload is out (ir_emit_optional_unwrap), so the payload is a borrow
+        if ir_node_is_weak_field_read(node.children[0]):
+            return true
         return ir_expr_is_borrowed(node.children[0])
     # a catch normalizes both arms to owned (the ok arm transfers the result
     # payload out of the shell; the fallback arm retains a borrow; see
@@ -4140,6 +4151,10 @@ fn ir_method_receiver_type(node: Node) -> String:
 # leaking one per read.
 fn ir_node_is_weak_field_read(idx: Int) -> Bool:
     node := get_node(idx)
+    # parentheses change nothing about the read: `(h.w).value()` mints the
+    # same shell, and its consumer must free it the same way
+    if node.kind == "grouped" and node.children.len() > 0:
+        return ir_node_is_weak_field_read(node.children[0])
     # a weak LOCAL read, or a read of a weak binding captured into the
     # emitting lambda, mints the same throwaway shell as a weak field read
     # (see ir_emit_ident_load); a loop variable shadowing the name reads its
@@ -5515,6 +5530,10 @@ fn ir_expr_is_fresh_optional_shell(expr_idx: Int) -> Bool:
         return true
     en := get_node(expr_idx)
     if en.kind == "none_lit":
+        return true
+    # a weak read builds its shell right here too, and the shell owns the
+    # count the upgrade took (ir_emit_weak_read)
+    if ir_node_is_weak_field_read(expr_idx):
         return true
     if en.kind != "call" and en.kind != "method_call" and en.kind != "await":
         return false

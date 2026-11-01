@@ -1,0 +1,38 @@
+# a weak field read off a temporary (`a.next.value().back`, `second(a).back`)
+# mints the same borrowing shell as any weak read. it once bound as an owning
+# optional and released a target the read never counted, a double free; the
+# fix must also not overcorrect into a shell that never dies. each round reads
+# through both temporaries, so a stranded shell per read climbs linearly.
+import leakprobe as probe
+
+struct Node:
+    value: Int
+    mut next: Node?
+    weak back: Node?
+
+fn second(a: Node) -> Node:
+    return a.next.value()
+
+fn round(seed: Int) -> Int:
+    a := Node(value: seed, next: none, back: none)
+    b := Node(value: seed + 1, next: none, back: none)
+    a.next = b
+    b.back = a
+    mut total := 0
+    back := a.next.value().back
+    if back != none:
+        total = total + back.value().value
+    via_call := second(a).back
+    if via_call != none:
+        total = total + via_call.value().value
+    return total
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

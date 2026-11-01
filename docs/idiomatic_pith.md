@@ -72,6 +72,19 @@ import std.collections as collections
 best := collections.max_by(records, fn(record: Record) => record.score)!
 ```
 
+A closure captures each outer variable it uses by value, when the closure is
+created. Assigning a captured variable inside the closure is rejected with
+E269, since the write would only change the closure's copy. To carry state
+out of a closure, return it, or keep it in a struct field or a collection:
+the closure copies the handle, so `counts.push(x)` or `acc.total += x` inside
+it updates the value the caller sees.
+
+```pith
+mut n := 0
+bump := fn() => n + 1      # reads n as it was when bump was created
+n = bump()                 # assign outside the closure
+```
+
 When a pipeline runs over a large collection or you only need the first
 few elements, switch to the lazy adapters in `std.iter`. The chain
 fuses and the source is walked once. See `docs/iterators.md` for the
@@ -251,16 +264,18 @@ distinct outcomes — usually one or the other tells the whole story.
 
 `map[k]`, `list[i]`, `s[i]`, and `bytes[i]` are the "I know it's there"
 form. If the key or index isn't there, the runtime prints a structured
-`pith runtime error: ...` and exits. That's the right behavior for
+`pith runtime error: ...` and exits. A store `list[i] = v` with `i` outside
+the list and `.value()` on a `none` stop the same way; `map[k] = v` inserts a
+missing key. That's the right behavior for
 tables you just populated, loops that already bounded `i`, and struct
 fields you invariantly initialized — a miss is a real bug and should
 crash loudly, not flow through as a zero.
 
-Inside a `T!` function, `map[k]` and `list[i]` instead propagate the
-miss as an error, which the caller can `catch` or `unwrap_or`. So the
+Inside a `T!` function, `map[k]`, `list[i]`, `list[i] = v` and `.value()`
+instead propagate the miss as an error, which the caller can `catch` or `unwrap_or`. So the
 same syntax means "assert" outside a Result context and "propagate"
 inside — no special operator required. (The propagated error carries a
-generic message, `index out of bounds`; supply your own with an explicit
+generic message, `index out of bounds` or `value() on none`; supply your own with an explicit
 `fail` when the caller needs one.)
 
 ```pith

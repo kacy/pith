@@ -110,10 +110,10 @@ impl Guard:
     # result into a hidden input; everything else can read it off the mirror
     # cookie instead.
     #
-    # it returns "" only when the os random source failed or the request
-    # never went through the session middleware. a form rendered with an
-    # empty token will be refused when it is submitted, which is the safe
-    # direction to fail in.
+    # it returns "" only when the os random source failed, the request never
+    # went through the session middleware, or the session store is full. a
+    # form rendered with an empty token will be refused when it is submitted,
+    # which is the safe direction to fail in.
     fn token(req: web.Request) -> String:
         existing := self.store.get(req, TOKEN_KEY)
         if existing.len() > 0:
@@ -121,7 +121,10 @@ impl Guard:
         minted := fresh_token() catch ""
         if minted.len() == 0:
             return ""
-        self.store.set(req, TOKEN_KEY, minted)
+        # provisional, so a flood of anonymous form views cannot fill the
+        # store and lock out sign-in (see std.web.session)
+        if not self.store.set_provisional(req, TOKEN_KEY, minted):
+            return ""
         return self.store.get(req, TOKEN_KEY)
 
 fn fresh_token() -> String!:

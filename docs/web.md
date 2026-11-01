@@ -410,7 +410,8 @@ closed over — build it once in `main` and capture it in the handlers, the way
 `examples/web_session.pith` does.
 
 ```pith
-store.set(req, "user", "u-7")
+store.set(req, "user", "u-7")             # false when the store is full
+store.set_provisional(req, "note", "x")  # see provisional sessions below
 store.get(req, "user")                  # "" when there is no session
 store.get_or(req, "theme", "dark")
 store.has(req, "user")
@@ -469,12 +470,34 @@ signature it accepts and an id it has never heard of, and treats the caller as
 signed out. run one instance, pin sessions to it with a sticky load balancer,
 or put the state somewhere both can reach.
 
-a visitor who never signs in never occupies a row: an id is minted per request
-but only written to the store when a handler actually stores something, and a
-request that reads nothing and writes nothing gets no `Set-Cookie` back. the
-store holds at most 100,000 sessions and refuses to grow past that rather than
-running the process out of memory; expired sessions are swept in the
-background of ordinary traffic.
+an id is minted per request but only written to the store when a handler
+stores something, so a request that reads nothing and writes nothing occupies
+no row and gets no `Set-Cookie` back. the store holds at most 100,000 sessions
+and refuses to grow past that rather than running the process out of memory;
+expired sessions are swept in the background of ordinary traffic.
+
+### provisional sessions
+
+a login form's csrf token has to live in a session before anybody has signed
+in. `store.set_provisional(req, key, value)` writes a value like that. a
+session that only provisional writes have touched is provisional: it lives at
+most `session.PROVISIONAL_TTL` (an hour) instead of the store's ttl, and when
+the store is full the oldest provisional session is evicted to make room for
+a new one. a `set` or `rotate` turns it into a full session, and full sessions
+are never evicted. `csrf` stores its token this way, so a flood of cookieless
+requests for the login page only churns through provisional sessions, and
+sign-in keeps working.
+
+eviction takes the oldest provisional session first. least-recently-used
+eviction would be the wrong choice here: a flood is made of the newest
+sessions, so it would evict the idle sessions of real users first and sign
+them out. evicting the oldest provisional session costs a real visitor at most
+a csrf token, and reloading the form gets a new one.
+
+`set`, `set_provisional` and `rotate` return false when the store is full of
+full sessions and they could not write, and `guard.sign_in` returns false
+with them. answer that with a 503 instead of a page that assumes the write
+happened.
 
 ## signing in
 
@@ -496,7 +519,8 @@ app = app.get("/app/me", me)
 fn log_in(req: web.Request) -> http.HttpResponse:
     if not password.verify(submitted, stored_hash):
         return http.unauthorized_response()
-    guard.sign_in(req, "u-7")
+    if not guard.sign_in(req, "u-7"):
+        return http.text(503, "try again shortly")
     return http.text(200, "welcome")
 
 fn me(req: web.Request) -> http.HttpResponse:
@@ -504,7 +528,8 @@ fn me(req: web.Request) -> http.HttpResponse:
 ```
 
 - `guard.sign_in(req, subject)` — rotate the session id, then record who the
-  caller is. this is what a successful password check ends with
+  caller is. this is what a successful password check ends with. it returns
+  false when the session store is full
 - `guard.sign_out(req)` — end the session on the server
 - `guard.user(req)` — the subject, or `""`
 - `guard.signed_in(req)` — whether anybody is

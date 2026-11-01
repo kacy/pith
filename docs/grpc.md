@@ -302,8 +302,9 @@ the full set lives in `std.net.grpc` as `grpc.GRPC_OK`, `GRPC_NOT_FOUND`,
 
 ## limits
 
-the server refuses oversized input rather than trying to buffer it. none of
-these are configurable yet. they sit well above what ordinary traffic needs, so
+the server refuses oversized input rather than trying to buffer it, and a
+client channel bounds what a server can make it buffer. none of these are
+configurable yet. they sit well above what ordinary traffic needs, so
 hitting one usually means something is wrong on the wire, not that the limit is
 too low.
 
@@ -313,6 +314,8 @@ too low.
 | `grpc.MAX_STREAM_MESSAGES` | 65536 | `RESOURCE_EXHAUSTED` on a buffered request stream |
 | `protobuf.MAX_NESTING_DEPTH` | 100 | the decode fails; a self-referential message cannot recurse without bound |
 | `http.MAX_REQUEST_BODY` | 10 MiB | the stream is reset |
+| http/2 frame payload | 16 KiB, the `SETTINGS_MAX_FRAME_SIZE` the server advertises | the connection is closed with a `FRAME_SIZE_ERROR` GOAWAY, refused from the frame header before any payload is buffered |
+| unary response on a dialed channel | `grpc.MAX_MESSAGE_BYTES` plus its 5-byte prefix | `RESOURCE_EXHAUSTED`; the http/2 stream is cancelled as soon as the body passes it |
 | concurrent streams per connection | 128 | `REFUSED_STREAM` |
 | concurrent connections per listener | 512 | the accept loop waits for one to end |
 | idle socket | 2 minutes | the connection is dropped |

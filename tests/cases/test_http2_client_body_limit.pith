@@ -1,0 +1,56 @@
+# the http/2 client bounds a unary response body. against the native h2c server,
+# a body past the client's limit fails the request and cancels its stream, and
+# the same connection then serves a small response, both on the inline codec
+# and after the connection is promoted to the threaded pipeline. the large
+# responses span many DATA frames and transport reads.
+
+import std.net.http2.connection as http2
+import std.net.http2.server as h2server
+import std.net.http2.hpack as hpack
+import std.net.http as http
+import std.time as time
+import std.bytes as bytes
+
+PORT := 17437
+
+fn handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    mut size := 16
+    if (req.path() catch "") == "/big":
+        size = 200000
+    mut body := "x"
+    while body.len() < size:
+        body = body + body
+    return http.text(200, body.substring(0, size))
+
+fn serve_once(listener: Int):
+    fd := tcp_accept(listener) catch 0
+    if fd != 0:
+        h2server.serve_h2c_connection(fd, handler)
+
+fn report(label: String, resp: http2.Response!):
+    if resp.is_err:
+        print("{label}: {resp.err}")
+    else:
+        print("{label}: {resp.ok.status}, {resp.ok.body.len()} bytes")
+
+fn main():
+    listener := tcp_listen("127.0.0.1", PORT) catch 0
+    task := spawn serve_once(listener)
+    time.delay(200)
+    opened := http2.open_h2c("127.0.0.1", PORT)
+    if opened.is_err:
+        print("dial failed")
+        tcp_close(listener)
+        return
+    client := opened.ok
+    print("default limit: {http2.MAX_RESPONSE_BODY}")
+    report("inline big, default limit", client.get("localhost", "/big"))
+    client.set_max_response_body_bytes(50000)
+    report("inline big", client.get("localhost", "/big"))
+    report("inline small", client.get("localhost", "/small"))
+    # a deadline-bounded call always runs on the threaded pipeline
+    no_extra: List[hpack.HeaderField] := []
+    report("threaded big", client.request_with_timeout("GET", "localhost", "/big", no_extra, bytes.empty(), 5000))
+    report("threaded small", client.request_with_timeout("GET", "localhost", "/small", no_extra, bytes.empty(), 5000))
+    client.close()
+    tcp_close(listener)

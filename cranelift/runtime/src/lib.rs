@@ -88,6 +88,7 @@ pub mod perf;
 pub mod platform;
 pub mod process;
 pub mod process_io;
+pub mod quarantine;
 pub mod runtime_core;
 pub mod sampler;
 pub mod share;

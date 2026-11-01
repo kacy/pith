@@ -242,12 +242,29 @@ impl ServerConn:
     # only when a new chunk is pulled, so steady-state reading does not re-concat
     # the buffer per frame.
     fn fill(n: Int) -> Int!:
-        while self.buf.len() - self.pos < n:
-            chunk := self.recv_chunk()!
-            if chunk.len() == 0:
-                fail "http2: connection closed"
+        have := self.buf.len() - self.pos
+        if have >= n:
+            return 0
+        chunk := self.recv_chunk()!
+        if chunk.len() == 0:
+            fail "http2: connection closed"
+        if have + chunk.len() >= n:
             self.buf = bytes.concat(self.buf.slice(self.pos, self.buf.len()), chunk)
             self.pos = 0
+            return 0
+        # the frame spans several chunks: gather them in one buffer so each byte
+        # is copied once, rather than re-concatenating the whole prefix per chunk.
+        out := bytes.buffer_with_capacity(n)
+        out.write_range(self.buf, self.pos, have)
+        out.write(chunk)!
+        while out.len() < n:
+            more := self.recv_chunk()
+            if more.is_err or more.ok.len() == 0:
+                out.free()
+                fail "http2: connection closed"
+            out.write(more.ok)!
+        self.buf = out.take_bytes()
+        self.pos = 0
         return 0
 
     # read and validate the 24-byte client connection preface (RFC 9113 §3.4).
@@ -262,14 +279,12 @@ impl ServerConn:
         return true
 
     # read one frame off the transport: the 9-byte header gives the payload
-    # length, then the whole frame is sliced out in one piece and the cursor
-    # advanced. the codec's reader parses and bounds-checks it.
+    # length, which is checked against the max frame size we advertised before
+    # any payload is buffered. then the whole frame is sliced out in one piece
+    # and the cursor advanced, and the codec's reader parses it.
     fn read_frame() -> frames.Frame!:
         self.fill(9)!
-        length_res := binary.read_u24_be_at(self.buf, self.pos)
-        if length_res.is_err:
-            fail length_res.err.message
-        total := 9 + length_res.ok
+        total := frames.frame_total(self.buf, self.pos, frames.DEFAULT_MAX_FRAME_SIZE)!
         self.fill(total)!
         full := self.buf.slice(self.pos, self.pos + total)
         self.pos = self.pos + total
@@ -1130,6 +1145,8 @@ fn run_reader(server: Server):
     while true:
         attempt := server.conn.read_frame()
         if attempt.is_err:
+            if attempt.err == frames.FRAME_TOO_LARGE:
+                send_goaway(server, frames.ERROR_FRAME_SIZE_ERROR)
             break
         outcome := handle_frame(server, attempt.ok)
         if outcome.is_err:
@@ -1667,6 +1684,21 @@ test "open_stream refuses an over-large header list with RST_STREAM":
     assert_eq(rst.header.frame_type, frames.FRAME_RST_STREAM)
     assert_eq(frames.parse_rst_stream(rst)!.error_code, frames.ERROR_ENHANCE_YOUR_CALM)
     assert_eq(server.active_count(), 0)
+
+test "an oversized frame header is refused with FRAME_SIZE_ERROR before its payload is read":
+    # a lone header declaring a 0xffffff-byte DATA payload. the reader must reject
+    # it from the header, not wait to buffer 16 MB; offline, waiting would show up
+    # as a connection-closed failure instead.
+    head := bytes.buffer()
+    for b in [255, 255, 255, 0, 0, 0, 0, 0, 1]:
+        head.write_byte(b)!
+    server := test_server(server_conn_from_bytes(head.take_bytes()))
+    run_reader(server)
+    opt := server.outbound.try_recv()
+    assert(opt != none)
+    item := opt.unwrap_or(raw_item(bytes.empty()))
+    goaway := frames.parse_goaway(frames.read_frame(binary.reader(item.raw), frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    assert_eq(frames.error_name(goaway.error_code), "FRAME_SIZE_ERROR")
 
 test "read_header_block refuses a CONTINUATION flood":
     # a header block that never sets END_HEADERS, followed by more CONTINUATION

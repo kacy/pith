@@ -45,6 +45,11 @@ MAX_CONTROL_PAYLOAD := 125
 # message the byte cap would admit.
 MAX_MESSAGE_BYTES := 16777216
 MAX_MESSAGE_FRAGMENTS := 262144
+# the most a client reads of the server's handshake response head before it gives
+# up on the dial, as http.MAX_HEADER_BYTES bounds a request head. an upgrade
+# response is a status line and a few fields, so a head this long means the
+# server is not answering the handshake.
+pub MAX_HANDSHAKE_HEAD_BYTES := 65536
 WS_CLOSE_MESSAGE_TOO_BIG := 1009
 WS_CLOSE_NONE := 0
 WS_CLOSE_TCP := 1
@@ -221,29 +226,29 @@ fn response_status_code(head: Bytes) -> Int!:
     if parts.len() < 2:
         fail "invalid websocket status line"
     return parse_int(parts[1])
-fn find_http_head_end(raw: Bytes) -> Int:
-    mut i := 0
-    while i < raw.len() - 3:
-        if raw[i] == 13 and raw[i + 1] == 10 and raw[i + 2] == 13 and raw[i + 3] == 10:
-            return i + 4
-        i = i + 1
-    i = 0
-    while i < raw.len() - 1:
-        if raw[i] == 10 and raw[i + 1] == 10:
-            return i + 2
-        i = i + 1
-    return -1
+# whether the head in `buf` has just ended: its last byte closes an empty line,
+# LF LF or CR LF CR LF. checked after each byte, so only the tail is looked at.
+fn head_just_ended(buf: ByteBuffer) -> Bool:
+    n := buf.len()
+    if n < 2 or buf.get(n - 1) != 10:
+        return false
+    if buf.get(n - 2) == 10:
+        return true
+    return n >= 4 and buf.get(n - 2) == 13 and buf.get(n - 3) == 10 and buf.get(n - 4) == 13
+# read the handshake response head a byte at a time, so nothing past it is taken
+# off the stream before the session's own reader starts. a head longer than
+# MAX_HANDSHAKE_HEAD_BYTES fails the dial.
 fn read_http_head(reader: BufferedBytesReader) -> Bytes!:
     buf := bytes.buffer_with_capacity(DEFAULT_READ_CHUNK_SIZE)
     defer buf.free()
-    mut head_end := -1
-    while head_end < 0:
+    while not head_just_ended(buf):
+        if buf.len() >= MAX_HANDSHAKE_HEAD_BYTES:
+            fail "websocket handshake response head exceeds the maximum"
         chunk := reader.read_bytes(1)!
         if chunk.is_empty():
             fail "websocket handshake response truncated"
         buf.write(chunk)!
-        head_end = find_http_head_end(buf.bytes())
-    return buf.bytes().slice(0, head_end)
+    return buf.bytes()
 fn validate_upgrade_response(head: Bytes, key: Bytes) -> Bool!:
     if response_status_code(head)! != 101:
         return false

@@ -1,0 +1,59 @@
+# a websocket dial bounds the handshake response head. a raw tcp server answers
+# the upgrade with a head that never ends, padded far past the limit; the dial
+# fails once the limit is reached instead of buffering until the server stops.
+
+import std.net.websocket as websocket
+import std.net.tcp as tcp
+import std.bytes as bytes
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn read_head(fd: Int) -> String:
+    mut seen := ""
+    while seen.index_of("\r\n\r\n") < 0:
+        chunk := tcp_read(fd, 4096) catch ""
+        if chunk == "":
+            return ""
+        seen = seen + chunk
+    return seen
+
+fn endless_head(fd: Int) -> Int:
+    if read_head(fd) != "":
+        tcp.write_all_bytes(fd, bytes.from_string_utf8("HTTP/1.1 101 Switching Protocols\r\nX-Pad: ")) catch 0
+        pad := bytes.array_filled(4096, 97) catch bytes.array()
+        mut sent := 0
+        while sent < 1048576:
+            wrote := tcp.write_all_bytes(fd, pad.bytes()) catch 0
+            if wrote == 0:
+                break
+            sent = sent + wrote
+    tcp_close(fd)
+    return 0
+
+fn main() -> String!:
+    port := choose_port(22300)!
+    listener := tcp_listen("127.0.0.1", port)!
+    print("limit: {websocket.MAX_HANDSHAKE_HEAD_BYTES}")
+    server := spawn serve_one(listener)
+    dialed := websocket.dial("127.0.0.1", port, "/")
+    if dialed.is_err:
+        print("dial: {dialed.err}")
+    else:
+        print("dial: accepted")
+    await server
+    tcp_close(listener)
+    return ""
+
+fn serve_one(listener: Int) -> Int:
+    fd := tcp_accept(listener) catch 0
+    if fd > 0:
+        endless_head(fd)
+    return 0

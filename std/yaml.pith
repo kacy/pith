@@ -597,6 +597,12 @@ fn looks_like_float(text: String) -> Bool:
         i = i + 1
     return digits > 0 and saw_marker and dots <= 1 and exponents <= 1
 
+# the exponent is applied one factor of ten at a time, so it is clamped
+# first. a nonzero mantissa here lies between 1e-308 and 1e19, so 1000
+# steps already reach inf or zero, and further steps would not change the
+# result: the clamp keeps every value the same and bounds the loop.
+YAML_MAX_EXPONENT := 1000
+
 fn parse_float_manual(text: String) -> Float:
     sign := split_sign(text)
     mut int_part := 0
@@ -619,7 +625,10 @@ fn parse_float_manual(text: String) -> Float:
             elif i + 1 < text.len() and text[i + 1] == "+":
                 i = i + 1
         elif in_exponent:
-            exponent = exponent * 10 + (ord(c) - 48)
+            # stop growing past the clamp below so a long exponent cannot
+            # overflow the int
+            if exponent < YAML_MAX_EXPONENT:
+                exponent = exponent * 10 + (ord(c) - 48)
         elif in_frac:
             frac_div = frac_div * 10.0
             frac = frac + (ord(c) - 48).to_float() / frac_div
@@ -627,6 +636,8 @@ fn parse_float_manual(text: String) -> Float:
             int_part = int_part * 10 + (ord(c) - 48)
         i = i + 1
     mut value := int_part.to_float() + frac
+    if exponent > YAML_MAX_EXPONENT:
+        exponent = YAML_MAX_EXPONENT
     mut e := 0
     while e < exponent:
         if exponent_negative:
@@ -1764,6 +1775,19 @@ test "yaml types plain scalars against the core schema":
     assert_eq(type_of(get_value(root, "e")), "null")
     # yes/no/on/off are strings under the 1.2 core schema
     assert_eq(type_of(get_value(root, "f")), "string")
+
+test "yaml clamps a huge float exponent instead of looping per unit":
+    # 1e99999999999 used to take minutes, one multiply per unit of exponent
+    root := parse("a: 1e99999999999" + chr(10) + "b: -2.5e+99999999999" + chr(10) + "c: 1e-99999999999" + chr(10) + "d: 0e99999999999" + chr(10) + "e: 1.5e3" + chr(10) + "f: .5e-2" + chr(10) + "g: 1e999999999999999999999")
+    assert(get_float(root, "a") > 1.0e308)
+    assert(get_float(root, "b") < -1.0e308)
+    assert_eq(get_float(root, "c"), 0.0)
+    assert_eq(get_float(root, "d"), 0.0)
+    assert_eq(get_float(root, "e"), 1500.0)
+    assert_eq(get_float(root, "f"), 0.005)
+    assert(get_float(root, "g") > 1.0e308)
+    assert_eq(parse_float_manual("1e1000"), parse_float_manual("1e5000"))
+    assert_eq(parse_float_manual("9.99e-1000"), 0.0)
 
 test "yaml reads nested blocks and sequences":
     nl := chr(10)

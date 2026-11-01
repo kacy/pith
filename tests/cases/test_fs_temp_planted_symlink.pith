@@ -1,0 +1,50 @@
+# temp files used to be named prefix + time_ms + "_" + random_int(0, 1000000)
+# from the seeded generator, and created by following whatever sat at the
+# name. this plants a dangling symlink at every name that scheme would pick
+# over the next few seconds, each pointing into a directory the program
+# never meant to write, and checks that nothing lands there.
+import std.fs as fs
+import std.os.process as process
+
+WINDOW_MS := 5000
+
+# plant links named prefix + t + "_" + draw + suffix for t over the window,
+# all in one ln call. a link's name is its target's base name.
+fn plant(planted_dir: String, outside_dir: String, prefix: String, suffix: String, draw: Int) -> Int!:
+    now := time()
+    mut args: List[String] := ["-s"]
+    mut t := now
+    while t < now + WINDOW_MS:
+        args.push(outside_dir + "/" + prefix + t.to_string() + "_" + draw.to_string() + suffix)
+        t += 1
+    args.push(planted_dir)
+    return process.command("ln").args(args).run()!
+
+fn main() -> Int!:
+    root := fs.make_temp_dir("pith-planted-")!
+    planted := root + "/planted"
+    outside := root + "/outside"
+    fs.make_dirs(planted)
+    fs.make_dirs(outside)
+
+    # the generator's next draw, which the old naming would have used
+    random_seed(1)
+    draw := random_int(0, 1000000)
+
+    print("plant-temp:{plant(planted, outside, "tmp-", ".txt", draw)!}")
+    random_seed(1)
+    temp := fs.make_temp_file_in(planted, "tmp-", ".txt")!
+    print("temp-created:{fs.is_file(temp)}")
+    print("temp-in-planted:{temp.starts_with(planted + "/")}")
+
+    target := planted + "/config.txt"
+    print("plant-atomic:{plant(planted, outside, ".config.txt.", ".tmp", draw)!}")
+    random_seed(1)
+    fs.write_atomic(target, "fresh")!
+    print("atomic-content:{fs.read(target)!}")
+
+    print("temp-dir-created:{fs.is_dir(fs.make_temp_dir_in(planted, "dir-")!)}")
+    print("outside-entries:{fs.list(outside).len()}")
+
+    fs.remove_tree(root)
+    return 0

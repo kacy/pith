@@ -145,6 +145,36 @@ mod tests {
     use super::*;
     use crate::ffi_util::unbox_result;
 
+    // a wait on one thread and a drain on another, off green. the wait used to
+    // hold the registry lock while it blocked, so the reader could not get its
+    // pipe and a child with more than a pipe buffer to write never exited.
+    #[test]
+    fn a_wait_does_not_block_a_reader_draining_the_same_child() {
+        use crate::process::{pith_process_close, pith_process_spawn, pith_process_wait};
+
+        let cmd = c"head -c 300000 /dev/zero";
+        let handle = unsafe { pith_process_spawn(cmd.as_ptr()) };
+        assert_ne!(handle, 0);
+        let (done, waited) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(pith_process_wait(handle)).unwrap());
+        let (sent, drained) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut total = 0;
+            while let PipeRead::Data(buf) = read_pipe(handle, Pipe::Stdout, 65536) {
+                if buf.is_empty() {
+                    break;
+                }
+                total += buf.len();
+            }
+            sent.send(total).unwrap();
+        });
+        // the bound only turns the old hang into a failure.
+        let limit = std::time::Duration::from_secs(30);
+        assert_eq!(drained.recv_timeout(limit), Ok(300000));
+        assert_eq!(waited.recv_timeout(limit), Ok(0));
+        pith_process_close(handle);
+    }
+
     #[test]
     fn invalid_process_io_handles_return_safe_defaults() {
         unsafe {

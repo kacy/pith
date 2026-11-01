@@ -1756,6 +1756,11 @@ cli-regressions-only:
 	set -e; \
 	case "$$cyc_out" in *'"code":"E306"'*) pass=$$((pass+1)); echo "ok   lint strong cycle";; *) echo "FAIL lint strong cycle"; fail=$$((fail+1));; esac; \
 	case "$$weak_out" in *'"code":"E306"'*) echo "FAIL lint weak edge exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint weak edge exempt";; esac; \
+	printf 'pub fn top() -> Int:\n    return 1\n' > "$$tmpdir/lint_first_line.pith"; \
+	set +e; \
+	first_out=$$(./target/release/pith lint --json "$$tmpdir/lint_first_line.pith" 2>/dev/null); \
+	set -e; \
+	case "$$first_out" in *'"code":"E304"'*) pass=$$((pass+1)); echo "ok   lint doc comment on line 1";; *) echo "FAIL lint doc comment on line 1"; fail=$$((fail+1));; esac; \
 	printf 'import std.net.tls as tls\n\nfn build() -> Int!:\n    config := tls.client_config()!\n    return 0\n\nfn main():\n    return\n' > "$$tmpdir/lint_open.pith"; \
 	printf 'import std.net.tls as tls\n\nfn build() -> Int!:\n    config := tls.client_config()!\n    defer config.close()\n    return 0\n\nfn main():\n    return\n' > "$$tmpdir/lint_closed.pith"; \
 	printf 'import std.net.tls as tls\n\nfn keep(c: tls.Config):\n    return\n\nfn build() -> Int!:\n    config := tls.client_config()!\n    keep(config)\n    return 0\n\nfn main():\n    return\n' > "$$tmpdir/lint_handoff.pith"; \

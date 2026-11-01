@@ -237,6 +237,10 @@ cases=(
   "tests/leaks/leak_temp_result_use SHAPE=12"
   tests/leaks/leak_task_handle_drop
   "tests/leaks/leak_task_handle_drop PITH_GREEN=0"
+  tests/leaks/leak_read_all_buffer
+  tests/leaks/leak_output_ctx_failed_reader
+  "tests/leaks/leak_output_ctx_failed_reader PITH_GREEN=0"
+  tests/leaks/leak_list_store_miss
   "tests/leaks/leak_unmarked_cycle PITH_CYCLE_GC=1"
   "tests/leaks/leak_map_value_cycle PITH_CYCLE_GC=1"
 )

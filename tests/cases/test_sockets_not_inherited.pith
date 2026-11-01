@@ -1,0 +1,27 @@
+# a child process must not inherit the parent's sockets.
+#
+# a server that spawns a helper would otherwise hand it every open connection:
+# the helper holds them open after the server closes its side, so the peer
+# never sees the hang-up. std sets close-on-exec on the sockets it creates,
+# but the green backend accepts and connects with raw libc calls, and those
+# descriptors used to stay inheritable. the child here lists its own open
+# descriptors and counts the sockets among them.
+
+import std.net.tcp as tcp
+import std.os.process as process
+
+PORT := 20965
+
+fn main() -> Int!:
+    listener := tcp.listen("127.0.0.1", PORT)!
+    client := tcp.connect("127.0.0.1", PORT)!
+    server := tcp.accept(listener)!
+
+    listing := process.command("sh").args(["-c", "ls -l /proc/self/fd/"]).output()!
+    count := listing.stdout.split("\n").filter(fn(line: String) => line.contains("socket:")).len()
+    print("sockets inherited by a child: {count}")
+
+    tcp.close(server)
+    tcp.close(client)
+    tcp.close(listener)
+    return 0

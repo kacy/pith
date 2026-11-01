@@ -314,12 +314,15 @@ fn check_doc_comment(name: String, node_idx: Int, source: String, is_method: Boo
         if is_line_indented(line, trimmed) != is_method:
             continue
         found_line = i
-    if found_line <= 0:
-        # can't find or first line — skip
+    if found_line < 0:
         return
-    # check line before the declaration for a comment
-    prev := lines[found_line - 1].trim()
-    if prev.len() == 0 or prev[0] != "#":
+    # the doc comment is the line just above the declaration; a declaration
+    # on the first line has none (#1292)
+    mut documented := false
+    if found_line > 0:
+        prev := lines[found_line - 1].trim()
+        documented = prev.len() > 0 and prev[0] == "#"
+    if not documented:
         report_linter_warning("E304", "public function '" + name + "' is missing a doc comment", found_line + 1, 0)
 
 # ---------------------------------------------------------------

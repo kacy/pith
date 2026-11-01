@@ -293,18 +293,40 @@ pub fn pow(base: BigInt, exponent: Int) -> BigInt!:
         fail "bigint: pow needs a non-negative exponent, got {exponent}"
     if exponent == 0:
         return one()
+    check_pow_digits(base, exponent)!
     mut result := one()
     mut factor := base
     mut remaining := exponent
     while remaining > 0:
         if remaining % 2 == 1:
+            # a product has at least one limb fewer than its factors
+            # together, so this refuses before multiplying, never a product
+            # that would fit
+            check_product_limbs(result, factor)!
             result = mul(result, factor)
             check_size(result)!
         remaining = remaining / 2
         if remaining > 0:
+            check_product_limbs(factor, factor)!
             factor = mul(factor, factor)
             check_size(factor)!
     return result
+
+# refuse a power whose result is sure to pass the size ceiling, before any
+# multiply runs. base^exponent has more than exponent * log10(base) digits,
+# and the bound below never exceeds that: (digits - 1) per factor, or 0.3
+# for a one-digit base of at least 2, since 2^10 > 10^3.
+fn check_pow_digits(base: BigInt, exponent: Int) -> Bool!:
+    max_digits := BIGINT_MAX_LIMBS * BIGINT_BASE_DIGITS
+    width := digit_count(base)
+    if width >= 2:
+        per := width - 1
+        if exponent > max_digits / per:
+            fail "bigint: pow of a {width} digit base to {exponent} exceeds the {max_digits} digit ceiling"
+    elif base.limbs.len() == 0 and base.small >= 2:
+        if exponent / 10 * 3 >= max_digits:
+            fail "bigint: pow of a one digit base to {exponent} exceeds the {max_digits} digit ceiling"
+    return true
 
 # --- powers of ten ---
 #
@@ -826,6 +848,16 @@ fn check_size(value: BigInt) -> Bool!:
         fail "bigint: value of {value.limbs.len()} limbs exceeds the {BIGINT_MAX_LIMBS} limb ceiling"
     return true
 
+# refuse a product sure to pass the size ceiling before computing it. a
+# value of n limbs is at least BIGINT_BASE^(n - 1), so a product has at
+# least left + right - 1 limbs. a small-form value counts as no limbs,
+# which only makes the bound looser.
+fn check_product_limbs(left: BigInt, right: BigInt) -> Bool!:
+    least := left.limbs.len() + right.limbs.len() - 1
+    if least > BIGINT_MAX_LIMBS:
+        fail "bigint: a product of at least {least} limbs exceeds the {BIGINT_MAX_LIMBS} limb ceiling"
+    return true
+
 fn check_digits(digits: Int) -> Bool!:
     if digits > BIGINT_MAX_LIMBS * BIGINT_BASE_DIGITS:
         fail "bigint: a {digits} digit value exceeds the {BIGINT_MAX_LIMBS * BIGINT_BASE_DIGITS} digit ceiling"
@@ -996,6 +1028,21 @@ test "digit count spans the limb boundary":
 test "the size ceiling refuses an exponent that would allocate":
     assert(ten_pow(2000000).is_err)
     assert(pow(from_int(10), 2000000).is_err)
+
+test "pow refuses an oversized result before multiplying":
+    # this ran for 82 s, squaring up to the ceiling before checking it
+    assert(pow(from_int(999999999999999999), 1048576).is_err)
+    assert(pow(from_int(-2), 9223372036854775807).is_err)
+    assert(pow(parse("1000000000000000000000")!, 100000).is_err)
+    # bases that never grow are still exact at any exponent
+    assert_eq(to_string(pow(one(), 9223372036854775807)!), "1")
+    assert_eq(to_string(pow(from_int(-1), 9223372036854775807)!), "-1")
+    assert_eq(to_string(pow(zero(), 9223372036854775807)!), "0")
+    # results near the boundaries the checks use stay exact
+    assert_eq(digit_count(pow(from_int(10), 1000)!), 1001)
+    assert_eq(digit_count(pow(from_int(2), 10000)!), 3011)
+    assert_eq(digit_count(pow(from_int(999999999), 100)!), 900)
+    assert_eq(to_string(pow(from_int(3), 40)!), "12157665459056928801")
 
 test "a value crosses to a float, losing precision where a float must":
     assert_eq(to_float(from_int(1)), 1.0)

@@ -356,7 +356,7 @@ enum ExitState {
     Finished(i64),
     /// still running, and this fd becomes readable when that changes.
     Watch(RawFd),
-    /// still running with nothing to watch it by: the caller has to block.
+    /// still running with nothing to watch it by: the caller has to poll.
     Unwatchable,
     /// the handle is not ours (closed under us, or never existed).
     Unknown,
@@ -366,9 +366,13 @@ enum ExitState {
 /// cannot get one.
 ///
 /// `pidfd_open` is linux 5.3 and newer. an older kernel answers ENOSYS and we
-/// fall back to blocking in `wait`.
+/// fall back to `poll_until_exit`.
 #[cfg(target_os = "linux")]
 fn watch_pid(pid: u32) -> Option<RawFd> {
+    #[cfg(test)]
+    if NO_PIDFD_FOR_TESTS.load(Ordering::Relaxed) {
+        return None;
+    }
     // SAFETY: pidfd_open takes a pid and a flags word and returns an fd or -1.
     // the pid is live: the caller holds the registry lock and has just seen the
     // child unreaped, so the number cannot have been recycled.
@@ -378,6 +382,12 @@ fn watch_pid(pid: u32) -> Option<RawFd> {
     }
     Some(fd as RawFd)
 }
+
+/// makes `watch_pid` answer as a kernel without pidfds would, so tests can
+/// take the path macOS and linux before 5.3 take.
+#[cfg(test)]
+pub(crate) static NO_PIDFD_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(target_os = "linux"))]
 fn watch_pid(_pid: u32) -> Option<RawFd> {
@@ -459,6 +469,28 @@ fn reap(handle: i64) -> i64 {
     }
 }
 
+/// wait for a child there is no pidfd for: look under the registry lock, and
+/// sleep between looks with the lock released. a wait that held the lock
+/// across the child's life would shut out a reader draining the child's
+/// pipes, and a child stuck on a full pipe never exits. the sleep parks a
+/// green task on the reactor's timer and blocks any other thread.
+fn poll_until_exit(handle: i64) -> i64 {
+    loop {
+        {
+            let mut handles = process_handles().lock();
+            let Some(entry) = handles.get_mut(&handle) else {
+                return -1;
+            };
+            match entry.child.try_wait() {
+                Ok(Some(status)) => return status.code().unwrap_or(-1) as i64,
+                Ok(None) => {}
+                Err(_) => return -1,
+            }
+        }
+        crate::platform::pith_sleep(2);
+    }
+}
+
 /// Wait for a spawned process to finish, returns exit code
 ///
 /// Off a green task this is a plain blocking wait. On one, the
@@ -477,7 +509,7 @@ pub extern "C" fn pith_process_wait(handle: i64) -> i64 {
     let watch = match exit_state(handle) {
         ExitState::Finished(code) => return code,
         ExitState::Unknown => return -1,
-        ExitState::Unwatchable => return reap(handle),
+        ExitState::Unwatchable => return poll_until_exit(handle),
         ExitState::Watch(fd) => fd,
     };
 

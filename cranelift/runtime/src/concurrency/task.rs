@@ -277,6 +277,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
     let cycle_slot = crate::cycle::mutator_slot_for_spawn();
     let join_handle = std::thread::spawn(move || {
         crate::cycle::adopt_mutator_slot(cycle_slot);
+        crate::stack_guard::enter_thread();
         let func_ptr = crate::pith_closure_get_fn(closure_handle);
         let result = if func_ptr == 0 {
             0
@@ -333,8 +334,9 @@ pub unsafe extern "C" fn pith_await(task_handle: i64) -> i64 {
 
 /// Join an os-thread task and return its result. Awaiting consumes the handle
 /// (Rust-style), so once the result is read the slab slot is reclaimed and the
-/// handle unregistered; a second await of the same handle, or an await of a
-/// stale/garbage one, safely returns 0.
+/// handle unregistered; a second await of the same handle, whether it runs
+/// after the first or alongside it, and an await of a stale/garbage one,
+/// safely return 0.
 pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
     if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return 0;
@@ -378,7 +380,12 @@ pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
             };
             state.waiters -= 1;
         }
-        state.result
+        // the result carries the task's count on whatever it returned, so
+        // only one awaiter may have it. the first to get here takes it, under
+        // the lock; an await of the same handle racing this one reads 0, the
+        // answer green gives once the first await has retired the task. two
+        // awaiters each handed the value used to release it twice.
+        std::mem::take(&mut state.result)
     };
 
     // the task is finished and we have consumed its result (we still hold `shared`

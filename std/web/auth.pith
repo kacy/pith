@@ -17,7 +17,8 @@
 #   fn log_in(req: web.Request) -> http.HttpResponse:
 #       if not password.verify(submitted, stored_hash):
 #           return http.unauthorized_response()
-#       guard.sign_in(req, "u-7")
+#       if not guard.sign_in(req, "u-7"):
+#           return http.text(503, "try again shortly")
 #       return http.redirect_response("/app/me")
 #
 #   fn me(req: web.Request) -> http.HttpResponse:
@@ -85,9 +86,15 @@ impl Guard:
     # with, and it rotates the session id before writing anything: an
     # attacker who planted a session id in the victim's browser holds one
     # that was retired at the exact moment it became worth having.
-    fn sign_in(req: web.Request, subject: String):
-        self.store.rotate(req)
-        self.store.set(req, SUBJECT_KEY, subject)
+    #
+    # returns false when the session store is full and the caller could not
+    # be signed in; nothing is written then, not even into the session the
+    # caller already had. answer it with 503, not with a page that assumes
+    # the sign-in worked.
+    fn sign_in(req: web.Request, subject: String) -> Bool:
+        if not self.store.rotate(req):
+            return false
+        return self.store.set(req, SUBJECT_KEY, subject)
 
     # end the session on the server. the response clears the cookie, so the
     # id stops meaning anything immediately rather than when a token would
@@ -174,7 +181,8 @@ fn open_route(store: session.Store, handler: fn(web.Request) -> http.HttpRespons
 
 fn login_handler(guard_v: Guard, subject: String) -> fn(web.Request) -> http.HttpResponse:
     return fn(req: web.Request):
-        guard_v.sign_in(req, subject)
+        if not guard_v.sign_in(req, subject):
+            return http.text(503, "store full")
         return http.text(200, "signed in")
 
 fn logout_handler(guard_v: Guard) -> fn(web.Request) -> http.HttpResponse:

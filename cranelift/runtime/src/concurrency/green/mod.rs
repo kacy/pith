@@ -87,6 +87,17 @@ pub use probe::{encode_probe, pith_green_cross_thread_probe};
 pub use stats::note_channel_wake;
 pub(crate) use wake::{park_current, take_handoff, wake, wake_pool, wake_with};
 
+/// the pieces of the scheduling word the loom models drive: its states and
+/// flags, and the pure transitions a wake and a suspend make on it.
+#[cfg(all(test, loom))]
+pub(crate) mod word {
+    pub(crate) use super::run::{after_yield, Requeue};
+    pub(crate) use super::task::{
+        owner_bits, S_READY, S_RUNNING, S_STATE_MASK, S_WAKE_PENDING,
+    };
+    pub(crate) use super::wake::{wake_step, WakeStep};
+}
+
 /// the whole green runtime: the per-task sync blocks, the per-worker queues
 /// and park spots, and the injector for off-worker spawns.
 struct Scheduler {
@@ -207,6 +218,23 @@ thread_local! {
 #[inline]
 pub(crate) fn current_task() -> Option<TaskId> {
     CURRENT_TASK.with(|c| c.get())
+}
+
+/// the green task running on this thread and the lowest address of its stack
+/// mapping, where the guard page starts, or `None` when no task runs here.
+/// the stack overflow handler calls this from a signal, so it only reads a
+/// thread-local cell, the scheduler's `OnceLock` and the lock-free arena.
+#[cfg(not(any(pith_asan, pith_tsan)))]
+pub(crate) fn running_task_stack() -> Option<(TaskId, usize)> {
+    let id = current_task()?;
+    let block = SCHEDULER.get()?.sync.get(id)?;
+    Some((id, block.stack_bottom.load(AtomicOrdering::Relaxed)))
+}
+
+/// the size of every green task's stack, in bytes.
+#[cfg(not(any(pith_asan, pith_tsan)))]
+pub(crate) fn task_stack_size() -> usize {
+    stack::stack_size()
 }
 
 /// the index of the worker this os thread is, or `None` off the pool. the

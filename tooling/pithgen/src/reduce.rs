@@ -242,7 +242,7 @@ pub fn cmd_reduce(args: &[String]) {
     let mode = if args.iter().any(|a| a == "--sanitize") {
         oracle::RunMode::Sanitize
     } else {
-        oracle::RunMode::Plain { valgrind_mem: false }
+        oracle::RunMode::Plain { valgrind_mem: false, leak: args.iter().any(|a| a == "--leak") }
     };
 
     let tc = oracle::locate_toolchain(Path::new(pith));
@@ -250,7 +250,7 @@ pub fn cmd_reduce(args: &[String]) {
     let work = out_dir.join("work");
 
     // confirm the finding on the full program first
-    let prog = gen::generate(seed);
+    let prog = gen::generate(seed, &gen::GenOpts::from_args(args));
     let outcome = oracle::run_case(seed, &prog.files, Some(&prog.expected), &tc, &work, mode);
     let finding = match &want_class {
         Some(c) => outcome.findings.iter().find(|f| &f.class == c),

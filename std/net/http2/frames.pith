@@ -247,12 +247,26 @@ pub fn frame_bytes(frame: Frame) -> Bytes!:
     out.write(frame.payload)!
     return out.bytes()
 
+# the failure for a frame longer than the receiver's max frame size. a
+# connection matches it to answer with a FRAME_SIZE_ERROR GOAWAY (RFC 9113 §4.2).
+pub FRAME_TOO_LARGE := "http2: frame length exceeds max frame size"
+
+# the full size (header plus payload) of the frame whose 9-byte header starts
+# at `pos` in `buf`. fails with FRAME_TOO_LARGE when the declared payload is
+# over `max_frame_size`, so a reader can reject the frame from its header
+# instead of buffering up to 16 MB that read_frame would refuse anyway.
+pub fn frame_total(buf: Bytes, pos: Int, max_frame_size: Int) -> Int!:
+    length := checked_read(binary.read_u24_be_at(buf, pos))!
+    if length > max_frame_size:
+        fail FRAME_TOO_LARGE
+    return 9 + length
+
 # read one frame from a binary reader, rejecting payloads larger than
 # `max_frame_size`. the reserved high bit of the stream id is masked off.
 pub fn read_frame(reader: binary.Reader, max_frame_size: Int) -> Frame!:
     length := checked_read(binary.read_u24_be(reader))!
     if length > max_frame_size:
-        fail "frame length exceeds max frame size"
+        fail FRAME_TOO_LARGE
     frame_type := checked_read(binary.read_u8(reader))!
     flags := checked_read(binary.read_u8(reader))!
     raw_stream := checked_read(binary.read_u32_be(reader))!
@@ -635,6 +649,14 @@ test "read_frame rejects a payload larger than the max frame size":
     reader := binary.reader(raw)
     result := read_frame(reader, 10)
     assert(result.is_err)
+
+test "frame_total rejects an oversized frame from its header alone":
+    # a bare header declaring 0xffffff payload bytes, with no payload behind it.
+    raw := encoding.from_hex("ffffff000000000001")!
+    result := frame_total(raw, 0, DEFAULT_MAX_FRAME_SIZE)
+    assert(result.is_err)
+    assert_eq(result.err, FRAME_TOO_LARGE)
+    assert_eq(frame_total(encoding.from_hex("004000000000000001")!, 0, DEFAULT_MAX_FRAME_SIZE)!, 9 + DEFAULT_MAX_FRAME_SIZE)
 
 test "read_frame rejects a truncated payload":
     # header claims 5 payload bytes but only 2 follow.

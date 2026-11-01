@@ -1,0 +1,22 @@
+# a search runs the vm once over the input, not once per start offset.
+# `[a-z]+@` over a long run of letters with no `@` used to take time
+# quadratic in the length (81 s at 32 KB); one pass takes milliseconds.
+
+import std.regex as regex
+import std.time as time
+
+fn main() -> Int!:
+    re := regex.compile("[a-z]+@")!
+    input := "a".repeat(64000)
+    t0 := time.now()
+    found := re.is_match(input)
+    all := re.find_all(input).len()
+    caps := re.captures(input) == none
+    elapsed := time.now() - t0
+    print("match: {found}")
+    print("find_all: {all}")
+    print("captures none: {caps}")
+    print("within bound: {elapsed < 2000}")
+    tail := re.find(input + "@")
+    print("tail match: {tail.value().start}-{tail.value().stop}")
+    return 0

@@ -1,0 +1,60 @@
+# a match whose arm can drop its borrowed subject pins the subject in a hidden
+# slot (ir_match_pin_kind). the pin has to be dropped on every way out: the
+# merge, a return from the arm, a tail match, and a break or continue, which
+# leave the count in the slot until the match runs again or the function
+# exits. each round takes all of them, so a pin left behind strands a node
+# per round.
+import leakprobe as probe
+
+struct C:
+    name: String
+
+struct H:
+    mut c: C
+
+fn tail(h: H) -> Int:
+    match h.c:
+        x =>
+            h.c = C(name: "t")
+            return x.name.len()
+
+fn early(h: H, seed: Int) -> Int:
+    match h.c:
+        x =>
+            h.c = C(name: "e")
+            if seed % 2 == 0:
+                return x.name.len()
+    return 0
+
+fn round(seed: Int) -> Int:
+    h := H(c: C(name: "n{seed}"))
+    mut total := 0
+    match h.c:
+        x =>
+            h.c = C(name: "m{seed}")
+            total = total + x.name.len()
+    total = total + tail(h) + early(h, seed)
+    mut i := 0
+    while i < 3:
+        i = i + 1
+        match h.c:
+            x =>
+                h.c = C(name: "w{i}")
+                total = total + x.name.len()
+                if i == 1:
+                    continue
+                if i == 2:
+                    break
+    return total
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 1:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

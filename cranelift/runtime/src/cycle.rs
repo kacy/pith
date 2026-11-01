@@ -429,9 +429,9 @@ fn register_new_slot() -> Arc<MutatorSlot> {
     slot
 }
 
-/// this thread's slot, created and registered on first use. this is how the main
-/// thread (and any other thread that reaches a gate or bracket) becomes a
-/// registered mutator without an explicit spawn seam. `None` only while
+/// this thread's slot, created and registered on first use. the main thread
+/// registers through here at process start (`register_main_mutator`), and any
+/// other thread that reaches a gate or bracket does on its first. `None` only while
 /// thread-local storage is tearing down, where the thread is exiting and a
 /// bracket can no longer matter.
 ///
@@ -473,6 +473,16 @@ fn existing_mutator_slot() -> Option<Arc<MutatorSlot>> {
 #[inline]
 fn on_collector() -> bool {
     ON_COLLECTOR.with(Cell::get)
+}
+
+/// Register the process main thread as a mutator, from the switches
+/// constructor before main runs. Registering at its first gate or bracket
+/// instead would let a collection that starts earlier (the collector thread
+/// starts on the first suspect) declare the world stopped while main mutates.
+pub(crate) fn register_main_mutator() {
+    if cycle_gc_enabled() {
+        let _ = mutator_slot();
+    }
 }
 
 /// Create and register a mutator slot on behalf of a thread about to be
@@ -574,10 +584,16 @@ fn exit_native() {
     let Some(slot) = mutator_slot() else {
         return;
     };
+    // running first, then the request: the stopper stores the request and
+    // then scans, so with both sides seq-cst either this load sees the
+    // request or the scan sees `running`. checking first would leave a
+    // window where the scan still reads `native` while this thread has
+    // already decided to run on.
+    slot.state.store(MUTATOR_RUNNING, Ordering::SeqCst);
+    #[cfg(test)]
+    tests::between_exit_steps();
     if GC_STOP.load(Ordering::SeqCst) {
         park_for_gc(&slot);
-    } else {
-        slot.state.store(MUTATOR_RUNNING, Ordering::SeqCst);
     }
 }
 
@@ -1418,7 +1434,7 @@ mod tests {
     use crate::runtime_core::{
         closure_buffered_for_tests, pith_closure_get_fn, pith_closure_new, pith_closure_release,
         pith_closure_retain, pith_closure_set_env_rc, pith_struct_alloc, pith_struct_release,
-        pith_struct_retain, pith_struct_set_dtor, pith_struct_weak_load, pith_struct_weak_release,
+        pith_struct_retain, pith_struct_set_dtor, pith_struct_weak_release, pith_struct_weak_upgrade,
         pith_struct_weak_retain, struct_dead_word_for_tests, struct_weak_count_for_tests,
     };
 
@@ -1570,7 +1586,7 @@ mod tests {
                                     // is the only thing keeping the header alive.
             assert_eq!(struct_dead_word_for_tests(s), 3);
             assert_eq!(struct_weak_count_for_tests(s), 1);
-            assert_eq!(pith_struct_weak_load(s), 0, "dead reads as none");
+            assert_eq!(pith_struct_weak_upgrade(s), 0, "dead reads as none");
             assert_eq!(suspect_count_for_tests(s as usize), 1);
 
             force_enabled_for_tests(false);
@@ -1580,7 +1596,7 @@ mod tests {
 
     #[test]
     #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
-    fn weak_load_ignores_the_buffered_bit() {
+    fn weak_upgrade_ignores_the_buffered_bit() {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
@@ -1590,9 +1606,10 @@ mod tests {
             pith_struct_retain(s);
             pith_struct_release(s); // buffered, still alive
             assert_eq!(struct_dead_word_for_tests(s), 2);
-            assert_eq!(pith_struct_weak_load(s), s, "buffered but alive");
+            assert_eq!(pith_struct_weak_upgrade(s), s, "buffered but alive");
+            pith_struct_release(s); // the upgrade's count
             pith_struct_release(s); // dies buffered
-            assert_eq!(pith_struct_weak_load(s), 0, "buffered and dead");
+            assert_eq!(pith_struct_weak_upgrade(s), 0, "buffered and dead");
             pith_struct_weak_release(s);
 
             force_enabled_for_tests(false);
@@ -1615,7 +1632,8 @@ mod tests {
             let list = crate::collections::list::pith_list_new(8, 4); // struct elements
             pith_list_push_value(list, elem); // list retains
             pith_struct_release(elem); // list holds the only strong count
-            assert_eq!(pith_struct_weak_load(elem), elem);
+            assert_eq!(pith_struct_weak_upgrade(elem), elem);
+            pith_struct_release(elem); // the upgrade's count
 
             pith_list_retain_handle(list.ptr as i64);
             pith_list_release(list); // 2 -> 1: buffered
@@ -1623,7 +1641,7 @@ mod tests {
             pith_list_release(list); // 1 -> 0: dies buffered
 
             assert_eq!(graveyard_count_for_tests(list.ptr as usize), 1);
-            assert_eq!(pith_struct_weak_load(elem), 0, "element was released");
+            assert_eq!(pith_struct_weak_upgrade(elem), 0, "element was released");
             assert_eq!(
                 pith_list_len(list),
                 0,
@@ -1659,7 +1677,7 @@ mod tests {
             pith_closure_release(closure); // 1 -> 0: dies buffered
 
             assert_eq!(graveyard_count_for_tests(closure as usize), 1);
-            assert_eq!(pith_struct_weak_load(captured), 0, "capture was released");
+            assert_eq!(pith_struct_weak_upgrade(captured), 0, "capture was released");
             assert_eq!(pith_closure_get_fn(closure), 0, "magic scrubbed");
 
             pith_struct_weak_release(captured);
@@ -1815,7 +1833,8 @@ mod tests {
             a.join().expect("releasing thread panicked");
             b.join().expect("releasing thread panicked");
 
-            assert_eq!(pith_struct_weak_load(s), s, "still alive: we hold a count");
+            assert_eq!(pith_struct_weak_upgrade(s), s, "still alive: we hold a count");
+            pith_struct_release(s); // the upgrade's count
             assert_eq!(
                 suspect_count_for_tests(s as usize),
                 1,
@@ -2042,6 +2061,117 @@ mod tests {
         force_enabled_for_tests(false);
     }
 
+    thread_local! {
+        // run by `exit_native` between its two steps on this thread, so a test
+        // can hold a mutator inside the handshake while a stop scans it.
+        static EXIT_PAUSE: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn between_exit_steps() {
+        EXIT_PAUSE.with(|pause| {
+            if let Some(pause) = pause.borrow_mut().as_mut() {
+                pause();
+            }
+        });
+    }
+
+    #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
+    fn a_stop_never_lands_between_the_bracket_exit_steps() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(2000);
+
+        // the mutator stops inside its bracket exit, between the state store
+        // and the request load (in whichever order the exit takes them), and
+        // a stop scans it there. the stop may only succeed once the exit has
+        // parked: a mutator that runs past the bracket while the world reads
+        // as stopped is the race.
+        let (at_pause_tx, at_pause_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        let thread_finished = Arc::clone(&finished);
+        let (slot, handle) = spawn_registered(move || {
+            {
+                let _native = native_bracket();
+                EXIT_PAUSE.with(|pause| {
+                    *pause.borrow_mut() = Some(Box::new(move || {
+                        let _ = at_pause_tx.send(());
+                        let _ = go_rx.recv();
+                    }));
+                });
+            }
+            EXIT_PAUSE.with(|pause| *pause.borrow_mut() = None);
+            thread_finished.store(true, Ordering::SeqCst);
+        });
+
+        at_pause_rx.recv().expect("the mutator reached the pause");
+        let stopper = std::thread::spawn(pith_cycle_stop_the_world);
+        while !GC_STOP.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+        // let the stopper scan the paused mutator many times over.
+        std::thread::sleep(Duration::from_millis(20));
+        go_tx.send(()).expect("the mutator is waiting");
+        let stopped = stopper.join().expect("stopper panicked");
+        if !stopped {
+            skip_congested("a_stop_never_lands_between_the_bracket_exit_steps");
+            handle.join().expect("bracketed thread panicked");
+            force_enabled_for_tests(false);
+            return;
+        }
+        {
+            let _resume = WorldResumer;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while slot.state_for_tests() != MUTATOR_PARKED_FOR_GC
+                && !finished.load(Ordering::SeqCst)
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                !finished.load(Ordering::SeqCst),
+                "the mutator ran past its bracket while the world read as stopped"
+            );
+            assert_eq!(slot.state_for_tests(), MUTATOR_PARKED_FOR_GC);
+        }
+        handle.join().expect("bracketed thread panicked");
+        assert!(finished.load(Ordering::SeqCst), "resume let it finish");
+        force_enabled_for_tests(false);
+    }
+
+    #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
+    fn a_stop_waits_for_main_before_its_first_gate() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(30);
+
+        // a thread playing main: registered the way the process start
+        // registers main, then mutating without ever reaching a gate.
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<Option<Arc<MutatorSlot>>>();
+        let done = Arc::new(AtomicBool::new(false));
+        let spinner_done = Arc::clone(&done);
+        let handle = std::thread::spawn(move || {
+            register_main_mutator();
+            let _ = started_tx.send(existing_mutator_slot());
+            while !spinner_done.load(Ordering::Relaxed) {
+                std::hint::spin_loop();
+            }
+        });
+        let slot = started_rx.recv().expect("main started");
+        let stopped = pith_cycle_stop_the_world();
+        done.store(true, Ordering::Relaxed);
+        handle.join().expect("main stand-in panicked");
+        if stopped {
+            pith_cycle_resume_the_world();
+        }
+        force_enabled_for_tests(false);
+        assert!(!stopped, "the stop must wait for main, which has not reached a gate");
+        assert!(slot.is_some(), "main registers at start");
+    }
+
     #[test]
     #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
     fn exited_slots_are_skipped_by_the_rendezvous() {
@@ -2220,12 +2350,12 @@ mod tests {
             let (a, b) = build_garbage_ring();
             pith_struct_release(a); // the last external count: garbage now
             assert_eq!(suspect_count_for_tests(a as usize), 1);
-            assert_eq!(pith_struct_weak_load(a), a, "the ring still holds it");
+            assert_eq!(crate::runtime_core::cycle_struct_alive(a), Some(true), "the ring still holds it");
 
             let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(a), 0, "ring member a reclaimed");
-            assert_eq!(pith_struct_weak_load(b), 0, "ring member b reclaimed");
+            assert_eq!(pith_struct_weak_upgrade(a), 0, "ring member a reclaimed");
+            assert_eq!(pith_struct_weak_upgrade(b), 0, "ring member b reclaimed");
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
                 2,
@@ -2262,8 +2392,8 @@ mod tests {
 
             let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(a), a, "externally owned: kept");
-            assert_eq!(pith_struct_weak_load(b), b, "reached only from a: kept");
+            assert_eq!(crate::runtime_core::cycle_struct_alive(a), Some(true), "externally owned: kept");
+            assert_eq!(crate::runtime_core::cycle_struct_alive(b), Some(true), "reached only from a: kept");
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
                 0,
@@ -2273,8 +2403,8 @@ mod tests {
             // the owner lets go: the same ring is garbage on the next pass.
             pith_struct_release(a);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(a), 0);
-            assert_eq!(pith_struct_weak_load(b), 0);
+            assert_eq!(pith_struct_weak_upgrade(a), 0);
+            assert_eq!(pith_struct_weak_upgrade(b), 0);
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
                 2
@@ -2304,7 +2434,7 @@ mod tests {
 
             let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(s), s, "leaf with an owner: kept");
+            assert_eq!(crate::runtime_core::cycle_struct_alive(s), Some(true), "leaf with an owner: kept");
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
                 0
@@ -2339,7 +2469,7 @@ mod tests {
 
             let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(s), 0, "struct half reclaimed");
+            assert_eq!(pith_struct_weak_upgrade(s), 0, "struct half reclaimed");
             assert_eq!(pith_closure_get_fn(c), 0, "closure half no longer validates");
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
@@ -2397,8 +2527,8 @@ mod tests {
                 forced_ok = pith_cycle_gc_collect_now() == 1;
             }
             assert!(forced_ok, "the forced collection must eventually run");
-            assert_eq!(pith_struct_weak_load(a), 0);
-            assert_eq!(pith_struct_weak_load(b), 0);
+            assert_eq!(pith_struct_weak_upgrade(a), 0);
+            assert_eq!(pith_struct_weak_upgrade(b), 0);
 
             pith_struct_weak_release(a);
             pith_struct_weak_release(b);

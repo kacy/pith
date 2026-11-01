@@ -1,0 +1,22 @@
+# a typed json.decode that fails on a later field: the fields read before the
+# failure (a string, and the optional shell) have to be released on the error
+# path. they once were not, about 110 bytes per failed decode (#1145).
+import std.json as json
+import leakprobe as probe
+
+pub struct LateFlat:
+    pub name: String
+    pub note: String?
+    pub bad: Int
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut failed := 0
+    while i < n:
+        doc := "\{\"name\":\"name{i}\",\"bad\":\"x\"\}"
+        r := json.decode_text[LateFlat](doc)
+        if r.is_err:
+            failed = failed + 1
+        i = i + 1
+    print("{probe.peak_kb()}")

@@ -1,0 +1,16 @@
+; a field read through a null struct handle. the stack overflow handler
+; catches SIGSEGV, and a fault that is not in a guard page must still kill
+; the process by SIGSEGV rather than be reported as an overflow or turned
+; into an exit status. safe pith cannot read a field of a null handle, so
+; this is combined text ir compiled with `pith build-ir`.
+string m0s0 "before"
+func main 0 void
+strref 1 m0s0
+call 2 pith_print_cstr unknown 1 1
+iconst 3 0
+field 4 3 0
+call 5 int_to_string string 1 4
+call 6 pith_print_cstr unknown 1 5
+iconst 7 0
+ret 7
+endfunc

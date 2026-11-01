@@ -1,0 +1,79 @@
+name: sanitizers
+# the regression corpus and the std tests against a sanitized runtime. too
+# slow for every push, so this runs nightly and on demand; see
+# tooling/sanitize.sh for what it covers.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  asan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: build
+        run: cargo build --release
+
+      - name: build the ir driver from the seed
+        run: ./target/release/pith run examples/hello.pith > /dev/null
+
+      - name: corpus and std tests under asan
+        run: make sanitize-asan-only
+
+  # programs pithgen generates from fresh seeds every night, built against the
+  # asan runtime and run on both backends with the freelist on and off. each
+  # distinct signature it finds becomes an issue labelled `pithgen`.
+  pithgen-hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: build
+        run: |
+          cargo build --release
+          make self-host self-host-ir-driver
+
+      - name: hunt
+        run: |
+          set -o pipefail
+          bash tooling/pithgen_hunt.sh 2>&1 | tee hunt.log
+          cat .pith-build/hunt/summary.md >> "$GITHUB_STEP_SUMMARY"
+        env:
+          PITHGEN_HUNT_MINUTES: "110"
+
+      - name: summary of a failed hunt
+        if: failure()
+        run: |
+          [ -f .pith-build/hunt/summary.md ] && cat .pith-build/hunt/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: keep the findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pithgen-findings
+          path: |
+            .pith-build/hunt/findings
+            .pith-build/hunt/signatures.tsv
+            .pith-build/hunt/summary.md
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: file issues
+        if: failure()
+        run: bash tooling/pithgen_issues.sh .pith-build/hunt
+        env:
+          GH_TOKEN: ${{ github.token }}

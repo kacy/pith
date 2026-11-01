@@ -1,4 +1,4 @@
-.PHONY: pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean
+.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean loom-check pithgen-leak
 
 
 # prints a bounded account of a failed regression case: exit status, the
@@ -92,6 +92,15 @@ check-tls-barriers:
 # tests cannot share a parallel test binary with unrelated suites.
 test-cycle-gc:
 	cargo test --manifest-path cranelift/Cargo.toml -p pith-runtime --locked -- --ignored --test-threads=1 cycle:: collections::map::tests::buffered_map
+
+# model-check the runtime's park/wake and count protocols (the blocking-pool
+# handshake, channel park/wake, task await, weak upgrade, mutex, semaphore and
+# wait group) with loom; see cranelift/runtime/src/loom_models. the models
+# with three threads explore up to three preemptions by default, which takes
+# about a second; LOOM_MAX_PREEMPTIONS=100 lifts the bound (several minutes).
+# its own target dir, since the cfg flag rebuilds every crate.
+loom-check:
+	RUSTFLAGS="--cfg loom" cargo test --release -p pith-runtime --locked --target-dir target/loom --lib loom_
 
 safety-check: build check-no-panics
 	cargo test --manifest-path cranelift/Cargo.toml --workspace --locked
@@ -878,7 +887,8 @@ pithgen-check: build self-host self-host-ir-driver
 # PITH_RUNTIME_LIB would also reach the prerequisite builds here and link the
 # compiler itself against the asan runtime. this is not part of the
 # deterministic gate; it needs the asan runtime and finds, not asserts.
-# PITHGEN_SEEDS overrides the range (default a quick 0..200 smoke).
+# PITHGEN_SEEDS overrides the range (default a quick 0..200 smoke), and
+# PITHGEN_FLAGS passes generation options (--pending-shapes, --shapes LIST).
 pithgen-sanitize: build self-host self-host-ir-driver
 	@echo "--- pithgen sanitize (asan matrix over freelist and green) ---"
 	@test -n "$(PITHGEN_CC)" -a -n "$(PITHGEN_RUNTIME_LIB)" || { echo "set PITHGEN_CC to an asan linker wrapper and PITHGEN_RUNTIME_LIB to an asan-built libpith_runtime.a"; exit 2; }
@@ -886,8 +896,20 @@ pithgen-sanitize: build self-host self-host-ir-driver
 	@rm -rf .pith-build/pithgen-sanitize
 	@CC="$(PITHGEN_CC)" PITH_RUNTIME_LIB="$(PITHGEN_RUNTIME_LIB)" PITH_KEEP_SYMBOLS=1 \
 		tooling/pithgen/target/release/pithgen run \
-		--sanitize --seeds $${PITHGEN_SEEDS:-0..200} \
+		--sanitize --seeds $${PITHGEN_SEEDS:-0..200} $(PITHGEN_FLAGS) \
 		--pith ./target/release/pith --out "$(CURDIR)/.pith-build/pithgen-sanitize"
+
+# the leak hunt: each ownership shape runs in a loop, and a shape whose share
+# of the peak resident set grows between a low and a high round count is a
+# finding. plain toolchain; finds, not asserts. PITHGEN_SEEDS and
+# PITHGEN_FLAGS as above.
+pithgen-leak: build self-host self-host-ir-driver
+	@echo "--- pithgen leak (ownership shapes in rounds, peak rss at two counts) ---"
+	@cargo build --release --quiet --manifest-path tooling/pithgen/Cargo.toml
+	@rm -rf .pith-build/pithgen-leak
+	@tooling/pithgen/target/release/pithgen run \
+		--leak --seeds $${PITHGEN_SEEDS:-0..100} $(PITHGEN_FLAGS) \
+		--pith ./target/release/pith --out "$(CURDIR)/.pith-build/pithgen-leak"
 
 # --- green-thread smoke test ---
 # the green backend (PITH_GREEN=1) must produce byte-identical output to the
@@ -1318,6 +1340,7 @@ MEMCHECK_VALGRIND := valgrind --error-exitcode=99 --leak-check=no --errors-for-l
 
 MEMCHECK_OSTHREAD_CASES := \
 	tests/cases/test_os_thread_spawn_reclaim tests/cases/test_await_ownership \
+	tests/cases/test_concurrent_await_one_result \
 	tests/cases/test_env_overlay \
 	tests/cases/test_channel_fanout_ownership \
 	tests/cases/test_channel_try_send_ownership \
@@ -1497,6 +1520,22 @@ memcheck-only:
 # ownership shape at two round counts and its peak resident set has to be the
 # same either way. the details, and how to add a case, are in
 # tooling/leak_check.sh and docs/ownership.md.
+
+# --- sanitizers ---
+# the regression corpus and the std tests against a runtime built with
+# AddressSanitizer or ThreadSanitizer on both backends, failing
+# on any report. slower than the rest of the suite, so the nightly workflow
+# runs these rather than every push. how they work, and what generated code
+# they cannot see, is in tooling/sanitize.sh.
+sanitize-asan: build sanitize-asan-only
+
+sanitize-asan-only:
+	@bash tooling/sanitize.sh asan
+
+sanitize-tsan: build sanitize-tsan-only
+
+sanitize-tsan-only:
+	@bash tooling/sanitize.sh tsan
 
 leak-check: build leak-check-only
 

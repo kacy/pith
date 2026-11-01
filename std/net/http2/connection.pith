@@ -57,6 +57,20 @@ pub DEFAULT_INITIAL_WINDOW := 65535
 MAX_HEADER_BLOCK_BYTES := 81920
 MAX_CONTINUATION_FRAMES := 64
 
+# the most a unary response body may hold, the same default as the http/1.1
+# client's http.MAX_RESPONSE_BODY. without it a server could make the client
+# buffer whatever it sends, since flow-control credit is granted as the body is
+# read. a body past it resets the stream (CANCEL) and fails the request with
+# RESPONSE_BODY_LIMIT. raise or lower it per connection with
+# set_max_response_body_bytes. a streaming Stream hands each DATA frame to its
+# caller as it arrives and is not limited.
+pub MAX_RESPONSE_BODY := 67108864
+pub RESPONSE_BODY_LIMIT := "http2: response body exceeds the maximum"
+# the reset_event code the reader delivers to a unary stream whose body passed
+# the limit. it is outside the RFC 9113 §7 codes, so it never collides with a
+# reset the peer sent.
+BODY_LIMIT_RESET := 0 - 1
+
 # how many consumed body bytes the sequential read loop lets accumulate before
 # granting the peer fresh flow-control credit mid-response. must sit well below
 # DEFAULT_INITIAL_WINDOW: the peer can keep sending while at most this much
@@ -105,19 +119,21 @@ pub struct Connection:
     # true for an h2c (plaintext) connection: the handle is a raw socket fd and
     # transport i/o goes through tcp rather than the tls session.
     mut plaintext: Bool
+    # the most a unary response body may hold (see MAX_RESPONSE_BODY).
+    mut max_response_body: Int
 
 # build a live connection over an established tls session handle.
 fn new_live_connection(handle: Int) -> Connection:
-    return Connection(handle, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), false)
+    return Connection(handle, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), false, MAX_RESPONSE_BODY)
 
 # build a live h2c (plaintext) connection over an open socket fd.
 fn new_h2c_connection(fd: Int) -> Connection:
-    return Connection(fd, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), true)
+    return Connection(fd, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), true, MAX_RESPONSE_BODY)
 
 # build an offline connection that reads `data` as if it arrived from a peer.
 # used by the tests to drive the read loop over a constructed frame stream.
 fn connection_from_frames(data: Bytes) -> Connection:
-    return Connection(0, false, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), false)
+    return Connection(0, false, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), false, MAX_RESPONSE_BODY)
 
 # the SETTINGS frame the client opens with: no server push, the default window,
 # and the default max frame size (so a peer must not send larger frames).
@@ -312,9 +328,15 @@ impl Connection:
             elif t == frames.FRAME_DATA:
                 df := frames.parse_data(frame)!
                 if df.stream_id == stream_id:
-                    body.write(df.data)!
                     # flow control counts the whole frame payload, padding included.
                     owed = owed + frame.header.length
+                    if df.data.len() > self.max_response_body - body.len():
+                        # settle what was consumed and cancel the stream, so the
+                        # connection stays usable for the next request.
+                        self.settle(acks, owed, stream_id, true)!
+                        self.send_frame(frames.rst_stream_frame(stream_id, frames.ERROR_CANCEL)!)!
+                        fail RESPONSE_BODY_LIMIT
+                    body.write(df.data)!
                     if df.end_stream:
                         self.settle(acks, owed, stream_id, true)!
                         return Response(status, headers, trailers, body.bytes())
@@ -361,6 +383,11 @@ impl Connection:
                 tcp_shutdown(self.tls_handle)
             else:
                 tls.conn_from_handle(self.tls_handle).shutdown_transport()
+
+    # the most a response body read on this connection may hold, in place of
+    # MAX_RESPONSE_BODY.
+    pub fn set_max_response_body_bytes(limit: Int):
+        self.max_response_body = limit
 
     # close the underlying transport.
     pub fn close():
@@ -794,6 +821,12 @@ impl Pool:
     pub fn open_stream(method: String, authority: String, path: String, extra: List[hpack.HeaderField], end_stream: Bool) -> Stream!:
         return self.clients[self.choose()].open_stream(method, authority, path, extra, end_stream)
 
+    # set every pooled connection's response body limit; see
+    # Client.set_max_response_body_bytes.
+    pub fn set_max_response_body_bytes(limit: Int):
+        for c in self.clients:
+            c.set_max_response_body_bytes(limit)
+
     # close every pooled connection.
     pub fn close():
         for c in self.clients:
@@ -869,22 +902,39 @@ fn reader_loop(client: Client):
 # trailers, and the body assembled from its DATA frames. it lives only on the
 # reader thread (in the reader's `accums` map), so it needs no lock. `to_event`
 # packs it into the single event the worker receives.
+#
+# the body is kept as its DATA payloads and joined once at the end, so a body of
+# many frames costs one copy rather than one per frame. a body of one frame, the
+# grpc unary case, is passed on with no copy at all.
 struct UnaryAccum:
     mut headers: List[hpack.HeaderField]
     mut trailers: List[hpack.HeaderField]
-    mut body: Bytes
+    mut parts: List[Bytes]
+    mut size: Int
     mut got_headers: Bool
 
 # a fresh accumulator with empty headers, trailers, and body.
 fn new_unary_accum() -> UnaryAccum:
     empty_headers: List[hpack.HeaderField] := []
     empty_trailers: List[hpack.HeaderField] := []
-    return UnaryAccum(empty_headers, empty_trailers, bytes.empty(), false)
+    empty_parts: List[Bytes] := []
+    return UnaryAccum(empty_headers, empty_trailers, empty_parts, 0, false)
 
 impl UnaryAccum:
+    # the body so far, joined.
+    fn body() -> Bytes:
+        if self.parts.len() == 0:
+            return bytes.empty()
+        if self.parts.len() == 1:
+            return self.parts[0]
+        out := bytes.buffer_with_capacity(self.size)
+        for part in self.parts:
+            out.write(part) catch 0
+        return out.take_bytes()
+
     # the coalesced event carrying the whole response.
     fn to_event() -> StreamEvent:
-        return unary_event(self.headers, self.trailers, self.body)
+        return unary_event(self.headers, self.trailers, self.body())
 
 # whether the reader should coalesce this stream's frames. an already-open
 # accumulator answers yes immediately; otherwise the first frame of a stream the
@@ -937,8 +987,20 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
         df := frames.parse_data(frame)!
         if accumulating(client, accums, df.stream_id):
             a := accums[df.stream_id]
-            a.body = bytes.concat(a.body, df.data)
-            if df.end_stream:
+            if df.data.len() > client.conn.max_response_body - a.size:
+                # past the body limit: drop what was gathered, cancel the stream
+                # on the wire, and fail the waiting request. the stream stops
+                # being unary, so a frame already in flight behind this one is
+                # not gathered again.
+                accums.remove(df.stream_id)
+                client.stop_unary(df.stream_id)
+                client.enqueue(frames.rst_stream_frame(df.stream_id, frames.ERROR_CANCEL)!)!
+                deliver(client, df.stream_id, reset_event(BODY_LIMIT_RESET))
+                client.mark_finished(df.stream_id)
+            elif df.data.len() > 0:
+                a.parts.push(df.data)
+                a.size = a.size + df.data.len()
+            if df.end_stream and accums.contains_key(df.stream_id):
                 deliver(client, df.stream_id, a.to_event())
                 accums.remove(df.stream_id)
         else:
@@ -1103,6 +1165,13 @@ fn writer_loop(outbound: Channel[Bytes], conn: Connection, closed: AtomicInt) ->
             closed.store(1)
             return 0
 
+# the failure a request reports for a reset of its stream: the reader's own
+# body-limit cancel, or a reset the peer sent.
+fn reset_failure(code: Int) -> String:
+    if code == BODY_LIMIT_RESET:
+        return RESPONSE_BODY_LIMIT
+    return "http2: stream was reset by the peer ({frames.error_name(code)})"
+
 # read stream events until end-of-stream, assembling the response. a closed
 # inbox (connection dropped) or a RST_STREAM fails the request. a header block
 # that arrives after the body has begun is the trailers.
@@ -1123,7 +1192,7 @@ fn assemble_response(inbox: Channel[StreamEvent]) -> Response!:
             # nothing to assemble across frames — return it directly.
             return Response(status_from(event.headers), event.headers, event.trailers, event.data)
         if event.kind == STREAM_RESET:
-            fail "http2: stream was reset by the peer ({frames.error_name(event.error_code)})"
+            fail reset_failure(event.error_code)
         if event.kind == STREAM_HEADERS:
             if not got_headers:
                 headers = event.headers
@@ -1169,7 +1238,7 @@ fn assemble_response_until(inbox: Channel[StreamEvent], deadline_ms: Int) -> Res
         if event.kind == STREAM_UNARY:
             return Response(status_from(event.headers), event.headers, event.trailers, event.data)
         if event.kind == STREAM_RESET:
-            fail "http2: stream was reset by the peer ({frames.error_name(event.error_code)})"
+            fail reset_failure(event.error_code)
         if event.kind == STREAM_HEADERS:
             if not got_headers:
                 headers = event.headers
@@ -1400,6 +1469,14 @@ impl Client:
         marked := self.unary.contains_key(stream_id)
         self.mu.unlock()
         return marked
+
+    # stop coalescing `stream_id`: later frames for it are delivered one at a
+    # time, which after a terminal event means they are dropped.
+    fn stop_unary(stream_id: Int):
+        self.mu.lock()
+        if self.unary.contains_key(stream_id):
+            self.unary.remove(stream_id)
+        self.mu.unlock()
 
     # remove a finished stream from the table and its flow-control state, then
     # record that the reader delivered `stream_id`'s terminal event, so a
@@ -1746,6 +1823,13 @@ impl Client:
         self.forget(stream_id)
         return attempt.ok
 
+    # the most a unary response body may hold, in place of MAX_RESPONSE_BODY.
+    # a request whose body passes it fails with RESPONSE_BODY_LIMIT and its
+    # stream is cancelled; the connection stays open. set it before requests
+    # are in flight.
+    pub fn set_max_response_body_bytes(limit: Int):
+        self.conn.max_response_body = limit
+
     # GET a path on the given authority over this client.
     pub fn get(authority: String, path: String) -> Response!:
         fields := request_fields("GET", self.conn.scheme(), authority, path, NO_FIELDS)
@@ -1915,6 +1999,24 @@ test "a RST_STREAM on our stream fails the response":
     conn := connection_from_frames(stream)
     assert(conn.read_response(1).is_err)
 
+test "the read loop refuses a body past the limit and cancels the stream":
+    block := header_block([hpack.header_field(":status", "200")])
+    stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("hello"), false), frames.data_frame(1, bytes.from_string_utf8("world"), true)])!
+    conn := connection_from_frames(stream)
+    conn.set_max_response_body_bytes(8)
+    result := conn.read_response(1)
+    assert(result.is_err)
+    assert_eq(result.err, RESPONSE_BODY_LIMIT)
+    # the consumed bytes are granted back on the connection and the stream is
+    # cancelled, so the connection can carry the next request.
+    reader := binary.reader(conn.sent)
+    update := frames.parse_window_update(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    assert_eq(update.stream_id, 0)
+    assert_eq(update.increment, 10)
+    rst := frames.parse_rst_stream(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
+    assert_eq(rst.stream_id, 1)
+    assert_eq(rst.error_code, frames.ERROR_CANCEL)
+
 # --- concurrent multiplexing tests ---
 
 # build a Client over an offline connection without spawning the reader/writer
@@ -2006,6 +2108,44 @@ test "the reader task replenishes flow control as body arrives":
     assert_eq(updates[0].increment, 5)
     assert_eq(updates[1].stream_id, 1)
     assert_eq(updates[1].increment, 5)
+
+test "the reader joins a unary body spread over several DATA frames":
+    block := header_block([hpack.header_field(":status", "200")])
+    stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("hello "), false), frames.data_frame(1, bytes.from_string_utf8("world"), false), frames.data_frame(1, bytes.from_string_utf8("!"), true)])!
+    client := offline_client(connection_from_frames(stream))
+    inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
+    client.streams.insert(1, inbox)
+    client.unary.insert(1, true)
+    client.active.push(1)
+    reader_loop(client)
+    r := assemble_response(inbox)!
+    assert_eq(r.status, 200)
+    assert_eq(r.body.to_string_utf8()!, "hello world!")
+
+test "the reader cancels a unary stream whose body passes the limit":
+    block := header_block([hpack.header_field(":status", "200")])
+    stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("hello"), false), frames.data_frame(1, bytes.from_string_utf8("world"), false), frames.data_frame(1, bytes.from_string_utf8("tail"), true)])!
+    conn := connection_from_frames(stream)
+    conn.set_max_response_body_bytes(8)
+    client := offline_client(conn)
+    inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
+    client.streams.insert(1, inbox)
+    client.unary.insert(1, true)
+    client.active.push(1)
+    reader_loop(client)
+    result := assemble_response(inbox)
+    assert(result.is_err)
+    assert_eq(result.err, RESPONSE_BODY_LIMIT)
+    mut cancelled := false
+    while true:
+        opt := client.outbound.recv()
+        if opt == none:
+            break
+        frame := frames.read_frame(binary.reader(opt.unwrap_or(bytes.empty())), frames.MAX_ALLOWED_FRAME_SIZE)!
+        if frame.header.frame_type == frames.FRAME_RST_STREAM:
+            rst := frames.parse_rst_stream(frame)!
+            cancelled = rst.stream_id == 1 and rst.error_code == frames.ERROR_CANCEL
+    assert(cancelled)
 
 test "assemble_response builds a response from stream events":
     inbox := Channel[StreamEvent](8)

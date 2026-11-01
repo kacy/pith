@@ -1,0 +1,232 @@
+# return_paths.pith: whether every path through a function returns
+#
+# a function that declares a return type has to leave every path by return
+# or fail. the emitter closes each body with a zero return, so a path that
+# fell off the end handed back 0, an empty list, none, a failed result with
+# no message, or a null struct whose first field read crashed. there is no
+# implicit none or ok: `-> T?` and `-> T!` follow the same rule.
+#
+# the walk is over the syntax alone, once per declaration, so generic bodies
+# and interface defaults are covered without waiting for an instance and
+# each is reported once. the checker reports what it finds as error E270
+# and the linter as a warning under the same code.
+
+from ast import Node, get_node
+
+## one path that falls off: the node to report at and what to say
+pub struct MissingReturn:
+    pub node: Int
+    pub message: String
+
+## the places in a top-level declaration (a function, an impl or interface
+## and their methods, a test) where a path reaches the end of a body that
+## has to return a value, including the closures inside them
+pub fn missing_return_sites(decl_idx: Int) -> List[MissingReturn]:
+    mut sites: List[MissingReturn] := []
+    mut node_idx := decl_idx
+    mut decl := get_node(decl_idx)
+    if decl.kind == "pub" and decl.children.len() > 0:
+        node_idx = decl.children[0]
+        decl = get_node(node_idx)
+    if decl.kind == "fn_decl":
+        function_sites(node_idx, decl, sites)
+    elif decl.kind == "impl_decl" or decl.kind == "interface_decl":
+        for child in decl.children:
+            mut member := get_node(child)
+            mut member_idx := child
+            if member.kind == "pub" and member.children.len() > 0:
+                member_idx = member.children[0]
+                member = get_node(member_idx)
+            if member.kind == "fn_decl":
+                function_sites(member_idx, member, sites)
+    elif decl.kind == "test_decl":
+        for child in decl.children:
+            closure_sites(child, sites)
+    return sites
+
+fn function_sites(decl_idx: Int, decl: Node, sites: List[MissingReturn]):
+    mut declares_value := false
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            declares_value = returns_node_names_a_value(cn)
+        elif cn.kind == "body":
+            closure_sites(child, sites)
+            if declares_value and cn.children.len() > 0:
+                block := get_node(cn.children[0])
+                if block.kind == "block" and body_always_returns(block) == false:
+                    # at the last statement, where the path falls off
+                    mut at := decl_idx
+                    if block.children.len() > 0:
+                        at = block.children[block.children.len() - 1]
+                    sites.push(MissingReturn(at, "'" + decl.value + "' declares a return type, but a path through its body reaches the end without returning a value"))
+
+fn returns_node_names_a_value(returns_node: Node) -> Bool:
+    if returns_node.children.len() == 0:
+        return false
+    return get_node(returns_node.children[0]).value != "Void"
+
+# a function body ending in a match returns the match's value: an inline
+# arm returns its expression (ir_function_tail_match), and a block arm has
+# to leave on its own
+fn body_always_returns(block: Node) -> Bool:
+    if block_always_leaves(block):
+        return true
+    if block.children.len() == 0:
+        return false
+    tail := get_node(block.children[block.children.len() - 1])
+    if tail.kind != "match_expr" or tail.children.len() < 2:
+        return false
+    mut skip := 1
+    for arm_idx in tail.children:
+        if skip > 0:
+            skip = skip - 1
+            continue
+        arm := get_node(arm_idx)
+        if arm.kind != "arm" or arm.children.len() < 2:
+            return false
+        body := get_node(arm.children[arm.children.len() - 1])
+        if body.kind == "block" and block_always_leaves(body) == false:
+            return false
+    return true
+
+# closures with a block body anywhere under the node: one that declares a
+# return type, or returns a value somewhere, has to return on every path
+fn closure_sites(idx: Int, sites: List[MissingReturn]):
+    node := get_node(idx)
+    for child in node.children:
+        closure_sites(child, sites)
+    if node.kind != "lambda" or node.children.len() == 0:
+        return
+    body := get_node(node.children[node.children.len() - 1])
+    if body.kind != "block":
+        return
+    mut declares_value := false
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            declares_value = returns_node_names_a_value(cn)
+    if declares_value == false:
+        declares_value = block_returns_a_value(body)
+    if declares_value and block_always_leaves(body) == false:
+        sites.push(MissingReturn(idx, "this closure returns a value, but a path through its body reaches the end without returning one"))
+
+# a `return <value>` in the block's own function, not in a closure inside it
+fn block_returns_a_value(node: Node) -> Bool:
+    if node.kind == "return":
+        return node.children.len() > 0
+    if node.kind == "lambda":
+        return false
+    for child in node.children:
+        if block_returns_a_value(get_node(child)):
+            return true
+    return false
+
+# whether control can never run past the end of the block: some statement
+# in it always leaves the function (what follows that one is unreachable)
+fn block_always_leaves(block: Node) -> Bool:
+    for child in block.children:
+        if statement_always_leaves(child):
+            return true
+    return false
+
+# return and fail leave. an if leaves when it has an else and every branch
+# leaves, a match when every arm does (the checker already holds matches to
+# exhaustive), `while true` when nothing in it breaks out, and a call to the
+# builtin exit never comes back. break and continue stay inside the
+# function, so they do not count.
+fn statement_always_leaves(idx: Int) -> Bool:
+    node := get_node(idx)
+    kind := node.kind
+    if kind == "return" or kind == "fail":
+        return true
+    if kind == "block":
+        return block_always_leaves(node)
+    if kind == "if_stmt":
+        return if_always_leaves(node)
+    if kind == "if_let":
+        if node.children.len() < 4:
+            return false
+        return statement_always_leaves(node.children[2]) and statement_always_leaves(node.children[3])
+    if kind == "match_expr":
+        return match_always_leaves(node)
+    if kind == "while_stmt":
+        if node.children.len() < 2:
+            return false
+        cond := get_node(node.children[0])
+        if cond.kind != "bool_lit" or cond.value != "true":
+            return false
+        return loop_body_breaks(get_node(node.children[1])) == false
+    if kind == "call":
+        if node.children.len() == 0:
+            return false
+        callee := get_node(node.children[0])
+        return callee.kind == "ident" and callee.value == "exit"
+    return false
+
+fn match_always_leaves(node: Node) -> Bool:
+    if node.children.len() < 2:
+        return false
+    mut skip := 1
+    for arm_idx in node.children:
+        if skip > 0:
+            skip = skip - 1
+            continue
+        arm := get_node(arm_idx)
+        if arm.kind != "arm" or arm.children.len() < 2:
+            return false
+        if arm_body_always_leaves(arm.children[arm.children.len() - 1]) == false:
+            return false
+    return true
+
+fn if_always_leaves(node: Node) -> Bool:
+    # children: [condition, then, elif..., else?]
+    if node.children.len() < 3:
+        return false
+    mut has_else := false
+    mut skip := 1
+    for child in node.children:
+        if skip > 0:
+            skip = skip - 1
+            continue
+        branch := get_node(child)
+        if branch.kind == "else":
+            has_else = true
+        # a then or else wraps its block; an elif puts its condition first
+        mut block_pos := 0
+        if branch.kind == "elif":
+            block_pos = 1
+        if branch.children.len() <= block_pos:
+            return false
+        if statement_always_leaves(branch_block_index(branch.children[block_pos])) == false:
+            return false
+    return has_else
+
+# an elif body may come wrapped in a then node
+fn branch_block_index(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.kind == "then" and node.children.len() > 0:
+        return node.children[0]
+    return idx
+
+# an arm's body is a block, or a body node wrapping the one expression of
+# an inline arm, which leaves only when it is a call to exit
+fn arm_body_always_leaves(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind == "body":
+        if node.children.len() == 0:
+            return false
+        return statement_always_leaves(node.children[0])
+    return statement_always_leaves(idx)
+
+# a break that ends this loop: one nested in an inner loop or a closure
+# ends that instead
+fn loop_body_breaks(node: Node) -> Bool:
+    if node.kind == "break":
+        return true
+    if node.kind == "while_stmt" or node.kind == "while_let" or node.kind == "for_stmt" or node.kind == "lambda":
+        return false
+    for child in node.children:
+        if loop_body_breaks(get_node(child)):
+            return true
+    return false

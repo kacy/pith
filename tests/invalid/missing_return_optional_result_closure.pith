@@ -1,0 +1,40 @@
+# an optional or result return type gets no implicit none or ok: the
+# fallen-off path used to return a zero none, or a failed result with no
+# error message. a closure that returns a value on one path must on all,
+# and methods and interface defaults are held to the same rule.
+fn find(xs: List[Int], want: Int) -> Int?:
+    for x in xs:
+        if x == want:
+            return x
+
+fn parse_flag(s: String) -> Bool!:
+    if s == "yes":
+        return true
+    if s == "no":
+        return false
+
+struct Counter:
+    pub n: Int
+
+impl Counter:
+    fn sign() -> Int:
+        if self.n > 0:
+            return 1
+
+interface Shape:
+    fn sides() -> Int:
+        if true:
+            return 0
+
+fn main():
+    pick := fn(x: Int) -> Int:
+        if x > 0:
+            return x
+    guess := fn(x: Int):
+        if x > 0:
+            return x
+    print(pick(1).to_string())
+    print(guess(1).to_string())
+    print(find([1], 1).unwrap_or(0).to_string())
+    print((parse_flag("yes") catch false).to_string())
+    print(Counter(1).sign().to_string())

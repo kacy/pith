@@ -27,6 +27,7 @@ from checker_builtins import register_builtin_types, builtin_scope_id, set_built
 from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration, take_interfaces_snapshot, restore_interfaces_snapshot
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner, MethodsSnapshot, take_methods_snapshot, restore_methods_snapshot
+from return_paths import missing_return_sites
 from std.collections import copy_list, copy_map
 
 # import alias -> module path, for `import x` and `import x as y`
@@ -1740,6 +1741,7 @@ fn check_declaration(node_idx: Int):
         check_implementation_declaration(node)
     elif node.kind == "test_decl":
         check_test_declaration(node)
+    check_missing_returns(node_idx)
 
 # ---------------------------------------------------------------
 # pass 2 — function checking
@@ -1785,6 +1787,14 @@ fn check_function_body(node_idx: Int, scope_id: Int):
 fn check_block_statement(node: Node, scope_id: Int):
     for child in node.children:
         check_statement(child, scope_id)
+
+# every path through a function that declares a return type has to leave
+# by return or fail (see return_paths). the emitter closes each body with a
+# zero return, so a path that fell off the end handed back 0, an empty list,
+# none, or a null struct whose first field read crashed.
+fn check_missing_returns(decl_idx: Int):
+    for site in missing_return_sites(decl_idx):
+        report_error_with_fix_at(site.node, "E270", site.message, "end every path with return or fail")
 
 # ---------------------------------------------------------------
 # pass 2 — impl checking

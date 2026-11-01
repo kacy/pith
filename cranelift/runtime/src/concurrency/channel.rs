@@ -373,11 +373,22 @@ struct TaggedChannel {
 /// its tag scrubbed, so a stale handle is rejected here like a garbage one.
 #[inline]
 unsafe fn channel_ref<'a>(handle: i64) -> Option<&'a TaggedChannel> {
+    channel_ref_for(handle, crate::quarantine::Op::Use)
+}
+
+/// `channel_ref`, naming what the caller does with the channel in a
+/// quarantine report.
+#[inline(always)]
+unsafe fn channel_ref_for<'a>(handle: i64, op: crate::quarantine::Op) -> Option<&'a TaggedChannel> {
     let ptr = handle as *const TaggedChannel;
     if !handle_registry::plausibly_aligned::<TaggedChannel>(ptr as *const ()) {
         return None;
     }
-    if (*ptr).magic != CHANNEL_MAGIC {
+    if !crate::quarantine::magic_is(
+        std::ptr::addr_of!((*ptr).magic),
+        CHANNEL_MAGIC,
+        op,
+    ) {
         return None;
     }
     Some(&*ptr)
@@ -433,6 +444,7 @@ unsafe fn release_count(t: &TaggedChannel) {
         return;
     }
     if prev == 0 {
+        crate::quarantine::over_release(crate::quarantine::Kind::Channel);
         // an over-release: put the count back rather than wrap. the same guard
         // every other kind's release has.
         t.refs.fetch_add(1, Ordering::Relaxed);
@@ -461,7 +473,10 @@ unsafe fn free_channel(p: *mut TaggedChannel) {
     let bytes = channel_bytes((*p).capacity as usize);
     // a stale handle must fail validation from here on
     (*p).magic = 0;
-    drop(Box::from_raw(p));
+    let magic = std::ptr::addr_of_mut!((*p).magic);
+    if !crate::quarantine::bury_box(p, magic, crate::quarantine::Kind::Channel) {
+        drop(Box::from_raw(p));
+    }
     crate::perf_count(&crate::PERF_CHANNEL_FREES, 1);
     crate::perf_count(&crate::PERF_CHANNEL_FREED_BYTES, bytes);
     #[cfg(test)]
@@ -659,7 +674,7 @@ pub extern "C" fn pith_channel_new(capacity: i64, payload_tag: i64) -> i64 {
 /// capture took a copy. Garbage handles are ignored, like every other kind.
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_retain(handle: i64) {
-    if let Some(t) = channel_ref(handle) {
+    if let Some(t) = channel_ref_for(handle, crate::quarantine::Op::Retain) {
         t.refs.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -668,7 +683,7 @@ pub unsafe extern "C" fn pith_channel_retain(handle: i64) {
 /// still queued by the payload tag.
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_release(handle: i64) {
-    if let Some(t) = channel_ref(handle) {
+    if let Some(t) = channel_ref_for(handle, crate::quarantine::Op::Release) {
         release_count(t);
     }
 }

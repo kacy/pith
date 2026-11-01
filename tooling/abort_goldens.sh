@@ -15,6 +15,10 @@
 # the consumer adds for the common case is proved to abort exactly as the
 # runtime call it replaced did.
 #
+# a case whose name starts with `quarantine_` is built and run with
+# PITH_QUARANTINE=1. those cases free a value and then read it from generated
+# code alone, which no sanitizer sees; the golden pins the report.
+#
 # regenerate with PITH_ABORT_GOLDEN_UPDATE=1 and read the diff before
 # committing: a golden that changes is a behaviour change.
 
@@ -60,10 +64,18 @@ compare() {
   fi
 }
 
+# the environment a case is built and run in
+case_env() {
+  case "$1" in
+    quarantine_*) echo "PITH_QUARANTINE=1" ;;
+    *) echo "PITH_QUARANTINE=0" ;;
+  esac
+}
+
 for f in "$CASES"/*.pith; do
   [ -e "$f" ] || continue
   name=$(basename "$f" .pith)
-  output=$(timeout 60 "$PITH" run "$f" 2>&1)
+  output=$(env "$(case_env "$name")" timeout 60 "$PITH" run "$f" 2>&1)
   status=$?
   compare "$name" "$(printf '%s\nexit: %d' "$output" "$status")"
 done
@@ -72,13 +84,13 @@ for f in "$CASES"/*.ir; do
   [ -e "$f" ] || continue
   name=$(basename "$f" .ir)
   exe="$tmpdir/$name"
-  if ! timeout 60 "$PITH" build-ir "$f" "$exe" > "$tmpdir/build.log" 2>&1; then
+  if ! env "$(case_env "$name")" timeout 60 "$PITH" build-ir "$f" "$exe" > "$tmpdir/build.log" 2>&1; then
     echo "FAIL $name (build-ir)"
     sed -e 's/^/  /' "$tmpdir/build.log" | head -n 20
     fail=$((fail + 1))
     continue
   fi
-  output=$(timeout 15 "$exe" 2>&1)
+  output=$(env "$(case_env "$name")" timeout 15 "$exe" 2>&1)
   status=$?
   compare "$name" "$(printf '%s\nexit: %d' "$output" "$status")"
 done

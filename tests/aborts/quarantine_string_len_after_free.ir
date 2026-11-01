@@ -1,0 +1,23 @@
+; the length of a string read after its last release, under
+; PITH_QUARANTINE=1. a default build reads the length from the string's
+; header inline; once the block is reused that header can belong to another
+; string and the read passes. quarantine keeps the block and its freed magic.
+string m0s0 "ab"
+string m0s1 "cd"
+string m0s2 "before:"
+func main 0 void
+strref 1 m0s0
+strref 2 m0s1
+concat 3 1 2
+call 4 pith_cstring_len int 1 3
+strref 5 m0s2
+call 6 int_to_string string 1 4
+concat 7 5 6
+call 8 pith_print_cstr unknown 1 7
+call 9 pith_cstring_release void 1 3
+call 10 pith_cstring_len int 1 3
+call 11 int_to_string string 1 10
+call 12 pith_print_cstr unknown 1 11
+iconst 13 0
+ret 13
+endfunc

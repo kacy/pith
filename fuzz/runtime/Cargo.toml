@@ -1,0 +1,23 @@
+# coverage-guided fuzz targets for the runtime's extern "C" entry points.
+# run.sh builds and runs them; the flags are at its top.
+#
+# the empty workspace table keeps this crate out of the root workspace, so
+# the runtime's own dependency set and lock file do not change.
+[package]
+name = "pith-runtime-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+pith-runtime = { path = "../../cranelift/runtime" }
+# the oracle for the runtime's own sha-256; already a runtime dependency.
+ring = "0.17.14"
+
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+panic = "abort"

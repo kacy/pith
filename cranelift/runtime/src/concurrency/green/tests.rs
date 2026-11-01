@@ -495,7 +495,7 @@ fn state_of(id: TaskId) -> u64 {
 // a task body that runs `body` and returns `value`.
 fn task_running(value: i64, body: impl FnOnce() + 'static) -> TaskCoroutine {
     TaskCoroutine::with_stack(
-        corosensei::stack::DefaultStack::new(STACK_SIZE).expect("stack"),
+        corosensei::stack::DefaultStack::new(DEFAULT_STACK_SIZE).expect("stack"),
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             let _finish = publish_yielder(yielder as *const TaskYielder);
             body();

@@ -81,6 +81,7 @@ pub mod string;
 pub mod string_list;
 pub mod substring;
 pub mod switches;
+pub(crate) mod sync;
 pub mod terminal;
 pub mod utility;
 pub mod zstd_codec;

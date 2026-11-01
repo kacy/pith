@@ -6,10 +6,31 @@ use super::*;
 /// owner worker. `Woken` and `Preempted` differ only in queue priority (see the
 /// `Yield` arm of `run_task`); `None` means the task parked and its block site
 /// owns waking it.
-pub(super) enum Requeue {
+#[cfg_attr(all(test, loom), derive(Debug, PartialEq))]
+pub(crate) enum Requeue {
     Woken(Option<usize>),
     Preempted(Option<usize>),
     None,
+}
+
+/// the word a just-suspended task moves to, and how it is re-enqueued. the
+/// word must read `Running`:
+///   - the preempt flag: overran its quantum -> `deferred` (lowest priority),
+///     so it yields to every other ready task on the worker.
+///   - the wake flag: a block-site wake landed while we were still Running
+///     (the wake/park race) -> `pinned`, resume promptly.
+///   - neither: a plain block -> Parked; the block site re-enqueues us.
+///
+/// pure, so the loom model of the park/wake word runs this same decision.
+pub(crate) fn after_yield(word: u64) -> (u64, Requeue) {
+    let ready = (word & S_OWNER_MASK) | S_READY;
+    if word & S_PREEMPT_PENDING != 0 {
+        (ready, Requeue::Preempted(word_owner(word)))
+    } else if word & S_WAKE_PENDING != 0 {
+        (ready, Requeue::Woken(word_owner(word)))
+    } else {
+        ((word & S_OWNER_MASK) | S_PARKED, Requeue::None)
+    }
 }
 
 /// record a task's completion and unblock everyone awaiting it.
@@ -199,14 +220,9 @@ pub(super) fn run_task(id: TaskId) {
             unsafe {
                 *block.coro.get() = Some(coro);
             }
-            // then decide how to re-enqueue on the scheduling word:
-            //   - the preempt flag: overran its quantum -> `deferred` (lowest
-            //     priority), so it yields to every other ready task on the worker.
-            //   - the wake flag: a block-site wake landed while we were still
-            //     Running (the wake/park race) -> `pinned`, resume promptly.
-            //   - neither: a plain block -> Parked; the block site re-enqueues us.
-            // a wake can land between the load and the CAS; the retry sees its
-            // flag, so it is never lost.
+            // then decide how to re-enqueue on the scheduling word (see
+            // `after_yield`). a wake can land between the load and the CAS;
+            // the retry sees its flag, so it is never lost.
             let mut word = block.word.load(AtomicOrdering::Acquire);
             let requeue = loop {
                 debug_assert_eq!(
@@ -214,13 +230,7 @@ pub(super) fn run_task(id: TaskId) {
                     S_RUNNING,
                     "a yielded task must still be Running (id {id})"
                 );
-                let (next, requeue) = if word & S_PREEMPT_PENDING != 0 {
-                    ((word & S_OWNER_MASK) | S_READY, Requeue::Preempted(word_owner(word)))
-                } else if word & S_WAKE_PENDING != 0 {
-                    ((word & S_OWNER_MASK) | S_READY, Requeue::Woken(word_owner(word)))
-                } else {
-                    ((word & S_OWNER_MASK) | S_PARKED, Requeue::None)
-                };
+                let (next, requeue) = after_yield(word);
                 match block.word.compare_exchange_weak(
                     word,
                     next,

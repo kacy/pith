@@ -1,0 +1,22 @@
+# a closure captures by value, so assigning a captured variable inside one
+# changed only the closure's copy: `c()` answered 1 every call and `n`
+# outside never moved. the checker rejects the assignment instead.
+mut total := 0
+
+fn main():
+    mut n := 0
+    c := fn() -> Int:
+        n = n + 1
+        return n
+    print("{c()} {c()} {n}")
+    mut hits := 0
+    d := fn(x: Int):
+        hits += x
+    d(2)
+    # a module global is not captured, and a local of the closure is its own
+    e := fn() -> Int:
+        total = total + 1
+        mut k := 0
+        k = k + 1
+        return k
+    print("{e()} {hits}")

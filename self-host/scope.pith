@@ -236,6 +236,32 @@ pub fn binding_decl_node_at(index: Int) -> Int:
         return binding_decl_nodes[index]
     return -1
 
+## true when `name`, read from `scope_id`, resolves past the scope `inner`
+## to a local of an enclosing function. a closure opens `inner` for its
+## parameters, so this is a capture: the closure holds a copy of the binding
+## made when it was created. a name bound at or below `inner`, or a module
+## name, is not one.
+pub fn binding_is_captured_past(scope_id: Int, name: String, inner: Int) -> Bool:
+    mut cur := scope_id
+    mut crossed := false
+    while cur >= 0:
+        entry := scope_entries[cur]
+        if binding_index.contains_key(binding_key(cur, name)):
+            if not crossed:
+                return false
+            # bound outside the closure: a local only if a function scope
+            # encloses the scope that binds it
+            mut up := cur
+            while up >= 0:
+                if scope_entries[up].is_function:
+                    return true
+                up = scope_entries[up].parent
+            return false
+        if cur == inner:
+            crossed = true
+        cur = entry.parent
+    return false
+
 ## true when an enclosing scope inside the SAME function already binds the
 ## name. the search stops at the function boundary, so shadowing a module-level
 ## name — which is ordinary, and everywhere — does not count, while shadowing

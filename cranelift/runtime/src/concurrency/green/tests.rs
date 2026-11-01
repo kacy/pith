@@ -605,3 +605,53 @@ fn a_stray_wake_leaves_no_duplicate_waitgroup_or_mutex_waiter() {
     assert_eq!(completion(b), Some(4));
     set_current_worker(None);
 }
+
+// a green task waits on a child with no pidfd to watch it by (macOS, linux
+// before 5.3). the wait must not hold the process registry across the
+// child's life: a reader draining the child's pipes, or a deadline's kill,
+// takes that lock, and a child stuck on a full pipe never exits.
+#[test]
+fn a_green_wait_without_a_pidfd_keeps_the_process_lock_free() {
+    use crate::process::*;
+    let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_current_worker(Some(0));
+    while take_pinned_on_0().is_some() {}
+    NO_PIDFD_FOR_TESTS.store(true, AtomicOrdering::Relaxed);
+
+    let cmd = std::ffi::CString::new("sleep 3").unwrap();
+    let handle = unsafe { pith_process_spawn(cmd.as_ptr()) };
+    assert_ne!(handle, 0, "sh should spawn");
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        let killed = pith_process_kill(handle);
+        (killed, start.elapsed())
+    });
+    let code = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let task_code = Arc::clone(&code);
+    let a = push_ready_task(task_running(0, move || {
+        task_code.store(pith_process_wait(handle), AtomicOrdering::Relaxed);
+    }));
+    run_task(a);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while completion(a).is_none() {
+        match take_pinned_on_0() {
+            Some(id) => run_task(id),
+            None => {
+                assert!(Instant::now() < deadline, "the wait never finished");
+                // as worker 0 between tasks: sweep its timers.
+                crate::netpoll::idle_wait(0, Duration::from_millis(5));
+            }
+        }
+    }
+    let (killed, kill_took) = killer.join().expect("killer panicked");
+    NO_PIDFD_FOR_TESTS.store(false, AtomicOrdering::Relaxed);
+    pith_process_close(handle);
+    set_current_worker(None);
+    assert!(
+        kill_took < Duration::from_secs(1),
+        "the kill waited {kill_took:?} on the registry lock"
+    );
+    assert_eq!(killed, 1, "the kill reached the running child");
+    assert_ne!(code.load(AtomicOrdering::Relaxed), 0, "a killed child is no clean exit");
+}

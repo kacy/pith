@@ -70,6 +70,7 @@ pub enum ListTypeTag {
     Closure,   // closure handle - needs retain/release
     Set,       // Set handle - needs retain/release
     Channel,   // channel handle - needs retain/release
+    Sync,      // Mutex, WaitGroup, Semaphore or AtomicInt handle - needs retain/release
 }
 
 pub const LIST_IMPL_ELEM_SIZE_OFFSET: i32 = std::mem::offset_of!(ListImpl, elem_size) as i32;
@@ -316,6 +317,7 @@ pub(crate) fn element_tag_from_code(code: i32) -> ListTypeTag {
         6 => ListTypeTag::Closure,
         7 => ListTypeTag::Set,
         8 => ListTypeTag::Channel,
+        9 => ListTypeTag::Sync,
         _ => ListTypeTag::Primitive,
     }
 }
@@ -335,6 +337,7 @@ pub(crate) unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::Closure => crate::runtime_core::pith_closure_retain(raw),
         ListTypeTag::Set => crate::collections::set::pith_set_retain_handle(raw),
         ListTypeTag::Channel => crate::concurrency::channel::pith_channel_retain(raw),
+        ListTypeTag::Sync => crate::concurrency::sync_handle::pith_sync_retain(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -374,6 +377,7 @@ pub(crate) unsafe fn release_element(tag: ListTypeTag, raw: i64) {
         ListTypeTag::Closure => crate::runtime_core::pith_closure_release(raw),
         ListTypeTag::Set => crate::collections::set::pith_set_release_handle(raw),
         ListTypeTag::Channel => crate::concurrency::channel::pith_channel_release(raw),
+        ListTypeTag::Sync => crate::concurrency::sync_handle::pith_sync_release(raw),
         ListTypeTag::Primitive => {}
     }
 }
@@ -509,6 +513,13 @@ pub unsafe extern "C" fn pith_list_new_set() -> PithList {
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_channel() -> PithList {
     pith_list_new(8, 8)
+}
+
+/// a list of sync primitive handles (Mutex, WaitGroup, Semaphore, AtomicInt)
+/// owns one count per element, like a list of channels.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_new_sync() -> PithList {
+    pith_list_new(8, 9)
 }
 
 #[no_mangle]

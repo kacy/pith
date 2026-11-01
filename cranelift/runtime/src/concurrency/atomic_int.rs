@@ -5,35 +5,35 @@
 //! (a cancellation code, a shared counter), so the value stays coherent
 //! across threads while a plain collection would race.
 
-use crate::handle_registry;
+use crate::concurrency::sync_handle::{self, SyncHeader, ATOMIC_INT_MAGIC};
 use std::sync::atomic::{AtomicI64, Ordering};
-
-/// Magic word for a cell ("PATM").
-const CELL_MAGIC: u64 = 0x5041_544d;
 
 /// A cell is validated by its magic word, the way lists and maps are, rather
 /// than by a registry lookup. The registry took a lock on every load and
-/// store, which made the one primitive meant to avoid a lock take one.
-/// Cells are never freed, so a valid handle always reads its magic.
+/// store, which made the one primitive meant to avoid a lock take one. A
+/// cell is owned by its count (see `sync_handle`) and freed at the last
+/// release, which scrubs the magic.
 #[repr(C)]
-struct Cell {
-    magic: u64,
+pub struct Cell {
+    header: SyncHeader,
     value: AtomicI64,
 }
 
 unsafe fn cell_ref<'a>(handle: i64) -> Option<&'a AtomicI64> {
-    let ptr = handle as *const ();
-    if !handle_registry::plausibly_aligned::<Cell>(ptr) || (*(ptr as *const Cell)).magic != CELL_MAGIC {
-        return None;
-    }
-    Some(&(*(ptr as *const Cell)).value)
+    sync_handle::header_of(handle as *const (), ATOMIC_INT_MAGIC, crate::quarantine::Op::Use)?;
+    Some(&(*(handle as *const Cell)).value)
+}
+
+/// the last count is gone.
+pub(crate) unsafe fn free_cell(p: *mut Cell) {
+    sync_handle::free_box(p);
 }
 
 /// Create an atomic cell holding `initial`.
 #[no_mangle]
 pub extern "C" fn pith_atomic_int_new(initial: i64) -> i64 {
     let ptr = Box::into_raw(Box::new(Cell {
-        magic: CELL_MAGIC,
+        header: SyncHeader::new(ATOMIC_INT_MAGIC),
         value: AtomicI64::new(initial),
     }));
     ptr as i64

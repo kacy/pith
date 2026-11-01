@@ -513,6 +513,9 @@ const CLOSURE_TAG_WEAK: u8 = 8;
 // a captured channel handle: the closure holds one of the channel's owner
 // counts, released like any other captured heap value.
 const CLOSURE_TAG_CHANNEL: u8 = 9;
+// a captured Mutex, WaitGroup, Semaphore or AtomicInt handle: one owner
+// count, like a channel's.
+const CLOSURE_TAG_SYNC: u8 = 10;
 
 // closures validate the same way strings and structs do: a magic word
 // at the front of the allocation, read without a lock. `#[repr(C)]`
@@ -744,6 +747,7 @@ unsafe fn release_captured_value(value: i64, tag: u8) {
         CLOSURE_TAG_CLOSURE => pith_closure_release(value),
         CLOSURE_TAG_WEAK => pith_struct_weak_release(value),
         CLOSURE_TAG_CHANNEL => crate::concurrency::channel::pith_channel_release(value),
+        CLOSURE_TAG_SYNC => crate::concurrency::sync_handle::pith_sync_release(value),
         _ => {}
     }
 }

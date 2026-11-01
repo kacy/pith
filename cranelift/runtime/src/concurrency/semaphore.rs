@@ -26,9 +26,10 @@
 //! [`channel`]: crate::concurrency::channel
 
 use crate::concurrency::green;
+use crate::concurrency::sync_handle::{self, BlockCount, SyncHeader, SEMAPHORE_MAGIC};
 use crate::handle_registry::{self, HandleKind};
 use std::collections::VecDeque;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// Semaphore state
 pub struct SemaphoreState {
@@ -41,14 +42,30 @@ pub struct SemaphoreState {
     green_waiters: VecDeque<usize>,
 }
 
+/// a semaphore is one allocation owned by its count (see `sync_handle`),
+/// freed at the last release.
+#[repr(C)]
+pub struct PithSemaphore {
+    header: SyncHeader,
+    lock: Mutex<SemaphoreState>,
+    cvar: Condvar,
+}
+
 /// Opaque handle to a Pith Semaphore
-pub type PithSemaphoreHandle = Arc<(Mutex<SemaphoreState>, Condvar)>;
+pub type PithSemaphoreHandle = PithSemaphore;
 
 unsafe fn semaphore_ref<'a>(handle: *mut PithSemaphoreHandle) -> Option<&'a PithSemaphoreHandle> {
     if !handle_registry::is_valid(handle as *const (), HandleKind::Semaphore) {
         return None;
     }
     Some(&*handle)
+}
+
+/// the last count is gone, so no task waits: a waiter holds a count of its
+/// own.
+pub(crate) unsafe fn free_semaphore(p: *mut PithSemaphore) {
+    handle_registry::unregister(p as *const (), HandleKind::Semaphore);
+    sync_handle::free_box(p);
 }
 
 fn lock_state(lock: &Mutex<SemaphoreState>) -> MutexGuard<'_, SemaphoreState> {
@@ -122,8 +139,11 @@ pub extern "C" fn pith_semaphore_new(initial: i64) -> *mut PithSemaphoreHandle {
         max: initial.max(0) as usize,
         green_waiters: VecDeque::new(),
     };
-    let sem = Arc::new((Mutex::new(state), Condvar::new()));
-    let ptr = Box::into_raw(Box::new(sem));
+    let ptr = Box::into_raw(Box::new(PithSemaphore {
+        header: SyncHeader::new(SEMAPHORE_MAGIC),
+        lock: Mutex::new(state),
+        cvar: Condvar::new(),
+    }));
     handle_registry::register(ptr as *const (), HandleKind::Semaphore);
     ptr
 }
@@ -139,13 +159,16 @@ pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle
     let Some(sem) = semaphore_ref(handle) else {
         return;
     };
-    let (lock, cvar) = &**sem;
+    // declared before the guard so its count is given back after the guard
+    // is dropped.
+    let block = BlockCount::new(&sem.header);
     // computed once: whether we run inside a green task does not change across a
     // suspend/resume. None means an os-thread caller, which condvar-waits.
     let green_task = green::current_task();
-    let mut guard = lock_state(lock);
+    let mut guard = lock_state(&sem.lock);
     while guard.count == 0 {
-        guard = block_on_acquire(lock, cvar, guard, green_task);
+        block.take();
+        guard = block_on_acquire(&sem.lock, &sem.cvar, guard, green_task);
     }
     guard.count -= 1;
 }
@@ -159,14 +182,13 @@ pub unsafe extern "C" fn pith_semaphore_release(handle: *mut PithSemaphoreHandle
     let Some(sem) = semaphore_ref(handle) else {
         return;
     };
-    let (lock, cvar) = &**sem;
-    let mut state = lock_state(lock);
+    let mut state = lock_state(&sem.lock);
     if state.count < state.max {
         state.count += 1;
     }
     // one freed permit wakes one waiter: an os-thread waiter via notify_one, and
     // a single parked green task. see the module note on one-waiter-per-permit.
-    cvar.notify_one();
+    sem.cvar.notify_one();
     wake_one_green_waiter(&mut state);
 }
 

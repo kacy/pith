@@ -20,8 +20,9 @@
 //! [`channel`]: crate::concurrency::channel
 
 use crate::concurrency::green;
+use crate::concurrency::sync_handle::{self, BlockCount, SyncHeader, WAITGROUP_MAGIC};
 use crate::handle_registry::{self, HandleKind};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// WaitGroup state
 pub struct WaitGroupState {
@@ -32,14 +33,30 @@ pub struct WaitGroupState {
     green_waiters: Vec<usize>,
 }
 
+/// a waitgroup is one allocation owned by its count (see `sync_handle`),
+/// freed at the last release.
+#[repr(C)]
+pub struct PithWaitGroup {
+    header: SyncHeader,
+    lock: Mutex<WaitGroupState>,
+    cvar: Condvar,
+}
+
 /// Opaque handle to a Pith WaitGroup
-pub type PithWaitGroupHandle = Arc<(Mutex<WaitGroupState>, Condvar)>;
+pub type PithWaitGroupHandle = PithWaitGroup;
 
 unsafe fn waitgroup_ref<'a>(handle: *mut PithWaitGroupHandle) -> Option<&'a PithWaitGroupHandle> {
     if !handle_registry::is_valid(handle as *const (), HandleKind::WaitGroup) {
         return None;
     }
     Some(&*handle)
+}
+
+/// the last count is gone, so no task waits: a waiter holds a count of its
+/// own.
+pub(crate) unsafe fn free_waitgroup(p: *mut PithWaitGroup) {
+    handle_registry::unregister(p as *const (), HandleKind::WaitGroup);
+    sync_handle::free_box(p);
 }
 
 fn lock_state(lock: &Mutex<WaitGroupState>) -> MutexGuard<'_, WaitGroupState> {
@@ -108,8 +125,11 @@ pub extern "C" fn pith_waitgroup_new() -> *mut PithWaitGroupHandle {
         count: 0,
         green_waiters: Vec::new(),
     };
-    let wg = Arc::new((Mutex::new(state), Condvar::new()));
-    let ptr = Box::into_raw(Box::new(wg));
+    let ptr = Box::into_raw(Box::new(PithWaitGroup {
+        header: SyncHeader::new(WAITGROUP_MAGIC),
+        lock: Mutex::new(state),
+        cvar: Condvar::new(),
+    }));
     handle_registry::register(ptr as *const (), HandleKind::WaitGroup);
     ptr
 }
@@ -123,8 +143,7 @@ pub unsafe extern "C" fn pith_waitgroup_add(handle: *mut PithWaitGroupHandle, de
     let Some(wg) = waitgroup_ref(handle) else {
         return;
     };
-    let (lock, _) = &**wg;
-    let mut state = lock_state(lock);
+    let mut state = lock_state(&wg.lock);
     state.count = (state.count as i64 + delta).max(0) as usize;
 }
 
@@ -137,13 +156,12 @@ pub unsafe extern "C" fn pith_waitgroup_done(handle: *mut PithWaitGroupHandle) {
     let Some(wg) = waitgroup_ref(handle) else {
         return;
     };
-    let (lock, cvar) = &**wg;
-    let mut state = lock_state(lock);
+    let mut state = lock_state(&wg.lock);
     if state.count > 0 {
         state.count -= 1;
     }
     if state.count == 0 {
-        cvar.notify_all();
+        wg.cvar.notify_all();
         wake_green_waiters(&mut state);
     }
 }
@@ -157,20 +175,23 @@ pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
     let Some(wg) = waitgroup_ref(handle) else {
         return;
     };
-    let (lock, cvar) = &**wg;
+    // declared before the guard so its count is given back after the guard
+    // is dropped.
+    let block = BlockCount::new(&wg.header);
     // computed once: whether we run inside a green task does not change across a
     // suspend/resume. None means an os-thread caller, which condvar-waits.
     let green_task = green::current_task();
-    let mut guard = lock_state(lock);
+    let mut guard = lock_state(&wg.lock);
     while guard.count > 0 {
-        guard = block_on_wait(lock, cvar, guard, green_task);
+        block.take();
+        guard = block_on_wait(&wg.lock, &wg.cvar, guard, green_task);
     }
 }
 
 /// how many green waiter entries the waitgroup lists.
 #[cfg(test)]
 pub(crate) unsafe fn green_waiters_for_tests(handle: *mut PithWaitGroupHandle) -> usize {
-    waitgroup_ref(handle).map_or(0, |wg| lock_state(&wg.0).green_waiters.len())
+    waitgroup_ref(handle).map_or(0, |wg| lock_state(&wg.lock).green_waiters.len())
 }
 
 #[cfg(test)]

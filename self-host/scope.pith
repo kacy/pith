@@ -157,16 +157,16 @@ pub fn binding_visible_from(scope_id: Int, name: String, module_path: String) ->
     return false
 
 ## true when the module declared a top-level binding of the name.
-## the root scope is always id 0 (first created after reset); builtin
-## registrations carry an empty tag and count as declared everywhere.
+## the root scope is always id 0 (first created after reset). a builtin
+## carries an empty tag and does not count: no module declares it, so
+## `from std.os import args` names nothing even though `args` resolves.
 pub fn module_declared_top_level(name: String, module_path: String) -> Bool:
     key := binding_key(0, name)
     if binding_index.contains_key(key):
         entries := binding_index[key]
         mut i := entries.len() - 1
         while i >= 0:
-            tag := binding_module_tags[entries[i]]
-            if tag == "" or tag == module_path:
+            if binding_module_tags[entries[i]] == module_path:
                 return true
             i = i - 1
     return false

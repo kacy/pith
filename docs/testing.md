@@ -404,6 +404,13 @@ other kinds of test, all wired through the `Makefile`:
   workflow runs the asan gate. the gate builds with `PITH_SANITIZE`, so the
   field and global accesses generated code makes are checked too. details are
   in `tooling/sanitize.sh`.
+- **the nightly hunt** — the same workflow spends about two hours generating
+  programs with pithgen from a fresh seed range each night and running them
+  against the asan runtime (`tooling/pithgen_hunt.sh`). each distinct
+  signature it finds is filed as an issue labelled `pithgen`, with the seed
+  that reproduces it, the report and the program; a signature that already
+  has an open issue gets a comment instead. the findings are also kept as a
+  workflow artifact for 30 days.
 - **leak growth** — `make leak-check` runs the cases under `tests/leaks/` at two
   round counts and fails when memory grew between them. this is the other half
   of `memcheck`, which has its leak check switched off on purpose.

@@ -5,7 +5,9 @@
 # against it, and fails on any report.
 #
 #   tooling/sanitize.sh asan            # corpus and std tests, both backends
-#   tooling/sanitize.sh tsan corpus     # corpus only, os threads
+#   tooling/sanitize.sh tsan corpus     # corpus only
+#   tooling/sanitize.sh asan setup      # only build the runtime and the
+#                                       # linker wrapper, and print both paths
 #
 # what it sees: the runtime is instrumented, and with PITH_SANITIZE set the
 # compiler reports each field, optional payload and global that generated
@@ -34,7 +36,7 @@ case "$kind" in
     sanitizer=thread
     ;;
   *)
-    echo "usage: tooling/sanitize.sh asan|tsan [corpus|std|all]" >&2
+    echo "usage: tooling/sanitize.sh asan|tsan [corpus|std|all|setup]" >&2
     exit 2
     ;;
 esac
@@ -148,6 +150,12 @@ cat >"$wrapper" <<EOF
 exec \${PITH_SANITIZE_CC:-cc} "\$@" -Wl,--whole-archive "$rt" -Wl,--no-whole-archive -lpthread -ldl -lm -lrt -lstdc++
 EOF
 chmod +x "$wrapper"
+
+if [ "$scope" = setup ]; then
+  echo "PITH_RUNTIME_LIB=$PWD/$runtime_lib"
+  echo "CC=$PWD/$wrapper"
+  exit 0
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

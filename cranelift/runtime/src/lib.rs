@@ -39,6 +39,21 @@ macro_rules! runtime_fatal {
     }};
 }
 
+/// The acquire half of a last release: `fetch_sub(1, Release)` saw the final
+/// count, and this orders every earlier holder's writes before the free.
+///
+/// ThreadSanitizer does not model a standalone fence, so under it this is an
+/// acquire load of the count instead, which pairs with the same release
+/// decrements and which TSan does see. Every other build gets the fence.
+macro_rules! acquire_last_count {
+    ($count:expr) => {{
+        #[cfg(not(pith_tsan))]
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        #[cfg(pith_tsan)]
+        let _ = $count.load(std::sync::atomic::Ordering::Acquire);
+    }};
+}
+
 pub mod alloc_sites;
 pub mod argon2;
 pub mod blake2b;

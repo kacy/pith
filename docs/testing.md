@@ -482,6 +482,61 @@ else. then list it in the `cases` array in `tooling/leak_check.sh`. keep the rou
 body allocation-heavy and free of anything that is supposed to grow: a collection
 that keeps filling up looks exactly like a leak.
 
+## sanitizers
+
+threadsanitizer and addresssanitizer both run pith programs on either backend.
+neither is part of the gate. they need a runtime built with the sanitizer, and
+the stable toolchain accepts `-Zsanitizer` only with `RUSTC_BOOTSTRAP=1`:
+
+```sh
+RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zsanitizer=thread -Cforce-frame-pointers=yes" \
+  cargo build --release -p pith-runtime -Zbuild-std \
+  --target x86_64-unknown-linux-gnu --target-dir target/tsan
+```
+
+for asan, use `-Zsanitizer=address` and leave out `-Zbuild-std`. a program
+is then built against that archive, linked through a `CC` that appends
+rustc's own sanitizer runtime (`librustc-stable_rt.tsan.a` or `.asan.a` from
+the toolchain's `lib/rustlib/<target>/lib`, inside `--whole-archive`, plus
+`-lpthread -ldl -lm -lrt -lstdc++`):
+
+```sh
+CC=cc-tsan PITH_RUNTIME_LIB=target/tsan/x86_64-unknown-linux-gnu/release/libpith_runtime.a \
+  PITH_SANITIZE=thread PITH_KEEP_SYMBOLS=1 ./target/release/pith build prog.pith
+PITH_STRUCT_FREELIST=0 ./prog
+```
+
+`pith test` honors the same variables. `PITH_STRUCT_FREELIST=0` matters for
+asan: a freed struct goes back on the freelist instead of to `free`, so a
+use after free reads a recycled struct and asan sees nothing.
+
+a sanitized build differs from a plain one in three places:
+
+- the runtime's build script turns `-Zsanitizer=thread` into `cfg(pith_tsan)`
+  and `address` into `cfg(pith_asan)`, because `cfg(sanitize)` itself is
+  unstable even with `RUSTC_BOOTSTRAP`. under `pith_tsan`, a last release
+  pairs with the earlier releases through an acquire load of the count rather
+  than `fence(Acquire)`, which tsan does not model. without it, every free on
+  one thread of an object last used on another came out as a data race.
+- the green backend tells both sanitizers about each coroutine stack switch
+  (`concurrency/green/fiber.rs`): asan through
+  `__sanitizer_start_switch_fiber` / `__sanitizer_finish_switch_fiber` on both
+  sides of a switch, tsan through one fiber per task that the worker switches
+  to before a resume and away from after it. a plain build compiles none of
+  this.
+- `PITH_SANITIZE=thread` or `address` makes the compiler report every struct
+  field, optional payload and global that generated code reads or writes to
+  the sanitizer (`__tsan_read8` / `__tsan_write8`, `__asan_load8` /
+  `__asan_store8`), and drops the inline fast paths for list, bytes and string
+  reads in favor of the runtime calls they stand in for. without it, a race or
+  a freed read in generated code is invisible. retains and releases are always
+  runtime calls, so the counts need nothing extra.
+
+tsan reports a `thread leak` for a task on the os-thread backend whose handle
+is still bound and never awaited when the process exits: only a discarded
+`spawn` is detached by itself. `TSAN_OPTIONS=report_thread_leaks=0` turns those
+off.
+
 ## on the roadmap
 
 one thing is not here yet: benchmarks. tagging, machine-readable output and

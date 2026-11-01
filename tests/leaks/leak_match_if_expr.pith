@@ -1,0 +1,105 @@
+# a match or if expression whose branches build fresh values used to be
+# classified as a borrow, so whatever consumed it (a return, a binding, an
+# argument, a field or a list element) retained a value that already carried
+# its own count: one string, list or struct leaked per evaluation (#1151).
+# where a branch is a borrow, it now takes a count on its way into the
+# expression's temp, so the mixed shapes hand over an owned value as well.
+# one SHAPE per registration in tooling/leak_check.sh.
+import std.env as env
+import leakprobe as probe
+
+struct Holder:
+    label: String
+
+fn mkl(i: Int) -> List[Int]:
+    return [i, i + 1, i + 2]
+
+fn take(s: String) -> Int:
+    return s.len()
+
+# shape 1: the issue's reproducer, a returned match over a string subject,
+# and a returned if.
+fn arm_fresh(i: Int) -> String:
+    s := "s" + i.to_string()
+    return match s:
+        "x" => "x"
+        m => "got " + m
+
+fn branch_fresh(i: Int) -> String:
+    return if i % 2 == 0: "even " + i.to_string() else: "odd " + i.to_string()
+
+# shape 2: a bound match over fresh strings.
+fn bound_match(i: Int) -> Int:
+    q := match i % 3:
+        0 => "a-" + i.to_string()
+        _ => "b-" + i.to_string()
+    return q.len()
+
+# shape 3: a bound if over fresh strings.
+fn bound_if(i: Int) -> Int:
+    q := if i % 3 == 0: "a-" + i.to_string() else: "b-" + i.to_string()
+    return q.len()
+
+# shape 4: a bound match over fresh lists.
+fn bound_list(i: Int) -> Int:
+    q := match i % 3:
+        0 => mkl(i)
+        _ => mkl(i + 1)
+    return q.len()
+
+# shape 5: a fresh string beside a borrowed one.
+fn mixed_string(i: Int, p: String) -> Int:
+    q := if i % 2 == 0: "a-" + i.to_string() else: p
+    return q.len()
+
+# shape 6: a fresh list beside a borrowed one.
+fn mixed_list(i: Int, l: List[Int]) -> Int:
+    q := match i % 2:
+        0 => mkl(i)
+        _ => l
+    return q.len()
+
+# shape 7: a fresh struct beside a borrowed one.
+fn mixed_struct(i: Int, h: Holder) -> Int:
+    q := if i % 2 == 0: Holder(label: "n" + i.to_string()) else: h
+    return q.label.len()
+
+# shape 8: an argument, a field initializer and a list element.
+fn consumers(i: Int, p: String) -> Int:
+    a := take(if i % 2 == 0: "a" + i.to_string() else: p)
+    h := Holder(label: if i % 2 == 0: "b" + i.to_string() else: p)
+    l := [if i % 2 == 0: "c" + i.to_string() else: p]
+    return a + h.label.len() + l.len()
+
+fn churn(shape: Int, i: Int, p: String, l: List[Int], h: Holder) -> Int:
+    if shape == 1:
+        return arm_fresh(i).len() + branch_fresh(i).len()
+    if shape == 2:
+        return bound_match(i)
+    if shape == 3:
+        return bound_if(i)
+    if shape == 4:
+        return bound_list(i)
+    if shape == 5:
+        return mixed_string(i, p)
+    if shape == 6:
+        return mixed_list(i, l)
+    if shape == 7:
+        return mixed_struct(i, h)
+    return consumers(i, p)
+
+fn main():
+    shape := env.int_or("SHAPE", 1)
+    p := "param-" + "string"
+    l := [7, 8, 9]
+    h := Holder(label: "he" + "ld")
+    n := probe.rounds()
+    mut i := 0
+    mut c := 0
+    while i < n:
+        c = c + churn(shape, i, p, l, h)
+        i = i + 1
+    if c == 0 - 1:
+        print("x")
+    kb := probe.peak_kb()
+    print("{kb}")

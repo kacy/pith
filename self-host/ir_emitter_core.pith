@@ -58,6 +58,7 @@ from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_fun
 # shared helpers: ast shapes, captures, results, optionals, literals
 from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_child, ir_is_binding_kind, ir_binding_name
 from ir_capture import ir_capture_find_free_vars
+from return_paths import statement_always_leaves
 from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_decode_result_value, ir_emit_result_flag_field, ir_emit_result_error_message, ir_emit_result_value_field, ir_result_field_kind
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_optional_value_as, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
@@ -1215,7 +1216,112 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # field has a kind to retain; a plain-value field is not rc either way.
     if node.kind == "field_access" and node.children.len() > 0 and ir_field_receiver_is_owned_temp(node.children[0]):
         return false
+    if node.kind == "match_expr" or node.kind == "if_expr":
+        return not ir_branch_values_are_owned(idx)
     return true
+
+# a match or if expression stores each branch's value into one temp, and the
+# consumer reads that temp. a branch value lands as is, except that where the
+# whole has a kind in ir_branch_retain_kind a borrowed branch is retained on
+# the way in (ir_emit_owned_branch_value), so every path leaves the temp
+# holding a count of its own. the expression is owned when every branch hands
+# over an owned value or is retained that way. otherwise it is a borrow, which
+# the consumer retains: a leak on the owned branches rather than a value
+# released twice on a borrowed one.
+#
+# a block arm stores nothing: one that always leaves the function never
+# reaches the consumer and is skipped, and one that can fall through makes the
+# whole a borrow. so does a branch of another type than the whole (a void call
+# beside a String, which the checker accepts), since a retain under the
+# whole's kind would be the wrong one for it. a branch widened to an optional
+# is built into a fresh Some that owns its payload
+# (ir_emit_optional_for_target), so it is owned.
+fn ir_branch_values_are_owned(idx: Int) -> Bool:
+    values := ir_branch_value_nodes(idx)
+    if values.contains(0 - 1):
+        return false
+    want := ir_infer_type(idx)
+    retains := ir_branch_retain_kind(idx).len() > 0
+    for v in values:
+        if not c_argument_widens_to_optional(v):
+            if ir_infer_type(v) != want:
+                return false
+            if not retains and ir_expr_is_borrowed(v):
+                return false
+    return true
+
+# the rc kind a borrowed branch of the match or if expression at idx is
+# retained under as it lands in the temp, or "" where branches land as is. the
+# kinds are the ones every consumer retains a borrow of and releases an owned
+# value of the same way, so a branch retained here reads like a call result.
+# an optional or tuple whole is left out: its shells follow their own rules.
+fn ir_branch_retain_kind(idx: Int) -> String:
+    kind := ir_rc_kind(ir_infer_type(idx))
+    if kind == "string" or kind == "list" or kind == "map" or kind == "set" or kind == "bytes":
+        return kind
+    if kind == "struct" or kind == "closure" or kind == "channel":
+        return kind
+    return ""
+
+# the value nodes of a match or if expression's branches, skipping block arms
+# that always leave the function. -1 stands for a branch whose value cannot be
+# named (a block arm that can fall through, or a malformed node).
+fn ir_branch_value_nodes(idx: Int) -> List[Int]:
+    node := get_node(idx)
+    mut values: List[Int] := []
+    if node.kind == "if_expr":
+        if node.children.len() < 3:
+            return [0 - 1]
+        values.push(node.children[1])
+        mut i := 2
+        while i < node.children.len() - 1:
+            branch := get_node(node.children[i])
+            if branch.children.len() < 2:
+                return [0 - 1]
+            values.push(branch.children[1])
+            i = i + 1
+        values.push(node.children[node.children.len() - 1])
+        return values
+    if node.children.len() < 2:
+        return [0 - 1]
+    mut i := 1
+    while i < node.children.len():
+        arm := get_node(node.children[i])
+        mut body_idx := 0 - 1
+        mut j := 1
+        while j < arm.children.len():
+            if node_kind(arm.children[j]) != "guard":
+                body_idx = arm.children[j]
+            j = j + 1
+        if body_idx < 0:
+            return [0 - 1]
+        body := get_node(body_idx)
+        if body.kind == "block":
+            if not statement_always_leaves(body_idx):
+                return [0 - 1]
+        elif body.kind == "body":
+            if body.children.len() == 0:
+                return [0 - 1]
+            values.push(body.children[0])
+        else:
+            values.push(body_idx)
+        i = i + 1
+    return values
+
+# emit one branch value of a match or if expression whose branches all land
+# owned (see ir_branch_values_are_owned): a borrowed one takes its own count.
+fn ir_emit_owned_branch_value(expr_idx: Int) -> Int:
+    r := ir_emit_call_arg(expr_idx)
+    if not c_argument_widens_to_optional(expr_idx) and ir_expr_is_borrowed(expr_idx):
+        ir_rc_retain_reg(r, ir_rc_kind(ir_infer_type(expr_idx)))
+    return r
+
+# whether the branches of the match or if expression at idx are emitted
+# through ir_emit_owned_branch_value. this and ir_expr_is_borrowed's answer
+# for the expression come from the same two checks, so a retain is emitted
+# exactly where the consumer is told the value is owned.
+fn ir_branches_take_counts(idx: Int) -> Bool:
+    return ir_branch_retain_kind(idx).len() > 0 and ir_branch_values_are_owned(idx)
 
 # true when a field-access node is really a payload-free variant
 # construction: the receiver names a boxed enum (directly, or through a
@@ -6882,6 +6988,8 @@ fn ir_value_extraction_is_uncounted(recv_idx: Int) -> Bool:
 fn ir_field_receiver_kind_can_own(kind: String) -> Bool:
     if kind == "call" or kind == "method_call" or kind == "struct_init":
         return true
+    if kind == "match_expr" or kind == "if_expr":
+        return true
     if kind == "catch_expr" or kind == "catch_block" or kind == "field_access":
         return true
     return kind == "try" or kind == "try_expr"
@@ -9851,9 +9959,13 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         # an arm the checker settled on an optional (`none => none; x => x`)
         # is recorded as widening, and the Some is built here rather than the
         # bare value landing in a slot every reader takes for a shell.
-        return ir_emit_match_expr(idx, node, ir_emit_call_arg, ir_block, subj_owned)
+        if ir_branches_take_counts(idx):
+            return ir_emit_match_expr(idx, node, ir_emit_call_arg, ir_emit_owned_branch_value, ir_block, subj_owned)
+        return ir_emit_match_expr(idx, node, ir_emit_call_arg, ir_emit_call_arg, ir_block, subj_owned)
     if kind == "if_expr":
-        return ir_emit_if_expr(node, ir_emit_call_arg)
+        if ir_branches_take_counts(idx):
+            return ir_emit_if_expr(node, ir_emit_call_arg, ir_emit_owned_branch_value)
+        return ir_emit_if_expr(node, ir_emit_call_arg, ir_emit_call_arg)
     if kind == "method_call":
         return ir_emit_method_call(idx)
 

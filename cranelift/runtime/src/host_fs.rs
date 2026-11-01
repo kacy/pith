@@ -306,6 +306,78 @@ fn append_file_at(path: &str, content: &[u8]) -> bool {
     }
 }
 
+/// the errno behind a failed call, or -1 when the error carries none.
+fn errno_of(err: std::io::Error) -> i64 {
+    err.raw_os_error().map_or(-1, i64::from)
+}
+
+/// create a file that must not exist yet and write `content` to it. the open
+/// is `O_CREAT|O_EXCL|O_NOFOLLOW`, so an existing file or a symlink planted at
+/// the name fails with `EEXIST` instead of being followed or truncated, and the
+/// file starts with `mode` (less the umask). returns 0 or the errno. a write
+/// that fails after the create removes the file again.
+fn create_new_file_at(path: &str, content: &[u8], mode: u32) -> i64 {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let opened = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(mode)
+        .open(path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(err) => return errno_of(err),
+    };
+    match file.write_all(content) {
+        Ok(()) => 0,
+        Err(err) => {
+            let _ = std::fs::remove_file(path);
+            errno_of(err)
+        }
+    }
+}
+
+/// `create_new_file_at` for pith: `content` is a `Bytes` handle and `mode` the
+/// permission bits. the bytes are copied before the job crosses to a pool
+/// thread, as in `pith_write_file_bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_fs_create_new(path: *const i8, content: i64, mode: i64) -> i64 {
+    let (Some(path_str), Some(bytes)) = (cstr_str(path), pith_bytes_ref(content)) else {
+        return libc::EINVAL as i64;
+    };
+    let mode = (mode & 0o7777) as u32;
+    if !blocking::offloads() {
+        return create_new_file_at(path_str, &bytes.data, mode);
+    }
+    let (path, content) = (path_str.to_string(), bytes.data.clone());
+    // `blocking::run` reports a job that panicked as the default, and a
+    // default 0 would read as success, so the job answers in an option.
+    blocking::run(&POOL, move || {
+        Some(create_new_file_at(&path, &content, mode))
+    })
+    .unwrap_or(-1)
+}
+
+/// create one directory with `mode` (less the umask). `mkdir(2)` fails with
+/// `EEXIST` on any existing path, a symlink included, so a planted name is
+/// never reused. returns 0 or the errno.
+#[no_mangle]
+pub unsafe extern "C" fn pith_fs_mkdir_new(path: *const i8, mode: i64) -> i64 {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let Some(path_str) = cstr_str(path) else {
+        return libc::EINVAL as i64;
+    };
+    let mode = (mode & 0o7777) as u32;
+    match std::fs::DirBuilder::new().mode(mode).create(path_str) {
+        Ok(()) => 0,
+        Err(err) => errno_of(err),
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
     let Some(path_str) = cstr_str(path) else {
@@ -680,6 +752,58 @@ mod tests {
 
     fn cstring(text: &str) -> CString {
         CString::new(text).unwrap()
+    }
+
+    #[test]
+    fn create_new_refuses_a_planted_symlink_and_an_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let victim = Scratch::new("victim");
+        std::fs::write(&victim.0, b"keep").unwrap();
+        let link = Scratch::new("link");
+        std::os::unix::fs::symlink(&victim.0, &link.0).unwrap();
+        let link_path = link.0.to_str().unwrap();
+        assert_eq!(
+            create_new_file_at(link_path, b"evil", 0o600),
+            libc::EEXIST as i64
+        );
+        assert_eq!(std::fs::read(&victim.0).unwrap(), b"keep");
+
+        let victim_path = victim.0.to_str().unwrap();
+        assert_eq!(
+            create_new_file_at(victim_path, b"evil", 0o600),
+            libc::EEXIST as i64
+        );
+        assert_eq!(std::fs::read(&victim.0).unwrap(), b"keep");
+
+        let fresh = Scratch::new("fresh");
+        assert_eq!(
+            create_new_file_at(fresh.0.to_str().unwrap(), b"data", 0o600),
+            0
+        );
+        assert_eq!(std::fs::read(&fresh.0).unwrap(), b"data");
+        let mode = std::fs::metadata(&fresh.0).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn mkdir_new_refuses_a_planted_symlink_and_sets_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let target = Scratch::new("target-dir");
+        std::fs::create_dir(&target.0).unwrap();
+        let link = Scratch::new("dir-link");
+        std::os::unix::fs::symlink(&target.0, &link.0).unwrap();
+        unsafe {
+            assert_eq!(
+                pith_fs_mkdir_new(link.cstr().as_ptr(), 0o700),
+                libc::EEXIST as i64
+            );
+            let fresh = Scratch::new("fresh-dir");
+            assert_eq!(pith_fs_mkdir_new(fresh.cstr().as_ptr(), 0o700), 0);
+            let mode = std::fs::metadata(&fresh.0).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+        }
     }
 
     #[test]

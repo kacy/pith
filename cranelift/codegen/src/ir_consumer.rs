@@ -307,6 +307,47 @@ fn inline_list_set_value(
     fallback: FuncRef,
     anchor: FuncRef,
 ) {
+    let done = builder.create_block();
+    let slow = inline_list_set_fast_path(builder, list, index, value, anchor, done);
+    builder.switch_to_block(slow);
+    builder.ins().call(fallback, &[list, index, value]);
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+}
+
+/// A `_checked` store and the `brif` on its result, lowered as one branch.
+/// The checked stores sit inside fallible functions, where the emitter
+/// follows each with a branch to the store's continuation or to its miss
+/// arm. Merging the flag into a block parameter would leave a constant 1 to
+/// test on the fast path, so the fast path jumps straight to `stored` and only
+/// the slow path tests the runtime's answer. The block is left terminated.
+fn inline_list_set_value_branch(
+    builder: &mut FunctionBuilder<'_>,
+    args: [Value; 3],
+    fallback: FuncRef,
+    anchor: FuncRef,
+    stored: Block,
+    missed: Block,
+) {
+    let [list, index, value] = args;
+    let slow = inline_list_set_fast_path(builder, list, index, value, anchor, stored);
+    builder.switch_to_block(slow);
+    let call = builder.ins().call(fallback, &[list, index, value]);
+    let did_store = builder.inst_results(call)[0];
+    builder.ins().brif(did_store, stored, &[], missed, &[]);
+}
+
+/// The in-bounds store of a primitive list, which jumps to `done`. Returns
+/// the cold block every other case branches to, for the caller to fill with
+/// the runtime call.
+fn inline_list_set_fast_path(
+    builder: &mut FunctionBuilder<'_>,
+    list: Value,
+    index: Value,
+    value: Value,
+    anchor: FuncRef,
+    done: Block,
+) -> Block {
     let (live, base) = list_header(builder, list, anchor);
     let tag = builder
         .ins()
@@ -317,7 +358,6 @@ fn inline_list_set_value(
     let writable = builder.ins().band(live, primitive);
     let (in_bounds, data_ptr) = list_index_in_bounds(builder, writable, base, index);
 
-    let done = builder.create_block();
     let store_block = builder.create_block();
     let slow = builder.create_block();
     builder.set_cold_block(slow);
@@ -330,12 +370,23 @@ fn inline_list_set_value(
         .ins()
         .store(MemFlags::new(), value, elem_addr, 0);
     builder.ins().jump(done, &[]);
+    slow
+}
 
-    builder.switch_to_block(slow);
-    builder.ins().call(fallback, &[list, index, value]);
-    builder.ins().jump(done, &[]);
-
-    builder.switch_to_block(done);
+/// The (stored, missed) labels when `fname` is a `_checked` list store into
+/// register `reg` and `next` is the `brif` on that register.
+fn checked_store_branch<'a>(fname: &str, reg: usize, next: Option<&&'a str>) -> Option<(&'a str, &'a str)> {
+    if !matches!(
+        fname,
+        "pith_list_set_value_checked" | "pith_list_set_value_owned_checked" | "pith_list_set_scalar_checked"
+    ) {
+        return None;
+    }
+    let parts: Vec<&'a str> = next?.split_whitespace().collect();
+    match parts.as_slice() {
+        ["brif", cond, stored, missed] if cond.parse::<usize>() == Ok(reg) => Some((stored, missed)),
+        _ => None,
+    }
 }
 
 /// Read a list's header without a branch: whether `list` is a live list,
@@ -1939,6 +1990,7 @@ const LOOP_KEEP_CALLS: &[&str] = &[
     "pith_list_len",
     "pith_list_set_scalar",
     "pith_list_set_scalar_strict",
+    "pith_list_set_scalar_checked",
     "byte_at",
     "string_len",
     "pith_cstring_eq",
@@ -2647,7 +2699,7 @@ fn compile_ir_function(
 
     // Compile instructions
     let mut terminated = false;
-    for line in body_lines {
+    for (line_idx, line) in body_lines.iter().enumerate() {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() || parts[0].starts_with(';') {
             continue;
@@ -3237,6 +3289,41 @@ fn compile_ir_function(
                             let v = emit_bits_op(&mut builder, op, args[0], args[1]);
                             regs.insert(reg, v);
                             kinds.clear(reg);
+                            continue;
+                        }
+                    }
+                    // a checked list store and the branch on its result
+                    // become one branch. the block ends here, so the `brif`
+                    // line is skipped like anything after a terminator, and
+                    // the result register is never defined: the emitter
+                    // reads it only in that branch.
+                    if fast_paths && !name_is_shadowed && args.len() == 3 {
+                        if let Some((stored, missed)) =
+                            checked_store_branch(fname, reg, body_lines.get(line_idx + 1))
+                        {
+                            let fallback = runtime_func_ref(
+                                codegen,
+                                &mut builder,
+                                &mut func_ref_cache,
+                                runtime_funcs,
+                                fname,
+                            )?;
+                            let anchor = runtime_func_ref(
+                                codegen,
+                                &mut builder,
+                                &mut func_ref_cache,
+                                runtime_funcs,
+                                "pith_list_len",
+                            )?;
+                            inline_list_set_value_branch(
+                                &mut builder,
+                                [args[0], args[1], args[2]],
+                                fallback,
+                                anchor,
+                                get_label(&labels, stored, func_name)?,
+                                get_label(&labels, missed, func_name)?,
+                            );
+                            terminated = true;
                             continue;
                         }
                     }

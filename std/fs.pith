@@ -1,6 +1,8 @@
 # file streams build on std.io's shared handle-backed surface
 from std.io import FileStream
 import std.bytes as bytes
+import std.crypto.random as crypto_random
+import std.encoding as encoding
 import std.os as os
 import std.os.path as path
 
@@ -33,9 +35,56 @@ pub struct Entry:
     pub is_dir: Bool
     pub size: Int
 
+# temp names carry 64 bits from the os random source. the name only keeps
+# programs from colliding: what keeps a planted file or symlink from being
+# used is that every temp file and dir is created exclusively, and a name
+# that is already taken is retried with a new one.
+TEMP_NAME_RANDOM_BYTES := 8
+TEMP_CREATE_ATTEMPTS := 100
+# errno for a path that already exists (the same on linux and macos).
+EEXIST := 17
+# permission bits: temp files and dirs are private to their owner, and the
+# file write_atomic renames into place gets what write would have given it.
+TEMP_FILE_MODE := 384
+TEMP_DIR_MODE := 448
+ATOMIC_FILE_MODE := 438
+
 fn temp_path_impl(dir_path: String, prefix: String, suffix: String) -> String:
-    unique := prefix + time().to_string() + "_" + random_int(0, 1000000).to_string() + suffix
-    return path.join(dir_path, unique)
+    # a failed random read leaves the name without its random part; the
+    # exclusive create then refuses the repeat instead of reusing it.
+    token := encoding.to_hex(crypto_random.bytes(TEMP_NAME_RANDOM_BYTES) catch bytes.empty())
+    return path.join(dir_path, prefix + token + suffix)
+
+# create a new file under a fresh temp name and write data to it, retrying
+# while the name is taken. the create never follows a symlink and never
+# opens an existing file.
+fn create_temp_file(dir_path: String, prefix: String, suffix: String, data: Bytes, mode: Int) -> String!:
+    mut attempt := 0
+    while attempt < TEMP_CREATE_ATTEMPTS:
+        file_path := temp_path_impl(dir_path, prefix, suffix)
+        errno := fs_create_new(file_path, data, mode)
+        if errno == 0:
+            return file_path
+        if errno != EEXIST:
+            fail "could not create temp file: " + file_path + " (os error " + errno.to_string() + ")"
+        attempt += 1
+    fail "could not find an unused temp file name in " + dir_path
+
+# create a new private directory under a fresh temp name, retrying while
+# the name is taken.
+fn create_temp_dir(dir_path: String, prefix: String) -> String!:
+    if not make_dirs(dir_path):
+        fail "could not create temp dir parent: " + dir_path
+    mut attempt := 0
+    while attempt < TEMP_CREATE_ATTEMPTS:
+        temp_dir_path := temp_path_impl(dir_path, prefix, "")
+        errno := fs_mkdir_new(temp_dir_path, TEMP_DIR_MODE)
+        if errno == 0:
+            return temp_dir_path
+        if errno != EEXIST:
+            fail "could not create temp dir: " + temp_dir_path + " (os error " + errno.to_string() + ")"
+        attempt += 1
+    fail "could not find an unused temp dir name in " + dir_path
 
 fn entry_for_path(entry_path: String) -> Entry!:
     meta := info(entry_path)!
@@ -50,10 +99,20 @@ fn walk_into(entries: List[Entry], root_path: String) -> List[Entry]!:
             walk_into(entries, child_path)!
     return entries
 
-fn atomic_temp_path(target_path: String) -> String:
+# write data to a new temp file next to target_path and rename it over the
+# target. the temp file is created exclusively in the target's own directory,
+# so the rename stays on one file system and replaces the target in one step.
+fn write_bytes_atomic_impl(target_path: String, data: Bytes) -> Bool!:
     dir_path := path.dir(target_path)
+    if dir_path != "." and not is_dir(dir_path):
+        if not make_dirs(dir_path):
+            fail "could not create parent dir: " + dir_path
     prefix := "." + path.base(target_path) + "."
-    return temp_path_impl(dir_path, prefix, ".tmp")
+    temp_path := create_temp_file(dir_path, prefix, ".tmp", data, ATOMIC_FILE_MODE)!
+    if not rename(temp_path, target_path):
+        remove(temp_path)
+        fail "could not replace file atomically: " + target_path
+    return true
 
 # ===============================================================
 # File Existence and Type
@@ -93,29 +152,11 @@ pub fn write_bytes(path: String, data: Bytes) -> Bool!:
 
 # write text to a temp file and rename it into place.
 pub fn write_atomic(target_path: String, data: String) -> Bool!:
-    parent := path.dir(target_path)
-    if parent != "." and not is_dir(parent):
-        if not make_dirs(parent):
-            fail "could not create parent dir: " + parent
-    temp_path := atomic_temp_path(target_path)
-    write(temp_path, data)!
-    errdefer remove(temp_path)
-    if not rename(temp_path, target_path):
-        fail "could not replace file atomically: " + target_path
-    return true
+    return write_bytes_atomic_impl(target_path, bytes.from_string_utf8(data))
 
 # write bytes to a temp file and rename it into place.
 pub fn write_bytes_atomic(target_path: String, data: Bytes) -> Bool!:
-    parent := path.dir(target_path)
-    if parent != "." and not is_dir(parent):
-        if not make_dirs(parent):
-            fail "could not create parent dir: " + parent
-    temp_path := atomic_temp_path(target_path)
-    write_bytes(temp_path, data)!
-    errdefer remove(temp_path)
-    if not rename(temp_path, target_path):
-        fail "could not replace file atomically: " + target_path
-    return true
+    return write_bytes_atomic_impl(target_path, data)
 
 # append text to a file.
 pub fn append(path: String, data: String) -> Bool!:
@@ -264,39 +305,34 @@ pub fn modified(path: String) -> Int!:
         fail "could not read the modification time: " + path
     return seconds
 
-# build a temp path candidate without creating it.
+# build a temp path candidate without creating it. another process can take
+# the name before it is used; make_temp_file and make_temp_dir create the
+# path themselves and are the safe way to get one.
 pub fn temp_path(prefix: String, suffix: String) -> String:
     return temp_path_impl(os.temp_dir(), prefix, suffix)
 
-# build a temp path candidate inside a specific directory.
+# build a temp path candidate inside a specific directory, with the same
+# caveat as temp_path.
 pub fn temp_path_in(dir_path: String, prefix: String, suffix: String) -> String:
     return temp_path_impl(dir_path, prefix, suffix)
 
-# create a temporary directory and return its path.
+# create a new temporary directory, readable only by its owner, and return
+# its path.
 pub fn make_temp_dir(prefix: String) -> String!:
-    dir_path := temp_path_impl(os.temp_dir(), prefix, "")
-    if not make_dirs(dir_path):
-        fail "could not create temp dir: " + dir_path
-    return dir_path
+    return create_temp_dir(os.temp_dir(), prefix)
 
-# create a temporary directory inside a specific directory.
+# create a new temporary directory inside a specific directory.
 pub fn make_temp_dir_in(dir_path: String, prefix: String) -> String!:
-    temp_dir_path := temp_path_impl(dir_path, prefix, "")
-    if not make_dirs(temp_dir_path):
-        fail "could not create temp dir: " + temp_dir_path
-    return temp_dir_path
+    return create_temp_dir(dir_path, prefix)
 
-# create an empty temporary file and return its path.
+# create a new empty temporary file, readable only by its owner, and return
+# its path.
 pub fn make_temp_file(prefix: String, suffix: String) -> String!:
-    file_path := temp_path_impl(os.temp_dir(), prefix, suffix)
-    write(file_path, "")!
-    return file_path
+    return create_temp_file(os.temp_dir(), prefix, suffix, bytes.empty(), TEMP_FILE_MODE)
 
-# create an empty temporary file inside a specific directory.
+# create a new empty temporary file inside a specific directory.
 pub fn make_temp_file_in(dir_path: String, prefix: String, suffix: String) -> String!:
-    file_path := temp_path_impl(dir_path, prefix, suffix)
-    write(file_path, "")!
-    return file_path
+    return create_temp_file(dir_path, prefix, suffix, bytes.empty(), TEMP_FILE_MODE)
 
 # walk a file tree in preorder starting at root_path.
 pub fn walk(root_path: String) -> List[Entry]!:

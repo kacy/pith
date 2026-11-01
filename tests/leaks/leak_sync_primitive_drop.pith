@@ -1,0 +1,76 @@
+# one sync primitive per round, held in a local, copied into a struct field
+# and a list, and dropped at the end of the round. the handle is counted like
+# a channel's, so the last owner frees it and the process stays flat; before
+# that, every Mutex, WaitGroup, Semaphore and AtomicInt lived for the life of
+# the process (issue #1291: 40 bytes a mutex).
+# one SHAPE per registration in tooling/leak_check.sh: 1 Mutex, 2 WaitGroup,
+# 3 Semaphore, 4 AtomicInt.
+import std.env as env
+import leakprobe as probe
+
+struct Locks:
+    pub mu: Mutex
+    pub n: Int
+
+struct Groups:
+    pub wg: WaitGroup
+    pub n: Int
+
+struct Permits:
+    pub sem: Semaphore
+    pub n: Int
+
+struct Cells:
+    pub cell: AtomicInt
+    pub n: Int
+
+fn mutex_round(i: Int) -> Int:
+    mu := Mutex()
+    mu.lock()
+    mu.unlock()
+    held := Locks(mu: mu, n: i)
+    all := [held.mu]
+    return all.len() + held.n
+
+fn waitgroup_round(i: Int) -> Int:
+    wg := WaitGroup()
+    wg.add(1)
+    wg.done()
+    wg.wait()
+    held := Groups(wg: wg, n: i)
+    all := [held.wg]
+    return all.len() + held.n
+
+fn semaphore_round(i: Int) -> Int:
+    sem := Semaphore(1)
+    sem.acquire()
+    sem.release()
+    held := Permits(sem: sem, n: i)
+    all := [held.sem]
+    return all.len() + held.n
+
+fn atomic_round(i: Int) -> Int:
+    cell := AtomicInt(i)
+    held := Cells(cell: cell, n: 1)
+    all := [held.cell]
+    return all.len() + held.cell.load()
+
+fn round(shape: Int, i: Int) -> Int:
+    if shape == 2:
+        return waitgroup_round(i)
+    if shape == 3:
+        return semaphore_round(i)
+    if shape == 4:
+        return atomic_round(i)
+    return mutex_round(i)
+
+fn main():
+    shape := env.int_or("SHAPE", 1)
+    mut i := 0
+    mut acc := 0
+    while i < probe.rounds():
+        acc = acc + round(shape, i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

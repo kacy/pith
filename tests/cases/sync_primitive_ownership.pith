@@ -1,0 +1,226 @@
+# Mutex, WaitGroup, Semaphore and AtomicInt handles are counted like
+# channels: retained on copy, released at scope exit, freed at zero. every
+# place a handle can live is exercised here (a local, a struct field, a
+# list, a map, an optional, a tuple, a channel payload, a closure capture, a
+# spawn argument, a task that outlives the function that made its handles,
+# and a module global), so a site that copies without a retain shows up as
+# a use after free under valgrind or the sanitizer gate.
+import std.time as time
+
+struct Guarded:
+    pub mu: Mutex
+    pub wg: WaitGroup
+    pub sem: Semaphore
+    pub hits: AtomicInt
+    pub name: String
+
+struct Holder:
+    pub mut mu: Mutex
+    pub n: Int
+
+mut global_mu := Mutex()
+mut global_hits := AtomicInt(0)
+
+fn bump_global(k: Int):
+    global_mu.lock()
+    global_hits.store(global_hits.load() + k)
+    global_mu.unlock()
+
+fn locals(i: Int) -> Int:
+    mu := Mutex()
+    wg := WaitGroup()
+    sem := Semaphore(1)
+    hits := AtomicInt(i)
+    mu.lock()
+    mu.unlock()
+    wg.add(1)
+    wg.done()
+    wg.wait()
+    sem.acquire()
+    sem.release()
+    return hits.load()
+
+fn make_mutex() -> Mutex:
+    return Mutex()
+
+fn make_guarded(name: String) -> Guarded:
+    return Guarded(mu: Mutex(), wg: WaitGroup(), sem: Semaphore(2), hits: AtomicInt(0), name: name)
+
+fn use_guarded(g: Guarded) -> Int:
+    g.mu.lock()
+    g.hits.store(g.hits.load() + 1)
+    g.mu.unlock()
+    g.sem.acquire()
+    g.sem.release()
+    g.wg.add(1)
+    g.wg.done()
+    g.wg.wait()
+    return g.hits.load()
+
+fn in_fields() -> Int:
+    g := make_guarded("a")
+    copy := g
+    mut total := use_guarded(g)
+    total = total + use_guarded(copy)
+    h := Holder(mu: make_mutex(), n: 1)
+    h.mu = Mutex()
+    h.mu.lock()
+    h.mu.unlock()
+    loose := h.mu
+    loose.lock()
+    loose.unlock()
+    return total + h.n
+
+fn in_list() -> Int:
+    mut mus: List[Mutex] := [Mutex(), Mutex()]
+    mus.push(Mutex())
+    first := mus[0]
+    first.lock()
+    first.unlock()
+    for m in mus:
+        m.lock()
+        m.unlock()
+    mus[1] = Mutex()
+    cells: List[AtomicInt] := [AtomicInt(1), AtomicInt(2)]
+    mut sum := 0
+    for c in cells:
+        sum = sum + c.load()
+    groups: List[WaitGroup] := []
+    groups.push(WaitGroup())
+    groups[0].add(1)
+    groups[0].done()
+    groups[0].wait()
+    sems := [Semaphore(1)]
+    sems[0].acquire()
+    sems[0].release()
+    return mus.len() + sum
+
+fn in_map() -> Int:
+    mut by_name: Map[String, Semaphore] := {}
+    by_name["a"] = Semaphore(1)
+    by_name["b"] = Semaphore(1)
+    by_name["a"] = Semaphore(3)
+    if let s = by_name.get("a"):
+        s.acquire()
+        s.release()
+    by_name.remove("b")
+    return by_name.len()
+
+fn in_optional(present: Bool) -> Int:
+    mut maybe: Mutex? := none
+    if present:
+        maybe = Mutex()
+    if let m = maybe:
+        m.lock()
+        m.unlock()
+        return 1
+    return 0
+
+fn in_tuple() -> Int:
+    pair := (AtomicInt(7), Mutex())
+    pair.1.lock()
+    pair.1.unlock()
+    return pair.0.load()
+
+fn over_channel() -> Int:
+    ch := Channel[WaitGroup](2)
+    ch.send(WaitGroup())
+    ch.send(WaitGroup())
+    mut n := 0
+    if let wg = ch.recv():
+        wg.add(1)
+        wg.done()
+        wg.wait()
+        n = n + 1
+    # the second one is still queued when the channel is freed
+    return n
+
+fn captured() -> Int:
+    mu := Mutex()
+    hits := AtomicInt(0)
+    add := fn(k: Int):
+        mu.lock()
+        hits.store(hits.load() + k)
+        mu.unlock()
+    add(2)
+    add(3)
+    return hits.load()
+
+fn make_counter() -> fn(Int) -> Int:
+    hits := AtomicInt(0)
+    return fn(k: Int) -> Int:
+        hits.store(hits.load() + k)
+        return hits.load()
+
+fn worker(mu: Mutex, wg: WaitGroup, sem: Semaphore, hits: AtomicInt, rounds: Int):
+    mut i := 0
+    while i < rounds:
+        sem.acquire()
+        mu.lock()
+        hits.store(hits.load() + 1)
+        mu.unlock()
+        sem.release()
+        i = i + 1
+    wg.done()
+
+fn shared_between_tasks() -> Int:
+    mu := Mutex()
+    wg := WaitGroup()
+    sem := Semaphore(2)
+    hits := AtomicInt(0)
+    mut tasks: List[Task[Void]] := []
+    mut i := 0
+    while i < 4:
+        wg.add(1)
+        tasks.push(spawn worker(mu, wg, sem, hits, 50))
+        i = i + 1
+    wg.wait()
+    for t in tasks:
+        await t
+    return hits.load()
+
+fn late_worker(g: Guarded, done: Channel[Int]):
+    time.delay(20)
+    use_guarded(g)
+    g.wg.wait()
+    done.send(g.hits.load())
+
+# the handles are made here and handed to a task, and this function returns
+# before the task touches them: the task's own counts keep them alive.
+fn start_late(done: Channel[Int]) -> Task[Void]:
+    g := make_guarded("late")
+    return spawn late_worker(g, done)
+
+fn outlives_creator() -> Int:
+    done := Channel[Int](1)
+    task := start_late(done)
+    mut got := 0
+    if let v = done.recv():
+        got = v
+    await task
+    return got
+
+fn main():
+    mut acc := 0
+    mut i := 0
+    while i < 20:
+        acc = acc + locals(i)
+        i = i + 1
+    print("locals {acc}")
+    print("fields {in_fields()}")
+    print("list {in_list()}")
+    print("map {in_map()}")
+    print("optional {in_optional(true)} {in_optional(false)}")
+    print("tuple {in_tuple()}")
+    print("channel {over_channel()}")
+    print("captured {captured()}")
+    counter := make_counter()
+    counter(4)
+    print("counter {counter(5)}")
+    print("tasks {shared_between_tasks()}")
+    print("late {outlives_creator()}")
+    i = 0
+    while i < 10:
+        bump_global(i)
+        i = i + 1
+    print("global {global_hits.load()}")

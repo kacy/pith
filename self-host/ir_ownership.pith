@@ -49,7 +49,7 @@ pub fn ir_rc_release_enabled(kind: String) -> Bool:
 
 # take one count on `r`, dispatching to the runtime retain that matches
 # the rc kind ("string", "list", "map", "set", "bytes", "struct",
-# "tuple", "closure", "weak"). this is what a borrow becomes an owned
+# "tuple", "closure", "channel", "sync", "weak"). this is what a borrow becomes an owned
 # count through: binding, assigning or storing a value read out of a
 # variable, a collection or a struct field goes through here first.
 # an unrecognised kind (including the "" ir_rc_kind returns for a
@@ -72,6 +72,8 @@ pub fn ir_rc_retain_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_closure_retain", "void", r)
     elif kind == "channel":
         ir_emit_call1(ir_reg(), "pith_channel_retain", "void", r)
+    elif kind == "sync":
+        ir_emit_call1(ir_reg(), "pith_sync_retain", "void", r)
     elif kind == "weak":
         # a weak local's slot holds the bare target pointer and counts only
         # against the header's weak count, never the strong one, or the
@@ -135,6 +137,8 @@ pub fn ir_rc_release_reg(r: Int, kind: String):
         ir_emit_call1(ir_reg(), "pith_closure_release", "void", r)
     elif kind == "channel":
         ir_emit_call1(ir_reg(), "pith_channel_release", "void", r)
+    elif kind == "sync":
+        ir_emit_call1(ir_reg(), "pith_sync_release", "void", r)
     elif kind == "weak":
         ir_emit_call1(ir_reg(), "pith_struct_weak_release", "void", r)
 
@@ -161,19 +165,21 @@ pub fn ir_kinded_code(kind: String) -> Int:
         return 7
     if kind == "channel":
         return 8
+    if kind == "sync":
+        return 9
     return 0
 
 # the rc kind the release helper dispatches `code` to, "" for 0 or an
 # unknown code.
 pub fn ir_kinded_code_kind(code: Int) -> String:
-    kinds := ["", "string", "list", "map", "set", "bytes", "struct", "closure", "channel"]
+    kinds := ["", "string", "list", "map", "set", "bytes", "struct", "closure", "channel", "sync"]
     if code < 0 or code >= kinds.len():
         return ""
     return kinds[code]
 
 # one past the highest code ir_kinded_code hands out.
 pub fn ir_kinded_code_count() -> Int:
-    return 9
+    return 10
 
 # the side slot holding the kind code of what a kinded local's slot owns.
 pub fn ir_kinded_tag_slot(name: String) -> String:

@@ -1136,7 +1136,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # and a function returning a channel retains a borrowed one on the
         # way out. classified as a borrow, the bind retained a second count
         # and every channel outlived its single release.
-        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure" or expr_kind == "tuple" or expr_kind == "channel":
+        if expr_kind == "list" or expr_kind == "map" or expr_kind == "set" or expr_kind == "bytes" or expr_kind == "struct" or expr_kind == "closure" or expr_kind == "tuple" or expr_kind == "channel" or expr_kind == "sync":
             return false
     if node.kind == "method_call":
         # a module-qualified call (`mod.helper(...)`) parses as a method call
@@ -4220,7 +4220,7 @@ fn ir_emit_value_for_target(val_idx: Int, target_type: String) -> Int:
 fn ir_kind_is_owned_optional_payload(kind: String) -> Bool:
     if kind == "struct" or kind == "list" or kind == "map" or kind == "set":
         return true
-    return kind == "bytes" or kind == "closure" or kind == "string" or kind == "channel"
+    return kind == "bytes" or kind == "closure" or kind == "string" or kind == "channel" or kind == "sync"
 
 # build a Some that owns its payload. the payload arrives owned either way: a
 # fresh value carries its own count, and a borrowed one is retained here to pair
@@ -4699,6 +4699,9 @@ fn ir_closure_capture_tag(kind: String) -> Int:
     # a captured channel handle: the closure holds one owner count
     if kind == "channel":
         return 9
+    # a captured Mutex, WaitGroup, Semaphore or AtomicInt: one owner count
+    if kind == "sync":
+        return 10
     return 0
 
 # a stack closure is never released, so it takes no count on what it
@@ -4860,7 +4863,7 @@ fn ir_release_owned_operand(expr_idx: Int, reg: Int, expr_type: String):
 # because a fresh string has shapes (an s[i] char, a concat) that no rc kind
 # describes.
 fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
-    if arg_kind == "struct" or arg_kind == "closure" or arg_kind == "channel":
+    if arg_kind == "struct" or arg_kind == "closure" or arg_kind == "channel" or arg_kind == "sync":
         return true
     return arg_kind == "list" or arg_kind == "map" or arg_kind == "set"
 
@@ -6327,6 +6330,8 @@ fn ir_element_tag_code(kind: String) -> Int:
         return 7
     if kind == "channel":
         return 8
+    if kind == "sync":
+        return 9
     return 0
 
 # whether a value of this type is a plain machine word with no count: an
@@ -6363,7 +6368,7 @@ fn ir_store_learns_kind(store_kind: String) -> Bool:
         return true
     if ir_kind_is_struct_header(store_kind):
         return true
-    return store_kind == "bytes" or store_kind == "closure" or store_kind == "channel"
+    return store_kind == "bytes" or store_kind == "closure" or store_kind == "channel" or store_kind == "sync"
 
 # materialize an element-tag code into a register, for the store to carry.
 fn ir_emit_element_tag_const(kind: String) -> Int:
@@ -6417,7 +6422,7 @@ fn ir_container_store_takes_count(store_kind: String) -> Bool:
         return true
     if ir_kind_is_struct_header(store_kind):
         return true
-    if store_kind == "channel":
+    if store_kind == "channel" or store_kind == "sync":
         return true
     return store_kind == "list" or store_kind == "map" or store_kind == "set" or store_kind == "closure"
 
@@ -6481,6 +6486,8 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
     # a channel handle is counted, so a List[Channel[T]] owns its elements
     if elem_kind == "channel":
         return "__list_new_channel"
+    if elem_kind == "sync":
+        return "__list_new_sync"
     return "__list_new"
 
 fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
@@ -6559,6 +6566,8 @@ fn ir_tuple_elem_code(kind: String) -> String:
         return "p"
     if kind == "channel":
         return "h"
+    if kind == "sync":
+        return "y"
     return "0"
 
 fn ir_tuple_dtor_code_kind(code: String) -> String:
@@ -6580,6 +6589,8 @@ fn ir_tuple_dtor_code_kind(code: String) -> String:
         return "tuple"
     if code == "h":
         return "channel"
+    if code == "y":
+        return "sync"
     return ""
 
 fn ir_tuple_dtor_signature(elem_nodes: List[Int]) -> String:
@@ -10824,7 +10835,7 @@ fn ir_stmt_discards_owned_value(kind: String) -> Bool:
 fn ir_kind_discards_at_statement(kind: String) -> Bool:
     if kind == "list" or kind == "map" or kind == "set":
         return true
-    if kind == "bytes" or kind == "closure" or kind == "channel":
+    if kind == "bytes" or kind == "closure" or kind == "channel" or kind == "sync":
         return true
     return ir_kind_is_struct_header(kind)
 
@@ -12694,7 +12705,7 @@ fn ir_emit_optional_tuple_walks():
     ir_emit_zero_ret_endfunc()
 
 fn ir_emit_optional_walks(trace: Bool):
-    mut kinds: List[String] := ["struct", "list", "map", "set", "bytes", "closure", "string", "channel"]
+    mut kinds: List[String] := ["struct", "list", "map", "set", "bytes", "closure", "string", "channel", "sync"]
     mut prefix := "__opt_dtor_"
     if trace:
         kinds = ["struct", "list", "map", "set", "closure"]

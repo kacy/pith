@@ -282,10 +282,13 @@ pub unsafe extern "C" fn pith_cstring_repeat(s: *const i8, n: i64) -> *mut i8 {
     let Some(bytes) = cstr_bytes(s) else {
         return crate::pith_cstring_empty();
     };
-    if n <= 0 {
+    let len = bytes.len();
+    // an empty string repeats to the empty string at any count. the copy
+    // loop below runs once per repetition, so a huge count of nothing used
+    // to spin for as long as the count said.
+    if n <= 0 || len == 0 {
         return crate::pith_cstring_empty();
     }
-    let len = bytes.len();
     let Some(total_len) = len.checked_mul(n as usize) else {
         return crate::pith_cstring_empty();
     };
@@ -378,5 +381,27 @@ mod tests {
         assert_eq!(index_of("héllo wörld", "ö"), 8);
         assert_eq!(index_of("héllo wörld", "wörld"), 7);
         assert_eq!(contains("héllo wörld", "ü"), 0);
+    }
+
+    fn repeat(text: &str, n: i64) -> Vec<u8> {
+        let t = std::ffi::CString::new(text).unwrap();
+        unsafe {
+            let out = pith_cstring_repeat(t.as_ptr(), n);
+            let bytes = cstr_bytes(out).unwrap().to_vec();
+            crate::pith_cstring_release(out);
+            bytes
+        }
+    }
+
+    #[test]
+    fn repeat_of_the_empty_string_returns_at_once() {
+        // this used to loop i64::MAX times copying nothing
+        assert_eq!(repeat("", i64::MAX), b"");
+        assert_eq!(repeat("", 3), b"");
+        assert_eq!(repeat("ab", 3), b"ababab");
+        assert_eq!(repeat("ab", 0), b"");
+        assert_eq!(repeat("ab", -1), b"");
+        // a total past the address space is refused, not wrapped
+        assert_eq!(repeat("abc", i64::MAX), b"");
     }
 }

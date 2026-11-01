@@ -1,0 +1,11 @@
+# a negative index store through a generic helper aborts too. a list of
+# strings takes the counted store, which the codegen never inlines.
+fn setit[T](xs: List[T], i: Int, v: T):
+    xs[i] = v
+
+fn main():
+    names := ["a", "b"]
+    setit(names, 1, "z")
+    print("before:{names[1]}")
+    setit(names, 0 - 1, "y")
+    print("after:{names[0]}")

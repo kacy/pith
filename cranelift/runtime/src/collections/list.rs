@@ -842,6 +842,65 @@ unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_c
     }
 }
 
+// The strict stores behind `xs[i] = v`. The stores above ignore an index
+// outside the list, which `.set(i, v)` and std internals rely on; an index
+// assignment is a program bug there and stops with the same error a read
+// gives. The codegen inlines the in-bounds store of a primitive list and only
+// calls these on its slow path, so the extra check costs nothing on the hot
+// path.
+#[cold]
+#[inline(never)]
+fn strict_store_out_of_bounds(index: i64, len: i64) -> ! {
+    eprintln!(
+        "pith runtime error: list index out of bounds: {} for list of length {}",
+        index, len
+    );
+    // panic-guard: an index store out of bounds is a program bug with nothing to write to.
+    std::process::exit(1);
+}
+
+#[inline]
+unsafe fn check_store_index(list: PithList, index: i64) {
+    let Some(impl_ref) = list_ref(list) else {
+        strict_index_bad_handle();
+    };
+    let len = impl_ref.len() as i64;
+    if index < 0 || index >= len {
+        strict_store_out_of_bounds(index, len);
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_value_strict(list: PithList, index: i64, value: i64) {
+    check_store_index(list, index);
+    set_value_inner(list, index, value, false);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_value_owned_strict(list: PithList, index: i64, value: i64) {
+    check_store_index(list, index);
+    set_value_inner(list, index, value, true);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_scalar_strict(list: PithList, index: i64, value: i64) {
+    check_store_index(list, index);
+    pith_list_set_scalar(list, index, value);
+}
+
+/// # Safety
+/// * `list` must be a valid list handle.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_set_value_kind_strict(
+    list: PithList,
+    index: i64,
+    value: i64,
+    elem_tag: i64,
+) {
+    check_store_index(list, index);
+    pith_list_set_value_kind(list, index, value, elem_tag);
+}
+
 /// Join a list of C string pointers with a separator.
 /// Returns a newly allocated C string.
 #[no_mangle]

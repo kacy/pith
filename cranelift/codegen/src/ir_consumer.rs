@@ -1225,7 +1225,15 @@ fn inline_runtime_call(
         runtime_func_ref(codegen, builder, func_ref_cache, runtime_funcs, name)
     };
     let value = match (fname, args.len()) {
-        ("pith_list_set_value" | "pith_list_set_value_owned" | "pith_list_set_scalar", 3) => {
+        (
+            "pith_list_set_value"
+            | "pith_list_set_value_owned"
+            | "pith_list_set_scalar"
+            | "pith_list_set_value_strict"
+            | "pith_list_set_value_owned_strict"
+            | "pith_list_set_scalar_strict",
+            3,
+        ) => {
             let fallback = runtime_ref(builder, fname)?;
             let anchor = runtime_ref(builder, "pith_list_len")?;
             inline_list_set_value(builder, args[0], args[1], args[2], fallback, anchor);
@@ -1833,7 +1841,8 @@ const INLINE_MAX_INSTS: usize = 24;
 /// The runtime functions a loop may call and still have its list header
 /// reads hoisted: none of them changes a list's header, frees a list or runs
 /// user code. The getters, length reads and string comparisons only read;
-/// `pith_list_set_scalar` stores a word with no count to take or drop; the
+/// `pith_list_set_scalar` stores a word with no count to take or drop (its
+/// strict form can also stop the process, like the strict getter); the
 /// yield lets another task run, and a task that changes a list this loop
 /// reads without a lock races it under OS threads too.
 const LOOP_KEEP_CALLS: &[&str] = &[
@@ -1841,6 +1850,7 @@ const LOOP_KEEP_CALLS: &[&str] = &[
     "pith_list_get_value_strict",
     "pith_list_len",
     "pith_list_set_scalar",
+    "pith_list_set_scalar_strict",
     "byte_at",
     "string_len",
     "pith_cstring_eq",

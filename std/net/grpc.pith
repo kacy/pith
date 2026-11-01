@@ -263,6 +263,7 @@ impl Conn:
 # close() it when done.
 pub fn dial(host: String, port: Int) -> Conn!:
     client := http2.open(host, port)!
+    limit_responses(client)
     return Conn(client: client, authority: host, credentials: no_credentials())
 
 # dial a grpc server using the caller's tls `config` (which must offer alpn
@@ -271,6 +272,7 @@ pub fn dial(host: String, port: Int) -> Conn!:
 # like dial.
 pub fn dial_with_config(host: String, port: Int, config: tls.Config) -> Conn!:
     client := http2.open_with_config(host, port, config)!
+    limit_responses(client)
     return Conn(client: client, authority: host, credentials: no_credentials())
 
 # dial a grpc server over plaintext http/2 (h2c) — no tls. matches a server
@@ -278,6 +280,7 @@ pub fn dial_with_config(host: String, port: Int, config: tls.Config) -> Conn!:
 # anything public, dial over tls. otherwise like dial.
 pub fn dial_h2c(host: String, port: Int) -> Conn!:
     client := http2.open_h2c(host, port)!
+    limit_responses(client)
     return Conn(client: client, authority: host, credentials: no_credentials())
 
 # make a one-shot unary call: dial host:port, run the method, and close. this is
@@ -385,6 +388,8 @@ pub fn parse_grpc_timeout(text: String) -> Int?:
 fn transport_error(detail: String) -> GrpcError:
     if detail == http2.REQUEST_DEADLINE_EXCEEDED:
         return GrpcError(GRPC_DEADLINE_EXCEEDED, "grpc: deadline exceeded")
+    if detail == http2.RESPONSE_BODY_LIMIT:
+        return GrpcError(GRPC_RESOURCE_EXHAUSTED, "grpc: response exceeds the receive limit")
     return GrpcError(GRPC_UNAVAILABLE, "grpc transport error: {detail}")
 
 # the standard grpc headers plus a W3C traceparent for `ctx`, so the server joins
@@ -588,6 +593,12 @@ fn has_header(fields: List[hpack.HeaderField], name: String) -> Bool:
 # the body makes the receiver buffer toward that number long before it can tell
 # the message will never arrive. 4 MiB is grpc's own default receive limit.
 pub MAX_MESSAGE_BYTES := 4194304
+
+# bound a channel's unary responses at the http/2 layer to one message and its
+# 5-byte prefix, so a server cannot make the client buffer past the receive
+# limit before the deframer sees the length.
+fn limit_responses(client: http2.Client):
+    client.set_max_response_body_bytes(MAX_MESSAGE_BYTES + 5)
 
 # a grpc message deframer: incoming DATA chunks arrive on arbitrary boundaries,
 # so it accumulates bytes and hands back complete length-prefixed messages

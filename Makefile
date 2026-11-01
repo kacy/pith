@@ -1,4 +1,4 @@
-.PHONY: pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean loom-check
+.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean loom-check
 
 
 # prints a bounded account of a failed regression case: exit status, the
@@ -1507,6 +1507,22 @@ memcheck-only:
 # ownership shape at two round counts and its peak resident set has to be the
 # same either way. the details, and how to add a case, are in
 # tooling/leak_check.sh and docs/ownership.md.
+
+# --- sanitizers ---
+# the regression corpus and the std tests against a runtime built with
+# AddressSanitizer or ThreadSanitizer on both backends, failing
+# on any report. slower than the rest of the suite, so the nightly workflow
+# runs these rather than every push. how they work, and what generated code
+# they cannot see, is in tooling/sanitize.sh.
+sanitize-asan: build sanitize-asan-only
+
+sanitize-asan-only:
+	@bash tooling/sanitize.sh asan
+
+sanitize-tsan: build sanitize-tsan-only
+
+sanitize-tsan-only:
+	@bash tooling/sanitize.sh tsan
 
 leak-check: build leak-check-only
 

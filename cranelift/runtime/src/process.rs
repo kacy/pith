@@ -406,7 +406,43 @@ fn exit_state(handle: i64) -> ExitState {
             Some(fd) => ExitState::Watch(fd),
             None => ExitState::Unwatchable,
         },
-        Err(_) => ExitState::Unwatchable,
+        // a child that cannot be polled cannot be waited for either, so this
+        // is the -1 a blocking wait would have come back with.
+        Err(_) => ExitState::Finished(-1),
+    }
+}
+
+/// the wait off a green task. it blocks the thread, as an os thread may, but
+/// never while holding the registry lock: a reader on another thread takes
+/// that lock to drain the child's pipes, and a child stuck on a full pipe
+/// never exits, so a wait that kept the lock would never return (and a kill
+/// from a deadline could not get in either).
+fn wait_off_green(handle: i64) -> i64 {
+    loop {
+        match exit_state(handle) {
+            ExitState::Finished(code) => return code,
+            ExitState::Unknown => return -1,
+            ExitState::Watch(fd) => {
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd naming the pidfd opened above.
+                let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+                let interrupted = ready < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+                // SAFETY: closing the pidfd we opened and have not shared.
+                unsafe { libc::close(fd) };
+                if interrupted {
+                    continue;
+                }
+                return reap(handle);
+            }
+            // no pidfd (an old kernel, or not linux): look again shortly,
+            // letting go of the lock in between.
+            ExitState::Unwatchable => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
     }
 }
 
@@ -434,9 +470,9 @@ pub extern "C" fn pith_process_wait(handle: i64) -> i64 {
         return -1;
     }
     // off a green task there is no worker to keep free and blocking is what an
-    // OS thread is for, so take the direct wait untouched.
+    // OS thread is for, but not with the registry locked; see `wait_off_green`.
     if !blocking::offloads() {
-        return reap(handle);
+        return wait_off_green(handle);
     }
     let watch = match exit_state(handle) {
         ExitState::Finished(code) => return code,

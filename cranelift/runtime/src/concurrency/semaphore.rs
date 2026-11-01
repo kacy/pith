@@ -95,7 +95,16 @@ fn block_on_acquire<'a>(
             state.green_waiters.push_back(id);
             drop(state);
             green::park_current(id);
-            lock_state(lock)
+            let mut state = lock_state(lock);
+            // a release that meant us popped our entry. one that is still
+            // there means this wake came from elsewhere, and the caller is
+            // about to re-check and maybe register again. a stale entry would
+            // let a later release pop it and wake us instead of a task that
+            // is really waiting, which then stays parked with a permit free.
+            if let Some(pos) = state.green_waiters.iter().rposition(|&waiter| waiter == id) {
+                state.green_waiters.remove(pos);
+            }
+            state
         }
     }
 }

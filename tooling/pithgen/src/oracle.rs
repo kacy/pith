@@ -553,8 +553,55 @@ fn first_line_diff(a: &str, b: &str) -> (usize, String, String) {
 /// report, a crash, or a divergence between settings.
 #[derive(Clone, Copy, PartialEq)]
 pub enum RunMode {
-    Plain { valgrind_mem: bool },
+    Plain { valgrind_mem: bool, leak: bool },
     Sanitize,
+}
+
+/// the leak oracle, for a program generated with --leak: run it at a low and
+/// a high round count and report each ownership shape whose share of the peak
+/// resident set grew between the two. the peak only rises, so a shape's share
+/// is how far it pushed the peak past where the shapes before it left it. a
+/// shape that strands a value per round moves its share by that value times
+/// the extra rounds; one that does not leaves it where its working set put
+/// it. PITHGEN_LEAK_ROUNDS (low,high) and PITHGEN_LEAK_LIMIT_KB override the
+/// defaults.
+fn leak_oracle(seed: u64, exe_s: &str, case_dir: &Path, base_envs: &[(String, String)], findings: &mut Vec<Finding>) {
+    let rounds = std::env::var("PITHGEN_LEAK_ROUNDS").unwrap_or_else(|_| "5000,25000".into());
+    let (low, high) = rounds.split_once(',').expect("PITHGEN_LEAK_ROUNDS is low,high");
+    let limit: i64 = std::env::var("PITHGEN_LEAK_LIMIT_KB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    let shares = |n: &str| -> Option<Vec<(String, i64)>> {
+        let mut envs = base_envs.to_vec();
+        envs.push(("PITH_LEAK_ROUNDS".into(), n.into()));
+        let run = run_with_timeout(exe_s, &[], case_dir, &envs, Duration::from_secs(120)).ok()?;
+        if run.code != Some(0) {
+            return None;
+        }
+        let mut prev = 0;
+        let mut out = Vec::new();
+        for line in run.stdout.lines() {
+            let Some(rest) = line.strip_prefix("own-kb ") else { continue };
+            let (name, kb) = rest.split_once(": ")?;
+            let kb: i64 = kb.trim().parse().ok()?;
+            out.push((name.to_string(), kb - prev));
+            prev = kb;
+        }
+        Some(out)
+    };
+    let (Some(lo), Some(hi)) = (shares(low), shares(high)) else { return };
+    for ((name, a), (_, b)) in lo.iter().zip(hi.iter()) {
+        if b - a > limit {
+            findings.push(Finding {
+                seed,
+                class: "leak".into(),
+                signature: format!("peak rss grows with rounds in ownership shape {}", name),
+                detail: format!("shape {}: {} kb at {} rounds, {} kb at {} rounds", name, a, low, b, high),
+                wo_pair: None,
+            });
+        }
+    }
 }
 
 pub fn run_case(
@@ -674,7 +721,8 @@ pub fn run_case(
             run_stdout = run_sanitize_matrix(seed, &exe_s, case_dir, &tc.envs, expected, &mut findings, &mut hang);
         }
     } else if built {
-        let valgrind_mem = matches!(mode, RunMode::Plain { valgrind_mem: true });
+        let valgrind_mem = matches!(mode, RunMode::Plain { valgrind_mem: true, .. });
+        let leak = matches!(mode, RunMode::Plain { leak: true, .. });
         let exe = case_dir.join("main");
         if exe.exists() {
             let exe_s = exe.to_string_lossy().to_string();
@@ -735,6 +783,9 @@ pub fn run_case(
                             wo_pair: Some((mm.expected, mm.actual)),
                         });
                     }
+                }
+                if findings.is_empty() && leak {
+                    leak_oracle(seed, &exe_s, case_dir, &tc.envs, &mut findings);
                 }
                 if findings.is_empty() && valgrind_mem {
                     let vg = run_with_timeout(

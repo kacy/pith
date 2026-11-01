@@ -56,6 +56,13 @@ threadlocal mut boolean_values: Map[Int, Bool] := {}
 threadlocal mut table_keys_by_slot: Map[Int, String] := {}
 threadlocal mut table_values_by_slot: Map[Int, Int] := {}
 threadlocal mut table_key_counts: Map[Int, Int] := {}
+# the first child of each table under each key, keyed "handle:key", so a
+# lookup does not scan the table. without it every assignment's lookups made
+# parsing quadratic in the number of keys: 100k keys took over a minute.
+threadlocal mut table_key_index: Map[String, Int] := {}
+
+fn table_index_key(handle: Int, key: String) -> String:
+    return handle.to_string() + ":" + key
 
 # Array children: flat append-only storage with offset/count
 threadlocal mut array_values_by_slot: Map[Int, Int] := {}
@@ -90,6 +97,7 @@ fn clear_table_entries(handle: Int):
     mut i := 0
     while i < cnt:
         slot := table_slot_key(handle, i)
+        table_key_index.remove(table_index_key(handle, table_keys_by_slot[slot]))
         table_keys_by_slot.remove(slot)
         table_values_by_slot.remove(slot)
         i = i + 1
@@ -108,6 +116,9 @@ fn set_table_property(handle: Int, key: String, val: Int):
     table_keys_by_slot.insert(slot, key)
     table_values_by_slot.insert(slot, val)
     table_key_counts.insert(handle, cnt + 1)
+    index_key := table_index_key(handle, key)
+    if not table_key_index.contains_key(index_key):
+        table_key_index.insert(index_key, val)
 
 # Appends a value to an array
 fn push_array_element(handle: Int, val: Int):
@@ -251,14 +262,7 @@ fn node_kind(handle: Int) -> String:
 fn table_lookup(handle: Int, key: String) -> Int:
     if node_kind(handle) != "table":
         return 0 - 1
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        slot := table_slot_key(handle, i)
-        if table_keys_by_slot[slot] == key:
-            return table_values_by_slot[slot]
-        i = i + 1
-    return 0 - 1
+    return table_key_index.get_default(table_index_key(handle, key), 0 - 1)
 
 # Skips whitespace (space, tab, carriage return)
 fn skip_whitespace():
@@ -480,15 +484,13 @@ fn ensure_table_path(root: Int, path: String) -> Int:
             is_sep = true
         if is_sep:
             key := path.substring(start, i)
+            # an empty segment (`[a..b]`, `[.]`) is not a key. accepting them
+            # let a header of dots alone build one table per dot.
+            if key == "":
+                parser_error = true
+                return 0 - 1
             # look up existing child in current table
-            cnt := table_key_counts[current]
-            mut found := 0 - 1
-            mut j := 0
-            while j < cnt:
-                slot := table_slot_key(current, j)
-                if table_keys_by_slot[slot] == key:
-                    found = table_values_by_slot[slot]
-                j = j + 1
+            mut found := table_key_index.get_default(table_index_key(current, key), 0 - 1)
             if found < 0:
                 found = allocate_node("table")
                 set_table_property(current, key, found)
@@ -537,6 +539,8 @@ fn toml_parse(input: String) -> Int:
             if parser_position < parser_input.len():
                 parser_position = parser_position + 1
             current_table = ensure_table_path(root, section)
+            if parser_error:
+                return 0 - 1
             skip_line()
         # key = value
         if c != chr(10) and c != "#" and c != "[":

@@ -450,9 +450,14 @@ fn describe_exit(status: &std::process::ExitStatus) -> String {
     use std::os::unix::process::ExitStatusExt;
     if let Some(sig) = status.signal() {
         let name = match sig {
-            11 => " (segmentation fault)",
-            6 => " (abort)",
-            9 => " (killed)",
+            4 => " (SIGILL, illegal instruction)",
+            6 => " (SIGABRT, abort)",
+            7 => " (SIGBUS, bus error)",
+            8 => " (SIGFPE, arithmetic exception)",
+            9 => " (SIGKILL, killed)",
+            11 => " (SIGSEGV, segmentation fault)",
+            13 => " (SIGPIPE, broken pipe)",
+            15 => " (SIGTERM, terminated)",
             _ => "",
         };
         return format!("crashed with signal {}{}", sig, name);
@@ -461,6 +466,20 @@ fn describe_exit(status: &std::process::ExitStatus) -> String {
         Some(c) => format!("failed with exit code {}", c),
         None => "failed".to_string(),
     }
+}
+
+/// The status `pith run` and `pith test` exit with when the program failed.
+/// A program that exited passes its code through. One killed by a signal
+/// has no code and would otherwise leave a bare exit 1 with nothing said,
+/// so this names the signal on stderr and exits with 128 plus its number,
+/// the status a shell reports for it.
+fn child_exit_code(path: &str, status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        return code;
+    }
+    eprintln!("pith: {} {}", path, describe_exit(status));
+    128 + status.signal().unwrap_or(0)
 }
 
 fn get_ir_from_compiler(path: &str, emit_tests: bool) -> Result<String, String> {
@@ -670,7 +689,7 @@ fn compile_and_run(path: &str, emit_tests: bool) {
             match status {
                 Ok(s) => {
                     if !s.success() {
-                        std::process::exit(s.code().unwrap_or(1));
+                        std::process::exit(child_exit_code(path, &s));
                     }
                 }
                 Err(e) => {

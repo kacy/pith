@@ -551,8 +551,9 @@ a sanitized build differs from a plain one in three places:
   runtime calls, so the counts need nothing extra.
 
 tsan reports a `thread leak` for a task on the os-thread backend whose handle
-is still bound and never awaited when the process exits: only a discarded
-`spawn` is detached by itself. `TSAN_OPTIONS=report_thread_leaks=0` turns those
+was passed on or stored and was never awaited before the process exits. a
+discarded `spawn` and a handle left unawaited in a local are detached
+automatically. `TSAN_OPTIONS=report_thread_leaks=0` turns those
 off.
 
 ## on the roadmap

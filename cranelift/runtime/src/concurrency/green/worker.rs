@@ -453,6 +453,7 @@ pub(super) fn has_any_work(index: usize) -> bool {
 
 /// the worker thread body: take work, run it, park when there is none.
 pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::MutatorSlot>>) {
+    crate::stack_guard::enter_thread();
     set_current_worker(Some(index));
     CACHE_OWNER.with(|c| c.set(Some(index)));
     // a worker moves reference counts, so it is a mutator the cycle collector

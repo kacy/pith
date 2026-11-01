@@ -52,8 +52,8 @@ output is part of the same determinism contract.
   line against that prediction; any divergence is a silent wrong
   answer — the class of bug no crash oracle can see. a line whose
   value genuinely cannot be pinned at generation time can be marked
-  as a wildcard the comparator skips; the summary counts them (the
-  current generator emits none).
+  as a wildcard the comparator skips; the summary counts them (only
+  leak mode emits them, for its peak readings).
 - **valgrind** (opt-in) — memcheck on the built binary.
 
 findings dedup by a normalized signature (paths, numbers, and
@@ -86,6 +86,28 @@ that is then cleared or rebound; early return, `continue` and nested loops
 over mutated lists. every value they print is a fresh heap string the
 generator computes, so a stale read shows up as filler.
 
+`--pending-shapes` adds 33 more, for the classes #1277 fixes. main's
+toolchain still gets them wrong, so they stay out of the default programs,
+the `pithgen-check` gate and the nightly hunt until those fixes land; then
+`OWN_SHAPES_SETTLED` moves up to cover them. without the flag a seed gives
+the program it gave before they were added. they are: a closure in a field
+or a list element called with an argument read from the same holder, that
+overwrites the field, replaces itself or empties its list (`fnfield`,
+`fnself`, `fnelem`, `fnelemself`); a catch-all or tuple arm over a field or
+an element whose body drops the subject's owner, inline, in a tail match and
+in a loop left by `continue` and `break` (`view*`); a field or element read
+in one operand of a concatenation, interpolation, tuple, map key, argument
+or store while a later operand, a call, overwrites or evicts it, including
+`o.name = rename(o)` (`sib*`); interpolating an optional struct, list or
+map (`opt*`); a getter's optional kept in a local while the container is
+cleared, rebound or has the element replaced (`getkept*`); map, filter and
+reduce whose function clears, grows or replaces the list it walks or the
+field it was read from (`walk*`); and a weak read handed to `unwrap_or`, a
+match, another weak slot and an interpolation, after which the strong owner
+lets go and the weak edge must read none (`weak*`). each shape's prints
+start with `own-<name>:`, and `--shapes LIST` (names, ids or `a..b`) emits
+exactly those shapes in every program, to pin a finding on one shape.
+
 on the plain toolchain these run clean, because the struct freelist recycles
 a freed block before anything reads it. `--sanitize` changes how the built
 binary runs. it links against whatever runtime `PITH_RUNTIME_LIB` names,
@@ -115,8 +137,27 @@ build the asan runtime with `RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zsanitizer=address
 wrapper has to
 add rustc's `librustc-stable_rt.asan.a` to the link. `pithgen reduce
 --sanitize` reduces a sanitizer or nondeterministic finding under the same
-matrix. there is no leak oracle yet: the generated programs run once, and a
-growth check needs a repeated-round mode they do not have.
+matrix.
+
+## the leak oracle
+
+`--leak` (on `gen`, `run` and `reduce`, plain toolchain only) moves each
+ownership shape into a fn of its own that main calls `PITH_LEAK_ROUNDS` times
+(once when unset). only the first round prints, so the expected output does
+not depend on the count, and after each shape's loop the program prints its
+peak resident set as a wildcard line. the oracle runs the binary at 5000 and
+25000 rounds and takes each shape's share of the peak: how far the peak rose
+past where the shapes before it left it. a shape that strands a value per
+round moves its share by that value times the extra rounds, so a share that
+grew by more than 256 kb (about 13 bytes a round) is a **leak** finding named
+after the shape. `PITHGEN_LEAK_ROUNDS=low,high` and `PITHGEN_LEAK_LIMIT_KB`
+override both. the readings use builtins only, so a generated program needs
+no std import. a shape that builds a reference cycle on purpose breaks it
+before it returns; one that did not would leak by design.
+
+```
+make pithgen-leak PITHGEN_SEEDS=0..200 PITHGEN_FLAGS=--pending-shapes
+```
 
 ## reducing a finding
 

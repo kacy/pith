@@ -39,14 +39,12 @@ stale and a fix to it is welcome.
   function value) is rejected with E254. key by a string, integer or bytes
   encoding of the value instead. bytes keys hash and compare by content. an
   optional map *value* is fine.
-- **`.value()` on an optional is unchecked**. it does not test for `none`. on a
-  `none` it reads back a zero (`0` for an `Int`, `""` for a `String`) or
-  crashes (a struct field read through it segfaults). check first, or use
-  `if let`, `match` or `unwrap_or`.
-- **some runtime errors stop the process**. `xs[i]` out of range and `m[k]` on
-  a missing key print `pith runtime error: ...` and exit, except inside a `T!`
-  function, where they propagate as an error. division by zero exits in either
-  case. `xs.get(i)` and `m.get(k)` return an optional.
+- **some runtime errors stop the process**. `xs[i]` and `xs[i] = v` out of
+  range, `m[k]` on a missing key and `.value()` on a `none` print
+  `pith runtime error: ...` and exit, except inside a `T!` function, where
+  they propagate as an error. division by zero exits in either case.
+  `xs.get(i)` and `m.get(k)` return an optional, and `if let`, `match` and
+  `unwrap_or` handle a `none` without stopping.
 - **a local that shadows a module global takes the name for the whole
   function**. the global is unreachable from that function, except on either
   side of a `for` loop whose variable shadows it. reading the global and then
@@ -210,6 +208,11 @@ stale and a fix to it is welcome.
   on the worker, so on a slow network mount they hold every task on it until
   they return. a file call from inside a task pays a thread handoff that a call
   from `main` does not.
+- **a green task's stack does not grow**. it is 1 MiB unless
+  `PITH_GREEN_STACK_KB` sets another size, and recursion that needs more
+  stops the process with a stack overflow report. generated code does not
+  probe the stack, so a single frame larger than the 4 KiB guard page could
+  step over it.
 - **preemption costs a check per loop back-edge**. compute-bound tasks are
   preempted at safe-points so a spinning loop cannot starve the tasks that
   share its worker. building with `PITH_GREEN_PREEMPT=0` removes the check,

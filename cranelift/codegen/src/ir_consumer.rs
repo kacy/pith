@@ -1225,7 +1225,15 @@ fn inline_runtime_call(
         runtime_func_ref(codegen, builder, func_ref_cache, runtime_funcs, name)
     };
     let value = match (fname, args.len()) {
-        ("pith_list_set_value" | "pith_list_set_value_owned" | "pith_list_set_scalar", 3) => {
+        (
+            "pith_list_set_value"
+            | "pith_list_set_value_owned"
+            | "pith_list_set_scalar"
+            | "pith_list_set_value_strict"
+            | "pith_list_set_value_owned_strict"
+            | "pith_list_set_scalar_strict",
+            3,
+        ) => {
             let fallback = runtime_ref(builder, fname)?;
             let anchor = runtime_ref(builder, "pith_list_len")?;
             inline_list_set_value(builder, args[0], args[1], args[2], fallback, anchor);
@@ -1921,7 +1929,8 @@ const INLINE_MAX_INSTS: usize = 24;
 /// The runtime functions a loop may call and still have its list header
 /// reads hoisted: none of them changes a list's header, frees a list or runs
 /// user code. The getters, length reads and string comparisons only read;
-/// `pith_list_set_scalar` stores a word with no count to take or drop; the
+/// `pith_list_set_scalar` stores a word with no count to take or drop (its
+/// strict form can also stop the process, like the strict getter); the
 /// yield lets another task run, and a task that changes a list this loop
 /// reads without a lock races it under OS threads too.
 const LOOP_KEEP_CALLS: &[&str] = &[
@@ -1929,6 +1938,7 @@ const LOOP_KEEP_CALLS: &[&str] = &[
     "pith_list_get_value_strict",
     "pith_list_len",
     "pith_list_set_scalar",
+    "pith_list_set_scalar_strict",
     "byte_at",
     "string_len",
     "pith_cstring_eq",
@@ -2358,9 +2368,10 @@ fn normalize_runtime_result(
     builder.ins().select(is_error, zero, encoded)
 }
 
-/// The start of `main`: every module's tracer registration, then each
-/// unprefixed `__init_globals_N`, then the main module's `__init_globals`,
-/// then the string globals, which point at their literals.
+/// The start of `main`: `pith_runtime_start`, which arms the stack overflow
+/// report, then every module's tracer registration, then each unprefixed
+/// `__init_globals_N`, then the main module's `__init_globals`, then the
+/// string globals, which point at their literals.
 ///
 /// The tracers come before any global is built: a global is marked shared
 /// as it is stored, and the marking walks a struct's fields through its
@@ -2378,12 +2389,17 @@ fn normalize_runtime_result(
 fn emit_main_prologue(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
+    runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
     global_data: &HashMap<String, DataId>,
     string_lits: &HashMap<String, DataId>,
     str_globals: &[(String, String)],
     body_lines: &[&str],
 ) {
+    if let Some(&start_id) = runtime_funcs.get("pith_runtime_start") {
+        let start_ref = codegen.module.declare_func_in_func(start_id, builder.func);
+        builder.ins().call(start_ref, &[]);
+    }
     let mut startup: Vec<(&String, FuncId)> = declared_funcs
         .iter()
         .filter(|(name, _)| name.contains("__cc_register_tracers"))
@@ -2593,6 +2609,7 @@ fn compile_ir_function(
         emit_main_prologue(
             codegen,
             &mut builder,
+            runtime_funcs,
             declared_funcs,
             global_data,
             string_lits,
@@ -4280,10 +4297,11 @@ mod tests {
         let plain = compiled(false);
         let sanitized = compiled(true);
         let calls = |text: &str| text.matches(" call ").count();
-        // the alloc and the fast path's cold fallback, against the alloc,
-        // the two checks and a plain list_len call
-        assert_eq!(calls(&plain), 2, "{plain}");
-        assert_eq!(calls(&sanitized), 4, "{sanitized}");
+        // after main's pith_runtime_start: the alloc and the fast path's
+        // cold fallback, against the alloc, the two checks and a plain
+        // list_len call
+        assert_eq!(calls(&plain), 3, "{plain}");
+        assert_eq!(calls(&sanitized), 5, "{sanitized}");
         assert!(!sanitized.contains("can_move"), "{sanitized}");
     }
 

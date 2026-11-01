@@ -1,0 +1,60 @@
+# one task reads a weak field over and over while another drops the target's
+# last strong owner. a weak read used to check that the target was alive and
+# take its count later, at `.value()`; a drop between the two ran the
+# destructor while the reader went on to revive the value, and the reader then
+# used freed fields (a crash in four runs of ten on PITH_GREEN=0, every
+# run under ASan). the read now takes its count in the same atomic step that
+# checks, so it sees either a live child or none.
+#
+# a race, so a pass is evidence rather than proof; the loom model of the
+# upgrade (cranelift/runtime/src/loom_models/weak.rs) is the exhaustive check.
+
+struct Child:
+    name: String
+    n: Int
+
+struct Holder:
+    mut child: Child?
+    weak w: Child?
+
+fn reader(ch: Channel[Holder]) -> Int:
+    mut torn := 0
+    while true:
+        got := ch.recv()
+        if got == none:
+            break
+        h := got.value()
+        mut spins := 0
+        while spins < 64:
+            w := h.w
+            if w == none:
+                break
+            c := w.value()
+            if c.name != "child-" + c.n.to_string():
+                torn = torn + 1
+            spins = spins + 1
+    return torn
+
+fn writer(ch: Channel[Holder], rounds: Int) -> Int:
+    mut i := 0
+    mut keep: List[Holder] := []
+    while i < rounds:
+        c := Child(name: "child-" + i.to_string(), n: i)
+        h := Holder(child: c, w: c)
+        keep.push(h)
+        ch.send(h)
+        if keep.len() > 3:
+            old := keep[0]
+            old.child = none
+            keep.remove(0)
+        i = i + 1
+    ch.close()
+    return i
+
+fn main():
+    ch := Channel[Holder](8)
+    r := spawn reader(ch)
+    w := spawn writer(ch, 100000)
+    sent := await w
+    torn := await r
+    print("sent {sent}, torn reads {torn}")

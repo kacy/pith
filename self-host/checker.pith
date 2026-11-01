@@ -18,7 +18,7 @@
 # code does not follow it.
 
 from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_VOID, TID_ERR, TID_NONE
-from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
+from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
 from ast import Node, get_node
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
@@ -2431,11 +2431,15 @@ fn collection_literal_matches_target(value_idx: Int, target_tid: Int, scope_id: 
 mut fn_bound_names: List[String] := []
 mut fn_weak_names: List[String] := []
 mut checker_lambda_depth := 0
+# the parameter scope of the innermost lambda being checked, or -1 outside
+# one. an assignment inside the lambda to a name bound past it is rejected.
+mut checker_lambda_scope := 0 - 1
 
 fn reset_fn_weak_tracking():
     fn_bound_names = []
     fn_weak_names = []
     checker_lambda_depth = 0
+    checker_lambda_scope = 0 - 1
 
 # record a non-weak binding name (param, loop variable, match payload, plain
 # `:=`), rejecting reuse of a name that is weak elsewhere in the function.
@@ -2579,6 +2583,12 @@ fn check_assignment(node: Node, scope_id: Int):
     if target_node.kind == "ident":
         if is_binding_mutable(scope_id, target_node.value) == false:
             report_error_with_fix("E216", "cannot assign to immutable variable '" + target_node.value + "'", "declare with 'mut': mut " + target_node.value)
+            return
+        # a closure captures by value, so the write would land on its copy
+        # and never reach the variable outside. it used to be accepted and
+        # silently dropped.
+        if checker_lambda_scope >= 0 and binding_is_captured_past(scope_id, target_node.value, checker_lambda_scope):
+            report_error_with_fix("E269", "cannot assign to '" + target_node.value + "' inside a closure: a closure captures a copy, so the variable outside would not change", "return the new value from the closure, or keep the state in a struct field or a collection the closure can update")
             return
     target_type := c_check_expr(target_idx, scope_id)
     val_type := c_check_expr(value_idx, scope_id)
@@ -7055,6 +7065,8 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
     # check body. the depth counter marks that names resolved in here cross a
     # closure boundary, which is what the weak-capture rejection keys off.
     checker_lambda_depth = checker_lambda_depth + 1
+    saved_lambda_scope := checker_lambda_scope
+    checker_lambda_scope = lambda_scope
     mut ret_type := TID_VOID
     if body_idx >= 0:
         body_node := get_node(body_idx)
@@ -7085,6 +7097,7 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
         else:
             ret_type = c_check_expr(body_idx, lambda_scope)
     checker_lambda_depth = checker_lambda_depth - 1
+    checker_lambda_scope = saved_lambda_scope
     return add_type_info(ti_function(params, ret_type))
 
 # ---------------------------------------------------------------
@@ -7965,6 +7978,7 @@ pub struct CheckerSnapshot:
     pub fn_bound_names: List[String]
     pub fn_weak_names: List[String]
     pub checker_lambda_depth: Int
+    pub checker_lambda_scope: Int
     pub lambda_inferred_return: Int
 
 # copy the checker's state out. the live state keeps changing
@@ -8030,6 +8044,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         fn_bound_names: copy_list(fn_bound_names),
         fn_weak_names: copy_list(fn_weak_names),
         checker_lambda_depth: checker_lambda_depth,
+        checker_lambda_scope: checker_lambda_scope,
         lambda_inferred_return: lambda_inferred_return)
 
 # make the live state a copy of the snapshot, leaving the snapshot as
@@ -8095,4 +8110,5 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     fn_bound_names = copy_list(s.fn_bound_names)
     fn_weak_names = copy_list(s.fn_weak_names)
     checker_lambda_depth = s.checker_lambda_depth
+    checker_lambda_scope = s.checker_lambda_scope
     lambda_inferred_return = s.lambda_inferred_return

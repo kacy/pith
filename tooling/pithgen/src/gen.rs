@@ -140,6 +140,7 @@ enum Print {
 
 pub struct Gen {
     rng: Rng,
+    opts: GenOpts,
     pub feats: Feats,
     structs: Vec<StructDef>,
     enums: Vec<EnumDef>,
@@ -159,8 +160,92 @@ const ENUM_POOL: &[&str] = &["Phase", "Route", "Verdict", "Pulse", "Grade", "Sta
 const IFACE_POOL: &[&str] = &["Source", "Gauge", "Sink"];
 const FN_POOL: &[&str] = &["blend", "carry", "weigh", "stamp", "tally", "probe", "gather", "settle"];
 const FIELD_POOL: &[&str] = &["label", "weight", "count", "tag", "note", "rank", "extra", "inner"];
-/// how many shapes block_ownership draws from
-const OWN_SHAPES: u32 = 23;
+/// the ownership shapes by id. a shape prints lines tagged `own-<name>:` (the
+/// shrink shape prints own-grow half the time), and `--shapes` takes names or
+/// ids. ids below OWN_SHAPES_SETTLED run clean on main's toolchain; the rest
+/// are pending (see GenOpts::pending). when their fixes land, set
+/// OWN_SHAPES_SETTLED to OWN_SHAPES and every program draws them.
+const OWN_SHAPE_NAMES: &[&str] = &[
+    "clear", "remove", "set", "call", "struct", "global", "field", "method", "element", "optional",
+    "weaktmp", "weaklive", "iflet", "closure", "optbind", "ifletclear", "match", "return", "shrink",
+    "tmpfield", "closurefield", "nested", "cut",
+    // pending: closures called out of a holder
+    "fnfield", "fnself", "fnelem", "fnelemself",
+    // pending: a catch-all or tuple arm that drops its borrowed subject
+    "viewfield", "viewstring", "viewenum", "viewelem", "viewtuple", "viewtail", "viewloop",
+    // pending: a sibling operand drops what an earlier one read
+    "sibcat", "sibinterp", "sibtuple", "sibmapkey", "sibarg", "sibassign", "sibindex",
+    // pending: interpolating an optional struct, list or map
+    "optstruct", "optlist", "optmap",
+    // pending: a kept getter optional outlives its container's hold
+    "getkept", "getkeptmap", "getkeptstr",
+    // pending: map, filter and reduce whose function changes what they walk
+    "walkfield", "walkfilter", "walkclear", "walkpush", "walkreplace",
+    // pending: consumers of a weak read
+    "weakunwrap", "weakmatch", "weakstore", "weakinterp",
+];
+const OWN_SHAPES_SETTLED: u32 = 23;
+const OWN_SHAPES: u32 = OWN_SHAPE_NAMES.len() as u32;
+
+/// the ownership shape's name for an id
+pub fn shape_name(k: u32) -> &'static str {
+    OWN_SHAPE_NAMES.get(k as usize).copied().unwrap_or("?")
+}
+
+/// generation options shared by gen, run and reduce. a seed and the same
+/// options always give the same program.
+#[derive(Clone)]
+pub struct GenOpts {
+    /// `--pending-shapes`: draw the pending ownership shapes too. they
+    /// reproduce bugs main's toolchain still has, so they stay out of the
+    /// default programs (the deterministic gate, the nightly hunt) until the
+    /// fixes land. without it a seed gives the program it gave before they
+    /// were added.
+    pub pending: bool,
+    /// emit exactly these ownership shapes in every program, to attribute
+    /// findings to one shape
+    pub only: Option<Vec<u32>>,
+    /// leak mode: each ownership shape runs in a loop of PITH_LEAK_ROUNDS
+    /// rounds (one by default), and the program prints its peak resident set
+    /// after each shape for the leak oracle
+    pub rounds: bool,
+}
+
+impl GenOpts {
+    pub fn from_args(args: &[String]) -> GenOpts {
+        let only = args
+            .iter()
+            .position(|a| a == "--shapes")
+            .and_then(|i| args.get(i + 1))
+            .map(|list| parse_shapes(list));
+        GenOpts {
+            pending: args.iter().any(|a| a == "--pending-shapes"),
+            only,
+            rounds: args.iter().any(|a| a == "--leak"),
+        }
+    }
+}
+
+/// a comma list of shape names, ids and `a..b` id ranges
+fn parse_shapes(list: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    for item in list.split(',').filter(|s| !s.is_empty()) {
+        if let Some((a, b)) = item.split_once("..") {
+            let a: u32 = a.parse().expect("bad --shapes range");
+            let b: u32 = b.parse().expect("bad --shapes range");
+            out.extend(a..b.min(OWN_SHAPES));
+        } else if let Ok(k) = item.parse::<u32>() {
+            assert!(k < OWN_SHAPES, "--shapes: no shape {}", k);
+            out.push(k);
+        } else {
+            match OWN_SHAPE_NAMES.iter().position(|n| *n == item) {
+                Some(k) => out.push(k as u32),
+                None => panic!("--shapes: no shape named {}", item),
+            }
+        }
+    }
+    out
+}
 const VARIANT_POOL: &[&str] = &["Alpha", "Beta", "Gamma", "Delta", "Omega", "Zed"];
 
 pub struct Program {
@@ -168,9 +253,12 @@ pub struct Program {
     pub expected: Vec<ExpLine>,       // predicted stdout for a clean run
 }
 
-pub fn generate(seed: u64) -> Program {
-    let mut g = Gen::new(seed);
+pub fn generate(seed: u64, opts: &GenOpts) -> Program {
+    let mut g = Gen::new(seed, opts.clone());
     g.decide_features();
+    if g.opts.only.is_some() {
+        g.feats.ownership = true;
+    }
     for m in 1..g.feats.n_modules {
         g.gen_module_decls(m);
     }
@@ -183,9 +271,10 @@ pub fn generate(seed: u64) -> Program {
 }
 
 impl Gen {
-    fn new(seed: u64) -> Gen {
+    fn new(seed: u64, opts: GenOpts) -> Gen {
         Gen {
             rng: Rng::new(seed),
+            opts,
             feats: Feats::default(),
             structs: Vec::new(),
             enums: Vec::new(),
@@ -205,7 +294,6 @@ impl Gen {
         self.expected.push(ExpLine { text, wildcard: false });
     }
 
-    #[allow(dead_code)]
     fn expect_wild(&mut self) {
         self.expected.push(ExpLine { text: String::new(), wildcard: true });
     }
@@ -2912,25 +3000,63 @@ impl ONode:
         return s
 "#;
         self.decl_text[0].push_str(decls);
+        if self.opts.pending || self.opts.only.is_some() {
+            self.decl_text[0].push_str(PENDING_DECLS);
+        }
+        if self.opts.rounds {
+            self.decl_text[0].push_str(ROUNDS_DECLS);
+        }
     }
 
     fn block_ownership(&mut self, out: &mut String, _sc: &mut Scope) {
         // pick a varied subset so programs differ by seed, but keep the odds
         // high that any given shape appears across a batch
-        let mut ids: Vec<u32> = (0..OWN_SHAPES).collect();
+        let n = if self.opts.pending { OWN_SHAPES } else { OWN_SHAPES_SETTLED };
+        let mut ids: Vec<u32> = (0..n).collect();
         for i in (1..ids.len()).rev() {
             let j = self.rng.below(i + 1);
             ids.swap(i, j);
         }
+        if let Some(only) = self.opts.only.clone() {
+            ids = only;
+        }
         let mut emitted = 0;
         for k in ids {
             // force the first couple regardless so the block is never empty
-            if emitted >= 2 && !self.rng.chance(60) {
+            if self.opts.only.is_none() && emitted >= 2 && !self.rng.chance(60) {
                 continue;
             }
-            self.emit_ownership_shape(out, k);
+            if self.opts.rounds {
+                self.emit_shape_rounds(out, k);
+            } else {
+                self.emit_ownership_shape(out, k);
+            }
             emitted += 1;
         }
+    }
+
+    /// leak mode: the shape becomes the body of its own fn, which main calls
+    /// PITH_LEAK_ROUNDS times. only the first round prints, so the expected
+    /// output is the same at any round count, and the peak resident set
+    /// printed after the loop is a wildcard line the leak oracle reads.
+    fn emit_shape_rounds(&mut self, out: &mut String, k: u32) {
+        let f = format!("oround{}", self.counter);
+        let r = format!("ow{}", self.counter + 1);
+        self.counter += 2;
+        let mut body = String::new();
+        self.emit_ownership_shape(&mut body, k);
+        // every print in a shape is a statement of its own, and no literal
+        // a shape emits contains this text
+        let body = body.replace("print(", "oput(");
+        self.decl_text[0].push_str(&format!("\nfn {}():\n{}", f, body));
+        out.push_str("    og_quiet = false\n");
+        out.push_str(&format!("    mut {} := 0\n", r));
+        out.push_str(&format!("    while {} < orounds():\n", r));
+        out.push_str(&format!("        {}()\n", f));
+        out.push_str("        og_quiet = true\n");
+        out.push_str(&format!("        {} = {} + 1\n", r, r));
+        out.push_str(&format!("    print(\"own-kb {}: {{opeak_kb()}}\")\n", shape_name(k)));
+        self.expect_wild();
     }
 
     fn emit_ownership_shape(&mut self, out: &mut String, k: u32) {
@@ -3224,6 +3350,394 @@ impl ONode:
                 out.push_str("        break\n");
                 self.expect(format!("own-closure: {}", a));
             }
+            _ => self.emit_pending_shape(out, k, &v),
+        }
+    }
+
+    /// a fresh heap string: the code that builds it at run time, and the text
+    /// it prints. a literal is a static the runtime never frees, so a stale
+    /// read of one would go unseen.
+    fn oheap(&mut self, tag: char) -> (String, String) {
+        let lit = self.olit(tag);
+        (format!("\"{}\" + \"-h\"", lit), format!("{}-h", lit))
+    }
+
+    fn oname(&mut self) -> String {
+        let n = format!("ow{}", self.counter);
+        self.counter += 1;
+        n
+    }
+
+    /// an OView whose every field holds a fresh heap value: the construction
+    /// and the printed names of c, s, cs[0] and the slot's node
+    fn oview(&mut self) -> (String, Vec<String>) {
+        let parts: Vec<(String, String)> = "csen".chars().map(|t| self.oheap(t)).collect();
+        let code = format!(
+            "OView(c: OLeaf(name: {}), s: {}, cs: [OLeaf(name: {})], slot: OSlot.Holds(ONode(name: {}, val: 1, tags: [], next: none, back: none)))",
+            parts[0].0, parts[1].0, parts[2].0, parts[3].0
+        );
+        (code, parts.into_iter().map(|p| p.1).collect())
+    }
+
+    /// the pending shapes: the classes #1277 fixes, which main's toolchain
+    /// still gets wrong. each drops the owner of a value it read (or keeps a
+    /// count it should not) and reads the value after an oscrub, so a freed
+    /// value reads back as filler and a stranded count shows as a live weak
+    /// edge.
+    fn emit_pending_shape(&mut self, out: &mut String, k: u32, v: &str) {
+        let name = shape_name(k);
+        match name {
+            "fnfield" => {
+                // a closure in a field called with an argument read from the
+                // same holder, overwriting that field while it runs
+                let (ac, a) = self.oheap('f');
+                out.push_str(&format!("    mut {} := OFn(name: {}, f: oplain)\n", v, ac));
+                out.push_str(&format!("    {}.f = fn(s: String) -> String:\n", v));
+                out.push_str(&format!("        {}.name = \"oreplaced\" + \"-ownpayload-x\"\n", v));
+                out.push_str("        oscrub()\n        return s\n");
+                out.push_str(&format!("    print(\"own-fnfield: {{{v}.f({v}.name)}} {{{v}.name}}\")\n", v = v));
+                // the closure captures its holder; put a plain fn back to
+                // break the cycle
+                out.push_str(&format!("    {}.f = oplain\n", v));
+                self.expect(format!("own-fnfield: {} oreplaced-ownpayload-x", a));
+            }
+            "fnself" => {
+                // a closure in a field that replaces itself while it runs
+                let (tc, t) = self.oheap('f');
+                out.push_str(&format!("    {} := OFn(name: \"\", f: oplain)\n", v));
+                out.push_str(&format!("    oinstall_self({}, {})\n", v, tc));
+                out.push_str(&format!("    print(\"own-fnself: {{{v}.f(\"x\")}} {{{v}.f(\"y\")}}\")\n", v = v));
+                self.expect(format!("own-fnself: {}x y", t));
+            }
+            "fnelem" => {
+                // a closure in a list element that empties its list
+                let (tc, t) = self.oheap('f');
+                out.push_str(&format!("    {} := OFs(fs: [])\n", v));
+                out.push_str(&format!("    {}.fs.push(oclearing({}, {}))\n", v, v, tc));
+                out.push_str(&format!("    print(\"own-fnelem: {{{v}.fs[0](1)}} {{{v}.fs.len()}}\")\n", v = v));
+                self.expect(format!("own-fnelem: {} 0", t));
+            }
+            "fnelemself" => {
+                // a closure in a list element that overwrites its own slot
+                let (tc, t) = self.oheap('f');
+                out.push_str(&format!("    {} := OFs(fs: [])\n", v));
+                out.push_str(&format!("    {}.fs.push(oreplacing({}, {}))\n", v, v, tc));
+                out.push_str(&format!("    print(\"own-fnelemself: {{{v}.fs[0](1)}} {{{v}.fs[0](2)}}\")\n", v = v));
+                self.expect(format!("own-fnelemself: {} oplain", t));
+            }
+            "viewfield" | "viewstring" | "viewenum" | "viewelem" | "viewtuple" | "viewtail" => {
+                // a catch-all or tuple arm over a field or an element, whose
+                // body drops the subject's owner before reading the binding
+                if name == "viewtuple" {
+                    // a struct of its own: a tuple field strands its
+                    // elements when the struct is freed, and the leak oracle
+                    // should pin that on this shape alone
+                    let (ac, a) = self.oheap('a');
+                    let (bc, b) = self.oheap('b');
+                    out.push_str(&format!("    {} := OPair(pair: ({}, OLeaf(name: {})))\n", v, ac, bc));
+                    out.push_str(&format!(
+                        "    match {}.pair:\n        (a, b) =>\n            {}.pair = (\"ox\", OLeaf(name: \"oy\"))\n            oscrub()\n            print(\"own-viewtuple: {{a}} {{b.name}}\")\n",
+                        v, v
+                    ));
+                    self.expect(format!("own-viewtuple: {} {}", a, b));
+                    return;
+                }
+                let (code, names) = self.oview();
+                out.push_str(&format!("    {} := {}\n", v, code));
+                let (subject, arms, line) = match name {
+                    "viewfield" => (
+                        format!("{}.c", v),
+                        format!("        x =>\n            {}.c = OLeaf(name: \"oother\")\n            oscrub()\n            print(\"own-viewfield: {{x.name}}\")\n", v),
+                        format!("own-viewfield: {}", names[0]),
+                    ),
+                    "viewstring" => (
+                        format!("{}.s", v),
+                        format!("        \"onope\" =>\n            print(\"own-viewstring: nope\")\n        x =>\n            {}.s = \"oother\" + \"-x\"\n            oscrub()\n            print(\"own-viewstring: {{x}}\")\n", v),
+                        format!("own-viewstring: {}", names[1]),
+                    ),
+                    "viewenum" => (
+                        format!("{}.slot", v),
+                        format!("        OSlot.Empty =>\n            print(\"own-viewenum: empty\")\n        x =>\n            {}.slot = OSlot.Empty\n            oscrub()\n            print(\"own-viewenum: {{oslot_name(x)}}\")\n", v),
+                        format!("own-viewenum: {}", names[3]),
+                    ),
+                    "viewelem" => (
+                        format!("{}.cs[0]", v),
+                        format!("        x =>\n            {}.cs.clear()\n            oscrub()\n            print(\"own-viewelem: {{x.name}}\")\n", v),
+                        format!("own-viewelem: {}", names[2]),
+                    ),
+                    _ => {
+                        // a tail match in a callee, every arm returning
+                        out.push_str(&format!("    print(\"own-viewtail: {{otake_view({})}}\")\n", v));
+                        self.expect(format!("own-viewtail: {}", names[0]));
+                        return;
+                    }
+                };
+                out.push_str(&format!("    match {}:\n{}", subject, arms));
+                self.expect(line);
+            }
+            "viewloop" => {
+                // the same in a loop, leaving the arm by continue and break
+                let (code, _) = self.oview();
+                let seen = self.oname();
+                let i = self.oname();
+                out.push_str(&format!("    {} := {}\n", v, code));
+                out.push_str(&format!("    mut {}: List[String] := []\n", seen));
+                out.push_str(&format!("    mut {} := 0\n", i));
+                out.push_str(&format!("    while {} < 3:\n", i));
+                out.push_str(&format!("        {}.c = OLeaf(name: \"oloop\" + \"-{{{}}}\")\n", v, i));
+                out.push_str(&format!("        {} = {} + 1\n", i, i));
+                out.push_str(&format!("        match {}.c:\n            x =>\n", v));
+                out.push_str(&format!("                {}.c = OLeaf(name: \"oother\")\n", v));
+                out.push_str("                oscrub()\n");
+                out.push_str(&format!("                {}.push(x.name)\n", seen));
+                out.push_str(&format!("                if {} == 1:\n                    continue\n", i));
+                out.push_str(&format!("                if {} == 2:\n                    break\n", i));
+                out.push_str(&format!("    print(\"own-viewloop: {{{}.join(\" \")}}\")\n", seen));
+                self.expect("own-viewloop: oloop-0 oloop-1".to_string());
+            }
+            "sibcat" | "sibinterp" | "sibtuple" | "sibmapkey" | "sibarg" => {
+                // a field (or element) read in one operand while a later
+                // operand, a call, overwrites or evicts it
+                let (ac, a) = self.oheap('s');
+                if name == "sibcat" && self.rng.chance(50) {
+                    out.push_str(&format!("    mut {}: List[String] := [{}]\n", v, ac));
+                    out.push_str(&format!("    print(\"own-sibcat: {{{v}[0] + oevict({v})}}\")\n", v = v));
+                    self.expect(format!("own-sibcat: {}!", a));
+                    return;
+                }
+                out.push_str(&format!(
+                    "    {} := ONode(name: {}, val: 1, tags: [], next: none, back: none)\n",
+                    v, ac
+                ));
+                match name {
+                    "sibcat" => {
+                        out.push_str(&format!("    print(\"own-sibcat: {{{v}.name + orename({v})}}\")\n", v = v));
+                        self.expect(format!("own-sibcat: {}!", a));
+                    }
+                    "sibinterp" => {
+                        out.push_str(&format!("    print(\"own-sibinterp: {{{v}.name}}{{orename({v})}}\")\n", v = v));
+                        self.expect(format!("own-sibinterp: {}!", a));
+                    }
+                    "sibtuple" => {
+                        let t = self.oname();
+                        out.push_str(&format!("    {} := ({}.name, orename({}))\n", t, v, v));
+                        out.push_str(&format!("    print(\"own-sibtuple: {{{t}.0}} {{{t}.1}}\")\n", t = t));
+                        self.expect(format!("own-sibtuple: {} !", a));
+                    }
+                    "sibmapkey" => {
+                        let m = self.oname();
+                        if self.rng.chance(50) {
+                            out.push_str(&format!("    mut {}: Map[String, String] := {{}}\n", m));
+                            out.push_str(&format!("    {}.insert({}.name, orename({}))\n", m, v, v));
+                        } else {
+                            out.push_str(&format!("    {}: Map[String, String] := {{{}.name: orename({})}}\n", m, v, v));
+                        }
+                        out.push_str(&format!("    print(\"own-sibmapkey: {{{}.keys()[0]}}\")\n", m));
+                        self.expect(format!("own-sibmapkey: {}", a));
+                    }
+                    _ => {
+                        out.push_str(&format!("    print(\"own-sibarg: {{otwo({v}.name, orename({v}))}}\")\n", v = v));
+                        self.expect(format!("own-sibarg: {}!", a));
+                    }
+                }
+            }
+            "sibassign" => {
+                // a store whose value, a call, overwrites the field, the
+                // global or the receiver being stored to
+                match self.rng.below(3) {
+                    0 => {
+                        let (ac, _) = self.oheap('s');
+                        out.push_str(&format!(
+                            "    {} := ONode(name: {}, val: 1, tags: [], next: none, back: none)\n",
+                            v, ac
+                        ));
+                        out.push_str(&format!("    {}.name = orename({})\n", v, v));
+                        out.push_str(&format!("    print(\"own-sibassign: {{{}.name}}\")\n", v));
+                        self.expect("own-sibassign: !".to_string());
+                    }
+                    1 => {
+                        out.push_str("    og_name = oset_global()\n");
+                        out.push_str("    print(\"own-sibassign: {og_name}\")\n");
+                        self.expect("own-sibassign: oouter-global".to_string());
+                    }
+                    _ => {
+                        let (ac, _) = self.oheap('s');
+                        out.push_str(&format!(
+                            "    {} := OBox(o: ONode(name: {}, val: 1, tags: [], next: none, back: none))\n",
+                            v, ac
+                        ));
+                        out.push_str(&format!("    {}.o.name = oswap_o({})\n", v, v));
+                        out.push_str(&format!("    print(\"own-sibassign: {{{}.o.name}}\")\n", v));
+                        // the store lands in the node the call replaced
+                        self.expect("own-sibassign: oswapped".to_string());
+                    }
+                }
+            }
+            "sibindex" => {
+                // an index store or read whose index, a call, replaces the list
+                let (ac, a) = self.oheap('s');
+                out.push_str(&format!("    {} := OItems(items: [{}], f: oplain)\n", v, ac));
+                if self.rng.chance(50) {
+                    let (bc, _) = self.oheap('s');
+                    out.push_str(&format!("    {}.items[oswap_items({})] = {}\n", v, v, bc));
+                    out.push_str(&format!("    print(\"own-sibindex: {{{}.items[0]}}\")\n", v));
+                    // the store lands in the list the call replaced
+                    self.expect("own-sibindex: oswapped-ownpayload-x".to_string());
+                } else {
+                    let r = self.oname();
+                    out.push_str(&format!("    {} := {}.items[oswap_items({})]\n", r, v, v));
+                    out.push_str(&format!("    print(\"own-sibindex: {{{}}}\")\n", r));
+                    self.expect(format!("own-sibindex: {}", a));
+                }
+            }
+            "optstruct" => {
+                let (ac, a) = self.oheap('p');
+                out.push_str(&format!("    {} := [OLeaf(name: {})]\n", v, ac));
+                out.push_str(&format!("    print(\"own-optstruct: {{{v}.get(0)}} {{{v}.get(3)}}\")\n", v = v));
+                self.expect(format!("own-optstruct: OLeaf(name: {}) none", a));
+            }
+            "optlist" => {
+                let (ac, a) = self.oheap('p');
+                out.push_str(&format!("    {} := [[{}, \"oy\"]]\n", v, ac));
+                out.push_str(&format!("    print(\"own-optlist: {{{}.get(0)}}\")\n", v));
+                self.expect(format!("own-optlist: [{}, oy]", a));
+            }
+            "optmap" => {
+                let (ac, a) = self.oheap('p');
+                out.push_str(&format!("    mut {}: List[Map[String, Int]] := []\n", v));
+                out.push_str(&format!("    {}.push({{{}: 7}})\n", v, ac));
+                out.push_str(&format!("    print(\"own-optmap: {{{}.get(0)}}\")\n", v));
+                self.expect(format!("own-optmap: {{{}: 7}}", a));
+            }
+            "getkept" | "getkeptstr" => {
+                // a getter's optional kept in a local while the list lets go
+                // of the element, then read
+                let (ac, a) = self.oheap('g');
+                let g = self.oname();
+                let getter = ["get(0)", "first()", "last()"][self.rng.below(3)];
+                let (elem_ty, other, read) = if name == "getkept" {
+                    ("OLeaf", "OLeaf(name: \"oother\")".to_string(), format!("{}.value().name", g))
+                } else {
+                    ("String", "\"oother\" + \"-x\"".to_string(), format!("{}.value()", g))
+                };
+                let elem = if name == "getkept" { format!("OLeaf(name: {})", ac) } else { ac };
+                out.push_str(&format!("    mut {}: List[{}] := [{}]\n", v, elem_ty, elem));
+                out.push_str(&format!("    {} := {}.{}\n", g, v, getter));
+                match self.rng.below(3) {
+                    0 => out.push_str(&format!("    {}.clear()\n", v)),
+                    1 => out.push_str(&format!("    {} = []\n", v)),
+                    _ => out.push_str(&format!("    {}[0] = {}\n", v, other)),
+                }
+                out.push_str("    oscrub()\n");
+                out.push_str(&format!("    if {} != none:\n        print(\"own-{}: {{{}}}\")\n", g, name, read));
+                self.expect(format!("own-{}: {}", name, a));
+            }
+            "getkeptmap" => {
+                let (ac, a) = self.oheap('g');
+                let g = self.oname();
+                out.push_str(&format!("    mut {}: Map[String, OLeaf] := {{}}\n", v));
+                out.push_str(&format!("    {}.insert(\"k\", OLeaf(name: {}))\n", v, ac));
+                out.push_str(&format!("    {} := {}.get(\"k\")\n", g, v));
+                if self.rng.chance(50) {
+                    out.push_str(&format!("    {}.remove(\"k\")\n", v));
+                } else {
+                    out.push_str(&format!("    {}.insert(\"k\", OLeaf(name: \"oother\"))\n", v));
+                }
+                out.push_str("    oscrub()\n");
+                out.push_str(&format!("    if {} != none:\n        print(\"own-getkeptmap: {{{}.value().name}}\")\n", g, g));
+                self.expect(format!("own-getkeptmap: {}", a));
+            }
+            "walkfield" | "walkfilter" => {
+                // map or filter over a field, with a function read from the
+                // same holder that replaces both the function and the list
+                let items: Vec<(String, String)> = (0..3).map(|_| self.oheap('w')).collect();
+                let codes: Vec<&str> = items.iter().map(|p| p.0.as_str()).collect();
+                let w = self.oname();
+                out.push_str(&format!("    {} := OItems(items: [{}], f: oplain)\n", v, codes.join(", ")));
+                out.push_str(&format!("    oinstall_walk({})\n", v));
+                if name == "walkfield" {
+                    out.push_str(&format!("    {} := {}.items.map({}.f)\n", w, v, v));
+                    let vals: Vec<String> = items.iter().map(|p| format!("{}!", p.1)).collect();
+                    self.expect(format!("own-walkfield: {}", vals.join(",")));
+                } else {
+                    out.push_str(&format!("    {} := {}.items.filter(fn(s: String) => {}.f(s).len() > 0)\n", w, v, v));
+                    let vals: Vec<String> = items.iter().map(|p| p.1.clone()).collect();
+                    self.expect(format!("own-walkfilter: {}", vals.join(",")));
+                }
+                out.push_str(&format!("    print(\"own-{}: {{{}.join(\",\")}}\")\n", name, w));
+            }
+            "walkclear" | "walkpush" | "walkreplace" => {
+                // map, filter or reduce over a local list whose function
+                // empties it, grows it or replaces an element, then reads its
+                // argument
+                let (ac, a) = self.oheap('w');
+                let (bc, b) = self.oheap('w');
+                let f = self.oname();
+                let w = self.oname();
+                let change = match name {
+                    "walkclear" => format!("{}.clear()", v),
+                    "walkpush" => format!("{}.push(\"ogrow\" + \"-x\")", v),
+                    _ => format!("{}[0] = \"oother\" + \"-x\"", v),
+                };
+                let len = if name == "walkclear" { 0 } else if name == "walkpush" { 4 } else { 2 };
+                out.push_str(&format!("    mut {}: List[String] := [{}, {}]\n", v, ac, bc));
+                let (sig, ret, call, result) = match self.rng.below(3) {
+                    0 => ("s: String) -> String", "s + \"?\"", format!("{}.map({})", v, f), format!("{}?,{}?", a, b)),
+                    1 => ("s: String) -> Bool", "s.len() > 0", format!("{}.filter({})", v, f), format!("{},{}", a, b)),
+                    _ => (
+                        "acc: String, s: String) -> String",
+                        "acc + s",
+                        format!("{}.reduce(\"\", {})", v, f),
+                        format!("{}{}", a, b),
+                    ),
+                };
+                out.push_str(&format!("    {} := fn({}:\n        {}\n        oscrub()\n        return {}\n", f, sig, change, ret));
+                out.push_str(&format!("    {} := {}\n", w, call));
+                if call.contains(".reduce(") {
+                    out.push_str(&format!("    print(\"own-{}: {{{}}} {{{}.len()}}\")\n", name, w, v));
+                } else {
+                    out.push_str(&format!("    print(\"own-{}: {{{}.join(\",\")}} {{{}.len()}}\")\n", name, w, v));
+                }
+                self.expect(format!("own-{}: {} {}", name, result, len));
+            }
+            "weakunwrap" | "weakmatch" | "weakstore" | "weakinterp" => {
+                // a weak read handed to a consumer, then the strong owner
+                // dropped: a consumer that kept the count it was handed keeps
+                // the target alive, and the weak edge reads live
+                let (ac, a) = self.oheap('k');
+                let r = self.oname();
+                out.push_str(&format!("    {} := OWeak(held: OLeaf(name: {}), w: none, w2: none)\n", v, ac));
+                out.push_str(&format!("    {}.w = {}.held\n", v, v));
+                let shown = match name {
+                    "weakunwrap" => {
+                        out.push_str(&format!("    {} := {}.w.unwrap_or(OLeaf(name: \"ofallback\")).name\n", r, v));
+                        a.clone()
+                    }
+                    "weakmatch" => {
+                        // in a callee: a match keeps its subject in a slot
+                        // until the function exits, so inline in main the
+                        // edge would read live at the check
+                        out.push_str(&format!("    {} := oweak_match({})\n", r, v));
+                        a.clone()
+                    }
+                    "weakstore" => {
+                        out.push_str(&format!("    {}.w2 = {}.w\n", v, v));
+                        out.push_str(&format!("    {} := {}.w2 != none\n", r, v));
+                        "true".to_string()
+                    }
+                    _ => {
+                        out.push_str(&format!("    {} := \"{{{}.w}}\"\n", r, v));
+                        format!("OLeaf(name: {})", a)
+                    }
+                };
+                out.push_str(&format!("    {}.held = none\n", v));
+                out.push_str("    oscrub()\n");
+                out.push_str(&format!(
+                    "    print(\"own-{}: {{{}}} {{{}.w == none}} {{{}.w2 == none}}\")\n",
+                    name, r, v, v
+                ));
+                self.expect(format!("own-{}: {} true true", name, shown));
+            }
             _ => unreachable!("ownership shape {} out of range", k),
         }
     }
@@ -3292,6 +3806,153 @@ impl ONode:
         }
     }
 }
+
+/// the helpers the pending ownership shapes lean on, appended after the
+/// settled ones. every callee here drops something its caller may still be
+/// reading, then oscrubs, so a freed struct or string is reused before the
+/// caller looks at it again.
+const PENDING_DECLS: &str = r#"
+struct OLeaf:
+    name: String
+
+struct OFn:
+    mut name: String
+    mut f: fn(String) -> String
+
+struct OFs:
+    mut fs: List[fn(Int) -> String]
+
+struct OView:
+    mut c: OLeaf
+    mut s: String
+    mut cs: List[OLeaf]
+    mut slot: OSlot
+
+struct OPair:
+    mut pair: (String, OLeaf)
+
+struct OWeak:
+    mut held: OLeaf?
+    weak w: OLeaf?
+    weak w2: OLeaf?
+
+struct OItems:
+    mut items: List[String]
+    mut f: fn(String) -> String
+
+struct OBox:
+    mut o: ONode
+
+mut og_name := "ostart"
+
+fn oscrub():
+    mut junk: List[OLeaf] := []
+    mut i := 0
+    while i < 40:
+        junk.push(OLeaf(name: "ofiller-{i}-ownpayload-x"))
+        i = i + 1
+    ochurn()
+
+fn oplain(s: String) -> String:
+    return s
+
+fn oplain_at(i: Int) -> String:
+    return "oplain"
+
+fn oinstall_self(o: OFn, tag: String):
+    o.f = fn(s: String) -> String:
+        o.f = oplain
+        oscrub()
+        return tag + s
+
+fn oclearing(b: OFs, tag: String) -> fn(Int) -> String:
+    return fn(i: Int) -> String:
+        b.fs = []
+        oscrub()
+        return tag
+
+fn oreplacing(b: OFs, tag: String) -> fn(Int) -> String:
+    return fn(i: Int) -> String:
+        b.fs[0] = oplain_at
+        oscrub()
+        return tag
+
+fn oslot_name(s: OSlot) -> String:
+    return match s:
+        OSlot.Holds(n) => n.name
+        OSlot.Empty => "empty"
+
+fn otake_view(h: OView) -> String:
+    match h.c:
+        x =>
+            h.c = OLeaf(name: "oother")
+            oscrub()
+            return x.name
+
+fn orename(o: ONode) -> String:
+    o.name = "orenamed" + "-ownpayload-x"
+    oscrub()
+    return "!"
+
+fn otwo(a: String, b: String) -> String:
+    return a + b
+
+fn oevict(xs: List[String]) -> String:
+    xs.clear()
+    oscrub()
+    return "!"
+
+fn oswap_items(o: OItems) -> Int:
+    o.items = ["oswapped" + "-ownpayload-x"]
+    oscrub()
+    return 0
+
+fn oswap_o(h: OBox) -> String:
+    h.o = ONode(name: "oswapped", val: 0, tags: [], next: none, back: none)
+    oscrub()
+    return "ov" + "-x"
+
+fn oset_global() -> String:
+    og_name = "oinner" + "-global"
+    oscrub()
+    return "oouter" + "-global"
+
+fn oweak_match(v: OWeak) -> String:
+    return match v.w:
+        none => "onone"
+        m => m.name
+
+fn oinstall_walk(o: OItems):
+    o.f = fn(s: String) -> String:
+        o.f = oplain
+        o.items = ["oother" + "-list"]
+        oscrub()
+        return s + "!"
+"#;
+
+/// leak mode's helpers: the round count, a print that only the first round
+/// reaches, and the process's peak resident set (the reading
+/// tests/leaks/leakprobe makes). builtins only, so a generated program needs
+/// no import and finds no std from outside a checkout.
+const ROUNDS_DECLS: &str = r#"
+mut og_quiet := false
+
+fn orounds() -> Int:
+    return parse_int(env_opt("PITH_LEAK_ROUNDS").unwrap_or("1")) catch 1
+
+fn oput(s: String):
+    if og_quiet == false:
+        print(s)
+
+fn opeak_kb() -> Int:
+    status := read_file("/proc/self/status") catch ""
+    for line in status.split(chr(10)):
+        if line.starts_with("VmHWM:"):
+            parsed := parse_int(line.replace("VmHWM:", "").replace("kB", "").trim())
+            if parsed.is_ok:
+                return parsed.ok
+    return 0
+"#;
 
 fn ty_mentions_param(ty: &Ty) -> bool {
     match ty {

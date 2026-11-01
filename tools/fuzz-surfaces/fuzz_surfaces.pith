@@ -1,0 +1,1054 @@
+# fuzz_surfaces.pith - mutation fuzzing for the std parsers that read
+# untrusted input, held to resource oracles as well as crash ones.
+#
+# generated code is not coverage-instrumented, so this is a black-box fuzzer:
+# it mutates real-shaped seeds, keeps an input when it produces an outcome it
+# has not seen before (a cheap stand-in for coverage), and checks every call
+# against four oracles:
+#
+#   1. no crash. the driver (run.sh) runs this binary under asan when asked
+#      and treats any non-zero exit as a finding; the input that was running
+#      is always in <out>/cur-<target>.
+#   2. a time budget per input. a call over --time-ms is a finding; a call
+#      that never returns is caught by the driver's timeout.
+#   3. a peak-rss budget relative to input size. the peak is reset before
+#      each call (/proc/self/clear_refs) and read after it (VmHWM).
+#   4. a read budget for the stream parsers. now and then an input is
+#      followed by a long tail (zeros, or its last line repeated) and the
+#      parser must stop reading within the protocol's own limits.
+#
+#   ./tools/fuzz-surfaces/fuzz_surfaces --target yaml --secs 60 --seed 3 --out DIR
+#   ./tools/fuzz-surfaces/fuzz_surfaces --target yaml --replay FILE
+#
+# targets: http1 http2 hpack h2server websocket yaml toml json protobuf
+# inflate gzip zstd tar zip regex glob
+
+import std.archive.tar as tar
+import std.archive.zip as zip
+import std.bits as bits
+import std.bytes as bytes
+import std.compress.gzip as gzip
+import std.compress.inflate as inflate
+import std.compress.zlib as zlib
+import std.compress.zstd as zstd
+import std.compress.zstd_pure_frame as zstd_pure
+import std.binary as binary
+import std.fs as fs
+import std.glob as glob
+import std.io as io
+import std.json as json
+import std.net.http as http
+import std.net.http2.frames as frames
+import std.net.http2.hpack as hpack
+import std.net.http2.server as h2server
+import std.net.websocket as websocket
+import std.protobuf as protobuf
+import std.rand as rand
+import std.regex as regex
+import std.time as time
+import std.toml as toml
+import std.yaml as yaml
+
+TARGETS := "http1 http2 hpack h2server websocket yaml toml json protobuf inflate gzip zstd tar zip regex glob"
+
+# decompression caps passed to the bounded decoders. the rss oracle allows
+# for this much output on top of the input-relative budget.
+DECOMPRESS_CAP := 4194304
+CORPUS_CAP := 3000
+TAIL_EVERY := 48
+AMPLIFY_EVERY := 64
+CRLF := "\r\n"
+
+# ---------------------------------------------------------------
+# options
+# ---------------------------------------------------------------
+
+fn arg_text(flag: String, fallback: String) -> String:
+    argv := args()
+    mut i := 0
+    while i < argv.len():
+        if argv[i] == flag and i + 1 < argv.len():
+            return argv[i + 1]
+        i = i + 1
+    return fallback
+
+fn arg_int(flag: String, fallback: Int) -> Int:
+    text := arg_text(flag, "")
+    if text == "":
+        return fallback
+    return parse_int(text) catch fallback
+
+# ---------------------------------------------------------------
+# resource probes
+# ---------------------------------------------------------------
+
+# peak resident set in kB since the last reset, or -1 when /proc is missing.
+fn peak_rss_kb() -> Int:
+    text := fs.read("/proc/self/status") catch ""
+    for line in text.split("\n"):
+        if line.starts_with("VmHWM:"):
+            return parse_int(line.substring(6, line.len()).replace("kB", "").trim()) catch -1
+    return -1
+
+fn current_rss_kb() -> Int:
+    text := fs.read("/proc/self/status") catch ""
+    for line in text.split("\n"):
+        if line.starts_with("VmRSS:"):
+            return parse_int(line.substring(6, line.len()).replace("kB", "").trim()) catch -1
+    return -1
+
+fn reset_peak_rss():
+    fs.write("/proc/self/clear_refs", "5") catch false
+
+# ---------------------------------------------------------------
+# byte helpers
+# ---------------------------------------------------------------
+
+fn b(text: String) -> Bytes:
+    return bytes.from_string_utf8(text)
+
+fn hex(text: String) -> Bytes:
+    return encoding_from_hex(text.replace(" ", ""))
+
+fn encoding_from_hex(text: String) -> Bytes:
+    out := bytes.buffer()
+    defer out.free()
+    mut i := 0
+    while i + 1 < text.len():
+        value := parse_int("0x" + text.substring(i, i + 2)) catch 0
+        out.write_byte(value) catch 0
+        i = i + 2
+    return out.bytes()
+
+# arbitrary bytes as text: valid utf-8 passes through, anything else keeps
+# its ascii bytes and turns the rest into '?'. the text parsers only take
+# strings, so this is the closest they get to raw bytes.
+fn as_text(data: Bytes) -> String:
+    direct := data.to_string_utf8()
+    if direct.is_ok:
+        return direct.ok
+    out := bytes.buffer()
+    defer out.free()
+    mut i := 0
+    while i < data.len():
+        if data[i] < 128:
+            out.write_byte(data[i]) catch 0
+        else:
+            out.write_byte(63) catch 0
+        i = i + 1
+    return out.bytes().to_string_utf8() catch ""
+
+fn repeat_bytes(unit: Bytes, total: Int) -> Bytes:
+    out := bytes.buffer_with_capacity(total + unit.len())
+    defer out.free()
+    if unit.len() == 0:
+        return bytes.empty()
+    while out.len() < total:
+        out.write(unit) catch 0
+    return out.bytes()
+
+fn zeros(total: Int) -> Bytes:
+    return repeat_bytes(hex("00000000000000000000000000000000"), total)
+
+# the bytes after the last line feed before the end (or the last 16 bytes),
+# the unit a "repeat the last line" tail is made of.
+fn last_line(data: Bytes) -> Bytes:
+    if data.len() == 0:
+        return b(CRLF)
+    mut end := data.len()
+    if data[end - 1] == 10:
+        end = end - 1
+    mut start := end
+    while start > 0 and data[start - 1] != 10:
+        start = start - 1
+    if end - start == 0 or end - start > 4096:
+        start = data.len() - 16
+        if start < 0:
+            start = 0
+        return data.slice(start, data.len())
+    return data.slice(start, data.len())
+
+# ---------------------------------------------------------------
+# mutation
+# ---------------------------------------------------------------
+
+INTERESTING_INTS := [0, 1, 127, 128, 255, 256, 32767, 32768, 65535, 65536, 16777215, 2147483647, 4294967295]
+INTERESTING_WIDTHS := [1, 2, 4]
+EXTREME_NUMBERS := ["0", "-1", "99999999999999999999", "18446744073709551616", "9223372036854775807", "-9223372036854775808", "1e99999999999", "1e-99999999999", "0x7fffffff", "4294967296", "1.7976931348623157e309", "000000000000000000000000001", "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"]
+
+fn interesting_value() -> Int:
+    return INTERESTING_INTS[rand.int(0, INTERESTING_INTS.len() - 1)]
+
+fn write_be(out: ByteBuffer, value: Int, width: Int):
+    mut shift := (width - 1) * 8
+    while shift >= 0:
+        out.write_byte(bits.band(bits.shr(value, shift), 255)) catch 0
+        shift = shift - 8
+
+# one havoc step over `input`. `other` is a second corpus entry for splicing,
+# `dict` holds tokens of the target's grammar.
+fn mutate_once(input: Bytes, other: Bytes, dict: List[Bytes], max_len: Int) -> Bytes:
+    n := input.len()
+    out := bytes.buffer_with_capacity(n + 64)
+    defer out.free()
+    choice := rand.int(0, 11)
+    if n == 0:
+        if dict.len() > 0:
+            return dict[rand.int(0, dict.len() - 1)]
+        return hex("00")
+    at := rand.int(0, n - 1)
+    if choice == 0:
+        # flip one bit
+        out.write(input.slice(0, at)) catch 0
+        out.write_byte(bits.xor(input[at], bits.shl(1, rand.int(0, 7)))) catch 0
+        out.write(input.slice(at + 1, n)) catch 0
+    elif choice == 1:
+        # set one byte to anything
+        out.write(input.slice(0, at)) catch 0
+        out.write_byte(rand.int(0, 255)) catch 0
+        out.write(input.slice(at + 1, n)) catch 0
+    elif choice == 2:
+        # delete a range
+        stop := at + rand.int(1, 32)
+        out.write(input.slice(0, at)) catch 0
+        if stop < n:
+            out.write(input.slice(stop, n)) catch 0
+    elif choice == 3 or choice == 4:
+        # insert a grammar token
+        if dict.len() == 0:
+            return input
+        token := dict[rand.int(0, dict.len() - 1)]
+        out.write(input.slice(0, at)) catch 0
+        out.write(token) catch 0
+        if choice == 4:
+            # overwrite rather than insert
+            skip := at + token.len()
+            if skip < n:
+                out.write(input.slice(skip, n)) catch 0
+        else:
+            out.write(input.slice(at, n)) catch 0
+    elif choice == 5:
+        # duplicate a slice many times: the shape of nesting bombs, long runs
+        # and repeated fields, where resource bugs live
+        span := rand.int(1, 16)
+        stop := min(at + span, n)
+        piece := input.slice(at, stop)
+        mut copies := rand.int(2, 64)
+        if rand.int(0, 7) == 0:
+            copies = rand.int(64, 4096)
+        out.write(input.slice(0, stop)) catch 0
+        mut i := 0
+        while i < copies and out.len() < max_len:
+            out.write(piece) catch 0
+            i = i + 1
+        out.write(input.slice(stop, n)) catch 0
+    elif choice == 6:
+        # splice with another entry
+        if other.len() == 0:
+            return input
+        cut := rand.int(0, other.len() - 1)
+        out.write(input.slice(0, at)) catch 0
+        out.write(other.slice(cut, other.len())) catch 0
+    elif choice == 7:
+        # truncate
+        return input.slice(0, at)
+    elif choice == 8:
+        # a big-endian length-shaped integer in place
+        width := INTERESTING_WIDTHS[rand.int(0, 2)]
+        out.write(input.slice(0, at)) catch 0
+        write_be(out, interesting_value(), width)
+        if at + width < n:
+            out.write(input.slice(at + width, n)) catch 0
+    elif choice == 9:
+        # random bytes inserted
+        out.write(input.slice(0, at)) catch 0
+        mut i := rand.int(1, 8)
+        while i > 0:
+            out.write_byte(rand.int(0, 255)) catch 0
+            i = i - 1
+        out.write(input.slice(at, n)) catch 0
+    elif choice == 10:
+        # replace a run of ascii digits with an extreme number
+        mut start := at
+        while start < n and (input[start] < 48 or input[start] > 57):
+            start = start + 1
+        if start >= n:
+            return input
+        mut stop := start
+        while stop < n and input[stop] >= 48 and input[stop] <= 57:
+            stop = stop + 1
+        out.write(input.slice(0, start)) catch 0
+        out.write(b(EXTREME_NUMBERS[rand.int(0, EXTREME_NUMBERS.len() - 1)])) catch 0
+        out.write(input.slice(stop, n)) catch 0
+    else:
+        # copy a chunk of the input over another place
+        src := rand.int(0, n - 1)
+        span := min(rand.int(1, 64), n - src)
+        out.write(input.slice(0, at)) catch 0
+        out.write(input.slice(src, src + span)) catch 0
+        if at + span < n:
+            out.write(input.slice(at + span, n)) catch 0
+    result := out.bytes()
+    if result.len() > max_len:
+        return result.slice(0, max_len)
+    return result
+
+# blow one slice of `input` up to about `size` bytes by repeating it in place.
+# small inputs hide amplification under the rss floor; the same structure at
+# a megabyte does not.
+fn amplify(input: Bytes, size: Int) -> Bytes:
+    if input.len() < 2:
+        return repeat_bytes(input, size)
+    at := rand.int(0, input.len() - 1)
+    stop := min(at + rand.int(1, 8), input.len())
+    out := bytes.buffer_with_capacity(size + input.len())
+    defer out.free()
+    out.write(input.slice(0, stop)) catch 0
+    out.write(repeat_bytes(input.slice(at, stop), size)) catch 0
+    out.write(input.slice(stop, input.len())) catch 0
+    return out.bytes()
+
+fn mutate(input: Bytes, other: Bytes, dict: List[Bytes], max_len: Int) -> Bytes:
+    mut out := input
+    mut steps := rand.int(1, 6)
+    while steps > 0:
+        out = mutate_once(out, other, dict, max_len)
+        steps = steps - 1
+    return out
+
+# ---------------------------------------------------------------
+# signatures: an outcome string with digits dropped, so error messages
+# that only differ in an offset count as the same path.
+# ---------------------------------------------------------------
+
+fn signature(text: String) -> String:
+    mut out := ""
+    mut i := 0
+    limit := min(text.len(), 80)
+    while i < limit:
+        ch := text[i]
+        # a colon past the message's own prefix usually introduces a quote
+        # of the input, which would make every input its own outcome
+        if ch == ":" and i >= 24:
+            return out
+        if ch < "0" or ch > "9":
+            out = out + ch
+        i = i + 1
+    return out
+
+fn err_sig(message: String) -> String:
+    return "err:" + signature(message)
+
+# ---------------------------------------------------------------
+# targets. each takes the input and returns an outcome signature.
+# `stream_read` reports how much of a stream input a parser consumed,
+# for the read-budget oracle.
+# ---------------------------------------------------------------
+
+struct Outcome:
+    sig: String
+    consumed: Int
+
+fn outcome(sig: String) -> Outcome:
+    return Outcome(sig, -1)
+
+# bytes still waiting in a cursor after a parser stopped reading.
+fn cursor_left(cursor: io.BytesCursor) -> Int:
+    rest := io.read_all_bytes(cursor) catch bytes.empty()
+    return rest.len()
+
+fn run_http1(input: Bytes) -> Outcome:
+    cursor := io.bytes_reader(input)
+    reader := cursor.buffered_chunked(rand.int(1, 4) * 997)
+    attempt := http.read_request_buffered_bytes(reader)
+    mut sig := ""
+    if attempt.is_err:
+        sig = err_sig(attempt.err)
+    else:
+        req := attempt.ok
+        mut total := req.body_bytes().len() + req.header_fields().len()
+        total = total + req.form().len() + req.post_form().len()
+        total = total + (req.cookies() catch {}).len()
+        total = total + (req.path_parts() catch []).len()
+        if req.is_multipart() catch false:
+            total = total + (req.multipart_parts() catch []).len()
+        auth := req.basic_auth()
+        if auth.is_ok:
+            total = total + 1
+        sig = "ok:" + ["GET", "POST", "HEAD"].contains(req.method() catch "?").to_string() + ":" + (total > 0).to_string() + ":" + req.wants_keep_alive().to_string()
+    left := cursor_left(cursor)
+    io.free_buffered_bytes_reader(reader)
+    cursor.close()
+    return Outcome(sig, input.len() - left)
+
+fn run_websocket(input: Bytes) -> Outcome:
+    cursor := io.bytes_reader(input)
+    reader := cursor.buffered_chunked(rand.int(1, 4) * 1021)
+    sink := bytes.buffer()
+    writer := sink.buffered_chunked(4096)
+    ws := websocket.from_buffered(reader, writer, false)
+    mut sig := ""
+    mut messages := 0
+    while messages < 64:
+        got := ws.recv()
+        if got.is_err:
+            sig = err_sig(got.err)
+            messages = 64
+        else:
+            messages = messages + 1
+    left := cursor_left(cursor)
+    ws.close_now()
+    io.free_buffered_bytes_reader(reader)
+    io.free_buffered_bytes_writer(writer)
+    sink.free()
+    cursor.close()
+    return Outcome(sig, input.len() - left)
+
+fn run_http2(input: Bytes) -> Outcome:
+    r := binary.reader(input)
+    mut sig := ""
+    mut frames_read := 0
+    while frames_read < 256:
+        attempt := frames.read_frame(r, frames.DEFAULT_MAX_FRAME_SIZE)
+        if attempt.is_err:
+            sig = sig + err_sig(attempt.err)
+            frames_read = 256
+        else:
+            frame := attempt.ok
+            piece := "t" + frame.header.frame_type.to_string() + ","
+            if not sig.contains(piece):
+                sig = sig + piece
+            parse_any_frame(frame)
+            frames_read = frames_read + 1
+    return outcome(signature(sig))
+
+fn parse_any_frame(frame: frames.Frame) -> Int:
+    t := frame.header.frame_type
+    mut n := 0
+    if t == 0:
+        n = (frames.parse_data(frame) catch frames.DataFrame(0, bytes.empty(), false)).data.len()
+    elif t == 1:
+        hf := frames.parse_headers(frame)
+        if hf.is_ok:
+            dec := hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE)
+            n = (dec.decode_bounded(hf.ok.block_fragment, 65536, 256) catch []).len()
+    elif t == 2:
+        n = (frames.parse_priority(frame)).is_ok.to_string().len()
+    elif t == 3:
+        n = (frames.parse_rst_stream(frame)).is_ok.to_string().len()
+    elif t == 4:
+        n = (frames.parse_settings(frame)).is_ok.to_string().len()
+    elif t == 5:
+        n = (frames.parse_push_promise(frame)).is_ok.to_string().len()
+    elif t == 6:
+        n = (frames.parse_ping(frame)).is_ok.to_string().len()
+    elif t == 7:
+        n = (frames.parse_goaway(frame)).is_ok.to_string().len()
+    elif t == 8:
+        n = (frames.parse_window_update(frame)).is_ok.to_string().len()
+    elif t == 9:
+        n = (frames.parse_continuation(frame)).is_ok.to_string().len()
+    return n
+
+fn run_hpack(input: Bytes) -> Outcome:
+    # the first byte picks a table size, the rest is split into header blocks
+    # that share one decoder, as successive requests on a connection do
+    if input.len() == 0:
+        return outcome("empty")
+    dec := hpack.new_decoder(input[0] * 64)
+    mut sig := ""
+    mut pos := 1
+    mut blocks := 0
+    while pos < input.len() and blocks < 8:
+        mut stop := pos + 1 + input[pos] * 4
+        if stop > input.len():
+            stop = input.len()
+        got := dec.decode_bounded(input.slice(pos + 1, max(stop, pos + 1)), 65536, 256)
+        if got.is_err:
+            piece := err_sig(got.err)
+            if not sig.contains(piece):
+                sig = sig + piece
+        elif not sig.contains("ok,"):
+            sig = sig + "ok,"
+        pos = stop
+        blocks = blocks + 1
+    return outcome(signature(sig))
+
+fn run_yaml(input: Bytes) -> Outcome:
+    text := as_text(input)
+    scope := yaml.open_scope()
+    handle := yaml.parse_all(text)
+    mut sig := ""
+    if handle < 0:
+        sig = err_sig(yaml.last_error())
+    else:
+        sig = "ok:" + yaml.type_of(handle) + walk_yaml(handle, 0).to_string()
+    decoded := yaml.decode_scalars(text)
+    if decoded.is_err:
+        sig = sig + "/scalars-err"
+    yaml.close_scope(scope)
+    return outcome(sig)
+
+fn walk_yaml(handle: Int, depth: Int) -> Int:
+    if depth > 64:
+        return 0
+    kind := yaml.type_of(handle)
+    if kind == "map":
+        mut total := 0
+        for key in yaml.keys(handle):
+            total = total + 1 + walk_yaml(yaml.get_value(handle, key), depth + 1)
+        return min(total, 1)
+    if kind == "string":
+        return min(yaml.scalar_string(handle).len(), 1)
+    if kind == "float":
+        f := yaml.scalar_float(handle)
+        return 0
+    if kind == "int":
+        return min(yaml.scalar_int(handle), 1)
+    return 0
+
+fn run_toml(input: Bytes) -> Outcome:
+    text := as_text(input)
+    scope := toml.open_scope()
+    handle := toml.parse(text)
+    mut sig := ""
+    if handle < 0:
+        sig = "err"
+    else:
+        sig = "ok:" + toml.type_of(handle) + ":" + min(toml.keys(handle).len(), 3).to_string()
+        for key in toml.keys(handle):
+            v := toml.get_value(handle, key)
+            letter := toml.type_of(v).substring(0, 1)
+            if not sig.contains(letter):
+                sig = sig + letter
+    decoded := toml.decode_scalars(text)
+    if decoded.is_err:
+        sig = sig + "/" + err_sig(decoded.err.message)
+    toml.close_scope(scope)
+    return outcome(sig)
+
+fn run_json(input: Bytes) -> Outcome:
+    text := as_text(input)
+    scope := json.open_scope()
+    handle := json.parse(text)
+    mut sig := ""
+    if handle < 0:
+        sig = "err"
+    else:
+        sig = "ok:" + json.type_of(handle)
+    decoded := json.decode_scalars_bytes(input)
+    if decoded.is_err:
+        sig = sig + "/" + err_sig(decoded.err.message)
+    else:
+        sig = sig + "/scalars"
+    json.close_scope(scope)
+    return outcome(sig)
+
+# walk a protobuf message generically: every field is read by its wire
+# type, and length-delimited ones are walked again as nested messages, the
+# way a reflective decoder treats unknown fields.
+fn walk_proto(data: Bytes, depth: Int) -> String:
+    r := protobuf.reader(data)
+    mut fields := 0
+    while not r.at_end() and fields < 4096:
+        tag := r.read_tag() catch:
+            return "tag-err"
+        if tag.wire == 2:
+            inner := r.read_bytes() catch:
+                return "len-err"
+            if depth < 32:
+                walk_proto(inner, depth + 1)
+                (protobuf.reader(inner).read_packed_varints() catch []).len()
+        elif tag.wire == 0:
+            r.read_varint() catch:
+                return "varint-err"
+        else:
+            r.skip(tag.wire) catch:
+                return "skip-err"
+        fields = fields + 1
+    return "ok" + min(fields, 4).to_string()
+
+fn run_protobuf(input: Bytes) -> Outcome:
+    return outcome(walk_proto(input, 0))
+
+fn result_sig(got: Bytes!) -> String:
+    if got.is_err:
+        return err_sig(got.err)
+    return "ok" + min(got.ok.len(), 1).to_string()
+
+fn run_inflate(input: Bytes) -> Outcome:
+    mut sig := result_sig(inflate.inflate_bounded(input, 0, DECOMPRESS_CAP))
+    sig = sig + "/" + result_sig(zlib.decompress_bounded(input, DECOMPRESS_CAP))
+    return outcome(sig)
+
+fn run_gzip(input: Bytes) -> Outcome:
+    return outcome(result_sig(gzip.decompress_bounded(input, DECOMPRESS_CAP)))
+
+fn run_zstd(input: Bytes) -> Outcome:
+    mut sig := result_sig(zstd.decompress_bounded(input, DECOMPRESS_CAP))
+    sig = sig + "/" + result_sig(zstd_pure.decompress_bounded(input, DECOMPRESS_CAP))
+    return outcome(sig)
+
+fn run_tar(input: Bytes) -> Outcome:
+    got := tar.list(input)
+    if got.is_err:
+        return outcome(err_sig(got.err))
+    return outcome("ok" + min(got.ok.len(), 3).to_string())
+
+fn run_zip(input: Bytes) -> Outcome:
+    got := zip.list(input)
+    if got.is_err:
+        return outcome(err_sig(got.err))
+    return outcome("ok" + min(got.ok.len(), 3).to_string())
+
+# pattern and subject are split at the first 0x01 byte.
+fn split_pair(input: Bytes) -> List[String]:
+    mut i := 0
+    while i < input.len() and input[i] != 1:
+        i = i + 1
+    if i >= input.len():
+        return [as_text(input), ""]
+    return [as_text(input.slice(0, i)), as_text(input.slice(i + 1, input.len()))]
+
+fn run_regex(input: Bytes) -> Outcome:
+    pair := split_pair(input)
+    compiled := regex.compile(pair[0])
+    if compiled.is_err:
+        return outcome(err_sig(compiled.err))
+    re := compiled.ok
+    mut sig := "ok:" + re.is_match(pair[1]).to_string()
+    sig = sig + min(re.find_all(pair[1]).len(), 2).to_string()
+    caps := re.captures(pair[1])
+    if caps != none:
+        sig = sig + "c"
+    sig = sig + min(re.replace_all(pair[1], "$1").len(), 1).to_string()
+    return outcome(sig)
+
+fn run_glob(input: Bytes) -> Outcome:
+    pair := split_pair(input)
+    return outcome("m:" + glob.matches(pair[0], pair[1]).to_string())
+
+# ---------------------------------------------------------------
+# h2server: the whole http/2 server connection over loopback tcp, so the
+# reader sees the input in transport-sized pieces exactly as from a peer.
+# ---------------------------------------------------------------
+
+fn h2_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.text(200, "n=" + req.body_bytes().len().to_string())
+
+fn h2_serve(fd: Int) -> Int:
+    h2server.serve_h2c_connection(fd, h2_handler)
+    return 0
+
+# write `data` in pieces and report how much the peer took before it stopped
+# reading (a closed or reset socket fails the write).
+fn h2_feed(fd: Int, data: Bytes) -> Int:
+    mut sent := 0
+    while sent < data.len():
+        stop := min(sent + 65536, data.len())
+        wrote := tcp_write_bytes(fd, data.slice(sent, stop))
+        if wrote.is_err or wrote.ok <= 0:
+            tcp_shutdown(fd)
+            return sent
+        sent = sent + wrote.ok
+    tcp_shutdown(fd)
+    return sent
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 2000:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            return probe.ok * 100000 + port
+        port = port + 1
+    fail "no free tcp port"
+
+threadlocal mut h2_listener: Int := -1
+threadlocal mut h2_port: Int := 0
+
+fn run_h2server(input: Bytes) -> Outcome:
+    if h2_listener < 0:
+        packed := choose_port(20000 + rand.int(0, 10000)) catch 0
+        h2_listener = packed / 100000
+        h2_port = packed % 100000
+    client := tcp_connect("127.0.0.1", h2_port) catch:
+        return outcome("connect-failed")
+    accepted := tcp_accept(h2_listener) catch:
+        tcp_close(client)
+        return outcome("accept-failed")
+    server_task := spawn h2_serve(accepted)
+    feeder := spawn h2_feed(client, input)
+    mut got := 0
+    while true:
+        chunk := tcp_read_bytes(client, 65536)
+        if chunk.is_err or chunk.ok.len() == 0:
+            break
+        got = got + chunk.ok.len()
+    sent := await feeder
+    await server_task
+    tcp_close(client)
+    return Outcome("sent" + min(got, 1).to_string(), sent)
+
+# ---------------------------------------------------------------
+# known bugs
+# ---------------------------------------------------------------
+
+# true for an input that only re-finds a bug already on file, which would
+# otherwise hang every batch and leave no time for anything new. delete a
+# clause once its bug is fixed; --no-skip turns them all off.
+fn hits_known_bug(target: String, input: Bytes) -> Bool:
+    if target == "yaml":
+        # parse_float_manual loops once per unit of a decimal exponent, so
+        # 1e99999999999 never finishes
+        return long_exponent(input)
+    return false
+
+# an e or E, an optional sign, then seven or more digits (dots included:
+# 1e9.99999999999 hangs the same loop)
+fn long_exponent(input: Bytes) -> Bool:
+    mut i := 0
+    while i < input.len():
+        if input[i] == 101 or input[i] == 69:
+            mut j := i + 1
+            if j < input.len() and (input[j] == 43 or input[j] == 45):
+                j = j + 1
+            mut digits := 0
+            while j < input.len() and ((input[j] >= 48 and input[j] <= 57) or input[j] == 46):
+                digits = digits + 1
+                j = j + 1
+            if digits >= 7:
+                return true
+        i = i + 1
+    return false
+
+# ---------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------
+
+fn run_target(target: String, input: Bytes) -> Outcome:
+    if target == "http1":
+        return run_http1(input)
+    if target == "http2":
+        return run_http2(input)
+    if target == "hpack":
+        return run_hpack(input)
+    if target == "h2server":
+        return run_h2server(input)
+    if target == "websocket":
+        return run_websocket(input)
+    if target == "yaml":
+        return run_yaml(input)
+    if target == "toml":
+        return run_toml(input)
+    if target == "json":
+        return run_json(input)
+    if target == "protobuf":
+        return run_protobuf(input)
+    if target == "inflate":
+        return run_inflate(input)
+    if target == "gzip":
+        return run_gzip(input)
+    if target == "zstd":
+        return run_zstd(input)
+    if target == "tar":
+        return run_tar(input)
+    if target == "zip":
+        return run_zip(input)
+    if target == "regex":
+        return run_regex(input)
+    if target == "glob":
+        return run_glob(input)
+    return outcome("unknown target")
+
+# the most a stream parser may read past its input before the read-budget
+# oracle calls it unbounded: one maximal message under the protocol's own
+# limits, plus slack for reader buffering (and for h2server, the socket
+# buffers between the feeder and the server).
+fn read_budget(target: String) -> Int:
+    if target == "http1":
+        # chunk framing may legitimately double the bytes behind a body
+        return http.MAX_HEADER_BYTES + 2 * http.MAX_REQUEST_BODY + 1048576
+    if target == "websocket":
+        return 16777216 + 1048576
+    if target == "h2server":
+        return 12582912
+    return -1
+
+# the tail streamed after an input for the read-budget oracle: zeros, or the
+# input's last line repeated, sized just past the budget.
+fn with_tail(target: String, input: Bytes, mode: Int) -> Bytes:
+    total := read_budget(target) + 1048576
+    mut tail := bytes.empty()
+    if mode == 1:
+        tail = repeat_bytes(last_line(input), total)
+    else:
+        tail = zeros(total)
+    return bytes.concat(input, tail)
+
+# ---------------------------------------------------------------
+# seeds and grammar tokens
+# ---------------------------------------------------------------
+
+fn http_request(lines: List[String], body: String) -> Bytes:
+    mut text := ""
+    for line in lines:
+        text = text + line + CRLF
+    return b(text + CRLF + body)
+
+fn seeds_for(target: String, scratch: String) -> List[Bytes]:
+    out: List[Bytes] := []
+    if target == "http1":
+        out.push(http_request(["GET /a/b?x=1&y=2 HTTP/1.1", "Host: example.com", "Cookie: a=1; b=2", "Authorization: Basic dXNlcjpwYXNz"], ""))
+        out.push(http_request(["POST /upload HTTP/1.1", "Host: h", "Content-Length: 11", "Content-Type: application/x-www-form-urlencoded"], "a=1&b=%20c&"))
+        out.push(http_request(["POST /c HTTP/1.1", "Host: h", "Transfer-Encoding: chunked"], "5" + CRLF + "hello" + CRLF + "0" + CRLF + "X-Trailer: v" + CRLF + CRLF))
+        out.push(http_request(["POST /c HTTP/1.1", "Host: h", "Transfer-Encoding: chunked"], "4;ext=1" + CRLF + "wiki" + CRLF + "0" + CRLF + CRLF))
+        out.push(http_request(["POST /m HTTP/1.1", "Host: h", "Content-Type: multipart/form-data; boundary=XX", "Content-Length: 70"], "--XX" + CRLF + "Content-Disposition: form-data; name=\"f\"" + CRLF + CRLF + "v" + CRLF + "--XX--" + CRLF))
+        out.push(http_request(["GET / HTTP/1.0", "Connection: keep-alive", "Expect: 100-continue"], ""))
+    elif target == "websocket":
+        mask := hex("01020304")
+        out.push(websocket.masked_frame_bytes(1, b("hello"), mask) catch bytes.empty())
+        out.push(websocket.masked_frame_bytes(9, b("ping"), mask) catch bytes.empty())
+        out.push(websocket.masked_frame_bytes(2, repeat_bytes(b("ab"), 300), mask) catch bytes.empty())
+        # a fragmented text message: fin=0 text, then fin=1 continuation
+        out.push(hex("0182 01020304 6967 8082 01020304 6967"))
+        out.push(hex("88 82 01020304 02ea"))
+        out.push(bytes.concat(hex("81 fe 0100 01020304"), repeat_bytes(b("x"), 256)))
+    elif target == "http2" or target == "h2server":
+        settings := frames.frame_bytes(frames.settings_frame([frames.setting(3, 100), frames.setting(4, 65535)]) catch frames.settings_ack_frame()) catch bytes.empty()
+        enc := hpack.new_encoder(4096, true)
+        block := enc.encode([hpack.header_field(":method", "POST"), hpack.header_field(":path", "/x"), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "h"), hpack.header_field("content-length", "3")])
+        headers := frames.frame_bytes(frames.headers_frame(1, block, false, true)) catch bytes.empty()
+        data := frames.frame_bytes(frames.data_frame(1, b("abc"), true)) catch bytes.empty()
+        ping := frames.frame_bytes(frames.ping_frame(hex("0102030405060708")) catch frames.settings_ack_frame()) catch bytes.empty()
+        wu := frames.frame_bytes(frames.window_update_frame(0, 1000) catch frames.settings_ack_frame()) catch bytes.empty()
+        split := frames.frame_bytes(frames.headers_frame(3, block.slice(0, 4), true, false)) catch bytes.empty()
+        cont := frames.frame_bytes(frames.continuation_frame(3, block.slice(4, block.len()), true)) catch bytes.empty()
+        mut stream := bytes.concat(settings, headers)
+        stream = bytes.concat(stream, data)
+        stream = bytes.concat(stream, ping)
+        stream = bytes.concat(stream, wu)
+        stream = bytes.concat(stream, bytes.concat(split, cont))
+        if target == "h2server":
+            preface := b("PRI * HTTP/2.0" + CRLF + CRLF + "SM" + CRLF + CRLF)
+            out.push(bytes.concat(preface, stream))
+            out.push(bytes.concat(preface, settings))
+        else:
+            out.push(stream)
+            out.push(headers)
+    elif target == "hpack":
+        enc := hpack.new_encoder(4096, true)
+        plain := hpack.new_encoder(4096, false)
+        fields := [hpack.header_field(":method", "GET"), hpack.header_field(":path", "/index.html"), hpack.header_field("custom-key", "custom-value"), hpack.header_field("cookie", "a=b; c=d")]
+        one := enc.encode(fields)
+        two := enc.encode(fields)
+        three := plain.encode(fields)
+        out.push(bytes.concat(hex("40"), bytes.concat(hex("7f"), bytes.concat(one, two))))
+        out.push(bytes.concat(hex("40"), bytes.concat(hex("7f"), three)))
+        out.push(hex("40 10 3f e1 1f 82 86 84 41 0f 77 77 77 2e 65 78 61 6d 70 6c 65 2e 63 6f 6d"))
+    elif target == "yaml":
+        out.push(b("name: demo\nport: 8080\nratio: 1.5e3\nenabled: true\nitems:\n  - a\n  - b: 1\n    c: [1, 2, {{d: e}}]\n"))
+        out.push(b("---\nanchor: &a {{x: 1}}\nref: *a\nblock: |\n  line one\n  line two\nfolded: >-\n  a\n  b\n...\n---\n- 0x1F\n- 0o17\n- .inf\n- -.nan\n- ~\n"))
+        out.push(b("\"quoted \\u00e9 \\x41\": 'single ''q'''\n? complex\n: value\n"))
+    elif target == "toml":
+        out.push(b("title = \"t\"\n[server]\nhost = \"h\"\nport = 8080\nratio = 1.5e3\n[[items]]\nname = 'a'\ntags = [\"x\", \"y\"]\n[a.b.c]\nd = {{ e = 1, f = [1, 2] }}\n"))
+        out.push(b("date = 1979-05-27T07:32:00Z\nmulti = \"\"\"\nline\\\n  more\"\"\"\nlit = '''raw'''\nhex = 0xDEAD_beef\nbin = 0b1010\ninf = -inf\n"))
+    elif target == "json":
+        out.push(b("{{\"a\": [1, 2.5e10, -3, true, false, null], \"b\": {{\"c\": \"d\\u00e9\\n\"}}, \"e\": \"\\ud83d\\ude00\"}}"))
+        out.push(b("[[[[[[1]]]]], {{\"k\": [{{}}, []]}}]"))
+        out.push(b("{{\"id\": 1, \"name\": \"x\", \"ok\": true, \"ratio\": 0.25}}"))
+    elif target == "protobuf":
+        out.push(hex("08 96 01 12 07 74 65 73 74 69 6e 67 1a 03 08 96 01 22 04 03 8e 02 9e a7 05"))
+        out.push(hex("0a 0c 0a 04 6e 61 6d 65 12 04 0a 02 08 01 25 00 00 80 3f 29 00 00 00 00 00 00 f0 3f"))
+    elif target == "inflate" or target == "gzip" or target == "zstd":
+        payloads := [b("hello hello hello hello world"), repeat_bytes(b("abcdefgh"), 4000), b("{{\"k\":[1,2,3]}}"), bytes.empty()]
+        for payload in payloads:
+            if target == "gzip":
+                out.push(gzip.compress(payload))
+            elif target == "zstd":
+                out.push(zstd.compress(payload))
+            else:
+                z := zlib.compress(payload)
+                out.push(z)
+                if z.len() > 6:
+                    out.push(z.slice(2, z.len() - 4))
+    elif target == "tar" or target == "zip":
+        dir := scratch + "/archive-seed"
+        fs.make_dirs(dir + "/sub")
+        fs.write(dir + "/a.txt", "alpha") catch false
+        fs.write(dir + "/sub/b.txt", "beta beta beta") catch false
+        if target == "tar":
+            out.push(tar.create([dir]) catch bytes.empty())
+        else:
+            out.push(zip.create([dir]) catch bytes.empty())
+    elif target == "regex":
+        out.push(b("(a|b)*c[0-9]+\\d?$" + chr(1) + "ababc123"))
+        out.push(b("^(\\w+)@(\\w+)\\.com" + chr(1) + "user@example.com"))
+        out.push(b("(x+x+)+y" + chr(1) + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))
+        out.push(b("[^a-z]|.*" + chr(1) + "Hello World"))
+    elif target == "glob":
+        out.push(b("src/**/*.pith" + chr(1) + "src/a/b/c.pith"))
+        out.push(b("*a*a*a*a*b" + chr(1) + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+        out.push(b("**/**/x/[a-c]?.txt" + chr(1) + "a/b/c/x/b1.txt"))
+    return out
+
+fn dict_for(target: String) -> List[Bytes]:
+    mut words: List[String] := []
+    if target == "http1":
+        words = [CRLF, CRLF + CRLF, ": ", "Transfer-Encoding: chunked" + CRLF, "Content-Length: ", "0" + CRLF + CRLF, "ffffffff" + CRLF, ";", "X: y" + CRLF, " HTTP/1.1", "%", "%zz", "?", "&", "=", "Cookie: ", "multipart/form-data; boundary=", "--", "\t", "\n", "Connection: close" + CRLF, "Host: a" + CRLF]
+    elif target == "yaml":
+        words = [": ", "- ", "\n", "\n  ", "&a ", "*a", "<<: *a", "!!str ", "!!binary ", "|", ">", "'", "\"", "\\u", "\\x", "? ", "{{", "}}", "[", "]", ",", "#", "---\n", "...\n", "1e", "1e99999999999", ".inf", "0x", "0o", "~", "%YAML 1.2\n", "\t"]
+    elif target == "toml":
+        words = [" = ", "\n", "[", "]", "[[", "]]", "{{", "}}", ",", ".", "\"", "'", "\"\"\"", "'''", "\\u", "\\U", "1e", "1e99999", "0x", "0o", "0b", "_", "inf", "nan", "1979-05-27T", "T00:00:00", "Z", "+"]
+    elif target == "json":
+        words = ["{{", "}}", "[", "]", ",", ":", "\"", "\\u", "\\ud800", "true", "false", "null", "1e", "1e999999999", "-0", ".5", "[[[[[[[[", "{{\"a\":"]
+    elif target == "regex":
+        words = ["(", ")", "|", "*", "+", "?", "[", "]", "^", "$", ".", "\\d", "\\w", "\\s", "\\", "[^", "-", "(a*)*", "{{2,}}", chr(1)]
+    elif target == "glob":
+        words = ["*", "**", "?", "[", "]", "[!", "/", "**/", "\\", "{{", "}}", "-", chr(1)]
+    out: List[Bytes] := []
+    for word in words:
+        out.push(b(word))
+    if target == "websocket" or target == "http2" or target == "h2server" or target == "hpack" or target == "protobuf" or target == "inflate" or target == "gzip" or target == "zstd" or target == "tar" or target == "zip":
+        for h in ["00", "ff", "7f", "80", "ffffff", "000000", "ffffffff", "0000000000000000", "1f8b08", "28b52ffd", "7801", "504b0304", "504b0102", "504b0506", "00ffff", "fe7f", "8000", "81", "88", "89", "8a", "fe", "01"]:
+            out.push(hex(h))
+    return out
+
+# ---------------------------------------------------------------
+# corpus on disk
+# ---------------------------------------------------------------
+
+fn load_dir(dir: String, limit: Int) -> List[Bytes]:
+    out: List[Bytes] := []
+    entries := fs.read_dir(dir) catch []
+    for entry in entries:
+        if out.len() >= limit:
+            break
+        if not entry.is_dir:
+            out.push(fs.read_bytes(entry.path) catch bytes.empty())
+    return out
+
+# ---------------------------------------------------------------
+# main loop
+# ---------------------------------------------------------------
+
+struct Budget:
+    time_ms: Int
+    rss_floor_kb: Int
+    rss_factor: Int
+
+# the rss a call may add: a fixed floor, plus a multiple of the input size,
+# plus the decompression cap for the decoders.
+fn rss_allowance_kb(budget: Budget, target: String, input_len: Int) -> Int:
+    mut allowed := budget.rss_floor_kb + budget.rss_factor * input_len / 1024
+    if target == "inflate" or target == "gzip" or target == "zstd":
+        allowed = allowed + 2 * DECOMPRESS_CAP / 1024
+    return allowed
+
+# keep the first few inputs of each kind per batch; a known bug that every
+# tenth input hits would otherwise bury the rest.
+threadlocal mut recorded: Map[String, Int] := {}
+RECORD_CAP := 3
+
+fn record(out_dir: String, target: String, kind: String, input: Bytes, detail: String) -> Int:
+    so_far := recorded.get(kind).unwrap_or(0)
+    recorded[kind] = so_far + 1
+    if so_far >= RECORD_CAP:
+        if so_far == RECORD_CAP:
+            print("FINDING " + target + " " + kind + " (more of this kind in this batch are not recorded)")
+        return 0
+    name := out_dir + "/findings/" + target + "-" + kind + "-" + time.mono_nanos().to_string() + ".bin"
+    fs.write_bytes(name, input) catch false
+    print("FINDING " + target + " " + kind + " len=" + input.len().to_string() + " " + detail + " -> " + name)
+    return 1
+
+threadlocal mut last_stats: String := ""
+
+fn check_one(target: String, input: Bytes, budget: Budget, out_dir: String, tail: Int) -> String:
+    mut run_input := input
+    if tail > 0:
+        run_input = with_tail(target, input, tail)
+    fs.write_bytes(out_dir + "/cur-" + target, run_input) catch false
+    reset_peak_rss()
+    base := current_rss_kb()
+    start := time.mono_nanos()
+    result := run_target(target, run_input)
+    elapsed_ms := (time.mono_nanos() - start) / 1000000
+    peak := peak_rss_kb()
+    last_stats = elapsed_ms.to_string() + "ms, peak rss +" + (peak - base).to_string() + "kB"
+    allowed_ms := budget.time_ms + input.len() / 1000
+    if elapsed_ms > allowed_ms:
+        record(out_dir, target, "slow", run_input, elapsed_ms.to_string() + "ms")
+    if base >= 0 and peak >= 0:
+        grew := peak - base
+        if grew > rss_allowance_kb(budget, target, run_input.len()):
+            record(out_dir, target, "rss", run_input, grew.to_string() + "kB over a " + base.to_string() + "kB base")
+    if tail > 0 and result.consumed > input.len() + read_budget(target):
+        record(out_dir, target, "unbounded-read", input, "read " + result.consumed.to_string() + " bytes of a " + run_input.len().to_string() + " byte stream")
+    return result.sig
+
+fn main() -> Int!:
+    target := arg_text("--target", "")
+    if not TARGETS.split(" ").contains(target):
+        print("usage: fuzz_surfaces --target <" + TARGETS.replace(" ", "|") + "> [--secs N] [--count N] [--seed N] [--out DIR] [--replay FILE]")
+        return 2
+    out_dir := arg_text("--out", "/tmp/fuzz-surfaces")
+    fs.make_dirs(out_dir + "/findings")
+    corpus_dir := out_dir + "/corpus/" + target
+    fs.make_dirs(corpus_dir)
+    budget := Budget(arg_int("--time-ms", 1000), arg_int("--rss-floor-mb", 16) * 1024, arg_int("--rss-factor", 64))
+
+    replay := arg_text("--replay", "")
+    if replay != "":
+        input := fs.read_bytes(replay)!
+        sig := check_one(target, input, budget, out_dir, arg_int("--tail", 0))
+        print("replay " + target + ": " + sig + " (" + last_stats + ")")
+        return 0
+
+    seed := arg_int("--seed", 1)
+    rand.seed(seed)
+    secs := arg_int("--secs", 0)
+    count := arg_int("--count", 1000)
+    max_len := arg_int("--max-len", 16384)
+    mut corpus := seeds_for(target, out_dir)
+    for entry in load_dir(corpus_dir, CORPUS_CAP):
+        corpus.push(entry)
+    dict := dict_for(target)
+    seen: Map[String, Bool] := {}
+    for entry in corpus:
+        seen[check_one(target, entry, budget, out_dir, 0)] = true
+
+    deadline := time.mono_millis() + secs * 1000
+    mut execs := 0
+    mut added := 0
+    mut skipped := 0
+    skip_known := arg_int("--no-skip", 0) == 0
+    # --deep 0 leaves out the megabyte-sized inputs (amplified slices and
+    # stream tails), for a quick run
+    deep := arg_int("--deep", 1) == 1
+    while (secs > 0 and time.mono_millis() < deadline) or (secs == 0 and execs < count):
+        parent := corpus[rand.int(0, corpus.len() - 1)]
+        other := corpus[rand.int(0, corpus.len() - 1)]
+        mut input := mutate(parent, other, dict, max_len)
+        amplified := deep and rand.int(0, AMPLIFY_EVERY - 1) == 0
+        if amplified:
+            input = amplify(input, rand.int(256, 1024) * 1024)
+        if skip_known and hits_known_bug(target, input):
+            skipped = skipped + 1
+            continue
+        mut tail := 0
+        if deep and read_budget(target) > 0 and rand.int(0, TAIL_EVERY - 1) == 0:
+            # http1 alternates zeros and a repeated last line; the binary
+            # protocols only get zeros
+            tail = 2
+            if target == "http1" and rand.int(0, 1) == 0:
+                tail = 1
+        sig := check_one(target, input, budget, out_dir, tail)
+        if not amplified and not seen.contains_key(sig):
+            seen[sig] = true
+            if corpus.len() < CORPUS_CAP:
+                corpus.push(input)
+                fs.write_bytes(corpus_dir + "/" + seed.to_string() + "-" + execs.to_string(), input) catch false
+                added = added + 1
+        execs = execs + 1
+    print("fuzz-surfaces " + target + ": " + execs.to_string() + " execs, " + seen.len().to_string() + " outcomes, corpus " + corpus.len().to_string() + " (+" + added.to_string() + "), " + skipped.to_string() + " skipped as known bugs")
+    return 0

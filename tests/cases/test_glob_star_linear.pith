@@ -1,0 +1,79 @@
+# glob matching stays polynomial in the number of stars.
+#
+# the matcher used to try every split for every `*` (and every `**`) by
+# recursion, so `*a*a*a*a*a*b` against a long run of a's took exponential
+# time. the case below hung the old matcher; the differential half checks the
+# new one against that recursive definition on small random inputs.
+
+import std.glob as glob
+import std.rand as rand
+
+fn ref_chars(pattern: String, text: String, p: Int, t: Int) -> Bool:
+    if p >= pattern.len():
+        return t >= text.len()
+    if pattern[p] == "*":
+        if ref_chars(pattern, text, p + 1, t):
+            return true
+        return t < text.len() and ref_chars(pattern, text, p, t + 1)
+    if t >= text.len():
+        return false
+    if pattern[p] != "?" and pattern[p] != text[t]:
+        return false
+    return ref_chars(pattern, text, p + 1, t + 1)
+
+fn ref_parts(pattern: List[String], path: List[String], p: Int, t: Int) -> Bool:
+    if p >= pattern.len():
+        return t >= path.len()
+    if pattern[p] == "**":
+        if ref_parts(pattern, path, p + 1, t):
+            return true
+        return t < path.len() and ref_parts(pattern, path, p, t + 1)
+    if t >= path.len():
+        return false
+    if not ref_chars(pattern[p], path[t], 0, 0):
+        return false
+    return ref_parts(pattern, path, p + 1, t + 1)
+
+fn segments(text: String) -> List[String]:
+    mut out: List[String] := []
+    for part in text.split("/"):
+        if part != "":
+            out.push(part)
+    return out
+
+fn random_text(alphabet: List[String], max_len: Int) -> String:
+    mut out := ""
+    mut n := rand.int(0, max_len)
+    while n > 0:
+        out = out + alphabet[rand.int(0, alphabet.len() - 1)]
+        n = n - 1
+    return out
+
+fn main() -> Int:
+    rand.seed(7)
+    mut mismatches := 0
+    mut matched := 0
+    mut i := 0
+    while i < 20000:
+        pattern := random_text(["a", "b", "*", "?", "/", "**/"], 7)
+        path := random_text(["a", "b", "/"], 8)
+        want := ref_parts(segments(pattern), segments(path), 0, 0)
+        if glob.matches(pattern, path) != want:
+            mismatches = mismatches + 1
+            if mismatches <= 5:
+                print("mismatch: " + pattern + " vs " + path)
+        if want:
+            matched = matched + 1
+        i = i + 1
+    print("mismatches: " + mismatches.to_string())
+    print("some matched: " + (matched > 1000).to_string())
+
+    mut long_a := ""
+    i = 0
+    while i < 2000:
+        long_a = long_a + "a"
+        i = i + 1
+    print(glob.matches("*a*a*a*a*a*a*a*a*b", long_a).to_string())
+    print(glob.matches("**/**/**/**/**/**/x", "a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/a/y").to_string())
+    print(glob.matches("*a*a*a*a*a*a*a*a*", long_a).to_string())
+    return 0

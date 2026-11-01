@@ -54,6 +54,21 @@ pub(crate) fn command_status(mut command: Command) -> Option<std::process::ExitS
     blocking::run(&POOL, move || command.status().ok())
 }
 
+/// a child's exit status as one number: its exit code, or 128 plus the signal
+/// number when a signal ended it, which is what a shell reports. a child that
+/// was killed (sigkill from the oom killer, a segfault) must not read as a
+/// clean exit, and every path that reports a status goes through this so they
+/// agree.
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> i64 {
+    use std::os::unix::process::ExitStatusExt;
+
+    match (status.code(), status.signal()) {
+        (Some(code), _) => code as i64,
+        (None, Some(signal)) => 128 + signal as i64,
+        (None, None) => -1,
+    }
+}
+
 /// which of a child's three pipes a caller wants. the discriminant indexes
 /// `ProcessHandle::pipes`.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -284,7 +299,7 @@ pub unsafe extern "C" fn pith_process_output_argv(
     // pith-visible handle is built here either way.
     match command_output(command) {
         Some(output) => {
-            let status = output.status.code().unwrap_or(-1) as i64;
+            let status = exit_code(output.status);
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             pith_store_process_output(status, stdout, stderr)
@@ -341,7 +356,7 @@ enum ExitState {
     Finished(i64),
     /// still running, and this fd becomes readable when that changes.
     Watch(RawFd),
-    /// still running with nothing to watch it by: the caller has to block.
+    /// still running with nothing to watch it by: the caller has to poll.
     Unwatchable,
     /// the handle is not ours (closed under us, or never existed).
     Unknown,
@@ -351,9 +366,13 @@ enum ExitState {
 /// cannot get one.
 ///
 /// `pidfd_open` is linux 5.3 and newer. an older kernel answers ENOSYS and we
-/// fall back to blocking in `wait`.
+/// fall back to `poll_until_exit`.
 #[cfg(target_os = "linux")]
 fn watch_pid(pid: u32) -> Option<RawFd> {
+    #[cfg(test)]
+    if NO_PIDFD_FOR_TESTS.load(Ordering::Relaxed) {
+        return None;
+    }
     // SAFETY: pidfd_open takes a pid and a flags word and returns an fd or -1.
     // the pid is live: the caller holds the registry lock and has just seen the
     // child unreaped, so the number cannot have been recycled.
@@ -363,6 +382,12 @@ fn watch_pid(pid: u32) -> Option<RawFd> {
     }
     Some(fd as RawFd)
 }
+
+/// makes `watch_pid` answer as a kernel without pidfds would, so tests can
+/// take the path macOS and linux before 5.3 take.
+#[cfg(test)]
+pub(crate) static NO_PIDFD_FOR_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(not(target_os = "linux"))]
 fn watch_pid(_pid: u32) -> Option<RawFd> {
@@ -386,12 +411,48 @@ fn exit_state(handle: i64) -> ExitState {
     match entry.child.try_wait() {
         // already exited, or already waited for once: `try_wait` remembers the
         // status, so a second wait on the same handle costs nothing.
-        Ok(Some(status)) => ExitState::Finished(status.code().unwrap_or(-1) as i64),
+        Ok(Some(status)) => ExitState::Finished(exit_code(status)),
         Ok(None) => match watch_pid(entry.child.id()) {
             Some(fd) => ExitState::Watch(fd),
             None => ExitState::Unwatchable,
         },
-        Err(_) => ExitState::Unwatchable,
+        // a child that cannot be polled cannot be waited for either, so this
+        // is the -1 a blocking wait would have come back with.
+        Err(_) => ExitState::Finished(-1),
+    }
+}
+
+/// the wait off a green task. it blocks the thread, as an os thread may, but
+/// never while holding the registry lock: a reader on another thread takes
+/// that lock to drain the child's pipes, and a child stuck on a full pipe
+/// never exits, so a wait that kept the lock would never return (and a kill
+/// from a deadline could not get in either).
+fn wait_off_green(handle: i64) -> i64 {
+    loop {
+        match exit_state(handle) {
+            ExitState::Finished(code) => return code,
+            ExitState::Unknown => return -1,
+            ExitState::Watch(fd) => {
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd naming the pidfd opened above.
+                let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+                let interrupted = ready < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+                // SAFETY: closing the pidfd we opened and have not shared.
+                unsafe { libc::close(fd) };
+                if interrupted {
+                    continue;
+                }
+                return reap(handle);
+            }
+            // no pidfd (an old kernel, or not linux): look again shortly,
+            // letting go of the lock in between.
+            ExitState::Unwatchable => std::thread::sleep(std::time::Duration::from_millis(2)),
+        }
     }
 }
 
@@ -403,8 +464,30 @@ fn reap(handle: i64) -> i64 {
         return -1;
     };
     match entry.child.wait() {
-        Ok(status) => status.code().unwrap_or(-1) as i64,
+        Ok(status) => exit_code(status),
         Err(_) => -1,
+    }
+}
+
+/// wait for a child there is no pidfd for: look under the registry lock, and
+/// sleep between looks with the lock released. a wait that held the lock
+/// across the child's life would shut out a reader draining the child's
+/// pipes, and a child stuck on a full pipe never exits. the sleep parks a
+/// green task on the reactor's timer and blocks any other thread.
+fn poll_until_exit(handle: i64) -> i64 {
+    loop {
+        {
+            let mut handles = process_handles().lock();
+            let Some(entry) = handles.get_mut(&handle) else {
+                return -1;
+            };
+            match entry.child.try_wait() {
+                Ok(Some(status)) => return status.code().unwrap_or(-1) as i64,
+                Ok(None) => {}
+                Err(_) => return -1,
+            }
+        }
+        crate::platform::pith_sleep(2);
     }
 }
 
@@ -419,14 +502,14 @@ pub extern "C" fn pith_process_wait(handle: i64) -> i64 {
         return -1;
     }
     // off a green task there is no worker to keep free and blocking is what an
-    // OS thread is for, so take the direct wait untouched.
+    // OS thread is for, but not with the registry locked; see `wait_off_green`.
     if !blocking::offloads() {
-        return reap(handle);
+        return wait_off_green(handle);
     }
     let watch = match exit_state(handle) {
         ExitState::Finished(code) => return code,
         ExitState::Unknown => return -1,
-        ExitState::Unwatchable => return reap(handle),
+        ExitState::Unwatchable => return poll_until_exit(handle),
         ExitState::Watch(fd) => fd,
     };
 
@@ -504,6 +587,16 @@ mod tests {
         cmd.args(["-c", "exit 5"]);
         assert_eq!(command_status(cmd).expect("sh should run").code(), Some(5));
         assert!(command_status(Command::new("/nonexistent-program")).is_none());
+    }
+
+    #[test]
+    fn exit_code_reports_a_signal_death_as_128_plus_the_signal() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "kill -9 $$"]);
+        assert_eq!(exit_code(command_status(cmd).expect("sh should run")), 137);
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "exit 4"]);
+        assert_eq!(exit_code(command_status(cmd).expect("sh should run")), 4);
     }
 
     #[test]

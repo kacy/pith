@@ -119,7 +119,7 @@ pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
     }
 
     match crate::process::command_status(cmd) {
-        Some(status) => status.code().unwrap_or(0) as i64,
+        Some(status) => crate::process::exit_code(status),
         None => -1,
     }
 }

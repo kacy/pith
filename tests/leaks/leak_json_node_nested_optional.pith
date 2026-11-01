@@ -1,0 +1,29 @@
+# typed json.decode of a struct with a nested struct field beside an
+# optional field, the shape that takes the node-pool path: the outer decode
+# reads the nested object through object_require_object and a decode_object
+# specialization. that step once left a count on the nested struct's string,
+# about 32 bytes per decode (#1142).
+import std.json as json
+import leakprobe as probe
+
+pub struct Geo:
+    pub lat: Int
+    pub lon: Int
+    pub name: String
+
+pub struct SiteMaybe:
+    pub code: String
+    pub geo: Geo
+    pub note: String?
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut total := 0
+    while i < n:
+        doc := "\{\"code\":\"c{i}\",\"geo\":\{\"lat\":1,\"lon\":2,\"name\":\"g{i}\"\},\"note\":\"x\"\}"
+        r := json.decode_text[SiteMaybe](doc)
+        if r.is_ok:
+            total = total + r.ok.geo.name.len()
+        i = i + 1
+    print("{probe.peak_kb()}")

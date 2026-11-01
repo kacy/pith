@@ -1,0 +1,53 @@
+# a closure called out of a struct field or a list element runs user code,
+# and here each one drops the count that kept its own argument or its own
+# environment alive: it overwrites the field the argument was read from,
+# replaces itself in its field, or empties the list it was read out of. the
+# call site has to pin both for the call. after the drop each closure
+# allocates strings of the same size, so a freed value reads back as filler.
+struct Holder:
+    mut name: String
+    mut f: fn(String) -> String
+
+struct Slot:
+    mut f: fn(Int) -> String
+
+struct Box:
+    mut fs: List[fn(Int) -> String]
+
+fn churn() -> List[String]:
+    mut junk: List[String] := []
+    mut i := 0
+    while i < 50:
+        junk.push("filler-{i}-x")
+        i = i + 1
+    return junk
+
+fn plain(i: Int) -> String:
+    return "plain"
+
+fn install(s: Slot, tag: String):
+    s.f = fn(i: Int) -> String:
+        s.f = plain
+        junk := churn()
+        return tag
+
+fn clearing(b: Box, tag: String) -> fn(Int) -> String:
+    return fn(i: Int) -> String:
+        b.fs = []
+        junk := churn()
+        return tag
+
+fn main() -> Int:
+    mut h := Holder(name: "hello" + "-world", f: fn(s: String) => s)
+    h.f = fn(s: String) -> String:
+        h.name = "replaced"
+        junk := churn()
+        return s
+    print("field argument: {h.f(h.name)} {h.name}")
+    s := Slot(f: plain)
+    install(s, "hello" + "-slot")
+    print("replaced itself: {s.f(1)} {s.f(2)}")
+    b := Box(fs: [])
+    b.fs.push(clearing(b, "hello" + "-element"))
+    print("cleared its list: {b.fs[0](1)} {b.fs.len()}")
+    return 0

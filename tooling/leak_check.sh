@@ -159,6 +159,10 @@ cases=(
   tests/leaks/leak_weak_field
   tests/leaks/leak_weak_read_off_temp
   tests/leaks/leak_weak_local
+  tests/leaks/leak_weak_read_binding
+  tests/leaks/leak_weak_read_consumers
+  tests/leaks/leak_match_view_pin
+  tests/leaks/leak_getter_shell_consumers
   tests/leaks/leak_weak_capture_cycle
   tests/leaks/leak_closure_captured_optional
   tests/leaks/leak_optional_plain_compare
@@ -187,6 +191,9 @@ cases=(
   tests/leaks/leak_json_fill_list
   tests/leaks/leak_json_fill_list_fail
   tests/leaks/leak_json_node_list
+  tests/leaks/leak_json_node_nested_optional
+  tests/leaks/leak_json_optional_string_present
+  tests/leaks/leak_json_decode_fail_after_fields
   tests/leaks/leak_json_fill_collections
   tests/leaks/leak_json_fill_collections_fail
   tests/leaks/leak_json_node_collections

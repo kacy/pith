@@ -1434,7 +1434,7 @@ mod tests {
     use crate::runtime_core::{
         closure_buffered_for_tests, pith_closure_get_fn, pith_closure_new, pith_closure_release,
         pith_closure_retain, pith_closure_set_env_rc, pith_struct_alloc, pith_struct_release,
-        pith_struct_retain, pith_struct_set_dtor, pith_struct_weak_load, pith_struct_weak_release,
+        pith_struct_retain, pith_struct_set_dtor, pith_struct_weak_release, pith_struct_weak_upgrade,
         pith_struct_weak_retain, struct_dead_word_for_tests, struct_weak_count_for_tests,
     };
 
@@ -1586,7 +1586,7 @@ mod tests {
                                     // is the only thing keeping the header alive.
             assert_eq!(struct_dead_word_for_tests(s), 3);
             assert_eq!(struct_weak_count_for_tests(s), 1);
-            assert_eq!(pith_struct_weak_load(s), 0, "dead reads as none");
+            assert_eq!(pith_struct_weak_upgrade(s), 0, "dead reads as none");
             assert_eq!(suspect_count_for_tests(s as usize), 1);
 
             force_enabled_for_tests(false);
@@ -1596,7 +1596,7 @@ mod tests {
 
     #[test]
     #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
-    fn weak_load_ignores_the_buffered_bit() {
+    fn weak_upgrade_ignores_the_buffered_bit() {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
@@ -1606,9 +1606,10 @@ mod tests {
             pith_struct_retain(s);
             pith_struct_release(s); // buffered, still alive
             assert_eq!(struct_dead_word_for_tests(s), 2);
-            assert_eq!(pith_struct_weak_load(s), s, "buffered but alive");
+            assert_eq!(pith_struct_weak_upgrade(s), s, "buffered but alive");
+            pith_struct_release(s); // the upgrade's count
             pith_struct_release(s); // dies buffered
-            assert_eq!(pith_struct_weak_load(s), 0, "buffered and dead");
+            assert_eq!(pith_struct_weak_upgrade(s), 0, "buffered and dead");
             pith_struct_weak_release(s);
 
             force_enabled_for_tests(false);
@@ -1631,7 +1632,8 @@ mod tests {
             let list = crate::collections::list::pith_list_new(8, 4); // struct elements
             pith_list_push_value(list, elem); // list retains
             pith_struct_release(elem); // list holds the only strong count
-            assert_eq!(pith_struct_weak_load(elem), elem);
+            assert_eq!(pith_struct_weak_upgrade(elem), elem);
+            pith_struct_release(elem); // the upgrade's count
 
             pith_list_retain_handle(list.ptr as i64);
             pith_list_release(list); // 2 -> 1: buffered
@@ -1639,7 +1641,7 @@ mod tests {
             pith_list_release(list); // 1 -> 0: dies buffered
 
             assert_eq!(graveyard_count_for_tests(list.ptr as usize), 1);
-            assert_eq!(pith_struct_weak_load(elem), 0, "element was released");
+            assert_eq!(pith_struct_weak_upgrade(elem), 0, "element was released");
             assert_eq!(
                 pith_list_len(list),
                 0,
@@ -1675,7 +1677,7 @@ mod tests {
             pith_closure_release(closure); // 1 -> 0: dies buffered
 
             assert_eq!(graveyard_count_for_tests(closure as usize), 1);
-            assert_eq!(pith_struct_weak_load(captured), 0, "capture was released");
+            assert_eq!(pith_struct_weak_upgrade(captured), 0, "capture was released");
             assert_eq!(pith_closure_get_fn(closure), 0, "magic scrubbed");
 
             pith_struct_weak_release(captured);
@@ -1831,7 +1833,8 @@ mod tests {
             a.join().expect("releasing thread panicked");
             b.join().expect("releasing thread panicked");
 
-            assert_eq!(pith_struct_weak_load(s), s, "still alive: we hold a count");
+            assert_eq!(pith_struct_weak_upgrade(s), s, "still alive: we hold a count");
+            pith_struct_release(s); // the upgrade's count
             assert_eq!(
                 suspect_count_for_tests(s as usize),
                 1,
@@ -2347,12 +2350,12 @@ mod tests {
             let (a, b) = build_garbage_ring();
             pith_struct_release(a); // the last external count: garbage now
             assert_eq!(suspect_count_for_tests(a as usize), 1);
-            assert_eq!(pith_struct_weak_load(a), a, "the ring still holds it");
+            assert_eq!(crate::runtime_core::cycle_struct_alive(a), Some(true), "the ring still holds it");
 
             let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(a), 0, "ring member a reclaimed");
-            assert_eq!(pith_struct_weak_load(b), 0, "ring member b reclaimed");
+            assert_eq!(pith_struct_weak_upgrade(a), 0, "ring member a reclaimed");
+            assert_eq!(pith_struct_weak_upgrade(b), 0, "ring member b reclaimed");
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
                 2,
@@ -2389,8 +2392,8 @@ mod tests {
 
             let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(a), a, "externally owned: kept");
-            assert_eq!(pith_struct_weak_load(b), b, "reached only from a: kept");
+            assert_eq!(crate::runtime_core::cycle_struct_alive(a), Some(true), "externally owned: kept");
+            assert_eq!(crate::runtime_core::cycle_struct_alive(b), Some(true), "reached only from a: kept");
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
                 0,
@@ -2400,8 +2403,8 @@ mod tests {
             // the owner lets go: the same ring is garbage on the next pass.
             pith_struct_release(a);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(a), 0);
-            assert_eq!(pith_struct_weak_load(b), 0);
+            assert_eq!(pith_struct_weak_upgrade(a), 0);
+            assert_eq!(pith_struct_weak_upgrade(b), 0);
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
                 2
@@ -2431,7 +2434,7 @@ mod tests {
 
             let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(s), s, "leaf with an owner: kept");
+            assert_eq!(crate::runtime_core::cycle_struct_alive(s), Some(true), "leaf with an owner: kept");
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
                 0
@@ -2466,7 +2469,7 @@ mod tests {
 
             let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
             if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_load(s), 0, "struct half reclaimed");
+            assert_eq!(pith_struct_weak_upgrade(s), 0, "struct half reclaimed");
             assert_eq!(pith_closure_get_fn(c), 0, "closure half no longer validates");
             assert_eq!(
                 CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
@@ -2524,8 +2527,8 @@ mod tests {
                 forced_ok = pith_cycle_gc_collect_now() == 1;
             }
             assert!(forced_ok, "the forced collection must eventually run");
-            assert_eq!(pith_struct_weak_load(a), 0);
-            assert_eq!(pith_struct_weak_load(b), 0);
+            assert_eq!(pith_struct_weak_upgrade(a), 0);
+            assert_eq!(pith_struct_weak_upgrade(b), 0);
 
             pith_struct_weak_release(a);
             pith_struct_weak_release(b);

@@ -120,7 +120,11 @@ pub extern "C" fn pith_runtime_start() {
 /// arm the stack overflow report on the calling thread: install the process
 /// handler on first use, give the thread an alternate signal stack, and
 /// record its guard region. called once per thread that runs pith code: the
-/// main thread, each green worker and each os-thread task.
+/// main thread, each green worker and each os-thread task. it runs before
+/// the thread resumes any coroutine, so it may hold the address of its
+/// thread-locals (tooling/check_tls_barriers.sh lists it), and it is kept
+/// out of line so that address never lands in a caller's frame.
+#[inline(never)]
 pub fn enter_thread() {
     #[cfg(not(any(pith_asan, pith_tsan)))]
     {

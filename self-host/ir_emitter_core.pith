@@ -9315,6 +9315,11 @@ fn ir_emit_list_store_bounds_check(key_idx: Int, obj_r: Int, idx_r: Int, value_r
     ir_emit("lt " + hi_ok.to_string() + " " + idx_r.to_string() + " " + len_r.to_string())
     ok_r := ir_reg()
     ir_emit("and " + ok_r.to_string() + " " + lo_ok.to_string() + " " + hi_ok.to_string())
+    ir_emit_list_store_miss_arm(ok_r, key_idx, idx_r, value_r, owned_kind)
+
+# branch on `ok_r`, failing the function when it is zero: a store that did not
+# happen, or a bounds test that failed before one.
+fn ir_emit_list_store_miss_arm(ok_r: Int, key_idx: Int, idx_r: Int, value_r: Int, owned_kind: String):
     store_l := ir_label()
     miss_l := ir_label()
     ir_emit("brif " + ok_r.to_string() + " " + store_l + " " + miss_l)
@@ -9503,18 +9508,21 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     if ir_expr_is_fresh_optional_shell(value_idx):
         idx_borrowed = false
     # a list store goes through the strict entry points, which stop on an
-    # index outside the list the way a read does; `.set(i, v)` keeps the
-    # lenient ones. inside a fallible function a bad index fails the function.
+    # index outside the list the way a read does. inside a fallible function a
+    # bad index fails the function instead: the store is a `_checked` one that
+    # returns whether it stored, so the bounds test is the store's own.
     list_store := set_name == "pith_list_set_value"
-    if list_store and ir_current_func_returns_result:
-        mut owned_kind := ""
-        if not idx_borrowed and ir_container_store_takes_count(idx_store_kind):
-            owned_kind = idx_store_kind
-        ir_emit_list_store_bounds_check(target.children[1], obj_r, idx_r, value_r, owned_kind)
+    checked_store := list_store and ir_current_func_returns_result
+    mut owned_kind := ""
+    if not idx_borrowed and ir_container_store_takes_count(idx_store_kind):
+        owned_kind = idx_store_kind
     mut idx_kind_store := ir_map_kind_store_name(set_name, not idx_borrowed)
     if idx_kind_store.len() == 0 and idx_borrowed:
         idx_kind_store = ir_list_kind_store_name(set_name)
     if idx_kind_store.len() > 0 and ir_store_learns_kind(idx_store_kind):
+        # the kind-carrying store has no checked form, so it is checked first.
+        if checked_store:
+            ir_emit_list_store_bounds_check(target.children[1], obj_r, idx_r, value_r, owned_kind)
         if list_store:
             idx_kind_store = idx_kind_store + "_strict"
         tag_r := ir_emit_element_tag_const(idx_store_kind)
@@ -9534,9 +9542,14 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # the codegen keep a loop's list header reads out of the loop
     if set_name == "pith_list_set_value" and ir_type_is_scalar_word(value_type):
         set_name = "pith_list_set_scalar"
-    if list_store:
-        set_name = set_name + "_strict"
-    ir_emit_call3(ir_reg(), set_name, "void", obj_r, idx_r, value_r)
+    if checked_store:
+        stored_r := ir_reg()
+        ir_emit_call3(stored_r, set_name + "_checked", "int", obj_r, idx_r, value_r)
+        ir_emit_list_store_miss_arm(stored_r, target.children[1], idx_r, value_r, owned_kind)
+    elif list_store:
+        ir_emit_call3(ir_reg(), set_name + "_strict", "void", obj_r, idx_r, value_r)
+    else:
+        ir_emit_call3(ir_reg(), set_name, "void", obj_r, idx_r, value_r)
     # a store reads its key the same way a lookup does: the runtime copies the
     # key bytes into the map's own storage rather than keeping the caller's
     # string, so an owned key temporary dies here too. the stored *value* is a

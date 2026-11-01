@@ -156,12 +156,10 @@ fn green_connect_addr(addr: &std::net::SocketAddr) -> i64 {
         std::net::SocketAddr::V6(_) => libc::AF_INET6,
     };
 
-    // SAFETY: creating a stream socket; the fd is validated before any use.
-    let fd = unsafe { libc::socket(family, libc::SOCK_STREAM, 0) };
+    let fd = stream_socket(family);
     if fd < 0 {
         return 0;
     }
-    fdio::set_nonblocking(fd);
     set_nodelay_raw(fd);
 
     // SAFETY: sockaddr_storage is plain-old-data; zeroing it is a valid start.
@@ -192,6 +190,73 @@ fn green_connect_addr(addr: &std::net::SocketAddr) -> i64 {
         }
     }
     open_socket(fd)
+}
+
+// the green paths create their sockets with raw libc calls, so they set
+// close-on-exec themselves (std does it for the os-thread paths): a child
+// process spawned later must not inherit a server's connections. linux sets
+// it, with non-blocking, in the call that creates the descriptor; macos has no
+// `accept4` or `SOCK_CLOEXEC`, so both flags are set right after, which leaves
+// a short window where a concurrent spawn can still inherit the descriptor.
+
+/// a non-blocking, close-on-exec stream socket, or a negative value on failure.
+#[cfg(target_os = "linux")]
+fn stream_socket(family: libc::c_int) -> RawFd {
+    // SAFETY: creating a socket; the caller checks the result before use.
+    unsafe {
+        libc::socket(
+            family,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+            0,
+        )
+    }
+}
+
+/// a non-blocking, close-on-exec stream socket, or a negative value on failure.
+#[cfg(not(target_os = "linux"))]
+fn stream_socket(family: libc::c_int) -> RawFd {
+    // SAFETY: creating a socket; the caller checks the result before use.
+    cloexec_nonblocking(unsafe { libc::socket(family, libc::SOCK_STREAM, 0) })
+}
+
+/// accept one connection on `listener` as a non-blocking, close-on-exec
+/// descriptor, or a negative value with errno set.
+#[cfg(target_os = "linux")]
+fn accept_raw(listener: RawFd) -> RawFd {
+    // SAFETY: accept on a listener fd the caller holds open; a null addr/len
+    // asks the kernel not to report the peer address, which we don't need.
+    unsafe {
+        libc::accept4(
+            listener,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+        )
+    }
+}
+
+/// accept one connection on `listener` as a non-blocking, close-on-exec
+/// descriptor, or a negative value with errno set.
+#[cfg(not(target_os = "linux"))]
+fn accept_raw(listener: RawFd) -> RawFd {
+    // SAFETY: as in the linux version.
+    cloexec_nonblocking(unsafe {
+        libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut())
+    })
+}
+
+/// set close-on-exec and non-blocking on `fd` if it is a descriptor, and
+/// return it unchanged either way.
+#[cfg(not(target_os = "linux"))]
+fn cloexec_nonblocking(fd: RawFd) -> RawFd {
+    if fd >= 0 {
+        // SAFETY: plain fcntl on a descriptor this process just created.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        fdio::set_nonblocking(fd);
+    }
+    fd
 }
 
 /// close a raw fd that never became a handle, cleaning up any reactor state
@@ -307,12 +372,8 @@ pub extern "C" fn pith_tcp_accept(server: i64) -> i64 {
     // green mode: accept on the non-blocking listener, yielding on would-block.
     if is_green() {
         loop {
-            // SAFETY: accept on a listener fd the guard holds open; a null
-            // addr/len asks the kernel not to report the peer address, which we
-            // don't need.
-            let fd = unsafe { libc::accept(server_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let fd = accept_raw(server_fd);
             if fd >= 0 {
-                fdio::set_nonblocking(fd);
                 set_nodelay_raw(fd);
                 return open_socket(fd);
             }
@@ -560,6 +621,39 @@ pub unsafe extern "C" fn pith_dns_resolve(hostname: *const i8) -> *mut i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// whether `fd` has close-on-exec and non-blocking set.
+    fn cloexec_and_nonblocking(fd: RawFd) -> (bool, bool) {
+        // SAFETY: reading the flags of a descriptor the test owns.
+        let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        // SAFETY: as above.
+        let fl_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        (
+            fd_flags & libc::FD_CLOEXEC != 0,
+            fl_flags & libc::O_NONBLOCK != 0,
+        )
+    }
+
+    #[test]
+    fn green_accept_and_connect_sockets_are_cloexec() {
+        use std::os::unix::io::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let accepted = accept_raw(listener.as_raw_fd());
+        assert!(accepted >= 0, "accept: {}", std::io::Error::last_os_error());
+        assert_eq!(cloexec_and_nonblocking(accepted), (true, true));
+
+        let created = stream_socket(libc::AF_INET);
+        assert!(created >= 0);
+        assert_eq!(cloexec_and_nonblocking(created), (true, true));
+
+        // SAFETY: closing the descriptors this test created.
+        unsafe {
+            libc::close(accepted);
+            libc::close(created);
+        }
+    }
 
     #[test]
     fn dns_resolve_rejects_null_and_invalid_utf8() {

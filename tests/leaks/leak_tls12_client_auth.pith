@@ -66,11 +66,11 @@ fn main() -> Int!:
     # handshakes against 400, keeping the one-to-four ratio the gate compares.
     #
     # the scale is also what keeps the residue below the gate's limit. a tls
-    # connection still costs about 1.6kb that it does not give back, client
-    # authentication or not (a plain 1.2 handshake per round grows at the same
-    # rate), so 300 extra handshakes carry roughly 800kb of pre-existing growth
-    # under the 2mb ceiling. what this case is here to catch is a new leak on
-    # the client-authentication path, which would have to be under 5kb a
+    # connection still costs about 200 bytes that it does not give back,
+    # client authentication or not, which is the mutex leak tracked in #1291,
+    # so 300 extra handshakes carry roughly 60kb of pre-existing growth under
+    # the 2mb ceiling. what this case is here to catch is a new leak on the
+    # client-authentication path, which would have to be under about 6kb a
     # handshake to hide underneath that.
     rounds := probe.rounds() / 2000
     server_cfg := tls.server_config(SERVER_CERT, SERVER_KEY)!.require_client_ca_file(CLIENT_CA)!

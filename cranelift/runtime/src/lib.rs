@@ -93,6 +93,7 @@ pub mod runtime_core;
 pub mod sampler;
 pub mod share;
 pub mod signals;
+pub mod stack_guard;
 pub mod string;
 pub mod string_list;
 pub mod substring;

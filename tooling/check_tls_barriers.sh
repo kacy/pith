@@ -35,7 +35,9 @@ fi
 
 # functions allowed to hold a thread-local address, as `::` paths. the
 # runtime's own accessors first; then the collection pass, which runs on a
-# plain thread that never resumes a coroutine; then std's and parking_lot's
+# plain thread that never resumes a coroutine; then the stack guard's
+# per-thread setup, which runs at thread start before any coroutine; then
+# std's and parking_lot's
 # own frames, which block the os thread and return without ever suspending
 # a coroutine. a path is matched against the mangled symbol as its sequence
 # of length-prefixed segments (`12pith_runtime12runtime_core14pool_slot_slow`),
@@ -57,6 +59,7 @@ pith_runtime::cycle::collector_visit
 pith_runtime::cycle::seed_node
 pith_runtime::cycle::children_of
 pith_runtime::cycle::collect
+pith_runtime::stack_guard::enter_thread
 std::sys::thread_local
 std::sync::once
 std::thread

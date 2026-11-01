@@ -1,0 +1,13 @@
+# unbounded recursion in a spawned task on the os-thread backend, where the
+# task is a thread of its own and runs into that thread's guard region.
+
+fn depth(n: Int) -> Int:
+    if n == 0:
+        return 0
+    return depth(n - 1) + 1
+
+fn main() -> Int!:
+    print("before")
+    t := spawn depth(100000000)
+    print((await t).to_string())
+    return 0

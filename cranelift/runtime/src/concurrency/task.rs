@@ -277,6 +277,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
     let cycle_slot = crate::cycle::mutator_slot_for_spawn();
     let join_handle = std::thread::spawn(move || {
         crate::cycle::adopt_mutator_slot(cycle_slot);
+        crate::stack_guard::enter_thread();
         let func_ptr = crate::pith_closure_get_fn(closure_handle);
         let result = if func_ptr == 0 {
             0

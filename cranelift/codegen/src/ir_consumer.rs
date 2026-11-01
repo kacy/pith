@@ -2307,9 +2307,10 @@ fn normalize_runtime_result(
     builder.ins().select(is_error, zero, encoded)
 }
 
-/// The start of `main`: every module's tracer registration, then each
-/// unprefixed `__init_globals_N`, then the main module's `__init_globals`,
-/// then the string globals, which point at their literals.
+/// The start of `main`: `pith_runtime_start`, which arms the stack overflow
+/// report, then every module's tracer registration, then each unprefixed
+/// `__init_globals_N`, then the main module's `__init_globals`, then the
+/// string globals, which point at their literals.
 ///
 /// The tracers come before any global is built: a global is marked shared
 /// as it is stored, and the marking walks a struct's fields through its
@@ -2327,12 +2328,17 @@ fn normalize_runtime_result(
 fn emit_main_prologue(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
+    runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
     global_data: &HashMap<String, DataId>,
     string_lits: &HashMap<String, DataId>,
     str_globals: &[(String, String)],
     body_lines: &[&str],
 ) {
+    if let Some(&start_id) = runtime_funcs.get("pith_runtime_start") {
+        let start_ref = codegen.module.declare_func_in_func(start_id, builder.func);
+        builder.ins().call(start_ref, &[]);
+    }
     let mut startup: Vec<(&String, FuncId)> = declared_funcs
         .iter()
         .filter(|(name, _)| name.contains("__cc_register_tracers"))
@@ -2542,6 +2548,7 @@ fn compile_ir_function(
         emit_main_prologue(
             codegen,
             &mut builder,
+            runtime_funcs,
             declared_funcs,
             global_data,
             string_lits,
@@ -4241,10 +4248,11 @@ mod tests {
         let plain = compiled(false);
         let sanitized = compiled(true);
         let calls = |text: &str| text.matches(" call ").count();
-        // the alloc and the fast path's cold fallback, against the alloc,
-        // the two checks and a plain list_len call
-        assert_eq!(calls(&plain), 2, "{plain}");
-        assert_eq!(calls(&sanitized), 4, "{sanitized}");
+        // after main's pith_runtime_start: the alloc and the fast path's
+        // cold fallback, against the alloc, the two checks and a plain
+        // list_len call
+        assert_eq!(calls(&plain), 3, "{plain}");
+        assert_eq!(calls(&sanitized), 5, "{sanitized}");
         assert!(!sanitized.contains("can_move"), "{sanitized}");
     }
 

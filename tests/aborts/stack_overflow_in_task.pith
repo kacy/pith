@@ -1,0 +1,14 @@
+# unbounded recursion in a spawned task runs off the end of its green stack.
+# the guard page faults, and the runtime must say so and exit with its
+# stack overflow status rather than let the process die by a bare SIGSEGV.
+
+fn depth(n: Int) -> Int:
+    if n == 0:
+        return 0
+    return depth(n - 1) + 1
+
+fn main() -> Int!:
+    print("before")
+    t := spawn depth(100000000)
+    print((await t).to_string())
+    return 0

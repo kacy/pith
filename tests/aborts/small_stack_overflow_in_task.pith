@@ -1,0 +1,14 @@
+# PITH_GREEN_STACK_KB sets the green stack size. the first task's recursion
+# fits in the default 1 MiB, and the golden runs with 64 KiB stacks, where
+# the same depth overflows and the report names the configured size.
+
+fn depth(n: Int) -> Int:
+    if n == 0:
+        return 0
+    return depth(n - 1) + 1
+
+fn main() -> Int!:
+    print("before")
+    t := spawn depth(20000)
+    print((await t).to_string())
+    return 0

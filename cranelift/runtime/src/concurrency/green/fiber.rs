@@ -50,19 +50,20 @@ extern "C" {
     fn __tsan_switch_to_fiber(fiber: *mut c_void, flags: u32);
 }
 
-/// the extent of a task's stack, which asan needs before switching onto it.
-/// `UNKNOWN` (a test's hand-built coroutine) skips the asan calls.
+/// the extent of a task's stack. `bottom` is the lowest address of its
+/// mapping, where the guard page starts, which the stack overflow handler
+/// checks a fault against. asan also needs the size before switching onto the
+/// stack. `UNKNOWN` (a test's hand-built coroutine) skips the asan calls.
 #[derive(Clone, Copy)]
 pub(super) struct StackBounds {
-    #[cfg(pith_asan)]
-    bottom: usize,
+    pub(super) bottom: usize,
     #[cfg(pith_asan)]
     size: usize,
 }
 
 impl StackBounds {
+    #[cfg(any(test, pith_asan))]
     pub(super) const UNKNOWN: StackBounds = StackBounds {
-        #[cfg(pith_asan)]
         bottom: 0,
         #[cfg(pith_asan)]
         size: 0,
@@ -70,16 +71,12 @@ impl StackBounds {
 
     #[inline(always)]
     pub(super) fn of(stack: &corosensei::stack::DefaultStack) -> StackBounds {
-        #[cfg(pith_asan)]
-        {
-            use corosensei::stack::Stack;
-            let bottom = stack.limit().get();
-            StackBounds { bottom, size: stack.base().get() - bottom }
-        }
-        #[cfg(not(pith_asan))]
-        {
-            let _ = stack;
-            StackBounds::UNKNOWN
+        use corosensei::stack::Stack;
+        let bottom = stack.limit().get();
+        StackBounds {
+            bottom,
+            #[cfg(pith_asan)]
+            size: stack.base().get() - bottom,
         }
     }
 }

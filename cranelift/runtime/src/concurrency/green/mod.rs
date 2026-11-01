@@ -59,6 +59,7 @@ use std::sync::atomic::{
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
 use std::time::{Duration, Instant};
 
+mod fiber;
 mod preempt;
 mod probe;
 mod queues;
@@ -71,6 +72,7 @@ mod tests;
 mod wake;
 mod worker;
 
+use fiber::*;
 use preempt::*;
 use queues::*;
 use run::*;
@@ -383,15 +385,17 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     // convention, call it with the closure handle. it runs on the coroutine's
     // own stack instead of a fresh OS-thread stack; the pith code is identical,
     // so refcount retain/release stays balanced across the boundary.
+    let stack = take_stack();
+    let bounds = StackBounds::of(&stack);
     let coro = TaskCoroutine::with_stack(
-        take_stack(),
+        stack,
         move |yielder: &TaskYielder, _input: ()| -> i64 {
             // publish this coroutine's yielder into the task's own sync block so
             // pith code running on this stack can suspend the task (via
             // park_current). this runs once, on the first resume (the body's
             // top does not run again after a suspend), and the pointer stays
             // valid for the whole life of the body, so once is enough.
-            publish_yielder(yielder as *const TaskYielder);
+            let _finish = publish_yielder(yielder as *const TaskYielder);
             // SAFETY: closure_handle was non-zero at spawn and pith owns the
             // closure's lifetime for the duration of the task; get_fn validates
             // the handle and returns 0 for anything bogus. the transmute matches
@@ -411,7 +415,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     );
 
     let id = alloc_id();
-    let generation = scheduler().sync.ensure(id).arm(SendCoroutine(coro), closure_handle);
+    let generation = scheduler().sync.ensure(id).arm(SendCoroutine(coro), bounds, closure_handle);
     enqueue_fresh(id);
     make_handle(id, generation)
 }

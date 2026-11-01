@@ -60,10 +60,12 @@ pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
     let second = n - 1;
     set_current_worker(Some(first));
 
+    let stack = take_stack();
+    let bounds = StackBounds::of(&stack);
     let coro = TaskCoroutine::with_stack(
-        take_stack(),
+        stack,
         move |yielder: &TaskYielder, _input: ()| -> i64 {
-            publish_yielder(yielder as *const TaskYielder);
+            let _finish = publish_yielder(yielder as *const TaskYielder);
             let Some(id) = current_task() else {
                 return encode_probe(n, None, None, false);
             };
@@ -77,7 +79,7 @@ pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
         },
     );
     let id = alloc_id();
-    let generation = scheduler().sync.ensure(id).arm(SendCoroutine(coro), 0);
+    let generation = scheduler().sync.ensure(id).arm(SendCoroutine(coro), bounds, 0);
 
     // first resume, on this thread: the body parks. claim it the way a waker
     // does (Parked -> Ready) but hand it straight to the thread below instead

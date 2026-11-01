@@ -1,0 +1,35 @@
+# a bare variant name in a pattern is a binding that matches every value, so
+# `Red => ...` used to match Green and Blue too. every spelling of it is
+# refused: a top-level arm, a tuple element, a payload slot and an optional
+# subject, which unwraps to the enum first.
+enum Color:
+    Red
+    Green
+    Blue
+
+enum Paint:
+    Coat(Color)
+    Bare
+
+fn code(c: Color) -> Int:
+    return match c:
+        Red => 1
+        _ => 0
+
+fn pair(c: Color, n: Int) -> Int:
+    return match (c, n):
+        (Green, _) => 1
+        _ => 0
+
+fn coat(p: Paint) -> Int:
+    return match p:
+        Paint.Coat(Blue) => 1
+        _ => 0
+
+fn maybe(c: Color?) -> Int:
+    return match c:
+        Red => 1
+        none => 0
+
+fn main():
+    print("{code(Color.Green)} {pair(Color.Red, 1)} {coat(Paint.Bare)} {maybe(none)}")

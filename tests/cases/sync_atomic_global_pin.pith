@@ -1,0 +1,56 @@
+# sync_atomic_field_pin with the replaced handle in a `mut` global. every task
+# sees the global, so an argument read from one is pinned like a field.
+mut lock: AtomicInt := AtomicInt(0)
+mut cell: AtomicInt := AtomicInt(1)
+
+fn take(l: AtomicInt) -> Int:
+    mut spins := 0
+    while not l.compare_set(0, 1):
+        spins = spins + 1
+    return spins
+
+fn count(l: AtomicInt, c: AtomicInt) -> Int:
+    l.store(0)
+    mut n := 0
+    mut k := 0
+    while k < 200:
+        n = n + c.load()
+        k = k + 1
+    return n
+
+fn reader(rounds: Int, out: Channel[Int]):
+    mut total := 0
+    mut i := 0
+    while i < rounds:
+        take(lock)
+        total = total + count(lock, cell)
+        i = i + 1
+    out.send(total)
+
+fn writer(rounds: Int, out: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        take(lock)
+        cell = AtomicInt(1)
+        lock.store(0)
+        i = i + 1
+    out.send(i)
+
+fn main():
+    rounds := 20000
+    out := Channel[Int](4)
+    r1 := spawn reader(rounds, out)
+    r2 := spawn reader(rounds, out)
+    w1 := spawn writer(rounds, out)
+    w2 := spawn writer(rounds, out)
+    mut sum := 0
+    mut got := 0
+    while got < 4:
+        if let v = out.recv():
+            sum = sum + v
+        got = got + 1
+    await r1
+    await r2
+    await w1
+    await w2
+    print("sum {sum}")

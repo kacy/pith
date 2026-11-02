@@ -195,6 +195,9 @@ mut ir_borrow_param_exported: Map[String, String] := {}
 # local names this module's own calls use, exported names other modules use.
 mut ir_storage_keepers_local: Map[String, Bool] := {}
 mut ir_storage_keepers_exported: Map[String, Bool] := {}
+# this module's `mut` globals. any task, or the callee itself, can replace the
+# value one holds, so an argument read from one is pinned (ir_arg_pin_kind).
+mut ir_mutable_global_names: Map[String, Bool] := {}
 # the functions that keep storage once atomic cell methods are allowed too
 # (a superset of the above). an atomic store can hand guarded storage to
 # another task as an unlock does, so a call to one of these still pins every
@@ -452,6 +455,7 @@ fn ir_reset_global_state():
     ir_global_set_int_names = []
     ir_global_bool_names = []
     ir_global_slot_names = []
+    ir_mutable_global_names = {}
 
 # clear the per-module type registries: struct and enum shapes, impl
 # methods, declared returns and result kinds, generic declarations and
@@ -3458,14 +3462,15 @@ fn ir_emit_call_arg(expr_idx: Int) -> Int:
 fn ir_arg_release_is_skipped(expr_idx: Int) -> Bool:
     return expr_idx >= 0 and c_argument_widens_to_optional(expr_idx)
 
-# a struct field or a container element read as an argument hands the callee
-# the owner's count and none of its own. that is enough for a builtin, but a
-# callee that runs user code can overwrite that field or evict that element,
-# directly or through a global, a capture or another argument, and the value
-# then dies under the parameter that still names it. so an argument like that
-# is pinned for the call: retained as soon as it is evaluated, and released
-# once the call returns. a local or a parameter needs no pin, since only this
-# frame can rebind it.
+# a struct field, a container element or a `mut` global read as an argument
+# hands the callee the owner's count and none of its own. that is enough for a
+# builtin, but a callee that runs user code can overwrite that field, evict
+# that element or reassign that global, directly or through another task it
+# lets run, and the value then dies under the parameter that still names it.
+# so an argument like that is pinned for the call: retained as soon as it is
+# evaluated, and released once the call returns. a local or a parameter needs
+# no pin, since only this frame can rebind it, and neither does a global that
+# is not `mut`.
 #
 # the rc kind to pin the argument at expr_idx as, or "" for none.
 fn ir_arg_pin_kind(expr_idx: Int) -> String:
@@ -3474,12 +3479,23 @@ fn ir_arg_pin_kind(expr_idx: Int) -> String:
     mut read_idx := expr_idx
     while node_kind(read_idx) == "grouped" and get_node(read_idx).children.len() > 0:
         read_idx = get_node(read_idx).children[0]
-    if node_kind(read_idx) != "field_access" and node_kind(read_idx) != "index":
+    read_kind := node_kind(read_idx)
+    if read_kind == "ident":
+        if not ir_reads_mutable_global(get_node(read_idx).value):
+            return ""
+    elif read_kind != "field_access" and read_kind != "index":
         return ""
     kind := ir_rc_kind(ir_infer_type(read_idx))
     if kind == "weak":
         return ""
     return kind
+
+# whether a bare name reads one of this module's `mut` globals rather than a
+# local, a parameter or a loop variable of the same spelling
+fn ir_reads_mutable_global(name: String) -> Bool:
+    if not ir_mutable_global_names.contains_key(name):
+        return false
+    return ir_loop_var_slot(name).len() == 0 and not ir_name_is_func_local(name)
 
 # pin the argument just evaluated into `reg` when pin is set and it needs it,
 # and record the kind (or "") so ir_unpin_args can release it after the call.
@@ -12560,6 +12576,8 @@ fn ir_record_returns_clause(name: String, returns_node: Node):
 fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
     gname := ir_binding_name(node)
     ir_record_global_slot(gname)
+    if node.value.contains(" mut"):
+        ir_mutable_global_names.insert(gname, true)
     mut init_val := "0"
     mut global_type := ""
     mut global_map_value_type := ""

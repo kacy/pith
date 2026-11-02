@@ -1432,16 +1432,34 @@ fn json_fill_skip_nested(input: Bytes, pos: Int, depth: Int) -> Int:
 ## array is consumed with the node parser's grammar and depth bound.
 ## Called only by compiler-generated code.
 pub fn fill_skip_value(input: Bytes, pos: Int) -> Int:
-    if pos < 0 or pos >= input.len():
+    n := input.len()
+    if pos < 0 or pos >= n:
         return -1
     b := input[pos]
+    # the string and number loops are written out here instead of going
+    # through the shared byte helpers. with a helper call per byte, a
+    # document with one unknown numeric key decoded 4.5% slower than the
+    # runtime fill did.
     if b == 34:
-        end := json_fill_string_end(input, pos)
-        if end < 0:
-            return -1
-        return end + 1
-    if b == 45 or json_byte_is_digit(b):
-        return json_byte_number_span_end(input, pos)
+        mut i := pos + 1
+        while i < n:
+            c := input[i]
+            if c == 34:
+                return i + 1
+            if c == 92:
+                i = i + 2
+            else:
+                i = i + 1
+        return -1
+    if b == 45 or (b >= 48 and b <= 57):
+        mut i := pos + 1
+        while i < n:
+            c := input[i]
+            if (c >= 48 and c <= 57) or c == 46 or c == 101 or c == 69 or c == 45 or c == 43:
+                i = i + 1
+            else:
+                return i
+        return i
     if json_byte_match_literal(input, pos, "true") or json_byte_match_literal(input, pos, "null"):
         return pos + 4
     if json_byte_match_literal(input, pos, "false"):

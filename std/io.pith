@@ -1587,6 +1587,7 @@ fn read_all_tcp_stream_bytes(stream: TcpStream) -> Bytes!:
 fn read_all_tcp_stream_bytes_chunked(stream: TcpStream, chunk_size: Int) -> Bytes!:
     size := normalized_chunk_size(chunk_size)
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := stream.read_bytes(size)!
     while not chunk.is_empty():
         buf.write(chunk)!
@@ -1599,6 +1600,7 @@ fn read_all_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context) -> Bytes!Block
 fn read_all_tcp_stream_bytes_chunked_ctx(stream: TcpStream, ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
     size := normalized_chunk_size(chunk_size)
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := tcp_stream_read_bytes_ctx(stream, ctx, size)!
     while not chunk.is_empty():
         wrote := buf.write(chunk)
@@ -1635,6 +1637,7 @@ fn read_all_file_stream_bytes(stream: FileStream) -> Bytes!:
 fn read_all_file_stream_bytes_chunked(stream: FileStream, chunk_size: Int) -> Bytes!:
     size := normalized_chunk_size(chunk_size)
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := stream.read_bytes(size)!
     while not chunk.is_empty():
         buf.write(chunk)!
@@ -1669,6 +1672,7 @@ fn read_all_process_stdout_bytes(reader: ProcessStdout) -> Bytes!:
 fn read_all_process_stdout_bytes_chunked(reader: ProcessStdout, chunk_size: Int) -> Bytes!:
     size := normalized_chunk_size(chunk_size)
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := reader.read_bytes(size)!
     while not chunk.is_empty():
         buf.write(chunk)!
@@ -1681,6 +1685,7 @@ fn read_all_process_stderr_bytes(reader: ProcessStderr) -> Bytes!:
 fn read_all_process_stderr_bytes_chunked(reader: ProcessStderr, chunk_size: Int) -> Bytes!:
     size := normalized_chunk_size(chunk_size)
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := reader.read_bytes(size)!
     while not chunk.is_empty():
         buf.write(chunk)!
@@ -1735,6 +1740,7 @@ fn read_all_process_stdout_bytes_ctx(reader: ProcessStdout, ctx: Context) -> Byt
 fn read_all_process_stdout_bytes_chunked_ctx(reader: ProcessStdout, ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
     size := normalized_chunk_size(chunk_size)
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := process_stdout_read_bytes_ctx(reader, ctx, size)!
     while not chunk.is_empty():
         wrote := buf.write(chunk)
@@ -1768,6 +1774,7 @@ fn read_all_process_stderr_bytes_ctx(reader: ProcessStderr, ctx: Context) -> Byt
 fn read_all_process_stderr_bytes_chunked_ctx(reader: ProcessStderr, ctx: Context, chunk_size: Int) -> Bytes!BlockingError:
     size := normalized_chunk_size(chunk_size)
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := process_stderr_read_bytes_ctx(reader, ctx, size)!
     while not chunk.is_empty():
         wrote := buf.write(chunk)
@@ -1780,6 +1787,7 @@ fn read_exact_bytes_cursor(reader: BytesCursor, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := bytes_cursor_read(reader, count - buf.len())!
         if chunk.is_empty():
@@ -1791,6 +1799,7 @@ fn read_exact_buffered_bytes_reader(reader: BufferedBytesReader, count: Int) -> 
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := buffered_bytes_reader_read(reader, count - buf.len())!
         if chunk.is_empty():
@@ -1802,6 +1811,7 @@ fn read_exact_tcp_stream_bytes(stream: TcpStream, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := tcp_stream_read_bytes(stream, count - buf.len())!
         if chunk.is_empty():
@@ -1813,6 +1823,7 @@ fn read_exact_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context, count: Int) 
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := tcp_stream_read_bytes_ctx(stream, ctx, count - buf.len())!
         if chunk.is_empty():
@@ -1826,6 +1837,7 @@ fn read_exact_file_stream_bytes(stream: FileStream, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := file_stream_read_bytes(stream, count - buf.len())!
         if chunk.is_empty():
@@ -1837,6 +1849,7 @@ fn read_exact_process_stdout_bytes(reader: ProcessStdout, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := process_stdout_read_bytes(reader, count - buf.len())!
         if chunk.is_empty():
@@ -1848,6 +1861,7 @@ fn read_exact_process_stdout_bytes_ctx(reader: ProcessStdout, ctx: Context, coun
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := process_stdout_read_bytes_ctx(reader, ctx, count - buf.len())!
         if chunk.is_empty():
@@ -1861,6 +1875,7 @@ fn read_exact_process_stderr_bytes(reader: ProcessStderr, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := process_stderr_read_bytes(reader, count - buf.len())!
         if chunk.is_empty():
@@ -1872,6 +1887,7 @@ fn read_exact_process_stderr_bytes_ctx(reader: ProcessStderr, ctx: Context, coun
     if count <= 0:
         return bytes.empty()
     buf := bytes.buffer_with_capacity(count)
+    errdefer buf.free()
     while buf.len() < count:
         chunk := process_stderr_read_bytes_ctx(reader, ctx, count - buf.len())!
         if chunk.is_empty():
@@ -1887,6 +1903,7 @@ fn read_all_buffered_bytes_reader(reader: BufferedBytesReader) -> Bytes!:
 fn read_all_buffered_bytes_reader_chunked(reader: BufferedBytesReader, chunk_size: Int) -> Bytes!:
     size := normalized_chunk_size(chunk_size)
     buf := bytes.buffer_with_capacity(size)
+    errdefer buf.free()
     mut chunk := reader.read_bytes(size)!
     while not chunk.is_empty():
         buf.write(chunk)!
@@ -1912,6 +1929,7 @@ fn buffered_bytes_reader_read_internal(reader: BufferedBytesReader, max_bytes: I
     state := buffered_bytes_readers[reader.handle]
 
     buf := bytes.buffer_with_capacity(max_bytes)
+    errdefer buf.free()
     while buf.len() < max_bytes:
         if state.cache.is_empty():
             filled := buffered_bytes_reader_fill(state)!

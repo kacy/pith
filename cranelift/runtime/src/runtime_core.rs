@@ -1,4 +1,3 @@
-use crate::collections::list::{pith_list_new, pith_list_push_value};
 use crate::string;
 use std::alloc::{alloc, Layout};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
@@ -444,42 +443,6 @@ pub(crate) unsafe fn cstring_check_freed(s: *const i8) {
     if crate::quarantine::on() {
         cstring_base(s);
     }
-}
-
-/// Debug: release with an emission-site id; prints the site when the traced
-/// string takes its final release.
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_release_traced(s: *const i8, site: i64) {
-    if let Some(base) = cstring_base(s) {
-        let rc = cstring_refcount(base).load(Ordering::Relaxed);
-        if rc == 1 {
-            if let Some(needle) = debug_trace_needle() {
-                let data_len = cstring_data_len(base);
-                let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
-                let content = String::from_utf8_lossy(bytes);
-                if content == needle {
-                    eprintln!("pith trace: site {} finally releases {:?}", site, content);
-                }
-            }
-        }
-    }
-    pith_cstring_release(s);
-}
-
-/// Debug: retain with an emission-site id; prints the site when the
-/// retained string matches `PITH_CSTRING_WATCH`.
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_retain_traced(s: *const i8, site: i64) {
-    if let Some(base) = cstring_base(s) {
-        if debug_watch_needle().is_some() {
-            let data_len = cstring_data_len(base);
-            let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
-            if Some(String::from_utf8_lossy(bytes).into_owned().as_str()) == debug_watch_needle() {
-                eprintln!("watch retain SITE {}", site);
-            }
-        }
-    }
-    pith_cstring_retain(s);
 }
 
 pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
@@ -1639,11 +1602,6 @@ mod tests {
             pith_struct_release(s);
         }
     }
-}
-
-#[no_mangle]
-pub extern "C" fn pith_print_int(n: i64) {
-    println!("{}", n);
 }
 
 #[no_mangle]
@@ -2868,31 +2826,6 @@ pub extern "C" fn pith_atan(n: f64) -> f64 {
 #[no_mangle]
 pub extern "C" fn pith_atan2(y: f64, x: f64) -> f64 {
     y.atan2(x)
-}
-
-#[no_mangle]
-pub extern "C" fn pith_log(n: f64) -> f64 {
-    n.ln()
-}
-
-#[no_mangle]
-pub extern "C" fn pith_log10(n: f64) -> f64 {
-    n.log10()
-}
-
-#[no_mangle]
-pub extern "C" fn pith_log2(n: f64) -> f64 {
-    n.log2()
-}
-
-#[no_mangle]
-pub extern "C" fn pith_exp(n: f64) -> f64 {
-    n.exp()
-}
-
-#[no_mangle]
-pub extern "C" fn pith_abs_float(n: f64) -> f64 {
-    n.abs()
 }
 
 #[no_mangle]
@@ -4325,16 +4258,3 @@ pub(crate) fn weak_upgrade<C: crate::sync::Count32>(strong: &C, flags: &C) -> bo
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_args_to_list() -> i64 {
-    let list = pith_list_new(8, 1);
-
-    for arg in std::env::args() {
-        let arg_len = arg.len();
-        let arg_ptr = pith_copy_bytes_to_cstring(&arg.as_bytes()[..arg_len]);
-        pith_list_push_value(list, arg_ptr as i64);
-        pith_cstring_release(arg_ptr as *const i8);
-    }
-
-    list.ptr as i64
-}

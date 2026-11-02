@@ -106,12 +106,17 @@ fn cmd_test(path: String, extra: List[String]) -> String!:
 # check command
 # ---------------------------------------------------------------
 
-fn cmd_check(path: String, json_mode: Bool) -> String!:
-    # read_file's error does not name the file
+# the contents of path, or an error naming the file and exit status 1.
+# read_file's own error does not name the file
+fn read_source_or_exit(path: String) -> String:
     source := read_file(path) catch:
         print_err("error: cannot read " + path)
         exit(1)
         return ""
+    return source
+
+fn cmd_check(path: String, json_mode: Bool) -> String!:
+    source := read_source_or_exit(path)
     outcome := run_check_pipeline(path)!
 
     if not outcome.parse_ok:
@@ -220,7 +225,7 @@ fn cmd_lint(path: String, json_mode: Bool) -> Bool:
 # ---------------------------------------------------------------
 
 fn cmd_doc(path: String, check_mode: Bool, json_mode: Bool) -> String!:
-    source := read_file(path)!
+    source := read_source_or_exit(path)
     doc_extract(source)
 
     if check_mode:
@@ -298,7 +303,7 @@ fn cmd_package(action: String, args_list: List[String]) -> String!:
 # ---------------------------------------------------------------
 
 fn cmd_lex(path: String) -> String!:
-    source := read_file(path)!
+    source := read_source_or_exit(path)
     tokens := lex_all(source)
     for tok in tokens:
         print(tok.kind + " " + tok.value)
@@ -309,7 +314,7 @@ fn cmd_lex(path: String) -> String!:
 # ---------------------------------------------------------------
 
 fn cmd_parse(path: String) -> String!:
-    source := read_file(path)!
+    source := read_source_or_exit(path)
     tokens := lex_all(source)
     reset_arena()
     root := parse_with_file(tokens, path)

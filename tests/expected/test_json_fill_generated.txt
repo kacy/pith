@@ -1,0 +1,138 @@
+in_order ok: 1 2 3 "eight" true 6
+reversed ok: 1 2 3 "eight" true 6
+shuffled ok: 1 2 3 "eight" true 6
+prefix_missing err: missing json field: a
+long_missing err: missing json field: a_much_longer_field_name
+near_names err: missing json field: a
+unknown_first ok: 1 2 3 "e" false 6
+escaped_key err: missing json field: n
+escaped_key_then_real ok: 6
+key_with_quote ok: 7
+empty_key ok: 8
+unterminated_key err: missing json field
+quote_at_0 ok: len 0 ""
+slash_at_0 ok: len 6 "\"tail"
+slashes_at_0 ok: len 2 "\\"
+quote_at_1 ok: len 1 "a"
+slash_at_1 ok: len 7 "a\"tail"
+slashes_at_1 ok: len 3 "a\\"
+quote_at_2 ok: len 2 "ab"
+slash_at_2 ok: len 8 "ab\"tail"
+slashes_at_2 ok: len 4 "ab\\"
+quote_at_3 ok: len 3 "abc"
+slash_at_3 ok: len 9 "abc\"tail"
+slashes_at_3 ok: len 5 "abc\\"
+quote_at_4 ok: len 4 "abcd"
+slash_at_4 ok: len 10 "abcd\"tail"
+slashes_at_4 ok: len 6 "abcd\\"
+quote_at_5 ok: len 5 "abcde"
+slash_at_5 ok: len 11 "abcde\"tail"
+slashes_at_5 ok: len 7 "abcde\\"
+quote_at_6 ok: len 6 "abcdef"
+slash_at_6 ok: len 12 "abcdef\"tail"
+slashes_at_6 ok: len 8 "abcdef\\"
+quote_at_7 ok: len 7 "abcdefg"
+slash_at_7 ok: len 13 "abcdefg\"tail"
+slashes_at_7 ok: len 9 "abcdefg\\"
+quote_at_8 ok: len 8 "abcdefgh"
+slash_at_8 ok: len 14 "abcdefgh\"tail"
+slashes_at_8 ok: len 10 "abcdefgh\\"
+quote_at_9 ok: len 9 "abcdefghi"
+slash_at_9 ok: len 15 "abcdefghi\"tail"
+slashes_at_9 ok: len 11 "abcdefghi\\"
+quote_at_10 ok: len 10 "abcdefghij"
+slash_at_10 ok: len 16 "abcdefghij\"tail"
+slashes_at_10 ok: len 12 "abcdefghij\\"
+quote_at_11 ok: len 11 "abcdefghijk"
+slash_at_11 ok: len 17 "abcdefghijk\"tail"
+slashes_at_11 ok: len 13 "abcdefghijk\\"
+quote_at_12 ok: len 12 "abcdefghijkl"
+slash_at_12 ok: len 18 "abcdefghijkl\"tail"
+slashes_at_12 ok: len 14 "abcdefghijkl\\"
+quote_at_13 ok: len 13 "abcdefghijklm"
+slash_at_13 ok: len 19 "abcdefghijklm\"tail"
+slashes_at_13 ok: len 15 "abcdefghijklm\\"
+quote_at_14 ok: len 14 "abcdefghijklmn"
+slash_at_14 ok: len 20 "abcdefghijklmn\"tail"
+slashes_at_14 ok: len 16 "abcdefghijklmn\\"
+quote_at_15 ok: len 15 "abcdefghijklmno"
+slash_at_15 ok: len 21 "abcdefghijklmno\"tail"
+slashes_at_15 ok: len 17 "abcdefghijklmno\\"
+quote_at_16 ok: len 16 "abcdefghijklmnop"
+slash_at_16 ok: len 22 "abcdefghijklmnop\"tail"
+slashes_at_16 ok: len 18 "abcdefghijklmnop\\"
+quote_at_17 ok: len 17 "abcdefghijklmnopq"
+slash_at_17 ok: len 23 "abcdefghijklmnopq\"tail"
+slashes_at_17 ok: len 19 "abcdefghijklmnopq\\"
+escape_run ok: len 32 "\n\t\u0041\\\"0123456789abcdef\/"
+bad_escape_kept_raw ok: len 6 "\q\u12"
+trailing_backslash err: missing json field
+unterminated_long err: missing json field
+utf8 ok: len 26 "café € 😀 ünïcödé"
+raw_bytes ok: len 2 "ab"
+invalid_utf8 ok: len 10
+repeated ok: len 6 "second"
+int 0 ok: 0
+int -0 ok: 0
+int 007 ok: 7
+int -12 ok: -12
+int 9223372036854775807 ok: 9223372036854775807
+int 9223372036854775808 ok: 9223372036854775807
+int 99999999999999999999999 ok: 9223372036854775807
+int -9223372036854775808 ok: -9223372036854775807
+int -99999999999999999999 ok: -9223372036854775807
+int 1e3 err: missing json field
+int 1.0 err: missing json field
+int +5 err: missing json field
+int - err: missing json field
+int --1 err: missing json field
+int 12x err: missing json field
+int 0x10 err: missing json field
+int_at_end err: missing json field
+float 3 ok: 3 sign +
+float -0.0 ok: 0 sign -
+float 0.1 ok: 0.1 sign +
+float 1e3 ok: 1000 sign +
+float 2.5E-3 ok: 0.0025 sign +
+float 1.7976931348623157e308 ok: 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368 sign +
+float 5e-324 ok: 0 sign +
+float 1e309 err: missing json field
+float -1e309 err: missing json field
+float 1e-400 ok: 0 sign +
+float .5 err: missing json field
+float 1.5.5 err: missing json field
+float 1e err: missing json field
+float +1 err: missing json field
+float - err: missing json field
+float 1-2 err: missing json field
+float 0.30000000000000004 ok: 0.3 sign +
+true_false ok: true 1
+false ok: false 2
+prefix_trailing err: missing json field
+short err: missing json field
+false_at_end err: missing json field
+capital err: missing json field
+skip_scalars ok: 1
+skip_nested ok: 2
+skip_lenient ok: 3
+skip_bad_escape err: missing json field
+skip_lone_surrogate err: missing json field
+skip_pair ok: 6
+skip_big_int err: missing json field
+skip_big_float ok: 8
+skip_plus ok: 9
+skip_plus_top err: missing json field
+skip_depth_127 ok: 11
+skip_depth_128 err: missing json field
+skip_depth_deep err: missing json field
+skip_unclosed err: missing json field
+skip_bad_literal err: missing json field
+tabs_newlines ok: 16
+trailing_garbage ok: 17
+empty_object err: missing json field: n
+empty_input err: missing json field
+only_space err: missing json field
+array err: missing json field
+vertical_tab err: missing json field
+double_comma err: missing json field
+missing_comma err: missing json field

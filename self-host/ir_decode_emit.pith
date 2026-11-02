@@ -27,6 +27,7 @@ from ir_type_helpers import ir_type_from_tid
 from ir_names import ir_base_decl_name
 from types import get_type_info, lookup_type_id
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label
+from ir_json_fill_emit import JsonFillField, ir_emit_json_fill_flat
 
 # result-returning decode helper calls, routed through the register-ABI
 # registry: a registered pair-returning helper is rcall'd and its pair
@@ -1536,34 +1537,6 @@ fn ir_json_decode_all_required_scalar(target_info: TypeInfo) -> Bool:
             return false
     return true
 
-# the fast path: one per-key byte scan per field, no scalar-object.
-# build the packed field spec ("<type><name>,..." in declaration order,
-# so a field's position is its struct slot) from a struct's decl node.
-# used both when interning the spec in the string prepass and when the
-# decoder references it, so the two always produce the identical string.
-pub fn ir_json_decode_spec_from_decl(decl: Node) -> String:
-    mut spec := ""
-    mut first := true
-    for child in decl.children:
-        fnode := ir_unwrap_pub_node(child)
-        if fnode.kind == "field" and fnode.children.len() > 0:
-            if not first:
-                spec = spec + ","
-            first = false
-            fname := fnode.value.split(" ")[0]
-            type_node := get_node(fnode.children[0])
-            spec = spec + ir_json_type_name_char(type_node.value) + fname
-    return spec
-
-# 2^n - 1: one bit per field, the mask when every field was filled.
-fn ir_json_required_mask(n: Int) -> Int:
-    mut mask := 0
-    mut i := 0
-    while i < n:
-        mask = mask * 2 + 1
-        i = i + 1
-    return mask
-
 # string is the only rc scalar, so the struct needs its destructor when
 # any field is a string; otherwise those field strings would leak.
 fn ir_json_decode_has_string(target_info: TypeInfo) -> Bool:
@@ -1574,18 +1547,13 @@ fn ir_json_decode_has_string(target_info: TypeInfo) -> Bool:
     return false
 
 # the fast path: decode a flat scalar struct in a single pass. the
-# runtime fills a pre-allocated struct, destructor attached, in place,
-# so there is no scalar-object, no per-field result tuple, and no leaked
-# field strings. a mask of the filled fields is checked against the
-# required set; any miss releases the struct and returns the decode error.
-fn ir_emit_json_decode_scan_fields(input_r: Int, target_info: TypeInfo) -> Int:
-    temp_name := ir_new_temp_name("json_decode")
-    ir_var_types.insert(temp_name, "tuple")
-    ok_l := ir_label()
-    err_l := ir_label()
-    done_l := ir_label()
+# struct is allocated here, destructor attached, and the decoder
+# generated for it (ir_json_fill_emit.pith) fills it in place, so there
+# is no scalar-object, no per-field result tuple, and no leaked field
+# strings; on any failure the decoder releases the struct and returns
+# the decode error.
+fn ir_emit_json_decode_scan_fields(input_r: Int, target_info: TypeInfo, index_idx: Int) -> Int:
     n := target_info.fields.len()
-
     struct_r := ir_reg()
     count_r := ir_reg()
     ir_emit("iconst " + count_r.to_string() + " " + n.to_string())
@@ -1594,39 +1562,20 @@ fn ir_emit_json_decode_scan_fields(input_r: Int, target_info: TypeInfo) -> Int:
         dtor_r := ir_reg()
         ir_emit("funcref " + dtor_r.to_string() + " __dtor_" + ir_struct_base_name(target_info.name))
         ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + struct_r.to_string() + " " + dtor_r.to_string())
-
-    spec_r := ir_reg()
-    ir_emit("strref " + spec_r.to_string() + " " + ir_str(ir_json_decode_spec_from_decl(get_node(ir_struct_decl_nodes[target_info.name]))))
-
-    mask_r := ir_reg()
-    ir_emit_call_text(mask_r, "pith_json_fill_struct", "int", 3, " " + input_r.to_string() + " " + spec_r.to_string() + " " + struct_r.to_string())
-
-    req_r := ir_reg()
-    ir_emit("iconst " + req_r.to_string() + " " + ir_json_required_mask(n).to_string())
-    eq_r := ir_reg()
-    ir_emit("eq " + eq_r.to_string() + " " + mask_r.to_string() + " " + req_r.to_string())
-    ir_emit("brif " + eq_r.to_string() + " " + ok_l + " " + err_l)
-
-    ir_emit_label(err_l)
-    ir_emit_call1(ir_reg(), "pith_struct_release", "void", struct_r)
-    err_res_r := ir_reg()
-    ir_emit_call_text(err_res_r, "pith_json_decode_missing_error", "tuple", 2, " " + mask_r.to_string() + " " + spec_r.to_string())
-    ir_emit("store " + temp_name + " " + err_res_r.to_string())
-    ir_emit("jmp " + done_l)
-
-    ir_emit_label(ok_l)
-    ir_emit("store " + temp_name + " " + ir_emit_ok_result_tuple_raw(struct_r).to_string())
-
-    ir_emit_label(done_l)
-    r := ir_reg()
-    ir_emit("load " + r.to_string() + " " + temp_name)
-    return r
+    mut fields: List[JsonFillField] := []
+    for field_name, i in target_info.fields:
+        field_tid := ir_struct_field_tid_at(target_info.name, i, target_info.field_types[i])
+        fields.push(JsonFillField(field_name, ir_json_field_type_char(field_tid)))
+    skip_fn := ir_resolve_json_call_name(index_idx, "fill_skip_value")
+    error_fn := ir_resolve_json_call_name(index_idx, "fill_missing_error")
+    malformed_fn := ir_resolve_json_call_name(index_idx, "fill_malformed_error")
+    return ir_emit_json_fill_flat(input_r, struct_r, fields, skip_fn, error_fn, malformed_fn)
 
 # --- the nested fill path --------------------------------------------------
 #
 # a struct with a nested struct field used to parse into the node pool and
 # copy its fields out through the object accessors, at about five hundred
-# times the cost of the flat fill above (docs/performance.md, nested json
+# times the cost of the flat decode above (docs/performance.md, nested json
 # decoding). it now fills in place too: the lowering allocates the whole
 # tree of structs, each with its destructor and each sub-struct stored in
 # its parent's slot, and hands the runtime one spec that carries the
@@ -1635,7 +1584,7 @@ fn ir_emit_json_decode_scan_fields(input_r: Int, target_info: TypeInfo) -> Int:
 # never allocates and never learns a destructor's address.
 #
 # the nested spec is a string the decode references with a strref, so
-# like the flat spec it has to be interned before any body is emitted.
+# it has to be interned before any body is emitted.
 # a struct with a struct field is common in programs that never decode,
 # so the prepass interns a spec only for the structs the program's
 # decode calls target, resolved through the checker's type for each
@@ -2052,9 +2001,6 @@ fn ir_emit_json_decode_fill_nested(input_r: Int, target_info: TypeInfo, spec: St
 
 ## emit the json decode map call sequence.
 pub fn ir_emit_json_decode_map_call(input_r: Int, target_info: TypeInfo, emit_expr: fn(Int) -> Int, emit_value: fn(Int, String) -> Int) -> Int:
-    if ir_json_decode_all_required_scalar(target_info):
-        return ir_emit_json_decode_scan_fields(input_r, target_info)
-
     temp_name := ir_new_temp_name("json_decode")
     ir_var_types.insert(temp_name, "tuple")
     done_l := ir_label()
@@ -2363,7 +2309,7 @@ pub fn ir_emit_json_decode_call(idx: Int, node: Node, text_input: Bool, emit_exp
     # any flat struct of required scalars decodes in one pass straight
     # into a pre-allocated struct, whatever its field count.
     if ir_json_decode_all_required_scalar(target_info):
-        scan_r := ir_emit_json_decode_scan_fields(input_r, target_info)
+        scan_r := ir_emit_json_decode_scan_fields(input_r, target_info, node.children[0])
         if owns_input:
             ir_rc_release_reg(input_r, "bytes")
         if fresh_text_input:

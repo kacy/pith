@@ -904,6 +904,28 @@ fn inline_handle_len(
     join_with_fallback_call(builder, slow, done, fallback, &[handle])
 }
 
+/// Inline `pith_bytes_data_ptr`: the handle test `pith_bytes_ref` makes,
+/// then the data pointer. A handle that fails the test goes to `fallback`,
+/// which answers 0 as it always does.
+fn inline_bytes_data_ptr(builder: &mut FunctionBuilder<'_>, handle: Value, fallback: FuncRef) -> Value {
+    let (done, slow) = strict_path_blocks(builder);
+    branch_if_not_magic_handle(
+        builder,
+        handle,
+        handle,
+        BYTES_HANDLE_ALIGN,
+        BYTES_MAGIC_OFFSET,
+        BYTES_MAGIC,
+        slow,
+    );
+    let ptr = builder
+        .ins()
+        .load(types::I64, MemFlags::new(), handle, BYTES_DATA_PTR_OFFSET);
+    jump_with_i64_arg(builder, done, ptr);
+    let handle = builder.block_params(slow)[0];
+    join_with_fallback_call(builder, slow, done, fallback, &[handle])
+}
+
 /// Inline a closure body's read of one of its captures
 /// (`pith_closure_get_env`) as the handle test `closure_base` makes and one
 /// load from the inline env. Every call into a closure reads its captures
@@ -1322,6 +1344,33 @@ fn inline_runtime_call(
         ("bytes_get_strict", 2) => {
             let fallback = runtime_ref(builder, "bytes_get_strict")?;
             inline_bytes_get_strict(builder, args[0], args[1], fallback)
+        }
+        // the typed json decoder's input: the handle tested once, then
+        // unchecked byte loads at indexes the decoder compared against the
+        // length itself.
+        ("pith_bytes_data_ptr", 1) => {
+            let fallback = runtime_ref(builder, fname)?;
+            inline_bytes_data_ptr(builder, args[0], fallback)
+        }
+        ("pith_store_u64", 3) => {
+            let addr = builder.ins().iadd(args[0], args[1]);
+            builder.ins().store(MemFlags::new().with_notrap(), args[2], addr, 0);
+            builder.ins().iconst(types::I64, 0)
+        }
+        ("pith_load_u8" | "pith_load_u16" | "pith_load_u32" | "pith_load_u64", 2) => {
+            let ty = match fname {
+                "pith_load_u8" => types::I8,
+                "pith_load_u16" => types::I16,
+                "pith_load_u32" => types::I32,
+                _ => types::I64,
+            };
+            let addr = builder.ins().iadd(args[0], args[1]);
+            let word = builder.ins().load(ty, MemFlags::new().with_notrap(), addr, 0);
+            if ty == types::I64 {
+                word
+            } else {
+                builder.ins().uextend(types::I64, word)
+            }
         }
         ("bytes_read_word", 3) => {
             let fallback = runtime_ref(builder, "bytes_read_word")?;

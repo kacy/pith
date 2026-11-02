@@ -1369,6 +1369,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_match_binding_reuse \
 	tests/cases/test_generic_match_binding \
 	tests/cases/test_json_fill_struct_shapes \
+	tests/cases/test_json_fill_generated \
 	tests/cases/test_json_fill_nested_shapes \
 	tests/cases/test_json_fill_float_shapes \
 	tests/cases/test_parse_float_contract \

@@ -1,0 +1,16 @@
+# global_arg_pin across modules. `label` is another module's `mut` global read
+# by its bare imported name, and relabel reassigns it, dropping the count the
+# argument borrowed, before it reads its parameter. retext does the same to a
+# field. both callees are imported by bare name, which made them look like
+# builtins to the call, so neither argument was pinned.
+from imported_global_pin_helper import label, relabel, Box, retext
+
+fn main():
+    label = "a-" + (3).to_string()
+    b := Box(text: "b-" + (4).to_string())
+    mut i := 0
+    while i < 3:
+        n := relabel(label)
+        m := retext(b, b.text)
+        print("n {n} {label} m {m} {b.text}")
+        i = i + 1

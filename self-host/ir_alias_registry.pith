@@ -109,6 +109,9 @@ pub mut ir_import_renames: Map[String, String] := {}
 pub mut ir_module_aliases: Map[String, String] := {}
 pub mut ir_import_declared_functions: Map[String, Bool] := {}
 pub mut ir_import_declared_globals: Map[String, Bool] := {}
+## the storage symbols of the imported globals declared `mut`, as
+## ir_resolve_storage_name spells them (`gm___g_msg`)
+pub mut ir_import_mutable_global_symbols: Map[String, Bool] := {}
 
 ## resolve a type name through aliases to an emission hint.
 pub fn ir_resolve_type_hint(type_name: String) -> String:
@@ -166,6 +169,8 @@ pub fn ir_collect_preloaded_root_metadata(root_idx: Int, module_path: String):
             ir_import_declared_functions.insert(module_path + "." + ir_base_decl_name(node.value), true)
         elif ir_is_binding_kind(node.kind):
             ir_import_declared_globals.insert(module_path + "." + ir_binding_name(node), true)
+            if node.value.contains(" mut"):
+                ir_import_mutable_global_symbols.insert(ir_import_target_name(module_path, ir_global_storage_symbol(ir_binding_name(node))), true)
             ir_record_imported_global_kind(node)
 
 # an imported global's type kind travels with the import: without it,

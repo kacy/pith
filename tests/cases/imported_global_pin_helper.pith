@@ -1,0 +1,16 @@
+# module half of test_imported_global_arg_pin
+pub mut label: String := "start"
+
+# a box with one replaceable string
+pub struct Box:
+    pub mut text: String
+
+# replace label, then read s, which the caller may have read from label
+pub fn relabel(s: String) -> Int:
+    label = "x-" + s.len().to_string()
+    return s.len()
+
+# replace b.text, then read s, which the caller may have read from b.text
+pub fn retext(b: Box, s: String) -> Int:
+    b.text = "y-" + s.len().to_string()
+    return s.len()

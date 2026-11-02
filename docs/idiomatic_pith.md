@@ -2,7 +2,7 @@
 
 This is the current style for everyday Pith code. It favors direct data flow,
 small helpers, and examples that read like application code instead of compiler
-tests.
+tests. For naming, layout and comments, see [STYLE.md](STYLE.md).
 
 ## printing and strings
 
@@ -247,8 +247,8 @@ Pith has two distinct shapes for "no value here". Pick by intent, not by mood:
 
 - **`T?` (Optional)** — for *predictable* absence the caller routinely
   handles. Lookup misses, end-of-stream, optional config fields, channel
-  closure. Construct with `none`; consume with `match`, `== none`, or `?`
-  inside a `T!` function. Examples: `Map.get`, `Channel.recv`,
+  closure. Construct with `none`; consume with `if let`, `match`,
+  `unwrap_or`, or `?` inside a `T!` function. Examples: `Map.get`, `Channel.recv`,
   `std.strings.get`.
 - **`T!` (Result)** — for *unexpected* failure the caller usually wants to
   propagate. I/O, parsing, network, anything with an external cause.

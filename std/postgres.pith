@@ -79,7 +79,7 @@ fn xor_bytes(a: Bytes, b: Bytes) -> Bytes:
     while i < bytes.len(a):
         out.write_byte(bits.xor(bytes.get(a, i), bytes.get(b, i))) catch 0
         i = i + 1
-    return out.bytes()
+    return out.take_bytes()
 
 # a decoded backend message: a type byte and its payload.
 struct Message:
@@ -156,9 +156,7 @@ impl Conn:
             out.write_byte(type_byte) catch 0
         out.write(be32(bytes.len(payload) + 4)) catch 0
         out.write(payload) catch 0
-        n := self.send_raw(out.bytes())!
-        out.free()
-        return n
+        return self.send_raw(out.take_bytes())!
 
     # close the connection.
     pub fn close():
@@ -252,7 +250,7 @@ impl Conn:
         params.write(cstring("database")) catch 0
         params.write(cstring(database)) catch 0
         params.write_byte(0) catch 0
-        self.send(0, params.bytes())!
+        self.send(0, params.take_bytes())!
 
         # SCRAM state carried across the two AuthenticationSASL rounds.
         mut client_nonce := ""
@@ -296,7 +294,7 @@ impl Conn:
                     initial.write(cstring("SCRAM-SHA-256")) catch 0
                     initial.write(be32(client_first.len())) catch 0
                     initial.write_string_utf8(client_first) catch 0
-                    self.send(112, initial.bytes())!
+                    self.send(112, initial.take_bytes())!
                 elif auth == 11:
                     # AuthenticationSASLContinue: server-first-message.
                     server_first := bytes.to_string_utf8(bytes.slice(msg.payload, 4, bytes.len(msg.payload)))!

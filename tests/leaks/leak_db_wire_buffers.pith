@@ -1,0 +1,147 @@
+# the postgres and mysql drivers frame every message in a byte buffer. the
+# buffer has no destructor, and three paths dropped it:
+#   - the postgres startup message, built and sent once per connection and
+#     never freed
+#   - a send that failed: both drivers copied the frame out of the buffer,
+#     propagated the write error and skipped the free, in the framing helper
+#     and in each caller that built the payload (mysql query, prepare and
+#     close_stmt)
+#   - the SCRAM initial response and the client proof, which a stub cannot
+#     drive cheaply enough to churn here (pbkdf2 runs 4096 rounds per login)
+#
+# a round connects to a loopback stub that accepts the login and then hangs
+# up, so most of the twelve statements that follow fail on the write.
+# SHAPE=1 drives postgres, SHAPE=2 mysql.
+#
+# a connect is far heavier than the in-memory rounds most cases here run, so
+# the harness round counts are scaled down by two hundred: 1,000 connections
+# against 4,000. before the fix the 3,000 extra rounds grew the peak by about
+# 14mb on postgres and 5mb on mysql; after it, by under 100kb.
+import leakprobe as probe
+import std.env as env
+import std.bits as bits
+import std.bytes as bytes
+import std.mysql as mysql
+import std.net.tcp as tcp
+import std.postgres as postgres
+
+PG_PORT := 21986
+MY_PORT := 21987
+
+fn byte1(value: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(value) catch 0
+    return out.take_bytes()
+
+fn be32(n: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(bits.mask8(bits.shr(n, 24))) catch 0
+    out.write_byte(bits.mask8(bits.shr(n, 16))) catch 0
+    out.write_byte(bits.mask8(bits.shr(n, 8))) catch 0
+    out.write_byte(bits.mask8(n)) catch 0
+    return out.take_bytes()
+
+fn le(value: Int, width: Int) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < width:
+        out.write_byte(bits.band(bits.shr(value, i * 8), 255)) catch 0
+        i = i + 1
+    return out.take_bytes()
+
+fn cat(parts: List[Bytes]) -> Bytes:
+    out := bytes.buffer()
+    for part in parts:
+        out.write(part) catch 0
+    return out.take_bytes()
+
+fn str(text: String) -> Bytes:
+    return bytes.from_string_utf8(text)
+
+fn cstr(text: String) -> Bytes:
+    return cat([str(text), byte1(0)])
+
+fn pg_msg(mtype: Int, payload: Bytes) -> Bytes:
+    return cat([byte1(mtype), be32(payload.len() + 4), payload])
+
+fn my_packet(seq: Int, payload: Bytes) -> Bytes:
+    return cat([le(payload.len(), 3), byte1(seq), payload])
+
+# a mysql 4.1 handshake greeting offering mysql_native_password.
+fn my_greeting() -> Bytes:
+    return cat([byte1(10), cstr("5.7.0-stub"), le(1, 4), str("12345678"), byte1(0), le(0, 2), byte1(45), le(0, 2), le(0, 2), byte1(21), cat([le(0, 8), le(0, 2)]), str("901234567890"), byte1(0), cstr("mysql_native_password")])
+
+# accept `rounds` logins, answer each with success and hang up. every read is
+# bound: a Bytes dropped at statement position is a documented emitter leak
+# that would add its own growth here.
+fn serve(listener: Int, shape: Int, rounds: Int) -> Int!:
+    mut i := 0
+    while i < rounds:
+        conn := tcp_accept(listener)!
+        if shape == 1:
+            startup := tcp_read_bytes(conn, 4096) catch bytes.empty()
+            wrote := tcp.write_all_bytes(conn, cat([pg_msg(82, be32(0)), pg_msg(90, str("I"))])) catch 0
+            if startup.len() + wrote < 0:
+                print("unreachable")
+        else:
+            greeted := tcp.write_all_bytes(conn, my_packet(0, my_greeting())) catch 0
+            response := tcp_read_bytes(conn, 4096) catch bytes.empty()
+            wrote := tcp.write_all_bytes(conn, my_packet(2, byte1(0))) catch 0
+            if greeted + response.len() + wrote < 0:
+                print("unreachable")
+        tcp_close(conn)
+        i = i + 1
+    return 0
+
+fn postgres_round() -> Int:
+    connected := postgres.connect("127.0.0.1", PG_PORT, "user", "pw", "db")
+    if connected.is_err:
+        return 0
+    conn := connected.ok
+    mut failed := 0
+    mut k := 0
+    while k < 12:
+        affected := postgres.exec_params(conn, "select $1", ["1"])
+        if affected.is_err:
+            failed = failed + 1
+        k = k + 1
+    conn.close()
+    return failed
+
+fn mysql_round() -> Int:
+    connected := mysql.connect("127.0.0.1", MY_PORT, "user", "pw", "db")
+    if connected.is_err:
+        return 0
+    conn := connected.ok
+    mut failed := 0
+    mut k := 0
+    while k < 12:
+        rows := mysql.query(conn, "select 1")
+        if rows.is_err:
+            failed = failed + 1
+        k = k + 1
+    conn.close()
+    return failed
+
+fn main() -> Int!:
+    shape := env.int_or("SHAPE", 1)
+    rounds := probe.rounds() / 200
+    mut port := PG_PORT
+    if shape != 1:
+        port = MY_PORT
+    listener := tcp_listen("127.0.0.1", port)!
+    task := spawn serve(listener, shape, rounds)
+    mut acc := 0
+    mut i := 0
+    while i < rounds:
+        if shape == 1:
+            acc = acc + postgres_round()
+        else:
+            acc = acc + mysql_round()
+        i = i + 1
+    await task
+    tcp_close(listener)
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")
+    return 0

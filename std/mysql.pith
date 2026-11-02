@@ -168,9 +168,7 @@ impl Conn:
         out.write(le_int(bytes.len(payload), 3)) catch 0
         out.write_byte(seq) catch 0
         out.write(payload) catch 0
-        n := self.send_raw(out.bytes())!
-        out.free()
-        return n
+        return self.send_raw(out.take_bytes())!
 
     # close the connection.
     pub fn close():
@@ -263,11 +261,10 @@ pub fn connect_tls(host: String, port: Int, user: String, password: String, data
     while reserved < 23:
         ssl.write_byte(0) catch 0
         reserved = reserved + 1
-    sent := conn.send_packet(1, ssl.bytes())
+    sent := conn.send_packet(1, ssl.take_bytes())
     if sent.is_err:
         conn.close()
         fail sent.err
-    ssl.free()
 
     session_result := tls.client(TcpStream(fd), server_name, config)
     if session_result.is_err:
@@ -311,8 +308,7 @@ impl Conn:
         out.write(scramble) catch 0
         out.write(cstring_bytes(database)) catch 0
         out.write(cstring_bytes(plugin)) catch 0
-        self.send_packet(response_seq, out.bytes())!
-        out.free()
+        self.send_packet(response_seq, out.take_bytes())!
         return self.finish_auth(password)
 
     # drive the post-response auth exchange: an OK ends it, an auth-switch
@@ -444,8 +440,7 @@ pub fn query(conn: Conn, text: String) -> Rows!:
     cmd := bytes.buffer()
     cmd.write_byte(3) catch 0
     cmd.write_string_utf8(text) catch 0
-    conn.send_packet(0, cmd.bytes())!
-    cmd.free()
+    conn.send_packet(0, cmd.take_bytes())!
 
     first := conn.read_packet()!
     lead := bytes.get(first, 0)
@@ -567,8 +562,7 @@ pub fn prepare(conn: Conn, text: String) -> Stmt!:
     cmd := bytes.buffer()
     cmd.write_byte(22) catch 0
     cmd.write_string_utf8(text) catch 0
-    conn.send_packet(0, cmd.bytes())!
-    cmd.free()
+    conn.send_packet(0, cmd.take_bytes())!
 
     resp := conn.read_packet()!
     if bytes.get(resp, 0) == 255:
@@ -749,8 +743,7 @@ pub fn close_stmt(conn: Conn, stmt: Stmt) -> Bool!:
     cmd := bytes.buffer()
     cmd.write_byte(25) catch 0
     cmd.write(le_int(stmt.id, 4)) catch 0
-    conn.send_packet(0, cmd.bytes())!
-    cmd.free()
+    conn.send_packet(0, cmd.take_bytes())!
     return true
 
 # --- connection pool ---

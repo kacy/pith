@@ -242,6 +242,12 @@ cases=(
   tests/leaks/leak_task_handle_drop
   "tests/leaks/leak_task_handle_drop PITH_GREEN=0"
   tests/leaks/leak_read_all_buffer
+  "tests/leaks/leak_std_byte_buffers SHAPE=1"
+  "tests/leaks/leak_std_byte_buffers SHAPE=2"
+  "tests/leaks/leak_std_byte_buffers SHAPE=3"
+  "tests/leaks/leak_std_byte_buffers SHAPE=4"
+  "tests/leaks/leak_db_wire_buffers SHAPE=1"
+  "tests/leaks/leak_db_wire_buffers SHAPE=2"
   tests/leaks/leak_output_ctx_failed_reader
   "tests/leaks/leak_output_ctx_failed_reader PITH_GREEN=0"
   tests/leaks/leak_list_store_miss

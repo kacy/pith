@@ -110,16 +110,6 @@ pub unsafe extern "C" fn pith_string_from_cstr(cstr: *const i8) -> PithString {
     pith_string_new(cstr as *const u8, len)
 }
 
-/// ABI-compatible version that stores result via pointer
-#[no_mangle]
-pub unsafe extern "C" fn pith_string_from_cstr_ptr(cstr: *const i8, out_ptr: *mut PithString) {
-    if out_ptr.is_null() {
-        return;
-    }
-
-    *out_ptr = pith_string_from_cstr(cstr);
-}
-
 /// Retain a string.
 ///
 /// Heap strings use copy-on-derive ownership: every operation that produces a
@@ -244,15 +234,6 @@ pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
     }
 }
 
-/// ABI wrapper for pith_string_len - takes pointer to PithString
-#[no_mangle]
-pub extern "C" fn pith_string_len_ptr(s_ptr: *const PithString) -> i64 {
-    if s_ptr.is_null() {
-        return 0;
-    }
-    unsafe { (*s_ptr).len }
-}
-
 /// ABI wrapper for pith_string_contains - takes pointers to PithStrings
 #[no_mangle]
 pub extern "C" fn pith_string_contains_ptr(
@@ -273,33 +254,6 @@ pub extern "C" fn pith_string_contains_ptr(
     }
 }
 
-/// ABI wrapper for pith_string_substring - takes pointer to PithString, returns new PithString on stack
-#[no_mangle]
-pub unsafe extern "C" fn pith_string_substring_ptr(
-    s_ptr: *const PithString,
-    start: i64,
-    end: i64,
-    out_ptr: *mut PithString,
-) {
-    if s_ptr.is_null() || out_ptr.is_null() {
-        return;
-    }
-    let s = &*s_ptr;
-    let result = pith_string_substring(*s, start, end);
-    *out_ptr = result;
-}
-
-/// ABI wrapper for pith_string_trim - takes pointer to PithString, returns new PithString on stack
-#[no_mangle]
-pub unsafe extern "C" fn pith_string_trim_ptr(s_ptr: *const PithString, out_ptr: *mut PithString) {
-    if s_ptr.is_null() || out_ptr.is_null() {
-        return;
-    }
-    let s = &*s_ptr;
-    let result = pith_string_trim(*s);
-    *out_ptr = result;
-}
-
 /// ABI wrapper for pith_string_starts_with
 #[no_mangle]
 pub extern "C" fn pith_string_starts_with_ptr(
@@ -311,24 +265,6 @@ pub extern "C" fn pith_string_starts_with_ptr(
     }
     unsafe {
         if pith_string_starts_with(*s_ptr, *prefix_ptr) {
-            1
-        } else {
-            0
-        }
-    }
-}
-
-/// ABI wrapper for pith_string_ends_with
-#[no_mangle]
-pub extern "C" fn pith_string_ends_with_ptr(
-    s_ptr: *const PithString,
-    suffix_ptr: *const PithString,
-) -> i64 {
-    if s_ptr.is_null() || suffix_ptr.is_null() {
-        return 0;
-    }
-    unsafe {
-        if pith_string_ends_with(*s_ptr, *suffix_ptr) {
             1
         } else {
             0

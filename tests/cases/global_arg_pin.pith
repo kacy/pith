@@ -1,0 +1,61 @@
+# a `mut` global read as an argument hands the callee the global's count and
+# none of its own. rename reassigns the global, which drops that count, and
+# then reads its parameter. finish does the same through another task, which
+# replaces the global once finish unlocks. both arguments need a pin.
+mut msg: String := "start"
+mut mu: Mutex := Mutex()
+mut shared: String := "msg-0"
+
+fn rename(s: String) -> Int:
+    msg = "x-" + s.len().to_string()
+    return s.len()
+
+fn finish(m: Mutex, s: String) -> Int:
+    m.unlock()
+    mut n := 0
+    mut k := 0
+    while k < 200:
+        n = n + s.len()
+        k = k + 1
+    return n
+
+fn reader(rounds: Int, out: Channel[Int]):
+    mut total := 0
+    mut i := 0
+    while i < rounds:
+        mu.lock()
+        total = total + finish(mu, shared)
+        i = i + 1
+    out.send(total)
+
+fn writer(rounds: Int, out: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        mu.lock()
+        # every message is five bytes, so the readers' totals are fixed
+        shared = "msg-" + (i % 10).to_string()
+        mu.unlock()
+        i = i + 1
+    out.send(i)
+
+fn main():
+    msg = "a-" + (3).to_string()
+    n := rename(msg)
+    print("n {n} {msg}")
+    rounds := 20000
+    out := Channel[Int](4)
+    r1 := spawn reader(rounds, out)
+    r2 := spawn reader(rounds, out)
+    w1 := spawn writer(rounds, out)
+    w2 := spawn writer(rounds, out)
+    mut sum := 0
+    mut got := 0
+    while got < 4:
+        if let v = out.recv():
+            sum = sum + v
+        got = got + 1
+    await r1
+    await r2
+    await w1
+    await w2
+    print("sum {sum}")

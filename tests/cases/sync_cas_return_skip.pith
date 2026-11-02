@@ -1,0 +1,64 @@
+# the shape that still skips its argument pins: a lock-free retry loop whose
+# only compare_set returns the moment it succeeds (bump). the reader calls it
+# with h.cell under an AtomicInt spin lock and releases the lock itself, so a
+# writer can replace h.cell only after bump has returned. release_cas is the
+# other half: its compare_set is the release, and nothing follows it.
+struct Holder:
+    pub lock: AtomicInt
+    pub mut cell: AtomicInt
+
+fn take(lock: AtomicInt) -> Int:
+    mut spins := 0
+    while not lock.compare_set(0, 1):
+        spins = spins + 1
+    return spins
+
+fn bump(cell: AtomicInt, by: Int):
+    while true:
+        current := cell.load()
+        if cell.compare_set(current, current + by):
+            return
+
+fn release_cas(lock: AtomicInt) -> Bool:
+    if lock.compare_set(1, 0):
+        return true
+    return false
+
+fn reader(h: Holder, rounds: Int, out: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        take(h.lock)
+        bump(h.cell, 1)
+        release_cas(h.lock)
+        i = i + 1
+    out.send(i)
+
+fn writer(h: Holder, rounds: Int, out: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        take(h.lock)
+        if h.cell.load() >= 0:
+            h.cell = AtomicInt(0)
+        h.lock.store(0)
+        i = i + 1
+    out.send(i)
+
+fn main():
+    h := Holder(lock: AtomicInt(0), cell: AtomicInt(0))
+    rounds := 20000
+    out := Channel[Int](4)
+    r1 := spawn reader(h, rounds, out)
+    r2 := spawn reader(h, rounds, out)
+    w1 := spawn writer(h, rounds, out)
+    w2 := spawn writer(h, rounds, out)
+    mut sum := 0
+    mut got := 0
+    while got < 4:
+        if let v = out.recv():
+            sum = sum + v
+        got = got + 1
+    await r1
+    await r2
+    await w1
+    await w2
+    print("sum {sum}")

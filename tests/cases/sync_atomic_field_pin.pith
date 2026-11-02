@@ -1,0 +1,61 @@
+# sync_atomic_handoff_pin with the guarded field holding a sync handle. count
+# releases the AtomicInt spin lock and then keeps loading the cell its caller
+# read from h.cell under that lock, while a writer takes the lock and replaces
+# h.cell. the store hands the field over as unlock would, so the cell argument
+# needs its own count for the call or count reads a freed handle.
+struct Holder:
+    pub lock: AtomicInt
+    pub mut cell: AtomicInt
+
+fn take(lock: AtomicInt) -> Int:
+    mut spins := 0
+    while not lock.compare_set(0, 1):
+        spins = spins + 1
+    return spins
+
+fn count(lock: AtomicInt, cell: AtomicInt) -> Int:
+    lock.store(0)
+    mut n := 0
+    mut k := 0
+    while k < 200:
+        n = n + cell.load()
+        k = k + 1
+    return n
+
+fn reader(h: Holder, rounds: Int, out: Channel[Int]):
+    mut total := 0
+    mut i := 0
+    while i < rounds:
+        take(h.lock)
+        total = total + count(h.lock, h.cell)
+        i = i + 1
+    out.send(total)
+
+fn writer(h: Holder, rounds: Int, out: Channel[Int]):
+    mut i := 0
+    while i < rounds:
+        take(h.lock)
+        h.cell = AtomicInt(1)
+        h.lock.store(0)
+        i = i + 1
+    out.send(i)
+
+fn main():
+    h := Holder(lock: AtomicInt(0), cell: AtomicInt(1))
+    rounds := 20000
+    out := Channel[Int](4)
+    r1 := spawn reader(h, rounds, out)
+    r2 := spawn reader(h, rounds, out)
+    w1 := spawn writer(h, rounds, out)
+    w2 := spawn writer(h, rounds, out)
+    mut sum := 0
+    mut got := 0
+    while got < 4:
+        if let v = out.recv():
+            sum = sum + v
+        got = got + 1
+    await r1
+    await r2
+    await w1
+    await w2
+    print("sum {sum}")

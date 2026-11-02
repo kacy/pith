@@ -104,14 +104,25 @@ call arguments:
 
 - callees borrow their parameters; a callee that stores an argument
   adds its own count
-- an argument read out of a field or a container element (`f(o, o.name)`,
-  `g(xs, xs[0])`) is pinned for the call: retained when it is evaluated
-  and released when the call returns. the borrow alone left the owner's
-  count as the only one, and a callee that overwrote the field or evicted
-  the element freed its own parameter. a builtin, or a function recorded
-  by `ir_record_storage_keepers` as writing no field, element or global,
-  cannot do that, so its arguments are not pinned. a local or a parameter
-  is never pinned, since only the calling frame can rebind it
+- an argument read out of a field, a container element or a `mut` global
+  (`f(o, o.name)`, `g(xs, xs[0])`, `h(config)`) is pinned for the call:
+  retained when it is evaluated and released when the call returns. the
+  borrow alone left the owner's count as the only one, and a callee that
+  overwrote the field, evicted the element or reassigned the global freed
+  its own parameter. a builtin, or a function recorded by
+  `ir_record_storage_keepers` as writing no field, element or global,
+  cannot do that, so its arguments are not pinned. a local, a parameter or
+  a global that is not `mut` is never pinned, since nothing outside the
+  calling frame can rebind it
+- an unlock, a `done`, a semaphore release or an `AtomicInt` store or
+  `compare_set` lets another task take a lock the caller held and replace
+  what the caller read under it, so a callee that makes one is not a
+  storage keeper. the one exception is a compare_set that returns at once
+  when it succeeds (`if cell.compare_set(old, new): return`), the shape of
+  a lock-free retry loop: a function whose only releases look like that
+  uses none of its arguments after one, so its arguments are not pinned
+  either. a function that calls it does run on afterwards, so the
+  exception does not carry over to its callers
 - a read out of a field or an element is pinned the same way, whatever
   the callee, when an operand evaluated after it can drop storage
   (`ir_later_operands_drop`). this covers the left side of a concat, an

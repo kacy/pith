@@ -1,0 +1,201 @@
+# the flat decoder json.decode[T] generates for a struct of required
+# scalars (self-host/ir_json_fill_emit.pith), on the inputs its own code
+# paths turn on. the expected output was produced by the runtime fill it
+# replaced (pith_json_fill_struct), so this pins that the two agree.
+#
+# the decoder guesses each key from the field after the last match and
+# compares it a word at a time, so names of every length up to and past
+# eight bytes, and a name that is a prefix of another, are here; it scans
+# a string value eight bytes at a time while none is a quote or a
+# backslash, so quotes and backslashes sit at each offset across two
+# words; keys that miss the guess (out of order, escaped, unknown) take
+# the general path, and the values under unknown keys are stepped over
+# with the node parser's grammar and depth bound. the integer edges, a
+# Float field's span, Bool prefixes, whitespace of every kind, bytes after
+# the closing brace and bytes that are not utf-8 complete it.
+
+import std.json as json
+import std.bytes as bytes
+
+struct Names:
+    pub a: Int
+    pub ab: Int
+    pub abcdefg: Int
+    pub abcdefgh: String
+    pub abcdefghi: Bool
+    pub a_much_longer_field_name: Int
+
+struct Text:
+    pub s: String
+
+struct Num:
+    pub n: Int
+
+struct Real:
+    pub x: Float
+
+struct Flag:
+    pub on: Bool
+    pub k: Int
+
+fn q(s: String) -> String:
+    return chr(34) + s + chr(34)
+
+fn obj(body: String) -> String:
+    return chr(123) + body + chr(125)
+
+fn show_names(label: String, r: Names!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    v := r.ok
+    print(label + " ok: " + v.a.to_string() + " " + v.ab.to_string() + " " + v.abcdefg.to_string() + " " + q(v.abcdefgh) + " " + v.abcdefghi.to_string() + " " + v.a_much_longer_field_name.to_string())
+
+fn show_text(label: String, r: Text!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    print(label + " ok: len " + r.ok.s.len().to_string() + " " + q(r.ok.s))
+
+fn show_num(label: String, r: Num!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    print(label + " ok: " + r.ok.n.to_string())
+
+fn show_real(label: String, r: Real!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    x := r.ok.x
+    mut sign := "+"
+    if 1.0 / x < 0.0:
+        sign = "-"
+    print(label + " ok: " + x.to_string() + " sign " + sign)
+
+fn show_flag(label: String, r: Flag!json.JsonDecodeError):
+    if r.is_err:
+        print(label + " err: " + r.err.message)
+        return
+    print(label + " ok: " + r.ok.on.to_string() + " " + r.ok.k.to_string())
+
+fn names_doc(order: List[Int]) -> String:
+    keys := ["a", "ab", "abcdefg", "abcdefgh", "abcdefghi", "a_much_longer_field_name"]
+    values := ["1", "2", "3", q("eight"), "true", "6"]
+    mut body := ""
+    for k, i in order:
+        if i > 0:
+            body = body + ","
+        body = body + q(keys[k]) + ":" + values[k]
+    return obj(body)
+
+fn text_doc(raw: String) -> String:
+    return obj(q("s") + ":" + chr(34) + raw + chr(34))
+
+fn nest(depth: Int) -> String:
+    mut s := ""
+    mut i := 0
+    while i < depth:
+        s = s + "["
+        i = i + 1
+    i = 0
+    while i < depth:
+        s = s + "]"
+        i = i + 1
+    return s
+
+fn main() -> Int:
+    dq := chr(34)
+    bs := chr(92)
+
+    # names: in order, reversed, shuffled, a prefix name missing
+    show_names("in_order", json.decode_text[Names](names_doc([0, 1, 2, 3, 4, 5])))
+    show_names("reversed", json.decode_text[Names](names_doc([5, 4, 3, 2, 1, 0])))
+    show_names("shuffled", json.decode_text[Names](names_doc([3, 0, 5, 1, 4, 2])))
+    show_names("prefix_missing", json.decode_text[Names](names_doc([1, 2, 3, 4, 5])))
+    show_names("long_missing", json.decode_text[Names](names_doc([0, 1, 2, 3, 4])))
+    show_names("near_names", json.decode_text[Names](obj(q("abc") + ":0," + q("abcdefgx") + ":0," + q("abcdefghij") + ":0," + q("a_much_longer_field_namf") + ":0," + q("A") + ":0")))
+    show_names("unknown_first", json.decode_text[Names](obj(q("abcdefgx") + ":" + q("x") + "," + q("a") + ":1," + q("ab") + ":2," + q("abcdefg") + ":3," + q("abcdefgh") + ":" + q("e") + "," + q("abcdefghi") + ":false," + q("a_much_longer_field_name") + ":6")))
+
+    # a key with an escape is compared raw, so it names nothing
+    show_num("escaped_key", json.decode_text[Num](obj(q(bs + "u006e") + ":5")))
+    show_num("escaped_key_then_real", json.decode_text[Num](obj(q(bs + "u006e") + ":5," + q("n") + ":6")))
+    show_num("key_with_quote", json.decode_text[Num](obj(dq + "n" + bs + dq + dq + ":5," + q("n") + ":7")))
+    show_num("empty_key", json.decode_text[Num](obj(q("") + ":1," + q("n") + ":8")))
+    show_num("unterminated_key", json.decode_text[Num](chr(123) + dq + "nnnnnnnnnnnnnnnnnnnn"))
+
+    # string values across the eight-byte scan
+    mut at := 0
+    while at < 18:
+        mut filler := ""
+        mut i := 0
+        while i < at:
+            filler = filler + chr(97 + i % 26)
+            i = i + 1
+        show_text("quote_at_" + at.to_string(), json.decode_text[Text](text_doc(filler)))
+        show_text("slash_at_" + at.to_string(), json.decode_text[Text](text_doc(filler + bs + dq + "tail")))
+        show_text("slashes_at_" + at.to_string(), json.decode_text[Text](text_doc(filler + bs + bs)))
+        at = at + 1
+    show_text("escape_run", json.decode_text[Text](text_doc(bs + "n" + bs + "t" + bs + "u0041" + bs + bs + bs + dq + "0123456789abcdef" + bs + "/")))
+    show_text("bad_escape_kept_raw", json.decode_text[Text](text_doc(bs + "q" + bs + "u12")))
+    show_text("trailing_backslash", json.decode_text[Text](chr(123) + q("s") + ":" + dq + "abcdefghijklmnop" + bs))
+    show_text("unterminated_long", json.decode_text[Text](chr(123) + q("s") + ":" + dq + "abcdefghijklmnopqrstuvwxyz"))
+    show_text("utf8", json.decode_text[Text](text_doc("café € 😀 ünïcödé")))
+    raw := bytes.from_string_utf8(obj(q("s") + ":" + q("ab")))
+    buf := bytes.buffer()
+    buf.write(bytes.from_string_utf8(obj(q("s") + ":" + q("abcdefghij")))) catch 0
+    buf.set(7, 255)
+    bad := buf.take_bytes()
+    show_text("raw_bytes", json.decode[Text](raw))
+    r := json.decode[Text](bad)
+    if r.is_ok:
+        print("invalid_utf8 ok: len " + r.ok.s.len().to_string())
+    else:
+        print("invalid_utf8 err: " + r.err.message)
+    show_text("repeated", json.decode_text[Text](obj(q("s") + ":" + q("first value, long") + "," + q("s") + ":" + q("second"))))
+
+    # integers
+    for text in ["0", "-0", "007", "-12", "9223372036854775807", "9223372036854775808", "99999999999999999999999", "-9223372036854775808", "-99999999999999999999", "1e3", "1.0", "+5", "-", "--1", "12x", "0x10"]:
+        show_num("int " + text, json.decode_text[Num](obj(q("n") + ":" + text)))
+    show_num("int_at_end", json.decode_text[Num](chr(123) + q("n") + ":42"))
+
+    # floats
+    for text in ["3", "-0.0", "0.1", "1e3", "2.5E-3", "1.7976931348623157e308", "5e-324", "1e309", "-1e309", "1e-400", ".5", "1.5.5", "1e", "+1", "-", "1-2", "0.30000000000000004"]:
+        show_real("float " + text, json.decode_text[Real](obj(q("x") + ":" + text)))
+
+    # bools
+    show_flag("true_false", json.decode_text[Flag](obj(q("on") + ":true," + q("k") + ":1")))
+    show_flag("false", json.decode_text[Flag](obj(q("on") + ":false," + q("k") + ":2")))
+    show_flag("prefix_trailing", json.decode_text[Flag](obj(q("on") + ":truex," + q("k") + ":3")))
+    show_flag("short", json.decode_text[Flag](chr(123) + q("k") + ":4," + q("on") + ":tru"))
+    show_flag("false_at_end", json.decode_text[Flag](chr(123) + q("k") + ":5," + q("on") + ":false"))
+    show_flag("capital", json.decode_text[Flag](obj(q("on") + ":True," + q("k") + ":6")))
+
+    # values under unknown keys
+    show_num("skip_scalars", json.decode_text[Num](obj(q("a") + ":1.5e3," + q("b") + ":-2," + q("c") + ":null," + q("d") + ":" + q("x" + bs + "q") + "," + q("n") + ":1")))
+    show_num("skip_nested", json.decode_text[Num](obj(q("a") + ":" + obj(q("x") + ":[1,2," + obj(q("y") + ":[]") + "]," + q("z") + ":" + obj("")) + "," + q("n") + ":2")))
+    show_num("skip_lenient", json.decode_text[Num](obj(q("a") + ":[1 2 3]," + q("b") + ":" + obj(q("x") + " 1 " + q("y") + ":2") + "," + q("n") + ":3")))
+    show_num("skip_bad_escape", json.decode_text[Num](obj(q("a") + ":[" + q("x" + bs + "q") + "]," + q("n") + ":4")))
+    show_num("skip_lone_surrogate", json.decode_text[Num](obj(q("a") + ":[" + q(bs + "ud800") + "]," + q("n") + ":5")))
+    show_num("skip_pair", json.decode_text[Num](obj(q("a") + ":[" + q(bs + "ud83d" + bs + "ude00") + "]," + q("n") + ":6")))
+    show_num("skip_big_int", json.decode_text[Num](obj(q("a") + ":[123456789012345678901]," + q("n") + ":7")))
+    show_num("skip_big_float", json.decode_text[Num](obj(q("a") + ":[1234567890123456789012.5]," + q("n") + ":8")))
+    show_num("skip_plus", json.decode_text[Num](obj(q("a") + ":[+1]," + q("n") + ":9")))
+    show_num("skip_plus_top", json.decode_text[Num](obj(q("a") + ":+1," + q("n") + ":10")))
+    show_num("skip_depth_127", json.decode_text[Num](obj(q("a") + ":" + nest(127) + "," + q("n") + ":11")))
+    show_num("skip_depth_128", json.decode_text[Num](obj(q("a") + ":" + nest(128) + "," + q("n") + ":12")))
+    show_num("skip_depth_deep", json.decode_text[Num](obj(q("a") + ":" + nest(5000) + "," + q("n") + ":13")))
+    show_num("skip_unclosed", json.decode_text[Num](chr(123) + q("n") + ":14," + q("a") + ":[1,2"))
+    show_num("skip_bad_literal", json.decode_text[Num](obj(q("a") + ":nul," + q("n") + ":15")))
+
+    # whitespace and the bytes around the object
+    show_num("tabs_newlines", json.decode_text[Num](chr(9) + chr(10) + chr(123) + chr(13) + chr(10) + q("n") + chr(9) + ":" + chr(10) + " 16" + chr(13) + chr(125)))
+    show_num("trailing_garbage", json.decode_text[Num](obj(q("n") + ":17") + " junk ]"))
+    show_num("empty_object", json.decode_text[Num](obj("")))
+    show_num("empty_input", json.decode_text[Num](""))
+    show_num("only_space", json.decode_text[Num]("   "))
+    show_num("array", json.decode_text[Num]("[1]"))
+    show_num("vertical_tab", json.decode_text[Num](obj(chr(11) + q("n") + ":18")))
+    show_num("double_comma", json.decode_text[Num](obj(q("n") + ":19,," + q("m") + ":1")))
+    show_num("missing_comma", json.decode_text[Num](obj(q("m") + ":1 " + q("n") + ":20")))
+    return 0

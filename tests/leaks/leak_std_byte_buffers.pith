@@ -1,0 +1,63 @@
+# std functions that build their result in a byte buffer. a ByteBuffer has no
+# destructor, so a path that returns without freeing or taking it strands the
+# buffer: its box and the bytes it held. one shape per path:
+#   1. csv.parse on a quoted field with an escaped quote, which decodes the
+#      field through a buffer and used to copy out of it and drop it
+#   2. json.encode_bytes, which did the same once per call
+#   3. read_exact_bytes past the end of a bytes cursor, which failed with
+#      "unexpected eof" and left the partly filled buffer behind
+#   4. the same on a buffered reader over the cursor
+import leakprobe as probe
+import std.env as env
+import std.bytes as bytes
+import std.csv as csv
+import std.io as io
+import std.json as json
+
+fn csv_round(i: Int) -> Int:
+    q := chr(34)
+    rows := csv.parse("id-{i}," + q + "say " + q + q + "hi" + q + q + q + ",x")
+    return rows[0][1].len()
+
+fn json_round(node: Int) -> Int:
+    data := json.encode_bytes(node) catch bytes.empty()
+    return data.len()
+
+fn cursor_round(data: Bytes) -> Int:
+    cursor := io.bytes_reader(data)
+    got := cursor.read_exact_bytes(64)
+    cursor.close()
+    if got.is_err:
+        return 1
+    return 0
+
+fn buffered_round(data: Bytes) -> Int:
+    cursor := io.bytes_reader(data)
+    reader := cursor.buffered()
+    got := reader.read_exact_bytes(64)
+    reader.free()
+    cursor.close()
+    if got.is_err:
+        return 1
+    return 0
+
+fn main():
+    shape := env.int_or("SHAPE", 1)
+    node := json.parse("[1,2,{chr(34)}three{chr(34)}]")
+    data := bytes.from_string_utf8("a short input")
+    n := probe.rounds()
+    mut acc := 0
+    mut i := 0
+    while i < n:
+        if shape == 1:
+            acc = acc + csv_round(i)
+        elif shape == 2:
+            acc = acc + json_round(node)
+        elif shape == 3:
+            acc = acc + cursor_round(data)
+        else:
+            acc = acc + buffered_round(data)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

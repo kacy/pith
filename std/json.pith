@@ -2096,8 +2096,9 @@ fn json_write_bytes(out: ByteBuffer, handle: Int) -> Int!:
 
 fn json_encode_bytes_result(handle: Int) -> Bytes!:
     out := bytes.buffer()
+    errdefer out.free()
     json_write_bytes(out, handle)!
-    return out.bytes()
+    return out.take_bytes()
 
 # Serializes a node tree to a JSON string.
 # Returns "null" for invalid handles.

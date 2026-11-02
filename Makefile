@@ -1797,6 +1797,11 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -eq 0 ] && echo "$$out" | grep -q "a first ... ok" && ! echo "$$out" | grep -q "c after failure" && echo "$$out" | grep -q "1 passed, 0 failed, 2 filtered out"; then pass=$$((pass+1)); echo "ok   test --filter runs only matching tests"; else echo "FAIL test --filter"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(./target/release/pith test --filter "first" "$$tmpdir/harness.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && echo "$$out" | grep -q "1 passed, 0 failed, 2 filtered out"; then pass=$$((pass+1)); echo "ok   test --filter before the file"; else echo "FAIL test --filter before the file"; echo "$$out"; fail=$$((fail+1)); fi; \
 	printf 'from std.testing import case, each\n\ntest "rows":\n    each([\n        case("alpha", 1),\n        case("beta", 2),\n], fn(n: Int) => n > 0)\n' > "$$tmpdir/rows.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/rows.pith" --filter "rows / beta" 2>&1); \
@@ -1874,7 +1879,7 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "unknown option '--fliter' for test"; then pass=$$((pass+1)); echo "ok   test refuses an unknown option"; else echo "FAIL test unknown option"; echo "$$out"; fail=$$((fail+1)); fi; \
-	for cmd in run build check; do \
+	for cmd in run build check doc lex parse; do \
 		set +e; \
 		out=$$(./target/release/pith $$cmd "$$tmpdir/missing.pith" 2>&1); \
 		status=$$?; \

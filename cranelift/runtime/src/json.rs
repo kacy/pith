@@ -15,52 +15,9 @@ fn skip_ws(input: &[u8], mut pos: usize) -> usize {
     pos
 }
 
-fn read_string_end(input: &[u8], pos: usize) -> Option<usize> {
-    if pos >= input.len() || input[pos] != b'"' {
-        return None;
-    }
-    let mut i = pos + 1;
-    // a backslash takes the byte after it with it, whatever it is; a
-    // backslash as the last byte runs off the end and reads as unterminated.
-    while i < input.len() {
-        match input[i] {
-            b'"' => return Some(i),
-            b'\\' => i += 2,
-            _ => i += 1,
-        }
-    }
-    None
-}
-
-fn read_int(input: &[u8], pos: usize) -> Option<(i64, usize)> {
-    let mut i = pos;
-    let mut neg = false;
-    if i < input.len() && input[i] == b'-' {
-        neg = true;
-        i += 1;
-    }
-    let start = i;
-    let mut value = 0i64;
-    while i < input.len() && input[i].is_ascii_digit() {
-        value = value
-            .saturating_mul(10)
-            .saturating_add((input[i] - b'0') as i64);
-        i += 1;
-    }
-    if i == start {
-        return None;
-    }
-    if neg {
-        value = -value;
-    }
-    Some((value, i))
-}
-
 /// The end of the number span at `pos`: the maximal run of the bytes a
-/// json number is written with. The span is the unit both fillers hand to
-/// the float conversion, and the unit an unknown key's number is skipped
-/// by, so `1.5` or `1e3` under a key the spec does not name is stepped
-/// over whole instead of stopping the decode at its `.`.
+/// json number is written with. The span is the unit the filler hands to
+/// the float conversion and the unit a number is read by.
 #[inline(always)]
 fn number_span_end(input: &[u8], pos: usize) -> usize {
     let mut i = pos;
@@ -72,8 +29,8 @@ fn number_span_end(input: &[u8], pos: usize) -> usize {
 
 /// The f64 a json number span denotes, or None when the span is not a
 /// finite number. The conversion is std's `f64::from_str`, the one
-/// `parse_float` uses, so both fillers and the node parser agree on the
-/// value to the last bit. The span's bytes are digits, sign, `.`, `e` and
+/// `parse_float` uses, so the filler, the generated flat decoder and the
+/// node parser agree on the value to the last bit. The span's bytes are digits, sign, `.`, `e` and
 /// `E` only, so `NaN` and `Infinity` can never reach the conversion; an
 /// exponent past the type's range comes back infinite and is refused
 /// here, which leaves `1.7976931348623157e308` the largest value a field
@@ -90,47 +47,27 @@ fn float_of_span(span: &[u8]) -> Option<f64> {
     }
 }
 
-/// Read the float at `pos` for an `f` field of the flat spec: a json
-/// number, so it starts with a digit or `-` like `read_int`'s, converted
-/// whole by `float_of_span`. Returns the value and the position after it.
-fn read_float(input: &[u8], pos: usize) -> Option<(f64, usize)> {
-    if pos >= input.len() || !(input[pos] == b'-' || input[pos].is_ascii_digit()) {
-        return None;
-    }
-    let end = number_span_end(input, pos);
-    let value = float_of_span(&input[pos..end])?;
-    Some((value, end))
-}
+/// What `pith_json_float_bits` answers for a span that is not a finite
+/// number: a NaN, which no finite value's bit pattern can be.
+pub const JSON_FLOAT_REFUSED: i64 = 0x7ff8_0000_0000_0001;
 
-/// Step over the value under a key the flat spec does not name. A scalar
-/// is stepped over by its own grammar, a number by its whole span; an
-/// object or an array is consumed with the node parser's grammar, the way
-/// the nested filler does it, so a flat target still decodes a document
-/// that carries a nested value under a key it does not want.
-fn skip_scalar(input: &[u8], pos: usize) -> Option<usize> {
-    if pos >= input.len() {
-        return None;
+/// The f64 bit pattern of the json number span `ptr[start..end]`, through
+/// `float_of_span`, or `JSON_FLOAT_REFUSED`. The flat decoder the compiler
+/// generates scans the span itself and hands it here, so a Float field
+/// gets the value `parse_float` and the node parser give the same text.
+///
+/// # Safety
+/// The bytes `ptr[start..end]` must be readable.
+#[no_mangle]
+pub unsafe extern "C" fn pith_json_float_bits(ptr: i64, start: i64, end: i64) -> i64 {
+    if ptr == 0 || start < 0 || end < start {
+        return JSON_FLOAT_REFUSED;
     }
-    if input[pos] == b'"' {
-        return read_string_end(input, pos).map(|end| end + 1);
+    let span = std::slice::from_raw_parts((ptr as *const u8).add(start as usize), (end - start) as usize);
+    match float_of_span(span) {
+        Some(value) => value.to_bits() as i64,
+        None => JSON_FLOAT_REFUSED,
     }
-    if input[pos] == b'-' || input[pos].is_ascii_digit() {
-        return Some(number_span_end(input, pos));
-    }
-    if input[pos..].starts_with(b"true") {
-        return Some(pos + 4);
-    }
-    if input[pos..].starts_with(b"false") {
-        return Some(pos + 5);
-    }
-    if input[pos..].starts_with(b"null") {
-        return Some(pos + 4);
-    }
-    if input[pos] == b'{' || input[pos] == b'[' {
-        // depth 2: the value sits inside the root object, which is depth 1.
-        return nested_skip_value(input, pos, 2).ok();
-    }
-    None
 }
 
 unsafe fn alloc_result(is_ok: i64, ok: i64, err: i64) -> i64 {
@@ -165,231 +102,12 @@ unsafe fn err_result(message: &[u8]) -> i64 {
     alloc_result(0, 0, error as i64)
 }
 
-/// The packed field spec is comma-separated fields, each `<type_char><name>`
-/// (i=int, s=string, b=bool, f=float) in declaration order, so a field's
-/// position is its struct slot. The emitter interns one literal per struct
-/// type.
-///
-/// A key is matched against the field whose type char sits at `pos` without
-/// splitting the spec first: the name bytes are compared in place and the
-/// byte after them must be the separator or the end of the spec.
-#[inline(always)]
-fn spec_field_at(spec: &[u8], pos: usize, key: &[u8]) -> bool {
-    // an empty field (two adjacent separators) has no type char and cannot
-    // match. the emitter never writes one; the split-based lookup this
-    // replaced skipped them, and this keeps that contract.
-    if spec[pos] == b',' {
-        return false;
-    }
-    let name = &spec[pos + 1..];
-    if name.len() < key.len() {
-        return false;
-    }
-    let Some(&first) = key.first() else {
-        return name.is_empty() || name[0] == b',';
-    };
-    // the first byte inline: on a miss it is nearly always the byte that
-    // differs, so the memcmp call is left to the fields that can match.
-    name[0] == first
-        && name[..key.len()] == *key
-        && (name.len() == key.len() || name[key.len()] == b',')
-}
-
-/// Where the field after the one at `pos`, whose name is `name_len` bytes,
-/// starts; `spec.len()` when that was the last field.
-#[inline(always)]
-fn spec_next_pos(spec: &[u8], pos: usize, name_len: usize) -> usize {
-    let end = pos + 1 + name_len;
-    if end < spec.len() {
-        end + 1
-    } else {
-        spec.len()
-    }
-}
-
-/// The field the decoder expects next: the one after the last match. An
+/// The field the filler expects next: the one after the last match. An
 /// encoder writes an object's keys in declaration order, so nearly every
 /// key matches here on one compare and the spec is never walked.
 struct SpecCursor {
     pos: usize,
     idx: usize,
-}
-
-/// Look up a key in the spec. Returns (slot, type_char) or None. The
-/// cursor's field is tried first; otherwise the spec is walked from the
-/// start, comparing each field's name in place. Either way the cursor
-/// moves to the field after the hit.
-#[inline(always)]
-fn spec_lookup(spec: &[u8], key: &[u8], cur: &mut SpecCursor) -> Option<(usize, u8)> {
-    if cur.pos < spec.len() && spec_field_at(spec, cur.pos, key) {
-        let hit = (cur.idx, spec[cur.pos]);
-        cur.pos = spec_next_pos(spec, cur.pos, key.len());
-        cur.idx += 1;
-        return Some(hit);
-    }
-    let mut pos = 0;
-    let mut idx = 0;
-    while pos < spec.len() {
-        if spec_field_at(spec, pos, key) {
-            cur.pos = spec_next_pos(spec, pos, key.len());
-            cur.idx = idx + 1;
-            return Some((idx, spec[pos]));
-        }
-        while pos < spec.len() && spec[pos] != b',' {
-            pos += 1;
-        }
-        pos += 1;
-        idx += 1;
-    }
-    None
-}
-
-/// The end quote of the key that opens at `pos`. Keys are the one string
-/// this decoder reads per field, so this is kept as a plain index loop the
-/// optimizer leaves alone: inlined into the field loop, `read_string_end`
-/// came out as a loop carrying eight induction variables at over twenty
-/// instructions per byte.
-#[inline(never)]
-fn read_key_end(input: &[u8], pos: usize) -> Option<usize> {
-    read_string_end(input, pos)
-}
-
-/// Decode a flat object of scalar fields straight into a pre-allocated
-/// struct in a single pass. The caller allocates the struct (with its
-/// destructor attached) and passes its data pointer; this writes each
-/// matched field into its slot: ints and bools inline, floats as their
-/// f64 bit pattern, strings as fresh counted cstrings the struct then
-/// owns. A float slot takes any json number, an integer one included (`3`
-/// widens to `3.0`); an int slot takes only an integer, so a fraction or
-/// an exponent under an `i` field fails the fill the way any wrong type
-/// does. Returns a bitmask of the fields
-/// it filled, or -1 on a malformed object. The caller checks the mask
-/// against the required set and, on any miss, releases the struct.
-///
-/// Per call this reads the spec's length once and otherwise touches only
-/// the spec bytes of the fields it compares against. The version this
-/// replaced split the whole spec byte by byte for every key, which was
-/// most of its cost (docs/performance.md, typed json decoding).
-#[no_mangle]
-pub unsafe extern "C" fn pith_json_fill_struct(
-    bytes_handle: i64,
-    spec_ptr: i64,
-    struct_ptr: i64,
-) -> i64 {
-    let Some(bytes) = pith_bytes_ref(bytes_handle) else {
-        return -1;
-    };
-    let input = bytes.data.as_slice();
-    let spec = cstr_bytes(spec_ptr);
-    let obj = struct_ptr as *mut i64;
-    let mut mask: i64 = 0;
-    let mut cur = SpecCursor { pos: 0, idx: 0 };
-
-    let mut pos = skip_ws(input, 0);
-    if pos >= input.len() || input[pos] != b'{' {
-        return -1;
-    }
-    pos = skip_ws(input, pos + 1);
-    if pos < input.len() && input[pos] == b'}' {
-        return 0;
-    }
-
-    loop {
-        let key_start = pos + 1;
-        let Some(key_end) = read_key_end(input, pos) else {
-            return -1;
-        };
-        let key = &input[key_start..key_end];
-        pos = skip_ws(input, key_end + 1);
-        if pos >= input.len() || input[pos] != b':' {
-            return -1;
-        }
-        pos = skip_ws(input, pos + 1);
-        if pos >= input.len() {
-            return -1;
-        }
-
-        if let Some((idx, field_type)) = spec_lookup(spec, key, &mut cur) {
-            let bit = 1i64 << idx;
-            let next = match field_type {
-                b'i' => {
-                    let Some((value, n)) = read_int(input, pos) else {
-                        return -1;
-                    };
-                    *obj.add(idx) = value;
-                    n
-                }
-                b's' => {
-                    let Some(end) = read_string_end(input, pos) else {
-                        return -1;
-                    };
-                    // a repeated key overwrites the slot. the string the
-                    // first occurrence minted belongs to this struct, so
-                    // it is dropped here rather than stranded.
-                    if mask & bit != 0 {
-                        crate::pith_cstring_release(*obj.add(idx) as *const i8);
-                    }
-                    *obj.add(idx) = crate::pith_copy_bytes_to_cstring(&input[pos + 1..end]) as i64;
-                    end + 1
-                }
-                b'b' => {
-                    if input[pos..].starts_with(b"true") {
-                        *obj.add(idx) = 1;
-                        pos + 4
-                    } else if input[pos..].starts_with(b"false") {
-                        *obj.add(idx) = 0;
-                        pos + 5
-                    } else {
-                        return -1;
-                    }
-                }
-                b'f' => {
-                    let Some((value, n)) = read_float(input, pos) else {
-                        return -1;
-                    };
-                    *obj.add(idx) = value.to_bits() as i64;
-                    n
-                }
-                _ => return -1,
-            };
-            mask |= bit;
-            pos = next;
-        } else {
-            let Some(next) = skip_scalar(input, pos) else {
-                return -1;
-            };
-            pos = next;
-        }
-
-        pos = skip_ws(input, pos);
-        if pos < input.len() && input[pos] == b',' {
-            pos = skip_ws(input, pos + 1);
-            continue;
-        }
-        if pos < input.len() && input[pos] == b'}' {
-            break;
-        }
-        return -1;
-    }
-    mask
-}
-
-/// The Err result a caller returns when the fill mask shows a required
-/// field was missing. Names the first missing field (in spec order) so
-/// the message matches the field-by-field decoder's errors.
-#[no_mangle]
-pub unsafe extern "C" fn pith_json_decode_missing_error(mask: i64, spec_ptr: i64) -> i64 {
-    let spec = cstr_bytes(spec_ptr);
-    let mut idx = 0;
-    for field in spec.split(|&b| b == b',') {
-        if !field.is_empty() && (mask & (1i64 << idx)) == 0 {
-            let mut msg = b"missing json field: ".to_vec();
-            msg.extend_from_slice(&field[1..]);
-            return err_result(&msg);
-        }
-        idx += 1;
-    }
-    err_result(b"missing json field")
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +125,9 @@ pub unsafe extern "C" fn pith_json_decode_missing_error(mask: i64, spec_ptr: i64
 // before this filler a nested shape parsed into std.json's node pool and
 // copied its fields out through the object accessors, so its values, its
 // error messages and the grammar it accepted were the node parser's. this
-// mirrors that parser rather than the flat filler above: string escapes are
+// mirrors that parser rather than the generated flat decoder
+// (self-host/ir_json_fill_emit.pith, for a struct of scalars alone),
+// which keeps the grammar of the flat filler it replaced: string escapes are
 // decoded, a colon or a comma may be missing, an object or array may run
 // off the end of the input, a number is an int only when it has no `.`,
 // `e` or `E`, an int past the parser's bound fails the whole parse, and a
@@ -428,11 +148,9 @@ pub unsafe extern "C" fn pith_json_decode_missing_error(mask: i64, spec_ptr: i64
 // hands over a table of destructor addresses and `#<k>` names the entry an
 // element struct gets (0 for a struct that needs none). the same
 // `o<name>#<k>(<sub-spec>)` form marks a struct field inside a collection
-// element, which has no pre-allocated slot either. the flat spec above
-// never contains any of this, and the flat filler never sees this grammar.
-// the scalar letters are the flat spec's, `f` for a float included: an `f`
-// slot takes any json number and holds the f64 bit pattern, an `i` slot
-// only an integer.
+// element, which has no pre-allocated slot either. the scalar letters are
+// `s`, `i`, `b` and `f`: an `f` slot takes any json number and holds the
+// f64 bit pattern, an `i` slot only an integer.
 //
 // ownership while a collection is built: the list or map handle is stored
 // into its slot (or pushed into, or inserted under its key in, its parent)
@@ -1588,8 +1306,8 @@ unsafe fn nested_fill_root(bytes_handle: i64, spec_ptr: i64, struct_ptr: i64, ch
 mod tests {
     use super::{
         float_of_span, nested_elem_tag, nested_element_error, nested_element_prefixed, nested_field_at,
-        nested_kind_error_at, nested_member_path, nested_prefixed_at, nested_spec_field_count, read_float,
-        skip_scalar, NestedAbort, NESTED_TOO_DEEP,
+        nested_kind_error_at, nested_member_path, nested_prefixed_at, nested_spec_field_count, pith_json_float_bits,
+        NestedAbort, JSON_FLOAT_REFUSED, NESTED_TOO_DEEP,
     };
 
     #[test]
@@ -1702,21 +1420,16 @@ mod tests {
     }
 
     #[test]
-    fn read_float_starts_like_a_json_number() {
-        assert_eq!(read_float(b"1.5,", 0), Some((1.5, 3)));
-        assert_eq!(read_float(b"-0.5}", 0), Some((-0.5, 4)));
-        assert_eq!(read_float(b"NaN", 0), None);
-        assert_eq!(read_float(b"Infinity", 0), None);
-        assert_eq!(read_float(b".5", 0), None);
-        assert_eq!(read_float(b"+1", 0), None);
-        assert_eq!(read_float(b"\"1.5\"", 0), None);
-    }
-
-    #[test]
-    fn skip_scalar_steps_over_a_whole_number_and_a_nested_value() {
-        assert_eq!(skip_scalar(b"1.5,", 0), Some(3));
-        assert_eq!(skip_scalar(b"1e3}", 0), Some(3));
-        assert_eq!(skip_scalar(b"{\"a\":[1,2.5,{}]},", 0), Some(16));
-        assert_eq!(skip_scalar(b"[1,2]}", 0), Some(5));
+    fn float_bits_converts_a_span_or_refuses_it() {
+        let doc = b"x:-0.0,1e309,2.5";
+        let ptr = doc.as_ptr() as i64;
+        unsafe {
+            assert_eq!(pith_json_float_bits(ptr, 2, 6), (-0.0f64).to_bits() as i64);
+            assert_eq!(pith_json_float_bits(ptr, 7, 12), JSON_FLOAT_REFUSED);
+            assert_eq!(pith_json_float_bits(ptr, 13, 16), 2.5f64.to_bits() as i64);
+            assert_eq!(pith_json_float_bits(ptr, 13, 13), JSON_FLOAT_REFUSED);
+            assert_eq!(pith_json_float_bits(0, 0, 1), JSON_FLOAT_REFUSED);
+        }
+        assert!(f64::from_bits(JSON_FLOAT_REFUSED as u64).is_nan());
     }
 }

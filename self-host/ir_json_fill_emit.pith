@@ -1,0 +1,631 @@
+# ir_json_fill_emit.pith: the decoder json.decode[T] gets for a flat
+# struct of required scalars, generated for T at the call site.
+#
+# the decoder scans the object bytes once and fills a pre-allocated
+# struct in place. it reads the input through its data pointer
+# (`pith_bytes_data_ptr`, then unchecked `pith_load_u8`/`_u16`/`_u32`/
+# `_u64` loads the codegen inlines), so the handle is tested once per
+# decode and every index is compared against the length here, in the
+# generated code. what stays in the runtime is what has to: minting a
+# string (`pith_cstring_from_raw`) and the float conversion
+# (`pith_json_float_bits`, std's f64 parse, so a Float field agrees with
+# parse_float to the bit). a value under a key the struct does not name
+# and the two errors go to std.json (`fill_skip_value`,
+# `fill_missing_error`, `fill_malformed_error`), since they are off the
+# path a well-formed document takes.
+#
+# keys are matched against the field names, which are known here, so
+# there is no spec to walk. the decoder keeps a guess, the field after
+# the one it matched last, since an encoder writes keys in declaration
+# order: at a key it compares the next bytes against that field's
+# `"<name>"`, a word at a time, without scanning the key first, so a
+# document whose keys come in order is read without a key scan at all.
+# anything else (another order, an unknown key, an escape in a key) falls
+# to the general path: scan the key to its closing quote, then compare
+# its length and bytes against each field.
+#
+# the code per field is small: the guess, the general compare and the
+# note that the field arrived. the value parsers, the whitespace and the
+# punctuation are emitted once per decode and shared, with the field's
+# slot in a variable (`pith_store_u64` writes it), because a decoder with
+# a copy of all of that per field outgrew the instruction cache at twenty
+# fields and ran 38% slower than the runtime fill on fewer instructions.
+#
+# the grammar and the outcomes are those of the runtime fill this
+# replaced (pith_json_fill_struct, #1104): keys and string values are
+# taken raw (no escape decoding, no utf-8 check), an Int field takes an
+# optional `-` and digits, saturating at the type's bounds, a Float field
+# any number span (`3` widens to 3.0), a Bool field `true` or `false` by
+# prefix, a repeated key's last value wins (a string slot releases the
+# earlier string), and any bytes after the closing brace are not looked
+# at. a malformed document fails as "missing json field", a field that
+# never arrived as "missing json field: <name>", the first in
+# declaration order. tests/cases/test_json_fill_struct_shapes and
+# test_json_fill_generated pin the shapes and the messages.
+
+from ir_builder import ir_emit, ir_reg, ir_label, ir_new_temp_name, ir_var_types, ir_str
+from ir_call_emit import ir_emit_call_text, ir_emit_call1, ir_emit_label
+from ir_struct_result_helpers import ir_emit_ok_result_tuple_raw, ir_emit_err_result_tuple_raw
+
+# the bit pattern pith_json_float_bits answers for a span that is not a
+# finite number (JSON_FLOAT_REFUSED in cranelift/runtime/src/json.rs).
+JSON_FILL_FLOAT_REFUSED := 9221120237041090561
+
+# the variables one generated decoder works in.
+struct JsonFillVars:
+    input: String
+    ptr: String
+    len: String
+    pos: String
+    obj: String
+    scan: String
+    aux: String
+    neg: String
+    slot: String
+    next: String
+
+# a field the decoder fills: its slot is its position in the list.
+pub struct JsonFillField:
+    pub name: String
+    pub kind: String
+
+fn ir_jf_var(prefix: String) -> String:
+    name := ir_new_temp_name(prefix)
+    ir_var_types.insert(name, "int")
+    return name
+
+fn ir_jf_load(var: String) -> Int:
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + var)
+    return r
+
+fn ir_jf_const(value: Int) -> Int:
+    r := ir_reg()
+    ir_emit("iconst " + r.to_string() + " " + value.to_string())
+    return r
+
+fn ir_jf_op(op: String, a: Int, b: Int) -> Int:
+    r := ir_reg()
+    ir_emit(op + " " + r.to_string() + " " + a.to_string() + " " + b.to_string())
+    return r
+
+fn ir_jf_op_const(op: String, a: Int, value: Int) -> Int:
+    return ir_jf_op(op, a, ir_jf_const(value))
+
+fn ir_jf_store_const(var: String, value: Int):
+    ir_emit("store " + var + " " + ir_jf_const(value).to_string())
+
+fn ir_jf_brif(cond: Int, then_l: String, else_l: String):
+    ir_emit("brif " + cond.to_string() + " " + then_l + " " + else_l)
+
+fn ir_jf_jmp(l: String):
+    ir_emit("jmp " + l)
+
+# the `width`-byte word at `at` (a register holding an index).
+fn ir_jf_word_at(v: JsonFillVars, at: Int, width: Int) -> Int:
+    mut fname := "pith_load_u8"
+    if width == 2:
+        fname = "pith_load_u16"
+    elif width == 4:
+        fname = "pith_load_u32"
+    elif width == 8:
+        fname = "pith_load_u64"
+    r := ir_reg()
+    ir_emit_call_text(r, fname, "int", 2, " " + ir_jf_load(v.ptr).to_string() + " " + at.to_string())
+    return r
+
+fn ir_jf_byte_at(v: JsonFillVars, at: Int) -> Int:
+    return ir_jf_word_at(v, at, 1)
+
+# pos += by
+fn ir_jf_advance(v: JsonFillVars, by: Int):
+    ir_emit("store " + v.pos + " " + ir_jf_op_const("add", ir_jf_load(v.pos), by).to_string())
+
+# branch to `fail_l` unless `pos + need <= len`; continues in a fresh block.
+fn ir_jf_need(v: JsonFillVars, at_var: String, need: Int, fail_l: String):
+    ok_l := ir_label()
+    end_r := ir_jf_op_const("add", ir_jf_load(at_var), need)
+    ir_jf_brif(ir_jf_op("lte", end_r, ir_jf_load(v.len)), ok_l, fail_l)
+    ir_emit_label(ok_l)
+
+# step pos over json whitespace. the first test is the common exit: a
+# byte above 32 is never whitespace.
+fn ir_jf_skip_ws(v: JsonFillVars):
+    top_l := ir_label()
+    chk_l := ir_label()
+    ws_l := ir_label()
+    done_l := ir_label()
+    ir_jf_jmp(top_l)
+    ir_emit_label(top_l)
+    ir_jf_brif(ir_jf_op("lt", ir_jf_load(v.pos), ir_jf_load(v.len)), chk_l, done_l)
+    ir_emit_label(chk_l)
+    ir_jf_brif(ir_jf_op_const("lte", ir_jf_byte_at(v, ir_jf_load(v.pos)), 32), ws_l, done_l)
+    ir_emit_label(ws_l)
+    b := ir_jf_byte_at(v, ir_jf_load(v.pos))
+    sp := ir_jf_op("or", ir_jf_op_const("eq", b, 32), ir_jf_op_const("eq", b, 9))
+    nl := ir_jf_op("or", ir_jf_op_const("eq", b, 10), ir_jf_op_const("eq", b, 13))
+    adv_l := ir_label()
+    ir_jf_brif(ir_jf_op("or", sp, nl), adv_l, done_l)
+    ir_emit_label(adv_l)
+    ir_jf_advance(v, 1)
+    ir_jf_jmp(top_l)
+    ir_emit_label(done_l)
+
+# branch to `fail_l` unless the byte at pos is `byte`; on a match pos
+# steps past it.
+fn ir_jf_expect(v: JsonFillVars, byte: Int, fail_l: String):
+    chk_l := ir_label()
+    ok_l := ir_label()
+    ir_jf_brif(ir_jf_op("lt", ir_jf_load(v.pos), ir_jf_load(v.len)), chk_l, fail_l)
+    ir_emit_label(chk_l)
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_byte_at(v, ir_jf_load(v.pos)), byte), ok_l, fail_l)
+    ir_emit_label(ok_l)
+    ir_jf_advance(v, 1)
+
+# branch to `then_l` when pos is in bounds and its byte is `byte`, else
+# to `else_l`.
+fn ir_jf_branch_byte(v: JsonFillVars, byte: Int, then_l: String, else_l: String):
+    chk_l := ir_label()
+    ir_jf_brif(ir_jf_op("lt", ir_jf_load(v.pos), ir_jf_load(v.len)), chk_l, else_l)
+    ir_emit_label(chk_l)
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_byte_at(v, ir_jf_load(v.pos)), byte), then_l, else_l)
+
+# the little-endian word of `text`'s bytes [at, at + width).
+fn ir_jf_text_word(text: String, at: Int, width: Int) -> Int:
+    mut word := 0
+    mut i := width - 1
+    while i >= 0:
+        word = word * 256 + ord(text[at + i])
+        i = i - 1
+    return word
+
+# the width of the next compare over `text` from `at`: eight bytes when
+# they fit, then four, two, one. a field name is an ascii identifier, so
+# an eight-byte word of one (or of its quotes) is a positive Int.
+fn ir_jf_chunk_width(text: String, at: Int) -> Int:
+    rest := text.len() - at
+    if rest >= 8:
+        return 8
+    if rest >= 4:
+        return 4
+    if rest >= 2:
+        return 2
+    return 1
+
+# branch to `fail_l` unless the bytes at `base + offset` are `text`; the
+# caller has checked they are in bounds.
+fn ir_jf_match_text(v: JsonFillVars, base_var: String, offset: Int, text: String, fail_l: String):
+    mut at := 0
+    while at < text.len():
+        width := ir_jf_chunk_width(text, at)
+        next_l := ir_label()
+        idx := ir_jf_op_const("add", ir_jf_load(base_var), offset + at)
+        word := ir_jf_word_at(v, idx, width)
+        ir_jf_brif(ir_jf_op_const("eq", word, ir_jf_text_word(text, at, width)), next_l, fail_l)
+        ir_emit_label(next_l)
+        at = at + width
+
+# whether the word `x` has a zero byte: the borrow out of a zero byte
+# sets its high bit and nothing else can, so the answer is exact.
+fn ir_jf_has_zero_byte(x: Int) -> Int:
+    low := ir_jf_op_const("sub", x, 72340172838076673)
+    high := ir_jf_op_const("band", ir_jf_op("bxor", x, ir_jf_const(0 - 1)), 0 - 9187201950435737472)
+    return ir_jf_op("band", low, high)
+
+# scan the string whose opening quote is at pos: leaves the index of its
+# closing quote in `v.scan`, or branches to `fail_l` when it runs off the
+# end. a backslash takes the byte after it along. eight bytes at a time
+# while none of them is a quote or a backslash, then a byte at a time to
+# the one that is: a byte loop alone ran a 256-byte value 17% slower than
+# the runtime fill did.
+fn ir_jf_scan_string(v: JsonFillVars, fail_l: String):
+    word_l := ir_label()
+    test_l := ir_label()
+    skip8_l := ir_label()
+    top_l := ir_label()
+    chk_l := ir_label()
+    other_l := ir_label()
+    esc_l := ir_label()
+    one_l := ir_label()
+    done_l := ir_label()
+    ir_emit("store " + v.scan + " " + ir_jf_op_const("add", ir_jf_load(v.pos), 1).to_string())
+    ir_jf_jmp(word_l)
+    ir_emit_label(word_l)
+    room := ir_jf_op_const("add", ir_jf_load(v.scan), 8)
+    ir_jf_brif(ir_jf_op("lte", room, ir_jf_load(v.len)), test_l, top_l)
+    ir_emit_label(test_l)
+    word := ir_jf_word_at(v, ir_jf_load(v.scan), 8)
+    quotes := ir_jf_has_zero_byte(ir_jf_op_const("bxor", word, 2459565876494606882))
+    slashes := ir_jf_has_zero_byte(ir_jf_op_const("bxor", word, 6655295901103053916))
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_op("bor", quotes, slashes), 0), skip8_l, top_l)
+    ir_emit_label(skip8_l)
+    ir_emit("store " + v.scan + " " + ir_jf_op_const("add", ir_jf_load(v.scan), 8).to_string())
+    ir_jf_jmp(word_l)
+    ir_emit_label(top_l)
+    ir_jf_brif(ir_jf_op("lt", ir_jf_load(v.scan), ir_jf_load(v.len)), chk_l, fail_l)
+    ir_emit_label(chk_l)
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_byte_at(v, ir_jf_load(v.scan)), 34), done_l, other_l)
+    ir_emit_label(other_l)
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_byte_at(v, ir_jf_load(v.scan)), 92), esc_l, one_l)
+    ir_emit_label(esc_l)
+    ir_emit("store " + v.scan + " " + ir_jf_op_const("add", ir_jf_load(v.scan), 2).to_string())
+    ir_jf_jmp(word_l)
+    ir_emit_label(one_l)
+    ir_emit("store " + v.scan + " " + ir_jf_op_const("add", ir_jf_load(v.scan), 1).to_string())
+    ir_jf_jmp(top_l)
+    ir_emit_label(done_l)
+
+# store `value` into the struct slot the variable `slot` names.
+fn ir_jf_store_slot(v: JsonFillVars, value: Int):
+    off := ir_jf_op_const("mul", ir_jf_load(v.slot), 8)
+    ir_emit_call_text(ir_reg(), "pith_store_u64", "void", 3, " " + ir_jf_load(v.obj).to_string() + " " + off.to_string() + " " + value.to_string())
+
+# an Int value: an optional `-` and at least one digit, accumulated with
+# saturation at the type's bounds (so `-` of the saturated value is the
+# negative bound plus one, as the runtime fill had it).
+fn ir_jf_emit_int(v: JsonFillVars, fail_l: String, done_l: String):
+    neg_l := ir_label()
+    pos_l := ir_label()
+    start_l := ir_label()
+    top_l := ir_label()
+    chk_l := ir_label()
+    mul_l := ir_label()
+    add_l := ir_label()
+    sum_l := ir_label()
+    sat_l := ir_label()
+    step_l := ir_label()
+    end_l := ir_label()
+    some_l := ir_label()
+    flip_l := ir_label()
+    keep_l := ir_label()
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_byte_at(v, ir_jf_load(v.pos)), 45), neg_l, pos_l)
+    ir_emit_label(neg_l)
+    ir_jf_store_const(v.neg, 1)
+    ir_jf_advance(v, 1)
+    ir_jf_jmp(start_l)
+    ir_emit_label(pos_l)
+    ir_jf_store_const(v.neg, 0)
+    ir_jf_jmp(start_l)
+    ir_emit_label(start_l)
+    ir_jf_store_const(v.aux, 0)
+    ir_emit("store " + v.scan + " " + ir_jf_load(v.pos).to_string())
+    ir_jf_jmp(top_l)
+    ir_emit_label(top_l)
+    ir_jf_brif(ir_jf_op("lt", ir_jf_load(v.scan), ir_jf_load(v.len)), chk_l, end_l)
+    ir_emit_label(chk_l)
+    d := ir_jf_op_const("sub", ir_jf_byte_at(v, ir_jf_load(v.scan)), 48)
+    not_digit := ir_jf_op("or", ir_jf_op_const("lt", d, 0), ir_jf_op_const("gt", d, 9))
+    ir_jf_brif(not_digit, end_l, mul_l)
+    ir_emit_label(mul_l)
+    ir_jf_brif(ir_jf_op_const("gt", ir_jf_load(v.aux), 922337203685477580), sat_l, add_l)
+    ir_emit_label(add_l)
+    d2 := ir_jf_op_const("sub", ir_jf_byte_at(v, ir_jf_load(v.scan)), 48)
+    tens := ir_jf_op_const("mul", ir_jf_load(v.aux), 10)
+    room := ir_jf_op("sub", ir_jf_const(9223372036854775807), d2)
+    ir_jf_brif(ir_jf_op("gt", tens, room), sat_l, sum_l)
+    ir_emit_label(sum_l)
+    d3 := ir_jf_op_const("sub", ir_jf_byte_at(v, ir_jf_load(v.scan)), 48)
+    ir_emit("store " + v.aux + " " + ir_jf_op("add", ir_jf_op_const("mul", ir_jf_load(v.aux), 10), d3).to_string())
+    ir_jf_jmp(step_l)
+    ir_emit_label(sat_l)
+    ir_jf_store_const(v.aux, 9223372036854775807)
+    ir_jf_jmp(step_l)
+    ir_emit_label(step_l)
+    ir_emit("store " + v.scan + " " + ir_jf_op_const("add", ir_jf_load(v.scan), 1).to_string())
+    ir_jf_jmp(top_l)
+    ir_emit_label(end_l)
+    ir_jf_brif(ir_jf_op("eq", ir_jf_load(v.scan), ir_jf_load(v.pos)), fail_l, some_l)
+    ir_emit_label(some_l)
+    ir_emit("store " + v.pos + " " + ir_jf_load(v.scan).to_string())
+    ir_jf_brif(ir_jf_load(v.neg), flip_l, keep_l)
+    ir_emit_label(flip_l)
+    ir_jf_store_slot(v, ir_jf_op("sub", ir_jf_const(0), ir_jf_load(v.aux)))
+    ir_jf_jmp(done_l)
+    ir_emit_label(keep_l)
+    ir_jf_store_slot(v, ir_jf_load(v.aux))
+    ir_jf_jmp(done_l)
+
+# a String value: the raw bytes between the quotes, as a fresh string the
+# struct owns. the struct is allocated zeroed, so a slot holds a string
+# only when a repeated key filled it before, and that string is released
+# (a zero slot releases nothing).
+fn ir_jf_emit_string(v: JsonFillVars, fail_l: String, done_l: String):
+    open_l := ir_label()
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_byte_at(v, ir_jf_load(v.pos)), 34), open_l, fail_l)
+    ir_emit_label(open_l)
+    ir_jf_scan_string(v, fail_l)
+    off := ir_jf_op_const("mul", ir_jf_load(v.slot), 8)
+    old := ir_reg()
+    ir_emit_call_text(old, "pith_load_u64", "int", 2, " " + ir_jf_load(v.obj).to_string() + " " + off.to_string())
+    ir_emit_call1(ir_reg(), "pith_cstring_release", "void", old)
+    first := ir_jf_op_const("add", ir_jf_load(v.pos), 1)
+    start := ir_jf_op("add", ir_jf_load(v.ptr), first)
+    count := ir_jf_op("sub", ir_jf_load(v.scan), first)
+    s := ir_reg()
+    ir_emit_call_text(s, "pith_cstring_from_raw", "string", 2, " " + start.to_string() + " " + count.to_string())
+    ir_jf_store_slot(v, s)
+    ir_emit("store " + v.pos + " " + ir_jf_op_const("add", ir_jf_load(v.scan), 1).to_string())
+    ir_jf_jmp(done_l)
+
+# a Bool value: `true` or `false`, matched by prefix.
+fn ir_jf_emit_bool(v: JsonFillVars, fail_l: String, done_l: String):
+    t_l := ir_label()
+    f_l := ir_label()
+    yes_l := ir_label()
+    room_l := ir_label()
+    e_l := ir_label()
+    no_l := ir_label()
+    end_r := ir_jf_op_const("add", ir_jf_load(v.pos), 4)
+    ir_jf_brif(ir_jf_op("lte", end_r, ir_jf_load(v.len)), t_l, fail_l)
+    ir_emit_label(t_l)
+    word := ir_jf_word_at(v, ir_jf_load(v.pos), 4)
+    ir_jf_brif(ir_jf_op_const("eq", word, ir_jf_text_word("true", 0, 4)), yes_l, f_l)
+    ir_emit_label(yes_l)
+    ir_jf_store_slot(v, ir_jf_const(1))
+    ir_jf_advance(v, 4)
+    ir_jf_jmp(done_l)
+    ir_emit_label(f_l)
+    end5 := ir_jf_op_const("add", ir_jf_load(v.pos), 5)
+    ir_jf_brif(ir_jf_op("lte", end5, ir_jf_load(v.len)), room_l, fail_l)
+    ir_emit_label(room_l)
+    word5 := ir_jf_word_at(v, ir_jf_load(v.pos), 4)
+    ir_jf_brif(ir_jf_op_const("eq", word5, ir_jf_text_word("fals", 0, 4)), e_l, fail_l)
+    ir_emit_label(e_l)
+    last := ir_jf_byte_at(v, ir_jf_op_const("add", ir_jf_load(v.pos), 4))
+    ir_jf_brif(ir_jf_op_const("eq", last, 101), no_l, fail_l)
+    ir_emit_label(no_l)
+    ir_jf_store_slot(v, ir_jf_const(0))
+    ir_jf_advance(v, 5)
+    ir_jf_jmp(done_l)
+
+# whether byte `b` is one a json number is written with: a digit, a sign,
+# `.`, `e` or `E`.
+fn ir_jf_is_number_byte(b: Int) -> Int:
+    d := ir_jf_op_const("sub", b, 48)
+    digit := ir_jf_op("and", ir_jf_op_const("gte", d, 0), ir_jf_op_const("lte", d, 9))
+    sign := ir_jf_op("or", ir_jf_op_const("eq", b, 43), ir_jf_op_const("eq", b, 45))
+    dot := ir_jf_op("or", ir_jf_op_const("eq", b, 46), ir_jf_op("or", ir_jf_op_const("eq", b, 101), ir_jf_op_const("eq", b, 69)))
+    return ir_jf_op("or", digit, ir_jf_op("or", sign, dot))
+
+# a Float value: a number span starting with `-` or a digit, converted by
+# the runtime; a span that is not a finite number fails the decode.
+fn ir_jf_emit_float(v: JsonFillVars, fail_l: String, done_l: String):
+    span_l := ir_label()
+    digit_l := ir_label()
+    top_l := ir_label()
+    chk_l := ir_label()
+    step_l := ir_label()
+    end_l := ir_label()
+    ok_l := ir_label()
+    first := ir_jf_byte_at(v, ir_jf_load(v.pos))
+    ir_jf_brif(ir_jf_op_const("eq", first, 45), span_l, digit_l)
+    ir_emit_label(digit_l)
+    d := ir_jf_op_const("sub", ir_jf_byte_at(v, ir_jf_load(v.pos)), 48)
+    ir_jf_brif(ir_jf_op("and", ir_jf_op_const("gte", d, 0), ir_jf_op_const("lte", d, 9)), span_l, fail_l)
+    ir_emit_label(span_l)
+    ir_emit("store " + v.scan + " " + ir_jf_load(v.pos).to_string())
+    ir_jf_jmp(top_l)
+    ir_emit_label(top_l)
+    ir_jf_brif(ir_jf_op("lt", ir_jf_load(v.scan), ir_jf_load(v.len)), chk_l, end_l)
+    ir_emit_label(chk_l)
+    ir_jf_brif(ir_jf_is_number_byte(ir_jf_byte_at(v, ir_jf_load(v.scan))), step_l, end_l)
+    ir_emit_label(step_l)
+    ir_emit("store " + v.scan + " " + ir_jf_op_const("add", ir_jf_load(v.scan), 1).to_string())
+    ir_jf_jmp(top_l)
+    ir_emit_label(end_l)
+    bits := ir_reg()
+    ir_emit_call_text(bits, "pith_json_float_bits", "int", 3, " " + ir_jf_load(v.ptr).to_string() + " " + ir_jf_load(v.pos).to_string() + " " + ir_jf_load(v.scan).to_string())
+    ir_emit("store " + v.aux + " " + bits.to_string())
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_load(v.aux), JSON_FILL_FLOAT_REFUSED), fail_l, ok_l)
+    ir_emit_label(ok_l)
+    ir_jf_store_slot(v, ir_jf_load(v.aux))
+    ir_emit("store " + v.pos + " " + ir_jf_load(v.scan).to_string())
+    ir_jf_jmp(done_l)
+
+# the colon after a key and the whitespace around it; pos is left on the
+# value's first byte, which is in bounds.
+fn ir_jf_emit_colon(v: JsonFillVars, fail_l: String):
+    value_l := ir_label()
+    ir_jf_skip_ws(v)
+    ir_jf_expect(v, 58, fail_l)
+    ir_jf_skip_ws(v)
+    ir_jf_brif(ir_jf_op("lt", ir_jf_load(v.pos), ir_jf_load(v.len)), value_l, fail_l)
+    ir_emit_label(value_l)
+
+# jump to the guess block of the field `next` names, by binary search
+# over [lo, hi].
+fn ir_jf_emit_guess_dispatch(v: JsonFillVars, lo: Int, hi: Int, try_ls: List[String]):
+    if lo == hi:
+        ir_jf_jmp(try_ls[lo])
+        return
+    mid := (lo + hi) / 2
+    low_l := ir_label()
+    high_l := ir_label()
+    ir_jf_brif(ir_jf_op_const("lte", ir_jf_load(v.next), mid), low_l, high_l)
+    ir_emit_label(low_l)
+    ir_jf_emit_guess_dispatch(v, lo, mid, try_ls)
+    ir_emit_label(high_l)
+    ir_jf_emit_guess_dispatch(v, mid + 1, hi, try_ls)
+
+# the index of a field kind's shared value parser.
+fn ir_jf_kind_index(kind: String) -> Int:
+    if kind == "i":
+        return 0
+    if kind == "s":
+        return 1
+    if kind == "b":
+        return 2
+    return 3
+
+## emit the generated decoder for a flat struct: `input_r` holds the
+## object bytes, `struct_r` the pre-allocated struct (zeroed, destructor
+## attached) whose slots follow `fields`. `skip_fn`, `error_fn` and
+## `malformed_fn` are std.json's fill_skip_value, fill_missing_error and
+## fill_malformed_error under the names this call reaches them by.
+## returns the register holding the decode's result box: the ok box
+## around the struct, or an error box after the struct was released.
+pub fn ir_emit_json_fill_flat(input_r: Int, struct_r: Int, fields: List[JsonFillField], skip_fn: String, error_fn: String, malformed_fn: String) -> Int:
+    v := JsonFillVars(ir_jf_var("jf_in"), ir_jf_var("jf_ptr"), ir_jf_var("jf_len"), ir_jf_var("jf_pos"), ir_jf_var("jf_obj"), ir_jf_var("jf_scan"), ir_jf_var("jf_aux"), ir_jf_var("jf_neg"), ir_jf_var("jf_slot"), ir_jf_var("jf_next"))
+    ks_var := ir_jf_var("jf_key")
+    result_var := ir_new_temp_name("json_decode")
+    ir_var_types.insert(result_var, "tuple")
+    n := fields.len()
+    mut have: List[String] := []
+    mut try_ls: List[String] := []
+    mut hit_ls: List[String] := []
+    for f in fields:
+        have.push(ir_jf_var("jf_have"))
+        try_ls.push(ir_label())
+        hit_ls.push(ir_label())
+    mut value_ls: List[String] := []
+    mut kinds_used: List[Bool] := []
+    mut kind_i := 0
+    while kind_i < 4:
+        value_ls.push(ir_label())
+        kinds_used.push(false)
+        kind_i = kind_i + 1
+    key_l := ir_label()
+    generic_l := ir_label()
+    unknown_l := ir_label()
+    after_l := ir_label()
+    close_l := ir_label()
+    bad_l := ir_label()
+    end_l := ir_label()
+    start_l := ir_label()
+
+    ir_emit("store " + v.input + " " + input_r.to_string())
+    ir_emit("store " + v.obj + " " + struct_r.to_string())
+    ptr_r := ir_reg()
+    ir_emit_call_text(ptr_r, "pith_bytes_data_ptr", "int", 1, " " + input_r.to_string())
+    ir_emit("store " + v.ptr + " " + ptr_r.to_string())
+    len_r := ir_reg()
+    ir_emit_call_text(len_r, "bytes_len", "int", 1, " " + input_r.to_string())
+    ir_emit("store " + v.len + " " + len_r.to_string())
+    for name in have:
+        ir_jf_store_const(name, 0)
+    for name in [v.pos, v.scan, v.aux, v.neg, v.slot, v.next, ks_var]:
+        ir_jf_store_const(name, 0)
+    ir_jf_brif(ir_jf_op_const("eq", ir_jf_load(v.ptr), 0), bad_l, start_l)
+
+    # the opening brace, and an empty object
+    ir_emit_label(start_l)
+    ir_jf_skip_ws(v)
+    ir_jf_expect(v, 123, bad_l)
+    ir_jf_skip_ws(v)
+    ir_jf_branch_byte(v, 125, close_l, key_l)
+
+    # a key: first the guess, the field after the last one matched
+    ir_emit_label(key_l)
+    guess_l := ir_label()
+    ir_jf_brif(ir_jf_op_const("lt", ir_jf_load(v.next), n), guess_l, generic_l)
+    ir_emit_label(guess_l)
+    ir_jf_emit_guess_dispatch(v, 0, n - 1, try_ls)
+    for f, k in fields:
+        ir_emit_label(try_ls[k])
+        quoted := chr(34) + f.name + chr(34)
+        ir_jf_need(v, v.pos, quoted.len(), generic_l)
+        ir_jf_match_text(v, v.pos, 0, quoted, generic_l)
+        ir_jf_advance(v, quoted.len())
+        ir_jf_jmp(hit_ls[k])
+
+    # the general key path: scan the key, then compare it with each name
+    ir_emit_label(generic_l)
+    open_l := ir_label()
+    ir_jf_branch_byte(v, 34, open_l, bad_l)
+    ir_emit_label(open_l)
+    ir_jf_scan_string(v, bad_l)
+    ir_emit("store " + ks_var + " " + ir_jf_op_const("add", ir_jf_load(v.pos), 1).to_string())
+    ir_emit("store " + v.pos + " " + ir_jf_op_const("add", ir_jf_load(v.scan), 1).to_string())
+    for f, k in fields:
+        bytes_l := ir_label()
+        miss_l := ir_label()
+        key_len := ir_jf_op("sub", ir_jf_load(v.scan), ir_jf_load(ks_var))
+        ir_jf_brif(ir_jf_op_const("eq", key_len, f.name.len()), bytes_l, miss_l)
+        ir_emit_label(bytes_l)
+        ir_jf_match_text(v, ks_var, 0, f.name, miss_l)
+        ir_jf_jmp(hit_ls[k])
+        ir_emit_label(miss_l)
+    ir_jf_jmp(unknown_l)
+
+    # a field's key matched: note it, aim the next guess past it, and go to
+    # the value parser for its kind
+    for f, k in fields:
+        ir_emit_label(hit_ls[k])
+        ir_jf_store_const(have[k], 1)
+        ir_jf_store_const(v.slot, k)
+        ir_jf_store_const(v.next, k + 1)
+        kind := ir_jf_kind_index(f.kind)
+        kinds_used[kind] = true
+        ir_jf_jmp(value_ls[kind])
+
+    kind_i = 0
+    while kind_i < 4:
+        if kinds_used[kind_i]:
+            ir_emit_label(value_ls[kind_i])
+            ir_jf_emit_colon(v, bad_l)
+            if kind_i == 0:
+                ir_jf_emit_int(v, bad_l, after_l)
+            elif kind_i == 1:
+                ir_jf_emit_string(v, bad_l, after_l)
+            elif kind_i == 2:
+                ir_jf_emit_bool(v, bad_l, after_l)
+            else:
+                ir_jf_emit_float(v, bad_l, after_l)
+        kind_i = kind_i + 1
+
+    # a key the struct does not name: its value is stepped over
+    ir_emit_label(unknown_l)
+    ir_jf_emit_colon(v, bad_l)
+    skipped := ir_reg()
+    ir_emit_call_text(skipped, skip_fn, "int", 2, " " + ir_jf_load(v.input).to_string() + " " + ir_jf_load(v.pos).to_string())
+    ir_emit("store " + v.aux + " " + skipped.to_string())
+    skipped_l := ir_label()
+    ir_jf_brif(ir_jf_op_const("lt", ir_jf_load(v.aux), 0), bad_l, skipped_l)
+    ir_emit_label(skipped_l)
+    ir_emit("store " + v.pos + " " + ir_jf_load(v.aux).to_string())
+    ir_jf_jmp(after_l)
+
+    # after a value: a comma leads to the next key, the closing brace ends
+    # the object
+    ir_emit_label(after_l)
+    comma_l := ir_label()
+    other_l := ir_label()
+    ir_jf_skip_ws(v)
+    ir_jf_branch_byte(v, 44, comma_l, other_l)
+    ir_emit_label(comma_l)
+    ir_jf_advance(v, 1)
+    ir_jf_skip_ws(v)
+    ir_jf_jmp(key_l)
+    ir_emit_label(other_l)
+    ir_jf_branch_byte(v, 125, close_l, bad_l)
+
+    # the closing brace: every field must have arrived, the first missing
+    # one in declaration order names the error
+    ir_emit_label(close_l)
+    for f, k in fields:
+        have_l := ir_label()
+        missing_l := ir_label()
+        ir_jf_brif(ir_jf_load(have[k]), have_l, missing_l)
+        ir_emit_label(missing_l)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", ir_jf_load(v.obj))
+        name_r := ir_reg()
+        ir_emit("strref " + name_r.to_string() + " " + ir_str(f.name))
+        err_r := ir_reg()
+        ir_emit_call1(err_r, error_fn, "struct", name_r)
+        ir_emit("store " + result_var + " " + ir_emit_err_result_tuple_raw(err_r).to_string())
+        ir_jf_jmp(end_l)
+        ir_emit_label(have_l)
+    ir_emit("store " + result_var + " " + ir_emit_ok_result_tuple_raw(ir_jf_load(v.obj)).to_string())
+    ir_jf_jmp(end_l)
+
+    ir_emit_label(bad_l)
+    ir_emit_call1(ir_reg(), "pith_struct_release", "void", ir_jf_load(v.obj))
+    bad_err := ir_reg()
+    ir_emit_call_text(bad_err, malformed_fn, "struct", 0, "")
+    ir_emit("store " + result_var + " " + ir_emit_err_result_tuple_raw(bad_err).to_string())
+    ir_jf_jmp(end_l)
+
+    ir_emit_label(end_l)
+    r := ir_reg()
+    ir_emit("load " + r.to_string() + " " + result_var)
+    return r

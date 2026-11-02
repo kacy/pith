@@ -1248,6 +1248,219 @@ pub fn scan_required_bool_bytes(input: Bytes, key: String) -> Bool!JsonDecodeErr
 pub fn scan_required_float_bytes(input: Bytes, key: String) -> Float!JsonDecodeError:
     return json_scan_required_float_bytes(input, key)!
 
+# --- the generated flat decoder's helpers --------------------------------
+#
+# json.decode[T] of a flat struct of required scalars is a decoder the
+# compiler generates for T (self-host/ir_json_fill_emit.pith): it scans
+# the object, matches each key against T's field names and parses each
+# value straight into the struct. what it hands off are the cases that
+# are rare enough not to be worth generating: a value under a key T does
+# not name, and the error for a field that never arrived. the grammar
+# these step over is the node parser's, as the decoder's always was.
+
+# the depth past which a nested value under a stray key is refused; the
+# node parser's MAX_PARSE_DEPTH, with the root object at depth 1.
+FILL_MAX_DEPTH := 128
+
+# the end of the json string whose opening quote is at `pos`: the index
+# of its closing quote, or -1 when it runs off the end. a backslash takes
+# the byte after it along, whatever that byte is.
+fn json_fill_string_end(input: Bytes, pos: Int) -> Int:
+    mut i := pos + 1
+    while i < input.len():
+        b := input[i]
+        if b == 34:
+            return i
+        if b == 92:
+            i = i + 2
+        else:
+            i = i + 1
+    return -1
+
+fn json_fill_hex_digit(b: Int) -> Int:
+    if b >= 48 and b <= 57:
+        return b - 48
+    if b >= 97 and b <= 102:
+        return b - 87
+    if b >= 65 and b <= 70:
+        return b - 55
+    return -1
+
+# the four hex digits at `at` as a code unit, or -1.
+fn json_fill_hex4(input: Bytes, at: Int) -> Int:
+    mut code := 0
+    mut d := 0
+    while d < 4:
+        digit := json_fill_hex_digit(input[at + d])
+        if digit < 0:
+            return -1
+        code = code * 16 + digit
+        d = d + 1
+    return code
+
+# whether the raw string content `input[start..end]` decodes: every
+# escape is one json_unescape_text takes, a surrogate pair complete.
+fn json_fill_escapes_valid(input: Bytes, start: Int, end: Int) -> Bool:
+    mut i := start
+    while i < end:
+        if input[i] != 92:
+            i = i + 1
+            continue
+        if i + 1 >= end:
+            return false
+        c := input[i + 1]
+        if c == 34 or c == 92 or c == 47 or c == 98 or c == 102 or c == 110 or c == 114 or c == 116:
+            i = i + 2
+            continue
+        if c != 117:
+            return false
+        if i + 5 >= end:
+            return false
+        code := json_fill_hex4(input, i + 2)
+        if code < 0:
+            return false
+        i = i + 6
+        if code >= 55296 and code <= 56319:
+            if i + 5 >= end or input[i] != 92 or input[i + 1] != 117:
+                return false
+            low := json_fill_hex4(input, i + 2)
+            if low < 56320 or low > 57343:
+                return false
+            i = i + 6
+        elif code >= 56320 and code <= 57343:
+            return false
+    return true
+
+# the parser's string branch for a string nobody keeps: the index after
+# its closing quote, or -1 when it is unterminated or has a bad escape.
+fn json_fill_skip_string(input: Bytes, pos: Int) -> Int:
+    end := json_fill_string_end(input, pos)
+    if end < 0:
+        return -1
+    if not json_fill_escapes_valid(input, pos + 1, end):
+        return -1
+    return end + 1
+
+# the parser's number branch: the span of number bytes at `pos`, -1 when
+# an integer's digits pass parse_integer_manual's overflow bound. a span
+# with a `.`, `e` or `E` after its first byte is a float and has none.
+fn json_fill_skip_number(input: Bytes, pos: Int) -> Int:
+    end := json_byte_number_span_end(input, pos + 1)
+    mut i := pos + 1
+    while i < end:
+        b := input[i]
+        if b == 46 or b == 101 or b == 69:
+            return end
+        i = i + 1
+    mut value := 0
+    i = pos
+    while i < end:
+        b := input[i]
+        if json_byte_is_digit(b):
+            if value > 922337203685477580 / 10:
+                return -1
+            value = value * 10 + (b - 48)
+        i = i + 1
+    return end
+
+# the parser's value grammar for a value nobody keeps, at nesting level
+# `depth`: a missing comma or colon is taken, and an array or object may
+# run off the end of the input. -1 when it is malformed or too deep.
+fn json_fill_skip_nested(input: Bytes, pos: Int, depth: Int) -> Int:
+    if depth > FILL_MAX_DEPTH:
+        return -1
+    mut i := json_byte_skip_whitespace(input, pos)
+    if i >= input.len():
+        return -1
+    b := input[i]
+    if b == 34:
+        return json_fill_skip_string(input, i)
+    if json_byte_match_literal(input, i, "true") or json_byte_match_literal(input, i, "null"):
+        return i + 4
+    if json_byte_match_literal(input, i, "false"):
+        return i + 5
+    if b == 91:
+        i = json_byte_skip_whitespace(input, i + 1)
+        if i < input.len() and input[i] == 93:
+            return i + 1
+        while i < input.len() and input[i] != 93:
+            i = json_fill_skip_nested(input, i, depth + 1)
+            if i < 0:
+                return -1
+            i = json_byte_skip_whitespace(input, i)
+            if i < input.len() and input[i] == 44:
+                i = i + 1
+            i = json_byte_skip_whitespace(input, i)
+        if i < input.len():
+            i = i + 1
+        return i
+    if b == 123:
+        i = json_byte_skip_whitespace(input, i + 1)
+        if i < input.len() and input[i] == 125:
+            return i + 1
+        mut done := false
+        while i < input.len() and not done:
+            i = json_byte_skip_whitespace(input, i)
+            if i >= input.len() or input[i] != 34:
+                return -1
+            i = json_fill_skip_string(input, i)
+            if i < 0:
+                return -1
+            i = json_byte_skip_whitespace(input, i)
+            if i < input.len() and input[i] == 58:
+                i = i + 1
+            i = json_fill_skip_nested(input, i, depth + 1)
+            if i < 0:
+                return -1
+            i = json_byte_skip_whitespace(input, i)
+            if i < input.len() and input[i] == 44:
+                i = i + 1
+            i = json_byte_skip_whitespace(input, i)
+            if i < input.len() and input[i] == 125:
+                done = true
+        if i < input.len() and input[i] == 125:
+            i = i + 1
+        return i
+    if json_byte_is_digit(b) or b == 45 or b == 43:
+        return json_fill_skip_number(input, i)
+    return -1
+
+## The index after the value at `pos` under a key the generated flat
+## decoder's target does not name, or -1 when it is malformed. A string
+## is stepped over to its closing quote with its escapes left alone, a
+## number by its whole span and a literal by its prefix; an object or an
+## array is consumed with the node parser's grammar and depth bound.
+## Called only by compiler-generated code.
+pub fn fill_skip_value(input: Bytes, pos: Int) -> Int:
+    if pos < 0 or pos >= input.len():
+        return -1
+    b := input[pos]
+    if b == 34:
+        end := json_fill_string_end(input, pos)
+        if end < 0:
+            return -1
+        return end + 1
+    if b == 45 or json_byte_is_digit(b):
+        return json_byte_number_span_end(input, pos)
+    if json_byte_match_literal(input, pos, "true") or json_byte_match_literal(input, pos, "null"):
+        return pos + 4
+    if json_byte_match_literal(input, pos, "false"):
+        return pos + 5
+    if b == 123 or b == 91:
+        # depth 2: the value sits inside the root object, which is depth 1
+        return json_fill_skip_nested(input, pos, 2)
+    return -1
+
+## The error the generated flat decoder returns when the field `name`
+## never arrived. Called only by compiler-generated code.
+pub fn fill_missing_error(name: String) -> JsonDecodeError:
+    return JsonDecodeError("missing json field: " + name)
+
+## The error the generated flat decoder returns for a malformed
+## document. Called only by compiler-generated code.
+pub fn fill_malformed_error() -> JsonDecodeError:
+    return JsonDecodeError("missing json field")
+
  # decodes json object bytes into a concrete struct.
  # this is lowered by the compiler so structs do not need runtime reflection.
 pub fn decode[T](input: Bytes) -> T!JsonDecodeError:

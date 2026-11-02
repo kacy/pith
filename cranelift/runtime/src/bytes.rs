@@ -178,6 +178,81 @@ pub unsafe extern "C" fn pith_bytes_len(handle: i64) -> i64 {
     bytes.data.len() as i64
 }
 
+/// The data pointer of a bytes handle, or 0 for a handle `pith_bytes_ref`
+/// refuses. The typed json decoder the compiler generates reads its input
+/// through this pointer with `pith_load_u8`, checking every index against
+/// the length itself, so the handle is tested once per decode rather than
+/// once per byte. The codegen inlines both; these are what a build without
+/// the inline fast paths (quarantine, sanitizers) calls.
+///
+/// # Safety
+/// handle must be a valid PithBytes or garbage.
+#[no_mangle]
+pub unsafe extern "C" fn pith_bytes_data_ptr(handle: i64) -> i64 {
+    match pith_bytes_ref(handle) {
+        Some(bytes) => bytes.data.as_ptr() as i64,
+        None => 0,
+    }
+}
+
+/// The byte at `ptr + idx`, unchecked: the caller holds the bytes alive
+/// and has compared `idx` against their length (see `pith_bytes_data_ptr`).
+/// The wider forms read 2, 4 or 8 bytes there as one little-endian
+/// integer, zero-extended, with no alignment asked of the address.
+///
+/// # Safety
+/// The bytes `ptr + idx` up to the width must be readable.
+#[no_mangle]
+pub unsafe extern "C" fn pith_load_u8(ptr: i64, idx: i64) -> i64 {
+    *(ptr as *const u8).offset(idx as isize) as i64
+}
+
+/// # Safety
+/// As `pith_load_u8`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_load_u16(ptr: i64, idx: i64) -> i64 {
+    u16::from_le(std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u16)) as i64
+}
+
+/// # Safety
+/// As `pith_load_u8`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_load_u32(ptr: i64, idx: i64) -> i64 {
+    u32::from_le(std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u32)) as i64
+}
+
+/// # Safety
+/// As `pith_load_u8`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_load_u64(ptr: i64, idx: i64) -> i64 {
+    u64::from_le(std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u64)) as i64
+}
+
+/// Store `value` as the 8 bytes at `ptr + off`, the mirror of
+/// `pith_load_u64`: the generated json decoder writes a struct slot whose
+/// index it holds in a variable with it.
+///
+/// # Safety
+/// The 8 bytes at `ptr + off` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn pith_store_u64(ptr: i64, off: i64, value: i64) {
+    std::ptr::write_unaligned((ptr as *mut u8).offset(off as isize) as *mut i64, value)
+}
+
+/// A fresh counted string holding the `len` bytes at `ptr`, copied as
+/// they are: no UTF-8 check and no escape decoding. The typed json decoder
+/// mints a flat struct's string fields with it.
+///
+/// # Safety
+/// `len` bytes at `ptr` must be readable.
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_from_raw(ptr: i64, len: i64) -> i64 {
+    if len <= 0 {
+        return crate::pith_copy_bytes_to_cstring(&[]) as i64;
+    }
+    crate::pith_copy_bytes_to_cstring(std::slice::from_raw_parts(ptr as *const u8, len as usize)) as i64
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_is_empty(handle: i64) -> i64 {
     let Some(bytes) = pith_bytes_ref(handle) else {
@@ -681,6 +756,35 @@ pub unsafe extern "C" fn pith_byte_buffer_clear(handle: i64) {
 mod tests {
     use super::*;
     use crate::ffi_util::unbox_result;
+
+    #[test]
+    fn raw_reads_and_writes_go_through_the_data_pointer() {
+        unsafe {
+            assert_eq!(pith_bytes_data_ptr(0), 0);
+            assert_eq!(pith_bytes_data_ptr(12345), 0);
+            let data = pith_bytes_from_vec(b"\"name\":\x80\xff".to_vec());
+            let ptr = pith_bytes_data_ptr(data);
+            assert_ne!(ptr, 0);
+            assert_eq!(pith_load_u8(ptr, 0), b'"' as i64);
+            assert_eq!(pith_load_u8(ptr, 8), 0xff);
+            assert_eq!(pith_load_u16(ptr, 1), i64::from(u16::from_le_bytes(*b"na")));
+            assert_eq!(pith_load_u32(ptr, 1), i64::from(u32::from_le_bytes(*b"name")));
+            assert_eq!(pith_load_u64(ptr, 1), u64::from_le_bytes(*b"name\":\x80\xff") as i64);
+            let s = pith_cstring_from_raw(ptr + 1, 4);
+            assert_eq!(crate::ffi_util::cstr_bytes(s as *const i8), Some(&b"name"[..]));
+            crate::pith_cstring_release(s as *const i8);
+            let invalid = pith_cstring_from_raw(ptr + 7, 2);
+            assert_eq!(crate::ffi_util::cstr_bytes(invalid as *const i8), Some(&b"\x80\xff"[..]));
+            crate::pith_cstring_release(invalid as *const i8);
+            let empty = pith_cstring_from_raw(ptr, 0);
+            assert_eq!(crate::ffi_util::cstr_bytes(empty as *const i8), Some(&b""[..]));
+            crate::pith_cstring_release(empty as *const i8);
+            let mut slots = [0i64; 3];
+            pith_store_u64(slots.as_mut_ptr() as i64, 8, -5);
+            assert_eq!(slots, [0, -5, 0]);
+            pith_bytes_release(data);
+        }
+    }
 
     #[test]
     fn constant_time_eq_fails_closed_on_invalid_handles() {

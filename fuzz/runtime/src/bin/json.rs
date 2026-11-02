@@ -4,19 +4,20 @@
 //! spec the emitter would intern, allocates the struct tree the lowering
 //! would allocate (destructors attached), builds the destructor table for
 //! a spec with collections, and picks the entry point the lowering picks:
-//! the flat filler for all-scalar fields, the nested one for struct
-//! fields, the collection one when a list or map appears anywhere. The
-//! rest of the input is the document. A filled tree is walked, then
-//! released, so a slot holding a freed or foreign value shows up.
+//! the nested filler without a list or map, the collection one when a list
+//! or map appears anywhere. A struct of scalars alone is decoded by code
+//! the compiler generates (self-host/ir_json_fill_emit.pith), not by a
+//! filler, so that shape goes through the nested filler here, which takes
+//! a flat spec too. The rest of the input is the document. A filled tree
+//! is walked, then released, so a slot holding a freed or foreign value
+//! shows up.
 #![no_main]
 
 use std::cell::RefCell;
 
 use pith_runtime::collections::list::{pith_list_get_value, pith_list_len, pith_list_release_handle, PithList};
 use pith_runtime::collections::map::{pith_map_get_cstr, pith_map_keys_cstr, pith_map_release_handle};
-use pith_runtime::json::{
-    pith_json_decode_missing_error, pith_json_fill_struct, pith_json_fill_struct_lists, pith_json_fill_struct_nested,
-};
+use pith_runtime::json::{pith_json_fill_struct_lists, pith_json_fill_struct_nested};
 use pith_runtime::{pith_cstring_release, pith_struct_alloc, pith_struct_release, pith_struct_set_dtor};
 use pith_runtime_fuzz::{cstr_vec, fuzz_target, Input, PBytes, PStr};
 
@@ -260,21 +261,8 @@ fuzz_target!(|data| {
     SHAPES.with(|s| {
         let shapes = &*s.borrow();
         unsafe {
-            let all_scalar = shapes[0].kinds.iter().all(|k| matches!(k, Kind::Scalar(_)));
             let root = prealloc(shapes, 0);
-            if all_scalar {
-                // ir_emit_json_decode_scan_fields
-                let n = shapes[0].kinds.len();
-                let mask = pith_json_fill_struct(doc.0, spec_ptr, root);
-                assert!(mask == -1 || (0..1 << n).contains(&mask), "mask {mask:#x} for {n} fields");
-                if mask == (1 << n) - 1 {
-                    walk(shapes, 0, root);
-                    pith_struct_release(root);
-                } else {
-                    pith_struct_release(root);
-                    take_result(shapes, pith_json_decode_missing_error(mask, spec_ptr), None);
-                }
-            } else if !has_collection(shapes, 0) {
+            if !has_collection(shapes, 0) {
                 take_result(shapes, pith_json_fill_struct_nested(doc.0, spec_ptr, root, check_utf8), Some(root));
             } else {
                 // the destructor table, when the spec names an index

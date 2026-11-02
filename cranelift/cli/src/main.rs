@@ -67,16 +67,17 @@ fn run_cli() {
             run_file(&path);
         }
         "test" => {
-            require_file_arg(&args, "test");
             // `--filter <substr>` (or `--filter=<substr>`) runs only the tests
             // whose name contains the substring; `--tag`/`--exclude-tag` select
             // and exclude by the labels a `test` block carries, and repeat to
             // name more than one; `--json` reports one record per result rather
             // than prose. every one of them reaches the test binary through the
-            // environment, which the subprocess inherits.
+            // environment, which the subprocess inherits. options may come
+            // before or after the file.
+            let mut file: Option<String> = None;
             let mut selected_tags: Vec<String> = Vec::new();
             let mut excluded_tags: Vec<String> = Vec::new();
-            let mut i = 3;
+            let mut i = 2;
             while i < args.len() {
                 if args[i] == "--filter" && i + 1 < args.len() {
                     env::set_var("PITH_TEST_FILTER", &args[i + 1]);
@@ -101,17 +102,21 @@ fn run_cli() {
                     i += 1;
                 } else if ["--filter", "--tag", "--exclude-tag"].contains(&args[i].as_str()) {
                     usage_error(&format!("{} needs a value", args[i]));
+                } else if file.is_none() && !args[i].starts_with('-') {
+                    file = Some(args[i].clone());
+                    i += 1;
                 } else {
                     usage_error(&unexpected_arg("test", &args[i]));
                 }
             }
+            let file = file.unwrap_or_else(|| usage_error("test requires a file argument"));
             if !selected_tags.is_empty() {
                 env::set_var("PITH_TEST_TAGS", selected_tags.join(","));
             }
             if !excluded_tags.is_empty() {
                 env::set_var("PITH_TEST_EXCLUDE_TAGS", excluded_tags.join(","));
             }
-            test_file(&args[2]);
+            test_file(&file);
         }
         "check" => {
             require_file_arg(&args, "check");
@@ -611,13 +616,18 @@ fn validate_combined_ir_contract(ir_text: &str) -> Result<(), String> {
 fn compile_to_object(path: &str, emit_tests: bool) -> Result<(Vec<u8>, usize), String> {
     // the ir driver says nothing when it cannot read its input, which would
     // be reported as a compiler bug, so a missing file is caught here
-    check_readable_file(path).map_err(|e| format!("Error reading {}: {}", path, e))?;
+    readable_source(path)?;
     let ir_text =
         get_ir_from_compiler(path, emit_tests).map_err(|e| format!("Error getting IR: {}", e))?;
     object_from_ir(&ir_text)
 }
 
 /// Ok when `path` is a regular file this process can open for reading.
+/// `check_readable_file` with an error that names the file.
+fn readable_source(path: &str) -> Result<(), String> {
+    check_readable_file(path).map_err(|e| format!("Error reading {}: {}", path, e))
+}
+
 fn check_readable_file(path: &str) -> std::io::Result<()> {
     if fs::File::open(path)?.metadata()?.is_dir() {
         return Err(std::io::ErrorKind::IsADirectory.into());
@@ -821,7 +831,7 @@ fn compile_and_run(path: &str, emit_tests: bool) {
 }
 
 fn parse_file(path: &str) {
-    match get_ast_from_compiler(path) {
+    match readable_source(path).and_then(|_| get_ast_from_compiler(path)) {
         Ok(ast) => println!("{}", ast),
         Err(e) => {
             eprintln!("{}", e);
@@ -831,7 +841,7 @@ fn parse_file(path: &str) {
 }
 
 fn lex_file(path: &str) {
-    match get_tokens_from_compiler(path) {
+    match readable_source(path).and_then(|_| get_tokens_from_compiler(path)) {
         Ok(tokens) => println!("{}", tokens),
         Err(e) => {
             eprintln!("{}", e);

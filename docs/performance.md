@@ -1500,6 +1500,102 @@ the A arm the main tree at e22c5a69 building the stage 2 bench source:
 (+0.17%), `small 4 20000` 33,115,253 to 32,700,739 (-1.25%); checksums
 identical, and none of those paths changed, so the movement is placement.
 
+## typed json decoding: the flat decoder in pith (2026-11-01)
+
+`json.decode[T]` of a struct whose fields are all required scalars used
+to call `pith_json_fill_struct`, a Rust walk over the object driven by a
+packed field spec. the compiler now generates that decoder in ir for each
+target type, at the call site (`self-host/ir_json_fill_emit.pith`), and
+the Rust fill and `pith_json_decode_missing_error` are deleted. the
+values, the accepted grammar and the error messages are the old fill's.
+`tests/cases/test_json_fill_generated` pins 138 lines of output that the
+runtime fill produced and the generated decoder reproduces: names around
+eight bytes long, quotes and backslashes at every offset of a string
+value, escaped and unknown keys, values under unknown keys down to the
+depth bound, integer saturation, and the Float and Bool edges.
+
+### what stays native and why
+
+the runtime keeps three primitives. the float conversion
+(`pith_json_float_bits`) is std's `f64::from_str`, the conversion
+`parse_float` uses, so a Float field agrees with the node parser to the
+bit. a string is minted by `pith_cstring_from_raw`, which is an
+allocation and a copy. the handle test (`pith_bytes_data_ptr`) runs once
+per decode; after it every byte read is `pith_load_u8`, `_u16`, `_u32` or
+`_u64`, which the codegen inlines to one load, and the generated code
+compares every index against the length itself. the same loop written
+with `bytes[i]` pays a magic check, a bounds check and a reload of the
+handle on each byte: a prototype of the small shape written that way read
+2,946 instructions per decode against the runtime fill's 1,525. the value
+under an unknown key and the two error structs go to `std.json`
+(`fill_skip_value`, `fill_missing_error`, `fill_malformed_error`), since
+a well-formed document with known keys never reaches them.
+
+the nested and collection fills (`pith_json_fill_struct_nested`,
+`pith_json_fill_struct_lists`) did not move. they are one recursive
+filler, `nested_fill_object` with its list and map siblings, written to
+the node parser's grammar: escapes decoded, a colon or comma optional,
+kind-named messages held until the whole document has parsed, and
+element errors named by path. a generated version has to reproduce all
+of it, and the Rust can only be deleted once all three shapes have moved,
+so this change leaves them alone.
+
+### how the generated code is laid out
+
+the decoder knows the field names, so there is no spec to walk. it keeps
+a guess, the field after the last one matched, and compares the next
+bytes against that field's quoted name a word at a time: `"id"` is one
+4-byte compare and `"active"` one 8-byte compare. a document with its keys
+in declaration order is read without scanning a key. any other key takes
+the general path, which scans the key and compares its length and bytes
+with each field.
+
+the first version gave every field its own copy of the colon, the
+whitespace skips, the value parser and the comma. it ran fewer
+instructions than the runtime fill on every shape, but at twenty fields
+the function was 41 KB, cachegrind counted 137 I1 misses per decode
+against none, and the wide row ran 38% slower. the layout that shipped
+keeps three small blocks per field (the guess, the general compare, and
+one that marks the field seen and sets its slot) and one shared parser
+per value kind, which stores through `pith_store_u64` at the slot held in
+a variable. the wide decode is 12.8 KB.
+
+a string value is scanned eight bytes at a time while none of them is a
+quote or a backslash, using the exact zero-byte test on the word XORed
+with `0x22..` and with `0x5c..`, and then a byte at a time to the match.
+with a byte loop alone, `small 256` ran 17% slower than the runtime fill
+and `wide 256` 52% slower.
+
+### by how much
+
+the A arm is the toolchain at `0a0a2959` (origin/main), the B arm this
+branch, both building the same bench source. wall time is the median of
+11 interleaved runs of the rows in `bench/compare.list`. instructions are
+callgrind's per-decode count, from two runs at different round counts
+differenced so startup drops out. checksums are identical in every row.
+
+| row | main | branch | wall | Ir per decode, main → branch |
+|---|---:|---:|---:|---|
+| small 4 × 20M | 804.5 ms | 708.6 ms | −11.9% | 1,500 → 1,158 (−22.8%) |
+| wide 32 × 3M | 774.8 ms | 593.2 ms | −23.4% | 9,285 → 6,209 (−33.1%) |
+| float 4 × 12M | 870.5 ms | 796.7 ms | −8.5% | 2,500 → 2,292 (−8.3%) |
+| nested 4 × 8M | 845.3 ms | 844.9 ms | −0.1% | 4,023 → 4,023 |
+| list 32 × 400k | 936.0 ms | 946.7 ms | +1.1% | 83,523 → 83,574 (+0.06%) |
+| list_walk 32 × 5k | 246.3 ms | 248.3 ms | +0.8% | 1,551,506 → 1,551,331 |
+| map 32 × 300k | 805.3 ms | 816.7 ms | +1.4% | 67,819 → 67,819 |
+
+the nested, list and map rows do not reach the flat decoder and their
+instruction counts match main to within 0.06%. a rerun of 15 interleaved
+runs put list at +1.2% and map at +1.5% on those same counts, which is
+code placement: the runtime archive lost two functions and gained eight.
+other shapes on the same binaries: `ints 4` −12.7%, `small 32` −25.0%,
+`small 256` −55.9%, `wide 4` −6.5%, `wide 256` −54.8%. the workloads that
+decode flat structs: event_ledger 200000 went from 1,689,665,937 to
+1,646,553,512 Ir (−2.6%; wall +0.4% on a 70 ms run), catalog_workload
+4000 from 33,121,484 to 30,058,548 Ir (−9.2%).
+
+`cranelift/runtime/src/json.rs` went from 1,722 lines to 1,435.
+
 ## result boxes (2026-09-24)
 
 a `T!` crosses a call as a heap struct, `[is_ok, ok, err]`: the callee

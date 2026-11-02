@@ -52,7 +52,7 @@ from ir_decode_emit import ir_json_intern_nested_specs, ir_emit_config_decode_sp
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg, ir_kinded_code, ir_kinded_code_kind, ir_kinded_code_count, ir_kinded_tag_slot, ir_kinded_release_slot, ir_kinded_rebind
-from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_handle_decode_callee, ir_declared_callable_return_type, ir_emit_result_ok_field_typed, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
+from ir_alias_registry import ir_active_generic_params, ir_active_generic_concrete_types, ir_active_generic_module_path, ir_resolve_type_node, ir_resolve_map_value_type_node, ir_global_int_names, ir_global_string_names, ir_global_list_string_names, ir_global_list_names, ir_global_map_names, ir_global_map_int_names, ir_global_map_value_types, ir_global_set_names, ir_global_set_int_names, ir_global_bool_names, ir_global_slot_names, ir_record_global_slot, ir_record_global_type, ir_type_aliases, ir_import_renames, ir_module_aliases, ir_import_declared_functions, ir_import_declared_globals, ir_import_mutable_global_symbols, ir_resolve_type_hint, ir_capture_blocked_names, ir_retkind, ir_import_declares_global, ir_collect_preloaded_root_metadata, ir_resolve_module_alias_method_call_name, ir_is_json_decode_callee, ir_is_handle_decode_callee, ir_declared_callable_return_type, ir_emit_result_ok_field_typed, ir_emit_named_field_access, ir_specialize_type_name, ir_resolve_type_node_with_subst, ir_extract_return_type_with_subst, ir_extract_optional_inner_type_with_subst, ir_extract_param_types_with_subst, ir_register_import_alias, ir_collect_from_import_renames
 from ir_struct_registry import ir_enum_needs_dtor, ir_struct_needs_dtor, ir_rc_field_kind, ir_reset_dtor_memo, ir_boxed_enums, ir_enum_payload_kinds, ir_enum_variant_lists, ir_struct_names, ir_struct_field_lookup, ir_struct_field_index_lookup, ir_struct_decl_nodes, ir_struct_field_default_nodes, ir_struct_drop_symbols, ir_struct_drop_symbol, ir_struct_base_name, ir_rc_kind, ir_known_struct_return_type, ir_binary_enum_eq_name, ir_struct_field_count, ir_struct_field_name_at, ir_struct_field_type_name, ir_struct_field_default_node
 from ir_builder import IrBuilderSnapshot, ir_builder_reset, ir_builder_reset_function, ir_builder_reset_registers, ir_builder_set_string_module_count, ir_builder_snapshot, ir_builder_restore, ir_builder_lines, ir_builder_append_lines, ir_new_temp_name, ir_emit, ir_str, ir_emit_string_table, ir_reg, ir_zero_reg, ir_label, ir_var_types, ir_var_regs, ir_current_func_return_kind, ir_untracked_rc_binds, ir_kinded_rc_binds, ir_kinded_release_symbol, ir_kinded_release_used
 # shared helpers: ast shapes, captures, results, optionals, literals
@@ -195,14 +195,20 @@ mut ir_borrow_param_exported: Map[String, String] := {}
 # local names this module's own calls use, exported names other modules use.
 mut ir_storage_keepers_local: Map[String, Bool] := {}
 mut ir_storage_keepers_exported: Map[String, Bool] := {}
-# the functions that keep storage once atomic cell methods are allowed too
-# (a superset of the above). an atomic store can hand guarded storage to
-# another task as an unlock does, so a call to one of these still pins every
-# argument except a sync handle; see ir_pin_arg.
-mut ir_atomic_keepers_local: Map[String, Bool] := {}
-mut ir_atomic_keepers_exported: Map[String, Bool] := {}
-# set while ir_record_storage_keepers fills the atomic maps
-mut ir_keeper_pass_atomic := false
+# functions that would keep storage but for compare_sets that return at once
+# when they succeed (ir_is_cas_return), the shape of a lock-free retry loop.
+# a successful compare_set can release a lock the program built from the cell
+# and let another task replace what the caller read under it, but nothing in
+# the function runs after that, so its own arguments need no pin either.
+# another function calling one does run on afterwards, so these never count
+# as keepers inside a body (ir_subtree_keeps_storage).
+mut ir_cas_return_fns_local: Map[String, Bool] := {}
+mut ir_cas_return_fns_exported: Map[String, Bool] := {}
+# set while ir_record_storage_keepers fills the maps above
+mut ir_keeper_pass_cas := false
+# this module's `mut` globals. any task, or the callee itself, can replace the
+# value one holds, so an argument read from one is pinned (ir_arg_pin_kind).
+mut ir_mutable_global_names: Map[String, Bool] := {}
 
 # --- per-module state: type metadata and the helpers it calls for ---
 
@@ -452,6 +458,7 @@ fn ir_reset_global_state():
     ir_global_set_int_names = []
     ir_global_bool_names = []
     ir_global_slot_names = []
+    ir_mutable_global_names = {}
 
 # clear the per-module type registries: struct and enum shapes, impl
 # methods, declared returns and result kinds, generic declarations and
@@ -486,6 +493,7 @@ fn ir_reset_type_state():
     ir_module_aliases = {}
     ir_import_declared_functions = {}
     ir_import_declared_globals = {}
+    ir_import_mutable_global_symbols = {}
     ir_current_func_return_kind = ""
     ir_current_func_optional_inner_kind = ""
     ir_current_func_returns_result = false
@@ -2029,15 +2037,15 @@ fn ir_local_closure_arg_positions(node: Node, callee_name: String) -> List[Int]:
 # methods of generic types are left out, as in ir_record_borrow_params.
 fn ir_record_storage_keepers(root_idx: Int):
     ir_storage_keepers_local = {}
-    ir_atomic_keepers_local = {}
-    ir_keeper_pass_atomic = false
+    ir_cas_return_fns_local = {}
+    ir_keeper_pass_cas = false
     ir_record_keeper_passes(root_idx)
-    ir_keeper_pass_atomic = true
+    ir_keeper_pass_cas = true
     ir_record_keeper_passes(root_idx)
-    ir_keeper_pass_atomic = false
+    ir_keeper_pass_cas = false
 
 # one fixed-point walk over the module's functions, filling the maps the
-# current pass names.
+# current pass names
 fn ir_record_keeper_passes(root_idx: Int):
     saved_impl_type := ir_current_impl_type
     mut changed := true
@@ -2064,10 +2072,7 @@ fn ir_record_keeper_passes(root_idx: Int):
 # record one function when its body keeps storage and it is not recorded yet.
 # true when this call added it.
 fn ir_record_storage_keeper(decl_idx: Int, sym: String) -> Bool:
-    if ir_keeper_pass_atomic:
-        if ir_atomic_keepers_local.contains_key(sym):
-            return false
-    elif ir_storage_keepers_local.contains_key(sym):
+    if ir_storage_keepers_local.contains_key(sym) or ir_cas_return_fns_local.contains_key(sym):
         return false
     body_idx := ir_tuple_walk_fn_body(decl_idx)
     if body_idx < 0 or not ir_subtree_keeps_storage(body_idx, decl_idx, body_idx):
@@ -2075,10 +2080,10 @@ fn ir_record_storage_keeper(decl_idx: Int, sym: String) -> Bool:
     mut exported := ""
     if ir_current_module_path.len() > 0:
         exported = ir_import_target_name(ir_current_module_path, sym)
-    if ir_keeper_pass_atomic:
-        ir_atomic_keepers_local.insert(sym, true)
+    if ir_keeper_pass_cas:
+        ir_cas_return_fns_local.insert(sym, true)
         if exported.len() > 0:
-            ir_atomic_keepers_exported.insert(exported, true)
+            ir_cas_return_fns_exported.insert(exported, true)
     else:
         ir_storage_keepers_local.insert(sym, true)
         if exported.len() > 0:
@@ -2088,17 +2093,41 @@ fn ir_record_storage_keeper(decl_idx: Int, sym: String) -> Bool:
 fn ir_is_storage_keeper(name: String) -> Bool:
     return ir_storage_keepers_local.contains_key(name) or ir_storage_keepers_exported.contains_key(name)
 
-# a function that keeps storage apart from atomic cell methods. a call to one
-# pins its arguments except the sync handles.
-fn ir_is_atomic_keeper(name: String) -> Bool:
-    return ir_atomic_keepers_local.contains_key(name) or ir_atomic_keepers_exported.contains_key(name)
-
-# the keeper test ir_subtree_keeps_storage applies to a callee: the strict
-# one, or during the atomic pass either kind.
-fn ir_callee_keeps_storage(name: String) -> Bool:
+# whether a call to `name` can skip its argument pins: a storage keeper, or a
+# function whose only release returns at once (ir_cas_return_fns_local)
+fn ir_call_needs_no_pins(name: String) -> Bool:
     if ir_is_storage_keeper(name):
         return true
-    return ir_keeper_pass_atomic and ir_is_atomic_keeper(name)
+    return ir_cas_return_fns_local.contains_key(name) or ir_cas_return_fns_exported.contains_key(name)
+
+# `if cell.compare_set(a, b): return` with no elif or else, on an AtomicInt,
+# where the return carries nothing or a literal. the function ends the moment
+# the compare_set succeeds, so nothing it does can follow that release.
+fn ir_is_cas_return(node: Node) -> Bool:
+    if node.kind != "if" and node.kind != "if_stmt":
+        return false
+    for child in node.children:
+        ck := node_kind(child)
+        if ck == "elif" or ck == "else":
+            return false
+    branch := ir_collect_if_branch(node)
+    if branch.cond_idx < 0 or branch.body_idx < 0:
+        return false
+    cond := get_node(branch.cond_idx)
+    if cond.kind != "method_call" or ir_plain_method_name(cond.value) != "compare_set":
+        return false
+    recv_type := ir_infer_type(cond.children[0])
+    if recv_type != "AtomicInt" and recv_type != "opaque:AtomicInt":
+        return false
+    mut ret_idx := branch.body_idx
+    while (node_kind(ret_idx) == "then" or node_kind(ret_idx) == "block") and get_node(ret_idx).children.len() == 1:
+        ret_idx = get_node(ret_idx).children[0]
+    ret := get_node(ret_idx)
+    if ret.kind != "return":
+        return false
+    if ret.children.len() == 0:
+        return true
+    return ret.children.len() == 1 and ["int_lit", "bool_lit"].contains(node_kind(ret.children[0]))
 
 # the free builtins that touch no counted value and no other task. a byte
 # buffer holds raw bytes, so writing to one cannot release anything.
@@ -2125,6 +2154,16 @@ fn ir_subtree_keeps_storage(idx: Int, decl_idx: Int, body_idx: Int) -> Bool:
         return true
     if kind == "spawn" or kind == "await" or kind == "select":
         return false
+    if ir_keeper_pass_cas:
+        # a defer would run after the release a cas return makes
+        if kind == "defer":
+            return false
+        if ir_is_cas_return(node):
+            cond := get_node(ir_collect_if_branch(node).cond_idx)
+            for child in cond.children:
+                if not ir_subtree_keeps_storage(child, decl_idx, body_idx):
+                    return false
+            return true
     if kind == "assignment":
         target := get_node(node.children[0])
         if target.kind != "ident" or not ir_name_is_bound_in(target.value, decl_idx, body_idx):
@@ -2137,14 +2176,14 @@ fn ir_subtree_keeps_storage(idx: Int, decl_idx: Int, body_idx: Int) -> Bool:
         if callee.kind != "ident":
             return false
         if ir_is_declared_callable(callee.value):
-            if not ir_callee_keeps_storage(ir_resolve_static_callee(node.children[0]).name):
+            if not ir_is_storage_keeper(ir_resolve_static_callee(node.children[0]).name):
                 return false
         elif not ir_is_pure_builtin(callee.value):
             return false
     elif kind == "method_call":
         callee_sym := ir_tuple_method_call_symbol(idx, node)
         if callee_sym.len() > 0:
-            if not ir_callee_keeps_storage(callee_sym):
+            if not ir_is_storage_keeper(callee_sym):
                 return false
         elif not ir_method_keeps_storage(idx):
             return false
@@ -2171,13 +2210,13 @@ fn ir_method_keeps_storage(idx: Int) -> Bool:
         return ["len", "is_empty", "contains"].contains(name)
     if recv_type == "bytes":
         return ["len", "is_empty", "get", "slice"].contains(name)
-    # an atomic cell's methods hold no counted value and never wait, but a
-    # store or a compare_set can release a lock a program built from the cell,
-    # handing guarded storage to another task, as unlock, done and release do.
-    # so they count only in the atomic pass, whose keepers still pin every
-    # argument but a sync handle. the other sync methods never count.
-    if ir_keeper_pass_atomic and (recv_type == "AtomicInt" or recv_type == "opaque:AtomicInt"):
-        return ["load", "store", "compare_set"].contains(name)
+    # a load releases nothing and hands nothing to another task. a store or a
+    # compare_set can release a lock a program built from the cell, the way
+    # unlock, done and release do, and the other task can then replace the
+    # field, element or global the caller read an argument from, sync handles
+    # included. so those never count, and neither do the other sync methods.
+    if recv_type == "AtomicInt" or recv_type == "opaque:AtomicInt":
+        return name == "load"
     return false
 
 # true when `name` is a parameter of the function or bound inside its body,
@@ -3454,14 +3493,15 @@ fn ir_emit_call_arg(expr_idx: Int) -> Int:
 fn ir_arg_release_is_skipped(expr_idx: Int) -> Bool:
     return expr_idx >= 0 and c_argument_widens_to_optional(expr_idx)
 
-# a struct field or a container element read as an argument hands the callee
-# the owner's count and none of its own. that is enough for a builtin, but a
-# callee that runs user code can overwrite that field or evict that element,
-# directly or through a global, a capture or another argument, and the value
-# then dies under the parameter that still names it. so an argument like that
-# is pinned for the call: retained as soon as it is evaluated, and released
-# once the call returns. a local or a parameter needs no pin, since only this
-# frame can rebind it.
+# a struct field, a container element or a `mut` global read as an argument
+# hands the callee the owner's count and none of its own. that is enough for a
+# builtin, but a callee that runs user code can overwrite that field, evict
+# that element or reassign that global, directly or through another task it
+# lets run, and the value then dies under the parameter that still names it.
+# so an argument like that is pinned for the call: retained as soon as it is
+# evaluated, and released once the call returns. a local or a parameter needs
+# no pin, since only this frame can rebind it, and neither does a global that
+# is not `mut`.
 #
 # the rc kind to pin the argument at expr_idx as, or "" for none.
 fn ir_arg_pin_kind(expr_idx: Int) -> String:
@@ -3470,23 +3510,34 @@ fn ir_arg_pin_kind(expr_idx: Int) -> String:
     mut read_idx := expr_idx
     while node_kind(read_idx) == "grouped" and get_node(read_idx).children.len() > 0:
         read_idx = get_node(read_idx).children[0]
-    if node_kind(read_idx) != "field_access" and node_kind(read_idx) != "index":
+    read_kind := node_kind(read_idx)
+    if read_kind == "ident":
+        if not ir_reads_mutable_global(get_node(read_idx).value):
+            return ""
+    elif read_kind != "field_access" and read_kind != "index":
         return ""
     kind := ir_rc_kind(ir_infer_type(read_idx))
     if kind == "weak":
         return ""
     return kind
 
+# whether a bare name reads a `mut` global, this module's or an imported one,
+# rather than a local, a parameter or a loop variable of the same spelling.
+# the name resolves the way its load does (ir_resolve_storage_name).
+fn ir_reads_mutable_global(name: String) -> Bool:
+    if ir_loop_var_slot(name).len() > 0 or ir_name_is_func_local(name):
+        return false
+    sym := ir_resolve_storage_name(name)
+    if ir_import_mutable_global_symbols.contains_key(sym):
+        return true
+    return sym == ir_global_storage_symbol(name) and ir_mutable_global_names.contains_key(name)
+
 # pin the argument just evaluated into `reg` when pin is set and it needs it,
 # and record the kind (or "") so ir_unpin_args can release it after the call.
-fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String], pin: Bool, skip_sync: Bool):
+fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String], pin: Bool):
     mut kind := ""
     if pin:
         kind = ir_arg_pin_kind(expr_idx)
-    # an atomic keeper (ir_is_atomic_keeper) can hand storage to another task
-    # but cannot drop a sync handle, so only those go unpinned
-    if skip_sync and kind == "sync":
-        kind = ""
     if kind.len() > 0:
         ir_rc_retain_reg(reg, kind)
     pins.push(kind)
@@ -3547,19 +3598,23 @@ fn ir_unpin_args(regs: List[Int], pins: List[String]):
             ir_rc_release_reg(regs[i], kind)
 
 # true when calling the callee at callee_idx can run user code. a bare name
-# that is neither declared nor a variable holding a function is a builtin.
+# that is neither declared, nor imported, nor a variable holding a function
+# is a builtin. a name brought in with `from m import f` is declared under
+# its target's name, not the written one, so it is found through the renames.
 fn ir_callee_runs_user_code(callee_idx: Int) -> Bool:
     callee := get_node(callee_idx)
     if callee.kind != "ident":
         return true
     name := callee.value
+    if ir_import_renames.contains_key(name):
+        return true
     return ir_is_declared_callable(name) or ir_name_is_func_local(name) or ir_loop_var_slot(name).len() > 0 or ir_global_slot_names.contains(name)
 
 # local_fn_positions lists the arguments, counted from start_idx, that land in
 # a parameter the callee only calls (see ir_record_closure_params). with pin
 # set, arguments are pinned as above; an argument a later one can drop is
 # pinned either way. pins receives one entry per register.
-fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int], pin: Bool, skip_sync: Bool, pins: List[String]) -> List[Int]:
+fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int], pin: Bool, pins: List[String]) -> List[Int]:
     later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, start_idx))
     mut arg_regs: List[Int] := []
     for child, i in node.children:
@@ -3576,8 +3631,7 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List
             pins.push("")
         else:
             arg_r := ir_emit_call_arg(expr_idx)
-            later := later_drops[arg_regs.len()]
-            ir_pin_arg(expr_idx, arg_r, pins, pin or later, skip_sync and not later)
+            ir_pin_arg(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
             arg_regs.push(arg_r)
     return arg_regs
 
@@ -4594,7 +4648,7 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
 # the receiver's register first, then each argument's. with pin set (an impl
 # method, which is user code) the receiver and the arguments are pinned the
 # way ir_collect_call_arg_regs pins, one pins entry per register.
-fn ir_collect_method_call_regs(node: Node, pin: Bool, skip_sync: Bool, pins: List[String]) -> List[Int]:
+fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> List[Int]:
     later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, 0))
     mut regs: List[Int] := []
     for child, i in node.children:
@@ -4609,8 +4663,7 @@ fn ir_collect_method_call_regs(node: Node, pin: Bool, skip_sync: Bool, pins: Lis
             r = ir_expr(expr_idx)
         else:
             r = ir_emit_call_arg(expr_idx)
-        later := later_drops[regs.len()]
-        ir_pin_arg(expr_idx, r, pins, pin or later, skip_sync and not later)
+        ir_pin_arg(expr_idx, r, pins, pin or later_drops[regs.len()])
         regs.push(r)
     return regs
 
@@ -5670,7 +5723,7 @@ fn ir_emit_test_assert_eq(node: Node, arg_regs: List[Int], want_equal: Bool) -> 
 
 fn ir_emit_local_handle_decode_text_path_call(idx: Int, node: Node, callee_node: Node) -> Int:
     mut arg_pins: List[String] := []
-    arg_regs := ir_collect_call_arg_regs(node, 1, [], false, false, arg_pins)
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], false, arg_pins)
     if arg_regs.len() < 2:
         ir_unpin_args(arg_regs, arg_pins)
         return ir_zero_reg()
@@ -6152,7 +6205,7 @@ fn ir_emit_indirect_expr_call(idx: Int, node: Node, callee_idx: Int) -> Int:
     if callee_pin.len() > 0:
         ir_rc_retain_reg(callee_r, callee_pin)
     mut arg_pins: List[String] := []
-    arg_regs := ir_collect_call_arg_regs(node, 1, [], true, false, arg_pins)
+    arg_regs := ir_collect_call_arg_regs(node, 1, [], true, arg_pins)
     mut ret_kind := ir_function_return_kind(callee_idx)
     if ret_kind == "unknown":
         ret_kind = "int"
@@ -6283,8 +6336,8 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     is_generic_callee := ir_is_generic_function_name(callee.name)
     callee = ir_specialize_static_callee(idx, node, callee, explicit_generic_types)
     mut arg_pins: List[String] := []
-    pins_args := ir_callee_runs_user_code(node.children[0]) and not ir_is_storage_keeper(callee.name)
-    arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions, pins_args, ir_is_atomic_keeper(callee.name), arg_pins)
+    pins_args := ir_callee_runs_user_code(node.children[0]) and not ir_call_needs_no_pins(callee.name)
+    arg_regs := ir_collect_call_arg_regs(node, 1, local_fn_positions, pins_args, arg_pins)
     if is_generic_callee and local_fn_positions.len() > 0:
         callee = ResolvedCallee(ir_bind_fn_specialization(callee.name, ir_fn_arg_bindings(node, local_fn_positions, arg_regs)), callee.imported)
     if callee.name == "Channel":
@@ -8171,7 +8224,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
             mut no_explicit_types: List[String] := []
             call_name = ir_queue_generic_call(call_name, idx, no_explicit_types, generic_ret_type)
         mut arg_pins: List[String] := []
-        arg_regs := ir_collect_call_arg_regs(node, 1, [], not ir_is_storage_keeper(call_name), ir_is_atomic_keeper(call_name), arg_pins)
+        arg_regs := ir_collect_call_arg_regs(node, 1, [], not ir_call_needs_no_pins(call_name), arg_pins)
         mut r := ir_reg()
         uses_result_abi := ir_callee_uses_result_abi(ResolvedCallee(call_name, true), idx)
         ret_type := ir_call_retkind_for_name(idx, uses_result_abi, call_name)
@@ -8233,7 +8286,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 arg_idx := ir_method_call_arg_expr(node, ai)
                 arg_r := ir_emit_call_arg(arg_idx)
                 arg_regs.push(arg_r)
-                ir_pin_arg(arg_idx, arg_r, arg_pins, true, false)
+                ir_pin_arg(arg_idx, arg_r, arg_pins, true)
                 ai = ai + 1
             r := ir_reg()
             ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
@@ -8263,7 +8316,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             emit_name = ir_queue_generic_method_call(idx, node, impl_name)
 
     mut call_pins: List[String] := []
-    call_regs := ir_collect_method_call_regs(node, impl_dispatch and not ir_is_storage_keeper(impl_name), impl_dispatch and ir_is_atomic_keeper(impl_name), call_pins)
+    call_regs := ir_collect_method_call_regs(node, impl_dispatch and not ir_call_needs_no_pins(impl_name), call_pins)
     obj_r := call_regs[0]
     mut arg_regs: List[Int] := []
     mut ci := 0
@@ -12556,6 +12609,8 @@ fn ir_record_returns_clause(name: String, returns_node: Node):
 fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
     gname := ir_binding_name(node)
     ir_record_global_slot(gname)
+    if node.value.contains(" mut"):
+        ir_mutable_global_names.insert(gname, true)
     mut init_val := "0"
     mut global_type := ""
     mut global_map_value_type := ""
@@ -13345,6 +13400,7 @@ fn ir_collect_root_import_metadata(root_idx: Int):
     ir_import_renames = {}
     ir_import_declared_functions = {}
     ir_import_declared_globals = {}
+    ir_import_mutable_global_symbols = {}
     for root, i in ir_preloaded_import_roots:
         ir_collect_preloaded_root_metadata(root, ir_preloaded_import_paths[i])
 

@@ -98,6 +98,7 @@ generic_body_spec_limit := 64
 # is walked in that module's context.
 mut struct_instance_decl_idx: Map[Int, Int] := {}
 mut impl_method_modules: Map[Int, String] := {}
+mut signature_alias_tables: Map[String, Map[String, String]] := {}
 # per-module snapshots taken as each module is checked, so a generic body
 # one module declares can be walked during a later module's turn with the
 # declaring module's imports, file stamp and global names in force.
@@ -257,6 +258,7 @@ pub fn initialize_checker(file_path: String):
     generic_body_spec_counts = {}
     struct_instance_decl_idx = {}
     impl_method_modules = {}
+    signature_alias_tables = {}
     checker_module_roots = {}
     checker_module_files = {}
     checker_module_alias_lists = {}
@@ -5602,8 +5604,11 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             # `Box[String].map[String]` are two bodies.
             record_generic_call_subst(owner_and_method_type_args(dispatch_type, method_type_args))
             queue_function_specialization(get_method_declaration_index(key), dispatch_type, method_type_args)
+        # the types come from the signature's own module, not the caller's
+        signature_scope := enter_signature_scope(get_method_declaration_index(key))
         param_types := collect_function_param_types_with_subst(method_node, struct_params, struct_args)
         ret_type := collect_function_return_type_with_subst(method_node, struct_params, struct_args)
+        leave_signature_scope(signature_scope)
         # check arg count
         if arg_indices.len() != param_types.len():
             report_error("E207", method_name + " expects " + param_types.len().to_string() + " arguments, got " + arg_indices.len().to_string())
@@ -7633,6 +7638,7 @@ fn snapshot_module_context(root_idx: Int):
     for alias in module_aliases.keys():
         entries.push(alias + "=" + module_aliases[alias])
     checker_module_alias_lists.insert(current_checker_module_path, entries.join(chr(9)))
+    signature_alias_tables.remove(current_checker_module_path)
 
 # make `module_path` the module being checked — its scoped lookups, imports,
 # diagnostic file stamp and global names — from the snapshot taken when it
@@ -7661,6 +7667,44 @@ fn enter_module_context(module_path: String) -> String:
     if checker_module_roots.contains_key(module_path):
         collect_module_global_names(checker_module_roots[module_path])
     return prev
+
+# what enter_signature_scope replaced.
+struct SignatureScope:
+    module_path: String
+    aliases: Map[String, String]
+
+# the import aliases recorded for `module_path`, parsed once. a large program
+# resolves a method signature from another module many times over.
+fn signature_module_aliases(module_path: String) -> Map[String, String]:
+    if signature_alias_tables.contains_key(module_path):
+        return signature_alias_tables[module_path]
+    mut aliases: Map[String, String] := {}
+    if checker_module_alias_lists.contains_key(module_path):
+        for entry in checker_module_alias_lists[module_path].split(chr(9)):
+            pair := entry.split("=")
+            if pair.len() == 2:
+                aliases.insert(pair[0], pair[1])
+    signature_alias_tables.insert(module_path, aliases)
+    return aliases
+
+# resolve type names as the module that declared `decl_idx` wrote them, until
+# leave_signature_scope. a signature's bare `Config` means its own module's
+# Config; read from the caller's module it means whichever module registered that
+# name last. this swaps only what a type lookup reads, so it is cheap enough to
+# run per call, unlike enter_module_context.
+fn enter_signature_scope(decl_idx: Int) -> SignatureScope:
+    saved := SignatureScope(current_checker_module_path, module_aliases)
+    declared_in := declaration_module(decl_idx)
+    if declared_in.len() > 0 and declared_in != current_checker_module_path:
+        current_checker_module_path = declared_in
+        set_defining_module(declared_in)
+        module_aliases = signature_module_aliases(declared_in)
+    return saved
+
+fn leave_signature_scope(saved: SignatureScope):
+    current_checker_module_path = saved.module_path
+    set_defining_module(saved.module_path)
+    module_aliases = saved.aliases
 
 # " in first[Int]": the specialization a report inside a generic body was
 # found at.

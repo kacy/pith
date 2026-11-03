@@ -1,0 +1,22 @@
+# one half of a pair of modules that declare the same struct name. every method
+# signature here spells its types bare, and a helper type from another module.
+import clash_chain_c as other
+
+pub struct Options:
+    pub label: String
+
+pub fn make() -> Options:
+    return Options("a")
+
+impl Options:
+    fn with_label(label: String) -> Options:
+        return Options(label)
+
+    fn merged(with: Options) -> Options:
+        return Options(self.label + with.label)
+
+    fn tag() -> other.Tag:
+        return other.Tag(self.label)
+
+    fn only_on_a() -> String:
+        return "a:" + self.label

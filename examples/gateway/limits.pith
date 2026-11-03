@@ -1,0 +1,43 @@
+# limits.pith: a rate limit per token subject. the route-wide limit is
+# web.rate_limit from the standard library; this one needs a bucket per caller,
+# which comes from the subject auth.pith attached to the request.
+
+import std.net.http as http
+import std.resilience as resilience
+import std.web as web
+import auth
+
+# a caller can mint as many subjects as it can get tokens for, so the table is
+# bounded. dropping it refills every bucket, which forgives some callers for a
+# moment and costs nothing else.
+MAX_TRACKED_SUBJECTS := 100000
+
+pub struct SubjectLimits:
+    mu: Mutex
+    per_second: Int
+    burst: Int
+    mut buckets: Map[String, resilience.Limiter]
+
+pub fn subject_limits(per_second: Int, burst: Int) -> SubjectLimits:
+    empty: Map[String, resilience.Limiter] := {}
+    return SubjectLimits(Mutex(), per_second, burst, empty)
+
+impl SubjectLimits:
+    fn bucket(subject: String) -> resilience.Limiter:
+        self.mu.lock()
+        defer self.mu.unlock()
+        if self.buckets.contains_key(subject):
+            return self.buckets[subject]
+        if self.buckets.len() >= MAX_TRACKED_SUBJECTS:
+            self.buckets = {}
+        created := resilience.rate_limiter(self.per_second, self.burst)
+        self.buckets.insert(subject, created)
+        return created
+
+# answer 429 once the token's subject has spent its bucket. this has to run after
+# auth.require, which is what sets the subject.
+pub fn per_subject(limits: SubjectLimits) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
+    return fn(next: fn(web.Request) -> http.HttpResponse, req: web.Request):
+        if not limits.bucket(req.value(auth.SUBJECT_KEY)).allow():
+            return http.response(429).header("Retry-After", "1").text_body("rate limited")
+        return next(req)

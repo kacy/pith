@@ -1,0 +1,86 @@
+# upstream.pith: the backends behind a route, and which one takes the next
+# request.
+#
+# two independent signals can take an upstream out of rotation. the breaker
+# reacts to real traffic failing. the health check notices a backend that is
+# down before a request has to find out, and notices when it comes back.
+
+import std.net.http as http
+import std.metrics as metrics
+import std.resilience as resilience
+import std.shutdown as shutdown
+import std.time as time
+import config
+
+# how many failed checks in a row take an upstream out of rotation. one success
+# puts it back.
+UNHEALTHY_AFTER := 2
+
+# how long one health check may take.
+HEALTH_TIMEOUT_MS := 1000
+
+pub struct Upstream:
+    pub address: String
+    pub host: String
+    pub port: Int
+    pub breaker: resilience.Breaker
+    # 1 while the health check says this upstream is up.
+    pub healthy: AtomicInt
+
+pub struct Pool:
+    pub route: String
+    pub upstreams: List[Upstream]
+    next: AtomicInt
+
+pub fn new_pool(route: config.Route) -> Pool!:
+    mut upstreams: List[Upstream] := []
+    for address in route.upstreams:
+        parts := config.split_address(address)!
+        upstreams.push(Upstream(address, parts.0, parts.1, resilience.circuit_breaker(route.breaker_failures, route.breaker_reset_ms), AtomicInt(1)))
+    return Pool(route.name, upstreams, AtomicInt(0))
+
+impl Pool:
+    # the index of the upstream that takes the next attempt, or -1 when every
+    # one is excluded, unhealthy or behind an open breaker. `tried` marks the
+    # upstreams this request has already used.
+    #
+    # a true from allow() can be the breaker's half-open probe, which must
+    # report back, so the caller owes that upstream's breaker a result.
+    fn pick(tried: List[Bool]) -> Int:
+        n := self.upstreams.len()
+        # a lost compare_set means another task advanced the counter, which is
+        # all this needs, so there is no retry.
+        start := self.next.load()
+        self.next.compare_set(start, start + 1)
+        for i in 0..n:
+            index := (start + i) % n
+            if tried[index]:
+                continue
+            candidate := self.upstreams[index]
+            if candidate.healthy.load() == 1 and candidate.breaker.allow():
+                return index
+        return -1
+
+fn check_once(client: http.Client, target: Upstream, path: String) -> Bool:
+    probe := http.request("GET", target.host, target.port, path).with_timeout(HEALTH_TIMEOUT_MS)
+    response := client.send(probe)
+    return response.is_ok and response.ok.status < 500
+
+# probe one upstream until a shutdown begins.
+pub fn health_loop(pool: Pool, target: Upstream, path: String, interval_ms: Int) -> Int:
+    client := http.client().with_keep_alives(false).with_max_redirects(0)
+    gauge := metrics.gauge("gateway_upstream_healthy").labels(["route", pool.route, "upstream", target.address])
+    gauge.set(1.0)
+    mut failures := 0
+    while not shutdown.requested():
+        if check_once(client, target, path):
+            failures = 0
+            target.healthy.store(1)
+            gauge.set(1.0)
+        else:
+            failures = failures + 1
+            if failures >= UNHEALTHY_AFTER:
+                target.healthy.store(0)
+                gauge.set(0.0)
+        time.delay(interval_ms)
+    return 0

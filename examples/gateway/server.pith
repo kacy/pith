@@ -1,0 +1,65 @@
+# server.pith: turn a config into a running gateway.
+
+import std.net.http as http
+import std.resilience as resilience
+import std.web as web
+import auth
+import config
+import limits
+import proxy
+import upstream
+
+METHODS := ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+
+# what an upstream connection pool may keep, and how long to wait to connect.
+IDLE_CONN_TIMEOUT_MS := 30000
+DIAL_TIMEOUT_MS := 1000
+
+fn upstream_client(settings: config.Server) -> http.Client:
+    # a proxy relays what the backend said, so it follows no redirects and leaves
+    # compression to the two ends.
+    return http.client().with_max_idle_conns_per_host(settings.max_idle_upstream_conns).with_idle_conn_timeout(IDLE_CONN_TIMEOUT_MS).with_dial_timeout(DIAL_TIMEOUT_MS).with_max_redirects(0).with_compression(false)
+
+fn route_pattern(prefix: String) -> String:
+    if prefix.ends_with("/"):
+        return prefix + "*rest"
+    return prefix + "/*rest"
+
+# spawn takes a call to a function in this module.
+fn watch_upstream(pool: upstream.Pool, target: upstream.Upstream, route: config.Route) -> Int:
+    return upstream.health_loop(pool, target, route.health_path, route.health_interval_ms)
+
+# an app with every configured route on it, plus the health checks those routes
+# asked for, already running. /healthz and /metrics come from web.new().
+pub fn build(cfg: config.Config) -> web.App!:
+    client := upstream_client(cfg.server)
+    mut app := web.new().with_config(web.server_config().with_max_body_bytes(cfg.server.max_body_bytes))
+    check := auth.verifier(cfg.auth)
+    for route in cfg.routes:
+        pool := upstream.new_pool(route)!
+        forwarder := proxy.forwarder(route, pool, client)
+        handler := fn(req: web.Request) => forwarder.forward(req)
+        pattern := route_pattern(route.prefix)
+        for method in METHODS:
+            app = app.handle(method, pattern, handler)
+        if route.rate_per_second > 0:
+            app = app.group(route.prefix, web.rate_limit(resilience.rate_limiter(route.rate_per_second, route.rate_burst)))
+        if route.auth:
+            app = app.group(route.prefix, auth.require(check))
+            if route.subject_rate_per_second > 0:
+                app = app.group(route.prefix, limits.per_subject(limits.subject_limits(route.subject_rate_per_second, route.subject_rate_burst)))
+        if route.health_path != "":
+            for target in pool.upstreams:
+                spawn watch_upstream(pool, target, route)
+    return app
+
+# serve until a shutdown drains the listener, over tls when a certificate is set.
+pub fn listen(cfg: config.Config, app: web.App) -> Int!:
+    if cfg.server.tls_cert != "":
+        return app.listen_tls(cfg.server.host, cfg.server.port, cfg.server.tls_cert, cfg.server.tls_key)!
+    return app.listen(cfg.server.host, cfg.server.port)!
+
+# parse a config's text, build the app and serve it.
+pub fn run(toml_text: String) -> Int!:
+    cfg := config.parse(toml_text)!
+    return listen(cfg, build(cfg)!)!

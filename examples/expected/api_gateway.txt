@@ -1,0 +1,64 @@
+=== round robin, with the route's prefix stripped ===
+200 blue saw GET /7?fields=name via 127.0.0.1:20310 (hop header: none)
+200 green saw GET /8 via 127.0.0.1:20310 (hop header: none)
+200 blue saw GET / via 127.0.0.1:20310 (hop header: none)
+
+=== what crosses the gateway ===
+200 green saw GET /1 via 127.0.0.1:20310 (hop header: none)
+200 blue saw GET /2 via 127.0.0.1:20310 (hop header: kept)
+set-cookie: backend=green, seen=yes
+x-backend header survives: true
+
+=== a path that means something else once decoded ===
+301 to /api/admin
+400 bad path
+
+=== bearer tokens checked at the edge ===
+401 unauthorized
+401 unauthorized
+401 unauthorized
+200 blue saw GET /account/me as ada via 127.0.0.1:20310 (hop header: none)
+
+=== a rate limit per subject ===
+200 blue saw GET /account/me as ada via 127.0.0.1:20310 (hop header: none)
+429 rate limited
+200 blue saw GET /account/me as grace via 127.0.0.1:20310 (hop header: none)
+
+=== a rate limit per route ===
+200 blue saw GET /limited via 127.0.0.1:20310 (hop header: none)
+200 blue saw GET /limited via 127.0.0.1:20310 (hop header: none)
+429 rate limited
+
+=== a request that is safe to repeat moves on ===
+200 green saw GET /failover/a via 127.0.0.1:20310 (hop header: none)
+200 green saw GET /failover/b via 127.0.0.1:20310 (hop header: none)
+200 green saw GET /failover/c via 127.0.0.1:20310 (hop header: none)
+
+=== a request that is not safe to repeat does not ===
+503 broken
+
+=== a breaker stops the traffic ===
+503 broken
+503 no upstream available
+503 no upstream available
+backend hits while open: 0
+
+=== an upstream that takes too long ===
+504 upstream timed out
+
+=== a health check takes a backend out, and puts it back ===
+200 canary
+taken out: true
+503 no upstream available
+put back: true
+
+=== and the gateway reports on all of it ===
+200 ok
+gateway_retries_total{route="failover"} 6
+gateway_upstream_healthy{route="canary",upstream="127.0.0.1:20316"} 1
+gateway_upstream_requests_total{outcome="failed",route="breaker",upstream="127.0.0.1:20313"} 2
+
+=== a shutdown lets the request in flight finish ===
+200 too late
+gateway finished with unfinished work: 0
+new connection refused: true

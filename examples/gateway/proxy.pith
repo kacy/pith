@@ -1,0 +1,172 @@
+# proxy.pith: forward one request to an upstream and relay the answer.
+#
+# bodies are buffered in both directions, capped by max_body_bytes. that keeps a
+# retry simple, since the body is still in hand, and suits json apis. it does not
+# suit large uploads or server-sent events.
+
+import std.metrics as metrics
+import std.net.http as http
+import std.net.url as url
+import std.time as time
+import std.web as web
+import auth
+import config
+import upstream
+
+# headers that describe one connection rather than the message (rfc 9110 7.6.1),
+# plus the ones the client recomputes for the outbound request.
+fn is_hop_by_hop(lower: String) -> Bool:
+    return lower == "connection" or lower == "keep-alive" or lower == "proxy-authenticate" or lower == "proxy-authorization" or lower == "proxy-connection" or lower == "te" or lower == "trailer" or lower == "transfer-encoding" or lower == "upgrade"
+
+# the extra hop-by-hop fields a Connection header names.
+fn connection_tokens(value: String) -> List[String]:
+    mut out: List[String] := []
+    for token in value.split(","):
+        out.push(token.trim().to_lower())
+    return out
+
+# headers a client may not choose: only the gateway sets these for an upstream.
+fn is_gateway_owned(lower: String) -> Bool:
+    return lower == auth.SUBJECT_HEADER.to_lower() or lower == "x-forwarded-for" or lower == "x-forwarded-host" or lower == "x-forwarded-proto"
+
+# a path a backend could split differently than the router did: an encoded slash
+# or backslash in a segment. `/public/a%2f..%2f..%2fadmin` is one segment under a
+# public route here, and /admin to a backend that decodes before it routes, which
+# would walk around that route's auth. encoded dot segments never get this far:
+# std.web redirects them to the clean path, which the router then matches again.
+fn path_is_ambiguous(path: String) -> Bool:
+    if not path.contains("%"):
+        return false
+    decoded := url.decode_path(path)
+    return decoded.split("/").len() != path.split("/").len() or decoded.contains("\\")
+
+# the path sent upstream: the raw path with the route's prefix segments dropped
+# when the route asks for that. it counts segments because the router matched by
+# segment, and `/%61pi` reaches a route under `/api`.
+fn upstream_path(path: String, query: String, skip_segments: Int) -> String:
+    mut target := path
+    if skip_segments > 0:
+        parts := path.split("/")
+        target = ""
+        mut i := skip_segments
+        while i < parts.len():
+            target = target + "/" + parts[i]
+            i = i + 1
+        if target == "" or path.ends_with("/"):
+            target = target + "/"
+    if query != "":
+        return target + "?" + query
+    return target
+
+fn count_segments(prefix: String) -> Int:
+    mut count := 0
+    for part in prefix.split("/"):
+        if part != "":
+            count = count + 1
+    return count
+
+fn outbound_headers(req: web.Request) -> Map[String, String]:
+    fields := req.raw.header_fields()
+    mut named: List[String] := []
+    if fields.contains_key("connection"):
+        named = connection_tokens(fields["connection"])
+    mut out: Map[String, String] := {}
+    for name in fields:
+        if is_hop_by_hop(name) or is_gateway_owned(name) or named.contains(name):
+            continue
+        if name == "host" or name == "content-length" or name.starts_with(":"):
+            continue
+        out.insert(name, fields[name])
+    if fields.contains_key("host"):
+        out.insert("x-forwarded-host", fields["host"])
+    subject := req.value(auth.SUBJECT_KEY)
+    if subject != "":
+        out.insert(auth.SUBJECT_HEADER, subject)
+    return out
+
+fn relay(answer: http.HttpResponse) -> http.HttpResponse:
+    mut named: List[String] := []
+    connection := answer.header_value("Connection")
+    if connection != "":
+        named = connection_tokens(connection)
+    mut headers: Map[String, String] := {}
+    for name in answer.headers:
+        lower := name.to_lower()
+        if not is_hop_by_hop(lower) and not named.contains(lower) and lower != "content-length":
+            headers.insert(name, answer.headers[name])
+    no_trailers: Map[String, String] := {}
+    return http.HttpResponse(answer.status, answer.content_type, headers, answer.body, answer.set_cookie_headers, no_trailers)
+
+fn can_repeat(method: String) -> Bool:
+    return method == "GET" or method == "HEAD" or method == "OPTIONS" or method == "PUT" or method == "DELETE"
+
+# an answer that says this upstream could not do the work, rather than that the
+# request was wrong.
+fn upstream_failed(status: Int) -> Bool:
+    return status == 502 or status == 503 or status == 504
+
+fn failure_response(error: String) -> http.HttpResponse:
+    if error.to_lower().contains("timeout") or error.to_lower().contains("timed out"):
+        return http.response(504).text_body("upstream timed out")
+    return http.response(502).text_body("bad gateway")
+
+pub struct Forwarder:
+    route: config.Route
+    pool: upstream.Pool
+    client: http.Client
+    skip_segments: Int
+
+pub fn forwarder(route: config.Route, pool: upstream.Pool, client: http.Client) -> Forwarder:
+    mut skip := 0
+    if route.strip_prefix:
+        skip = count_segments(route.prefix)
+    return Forwarder(route, pool, client, skip)
+
+fn record(route: String, address: String, outcome: String, started: Int):
+    metrics.counter("gateway_upstream_requests_total").labels(["route", route, "upstream", address, "outcome", outcome]).inc()
+    metrics.histogram("gateway_upstream_duration_ms").labels(["route", route, "upstream", address]).observe((time.mono_millis() - started).to_float())
+
+impl Forwarder:
+    # try upstreams in turn: as many as the route's retries allow for a method
+    # that is safe to repeat, and one for any other method.
+    fn forward(req: web.Request) -> http.HttpResponse:
+        raw_path := req.raw.path() catch "/"
+        if path_is_ambiguous(raw_path):
+            return http.response(400).text_body("bad path")
+        method := req.method()
+        target := upstream_path(raw_path, req.raw.query() catch "", self.skip_segments)
+        headers := outbound_headers(req)
+        n := self.pool.upstreams.len()
+        mut tried: List[Bool] := []
+        for i in 0..n:
+            tried.push(false)
+        mut attempts := 1
+        if can_repeat(method):
+            attempts = self.route.retries + 1
+        mut last := http.response(503).text_body("no upstream available")
+        mut attempt := 0
+        while attempt < attempts:
+            index := self.pool.pick(tried)
+            if index < 0:
+                break
+            tried[index] = true
+            chosen := self.pool.upstreams[index]
+            if attempt > 0:
+                metrics.counter("gateway_retries_total").labels(["route", self.route.name]).inc()
+            started := time.mono_millis()
+            outbound := http.ClientRequest(method, chosen.host, chosen.port, target, headers, req.raw.body, false, self.route.timeout_ms, 0, 0)
+            answer := self.client.send(outbound)
+            if answer.is_err:
+                chosen.breaker.failure()
+                record(self.route.name, chosen.address, "error", started)
+                last = failure_response(answer.err)
+            elif upstream_failed(answer.ok.status):
+                chosen.breaker.failure()
+                record(self.route.name, chosen.address, "failed", started)
+                last = relay(answer.ok)
+            else:
+                chosen.breaker.success()
+                record(self.route.name, chosen.address, "ok", started)
+                return relay(answer.ok)
+            attempt = attempt + 1
+        return last

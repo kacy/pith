@@ -494,10 +494,47 @@ fn ensure_table_path(root: Int, path: String) -> Int:
             if found < 0:
                 found = allocate_node("table")
                 set_table_property(current, key, found)
+            # a path through an array of tables means its latest table
+            if node_kind(found) == "array" and array_item_counts[found] > 0:
+                found = array_values_by_slot[array_slot_key(found, array_item_counts[found] - 1)]
             current = found
             start = i + 1
         i = i + 1
     return current
+
+# open the next table of the array of tables at `path`, for a `[[path]]` header,
+# creating the array on the first one. a key that already holds anything else
+# fails the parse.
+fn append_table_at_path(root: Int, path: String) -> Int:
+    mut parent := root
+    mut key := path
+    dot := path.last_index_of(".")
+    if dot >= 0:
+        parent = ensure_table_path(root, path.substring(0, dot))
+        if parser_error:
+            return 0 - 1
+        key = path.substring(dot + 1, path.len())
+    if key == "":
+        parser_error = true
+        return 0 - 1
+    mut array := table_key_index.get_default(table_index_key(parent, key), 0 - 1)
+    if array < 0:
+        array = allocate_node("array")
+        set_table_property(parent, key, array)
+    elif node_kind(array) != "array" or not array_holds_only_tables(array):
+        parser_error = true
+        return 0 - 1
+    table := allocate_node("table")
+    push_array_element(array, table)
+    return table
+
+fn array_holds_only_tables(array: Int) -> Bool:
+    mut i := 0
+    while i < array_item_counts[array]:
+        if node_kind(array_values_by_slot[array_slot_key(array, i)]) != "table":
+            return false
+        i = i + 1
+    return true
 
 # ===============================================================
 # Public API — Parsing
@@ -531,6 +568,9 @@ fn toml_parse(input: String) -> Int:
         # table header [name]
         if c == "[":
             parser_position = parser_position + 1
+            is_array := parser_position < parser_input.len() and get_char_at(parser_position) == "["
+            if is_array:
+                parser_position = parser_position + 1
             skip_whitespace()
             start := parser_position
             while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
@@ -538,7 +578,13 @@ fn toml_parse(input: String) -> Int:
             section := parser_input.substring(start, parser_position)
             if parser_position < parser_input.len():
                 parser_position = parser_position + 1
-            current_table = ensure_table_path(root, section)
+            if is_array:
+                if parser_position >= parser_input.len() or get_char_at(parser_position) != "]":
+                    return 0 - 1
+                parser_position = parser_position + 1
+                current_table = append_table_at_path(root, section)
+            else:
+                current_table = ensure_table_path(root, section)
             if parser_error:
                 return 0 - 1
             skip_line()
@@ -985,6 +1031,14 @@ fn toml_array_get(handle: Int, index: Int) -> Int:
         return 0 - 1
     return array_values_by_slot[array_slot_key(handle, index)]
 
+# Gets a string element of an array by index. Returns an empty string when the
+# index is out of bounds or the element is not a string.
+pub fn array_string(handle: Int, index: Int) -> String:
+    node := toml_array_get(handle, index)
+    if node_kind(node) == "string":
+        return string_values[node]
+    return ""
+
 # ===============================================================
 # Public API — Table Introspection
 # ===============================================================
@@ -1079,6 +1133,39 @@ test "toml keeps sibling tables and nested arrays addressable regardless of orde
     assert(type_of(second) == "array")
     assert(array_len(first) == 2)
     assert(array_len(second) == 2)
+
+test "toml reads arrays of tables":
+    scope := open_scope()
+    defer close_scope(scope)
+    root := parse("title = \"x\"\n[[route]]\nname = \"a\"\nhosts = [\"h1\", \"h2\"]\n[route.limits]\nmax = 5\n[[route]]\nname = \"b\"\n[server]\nport = 1\n")
+    routes := get_array(root, "route")
+    assert_eq(array_len(routes), 2)
+    first := array_get(routes, 0)
+    assert_eq(get_string(first, "name"), "a")
+    assert_eq(array_string(get_array(first, "hosts"), 1), "h2")
+    assert_eq(array_string(get_array(first, "hosts"), 2), "")
+    assert_eq(get_int(get_table(first, "limits"), "max"), 5)
+    assert_eq(get_string(array_get(routes, 1), "name"), "b")
+    assert_eq(get_int(get_table(root, "server"), "port"), 1)
+
+test "toml reads a nested array of tables":
+    scope := open_scope()
+    defer close_scope(scope)
+    root := parse("[[a]]\nn = 1\n[[a.b]]\nm = 2\n[[a.b]]\nm = 3\n[[a]]\nn = 4\n[[a.b]]\nm = 5\n")
+    outer := get_array(root, "a")
+    assert_eq(array_len(outer), 2)
+    assert_eq(array_len(get_array(array_get(outer, 0), "b")), 2)
+    assert_eq(get_int(array_get(get_array(array_get(outer, 1), "b"), 0), "m"), 5)
+
+test "toml refuses a malformed or conflicting array of tables header":
+    scope := open_scope()
+    defer close_scope(scope)
+    assert_eq(parse("[[a]\nx = 1\n"), 0 - 1)
+    assert_eq(parse("[[]]\n"), 0 - 1)
+    assert_eq(parse("[[a.]]\n"), 0 - 1)
+    assert_eq(parse("a = 1\n[[a]]\n"), 0 - 1)
+    assert_eq(parse("a = [1]\n[[a]]\n"), 0 - 1)
+    assert_eq(parse("[a]\n[[a]]\n"), 0 - 1)
 
 test "toml parses scalar values":
     doc := "title = " + chr(34) + "pith" + chr(34) + chr(10) + "version = 3" + chr(10) + "pi = 3.14" + chr(10) + "enabled = true"

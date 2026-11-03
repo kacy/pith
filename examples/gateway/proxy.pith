@@ -65,7 +65,7 @@ fn count_segments(prefix: String) -> Int:
             count = count + 1
     return count
 
-fn outbound_headers(req: web.Request) -> Map[String, String]:
+fn outbound_headers(req: web.Request, scheme: String) -> Map[String, String]:
     fields := req.raw.header_fields()
     mut named: List[String] := []
     if fields.contains_key("connection"):
@@ -79,6 +79,7 @@ fn outbound_headers(req: web.Request) -> Map[String, String]:
         out.insert(name, fields[name])
     if fields.contains_key("host"):
         out.insert("x-forwarded-host", fields["host"])
+    out.insert("x-forwarded-proto", scheme)
     subject := req.value(auth.SUBJECT_KEY)
     if subject != "":
         out.insert(auth.SUBJECT_HEADER, subject)
@@ -92,7 +93,8 @@ fn relay(answer: http.HttpResponse) -> http.HttpResponse:
     mut headers: Map[String, String] := {}
     for name in answer.headers:
         lower := name.to_lower()
-        if not is_hop_by_hop(lower) and not named.contains(lower) and lower != "content-length":
+        # the cookies travel in set_cookie_headers, and the map repeats the last
+        if not is_hop_by_hop(lower) and not named.contains(lower) and lower != "content-length" and lower != "set-cookie":
             headers.insert(name, answer.headers[name])
     no_trailers: Map[String, String] := {}
     return http.HttpResponse(answer.status, answer.content_type, headers, answer.body, answer.set_cookie_headers, no_trailers)
@@ -115,12 +117,13 @@ pub struct Forwarder:
     pool: upstream.Pool
     client: http.Client
     skip_segments: Int
+    scheme: String
 
-pub fn forwarder(route: config.Route, pool: upstream.Pool, client: http.Client) -> Forwarder:
+pub fn forwarder(route: config.Route, pool: upstream.Pool, client: http.Client, scheme: String) -> Forwarder:
     mut skip := 0
     if route.strip_prefix:
         skip = count_segments(route.prefix)
-    return Forwarder(route, pool, client, skip)
+    return Forwarder(route, pool, client, skip, scheme)
 
 fn record(route: String, address: String, outcome: String, started: Int):
     metrics.counter("gateway_upstream_requests_total").labels(["route", route, "upstream", address, "outcome", outcome]).inc()
@@ -135,7 +138,7 @@ impl Forwarder:
             return http.response(400).text_body("bad path")
         method := req.method()
         target := upstream_path(raw_path, req.raw.query() catch "", self.skip_segments)
-        headers := outbound_headers(req)
+        headers := outbound_headers(req, self.scheme)
         n := self.pool.upstreams.len()
         mut tried: List[Bool] := []
         for i in 0..n:

@@ -1,0 +1,42 @@
+# demo_identity.pith: a stand-in identity provider for the walkthroughs. it
+# publishes a throwaway key set and signs tokens with the private half, the same
+# pair as examples/jwks_verify.pith. a real deployment points [auth] at its
+# issuer and has none of this.
+
+import std.bytes as bytes
+import std.crypto.jwt as jwt
+import std.encoding as encoding
+import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
+
+pub ISSUER := "example-idp"
+pub AUDIENCE := "gateway"
+
+IDP_PKCS8 := "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104208e96c2e4d3733a315a6874630d2557dbd59d7c555f22329202ba6721e5cf14c7a14403420004c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
+IDP_PUBLIC := "04c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
+
+fn key_set() -> String:
+    point := encoding.from_hex(IDP_PUBLIC) catch bytes.empty()
+    x := encoding.b64_url_raw_encode(point.slice(1, 33))
+    y := encoding.b64_url_raw_encode(point.slice(33, 65))
+    return "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"use\":\"sig\",\"kid\":\"idp\",\"x\":\"" + x + "\",\"y\":\"" + y + "\"}}]}}"
+
+# publish the key set at /keys.
+pub fn serve(port: Int) -> Int:
+    return web.bare().get("/keys", fn(req: web.Request) => http.json(200, key_set())).listen("127.0.0.1", port) catch 0
+
+pub fn token_for(subject: String, audience: String) -> String!:
+    return jwt.claims().issuer(ISSUER).audience(audience).subject(subject).expires_in(3600).sign_es256(encoding.from_hex(IDP_PKCS8)!)!
+
+# connect until the accept loop answers, rather than sleeping a guess.
+pub fn wait_for_port(port: Int) -> Bool:
+    mut tries := 0
+    while tries < 500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        sleep(10)
+        tries = tries + 1
+    return false

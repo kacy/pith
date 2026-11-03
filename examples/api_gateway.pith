@@ -7,12 +7,11 @@
 # Run:  pith run examples/api_gateway.pith
 
 import std.bytes as bytes
-import std.crypto.jwt as jwt
-import std.encoding as encoding
 import std.net.http as http
 import std.net.tcp as tcp
 import std.shutdown as shutdown
 import std.web as web
+import gateway.demo_identity as identity
 import gateway.server as server
 
 GATEWAY_PORT := 20310
@@ -24,14 +23,6 @@ IDENTITY_PORT := 20315
 CANARY_PORT := 20316
 # nothing listens here.
 DEAD_PORT := 20319
-
-ISSUER := "example-idp"
-AUDIENCE := "gateway"
-
-# the identity provider's signing key, the same throwaway pair as
-# examples/jwks_verify.pith. the private half stays with the issuer.
-IDP_PKCS8 := "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104208e96c2e4d3733a315a6874630d2557dbd59d7c555f22329202ba6721e5cf14c7a14403420004c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
-IDP_PUBLIC := "04c9cf1aff5814fc4bcc3a568fc9f653af15f167e93a62fbd94d48049bd96888f3a72f24f2be3d64c6055e73547e6d12e1e3f272c7edbad6ce19b5d79271de3dbe"
 
 # how many requests reached the broken backend.
 broken_hits := AtomicInt(0)
@@ -88,17 +79,8 @@ fn answer_health(req: web.Request) -> http.HttpResponse:
 fn serve_canary() -> Int:
     return web.bare().get("/health", answer_health).get("/*rest", fn(req: web.Request) => http.text(200, "canary")).listen("127.0.0.1", CANARY_PORT) catch 0
 
-fn key_set() -> String:
-    point := encoding.from_hex(IDP_PUBLIC) catch bytes.empty()
-    x := encoding.b64_url_raw_encode(point.slice(1, 33))
-    y := encoding.b64_url_raw_encode(point.slice(33, 65))
-    return "{{\"keys\":[{{\"kty\":\"EC\",\"crv\":\"P-256\",\"use\":\"sig\",\"kid\":\"idp\",\"x\":\"" + x + "\",\"y\":\"" + y + "\"}}]}}"
-
 fn serve_identity() -> Int:
-    return web.bare().get("/keys", fn(req: web.Request) => http.json(200, key_set())).listen("127.0.0.1", IDENTITY_PORT) catch 0
-
-fn token_for(subject: String, audience: String) -> String!:
-    return jwt.claims().issuer(ISSUER).audience(audience).subject(subject).expires_in(3600).sign_es256(encoding.from_hex(IDP_PKCS8)!)!
+    return identity.serve(IDENTITY_PORT)
 
 fn address(port: Int) -> String:
     return "\"127.0.0.1:" + port.to_string() + "\""
@@ -113,8 +95,8 @@ fn gateway_config() -> String:
         "port = " + GATEWAY_PORT.to_string(),
         "[auth]",
         "jwks_url = \"http://127.0.0.1:" + IDENTITY_PORT.to_string() + "/keys\"",
-        "issuer = \"" + ISSUER + "\"",
-        "audience = \"" + AUDIENCE + "\"",
+        "issuer = \"" + identity.ISSUER + "\"",
+        "audience = \"" + identity.AUDIENCE + "\"",
         "[[route]]",
         "name = \"users\"",
         "prefix = \"/api/users\"",
@@ -164,17 +146,6 @@ fn gateway_config() -> String:
         "health_interval_ms = 20",
         "upstreams = [" + address(CANARY_PORT) + "]"
     ].join("\n")
-
-fn wait_for_port(port: Int) -> Bool:
-    mut tries := 0
-    while tries < 500:
-        probe := tcp.connect("127.0.0.1", port)
-        if probe.is_ok:
-            tcp.close(probe.ok)
-            return true
-        sleep(10)
-        tries = tries + 1
-    return false
 
 fn serve_gateway(toml_text: String) -> Int:
     result := server.run(toml_text)
@@ -233,10 +204,10 @@ fn main() -> Int!:
     spawn serve_identity()
     spawn serve_canary()
     for port in [BLUE_PORT, GREEN_PORT, BROKEN_PORT, SLOW_PORT, IDENTITY_PORT, CANARY_PORT]:
-        wait_for_port(port)
+        identity.wait_for_port(port)
 
     gateway_done := spawn serve_gateway(gateway_config())
-    wait_for_port(GATEWAY_PORT)
+    identity.wait_for_port(GATEWAY_PORT)
 
     print("=== round robin, with the route's prefix stripped ===")
     print(get("/api/users/7?fields=name"))
@@ -261,15 +232,15 @@ fn main() -> Int!:
     print("=== bearer tokens checked at the edge ===")
     print(get("/account/me"))
     print(with_token("/account/me", "not-a-token"))
-    print(with_token("/account/me", token_for("someone", "billing")!))
-    ada := token_for("ada", AUDIENCE)!
+    print(with_token("/account/me", identity.token_for("someone", "billing")!))
+    ada := identity.token_for("ada", identity.AUDIENCE)!
     print(with_token("/account/me", ada))
 
     print("")
     print("=== a rate limit per subject ===")
     print(with_token("/account/me", ada))
     print(with_token("/account/me", ada))
-    print(with_token("/account/me", token_for("grace", AUDIENCE)!))
+    print(with_token("/account/me", identity.token_for("grace", identity.AUDIENCE)!))
 
     print("")
     print("=== a rate limit per route ===")

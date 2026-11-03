@@ -1,10 +1,13 @@
 # server.pith: turn a config into a running gateway.
 
+import std.net.grpc as grpc
 import std.net.http as http
 import std.resilience as resilience
+import std.log as log
 import std.web as web
 import auth
 import config
+import grpc_proxy
 import limits
 import proxy
 import upstream
@@ -35,9 +38,12 @@ pub fn build(cfg: config.Config) -> web.App!:
     client := upstream_client(cfg.server)
     mut app := web.new().with_config(web.server_config().with_max_body_bytes(cfg.server.max_body_bytes))
     check := auth.verifier(cfg.auth)
+    mut scheme := "http"
+    if cfg.server.tls_cert != "":
+        scheme = "https"
     for route in cfg.routes:
         pool := upstream.new_pool(route)!
-        forwarder := proxy.forwarder(route, pool, client)
+        forwarder := proxy.forwarder(route, pool, client, scheme)
         handler := fn(req: web.Request) => forwarder.forward(req)
         pattern := route_pattern(route.prefix)
         for method in METHODS:
@@ -53,11 +59,32 @@ pub fn build(cfg: config.Config) -> web.App!:
                 spawn watch_upstream(pool, target, route)
     return app
 
-# serve until a shutdown drains the listener, over tls when a certificate is set.
-pub fn listen(cfg: config.Config, app: web.App) -> Int!:
+fn run_grpc_listener(cfg: config.Config, dispatch: fn(String, grpc.GrpcStream) -> Int!grpc.GrpcError) -> Int!:
+    if cfg.server.tls_cert != "":
+        return grpc.serve_stream_tls(cfg.server.host, cfg.server.grpc_port, cfg.server.tls_cert, cfg.server.tls_key, dispatch)!
+    return grpc.serve_stream(cfg.server.host, cfg.server.grpc_port, dispatch)!
+
+fn serve_grpc(cfg: config.Config, forwarder: grpc_proxy.Proxy) -> Int:
+    result := run_grpc_listener(cfg, fn(method: String, call: grpc.GrpcStream) => forwarder.forward(method, call))
+    if result.is_err:
+        log.root().target("gateway").error().str("error", result.err).msg("grpc listener failed")
+        return 1
+    return result.ok
+
+fn serve_http(cfg: config.Config, app: web.App) -> Int!:
     if cfg.server.tls_cert != "":
         return app.listen_tls(cfg.server.host, cfg.server.port, cfg.server.tls_cert, cfg.server.tls_key)!
     return app.listen(cfg.server.host, cfg.server.port)!
+
+# serve until a shutdown drains the listeners, over tls when a certificate is
+# set. the answer is how much work was unfinished when the drain ended.
+pub fn listen(cfg: config.Config, app: web.App) -> Int!:
+    if cfg.server.grpc_port == 0:
+        return serve_http(cfg, app)!
+    forwarder := grpc_proxy.proxy(cfg)!
+    grpc_done := spawn serve_grpc(cfg, forwarder)
+    unfinished := serve_http(cfg, app)!
+    return unfinished + await grpc_done
 
 # parse a config's text, build the app and serve it.
 pub fn run(toml_text: String) -> Int!:

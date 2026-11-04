@@ -5290,22 +5290,7 @@ impl Client:
                 if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
                     length = parsed.content_length
                 reusable := self.keep_alives and not parsed.wants_close and parsed.status != 101 and not request_prefers_close_header(req)
-                return OpenResponse(
-                    status: resp.status,
-                    content_type: resp.content_type,
-                    headers: resp.headers,
-                    set_cookie_headers: resp.set_cookie_headers,
-                    content_length: length,
-                    client: self,
-                    conn: c,
-                    src: wire_source(c),
-                    head: parsed,
-                    reusable: reusable,
-                    left: parsed.content_length,
-                    in_chunk: false,
-                    finished: false,
-                    closed: false
-                )
+                return OpenResponse(status: resp.status, content_type: resp.content_type, headers: resp.headers, set_cookie_headers: resp.set_cookie_headers, content_length: length, client: self, conn: c, src: wire_source(c), head: parsed, reusable: reusable, left: parsed.content_length, in_chunk: false, finished: false, closed: false)
             wire_close(c)
             if retried or not c.reused or head.err != NO_RESPONSE_MESSAGE or not request_replayable(req):
                 fail head.err

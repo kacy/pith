@@ -1,0 +1,91 @@
+# one http.Client shared by many tasks, the shape of a server calling a backend
+# from its handlers. every caller has to get the response to its own request.
+#
+# the pool used to keep each connection's buffered reader and writer, which are
+# handles into the registry of the task that built them. in another task the same
+# number named a different connection, so requests went down the wrong socket:
+# callers failed with "server closed the connection before responding", and some
+# got another caller's response.
+import std.bytes as bytes
+import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
+
+PORT := 20351
+RAW_PORT := 20352
+TASKS := 32
+ROUNDS := 200
+
+fn echo(req: web.Request) -> http.HttpResponse:
+    return http.text(200, req.query("id"))
+
+fn serve() -> Int:
+    return web.bare().get("/echo", echo).listen("127.0.0.1", PORT) catch 0
+
+struct Tally:
+    right: AtomicInt
+    wrong: AtomicInt
+    failed: AtomicInt
+
+fn bump(counter: AtomicInt):
+    mut seen := counter.load()
+    while not counter.compare_set(seen, seen + 1):
+        seen = counter.load()
+
+fn caller(client: http.Client, who: Int, tally: Tally) -> Int:
+    for i in 0..ROUNDS:
+        id := (who * 1000000 + i).to_string()
+        answer := client.send(http.request("GET", "127.0.0.1", PORT, "/echo?id=" + id))
+        if answer.is_err:
+            bump(tally.failed)
+        elif (bytes.to_string_utf8(answer.ok.body) catch "") == id:
+            bump(tally.right)
+        else:
+            bump(tally.wrong)
+    return 0
+
+# answer each connection's first request, with bytes after the response that
+# belong to nothing.
+fn serve_extra_bytes() -> Int!:
+    listener := tcp.listen("127.0.0.1", RAW_PORT)!
+    mut served := 0
+    while served < 2:
+        conn := tcp.accept(listener)!
+        tcp.read(conn, 4096)!
+        body := "reply " + served.to_string()
+        tcp.write(conn, "HTTP/1.1 200 OK\r\nContent-Length: " + body.len().to_string() + "\r\n\r\n" + body + "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nforged")!
+        served = served + 1
+    tcp.close(listener)
+    return served
+
+fn wait_for_port(port: Int):
+    for i in 0..500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return
+        sleep(10)
+
+fn main() -> Int!:
+    spawn serve()
+    wait_for_port(PORT)
+    client := http.client()
+    client.max_idle_conns_per_host = TASKS
+    tally := Tally(AtomicInt(0), AtomicInt(0), AtomicInt(0))
+    mut tasks: List[Task[Int]] := []
+    for who in 1..(TASKS + 1):
+        tasks.push(spawn caller(client, who, tally))
+    for t in tasks:
+        await t
+    print("right={tally.right.load()} wrong={tally.wrong.load()} failed={tally.failed.load()}")
+    print("connections kept for reuse: " + (client.idle_connections() > 0).to_string())
+
+    raw := spawn serve_extra_bytes()
+    sleep(50)
+    extra := http.client()
+    for i in 0..2:
+        reply := extra.send(http.request("GET", "127.0.0.1", RAW_PORT, "/"))!
+        print(bytes.to_string_utf8(reply.body)!)
+    print("idle after a response with bytes behind it: " + extra.idle_connections().to_string())
+    await raw
+    return 0

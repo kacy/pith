@@ -2899,33 +2899,6 @@ pub fn redirect(url: String) -> String:
 # Server Helpers
 # ===============================================================
 
-# how an http/1.1 server connection behaves, modeled on net/http's Server
-# fields. a timeout of 0 means none. server_config() gives the defaults the
-# plain entry points (serve_connection_fd, serve_connection_tls, ...) use:
-# no timeouts, the MAX_HEADER_BYTES and MAX_REQUEST_BODY limits, keep-alive
-# on, and no cap on requests per connection. std.web starts from
-# web.server_config() instead, which keeps read timeouts on.
-#
-#   * read_header_timeout_ms: how long the request head may take. on the
-#     first request it counts from when the connection was served, the wait
-#     for the first byte included; on a later one, from its first byte. this
-#     is what stops a slowloris client that sends a byte at a time. when it
-#     is 0, read_timeout_ms applies.
-#   * read_timeout_ms: how long the head and the body together may take,
-#     counted from the same point.
-#   * write_timeout_ms: how long the response may take, counted from when the
-#     request head has been read, so it covers the handler as well.
-#   * idle_timeout_ms: how long a keep-alive connection may wait for its next
-#     request to start. when it is 0, read_timeout_ms applies.
-#   * max_header_bytes, max_body_bytes: the request-size limits, answered with
-#     431 and 413.
-#   * keep_alives: false closes the connection after every response.
-#   * max_requests_per_conn: close the connection after this many responses,
-#     0 for no limit.
-#
-# a request that runs out of time once its first byte has arrived is answered
-# with 408 and the connection closes. a connection that times out with
-# nothing sent, or that runs out of write time, is closed with no answer.
 # --- streaming a response ---------------------------------------------------
 #
 # a handler returns a whole HttpResponse, which middleware can read and change.
@@ -3025,6 +2998,35 @@ pub fn request_peer_address() -> String:
         return ""
     return tcp_peer_address(request_socket)
 
+# how an http/1.1 server connection behaves, modeled on net/http's Server
+# fields. a timeout of 0 means none. server_config() gives the defaults the
+# plain entry points (serve_connection_fd, serve_connection_tls, ...) use:
+# no timeouts, the MAX_HEADER_BYTES and MAX_REQUEST_BODY limits, keep-alive
+# on, and no cap on requests per connection. std.web starts from
+# web.server_config() instead, which keeps read timeouts on.
+#
+#   * read_header_timeout_ms: how long the request head may take. on the
+#     first request it counts from when the connection was served, the wait
+#     for the first byte included; on a later one, from its first byte. this
+#     is what stops a slowloris client that sends a byte at a time. when it
+#     is 0, read_timeout_ms applies.
+#   * read_timeout_ms: how long the head and the body together may take,
+#     counted from the same point.
+#   * write_timeout_ms: how long the response may take, counted from when the
+#     request head has been read, so it covers the handler as well.
+#   * idle_timeout_ms: how long a keep-alive connection may wait for its next
+#     request to start. when it is 0, read_timeout_ms applies.
+#   * max_header_bytes, max_body_bytes: the request-size limits, answered with
+#     431 and 413.
+#   * keep_alives: false closes the connection after every response.
+#   * max_requests_per_conn: close the connection after this many responses,
+#     0 for no limit.
+#   * max_connections: how many connections std.web serves at once, 0 for its
+#     default. the plain http entry points here do not cap connections.
+#
+# a request that runs out of time once its first byte has arrived is answered
+# with 408 and the connection closes. a connection that times out with
+# nothing sent, or that runs out of write time, is closed with no answer.
 pub struct ServerConfig:
     pub read_header_timeout_ms: Int
     pub read_timeout_ms: Int
@@ -3034,8 +3036,6 @@ pub struct ServerConfig:
     pub max_body_bytes: Int
     pub keep_alives: Bool
     pub max_requests_per_conn: Int
-    # how many connections std.web serves at once, or 0 for its default. the
-    # plain http entry points here do not cap connections.
     pub max_connections: Int
 
 # the default server configuration (see ServerConfig).

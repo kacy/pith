@@ -475,8 +475,8 @@ green backend cut internal context switches from about five per grpc call to
 well under one and raised throughput on a two-core box (see the grpc section
 of `docs/performance.md`). on the channel fan-out benchmark — eight tasks
 trading a million messages through one bounded channel — it runs well ahead of
-the os-thread backend, and at 38 ms median it is ahead of go (49 ms) on the
-2026-10-30 suite run. see the headline table in `docs/performance.md`. it does the least for tasks that are already
+the os-thread backend, and at 40 ms median it is ahead of go (49 ms) on the
+2026-11-04 suite run. see the headline table in `docs/performance.md`. it does the least for tasks that are already
 cpu-bound and rarely wait — those never hit the handoffs green makes cheap.
 
 the machinery behind that: coroutine stacks are pooled and reused rather

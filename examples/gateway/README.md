@@ -1,6 +1,6 @@
 # api gateway
 
-an api gateway in about 700 lines of pith, with no dependencies. it builds to one
+an api gateway in about 850 lines of pith, with no dependencies. it builds to one
 static binary. the tls, http/2, grpc, jwt and metrics code it runs on is all
 standard library that you can read.
 

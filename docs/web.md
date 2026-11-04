@@ -313,6 +313,41 @@ registered for the same path wins over the `GET` one, for a handler that can
 answer without building the body. `Allow` lists `HEAD` wherever it lists
 `GET`.
 
+### streaming a response
+
+a handler can send its body as it is produced, which suits server-sent events and
+large downloads. return `http.stream_response` with the head and a function that
+writes the pieces:
+
+```pith
+fn ticks(write: fn(Bytes) -> Int!) -> Int!:
+    for i in 0..3:
+        write(bytes.from_string_utf8("tick {i}\n"))!
+    return 0
+
+fn feed(req: web.Request) -> http.HttpResponse:
+    return http.stream_response(http.response(200).content_type("text/plain"), ticks)
+```
+
+the head passes through the middleware like any response, and the function runs
+after it returns, on the same task. http/1.1 sends chunks unless the head has a
+`Content-Length`, and http/2 sends DATA frames. a function that fails, or a client
+that went away, ends the response early, and the client can tell it was cut short.
+
+the client side of this is `client.open(request)`, which returns once the head
+arrives. `read()` hands over the body as it comes and is empty at the end, and
+`close()` returns the connection to the pool:
+
+```pith
+stream := client.open(http.request("GET", "localhost", 8080, "/feed"))!
+defer stream.close()
+while true:
+    piece := stream.read()!
+    if piece.is_empty():
+        break
+    use(piece)
+```
+
 ## middleware
 
 middleware wraps every matched route. a middleware is a function that takes `next`

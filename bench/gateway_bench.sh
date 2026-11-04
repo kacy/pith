@@ -18,8 +18,7 @@
 #   PITH         pith compiler (default: ./target/release/pith)
 #   ARMS         arms to run (default: "pith go")
 #   SCENARIOS    scenarios to run (default: "plain auth failure")
-#   CONNS        wrk connection counts (default: "64 256"). std.web answers 503
-#                past 512 open connections, so a higher count measures refusals.
+#   CONNS        wrk connection counts (default: "64 256 1024")
 #   TRIALS       trials per arm and scenario; the median is reported (default: 3)
 #   DURATION     seconds per measured run (default: 8)
 #   WORKERS      PITH_GREEN_WORKERS and GOMAXPROCS for the gateway (default: 16)
@@ -34,7 +33,7 @@ cd "$root"
 pith=${PITH:-./target/release/pith}
 arms=${ARMS:-pith go}
 scenarios=${SCENARIOS:-plain auth failure}
-conns_list=${CONNS:-64 256}
+conns_list=${CONNS:-64 256 1024}
 trials=${TRIALS:-3}
 duration=${DURATION:-8}
 workers=${WORKERS:-16}

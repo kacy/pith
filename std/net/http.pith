@@ -2607,6 +2607,12 @@ impl HttpResponse:
     fn header(name: String, value: String) -> HttpResponse:
         if header_key_matches(name, "Content-Type"):
             return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
+        # Set-Cookie repeats rather than replaces (rfc 9110 5.3), so it lives in
+        # the list both the http/1.1 and the http/2 writers send from
+        if header_key_matches(name, "Set-Cookie"):
+            mut cookies := copy_string_list(self.set_cookie_headers)
+            cookies.push(value)
+            return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, cookies, copy_headers_map(self.trailers))
         return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
 
     fn with_body_text(text: String) -> HttpResponse:
@@ -2893,6 +2899,22 @@ pub fn redirect(url: String) -> String:
 # Server Helpers
 # ===============================================================
 
+# the socket of the connection this task is serving, for
+# request_peer_address. a connection, and each http/2 stream, has its own task.
+threadlocal mut request_socket: Int := 0
+
+# note the socket this task's requests arrive on. the server entry points call it.
+pub fn set_request_socket(fd: Int):
+    request_socket = fd
+
+# the address of the client this task's request came from, as `ip:port`
+# (`[ip]:port` for ipv6). it is "" outside a handler's own task, including in a
+# task the handler spawned.
+pub fn request_peer_address() -> String:
+    if request_socket <= 0:
+        return ""
+    return tcp_peer_address(request_socket)
+
 # how an http/1.1 server connection behaves, modeled on net/http's Server
 # fields. a timeout of 0 means none. server_config() gives the defaults the
 # plain entry points (serve_connection_fd, serve_connection_tls, ...) use:
@@ -2916,6 +2938,8 @@ pub fn redirect(url: String) -> String:
 #   * keep_alives: false closes the connection after every response.
 #   * max_requests_per_conn: close the connection after this many responses,
 #     0 for no limit.
+#   * max_connections: how many connections std.web serves at once, 0 for its
+#     default. the plain http entry points here do not cap connections.
 #
 # a request that runs out of time once its first byte has arrived is answered
 # with 408 and the connection closes. a connection that times out with
@@ -2929,37 +2953,44 @@ pub struct ServerConfig:
     pub max_body_bytes: Int
     pub keep_alives: Bool
     pub max_requests_per_conn: Int
+    pub max_connections: Int
 
 # the default server configuration (see ServerConfig).
 pub fn server_config() -> ServerConfig:
-    return ServerConfig(0, 0, 0, 0, MAX_HEADER_BYTES, MAX_REQUEST_BODY, true, 0)
+    return ServerConfig(0, 0, 0, 0, MAX_HEADER_BYTES, MAX_REQUEST_BODY, true, 0, 0)
 
 impl ServerConfig:
     fn with_read_header_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+        return ServerConfig(ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
 
     fn with_read_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+        return ServerConfig(self.read_header_timeout_ms, ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
 
     fn with_write_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
 
     fn with_idle_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
 
     fn with_max_header_bytes(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, limit, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, limit, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
 
     fn with_max_body_bytes(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, limit, self.keep_alives, self.max_requests_per_conn)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, limit, self.keep_alives, self.max_requests_per_conn, self.max_connections)
 
     fn with_keep_alives(enabled: Bool) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, enabled, self.max_requests_per_conn)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, enabled, self.max_requests_per_conn, self.max_connections)
 
     fn with_max_requests_per_conn(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, limit)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, limit, self.max_connections)
 
     # the head's time limit after the read_timeout_ms fallback.
+
+    # how many connections std.web serves at once. past it a new connection is
+    # refused with a 503. 0 means std.web's default.
+    fn with_max_connections(limit: Int) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, limit)
+
     fn header_timeout() -> Int:
         if self.read_header_timeout_ms > 0:
             return self.read_header_timeout_ms
@@ -5687,6 +5718,7 @@ fn read_ran_out(head_due: Int, body_due: Int) -> Bool:
 
 # serve requests on `conn` until either side asks to close.
 fn serve_requests(conn: ServerConn) -> Int!:
+    set_request_socket(conn.src.socket)
     mut total := 0
     mut served := 0
     while true:

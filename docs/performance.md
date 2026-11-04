@@ -10,20 +10,20 @@ different hardware.
 
 ## where pith stands
 
-the current numbers are the 2026-10-30 suite run in
+the current numbers are the 2026-11-04 suite run in
 [bench/README.md](../bench/README.md): every benchmark against go 1.27 and
 rust 1.99 ports on a ryzen 9 9950x, pinned to one ccd, with every runner on
-one build (main after #1260). a few rows from it, as median wall time:
+one build (main after #1313). a few rows from it, as median wall time:
 
 | workload | pith | go | rust |
 |---|---:|---:|---:|
-| json decode, 20M small objects | 817 ms | 3549 ms | 1105 ms |
-| event ledger, 200k events | 70 ms | 96 ms | 51 ms |
-| channel fan-out, 1M messages | 38 ms | 49 ms | 445 ms |
-| closure error handling, 2M calls | 353 ms | 183 ms | 160 ms |
-| green fan-out, 2M tasks from main | 621 ms | 242 ms | 389 ms |
-| sha512, 256 MB | 433 ms | 191 ms | 209 ms |
-| http server at 256 connections | 1.96M req/s, p99 191 µs | 1.01M (net/http), 2.24M (minimal) | 1.76M (hyper), p99 288 µs |
+| json decode, 20M small objects | 707 ms | 3540 ms | 1122 ms |
+| event ledger, 200k events | 72 ms | 103 ms | 50 ms |
+| channel fan-out, 1M messages | 40 ms | 49 ms | 452 ms |
+| closure error handling, 2M calls | 355 ms | 181 ms | 159 ms |
+| green fan-out, 2M tasks from main | 625 ms | 242 ms | 391 ms |
+| sha512, 256 MB | 432 ms | 190 ms | 208 ms |
+| http server at 256 connections | 1.95M req/s, p99 191 µs | 1.01M (net/http), 2.28M (minimal) | 1.76M (hyper), p99 274 µs |
 
 pith is ahead of go on json decoding, substring search, the event ledger
 and catalog workloads, channels, spawning inside tasks and http latency. it
@@ -31,6 +31,12 @@ is behind go on closures, reference cycles, spawning from main, sha512 and
 concurrent grpc calls, and behind rust on most single-threaded compute. the list of the
 largest gaps, with their causes, is under "where pith stands" in
 bench/README.md.
+
+since the 2026-10-30 run, the flat json decoder in ir (#1305) made the small and
+wide shapes 13 and 24% faster. a use-after-free fix (#1270) made the zstd pure
+codec 2 to 5.5% slower, and `event_ledger`, `generic_sort` and the http server
+about 2 to 3% slower. concurrent grpc calls are also 2 to 3.6% slower, with no
+traced cause. bench/README.md has the races behind these figures.
 
 ### the 2-core machine (july to september 2026)
 

@@ -123,7 +123,7 @@ seconds, and the entire self-hosted compiler in about 1.3.
 
 ## the numbers
 
-measured 2026-10-30 on a ryzen 9 9950x, every language pinned to the same
+measured 2026-11-04 on a ryzen 9 9950x, every language pinned to the same
 eight cores, against go 1.27 and rust 1.99 ports that do the same work and
 print the same checksums. the full tables, one row per benchmark, are in
 [bench/README.md](bench/README.md); the history and the profiling behind
@@ -131,15 +131,15 @@ them are in [docs/performance.md](docs/performance.md).
 
 | workload | pith | go | rust |
 |---|---:|---:|---:|
-| json decode, 20M small objects | **817 ms** | 3549 ms | 1105 ms |
-| substring search | **46 ms** | 220 ms | 207 ms |
-| channel fan-out, 1M messages | **38 ms** | 49 ms | 445 ms |
-| event ledger, 200k events (json, collections, crypto) | 70 ms | 96 ms | 51 ms |
-| sort 100k ints, 30 rounds | 302 ms | 502 ms | 60 ms |
-| csv encode | 417 ms | 308 ms | 129 ms |
-| error handling through closures | 353 ms | 183 ms | 160 ms |
-| sha256, 256 MB | 110 ms | 96 ms | 96 ms |
-| http server at 256 connections, req/s | 1.96M | 2.24M (minimal), 1.01M (net/http) | 1.76M (hyper) |
+| json decode, 20M small objects | **707 ms** | 3540 ms | 1122 ms |
+| substring search | **45 ms** | 220 ms | 222 ms |
+| channel fan-out, 1M messages | **40 ms** | 49 ms | 452 ms |
+| event ledger, 200k events (json, collections, crypto) | 72 ms | 103 ms | 50 ms |
+| sort 100k ints, 30 rounds | 310 ms | 504 ms | 59 ms |
+| csv encode | 415 ms | 309 ms | 128 ms |
+| error handling through closures | 355 ms | 181 ms | 159 ms |
+| sha256, 256 MB | 111 ms | 96 ms | 95 ms |
+| http server at 256 connections, req/s | 1.95M | 2.28M (minimal), 1.01M (net/http) | 1.76M (hyper) |
 
 - pith is faster than go on json decoding, text search, the event ledger
   and catalog workloads, int sorting, channels, spawning and parallel
@@ -151,8 +151,8 @@ them are in [docs/performance.md](docs/performance.md).
 - go is ahead on closures, reference cycles, task scheduling, string
   building, string-keyed maps, concurrent grpc calls and raw http
   throughput against a minimal server.
-- rust is ahead on most single-threaded compute, mostly by 1.4x to 5.7x.
-  the outlier is walking decoded json (9.7x).
+- rust is ahead on most single-threaded compute, mostly by 1.4x to 5.6x.
+  the outlier is walking decoded json (8.9x).
 
 ## what it does not do
 

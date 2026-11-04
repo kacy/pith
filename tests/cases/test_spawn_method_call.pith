@@ -1,0 +1,22 @@
+# spawn takes a call through a module alias and a method call, as well as a plain
+# call. the receiver and the arguments are evaluated on the new task.
+import spawn_module_helper as helper
+
+struct Counter:
+    base: Int
+
+impl Counter:
+    fn plus(n: Int) -> Int:
+        return self.base + n
+
+    fn spawn_from_method(n: Int) -> Int:
+        t := spawn self.plus(n)
+        return await t
+
+fn main():
+    a := spawn helper.add(2, 3)
+    print((await a).to_string())
+    c := Counter(10)
+    b := spawn c.plus(5)
+    print((await b).to_string())
+    print(c.spawn_from_method(6).to_string())

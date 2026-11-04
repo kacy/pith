@@ -8795,8 +8795,8 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     mut captures: List[String] := []
     call_node := get_node(call_idx)
     if call_node.children.len() > 0:
-        callee := ir_resolve_static_callee(call_node.children[0])
-        if callee.name.len() == 0:
+        # a method call's first child is its receiver, which the task reads
+        if call_node.kind == "method_call" or ir_resolve_static_callee(call_node.children[0]).name.len() == 0:
             captures = ir_find_free_vars(call_node.children[0], [])
         mut i := 1
         while i < call_node.children.len():
@@ -9149,7 +9149,7 @@ fn ir_emit_struct_init(idx: Int, node: Node) -> Int:
 fn ir_emit_spawn_expr(node: Node) -> Int:
     if node.children.len() > 0:
         inner := get_node(node.children[0])
-        if inner.kind == "call":
+        if inner.kind == "call" or inner.kind == "method_call":
             closure_r := ir_emit_spawn_wrapper(node.children[0])
             r := ir_reg()
             ir_emit_call1(r, "spawn", "unknown", closure_r)

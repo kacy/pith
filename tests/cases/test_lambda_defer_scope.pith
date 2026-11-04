@@ -1,0 +1,21 @@
+# a failure inside a lambda belongs to the lambda. it used to run the enclosing
+# function's defers and errdefers there, and each plain defer then ran again when
+# the function itself ended.
+fn check(ok: Bool) -> Int!:
+    if ok:
+        return 1
+    fail "no"
+
+fn run() -> Int!:
+    defer print("function defer")
+    errdefer print("function errdefer")
+    attempt := fn(ok: Bool) -> Int!:
+        defer print("lambda defer")
+        return check(ok)! + 1
+    print((attempt(false) catch 0).to_string())
+    print((attempt(true) catch 0).to_string())
+    print("still in the function")
+    return 0
+
+fn main():
+    print((run() catch 9).to_string())

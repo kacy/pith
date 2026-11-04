@@ -2899,6 +2899,22 @@ pub fn redirect(url: String) -> String:
 # Server Helpers
 # ===============================================================
 
+# the socket of the connection this task is serving, for
+# request_peer_address. a connection, and each http/2 stream, has its own task.
+threadlocal mut request_socket: Int := 0
+
+# note the socket this task's requests arrive on. the server entry points call it.
+pub fn set_request_socket(fd: Int):
+    request_socket = fd
+
+# the address of the client this task's request came from, as `ip:port`
+# (`[ip]:port` for ipv6). it is "" outside a handler's own task, including in a
+# task the handler spawned.
+pub fn request_peer_address() -> String:
+    if request_socket <= 0:
+        return ""
+    return tcp_peer_address(request_socket)
+
 # how an http/1.1 server connection behaves, modeled on net/http's Server
 # fields. a timeout of 0 means none. server_config() gives the defaults the
 # plain entry points (serve_connection_fd, serve_connection_tls, ...) use:
@@ -2922,26 +2938,12 @@ pub fn redirect(url: String) -> String:
 #   * keep_alives: false closes the connection after every response.
 #   * max_requests_per_conn: close the connection after this many responses,
 #     0 for no limit.
+#   * max_connections: how many connections std.web serves at once, 0 for its
+#     default. the plain http entry points here do not cap connections.
 #
 # a request that runs out of time once its first byte has arrived is answered
 # with 408 and the connection closes. a connection that times out with
 # nothing sent, or that runs out of write time, is closed with no answer.
-# the socket of the connection this task is serving, for
-# request_peer_address. a connection, and each http/2 stream, has its own task.
-threadlocal mut request_socket: Int := 0
-
-# note the socket this task's requests arrive on. the server entry points call it.
-pub fn set_request_socket(fd: Int):
-    request_socket = fd
-
-# the address of the client this task's request came from, as `ip:port`
-# (`[ip]:port` for ipv6). it is "" outside a handler's own task, including in a
-# task the handler spawned.
-pub fn request_peer_address() -> String:
-    if request_socket <= 0:
-        return ""
-    return tcp_peer_address(request_socket)
-
 pub struct ServerConfig:
     pub read_header_timeout_ms: Int
     pub read_timeout_ms: Int
@@ -2951,8 +2953,6 @@ pub struct ServerConfig:
     pub max_body_bytes: Int
     pub keep_alives: Bool
     pub max_requests_per_conn: Int
-    # how many connections std.web serves at once, or 0 for its default. the
-    # plain http entry points here do not cap connections.
     pub max_connections: Int
 
 # the default server configuration (see ServerConfig).

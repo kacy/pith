@@ -365,6 +365,23 @@ impl BufferedBytesReader:
     fn free():
         free_buffered_bytes_reader(self)
 
+# what a buffered reader holds now, or what one read of its source brings, up to
+# `max_bytes`. empty at end of input. unlike read_bytes this does not wait for
+# `max_bytes` to arrive, which is what a stream of small pieces needs.
+pub fn buffered_read_available(reader: BufferedBytesReader, max_bytes: Int) -> Bytes!:
+    if max_bytes <= 0 or not buffered_bytes_readers.contains_key(reader.handle):
+        return bytes.empty()
+    state := buffered_bytes_readers[reader.handle]
+    if state.cache.is_empty():
+        if buffered_bytes_reader_fill(state)! <= 0:
+            return bytes.empty()
+    cached := state.cache
+    if cached.len() <= max_bytes:
+        state.cache = bytes.empty()
+        return cached
+    state.cache = cached.slice(max_bytes, cached.len())
+    return cached.slice(0, max_bytes)
+
 impl BytesReader for BufferedBytesReader:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return buffered_bytes_reader_read(self, max_bytes)

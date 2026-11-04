@@ -909,6 +909,29 @@ fn assemble_request(inbox: Channel[StreamEvent]) -> http.HttpRequestBytes!:
 # own task so a slow or failing request never blocks the reader or another stream.
 # a streaming server hands the stream to the streaming handler instead of
 # buffering (handle_streaming_stream).
+# run the producer a handler left (see http.stream_response) over this stream: the
+# head, then a DATA frame per piece, flow controlled like any body. a producer
+# that fails, or a client that went away, resets the stream.
+fn send_streamed_response(server: Server, stream_id: Int, req: http.HttpRequestBytes, response: http.HttpResponse):
+    producer := http.take_response_producer()
+    is_head := req.method_text == "HEAD"
+    server.outbound.send(Outbound(OUT_RESPONSE, bytes.empty(), stream_id, response_fields(response), is_head))
+    if is_head:
+        server.forget(stream_id)
+        return
+    write := fn(data: Bytes) -> Int!:
+        if data.is_empty():
+            return 0
+        if send_stream_data(server, stream_id, data, false) < data.len():
+            fail "http2: the client went away"
+        return data.len()
+    finished := producer(write)
+    if finished.is_err:
+        server.reset(stream_id, frames.ERROR_CANCEL)
+        return
+    send_stream_data(server, stream_id, bytes.empty(), true)
+    server.forget(stream_id)
+
 fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
     # scope the json node pool to this one stream. a handler that parses the
     # request body allocates into per-task pool storage that nothing frees on
@@ -931,6 +954,9 @@ fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
             server.forget(stream_id)
         return
     response := server.handler(result.ok)
+    if http.response_is_streaming():
+        send_streamed_response(server, stream_id, result.ok, response)
+        return
     # flatten the response to plain header fields here, in the handler task, so no
     # Map crosses to the writer. the Outbound is built inline at the send site (a
     # by-value struct moved into a constructor inside a helper loses its heap

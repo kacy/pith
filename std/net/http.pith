@@ -2926,6 +2926,89 @@ pub fn redirect(url: String) -> String:
 # a request that runs out of time once its first byte has arrived is answered
 # with 408 and the connection closes. a connection that times out with
 # nothing sent, or that runs out of write time, is closed with no answer.
+# --- streaming a response ---------------------------------------------------
+#
+# a handler returns a whole HttpResponse, which middleware can read and change.
+# to send a body as it is produced, a handler returns stream_response(head,
+# producer) instead. the head goes through the middleware like any response, and
+# the server then sends it and runs the producer on this same task, handing it a
+# function that writes one piece. http/1.1 frames the pieces as chunks unless the
+# head has a Content-Length, and http/2 sends them as DATA frames. a producer that
+# fails ends the response early so the client can tell it was cut short: the
+# connection closes on http/1.1 and the stream resets on http/2.
+#
+# the producer waits in a task-local value rather than in HttpResponse, so the
+# response type and the code that copies it stay as they are. a middleware that
+# replaces the response after the handler ran should not call a streaming handler.
+struct ResponseProducer:
+    run: fn(fn(Bytes) -> Int!) -> Int!
+
+threadlocal mut pending_producer: ResponseProducer? := none
+
+# answer with `head` and a body `producer` writes piece by piece.
+pub fn stream_response(head: HttpResponse, producer: fn(fn(Bytes) -> Int!) -> Int!) -> HttpResponse:
+    pending_producer = ResponseProducer(producer)
+    return head
+
+# whether the handler that just ran on this task asked to stream its body.
+pub fn response_is_streaming() -> Bool:
+    return pending_producer != none
+
+fn no_response_producer(write: fn(Bytes) -> Int!) -> Int!:
+    return 0
+
+# hand over the producer a handler left, clearing it. the http/2 server calls this
+# to run it over its own framing.
+pub fn take_response_producer() -> fn(fn(Bytes) -> Int!) -> Int!:
+    if let pending = pending_producer:
+        pending_producer = none
+        return pending.run
+    return no_response_producer
+
+# one chunk of a chunked body, framed. an empty piece would end the body, so it
+# writes nothing.
+fn chunk_frame(data: Bytes) -> Bytes:
+    out := bytes.buffer_with_capacity(data.len() + 16)
+    out.write_string_utf8(lower_hex_int(data.len()) + "\r\n") catch 0
+    out.write(data) catch 0
+    out.write_string_utf8("\r\n") catch 0
+    return out.take_bytes()
+
+fn streamed_head_bytes(resp: HttpResponse, chunked: Bool, connection: String, is_head: Bool) -> Bytes!:
+    out := bytes.buffer_with_capacity(RESPONSE_HEAD_CAPACITY)
+    errdefer out.free()
+    # the framing field takes the body's length from here, and a sized stream has
+    # declared one
+    declared := parse_int(header_lookup(resp.headers, "Content-Length").trim()) catch 0
+    write_response_head(out, resp, declared, chunked, connection, current_date_field(), is_head)!
+    return out.take_bytes()
+
+# send a streamed response on an http/1.1 connection: the head, then what the
+# producer writes. the answer is whether the body ended as framed, so the
+# connection can carry another request. HEAD gets the head alone.
+fn write_streamed_response(src: ByteSource, writer: BufferedBytesWriter, req: HttpRequestBytes, resp: HttpResponse, connection: String) -> Bool!:
+    producer := take_response_producer()
+    is_head := req.method_text == "HEAD"
+    sized := header_lookup(resp.headers, "Content-Length") != ""
+    chunked := not sized and req.version_text != "HTTP/1.0"
+    # without a length or chunks only the close can end the body
+    mut closing := connection
+    if not sized and not chunked:
+        closing = "close"
+    source_write(src, writer, streamed_head_bytes(resp, chunked, closing, is_head)!)!
+    if is_head:
+        return closing != "close"
+    write := fn(data: Bytes) -> Int!:
+        if data.is_empty():
+            return 0
+        if chunked:
+            return source_write(src, writer, chunk_frame(data))!
+        return source_write(src, writer, data)!
+    producer(write)!
+    if chunked:
+        source_write(src, writer, bytes.from_string_utf8("0\r\n\r\n"))!
+    return closing != "close"
+
 # the socket of the connection this task is serving, for
 # request_peer_address. a connection, and each http/2 stream, has its own task.
 threadlocal mut request_socket: Int := 0
@@ -4830,6 +4913,26 @@ pub struct Client:
     pub mut max_response_body_bytes: Int
     pool: ConnPool
 
+# a response whose head has arrived and whose body has not been read. read()
+# hands over the body as it comes, and close() gives the connection back. both
+# belong to the task that opened it, like any connection's reader and writer.
+pub struct OpenResponse:
+    pub status: Int
+    pub content_type: String
+    pub headers: Map[String, String]
+    pub set_cookie_headers: List[String]
+    # the body's declared length, or -1 when it has none.
+    pub content_length: Int
+    client: Client
+    conn: WireConn
+    src: ByteSource
+    head: ResponseHead
+    reusable: Bool
+    mut left: Int
+    mut in_chunk: Bool
+    mut finished: Bool
+    mut closed: Bool
+
 # net/http's DefaultMaxIdleConnsPerHost and the idle timeout of its
 # DefaultTransport.
 DEFAULT_MAX_IDLE_CONNS_PER_HOST := 2
@@ -5144,6 +5247,95 @@ impl Client:
             total = total + self.pool.idle[key].len()
         self.pool.mu.unlock()
         return total
+
+    # send `req` and return as soon as the response head arrives, leaving the body
+    # to read() on what comes back. redirects are not followed, and the body is not
+    # decompressed. the request's time limit, or the client's, covers the head only:
+    # a body may take as long as it takes. close() the result.
+    #
+    # a request that fails on a reused connection before any of the response
+    # arrives is sent once more, as in send.
+    fn open(req: ClientRequest) -> OpenResponse!:
+        if not trace.is_active():
+            return self.open_untraced(req)
+        span := start_http_client_span(req.method, req.host, req.path)
+        traced := req.header("traceparent", trace.format_traceparent(span.context()))
+        started := time_mod.mono_nanos()
+        opened := self.open_untraced(traced)
+        if opened.is_err:
+            finish_http_client_span(span, req.method, -1, started)
+            fail opened.err
+        response := opened!
+        finish_http_client_span(span, req.method, response.status, started)
+        return response
+
+    fn open_untraced(req: ClientRequest) -> OpenResponse!:
+        mut limit := self.timeout_ms
+        if req.timeout_ms > 0:
+            limit = req.timeout_ms
+        mut deadline := 0
+        if limit > 0:
+            deadline = time_mod.mono_millis() + limit
+        route := self.route_for(req)!
+        mut retried := false
+        while true:
+            c := self.conn_for(req, route, deadline)!
+            head := self.send_for_head(c, req, route, deadline)
+            if head.is_ok:
+                parsed := head.ok
+                # the time limit was for the head
+                arm_client_deadline(c.stream.fd, 0, true)
+                resp := response_from_parsed(parsed, bytes.empty(), {})
+                mut length := -1
+                if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
+                    length = parsed.content_length
+                reusable := self.keep_alives and not parsed.wants_close and parsed.status != 101 and not request_prefers_close_header(req)
+                return OpenResponse(
+                    status: resp.status,
+                    content_type: resp.content_type,
+                    headers: resp.headers,
+                    set_cookie_headers: resp.set_cookie_headers,
+                    content_length: length,
+                    client: self,
+                    conn: c,
+                    src: wire_source(c),
+                    head: parsed,
+                    reusable: reusable,
+                    left: parsed.content_length,
+                    in_chunk: false,
+                    finished: false,
+                    closed: false
+                )
+            wire_close(c)
+            if retried or not c.reused or head.err != NO_RESPONSE_MESSAGE or not request_replayable(req):
+                fail head.err
+            retried = true
+        fail NO_RESPONSE_MESSAGE
+
+    # write `req` on `c` and read the response head. Expect: 100-continue is not
+    # waited for here: the body goes with the head.
+    fn send_for_head(c: WireConn, req: ClientRequest, route: ClientRoute, deadline: Int) -> ResponseHead!:
+        fd := c.stream.fd
+        mut connection := ""
+        if not self.keep_alives:
+            connection = "close"
+        mut target := normalize_path(req.path)
+        if route.absolute:
+            target = "http://" + host_header_value(req.host, req.port, false) + target
+        arm_client_deadline(fd, deadline, false)
+        client_write(c, request_wire_bytes(req, target, connection, false)!, deadline)!
+        src := wire_source(c)
+        mut header_due := 0
+        if self.response_header_timeout_ms > 0:
+            header_due = time_mod.mono_millis() + self.response_header_timeout_ms
+        arm_client_deadline(fd, earliest_due(deadline, header_due), true)
+        arrived := source_wait_bytes(src) catch 0
+        if arrived <= 0:
+            fail client_timeout_failure(NO_RESPONSE_MESSAGE, deadline, header_due)
+        head := read_response_head_from(src, req.method, self.max_response_header_bytes)
+        if head.is_err:
+            fail client_timeout_failure(head.err, deadline, header_due)
+        return head!
 
     fn send_untraced(req: ClientRequest) -> HttpResponse!:
         result := self.follow(req, BufferedBytesWriter(0), false)!
@@ -5530,6 +5722,95 @@ fn dial_tcp(host: String, port: Int, timeout_ms: Int) -> TcpStream!:
         fail "http: dial tcp {host}:{port}: connection failed"
     return io.from_fd(fd)
 
+# the most one read() of an open response returns.
+OPEN_RESPONSE_READ_BYTES := 65536
+
+# what `src` has now or brings on its next read, up to `count` bytes. empty at end
+# of input.
+fn source_read_available(src: ByteSource, count: Int) -> Bytes!:
+    if src.use_tls:
+        return src.conn.read_bytes(count)
+    return io.buffered_read_available(src.reader, count)
+
+impl OpenResponse:
+    # the next piece of the body, as soon as any of it arrives. empty at the end
+    # of the body, and it fails when the body stops before its framing says it
+    # should.
+    fn read() -> Bytes!:
+        if self.finished:
+            return bytes.empty()
+        kind := self.head.kind
+        if kind == HTTP_RESPONSE_BODY_NONE:
+            self.finished = true
+            return bytes.empty()
+        if kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
+            piece := source_read_available(self.src, OPEN_RESPONSE_READ_BYTES)!
+            if piece.is_empty():
+                self.finished = true
+            return piece
+        if kind == HTTP_RESPONSE_BODY_CHUNKED and not self.in_chunk:
+            if not self.next_chunk()!:
+                self.finished = true
+                return bytes.empty()
+        mut want := self.left
+        if want > OPEN_RESPONSE_READ_BYTES:
+            want = OPEN_RESPONSE_READ_BYTES
+        piece := source_read_available(self.src, want)!
+        if piece.is_empty():
+            fail "http: response body ended early"
+        self.left = self.left - piece.len()
+        if self.left == 0:
+            if kind == HTTP_RESPONSE_BODY_EXACT:
+                self.finished = true
+            else:
+                self.in_chunk = false
+                if chunk_line_content_end(source_read_line(self.src, CHUNK_LINE_LIMIT)!)! != 0:
+                    fail "http: chunk data is not followed by a line ending"
+        return piece
+
+    # read the next chunk's size. false at the last chunk, with its trailers read.
+    fn next_chunk() -> Bool!:
+        size := chunk_size_from_line(source_read_line(self.src, CHUNK_LINE_LIMIT)!)!
+        if size == 0:
+            trailers: Map[String, String] := {}
+            mut trailer_bytes := 0
+            mut done := false
+            while not done:
+                line := source_read_line(self.src, CHUNK_LINE_LIMIT)!
+                trailer_bytes = trailer_bytes + line.len()
+                if trailer_bytes > MAX_HEADER_BYTES:
+                    fail HEADER_LIMIT_MESSAGE
+                done = chunk_trailer_ends(line, trailers)!
+            return false
+        self.left = size
+        self.in_chunk = true
+        return true
+
+    # the rest of the body in one piece, failing past `limit` bytes.
+    fn read_all(limit: Int) -> Bytes!:
+        out := bytes.buffer()
+        errdefer out.free()
+        while true:
+            piece := self.read()!
+            if piece.is_empty():
+                return out.take_bytes()
+            if out.len() + piece.len() > limit:
+                fail "http: response body exceeds the limit"
+            out.write(piece)!
+        return out.take_bytes()
+
+    # finish with the response. a connection whose body was read to its end goes
+    # back to the pool, and any other closes, since unread bytes would otherwise
+    # reach the next request's caller. a second close does nothing.
+    fn close():
+        if self.closed:
+            return
+        self.closed = true
+        if self.finished and self.reusable:
+            self.client.put_idle(self.conn)
+        else:
+            wire_close(self.conn)
+
 # whether a client request names Expect: 100-continue.
 fn request_expects_continue(req: ClientRequest) -> Bool:
     return header_lookup(req.headers, "Expect").trim().to_lower() == "100-continue"
@@ -5705,6 +5986,9 @@ fn serve_exchange(conn: ServerConn, served: Int, persistent: Bool) -> Exchange!:
         connection = connection_value(got.ok.wants_close or last, req.version_text == "HTTP/1.0", resp)
     else:
         connection = standalone_connection(resp, "")
+    if response_is_streaming():
+        reusable := write_streamed_response(src, conn.writer, req, resp, connection) catch false
+        return Exchange(0, persistent and reusable, "")
     written := write_server_response(src, conn.writer, req, resp, connection)!
     return Exchange(written, persistent and connection != "close", "")
 

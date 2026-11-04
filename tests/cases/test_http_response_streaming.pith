@@ -1,0 +1,100 @@
+# a handler that sends its body as it is produced, and a client that reads it the
+# same way. the two sides take turns: each piece is held back until the client
+# says it has the one before, so nothing can pass by being buffered whole.
+import std.bytes as bytes
+import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
+
+PORT := 20357
+PIECES := 3
+
+client_saw := Channel[Int](1)
+
+fn text(data: String) -> Bytes:
+    return bytes.from_string_utf8(data)
+
+fn ticks(write: fn(Bytes) -> Int!) -> Int!:
+    for i in 0..PIECES:
+        write(text("tick " + i.to_string() + "\n"))!
+        client_saw.recv()
+    return 0
+
+fn turn_by_turn(req: web.Request) -> http.HttpResponse:
+    return http.stream_response(http.response(200).content_type("text/plain").header("X-Streamed", "yes"), ticks)
+
+fn sized_body(write: fn(Bytes) -> Int!) -> Int!:
+    write(text("12345"))!
+    write(text("67890"))!
+    return 0
+
+fn sized(req: web.Request) -> http.HttpResponse:
+    return http.stream_response(http.response(200).header("Content-Length", "10"), sized_body)
+
+fn cut_off(write: fn(Bytes) -> Int!) -> Int!:
+    write(text("partial"))!
+    fail "the source went away"
+
+fn broken(req: web.Request) -> http.HttpResponse:
+    return http.stream_response(http.response(200), cut_off)
+
+fn tagged(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    return next(req).header("X-Middleware", "ran")
+
+fn serve() -> Int:
+    return web.bare().use_mw(tagged).get("/ticks", turn_by_turn).get("/sized", sized).get("/broken", broken).get("/plain", fn(req: web.Request) => http.text(200, "plain")).listen("127.0.0.1", PORT) catch 0
+
+fn wait_for_port(port: Int):
+    for i in 0..500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return
+        sleep(10)
+
+fn request(path: String) -> http.ClientRequest:
+    return http.request("GET", "127.0.0.1", PORT, path)
+
+fn read_text(open: http.OpenResponse) -> String!:
+    return bytes.to_string_utf8(open.read_all(1048576)!)!
+
+fn main() -> Int!:
+    spawn serve()
+    wait_for_port(PORT)
+    client := http.client()
+
+    stream := client.open(request("/ticks"))!
+    print("status " + stream.status.to_string() + ", declared length " + stream.content_length.to_string())
+    print("from the head: " + stream.headers["X-Streamed"] + ", middleware " + stream.headers["X-Middleware"])
+    for i in 0..PIECES:
+        print(bytes.to_string_utf8(stream.read()!)!.trim())
+        client_saw.send(i)
+    print("end of body: " + stream.read()!.is_empty().to_string())
+    stream.close()
+    print("connection kept: " + (client.idle_connections() == 1).to_string())
+
+    # the chunked framing left the connection ready for another request
+    plain := client.send(request("/plain"))!
+    print(bytes.to_string_utf8(plain.body)!)
+
+    with_length := client.open(request("/sized"))!
+    print("declared length " + with_length.content_length.to_string())
+    print(read_text(with_length)!)
+    with_length.close()
+
+    # a whole buffered read of a streamed response works too
+    whole := client.open(request("/plain"))!
+    print(read_text(whole)!)
+    whole.close()
+
+    # a producer that fails cuts the body short, and the client can tell
+    cut := client.open(request("/broken"))!
+    print(bytes.to_string_utf8(cut.read()!)!)
+    print("cut short: " + cut.read().is_err.to_string())
+    cut.close()
+
+    # closing early gives up the connection rather than reusing it with bytes left
+    early := client.open(request("/sized"))!
+    early.close()
+    print("idle after closing early: " + client.idle_connections().to_string())
+    return 0

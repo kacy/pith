@@ -3,6 +3,7 @@
 from ast import get_node
 from ir_ast_helpers import ir_list_contains, ir_is_binding_kind, ir_binding_name
 from ir_metadata import ir_is_known_returning_func
+from checker_builtins import is_builtin_function
 
 fn ir_copy_names(names: List[String]) -> List[String]:
     mut copy: List[String] := []
@@ -19,6 +20,10 @@ fn ir_should_capture_name(name: String, bound: List[String], free: List[String],
     if locals.contains_key(name):
         return true
     if blocked_names.contains_key(name):
+        return false
+    # a builtin is called by name. taking `print` for a variable made the
+    # enclosing function load a local that does not exist.
+    if is_builtin_function(name):
         return false
     return not ir_is_known_returning_func(name)
 

@@ -7311,14 +7311,34 @@ fn check_spawn_expression(node: Node, scope_id: Int) -> Int:
         report_error("E232", "spawn requires a function call")
         return TID_ERR
     inner_node := get_node(node.children[0])
-    if inner_node.kind != "call":
+    if inner_node.kind != "call" and inner_node.kind != "method_call":
         report_error("E232", "spawn requires a function call")
         return TID_ERR
     inner := c_check_expr(node.children[0], scope_id)
     if is_error_type(inner):
         return TID_ERR
-    check_spawn_shared_collections(inner_node)
+    # the callee of a plain call is child 0, and a method call's receiver is
+    # evaluated in the task like its arguments
+    mut first_arg := 1
+    if inner_node.kind == "method_call":
+        first_arg = 0
+    for child, i in inner_node.children:
+        if i >= first_arg and report_spawn_arg_try(child):
+            return TID_ERR
+    check_spawn_shared_collections(inner_node, first_arg)
     return add_type_info(ti_task(inner))
+
+# a spawned call runs on the new task, arguments included, so a `!` among them
+# has no enclosing function to return from. true when it reported one.
+fn report_spawn_arg_try(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind == "try" or node.kind == "try_expr":
+        report_error_with_fix_at(idx, "E232", "`!` cannot be used in a spawn's arguments, which run on the new task", "bind the value before the spawn")
+        return true
+    for child in node.children:
+        if report_spawn_arg_try(child):
+            return true
+    return false
 
 # a spawned task runs on its own os thread. reference counts are atomic,
 # but a list, map, or set is an unsynchronized buffer behind a handle,
@@ -7326,9 +7346,9 @@ fn check_spawn_expression(node: Node, scope_id: Int) -> Int:
 # mutate the same buffer. a fresh collection (a literal, a copy, a call
 # result) is not shared and is fine — that is also the escape hatch. a
 # value meant to cross tasks belongs in a channel or an atomic cell.
-fn check_spawn_shared_collections(call_node: Node):
+fn check_spawn_shared_collections(call_node: Node, first_arg: Int):
     for child, i in call_node.children:
-        if i == 0:
+        if i < first_arg:
             continue
         mut expr_idx := child
         arg_node := get_node(child)

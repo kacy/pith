@@ -8694,6 +8694,11 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # goes to whoever called the lambda, not out of the process.
     saved_in_main := ir_emitting_main_body
     ir_emitting_main_body = false
+    # the enclosing function's result does not apply either. an index miss in a
+    # lambda under a `-> T!` function used to build that function's error, which
+    # the lambda's caller then read as its value.
+    saved_returns_result := ir_current_func_returns_result
+    ir_current_func_returns_result = ir_fn_returns_result(idx)
     # the lambda body is its own name scope: its params and captures land in
     # ir_var_regs below, and everything the body binds is collected here, so a
     # name it binds resolves to the lambda's own storage rather than a module
@@ -8732,6 +8737,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_emitting_main_body = saved_in_main
+    ir_current_func_returns_result = saved_returns_result
     ir_rc_locals = saved_string_locals
     ir_rc_local_kinds = saved_rc_kinds
     ir_tuple_local_tid = saved_tuple_tids
@@ -8795,8 +8801,8 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     mut captures: List[String] := []
     call_node := get_node(call_idx)
     if call_node.children.len() > 0:
-        callee := ir_resolve_static_callee(call_node.children[0])
-        if callee.name.len() == 0:
+        # a method call's first child is its receiver, which the task reads
+        if call_node.kind == "method_call" or ir_resolve_static_callee(call_node.children[0]).name.len() == 0:
             captures = ir_find_free_vars(call_node.children[0], [])
         mut i := 1
         while i < call_node.children.len():
@@ -8812,6 +8818,19 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
     saved_loop_var_slots := ir_loop_var_slots
+    # the wrapper is its own function. without these an index miss in an argument
+    # took the enclosing function's error path: it released that function's
+    # locals, which do not exist here, and returned its error shape.
+    saved_rc_locals := ir_rc_locals
+    saved_rc_kinds := ir_rc_local_kinds
+    saved_returns_result := ir_current_func_returns_result
+    saved_ret_kind := ir_current_func_return_kind
+    saved_in_main := ir_emitting_main_body
+    ir_rc_locals = []
+    ir_rc_local_kinds = []
+    ir_current_func_returns_result = false
+    ir_current_func_return_kind = ""
+    ir_emitting_main_body = false
 
     ir_reset_lambda_emit_state()
     ir_emit_func_header(wrapper_name, 1, "unknown")
@@ -8824,6 +8843,11 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_loop_var_slots = saved_loop_var_slots
+    ir_rc_locals = saved_rc_locals
+    ir_rc_local_kinds = saved_rc_kinds
+    ir_current_func_returns_result = saved_returns_result
+    ir_current_func_return_kind = saved_ret_kind
+    ir_emitting_main_body = saved_in_main
 
     closure_r := ir_reg()
     ir_emit("closure_ref " + closure_r.to_string() + " " + wrapper_name)
@@ -9149,7 +9173,7 @@ fn ir_emit_struct_init(idx: Int, node: Node) -> Int:
 fn ir_emit_spawn_expr(node: Node) -> Int:
     if node.children.len() > 0:
         inner := get_node(node.children[0])
-        if inner.kind == "call":
+        if inner.kind == "call" or inner.kind == "method_call":
             closure_r := ir_emit_spawn_wrapper(node.children[0])
             r := ir_reg()
             ir_emit_call1(r, "spawn", "unknown", closure_r)

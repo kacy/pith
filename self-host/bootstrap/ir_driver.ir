@@ -42008,6 +42008,17 @@ call 65 pith_list_release_handle void 1 64
 iconst 66 0
 ret 66
 endfunc
+func checker_builtins_is_builtin_function 1 bool
+param name
+load 1 checker_builtins___g_builtin_scope
+load 2 name
+call 3 scope_lookup_binding_index int 2 1 2
+iconst 4 0
+gte 5 3 4
+ret 5
+iconst 6 0
+ret 6
+endfunc
 func checker_builtins_builtin_scope_id 0 int
 load 0 checker_builtins___g_builtin_scope
 ret 0
@@ -175019,78 +175030,280 @@ string m47s294 "sha256,hex_encode,byte_buffer_string,hex_decode,to_hex,b64_encod
 string m47s295 "term_size,term_write,abs,min,max,clamp,len,fnv1a,ord,exec,fs_file_size,fs_file_mtime,fs_create_new,fs_mkdir_new,byte_buffer_len,byte_buffer_get,crypto_x25519_keygen,crypto_p256_keygen,crypto_p384_keygen,os_pid,signal_notify,signal_wait,signal_raise,tcp_shutdown,UInt,Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,float_to_bits"
 string m47s296 "term_is_tty,term_raw_enter,term_restore,file_exists,dir_exists,fs_remove_dir,fs_remove_tree,os_chdir,os_set_env,os_unset_env,get_bool,object_has,has,crypto_constant_time_eq,crypto_verify_ed25519,crypto_verify_ecdsa_p256_sha256_asn1,crypto_verify_ecdsa_p256_sha384_asn1,crypto_verify_ecdsa_p384_sha384_asn1,crypto_verify_rsa_pkcs1_sha256,crypto_verify_rsa_pkcs1_sha384,crypto_verify_rsa_pss_sha384,crypto_verify_rsa_pss_sha512,crypto_verify_rsa_pkcs1_sha512,crypto_verify_rsa_pss_sha256,byte_buffer_set"
 string m47s297 "pow,sqrt,floor,ceil,round,to_float,get_float,float_from_bits"
-string m47s298 "pat_binding"
-string m47s299 "block"
-string m47s300 "body"
-string m47s301 "loop_index"
-string m47s302 "loop_var"
-string m47s303 "for_stmt"
-string m47s304 "while_let"
-string m47s305 "if_let"
-string m47s306 "param"
-string m47s307 "lambda"
-string m47s308 "self"
-string m47s309 "ident"
-string m47s310 "file_open_read failed"
-string m47s311 "file_open_write failed"
-string m47s312 "file_open_append failed"
-string m47s313 "byte_buffer_write_byte failed"
-string m47s314 "tcp_connect failed"
-string m47s315 "tcp_listen failed"
-string m47s316 "tcp_accept failed"
-string m47s317 "process_spawn failed"
-string m47s318 "process_spawn_argv failed"
-string m47s319 "process_output_argv failed"
-string m47s320 "crypto_x25519_keygen failed"
-string m47s321 "crypto_p256_keygen failed"
-string m47s322 "crypto_p384_keygen failed"
-string m47s323 "write_file failed"
-string m47s324 "append_file failed"
-string m47s325 "write_file_bytes failed"
-string m47s326 "append_file_bytes failed"
-string m47s327 "read_file failed"
-string m47s328 "exec_output failed"
-string m47s329 "dns_resolve failed"
-string m47s330 "bytes_to_string_utf8 failed"
-string m47s331 "bytes_substring_utf8 failed"
-string m47s332 "file_read failed"
-string m47s333 "tcp_read failed"
-string m47s334 "process_read failed"
-string m47s335 "process_read_err failed"
-string m47s336 "term_read failed"
-string m47s337 "read_file_bytes failed"
-string m47s338 "b64_decode failed"
-string m47s339 "from_hex failed"
-string m47s340 "file_read_bytes failed"
-string m47s341 "tcp_read_bytes failed"
-string m47s342 "process_read_bytes failed"
-string m47s343 "process_read_err_bytes failed"
-string m47s344 "crypto_x25519_public_key failed"
-string m47s345 "crypto_x25519_shared_secret failed"
-string m47s346 "crypto_aes_128_gcm_seal failed"
-string m47s347 "crypto_aes_128_gcm_open failed"
-string m47s348 "crypto_aes_256_gcm_seal failed"
-string m47s349 "crypto_aes_256_gcm_open failed"
-string m47s350 "crypto_chacha20_poly1305_seal failed"
-string m47s351 "crypto_chacha20_poly1305_open failed"
-string m47s352 "crypto_sign_rsa_pss_sha256_pkcs8 failed"
-string m47s353 "crypto_sign_rsa_pkcs1_sha256_pkcs8 failed"
-string m47s354 "crypto_sign_ed25519_pkcs8 failed"
-string m47s355 "crypto_sign_ecdsa_p256_sha256_pkcs8 failed"
-string m47s356 "crypto_sign_ecdsa_p256_sha256_asn1_pkcs8 failed"
-string m47s357 "crypto_sign_rsa_pss_sha384_pkcs8 failed"
-string m47s358 "crypto_sign_rsa_pss_sha512_pkcs8 failed"
-string m47s359 "crypto_sign_rsa_pkcs1_sha384_pkcs8 failed"
-string m47s360 "crypto_sign_rsa_pkcs1_sha512_pkcs8 failed"
-string m47s361 "crypto_sign_ecdsa_p384_sha384_asn1_pkcs8 failed"
-string m47s362 "crypto_blake2b failed"
-string m47s363 "crypto_argon2id failed"
-string m47s364 "zstd_compress failed"
-string m47s365 "zstd_decompress failed"
-string m47s366 "index out of bounds"
-string m47s367 "unwrap of none"
-string m47s368 "value() on none"
-string m47s369 "none"
+string m47s298 "pith_cycle_gc_stats"
+string m47s299 "pith_cycle_gc_collect_now"
+string m47s300 "process_output_close"
+string m47s301 "process_output_stderr"
+string m47s302 "process_output_stdout"
+string m47s303 "process_output_status"
+string m47s304 "process_close"
+string m47s305 "process_kill"
+string m47s306 "process_wait"
+string m47s307 "term_write"
+string m47s308 "term_read"
+string m47s309 "term_size"
+string m47s310 "term_restore"
+string m47s311 "term_raw_enter"
+string m47s312 "term_is_tty"
+string m47s313 "process_read_err_bytes"
+string m47s314 "process_read_bytes"
+string m47s315 "process_write_bytes"
+string m47s316 "process_read_err"
+string m47s317 "process_read"
+string m47s318 "process_write"
+string m47s319 "process_output_argv"
+string m47s320 "process_spawn_argv"
+string m47s321 "process_spawn"
+string m47s322 "tcp_set_write_deadline"
+string m47s323 "tcp_set_read_deadline"
+string m47s324 "tcp_set_timeout"
+string m47s325 "tcp_wait_writable"
+string m47s326 "tcp_wait_readable"
+string m47s327 "tcp_write_bytes"
+string m47s328 "tcp_read_bytes"
+string m47s329 "tcp_write"
+string m47s330 "tcp_read"
+string m47s331 "tcp_accept"
+string m47s332 "tcp_listen"
+string m47s333 "tcp_connect"
+string m47s334 "file_close"
+string m47s335 "file_write_bytes"
+string m47s336 "file_read_bytes"
+string m47s337 "file_write"
+string m47s338 "file_read"
+string m47s339 "byte_buffer_clear"
+string m47s340 "byte_buffer_set"
+string m47s341 "byte_buffer_get"
+string m47s342 "byte_buffer_len"
+string m47s343 "byte_buffer_string"
+string m47s344 "byte_buffer_bytes"
+string m47s345 "byte_buffer_write_word"
+string m47s346 "byte_buffer_write_range"
+string m47s347 "sha256_blocks"
+string m47s348 "crc32_fold"
+string m47s349 "bytes_read_word"
+string m47s350 "byte_buffer_copy_within"
+string m47s351 "byte_buffer_write_byte"
+string m47s352 "byte_buffer_write_string_utf8"
+string m47s353 "byte_buffer_write"
+string m47s354 "byte_buffer_with_capacity"
+string m47s355 "byte_buffer_take_bytes"
+string m47s356 "byte_buffer_free"
+string m47s357 "byte_buffer_new"
+string m47s358 "zstd_decompress"
+string m47s359 "zstd_compress"
+string m47s360 "crypto_argon2id"
+string m47s361 "crypto_blake2b"
+string m47s362 "crypto_verify_rsa_pkcs1_sha512"
+string m47s363 "crypto_verify_rsa_pss_sha512"
+string m47s364 "crypto_verify_rsa_pss_sha384"
+string m47s365 "crypto_sign_ecdsa_p384_sha384_asn1_pkcs8"
+string m47s366 "crypto_sign_rsa_pkcs1_sha512_pkcs8"
+string m47s367 "crypto_sign_rsa_pkcs1_sha384_pkcs8"
+string m47s368 "crypto_sign_rsa_pss_sha512_pkcs8"
+string m47s369 "crypto_sign_rsa_pss_sha384_pkcs8"
+string m47s370 "crypto_sign_ecdsa_p256_sha256_asn1_pkcs8"
+string m47s371 "crypto_sign_ecdsa_p256_sha256_pkcs8"
+string m47s372 "crypto_sign_ed25519_pkcs8"
+string m47s373 "crypto_sign_rsa_pkcs1_sha256_pkcs8"
+string m47s374 "crypto_sign_rsa_pss_sha256_pkcs8"
+string m47s375 "crypto_verify_rsa_pss_sha256"
+string m47s376 "crypto_verify_rsa_pkcs1_sha384"
+string m47s377 "crypto_verify_rsa_pkcs1_sha256"
+string m47s378 "crypto_verify_ecdsa_p384_sha384_asn1"
+string m47s379 "crypto_verify_ecdsa_p256_sha384_asn1"
+string m47s380 "crypto_verify_ecdsa_p256_sha256_asn1"
+string m47s381 "crypto_verify_ed25519"
+string m47s382 "crypto_chacha20_poly1305_open"
+string m47s383 "crypto_chacha20_poly1305_seal"
+string m47s384 "crypto_aes_256_gcm_open"
+string m47s385 "crypto_aes_256_gcm_seal"
+string m47s386 "crypto_aes_128_gcm_open"
+string m47s387 "crypto_aes_128_gcm_seal"
+string m47s388 "crypto_x25519_close"
+string m47s389 "crypto_x25519_shared_secret"
+string m47s390 "crypto_x25519_public_key"
+string m47s391 "crypto_p384_keygen"
+string m47s392 "crypto_p256_keygen"
+string m47s393 "crypto_x25519_keygen"
+string m47s394 "secure_random_bytes"
+string m47s395 "crypto_constant_time_eq"
+string m47s396 "bytes_substring_utf8"
+string m47s397 "bytes_get"
+string m47s398 "bytes_eq"
+string m47s399 "fs_mkdir_new"
+string m47s400 "fs_create_new"
+string m47s401 "append_file_bytes"
+string m47s402 "write_file_bytes"
+string m47s403 "append_file"
+string m47s404 "write_file"
+string m47s405 "os_set_env"
+string m47s406 "rename_file"
+string m47s407 "file_open_append"
+string m47s408 "file_open_write"
+string m47s409 "file_open_read"
+string m47s410 "from_hex"
+string m47s411 "b64_decode"
+string m47s412 "read_file_bytes"
+string m47s413 "dns_resolve"
+string m47s414 "exec_output"
+string m47s415 "read_file"
+string m47s416 "bytes_from_string_utf8"
+string m47s417 "os_unset_env"
+string m47s418 "os_chdir"
+string m47s419 "os_cert_roots_pem"
+string m47s420 "os_home_dir"
+string m47s421 "os_temp_dir"
+string m47s422 "signal_raise"
+string m47s423 "signal_wait"
+string m47s424 "signal_notify"
+string m47s425 "os_pid"
+string m47s426 "os_getcwd"
+string m47s427 "list_dir"
+string m47s428 "fs_file_mtime"
+string m47s429 "fs_file_size"
+string m47s430 "env_opt"
+string m47s431 "env"
+string m47s432 "fs_remove_tree"
+string m47s433 "fs_remove_dir"
+string m47s434 "remove_file"
+string m47s435 "mkdir"
+string m47s436 "dir_exists"
+string m47s437 "file_exists"
+string m47s438 "ord"
+string m47s439 "exec"
+string m47s440 "test_name"
+string m47s441 "skip_test"
+string m47s442 "print_err"
+string m47s443 "fmt_float"
+string m47s444 "pow"
+string m47s445 "round"
+string m47s446 "ceil"
+string m47s447 "floor"
+string m47s448 "sqrt"
+string m47s449 "format_time"
+string m47s450 "clamp"
+string m47s451 "UInt64"
+string m47s452 "UInt32"
+string m47s453 "UInt16"
+string m47s454 "UInt8"
+string m47s455 "Int64"
+string m47s456 "Int32"
+string m47s457 "Int16"
+string m47s458 "Int8"
+string m47s459 "UInt"
+string m47s460 "bit_rotr64"
+string m47s461 "bit_rotl64"
+string m47s462 "bit_rotr32"
+string m47s463 "bit_rotl32"
+string m47s464 "bit_shr"
+string m47s465 "bit_shl"
+string m47s466 "bit_xor"
+string m47s467 "bit_or"
+string m47s468 "bit_and"
+string m47s469 "random_int"
+string m47s470 "max"
+string m47s471 "min"
+string m47s472 "random_string"
+string m47s473 "chr"
+string m47s474 "bit_not"
+string m47s475 "abs"
+string m47s476 "tcp_shutdown"
+string m47s477 "tcp_close"
+string m47s478 "random_seed"
+string m47s479 "sleep"
+string m47s480 "exit"
+string m47s481 "report_test_case"
+string m47s482 "set_test_failed"
+string m47s483 "assert"
+string m47s484 "args"
+string m47s485 "input"
+string m47s486 "float_to_bits"
+string m47s487 "float_from_bits"
+string m47s488 "random_float"
+string m47s489 "time_nanos"
+string m47s490 "time"
+string m47s491 "List[Int]"
+string m47s492 "List[String]"
+string m47s493 "<error>"
+string m47s494 "Void"
+string m47s495 "Bytes"
+string m47s496 "String"
+string m47s497 "Bool"
+string m47s498 "Float"
+string m47s499 "Int"
+string m47s500 "pat_binding"
+string m47s501 "block"
+string m47s502 "body"
+string m47s503 "loop_index"
+string m47s504 "loop_var"
+string m47s505 "for_stmt"
+string m47s506 "while_let"
+string m47s507 "if_let"
+string m47s508 "param"
+string m47s509 "lambda"
+string m47s510 "self"
+string m47s511 "ident"
+string m47s512 "file_open_read failed"
+string m47s513 "file_open_write failed"
+string m47s514 "file_open_append failed"
+string m47s515 "byte_buffer_write_byte failed"
+string m47s516 "tcp_connect failed"
+string m47s517 "tcp_listen failed"
+string m47s518 "tcp_accept failed"
+string m47s519 "process_spawn failed"
+string m47s520 "process_spawn_argv failed"
+string m47s521 "process_output_argv failed"
+string m47s522 "crypto_x25519_keygen failed"
+string m47s523 "crypto_p256_keygen failed"
+string m47s524 "crypto_p384_keygen failed"
+string m47s525 "write_file failed"
+string m47s526 "append_file failed"
+string m47s527 "write_file_bytes failed"
+string m47s528 "append_file_bytes failed"
+string m47s529 "read_file failed"
+string m47s530 "exec_output failed"
+string m47s531 "dns_resolve failed"
+string m47s532 "bytes_to_string_utf8 failed"
+string m47s533 "bytes_substring_utf8 failed"
+string m47s534 "file_read failed"
+string m47s535 "tcp_read failed"
+string m47s536 "process_read failed"
+string m47s537 "process_read_err failed"
+string m47s538 "term_read failed"
+string m47s539 "read_file_bytes failed"
+string m47s540 "b64_decode failed"
+string m47s541 "from_hex failed"
+string m47s542 "file_read_bytes failed"
+string m47s543 "tcp_read_bytes failed"
+string m47s544 "process_read_bytes failed"
+string m47s545 "process_read_err_bytes failed"
+string m47s546 "crypto_x25519_public_key failed"
+string m47s547 "crypto_x25519_shared_secret failed"
+string m47s548 "crypto_aes_128_gcm_seal failed"
+string m47s549 "crypto_aes_128_gcm_open failed"
+string m47s550 "crypto_aes_256_gcm_seal failed"
+string m47s551 "crypto_aes_256_gcm_open failed"
+string m47s552 "crypto_chacha20_poly1305_seal failed"
+string m47s553 "crypto_chacha20_poly1305_open failed"
+string m47s554 "crypto_sign_rsa_pss_sha256_pkcs8 failed"
+string m47s555 "crypto_sign_rsa_pkcs1_sha256_pkcs8 failed"
+string m47s556 "crypto_sign_ed25519_pkcs8 failed"
+string m47s557 "crypto_sign_ecdsa_p256_sha256_pkcs8 failed"
+string m47s558 "crypto_sign_ecdsa_p256_sha256_asn1_pkcs8 failed"
+string m47s559 "crypto_sign_rsa_pss_sha384_pkcs8 failed"
+string m47s560 "crypto_sign_rsa_pss_sha512_pkcs8 failed"
+string m47s561 "crypto_sign_rsa_pkcs1_sha384_pkcs8 failed"
+string m47s562 "crypto_sign_rsa_pkcs1_sha512_pkcs8 failed"
+string m47s563 "crypto_sign_ecdsa_p384_sha384_asn1_pkcs8 failed"
+string m47s564 "crypto_blake2b failed"
+string m47s565 "crypto_argon2id failed"
+string m47s566 "zstd_compress failed"
+string m47s567 "zstd_decompress failed"
+string m47s568 "index out of bounds"
+string m47s569 "unwrap of none"
+string m47s570 "value() on none"
+string m47s571 "none"
 struct Node kind value children line col
 struct Token kind value current_line current_column
 struct TypeInfo kind name fields field_types field_pub field_mut param_types return_type inner key_type value_type elements variants variant_types
@@ -175401,12 +175614,20 @@ ret 21
 label L14
 label L12
 load 22 name
-call 23 ir_metadata_ir_is_known_returning_func bool 1 22
-iconst 25 1
-sub 24 25 23
+call 23 checker_builtins_is_builtin_function bool 1 22
+brif 23 L16 L17
+label L16
+iconst 24 0
 ret 24
-iconst 26 0
-ret 26
+label L17
+label L15
+load 25 name
+call 26 ir_metadata_ir_is_known_returning_func bool 1 25
+iconst 28 1
+sub 27 28 26
+ret 27
+iconst 29 0
+ret 29
 endfunc
 func ir_capture_ir_find_free_vars_walk 5 list_string
 param idx
@@ -175447,11 +175668,11 @@ call 21 pith_struct_release void 1 18
 store node 20
 load 22 node
 field 23 22 0 string kind
-strref 24 m47s309
+strref 24 m47s511
 call 25 pith_cstring_eq bool 2 23 24
 call 26 pith_cstring_release void 1 24
-brif 25 L16 L17
-label L16
+brif 25 L19 L20
+label L19
 load 27 name
 load 28 node
 field 29 28 8 string value
@@ -175464,8 +175685,8 @@ load 34 free
 load 35 blocked_names
 load 36 locals
 call 37 ir_capture_ir_should_capture_name bool 5 32 33 34 35 36
-brif 37 L19 L20
-label L19
+brif 37 L22 L23
+label L22
 load 38 updated
 load 39 free
 call 40 ir_capture_ir_copy_names list_string 1 39
@@ -175500,8 +175721,8 @@ call 67 pith_struct_release void 1 66
 load 68 bind_name
 call 69 pith_cstring_release void 1 68
 ret 45
-label L20
-label L18
+label L23
+label L21
 load 70 free
 call 71 pith_list_retain_handle void 1 70
 load 72 node
@@ -175531,31 +175752,31 @@ call 95 pith_struct_release void 1 94
 load 96 bind_name
 call 97 pith_cstring_release void 1 96
 ret 70
-label L17
-label L15
+label L20
+label L18
 load 98 node
 field 99 98 0 string kind
-strref 100 m47s308
+strref 100 m47s510
 call 101 pith_cstring_eq bool 2 99 100
 call 102 pith_cstring_release void 1 100
-brif 101 L22 L23
-label L22
-strref 103 m47s308
+brif 101 L25 L26
+label L25
+strref 103 m47s510
 load 104 bound
 load 105 free
 load 106 blocked_names
 load 107 locals
 call 108 ir_capture_ir_should_capture_name bool 5 103 104 105 106 107
 call 109 pith_cstring_release void 1 103
-brif 108 L25 L26
-label L25
+brif 108 L28 L29
+label L28
 load 110 updated
 load 111 free
 call 112 ir_capture_ir_copy_names list_string 1 111
 call 113 pith_list_release_handle void 1 110
 store updated 112
 load 114 updated
-strref 115 m47s308
+strref 115 m47s510
 call 116 pith_list_push_value_owned void 2 114 115
 load 117 updated
 load 118 node
@@ -175583,8 +175804,8 @@ call 139 pith_struct_release void 1 138
 load 140 bind_name
 call 141 pith_cstring_release void 1 140
 ret 117
-label L26
-label L24
+label L29
+label L27
 load 142 free
 call 143 pith_list_retain_handle void 1 142
 load 144 node
@@ -175614,15 +175835,15 @@ call 167 pith_struct_release void 1 166
 load 168 bind_name
 call 169 pith_cstring_release void 1 168
 ret 142
-label L23
-label L21
+label L26
+label L24
 load 170 node
 field 171 170 0 string kind
-strref 172 m47s307
+strref 172 m47s509
 call 173 pith_cstring_eq bool 2 171 172
 call 174 pith_cstring_release void 1 172
-brif 173 L28 L29
-label L28
+brif 173 L31 L32
+label L31
 load 175 inner_bound
 load 176 bound
 call 177 ir_capture_ir_copy_names list_string 1 176
@@ -175636,17 +175857,17 @@ iconst 183 0
 store __for_idx_403 183
 store __for_len_403 182
 store __for_iter_403 180
-label L30
+label L33
 load 184 __for_idx_403
 load 185 __for_len_403
 lt 186 184 185
-brif 186 L34 L33
-label L34
+brif 186 L37 L36
+label L37
 load 187 __for_iter_403
 call 188 pith_auto_len int 1 187
 lt 186 184 188
-brif 186 L31 L33
-label L31
+brif 186 L34 L36
+label L34
 load 189 __for_iter_403
 load 190 __for_idx_403
 call 191 pith_list_get_value unknown 2 189 190
@@ -175658,25 +175879,25 @@ call 195 pith_struct_release void 1 192
 store cn 194
 load 196 cn
 field 197 196 0 string kind
-strref 198 m47s306
+strref 198 m47s508
 call 199 pith_cstring_eq bool 2 197 198
 call 200 pith_cstring_release void 1 198
-brif 199 L36 L37
-label L36
+brif 199 L39 L40
+label L39
 load 201 inner_bound
 load 202 cn
 field 203 202 8 string value
 call 204 pith_list_push_value void 2 201 203
-jmp L35
-label L37
+jmp L38
+label L40
+label L38
 label L35
-label L32
 load 205 __for_idx_403
 iconst 206 1
 add 207 205 206
 store __for_idx_403 207
-jmp L30
-label L33
+jmp L33
+label L36
 load 208 __for_iter_403
 call 209 pith_list_release_handle void 1 208
 load 210 updated_free
@@ -175692,17 +175913,17 @@ iconst 218 0
 store __for_idx_404 218
 store __for_len_404 217
 store __for_iter_404 215
-label L38
+label L41
 load 219 __for_idx_404
 load 220 __for_len_404
 lt 221 219 220
-brif 221 L42 L41
-label L42
+brif 221 L45 L44
+label L45
 load 222 __for_iter_404
 call 223 pith_auto_len int 1 222
 lt 221 219 223
-brif 221 L39 L41
-label L39
+brif 221 L42 L44
+label L42
 load 224 __for_iter_404
 load 225 __for_idx_404
 call 226 pith_list_get_value unknown 2 224 225
@@ -175713,25 +175934,25 @@ call 229 ast_get_node struct:Node 1 228
 call 230 pith_struct_release void 1 227
 store cn 229
 iconst 231 0
-store __or_231_46 231
+store __or_231_49 231
 load 232 cn
 field 233 232 0 string kind
-strref 234 m47s300
+strref 234 m47s502
 call 235 pith_cstring_eq bool 2 233 234
 call 236 pith_cstring_release void 1 234
-store __or_231_46 235
-brif 235 L47 L46
-label L46
+store __or_231_49 235
+brif 235 L50 L49
+label L49
 load 237 cn
 field 238 237 0 string kind
-strref 239 m47s299
+strref 239 m47s501
 call 240 pith_cstring_eq bool 2 238 239
 call 241 pith_cstring_release void 1 239
-store __or_231_46 240
+store __or_231_49 240
+label L50
+load 242 __or_231_49
+brif 242 L47 L48
 label L47
-load 242 __or_231_46
-brif 242 L44 L45
-label L44
 load 243 __loopvar_404_child
 load 244 inner_bound
 load 245 updated_free
@@ -175741,16 +175962,16 @@ call 248 ir_capture_ir_find_free_vars_walk list_string 5 243 244 245 246 247
 load 249 updated_free
 call 250 pith_list_release_handle void 1 249
 store updated_free 248
-jmp L43
-label L45
+jmp L46
+label L48
+label L46
 label L43
-label L40
 load 251 __for_idx_404
 iconst 252 1
 add 253 251 252
 store __for_idx_404 253
-jmp L38
-label L41
+jmp L41
+label L44
 load 254 __for_iter_404
 call 255 pith_list_release_handle void 1 254
 load 256 updated_free
@@ -175779,35 +176000,35 @@ call 278 pith_struct_release void 1 277
 load 279 bind_name
 call 280 pith_cstring_release void 1 279
 ret 256
-label L29
-label L27
+label L32
+label L30
 iconst 281 0
-store __or_281_51 281
+store __or_281_54 281
 load 282 node
 field 283 282 0 string kind
-strref 284 m47s305
+strref 284 m47s507
 call 285 pith_cstring_eq bool 2 283 284
 call 286 pith_cstring_release void 1 284
-store __or_281_51 285
-brif 285 L52 L51
-label L51
+store __or_281_54 285
+brif 285 L55 L54
+label L54
 load 287 node
 field 288 287 0 string kind
-strref 289 m47s304
+strref 289 m47s506
 call 290 pith_cstring_eq bool 2 288 289
 call 291 pith_cstring_release void 1 289
-store __or_281_51 290
+store __or_281_54 290
+label L55
+load 292 __or_281_54
+brif 292 L52 L53
 label L52
-load 292 __or_281_51
-brif 292 L49 L50
-label L49
 load 293 node
 field 294 293 16 list children
 call 295 pith_list_len int 1 294
 iconst 296 3
 lt 297 295 296
-brif 297 L54 L55
-label L54
+brif 297 L57 L58
+label L57
 load 298 idx
 load 299 bound
 load 300 free
@@ -175841,8 +176062,8 @@ call 327 pith_struct_release void 1 326
 load 328 bind_name
 call 329 pith_cstring_release void 1 328
 ret 303
-label L55
-label L53
+label L58
+label L56
 load 330 body_bound
 load 331 bound
 call 332 ir_capture_ir_copy_names list_string 1 331
@@ -175883,8 +176104,8 @@ field 363 362 16 list children
 call 364 pith_list_len int 1 363
 iconst 365 3
 gt 366 364 365
-brif 366 L57 L58
-label L57
+brif 366 L60 L61
+label L60
 load 367 node
 field 368 367 16 list children
 iconst 369 3
@@ -175897,9 +176118,9 @@ call 375 ir_capture_ir_find_free_vars_walk list_string 5 370 371 372 373 374
 load 376 let_free
 call 377 pith_list_release_handle void 1 376
 store let_free 375
-jmp L56
-label L58
-label L56
+jmp L59
+label L61
+label L59
 load 378 let_free
 load 379 node
 call 380 pith_struct_release void 1 379
@@ -175926,28 +176147,28 @@ call 400 pith_struct_release void 1 399
 load 401 bind_name
 call 402 pith_cstring_release void 1 401
 ret 378
-label L50
-label L48
+label L53
+label L51
 iconst 403 0
-store __and_403_62 403
+store __and_403_65 403
 load 404 node
 field 405 404 0 string kind
-strref 406 m47s303
+strref 406 m47s505
 call 407 pith_cstring_eq bool 2 405 406
 call 408 pith_cstring_release void 1 406
-store __and_403_62 407
-brif 407 L62 L63
-label L62
+store __and_403_65 407
+brif 407 L65 L66
+label L65
 load 409 node
 field 410 409 16 list children
 call 411 pith_list_len int 1 410
 iconst 412 2
 gte 413 411 412
-store __and_403_62 413
+store __and_403_65 413
+label L66
+load 414 __and_403_65
+brif 414 L63 L64
 label L63
-load 414 __and_403_62
-brif 414 L60 L61
-label L60
 load 415 loop_bound
 load 416 bound
 call 417 ir_capture_ir_copy_names list_string 1 416
@@ -175961,17 +176182,17 @@ iconst 423 0
 store __for_idx_405 423
 store __for_len_405 422
 store __for_iter_405 420
-label L64
+label L67
 load 424 __for_idx_405
 load 425 __for_len_405
 lt 426 424 425
-brif 426 L68 L67
-label L68
+brif 426 L71 L70
+label L71
 load 427 __for_iter_405
 call 428 pith_auto_len int 1 427
 lt 426 424 428
-brif 426 L65 L67
-label L65
+brif 426 L68 L70
+label L68
 load 429 __for_iter_405
 load 430 __for_idx_405
 call 431 pith_list_get_value unknown 2 429 430
@@ -175982,39 +176203,39 @@ call 434 ast_get_node struct:Node 1 433
 call 435 pith_struct_release void 1 432
 store cn 434
 iconst 436 0
-store __or_436_72 436
+store __or_436_75 436
 load 437 cn
 field 438 437 0 string kind
-strref 439 m47s302
+strref 439 m47s504
 call 440 pith_cstring_eq bool 2 438 439
 call 441 pith_cstring_release void 1 439
-store __or_436_72 440
-brif 440 L73 L72
-label L72
+store __or_436_75 440
+brif 440 L76 L75
+label L75
 load 442 cn
 field 443 442 0 string kind
-strref 444 m47s301
+strref 444 m47s503
 call 445 pith_cstring_eq bool 2 443 444
 call 446 pith_cstring_release void 1 444
-store __or_436_72 445
+store __or_436_75 445
+label L76
+load 447 __or_436_75
+brif 447 L73 L74
 label L73
-load 447 __or_436_72
-brif 447 L70 L71
-label L70
 load 448 loop_bound
 load 449 cn
 field 450 449 8 string value
 call 451 pith_list_push_value void 2 448 450
-jmp L69
-label L71
+jmp L72
+label L74
+label L72
 label L69
-label L66
 load 452 __for_idx_405
 iconst 453 1
 add 454 452 453
 store __for_idx_405 454
-jmp L64
-label L67
+jmp L67
+label L70
 load 455 __for_iter_405
 call 456 pith_list_release_handle void 1 455
 load 457 for_free
@@ -176065,28 +176286,28 @@ call 500 pith_struct_release void 1 499
 load 501 bind_name
 call 502 pith_cstring_release void 1 501
 ret 476
-label L61
-label L59
+label L64
+label L62
 iconst 503 0
-store __or_503_77 503
+store __or_503_80 503
 load 504 node
 field 505 504 0 string kind
-strref 506 m47s300
+strref 506 m47s502
 call 507 pith_cstring_eq bool 2 505 506
 call 508 pith_cstring_release void 1 506
-store __or_503_77 507
-brif 507 L78 L77
-label L77
+store __or_503_80 507
+brif 507 L81 L80
+label L80
 load 509 node
 field 510 509 0 string kind
-strref 511 m47s299
+strref 511 m47s501
 call 512 pith_cstring_eq bool 2 510 511
 call 513 pith_cstring_release void 1 511
-store __or_503_77 512
+store __or_503_80 512
+label L81
+load 514 __or_503_80
+brif 514 L78 L79
 label L78
-load 514 __or_503_77
-brif 514 L75 L76
-label L75
 load 515 scoped_bound
 load 516 bound
 call 517 ir_capture_ir_copy_names list_string 1 516
@@ -176105,17 +176326,17 @@ iconst 527 0
 store __for_idx_406 527
 store __for_len_406 526
 store __for_iter_406 524
-label L79
+label L82
 load 528 __for_idx_406
 load 529 __for_len_406
 lt 530 528 529
-brif 530 L83 L82
-label L83
+brif 530 L86 L85
+label L86
 load 531 __for_iter_406
 call 532 pith_auto_len int 1 531
 lt 530 528 532
-brif 530 L80 L82
-label L80
+brif 530 L83 L85
+label L83
 load 533 __for_iter_406
 load 534 __for_idx_406
 call 535 pith_list_get_value unknown 2 533 534
@@ -176137,48 +176358,48 @@ store child_node 546
 load 548 child_node
 field 549 548 0 string kind
 call 550 ir_ast_helpers_ir_is_binding_kind bool 1 549
-brif 550 L85 L86
-label L85
+brif 550 L88 L89
+label L88
 load 551 bind_name
 load 552 child_node
 call 553 ir_ast_helpers_ir_binding_name string 1 552
 call 554 pith_cstring_release void 1 551
 store bind_name 553
 iconst 555 0
-store __and_555_90 555
+store __and_555_93 555
 load 556 bind_name
 call 557 pith_cstring_len int 1 556
 iconst 558 0
 gt 559 557 558
-store __and_555_90 559
-brif 559 L90 L91
-label L90
+store __and_555_93 559
+brif 559 L93 L94
+label L93
 load 560 scoped_bound
 load 561 bind_name
 call 562 ir_ast_helpers_ir_list_contains bool 2 560 561
 iconst 564 1
 sub 563 564 562
-store __and_555_90 563
+store __and_555_93 563
+label L94
+load 565 __and_555_93
+brif 565 L91 L92
 label L91
-load 565 __and_555_90
-brif 565 L88 L89
-label L88
 load 566 scoped_bound
 load 567 bind_name
 call 568 pith_list_push_value void 2 566 567
+jmp L90
+label L92
+label L90
 jmp L87
 label L89
 label L87
-jmp L84
-label L86
 label L84
-label L81
 load 569 __for_idx_406
 iconst 570 1
 add 571 569 570
 store __for_idx_406 571
-jmp L79
-label L82
+jmp L82
+label L85
 load 572 __for_iter_406
 call 573 pith_list_release_handle void 1 572
 load 574 updated_free
@@ -176207,8 +176428,8 @@ call 596 pith_struct_release void 1 595
 load 597 bind_name
 call 598 pith_cstring_release void 1 597
 ret 574
-label L76
-label L74
+label L79
+label L77
 load 599 idx
 load 600 bound
 load 601 free
@@ -176294,17 +176515,17 @@ iconst 16 0
 store __for_idx_407 16
 store __for_len_407 15
 store __for_iter_407 12
-label L92
+label L95
 load 17 __for_idx_407
 load 18 __for_len_407
 lt 19 17 18
-brif 19 L96 L95
-label L96
+brif 19 L99 L98
+label L99
 load 20 __for_iter_407
 call 21 pith_auto_len int 1 20
 lt 19 17 21
-brif 19 L93 L95
-label L93
+brif 19 L96 L98
+label L96
 load 22 __for_iter_407
 load 23 __for_idx_407
 call 24 pith_list_get_value unknown 2 22 23
@@ -176318,13 +176539,13 @@ call 30 ir_capture_ir_find_free_vars_walk list_string 5 25 26 27 28 29
 load 31 updated_free
 call 32 pith_list_release_handle void 1 31
 store updated_free 30
-label L94
+label L97
 load 33 __for_idx_407
 iconst 34 1
 add 35 33 34
 store __for_idx_407 35
-jmp L92
-label L95
+jmp L95
+label L98
 load 36 __for_iter_407
 call 37 pith_list_release_handle void 1 36
 load 38 updated_free
@@ -176346,32 +176567,32 @@ call 6 pith_struct_release void 1 3
 store node 5
 load 7 node
 field 8 7 0 string kind
-strref 9 m47s298
+strref 9 m47s500
 call 10 pith_cstring_eq bool 2 8 9
 call 11 pith_cstring_release void 1 9
-brif 10 L98 L99
-label L98
+brif 10 L101 L102
+label L101
 load 12 names
 load 13 node
 field 14 13 8 string value
 call 15 ir_ast_helpers_ir_list_contains bool 2 12 14
 iconst 17 1
 sub 16 17 15
-brif 16 L101 L102
-label L101
+brif 16 L104 L105
+label L104
 load 18 names
 load 19 node
 field 20 19 8 string value
 call 21 pith_list_push_value void 2 18 20
-jmp L100
-label L102
-label L100
+jmp L103
+label L105
+label L103
 load 22 node
 call 23 pith_struct_release void 1 22
 iconst 24 0
 ret 24
-label L99
-label L97
+label L102
+label L100
 load 25 node
 field 26 25 16 list children
 call 27 pith_list_retain_handle void 1 26
@@ -176380,17 +176601,17 @@ iconst 29 0
 store __for_idx_408 29
 store __for_len_408 28
 store __for_iter_408 26
-label L103
+label L106
 load 30 __for_idx_408
 load 31 __for_len_408
 lt 32 30 31
-brif 32 L107 L106
-label L107
+brif 32 L110 L109
+label L110
 load 33 __for_iter_408
 call 34 pith_auto_len int 1 33
 lt 32 30 34
-brif 32 L104 L106
-label L104
+brif 32 L107 L109
+label L107
 load 35 __for_iter_408
 load 36 __for_idx_408
 call 37 pith_list_get_value unknown 2 35 36
@@ -176398,13 +176619,13 @@ store __loopvar_408_child 37
 load 38 __loopvar_408_child
 load 39 names
 call 40 ir_capture_ir_collect_pattern_names void 2 38 39
-label L105
+label L108
 load 41 __for_idx_408
 iconst 42 1
 add 43 41 42
 store __for_idx_408 43
-jmp L103
-label L106
+jmp L106
+label L109
 load 44 __for_iter_408
 call 45 pith_list_release_handle void 1 44
 load 46 node

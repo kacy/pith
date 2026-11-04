@@ -584,6 +584,10 @@ The sweep needs all 16 wrk threads. With 8, its old default, wrk held the minima
 WRK=wrk PITH=./target/release/pith bench/http_sweep.sh
 ```
 
+## api gateway benchmark
+
+`bench/gateway_bench.sh` compares `examples/gateway` with `bench/gateway.go`, a Go `net/http` gateway with the same behavior. It covers plain forwarding, an ES256 bearer token checked at the edge, and a backend killed partway through a run. The results and what limits them are in [examples/gateway/README.md](../examples/gateway/README.md).
+
 ## catalog service benchmark
 
 there is also a more realistic in-memory microservice benchmark:

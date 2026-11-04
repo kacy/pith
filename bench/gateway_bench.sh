@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # compare the gateway in examples/gateway with its go counterpart, bench/gateway.go,
-# and print one table of median req/s, latency and memory.
+# and print one table of median req/s, latency and memory. req/s counts successful
+# responses only, so a request refused quickly does not read as throughput.
 #
 #   bench/gateway_bench.sh
 #
@@ -17,7 +18,8 @@
 #   PITH         pith compiler (default: ./target/release/pith)
 #   ARMS         arms to run (default: "pith go")
 #   SCENARIOS    scenarios to run (default: "plain auth failure")
-#   CONNS        wrk connection counts (default: "64 256 1024")
+#   CONNS        wrk connection counts (default: "64 256"). std.web answers 503
+#                past 512 open connections, so a higher count measures refusals.
 #   TRIALS       trials per arm and scenario; the median is reported (default: 3)
 #   DURATION     seconds per measured run (default: 8)
 #   WORKERS      PITH_GREEN_WORKERS and GOMAXPROCS for the gateway (default: 16)
@@ -32,7 +34,7 @@ cd "$root"
 pith=${PITH:-./target/release/pith}
 arms=${ARMS:-pith go}
 scenarios=${SCENARIOS:-plain auth failure}
-conns_list=${CONNS:-64 256 1024}
+conns_list=${CONNS:-64 256}
 trials=${TRIALS:-3}
 duration=${DURATION:-8}
 workers=${WORKERS:-16}
@@ -156,11 +158,12 @@ run_once() {
     p50=$(to_us "$(echo "$out" | awk '$1 == "50%" { print $2 }')")
     p99=$(to_us "$(echo "$out" | awk '$1 == "99%" { print $2 }')")
     failed=$(echo "$out" | awk '/Non-2xx/ { n = $NF } /Socket errors/ { gsub(",", ""); s = $4 + $6 + $8 + $10 } END { print n + s + 0 }')
+    rate=$(awk -v r="$rate" -v f="$failed" -v d="$duration" 'BEGIN { printf "%.0f", r - f / d }')
     echo "$rate $p50 $p99 $failed $rss"
     stop_all
 }
 
-echo "| scenario | conns | arm | req/s | p50 us | p99 us | failed | peak rss kb |"
+echo "| scenario | conns | arm | ok req/s | p50 us | p99 us | failed | peak rss kb |"
 echo "|---|---:|---|---:|---:|---:|---:|---:|"
 for scenario in $scenarios; do
     for conns in $conns_list; do

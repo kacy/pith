@@ -356,6 +356,12 @@ impl BufferedBytesReader:
     fn read_all_bytes_chunked(chunk_size: Int) -> Bytes!:
         return read_all_buffered_bytes_reader_chunked(self, chunk_size)
 
+    # how many bytes this reader holds that nothing has read yet.
+    fn cached_len() -> Int:
+        if not buffered_bytes_readers.contains_key(self.handle):
+            return 0
+        return buffered_bytes_readers[self.handle].cache.len()
+
     fn free():
         free_buffered_bytes_reader(self)
 

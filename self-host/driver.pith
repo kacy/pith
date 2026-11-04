@@ -5,7 +5,8 @@
 
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
-from ast import get_node, node_count
+from ast import get_node, node_count, set_node_value
+from checker_modules import module_default_alias
 from errors import Diagnostic
 from std.collections import copy_list, copy_map
 import std.time as time
@@ -68,6 +69,48 @@ pub fn find_imports(root_idx: Int) -> List[String]:
             else:
                 imports.push(value)
     return imports
+
+# one file can be imported under several spellings: `import config` beside it,
+# `import gateway.config` from the directory above. it is parsed once, and its
+# declarations are registered under the spelling that reached it first, so a
+# later importer has to use that one. these record the first spelling of each
+# file, and which (importing file, spelling) pairs have to change to it.
+mut first_import_spellings: Map[String, String] := {}
+mut import_respellings: Map[String, String] := {}
+
+fn import_respelling_key(source_path: String, mod_path: String) -> String:
+    return source_path + chr(9) + mod_path
+
+# give every import in `root` the spelling its file was first reached by, so
+# the checker and the emitter see one name for one module. `root` is the file at
+# `source_path`.
+pub fn respell_imports(root_idx: Int, source_path: String):
+    if import_respellings.len() == 0:
+        return
+    for child in get_node(root_idx).children:
+        mut idx := child
+        node := get_node(child)
+        if node.kind == "pub" and node.children.len() > 0:
+            idx = node.children[0]
+        inner := get_node(idx)
+        if inner.kind == "import":
+            as_pos := inner.value.index_of(" as ")
+            mut spelled := inner.value
+            if as_pos >= 0:
+                spelled = inner.value.substring(0, as_pos)
+            key := import_respelling_key(source_path, spelled)
+            if import_respellings.contains_key(key):
+                # the name it is used by in this file stays what it was
+                mut alias := module_default_alias(spelled)
+                if as_pos >= 0:
+                    alias = inner.value.substring(as_pos + 4, inner.value.len())
+                set_node_value(idx, import_respellings[key] + " as " + alias)
+        elif inner.kind == "from_import":
+            space_pos := inner.value.index_of(" ")
+            if space_pos >= 0:
+                key := import_respelling_key(source_path, inner.value.substring(0, space_pos))
+                if import_respellings.contains_key(key):
+                    set_node_value(idx, import_respellings[key] + inner.value.substring(space_pos, inner.value.len()))
 
 # global visited map for diamond import dedup.
 # keep it global so the recursive import walk can mutate one shared map.
@@ -203,6 +246,8 @@ pub struct DriverSnapshot:
     pub edge_files: List[String]
     pub read_files: List[String]
     pub contents: List[String]
+    pub first_spellings: Map[String, String]
+    pub respellings: Map[String, String]
 
 # copy the driver's post-walk state out.
 pub fn take_driver_snapshot() -> DriverSnapshot:
@@ -221,7 +266,9 @@ pub fn take_driver_snapshot() -> DriverSnapshot:
         edge_sources: copy_list(walk_edge_sources),
         edge_files: copy_list(walk_edge_files),
         read_files: copy_list(walk_read_files),
-        contents: copy_list(walk_contents))
+        contents: copy_list(walk_contents),
+        first_spellings: copy_map(first_import_spellings),
+        respellings: copy_map(import_respellings))
 
 # make the driver's state a copy of the snapshot: what a walk over the
 # same closure would have left, timings aside. the snapshot is left as
@@ -243,6 +290,8 @@ pub fn restore_driver_snapshot(s: DriverSnapshot):
     walk_edge_files = copy_list(s.edge_files)
     walk_read_files = copy_list(s.read_files)
     walk_contents = copy_list(s.contents)
+    first_import_spellings = copy_map(s.first_spellings)
+    import_respellings = copy_map(s.respellings)
     reset_import_timings()
 
 # true when walking the closure again would read exactly what the
@@ -566,7 +615,9 @@ pub fn resolve_imports(root_idx: Int, source_path: String) -> List[Int]!:
         return roots
     imports := find_imports(root_idx)
     positions := import_positions(root_idx, imports)
-    return resolve_import_list(imports, positions.0, positions.1, source_path)!
+    resolved := resolve_import_list(imports, positions.0, positions.1, source_path)!
+    respell_imports(root_idx, source_path)
+    return resolved
 
 # the import walk from a list of module paths rather than a root node,
 # with the line and column of each import declaration alongside for the
@@ -592,6 +643,11 @@ pub fn resolve_import_list(imports: List[String], lines: List[Int], cols: List[I
         walk_edge_paths.push(mod_path)
         walk_edge_sources.push(source_path)
         walk_edge_files.push(file_path)
+        if first_import_spellings.contains_key(file_path):
+            if first_import_spellings[file_path] != mod_path:
+                import_respellings.insert(import_respelling_key(source_path, mod_path), first_import_spellings[file_path])
+        else:
+            first_import_spellings.insert(file_path, mod_path)
         if visited_files.contains_key(file_path):
             continue
         # Check for import cycles (must check this AFTER checking visited)
@@ -671,6 +727,8 @@ pub fn begin_driver(source_path: String):
     module_range_ends = []
     module_range_files = []
     walk_edge_paths = []
+    first_import_spellings = {}
+    import_respellings = {}
     walk_edge_sources = []
     walk_edge_files = []
     walk_read_files = []

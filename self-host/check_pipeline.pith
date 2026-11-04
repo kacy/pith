@@ -8,7 +8,7 @@
 from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import reset_arena, get_node, node_count, truncate_arena, take_nodes_from, append_relocated_nodes
-from driver import init_driver, begin_driver, resolve_imports, resolve_import_list, find_imports, import_positions, record_entry_node_range, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node, import_timing_line, import_module_timings, walk_module_files, walk_is_unchanged, DriverSnapshot, take_driver_snapshot, restore_driver_snapshot
+from driver import init_driver, begin_driver, resolve_imports, resolve_import_list, respell_imports, find_imports, import_positions, record_entry_node_range, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node, import_timing_line, import_module_timings, walk_module_files, walk_is_unchanged, DriverSnapshot, take_driver_snapshot, restore_driver_snapshot
 from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module, get_definition_of, CheckerSnapshot, take_checker_snapshot, restore_checker_snapshot
 from errors import Diagnostic
 from std.collections import copy_list
@@ -217,6 +217,7 @@ fn run_cached_pipeline(path: String) -> CheckOutcome!:
     if closure_cache_ready and same_imports(imports) and walk_is_unchanged(cache_driver[0]):
         restore_started := time.mono_millis()
         restore_driver_snapshot(cache_driver[0])
+        respell_imports(root, path)
         record_entry_node_range(entry_start, node_count(), path)
         restore_checker_snapshot(cache_checker[0])
         timing_snapshot_ms = time.mono_millis() - restore_started
@@ -235,6 +236,7 @@ fn run_cached_pipeline(path: String) -> CheckOutcome!:
     begin_driver(path)
     import_roots := resolve_import_list(imports, positions.0, positions.1, path)!
     root = root + append_relocated_nodes(taken, entry_start)
+    respell_imports(root, path)
     resolved := time.mono_millis()
     timing_imports_ms = resolved - parsed
     timing_module_count = import_roots.len() + 1

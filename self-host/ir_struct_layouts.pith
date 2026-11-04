@@ -38,14 +38,23 @@ pub fn ir_struct_field_count_with_state(struct_name: String, struct_names: Map[S
 # falls through to a linear scan of the whole "Struct.field" -> index
 # table, so the fallback path costs one pass over every field of every
 # struct in the program and should not sit inside a hot loop.
+#
+# the type table is keyed by bare name, so with two modules declaring the name
+# it can answer with the other module's struct. its answer only counts when this
+# module's layout agrees. taking it unchecked made a same-named struct's fields
+# look unknown, which cost it its destructor: its contents leaked, and a share
+# walk could not see inside it, so what it held stayed on plain counts while
+# other tasks reached it.
 pub fn ir_struct_field_name_at_with_state(struct_name: String, field_index: Int, struct_names: Map[String, Int], struct_field_index_lookup: Map[String, String]) -> String:
+    prefix := ir_struct_layout_name_with_state(struct_name, struct_names) + "."
+    want := field_index.to_string()
     struct_tid := lookup_type_id(struct_name)
     if struct_tid >= 0:
         struct_info := get_type_info(struct_tid)
         if struct_info.kind == "struct" and field_index >= 0 and field_index < struct_info.fields.len():
-            return struct_info.fields[field_index]
-    prefix := ir_struct_layout_name_with_state(struct_name, struct_names) + "."
-    want := field_index.to_string()
+            candidate := struct_info.fields[field_index]
+            if struct_field_index_lookup.get_default(prefix + candidate, "") == want:
+                return candidate
     for key in struct_field_index_lookup:
         if key.starts_with(prefix) and struct_field_index_lookup[key] == want:
             return key.substring(prefix.len(), key.len())

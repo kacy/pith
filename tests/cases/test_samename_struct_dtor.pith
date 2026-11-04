@@ -1,0 +1,15 @@
+# a struct keeps its destructor when a module registered later declares the same
+# name. the emitter used to read the field names from the other struct, decide
+# this one held nothing to release, and emit no destructor, so what it held
+# leaked and was never reached by a share walk.
+import clash_dtor_a as a
+import clash_dtor_b as b
+
+fn use_both():
+    first := a.make("held by a")
+    second := b.make()
+    print(first.held.name + " " + second.size.to_string())
+
+fn main():
+    use_both()
+    print("done")

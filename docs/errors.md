@@ -364,6 +364,15 @@ error[E231]: return statement outside of function
 
 a `spawn` or `await` expression has a type error.
 
+
+a spawn's arguments and a method call's receiver are evaluated on the new task, so
+`!` among them has no function to return from. bind the value before the spawn:
+
+```
+value := load()!
+t := spawn work(value)
+```
+
 ### E233 — type nesting too deep
 
 type declarations are nested too deeply (exceeds the compiler's recursion limit).

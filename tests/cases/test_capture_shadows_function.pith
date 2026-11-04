@@ -1,0 +1,19 @@
+# a local, parameter or loop variable spelled like an imported function is the
+# variable when a spawn or a lambda captures it. a loop variable used to be left
+# uncaptured, and the task read the function's address as its value.
+from shadow_fn_helper import target
+
+fn plus_one(x: Int) -> Int:
+    return x + 1
+
+fn from_param(target: Int) -> Int:
+    read := fn() => target + 1
+    return read()
+
+fn main():
+    print(target().to_string())
+    for target in [5, 6]:
+        task := spawn plus_one(target)
+        read := fn() => target * 10
+        print((await task).to_string() + " " + read().to_string())
+    print(from_param(1).to_string())

@@ -1,0 +1,15 @@
+# indexing a list in a spawn's arguments, inside a function that returns a result.
+# the task wrapper took the enclosing function's error path, which released that
+# function's locals, and any declared after the spawn failed the build.
+fn size(text: String) -> Int:
+    return text.len()
+
+fn run() -> Int!:
+    words := ["abc"]
+    task := spawn size(words[0])
+    later := ["kept"]
+    print((await task).to_string() + " " + later[0])
+    return 0
+
+fn main():
+    print((run() catch 1).to_string())

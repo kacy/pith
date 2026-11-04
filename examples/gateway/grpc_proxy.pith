@@ -9,6 +9,7 @@
 
 import std.metrics as metrics
 import std.net.grpc as grpc
+import std.net.tls as tls
 import std.time as time
 import auth
 import config
@@ -17,6 +18,9 @@ struct Target:
     address: String
     host: String
     port: Int
+    use_tls: Bool
+    # the certificate authority for a tls target, or "" for the system's.
+    ca_file: String
     mu: Mutex
     # the shared http/2 connection, dialed on first use.
     mut conn: grpc.Conn?
@@ -31,7 +35,7 @@ pub fn proxy(cfg: config.Config) -> Proxy!:
     mut targets: List[Target] := []
     for address in cfg.server.grpc_upstreams:
         parts := config.split_address(address)!
-        targets.push(Target(address, parts.0, parts.1, Mutex(), none))
+        targets.push(Target(address, parts.host, parts.port, parts.use_tls, cfg.server.upstream_ca, Mutex(), none))
     return Proxy(targets, AtomicInt(0), auth.verifier(cfg.auth), cfg.server.grpc_auth)
 
 impl Target:
@@ -40,9 +44,16 @@ impl Target:
         defer self.mu.unlock()
         if let live = self.conn:
             return live
-        dialed := grpc.dial_h2c(self.host, self.port)!
+        dialed := self.dial()!
         self.conn = dialed
         return dialed
+
+    fn dial() -> grpc.Conn!:
+        if not self.use_tls:
+            return grpc.dial_h2c(self.host, self.port)!
+        if self.ca_file == "":
+            return grpc.dial(self.host, self.port)!
+        return grpc.dial_with_config(self.host, self.port, tls.client_config_with_ca_file(self.ca_file)!)!
 
     # forget a connection that failed, unless another task already replaced it.
     fn drop_connection(failed: grpc.Conn):

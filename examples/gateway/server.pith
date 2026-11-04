@@ -2,6 +2,7 @@
 
 import std.net.grpc as grpc
 import std.net.http as http
+import std.net.tls as tls
 import std.resilience as resilience
 import std.log as log
 import std.web as web
@@ -18,45 +19,49 @@ METHODS := ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
 IDLE_CONN_TIMEOUT_MS := 30000
 DIAL_TIMEOUT_MS := 1000
 
-fn upstream_client(settings: config.Server) -> http.Client:
+fn upstream_client(settings: config.Server) -> http.Client!:
     # a proxy relays what the backend said, so it follows no redirects and leaves
     # compression to the two ends.
-    return http.client().with_max_idle_conns_per_host(settings.max_idle_upstream_conns).with_idle_conn_timeout(IDLE_CONN_TIMEOUT_MS).with_dial_timeout(DIAL_TIMEOUT_MS).with_max_redirects(0).with_compression(false)
+    client := http.client().with_max_idle_conns_per_host(settings.max_idle_upstream_conns).with_idle_conn_timeout(IDLE_CONN_TIMEOUT_MS).with_dial_timeout(DIAL_TIMEOUT_MS).with_max_redirects(0).with_compression(false)
+    if settings.upstream_ca != "":
+        return client.with_tls_config(tls.client_config_with_ca_file(settings.upstream_ca)!)
+    return client
 
 fn route_pattern(prefix: String) -> String:
     if prefix.ends_with("/"):
         return prefix + "*rest"
     return prefix + "/*rest"
 
-# spawn takes a call to a function in this module.
-fn watch_upstream(pool: upstream.Pool, target: upstream.Upstream, route: config.Route) -> Int:
-    return upstream.health_loop(pool, target, route.health_path, route.health_interval_ms)
-
 # an app with every configured route on it, plus the health checks those routes
 # asked for, already running. /healthz and /metrics come from web.new().
 pub fn build(cfg: config.Config) -> web.App!:
-    client := upstream_client(cfg.server)
-    mut app := web.new().with_config(web.server_config().with_max_body_bytes(cfg.server.max_body_bytes))
+    client := upstream_client(cfg.server)!
+    # health checks get their own client: a probe should open its own connection
+    # and say nothing about the pool requests use
+    prober := client.copy().with_keep_alives(false)
+    mut app := web.new().with_config(web.server_config().with_max_body_bytes(cfg.server.max_body_bytes).with_max_connections(cfg.server.max_connections))
     check := auth.verifier(cfg.auth)
     mut scheme := "http"
     if cfg.server.tls_cert != "":
         scheme = "https"
     for route in cfg.routes:
         pool := upstream.new_pool(route)!
-        forwarder := proxy.forwarder(route, pool, client, scheme)
+        forwarder := proxy.forwarder(route, pool, client, scheme, cfg.server.trust_forwarded_for)
         handler := fn(req: web.Request) => forwarder.forward(req)
         pattern := route_pattern(route.prefix)
         for method in METHODS:
             app = app.handle(method, pattern, handler)
+        if route.ip_rate_per_second > 0:
+            app = app.group(route.prefix, limits.per_address(limits.caller_limits(route.ip_rate_per_second, route.ip_rate_burst)))
         if route.rate_per_second > 0:
             app = app.group(route.prefix, web.rate_limit(resilience.rate_limiter(route.rate_per_second, route.rate_burst)))
         if route.auth:
             app = app.group(route.prefix, auth.require(check))
             if route.subject_rate_per_second > 0:
-                app = app.group(route.prefix, limits.per_subject(limits.subject_limits(route.subject_rate_per_second, route.subject_rate_burst)))
+                app = app.group(route.prefix, limits.per_subject(limits.caller_limits(route.subject_rate_per_second, route.subject_rate_burst)))
         if route.health_path != "":
             for target in pool.upstreams:
-                spawn watch_upstream(pool, target, route)
+                spawn upstream.health_loop(pool, target, route.health_path, route.health_interval_ms, prober)
     return app
 
 fn run_grpc_listener(cfg: config.Config, dispatch: fn(String, grpc.GrpcStream) -> Int!grpc.GrpcError) -> Int!:

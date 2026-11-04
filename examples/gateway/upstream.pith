@@ -5,6 +5,7 @@
 # reacts to real traffic failing. the health check notices a backend that is
 # down before a request has to find out, and notices when it comes back.
 
+import std.bytes as bytes
 import std.net.http as http
 import std.metrics as metrics
 import std.resilience as resilience
@@ -23,6 +24,7 @@ pub struct Upstream:
     pub address: String
     pub host: String
     pub port: Int
+    pub use_tls: Bool
     pub breaker: resilience.Breaker
     # 1 while the health check says this upstream is up.
     pub healthy: AtomicInt
@@ -36,7 +38,7 @@ pub fn new_pool(route: config.Route) -> Pool!:
     mut upstreams: List[Upstream] := []
     for address in route.upstreams:
         parts := config.split_address(address)!
-        upstreams.push(Upstream(address, parts.0, parts.1, resilience.circuit_breaker(route.breaker_failures, route.breaker_reset_ms), AtomicInt(1)))
+        upstreams.push(Upstream(address, parts.host, parts.port, parts.use_tls, resilience.circuit_breaker(route.breaker_failures, route.breaker_reset_ms), AtomicInt(1)))
     return Pool(route.name, upstreams, AtomicInt(0))
 
 impl Pool:
@@ -62,13 +64,12 @@ impl Pool:
         return -1
 
 fn check_once(client: http.Client, target: Upstream, path: String) -> Bool:
-    probe := http.request("GET", target.host, target.port, path).with_timeout(HEALTH_TIMEOUT_MS)
+    probe := http.ClientRequest("GET", target.host, target.port, path, {}, bytes.empty(), target.use_tls, HEALTH_TIMEOUT_MS, 0, 0)
     response := client.send(probe)
     return response.is_ok and response.ok.status < 500
 
 # probe one upstream until a shutdown begins.
-pub fn health_loop(pool: Pool, target: Upstream, path: String, interval_ms: Int) -> Int:
-    client := http.client().with_keep_alives(false).with_max_redirects(0)
+pub fn health_loop(pool: Pool, target: Upstream, path: String, interval_ms: Int, client: http.Client) -> Int:
     gauge := metrics.gauge("gateway_upstream_healthy").labels(["route", pool.route, "upstream", target.address])
     gauge.set(1.0)
     mut failures := 0

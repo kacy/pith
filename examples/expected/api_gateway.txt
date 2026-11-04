@@ -8,6 +8,7 @@
 200 blue saw GET /2 via 127.0.0.1:20310 (hop header: kept)
 set-cookie: backend=green, seen=yes
 x-backend header survives: true
+a claimed x-forwarded-for becomes: 127.0.0.1
 
 === a path that means something else once decoded ===
 301 to /api/admin
@@ -28,6 +29,22 @@ x-backend header survives: true
 200 blue saw GET /limited via 127.0.0.1:20310 (hop header: none)
 200 blue saw GET /limited via 127.0.0.1:20310 (hop header: none)
 429 rate limited
+
+=== a rate limit per client address ===
+200 blue saw GET /per-address via 127.0.0.1:20310 (hop header: none)
+429 rate limited
+
+=== a response relayed as it arrives ===
+content type: text/event-stream
+event 0
+event 1
+event 2
+end of stream: true
+declared length: 300000
+bytes received: 300000
+
+=== an upstream reached over tls ===
+200 over tls, /secure/report
 
 === a request that is safe to repeat moves on ===
 200 green saw GET /failover/a via 127.0.0.1:20310 (hop header: none)

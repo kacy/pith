@@ -1,43 +1,53 @@
-# limits.pith: a rate limit per token subject. the route-wide limit is
-# web.rate_limit from the standard library; this one needs a bucket per caller,
-# which comes from the subject auth.pith attached to the request.
+# limits.pith: rate limits per caller, by token subject or by client address. the
+# route-wide limit is web.rate_limit from the standard library; these need a
+# bucket per caller.
 
 import std.net.http as http
 import std.resilience as resilience
 import std.web as web
 import auth
 
-# a caller can mint as many subjects as it can get tokens for, so the table is
+# a caller can mint subjects with tokens and addresses with ipv6, so the table is
 # bounded. dropping it refills every bucket, which forgives some callers for a
 # moment and costs nothing else.
-MAX_TRACKED_SUBJECTS := 100000
+MAX_TRACKED_CALLERS := 100000
 
-pub struct SubjectLimits:
+pub struct CallerLimits:
     mu: Mutex
     per_second: Int
     burst: Int
     mut buckets: Map[String, resilience.Limiter]
 
-pub fn subject_limits(per_second: Int, burst: Int) -> SubjectLimits:
+pub fn caller_limits(per_second: Int, burst: Int) -> CallerLimits:
     empty: Map[String, resilience.Limiter] := {}
-    return SubjectLimits(Mutex(), per_second, burst, empty)
+    return CallerLimits(Mutex(), per_second, burst, empty)
 
-impl SubjectLimits:
-    fn bucket(subject: String) -> resilience.Limiter:
+impl CallerLimits:
+    fn bucket(caller: String) -> resilience.Limiter:
         self.mu.lock()
         defer self.mu.unlock()
-        if self.buckets.contains_key(subject):
-            return self.buckets[subject]
-        if self.buckets.len() >= MAX_TRACKED_SUBJECTS:
+        if self.buckets.contains_key(caller):
+            return self.buckets[caller]
+        if self.buckets.len() >= MAX_TRACKED_CALLERS:
             self.buckets = {}
         created := resilience.rate_limiter(self.per_second, self.burst)
-        self.buckets.insert(subject, created)
+        self.buckets.insert(caller, created)
         return created
+
+fn too_many() -> http.HttpResponse:
+    return http.response(429).header("Retry-After", "1").text_body("rate limited")
 
 # answer 429 once the token's subject has spent its bucket. this has to run after
 # auth.require, which is what sets the subject.
-pub fn per_subject(limits: SubjectLimits) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
+pub fn per_subject(limits: CallerLimits) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
     return fn(next: fn(web.Request) -> http.HttpResponse, req: web.Request):
         if not limits.bucket(req.value(auth.SUBJECT_KEY)).allow():
-            return http.response(429).header("Retry-After", "1").text_body("rate limited")
+            return too_many()
+        return next(req)
+
+# answer 429 once the client's address has spent its bucket.
+pub fn per_address(limits: CallerLimits) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
+    return fn(next: fn(web.Request) -> http.HttpResponse, req: web.Request):
+        if not limits.bucket(req.peer_ip()).allow():
+            return too_many()
         return next(req)

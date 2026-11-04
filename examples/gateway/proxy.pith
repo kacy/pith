@@ -1,12 +1,16 @@
 # proxy.pith: forward one request to an upstream and relay the answer.
 #
-# bodies are buffered in both directions, capped by max_body_bytes. that keeps a
-# retry simple, since the body is still in hand, and suits json apis. it does not
-# suit large uploads or server-sent events.
+# a request body is buffered, capped by max_body_bytes, which keeps it in hand for
+# a retry. a response is relayed as it arrives when it is large or has no declared
+# length, so server-sent events and downloads pass through, and the retry decision
+# is made on the response head. a small response with a declared length is read
+# whole, which is the common case and the cheaper one.
 
+import std.bytes as bytes
 import std.metrics as metrics
 import std.net.http as http
 import std.net.url as url
+import std.shutdown as shutdown
 import std.time as time
 import std.web as web
 import auth
@@ -65,7 +69,7 @@ fn count_segments(prefix: String) -> Int:
             count = count + 1
     return count
 
-fn outbound_headers(req: web.Request, scheme: String) -> Map[String, String]:
+fn outbound_headers(req: web.Request, scheme: String, trust_forwarded_for: Bool) -> Map[String, String]:
     fields := req.raw.header_fields()
     mut named: List[String] := []
     if fields.contains_key("connection"):
@@ -80,24 +84,51 @@ fn outbound_headers(req: web.Request, scheme: String) -> Map[String, String]:
     if fields.contains_key("host"):
         out.insert("x-forwarded-host", fields["host"])
     out.insert("x-forwarded-proto", scheme)
+    mut forwarded_for := req.peer_ip()
+    if trust_forwarded_for and fields.contains_key("x-forwarded-for"):
+        forwarded_for = fields["x-forwarded-for"] + ", " + forwarded_for
+    out.insert("x-forwarded-for", forwarded_for)
     subject := req.value(auth.SUBJECT_KEY)
     if subject != "":
         out.insert(auth.SUBJECT_HEADER, subject)
     return out
 
-fn relay(answer: http.HttpResponse) -> http.HttpResponse:
+# what crosses back from an upstream's answer: its headers, minus those about the
+# connection. a body read whole gets its length from the server that sends it.
+fn relayed_headers(answer: http.OpenResponse, keep_length: Bool) -> Map[String, String]:
     mut named: List[String] := []
-    connection := answer.header_value("Connection")
-    if connection != "":
-        named = connection_tokens(connection)
+    for name in answer.headers:
+        if name.to_lower() == "connection":
+            named = connection_tokens(answer.headers[name])
     mut headers: Map[String, String] := {}
     for name in answer.headers:
         lower := name.to_lower()
         # the cookies travel in set_cookie_headers, and the map repeats the last
-        if not is_hop_by_hop(lower) and not named.contains(lower) and lower != "content-length" and lower != "set-cookie":
-            headers.insert(name, answer.headers[name])
+        if is_hop_by_hop(lower) or named.contains(lower) or lower == "set-cookie":
+            continue
+        if lower == "content-length" and not keep_length:
+            continue
+        headers.insert(name, answer.headers[name])
+    return headers
+
+fn relayed_head(answer: http.OpenResponse, body: Bytes, keep_length: Bool) -> http.HttpResponse:
     no_trailers: Map[String, String] := {}
-    return http.HttpResponse(answer.status, answer.content_type, headers, answer.body, answer.set_cookie_headers, no_trailers)
+    return http.HttpResponse(answer.status, answer.content_type, relayed_headers(answer, keep_length), body, answer.set_cookie_headers, no_trailers)
+
+# copy an upstream's body to the client as it arrives, ending once a shutdown has
+# used up its grace for streams.
+fn pump_body(answer: http.OpenResponse, write: fn(Bytes) -> Int!) -> Int!:
+    defer answer.close()
+    mut total := 0
+    while true:
+        piece := answer.read()!
+        if piece.is_empty():
+            return total
+        write(piece)!
+        total = total + piece.len()
+        if shutdown.stream_deadline_passed():
+            fail "shutting down"
+    return total
 
 fn can_repeat(method: String) -> Bool:
     return method == "GET" or method == "HEAD" or method == "OPTIONS" or method == "PUT" or method == "DELETE"
@@ -107,10 +138,28 @@ fn can_repeat(method: String) -> Bool:
 fn upstream_failed(status: Int) -> Bool:
     return status == 502 or status == 503 or status == 504
 
+# a response up to this size with a declared length is read whole and sent as one
+# write. a larger one, or one with no declared length, is relayed as it arrives.
+READ_WHOLE_BYTES := 65536
+
 fn failure_response(error: String) -> http.HttpResponse:
     if error.to_lower().contains("timeout") or error.to_lower().contains("timed out"):
         return http.response(504).text_body("upstream timed out")
     return http.response(502).text_body("bad gateway")
+
+# read a small body whole and relay it. a HEAD answer has no body, so what it
+# declares is kept for the client.
+fn read_whole(answer: http.OpenResponse, method: String) -> http.HttpResponse:
+    defer answer.close()
+    body := answer.read_all(READ_WHOLE_BYTES)
+    if body.is_err:
+        return failure_response(body.err)
+    return relayed_head(answer, body.ok, method == "HEAD")
+
+fn relay_as_it_comes(answer: http.OpenResponse) -> http.HttpResponse:
+    pump := fn(write: fn(Bytes) -> Int!) -> Int!:
+        return pump_body(answer, write)!
+    return http.stream_response(relayed_head(answer, bytes.empty(), true), pump)
 
 pub struct Forwarder:
     route: config.Route
@@ -118,12 +167,13 @@ pub struct Forwarder:
     client: http.Client
     skip_segments: Int
     scheme: String
+    trust_forwarded_for: Bool
 
-pub fn forwarder(route: config.Route, pool: upstream.Pool, client: http.Client, scheme: String) -> Forwarder:
+pub fn forwarder(route: config.Route, pool: upstream.Pool, client: http.Client, scheme: String, trust_forwarded_for: Bool) -> Forwarder:
     mut skip := 0
     if route.strip_prefix:
         skip = count_segments(route.prefix)
-    return Forwarder(route, pool, client, skip, scheme)
+    return Forwarder(route, pool, client, skip, scheme, trust_forwarded_for)
 
 fn record(route: String, address: String, outcome: String, started: Int):
     metrics.counter("gateway_upstream_requests_total").labels(["route", route, "upstream", address, "outcome", outcome]).inc()
@@ -138,7 +188,7 @@ impl Forwarder:
             return http.response(400).text_body("bad path")
         method := req.method()
         target := upstream_path(raw_path, req.raw.query() catch "", self.skip_segments)
-        headers := outbound_headers(req, self.scheme)
+        headers := outbound_headers(req, self.scheme, self.trust_forwarded_for)
         n := self.pool.upstreams.len()
         mut tried: List[Bool] := []
         for i in 0..n:
@@ -157,19 +207,22 @@ impl Forwarder:
             if attempt > 0:
                 metrics.counter("gateway_retries_total").labels(["route", self.route.name]).inc()
             started := time.mono_millis()
-            outbound := http.ClientRequest(method, chosen.host, chosen.port, target, headers, req.raw.body, false, self.route.timeout_ms, 0, 0)
-            answer := self.client.send(outbound)
-            if answer.is_err:
+            outbound := http.ClientRequest(method, chosen.host, chosen.port, target, headers, req.raw.body, chosen.use_tls, self.route.timeout_ms, 0, 0)
+            opened := self.client.open(outbound)
+            if opened.is_err:
                 chosen.breaker.failure()
                 record(self.route.name, chosen.address, "error", started)
-                last = failure_response(answer.err)
-            elif upstream_failed(answer.ok.status):
+                last = failure_response(opened.err)
+            elif upstream_failed(opened.ok.status):
                 chosen.breaker.failure()
                 record(self.route.name, chosen.address, "failed", started)
-                last = relay(answer.ok)
+                last = read_whole(opened.ok, method)
             else:
                 chosen.breaker.success()
                 record(self.route.name, chosen.address, "ok", started)
-                return relay(answer.ok)
+                answer := opened.ok
+                if answer.content_length >= 0 and answer.content_length <= READ_WHOLE_BYTES or method == "HEAD":
+                    return read_whole(answer, method)
+                return relay_as_it_comes(answer)
             attempt = attempt + 1
         return last

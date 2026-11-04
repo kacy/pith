@@ -1,0 +1,85 @@
+# what a handler can learn about its client, how many connections std.web serves,
+# and a Set-Cookie header sent like any other header.
+import std.bytes as bytes
+import std.net.http as http
+import std.net.tcp as tcp
+import std.net.tls as tls
+import std.web as web
+
+PORT := 20353
+CAPPED_PORT := 20354
+TLS_PORT := 20355
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+fn whoami(req: web.Request) -> http.HttpResponse:
+    return http.text(200, req.peer_ip()).header("Set-Cookie", "a=1").header("Set-Cookie", "b=2").header("X-Port-Known", (req.peer_address().len() > req.peer_ip().len()).to_string())
+
+fn in_spawned_task() -> String:
+    return http.request_peer_address()
+
+fn spawned(req: web.Request) -> http.HttpResponse:
+    task := spawn in_spawned_task()
+    return http.text(200, "[" + await task + "]")
+
+fn serve_plain() -> Int:
+    return web.bare().get("/who", whoami).get("/spawned", spawned).listen("127.0.0.1", PORT) catch 0
+
+fn serve_capped() -> Int:
+    return web.bare().with_config(web.server_config().with_max_connections(2)).get("/who", whoami).listen("127.0.0.1", CAPPED_PORT) catch 0
+
+fn serve_tls() -> Int:
+    return web.bare().get("/who", whoami).listen_tls("127.0.0.1", TLS_PORT, CERT_PATH, KEY_PATH) catch 0
+
+fn wait_for_port(port: Int):
+    for i in 0..500:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return
+        sleep(10)
+
+fn request_on(fd: Int) -> String!:
+    tcp.write_all(fd, "GET /who HTTP/1.1\r\nHost: x\r\n\r\n")!
+    return tcp.read(fd, 4096)
+
+fn status_of(reply: String) -> String:
+    return reply.split("\r\n")[0]
+
+fn main() -> Int!:
+    spawn serve_plain()
+    spawn serve_capped()
+    wait_for_port(PORT)
+    wait_for_port(CAPPED_PORT)
+    sleep(50)
+
+    first := tcp.connect("127.0.0.1", CAPPED_PORT)!
+    second := tcp.connect("127.0.0.1", CAPPED_PORT)!
+    print("first: " + status_of(request_on(first)!))
+    print("second: " + status_of(request_on(second)!))
+    third := tcp.connect("127.0.0.1", CAPPED_PORT)!
+    print("third: " + status_of(request_on(third)!))
+    tcp.close(third)
+    tcp.close(first)
+    tcp.close(second)
+    # the budget is per process, so give the slots back before the next part
+    sleep(50)
+
+    client := http.client()
+    reply := client.send(http.request("GET", "127.0.0.1", PORT, "/who"))!
+    print("peer ip: " + bytes.to_string_utf8(reply.body)!)
+    print("address has a port: " + reply.header_value("X-Port-Known"))
+    print("cookies: " + reply.set_cookie_headers.join(", "))
+    print("in a spawned task: " + bytes.to_string_utf8(client.send(http.request("GET", "127.0.0.1", PORT, "/spawned"))!.body)!)
+
+    # this client offers no alpn, and the listener offers h2 and http/1.1
+    spawn serve_tls()
+    wait_for_port(TLS_PORT)
+    secure := http.client()
+    secure.tls_config = tls.client_config_with_ca_file(CA_PATH)!
+    over_tls := secure.send(http.https_request_port("GET", "localhost", TLS_PORT, "/who"))!
+    print("peer ip over tls: " + bytes.to_string_utf8(over_tls.body)!)
+
+    print("a closed socket has no peer: [" + tcp.peer_address(first) + "]")
+    return 0

@@ -118,6 +118,9 @@ a handler receives a `web.Request`. the common accessors are right there:
 - `req.body()` — the body as text
 - `req.is_json()` — true when the `Content-Type` is `application/json`
 - `req.method()` and `req.path()`
+- `req.peer_address()` and `req.peer_ip()` — the client's address, as `ip:port` or
+  just the ip. this is the peer of the connection, so behind a proxy it is the
+  proxy, and it is `""` in a task the handler spawned
 
 when you need more, like cookies, multipart parts, or the raw bytes, reach through
 `req.raw`, which is the underlying `std.net.http` request.
@@ -958,6 +961,9 @@ and `listen_tls` serve. `web.server_config()` is the default:
 | `max_body_bytes` | `http.MAX_REQUEST_BODY` (10 mb) | the request body |
 | `keep_alives` | true | whether a connection serves more than one request |
 | `max_requests_per_conn` | 0, no limit | how many requests one connection serves |
+| `max_connections` | 0, which means 512 | how many connections `listen` and `listen_tls` serve at once, counted across every such listener in the process |
+
+past `max_connections`, a new connection is refused with a 503.
 
 net/http turns every timeout off by default, and a server built that way can be
 held open by a client that sends one byte of its head every few seconds. the

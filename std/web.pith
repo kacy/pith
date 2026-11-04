@@ -168,11 +168,14 @@ OBS_CONNECTIONS_REFUSED := "http_server_connections_refused_total"
 # compare_set in a retry loop rather than store(load() + 1): the two web accept
 # loops can run in the same process, and a lost increment is a cap that drifts
 # upward forever.
-fn claim_connection_slot() -> Bool:
+fn claim_connection_slot(config: http.ServerConfig) -> Bool:
+    mut limit := MAX_CONNECTIONS
+    if config.max_connections > 0:
+        limit = config.max_connections
     mut settled := false
     while not settled:
         live := live_connections.load()
-        if live >= MAX_CONNECTIONS:
+        if live >= limit:
             return false
         settled = live_connections.compare_set(live, live + 1)
     metrics.gauge(OBS_CONNECTIONS).add(1.0)
@@ -255,6 +258,23 @@ impl Request:
         mut updated := self.values
         updated.insert(key, value)
         return Request(self.raw, self.params, self.pattern, updated)
+
+    # the client's address, as `ip:port` (`[ip]:port` for ipv6). this is the peer
+    # of the connection, so behind a proxy it is the proxy. it is "" in a task the
+    # handler spawned.
+    fn peer_address() -> String:
+        return http.request_peer_address()
+
+    # the client's address without its port or ipv6 brackets.
+    fn peer_ip() -> String:
+        address := http.request_peer_address()
+        colon := address.last_index_of(":")
+        if colon < 0:
+            return address
+        ip := address.substring(0, colon)
+        if ip.starts_with("["):
+            return ip.substring(1, ip.len() - 1)
+        return ip
 
     # a value an earlier middleware attached, or "" when nothing did.
     fn value(key: String) -> String:
@@ -722,7 +742,7 @@ fn handle_conn(app: App, fd: Int):
 # returns it as work it abandoned — bounded, and reported. the other direction
 # drops a connection silently.
 fn spawn_conn(app: App, fd: Int):
-    if not claim_connection_slot():
+    if not claim_connection_slot(app.config):
         refuse_conn(fd)
         return
     shutdown.enter()
@@ -770,7 +790,7 @@ fn handle_tls_socket(app: App, listener_handle: Int, fd: Int):
 # accept — see spawn_conn for why the count cannot wait for the task to start,
 # and for why reaching MAX_CONNECTIONS refuses rather than stalls the loop.
 fn spawn_tls_conn(app: App, listener_handle: Int, fd: Int):
-    if not claim_connection_slot():
+    if not claim_connection_slot(app.config):
         refuse_tls_conn(fd)
         return
     shutdown.enter()
@@ -1494,7 +1514,7 @@ test "an accepted tls connection is in the drain count before its handshake star
 fn hold_connection_slots(n: Int):
     mut taken := 0
     while taken < n:
-        assert(claim_connection_slot())
+        assert(claim_connection_slot(server_config()))
         taken = taken + 1
 
 # hand `n` slots back, undoing hold_connection_slots.

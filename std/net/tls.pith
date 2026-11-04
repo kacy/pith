@@ -853,8 +853,10 @@ fn select_alpn_protocol(config: Config, offered: List[String]) -> String!:
     protocols := config_alpn_protocols(config)
     if protocols.len() == 0:
         return ""
+    # a client that offers no alpn is not refusing any protocol (rfc 7301 3.2);
+    # the handshake goes on with none selected
     if offered.len() == 0:
-        fail "client did not offer alpn"
+        return ""
     for protocol in protocols:
         if offered.contains(protocol):
             return protocol
@@ -3709,6 +3711,7 @@ test "tls config helpers track alpn, client auth, and resumption":
     assert(config_has(native_config_verify_connection, client_cfg.handle))
     assert_eq(select_alpn_protocol(server_cfg, ["pith.rpc", "http/1.1"])!, "pith.rpc")
     assert(select_alpn_protocol(server_cfg, ["http/1.1"]).is_err)
+    assert_eq(select_alpn_protocol(server_cfg, [])!, "")
     assert(config_requests_client_certificate(server_cfg))
     assert(config_requires_client_certificate(server_cfg))
     assert(config_has(native_config_verify_connection, server_cfg.handle))

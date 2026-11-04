@@ -468,6 +468,22 @@ pub extern "C" fn pith_tcp_read_bytes(conn_fd: i64, max_bytes: i64) -> i64 {
     }
 }
 
+/// The address of the peer of a connected socket, as `ip:port` (`[ip]:port` for
+/// ipv6), or an empty string for a stale handle or a socket with no peer.
+#[no_mangle]
+pub extern "C" fn pith_tcp_peer_address(conn: i64) -> *mut i8 {
+    use std::mem::ManuallyDrop;
+    use std::net::TcpStream;
+    use std::os::unix::io::FromRawFd;
+
+    let address = socket(conn).and_then(|guard| {
+        // the guard keeps the descriptor open, and ManuallyDrop leaves it open
+        let stream = ManuallyDrop::new(unsafe { TcpStream::from_raw_fd(guard.fd()) });
+        stream.peer_addr().ok()
+    });
+    crate::pith_strdup_string(&address.map(|a| a.to_string()).unwrap_or_default())
+}
+
 /// wait for a handle to become readable or writable, the tri-state contract of
 /// `fdio::wait_ready`: `1` ready, `0` timed out, `-1` an error, which covers
 /// a stale handle and a handle closed while the wait was inside.

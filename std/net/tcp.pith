@@ -193,6 +193,11 @@ pub fn set_write_deadline(fd: Int, ms: Int):
 # handle fails. the descriptor itself is released once no call is inside on it,
 # so its number is never handed to a new connection while one is; see "closing
 # a connection another task is using" in docs/concurrency.md.
+# the address of the peer of a connected socket, as `ip:port` (`[ip]:port` for
+# ipv6), or "" when the socket is closed or has no peer.
+pub fn peer_address(fd: Int) -> String:
+    return tcp_peer_address(fd)
+
 pub fn close(fd: Int):
     tcp_close(fd)
 

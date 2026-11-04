@@ -230,6 +230,12 @@ impl ServerConn:
     # read one transport chunk: from the tcp socket or the tls session when live,
     # otherwise nothing (the offline buffer is exhausted, which reads as
     # end-of-stream).
+    # the connection's socket, whichever transport it runs over.
+    fn socket_fd() -> Int:
+        if self.transport == TRANSPORT_TLS:
+            return tls.Conn(self.tls_handle).socket()
+        return self.fd
+
     fn recv_chunk() -> Bytes!:
         if self.transport == TRANSPORT_TCP:
             return tcp_read_bytes(self.fd, RECV_CHUNK)!
@@ -685,7 +691,9 @@ fn response_fields(response: http.HttpResponse) -> List[hpack.HeaderField]:
         fields.push(hpack.header_field("content-type", response.content_type))
     for key in response.headers:
         name := key.to_lower()
-        if is_hop_by_hop(name) or name == "content-type" or name == "content-length":
+        # as on http/1.1, cookies come from the list alone: a response read by
+        # the http client also has its last one in this map
+        if is_hop_by_hop(name) or name == "content-type" or name == "content-length" or name == "set-cookie":
             continue
         fields.push(hpack.header_field(name, response.headers[key]))
     for cookie in response.set_cookie_headers:
@@ -908,6 +916,7 @@ fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
     # that still points into the pool — so the whole tree is dead here.
     scope := json.open_scope()
     defer json.close_scope(scope)
+    http.set_request_socket(server.conn.socket_fd())
     if server.streaming:
         handle_streaming_stream(server, stream_id, inbox)
         return

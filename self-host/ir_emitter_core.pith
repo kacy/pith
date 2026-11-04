@@ -8699,6 +8699,9 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # the lambda's caller then read as its value.
     saved_returns_result := ir_current_func_returns_result
     ir_current_func_returns_result = ir_fn_returns_result(idx)
+    # nor do its defers: a `!` that failed in the lambda used to run them there,
+    # and a plain defer then ran a second time when the function ended.
+    saved_defers := ir_defers_enter_function()
     # the lambda body is its own name scope: its params and captures land in
     # ir_var_regs below, and everything the body binds is collected here, so a
     # name it binds resolves to the lambda's own storage rather than a module
@@ -8738,6 +8741,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_emitting_main_body = saved_in_main
     ir_current_func_returns_result = saved_returns_result
+    ir_defers_leave_function(saved_defers)
     ir_rc_locals = saved_string_locals
     ir_rc_local_kinds = saved_rc_kinds
     ir_tuple_local_tid = saved_tuple_tids
@@ -8792,6 +8796,28 @@ fn ir_captures_uncounted(captures: List[String]) -> Bool:
             return false
     return true
 
+# the defers of the function being emitted. a lambda or a spawn wrapper is its own
+# function, so it starts with none of them.
+struct SavedDefers:
+    nodes: List[Int]
+    is_err: List[Int]
+    scope_starts: List[Int]
+    loop_bases: List[Int]
+
+fn ir_defers_enter_function() -> SavedDefers:
+    saved := SavedDefers(ir_defer_nodes, ir_defer_is_err, ir_defer_scope_starts, ir_defer_loop_base_stack)
+    ir_defer_nodes = []
+    ir_defer_is_err = []
+    ir_defer_scope_starts = []
+    ir_defer_loop_base_stack = []
+    return saved
+
+fn ir_defers_leave_function(saved: SavedDefers):
+    ir_defer_nodes = saved.nodes
+    ir_defer_is_err = saved.is_err
+    ir_defer_scope_starts = saved.scope_starts
+    ir_defer_loop_base_stack = saved.loop_bases
+
 # build the `__spawn_N` wrapper a `spawn f(args)` runs on the new task: the
 # free variables of the callee expression and of every argument become the
 # wrapper's captures, so the call is evaluated inside the task.
@@ -8826,6 +8852,7 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     saved_returns_result := ir_current_func_returns_result
     saved_ret_kind := ir_current_func_return_kind
     saved_in_main := ir_emitting_main_body
+    saved_defers := ir_defers_enter_function()
     ir_rc_locals = []
     ir_rc_local_kinds = []
     ir_current_func_returns_result = false
@@ -8848,6 +8875,7 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     ir_current_func_returns_result = saved_returns_result
     ir_current_func_return_kind = saved_ret_kind
     ir_emitting_main_body = saved_in_main
+    ir_defers_leave_function(saved_defers)
 
     closure_r := ir_reg()
     ir_emit("closure_ref " + closure_r.to_string() + " " + wrapper_name)

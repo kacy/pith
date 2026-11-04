@@ -1,0 +1,169 @@
+# config.pith: the gateway's listeners, auth settings and routes, read from
+# toml. see gateway.toml for a complete file.
+
+import std.toml as toml
+
+pub struct Server:
+    pub host: String
+    pub port: Int
+    pub tls_cert: String
+    pub tls_key: String
+    pub max_body_bytes: Int
+    pub max_idle_upstream_conns: Int
+    pub max_connections: Int
+    # keep an X-Forwarded-For the client sent and add to it, for a gateway behind
+    # a load balancer. otherwise the client's own address replaces it.
+    pub trust_forwarded_for: Bool
+    # a certificate authority for upstreams reached over https, in place of the
+    # system's.
+    pub upstream_ca: String
+    pub grpc_port: Int
+    pub grpc_upstreams: List[String]
+    pub grpc_auth: Bool
+
+pub struct Auth:
+    pub jwks_url: String
+    pub issuer: String
+    pub audience: String
+
+pub struct Route:
+    pub name: String
+    pub prefix: String
+    pub upstreams: List[String]
+    pub strip_prefix: Bool
+    pub auth: Bool
+    # requests per second for the whole route, and for each token subject. 0
+    # turns a limit off.
+    pub rate_per_second: Int
+    pub rate_burst: Int
+    pub subject_rate_per_second: Int
+    pub subject_rate_burst: Int
+    pub ip_rate_per_second: Int
+    pub ip_rate_burst: Int
+    pub timeout_ms: Int
+    # further upstreams to try for a request that is safe to repeat.
+    pub retries: Int
+    pub breaker_failures: Int
+    pub breaker_reset_ms: Int
+    # empty turns active health checks off.
+    pub health_path: String
+    pub health_interval_ms: Int
+
+pub struct Config:
+    pub server: Server
+    pub auth: Auth
+    pub routes: List[Route]
+
+# an upstream as written in the config: "host:port", or "https://host:port" to
+# reach it over tls.
+pub struct Address:
+    pub host: String
+    pub port: Int
+    pub use_tls: Bool
+
+# split an upstream's address. a port outside 1-65535 fails here, at startup,
+# instead of on the first request.
+pub fn split_address(address: String) -> Address!:
+    mut rest := address
+    use_tls := address.starts_with("https://")
+    if use_tls:
+        rest = address.substring(8, address.len())
+    colon := rest.last_index_of(":")
+    if colon <= 0:
+        fail "upstream '" + address + "' is not host:port"
+    port := parse_int(rest.substring(colon + 1, rest.len())) catch 0
+    if port < 1 or port > 65535:
+        fail "upstream '" + address + "' has a bad port"
+    return Address(rest.substring(0, colon), port, use_tls)
+
+# a required string, with toml's typed error turned into this module's text.
+fn required_string(table: Int, key: String) -> String!:
+    value := toml.get_string(table, key)
+    if value == "":
+        fail "missing or empty '" + key + "'"
+    return value
+
+fn string_list(table: Int, key: String) -> List[String]:
+    mut out: List[String] := []
+    array := toml.get_array(table, key)
+    mut i := 0
+    while i < toml.array_len(array):
+        out.push(toml.array_string(array, i))
+        i = i + 1
+    return out
+
+fn read_route(table: Int) -> Route!:
+    name := required_string(table, "name")!
+    prefix := required_string(table, "prefix")!
+    upstreams := string_list(table, "upstreams")
+    if not prefix.starts_with("/"):
+        fail "route '" + name + "': prefix must start with /"
+    if upstreams.len() == 0:
+        fail "route '" + name + "': no upstreams"
+    for address in upstreams:
+        split_address(address)!
+    rate := toml.get_int_or(table, "rate_per_second", 0)
+    subject_rate := toml.get_int_or(table, "subject_rate_per_second", 0)
+    ip_rate := toml.get_int_or(table, "ip_rate_per_second", 0)
+    return Route(
+        name: name,
+        prefix: prefix,
+        upstreams: upstreams,
+        strip_prefix: toml.get_bool_or(table, "strip_prefix", false),
+        auth: toml.get_bool_or(table, "auth", false),
+        rate_per_second: rate,
+        rate_burst: toml.get_int_or(table, "rate_burst", rate),
+        subject_rate_per_second: subject_rate,
+        subject_rate_burst: toml.get_int_or(table, "subject_rate_burst", subject_rate),
+        ip_rate_per_second: ip_rate,
+        ip_rate_burst: toml.get_int_or(table, "ip_rate_burst", ip_rate),
+        timeout_ms: toml.get_int_or(table, "timeout_ms", 5000),
+        retries: toml.get_int_or(table, "retries", 1),
+        breaker_failures: toml.get_int_or(table, "breaker_failures", 5),
+        breaker_reset_ms: toml.get_int_or(table, "breaker_reset_ms", 10000),
+        health_path: toml.get_string_or(table, "health_path", ""),
+        health_interval_ms: toml.get_int_or(table, "health_interval_ms", 2000)
+    )
+
+# parse a config file's text, failing with the first thing wrong with it.
+pub fn parse(text: String) -> Config!:
+    parsed := toml.parse_required(text)
+    if parsed.is_err:
+        fail parsed.err.message
+    root := parsed.ok
+    server := toml.get_table(root, "server")
+    auth := toml.get_table(root, "auth")
+    mut routes: List[Route] := []
+    tables := toml.get_array(root, "route")
+    mut i := 0
+    while i < toml.array_len(tables):
+        routes.push(read_route(toml.array_get(tables, i))!)
+        i = i + 1
+    if routes.len() == 0:
+        fail "no routes configured"
+    grpc_upstreams := string_list(server, "grpc_upstreams")
+    for address in grpc_upstreams:
+        split_address(address)!
+    settings := Server(
+        host: toml.get_string_or(server, "host", "0.0.0.0"),
+        port: toml.get_int_or(server, "port", 8080),
+        tls_cert: toml.get_string_or(server, "tls_cert", ""),
+        tls_key: toml.get_string_or(server, "tls_key", ""),
+        max_body_bytes: toml.get_int_or(server, "max_body_bytes", 10485760),
+        max_idle_upstream_conns: toml.get_int_or(server, "max_idle_upstream_conns", 256),
+        max_connections: toml.get_int_or(server, "max_connections", 4096),
+        trust_forwarded_for: toml.get_bool_or(server, "trust_forwarded_for", false),
+        upstream_ca: toml.get_string_or(server, "upstream_ca", ""),
+        grpc_port: toml.get_int_or(server, "grpc_port", 0),
+        grpc_upstreams: grpc_upstreams,
+        grpc_auth: toml.get_bool_or(server, "grpc_auth", false)
+    )
+    identity := Auth(toml.get_string_or(auth, "jwks_url", ""), toml.get_string_or(auth, "issuer", ""), toml.get_string_or(auth, "audience", ""))
+    if settings.grpc_port > 0 and grpc_upstreams.len() == 0:
+        fail "grpc_port is set but grpc_upstreams is empty"
+    if settings.grpc_auth and identity.jwks_url == "":
+        fail "grpc_auth is on but [auth] has no jwks_url"
+    for route in routes:
+        if route.auth and identity.jwks_url == "":
+            fail "route '" + route.name + "' requires auth but [auth] has no jwks_url"
+    return Config(settings, identity, routes)

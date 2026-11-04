@@ -1,0 +1,62 @@
+# a complete gateway config. run it with:
+#
+#   pith build examples/gateway/main.pith -o gateway
+#   ./gateway examples/gateway/gateway.toml
+
+[server]
+host = "0.0.0.0"
+port = 8080
+# set both to serve https, with http/2 negotiated. grpc_port uses them too.
+# tls_cert = "cert.pem"
+# tls_key = "key.pem"
+max_body_bytes = 10485760
+max_idle_upstream_conns = 256
+# past this many open connections a new one gets a 503.
+max_connections = 4096
+# keep an X-Forwarded-For the client sent, for a gateway behind a load balancer.
+# otherwise the client's own address replaces it.
+trust_forwarded_for = false
+# a certificate authority for upstreams reached over https, in place of the
+# system's.
+# upstream_ca = "ca.pem"
+# a second listener for grpc, forwarding to these backends. "host:port" is h2c and
+# "https://host:port" is tls. 0 turns it off.
+grpc_port = 0
+grpc_upstreams = []
+grpc_auth = false
+
+# where bearer tokens are checked. needed by any route with auth = true.
+[auth]
+jwks_url = "https://issuer.example/.well-known/jwks.json"
+issuer = "https://issuer.example"
+audience = "gateway"
+
+[[route]]
+name = "users"
+prefix = "/api/users"
+# /api/users/7 reaches the backend as /7
+strip_prefix = true
+# "host:port", or "https://host:port" to reach an upstream over tls
+upstreams = ["127.0.0.1:9001", "127.0.0.1:9002"]
+auth = true
+# requests per second across the route, and for each token subject
+rate_per_second = 5000
+rate_burst = 1000
+subject_rate_per_second = 50
+subject_rate_burst = 100
+# and for each client address
+ip_rate_per_second = 100
+ip_rate_burst = 200
+timeout_ms = 2000
+# further upstreams to try for GET, HEAD, OPTIONS, PUT and DELETE
+retries = 1
+# consecutive failures that open an upstream's breaker, and the wait before a probe
+breaker_failures = 5
+breaker_reset_ms = 10000
+health_path = "/healthz"
+health_interval_ms = 2000
+
+[[route]]
+name = "public"
+prefix = "/"
+upstreams = ["127.0.0.1:9100"]

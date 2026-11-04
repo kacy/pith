@@ -1,0 +1,170 @@
+# api_gateway_grpc.pith: grpc through the gateway in examples/gateway/.
+#
+# the gateway forwards calls to services it has no generated code for, so this
+# backend speaks a made-up service in plain bytes. a process serves one grpc
+# dispatch, so the backend is this same program run again as a child.
+#
+# Run:  pith run examples/api_gateway_grpc.pith
+
+import std.bytes as bytes
+import std.net.grpc as grpc
+import std.os.process as process
+import std.time as time
+import gateway.demo_identity as identity
+import gateway.server as server
+
+GATEWAY_PORT := 20320
+GRPC_PORT := 20321
+BACKEND_PORT := 20322
+IDENTITY_PORT := 20323
+# nothing listens here, and it is first in the list.
+DEAD_PORT := 20329
+
+fn text(data: Bytes) -> String:
+    return bytes.to_string_utf8(data) catch "?"
+
+fn data(value: String) -> Bytes:
+    return bytes.from_string_utf8(value)
+
+# --- the backend, in the child process ---
+
+fn backend(method: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+    if method == "/demo.Echo/Who":
+        fields := call.metadata()
+        mut subject := "nobody"
+        if fields.contains_key("x-auth-subject"):
+            subject = fields["x-auth-subject"]
+        mut tag := "none"
+        if fields.contains_key("x-tag"):
+            tag = fields["x-tag"]
+        call.recv_message()!
+        call.send_message(data("subject=" + subject + " tag=" + tag))
+        return 0
+    if method == "/demo.Echo/Upper":
+        step := call.recv_message()!
+        call.send_message(data(text(step.message).to_upper()))
+        return 0
+    if method == "/demo.Echo/Count":
+        step := call.recv_message()!
+        for i in 0..(parse_int(text(step.message)) catch 0):
+            call.send_message(data("tick " + i.to_string()))
+        return 0
+    if method == "/demo.Echo/Chat":
+        while true:
+            step := call.recv_message()!
+            if step.done:
+                return 0
+            call.send_message(data("heard " + text(step.message)))
+    if method == "/demo.Echo/Slow":
+        time.delay(2000)
+        return 0
+    fail grpc.GrpcError(grpc.GRPC_NOT_FOUND, "no such method here")
+
+fn run_backend() -> Int:
+    return grpc.serve_stream("127.0.0.1", BACKEND_PORT, backend) catch 1
+
+# --- the gateway and the client, in the parent ---
+
+fn gateway_config() -> String:
+    return [
+        "[server]",
+        "host = \"127.0.0.1\"",
+        "port = " + GATEWAY_PORT.to_string(),
+        "grpc_port = " + GRPC_PORT.to_string(),
+        "grpc_auth = true",
+        "grpc_upstreams = [\"127.0.0.1:" + DEAD_PORT.to_string() + "\", \"127.0.0.1:" + BACKEND_PORT.to_string() + "\"]",
+        "[auth]",
+        "jwks_url = \"http://127.0.0.1:" + IDENTITY_PORT.to_string() + "/keys\"",
+        "issuer = \"" + identity.ISSUER + "\"",
+        "audience = \"" + identity.AUDIENCE + "\"",
+        "[[route]]",
+        "name = \"unused\"",
+        "prefix = \"/unused\"",
+        "upstreams = [\"127.0.0.1:" + BACKEND_PORT.to_string() + "\"]"
+    ].join("\n")
+
+fn serve_gateway(toml_text: String) -> Int:
+    result := server.run(toml_text)
+    if result.is_err:
+        print("gateway: " + result.err)
+        return 1
+    return result.ok
+
+fn serve_identity() -> Int:
+    return identity.serve(IDENTITY_PORT)
+
+fn show(result: Bytes!grpc.GrpcError) -> String:
+    if result.is_err:
+        return grpc.status_name(result.err.status) + ": " + result.err.message
+    return text(result.ok)
+
+# run one streaming call to its end, printing each message.
+fn print_stream(conn: grpc.Conn, bearer: List[String]) -> Int!grpc.GrpcError:
+    ticks := conn.server_stream_with_headers("/demo.Echo/Count", data("3"), bearer)!
+    defer ticks.close()
+    while true:
+        step := ticks.recv()!
+        if step.done:
+            return 0
+        print(text(step.message))
+    return 0
+
+fn talk(conn: grpc.Conn, bearer: List[String]) -> Int!grpc.GrpcError:
+    chat := conn.bidi_stream_with_headers("/demo.Echo/Chat", bearer)!
+    defer chat.close()
+    for word in ["one", "two"]:
+        chat.send(data(word))
+        print(text(chat.recv()!.message))
+    chat.close_send()
+    print("finished: " + chat.recv()!.done.to_string())
+    return 0
+
+fn main() -> Int!:
+    argv := args()
+    if argv.len() > 1 and argv[1] == "backend":
+        return run_backend()
+
+    child := process.command(argv[0]).arg("backend").start()!
+    defer child.kill()
+    spawn serve_identity()
+    spawn serve_gateway(gateway_config())
+    identity.wait_for_port(IDENTITY_PORT)
+    identity.wait_for_port(BACKEND_PORT)
+    identity.wait_for_port(GRPC_PORT)
+
+    conn := grpc.dial_h2c("127.0.0.1", GRPC_PORT)!
+    defer conn.close()
+    token := identity.token_for("ada", identity.AUDIENCE)!
+    bearer := ["authorization", "Bearer " + token]
+
+    print("=== a token is required ===")
+    print(show(conn.unary("/demo.Echo/Upper", data("hello"))))
+    print(show(conn.unary_with_headers("/demo.Echo/Upper", data("hello"), ["authorization", "Bearer nonsense"])))
+
+    print("")
+    print("=== unary, past an upstream that is down ===")
+    print(show(conn.unary_with_headers("/demo.Echo/Upper", data("hello"), bearer)))
+    print(show(conn.unary_with_headers("/demo.Echo/Upper", data("again"), bearer)))
+
+    print("")
+    print("=== metadata crosses, a claimed subject does not ===")
+    print(show(conn.unary_with_headers("/demo.Echo/Who", data(""), ["authorization", "Bearer " + token, "x-tag", "blue", "x-auth-subject", "forged"])))
+
+    print("")
+    print("=== a backend's status comes back as it was ===")
+    print(show(conn.unary_with_headers("/demo.Echo/Missing", data(""), bearer)))
+
+    print("")
+    print("=== server streaming ===")
+    streamed := print_stream(conn, bearer)
+    print("failed: " + streamed.is_err.to_string())
+
+    print("")
+    print("=== both ways at once ===")
+    talked := talk(conn, bearer)
+    print("failed: " + talked.is_err.to_string())
+
+    print("")
+    print("=== the caller's deadline reaches the backend ===")
+    print(grpc.status_name(conn.unary_with_headers_and_deadline("/demo.Echo/Slow", data(""), bearer, 100).err.status))
+    return 0

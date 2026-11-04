@@ -1,0 +1,150 @@
+# grpc_proxy.pith: forward grpc calls without knowing their services.
+#
+# every kind of rpc has the same shape on the wire, a stream of messages each way
+# followed by a status, so one bidirectional stream carries unary and streaming
+# calls alike and no generated code is involved. messages cross as opaque bytes.
+#
+# only the status crosses back. std.net.grpc does not expose a backend's response
+# headers or its custom trailers, so those stop here.
+
+import std.metrics as metrics
+import std.net.grpc as grpc
+import std.net.tls as tls
+import std.time as time
+import auth
+import config
+
+struct Target:
+    address: String
+    host: String
+    port: Int
+    use_tls: Bool
+    # the certificate authority for a tls target, or "" for the system's.
+    ca_file: String
+    mu: Mutex
+    # the shared http/2 connection, dialed on first use.
+    mut conn: grpc.Conn?
+
+pub struct Proxy:
+    targets: List[Target]
+    next: AtomicInt
+    check: auth.Verifier
+    requires_auth: Bool
+
+# a proxy for the configured grpc upstreams.
+pub fn proxy(cfg: config.Config) -> Proxy!:
+    mut targets: List[Target] := []
+    for address in cfg.server.grpc_upstreams:
+        parts := config.split_address(address)!
+        targets.push(Target(address, parts.host, parts.port, parts.use_tls, cfg.server.upstream_ca, Mutex(), none))
+    return Proxy(targets, AtomicInt(0), auth.verifier(cfg.auth), cfg.server.grpc_auth)
+
+impl Target:
+    fn connection() -> grpc.Conn!:
+        self.mu.lock()
+        defer self.mu.unlock()
+        if let live = self.conn:
+            return live
+        dialed := self.dial()!
+        self.conn = dialed
+        return dialed
+
+    fn dial() -> grpc.Conn!:
+        if not self.use_tls:
+            return grpc.dial_h2c(self.host, self.port)!
+        if self.ca_file == "":
+            return grpc.dial(self.host, self.port)!
+        return grpc.dial_with_config(self.host, self.port, tls.client_config_with_ca_file(self.ca_file)!)!
+
+    # forget a connection that failed, unless another task already replaced it.
+    fn drop_connection(failed: grpc.Conn):
+        self.mu.lock()
+        defer self.mu.unlock()
+        if let live = self.conn:
+            if live == failed:
+                self.conn = none
+                failed.close()
+
+# copy the client's messages upstream until it finishes or goes away.
+fn pump_requests(call: grpc.GrpcStream, upstream: grpc.BidiStream) -> Int:
+    while true:
+        step := call.recv_message()
+        if step.is_err:
+            upstream.close()
+            return 0
+        if step.ok.done:
+            upstream.close_send()
+            return 0
+        upstream.send(step.ok.message)
+    return 0
+
+# the caller's metadata as the flat list the client takes, with the subject the
+# gateway verified in place of any the caller claimed, and what is left of the
+# caller's deadline.
+fn upstream_headers(call: grpc.GrpcStream, subject: String) -> List[String]:
+    mut headers: List[String] := []
+    fields := call.metadata()
+    for name in fields:
+        if name != auth.SUBJECT_HEADER.to_lower():
+            headers.push(name)
+            headers.push(fields[name])
+    if subject != "":
+        headers.push(auth.SUBJECT_HEADER.to_lower())
+        headers.push(subject)
+    if call.deadline_ms() > 0:
+        headers.push("grpc-timeout")
+        headers.push((call.deadline_ms() - time.mono_millis()).to_string() + "m")
+    return headers
+
+fn record(address: String, status: Int):
+    metrics.counter("gateway_grpc_calls_total").labels(["upstream", address, "status", status.to_string()]).inc()
+
+impl Proxy:
+    # open the upstream stream on the next target that takes it.
+    fn open(full_method: String, headers: List[String]) -> (Target, grpc.BidiStream)!grpc.GrpcError:
+        n := self.targets.len()
+        start := self.next.load()
+        self.next.compare_set(start, start + 1)
+        for i in 0..n:
+            target := self.targets[(start + i) % n]
+            connected := target.connection()
+            if connected.is_ok:
+                opened := connected.ok.bidi_stream_with_headers(full_method, headers)
+                if opened.is_ok:
+                    return (target, opened.ok)
+                target.drop_connection(connected.ok)
+        fail grpc.GrpcError(grpc.GRPC_UNAVAILABLE, "no upstream available")
+
+    # the subject of the call's token, or a failure when one is required and it
+    # is not valid.
+    fn subject_of(call: grpc.GrpcStream) -> String!grpc.GrpcError:
+        if not self.requires_auth:
+            return ""
+        fields := call.metadata()
+        if fields.contains_key("authorization"):
+            header := fields["authorization"]
+            if header.starts_with("Bearer "):
+                verified := self.check.keys.verify(header.substring(7, header.len()), self.check.options)
+                if verified.is_ok:
+                    return verified.ok.subject()
+        fail grpc.GrpcError(grpc.GRPC_UNAUTHENTICATED, "unauthenticated")
+
+    # carry one call to its end: requests upstream on their own task, responses
+    # back on this one, then the upstream's status.
+    fn forward(full_method: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+        subject := self.subject_of(call)!
+        opened := self.open(full_method, upstream_headers(call, subject))!
+        target := opened.0
+        upstream := opened.1
+        defer upstream.close()
+        spawn pump_requests(call, upstream)
+        while true:
+            step := upstream.recv()
+            if step.is_err:
+                record(target.address, step.err.status)
+                fail step.err
+            if step.ok.done:
+                record(target.address, grpc.GRPC_OK)
+                return 0
+            call.send_message(step.ok.message)
+        return 0

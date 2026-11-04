@@ -1,0 +1,31 @@
+# main.pith: run the gateway from a config file.
+#
+#   pith build examples/gateway/main.pith -o gateway
+#   ./gateway examples/gateway/gateway.toml
+
+import std.fs as fs
+import std.log as log
+import std.obs as obs
+import std.shutdown as shutdown
+import config
+import server
+
+fn run(path: String) -> Int!:
+    cfg := config.parse(fs.read(path)!)!
+    obs.init()
+    defer obs.shutdown()
+    shutdown.on_signals()!
+    app := server.build(cfg)!
+    log.root().target("gateway").info().str("host", cfg.server.host).int("port", cfg.server.port).int("routes", cfg.routes.len()).msg("listening")
+    return server.listen(cfg, app)!
+
+fn main() -> Int:
+    argv := args()
+    if argv.len() != 2:
+        print("usage: gateway <config.toml>")
+        return 2
+    result := run(argv[1])
+    if result.is_err:
+        print("gateway: " + result.err)
+        return 1
+    return result.ok

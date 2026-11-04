@@ -1,0 +1,45 @@
+# auth.pith: bearer tokens checked at the edge against the issuer's published
+# keys, so the services behind the gateway can trust the subject it passes on.
+
+import std.crypto.jwks as jwks
+import std.crypto.jwt as jwt
+import std.net.http as http
+import std.web as web
+import config
+
+# where the verified subject sits on the request between middleware.
+pub SUBJECT_KEY := "gateway.subject"
+
+# the header the upstream reads the subject from. proxy.pith strips any copy the
+# client sent, so an upstream only ever sees the value set here.
+pub SUBJECT_HEADER := "X-Auth-Subject"
+
+KEY_FETCH_TIMEOUT_MS := 2000
+
+pub struct Verifier:
+    keys: jwks.Cache
+    options: jwt.Options
+
+# a verifier for the route settings: the key set to fetch and the claims to require.
+pub fn verifier(settings: config.Auth) -> Verifier:
+    mut options := jwt.default_options()
+    if settings.issuer != "":
+        options = jwt.with_issuer(options, settings.issuer)
+    if settings.audience != "":
+        options = jwt.with_audience(options, settings.audience)
+    return Verifier(jwks.cache(settings.jwks_url).timeout_ms(KEY_FETCH_TIMEOUT_MS), options)
+
+fn unauthorized() -> http.HttpResponse:
+    return http.response(401).header("WWW-Authenticate", "Bearer").text_body("unauthorized")
+
+# refuse a request without a valid token, and attach the token's subject to one
+# with a valid token. the reason a token failed stays out of the response.
+pub fn require(check: Verifier) -> fn(fn(web.Request) -> http.HttpResponse, web.Request) -> http.HttpResponse:
+    return fn(next: fn(web.Request) -> http.HttpResponse, req: web.Request):
+        header := req.header("Authorization")
+        if not header.starts_with("Bearer "):
+            return unauthorized()
+        verified := check.keys.verify(header.substring(7, header.len()), check.options)
+        if verified.is_err:
+            return unauthorized()
+        return next(req.with_value(SUBJECT_KEY, verified.ok.subject()))

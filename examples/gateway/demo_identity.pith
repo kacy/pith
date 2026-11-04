@@ -26,6 +26,7 @@ fn key_set() -> String:
 pub fn serve(port: Int) -> Int:
     return web.bare().get("/keys", fn(req: web.Request) => http.json(200, key_set())).listen("127.0.0.1", port) catch 0
 
+# a signed token for `subject`, valid for `audience` for an hour.
 pub fn token_for(subject: String, audience: String) -> String!:
     return jwt.claims().issuer(ISSUER).audience(audience).subject(subject).expires_in(3600).sign_es256(encoding.from_hex(IDP_PKCS8)!)!
 

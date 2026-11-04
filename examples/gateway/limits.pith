@@ -18,6 +18,7 @@ pub struct CallerLimits:
     burst: Int
     mut buckets: Map[String, resilience.Limiter]
 
+# one token bucket per caller, each refilled at `per_second` up to `burst`.
 pub fn caller_limits(per_second: Int, burst: Int) -> CallerLimits:
     empty: Map[String, resilience.Limiter] := {}
     return CallerLimits(Mutex(), per_second, burst, empty)

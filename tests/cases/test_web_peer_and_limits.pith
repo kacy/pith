@@ -3,10 +3,15 @@
 import std.bytes as bytes
 import std.net.http as http
 import std.net.tcp as tcp
+import std.net.tls as tls
 import std.web as web
 
 PORT := 20353
 CAPPED_PORT := 20354
+TLS_PORT := 20355
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
 
 fn whoami(req: web.Request) -> http.HttpResponse:
     return http.text(200, req.peer_ip()).header("Set-Cookie", "a=1").header("Set-Cookie", "b=2").header("X-Port-Known", (req.peer_address().len() > req.peer_ip().len()).to_string())
@@ -23,6 +28,9 @@ fn serve_plain() -> Int:
 
 fn serve_capped() -> Int:
     return web.bare().with_config(web.server_config().with_max_connections(2)).get("/who", whoami).listen("127.0.0.1", CAPPED_PORT) catch 0
+
+fn serve_tls() -> Int:
+    return web.bare().get("/who", whoami).listen_tls("127.0.0.1", TLS_PORT, CERT_PATH, KEY_PATH) catch 0
 
 fn wait_for_port(port: Int):
     for i in 0..500:
@@ -64,6 +72,14 @@ fn main() -> Int!:
     print("address has a port: " + reply.header_value("X-Port-Known"))
     print("cookies: " + reply.set_cookie_headers.join(", "))
     print("in a spawned task: " + bytes.to_string_utf8(client.send(http.request("GET", "127.0.0.1", PORT, "/spawned"))!.body)!)
+
+    # this client offers no alpn, and the listener offers h2 and http/1.1
+    spawn serve_tls()
+    wait_for_port(TLS_PORT)
+    secure := http.client()
+    secure.tls_config = tls.client_config_with_ca_file(CA_PATH)!
+    over_tls := secure.send(http.https_request_port("GET", "localhost", TLS_PORT, "/who"))!
+    print("peer ip over tls: " + bytes.to_string_utf8(over_tls.body)!)
 
     print("a closed socket has no peer: [" + tcp.peer_address(first) + "]")
     return 0

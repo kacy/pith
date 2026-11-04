@@ -59,7 +59,9 @@ fn main() -> Int!:
     print("first: " + status_of(request_on(first)!))
     print("second: " + status_of(request_on(second)!))
     third := tcp.connect("127.0.0.1", CAPPED_PORT)!
-    print("third: " + status_of(request_on(third)!))
+    # it sends nothing first: closing on an unread request sends a reset, which
+    # can destroy the 503 (see refuse_conn in std/web.pith)
+    print("third: " + status_of(tcp.read(third, 4096)!))
     tcp.close(third)
     tcp.close(first)
     tcp.close(second)

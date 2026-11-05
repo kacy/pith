@@ -22,9 +22,13 @@ pub struct ByteBuffer:
 pub struct ByteArray:
     pub handle: Int
 
-# return an empty bytes value.
+EMPTY_BYTES := bytes_from_string_utf8("")
+
+# return an empty bytes value. every caller shares one, which is safe because a
+# Bytes never changes, and an empty one is common enough on a server's hot path
+# to be worth not allocating.
 pub fn empty() -> Bytes:
-    return bytes_from_string_utf8("")
+    return EMPTY_BYTES
 
 # encode a utf-8 string into bytes.
 pub fn from_string_utf8(text: String) -> Bytes:

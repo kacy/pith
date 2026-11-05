@@ -375,8 +375,8 @@ impl KeySet:
 # parsed from it, because a parse on every verify shows up in a server's
 # profile. an entry there always comes from the text in `cached_document`:
 # storing new text drops the entry, and a parse only stores its result if the
-# text it read is still current. a key set is never changed once parsed, so tasks
-# can share one.
+# text it read is still current. nothing changes a key set once it is stored
+# here, and `Cache.keys` gives callers their own copy, so tasks can share one.
 
 mut jwks_mu := Mutex()
 mut next_cache_handle := 1
@@ -443,6 +443,15 @@ impl Cache:
 
     # the current key set, fetching it if there is none or the ttl has passed.
     fn keys() -> KeySet!:
+        shared := self.shared_keys()!
+        mut copied: List[Key] := []
+        for key in shared.keys:
+            copied.push(key)
+        return KeySet(copied)
+
+    # the key set every verify reads. `keys` hands callers a copy, so nothing
+    # outside this module can change what later verifies accept.
+    fn shared_keys() -> KeySet!:
         jwks_mu.lock()
         if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:
             held := parsed_keys[self.handle]
@@ -468,7 +477,7 @@ impl Cache:
     # a stream of invented `kid`s becomes a stream of refusals rather than a
     # stream of requests at the issuer.
     fn verify(token: String, options: jwt.Options) -> jwt.Verified!:
-        set := self.keys()!
+        set := self.shared_keys()!
         kid := token_kid(token)
         if kid.len() == 0 or set.has(kid):
             return set.verify_named(kid, token, options)!
@@ -697,6 +706,14 @@ test "a cache keeps one parsed key set until the document changes":
     assert(second.has("ec-2"))
     assert(not second.has("ec-1"))
     assert(keys.keys()!.has("ec-2"))
+
+test "changing the key set a cache hands out does not change what it verifies":
+    keys := cache(UNREACHABLE_JWKS)
+    store_document(keys.handle, es256_document())
+    mut handed_out := keys.keys()!
+    handed_out.keys.clear()
+    assert_eq(keys.keys()!.keys.len(), 1)
+    assert(keys.verify(ES256_TOKEN, at(RFC7515_INSTANT)).is_ok)
 
 test "a cached key set does not outlive the document's ttl":
     keys := cache(UNREACHABLE_JWKS).timeout_ms(200)

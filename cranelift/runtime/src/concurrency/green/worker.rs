@@ -147,25 +147,37 @@ pub(super) fn debug_assert_stealable(id: TaskId) {
 #[inline(always)]
 pub(super) fn debug_assert_stealable(_id: TaskId) {}
 
+/// which waiting work goes first on a periodic turn. they alternate because a
+/// preempted task usually goes straight back on the deferred queue, so a turn that
+/// always preferred that queue would never reach a fresh task behind a cpu hog.
+#[derive(Clone, Copy)]
+pub(super) enum WaitingTurn {
+    Deferred,
+    Fresh,
+}
+
 /// find the next ready task for worker `index`: its pinned queue first (resume
 /// suspended work it owns), then its own local queue, then the injector, then a
 /// steal from a random peer's local queue, and only then its deferred queue.
-/// with `turn_for_waiting` the deferred queue and then the fresh tasks go first
-/// instead; the worker loop asks for that every `POLL_EVERY` tasks. a preempted
-/// task and a task that has never run then wait a bounded number of turns, even
-/// on a worker whose pinned queue never empties. returns `None` if the whole pool
-/// is momentarily empty.
+/// with a `WaitingTurn` the deferred queue or the fresh tasks go first instead;
+/// the worker loop asks for one every `POLL_EVERY` tasks, alternating which goes
+/// first. a preempted task and a task that has never run then wait a bounded
+/// number of turns, even on a worker whose pinned queue never empties. returns
+/// `None` if the whole pool is momentarily empty.
 pub(super) fn find_work(
     index: usize,
-    turn_for_waiting: bool,
+    turn: Option<WaitingTurn>,
     watch: &mut PinWatch,
 ) -> Option<TaskId> {
     let sched = scheduler();
 
-    if turn_for_waiting {
-        if let Some(id) = pop_deferred(index).or_else(|| pop_fresh(index)) {
-            return Some(id);
-        }
+    let waiting = match turn {
+        Some(WaitingTurn::Deferred) => pop_deferred(index).or_else(|| pop_fresh(index)),
+        Some(WaitingTurn::Fresh) => pop_fresh(index).or_else(|| pop_deferred(index)),
+        None => None,
+    };
+    if waiting.is_some() {
+        return waiting;
     }
 
     // pinned first: these are woken tasks this worker must resume itself.
@@ -485,7 +497,8 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
     let mut since_poll: u32 = 0;
     // set on the same count as the socket poll: the next `find_work` serves
     // one preempted or fresh task ahead of everything else.
-    let mut waiting_turn = false;
+    let mut waiting_turn = None;
+    let mut last_turn = WaitingTurn::Fresh;
     let mut watch = PinWatch::new();
     loop {
         if worker.search_token.swap(false, AtomicOrdering::SeqCst) {
@@ -495,7 +508,7 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
             }
             searching = true;
         }
-        match find_work(index, std::mem::take(&mut waiting_turn), &mut watch) {
+        match find_work(index, waiting_turn.take(), &mut watch) {
             Some(id) => {
                 idle_timeout = PARK_TIMEOUT_MIN;
                 if searching {
@@ -518,7 +531,11 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
                 since_poll += 1;
                 if since_poll >= POLL_EVERY {
                     since_poll = 0;
-                    waiting_turn = true;
+                    last_turn = match last_turn {
+                        WaitingTurn::Deferred => WaitingTurn::Fresh,
+                        WaitingTurn::Fresh => WaitingTurn::Deferred,
+                    };
+                    waiting_turn = Some(last_turn);
                     crate::netpoll::poll_ready(index);
                 }
             }

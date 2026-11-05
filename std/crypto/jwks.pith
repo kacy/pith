@@ -349,7 +349,10 @@ impl KeySet:
     # a single-key issuer needs and what a rotating one is not supposed to
     # leave you doing.
     fn verify(token: String, options: jwt.Options) -> jwt.Verified!:
-        kid := token_kid(token)
+        return self.verify_named(token_kid(token), token, options)!
+
+    # `verify`, for a caller that has already read the token's kid.
+    fn verify_named(kid: String, token: String, options: jwt.Options) -> jwt.Verified!:
         if kid.len() > 0:
             return verify_with(self.key(kid)!, token, options)!
         # a set with one key is the common case, and there the reason it
@@ -468,10 +471,10 @@ impl Cache:
         set := self.keys()!
         kid := token_kid(token)
         if kid.len() == 0 or set.has(kid):
-            return set.verify(token, options)!
+            return set.verify_named(kid, token, options)!
         if not self.may_refresh():
             fail "this key set holds no key with kid '" + kid + "'"
-        return self.refresh()!.verify(token, options)!
+        return self.refresh()!.verify_named(kid, token, options)!
 
     # whether a kid we have never seen may force a fetch right now. taking
     # the stamp and deciding under one lock is what keeps a burst of unknown

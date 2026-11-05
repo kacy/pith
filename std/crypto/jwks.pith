@@ -368,16 +368,18 @@ impl KeySet:
 # the cache
 # ---------------------------------------------------------------
 #
-# the document text is what is cached, and it is parsed per use. a key set is
-# a handful of keys and the parse is a small json read; keeping the text
-# rather than the parsed keys means the shared table holds nothing but
-# strings and integers, which is one fewer thing to get wrong about who owns
-# what across tasks.
+# the document text is what a fetch stores, and `parsed_keys` holds the key set
+# parsed from it, because a parse on every verify shows up in a server's
+# profile. an entry there always comes from the text in `cached_document`:
+# storing new text drops the entry, and a parse only stores its result if the
+# text it read is still current. nothing changes a key set once it is stored
+# here, and `Cache.keys` gives callers their own copy, so tasks can share one.
 
 mut jwks_mu := Mutex()
 mut next_cache_handle := 1
 mut cached_document: Map[Int, String] := {}
 mut cached_at: Map[Int, Int] := {}
+mut parsed_keys: Map[Int, KeySet] := {}
 mut refreshed_at: Map[Int, Int] := {}
 
 # a key set fetched from `url` and kept for a while. build one at startup and
@@ -390,6 +392,15 @@ pub struct Cache:
     timeout_v: Int
     max_bytes_v: Int
     cooldown_v: Int
+
+# record freshly fetched text for a cache, dropping the key set parsed from the
+# text it replaces.
+fn store_document(handle: Int, text: String):
+    jwks_mu.lock()
+    cached_document.insert(handle, text)
+    cached_at.insert(handle, time.unix())
+    parsed_keys.remove(handle)
+    jwks_mu.unlock()
 
 # a cache over the key set published at `url`. https is what an issuer
 # publishes over and what you want: the document is the root of trust for
@@ -429,7 +440,28 @@ impl Cache:
 
     # the current key set, fetching it if there is none or the ttl has passed.
     fn keys() -> KeySet!:
-        return parse(self.document(false)!)!
+        shared := self.shared_keys()!
+        mut copied: List[Key] := []
+        for key in shared.keys:
+            copied.push(key)
+        return KeySet(copied)
+
+    # the key set every verify reads. `keys` hands callers a copy, so nothing
+    # outside this module can change what later verifies accept.
+    fn shared_keys() -> KeySet!:
+        jwks_mu.lock()
+        if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:
+            held := parsed_keys[self.handle]
+            jwks_mu.unlock()
+            return held
+        jwks_mu.unlock()
+        text := self.document(false)!
+        set := parse(text)!
+        jwks_mu.lock()
+        if cached_document.contains_key(self.handle) and cached_document[self.handle] == text:
+            parsed_keys.insert(self.handle, set)
+        jwks_mu.unlock()
+        return set
 
     # fetch now, whatever the ttl says, and return what came back. reach for
     # it when something outside told you the issuer rotated.
@@ -442,7 +474,7 @@ impl Cache:
     # a stream of invented `kid`s becomes a stream of refusals rather than a
     # stream of requests at the issuer.
     fn verify(token: String, options: jwt.Options) -> jwt.Verified!:
-        set := self.keys()!
+        set := self.shared_keys()!
         kid := token_kid(token)
         if kid.len() == 0 or set.has(kid):
             return set.verify(token, options)!
@@ -479,10 +511,7 @@ impl Cache:
             return held
 
         fetched := fetch(self.url_v, self.timeout_v, self.max_bytes_v)!
-        jwks_mu.lock()
-        cached_document.insert(self.handle, fetched)
-        cached_at.insert(self.handle, time.unix())
-        jwks_mu.unlock()
+        store_document(self.handle, fetched)
         return fetched
 
 fn fetch(jwks_url: String, wait_ms: Int, limit: Int) -> String!:
@@ -654,6 +683,50 @@ fn with_kid(token: String, kid: String) -> String:
     rest := token.substring(token.index_of("."), token.len())
     header := encoding.b64_url_raw_encode(bytes.from_string_utf8("{{\"alg\":\"ES256\",\"kid\":\"" + kid + "\"}}"))
     return header + rest
+
+# a port nothing listens on, so a fetch fails at once rather than answering.
+UNREACHABLE_JWKS := "http://127.0.0.1:1/keys"
+
+test "a cache keeps one parsed key set until the document changes":
+    keys := cache(UNREACHABLE_JWKS)
+    store_document(keys.handle, "{{\"keys\":[" + es256_key("ec-1") + "]}}")
+    first := keys.keys()!
+    assert(first.has("ec-1"))
+    # this read comes from the parsed set: swapping the text behind it without
+    # going through store_document is not seen.
+    cached_document.insert(keys.handle, "not json")
+    assert(keys.keys()!.has("ec-1"))
+
+    # new text replaces the set, and the old key is gone at once.
+    store_document(keys.handle, "{{\"keys\":[" + es256_key("ec-2") + "]}}")
+    second := keys.keys()!
+    assert(second.has("ec-2"))
+    assert(not second.has("ec-1"))
+    assert(keys.keys()!.has("ec-2"))
+
+test "changing the key set a cache hands out does not change what it verifies":
+    keys := cache(UNREACHABLE_JWKS)
+    store_document(keys.handle, es256_document())
+    mut handed_out := keys.keys()!
+    handed_out.keys.clear()
+    assert_eq(keys.keys()!.keys.len(), 1)
+    assert(keys.verify(ES256_TOKEN, at(RFC7515_INSTANT)).is_ok)
+
+test "a cached key set does not outlive the document's ttl":
+    keys := cache(UNREACHABLE_JWKS).timeout_ms(200)
+    store_document(keys.handle, "{{\"keys\":[" + es256_key("ec-1") + "]}}")
+    assert(keys.keys()!.has("ec-1"))
+    cached_at.insert(keys.handle, time.unix() - DEFAULT_TTL - 1)
+    # stale, so it has to fetch, and the issuer is not answering.
+    assert(keys.keys().is_err)
+
+test "a document that does not parse leaves nothing cached to verify against":
+    keys := cache(UNREACHABLE_JWKS)
+    store_document(keys.handle, "{{\"keys\":[" + es256_key("ec-1") + "]}}")
+    assert(keys.keys()!.has("ec-1"))
+    store_document(keys.handle, "not json")
+    assert(keys.keys().is_err)
+    assert(keys.keys().is_err)
 
 test "an rsa key with the identity exponent e=1 is refused":
     # "AQ" is base64url for the single byte 0x01, i.e. e = 1 — RSA's identity,

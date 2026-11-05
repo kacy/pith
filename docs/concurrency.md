@@ -391,7 +391,9 @@ back its park timeout off it parks directly, and an idle pool stays quiet.
 
 two rules decide placement. a worker that wakes a task parked on another
 worker takes it, so the woken task resumes where its waker is, and a pair that
-talk to each other converge onto one worker after their first exchange. a task
+talk to each other converge onto one worker after their first exchange. a mutex
+unlock is the exception and leaves the task it wakes where it was, because that
+task only wants the lock. a task
 that never waits on anyone is never moved. that rule alone would pull parallel
 work onto one worker whenever it synchronizes, so there is a second one: when
 a worker has woken tasks queued and has stayed inside one task for 20us, an
@@ -550,7 +552,8 @@ descheduled at a loop back-edge instead of holding its worker until it finishes.
 coordinates already yields on its own and never needs any of it.
 
 and placement follows the two rules in "the green backend" above: a woken
-task moves to the worker that woke it, and an idle worker takes queued tasks
+task moves to the worker that woke it, unless a mutex unlock woke it, and an
+idle worker takes queued tasks
 off a worker stuck in a long one. `PITH_GREEN_WORKERS=1` takes the choice away
 entirely, and `PITH_GREEN_MIGRATE=0` keeps each task on the first worker that
 runs it.

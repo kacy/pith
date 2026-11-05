@@ -34,8 +34,9 @@
 //! from the thread it ran on (see the accessor notes above `current_task`), so
 //! it may resume on any worker. the first worker to run a task becomes its
 //! owner, and a wake enqueues it on the owner's pinned queue. two rules move
-//! it: a worker that wakes a task parked on another worker takes it
-//! (`claim_parked`; `PITH_GREEN_MIGRATE=0` turns this off), and an idle worker
+//! it: a worker that wakes a task parked on another worker takes it, unless the
+//! wake is a mutex unlock (`claim_parked`; `PITH_GREEN_MIGRATE=0` turns this off),
+//! and an idle worker
 //! takes a queued task off a peer that has been inside one long task for a
 //! while (`steal_pinned`). a coroutine changes threads only while it is
 //! off-CPU and held by exactly one thread, which is what makes
@@ -85,7 +86,7 @@ use worker::*;
 pub use preempt::{pith_green_maybe_yield, PITH_PREEMPT_REQUESTED};
 pub use probe::{encode_probe, pith_green_cross_thread_probe};
 pub use stats::note_channel_wake;
-pub(crate) use wake::{park_current, take_handoff, wake, wake_pool, wake_with};
+pub(crate) use wake::{park_current, take_handoff, wake, wake_in_place, wake_pool, wake_with};
 
 /// the pieces of the scheduling word the loom models drive: its states and
 /// flags, and the pure transitions a wake and a suspend make on it.

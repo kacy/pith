@@ -509,6 +509,13 @@ fn header_lookup(headers: Map[String, String], name: String) -> String:
             return headers[key]
     return ""
 
+# whether `headers` names `name` at all, even with an empty value.
+fn header_named(headers: Map[String, String], name: String) -> Bool:
+    for key in headers:
+        if header_key_matches(key, name):
+            return true
+    return false
+
 fn header_without(headers: Map[String, String], name: String) -> Map[String, String]:
     mut copied: Map[String, String] := {}
     for key in headers:
@@ -1180,6 +1187,20 @@ fn is_tchar(b: Int) -> Bool:
     if b >= 48 and b <= 57:
         return true
     return b == 33 or (b >= 35 and b <= 39) or b == 42 or b == 43 or b == 45 or b == 46 or b == 94 or b == 95 or b == 96 or b == 124 or b == 126
+
+# whether `name` can go on the wire as a field name (rfc 9110 5.1): one or more
+# token characters. stripping control bytes would not be enough, because
+# `Content-Length\n` would then become a framing field that no check saw, and a
+# name holding a colon would write a field of the caller's choosing.
+fn is_field_name(name: String) -> Bool:
+    if name == "":
+        return false
+    mut i := 0
+    while i < name.len():
+        if not is_tchar(ord(name[i])):
+            return false
+        i = i + 1
+    return true
 
 fn is_digit(b: Int) -> Bool:
     return b >= 48 and b <= 57
@@ -2809,6 +2830,10 @@ fn write_response_head(out: ByteBuffer, response: HttpResponse, body_length: Int
     mut explicit_length := ""
     mut has_date := false
     for key in response.headers:
+        # as in net/http, a server drops a bad name: the handler has already
+        # returned, so there is nobody to give an error to.
+        if not is_field_name(key):
+            continue
         if header_key_matches(key, "Content-Length"):
             explicit_length = response.headers[key].trim()
             continue
@@ -4217,16 +4242,23 @@ fn method_expects_body(method: String) -> Bool:
 # Connection, Accept-Encoding: gzip when `accept_gzip` is set and the request
 # names none, and the framing of the body. a Content-Length or
 # Transfer-Encoding the request names is replaced by the framing that matches
-# the body.
-fn request_head_bytes(req: ClientRequest, target: String, connection: String, accept_gzip: Bool) -> Bytes:
+# the body. an empty Host or Connection counts as not named and writes no line
+# of its own. an empty Accept-Encoding is kept, since it asks for no encoding
+# (rfc 9110 12.5.3). a field name that is not a token fails the request.
+fn request_head_bytes(req: ClientRequest, target: String, connection: String, accept_gzip: Bool) -> Bytes!:
     crlf := chr(13) + chr(10)
     out := bytes.buffer()
+    errdefer out.free()
     mut line := strip_header_controls(req.method) + " " + strip_header_controls(target) + " HTTP/1.1" + crlf
     if header_lookup(req.headers, "Host") == "":
         line = line + "Host: " + strip_header_controls(host_header_value(req.host, req.port, req.use_tls)) + crlf
     out.write(bytes.from_string_utf8(line)) catch 0
     for key in req.headers:
+        if not is_field_name(key):
+            fail "invalid header field name: " + strip_header_controls(key)
         if header_key_matches(key, "Content-Length") or header_key_matches(key, "Transfer-Encoding"):
+            continue
+        if req.headers[key] == "" and (header_key_matches(key, "Host") or header_key_matches(key, "Connection")):
             continue
         # strip CR/LF/NUL so an untrusted value reflected into a header
         # (.bearer, .cookie, .header with attacker input) cannot inject a
@@ -4236,7 +4268,7 @@ fn request_head_bytes(req: ClientRequest, target: String, connection: String, ac
     mut tail := ""
     if connection != "" and header_lookup(req.headers, "Connection") == "":
         tail = tail + "Connection: " + connection + crlf
-    if accept_gzip and header_lookup(req.headers, "Accept-Encoding") == "":
+    if accept_gzip and not header_named(req.headers, "Accept-Encoding"):
         tail = tail + "Accept-Encoding: gzip" + crlf
     if request_sends_chunked(req):
         tail = tail + "Transfer-Encoding: chunked" + crlf
@@ -4261,7 +4293,7 @@ fn request_body_bytes(req: ClientRequest) -> Bytes:
 
 # the whole request, head and body.
 fn request_wire_bytes(req: ClientRequest, target: String, connection: String, accept_gzip: Bool) -> Bytes!:
-    head := request_head_bytes(req, target, connection, accept_gzip)
+    head := request_head_bytes(req, target, connection, accept_gzip)!
     body := request_body_bytes(req)
     if body.is_empty():
         return head
@@ -5528,7 +5560,7 @@ impl Client:
         expect := self.expect_continue_timeout_ms > 0 and request_expects_continue(req) and not req.body.is_empty()
         mut wire := bytes.empty()
         if expect:
-            wire = request_head_bytes(req, target, connection, accept_gzip)
+            wire = request_head_bytes(req, target, connection, accept_gzip)!
         else:
             wire = request_wire_bytes(req, target, connection, accept_gzip)!
         arm_client_deadline(fd, deadline, false)
@@ -6832,6 +6864,24 @@ test "a client request head names the origin and frames the body":
     assert_eq(sized, "POST /p HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nhi")
     chunked := request_wire_bytes(post_request("h", 80, "/p").body_text("hello").header("Transfer-Encoding", "chunked"), "/p", "", false)!.to_string_utf8()!
     assert_eq(chunked, "POST /p HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+
+test "a client request fails on a field name that is not a token":
+    for name in ["Content-Length\n", "Transfer-Encoding\r\n", "Host\n", "X: y", "Content-Length ", "Bad Name", ""]:
+        assert(request_wire_bytes(post_request("h", 80, "/p").body_text("x").header(name, "99"), "/p", "", false).is_err)
+
+test "an empty Host or Connection writes only the default":
+    wire := request_wire_bytes(get_request("h", 80, "/").header("Host", "").header("Connection", ""), "/", "close", false)!.to_string_utf8()!
+    assert_eq(wire, "GET / HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n")
+
+test "an empty Accept-Encoding stops the client asking for gzip":
+    wire := request_wire_bytes(get_request("h", 80, "/").header("Accept-Encoding", ""), "/", "", true)!.to_string_utf8()!
+    assert_eq(wire, "GET / HTTP/1.1\r\nHost: h\r\nAccept-Encoding: \r\n\r\n")
+
+test "a response drops a field name that is not a token":
+    for name in ["Content-Length\n", "Transfer-Encoding\r\n", "X: y", "Bad Name"]:
+        payload := text(200, "ok").header(name, "99").to_string()!
+        assert(not payload.contains("99"))
+        assert(payload.contains("Content-Length: 2\r\n"))
 
 test "proxy_for follows net/http's NO_PROXY rules":
     p := "http://proxy.test:3128"

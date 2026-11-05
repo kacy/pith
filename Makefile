@@ -1,4 +1,4 @@
-.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean fuzz-surfaces-check fuzz-surfaces loom-check pithgen-leak
+.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-fresh-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean fuzz-surfaces-check fuzz-surfaces loom-check pithgen-leak
 
 
 # prints a bounded account of a failed regression case: exit status, the
@@ -1218,6 +1218,25 @@ green-preempted-fairness: build
 		exit 1; \
 	fi
 
+# --- green-thread fresh-task fairness ---
+# a task that has never run waits on a local queue behind the woken tasks. a
+# worker that never runs out of woken tasks must still give it a turn, or a new
+# connection's handler never starts: at a single worker this case then hangs.
+green-fresh-fairness: build
+	@echo "--- green-thread fresh-task fairness (byte-identical off vs on, 1 and default workers) ---"
+	@off=$$(timeout 60 env PITH_GREEN=0 ./target/release/pith run tests/green/fresh_fairness.pith 2>/dev/null); \
+	on1=$$(timeout 60 env PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run tests/green/fresh_fairness.pith 2>/dev/null); \
+	onN=$$(timeout 60 env PITH_GREEN=1 ./target/release/pith run tests/green/fresh_fairness.pith 2>/dev/null); \
+	if [ "$$off" = "$$on1" ] && [ "$$off" = "$$onN" ] && [ -n "$$off" ]; then \
+		echo "ok   identical output at 1 and default workers: $$on1"; \
+	else \
+		echo "FAIL output differs"; \
+		echo "  os-thread:        $$off"; \
+		echo "  green 1 worker:   $$on1"; \
+		echo "  green default:    $$onN"; \
+		exit 1; \
+	fi
+
 # --- green-thread socket waits under the edge-triggered reactor ---
 # a readiness wait on data that is already buffered, and a reader and a writer
 # blocking on one socket. a missed edge shows as a 0 where the os-thread run
@@ -1244,7 +1263,7 @@ green-edge-waits: build
 # byte-for-byte. green-echo is intentionally left out: it binds a
 # fixed loopback port and races a sleep to let the server start, which is too
 # flaky for a shared runner.
-green-tests: green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-starvation green-pinned-fairness green-preempted-fairness green-pool-wake green-edge-waits
+green-tests: green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-starvation green-pinned-fairness green-preempted-fairness green-fresh-fairness green-pool-wake green-edge-waits
 	@echo "all green-thread tests passed"
 
 # --- full corpus under each backend ---

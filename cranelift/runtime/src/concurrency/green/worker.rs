@@ -150,18 +150,20 @@ pub(super) fn debug_assert_stealable(_id: TaskId) {}
 /// find the next ready task for worker `index`: its pinned queue first (resume
 /// suspended work it owns), then its own local queue, then the injector, then a
 /// steal from a random peer's local queue, and only then its deferred queue.
-/// with `deferred_first` the deferred queue goes first instead; the worker loop
-/// asks for that every `POLL_EVERY` tasks so a preempted task waits a bounded
-/// number of turns. returns `None` if the whole pool is momentarily empty.
+/// with `turn_for_waiting` the deferred queue and then the fresh tasks go first
+/// instead; the worker loop asks for that every `POLL_EVERY` tasks. a preempted
+/// task and a task that has never run then wait a bounded number of turns, even
+/// on a worker whose pinned queue never empties. returns `None` if the whole pool
+/// is momentarily empty.
 pub(super) fn find_work(
     index: usize,
-    deferred_first: bool,
+    turn_for_waiting: bool,
     watch: &mut PinWatch,
 ) -> Option<TaskId> {
     let sched = scheduler();
 
-    if deferred_first {
-        if let Some(id) = pop_deferred(index) {
+    if turn_for_waiting {
+        if let Some(id) = pop_deferred(index).or_else(|| pop_fresh(index)) {
             return Some(id);
         }
     }
@@ -176,20 +178,7 @@ pub(super) fn find_work(
         }
     }
 
-    // own local queue (stealable): pop into a local so the queue lock is
-    // released before the debug invariant check reads the task's word.
-    let own = &sched.workers[index].local;
-    if let Some(id) = own.pop() {
-        debug_assert_stealable(id);
-        return Some(id);
-    }
-
-    // one at a time from the injector, unlike a peer steal below. the
-    // injector holds what `main` spawned, often a handful of tasks that talk
-    // to each other; taking half of them packed them onto one worker and made
-    // the channel fan-out benchmark about twice as slow.
-    if let Some(id) = sched.injector.try_pop() {
-        debug_assert_stealable(id);
+    if let Some(id) = pop_fresh(index) {
         return Some(id);
     }
 
@@ -197,6 +186,7 @@ pub(super) fn find_work(
     // hammer worker 0. an empty victim is skipped on its atomic length, so the
     // scan takes a lock only where there is something to take, and a hit
     // takes half the victim's backlog along with it.
+    let own = &sched.workers[index].local;
     let n = sched.workers.len();
     let start = steal_start(n);
     for k in 0..n {
@@ -226,6 +216,25 @@ pub(super) fn find_work(
     // this is what lets the other tasks on this worker make progress before the
     // hog runs again.
     pop_deferred(index)
+}
+
+/// take a task that has never run: from this worker's local queue, then the
+/// injector.
+fn pop_fresh(index: usize) -> Option<TaskId> {
+    let sched = scheduler();
+    // pop into a local so the queue lock is released before the debug
+    // invariant check reads the task's word.
+    if let Some(id) = sched.workers[index].local.pop() {
+        debug_assert_stealable(id);
+        return Some(id);
+    }
+    // one at a time from the injector, unlike a peer steal. the injector holds
+    // what `main` spawned, often a handful of tasks that talk to each other;
+    // taking half of them packed them onto one worker and made the channel
+    // fan-out benchmark about twice as slow.
+    let id = sched.injector.try_pop()?;
+    debug_assert_stealable(id);
+    Some(id)
 }
 
 /// how long a peer must stay inside one task before a thief takes a task off
@@ -390,9 +399,10 @@ pub(super) fn park(index: usize, timeout: Duration) -> bool {
 pub(super) const PARK_SPIN: Duration = Duration::from_micros(10);
 
 /// how many tasks a busy worker runs between non-blocking polls of its
-/// sockets and serves its deferred queue first. go checks its global queue on
-/// the same kind of count (61); this only bounds how long a ready socket's
-/// task, or a preempted one, can wait behind queued work.
+/// sockets and serves its deferred and fresh tasks first. go checks its global
+/// queue on the same kind of count (61); this only bounds how long a ready
+/// socket's task, a preempted one, or one that has never run can wait behind
+/// queued work.
 pub(super) const POLL_EVERY: u32 = 61;
 
 /// look for work for up to `PARK_SPIN` before parking. probes are spaced by a
@@ -474,8 +484,8 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
     let worker = &scheduler().workers[index];
     let mut since_poll: u32 = 0;
     // set on the same count as the socket poll: the next `find_work` serves
-    // one preempted task ahead of everything else.
-    let mut deferred_turn = false;
+    // one preempted or fresh task ahead of everything else.
+    let mut waiting_turn = false;
     let mut watch = PinWatch::new();
     loop {
         if worker.search_token.swap(false, AtomicOrdering::SeqCst) {
@@ -485,7 +495,7 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
             }
             searching = true;
         }
-        match find_work(index, std::mem::take(&mut deferred_turn), &mut watch) {
+        match find_work(index, std::mem::take(&mut waiting_turn), &mut watch) {
             Some(id) => {
                 idle_timeout = PARK_TIMEOUT_MIN;
                 if searching {
@@ -500,14 +510,15 @@ pub(super) fn worker_loop(index: usize, cycle_slot: Option<Arc<crate::cycle::Mut
                 // a worker that always has work never parks, so it never
                 // waits in its poller: look at its sockets every so often, or
                 // the tasks whose data has arrived would wait behind all of
-                // its queued work. the same count gives the deferred queue a
-                // turn, or a preempted task would wait for the worker to run
-                // dry, which a server under steady load may not do for
-                // hundreds of milliseconds.
+                // its queued work. the same count gives preempted and fresh
+                // tasks a turn, or they would wait for the worker to run dry,
+                // which a server under steady load may not do at all. a fresh
+                // task is often a new connection's handler, and one left
+                // waiting here is a client that connected and hears nothing.
                 since_poll += 1;
                 if since_poll >= POLL_EVERY {
                     since_poll = 0;
-                    deferred_turn = true;
+                    waiting_turn = true;
                     crate::netpoll::poll_ready(index);
                 }
             }

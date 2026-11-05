@@ -385,6 +385,12 @@ impl MapImpl {
         }
     }
 
+    /// the stored keys, borrowed. a map with raw int values stores no `MapKey`,
+    /// so this is for the string and bytes flavors.
+    fn stored_keys(&self) -> impl Iterator<Item = &MapKey> {
+        self.data.keys()
+    }
+
     fn keys(&self) -> Vec<MapKey> {
         match &self.int_values8 {
             Some(data) => data.keys().map(|key| MapKey::Int(*key)).collect(),
@@ -1886,8 +1892,8 @@ pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
     // string-tagged: the list owns the freshly copied key strings
     let list = pith_list_new(8, 1);
 
-    for key in impl_ref.keys() {
-        if let MapKey::String(ref bytes) = key {
+    for key in impl_ref.stored_keys() {
+        if let MapKey::String(bytes) = key {
             let ptr = crate::pith_copy_bytes_to_cstring(bytes);
             pith_list_push_value(list, ptr as i64);
             crate::pith_cstring_release(ptr as *const i8);

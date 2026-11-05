@@ -3990,6 +3990,9 @@ pub fn send_response(fd: Int, response: String) -> Int!:
 # response_set_cookie_headers.
 fn response_headers_map(raw_head: Bytes) -> Map[String, String]:
     mut result: Map[String, String] := {}
+    # the names so far, to find a repeat in any case. the last one wins, under
+    # the spelling it arrived with.
+    mut names: List[String] := []
     hdrs := headers_bytes(raw_head)
     mut line_start := 0
     mut pos := 0
@@ -4004,7 +4007,16 @@ fn response_headers_map(raw_head: Bytes) -> Map[String, String]:
                 line_text := decode_utf8(hdrs.slice(line_start, line_end)) catch ""
                 colon := line_text.index_of(":")
                 if colon > 0:
-                    result = header_with(result, line_text.substring(0, colon).trim(), line_text.substring(colon + 1, line_text.len()).trim())
+                    name := line_text.substring(0, colon).trim()
+                    mut i := 0
+                    while i < names.len() and not header_key_matches(names[i], name):
+                        i = i + 1
+                    if i < names.len():
+                        result.remove(names[i])
+                        names[i] = name
+                    else:
+                        names.push(name)
+                    result.insert(name, line_text.substring(colon + 1, line_text.len()).trim())
             line_start = pos + 1
         pos = pos + 1
     return result
@@ -4221,11 +4233,25 @@ fn method_expects_body(method: String) -> Bool:
 fn request_head_bytes(req: ClientRequest, target: String, connection: String, accept_gzip: Bool) -> Bytes:
     crlf := chr(13) + chr(10)
     out := bytes.buffer()
+    # one pass over the names for everything the head asks about them, since
+    # listing a map's keys copies them. an empty value counts as not naming the
+    # field, as it does for `header_lookup`.
+    names := req.headers.keys()
+    mut has_host := false
+    mut has_connection := false
+    mut has_accept_encoding := false
+    for key in names:
+        if header_key_matches(key, "Host"):
+            has_host = has_host or req.headers[key] != ""
+        elif header_key_matches(key, "Connection"):
+            has_connection = has_connection or req.headers[key] != ""
+        elif header_key_matches(key, "Accept-Encoding"):
+            has_accept_encoding = has_accept_encoding or req.headers[key] != ""
     mut line := strip_header_controls(req.method) + " " + strip_header_controls(target) + " HTTP/1.1" + crlf
-    if header_lookup(req.headers, "Host") == "":
+    if not has_host:
         line = line + "Host: " + strip_header_controls(host_header_value(req.host, req.port, req.use_tls)) + crlf
     out.write(bytes.from_string_utf8(line)) catch 0
-    for key in req.headers:
+    for key in names:
         if header_key_matches(key, "Content-Length") or header_key_matches(key, "Transfer-Encoding"):
             continue
         # strip CR/LF/NUL so an untrusted value reflected into a header
@@ -4234,10 +4260,12 @@ fn request_head_bytes(req: ClientRequest, target: String, connection: String, ac
         # stream. the response path applies the same guard.
         out.write(bytes.from_string_utf8(strip_header_controls(key) + ": " + strip_header_controls(req.headers[key]) + crlf)) catch 0
     mut tail := ""
-    if connection != "" and header_lookup(req.headers, "Connection") == "":
+    if connection != "" and not has_connection:
         tail = tail + "Connection: " + connection + crlf
-    if accept_gzip and header_lookup(req.headers, "Accept-Encoding") == "":
+    if accept_gzip and not has_accept_encoding:
         tail = tail + "Accept-Encoding: gzip" + crlf
+    # the framing has one answer, shared with `request_body_bytes`: a head and a
+    # body that disagree about it are a request smuggling bug.
     if request_sends_chunked(req):
         tail = tail + "Transfer-Encoding: chunked" + crlf
     elif not req.body.is_empty() or method_expects_body(req.method):
@@ -6855,3 +6883,46 @@ test "proxy_for follows net/http's NO_PROXY rules":
     assert_eq(addr.1, 3128)
     assert_eq(parse_proxy_address("http://proxy.test")!.1, 80)
     assert(parse_proxy_address("socks5://proxy.test:1080").is_err)
+
+test "response headers keep the last of a repeated name, in any case":
+    crlf := chr(13) + chr(10)
+    head := "HTTP/1.1 200 OK" + crlf + "Content-Length: 1" + crlf + "X-A: one" + crlf + "content-length: 2" + crlf + "x-a: two" + crlf + "X-A: three" + crlf + "X-B: b" + crlf + crlf
+    headers := response_headers_map(bytes.from_string_utf8(head))
+    assert_eq(headers.len(), 3)
+    assert_eq(headers["content-length"], "2")
+    assert_eq(headers["X-A"], "three")
+    assert_eq(headers["X-B"], "b")
+    assert(not headers.contains_key("Content-Length"))
+    assert(not headers.contains_key("x-a"))
+
+test "a request head reads each field the request names, in any case":
+    plain := ClientRequest("GET", "h.test", 8080, "/", {}, bytes.empty(), false, 0, 0, 0)
+    head := request_head_bytes(plain, "/", "keep-alive", true).to_string_utf8() catch ""
+    assert(head.contains("Host: h.test:8080"))
+    assert(head.contains("Connection: keep-alive"))
+    assert(head.contains("Accept-Encoding: gzip"))
+    assert(not head.contains("Transfer-Encoding"))
+
+    named := ClientRequest("POST", "h.test", 80, "/", {"hOsT": "other.test", "connection": "close", "accept-encoding": "br", "transfer-encoding": "Chunked", "content-length": "9"}, bytes.from_string_utf8("x"), false, 0, 0, 0)
+    assert(request_sends_chunked(named))
+    written := request_head_bytes(named, "/", "keep-alive", true).to_string_utf8() catch ""
+    assert(written.contains("hOsT: other.test"))
+    assert(not written.contains("Host: h.test"))
+    assert(not written.contains("keep-alive"))
+    assert(not written.contains("gzip"))
+    assert(written.contains("Transfer-Encoding: chunked"))
+    assert(not written.contains("content-length"))
+    assert(not written.contains("Content-Length"))
+
+    # however a request spells its framing fields, head and body agree.
+    mixed := ClientRequest("POST", "h.test", 80, "/", {"Transfer-Encoding": "gzip", "transfer-encoding": "chunked", "TRANSFER-ENCODING": "identity"}, bytes.from_string_utf8("x"), false, 0, 0, 0)
+    mixed_head := request_head_bytes(mixed, "/", "", false).to_string_utf8() catch ""
+    body := request_body_bytes(mixed).to_string_utf8() catch ""
+    assert_eq(mixed_head.contains("Transfer-Encoding: chunked"), body != "x")
+    assert_eq(mixed_head.contains("Content-Length: 1"), body == "x")
+
+    # an empty value counts as not naming the field.
+    blank := ClientRequest("GET", "h.test", 80, "/", {"Host": "", "Connection": ""}, bytes.empty(), false, 0, 0, 0)
+    filled := request_head_bytes(blank, "/", "close", false).to_string_utf8() catch ""
+    assert(filled.contains("Host: h.test"))
+    assert(filled.contains("Connection: close"))

@@ -4,8 +4,11 @@
 # waits in the local queue, which is only looked at once pinned is empty. the
 # periodic turn in `find_work` is what gets it started.
 #
-# a regression shows up as this test never finishing: the pair only stops once the
-# fresh task has run.
+# a cpu hog runs beside them, which is preempted and goes back on the deferred queue
+# every time it gets a turn. the turn has to reach the fresh task anyway.
+#
+# a regression shows up as this test never finishing: the pair and the hog only stop
+# once the fresh task has run.
 
 fn pinger(to: Channel[Int], back: Channel[Int], stop: AtomicInt) -> Int:
     # started from here so the pair is already running when the fresh task queues
@@ -27,6 +30,12 @@ fn ponger(to: Channel[Int], back: Channel[Int]) -> Int:
         back.send(v.unwrap_or(0))
     return 1
 
+fn hog(stop: AtomicInt) -> Int:
+    mut spins := 0
+    while stop.load() == 0:
+        spins = spins + 1
+    return 1
+
 fn set_stop(stop: AtomicInt) -> Int:
     stop.store(1)
     return 1
@@ -35,6 +44,7 @@ fn main():
     to := Channel[Int](1)
     back := Channel[Int](1)
     stop := AtomicInt(0)
+    h := spawn hog(stop)
     p2 := spawn ponger(to, back)
     p1 := spawn pinger(to, back, stop)
-    print("pair:" + ((await p1) + (await p2)).to_string())
+    print("done:" + ((await p1) + (await p2) + (await h)).to_string())

@@ -606,6 +606,59 @@ fn a_stray_wake_leaves_no_duplicate_waitgroup_or_mutex_waiter() {
     set_current_worker(None);
 }
 
+// a mutex unlock from another worker leaves the waiter on its owner, where a
+// plain wake from that worker moves it. the difference is what keeps a contended
+// lock from gathering its users onto one worker.
+#[test]
+fn a_mutex_unlock_leaves_the_waiter_on_its_owner() {
+    use crate::concurrency::mutex::*;
+    let _guard = PREEMPT_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    if scheduler().workers.len() < 2 || !scheduler().migrate {
+        return;
+    }
+    set_current_worker(Some(0));
+    while take_pinned_on_0().is_some() {}
+
+    let m = pith_mutex_new();
+    unsafe { pith_mutex_lock(m) }; // held by this thread
+    let m_addr = m as usize;
+    let id = push_ready_task(task_running(5, move || unsafe {
+        pith_mutex_lock(m_addr as *mut PithMutexHandle);
+        pith_mutex_unlock(m_addr as *mut PithMutexHandle);
+    }));
+    run_task(id);
+    assert_eq!(state_of(id), S_PARKED);
+
+    set_current_worker(Some(1));
+    unsafe { pith_mutex_unlock(m) };
+    let word = sync_block(id).unwrap().word.load(AtomicOrdering::Acquire);
+    assert_eq!(word_owner(word), Some(0), "the unlock must not move the waiter");
+    set_current_worker(Some(0));
+    assert_eq!(take_pinned_on_0(), Some(id));
+    run_task(id);
+    assert_eq!(completion(id), Some(5));
+
+    // the same park and a plain wake from worker 1 does move it.
+    let other = push_ready_task(task_running(6, || {
+        park_current(current_task().expect("test body runs inside a task"));
+    }));
+    run_task(other);
+    assert_eq!(state_of(other), S_PARKED);
+    set_current_worker(Some(1));
+    wake(other);
+    let word = sync_block(other).unwrap().word.load(AtomicOrdering::Acquire);
+    assert_eq!(word_owner(word), Some(1), "a plain wake moves the task to its waker");
+    let taken = scheduler().workers[1]
+        .pinned
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop();
+    assert_eq!(taken, Some(other));
+    run_task(other);
+    assert_eq!(completion(other), Some(6));
+    set_current_worker(None);
+}
+
 // a green task waits on a child with no pidfd to watch it by (macOS, linux
 // before 5.3). the wait must not hold the process registry across the
 // child's life: a reader draining the child's pipes, or a deadline's kill,

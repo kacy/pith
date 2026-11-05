@@ -189,7 +189,7 @@ pub unsafe extern "C" fn pith_mutex_unlock(handle: *mut PithMutexHandle) {
     if m.state.swap(0, Ordering::Release) == 2 {
         let mut waiters = lock_waiters(m);
         for id in waiters.drain(..) {
-            green::wake(id);
+            green::wake_in_place(id);
         }
     }
 }

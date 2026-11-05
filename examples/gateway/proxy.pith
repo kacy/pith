@@ -29,9 +29,11 @@ fn connection_tokens(value: String) -> List[String]:
         out.push(token.trim().to_lower())
     return out
 
+SUBJECT_HEADER_LOWER := auth.SUBJECT_HEADER.to_lower()
+
 # headers a client may not choose: only the gateway sets these for an upstream.
 fn is_gateway_owned(lower: String) -> Bool:
-    return lower == auth.SUBJECT_HEADER.to_lower() or lower == "x-forwarded-for" or lower == "x-forwarded-host" or lower == "x-forwarded-proto"
+    return lower == SUBJECT_HEADER_LOWER or lower == "x-forwarded-for" or lower == "x-forwarded-host" or lower == "x-forwarded-proto"
 
 # a path a backend could split differently than the router did: an encoded slash
 # or backslash in a segment. `/public/a%2f..%2f..%2fadmin` is one segment under a
@@ -161,9 +163,22 @@ fn relay_as_it_comes(answer: http.OpenResponse) -> http.HttpResponse:
         return pump_body(answer, write)!
     return http.stream_response(relayed_head(answer, bytes.empty(), true), pump)
 
+# one upstream's metrics, looked up once so a request does not build label lists.
+struct UpstreamMetrics:
+    ok: metrics.Counter
+    failed: metrics.Counter
+    error: metrics.Counter
+    duration: metrics.Histogram
+
+fn upstream_metrics(route: String, address: String) -> UpstreamMetrics:
+    requests := metrics.counter("gateway_upstream_requests_total")
+    outcome := fn(name: String) => requests.labels(["route", route, "upstream", address, "outcome", name])
+    return UpstreamMetrics(outcome("ok"), outcome("failed"), outcome("error"), metrics.histogram("gateway_upstream_duration_ms").labels(["route", route, "upstream", address]))
+
 pub struct Forwarder:
     route: config.Route
     pool: upstream.Pool
+    instruments: List[UpstreamMetrics]
     client: http.Client
     skip_segments: Int
     scheme: String
@@ -174,11 +189,14 @@ pub fn forwarder(route: config.Route, pool: upstream.Pool, client: http.Client, 
     mut skip := 0
     if route.strip_prefix:
         skip = count_segments(route.prefix)
-    return Forwarder(route, pool, client, skip, scheme, trust_forwarded_for)
+    mut instruments: List[UpstreamMetrics] := []
+    for target in pool.upstreams:
+        instruments.push(upstream_metrics(route.name, target.address))
+    return Forwarder(route, pool, instruments, client, skip, scheme, trust_forwarded_for)
 
-fn record(route: String, address: String, outcome: String, started: Int):
-    metrics.counter("gateway_upstream_requests_total").labels(["route", route, "upstream", address, "outcome", outcome]).inc()
-    metrics.histogram("gateway_upstream_duration_ms").labels(["route", route, "upstream", address]).observe((time.mono_millis() - started).to_float())
+fn record(outcome: metrics.Counter, duration: metrics.Histogram, started: Int):
+    outcome.inc()
+    duration.observe((time.mono_millis() - started).to_float())
 
 impl Forwarder:
     # try upstreams in turn: as many as the route's retries allow for a method
@@ -205,6 +223,7 @@ impl Forwarder:
                 break
             tried[index] = true
             chosen := self.pool.upstreams[index]
+            instruments := self.instruments[index]
             if attempt > 0:
                 metrics.counter("gateway_retries_total").labels(["route", self.route.name]).inc()
             started := time.mono_millis()
@@ -212,15 +231,15 @@ impl Forwarder:
             opened := self.client.open(outbound)
             if opened.is_err:
                 chosen.breaker.failure()
-                record(self.route.name, chosen.address, "error", started)
+                record(instruments.error, instruments.duration, started)
                 last = failure_response(opened.err)
             elif upstream_failed(opened.ok.status):
                 chosen.breaker.failure()
-                record(self.route.name, chosen.address, "failed", started)
+                record(instruments.failed, instruments.duration, started)
                 last = read_whole(opened.ok, method)
             else:
                 chosen.breaker.success()
-                record(self.route.name, chosen.address, "ok", started)
+                record(instruments.ok, instruments.duration, started)
                 answer := opened.ok
                 if answer.content_length >= 0 and answer.content_length <= READ_WHOLE_BYTES or method == "HEAD":
                     return read_whole(answer, method)

@@ -85,10 +85,22 @@ pub(super) fn publish_yielder(yielder: *const TaskYielder) -> FinishGuard {
 /// flag if the task is still mid-suspend, so a wake is never lost and never
 /// double-enqueued.
 pub(crate) fn wake(id: TaskId) {
+    wake_placed(id, true);
+}
+
+/// `wake`, leaving the task on its owner. for a waker that has no reason to work
+/// with the task it wakes, as when a mutex unlock wakes a task that only wants the
+/// lock. moving that task to the unlocker's worker gains no shared work, and each
+/// contended lock then gathers its users onto fewer workers while the rest idle.
+pub(crate) fn wake_in_place(id: TaskId) {
+    wake_placed(id, false);
+}
+
+fn wake_placed(id: TaskId, may_move: bool) {
     let Some(block) = sync_block(id) else {
         return;
     };
-    let Some(owner) = claim_parked(block) else {
+    let Some(owner) = claim_parked(block, may_move) else {
         return;
     };
     // a parked task always ran, so `owner` is set; fall back to the injector
@@ -105,8 +117,8 @@ pub(crate) fn wake(id: TaskId) {
 /// task was not parked: still `Running` (the pending flag is set so the yield
 /// arm re-enqueues it), already `Ready`, or `Done`.
 ///
-/// with migration on (the default, read once into the scheduler), a worker
-/// that wakes a task pinned to a different worker takes it: the
+/// with migration on (the default, read once into the scheduler) and `may_move`
+/// set, a worker that wakes a task pinned to a different worker takes it: the
 /// owner bits are rewritten in the claiming CAS, so from the moment the task
 /// is `Ready` every reader of the word (the enqueue below, the resume that
 /// follows, the next wake) agrees on the new home. a pair of tasks that talk
@@ -120,10 +132,10 @@ pub(crate) fn wake(id: TaskId) {
 /// from the thread the task parked on. see the accessor block above
 /// `current_task`, and the placement section of the module doc.
 #[inline]
-pub(super) fn claim_parked(block: &SyncBlock) -> Option<Option<usize>> {
+pub(super) fn claim_parked(block: &SyncBlock, may_move: bool) -> Option<Option<usize>> {
     let sched = scheduler();
     let home_for = |owner: Option<usize>| {
-        if sched.migrate {
+        if sched.migrate && may_move {
             match (owner, current_worker()) {
                 (Some(o), Some(w)) if w != o => Some(w),
                 _ => owner,
@@ -202,7 +214,7 @@ pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
     let Some(block) = sync_block(id) else {
         return;
     };
-    let Some(owner) = claim_parked(block) else {
+    let Some(owner) = claim_parked(block, true) else {
         return;
     };
     // the claim above made this thread the only one touching the handoff cell

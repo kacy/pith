@@ -1,0 +1,392 @@
+# guarded data and locked blocks
+
+a design for checking, at compile time, that data shared between tasks is only
+touched with its lock held. nothing here is implemented. this page says why the
+check is needed, what the syntax would be, what the checker would enforce, what
+it would cost, and in what order it could land.
+
+## why
+
+pith makes memory safe by having the compiler place every retain and release,
+and the runtime checks the rest. that covers one task. it does not cover two
+tasks that reach the same list, map or struct, because a collection is one
+buffer behind a handle, and two tasks writing it at once corrupt the buffer.
+docs/concurrency.md says so, and E248 refuses the one case the checker can see:
+a collection this scope still holds, passed straight to `spawn`.
+
+everything else is convention. a `Mutex` is a value with `lock()` and
+`unlock()` and no relation to any data. std pairs them by naming, as in
+`rooms` beside `rooms_mu`, and by comments like the one in std/metrics.pith
+that says `shard_mu[i]` guards entry `i` of every map list below it. the
+compiler accepts all of these:
+
+- reading or writing guarded data without taking the lock, from a function
+  written later by someone who did not know the convention
+- an early `return` or a `!` between `lock()` and `unlock()`, which leaves the
+  lock held and parks every later caller for good
+- taking a lock a task already holds, which deadlocks, since there is no
+  reentrancy
+- a `mut` global collection in a program that spawns, with no lock at all.
+  `std.args` is one, and docs/limitations.md says it can tear with no
+  diagnostic
+
+std has 382 `lock()` and `unlock()` calls in 24 files, every one paired by
+hand. the 2026-10-31 audit found a wake race in the runtime (fixed in #1270),
+and thread sanitizer still reports an unlocked read in the http/2 client. the
+checks below would not have found the runtime bug, which is rust code, but they
+turn the whole class of "forgot the lock" and "forgot the unlock" bugs in pith
+code into compile errors.
+
+rust prevents these with its ownership rules: data behind a `Mutex<T>` can
+only be reached through the lock, and the `Send` and `Sync` traits stop a plain
+collection from crossing a thread at all. the design here aims at that
+guarantee without the ownership model that delivers it in rust: existing pith
+code keeps its shape and gains annotations, and the checker does the pairing
+that comments do today.
+
+## the design
+
+three additions to the language and one rule.
+
+### `guarded by`
+
+a declaration can name the mutex that guards it:
+
+```pith
+mut jwks_mu := Mutex()
+mut cached_document: Map[Int, String] := {} guarded by jwks_mu
+mut cached_at: Map[Int, Int] := {} guarded by jwks_mu
+mut parsed_keys: Map[Int, KeySet] := {} guarded by jwks_mu
+```
+
+it works on module globals, on struct fields naming a sibling field, and on
+locals:
+
+```pith
+struct PoolConn:
+    conns: List[Conn]
+    pick: Mutex
+    next: Int guarded by pick
+```
+
+the guard must be a `Mutex`, or a `List[Mutex]` (see "sharded locks" below).
+reading or writing a guarded name outside a block that holds its guard is a
+compile error:
+
+```pith
+fn peek(handle: Int) -> String?:
+    return cached_document.get(handle)
+    # error[E271]: cached_document is guarded by jwks_mu, which this function does not hold
+    #   fix: wrap the access in `locked jwks_mu:`, or mark the function `requires jwks_mu`
+```
+
+a read counts as an access. a read of a map while another task inserts into it
+is as unsafe as the write, so there is no read exemption.
+
+### `locked`
+
+a block that holds a mutex for its length and releases it on every exit:
+
+```pith
+fn store_document(handle: Int, text: String):
+    locked jwks_mu:
+        cached_document.insert(handle, text)
+        cached_at.insert(handle, time.unix())
+        parsed_keys.remove(handle)
+```
+
+the block is an ordinary block. `return`, `break`, `continue`, a `!` that
+propagates and falling off the end all unlock. that is the same shape as
+`defer`, which the emitter already lowers statically at each exit, loops
+included (`ir_defer_loop_base_stack` in self-host/ir_emitter_core.pith), so
+`locked m:` lowers to `m.lock()`, the body, and `m.unlock()` on each exit
+edge. no runtime machinery is added.
+
+inside the block the checker treats the mutex as held. a nested `locked` on a
+mutex the block already holds is a compile error, since the runtime would
+deadlock there.
+
+`lock()` and `unlock()` stay. a `locked` block cannot express "unlock early,
+do slow work, lock again", which `Cache.shared_keys` in std/crypto/jwks.pith
+does around a fetch, and some code wants the lock held across a call boundary.
+those keep the calls. the checker does not try to follow a hand-written
+`lock()`: guarded data under one is still an error, and the fix is a `locked`
+block around the accesses, or a `requires` helper for the part that needs the
+lock.
+
+### `requires`
+
+a function that expects to be called with a lock held says so:
+
+```pith
+fn evict(handle: Int) requires jwks_mu:
+    cached_document.remove(handle)
+    cached_at.remove(handle)
+```
+
+inside its body the mutex counts as held. every call to it must be inside a
+`locked` block for that mutex, or inside another function that `requires` it.
+calling it anywhere else is a compile error. for a method, the mutex may be a
+field: `fn bump() requires self.pick:`.
+
+### the sharing rule
+
+the annotations only protect data someone annotated. the rule that makes
+people annotate: a `mut` module global whose type is a list, map, set or
+struct, in a program that contains `spawn`, must be one of
+
+- `guarded by` a mutex
+- `threadlocal`
+- never assigned or mutated after module init (the checker already knows
+  which globals a function writes, from `ir_record_storage_keepers`)
+
+anything else is an error. it lands as a lint first (see "stages"), because
+every program with an unguarded global collection and a `spawn` trips it, and
+some of those are single-task programs that spawn once for something
+unrelated. the lint names the global and the spawn.
+
+struct fields are out of scope for the rule in this design. a struct that
+crosses to a task through `spawn` is already E248 if it is a collection, and a
+struct holding collections is a known E248 gap. widening E248 to structs is a
+separate, smaller change and is listed under "open questions".
+
+## the examples, before and after
+
+### module state: std/crypto/jwks.pith
+
+before:
+
+```pith
+mut jwks_mu := Mutex()
+mut cached_document: Map[Int, String] := {}
+mut cached_at: Map[Int, Int] := {}
+mut parsed_keys: Map[Int, KeySet] := {}
+
+fn store_document(handle: Int, text: String):
+    jwks_mu.lock()
+    cached_document.insert(handle, text)
+    cached_at.insert(handle, time.unix())
+    parsed_keys.remove(handle)
+    jwks_mu.unlock()
+
+    fn shared_keys() -> KeySet!:
+        jwks_mu.lock()
+        if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:
+            held := parsed_keys[self.handle]
+            jwks_mu.unlock()
+            return held
+        jwks_mu.unlock()
+        text := self.document(false)!
+        set := parse(text)!
+        jwks_mu.lock()
+        if cached_document.contains_key(self.handle) and cached_document[self.handle] == text:
+            parsed_keys.insert(self.handle, set)
+        jwks_mu.unlock()
+        return set
+```
+
+after:
+
+```pith
+mut jwks_mu := Mutex()
+mut cached_document: Map[Int, String] := {} guarded by jwks_mu
+mut cached_at: Map[Int, Int] := {} guarded by jwks_mu
+mut parsed_keys: Map[Int, KeySet] := {} guarded by jwks_mu
+
+fn store_document(handle: Int, text: String):
+    locked jwks_mu:
+        cached_document.insert(handle, text)
+        cached_at.insert(handle, time.unix())
+        parsed_keys.remove(handle)
+
+    fn shared_keys() -> KeySet!:
+        locked jwks_mu:
+            if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:
+                return parsed_keys[self.handle]
+        text := self.document(false)!
+        set := parse(text)!
+        locked jwks_mu:
+            if cached_document.contains_key(self.handle) and cached_document[self.handle] == text:
+                parsed_keys.insert(self.handle, set)
+        return set
+```
+
+the early return no longer carries its own unlock, the fetch happens between
+two blocks exactly as it happened between two unlock and lock pairs, and any
+new function in the module that touches `parsed_keys` without the lock fails
+to compile.
+
+### a struct field: std/net/grpc.pith
+
+before:
+
+```pith
+impl PoolConn:
+    fn choose() -> Int:
+        self.pick.lock()
+        i := self.next
+        self.next = (self.next + 1) % self.conns.len()
+        self.pick.unlock()
+        return i
+```
+
+after:
+
+```pith
+struct PoolConn:
+    conns: List[Conn]
+    pick: Mutex
+    next: Int guarded by pick
+
+impl PoolConn:
+    fn choose() -> Int:
+        locked self.pick:
+            i := self.next
+            self.next = (self.next + 1) % self.conns.len()
+            return i
+```
+
+### sharded locks: std/metrics.pith
+
+the registry keeps eight mutexes in a list, and `shard_mu[i]` guards element
+`i` of several map lists. the checker cannot match an index expression at one
+site to an index expression at another, so a guard that is a `List[Mutex]`
+is checked at the list level: any `locked shard_mu[k]:` satisfies
+`guarded by shard_mu`.
+
+```pith
+mut shard_mu: List[Mutex] := [Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex()]
+mut metric_descriptions: List[Map[String, String]] := [{}, {}, {}, {}, {}, {}, {}, {}] guarded by shard_mu
+
+fn register_description(bare: String, help: String, unit: String):
+    shard := shard_of(bare)
+    locked shard_mu[shard]:
+        if help != "" and not metric_descriptions[shard].contains_key(bare):
+            metric_descriptions[shard].insert(bare, help)
+```
+
+this is weaker than the single-mutex case: holding shard 3 and touching
+element 5 compiles. it still catches the unlocked access, which is the bug
+that has happened, and the comment in std/metrics.pith that describes the
+invariant stays.
+
+## what the checker enforces
+
+the whole check is a pass over each function body after type checking, with a
+set of "held" mutexes that grows on entering a `locked` block or a `requires`
+function and shrinks on leaving the block.
+
+1. an access to a name declared `guarded by m` requires `m` in the held set.
+   an access is any read or write of the name, including a method call on it
+   and passing it as an argument.
+2. a `locked m:` block adds `m`. `m` must be a `Mutex`, or an index into a
+   `List[Mutex]`. `m` already in the held set is an error (self deadlock).
+3. a call to a function declared `requires m` needs `m` in the held set.
+4. `guarded by m` on a struct field requires `m` to be a sibling field of
+   type `Mutex` or `List[Mutex]`. on a global, `m` must be a global in the
+   same module. on a local, `m` must be a local or parameter in scope.
+5. a `mut` global collection or struct in a program that spawns must be
+   guarded, `threadlocal`, or not written after init (the sharing rule).
+
+what the checker does not do:
+
+- it does not know which index of a `List[Mutex]` is held.
+- it does not follow a hand-written `lock()`. an access to guarded data after
+  `m.lock()` and before `m.unlock()` is still an error, and the fix is the
+  `locked` block.
+- it does not check lock order, so two blocks that nest two mutexes in
+  opposite orders can still deadlock at run time. a later lint could record
+  each function's nesting order and report a cycle.
+- it does not check that a `locked` block holds no park. holding a lock
+  across a channel receive or a socket read is allowed, as it is today, and
+  docs/concurrency.md still advises against it. a lint for a parking call
+  inside `locked` is cheap and listed under open questions.
+
+## what it costs
+
+### at run time
+
+a program pays nothing it does not pay today. `locked m:` emits the same
+`pith_mutex_lock` and `pith_mutex_unlock` calls the hand-written pairs emit
+today, one per exit edge, and the annotations and `requires` emit nothing.
+`defer` is lowered the same way and has no runtime cost.
+
+for the data that the sharing rule newly forces behind a lock, the cost is
+one uncontended lock and unlock pair per access. measured on the ryzen 9
+9950x with a 20M-iteration loop, pinned to one core, an uncontended pair
+costs 8 ns (a compare-and-swap to take the lock and one swap to release it,
+on a line the core already owns). the contended cost is what `lock_sweep`
+measures: sixteen tasks on one mutex, 50M operations, 87 ms in the
+2026-11-05 run, against 61 ms for go.
+
+where this could show in a benchmark:
+
+- `std.args` gains a lock. it is read at startup, not on a hot path.
+- a program that today reads a global map from many tasks with no lock, and
+  gets away with it because nothing writes after init, is not forced to lock:
+  the sharing rule accepts a global that is never written after module init.
+- a block that is wider than the hand-written pair it replaces holds the lock
+  longer. `shared_keys` above shows the fix, which is two blocks. the lint for
+  a parking call inside `locked` would catch the worst version.
+
+the gateway and http server benchmarks lock on pooled connections and
+registries already, through the pairs that become blocks, so their numbers
+should not move. the way to confirm that is the interleaved race in
+bench/README.md after the std migration, with `lock_sweep`, the http sweep
+and the gateway as the rows to watch.
+
+### at compile time
+
+one more pass over each function body, linear in its size, with a small set
+of held mutexes. the checker already walks every body for E248 and for
+`ir_record_storage_keepers`, so this is a few percent of check time at most.
+docs/lsp.md has the measured analysis times to compare against after the
+pass exists.
+
+### in the language
+
+the language gains three words and one rule. `guarded by` is a declaration
+suffix, `locked` is a block, and `requires` is a function suffix. none of them changes what a value is
+or how it is passed, and code with none of them compiles as before until the
+sharing rule becomes an error.
+
+## stages
+
+1. **`locked` alone.** the block, its lowering on the defer path, tests for
+   each exit kind (fall through, return, break, continue, `!`), and the
+   self-deadlock error. this is useful by itself: it removes every
+   hand-written unlock on an early exit. std migrates its pairs to blocks
+   where the pair sits in one function, which is most of the 382 calls.
+2. **`guarded by` and `requires`.** the annotations, the held-set pass, E271
+   for an unguarded access and its fix text, the sibling-field rule, and the
+   `List[Mutex]` weakening. std annotates every global and field that a
+   comment says is guarded. the metrics shards and the http/2 connection
+   state are the two to do first, since they are where the comments are
+   longest.
+3. **the sharing rule as a lint.** `pith lint` reports an unguarded `mut`
+   global collection in a program that spawns, naming the global and the
+   spawn. std and the examples go clean.
+4. **the sharing rule as an error.** at a version boundary, after a release
+   with the lint on, with the lint's text as the error's fix text.
+
+the count checker proposed alongside this one is independent and can run
+before or after. neither needs the other.
+
+## open questions
+
+- **the word.** `guarded by` reads well in a declaration and matches the
+  comments std already writes. `locked` could be `with m:` or `hold m:`; it
+  should not be `lock m:`, which reads as a statement that does not release.
+- **struct fields and the sharing rule.** E248 misses a struct holding a
+  collection. widening it to structs whose fields are collections, unless
+  those fields are `guarded by`, would close that gap and is a smaller change
+  than this one.
+- **a lint for parking inside `locked`.** channel receive, socket reads,
+  `sleep` and file reads inside a block would warn. cheap, and it enforces the
+  advice docs/concurrency.md already gives.
+- **lock order.** recording each function's lock nesting and reporting a
+  cycle between functions would catch the deadlocks the checker above cannot.
+  it needs whole-program call information the checker has in part.
+- **`RwMutex`.** nothing here needs a reader-writer lock, and std does not
+  have one. if one is added, `guarded by` applies unchanged and `locked` would
+  take a mode.

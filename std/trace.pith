@@ -454,19 +454,17 @@ pub fn set_sink(on: Bool):
     sink_active.store(0)
     mut i := 0
     while i < SINK_SHARDS:
-        sink_mus[i].lock()
-        sink_shards[i] = []
-        sink_mus[i].unlock()
+        locked sink_mus[i]:
+            sink_shards[i] = []
         i = i + 1
 
 fn record_finished_span(span: Span):
     if sink_active.load() == 0:
         return
     s := sink_shard(span.trace_id)
-    sink_mus[s].lock()
-    if sink_shards[s].len() < FINISHED_SPANS_CAP / SINK_SHARDS:
-        sink_shards[s].push(span)
-    sink_mus[s].unlock()
+    locked sink_mus[s]:
+        if sink_shards[s].len() < FINISHED_SPANS_CAP / SINK_SHARDS:
+            sink_shards[s].push(span)
 
 # take and clear the finished spans collected so far (the exporter calls this).
 pub fn drain_finished_spans() -> List[Span]:

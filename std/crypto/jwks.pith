@@ -399,11 +399,10 @@ pub struct Cache:
 # record freshly fetched text for a cache, dropping the key set parsed from the
 # text it replaces.
 fn store_document(handle: Int, text: String):
-    jwks_mu.lock()
-    cached_document.insert(handle, text)
-    cached_at.insert(handle, time.unix())
-    parsed_keys.remove(handle)
-    jwks_mu.unlock()
+    locked jwks_mu:
+        cached_document.insert(handle, text)
+        cached_at.insert(handle, time.unix())
+        parsed_keys.remove(handle)
 
 # a cache over the key set published at `url`. https is what an issuer
 # publishes over and what you want: the document is the root of trust for
@@ -452,18 +451,15 @@ impl Cache:
     # the key set every verify reads. `keys` hands callers a copy, so nothing
     # outside this module can change what later verifies accept.
     fn shared_keys() -> KeySet!:
-        jwks_mu.lock()
-        if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:
-            held := parsed_keys[self.handle]
-            jwks_mu.unlock()
-            return held
-        jwks_mu.unlock()
+        locked jwks_mu:
+            if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:
+                held := parsed_keys[self.handle]
+                return held
         text := self.document(false)!
         set := parse(text)!
-        jwks_mu.lock()
-        if cached_document.contains_key(self.handle) and cached_document[self.handle] == text:
-            parsed_keys.insert(self.handle, set)
-        jwks_mu.unlock()
+        locked jwks_mu:
+            if cached_document.contains_key(self.handle) and cached_document[self.handle] == text:
+                parsed_keys.insert(self.handle, set)
         return set
 
     # fetch now, whatever the ttl says, and return what came back. reach for
@@ -489,15 +485,14 @@ impl Cache:
     # the stamp and deciding under one lock is what keeps a burst of unknown
     # kids to one fetch between them.
     fn may_refresh() -> Bool:
-        jwks_mu.lock()
-        now := time.unix()
-        mut allowed := true
-        if refreshed_at.contains_key(self.handle) and now - refreshed_at[self.handle] < self.cooldown_v:
-            allowed = false
-        if allowed:
-            refreshed_at.insert(self.handle, now)
-        jwks_mu.unlock()
-        return allowed
+        locked jwks_mu:
+            now := time.unix()
+            mut allowed := true
+            if refreshed_at.contains_key(self.handle) and now - refreshed_at[self.handle] < self.cooldown_v:
+                allowed = false
+            if allowed:
+                refreshed_at.insert(self.handle, now)
+            return allowed
 
     # the cached document, fetching when it is missing, stale, or `force`.
     # the lock is taken to read the cache and again to write it, and is never

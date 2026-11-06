@@ -5296,12 +5296,11 @@ impl Client:
 
     # how many idle connections the client holds.
     fn idle_connections() -> Int:
-        self.pool.mu.lock()
-        mut total := 0
-        for key in self.pool.idle:
-            total = total + self.pool.idle[key].len()
-        self.pool.mu.unlock()
-        return total
+        locked self.pool.mu:
+            mut total := 0
+            for key in self.pool.idle:
+                total = total + self.pool.idle[key].len()
+            return total
 
     # send `req` and return as soon as the response head arrives, leaving the body
     # to read() on what comes back. redirects are not followed, and the body is not

@@ -45,11 +45,10 @@ FLUSH_PERMITS := 2
 # push, so two tasks joining a new room cannot both create it and lose one of
 # the two members.
 fn join(room_name: String, member: String):
-    rooms_mu.lock()
-    room := rooms.get(room_name).unwrap_or(Room(room_name, []))
-    room.members.push(member)
-    rooms[room_name] = room
-    rooms_mu.unlock()
+    locked rooms_mu:
+        room := rooms.get(room_name).unwrap_or(Room(room_name, []))
+        room.members.push(member)
+        rooms[room_name] = room
     # compare_set in a loop, not store(load() + 1): between a load and a store
     # another task can bump the same counter, and that increment would be lost.
     mut settled := false
@@ -60,21 +59,19 @@ fn join(room_name: String, member: String):
 # the read path. it copies the names out under the lock rather than handing the
 # list itself back, so a caller iterating it cannot race a later join.
 fn members_of(room_name: String) -> List[String]:
-    rooms_mu.lock()
-    room := rooms.get(room_name).unwrap_or(Room(room_name, []))
-    mut names: List[String] := []
-    for m in room.members:
-        names.push(m)
-    rooms_mu.unlock()
-    return names
+    locked rooms_mu:
+        room := rooms.get(room_name).unwrap_or(Room(room_name, []))
+        mut names: List[String] := []
+        for m in room.members:
+            names.push(m)
+        return names
 
 fn room_names() -> List[String]:
-    rooms_mu.lock()
-    mut names: List[String] := []
-    for name in rooms.keys():
-        names.push(name)
-    rooms_mu.unlock()
-    return names
+    locked rooms_mu:
+        mut names: List[String] := []
+        for name in rooms.keys():
+            names.push(name)
+        return names
 
 # one room's flush. the group calls this as fn() -> Int!, so each room gets its
 # own named function below rather than a closure — a pith lambda cannot fail.

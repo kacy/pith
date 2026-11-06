@@ -186,12 +186,11 @@ fn atomic_max_float(cell: AtomicInt, value: Float):
 # record a metric's help text and/or unit (first non-empty value wins).
 fn register_description(bare: String, help: String, unit: String):
     shard := shard_of(bare)
-    shard_mu[shard].lock()
-    if help != "" and not metric_descriptions[shard].contains_key(bare):
-        metric_descriptions[shard].insert(bare, help)
-    if unit != "" and not metric_units[shard].contains_key(bare):
-        metric_units[shard].insert(bare, unit)
-    shard_mu[shard].unlock()
+    locked shard_mu[shard]:
+        if help != "" and not metric_descriptions[shard].contains_key(bare):
+            metric_descriptions[shard].insert(bare, help)
+        if unit != "" and not metric_units[shard].contains_key(bare):
+            metric_units[shard].insert(bare, unit)
 
 # escape help text for a prometheus `# HELP` line: backslash and newline only
 # (unlike a label value, a double-quote needs no escaping here).
@@ -282,12 +281,11 @@ fn default_histogram_buckets() -> List[Float]:
 # bare name's shard, so it must be called before a series shard is held.
 fn buckets_for(bare: String) -> List[Float]:
     shard := shard_of(bare)
-    shard_mu[shard].lock()
-    mut out := default_histogram_buckets()
-    if histogram_bucket_defs[shard].contains_key(bare):
-        out = histogram_bucket_defs[shard][bare]
-    shard_mu[shard].unlock()
-    return out
+    locked shard_mu[shard]:
+        mut out := default_histogram_buckets()
+        if histogram_bucket_defs[shard].contains_key(bare):
+            out = histogram_bucket_defs[shard][bare]
+        return out
 
 # register custom bucket boundaries for a bare metric, first call wins so a
 # metric's boundaries stay stable once observations start. it hands back the
@@ -296,12 +294,11 @@ fn buckets_for(bare: String) -> List[Float]:
 # whether it won.
 fn register_buckets(bare: String, bounds: List[Float]) -> List[Float]:
     shard := shard_of(bare)
-    shard_mu[shard].lock()
-    if not histogram_bucket_defs[shard].contains_key(bare):
-        histogram_bucket_defs[shard].insert(bare, bounds)
-    effective := histogram_bucket_defs[shard][bare]
-    shard_mu[shard].unlock()
-    return effective
+    locked shard_mu[shard]:
+        if not histogram_bucket_defs[shard].contains_key(bare):
+            histogram_bucket_defs[shard].insert(bare, bounds)
+        effective := histogram_bucket_defs[shard][bare]
+        return effective
 
 # a stable, human-readable rendering of a float bound or value: whole numbers
 # print without a trailing ".0" (so a bucket reads le="5", a count reads "3"),

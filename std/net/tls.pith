@@ -58,35 +58,30 @@ mut native_config_mu := Mutex()
 # map. they are generic over the value type because the registry is a dozen maps
 # of eight value types that all share this access shape.
 fn config_has[V](values: Map[Int, V], handle: Int) -> Bool:
-    native_config_mu.lock()
-    found := values.contains_key(handle)
-    native_config_mu.unlock()
-    return found
+    locked native_config_mu:
+        found := values.contains_key(handle)
+        return found
 
 fn config_get[V](values: Map[Int, V], handle: Int, fallback: V) -> V:
-    native_config_mu.lock()
-    mut out := fallback
-    if values.contains_key(handle):
-        out = values[handle]
-    native_config_mu.unlock()
-    return out
+    locked native_config_mu:
+        mut out := fallback
+        if values.contains_key(handle):
+            out = values[handle]
+        return out
 
 fn config_put[V](values: Map[Int, V], handle: Int, value: V):
-    native_config_mu.lock()
-    values.insert(handle, value)
-    native_config_mu.unlock()
+    locked native_config_mu:
+        values.insert(handle, value)
 
 fn config_drop[V](values: Map[Int, V], handle: Int):
-    native_config_mu.lock()
-    if values.contains_key(handle):
-        values.remove(handle)
-    native_config_mu.unlock()
+    locked native_config_mu:
+        if values.contains_key(handle):
+            values.remove(handle)
 
 fn config_len[V](values: Map[Int, V]) -> Int:
-    native_config_mu.lock()
-    n := values.len()
-    native_config_mu.unlock()
-    return n
+    locked native_config_mu:
+        n := values.len()
+        return n
 
 # the root bundle caches, guarded by native_config_mu like the registry above.
 #
@@ -112,11 +107,10 @@ mut native_roots_parsed: Map[String, List[x509.Certificate]] := {}
 
 # hand out the next config handle, one per caller.
 fn next_config_handle() -> Int:
-    native_config_mu.lock()
-    handle := next_native_config_handle
-    next_native_config_handle = next_native_config_handle + 1
-    native_config_mu.unlock()
-    return handle
+    locked native_config_mu:
+        handle := next_native_config_handle
+        next_native_config_handle = next_native_config_handle + 1
+        return handle
 
 # how many server handshakes have failed since the process started. a failed
 # handshake is normal traffic — probes, scanners, clients that hang up — so a
@@ -360,33 +354,29 @@ fn native_conn_register(state: NativeConnState) -> Int:
     while not next_native_conn_handle.compare_set(handle, handle + 1):
         handle = next_native_conn_handle.load()
     s := native_conn_shard(handle)
-    native_conn_mus[s].lock()
-    native_conn_shards[s].insert(handle, state)
-    native_conn_mus[s].unlock()
+    locked native_conn_mus[s]:
+        native_conn_shards[s].insert(handle, state)
     return handle
 
 # fetch a connection's state struct. it is a reference, so mutating its read_seq
 # / write_seq / pending persists; the lock guards only the map lookup.
 fn native_conn_get(handle: Int) -> NativeConnState:
     s := native_conn_shard(handle)
-    native_conn_mus[s].lock()
-    state := native_conn_shards[s][handle]
-    native_conn_mus[s].unlock()
-    return state
+    locked native_conn_mus[s]:
+        state := native_conn_shards[s][handle]
+        return state
 
 fn native_conn_has(handle: Int) -> Bool:
     s := native_conn_shard(handle)
-    native_conn_mus[s].lock()
-    present := native_conn_shards[s].contains_key(handle)
-    native_conn_mus[s].unlock()
-    return present
+    locked native_conn_mus[s]:
+        present := native_conn_shards[s].contains_key(handle)
+        return present
 
 fn native_conn_drop(handle: Int):
     s := native_conn_shard(handle)
-    native_conn_mus[s].lock()
-    if native_conn_shards[s].contains_key(handle):
-        native_conn_shards[s].remove(handle)
-    native_conn_mus[s].unlock()
+    locked native_conn_mus[s]:
+        if native_conn_shards[s].contains_key(handle):
+            native_conn_shards[s].remove(handle)
 
 # parsed client hello data used for server-side config selection.
 pub struct ClientHelloInfo:
@@ -441,23 +431,21 @@ mut native_listener_config: Map[Int, Config] := {}
 # the config a listener was opened with. fails once the listener is closed:
 # the registry entry is removed with the socket, and a handle is never reissued.
 fn listener_config(fd: Int) -> Config!:
-    native_config_mu.lock()
-    defer native_config_mu.unlock()
-    if native_listener_config.contains_key(fd):
-        return native_listener_config[fd]
-    fail "native tls listener not found"
+    locked native_config_mu:
+        if native_listener_config.contains_key(fd):
+            return native_listener_config[fd]
+        fail "native tls listener not found"
 
-# record a listener's config. a stale entry under the same fd (a listener
-# whose socket was closed without release_listener_config, the number since
-# reissued by the kernel) is read out before the insert overwrites it, for the
-# reason drop_listener_config gives: its release must not happen under the lock.
+    # record a listener's config. a stale entry under the same fd (a listener
+    # whose socket was closed without release_listener_config, the number since
+    # reissued by the kernel) is read out before the insert overwrites it, for the
+    # reason drop_listener_config gives: its release must not happen under the lock.
 fn put_listener_config(fd: Int, config: Config):
-    native_config_mu.lock()
-    mut stale := config
-    if native_listener_config.contains_key(fd):
-        stale = native_listener_config[fd]
-    native_listener_config.insert(fd, config)
-    native_config_mu.unlock()
+    locked native_config_mu:
+        mut stale := config
+        if native_listener_config.contains_key(fd):
+            stale = native_listener_config[fd]
+        native_listener_config.insert(fd, config)
     # `stale` drops its count at the return, off the lock; when there was no
     # stale entry it is a second count on the config being stored and is
     # harmless to drop.
@@ -469,16 +457,14 @@ fn put_listener_config(fd: Int, config: Config):
 # Config.drop, and with it Config.close, under the lock this function holds.
 # the count `held` took drops at the return, after the unlock.
 fn drop_listener_config(fd: Int) -> Bool:
-    native_config_mu.lock()
-    if not native_listener_config.contains_key(fd):
-        native_config_mu.unlock()
-        return false
-    held := native_listener_config[fd]
-    native_listener_config.remove(fd)
-    native_config_mu.unlock()
+    locked native_config_mu:
+        if not native_listener_config.contains_key(fd):
+            return false
+        held := native_listener_config[fd]
+        native_listener_config.remove(fd)
+        return held.handle >= 0
     # a config handle is never negative, so this is true; the read is what
     # makes `held` a use, and its count drops at this return, off the lock.
-    return held.handle >= 0
 
 # the config hooks, guarded by native_config_mu like the rest of the registry.
 mut native_config_verify_connection: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
@@ -508,10 +494,9 @@ fn parse_roots_cached(roots_pem: String) -> List[x509.Certificate]!:
     if hit:
         return cached
     parsed := x509.parse_pem_chain(roots_pem)!
-    native_config_mu.lock()
-    if not native_roots_parsed.contains_key(roots_pem) and native_roots_parsed.len() < TLS_MAX_ROOTS_CACHE:
-        native_roots_parsed.insert(roots_pem, parsed)
-    native_config_mu.unlock()
+    locked native_config_mu:
+        if not native_roots_parsed.contains_key(roots_pem) and native_roots_parsed.len() < TLS_MAX_ROOTS_CACHE:
+            native_roots_parsed.insert(roots_pem, parsed)
     return parsed
 
 # the system root bundle as pem text, read from disk at most once.
@@ -536,12 +521,11 @@ fn system_roots_pem() -> String!:
     # parse here so a broken system bundle fails config creation, and so the
     # first config warms the parse cache for every later one.
     parse_roots_cached(loaded)!
-    native_config_mu.lock()
-    if native_system_roots_pem == "":
-        native_system_roots_pem = loaded
-    winner := native_system_roots_pem
-    native_config_mu.unlock()
-    return winner
+    locked native_config_mu:
+        if native_system_roots_pem == "":
+            native_system_roots_pem = loaded
+        winner := native_system_roots_pem
+        return winner
 
 fn native_config_handle(roots_pem: String) -> Config!:
     if roots_pem == "":
@@ -988,31 +972,30 @@ fn select_server_resumption(config: Config, hrr_prefix: Bytes, client_hello: tls
     # park a task — so holding the lock across it is cheaper and simpler than
     # releasing and revalidating. the defer also releases the lock when the
     # binder call propagates an error.
-    native_session_mu.lock()
-    defer native_session_mu.unlock()
-    if not native_server_session_tickets.contains_key(ticket_key):
-        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
-    entry := native_server_session_tickets[ticket_key]
-    if session_ticket_expired(entry):
-        forget_server_ticket_locked(ticket_key)
-        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
-    if entry.config_handle != config.handle or not client_hello.cipher_suites.contains(entry.cipher) or entry.alpn_protocol != selected_alpn:
-        return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
-    # after a HelloRetryRequest the binder covers the retry transcript:
-    # message_hash(ClientHello1) ‖ HelloRetryRequest ‖ truncated ClientHello2
-    # (rfc 8446 §4.2.11.2). hrr_prefix is empty on the direct path.
-    expected_binder := tls13.resumption_binder_verify_data_for_cipher(entry.cipher, entry.psk, hrr_prefix.concat(client_hello.psk_binder_input))!
-    # the binder is a MAC that proves the client holds the PSK; compare it in
-    # constant time. an ordinary byte-equality short-circuits on the first
-    # differing byte, which leaks the correct binder one byte at a time and lets
-    # an attacker who holds only the ticket forge it and resume as its owner.
-    if not subtle.equal(expected_binder, client_hello.psk_binder):
-        # the server recognizes this ticket, so a wrong binder is a corrupt or
-        # forged offer, not a stale one — rfc 8446 §4.2.11.2 requires an abort
-        # here rather than a quiet fall back to a full handshake.
-        fail "tls psk binder does not validate"
-    touch_server_ticket_locked(ticket_key)
-    return ServerResumptionDecision(true, entry.cipher, entry.psk)
+    locked native_session_mu:
+        if not native_server_session_tickets.contains_key(ticket_key):
+            return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+        entry := native_server_session_tickets[ticket_key]
+        if session_ticket_expired(entry):
+            forget_server_ticket_locked(ticket_key)
+            return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+        if entry.config_handle != config.handle or not client_hello.cipher_suites.contains(entry.cipher) or entry.alpn_protocol != selected_alpn:
+            return ServerResumptionDecision(false, fallback_cipher, bytes.empty())
+        # after a HelloRetryRequest the binder covers the retry transcript:
+        # message_hash(ClientHello1) ‖ HelloRetryRequest ‖ truncated ClientHello2
+        # (rfc 8446 §4.2.11.2). hrr_prefix is empty on the direct path.
+        expected_binder := tls13.resumption_binder_verify_data_for_cipher(entry.cipher, entry.psk, hrr_prefix.concat(client_hello.psk_binder_input))!
+        # the binder is a MAC that proves the client holds the PSK; compare it in
+        # constant time. an ordinary byte-equality short-circuits on the first
+        # differing byte, which leaks the correct binder one byte at a time and lets
+        # an attacker who holds only the ticket forge it and resume as its owner.
+        if not subtle.equal(expected_binder, client_hello.psk_binder):
+            # the server recognizes this ticket, so a wrong binder is a corrupt or
+            # forged offer, not a stale one — rfc 8446 §4.2.11.2 requires an abort
+            # here rather than a quiet fall back to a full handshake.
+            fail "tls psk binder does not validate"
+        touch_server_ticket_locked(ticket_key)
+        return ServerResumptionDecision(true, entry.cipher, entry.psk)
 
 fn client_key_is_ecdsa(config: Config) -> Bool!:
     chain := native_config_client_cert_chain(config)!
@@ -1125,34 +1108,28 @@ fn touch_client_cached_session_locked(cache_key: String):
         native_client_session_cache_order.push(cache_key)
 
 fn forget_server_ticket(ticket_key: String):
-    native_session_mu.lock()
-    forget_server_ticket_locked(ticket_key)
-    native_session_mu.unlock()
+    locked native_session_mu:
+        forget_server_ticket_locked(ticket_key)
 
 fn forget_client_cached_session(cache_key: String):
-    native_session_mu.lock()
-    forget_client_cached_session_locked(cache_key)
-    native_session_mu.unlock()
+    locked native_session_mu:
+        forget_client_cached_session_locked(cache_key)
 
 fn remember_server_ticket(ticket_key: String, entry: SessionTicketEntry):
-    native_session_mu.lock()
-    remember_server_ticket_locked(ticket_key, entry)
-    native_session_mu.unlock()
+    locked native_session_mu:
+        remember_server_ticket_locked(ticket_key, entry)
 
 fn touch_server_ticket(ticket_key: String):
-    native_session_mu.lock()
-    touch_server_ticket_locked(ticket_key)
-    native_session_mu.unlock()
+    locked native_session_mu:
+        touch_server_ticket_locked(ticket_key)
 
 fn remember_client_cached_session(cache_key: String, session: CachedSession):
-    native_session_mu.lock()
-    remember_client_cached_session_locked(cache_key, session)
-    native_session_mu.unlock()
+    locked native_session_mu:
+        remember_client_cached_session_locked(cache_key, session)
 
 fn touch_client_cached_session(cache_key: String):
-    native_session_mu.lock()
-    touch_client_cached_session_locked(cache_key)
-    native_session_mu.unlock()
+    locked native_session_mu:
+        touch_client_cached_session_locked(cache_key)
 
 # find a usable cached session for cache_key, refreshing its lru position, or
 # return an empty session (zero-length ticket) when there is nothing to resume.
@@ -1160,16 +1137,15 @@ fn touch_client_cached_session(cache_key: String):
 # helper on purpose: the caller goes on to build and send the resuming client
 # hello — network writes — and must not hold the lock across those.
 fn lookup_resumable_client_session(cache_key: String) -> CachedSession:
-    native_session_mu.lock()
-    defer native_session_mu.unlock()
-    if not native_client_session_cache.contains_key(cache_key):
-        return empty_cached_session()
-    session := native_client_session_cache[cache_key]
-    if cached_session_expired(session):
-        forget_client_cached_session_locked(cache_key)
-        return empty_cached_session()
-    touch_client_cached_session_locked(cache_key)
-    return session
+    locked native_session_mu:
+        if not native_client_session_cache.contains_key(cache_key):
+            return empty_cached_session()
+        session := native_client_session_cache[cache_key]
+        if cached_session_expired(session):
+            forget_client_cached_session_locked(cache_key)
+            return empty_cached_session()
+        touch_client_cached_session_locked(cache_key)
+        return session
 
 fn allocate_native_conn(stream: TcpStream, version: Int, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState, read_secret: Bytes, write_secret: Bytes) -> Conn:
     cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false, read_secret: read_secret, write_secret: write_secret, key_updates_received: 0, key_update_responded: false)
@@ -2883,24 +2859,23 @@ fn remember_client_ticket_from_message(handle: Int, cipher: Int, message: tls13.
 # sequence under the write lock exactly like a data record, so a concurrent
 # writer can never reuse the nonce.
 fn send_conn_fatal_alert(cs: NativeConnState, description: Int) -> Int!:
-    cs.write_mu.lock()
-    defer cs.write_mu.unlock()
-    if cs.failed:
+    locked cs.write_mu:
+        if cs.failed:
+            return 0
+        alert := bytes.buffer_with_capacity(2)
+        defer alert.free()
+        alert.write_byte(ALERT_LEVEL_FATAL)!
+        alert.write_byte(description)!
+        seq := cs.write_seq
+        cs.write_seq = seq + 1
+        record := seal_conn_record(cs.version, cs.cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_ALERT, alert.bytes())!
+        native_write_all(TcpStream(cs.fd), record)!
         return 0
-    alert := bytes.buffer_with_capacity(2)
-    defer alert.free()
-    alert.write_byte(ALERT_LEVEL_FATAL)!
-    alert.write_byte(description)!
-    seq := cs.write_seq
-    cs.write_seq = seq + 1
-    record := seal_conn_record(cs.version, cs.cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_ALERT, alert.bytes())!
-    native_write_all(TcpStream(cs.fd), record)!
-    return 0
 
-# read one record on an established connection, answering an oversized or
-# structurally invalid one with the matching sealed fatal alert. truncation
-# and eof stay alert-free — the peer is gone. `lead` is the start of the
-# header when the caller already read it.
+    # read one record on an established connection, answering an oversized or
+    # structurally invalid one with the matching sealed fatal alert. truncation
+    # and eof stay alert-free — the peer is gone. `lead` is the start of the
+    # header when the caller already read it.
 fn read_conn_record_alerting(cs: NativeConnState, stream: TcpStream, lead: Bytes) -> tls13.Record!:
     header := lead.concat(stream.read_exact_bytes(5 - lead.len())!)
     if header.len() != 5:
@@ -2920,9 +2895,8 @@ fn read_conn_record_alerting(cs: NativeConnState, stream: TcpStream, lead: Bytes
 # concurrent reader must not see it half-replaced.
 fn native_conn_unread_bytes(handle: Int, data: Bytes):
     cs := native_conn_get(handle)
-    cs.read_mu.lock()
-    defer cs.read_mu.unlock()
-    cs.pending = bytes.concat(data, cs.pending)
+    locked cs.read_mu:
+        cs.pending = bytes.concat(data, cs.pending)
 
 fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     mut size := max_bytes
@@ -2933,27 +2907,26 @@ fn native_conn_read_bytes(handle: Int, max_bytes: Int) -> Bytes!:
     # cs.pending and cs.read_seq, and read_seq drives the AEAD nonce, so two
     # concurrent readers must not interleave here. write uses a separate mutex,
     # so full-duplex read/write is unaffected.
-    cs.read_mu.lock()
-    defer cs.read_mu.unlock()
-    if cs.failed:
-        fail "tls connection is unusable after an earlier record error"
-    pending := cs.pending
-    if pending.len() > 0:
-        if pending.len() > size:
-            out := pending.slice(0, size)
-            cs.pending = pending.slice(size, pending.len())
-            return out
-        cs.pending = bytes.empty()
-        return pending
-    # a read that fails before the first byte of the next record, a socket
-    # deadline running out say, leaves the stream where it was, so the
-    # connection stays usable and can still send an answer. a failure once a
-    # record has started cannot be resumed and poisons it.
-    lead := tcp_read_bytes(cs.fd, 5)!
-    return read_conn_records(handle, cs, size, lead)
+    locked cs.read_mu:
+        if cs.failed:
+            fail "tls connection is unusable after an earlier record error"
+        pending := cs.pending
+        if pending.len() > 0:
+            if pending.len() > size:
+                out := pending.slice(0, size)
+                cs.pending = pending.slice(size, pending.len())
+                return out
+            cs.pending = bytes.empty()
+            return pending
+        # a read that fails before the first byte of the next record, a socket
+        # deadline running out say, leaves the stream where it was, so the
+        # connection stays usable and can still send an answer. a failure once a
+        # record has started cannot be resumed and poisons it.
+        lead := tcp_read_bytes(cs.fd, 5)!
+        return read_conn_records(handle, cs, size, lead)
 
-# the record loop of native_conn_read_bytes, from a first record whose header
-# starts with `lead`. any failure here poisons the connection.
+    # the record loop of native_conn_read_bytes, from a first record whose header
+    # starts with `lead`. any failure here poisons the connection.
 fn read_conn_records(handle: Int, cs: NativeConnState, size: Int, lead: Bytes) -> Bytes!:
     errdefer cs.failed = true
     if lead.is_empty():
@@ -3080,49 +3053,47 @@ fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
     # hold the write lock across the whole seal-and-send so a second writer on
     # this connection cannot claim the same sequence number (a reused AEAD
     # nonce) or interleave its record bytes on the wire.
-    cs.write_mu.lock()
-    defer cs.write_mu.unlock()
-    # any seal or write error poisons the connection.
-    errdefer cs.failed = true
-    if cs.failed:
-        fail "tls connection is unusable after an earlier record error"
-    stream := TcpStream(cs.fd)
-    cipher := cs.cipher
-    mut count := data.len()
-    if count > TLS_MAX_PLAINTEXT_RECORD:
-        count = TLS_MAX_PLAINTEXT_RECORD
-    chunk := data.slice(0, count)
-    seq := cs.write_seq
-    # consume the sequence number before the send: if the write fails partway,
-    # the connection is poisoned and no retry can reseal at this same sequence.
-    cs.write_seq = seq + 1
-    record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
-    native_write_all(stream, record)!
-    # an application write opens a new coalescing window: the next
-    # update_requested from the peer earns a fresh KeyUpdate response.
-    cs.key_update_responded = false
-    return count
+    locked cs.write_mu:
+        # any seal or write error poisons the connection.
+        errdefer cs.failed = true
+        if cs.failed:
+            fail "tls connection is unusable after an earlier record error"
+        stream := TcpStream(cs.fd)
+        cipher := cs.cipher
+        mut count := data.len()
+        if count > TLS_MAX_PLAINTEXT_RECORD:
+            count = TLS_MAX_PLAINTEXT_RECORD
+        chunk := data.slice(0, count)
+        seq := cs.write_seq
+        # consume the sequence number before the send: if the write fails partway,
+        # the connection is poisoned and no retry can reseal at this same sequence.
+        cs.write_seq = seq + 1
+        record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_APPLICATION_DATA, chunk)!
+        native_write_all(stream, record)!
+        # an application write opens a new coalescing window: the next
+        # update_requested from the peer earns a fresh KeyUpdate response.
+        cs.key_update_responded = false
+        return count
 
-# send a close_notify alert, best-effort, before the socket closes. this is
-# what lets a peer tell a clean shutdown from a truncation: without it, an
-# attacker who cuts the tcp connection looks identical to us finishing, and a
-# peer reading a length-delimited stream cannot know it got everything (RFC 8446
-# §6.1). a failure here (already-closed, poisoned connection) just falls through
-# to closing the socket.
+    # send a close_notify alert, best-effort, before the socket closes. this is
+    # what lets a peer tell a clean shutdown from a truncation: without it, an
+    # attacker who cuts the tcp connection looks identical to us finishing, and a
+    # peer reading a length-delimited stream cannot know it got everything (RFC 8446
+    # §6.1). a failure here (already-closed, poisoned connection) just falls through
+    # to closing the socket.
 fn send_close_notify(cs: NativeConnState) -> Int!:
-    cs.write_mu.lock()
-    defer cs.write_mu.unlock()
-    if cs.failed:
+    locked cs.write_mu:
+        if cs.failed:
+            return 0
+        alert := bytes.buffer_with_capacity(2)
+        defer alert.free()
+        alert.write_byte(1)!
+        alert.write_byte(tls13.ALERT_CLOSE_NOTIFY)!
+        seq := cs.write_seq
+        cs.write_seq = seq + 1
+        record := seal_conn_record(cs.version, cs.cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_ALERT, alert.bytes())!
+        native_write_all(TcpStream(cs.fd), record)!
         return 0
-    alert := bytes.buffer_with_capacity(2)
-    defer alert.free()
-    alert.write_byte(1)!
-    alert.write_byte(tls13.ALERT_CLOSE_NOTIFY)!
-    seq := cs.write_seq
-    cs.write_seq = seq + 1
-    record := seal_conn_record(cs.version, cs.cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_ALERT, alert.bytes())!
-    native_write_all(TcpStream(cs.fd), record)!
-    return 0
 
 fn native_conn_close(handle: Int):
     if not native_conn_has(handle):
@@ -3137,31 +3108,30 @@ fn native_conn_close(handle: Int):
 # update under the current keys, then switch. the caller holds no write lock; we
 # take it so a concurrent app-data write cannot interleave with the rotation.
 fn rotate_send_keys(cs: NativeConnState, cipher: Int, request_peer_update: Bool) -> Bool!:
-    cs.write_mu.lock()
-    defer cs.write_mu.unlock()
-    # a failure between consuming the sequence and installing the new key
-    # leaves the send epoch desynced from the peer; poison the connection
-    # rather than keep writing under a half-rotated state.
-    errdefer cs.failed = true
-    if cs.failed:
-        return false
-    update := tls13.encode_key_update(request_peer_update)!
-    seq := cs.write_seq
-    cs.write_seq = seq + 1
-    record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_HANDSHAKE, update)!
-    native_write_all(TcpStream(cs.fd), record)!
-    next_secret := tls13.next_application_traffic_secret_for_cipher(cipher, cs.write_secret)!
-    keys := traffic_keys_for_cipher(cipher, next_secret)!
-    cs.write_key = keys.key
-    cs.write_iv = keys.iv
-    cs.write_seq = 0
-    cs.write_secret = next_secret
-    return true
+    locked cs.write_mu:
+        # a failure between consuming the sequence and installing the new key
+        # leaves the send epoch desynced from the peer; poison the connection
+        # rather than keep writing under a half-rotated state.
+        errdefer cs.failed = true
+        if cs.failed:
+            return false
+        update := tls13.encode_key_update(request_peer_update)!
+        seq := cs.write_seq
+        cs.write_seq = seq + 1
+        record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_HANDSHAKE, update)!
+        native_write_all(TcpStream(cs.fd), record)!
+        next_secret := tls13.next_application_traffic_secret_for_cipher(cipher, cs.write_secret)!
+        keys := traffic_keys_for_cipher(cipher, next_secret)!
+        cs.write_key = keys.key
+        cs.write_iv = keys.iv
+        cs.write_seq = 0
+        cs.write_secret = next_secret
+        return true
 
-# a peer sent a KeyUpdate: switch our receive keys to the next generation (we
-# already hold read_mu here), and if it asked us to update in turn, rotate our
-# send keys and announce it. this is what keeps a conformant peer's KeyUpdate
-# from silently killing the connection.
+    # a peer sent a KeyUpdate: switch our receive keys to the next generation (we
+    # already hold read_mu here), and if it asked us to update in turn, rotate our
+    # send keys and announce it. this is what keeps a conformant peer's KeyUpdate
+    # from silently killing the connection.
 fn apply_peer_key_update(cs: NativeConnState, cipher: Int, message: tls13.HandshakeMessage) -> Bool!:
     if cs.version != TLS_VERSION_13 or cs.read_secret.len() == 0:
         fail "unexpected key update on a non-1.3 connection"

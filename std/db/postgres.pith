@@ -67,10 +67,9 @@ pub fn open(url: String) -> Db!:
 # pool is self-synchronizing, so its dials and closes happen off this lock and
 # a slow connect never blocks other tasks' lookups.
 fn pool_at(pool_handle: Int) -> postgres.Pool:
-    registry_mu.lock()
-    pool := pools[pool_handle]
-    registry_mu.unlock()
-    return pool
+    locked registry_mu:
+        pool := pools[pool_handle]
+        return pool
 
 # take a connection from pool `pool_handle`; past the cap this waits.
 fn acquire_from_pool(pool_handle: Int) -> postgres.Conn!:
@@ -130,11 +129,10 @@ PREPARED_NAME := "pith_db_stmt"
 # pin handle. the caller then runs BEGIN or PREPARE on the pinned connection.
 fn pin_connection(pool_handle: Int) -> Int!:
     conn := acquire_from_pool(pool_handle)!
-    pins_mu.lock()
-    pins.push(Pin(conn: conn, pool: pool_handle, broken: false, finished: false))
-    handle := pins.len() - 1
-    pins_mu.unlock()
-    return handle
+    locked pins_mu:
+        pins.push(Pin(conn: conn, pool: pool_handle, broken: false, finished: false))
+        handle := pins.len() - 1
+        return handle
 
 # the pinned connection for a handle. only call it while the pin is live (its
 # callers all guard with pin_finished first); a finished pin has cleared it.
@@ -146,23 +144,20 @@ fn pin_conn(handle: Int) -> postgres.Conn:
 
 # whether the pinned connection has ended (committed, closed, or discarded).
 fn pin_finished(handle: Int) -> Bool:
-    pins_mu.lock()
-    done := pins[handle].finished
-    pins_mu.unlock()
-    return done
+    locked pins_mu:
+        done := pins[handle].finished
+        return done
 
 # whether a statement on the pinned connection has failed.
 fn pin_broken(handle: Int) -> Bool:
-    pins_mu.lock()
-    broken := pins[handle].broken
-    pins_mu.unlock()
-    return broken
+    locked pins_mu:
+        broken := pins[handle].broken
+        return broken
 
 # mark the pinned connection out of sync after a failed statement.
 fn pin_mark_broken(handle: Int):
-    pins_mu.lock()
-    pins[handle].broken = true
-    pins_mu.unlock()
+    locked pins_mu:
+        pins[handle].broken = true
 
 # finish the pin and return its connection to the pool for reuse. the slot drops
 # its reference to the connection so a spent pin retains nothing.

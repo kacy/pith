@@ -11757,6 +11757,22 @@ fn ir_stmt_control(idx: Int, node: Node):
     elif node.kind == "for" or node.kind == "for_stmt":
         ir_emit_for_stmt(node)
 
+    elif node.kind == "locked_stmt":
+        ir_emit_locked_stmt(node)
+
+# `locked m:` is its own defer scope: the lock call runs on entry, and the
+# unlock call is registered as the scope's first defer, so every exit that
+# runs defers (falling off the end, return, fail, `!`, break and continue)
+# unlocks after the body's own defers.
+fn ir_emit_locked_stmt(node: Node):
+    if node.children.len() < 4:
+        return
+    ir_defer_push_scope()
+    ir_stmt(node.children[1])
+    ir_defer_register(node.children[2], 0)
+    ir_block(node.children[3])
+    ir_defer_pop_scope_emit()
+
 # --- block lowering ---
 #
 # a block is statements plus the two loop-control jumps that need to

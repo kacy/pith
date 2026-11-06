@@ -1,0 +1,14 @@
+# a Mutex is not reentrant: locking one the enclosing block already holds
+# would park the task on itself for good.
+mut m := Mutex()
+mut count := 0
+
+fn twice():
+    locked m:
+        count = count + 1
+        if count > 0:
+            locked m:
+                count = count + 1
+
+fn main():
+    twice()

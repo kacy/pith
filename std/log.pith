@@ -182,16 +182,14 @@ pub fn set_level(level: Int):
     log_set_level(level)
 
 fn log_set_level(level: Int):
-    settings_mu.lock()
-    min_level = level
-    min_level_cell.store(level)
-    settings_mu.unlock()
+    locked settings_mu:
+        min_level = level
+        min_level_cell.store(level)
 
 # set the global output format.
 pub fn set_format(format: Int):
-    settings_mu.lock()
-    output_format = format
-    settings_mu.unlock()
+    locked settings_mu:
+        output_format = format
 
 # use console output for the global logger.
 pub fn set_console():
@@ -206,18 +204,16 @@ pub fn set_file(path: String):
     log_set_file(path)
 
 fn log_set_file(path: String):
-    settings_mu.lock()
-    sink_path = path
-    settings_mu.unlock()
+    locked settings_mu:
+        sink_path = path
 
 # stop writing log output to a file sink.
 pub fn clear_file():
     log_clear_file()
 
 fn log_clear_file():
-    settings_mu.lock()
-    sink_path = ""
-    settings_mu.unlock()
+    locked settings_mu:
+        sink_path = ""
 
 impl Logger:
     fn with(fields: List[Field]) -> Logger:

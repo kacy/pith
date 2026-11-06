@@ -138,12 +138,11 @@ mut predef_mu := Mutex()
 mut predef_tables: List[fse.FseTable] := []
 
 fn predefined_tables() -> List[fse.FseTable]:
-    predef_mu.lock()
-    if predef_tables.len() == 0:
-        predef_tables.push(fse.build_decode_table(ll_default(), LL_DEFAULT_LOG))
-        predef_tables.push(fse.build_decode_table(of_default(), OF_DEFAULT_LOG))
-        predef_tables.push(fse.build_decode_table(ml_default(), ML_DEFAULT_LOG))
-    predef_mu.unlock()
+    locked predef_mu:
+        if predef_tables.len() == 0:
+            predef_tables.push(fse.build_decode_table(ll_default(), LL_DEFAULT_LOG))
+            predef_tables.push(fse.build_decode_table(of_default(), OF_DEFAULT_LOG))
+            predef_tables.push(fse.build_decode_table(ml_default(), ML_DEFAULT_LOG))
     return predef_tables
 
 # build a table for one code stream given its mode, returning the table and

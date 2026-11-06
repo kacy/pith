@@ -181,6 +181,7 @@ statement     = binding
               | for_stmt
               | while_stmt
               | while_let
+              | locked_stmt
               | match_stmt
               | return_stmt
               | fail_stmt
@@ -214,6 +215,11 @@ for_iterable  = expression , [ ( ".." | "..=" ) , expression ] ;
 
 while_stmt    = "while" , expression , ":" , block ;
 while_let     = "while" , "let" , pattern , "=" , expression , ":" , block ;
+
+(* holds a mutex for the block and releases it on every exit. `locked` is  *)
+(* a keyword only here, followed by a name or `self`.                       *)
+locked_stmt   = "locked" , mutex_path , ":" , block ;
+mutex_path    = ( IDENT | "self" ) , { "." , IDENT | "[" , ( IDENT | INT ) , "]" } ;
 
 match_stmt    = "match" , expression , ":" , NEWLINE
               , INDENT , { match_arm , NEWLINE } , DEDENT ;

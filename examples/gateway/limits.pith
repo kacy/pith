@@ -25,15 +25,14 @@ pub fn caller_limits(per_second: Int, burst: Int) -> CallerLimits:
 
 impl CallerLimits:
     fn bucket(caller: String) -> resilience.Limiter:
-        self.mu.lock()
-        defer self.mu.unlock()
-        if self.buckets.contains_key(caller):
-            return self.buckets[caller]
-        if self.buckets.len() >= MAX_TRACKED_CALLERS:
-            self.buckets = {}
-        created := resilience.rate_limiter(self.per_second, self.burst)
-        self.buckets.insert(caller, created)
-        return created
+        locked self.mu:
+            if self.buckets.contains_key(caller):
+                return self.buckets[caller]
+            if self.buckets.len() >= MAX_TRACKED_CALLERS:
+                self.buckets = {}
+            created := resilience.rate_limiter(self.per_second, self.burst)
+            self.buckets.insert(caller, created)
+            return created
 
 fn too_many() -> http.HttpResponse:
     return http.response(429).header("Retry-After", "1").text_body("rate limited")

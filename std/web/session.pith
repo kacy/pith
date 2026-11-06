@@ -141,29 +141,39 @@ pub struct Store:
 # first two segments (a store number and a base64url id) can hold no "|" and
 # so the split is never ambiguous however the caller spells a key.
 
-mut session_mu := Mutex()
-mut next_store_handle := 1
+guard session_mu:
+    mut next_store_handle := 1
 
-# "<store>|<id>|<key>" -> the value a handler stored
-mut session_values: Map[String, String] := {}
-# "<store>|<id>" -> the keys that session holds, newline separated
-mut session_keys: Map[String, String] := {}
-# "<store>|<id>" -> the unix second it stops being valid
-mut session_expiry: Map[String, Int] := {}
-mut session_count := 0
-mut last_sweep := 0
-# the cap ensure_session enforces. it is MAX_SESSIONS outside the tests, which
-# lower it to exercise eviction without creating a hundred thousand sessions.
-mut session_cap := MAX_SESSIONS
+    # "<store>|<id>|<key>" -> the value a handler stored
+    mut session_values: Map[String, String] := {}
+    # "<store>|<id>" -> the keys that session holds, newline separated
+    mut session_keys: Map[String, String] := {}
+    # "<store>|<id>" -> the unix second it stops being valid
+    mut session_expiry: Map[String, Int] := {}
+    mut session_count := 0
+    mut last_sweep := 0
+    # the cap ensure_session enforces. it is MAX_SESSIONS outside the tests, which
+    # lower it to exercise eviction without creating a hundred thousand sessions.
+    mut session_cap := MAX_SESSIONS
 
-# "<store>|<id>" of every provisional session
-mut session_provisional: Map[String, Bool] := {}
-# provisional sessions in the order they were created, the eviction order.
-# entries before `provisional_head` have been consumed; entries for sessions
-# that have since been promoted or dropped are skipped when reached, and
-# dropped when the queue is compacted.
-mut provisional_queue: List[String] := []
-mut provisional_head := 0
+    # "<store>|<id>" of every provisional session
+    mut session_provisional: Map[String, Bool] := {}
+    # provisional sessions in the order they were created, the eviction order.
+    # entries before `provisional_head` have been consumed; entries for sessions
+    # that have since been promoted or dropped are skipped when reached, and
+    # dropped when the queue is compacted.
+    mut provisional_queue: List[String] := []
+    mut provisional_head := 0
+
+# what a write or a rotation under the lock reports, so the logging happens
+# after the lock is released
+WRITE_OK := 0
+WRITE_UNATTACHED := 1
+WRITE_FULL := 2
+
+fn current_cap() -> Int:
+    locked session_mu:
+        return session_cap
 
 fn session_key(handle: Int, id: String) -> String:
     return handle.to_string() + "|" + id
@@ -181,10 +191,10 @@ fn value_key(handle: Int, id: String, key: String) -> String:
 pub fn store(secret: Bytes) -> Store!:
     if secret.len() < MIN_SECRET_BYTES:
         fail "a session secret must be at least " + MIN_SECRET_BYTES.to_string() + " bytes"
-    session_mu.lock()
-    handle := next_store_handle
-    next_store_handle = next_store_handle + 1
-    session_mu.unlock()
+    mut handle := 0
+    locked session_mu:
+        handle = next_store_handle
+        next_store_handle = next_store_handle + 1
     return Store(handle, secret, DEFAULT_COOKIE, DEFAULT_TTL, DEFAULT_PATH, DEFAULT_SAME_SITE, true)
 
 impl Store:
@@ -222,16 +232,16 @@ impl Store:
 # the table, under the lock
 # ---------------------------------------------------------------
 #
-# every helper below assumes session_mu is already held. the public surface
+# every helper below is marked `holding session_mu`. the public surface
 # takes it once at its own boundary; none of this ever blocks, so the section
 # is always short.
 
-fn expired_at(now: Int, key: String) -> Bool:
+fn expired_at(now: Int, key: String) -> Bool holding session_mu:
     if not session_expiry.contains_key(key):
         return true
     return session_expiry[key] <= now
 
-fn drop_session(key: String):
+fn drop_session(key: String) holding session_mu:
     if not session_expiry.contains_key(key):
         return
     for name in stored_keys(key):
@@ -245,7 +255,7 @@ fn drop_session(key: String):
 # rebuild the eviction queue from the provisional sessions still in it. each
 # rebuild follows at least as many pushes or pops as the entries it keeps, so
 # the queue costs O(1) amortized per session.
-fn compact_provisional():
+fn compact_provisional() holding session_mu:
     mut kept: List[String] := []
     mut i := provisional_head
     while i < provisional_queue.len():
@@ -258,13 +268,13 @@ fn compact_provisional():
 
 # queue a new provisional session for eviction, compacting the queue once
 # stale entries outnumber live ones.
-fn queue_provisional(key: String):
+fn queue_provisional(key: String) holding session_mu:
     provisional_queue.push(key)
     if provisional_queue.len() - provisional_head > 2 * session_provisional.len() + 1024:
         compact_provisional()
 
 # drop the oldest provisional session. false when there is none to drop.
-fn evict_provisional() -> Bool:
+fn evict_provisional() -> Bool holding session_mu:
     while provisional_head < provisional_queue.len():
         key := provisional_queue[provisional_head]
         provisional_head = provisional_head + 1
@@ -277,12 +287,12 @@ fn evict_provisional() -> Bool:
 
 # how long `key` lives past its last use: PROVISIONAL_TTL while it is
 # provisional (or the store's ttl, if that is shorter), the store's ttl after.
-fn ttl_for(key: String, ttl: Int) -> Int:
+fn ttl_for(key: String, ttl: Int) -> Int holding session_mu:
     if ttl > PROVISIONAL_TTL and session_provisional.contains_key(key):
         return PROVISIONAL_TTL
     return ttl
 
-fn stored_keys(key: String) -> List[String]:
+fn stored_keys(key: String) -> List[String] holding session_mu:
     if not session_keys.contains_key(key):
         return []
     joined := session_keys[key]
@@ -290,7 +300,7 @@ fn stored_keys(key: String) -> List[String]:
         return []
     return joined.split("\n")
 
-fn record_key(key: String, name: String):
+fn record_key(key: String, name: String) holding session_mu:
     for existing in stored_keys(key):
         if existing == name:
             return
@@ -299,7 +309,7 @@ fn record_key(key: String, name: String):
         return
     session_keys.insert(key, name)
 
-fn forget_key(key: String, name: String):
+fn forget_key(key: String, name: String) holding session_mu:
     mut out := ""
     for existing in stored_keys(key):
         if existing == name:
@@ -310,7 +320,7 @@ fn forget_key(key: String, name: String):
     session_keys.insert(key, out)
 
 # drop every expired session. returns how many went.
-fn sweep_expired(now: Int) -> Int:
+fn sweep_expired(now: Int) -> Int holding session_mu:
     mut doomed: List[String] := []
     for key in session_expiry:
         if session_expiry[key] <= now:
@@ -323,11 +333,11 @@ fn sweep_expired(now: Int) -> Int:
 
 # sweep if it has been a while. called on the paths that are about to grow
 # the table, so expiry costs nothing until there is traffic to pay for it.
-fn maybe_sweep(now: Int):
+fn maybe_sweep(now: Int) holding session_mu:
     if now - last_sweep >= SWEEP_INTERVAL:
         sweep_expired(now)
 
-fn live(now: Int, key: String) -> Bool:
+fn live(now: Int, key: String) -> Bool holding session_mu:
     return not expired_at(now, key)
 
 # create the session if it is not there, and slide its window either way. a
@@ -336,7 +346,7 @@ fn live(now: Int, key: String) -> Bool:
 # demotes a full one. a new session takes the place of the oldest provisional
 # one when the table is full, and this returns false when there is none to
 # evict, which is the only way it refuses.
-fn ensure_session(key: String, now: Int, ttl: Int, provisional: Bool) -> Bool:
+fn ensure_session(key: String, now: Int, ttl: Int, provisional: Bool) -> Bool holding session_mu:
     if session_expiry.contains_key(key):
         if session_expiry[key] <= now:
             drop_session(key)
@@ -405,7 +415,7 @@ fn cleared_cookie(store: Store) -> http.Cookie:
 # used yet. which of the two is live is decided by looking in the table, so a
 # handler that rotates or destroys a session needs no other bookkeeping.
 
-fn existing_id(store: Store, req: web.Request, now: Int) -> String:
+fn existing_id(store: Store, req: web.Request, now: Int) -> String holding session_mu:
     fresh := req.value(FRESH_KEY)
     if fresh.len() > 0 and live(now, session_key(store.handle, fresh)):
         return fresh
@@ -416,7 +426,7 @@ fn existing_id(store: Store, req: web.Request, now: Int) -> String:
 
 # where a write goes: the live session if there is one, otherwise the fresh
 # id, which the write itself brings into being.
-fn write_id(store: Store, req: web.Request, now: Int) -> String:
+fn write_id(store: Store, req: web.Request, now: Int) -> String holding session_mu:
     id := existing_id(store, req, now)
     if id.len() > 0:
         return id
@@ -477,22 +487,28 @@ impl Store:
         if key.len() == 0 or key.contains("\n"):
             log.root().target("web.session").error().msg("a session key must be non-empty and hold no newline")
             return false
-        session_mu.lock()
+        mut status := WRITE_OK
+        locked session_mu:
+            status = self.write_locked(req, key, value, provisional)
+        if status == WRITE_UNATTACHED:
+            warn_unattached()
+            return false
+        if status == WRITE_FULL:
+            log.root().target("web.session").error().int("limit", current_cap()).msg("this process is holding all the sessions it will; not creating another")
+            return false
+        return true
+
+    fn write_locked(req: web.Request, key: String, value: String, provisional: Bool) -> Int holding session_mu:
         now := time.unix()
         id := write_id(self, req, now)
         if id.len() == 0:
-            session_mu.unlock()
-            warn_unattached()
-            return false
+            return WRITE_UNATTACHED
         full := session_key(self.handle, id)
         if not ensure_session(full, now, self.ttl_v, provisional):
-            session_mu.unlock()
-            log.root().target("web.session").error().int("limit", session_cap).msg("this process is holding all the sessions it will; not creating another")
-            return false
+            return WRITE_FULL
         session_values.insert(value_key(self.handle, id, key), value)
         record_key(full, key)
-        session_mu.unlock()
-        return true
+        return WRITE_OK
 
     # drop one key from this request's session, leaving the rest of it alone.
     fn remove(req: web.Request, key: String):
@@ -514,9 +530,9 @@ impl Store:
 
     # true when this request already has a session on the server.
     fn active(req: web.Request) -> Bool:
-        session_mu.lock()
-        id := existing_id(self, req, time.unix())
-        session_mu.unlock()
+        mut id := ""
+        locked session_mu:
+            id = existing_id(self, req, time.unix())
         return id.len() > 0
 
     # move this request's session to a brand new id, keeping its contents,
@@ -533,17 +549,25 @@ impl Store:
     # false only when the request had no session and the table is full of
     # full sessions.
     fn rotate(req: web.Request) -> Bool:
-        session_mu.lock()
+        mut status := WRITE_OK
+        locked session_mu:
+            status = self.rotate_locked(req)
+        if status == WRITE_UNATTACHED:
+            warn_unattached()
+            return false
+        if status == WRITE_FULL:
+            log.root().target("web.session").error().int("limit", current_cap()).msg("this process is holding all the sessions it will; not rotating")
+            return false
+        return true
+
+    fn rotate_locked(req: web.Request) -> Int holding session_mu:
         now := time.unix()
         fresh := req.value(FRESH_KEY)
         if fresh.len() == 0:
-            session_mu.unlock()
-            warn_unattached()
-            return false
+            return WRITE_UNATTACHED
         current := existing_id(self, req, now)
         if current == fresh:
-            session_mu.unlock()
-            return true
+            return WRITE_OK
         mut names: List[String] := []
         mut values: List[String] := []
         if current.len() > 0:
@@ -554,16 +578,13 @@ impl Store:
             drop_session(source)
         target := session_key(self.handle, fresh)
         if not ensure_session(target, now, self.ttl_v, false):
-            session_mu.unlock()
-            log.root().target("web.session").error().int("limit", session_cap).msg("this process is holding all the sessions it will; not rotating")
-            return false
+            return WRITE_FULL
         mut i := 0
         while i < names.len():
             session_values.insert(value_key(self.handle, fresh, names[i]), values[i])
             record_key(target, names[i])
             i = i + 1
-        session_mu.unlock()
-        return true
+        return WRITE_OK
 
     # end this request's session: the server forgets it and the response
     # clears the cookie. this is what logout is — the id stops meaning
@@ -621,22 +642,21 @@ fn run(store: Store, next: fn(web.Request) -> http.HttpResponse, req: web.Reques
     offered := req.raw.cookie_or(store.cookie_v, "")
     presented := opened_cookie(store.secret, offered)
 
-    session_mu.lock()
-    now := time.unix()
     mut carried := ""
-    if presented.len() > 0 and live(now, session_key(store.handle, presented)):
-        # slide the idle window forward: this session is being used.
-        key := session_key(store.handle, presented)
-        session_expiry.insert(key, now + ttl_for(key, store.ttl_v))
-        carried = presented
-    session_mu.unlock()
+    locked session_mu:
+        now := time.unix()
+        if presented.len() > 0 and live(now, session_key(store.handle, presented)):
+            # slide the idle window forward: this session is being used.
+            key := session_key(store.handle, presented)
+            session_expiry.insert(key, now + ttl_for(key, store.ttl_v))
+            carried = presented
 
     scoped := req.with_value(ID_KEY, carried).with_value(FRESH_KEY, fresh)
     resp := next(scoped)
 
-    session_mu.lock()
-    after := existing_id(store, scoped, time.unix())
-    session_mu.unlock()
+    mut after := ""
+    locked session_mu:
+        after = existing_id(store, scoped, time.unix())
 
     if after.len() == 0:
         # the handler destroyed the session, or the cookie named one that had
@@ -926,6 +946,27 @@ fn checked_login_for(target: Store) -> fn(web.Request) -> http.HttpResponse:
             return http.text(503, "full")
         return http.text(200, "in")
 
+# the tests read and set the table through these, under its lock
+fn expiry_of(key: String) -> Int:
+    locked session_mu:
+        return session_expiry.get(key).unwrap_or(0)
+
+fn has_session(key: String) -> Bool:
+    locked session_mu:
+        return session_expiry.contains_key(key)
+
+fn is_provisional(key: String) -> Bool:
+    locked session_mu:
+        return session_provisional.contains_key(key)
+
+fn cap_sessions_at_count_plus(extra: Int):
+    locked session_mu:
+        session_cap = session_count + extra
+
+fn restore_session_cap():
+    locked session_mu:
+        session_cap = MAX_SESSIONS
+
 # the table key of the session a Set-Cookie line names.
 fn table_key(target: Store, line: String) -> String:
     pair := cookie_pair(line)
@@ -936,16 +977,16 @@ test "a provisional session lives PROVISIONAL_TTL until a full write promotes it
     guard := middleware(sessions)
     line := set_cookie_for(guard(provisional_for(sessions), request_with_cookie("")), DEFAULT_COOKIE)
     key := table_key(sessions, line)
-    assert(session_expiry[key] - time.unix() <= PROVISIONAL_TTL)
+    assert(expiry_of(key) - time.unix() <= PROVISIONAL_TTL)
     # the browser comes back and the handler stores something real.
     guard(writer_for(sessions), request_with_cookie(cookie_pair(line)))
-    assert(session_expiry[key] - time.unix() > PROVISIONAL_TTL)
-    assert(not session_provisional.contains_key(key))
+    assert(expiry_of(key) - time.unix() > PROVISIONAL_TTL)
+    assert(not is_provisional(key))
 
 test "a full table evicts the oldest provisional session so a sign-in still works":
     sessions := store(test_secret())!
     guard := middleware(sessions)
-    session_cap = session_count + 3
+    cap_sessions_at_count_plus(3)
     first := set_cookie_for(guard(provisional_for(sessions), request_with_cookie("")), DEFAULT_COOKIE)
     guard(provisional_for(sessions), request_with_cookie(""))
     guard(provisional_for(sessions), request_with_cookie(""))
@@ -956,36 +997,36 @@ test "a full table evicts the oldest provisional session so a sign-in still work
     assert_eq(login.status, 200)
     assert(set_cookie_for(login, DEFAULT_COOKIE).len() > 0)
     assert_eq(sessions.count(), 3)
-    assert(not session_expiry.contains_key(table_key(sessions, first)))
+    assert(not has_session(table_key(sessions, first)))
     # another anonymous visitor still gets a token, at the cost of another
     # provisional session, never the signed-in one.
     assert_eq(guard(provisional_for(sessions), request_with_cookie("")).status, 200)
     assert_eq(guard(provisional_for(sessions), request_with_cookie("")).status, 200)
     reader := fn(req: web.Request) => http.text(200, sessions.get(req, "user"))
     assert_eq(guard(reader, request_with_cookie(cookie_pair(set_cookie_for(login, DEFAULT_COOKIE)))).body_text()!, "ada")
-    session_cap = MAX_SESSIONS
+    restore_session_cap()
 
 test "rotating a provisional session in a full table keeps its contents":
     sessions := store(test_secret())!
     guard := middleware(sessions)
-    session_cap = session_count + 1
+    cap_sessions_at_count_plus(1)
     line := set_cookie_for(guard(provisional_for(sessions), request_with_cookie("")), DEFAULT_COOKIE)
     login := guard(checked_login_for(sessions), request_with_cookie(cookie_pair(line)))
     assert_eq(login.status, 200)
     reader := fn(req: web.Request) => http.text(200, sessions.get(req, "token") + "/" + sessions.get(req, "user"))
     assert_eq(guard(reader, request_with_cookie(cookie_pair(set_cookie_for(login, DEFAULT_COOKIE)))).body_text()!, "t/ada")
-    session_cap = MAX_SESSIONS
+    restore_session_cap()
 
 test "a table full of full sessions refuses a new one and says so":
     sessions := store(test_secret())!
     guard := middleware(sessions)
-    session_cap = session_count + 1
+    cap_sessions_at_count_plus(1)
     guard(writer_for(sessions), request_with_cookie(""))
     refused := guard(checked_login_for(sessions), request_with_cookie(""))
     assert_eq(refused.status, 503)
     assert_eq(refused.cookies().len(), 0)
     assert_eq(guard(provisional_for(sessions), request_with_cookie("")).status, 503)
-    session_cap = MAX_SESSIONS
+    restore_session_cap()
 
 test "the eviction queue stays bounded by the provisional sessions it holds":
     sessions := store(test_secret())!
@@ -996,4 +1037,5 @@ test "the eviction queue stays bounded by the provisional sessions it holds":
         # promoting each one leaves a stale queue entry behind
         guard(writer_for(sessions), request_with_cookie(cookie_pair(line)))
         i = i + 1
-    assert(provisional_queue.len() - provisional_head <= 2 * session_provisional.len() + 1025)
+    locked session_mu:
+        assert(provisional_queue.len() - provisional_head <= 2 * session_provisional.len() + 1025)

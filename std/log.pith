@@ -69,14 +69,14 @@ pub struct Event:
 # old value under a reader that has just loaded it. the lock covers the reads
 # and the writes; it is never held across the log write itself, which happens
 # from emit_record on a Logger that already carries its own copy.
-mut settings_mu := Mutex()
-mut min_level: Int := LEVEL_DEBUG
+guard settings_mu:
+    mut min_level: Int := LEVEL_DEBUG
+    mut sink_path: String := ""
+    mut output_format: Int := FORMAT_CONSOLE
 # min_level again, readable without the lock. a call below the level returns
 # before it builds a logger, so a service with debug logging off does not take
 # settings_mu once per debug line: 32 tasks doing that ran slower than one.
 mut min_level_cell := AtomicInt(LEVEL_DEBUG)
-mut sink_path: String := ""
-mut output_format: Int := FORMAT_CONSOLE
 
 fn trace_rank() -> Int:
     return 0 - 1
@@ -159,11 +159,13 @@ fn add_field(base: List[Field], item: Field) -> List[Field]:
 # so a logger never mixes a level from before a reconfiguration with a sink from
 # after it.
 pub fn root() -> Logger:
-    settings_mu.lock()
-    level := min_level
-    format := output_format
-    path := sink_path
-    settings_mu.unlock()
+    mut level := 0
+    mut format := 0
+    mut path := ""
+    locked settings_mu:
+        level = min_level
+        format = output_format
+        path = sink_path
     return Logger(level, format, path, [], "", "", "")
 
 # create a compact trace id suitable for logs and future propagation.

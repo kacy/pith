@@ -432,8 +432,8 @@ impl Span:
 # a trace's spans in the order they ended. set_sink and the drain take the
 # shard locks in index order.
 SINK_SHARDS := 8
-mut sink_mus: List[Mutex] := [Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex()]
-mut sink_shards: List[List[Span]] := [[], [], [], [], [], [], [], []]
+guard sink_mus[8]:
+    mut sink_shards: List[List[Span]] := [[], [], [], [], [], [], [], []]
 mut sink_active := AtomicInt(0)
 FINISHED_SPANS_CAP := 2048
 
@@ -471,10 +471,10 @@ pub fn drain_finished_spans() -> List[Span]:
     mut out: List[Span] := []
     mut i := 0
     while i < SINK_SHARDS:
-        sink_mus[i].lock()
-        taken := sink_shards[i]
-        sink_shards[i] = []
-        sink_mus[i].unlock()
+        mut taken: List[Span] := []
+        locked sink_mus[i]:
+            taken = sink_shards[i]
+            sink_shards[i] = []
         for span in taken:
             out.push(span)
         i = i + 1

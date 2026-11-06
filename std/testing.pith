@@ -29,10 +29,10 @@ import std.fs as fs
 # which here means a failure that never gets reported. the lock covers the
 # counters and the silent flag; the line is printed after it is released, so a
 # slow terminal never serializes the tasks under test.
-mut counts_mu := Mutex()
-mut pass_count: Int := 0
-mut fail_count: Int := 0
-mut silent: Bool := false
+guard counts_mu:
+    mut pass_count: Int := 0
+    mut fail_count: Int := 0
+    mut silent: Bool := false
 
 # clear the tally and, with it, the process verdict. the only caller is a test
 # of the tally itself, which provokes failures on purpose; clearing the verdict
@@ -58,19 +58,19 @@ pub fn silence_output():
 # own result is: prose for a terminal, one json record per result under
 # `pith test --json`.
 fn record_pass(name: String):
-    counts_mu.lock()
-    pass_count = pass_count + 1
-    quiet := silent
-    counts_mu.unlock()
+    mut quiet := false
+    locked counts_mu:
+        pass_count = pass_count + 1
+        quiet = silent
     if quiet:
         return
     report_test_case(name, true, "")
 
 fn record_fail(name: String, detail: String):
-    counts_mu.lock()
-    fail_count = fail_count + 1
-    quiet := silent
-    counts_mu.unlock()
+    mut quiet := false
+    locked counts_mu:
+        fail_count = fail_count + 1
+        quiet = silent
     # the run has failed whether or not anyone is listening. marking it here,
     # rather than only counting it, is what makes a failed check inside a `test`
     # block fail that block instead of vanishing into a tally it never prints.
@@ -327,25 +327,29 @@ pub fn each[T](rows: List[Case[T]], body: fn(T) -> Bool):
 
 fn failure_count() -> Int:
     locked counts_mu:
-        n := fail_count
-        return n
+        return fail_count
+
+fn pass_total() -> Int:
+    locked counts_mu:
+        return pass_count
 
 # say which row a failure belongs to without counting it a second time: the
 # check inside it already moved the tally and set the verdict.
 fn name_case_failure(name: String, detail: String):
-    counts_mu.lock()
-    quiet := silent
-    counts_mu.unlock()
+    mut quiet := false
+    locked counts_mu:
+        quiet = silent
     if quiet:
         return
     report_test_case(name, false, detail)
 
 # print summary
 pub fn done():
-    counts_mu.lock()
-    passed := pass_count
-    failed := fail_count
-    counts_mu.unlock()
+    mut passed := 0
+    mut failed := 0
+    locked counts_mu:
+        passed = pass_count
+        failed = fail_count
     print("")
     if failed == 0:
         print((passed + failed).to_string() + " passed")
@@ -368,8 +372,8 @@ test "testing helpers count passing checks":
     assert_contains("hello pith", "pith")
     assert_eq_text("same", "same")
 
-    assert(pass_count == 11)
-    assert(fail_count == 0)
+    assert(pass_total() == 11)
+    assert(failure_count() == 0)
 
 test "testing helpers count failing checks":
     reset_counts()
@@ -387,8 +391,8 @@ test "testing helpers count failing checks":
     assert_contains("hello", "pith")
     assert_eq_text("left", "right")
 
-    assert(pass_count == 0)
-    assert(fail_count == 11)
+    assert(pass_total() == 0)
+    assert(failure_count() == 11)
 
     # those eleven failures are what this test is about, not what it reports.
     # without this the block would end on a failed verdict and be counted, quite
@@ -402,8 +406,8 @@ test "testing helpers inspect files and temp dirs":
     ok := with_temp_dir("pith-std-testing-", fn(dir: String) => fs.is_dir(dir))
 
     assert(ok)
-    assert(pass_count == 1)
-    assert(fail_count == 0)
+    assert(pass_total() == 1)
+    assert(failure_count() == 0)
 
 # assert from a task, so the tally takes concurrent writes. the counters are
 # private to this module, which is why this regression lives beside them rather
@@ -432,8 +436,8 @@ test "the tally survives assertions made from several tasks at once":
     expected = expected + await c
     expected = expected + await d
 
-    assert(pass_count == expected)
-    assert(fail_count == 0)
+    assert(pass_total() == expected)
+    assert(failure_count() == 0)
 
 # a payload enum for the compiler regression test below. the two payload
 # variants deliberately carry different heap types so the test can reuse
@@ -466,8 +470,8 @@ test "match payload bindings work directly in a test body":
         _ => ""
     assert_eq(count, "3")
 
-    assert(pass_count == 2)
-    assert(fail_count == 0)
+    assert(pass_total() == 2)
+    assert(failure_count() == 0)
 
 test "a table reports every row, and one bad row does not end the table":
     reset_counts()
@@ -482,8 +486,8 @@ test "a table reports every row, and one bad row does not end the table":
 
     # three rows passed and the fourth still ran after the third failed, which
     # is the whole difference from a hand-written loop.
-    assert(pass_count == 3)
-    assert(fail_count == 1)
+    assert(pass_total() == 3)
+    assert(failure_count() == 1)
 
     reset_counts()
 
@@ -501,8 +505,8 @@ test "a row that fails a check is named once, not counted twice":
     # does, so the tally reads two passes: the check and the row it held. the
     # failing check counted itself, and naming the row it belongs to does not
     # count it a second time.
-    assert(pass_count == 2)
-    assert(fail_count == 1)
+    assert(pass_total() == 2)
+    assert(failure_count() == 1)
 
     reset_counts()
 
@@ -527,7 +531,7 @@ test "a table of input and expected pairs reads as a table":
         case("several", ("abcd", 4)),
 ], fn(c: (String, Int)) => c.0.len() == c.1)
 
-    assert(pass_count == 3)
-    assert(fail_count == 0)
+    assert(pass_total() == 3)
+    assert(failure_count() == 0)
 
     reset_counts()

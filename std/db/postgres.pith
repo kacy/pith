@@ -40,8 +40,8 @@ import std.time as time
 # holds the handle. each pool synchronizes its own idle set, so every read of
 # `pools` (open, pool_at, and Db.close) takes registry_mu around the lookup
 # and nothing else, and a slow connect or close happens off the lock.
-mut pools: List[postgres.Pool] := []
-mut registry_mu := Mutex()
+guard registry_mu:
+    mut pools: List[postgres.Pool] := []
 
 # a pooled handle to a postgres database. it is just an index into the pool
 # registry, so it is cheap to copy and safe to share across tasks.
@@ -57,10 +57,10 @@ pub fn open(url: String) -> Db!:
     if dsn.driver != "postgres":
         fail "db.postgres: url is not a postgres url: {url}"
     pool := postgres.pool(dsn.host, dsn.port, dsn.user, dsn.password, dsn.dbname, dsn.pool_size)
-    registry_mu.lock()
-    pools.push(pool)
-    handle := pools.len() - 1
-    registry_mu.unlock()
+    mut handle := 0
+    locked registry_mu:
+        pools.push(pool)
+        handle = pools.len() - 1
     return Db(handle: handle)
 
 # look up pool `pool_handle`. the registry lock only covers the lookup; the
@@ -117,8 +117,8 @@ struct Pin:
 # every access to `pins` is one of the small helpers below, and each takes
 # pins_mu around exactly one field read or write; the connection i/o that
 # follows (release, discard) happens after the unlock.
-mut pins: List[Pin] := []
-mut pins_mu := Mutex()
+guard pins_mu:
+    mut pins: List[Pin] := []
 
 # every prepared statement is parsed under this one name. a Stmt pins its own
 # connection, so the fixed name never collides across statements; it is
@@ -137,10 +137,8 @@ fn pin_connection(pool_handle: Int) -> Int!:
 # the pinned connection for a handle. only call it while the pin is live (its
 # callers all guard with pin_finished first); a finished pin has cleared it.
 fn pin_conn(handle: Int) -> postgres.Conn:
-    pins_mu.lock()
-    conn := pins[handle].conn
-    pins_mu.unlock()
-    return conn.value()
+    locked pins_mu:
+        return pins[handle].conn.value()
 
 # whether the pinned connection has ended (committed, closed, or discarded).
 fn pin_finished(handle: Int) -> Bool:
@@ -162,24 +160,26 @@ fn pin_mark_broken(handle: Int):
 # finish the pin and return its connection to the pool for reuse. the slot drops
 # its reference to the connection so a spent pin retains nothing.
 fn pin_release(handle: Int):
-    pins_mu.lock()
-    conn := pins[handle].conn
-    pool := pins[handle].pool
-    pins[handle].conn = none
-    pins[handle].finished = true
-    pins_mu.unlock()
+    mut conn: postgres.Conn? := none
+    mut pool := 0
+    locked pins_mu:
+        conn = pins[handle].conn
+        pool = pins[handle].pool
+        pins[handle].conn = none
+        pins[handle].finished = true
     release_to_pool(pool, conn.value())
 
 # finish the pin and close its connection instead of reusing it, for when it is
 # out of protocol sync. the slot drops its reference the same way, and the
 # connection is discarded back to the pool so its cap slot returns.
 fn pin_discard(handle: Int):
-    pins_mu.lock()
-    conn := pins[handle].conn
-    pool := pins[handle].pool
-    pins[handle].conn = none
-    pins[handle].finished = true
-    pins_mu.unlock()
+    mut conn: postgres.Conn? := none
+    mut pool := 0
+    locked pins_mu:
+        conn = pins[handle].conn
+        pool = pins[handle].pool
+        pins[handle].conn = none
+        pins[handle].finished = true
     discard_to_pool(pool, conn.value())
 
 # a transaction: a connection pinned out of the pool with BEGIN already sent. it

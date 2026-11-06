@@ -59,11 +59,11 @@ DEFAULT_SAMPLER := "parentbased_always_on"
 # read-modify-writes in start and shutdown, which is what makes init idempotent
 # rather than merely usually-idempotent. the flush calls are outside it, so the
 # exporter's POST never runs under the lock.
-mut obs_mu := Mutex()
-# whether init has already run (init is idempotent).
-mut started := false
-# whether the exporter loop should keep going; shutdown() clears it.
-mut running := false
+guard obs_mu:
+    # whether init has already run (init is idempotent).
+    mut started := false
+    # whether the exporter loop should keep going; shutdown() clears it.
+    mut running := false
 
 fn set_running(on: Bool):
     locked obs_mu:
@@ -243,11 +243,11 @@ FLUSH_DEADLINE_MS := 5000
 # need to call this at all: std.shutdown's drain already waits for the same
 # flush, so the batch goes out either way.
 pub fn shutdown():
-    obs_mu.lock()
-    was_running := running
-    running = false
-    started = false
-    obs_mu.unlock()
+    mut was_running := false
+    locked obs_mu:
+        was_running = running
+        running = false
+        started = false
     if not was_running:
         return
     lifecycle.wait_flushes(FLUSH_DEADLINE_MS)

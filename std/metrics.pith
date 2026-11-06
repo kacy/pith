@@ -109,27 +109,27 @@ struct HistSeries:
 # the registry, sharded. shard_mu[i] guards entry i of every map list below;
 # nothing reads or writes those maps without it, and no path holds two shard
 # locks except the whole-registry walk, which takes them in index order.
-mut shard_mu: List[Mutex] := [Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex()]
+guard shard_mu[8]:
+    # series keyed by full series key (the bare name for an unlabeled metric,
+    # or name{k="v",...} for a labeled one). a key may appear in more than one
+    # of these if a program registers the same name as two kinds; the render
+    # order below resolves that the way the single-map version used to.
+    mut counter_series: List[Map[String, Series]] := [{}, {}, {}, {}, {}, {}, {}, {}]
+    mut gauge_series: List[Map[String, Series]] := [{}, {}, {}, {}, {}, {}, {}, {}]
+    mut histogram_series: List[Map[String, HistSeries]] := [{}, {}, {}, {}, {}, {}, {}, {}]
 
-# series keyed by full series key (the bare name for an unlabeled metric, or
-# name{k="v",...} for a labeled one). a key may appear in more than one of these
-# if a program registers the same name as two kinds; the render order below
-# resolves that the way the single-map version used to.
-mut counter_series: List[Map[String, Series]] := [{}, {}, {}, {}, {}, {}, {}, {}]
-mut gauge_series: List[Map[String, Series]] := [{}, {}, {}, {}, {}, {}, {}, {}]
-mut histogram_series: List[Map[String, HistSeries]] := [{}, {}, {}, {}, {}, {}, {}, {}]
+    # optional help text and unit per bare metric name (see describe). the
+    # help renders as a prometheus `# HELP` line; both feed the OTLP
+    # Metric.description and .unit fields. keyed by the bare name, so sharded
+    # on that rather than on the series key.
+    mut metric_descriptions: List[Map[String, String]] := [{}, {}, {}, {}, {}, {}, {}, {}]
+    mut metric_units: List[Map[String, String]] := [{}, {}, {}, {}, {}, {}, {}, {}]
 
-# optional help text and unit per bare metric name (see describe). the help
-# renders as a prometheus `# HELP` line; both feed the OTLP Metric.description
-# and .unit fields. keyed by the bare name, so sharded on that rather than on
-# the series key.
-mut metric_descriptions: List[Map[String, String]] := [{}, {}, {}, {}, {}, {}, {}, {}]
-mut metric_units: List[Map[String, String]] := [{}, {}, {}, {}, {}, {}, {}, {}]
-
-# custom bucket boundaries per bare metric name (see Histogram.buckets). a
-# metric with no entry here uses default_histogram_buckets(). all series of one
-# metric share its boundaries, so this is keyed by the bare name too.
-mut histogram_bucket_defs: List[Map[String, List[Float]]] := [{}, {}, {}, {}, {}, {}, {}, {}]
+    # custom bucket boundaries per bare metric name (see Histogram.buckets). a
+    # metric with no entry here uses default_histogram_buckets(). all series
+    # of one metric share its boundaries, so this is keyed by the bare name
+    # too.
+    mut histogram_bucket_defs: List[Map[String, List[Float]]] := [{}, {}, {}, {}, {}, {}, {}, {}]
 
 # which shard owns a name. a sampled hash rather than a hash of every byte: this
 # runs on the registry path, which std.net.http hits once per label set per
@@ -439,26 +439,29 @@ fn resolve_counter(key: String, bare: String, pairs: List[String]) -> Counter:
     sync_cache()
     if counter_cache.contains_key(key):
         return counter_cache[key]
-    shard := shard_of(key)
-    shard_mu[shard].lock()
-    if not counter_series[shard].contains_key(key):
-        counter_series[shard].insert(key, new_series(key, bare, pairs))
-    found := counter_series[shard][key]
-    shard_mu[shard].unlock()
+    found := counter_series_for(shard_of(key), key, bare, pairs)
     made := counter_instrument(found)
     counter_cache.insert(key, made)
     return made
+
+# the series for a key on its shard, made on first sight
+fn counter_series_for(shard: Int, key: String, bare: String, pairs: List[String]) -> Series:
+    locked shard_mu[shard]:
+        if not counter_series[shard].contains_key(key):
+            counter_series[shard].insert(key, new_series(key, bare, pairs))
+        return counter_series[shard][key]
+
+fn gauge_series_for(shard: Int, key: String, bare: String, pairs: List[String]) -> Series:
+    locked shard_mu[shard]:
+        if not gauge_series[shard].contains_key(key):
+            gauge_series[shard].insert(key, new_series(key, bare, pairs))
+        return gauge_series[shard][key]
 
 fn resolve_gauge(key: String, bare: String, pairs: List[String]) -> Gauge:
     sync_cache()
     if gauge_cache.contains_key(key):
         return gauge_cache[key]
-    shard := shard_of(key)
-    shard_mu[shard].lock()
-    if not gauge_series[shard].contains_key(key):
-        gauge_series[shard].insert(key, new_series(key, bare, pairs))
-    found := gauge_series[shard][key]
-    shard_mu[shard].unlock()
+    found := gauge_series_for(shard_of(key), key, bare, pairs)
     made := gauge_instrument(found)
     gauge_cache.insert(key, made)
     return made
@@ -474,24 +477,25 @@ fn resolve_histogram(key: String, bare: String, pairs: List[String]) -> Histogra
     if histogram_cache.contains_key(key):
         return histogram_cache[key]
     shard := shard_of(key)
-    shard_mu[shard].lock()
-    known := histogram_series[shard].contains_key(key)
-    if known:
-        found := histogram_series[shard][key]
-        shard_mu[shard].unlock()
+    if let found = known_histogram(shard, key):
         made := histogram_instrument(found)
         histogram_cache.insert(key, made)
         return made
-    shard_mu[shard].unlock()
     bounds := buckets_for(bare)
-    shard_mu[shard].lock()
-    if not histogram_series[shard].contains_key(key):
-        histogram_series[shard].insert(key, new_hist_series(key, bare, pairs, bounds))
-    created := histogram_series[shard][key]
-    shard_mu[shard].unlock()
+    created := histogram_series_for(shard, key, bare, pairs, bounds)
     made := histogram_instrument(created)
     histogram_cache.insert(key, made)
     return made
+
+fn known_histogram(shard: Int, key: String) -> HistSeries?:
+    locked shard_mu[shard]:
+        return histogram_series[shard].get(key)
+
+fn histogram_series_for(shard: Int, key: String, bare: String, pairs: List[String], bounds: List[Float]) -> HistSeries:
+    locked shard_mu[shard]:
+        if not histogram_series[shard].contains_key(key):
+            histogram_series[shard].insert(key, new_hist_series(key, bare, pairs, bounds))
+        return histogram_series[shard][key]
 
 fn same_bounds(a: List[Float], b: List[Float]) -> Bool:
     if a.len() != b.len():
@@ -516,17 +520,21 @@ struct RegistryView:
     descriptions: Map[String, String]
     units: Map[String, String]
 
-fn lock_all_shards():
-    mut i := 0
-    while i < REGISTRY_SHARDS:
-        shard_mu[i].lock()
-        i = i + 1
+# run one whole-registry operation with every shard lock held. each call
+# takes shard i and recurses for the next, so the locks are taken in index
+# order and released in reverse, and the operation runs in the innermost
+# call, under all eight.
+WALK_VIEW := 0
+WALK_RESET := 1
 
-fn unlock_all_shards():
-    mut i := REGISTRY_SHARDS - 1
-    while i >= 0:
-        shard_mu[i].unlock()
-        i = i - 1
+fn walk_all_shards(i: Int, op: Int, view: RegistryView):
+    locked shard_mu[i]:
+        if i + 1 < REGISTRY_SHARDS:
+            walk_all_shards(i + 1, op, view)
+        elif op == WALK_VIEW:
+            fill_view(view)
+        else:
+            clear_registry()
 
 fn collect_keys(view: RegistryView) -> List[String]:
     mut seen: Map[String, Bool] := {}
@@ -547,29 +555,25 @@ fn collect_keys(view: RegistryView) -> List[String]:
     return names.sort()
 
 fn registry_view() -> RegistryView:
-    mut counters: Map[String, Series] := {}
-    mut gauges: Map[String, Series] := {}
-    mut histograms: Map[String, HistSeries] := {}
-    mut descriptions: Map[String, String] := {}
-    mut units: Map[String, String] := {}
-    lock_all_shards()
+    mut view := RegistryView([], {}, {}, {}, {}, {})
+    walk_all_shards(0, WALK_VIEW, view)
+    view.keys = collect_keys(view)
+    return view
+
+fn fill_view(view: RegistryView) holding shard_mu:
     mut shard := 0
     while shard < REGISTRY_SHARDS:
         for key in counter_series[shard]:
-            counters.insert(key, counter_series[shard][key])
+            view.counters.insert(key, counter_series[shard][key])
         for key in gauge_series[shard]:
-            gauges.insert(key, gauge_series[shard][key])
+            view.gauges.insert(key, gauge_series[shard][key])
         for key in histogram_series[shard]:
-            histograms.insert(key, histogram_series[shard][key])
+            view.histograms.insert(key, histogram_series[shard][key])
         for bare in metric_descriptions[shard]:
-            descriptions.insert(bare, metric_descriptions[shard][bare])
+            view.descriptions.insert(bare, metric_descriptions[shard][bare])
         for bare in metric_units[shard]:
-            units.insert(bare, metric_units[shard][bare])
+            view.units.insert(bare, metric_units[shard][bare])
         shard = shard + 1
-    unlock_all_shards()
-    mut view := RegistryView([], counters, gauges, histograms, descriptions, units)
-    view.keys = collect_keys(view)
-    return view
 
 # which value map holds this series key, with the same precedence the
 # single-map version had: a name registered as two kinds renders as the first
@@ -617,7 +621,9 @@ fn view_unit(view: RegistryView, bare: String) -> String:
 # which are no longer in the registry: those writes are safe and invisible. take
 # a fresh instrument after a reset.
 pub fn reset():
-    lock_all_shards()
+    walk_all_shards(0, WALK_RESET, RegistryView([], {}, {}, {}, {}, {}))
+
+fn clear_registry() holding shard_mu:
     mut shard := 0
     while shard < REGISTRY_SHARDS:
         counter_series[shard].clear()
@@ -628,7 +634,6 @@ pub fn reset():
         histogram_bucket_defs[shard].clear()
         shard = shard + 1
     registry_epoch.store(registry_epoch.load() + 1)
-    unlock_all_shards()
 
 # create or reopen a counter by name.
 pub fn counter(name: String) -> Counter:
@@ -758,17 +763,16 @@ impl Histogram:
         if same_bounds(self.bounds, effective):
             return self
         shard := shard_of(self.name)
-        shard_mu[shard].lock()
         mut found := new_hist_series(self.name, self.bare, self.pairs, effective)
-        if histogram_series[shard].contains_key(self.name):
-            existing := histogram_series[shard][self.name]
-            if same_bounds(existing.bounds, effective):
-                found = existing
+        locked shard_mu[shard]:
+            if histogram_series[shard].contains_key(self.name):
+                existing := histogram_series[shard][self.name]
+                if same_bounds(existing.bounds, effective):
+                    found = existing
+                else:
+                    histogram_series[shard].insert(self.name, found)
             else:
                 histogram_series[shard].insert(self.name, found)
-        else:
-            histogram_series[shard].insert(self.name, found)
-        shard_mu[shard].unlock()
         return histogram_instrument(found)
 
     fn count() -> Int:

@@ -763,14 +763,14 @@ pub fn close_stmt(conn: Conn, stmt: Stmt) -> Bool!:
 # channel (already safe across tasks), so many green tasks can share one pool
 # without an outer lock, and the connect/close network i/o stays outside `mu`.
 pub struct Pool:
-    mut idle: List[Conn]
+    guard mu:
+        mut idle: List[Conn]
     host: String
     port: Int
     user: String
     password: String
     database: String
     max_open: Int
-    mu: Mutex
     slots: Channel[Bool]
 
 # create a pool that dials the given server. it opens connections lazily and
@@ -782,7 +782,7 @@ pub fn pool(host: String, port: Int, user: String, password: String, database: S
     while i < cap:
         slots.send(true)
         i = i + 1
-    return Pool(idle: [], host: host, port: port, user: user, password: password, database: database, max_open: cap, mu: Mutex(), slots: slots)
+    return Pool(idle: [], host: host, port: port, user: user, password: password, database: database, max_open: cap, slots: slots)
 
 # a pool must allow at least one connection.
 fn clamp_open(max_open: Int) -> Int:
@@ -797,13 +797,12 @@ impl Pool:
     # failed dial it hands the slot back so the cap does not leak.
     pub fn acquire() -> Conn!:
         self.slots.recv()
-        self.mu.lock()
-        n := self.idle.len()
         mut reused: Conn? := none
-        if n > 0:
-            reused = self.idle[n - 1]
-            self.idle = self.idle.slice(0, n - 1)
-        self.mu.unlock()
+        locked self.mu:
+            n := self.idle.len()
+            if n > 0:
+                reused = self.idle[n - 1]
+                self.idle = self.idle.slice(0, n - 1)
         if reused != none:
             return reused?
         fresh := connect(self.host, self.port, self.user, self.password, self.database)
@@ -817,11 +816,11 @@ impl Pool:
     # so an acquirer woken by that slot finds the connection waiting for it and
     # does not open a redundant one.
     pub fn release(conn: Conn):
-        self.mu.lock()
-        keep := self.idle.len() < self.max_open
-        if keep:
-            self.idle.push(conn)
-        self.mu.unlock()
+        mut keep := false
+        locked self.mu:
+            keep = self.idle.len() < self.max_open
+            if keep:
+                self.idle.push(conn)
         if not keep:
             conn.close()
         self.slots.send(true)
@@ -835,10 +834,10 @@ impl Pool:
 
     # close every idle connection.
     pub fn close():
-        self.mu.lock()
-        idle := self.idle
-        self.idle = []
-        self.mu.unlock()
+        mut idle: List[Conn] := []
+        locked self.mu:
+            idle = self.idle
+            self.idle = []
         for conn in idle:
             conn.close()
 

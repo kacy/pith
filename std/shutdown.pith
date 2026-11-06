@@ -65,16 +65,17 @@ pub DEFAULT_DRAIN_MS := 15000
 # state where a listener is closed but still registered, or the count is lost.
 # the tcp_close calls happen outside it — a syscall under a lock a connection
 # task also wants is how an accept loop and a request path deadlock.
-mut mu := Mutex()
-mut drain_deadline_ms := DEFAULT_DRAIN_MS
-mut requested_flag := false
-# when the first request() landed, on the monotonic clock. paired with the flag
-# rather than used as its own sentinel: the monotonic clock starts at 0, so a
-# drain requested in the first millisecond of the process would read as "never".
-mut requested_at_ms := 0
-mut listener_fds: List[Int] := []
-mut inflight_count := 0
-mut pending_flushes := 0
+guard mu:
+    mut drain_deadline_ms := DEFAULT_DRAIN_MS
+    mut requested_flag := false
+    # when the first request() landed, on the monotonic clock. paired with the
+    # flag rather than used as its own sentinel: the monotonic clock starts at
+    # 0, so a drain requested in the first millisecond of the process would
+    # read as "never".
+    mut requested_at_ms := 0
+    mut listener_fds: List[Int] := []
+    mut inflight_count := 0
+    mut pending_flushes := 0
 
 ## whether a graceful shutdown has been requested. an accept loop tests this to
 ## tell "the accept failed because we are shutting down" from "the accept failed
@@ -100,20 +101,20 @@ pub fn requested() -> Bool:
 ## harmless no-op.
 pub fn request():
     now := time.mono_millis()
-    mu.lock()
-    # the first request wins the clock: a second one must not push the stream
-    # deadline out and hand an endless stream another half grace period.
-    if not requested_flag:
-        requested_at_ms = now
-    requested_flag = true
     # snapshot under the lock, act outside it: a syscall while holding a lock a
     # connection task also wants is how an accept loop and a request path
     # deadlock. the registry is left intact — each listener is closed by the
     # loop that owns it.
     mut stopping: List[Int] := []
-    for fd in listener_fds:
-        stopping.push(fd)
-    mu.unlock()
+    locked mu:
+        # the first request wins the clock: a second one must not push the
+        # stream deadline out and hand an endless stream another half grace
+        # period.
+        if not requested_flag:
+            requested_at_ms = now
+        requested_flag = true
+        for fd in listener_fds:
+            stopping.push(fd)
     for fd in stopping:
         tcp_shutdown(fd)
 
@@ -292,11 +293,13 @@ pub fn drain_default() -> Int:
 ## status, and tear the connections down — all inside the deadline the
 ## orchestrator gave.
 pub fn stream_deadline() -> Int:
-    mu.lock()
-    requested := requested_flag
-    at := requested_at_ms
-    ms := drain_deadline_ms
-    mu.unlock()
+    mut requested := false
+    mut at := 0
+    mut ms := 0
+    locked mu:
+        requested = requested_flag
+        at = requested_at_ms
+        ms = drain_deadline_ms
     if not requested:
         return 0
     return at + ms / 2

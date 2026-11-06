@@ -378,12 +378,12 @@ impl KeySet:
 # text it read is still current. nothing changes a key set once it is stored
 # here, and `Cache.keys` gives callers their own copy, so tasks can share one.
 
-mut jwks_mu := Mutex()
-mut next_cache_handle := 1
-mut cached_document: Map[Int, String] := {}
-mut cached_at: Map[Int, Int] := {}
-mut parsed_keys: Map[Int, KeySet] := {}
-mut refreshed_at: Map[Int, Int] := {}
+guard jwks_mu:
+    mut next_cache_handle := 1
+    mut cached_document: Map[Int, String] := {}
+    mut cached_at: Map[Int, Int] := {}
+    mut parsed_keys: Map[Int, KeySet] := {}
+    mut refreshed_at: Map[Int, Int] := {}
 
 # a key set fetched from `url` and kept for a while. build one at startup and
 # share it: every verify goes through the same cached document, so an issuer
@@ -410,10 +410,10 @@ fn store_document(handle: Int, text: String):
 # it with keys of their own. http is allowed for a key set served by a
 # sidecar on the loopback interface, and for nothing else.
 pub fn cache(jwks_url: String) -> Cache:
-    jwks_mu.lock()
-    handle := next_cache_handle
-    next_cache_handle = next_cache_handle + 1
-    jwks_mu.unlock()
+    mut handle := 0
+    locked jwks_mu:
+        handle = next_cache_handle
+        next_cache_handle = next_cache_handle + 1
     return Cache(handle, jwks_url, DEFAULT_TTL, DEFAULT_TIMEOUT_MS, MAX_DOCUMENT_BYTES, DEFAULT_REFRESH_COOLDOWN)
 
 impl Cache:
@@ -499,12 +499,11 @@ impl Cache:
     # held across the fetch — a parked task holding this would stall every
     # other verify in the process behind one slow issuer.
     fn document(force: Bool) -> String!:
-        jwks_mu.lock()
-        now := time.unix()
         mut held := ""
-        if not force and cached_document.contains_key(self.handle) and now - cached_at[self.handle] < self.ttl_v:
-            held = cached_document[self.handle]
-        jwks_mu.unlock()
+        locked jwks_mu:
+            now := time.unix()
+            if not force and cached_document.contains_key(self.handle) and now - cached_at[self.handle] < self.ttl_v:
+                held = cached_document[self.handle]
         if held.len() > 0:
             return held
 
@@ -692,7 +691,8 @@ test "a cache keeps one parsed key set until the document changes":
     assert(first.has("ec-1"))
     # this read comes from the parsed set: swapping the text behind it without
     # going through store_document is not seen.
-    cached_document.insert(keys.handle, "not json")
+    locked jwks_mu:
+        cached_document.insert(keys.handle, "not json")
     assert(keys.keys()!.has("ec-1"))
 
     # new text replaces the set, and the old key is gone at once.
@@ -714,7 +714,8 @@ test "a cached key set does not outlive the document's ttl":
     keys := cache(UNREACHABLE_JWKS).timeout_ms(200)
     store_document(keys.handle, "{{\"keys\":[" + es256_key("ec-1") + "]}}")
     assert(keys.keys()!.has("ec-1"))
-    cached_at.insert(keys.handle, time.unix() - DEFAULT_TTL - 1)
+    locked jwks_mu:
+        cached_at.insert(keys.handle, time.unix() - DEFAULT_TTL - 1)
     # stale, so it has to fetch, and the issuer is not answering.
     assert(keys.keys().is_err)
 

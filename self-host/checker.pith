@@ -188,6 +188,15 @@ pub mut expression_type_cache: Map[Int, Int] := {}
 # use-site -> declaration-node map, recorded as identifiers and calls
 # resolve, so editor tooling can answer go-to-definition
 mut definition_of: Map[Int, Int] := {}
+
+# the mutex paths held at the statement being checked: the function's
+# `holding` paths first, then the `locked` blocks around the statement,
+# innermost last. a nested block on a path already here would deadlock, since
+# a mutex is not reentrant. a closure body starts its own list.
+mut locked_paths: List[String] := []
+
+# "<struct type id>.<field>" -> the sibling field naming its guard mutex
+mut struct_field_guards: Map[String, String] := {}
 # argument expressions the checker accepted by widening a plain value into
 # the optional its parameter declares (`f(3)` against `fn f(x: Int?)`).
 # the emitter has no view of a callee's declared parameter types once the
@@ -239,6 +248,8 @@ pub fn initialize_checker(file_path: String):
     suppress_unknown_type_for = {}
     expression_type_cache = {}
     definition_of = {}
+    struct_field_guards = {}
+    locked_paths = []
     optional_widened_arguments = {}
     open_empty_literal_bindings = {}
     module_aliases = {}
@@ -936,6 +947,9 @@ fn register_struct_declaration(node_idx: Int, node: Node):
         report_error_at(node_idx, "E250", "'" + name + "' is a builtin type name and cannot be used as a struct name")
         return
     if declaration_has_generic_params(node):
+        for child in node.children:
+            if get_node(child).kind == "field" and guard_of_value(get_node(child).value) != "":
+                report_error_at(node_idx, "E274", "a guard block is not allowed in a generic struct")
         register_generic_declaration(name, node_idx)
         define_binding_at(current_scope, name, TID_ERR, false, node_idx)
         return
@@ -960,6 +974,9 @@ fn register_struct_declaration(node_idx: Int, node: Node):
             fname := extract_field_name(cn.value)
             is_pub := cn.value.contains(" pub")
             is_mut := cn.value.contains(" mut")
+            field_guard := guard_of_value(cn.value)
+            if field_guard != "":
+                struct_field_guards.insert(tid.to_string() + "." + fname, field_guard)
             field_names.push(fname)
             if cn.children.len() > 0:
                 ftid := resolve_type_implementation(cn.children[0])
@@ -1777,7 +1794,7 @@ fn check_function_declaration(node: Node):
             note_fn_binding_name(pname, child)
             param_idx = param_idx + 1
         elif cn.kind == "body":
-            check_function_body(child, fn_scope)
+            check_body_holding(node, child, fn_scope)
 
 fn check_function_body(node_idx: Int, scope_id: Int):
     if c_module_global_names.len() > 0:
@@ -1986,7 +2003,7 @@ fn check_method_body(type_name: String, type_tid: Int, node_idx: Int, node: Node
             note_fn_binding_name(pname, child)
             param_idx = param_idx + 1
         elif cn.kind == "body":
-            check_function_body(child, method_scope)
+            check_body_holding(node, child, method_scope)
 
 # ---------------------------------------------------------------
 # pass 2 — test checking
@@ -2101,10 +2118,126 @@ fn defer_body_has_forbidden_node(idx: Int) -> Bool:
             return true
     return false
 
-# the mutex paths of the `locked` blocks around the statement being checked,
-# innermost last. a nested block on a path already here would deadlock, since
-# a mutex is not reentrant. a closure body starts its own list.
-mut locked_paths: List[String] := []
+# the mutex a guarded declaration names in its value ("x guard:mu mut"), or ""
+fn guard_of_value(value: String) -> String:
+    at := value.index_of(" guard:")
+    if at < 0:
+        return ""
+    rest := value.substring(at + 7, value.len())
+    sp := rest.index_of(" ")
+    if sp >= 0:
+        return rest.substring(0, sp)
+    return rest
+
+# whether a mutex path is held: the path itself, or for a guard that is a
+# list of mutexes, any element of it. module init runs before any task, so
+# code outside a function needs no lock.
+fn path_is_held(path: String, scope_id: Int) -> Bool:
+    if get_scope_return_type(scope_id) < 0:
+        return true
+    for held in locked_paths:
+        if held == path or held.starts_with(path + "["):
+            return true
+    return false
+
+fn require_held(at: Int, what: String, path: String, scope_id: Int):
+    if path_is_held(path, scope_id):
+        return
+    report_error_with_fix_at(at, "E271", what + ", which is not held here", "wrap the access in `locked " + path + ":`, or mark the function `holding " + path + "`")
+
+# a guarded field read through a path needs that path's guard field held:
+# `self.next` under `guard pick` needs `self.pick`.
+fn check_guarded_field(at: Int, base_idx: Int, field: String, guard: String, scope_id: Int):
+    if get_scope_return_type(scope_id) < 0:
+        return
+    base := locked_path_text(base_idx)
+    if base == "":
+        report_error_with_fix_at(at, "E271", "'" + field + "' is guarded by '" + guard + "', and the checker can only match the lock through a variable, self or a field path", "bind the value to a name first, then lock `name." + guard + "`")
+        return
+    require_held(at, "'" + base + "." + field + "' is guarded by " + base + "." + guard, base + "." + guard, scope_id)
+
+# the function's `holding` paths, checked as mutexes in its scope, become the
+# held set its body starts with
+fn check_body_holding(decl: Node, body_idx: Int, scope_id: Int):
+    saved := locked_paths
+    mut held: List[String] := []
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "holding":
+            for p in cn.children:
+                text := locked_path_text(p)
+                if text == "":
+                    report_error_at(p, "E272", "holding needs a variable or a field path that holds a Mutex")
+                else:
+                    t := c_check_expr(p, scope_id)
+                    if is_error_type(t) == false and not is_mutex_or_mutex_list(t):
+                        report_error_at(p, "E272", "holding needs a Mutex or a List[Mutex], got " + get_type_name(t))
+                    held.push(text)
+    locked_paths = held
+    check_function_body(body_idx, scope_id)
+    locked_paths = saved
+
+fn is_mutex_or_mutex_list(t: Int) -> Bool:
+    if get_type_name(t) == "Mutex":
+        return true
+    info := get_type_info(t)
+    return info.kind == "list" and get_type_name(info.inner) == "Mutex"
+
+# a call to a function declared `holding m` needs `m` held at the call. a
+# path rooted at `self` is read off the receiver, and one rooted at a
+# parameter off that argument.
+fn check_holding_call(call_idx: Int, def_key: Int, node: Node, scope_id: Int):
+    if definition_of.contains_key(def_key) == false:
+        return
+    decl_idx := definition_of[def_key]
+    decl := get_node(decl_idx)
+    if decl.kind != "fn_decl":
+        return
+    mut holding := 0 - 1
+    mut params: List[String] := []
+    for child in decl.children:
+        cn := get_node(child)
+        if cn.kind == "holding":
+            holding = child
+        elif cn.kind == "param":
+            params.push(extract_binding_name(cn.value))
+    if holding < 0:
+        return
+    # a method call carries its receiver first; a plain call its callee
+    mut args: List[Int] := []
+    mut receiver := 0 - 1
+    for child, i in node.children:
+        if i == 0:
+            if node.kind == "method_call":
+                receiver = child
+        else:
+            args.push(child)
+    for p in get_node(holding).children:
+        need := locked_path_text(p)
+        mut root := need
+        dot := need.index_of(".")
+        brk := need.index_of("[")
+        mut cut := need.len()
+        if dot >= 0:
+            cut = dot
+        if brk >= 0 and brk < cut:
+            cut = brk
+        root = need.substring(0, cut)
+        mut source := 0 - 1
+        if root == "self":
+            source = receiver
+        else:
+            for pname, pi in params:
+                if pname == root and pi < args.len():
+                    source = args[pi]
+        mut path := need
+        if source >= 0:
+            src := locked_path_text(source)
+            if src == "":
+                report_error_with_fix_at(call_idx, "E271", "'" + decl.value + "' is holding " + need + ", and the checker can only match that lock through a variable, self or a field path", "bind the value to a name first")
+                continue
+            path = src + need.substring(cut, need.len())
+        require_held(call_idx, "'" + decl.value + "' must be called holding " + path, path, scope_id)
 
 # `locked m: body` lowers to `m.lock()`, the body, and `m.unlock()` at every
 # exit, so the mutex expression is evaluated again at each exit. it must be a
@@ -3183,11 +3316,16 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "if_expr":
         return check_if_expression(node, scope_id)
     if node.kind == "call":
-        return check_function_call(node, scope_id)
+        call_tid := check_function_call(node, scope_id)
+        if node.children.len() > 0:
+            check_holding_call(node_idx, node.children[0], node, scope_id)
+        return call_tid
     if node.kind == "method_call":
-        return check_method_call(node, scope_id)
+        method_tid := check_method_call(node, scope_id)
+        check_holding_call(node_idx, node_idx, node, scope_id)
+        return method_tid
     if node.kind == "field_access":
-        return check_field_access_expression(node, scope_id)
+        return check_field_access_expression(node_idx, node, scope_id)
     if node.kind == "index":
         return check_index_expression(node, scope_id)
     if node.kind == "unwrap":
@@ -3203,7 +3341,13 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "match_expr":
         return check_match_expression(node_idx, scope_id)
     if node.kind == "lambda":
-        return check_lambda_expression(node, scope_id)
+        # a closure body runs whenever it is called, so the locks held where
+        # it is made say nothing about it
+        saved_locked := locked_paths
+        locked_paths = []
+        lambda_tid := check_lambda_expression(node, scope_id)
+        locked_paths = saved_locked
+        return lambda_tid
     if node.kind == "list":
         return check_list_expression(node, scope_id)
     if node.kind == "map":
@@ -3302,7 +3446,12 @@ fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
         # alias never answers a bare reference.
         owned_idx := lookup_binding_index_preferring(scope_id, name, current_checker_module_path, bare_name_import_sources(name))
         if owned_idx >= 0:
-            record_definition(node_idx, binding_decl_node_at(owned_idx))
+            decl_idx := binding_decl_node_at(owned_idx)
+            record_definition(node_idx, decl_idx)
+            if decl_idx >= 0:
+                guard := guard_of_value(get_node(decl_idx).value)
+                if guard != "" and get_node(decl_idx).kind == "binding":
+                    require_held(node_idx, "'" + name + "' is guarded by " + guard, guard, scope_id)
             return binding_type_at(owned_idx)
         # every binding of the name belongs to another module: it resolves
         # only through an import; the shared global scope would otherwise
@@ -6293,7 +6442,7 @@ fn expect_one_widened_argument(method: String, args: List[Int], expected: Int, s
 # field access
 # ---------------------------------------------------------------
 
-fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
+fn check_field_access_expression(node_idx: Int, node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
         return TID_ERR
     field_name := node.value
@@ -6337,6 +6486,9 @@ fn check_field_access_expression(node: Node, scope_id: Int) -> Int:
         mut fidx := 0
         while fidx < obj_info.fields.len():
             if strings_equal(obj_info.fields[fidx], field_name):
+                guard_key := obj_type.to_string() + "." + field_name
+                if struct_field_guards.contains_key(guard_key):
+                    check_guarded_field(node_idx, obj_node_idx, field_name, struct_field_guards[guard_key], scope_id)
                 if fidx < obj_info.field_types.len():
                     return obj_info.field_types[fidx]
                 return TID_ERR
@@ -7242,10 +7394,7 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
             block_scope := create_function_scope(lambda_scope, block_expect)
             saved_infer := lambda_inferred_return
             lambda_inferred_return = 0 - 1
-            saved_locked := locked_paths
-            locked_paths = []
             check_block_statement(body_node, block_scope)
-            locked_paths = saved_locked
             if declared_return >= 0:
                 ret_type = declared_return
             elif lambda_inferred_return >= 0:
@@ -7935,7 +8084,7 @@ fn walk_specialized_body(decl_idx: Int, decl_node: Node, self_tid: Int, param_ty
             note_fn_binding_name(pname, child)
             param_idx = param_idx + 1
         elif cn.kind == "body":
-            check_function_body(child, fn_scope)
+            check_body_holding(decl_node, child, fn_scope)
 
 ## walk a generic function's body, or a generic method's, with the method's
 ## own type parameters resolving to `concrete_tids`. `self_tid` is the owner

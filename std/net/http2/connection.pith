@@ -801,8 +801,8 @@ pub fn open_url(url_string: String) -> Client!:
 # a throughput gain; close() shuts every connection down.
 pub struct Pool:
     clients: List[Client]
-    mut next: Int
-    pick: Mutex
+    guard pick:
+        mut next: Int
 
 impl Pool:
     # the index of the next connection, round-robin, safe across concurrent callers.
@@ -839,7 +839,7 @@ pub fn open_pool(host: String, port: Int, n: Int) -> Pool!:
     while i < n:
         clients.push(open(host, port)!)
         i = i + 1
-    return Pool(clients: clients, next: 0, pick: Mutex())
+    return Pool(clients: clients, next: 0)
 
 # like open_pool but dialing each connection with the caller's tls `config`
 # (which must offer alpn "h2") — e.g. one trusting a private ca.
@@ -849,7 +849,7 @@ pub fn open_pool_with_config(host: String, port: Int, n: Int, config: tls.Config
     while i < n:
         clients.push(open_with_config(host, port, config)!)
         i = i + 1
-    return Pool(clients: clients, next: 0, pick: Mutex())
+    return Pool(clients: clients, next: 0)
 
 # drop `target` from an id list, returning the remaining ids.
 fn list_remove_int(items: List[Int], target: Int) -> List[Int]:

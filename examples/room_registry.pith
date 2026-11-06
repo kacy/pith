@@ -25,10 +25,10 @@ struct Room:
     name: String
     members: List[String]
 
-# the registry, and the lock that guards it. every read and every write of
-# `rooms` happens between a lock() and an unlock().
-mut rooms: Map[String, Room] := {}
-mut rooms_mu := Mutex()
+# the registry, and the lock that guards it. `rooms` is in the guard block,
+# so the compiler refuses any read or write of it outside `locked rooms_mu:`.
+guard rooms_mu:
+    mut rooms: Map[String, Room] := {}
 
 # a counter several tasks bump. it is deliberately not under rooms_mu: an
 # atomic needs no lock, so counting a join does not serialise against a

@@ -1174,8 +1174,8 @@ test "bidi reader deframes several echoed messages in order":
 # for a throughput gain. close() shuts every channel down.
 pub struct PoolConn:
     conns: List[Conn]
-    mut next: Int
-    pick: Mutex
+    guard pick:
+        mut next: Int
 
 impl PoolConn:
     # the index of the next channel, round-robin, safe across concurrent callers.
@@ -1225,7 +1225,7 @@ pub fn dial_pool(host: String, port: Int, n: Int) -> PoolConn!:
     while i < n:
         conns.push(dial(host, port)!)
         i = i + 1
-    return PoolConn(conns: conns, next: 0, pick: Mutex())
+    return PoolConn(conns: conns, next: 0)
 
 # like dial_pool but dialing each channel with the caller's tls `config` (which
 # must offer alpn "h2") — e.g. one trusting a private ca.
@@ -1235,7 +1235,7 @@ pub fn dial_pool_with_config(host: String, port: Int, n: Int, config: tls.Config
     while i < n:
         conns.push(dial_with_config(host, port, config)!)
         i = i + 1
-    return PoolConn(conns: conns, next: 0, pick: Mutex())
+    return PoolConn(conns: conns, next: 0)
 
 # --- server ---
 #
@@ -1810,10 +1810,10 @@ impl GrpcStream:
 # path only — the buffered serve paths hand back a whole response and cannot be
 # endless.
 
-mut live_mu := Mutex()
-mut live_streams: Map[Int, GrpcStream] := {}
-mut next_live_id := 0
-mut closed_by_shutdown := 0
+guard live_mu:
+    mut live_streams: Map[Int, GrpcStream] := {}
+    mut next_live_id := 0
+    mut closed_by_shutdown := 0
 mut stream_watch_started := false
 
 ## how many rpcs a graceful shutdown had to close because their handler did not.
@@ -1847,14 +1847,13 @@ fn forget_live_stream(id: Int):
 # lock keeps a send that blocks on a flow-control window from wedging the
 # handlers still trying to register and release.
 fn close_live_streams(status: Int, message: String) -> Int:
-    live_mu.lock()
     mut doomed: List[GrpcStream] := []
-    for id in live_streams.keys():
-        doomed.push(live_streams[id])
-    empty: Map[Int, GrpcStream] := {}
-    live_streams = empty
-    closed_by_shutdown = closed_by_shutdown + doomed.len()
-    live_mu.unlock()
+    locked live_mu:
+        for id in live_streams.keys():
+            doomed.push(live_streams[id])
+        empty: Map[Int, GrpcStream] := {}
+        live_streams = empty
+        closed_by_shutdown = closed_by_shutdown + doomed.len()
     for call in doomed:
         call.finish(status, message)
     return doomed.len()

@@ -4894,8 +4894,8 @@ impl TlsClientConn:
 
 # the idle connections of a client, by origin.
 struct ConnPool:
-    mut idle: Map[String, List[WireConn]]
-    mu: Mutex
+    guard mu:
+        mut idle: Map[String, List[WireConn]]
 
 # an http/1.1 client in the shape of net/http's Client and Transport: it keeps
 # connections alive and reuses them per origin, follows redirects, and bounds
@@ -5001,7 +5001,7 @@ DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS := 1000
 # origin kept for 90 seconds, up to 10 redirects, gzip asked for and decoded,
 # and a 1 second wait for 100 Continue.
 pub fn client() -> Client:
-    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, true, DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS, "", false, no_tls_config(), MAX_RESPONSE_HEADER_BYTES, MAX_RESPONSE_BODY, ConnPool({}, Mutex()))
+    return Client(0, 0, 0, DEFAULT_MAX_IDLE_CONNS_PER_HOST, DEFAULT_IDLE_CONN_TIMEOUT_MS, DEFAULT_MAX_REDIRECTS, true, true, DEFAULT_EXPECT_CONTINUE_TIMEOUT_MS, "", false, no_tls_config(), MAX_RESPONSE_HEADER_BYTES, MAX_RESPONSE_BODY, ConnPool({}))
 
 # a request for `method` and an absolute http or https url, as net/http's
 # NewRequest builds one.
@@ -5286,10 +5286,10 @@ impl Client:
 
     # close every idle connection. connections in use are not touched.
     fn close_idle_connections():
-        self.pool.mu.lock()
-        idle := self.pool.idle
-        self.pool.idle = {}
-        self.pool.mu.unlock()
+        mut idle: Map[String, List[WireConn]] := {}
+        locked self.pool.mu:
+            idle = self.pool.idle
+            self.pool.idle = {}
         for key in idle:
             for c in idle[key]:
                 wire_close(c)
@@ -5458,17 +5458,16 @@ impl Client:
     fn conn_for(req: ClientRequest, route: ClientRoute, deadline: Int) -> WireConn!:
         key := route.key
         while true:
-            self.pool.mu.lock()
             mut found := false
             mut c := WireConn(TcpStream(0), BufferedBytesReader(0), BufferedBytesWriter(0), tls.Conn(0), false, key, 0, false)
-            if self.pool.idle.contains_key(key):
-                list := self.pool.idle[key]
-                n := list.len()
-                if n > 0:
-                    c = list[n - 1]
-                    list.remove(n - 1)
-                    found = true
-            self.pool.mu.unlock()
+            locked self.pool.mu:
+                if self.pool.idle.contains_key(key):
+                    list := self.pool.idle[key]
+                    n := list.len()
+                    if n > 0:
+                        c = list[n - 1]
+                        list.remove(n - 1)
+                        found = true
             if not found:
                 return self.dial(req, route, deadline)
             if idle_conn_usable(c, self.idle_conn_timeout_ms):
@@ -5549,15 +5548,15 @@ impl Client:
             c.writer.free()
             idle = WireConn(c.stream, BufferedBytesReader(0), BufferedBytesWriter(0), c.tls_conn, false, c.key, 0, false)
         idle.idle_since = time_mod.mono_millis()
-        self.pool.mu.lock()
-        mut list: List[WireConn] := []
-        if self.pool.idle.contains_key(c.key):
-            list = self.pool.idle[c.key]
-        keep := list.len() < self.max_idle_conns_per_host
-        if keep:
-            list.push(idle)
-            self.pool.idle[c.key] = list
-        self.pool.mu.unlock()
+        mut keep := false
+        locked self.pool.mu:
+            mut list: List[WireConn] := []
+            if self.pool.idle.contains_key(c.key):
+                list = self.pool.idle[c.key]
+            keep = list.len() < self.max_idle_conns_per_host
+            if keep:
+                list.push(idle)
+                self.pool.idle[c.key] = list
         if not keep:
             wire_close(idle)
 

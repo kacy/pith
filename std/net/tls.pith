@@ -243,11 +243,6 @@ struct CachedSession:
     peer_certificates: List[PeerCertificate]
     expires_at_ms: Int
 
-mut native_server_session_tickets: Map[String, SessionTicketEntry] := {}
-mut native_client_session_cache: Map[String, CachedSession] := {}
-mut native_server_session_ticket_order: List[String] := []
-mut native_client_session_cache_order: List[String] := []
-
 # one lock covers all four session stores above. each map moves together with
 # its lru order list, so any access has to hold the lock for the whole
 # operation, not just the map half. concurrent handshakes are the normal case:
@@ -260,7 +255,11 @@ mut native_client_session_cache_order: List[String] := []
 # the mutex is not reentrant: relocking from the holder deadlocks. helpers that
 # expect the lock to be held already carry a _locked suffix and must never call
 # back into the locking wrappers.
-mut native_session_mu := Mutex()
+guard native_session_mu:
+    mut native_server_session_tickets: Map[String, SessionTicketEntry] := {}
+    mut native_client_session_cache: Map[String, CachedSession] := {}
+    mut native_server_session_ticket_order: List[String] := []
+    mut native_client_session_cache_order: List[String] := []
 
 # A reusable TLS configuration (roots, certificates, ALPN, verification hooks).
 # A config is a handle into a registry; build it, hand it to dial/listen as many
@@ -339,8 +338,8 @@ struct NativeConnState:
 # samples waiting on that lock. a handle always maps to the same shard, and no
 # path holds two shard locks.
 NATIVE_CONN_SHARDS := 16
-mut native_conn_mus: List[Mutex] := [Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex(), Mutex()]
-mut native_conn_shards: List[Map[Int, NativeConnState]] := [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]
+guard native_conn_mus[16]:
+    mut native_conn_shards: List[Map[Int, NativeConnState]] := [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]
 
 # a garbage handle can be negative, and must still name a shard (where it is
 # then not found) rather than index off the list.
@@ -1067,17 +1066,17 @@ fn cached_session_expired(entry: CachedSession) -> Bool:
 # helpers below them take it. code that needs several store operations to be
 # atomic (a lookup that also evicts, say) locks once and uses the _locked forms.
 
-fn forget_server_ticket_locked(ticket_key: String):
+fn forget_server_ticket_locked(ticket_key: String) holding native_session_mu:
     if native_server_session_tickets.contains_key(ticket_key):
         native_server_session_tickets.remove(ticket_key)
     native_server_session_ticket_order = drop_key(native_server_session_ticket_order, ticket_key)
 
-fn forget_client_cached_session_locked(cache_key: String):
+fn forget_client_cached_session_locked(cache_key: String) holding native_session_mu:
     if native_client_session_cache.contains_key(cache_key):
         native_client_session_cache.remove(cache_key)
     native_client_session_cache_order = drop_key(native_client_session_cache_order, cache_key)
 
-fn remember_server_ticket_locked(ticket_key: String, entry: SessionTicketEntry):
+fn remember_server_ticket_locked(ticket_key: String, entry: SessionTicketEntry) holding native_session_mu:
     forget_server_ticket_locked(ticket_key)
     native_server_session_tickets.insert(ticket_key, entry)
     native_server_session_ticket_order.push(ticket_key)
@@ -1087,12 +1086,12 @@ fn remember_server_ticket_locked(ticket_key: String, entry: SessionTicketEntry):
         if native_server_session_tickets.contains_key(oldest):
             native_server_session_tickets.remove(oldest)
 
-fn touch_server_ticket_locked(ticket_key: String):
+fn touch_server_ticket_locked(ticket_key: String) holding native_session_mu:
     if native_server_session_tickets.contains_key(ticket_key):
         native_server_session_ticket_order = drop_key(native_server_session_ticket_order, ticket_key)
         native_server_session_ticket_order.push(ticket_key)
 
-fn remember_client_cached_session_locked(cache_key: String, session: CachedSession):
+fn remember_client_cached_session_locked(cache_key: String, session: CachedSession) holding native_session_mu:
     forget_client_cached_session_locked(cache_key)
     native_client_session_cache.insert(cache_key, session)
     native_client_session_cache_order.push(cache_key)
@@ -1102,7 +1101,7 @@ fn remember_client_cached_session_locked(cache_key: String, session: CachedSessi
         if native_client_session_cache.contains_key(oldest):
             native_client_session_cache.remove(oldest)
 
-fn touch_client_cached_session_locked(cache_key: String):
+fn touch_client_cached_session_locked(cache_key: String) holding native_session_mu:
     if native_client_session_cache.contains_key(cache_key):
         native_client_session_cache_order = drop_key(native_client_session_cache_order, cache_key)
         native_client_session_cache_order.push(cache_key)
@@ -3825,18 +3824,19 @@ test "tls helper names cover current protocol values":
     assert_eq(cipher_suite_name(TLS_CIPHER_CHACHA20_POLY1305_SHA256), "TLS_CHACHA20_POLY1305_SHA256")
     assert_eq(cipher_suite_name(0), "unknown")
 
-# the test runner forks a fresh single-threaded process per test, so resetting
-# and reading the stores directly is safe here; the mutating helpers under test
-# still take native_session_mu, so the lock/unlock pairing is exercised too.
+# the test resets and reads the stores directly, under native_session_mu like
+# every other access; the helpers under test take it themselves in between.
 test "tls cache helpers evict oldest and expire entries":
-    native_client_session_cache = {}
-    native_client_session_cache_order = []
-    native_server_session_tickets = {}
-    native_server_session_ticket_order = []
+    locked native_session_mu:
+        native_client_session_cache = {}
+        native_client_session_cache_order = []
+        native_server_session_tickets = {}
+        native_server_session_ticket_order = []
 
     remember_client_cached_session("first", cached_session_from_peer(bytes.from_string_utf8("a"), bytes.from_string_utf8("psk-a"), TLS_CIPHER_AES_128_GCM_SHA256, "pith", empty_peer_identity(), time.now() - 1))
-    assert(native_client_session_cache.contains_key("first"))
-    assert(cached_session_expired(native_client_session_cache["first"]))
+    locked native_session_mu:
+        assert(native_client_session_cache.contains_key("first"))
+        assert(cached_session_expired(native_client_session_cache["first"]))
     forget_client_cached_session("first")
 
     mut i := 0
@@ -3846,12 +3846,14 @@ test "tls cache helpers evict oldest and expire entries":
         i = i + 1
     touch_client_cached_session("client-1")
     remember_client_cached_session("client-extra", cached_session_from_peer(bytes.from_string_utf8("extra"), bytes.from_string_utf8("psk"), TLS_CIPHER_AES_128_GCM_SHA256, "pith", empty_peer_identity(), time.now() + 1000))
-    assert_eq(native_client_session_cache_order.len(), TLS_MAX_CLIENT_SESSION_CACHE)
-    assert(not native_client_session_cache.contains_key("client-2"))
-    assert(native_client_session_cache.contains_key("client-1"))
+    locked native_session_mu:
+        assert_eq(native_client_session_cache_order.len(), TLS_MAX_CLIENT_SESSION_CACHE)
+        assert(not native_client_session_cache.contains_key("client-2"))
+        assert(native_client_session_cache.contains_key("client-1"))
 
     remember_server_ticket("expired", SessionTicketEntry(1, TLS_CIPHER_AES_128_GCM_SHA256, bytes.from_string_utf8("psk"), "pith", time.now() - 1000, 1))
-    assert(session_ticket_expired(native_server_session_tickets["expired"]))
+    locked native_session_mu:
+        assert(session_ticket_expired(native_server_session_tickets["expired"]))
     forget_server_ticket("expired")
 
     i = 0
@@ -3861,9 +3863,10 @@ test "tls cache helpers evict oldest and expire entries":
         i = i + 1
     touch_server_ticket("server-1")
     remember_server_ticket("server-extra", SessionTicketEntry(1, TLS_CIPHER_AES_128_GCM_SHA256, bytes.from_string_utf8("psk"), "pith", time.now(), 1000))
-    assert_eq(native_server_session_ticket_order.len(), TLS_MAX_SERVER_SESSION_TICKETS)
-    assert(not native_server_session_tickets.contains_key("server-2"))
-    assert(native_server_session_tickets.contains_key("server-1"))
+    locked native_session_mu:
+        assert_eq(native_server_session_ticket_order.len(), TLS_MAX_SERVER_SESSION_TICKETS)
+        assert(not native_server_session_tickets.contains_key("server-2"))
+        assert(native_server_session_tickets.contains_key("server-1"))
 
 test "server signature scheme selection honours the client's offer and version":
     # rsa: 1.2 accepts pkcs1; 1.3 restricts to pss.
@@ -3968,18 +3971,21 @@ test "a refused client chain answers with the alert that names the failure":
     assert(x509.verify_client_chain([good], roots).ok)
 
 test "tls resumable session lookup drops expired entries and refreshes lru":
-    native_client_session_cache = {}
-    native_client_session_cache_order = []
+    locked native_session_mu:
+        native_client_session_cache = {}
+        native_client_session_cache_order = []
 
     assert_eq(lookup_resumable_client_session("missing").ticket.len(), 0)
 
     remember_client_cached_session("stale", cached_session_from_peer(bytes.from_string_utf8("old"), bytes.from_string_utf8("psk"), TLS_CIPHER_AES_128_GCM_SHA256, "pith", empty_peer_identity(), time.now() - 1))
     assert_eq(lookup_resumable_client_session("stale").ticket.len(), 0)
-    assert(not native_client_session_cache.contains_key("stale"))
-    assert_eq(native_client_session_cache_order.len(), 0)
+    locked native_session_mu:
+        assert(not native_client_session_cache.contains_key("stale"))
+        assert_eq(native_client_session_cache_order.len(), 0)
 
     remember_client_cached_session("front", cached_session_from_peer(bytes.from_string_utf8("f"), bytes.from_string_utf8("psk"), TLS_CIPHER_AES_128_GCM_SHA256, "pith", empty_peer_identity(), time.now() + 1000))
     remember_client_cached_session("back", cached_session_from_peer(bytes.from_string_utf8("b"), bytes.from_string_utf8("psk"), TLS_CIPHER_AES_128_GCM_SHA256, "pith", empty_peer_identity(), time.now() + 1000))
     found := lookup_resumable_client_session("front")
     assert_eq(found.ticket.to_string_utf8()!, "f")
-    assert_eq(native_client_session_cache_order[native_client_session_cache_order.len() - 1], "front")
+    locked native_session_mu:
+        assert_eq(native_client_session_cache_order[native_client_session_cache_order.len() - 1], "front")

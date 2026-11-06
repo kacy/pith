@@ -5,7 +5,7 @@
 # a small command-line wrapper around them.
 
 from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr
-from ast import add_node, add_node_with_type_args, add_leaf, get_node
+from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value
 from errors import Diagnostic
 
 # ---------------------------------------------------------------
@@ -1804,7 +1804,10 @@ pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
         skip_newlines()
         if not check("eof"):
             before := current_token_position
-            decls.push(parse_top_level_decl())
+            if at_guard_block():
+                parse_module_guard_block(decls)
+            else:
+                decls.push(parse_top_level_decl())
             if current_token_position == before:
                 parser_report_error_here("E242", "parser stalled at top level", "")
                 decls.push(add_leaf_with_position("error", "parser stalled at top level"))
@@ -1875,6 +1878,105 @@ fn parse_dotted_path() -> String:
         next := expect("identifier")
         path = path + "." + next.value
     return path
+
+# `guard name:` or `guard name[n]:` opens a guard block. `guard` is a keyword
+# only here, before a name and a colon or a bracket, so it stays usable as a
+# name everywhere else.
+fn at_guard_block() -> Bool:
+    if _cur_tok_kind() != "identifier" or _cur_tok_value() != "guard":
+        return false
+    if _peek_ahead_kind(1) != "identifier":
+        return false
+    after := _peek_ahead_kind(2)
+    return after == "colon" or after == "lbracket"
+
+# a guarded declaration carries its mutex in its value, after the name and
+# before the modifiers: "cached guard:jwks_mu mut". every reader of the value
+# takes the name up to the first space and the modifiers by " mut", " pub" and
+# " weak", so the marker reads as neither, and it moves with the node when
+# the language server relocates a tree.
+fn mark_guarded(idx: Int, guard: String):
+    value := get_node(idx).value
+    mut name := value
+    mut rest := ""
+    sp := value.index_of(" ")
+    if sp >= 0:
+        name = value.substring(0, sp)
+        rest = value.substring(sp, value.len())
+    set_node_value(idx, name + " guard:" + guard + rest)
+
+fn mutex_call_at(line: Int, col: Int) -> Int:
+    mut callee: List[Int] := [add_leaf("ident", "Mutex", line, col)]
+    return add_node("call", "", callee, line, col)
+
+# a module guard block declares its mutex and the globals it protects, and
+# lands as flat declarations: `name := Mutex()` (or a list of n of them for
+# `guard name[n]:`) and then each global, marked with the guard. a guarded
+# global is private to its module, since no other module can name the mutex.
+fn parse_module_guard_block(decls: List[Int]):
+    advance_token()
+    name_tok := expect("identifier")
+    line := name_tok.current_line
+    col := name_tok.current_column
+    mut count := 0 - 1
+    if match_tok("lbracket"):
+        count_tok := expect("int_lit")
+        count = parse_guard_count(count_tok.value)
+        if count < 1:
+            parser_report_error_at(count_tok.current_line, count_tok.current_column, "E274", "a sharded guard needs a count of at least 1", "write the number of mutexes: `guard " + name_tok.value + "[8]:`")
+            count = 1
+        expect("rbracket")
+    expect("colon")
+    mut mutex := 0
+    if count < 0:
+        mutex = mutex_call_at(line, col)
+    else:
+        mut items: List[Int] := []
+        mut i := 0
+        while i < count:
+            items.push(mutex_call_at(line, col))
+            i = i + 1
+        mutex = add_node("list", "", items, line, col)
+    mut mutex_children: List[Int] := [mutex]
+    decls.push(add_node("binding", name_tok.value, mutex_children, line, col))
+    expect("newline")
+    expect("indent")
+    while not check("dedent") and not check("eof"):
+        before := current_token_position
+        if check("kw_pub"):
+            guard_error_here("a guarded global cannot be pub, since another module could not take its mutex", "export a function that takes the lock instead")
+            advance_token()
+        if check("kw_mut"):
+            b := parse_binding()
+            mark_guarded(b, name_tok.value)
+            decls.push(b)
+        else:
+            guard_error_here("a guard block holds only `mut` globals", "declare the global with mut, or move it out of the guard block")
+            skip_to_line_end()
+        if current_token_position == before:
+            advance_token()
+        skip_newlines()
+    expect("dedent")
+
+fn parse_guard_count(text: String) -> Int:
+    mut n := 0
+    mut i := 0
+    while i < text.len():
+        c := ord(text[i])
+        if c < 48 or c > 57:
+            return 0 - 1
+        n = n * 10 + c - 48
+        i = i + 1
+    return n
+
+# an E274 at the token about to be read, which is the one at fault
+fn guard_error_here(message: String, fix: String):
+    at := position_from_mark(current_token_position)
+    parser_report_error_at(at.0, at.1, "E274", message, fix)
+
+fn skip_to_line_end():
+    while not check("newline") and not check("eof") and not check("dedent"):
+        advance_token()
 
 fn parse_top_level_decl() -> Int:
     mut is_pub := false
@@ -1949,9 +2051,10 @@ fn parse_fn_decl() -> Int:
         ret_node = add_node_with_position("returns", "", ret_children)
 
     parse_optional_where_clause(generics, name_tok.value)
+    holding_node := parse_optional_holding()
 
     # the child layout the checker and emitter walk: generics, params,
-    # returns (when present), then the body.
+    # returns (when present), holding (when present), then the body.
     mut children: List[Int] := []
     for g in generics:
         children.push(g)
@@ -1959,6 +2062,8 @@ fn parse_fn_decl() -> Int:
         children.push(p)
     if ret_node >= 0:
         children.push(ret_node)
+    if holding_node >= 0:
+        children.push(holding_node)
 
     expect("colon")
     body := parse_block()
@@ -1966,6 +2071,18 @@ fn parse_fn_decl() -> Int:
     children.push(add_node_with_position("body", "", body_children))
 
     return add_node_with_position("fn_decl", name_tok.value, children)
+
+# `holding m, self.pick` after a signature: the mutexes a caller must hold.
+# a contextual keyword, like `where`. the node's children are the mutex
+# paths, or -1 when the signature has none.
+fn parse_optional_holding() -> Int:
+    if check("identifier") == false or _cur_tok_value() != "holding":
+        return 0 - 1
+    advance_token()
+    mut paths: List[Int] := [parse_expression()]
+    while match_tok("comma"):
+        paths.push(parse_expression())
+    return add_node_with_position("holding", "", paths)
 
 # `where T: Bound + Bound, U: Bound` — the clause spelling of generic
 # bounds, shared by function declarations and interface member signatures.
@@ -2116,16 +2233,51 @@ fn parse_struct_decl() -> Int:
     # store generic_param nodes so checker can access bounds
     for g in generics:
         children.push(g)
+    # a guard block's mutex becomes the struct's last field, defaulting to a
+    # fresh Mutex(), so a constructor call leaves it out
+    mut guard_fields: List[Int] := []
     while not check("dedent") and not check("eof"):
         before := current_token_position
-        children.push(parse_struct_field())
+        if at_guard_block():
+            parse_struct_guard_block(children, guard_fields)
+        else:
+            children.push(parse_struct_field())
         if current_token_position == before:
             children.push(add_leaf_with_position("error", "parser stalled in struct"))
             advance_token()
         skip_newlines()
     expect("dedent")
+    for g in guard_fields:
+        children.push(g)
 
     return add_node_with_position("struct_decl", name_tok.value, children)
+
+# `guard name:` inside a struct: the fields under it are marked with the
+# guard, and a `name: Mutex = Mutex()` field is queued for the end.
+fn parse_struct_guard_block(children: List[Int], guard_fields: List[Int]):
+    advance_token()
+    name_tok := expect("identifier")
+    line := name_tok.current_line
+    col := name_tok.current_column
+    if check("lbracket"):
+        guard_error_here("a sharded guard is only allowed on module globals", "use one mutex per struct value: `guard " + name_tok.value + ":`")
+        while not check("rbracket") and not check("newline") and not check("eof"):
+            advance_token()
+        match_tok("rbracket")
+    expect("colon")
+    mut field_children: List[Int] := [add_leaf("type", "Mutex", line, col), mutex_call_at(line, col)]
+    guard_fields.push(add_node("field", name_tok.value, field_children, line, col))
+    expect("newline")
+    expect("indent")
+    while not check("dedent") and not check("eof"):
+        before := current_token_position
+        f := parse_struct_field()
+        mark_guarded(f, name_tok.value)
+        children.push(f)
+        if current_token_position == before:
+            advance_token()
+        skip_newlines()
+    expect("dedent")
 
 fn parse_struct_field() -> Int:
     mut modifiers := ""

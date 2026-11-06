@@ -1,0 +1,63 @@
+# a guard block declares a mutex and the data it protects. module globals
+# under `guard m:` are reached inside `locked m:` or in a function marked
+# `holding m`; struct fields under `guard pick:` the same way through
+# `self.pick` or any other path to the value. `guard m[n]:` declares n
+# mutexes, and holding any of them reaches the data under it.
+guard counts_mu:
+    mut total: Int := 0
+    mut by_task: Map[Int, Int] := {}
+
+guard shard_mu[4]:
+    mut shard_hits: List[Int] := [0, 0, 0, 0]
+
+struct Pool:
+    size: Int
+    guard pick:
+        next: Int
+
+impl Pool:
+    fn choose() -> Int:
+        locked self.pick:
+            i := self.next
+            self.advance()
+            return i
+
+    fn advance() holding self.pick:
+        self.next = (self.next + 1) % self.size
+
+fn record(task: Int) holding counts_mu:
+    total = total + 1
+    by_task.insert(task, by_task.get(task).unwrap_or(0) + 1)
+
+fn work(task: Int, n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        locked counts_mu:
+            record(task)
+        k := i % 4
+        locked shard_mu[k]:
+            shard_hits[k] = shard_hits[k] + 1
+        i = i + 1
+    return n
+
+# `guard` and `holding` stay ordinary names everywhere else
+fn names(guard: Int) -> Int:
+    holding := guard + 1
+    return holding
+
+fn main():
+    mut tasks: List[Task[Int]] := []
+    mut t := 0
+    while t < 8:
+        tasks.push(spawn work(t, 1000))
+        t = t + 1
+    for task in tasks:
+        await task
+    locked counts_mu:
+        print("total {total}, tasks {by_task.len()}, task 3 {by_task[3]}")
+    locked shard_mu[0]:
+        print("shards {shard_hits[0]} {shard_hits[1]} {shard_hits[2]} {shard_hits[3]}")
+    # the constructor leaves out the guard's mutex, which defaults to a new one
+    p := Pool(3, 0)
+    print("picks {p.choose()} {p.choose()} {p.choose()} {p.choose()}")
+    print("names {names(4)}")

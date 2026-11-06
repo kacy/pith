@@ -245,6 +245,34 @@ must be a variable, a field, or a list element indexed by a variable or a
 literal, and the block may not change it (E272). a `locked` block inside
 another one on the same mutex is a deadlock and a compile error (E273).
 
+a `guard` block ties the mutex to the data it protects, and the checker
+then refuses any access to that data without the lock (E271):
+
+```pith
+guard rooms_mu:
+    mut rooms: Map[String, Room] := {}
+
+fn join(name: String, member: String):
+    locked rooms_mu:
+        add_member(name, member)
+
+fn add_member(name: String, member: String) holding rooms_mu:
+    room := rooms.get(name).unwrap_or(Room(name, []))
+    room.members.push(member)
+    rooms[name] = room
+```
+
+the block declares `rooms_mu` as a `Mutex` and `rooms` as an ordinary module
+global, private to the module. a function marked `holding rooms_mu` may touch
+`rooms`, and every call to it must hold the mutex. in a struct, `guard pick:`
+adds a `pick` mutex field after the others, defaulting to a new one, so a
+constructor call leaves it out; the fields under it are reached through
+`locked p.pick:`, or `locked self.pick:` in a method.
+
+`guard shard_mu[8]:` declares a list of eight mutexes, for state split into
+shards. holding any element of the list reaches the data under it, since the
+checker does not track which index is which.
+
 `rooms_mu.lock()` and `rooms_mu.unlock()` are still there for a lock that
 has to be released partway through and taken again, as `std.crypto.jwks`
 does around a key fetch. `locked` is a keyword only at the head of a block,

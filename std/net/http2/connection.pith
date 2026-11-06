@@ -576,12 +576,13 @@ MODE_PROMOTING := 1
 MODE_THREADED := 2
 
 # a multiplexed http/2 client over one connection. many request() calls share
-# it. the mutex guards the stream table, the id counter, the closed/going-away
-# flags, and the last stream the peer promised to serve; the channels are
-# already safe to use across tasks. `active` mirrors the stream-table keys as an
-# ordered List[Int]: many call sites iterate it, and it keeps a deterministic
-# order that keys() does not promise. replacing it with keys() has not been
-# measured.
+# it. `mu` guards the fields in its guard block: the stream table and the maps
+# beside it, the id counter, the going-away state, the peer's settings, and the
+# send windows. the checker holds every access to them to the lock. the
+# channels and the atomics are already safe to use across tasks. `active`
+# mirrors the stream-table keys as an ordered List[Int]: many call sites iterate
+# it, and it keeps a deterministic order that keys() does not promise. replacing
+# it with keys() has not been measured.
 #
 # --- the inline fast-path ---
 #
@@ -623,48 +624,51 @@ MODE_THREADED := 2
 # before the transport drops.
 pub struct Client:
     conn: Connection
-    mu: Mutex
-    mut next_stream_id: Int
-    streams: Map[Int, Channel[StreamEvent]]
-    mut active: List[Int]
-    # the ids of streams the reader should coalesce: a unary request()/get() marks
-    # its stream here so the reader batches its three response frames into one
-    # STREAM_UNARY event. a streaming stream is never marked, so its events flow
-    # incrementally. presence means unary; removed when the stream is forgotten.
-    unary: Map[Int, Bool]
-    # streams whose terminal event (end-of-stream or reset) the reader has
-    # delivered. Stream.close() consults it: a finished stream is only
-    # forgotten, while an unfinished one is reset on the wire first. entries
-    # leave in forget().
-    finished: Map[Int, Bool]
+    guard mu:
+        mut next_stream_id: Int
+        streams: Map[Int, Channel[StreamEvent]]
+        mut active: List[Int]
+        # the ids of streams the reader should coalesce: a unary request()/get() marks
+        # its stream here so the reader batches its three response frames into one
+        # STREAM_UNARY event. a streaming stream is never marked, so its events flow
+        # incrementally. presence means unary; removed when the stream is forgotten.
+        unary: Map[Int, Bool]
+        # streams whose terminal event (end-of-stream or reset) the reader has
+        # delivered. Stream.close() consults it: a finished stream is only
+        # forgotten, while an unfinished one is reset on the wire first. entries
+        # leave in forget().
+        finished: Map[Int, Bool]
+        mut going_away: Bool
+        mut last_peer_stream: Int
+        # the peer's SETTINGS_MAX_HEADER_LIST_SIZE (RFC 9113 §6.5.2). when
+        # non-zero, it caps a request's uncompressed header footprint before it
+        # is sent.
+        mut peer_max_header_list: Int
+        # send-side flow control (RFC 9113 §6.9). we may not send more DATA than the
+        # peer's windows allow. `conn_send_window` is the connection-level credit
+        # (starts at the default, grows only on a stream-0 WINDOW_UPDATE);
+        # `send_windows` holds each open stream's credit; `peer_initial_window` is
+        # the value new stream windows start at (the peer's SETTINGS_INITIAL_WINDOW_SIZE).
+        # `credit` pokes a stream's blocked body sender when a window grows.
+        mut conn_send_window: Int
+        mut peer_initial_window: Int
+        send_windows: Map[Int, Int]
+        credit: Map[Int, Channel[Int]]
+        # the peer's SETTINGS_MAX_CONCURRENT_STREAMS (0 = unlimited). request() waits
+        # on `slot_free` for a slot when the cap is reached; forget() pokes it.
+        mut max_concurrent: Int
+    # the peer's SETTINGS_MAX_FRAME_SIZE. it bounds our outbound HEADERS (split
+    # into CONTINUATION past it) and DATA frames. it is an atomic rather than
+    # under `mu` because every request reads it to pick a path before taking any
+    # lock, while the reader can change it at any time.
+    peer_max_frame_size: AtomicInt
     outbound: Channel[Bytes]
     closed: AtomicInt
-    mut going_away: Bool
-    mut last_peer_stream: Int
     writer: Task[Int]
     # closed by the reader on its way out, so close() can wait for it to stop
     # before the transport descriptor is released. an offline client runs no
     # reader, so its signal starts closed.
     reader_done: Channel[Int]
-    # the peer's advertised limits (RFC 9113 §6.5.2), applied from its SETTINGS.
-    # the frame size bounds our outbound HEADERS (split into CONTINUATION past
-    # it); the header-list size, when non-zero, caps a request's uncompressed
-    # header footprint before it is sent.
-    mut peer_max_frame_size: Int
-    mut peer_max_header_list: Int
-    # send-side flow control (RFC 9113 §6.9). we may not send more DATA than the
-    # peer's windows allow. `conn_send_window` is the connection-level credit
-    # (starts at the default, grows only on a stream-0 WINDOW_UPDATE);
-    # `send_windows` holds each open stream's credit; `peer_initial_window` is
-    # the value new stream windows start at (the peer's SETTINGS_INITIAL_WINDOW_SIZE).
-    # `credit` pokes a stream's blocked body sender when a window grows.
-    mut conn_send_window: Int
-    mut peer_initial_window: Int
-    send_windows: Map[Int, Int]
-    credit: Map[Int, Channel[Int]]
-    # the peer's SETTINGS_MAX_CONCURRENT_STREAMS (0 = unlimited). request() waits
-    # on `slot_free` for a slot when the cap is reached; forget() pokes it.
-    mut max_concurrent: Int
     slot_free: Channel[Int]
     # the inline fast-path state (see the struct note above). `gate` guards `mode`
     # and `inline_busy`; `handoff` (capacity 1) lets the promoter wait for an
@@ -672,9 +676,9 @@ pub struct Client:
     # releases the parked reader when the client promotes; `ready` is closed once
     # the pipeline is up so any threaded caller that arrived mid-promotion can
     # proceed.
-    gate: Mutex
-    mut mode: Int
-    mut inline_busy: Bool
+    guard gate:
+        mut mode: Int
+        mut inline_busy: Bool
     handoff: Channel[Int]
     ready: Channel[Int]
     promote_gate: Channel[Int]
@@ -719,10 +723,11 @@ impl Stream:
     # touching the wire, so closing a completed rpc sends nothing. a second
     # close finds the stream gone and is a no-op.
     pub fn close():
-        self.client.mu.lock()
-        registered := self.client.streams.contains_key(self.id)
-        done := self.client.finished.contains_key(self.id)
-        self.client.mu.unlock()
+        mut registered := false
+        mut done := false
+        locked self.client.mu:
+            registered = self.client.streams.contains_key(self.id)
+            done = self.client.finished.contains_key(self.id)
         if not registered:
             return
         if not done:
@@ -761,7 +766,7 @@ fn client_from_connection(conn: Connection) -> Client:
     # parks on `outbound` through the inline phase (inline calls write directly)
     # and is ready to drain it the moment the client promotes.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn, Mutex(), 1, table, ids, unary_streams, finished_streams, outbound, closed, false, 0, writer, reader_done, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_INLINE, false, Channel[Int](1), Channel[Int](1), Channel[Int](1))
+    client := Client(conn: conn, next_stream_id: 1, streams: table, active: ids, unary: unary_streams, finished: finished_streams, going_away: false, last_peer_stream: 0, peer_max_header_list: 0, conn_send_window: DEFAULT_INITIAL_WINDOW, peer_initial_window: DEFAULT_INITIAL_WINDOW, send_windows: windows, credit: credit, max_concurrent: 0, peer_max_frame_size: AtomicInt(frames.DEFAULT_MAX_FRAME_SIZE), outbound: outbound, closed: closed, writer: writer, reader_done: reader_done, slot_free: Channel[Int](SLOT_POKE_CAP), mode: MODE_INLINE, inline_busy: false, handoff: Channel[Int](1), ready: Channel[Int](1), promote_gate: Channel[Int](1))
     # spawn the reader too, but it parks on `promote_gate` and reads nothing until
     # promotion releases it. spawning both tasks here — never from the request
     # path — keeps task startup off the hot path and has proven the reliable place
@@ -1074,7 +1079,10 @@ fn handle_goaway(client: Client, ga: frames.GoawayFrame) -> Bool!:
 # never blocks the reader; the writer is still draining when this runs after a
 # protocol error, so a queued frame flushes.
 fn send_goaway(client: Client, error_code: Int):
-    frame := frames.goaway_frame(client.last_peer_stream, error_code, bytes.empty())
+    mut last := 0
+    locked client.mu:
+        last = client.last_peer_stream
+    frame := frames.goaway_frame(last, error_code, bytes.empty())
     if frame.is_err:
         return
     wire := frames.frame_bytes(frame.ok)
@@ -1087,13 +1095,12 @@ fn send_goaway(client: Client, error_code: Int):
 # taken under the mutex and the send happens outside it, so a briefly-behind
 # consumer never blocks the stream table.
 fn deliver(client: Client, stream_id: Int, event: StreamEvent):
-    client.mu.lock()
-    if not client.streams.contains_key(stream_id):
-        client.mu.unlock()
-        return
-    inbox := client.streams[stream_id]
-    client.mu.unlock()
-    inbox.send(event)
+    mut target: Channel[StreamEvent]? := none
+    locked client.mu:
+        if client.streams.contains_key(stream_id):
+            target = client.streams[stream_id]
+    if let inbox = target:
+        inbox.send(event)
 
 # close every waiting stream's inbox and clear the table, so pending request()
 # calls unblock with a connection-closed error.
@@ -1255,27 +1262,26 @@ fn assemble_response_until(inbox: Channel[StreamEvent], deadline_ms: Int) -> Res
 # max-concurrent-streams caps how many streams we open at once. push-related and
 # unknown identifiers are ignored.
 fn apply_settings(client: Client, settings: List[frames.Setting]):
-    client.mu.lock()
     mut admit_more := false
-    for s in settings:
-        if s.id == SETTINGS_HEADER_TABLE_SIZE:
-            client.conn.encoder.set_max_table_size(s.value)
-        elif s.id == SETTINGS_MAX_FRAME_SIZE:
-            client.peer_max_frame_size = s.value
-        elif s.id == SETTINGS_MAX_HEADER_LIST_SIZE:
-            client.peer_max_header_list = s.value
-        elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
-            # RFC 9113 §6.9.2: a change adjusts every open stream's send window
-            # by the delta from the previous initial value.
-            delta := s.value - client.peer_initial_window
-            client.peer_initial_window = s.value
-            for sid in client.active:
-                if client.send_windows.contains_key(sid):
-                    client.send_windows.insert(sid, client.send_windows[sid] + delta)
-        elif s.id == SETTINGS_MAX_CONCURRENT_STREAMS:
-            client.max_concurrent = s.value
-            admit_more = true
-    client.mu.unlock()
+    locked client.mu:
+        for s in settings:
+            if s.id == SETTINGS_HEADER_TABLE_SIZE:
+                client.conn.encoder.set_max_table_size(s.value)
+            elif s.id == SETTINGS_MAX_FRAME_SIZE:
+                client.peer_max_frame_size.store(s.value)
+            elif s.id == SETTINGS_MAX_HEADER_LIST_SIZE:
+                client.peer_max_header_list = s.value
+            elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
+                # RFC 9113 §6.9.2: a change adjusts every open stream's send window
+                # by the delta from the previous initial value.
+                delta := s.value - client.peer_initial_window
+                client.peer_initial_window = s.value
+                for sid in client.active:
+                    if client.send_windows.contains_key(sid):
+                        client.send_windows.insert(sid, client.send_windows[sid] + delta)
+            elif s.id == SETTINGS_MAX_CONCURRENT_STREAMS:
+                client.max_concurrent = s.value
+                admit_more = true
     # a raised (or first-seen) limit may let a queued request() proceed.
     if admit_more:
         client.slot_free.try_send(1)
@@ -1319,25 +1325,20 @@ fn header_block_wire(stream_id: Int, block: Bytes, end_stream: Bool, max_frame_s
 # that one stream. pokes are sent outside the mutex so a full poke channel (one
 # already pending) never blocks the reader.
 fn grant_send_credit(client: Client, stream_id: Int, increment: Int):
-    client.mu.lock()
-    if stream_id == 0:
-        client.conn_send_window = client.conn_send_window + increment
-        mut waiters: List[Channel[Int]] := []
-        for sid in client.active:
-            if client.credit.contains_key(sid):
-                waiters.push(client.credit[sid])
-        client.mu.unlock()
-        for ch in waiters:
-            ch.try_send(1)
-        return
-    if client.send_windows.contains_key(stream_id):
-        client.send_windows.insert(stream_id, client.send_windows[stream_id] + increment)
-    if client.credit.contains_key(stream_id):
-        ch := client.credit[stream_id]
-        client.mu.unlock()
+    mut waiters: List[Channel[Int]] := []
+    locked client.mu:
+        if stream_id == 0:
+            client.conn_send_window = client.conn_send_window + increment
+            for sid in client.active:
+                if client.credit.contains_key(sid):
+                    waiters.push(client.credit[sid])
+        else:
+            if client.send_windows.contains_key(stream_id):
+                client.send_windows.insert(stream_id, client.send_windows[stream_id] + increment)
+            if client.credit.contains_key(stream_id):
+                waiters.push(client.credit[stream_id])
+    for ch in waiters:
         ch.try_send(1)
-        return
-    client.mu.unlock()
 
 # stream `data` as DATA frames over the client, honoring the peer's send windows
 # (RFC 9113 §6.9): reserve credit bounded by the stream window, the connection
@@ -1390,11 +1391,11 @@ impl Client:
             grant := self.reserve_send_locked(stream_id, want)
             return grant
 
-    # the body of reserve_send, with `mu` already held by the caller. a caller
+    # the body of reserve_send, for a caller already holding `mu`. a caller
     # that is already inside the mutex for another reason (open_stream_with_fields
     # fusing a body into the HEADERS write) reserves through this and saves the
     # lock round trip.
-    fn reserve_send_locked(stream_id: Int, want: Int) -> Int:
+    fn reserve_send_locked(stream_id: Int, want: Int) -> Int holding self.mu:
         mut win := 0
         if self.send_windows.contains_key(stream_id):
             win = self.send_windows[stream_id]
@@ -1403,8 +1404,9 @@ impl Client:
             grant = win
         if grant > self.conn_send_window:
             grant = self.conn_send_window
-        if grant > self.peer_max_frame_size:
-            grant = self.peer_max_frame_size
+        max_frame := self.peer_max_frame_size.load()
+        if grant > max_frame:
+            grant = max_frame
         if grant > 0:
             self.send_windows.insert(stream_id, win - grant)
             self.conn_send_window = self.conn_send_window - grant
@@ -1414,13 +1416,13 @@ impl Client:
 
     # reserve `want` bytes of send credit for `stream_id` all at once, or nothing
     # at all: true means both windows were debited by the full `want`, false means
-    # neither moved. `mu` must be held. this is deliberately not a partial
+    # neither moved. this is deliberately not a partial
     # reservation — a caller that took a short grant and handed the remainder back
     # would have to undo a debit on every error path, and one missed undo silently
     # shrinks the connection window for the life of the connection. failing here
     # instead costs only the ordinary flow-controlled send.
-    fn reserve_send_all_locked(stream_id: Int, want: Int) -> Bool:
-        if want <= 0 or want > self.peer_max_frame_size:
+    fn reserve_send_all_locked(stream_id: Int, want: Int) -> Bool holding self.mu:
+        if want <= 0 or want > self.peer_max_frame_size.load():
             return false
         if not self.send_windows.contains_key(stream_id):
             return false
@@ -1434,14 +1436,14 @@ impl Client:
     # block until this stream's credit is poked (a WINDOW_UPDATE grew a window),
     # returning false if the connection closed instead (the channel was closed).
     fn await_credit(stream_id: Int) -> Bool:
-        self.mu.lock()
-        if not self.credit.contains_key(stream_id):
-            self.mu.unlock()
-            return false
-        ch := self.credit[stream_id]
-        self.mu.unlock()
-        opt := ch.recv()
-        return opt != none
+        mut poke: Channel[Int]? := none
+        locked self.mu:
+            if self.credit.contains_key(stream_id):
+                poke = self.credit[stream_id]
+        if let ch = poke:
+            opt := ch.recv()
+            return opt != none
+        return false
 
     # serialize a frame and queue it for the writer task.
     fn enqueue(frame: frames.Frame) -> Bool!:
@@ -1536,51 +1538,59 @@ impl Client:
         # way rather than letting a future one emit an invalid stream silently.
         if end_stream and body.len() > 0:
             fail "http2: cannot half-close a stream that still has a body to send"
-        self.mu.lock()
-        while true:
-            if self.closed.load() != 0:
-                self.mu.unlock()
-                fail "http2: client is closed"
-            if self.going_away:
-                self.mu.unlock()
-                fail "http2: peer sent GOAWAY; not opening new streams"
-            if self.max_concurrent <= 0 or self.active.len() < self.max_concurrent:
-                break
-            self.mu.unlock()
-            slot := self.slot_free.recv()
-            if slot == none:
-                fail "http2: client is closed"
-            self.mu.lock()
-        if self.peer_max_header_list > 0 and header_list_size(fields) > self.peer_max_header_list:
-            self.mu.unlock()
-            fail "http2: request header list exceeds the peer's limit"
-        stream_id := self.next_stream_id
-        self.next_stream_id = self.next_stream_id + 2
-        inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
-        self.streams.insert(stream_id, inbox)
-        if unary:
-            self.unary.insert(stream_id, true)
-        self.active.push(stream_id)
-        self.send_windows.insert(stream_id, self.peer_initial_window)
-        self.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
-        block := self.conn.encoder.encode(fields)
-        built := header_block_wire(stream_id, block, end_stream, self.peer_max_frame_size)
-        if built.is_err:
-            self.mu.unlock()
-            self.forget(stream_id)
-            fail built.err
-        mut wire := built.ok
+        # each pass takes `mu` once and either opens the stream or leaves to wait
+        # for a concurrency slot. the admission check and the registration share
+        # one critical section, so a slot cannot be taken twice.
+        mut opened := false
+        mut stream_id := 0
+        mut target: Channel[StreamEvent]? := none
+        mut build_error := ""
         mut fused := false
-        if body.len() > 0:
-            # serialize before reserving, so a frame that cannot be built never
-            # leaves a debit behind to undo.
-            framed := frames.frame_bytes(frames.data_frame(stream_id, body, true))
-            if not framed.is_err:
-                if self.reserve_send_all_locked(stream_id, body.len()):
-                    wire = bytes.concat(wire, framed.ok)
-                    fused = true
-        accepted := self.outbound.send(wire)
-        self.mu.unlock()
+        mut accepted := false
+        while not opened:
+            locked self.mu:
+                if self.closed.load() != 0:
+                    fail "http2: client is closed"
+                if self.going_away:
+                    fail "http2: peer sent GOAWAY; not opening new streams"
+                if self.max_concurrent <= 0 or self.active.len() < self.max_concurrent:
+                    opened = true
+                    if self.peer_max_header_list > 0 and header_list_size(fields) > self.peer_max_header_list:
+                        fail "http2: request header list exceeds the peer's limit"
+                    stream_id = self.next_stream_id
+                    self.next_stream_id = self.next_stream_id + 2
+                    inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
+                    target = inbox
+                    self.streams.insert(stream_id, inbox)
+                    if unary:
+                        self.unary.insert(stream_id, true)
+                    self.active.push(stream_id)
+                    self.send_windows.insert(stream_id, self.peer_initial_window)
+                    self.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
+                    block := self.conn.encoder.encode(fields)
+                    built := header_block_wire(stream_id, block, end_stream, self.peer_max_frame_size.load())
+                    if built.is_err:
+                        build_error = built.err
+                    else:
+                        mut wire := built.ok
+                        if body.len() > 0:
+                            # serialize before reserving, so a frame that cannot
+                            # be built never leaves a debit behind to undo.
+                            framed := frames.frame_bytes(frames.data_frame(stream_id, body, true))
+                            if not framed.is_err:
+                                if self.reserve_send_all_locked(stream_id, body.len()):
+                                    wire = bytes.concat(wire, framed.ok)
+                                    fused = true
+                        # sent under the lock, so hpack encoding order matches
+                        # wire order.
+                        accepted = self.outbound.send(wire)
+            if not opened:
+                slot := self.slot_free.recv()
+                if slot == none:
+                    fail "http2: client is closed"
+        if build_error != "":
+            self.forget(stream_id)
+            fail build_error
         if not accepted:
             self.forget(stream_id)
             fail "http2: connection closed"
@@ -1589,7 +1599,7 @@ impl Client:
             # window is fresh, so it is never the shortfall here); send the body
             # under flow control, waiting for a WINDOW_UPDATE if it must.
             send_stream_data(self, stream_id, body, true)
-        return Stream(self, stream_id, inbox)
+        return Stream(self, stream_id, target.value())
 
     # open a stream for a streaming rpc: fills the four pseudo-headers from the
     # method, authority, and path, appends `extra` (e.g. content-type), and sends
@@ -1620,10 +1630,10 @@ impl Client:
     # `handoff`. the poke is capacity-1 and coalesced, so a stray poke (the
     # promoter already saw us idle) is harmless: promotion happens at most once.
     fn end_inline():
-        self.gate.lock()
-        self.inline_busy = false
-        promoting := self.mode != MODE_INLINE
-        self.gate.unlock()
+        mut promoting := false
+        locked self.gate:
+            self.inline_busy = false
+            promoting = self.mode != MODE_INLINE
         if promoting:
             self.handoff.try_send(1)
 
@@ -1633,21 +1643,21 @@ impl Client:
     # in-flight inline call has released the socket and the reader owns it, the
     # caller can then open a stream with no risk of racing the inline codec.
     fn ensure_threaded():
-        self.gate.lock()
-        m := self.mode
-        if m == MODE_THREADED:
-            self.gate.unlock()
+        mut seen := MODE_INLINE
+        mut must_wait := false
+        locked self.gate:
+            seen = self.mode
+            if seen == MODE_INLINE:
+                # we are the promoter.
+                self.mode = MODE_PROMOTING
+                must_wait = self.inline_busy
+        if seen == MODE_THREADED:
             return
-        if m == MODE_PROMOTING:
-            self.gate.unlock()
+        if seen == MODE_PROMOTING:
             # another caller is promoting; wait for it. recv returns once `ready`
             # is closed (or at once if it already is).
             self.ready.recv()
             return
-        # m == MODE_INLINE: we are the promoter.
-        self.mode = MODE_PROMOTING
-        must_wait := self.inline_busy
-        self.gate.unlock()
         if must_wait:
             # an inline call still owns the socket + decoder; wait for it to drop
             # its lease before we hand them to the reader. two readers on one tls
@@ -1680,11 +1690,14 @@ impl Client:
     # the write never blocks on flow control before the response is read).
     fn inline_round_trip(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
         has_body := body.len() > 0
-        # the inline lease makes this the sole user of the socket, the encoder,
-        # the decoder and next_stream_id (the reader and writer stay parked until
-        # the client promotes), so no mutex is needed here.
-        stream_id := self.next_stream_id
-        self.next_stream_id = self.next_stream_id + 2
+        # the inline lease makes this the sole user of the socket, the encoder
+        # and the decoder (the reader and writer stay parked until the client
+        # promotes). the stream id is shared with the threaded path, so it is
+        # taken under `mu` like everywhere else; the lock is uncontended here.
+        mut stream_id := 0
+        locked self.mu:
+            stream_id = self.next_stream_id
+            self.next_stream_id = self.next_stream_id + 2
         block := self.conn.encoder.encode(fields)
         mut wire := frames.frame_bytes(frames.headers_frame(stream_id, block, not has_body, true))!
         if has_body:
@@ -1702,7 +1715,7 @@ impl Client:
         # fast path: a body small enough to ride one DATA frame within the send
         # window, on a connection no other inline call is using. this is the
         # common grpc unary shape, and it avoids the pipeline entirely.
-        if body.len() <= self.peer_max_frame_size and self.try_begin_inline():
+        if body.len() <= self.peer_max_frame_size.load() and self.try_begin_inline():
             result := self.inline_round_trip(fields, body)
             # release the lease before propagating, so an error never leaks it.
             self.end_inline()
@@ -1720,7 +1733,7 @@ impl Client:
     # flow-controlled DATA on its own task while the response is read.
     fn threaded_request(fields: List[hpack.HeaderField], body: Bytes) -> Response!:
         has_body := body.len() > 0
-        if has_body and body.len() <= self.peer_max_frame_size:
+        if has_body and body.len() <= self.peer_max_frame_size.load():
             # the body is a single frame within the initial window, so it rides
             # the HEADERS write as one message to the writer task — one handoff,
             # not two. this is the common grpc unary case.
@@ -1782,7 +1795,7 @@ impl Client:
     # table — which also wakes a body sender still blocked on flow control.
     fn threaded_request_until(fields: List[hpack.HeaderField], body: Bytes, deadline_ms: Int) -> Response!:
         has_body := body.len() > 0
-        if has_body and body.len() > self.peer_max_frame_size:
+        if has_body and body.len() > self.peer_max_frame_size.load():
             stream := self.open_stream_with_fields(fields, false, true)!
             stream_id := stream.id
             # a large body may block on flow-control credit, so send it on a
@@ -2027,7 +2040,7 @@ fn offline_client(conn: Connection) -> Client:
     # wait on one that will never run.
     reader_done := Channel[Int](1)
     reader_done.close()
-    return Client(conn, Mutex(), 1, table, ids, unary_streams, finished_streams, Channel[Bytes](OUTBOUND_CAP), AtomicInt(0), false, 0, spawn idle_writer(), reader_done, frames.DEFAULT_MAX_FRAME_SIZE, 0, DEFAULT_INITIAL_WINDOW, DEFAULT_INITIAL_WINDOW, windows, credit, 0, Channel[Int](SLOT_POKE_CAP), Mutex(), MODE_THREADED, false, Channel[Int](1), Channel[Int](1), gate)
+    return Client(conn: conn, next_stream_id: 1, streams: table, active: ids, unary: unary_streams, finished: finished_streams, going_away: false, last_peer_stream: 0, peer_max_header_list: 0, conn_send_window: DEFAULT_INITIAL_WINDOW, peer_initial_window: DEFAULT_INITIAL_WINDOW, send_windows: windows, credit: credit, max_concurrent: 0, peer_max_frame_size: AtomicInt(frames.DEFAULT_MAX_FRAME_SIZE), outbound: Channel[Bytes](OUTBOUND_CAP), closed: AtomicInt(0), writer: spawn idle_writer(), reader_done: reader_done, slot_free: Channel[Int](SLOT_POKE_CAP), mode: MODE_THREADED, inline_busy: false, handoff: Channel[Int](1), ready: Channel[Int](1), promote_gate: gate)
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -2057,10 +2070,11 @@ test "the reader task demuxes frames to the right streams":
     client := offline_client(connection_from_frames(stream))
     inbox1 := Channel[StreamEvent](STREAM_INBOX_CAP)
     inbox3 := Channel[StreamEvent](STREAM_INBOX_CAP)
-    client.streams.insert(1, inbox1)
-    client.active.push(1)
-    client.streams.insert(3, inbox3)
-    client.active.push(3)
+    locked client.mu:
+        client.streams.insert(1, inbox1)
+        client.active.push(1)
+        client.streams.insert(3, inbox3)
+        client.active.push(3)
     # runs to end-of-stream, then closes the inboxes.
     reader_loop(client)
 
@@ -2085,8 +2099,9 @@ test "the reader task replenishes flow control as body arrives":
     stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("hello"), false), frames.data_frame(1, bytes.empty(), true)])!
     client := offline_client(connection_from_frames(stream))
     inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
-    client.streams.insert(1, inbox)
-    client.active.push(1)
+    locked client.mu:
+        client.streams.insert(1, inbox)
+        client.active.push(1)
     reader_loop(client)
     updates := drain_window_updates(client.outbound)!
     # the 5-byte DATA frame grants a connection and a stream WINDOW_UPDATE; the
@@ -2102,9 +2117,10 @@ test "the reader joins a unary body spread over several DATA frames":
     stream := encode_frames([frames.headers_frame(1, block, false, true), frames.data_frame(1, bytes.from_string_utf8("hello "), false), frames.data_frame(1, bytes.from_string_utf8("world"), false), frames.data_frame(1, bytes.from_string_utf8("!"), true)])!
     client := offline_client(connection_from_frames(stream))
     inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
-    client.streams.insert(1, inbox)
-    client.unary.insert(1, true)
-    client.active.push(1)
+    locked client.mu:
+        client.streams.insert(1, inbox)
+        client.unary.insert(1, true)
+        client.active.push(1)
     reader_loop(client)
     r := assemble_response(inbox)!
     assert_eq(r.status, 200)
@@ -2117,9 +2133,10 @@ test "the reader cancels a unary stream whose body passes the limit":
     conn.set_max_response_body_bytes(8)
     client := offline_client(conn)
     inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
-    client.streams.insert(1, inbox)
-    client.unary.insert(1, true)
-    client.active.push(1)
+    locked client.mu:
+        client.streams.insert(1, inbox)
+        client.unary.insert(1, true)
+        client.active.push(1)
     reader_loop(client)
     result := assemble_response(inbox)
     assert(result.is_err)
@@ -2225,17 +2242,19 @@ test "a GOAWAY drops streams above last-stream-id and keeps the rest":
     client := offline_client(connection_from_frames(bytes.empty()))
     inbox1 := Channel[StreamEvent](4)
     inbox3 := Channel[StreamEvent](4)
-    client.streams.insert(1, inbox1)
-    client.active.push(1)
-    client.streams.insert(3, inbox3)
-    client.active.push(3)
+    locked client.mu:
+        client.streams.insert(1, inbox1)
+        client.active.push(1)
+        client.streams.insert(3, inbox3)
+        client.active.push(3)
     # last-stream-id 1: the peer served stream 1 but not stream 3.
     ga := frames.parse_goaway(frames.goaway_frame(1, frames.ERROR_NO_ERROR, bytes.empty())!)!
     keep := handle_goaway(client, ga)!
     assert(keep)
-    assert(client.going_away)
-    assert(client.streams.contains_key(1))
-    assert(not client.streams.contains_key(3))
+    locked client.mu:
+        assert(client.going_away)
+        assert(client.streams.contains_key(1))
+        assert(not client.streams.contains_key(3))
     # stream 3's inbox was closed, so its waiting request() unblocks with none.
     assert(inbox3.recv() == none)
 
@@ -2255,8 +2274,9 @@ test "header_list_size sums names, values, and per-field overhead":
 test "apply_settings records the peer's frame and header-list limits":
     client := offline_client(connection_from_frames(bytes.empty()))
     apply_settings(client, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 32768), frames.setting(SETTINGS_MAX_HEADER_LIST_SIZE, 8192), frames.setting(SETTINGS_HEADER_TABLE_SIZE, 0)])
-    assert_eq(client.peer_max_frame_size, 32768)
-    assert_eq(client.peer_max_header_list, 8192)
+    assert_eq(client.peer_max_frame_size.load(), 32768)
+    locked client.mu:
+        assert_eq(client.peer_max_header_list, 8192)
 
 test "header_block_wire emits a single HEADERS when the block fits":
     block := bytes.from_string_utf8("small")
@@ -2298,12 +2318,13 @@ test "header_block_wire splits a large block into HEADERS + CONTINUATION":
 # register a stream on an offline client with the given send windows, ready for
 # the flow-control helpers to act on it.
 fn arm_send_stream(client: Client, stream_id: Int, stream_window: Int, conn_window: Int, max_frame: Int):
-    client.streams.insert(stream_id, Channel[StreamEvent](STREAM_INBOX_CAP))
-    client.active.push(stream_id)
-    client.send_windows.insert(stream_id, stream_window)
-    client.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
-    client.conn_send_window = conn_window
-    client.peer_max_frame_size = max_frame
+    locked client.mu:
+        client.streams.insert(stream_id, Channel[StreamEvent](STREAM_INBOX_CAP))
+        client.active.push(stream_id)
+        client.send_windows.insert(stream_id, stream_window)
+        client.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
+        client.conn_send_window = conn_window
+    client.peer_max_frame_size.store(max_frame)
 
 # read the next DATA frame off an outbound channel, failing if it closed first.
 fn next_data_frame(ch: Channel[Bytes]) -> frames.DataFrame!:
@@ -2332,11 +2353,13 @@ test "reserve_send is bounded by the stream and connection windows":
     arm_send_stream(client, 1, 10, 6, 100)
     # min(want 8, stream 10, conn 6, frame 100) = 6, debited from both windows.
     assert_eq(client.reserve_send(1, 8), 6)
-    assert_eq(client.send_windows[1], 4)
-    assert_eq(client.conn_send_window, 0)
+    locked client.mu:
+        assert_eq(client.send_windows[1], 4)
+        assert_eq(client.conn_send_window, 0)
     # no connection credit left: nothing can be reserved.
     assert_eq(client.reserve_send(1, 4), 0)
-    assert_eq(client.send_windows[1], 4)
+    locked client.mu:
+        assert_eq(client.send_windows[1], 4)
 
 test "reserve_send caps a chunk at the peer's max frame size":
     client := offline_client(connection_from_frames(bytes.empty()))
@@ -2364,8 +2387,9 @@ test "reserve_send_all_locked refuses more than one frame's worth":
         assert(not client.reserve_send_all_locked(1, 17))
         assert_eq(client.conn_send_window, 1000)
         assert(client.reserve_send_all_locked(1, 16))
-    assert_eq(client.conn_send_window, 984)
-    assert_eq(client.send_windows[1], 984)
+    locked client.mu:
+        assert_eq(client.conn_send_window, 984)
+        assert_eq(client.send_windows[1], 984)
 
 test "a single-frame body rides the HEADERS write as one message":
     client := offline_client(connection_from_frames(bytes.empty()))
@@ -2385,12 +2409,13 @@ test "a single-frame body rides the HEADERS write as one message":
     # both frames came out of that one message: the writer sees a single handoff.
     assert_eq(binary.remaining(reader), 0)
     # and the fused body was paid for out of both send windows.
-    assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW - 10)
-    assert_eq(client.send_windows[stream.id], DEFAULT_INITIAL_WINDOW - 10)
+    locked client.mu:
+        assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW - 10)
+        assert_eq(client.send_windows[stream.id], DEFAULT_INITIAL_WINDOW - 10)
 
 test "a body exactly at the peer's frame cap still rides the HEADERS write":
     client := offline_client(connection_from_frames(bytes.empty()))
-    client.peer_max_frame_size = 8
+    client.peer_max_frame_size.store(8)
     body := bytes.from_string_utf8("12345678")
     opened := client.open_stream_with_body(post_fields(), false, true, body)
     assert(not opened.is_err)
@@ -2411,13 +2436,15 @@ test "an empty body still half-closes on the HEADERS frame":
     assert(head.end_stream)
     assert_eq(binary.remaining(reader), 0)
     # nothing was reserved, because nothing was sent.
-    assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW)
+    locked client.mu:
+        assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW)
 
 test "a body waits for credit when the connection window is exhausted":
     client := offline_client(connection_from_frames(bytes.empty()))
     # the stream window is always fresh at open time, so an empty connection
     # window is the only way the fused reservation is refused.
-    client.conn_send_window = 0
+    locked client.mu:
+        client.conn_send_window = 0
     opener := spawn open_with_body_task(client, bytes.from_string_utf8("late"))
     # the HEADERS go out on their own; reading them proves the body did not ride
     # along, and that the opener is now waiting on a WINDOW_UPDATE.
@@ -2435,24 +2462,29 @@ test "grant_send_credit grows the stream and connection windows":
     client := offline_client(connection_from_frames(bytes.empty()))
     arm_send_stream(client, 1, 0, 0, 100)
     grant_send_credit(client, 1, 50)
-    assert_eq(client.send_windows[1], 50)
+    locked client.mu:
+        assert_eq(client.send_windows[1], 50)
     grant_send_credit(client, 0, 30)
-    assert_eq(client.conn_send_window, 30)
+    locked client.mu:
+        assert_eq(client.conn_send_window, 30)
 
 test "a new SETTINGS_INITIAL_WINDOW_SIZE resizes open stream windows by the delta":
     client := offline_client(connection_from_frames(bytes.empty()))
-    client.streams.insert(1, Channel[StreamEvent](1))
-    client.active.push(1)
-    client.send_windows.insert(1, DEFAULT_INITIAL_WINDOW)
+    locked client.mu:
+        client.streams.insert(1, Channel[StreamEvent](1))
+        client.active.push(1)
+        client.send_windows.insert(1, DEFAULT_INITIAL_WINDOW)
     # the peer shrinks the initial window; the open stream shrinks by the delta.
     apply_settings(client, [frames.setting(SETTINGS_INITIAL_WINDOW_SIZE, 1000)])
-    assert_eq(client.peer_initial_window, 1000)
-    assert_eq(client.send_windows[1], 1000)
+    locked client.mu:
+        assert_eq(client.peer_initial_window, 1000)
+        assert_eq(client.send_windows[1], 1000)
 
 test "apply_settings records the peer's max concurrent streams":
     client := offline_client(connection_from_frames(bytes.empty()))
     apply_settings(client, [frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 3)])
-    assert_eq(client.max_concurrent, 3)
+    locked client.mu:
+        assert_eq(client.max_concurrent, 3)
 
 test "send_stream_data splits a body across the window and finishes after a WINDOW_UPDATE":
     client := offline_client(connection_from_frames(bytes.empty()))
@@ -2494,8 +2526,9 @@ test "a stream's recv yields its events one at a time":
 
 test "send_stream_data half-closes only on the chunk that asks":
     client := offline_client(connection_from_frames(bytes.empty()))
-    client.send_windows.insert(1, DEFAULT_INITIAL_WINDOW)
-    client.credit.insert(1, Channel[Int](CREDIT_POKE_CAP))
+    locked client.mu:
+        client.send_windows.insert(1, DEFAULT_INITIAL_WINDOW)
+        client.credit.insert(1, Channel[Int](CREDIT_POKE_CAP))
     assert_eq(send_stream_data(client, 1, bytes.from_string_utf8("hello"), false), 5)
     assert_eq(send_stream_data(client, 1, bytes.from_string_utf8("bye"), true), 3)
     first := next_data_frame(client.outbound)!
@@ -2564,10 +2597,12 @@ test "an inline request runs synchronously and leaves the client single-stream":
     assert_eq(resp.status, 200)
     assert_eq(resp.body.to_string_utf8()!, "pong")
     # no second stream ever appeared, so the client stayed inline: no pipeline.
-    assert_eq(client.mode, MODE_INLINE)
-    assert(not client.inline_busy)
+    locked client.gate:
+        assert_eq(client.mode, MODE_INLINE)
+        assert(not client.inline_busy)
     # the stream id advanced by two, ready for the next inline call.
-    assert_eq(client.next_stream_id, 3)
+    locked client.mu:
+        assert_eq(client.next_stream_id, 3)
     client.close()
 
 test "sequential inline requests reuse the fast path with monotonic ids":
@@ -2583,13 +2618,16 @@ test "sequential inline requests reuse the fast path with monotonic ids":
     r2 := client.get("example.com", "/b")!
     assert_eq(r2.body.to_string_utf8()!, "two")
     # both ran inline; the ids used were 1 then 3.
-    assert_eq(client.mode, MODE_INLINE)
-    assert_eq(client.next_stream_id, 5)
+    locked client.gate:
+        assert_eq(client.mode, MODE_INLINE)
+    locked client.mu:
+        assert_eq(client.next_stream_id, 5)
     client.close()
 
 test "the inline lease is exclusive and released again by end_inline":
     client := client_from_connection(connection_from_frames(bytes.empty()))
-    assert_eq(client.mode, MODE_INLINE)
+    locked client.gate:
+        assert_eq(client.mode, MODE_INLINE)
     assert(client.try_begin_inline())
     # a second attempt fails while the lease is held.
     assert(not client.try_begin_inline())
@@ -2607,22 +2645,28 @@ test "a closed client refuses the inline lease":
 
 test "ensure_threaded is a no-op once the client is already threaded":
     client := offline_client(connection_from_frames(bytes.empty()))
-    assert_eq(client.mode, MODE_THREADED)
+    locked client.gate:
+        assert_eq(client.mode, MODE_THREADED)
     client.ensure_threaded()
-    assert_eq(client.mode, MODE_THREADED)
+    locked client.gate:
+        assert_eq(client.mode, MODE_THREADED)
 
 test "the first concurrency promotes the client and leaves the send window whole":
     client := client_from_connection(connection_from_frames(bytes.empty()))
-    assert_eq(client.mode, MODE_INLINE)
+    locked client.gate:
+        assert_eq(client.mode, MODE_INLINE)
     client.ensure_threaded()
     # the one-way latch is now set and the pipeline owns the socket.
-    assert_eq(client.mode, MODE_THREADED)
+    locked client.gate:
+        assert_eq(client.mode, MODE_THREADED)
     # promotion does not touch the connection send window: inline's sends were
     # already re-granted by the peer, so it stays at the initial value.
-    assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW)
+    locked client.mu:
+        assert_eq(client.conn_send_window, DEFAULT_INITIAL_WINDOW)
     # promotion is idempotent.
     client.ensure_threaded()
-    assert_eq(client.mode, MODE_THREADED)
+    locked client.gate:
+        assert_eq(client.mode, MODE_THREADED)
     client.close()
 
 test "assemble_response_until returns a response that arrives in time":
@@ -2656,15 +2700,17 @@ test "a closed stream leaves the table and frees its concurrency slot":
     sid := stream.id
     # the HEADERS block reached the writer queue.
     assert(client.outbound.try_recv() != none)
-    assert(client.streams.contains_key(sid))
-    assert_eq(client.active.len(), 1)
+    locked client.mu:
+        assert(client.streams.contains_key(sid))
+        assert_eq(client.active.len(), 1)
     stream.close()
     # an unfinished stream is reset on the wire: one queued RST_STREAM.
     assert(client.outbound.try_recv() != none)
-    assert(not client.streams.contains_key(sid))
-    assert(not client.credit.contains_key(sid))
-    assert(not client.send_windows.contains_key(sid))
-    assert_eq(client.active.len(), 0)
+    locked client.mu:
+        assert(not client.streams.contains_key(sid))
+        assert(not client.credit.contains_key(sid))
+        assert(not client.send_windows.contains_key(sid))
+        assert_eq(client.active.len(), 0)
     # the freed slot poked the waiters' channel.
     assert(client.slot_free.try_recv() != none)
     # a second close finds nothing and queues nothing.
@@ -2679,7 +2725,59 @@ test "closing a finished stream skips the wire reset":
     stream.close()
     # no RST_STREAM queued: the stream's terminal event already arrived.
     assert(client.outbound.try_recv() == none)
-    assert(not client.streams.contains_key(stream.id))
-    assert(not client.finished.contains_key(stream.id))
+    locked client.mu:
+        assert(not client.streams.contains_key(stream.id))
+        assert(not client.finished.contains_key(stream.id))
     # recv on the closed inbox reports the close instead of blocking.
     assert(stream.recv().is_err)
+
+fn post_fields() -> List[hpack.HeaderField]:
+    return [hpack.header_field(":method", "POST"), hpack.header_field(":path", "/s"), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "t")]
+
+fn open_second_stream(client: Client) -> Int:
+    opened := client.open_stream_with_fields(post_fields(), false, false) catch:
+        return 0 - 1
+    return opened.id
+
+test "a stream waits for a concurrency slot and opens once one frees":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    apply_settings(client, [frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 1)])
+    # the settings poke would admit a waiter at once; drain it so the second
+    # open has to wait for the first stream's slot.
+    client.slot_free.try_recv()
+    first := client.open_stream_with_fields(post_fields(), false, false)!
+    assert(client.outbound.try_recv() != none)
+    waiter := spawn open_second_stream(client)
+    # give the waiter time to find no slot and block on slot_free, so the
+    # close below is what admits it.
+    sleep(20)
+    locked client.mu:
+        assert_eq(client.active.len(), 1)
+    first.close()
+    second_id := await waiter
+    assert_eq(second_id, first.id + 2)
+    locked client.mu:
+        assert_eq(client.active.len(), 1)
+
+test "a refused open releases the lock for the next one":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    apply_settings(client, [frames.setting(SETTINGS_MAX_HEADER_LIST_SIZE, 8)])
+    refused := client.open_stream_with_fields(post_fields(), false, false)
+    assert(refused.is_err)
+    # the refusal failed from inside the locked block; if it had kept `mu`,
+    # this would hang instead of failing the same way.
+    assert(client.open_stream_with_fields(post_fields(), false, false).is_err)
+    locked client.mu:
+        client.peer_max_header_list = 0
+        assert_eq(client.active.len(), 0)
+    accepted := client.open_stream_with_fields(post_fields(), false, false)!
+    assert_eq(accepted.id, 1)
+
+test "a closed or going-away client refuses new streams":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    locked client.mu:
+        client.going_away = true
+    assert(client.open_stream_with_fields(post_fields(), false, false).is_err)
+    other := offline_client(connection_from_frames(bytes.empty()))
+    other.closed.store(1)
+    assert(other.open_stream_with_fields(post_fields(), false, false).is_err)

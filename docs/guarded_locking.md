@@ -482,9 +482,13 @@ build settled a question this page left open, or departed from it:
 - **what counts as a write.** an assignment rooted at the global, or a mutating
   method called on it. a write through a function that takes the collection as
   an argument is not seen.
-- **std left for later.** the TLS config registry passes its maps into generic
-  accessors that take the lock themselves, which the checker cannot follow;
-  the HTTP/2 client's `mu` does not say which fields it covers, and its inline
+- **the TLS config registry.** it was fourteen handle-keyed maps behind
+  generic accessors that took the lock themselves, which the checker could not
+  follow. it is now one guarded map from handle to a `ConfigRecord`. a reader
+  takes the record under the lock and uses it after; a setter copies the
+  record, changes the copy and stores it under one lock, so a record is never
+  changed after it is stored.
+- **std left for later.** the HTTP/2 client's `mu` does not say which fields it covers, and its inline
   path reads some of them under a lease protocol; and `Limiter`, `Breaker` and
   std.concurrent's test counters keep their state in atomics, with the mutex
   only serializing a read-modify-write.

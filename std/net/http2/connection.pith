@@ -624,8 +624,9 @@ MODE_THREADED := 2
 # before the transport drops.
 pub struct Client:
     conn: Connection
+    # the next stream id to hand out; see take_stream_id.
+    next_stream_id: AtomicInt
     guard mu:
-        mut next_stream_id: Int
         streams: Map[Int, Channel[StreamEvent]]
         mut active: List[Int]
         # the ids of streams the reader should coalesce: a unary request()/get() marks
@@ -766,7 +767,7 @@ fn client_from_connection(conn: Connection) -> Client:
     # parks on `outbound` through the inline phase (inline calls write directly)
     # and is ready to drain it the moment the client promotes.
     writer := spawn writer_loop(outbound, conn, closed)
-    client := Client(conn: conn, next_stream_id: 1, streams: table, active: ids, unary: unary_streams, finished: finished_streams, going_away: false, last_peer_stream: 0, peer_max_header_list: 0, conn_send_window: DEFAULT_INITIAL_WINDOW, peer_initial_window: DEFAULT_INITIAL_WINDOW, send_windows: windows, credit: credit, max_concurrent: 0, peer_max_frame_size: AtomicInt(frames.DEFAULT_MAX_FRAME_SIZE), outbound: outbound, closed: closed, writer: writer, reader_done: reader_done, slot_free: Channel[Int](SLOT_POKE_CAP), mode: MODE_INLINE, inline_busy: false, handoff: Channel[Int](1), ready: Channel[Int](1), promote_gate: Channel[Int](1))
+    client := Client(conn: conn, next_stream_id: AtomicInt(1), streams: table, active: ids, unary: unary_streams, finished: finished_streams, going_away: false, last_peer_stream: 0, peer_max_header_list: 0, conn_send_window: DEFAULT_INITIAL_WINDOW, peer_initial_window: DEFAULT_INITIAL_WINDOW, send_windows: windows, credit: credit, max_concurrent: 0, peer_max_frame_size: AtomicInt(frames.DEFAULT_MAX_FRAME_SIZE), outbound: outbound, closed: closed, writer: writer, reader_done: reader_done, slot_free: Channel[Int](SLOT_POKE_CAP), mode: MODE_INLINE, inline_busy: false, handoff: Channel[Int](1), ready: Channel[Int](1), promote_gate: Channel[Int](1))
     # spawn the reader too, but it parks on `promote_gate` and reads nothing until
     # promotion releases it. spawning both tasks here — never from the request
     # path — keeps task startup off the hot path and has proven the reliable place
@@ -1557,8 +1558,7 @@ impl Client:
                     opened = true
                     if self.peer_max_header_list > 0 and header_list_size(fields) > self.peer_max_header_list:
                         fail "http2: request header list exceeds the peer's limit"
-                    stream_id = self.next_stream_id
-                    self.next_stream_id = self.next_stream_id + 2
+                    stream_id = self.take_stream_id()
                     inbox := Channel[StreamEvent](STREAM_INBOX_CAP)
                     target = inbox
                     self.streams.insert(stream_id, inbox)
@@ -1614,6 +1614,20 @@ impl Client:
         return self.open_stream_with_fields(fields, end_stream, false)!
 
     # --- inline fast-path plumbing (see the Client note) ---
+
+    # hand out the next client stream id: odd, and two past the last one (RFC
+    # 9113 §5.1.1). the threaded path takes its id under `mu`, so ids reach the
+    # wire in the order they were taken; the inline path takes its id under the
+    # inline lease, before any threaded caller exists. compare_set makes the
+    # ids unique even if two callers ever met here. it is an atomic rather than
+    # under `mu` because a lock on the inline path costs about 1% of a
+    # sequential grpc call.
+    fn take_stream_id() -> Int:
+        while true:
+            id := self.next_stream_id.load()
+            if self.next_stream_id.compare_set(id, id + 2):
+                return id
+        return 0
 
     # try to take the inline lease: succeed only while the connection is still
     # single-stream (MODE_INLINE) and no other inline call holds it. on success
@@ -1692,12 +1706,8 @@ impl Client:
         has_body := body.len() > 0
         # the inline lease makes this the sole user of the socket, the encoder
         # and the decoder (the reader and writer stay parked until the client
-        # promotes). the stream id is shared with the threaded path, so it is
-        # taken under `mu` like everywhere else; the lock is uncontended here.
-        mut stream_id := 0
-        locked self.mu:
-            stream_id = self.next_stream_id
-            self.next_stream_id = self.next_stream_id + 2
+        # promotes), so no mutex is needed here.
+        stream_id := self.take_stream_id()
         block := self.conn.encoder.encode(fields)
         mut wire := frames.frame_bytes(frames.headers_frame(stream_id, block, not has_body, true))!
         if has_body:
@@ -2040,7 +2050,7 @@ fn offline_client(conn: Connection) -> Client:
     # wait on one that will never run.
     reader_done := Channel[Int](1)
     reader_done.close()
-    return Client(conn: conn, next_stream_id: 1, streams: table, active: ids, unary: unary_streams, finished: finished_streams, going_away: false, last_peer_stream: 0, peer_max_header_list: 0, conn_send_window: DEFAULT_INITIAL_WINDOW, peer_initial_window: DEFAULT_INITIAL_WINDOW, send_windows: windows, credit: credit, max_concurrent: 0, peer_max_frame_size: AtomicInt(frames.DEFAULT_MAX_FRAME_SIZE), outbound: Channel[Bytes](OUTBOUND_CAP), closed: AtomicInt(0), writer: spawn idle_writer(), reader_done: reader_done, slot_free: Channel[Int](SLOT_POKE_CAP), mode: MODE_THREADED, inline_busy: false, handoff: Channel[Int](1), ready: Channel[Int](1), promote_gate: gate)
+    return Client(conn: conn, next_stream_id: AtomicInt(1), streams: table, active: ids, unary: unary_streams, finished: finished_streams, going_away: false, last_peer_stream: 0, peer_max_header_list: 0, conn_send_window: DEFAULT_INITIAL_WINDOW, peer_initial_window: DEFAULT_INITIAL_WINDOW, send_windows: windows, credit: credit, max_concurrent: 0, peer_max_frame_size: AtomicInt(frames.DEFAULT_MAX_FRAME_SIZE), outbound: Channel[Bytes](OUTBOUND_CAP), closed: AtomicInt(0), writer: spawn idle_writer(), reader_done: reader_done, slot_free: Channel[Int](SLOT_POKE_CAP), mode: MODE_THREADED, inline_busy: false, handoff: Channel[Int](1), ready: Channel[Int](1), promote_gate: gate)
 
 # pull the next event off an inbox, failing if the channel closed first.
 fn next_event(inbox: Channel[StreamEvent]) -> StreamEvent!:
@@ -2601,8 +2611,7 @@ test "an inline request runs synchronously and leaves the client single-stream":
         assert_eq(client.mode, MODE_INLINE)
         assert(not client.inline_busy)
     # the stream id advanced by two, ready for the next inline call.
-    locked client.mu:
-        assert_eq(client.next_stream_id, 3)
+    assert_eq(client.next_stream_id.load(), 3)
     client.close()
 
 test "sequential inline requests reuse the fast path with monotonic ids":
@@ -2620,8 +2629,7 @@ test "sequential inline requests reuse the fast path with monotonic ids":
     # both ran inline; the ids used were 1 then 3.
     locked client.gate:
         assert_eq(client.mode, MODE_INLINE)
-    locked client.mu:
-        assert_eq(client.next_stream_id, 5)
+    assert_eq(client.next_stream_id.load(), 5)
     client.close()
 
 test "the inline lease is exclusive and released again by end_inline":

@@ -1800,6 +1800,17 @@ cli-regressions-only:
 	set -e; \
 	case "$$shadow_out" in *'"code":"E308"'*) pass=$$((pass+1)); echo "ok   lint shadowed global";; *) echo "FAIL lint shadowed global"; fail=$$((fail+1));; esac; \
 	case "$$noshadow_out" in *'"code":"E308"'*) echo "FAIL lint distinct local exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint distinct local exempt";; esac; \
+	printf 'mut hits: Map[String, Int] := {}\n\nfn bump():\n    hits.insert("a", 1)\n\nfn main():\n    t := spawn bump()\n    await t\n' > "$$tmpdir/lint_shared.pith"; \
+	printf 'mut hits: Map[String, Int] := {}\n\nfn bump():\n    hits.insert("a", 1)\n\nfn main():\n    bump()\n' > "$$tmpdir/lint_unspawned.pith"; \
+	printf 'guard hits_mu:\n    mut hits: Map[String, Int] := {}\nthreadlocal mut scratch: List[Int] := []\nmut names: List[String] := ["a"]\n\nfn bump():\n    locked hits_mu:\n        hits.insert("a", 1)\n    scratch.push(names.len())\n\nfn main():\n    t := spawn bump()\n    await t\n' > "$$tmpdir/lint_shared_ok.pith"; \
+	set +e; \
+	shared_out=$$(./target/release/pith lint --json "$$tmpdir/lint_shared.pith" 2>/dev/null); \
+	unspawned_out=$$(./target/release/pith lint --json "$$tmpdir/lint_unspawned.pith" 2>/dev/null); \
+	shared_ok_out=$$(./target/release/pith lint --json "$$tmpdir/lint_shared_ok.pith" 2>/dev/null); \
+	set -e; \
+	case "$$shared_out" in *'"code":"E309"'*) pass=$$((pass+1)); echo "ok   lint unguarded shared global";; *) echo "FAIL lint unguarded shared global"; fail=$$((fail+1));; esac; \
+	case "$$unspawned_out" in *'"code":"E309"'*) echo "FAIL lint program without spawn exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint program without spawn exempt";; esac; \
+	case "$$shared_ok_out" in *'"code":"E309"'*) echo "FAIL lint guarded, threadlocal and read-only globals exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint guarded, threadlocal and read-only globals exempt";; esac; \
 	printf 'test "a first":\n    assert(true)\ntest "b fails":\n    assert(false)\ntest "c after failure":\n    assert(true)\n' > "$$tmpdir/harness.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/harness.pith" 2>&1); \

@@ -144,8 +144,6 @@ stale and a fix to it is welcome.
 - **the tls root bundle cache holds eight bundles**. a process that trusts
   more than eight distinct ca bundles keeps working but re-parses the ones past
   the cap on every config, and a cached bundle is never evicted.
-- **`std.args` has no lock**. set it up and parse from one task. calling the
-  setup functions from a spawned task can tear its state with no diagnostic.
 
 ## tooling
 

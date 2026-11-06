@@ -42,6 +42,7 @@ from check_pipeline import run_check_pipeline
 from printer import print_ast
 from formatter import fmt_source
 from linter import lint_module, source_is_generated
+from sharing_lint import lint_shared_globals
 from errors import render_diagnostics, render_diagnostics_for_path, render_diagnostics_json, has_errors
 from docgen import doc_extract, doc_format, doc_format_json, doc_check, doc_search
 from package_cli import package_root_path, cmd_package_deps, cmd_package_lock, cmd_package_install, cmd_package_inspect, cmd_package_context, cmd_new
@@ -206,12 +207,16 @@ fn cmd_lint(path: String, json_mode: Bool) -> Bool:
             print("ok (generated)")
         return true
 
-    diags := lint_module(outcome.root, source, path)
+    mut diags := lint_module(outcome.root, source, path)
+    # the sharing rule looks at the whole program, so its warnings can name a
+    # global in an imported module; they are rendered against that file.
+    for d in lint_shared_globals(outcome.root, path, outcome.import_roots):
+        diags.push(d)
 
     if json_mode:
         print(render_diagnostics_json(diags))
     elif diags.len() > 0:
-        print(render_diagnostics(diags, source))
+        print(render_diagnostics_for_path(diags, path, source) catch render_diagnostics(diags, source))
     else:
         print("ok")
     # a warning fails too. every lint rule is a convention this

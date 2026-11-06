@@ -1,0 +1,202 @@
+# sharing_lint.pith: the sharing rule (E309)
+#
+# in a program that spawns tasks, a `mut` module global that holds a list, a
+# map, a set or a struct is one buffer every task can reach. two tasks writing
+# it at once corrupt it, and a reader can see it torn. so each such global has
+# to be one of: declared in a `guard` block, `threadlocal`, or never written
+# after module init. this pass reports the rest as warnings, naming the global
+# and one spawn in the program.
+#
+# the pass runs over the whole program `pith lint` loaded: the entry module and
+# everything it imports, so a library global is reported when a program that
+# spawns uses it. a program spawns when something in the entry module reaches a
+# spawn: a function spawns if its body holds one or calls, by name, a function
+# that spawns. names are matched without their module, which can count a
+# program as spawning when it does not, never the other way. a program that
+# never reaches a spawn reports nothing. the pass reads the types the checker
+# already recorded, so it runs after a successful check.
+
+from ast import Node, get_node
+from errors import Diagnostic
+from checker import c_get_expr_type
+from types import get_type_info, get_type_name, is_error_type
+from driver import get_resolved_module_file
+
+# method names that change a collection in place
+MUTATING_METHODS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
+
+# builtin values that synchronize themselves, or hold no shared buffer
+SELF_SYNCHRONIZED := ",AtomicInt,Mutex,WaitGroup,Semaphore,Channel,Task,"
+
+## the E309 warnings for the program rooted at `entry_root`, read from
+## `entry_path`, with `import_roots` the modules it loaded.
+pub fn lint_shared_globals(entry_root: Int, entry_path: String, import_roots: List[Int]) -> List[Diagnostic]:
+    mut out: List[Diagnostic] := []
+    mut roots: List[Int] := [entry_root]
+    mut files: List[String] := [entry_path]
+    for r in import_roots:
+        roots.push(r)
+        files.push(get_resolved_module_file(r))
+    spawn_at := reached_spawn(roots, files)
+    if spawn_at == "":
+        return out
+    for r, i in roots:
+        lint_module_globals(r, files[i], spawn_at, out)
+    return out
+
+# where the entry module (roots[0]) reaches a spawn, as "file:line", or ""
+fn reached_spawn(roots: List[Int], files: List[String]) -> String:
+    mut fn_names: List[String] := []
+    mut fn_nodes: List[Int] := []
+    mut fn_module: List[Int] := []
+    for r, i in roots:
+        collect_functions(r, i, fn_names, fn_nodes, fn_module)
+    # where each spawning function's spawn is, or the callee it reaches one by
+    mut spawning: Map[String, String] := {}
+    for idx, k in fn_nodes:
+        found := first_spawn(idx)
+        if found >= 0:
+            spawning.insert(fn_names[k], files[fn_module[k]] + ":" + get_node(found).line.to_string())
+    mut changed := true
+    while changed:
+        changed = false
+        for idx, k in fn_nodes:
+            if not spawning.contains_key(fn_names[k]):
+                via := called_spawning(idx, spawning)
+                if via != "":
+                    spawning.insert(fn_names[k], spawning[via])
+                    changed = true
+    for idx, k in fn_nodes:
+        if fn_module[k] == 0 and spawning.contains_key(fn_names[k]):
+            return spawning[fn_names[k]]
+    # a spawn at the entry's top level, outside any function
+    entry := get_node(roots[0])
+    for child in entry.children:
+        if get_node(child).kind != "fn_decl" and get_node(child).kind != "impl_decl":
+            found := first_spawn(child)
+            if found >= 0:
+                return files[0] + ":" + get_node(found).line.to_string()
+    return ""
+
+# every function and method declared under a module root, and every test
+fn collect_functions(idx: Int, module: Int, names: List[String], nodes: List[Int], modules: List[Int]):
+    node := get_node(idx)
+    if node.kind == "fn_decl":
+        names.push(node.value)
+        nodes.push(idx)
+        modules.push(module)
+        return
+    if node.kind == "test_decl":
+        names.push("test " + node.value)
+        nodes.push(idx)
+        modules.push(module)
+        return
+    if node.kind == "module" or node.kind == "pub" or node.kind == "impl_decl":
+        for child in node.children:
+            collect_functions(child, module, names, nodes, modules)
+
+# the first name a subtree calls that is a spawning function, or ""
+fn called_spawning(idx: Int, spawning: Map[String, String]) -> String:
+    node := get_node(idx)
+    if node.kind == "call" and node.children.len() > 0:
+        callee := get_node(node.children[0])
+        if (callee.kind == "ident" or callee.kind == "field_access") and spawning.contains_key(callee.value):
+            return callee.value
+    if node.kind == "method_call" and spawning.contains_key(node.value):
+        return node.value
+    for child in node.children:
+        found := called_spawning(child, spawning)
+        if found != "":
+            return found
+    return ""
+
+# the first spawn under a node, or -1
+fn first_spawn(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.kind == "spawn":
+        return idx
+    for child in node.children:
+        found := first_spawn(child)
+        if found >= 0:
+            return found
+    return 0 - 1
+
+fn lint_module_globals(root_idx: Int, file: String, spawn_at: String, out: List[Diagnostic]):
+    root := get_node(root_idx)
+    mut candidates: List[Int] := []
+    for child in root.children:
+        mut node := get_node(child)
+        mut idx := child
+        if node.kind == "pub" and node.children.len() > 0:
+            idx = node.children[0]
+            node = get_node(idx)
+        # a threadlocal global is wrapped, and is one copy per thread
+        if node.kind == "binding" and node.value.contains(" mut") and not node.value.contains(" guard:"):
+            if holds_shared_buffer(node):
+                candidates.push(idx)
+    if candidates.len() == 0:
+        return
+    mut written: Map[String, Bool] := {}
+    for child in root.children:
+        mut idx := child
+        if get_node(idx).kind == "pub" and get_node(idx).children.len() > 0:
+            idx = get_node(idx).children[0]
+        # a global's own initializer runs at module init, before any task
+        kind := get_node(idx).kind
+        if kind != "binding" and kind != "threadlocal":
+            collect_writes(idx, written)
+    for idx in candidates:
+        node := get_node(idx)
+        name := binding_name(node.value)
+        if written.contains_key(name):
+            out.push(Diagnostic("warning", "E309", "'" + name + "' is a mut module global holding a shared buffer, written after module init, in a program that spawns tasks (" + spawn_at + ")", file, node.line, node.col, "declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init"))
+
+fn binding_name(value: String) -> String:
+    sp := value.index_of(" ")
+    if sp >= 0:
+        return value.substring(0, sp)
+    return value
+
+# whether a global's type is a list, a map, a set or a struct, read from the
+# type the checker recorded for its initializer
+fn holds_shared_buffer(node: Node) -> Bool:
+    if node.children.len() == 0:
+        return false
+    tid := c_get_expr_type(node.children[node.children.len() - 1])
+    if is_error_type(tid):
+        return false
+    info := get_type_info(tid)
+    if info.kind == "list" or info.kind == "map" or info.kind == "set":
+        return true
+    if info.kind == "struct":
+        base := get_type_name(tid)
+        bracket := base.index_of("[")
+        mut bare := base
+        if bracket >= 0:
+            bare = base.substring(0, bracket)
+        return not SELF_SYNCHRONIZED.contains("," + bare + ",")
+    return false
+
+# the names of the module globals a subtree writes: an assignment rooted at
+# the name (`g = x`, `g[k] = x`, `g.f = x`) or a mutating method called on it
+fn collect_writes(idx: Int, written: Map[String, Bool]):
+    node := get_node(idx)
+    if node.kind == "assignment" and node.children.len() >= 1:
+        root := path_root(node.children[0])
+        if root != "":
+            written.insert(root, true)
+    if node.kind == "method_call" and node.children.len() >= 1 and MUTATING_METHODS.contains("," + node.value + ","):
+        root := path_root(node.children[0])
+        if root != "":
+            written.insert(root, true)
+    for child in node.children:
+        collect_writes(child, written)
+
+# the variable at the root of `g`, `g[k]` or `g.f`, or ""
+fn path_root(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "ident":
+        return node.value
+    if (node.kind == "index" or node.kind == "field_access") and node.children.len() >= 1:
+        return path_root(node.children[0])
+    return ""

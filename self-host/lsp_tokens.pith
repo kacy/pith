@@ -70,6 +70,8 @@ fn classify_token(kind: String, value: String, line_text: String, col: Int, len:
     if kind == "comment":
         return TOKEN_TYPE_COMMENT
     if kind == "identifier":
+        if value == "locked" and locked_heads_block(line_text, col, len):
+            return TOKEN_TYPE_KEYWORD
         first := ord(value[0])
         if first >= 65 and first <= 90:
             return TOKEN_TYPE_TYPE
@@ -80,6 +82,18 @@ fn classify_token(kind: String, value: String, line_text: String, col: Int, len:
     if OPERATOR_KINDS.contains("," + kind + ","):
         return TOKEN_TYPE_OPERATOR
     return 0 - 1
+
+# `locked` is a keyword only where it opens a block: first on its line and
+# followed by a space and the mutex, the same test the parser makes.
+fn locked_heads_block(line_text: String, col: Int, len: Int) -> Bool:
+    mut i := 0
+    while i < col - 1 and i < line_text.len():
+        b := ord(line_text[i])
+        if b != 32 and b != 9:
+            return false
+        i = i + 1
+    after := col - 1 + len
+    return after + 1 < line_text.len() and ord(line_text[after]) == 32 and is_ident_byte(ord(line_text[after + 1]))
 
 # the document split into lines once, so per-token position conversion
 # works on the token's line instead of rescanning the whole text.

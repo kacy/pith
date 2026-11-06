@@ -1,0 +1,32 @@
+# a locked block re-evaluates its mutex expression at every exit to unlock
+# it, so the expression must be a path to a Mutex that the body leaves alone.
+mut m := Mutex()
+mut locks: List[Mutex] := [Mutex(), Mutex()]
+
+fn pick() -> Mutex:
+    return m
+
+fn not_a_mutex():
+    n := 3
+    locked n:
+        print("no")
+
+fn not_a_path():
+    locked pick():
+        print("no")
+
+fn rebinds_root():
+    mut held := Mutex()
+    locked held:
+        held = Mutex()
+
+fn moves_index():
+    mut i := 0
+    locked locks[i]:
+        i = 1
+
+fn main():
+    not_a_mutex()
+    not_a_path()
+    rebinds_root()
+    moves_index()

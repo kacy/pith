@@ -1488,6 +1488,13 @@ fn parse_statement() -> Int:
     if _cur_tok_kind() == "kw_weak":
         return parse_binding()
 
+    # `locked m:` holds a mutex for a block. `locked` is a keyword only here,
+    # where an identifier or `self` follows it, so a variable named `locked`
+    # still parses everywhere else.
+    if _cur_tok_kind() == "identifier" and _cur_tok_value() == "locked":
+        if _peek_ahead_kind(1) == "identifier" or _peek_ahead_kind(1) == "kw_self":
+            return parse_locked_stmt()
+
     # binding: name := expr or name: Type := expr
     if _cur_tok_kind() == "identifier":
         if _peek_ahead_kind(1) == "colon_eq":
@@ -1530,6 +1537,24 @@ fn parse_defer_stmt() -> Int:
     inner := parse_statement()
     mut children: List[Int] := [inner]
     return add_node_with_position("defer", "", children)
+
+# `locked <mutex>: <block>` takes the mutex, runs the block and releases the
+# mutex on every exit from it. the node's children are the mutex expression,
+# a `lock()` call and an `unlock()` call on that same expression, and the
+# block. the emitter runs the first call on entry and registers the second as
+# a defer of the block, so every exit edge a defer covers also unlocks.
+fn parse_locked_stmt() -> Int:
+    advance_token()
+    mutex := parse_expression()
+    expect("colon")
+    body := parse_block()
+    at := get_node(mutex)
+    mut lock_args: List[Int] := [mutex]
+    lock_call := add_node("method_call", "lock", lock_args, at.line, at.col)
+    mut unlock_args: List[Int] := [mutex]
+    unlock_call := add_node("method_call", "unlock", unlock_args, at.line, at.col)
+    mut children: List[Int] := [mutex, lock_call, unlock_call, body]
+    return add_node("locked_stmt", "", children, at.line, at.col)
 
 # `errdefer <stmt>`: same shape as defer, but the emitter only re-emits it at
 # the error-exit edges (fail / `!`-propagation), never on a normal return or

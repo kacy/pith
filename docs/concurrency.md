@@ -224,19 +224,31 @@ freed when the last holder is released. a task started with `spawn` holds
 its own count on each one it receives, so it can keep using it after the
 function that created it returns.
 
-`Mutex()` guards a section that must not run twice at once:
+`Mutex()` guards a section that must not run twice at once, and a `locked`
+block holds it for the length of the block:
 
 ```pith
 mut rooms: Map[String, Room] := {}
 mut rooms_mu := Mutex()
 
 fn join(name: String, member: String):
-    rooms_mu.lock()
-    room := rooms.get(name).unwrap_or(Room(name, []))
-    room.members.push(member)
-    rooms[name] = room
-    rooms_mu.unlock()
+    locked rooms_mu:
+        room := rooms.get(name).unwrap_or(Room(name, []))
+        room.members.push(member)
+        rooms[name] = room
 ```
+
+the block takes the mutex on entry and releases it on every way out of the
+block: the end of the block, `return`, `fail`, a `!` that propagates, `break`
+and `continue`. the release runs after the block's own `defer`s. the mutex
+must be a variable, a field, or a list element indexed by a variable or a
+literal, and the block may not change it (E272). a `locked` block inside
+another one on the same mutex is a deadlock and a compile error (E273).
+
+`rooms_mu.lock()` and `rooms_mu.unlock()` are still there for a lock that
+has to be released partway through and taken again, as `std.crypto.jwks`
+does around a key fetch. `locked` is a keyword only at the head of a block,
+so a variable named `locked` still works.
 
 `examples/room_registry.pith` is this worked through: a registry several
 tasks read and write, a counter, a capped flush, and a group over the rooms.

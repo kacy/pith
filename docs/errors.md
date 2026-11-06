@@ -786,6 +786,37 @@ error[E270]: 'mk' declares a return type, but a path through its body reaches th
 error[E270]: this closure returns a value, but a path through its body reaches the end without returning one
 ```
 
+### E272 — a locked block's mutex
+
+`locked m:` takes `m` on entry and releases it at every exit from the block,
+which means evaluating `m` again at each exit. so `m` has to be a path that
+names the same `Mutex` every time: a variable, `self`, a field read off one,
+or a list element indexed by a variable or a literal. the body may not
+assign the path, a part of it, or an index variable in it, and may not
+rebind one of those names, since the unlock would then reach a different
+mutex. a `locked` block outside a function is rejected the same way.
+
+```
+error[E272]: locked needs a Mutex, got Int
+error[E272]: a locked block needs a variable, a field or an indexed element that holds a Mutex
+  fix: bind the mutex to a name first: `m := pick_lock()`, then `locked m:`
+error[E272]: the body of this locked block changes 'i', so the unlock at its exit could reach a different mutex
+  fix: change 'i' outside the locked block
+```
+
+### E273 — locking a mutex the block already holds
+
+a `Mutex` is not reentrant. a `locked` block nested inside one that already
+holds the same mutex would park the task on itself for good, so the checker
+rejects it. the check compares the two paths as written, inside one function
+or closure body: it does not follow a call into a function that takes the
+same lock.
+
+```
+error[E273]: 'm' is already held by an enclosing locked block, and locking it again would deadlock
+  fix: remove the inner locked block; the outer one already holds the mutex
+```
+
 ---
 
 ## lint errors (E3xx)

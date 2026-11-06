@@ -142,6 +142,8 @@ pub fn statement_always_leaves(idx: Int) -> Bool:
         return true
     if kind == "block":
         return block_always_leaves(node)
+    if kind == "locked_stmt":
+        return node.children.len() >= 4 and statement_always_leaves(node.children[3])
     if kind == "if_stmt":
         return if_always_leaves(node)
     if kind == "if_let":

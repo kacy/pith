@@ -320,6 +320,10 @@ fn print_stmt(idx: Int, indent: Int):
         print_while_stmt(idx, indent)
         return
 
+    if node.kind == "locked_stmt":
+        print_locked_stmt(idx, indent)
+        return
+
     if node.kind == "match_expr":
         print_match(idx, indent)
         return
@@ -397,6 +401,14 @@ fn print_while_stmt(idx: Int, indent: Int):
     print_line(indent, "while")
     print_expr(node.children[0], indent + 1)
     print_block_contents(node.children[1], indent + 1)
+
+# children[0] is the mutex; the lock and unlock calls at 1 and 2 are
+# generated, so only the mutex and the body are shown
+fn print_locked_stmt(idx: Int, indent: Int):
+    node := get_node(idx)
+    print_line(indent, "locked")
+    print_expr(node.children[0], indent + 1)
+    print_block_contents(node.children[3], indent + 1)
 
 fn print_match(idx: Int, indent: Int):
     node := get_node(idx)
@@ -594,7 +606,7 @@ fn print_expr(idx: Int, indent: Int):
         return
 
     # statement nodes appearing as expressions
-    if node.kind == "binding" or node.kind == "assignment" or node.kind == "if_stmt" or node.kind == "for_stmt" or node.kind == "while_stmt" or node.kind == "return" or node.kind == "fail" or node.kind == "break" or node.kind == "continue":
+    if node.kind == "binding" or node.kind == "assignment" or node.kind == "if_stmt" or node.kind == "for_stmt" or node.kind == "while_stmt" or node.kind == "locked_stmt" or node.kind == "return" or node.kind == "fail" or node.kind == "break" or node.kind == "continue":
         print_stmt(idx, indent)
         return
 

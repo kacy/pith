@@ -2038,6 +2038,8 @@ fn check_statement(node_idx: Int, scope_id: Int):
         check_defer_statement(node, scope_id)
     elif node.kind == "errdefer":
         check_errdefer_statement(node, scope_id)
+    elif node.kind == "locked_stmt":
+        check_locked_statement(node, scope_id)
     else:
         # expression statement
         c_check_expr(node_idx, scope_id)
@@ -2090,7 +2092,7 @@ fn defer_body_has_forbidden_node(idx: Int) -> Bool:
     k := node.kind
     if k == "return" or k == "fail" or k == "break" or k == "continue":
         return true
-    if k == "defer" or k == "errdefer" or k == "binding" or k == "bind":
+    if k == "defer" or k == "errdefer" or k == "binding" or k == "bind" or k == "locked_stmt":
         return true
     if k == "try" or k == "try_expr" or k == "unwrap":
         return true
@@ -2098,6 +2100,109 @@ fn defer_body_has_forbidden_node(idx: Int) -> Bool:
         if defer_body_has_forbidden_node(child):
             return true
     return false
+
+# the mutex paths of the `locked` blocks around the statement being checked,
+# innermost last. a nested block on a path already here would deadlock, since
+# a mutex is not reentrant. a closure body starts its own list.
+mut locked_paths: List[String] := []
+
+# `locked m: body` lowers to `m.lock()`, the body, and `m.unlock()` at every
+# exit, so the mutex expression is evaluated again at each exit. it must be a
+# path that names the same mutex every time: a variable, `self`, field reads
+# off one, or an index by a variable or literal. the body may not assign or
+# rebind any part of that path.
+fn check_locked_statement(node: Node, scope_id: Int):
+    if node.children.len() < 4:
+        return
+    if get_scope_return_type(scope_id) < 0:
+        report_error("E272", "a locked block is only allowed inside a function")
+        return
+    mutex_idx := node.children[0]
+    path := locked_path_text(mutex_idx)
+    if path == "":
+        report_error_with_fix_at(mutex_idx, "E272", "a locked block needs a variable, a field or an indexed element that holds a Mutex", "bind the mutex to a name first: `m := pick_lock()`, then `locked m:`")
+        return
+    mutex_type := c_check_expr(mutex_idx, scope_id)
+    if is_error_type(mutex_type):
+        return
+    if get_type_name(mutex_type) != "Mutex":
+        report_error_at(mutex_idx, "E272", "locked needs a Mutex, got " + get_type_name(mutex_type))
+        return
+    if locked_paths.contains(path):
+        report_error_with_fix_at(mutex_idx, "E273", "'" + path + "' is already held by an enclosing locked block, and locking it again would deadlock", "remove the inner locked block; the outer one already holds the mutex")
+        return
+    body_idx := node.children[3]
+    names := locked_path_names(mutex_idx)
+    reassigned := locked_body_reassigns(body_idx, path, names)
+    if reassigned != "":
+        report_error_with_fix_at(mutex_idx, "E272", "the body of this locked block changes '" + reassigned + "', so the unlock at its exit could reach a different mutex", "change '" + reassigned + "' outside the locked block")
+        return
+    c_check_expr(node.children[1], scope_id)
+    c_check_expr(node.children[2], scope_id)
+    locked_paths.push(path)
+    check_block_statement(get_node(body_idx), create_scope(scope_id))
+    locked_paths.remove(locked_paths.len() - 1)
+
+# the source text of a mutex path, or "" when the expression is not one.
+fn locked_path_text(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "ident":
+        return node.value
+    if node.kind == "self":
+        return "self"
+    if node.kind == "field_access" and node.children.len() == 1:
+        base := locked_path_text(node.children[0])
+        if base == "":
+            return ""
+        return base + "." + node.value
+    if node.kind == "index" and node.children.len() == 2:
+        base := locked_path_text(node.children[0])
+        key := get_node(node.children[1])
+        if base == "":
+            return ""
+        if key.kind == "ident" or key.kind == "int_lit":
+            return base + "[" + key.value + "]"
+    return ""
+
+# every variable a mutex path reads: its root and any index variables.
+fn locked_path_names(idx: Int) -> List[String]:
+    node := get_node(idx)
+    mut names: List[String] := []
+    if node.kind == "ident":
+        names.push(node.value)
+    elif node.kind == "field_access" and node.children.len() == 1:
+        for n in locked_path_names(node.children[0]):
+            names.push(n)
+    elif node.kind == "index" and node.children.len() == 2:
+        for n in locked_path_names(node.children[0]):
+            names.push(n)
+        key := get_node(node.children[1])
+        if key.kind == "ident":
+            names.push(key.value)
+    return names
+
+# the first part of a mutex path that the body assigns or rebinds, or "".
+# an assignment counts when its target is the path or a prefix of it, or one
+# of the variables the path reads; a binding counts when it shadows one of
+# those variables. a closure body runs later, so it is not searched.
+fn locked_body_reassigns(idx: Int, path: String, names: List[String]) -> String:
+    node := get_node(idx)
+    if node.kind == "lambda":
+        return ""
+    if node.kind == "assignment" and node.children.len() >= 1:
+        target := locked_path_text(node.children[0])
+        if target != "":
+            if names.contains(target) or target == path or path.starts_with(target + ".") or path.starts_with(target + "["):
+                return target
+    if node.kind == "binding":
+        bound := extract_binding_name(node.value)
+        if names.contains(bound):
+            return bound
+    for child in node.children:
+        found := locked_body_reassigns(child, path, names)
+        if found != "":
+            return found
+    return ""
 
 # ---------------------------------------------------------------
 # binding statement
@@ -7137,7 +7242,10 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
             block_scope := create_function_scope(lambda_scope, block_expect)
             saved_infer := lambda_inferred_return
             lambda_inferred_return = 0 - 1
+            saved_locked := locked_paths
+            locked_paths = []
             check_block_statement(body_node, block_scope)
+            locked_paths = saved_locked
             if declared_return >= 0:
                 ret_type = declared_return
             elif lambda_inferred_return >= 0:

@@ -1,0 +1,102 @@
+# a `locked m:` block takes the mutex on entry and releases it on every exit:
+# falling off the end, return, fail, a `!` that propagates, break and
+# continue. each case below leaves a block one way and then takes the same
+# mutex again. a mutex is not reentrant, so a block that left it held would
+# deadlock the test there.
+mut m := Mutex()
+mut count := 0
+
+fn held() -> String:
+    m.lock()
+    m.unlock()
+    return "free"
+
+fn fall_through():
+    locked m:
+        count = count + 1
+        print("inside")
+
+fn early_return(x: Int) -> Int:
+    locked m:
+        if x > 0:
+            return x * 2
+        count = count + 1
+    return 0
+
+fn fails(x: Int) -> Int!:
+    locked m:
+        if x < 0:
+            fail "negative"
+        return x
+
+fn positive(x: Int) -> Int!:
+    if x < 0:
+        fail "negative"
+    return x
+
+fn propagates(x: Int) -> Int!:
+    locked m:
+        v := positive(x)!
+        return v + 1
+
+fn loop_exits():
+    mut i := 0
+    while i < 5:
+        i = i + 1
+        locked m:
+            if i == 2:
+                continue
+            if i == 4:
+                break
+            count = count + 1
+    print("loop stopped at {i}, count {count}: {held()}")
+
+# the body's own defers run first, then the unlock
+fn with_defers():
+    defer print("outer defer: {held()}")
+    locked m:
+        defer print("body defer")
+        print("body")
+
+struct Pool:
+    pick: Mutex
+    next: Int
+    size: Int
+
+impl Pool:
+    fn choose() -> Int:
+        locked self.pick:
+            i := self.next
+            self.next = (self.next + 1) % self.size
+            return i
+
+mut shard_mu: List[Mutex] := [Mutex(), Mutex()]
+mut shard_hits: List[Int] := [0, 0]
+
+fn hit(shard: Int):
+    locked shard_mu[shard]:
+        shard_hits[shard] = shard_hits[shard] + 1
+
+# `locked` stays an ordinary name everywhere but the head of a block
+fn plain_name() -> Bool:
+    locked := true
+    return locked
+
+fn main():
+    fall_through()
+    print("after fall through: {held()}")
+    print("return {early_return(3)}: {held()}")
+    print("no return {early_return(0)}: {held()}")
+    print("ok {fails(5) catch 0}: {held()}")
+    print("fail {fails(0 - 1) catch 0 - 9}: {held()}")
+    print("bang {propagates(0 - 1) catch 0 - 7}: {held()}")
+    loop_exits()
+    with_defers()
+    mut p := Pool(Mutex(), 0, 3)
+    print("picks {p.choose()} {p.choose()} {p.choose()} {p.choose()}")
+    hit(0)
+    hit(1)
+    hit(1)
+    print("shards {shard_hits[0]} {shard_hits[1]}")
+    print("plain name {plain_name()}")
+    print("count {count}")

@@ -19,77 +19,26 @@ import std.time as time
 from std.io import TcpStream
 
 # the config registry: a config is a plain Int handle, and everything it holds
-# lives in these handle-keyed maps. handle allocators come first. valid handles
-# are non-negative (error paths fail with a Result rather than hand back a
-# config). the two ranges are kept apart, configs from 0 and connections from a
-# high base, so a handle reads unambiguously in a trace.
+# lives in one ConfigRecord per handle. valid handles are non-negative (error
+# paths fail with a Result rather than hand back a config). config handles count
+# from 0 and connection handles from a high base, so a handle reads
+# unambiguously in a trace.
 mut next_native_conn_handle := AtomicInt(1000000)
-mut native_config_roots_pem: Map[Int, String] := {}
-mut native_config_alpn: Map[Int, List[String]] := {}
-mut native_config_resumption_enabled: Map[Int, Bool] := {}
-mut native_config_require_tls13: Map[Int, Bool] := {}
-mut native_config_skip_verification: Map[Int, Bool] := {}
-# post-handshake messages may be fragmented across sealed records; this holds
-# the incomplete tail per connection between reads.
-mut native_conn_handshake_pending: Map[Int, Bytes] := {}
-mut native_config_require_tls12: Map[Int, Bool] := {}
-mut native_client_cert_pem: Map[Int, String] := {}
-mut native_client_key_der: Map[Int, Bytes] := {}
-mut native_server_cert_pem: Map[Int, String] := {}
-mut native_server_key_der: Map[Int, Bytes] := {}
-mut native_server_client_ca_pem: Map[Int, String] := {}
-mut native_server_client_ca_optional: Map[Int, Bool] := {}
 
-# guards the whole config registry above, the two hook maps declared further
-# down, the handle counter, and the root bundle caches below. the registry is
-# not startup-only state: an https client builds a fresh config for every
-# request (see std.net.http), so one task is allocating a handle and inserting
-# while another is mid-handshake reading the same maps and a third is removing
-# from them in Config.close(). two tasks that read the counter together would
-# also land on the same handle and share a registry slot, so a handshake could
-# pick up another config's certificate and key. the lock only ever spans a
-# single map operation — pem parsing, certificate verification, and the
-# user-supplied config hooks all run off it.
-#
-# the guard block holds the state only native_config_mu's own functions touch:
-# the handle counter and the two root bundle caches described below. the
-# handle-keyed maps above go through the generic config_* accessors, which take
-# the map as an argument, so the checker cannot hold their callers to the lock;
-# they stay outside the block and keep to the accessors by convention.
+# guards the config registry, the handle counter, and the root bundle caches
+# described below. the registry is not startup-only state: an https client
+# builds a fresh config for every request (see std.net.http), so one task is
+# creating a config while another is mid-handshake reading one and a third is
+# closing one. two tasks that read the counter together would also land on the
+# same handle and share a registry slot, so a handshake could pick up another
+# config's certificate and key. the lock only ever spans a map operation and a
+# record copy. pem parsing, certificate verification, and the user-supplied
+# config hooks all run off it.
 guard native_config_mu:
     mut next_native_config_handle := 0
+    mut native_configs: Map[Int, ConfigRecord] := {}
     mut native_system_roots_pem := ""
     mut native_roots_parsed: Map[String, List[x509.Certificate]] := {}
-
-# the registry accessors. each takes native_config_mu for one map operation and
-# hands the value back to the caller, so nothing outside them touches a registry
-# map. they are generic over the value type because the registry is a dozen maps
-# of eight value types that all share this access shape.
-fn config_has[V](values: Map[Int, V], handle: Int) -> Bool:
-    locked native_config_mu:
-        found := values.contains_key(handle)
-        return found
-
-fn config_get[V](values: Map[Int, V], handle: Int, fallback: V) -> V:
-    locked native_config_mu:
-        mut out := fallback
-        if values.contains_key(handle):
-            out = values[handle]
-        return out
-
-fn config_put[V](values: Map[Int, V], handle: Int, value: V):
-    locked native_config_mu:
-        values.insert(handle, value)
-
-fn config_drop[V](values: Map[Int, V], handle: Int):
-    locked native_config_mu:
-        if values.contains_key(handle):
-            values.remove(handle)
-
-fn config_len[V](values: Map[Int, V]) -> Int:
-    locked native_config_mu:
-        n := values.len()
-        return n
 
 # the root bundle caches, guarded by native_config_mu like the registry above.
 #
@@ -110,13 +59,6 @@ fn config_len[V](values: Map[Int, V]) -> Int:
 # that bounded: a program trusting more than this many distinct bundles keeps
 # working, it just parses the ones that did not fit.
 TLS_MAX_ROOTS_CACHE := 8
-
-# hand out the next config handle, one per caller.
-fn next_config_handle() -> Int:
-    locked native_config_mu:
-        handle := next_native_config_handle
-        next_native_config_handle = next_native_config_handle + 1
-        return handle
 
 # how many server handshakes have failed since the process started. a failed
 # handshake is normal traffic — probes, scanners, clients that hang up — so a
@@ -318,6 +260,10 @@ struct NativeConnState:
     mut read_seq: Int
     mut write_seq: Int
     mut pending: Bytes
+    # the incomplete tail of a post-handshake message that spans records (a
+    # peer fragmenting its session tickets, say), kept for the next read. the
+    # record loop owns it under read_mu, like pending.
+    mut handshake_tail: Bytes
     cache_key: String
     resumption_master_secret: Bytes
     state: ConnectionState
@@ -402,6 +348,78 @@ struct ConfigHookResult:
     selected_config: Config?
     reason: String
 
+# one config's settings. an empty string, list or key means the setting is
+# absent, and a hook counts only when its has_ flag is set.
+#
+# a record is never changed once it is in the registry: config_edit changes a
+# fresh copy and stores the copy. so a record that config_record hands out can
+# be read off the lock while another task edits or closes the config. copies
+# share the alpn list, which is safe because nothing changes it in place either.
+struct ConfigRecord:
+    mut roots_pem: String
+    mut alpn: List[String]
+    mut resumption_enabled: Bool
+    mut require_tls13: Bool
+    mut require_tls12: Bool
+    mut skip_verification: Bool
+    mut has_verify_connection: Bool
+    mut verify_connection: fn(ConfigHookContext) -> ConfigHookResult
+    mut has_server_selector: Bool
+    mut server_selector: fn(ConfigHookContext) -> ConfigHookResult
+    mut client_cert_pem: String
+    mut client_key_der: Bytes
+    mut server_cert_pem: String
+    mut server_key_der: Bytes
+    mut client_ca_pem: String
+    mut client_ca_optional: Bool
+
+fn empty_config_record() -> ConfigRecord:
+    none_offered: List[String] := []
+    return ConfigRecord(roots_pem: "", alpn: none_offered, resumption_enabled: false, require_tls13: false, require_tls12: false, skip_verification: false, has_verify_connection: false, verify_connection: no_config_hook, has_server_selector: false, server_selector: no_config_hook, client_cert_pem: "", client_key_der: bytes.empty(), server_cert_pem: "", server_key_der: bytes.empty(), client_ca_pem: "", client_ca_optional: false)
+
+fn copy_config_record(r: ConfigRecord) -> ConfigRecord:
+    return ConfigRecord(roots_pem: r.roots_pem, alpn: r.alpn, resumption_enabled: r.resumption_enabled, require_tls13: r.require_tls13, require_tls12: r.require_tls12, skip_verification: r.skip_verification, has_verify_connection: r.has_verify_connection, verify_connection: r.verify_connection, has_server_selector: r.has_server_selector, server_selector: r.server_selector, client_cert_pem: r.client_cert_pem, client_key_der: r.client_key_der, server_cert_pem: r.server_cert_pem, server_key_der: r.server_key_der, client_ca_pem: r.client_ca_pem, client_ca_optional: r.client_ca_optional)
+
+# add a config to the registry under the next handle.
+fn config_create(record: ConfigRecord) -> Config:
+    mut handle := 0
+    locked native_config_mu:
+        handle = next_native_config_handle
+        next_native_config_handle = next_native_config_handle + 1
+        native_configs.insert(handle, record)
+    return Config(handle)
+
+# the config's record, or an empty one once the config is closed. handles are
+# never reissued, so a stale handle reads as empty and fails cleanly instead of
+# landing on another config's certificate and key.
+fn config_record(handle: Int) -> ConfigRecord:
+    locked native_config_mu:
+        if native_configs.contains_key(handle):
+            found := native_configs[handle]
+            return found
+    return empty_config_record()
+
+fn config_open(handle: Int) -> Bool:
+    locked native_config_mu:
+        found := native_configs.contains_key(handle)
+        return found
+
+# change a config. `edit` sets fields on a copy of the record, and the copy
+# replaces it, all under the lock, so two setters on one config cannot lose each
+# other's change. a closed config has no record, so the edit is skipped rather
+# than leaving a partial record behind.
+fn config_edit(handle: Int, edit: fn(ConfigRecord)):
+    locked native_config_mu:
+        if native_configs.contains_key(handle):
+            next := copy_config_record(native_configs[handle])
+            edit(next)
+            native_configs.insert(handle, next)
+
+fn config_close(handle: Int):
+    locked native_config_mu:
+        if native_configs.contains_key(handle):
+            native_configs.remove(handle)
+
 struct PeerIdentity:
     common_name: String
     issuer_common_name: String
@@ -478,13 +496,8 @@ fn drop_listener_config(fd: Int) -> Bool:
     # a config handle is never negative, so this is true; the read is what
     # makes `held` a use, and its count drops at this return, off the lock.
 
-# the config hooks, guarded by native_config_mu like the rest of the registry.
-mut native_config_verify_connection: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
-mut native_server_config_selector: Map[Int, fn(ConfigHookContext) -> ConfigHookResult] := {}
-
-# the value config_get falls back to when a config has no hook installed: it
-# approves the connection and selects nothing. the callers check first and only
-# reach this if the hook was removed in between.
+# the hook a record holds when none is installed: it approves the connection
+# and selects nothing. the has_ flags keep it from ever being called.
 fn no_config_hook(ctx: ConfigHookContext) -> ConfigHookResult:
     return ConfigHookResult(none, "")
 
@@ -545,9 +558,9 @@ fn native_config_handle(roots_pem: String) -> Config!:
     # parse once here so config creation fails early for bad pem data. the
     # parse is cached, so a second config over the same roots pays a lookup.
     parse_roots_cached(roots_pem)!
-    handle := next_config_handle()
-    config_put(native_config_roots_pem, handle, roots_pem)
-    return Config(handle)
+    record := empty_config_record()
+    record.roots_pem = roots_pem
+    return config_create(record)
 
 fn native_server_config_handle(cert_pem: String, key_pem: String) -> Config!:
     certs := x509.parse_pem_chain(cert_pem)!
@@ -556,14 +569,13 @@ fn native_server_config_handle(cert_pem: String, key_pem: String) -> Config!:
     key := encoding.pem_decode(key_pem)!
     if key.kind != "PRIVATE KEY":
         fail "tls private key must be pkcs#8 pem"
-    handle := next_config_handle()
-    config_put(native_server_cert_pem, handle, cert_pem)
-    config_put(native_server_key_der, handle, key.body)
-    return Config(handle)
+    record := empty_config_record()
+    record.server_cert_pem = cert_pem
+    record.server_key_der = key.body
+    return config_create(record)
 
 fn config_alpn_protocols(config: Config) -> List[String]:
-    none_offered: List[String] := []
-    return config_get(native_config_alpn, config.handle, none_offered)
+    return config_record(config.handle).alpn
 
 fn config_alpn_key(config: Config) -> String:
     protocols := config_alpn_protocols(config)
@@ -575,28 +587,30 @@ fn config_session_cache_key(config: Config, server_name: String) -> String:
     return config.handle.to_string() + "|" + server_name + "|" + config_alpn_key(config)
 
 fn config_has_client_certificate(config: Config) -> Bool:
-    return config_has(native_client_cert_pem, config.handle) and config_has(native_client_key_der, config.handle)
+    record := config_record(config.handle)
+    return record.client_cert_pem != "" and record.client_key_der.len() > 0
 
 fn config_requires_client_certificate(config: Config) -> Bool:
     # a config with client ca roots requires a certificate unless it was
-    # installed as optional; an absent flag reads as required.
-    return config_has(native_server_client_ca_pem, config.handle) and not config_get(native_server_client_ca_optional, config.handle, false)
+    # installed as optional.
+    record := config_record(config.handle)
+    return record.client_ca_pem != "" and not record.client_ca_optional
 
 fn config_requests_client_certificate(config: Config) -> Bool:
-    return config_has(native_server_client_ca_pem, config.handle)
+    return config_record(config.handle).client_ca_pem != ""
 
 fn config_resumption_enabled(config: Config) -> Bool:
-    return config_get(native_config_resumption_enabled, config.handle, false)
+    return config_record(config.handle).resumption_enabled
 
 # true when this config may negotiate the TLS 1.2 fallback (the default);
 # require_tls13() turns it off.
 fn config_offers_tls12(config: Config) -> Bool:
-    return not config_get(native_config_require_tls13, config.handle, false)
+    return not config_record(config.handle).require_tls13
 
 # true when this config offers only TLS 1.2 (a max-version cap: it will not offer
 # 1.3). require_tls12() sets it.
 fn config_max_is_tls12(config: Config) -> Bool:
-    return config_get(native_config_require_tls12, config.handle, false)
+    return config_record(config.handle).require_tls12
 
 # the der of every CERTIFICATE block in `cert_pem`, in order (leaf first).
 # `empty_message` is the failure when there are none.
@@ -611,40 +625,40 @@ fn certificate_ders_from_pem(cert_pem: String, empty_message: String) -> List[By
     return certs
 
 fn native_config_client_cert_chain(config: Config) -> List[Bytes]!:
-    cert_pem := config_get(native_client_cert_pem, config.handle, "")
+    cert_pem := config_record(config.handle).client_cert_pem
     if cert_pem == "":
         fail "native tls client certificate not found"
     return certificate_ders_from_pem(cert_pem, "tls client certificate chain is empty")!
 
 fn native_client_private_key(config: Config) -> Bytes!:
-    key := config_get(native_client_key_der, config.handle, bytes.empty())
+    key := config_record(config.handle).client_key_der
     if key.len() == 0:
         fail "native tls client key not found"
     return key
 
 fn native_config_roots(config: Config) -> List[x509.Certificate]!:
-    roots_pem := config_get(native_config_roots_pem, config.handle, "")
+    roots_pem := config_record(config.handle).roots_pem
     if roots_pem == "":
         fail "native tls client config not found"
     return parse_roots_cached(roots_pem)!
 
 fn is_native_config(config: Config) -> Bool:
-    return config_has(native_config_roots_pem, config.handle)
+    return config_record(config.handle).roots_pem != ""
 
 fn is_native_server_config(config: Config) -> Bool:
-    return config_has(native_server_cert_pem, config.handle)
+    return config_record(config.handle).server_cert_pem != ""
 
 fn is_native_conn(handle: Int) -> Bool:
     return native_conn_has(handle)
 
 fn native_server_certificate_chain(config: Config) -> List[Bytes]!:
-    cert_pem := config_get(native_server_cert_pem, config.handle, "")
+    cert_pem := config_record(config.handle).server_cert_pem
     if cert_pem == "":
         fail "native tls server config not found"
     return certificate_ders_from_pem(cert_pem, "tls certificate chain is empty")!
 
 fn native_server_private_key(config: Config) -> Bytes!:
-    key := config_get(native_server_key_der, config.handle, bytes.empty())
+    key := config_record(config.handle).server_key_der
     if key.len() == 0:
         fail "native tls server key not found"
     return key
@@ -809,7 +823,7 @@ fn verify_certificate_chain(certs: List[x509.Certificate], config: Config, serve
     # dangerously_skip_verification() disables the chain and hostname checks
     # only; record protection, the downgrade sentinel, and every other
     # handshake check still apply.
-    if config_get(native_config_skip_verification, config.handle, false):
+    if config_record(config.handle).skip_verification:
         return true
     roots := native_config_roots(config)!
     result := x509.verify_server_chain(certs, roots, server_name)
@@ -824,7 +838,7 @@ fn verify_certificate_chain(certs: List[x509.Certificate], config: Config, serve
 # caller can send the alert that names the failure instead of one code for every
 # way a chain can be wrong.
 fn verify_client_certificate_chain(certs: List[x509.Certificate], config: Config) -> String!:
-    ca_pem := config_get(native_server_client_ca_pem, config.handle, "")
+    ca_pem := config_record(config.handle).client_ca_pem
     if ca_pem == "":
         fail "native tls client ca config not found"
     roots := x509.parse_pem_chain(ca_pem)!
@@ -926,12 +940,14 @@ fn copy_client_hello_info(info: ClientHelloInfo) -> ClientHelloInfo:
     return ClientHelloInfo(info.server_name, copy_string_list(info.alpn_protocols))
 
 fn run_verify_connection_hook(config: Config, state: ConnectionState) -> Bool!:
-    if not config_has(native_config_verify_connection, config.handle):
+    record := config_record(config.handle)
+    if not record.has_verify_connection:
         return true
-    hook := config_get(native_config_verify_connection, config.handle, no_config_hook)
+    hook := record.verify_connection
     ctx := ConfigHookContext("verify_connection", copy_connection_state(state), empty_client_hello_info())
     # the hook is application code and may do anything, so it runs off the
-    # registry lock — config_get already copied the fn value out.
+    # registry lock. the record is a snapshot, so a close in the meantime
+    # cannot pull the hook out from under it.
     result := hook(ctx)
     if result.reason != "":
         fail result.reason
@@ -943,9 +959,10 @@ fn select_server_config(config: Config, client_hello: tls13.ClientHello) -> Conf
 # the server-name-based config selection shared by the 1.3 and 1.2 handshakes,
 # so a name-based virtual host works on the fallback too.
 fn select_server_config_for(config: Config, server_name: String, alpn_protocols: List[String]) -> Config!:
-    if not config_has(native_server_config_selector, config.handle):
+    record := config_record(config.handle)
+    if not record.has_server_selector:
         return config
-    selector := config_get(native_server_config_selector, config.handle, no_config_hook)
+    selector := record.server_selector
     info := ClientHelloInfo(server_name, copy_string_list(alpn_protocols))
     ctx := ConfigHookContext("select_server_config", empty_connection_state(), copy_client_hello_info(info))
     # application code again: called off the lock.
@@ -1160,7 +1177,7 @@ fn lookup_resumable_client_session(cache_key: String) -> CachedSession:
         return session
 
 fn allocate_native_conn(stream: TcpStream, version: Int, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState, read_secret: Bytes, write_secret: Bytes) -> Conn:
-    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false, read_secret: read_secret, write_secret: write_secret, key_updates_received: 0, key_update_responded: false)
+    cs := NativeConnState(fd: stream.fd, cipher: cipher, read_key: read_keys.key, read_iv: read_keys.iv, write_key: write_keys.key, write_iv: write_keys.iv, read_seq: read_seq, write_seq: write_seq, pending: bytes.empty(), handshake_tail: bytes.empty(), cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, write_mu: Mutex(), read_mu: Mutex(), failed: false, read_secret: read_secret, write_secret: write_secret, key_updates_received: 0, key_update_responded: false)
     return Conn(native_conn_register(cs))
 
 # write a plaintext fatal alert before tearing a handshake down, so the peer
@@ -3012,11 +3029,11 @@ fn read_conn_records(handle: Int, cs: NativeConnState, size: Int, lead: Bytes) -
                 fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "empty tls handshake record")
             # post-handshake messages may span records (a peer fragmenting its
             # session tickets, say); keep the incomplete tail for the next read.
-            combined := bytes.concat(config_get(native_conn_handshake_pending, handle, bytes.empty()), inner.payload)
+            combined := bytes.concat(cs.handshake_tail, inner.payload)
             if combined.len() > TLS_MAX_HANDSHAKE_FLIGHT:
                 fail conn_refuse_with(cs, ALERT_DECODE_ERROR, "tls post-handshake message is too large")
             messages := tls13.decode_handshakes_prefix(combined)
-            config_put(native_conn_handshake_pending, handle, combined.slice(tls13.handshakes_encoded_len(messages), combined.len()))
+            cs.handshake_tail = combined.slice(tls13.handshakes_encoded_len(messages), combined.len())
             for message in messages:
                 # a HelloRequest to a client or ClientHello to a server on an
                 # established 1.2 connection is a renegotiation attempt; this
@@ -3110,7 +3127,6 @@ fn send_close_notify(cs: NativeConnState) -> Int!:
 fn native_conn_close(handle: Int):
     if not native_conn_has(handle):
         return
-    config_drop(native_conn_handshake_pending, handle)
     cs := native_conn_get(handle)
     send_close_notify(cs) catch 0
     tcp_close(cs.fd)
@@ -3209,7 +3225,11 @@ pub fn server_config(cert_path: String, key_path: String) -> Config!:
 
 # install a server-side config selector that runs before the native handshake.
 pub fn with_config_selector(config: Config, chooser: fn(ClientHelloInfo) -> Config) -> Config:
-    config_put(native_server_config_selector, config.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(chooser(ctx.client_hello), ""))
+    selector := fn(ctx: ConfigHookContext) => ConfigHookResult(chooser(ctx.client_hello), "")
+    install := fn(r: ConfigRecord):
+        r.has_server_selector = true
+        r.server_selector = selector
+    config_edit(config.handle, install)
     return config
 
 # dial a tls server with system roots and host name verification.
@@ -3304,7 +3324,12 @@ pub fn release_listener_config(listener: Listener):
 # an open server config pins its certificate pem and its private key der in the
 # registry for as long as it stays open.
 pub fn open_server_configs() -> Int:
-    return config_len(native_server_cert_pem)
+    locked native_config_mu:
+        mut n := 0
+        for handle in native_configs.keys():
+            if native_configs[handle].server_cert_pem != "":
+                n = n + 1
+        return n
 
 # how many server handshakes have failed since this process started.
 #
@@ -3339,10 +3364,9 @@ impl Config:
         for protocol in protocols:
             if protocol != "":
                 next_protocols.push(protocol)
-        if next_protocols.len() == 0:
-            config_drop(native_config_alpn, self.handle)
-            return self
-        config_put(native_config_alpn, self.handle, next_protocols)
+        install := fn(r: ConfigRecord):
+            r.alpn = next_protocols
+        config_edit(self.handle, install)
         return self
 
     fn with_client_certificate(cert_path: String, key_path: String) -> Config!:
@@ -3354,24 +3378,32 @@ impl Config:
         key := encoding.pem_decode(key_pem)!
         if key.kind != "PRIVATE KEY":
             fail "tls client private key must be pkcs#8 pem"
-        config_put(native_client_cert_pem, self.handle, cert_pem)
-        config_put(native_client_key_der, self.handle, key.body)
+        install := fn(r: ConfigRecord):
+            r.client_cert_pem = cert_pem
+            r.client_key_der = key.body
+        config_edit(self.handle, install)
         return self
 
     fn require_client_ca_file(path: String) -> Config!:
         roots_pem := read_client_ca_bundle(path)!
-        config_put(native_server_client_ca_pem, self.handle, roots_pem)
-        config_drop(native_server_client_ca_optional, self.handle)
+        install := fn(r: ConfigRecord):
+            r.client_ca_pem = roots_pem
+            r.client_ca_optional = false
+        config_edit(self.handle, install)
         return self
 
     fn request_client_ca_file(path: String) -> Config!:
         roots_pem := read_client_ca_bundle(path)!
-        config_put(native_server_client_ca_pem, self.handle, roots_pem)
-        config_put(native_server_client_ca_optional, self.handle, true)
+        install := fn(r: ConfigRecord):
+            r.client_ca_pem = roots_pem
+            r.client_ca_optional = true
+        config_edit(self.handle, install)
         return self
 
     fn enable_session_resumption() -> Config:
-        config_put(native_config_resumption_enabled, self.handle, true)
+        install := fn(r: ConfigRecord):
+            r.resumption_enabled = true
+        config_edit(self.handle, install)
         return self
 
     # Restrict this config to TLS 1.3 only, refusing the TLS 1.2 fallback.
@@ -3381,7 +3413,9 @@ impl Config:
     # crypto/tls and rustls. Call this when a peer must not be allowed to
     # negotiate 1.2 — the equivalent of setting a minimum version of 1.3.
     fn require_tls13() -> Config:
-        config_put(native_config_require_tls13, self.handle, true)
+        install := fn(r: ConfigRecord):
+            r.require_tls13 = true
+        config_edit(self.handle, install)
         return self
 
     # Disable certificate-chain and hostname verification on a client config.
@@ -3391,7 +3425,9 @@ impl Config:
     # and must never ship in production configuration; prefer
     # client_config_with_ca_file with the peer's real root.
     fn dangerously_skip_verification() -> Config:
-        config_put(native_config_skip_verification, self.handle, true)
+        install := fn(r: ConfigRecord):
+            r.skip_verification = true
+        config_edit(self.handle, install)
         return self
 
     # Restrict this client config to TLS 1.2 only — a maximum-version cap. The
@@ -3399,11 +3435,17 @@ impl Config:
     # 1.3-capable server. This is the inverse of require_tls13(); the two are
     # mutually exclusive and require_tls12 takes effect if both are set.
     fn require_tls12() -> Config:
-        config_put(native_config_require_tls12, self.handle, true)
+        install := fn(r: ConfigRecord):
+            r.require_tls12 = true
+        config_edit(self.handle, install)
         return self
 
     fn with_verify_connection(verify: fn(ConnectionState) -> String) -> Config:
-        config_put(native_config_verify_connection, self.handle, fn(ctx: ConfigHookContext) => ConfigHookResult(none, verify(ctx.state)))
+        hook := fn(ctx: ConfigHookContext) => ConfigHookResult(none, verify(ctx.state))
+        install := fn(r: ConfigRecord):
+            r.has_verify_connection = true
+            r.verify_connection = hook
+        config_edit(self.handle, install)
         return self
 
     # give the config's registry slot back.
@@ -3428,25 +3470,11 @@ impl Config:
     # handshake timeout after the accept returned. so a server closes its
     # config after the drain, never before it.
     #
-    # every map a config can write to is dropped here. missing one would move
-    # the leak rather than fix it, so there is a test that walks all of them.
-    # a handle is never reissued, so a use after close reads an empty registry
-    # and fails — it cannot land on another config's certificate and key.
+    # the whole record goes in one removal, so no setting outlives the config.
+    # a handle is never reissued, so a use after close reads an empty record
+    # and fails. it cannot land on another config's certificate and key.
     fn close():
-        config_drop(native_config_roots_pem, self.handle)
-        config_drop(native_config_alpn, self.handle)
-        config_drop(native_config_resumption_enabled, self.handle)
-        config_drop(native_config_require_tls13, self.handle)
-        config_drop(native_config_require_tls12, self.handle)
-        config_drop(native_config_skip_verification, self.handle)
-        config_drop(native_config_verify_connection, self.handle)
-        config_drop(native_server_config_selector, self.handle)
-        config_drop(native_client_cert_pem, self.handle)
-        config_drop(native_client_key_der, self.handle)
-        config_drop(native_server_cert_pem, self.handle)
-        config_drop(native_server_key_der, self.handle)
-        config_drop(native_server_client_ca_pem, self.handle)
-        config_drop(native_server_client_ca_optional, self.handle)
+        config_close(self.handle)
         return
 
 # a config gives its registry slot back when the last value naming it goes
@@ -3690,14 +3718,14 @@ test "tls config helpers track alpn, client auth, and resumption":
     assert_eq(config_alpn_protocols(client_cfg)[0], "pith.rpc")
     assert(config_has_client_certificate(client_cfg))
     assert(config_resumption_enabled(client_cfg))
-    assert(config_has(native_config_verify_connection, client_cfg.handle))
+    assert(config_record(client_cfg.handle).has_verify_connection)
     assert_eq(select_alpn_protocol(server_cfg, ["pith.rpc", "http/1.1"])!, "pith.rpc")
     assert(select_alpn_protocol(server_cfg, ["http/1.1"]).is_err)
     assert_eq(select_alpn_protocol(server_cfg, [])!, "")
     assert(config_requests_client_certificate(server_cfg))
     assert(config_requires_client_certificate(server_cfg))
-    assert(config_has(native_config_verify_connection, server_cfg.handle))
-    assert(config_has(native_server_config_selector, server_cfg.handle))
+    assert(config_record(server_cfg.handle).has_verify_connection)
+    assert(config_record(server_cfg.handle).has_server_selector)
 
     optional_cfg := server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.request_client_ca_file("tests/live/fixtures/localhost-ca.crt")!
     assert(config_requests_client_certificate(optional_cfg))
@@ -3707,23 +3735,13 @@ test "tls config helpers track alpn, client auth, and resumption":
     server_cfg.close()
     optional_cfg.close()
 
-test "closing a client config empties every registry map it wrote to":
+test "closing a client config removes its registry record":
     cfg := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["pith.rpc"]).with_client_certificate("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.enable_session_resumption().require_tls13().with_verify_connection(verify_state_accept)
     assert(is_native_config(cfg))
 
     cfg.close()
 
-    # every map a client config can write to has to be empty afterwards. a
-    # close that misses one moves the leak rather than fixing it, and the miss
-    # is invisible from the outside because the handle is never reissued.
-    assert(not config_has(native_config_roots_pem, cfg.handle))
-    assert(not config_has(native_config_alpn, cfg.handle))
-    assert(not config_has(native_config_resumption_enabled, cfg.handle))
-    assert(not config_has(native_config_require_tls13, cfg.handle))
-    assert(not config_has(native_config_require_tls12, cfg.handle))
-    assert(not config_has(native_config_verify_connection, cfg.handle))
-    assert(not config_has(native_client_cert_pem, cfg.handle))
-    assert(not config_has(native_client_key_der, cfg.handle))
+    assert(not config_open(cfg.handle))
     assert(not is_native_config(cfg))
 
     # a closed config is dead rather than dangerous: handles count up and are
@@ -3735,7 +3753,7 @@ test "closing a client config empties every registry map it wrote to":
     # closing again is a no-op, so a failure path can close unconditionally.
     cfg.close()
 
-test "closing a server config empties every registry map it wrote to":
+test "closing a server config removes its registry record":
     before := open_server_configs()
     cfg := server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.with_alpn(["pith.rpc"]).request_client_ca_file("tests/live/fixtures/localhost-ca.crt")!
     assert(is_native_server_config(cfg))
@@ -3743,14 +3761,9 @@ test "closing a server config empties every registry map it wrote to":
 
     cfg.close()
 
-    # the server half of the client test above. the certificate pem and the
-    # private key der are the expensive entries here, so a close that misses one
-    # keeps a key in memory for the rest of the process.
-    assert(not config_has(native_server_cert_pem, cfg.handle))
-    assert(not config_has(native_server_key_der, cfg.handle))
-    assert(not config_has(native_server_client_ca_pem, cfg.handle))
-    assert(not config_has(native_server_client_ca_optional, cfg.handle))
-    assert(not config_has(native_config_alpn, cfg.handle))
+    # the certificate pem and the private key der are the expensive parts of a
+    # server config, and they go with the record.
+    assert(not config_open(cfg.handle))
     assert(not is_native_server_config(cfg))
     assert_eq(open_server_configs(), before)
 
@@ -4002,3 +4015,49 @@ test "tls resumable session lookup drops expired entries and refreshes lru":
     assert_eq(found.ticket.to_string_utf8()!, "f")
     locked native_session_mu:
         assert_eq(native_client_session_cache_order[native_client_session_cache_order.len() - 1], "front")
+
+test "a setter on a closed config does not bring its record back":
+    cfg := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+    cfg.close()
+    reopened := cfg.with_alpn(["h2"]).require_tls13().enable_session_resumption()
+    assert(not config_open(reopened.handle))
+    assert_eq(config_alpn_protocols(reopened).len(), 0)
+
+test "each setter keeps the settings made before it":
+    cfg := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["h2", "http/1.1"]).require_tls13().enable_session_resumption()
+    assert_eq(config_alpn_key(cfg), "h2,http/1.1")
+    assert(not config_offers_tls12(cfg))
+    assert(config_resumption_enabled(cfg))
+    # an empty alpn list clears the setting and leaves the others alone.
+    cleared := cfg.with_alpn([])
+    assert_eq(config_alpn_key(cleared), "")
+    assert(config_resumption_enabled(cleared))
+    cfg.close()
+
+fn set_alpn_on(cfg: Config) -> Bool:
+    cfg.with_alpn(["h2"])
+    return true
+
+fn set_resumption_on(cfg: Config) -> Bool:
+    cfg.enable_session_resumption()
+    return true
+
+fn set_tls13_on(cfg: Config) -> Bool:
+    cfg.require_tls13()
+    return true
+
+test "setters racing on one config from several tasks keep every change":
+    mut round := 0
+    while round < 50:
+        cfg := client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!
+        a := spawn set_alpn_on(cfg)
+        b := spawn set_resumption_on(cfg)
+        c := spawn set_tls13_on(cfg)
+        await a
+        await b
+        await c
+        assert_eq(config_alpn_key(cfg), "h2")
+        assert(config_resumption_enabled(cfg))
+        assert(not config_offers_tls12(cfg))
+        cfg.close()
+        round = round + 1

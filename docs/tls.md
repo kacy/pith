@@ -122,10 +122,14 @@ the functions that build a config for you close it for you — `tls.dial`,
 close, because there the config came from the caller and may well be reused for
 the next connection.
 
+a closed config stays closed. a handshake on it fails, and a `with_*` or
+`require_*` call on it changes nothing, so a stale reference cannot rebuild part
+of a config after its owner closed it.
+
 what a config does **not** own is its trust anchors. root bundles are parsed
 once per distinct bundle and shared by every config that trusts them, and the
 system bundle is read from disk at most once per process, so building a config
-per request costs a few small map entries rather than a copy and a re-parse of
+per request costs one small registry record rather than a copy and a re-parse of
 a couple of hundred kilobytes of pem. that sharing is why `client_config()` is
 cheap enough to call on a hot path; closing is what keeps it that way.
 

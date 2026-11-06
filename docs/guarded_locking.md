@@ -488,10 +488,13 @@ build settled a question this page left open, or departed from it:
   takes the record under the lock and uses it after; a setter copies the
   record, changes the copy and stores it under one lock, so a record is never
   changed after it is stored.
-- **std left for later.** the HTTP/2 client's `mu` does not say which fields it covers, and its inline
-  path reads some of them under a lease protocol; and `Limiter`, `Breaker` and
-  std.concurrent's test counters keep their state in atomics, with the mutex
-  only serializing a read-modify-write.
+- **the HTTP/2 client.** `mu` and `gate` each guard a block of `Client`'s
+  fields. the stream id counter and the peer's frame size limit are atomics
+  instead, because the inline path and every request read them before taking a
+  lock. guarding the rest found two reads made without the lock.
+- **std left for later.** `Limiter`, `Breaker` and std.concurrent's test
+  counters keep their state in atomics, with the mutex only serializing a
+  read-modify-write.
 
 ## open questions
 

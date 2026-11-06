@@ -786,6 +786,27 @@ error[E270]: 'mk' declares a return type, but a path through its body reaches th
 error[E270]: this closure returns a value, but a path through its body reaches the end without returning one
 ```
 
+### E271 — guarded data without its lock
+
+data declared in a `guard` block can only be read or written with its mutex
+held: inside a `locked` block for it, or in a function marked `holding` it.
+a read counts, since reading a map while another task inserts into it is as
+unsafe as the write. a struct field under `guard pick:` needs `pick` held on
+the same value, so `p.next` needs `p.pick`, and the value has to be reached
+through a path the checker can compare: a variable, `self`, or a field read
+off one. a call to a function marked `holding m` needs `m` held at the call;
+a path rooted at `self` is read off the receiver, and one rooted at a
+parameter off that argument. a closure body runs when it is called, so the
+locks held where it is made do not count inside it. code outside a function
+runs at module init, before any task, and needs no lock.
+
+```
+error[E271]: 'cache' is guarded by cache_mu, which is not held here
+  fix: wrap the access in `locked cache_mu:`, or mark the function `holding cache_mu`
+error[E271]: 'p.next' is guarded by p.pick, which is not held here
+error[E271]: 'evict' must be called holding cache_mu, which is not held here
+```
+
 ### E272 — a locked block's mutex
 
 `locked m:` takes `m` on entry and releases it at every exit from the block,
@@ -815,6 +836,20 @@ same lock.
 ```
 error[E273]: 'm' is already held by an enclosing locked block, and locking it again would deadlock
   fix: remove the inner locked block; the outer one already holds the mutex
+```
+
+### E274 — a guard block's shape
+
+a module guard block holds only `mut` globals, and none of them may be `pub`,
+since another module could not take the mutex. a sharded guard,
+`guard m[n]:`, needs a count of at least 1 and is only allowed on module
+globals. a guard block is not allowed in a generic struct.
+
+```
+error[E274]: a guarded global cannot be pub, since another module could not take its mutex
+error[E274]: a guard block holds only `mut` globals
+error[E274]: a sharded guard is only allowed on module globals
+error[E274]: a guard block is not allowed in a generic struct
 ```
 
 ---

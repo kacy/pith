@@ -1,0 +1,50 @@
+# data in a guard block can only be touched with its mutex held: inside a
+# `locked` block for it, or in a function marked `holding` it. a closure
+# body runs later, so a lock around where it is made does not count.
+guard cache_mu:
+    mut cache: Map[Int, String] := {}
+
+struct Pool:
+    size: Int
+    guard pick:
+        next: Int
+
+impl Pool:
+    fn bump() holding self.pick:
+        self.next = self.next + 1
+
+fn evict(k: Int) holding cache_mu:
+    cache.remove(k)
+
+fn make_pool() -> Pool:
+    return Pool(2, 0)
+
+fn read_unlocked(k: Int) -> Bool:
+    return cache.contains_key(k)
+
+fn field_unlocked(p: Pool) -> Int:
+    return p.next
+
+fn field_wrong_lock(p: Pool, q: Pool) -> Int:
+    locked q.pick:
+        return p.next
+
+fn not_a_path() -> Int:
+    locked cache_mu:
+        return make_pool().next
+
+fn call_unlocked():
+    evict(1)
+
+fn method_unlocked(p: Pool):
+    p.bump()
+
+fn closure_later() -> fn() -> Int:
+    locked cache_mu:
+        return fn() -> Int => cache.len()
+
+fn main():
+    print("{read_unlocked(1)} {field_unlocked(make_pool())} {not_a_path()}")
+    call_unlocked()
+    method_unlocked(make_pool())
+    print("{field_wrong_lock(make_pool(), make_pool())} {closure_later()()}")

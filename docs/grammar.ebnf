@@ -106,7 +106,14 @@ top_level_decl = [ "pub" ] , ( fn_decl
                               | impl_decl
                               | type_alias
                               | test_decl
+                              | guard_block
                               | [ "threadlocal" ] , binding ) , NEWLINE ;
+
+(* a guard block declares a mutex, or n of them, and the mut globals it   *)
+(* protects. `guard` is a keyword only here and in a struct body.          *)
+guard_block   = "guard" , IDENT , [ "[" , INT , "]" ] , ":" , NEWLINE
+              , INDENT , { "mut" , binding_tail , NEWLINE } , DEDENT ;
+binding_tail  = IDENT , [ ":" , type_expr ] , ":=" , expression ;
 
 test_decl     = "test" , STRING_LIT , [ tag_list ] , ":" , block ;
 tag_list      = "[" , IDENT , { "," , IDENT } , "]" ;
@@ -118,7 +125,10 @@ tag_list      = "[" , IDENT , { "," , IDENT } , "]" ;
 
 (* functions *)
 fn_decl       = "fn" , IDENT , [ generic_params ] , "(" , [ param_list ] , ")"
-              , [ "->" , type_expr ] , ":" , block ;
+              , [ "->" , type_expr ] , [ holding ] , ":" , block ;
+
+(* the mutexes a caller must hold. `holding` is a keyword only here. *)
+holding       = "holding" , mutex_path , { "," , mutex_path } ;
 
 param_list    = param , { "," , param } ;
 param         = [ "mut" ] , [ "ref" ] , IDENT , ":" , type_expr , [ "=" , expression ] ;
@@ -129,6 +139,11 @@ type_bound     = type_expr , { "+" , type_expr } ;
 
 (* structs *)
 struct_decl   = "struct" , IDENT , [ generic_params ] , ":" , NEWLINE
+              , INDENT , { ( struct_field | struct_guard ) NEWLINE } , DEDENT ;
+
+(* a struct guard adds a Mutex field, defaulting to a new one, after the  *)
+(* struct's other fields, and guards the fields under it.                 *)
+struct_guard  = "guard" , IDENT , ":" , NEWLINE
               , INDENT , { struct_field NEWLINE } , DEDENT ;
 
 struct_field  = [ "pub" ] , [ "mut" ] , [ "weak" ] , IDENT , ":" , type_expr

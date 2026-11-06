@@ -449,6 +449,46 @@ bottom up, one squash-merged commit per stage. before each merge the next pull
 request is retargeted to main, and main's own CI run on each merged commit
 must be green before the next stage merges.
 
+## as built
+
+stages 1 to 3 are #1324, #1325 and the sharing lint after them. where the
+build settled a question this page left open, or departed from it:
+
+- **error codes.** E271 is an access or a call without the lock. E272 is a
+  `locked` or `holding` path that is not a path to a `Mutex`, or a `locked`
+  body that changes its own path, since the unlock re-reads the path at each
+  exit. E273 is a `locked` block on a path an enclosing block or the
+  function's `holding` already holds. E274 is a guard block's shape. E309 is
+  the sharing lint.
+- **the mutex path.** `locked` and `holding` take a variable, `self`, a field
+  read off one, or a list element indexed by a variable or a literal. a call
+  result such as `locked pick_lock():` is refused, because the path is
+  evaluated again to unlock.
+- **guard blocks lower to plain declarations.** a module block becomes
+  `m := Mutex()` and the globals; a struct block adds `m: Mutex = Mutex()` as
+  the struct's last field, so a constructor call leaves it out. the emitter is
+  unchanged.
+- **guarded globals are private.** a `pub` global in a guard block is E274,
+  since no other module can name the mutex. a sharded guard is for module
+  globals only, and a generic struct cannot have a guard block.
+- **`holding` on a list.** `holding shard_mu` on a `List[Mutex]` is satisfied by
+  holding any element, which lets a whole-registry operation run under every
+  shard: std/metrics.pith takes all eight by a recursion that nests eight
+  `locked` blocks, in index order.
+- **"a program that spawns".** the lint counts a program as spawning when a
+  function in the linted file holds a `spawn` or calls, by name, a function
+  that does. a `spawn` merely present in an imported module does not count, so
+  the compiler, which imports std.concurrent without spawning, is not flagged.
+- **what counts as a write.** an assignment rooted at the global, or a mutating
+  method called on it. a write through a function that takes the collection as
+  an argument is not seen.
+- **std left for later.** the TLS config registry passes its maps into generic
+  accessors that take the lock themselves, which the checker cannot follow;
+  the HTTP/2 client's `mu` does not say which fields it covers, and its inline
+  path reads some of them under a lease protocol; and `Limiter`, `Breaker` and
+  std.concurrent's test counters keep their state in atomics, with the mutex
+  only serializing a read-modify-write.
+
 ## open questions
 
 - **the words.** `guard`, `locked` and `holding` are the current choice.
@@ -458,8 +498,8 @@ must be green before the next stage merges.
   shared with a spawned task is already E248 when it is a collection, so a
   `guard` block inside a function body is left out until a case needs it.
 - **the sharded form.** `guard shard_mu[8]:` fixes the count at compile time,
-  which matches std/metrics.pith. a shard count chosen at run time would need
-  another form.
+  which matches std/metrics.pith, std/trace.pith and the TLS connection
+  shards. a shard count chosen at run time would need another form.
 - **struct fields and the sharing rule.** E248 misses a struct holding a
   collection. widening it to structs whose fields are collections, unless
   those fields are in a `guard` block, would close that gap and is a smaller

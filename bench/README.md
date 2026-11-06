@@ -26,7 +26,7 @@ So, two habits:
 Absolute times are only comparable within a run. Memory columns are far more
 stable than time columns and carry most of the signal here.
 
-## the full suite against go and rust (2026-11-04)
+## the full suite against go and rust (2026-11-05)
 
 ### at a glance
 
@@ -36,28 +36,28 @@ have every benchmark, with arguments and caveats.
 
 | area | benchmarks | against go | against rust |
 |---|---|---|---|
-| substring search | `substring_search` | 2.3-5.0x faster | 2.0-5.0x faster |
-| JSON decoding | `json_decode_shapes` (6 shapes) | 1.3-5.4x faster | 2.5x faster to 1.4x slower |
-| walking decoded JSON | `json_decode_shapes/list_walk` | 5.0x slower | 8.9x slower |
-| service logic | `event_ledger`, `catalog_workload`, `std_pipeline` | 1.4x faster to 1.1x slower | 1.4-1.6x slower |
-| sorting | `generic_sort` (int, string) | 1.6x faster to even | 2.1-5.2x slower |
-| maps | `map_update` (int, bytes, string keys) | 1.4x faster to 1.5x slower | 1.2x faster to 1.8x slower |
-| strings and text | `string_build`, `string_buffer`, `csv_encode`, `path_clean_count` | 3.0x faster to 1.6x slower | 1.05-3.2x slower |
-| HTTP head parsing | `http_head_read` | 1.3x slower | 5.6x slower |
-| closures | `closure_calls`, `closure_error` | 1.5-2.0x slower | 2.2-4.2x slower |
-| reference cycles | `cyclic_graph`, `cyclic_graph_strong` | 2.1-5.7x slower | 1.8-2.5x slower |
-| hashing | sha256, sha512, fnv1a, crc32 | 1.16-2.3x slower | 1.17-2.2x slower |
-| channels, spawning, parallel work | `chan_fanout`, `lock_sweep/spawn`, `cpu_parallel_sync` | 1.15-2.1x faster | 1.1-11x faster |
-| task scheduling | `task_churn`, `task_pingpong`, `green_fanout` | 1.3-2.6x slower | 2.4x faster to 1.6x slower |
-| locks and metrics | `lock_sweep`, `metrics_contention` | 1.2x faster to 1.8x slower | 2.6x faster to 2.0x slower |
-| HTTP server throughput | `http_sweep.sh`, 32-1024 connections | 1.6-2.3x faster than net/http, 13-20% behind a minimal server | 1.1-1.2x ahead of hyper up to 256 connections, 14% behind at 1024 |
+| substring search | `substring_search` | 1.9-4.9x faster | 1.75-4.9x faster |
+| JSON decoding | `json_decode_shapes` (6 shapes) | 1.5-5.3x faster | 2.5x faster to 1.2x slower |
+| walking decoded JSON | `json_decode_shapes/list_walk` | 5.0x slower | 9.0x slower |
+| service logic | `event_ledger`, `catalog_workload`, `std_pipeline` | 1.3x faster to 1.1x slower | 1.4-1.6x slower |
+| sorting | `generic_sort` (int, string) | 1.6x faster to even | 2.1-5.3x slower |
+| maps | `map_update` (int, bytes, string keys) | 1.4x faster to 1.4x slower | 1.2x faster to 1.85x slower |
+| strings and text | `string_build`, `string_buffer`, `csv_encode`, `path_clean_count` | 2.9x faster to 1.6x slower | 1.06-3.2x slower |
+| HTTP head parsing | `http_head_read` | 1.4x slower | 5.9x slower |
+| closures | `closure_calls`, `closure_error` | 1.55-2.0x slower | 2.2-4.3x slower |
+| reference cycles | `cyclic_graph`, `cyclic_graph_strong` | 2.1-5.8x slower | 1.8-2.5x slower |
+| hashing | sha256, sha512, fnv1a, crc32 | 1.13-2.3x slower | 1.13-2.1x slower |
+| channels, spawning, parallel work | `chan_fanout`, `lock_sweep/spawn`, `cpu_parallel_sync` | 1.15-2.0x faster | 1.1-12x faster |
+| task scheduling | `task_churn`, `task_pingpong`, `green_fanout` | 1.3-2.7x slower | 2.3x faster to 1.6x slower |
+| locks and metrics | `lock_sweep`, `metrics_contention` | 1.3x faster to 1.4x slower | 2.6x faster to 1.8x slower |
+| HTTP server throughput | `http_sweep.sh`, 32-1024 connections | 1.5-2.3x faster than net/http, 15-19% behind a minimal server | 1.06-1.24x ahead of hyper up to 256 connections, 15% behind at 1024 |
 | HTTP server p99 latency | same | lowest at every connection count | lowest at every connection count |
 | gRPC unary calls | `bench/grpc/run.sh`, pinned | 1.02x faster to 1.05x slower at concurrency 1, 1.2-1.3x slower at 8 | 1.06-1.24x faster |
 | catalog service p50 | `catalog_server_rust` | 1.1-1.25x slower | 1.06x faster to 1.02x slower |
 | zstd, MB/s | `zstd` | decode 5.1-6.7x slower, encode 4.1-8.8x slower | decode 1.3-1.5x slower, encode 2.2-3.3x slower |
-| API gateway | `gateway_bench.sh`, 64-1024 connections, forwarding with no token | 2.4x slower at 64, even at 1024, with lower p99 at 1024 and 40-60% less memory | no port |
+| API gateway | `gateway_bench.sh`, 64-1024 connections, forwarding with no token | 1.2-1.7x faster, with 3.4-4.4x lower p99 and 40-70% less memory | no port |
 
-Every row comes from the same build, main after #1313. The server, gRPC,
+Every row comes from the same build, main after #1320. The server, gRPC,
 catalog service and zstd rows come from their own runners, described in their
 sections below.
 
@@ -82,7 +82,7 @@ TRIALS=3 bench/compare.sh map_update json_decode_shapes
 
 Setup: Ryzen 9 9950X, every run pinned to one CCD (cpus 0-7,16-23), 16 workers
 (`PITH_GREEN_WORKERS`, `GOMAXPROCS`, tokio worker threads), Go 1.27.3,
-Rust 1.99.1, Pith at main after #1313 (Cranelift 0.130). Times are the median wall time of 5 interleaved rounds, process start
+Rust 1.99.1, Pith at main after #1320 (Cranelift 0.130). Times are the median wall time of 5 interleaved rounds, process start
 included.
 
 The first run of this suite, at `64245d29`, led to #1194 to #1201. Against
@@ -91,7 +91,7 @@ both ports, `closure_calls` from 1097 to 275, `cpu_parallel_sync` from 1820 to
 904, `crc32` from 490 to 288, `csv_encode` from 708 to 547, `closure_error`
 from 602 to 472 and `tight_loop` from 747 to 602. Most other rows are 3 to 8
 percent faster. The HTTP, catalog, zstd and gRPC tables were from the first
-run until the sixth run below replaced them, and the tables now are the seventh.
+run until the sixth run below replaced them, and the tables now are the eighth.
 
 A second run, at `3a9aacf2`, led to #1203 to #1207. A none optional is now
 the null pointer, and an optional that a getter returns no longer gets a heap
@@ -175,7 +175,7 @@ that timer granularity dominates. The other compute and concurrency rows are
 within 5 percent of the fifth run. `lock_sweep/spawn` and `lock_sweep/breaker`
 are bimodal on every build, at about 36 or 48 ms and 87 or 113 ms.
 
-The tables below are a seventh run, at `eaef9d4d` (main after #1313), with
+The seventh run was at `eaef9d4d` (main after #1313), with
 every runner on the same build. Against the sixth run,
 `json_decode_shapes/wide` went from 785 to 594 ms and `json_decode_shapes/small`
 from 817 to 707, from generating the flat decoder in IR (#1305), and
@@ -214,40 +214,73 @@ streaming and connection-cap work in `std/net/http.pith`. These races measure
 wall time only, so they do not separate the added counts from code placement.
 gRPC was not sampled, so its drop has no traced cause.
 
+The tables below are an eighth run, at `54b39e00` (main after #1320), with every
+runner on the same build. #1315 to #1319 came out of the API gateway benchmark,
+where Go had been 2.4x ahead at 64 connections. A mutex unlock now leaves the
+woken task on its own worker (#1316), a busy worker gives tasks that have never
+run a turn (#1315), the jwks cache keeps parsed keys (#1317, #1318), and the HTTP
+client allocates less (#1319). The gateway now forwards 1.2 to 1.7x as many
+requests per second as the Go gateway; its section below has the numbers and the
+cost of #1316.
+
+Against the seventh run, 38 compute and concurrency rows are within 3 percent.
+Eight moved further. `path_clean_count` (+3.2 percent) read level in an earlier
+race of the same builds. For the other seven, and for HTTP at 32 connections, the
+old build (`ee9a9eac`, behind the seventh run) and the new one raced each other,
+interleaved, 21 rounds per row:
+
+| row | seventh-run build | eighth-run build | change |
+|---|---:|---:|---:|
+| `json_decode_shapes/map` (ms) | 814 | 689 | -15.3% |
+| `metrics_contention/labels` (ms) | 86.3 | 84.6 | -2.0% |
+| `lock_sweep/breaker` (ms) | 88.6 | 89.6 | +1.0% |
+| `lock_sweep/labels` (ms) | 60.9 | 60.3 | -1.0% |
+| `lock_sweep/log` (ms) | 54.2 | 53.9 | -0.6% |
+| `http_head_read` (ms) | 647.5 | 646.7 | -0.1% |
+| `substring_search/absent` (ms) | 0.9 | 0.9 | +0.3% |
+| HTTP server, 32 connections (req/s, 8 rounds) | 1.16M | 1.13M | -2.3% |
+
+Only `json_decode_shapes/map` is a real change; it was not bisected. The suite
+had `lock_sweep/breaker` 21 percent faster, but that row lands at about 87 or
+113 ms from run to run, and the race found both builds at the lower level. The
+HTTP rounds ranged over 1.03-1.23M for the old build and 1.08-1.19M for the new
+one. The zstd, gRPC and catalog service runners read every arm within 3.5
+percent of the seventh run, so their tables below are unchanged.
+
 ### compute and std
 
 | benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---|---:|---:|---:|---:|---:|
-| event_ledger | `200000` | 72 | 103 | 50 | 0.70x | 1.43x |
-| std_pipeline | `50000` | 87 | 78 | 55 | 1.12x | 1.57x |
+| event_ledger | `200000` | 72 | 95 | 50 | 0.76x | 1.43x |
+| std_pipeline | `50000` | 88 | 78 | 56 | 1.14x | 1.58x |
 | catalog_workload | `4000` | 3.0 | 3.5 | 2.1 | 0.86x | 1.43x |
-| string_build | `2000000` | 41 | 33 | 21 | 1.26x | 1.97x |
-| closure_error | `2000000` | 355 | 181 | 159 | 1.96x | 2.24x |
-| tight_loop | `2000000000` | 480 | 353 | 1.3 | 1.36x | (a) |
-| closure_calls | `50000000` | 110 | 72 | 26 | 1.52x | 4.23x |
-| substring_search | `20000` | 45 | 220 | 222 | 0.20x | 0.20x |
-| substring_search/absent | `500 long-absent` | 1.7 | 3.9 | 3.4 | 0.44x | 0.50x |
-| string_buffer/build | `current build 100000 200 200` | 558 | 1654 | 258 | 0.34x | 2.16x |
-| string_buffer/snapshot | `current snapshot 10000 200 200` | 302 | 193 | 286 | 1.56x | 1.05x |
-| cyclic_graph | `10000000` | 260 | 123 | 142 | 2.12x | 1.83x |
-| cyclic_graph_strong | `10000000` | 697 | 123 | 283 | 5.65x | 2.47x |
-| csv_encode | `5000 400` | 415 | 309 | 128 | 1.34x | 3.25x |
-| json_decode_shapes/small | `small 4 20000000` | 707 | 3540 | 1122 | 0.20x | 0.63x |
-| json_decode_shapes/wide | `wide 32 3000000` | 594 | 3200 | 1511 | 0.19x | 0.39x |
-| json_decode_shapes/nested | `nested 4 8000000` | 843 | 2212 | 792 | 0.38x | 1.06x |
-| json_decode_shapes/list | `list 32 400000` | 941 | 2095 | 915 | 0.45x | 1.03x |
-| json_decode_shapes/list_walk | `list_walk 32 5000` | 249 | 50 | 28 | 4.97x | 8.92x |
-| json_decode_shapes/map | `map 32 300000` | 800 | 1043 | 581 | 0.77x | 1.38x |
-| json_decode_shapes/float | `float 4 12000000` | 802 | 3550 | 959 | 0.23x | 0.84x |
-| path_clean_count | `2000000` | 567 | 758 | 180 | 0.75x | 3.14x |
-| map_update/string | `string 50000000 64` | 748 | 506 | 476 | 1.48x | 1.57x |
-| map_update/bytes | `bytes 50000000 64` | 897 | 1253 | 485 | 0.72x | 1.85x |
-| map_update/int | `int 100000000 64` | 577 | 680 | 702 | 0.85x | 0.82x |
-| generic_sort/int | `current random int 100000 30` | 310 | 504 | 59 | 0.62x | 5.23x |
-| generic_sort/string | `current random string 100000 30` | 663 | 655 | 316 | 1.01x | 2.10x |
-| http_head_read | `1000000` | 642 | 488 | 114 | 1.32x | 5.62x |
+| string_build | `2000000` | 41 | 33 | 21 | 1.27x | 2.00x |
+| closure_error | `2000000` | 359 | 182 | 160 | 1.97x | 2.24x |
+| tight_loop | `2000000000` | 483 | 355 | 1.4 | 1.36x | (a) |
+| closure_calls | `50000000` | 112 | 72 | 26 | 1.55x | 4.27x |
+| substring_search | `20000` | 45 | 221 | 223 | 0.20x | 0.20x |
+| substring_search/absent | `500 long-absent` | 2.0 | 3.8 | 3.5 | 0.53x | 0.57x |
+| string_buffer/build | `current build 100000 200 200` | 564 | 1613 | 258 | 0.35x | 2.18x |
+| string_buffer/snapshot | `current snapshot 10000 200 200` | 307 | 191 | 289 | 1.61x | 1.06x |
+| cyclic_graph | `10000000` | 263 | 123 | 143 | 2.13x | 1.84x |
+| cyclic_graph_strong | `10000000` | 717 | 124 | 288 | 5.80x | 2.49x |
+| csv_encode | `5000 400` | 416 | 309 | 130 | 1.35x | 3.20x |
+| json_decode_shapes/small | `small 4 20000000` | 716 | 3562 | 1105 | 0.20x | 0.65x |
+| json_decode_shapes/wide | `wide 32 3000000` | 606 | 3210 | 1538 | 0.19x | 0.39x |
+| json_decode_shapes/nested | `nested 4 8000000` | 860 | 2269 | 798 | 0.38x | 1.08x |
+| json_decode_shapes/list | `list 32 400000` | 945 | 2108 | 928 | 0.45x | 1.02x |
+| json_decode_shapes/list_walk | `list_walk 32 5000` | 253 | 50 | 28 | 5.03x | 8.99x |
+| json_decode_shapes/map | `map 32 300000` | 706 | 1048 | 583 | 0.67x | 1.21x |
+| json_decode_shapes/float | `float 4 12000000` | 807 | 3584 | 973 | 0.23x | 0.83x |
+| path_clean_count | `2000000` | 585 | 762 | 182 | 0.77x | 3.21x |
+| map_update/string | `string 50000000 64` | 755 | 527 | 474 | 1.43x | 1.59x |
+| map_update/bytes | `bytes 50000000 64` | 910 | 1248 | 491 | 0.73x | 1.85x |
+| map_update/int | `int 100000000 64` | 581 | 683 | 708 | 0.85x | 0.82x |
+| generic_sort/int | `current random int 100000 30` | 313 | 511 | 60 | 0.61x | 5.25x |
+| generic_sort/string | `current random string 100000 30` | 666 | 656 | 320 | 1.01x | 2.08x |
+| http_head_read | `1000000` | 662 | 487 | 112 | 1.36x | 5.91x |
 
-The hash kernels hash 256 MB. The rows below subtract the `none` arm (101 ms
+The hash kernels hash 256 MB. The rows below subtract the `none` arm (103 ms
 for Pith, 48 for Go, 47 for Rust), which only builds the input. sha256 and crc32
 hand whole blocks to a runtime kernel that uses the CPU's SHA and carry-less
 multiply instructions (#1242), which took sha256 from 844 to 110 ms and crc32
@@ -255,35 +288,33 @@ from 226 to 14.
 
 | kernel | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---:|---:|---:|---:|---:|
-| sha256 | 111 | 96 | 95 | 1.16x | 1.17x |
-| sha512 | 432 | 190 | 208 | 2.28x | 2.08x |
-| fnv1a | 234 | 187 | 188 | 1.25x | 1.25x |
-| crc32 | 14 | 6.6 | 6.4 | 2.14x | 2.20x |
+| sha256 | 109 | 96 | 97 | 1.13x | 1.13x |
+| sha512 | 433 | 189 | 210 | 2.29x | 2.06x |
+| fnv1a | 235 | 187 | 189 | 1.26x | 1.25x |
+| crc32 | 13 | 6.2 | 6.4 | 2.05x | 1.98x |
 
 ### concurrency
 
 | benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |
 |---|---|---:|---:|---:|---:|---:|
-| chan_fanout | `1000000` | 40 | 49 | 452 | 0.81x | 0.09x |
-| task_churn | `200000` | 989 | 676 | 2327 | 1.46x | 0.43x |
-| task_pingpong | `2000000` | 401 | 314 | 525 | 1.28x | 0.76x |
-| green_fanout | `2000000` | 625 | 242 | 391 | 2.58x | 1.60x |
-| cpu_parallel_sync | `200 1000000` | 653 | 750 | 724 | 0.87x | 0.90x |
-| lock_sweep/log | `log 16 100000000` | 53 | 44 | 3.6 | 1.22x | (a) |
-| lock_sweep/spawn | `spawn 16 1600000` | 38 | 78 | 99 | 0.48x | 0.38x |
-| lock_sweep/labels | `labels 16 1600000` | 72 | 80 | 54 | 0.90x | 1.33x |
-| lock_sweep/breaker | `breaker 16 50000000` | 111 | 61 | 54 | 1.83x | 2.05x |
-| lock_sweep/readfile | `readfile 16 200000` | 90 | 96 | 232 | 0.93x | 0.39x |
-| metrics_contention/counter | `3 4000000 16 counter` | 610 | 511 | 345 | 1.20x | 1.77x |
-| metrics_contention/histogram | `3 4000000 16 histogram` | 549 | 674 | 530 | 0.81x | 1.04x |
-| metrics_contention/labels | `3 1000000 16 labels` | 92 | 105 | 133 | 0.87x | 0.69x |
+| chan_fanout | `1000000` | 40 | 49 | 471 | 0.82x | 0.09x |
+| task_churn | `200000` | 1005 | 673 | 2346 | 1.49x | 0.43x |
+| task_pingpong | `2000000` | 403 | 314 | 521 | 1.28x | 0.77x |
+| green_fanout | `2000000` | 641 | 241 | 392 | 2.66x | 1.64x |
+| cpu_parallel_sync | `200 1000000` | 654 | 753 | 723 | 0.87x | 0.90x |
+| lock_sweep/log | `log 16 100000000` | 56 | 44 | 3.5 | 1.27x | (a) |
+| lock_sweep/spawn | `spawn 16 1600000` | 38 | 79 | 99 | 0.49x | 0.39x |
+| lock_sweep/labels | `labels 16 1600000` | 60 | 80 | 54 | 0.75x | 1.10x |
+| lock_sweep/breaker | `breaker 16 50000000` | 88 | 61 | 55 | 1.43x | 1.60x |
+| lock_sweep/readfile | `readfile 16 200000` | 89 | 98 | 232 | 0.91x | 0.38x |
+| metrics_contention/counter | `3 4000000 16 counter` | 627 | 506 | 342 | 1.24x | 1.84x |
+| metrics_contention/histogram | `3 4000000 16 histogram` | 545 | 688 | 525 | 0.79x | 1.04x |
+| metrics_contention/labels | `3 1000000 16 labels` | 83 | 106 | 133 | 0.78x | 0.62x |
 
 `lock_sweep/breaker` is sixteen tasks contending on one mutex. Its Pith time
-lands at about 87 or 113 ms from run to run, and this run read 88 to 117 ms
-across its rounds with a median of 111. Its Rust time has read 55, 77 and now
-54 ms across the last three runs. `lock_sweep/spawn` lands at about 36 or 48 ms,
-and read about 37 ms in every round here. `lock_sweep/labels` read 56 to 80 ms
-across its rounds.
+lands at about 87 or 113 ms from run to run, and this run read a median of
+88. Its Rust time has read 55, 77, 54 and now 55 ms across the last four runs.
+`lock_sweep/spawn` lands at about 36 or 48 ms, and read 38 ms here.
 
 (a) LLVM removes the loop, so the Rust time is not a loop cost: `tight_loop`
 becomes a closed form, `lock_sweep/log` hoists the level check out of the loop,
@@ -338,19 +369,19 @@ setup as the sweep above (wrk -t16 on the other CCD, 10 s runs, median of 3):
 
 | conns | pith | net/http | min go | fasthttp | hyper | rustmin |
 |---:|---:|---:|---:|---:|---:|---:|
-| 32 | 1.18M | 757k | 1.35M | 1.35M | 1.07M | 1.07M |
-| 128 | 1.81M | 784k | 2.26M | 2.21M | 1.48M | 1.57M |
-| 256 | 1.95M | 1.01M | 2.28M | 2.24M | 1.76M | 1.85M |
-| 1024 | 1.95M | 1.17M | 2.33M | 2.23M | 2.27M | 2.32M |
+| 32 | 1.13M | 744k | 1.34M | 1.34M | 1.07M | 1.07M |
+| 128 | 1.82M | 783k | 2.23M | 2.20M | 1.47M | 1.56M |
+| 256 | 1.92M | 992k | 2.27M | 2.23M | 1.75M | 1.83M |
+| 1024 | 1.92M | 1.16M | 2.32M | 2.23M | 2.25M | 2.29M |
 
 p99 latency in µs:
 
 | conns | pith | net/http | min go | fasthttp | hyper | rustmin |
 |---:|---:|---:|---:|---:|---:|---:|
-| 32 | 52 | 298 | 296 | 296 | 88 | 71 |
-| 128 | 111 | 1360 | 434 | 427 | 152 | 141 |
-| 256 | 191 | 1800 | 727 | 712 | 274 | 257 |
-| 1024 | 847 | 3900 | 1430 | 1440 | 990 | 1000 |
+| 32 | 52 | 303 | 290 | 309 | 100 | 62 |
+| 128 | 108 | 1340 | 442 | 438 | 154 | 143 |
+| 256 | 184 | 1860 | 767 | 744 | 275 | 262 |
+| 1024 | 960 | 4110 | 1420 | 1600 | 1020 | 1120 |
 
 Pith handles more requests per second than both Rust servers up to 256
 connections, and both pass it at 1024. It has the lowest p99 of all six
@@ -428,8 +459,8 @@ Pith matches or beats Go on JSON decoding, substring search, the event
 ledger, the catalog workload, generic sorting, path cleaning, map updates
 with int and bytes keys, file reads, channel fan-out, parallel compute with
 a coordinator, spawn-and-await inside tasks, labeled metrics, gRPC at
-concurrency 1, and HTTP latency. Its HTTP server also handles more requests
-per second than hyper up to 256 connections. It trails Rust on most compute rows, often by 2x or more. The largest gaps come
+concurrency 1, HTTP latency and the API gateway. Its HTTP server also handles
+more requests per second than hyper up to 256 connections. It trails Rust on most compute rows, often by 2x or more. The largest gaps come
 from these:
 
 - heap-allocated closures (`closure_calls`, `closure_error`): a closure
@@ -633,7 +664,7 @@ WRK=wrk PITH=./target/release/pith bench/http_sweep.sh
 
 ## api gateway benchmark
 
-`bench/gateway_bench.sh` compares `examples/gateway` with `bench/gateway.go`, a Go `net/http` gateway with the same behavior. It covers plain forwarding, an ES256 bearer token checked at the edge, and a backend killed partway through a run. The results from the 2026-11-04 run and what limits them are in [examples/gateway/README.md](../examples/gateway/README.md).
+`bench/gateway_bench.sh` compares `examples/gateway` with `bench/gateway.go`, a Go `net/http` gateway with the same behavior. It covers plain forwarding, an ES256 bearer token checked at the edge, and a backend killed partway through a run. The results from the 2026-11-05 run, the changes behind them and what they cost are in [examples/gateway/README.md](../examples/gateway/README.md).
 
 ## catalog service benchmark
 

@@ -429,15 +429,14 @@ impl Store:
     # the value stored under `key`, or "" when this request has no session or
     # the session has no such key.
     fn get(req: web.Request, key: String) -> String:
-        session_mu.lock()
-        id := existing_id(self, req, time.unix())
-        mut out := ""
-        if id.len() > 0:
-            full := value_key(self.handle, id, key)
-            if session_values.contains_key(full):
-                out = session_values[full]
-        session_mu.unlock()
-        return out
+        locked session_mu:
+            id := existing_id(self, req, time.unix())
+            mut out := ""
+            if id.len() > 0:
+                full := value_key(self.handle, id, key)
+                if session_values.contains_key(full):
+                    out = session_values[full]
+            return out
 
     # the value stored under `key`, or `fallback` when it is missing or empty.
     fn get_or(req: web.Request, key: String, fallback: String) -> String:
@@ -448,13 +447,12 @@ impl Store:
 
     # true when this request's session holds `key`.
     fn has(req: web.Request, key: String) -> Bool:
-        session_mu.lock()
-        id := existing_id(self, req, time.unix())
-        mut out := false
-        if id.len() > 0:
-            out = session_values.contains_key(value_key(self.handle, id, key))
-        session_mu.unlock()
-        return out
+        locked session_mu:
+            id := existing_id(self, req, time.unix())
+            mut out := false
+            if id.len() > 0:
+                out = session_values.contains_key(value_key(self.handle, id, key))
+            return out
 
     # store `value` under `key`, creating the session if this request had
     # none — which is also what makes the middleware send a cookie back. a
@@ -498,23 +496,21 @@ impl Store:
 
     # drop one key from this request's session, leaving the rest of it alone.
     fn remove(req: web.Request, key: String):
-        session_mu.lock()
-        id := existing_id(self, req, time.unix())
-        if id.len() > 0:
-            session_values.remove(value_key(self.handle, id, key))
-            forget_key(session_key(self.handle, id), key)
-        session_mu.unlock()
+        locked session_mu:
+            id := existing_id(self, req, time.unix())
+            if id.len() > 0:
+                session_values.remove(value_key(self.handle, id, key))
+                forget_key(session_key(self.handle, id), key)
 
     # the keys this request's session holds, in the order they were first
     # written.
     fn keys(req: web.Request) -> List[String]:
-        session_mu.lock()
-        id := existing_id(self, req, time.unix())
-        mut out: List[String] := []
-        if id.len() > 0:
-            out = stored_keys(session_key(self.handle, id))
-        session_mu.unlock()
-        return out
+        locked session_mu:
+            id := existing_id(self, req, time.unix())
+            mut out: List[String] := []
+            if id.len() > 0:
+                out = stored_keys(session_key(self.handle, id))
+            return out
 
     # true when this request already has a session on the server.
     fn active(req: web.Request) -> Bool:
@@ -573,11 +569,10 @@ impl Store:
     # clears the cookie. this is what logout is — the id stops meaning
     # anything the instant it is called, rather than when a token expires.
     fn destroy(req: web.Request):
-        session_mu.lock()
-        for id in [req.value(FRESH_KEY), req.value(ID_KEY)]:
-            if id.len() > 0:
-                drop_session(session_key(self.handle, id))
-        session_mu.unlock()
+        locked session_mu:
+            for id in [req.value(FRESH_KEY), req.value(ID_KEY)]:
+                if id.len() > 0:
+                    drop_session(session_key(self.handle, id))
 
     # a cookie carrying this store's Path, SameSite, Secure and lifetime, but
     # none of its meaning — the shape a companion cookie should take so that
@@ -594,23 +589,21 @@ impl Store:
     # how many sessions this store holds right now, expired ones included
     # until they are swept.
     fn count() -> Int:
-        session_mu.lock()
-        mut total := 0
-        prefix := self.handle.to_string() + "|"
-        for key in session_expiry:
-            if key.starts_with(prefix):
-                total = total + 1
-        session_mu.unlock()
-        return total
+        locked session_mu:
+            mut total := 0
+            prefix := self.handle.to_string() + "|"
+            for key in session_expiry:
+                if key.starts_with(prefix):
+                    total = total + 1
+            return total
 
     # drop every expired session now rather than waiting for traffic to do
     # it, and return how many went. sweeping is shared across stores, so this
     # clears expired sessions in every store in the process.
     fn sweep() -> Int:
-        session_mu.lock()
-        dropped := sweep_expired(time.unix())
-        session_mu.unlock()
-        return dropped
+        locked session_mu:
+            dropped := sweep_expired(time.unix())
+            return dropped
 
 # ---------------------------------------------------------------
 # the middleware

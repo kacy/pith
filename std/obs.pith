@@ -66,15 +66,13 @@ mut started := false
 mut running := false
 
 fn set_running(on: Bool):
-    obs_mu.lock()
-    running = on
-    obs_mu.unlock()
+    locked obs_mu:
+        running = on
 
 fn is_running() -> Bool:
-    obs_mu.lock()
-    r := running
-    obs_mu.unlock()
-    return r
+    locked obs_mu:
+        r := running
+        return r
 
 # flush all finished spans to the collector, best effort (a failed POST is
 # swallowed so the loop keeps running).
@@ -183,13 +181,11 @@ fn resolve_instance_id(explicit: String) -> String:
 pub fn start(service_name: String, service_version: String, service_instance_id: String, endpoint: String, protocol: String, headers: List[String], timeout_ms: Int, compression: String, metric_interval_ms: Int, span_delay_ms: Int, sampler_name: String, sampler_arg: Float):
     if endpoint == "":
         return
-    obs_mu.lock()
-    if started:
-        obs_mu.unlock()
-        return
-    started = true
-    running = true
-    obs_mu.unlock()
+    locked obs_mu:
+        if started:
+            return
+        started = true
+        running = true
 
     dest := otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol).with_headers(headers).with_timeout(timeout_ms).with_compression(compression)
     # install the sampler before turning tracing on so the first span already

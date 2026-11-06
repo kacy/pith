@@ -416,14 +416,13 @@ impl Server:
     # and a credit channel, so the handler can stream a response body under flow
     # control once it runs.
     fn register(stream_id: Int, inbox: Channel[StreamEvent]):
-        self.mu.lock()
-        self.streams.insert(stream_id, inbox)
-        self.active.push(stream_id)
-        self.send_windows.insert(stream_id, self.peer_initial_window)
-        self.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
-        if stream_id > self.last_stream_id:
-            self.last_stream_id = stream_id
-        self.mu.unlock()
+        locked self.mu:
+            self.streams.insert(stream_id, inbox)
+            self.active.push(stream_id)
+            self.send_windows.insert(stream_id, self.peer_initial_window)
+            self.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
+            if stream_id > self.last_stream_id:
+                self.last_stream_id = stream_id
 
     # drop a stream from the table once its handler is done (or it was reset). its
     # send window is dropped and its credit channel closed, which wakes the body
@@ -436,24 +435,22 @@ impl Server:
     # other stream on the connection along with its control frames. closing wakes
     # the send, and a send into a closed channel is a no-op.
     fn forget(stream_id: Int):
-        self.mu.lock()
-        if self.streams.contains_key(stream_id):
-            self.streams[stream_id].close()
-            self.streams.remove(stream_id)
-        if self.send_windows.contains_key(stream_id):
-            self.send_windows.remove(stream_id)
-        if self.credit.contains_key(stream_id):
-            self.credit[stream_id].close()
-            self.credit.remove(stream_id)
-        self.active = list_remove_int(self.active, stream_id)
-        self.mu.unlock()
+        locked self.mu:
+            if self.streams.contains_key(stream_id):
+                self.streams[stream_id].close()
+                self.streams.remove(stream_id)
+            if self.send_windows.contains_key(stream_id):
+                self.send_windows.remove(stream_id)
+            if self.credit.contains_key(stream_id):
+                self.credit[stream_id].close()
+                self.credit.remove(stream_id)
+            self.active = list_remove_int(self.active, stream_id)
 
     # how many streams are currently open, for the concurrency cap.
     fn active_count() -> Int:
-        self.mu.lock()
-        n := self.active.len()
-        self.mu.unlock()
-        return n
+        locked self.mu:
+            n := self.active.len()
+            return n
 
     # hand an event to a stream's inbox, dropping it if the stream is already gone.
     # the channel handle is taken under the mutex and the send happens outside it,
@@ -497,10 +494,9 @@ impl Server:
     # stale handle, but there is no reason to make one. the syscall does not
     # block, so it is safe to hold the lock across it.
     fn shutdown_transport_if_live():
-        self.mu.lock()
-        if self.closed.load() == 0:
-            self.conn.shutdown_transport()
-        self.mu.unlock()
+        locked self.mu:
+            if self.closed.load() == 0:
+                self.conn.shutdown_transport()
 
     # hand every open stream a cancel event, so a handler parked on recv_event()
     # wakes and can end its rpc itself.
@@ -521,23 +517,22 @@ impl Server:
     # close every open stream's inbox so handlers blocked on recv() unblock, then
     # clear the table. called when the connection winds down.
     fn shutdown_streams():
-        self.mu.lock()
-        self.closed.store(1)
-        for stream_id in self.active:
-            if self.streams.contains_key(stream_id):
-                self.streams[stream_id].close()
-            # closing the credit channel wakes a body sender blocked on a window so
-            # it stops rather than waiting for a WINDOW_UPDATE that will never come.
-            if self.credit.contains_key(stream_id):
-                self.credit[stream_id].close()
-        empty: Map[Int, Channel[StreamEvent]] := {}
-        self.streams = empty
-        empty_windows: Map[Int, Int] := {}
-        self.send_windows = empty_windows
-        empty_credit: Map[Int, Channel[Int]] := {}
-        self.credit = empty_credit
-        self.active = []
-        self.mu.unlock()
+        locked self.mu:
+            self.closed.store(1)
+            for stream_id in self.active:
+                if self.streams.contains_key(stream_id):
+                    self.streams[stream_id].close()
+                # closing the credit channel wakes a body sender blocked on a window so
+                # it stops rather than waiting for a WINDOW_UPDATE that will never come.
+                if self.credit.contains_key(stream_id):
+                    self.credit[stream_id].close()
+            empty: Map[Int, Channel[StreamEvent]] := {}
+            self.streams = empty
+            empty_windows: Map[Int, Int] := {}
+            self.send_windows = empty_windows
+            empty_credit: Map[Int, Channel[Int]] := {}
+            self.credit = empty_credit
+            self.active = []
 
 # --- the streaming handler surface ---
 #
@@ -1070,19 +1065,18 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
 # every open stream's window by the delta from the previous value. other
 # identifiers do not shape what the server sends, so they are ignored.
 fn apply_peer_settings(server: Server, settings: List[frames.Setting]):
-    server.mu.lock()
-    for s in settings:
-        if s.id == SETTINGS_HEADER_TABLE_SIZE:
-            server.conn.encoder.set_max_table_size(s.value)
-        elif s.id == SETTINGS_MAX_FRAME_SIZE:
-            server.peer_max_frame_size = s.value
-        elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
-            delta := s.value - server.peer_initial_window
-            server.peer_initial_window = s.value
-            for sid in server.active:
-                if server.send_windows.contains_key(sid):
-                    server.send_windows.insert(sid, server.send_windows[sid] + delta)
-    server.mu.unlock()
+    locked server.mu:
+        for s in settings:
+            if s.id == SETTINGS_HEADER_TABLE_SIZE:
+                server.conn.encoder.set_max_table_size(s.value)
+            elif s.id == SETTINGS_MAX_FRAME_SIZE:
+                server.peer_max_frame_size = s.value
+            elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
+                delta := s.value - server.peer_initial_window
+                server.peer_initial_window = s.value
+                for sid in server.active:
+                    if server.send_windows.contains_key(sid):
+                        server.send_windows.insert(sid, server.send_windows[sid] + delta)
 
 # whether a decoded header name or value is free of the octets that MUST NOT
 # appear in an http/2 field: NUL, CR, and LF. bridging such a field into an

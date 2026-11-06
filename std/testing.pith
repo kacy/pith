@@ -39,11 +39,10 @@ mut silent: Bool := false
 # it just set is how those failures stay the subject rather than becoming the
 # result. anything else that resets counts is saying the same thing.
 fn reset_counts():
-    counts_mu.lock()
-    pass_count = 0
-    fail_count = 0
-    silent = false
-    counts_mu.unlock()
+    locked counts_mu:
+        pass_count = 0
+        fail_count = 0
+        silent = false
     set_test_failed(false)
 
 ## stop printing a line per check and per case. the tally still counts, and a
@@ -51,9 +50,8 @@ fn reset_counts():
 ## that runs a table many thousands of times and wants its own line at the end
 ## rather than one per row.
 pub fn silence_output():
-    counts_mu.lock()
-    silent = true
-    counts_mu.unlock()
+    locked counts_mu:
+        silent = true
 
 # a result is printed through the runner rather than with print(), so the shape
 # of a check or a table row is decided in the same place the shape of a test's
@@ -328,10 +326,9 @@ pub fn each[T](rows: List[Case[T]], body: fn(T) -> Bool):
             record_fail(name, "the case did not hold")
 
 fn failure_count() -> Int:
-    counts_mu.lock()
-    n := fail_count
-    counts_mu.unlock()
-    return n
+    locked counts_mu:
+        n := fail_count
+        return n
 
 # say which row a failure belongs to without counting it a second time: the
 # check inside it already moved the tally and set the verdict.

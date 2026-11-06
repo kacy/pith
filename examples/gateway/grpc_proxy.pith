@@ -41,13 +41,12 @@ pub fn proxy(cfg: config.Config) -> Proxy!:
 
 impl Target:
     fn connection() -> grpc.Conn!:
-        self.mu.lock()
-        defer self.mu.unlock()
-        if let live = self.conn:
-            return live
-        dialed := self.dial()!
-        self.conn = dialed
-        return dialed
+        locked self.mu:
+            if let live = self.conn:
+                return live
+            dialed := self.dial()!
+            self.conn = dialed
+            return dialed
 
     fn dial() -> grpc.Conn!:
         if not self.use_tls:
@@ -58,14 +57,13 @@ impl Target:
 
     # forget a connection that failed, unless another task already replaced it.
     fn drop_connection(failed: grpc.Conn):
-        self.mu.lock()
-        defer self.mu.unlock()
-        if let live = self.conn:
-            if live == failed:
-                self.conn = none
-                failed.close()
+        locked self.mu:
+            if let live = self.conn:
+                if live == failed:
+                    self.conn = none
+                    failed.close()
 
-# copy the client's messages upstream until it finishes or goes away.
+    # copy the client's messages upstream until it finishes or goes away.
 fn pump_requests(call: grpc.GrpcStream, upstream: grpc.BidiStream) -> Int:
     while true:
         step := call.recv_message()

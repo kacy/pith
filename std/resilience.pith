@@ -126,22 +126,21 @@ impl Limiter:
     # spend one token if the bucket has one. never waits: a denied caller
     # decides what denial means — a 429, a drop, a fallback.
     fn allow() -> Bool:
-        self.mu.lock()
-        now := time.mono_millis()
-        elapsed := now - self.stamp.load()
-        # tokens are tracked in thousandths so integer math can meter
-        # fractional refill: per_second tokens/s is per_second m-tokens/ms.
-        mut tokens := self.tokens_m.load() + elapsed * self.rate
-        if tokens > self.burst_m:
-            tokens = self.burst_m
-        mut allowed := false
-        if tokens >= 1000:
-            tokens = tokens - 1000
-            allowed = true
-        self.tokens_m.store(tokens)
-        self.stamp.store(now)
-        self.mu.unlock()
-        return allowed
+        locked self.mu:
+            now := time.mono_millis()
+            elapsed := now - self.stamp.load()
+            # tokens are tracked in thousandths so integer math can meter
+            # fractional refill: per_second tokens/s is per_second m-tokens/ms.
+            mut tokens := self.tokens_m.load() + elapsed * self.rate
+            if tokens > self.burst_m:
+                tokens = self.burst_m
+            mut allowed := false
+            if tokens >= 1000:
+                tokens = tokens - 1000
+                allowed = true
+            self.tokens_m.store(tokens)
+            self.stamp.store(now)
+            return allowed
 
 # ---------------------------------------------------------------
 # circuit breaker
@@ -173,56 +172,52 @@ impl Breaker:
     # until reset_ms has passed; then exactly one caller gets through as the
     # probe and must report back through success() or failure().
     fn allow() -> Bool:
-        self.mu.lock()
-        mut allowed := true
-        # the open flag is explicit state rather than a timestamp sentinel:
-        # the mono clock starts at zero with the process, so "opened at 0"
-        # is a perfectly real moment.
-        if self.open.load() == 1:
-            allowed = false
-            waited := time.mono_millis() - self.opened_at.load()
-            if waited >= self.reset_ms and self.probing.load() == 0:
-                self.probing.store(1)
-                allowed = true
-        self.mu.unlock()
-        return allowed
+        locked self.mu:
+            mut allowed := true
+            # the open flag is explicit state rather than a timestamp sentinel:
+            # the mono clock starts at zero with the process, so "opened at 0"
+            # is a perfectly real moment.
+            if self.open.load() == 1:
+                allowed = false
+                waited := time.mono_millis() - self.opened_at.load()
+                if waited >= self.reset_ms and self.probing.load() == 0:
+                    self.probing.store(1)
+                    allowed = true
+            return allowed
 
     # report a success: the circuit closes and the failure count resets.
     fn success():
-        self.mu.lock()
-        self.failures.store(0)
-        self.open.store(0)
-        self.probing.store(0)
-        self.mu.unlock()
+        locked self.mu:
+            self.failures.store(0)
+            self.open.store(0)
+            self.probing.store(0)
 
     # report a failure: closed, it counts toward the threshold and trips the
     # circuit when reached; half-open, the probe failed and the circuit
     # re-opens for another reset_ms.
     fn failure():
-        self.mu.lock()
-        if self.open.load() == 1:
-            self.opened_at.store(time.mono_millis())
-            self.probing.store(0)
-        else:
-            count := self.failures.load() + 1
-            self.failures.store(count)
-            if count >= self.threshold:
-                self.open.store(1)
+        locked self.mu:
+            if self.open.load() == 1:
                 self.opened_at.store(time.mono_millis())
                 self.probing.store(0)
-        self.mu.unlock()
+            else:
+                count := self.failures.load() + 1
+                self.failures.store(count)
+                if count >= self.threshold:
+                    self.open.store(1)
+                    self.opened_at.store(time.mono_millis())
+                    self.probing.store(0)
 
     # "closed", "open", or "half_open" — for logs and dashboards; decisions
     # belong to allow().
     fn state() -> String:
-        self.mu.lock()
-        mut current := "closed"
-        if self.open.load() == 1:
-            current = "open"
-            if self.probing.load() == 1:
-                current = "half_open"
-        self.mu.unlock()
-        return current
+        locked self.mu:
+            mut current := "closed"
+            if self.open.load() == 1:
+                current = "open"
+                if self.probing.load() == 1:
+                    current = "half_open"
+            return current
 
 # ---------------------------------------------------------------
 # tests

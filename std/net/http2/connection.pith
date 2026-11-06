@@ -807,11 +807,10 @@ pub struct Pool:
 impl Pool:
     # the index of the next connection, round-robin, safe across concurrent callers.
     fn choose() -> Int:
-        self.pick.lock()
-        i := self.next
-        self.next = (self.next + 1) % self.clients.len()
-        self.pick.unlock()
-        return i
+        locked self.pick:
+            i := self.next
+            self.next = (self.next + 1) % self.clients.len()
+            return i
 
     # send a request over the next pooled connection; otherwise like Client.request.
     pub fn request(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes) -> Response!:
@@ -1049,28 +1048,27 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
 # not serve (id above last_stream_id), while leaving lower-id streams to finish.
 # returns true so the reader keeps draining those until the peer closes.
 fn handle_goaway(client: Client, ga: frames.GoawayFrame) -> Bool!:
-    client.mu.lock()
-    client.going_away = true
-    client.last_peer_stream = ga.last_stream_id
-    mut survivors: List[Int] := []
-    for sid in client.active:
-        if sid > ga.last_stream_id:
-            if client.streams.contains_key(sid):
-                client.streams[sid].close()
-                client.streams.remove(sid)
-            # wake any body sender on a dropped stream so it stops.
-            if client.credit.contains_key(sid):
-                client.credit[sid].close()
-                client.credit.remove(sid)
-            if client.send_windows.contains_key(sid):
-                client.send_windows.remove(sid)
-        else:
-            survivors.push(sid)
-    client.active = survivors
-    remaining := survivors.len()
-    client.mu.unlock()
+    locked client.mu:
+        client.going_away = true
+        client.last_peer_stream = ga.last_stream_id
+        mut survivors: List[Int] := []
+        for sid in client.active:
+            if sid > ga.last_stream_id:
+                if client.streams.contains_key(sid):
+                    client.streams[sid].close()
+                    client.streams.remove(sid)
+                # wake any body sender on a dropped stream so it stops.
+                if client.credit.contains_key(sid):
+                    client.credit[sid].close()
+                    client.credit.remove(sid)
+                if client.send_windows.contains_key(sid):
+                    client.send_windows.remove(sid)
+            else:
+                survivors.push(sid)
+        client.active = survivors
+        remaining := survivors.len()
+        return remaining > 0
     # nothing left to wait for: the connection is done.
-    return remaining > 0
 
 # best-effort GOAWAY to the peer. try_send so a full or closed outbound channel
 # never blocks the reader; the writer is still draining when this runs after a
@@ -1100,24 +1098,23 @@ fn deliver(client: Client, stream_id: Int, event: StreamEvent):
 # close every waiting stream's inbox and clear the table, so pending request()
 # calls unblock with a connection-closed error.
 fn fail_all(client: Client):
-    client.mu.lock()
-    client.closed.store(1)
-    for stream_id in client.active:
-        if client.streams.contains_key(stream_id):
-            client.streams[stream_id].close()
-        # closing the credit channel wakes a blocked body sender to give up.
-        if client.credit.contains_key(stream_id):
-            client.credit[stream_id].close()
-    empty: Map[Int, Channel[StreamEvent]] := {}
-    empty_unary: Map[Int, Bool] := {}
-    empty_windows: Map[Int, Int] := {}
-    empty_credit: Map[Int, Channel[Int]] := {}
-    client.streams = empty
-    client.unary = empty_unary
-    client.send_windows = empty_windows
-    client.credit = empty_credit
-    client.active = []
-    client.mu.unlock()
+    locked client.mu:
+        client.closed.store(1)
+        for stream_id in client.active:
+            if client.streams.contains_key(stream_id):
+                client.streams[stream_id].close()
+            # closing the credit channel wakes a blocked body sender to give up.
+            if client.credit.contains_key(stream_id):
+                client.credit[stream_id].close()
+        empty: Map[Int, Channel[StreamEvent]] := {}
+        empty_unary: Map[Int, Bool] := {}
+        empty_windows: Map[Int, Int] := {}
+        empty_credit: Map[Int, Channel[Int]] := {}
+        client.streams = empty
+        client.unary = empty_unary
+        client.send_windows = empty_windows
+        client.credit = empty_credit
+        client.active = []
     # unblock any request waiting on a full outbound channel now the writer is
     # stopping, so it fails fast instead of hanging.
     client.outbound.close()
@@ -1389,10 +1386,9 @@ impl Client:
     # windows by that amount. a window can be negative after a settings shrink,
     # so a non-positive result just means "wait".
     fn reserve_send(stream_id: Int, want: Int) -> Int:
-        self.mu.lock()
-        grant := self.reserve_send_locked(stream_id, want)
-        self.mu.unlock()
-        return grant
+        locked self.mu:
+            grant := self.reserve_send_locked(stream_id, want)
+            return grant
 
     # the body of reserve_send, with `mu` already held by the caller. a caller
     # that is already inside the mutex for another reason (open_stream_with_fields
@@ -1465,53 +1461,49 @@ impl Client:
     # once per stream when the reader sees its first frame; a streaming stream is
     # never marked, so this is false and its events flow incrementally.
     fn is_unary(stream_id: Int) -> Bool:
-        self.mu.lock()
-        marked := self.unary.contains_key(stream_id)
-        self.mu.unlock()
-        return marked
+        locked self.mu:
+            marked := self.unary.contains_key(stream_id)
+            return marked
 
     # stop coalescing `stream_id`: later frames for it are delivered one at a
     # time, which after a terminal event means they are dropped.
     fn stop_unary(stream_id: Int):
-        self.mu.lock()
-        if self.unary.contains_key(stream_id):
-            self.unary.remove(stream_id)
-        self.mu.unlock()
+        locked self.mu:
+            if self.unary.contains_key(stream_id):
+                self.unary.remove(stream_id)
 
     # remove a finished stream from the table and its flow-control state, then
     # record that the reader delivered `stream_id`'s terminal event, so a
     # later close() skips the wire reset. only a stream still in the table is
     # marked, so a late frame after forget() cannot re-grow the map.
     fn mark_finished(stream_id: Int):
-        self.mu.lock()
-        if self.streams.contains_key(stream_id):
-            self.finished.insert(stream_id, true)
-        self.mu.unlock()
+        locked self.mu:
+            if self.streams.contains_key(stream_id):
+                self.finished.insert(stream_id, true)
 
     # remove a finished stream from the table and its flow-control state, then
     # free a concurrency slot so a request queued behind the peer's limit can go.
     fn forget(stream_id: Int):
-        self.mu.lock()
-        if self.streams.contains_key(stream_id):
-            self.streams.remove(stream_id)
-        if self.unary.contains_key(stream_id):
-            self.unary.remove(stream_id)
-        if self.finished.contains_key(stream_id):
-            self.finished.remove(stream_id)
-        if self.send_windows.contains_key(stream_id):
-            self.send_windows.remove(stream_id)
-        if self.credit.contains_key(stream_id):
-            # drain before closing: a channel the runtime can reclaim must be
-            # both closed and empty, and a stream that never spent its last
-            # credit poke leaves one value sitting in the ring.
-            credit_ch := self.credit[stream_id]
-            mut drained := credit_ch.try_recv()
-            while drained != none:
-                drained = credit_ch.try_recv()
-            credit_ch.close()
-            self.credit.remove(stream_id)
-        self.active = list_remove_int(self.active, stream_id)
-        self.mu.unlock()
+        locked self.mu:
+            if self.streams.contains_key(stream_id):
+                self.streams.remove(stream_id)
+            if self.unary.contains_key(stream_id):
+                self.unary.remove(stream_id)
+            if self.finished.contains_key(stream_id):
+                self.finished.remove(stream_id)
+            if self.send_windows.contains_key(stream_id):
+                self.send_windows.remove(stream_id)
+            if self.credit.contains_key(stream_id):
+                # drain before closing: a channel the runtime can reclaim must be
+                # both closed and empty, and a stream that never spent its last
+                # credit poke leaves one value sitting in the ring.
+                credit_ch := self.credit[stream_id]
+                mut drained := credit_ch.try_recv()
+                while drained != none:
+                    drained = credit_ch.try_recv()
+                credit_ch.close()
+                self.credit.remove(stream_id)
+            self.active = list_remove_int(self.active, stream_id)
         self.slot_free.try_send(1)
 
     # open a stream from a full header-field list: wait for a slot when the peer
@@ -1617,12 +1609,10 @@ impl Client:
     # single-stream (MODE_INLINE) and no other inline call holds it. on success
     # the caller owns the socket, the encoder and the decoder until end_inline().
     fn try_begin_inline() -> Bool:
-        self.gate.lock()
-        if self.closed.load() != 0 or self.mode != MODE_INLINE or self.inline_busy:
-            self.gate.unlock()
-            return false
-        self.inline_busy = true
-        self.gate.unlock()
+        locked self.gate:
+            if self.closed.load() != 0 or self.mode != MODE_INLINE or self.inline_busy:
+                return false
+            self.inline_busy = true
         return true
 
     # release the inline lease. if a promotion latched while this call held the
@@ -1678,9 +1668,8 @@ impl Client:
             # the writer already runs and the reader is already spawned (parked
             # on promote_gate); release it to take over the socket now.
             self.promote_gate.send(1)
-        self.gate.lock()
-        self.mode = MODE_THREADED
-        self.gate.unlock()
+        locked self.gate:
+            self.mode = MODE_THREADED
         # release every caller that was waiting on the promotion.
         self.ready.close()
 
@@ -1840,9 +1829,8 @@ impl Client:
     # client lifetime) is awaited so it flushes before the transport drops; a
     # promoted client's reader then unblocks on the closed transport.
     pub fn close():
-        self.mu.lock()
-        self.going_away = true
-        self.mu.unlock()
+        locked self.mu:
+            self.going_away = true
         # mark closed first, so a concurrent promoter sees it and does not release
         # the reader onto a transport we are about to drop.
         self.closed.store(1)
@@ -2358,26 +2346,24 @@ test "reserve_send caps a chunk at the peer's max frame size":
 test "reserve_send_all_locked debits the whole request or nothing at all":
     client := offline_client(connection_from_frames(bytes.empty()))
     arm_send_stream(client, 1, 10, 6, 100)
-    client.mu.lock()
-    # eight bytes wanted against a six-byte connection window: refused, and both
-    # windows are left exactly as they were — no partial grant to hand back.
-    assert(not client.reserve_send_all_locked(1, 8))
-    assert_eq(client.send_windows[1], 10)
-    assert_eq(client.conn_send_window, 6)
-    # what both windows can cover is taken in full.
-    assert(client.reserve_send_all_locked(1, 6))
-    assert_eq(client.send_windows[1], 4)
-    assert_eq(client.conn_send_window, 0)
-    client.mu.unlock()
+    locked client.mu:
+        # eight bytes wanted against a six-byte connection window: refused, and both
+        # windows are left exactly as they were — no partial grant to hand back.
+        assert(not client.reserve_send_all_locked(1, 8))
+        assert_eq(client.send_windows[1], 10)
+        assert_eq(client.conn_send_window, 6)
+        # what both windows can cover is taken in full.
+        assert(client.reserve_send_all_locked(1, 6))
+        assert_eq(client.send_windows[1], 4)
+        assert_eq(client.conn_send_window, 0)
 
 test "reserve_send_all_locked refuses more than one frame's worth":
     client := offline_client(connection_from_frames(bytes.empty()))
     arm_send_stream(client, 1, 1000, 1000, 16)
-    client.mu.lock()
-    assert(not client.reserve_send_all_locked(1, 17))
-    assert_eq(client.conn_send_window, 1000)
-    assert(client.reserve_send_all_locked(1, 16))
-    client.mu.unlock()
+    locked client.mu:
+        assert(not client.reserve_send_all_locked(1, 17))
+        assert_eq(client.conn_send_window, 1000)
+        assert(client.reserve_send_all_locked(1, 16))
     assert_eq(client.conn_send_window, 984)
     assert_eq(client.send_windows[1], 984)
 

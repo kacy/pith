@@ -1180,11 +1180,10 @@ pub struct PoolConn:
 impl PoolConn:
     # the index of the next channel, round-robin, safe across concurrent callers.
     fn choose() -> Int:
-        self.pick.lock()
-        i := self.next
-        self.next = (self.next + 1) % self.conns.len()
-        self.pick.unlock()
-        return i
+        locked self.pick:
+            i := self.next
+            self.next = (self.next + 1) % self.conns.len()
+            return i
 
     # unary rpc over the next pooled channel; see Conn.unary.
     pub fn unary(full_method: String, request: Bytes) -> Bytes!GrpcError:
@@ -1824,27 +1823,24 @@ mut stream_watch_started := false
 ## handlers to fix, and is the difference between a deploy that hands over and
 ## one that only looks like it did.
 pub fn streams_closed_by_shutdown() -> Int:
-    live_mu.lock()
-    n := closed_by_shutdown
-    live_mu.unlock()
-    return n
+    locked live_mu:
+        n := closed_by_shutdown
+        return n
 
 # hold a live rpc for the drain watchdog, returning the ticket that releases it.
 fn register_live_stream(call: GrpcStream) -> Int:
-    live_mu.lock()
-    id := next_live_id
-    next_live_id = next_live_id + 1
-    live_streams.insert(id, call)
-    live_mu.unlock()
-    return id
+    locked live_mu:
+        id := next_live_id
+        next_live_id = next_live_id + 1
+        live_streams.insert(id, call)
+        return id
 
 # release a ticket. a no-op when the watchdog has already taken the stream, which
 # is what a handler that outlived the deadline finds on its way out.
 fn forget_live_stream(id: Int):
-    live_mu.lock()
-    if live_streams.contains_key(id):
-        live_streams.remove(id)
-    live_mu.unlock()
+    locked live_mu:
+        if live_streams.contains_key(id):
+            live_streams.remove(id)
 
 # take every held rpc out of the registry and end it with `status`. taking them
 # out first means a second sweep finds nothing, and finishing them outside the

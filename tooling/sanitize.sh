@@ -191,8 +191,11 @@ while read -r status item backend; do
     ok) ;;
     REPORT)
       echo "REPORT $item ($backend)"
-      sed -n '/^==[0-9]*==ERROR\|^WARNING: ThreadSanitizer/,/^SUMMARY/p' \
-        "$work/$(echo "$item" | tr / _).$backend.log" 2>/dev/null | head -60
+      # awk stops itself at 60 lines. `sed | head` would die of SIGPIPE on a
+      # longer report, and under pipefail that aborted the gate before the
+      # remaining reports and the summary. a missing log prints nothing.
+      awk '/^==[0-9]*==ERROR|^WARNING: ThreadSanitizer/,/^SUMMARY/ { print; if (++n == 60) exit }' \
+        "$work/$(echo "$item" | tr / _).$backend.log" 2>/dev/null || true
       failed=1
       ;;
     FAIL)

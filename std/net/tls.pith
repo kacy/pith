@@ -23,7 +23,6 @@ from std.io import TcpStream
 # are non-negative (error paths fail with a Result rather than hand back a
 # config). the two ranges are kept apart, configs from 0 and connections from a
 # high base, so a handle reads unambiguously in a trace.
-mut next_native_config_handle := 0
 mut next_native_conn_handle := AtomicInt(1000000)
 mut native_config_roots_pem: Map[Int, String] := {}
 mut native_config_alpn: Map[Int, List[String]] := {}
@@ -51,7 +50,16 @@ mut native_server_client_ca_optional: Map[Int, Bool] := {}
 # pick up another config's certificate and key. the lock only ever spans a
 # single map operation — pem parsing, certificate verification, and the
 # user-supplied config hooks all run off it.
-mut native_config_mu := Mutex()
+#
+# the guard block holds the state only native_config_mu's own functions touch:
+# the handle counter and the two root bundle caches described below. the
+# handle-keyed maps above go through the generic config_* accessors, which take
+# the map as an argument, so the checker cannot hold their callers to the lock;
+# they stay outside the block and keep to the accessors by convention.
+guard native_config_mu:
+    mut next_native_config_handle := 0
+    mut native_system_roots_pem := ""
+    mut native_roots_parsed: Map[String, List[x509.Certificate]] := {}
 
 # the registry accessors. each takes native_config_mu for one map operation and
 # hands the value back to the caller, so nothing outside them touches a registry
@@ -102,8 +110,6 @@ fn config_len[V](values: Map[Int, V]) -> Int:
 # that bounded: a program trusting more than this many distinct bundles keeps
 # working, it just parses the ones that did not fit.
 TLS_MAX_ROOTS_CACHE := 8
-mut native_system_roots_pem := ""
-mut native_roots_parsed: Map[String, List[x509.Certificate]] := {}
 
 # hand out the next config handle, one per caller.
 fn next_config_handle() -> Int:
@@ -424,14 +430,21 @@ pub struct Listener:
 # listener's count is what keeps a config the caller stopped naming alive until
 # the listener closes. reading and dropping this map goes through
 # listener_config and drop_listener_config rather than the generic helpers: a
-# config released under native_config_mu would take the same lock again.
-# declared after Config because a global's type is resolved where it is written.
-mut native_listener_config: Map[Int, Config] := {}
+# config released under the lock would run Config.close, which takes
+# native_config_mu.
+# declared after Config because a global's type is resolved where it is written,
+# and so under a lock of its own: its functions touch nothing else.
+guard native_listener_mu:
+    mut native_listener_config: Map[Int, Config] := {}
+
+fn listener_known(fd: Int) -> Bool:
+    locked native_listener_mu:
+        return native_listener_config.contains_key(fd)
 
 # the config a listener was opened with. fails once the listener is closed:
 # the registry entry is removed with the socket, and a handle is never reissued.
 fn listener_config(fd: Int) -> Config!:
-    locked native_config_mu:
+    locked native_listener_mu:
         if native_listener_config.contains_key(fd):
             return native_listener_config[fd]
         fail "native tls listener not found"
@@ -441,7 +454,7 @@ fn listener_config(fd: Int) -> Config!:
     # reissued by the kernel) is read out before the insert overwrites it, for the
     # reason drop_listener_config gives: its release must not happen under the lock.
 fn put_listener_config(fd: Int, config: Config):
-    locked native_config_mu:
+    locked native_listener_mu:
         mut stale := config
         if native_listener_config.contains_key(fd):
             stale = native_listener_config[fd]
@@ -457,7 +470,7 @@ fn put_listener_config(fd: Int, config: Config):
 # Config.drop, and with it Config.close, under the lock this function holds.
 # the count `held` took drops at the return, after the unlock.
 fn drop_listener_config(fd: Int) -> Bool:
-    locked native_config_mu:
+    locked native_listener_mu:
         if not native_listener_config.contains_key(fd):
             return false
         held := native_listener_config[fd]
@@ -485,12 +498,12 @@ fn no_config_hook(ctx: ConfigHookContext) -> ConfigHookResult:
 # holding the lock across the parse — would serialize every config creation in
 # the process behind a quarter-second parse.
 fn parse_roots_cached(roots_pem: String) -> List[x509.Certificate]!:
-    native_config_mu.lock()
-    hit := native_roots_parsed.contains_key(roots_pem)
+    mut hit := false
     mut cached: List[x509.Certificate] := []
-    if hit:
-        cached = native_roots_parsed[roots_pem]
-    native_config_mu.unlock()
+    locked native_config_mu:
+        hit = native_roots_parsed.contains_key(roots_pem)
+        if hit:
+            cached = native_roots_parsed[roots_pem]
     if hit:
         return cached
     parsed := x509.parse_pem_chain(roots_pem)!
@@ -512,9 +525,9 @@ fn parse_roots_cached(roots_pem: String) -> List[x509.Certificate]!:
 # cold start both read the file and one of them wins; both return the winner, so
 # every config still shares a single copy.
 fn system_roots_pem() -> String!:
-    native_config_mu.lock()
-    cached := native_system_roots_pem
-    native_config_mu.unlock()
+    mut cached := ""
+    locked native_config_mu:
+        cached = native_system_roots_pem
     if cached != "":
         return cached
     loaded := os_certs.roots_pem()!
@@ -3454,7 +3467,7 @@ impl Listener:
         return self.handshake(self.accept_socket()!)!
 
     fn accept_socket() -> Int!:
-        if config_has(native_listener_config, self.handle):
+        if listener_known(self.handle):
             fd := tcp_accept(self.handle)!
             # bound the handshake so a slow or silent client can't pin a server
             # task before it authenticates; handshake() clears this deadline once

@@ -12,16 +12,19 @@ import std.time as time
 
 PORT := 20261
 
-# a tiny in-memory catalog, seeded once at startup (read-only, so no lock needed).
-mut store: Map[String, cat.Product] := {}
+# a tiny in-memory catalog, built once at module init and never written after,
+# so the handler tasks read it without a lock.
+store := seeded()
 
-fn seed():
-    store.insert("sku-1", cat.Product(sku: "sku-1", name: "usb-c cable", price: 9.99,
+fn seeded() -> Map[String, cat.Product]:
+    mut items: Map[String, cat.Product] := {}
+    items.insert("sku-1", cat.Product(sku: "sku-1", name: "usb-c cable", price: 9.99,
         category: cat.Category_ELECTRONICS, tags: ["cable", "usb"], in_stock: true))
-    store.insert("sku-2", cat.Product(sku: "sku-2", name: "go programming language", price: 34.5,
+    items.insert("sku-2", cat.Product(sku: "sku-2", name: "go programming language", price: 34.5,
         category: cat.Category_BOOKS, tags: ["go", "book"], in_stock: true))
-    store.insert("sku-3", cat.Product(sku: "sku-3", name: "usb hub", price: 19.0,
+    items.insert("sku-3", cat.Product(sku: "sku-3", name: "usb hub", price: 19.0,
         category: cat.Category_ELECTRONICS, tags: ["usb", "hub"], in_stock: false))
+    return items
 
 # --- the handlers: one per rpc, typed messages in and out ---
 
@@ -44,7 +47,6 @@ fn run_server():
     cat.serve_Catalog("127.0.0.1", PORT, get_product, search) catch 0
 
 fn main():
-    seed()
     spawn run_server()
     time.delay(400)
 

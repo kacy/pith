@@ -15,24 +15,22 @@
 # cross-module access in the current runtime
 # ===============================================================
 
-# these are shared globals with no lock, and that is safe because the parser has
-# exactly one shape: init, add_flag / add_option / add_positional, then parse,
-# all from main before the program does any work. every function that writes is
-# one of those setup calls, and every function that reads (get_flag, get_option,
-# get_positional, has_errors, get_errors, help_text) only reads — there is no
-# path in the module that mutates from the query side, so once parse returns the
-# state is fixed for the life of the process. calling the setup half from a
-# spawned task is not supported and would need a lock.
-mut app_name: String := ""
-mut app_desc: String := ""
-mut flags_data: String := ""
-mut flag_count: Int := 0
-mut opts_data: String := ""
-mut opt_count: Int := 0
-mut pos_data: String := ""
-mut pos_count: Int := 0
-mut error_data: String := ""
-mut error_count: Int := 0
+# the parser state, under args_mu. every public function takes the lock for
+# its whole body, so setup, parsing and the queries can be called from any task
+# in any order without tearing the state. `help_text_locked` and `add_error`
+# run with the lock already held, for the parser to call from inside its own
+# section.
+guard args_mu:
+    mut app_name: String := ""
+    mut app_desc: String := ""
+    mut flags_data: String := ""
+    mut flag_count: Int := 0
+    mut opts_data: String := ""
+    mut opt_count: Int := 0
+    mut pos_data: String := ""
+    mut pos_count: Int := 0
+    mut error_data: String := ""
+    mut error_count: Int := 0
 
 # ===============================================================
 # Setup
@@ -40,38 +38,42 @@ mut error_count: Int := 0
 
 ## Initialize parser metadata for help output.
 pub fn init(name: String, description: String):
-    app_name = name
-    app_desc = description
+    locked args_mu:
+        app_name = name
+        app_desc = description
 
 # register a boolean flag like --verbose or -v.
 pub fn add_flag(name: String, short: String, description: String):
-    entry := name + "|" + short + "|" + description + "|0"
-    if flag_count > 0:
-        sep := flags_data + "~"
-        flags_data = sep + entry
-    else:
-        flags_data = entry
-    flag_count = flag_count + 1
+    locked args_mu:
+        entry := name + "|" + short + "|" + description + "|0"
+        if flag_count > 0:
+            sep := flags_data + "~"
+            flags_data = sep + entry
+        else:
+            flags_data = entry
+        flag_count = flag_count + 1
 
 # register an option that expects a value.
 pub fn add_option(name: String, short: String, description: String, default_val: String):
-    entry := name + "|" + short + "|" + description + "|" + default_val
-    if opt_count > 0:
-        sep := opts_data + "~"
-        opts_data = sep + entry
-    else:
-        opts_data = entry
-    opt_count = opt_count + 1
+    locked args_mu:
+        entry := name + "|" + short + "|" + description + "|" + default_val
+        if opt_count > 0:
+            sep := opts_data + "~"
+            opts_data = sep + entry
+        else:
+            opts_data = entry
+        opt_count = opt_count + 1
 
 # register a positional argument in parse order.
 pub fn add_positional(name: String, description: String):
-    entry := name + "|" + description + "| "
-    if pos_count > 0:
-        sep := pos_data + "~"
-        pos_data = sep + entry
-    else:
-        pos_data = entry
-    pos_count = pos_count + 1
+    locked args_mu:
+        entry := name + "|" + description + "| "
+        if pos_count > 0:
+            sep := pos_data + "~"
+            pos_data = sep + entry
+        else:
+            pos_data = entry
+        pos_count = pos_count + 1
 
 # ===============================================================
 # Internal field access
@@ -150,56 +152,57 @@ pub fn parse():
 
 # parse an explicit argv list instead of reading process args().
 pub fn parse_list(argv: List[String]):
-    mut pi := 0
-    mut pending_long := ""
-    mut pending_short := ""
-    for arg in argv:
-        if pending_long != "":
-            opts_data = rebuild_with_update(opts_data, pending_long, 3, arg)
-            pending_long = ""
-            continue
-        if pending_short != "":
-            opts_data = rebuild_with_update(opts_data, pending_short, 3, arg)
-            pending_short = ""
-            continue
-        if arg == "--help" or arg == "-h":
-            print(help_text())
-        elif arg.starts_with("--"):
-            name := arg.substring(2, arg.len())
-            eq := find_eq(name)
-            if eq >= 0:
-                oname := name.substring(0, eq)
-                oval := name.substring(eq + 1, name.len())
-                if find_record(opts_data, opt_count, oname) != "":
-                    opts_data = rebuild_with_update(opts_data, oname, 3, oval)
+    locked args_mu:
+        mut pi := 0
+        mut pending_long := ""
+        mut pending_short := ""
+        for arg in argv:
+            if pending_long != "":
+                opts_data = rebuild_with_update(opts_data, pending_long, 3, arg)
+                pending_long = ""
+                continue
+            if pending_short != "":
+                opts_data = rebuild_with_update(opts_data, pending_short, 3, arg)
+                pending_short = ""
+                continue
+            if arg == "--help" or arg == "-h":
+                print(help_text_locked())
+            elif arg.starts_with("--"):
+                name := arg.substring(2, arg.len())
+                eq := find_eq(name)
+                if eq >= 0:
+                    oname := name.substring(0, eq)
+                    oval := name.substring(eq + 1, name.len())
+                    if find_record(opts_data, opt_count, oname) != "":
+                        opts_data = rebuild_with_update(opts_data, oname, 3, oval)
+                    else:
+                        add_error("unknown option: --" + oname)
+                elif find_record(flags_data, flag_count, name) != "":
+                    flags_data = rebuild_with_update(flags_data, name, 3, "1")
+                elif find_record(opts_data, opt_count, name) != "":
+                    pending_long = name
                 else:
-                    add_error("unknown option: --" + oname)
-            elif find_record(flags_data, flag_count, name) != "":
-                flags_data = rebuild_with_update(flags_data, name, 3, "1")
-            elif find_record(opts_data, opt_count, name) != "":
-                pending_long = name
+                    add_error("unknown option: --" + name)
+            elif arg.starts_with("-") and arg != "-":
+                short := arg.substring(1, arg.len())
+                lf := find_by_short(flags_data, flag_count, short)
+                lo := find_by_short(opts_data, opt_count, short)
+                if lf != "":
+                    flags_data = rebuild_with_update(flags_data, lf, 3, "1")
+                elif lo != "":
+                    pending_short = lo
+                else:
+                    add_error("unknown option: -" + short)
             else:
-                add_error("unknown option: --" + name)
-        elif arg.starts_with("-") and arg != "-":
-            short := arg.substring(1, arg.len())
-            lf := find_by_short(flags_data, flag_count, short)
-            lo := find_by_short(opts_data, opt_count, short)
-            if lf != "":
-                flags_data = rebuild_with_update(flags_data, lf, 3, "1")
-            elif lo != "":
-                pending_short = lo
-            else:
-                add_error("unknown option: -" + short)
-        else:
-            if pi < pos_count:
-                pos_data = rebuild_with_update_by_index(pos_data, pi, 2, arg)
-                pi = pi + 1
-            else:
-                add_error("unexpected argument: " + arg)
-    if pending_long != "":
-        add_error("--" + pending_long + " requires a value")
-    if pending_short != "":
-        add_error("-" + pending_short + " requires a value")
+                if pi < pos_count:
+                    pos_data = rebuild_with_update_by_index(pos_data, pi, 2, arg)
+                    pi = pi + 1
+                else:
+                    add_error("unexpected argument: " + arg)
+        if pending_long != "":
+            add_error("--" + pending_long + " requires a value")
+        if pending_short != "":
+            add_error("-" + pending_short + " requires a value")
 
 fn find_eq(s: String) -> Int:
     mut i := 0
@@ -222,7 +225,7 @@ fn rebuild_with_update_by_index(data: String, rec_idx: Int, field_idx: Int, new_
             result = rec
     return result
 
-fn add_error(msg: String):
+fn add_error(msg: String) holding args_mu:
     if error_count > 0:
         sep := error_data + chr(10)
         error_data = sep + msg
@@ -236,32 +239,37 @@ fn add_error(msg: String):
 
 ## Return true when a parsed flag was present.
 pub fn get_flag(name: String) -> Bool:
-    rec := find_record(flags_data, flag_count, name)
-    if rec == "":
-        return false
-    return get_field(rec, 3) == "1"
+    locked args_mu:
+        rec := find_record(flags_data, flag_count, name)
+        if rec == "":
+            return false
+        return get_field(rec, 3) == "1"
 
 # get the parsed value for an option by long name.
 pub fn get_option(name: String) -> String:
-    rec := find_record(opts_data, opt_count, name)
-    if rec == "":
-        return ""
-    return get_field(rec, 3)
+    locked args_mu:
+        rec := find_record(opts_data, opt_count, name)
+        if rec == "":
+            return ""
+        return get_field(rec, 3)
 
 # get the parsed value for a positional argument by name.
 pub fn get_positional(name: String) -> String:
-    rec := find_record(pos_data, pos_count, name)
-    if rec == "":
-        return ""
-    return get_field(rec, 2).trim()
+    locked args_mu:
+        rec := find_record(pos_data, pos_count, name)
+        if rec == "":
+            return ""
+        return get_field(rec, 2).trim()
 
 # true when parsing recorded one or more argument errors.
 pub fn has_errors() -> Bool:
-    return error_count > 0
+    locked args_mu:
+        return error_count > 0
 
 # return all parse errors joined with newlines.
 pub fn get_errors() -> String:
-    return error_data
+    locked args_mu:
+        return error_data
 
 # ===============================================================
 # Help Text
@@ -269,6 +277,11 @@ pub fn get_errors() -> String:
 
 ## Render usage and argument help text.
 pub fn help_text() -> String:
+    locked args_mu:
+        return help_text_locked()
+
+# the help text, with the parser state already locked
+fn help_text_locked() -> String holding args_mu:
     nl := chr(10)
     mut out := app_name + " - " + app_desc + nl + nl
 

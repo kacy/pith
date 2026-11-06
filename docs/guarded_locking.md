@@ -409,25 +409,25 @@ before or after. neither needs the other.
 ## branches and pull requests
 
 the feature is built in isolation from main until it is complete and shown to
-cause no regressions.
+cause no regressions, and it lands as one commit per stage.
 
-- a feature branch, `guarded-locking`, is cut from main when work starts.
-  every pull request for stages 1 to 3 is part of one stack on it: the first
-  targets `guarded-locking`, and each later one branches from the one before
-  and targets it, so each diff shows one step.
-- each stage is split into small pull requests where that helps review: the
-  compiler change with its tests in one, the std migration in the next.
+- each of stages 1 to 3 is one pull request, split into several small commits
+  where that helps review: the compiler change with its tests, then the std
+  migration.
+- the pull requests form one stack. stage 1 branches from main, and each later
+  stage branches from the one before and targets it, so each diff shows one
+  stage.
 - every pull request stays open until the whole feature is up. nothing merges
-  into `guarded-locking` or main before then.
-- work moves to the next pull request without waiting for the previous one's
-  long CI jobs. every pull request must still have green CI before it merges.
-- if main moves while the stack is open, main is merged into
-  `guarded-locking` and through the stack, and the affected CI runs again.
+  into main before then.
+- work moves to the next stage without waiting for the previous one's long CI
+  jobs. every pull request must still have green CI before it merges.
+- if main moves while the stack is open, main is merged into stage 1 and
+  through the stack, and the affected CI runs again.
 
 ## testing and merging
 
-when the last pull request is up, the tip of the stack is tested against main
-at the commit `guarded-locking` was cut from:
+when the last pull request is up, the tip of the stack is tested against the
+main commit stage 1 branched from:
 
 - the full regression suite: `make run-regressions`, `make
   run-regressions-self`, `make test-std-self`, `make run-examples-self-only`,
@@ -444,11 +444,10 @@ at the commit `guarded-locking` was cut from:
   docs/lsp.md, before and after.
 
 the results go into bench/README.md with the last pull request. if they show
-no regressions and every pull request has green CI, the stack merges bottom up
-into `guarded-locking`, with each next pull request retargeted to
-`guarded-locking` before its base is squash-merged. then `guarded-locking`
-merges into main through one pull request, squash-merged after main's own CI
-run on that commit is green.
+no regressions and every pull request has green CI, the stack merges into main
+bottom up, one squash-merged commit per stage. before each merge the next pull
+request is retargeted to main, and main's own CI run on each merged commit
+must be green before the next stage merges.
 
 ## open questions
 

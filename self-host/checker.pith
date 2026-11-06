@@ -2172,12 +2172,18 @@ fn check_body_holding(decl: Node, body_idx: Int, scope_id: Int):
                     report_error_at(p, "E272", "holding needs a variable or a field path that holds a Mutex")
                 else:
                     t := c_check_expr(p, scope_id)
-                    if is_error_type(t) == false and get_type_name(t) != "Mutex" and get_type_name(t) != "List[Mutex]":
-                        report_error_at(p, "E272", "holding needs a Mutex, got " + get_type_name(t))
+                    if is_error_type(t) == false and not is_mutex_or_mutex_list(t):
+                        report_error_at(p, "E272", "holding needs a Mutex or a List[Mutex], got " + get_type_name(t))
                     held.push(text)
     locked_paths = held
     check_function_body(body_idx, scope_id)
     locked_paths = saved
+
+fn is_mutex_or_mutex_list(t: Int) -> Bool:
+    if get_type_name(t) == "Mutex":
+        return true
+    info := get_type_info(t)
+    return info.kind == "list" and get_type_name(info.inner) == "Mutex"
 
 # a call to a function declared `holding m` needs `m` held at the call. a
 # path rooted at `self` is read off the receiver, and one rooted at a

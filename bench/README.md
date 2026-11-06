@@ -475,6 +475,77 @@ from these:
 - the node pool behind `json_decode_shapes/list_walk`, about 5.0x Go
 - concurrent gRPC calls, 1.2-1.3x behind grpc-go at concurrency 8
 
+## guarded locking against its base (2026-11-06)
+
+The guarded-locking stack (#1324, #1325, #1326) adds `locked` blocks, `guard`
+blocks, `holding` functions and the E309 lint, and moves std's lock and unlock
+pairs into blocks and its shared state into guard blocks. The tip of the stack
+was measured against a1754077, the main commit the stack branched from, on the
+setup above.
+
+The cross-language suite ran once on each tree. 41 of its 46 Pith rows are
+within 2 percent of each other, and three more are 2.6 to 3.4 percent faster
+on the stack (`lock_sweep/labels`, `catalog_workload`, `lock_sweep/readfile`).
+The other two moved further and were raced, 21 interleaved rounds each:
+
+| benchmark | base | stack | change |
+|---|---:|---:|---:|
+| lock_sweep/spawn | 47.3 ms [37.0-48.2] | 45.5 ms [36.0-46.6] | -3.9% |
+| substring_search/absent | 0.9 ms | 0.9 ms | +1.1% |
+
+`lock_sweep/spawn` has two modes, near 37 ms and near 47 ms, and the base's
+suite run happened to land on the faster one.
+
+The HTTP sweep and the gateway alternated base and stack runs, three each, with
+five more gateway runs at 1024 connections because its p99 there swings by a
+millisecond from run to run. Medians:
+
+| http server | base req/s | stack req/s | base p99 | stack p99 |
+|---:|---:|---:|---:|---:|
+| 32 | 1.17M | 1.16M | 53 us | 53 us |
+| 128 | 1.85M | 1.80M | 110 us | 109 us |
+| 256 | 1.93M | 1.94M | 196 us | 185 us |
+| 1024 | 1.93M | 1.94M | 990 us | 870 us |
+
+| gateway | conns | base req/s | stack req/s | base p99 | stack p99 |
+|---|---:|---:|---:|---:|---:|
+| plain | 64 | 472k | 469k | 276 us | 262 us |
+| plain | 256 | 485k | 484k | 950 us | 1060 us |
+| plain | 1024 | 465k | 467k | 4.3 ms | 4.5 ms |
+| auth | 64 | 150k | 150k | 789 us | 777 us |
+| auth | 256 | 152k | 153k | 3.4 ms | 3.0 ms |
+| auth | 1024 | 147k | 147k | 10.3 ms | 11.6 ms |
+| failure | 1024 | 407k | 406k | 4.2 ms | 4.1 ms |
+
+The gateway's peak memory moved by under 3 percent in every row, and no
+request failed in either tree.
+
+The gRPC Pith client ran five rounds against the grpc-go server, alternating
+trees, with the server pinned to cpus 8-15,24-31 and the client to 0-7,16-23:
+
+| payload | concurrency | base | stack |
+|---|---:|---:|---:|
+| 16 B | 1 | 37.8k | 37.7k |
+| 1 KiB | 1 | 35.3k | 37.0k |
+| 16 B | 8 | 103.1k | 103.6k |
+| 1 KiB | 8 | 83.7k | 84.0k |
+
+Checking costs a little more, since the checker now walks each body with a set
+of held mutexes. Both compilers ran on the base tree's sources, seven
+interleaved rounds:
+
+| job | base | stack | change |
+|---|---:|---:|---:|
+| `pith check self-host/ir_emitter_core.pith` | 278 ms | 282 ms | +1.4% |
+| `pith check std/net/http.pith` | 273 ms | 277 ms | +1.4% |
+| `pith build self-host/pith_main.pith` | 1206 ms | 1208 ms | +0.1% |
+
+The regression suite passed on the stack, memcheck and AddressSanitizer
+included. ThreadSanitizer reports the same findings on both trees: a race on a
+test's own global in `test_tls_server_config_release`, thread leaks in
+`test_task_handle_scope` and the http/2 connection tests, and the intermittent
+http/2 client race.
+
 ## event ledger benchmark (json + collections + crypto)
 
 `bench/event_ledger.*` ingests a stream of newline-delimited JSON events,

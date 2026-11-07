@@ -488,13 +488,15 @@ error[E247]: cannot find module 'fs'
              ^
 ```
 
-### E248 — collection shared into a spawned task
+### E248 — collection shared with another task
 
 a spawned task runs concurrently with the scope that spawned it, on a pool of
 os threads. reference counts are atomic, but a list, map, or set is an
 unsynchronized buffer behind a handle, so passing one the current scope still
-holds lets both mutate the same buffer.
-pass data through a channel, hand the task a copy, or use an atomic cell for
+holds lets both mutate the same buffer. the same holds for a value sent
+through a channel: the receiver gets the handle, not a copy, so `send` and
+`try_send` are checked like a spawn's arguments.
+hand the task a copy, build the value in the call, or use an atomic cell for
 a shared scalar. a fresh collection — a literal, a copy, a call result — is
 not shared and is allowed.
 
@@ -507,7 +509,8 @@ error[E248]: a spawned task cannot take a list this scope still holds; both thre
 a struct argument is refused the same way when one of its fields reaches a
 list, a map or a set outside a `guard` block, directly or through a nested
 struct or optional struct field. move the field into a `guard` block, or build
-the struct in the spawn's arguments so the task holds the only reference.
+the struct in the spawn's arguments, or the send's, so the other task holds
+the only reference.
 
 ```
 error[E248]: a spawned task cannot take this Account: its field 'inbox.messages' is a collection outside a `guard` block, and both threads would reach the same buffer

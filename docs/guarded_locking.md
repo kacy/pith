@@ -522,6 +522,10 @@ build settled a question this page left open, or departed from it:
   credentials, the stream reader's header blocks, the http/2 pool's client
   list and the terminal's options and output queue. std.obs builds its
   export target in the spawn's arguments instead.
+- **E248 at channel sends.** `send` and `try_send` are checked like a spawn's
+  arguments, since the receiver gets the handle. the http/2 client and server
+  handed stream events to a helper that sent its parameter; the helper now
+  returns the inbox, and each caller builds the event in the send.
 - **lock order.** E311 is a lint for two mutexes taken in opposite orders
   anywhere in the program. it records each mutex taken while another is held,
   directly or in a function called under the lock through a call the checker

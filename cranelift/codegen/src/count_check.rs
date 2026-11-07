@@ -192,6 +192,10 @@ struct State {
     /// objects a null may stand in for: paths joined where one side held the
     /// object and the other a null, and releasing a null does nothing
     maybe_null: HashSet<String>,
+    /// for a field read: the field it read, as "base:index", and when
+    field_of: HashMap<String, (String, usize)>,
+    /// fields whose value was released through a read and not yet replaced
+    emptied: BTreeSet<String>,
 }
 
 /// the state at a block boundary. an object a slot holds is named by its
@@ -210,6 +214,7 @@ struct Canon {
     regs: BTreeMap<String, String>,
     nulls: BTreeSet<String>,
     unknowns: BTreeSet<String>,
+    emptied: BTreeSet<String>,
 }
 
 /// where two paths meet. a slot holding one object on one side and a null on
@@ -220,12 +225,12 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Option<Canon> {
     if a == b {
         return Some(a.clone());
     }
-    if a.unknowns != b.unknowns {
+    if a.unknowns != b.unknowns || a.emptied != b.emptied {
         return None;
     }
     let mut a_nulls = a.nulls.clone();
     let mut b_nulls = b.nulls.clone();
-    let mut out = Canon { unknowns: a.unknowns.clone(), ..Canon::default() };
+    let mut out = Canon { unknowns: a.unknowns.clone(), emptied: a.emptied.clone(), ..Canon::default() };
     let keys: BTreeSet<&Vec<String>> = a.objs.keys().chain(b.objs.keys()).collect();
     for k in keys {
         match (a.objs.get(k), b.objs.get(k)) {
@@ -281,11 +286,13 @@ struct FuncCheck<'a, 'f> {
     origins: HashMap<String, String>,
     current: String,
     current_dst: String,
+    /// field reads so far, to order them
+    reads: usize,
 }
 
 impl<'a, 'f> FuncCheck<'a, 'f> {
     fn new(f: &'f Func<'a>, globals: &'f HashMap<&'a str, &'a str>, user_funcs: &'f HashSet<&'a str>) -> Self {
-        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new() };
+        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new(), reads: 0 };
         c.scalar_temps = c.infer_scalar_temps();
         c
     }
@@ -428,6 +435,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 _ => {}
             }
         }
+        for field in &st.emptied {
+            let (base, off) = field.rsplit_once(':').unwrap_or((field.as_str(), ""));
+            let base = key_of.get(&base.to_string()).cloned().unwrap_or_else(|| base.to_string());
+            out.emptied.insert(format!("{base}:{off}"));
+        }
         out
     }
 
@@ -456,6 +468,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         for s in &canon.unknowns {
             st.slots.insert(s.clone(), Val::Unknown);
         }
+        st.emptied = canon.emptied.clone();
         st
     }
 
@@ -537,6 +550,15 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         out
     }
 
+    /// what a field's base refers to, so a read and a store through two
+    /// loads of the same struct name the same field
+    fn base_key(&self, st: &State, reg: &str) -> String {
+        match self.val(st, reg) {
+            Val::Obj(o) => o,
+            _ => format!("reg{reg}"),
+        }
+    }
+
     fn val(&self, st: &State, reg: &str) -> Val {
         st.regs.get(reg).cloned().unwrap_or(Val::Plain)
     }
@@ -545,6 +567,14 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
     fn take(&mut self, st: &mut State, reg: &str, why: &str) -> Result<(), String> {
         match self.val(st, reg) {
             Val::Obj(o) => {
+                if st.counts.get(&o).copied().unwrap_or(0) <= 0 {
+                    if let Some((field, _)) = st.field_of.get(&o).cloned() {
+                        // the struct's count on the field's value, given up
+                        // to replace it: the field must be stored again
+                        st.emptied.insert(field);
+                        return Ok(());
+                    }
+                }
                 let n = st.counts.entry(o).or_insert(0);
                 if *n <= 0 {
                     self.problems.push(format!("{why} gives up a count it doesn't hold (register {reg})"));
@@ -610,7 +640,13 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 let v = if ins[4] == "unknown" {
                     Val::Unknown
                 } else if is_counted(ins[4]) {
-                    Val::Obj(self.new_obj(st, 0))
+                    let o = self.new_obj(st, 0);
+                    // a read names its field by byte offset, a store by index
+                    let index = ins[3].parse::<i64>().map(|b| b / 8).unwrap_or(-1);
+                    let field = format!("{}:{}", self.base_key(st, ins[2]), index);
+                    self.reads += 1;
+                    st.field_of.insert(o.clone(), (field, self.reads));
+                    Val::Obj(o)
                 } else {
                     Val::Plain
                 };
@@ -619,6 +655,22 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             }
             "sstore" if ins.len() >= 4 => {
                 self.take(st, ins[3], "a struct field store")?;
+                let field = format!("{}:{}", self.base_key(st, ins[1]), ins[2]);
+                if !st.emptied.remove(&field) {
+                    // the store displaces the old value: the latest read of
+                    // it that held no count now carries the struct's one
+                    // count, for this function to give up
+                    let displaced = st
+                        .field_of
+                        .iter()
+                        .filter(|(o, (f, _))| *f == field && st.counts.get(*o).copied().unwrap_or(0) == 0)
+                        .max_by_key(|(_, (_, seq))| *seq)
+                        .map(|(o, _)| o.clone());
+                    if let Some(o) = displaced {
+                        st.counts.insert(o.clone(), 1);
+                    }
+                    st.field_of.retain(|_, (f, _)| *f != field);
+                }
                 Ok(false)
             }
             "concat" | "concatn" | "appendn" if ins.len() >= 2 => {
@@ -656,6 +708,12 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 }
             }
             match row.result.value {
+                // a generic runtime call (an await, an element get) says on
+                // the call line when this use of it yields a plain value
+                _ if SCALAR_KINDS.contains(&typ) => Val::Plain,
+                // an await of an unknown kind may be an Int; a count on it
+                // can't be settled either way
+                ResultValue::Own if typ == "unknown" => Val::Unknown,
                 ResultValue::Plain => Val::Plain,
                 ResultValue::Own => Val::Obj(self.new_obj(st, 1)),
                 ResultValue::Borrow(_) => Val::Obj(self.new_obj(st, 0)),
@@ -678,6 +736,9 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
     }
 
     fn ret(&mut self, ins: &[&str], st: &mut State) {
+        if !st.emptied.is_empty() {
+            self.problems.push("releases a field's value and returns without storing a new one (it dangles)".into());
+        }
         let mut counts = st.counts.clone();
         // a function returning a tuple has `unknown` on its func line, but
         // its callers still take the result as owned, so a return hands off
@@ -852,6 +913,51 @@ mod tests {
         // releasing a null before the first store is fine either way
         let r = check(&MAIN.replace("call 4 pith_list_release_handle void 1 2\n", ""));
         assert_eq!(r.passed, 1, "{:?}", r);
+    }
+
+    // fn set_value(s: String): self.value = s
+    const SET_VALUE: &str = "
+        func Input_set_value 2 void
+        param self
+        param s
+        load 1 s
+        call 3 pith_cstring_retain void 1 1
+        load 2 self
+        field 5 2 0 string value
+        call 6 pith_cstring_release void 1 5
+        sstore 2 0 1
+        iconst 7 0
+        ret 7
+        mark kind self Input
+        mark kind s string
+        endfunc
+    ";
+
+    #[test]
+    fn a_field_replaced_through_its_read_balances() {
+        let r = check(SET_VALUE);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_field_released_and_never_stored_dangles() {
+        let r = check(&SET_VALUE.replace("sstore 2 0 1\n", "call 8 pith_cstring_release void 1 1\n"));
+        assert_eq!(r.failed, 1, "{:?}", r);
+        assert!(r.problems.iter().any(|p| p.contains("dangles")), "{:?}", r.problems);
+    }
+
+    #[test]
+    fn a_store_then_a_release_of_the_old_value_balances() {
+        // the order Buffer.reset compiles to: read, store, then release
+        let store_first = SET_VALUE.replace(
+            "call 6 pith_cstring_release void 1 5\nsstore 2 0 1\n",
+            "sstore 2 0 1\ncall 6 pith_cstring_release void 1 5\n",
+        );
+        let r = check(&store_first);
+        assert_eq!((r.passed, r.failed), (1, 0), "{:?}", r);
+        // and the displaced value, never released, is a leak
+        let r = check(&store_first.replace("call 6 pith_cstring_release void 1 5\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
     }
 
     #[test]

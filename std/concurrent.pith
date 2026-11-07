@@ -341,9 +341,10 @@ impl BlockingError:
 # capture them from.
 
 mut group_test_ran := AtomicInt(0)
-mut group_test_live := AtomicInt(0)
-mut group_test_peak := AtomicInt(0)
-mut group_test_peak_mu := Mutex()
+
+guard group_test_peak_mu:
+    mut group_test_live := 0
+    mut group_test_peak := 0
 
 # compare_set in a loop, not store(load() + 1): those are two operations, and a
 # sibling bumping the counter between them costs an increment. these units run
@@ -374,15 +375,14 @@ fn group_test_tracked() -> Int!:
     # under one lock, so the observed peak is a value that really existed rather
     # than two racing updates blended together.
     locked group_test_peak_mu:
-        now := group_test_live.load() + 1
-        group_test_live.store(now)
-        if now > group_test_peak.load():
-            group_test_peak.store(now)
+        group_test_live = group_test_live + 1
+        if group_test_live > group_test_peak:
+            group_test_peak = group_test_live
 
     time.delay(20)
 
     locked group_test_peak_mu:
-        group_test_live.store(group_test_live.load() - 1)
+        group_test_live = group_test_live - 1
     return 1
 
 test "a group of successful work reports success":
@@ -422,8 +422,9 @@ test "cancelling a group's parent cancels the group":
     assert(g.wait().is_ok)
 
 test "a limited group runs no more than its permits at once":
-    group_test_live.store(0)
-    group_test_peak.store(0)
+    locked group_test_peak_mu:
+        group_test_live = 0
+        group_test_peak = 0
     g := group_limited(background(), 2)
     mut i := 0
     while i < 6:
@@ -431,9 +432,12 @@ test "a limited group runs no more than its permits at once":
         i = i + 1
 
     assert(g.wait().is_ok)
-    assert(group_test_peak.load() <= 2)
+    mut peak := 0
+    locked group_test_peak_mu:
+        peak = group_test_peak
+    assert(peak <= 2)
     # and it really did overlap, rather than serialising by accident
-    assert(group_test_peak.load() >= 1)
+    assert(peak >= 1)
 
 test "a group limit below one is clamped rather than deadlocking":
     g := group_limited(background(), 0)

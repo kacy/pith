@@ -1115,6 +1115,12 @@ mut ir_weak_capture_names: List[String] := []
 # (ir_owned_receiver_getter_payload_kind)
 mut ir_getter_consumed_idx := 0 - 1
 
+# the `unwrap_or` nodes lowered through the register pair
+# (ir_emit_unwrap_or_pair). no box keeps the payload there: the ok arm hands
+# out the payload's own count and the fallback arm gives the fallback one, so
+# the value is owned, not the borrow a box's unwrap_or hands out.
+mut ir_pair_unwrap_nodes: Map[Int, Bool] := {}
+
 # true when reading `name` must resolve liveness through
 # pith_struct_weak_load: a weak local of the emitting function, or a weak
 # binding captured from the enclosing one. a loop variable shadowing the
@@ -1301,6 +1307,8 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # extraction carries. the RESULT unwrap_or is untouched: its
         # receiver's kind is "result", and its string payload keeps the
         # retain-at-escape convention.
+        if mname == "unwrap_or" and ir_pair_unwrap_nodes.contains_key(idx):
+            return false
         if (mname == "unwrap_or" or mname == "value") and node.children.len() > 0:
             extract_recv_tid := c_get_expr_type(node.children[0])
             if extract_recv_tid >= 0 and get_type_info(extract_recv_tid).kind == "optional":
@@ -7698,6 +7706,7 @@ fn ir_extraction_operand_class(idx: Int) -> String:
 # path applies, then drops the error by its kind, the same order the box
 # path uses.
 fn ir_emit_unwrap_or_pair(idx: Int, node: Node, flag_r: Int, val_r: Int) -> Int:
+    ir_pair_unwrap_nodes.insert(idx, true)
     recv_tid := c_get_expr_type(node.children[0])
     temp_name := ir_new_temp_name("unwrap_or")
     arg_idx := ir_method_call_arg_expr(node, 0)

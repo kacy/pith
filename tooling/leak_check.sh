@@ -191,6 +191,7 @@ cases=(
   tests/leaks/leak_field_off_indexed_temporary
   tests/leaks/leak_iterator_loop
   tests/leaks/leak_or_pattern_subject
+  tests/leaks/leak_pair_unwrap_or
   "tests/leaks/leak_crosskind_binding SHAPE=1"
   "tests/leaks/leak_crosskind_binding SHAPE=2"
   "tests/leaks/leak_crosskind_binding SHAPE=3"

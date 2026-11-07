@@ -637,7 +637,8 @@ fn main() -> Int:
     emit_tests := parsed.emit_tests
     emit_combined := parsed.emit_combined
     validate_combined := parsed.validate_combined
-    set_count_marks(env("PITH_CHECK_COUNTS") == "1")
+    count_mode := env("PITH_CHECK_COUNTS")
+    set_count_marks(count_mode == "1" or count_mode == "2" or count_mode == "only")
     if emit_combined:
         emit_combined_file(path, emit_tests, validate_combined)
     else:

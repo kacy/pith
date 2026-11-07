@@ -236,8 +236,32 @@ refuses a runtime function without a row there.
 (`cranelift/codegen/src/count_check.rs`) on the marked ir before the
 backend drops the marks. it prints, on stderr, how many functions balance,
 how many don't, and how many it couldn't settle, with each unbalanced
-function and the instruction that made the count in question. it only
-reports for now and never fails the build.
+function and the instruction that made the count in question. it checks two
+rules:
+
+- balance: on every path, each count a function takes is given up exactly
+  once, by a release, a store into a holder, or the return.
+- borrow: a loop variable marked `borrow` is not read after the loop body
+  could have dropped what it borrows from, through an evicting method such
+  as `clear` or `pop`, a store into the same storage, or a call into a
+  function that writes it. a call the checker knows nothing about counts as
+  a write.
+
+`PITH_CHECK_COUNTS=2` adds the join details and the names of the balanced
+functions. `PITH_CHECK_COUNTS=only` reports and stops before code
+generation, for tools that want only the report.
+
+the build itself never fails on a finding. `make count-marks-check-only`,
+which ci runs, checks every corpus program and example and fails on any
+unbalanced function or borrow finding. a function the checker can't settle,
+such as one holding a weak reference, is counted as undecided and doesn't
+fail the target.
+
+the checker was tested by mutation: delete one release, or duplicate one, in
+a function it balances, and see whether it flags that function. it caught
+300 of 300 mutants on `tests/cases/test_process_command` and 295 of 300 on
+`examples/api_gateway`. four of the five misses were duplicated releases and
+one was a deleted release.
 
 marks generate no code. the consumer drops every `mark` line before its first
 pass, so a mark can't split a pattern its rewrites match, and a build with

@@ -7612,8 +7612,14 @@ fn check_spawn_shared_collections(call_node: Node, first_arg: Int):
         if arg_node.kind == "arg" and arg_node.children.len() > 0:
             expr_idx = arg_node.children[0]
         if spawn_arg_shares_collection(expr_idx):
-            kind := get_type_info(c_get_expr_type(expr_idx)).kind
-            report_error_with_fix_at(expr_idx, "E248", "a spawned task cannot take a " + kind + " this scope still holds; both threads would mutate the same buffer", "send it through a channel, or pass a copy (copy_" + kind + ")")
+            tid := c_get_expr_type(expr_idx)
+            kind := get_type_info(tid).kind
+            if kind == "list" or kind == "map" or kind == "set":
+                report_error_with_fix_at(expr_idx, "E248", "a spawned task cannot take a " + kind + " this scope still holds; both threads would mutate the same buffer", "send it through a channel, or pass a copy (copy_" + kind + ")")
+            else:
+                mut seen: Map[Int, Bool] := {}
+                path := struct_holds_unguarded_collection(tid, seen)
+                report_error_with_fix_at(expr_idx, "E248", "a spawned task cannot take this " + get_type_name(tid) + ": its field '" + path + "' is a collection outside a `guard` block, and both threads would reach the same buffer", "move the field into a `guard` block, or hand the task its own copy")
 
 # true when the argument names a collection some other scope keeps a
 # handle to: a variable, a struct field, or a container element. fresh
@@ -7626,7 +7632,32 @@ fn spawn_arg_shares_collection(expr_idx: Int) -> Bool:
     if tid < 0:
         return false
     kind := get_type_info(tid).kind
-    return kind == "list" or kind == "map" or kind == "set"
+    if kind == "list" or kind == "map" or kind == "set":
+        return true
+    mut seen: Map[Int, Bool] := {}
+    return struct_holds_unguarded_collection(tid, seen) != ""
+
+# the first field path under a struct type that reaches a list, a map or a set
+# outside a `guard` block, or "". a struct field or an optional struct is
+# followed into, once per type.
+fn struct_holds_unguarded_collection(tid: Int, seen: Map[Int, Bool]) -> String:
+    info := get_type_info(tid)
+    if info.kind == "optional" and info.inner >= 0:
+        return struct_holds_unguarded_collection(info.inner, seen)
+    if info.kind != "struct" or seen.contains_key(tid):
+        return ""
+    seen.insert(tid, true)
+    for fname, i in info.fields:
+        if struct_field_guards.contains_key(tid.to_string() + "." + fname):
+            continue
+        ftid := info.field_types[i]
+        fkind := get_type_info(ftid).kind
+        if fkind == "list" or fkind == "map" or fkind == "set":
+            return fname
+        inner := struct_holds_unguarded_collection(ftid, seen)
+        if inner != "":
+            return fname + "." + inner
+    return ""
 
 fn check_await_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:

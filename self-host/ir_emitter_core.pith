@@ -7239,6 +7239,12 @@ fn ir_field_receiver_kind_can_own(kind: String) -> Bool:
         return true
     if kind == "catch_expr" or kind == "catch_block" or kind == "field_access":
         return true
+    # an element read off a temporary container arrives owned
+    # (ir_index_reads_owned_element), so `make().items[0].name` releases the
+    # element once its field is read. a plain `xs[i]` is a borrow and stays out
+    # through the ownership check that follows.
+    if kind == "index":
+        return true
     return kind == "try" or kind == "try_expr"
 
 # true when a field access's receiver is a fresh value nothing else names: a
@@ -9595,9 +9601,22 @@ fn ir_index_reads_owned_element(idx: Int) -> Bool:
     node := get_node(idx)
     if node.children.len() == 0 or ir_expr_is_fresh_string_index(idx):
         return false
-    if not ir_index_container_is_owned_temp(node.children[0]):
+    if not ir_index_container_is_owned_temp(node.children[0]) and not ir_index_read_is_pinned(idx):
         return false
     return ir_rc_kind(ir_infer_type(idx)).len() > 0
+
+# true when an index read pins its container around a key that could drop it
+# (`o.items[shrink(o)]`, ir_emit_index_expr). the element then takes a count
+# of its own before the pin goes, so it arrives owned too; called borrowed, a
+# consumer that only read it left that count behind. the two checks are the
+# ones the emitter makes when it pins.
+fn ir_index_read_is_pinned(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.children.len() < 2:
+        return false
+    if ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1):
+        return false
+    return ir_arg_pin_kind(node.children[0]).len() > 0
 
 fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     obj_r := ir_expr(node.children[0])
@@ -9614,8 +9633,7 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     # `o.items[shrink(o)]`: a key that can drop the container read before it
     # pins the container for the read. the element then takes a count of its
     # own before the pin goes, since the pin may have been the container's
-    # last; a consumer that retains it as well leaks it, which is the safe
-    # side for a shape this rare.
+    # last, and ir_index_read_is_pinned tells the consumer it arrives owned.
     obj_pin := ir_pin_operand(node.children[0], obj_r, not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1))
     if obj_pin.len() > 0:
         read_r := ir_emit_index_read(idx, node, obj_r)

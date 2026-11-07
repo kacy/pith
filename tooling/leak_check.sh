@@ -188,6 +188,7 @@ cases=(
   tests/leaks/leak_interpolated_collection
   tests/leaks/leak_interp_early_exit
   tests/leaks/leak_optional_index_store
+  tests/leaks/leak_field_off_indexed_temporary
   "tests/leaks/leak_crosskind_binding SHAPE=1"
   "tests/leaks/leak_crosskind_binding SHAPE=2"
   "tests/leaks/leak_crosskind_binding SHAPE=3"

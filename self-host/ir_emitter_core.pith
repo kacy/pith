@@ -1143,6 +1143,11 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # borrows the element. mirrors ir_emit_index_expr's dispatch.
         if ir_expr_is_fresh_string_index(idx):
             return false
+        # a read off a temporary container (`s.split(",")[0]`) retains its
+        # element before the container goes (ir_emit_index_expr), so the
+        # element arrives owned
+        if ir_index_reads_owned_element(idx):
+            return false
         return true
     if node.kind == "binary" or node.kind == "interp" or node.kind == "string_interp":
         return false
@@ -6108,6 +6113,11 @@ fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
         # and `bs.contains(bytes.from_string_utf8(s))` worth writing, and every
         # one of them stranded its operand.
         ir_release_owned_operand(target_idx, target_r, ir_infer_type(target_idx))
+    # the list dies with the scan too when nothing else holds it: a literal
+    # (`["a", "b"].contains(x)`) or a call result. a borrowed list is left
+    # alone. the scan returns an index, never an element, so nothing it hands
+    # out depends on the list living on.
+    ir_release_owned_operand(list_idx, list_r, ir_infer_type(list_idx))
     return out_r
 
 fn ir_emit_list_contains_method(node: Node, obj_type: String) -> Int:
@@ -9487,8 +9497,37 @@ fn ir_emit_fail_expr(node: Node) -> Int:
     ir_emit("iconst " + r.to_string() + " 0")
     return r
 
+# true when the container an index reads is a temporary nothing else holds,
+# such as a call result or a literal, so the read has to release it
+fn ir_index_container_is_owned_temp(container_idx: Int) -> Bool:
+    if ir_expr_is_borrowed(container_idx):
+        return false
+    kind := ir_rc_kind(ir_infer_type(container_idx))
+    return kind == "list" or kind == "map" or kind == "string" or kind == "bytes"
+
+# true when an index read hands out an element with a count of its own: the
+# container is a temporary and the element is counted. a string's char is
+# already fresh and needs no retain.
+fn ir_index_reads_owned_element(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.children.len() == 0 or ir_expr_is_fresh_string_index(idx):
+        return false
+    if not ir_index_container_is_owned_temp(node.children[0]):
+        return false
+    return ir_rc_kind(ir_infer_type(idx)).len() > 0
+
 fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     obj_r := ir_expr(node.children[0])
+    # `s.split(",")[0]`, `make().items[i]`: the container dies with the read.
+    # a counted element takes a count of its own first, since the container
+    # may have been its last owner; ir_expr_is_borrowed calls it owned to
+    # match. before this every such read leaked the whole container.
+    if ir_index_container_is_owned_temp(node.children[0]):
+        read_r := ir_emit_index_read(idx, node, obj_r)
+        if ir_index_reads_owned_element(idx):
+            ir_rc_retain_reg(read_r, ir_rc_kind(ir_infer_type(idx)))
+        ir_rc_release_reg(obj_r, ir_rc_kind(ir_infer_type(node.children[0])))
+        return read_r
     # `o.items[shrink(o)]`: a key that can drop the container read before it
     # pins the container for the read. the element then takes a count of its
     # own before the pin goes, since the pin may have been the container's

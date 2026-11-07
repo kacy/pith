@@ -1792,6 +1792,11 @@ fn report_counts(report: &crate::count_check::CountReport) {
     for (reason, n) in &report.undecided_reasons {
         eprintln!("  undecided ({n}): {reason}");
     }
+    if std::env::var("PITH_CHECK_COUNTS").as_deref() == Ok("2") {
+        for d in &report.join_details {
+            eprintln!("  join: {d}");
+        }
+    }
 }
 
 fn is_count_mark(line: &str) -> bool {
@@ -1806,7 +1811,7 @@ pub fn compile_from_ir(
     runtime_funcs: &HashMap<String, FuncId>,
 ) -> Result<HashMap<String, FuncId>, CompileError> {
     // the count checker reads the marks, so it runs before they are dropped
-    if std::env::var("PITH_CHECK_COUNTS").as_deref() == Ok("1") {
+    if matches!(std::env::var("PITH_CHECK_COUNTS").as_deref(), Ok("1") | Ok("2")) {
         let raw: Vec<&str> = ir_text.lines().collect();
         report_counts(&crate::count_check::check_counts(&raw));
     }

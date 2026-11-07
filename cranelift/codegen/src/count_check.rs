@@ -70,6 +70,8 @@ pub struct CountReport {
     pub problems: Vec<String>,
     /// why the undecided functions couldn't be settled, with counts
     pub undecided_reasons: BTreeMap<String, usize>,
+    /// for each function undecided at a join, what disagreed there
+    pub join_details: Vec<String>,
 }
 
 impl CountReport {
@@ -162,6 +164,9 @@ pub fn check_counts(lines: &[&str]) -> CountReport {
         match checker.run() {
             Err(reason) => {
                 report.undecided += 1;
+                if !checker.join_detail.is_empty() {
+                    report.join_details.push(format!("{}: {}", f.name, checker.join_detail));
+                }
                 *report.undecided_reasons.entry(reason).or_insert(0) += 1;
             }
             Ok(()) if checker.problems.is_empty() => report.passed += 1,
@@ -236,18 +241,23 @@ struct Canon {
     emptied: BTreeSet<String>,
     shells: BTreeSet<String>,
     owned_fields: BTreeSet<String>,
+    /// view slots that share an owned slot's value: view -> owned slot
+    aliases: BTreeMap<String, String>,
 }
 
 /// where two paths meet. a slot holding one object on one side and a null on
 /// the other becomes that object or a null. a register only one side defines
 /// can't be used past the join, so a count it holds there is a leak. any
 /// other disagreement is one the checker can't settle.
-fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Option<Canon> {
+fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> {
     if a == b {
-        return Some(a.clone());
+        return Ok(a.clone());
     }
-    if a.unknowns != b.unknowns || a.emptied != b.emptied {
-        return None;
+    if a.unknowns != b.unknowns {
+        return Err(format!("slots of unknown kind differ: {:?} vs {:?}", a.unknowns, b.unknowns));
+    }
+    if a.emptied != b.emptied {
+        return Err(format!("emptied fields differ: {:?} vs {:?}", a.emptied, b.emptied));
     }
     let mut a_nulls = a.nulls.clone();
     let mut b_nulls = b.nulls.clone();
@@ -256,6 +266,8 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Option<Canon> {
         emptied: a.emptied.clone(),
         shells: a.shells.union(&b.shells).cloned().collect(),
         owned_fields: a.owned_fields.union(&b.owned_fields).cloned().collect(),
+        // a view only one path pointed at a value is dead past the join
+        aliases: a.aliases.iter().filter(|(v, h)| b.aliases.get(*v) == Some(*h)).map(|(v, h)| (v.clone(), h.clone())).collect(),
         ..Canon::default()
     };
     let keys: BTreeSet<&Vec<String>> = a.objs.keys().chain(b.objs.keys()).collect();
@@ -270,20 +282,28 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Option<Canon> {
             (None, Some(y)) if k.len() == 1 && y.0 <= 1 && a_nulls.remove(&k[0]) => {
                 out.objs.insert(k.clone(), (y.0, true));
             }
-            _ => return None,
+            // a borrow one path made and the other never did: it holds no
+            // count, and a slot only one path wrote can't be read past here
+            (Some(x), None) | (None, Some(x)) if x.0 == 0 && !k.iter().any(|s| a_nulls.contains(s) || b_nulls.contains(s)) => {}
+            (x, y) => return Err(format!("{} holds {:?} on one path and {:?} on the other", k.join("|"), x, y)),
         }
     }
-    if a_nulls != b_nulls {
-        return None;
+    // a null holds nothing, so a slot null on one path and never written on
+    // the other agrees; the slot is kept null only where both paths say so.
+    // a slot one path left null and the other gave a count is the holder
+    // case handled above.
+    let held_keys: BTreeSet<&String> = out.objs.keys().flatten().collect();
+    if a_nulls.iter().chain(b_nulls.iter()).any(|n| held_keys.contains(n)) {
+        return Err(format!("nulls differ: {:?} vs {:?}", a_nulls, b_nulls));
     }
-    out.nulls = a_nulls;
+    out.nulls = a_nulls.intersection(&b_nulls).cloned().collect();
     let ids: BTreeSet<&String> = a.regobjs.keys().chain(b.regobjs.keys()).collect();
     for id in ids {
         match (a.regobjs.get(id), b.regobjs.get(id)) {
             (Some(x), Some(y)) if x == y => {
                 out.regobjs.insert(id.clone(), *x);
             }
-            (Some(_), Some(_)) => return None,
+            (Some(x), Some(y)) => return Err(format!("register object {id} holds {x} on one path and {y} on the other")),
             (Some(n), None) | (None, Some(n)) => {
                 if *n > 0 {
                     leaks.push(id.clone());
@@ -292,15 +312,26 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Option<Canon> {
             (None, None) => {}
         }
     }
+    let live = |key: &String| key == "null" || out.regobjs.contains_key(key) || out.objs.keys().any(|k| format!("@{}", k.join("|")) == *key);
+    let mut regs = BTreeMap::new();
     for (r, key) in &a.regs {
-        if b.regs.get(r) == Some(key) {
-            let live = key == "null" || out.regobjs.contains_key(key) || out.objs.keys().any(|k| format!("@{}", k.join("|")) == *key);
-            if live {
-                out.regs.insert(r.clone(), key.clone());
+        let merged = match b.regs.get(r) {
+            Some(other) if other == key => Some(key.clone()),
+            // a register read from a slot that held a null on one path and a
+            // value on the other: the join made that value "one count or a
+            // null", and the register follows it
+            Some(other) if key == "null" && live(other) => Some(other.clone()),
+            Some(other) if other == "null" && live(key) => Some(key.clone()),
+            _ => None,
+        };
+        if let Some(k) = merged {
+            if live(&k) {
+                regs.insert(r.clone(), k);
             }
         }
     }
-    Some(out)
+    out.regs = regs;
+    Ok(out)
 }
 
 struct FuncCheck<'a, 'f> {
@@ -315,11 +346,13 @@ struct FuncCheck<'a, 'f> {
     current_dst: String,
     /// field reads so far, to order them
     reads: usize,
+    /// what disagreed at the join that left the function undecided
+    join_detail: String,
 }
 
 impl<'a, 'f> FuncCheck<'a, 'f> {
     fn new(f: &'f Func<'a>, globals: &'f HashMap<&'a str, &'a str>, user_funcs: &'f HashSet<&'a str>) -> Self {
-        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new(), reads: 0 };
+        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new(), reads: 0, join_detail: String::new() };
         c.scalar_temps = c.infer_scalar_temps();
         c
     }
@@ -426,8 +459,25 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         let mut key_of: HashMap<&String, String> = HashMap::new();
         for (o, n) in &st.counts {
             if let Some(names) = holders.get(o) {
-                out.objs.insert(names.clone(), (*n, st.maybe_null.contains(o)));
-                key_of.insert(o, format!("@{}", names.join("|")));
+                let maybe_null = st.maybe_null.contains(o);
+                let owners: Vec<&String> = names.iter().filter(|s| self.class_of(s) == SlotClass::Holder).collect();
+                if names.len() >= 2 && !owners.is_empty() && *n == owners.len() as i64 {
+                    // several slots share one value and each owned slot has a
+                    // count of its own (`name = value` with a retain): each
+                    // owned slot is its own count, and a view slot sharing the
+                    // value is an alias of the first. a path where the slots
+                    // hold separate values agrees with this one.
+                    for slot in &owners {
+                        out.objs.insert(vec![(*slot).clone()], (1, maybe_null));
+                    }
+                    for slot in names.iter().filter(|s| !owners.contains(s)) {
+                        out.aliases.insert(slot.clone(), owners[0].clone());
+                    }
+                    key_of.insert(o, format!("@{}", owners[0]));
+                } else {
+                    out.objs.insert(names.clone(), (*n, maybe_null));
+                    key_of.insert(o, format!("@{}", names.join("|")));
+                }
             } else if *n != 0 && referenced.contains(o) {
                 out.regobjs.insert(o.clone(), *n);
                 key_of.insert(o, o.clone());
@@ -491,6 +541,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             }
             for s in names {
                 st.slots.insert(s.clone(), Val::Obj(o.clone()));
+            }
+        }
+        for (view, owner) in &canon.aliases {
+            if let Some(v) = st.slots.get(owner).cloned() {
+                st.slots.insert(view.clone(), v);
             }
         }
         for (id, n) in &canon.regobjs {
@@ -557,9 +612,12 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             }
             let key = match seen.get(&b) {
                 Some(prev) => match self.join_at(prev, &key, &order[b]) {
-                    Some(merged) if merged == *prev => continue,
-                    Some(merged) => merged,
-                    None => return Err("paths join with different counts".into()),
+                    Ok(merged) if merged == *prev => continue,
+                    Ok(merged) => merged,
+                    Err(why) => {
+                        self.join_detail = format!("at {}: {}", order[b], why);
+                        return Err("paths join with different counts".into());
+                    }
                 },
                 None => key,
             };
@@ -585,7 +643,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         Ok(())
     }
 
-    fn join_at(&mut self, a: &Canon, b: &Canon, label: &str) -> Option<Canon> {
+    fn join_at(&mut self, a: &Canon, b: &Canon, label: &str) -> Result<Canon, String> {
         let mut leaks = Vec::new();
         let out = join(a, b, &mut leaks);
         for id in leaks {
@@ -1054,6 +1112,161 @@ mod tests {
         assert_eq!((r.passed, r.failed), (1, 0), "{:?}", r);
         // and the displaced value, never released, is a leak
         let r = check(&store_first.replace("call 6 pith_cstring_release void 1 5\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+    // name = value with a retain on one path, name = a fresh substring on the
+    // other, both released at exit: the shape parser_mark_guarded compiles to
+    const ALIASED: &str = "
+        func mark 1 void
+        param s
+        iconst 1 0
+        store value 1
+        iconst 2 0
+        store name 2
+        load 3 s
+        call 4 pith_cstring_trim string 1 3
+        store value 4
+        load 5 value
+        call 6 pith_cstring_retain void 1 5
+        store name 5
+        iconst 7 1
+        brif 7 L1 L2
+        label L1
+        load 8 value
+        iconst 9 0
+        call 10 pith_cstring_substring string 3 8 9 9
+        load 11 name
+        call 12 pith_cstring_release void 1 11
+        store name 10
+        jmp L2
+        label L2
+        load 13 value
+        call 14 pith_cstring_release void 1 13
+        load 15 name
+        call 16 pith_cstring_release void 1 15
+        iconst 17 0
+        ret 17
+        mark kind s string
+        mark kind value string
+        mark kind name string
+        mark owns value string
+        mark owns name string
+        endfunc
+    ";
+
+    #[test]
+    fn slots_sharing_a_value_join_slots_holding_their_own() {
+        let r = check(ALIASED);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_missing_release_after_an_aliasing_join_is_still_a_leak() {
+        let r = check(&ALIASED.replace("call 16 pith_cstring_release void 1 15\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
+        // and dropping the release of the old shared value on one path too
+        let r = check(&ALIASED.replace("call 12 pith_cstring_release void 1 11\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+
+    // examples/graceful_shutdown.pith: a result rebound each loop pass, its old
+    // value released through a register read before a branch. the slot is
+    // null on the first pass and a value on later ones.
+    #[test]
+    fn a_result_rebound_in_a_loop_balances() {
+        let ir = r#"func std_time_delay 1 void
+param x
+iconst 1 0
+ret 1
+endfunc
+func await_listening 1 bool
+param port
+iconst 1 0
+store probe 1
+iconst 2 0
+store waited 2
+label L12
+load 3 waited
+iconst 4 10000
+lt 5 3 4
+brif 5 L13 L14
+label L13
+load 6 probe
+strref 7 m53s59
+load 8 port
+call 9 tcp_connect result_int 2 7 8
+call 10 pith_cstring_release void 1 7
+iconst 11 0
+neq 12 9 11
+brif 12 L15 L16
+label L15
+iconst 13 1
+sub 14 9 13
+iconst 15 1
+iconst 16 0
+iconst 17 3
+call 18 pith_struct_alloc struct:tuple 1 17
+sstore 18 0 15
+sstore 18 1 14
+sstore 18 2 16
+store __legacy_result_11_15 18
+jmp L17
+label L16
+strref 19 m53s1109
+iconst 20 0
+iconst 21 3
+call 22 pith_struct_alloc struct:tuple 1 21
+sstore 22 0 20
+sstore 22 1 20
+sstore 22 2 19
+store __legacy_result_11_15 22
+label L17
+load 23 __legacy_result_11_15
+call 24 __tuple_cascade_0s_m53 void 1 6
+store probe 23
+load 25 probe
+field 26 25 0 bool is_ok
+brif 26 L19 L20
+label L19
+load 27 probe
+field 28 27 8 int ok
+call 29 tcp_close unknown 1 28
+iconst 30 1
+load 31 probe
+call 32 __tuple_cascade_0s_m53 void 1 31
+ret 30
+label L20
+label L18
+iconst 33 20
+call 34 std_time_delay void 1 33
+load 35 waited
+iconst 36 20
+add 37 35 36
+store waited 37
+jmp L12
+label L14
+iconst 38 0
+load 39 probe
+call 40 __tuple_cascade_0s_m53 void 1 39
+ret 38
+load 41 probe
+call 42 __tuple_cascade_0s_m53 void 1 41
+iconst 43 0
+ret 43
+mark kind __legacy_result_11_15 tuple
+mark kind waited int
+mark kind port int
+mark kind probe tuple
+mark owns probe tuple
+mark untracked waited
+endfunc
+"#;
+        let r = check(ir);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+        // without the release of the old value, the next pass leaks it
+        let r = check(&ir.replace("call 24 __tuple_cascade_0s_m53 void 1 6\n", ""));
         assert_eq!(r.failed, 1, "{:?}", r);
     }
 

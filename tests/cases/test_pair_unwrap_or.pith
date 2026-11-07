@@ -1,0 +1,24 @@
+# `unwrap_or` on a call that returns through the register pair: the ok arm
+# hands out the payload's own count and the fallback arm gives the fallback a
+# count of its own, so the value is owned. a borrowed fallback stays readable
+# after it was handed out.
+
+fn fetch(i: Int) -> String!:
+    if i < 0:
+        fail "negative"
+    return "v" + i.to_string()
+
+fn main():
+    fallback := "fb-" + 1.to_string()
+    ok_text := fetch(3).unwrap_or(fallback)
+    err_text := fetch(0 - 1).unwrap_or(fallback)
+    missing := read_file("/nonexistent/pith/path").unwrap_or(fallback)
+    print("{ok_text} {err_text} {missing} {fallback}")
+    mut total := 0
+    mut i := 0
+    while i < 1000:
+        a := fetch(i).unwrap_or(fallback)
+        b := fetch(0 - i - 1).unwrap_or(fallback)
+        total = total + a.len() + b.len()
+        i = i + 1
+    print("{total} {fallback}")

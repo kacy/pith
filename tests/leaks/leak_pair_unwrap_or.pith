@@ -1,0 +1,26 @@
+# `x := f().unwrap_or(d)` where f returns through the register pair, a user
+# String! function or read_file: the payload's count was handed out and then
+# retained again as if borrowed, leaking one string per call.
+import leakprobe as probe
+
+fn fetch(i: Int) -> String!:
+    if i < 0:
+        fail "negative"
+    return "v" + i.to_string()
+
+fn round(i: Int) -> Int:
+    a := fetch(i).unwrap_or("")
+    b := read_file("tests/leaks/leak_pair_unwrap_or.pith").unwrap_or("")
+    return a.len() + b.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

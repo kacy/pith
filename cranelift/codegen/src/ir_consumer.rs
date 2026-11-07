@@ -1781,6 +1781,19 @@ fn live_functions(lines: &[&str]) -> Option<HashSet<String>> {
     Some(live)
 }
 
+// the count checker's findings on stderr. it only reports for now: its
+// unbalanced functions are still being sorted into checker gaps and real
+// bugs, so they don't fail the build yet.
+fn report_counts(report: &crate::count_check::CountReport) {
+    eprintln!("{}", report.summary());
+    for p in &report.problems {
+        eprintln!("  unbalanced: {p}");
+    }
+    for (reason, n) in &report.undecided_reasons {
+        eprintln!("  undecided ({n}): {reason}");
+    }
+}
+
 fn is_count_mark(line: &str) -> bool {
     let line = line.trim_start();
     line == "mark" || line.starts_with("mark ")
@@ -1792,6 +1805,11 @@ pub fn compile_from_ir(
     ir_text: &str,
     runtime_funcs: &HashMap<String, FuncId>,
 ) -> Result<HashMap<String, FuncId>, CompileError> {
+    // the count checker reads the marks, so it runs before they are dropped
+    if std::env::var("PITH_CHECK_COUNTS").as_deref() == Ok("1") {
+        let raw: Vec<&str> = ir_text.lines().collect();
+        report_counts(&crate::count_check::check_counts(&raw));
+    }
     // `mark` lines are notes for the count checker and generate nothing. they
     // go before any pass reads the text, so they can't split a pattern the
     // rewrites below look for and change the code (see docs/ir-contract.md).

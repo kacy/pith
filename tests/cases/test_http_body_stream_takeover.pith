@@ -1,0 +1,186 @@
+# two things a handler can do with the http/1.1 connection itself.
+#
+# with ServerConfig.stream_request_bodies, the handler reads the request body
+# with http.read_body_part as it arrives, sized or chunked. a body the handler
+# leaves unread is drained, so the next request on the connection is read from
+# the right place, and one too large to drain closes the connection instead.
+#
+# http.take_connection hands the connection to a function with read and write,
+# here a toy upgrade that answers 101 and echoes upper-cased.
+
+import std.net.http as http
+import std.net.tls as tls
+import std.bytes as bytes
+import std.time as time_mod
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+GIVE_UP_MS := 3000
+
+fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "?"
+    if path == "/count":
+        mut total := 0
+        mut parts := 0
+        while true:
+            part := http.read_body_part(5) catch bytes.empty()
+            if part.is_empty():
+                break
+            total = total + part.len()
+            parts = parts + 1
+        return http.text(200, "bytes={total} parts>1={parts > 1}")
+    if path == "/upgrade":
+        return http.take_connection(shout)
+    return http.text(200, "ignored")
+
+# answer the upgrade, greet from another task (write works from any task),
+# then send back upper-cased whatever arrives until the client closes.
+fn shout(read: fn(Int) -> Bytes!, write: fn(Bytes) -> Int!) -> Int!:
+    write(bytes.from_string_utf8("HTTP/1.1 101 Switching Protocols\r\nUpgrade: shout\r\nConnection: Upgrade\r\n\r\n"))!
+    greeter := spawn greet(write)
+    await greeter
+    while true:
+        got := read(1024)!
+        if got.is_empty():
+            return 0
+        write(bytes.from_string_utf8(got.to_string_utf8()!.to_upper()))!
+    return 0
+
+fn greet(write: fn(Bytes) -> Int!) -> Int:
+    return write(bytes.from_string_utf8("ready;")) catch 0
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn accept_loop(listener: Int, config: http.ServerConfig) -> Int:
+    while true:
+        fd := tcp_accept(listener) catch 0
+        if fd > 0:
+            spawn serve_plain(fd, config)
+    return 0
+
+fn serve_plain(fd: Int, config: http.ServerConfig) -> Int:
+    return http.serve_connection_fd_with(fd, route, config) catch 0
+
+fn start_server(start: Int, config: http.ServerConfig) -> Int!:
+    port := choose_port(start)!
+    listener := tcp_listen("127.0.0.1", port)!
+    spawn accept_loop(listener, config)
+    return port
+
+fn tls_accept_loop(listener: tls.Listener, config: http.ServerConfig) -> Int:
+    while true:
+        conn := listener.accept() catch tls.Conn(0)
+        if conn.handle != 0:
+            spawn serve_tls(conn, config)
+    return 0
+
+fn serve_tls(conn: tls.Conn, config: http.ServerConfig) -> Int:
+    http.serve_connection_tls_with(conn, route, config) catch 0
+    conn.close()
+    return 0
+
+# what a tls connection brings until `want` is in it or GIVE_UP_MS passes
+fn tls_read_until(conn: tls.Conn, want: String) -> String:
+    mut out := ""
+    started := time_mod.mono_millis()
+    while time_mod.mono_millis() - started < GIVE_UP_MS and not out.contains(want):
+        chunk := conn.read_bytes(4096) catch bytes.empty()
+        if chunk.is_empty():
+            return out
+        out = out + (chunk.to_string_utf8() catch "?")
+    return out
+
+# the streamed body and the takeover again, over tls
+fn tls_case(config: http.ServerConfig) -> Int!:
+    port := choose_port(24810)!
+    server_tls := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["http/1.1"])
+    listener := tls.listen("127.0.0.1", port, server_tls)!
+    spawn tls_accept_loop(listener, config)
+    client := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["http/1.1"])
+    conn := tls.dial_with_config("127.0.0.1", port, "localhost", client)!
+    conn.write_all_bytes(bytes.from_string_utf8("POST /count HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"))!
+    print("tls sized: " + last_body(tls_read_until(conn, "parts")))
+    conn.write_all_bytes(bytes.from_string_utf8("GET /upgrade HTTP/1.1\r\nHost: x\r\nUpgrade: shout\r\nConnection: Upgrade\r\n\r\n"))!
+    head := tls_read_until(conn, "ready;")
+    print("tls upgrade: " + head.contains("101 Switching Protocols").to_string() + ", greeting: " + head.contains("ready;").to_string())
+    conn.write_all_bytes(bytes.from_string_utf8("secret"))!
+    print("tls echo: " + tls_read_until(conn, "SECRET"))
+    conn.close()
+    return 0
+
+# what arrives until `want` is in it, the peer closes, or GIVE_UP_MS passes
+fn read_until(fd: Int, want: String) -> String:
+    mut out := ""
+    started := time_mod.mono_millis()
+    while time_mod.mono_millis() - started < GIVE_UP_MS:
+        if out.contains(want):
+            return out
+        if tcp_wait_readable(fd, 100) == 0:
+            continue
+        chunk := tcp_read_bytes(fd, 65536) catch bytes.empty()
+        if chunk.is_empty():
+            return out
+        out = out + (chunk.to_string_utf8() catch "?")
+    return out
+
+# the body of the last response in `text`
+fn last_body(text: String) -> String:
+    at := text.last_index_of("\r\n\r\n")
+    if at < 0:
+        return "?"
+    return text.substring(at + 4, text.len())
+
+fn main():
+    config := http.server_config().with_stream_request_bodies(true)
+    port := start_server(24610, config) catch 0
+    if port == 0:
+        print("listen-error")
+        return
+
+    # a sized body, read in parts
+    fd := tcp_connect("127.0.0.1", port) catch 0
+    tcp_write(fd, "POST /count HTTP/1.1\r\nHost: x\r\nContent-Length: 23\r\n\r\nhello streaming request") catch 0
+    print("sized: " + last_body(read_until(fd, "parts")))
+
+    # a chunked body on the same connection
+    tcp_write(fd, "POST /count HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n9\r\nstreaming\r\n0\r\n\r\n") catch 0
+    print("chunked: " + last_body(read_until(fd, "bytes=15")))
+
+    # a body the handler ignores is drained: the next request still works
+    tcp_write(fd, "POST /skip HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789") catch 0
+    print("ignored: " + last_body(read_until(fd, "ignored")))
+    tcp_write(fd, "POST /count HTTP/1.1\r\nHost: x\r\nContent-Length: 3\r\n\r\nabc") catch 0
+    print("after drain: " + last_body(read_until(fd, "bytes=3")))
+    tcp_close(fd)
+
+    # one too large to drain closes the connection after the response
+    big := tcp_connect("127.0.0.1", port) catch 0
+    tcp_write(big, "POST /skip HTTP/1.1\r\nHost: x\r\nContent-Length: 10000000\r\n\r\nstart") catch 0
+    reply := read_until(big, "never")
+    print("too big to drain: closes={reply.contains("Connection: close")} answered={reply.contains("ignored")}")
+    tcp_close(big)
+
+    # taking the connection over
+    up := tcp_connect("127.0.0.1", port) catch 0
+    tcp_write(up, "GET /upgrade HTTP/1.1\r\nHost: x\r\nUpgrade: shout\r\nConnection: Upgrade\r\n\r\n") catch 0
+    head := read_until(up, "ready;")
+    print("upgrade: " + head.substring(0, head.index_of("\r\n")))
+    print("greeting from another task: " + head.contains("\r\n\r\nready;").to_string())
+    tcp_write(up, "ping") catch 0
+    print("echo: " + read_until(up, "PING"))
+    tcp_write(up, " and pong") catch 0
+    print("echo: " + read_until(up, "PONG"))
+    tcp_close(up)
+
+    if tls_case(config).is_err:
+        print("tls case failed")

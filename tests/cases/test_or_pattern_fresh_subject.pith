@@ -1,0 +1,39 @@
+# a match on a fresh enum whose arms use or-patterns: the subject is released
+# once an arm is taken, and a name an or-pattern binds keeps its own count.
+
+struct Meta:
+    author: String
+
+enum Packet:
+    Empty
+    Text(String)
+    Tagged(String, Int)
+    Wrapped(Meta)
+
+fn make(n: Int) -> Packet:
+    if n == 0:
+        return Packet.Empty
+    if n == 1:
+        return Packet.Text("t" + n.to_string())
+    if n == 2:
+        return Packet.Tagged("g" + n.to_string(), 42)
+    return Packet.Wrapped(Meta(author: "a" + n.to_string()))
+
+fn label(n: Int) -> String:
+    match make(n):
+        Packet.Empty | Packet.Wrapped(_) => "plain"
+        Packet.Text(s) | Packet.Tagged(s, _) => "named " + s
+
+fn main():
+    mut i := 0
+    while i < 4:
+        print(label(i))
+        i = i + 1
+    mut kept: List[String] := []
+    i = 0
+    while i < 1000:
+        match make(i % 4):
+            Packet.Text(s) | Packet.Tagged(s, _) => kept.push(s)
+            Packet.Empty | Packet.Wrapped(_) => kept.push("-")
+        i = i + 1
+    print("{kept.len()} {kept[1]} {kept[2]} {kept[3]}")

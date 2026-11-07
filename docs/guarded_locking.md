@@ -327,8 +327,8 @@ what the checker does not do:
   `m.lock()` and before `m.unlock()` is still an error, and the fix is the
   `locked` block.
 - it does not check lock order, so two blocks that nest two mutexes in
-  opposite orders can still deadlock at run time. a later lint could record
-  each function's nesting order and report a cycle.
+  opposite orders can still deadlock at run time. the E311 lint reports it
+  (see "as built").
 - it does not check that a `locked` block holds no park. holding a lock
   across a channel receive or a socket read compiles, as it does today. the
   E310 lint reports it (see "as built").
@@ -513,6 +513,13 @@ build settled a question this page left open, or departed from it:
   `recv`, and the std file, tcp, tls and websocket reads. a channel send is
   left out, because the HTTP/2 client sends its frames under `mu` to keep
   stream ids in order. std, the examples and the compiler lint clean.
+- **lock order.** E311 is a lint for two mutexes taken in opposite orders
+  anywhere in the program. it records each mutex taken while another is held,
+  directly or in a function called under the lock through a call the checker
+  resolved, and reports a pair taken both ways. a mutex is named by its
+  module global, by its struct type and field, or by its sharded guard, so
+  two values of one struct are one name and nesting them is not reported.
+  std, the examples and the compiler lint clean.
 
 ## open questions
 
@@ -529,9 +536,6 @@ build settled a question this page left open, or departed from it:
   collection. widening it to structs whose fields are collections, unless
   those fields are in a `guard` block, would close that gap and is a smaller
   change than this one.
-- **lock order.** recording each function's lock nesting and reporting a
-  cycle between functions would catch the deadlocks the checker above cannot.
-  it needs whole-program call information the checker has in part.
 - **`RwMutex`.** nothing here needs a reader-writer lock, and std does not
   have one. if one is added, `guard` applies unchanged and `locked` would
   take a mode.

@@ -1047,3 +1047,25 @@ warning[E310]: a channel `recv` runs with a mutex held, so the task parks holdin
                      ^
   fix: park before taking the lock or after releasing it, and copy what the call needs while the lock is held
 ```
+
+### E311 — two mutexes taken in opposite orders (warning)
+
+a task that holds mutex A and waits for B, while another task holds B and
+waits for A, deadlocks both. `pith lint` records every place in the program a
+mutex is taken while another is held and reports a pair taken in both orders.
+a mutex taken inside a function called while another is held counts, through
+calls the checker resolved; a call through a function value is not followed,
+and a closure or a `spawn` inside the block is not walked.
+
+a mutex is named by where it lives: a module global by its module and name, a
+struct field by the struct's type and the field, and every element of a
+sharded guard by the guard's name. two values of one struct share a name, so
+nesting them, as a transfer between two accounts does, is not reported, and a
+mutex reached through a local or a parameter of type `Mutex` is skipped.
+
+```
+warning[E311]: 'ledger.b_mu' is taken here while 'ledger.a_mu' is held, and ledger.pith:16 takes 'ledger.a_mu' while 'ledger.b_mu' is held; two tasks taking these in opposite orders can deadlock
+  10 |         locked b_mu:
+                      ^
+  fix: take the mutexes in one fixed order everywhere, or release the first before taking the second
+```

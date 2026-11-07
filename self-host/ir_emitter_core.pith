@@ -11821,6 +11821,13 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
 # none; the value is read from the Some shell's slot 8 inside the loop.
 fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: String):
     iter_r := ir_expr(node.children[0])
+    # a fresh iterator (`for x in Range(0, n)`) belongs to the loop, which
+    # releases it at its end label and, for an early return inside the body,
+    # at the function's exit edges. a borrowed one is left to its owner. the
+    # loop used to drop it in every case, leaking one iterator per loop run.
+    mut iter_kind := ""
+    if not ir_expr_is_borrowed(node.children[0]):
+        iter_kind = ir_rc_kind(ir_infer_type(node.children[0]))
     fid := ir_for_count
     ir_for_count = ir_for_count + 1
     it_var := "__for_it_" + fid.to_string()
@@ -11844,6 +11851,11 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     ir_emit("load " + it_cur.to_string() + " " + it_var)
     opt_r := ir_reg()
     ir_emit("call " + opt_r.to_string() + " " + next_name + " tuple 1 " + it_cur.to_string())
+    # the step's optional also lives in a slot, so a return from the body,
+    # which skips the step and end labels that release it, can release it
+    # at the function's exit edges
+    opt_var := "__for_opt_" + fid.to_string()
+    ir_emit("store " + opt_var + " " + opt_r.to_string())
     flag_r := ir_optional_flag_field(opt_r)
     ir_emit("brif " + flag_r.to_string() + " " + body_l + " " + end_l)
     ir_emit_label(body_l)
@@ -11861,7 +11873,17 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     ir_break_stack = ir_push_string(ir_break_stack, end_l)
     ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
     ir_defer_loop_enter()
+    if iter_kind.len() > 0:
+        ir_loop_iter_vars.push(it_var)
+        ir_loop_iter_kinds.push(iter_kind)
+    ir_loop_iter_vars.push(opt_var)
+    ir_loop_iter_kinds.push("tuple")
     ir_block(node.children[1])
+    ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
+    ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
+    if iter_kind.len() > 0:
+        ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
+        ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
     ir_defer_loop_exit()
     ir_loop_var_pop(names.index_name, prev_index_slot)
     ir_loop_var_pop(names.value_name, prev_value_slot)
@@ -11884,6 +11906,10 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     ir_emit("jmp " + head_l)
     ir_emit_label(end_l)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
+    if iter_kind.len() > 0:
+        it_end := ir_reg()
+        ir_emit("load " + it_end.to_string() + " " + it_var)
+        ir_rc_release_reg(it_end, iter_kind)
 
 fn ir_stmt_control(idx: Int, node: Node):
     if node.kind == "if" or node.kind == "if_stmt":

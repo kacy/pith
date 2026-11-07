@@ -106,21 +106,21 @@ pub fn attempt_if[T](policy: Retry, op: fn() -> T!, transient: fn(String) -> Boo
 # reserve of `burst`. each allowed call spends one token, so sustained load
 # is held to per_second while short spikes up to burst pass untouched.
 #
-# a limiter is shared by every task that holds it, so its state lives in
-# atomic cells behind its own mutex. limiters and breakers used to share one
-# module-wide mutex and handle-keyed maps, which made unrelated limiters and
-# breakers wait on each other: 32 tasks with a breaker each ran 24x slower
+# a limiter is shared by every task that holds it, so its changing state sits
+# in a guard block behind its own mutex. limiters and breakers used to share
+# one module-wide mutex and handle-keyed maps, which made unrelated limiters
+# and breakers wait on each other: 32 tasks with a breaker each ran 24x slower
 # than one.
 pub struct Limiter:
-    mu: Mutex
     rate: Int
     burst_m: Int
-    tokens_m: AtomicInt
-    stamp: AtomicInt
+    guard mu:
+        tokens_m: Int
+        stamp: Int
 
 # build a limiter refilling `per_second` tokens with a reserve of `burst`.
 pub fn rate_limiter(per_second: Int, burst: Int) -> Limiter:
-    return Limiter(Mutex(), per_second, burst * 1000, AtomicInt(burst * 1000), AtomicInt(time.mono_millis()))
+    return Limiter(rate: per_second, burst_m: burst * 1000, tokens_m: burst * 1000, stamp: time.mono_millis())
 
 impl Limiter:
     # spend one token if the bucket has one. never waits: a denied caller
@@ -128,18 +128,18 @@ impl Limiter:
     fn allow() -> Bool:
         locked self.mu:
             now := time.mono_millis()
-            elapsed := now - self.stamp.load()
+            elapsed := now - self.stamp
             # tokens are tracked in thousandths so integer math can meter
             # fractional refill: per_second tokens/s is per_second m-tokens/ms.
-            mut tokens := self.tokens_m.load() + elapsed * self.rate
+            mut tokens := self.tokens_m + elapsed * self.rate
             if tokens > self.burst_m:
                 tokens = self.burst_m
             mut allowed := false
             if tokens >= 1000:
                 tokens = tokens - 1000
                 allowed = true
-            self.tokens_m.store(tokens)
-            self.stamp.store(now)
+            self.tokens_m = tokens
+            self.stamp = now
             return allowed
 
 # ---------------------------------------------------------------
@@ -151,21 +151,21 @@ impl Limiter:
 # once `reset_ms` has passed. the probe's outcome decides: success closes
 # the circuit, failure re-opens it for another reset_ms.
 #
-# like a limiter, a breaker keeps its state in atomic cells behind its own
-# mutex; `open` and `probing` hold 0 or 1.
+# like a limiter, a breaker keeps its changing state in a guard block behind
+# its own mutex.
 pub struct Breaker:
-    mu: Mutex
     threshold: Int
     reset_ms: Int
-    failures: AtomicInt
-    open: AtomicInt
-    opened_at: AtomicInt
-    probing: AtomicInt
+    guard mu:
+        failures: Int
+        open: Bool
+        opened_at: Int
+        probing: Bool
 
 # build a breaker that trips after `failures` consecutive failures and
 # allows its half-open probe once `reset_ms` has passed.
 pub fn circuit_breaker(failures: Int, reset_ms: Int) -> Breaker:
-    return Breaker(Mutex(), failures, reset_ms, AtomicInt(0), AtomicInt(0), AtomicInt(0), AtomicInt(0))
+    return Breaker(threshold: failures, reset_ms: reset_ms, failures: 0, open: false, opened_at: 0, probing: false)
 
 impl Breaker:
     # true when the call may proceed. while open, every caller is refused
@@ -177,45 +177,45 @@ impl Breaker:
             # the open flag is explicit state rather than a timestamp sentinel:
             # the mono clock starts at zero with the process, so "opened at 0"
             # is a perfectly real moment.
-            if self.open.load() == 1:
+            if self.open:
                 allowed = false
-                waited := time.mono_millis() - self.opened_at.load()
-                if waited >= self.reset_ms and self.probing.load() == 0:
-                    self.probing.store(1)
+                waited := time.mono_millis() - self.opened_at
+                if waited >= self.reset_ms and not self.probing:
+                    self.probing = true
                     allowed = true
             return allowed
 
     # report a success: the circuit closes and the failure count resets.
     fn success():
         locked self.mu:
-            self.failures.store(0)
-            self.open.store(0)
-            self.probing.store(0)
+            self.failures = 0
+            self.open = false
+            self.probing = false
 
     # report a failure: closed, it counts toward the threshold and trips the
     # circuit when reached; half-open, the probe failed and the circuit
     # re-opens for another reset_ms.
     fn failure():
         locked self.mu:
-            if self.open.load() == 1:
-                self.opened_at.store(time.mono_millis())
-                self.probing.store(0)
+            if self.open:
+                self.opened_at = time.mono_millis()
+                self.probing = false
             else:
-                count := self.failures.load() + 1
-                self.failures.store(count)
+                count := self.failures + 1
+                self.failures = count
                 if count >= self.threshold:
-                    self.open.store(1)
-                    self.opened_at.store(time.mono_millis())
-                    self.probing.store(0)
+                    self.open = true
+                    self.opened_at = time.mono_millis()
+                    self.probing = false
 
     # "closed", "open", or "half_open" — for logs and dashboards; decisions
     # belong to allow().
     fn state() -> String:
         locked self.mu:
             mut current := "closed"
-            if self.open.load() == 1:
+            if self.open:
                 current = "open"
-                if self.probing.load() == 1:
+                if self.probing:
                     current = "half_open"
             return current
 

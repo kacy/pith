@@ -213,6 +213,8 @@ struct State {
     /// tuple shells built without a destructor: freeing one frees the shell
     /// alone, and the counts its fields held pass to whoever read them out
     shells: BTreeSet<String>,
+    /// the shell fields, as "shell:index", that hold an owned payload
+    owned_fields: BTreeSet<String>,
 }
 
 /// the state at a block boundary. an object a slot holds is named by its
@@ -233,6 +235,7 @@ struct Canon {
     unknowns: BTreeSet<String>,
     emptied: BTreeSet<String>,
     shells: BTreeSet<String>,
+    owned_fields: BTreeSet<String>,
 }
 
 /// where two paths meet. a slot holding one object on one side and a null on
@@ -252,6 +255,7 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Option<Canon> {
         unknowns: a.unknowns.clone(),
         emptied: a.emptied.clone(),
         shells: a.shells.union(&b.shells).cloned().collect(),
+        owned_fields: a.owned_fields.union(&b.owned_fields).cloned().collect(),
         ..Canon::default()
     };
     let keys: BTreeSet<&Vec<String>> = a.objs.keys().chain(b.objs.keys()).collect();
@@ -463,6 +467,12 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 out.shells.insert(k.clone());
             }
         }
+        for field in &st.owned_fields {
+            let (base, off) = field.rsplit_once(':').unwrap_or((field.as_str(), ""));
+            if let Some(k) = key_of.get(&base.to_string()) {
+                out.owned_fields.insert(format!("{k}:{off}"));
+            }
+        }
         for field in &st.emptied {
             let (base, off) = field.rsplit_once(':').unwrap_or((field.as_str(), ""));
             let base = key_of.get(&base.to_string()).cloned().unwrap_or_else(|| base.to_string());
@@ -498,6 +508,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         }
         st.emptied = canon.emptied.clone();
         st.shells = canon.shells.clone();
+        st.owned_fields = canon.owned_fields.clone();
         st
     }
 
@@ -619,7 +630,9 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                     let readers: Vec<String> = st
                         .field_of
                         .iter()
-                        .filter(|(r, (f, _))| f.starts_with(&prefix) && st.counts.get(*r).copied().unwrap_or(0) == 0)
+                        .filter(|(r, (f, _))| {
+                            f.starts_with(&prefix) && st.owned_fields.contains(f) && st.counts.get(*r).copied().unwrap_or(0) == 0
+                        })
                         .map(|(r, _)| r.clone())
                         .collect();
                     for r in readers {
@@ -701,8 +714,21 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 Ok(false)
             }
             "sstore" if ins.len() >= 4 => {
-                self.take(st, ins[3], "a struct field store")?;
                 let field = format!("{}:{}", self.base_key(st, ins[1]), ins[2]);
+                let into_shell = matches!(self.val(st, ins[1]), Val::Obj(ref b) if st.shells.contains(b));
+                let held = match self.val(st, ins[3]) {
+                    Val::Obj(o) => st.counts.get(&o).copied().unwrap_or(0) > 0,
+                    _ => false,
+                };
+                if into_shell && !held {
+                    // a destructor-less shell can hold a borrowed payload:
+                    // freeing the shell leaves the payload alone
+                    return Ok(false);
+                }
+                self.take(st, ins[3], "a struct field store")?;
+                if into_shell {
+                    st.owned_fields.insert(field.clone());
+                }
                 if !st.emptied.remove(&field) {
                     // the store displaces the old value: the latest read of
                     // it that held no count now carries the struct's one
@@ -849,7 +875,9 @@ fn split_blocks<'a, 'b>(body: &'b [Vec<&'a str>]) -> (Vec<Vec<&'b [&'a str]>>, V
             blocks.push(Vec::new());
             continue;
         }
-        blocks.last_mut().unwrap().push(ins.as_slice());
+        if let Some(block) = blocks.last_mut() {
+            block.push(ins.as_slice());
+        }
     }
     let index: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
     let mut succ = Vec::new();

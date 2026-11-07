@@ -429,6 +429,57 @@ pub fn set_current_module_path(path: String):
 pub fn set_test_mode(enabled: Bool):
     ir_emit_tests = enabled
 
+# when on, the emitter adds `mark` lines for the count checker: the kind of
+# each global and local, and the locals the exit cleanup releases. the
+# consumer skips them, so the generated code is the same either way.
+mut ir_count_marks := false
+
+# the variable kinds a function starts with (the seeded globals), kept only
+# while marks are on, so the marks list just the names the function adds or
+# changes.
+mut ir_count_marks_seeded: Map[String, String] := {}
+
+# turn the count checker's `mark` lines on or off for everything emitted
+# after this. ir_driver sets it from PITH_CHECK_COUNTS.
+pub fn set_count_marks(enabled: Bool):
+    ir_count_marks = enabled
+
+# a name as the one token loads and stores use. a `mut` parameter is
+# recorded as "items mut", the way its `param` line spells it.
+fn ir_count_mark_name(name: String) -> String:
+    return name.split(" ")[0]
+
+# a kind as one ir token. a `mut` parameter's kind can arrive as "mut list".
+fn ir_count_mark_kind(kind: String) -> String:
+    mut k := kind
+    if k.starts_with("mut "):
+        k = k.substring(4, k.len())
+    if k.len() == 0 or k.contains(" "):
+        return "unknown"
+    return k
+
+# the marks for the function being closed. they come last so they describe
+# the whole body.
+fn ir_emit_count_marks():
+    if not ir_count_marks:
+        return
+    mut names: List[String] := []
+    for name in ir_var_types.keys():
+        kind := ir_var_types[name]
+        if ir_count_marks_seeded.contains_key(name) and ir_count_marks_seeded[name] == kind:
+            continue
+        names.push(name)
+    names.sort()
+    for name in names:
+        ir_emit("mark kind " + ir_count_mark_name(name) + " " + ir_count_mark_kind(ir_var_types[name]))
+    for name, i in ir_rc_locals:
+        ir_emit("mark owns " + ir_count_mark_name(name) + " " + ir_count_mark_kind(ir_rc_local_kinds[i]))
+    for name in ir_untracked_rc_binds:
+        if ir_kinded_rc_binds.contains(name):
+            ir_emit("mark mixed " + ir_count_mark_name(name))
+        else:
+            ir_emit("mark untracked " + ir_count_mark_name(name))
+
 # the path of the file under test, as it was named on the command line.
 # a test build reports it with every result record and names it as the
 # file of an assertion that failed, so a reader of the machine-readable
@@ -11438,6 +11489,38 @@ fn ir_subtree_assigns_name(idx: Int, name: String) -> Bool:
             return true
     return false
 
+# the count checker's view of a list or string loop's slots: the index and
+# length are ints, the iterable is held for the loop (owned when the loop
+# took its own count), and the variable either owns its element or borrows it
+# from the iterable. the borrow is the claim ir_subtree_keeps_storage makes.
+fn ir_emit_for_loop_marks(node: Node, fid: Int, names: IrForBindingNames, item_kind: String, iter_type: String, iter_release_kind: String, owns_value: Bool, value_kind: String):
+    ft := "__for_iter_" + fid.to_string()
+    ir_emit("mark kind __for_idx_" + fid.to_string() + " int")
+    ir_emit("mark kind __for_len_" + fid.to_string() + " int")
+    mut iter_kind := ir_rc_kind(iter_type)
+    if iter_release_kind.len() > 0:
+        iter_kind = iter_release_kind
+        ir_emit("mark owns " + ft + " " + ir_count_mark_kind(iter_kind))
+    if iter_kind.len() == 0:
+        iter_kind = "unknown"
+    ir_emit("mark kind " + ft + " " + ir_count_mark_kind(iter_kind))
+    if names.index_name.len() > 0:
+        ir_emit("mark kind " + ir_loop_var_slot_name(fid, names.index_name) + " int")
+    if names.value_name.len() == 0:
+        return
+    value_slot := ir_loop_var_slot_name(fid, names.value_name)
+    if owns_value:
+        ir_emit("mark owns " + value_slot + " " + ir_count_mark_kind(value_kind))
+        return
+    mut elem_kind := ""
+    if item_kind != "char":
+        elem_kind = ir_rc_kind(ir_substitute_type_name(ir_list_element_kind(node.children[0])))
+    if elem_kind.len() == 0:
+        ir_emit("mark kind " + value_slot + " int")
+        return
+    ir_emit("mark kind " + value_slot + " " + ir_count_mark_kind(elem_kind))
+    ir_emit("mark borrow " + value_slot + " " + ft)
+
 fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
     iter_type := ir_infer_type(node.children[0])
     mut iter_r := ir_expr(node.children[0])
@@ -11507,6 +11590,8 @@ fn ir_emit_for_indexed_stmt(node: Node, names: IrForBindingNames):
         value_kind = ir_rc_kind(ir_substitute_type_name(ir_list_element_kind(node.children[0])))
     owns_value := value_kind.len() > 0 and names.value_name.len() > 0
     value_slot := ir_loop_var_slot_name(fid, names.value_name)
+    if ir_count_marks:
+        ir_emit_for_loop_marks(node, fid, names, item_kind, iter_type, iter_release_kind, owns_value, value_kind)
     if owns_value:
         null_r := ir_reg()
         ir_emit("iconst " + null_r.to_string() + " 0")
@@ -12410,6 +12495,7 @@ fn ir_emit_default_return() -> Int:
         ir_emit("ret2 " + dr.to_string() + " " + dr2.to_string())
     else:
         ir_emit("ret " + dr.to_string())
+    ir_emit_count_marks()
     ir_emit("endfunc")
     return 0
 
@@ -12440,6 +12526,10 @@ fn ir_prepare_func_emission(ret_type: String):
     ir_loop_iter_kinds = []
     ir_loop_var_slots = {}
     ir_seed_global_types()
+    if ir_count_marks:
+        ir_count_marks_seeded = {}
+        for name in ir_var_types.keys():
+            ir_count_marks_seeded.insert(name, ir_var_types[name])
     ir_current_func_return_kind = ret_type
     ir_set_pair_return(ret_type == "result_reg")
     ir_current_func_optional_inner_kind = ""
@@ -12743,6 +12833,15 @@ fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
         ir_threadlocal_kinds.insert(gname, global_type)
         return
     ir_emit("global " + ir_global_storage_symbol(gname) + " " + init_val)
+    if ir_count_marks:
+        # an initializer that isn't a plain literal (`-1`, a call) leaves
+        # global_type empty; the mark falls back on the checked type, without
+        # changing what the code above records
+        mut mark_kind := global_type
+        for gc in node.children:
+            if mark_kind.len() == 0:
+                mark_kind = ir_checked_type(gc)
+        ir_emit("mark global " + ir_global_storage_symbol(gname) + " " + ir_count_mark_kind(mark_kind))
 
 # generate the per-thread lazy initializer for each threadlocal global: a
 # `() -> kind` thunk that builds the same initial value a plain global would get

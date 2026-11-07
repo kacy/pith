@@ -1811,6 +1811,14 @@ cli-regressions-only:
 	case "$$shared_out" in *'"code":"E309"'*) pass=$$((pass+1)); echo "ok   lint unguarded shared global";; *) echo "FAIL lint unguarded shared global"; fail=$$((fail+1));; esac; \
 	case "$$unspawned_out" in *'"code":"E309"'*) echo "FAIL lint program without spawn exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint program without spawn exempt";; esac; \
 	case "$$shared_ok_out" in *'"code":"E309"'*) echo "FAIL lint guarded, threadlocal and read-only globals exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint guarded, threadlocal and read-only globals exempt";; esac; \
+	printf 'guard mu:\n    mut seen := 0\n\nfn take(ch: Channel[Int]) -> Int:\n    locked mu:\n        seen = seen + 1\n        got := ch.recv()\n    return seen\n\nfn held(ch: Channel[Int]) -> Int holding mu:\n    sleep(1)\n    return seen\n\nfn main():\n    return\n' > "$$tmpdir/lint_park.pith"; \
+	printf 'struct Conn:\n    n: Int\n\nimpl Conn:\n    fn read() -> Int:\n        return self.n\n\nguard mu:\n    mut seen := 0\n\nfn take(c: Conn, ch: Channel[Int]) -> Int:\n    locked mu:\n        seen = c.read()\n        ok := ch.send(1)\n        got := select:\n            v := ch.recv() => 1\n            default => 2\n    v := ch.recv()\n    return seen\n\nfn main():\n    return\n' > "$$tmpdir/lint_park_ok.pith"; \
+	set +e; \
+	park_out=$$(./target/release/pith lint --json "$$tmpdir/lint_park.pith" 2>/dev/null); \
+	park_ok_out=$$(./target/release/pith lint --json "$$tmpdir/lint_park_ok.pith" 2>/dev/null); \
+	set -e; \
+	case "$$park_out" in *'"code":"E310"'*'"line":7'*'"code":"E310"'*'"line":11'*) pass=$$((pass+1)); echo "ok   lint park under a lock";; *) echo "FAIL lint park under a lock"; fail=$$((fail+1));; esac; \
+	case "$$park_ok_out" in *'"code":"E310"'*) echo "FAIL lint send, default select and own Conn exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint send, default select and own Conn exempt";; esac; \
 	printf 'test "a first":\n    assert(true)\ntest "b fails":\n    assert(false)\ntest "c after failure":\n    assert(true)\n' > "$$tmpdir/harness.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/harness.pith" 2>&1); \

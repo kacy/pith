@@ -2926,10 +2926,14 @@ fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
             # the chained kind is the kind of the source's first binding.
             # when another site binds the source under a different kind,
             # this read can see that binding, so the checker's type for the
-            # read takes precedence.
-            read_kind := ir_rc_kind(ir_checked_type(parts.val_idx))
-            if read_kind.len() > 0 and read_kind != ir_rc_kind(bind_type):
-                bind_type = read_kind
+            # read takes precedence. the caller runs the result through
+            # ir_rc_kind, which reads a type hint: the chained kind `struct`
+            # is not one and came back empty, so `mut b := a` with a struct
+            # `a` went untracked and a later `b = f()` leaked the fresh value.
+            # the checked type carries the same kind as a valid hint.
+            read_type := ir_checked_type(parts.val_idx)
+            if ir_rc_kind(read_type).len() > 0:
+                bind_type = read_type
         else:
             # the checker's recorded type resolves module-qualified calls
             # (bytes.from_string_utf8 and friends) that local inference

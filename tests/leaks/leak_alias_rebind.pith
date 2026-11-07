@@ -1,0 +1,42 @@
+# `mut b := a` where `a` is an owned struct local, then `b = f()`. the alias
+# bind looked up the source's kind (`struct`) and passed it on as a type hint,
+# which classified as nothing, so `b` went untracked and the fresh value the
+# reassignment stored was never released.
+import leakprobe as probe
+
+struct Item:
+    kind: String
+    child: Int
+
+fn get_item(i: Int) -> Item:
+    if i % 2 == 0:
+        return Item(kind: "pub", child: i + 1)
+    return Item(kind: "k" + i.to_string(), child: 0)
+
+fn follow(i: Int) -> Int:
+    node := get_item(i)
+    mut actual := node
+    if node.kind == "pub":
+        actual = get_item(node.child)
+    return actual.kind.len()
+
+fn walk(i: Int) -> Int:
+    first := get_item(i)
+    mut cur := first
+    mut steps := 0
+    while cur.child > 0 and steps < 3:
+        cur = get_item(cur.child)
+        steps = steps + 1
+    return cur.kind.len() + steps
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + follow(i) + walk(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

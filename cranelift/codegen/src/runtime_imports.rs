@@ -52,6 +52,11 @@ fn declare_runtime_function(
     Ok(func_id)
 }
 
+/// every name the IR may call a runtime function by
+pub fn runtime_function_keys() -> impl Iterator<Item = &'static str> {
+    ABI_RUNTIME_FUNCTIONS.iter().chain(COMPAT_RUNTIME_FUNCTIONS).map(|decl| decl.key)
+}
+
 /// Import every runtime function in the generated table, keyed by the name
 /// the IR calls it by. Several keys may name one symbol (a short key and
 /// its full-symbol spelling), so each symbol is declared once.

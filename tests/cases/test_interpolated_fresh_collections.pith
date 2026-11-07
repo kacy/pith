@@ -1,0 +1,34 @@
+# a collection or struct rendered into a string: a fresh one (a call result)
+# is released once rendered, and a borrowed one (a local) is left alone and
+# still reads the same afterwards.
+
+struct Point:
+    x: Int
+    y: Int
+
+fn nums(n: Int) -> List[Int]:
+    return [n, n + 1]
+
+fn table() -> Map[String, Int]:
+    return {"a": 1}
+
+fn tags() -> Set[String]:
+    return {"zed", "alpha"}
+
+fn origin() -> Point:
+    return Point(x: 0, y: 0)
+
+fn main():
+    print("fresh: {nums(3)} {table()} {tags()} {origin()}")
+    kept := ["one", "two"]
+    m := {"k": 2}
+    s: Set[String] := {"b", "a"}
+    p := Point(x: 1, y: 2)
+    print("borrowed: {kept} {m} {s} {p}")
+    print("again: {kept} {m} {s} {p}")
+    mut i := 0
+    mut total := 0
+    while i < 1000:
+        total = total + "{nums(i)}{tags()}".len()
+        i = i + 1
+    print(total.to_string())

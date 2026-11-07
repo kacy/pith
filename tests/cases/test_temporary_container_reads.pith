@@ -1,0 +1,31 @@
+# an element read off a temporary container: the container is released by the
+# read, and a counted element keeps a count of its own, so each value here is
+# still intact after later allocations could have reused freed blocks.
+
+struct Box:
+    names: List[String]
+
+fn names(i: Int) -> List[String]:
+    return ["first-" + i.to_string().repeat(8), "second"]
+
+fn make(i: Int) -> Box:
+    return Box(names: names(i))
+
+fn keep(s: String) -> String:
+    return s + "!"
+
+fn main():
+    bound := names(7)[0]
+    field := make(8).names[0]
+    passed := keep(names(9)[0])
+    split := "alpha-beta,gamma".split(",")[0]
+    mut fill: List[String] := []
+    mut i := 0
+    while i < 50:
+        fill.push("zzzzzzzzzzzzzzzzzzzzzzzzzz".repeat(2))
+        i = i + 1
+    print(bound)
+    print(field)
+    print(passed)
+    print(split)
+    print(fill.len().to_string())

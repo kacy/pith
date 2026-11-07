@@ -492,9 +492,12 @@ build settled a question this page left open, or departed from it:
   fields. the stream id counter and the peer's frame size limit are atomics
   instead, because the inline path and every request read them before taking a
   lock. guarding the rest found two reads made without the lock.
-- **std left for later.** `Limiter`, `Breaker` and std.concurrent's test
-  counters keep their state in atomics, with the mutex only serializing a
-  read-modify-write.
+- **`Limiter` and `Breaker`.** they kept their state in atomics, but every
+  access already took the struct's mutex, so the atomics bought nothing. the
+  state is now plain fields in a `guard mu:` block. with 32 tasks sharing one
+  limiter and one breaker, a call takes 16% less time. std.concurrent's test
+  counters for the live and peak task counts moved the same way, and the
+  counter it bumps without a lock stays an atomic.
 
 ## open questions
 

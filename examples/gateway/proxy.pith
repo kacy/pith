@@ -15,6 +15,7 @@ import std.time as time
 import std.web as web
 import auth
 import config
+import tunnel
 import upstream
 
 # headers that describe one connection rather than the message (rfc 9110 7.6.1),
@@ -208,6 +209,8 @@ impl Forwarder:
         method := req.method()
         target := upstream_path(raw_path, req.raw.query() catch "", self.skip_segments)
         headers := outbound_headers(req, self.scheme, self.trust_forwarded_for)
+        if tunnel.wants_websocket(req):
+            return self.upgrade(target, headers)
         n := self.pool.upstreams.len()
         mut tried: List[Bool] := []
         for i in 0..n:
@@ -246,3 +249,18 @@ impl Forwarder:
                 return relay_as_it_comes(answer)
             attempt = attempt + 1
         return last
+
+    # a websocket upgrade goes to one upstream through a tunnel: it can't be
+    # retried once bytes flow, so a failure here is the client's to retry.
+    fn upgrade(target: String, headers: Map[String, String]) -> http.HttpResponse:
+        mut tried: List[Bool] := []
+        for i in 0..self.pool.upstreams.len():
+            tried.push(false)
+        index := self.pool.pick(tried)
+        if index < 0:
+            return http.response(503).text_body("no upstream available")
+        chosen := self.pool.upstreams[index]
+        if chosen.use_tls:
+            return http.response(501).text_body("websocket to a tls upstream is not supported")
+        metrics.counter("gateway_websocket_tunnels_total").labels(["route", self.route.name]).inc()
+        return tunnel.open(chosen.host, chosen.port, target, headers)

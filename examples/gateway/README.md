@@ -117,9 +117,13 @@ gateway does not.
 
 - **a request body is buffered**, up to `max_body_bytes`, which keeps it in hand
   for a retry. an upload larger than memory should allows will not work through
-  it.
-- **websockets are not proxied.** an upgrade needs the two connections handed over
-  to a raw copy, which `std.web` has no way to do.
+  it. std can hand a body to the handler as it arrives
+  (`ServerConfig.with_stream_request_bodies`), but a streamed body can't be sent
+  twice, so the gateway keeps buffering.
+- **websockets go to one upstream and are not retried.** `tunnel.pith` sends the
+  upgrade to an upstream and copies bytes both ways once the connection is taken
+  over. a failure there is the client's to retry, and a tls upstream gets a
+  `501` for an upgrade.
 - **an endless response holds a shutdown until its next piece.** a stream checks
   for a drain between pieces, so one whose upstream has gone quiet lasts until the
   grace period ends and is counted as unfinished work.

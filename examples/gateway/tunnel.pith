@@ -1,0 +1,64 @@
+# tunnel.pith: carry a websocket upgrade through to an upstream.
+#
+# an upgrade can't be retried or relayed as a response: once the upstream says
+# 101 the connection is a byte stream both ways. so the gateway sends the
+# request head to one upstream over a fresh connection, then takes the client's
+# connection over (http.take_connection) and copies bytes in both directions,
+# the upstream's 101 included, until either side closes.
+#
+# a tls upstream is not tunnelled; the route answers 501 for an upgrade to one.
+
+import std.bytes as bytes
+import std.net.http as http
+import std.web as web
+
+# how much one copy step reads.
+TUNNEL_READ_BYTES := 65536
+
+# whether `req` asks to become a websocket.
+pub fn wants_websocket(req: web.Request) -> Bool:
+    return req.method() == "GET" and req.header("Upgrade").to_lower() == "websocket"
+
+# the request head the upstream gets: the client's end-to-end fields from
+# `headers`, plus the two hop-by-hop fields an upgrade needs.
+fn upgrade_head(host: String, target: String, headers: Map[String, String]) -> Bytes:
+    mut head := "GET {target} HTTP/1.1\r\nHost: {host}\r\n"
+    for name in headers:
+        head = head + name + ": " + headers[name] + "\r\n"
+    head = head + "Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+    return bytes.from_string_utf8(head)
+
+# open the upstream connection and send the upgrade request. the answer to the
+# client comes from the upstream, through the tunnel.
+pub fn open(host: String, port: Int, target: String, headers: Map[String, String]) -> http.HttpResponse:
+    fd := tcp_connect(host, port) catch 0
+    if fd <= 0:
+        return http.response(502).text_body("upstream unavailable")
+    sent := tcp_write_bytes(fd, upgrade_head(host, target, headers))
+    if sent.is_err:
+        tcp_close(fd)
+        return http.response(502).text_body("upstream unavailable")
+    return http.take_connection(fn(read: fn(Int) -> Bytes!, write: fn(Bytes) -> Int!) -> Int! => carry(fd, read, write))
+
+# copy client to upstream on this task and upstream to client on another, until
+# the client closes; closing the upstream then ends the other direction.
+fn carry(fd: Int, read: fn(Int) -> Bytes!, write: fn(Bytes) -> Int!) -> Int!:
+    back := spawn upstream_to_client(fd, write)
+    while true:
+        got := read(TUNNEL_READ_BYTES) catch bytes.empty()
+        if got.is_empty():
+            break
+        if tcp_write_bytes(fd, got).is_err:
+            break
+    tcp_close(fd)
+    await back
+    return 0
+
+fn upstream_to_client(fd: Int, write: fn(Bytes) -> Int!) -> Int:
+    while true:
+        got := tcp_read_bytes(fd, TUNNEL_READ_BYTES) catch bytes.empty()
+        if got.is_empty():
+            return 0
+        if write(got).is_err:
+            return 0
+    return 0

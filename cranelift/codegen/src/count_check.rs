@@ -220,6 +220,9 @@ struct State {
     shells: BTreeSet<String>,
     /// the shell fields, as "shell:index", that hold an owned payload
     owned_fields: BTreeSet<String>,
+    /// a register that tests an object against null: test register ->
+    /// (object, whether a set test means the object is there)
+    null_tests: BTreeMap<String, (String, bool)>,
 }
 
 /// the state at a block boundary. an object a slot holds is named by its
@@ -633,6 +636,31 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             if ended {
                 continue;
             }
+            // a branch on whether a value is null settles its count: the null
+            // side holds none
+            let last = blocks[b].last().copied().unwrap_or(&[]);
+            if last.first() == Some(&"brif") && last.len() >= 4 && succ[b].len() == 2 {
+                // (object, count when the test is set, count when it isn't)
+                let mut settle: Option<(String, Option<i64>, Option<i64>)> = None;
+                if let Some((obj, set_means_there)) = st.null_tests.get(last[1]).cloned() {
+                    // the null side holds no count; the other keeps its own
+                    settle = Some(if set_means_there { (obj, None, Some(0)) } else { (obj, Some(0), None) });
+                } else if let Val::Obj(obj) = self.val(&st, last[1]) {
+                    settle = Some((obj, None, Some(0)));
+                }
+                if let Some((obj, when_set, when_clear)) = settle {
+                    for (i, s) in succ[b].iter().enumerate() {
+                        let mut side = st.clone();
+                        if let Some(n) = if i == 0 { when_set } else { when_clear } {
+                            side.counts.insert(obj.clone(), n);
+                        }
+                        side.null_tests.clear();
+                        let out = self.canon(&side, &format!("the end of {}", order[b]));
+                        work.push((*s, out));
+                    }
+                    continue;
+                }
+            }
             let out = self.canon(&st, &format!("the end of {}", order[b]));
             for s in &succ[b] {
                 work.push((*s, out.clone()));
@@ -672,10 +700,19 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             Val::Obj(o) => {
                 if st.counts.get(&o).copied().unwrap_or(0) <= 0 {
                     if let Some((field, _)) = st.field_of.get(&o).cloned() {
-                        // the struct's count on the field's value, given up
-                        // to replace it: the field must be stored again
-                        st.emptied.insert(field);
-                        return Ok(());
+                        if st.owned_fields.remove(&field) {
+                            // a destructor-less shell's payload, taken over
+                            // and given up here: the shell no longer owns it
+                            st.field_of.remove(&o);
+                            return Ok(());
+                        }
+                        let base = field.rsplit_once(':').map(|(b, _)| b.to_string()).unwrap_or_default();
+                        if !st.shells.contains(&base) {
+                            // the struct's count on the field's value, given
+                            // up to replace it: the field must be stored again
+                            st.emptied.insert(field);
+                            return Ok(());
+                        }
                     }
                 }
                 let n = st.counts.entry(o.clone()).or_insert(0);
@@ -714,6 +751,19 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             "iconst" if ins.len() >= 3 => {
                 let v = if ins[2] == "0" { Val::Null } else { Val::Plain };
                 st.regs.insert(ins[1].to_string(), v);
+                Ok(false)
+            }
+            "eq" | "neq" if ins.len() >= 4 => {
+                // `neq t x 0`: t says whether x is there
+                let (a, b) = (self.val(st, ins[2]), self.val(st, ins[3]));
+                let obj = match (a, b) {
+                    (Val::Obj(o), Val::Null) | (Val::Null, Val::Obj(o)) => Some(o),
+                    _ => None,
+                };
+                if let Some(o) = obj {
+                    st.null_tests.insert(ins[1].to_string(), (o, op == "neq"));
+                }
+                st.regs.insert(ins[1].to_string(), Val::Plain);
                 Ok(false)
             }
             _ if PLAIN_OPS.contains(&op) => {
@@ -810,8 +860,25 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 Ok(false)
             }
             "call" if ins.len() >= 5 => self.call(ins, st).map(|_| false),
+            // the register-pair abi carries an error payload whose count
+            // depends on the flag, and the error handling around it isn't
+            // modelled yet
             "rcall" => Err("a call returning the register pair".into()),
             "ret2" => Err("a register-pair return".into()),
+            "optval" => Err("instruction optval".into()),
+            "tuple_stack" if ins.len() >= 2 => {
+                // a shell in the frame: never released, and its payloads go
+                // through the stack cascade, which gives up what it took
+                let o = self.new_obj(st, 0);
+                st.shells.insert(o.clone());
+                st.regs.insert(ins[1].to_string(), Val::Obj(o));
+                Ok(false)
+            }
+            "closure_stack" if ins.len() >= 2 => {
+                let o = self.new_obj(st, 0);
+                st.regs.insert(ins[1].to_string(), Val::Obj(o));
+                Ok(false)
+            }
             "ret" => {
                 self.ret(ins, st);
                 Ok(true)
@@ -827,6 +894,10 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         // yet, and an upgrade turns it into a strong one
         if callee.starts_with("pith_struct_weak_") {
             return Err("a weak reference".into());
+        }
+        if callee.contains("__tuple_stack_cascade_") {
+            st.regs.insert(dst.to_string(), Val::Plain);
+            return Ok(());
         }
         if is_emitted_release(callee) {
             if let Some(a) = args.first() {

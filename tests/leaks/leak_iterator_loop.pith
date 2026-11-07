@@ -1,0 +1,33 @@
+# a for-loop over a fresh iterator never released it: one iterator per loop
+# run, whether the loop ran out, broke, or returned from its body, and on a
+# return the optional next() handed the last step as well.
+import leakprobe as probe
+import std.iter as iter
+
+fn first_over(limit: Int) -> Int:
+    for x in iter.Range(0, 10):
+        if x > limit:
+            return x
+    return 0
+
+fn round(i: Int) -> Int:
+    mut total := 0
+    for x in iter.Range(0, 3):
+        total = total + x
+    for x in iter.Range(0, 10):
+        if x == 2:
+            break
+        total = total + x
+    return total + first_over(1)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

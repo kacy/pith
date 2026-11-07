@@ -1,0 +1,30 @@
+# a field read off an element of a temporary container (`make().items[0].name`)
+# left the element with the count the index read gave it.
+import leakprobe as probe
+
+struct Spec:
+    name: String
+
+struct Pack:
+    specs: List[Spec]
+
+fn nested(i: Int) -> Pack:
+    return Pack(specs: [Spec(name: "n" + i.to_string())])
+
+fn specs(i: Int) -> List[Spec]:
+    return [Spec(name: "s" + i.to_string())]
+
+fn round(i: Int) -> Int:
+    return nested(i).specs[0].name.len() + specs(i)[0].name.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -228,6 +228,10 @@ struct State {
     /// a register that tests an object against null: test register ->
     /// (object, whether a set test means the object is there)
     null_tests: BTreeMap<String, (String, bool)>,
+    /// field reads that took a count of their own: giving that back leaves
+    /// the read holding nothing, and a further release is one too many,
+    /// not the release of the field's value a replace starts with
+    counted_reads: HashSet<String>,
 }
 
 /// the state at a block boundary. an object a slot holds is named by its
@@ -257,7 +261,7 @@ struct Canon {
 /// the other becomes that object or a null. a register only one side defines
 /// can't be used past the join, so a count it holds there is a leak. any
 /// other disagreement is one the checker can't settle.
-fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> {
+fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>, mismatches: &mut Vec<(String, i64, i64)>) -> Result<Canon, String> {
     if a == b {
         return Ok(a.clone());
     }
@@ -309,6 +313,15 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
     for k in keys {
         match (a.objs.get(k), b.objs.get(k)) {
             (Some(x), Some(y)) if x.0 == y.0 => {
+                out.objs.insert(k.clone(), (x.0, x.1 || y.1));
+            }
+            // the same holders reach the join with a different number of
+            // counts: one path took or gave up a count the other didn't (in
+            // a loop, every pass does it again). reported, and the first
+            // side's count, the block's earlier state, carried on so the walk
+            // settles instead of growing the count each pass.
+            (Some(x), Some(y)) => {
+                mismatches.push((k.join("|"), x.0, y.0));
                 out.objs.insert(k.clone(), (x.0, x.1 || y.1));
             }
             (Some(x), None) if k.len() == 1 && x.0 <= 1 && b_nulls.remove(&k[0]) => {
@@ -746,7 +759,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
 
     fn join_at(&mut self, a: &Canon, b: &Canon, label: &str) -> Result<Canon, String> {
         let mut leaks = Vec::new();
-        let out = join(a, b, &mut leaks);
+        let mut mismatches = Vec::new();
+        let out = join(a, b, &mut leaks, &mut mismatches);
+        for (k, x, y) in mismatches {
+            self.problems.push(format!("paths reach {label} holding {x} and {y} count(s) of `@{k}`"));
+        }
         for id in leaks {
             let from = self.origins.get(&id).cloned().unwrap_or(id);
             self.problems.push(format!("a count only one path holds reaches {label} (leak), from `{from}`"));
@@ -771,7 +788,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
     fn take(&mut self, st: &mut State, reg: &str, why: &str) -> Result<(), String> {
         match self.val(st, reg) {
             Val::Obj(o) => {
-                if st.counts.get(&o).copied().unwrap_or(0) <= 0 {
+                if st.counts.get(&o).copied().unwrap_or(0) <= 0 && !st.counted_reads.contains(&o) {
                     if let Some((field, _)) = st.field_of.get(&o).cloned() {
                         if st.owned_fields.remove(&field) {
                             // a destructor-less shell's payload, taken over
@@ -1040,7 +1057,12 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         }
         if RETAINS.contains(&callee) {
             match self.val(st, args[0]) {
-                Val::Obj(o) => *st.counts.entry(o).or_insert(0) += 1,
+                Val::Obj(o) => {
+                    if st.field_of.contains_key(&o) {
+                        st.counted_reads.insert(o.clone());
+                    }
+                    *st.counts.entry(o).or_insert(0) += 1
+                }
                 Val::Unknown => return Err("a value of unknown kind meets a count".into()),
                 _ => {}
             }
@@ -1530,6 +1552,109 @@ endfunc
     fn a_branch_value_read_across_a_later_join_balances() {
         let r = check(IF_VALUE_ACROSS_JOIN);
         assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+
+    // a field read retained for a call and released after it
+    const FIELD_READ_ARG: &str = "
+func show 1 int
+param settings
+load 13 settings
+field 14 13 8 string issuer
+call 15 pith_cstring_retain void 1 14
+call 16 pith_cstring_len int 1 14
+call 17 pith_cstring_release void 1 14
+ret 16
+mark kind settings struct
+endfunc
+";
+
+    #[test]
+    fn a_retained_field_read_released_once_balances() {
+        let r = check(FIELD_READ_ARG);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_retained_field_read_released_twice_is_reported() {
+        let r = check(&FIELD_READ_ARG.replace("call 17 pith_cstring_release void 1 14\n", "call 17 pith_cstring_release void 1 14\ncall 18 pith_cstring_release void 1 14\n"));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+    // an owned local released on one path of a branch only
+    const BRANCH_RELEASE: &str = "
+func pick 1 int
+param n
+iconst 1 0
+store s 1
+load 2 s
+call 3 int_to_string string 1 2
+call 4 pith_cstring_release void 1 2
+store s 3
+load 5 n
+brif 5 L1 L2
+label L1
+load 6 s
+call 7 pith_cstring_retain void 1 6
+call 8 pith_cstring_release void 1 6
+jmp L3
+label L2
+jmp L3
+label L3
+load 9 s
+call 10 pith_cstring_release void 1 9
+iconst 11 0
+ret 11
+mark kind n int
+mark kind s string
+mark owns s string
+endfunc
+";
+
+    #[test]
+    fn a_balanced_branch_balances() {
+        let r = check(BRANCH_RELEASE);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_release_missing_on_one_branch_is_reported() {
+        let r = check(&BRANCH_RELEASE.replace("call 8 pith_cstring_release void 1 6\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+
+    // a list retained and released around a call on every loop pass
+    const LOOP_RETAIN: &str = "
+func drain 1 int
+param xs
+label L1
+load 2 xs
+call 3 pith_list_len int 1 2
+brif 3 L2 L3
+label L2
+load 4 xs
+call 5 pith_list_retain_handle void 1 4
+call 6 pith_list_len int 1 4
+call 7 pith_list_release_handle void 1 4
+jmp L1
+label L3
+iconst 8 0
+ret 8
+mark kind xs list
+endfunc
+";
+
+    #[test]
+    fn a_loop_that_gives_back_what_it_takes_balances() {
+        let r = check(LOOP_RETAIN);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_loop_that_keeps_a_count_each_pass_is_reported() {
+        let r = check(&LOOP_RETAIN.replace("call 7 pith_list_release_handle void 1 4\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
     }
 
     #[test]

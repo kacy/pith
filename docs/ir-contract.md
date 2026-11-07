@@ -259,9 +259,11 @@ fail the target.
 
 the checker was tested by mutation: delete one release, or duplicate one, in
 a function it balances, and see whether it flags that function. it caught
-300 of 300 mutants on `tests/cases/test_process_command` and 295 of 300 on
-`examples/api_gateway`. four of the five misses were duplicated releases and
-one was a deleted release.
+300 of 300 mutants on `tests/cases/test_process_command`, and 800 of 800 on
+`examples/api_gateway` over two seeds. two rules close the gaps an earlier
+run left: paths that reach a join holding a different number of counts on
+the same value are reported, and so is a release of a field read that
+already gave back the count it took.
 
 marks generate no code. the consumer drops every `mark` line before its first
 pass, so a mark can't split a pattern its rewrites match, and a build with

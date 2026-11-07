@@ -197,6 +197,8 @@ mut locked_paths: List[String] := []
 
 # "<struct type id>.<field>" -> the sibling field naming its guard mutex
 mut struct_field_guards: Map[String, String] := {}
+# "<struct type id>.<field>" for each field declared `frozen`
+mut struct_field_frozen: Map[String, Bool] := {}
 # argument expressions the checker accepted by widening a plain value into
 # the optional its parameter declares (`f(3)` against `fn f(x: Int?)`).
 # the emitter has no view of a callee's declared parameter types once the
@@ -249,6 +251,7 @@ pub fn initialize_checker(file_path: String):
     expression_type_cache = {}
     definition_of = {}
     struct_field_guards = {}
+    struct_field_frozen = {}
     locked_paths = []
     optional_widened_arguments = {}
     open_empty_literal_bindings = {}
@@ -977,6 +980,10 @@ fn register_struct_declaration(node_idx: Int, node: Node):
             field_guard := guard_of_value(cn.value)
             if field_guard != "":
                 struct_field_guards.insert(tid.to_string() + "." + fname, field_guard)
+            if cn.value.contains(" frozen"):
+                if field_guard != "":
+                    report_error_at(child, "E274", "'" + fname + "' is frozen, so it is never changed and needs no guard; move it out of the guard block")
+                struct_field_frozen.insert(tid.to_string() + "." + fname, true)
             field_names.push(fname)
             if cn.children.len() > 0:
                 ftid := resolve_type_implementation(cn.children[0])
@@ -2016,6 +2023,7 @@ fn check_test_declaration(node: Node):
         cn := get_node(child)
         if cn.kind == "body":
             check_function_body(child, test_scope)
+            check_guard_rules(child)
     checking_test_decl = false
 
 # ---------------------------------------------------------------
@@ -2176,6 +2184,7 @@ fn check_body_holding(decl: Node, body_idx: Int, scope_id: Int):
     locked_paths = held
     check_function_body(body_idx, scope_id)
     locked_paths = saved
+    check_guard_rules(body_idx)
 
 fn is_mutex_or_mutex_list(t: Int) -> Bool:
     if get_type_name(t) == "Mutex":
@@ -7667,7 +7676,7 @@ fn struct_holds_unguarded_collection(tid: Int, seen: Map[Int, Bool]) -> String:
         return ""
     seen.insert(tid, true)
     for fname, i in info.fields:
-        if struct_field_guards.contains_key(tid.to_string() + "." + fname):
+        if struct_field_guards.contains_key(tid.to_string() + "." + fname) or struct_field_frozen.contains_key(tid.to_string() + "." + fname):
             continue
         ftid := info.field_types[i]
         fkind := get_type_info(ftid).kind
@@ -7741,6 +7750,8 @@ fn instantiate_generic_struct_type(decl_idx: Int, type_args: List[Int]) -> Int:
             fname := extract_field_name(cn.value)
             is_pub := cn.value.contains(" pub")
             is_mut := cn.value.contains(" mut")
+            if cn.value.contains(" frozen"):
+                struct_field_frozen.insert(tid.to_string() + "." + fname, true)
             field_names.push(fname)
             field_pub.push(is_pub)
             field_mut.push(is_mut)
@@ -8527,3 +8538,179 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     checker_lambda_depth = s.checker_lambda_depth
     checker_lambda_scope = s.checker_lambda_scope
     lambda_inferred_return = s.lambda_inferred_return
+
+# ---------------------------------------------------------------
+# frozen guarded fields (E275) and handles that leave a lock (E276)
+# ---------------------------------------------------------------
+#
+# a guarded collection is safe while it is reached under its lock, and a
+# handle to it read inside `locked` and kept after the block reaches the same
+# buffer with no lock at all. so a guarded field or a guarded global holding
+# a collection, or a struct that reaches one outside a guard block, may not
+# leave its block: not stored in a variable declared outside it, not returned
+# from it, and not captured by a closure made inside it. a binding made inside
+# the block ends with it, so it cannot carry one out.
+#
+# a block that moves the value out and leaves the field holding a new one,
+# `idle = self.idle` then `self.idle = []`, is a take: the guard no longer
+# reaches the buffer, so it is not an escape.
+#
+# a field declared `frozen` is set when its struct is built and never changed
+# after: not reassigned, and not changed in place through any path that runs
+# through it (E275). it needs no lock, and E248 and this rule do not count it
+# as a shared buffer, the way a router built once and then only read is
+# shared by every connection. a write through another name, after the value
+# is copied out of the field, is not seen.
+#
+# both checks run after a body is checked, when every expression has a type.
+
+# the methods that change a list, a map or a set in place
+COLLECTION_MUTATORS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
+
+fn check_guard_rules(body_idx: Int):
+    check_frozen_writes(body_idx)
+    check_lock_escapes(body_idx, body_idx)
+
+# the first frozen field on a path such as `a.b[i].c`, or ""
+fn frozen_field_on_path(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "field_access" and node.children.len() >= 1:
+        tid := c_get_expr_type(node.children[0])
+        if not is_error_type(tid) and struct_field_frozen.contains_key(tid.to_string() + "." + node.value):
+            return node.value
+        return frozen_field_on_path(node.children[0])
+    if node.kind == "index" and node.children.len() >= 1:
+        return frozen_field_on_path(node.children[0])
+    return ""
+
+fn check_frozen_writes(idx: Int):
+    node := get_node(idx)
+    if node.kind == "assignment" and node.children.len() >= 1:
+        frozen := frozen_field_on_path(node.children[0])
+        if frozen != "":
+            report_error_with_fix_at(node.children[0], "E275", "'" + frozen + "' is frozen, so it cannot be changed after its struct is built", "build a new value with the change, or drop `frozen` and keep the field in a guard block")
+    if node.kind == "method_call" and node.children.len() >= 1 and COLLECTION_MUTATORS.contains("," + node.value + ","):
+        frozen := frozen_field_on_path(node.children[0])
+        if frozen != "":
+            report_error_with_fix_at(node.children[0], "E275", "'" + frozen + "' is frozen, so it cannot be changed in place", "build a new value with the change, or drop `frozen` and keep the field in a guard block")
+    for child in node.children:
+        check_frozen_writes(child)
+
+# whether a value of type `tid` reaches a buffer another task could change:
+# a collection, or a struct that reaches one outside a guard block
+fn holds_shared_buffer_type(tid: Int) -> Bool:
+    if is_error_type(tid):
+        return false
+    kind := get_type_info(tid).kind
+    if kind == "list" or kind == "map" or kind == "set":
+        return true
+    mut seen: Map[Int, Bool] := {}
+    return struct_holds_unguarded_collection(tid, seen) != ""
+
+# the guarded name a path reads, when the path reads a guarded field or a
+# guarded global and its value holds a shared buffer, or ""
+fn escaping_guarded_read(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind != "ident" and node.kind != "field_access" and node.kind != "index":
+        return ""
+    if not holds_shared_buffer_type(c_get_expr_type(idx)):
+        return ""
+    return guarded_segment(idx)
+
+# the first guarded field or guarded global a path passes through, or ""
+fn guarded_segment(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "ident":
+        if definition_of.contains_key(idx):
+            decl := get_node(definition_of[idx])
+            if decl.kind == "binding" and guard_of_value(decl.value) != "":
+                return node.value
+        return ""
+    if node.kind == "field_access" and node.children.len() >= 1:
+        tid := c_get_expr_type(node.children[0])
+        if not is_error_type(tid) and struct_field_guards.contains_key(tid.to_string() + "." + node.value):
+            return node.value
+        return guarded_segment(node.children[0])
+    if node.kind == "index" and node.children.len() >= 1:
+        return guarded_segment(node.children[0])
+    return ""
+
+# walk a function body, checking each `locked` block's body for a guarded
+# handle that leaves it
+fn check_lock_escapes(idx: Int, fn_body: Int):
+    node := get_node(idx)
+    if node.kind == "locked_stmt" and node.children.len() == 4:
+        block := node.children[3]
+        mut inner: Map[String, Bool] := {}
+        collect_bound_names(block, inner)
+        check_escape_sites(block, inner, idx, fn_body, block)
+    for child in node.children:
+        check_lock_escapes(child, fn_body)
+
+# the names bound inside a subtree
+fn collect_bound_names(idx: Int, out: Map[String, Bool]):
+    node := get_node(idx)
+    if node.kind == "binding" and node.value != "":
+        out.insert(bound_name(node.value), true)
+    for child in node.children:
+        collect_bound_names(child, out)
+
+fn bound_name(value: String) -> String:
+    mut rest := value
+    if rest.starts_with("mut "):
+        rest = rest.substring(4, rest.len())
+    sp := rest.index_of(" ")
+    if sp >= 0:
+        return rest.substring(0, sp)
+    return rest
+
+fn report_escape(at: Int, name: String, how: String):
+    report_error_with_fix_at(at, "E276", "'" + name + "' is guarded, and " + how + ", so the buffer is reached after the lock is released", "copy what is needed inside the block, or declare the field `frozen` outside the guard block if it is never changed")
+
+fn check_escape_sites(idx: Int, inner: Map[String, Bool], locked_idx: Int, fn_body: Int, block: Int):
+    node := get_node(idx)
+    if node.kind == "assignment" and node.children.len() >= 2:
+        name := escaping_guarded_read(node.children[1])
+        if name != "" and not block_replaces(block, node.children[1]):
+            target := get_node(node.children[0])
+            if target.kind != "ident" or not inner.contains_key(target.value):
+                report_escape(node.children[1], name, "this stores its value where it outlives the block")
+    elif node.kind == "return" and node.children.len() >= 1:
+        name := escaping_guarded_read(node.children[0])
+        if name != "":
+            report_escape(node.children[0], name, "this returns its value out of the block")
+    elif node.kind == "lambda":
+        captured := first_guarded_read(idx)
+        if captured >= 0:
+            report_escape(captured, escaping_guarded_read(captured), "a closure made inside the block captures it")
+        return
+    for child in node.children:
+        check_escape_sites(child, inner, locked_idx, fn_body, block)
+
+# whether the block assigns the path read at `read_idx` a new value, which
+# makes reading it out a take
+fn block_replaces(block: Int, read_idx: Int) -> Bool:
+    path := locked_path_text(read_idx)
+    if path == "":
+        return false
+    return assigns_path(block, path, read_idx)
+
+fn assigns_path(idx: Int, path: String, read_idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind == "assignment" and node.children.len() >= 2 and node.children[1] != read_idx:
+        if locked_path_text(node.children[0]) == path:
+            return true
+    for child in node.children:
+        if assigns_path(child, path, read_idx):
+            return true
+    return false
+
+# the first guarded read under a node, or -1
+fn first_guarded_read(idx: Int) -> Int:
+    if escaping_guarded_read(idx) != "":
+        return idx
+    for child in get_node(idx).children:
+        found := first_guarded_read(child)
+        if found >= 0:
+            return found
+    return 0 - 1

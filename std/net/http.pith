@@ -129,12 +129,11 @@ pub struct HttpRequestBytes:
     pub version_text: String
     pub headers_text: String
     pub body_text_cache: String
-    # a request can be read on more than one task, as a grpc stream's is, so
-    # the maps sit under fields_mu
-    guard fields_mu:
-        pub header_map: Map[String, String]
-        pub query_map: Map[String, String]
-        pub path_parts_cache: List[String]
+    # set when the request is built and only read after, so a request can be
+    # read on more than one task, as a grpc stream's is
+    pub frozen header_map: Map[String, String]
+    pub frozen query_map: Map[String, String]
+    pub frozen path_parts_cache: List[String]
 
 # request metadata returned when a body is streamed into a writer.
 pub struct StreamedHttpRequest:
@@ -1597,20 +1596,17 @@ impl HttpRequestBytes:
     # header_map holds fields set when the request was built, such as the Host
     # an absolute-form target names; they win over the head.
     fn header(name: String) -> String!:
-        mut value := ""
-        locked self.fields_mu:
-            if self.header_map.len() > 0:
-                value = header_lookup(self.header_map, name)
-        if value != "":
-            return value
+        if self.header_map.len() > 0:
+            value := header_lookup(self.header_map, name)
+            if value != "":
+                return value
         return head_header_value(self.head, name)
     # every header field as a map with lowercase names, repeated fields
     # combined as header() combines them.
     fn header_fields() -> Map[String, String]:
         mut fields := head_header_fields(self.head)
-        locked self.fields_mu:
-            for key in self.header_map:
-                fields.insert(key.to_lower(), self.header_map[key])
+        for key in self.header_map:
+            fields.insert(key.to_lower(), self.header_map[key])
         return fields
     fn header_or(name: String, fallback: String) -> String:
         value := self.header(name) catch ""
@@ -1691,9 +1687,8 @@ impl HttpRequestBytes:
     fn is_patch(path_name: String) -> Bool!:
         return self.matches("PATCH", path_name)!
     fn query_param(name: String) -> String!:
-        locked self.fields_mu:
-            if self.query_map.contains_key(name):
-                return self.query_map[name]
+        if self.query_map.contains_key(name):
+            return self.query_map[name]
         params := query_params_map_from_string(self.query_text)
         if params.contains_key(name):
             return params[name]
@@ -1704,10 +1699,7 @@ impl HttpRequestBytes:
             return fallback
         return value
     fn has_query_param(name: String) -> Bool!:
-        locked self.fields_mu:
-            if self.query_map.contains_key(name):
-                return true
-        return query_params_map_from_string(self.query_text).contains_key(name)
+        return self.query_map.contains_key(name) or query_params_map_from_string(self.query_text).contains_key(name)
     fn cookies() -> Map[String, String]!:
         return parse_cookie_map(self.header_or("Cookie", ""))
     fn cookie(name: String) -> String!:
@@ -1743,9 +1735,8 @@ impl HttpRequestBytes:
     fn multipart_text_or(name: String, fallback: String) -> String:
         return self.multipart_text(name) catch fallback
     fn path_parts() -> List[String]!:
-        locked self.fields_mu:
-            if self.path_parts_cache.len() > 0:
-                return copy_string_list(self.path_parts_cache)
+        if self.path_parts_cache.len() > 0:
+            return copy_string_list(self.path_parts_cache)
         return path_segments(self.path_text)
     fn matches_path(pattern: String) -> Bool!:
         return route_match_path(self.path_text, pattern)

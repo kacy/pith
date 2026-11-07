@@ -1,0 +1,11 @@
+# a frozen field is set when its struct is built and never changed (E275)
+struct Router:
+    frozen routes: List[String]
+    hits: Int
+
+fn main():
+    r := Router(routes: ["/"], hits: 0)
+    r.routes.push("/admin")
+    r.routes = []
+    r.routes[0] = "/x"
+    r.hits = r.hits + 1

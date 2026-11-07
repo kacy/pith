@@ -866,6 +866,26 @@ sharing rule (E309). a send hands over the handle, so the value sent must be
 one the sender does not keep: built in the call, or an independent copy
 (`std.collections.copy_list` and friends).
 
+### frozen fields
+
+a field declared `frozen` is set when its struct is built and never changed
+after: it cannot be reassigned, and nothing can change its value in place
+through a path that runs through it (E275). so it is safe for any number of
+tasks to read at once, with no lock, and E248 does not count it as a shared
+buffer:
+
+```pith
+struct Router:
+    frozen routes: List[Route]
+    frozen middleware: List[Middleware]
+```
+
+std.web's router, a request's header and query maps, a metrics series' labels
+and an http/2 pool's connection list are frozen. the check follows paths: a
+copy of the value taken out of the field and changed through the copy's name
+is not seen, so keep a frozen value read-only wherever it goes. `frozen` is a
+word only before a field name, so a variable named `frozen` still works.
+
 ## finding a use after free
 
 a count bug in emitted code shows up as a value read after its last

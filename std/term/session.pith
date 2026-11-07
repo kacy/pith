@@ -54,10 +54,10 @@ pub struct Terminal:
     mut closed: Bool
     mut reader: Task[Int]
     mut waiter: Task[Int]
-    # the reader task reads the options, so they and the queued output sit
-    # under out_mu
+    # fixed when the session opens; the reader task reads them
+    frozen opts: Options
+    # the queued output
     guard out_mu:
-        opts: Options
         mut pending_out: List[String]
 
 # how long the reader sleeps per poll when nothing is pending. bounded so
@@ -132,8 +132,7 @@ fn reader_loop(t: Terminal) -> Int:
     while t.running:
         mut wait_ms := IDLE_READ_MS
         if input.pending(p):
-            locked t.out_mu:
-                wait_ms = t.opts.esc_timeout_ms
+            wait_ms = t.opts.esc_timeout_ms
         r := tty.read(4096, wait_ms)
         if not r.is_ok:
             if t.running:
@@ -203,11 +202,9 @@ impl Terminal:
             return
         self.closed = true
         self.running = false
-        mut leave := ""
         locked self.out_mu:
             self.pending_out = []
-            leave = leave_sequence(self.opts)
-        tty.write_str(leave) catch 0
+        tty.write_str(leave_sequence(self.opts)) catch 0
         tty.restore()
         await self.reader
         await self.waiter

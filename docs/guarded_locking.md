@@ -522,6 +522,19 @@ build settled a question this page left open, or departed from it:
   credentials, the stream reader's header blocks, the http/2 pool's client
   list and the terminal's options and output queue. std.obs builds its
   export target in the spawn's arguments instead.
+- **frozen fields and handles that leave a lock.** a handle copied out of a
+  `locked` block reached the buffer with no lock. E276 now refuses a guarded
+  collection stored outside the block, returned from it or captured by a
+  closure made in it, and allows a take that gives the field a new value.
+  read-only data needed a way out, so a struct field can be declared `frozen`:
+  set at construction, never changed through a path that runs through it
+  (E275), read by any task with no lock, and not a shared buffer to E248.
+  std.web's router, a request's header, query and path maps, the http/2
+  pool's client list, the terminal's options, metrics series labels, the tls
+  parsed-roots cache entries and the gateway's grpc targets moved from guards
+  to frozen fields, which drops the per-request mutex E248 had added to
+  requests. zstd's predefined tables are built at module init. a write through
+  a copy of a frozen value, under another name, is not seen.
 - **E248 at channel sends.** `send` and `try_send` are checked like a spawn's
   arguments, since the receiver gets the handle. the http/2 client and server
   handed stream events to a helper that sent its parameter; the helper now

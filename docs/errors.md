@@ -1102,3 +1102,39 @@ warning[E312]: this call takes 'self.mu', which is already held here; a mutex is
                    ^
   fix: call a version that expects the lock held, marked `holding`, or release the mutex before the call
 ```
+
+### E275 — a frozen field is changed
+
+a field declared `frozen` is set when its struct is built and never changed
+after (see docs/ownership.md, "frozen fields"). reassigning it, assigning to
+one of its elements, or calling a method that changes it in place (`push`,
+`insert`, `remove` and the like) through a path that runs through it is
+refused. build a new struct with the changed value, or drop `frozen` and keep
+the field in a `guard` block.
+
+```
+error[E275]: 'routes' is frozen, so it cannot be changed in place
+  8 |     r.routes.push("/admin")
+          ^
+  fix: build a new value with the change, or drop `frozen` and keep the field in a guard block
+```
+
+### E276 — a guarded value leaves its lock
+
+a guarded field or global holding a collection, or a struct that reaches one
+outside a guard block, is reached safely only while its mutex is held. inside
+`locked`, its value may not be stored in a variable declared outside the
+block, returned from the block, or captured by a closure made in the block:
+each keeps a handle to the buffer after the lock is released.
+
+a block that moves the value out and gives the field a new one, `out =
+self.items` then `self.items = []`, is a take and is allowed, since the guard
+no longer reaches the old buffer. a value that never changes after it is
+built belongs in a `frozen` field instead of a guard.
+
+```
+error[E276]: 'messages' is guarded, and this returns its value out of the block, so the buffer is reached after the lock is released
+  11 |         return inbox.messages
+                      ^
+  fix: copy what is needed inside the block, or declare the field `frozen` outside the guard block if it is never changed
+```

@@ -1618,6 +1618,8 @@ validate-ir-contract-only:
 # docs/ir-contract.md). a golden program pins the marks themselves, and over
 # the corpus the ir with its marks taken out must be exactly the ir a run
 # without the variable emits, so the marks can't change the generated code.
+# the same marked ir then goes through the checker, and a function it finds
+# unbalanced, or a borrow a write can drop, fails the target.
 count-marks-check-only:
 	@echo "--- count marks ---"
 	@[ -x self-host/ir_driver ] || $(MAKE) --no-print-directory self-host-ir-driver
@@ -1626,18 +1628,25 @@ count-marks-check-only:
 		| awk '$$1=="func"{f=$$0; next} $$1=="mark"{if(f!=""){print f; f=""} print}' > .pith-build/marks.out
 	@diff -u tests/count_marks/marks.expected .pith-build/marks.out || \
 		{ echo "marks differ from tests/count_marks/marks.expected"; exit 1; }
-	@bad=0; n=0; \
+	@bad=0; unbalanced=0; n=0; \
 	for f in tests/cases/test_*.pith examples/*.pith; do \
 		grep -q "^fn main" "$$f" || continue; \
 		n=$$((n+1)); \
 		./self-host/ir_driver --combined "$$f" > .pith-build/plain.ir 2>&1; \
-		PITH_CHECK_COUNTS=1 ./self-host/ir_driver --combined "$$f" 2>&1 | grep -v '^mark ' > .pith-build/marked.ir; \
+		PITH_CHECK_COUNTS=1 ./self-host/ir_driver --combined "$$f" > .pith-build/withmarks.ir 2>&1; \
+		grep -v '^mark ' .pith-build/withmarks.ir > .pith-build/marked.ir; \
 		if ! cmp -s .pith-build/plain.ir .pith-build/marked.ir; then \
 			bad=$$((bad+1)); echo "MARKS CHANGE THE IR: $$f"; \
 		fi; \
+		PITH_CHECK_COUNTS=only ./target/release/pith build-ir .pith-build/withmarks.ir .pith-build/counts.bin 2>&1 \
+			| grep -E '^  (unbalanced|borrow): ' > .pith-build/counts.out; \
+		if [ -s .pith-build/counts.out ]; then \
+			unbalanced=$$((unbalanced+1)); echo "COUNT CHECK: $$f"; cat .pith-build/counts.out; \
+		fi; \
 	done; \
 	echo "compared $$n programs with and without marks, $$bad differ"; \
-	[ $$bad -eq 0 ]
+	echo "count-checked $$n programs, $$unbalanced with findings"; \
+	[ $$bad -eq 0 ] && [ $$unbalanced -eq 0 ]
 
 # --- gzip interop check ---
 # both directions against the system tool: pith reads gzip's output

@@ -6482,6 +6482,17 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
             loop_slot := ir_loop_var_slot(callee.name)
             if loop_slot.len() > 0:
                 callee = ResolvedCallee(loop_slot, callee.imported)
+            elif not callee.imported and ir_name_is_threadlocal(callee.name):
+                # a threadlocal holding a fn value has no data slot to call
+                # through: this thread's value is read into a slot of the
+                # function's own, and the call goes through that. the
+                # threadlocal keeps its count; a callee that replaces it
+                # mid-call is no different from one replacing a global.
+                fn_r := ir_reg()
+                ir_emit_tls_load(fn_r, callee.name)
+                fn_slot := ir_new_temp_name("tlfn")
+                ir_emit("store " + fn_slot + " " + fn_r.to_string())
+                callee = ResolvedCallee(fn_slot, false)
             elif not callee.imported and not ir_name_is_func_local(callee.name) and ir_global_slot_names.contains(callee.name):
                 # a module global holding a fn value, called by its own name.
                 # the consumer resolves a callee it cannot find among the
@@ -13019,7 +13030,7 @@ fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
     mut global_map_value_type := ""
     for gc in node.children:
         gcn := get_node(gc)
-        if gcn.kind == "type" or gcn.kind == "generic_type" or gcn.kind == "optional_type":
+        if gcn.kind == "type" or gcn.kind == "generic_type" or gcn.kind == "optional_type" or gcn.kind == "fn_type":
             global_type = ir_resolve_type_node(gc)
             if global_map_value_type.len() == 0:
                 global_map_value_type = ir_resolve_map_value_type_node(gc)

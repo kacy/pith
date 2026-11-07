@@ -152,6 +152,9 @@ pub struct Conn:
     # on other tasks read it, so it sits under credentials_mu.
     guard credentials_mu:
         credentials: List[String]
+    # 1 once set_credentials has stored a non-empty list, so a channel with
+    # none (the usual case) skips the lock on every call
+    has_credentials: AtomicInt
 
 # an empty credential list, typed for the Conn field.
 fn no_credentials() -> List[String]:
@@ -173,10 +176,16 @@ impl Conn:
     pub fn set_credentials(metadata: List[String]):
         locked self.credentials_mu:
             self.credentials = metadata
+            if metadata.len() > 0:
+                self.has_credentials.store(1)
+            else:
+                self.has_credentials.store(0)
 
     # this channel's credentials followed by `extra`, which is what every call
     # actually sends.
     fn call_metadata(extra: List[String]) -> List[String]:
+        if self.has_credentials.load() == 0:
+            return extra
         mut out: List[String] := []
         locked self.credentials_mu:
             if self.credentials.len() == 0:
@@ -268,7 +277,7 @@ impl Conn:
 pub fn dial(host: String, port: Int) -> Conn!:
     client := http2.open(host, port)!
     limit_responses(client)
-    return Conn(client: client, authority: host, credentials: no_credentials())
+    return Conn(client: client, authority: host, credentials: no_credentials(), has_credentials: AtomicInt(0))
 
 # dial a grpc server using the caller's tls `config` (which must offer alpn
 # "h2") — for example one built with tls.client_config_with_ca_file to trust a
@@ -277,7 +286,7 @@ pub fn dial(host: String, port: Int) -> Conn!:
 pub fn dial_with_config(host: String, port: Int, config: tls.Config) -> Conn!:
     client := http2.open_with_config(host, port, config)!
     limit_responses(client)
-    return Conn(client: client, authority: host, credentials: no_credentials())
+    return Conn(client: client, authority: host, credentials: no_credentials(), has_credentials: AtomicInt(0))
 
 # dial a grpc server over plaintext http/2 (h2c) — no tls. matches a server
 # started with grpc.serve. use this for local or trusted-network endpoints; for
@@ -285,7 +294,7 @@ pub fn dial_with_config(host: String, port: Int, config: tls.Config) -> Conn!:
 pub fn dial_h2c(host: String, port: Int) -> Conn!:
     client := http2.open_h2c(host, port)!
     limit_responses(client)
-    return Conn(client: client, authority: host, credentials: no_credentials())
+    return Conn(client: client, authority: host, credentials: no_credentials(), has_credentials: AtomicInt(0))
 
 # make a one-shot unary call: dial host:port, run the method, and close. this is
 # the simplest entry point; for several calls over one connection, dial() a

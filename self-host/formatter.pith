@@ -114,6 +114,11 @@ fn format_code_line(line: String) -> String:
             i = i + 1
         else:
             break
+    # a closing delimiter trims the space before it, but never into the
+    # indentation: a line that starts with `)` (the end of a multi-line call)
+    # used to lose its indentation and land in column 0. the text after the
+    # indentation starts with a non-space, so trimming stops there.
+    indent_len := output.len()
 
     while i < line.len():
         ch := line[i]
@@ -278,14 +283,10 @@ fn format_code_line(line: String) -> String:
             continue
 
         # closing delimiters — no space before
-        if ch == ")" or ch == "]":
-            output = trim_trailing_spaces(output)
-            output = output + ch
-            i = i + 1
-            continue
         RB := chr(125)
-        if ch == RB:
-            output = trim_trailing_spaces(output)
+        if ch == ")" or ch == "]" or ch == RB:
+            if output.len() > indent_len:
+                output = trim_trailing_spaces(output)
             output = output + ch
             i = i + 1
             continue
@@ -477,6 +478,15 @@ test "a unary minus already spaced apart is pulled back to its operand":
     assert(kept.contains("xs[n - 1]"))
     assert(kept.contains("g(n - 1, 0, xs)"))
     assert(kept.contains("(0 - 1)"))
+
+test "a line that starts with a closing delimiter keeps its indentation":
+    call := "fn f() -> Int:" + chr(10) + "    if true:" + chr(10) + "        return g(" + chr(10) + "            a: 1," + chr(10) + "        )" + chr(10) + "    xs := [" + chr(10) + "        1," + chr(10) + "    ]" + chr(10) + "    return 0" + chr(10)
+    out := fmt_source(call)
+    assert(out.contains(chr(10) + "        )" + chr(10)))
+    assert(out.contains(chr(10) + "    ]" + chr(10)))
+    assert(fmt_source(out) == out)
+    # a closing delimiter after other text still drops the space before it
+    assert(fmt_source("fn h() -> Int:" + chr(10) + "    return g(1 )" + chr(10)).contains("g(1)"))
 
 test "a line ending in an operator keeps no trailing space":
     # the spacing pass puts a space after an operator before it knows whether

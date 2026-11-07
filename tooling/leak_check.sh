@@ -197,6 +197,7 @@ cases=(
   "tests/leaks/leak_select_recv SHAPE=2"
   "tests/leaks/leak_select_recv SHAPE=3"
   "tests/leaks/leak_select_recv SHAPE=4"
+  tests/leaks/leak_threadlocal_fn_value
   "tests/leaks/leak_crosskind_binding SHAPE=1"
   "tests/leaks/leak_crosskind_binding SHAPE=2"
   "tests/leaks/leak_crosskind_binding SHAPE=3"

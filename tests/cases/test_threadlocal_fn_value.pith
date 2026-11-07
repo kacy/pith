@@ -1,0 +1,18 @@
+# a threadlocal holding a fn value. its type was dropped (the getter had no
+# return kind and the ir was refused), and a call by the threadlocal's name
+# went to a data slot that threadlocals don't have. each task starts from the
+# initializer and a reassignment stays on the task that made it.
+threadlocal mut handler: fn(Int) -> Int := fn(x: Int) -> Int => x + 1
+
+fn work(n: Int) -> Int:
+    first := handler(n)
+    handler = fn(x: Int) -> Int => x * 100
+    return first + handler(n)
+
+fn main():
+    print(handler(4).to_string())
+    handler = fn(x: Int) -> Int => x * 10
+    print(handler(4).to_string())
+    t := spawn work(3)
+    print((await t).to_string())
+    print(handler(4).to_string())

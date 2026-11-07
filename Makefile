@@ -1819,6 +1819,14 @@ cli-regressions-only:
 	set -e; \
 	case "$$park_out" in *'"code":"E310"'*'"line":7'*'"code":"E310"'*'"line":11'*) pass=$$((pass+1)); echo "ok   lint park under a lock";; *) echo "FAIL lint park under a lock"; fail=$$((fail+1));; esac; \
 	case "$$park_ok_out" in *'"code":"E310"'*) echo "FAIL lint send, default select and own Conn exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint send, default select and own Conn exempt";; esac; \
+	printf 'guard a_mu:\n    mut a := 0\n\nguard b_mu:\n    mut b := 0\n\nfn credit():\n    locked a_mu:\n        locked b_mu:\n            b = a\n\nfn debit():\n    locked b_mu:\n        settle()\n\nfn settle():\n    locked a_mu:\n        a = 0\n\nfn main():\n    return\n' > "$$tmpdir/lint_order.pith"; \
+	printf 'guard a_mu:\n    mut a := 0\n\nguard b_mu:\n    mut b := 0\n\nstruct Acct:\n    guard mu:\n        mut n: Int\n\nfn one():\n    locked a_mu:\n        locked b_mu:\n            b = a\n\nfn two():\n    locked a_mu:\n        locked b_mu:\n            a = b\n\nfn transfer(x: Acct, y: Acct):\n    locked x.mu:\n        locked y.mu:\n            y.n = x.n\n\nfn main():\n    return\n' > "$$tmpdir/lint_order_ok.pith"; \
+	set +e; \
+	order_out=$$(./target/release/pith lint --json "$$tmpdir/lint_order.pith" 2>/dev/null); \
+	order_ok_out=$$(./target/release/pith lint --json "$$tmpdir/lint_order_ok.pith" 2>/dev/null); \
+	set -e; \
+	case "$$order_out" in *'"code":"E311"'*) pass=$$((pass+1)); echo "ok   lint opposite lock order through a call";; *) echo "FAIL lint opposite lock order through a call"; fail=$$((fail+1));; esac; \
+	case "$$order_ok_out" in *'"code":"E311"'*) echo "FAIL lint one lock order and same-struct nesting exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint one lock order and same-struct nesting exempt";; esac; \
 	printf 'test "a first":\n    assert(true)\ntest "b fails":\n    assert(false)\ntest "c after failure":\n    assert(true)\n' > "$$tmpdir/harness.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/harness.pith" 2>&1); \

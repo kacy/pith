@@ -1,0 +1,30 @@
+# an optional parameter stored by index into a map and a list: the value was
+# retained for the optional slot and then again by the store, leaking one
+# shell per store.
+import leakprobe as probe
+
+fn into_map(m: Map[String, String?], k: String, x: String?):
+    m[k] = x
+
+fn into_list(xs: List[String?], i: Int, x: String?):
+    xs[i] = x
+
+fn round(m: Map[String, String?], xs: List[String?], i: Int) -> Int:
+    v: String? := "v" + i.to_string()
+    into_map(m, "k", v)
+    into_list(xs, 0, v)
+    return m.len() + xs.len()
+
+fn main():
+    n := probe.rounds()
+    mut m: Map[String, String?] := {}
+    mut xs: List[String?] := [none]
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(m, xs, i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

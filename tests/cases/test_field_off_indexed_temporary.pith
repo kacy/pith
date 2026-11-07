@@ -1,0 +1,37 @@
+# a field read off an element of a temporary container: the element arrives
+# owned and is released once its field is read. a plain element read is a
+# borrow and the container keeps it. a read whose key could drop the
+# container pins it, and that element arrives owned as well.
+
+struct Spec:
+    name: String
+
+struct Pack:
+    specs: List[Spec]
+
+fn nested(i: Int) -> Pack:
+    return Pack(specs: [Spec(name: "n" + i.to_string()), Spec(name: "second")])
+
+fn specs(i: Int) -> List[Spec]:
+    return [Spec(name: "s" + i.to_string())]
+
+mut shelf: List[String] := []
+
+fn shrink() -> Int:
+    shelf = ["fresh"]
+    return 0
+
+fn main():
+    print(nested(1).specs[0].name + " " + nested(2).specs[1].name + " " + specs(3)[0].name)
+    kept := specs(4)
+    print(kept[0].name)
+    print(kept[0].name)
+    mut total := 0
+    mut i := 0
+    while i < 1000:
+        total = total + nested(i).specs[0].name.len() + specs(i)[0].name.len()
+        i = i + 1
+    print(total.to_string())
+    shelf = ["kept-" + 1.to_string()]
+    print(shelf[shrink()])
+    print(shelf[0])

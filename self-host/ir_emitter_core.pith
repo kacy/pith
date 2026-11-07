@@ -1115,6 +1115,12 @@ mut ir_weak_capture_names: List[String] := []
 # (ir_owned_receiver_getter_payload_kind)
 mut ir_getter_consumed_idx := 0 - 1
 
+# the `unwrap_or` nodes lowered through the register pair
+# (ir_emit_unwrap_or_pair). no box keeps the payload there: the ok arm hands
+# out the payload's own count and the fallback arm gives the fallback one, so
+# the value is owned, not the borrow a box's unwrap_or hands out.
+mut ir_pair_unwrap_nodes: Map[Int, Bool] := {}
+
 # true when reading `name` must resolve liveness through
 # pith_struct_weak_load: a weak local of the emitting function, or a weak
 # binding captured from the enclosing one. a loop variable shadowing the
@@ -1301,6 +1307,8 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # extraction carries. the RESULT unwrap_or is untouched: its
         # receiver's kind is "result", and its string payload keeps the
         # retain-at-escape convention.
+        if mname == "unwrap_or" and ir_pair_unwrap_nodes.contains_key(idx):
+            return false
         if (mname == "unwrap_or" or mname == "value") and node.children.len() > 0:
             extract_recv_tid := c_get_expr_type(node.children[0])
             if extract_recv_tid >= 0 and get_type_info(extract_recv_tid).kind == "optional":
@@ -2918,10 +2926,14 @@ fn ir_prepass_bind_type(parts: IrBindParts, names: List[String]) -> String:
             # the chained kind is the kind of the source's first binding.
             # when another site binds the source under a different kind,
             # this read can see that binding, so the checker's type for the
-            # read takes precedence.
-            read_kind := ir_rc_kind(ir_checked_type(parts.val_idx))
-            if read_kind.len() > 0 and read_kind != ir_rc_kind(bind_type):
-                bind_type = read_kind
+            # read takes precedence. the caller runs the result through
+            # ir_rc_kind, which reads a type hint: the chained kind `struct`
+            # is not one and came back empty, so `mut b := a` with a struct
+            # `a` went untracked and a later `b = f()` leaked the fresh value.
+            # the checked type carries the same kind as a valid hint.
+            read_type := ir_checked_type(parts.val_idx)
+            if ir_rc_kind(read_type).len() > 0:
+                bind_type = read_type
         else:
             # the checker's recorded type resolves module-qualified calls
             # (bytes.from_string_utf8 and friends) that local inference
@@ -7239,6 +7251,12 @@ fn ir_field_receiver_kind_can_own(kind: String) -> Bool:
         return true
     if kind == "catch_expr" or kind == "catch_block" or kind == "field_access":
         return true
+    # an element read off a temporary container arrives owned
+    # (ir_index_reads_owned_element), so `make().items[0].name` releases the
+    # element once its field is read. a plain `xs[i]` is a borrow and stays out
+    # through the ownership check that follows.
+    if kind == "index":
+        return true
     return kind == "try" or kind == "try_expr"
 
 # true when a field access's receiver is a fresh value nothing else names: a
@@ -7692,6 +7710,7 @@ fn ir_extraction_operand_class(idx: Int) -> String:
 # path applies, then drops the error by its kind, the same order the box
 # path uses.
 fn ir_emit_unwrap_or_pair(idx: Int, node: Node, flag_r: Int, val_r: Int) -> Int:
+    ir_pair_unwrap_nodes.insert(idx, true)
     recv_tid := c_get_expr_type(node.children[0])
     temp_name := ir_new_temp_name("unwrap_or")
     arg_idx := ir_method_call_arg_expr(node, 0)
@@ -9595,9 +9614,22 @@ fn ir_index_reads_owned_element(idx: Int) -> Bool:
     node := get_node(idx)
     if node.children.len() == 0 or ir_expr_is_fresh_string_index(idx):
         return false
-    if not ir_index_container_is_owned_temp(node.children[0]):
+    if not ir_index_container_is_owned_temp(node.children[0]) and not ir_index_read_is_pinned(idx):
         return false
     return ir_rc_kind(ir_infer_type(idx)).len() > 0
+
+# true when an index read pins its container around a key that could drop it
+# (`o.items[shrink(o)]`, ir_emit_index_expr). the element then takes a count
+# of its own before the pin goes, so it arrives owned too; called borrowed, a
+# consumer that only read it left that count behind. the two checks are the
+# ones the emitter makes when it pins.
+fn ir_index_read_is_pinned(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.children.len() < 2:
+        return false
+    if ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1):
+        return false
+    return ir_arg_pin_kind(node.children[0]).len() > 0
 
 fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     obj_r := ir_expr(node.children[0])
@@ -9614,8 +9646,7 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     # `o.items[shrink(o)]`: a key that can drop the container read before it
     # pins the container for the read. the element then takes a count of its
     # own before the pin goes, since the pin may have been the container's
-    # last; a consumer that retains it as well leaks it, which is the safe
-    # side for a shape this rare.
+    # last, and ir_index_read_is_pinned tells the consumer it arrives owned.
     obj_pin := ir_pin_operand(node.children[0], obj_r, not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1))
     if obj_pin.len() > 0:
         read_r := ir_emit_index_read(idx, node, obj_r)
@@ -9960,6 +9991,12 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # a bare `none` falls through to borrowed and sent the store down the
     # retaining path, stranding a shell per `m[k] = none`.
     if ir_expr_is_fresh_optional_shell(value_idx):
+        idx_borrowed = false
+    # into an optional slot the value always arrives owned: the preparation
+    # above retains a borrowed shell (ir_emit_optional_for_target). treated as
+    # borrowed, the store retained it again, and `m[k] = x` with an optional
+    # parameter `x` leaked one shell per store.
+    if value_type == "tuple":
         idx_borrowed = false
     # a list store goes through the strict entry points, which stop on an
     # index outside the list the way a read does. inside a fallible function a
@@ -11884,6 +11921,13 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
 # none; the value is read from the Some shell's slot 8 inside the loop.
 fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: String):
     iter_r := ir_expr(node.children[0])
+    # a fresh iterator (`for x in Range(0, n)`) belongs to the loop, which
+    # releases it at its end label and, for an early return inside the body,
+    # at the function's exit edges. a borrowed one is left to its owner. the
+    # loop used to drop it in every case, leaking one iterator per loop run.
+    mut iter_kind := ""
+    if not ir_expr_is_borrowed(node.children[0]):
+        iter_kind = ir_rc_kind(ir_infer_type(node.children[0]))
     fid := ir_for_count
     ir_for_count = ir_for_count + 1
     it_var := "__for_it_" + fid.to_string()
@@ -11907,6 +11951,11 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     ir_emit("load " + it_cur.to_string() + " " + it_var)
     opt_r := ir_reg()
     ir_emit("call " + opt_r.to_string() + " " + next_name + " tuple 1 " + it_cur.to_string())
+    # the step's optional also lives in a slot, so a return from the body,
+    # which skips the step and end labels that release it, can release it
+    # at the function's exit edges
+    opt_var := "__for_opt_" + fid.to_string()
+    ir_emit("store " + opt_var + " " + opt_r.to_string())
     flag_r := ir_optional_flag_field(opt_r)
     ir_emit("brif " + flag_r.to_string() + " " + body_l + " " + end_l)
     ir_emit_label(body_l)
@@ -11924,7 +11973,17 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     ir_break_stack = ir_push_string(ir_break_stack, end_l)
     ir_continue_stack = ir_push_string(ir_continue_stack, step_l)
     ir_defer_loop_enter()
+    if iter_kind.len() > 0:
+        ir_loop_iter_vars.push(it_var)
+        ir_loop_iter_kinds.push(iter_kind)
+    ir_loop_iter_vars.push(opt_var)
+    ir_loop_iter_kinds.push("tuple")
     ir_block(node.children[1])
+    ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
+    ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
+    if iter_kind.len() > 0:
+        ir_loop_iter_vars.remove(ir_loop_iter_vars.len() - 1)
+        ir_loop_iter_kinds.remove(ir_loop_iter_kinds.len() - 1)
     ir_defer_loop_exit()
     ir_loop_var_pop(names.index_name, prev_index_slot)
     ir_loop_var_pop(names.value_name, prev_value_slot)
@@ -11947,6 +12006,10 @@ fn ir_emit_for_iterator_stmt(node: Node, names: IrForBindingNames, next_name: St
     ir_emit("jmp " + head_l)
     ir_emit_label(end_l)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
+    if iter_kind.len() > 0:
+        it_end := ir_reg()
+        ir_emit("load " + it_end.to_string() + " " + it_var)
+        ir_rc_release_reg(it_end, iter_kind)
 
 fn ir_stmt_control(idx: Int, node: Node):
     if node.kind == "if" or node.kind == "if_stmt":

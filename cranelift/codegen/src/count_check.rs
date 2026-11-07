@@ -278,7 +278,29 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
         aliases: a.aliases.iter().filter(|(v, h)| b.aliases.get(*v) == Some(*h)).map(|(v, h)| (v.clone(), h.clone())).collect(),
         ..Canon::default()
     };
-    let keys: BTreeSet<&Vec<String>> = a.objs.keys().chain(b.objs.keys()).collect();
+    // a slot that holds a different value with one count on each path
+    // (`x := f() catch fresh()`, the payload on one path and the default on
+    // the other) holds one count past the join, whichever value it is. the
+    // slots the two values share keep it; the others held the value on
+    // their path only and can't be read past here.
+    let one_count_only = |x: &Canon, y: &Canon| -> Vec<Vec<String>> {
+        x.objs.iter().filter(|(k, v)| v.0 == 1 && !y.objs.contains_key(*k)).map(|(k, _)| k.clone()).collect()
+    };
+    let (a_one, b_one) = (one_count_only(a, b), one_count_only(b, a));
+    let mut paired: HashSet<Vec<String>> = HashSet::new();
+    for ka in &a_one {
+        let partners: Vec<&Vec<String>> = b_one.iter().filter(|kb| kb.iter().any(|s| ka.contains(s))).collect();
+        if let [kb] = partners[..] {
+            let shared: Vec<String> = ka.iter().filter(|s| kb.contains(s)).cloned().collect();
+            if out.objs.contains_key(&shared) || paired.contains(kb) {
+                continue;
+            }
+            out.objs.insert(shared, (1, a.objs[ka].1 || b.objs[kb].1));
+            paired.insert(ka.clone());
+            paired.insert(kb.clone());
+        }
+    }
+    let keys: BTreeSet<&Vec<String>> = a.objs.keys().chain(b.objs.keys()).filter(|k| !paired.contains(*k)).collect();
     for k in keys {
         match (a.objs.get(k), b.objs.get(k)) {
             (Some(x), Some(y)) if x.0 == y.0 => {
@@ -1357,6 +1379,67 @@ endfunc
     fn a_catch_over_a_nullable_string_balances() {
         let r = check(CATCH_NULLABLE);
         assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+
+    // `return zstd_compress(d) catch bytes.empty()`: the catch slot holds the
+    // payload on one path and a fresh default on the other
+    const CATCH_FRESH_DEFAULT: &str = "
+func make_default 1 string
+param b
+load 1 b
+call 2 bytes_to_string_utf8 string 1 1
+ret 2
+mark kind b bytes
+endfunc
+func compress 1 string
+param data
+load 1 data
+call 3 bytes_to_string_utf8 string 1 1
+iconst 4 0
+neq 5 3 4
+brif 5 L9 L10
+label L9
+iconst 6 1
+store __lp_flag_4_9 6
+store __lp_val_4_9 3
+jmp L11
+label L10
+iconst 7 0
+store __lp_flag_4_9 7
+strref 8 m12s93
+store __lp_val_4_9 8
+label L11
+load 9 __lp_flag_4_9
+load 10 __lp_val_4_9
+brif 9 L12 L13
+label L12
+store __catch_11_12 10
+jmp L14
+label L13
+call 11 pith_cstring_release void 1 10
+load 15 data
+call 12 make_default string 1 15
+store __catch_11_12 12
+label L14
+load 13 __catch_11_12
+ret 13
+iconst 14 0
+ret 14
+mark kind data bytes
+endfunc
+";
+
+    #[test]
+    fn a_catch_with_a_fresh_default_balances() {
+        let r = check(CATCH_FRESH_DEFAULT);
+        assert_eq!((r.passed, r.failed, r.undecided), (2, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_catch_with_a_fresh_default_that_drops_the_payload_is_a_leak() {
+        let r = check(&CATCH_FRESH_DEFAULT.replace("store __catch_11_12 10\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
     }
 
     #[test]

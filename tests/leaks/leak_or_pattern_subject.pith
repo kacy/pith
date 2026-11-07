@@ -1,0 +1,32 @@
+# a match on a fresh enum with an or-pattern arm never released the subject:
+# an or-pattern ruled the release out whatever its alternatives were.
+import leakprobe as probe
+
+enum Packet:
+    Empty
+    Text(String)
+    Tagged(String, Int)
+
+fn make(n: Int) -> Packet:
+    if n == 0:
+        return Packet.Empty
+    if n == 1:
+        return Packet.Text("t" + n.to_string())
+    return Packet.Tagged("g" + n.to_string(), n)
+
+fn round(i: Int) -> Int:
+    match make(i % 3):
+        Packet.Empty | Packet.Text(_) => 1
+        Packet.Tagged(s, k) => s.len() + k
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

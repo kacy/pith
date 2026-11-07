@@ -2650,11 +2650,15 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
 # ownership the tracked-locals list already accounts for. releasing either
 # would be an over-release of a count this function never took.
 fn ir_assign_targets_global_slot(name: String) -> Bool:
-    if not ir_global_slot_names.contains(name):
+    if ir_loop_var_slot(name).len() > 0 or ir_name_is_func_local(name):
         return false
-    if ir_loop_var_slot(name).len() > 0:
-        return false
-    return not ir_name_is_func_local(name)
+    if ir_global_slot_names.contains(name):
+        return true
+    # a `mut` global imported by name (`from store import items`) is a global
+    # slot too. without this an assignment to one skipped the release of the
+    # value it replaced, leaking it, and skipped the share marking every
+    # other global store gets.
+    return ir_import_mutable_global_symbols.contains_key(ir_resolve_storage_name(name))
 
 # one helper per (ok, err) payload signature used this module. each releases the
 # live payload of a result/optional tuple (slot 8 when the flag is set, slot 16

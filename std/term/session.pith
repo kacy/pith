@@ -132,8 +132,7 @@ fn reader_loop(t: Terminal) -> Int:
     while t.running:
         mut wait_ms := IDLE_READ_MS
         if input.pending(p):
-            locked t.out_mu:
-                wait_ms = t.opts.esc_timeout_ms
+            wait_ms = t.opts.esc_timeout_ms
         r := tty.read(4096, wait_ms)
         if not r.is_ok:
             if t.running:

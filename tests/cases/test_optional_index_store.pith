@@ -1,0 +1,34 @@
+# an optional stored by index into a map or a list arrives owned at the store,
+# however the expression classifies: a parameter, a local, a none or a fresh
+# value. each is read back, and the stored parameter stays readable after.
+
+fn into_map(m: Map[String, String?], k: String, x: String?):
+    m[k] = x
+
+fn into_list(xs: List[String?], i: Int, x: String?):
+    xs[i] = x
+
+fn show(x: String?) -> String:
+    return x.unwrap_or("none")
+
+fn main():
+    mut m: Map[String, String?] := {}
+    mut xs: List[String?] := [none, none, none, none]
+    built := "built-" + 7.to_string()
+    held: String? := built
+    into_map(m, "param", held)
+    m["local"] = held
+    m["none"] = none
+    m["fresh"] = "f" + 1.to_string()
+    into_list(xs, 0, held)
+    xs[1] = held
+    xs[2] = none
+    xs[3] = "g" + 2.to_string()
+    print("{show(m["param"])} {show(m["local"])} {show(m["none"])} {show(m["fresh"])}")
+    print("{show(xs[0])} {show(xs[1])} {show(xs[2])} {show(xs[3])}")
+    mut i := 0
+    while i < 1000:
+        into_map(m, "param", held)
+        into_list(xs, 0, held)
+        i = i + 1
+    print(show(held))

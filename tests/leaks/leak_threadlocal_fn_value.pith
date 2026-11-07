@@ -1,0 +1,23 @@
+# a threadlocal holding a fn value, reassigned and called through its name
+# every round: the replaced closure and the read for each call must not stay
+# behind.
+import leakprobe as probe
+
+threadlocal mut handler: fn(Int) -> Int := fn(x: Int) -> Int => x + 1
+
+fn round(i: Int) -> Int:
+    k := i % 7
+    handler = fn(x: Int) -> Int => x * k
+    return handler(i)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -366,6 +366,13 @@ struct Scoped:
     segments: List[String]
     mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse
 
+# the routes and the middleware an App answers with. a router is built by the
+# App builder and only read after that.
+struct Router:
+    routes: List[Route]
+    middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
+    scoped: List[Scoped]
+
 # a web application: an ordered list of routes plus the middleware that wraps
 # them. build one with new(), add routes with get/post/put/delete and middleware
 # with use_mw (app-wide) or group (bound to a path prefix), then call listen().
@@ -374,10 +381,12 @@ struct Scoped:
 # purpose: a type-aliased fn field is miscopied when the App builder clones
 # itself, the same reason Route.handler is written out longhand.
 pub struct App:
-    routes: List[Route]
-    middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
-    scoped: List[Scoped]
     config: http.ServerConfig
+    # every connection task reads the router, so it sits behind the app's
+    # mutex. the builder never changes a router in place: each call makes a
+    # new one, and a connection takes the router once, as it starts.
+    guard mu:
+        router: Router
 
 # a batteries-included App: the default `GET /healthz`, the built-in
 # observability middleware wrapping every route (metrics + a per-request trace
@@ -396,7 +405,7 @@ pub fn new() -> App:
 # opinionated, observable default.
 pub fn bare() -> App:
     healthz := fn(req: Request) => http.text(200, "ok")
-    return App([make_route("GET", "/healthz", healthz)], [], [], server_config())
+    return App(config: server_config(), router: Router([make_route("GET", "/healthz", healthz)], [], []))
 
 # return a copy of `routes` with `route` appended. building a new list keeps the
 # App builder pure: adding a route never mutates an App someone else is holding.
@@ -576,9 +585,9 @@ fn path_in_scope(parts: List[String], prefix_parts: List[String]) -> Bool:
 # the middleware onion for a path split into `parts`: app-wide first, then any
 # group middleware whose prefix covers it, so a group guard runs inside the
 # logging and metrics that wrap everything.
-fn chain_for(app: App, parts: List[String]) -> List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]:
-    mut chain := app.middleware
-    for scope in app.scoped:
+fn chain_for(router: Router, parts: List[String]) -> List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]:
+    mut chain := router.middleware
+    for scope in router.scoped:
         if path_in_scope(parts, scope.segments):
             chain = with_mw(chain, scope.mw)
     return chain
@@ -597,9 +606,9 @@ fn allow_method(seen: List[String], method: String) -> Bool:
 # OPTIONS comes last, since the router answers it for any path a route
 # claims. empty when no route matches the path at all. `any_path` lists the
 # methods of every route, which is what `OPTIONS *` asks about.
-fn allowed_methods(app: App, parts: List[String], any_path: Bool) -> String:
+fn allowed_methods(router: Router, parts: List[String], any_path: Bool) -> String:
     mut seen: List[String] := []
-    for route in app.routes:
+    for route in router.routes:
         if any_path or http.segments_match(parts, route.segments):
             allow_method(seen, route.method)
             if route.method == "GET":
@@ -612,11 +621,11 @@ fn allowed_methods(app: App, parts: List[String], any_path: Bool) -> String:
 # the pattern of the first route that matches this path under any method, so
 # a synthesized OPTIONS answer is labeled with the route it is about rather
 # than the raw path — the observability middleware uses it as a metric label.
-fn route_for_path(app: App, parts: List[String]) -> Route:
-    for route in app.routes:
+fn route_for_path(router: Router, parts: List[String]) -> Route:
+    for route in router.routes:
         if http.segments_match(parts, route.segments):
             return route
-    return app.routes[0]
+    return router.routes[0]
 
 # what an OPTIONS request is answered with: 204 and the methods the path
 # accepts. it closes over a small struct rather than the bare string for the
@@ -634,9 +643,9 @@ fn asterisk_options_handler(options: Options) -> fn(Request) -> http.HttpRespons
     return fn(req: Request) => http.response(200).header("Allow", options.allow)
 
 # run `route`'s handler inside the middleware onion for the path.
-fn run_route(app: App, route: Route, req: http.HttpRequestBytes, parts: List[String]) -> http.HttpResponse:
+fn run_route(router: Router, route: Route, req: http.HttpRequestBytes, parts: List[String]) -> http.HttpResponse:
     empty_values: Map[String, String] := {}
-    handler := wrap_middleware(chain_for(app, parts), route.handler)
+    handler := wrap_middleware(chain_for(router, parts), route.handler)
     return handler(Request(req, params_for(route, parts), route.pattern, empty_values))
 
 # the 301 a path that is not in canonical form gets (see http.clean_path),
@@ -670,13 +679,13 @@ fn clean_path_redirect(req: http.HttpRequestBytes, path: String) -> http.HttpRes
 #     through the middleware chain with the path's methods.
 #   * any other request to a path some route claims gets 405 with an Allow
 #     header, and a path no route claims gets 404. neither runs middleware.
-fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
+fn dispatch(router: Router, req: http.HttpRequestBytes) -> http.HttpResponse:
     method := req.method() catch "GET"
     path := req.path() catch "/"
     if method == "OPTIONS" and path == "*":
         empty_values: Map[String, String] := {}
         no_parts: List[String] := []
-        handler := wrap_middleware(chain_for(app, no_parts), asterisk_options_handler(Options(allowed_methods(app, no_parts, true))))
+        handler := wrap_middleware(chain_for(router, no_parts), asterisk_options_handler(Options(allowed_methods(router, no_parts, true))))
         return handler(Request(req, empty_values, "*", empty_values))
     if not http.path_is_clean(path):
         return clean_path_redirect(req, path)
@@ -684,22 +693,22 @@ fn dispatch(app: App, req: http.HttpRequestBytes) -> http.HttpResponse:
     is_head := method == "HEAD"
     mut get_index := -1
     mut i := 0
-    while i < app.routes.len():
-        route := app.routes[i]
+    while i < router.routes.len():
+        route := router.routes[i]
         if http.segments_match(parts, route.segments):
             if route.method == method:
-                return run_route(app, route, req, parts)
+                return run_route(router, route, req, parts)
             if is_head and get_index < 0 and route.method == "GET":
                 get_index = i
         i = i + 1
     if get_index >= 0:
-        return run_route(app, app.routes[get_index], req, parts)
-    allow := allowed_methods(app, parts, false)
+        return run_route(router, router.routes[get_index], req, parts)
+    allow := allowed_methods(router, parts, false)
     if allow.len() == 0:
         return http.not_found_response()
     if method == "OPTIONS":
-        options := make_route(method, route_for_path(app, parts).pattern, options_handler(Options(allow)))
-        return run_route(app, options, req, parts)
+        options := make_route(method, route_for_path(router, parts).pattern, options_handler(Options(allow)))
+        return run_route(router, options, req, parts)
     return http.method_not_allowed_response().header("Allow", allow)
 
 # serve one accepted connection to completion on its own task, then close it.
@@ -718,7 +727,8 @@ fn handle_conn(app: App, fd: Int):
     defer shutdown.leave()
     defer release_connection_slot()
     set_read_bound(fd, app.config)
-    http.serve_connection_fd_with(fd, fn(req: http.HttpRequestBytes) => dispatch(app, req), app.config) catch 0
+    router := app.current_router()
+    http.serve_connection_fd_with(fd, fn(req: http.HttpRequestBytes) => dispatch(router, req), app.config) catch 0
 
 # hand an accepted socket to its own task, counted in the drain from the moment
 # it was accepted — or refuse it, if the server is already at MAX_CONNECTIONS.
@@ -754,11 +764,12 @@ fn spawn_conn(app: App, fd: Int):
 # as the plaintext listen. the http/2 server closes the conn itself; the http/1.1
 # fallback does not, so we close it here. spawned per connection by listen_tls.
 fn handle_tls_conn(app: App, conn: tls.Conn):
+    router := app.current_router()
     if conn.negotiated_protocol() == "h2":
-        http2server.serve_h2_tls_connection(conn, fn(req: http.HttpRequestBytes) => dispatch(app, req))
+        http2server.serve_h2_tls_connection(conn, fn(req: http.HttpRequestBytes) => dispatch(router, req))
         return
     set_read_bound(conn.socket(), app.config)
-    http.serve_connection_tls_with(conn, fn(req: http.HttpRequestBytes) => dispatch(app, req), app.config) catch 0
+    http.serve_connection_tls_with(conn, fn(req: http.HttpRequestBytes) => dispatch(router, req), app.config) catch 0
     conn.close()
 
 # handshake an accepted socket and serve it. spawned per connection by
@@ -797,6 +808,12 @@ fn spawn_tls_conn(app: App, listener_handle: Int, fd: Int):
     spawn handle_tls_socket(app, listener_handle, fd)
 
 impl App:
+    # the router, read under the app's mutex. the builder never changes a
+    # router in place, so the caller can keep using it after the lock.
+    fn current_router() -> Router:
+        locked self.mu:
+            return self.router
+
     # register a route for any method. returns a new App, so calls chain. get,
     # post, put, patch, delete and head are this with the method filled in.
     #
@@ -806,7 +823,8 @@ impl App:
     # nothing; any other segment must match exactly once the request's
     # segment is percent-decoded.
     fn handle(method: String, pattern: String, handler: fn(Request) -> http.HttpResponse) -> App:
-        return App(with_route(self.routes, make_route(method, pattern, handler)), self.middleware, self.scoped, self.config)
+        r := self.current_router()
+        return App(config: self.config, router: Router(with_route(r.routes, make_route(method, pattern, handler)), r.middleware, r.scoped))
 
     # register a GET route. it answers HEAD too, unless a HEAD route for the
     # same path comes first. returns a new App, so calls chain:
@@ -853,7 +871,7 @@ impl App:
     # middleware and the 301, 404 and 405 answers all apply. it is what an
     # http.serve_* loop or a test hands requests to.
     fn serve(req: http.HttpRequestBytes) -> http.HttpResponse:
-        return dispatch(self, req)
+        return dispatch(self.current_router(), req)
 
     # register a middleware. returns a new App, so calls chain alongside routes.
     # the first middleware registered runs outermost: it sees the request first
@@ -865,7 +883,8 @@ impl App:
     #
     # here logging wraps auth wraps home.
     fn use_mw(mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse) -> App:
-        return App(self.routes, with_mw(self.middleware, mw), self.scoped, self.config)
+        r := self.current_router()
+        return App(config: self.config, router: Router(r.routes, with_mw(r.middleware, mw), r.scoped))
 
     # bind a middleware to a path prefix: it wraps only the routes that live
     # under that prefix, and runs after (inside) the app-wide middleware. the
@@ -879,11 +898,12 @@ impl App:
     #
     # `/login` and `/healthz` stay open; everything under `/api` is guarded.
     fn group(prefix: String, mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse) -> App:
+        r := self.current_router()
         mut out: List[Scoped] := []
-        for existing in self.scoped:
+        for existing in r.scoped:
             out.push(existing)
         out.push(Scoped(prefix, http.path_segments(prefix), mw))
-        return App(self.routes, self.middleware, out, self.config)
+        return App(config: self.config, router: Router(r.routes, r.middleware, out))
 
     # use `config` for the connections listen() and listen_tls() serve over
     # http/1.1: their timeouts, request-size limits and keep-alive policy. the
@@ -892,7 +912,7 @@ impl App:
     #   config := web.server_config().with_read_timeout(30000).with_max_body_bytes(1048576)
     #   app := web.new().with_config(config).get("/", home)
     fn with_config(config: http.ServerConfig) -> App:
-        return App(self.routes, self.middleware, self.scoped, config)
+        return App(config: config, router: self.current_router())
 
     # bind host:port and serve, one task per connection. this blocks, so it is
     # usually the last thing main does; spawn it if you need to keep going.
@@ -943,8 +963,8 @@ impl App:
     # reach for listen_tls when you want http/2 with encryption. this blocks, like
     # listen; spawn it if you need to keep going.
     fn listen_h2c(host: String, port: Int) -> Int!:
-        app := self
-        return http2server.listen_h2c(host, port, fn(req: http.HttpRequestBytes) => dispatch(app, req))!
+        router := self.current_router()
+        return http2server.listen_h2c(host, port, fn(req: http.HttpRequestBytes) => dispatch(router, req))!
 
     # bind host:port and serve forever over tls, negotiating http/2 when the client
     # supports it and falling back to http/1.1 on the same connection otherwise.
@@ -1138,7 +1158,7 @@ struct ParsedUser:
 # without standing up a server. only body() is exercised here, so the rest of the
 # request fields are left empty.
 fn request_with_body(body: String) -> Request:
-    raw := http.HttpRequestBytes(bytes.empty(), bytes.from_string_utf8(body), "POST", "/users", "", "HTTP/1.1", "", body, {}, {}, [])
+    raw := http.HttpRequestBytes(head: bytes.empty(), body: bytes.from_string_utf8(body), method_text: "POST", path_text: "/users", query_text: "", version_text: "HTTP/1.1", headers_text: "", body_text_cache: body, header_map: {}, query_map: {}, path_parts_cache: [])
     return Request(raw, {}, "/users", {})
 
 test "web.parse decodes a valid json body into a typed struct":
@@ -1316,7 +1336,7 @@ test "a web.App served over h2c returns a 404 body for an unmatched path":
 # a bare request for dispatch, so the routing tests below need no socket at
 # all. only the method and path are read on this path.
 fn request_for(method: String, path: String) -> http.HttpRequestBytes:
-    return http.HttpRequestBytes(bytes.empty(), bytes.empty(), method, path, "", "HTTP/1.1", "", "", {}, {}, [])
+    return http.HttpRequestBytes(head: bytes.empty(), body: bytes.empty(), method_text: method, path_text: path, query_text: "", version_text: "HTTP/1.1", headers_text: "", body_text_cache: "", header_map: {}, query_map: {}, path_parts_cache: [])
 
 fn show_user(req: Request) -> http.HttpResponse:
     return http.text(200, "user " + req.param("id"))
@@ -1326,14 +1346,14 @@ fn create_user(req: Request) -> http.HttpResponse:
 
 test "OPTIONS on a known path answers with the methods that path accepts":
     app := bare().get("/users/:id", show_user).post("/users/:id", create_user)
-    resp := dispatch(app, request_for("OPTIONS", "/users/42"))
+    resp := dispatch(app.current_router(), request_for("OPTIONS", "/users/42"))
 
     assert_eq(resp.status, 204)
     assert_eq(resp.header_value("Allow"), "GET, HEAD, POST, OPTIONS")
 
 test "OPTIONS * answers with every method the app serves":
     app := bare().get("/users/:id", show_user).post("/users", create_user).get("/about", show_user)
-    resp := dispatch(app, request_for("OPTIONS", "*"))
+    resp := dispatch(app.current_router(), request_for("OPTIONS", "*"))
 
     assert_eq(resp.status, 200)
     assert_eq(resp.header_value("Allow"), "GET, HEAD, POST, OPTIONS")
@@ -1343,7 +1363,7 @@ test "OPTIONS * answers with every method the app serves":
 
 test "OPTIONS on a path no route claims is still a 404":
     app := bare().get("/users/:id", show_user)
-    resp := dispatch(app, request_for("OPTIONS", "/orders/42"))
+    resp := dispatch(app.current_router(), request_for("OPTIONS", "/orders/42"))
 
     assert_eq(resp.status, 404)
 
@@ -1351,7 +1371,7 @@ test "the synthesized OPTIONS answer runs through the middleware chain":
     # this is what makes cors preflight reachable: without it an OPTIONS
     # request would 404 before any middleware got to look at it.
     app := bare().use_mw(bracket_a).get("/about", show_user)
-    resp := dispatch(app, request_for("OPTIONS", "/about"))
+    resp := dispatch(app.current_router(), request_for("OPTIONS", "/about"))
 
     assert_eq(resp.body_text()!, "a()")
 
@@ -1362,25 +1382,25 @@ test "a group guard is not bypassed by a leading or doubled empty path segment":
     # "//api/items" and "/api//items" are redirected to "/api/items" before
     # any route runs, so neither reaches the guarded handler unguarded.
     app := bare().group("/api", deny_group).get("/api/items", show_user)
-    assert_eq(dispatch(app, request_for("GET", "/api/items")).status, 401)
+    assert_eq(dispatch(app.current_router(), request_for("GET", "/api/items")).status, 401)
     for doubled in ["//api/items", "/api//items"]:
-        resp := dispatch(app, request_for("GET", doubled))
+        resp := dispatch(app.current_router(), request_for("GET", doubled))
         assert_eq(resp.status, 301)
         assert_eq(resp.header_value("Location"), "/api/items")
     # a trailing slash is not redirected, and the scope check sees it as the
     # same path the router does.
-    assert_eq(dispatch(app, request_for("GET", "/api/items/")).status, 401)
+    assert_eq(dispatch(app.current_router(), request_for("GET", "/api/items/")).status, 401)
     # a path genuinely outside the group is still unguarded.
     open_app := bare().group("/api", deny_group).get("/items", show_user)
-    assert_eq(dispatch(open_app, request_for("GET", "/items")).status, 200)
+    assert_eq(open_app.serve(request_for("GET", "/items")).status, 200)
 
 test "a group guard also wraps the synthesized OPTIONS answer":
     app := bare().group("/api", bracket_b).get("/api/items", show_user)
-    resp := dispatch(app, request_for("OPTIONS", "/api/items"))
+    resp := dispatch(app.current_router(), request_for("OPTIONS", "/api/items"))
 
     assert_eq(resp.body_text()!, "b()")
     # a path outside the group is not wrapped by it.
-    outside := dispatch(bare().group("/api", bracket_b).get("/items", show_user), request_for("OPTIONS", "/items"))
+    outside := bare().group("/api", bracket_b).get("/items", show_user).serve(request_for("OPTIONS", "/items"))
     assert_eq(outside.status, 204)
 
 fn always_pong(req: Request) -> http.HttpResponse:

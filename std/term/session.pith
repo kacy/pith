@@ -52,10 +52,13 @@ pub struct Terminal:
     mut rows: Int
     mut running: Bool
     mut closed: Bool
-    opts: Options
-    mut pending_out: List[String]
     mut reader: Task[Int]
     mut waiter: Task[Int]
+    # the reader task reads the options, so they and the queued output sit
+    # under out_mu
+    guard out_mu:
+        opts: Options
+        mut pending_out: List[String]
 
 # how long the reader sleeps per poll when nothing is pending. bounded so
 # close() never waits on a read parked forever against an idle terminal.
@@ -129,7 +132,8 @@ fn reader_loop(t: Terminal) -> Int:
     while t.running:
         mut wait_ms := IDLE_READ_MS
         if input.pending(p):
-            wait_ms = t.opts.esc_timeout_ms
+            locked t.out_mu:
+                wait_ms = t.opts.esc_timeout_ms
         r := tty.read(4096, wait_ms)
         if not r.is_ok:
             if t.running:
@@ -176,14 +180,17 @@ impl Terminal:
     # composed of many small writes, and one syscall per frame beats one
     # per fragment.
     fn write(s: String):
-        self.pending_out.push(s)
+        locked self.out_mu:
+            self.pending_out.push(s)
 
     # write everything queued in one call. returns the byte count.
     fn flush() -> Int!:
-        if self.pending_out.len() == 0:
-            return 0
-        joined := self.pending_out.join("")
-        self.pending_out = []
+        mut joined := ""
+        locked self.out_mu:
+            if self.pending_out.len() == 0:
+                return 0
+            joined = self.pending_out.join("")
+            self.pending_out = []
         return tty.write_str(joined)!
 
     # restore the terminal and stop the session: leave the modes in reverse
@@ -196,8 +203,11 @@ impl Terminal:
             return
         self.closed = true
         self.running = false
-        self.pending_out = []
-        tty.write_str(leave_sequence(self.opts)) catch 0
+        mut leave := ""
+        locked self.out_mu:
+            self.pending_out = []
+            leave = leave_sequence(self.opts)
+        tty.write_str(leave) catch 0
         tty.restore()
         await self.reader
         await self.waiter

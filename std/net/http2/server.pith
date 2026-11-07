@@ -208,25 +208,40 @@ struct ServerConn:
     mut transport: Int
     mut buf: Bytes
     mut pos: Int
-    mut encoder: hpack.Encoder
-    mut decoder: hpack.Decoder
     mut sent: Bytes
+    guard hpack_mu:
+        mut encoder: hpack.Encoder
+        mut decoder: hpack.Decoder
 
 # build a live server connection over an accepted cleartext tcp socket (h2c).
 fn new_live_server_conn(fd: Int) -> ServerConn:
-    return ServerConn(fd, 0, TRANSPORT_TCP, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), bytes.empty())
+    return ServerConn(fd: fd, tls_handle: 0, transport: TRANSPORT_TCP, buf: bytes.empty(), pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # build a live server connection over an accepted tls session (h2 via alpn). the
 # handle addresses the same tls session the h2 client reads and writes over.
 fn new_tls_server_conn(handle: Int) -> ServerConn:
-    return ServerConn(0, handle, TRANSPORT_TLS, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), bytes.empty())
+    return ServerConn(fd: 0, tls_handle: handle, transport: TRANSPORT_TLS, buf: bytes.empty(), pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # build an offline server connection that reads `data` as if it arrived from a
 # client. used by the tests to drive the reader over a constructed frame stream.
 fn server_conn_from_bytes(data: Bytes) -> ServerConn:
-    return ServerConn(0, 0, TRANSPORT_OFFLINE, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), bytes.empty())
+    return ServerConn(fd: 0, tls_handle: 0, transport: TRANSPORT_OFFLINE, buf: data, pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 impl ServerConn:
+    # the hpack encoder and decoder, under hpack_mu: the reader decodes, and
+    # the writer and a settings frame from the reader both use the encoder.
+    fn encode_block(fields: List[hpack.HeaderField]) -> Bytes:
+        locked self.hpack_mu:
+            return self.encoder.encode(fields)
+
+    fn decode_block(block: Bytes) -> List[hpack.HeaderField]!:
+        locked self.hpack_mu:
+            return self.decoder.decode(block)!
+
+    fn set_encoder_table_size(size: Int):
+        locked self.hpack_mu:
+            self.encoder.set_max_table_size(size)
+
     # read one transport chunk: from the tcp socket or the tls session when live,
     # otherwise nothing (the offline buffer is exhausted, which reads as
     # end-of-stream).
@@ -709,7 +724,7 @@ fn response_trailer_fields(response: http.HttpResponse) -> List[hpack.HeaderFiel
 # afterward (see send_stream_data). runs only on the writer task, the sole owner
 # of the encoder and the socket.
 fn send_headers(conn: ServerConn, stream_id: Int, fields: List[hpack.HeaderField], end_stream: Bool) -> Int!:
-    block := conn.encoder.encode(fields)
+    block := conn.encode_block(fields)
     conn.send_frame(frames.headers_frame(stream_id, block, end_stream, true))!
     return 0
 
@@ -1011,7 +1026,7 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
         block := server.conn.read_header_block(hf)!
         # decode in receive order to keep the single hpack decoder in step, even
         # for a stream we are about to refuse.
-        fields := server.conn.decoder.decode(block)!
+        fields := server.conn.decode_block(block)!
         open_stream(server, hf, fields)
         return true
     if t == frames.FRAME_DATA:
@@ -1063,7 +1078,7 @@ fn apply_peer_settings(server: Server, settings: List[frames.Setting]):
     locked server.mu:
         for s in settings:
             if s.id == SETTINGS_HEADER_TABLE_SIZE:
-                server.conn.encoder.set_max_table_size(s.value)
+                server.conn.set_encoder_table_size(s.value)
             elif s.id == SETTINGS_MAX_FRAME_SIZE:
                 server.peer_max_frame_size = s.value
             elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:

@@ -187,7 +187,6 @@ pub fn start(service_name: String, service_version: String, service_instance_id:
         started = true
         running = true
 
-    dest := otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol).with_headers(headers).with_timeout(timeout_ms).with_compression(compression)
     # install the sampler before turning tracing on so the first span already
     # sees the right decision.
     trace.set_sampler_from_name(sampler_name, sampler_arg)
@@ -199,8 +198,9 @@ pub fn start(service_name: String, service_version: String, service_instance_id:
     # run_exporter answers with flush_done() when that export has finished.
     lifecycle.expect_flush()
     # a bare, unqualified call so `spawn` accepts it; the task detaches and runs
-    # for the process lifetime (until shutdown()).
-    spawn run_exporter(dest, tick, metric_interval_ms)
+    # for the process lifetime (until shutdown()). the target is built in the
+    # spawn's arguments, so the task holds the only reference to its headers.
+    spawn run_exporter(otlp.target_with_resource(service_name, service_version, service_instance_id, endpoint, protocol).with_headers(headers).with_timeout(timeout_ms).with_compression(compression), tick, metric_interval_ms)
 
 # read the OTEL_* environment and turn observability on. with no
 # OTEL_EXPORTER_OTLP_ENDPOINT set, this does nothing. one call wires up tracing,

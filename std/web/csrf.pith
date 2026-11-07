@@ -206,7 +206,7 @@ fn test_secret() -> Bytes:
 # a request built by hand, so the tests need no socket. `extra` carries the
 # Cookie, the token header, or a Content-Type, whichever the case is about.
 fn request_of(method: String, extra: Map[String, String], body: String) -> web.Request:
-    raw := http.HttpRequestBytes(bytes.empty(), bytes.empty(), method, "/transfer", "", "HTTP/1.1", "", body, extra, {}, [])
+    raw := http.HttpRequestBytes(head: bytes.empty(), body: bytes.empty(), method_text: method, path_text: "/transfer", query_text: "", version_text: "HTTP/1.1", headers_text: "", body_text_cache: body, header_map: extra, query_map: {}, path_parts_cache: [])
     return web.Request(raw, {}, "/transfer", {})
 
 fn cookie_pair(resp: http.HttpResponse, name: String) -> String:

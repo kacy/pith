@@ -203,9 +203,10 @@ pass data between tasks through a channel rather than sharing a
 mutable collection. a channel hands the value over instead of aliasing
 it, so each task mutates its own. immutable values and independent
 copies (`std.collections.copy_list` and friends) are also safe to
-hand off. the checker enforces this only for a `spawn` argument: passing
-a collection the current scope still holds reports E248. a collection
-reached through a global or a struct field is not checked.
+hand off. the checker enforces this for a `spawn` argument: passing a
+collection the current scope still holds reports E248, and so does a struct
+whose fields reach a collection outside a `guard` block. a global is covered
+by the sharing rule (E309).
 
 when a channel is the wrong shape — a registry every request reads and a
 few requests write, a counter, a cap on how many things run at once — reach

@@ -219,7 +219,7 @@ pub fn middleware(policy: Policy) -> fn(fn(web.Request) -> http.HttpResponse, we
 
 # a request carrying the given headers, built without standing up a server.
 fn request_with_headers(method: String, headers: Map[String, String]) -> web.Request:
-    raw := http.HttpRequestBytes(bytes.empty(), bytes.empty(), method, "/api/items", "", "HTTP/1.1", "", "", headers, {}, [])
+    raw := http.HttpRequestBytes(head: bytes.empty(), body: bytes.empty(), method_text: method, path_text: "/api/items", query_text: "", version_text: "HTTP/1.1", headers_text: "", body_text_cache: "", header_map: headers, query_map: {}, path_parts_cache: [])
     return web.Request(raw, {}, "/api/items", {})
 
 fn ok_handler(req: web.Request) -> http.HttpResponse:

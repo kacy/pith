@@ -165,8 +165,8 @@ unrelated. the lint names the global and the spawn.
 
 struct fields are out of scope for the rule in this design. a struct that
 crosses to a task through `spawn` is already E248 if it is a collection, and a
-struct holding collections is a known E248 gap. widening E248 to structs is a
-separate, smaller change and is listed under "open questions".
+struct holding collections was a known E248 gap, since closed (see "as
+built").
 
 ## the examples, before and after
 
@@ -513,6 +513,15 @@ build settled a question this page left open, or departed from it:
   `recv`, and the std file, tcp, tls and websocket reads. a channel send is
   left out, because the HTTP/2 client sends its frames under `mu` to keep
   stream ids in order. std, the examples and the compiler lint clean.
+- **E248 and structs.** a struct passed to `spawn` is refused when one of
+  its fields reaches a list, a map or a set outside a `guard` block. moving
+  std under the rule put the http/2 hpack encoder and decoder under
+  `hpack_mu` on both connection types, std.web's routes under the app's
+  mutex (a connection takes them once, as it starts), and a request's header,
+  query and path maps under `fields_mu`, along with the grpc channel's
+  credentials, the stream reader's header blocks, the http/2 pool's client
+  list and the terminal's options and output queue. std.obs builds its
+  export target in the spawn's arguments instead.
 - **lock order.** E311 is a lint for two mutexes taken in opposite orders
   anywhere in the program. it records each mutex taken while another is held,
   directly or in a function called under the lock through a call the checker
@@ -537,10 +546,6 @@ build settled a question this page left open, or departed from it:
 - **the sharded form.** `guard shard_mu[8]:` fixes the count at compile time,
   which matches std/metrics.pith, std/trace.pith and the TLS connection
   shards. a shard count chosen at run time would need another form.
-- **struct fields and the sharing rule.** E248 misses a struct holding a
-  collection. widening it to structs whose fields are collections, unless
-  those fields are in a `guard` block, would close that gap and is a smaller
-  change than this one.
 - **`RwMutex`.** nothing here needs a reader-writer lock, and std does not
   have one. if one is added, `guard` applies unchanged and `locked` would
   take a mode.

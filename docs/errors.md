@@ -504,6 +504,18 @@ error[E248]: a spawned task cannot take a list this scope still holds; both thre
                             ^
 ```
 
+a struct argument is refused the same way when one of its fields reaches a
+list, a map or a set outside a `guard` block, directly or through a nested
+struct or optional struct field. move the field into a `guard` block, or build
+the struct in the spawn's arguments so the task holds the only reference.
+
+```
+error[E248]: a spawned task cannot take this Account: its field 'inbox.messages' is a collection outside a `guard` block, and both threads would reach the same buffer
+  16 |     t := spawn count(acct)
+                            ^
+  fix: move the field into a `guard` block, or hand the task its own copy
+```
+
 ### E249 — weak field must be an optional struct
 
 ```

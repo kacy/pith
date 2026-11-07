@@ -148,8 +148,10 @@ pub struct Conn:
     client: http2.Client
     authority: String
     # metadata sent on every call over this channel — credentials, usually.
-    # set_credentials fills it; empty means the channel adds nothing.
-    credentials: List[String]
+    # set_credentials fills it; empty means the channel adds nothing. calls
+    # on other tasks read it, so it sits under credentials_mu.
+    guard credentials_mu:
+        credentials: List[String]
 
 # an empty credential list, typed for the Conn field.
 fn no_credentials() -> List[String]:
@@ -169,16 +171,18 @@ impl Conn:
     ## metadata still goes through the *_with_headers forms, and is appended
     ## after these, so a call can add to them but not silently drop them.
     pub fn set_credentials(metadata: List[String]):
-        self.credentials = metadata
+        locked self.credentials_mu:
+            self.credentials = metadata
 
     # this channel's credentials followed by `extra`, which is what every call
     # actually sends.
     fn call_metadata(extra: List[String]) -> List[String]:
-        if self.credentials.len() == 0:
-            return extra
         mut out: List[String] := []
-        for item in self.credentials:
-            out.push(item)
+        locked self.credentials_mu:
+            if self.credentials.len() == 0:
+                return extra
+            for item in self.credentials:
+                out.push(item)
         for item in extra:
             out.push(item)
         return out
@@ -678,12 +682,15 @@ pub struct StreamMessage:
 pub struct StreamReader:
     mut deframer: Deframer
     mut done: Bool
-    mut headers: List[hpack.HeaderField]
-    mut trailers: List[hpack.HeaderField]
+    # a bidi stream sends on one task and receives on another, so the header
+    # blocks sit under headers_mu
+    guard headers_mu:
+        mut headers: List[hpack.HeaderField]
+        mut trailers: List[hpack.HeaderField]
 
 fn new_stream_reader() -> StreamReader:
     empty: List[hpack.HeaderField] := []
-    return StreamReader(new_deframer(), false, empty, empty)
+    return StreamReader(deframer: new_deframer(), done: false, headers: empty, trailers: empty)
 
 impl StreamReader:
     # apply one stream event: a HEADERS block is stored as the response headers or,
@@ -693,10 +700,11 @@ impl StreamReader:
         if ev.is_reset():
             fail GrpcError(GRPC_INTERNAL, "grpc: stream reset (error code {ev.error_code})")
         if ev.is_headers():
-            if has_header(ev.headers, "grpc-status"):
-                self.trailers = ev.headers
-            else:
-                self.headers = ev.headers
+            locked self.headers_mu:
+                if has_header(ev.headers, "grpc-status"):
+                    self.trailers = ev.headers
+                else:
+                    self.headers = ev.headers
             if ev.end:
                 self.done = true
         elif ev.is_data():
@@ -718,13 +726,15 @@ impl StreamReader:
     # the terminal grpc-status, from the trailers (or the initial headers / the
     # http status), read once the stream has finished.
     fn final_status() -> Int:
-        mut http_status := parse_status(find_header(self.headers, ":status"))
-        if http_status == 0:
-            http_status = 200
-        return status_from(self.headers, self.trailers, http_status)
+        locked self.headers_mu:
+            mut http_status := parse_status(find_header(self.headers, ":status"))
+            if http_status == 0:
+                http_status = 200
+            return status_from(self.headers, self.trailers, http_status)
 
     fn final_message() -> String:
-        return message_from(self.headers, self.trailers)
+        locked self.headers_mu:
+            return message_from(self.headers, self.trailers)
 
 # pull one message from an in-progress stream: hand back a buffered message if the
 # reader has one, else read stream events until a message completes or the stream

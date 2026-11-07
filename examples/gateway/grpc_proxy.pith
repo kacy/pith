@@ -26,10 +26,13 @@ struct Target:
     mut conn: grpc.Conn?
 
 pub struct Proxy:
-    targets: List[Target]
     next: AtomicInt
     check: auth.Verifier
     requires_auth: Bool
+    # every grpc call's task picks from the targets, so they sit under
+    # targets_mu. the list is never changed after the proxy is built.
+    guard targets_mu:
+        targets: List[Target]
 
 # a proxy for the configured grpc upstreams.
 pub fn proxy(cfg: config.Config) -> Proxy!:
@@ -37,7 +40,7 @@ pub fn proxy(cfg: config.Config) -> Proxy!:
     for address in cfg.server.grpc_upstreams:
         parts := config.split_address(address)!
         targets.push(Target(address, parts.host, parts.port, parts.use_tls, cfg.server.upstream_ca, Mutex(), none))
-    return Proxy(targets, AtomicInt(0), auth.verifier(cfg.auth), cfg.server.grpc_auth)
+    return Proxy(next: AtomicInt(0), check: auth.verifier(cfg.auth), requires_auth: cfg.server.grpc_auth, targets: targets)
 
 impl Target:
     fn connection() -> grpc.Conn!:
@@ -100,11 +103,14 @@ fn record(address: String, status: Int):
 impl Proxy:
     # open the upstream stream on the next target that takes it.
     fn open(full_method: String, headers: List[String]) -> (Target, grpc.BidiStream)!grpc.GrpcError:
-        n := self.targets.len()
+        mut targets: List[Target] := []
+        locked self.targets_mu:
+            targets = self.targets
+        n := targets.len()
         start := self.next.load()
         self.next.compare_set(start, start + 1)
         for i in 0..n:
-            target := self.targets[(start + i) % n]
+            target := targets[(start + i) % n]
             connected := target.connection()
             if connected.is_ok:
                 opened := connected.ok.bidi_stream_with_headers(full_method, headers)

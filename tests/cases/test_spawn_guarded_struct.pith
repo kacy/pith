@@ -1,0 +1,42 @@
+# a struct handed to a task passes E248 when every collection it reaches is in
+# a guard block, or when the struct is built in the spawn's own arguments
+struct Inbox:
+    owner: String
+    guard mu:
+        messages: List[String]
+
+impl Inbox:
+    fn post(text: String):
+        locked self.mu:
+            self.messages.push(text)
+
+    fn count() -> Int:
+        locked self.mu:
+            return self.messages.len()
+
+struct Plain:
+    items: List[Int]
+
+fn post_many(inbox: Inbox, n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        inbox.post("m")
+        i = i + 1
+    return n
+
+fn total(p: Plain) -> Int:
+    mut sum := 0
+    for x in p.items:
+        sum = sum + x
+    return sum
+
+fn main() -> Int:
+    inbox := Inbox(owner: "a", messages: [])
+    a := spawn post_many(inbox, 100)
+    b := spawn post_many(inbox, 100)
+    await a
+    await b
+    print("posted {inbox.count()}")
+    t := spawn total(Plain(items: [1, 2, 3]))
+    print("total {await t}")
+    return 0

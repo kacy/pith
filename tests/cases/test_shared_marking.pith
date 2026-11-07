@@ -12,7 +12,9 @@ struct Node:
     leaf: Leaf
     mut next: Node?
     weak back: Node?
-    items: List[Leaf]
+    # several tasks walk one node, so its list sits under items_mu
+    guard items_mu:
+        items: List[Leaf]
 
 struct Box:
     mut held: Node?
@@ -29,8 +31,9 @@ fn make(n: Int) -> Node:
 
 fn walk(node: Node) -> Int:
     mut total := node.leaf.n
-    for it in node.items:
-        total = total + it.n
+    locked node.items_mu:
+        for it in node.items:
+            total = total + it.n
     if node.next != none:
         total = total + node.next.value().leaf.n
     return total

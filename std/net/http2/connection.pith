@@ -112,8 +112,6 @@ pub struct Connection:
     mut live: Bool
     mut buf: Bytes
     mut pos: Int
-    mut encoder: hpack.Encoder
-    mut decoder: hpack.Decoder
     mut next_stream_id: Int
     mut sent: Bytes
     # true for an h2c (plaintext) connection: the handle is a raw socket fd and
@@ -121,19 +119,22 @@ pub struct Connection:
     mut plaintext: Bool
     # the most a unary response body may hold (see MAX_RESPONSE_BODY).
     mut max_response_body: Int
+    guard hpack_mu:
+        mut encoder: hpack.Encoder
+        mut decoder: hpack.Decoder
 
 # build a live connection over an established tls session handle.
 fn new_live_connection(handle: Int) -> Connection:
-    return Connection(handle, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), false, MAX_RESPONSE_BODY)
+    return Connection(tls_handle: handle, live: true, buf: bytes.empty(), pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: false, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # build a live h2c (plaintext) connection over an open socket fd.
 fn new_h2c_connection(fd: Int) -> Connection:
-    return Connection(fd, true, bytes.empty(), 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), true, MAX_RESPONSE_BODY)
+    return Connection(tls_handle: fd, live: true, buf: bytes.empty(), pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: true, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # build an offline connection that reads `data` as if it arrived from a peer.
 # used by the tests to drive the read loop over a constructed frame stream.
 fn connection_from_frames(data: Bytes) -> Connection:
-    return Connection(0, false, data, 0, hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE), 1, bytes.empty(), false, MAX_RESPONSE_BODY)
+    return Connection(tls_handle: 0, live: false, buf: data, pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: false, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # the SETTINGS frame the client opens with: no server push, the default window,
 # and the default max frame size (so a peer must not send larger frames).
@@ -168,6 +169,20 @@ fn request_fields(method: String, scheme: String, authority: String, path: Strin
     return fields
 
 impl Connection:
+    # the hpack encoder and decoder, under hpack_mu: the reader decodes, and
+    # the writer and a settings frame from the reader both use the encoder.
+    fn encode_block(fields: List[hpack.HeaderField]) -> Bytes:
+        locked self.hpack_mu:
+            return self.encoder.encode(fields)
+
+    fn decode_block(block: Bytes) -> List[hpack.HeaderField]!:
+        locked self.hpack_mu:
+            return self.decoder.decode(block)!
+
+    fn set_encoder_table_size(size: Int):
+        locked self.hpack_mu:
+            self.encoder.set_max_table_size(size)
+
     # the request :scheme pseudo-header: "http" for an h2c connection, "https"
     # over tls.
     fn scheme() -> String:
@@ -312,7 +327,7 @@ impl Connection:
                 hf := frames.parse_headers(frame)!
                 block := self.read_header_block(hf)!
                 # always decode to keep the hpack dynamic table in lockstep.
-                decoded := self.decoder.decode(block)!
+                decoded := self.decode_block(block)!
                 if hf.stream_id == stream_id:
                     # the first header block is the response; a later one (after
                     # the body has begun) is the trailers.
@@ -367,7 +382,7 @@ impl Connection:
     fn request_get(authority: String, path: String) -> Response!:
         stream_id := self.next_stream_id
         self.next_stream_id = self.next_stream_id + 2
-        block := self.encoder.encode(request_fields("GET", self.scheme(), authority, path, NO_FIELDS))
+        block := self.encode_block(request_fields("GET", self.scheme(), authority, path, NO_FIELDS))
         self.send_frame(frames.headers_frame(stream_id, block, true, true))!
         return self.read_response(stream_id)!
 
@@ -806,35 +821,40 @@ pub fn open_url(url_string: String) -> Client!:
 # grpc clients open multiple subchannels. keep n at or below the core count for
 # a throughput gain; close() shuts every connection down.
 pub struct Pool:
-    clients: List[Client]
     guard pick:
+        clients: List[Client]
         mut next: Int
 
 impl Pool:
-    # the index of the next connection, round-robin, safe across concurrent callers.
-    fn choose() -> Int:
+    # the next connection, round-robin, safe across concurrent callers.
+    fn choose() -> Client:
         locked self.pick:
-            i := self.next
+            c := self.clients[self.next]
             self.next = (self.next + 1) % self.clients.len()
-            return i
+            return c
+
+    # every pooled connection. the list is never changed after the pool opens.
+    fn all_clients() -> List[Client]:
+        locked self.pick:
+            return self.clients
 
     # send a request over the next pooled connection; otherwise like Client.request.
     pub fn request(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes) -> Response!:
-        return self.clients[self.choose()].request(method, authority, path, extra, body)
+        return self.choose().request(method, authority, path, extra, body)
 
     # open a stream over the next pooled connection; otherwise like Client.open_stream.
     pub fn open_stream(method: String, authority: String, path: String, extra: List[hpack.HeaderField], end_stream: Bool) -> Stream!:
-        return self.clients[self.choose()].open_stream(method, authority, path, extra, end_stream)
+        return self.choose().open_stream(method, authority, path, extra, end_stream)
 
     # set every pooled connection's response body limit; see
     # Client.set_max_response_body_bytes.
     pub fn set_max_response_body_bytes(limit: Int):
-        for c in self.clients:
+        for c in self.all_clients():
             c.set_max_response_body_bytes(limit)
 
     # close every pooled connection.
     pub fn close():
-        for c in self.clients:
+        for c in self.all_clients():
             c.close()
 
 # open a pool of n http/2 connections to host:port over tls (alpn "h2"), trusting
@@ -970,7 +990,7 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
         hf := frames.parse_headers(frame)!
         block := client.conn.read_header_block(hf)!
         # decode in receive order to keep the single hpack table in step.
-        decoded := client.conn.decoder.decode(block)!
+        decoded := client.conn.decode_block(block)!
         if accumulating(client, accums, hf.stream_id):
             a := accums[hf.stream_id]
             # the first header block is the response headers; a later one (after
@@ -1267,7 +1287,7 @@ fn apply_settings(client: Client, settings: List[frames.Setting]):
     locked client.mu:
         for s in settings:
             if s.id == SETTINGS_HEADER_TABLE_SIZE:
-                client.conn.encoder.set_max_table_size(s.value)
+                client.conn.set_encoder_table_size(s.value)
             elif s.id == SETTINGS_MAX_FRAME_SIZE:
                 client.peer_max_frame_size.store(s.value)
             elif s.id == SETTINGS_MAX_HEADER_LIST_SIZE:
@@ -1567,7 +1587,7 @@ impl Client:
                     self.active.push(stream_id)
                     self.send_windows.insert(stream_id, self.peer_initial_window)
                     self.credit.insert(stream_id, Channel[Int](CREDIT_POKE_CAP))
-                    block := self.conn.encoder.encode(fields)
+                    block := self.conn.encode_block(fields)
                     built := header_block_wire(stream_id, block, end_stream, self.peer_max_frame_size.load())
                     if built.is_err:
                         build_error = built.err
@@ -1708,7 +1728,7 @@ impl Client:
         # and the decoder (the reader and writer stay parked until the client
         # promotes), so no mutex is needed here.
         stream_id := self.take_stream_id()
-        block := self.conn.encoder.encode(fields)
+        block := self.conn.encode_block(fields)
         mut wire := frames.frame_bytes(frames.headers_frame(stream_id, block, not has_body, true))!
         if has_body:
             # HEADERS and DATA ride one write (one tls record, one syscall)

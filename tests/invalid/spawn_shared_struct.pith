@@ -1,0 +1,18 @@
+# a struct whose field reaches a list outside a guard block is one buffer two
+# tasks would share, as a bare list is (E248)
+struct Inbox:
+    owner: String
+    messages: List[String]
+
+struct Account:
+    name: String
+    inbox: Inbox
+
+fn count(a: Account) -> Int:
+    return a.inbox.messages.len()
+
+fn main() -> Int!:
+    acct := Account(name: "a", inbox: Inbox(owner: "a", messages: ["hi"]))
+    t := spawn count(acct)
+    print((await t).to_string())
+    return 0

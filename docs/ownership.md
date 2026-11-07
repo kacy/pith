@@ -859,9 +859,9 @@ plain buffer behind a handle, so two tasks mutating the same collection race
 on that buffer.
 
 the rule: **do not share a mutable collection across tasks — pass data
-through a channel instead.** the checker enforces it only at a `spawn`
-argument (E248); a collection reached through a global or a struct field
-is not checked. a
+through a channel instead.** the checker enforces it at a `spawn`
+argument (E248), for a collection and for a struct whose fields reach one
+outside a `guard` block, and for a global through the sharing rule (E309). a
 channel hands the value over rather than aliasing it, which keeps each
 task's mutations to itself. immutable values and independent copies
 (`std.collections.copy_list` and friends) are also safe to hand off.

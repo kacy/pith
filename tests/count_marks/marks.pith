@@ -1,0 +1,36 @@
+# the count checker's marks for each shape the emitter marks. the expected
+# lines are in marks.expected; `make count-marks-check-only` compares them.
+
+struct Item:
+    name: String
+
+mut depth := 0 - 1
+
+fn first_name(items: List[Item]) -> String:
+    # the loop variable borrows each element: the body keeps storage
+    for item in items:
+        return item.name
+    return ""
+
+fn drain(mut items: List[Item]) -> Int:
+    # the body can drop the element, so the variable owns a count of its own
+    mut total := 0
+    for item in items:
+        items.clear()
+        total = total + item.name.len()
+    return total
+
+fn letters(word: String) -> Int:
+    # a string loop's variable is a fresh string each pass
+    mut count := 0
+    for ch in word:
+        if ch != " ":
+            count = count + 1
+    return count
+
+fn main():
+    mut items: List[Item] := []
+    items.push(Item(name: "a"))
+    label := first_name(items)
+    depth = drain(items) + letters(label)
+    print(label)

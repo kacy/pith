@@ -1,4 +1,4 @@
-.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-fresh-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean fuzz-surfaces-check fuzz-surfaces loom-check pithgen-leak
+.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-fresh-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean fuzz-surfaces-check fuzz-surfaces loom-check pithgen-leak count-marks-check-only
 
 
 # prints a bounded account of a failed regression case: exit status, the
@@ -1611,6 +1611,32 @@ validate-ir-contract-only:
 		fi; \
 	done; \
 	echo "validated $$n programs, $$bad failed"; \
+	[ $$bad -eq 0 ]
+
+# --- count marks ---
+# the `mark` lines PITH_CHECK_COUNTS=1 adds for the count checker (see
+# docs/ir-contract.md). a golden program pins the marks themselves, and over
+# the corpus the ir with its marks taken out must be exactly the ir a run
+# without the variable emits, so the marks can't change the generated code.
+count-marks-check-only:
+	@echo "--- count marks ---"
+	@[ -x self-host/ir_driver ] || $(MAKE) --no-print-directory self-host-ir-driver
+	@mkdir -p .pith-build
+	@PITH_CHECK_COUNTS=1 ./self-host/ir_driver --combined tests/count_marks/marks.pith \
+		| awk '$$1=="func"{f=$$0; next} $$1=="mark"{if(f!=""){print f; f=""} print}' > .pith-build/marks.out
+	@diff -u tests/count_marks/marks.expected .pith-build/marks.out || \
+		{ echo "marks differ from tests/count_marks/marks.expected"; exit 1; }
+	@bad=0; n=0; \
+	for f in tests/cases/test_*.pith examples/*.pith; do \
+		grep -q "^fn main" "$$f" || continue; \
+		n=$$((n+1)); \
+		./self-host/ir_driver --combined "$$f" > .pith-build/plain.ir 2>&1; \
+		PITH_CHECK_COUNTS=1 ./self-host/ir_driver --combined "$$f" 2>&1 | grep -v '^mark ' > .pith-build/marked.ir; \
+		if ! cmp -s .pith-build/plain.ir .pith-build/marked.ir; then \
+			bad=$$((bad+1)); echo "MARKS CHANGE THE IR: $$f"; \
+		fi; \
+	done; \
+	echo "compared $$n programs with and without marks, $$bad differ"; \
 	[ $$bad -eq 0 ]
 
 # --- gzip interop check ---

@@ -181,7 +181,7 @@ pith_load_u8|-,-|-|bytes.rs:198|raw pointer read; no counts
 pith_load_u16|-,-|-|bytes.rs:198|raw pointer read; no counts
 pith_load_u32|-,-|-|bytes.rs:198|raw pointer read; no counts
 pith_load_u64|-,-|-|bytes.rs:198|raw pointer read; no counts
-pith_store_u64|-,-,-|-|bytes.rs:238|UNSURE: a raw unaligned word store with no retain or release. The runtime treats value as a plain word; if the decoder ever stores a counted pointer with it, the slot silently takes the caller's count (behaves as c). The doc says only "writes a struct slot"
+pith_store_u64|-,-,c|-|bytes.rs:238|a raw word store with no retain or release. the generated JSON decoders store a counted string into a struct slot with it, and the slot keeps the count the caller held, so the value is consumed; a plain int stored the same way carries no count to consume
 pith_cstring_from_raw|-,-|own|bytes.rs:249|fresh string copied from a raw pointer and length (doc: "A fresh counted string")
 bytes_slice|b,-,-|own|bytes.rs:311|whole-range slice returns arg 0 itself after pith_bytes_retain; otherwise a fresh copy; 0 on invalid handle
 bytes_concat|b,b|own|bytes.rs:329|with an empty side, returns the other argument after pith_bytes_retain (bytes.rs:329/333); otherwise fresh; 0 on invalid handle

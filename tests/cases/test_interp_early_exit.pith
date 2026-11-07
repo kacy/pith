@@ -1,0 +1,30 @@
+# an interpolation whose later part leaves the function early, by an index
+# miss or a `!`, used to drop the string folded so far. a lambda emitted
+# inside a part has exits of its own and must leave the outer string alone.
+
+fn fails(i: Int) -> Int!:
+    if i % 2 == 0:
+        fail "even"
+    return i
+
+fn apply(f: fn(Int) -> Int!, i: Int) -> Int:
+    return f(i) catch 0 - 1
+
+fn miss(ys: List[Int], i: Int) -> String!:
+    return "{i.to_string().repeat(3)} {ys[0]} {ys[i]}"
+
+fn bang(i: Int) -> String!:
+    return "{i.to_string().repeat(3)} {fails(i)!}"
+
+fn with_lambda(i: Int) -> String!:
+    head := "h" + i.to_string()
+    return "{head.repeat(2)} {apply(fn(x: Int) => fails(x), i)} {fails(i + 1)!}"
+
+fn main():
+    ys := [10, 20]
+    print(miss(ys, 1) catch "miss")
+    print(miss(ys, 5) catch "miss")
+    print(bang(3) catch "fail")
+    print(bang(4) catch "fail")
+    print(with_lambda(2) catch "fail")
+    print(with_lambda(3) catch "fail")

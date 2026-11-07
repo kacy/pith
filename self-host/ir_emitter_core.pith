@@ -110,6 +110,36 @@ mut ir_last_lambda_symbol := ""
 # emitted ir stays bootstrap-stable.
 mut ir_rc_locals: List[String] := []
 mut ir_rc_local_kinds: List[String] := []
+# owned registers an expression holds while a later part of it is emitted,
+# such as the folded prefix of an interpolation. an early exit inside that
+# later part (an index miss, a `!`) releases them in ir_emit_rc_cleanup,
+# because the expression that would have consumed them never finishes. a
+# lambda emitted in the middle suspends them, since its exits are its own.
+mut ir_inflight_regs: List[Int] := []
+mut ir_inflight_kinds: List[String] := []
+mut ir_inflight_saved_regs: List[List[Int]] := []
+mut ir_inflight_saved_kinds: List[List[String]] := []
+
+fn ir_inflight_push(r: Int, kind: String):
+    ir_inflight_regs.push(r)
+    ir_inflight_kinds.push(kind)
+
+fn ir_inflight_pop():
+    ir_inflight_regs.remove(ir_inflight_regs.len() - 1)
+    ir_inflight_kinds.remove(ir_inflight_kinds.len() - 1)
+
+fn ir_inflight_suspend():
+    ir_inflight_saved_regs.push(ir_inflight_regs)
+    ir_inflight_saved_kinds.push(ir_inflight_kinds)
+    ir_inflight_regs = []
+    ir_inflight_kinds = []
+
+fn ir_inflight_resume():
+    last := ir_inflight_saved_regs.len() - 1
+    ir_inflight_regs = ir_inflight_saved_regs[last]
+    ir_inflight_kinds = ir_inflight_saved_kinds[last]
+    ir_inflight_saved_regs.remove(last)
+    ir_inflight_saved_kinds.remove(last)
 # locals of the current function that own the task a `spawn` gave them (see
 # ir_collect_task_owners). zero-stored in the prologue like the rc locals, and
 # detached at every exit edge and before every rebind.
@@ -2839,6 +2869,8 @@ fn ir_emit_result_arg_release_helpers():
 # the one being returned (its count transfers to the caller). the prologue
 # zero-stores each tracked name, so the loads are valid on every path.
 fn ir_emit_rc_cleanup(exclude: String):
+    for r, ri in ir_inflight_regs:
+        ir_rc_release_reg(r, ir_inflight_kinds[ri])
     mut i := 0
     while i < ir_rc_locals.len():
         name := ir_rc_locals[i]
@@ -7207,6 +7239,12 @@ fn ir_field_receiver_kind_can_own(kind: String) -> Bool:
         return true
     if kind == "catch_expr" or kind == "catch_block" or kind == "field_access":
         return true
+    # an element read off a temporary container arrives owned
+    # (ir_index_reads_owned_element), so `make().items[0].name` releases the
+    # element once its field is read. a plain `xs[i]` is a borrow and stays out
+    # through the ownership check that follows.
+    if kind == "index":
+        return true
     return kind == "try" or kind == "try_expr"
 
 # true when a field access's receiver is a fresh value nothing else names: a
@@ -8598,13 +8636,24 @@ fn ir_emit_string_interp(idx: Int) -> Int:
     later_drops := ir_later_operands_drop(kids4_children)
     mut pinned_regs: List[Int] := []
     mut pinned_kinds: List[String] := []
+    mut inflight := 0
     while _fi4 < kids4_children.len():
         child := kids4_children[_fi4]
+        if result_r >= 0 and result_owned:
+            ir_inflight_push(result_r, "string")
+            inflight = inflight + 1
         part_r := ir_string_interp_part_reg(child)
+        if result_r >= 0 and result_owned:
+            ir_inflight_pop()
+            inflight = inflight - 1
         part_owned := ir_string_interp_part_owned(child)
         if not part_owned:
+            pin_kind := ir_pin_operand(child, part_r, later_drops[_fi4])
             pinned_regs.push(part_r)
-            pinned_kinds.push(ir_pin_operand(child, part_r, later_drops[_fi4]))
+            pinned_kinds.push(pin_kind)
+            if pin_kind.len() > 0:
+                ir_inflight_push(part_r, pin_kind)
+                inflight = inflight + 1
         if result_r < 0:
             result_r = part_r
             result_owned = part_owned
@@ -8626,6 +8675,9 @@ fn ir_emit_string_interp(idx: Int) -> Int:
         # single borrowed part ("{s}"): callers treat interpolation results
         # as owned, so give this one its own count
         ir_string_retain_reg(result_r)
+    while inflight > 0:
+        ir_inflight_pop()
+        inflight = inflight - 1
     ir_unpin_args(pinned_regs, pinned_kinds)
     return result_r
 
@@ -8717,6 +8769,7 @@ fn ir_emit_lambda_default_return():
     ir_emit_zero_ret_endfunc()
 
 fn ir_finish_lambda_emit(saved_builder: IrBuilderSnapshot, saved_vars: Map[String, Int], saved_types: Map[String, String]):
+    ir_inflight_resume()
     ir_append_deferred_lambda_body()
     ir_builder_restore(saved_builder)
     ir_var_regs = saved_vars
@@ -8755,6 +8808,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
 
     # save current state and emit lambda to deferred buffer
     saved_builder := ir_builder_snapshot()
+    ir_inflight_suspend()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
     saved_string_locals := ir_rc_locals
@@ -8942,6 +8996,7 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
             i = i + 1
 
     saved_builder := ir_builder_snapshot()
+    ir_inflight_suspend()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
     saved_loop_var_slots := ir_loop_var_slots
@@ -9081,6 +9136,7 @@ fn ir_named_function_value_wrapper(idx: Int, target_name: String) -> String:
         ret_type = "unknown"
 
     saved_builder := ir_builder_snapshot()
+    ir_inflight_suspend()
     saved_vars := ir_copy_var_regs(ir_var_regs)
     saved_types := ir_copy_var_types(ir_var_types)
     saved_loop_var_slots := ir_loop_var_slots
@@ -9545,9 +9601,22 @@ fn ir_index_reads_owned_element(idx: Int) -> Bool:
     node := get_node(idx)
     if node.children.len() == 0 or ir_expr_is_fresh_string_index(idx):
         return false
-    if not ir_index_container_is_owned_temp(node.children[0]):
+    if not ir_index_container_is_owned_temp(node.children[0]) and not ir_index_read_is_pinned(idx):
         return false
     return ir_rc_kind(ir_infer_type(idx)).len() > 0
+
+# true when an index read pins its container around a key that could drop it
+# (`o.items[shrink(o)]`, ir_emit_index_expr). the element then takes a count
+# of its own before the pin goes, so it arrives owned too; called borrowed, a
+# consumer that only read it left that count behind. the two checks are the
+# ones the emitter makes when it pins.
+fn ir_index_read_is_pinned(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.children.len() < 2:
+        return false
+    if ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1):
+        return false
+    return ir_arg_pin_kind(node.children[0]).len() > 0
 
 fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     obj_r := ir_expr(node.children[0])
@@ -9564,8 +9633,7 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     # `o.items[shrink(o)]`: a key that can drop the container read before it
     # pins the container for the read. the element then takes a count of its
     # own before the pin goes, since the pin may have been the container's
-    # last; a consumer that retains it as well leaks it, which is the safe
-    # side for a shape this rare.
+    # last, and ir_index_read_is_pinned tells the consumer it arrives owned.
     obj_pin := ir_pin_operand(node.children[0], obj_r, not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1))
     if obj_pin.len() > 0:
         read_r := ir_emit_index_read(idx, node, obj_r)
@@ -9910,6 +9978,12 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # a bare `none` falls through to borrowed and sent the store down the
     # retaining path, stranding a shell per `m[k] = none`.
     if ir_expr_is_fresh_optional_shell(value_idx):
+        idx_borrowed = false
+    # into an optional slot the value always arrives owned: the preparation
+    # above retains a borrowed shell (ir_emit_optional_for_target). treated as
+    # borrowed, the store retained it again, and `m[k] = x` with an optional
+    # parameter `x` leaked one shell per store.
+    if value_type == "tuple":
         idx_borrowed = false
     # a list store goes through the strict entry points, which stop on an
     # index outside the list the way a read does. inside a fallible function a

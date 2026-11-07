@@ -288,6 +288,8 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
     };
     let (a_one, b_one) = (one_count_only(a, b), one_count_only(b, a));
     let mut paired: HashSet<Vec<String>> = HashSet::new();
+    // what a register naming either paired value names past the join
+    let mut renamed: HashMap<String, String> = HashMap::new();
     for ka in &a_one {
         let partners: Vec<&Vec<String>> = b_one.iter().filter(|kb| kb.iter().any(|s| ka.contains(s))).collect();
         if let [kb] = partners[..] {
@@ -295,6 +297,9 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
             if out.objs.contains_key(&shared) || paired.contains(kb) {
                 continue;
             }
+            let key = format!("@{}", shared.join("|"));
+            renamed.insert(format!("@{}", ka.join("|")), key.clone());
+            renamed.insert(format!("@{}", kb.join("|")), key);
             out.objs.insert(shared, (1, a.objs[ka].1 || b.objs[kb].1));
             paired.insert(ka.clone());
             paired.insert(kb.clone());
@@ -355,8 +360,9 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
     let maybe: HashSet<String> = out.objs.iter().filter(|(_, v)| v.1).map(|(k, _)| format!("@{}", k.join("|"))).collect();
     let mut regs = BTreeMap::new();
     let names: BTreeSet<&String> = a.regs.keys().chain(b.regs.keys()).collect();
+    let follow = |k: Option<&String>| k.map(|k| renamed.get(k).unwrap_or(k).clone());
     for r in names {
-        let merged = match (a.regs.get(r), b.regs.get(r)) {
+        let merged = match (follow(a.regs.get(r)).as_ref(), follow(b.regs.get(r)).as_ref()) {
             (Some(x), Some(y)) if x == y => Some(x.clone()),
             // a register read from a slot that held a null on one path and a
             // value on the other: the join made that value "one count or a
@@ -1488,6 +1494,42 @@ endfunc
     fn a_received_shell_never_released_is_a_leak() {
         let r = check(&SELECT_RECV.replace("call 20 pith_struct_release void 1 15\n", ""));
         assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+
+    // `x := if c: fresh() else: p`, then another branch before x is handed
+    // off: the register reading x crosses the second join
+    const IF_VALUE_ACROSS_JOIN: &str = "
+func pick 1 string
+param p
+iconst 1 1
+brif 1 L1 L2
+label L1
+call 3 int_to_string string 1 1
+store __ifexpr_1 3
+jmp L3
+label L2
+load 4 p
+call 5 pith_cstring_retain void 1 4
+store __ifexpr_1 4
+label L3
+load 6 __ifexpr_1
+iconst 7 1
+brif 7 L4 L5
+label L4
+jmp L6
+label L5
+jmp L6
+label L6
+ret 6
+mark kind p string
+endfunc
+";
+
+    #[test]
+    fn a_branch_value_read_across_a_later_join_balances() {
+        let r = check(IF_VALUE_ACROSS_JOIN);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
     }
 
     #[test]

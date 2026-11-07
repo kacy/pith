@@ -1271,6 +1271,12 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
             if extract_recv_tid >= 0 and get_type_info(extract_recv_tid).kind == "optional":
                 if ir_rc_kind(ir_type_from_tid(get_type_info(extract_recv_tid).inner)).len() > 0:
                     return false
+        # `to_string` on a String lowers to the receiver itself, with no
+        # fresh buffer, so it is borrowed exactly when the receiver is. as a
+        # fresh name it classified owned, and `take(s.to_string())` released
+        # a String parameter its caller still held: a use after free.
+        if mname == "to_string" and node.children.len() > 0 and ir_expr_is_string_receiver(node.children[0]):
+            return ir_expr_is_borrowed(node.children[0])
         return not ir_string_method_returns_fresh(mname)
     # a payload-free variant written bare (`Holder.Empty`, or the alias-
     # qualified `mod.Holder.Empty`) parses as a field access but mints a
@@ -1415,6 +1421,14 @@ fn ir_field_access_is_bare_variant(idx: Int) -> Bool:
     if not ir_struct_field_index_lookup.contains_key(key):
         return false
     return ir_struct_field_lookup.contains_key(key) and ir_struct_field_lookup[key] == ename
+
+# true when the checker typed the expression as a String
+fn ir_expr_is_string_receiver(idx: Int) -> Bool:
+    tid := c_get_expr_type(idx)
+    if tid < 0:
+        return false
+    info := get_type_info(tid)
+    return info.kind == "primitive" and info.name == "String"
 
 fn ir_string_method_returns_fresh(mname: String) -> Bool:
     if mname == "to_string" or mname == "trim" or mname == "substring":
@@ -5320,6 +5334,11 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
     # string mid-comparison. a counted extraction is a transfer like any
     # other, and reaches the borrowed-classification branch above this one.
     if ir_value_extraction_is_uncounted(idx):
+        return false
+    # a call the borrow classifier calls borrowed hands back a value its
+    # owner still holds, such as `s.to_string()` on a String, which is `s`
+    # itself. releasing it freed the caller's string.
+    if ir_expr_is_borrowed(idx):
         return false
     expr_type := ir_infer_type(idx)
     return expr_type == "string"

@@ -1,0 +1,32 @@
+# `to_string` on a String is the string itself, so on a borrowed String it is
+# a borrow too. it used to classify as a fresh string, and passing or binding
+# it released a parameter the caller still held. the strings here are built
+# at run time: a literal ignores retain and release and would hide the bug.
+
+fn take(s: String) -> Int:
+    return s.len()
+
+fn as_argument(s: String) -> Int:
+    return take(s.to_string())
+
+fn as_binding(s: String) -> Int:
+    t := s.to_string()
+    return take(t)
+
+fn generic_identity[T](marker: T, s: String) -> Int:
+    t := s.to_string()
+    return take(t) + take(s.to_string()) + s.len()
+
+fn main():
+    heap := "ab".repeat(20)
+    mut total := 0
+    mut i := 0
+    while i < 3:
+        total = total + as_argument(heap) + as_binding(heap)
+        total = total + generic_identity("tag", heap) + generic_identity(1, heap)
+        i = i + 1
+    # a freed string's block would be handed to this one
+    filler := "zz".repeat(20)
+    print(heap)
+    print(filler)
+    print(total.to_string())

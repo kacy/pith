@@ -1015,3 +1015,32 @@ warning[E309]: 'hits' is a mut module global holding a shared buffer, written af
                                      ^
   fix: declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init
 ```
+
+### E310 — a call that parks while a mutex is held (warning)
+
+a task that parks inside a `locked` block, or anywhere in a `holding`
+function, keeps the mutex for as long as it is parked, and every task that
+needs the mutex waits for the park too. `pith lint` reports these calls when
+the mutex is held:
+
+- `await`
+- a `select` with no `default` arm
+- `sleep` and `time.delay`
+- a channel `recv`
+- `fs.read` and the other `std.fs` reads
+- `tcp.accept`, `tcp.connect` and the `std.net.tcp` reads
+- the reads, receives and accepts of `tls.Conn`, `tls.Listener` and
+  `websocket.Conn`
+
+a channel `send` is not reported. it parks only when the channel is full, and
+sending under the lock is how a writer keeps its frames in order. a closure or
+a `spawn` inside the block runs later or on another task, so neither is
+checked, and a call to a function that parks somewhere inside it is not
+followed.
+
+```
+warning[E310]: a channel `recv` runs with a mutex held, so the task parks holding it and every task that needs the mutex waits for the park too
+  7 |         job := jobs.recv()
+                     ^
+  fix: park before taking the lock or after releasing it, and copy what the call needs while the lock is held
+```

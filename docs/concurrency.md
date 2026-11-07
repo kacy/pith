@@ -287,7 +287,8 @@ tasks read and write, a counter, a capped flush, and a group over the rooms.
 
 hold it for the shortest span that keeps the data consistent, and never
 across a channel receive or a socket read — a task parked inside a lock
-holds it for as long as it is parked. there is no reentrancy: locking a
+holds it for as long as it is parked. `pith lint` reports a call that parks
+while a mutex is held (E310). there is no reentrancy: locking a
 mutex a task already holds deadlocks it.
 
 `AtomicInt(n)` is a single integer several tasks can touch without a lock:

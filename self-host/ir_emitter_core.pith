@@ -9898,6 +9898,12 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # retaining path, stranding a shell per `m[k] = none`.
     if ir_expr_is_fresh_optional_shell(value_idx):
         idx_borrowed = false
+    # into an optional slot the value always arrives owned: the preparation
+    # above retains a borrowed shell (ir_emit_optional_for_target). treated as
+    # borrowed, the store retained it again, and `m[k] = x` with an optional
+    # parameter `x` leaked one shell per store.
+    if value_type == "tuple":
+        idx_borrowed = false
     # a list store goes through the strict entry points, which stop on an
     # index outside the list the way a read does. inside a fallible function a
     # bad index fails the function instead: the store is a `_checked` one that

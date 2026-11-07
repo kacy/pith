@@ -11,6 +11,7 @@ from ast import reset_arena, get_node, node_count, truncate_arena, take_nodes_fr
 from driver import init_driver, begin_driver, resolve_imports, resolve_import_list, respell_imports, find_imports, import_positions, record_entry_node_range, dr_read_source, get_driver_parse_diagnostics, driver_has_parse_errors, get_resolved_module_path, get_resolved_module_file, set_source_overlay, clear_source_overlays, file_for_node, import_timing_line, import_module_timings, walk_module_files, walk_is_unchanged, DriverSnapshot, take_driver_snapshot, restore_driver_snapshot
 from checker import initialize_checker, set_checker_module_path, set_checker_file_path, c_run_module, get_definition_of, CheckerSnapshot, take_checker_snapshot, restore_checker_snapshot
 from errors import Diagnostic
+from sharing_lint import add_sharing_errors
 from std.collections import copy_list
 import std.time as time
 
@@ -177,7 +178,7 @@ fn check_entry(path: String, root: Int, import_roots: List[Int], resolved: Int) 
     set_checker_module_path("")
     set_checker_file_path(path)
     entry_started := time.mono_nanos()
-    diags := c_run_module(root)
+    diags := add_sharing_errors(c_run_module(root), root, path, import_roots)
     timing_check_files.push(path)
     timing_check_us.push((time.mono_nanos() - entry_started) / 1000)
     timing_check_ms = time.mono_millis() - resolved
@@ -311,7 +312,7 @@ pub fn run_check_pipeline(path: String) -> CheckOutcome!:
     set_checker_module_path("")
     set_checker_file_path(path)
     entry_started := time.mono_nanos()
-    diags := c_run_module(root)
+    diags := add_sharing_errors(c_run_module(root), root, path, import_roots)
     timing_check_files.push(path)
     timing_check_us.push((time.mono_nanos() - entry_started) / 1000)
     timing_check_ms = time.mono_millis() - resolved

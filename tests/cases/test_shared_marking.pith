@@ -19,10 +19,10 @@ struct Box:
     mut leaves: List[Leaf]
     mut table: Map[String, Leaf]
 
-mut shared_box := Box(held: none, leaves: [], table: {})
 # containers and fields are not synchronized: tasks that write the shared box
 # take this lock, as any program sharing mutable state must
-mut box_mu := Mutex()
+guard box_mu:
+    mut shared_box := Box(held: none, leaves: [], table: {})
 
 fn make(n: Int) -> Node:
     return Node(leaf: Leaf(n: n), next: none, back: none, items: [Leaf(n: n * 2)])
@@ -82,22 +82,21 @@ fn publisher(n: Int) -> Int:
     fresh := make(n)
     leaf := Leaf(n: n)
     entry := Leaf(n: n + 1)
-    box_mu.lock()
-    shared_box.held = fresh
-    shared_box.leaves.push(leaf)
-    shared_box.table.insert("k" + n.to_string(), entry)
-    box_mu.unlock()
+    locked box_mu:
+        shared_box.held = fresh
+        shared_box.leaves.push(leaf)
+        shared_box.table.insert("k" + n.to_string(), entry)
     # keep using what was published, from this task, while readers retain it
     return walk(fresh) + leaf.n - n * 4 - 1
 
 fn reader(n: Int) -> Int:
     mut total := 0
-    box_mu.lock()
-    held := shared_box.held
+    mut held: Node? := none
     mut leaves: List[Leaf] := []
-    for leaf in shared_box.leaves:
-        leaves.push(leaf)
-    box_mu.unlock()
+    locked box_mu:
+        held = shared_box.held
+        for leaf in shared_box.leaves:
+            leaves.push(leaf)
     if held != none:
         total = total + walk(held.value())
     for leaf in leaves:
@@ -151,7 +150,8 @@ fn main() -> Int:
         i = i + 1
     for t in pubs:
         await t
-    print("box " + shared_box.leaves.len().to_string() + " " + shared_box.table.len().to_string())
+    locked box_mu:
+        print("box " + shared_box.leaves.len().to_string() + " " + shared_box.table.len().to_string())
 
     # a closure that captures a struct, run by other tasks
     base := make(7)

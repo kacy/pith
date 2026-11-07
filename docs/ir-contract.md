@@ -25,7 +25,11 @@ each function body.
 values inside a body live in **registers**, written as bare integers (`1`, `2`,
 `8`). a register is assigned once by the instruction that produces it and read by
 later instructions. registers are function-local. named **variables** (`store` /
-`load`) are the mutable slots that survive across basic blocks; registers do not.
+`load`) are the mutable slots that carry values across basic blocks. a register
+can be read in a later block only when the block that defines it runs on every
+path there: the inlined `contains` search, for one, keeps its list and length in
+registers across its loop. a register defined on just one branch is gone after
+the branches meet.
 
 ## declarations
 
@@ -227,6 +231,13 @@ parameter with an `owns` mark is one the function's prologue retains, and
 its exit cleanup gives that count back. runtime functions differ case by
 case, and `cranelift/runtime-abi/runtime_ownership.txt` says how; `build.rs`
 refuses a runtime function without a row there.
+
+`PITH_CHECK_COUNTS=1 pith build file.pith` also runs the count checker
+(`cranelift/codegen/src/count_check.rs`) on the marked ir before the
+backend drops the marks. it prints, on stderr, how many functions balance,
+how many don't, and how many it couldn't settle, with each unbalanced
+function and the instruction that made the count in question. it only
+reports for now and never fails the build.
 
 marks generate no code. the consumer drops every `mark` line before its first
 pass, so a mark can't split a pattern its rewrites match, and a build with

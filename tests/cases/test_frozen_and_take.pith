@@ -1,0 +1,48 @@
+# frozen data is shared without a lock, and a guarded value moved out of its
+# field, with the field given a new value, is a take rather than an escape
+struct Router:
+    frozen routes: List[String]
+
+struct Queue:
+    guard mu:
+        mut items: List[Int]
+
+impl Queue:
+    fn push(n: Int):
+        locked self.mu:
+            self.items.push(n)
+
+    fn take_all() -> List[Int]:
+        mut out: List[Int] := []
+        locked self.mu:
+            out = self.items
+            self.items = []
+        return out
+
+    fn count() -> Int:
+        locked self.mu:
+            return self.items.len()
+
+fn route_count(r: Router) -> Int:
+    return r.routes.len()
+
+fn fill(q: Queue, n: Int) -> Int:
+    mut i := 0
+    while i < n:
+        q.push(i)
+        i = i + 1
+    return n
+
+fn main() -> Int:
+    r := Router(routes: ["/", "/a", "/b"])
+    a := spawn route_count(r)
+    b := spawn route_count(r)
+    print("routes {await a} {await b}")
+    q := Queue(items: [])
+    t1 := spawn fill(q, 50)
+    t2 := spawn fill(q, 50)
+    await t1
+    await t2
+    taken := q.take_all()
+    print("took {taken.len()} left {q.count()}")
+    return 0

@@ -1,0 +1,26 @@
+# a guarded collection read inside `locked` may not outlive the block (E276)
+guard cache_mu:
+    mut cache: Map[String, List[Int]] := {}
+
+struct Inbox:
+    guard mu:
+        mut messages: List[String]
+
+fn leak_by_return(inbox: Inbox) -> List[String]:
+    locked inbox.mu:
+        return inbox.messages
+
+fn leak_by_store() -> List[Int]:
+    mut out: List[Int] := []
+    locked cache_mu:
+        out = cache["a"]
+    return out
+
+fn leak_by_closure(inbox: Inbox) -> fn() -> Int:
+    mut f := fn() => 0
+    locked inbox.mu:
+        f = fn() => inbox.messages.len()
+    return f
+
+fn main():
+    return

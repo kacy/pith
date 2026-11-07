@@ -2287,6 +2287,11 @@ fn parse_struct_field() -> Int:
         modifiers = modifiers + " mut"
     if match_tok("kw_weak"):
         modifiers = modifiers + " weak"
+    # `frozen` is a word only before a field name, so a field named frozen
+    # still parses
+    if _cur_tok_kind() == "identifier" and _cur_tok_value() == "frozen" and _peek_ahead_kind(1) == "identifier" and _peek_ahead_kind(2) == "colon":
+        advance_token()
+        modifiers = modifiers + " frozen"
     name_tok := expect("identifier")
     expect("colon")
     type_node := parse_type_expr()

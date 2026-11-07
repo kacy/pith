@@ -833,6 +833,20 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 st.regs.insert(ins[1].to_string(), Val::Plain);
                 Ok(false)
             }
+            // a channel receive hands back no shell at all when nothing
+            // came (runtime_ownership.txt), so its flag says whether the
+            // value is there, the same as a null test. other optionals can
+            // be a real shell with the flag clear.
+            "optflag" if ins.len() >= 3 => {
+                if let Val::Obj(o) = self.val(st, ins[2]) {
+                    let origin = self.origins.get(&o).map(String::as_str).unwrap_or("");
+                    if origin.contains(" pith_channel_try_recv ") || origin.contains(" pith_channel_recv ") {
+                        st.null_tests.insert(ins[1].to_string(), (o, true));
+                    }
+                }
+                st.regs.insert(ins[1].to_string(), Val::Plain);
+                Ok(false)
+            }
             _ if PLAIN_OPS.contains(&op) => {
                 if ins.len() > 1 {
                     st.regs.insert(ins[1].to_string(), Val::Plain);
@@ -1439,6 +1453,40 @@ endfunc
     #[test]
     fn a_catch_with_a_fresh_default_that_drops_the_payload_is_a_leak() {
         let r = check(&CATCH_FRESH_DEFAULT.replace("store __catch_11_12 10\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+
+    // a select receive arm: the shell is there only when the flag is set
+    const SELECT_RECV: &str = "
+func pick 1 int
+param ch
+load 14 ch
+call 15 pith_channel_try_recv tuple 1 14
+optflag 16 15
+brif 16 L11 L12
+label L11
+store v 15
+load 18 v
+call 20 pith_struct_release void 1 15
+iconst 19 1
+ret 19
+label L12
+iconst 21 0
+ret 21
+mark kind ch channel
+endfunc
+";
+
+    #[test]
+    fn a_received_shell_released_where_it_came_balances() {
+        let r = check(SELECT_RECV);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_received_shell_never_released_is_a_leak() {
+        let r = check(&SELECT_RECV.replace("call 20 pith_struct_release void 1 15\n", ""));
         assert_eq!(r.failed, 1, "{:?}", r);
     }
 

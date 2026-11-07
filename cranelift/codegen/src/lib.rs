@@ -6,6 +6,7 @@ use cranelift::prelude::*;
 use cranelift_module::Module;
 use cranelift_object::{ObjectBuilder, ObjectModule};
 
+pub mod count_check;
 pub mod ir_consumer;
 pub mod linker;
 mod loop_hoist;

@@ -25,7 +25,11 @@ each function body.
 values inside a body live in **registers**, written as bare integers (`1`, `2`,
 `8`). a register is assigned once by the instruction that produces it and read by
 later instructions. registers are function-local. named **variables** (`store` /
-`load`) are the mutable slots that survive across basic blocks; registers do not.
+`load`) are the mutable slots that carry values across basic blocks. a register
+can be read in a later block only when the block that defines it runs on every
+path there: the inlined `contains` search, for one, keeps its list and length in
+registers across its loop. a register defined on just one branch is gone after
+the branches meet.
 
 ## declarations
 

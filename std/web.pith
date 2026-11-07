@@ -367,11 +367,11 @@ struct Scoped:
     mw: fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse
 
 # the routes and the middleware an App answers with. a router is built by the
-# App builder and only read after that.
+# App builder and never changed after, so every connection reads it.
 struct Router:
-    routes: List[Route]
-    middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
-    scoped: List[Scoped]
+    frozen routes: List[Route]
+    frozen middleware: List[fn(fn(Request) -> http.HttpResponse, Request) -> http.HttpResponse]
+    frozen scoped: List[Scoped]
 
 # a web application: an ordered list of routes plus the middleware that wraps
 # them. build one with new(), add routes with get/post/put/delete and middleware
@@ -382,11 +382,9 @@ struct Router:
 # itself, the same reason Route.handler is written out longhand.
 pub struct App:
     config: http.ServerConfig
-    # every connection task reads the router, so it sits behind the app's
-    # mutex. the builder never changes a router in place: each call makes a
-    # new one, and a connection takes the router once, as it starts.
-    guard mu:
-        router: Router
+    # every connection task reads the router. the builder never changes one
+    # in place: each call makes a new App with a new router.
+    frozen router: Router
 
 # a batteries-included App: the default `GET /healthz`, the built-in
 # observability middleware wrapping every route (metrics + a per-request trace
@@ -808,11 +806,9 @@ fn spawn_tls_conn(app: App, listener_handle: Int, fd: Int):
     spawn handle_tls_socket(app, listener_handle, fd)
 
 impl App:
-    # the router, read under the app's mutex. the builder never changes a
-    # router in place, so the caller can keep using it after the lock.
+    # the router this app answers with.
     fn current_router() -> Router:
-        locked self.mu:
-            return self.router
+        return self.router
 
     # register a route for any method. returns a new App, so calls chain. get,
     # post, put, patch, delete and head are this with the method filled in.

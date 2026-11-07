@@ -25,6 +25,11 @@ from std.io import TcpStream
 # unambiguously in a trace.
 mut next_native_conn_handle := AtomicInt(1000000)
 
+# one parsed root bundle in the cache. it is never changed once cached, so a
+# reader takes the record under the lock and uses the certificates after it.
+struct ParsedRoots:
+    frozen certs: List[x509.Certificate]
+
 # guards the config registry, the handle counter, and the root bundle caches
 # described below. the registry is not startup-only state: an https client
 # builds a fresh config for every request (see std.net.http), so one task is
@@ -38,7 +43,7 @@ guard native_config_mu:
     mut next_native_config_handle := 0
     mut native_configs: Map[Int, ConfigRecord] := {}
     mut native_system_roots_pem := ""
-    mut native_roots_parsed: Map[String, List[x509.Certificate]] := {}
+    mut native_roots_parsed: Map[String, ParsedRoots] := {}
 
 # the root bundle caches, guarded by native_config_mu like the registry above.
 #
@@ -510,18 +515,15 @@ fn no_config_hook(ctx: ConfigHookContext) -> ConfigHookResult:
 # holding the lock across the parse — would serialize every config creation in
 # the process behind a quarter-second parse.
 fn parse_roots_cached(roots_pem: String) -> List[x509.Certificate]!:
-    mut hit := false
-    mut cached: List[x509.Certificate] := []
+    mut cached: ParsedRoots? := none
     locked native_config_mu:
-        hit = native_roots_parsed.contains_key(roots_pem)
-        if hit:
-            cached = native_roots_parsed[roots_pem]
-    if hit:
-        return cached
+        cached = native_roots_parsed.get(roots_pem)
+    if let hit = cached:
+        return hit.certs
     parsed := x509.parse_pem_chain(roots_pem)!
     locked native_config_mu:
         if not native_roots_parsed.contains_key(roots_pem) and native_roots_parsed.len() < TLS_MAX_ROOTS_CACHE:
-            native_roots_parsed.insert(roots_pem, parsed)
+            native_roots_parsed.insert(roots_pem, ParsedRoots(certs: parsed))
     return parsed
 
 # the system root bundle as pem text, read from disk at most once.

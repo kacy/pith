@@ -130,20 +130,20 @@ pub struct SequenceTables:
     pub of_rle: Int
 
 # the predefined tables are fixed by the format, but they were rebuilt from
-# their distributions for every block that named them — a measurable slice of
-# small-frame decode. build each once, under a lock so concurrent decoders
-# cannot interleave the first fill, and share the result: an fse table is
-# read-only after construction, so sharing is safe. order: ll, of, ml.
-guard predef_mu:
-    mut predef_tables: List[fse.FseTable] := []
+# their distributions for every block that named them, a measurable slice of
+# small-frame decode. they are built once, at module init, and shared: an fse
+# table is read-only after construction, so sharing is safe. order: ll, of, ml.
+PREDEF_TABLES := build_predefined_tables()
+
+fn build_predefined_tables() -> List[fse.FseTable]:
+    mut tables: List[fse.FseTable] := []
+    tables.push(fse.build_decode_table(ll_default(), LL_DEFAULT_LOG))
+    tables.push(fse.build_decode_table(of_default(), OF_DEFAULT_LOG))
+    tables.push(fse.build_decode_table(ml_default(), ML_DEFAULT_LOG))
+    return tables
 
 fn predefined_tables() -> List[fse.FseTable]:
-    locked predef_mu:
-        if predef_tables.len() == 0:
-            predef_tables.push(fse.build_decode_table(ll_default(), LL_DEFAULT_LOG))
-            predef_tables.push(fse.build_decode_table(of_default(), OF_DEFAULT_LOG))
-            predef_tables.push(fse.build_decode_table(ml_default(), ML_DEFAULT_LOG))
-        return predef_tables
+    return PREDEF_TABLES
 
 # build a table for one code stream given its mode, returning the table and
 # how many bytes of description it consumed. an rle mode carries a single

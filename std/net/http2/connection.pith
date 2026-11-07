@@ -821,8 +821,9 @@ pub fn open_url(url_string: String) -> Client!:
 # grpc clients open multiple subchannels. keep n at or below the core count for
 # a throughput gain; close() shuts every connection down.
 pub struct Pool:
+    # the pooled connections, fixed when the pool opens
+    frozen clients: List[Client]
     guard pick:
-        clients: List[Client]
         mut next: Int
 
 impl Pool:
@@ -833,10 +834,9 @@ impl Pool:
             self.next = (self.next + 1) % self.clients.len()
             return c
 
-    # every pooled connection. the list is never changed after the pool opens.
+    # every pooled connection.
     fn all_clients() -> List[Client]:
-        locked self.pick:
-            return self.clients
+        return self.clients
 
     # send a request over the next pooled connection; otherwise like Client.request.
     pub fn request(method: String, authority: String, path: String, extra: List[hpack.HeaderField], body: Bytes) -> Response!:

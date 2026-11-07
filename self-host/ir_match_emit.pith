@@ -82,7 +82,9 @@ fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int
 # arm has bound its names. a bare binding on a non-optional subject IS the
 # subject (an uncounted alias the arm body may store or return), and a
 # tuple pattern binds element borrows the subject's cascade owns, so both
-# rule the release out; an or-pattern may hide either shape. a variant
+# rule the release out. an or-pattern is as safe as its alternatives: it
+# used to rule the release out whatever they were, and `match f():` with an
+# `A | B(_)` arm leaked the subject. a variant
 # pattern is safe only when every bound rc slot's kind resolved: an
 # "unknown" slot is bound without a retain (ir_bind_owned_rc_payload emits
 # nothing for it), and freeing the box would leave that binding dangling.
@@ -91,8 +93,13 @@ fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int
 fn ir_match_pattern_keeps_subject_free(pat: Node, subj_is_optional: Bool) -> Bool:
     if pat.kind == "pat_binding":
         return subj_is_optional
-    if pat.kind == "pat_tuple" or pat.kind == "pat_or":
+    if pat.kind == "pat_tuple":
         return false
+    if pat.kind == "pat_or":
+        for alt_idx in pat.children:
+            if not ir_match_pattern_keeps_subject_free(get_node(alt_idx), subj_is_optional):
+                return false
+        return true
     if pat.kind == "pat_variant":
         mut kinds: List[String] := []
         if ir_enum_payload_kinds.contains_key(pat.value):

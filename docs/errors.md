@@ -1047,3 +1047,43 @@ warning[E310]: a channel `recv` runs with a mutex held, so the task parks holdin
                      ^
   fix: park before taking the lock or after releasing it, and copy what the call needs while the lock is held
 ```
+
+### E311 — two mutexes taken in opposite orders (warning)
+
+a task that holds mutex A and waits for B, while another task holds B and
+waits for A, deadlocks both. `pith lint` records every place in the program a
+mutex is taken while another is held and reports a pair taken in both orders.
+a mutex taken inside a function called while another is held counts, through
+calls the checker resolved; a call through a function value is not followed,
+and a closure or a `spawn` inside the block is not walked.
+
+a mutex is named by where it lives: a module global by its module and name, a
+struct field by the struct's type and the field, and every element of a
+sharded guard by the guard's name. two values of one struct share a name, so
+nesting them, as a transfer between two accounts does, is not reported, and a
+mutex reached through a local or a parameter of type `Mutex` is skipped.
+
+```
+warning[E311]: 'ledger.b_mu' is taken here while 'ledger.a_mu' is held, and ledger.pith:16 takes 'ledger.a_mu' while 'ledger.b_mu' is held; two tasks taking these in opposite orders can deadlock
+  10 |         locked b_mu:
+                      ^
+  fix: take the mutexes in one fixed order everywhere, or release the first before taking the second
+```
+
+### E312 — a call that takes a mutex already held (warning)
+
+a mutex is not reentrant, so a task that holds one and calls a function that
+takes it again waits for itself forever. E273 refuses a `locked` block nested
+in a block on the same path; `pith lint` reports the same mistake made
+through a call. a module global is matched through the callee and everything
+it calls, except a sharded guard, whose elements share one name. a struct's mutex is matched when a method called on the receiver
+whose mutex is held locks that field on `self`, so `self.encode()` inside
+`locked self.mu:` is reported when `encode` takes `self.mu`, while a method
+called on a different value of the same struct is not.
+
+```
+warning[E312]: this call takes 'self.mu', which is already held here; a mutex is not reentrant, so the task deadlocks
+  21 |             self.bump()
+                   ^
+  fix: call a version that expects the lock held, marked `holding`, or release the mutex before the call
+```

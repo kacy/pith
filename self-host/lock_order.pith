@@ -1,0 +1,363 @@
+# lock_order.pith: two mutexes taken in opposite orders (E311), and a call
+# that takes a mutex its caller already holds (E312)
+#
+# a task that holds mutex A and waits for B, while another task holds B and
+# waits for A, deadlocks both. the checker stops a block from taking a mutex
+# it already holds (E273), but it cannot see two functions that nest the same
+# pair the other way round. this pass records, for the whole program `pith
+# lint` loaded, every place a mutex is taken while another is held, and
+# reports a pair taken in both orders.
+#
+# a mutex is named by where it lives: a module global by its module and name,
+# a struct field by the struct's type and the field, and every element of a
+# sharded guard by the guard's name, since the index is not known. two values
+# of one struct share a name, so nesting two of them is not reported, and a
+# mutex reached through a local or a parameter of type `Mutex` has no name and
+# is skipped. a lock taken inside a function called while a mutex is held
+# counts, through calls the checker resolved to a declaration; a call through
+# a function value is not followed. a closure or a `spawn` inside a block runs
+# later or on another task, so neither is walked.
+#
+# a mutex is not reentrant, so a call made while holding one, to a function
+# that takes the same one, deadlocks the task on the spot. E273 sees a
+# `locked` block nested in another; this pass sees the call. a module global
+# is matched through the callee's whole call chain, except a sharded guard,
+# whose elements share one name. a struct's mutex is
+# matched when a method called on the same receiver path, `self` or `conn`,
+# locks that field on `self` itself, since two values of one struct share a
+# name otherwise.
+
+from ast import Node, get_node
+from errors import Diagnostic
+from checker import c_get_expr_type, get_definition_of
+from types import get_type_info, get_type_name, is_error_type
+from driver import get_resolved_module_file, get_resolved_module_path
+
+# the program's functions and what the walk below found in them
+struct LockGraph:
+    # a function's declaration node -> its index in the lists below
+    fn_index: Map[Int, Int]
+    fn_nodes: List[Int]
+    fn_modules: List[Int]
+    # each module's globals, keyed "module\tname"
+    globals: Map[String, Bool]
+    # each module's name for the mutexes it declares
+    module_labels: List[String]
+    # the mutexes a function takes itself, then through its callees
+    takes: List[Map[String, Bool]]
+    callees: List[List[Int]]
+    # calls made while a mutex is held: the caller's held set, the callee
+    held_call_held: List[List[String]]
+    held_call_callee: List[Int]
+    held_call_module: List[Int]
+    held_call_line: List[Int]
+    held_call_col: List[Int]
+    # A -> B: B taken while A is held, and where
+    edge_from: List[String]
+    edge_to: List[String]
+    edge_module: List[Int]
+    edge_line: List[Int]
+    edge_col: List[Int]
+    # names that are module globals, which E312 can match exactly, and the
+    # sharded ones among them, which it cannot, since the index is not known
+    global_names: Map[String, Bool]
+    sharded_names: Map[String, Bool]
+    # per function, the fields it locks on `self`
+    self_takes: List[Map[String, Bool]]
+    # method calls made while a mutex is held, for E312: the callee, the
+    # receiver's path, the held paths, and where
+    method_call_callee: List[Int]
+    method_call_receiver: List[String]
+    method_call_held: List[List[String]]
+    method_call_line: List[Int]
+    method_call_col: List[Int]
+    # E312 sites in the entry file
+    reentry_messages: List[String]
+    reentry_lines: List[Int]
+    reentry_cols: List[Int]
+
+## the E311 and E312 warnings for the program rooted at `entry_root`, read from
+## `entry_path`, with `import_roots` the modules it loaded. a pair is
+## reported when one of its two orders is taken in the entry file.
+pub fn lint_lock_order(entry_root: Int, entry_path: String, import_roots: List[Int]) -> List[Diagnostic]:
+    mut roots: List[Int] := [entry_root]
+    mut files: List[String] := [entry_path]
+    mut labels: List[String] := [module_label(entry_path)]
+    for r in import_roots:
+        roots.push(r)
+        files.push(get_resolved_module_file(r))
+        labels.push(get_resolved_module_path(r))
+    g := LockGraph(fn_index: {}, fn_nodes: [], fn_modules: [], globals: {}, module_labels: labels, takes: [], callees: [], held_call_held: [], held_call_callee: [], held_call_module: [], held_call_line: [], held_call_col: [], edge_from: [], edge_to: [], edge_module: [], edge_line: [], edge_col: [], global_names: {}, sharded_names: {}, self_takes: [], method_call_callee: [], method_call_receiver: [], method_call_held: [], method_call_line: [], method_call_col: [], reentry_messages: [], reentry_lines: [], reentry_cols: [])
+    for r, i in roots:
+        collect_lock_functions(r, i, g)
+    definitions := get_definition_of()
+    for idx, k in g.fn_nodes:
+        held := holding_names(idx, g.fn_modules[k], g)
+        walk_locks(idx, k, held, holding_paths(idx), definitions, g)
+    close_takes(g)
+    add_call_edges(g)
+    check_method_reentry(g)
+    mut out := report_cycles(files, g)
+    for message, i in g.reentry_messages:
+        out.push(Diagnostic("warning", "E312", message, files[0], g.reentry_lines[i], g.reentry_cols[i], "call a version that expects the lock held, marked `holding`, or release the mutex before the call"))
+    return out
+
+# a module's label for the entry file, which the import walk did not name
+fn module_label(path: String) -> String:
+    mut name := path
+    slash := name.last_index_of("/")
+    if slash >= 0:
+        name = name.substring(slash + 1, name.len())
+    if name.ends_with(".pith"):
+        name = name.substring(0, name.len() - 5)
+    return name
+
+fn collect_lock_functions(idx: Int, module: Int, g: LockGraph):
+    node := get_node(idx)
+    if node.kind == "fn_decl" or node.kind == "test_decl":
+        g.fn_index.insert(idx, g.fn_nodes.len())
+        g.fn_nodes.push(idx)
+        g.fn_modules.push(module)
+        g.takes.push({})
+        g.self_takes.push({})
+        g.callees.push([])
+        return
+    if node.kind == "binding" and node.value != "":
+        g.globals.insert(module.to_string() + "\t" + binding_name(node.value), true)
+        return
+    if node.kind == "module" or node.kind == "pub" or node.kind == "impl_decl":
+        for child in node.children:
+            collect_lock_functions(child, module, g)
+
+# the name a binding node declares: its value starts with the name
+fn binding_name(value: String) -> String:
+    mut rest := value
+    if rest.starts_with("mut "):
+        rest = rest.substring(4, rest.len())
+    sp := rest.index_of(" ")
+    if sp >= 0:
+        return rest.substring(0, sp)
+    return rest
+
+# the name of the mutex a `locked` or `holding` path takes, or "" when it has
+# none: a module global, a struct field, or an element of a sharded guard
+fn mutex_name(idx: Int, module: Int, g: LockGraph) -> String:
+    node := get_node(idx)
+    if node.kind == "ident":
+        if g.globals.contains_key(module.to_string() + "\t" + node.value):
+            name := g.module_labels[module] + "." + node.value
+            g.global_names.insert(name, true)
+            return name
+        return ""
+    if node.kind == "index" and node.children.len() >= 1:
+        name := mutex_name(node.children[0], module, g)
+        if name != "":
+            g.sharded_names.insert(name, true)
+        return name
+    if node.kind == "field_access" and node.children.len() >= 1:
+        tid := c_get_expr_type(node.children[0])
+        if is_error_type(tid) or get_type_info(tid).kind != "struct":
+            return ""
+        return get_type_name(tid) + "." + node.value
+    return ""
+
+# the mutexes a function's `holding` clause names, held as its body starts
+fn holding_names(idx: Int, module: Int, g: LockGraph) -> List[String]:
+    mut held: List[String] := []
+    for child in get_node(idx).children:
+        cn := get_node(child)
+        if cn.kind == "holding":
+            for p in cn.children:
+                name := mutex_name(p, module, g)
+                if name != "":
+                    held.push(name)
+    return held
+
+# the source path of a `locked` or `holding` path, `self.mu` or `conn.mu`, or
+# "" for anything else
+fn path_text(idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "ident":
+        return node.value
+    if node.kind == "self":
+        return "self"
+    if node.kind == "field_access" and node.children.len() >= 1:
+        base := path_text(node.children[0])
+        if base == "":
+            return ""
+        return base + "." + node.value
+    return ""
+
+# the paths a function's `holding` clause names
+fn holding_paths(idx: Int) -> List[String]:
+    mut paths: List[String] := []
+    for child in get_node(idx).children:
+        cn := get_node(child)
+        if cn.kind == "holding":
+            for p in cn.children:
+                text := path_text(p)
+                if text != "":
+                    paths.push(text)
+    return paths
+
+# walk function `k` with `held` the mutexes held at `idx`, and `held_paths`
+# the paths they were taken through, recording what it takes, what it calls,
+# and each mutex taken while another is held
+fn walk_locks(idx: Int, k: Int, held: List[String], held_paths: List[String], definitions: Map[Int, Int], g: LockGraph):
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return
+    module := g.fn_modules[k]
+    if node.kind == "locked_stmt" and node.children.len() == 4:
+        walk_locks(node.children[0], k, held, held_paths, definitions, g)
+        name := mutex_name(node.children[0], module, g)
+        if name == "":
+            walk_locks(node.children[3], k, held, held_paths, definitions, g)
+            return
+        g.takes[k].insert(name, true)
+        path := path_text(node.children[0])
+        if path.starts_with("self."):
+            g.self_takes[k].insert(path.substring(5, path.len()), true)
+        for h in held:
+            if h != name:
+                g.edge_from.push(h)
+                g.edge_to.push(name)
+                g.edge_module.push(module)
+                g.edge_line.push(node.line)
+                g.edge_col.push(node.col)
+        mut inner := copy_names(held)
+        inner.push(name)
+        mut inner_paths := copy_names(held_paths)
+        inner_paths.push(path)
+        walk_locks(node.children[3], k, inner, inner_paths, definitions, g)
+        return
+    mut def_key := 0 - 1
+    if node.kind == "call" and node.children.len() > 0:
+        def_key = node.children[0]
+    elif node.kind == "method_call":
+        def_key = idx
+    if def_key >= 0 and definitions.contains_key(def_key) and g.fn_index.contains_key(definitions[def_key]):
+        callee := g.fn_index[definitions[def_key]]
+        g.callees[k].push(callee)
+        if held.len() > 0:
+            g.held_call_held.push(copy_names(held))
+            g.held_call_callee.push(callee)
+            g.held_call_module.push(module)
+            g.held_call_line.push(node.line)
+            g.held_call_col.push(node.col)
+            if node.kind == "method_call" and node.children.len() > 0 and module == 0:
+                receiver := path_text(node.children[0])
+                if receiver != "":
+                    g.method_call_callee.push(callee)
+                    g.method_call_receiver.push(receiver)
+                    g.method_call_held.push(copy_names(held_paths))
+                    g.method_call_line.push(node.line)
+                    g.method_call_col.push(node.col)
+    for child in node.children:
+        walk_locks(child, k, held, held_paths, definitions, g)
+
+fn copy_names(names: List[String]) -> List[String]:
+    mut out: List[String] := []
+    for n in names:
+        out.push(n)
+    return out
+
+# a function takes what its callees take, until nothing changes
+fn close_takes(g: LockGraph):
+    mut changed := true
+    while changed:
+        changed = false
+        for callees, k in g.callees:
+            for c in callees:
+                for name in g.takes[c].keys():
+                    if not g.takes[k].contains_key(name):
+                        g.takes[k].insert(name, true)
+                        changed = true
+
+# a call made while A is held, to a function that takes B, takes B under A
+fn add_call_edges(g: LockGraph):
+    for held, i in g.held_call_held:
+        for name in g.takes[g.held_call_callee[i]].keys():
+            for h in held:
+                if h != name:
+                    g.edge_from.push(h)
+                    g.edge_to.push(name)
+                    g.edge_module.push(g.held_call_module[i])
+                    g.edge_line.push(g.held_call_line[i])
+                    g.edge_col.push(g.held_call_col[i])
+                elif g.global_names.contains_key(name) and not g.sharded_names.contains_key(name) and g.held_call_module[i] == 0:
+                    report_reentry(name, g.held_call_line[i], g.held_call_col[i], g)
+
+# a method called on a receiver whose mutex the caller holds, when the method
+# locks that same field on `self`
+fn check_method_reentry(g: LockGraph):
+    for callee, i in g.method_call_callee:
+        for field in g.self_takes[callee].keys():
+            want := g.method_call_receiver[i] + "." + field
+            for held in g.method_call_held[i]:
+                if held == want:
+                    report_reentry(want, g.method_call_line[i], g.method_call_col[i], g)
+
+fn report_reentry(name: String, line: Int, col: Int, g: LockGraph):
+    for l, i in g.reentry_lines:
+        if l == line and g.reentry_cols[i] == col:
+            return
+    g.reentry_messages.push("this call takes '" + name + "', which is already held here; a mutex is not reentrant, so the task deadlocks")
+    g.reentry_lines.push(line)
+    g.reentry_cols.push(col)
+
+# each edge in the entry file whose target leads back to its source, once
+# per pair of mutexes, naming one place the other order is taken
+fn report_cycles(files: List[String], g: LockGraph) -> List[Diagnostic]:
+    mut out: List[Diagnostic] := []
+    mut reported: Map[String, Bool] := {}
+    for src, e in g.edge_from:
+        if g.edge_module[e] != 0:
+            continue
+        to := g.edge_to[e]
+        pair := pair_key(src, to)
+        if reported.contains_key(pair):
+            continue
+        back := first_edge_back(to, src, g)
+        if back < 0:
+            continue
+        reported.insert(pair, true)
+        at := files[g.edge_module[back]] + ":" + g.edge_line[back].to_string()
+        message := "'" + to + "' is taken here while '" + src + "' is held, and " + at + " takes '" + g.edge_to[back] + "' while '" + g.edge_from[back] + "' is held; two tasks taking these in opposite orders can deadlock"
+        out.push(Diagnostic("warning", "E311", message, files[0], g.edge_line[e], g.edge_col[e], "take the mutexes in one fixed order everywhere, or release the first before taking the second"))
+    return out
+
+fn pair_key(a: String, b: String) -> String:
+    if a < b:
+        return a + "\t" + b
+    return b + "\t" + a
+
+# the first edge of a path of edges from `start` to `goal`, or -1
+fn first_edge_back(start: String, goal: String, g: LockGraph) -> Int:
+    mut seen: Map[String, Bool] := {}
+    seen.insert(start, true)
+    # each frontier entry: the mutex reached, and the edge out of `start` that
+    # began the path to it
+    mut frontier: List[String] := [start]
+    mut first: List[Int] := [0 - 1]
+    while frontier.len() > 0:
+        mut next_frontier: List[String] := []
+        mut next_first: List[Int] := []
+        for at, i in frontier:
+            for src, e in g.edge_from:
+                if src != at:
+                    continue
+                began := first[i]
+                mut path_first := began
+                if began < 0:
+                    path_first = e
+                to := g.edge_to[e]
+                if to == goal:
+                    return path_first
+                if not seen.contains_key(to):
+                    seen.insert(to, true)
+                    next_frontier.push(to)
+                    next_first.push(path_first)
+        frontier = next_frontier
+        first = next_first
+    return 0 - 1

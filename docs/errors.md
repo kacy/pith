@@ -988,19 +988,22 @@ warning[E308]: binding 'items' shadows the module global declared on line 1; the
   fix: rename the binding, or drop the global if the binding is what you meant
 ```
 
-### E309 — an unguarded shared global in a program that spawns (warning)
+### E309 — an unguarded shared global in a program that spawns
 
 a `mut` module global that holds a list, a map, a set or a struct is one buffer
 every task can reach, and two tasks writing it at once corrupt it. in a program
-that spawns tasks, `pith lint` reports each such global that is written after
-module init and is neither declared in a `guard` block nor `threadlocal`. the
-warning names one spawn the program reaches.
+that spawns tasks, `pith check`, `build`, `run` and `test` refuse each such
+global that is written after module init and is neither declared in a `guard`
+block nor `threadlocal`, and `pith lint` reports it as well. the error names
+one spawn the program reaches.
 
-the lint covers the whole program the linted file loads, so a library global
-is reported when a program that spawns uses it. a program spawns when a
-function in the linted file holds a `spawn`, or calls one that does; calls are
-matched by name, so a name two modules share can count a program as spawning
-when it does not. a write is an assignment rooted at the global (`g = x`,
+the rule covers the whole program the file loads, so a library global is
+reported when a program that spawns uses it. a program spawns when a function
+in the entry file holds a `spawn`, or calls one that does. a call is resolved
+to its module's function, its import or, for a method, its receiver's type; a
+method on a receiver whose type does not say whose method it is, such as an
+interface, counts every method of that name. a call through a function value
+is not followed. a write is an assignment rooted at the global (`g = x`,
 `g[k] = x`, `g.f = x`) or a call of a mutating method on it (`push`, `insert`,
 `remove`, `clear` and the like). a write made through a function that takes the
 collection as an argument is not seen.
@@ -1010,7 +1013,7 @@ its own initializer, `catalog := seeded()`, rather than in a function called
 from `main`, and drop the `mut`.
 
 ```
-warning[E309]: 'hits' is a mut module global holding a shared buffer, written after module init, in a program that spawns tasks (app.pith:7)
+error[E309]: 'hits' is a mut module global holding a shared buffer, written after module init, in a program that spawns tasks (app.pith:7)
   1 | mut hits: Map[String, Int] := {}
                                      ^
   fix: declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init

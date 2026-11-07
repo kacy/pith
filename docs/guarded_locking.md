@@ -399,8 +399,9 @@ sharing rule becomes an error.
 4. **the sharing rule as an error.** at a version boundary, after a release
    with the lint on, with the lint's text as the error's fix text.
 
-stages 1 to 3 are the feature. stage 4 waits for a release and lands on its
-own afterwards.
+stages 1 to 3 are the feature. stage 4 was planned to wait for a release.
+pith has no users outside this tree yet, so it landed right after the
+others (see "as built").
 
 the count checker proposed alongside this one is independent and can run
 before or after. neither needs the other.
@@ -474,10 +475,20 @@ build settled a question this page left open, or departed from it:
   holding any element, which lets a whole-registry operation run under every
   shard: std/metrics.pith takes all eight by a recursion that nests eight
   `locked` blocks, in index order.
-- **"a program that spawns".** the lint counts a program as spawning when a
-  function in the linted file holds a `spawn` or calls, by name, a function
-  that does. a `spawn` merely present in an imported module does not count, so
-  the compiler, which imports std.concurrent without spawning, is not flagged.
+- **the sharing rule is an error.** E309 started as a lint and is now an
+  error from `pith check`, `build`, `run` and `test`, which run it after the
+  checker on a program that checked cleanly. `pith lint` still reports it.
+- **"a program that spawns".** a program spawns when a function in the entry
+  file holds a `spawn` or calls a function that does. a `spawn` merely present
+  in an imported module does not count, so the compiler, which imports
+  std.concurrent without spawning, is not flagged. calls are resolved by
+  module: a plain name to the module's own function or a `from` import,
+  `alias.f` through the import, and a method through its receiver's type. a
+  method on a receiver whose type does not name the declaration, such as an
+  interface, counts every method of that name. the lint first matched calls
+  by bare name, and that flagged bench/catalog_server.pith, which never
+  spawns, because std.net.http has a function with the same name as one of
+  its own.
 - **what counts as a write.** an assignment rooted at the global, or a mutating
   method called on it. a write through a function that takes the collection as
   an argument is not seen.

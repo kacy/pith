@@ -185,6 +185,7 @@ cases=(
   tests/leaks/leak_pad_result
   tests/leaks/leak_imported_global_store
   tests/leaks/leak_temporary_container_reads
+  tests/leaks/leak_iterator_loop
   "tests/leaks/leak_crosskind_binding SHAPE=1"
   "tests/leaks/leak_crosskind_binding SHAPE=2"
   "tests/leaks/leak_crosskind_binding SHAPE=3"

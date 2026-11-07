@@ -193,6 +193,46 @@ jmp LABEL                   unconditional branch.
 label NAME                  a branch target.
 ```
 
+## count marks
+
+with `PITH_CHECK_COUNTS=1` set, the emitter adds `mark` lines for the count
+checker. they state facts the instructions leave out: a load or a `param`
+doesn't say whether the value is an int or a string, and a local's exit
+cleanup doesn't say which locals the emitter believes own a count.
+
+```
+mark global NAME KIND       a global's kind, after its `global` line.
+mark kind NAME KIND         a local's or parameter's kind. seeded globals are
+                            left out unless the function rebinds the name.
+mark owns NAME KIND         the exit cleanup releases NAME, so the emitter
+                            counts it as holding one count of KIND.
+mark borrow NAME FROM       NAME holds no count of its own: it borrows from the
+                            value in slot FROM, which must stay alive and
+                            unchanged while NAME is used. a list loop's
+                            variable borrows from the loop's iterable this way
+                            when the body can't drop the element.
+mark mixed NAME             NAME holds different kinds on different paths; a
+                            side slot records which, and the cleanup reads it.
+mark untracked NAME         NAME is never released by the cleanup.
+```
+
+a function's `kind`, `owns`, `mixed` and `untracked` marks come just before
+its `endfunc`. a loop's marks come where the loop sets up its slots. a
+slot with no mark is one the emitter made for a scalar, such as the flag a
+short-circuit `and` keeps. functions the emitter makes itself, such as
+destructors and enum equality, carry none.
+
+a user function borrows every parameter: the caller keeps its count. a
+parameter with an `owns` mark is one the function's prologue retains, and
+its exit cleanup gives that count back. runtime functions differ case by
+case, and `cranelift/runtime-abi/runtime_ownership.txt` says how; `build.rs`
+refuses a runtime function without a row there.
+
+marks generate no code. the consumer drops every `mark` line before its first
+pass, so a mark can't split a pattern its rewrites match, and a build with
+marks produces the same object code as one without. without the variable, no
+marks are written, and the dumped ir and the bootstrap seed are unchanged.
+
 ## the type vocabulary
 
 types travel through the ir as short **kind strings**, not as structured data.
@@ -401,4 +441,5 @@ tightening targets, not settled behavior:
 | producing the ir | `self-host/ir_emitter_core.pith` and its satellites |
 | consuming the ir | `cranelift/codegen/src/ir_consumer.rs` |
 | runtime function signatures | `cranelift/runtime-abi/runtime_functions.txt` → `build.rs` |
+| what runtime functions do with counts | `cranelift/runtime-abi/runtime_ownership.txt` → `build.rs` |
 | this contract | this file |

@@ -13,6 +13,7 @@
 #   E308 — a binding shadows a module global
 #   E309 — an unguarded shared global in a program that spawns (in
 #           sharing_lint.pith, since it reads the whole program)
+#   E310 — a call that parks while a mutex is held
 #   E270 — a path falls off the end of a body that returns a value (also
 #          a checker error)
 
@@ -21,6 +22,8 @@ from ir_ast_helpers import ir_is_binding_kind
 from errors import Diagnostic
 from std.strings import lines_keep_empty
 from return_paths import missing_return_sites
+from checker import c_get_expr_type
+from types import get_type_info, is_error_type, lookup_qualified_type_id
 
 # ---------------------------------------------------------------
 # diagnostics
@@ -45,6 +48,11 @@ mut l_resource_closed := false
 # pass (E308, below). filled before any function is walked, so a global
 # written below the function that shadows it still counts.
 mut l_module_globals: Map[String, Int] := {}
+
+# std's connection and listener types, as (module, type), whose reads,
+# receives and accepts park (E310, below). they are matched by type id, so a
+# program's own `Conn` is not mistaken for one of these.
+STREAM_TYPES: List[(String, String)] := [("std.net.tls", "Conn"), ("std.net.tls", "Listener"), ("std.net.websocket", "Conn")]
 
 fn report_linter_warning(code: String, message: String, line: Int, col: Int):
     l_diagnostics.push(Diagnostic("warning", code, message, l_file, line, col, ""))
@@ -141,6 +149,7 @@ fn lint_top_level(node_idx: Int, source: String):
     elif inner.kind == "test_decl":
         lint_block_depth(inner, 1)
         lint_shadowed_globals(inner_idx)
+        lint_parking_in_locked(inner_idx, 0)
     for site in missing_return_sites(inner_idx):
         at := get_node(site.node)
         report_linter_warning("E270", site.message, at.line, at.col)
@@ -165,6 +174,7 @@ fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
         if cn.kind == "body":
             lint_block_depth(cn, 1)
             lint_unclosed_resources(child)
+            lint_parking_in_locked(child, l_holding_count(node))
     lint_shadowed_globals(node_idx)
 
 fn lint_impl_decl(node: Node, source: String):
@@ -195,6 +205,7 @@ fn lint_impl_decl(node: Node, source: String):
                 if cn.kind == "body":
                     lint_block_depth(cn, 1)
                     lint_unclosed_resources(child)
+                    lint_parking_in_locked(child, l_holding_count(actual))
             lint_shadowed_globals(actual_idx)
 
 # ---------------------------------------------------------------
@@ -673,3 +684,104 @@ fn l_collect_resource_bindings(node_idx: Int, body_idx: Int):
 
 fn lint_unclosed_resources(body_idx: Int):
     l_collect_resource_bindings(body_idx, body_idx)
+
+# ---------------------------------------------------------------
+# E310: a call that parks while a mutex is held
+# ---------------------------------------------------------------
+#
+# a task that parks while it holds a mutex makes every task that wants the
+# mutex wait out the park as well: a receive waits on a sender, a read on a
+# peer, a sleep on the clock. docs/concurrency.md advises against it, and
+# this rule reports the calls that park by themselves. a call to a function
+# that parks somewhere inside is not followed. a channel send is not
+# reported: it parks only on a full channel, and a send under the lock is how
+# a writer keeps its frames in order.
+#
+# a closure or a spawned call inside the block runs later or on another
+# task, so neither is walked. a `holding` function's whole body counts as
+# held.
+fn lint_parking_in_locked(idx: Int, held: Int):
+    node := get_node(idx)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return
+    if node.kind == "locked_stmt" and node.children.len() == 4:
+        lint_parking_in_locked(node.children[0], held)
+        lint_parking_in_locked(node.children[3], held + 1)
+        return
+    # a select arm's channel operation is the select's own wait, which the
+    # select node answers for, so only the arm's body is walked
+    if node.kind == "select_recv_arm" or node.kind == "select_send_arm" or node.kind == "select_timeout_arm":
+        for child, i in node.children:
+            if i > 0:
+                lint_parking_in_locked(child, held)
+        return
+    if held > 0:
+        what := l_parking_call(node)
+        if what != "":
+            message := what + " runs with a mutex held, so the task parks holding it and every task that needs the mutex waits for the park too"
+            fix := "park before taking the lock or after releasing it, and copy what the call needs while the lock is held"
+            l_diagnostics.push(Diagnostic("warning", "E310", message, l_file, node.line, node.col, fix))
+    for child in node.children:
+        lint_parking_in_locked(child, held)
+
+# the parking calls the rule reports, keyed by the module a call resolves to
+# through its import alias
+fn l_parking_module_call(module_path: String, name: String) -> Bool:
+    if module_path == "std.time":
+        return name == "delay"
+    if module_path == "std.fs":
+        return name.starts_with("read")
+    if module_path == "std.net.tcp":
+        return name == "accept" or name == "connect" or name.starts_with("read")
+    return false
+
+# a description of the park when `node` is a call that parks, or ""
+fn l_parking_call(node: Node) -> String:
+    if node.kind == "await":
+        return "`await`"
+    if node.kind == "select_expr":
+        for child in node.children:
+            if get_node(child).kind == "select_default_arm":
+                return ""
+        return "a `select` with no default arm"
+    if node.kind == "call" and node.children.len() > 0:
+        callee := get_node(node.children[0])
+        if callee.kind == "ident" and callee.value == "sleep":
+            return "`sleep`"
+        return ""
+    if node.kind != "method_call" or node.children.len() == 0:
+        return ""
+    receiver := get_node(node.children[0])
+    if receiver.kind == "ident" and l_import_aliases.contains_key(receiver.value):
+        if l_parking_module_call(l_import_aliases[receiver.value], node.value):
+            return "`" + receiver.value + "." + node.value + "`"
+        return ""
+    tid := c_get_expr_type(node.children[0])
+    if is_error_type(tid):
+        return ""
+    info := get_type_info(tid)
+    if info.kind == "channel" and node.value == "recv":
+        return "a channel `recv`"
+    if info.kind == "struct":
+        stream := l_parking_stream_type(tid, node.value)
+        if stream != "":
+            return "`" + node.value + "` on a " + stream
+    return ""
+
+# the type, as `tls.Conn`, when `name` is a blocking method of one of std's
+# connection and listener types, or ""
+fn l_parking_stream_type(tid: Int, name: String) -> String:
+    if name != "accept" and not name.starts_with("read") and not name.starts_with("recv"):
+        return ""
+    for entry in STREAM_TYPES:
+        if lookup_qualified_type_id(entry.0, entry.1) == tid:
+            segments := entry.0.split(".")
+            return segments[segments.len() - 1] + "." + entry.1
+    return ""
+
+# 1 when a function is declared `holding`, so its body starts held, else 0
+fn l_holding_count(node: Node) -> Int:
+    for child in node.children:
+        if get_node(child).kind == "holding":
+            return 1
+    return 0

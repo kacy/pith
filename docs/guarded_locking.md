@@ -330,9 +330,8 @@ what the checker does not do:
   opposite orders can still deadlock at run time. a later lint could record
   each function's nesting order and report a cycle.
 - it does not check that a `locked` block holds no park. holding a lock
-  across a channel receive or a socket read is allowed, as it is today, and
-  docs/concurrency.md still advises against it. a lint for a parking call
-  inside `locked` is cheap and listed under open questions.
+  across a channel receive or a socket read compiles, as it does today. the
+  E310 lint reports it (see "as built").
 
 ## what it costs
 
@@ -498,6 +497,11 @@ build settled a question this page left open, or departed from it:
   limiter and one breaker, a call takes 16% less time. std.concurrent's test
   counters for the live and peak task counts moved the same way, and the
   counter it bumps without a lock stays an atomic.
+- **parking under a lock.** E310 is a lint for a call that parks while a
+  mutex is held: `await`, a `select` with no default arm, `sleep`, a channel
+  `recv`, and the std file, tcp, tls and websocket reads. a channel send is
+  left out, because the HTTP/2 client sends its frames under `mu` to keep
+  stream ids in order. std, the examples and the compiler lint clean.
 
 ## open questions
 
@@ -514,9 +518,6 @@ build settled a question this page left open, or departed from it:
   collection. widening it to structs whose fields are collections, unless
   those fields are in a `guard` block, would close that gap and is a smaller
   change than this one.
-- **a lint for parking inside `locked`.** channel receive, socket reads,
-  `sleep` and file reads inside a block would warn. cheap, and it enforces the
-  advice docs/concurrency.md already gives.
 - **lock order.** recording each function's lock nesting and reporting a
   cycle between functions would catch the deadlocks the checker above cannot.
   it needs whole-program call information the checker has in part.

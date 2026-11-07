@@ -29,10 +29,9 @@ pub struct Proxy:
     next: AtomicInt
     check: auth.Verifier
     requires_auth: Bool
-    # every grpc call's task picks from the targets, so they sit under
-    # targets_mu. the list is never changed after the proxy is built.
-    guard targets_mu:
-        targets: List[Target]
+    # every grpc call's task picks from the targets, which are fixed when the
+    # proxy is built
+    frozen targets: List[Target]
 
 # a proxy for the configured grpc upstreams.
 pub fn proxy(cfg: config.Config) -> Proxy!:
@@ -103,9 +102,7 @@ fn record(address: String, status: Int):
 impl Proxy:
     # open the upstream stream on the next target that takes it.
     fn open(full_method: String, headers: List[String]) -> (Target, grpc.BidiStream)!grpc.GrpcError:
-        mut targets: List[Target] := []
-        locked self.targets_mu:
-            targets = self.targets
+        targets := self.targets
         n := targets.len()
         start := self.next.load()
         self.next.compare_set(start, start + 1)

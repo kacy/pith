@@ -615,17 +615,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         // the thread-local slots this function names, each holding one count
         // of its value from the start, like a global
         for ins in &self.f.body {
-            let callee = if ins[0] == "call" { ins.get(2) } else { None };
-            if let Some(c) = callee {
-                if c.starts_with("pith_tls_") && is_counted(ins.get(3).copied().unwrap_or("int")) || c.starts_with("pith_tls_set") {
-                    if let Some(v) = ins.get(5).and_then(|a| self.consts.get(a)) {
-                        let slot = format!("tls:{v}");
-                        if !st.slots.contains_key(&slot) {
-                            st.counts.insert(slot.clone(), 1);
-                            st.maybe_null.insert(slot.clone());
-                            st.slots.insert(slot.clone(), Val::Obj(slot.clone()));
-                        }
-                    }
+            if let Some(slot) = self.counted_tls_slot(ins) {
+                if !st.slots.contains_key(&slot) {
+                    st.counts.insert(slot.clone(), 1);
+                    st.maybe_null.insert(slot.clone());
+                    st.slots.insert(slot.clone(), Val::Obj(slot.clone()));
                 }
             }
         }
@@ -931,6 +925,23 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         }
     }
 
+    /// the thread-local slot a getter or setter names, when its value is
+    /// counted. a tagged call says so by its last argument, the element tag
+    /// of the value's kind (0 for an uncounted value); an untagged getter by
+    /// its result type. an untagged setter alone does not tell.
+    fn counted_tls_slot(&self, ins: &[&str]) -> Option<String> {
+        if ins[0] != "call" || ins.len() < 6 || !ins[2].starts_with("pith_tls_") {
+            return None;
+        }
+        let counted = if ins[2].ends_with("_tagged") {
+            ins.last().and_then(|t| self.consts.get(t)).is_some_and(|t| *t != "0")
+        } else {
+            ins[2].starts_with("pith_tls_get_or_init") && is_counted(ins[3])
+        };
+        let slot = self.consts.get(ins[5])?;
+        counted.then(|| format!("tls:{slot}"))
+    }
+
     fn call(&mut self, ins: &[&str], st: &mut State) -> Result<(), String> {
         let (dst, callee, typ) = (ins[1], ins[2], ins[3]);
         let args: Vec<&str> = ins.iter().skip(5).copied().collect();
@@ -947,7 +958,8 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         // the getter hands out that value, and the setter puts a new value
         // in after the old one was released through a getter's result
         if callee.starts_with("pith_tls_get_or_init") || callee.starts_with("pith_tls_set") {
-            if let Some(slot) = args.first().and_then(|a| self.consts.get(a)).map(|v| format!("tls:{v}")) {
+            // a slot of an uncounted type is never seeded and holds nothing
+            if let Some(slot) = args.first().and_then(|a| self.consts.get(a)).map(|v| format!("tls:{v}")).filter(|s| st.slots.contains_key(s)) {
                 if callee.starts_with("pith_tls_set") {
                     let v = args.get(1).map(|a| self.val(st, a)).unwrap_or(Val::Plain);
                     let held = match v {

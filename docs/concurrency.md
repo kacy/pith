@@ -269,9 +269,9 @@ adds a `pick` mutex field after the others, defaulting to a new one, so a
 constructor call leaves it out; the fields under it are reached through
 `locked p.pick:`, or `locked self.pick:` in a method.
 
-in a program that spawns tasks, `pith lint` warns about a `mut` global
-collection that is written after module init and is neither in a `guard`
-block nor `threadlocal` (E309).
+in a program that spawns tasks, a `mut` global collection that is written
+after module init must be in a `guard` block or `threadlocal`, and the
+compiler refuses one that is neither (E309).
 
 `guard shard_mu[8]:` declares a list of eight mutexes, for state split into
 shards. holding any element of the list reaches the data under it, since the

@@ -182,6 +182,7 @@ cases=(
   tests/leaks/leak_json_parse_restore
   tests/leaks/leak_json_parse_decode_list
   tests/leaks/leak_toml_parse_restore
+  tests/leaks/leak_temporary_container_reads
   "tests/leaks/leak_crosskind_binding SHAPE=1"
   "tests/leaks/leak_crosskind_binding SHAPE=2"
   "tests/leaks/leak_crosskind_binding SHAPE=3"

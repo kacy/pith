@@ -1,0 +1,36 @@
+# a container nothing else holds, read once and dropped: indexed
+# (`s.split(",")[0]`, a call's list, a struct field off a call) or searched
+# (`["a", "b"].contains(x)`). each read used to leak the whole container.
+import leakprobe as probe
+
+struct Box:
+    items: List[Int]
+    names: List[String]
+
+fn make(n: Int) -> Box:
+    return Box(items: [n, n + 1], names: [n.to_string(), "x"])
+
+fn mk(n: Int) -> List[Int]:
+    return [n, n + 1]
+
+fn is_known(s: String) -> Bool:
+    return ["alpha", "beta", "gamma"].contains(s)
+
+fn round(i: Int) -> Int:
+    mut total := make(i).items[0] + make(i).names[0].len() + mk(i)[1]
+    total = total + "a,b,c".split(",")[0].len()
+    if is_known("beta"):
+        total = total + 1
+    return total
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -293,10 +293,12 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
             // a borrow one path made and the other never did: it holds no
             // count, and a slot only one path wrote can't be read past here
             (Some(x), None) | (None, Some(x)) if x.0 == 0 && !k.iter().any(|s| a_nulls.contains(s) || b_nulls.contains(s)) => {}
-            // a count one path holds in slots the other never wrote: nothing
-            // on the other path can give it up, so the first path leaks it
-            (Some(x), None) | (None, Some(x)) if x.0 > 0 && !x.1 && !k.iter().any(|s| a_nulls.contains(s) || b_nulls.contains(s)) => {
-                leaks.push(format!("@{}", k.join("|")));
+            // a count one path holds in slots the other never wrote, or wrote
+            // a plain value to (a literal): a slot survives the join and can be
+            // read past it, so the count is kept as one count or nothing. one
+            // never given up is still a leak at the return.
+            (Some(x), None) | (None, Some(x)) if x.0 == 1 && !k.iter().any(|s| a_nulls.contains(s) || b_nulls.contains(s)) => {
+                out.objs.insert(k.clone(), (1, true));
             }
             (x, y) => return Err(format!("{} holds {:?} on one path and {:?} on the other", k.join("|"), x, y)),
         }
@@ -353,6 +355,9 @@ struct FuncCheck<'a, 'f> {
     globals: &'f HashMap<&'a str, &'a str>,
     user_funcs: &'f HashSet<&'a str>,
     scalar_temps: HashSet<&'a str>,
+    /// the integer constant each `iconst` register holds, for the slot number
+    /// a thread-local call names
+    consts: HashMap<&'a str, &'a str>,
     problems: Vec<String>,
     /// the instruction that made each object, for the messages
     origins: HashMap<String, String>,
@@ -366,8 +371,9 @@ struct FuncCheck<'a, 'f> {
 
 impl<'a, 'f> FuncCheck<'a, 'f> {
     fn new(f: &'f Func<'a>, globals: &'f HashMap<&'a str, &'a str>, user_funcs: &'f HashSet<&'a str>) -> Self {
-        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new(), reads: 0, join_detail: String::new() };
+        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), consts: HashMap::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new(), reads: 0, join_detail: String::new() };
         c.scalar_temps = c.infer_scalar_temps();
+        c.consts = f.body.iter().filter(|ins| ins[0] == "iconst" && ins.len() >= 3).map(|ins| (ins[1], ins[2])).collect();
         c
     }
 
@@ -603,6 +609,23 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                     let o = format!("param:{p}");
                     st.counts.insert(o.clone(), 0);
                     st.slots.insert(p.to_string(), Val::Obj(o));
+                }
+            }
+        }
+        // the thread-local slots this function names, each holding one count
+        // of its value from the start, like a global
+        for ins in &self.f.body {
+            let callee = if ins[0] == "call" { ins.get(2) } else { None };
+            if let Some(c) = callee {
+                if c.starts_with("pith_tls_") && is_counted(ins.get(3).copied().unwrap_or("int")) || c.starts_with("pith_tls_set") {
+                    if let Some(v) = ins.get(5).and_then(|a| self.consts.get(a)) {
+                        let slot = format!("tls:{v}");
+                        if !st.slots.contains_key(&slot) {
+                            st.counts.insert(slot.clone(), 1);
+                            st.maybe_null.insert(slot.clone());
+                            st.slots.insert(slot.clone(), Val::Obj(slot.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -920,6 +943,33 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             st.regs.insert(dst.to_string(), Val::Plain);
             return Ok(());
         }
+        // a thread-local slot holds one count of its value, like a global:
+        // the getter hands out that value, and the setter puts a new value
+        // in after the old one was released through a getter's result
+        if callee.starts_with("pith_tls_get_or_init") || callee.starts_with("pith_tls_set") {
+            if let Some(slot) = args.first().and_then(|a| self.consts.get(a)).map(|v| format!("tls:{v}")) {
+                if callee.starts_with("pith_tls_set") {
+                    let v = args.get(1).map(|a| self.val(st, a)).unwrap_or(Val::Plain);
+                    let held = match v {
+                        Val::Null | Val::Plain => Val::Obj(self.new_obj(st, 1)),
+                        other => other,
+                    };
+                    st.slots.insert(slot, held);
+                    st.regs.insert(dst.to_string(), Val::Plain);
+                    return Ok(());
+                }
+                if is_counted(typ) {
+                    if !st.slots.contains_key(&slot) {
+                        st.counts.insert(slot.clone(), 1);
+                        st.maybe_null.insert(slot.clone());
+                        st.slots.insert(slot.clone(), Val::Obj(slot.clone()));
+                    }
+                    let v = st.slots.get(&slot).cloned().unwrap_or(Val::Plain);
+                    st.regs.insert(dst.to_string(), v);
+                    return Ok(());
+                }
+            }
+        }
         if is_emitted_release(callee) {
             if let Some(a) = args.first() {
                 self.take(st, a, callee)?;
@@ -1000,7 +1050,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         let mut global_holds: HashMap<&String, i64> = HashMap::new();
         for (s, v) in &st.slots {
             if let Val::Obj(o) = v {
-                if self.globals.contains_key(s.as_str()) {
+                if self.globals.contains_key(s.as_str()) || s.starts_with("tls:") {
                     *global_holds.entry(o).or_insert(0) += 1;
                 }
             }
@@ -1046,6 +1096,155 @@ fn split_blocks<'a, 'b>(body: &'b [Vec<&'a str>]) -> (Vec<Vec<&'b [&'a str]>>, V
         succ.push(next);
     }
     (blocks, succ, names)
+}
+
+// ---- the borrow rule, first part: loop variables ----
+//
+// a list loop's variable borrows its element (`mark borrow V FROM`) only when
+// the emitter proved the body can't drop the element (ir_subtree_keeps_storage),
+// which is the claim #1270 found wrong. this pass makes the same judgement from
+// the IR alone: a function can drop a stored element when it writes a field or
+// a global, changes a container, calls something the checker can't see, or
+// calls a function that does. a borrowed variable read after such an
+// instruction in its loop body may read an element that is gone.
+
+/// runtime calls that can drop a value a container holds: they evict an
+/// element, overwrite a slot, or store a raw word over one. a push or an
+/// insert of a new key only adds, so a borrowed element stays alive
+const EVICTING_NAME_PARTS: &[&str] = &[
+    "clear", "remove", "pop", "set_value", "take", "truncate", "drain", "store_u64", "tls_set", "set_env",
+];
+
+fn runtime_call_writes(callee: &str) -> bool {
+    if callee.contains("release") || callee.contains("retain") {
+        return false;
+    }
+    EVICTING_NAME_PARTS.iter().any(|p| callee.contains(p))
+}
+
+/// the functions that can drop a stored value, by name, worked out to a fixed
+/// point over the calls between them
+fn storage_writers(funcs: &[(&str, Vec<Vec<&str>>)], globals: &HashSet<&str>) -> HashSet<String> {
+    let user: HashSet<&str> = funcs.iter().map(|(n, _)| *n).collect();
+    let mut writers: HashSet<String> = HashSet::new();
+    loop {
+        let mut changed = false;
+        for (name, body) in funcs {
+            if writers.contains(*name) {
+                continue;
+            }
+            let fresh = fresh_allocations(body);
+            if body.iter().any(|ins| instruction_writes(ins, globals, &user, &writers, &fresh)) {
+                writers.insert(name.to_string());
+                changed = true;
+            }
+        }
+        if !changed {
+            return writers;
+        }
+    }
+}
+
+/// the registers a function's own allocations land in: a field store into one
+/// fills a fresh struct and can't drop anything
+fn fresh_allocations<'a>(body: &[Vec<&'a str>]) -> HashSet<&'a str> {
+    body.iter()
+        .filter(|ins| {
+            (ins[0] == "call" && ins.len() > 2 && ins[2] == "pith_struct_alloc") || (ins[0] == "tuple_stack" && ins.len() > 1)
+        })
+        .map(|ins| ins[1])
+        .collect()
+}
+
+fn instruction_writes(
+    ins: &[&str],
+    globals: &HashSet<&str>,
+    user: &HashSet<&str>,
+    writers: &HashSet<String>,
+    fresh: &HashSet<&str>,
+) -> bool {
+    match ins[0] {
+        "sstore" => ins.len() < 2 || !fresh.contains(ins[1]),
+        "store" if ins.len() >= 2 => globals.contains(ins[1]),
+        "call" | "rcall" => {
+            let callee = if ins[0] == "call" { ins.get(2) } else { ins.get(3) };
+            let Some(callee) = callee else { return true };
+            // an emitted release helper drops only its own argument
+            if is_emitted_release(callee) || callee.contains("__tuple_stack_cascade_") {
+                return false;
+            }
+            if user.contains(callee) {
+                writers.contains(*callee)
+            } else if runtime_ownership(callee).is_some() {
+                runtime_call_writes(callee)
+            } else {
+                // a call the checker can't see into may do anything
+                true
+            }
+        }
+        _ => false,
+    }
+}
+
+/// every borrowed loop variable read after an instruction in its loop body
+/// that can drop the element it borrows
+pub fn check_loop_borrows(lines: &[&str]) -> Vec<String> {
+    let mut globals: HashSet<&str> = HashSet::new();
+    let mut funcs: Vec<(&str, Vec<Vec<&str>>)> = Vec::new();
+    let mut borrows: Vec<(usize, &str, &str)> = Vec::new();
+    for line in lines {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        match parts.first() {
+            Some(&"global") if parts.len() >= 2 => {
+                globals.insert(parts[1]);
+            }
+            Some(&"func") if parts.len() >= 2 => funcs.push((parts[1], Vec::new())),
+            Some(&"mark") if parts.len() >= 4 && parts[1] == "borrow" => {
+                if !funcs.is_empty() {
+                    borrows.push((funcs.len() - 1, parts[2], parts[3]));
+                }
+            }
+            Some(&"endfunc") | Some(&"mark") | None => {}
+            Some(_) => {
+                if let Some(f) = funcs.last_mut() {
+                    f.1.push(parts);
+                }
+            }
+        }
+    }
+    let writers = storage_writers(&funcs, &globals);
+    let user: HashSet<&str> = funcs.iter().map(|(n, _)| *n).collect();
+    let mut problems = Vec::new();
+    for (fi, var, from) in borrows {
+        let (name, body) = &funcs[fi];
+        let Some(start) = body.iter().position(|ins| ins[0] == "store" && ins.get(1) == Some(&var)) else { continue };
+        // the loop's head is the label before the first read of its index;
+        // the body runs from the variable's store to the jmp back there
+        let fid = var.trim_start_matches("__loopvar_").split('_').next().unwrap_or("");
+        let idx_slot = format!("__for_idx_{fid}");
+        let Some(head) = body
+            .iter()
+            .position(|ins| ins[0] == "load" && ins.get(2) == Some(&idx_slot.as_str()))
+            .and_then(|i| body[..i].iter().rposition(|ins| ins[0] == "label"))
+            .and_then(|i| body[i].get(1).copied())
+        else {
+            continue;
+        };
+        let Some(end) = body.iter().rposition(|ins| ins[0] == "jmp" && ins.get(1) == Some(&head)) else { continue };
+        if end <= start {
+            continue;
+        }
+        let region = &body[start + 1..end];
+        let fresh = fresh_allocations(body);
+        let Some(w) = region.iter().position(|ins| instruction_writes(ins, &globals, &user, &writers, &fresh)) else { continue };
+        if region[w + 1..].iter().any(|ins| ins[0] == "load" && ins.get(2) == Some(&var)) {
+            problems.push(format!(
+                "{name}: {var} borrows from {from}, and `{}` can drop the element before a later read",
+                region[w].join(" ")
+            ));
+        }
+    }
+    problems
 }
 
 #[cfg(test)]
@@ -1363,6 +1562,88 @@ endfunc
         // without the release of the old value, the next pass leaks it
         let r = check(&ir.replace("call 24 __tuple_cascade_0s_m53 void 1 6\n", ""));
         assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+
+    // fn total(xs: List[Node]) -> Int: for n in xs: sum = sum + n.name.len()
+    // the loop as the emitter writes it when the body keeps storage
+    const SUM_NAMES: &str = "
+        func total 1 int
+        param xs
+        iconst 1 0
+        store sum 1
+        load 2 xs
+        call 3 pith_auto_len int 1 2
+        iconst 4 0
+        store __for_idx_0 4
+        store __for_len_0 3
+        store __for_iter_0 2
+        label L0
+        load 5 __for_idx_0
+        load 6 __for_len_0
+        lt 7 5 6
+        brif 7 L1 L3
+        label L1
+        load 8 __for_iter_0
+        load 9 __for_idx_0
+        call 10 pith_list_get_value unknown 2 8 9
+        store __loopvar_0_n 10
+        load 11 __loopvar_0_n
+        field 12 11 0 string name
+        call 13 pith_cstring_len int 1 12
+        load 14 sum
+        add 15 14 13
+        store sum 15
+        label L2
+        load 16 __for_idx_0
+        iconst 17 1
+        add 18 16 17
+        store __for_idx_0 18
+        jmp L0
+        label L3
+        load 19 sum
+        ret 19
+        mark kind __for_idx_0 int
+        mark kind __for_len_0 int
+        mark kind __for_iter_0 list
+        mark kind __loopvar_0_n struct
+        mark borrow __loopvar_0_n __for_iter_0
+        mark kind xs list
+        mark kind sum int
+        endfunc
+    ";
+
+    fn borrow_problems(ir: &str) -> Vec<String> {
+        let lines: Vec<&str> = ir.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        check_loop_borrows(&lines)
+    }
+
+    // the #1270 shape: the body clears the list, then reads the variable
+    #[test]
+    fn a_borrowed_loop_variable_read_after_a_clear_is_reported() {
+        assert!(borrow_problems(SUM_NAMES).is_empty());
+        let cleared = SUM_NAMES.replace(
+            "load 11 __loopvar_0_n\n",
+            "call 30 list_clear void 1 8\nload 11 __loopvar_0_n\n",
+        );
+        let problems = borrow_problems(&cleared);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("list_clear"), "{problems:?}");
+    }
+
+    #[test]
+    fn a_call_into_a_function_that_writes_a_global_counts_as_a_drop() {
+        let writer = "global __g_items list\nfunc bump 0 void\nload 1 __g_items\nstore __g_items 1\niconst 2 0\nret 2\nendfunc\n";
+        let keeper = "func peek 0 int\niconst 1 7\nret 1\nendfunc\n";
+        let calls = |callee: &str| {
+            format!(
+                "{writer}{keeper}{}",
+                SUM_NAMES.replace("load 11 __loopvar_0_n\n", &format!("call 30 {callee} int 0\nload 11 __loopvar_0_n\n"))
+            )
+        };
+        assert_eq!(borrow_problems(&calls("bump")).len(), 1);
+        // a function that writes nothing keeps the borrow good
+        assert!(borrow_problems(&calls("peek")).is_empty());
     }
 
     #[test]

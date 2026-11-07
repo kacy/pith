@@ -1818,6 +1818,9 @@ pub fn compile_from_ir(
     if matches!(count_mode.as_str(), "1" | "2" | "only") {
         let raw: Vec<&str> = ir_text.lines().collect();
         report_counts(&crate::count_check::check_counts(&raw));
+        for p in crate::count_check::check_loop_borrows(&raw) {
+            eprintln!("  borrow: {p}");
+        }
         // `only` is for tools that want the report and nothing else, such as
         // the mutation run that checks the checker
         if count_mode == "only" {

@@ -1827,6 +1827,15 @@ cli-regressions-only:
 	set -e; \
 	case "$$order_out" in *'"code":"E311"'*) pass=$$((pass+1)); echo "ok   lint opposite lock order through a call";; *) echo "FAIL lint opposite lock order through a call"; fail=$$((fail+1));; esac; \
 	case "$$order_ok_out" in *'"code":"E311"'*) echo "FAIL lint one lock order and same-struct nesting exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint one lock order and same-struct nesting exempt";; esac; \
+	printf 'guard log_mu:\n    mut lines := 0\n\nstruct Codec:\n    guard mu:\n        mut n: Int\n\nimpl Codec:\n    fn bump():\n        locked self.mu:\n            self.n = self.n + 1\n\n    fn twice():\n        locked self.mu:\n            self.bump()\n\nfn note():\n    locked log_mu:\n        lines = lines + 1\n\nfn flush():\n    locked log_mu:\n        note()\n\nfn main():\n    return\n' > "$$tmpdir/lint_reentry.pith"; \
+	printf 'struct Codec:\n    guard mu:\n        mut n: Int\n\nimpl Codec:\n    fn bump():\n        locked self.mu:\n            self.n = self.n + 1\n\n    fn bump_locked() holding self.mu:\n        self.n = self.n + 1\n\n    fn twice():\n        locked self.mu:\n            self.bump_locked()\n        self.bump()\n\nfn move(a: Codec, b: Codec):\n    locked a.mu:\n        b.bump()\n\nfn main():\n    return\n' > "$$tmpdir/lint_reentry_ok.pith"; \
+	set +e; \
+	reentry_out=$$(./target/release/pith lint --json "$$tmpdir/lint_reentry.pith" 2>/dev/null); \
+	reentry_ok_out=$$(./target/release/pith lint --json "$$tmpdir/lint_reentry_ok.pith" 2>/dev/null); \
+	set -e; \
+	reentry_lines=$$(printf '%s' "$$reentry_out" | grep -o '"code":"E312"[^}]*"line":[0-9]*' | grep -o '"line":[0-9]*' | sort | tr '\n' ' '); \
+	case "$$reentry_lines" in '"line":15 "line":23 ') pass=$$((pass+1)); echo "ok   lint call that retakes a held mutex";; *) echo "FAIL lint call that retakes a held mutex ($$reentry_lines)"; fail=$$((fail+1));; esac; \
+	case "$$reentry_ok_out" in *'"code":"E312"'*) echo "FAIL lint holding helper and other-value call exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint holding helper and other-value call exempt";; esac; \
 	printf 'test "a first":\n    assert(true)\ntest "b fails":\n    assert(false)\ntest "c after failure":\n    assert(true)\n' > "$$tmpdir/harness.pith"; \
 	set +e; \
 	out=$$(./target/release/pith test "$$tmpdir/harness.pith" 2>&1); \

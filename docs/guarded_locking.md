@@ -529,6 +529,11 @@ build settled a question this page left open, or departed from it:
   module global, by its struct type and field, or by its sharded guard, so
   two values of one struct are one name and nesting them is not reported.
   std, the examples and the compiler lint clean.
+- **reentry through a call.** E312 is a lint for a call that takes a mutex
+  its caller holds, which E273 cannot see because no `locked` block is
+  nested. a module global is followed through the whole call chain; a
+  struct's mutex is matched when a method on the same receiver locks that
+  field on `self`.
 
 ## open questions
 

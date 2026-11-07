@@ -329,15 +329,22 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
     }
     let obj_keys: HashSet<String> = out.objs.keys().map(|k| format!("@{}", k.join("|"))).collect();
     let live = |key: &String| key == "null" || out.regobjs.contains_key(key) || obj_keys.contains(key);
+    // values the join made "one count or nothing"
+    let maybe: HashSet<String> = out.objs.iter().filter(|(_, v)| v.1).map(|(k, _)| format!("@{}", k.join("|"))).collect();
     let mut regs = BTreeMap::new();
-    for (r, key) in &a.regs {
-        let merged = match b.regs.get(r) {
-            Some(other) if other == key => Some(key.clone()),
+    let names: BTreeSet<&String> = a.regs.keys().chain(b.regs.keys()).collect();
+    for r in names {
+        let merged = match (a.regs.get(r), b.regs.get(r)) {
+            (Some(x), Some(y)) if x == y => Some(x.clone()),
             // a register read from a slot that held a null on one path and a
             // value on the other: the join made that value "one count or a
             // null", and the register follows it
-            Some(other) if key == "null" && live(other) => Some(other.clone()),
-            Some(other) if other == "null" && live(key) => Some(key.clone()),
+            (Some(x), Some(y)) if x == "null" && live(y) => Some(y.clone()),
+            (Some(x), Some(y)) if y == "null" && live(x) => Some(x.clone()),
+            // a register's definition dominates its uses, so one missing on
+            // one side held a plain value there (a literal read from the same
+            // slot). it follows the value the same way a null does.
+            (Some(x), None) | (None, Some(x)) if maybe.contains(x) => Some(x.clone()),
             _ => None,
         };
         if let Some(k) = merged {
@@ -1303,6 +1310,54 @@ mod tests {
         mark kind xs list
         endfunc
     ";
+
+
+    // `return b.to_string_utf8() catch ""`: the payload slot holds the fresh
+    // string on the success path and a literal on the failure path, and the
+    // catch slot copies it on success and releases it on failure
+    const CATCH_NULLABLE: &str = "
+func plain 1 string
+param b
+load 1 b
+call 2 bytes_to_string_utf8 string 1 1
+iconst 3 0
+neq 4 2 3
+brif 4 L0 L1
+label L0
+iconst 5 1
+store __lp_flag_3_0 5
+store __lp_val_3_0 2
+jmp L2
+label L1
+iconst 6 0
+store __lp_flag_3_0 6
+strref 7 m1s56
+store __lp_val_3_0 7
+label L2
+load 8 __lp_flag_3_0
+load 9 __lp_val_3_0
+brif 8 L3 L4
+label L3
+store __catch_10_3 9
+jmp L5
+label L4
+call 10 pith_cstring_release void 1 9
+strref 11 m1s13
+store __catch_10_3 11
+label L5
+load 12 __catch_10_3
+ret 12
+iconst 13 0
+ret 13
+mark kind b bytes
+endfunc
+";
+
+    #[test]
+    fn a_catch_over_a_nullable_string_balances() {
+        let r = check(CATCH_NULLABLE);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
 
     #[test]
     fn a_retained_borrow_returned_balances() {

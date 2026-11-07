@@ -189,6 +189,11 @@ mut ir_stack_box_call_idx := 0 - 1
 # a call that builds its own heap box (a generic decode, say) leaves it unset,
 # and the bind then takes the local off the list so cleanup frees that shell.
 mut ir_stack_box_built := false
+
+# whether the select being emitted lands each arm's value owned
+# (ir_branches_take_counts), saved and restored around a nested select
+mut ir_select_takes_counts := false
+
 # every name the function currently being emitted binds for the whole body: a
 # local, an `if let` or `match` payload. parameters and lambda captures are
 # the same thing and live in ir_var_regs; a `for` variable is not, and is
@@ -1335,7 +1340,7 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # field has a kind to retain; a plain-value field is not rc either way.
     if node.kind == "field_access" and node.children.len() > 0 and ir_field_receiver_is_owned_temp(node.children[0]):
         return false
-    if node.kind == "match_expr" or node.kind == "if_expr":
+    if node.kind == "match_expr" or node.kind == "if_expr" or node.kind == "select_expr":
         return not ir_branch_values_are_owned(idx)
     return true
 
@@ -1362,12 +1367,27 @@ fn ir_branch_values_are_owned(idx: Int) -> Bool:
     want := ir_infer_type(idx)
     retains := ir_branch_retain_kind(idx).len() > 0
     for v in values:
-        if not c_argument_widens_to_optional(v):
+        # a bare `none` branch lands a null, which holds no count to lend
+        if not c_argument_widens_to_optional(v) and node_kind(v) != "none_lit":
             if ir_infer_type(v) != want:
                 return false
-            if not retains and ir_expr_is_borrowed(v):
+            if not retains and ir_expr_is_borrowed(v) and not ir_select_value_is_binding(idx, v):
                 return false
     return true
+
+# whether value v of the select at idx is a receive arm's own binding, whose
+# count the arm hands over (ir_select_arm_returns_binding) rather than lends
+fn ir_select_value_is_binding(idx: Int, v: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "select_expr":
+        return false
+    for arm_idx in node.children:
+        arm := get_node(arm_idx)
+        if arm.kind == "select_recv_arm" and arm.children.len() >= 2 and ir_select_arm_returns_binding(arm.children[1], arm.value):
+            body := get_node(arm.children[1])
+            if arm.children[1] == v or (body.kind == "body" and body.children.len() > 0 and body.children[0] == v):
+                return true
+    return false
 
 # the rc kind a borrowed branch of the match or if expression at idx is
 # retained under as it lands in the temp, or "" where branches land as is. the
@@ -1401,13 +1421,19 @@ fn ir_branch_value_nodes(idx: Int) -> List[Int]:
             i = i + 1
         values.push(node.children[node.children.len() - 1])
         return values
-    if node.children.len() < 2:
+    # a match arm starts with its pattern after the subject; a select has no
+    # subject, and an arm's value is its last part (after the receive, send
+    # or timeout, or alone in a default arm)
+    mut first := 1
+    if node.kind == "select_expr":
+        first = 0
+    elif node.children.len() < 2:
         return [0 - 1]
-    mut i := 1
+    mut i := first
     while i < node.children.len():
         arm := get_node(node.children[i])
         mut body_idx := 0 - 1
-        mut j := 1
+        mut j := first
         while j < arm.children.len():
             if node_kind(arm.children[j]) != "guard":
                 body_idx = arm.children[j]
@@ -7953,6 +7979,11 @@ fn ir_emit_select_recv_probe(recv_idx: Int) -> Int:
     ch_r := ir_expr(recv_node.children[0])
     r := ir_reg()
     ir_emit_call1(r, "pith_channel_try_recv", "tuple", ch_r)
+    # the runtime builds the shell without a destructor, as it does for a
+    # plain receive (ir_runtime_opt_producer_payload_kind)
+    payload_kind := ir_runtime_opt_producer_payload_kind("pith_channel_try_recv", ir_method_receiver_type(recv_node))
+    if payload_kind.len() > 0:
+        ir_emit_optional_attach_dtor(r, payload_kind)
     return r
 
 fn ir_emit_select_send_probe(send_idx: Int) -> Int:
@@ -7999,14 +8030,29 @@ fn ir_emit_select_arm_body(body_idx: Int, bind_name: String, bind_r: Int, bind_t
     # on an optional beside a `none` arm is built as the Some it widens to
     if body_node.kind == "body":
         if body_node.children.len() > 0:
-            body_r = ir_emit_call_arg(body_node.children[0])
+            body_r = ir_emit_select_arm_value(body_node.children[0])
     elif body_node.kind == "block":
         ir_block(body_idx)
     else:
-        body_r = ir_emit_call_arg(body_idx)
+        body_r = ir_emit_select_arm_value(body_idx)
     ir_var_regs = saved_vars
     ir_var_types = saved_types
     return body_r
+
+fn ir_emit_select_arm_value(expr_idx: Int) -> Int:
+    if ir_select_takes_counts:
+        return ir_emit_owned_branch_value(expr_idx)
+    return ir_emit_call_arg(expr_idx)
+
+# whether a receive arm's value is its bound name itself, which hands the
+# received shell's count on as the select's value
+fn ir_select_arm_returns_binding(body_idx: Int, bind_name: String) -> Bool:
+    mut value_idx := body_idx
+    body := get_node(body_idx)
+    if body.kind == "body" and body.children.len() > 0:
+        value_idx = body.children[0]
+    value := get_node(value_idx)
+    return value.kind == "ident" and value.value == bind_name
 
 fn ir_select_probe_arm_indices(node: Node) -> List[Int]:
     mut probe_arms: List[Int] := []
@@ -8042,6 +8088,12 @@ fn ir_emit_select_probe_arm(arm_idx: Int, result_temp: String, end_l: String):
         ir_emit("brif " + ready_r.to_string() + " " + hit_l + " " + next_l)
         ir_emit_label(hit_l)
         body_r := ir_emit_select_arm_body(arm_node.children[1], arm_node.value, maybe_r, ir_checked_type(arm_node.children[0]))
+        # the arm's binding is a local of the arm: the shell the receive
+        # handed over is released when the arm is done with it, unless the
+        # arm's value is the binding, which keeps that count. every other
+        # use that keeps the value took a count of its own.
+        if not ir_select_arm_returns_binding(arm_node.children[1], arm_node.value):
+            ir_emit_call1(ir_reg(), "pith_struct_release", "void", maybe_r)
         ir_emit("store " + result_temp + " " + body_r.to_string())
         ir_emit("jmp " + end_l)
         ir_emit_label(next_l)
@@ -8166,7 +8218,10 @@ fn ir_emit_select_wait(loop_l: String, probe_count: Int, offset_name: String):
     ir_emit_call1(sleep_r, "sleep", "unknown", delay_r)
     ir_emit("jmp " + loop_l)
 
-fn ir_emit_select_expr(node: Node) -> Int:
+fn ir_emit_select_expr(idx: Int) -> Int:
+    node := get_node(idx)
+    saved_takes := ir_select_takes_counts
+    ir_select_takes_counts = ir_branches_take_counts(idx)
     result_temp := ir_new_temp_name("select")
     parts := ir_collect_select_parts(node)
     probe_count := parts.probe_arms.len()
@@ -8182,6 +8237,7 @@ fn ir_emit_select_expr(node: Node) -> Int:
     ir_emit_select_timeout(parts.timeout_idx, deadline_name, result_temp, end_l)
     ir_emit_select_wait(loop_l, probe_count, offset_name)
     ir_emit_label(end_l)
+    ir_select_takes_counts = saved_takes
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + result_temp)
     return r
@@ -10400,7 +10456,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_catch_block(node)
 
     if kind == "select_expr":
-        return ir_emit_select_expr(node)
+        return ir_emit_select_expr(idx)
 
     if kind == "fail":
         return ir_emit_fail_expr(node)

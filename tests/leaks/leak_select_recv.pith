@@ -1,0 +1,69 @@
+# a select receive arm. the shell the receive handed over was stored in the
+# arm's binding and never released, and its payload with it; and an arm value
+# that already owned its count was retained again by the binding of the
+# select. SHAPE picks the arm form:
+#   1: an Int channel, the arm builds a tuple from the binding
+#   2: a String channel, the arm reads the binding's payload
+#   3: a String channel, the arm's value is the binding itself
+#   4: a String channel and a default arm that builds a fresh string
+import leakprobe as probe
+import std.concurrent
+
+fn got_value(v: Int?) -> (Int, Int?):
+    return (1, v)
+
+fn timed_out(v: Int?) -> (Int, Int?):
+    return (0, v)
+
+fn int_arm() -> Int:
+    ch := Channel[Int](1)
+    ch.send(5)
+    got := select:
+        v := ch.recv() => got_value(v)
+        timeout 50 => timed_out(none)
+    return got.0
+
+fn payload_arm(i: Int) -> Int:
+    ch := Channel[String](1)
+    ch.send("m" + i.to_string())
+    n := select:
+        v := ch.recv() => v.unwrap_or("").len()
+        timeout 50 => 0
+    return n
+
+fn binding_arm(i: Int) -> Int:
+    ch := Channel[String](1)
+    ch.send("m" + i.to_string())
+    got := select:
+        v := ch.recv() => v
+        timeout 50 => none
+    return got.unwrap_or("").len()
+
+fn default_arm(i: Int) -> Int:
+    ch := Channel[String](1)
+    if i % 2 == 0:
+        ch.send("m" + i.to_string())
+    s := select:
+        v := ch.recv() => "r" + v.unwrap_or("")
+        default => "d" + i.to_string()
+    return s.len()
+
+fn main():
+    shape := env("SHAPE")
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        if shape == "1":
+            checksum = checksum + int_arm()
+        elif shape == "2":
+            checksum = checksum + payload_arm(i)
+        elif shape == "3":
+            checksum = checksum + binding_arm(i)
+        else:
+            checksum = checksum + default_arm(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

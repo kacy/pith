@@ -193,6 +193,10 @@ cases=(
   tests/leaks/leak_or_pattern_subject
   tests/leaks/leak_pair_unwrap_or
   tests/leaks/leak_alias_rebind
+  "tests/leaks/leak_select_recv SHAPE=1"
+  "tests/leaks/leak_select_recv SHAPE=2"
+  "tests/leaks/leak_select_recv SHAPE=3"
+  "tests/leaks/leak_select_recv SHAPE=4"
   "tests/leaks/leak_crosskind_binding SHAPE=1"
   "tests/leaks/leak_crosskind_binding SHAPE=2"
   "tests/leaks/leak_crosskind_binding SHAPE=3"

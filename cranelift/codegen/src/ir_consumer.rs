@@ -1781,13 +1781,21 @@ fn live_functions(lines: &[&str]) -> Option<HashSet<String>> {
     Some(live)
 }
 
+fn is_count_mark(line: &str) -> bool {
+    let line = line.trim_start();
+    line == "mark" || line.starts_with("mark ")
+}
+
 /// Compile IR text to native code via Cranelift
 pub fn compile_from_ir(
     codegen: &mut CodeGen,
     ir_text: &str,
     runtime_funcs: &HashMap<String, FuncId>,
 ) -> Result<HashMap<String, FuncId>, CompileError> {
-    let lines: Vec<&str> = ir_text.lines().collect();
+    // `mark` lines are notes for the count checker and generate nothing. they
+    // go before any pass reads the text, so they can't split a pattern the
+    // rewrites below look for and change the code (see docs/ir-contract.md).
+    let lines: Vec<&str> = ir_text.lines().filter(|line| !is_count_mark(line)).collect();
     let live = live_functions(&lines);
     let is_live = |name: &str| live.as_ref().map_or(true, |set| set.contains(name));
     let mut declared_funcs: HashMap<String, FuncId> = HashMap::new();
@@ -4725,6 +4733,16 @@ mod tests {
     #[test]
     fn unknown_instruction_returns_compile_error() {
         let err = compile_err_for_ir("func main 0 int\nsurprise 1 2 3\nendfunc\n");
+        assert!(err.contains("unknown or malformed instruction"));
+    }
+
+    #[test]
+    fn count_marks_are_skipped_anywhere() {
+        compile_ok_for_ir(
+            "mark global __g_x string\nfunc main 0 int\nparam p\nmark kind p string\niconst 1 0\nmark owns s string\nret 1\nmark mixed t\nendfunc\n",
+        );
+        // only the whole word: `marked` is still an unknown instruction
+        let err = compile_err_for_ir("func main 0 int\nmarked 1\nendfunc\n");
         assert!(err.contains("unknown or malformed instruction"));
     }
 

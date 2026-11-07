@@ -4858,17 +4858,30 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
             # a fresh shell (a call result, a weak read) is the part's own
             ir_release_owned_optional_operand(expr_idx, part_r)
             return text_r
+        # a collection or struct part dies once rendered when nothing else
+        # holds it, like a call result (`"{names()}"`): before this every such
+        # part leaked. a borrowed one is left alone.
         if part_info.kind == "list":
-            return ir_emit_display_list(part_r, ir_type_from_tid(part_info.inner), false)
+            text_r := ir_emit_display_list(part_r, ir_type_from_tid(part_info.inner), false)
+            ir_release_owned_operand(expr_idx, part_r, part_type)
+            return text_r
         if part_info.kind == "map":
-            return ir_emit_display_map(part_r, ir_type_from_tid(part_info.key_type), ir_type_from_tid(part_info.value_type))
+            text_r := ir_emit_display_map(part_r, ir_type_from_tid(part_info.key_type), ir_type_from_tid(part_info.value_type))
+            ir_release_owned_operand(expr_idx, part_r, part_type)
+            return text_r
         if part_info.kind == "set":
             converted := ir_reg()
             ir_emit_call1(converted, ir_for_iter_conversion_call(ir_bytes_keyed_type(expr_idx, "set")), "list", part_r)
-            return ir_emit_display_list(converted, ir_type_from_tid(part_info.inner), true)
+            text_r := ir_emit_display_list(converted, ir_type_from_tid(part_info.inner), true)
+            # the list a set is shown through is always fresh
+            ir_rc_release_reg(converted, "list")
+            ir_release_owned_operand(expr_idx, part_r, part_type)
+            return text_r
     if part_type.len() > 0 and ir_struct_names.contains_key(part_type):
         if not ir_boxed_enums.contains_key(part_type):
-            return ir_emit_display_struct(part_r, part_type)
+            text_r := ir_emit_display_struct(part_r, part_type)
+            ir_release_owned_operand(expr_idx, part_r, part_type)
+            return text_r
     return part_r
 
 # kind codes shared with the runtime display helpers:

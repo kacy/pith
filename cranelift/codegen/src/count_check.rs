@@ -72,6 +72,8 @@ pub struct CountReport {
     pub undecided_reasons: BTreeMap<String, usize>,
     /// for each function undecided at a join, what disagreed there
     pub join_details: Vec<String>,
+    /// the functions that balance, for tools that check the checker
+    pub balanced_names: Vec<String>,
 }
 
 impl CountReport {
@@ -169,7 +171,10 @@ pub fn check_counts(lines: &[&str]) -> CountReport {
                 }
                 *report.undecided_reasons.entry(reason).or_insert(0) += 1;
             }
-            Ok(()) if checker.problems.is_empty() => report.passed += 1,
+            Ok(()) if checker.problems.is_empty() => {
+                report.passed += 1;
+                report.balanced_names.push(f.name.to_string());
+            }
             Ok(()) => {
                 report.failed += 1;
                 for p in checker.problems {
@@ -288,6 +293,11 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
             // a borrow one path made and the other never did: it holds no
             // count, and a slot only one path wrote can't be read past here
             (Some(x), None) | (None, Some(x)) if x.0 == 0 && !k.iter().any(|s| a_nulls.contains(s) || b_nulls.contains(s)) => {}
+            // a count one path holds in slots the other never wrote: nothing
+            // on the other path can give it up, so the first path leaks it
+            (Some(x), None) | (None, Some(x)) if x.0 > 0 && !x.1 && !k.iter().any(|s| a_nulls.contains(s) || b_nulls.contains(s)) => {
+                leaks.push(format!("@{}", k.join("|")));
+            }
             (x, y) => return Err(format!("{} holds {:?} on one path and {:?} on the other", k.join("|"), x, y)),
         }
     }
@@ -315,7 +325,8 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Result<Canon, String> 
             (None, None) => {}
         }
     }
-    let live = |key: &String| key == "null" || out.regobjs.contains_key(key) || out.objs.keys().any(|k| format!("@{}", k.join("|")) == *key);
+    let obj_keys: HashSet<String> = out.objs.keys().map(|k| format!("@{}", k.join("|"))).collect();
+    let live = |key: &String| key == "null" || out.regobjs.contains_key(key) || obj_keys.contains(key);
     let mut regs = BTreeMap::new();
     for (r, key) in &a.regs {
         let merged = match b.regs.get(r) {
@@ -595,8 +606,18 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 }
             }
         }
+        // only the globals this function names: the rest never change here,
+        // and carrying every global of the program through every block was
+        // most of the checker's time on a large program
+        let named: HashSet<&str> = self
+            .f
+            .body
+            .iter()
+            .filter(|ins| (ins[0] == "load" || ins[0] == "store") && ins.len() >= 3)
+            .map(|ins| if ins[0] == "load" { ins[2] } else { ins[1] })
+            .collect();
         for (g, k) in self.globals.iter() {
-            if is_counted(k) {
+            if is_counted(k) && named.contains(g) {
                 // a global holds one count of its value, or a null
                 let o = format!("global:{g}");
                 st.counts.insert(o.clone(), 1);
@@ -933,6 +954,9 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 // an await of an unknown kind may be an Int; a count on it
                 // can't be settled either way
                 ResultValue::Own if typ == "unknown" => Val::Unknown,
+                // a row that can't name where its counted result is borrowed
+                // from (the thread-local getters hand back the slot's value)
+                ResultValue::Plain if is_counted(typ) => Val::Obj(self.new_obj(st, 0)),
                 ResultValue::Plain => Val::Plain,
                 ResultValue::Own => Val::Obj(self.new_obj(st, 1)),
                 ResultValue::Borrow(_) => Val::Obj(self.new_obj(st, 0)),

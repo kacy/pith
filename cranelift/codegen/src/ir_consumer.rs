@@ -1796,6 +1796,9 @@ fn report_counts(report: &crate::count_check::CountReport) {
         for d in &report.join_details {
             eprintln!("  join: {d}");
         }
+        for name in &report.balanced_names {
+            eprintln!("  balanced: {name}");
+        }
     }
 }
 
@@ -1811,9 +1814,15 @@ pub fn compile_from_ir(
     runtime_funcs: &HashMap<String, FuncId>,
 ) -> Result<HashMap<String, FuncId>, CompileError> {
     // the count checker reads the marks, so it runs before they are dropped
-    if matches!(std::env::var("PITH_CHECK_COUNTS").as_deref(), Ok("1") | Ok("2")) {
+    let count_mode = std::env::var("PITH_CHECK_COUNTS").unwrap_or_default();
+    if matches!(count_mode.as_str(), "1" | "2" | "only") {
         let raw: Vec<&str> = ir_text.lines().collect();
         report_counts(&crate::count_check::check_counts(&raw));
+        // `only` is for tools that want the report and nothing else, such as
+        // the mutation run that checks the checker
+        if count_mode == "only" {
+            return Err(CompileError::ModuleError("stopped after the count check (PITH_CHECK_COUNTS=only)".into()));
+        }
     }
     // `mark` lines are notes for the count checker and generate nothing. they
     // go before any pass reads the text, so they can't split a pattern the

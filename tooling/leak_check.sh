@@ -185,6 +185,7 @@ cases=(
   tests/leaks/leak_pad_result
   tests/leaks/leak_imported_global_store
   tests/leaks/leak_temporary_container_reads
+  tests/leaks/leak_interpolated_collection
   tests/leaks/leak_or_pattern_subject
   "tests/leaks/leak_crosskind_binding SHAPE=1"
   "tests/leaks/leak_crosskind_binding SHAPE=2"

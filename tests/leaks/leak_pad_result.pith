@@ -1,0 +1,29 @@
+# pad_left and pad_right always build a new string, but the emitter's list of
+# methods that return one left them out, so a returned pad (`zfill`) was
+# retained as if it were borrowed and leaked one string per call. returned,
+# bound and passed are all churned here.
+import leakprobe as probe
+import std.strings as strings
+
+fn padded(s: String) -> String:
+    return s.pad_right(8, ".")
+
+fn take(s: String) -> Int:
+    return s.len()
+
+fn round(i: Int) -> Int:
+    n := i.to_string()
+    bound := n.pad_left(10, "0")
+    return strings.zfill(n, 6).len() + padded(n).len() + bound.len() + take(n.pad_left(12, " "))
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

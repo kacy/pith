@@ -61,16 +61,18 @@ pub fn build(cfg: config.Config) -> web.App!:
                 app = app.group(route.prefix, limits.per_subject(limits.caller_limits(route.subject_rate_per_second, route.subject_rate_burst)))
         if route.health_path != "":
             for target in pool.upstreams:
-                spawn upstream.health_loop(pool, target, route.health_path, route.health_interval_ms, prober)
+                spawn upstream.health_loop(pool.route, target, route.health_path, route.health_interval_ms, prober)
     return app
 
-fn run_grpc_listener(cfg: config.Config, dispatch: fn(String, grpc.GrpcStream) -> Int!grpc.GrpcError) -> Int!:
-    if cfg.server.tls_cert != "":
-        return grpc.serve_stream_tls(cfg.server.host, cfg.server.grpc_port, cfg.server.tls_cert, cfg.server.tls_key, dispatch)!
-    return grpc.serve_stream(cfg.server.host, cfg.server.grpc_port, dispatch)!
+fn run_grpc_listener(host: String, port: Int, tls_cert: String, tls_key: String, dispatch: fn(String, grpc.GrpcStream) -> Int!grpc.GrpcError) -> Int!:
+    if tls_cert != "":
+        return grpc.serve_stream_tls(host, port, tls_cert, tls_key, dispatch)!
+    return grpc.serve_stream(host, port, dispatch)!
 
-fn serve_grpc(cfg: config.Config, forwarder: grpc_proxy.Proxy) -> Int:
-    result := run_grpc_listener(cfg, fn(method: String, call: grpc.GrpcStream) => forwarder.forward(method, call))
+# the grpc listener's task. it takes the few settings it needs rather than the
+# config, which the http listener keeps reading.
+fn serve_grpc(host: String, port: Int, tls_cert: String, tls_key: String, forwarder: grpc_proxy.Proxy) -> Int:
+    result := run_grpc_listener(host, port, tls_cert, tls_key, fn(method: String, call: grpc.GrpcStream) => forwarder.forward(method, call))
     if result.is_err:
         log.root().target("gateway").error().str("error", result.err).msg("grpc listener failed")
         return 1
@@ -87,7 +89,7 @@ pub fn listen(cfg: config.Config, app: web.App) -> Int!:
     if cfg.server.grpc_port == 0:
         return serve_http(cfg, app)!
     forwarder := grpc_proxy.proxy(cfg)!
-    grpc_done := spawn serve_grpc(cfg, forwarder)
+    grpc_done := spawn serve_grpc(cfg.server.host, cfg.server.grpc_port, cfg.server.tls_cert, cfg.server.tls_key, forwarder)
     unfinished := serve_http(cfg, app)!
     return unfinished + await grpc_done
 

@@ -70,8 +70,8 @@ fn check_once(client: http.Client, target: Upstream, path: String) -> Bool:
     return response.is_ok and response.ok.status < 500
 
 # probe one upstream until a shutdown begins.
-pub fn health_loop(pool: Pool, target: Upstream, path: String, interval_ms: Int, client: http.Client) -> Int:
-    gauge := metrics.gauge("gateway_upstream_healthy").labels(["route", pool.route, "upstream", target.address])
+pub fn health_loop(route: String, target: Upstream, path: String, interval_ms: Int, client: http.Client) -> Int:
+    gauge := metrics.gauge("gateway_upstream_healthy").labels(["route", route, "upstream", target.address])
     gauge.set(1.0)
     mut failures := 0
     while not shutdown.requested():

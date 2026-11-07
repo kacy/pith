@@ -1,0 +1,32 @@
+# an interpolation that leaves its function early from a later part, by an
+# index miss or a failing `!`, used to strand the string folded before it.
+import leakprobe as probe
+
+fn fails(i: Int) -> Int!:
+    if i >= 0:
+        fail "always"
+    return i
+
+fn miss(ys: List[Int], i: Int) -> String!:
+    return "{i.to_string().repeat(4)} {ys[0]} {ys[5]}"
+
+fn bang(i: Int) -> String!:
+    return "{i.to_string().repeat(4)} {fails(i)!}"
+
+fn round(i: Int) -> Int:
+    ys := [1, 2]
+    a := miss(ys, i) catch "m"
+    b := bang(i) catch "b"
+    return a.len() + b.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

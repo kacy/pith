@@ -445,7 +445,7 @@ impl Server:
     # send window is dropped and its credit channel closed, which wakes the body
     # sender if it was blocked waiting on a window (it then gives up).
     #
-    # the inbox is closed as well as removed. deliver() takes the inbox handle
+    # the inbox is closed as well as removed. inbox_for() takes the inbox handle
     # under the mutex and sends outside it, so a stream that ends in that window
     # would otherwise leave the reader parked on a send into an inbox nobody will
     # ever drain — and the reader is shared, so that one stream wedges every
@@ -469,16 +469,15 @@ impl Server:
             n := self.active.len()
             return n
 
-    # hand an event to a stream's inbox, dropping it if the stream is already gone.
-    # the channel handle is taken under the mutex and the send happens outside it,
-    # so a briefly-behind handler never blocks the stream table (mirrors the
-    # client's deliver()).
-    fn deliver(stream_id: Int, event: StreamEvent):
+    # a stream's inbox, or none when the stream is already gone. the channel
+    # handle is taken under the mutex and the caller sends outside it, so a
+    # briefly-behind handler never blocks the stream table (mirrors the
+    # client's inbox_for()). the caller builds the event in the send.
+    fn inbox_for(stream_id: Int) -> Channel[StreamEvent]?:
         mut inbox: Channel[StreamEvent]? := none
         locked self.mu:
             inbox = self.streams.get(stream_id)
-        if let ch = inbox:
-            ch.send(event)
+        return inbox
 
     # queue a pre-serialized control frame for the writer. the outbound queue is
     # deeply buffered, so this effectively never blocks for the small control
@@ -526,7 +525,8 @@ impl Server:
             for stream_id in self.active:
                 ids.push(stream_id)
         for stream_id in ids:
-            self.deliver(stream_id, reset_event(frames.ERROR_CANCEL))
+            if let inbox = self.inbox_for(stream_id):
+                inbox.send(reset_event(frames.ERROR_CANCEL))
 
     # close every open stream's inbox so handlers blocked on recv() unblock, then
     # clear the table. called when the connection winds down.
@@ -1031,7 +1031,8 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
         return true
     if t == frames.FRAME_DATA:
         df := frames.parse_data(frame)!
-        server.deliver(df.stream_id, data_event(df.data, df.end_stream))
+        if let inbox = server.inbox_for(df.stream_id):
+            inbox.send(data_event(df.data, df.end_stream))
         # flow control counts the whole frame payload; grant the credit back so a
         # larger request body keeps flowing.
         replenish(server, df.stream_id, frame.header.length, df.end_stream)
@@ -1059,7 +1060,8 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
         return true
     if t == frames.FRAME_RST_STREAM:
         rs := frames.parse_rst_stream(frame)!
-        server.deliver(rs.stream_id, reset_event(rs.error_code))
+        if let inbox = server.inbox_for(rs.stream_id):
+            inbox.send(reset_event(rs.error_code))
         return true
     if t == frames.FRAME_GOAWAY:
         # the client is winding the connection down; stop reading.
@@ -1140,7 +1142,8 @@ fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.Heade
     locked server.mu:
         known = server.streams.contains_key(stream_id)
     if known:
-        server.deliver(stream_id, headers_event(fields, hf.end_stream))
+        if let inbox = server.inbox_for(stream_id):
+            inbox.send(headers_event(fields, hf.end_stream))
         return
     # client-initiated streams are odd (RFC 9113 §5.1.1); reject anything else.
     if stream_id % 2 == 0:
@@ -1159,7 +1162,8 @@ fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.Heade
     # spawn the handler before delivering the first event: the inbox is buffered,
     # so the send never blocks the reader waiting for the handler to start.
     spawn handle_stream(server, stream_id, inbox)
-    server.deliver(stream_id, headers_event(fields, hf.end_stream))
+    if let inbox = server.inbox_for(stream_id):
+        inbox.send(headers_event(fields, hf.end_stream))
 
 # grant flow-control credit for consumed body bytes: at the connection level
 # always, and at the stream level while the stream stays open. mirrors the

@@ -1,0 +1,15 @@
+# a value sent through a channel reaches the receiving task, so a list or a
+# struct reaching one that the sender still holds is refused (E248)
+struct Batch:
+    id: Int
+    rows: List[Int]
+
+fn main() -> Int!:
+    lists := Channel[List[Int]](1)
+    batches := Channel[Batch](1)
+    data: List[Int] := [1, 2, 3]
+    lists.send(data)
+    b := Batch(id: 1, rows: [4])
+    batches.try_send(b)
+    print(data.len().to_string())
+    return 0

@@ -200,13 +200,13 @@ collection at once — a list or map is a plain buffer behind a handle, and
 concurrent mutation races on that buffer.
 
 pass data between tasks through a channel rather than sharing a
-mutable collection. a channel hands the value over instead of aliasing
-it, so each task mutates its own. immutable values and independent
-copies (`std.collections.copy_list` and friends) are also safe to
-hand off. the checker enforces this for a `spawn` argument: passing a
-collection the current scope still holds reports E248, and so does a struct
-whose fields reach a collection outside a `guard` block. a global is covered
-by the sharing rule (E309).
+mutable collection. a channel hands over the handle, so the sender must not
+keep one: send a value built in the call, or an independent copy
+(`std.collections.copy_list` and friends). the checker enforces this for a
+`spawn` argument and for a channel `send` or `try_send`: a collection the
+current scope still holds reports E248, and so does a struct whose fields
+reach a collection outside a `guard` block. a global is covered by the
+sharing rule (E309).
 
 when a channel is the wrong shape — a registry every request reads and a
 few requests write, a counter, a cap on how many things run at once — reach

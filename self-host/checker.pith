@@ -6300,6 +6300,17 @@ fn check_sync_primitive_method_call(type_name: String, method: String, args: Lis
             return tid_bool
     return tid_err
 
+# a sent value reaches the receiving task, so it is held to the same rule as
+# a spawn's argument (E248)
+fn check_sent_value(args: List[Int]):
+    if args.len() != 1:
+        return
+    mut expr_idx := args[0]
+    arg_node := get_node(expr_idx)
+    if arg_node.kind == "arg" and arg_node.children.len() > 0:
+        expr_idx = arg_node.children[0]
+    report_shared_handoff(expr_idx, "a channel send cannot hand over")
+
 fn check_channel_method_call(method: String, info: TypeInfo, args: List[Int], scope_id: Int) -> Int:
     tid_int := lookup_type_id("Int")
     tid_bool := lookup_type_id("Bool")
@@ -6309,6 +6320,7 @@ fn check_channel_method_call(method: String, info: TypeInfo, args: List[Int], sc
     # widens into an optional payload there the same way a list push does.
     if method == "send":
         expect_one_widened_argument("Channel.send", args, inner, scope_id)
+        check_sent_value(args)
         return tid_bool
     if method == "recv":
         # recv() returns T? (optional of inner type)
@@ -6316,6 +6328,7 @@ fn check_channel_method_call(method: String, info: TypeInfo, args: List[Int], sc
         return add_type_info(ti_optional(inner))
     if method == "try_send":
         expect_one_widened_argument("Channel.try_send", args, inner, scope_id)
+        check_sent_value(args)
         return tid_bool
     if method == "try_recv":
         expect_no_arguments("Channel.try_recv", args)
@@ -7611,15 +7624,21 @@ fn check_spawn_shared_collections(call_node: Node, first_arg: Int):
         arg_node := get_node(child)
         if arg_node.kind == "arg" and arg_node.children.len() > 0:
             expr_idx = arg_node.children[0]
-        if spawn_arg_shares_collection(expr_idx):
-            tid := c_get_expr_type(expr_idx)
-            kind := get_type_info(tid).kind
-            if kind == "list" or kind == "map" or kind == "set":
-                report_error_with_fix_at(expr_idx, "E248", "a spawned task cannot take a " + kind + " this scope still holds; both threads would mutate the same buffer", "send it through a channel, or pass a copy (copy_" + kind + ")")
-            else:
-                mut seen: Map[Int, Bool] := {}
-                path := struct_holds_unguarded_collection(tid, seen)
-                report_error_with_fix_at(expr_idx, "E248", "a spawned task cannot take this " + get_type_name(tid) + ": its field '" + path + "' is a collection outside a `guard` block, and both threads would reach the same buffer", "move the field into a `guard` block, or hand the task its own copy")
+        report_shared_handoff(expr_idx, "a spawned task cannot take")
+
+# E248 for a value handed to another task, by `spawn` or by a channel send,
+# that this scope still holds a handle to. `refused` starts the message.
+fn report_shared_handoff(expr_idx: Int, refused: String):
+    if not spawn_arg_shares_collection(expr_idx):
+        return
+    tid := c_get_expr_type(expr_idx)
+    kind := get_type_info(tid).kind
+    if kind == "list" or kind == "map" or kind == "set":
+        report_error_with_fix_at(expr_idx, "E248", refused + " a " + kind + " this scope still holds; both threads would mutate the same buffer", "pass a copy (copy_" + kind + "), or build the value in the call")
+        return
+    mut seen: Map[Int, Bool] := {}
+    path := struct_holds_unguarded_collection(tid, seen)
+    report_error_with_fix_at(expr_idx, "E248", refused + " this " + get_type_name(tid) + ": its field '" + path + "' is a collection outside a `guard` block, and both threads would reach the same buffer", "move the field into a `guard` block, or hand over a copy built in the call")
 
 # true when the argument names a collection some other scope keeps a
 # handle to: a variable, a struct field, or a container element. fresh

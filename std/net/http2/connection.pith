@@ -1001,10 +1001,12 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
             else:
                 a.trailers = decoded
             if hf.end_stream:
-                deliver(client, hf.stream_id, a.to_event())
+                if let inbox = inbox_for(client, hf.stream_id):
+                    inbox.send(a.to_event())
                 accums.remove(hf.stream_id)
         else:
-            deliver(client, hf.stream_id, headers_event(decoded, hf.end_stream))
+            if let inbox = inbox_for(client, hf.stream_id):
+                inbox.send(headers_event(decoded, hf.end_stream))
             if hf.end_stream:
                 client.mark_finished(hf.stream_id)
         return true
@@ -1020,16 +1022,19 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
                 accums.remove(df.stream_id)
                 client.stop_unary(df.stream_id)
                 client.enqueue(frames.rst_stream_frame(df.stream_id, frames.ERROR_CANCEL)!)!
-                deliver(client, df.stream_id, reset_event(BODY_LIMIT_RESET))
+                if let inbox = inbox_for(client, df.stream_id):
+                    inbox.send(reset_event(BODY_LIMIT_RESET))
                 client.mark_finished(df.stream_id)
             elif df.data.len() > 0:
                 a.parts.push(df.data)
                 a.size = a.size + df.data.len()
             if df.end_stream and accums.contains_key(df.stream_id):
-                deliver(client, df.stream_id, a.to_event())
+                if let inbox = inbox_for(client, df.stream_id):
+                    inbox.send(a.to_event())
                 accums.remove(df.stream_id)
         else:
-            deliver(client, df.stream_id, data_event(df.data, df.end_stream))
+            if let inbox = inbox_for(client, df.stream_id):
+                inbox.send(data_event(df.data, df.end_stream))
             if df.end_stream:
                 client.mark_finished(df.stream_id)
         # flow control counts the whole frame payload, padding included.
@@ -1062,7 +1067,8 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
         # drop any half-built unary accumulator; the reset ends the stream.
         if accums.contains_key(rs.stream_id):
             accums.remove(rs.stream_id)
-        deliver(client, rs.stream_id, reset_event(rs.error_code))
+        if let inbox = inbox_for(client, rs.stream_id):
+            inbox.send(reset_event(rs.error_code))
         # a reset is terminal: close() must not answer it with a reset of ours.
         client.mark_finished(rs.stream_id)
         return true
@@ -1111,17 +1117,17 @@ fn send_goaway(client: Client, error_code: Int):
         return
     client.outbound.try_send(wire.ok)
 
-# hand an event to a waiting stream, dropping it if the stream is already gone
-# (e.g. a trailing frame after the response finished). the channel handle is
-# taken under the mutex and the send happens outside it, so a briefly-behind
-# consumer never blocks the stream table.
-fn deliver(client: Client, stream_id: Int, event: StreamEvent):
+# the inbox of a waiting stream, or none when the stream is already gone (e.g. a
+# trailing frame after the response finished). the channel handle is taken
+# under the mutex and the caller sends outside it, so a briefly-behind consumer
+# never blocks the stream table. the caller builds the event in the send, so
+# the stream's task holds the only reference to its headers.
+fn inbox_for(client: Client, stream_id: Int) -> Channel[StreamEvent]?:
     mut target: Channel[StreamEvent]? := none
     locked client.mu:
         if client.streams.contains_key(stream_id):
             target = client.streams[stream_id]
-    if let inbox = target:
-        inbox.send(event)
+    return target
 
 # close every waiting stream's inbox and clear the table, so pending request()
 # calls unblock with a connection-closed error.

@@ -4,23 +4,28 @@
 # map, a set or a struct is one buffer every task can reach. two tasks writing
 # it at once corrupt it, and a reader can see it torn. so each such global has
 # to be one of: declared in a `guard` block, `threadlocal`, or never written
-# after module init. this pass reports the rest as warnings, naming the global
-# and one spawn in the program.
+# after module init. this pass reports the rest as errors, naming the global
+# and one spawn in the program. `pith check`, `build`, `run` and `test` run it
+# after the checker, and `pith lint` reports it as well.
 #
 # the pass runs over the whole program `pith lint` loaded: the entry module and
 # everything it imports, so a library global is reported when a program that
 # spawns uses it. a program spawns when something in the entry module reaches a
-# spawn: a function spawns if its body holds one or calls, by name, a function
-# that spawns. names are matched without their module, which can count a
-# program as spawning when it does not, never the other way. a program that
+# spawn: a function spawns if its body holds one or calls a function that
+# spawns. a call is resolved the way the checker resolves it: a plain name to
+# the module's own function or a `from` import, `alias.f` through the import,
+# and a method through its receiver's type. a method on a receiver whose type
+# does not name the declaration, such as an interface, counts every method of
+# that name. a call through a function value is not followed. a program that
 # never reaches a spawn reports nothing. the pass reads the types the checker
 # already recorded, so it runs after a successful check.
 
 from ast import Node, get_node
-from errors import Diagnostic
-from checker import c_get_expr_type
+from errors import Diagnostic, has_errors
+from checker import c_get_expr_type, get_definition_of
 from types import get_type_info, get_type_name, is_error_type
-from driver import get_resolved_module_file
+from driver import get_resolved_module_file, get_resolved_module_path
+from checker_methods import method_tid_key, has_method_declaration, get_method_declaration_index
 
 # method names that change a collection in place
 MUTATING_METHODS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
@@ -28,7 +33,20 @@ MUTATING_METHODS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,exte
 # builtin values that synchronize themselves, or hold no shared buffer
 SELF_SYNCHRONIZED := ",AtomicInt,Mutex,WaitGroup,Semaphore,Channel,Task,"
 
-## the E309 warnings for the program rooted at `entry_root`, read from
+# the kinds of type with no pith methods of their own
+BUILTIN_RECEIVER_KINDS := ",channel,list,map,optional,primitive,result,set,task,tuple,function,"
+
+## the program's diagnostics with the sharing rule's errors added. the rule
+## reads the types the checker recorded, so it runs only on a program that
+## checked cleanly.
+pub fn add_sharing_errors(diags: List[Diagnostic], entry_root: Int, entry_path: String, import_roots: List[Int]) -> List[Diagnostic]:
+    if has_errors(diags):
+        return diags
+    for d in lint_shared_globals(entry_root, entry_path, import_roots):
+        diags.push(d)
+    return diags
+
+## the E309 errors for the program rooted at `entry_root`, read from
 ## `entry_path`, with `import_roots` the modules it loaded.
 pub fn lint_shared_globals(entry_root: Int, entry_path: String, import_roots: List[Int]) -> List[Diagnostic]:
     mut out: List[Diagnostic] := []
@@ -37,38 +55,45 @@ pub fn lint_shared_globals(entry_root: Int, entry_path: String, import_roots: Li
     for r in import_roots:
         roots.push(r)
         files.push(get_resolved_module_file(r))
+    # the globals the rule could report come first: they are a scan of each
+    # module's top level, and most programs have none, which spares them the
+    # spawn search over every function
+    mut written: List[List[Int]] := []
+    mut any := false
+    for r in roots:
+        found := written_shared_globals(r)
+        if found.len() > 0:
+            any = true
+        written.push(found)
+    if not any:
+        return out
     spawn_at := reached_spawn(roots, files)
     if spawn_at == "":
         return out
-    for r, i in roots:
-        lint_module_globals(r, files[i], spawn_at, out)
+    for found, i in written:
+        for idx in found:
+            node := get_node(idx)
+            name := binding_name(node.value)
+            out.push(Diagnostic("error", "E309", "'" + name + "' is a mut module global holding a shared buffer, written after module init, in a program that spawns tasks (" + spawn_at + ")", files[i], node.line, node.col, "declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init"))
     return out
+
+# the program's functions, for the spawn search below. `nodes[k]` is a
+# function's declaration node and `modules[k]` the index of its module in the
+# roots list. a free function is found by module and name, a method by its
+# declaration node, which the checker hands back for a typed receiver, or by
+# name alone when the receiver's type does not say whose method it is.
+struct ProgramFns:
+    nodes: List[Int]
+    modules: List[Int]
+    free_fns: Map[String, Int]
+    methods_by_name: Map[String, List[Int]]
+    aliases: Map[String, Int]
+    from_names: Map[String, Int]
+    module_of: Map[Int, Int]
+    definitions: Map[Int, Int]
 
 # where the entry module (roots[0]) reaches a spawn, as "file:line", or ""
 fn reached_spawn(roots: List[Int], files: List[String]) -> String:
-    mut fn_names: List[String] := []
-    mut fn_nodes: List[Int] := []
-    mut fn_module: List[Int] := []
-    for r, i in roots:
-        collect_functions(r, i, fn_names, fn_nodes, fn_module)
-    # where each spawning function's spawn is, or the callee it reaches one by
-    mut spawning: Map[String, String] := {}
-    for idx, k in fn_nodes:
-        found := first_spawn(idx)
-        if found >= 0:
-            spawning.insert(fn_names[k], files[fn_module[k]] + ":" + get_node(found).line.to_string())
-    mut changed := true
-    while changed:
-        changed = false
-        for idx, k in fn_nodes:
-            if not spawning.contains_key(fn_names[k]):
-                via := called_spawning(idx, spawning)
-                if via != "":
-                    spawning.insert(fn_names[k], spawning[via])
-                    changed = true
-    for idx, k in fn_nodes:
-        if fn_module[k] == 0 and spawning.contains_key(fn_names[k]):
-            return spawning[fn_names[k]]
     # a spawn at the entry's top level, outside any function
     entry := get_node(roots[0])
     for child in entry.children:
@@ -76,39 +101,153 @@ fn reached_spawn(roots: List[Int], files: List[String]) -> String:
             found := first_spawn(child)
             if found >= 0:
                 return files[0] + ":" + get_node(found).line.to_string()
+    fns := ProgramFns(nodes: [], modules: [], free_fns: {}, methods_by_name: {}, aliases: {}, from_names: {}, module_of: {}, definitions: get_definition_of())
+    for r, i in roots:
+        collect_functions(r, i, false, fns)
+    record_imports(roots, fns)
+    # a depth-first search from the entry's functions. a function's calls are
+    # resolved only when the search reaches it, and the search ends at the
+    # first spawn, so a function visited without one cannot reach one.
+    mut visited: Map[Int, Bool] := {}
+    for idx, k in fns.nodes:
+        if fns.modules[k] == 0:
+            found := spawn_reached_from(idx, fns, files, visited)
+            if found != "":
+                return found
+    return ""
+
+# where a function reaches a spawn, as "file:line", or "" when it does not or
+# the search has already been through it
+fn spawn_reached_from(idx: Int, fns: ProgramFns, files: List[String], visited: Map[Int, Bool]) -> String:
+    if visited.contains_key(idx):
+        return ""
+    visited.insert(idx, true)
+    module := fns.module_of[idx]
+    mut targets: List[Int] := []
+    found := collect_call_targets(idx, module, fns, targets)
+    if found >= 0:
+        return files[module] + ":" + get_node(found).line.to_string()
+    for target in targets:
+        reached := spawn_reached_from(target, fns, files, visited)
+        if reached != "":
+            return reached
     return ""
 
 # every function and method declared under a module root, and every test
-fn collect_functions(idx: Int, module: Int, names: List[String], nodes: List[Int], modules: List[Int]):
+fn collect_functions(idx: Int, module: Int, in_impl: Bool, fns: ProgramFns):
     node := get_node(idx)
-    if node.kind == "fn_decl":
-        names.push(node.value)
-        nodes.push(idx)
-        modules.push(module)
+    if node.kind == "fn_decl" or node.kind == "test_decl":
+        fns.nodes.push(idx)
+        fns.modules.push(module)
+        fns.module_of.insert(idx, module)
+        if node.kind == "fn_decl" and in_impl:
+            mut same: List[Int] := []
+            if fns.methods_by_name.contains_key(node.value):
+                same = fns.methods_by_name[node.value]
+            same.push(idx)
+            fns.methods_by_name.insert(node.value, same)
+        elif node.kind == "fn_decl":
+            fns.free_fns.insert(module.to_string() + "\t" + node.value, idx)
         return
-    if node.kind == "test_decl":
-        names.push("test " + node.value)
-        nodes.push(idx)
-        modules.push(module)
-        return
-    if node.kind == "module" or node.kind == "pub" or node.kind == "impl_decl":
+    if node.kind == "module" or node.kind == "pub":
         for child in node.children:
-            collect_functions(child, module, names, nodes, modules)
+            collect_functions(child, module, in_impl, fns)
+    if node.kind == "impl_decl":
+        for child in node.children:
+            collect_functions(child, module, true, fns)
 
-# the first name a subtree calls that is a spawning function, or ""
-fn called_spawning(idx: Int, spawning: Map[String, String]) -> String:
+# each module's import aliases and `from` names, keyed by "module\tname",
+# pointing at the index of the module they name
+fn record_imports(roots: List[Int], fns: ProgramFns):
+    mut by_path: Map[String, Int] := {}
+    for r, i in roots:
+        path := get_resolved_module_path(r)
+        if path != "":
+            by_path.insert(path, i)
+    for r, i in roots:
+        for child in get_node(r).children:
+            node := get_node(child)
+            parts := node.value.split(" ")
+            if parts.len() == 0 or not by_path.contains_key(parts[0]):
+                continue
+            target := by_path[parts[0]]
+            if node.kind == "import":
+                segments := parts[0].split(".")
+                mut alias := segments[segments.len() - 1]
+                if parts.len() >= 3 and parts[1] == "as":
+                    alias = parts[2]
+                fns.aliases.insert(i.to_string() + "\t" + alias, target)
+            elif node.kind == "from_import":
+                for name, j in parts:
+                    if j > 0:
+                        fns.from_names.insert(i.to_string() + "\t" + name, target)
+
+# the functions a subtree in `module` calls, appended to `out`, and the first
+# spawn in it, or -1. the walk stops at a spawn, since then the calls no longer
+# matter. the checker
+# records the declaration most calls resolve to; the module, import and
+# receiver-type lookups below cover the rest, such as a method called through
+# an interface.
+fn collect_call_targets(idx: Int, module: Int, fns: ProgramFns, out: List[Int]) -> Int:
     node := get_node(idx)
+    if node.kind == "spawn":
+        return idx
+    mut def_key := 0 - 1
     if node.kind == "call" and node.children.len() > 0:
+        def_key = node.children[0]
+    elif node.kind == "method_call":
+        def_key = idx
+    if def_key >= 0 and fns.definitions.contains_key(def_key) and fns.module_of.contains_key(fns.definitions[def_key]):
+        out.push(fns.definitions[def_key])
+    elif node.kind == "call" and node.children.len() > 0:
         callee := get_node(node.children[0])
-        if (callee.kind == "ident" or callee.kind == "field_access") and spawning.contains_key(callee.value):
-            return callee.value
-    if node.kind == "method_call" and spawning.contains_key(node.value):
-        return node.value
+        if callee.kind == "ident":
+            push_free_fn(module, callee.value, fns, out)
+            if fns.from_names.contains_key(module.to_string() + "\t" + callee.value):
+                push_free_fn(fns.from_names[module.to_string() + "\t" + callee.value], callee.value, fns, out)
+        elif callee.kind == "field_access" and callee.children.len() > 0:
+            push_module_call(module, callee.children[0], callee.value, fns, out)
+    elif node.kind == "method_call" and node.children.len() > 0:
+        if not push_module_call(module, node.children[0], node.value, fns, out):
+            push_method(node.children[0], node.value, fns, out)
     for child in node.children:
-        found := called_spawning(child, spawning)
-        if found != "":
+        found := collect_call_targets(child, module, fns, out)
+        if found >= 0:
             return found
-    return ""
+    return 0 - 1
+
+fn push_free_fn(module: Int, name: String, fns: ProgramFns, out: List[Int]):
+    key := module.to_string() + "\t" + name
+    if fns.free_fns.contains_key(key):
+        out.push(fns.free_fns[key])
+
+# `alias.name(...)` with `alias` an import of `module`: push the function it
+# names and return true. false when the receiver is not an import alias.
+fn push_module_call(module: Int, receiver_idx: Int, name: String, fns: ProgramFns, out: List[Int]) -> Bool:
+    receiver := get_node(receiver_idx)
+    if receiver.kind != "ident":
+        return false
+    key := module.to_string() + "\t" + receiver.value
+    if not fns.aliases.contains_key(key):
+        return false
+    push_free_fn(fns.aliases[key], name, fns, out)
+    return true
+
+# a method call: the declaration the receiver's type names, or every method
+# with this name when the type does not say. a builtin collection, channel or
+# task has no pith methods, so a call on one adds nothing.
+fn push_method(receiver_idx: Int, name: String, fns: ProgramFns, out: List[Int]):
+    tid := c_get_expr_type(receiver_idx)
+    if not is_error_type(tid):
+        key := method_tid_key(tid, name)
+        if has_method_declaration(key):
+            out.push(get_method_declaration_index(key))
+            return
+        if BUILTIN_RECEIVER_KINDS.contains("," + get_type_info(tid).kind + ","):
+            return
+    if fns.methods_by_name.contains_key(name):
+        for m in fns.methods_by_name[name]:
+            out.push(m)
 
 # the first spawn under a node, or -1
 fn first_spawn(idx: Int) -> Int:
@@ -121,8 +260,11 @@ fn first_spawn(idx: Int) -> Int:
             return found
     return 0 - 1
 
-fn lint_module_globals(root_idx: Int, file: String, spawn_at: String, out: List[Diagnostic]):
+# the module's `mut` globals holding a shared buffer that are neither guarded
+# nor threadlocal and are written after module init
+fn written_shared_globals(root_idx: Int) -> List[Int]:
     root := get_node(root_idx)
+    mut reported: List[Int] := []
     mut candidates: List[Int] := []
     for child in root.children:
         mut node := get_node(child)
@@ -135,7 +277,7 @@ fn lint_module_globals(root_idx: Int, file: String, spawn_at: String, out: List[
             if holds_shared_buffer(node):
                 candidates.push(idx)
     if candidates.len() == 0:
-        return
+        return reported
     mut written: Map[String, Bool] := {}
     for child in root.children:
         mut idx := child
@@ -146,10 +288,9 @@ fn lint_module_globals(root_idx: Int, file: String, spawn_at: String, out: List[
         if kind != "binding" and kind != "threadlocal":
             collect_writes(idx, written)
     for idx in candidates:
-        node := get_node(idx)
-        name := binding_name(node.value)
-        if written.contains_key(name):
-            out.push(Diagnostic("warning", "E309", "'" + name + "' is a mut module global holding a shared buffer, written after module init, in a program that spawns tasks (" + spawn_at + ")", file, node.line, node.col, "declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init"))
+        if written.contains_key(binding_name(get_node(idx).value)):
+            reported.push(idx)
+    return reported
 
 fn binding_name(value: String) -> String:
     sp := value.index_of(" ")

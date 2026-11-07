@@ -1,0 +1,29 @@
+# a channel send passes E248 for a value built in the send, a copy, or a
+# struct whose collections are guarded
+import std.collections as collections
+
+struct Batch:
+    id: Int
+    guard mu:
+        rows: List[Int]
+
+fn sum(b: Batch) -> Int:
+    mut total := 0
+    locked b.mu:
+        for r in b.rows:
+            total = total + r
+    return total
+
+fn main() -> Int:
+    lists := Channel[List[Int]](4)
+    data: List[Int] := [1, 2, 3]
+    lists.send([7, 8])
+    lists.send(collections.copy_list(data))
+    batches := Channel[Batch](2)
+    b := Batch(id: 1, rows: [4, 5])
+    batches.send(b)
+    first := lists.recv().value()
+    second := lists.recv().value()
+    got := batches.recv().value()
+    print("lists {first.len()} {second.len()} batch {sum(got)} kept {data.len()}")
+    return 0

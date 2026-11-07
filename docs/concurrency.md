@@ -274,6 +274,13 @@ in a program that spawns tasks, a `mut` global collection that is written
 after module init must be in a `guard` block or `threadlocal`, and the
 compiler refuses one that is neither (E309).
 
+a value read inside `locked` stays there: storing a guarded collection in
+a variable declared outside the block, returning it, or capturing it in a
+closure is refused (E276), since the handle would reach the buffer after the
+unlock. moving it out and giving the field a new value, as a drain does, is
+allowed. data that is built once and only read after belongs in a `frozen`
+field (see docs/ownership.md), which any task reads with no lock.
+
 `guard shard_mu[8]:` declares a list of eight mutexes, for state split into
 shards. holding any element of the list reaches the data under it, since the
 checker does not track which index is which.

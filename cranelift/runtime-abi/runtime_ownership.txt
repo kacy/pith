@@ -1,0 +1,529 @@
+# key|params|result|evidence|note
+#
+# what each runtime function does with the reference counts of its arguments
+# and its result. the count checker reads this instead of trusting the
+# emitter, which is the thing it checks. build.rs refuses a key from
+# runtime_functions.txt without exactly one row here.
+#
+# params, one token per parameter:
+#   -   not a counted value (an int, a float, a length, a tag, a file handle)
+#   b   borrowed: read during the call; the caller's count is left alone. a
+#       callee that keeps the value takes a count of its own.
+#   c   consumed: the callee takes over the caller's count
+#
+# result:
+#   -          void, or not a counted value
+#   own        the caller gets a count it must give up
+#   borrow:N   valid only while argument N lives and is unchanged
+#   pair:...   the function returns the (flag, payload) register pair, and
+#              the rest of the token describes the payload
+#
+# retain functions are `b` here: they add a count, which the checker knows by
+# name. evidence is the line of the code or doc comment that decides a row.
+# each row comes from the runtime source, not from how the emitter calls it.
+pith_runtime_error|-|-|-|never returns: prints and exits(1)
+pith_concat_cstr|b,b|own|runtime_core.rs:1608|fresh string (pith_strdup / pith_alloc_cstring); both inputs only read. Both null returns null
+pith_concat_cstr_many|-,b,b,b,b,b,b,b,b|own|runtime_core.rs:1640|first param is the part count; parts only read; fresh allocation, null when every part is null
+pith_cstring_append_many|-,c,b,b,b,b,b,b,b|own|runtime_core.rs:1679|base consumed: written in place (possibly realloc'd, old pointer invalid) when its count is 1, else a fresh concat is built and base is released (runtime_core.rs:1730). Result carries the count. Parts only read; a part equal to base forces the copy path
+pith_cstring_retain|b|-|runtime_core.rs:248|retain: adds one count to a heap cstring; no-op for literals and null
+pith_display_list|b,-,-|own|runtime_core.rs:2984|fresh string; list and its elements only read. Internal leak: for elem_kind 1 display_value allocates via pith_float_to_cstr and never releases it (runtime_core.rs:2962)
+pith_list_retain_handle|b|-|list.rs:1677|retain: adds one count to arg 0 (no-op when the magic check fails)
+pith_list_release_handle|c|-|list.rs:1688|release: drops one count; at zero releases every owned element (list.rs:1508) and frees
+pith_map_retain_handle|b|-|map.rs:954|retain: adds one count to arg 0 (no-op when the magic check fails)
+pith_map_release_handle|c|-|map.rs:965|release: drops one count via pith_map_release (map.rs:721); at zero releases owned values and frees
+pith_set_retain_handle|b|-|set.rs:367|retain: adds one count to arg 0 (no-op when the magic check fails)
+pith_set_release_handle|c|-|set.rs:378|release: drops one count via pith_set_release (set.rs:341); sets hold no counted elements
+pith_display_map|b,-,-|own|-|fresh cstring from pith_copy_bytes_to_cstring (map.rs:1863); map and its values only read
+pith_cstring_release|c|-|runtime_core.rs:289|release: drops one count, frees on last; no-op for literals and null
+pith_print|b|-|runtime_core.rs:1088|reads only. Rust signature takes PithString by value (ptr,len,is_heap: 24 bytes, passed in memory under SysV), not one I64; ABI line says I64
+int_to_string|-|own|-|fresh
+uint_to_string|-|own|-|fresh
+float_to_string|-|own|-|fresh
+float_format|-,-|own|-|fresh
+format_pad|b,-,-,-|own|-|fresh copy even when no padding is needed
+bool_to_string|-|own|-|fresh heap copy of "true"/"false"
+ord|b|-|-|
+chr|-|own|runtime_core.rs:1864|returns a static one-byte string from STATIC_CHARS with the literal magic; retain/release are no-ops on it, so releasing it is safe but not required
+pith_print_cstr|b|-|-|
+pith_closure_new|-|own|-|fresh closure, refcount 1 (func_ptr is a code address)
+pith_closure_get_fn|b|-|-|returns the code pointer, not counted
+pith_closure_set_env|b,-,b|-|runtime_core.rs:1029|stores value into the slot without retaining and leaves the slot tag untouched (0 on a fresh closure), so the closure never releases it; the stored value holds no count of its own. Does not release a previous slot value
+pith_closure_set_env_rc|b,-,c,-|-|runtime_core.rs:1042|stores without retaining ("the caller has already retained the value into the closure") and tags the slot so the closure's last release drops that count (runtime_core.rs:702). Consumes only when tag is a counted kind (1-10; tag 8 is a weak count); tag 0 stores a plain value. Overwriting a slot does not release its old value
+pith_closure_get_env|b,-|borrow:0|runtime_core.rs:1068|returns the stored slot value without retaining; owned by the closure's capture count
+pith_closure_retain|b|-|runtime_core.rs:793|retain: adds one count to the closure
+pith_closure_release|c|-|runtime_core.rs:807|release: drops one count; last release releases every tagged capture then frees the shell
+print_err|b|-|-|
+pith_main_error_exit|b,-|-|runtime_core.rs:1807|never returns: prints err (read only when is_string != 0) and exits(1)
+bit_and|-,-|-|-|
+bit_or|-,-|-|-|
+bit_xor|-,-|-|-|
+bit_shl|-,-|-|-|
+bit_shr|-,-|-|-|
+bit_rotl32|-,-|-|-|
+bit_rotr32|-,-|-|-|
+bit_rotl64|-,-|-|-|
+bit_rotr64|-,-|-|-|
+bit_not|-|-|-|
+UInt|-|-|-|
+Int8|-|-|-|
+Int16|-|-|-|
+Int32|-|-|-|
+Int64|-|-|-|
+UInt8|-|-|-|
+UInt16|-|-|-|
+UInt32|-|-|-|
+UInt64|-|-|-|
+abs|-|-|-|
+min|-,-|-|-|
+max|-,-|-|-|
+clamp|-,-,-|-|-|
+pow|-,-|-|-|
+sqrt|-|-|-|
+floor|-|-|-|
+ceil|-|-|-|
+round|-|-|-|
+assert|-|-|-|
+pith_list_eq_scalar|b,b|-|-|reads list contents only
+pith_list_eq_string|b,b|-|-|reads list contents and element strings only
+pith_assert_eq_fail|b,b,-|-|runtime_core.rs:2020|a and b are decoded per kind (string, bytes, list) and only read; they are uncounted when kind is int/float/bool
+pith_assert_ne_fail|b,b,-|-|runtime_core.rs:2038|as pith_assert_eq_fail
+set_test_failed|-|-|-|
+pith_test_fail_site|b,-,-|-|-|copies file into a Rust String
+report_test_case|b,-,b|-|-|
+pith_test_fork||-|-|returns a pid
+pith_test_set_file|b|-|-|copies file into a Rust String; returns 0
+pith_test_should_run|b,b|-|-|copies both into Rust Strings
+pith_test_enter|b|-|-|copies name into a Rust String; returns 0
+pith_test_child_ok||-|-|never returns
+skip_test|b|-|-|never returns: exits with the skip code
+test_name||own|runtime_core.rs:2420|fresh string via pith_strdup_string (allocated even when empty)
+pith_test_record|b,-|-|-|
+pith_test_summary||-|-|
+pith_list_new|-,-|own|-|fresh list rc=1 (list.rs:93, list.rs:526); params are elem_size and tag code
+pith_list_new_default||own|-|fresh primitive list (list.rs:449)
+pith_list_new_cstr||own|-|fresh String-tagged list
+pith_list_new_nested_list||own|-|fresh List-tagged list
+pith_list_new_nested_map||own|-|fresh Map-tagged list
+pith_list_new_struct||own|-|fresh Struct-tagged list
+pith_list_new_bytes||own|-|fresh Bytes-tagged list
+pith_list_new_closure||own|-|fresh Closure-tagged list
+pith_list_new_set||own|-|fresh Set-tagged list
+pith_list_new_channel||own|-|fresh Channel-tagged list
+pith_list_new_sync||own|-|fresh Sync-tagged list
+pith_map_new_default||own|-|fresh string-key map, primitive values
+pith_map_new_int||own|-|fresh int-key map, primitive values
+pith_map_new_cstr_val||own|-|fresh string-key map owning String values
+pith_map_new_int_cstr_val||own|-|fresh int-key map owning String values
+pith_set_new_default||own|-|fresh string set rc=1 (set.rs:173)
+pith_list_push_value|b,b|-|list.rs:770|list retains the value with its element tag (list.rs:661-662); primitive list retains nothing
+pith_list_push_value_owned|b,c|-|list.rs:668|takes the caller's count only when the list is tagged; an untagged (Primitive) list takes nothing and the caller's count leaks (list.rs:673-676); invalid handle returns without taking it (leak)
+list_push_kind|b,b,-|-|list.rs:755|borrowed: list retains with its tag (adopting tag when empty and Primitive); if it cannot own the kind it adds an extra retain under arg 2's kind (leak, never a free). If the list holds a different heap kind it also retains under the list's own (wrong) tag (list.rs:758)
+pith_list_set_value|b,-,b|-|list.rs:858|retains incoming value, releases displaced element (list.rs:861-865); out-of-range index stores nothing and takes nothing
+pith_list_set_value_owned|b,-,c|-|list.rs:847|consumes: in range takes the caller's count (tagged list); out of range releases it (list.rs:849-851). Untagged list: release_element(Primitive) is a no-op so nothing is consumed. Invalid handle returns without releasing (leak)
+pith_list_set_scalar|b,-,-|-|list.rs:818|scalar store, no counts; a non-Primitive list falls back to set_value_inner borrowed (list.rs:829-831)
+list_set_kind|b,-,b,-|-|list.rs:740|borrowed: retains (same fallback as list_push_kind, never adopts in practice), then releases displaced (list.rs:741-745); out-of-range takes nothing
+pith_list_set_value_strict|b,-,b|-|list.rs:899|as pith_list_set_value; exits process on bad index (list.rs:886-894)
+pith_list_set_value_owned_strict|b,-,c|-|list.rs:905|as pith_list_set_value_owned after a bounds check that exits on miss; consumes when list tagged
+pith_list_set_scalar_strict|b,-,-|-|list.rs:909|bounds check then pith_list_set_scalar
+list_set_kind_strict|b,-,b,-|-|list.rs:961|bounds check then pith_list_set_value_kind
+pith_list_set_value_checked|b,-,b|-|list.rs:932|returns 1 stored / 0 miss (int); borrowed either way
+pith_list_set_value_owned_checked|b,-,c|-|list.rs:914|CONDITIONAL on result: returns 1 and consumes (tagged list) when in bounds; returns 0 and leaves the value with the caller on a miss or dead handle (list.rs:916-918, 942-944)
+pith_list_set_scalar_checked|b,-,-|-|list.rs:950|returns 1/0 (int); no counts
+list_join|b,b|own|list.rs:972|fresh cstring (list.rs:1003); empty list returns the static empty literal (list.rs:979, release is a no-op); invalid handle returns null
+list_join_int|b,b|own|-|fresh cstring via pith_copy_bytes_to_cstring (list.rs:1055); invalid handle returns null
+pith_list_get_value|b,-|borrow:0|list.rs:1244|returns the stored word without retaining; 0 on miss
+pith_list_get_value_strict|b,-|borrow:0|list.rs:1218|stored word, no retain; exits on miss
+pith_list_get_value_unchecked|b,-|borrow:0|list.rs:1273|stored word, no retain; 0 on miss
+pith_list_get_opt|b,-|own|runtime_core.rs:3753|fresh 2-slot optional struct (pith_struct_alloc) or 0 for None; payload field is the stored element NOT retained (borrowed from arg 0, list.rs:1107)
+pith_list_first_opt|b|own|runtime_core.rs:3770|fresh optional box or 0; payload not retained (borrowed from arg 0, list.rs:1123)
+pith_list_last_opt|b|own|runtime_core.rs:3770|fresh optional box or 0; payload not retained (borrowed from arg 0, list.rs:1150)
+pith_list_first_opt_pair|b|pair:borrow:0|runtime_core.rs:3780|(1, stored element) or (0,0); element not retained
+pith_list_last_opt_pair|b|pair:borrow:0|runtime_core.rs:3780|(1, stored element) or (0,0); element not retained
+pith_list_len|b|-|-|
+pith_list_pop|b|-|list.rs:1062|UNSURE: ABI mismatch. Key says (I64)->I64 but the Rust symbol is (list: *mut PithList, elem_size: i64, out: *mut u8) -> bool. The popped element is written to *out with the list's count transferred to the caller (list.rs:1081-1083), so the out value is owned, but with one argument the out/elem_size registers are garbage
+pith_auto_len|b|-|-|reads list length or cstring length
+pith_map_len|b|-|-|
+pith_string_contains|b,b|-|string.rs:239|reads only. Rust takes *const PithString (pointers to {ptr,len,is_heap} structs), not cstrings
+pith_string_starts_with|b,b|-|string.rs:259|reads only. Rust takes *const PithString, not cstrings
+pith_cstring_eq|b,b|-|-|
+string_len|b|-|-|
+pith_cstring_is_empty|b|-|-|
+bytes_from_string_utf8|b|own|-|copies the string's bytes into a fresh Bytes; a null string gives a fresh empty Bytes
+list_insert|b,-,b|-|list.rs:799|list retains with its tag (list.rs:775-777)
+pith_list_insert_value_owned|b,-,c|-|list.rs:783|takes caller's count when tagged; untagged list takes nothing (leak, list.rs:786-787); invalid handle leaks
+list_insert_kind|b,-,b,-|-|list.rs:713|borrowed, same retain logic as list_push_kind (borrowed_store_retains list.rs:755)
+map_take_ikey|b,-|own|map.rs:895|removes entry and transfers the map's count to the caller, no retain/release (map.rs:945-950); primitive map returns the raw int; 0 on miss
+map_take|b,b|own|map.rs:914|transfers the map's count to caller (take_keyed map.rs:945); key cstring only read; 0 on miss
+pith_struct_retain|b|-|runtime_core.rs:3852|retain: adds one strong count; a dead struct gets no count
+pith_share|b,-|-|share.rs:49|marks value and everything reachable shared (flag bits only); no count change; tag is an element-tag code
+pith_share_into|b,b,-|-|share.rs:62|write barrier: marks value shared when holder struct is shared; no count change on either
+pith_struct_release|c|-|runtime_core.rs:3921|release: drops one strong count; last runs the destructor, marks dead, drops the implicit weak unit
+pith_struct_strong_count|b|-|-|reads the strong count
+pith_quarantine_check_struct|b|-|-|reads header flags only (runtime_core.rs:3818); exits on a dead struct
+pith_struct_set_dtor|b,-|-|-|writes the destructor address into the header
+pith_struct_weak_retain|b|-|runtime_core.rs:4162|adds one weak count; strong count untouched
+pith_struct_weak_release|b|-|runtime_core.rs:4180|drops one weak count (consumes a weak reference); strong count untouched
+pith_struct_weak_upgrade|b|own|runtime_core.rs:4195|returns ptr with one new strong count taken by CAS, or 0 when dead; the caller releases it
+pith_cc_register_tracer|-,-|-|-|dtor and tracer are function addresses
+pith_cc_visit|b,-|-|cycle.rs:216|reports a child to the installed collector hook or the per-thread buffer; never retains or releases
+pith_cycle_gc_collect_now||-|-|returns 1/0
+pith_cycle_gc_stats||-|-|
+pith_bytes_retain|b|-|bytes.rs:91|retain: the caller holds one more count after the call; magic check makes garbage a no-op
+pith_bytes_release|c|-|bytes.rs:103|release: drops one count, the last frees; over-release is caught and undone
+bytes_to_string_utf8|b|own|bytes.rs:147|fresh string copy via pith_copy_bytes_to_cstring; null on invalid handle or invalid utf-8
+bytes_substring_utf8|b,-,-|own|bytes.rs:170|fresh string copy of the clamped range; null on invalid utf-8 or handle
+bytes_len|b|-|-|
+bytes_is_empty|b|-|-|
+bytes_get|b,-|-|-|
+bytes_get_strict|b,-|-|-|exits the process on a bad handle or out-of-bounds index
+pith_bytes_data_ptr|b|-|bytes.rs:181|returns the raw data pointer (uncounted), valid only while arg 0 lives; doc says the caller holds the bytes alive
+pith_load_u8|-,-|-|bytes.rs:198|raw pointer read; no counts
+pith_load_u16|-,-|-|bytes.rs:198|raw pointer read; no counts
+pith_load_u32|-,-|-|bytes.rs:198|raw pointer read; no counts
+pith_load_u64|-,-|-|bytes.rs:198|raw pointer read; no counts
+pith_store_u64|-,-,-|-|bytes.rs:238|UNSURE: a raw unaligned word store with no retain or release. The runtime treats value as a plain word; if the decoder ever stores a counted pointer with it, the slot silently takes the caller's count (behaves as c). The doc says only "writes a struct slot"
+pith_cstring_from_raw|-,-|own|bytes.rs:249|fresh string copied from a raw pointer and length (doc: "A fresh counted string")
+bytes_slice|b,-,-|own|bytes.rs:311|whole-range slice returns arg 0 itself after pith_bytes_retain; otherwise a fresh copy; 0 on invalid handle
+bytes_concat|b,b|own|bytes.rs:329|with an empty side, returns the other argument after pith_bytes_retain (bytes.rs:329/333); otherwise fresh; 0 on invalid handle
+bytes_eq|b,b|-|-|
+crypto_constant_time_eq|b,b|-|-|
+secure_random_bytes|-|own|-|fresh Bytes, or 0 when the random source fails
+crypto_x25519_keygen||-|crypto.rs:149|returns a registry-tracked key handle (Box, not refcounted); freed by crypto_x25519_close
+crypto_p256_keygen||-|crypto.rs:149|uncounted key handle, as x25519_keygen
+crypto_p384_keygen||-|crypto.rs:149|uncounted key handle, as x25519_keygen
+crypto_x25519_public_key|-|own|-|arg is an uncounted key handle; result is a fresh Bytes copy of the public key
+crypto_x25519_shared_secret|-,b|own|crypto.rs:194|key handle is uncounted (its private key is taken, single use); peer key Bytes borrowed; fresh Bytes result or 0
+crypto_x25519_close|-|-|crypto.rs:205|frees the uncounted key handle (unregister + Box drop)
+crypto_aes_128_gcm_seal|b,b,b,b|own|-|all Bytes borrowed (copied before sealing); fresh Bytes or 0
+crypto_aes_128_gcm_open|b,b,b,b|own|-|all Bytes borrowed; fresh Bytes or 0
+crypto_aes_256_gcm_seal|b,b,b,b|own|-|all Bytes borrowed; fresh Bytes or 0
+crypto_aes_256_gcm_open|b,b,b,b|own|-|all Bytes borrowed; fresh Bytes or 0
+crypto_chacha20_poly1305_seal|b,b,b,b|own|-|all Bytes borrowed; fresh Bytes or 0
+crypto_chacha20_poly1305_open|b,b,b,b|own|-|all Bytes borrowed; fresh Bytes or 0
+crypto_verify_ed25519|b,b,b|-|-|
+crypto_verify_ecdsa_p256_sha256_asn1|b,b,b|-|-|
+crypto_verify_ecdsa_p256_sha384_asn1|b,b,b|-|-|
+crypto_verify_ecdsa_p384_sha384_asn1|b,b,b|-|-|
+crypto_verify_rsa_pkcs1_sha256|b,b,b|-|-|
+crypto_verify_rsa_pkcs1_sha384|b,b,b|-|-|
+crypto_verify_rsa_pss_sha256|b,b,b|-|-|
+crypto_sign_rsa_pss_sha256_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_rsa_pkcs1_sha256_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_ed25519_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_ecdsa_p256_sha256_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_ecdsa_p256_sha256_asn1_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_rsa_pss_sha384_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_rsa_pss_sha512_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_rsa_pkcs1_sha384_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_rsa_pkcs1_sha512_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_sign_ecdsa_p384_sha384_asn1_pkcs8|b,b|own|-|fresh Bytes or 0
+crypto_verify_rsa_pss_sha384|b,b,b|-|-|
+crypto_verify_rsa_pss_sha512|b,b,b|-|-|
+crypto_verify_rsa_pkcs1_sha512|b,b,b|-|-|
+crypto_blake2b|b,b,-|own|-|fresh Bytes or 0
+crypto_argon2id|b,b,-,-,-,-|own|-|fresh Bytes or 0
+zstd_compress|b,-|own|-|fresh Bytes or 0
+zstd_decompress|b,-|own|-|fresh Bytes or 0
+pith_json_float_bits|-,-,-|-|-|raw pointer plus span; returns f64 bits
+pith_json_fill_struct_nested|b,b,c,-|own|json.rs:1297|struct_ptr is consumed: on success it goes into the ok box without a retain (json.rs:1297), on failure it is released (json.rs:1299); doc json.rs:1221. Result is a fresh 3-slot result box (json.rs:73) with no dtor set, holding struct_ptr's count (ok) or a fresh error struct with its own dtor (err, json.rs:95)
+pith_json_fill_struct_lists|b,b,c,-,b,-|own|json.rs:1297|as fill_struct_nested; dtors_ptr table is borrowed ("belongs to the caller, which releases it after the call", json.rs:1245)
+byte_buffer_new||-|bytes.rs:30|ByteBuffer is a single-owner, uncounted handle (no refcount field)
+byte_buffer_with_capacity|-|-|bytes.rs:30|uncounted ByteBuffer handle
+byte_buffer_write|-,b|pair:-|bytes.rs:509|ByteBuffer uncounted; Bytes borrowed (copied in). ok payload is a count; err payload is an owned fresh string (ffi_util.rs:92)
+byte_buffer_free|-|-|bytes.rs:448|frees the single-owner ByteBuffer; no refcount involved
+byte_buffer_take_bytes|-|own|bytes.rs:666|frees the uncounted ByteBuffer and moves its storage into a fresh Bytes (rc 1)
+byte_buffer_write_string_utf8|-,b|pair:-|bytes.rs:517|string borrowed (copied in). ok payload is a count; err payload is an owned fresh string
+byte_buffer_write_byte|-,-|-|-|
+byte_buffer_copy_within|-,-,-|-|-|
+bytes_read_word|b,-,-|-|-|
+crc32_fold|-,b,-|-|-|
+sha256_blocks|b,b,-|-|-|state is a primitive Int list mutated in place (borrowed)
+byte_buffer_write_range|-,b,-,-|-|-|ByteBuffer uncounted; src Bytes borrowed
+byte_buffer_write_word|-,-,-|-|-|
+byte_buffer_bytes|-|own|-|fresh Bytes copy; the buffer is unchanged
+byte_buffer_string|-|own|bytes.rs:703|fresh string copy, or the static empty string (release is a no-op)
+byte_buffer_len|-|-|-|
+byte_buffer_get|-,-|-|-|
+byte_buffer_set|-,-,-|-|-|
+byte_buffer_clear|-|-|-|
+file_exists|b|-|-|
+dir_exists|b|-|-|
+mkdir|b|-|-|
+remove_file|b|-|-|
+fs_remove_dir|b|-|-|
+fs_remove_tree|b|-|-|path copied before the blocking-pool park
+rename_file|b,b|-|-|
+fs_file_size|b|-|-|
+fs_file_mtime|b|-|-|
+list_dir|b|own|host_fs.rs:710|fresh String-tagged list. RUNTIME BUG: each name is minted by pith_strdup_string (rc 1) and pushed with pith_list_push_value, which retains for a String-tagged list (list.rs:770), so every name string ends at rc 2 with one owner and leaks; it should use pith_list_push_value_owned (host_fs.rs:712)
+os_getcwd||own|-|fresh string or null
+os_pid||-|-|
+signal_notify|-|-|-|
+signal_wait|-|-|-|
+signal_raise|-|-|-|
+term_is_tty|-|-|-|
+term_raw_enter|-|-|-|
+term_restore|-|-|-|
+term_size|-|-|-|
+term_read|-,-,-|own|-|fresh Bytes from pith_bytes_from_vec (empty Bytes on timeout); 0 on EOF/error
+term_write|-,b|-|-|data Bytes read through pith_bytes_ref, no count change; returns byte count
+os_chdir|b|-|-|
+os_temp_dir||own|-|fresh string or null
+os_home_dir||own|-|fresh string or null
+os_set_env|b,b|-|-|the overlay copies name and value into Rust Strings
+os_unset_env|b|-|-|
+os_cert_roots_pem||own|crypto.rs:515|fresh string, or the static empty string (release is a no-op)
+read_file|b|own|-|fresh string or null
+read_file_bytes|b|own|-|fresh Bytes or 0
+write_file|b,b|-|-|
+append_file|b,b|-|-|
+write_file_bytes|b,b|-|-|data is copied before any pool park
+fs_create_new|b,b,-|-|-|
+fs_mkdir_new|b,-|-|-|
+append_file_bytes|b,b|-|-|
+file_open_read|b|-|-|returns an uncounted file handle (table key)
+file_open_write|b|-|-|uncounted file handle
+file_open_append|b|-|-|uncounted file handle
+file_read|-,-|own|host_fs.rs:531|fresh string, the static empty string at eof (release is a no-op), or null
+file_write|-,b|pair:-|host_fs.rs:551|ok payload is a count; err payload is an owned fresh string
+file_read_bytes|-,-|own|-|fresh Bytes or 0
+file_write_bytes|-,b|pair:-|host_fs.rs:561|ok payload is a count; err payload is an owned fresh string
+file_close|-|-|-|
+exit|-|-|-|
+sleep|-|-|-|
+time||-|-|
+time_nanos||-|-|
+env|b|own|-|fresh string (empty string is also freshly allocated)
+env_opt|b|own|host_fs.rs:600|fresh 2-slot Some box (optional_tuple, runtime_core.rs:3753) holding a fresh string in field 1, or 0 for none. The box has no dtor set, so releasing the box alone does not release the inner string
+input||own|-|fresh C string via pith_copy_bytes_to_cstring; null on read failure
+exec|b|-|-|command string borrowed via cstr_str; returns exit code
+random_float||-|-|F64
+random_seed|-|-|-|
+random_int|-,-|-|-|
+sin|-|-|-|
+cos|-|-|-|
+tan|-|-|-|
+asin|-|-|-|
+acos|-|-|-|
+atan|-|-|-|
+atan2|-,-|-|-|
+pith_cstring_compare|b,b|-|-|
+pith_cstring_lt|b,b|-|-|
+pith_cstring_gt|b,b|-|-|
+pith_cstring_lte|b,b|-|-|
+pith_cstring_gte|b,b|-|-|
+fmt_float|-,-|own|-|fresh C string (platform.rs:171)
+random_string|-|own|-|fresh C string from pith_alloc_cstring (platform.rs:180)
+args||own|string_list.rs:7|fresh string-tagged list (tag 1); each element pushed with a retain and the local count released, so the list owns one count per element
+pith_cstring_substring|b,-,-|own|string_list.rs:112|fresh copy, the static empty string for an empty range, null for a null s; exits on a split utf-8 character
+pith_cstring_contains|b,b|-|-|
+pith_string_split_to_list|b,b|own|string_list.rs:140|fresh string-tagged list; each part is fresh and its count moves into the list via pith_list_push_value_owned
+pith_cstring_trim|b|own|-|fresh, or null for a null s
+trim_left|b|own|-|fresh, or null for a null s
+pith_cstring_char_at|b,-|own|string_list.rs:205|fresh 1-byte string, or the static empty string when out of range
+pith_cstring_char_at_opt|b,-|own|string_list.rs:248|fresh optional struct (strong 1) whose field 1 holds a fresh 1-byte string; the struct owns that string's count, and no dtor is set on the shell. 0 (none) when out of range
+pith_cstring_char_at_strict|b,-|own|-|fresh 1-byte string; exits when out of range
+byte_at|b,-|-|-|
+pith_cstring_byte_at|b,-|-|-|
+pith_cstring_len|b|-|-|
+pith_bytes_get|b,-|-|-|
+pith_bytes_read_word|b,-,-|-|-|
+Mutex||own|-|fresh mutex with header refs=1 (sync handle; released by pith_sync_release)
+lock|b|-|sync_handle.rs:13|a contended wait takes its own BlockCount and returns it before the call ends; net zero for the caller
+unlock|b|-|-|
+WaitGroup||own|-|fresh waitgroup, refs=1
+add|b,-|-|-|
+done|b|-|-|
+wait|b|-|sync_handle.rs:13|blocking wait takes and returns its own BlockCount; net zero
+Semaphore|-|own|-|fresh semaphore, refs=1
+acquire|b|-|sync_handle.rs:13|blocking wait takes and returns its own BlockCount; net zero
+release|b|-|-|semaphore permit release (pith_semaphore_release), NOT a refcount release
+pith_mutex_lock|b|-|sync_handle.rs:13|same symbol as key lock
+pith_mutex_unlock|b|-|-|same symbol as key unlock
+pith_waitgroup_add|b,-|-|-|same symbol as key add
+pith_waitgroup_done|b|-|-|same symbol as key done
+pith_waitgroup_wait|b|-|sync_handle.rs:13|same symbol as key wait
+pith_semaphore_acquire|b|-|sync_handle.rs:13|same symbol as key acquire
+pith_semaphore_release|b|-|-|permit release, not a refcount release
+pith_sync_retain|b|-|sync_handle.rs:109|RETAIN: adds one count to arg 0 (mutex, waitgroup, semaphore or atomic int); garbage handles ignored
+pith_sync_release|c|-|sync_handle.rs:120|RELEASE: drops one count; the last frees (sync_handle.rs:128); garbage handles ignored
+AtomicInt|-|own|-|fresh atomic cell, refs=1 (atomic_int.rs:34)
+pith_atomic_int_get|b|-|-|
+pith_atomic_int_set|b,-|-|-|
+pith_atomic_int_compare_set|b,-,-|-|-|returns 1/0
+pith_cstring_to_upper|b|own|-|fresh, or null for a null s
+pith_cstring_to_lower|b|own|-|fresh, or null for a null s
+pith_cstring_reverse|b|own|-|fresh, or null for a null s
+pith_cstring_replace|b,b,b|own|-|fresh, or null for a null s
+clear|b|-|list.rs:1433|releases every owned element then empties
+list_clear|b|-|list.rs:1433|releases every owned element then empties
+remove|b,-|-|list.rs:1418|releases the list's count on the removed element; returns 1/0 (int)
+list_remove|b,-|-|list.rs:1418|releases the list's count on the removed element; returns 1/0 (int)
+list_reverse|b|-|-|swap only
+pith_list_sort_strings|b|-|-|sorts in place; no counts move
+to_float|-|-|-|
+to_int|-|-|-|
+pith_int_to_float|-|-|-|
+pith_float_to_int|-|-|-|
+float_from_bits|-|-|-|
+float_to_bits|-|-|-|
+parse_int|b|pair:-|encoding.rs:7|ok payload is an int; err payload is an owned fresh string (result_err, ffi_util.rs:92)
+parse_float|b|pair:-|encoding.rs:69|ok payload is f64 bits; err payload is an owned fresh string
+b64_encode|b|own|-|fresh string, or null for a null input
+encode|b|own|-|same symbol as b64_encode
+pith_hex_encode|b|own|-|fresh string (pith_alloc_cstring), or null for a null input
+hex|-|own|-|fresh string
+oct|-|own|-|fresh string
+bin|-|own|-|fresh string
+sha256|b|own|-|UNSURE: pith_sha256 is not defined under cranelift/runtime/src, so a call would fail to link; the row is a placeholder
+format_time|-,b|own|utility.rs:9|fmt is never read; fresh result
+write|b,b|-|-|
+info|b|-|-|
+warn|b|-|-|
+pith_spawn|c|-|concurrency/task.rs:291|the task owns the closure's count and releases it when the body returns (os thread task.rs:293; green green/run.rs:53); result is a task handle (slab id, not counted); closure 0 returns 0 with nothing taken
+pith_await|-|own|concurrency/task.rs:383|task handle not counted; the result carries the task body's count on whatever it returned and is handed to the first awaiter only (green: green/mod.rs:460); a second or stale await returns 0. Counted only if the task's T is a counted kind; a detached task's result is never released
+process_spawn|b|-|-|cmd string borrowed via cstr_str; returns a process registry id (not counted)
+process_spawn_argv|b,b,b,b,b|-|-|program/cwd strings and argv/env_keys/env_values lists only read (process.rs:156 pith_list_get_value, no retain); returns a registry id
+process_output_argv|b,b,b,b,b|-|-|same inputs as process_spawn_argv; returns a ProcessOutput registry id (not counted)
+exec_output|b|own|-|fresh, or null on failure
+b64_decode|b|own|-|fresh, or null for a null input
+fnv1a|b|-|-|
+pith_cstring_index_of|b,b|-|-|
+pith_cstring_starts_with|b,b|-|-|
+pith_cstring_ends_with|b,b|-|-|
+pad_left|b,-,b|own|-|fresh (pith_strdup or pith_alloc_cstring); null for a null s
+pad_right|b,-,b|own|-|fresh (pith_strdup or pith_alloc_cstring); null for a null s
+pith_cstring_pad_left|b,-,b|own|-|fresh (pith_strdup or pith_alloc_cstring); null for a null s
+pith_cstring_pad_right|b,-,b|own|-|fresh (pith_strdup or pith_alloc_cstring); null for a null s
+pith_cstring_repeat|b,-|own|utility.rs:287|fresh, or the static empty string (release is a no-op on it)
+pith_cstring_chars|b|own|string_list.rs:417|fresh string-tagged list of static one-byte strings from chr (retain/release are no-ops on them)
+sort|b|-|-|sorts values8 in place; no counts move
+list_sort_copy|b|own|string_list.rs:497|fresh list with the source's tag; each element pushed with pith_list_push_value, which retains when the tag is counted. An untagged source gives an untagged copy holding uncounted aliases
+list_sort_strings_copy|b|own|string_list.rs:518|as list_sort_copy, then sorted as strings
+list_slice_copy|b,-,-|own|string_list.rs:478|forwards to pith_list_slice: fresh list with the source's tag, elements pushed with retain when the tag is counted
+second|b,b|borrow:1|runtime_core.rs:3054|returns b unchanged with no retain; a is ignored. Counted only if the caller passes counted values
+process_read|-,-|own|process_io.rs:82|fresh C string; empty-string literal on EOF (release is a no-op); null on failure
+process_read_err|-,-|own|process_io.rs:82|fresh C string; empty literal on EOF; null on failure
+process_write|-,b|pair:own|process_io.rs:125|data string borrowed via cstr_bytes. ok payload is a byte count (not counted); error payload is an owned fresh string (ffi_util.rs:92, ffi_util.rs:106)
+process_read_bytes|-,-|own|process_io.rs:93|fresh Bytes; empty Bytes on EOF; 0 on failure
+process_read_err_bytes|-,-|own|process_io.rs:93|fresh Bytes; empty Bytes on EOF; 0 on failure
+process_write_bytes|-,b|pair:own|process_io.rs:135|data Bytes borrowed via pith_bytes_ref. ok payload is a byte count (not counted); error payload is an owned fresh string (ffi_util.rs:92)
+tcp_listen|b,-|-|-|returns an uncounted socket handle
+tcp_connect|b,-|-|-|returns an uncounted socket handle
+tcp_accept|-|-|-|uncounted socket handles
+tcp_read|-|own|-|fresh string or null
+tcp_write|-,b|pair:-|network.rs:512|string borrowed across a possible park; ok payload is a count; err payload is an owned fresh string
+tcp_read_bytes|-,-|own|-|fresh Bytes or 0
+tcp_write_bytes|-,b|pair:-|network.rs:522|Bytes borrowed across a possible park; ok payload is a count; err payload is an owned fresh string
+tcp_wait_readable|-,-|-|-|
+tcp_wait_writable|-,-|-|-|
+tcp_peer_address|-|own|-|fresh string (empty on failure, also fresh)
+tcp_close|-|-|-|
+tcp_shutdown|-|-|-|
+tcp_set_timeout|-,-|-|-|
+tcp_set_read_deadline|-,-|-|-|
+tcp_set_write_deadline|-,-|-|-|
+Channel|-,-|own|-|fresh channel, refs=1 (concurrency/channel.rs:634); payload_tag is an element-tag code
+pith_channel_retain|b|-|concurrency/channel.rs:676|RETAIN: adds one count to arg 0; garbage handles ignored
+pith_channel_release|c|-|concurrency/channel.rs:685|RELEASE: drops one count; the last frees the channel and releases still-queued values by payload tag (concurrency/channel.rs:461)
+pith_channel_send|b,c|-|concurrency/channel.rs:461|value is stored raw (ring try_enqueue channel.rs:780/797, or pending_value channel.rs:890) and later handed to a receiver or released by free_channel, so the channel takes the caller's count. CONDITIONAL: consumed only when the call returns 1; on 0 (closed, garbage handle, undelivered rendezvous) nothing is stored and the caller keeps its count. With payload_tag 0 the value is not counted. A blocking send takes and returns its own ParkCount on the channel (net zero)
+pith_channel_try_send|b,c|-|concurrency/channel.rs:461|as pith_channel_send: consumed only on return 1 (stored raw at channel.rs:928 or channel.rs:943); on 0 (full, closed, no waiting receiver) the caller keeps its count. Possible runtime leak: an unbuffered try_send deposit that a close drops (channel.rs:1044 sets pending_value = None without release) after try_send already returned 1
+pith_channel_recv|b|own|concurrency/channel.rs:1009|returns a fresh optional shell (optional_tuple, pith_struct_alloc with no dtor) or 0 for none; the payload is the count the channel held (moved, not retained), now owned by the caller separately from the shell
+pith_channel_recv_pair|b|pair:own|concurrency/channel.rs:1015|second register is the dequeued value carrying the channel's count (moved to caller); 0 when is_ok=0
+pith_channel_try_recv|b|own|concurrency/channel.rs:1020|as pith_channel_recv: fresh shell, payload count moved from the channel to the caller
+pith_channel_try_recv_pair|b|pair:own|concurrency/channel.rs:1026|payload count moved from the channel to the caller; 0 when is_ok=0
+pith_channel_close|b|-|concurrency/channel.rs:1044|returns 1/0. Drops an unbuffered pending deposit without releasing it (the blocked sender then returns 0 and keeps its count; see try_send note)
+pith_channel_is_closed|b|-|-|
+pith_select_next_index|-|-|-|
+pith_channel_len|b|-|-|
+pith_channel_cap|b|-|-|
+pith_task_is_done|-|-|-|task handle is a slab id, not counted
+pith_task_detach|-|-|-|task handle not counted; a finished task's unawaited result is not released
+pith_green_maybe_yield||-|-|
+error|b|-|-|
+debug|b|-|-|symbol is pith_log_error
+to_hex|b|own|-|same symbol as pith_hex_encode
+from_hex|b|own|-|fresh string, or null for a null or odd-length input
+dns_resolve|b|own|-|fresh string or null
+float_fixed|-,-|own|-|fresh
+is_dir|b|-|-|
+pith_cstring_last_index_of|b,b|-|-|
+process_wait|-|-|-|
+process_kill|-|-|-|
+process_close|-|-|-|
+process_output_status|-|-|-|
+process_output_stdout|-|own|process.rs:330|fresh copy via pith_strdup_string; null for an unknown handle
+process_output_stderr|-|own|process.rs:342|fresh copy via pith_strdup_string; null for an unknown handle
+process_output_close|-|-|-|
+tcp_read2|-,-|own|-|fresh string or null
+pith_struct_alloc|-|own|-|fresh struct, strong 1; returns 0 for num_fields <= 0
+insert|b,b,b|-|map.rs:1156|map retains value when heap-valued (insert_keyed map.rs:1148), releases displaced value (map.rs:1162-1164); key bytes copied, string not retained (map.rs:1004)
+map_insert|b,b,b|-|map.rs:1156|map retains value when heap-valued, releases displaced; key copied, not retained
+map_insert_ikey|b,-,b|-|map.rs:1683|retains value when heap-valued, releases displaced (map.rs:1685-1687); int fast path stores raw
+pith_map_insert_cstr_owned|b,b,c|-|map.rs:1056|takes caller's count when map is heap-valued; a primitive-valued map takes nothing (leak). Null key or invalid handle returns early without taking it (map.rs:1122-1128, leak)
+pith_map_insert_ikey_owned|b,-,c|-|map.rs:1626|takes caller's count on the heap-valued path (map.rs:1682); primitive int fast path takes nothing (leak)
+map_insert_kind|b,b,b,-|-|map.rs:1070|borrowed: adopts tag when empty and Primitive, then retains; if it cannot own the kind adds a retain under arg 3's kind (leak, map.rs:1087-1091). A map of a different heap kind also retains under its own tag
+map_insert_ikey_kind|b,-,b,-|-|map.rs:1649|borrowed; same adopt/fallback as map_insert_kind
+map_insert_owned_kind|b,b,c,-|-|map.rs:1094|takes caller's count after adopting; a map that cannot own the kind (non-empty Primitive) takes nothing (map.rs:1095-1096, leak)
+map_insert_ikey_owned_kind|b,-,c,-|-|map.rs:1662|takes caller's count after adopting; non-owning map takes nothing (leak)
+map_get|b,b|borrow:0|map.rs:1268|stored word, not retained; 0 on miss or null key
+map_get_opt|b,b|own|runtime_core.rs:3753|fresh optional box or 0; payload is stored value not retained (borrowed from arg 0)
+map_get_ikey_opt|b,-|own|runtime_core.rs:3753|fresh optional box or 0; payload not retained (borrowed from arg 0)
+pith_map_get_cstr_opt_pair|b,b|pair:borrow:0|runtime_core.rs:3780|(1, stored value) or (0,0), not retained
+pith_map_get_ikey_opt_pair|b,-|pair:borrow:0|runtime_core.rs:3780|(1, stored value) or (0,0), not retained
+map_get_strict|b,b|borrow:0|map.rs:1330|stored word, not retained; exits on miss
+map_get_ikey_strict|b,-|borrow:0|map.rs:1761|stored word, not retained; exits on miss
+map_upsert_add|b,b,-|-|map.rs:1170|int-valued maps only (exits on heap-valued); returns new int
+map_upsert_add_ikey|b,-,-|-|map.rs:1170|int-valued maps only; returns new int
+map_upsert_add_bkey|b,b,-|-|map.rs:1233|bytes key borrowed for the call; int result
+get_default|b,b,b|borrow:0|map.rs:1374|hit: stored value not retained (borrow:0); miss/null key/bad handle: returns arg 2 unchanged (borrow:2)
+map_get_default|b,b,b|borrow:0|map.rs:1374|hit: stored value not retained; miss returns arg 2 unchanged (borrow:2)
+map_get_default_ikey|b,-,b|borrow:0|map.rs:1386|hit: stored value not retained; miss returns arg 2 unchanged (borrow:2)
+contains_key|b,b|-|-|
+map_contains_key|b,b|-|-|
+map_contains_ikey|b,-|-|-|
+keys|b|own|-|fresh String-tagged list; each key a fresh cstring the list owns (push retains, then local count released, map.rs:1897-1899)
+map_keys|b|own|-|fresh String-tagged list of fresh key strings
+map_keys_ikey|b|own|-|fresh primitive list of int keys
+map_remove|b,b|-|map.rs:1029|releases the map's count on the removed value
+map_remove_ikey|b,-|-|map.rs:1815|releases the map's count on the removed value
+map_len|b|-|-|
+map_clear|b|-|map.rs:1942|releases every owned value then empties
+map_is_empty|b|-|-|
+map_values|b|own|map.rs:1975|fresh list tagged with the map's value tag; push_value retains each value, so the list owns its own counts
+pith_set_new_int||own|-|fresh int set
+set_len|b|-|-|
+set_add|b,b|-|set.rs:105|element content copied, cstring not retained; returns 1/0
+set_add_int|b,-|-|-|returns 1/0
+set_contains|b,b|-|-|
+set_contains_int|b,-|-|-|
+set_remove|b,b|-|-|
+set_remove_int|b,-|-|-|
+set_clear|b|-|-|elements are copies, nothing released
+set_is_empty|b|-|-|
+pith_set_to_list_cstr|b|own|-|fresh String-tagged list of fresh strings (set.rs:493-499); invalid handle gives an empty list; an int-flavored set returns null (0) via pith_set_to_list_string (set.rs:486-489)
+pith_set_to_list_int_handle|b|own|-|fresh primitive list; returns null (0) when the set is not int-flavored (set.rs:452-455)
+pith_set_new_bytes||own|-|fresh bytes set
+set_add_bytes|b,b|-|set.rs:672|bytes handle only read, content copied, never retained; returns 1/0
+set_contains_bytes|b,b|-|-|
+set_remove_bytes|b,b|-|-|
+pith_set_to_list_bytes|b|own|-|fresh Bytes-tagged list; each element a fresh bytes object pushed with push_value_owned (set.rs:753-754)
+pith_map_new_bytes||own|-|fresh bytes-key map, primitive values
+pith_map_new_bytes_cstr_val||own|-|fresh bytes-key map owning String values
+map_insert_bkey|b,b,b|-|map.rs:1416|key handle only read and copied (map.rs:1416-1422); value retained when heap-valued, displaced released
+pith_map_insert_bkey_owned|b,b,c|-|map.rs:1434|takes caller's count when heap-valued; primitive map, invalid handle, or a key that is not a bytes object (map.rs:1139-1141) take nothing (leak)
+map_insert_bkey_kind|b,b,b,-|-|map.rs:1458|borrowed; adopt/fallback as map_insert_kind
+map_insert_bkey_owned_kind|b,b,c,-|-|map.rs:1478|takes caller's count after adopting; non-owning map takes nothing (leak)
+map_get_bkey_opt|b,b|own|runtime_core.rs:3753|fresh optional box or 0; payload not retained (borrowed from arg 0)
+pith_map_get_bkey_opt_pair|b,b|pair:borrow:0|runtime_core.rs:3780|(1, stored value) or (0,0), not retained
+map_get_bkey_strict|b,b|borrow:0|map.rs:1538|stored word, not retained; exits on miss
+map_get_default_bkey|b,b,b|borrow:0|map.rs:1570|hit: stored value not retained; miss returns arg 2 unchanged (borrow:2)
+map_contains_bkey|b,b|-|-|
+map_keys_bkey|b|own|-|fresh Bytes-tagged list of fresh bytes objects pushed owned (map.rs:1604-1607)
+map_remove_bkey|b,b|-|map.rs:1586|releases the map's count on the removed value
+map_take_bkey|b,b|own|map.rs:927|transfers the map's count to caller (take_keyed map.rs:945); 0 on miss
+pith_tls_get_or_init|-,-|-|runtime_core.rs:3171|UNSURE: format gap, not a source doubt. The result is the value stored in the thread-local slot, returned without a retain: a borrow owned by the TLS map, not by any argument, so the caller must not release it. On first access the init thunk's result is stored as is (its count, if any, moves into the slot). Untagged: the runtime never releases the slot
+pith_tls_set|-,c|-|runtime_core.rs:3224|stores value without retaining and does not release the old value; doc says the emitter releases the old value before the call, so the slot owns the new value's count. Untagged: the runtime never releases it (process-lifetime on the main thread)
+pith_tls_get_or_init_tagged|-,-,-|-|runtime_core.rs:3171|UNSURE: format gap, not a source doubt. As pith_tls_get_or_init: result borrowed from the TLS slot, no retain. The tag lets release_finished_tls drop the slot's count when the task or thread ends (runtime_core.rs:3106)
+pith_tls_set_tagged|-,c,-|-|runtime_core.rs:3224|as pith_tls_set; with a counted tag the slot's count is released by release_finished_tls at task or thread end (runtime_core.rs:3106). Old value not released
+pith_runtime_start||-|-|

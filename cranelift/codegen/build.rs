@@ -145,7 +145,137 @@ fn generate_runtime_table() -> Result<(), String> {
     );
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
-    fs::write(out_dir.join("runtime_table.rs"), out).map_err(|e| e.to_string())
+    fs::write(out_dir.join("runtime_table.rs"), out).map_err(|e| e.to_string())?;
+    generate_ownership_table(&manifest_dir, &contents)
+}
+
+// cranelift/runtime-abi/runtime_ownership.txt says what each runtime function
+// does with the counts of its arguments and its result, for the count checker.
+// every key in runtime_functions.txt needs exactly one row with the same
+// number of parameters, so a new runtime function can't be added without
+// deciding its ownership.
+fn generate_ownership_table(
+    manifest_dir: &std::path::Path,
+    abi_contents: &str,
+) -> Result<(), String> {
+    let path = manifest_dir.join("../runtime-abi/runtime_ownership.txt");
+    println!("cargo:rerun-if-changed={}", path.display());
+    let contents = fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+
+    let mut param_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for line in abi_contents.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('|').collect();
+        let count = if parts[2].trim().is_empty() {
+            0
+        } else {
+            parts[2].split(',').count()
+        };
+        param_counts.insert(parts[0].trim(), count);
+    }
+
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut table = String::from("const RUNTIME_OWNERSHIP: &[RuntimeOwnership] = &[\n");
+    for (line_no, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let at = |msg: String| format!("{}:{}: {}", path.display(), line_no + 1, msg);
+        let parts: Vec<&str> = line.split('|').collect();
+        if parts.len() < 3 {
+            return Err(at(
+                "expected key|params|result, then optional evidence and note columns".into(),
+            ));
+        }
+        let key = parts[0].trim();
+        let Some(&expected) = param_counts.get(key) else {
+            return Err(at(format!("'{key}' is not a key in runtime_functions.txt")));
+        };
+        if !seen.insert(key.to_string()) {
+            return Err(at(format!("'{key}' has more than one row")));
+        }
+        let params_text = parts[1].trim();
+        let params: Vec<&str> = if params_text.is_empty() {
+            vec![]
+        } else {
+            params_text.split(',').map(str::trim).collect()
+        };
+        if params.len() != expected {
+            return Err(at(format!(
+                "'{key}' lists {} parameters; runtime_functions.txt has {expected}",
+                params.len()
+            )));
+        }
+        let mut arg_items = Vec::new();
+        for p in &params {
+            arg_items.push(match *p {
+                "-" => "ArgOwnership::Plain",
+                "b" => "ArgOwnership::Borrow",
+                "c" => "ArgOwnership::Consume",
+                other => {
+                    return Err(at(format!(
+                        "unknown parameter token '{other}'; use -, b or c"
+                    )))
+                }
+            });
+        }
+        let result = parse_result_token(parts[2].trim(), params.len()).map_err(at)?;
+        table.push_str(&format!(
+            "    RuntimeOwnership {{ key: \"{key}\", args: &[{}], result: {result} }},\n",
+            arg_items.join(", ")
+        ));
+    }
+    table.push_str("];\n");
+    let missing: Vec<&str> = param_counts
+        .keys()
+        .copied()
+        .filter(|k| !seen.contains(*k))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{}: no ownership row for {} runtime function(s): {}",
+            path.display(),
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
+    fs::write(out_dir.join("runtime_ownership_table.rs"), table).map_err(|e| e.to_string())
+}
+
+// `-`, `own`, `borrow:N`, or one of those after `pair:` for a function that
+// returns the (flag, payload) register pair.
+fn parse_result_token(text: &str, nparams: usize) -> Result<String, String> {
+    let (pair, rest) = match text.strip_prefix("pair:") {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let value =
+        match rest {
+            "-" => "ResultValue::Plain".to_string(),
+            "own" => "ResultValue::Own".to_string(),
+            _ => match rest
+                .strip_prefix("borrow:")
+                .and_then(|n| n.parse::<usize>().ok())
+            {
+                Some(n) if n < nparams => format!("ResultValue::Borrow({n})"),
+                Some(n) => {
+                    return Err(format!(
+                        "result borrows from argument {n}, but there are {nparams}"
+                    ))
+                }
+                None => return Err(format!(
+                    "unknown result token '{text}'; use -, own or borrow:N, optionally after pair:"
+                )),
+            },
+        };
+    Ok(format!(
+        "ResultOwnership {{ pair: {pair}, value: {value} }}"
+    ))
 }
 
 #[derive(Clone, Copy)]

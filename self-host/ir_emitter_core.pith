@@ -42,7 +42,7 @@ from ast import get_node, node_kind, node_value, node_child, node_child_count, N
 from checker import generic_base_identity, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
-from ir_metadata import ir_is_bool_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
+from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_import_target_name, ir_global_storage_symbol, ir_base_decl_name, ir_import_impl_method_name
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_by_symbol, ir_queue_generic_specialization_for_tids, ir_generic_specialization_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_generic_method_owner_param_counts, ir_generic_owner_param_count, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_queue_generic_specialization
@@ -1276,6 +1276,12 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
             if extract_recv_tid >= 0 and get_type_info(extract_recv_tid).kind == "optional":
                 if ir_rc_kind(ir_type_from_tid(get_type_info(extract_recv_tid).inner)).len() > 0:
                     return false
+        # `to_string` on a String lowers to the receiver itself, with no
+        # fresh buffer, so it is borrowed exactly when the receiver is. as a
+        # fresh name it classified owned, and `take(s.to_string())` released
+        # a String parameter its caller still held: a use after free.
+        if mname == "to_string" and node.children.len() > 0 and ir_expr_is_string_receiver(node.children[0]):
+            return ir_expr_is_borrowed(node.children[0])
         return not ir_string_method_returns_fresh(mname)
     # a payload-free variant written bare (`Holder.Empty`, or the alias-
     # qualified `mod.Holder.Empty`) parses as a field access but mints a
@@ -1421,18 +1427,23 @@ fn ir_field_access_is_bare_variant(idx: Int) -> Bool:
         return false
     return ir_struct_field_lookup.contains_key(key) and ir_struct_field_lookup[key] == ename
 
+# true when the checker typed the expression as a String
+fn ir_expr_is_string_receiver(idx: Int) -> Bool:
+    tid := c_get_expr_type(idx)
+    if tid < 0:
+        return false
+    info := get_type_info(tid)
+    return info.kind == "primitive" and info.name == "String"
+
+# every method STRING_RETURNING_METHODS names builds a new string (each one's
+# row in runtime_ownership.txt says `own`), plus the few that list leaves out.
+# this used to be a second, hand-kept list, and pad_left and pad_right were
+# missing from it: `return s.pad_left(w, "0")` retained the fresh string as if
+# it were borrowed and leaked one per call.
 fn ir_string_method_returns_fresh(mname: String) -> Bool:
-    if mname == "to_string" or mname == "trim" or mname == "substring":
+    if ir_is_string_returning_method(mname):
         return true
-    if mname == "to_upper" or mname == "to_lower" or mname == "reverse":
-        return true
-    if mname == "join" or mname == "repeat" or mname == "replace":
-        return true
-    if mname == "trim_left" or mname == "trim_right" or mname == "char_at":
-        return true
-    if mname == "pop":
-        return true
-    return false
+    return mname == "to_string" or mname == "trim_left" or mname == "trim_right" or mname == "pop"
 
 # --- defer scope machinery ---
 #
@@ -2655,11 +2666,15 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
 # ownership the tracked-locals list already accounts for. releasing either
 # would be an over-release of a count this function never took.
 fn ir_assign_targets_global_slot(name: String) -> Bool:
-    if not ir_global_slot_names.contains(name):
+    if ir_loop_var_slot(name).len() > 0 or ir_name_is_func_local(name):
         return false
-    if ir_loop_var_slot(name).len() > 0:
-        return false
-    return not ir_name_is_func_local(name)
+    if ir_global_slot_names.contains(name):
+        return true
+    # a `mut` global imported by name (`from store import items`) is a global
+    # slot too. without this an assignment to one skipped the release of the
+    # value it replaced, leaking it, and skipped the share marking every
+    # other global store gets.
+    return ir_import_mutable_global_symbols.contains_key(ir_resolve_storage_name(name))
 
 # one helper per (ok, err) payload signature used this module. each releases the
 # live payload of a result/optional tuple (slot 8 when the flag is set, slot 16
@@ -5325,6 +5340,11 @@ fn ir_expr_is_transferred_call_temp(idx: Int) -> Bool:
     # string mid-comparison. a counted extraction is a transfer like any
     # other, and reaches the borrowed-classification branch above this one.
     if ir_value_extraction_is_uncounted(idx):
+        return false
+    # a call the borrow classifier calls borrowed hands back a value its
+    # owner still holds, such as `s.to_string()` on a String, which is `s`
+    # itself. releasing it freed the caller's string.
+    if ir_expr_is_borrowed(idx):
         return false
     expr_type := ir_infer_type(idx)
     return expr_type == "string"

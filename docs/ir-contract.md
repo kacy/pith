@@ -222,6 +222,12 @@ slot with no mark is one the emitter made for a scalar, such as the flag a
 short-circuit `and` keeps. functions the emitter makes itself, such as
 destructors and enum equality, carry none.
 
+a user function borrows every parameter: the caller keeps its count. a
+parameter with an `owns` mark is one the function's prologue retains, and
+its exit cleanup gives that count back. runtime functions differ case by
+case, and `cranelift/runtime-abi/runtime_ownership.txt` says how; `build.rs`
+refuses a runtime function without a row there.
+
 marks generate no code. the consumer drops every `mark` line before its first
 pass, so a mark can't split a pattern its rewrites match, and a build with
 marks produces the same object code as one without. without the variable, no
@@ -435,4 +441,5 @@ tightening targets, not settled behavior:
 | producing the ir | `self-host/ir_emitter_core.pith` and its satellites |
 | consuming the ir | `cranelift/codegen/src/ir_consumer.rs` |
 | runtime function signatures | `cranelift/runtime-abi/runtime_functions.txt` → `build.rs` |
+| what runtime functions do with counts | `cranelift/runtime-abi/runtime_ownership.txt` → `build.rs` |
 | this contract | this file |

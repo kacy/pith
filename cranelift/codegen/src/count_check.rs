@@ -42,6 +42,20 @@ const PLAIN_OPS: &[&str] = &[
     "closure_ref", "strref",
 ];
 
+/// the release helpers the emitter writes into each module: a tuple's
+/// cascade, a fallible argument's release, and the release that dispatches
+/// on a side slot's kind code. each gives up its first argument's count.
+fn is_emitted_release(callee: &str) -> bool {
+    callee.contains("__tuple_cascade_") || callee.contains("__result_arg_release_") || callee.contains("__kinded_release_m")
+}
+
+/// a kind a generic body left unsubstituted, such as `T`: it may be counted
+/// or not, so the checker can't settle a count on it
+fn kind_of_text(kind: &str) -> &str {
+    let unsubstituted = kind.len() <= 2 && kind.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    if unsubstituted { "unknown" } else { kind }
+}
+
 fn is_counted(kind: &str) -> bool {
     !SCALAR_KINDS.contains(&kind) && kind != "unknown" && !kind.starts_with("result_reg")
 }
@@ -117,7 +131,7 @@ pub fn check_counts(lines: &[&str]) -> CountReport {
                     f.marked = true;
                     match parts[1] {
                         "kind" if parts.len() >= 4 => {
-                            f.kinds.insert(parts[2], parts[3]);
+                            f.kinds.insert(parts[2], kind_of_text(parts[3]));
                         }
                         "owns" if parts.len() >= 4 => {
                             f.owns.insert(parts[2]);
@@ -196,6 +210,9 @@ struct State {
     field_of: HashMap<String, (String, usize)>,
     /// fields whose value was released through a read and not yet replaced
     emptied: BTreeSet<String>,
+    /// tuple shells built without a destructor: freeing one frees the shell
+    /// alone, and the counts its fields held pass to whoever read them out
+    shells: BTreeSet<String>,
 }
 
 /// the state at a block boundary. an object a slot holds is named by its
@@ -215,6 +232,7 @@ struct Canon {
     nulls: BTreeSet<String>,
     unknowns: BTreeSet<String>,
     emptied: BTreeSet<String>,
+    shells: BTreeSet<String>,
 }
 
 /// where two paths meet. a slot holding one object on one side and a null on
@@ -230,7 +248,12 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>) -> Option<Canon> {
     }
     let mut a_nulls = a.nulls.clone();
     let mut b_nulls = b.nulls.clone();
-    let mut out = Canon { unknowns: a.unknowns.clone(), emptied: a.emptied.clone(), ..Canon::default() };
+    let mut out = Canon {
+        unknowns: a.unknowns.clone(),
+        emptied: a.emptied.clone(),
+        shells: a.shells.union(&b.shells).cloned().collect(),
+        ..Canon::default()
+    };
     let keys: BTreeSet<&Vec<String>> = a.objs.keys().chain(b.objs.keys()).collect();
     for k in keys {
         match (a.objs.get(k), b.objs.get(k)) {
@@ -435,6 +458,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 _ => {}
             }
         }
+        for o in &st.shells {
+            if let Some(k) = key_of.get(o) {
+                out.shells.insert(k.clone());
+            }
+        }
         for field in &st.emptied {
             let (base, off) = field.rsplit_once(':').unwrap_or((field.as_str(), ""));
             let base = key_of.get(&base.to_string()).cloned().unwrap_or_else(|| base.to_string());
@@ -469,12 +497,18 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             st.slots.insert(s.clone(), Val::Unknown);
         }
         st.emptied = canon.emptied.clone();
+        st.shells = canon.shells.clone();
         st
     }
 
     fn run(&mut self) -> Result<(), String> {
         if !self.f.mixed.is_empty() {
             return Err("a local whose kind changes by path".into());
+        }
+        // a generated JSON decoder keeps its struct in a slot it records as
+        // a plain word, so the struct's count can't be followed
+        if self.f.kinds.keys().any(|k| k.starts_with("__jf_")) {
+            return Err("a JSON decoder's raw word slots".into());
         }
         let (blocks, succ, order) = split_blocks(&self.f.body);
         let mut st = State::default();
@@ -575,11 +609,24 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                         return Ok(());
                     }
                 }
-                let n = st.counts.entry(o).or_insert(0);
+                let n = st.counts.entry(o.clone()).or_insert(0);
                 if *n <= 0 {
                     self.problems.push(format!("{why} gives up a count it doesn't hold (register {reg})"));
                 }
                 *n -= 1;
+                if *n == 0 && st.shells.contains(&o) {
+                    let prefix = format!("{o}:");
+                    let readers: Vec<String> = st
+                        .field_of
+                        .iter()
+                        .filter(|(r, (f, _))| f.starts_with(&prefix) && st.counts.get(*r).copied().unwrap_or(0) == 0)
+                        .map(|(r, _)| r.clone())
+                        .collect();
+                    for r in readers {
+                        st.counts.insert(r.clone(), 1);
+                        st.field_of.remove(&r);
+                    }
+                }
                 Ok(())
             }
             Val::Unknown => Err("a value of unknown kind meets a count".into()),
@@ -637,7 +684,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 Ok(false)
             }
             "field" if ins.len() >= 5 => {
-                let v = if ins[4] == "unknown" {
+                let v = if kind_of_text(ins[4]) == "unknown" {
                     Val::Unknown
                 } else if is_counted(ins[4]) {
                     let o = self.new_obj(st, 0);
@@ -692,6 +739,18 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
     fn call(&mut self, ins: &[&str], st: &mut State) -> Result<(), String> {
         let (dst, callee, typ) = (ins[1], ins[2], ins[3]);
         let args: Vec<&str> = ins.iter().skip(5).copied().collect();
+        // a weak reference keeps a second count the checker doesn't model
+        // yet, and an upgrade turns it into a strong one
+        if callee.starts_with("pith_struct_weak_") {
+            return Err("a weak reference".into());
+        }
+        if is_emitted_release(callee) {
+            if let Some(a) = args.first() {
+                self.take(st, a, callee)?;
+            }
+            st.regs.insert(dst.to_string(), Val::Plain);
+            return Ok(());
+        }
         if RETAINS.contains(&callee) {
             match self.val(st, args[0]) {
                 Val::Obj(o) => *st.counts.entry(o).or_insert(0) += 1,
@@ -700,6 +759,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             }
             st.regs.insert(dst.to_string(), Val::Plain);
             return Ok(());
+        }
+        if callee == "pith_struct_set_dtor" {
+            if let Some(Val::Obj(o)) = args.first().map(|a| self.val(st, a)) {
+                st.shells.remove(&o);
+            }
         }
         let result = if let Some(row) = runtime_ownership(callee) {
             for (i, a) in row.args.iter().enumerate() {
@@ -731,6 +795,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         } else {
             return Err("a call the checker has no summary for".into());
         };
+        if callee == "pith_struct_alloc" && (typ == "struct:tuple" || typ == "tuple") {
+            if let Val::Obj(o) = &result {
+                st.shells.insert(o.clone());
+            }
+        }
         st.regs.insert(dst.to_string(), result);
         Ok(())
     }

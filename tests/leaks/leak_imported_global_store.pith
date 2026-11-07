@@ -1,0 +1,24 @@
+# a `mut` global imported by name is assigned from another module. the store
+# skipped the release of the value it replaced, leaking one list and one
+# string per round, because only this module's own globals counted as global
+# slots for an assignment.
+import leakprobe as probe
+from imported_global_holder import held_list, held_name
+
+fn round(i: Int) -> Int:
+    n := i.to_string()
+    held_list = [n, n + "!"]
+    held_name = "name " + n
+    return held_list.len() + held_name.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

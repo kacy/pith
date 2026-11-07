@@ -25,7 +25,7 @@
 
 use crate::blocking::{self, Pool};
 use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
-use crate::collections::list::{pith_list_new, pith_list_push_value};
+use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
 use crate::ffi_util::{cstr_bytes, cstr_str, write_result, ResultPair};
 use crate::runtime_core::optional_tuple;
 use parking_lot::Mutex;
@@ -707,9 +707,11 @@ pub unsafe extern "C" fn pith_list_dir(path: *const i8) -> i64 {
     // an unreadable directory is an empty list, not an error. the
     // list and its strings are pith objects, so they are built here rather than
     // on the pool thread.
+    // each name is born with one count, which the String-tagged list takes
+    // over; a plain push would add a second one nobody gives back.
     let list = pith_list_new(8, 1);
     for name in names.unwrap_or_default() {
-        pith_list_push_value(list, crate::pith_strdup_string(&name) as i64);
+        pith_list_push_value_owned(list, crate::pith_strdup_string(&name) as i64);
     }
     list.ptr as i64
 }
@@ -978,6 +980,25 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["one.txt", "two.txt"]);
         assert!(list_dir_at(&format!("{}/nope", scratch.0.display())).is_none());
+    }
+
+    #[test]
+    fn a_listed_name_has_one_owner() {
+        let scratch = Scratch::new("owners");
+        std::fs::create_dir(&scratch.0).unwrap();
+        std::fs::write(scratch.0.join("a.txt"), b"1").unwrap();
+        std::fs::write(scratch.0.join("b.txt"), b"2").unwrap();
+        let path = CString::new(scratch.0.to_str().unwrap()).unwrap();
+        unsafe {
+            let handle = pith_list_dir(path.as_ptr());
+            let list = crate::collections::list::PithList { ptr: handle as *mut () };
+            for i in 0..2 {
+                let name = crate::collections::list::pith_list_get_value(list, i) as *const i8;
+                // the list's count and nothing else: a second one is a leak
+                assert_eq!(crate::runtime_core::cstring_refcount_for_tests(name), Some(1));
+            }
+            crate::collections::list::pith_list_release_handle(handle);
+        }
     }
 
     #[test]

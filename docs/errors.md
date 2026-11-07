@@ -1069,3 +1069,21 @@ warning[E311]: 'ledger.b_mu' is taken here while 'ledger.a_mu' is held, and ledg
                       ^
   fix: take the mutexes in one fixed order everywhere, or release the first before taking the second
 ```
+
+### E312 — a call that takes a mutex already held (warning)
+
+a mutex is not reentrant, so a task that holds one and calls a function that
+takes it again waits for itself forever. E273 refuses a `locked` block nested
+in a block on the same path; `pith lint` reports the same mistake made
+through a call. a module global is matched through the callee and everything
+it calls, except a sharded guard, whose elements share one name. a struct's mutex is matched when a method called on the receiver
+whose mutex is held locks that field on `self`, so `self.encode()` inside
+`locked self.mu:` is reported when `encode` takes `self.mu`, while a method
+called on a different value of the same struct is not.
+
+```
+warning[E312]: this call takes 'self.mu', which is already held here; a mutex is not reentrant, so the task deadlocks
+  21 |             self.bump()
+                   ^
+  fix: call a version that expects the lock held, marked `holding`, or release the mutex before the call
+```

@@ -255,7 +255,7 @@ the build itself never fails on a finding. `make count-marks-check-only`,
 which ci runs, checks every corpus program and example and fails on any
 unbalanced function or borrow finding. a function the checker can't settle,
 such as one holding a weak reference, is counted as undecided and doesn't
-fail the target. over the corpus, 7052 distinct functions balance and 193
+fail the target. over the corpus, 7051 distinct functions balance and 194
 are undecided; the rest of the undecided are values of unknown kind, calls
 with no summary, weak references and locals whose kind changes by path.
 
@@ -269,9 +269,10 @@ value into locals.
 the checker was tested by mutation: delete one release, or duplicate one, in
 a function it balances, and see whether it flags that function. on
 `examples/api_gateway`, where 3579 functions balance, it caught 299 of 300
-mutants and 497 of 500 over two seeds; on `tests/cases/test_process_command`
-it caught 299 of 300. the misses are a deleted release of a retained read
-of a borrowing getter's payload, and a duplicated release of a field read.
+mutants and 499 of 500 over two seeds; on `tests/cases/test_process_command`
+it caught all 300. the misses are a doubled release of a channel receive's
+optional after it was stored, and a deleted release of a result box after its
+`ok` payload was read.
 
 marks generate no code. the consumer drops every `mark` line before its first
 pass, so a mark can't split a pattern its rewrites match, and a build with

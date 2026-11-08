@@ -5,7 +5,7 @@
 # a small command-line wrapper around them.
 
 from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr
-from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value
+from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value, node_kind
 from errors import Diagnostic
 
 # ---------------------------------------------------------------
@@ -531,8 +531,18 @@ fn parse_pipe_expression() -> Int:
     while check("pipe"):
         advance_token()
         right := parse_additive_expression()
-        mut children: List[Int] := [left, right]
-        left = add_node_from_mark("binary", "pipe", children, mark)
+        # `x | f` is the call `f(x)`, built here so the checker and the
+        # emitter see an ordinary call. any other right side stays a pipe
+        # node, which the checker refuses (E208).
+        right_kind := node_kind(right)
+        if right_kind == "ident" or right_kind == "field_access":
+            mut arg_children: List[Int] := [left]
+            arg := add_node_at_node("arg", "", arg_children, left)
+            mut call_children: List[Int] := [right, arg]
+            left = add_node_from_mark("call", "", call_children, mark)
+        else:
+            mut children: List[Int] := [left, right]
+            left = add_node_from_mark("binary", "pipe", children, mark)
     return left
 
 fn parse_additive_expression() -> Int:

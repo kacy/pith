@@ -1103,6 +1103,19 @@ warning[E312]: this call takes 'self.mu', which is already held here; a mutex is
   fix: call a version that expects the lock held, marked `holding`, or release the mutex before the call
 ```
 
+### E313: assignment into an index of a String or Bytes
+
+a `String` and a `Bytes` value are immutable, so `s[i] = v` and `b[i] += 1`
+are refused. build a new value instead, or keep bytes that change in a
+`ByteBuffer`.
+
+```
+error[E313]: cannot assign into an index of a Bytes: the value is immutable
+  3 |     b[0] = 70
+             ^
+  fix: build a new value, or use a ByteBuffer for bytes that change
+```
+
 ### E275 — a frozen field is changed
 
 a field declared `frozen` is set when its struct is built and never changed

@@ -9983,6 +9983,13 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
 
 fn ir_emit_index_read(idx: Int, node: Node, obj_r: Int) -> Int:
     idx_r := ir_expr(node.children[1])
+    return ir_emit_index_read_at(idx, node, obj_r, idx_r, true)
+
+# read `obj[key]` from registers already evaluated. with `release_key` false
+# the caller still needs the key after the read (`xs[i] += n` stores through
+# it) and releases an owned key itself; only a miss that leaves the function
+# releases it here.
+fn ir_emit_index_read_at(idx: Int, node: Node, obj_r: Int, idx_r: Int, release_key: Bool) -> Int:
     r := ir_reg()
     mut obj_type := ir_checked_type(node.children[0])
     mut value_type := ir_checked_index_type(idx)
@@ -10000,7 +10007,7 @@ fn ir_emit_index_read(idx: Int, node: Node, obj_r: Int) -> Int:
     # plain "map" everywhere else in this function
     keyed_type := ir_bytes_keyed_type(node.children[0], obj_type)
     if ir_current_func_returns_result and ir_index_supports_propagate(keyed_type):
-        return ir_emit_index_expr_propagate(node.children[1], obj_r, idx_r, keyed_type, value_type)
+        return ir_emit_index_expr_propagate(node.children[1], obj_r, idx_r, keyed_type, value_type, release_key)
     call_name := ir_index_get_call_name(keyed_type)
     if obj_type == "string":
         ir_emit_call2(r, call_name, "string", obj_r, idx_r)
@@ -10012,7 +10019,8 @@ fn ir_emit_index_read(idx: Int, node: Node, obj_r: Int) -> Int:
         ir_emit_call2(r, call_name, value_type, obj_r, idx_r)
     else:
         ir_emit_call2(r, call_name, ir_infer_type(idx), obj_r, idx_r)
-    ir_release_owned_index_key(node.children[1], idx_r)
+    if release_key:
+        ir_release_owned_index_key(node.children[1], idx_r)
     return r
 
 # an index key computed in place (`m[a.to_string() + ":" + b.to_string()]`)
@@ -10045,13 +10053,14 @@ fn ir_index_supports_propagate(obj_type: String) -> Bool:
 # emit `map[k]` / `list[i]` as a fail-propagate: call the _opt runtime,
 # branch on is_some, on none return the fail result tuple, on some
 # continue with the unwrapped value. Mirrors ir_emit_optional_unwrap.
-fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: String, value_type: String) -> Int:
+fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: String, value_type: String, release_key: Bool) -> Int:
     opt_name := ir_index_get_opt_call_name(obj_type)
     opt_r := ir_reg()
     ir_emit_call2(opt_r, opt_name, "tuple", obj_r, idx_r)
     # release the key before the branch: the miss arm returns early, so a
     # release placed after it would only run on the hit path.
-    ir_release_owned_index_key(key_idx, idx_r)
+    if release_key:
+        ir_release_owned_index_key(key_idx, idx_r)
     flag_r := ir_optional_flag_field(opt_r)
     some_l := ir_label()
     none_l := ir_label()
@@ -10070,6 +10079,8 @@ fn ir_emit_index_expr_propagate(key_idx: Int, obj_r: Int, idx_r: Int, obj_type: 
     ir_emit("jmp " + merge_l)
     ir_emit_label(none_l)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", opt_r)
+    if not release_key:
+        ir_release_owned_index_key(key_idx, idx_r)
     ir_emit_miss_return("index out of bounds")
     ir_emit_label(merge_l)
     return unwrapped_r
@@ -10253,6 +10264,9 @@ fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int
     delta_idx := ir_upsert_delta_idx(map_idx, key_idx, value_idx)
     if delta_idx < 0:
         return 0 - 1
+    return ir_emit_map_upsert_call(map_idx, key_idx, delta_idx, obj_type)
+
+fn ir_emit_map_upsert_call(map_idx: Int, key_idx: Int, delta_idx: Int, obj_type: String) -> Int:
     call_name := ir_map_upsert_add_call_name(ir_bytes_keyed_type(map_idx, obj_type))
     map_r := ir_expr(map_idx)
     key_r := ir_expr(key_idx)
@@ -10265,6 +10279,23 @@ fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int
     # recognizer admits a wider key.
     ir_release_owned_index_key(key_idx, key_r)
     return r
+
+# `m[k] += d` on an int-valued map: the same fused update as `m[k] = m[k] + d`.
+# -1 for anything else.
+fn ir_try_emit_map_upsert_delta(target_idx: Int, delta_idx: Int) -> Int:
+    if ir_current_func_returns_result:
+        return 0 - 1
+    target := get_node(target_idx)
+    map_idx := target.children[0]
+    key_idx := target.children[1]
+    obj_type := ir_infer_type(map_idx)
+    if obj_type != "map" and obj_type != "map_int":
+        return 0 - 1
+    if ir_checked_index_type(target_idx) != "int":
+        return 0 - 1
+    if not ir_pure_read_expr(map_idx) or not ir_pure_read_expr(key_idx) or not ir_pure_read_expr(delta_idx):
+        return 0 - 1
+    return ir_emit_map_upsert_call(map_idx, key_idx, delta_idx, obj_type)
 
 # `m.insert(k, m[k] + d)` written as a method call. -1 for anything else.
 fn ir_try_emit_map_upsert_method(idx: Int) -> Int:
@@ -10283,11 +10314,19 @@ fn ir_try_emit_map_upsert_method(idx: Int) -> Int:
     return ir_try_emit_map_upsert_add(node.children[0], key_idx, value_idx)
 
 fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
+    return ir_emit_index_store(target_idx, value_idx, "")
+
+# `obj[key] = value`, or with `compound_op` set, `obj[key] += value` and the
+# other compound forms: the container and key are evaluated once, the element
+# read through them, and the result stored back through them.
+fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> Bool:
     target := get_node(target_idx)
     if target.kind != "index" or target.children.len() < 2:
         return false
 
-    if ir_try_emit_map_upsert_add(target.children[0], target.children[1], value_idx) >= 0:
+    if compound_op.len() == 0 and ir_try_emit_map_upsert_add(target.children[0], target.children[1], value_idx) >= 0:
+        return true
+    if compound_op == "add" and ir_try_emit_map_upsert_delta(target_idx, value_idx) >= 0:
         return true
 
     later_drops := ir_later_operands_drop([target.children[0], target.children[1], value_idx])
@@ -10303,7 +10342,16 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
         value_type = ir_lookup_map_value_type_for_expr(target.children[0])
     if value_type.len() == 0:
         value_type = ir_infer_type(value_idx)
-    value_r := ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
+    mut value_r := 0 - 1
+    if compound_op.len() > 0:
+        # the checker admits only numeric targets here, so the result is a
+        # plain word with no count to take or drop
+        cur_r := ir_emit_index_read_at(target_idx, target, obj_r, idx_r, false)
+        rhs_r := ir_expr(value_idx)
+        value_r = ir_reg()
+        ir_emit_simple_binary(value_r, compound_op, cur_r, rhs_r)
+    else:
+        value_r = ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # tagged containers retain stored elements in the runtime. a borrowed heap
     # value carries its kind with it, so the container adopts it where it has
     # none and takes exactly one count either way. a list used to get a
@@ -11410,6 +11458,8 @@ fn ir_emit_compound_assignment(node: Node):
     compound_op := ir_compound_assignment_ir_op(op)
     if compound_op.len() > 0 and node.children.len() >= 2:
         if ir_emit_field_compound_assignment(node.children[0], node.children[1], compound_op):
+            return
+        if ir_emit_index_store(node.children[0], node.children[1], compound_op):
             return
         tn := get_node(node.children[0])
         name := tn.value

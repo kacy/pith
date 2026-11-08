@@ -17,7 +17,7 @@
 # prefix from when every module shared one flat symbol namespace; newer
 # code does not follow it.
 
-from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_VOID, TID_ERR, TID_NONE
+from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
 from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
 from ast import Node, get_node
 from errors import Diagnostic, render_diagnostics_json
@@ -2844,6 +2844,14 @@ fn check_assignment(node: Node, scope_id: Int):
             return
     target_type := c_check_expr(target_idx, scope_id)
     val_type := c_check_expr(value_idx, scope_id)
+    # a String and a Bytes value are immutable, and nothing in the runtime
+    # stores into one. the store used to compile as a list store and stop at
+    # run time with "invalid list handle".
+    if target_node.kind == "index" and target_node.children.len() >= 2:
+        container_type := c_get_expr_type(target_node.children[0])
+        if container_type == TID_STRING or container_type == TID_BYTES:
+            report_error_with_fix("E313", "cannot assign into an index of a " + get_type_name(container_type) + ": the value is immutable", "build a new value, or use a ByteBuffer for bytes that change")
+            return
     # `mut x := none` binds the none type, which only an optional target
     # accepts, so the binding could never be assigned into and the error landed
     # on the first use rather than on the declaration. the first concrete
@@ -3647,30 +3655,12 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
 # pipe expression: value | fn_name
 # ---------------------------------------------------------------
 
+# the parser turns `x | f` and `x | mod.f` into the call `f(x)`, so a pipe
+# node that reaches the checker has something else on its right.
 fn check_pipe_expression(node: Node, scope_id: Int) -> Int:
-    left := c_check_expr(node.children[0], scope_id)
-    if is_error_type(left):
-        return TID_ERR
-    rhs_node := get_node(node.children[1])
-    if rhs_node.kind != "ident":
-        report_error("E208", "pipe operator requires a function name on the right")
-        return TID_ERR
-    fn_name := rhs_node.value
-    fn_tid := lookup_binding(scope_id, fn_name)
-    if fn_tid < 0:
-        report_error("E201", "undefined function: " + fn_name)
-        return TID_ERR
-    fn_info := get_type_info(fn_tid)
-    if fn_info.kind != "function":
-        report_error("E208", "'" + fn_name + "' is not a function")
-        return TID_ERR
-    if fn_info.param_types.len() != 1:
-        report_error("E207", "pipe target '" + fn_name + "' must take exactly 1 parameter")
-        return TID_ERR
-    if left != fn_info.param_types[0]:
-        report_error("E200", "pipe type mismatch: function expects " + get_type_name(fn_info.param_types[0]) + ", got " + get_type_name(left))
-        return TID_ERR
-    return fn_info.return_type
+    c_check_expr(node.children[0], scope_id)
+    report_error("E208", "pipe operator requires a function name on the right")
+    return TID_ERR
 
 # ---------------------------------------------------------------
 # unary expression

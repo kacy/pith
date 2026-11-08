@@ -5058,7 +5058,10 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
         return converted
     if part_type == "int":
         converted := ir_reg()
-        ir_emit_call1(converted, "int_to_string", "string", part_r)
+        if ir_is_unsigned_word(part_tid):
+            ir_emit_call1(converted, "uint_to_string", "string", part_r)
+        else:
+            ir_emit_call1(converted, "int_to_string", "string", part_r)
         return converted
     if part_tid >= 0:
         part_info := get_type_info(part_tid)
@@ -5918,8 +5921,32 @@ fn ir_plain_compare_operand_ok(tid: Int, info: TypeInfo) -> Bool:
 # and ordered comparison (which call the runtime rather than compare pointers),
 # enum structural equality, and the plain integer binops. emits into r (already
 # allocated by the caller so register numbering is stable) and returns it.
+# true for the unsigned 64-bit types, whose values are the bits of an i64:
+# division, remainder, ordering and printing need the unsigned forms, or a
+# value at or past 2^63 reads as negative. the narrower unsigned types are kept
+# zero-extended, so the signed forms already answer correctly for them.
+fn ir_is_unsigned_word(tid: Int) -> Bool:
+    if tid < 0:
+        return false
+    name := get_type_name(tid)
+    return name == "UInt" or name == "UInt64"
+
+# the unsigned form of an integer op on a value of type `tid`, or the op itself.
+fn ir_unsigned_op(tid: Int, op: String) -> String:
+    if not ir_is_unsigned_word(tid):
+        return op
+    if op == "div" or op == "mod" or op == "lt" or op == "gt" or op == "lte" or op == "gte":
+        if op == "mod":
+            return "urem"
+        return "u" + op
+    return op
+
 fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
     op := node.value
+    unsigned_op := ir_unsigned_op(c_get_expr_type(node.children[0]), op)
+    if unsigned_op != op:
+        ir_emit(unsigned_op + " " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+        return r
     left_type := ir_infer_type(node.children[0])
     right_type := ir_infer_type(node.children[1])
     is_str_op := left_type == "string" or right_type == "string"
@@ -10388,7 +10415,7 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
         cur_r := ir_emit_index_read_at(target_idx, target, obj_r, idx_r, false)
         rhs_r := ir_expr(value_idx)
         sum_r := ir_reg()
-        ir_emit_simple_binary(sum_r, compound_op, cur_r, rhs_r)
+        ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(target_idx), compound_op), cur_r, rhs_r)
         value_r = ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     else:
         value_r = ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
@@ -11446,7 +11473,7 @@ fn ir_emit_field_compound_assignment(target_idx: Int, value_idx: Int, compound_o
     ir_emit_named_field_access(cur, obj_r, lookup_key, fname, ir_checked_struct_field_type(recv_idx, fname))
     rhs := ir_expr(value_idx)
     sum_r := ir_reg()
-    ir_emit_simple_binary(sum_r, compound_op, cur, rhs)
+    ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(target_idx), compound_op), cur, rhs)
     res := ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + res.to_string())
     return true
@@ -11508,7 +11535,7 @@ fn ir_emit_compound_assignment(node: Node):
         ir_emit_name_load(cur, name)
         rhs := ir_expr(node.children[1])
         sum_r := ir_reg()
-        ir_emit_simple_binary(sum_r, compound_op, cur, rhs)
+        ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(node.children[0]), compound_op), cur, rhs)
         ir_emit_name_store(name, ir_narrow_to_tid(c_get_expr_type(node.children[0]), sum_r))
 
 # emit a label and clear the return-tracking flag: a label starts a

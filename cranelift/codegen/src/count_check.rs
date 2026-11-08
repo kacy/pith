@@ -35,11 +35,17 @@ const RETAINS: &[&str] = &[
 // a task handle is in the list too: the runtime keeps no count on it
 // (runtime_ownership.txt, pith_await and pith_task_detach), so a returned
 // handle that is awaited or detached has nothing to give back
-const SCALAR_KINDS: &[&str] = &["int", "bool", "float", "void", "uint", "byte", "char", "i32", "u8", "task"];
+// the fixed-width integer types reach the IR under their source names
+// (`func f 1 UInt64`, `mark kind x Int8`), and are plain words like `int`
+const SCALAR_KINDS: &[&str] = &[
+    "int", "bool", "float", "void", "uint", "byte", "char", "i32", "u8", "task", "UInt", "Int8", "Int16", "Int32",
+    "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
+];
 
 /// instructions that make a plain value from plain operands
 const PLAIN_OPS: &[&str] = &[
     "iconst", "fconst", "add", "sub", "mul", "div", "mod", "lt", "gt", "lte", "gte", "eq", "neq",
+    "udiv", "urem", "ult", "ugt", "ulte", "ugte",
     "and", "or", "xor", "shl", "shr", "ushr", "not", "neg", "band", "bor", "bxor", "fadd", "fsub",
     "fmul", "fdiv", "flt", "fgt", "flte", "fgte", "feq", "fneq", "optflag", "funcref",
     "closure_ref", "strref",
@@ -1965,6 +1971,32 @@ endfunc
         assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
         let r = check(&CHECKED_OWNED_STORE.replace("call 5 pith_cstring_release void 1 1\n", ""));
         assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+    // a fixed-width integer named by its source type is a plain word
+    const SIZED_INT_RETURN: &str = "
+func larger 2 UInt64
+param a
+param b
+load 2 a
+load 3 b
+ugt 4 2 3
+brif 4 L1 L2
+label L1
+load 5 a
+ret 5
+label L2
+load 6 b
+ret 6
+mark kind a UInt64
+mark kind b UInt64
+endfunc
+";
+
+    #[test]
+    fn a_sized_integer_is_not_counted() {
+        let r = check(SIZED_INT_RETURN);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
     }
 
     // an owned local released on one path of a branch only

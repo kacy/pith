@@ -2022,6 +2022,8 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                     fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls certificate verify")
                 if not scheme_matches_certificate_key(cv.signature_scheme, certs[0].public_key_algorithm):
                     fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_ILLEGAL_PARAMETER, "tls signature scheme does not match the certificate key type")
+                if not tls13.certificate_verify_scheme_allowed(cv.signature_scheme):
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_ILLEGAL_PARAMETER, "tls 1.3 certificate verify signed with pkcs#1 v1.5")
                 if not (tls13.verify_server_certificate_for_cipher(server_hello.cipher_suite, certs[0].subject_public_key, cv.signature_scheme, transcript_buf.bytes(), cv.signature) catch false):
                     fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECRYPT_ERROR, "certificate verify failed")
                 cert_verify_seen = true
@@ -2803,6 +2805,8 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client certificate verify")
                 if not scheme_matches_certificate_key(cv.signature_scheme, client_certs[0].public_key_algorithm):
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_ILLEGAL_PARAMETER, "tls client signature scheme does not match the certificate key type")
+                if not tls13.certificate_verify_scheme_allowed(cv.signature_scheme):
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_ILLEGAL_PARAMETER, "tls 1.3 client certificate verify signed with pkcs#1 v1.5")
                 if not (tls13.verify_client_certificate_for_cipher(cipher, client_certs[0].subject_public_key, cv.signature_scheme, transcript.bytes(), cv.signature) catch false):
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECRYPT_ERROR, "client certificate verify failed")
                 client_cert_verify_seen = true
@@ -3908,6 +3912,20 @@ test "server signature scheme selection honours the client's offer and version":
     assert_eq(select_server_signature_scheme(true, true, [TLS_SIG_RSA_PSS_RSAE_SHA256]), 0)
     # an empty offer (a 1.2 client omitting the extension) takes the top choice.
     assert_eq(select_server_signature_scheme(false, false, []), TLS_SIG_RSA_PSS_RSAE_SHA256)
+
+test "a tls 1.3 certificate verify refuses a pkcs#1 v1.5 signature":
+    # rfc 8446 §4.4.3 allows only rsa-pss in a 1.3 CertificateVerify. the same
+    # signature over the same input is good under the 1.2 rules, so this checks
+    # the scheme gate rather than the signature.
+    cfg := client_config_with_ca_file("tests/live/fixtures/clientcert-ca.crt")!.with_client_certificate("tests/live/fixtures/clientcert-rsa.crt", "tests/live/fixtures/clientcert-rsa.key")!
+    leaf := x509.parse_der(native_config_client_cert_chain(cfg)![0])!
+    transcript := bytes.from_string_utf8("a tls 1.3 handshake transcript through certificate")
+    input := tls13.client_certificate_verify_input_sha256(transcript)!
+    signed := sign_with_client_scheme(cfg, TLS_SIG_RSA_PKCS1_SHA256, input)!
+    assert(tls13.verify_certificate_signature(leaf.subject_public_key, TLS_SIG_RSA_PKCS1_SHA256, input, signed)!)
+    assert(not tls13.verify_client_certificate_sha256(leaf.subject_public_key, TLS_SIG_RSA_PKCS1_SHA256, transcript, signed)!)
+    pss := sign_with_client_scheme(cfg, TLS_SIG_RSA_PSS_RSAE_SHA256, input)!
+    assert(tls13.verify_client_certificate_sha256(leaf.subject_public_key, TLS_SIG_RSA_PSS_RSAE_SHA256, transcript, pss)!)
 
 test "a tls 1.2 certificate verify signature is bound to the transcript it signed":
     # the 1.2 CertificateVerify signs the raw handshake transcript, so a

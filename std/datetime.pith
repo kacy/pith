@@ -239,41 +239,57 @@ pub fn is_valid(d: Int) -> Bool:
 # Date Arithmetic
 # ===============================================================
 
-# Adds n days to a date (n can be negative)
+# division that rounds toward negative infinity, for the day and month
+# arithmetic below, which runs on either side of the epoch.
+fn floor_div(a: Int, b: Int) -> Int:
+    q := a / b
+    if (a % b != 0) and ((a < 0) != (b < 0)):
+        return q - 1
+    return q
+
+# days from 1970-01-01 to a calendar date, proleptic gregorian. a day past the
+# end of its month runs on into the next, as add_days always allowed.
+fn days_from_civil(y: Int, m: Int, d: Int) -> Int:
+    mut yy := y
+    if m <= 2:
+        yy = y - 1
+    era := floor_div(yy, 400)
+    yoe := yy - era * 400
+    mp := (m + 9) % 12
+    doy := (153 * mp + 2) / 5 + d - 1
+    doe := yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+
+# the calendar date `z` days after 1970-01-01, packed.
+fn civil_from_days(z: Int) -> Int:
+    shifted := z + 719468
+    era := floor_div(shifted, 146097)
+    doe := shifted - era * 146097
+    yoe := (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365
+    doy := doe - (365 * yoe + yoe / 4 - yoe / 100)
+    mp := (5 * doy + 2) / 153
+    d := doy - (153 * mp + 2) / 5 + 1
+    mut m := mp + 3
+    if mp >= 10:
+        m = mp - 9
+    mut y := yoe + era * 400
+    if m <= 2:
+        y = y + 1
+    return date(y, m, d)
+
+# Adds n days to a date (n can be negative). the work does not grow with n:
+# it used to step a month at a time, so a large n spun for as long as it named.
 pub fn add_days(d: Int, n: Int) -> Int:
-    mut y := year(d)
-    mut m := month(d)
-    mut dy := day(d) + n
-    # handle positive overflow
-    while dy > days_in_month(y, m):
-        dy = dy - days_in_month(y, m)
-        m = m + 1
-        if m > 12:
-            m = 1
-            y = y + 1
-    # handle negative underflow
-    while dy < 1:
-        m = m - 1
-        if m < 1:
-            m = 12
-            y = y - 1
-        dy = dy + days_in_month(y, m)
-    return date(y, m, dy)
+    return civil_from_days(days_from_civil(year(d), month(d), day(d)) + n)
 
 # Adds n months to a date, clamping the day if needed
 pub fn add_months(d: Int, n: Int) -> Int:
-    mut y := year(d)
-    mut m := month(d) + n
+    total := year(d) * 12 + month(d) - 1 + n
+    y := floor_div(total, 12)
+    m := total - y * 12 + 1
     dy := day(d)
-    # normalize month
-    while m > 12:
-        m = m - 12
-        y = y + 1
-    while m < 1:
-        m = m + 12
-        y = y - 1
     # clamp day
-    mut max_day := days_in_month(y, m)
+    max_day := days_in_month(y, m)
     mut clamped := dy
     if clamped > max_day:
         clamped = max_day
@@ -286,26 +302,7 @@ pub fn add_years(d: Int, n: Int) -> Int:
 # Returns the number of days between two dates (b - a)
 # Positive if b is after a, negative if before
 pub fn diff_days(a: Int, b: Int) -> Int:
-    a_total := to_day_number(a)
-    b_total := to_day_number(b)
-    return b_total - a_total
-
-# Converts a date to an absolute day number (days since year 0)
-# Used internally for day difference calculations
-fn to_day_number(d: Int) -> Int:
-    y := year(d)
-    m := month(d)
-    dy := day(d)
-    # days from years
-    mut y1 := y - 1
-    mut total := y1 * 365 + y1 / 4 - y1 / 100 + y1 / 400
-    # days from months
-    mut i := 1
-    while i < m:
-        total = total + days_in_month(y, i)
-        i = i + 1
-    total = total + dy
-    return total
+    return days_from_civil(year(b), month(b), day(b)) - days_from_civil(year(a), month(a), day(a))
 
 # ===============================================================
 # Comparison and Range
@@ -331,19 +328,9 @@ pub fn in_range(d: Int, start: Int, end: Int) -> Bool:
 # Epoch Conversion
 # ===============================================================
 
-# Converts a Unix timestamp (milliseconds) to a date
-# Only handles dates from 1970 onwards
+# Converts a Unix timestamp (milliseconds) to a date, on either side of 1970
 pub fn from_timestamp(ms: Int) -> Int:
-    mut days := ms / 1000 / 86400
-    mut y := 1970
-    while days >= days_in_year(y):
-        days = days - days_in_year(y)
-        y = y + 1
-    mut m := 1
-    while days >= days_in_month(y, m):
-        days = days - days_in_month(y, m)
-        m = m + 1
-    return date(y, m, days + 1)
+    return civil_from_days(floor_div(ms, 86400000))
 
 # Returns today's date (from system clock)
 pub fn today() -> Int:
@@ -439,3 +426,22 @@ test "weekday and diff_days line up with the calendar":
     assert_eq(diff_days(date(2024, 2, 1), date(2024, 3, 1)), 29)
     assert_eq(year(parse_date("2026-07-04")), 2026)
     assert_eq(day(parse_date("2026-07-04")), 4)
+
+test "date arithmetic takes constant time and agrees with stepping":
+    # these used to loop once per month or year of the offset
+    assert_eq(add_days(date(2024, 1, 1), 1000000000), date(2739931, 1, 4))
+    assert_eq(add_days(add_days(date(2024, 1, 1), 1000000000), 0 - 1000000000), date(2024, 1, 1))
+    assert_eq(add_months(date(2024, 1, 31), 1200000001), date(100002024, 2, 29))
+    assert_eq(from_timestamp(0 - 86400000), date(1969, 12, 31))
+    assert_eq(from_timestamp(951782400000), date(2000, 2, 29))
+    assert_eq(to_timestamp(date(1969, 12, 31)), 0 - 86400000)
+    # every day across four centuries matches a one-day step
+    mut d := date(1899, 12, 25)
+    mut n := 0
+    while n < 146100:
+        next := add_days(d, 1)
+        assert_eq(diff_days(d, next), 1)
+        assert(is_valid(next))
+        d = next
+        n = n + 1
+    assert_eq(d, add_days(date(1899, 12, 25), 146100))

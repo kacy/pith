@@ -537,7 +537,30 @@ fn fetch(jwks_url: String, wait_ms: Int, limit: Int) -> String!:
 # over an authenticated channel. http is tolerated only for a sidecar on the
 # loopback interface, where there is no network path to tamper with.
 fn is_loopback_host(host: String) -> Bool:
-    return host == "localhost" or host == "127.0.0.1" or host == "::1" or host.starts_with("127.")
+    if host == "localhost" or host == "::1" or host == "[::1]":
+        return true
+    return is_loopback_ipv4(host)
+
+# a dotted-quad address in 127.0.0.0/8. a prefix test alone accepted a dns name
+# such as `127.example.net`, which resolves wherever its owner points it.
+fn is_loopback_ipv4(host: String) -> Bool:
+    parts := host.split(".")
+    if parts.len() != 4 or parts[0] != "127":
+        return false
+    for part in parts:
+        if part.len() == 0 or part.len() > 3:
+            return false
+        mut value := 0
+        mut i := 0
+        while i < part.len():
+            code := ord(part[i])
+            if code < 48 or code > 57:
+                return false
+            value = value * 10 + code - 48
+            i = i + 1
+        if value > 255:
+            return false
+    return true
 
 fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int) -> http.HttpResponse!:
     if target.scheme == "https":
@@ -614,6 +637,11 @@ test "jwks refuses an http url to a non-loopback host":
     assert(is_loopback_host("::1"))
     assert(not is_loopback_host("issuer.internal"))
     assert(not is_loopback_host("evil.example"))
+    assert(not is_loopback_host("127.evil.example"))
+    assert(not is_loopback_host("127.0.0.1.evil.example"))
+    assert(not is_loopback_host("127.0.0.256"))
+    assert(not is_loopback_host("127..0.1"))
+    assert(is_loopback_host("127.10.20.30"))
     # a fetch to a non-loopback http endpoint fails at the scheme/host check,
     # before any network i/o — the trust root must not travel in cleartext.
     result := fetch("http://issuer.internal/.well-known/jwks.json", 100, 65536)

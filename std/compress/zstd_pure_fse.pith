@@ -256,12 +256,15 @@ pub struct NCount:
 ## probability space does, which is why this peeks a wide field and then
 ## consumes only the width that field turned out to need. a zero count is
 ## followed by a repeat field, so long runs of absent symbols cost little.
-pub fn read_ncount(data: Bytes, start: Int, end: Int, max_symbol: Int) -> NCount!:
+## `max_log` is the largest accuracy log the format allows for this table
+## (rfc 8878 §4.1.1, §4.2.1.2): the table has 2^log entries, so the 4-bit
+## field alone would let a frame ask for 4 million of them.
+pub fn read_ncount(data: Bytes, start: Int, end: Int, max_symbol: Int, max_log: Int) -> NCount!:
     if start >= end:
         fail "zstd: empty fse table description"
     reader := stream.forward_reader(data, start, end)
     log := reader.read(4) + 5
-    if log > 22:
+    if log > max_log:
         fail "zstd: fse accuracy log " + log.to_string() + " is out of range"
 
     mut counts: List[Int] := []
@@ -380,7 +383,7 @@ fn ncount_round_trip(counts: List[Int], log: Int, max_symbol: Int) -> NCount!:
     for byte in packed:
         buf.write_byte(byte)
     data := buf.take_bytes()
-    return read_ncount(data, 0, data.len(), max_symbol)!
+    return read_ncount(data, 0, data.len(), max_symbol, 9)!
 
 test "a table description round trips":
     # counts summing to 2^5 = 32
@@ -420,14 +423,14 @@ test "a long run of absent symbols survives":
         k = k + 1
 
 test "a truncated or malformed description is refused":
-    assert(read_ncount(bytes.empty(), 0, 0, 255).is_err)
+    assert(read_ncount(bytes.empty(), 0, 0, 255, 9).is_err)
 
     # two zero bytes would decode as thirty-two low-probability symbols,
     # which balances — but only by reading bits that are not there.
     mut short_desc := bytes.buffer()
     short_desc.write_byte(0)
     short_desc.write_byte(0)
-    assert(read_ncount(short_desc.take_bytes(), 0, 2, 255).is_err)
+    assert(read_ncount(short_desc.take_bytes(), 0, 2, 255, 9).is_err)
 
     # an accuracy log past the format's ceiling
     mut bad_log := bytes.buffer()
@@ -435,13 +438,13 @@ test "a truncated or malformed description is refused":
     bad_log.write_byte(0)
     bad_log.write_byte(0)
     bad_log.write_byte(0)
-    assert(read_ncount(bad_log.take_bytes(), 0, 4, 255).is_err)
+    assert(read_ncount(bad_log.take_bytes(), 0, 4, 255, 22).is_err)
 
     # a well-formed description that stops short of balancing
     packed := write_ncount([10, 12, 10], 5)
     mut truncated := bytes.buffer()
     truncated.write_byte(packed[0])
-    assert(read_ncount(truncated.take_bytes(), 0, 1, 255).is_err)
+    assert(read_ncount(truncated.take_bytes(), 0, 1, 255, 9).is_err)
 
 test "fse round trips a symbol sequence through a real backward stream":
     counts := [10, 12, 10]
@@ -517,3 +520,14 @@ test "bit_length matches floor-log2 plus one":
     assert_eq(bit_length(3), 2)
     assert_eq(bit_length(7), 3)
     assert_eq(bit_length(8), 4)
+
+test "an accuracy log past the table's limit is refused":
+    # a balanced description at log 10, one past the largest a literal or
+    # match length table may use
+    packed := write_ncount([512, 512], 10)
+    mut buf := bytes.buffer()
+    for byte in packed:
+        buf.write_byte(byte)
+    data := buf.take_bytes()
+    assert(read_ncount(data, 0, data.len(), 255, 9).is_err)
+    assert_eq(read_ncount(data, 0, data.len(), 255, 10)!.log, 10)

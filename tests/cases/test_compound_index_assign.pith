@@ -1,0 +1,53 @@
+# compound assignment through an index: the container and key are evaluated
+# once, the element read through them and the result stored back.
+struct Tally:
+    counts: List[Int]
+
+mut calls := 0
+
+fn next_slot() -> Int:
+    calls += 1
+    return 1
+
+fn bump(xs: List[Int], i: Int) -> Int!:
+    xs[i] += 10
+    return xs[i]
+
+fn bump_key(m: Map[String, Int], k: String) -> Int!:
+    m[k] += 1
+    return m[k]
+
+fn main() -> Int:
+    xs := [1, 2, 3]
+    xs[1] += 5
+    xs[2] -= 1
+    xs[0] *= 7
+    xs[1] /= 2
+    print("list {xs[0]} {xs[1]} {xs[2]}")
+
+    fs := [1.5, 2.5]
+    fs[0] += 0.25
+    fs[1] *= 2.0
+    print("float {fs[0]} {fs[1]}")
+
+    m := {"a": 1, "b": 10}
+    m["a"] += 2
+    m["b"] -= 3
+    k := "a"
+    m[k] += 4
+    prefix := "b"
+    m[prefix + ""] *= 2
+    print("map {m["a"]} {m["b"]}")
+
+    im := {1: 100}
+    im[1] += 5
+    print("int map {im[1]}")
+
+    t := Tally(counts: [0, 0])
+    t.counts[1] += 3
+    t.counts[next_slot()] += 4
+    print("field {t.counts[1]} calls {calls}")
+
+    print("fallible {bump(xs, 0).unwrap_or(0 - 1)} {bump(xs, 9).unwrap_or(0 - 1)}")
+    print("fallible map {bump_key(m, "a").unwrap_or(0 - 1)} {bump_key(m, "zz").unwrap_or(0 - 1)}")
+    return 0

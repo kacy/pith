@@ -75,6 +75,11 @@ fn proxy_conn(listener_handle: Int, fd: Int) -> Int:
             if line.index_of("refused.test") >= 0:
                 tcp_write(fd, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n") catch 0
                 break
+            if line.index_of("longhead.test") >= 0:
+                # a refusal with a head just under the client's limit
+                pad := "X-Pad: " + "p".repeat(60) + "\r\n"
+                tcp_write(fd, "HTTP/1.1 407 Proxy Authentication Required\r\n" + pad.repeat(4000) + "Content-Length: 0\r\n\r\n") catch 0
+                break
             tcp_write(fd, "HTTP/1.1 200 Connection established\r\n\r\n") catch 0
             conn := tls.handshake(tls.listener_from_handle(listener_handle), fd) catch tls.Conn(0)
             if conn.handle != 0:
@@ -119,6 +124,14 @@ fn main() -> String!:
     print("again, on the pooled tunnel: " + show(secure.get("https://localhost/again")))
     print("proxy connections so far: {accepted(count)}")
     print("CONNECT refused: " + show(secure.get("https://refused.test/")))
+    # the reply head is read a byte at a time; a long one used to cost the
+    # square of its length
+    started := time()
+    long_refusal := show(secure.get("https://longhead.test/"))
+    mut pace := "promptly"
+    if time() - started > 5000:
+        pace = "slowly"
+    print("CONNECT refused with a long head, " + pace + ": " + long_refusal)
 
     # the environment's proxy, with the rules net/http applies to it
     os.set_env("HTTP_PROXY", proxy)

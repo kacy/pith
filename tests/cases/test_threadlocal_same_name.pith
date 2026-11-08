@@ -1,0 +1,26 @@
+# two modules may each declare a threadlocal of the same name. the slots were
+# keyed by the bare name, so the two shared storage: here a list and an int,
+# which read each other's value. in std, json, toml and yaml shared their
+# parser state and their scope depth, so a yaml scope closed out of order with
+# a json scope skipped its reclaim.
+import tls_same_name_a as a
+import tls_same_name_b as b
+import std.json as json
+import std.yaml as yaml
+
+fn main() -> Int:
+    a.add("x")
+    b.bump()
+    a.add("y")
+    b.bump()
+    b.bump()
+    print("list {a.joined()} count {b.count()}")
+
+    yaml_base := yaml.pool_live_nodes()
+    json_scope := json.open_scope()
+    yaml_scope := yaml.open_scope()
+    json.close_scope(json_scope)
+    yaml.parse("k: v")
+    yaml.close_scope(yaml_scope)
+    print("yaml reclaimed after a json scope closed first: {yaml.pool_live_nodes() - yaml_base}")
+    return 0

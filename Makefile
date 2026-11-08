@@ -91,7 +91,7 @@ check-tls-barriers:
 # thread a forced collect spawns lives for the rest of the process, so these
 # tests cannot share a parallel test binary with unrelated suites.
 test-cycle-gc:
-	cargo test --manifest-path cranelift/Cargo.toml -p pith-runtime --locked -- --ignored --test-threads=1 cycle:: collections::map::tests::buffered_map
+	cargo test -p pith-runtime --locked -- --ignored --test-threads=1 cycle:: collections::map::tests::buffered_map
 
 # model-check the runtime's park/wake and count protocols (the blocking-pool
 # handshake, channel park/wake, task await, weak upgrade, mutex, semaphore and
@@ -103,7 +103,7 @@ loom-check:
 	RUSTFLAGS="--cfg loom" cargo test --release -p pith-runtime --locked --target-dir target/loom --lib loom_
 
 safety-check: build check-no-panics
-	cargo test --manifest-path cranelift/Cargo.toml --workspace --locked
+	cargo test --workspace --locked
 	./target/release/pith run tests/cases/test_channel_runtime.pith
 	./target/release/pith run tests/cases/test_concurrent_runtime.pith
 	./target/release/pith run tests/cases/test_select_runtime.pith

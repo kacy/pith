@@ -12,7 +12,10 @@ jobs:
     # with zero output inside the memcheck step's apt-get preamble (a
     # mirror stall), and each time it sat until someone noticed — the run
     # for #811 burned four hours. a wedged run should fail in minutes.
-    timeout-minutes: 90
+    # the job takes about 83 minutes on a typical runner and was cancelled
+    # at 90 on a slow one, with every step about a fifth slower, so the bound
+    # sits well above the normal run while still catching a wedge.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 

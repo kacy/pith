@@ -1,0 +1,51 @@
+# `?` on a fresh optional, a function's returned Some: the shell was never
+# released, about 50 bytes a call. SHAPE=try has an Int payload, SHAPE=string
+# a counted one (plus a local optional unwrapped twice, which must keep its
+# shell), and SHAPE=chan a channel receive's unwrap_or.
+import leakprobe as probe
+
+fn maybe(n: Int) -> Int?:
+    if n > 0:
+        return n
+    return none
+
+fn unwrapped(n: Int) -> Int!:
+    v := maybe(n)?
+    return v * 10
+
+fn smaybe(n: Int) -> String?:
+    if n > 0:
+        return "s" + n.to_string()
+    return none
+
+fn sunwrapped(n: Int) -> Int!:
+    s := smaybe(n)?
+    return s.len()
+
+fn local_unwrap(n: Int) -> Int!:
+    held := smaybe(n)
+    a := held?
+    b := held?
+    return a.len() + b.len()
+
+fn recv_or(ch: Channel[Int]) -> Int:
+    ch.send(3)
+    return ch.recv().unwrap_or(1)
+
+fn main():
+    n := probe.rounds()
+    shape := env("SHAPE")
+    ch := Channel[Int](4)
+    mut i := 0
+    mut c := 0
+    while i < n:
+        if shape == "chan":
+            c = c + recv_or(ch)
+        elif shape == "string":
+            c = c + (sunwrapped(i % 5) catch 0) + (local_unwrap(i % 4) catch 0)
+        else:
+            c = c + (unwrapped(i % 5) catch 0)
+        i = i + 1
+    if c == 0 - 1:
+        print("x")
+    print("{probe.peak_kb()}")

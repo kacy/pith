@@ -2,6 +2,42 @@
 
 from ir_builder import ir_emit, ir_label
 from ir_result_abi import ir_emit_result_flag_field, ir_emit_ret_known_err_box
+from ir_ownership import ir_rc_release_reg
+
+# values a typed decode has already pulled out of the document while a later
+# field is still being read. a failing later field stores its error and jumps
+# past the struct (ir_emit_decode_field_error_branch), so these are released
+# there: a toml or json decode failing on a later field leaked the earlier
+# ones.
+pub mut ir_decode_partial_regs: List[Int] := []
+pub mut ir_decode_partial_kinds: List[String] := []
+
+## hold a decoded value until its struct is built.
+pub fn ir_decode_partial_push(r: Int, kind: String):
+    if kind.len() == 0:
+        return
+    ir_decode_partial_regs.push(r)
+    ir_decode_partial_kinds.push(kind)
+
+# where the decode being emitted starts in the held list. an error branch
+# releases only that decode's values: a decode nested inside another one
+# fails into its own temp, and the outer decode's error branch releases the
+# outer values once.
+pub mut ir_decode_partial_floor := 0
+
+## start holding values for one struct decode; the answer goes back to
+## ir_decode_partial_end.
+pub fn ir_decode_partial_begin() -> Int:
+    saved := ir_decode_partial_floor
+    ir_decode_partial_floor = ir_decode_partial_regs.len()
+    return saved
+
+## the struct owns its values now: drop them and restore the outer decode.
+pub fn ir_decode_partial_end(saved: Int):
+    while ir_decode_partial_regs.len() > ir_decode_partial_floor:
+        ir_decode_partial_regs.remove(ir_decode_partial_regs.len() - 1)
+        ir_decode_partial_kinds.remove(ir_decode_partial_kinds.len() - 1)
+    ir_decode_partial_floor = saved
 
 ## guard one fallible step of a generated body: test `result_r`, and on
 ## the error arm store the box whole into `temp_name` and jump to
@@ -18,6 +54,24 @@ pub fn ir_emit_result_store_error_branch(result_r: Int, temp_name: String, done_
     err_l := ir_label()
     ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
     ir_emit("label " + err_l)
+    ir_emit("store " + temp_name + " " + result_r.to_string())
+    ir_emit("jmp " + done_l)
+    ir_emit("label " + ok_l)
+
+## the error branch after one field of a struct decode: the fields decoded
+## before it are released, since the struct that would own them is never
+## built. only a decode's own field checks use it: a builder emitted inline
+## for one field (a list, a map) fails through the plain branch above, and
+## the field check after it releases the decode's values once.
+pub fn ir_emit_decode_field_error_branch(result_r: Int, temp_name: String, done_l: String):
+    ok_flag_r := ir_emit_result_flag_field(result_r, "is_ok")
+    ok_l := ir_label()
+    err_l := ir_label()
+    ir_emit("brif " + ok_flag_r.to_string() + " " + ok_l + " " + err_l)
+    ir_emit("label " + err_l)
+    for held_r, hi in ir_decode_partial_regs:
+        if hi >= ir_decode_partial_floor:
+            ir_rc_release_reg(held_r, ir_decode_partial_kinds[hi])
     ir_emit("store " + temp_name + " " + result_r.to_string())
     ir_emit("jmp " + done_l)
     ir_emit("label " + ok_l)

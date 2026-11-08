@@ -90,7 +90,7 @@ fn ir_emit_match_arm_return(body_idx: Int, emit_ret: fn(Int), emit_block: fn(Int
 # nothing for it), and freeing the box would leave that binding dangling.
 # an optional subject's bare binding is the counted payload extraction, not
 # an alias, so it keeps the subject free.
-fn ir_match_pattern_keeps_subject_free(pat: Node, subj_is_optional: Bool) -> Bool:
+pub fn ir_match_pattern_keeps_subject_free(pat: Node, subj_is_optional: Bool) -> Bool:
     if pat.kind == "pat_binding":
         return subj_is_optional
     if pat.kind == "pat_tuple":
@@ -149,7 +149,13 @@ fn ir_match_subject_release_kind(node: Node, subj_type: String, subj_owned: Bool
 ## lower a function-tail match directly into returns. subj_owned reports
 ## whether the subject expression is an owned fresh temporary whose count
 ## this match must release (the caller classifies; see ir_expr_complex).
-pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int, subj_owned: Bool):
+## alias_release is a kind ir_match_alias_release (in the emitter core)
+## settled on: an owned fresh subject the arms only read through a bare
+## binding, released after the taken arm. alias_track puts the subject in
+## flight while an arm runs (true) and takes it out again (false), so an arm
+## that returns releases it in the exit cleanup; alias_free releases it by
+## that kind. "" leaves the subject to the release below.
+pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_ret: fn(Int), emit_block: fn(Int) -> Int, subj_owned: Bool, alias_release: String, alias_track: fn(Int, String, Bool), alias_free: fn(Int, String)):
     subj_r := emit_expr(node.children[0])
     # every arm returns, so the exit cleanup is what releases a pin here
     ir_take_match_pin(subj_r)
@@ -188,13 +194,19 @@ pub fn ir_emit_match_return(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emi
         # a failing guard still hands a live subject to the next arm's test.
         if subj_release.len() > 0:
             ir_rc_release_reg(subj_r, subj_release)
+        if alias_release.len() > 0:
+            alias_track(subj_r, alias_release, true)
         ir_emit_match_arm_return(body_idx, emit_ret, emit_block)
+        if alias_release.len() > 0:
+            alias_track(subj_r, alias_release, false)
         ir_emit_label(next_l)
         i = i + 1
     # no arm matched: the fall-through lands on the function's default
     # return, and the subject dies unread.
     if subj_release.len() > 0:
         ir_rc_release_reg(subj_r, subj_release)
+    if alias_release.len() > 0:
+        alias_free(subj_r, alias_release)
 
 # emit a bool register that is 1 when subj_r matches pat, ignoring any bindings
 # (those are emitted separately, only in the branch where the pattern matched).
@@ -630,7 +642,13 @@ pub fn ir_emit_if_expr(node: Node, emit_expr: fn(Int) -> Int, emit_value: fn(Int
 ## must release (the caller classifies; see ir_expr_complex). emit_value emits
 ## an arm's value and emit_expr the subject and the guards, as in
 ## ir_emit_if_expr.
-pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_value: fn(Int) -> Int, emit_block: fn(Int) -> Int, subj_owned: Bool) -> Int:
+## alias_release is a kind ir_match_alias_release (in the emitter core)
+## settled on: an owned fresh subject the arms only read through a bare
+## binding, released after the taken arm. alias_track puts the subject in
+## flight while an arm runs (true) and takes it out again (false), so an arm
+## that returns releases it in the exit cleanup; alias_free releases it by
+## that kind. "" leaves the subject to the release below.
+pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_value: fn(Int) -> Int, emit_block: fn(Int) -> Int, subj_owned: Bool, alias_release: String, alias_track: fn(Int, String, Bool), alias_free: fn(Int, String)) -> Int:
     subj_r := emit_expr(node.children[0])
     pin_kind := ir_match_pin_slot_kind
     pin_slot := ir_take_match_pin(subj_r)
@@ -671,7 +689,14 @@ pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_
         # guard so a failing guard still hands a live subject onward.
         if subj_release.len() > 0:
             ir_rc_release_reg(subj_r, subj_release)
+        if alias_release.len() > 0:
+            alias_track(subj_r, alias_release, true)
         ir_emit_match_arm_body(body_idx, result_temp, emit_value, emit_block)
+        if alias_release.len() > 0:
+            alias_track(subj_r, alias_release, false)
+            # the arm's value is in the temp with a count of its own
+            if not ir_last_was_ret:
+                alias_free(subj_r, alias_release)
         if not ir_last_was_ret:
             ir_emit("jmp " + end_l)
         ir_emit_label(next_l)
@@ -680,6 +705,8 @@ pub fn ir_emit_match_expr(idx: Int, node: Node, emit_expr: fn(Int) -> Int, emit_
     # temp defined.
     if subj_release.len() > 0:
         ir_rc_release_reg(subj_r, subj_release)
+    if alias_release.len() > 0:
+        alias_free(subj_r, alias_release)
     zero_r := ir_reg()
     ir_emit("iconst " + zero_r.to_string() + " 0")
     ir_emit("store " + result_temp + " " + zero_r.to_string())

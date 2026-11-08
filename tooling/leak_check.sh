@@ -199,6 +199,21 @@ cases=(
   "tests/leaks/leak_select_recv SHAPE=4"
   tests/leaks/leak_threadlocal_fn_value
   tests/leaks/leak_concat_early_exit
+  tests/leaks/leak_rebound_result_local
+  tests/leaks/leak_match_fresh_result
+  tests/leaks/leak_interp_result
+  "tests/leaks/leak_decode_missing_field SHAPE=toml"
+  "tests/leaks/leak_decode_missing_field SHAPE=json"
+  "tests/leaks/leak_json_decode_partial SHAPE=late"
+  "tests/leaks/leak_json_decode_partial SHAPE=early"
+  tests/leaks/leak_mut_param_rebind
+  "tests/leaks/leak_unwrap_fresh_optional SHAPE=try"
+  "tests/leaks/leak_unwrap_fresh_optional SHAPE=string"
+  "tests/leaks/leak_unwrap_fresh_optional SHAPE=chan"
+  "tests/leaks/leak_decode_path_walk SHAPE=ok"
+  "tests/leaks/leak_decode_path_walk SHAPE=missing"
+  tests/leaks/leak_iflet_return
+  tests/leaks/leak_enum_compare_temp
   "tests/leaks/leak_crosskind_binding SHAPE=1"
   "tests/leaks/leak_crosskind_binding SHAPE=2"
   "tests/leaks/leak_crosskind_binding SHAPE=3"

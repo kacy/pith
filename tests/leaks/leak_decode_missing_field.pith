@@ -1,0 +1,36 @@
+# a typed decode whose second field is missing. the toml decode had already
+# taken the first field's string out of the document, and the failure
+# jumped past the struct without releasing it: about 31 bytes per decode.
+# SHAPE picks toml or json.
+import leakprobe as probe
+import std.toml as toml
+import std.json as json
+
+struct Server:
+    pub host: String
+    pub port: Int
+
+fn tdecode[T](s: String) -> T!toml.TomlDecodeError:
+    return toml.decode_text[T](s)!
+
+fn jdecode[T](s: String) -> T!json.JsonDecodeError:
+    return json.decode_text[T](s)!
+
+fn main():
+    n := probe.rounds()
+    shape := env("SHAPE")
+    mut i := 0
+    mut bad := 0
+    while i < n:
+        if shape == "toml":
+            r := tdecode[Server]("host = \"h" + i.to_string() + "\"\n")
+            if r.is_err:
+                bad = bad + 1
+        else:
+            r := jdecode[Server]("{\"host\": \"h" + i.to_string() + "\"}")
+            if r.is_err:
+                bad = bad + 1
+        i = i + 1
+    if bad == 0 - 1:
+        print("x")
+    print("{probe.peak_kb()}")

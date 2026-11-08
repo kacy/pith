@@ -99,8 +99,7 @@ stale and a fix to it is welcome.
 - **tls 1.2 is a fallback**. the client and server speak tls 1.3 and fall back
   to 1.2 with ecdhe and aead suites only, refusing anything older.
   `require_tls13()` locks a config to 1.3. the 1.2 path does client
-  certificates but no session resumption or renegotiation, and its client
-  ignores the `certificate_types` of a CertificateRequest (#1134).
+  certificates but no session resumption or renegotiation.
 - **most resource types close by hand**. `std.net.tls.Config` is the only std
   type that implements `Drop`. files, processes, connections, listeners,
   websocket sessions, grpc streams, buffered readers and writers and database
@@ -157,11 +156,6 @@ stale and a fix to it is welcome.
   function or a statement names the line of its last token: a duplicate method
   is reported on the last line of its body. go-to-definition on a local lands
   on the end of its initializer (#1158).
-- **`pith lint` checks only the first file it is given** (#1161). run it once
-  per file.
-- **`pith build` fails under a directory whose name contains `.pith`** (#1166).
-  the object path replaces every `.pith` in the path, so `foo.pith/main.pith`
-  fails with `Error writing object`.
 - **no package registry**. dependencies are local path entries in
   `pith.toml`. `pith package lock` and `pith package install` work on those
   paths, but nothing fetches over the network.
@@ -181,14 +175,7 @@ stale and a fix to it is welcome.
   - a discarded `catch`, `select` or `match` expression releases only a string
     result (#1091).
   - a `T!` stored in a struct field or a list element (#1167).
-  - a fresh `String` result passed straight to `assert_eq` (#1118).
-  - returning a `match` expression with a fresh string arm (#1151), and a match
-    on a result local with a tuple payload (#1150).
-  - some `json.decode` shapes: a present optional `String` field (#1144), a
-    nested struct on the node-pool path (#1142), and a decode that fails
-    partway (#1145).
-  - a `Mutex` is never freed, which leaves about 40 bytes per mutex and about
-    200 bytes per tls connection (#1291).
+  - a match on a result local with a tuple payload (#1150).
 - **closing a channel can race a send**. a send that passes its closed check
   as another task closes the channel can enqueue a value nobody reads, and the
   send reports success. a channel costs about 416 bytes plus 16 bytes per
@@ -209,9 +196,7 @@ stale and a fix to it is welcome.
   from `main` does not.
 - **a green task's stack does not grow**. it is 1 MiB unless
   `PITH_GREEN_STACK_KB` sets another size, and recursion that needs more
-  stops the process with a stack overflow report. generated code does not
-  probe the stack, so a single frame larger than the 4 KiB guard page could
-  step over it.
+  stops the process with a stack overflow report.
 - **preemption costs a check per loop back-edge**. compute-bound tasks are
   preempted at safe-points so a spinning loop cannot starve the tasks that
   share its worker. building with `PITH_GREEN_PREEMPT=0` removes the check,

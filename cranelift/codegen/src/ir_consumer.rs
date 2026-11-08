@@ -1402,6 +1402,33 @@ fn inline_runtime_call(
             let fallback = runtime_ref(builder, fname)?;
             inline_list_len(builder, args[0], fallback)
         }
+        // the narrow integer conversions are a truncate and a sign or zero
+        // extend, cheap enough to emit after every arithmetic op on a narrow
+        // type, which is where the emitter puts them
+        ("Int8" | "pith_int8", 1) => {
+            let low = builder.ins().ireduce(types::I8, args[0]);
+            builder.ins().sextend(types::I64, low)
+        }
+        ("Int16" | "pith_int16", 1) => {
+            let low = builder.ins().ireduce(types::I16, args[0]);
+            builder.ins().sextend(types::I64, low)
+        }
+        ("Int32" | "pith_int32", 1) => {
+            let low = builder.ins().ireduce(types::I32, args[0]);
+            builder.ins().sextend(types::I64, low)
+        }
+        ("UInt8" | "pith_uint8", 1) => {
+            let low = builder.ins().ireduce(types::I8, args[0]);
+            builder.ins().uextend(types::I64, low)
+        }
+        ("UInt16" | "pith_uint16", 1) => {
+            let low = builder.ins().ireduce(types::I16, args[0]);
+            builder.ins().uextend(types::I64, low)
+        }
+        ("UInt32" | "pith_uint32", 1) => {
+            let low = builder.ins().ireduce(types::I32, args[0]);
+            builder.ins().uextend(types::I64, low)
+        }
         ("string_len" | "pith_cstring_len", 1) => {
             let fallback = runtime_ref(builder, "string_len")?;
             inline_cstring_len(builder, args[0], fallback)

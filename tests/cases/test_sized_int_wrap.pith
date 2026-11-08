@@ -1,0 +1,50 @@
+# arithmetic on a narrow integer type wraps into that type's range. the ir
+# computes in 64 bits, and nothing brought the result back: Int8(127) + 1 held
+# 128 and UInt8(3) - UInt8(5) held -2, values their type cannot hold, and a
+# comparison against the wrapped value said false.
+struct Pixel:
+    level: UInt8
+
+fn checksum(data: List[UInt8]) -> UInt8:
+    mut sum := UInt8(0)
+    for b in data:
+        sum = sum + b
+    return sum
+
+fn neg(x: Int8) -> Int8:
+    return -x
+
+fn main() -> Int:
+    a := Int8(127) + Int8(1)
+    print("Int8 127 + 1 = {a}, equals -128: {a == Int8(-128)}")
+    print("UInt8 255 + 1 = {UInt8(255) + UInt8(1)}")
+    print("UInt8 3 - 5 = {UInt8(3) - UInt8(5)}")
+    print("UInt8 200 + 100 = {UInt8(200) + UInt8(100)}")
+    print("Int16 32767 + 1 = {Int16(32767) + Int16(1)}")
+    print("UInt16 0 - 1 = {UInt16(0) - UInt16(1)}")
+    print("Int32 max * 2 = {Int32(2147483647) * Int32(2)}")
+    print("UInt32 max + 1 = {UInt32(4294967295) + UInt32(1)}")
+    print("Int8 -128 / -1 = {Int8(-128) / Int8(-1)}")
+    print("negate Int8 -128 = {neg(Int8(-128))}")
+
+    mut n := UInt8(250)
+    n += UInt8(10)
+    print("compound += {n}")
+    mut m := Int8(-100)
+    m -= Int8(100)
+    print("compound -= {m}")
+
+    mut p := Pixel(UInt8(250))
+    p.level += UInt8(9)
+    print("field += {p.level}")
+
+    levels := [UInt8(255), UInt8(1)]
+    levels[0] += UInt8(2)
+    print("index += {levels[0]}")
+
+    bytes_in := [UInt8(200), UInt8(100), UInt8(7)]
+    print("checksum {checksum(bytes_in)}")
+
+    # the 64-bit types are unchanged
+    print("Int {9223372036854775807 + 0}")
+    return 0

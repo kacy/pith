@@ -39,92 +39,190 @@ fn toml_decode_fail(message: String) -> TomlDecodeError:
 # document landed on that id next; leaving the counter alone costs nothing and
 # turns that mistake into a plain "invalid handle".
 threadlocal mut next_node_id: Int := 0
-threadlocal mut node_types: Map[Int, String] := {}
-threadlocal mut string_values: Map[Int, String] := {}
-threadlocal mut integer_values: Map[Int, Int] := {}
-threadlocal mut float_values: Map[Int, Float] := {}
-threadlocal mut boolean_values: Map[Int, Bool] := {}
 
-# Table children: flat append-only storage with offset/count
-# Table entries and array children live under stable per-node slot keys.
-# A single flat append-only list with a per-node offset window broke on
-# interleaving: TOML appends a table header, then that table's keys, then the
-# NEXT header, so a parent table's window straddled a sibling's children and
-# `[a]\nx=1\n[b]\ny=2` lost table `b` entirely (get_table returned -1). Slot
-# keys (handle:index) keep each node's children addressable regardless of
-# parse order, the same scheme std.json uses for objects.
-threadlocal mut table_keys_by_slot: Map[Int, String] := {}
-threadlocal mut table_values_by_slot: Map[Int, Int] := {}
-threadlocal mut table_key_counts: Map[Int, Int] := {}
-# the first child of each table under each key, keyed "handle:key", so a
-# lookup does not scan the table. without it every assignment's lookups made
-# parsing quadratic in the number of keys: 100k keys took over a minute.
-threadlocal mut table_key_index: Map[String, Int] := {}
+# Parser state, declared ahead of the pool because a failed table insert
+# fails the parse
+threadlocal mut parser_input: String := ""
+threadlocal mut parser_position: Int := 0
+threadlocal mut parser_error: Bool := false
+threadlocal mut parser_depth: Int := 0
 
-fn table_index_key(handle: Int, key: String) -> String:
-    return handle.to_string() + ":" + key
+# node kinds, as stored in node_kinds.
+TOML_STRING := 1
+TOML_BOOL := 2
+TOML_INT := 3
+TOML_FLOAT := 4
+TOML_TABLE := 5
+TOML_ARRAY := 6
 
-# Array children: flat append-only storage with offset/count
-threadlocal mut array_values_by_slot: Map[Int, Int] := {}
-threadlocal mut array_item_counts: Map[Int, Int] := {}
+# the pool keeps nodes in parallel lists, one slot per live node in id order,
+# the way std.json does. a node is its kind and one Int payload: the value of an
+# int, 0 or 1 for a bool, the bits of a float, or for a string, table or array
+# the index of its entry in the side lists below. a node used to take an entry
+# in seven maps, and each table key a string-keyed index entry besides.
+#
+# a table's children live in lists of its own rather than in one flat list: a
+# table gains keys after it is created, and a later header can reopen it, so
+# its children are not contiguous in parse order.
+threadlocal mut node_kinds: List[Int] := []
+threadlocal mut node_payloads: List[Int] := []
+threadlocal mut node_strings: List[String] := []
+threadlocal mut table_keys: List[List[String]] := []
+threadlocal mut table_values: List[List[Int]] := []
+# the first child of each key, so a lookup does not scan the table. without it
+# every assignment's lookups made parsing quadratic in the number of keys.
+threadlocal mut table_index: List[Map[String, Int]] := []
+threadlocal mut array_items: List[List[Int]] := []
+
+# ids are dense except where a reclaim left a gap: a scope gives back the
+# newest nodes but not their ids, so the next node's id is past the gap. each
+# run of consecutive ids is a segment, the id of its first node and the slot
+# that node sits in. a reclaim only ever drops a suffix of the slots.
+threadlocal mut segment_ids: List[Int] := []
+threadlocal mut segment_slots: List[Int] := []
 
 # How many scopes open_scope() has handed out and not yet reclaimed.
 threadlocal mut open_scope_depth: Int := 0
 
-# Allocates a new node of the specified type
-fn allocate_node(kind: String) -> Int:
-    idx := next_node_id
+# appends a node and returns its id.
+fn new_node(kind: Int, payload: Int) -> Int:
+    node_id := next_node_id
     next_node_id = next_node_id + 1
-    node_types.insert(idx, kind)
-    string_values.insert(idx, "")
-    integer_values.insert(idx, 0)
-    float_values.insert(idx, 0.0)
-    boolean_values.insert(idx, false)
-    table_key_counts.insert(idx, 0)
-    array_item_counts.insert(idx, 0)
-    return idx
+    slot := node_kinds.len()
+    last := segment_ids.len() - 1
+    if last < 0 or segment_ids[last] + (slot - segment_slots[last]) != node_id:
+        segment_ids.push(node_id)
+        segment_slots.push(slot)
+    node_kinds.push(kind)
+    node_payloads.push(payload)
+    return node_id
 
-# a slot key packs the handle into the high 32 bits and the index into the
-# low 32, as std.json's does.
-fn table_slot_key(handle: Int, index: Int) -> Int:
-    return bits.bor(bits.shl(handle, 32), index)
+fn new_string_node(text: String) -> Int:
+    node_strings.push(text)
+    return new_node(TOML_STRING, node_strings.len() - 1)
 
-fn array_slot_key(handle: Int, index: Int) -> Int:
-    return table_slot_key(handle, index)
+fn new_table_node() -> Int:
+    mut keys: List[String] := []
+    mut values: List[Int] := []
+    mut index: Map[String, Int] := {}
+    table_keys.push(keys)
+    table_values.push(values)
+    table_index.push(index)
+    return new_node(TOML_TABLE, table_keys.len() - 1)
 
-fn clear_table_entries(handle: Int):
-    cnt := table_key_counts[handle]
-    mut i := 0
-    while i < cnt:
-        slot := table_slot_key(handle, i)
-        table_key_index.remove(table_index_key(handle, table_keys_by_slot[slot]))
-        table_keys_by_slot.remove(slot)
-        table_values_by_slot.remove(slot)
-        i = i + 1
+fn new_array_node() -> Int:
+    mut items: List[Int] := []
+    array_items.push(items)
+    return new_node(TOML_ARRAY, array_items.len() - 1)
 
-fn clear_array_entries(handle: Int):
-    cnt := array_item_counts[handle]
-    mut i := 0
-    while i < cnt:
-        array_values_by_slot.remove(array_slot_key(handle, i))
-        i = i + 1
+# the slot of a live node, or -1 for a handle that is not one.
+fn node_slot(handle: Int) -> Int:
+    count := segment_ids.len()
+    if count == 0 or handle < segment_ids[0]:
+        return 0 - 1
+    # the newest segment holds the handle in the common case
+    mut seg := count - 1
+    if handle < segment_ids[seg]:
+        # the last segment starting at or before the handle
+        mut lo := 0
+        mut hi := count - 1
+        while lo < hi:
+            mid := (lo + hi + 1) / 2
+            if segment_ids[mid] <= handle:
+                lo = mid
+            else:
+                hi = mid - 1
+        seg = lo
+    slot := segment_slots[seg] + (handle - segment_ids[seg])
+    mut end := node_kinds.len()
+    if seg + 1 < count:
+        end = segment_slots[seg + 1]
+    if slot >= end:
+        return 0 - 1
+    return slot
 
-# Sets a key-value pair in a table
+# the payload of a node already known to be live.
+fn node_payload(handle: Int) -> Int:
+    return node_payloads[node_slot(handle)]
+
+# the side-list index of a table or an array node, or -1 for a handle of any
+# other kind.
+fn table_entry(handle: Int) -> Int:
+    slot := node_slot(handle)
+    if slot < 0 or node_kinds[slot] != TOML_TABLE:
+        return 0 - 1
+    return node_payloads[slot]
+
+fn array_entry(handle: Int) -> Int:
+    slot := node_slot(handle)
+    if slot < 0 or node_kinds[slot] != TOML_ARRAY:
+        return 0 - 1
+    return node_payloads[slot]
+
+# the first child under `key` in a table, or -1.
+fn table_first(handle: Int, key: String) -> Int:
+    entry := table_entry(handle)
+    if entry < 0:
+        return 0 - 1
+    return table_index[entry].get_default(key, 0 - 1)
+
+fn table_count(handle: Int) -> Int:
+    entry := table_entry(handle)
+    if entry < 0:
+        return 0
+    return table_keys[entry].len()
+
+fn table_key_at(handle: Int, index: Int) -> String:
+    return table_keys[table_entry(handle)][index]
+
+fn array_count(handle: Int) -> Int:
+    entry := array_entry(handle)
+    if entry < 0:
+        return 0
+    return array_items[entry].len()
+
+fn array_item(handle: Int, index: Int) -> Int:
+    return array_items[array_entry(handle)][index]
+
+# Sets a key-value pair in a table. a key path through a value that is not a
+# table (`a = 1` then `[a.b]`) has nowhere to put the key, and fails the parse.
 fn set_table_property(handle: Int, key: String, val: Int):
-    cnt := table_key_counts[handle]
-    slot := table_slot_key(handle, cnt)
-    table_keys_by_slot.insert(slot, key)
-    table_values_by_slot.insert(slot, val)
-    table_key_counts.insert(handle, cnt + 1)
-    index_key := table_index_key(handle, key)
-    if not table_key_index.contains_key(index_key):
-        table_key_index.insert(index_key, val)
+    entry := table_entry(handle)
+    if entry < 0:
+        parser_error = true
+        return
+    table_keys[entry].push(key)
+    table_values[entry].push(val)
+    if not table_index[entry].contains_key(key):
+        table_index[entry].insert(key, val)
 
 # Appends a value to an array
 fn push_array_element(handle: Int, val: Int):
-    cnt := array_item_counts[handle]
-    array_values_by_slot.insert(array_slot_key(handle, cnt), val)
-    array_item_counts.insert(handle, cnt + 1)
+    entry := array_entry(handle)
+    if entry < 0:
+        parser_error = true
+        return
+    array_items[entry].push(val)
+
+fn truncate_ints(items: List[Int], len: Int):
+    while items.len() > len:
+        items.remove(items.len() - 1)
+
+fn truncate_strings(items: List[String], len: Int):
+    while items.len() > len:
+        items.remove(items.len() - 1)
+
+fn truncate_int_lists(items: List[List[Int]], len: Int):
+    while items.len() > len:
+        items.remove(items.len() - 1)
+
+fn truncate_string_lists(items: List[List[String]], len: Int):
+    while items.len() > len:
+        items.remove(items.len() - 1)
+
+fn truncate_maps(items: List[Map[String, Int]], len: Int):
+    while items.len() > len:
+        items.remove(items.len() - 1)
 
 # ===============================================================
 # Node-pool reclamation
@@ -141,19 +239,47 @@ fn push_array_element(handle: Int, val: Int):
 # exactly the entries added since. safe once the struct is built: its string
 # fields are independent heap copies, not references back into the pool.
 fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int):
-    mut node_id := next_node_id - 1
-    while node_id >= node_id_mark:
-        if node_types.contains_key(node_id):
-            node_types.remove(node_id)
-            string_values.remove(node_id)
-            integer_values.remove(node_id)
-            float_values.remove(node_id)
-            boolean_values.remove(node_id)
-            clear_table_entries(node_id)
-            table_key_counts.remove(node_id)
-            clear_array_entries(node_id)
-            array_item_counts.remove(node_id)
-        node_id = node_id - 1
+    # find the first slot whose id is at or past the mark, dropping the
+    # segments that lie wholly past it
+    mut cut := node_kinds.len()
+    while segment_ids.len() > 0:
+        last := segment_ids.len() - 1
+        if segment_ids[last] >= node_id_mark:
+            cut = segment_slots[last]
+            truncate_ints(segment_ids, last)
+            truncate_ints(segment_slots, last)
+        else:
+            within := segment_slots[last] + (node_id_mark - segment_ids[last])
+            if within < cut:
+                cut = within
+            break
+    if cut >= node_kinds.len():
+        return
+    # entries in the side lists were appended in node order, so the first
+    # dropped node of each kind marks where that list is cut
+    mut strings_cut := 0 - 1
+    mut tables_cut := 0 - 1
+    mut arrays_cut := 0 - 1
+    mut slot := cut
+    while slot < node_kinds.len() and (strings_cut < 0 or tables_cut < 0 or arrays_cut < 0):
+        kind := node_kinds[slot]
+        if kind == TOML_STRING and strings_cut < 0:
+            strings_cut = node_payloads[slot]
+        elif kind == TOML_TABLE and tables_cut < 0:
+            tables_cut = node_payloads[slot]
+        elif kind == TOML_ARRAY and arrays_cut < 0:
+            arrays_cut = node_payloads[slot]
+        slot = slot + 1
+    if strings_cut >= 0:
+        truncate_strings(node_strings, strings_cut)
+    if tables_cut >= 0:
+        truncate_string_lists(table_keys, tables_cut)
+        truncate_int_lists(table_values, tables_cut)
+        truncate_maps(table_index, tables_cut)
+    if arrays_cut >= 0:
+        truncate_int_lists(array_items, arrays_cut)
+    truncate_ints(node_kinds, cut)
+    truncate_ints(node_payloads, cut)
 
 # node-pool position a compiler-lowered typed decode rolls back to.
 pub fn pool_mark_node_id() -> Int:
@@ -206,17 +332,12 @@ pub fn close_scope(scope: TomlScope):
 # how many nodes the pool currently holds. useful for asserting in a test that
 # a parse loop gives its nodes back.
 pub fn pool_live_nodes() -> Int:
-    return node_types.len()
+    return node_kinds.len()
 
 # ===============================================================
 # Parser (Internal)
 # ===============================================================
 
-# Parser state
-threadlocal mut parser_input: String := ""
-threadlocal mut parser_position: Int := 0
-threadlocal mut parser_error: Bool := false
-threadlocal mut parser_depth: Int := 0
 
 # Maximum nested-array depth. Deep enough for any real document, shallow
 # enough that the recursive value parser can't overflow the native stack.
@@ -256,13 +377,27 @@ fn literal_at(at: Int, word: String) -> Bool:
 # node ids are never reused, so a handle left over from a reclaimed scope
 # reads as "no live node" rather than aliasing a later document's node.
 fn node_kind(handle: Int) -> String:
-    return node_types.get_default(handle, "")
+    slot := node_slot(handle)
+    if slot < 0:
+        return ""
+    kind := node_kinds[slot]
+    if kind == TOML_STRING:
+        return "string"
+    if kind == TOML_TABLE:
+        return "table"
+    if kind == TOML_ARRAY:
+        return "array"
+    if kind == TOML_INT:
+        return "int"
+    if kind == TOML_BOOL:
+        return "bool"
+    return "float"
 
 # Looks up a direct key in a table and returns the child handle, or -1.
 fn table_lookup(handle: Int, key: String) -> Int:
     if node_kind(handle) != "table":
         return 0 - 1
-    return table_key_index.get_default(table_index_key(handle, key), 0 - 1)
+    return table_first(handle, key)
 
 # Skips whitespace (space, tab, carriage return)
 fn skip_whitespace():
@@ -391,26 +526,21 @@ fn parse_value_node() -> Int:
         # value the parser read (the toml twin of json's #1108).
         text := parser_input.substring(start, parser_position)
         parser_position = parser_position + 1
-        idx := allocate_node("string")
-        string_values.insert(idx, text)
-        return idx
+        return new_string_node(text)
 
     # boolean true
     if literal_at(parser_position, "true"):
         parser_position = parser_position + 4
-        idx := allocate_node("bool")
-        boolean_values.insert(idx, true)
-        return idx
+        return new_node(TOML_BOOL, 1)
     # boolean false
     if literal_at(parser_position, "false"):
         parser_position = parser_position + 5
-        idx := allocate_node("bool")
-        return idx
+        return new_node(TOML_BOOL, 0)
 
     # array
     if c == "[":
         parser_position = parser_position + 1
-        arr := allocate_node("array")
+        arr := new_array_node()
         skip_whitespace()
         mut iterations := 0
         mut last_pos := parser_position
@@ -458,15 +588,13 @@ fn parse_value_node() -> Int:
             parser_position = parser_position + 1
         num_str := parser_input.substring(start, parser_position)
         if is_float:
-            idx := allocate_node("float")
-            float_values.insert(idx, parse_float_manual(num_str))
+            idx := new_node(TOML_FLOAT, float_to_bits(parse_float_manual(num_str)))
             return idx
         if not is_float:
             parsed := parse_int(num_str.replace("_", "")) catch:
                 parser_error = true
                 return 0 - 1
-            idx := allocate_node("int")
-            integer_values.insert(idx, parsed)
+            idx := new_node(TOML_INT, parsed)
             return idx
 
     parser_error = true
@@ -490,13 +618,13 @@ fn ensure_table_path(root: Int, path: String) -> Int:
                 parser_error = true
                 return 0 - 1
             # look up existing child in current table
-            mut found := table_key_index.get_default(table_index_key(current, key), 0 - 1)
+            mut found := table_first(current, key)
             if found < 0:
-                found = allocate_node("table")
+                found = new_table_node()
                 set_table_property(current, key, found)
             # a path through an array of tables means its latest table
-            if node_kind(found) == "array" and array_item_counts[found] > 0:
-                found = array_values_by_slot[array_slot_key(found, array_item_counts[found] - 1)]
+            if node_kind(found) == "array" and array_count(found) > 0:
+                found = array_item(found, array_count(found) - 1)
             current = found
             start = i + 1
         i = i + 1
@@ -517,21 +645,21 @@ fn append_table_at_path(root: Int, path: String) -> Int:
     if key == "":
         parser_error = true
         return 0 - 1
-    mut array := table_key_index.get_default(table_index_key(parent, key), 0 - 1)
+    mut array := table_first(parent, key)
     if array < 0:
-        array = allocate_node("array")
+        array = new_array_node()
         set_table_property(parent, key, array)
     elif node_kind(array) != "array" or not array_holds_only_tables(array):
         parser_error = true
         return 0 - 1
-    table := allocate_node("table")
+    table := new_table_node()
     push_array_element(array, table)
     return table
 
 fn array_holds_only_tables(array: Int) -> Bool:
     mut i := 0
-    while i < array_item_counts[array]:
-        if node_kind(array_values_by_slot[array_slot_key(array, i)]) != "table":
+    while i < array_count(array):
+        if node_kind(array_item(array, i)) != "table":
             return false
         i = i + 1
     return true
@@ -543,14 +671,18 @@ fn array_holds_only_tables(array: Int) -> Bool:
 # Parses a TOML string and returns a root table handle.
 # Returns -1 on parse error. The root is a table containing all top-level keys.
 pub fn parse(input: String) -> Int:
-    return toml_parse(input)
+    root := toml_parse(input)
+    # the parser keeps the input only for the parse; a long-running task
+    # should not hold the last document after it
+    parser_input = ""
+    return root
 
 fn toml_parse(input: String) -> Int:
     parser_input = input
     parser_position = 0
     parser_error = false
     parser_depth = 0
-    root := allocate_node("table")
+    root := new_table_node()
     mut current_table := root
 
     while parser_position < parser_input.len():
@@ -899,7 +1031,7 @@ pub fn get_string(handle: Int, key: String) -> String:
 fn toml_get_string(handle: Int, key: String) -> String:
     node := table_lookup(handle, key)
     if node_kind(node) == "string":
-        return string_values[node]
+        return node_strings[node_payload(node)]
     return ""
 
 ## get a required string field or return a typed decode error.
@@ -909,13 +1041,13 @@ pub fn require_string(handle: Int, key: String) -> String!TomlDecodeError:
         fail toml_decode_fail("missing string field: " + key)
     if node_kind(node) != "string":
         fail toml_decode_fail("expected string field: " + key)
-    return string_values[node]
+    return node_strings[node_payload(node)]
 
 # Gets a string value by key from a table with a fallback.
 pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
     node := table_lookup(handle, key)
     if node_kind(node) == "string":
-        return string_values[node]
+        return node_strings[node_payload(node)]
     return default_value
 
 # Gets an integer value by key from a table. Returns 0 if not found or wrong type.
@@ -925,7 +1057,7 @@ pub fn get_int(handle: Int, key: String) -> Int:
 fn toml_get_int(handle: Int, key: String) -> Int:
     node := table_lookup(handle, key)
     if node_kind(node) == "int":
-        return integer_values[node]
+        return node_payload(node)
     return 0
 
 ## get a required int field or return a typed decode error.
@@ -935,13 +1067,13 @@ pub fn require_int(handle: Int, key: String) -> Int!TomlDecodeError:
         fail toml_decode_fail("missing int field: " + key)
     if node_kind(node) != "int":
         fail toml_decode_fail("expected int field: " + key)
-    return integer_values[node]
+    return node_payload(node)
 
 # Gets an integer value by key from a table with a fallback.
 pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
     node := table_lookup(handle, key)
     if node_kind(node) == "int":
-        return integer_values[node]
+        return node_payload(node)
     return default_value
 
 # Gets a float value by key from a table. Returns 0.0 if not found or wrong type.
@@ -951,14 +1083,14 @@ pub fn get_float(handle: Int, key: String) -> Float:
 fn toml_get_float(handle: Int, key: String) -> Float:
     node := table_lookup(handle, key)
     if node_kind(node) == "float":
-        return float_values[node]
+        return float_from_bits(node_payload(node))
     return 0.0
 
 # Gets a float value by key from a table with a fallback.
 pub fn get_float_or(handle: Int, key: String, default_value: Float) -> Float:
     node := table_lookup(handle, key)
     if node_kind(node) == "float":
-        return float_values[node]
+        return float_from_bits(node_payload(node))
     return default_value
 
 # Gets a boolean value by key from a table. Returns false if not found or wrong type.
@@ -968,7 +1100,7 @@ pub fn get_bool(handle: Int, key: String) -> Bool:
 fn toml_get_bool(handle: Int, key: String) -> Bool:
     node := table_lookup(handle, key)
     if node_kind(node) == "bool":
-        return boolean_values[node]
+        return (node_payload(node) != 0)
     return false
 
 ## get a required bool field or return a typed decode error.
@@ -978,13 +1110,13 @@ pub fn require_bool(handle: Int, key: String) -> Bool!TomlDecodeError:
         fail toml_decode_fail("missing bool field: " + key)
     if node_kind(node) != "bool":
         fail toml_decode_fail("expected bool field: " + key)
-    return boolean_values[node]
+    return (node_payload(node) != 0)
 
 # Gets a boolean value by key from a table with a fallback.
 pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
     node := table_lookup(handle, key)
     if node_kind(node) == "bool":
-        return boolean_values[node]
+        return (node_payload(node) != 0)
     return default_value
 
 # Gets a sub-table handle by key. Returns -1 if not found or not a table.
@@ -1018,7 +1150,7 @@ pub fn array_len(handle: Int) -> Int:
 fn toml_array_len(handle: Int) -> Int:
     if node_kind(handle) != "array":
         return 0
-    return array_item_counts[handle]
+    return array_count(handle)
 
 # Gets the handle of an array element by index. Returns -1 if out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
@@ -1027,16 +1159,16 @@ pub fn array_get(handle: Int, index: Int) -> Int:
 fn toml_array_get(handle: Int, index: Int) -> Int:
     if node_kind(handle) != "array":
         return 0 - 1
-    if index < 0 or index >= array_item_counts[handle]:
+    if index < 0 or index >= array_count(handle):
         return 0 - 1
-    return array_values_by_slot[array_slot_key(handle, index)]
+    return array_item(handle, index)
 
 # Gets a string element of an array by index. Returns an empty string when the
 # index is out of bounds or the element is not a string.
 pub fn array_string(handle: Int, index: Int) -> String:
     node := toml_array_get(handle, index)
     if node_kind(node) == "string":
-        return string_values[node]
+        return node_strings[node_payload(node)]
     return ""
 
 # ===============================================================
@@ -1051,10 +1183,10 @@ fn toml_keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if node_kind(handle) != "table":
         return result
-    cnt := table_key_counts[handle]
+    cnt := table_count(handle)
     mut i := 0
     while i < cnt:
-        result.push(table_keys_by_slot[table_slot_key(handle, i)])
+        result.push(table_key_at(handle, i))
         i = i + 1
     return result
 

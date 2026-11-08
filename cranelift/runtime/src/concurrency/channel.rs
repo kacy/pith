@@ -885,7 +885,12 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 
     if state.capacity == 0 {
         while !state.closed {
-            if state.receiver_waiting > 0 && state.pending_value.is_none() {
+            // offer the value as soon as the slot is free, not only once a
+            // receiver is parked: a receiver that polls (`try_recv`, which
+            // `select` and `recv_ctx` use) never parks, so a sender that
+            // waited for one never met it and the select ran to its
+            // timeout. the send still returns only once the value is taken.
+            if state.pending_value.is_none() {
                 let handoffs_before = state.deliveries;
                 state.pending_value = Some(value);
                 wake_receivers(inner, &mut state);
@@ -1271,6 +1276,31 @@ mod tests {
                 1,
                 "delivered value reported as failed"
             );
+        }
+    }
+
+    // a receiver that polls with try_recv, as a select does, meets a sender
+    // that parked first. the sender used to offer its value only to a parked
+    // receiver, so the poll never saw it.
+    #[test]
+    fn unbuffered_try_recv_meets_a_parked_sender() {
+        unsafe {
+            let ch = pith_channel_new(0, 0);
+            let sender = std::thread::spawn(move || pith_channel_send(ch, 42));
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let mut got = None;
+            for _ in 0..2000 {
+                let opt = pith_channel_try_recv(ch);
+                if opt != 0 {
+                    let t = shell(opt);
+                    got = Some(*t.add(1));
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(got, Some(42));
+            assert_eq!(sender.join().unwrap(), 1);
+            pith_channel_close(ch);
         }
     }
 

@@ -2304,7 +2304,10 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     transcript.write(certificate)!
     transcript.write(server_key_exchange)!
 
+    # a failed write leaves the function early, so the buffer is freed by the
+    # defer rather than after the send
     flight := bytes.buffer()
+    defer flight.free()
     flight.write(server_hello)!
     flight.write(certificate)!
     flight.write(server_key_exchange)!
@@ -2314,7 +2317,6 @@ fn native_server_handshake_tls12(stream: TcpStream, config: Config, client_hello
     transcript.write(server_done)!
     flight.write(server_done)!
     write_plaintext_flight(stream, flight.bytes())!
-    flight.free()
 
     # the client's plaintext flight: an optional Certificate, then
     # ClientKeyExchange, then a CertificateVerify when it presented one. any of

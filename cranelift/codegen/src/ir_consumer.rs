@@ -1796,6 +1796,9 @@ fn report_counts(report: &crate::count_check::CountReport) {
         for d in &report.join_details {
             eprintln!("  join: {d}");
         }
+        for name in &report.undecided_names {
+            eprintln!("  undecided: {name}");
+        }
         for name in &report.balanced_names {
             eprintln!("  balanced: {name}");
         }

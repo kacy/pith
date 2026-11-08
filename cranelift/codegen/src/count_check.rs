@@ -77,6 +77,8 @@ pub struct CountReport {
     pub join_details: Vec<String>,
     /// the functions that balance, for tools that check the checker
     pub balanced_names: Vec<String>,
+    /// "function: reason, at `instruction`" for each undecided function
+    pub undecided_names: Vec<String>,
 }
 
 impl CountReport {
@@ -172,6 +174,7 @@ pub fn check_counts(lines: &[&str]) -> CountReport {
                 if !checker.join_detail.is_empty() {
                     report.join_details.push(format!("{}: {}", f.name, checker.join_detail));
                 }
+                report.undecided_names.push(format!("{}: {}, at `{}`", f.name, reason, checker.current));
                 *report.undecided_reasons.entry(reason).or_insert(0) += 1;
             }
             Ok(()) if checker.problems.is_empty() => {
@@ -223,6 +226,9 @@ struct State {
     field_of: HashMap<String, (String, usize)>,
     /// fields whose value was released through a read and not yet replaced
     emptied: BTreeSet<String>,
+    /// optionals a channel receive handed back: no shell at all when nothing
+    /// came, so a clear flag means a null (runtime_ownership.txt)
+    none_is_null: BTreeSet<String>,
     /// tuple shells built without a destructor: freeing one frees the shell
     /// alone, and the counts its fields held pass to whoever read them out
     shells: BTreeSet<String>,
@@ -231,6 +237,10 @@ struct State {
     /// a register that tests an object against null: test register ->
     /// (object, whether a set test means the object is there)
     null_tests: BTreeMap<String, (String, bool)>,
+    /// a send's result register -> the object it took a count of. the
+    /// channel keeps that count only when the send reports success, so a
+    /// branch on the result gives it back on the failing side
+    cond_takes: BTreeMap<String, String>,
     /// field reads that took a count of their own: giving that back leaves
     /// the read holding nothing, and a further release is one too many,
     /// not the release of the field's value a replace starts with
@@ -255,6 +265,7 @@ struct Canon {
     unknowns: BTreeSet<String>,
     emptied: BTreeSet<String>,
     shells: BTreeSet<String>,
+    none_is_null: BTreeSet<String>,
     owned_fields: BTreeSet<String>,
     /// view slots that share an owned slot's value: view -> owned slot
     aliases: BTreeMap<String, String>,
@@ -280,6 +291,9 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>, mismatches: &mut Vec<(Str
         unknowns: a.unknowns.clone(),
         emptied: a.emptied.clone(),
         shells: a.shells.union(&b.shells).cloned().collect(),
+        // a receive's no-shell none holds only where both paths got the value
+        // from a receive: an optional of another kind can be a real none shell
+        none_is_null: a.none_is_null.intersection(&b.none_is_null).cloned().collect(),
         owned_fields: a.owned_fields.union(&b.owned_fields).cloned().collect(),
         // a view only one path pointed at a value is dead past the join
         aliases: a.aliases.iter().filter(|(v, h)| b.aliases.get(*v) == Some(*h)).map(|(v, h)| (v.clone(), h.clone())).collect(),
@@ -363,7 +377,15 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>, mismatches: &mut Vec<(Str
             }
             (Some(x), Some(y)) => return Err(format!("register object {id} holds {x} on one path and {y} on the other")),
             (Some(n), None) | (None, Some(n)) => {
-                if *n > 0 {
+                // a count one path holds in registers the other path settled to
+                // a null (a channel receive that brought nothing) is one count
+                // or nothing past the join, like a slot's
+                let (holder, other) = if a.regobjs.contains_key(id) { (a, b) } else { (b, a) };
+                let refs: Vec<&String> = holder.regs.iter().filter(|(_, k)| *k == id).map(|(r, _)| r).collect();
+                let settled = !refs.is_empty() && refs.iter().all(|r| other.regs.get(*r).is_some_and(|k| k == "null"));
+                if *n > 0 && settled {
+                    out.regobjs.insert(id.clone(), *n);
+                } else if *n > 0 {
                     leaks.push(id.clone());
                 }
             }
@@ -409,6 +431,9 @@ struct FuncCheck<'a, 'f> {
     /// the integer constant each `iconst` register holds, for the slot number
     /// a thread-local call names
     consts: HashMap<&'a str, &'a str>,
+    /// objects an rcall made for a plain ok payload: they hold a count only
+    /// on the error side
+    plain_ok_payloads: HashSet<String>,
     problems: Vec<String>,
     /// the instruction that made each object, for the messages
     origins: HashMap<String, String>,
@@ -422,7 +447,7 @@ struct FuncCheck<'a, 'f> {
 
 impl<'a, 'f> FuncCheck<'a, 'f> {
     fn new(f: &'f Func<'a>, globals: &'f HashMap<&'a str, &'a str>, user_funcs: &'f HashSet<&'a str>) -> Self {
-        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), consts: HashMap::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new(), reads: 0, join_detail: String::new() };
+        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), consts: HashMap::new(), plain_ok_payloads: HashSet::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new(), reads: 0, join_detail: String::new() };
         c.scalar_temps = c.infer_scalar_temps();
         c.consts = f.body.iter().filter(|ins| ins[0] == "iconst" && ins.len() >= 3).map(|ins| (ins[1], ins[2])).collect();
         c
@@ -583,6 +608,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 _ => {}
             }
         }
+        for o in &st.none_is_null {
+            if let Some(k) = key_of.get(o) {
+                out.none_is_null.insert(k.clone());
+            }
+        }
         for o in &st.shells {
             if let Some(k) = key_of.get(o) {
                 out.shells.insert(k.clone());
@@ -634,6 +664,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         }
         st.emptied = canon.emptied.clone();
         st.shells = canon.shells.clone();
+        st.none_is_null = canon.none_is_null.clone();
         st.owned_fields = canon.owned_fields.clone();
         st
     }
@@ -730,6 +761,19 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             let last = blocks[b].last().copied().unwrap_or(&[]);
             if last.first() == Some(&"brif") && last.len() >= 4 && succ[b].len() == 2 {
                 // (object, count when the test is set, count when it isn't)
+                if let Some(obj) = st.cond_takes.get(last[1]).cloned() {
+                    for (i, s) in succ[b].iter().enumerate() {
+                        let mut side = st.clone();
+                        if i == 1 {
+                            *side.counts.entry(obj.clone()).or_insert(0) += 1;
+                        }
+                        side.cond_takes.clear();
+                        side.null_tests.clear();
+                        let out = self.canon(&side, &format!("the end of {}", order[b]));
+                        work.push((*s, out));
+                    }
+                    continue;
+                }
                 let mut settle: Option<(String, Option<i64>, Option<i64>)> = None;
                 if let Some((obj, set_means_there)) = st.null_tests.get(last[1]).cloned() {
                     // the null side holds no count; the other keeps its own
@@ -742,6 +786,20 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                         let mut side = st.clone();
                         if let Some(n) = if i == 0 { when_set } else { when_clear } {
                             side.counts.insert(obj.clone(), n);
+                            // on the null side the registers and slots holding
+                            // it hold a null, and releasing one does nothing
+                            if n == 0 {
+                                for v in side.regs.values_mut() {
+                                    if *v == Val::Obj(obj.clone()) {
+                                        *v = Val::Null;
+                                    }
+                                }
+                                for v in side.slots.values_mut() {
+                                    if *v == Val::Obj(obj.clone()) {
+                                        *v = Val::Null;
+                                    }
+                                }
+                            }
                         }
                         side.null_tests.clear();
                         let out = self.canon(&side, &format!("the end of {}", order[b]));
@@ -813,7 +871,10 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                     self.problems.push(format!("{why} gives up a count it doesn't hold (register {reg})"));
                 }
                 *n -= 1;
-                if *n == 0 && st.shells.contains(&o) {
+                // a plain release frees the shell alone and its payloads pass
+                // to whoever read them out; an emitted release helper drops
+                // them with it
+                if *n == 0 && st.shells.contains(&o) && !is_emitted_release(why) {
                     let prefix = format!("{o}:");
                     let readers: Vec<String> = st
                         .field_of
@@ -865,8 +926,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             // be a real shell with the flag clear.
             "optflag" if ins.len() >= 3 => {
                 if let Val::Obj(o) = self.val(st, ins[2]) {
-                    let origin = self.origins.get(&o).map(String::as_str).unwrap_or("");
-                    if origin.contains(" pith_channel_try_recv ") || origin.contains(" pith_channel_recv ") {
+                    if st.none_is_null.contains(&o) {
                         st.null_tests.insert(ins[1].to_string(), (o, true));
                     }
                 }
@@ -918,7 +978,17 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                     let o = self.new_obj(st, 0);
                     // a read names its field by byte offset, a store by index
                     let index = ins[3].parse::<i64>().map(|b| b / 8).unwrap_or(-1);
-                    let field = format!("{}:{}", self.base_key(st, ins[2]), index);
+                    let base = self.base_key(st, ins[2]);
+                    let field = format!("{base}:{index}");
+                    // reading `ok` or `err` names a result box (an optional's
+                    // payload is `value`). a box this function holds has no
+                    // destructor and owns its payload, so freeing the box hands
+                    // that count to the read (docs/ir-contract.md)
+                    let name = ins.get(5).copied().unwrap_or("");
+                    if (name == "ok" || name == "err") && st.counts.get(&base).copied().unwrap_or(0) > 0 {
+                        st.shells.insert(base);
+                        st.owned_fields.insert(field.clone());
+                    }
                     self.reads += 1;
                     st.field_of.insert(o.clone(), (field, self.reads));
                     Val::Obj(o)
@@ -967,12 +1037,28 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 Ok(false)
             }
             "call" if ins.len() >= 5 => self.call(ins, st).map(|_| false),
-            // the register-pair abi carries an error payload whose count
-            // depends on the flag, and the error handling around it isn't
-            // modelled yet
-            "rcall" => Err("a call returning the register pair".into()),
-            "ret2" => Err("a register-pair return".into()),
-            "optval" => Err("instruction optval".into()),
+            "rcall" if ins.len() >= 6 => self.rcall(ins, st).map(|_| false),
+            "ret2" if ins.len() >= 3 => {
+                self.ret(&["ret", ins[2]], st, true);
+                Ok(true)
+            }
+            // `optval REG OPT KIND NAME`: the payload of an optional, read
+            // the way a field is (slot 1 of the shell), or 0 for none
+            "optval" if ins.len() >= 4 => {
+                let v = if kind_of_text(ins[3]) == "unknown" {
+                    Val::Unknown
+                } else if is_counted(ins[3]) {
+                    let o = self.new_obj(st, 0);
+                    let field = format!("{}:1", self.base_key(st, ins[2]));
+                    self.reads += 1;
+                    st.field_of.insert(o.clone(), (field, self.reads));
+                    Val::Obj(o)
+                } else {
+                    Val::Plain
+                };
+                st.regs.insert(ins[1].to_string(), v);
+                Ok(false)
+            }
             "tuple_stack" if ins.len() >= 2 => {
                 // a shell in the frame: never released, and its payloads go
                 // through the stack cascade, which gives up what it took
@@ -987,7 +1073,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 Ok(false)
             }
             "ret" => {
-                self.ret(ins, st);
+                self.ret(ins, st, false);
                 Ok(true)
             }
             _ => Err(format!("instruction {op}")),
@@ -1085,6 +1171,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             for (i, a) in row.args.iter().enumerate() {
                 if *a == ArgOwnership::Consume && i < args.len() {
                     self.take(st, args[i], callee)?;
+                    if callee == "pith_channel_send" || callee == "pith_channel_try_send" {
+                        if let Val::Obj(o) = self.val(st, args[i]) {
+                            st.cond_takes.insert(dst.to_string(), o);
+                        }
+                    }
                 }
             }
             match row.result.value {
@@ -1119,11 +1210,63 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 st.shells.insert(o.clone());
             }
         }
+        if callee == "pith_channel_recv" || callee == "pith_channel_try_recv" {
+            if let Val::Obj(o) = &result {
+                st.none_is_null.insert(o.clone());
+            }
+        }
         st.regs.insert(dst.to_string(), result);
         Ok(())
     }
 
-    fn ret(&mut self, ins: &[&str], st: &mut State) {
+    /// `rcall FLAG VAL CALLEE KIND N ARGS`: a call returning the register
+    /// pair (docs/ir-contract.md). its arguments follow the rules of a plain
+    /// call. VAL holds one count: the ok payload's when the flag is set and
+    /// KIND is counted, the error value's when it is clear. with a plain ok
+    /// payload the count is there only when the flag is clear, which the
+    /// flag says the way a null test does. a runtime pair that borrows its
+    /// payload hands out no count on either side.
+    fn rcall(&mut self, ins: &[&str], st: &mut State) -> Result<(), String> {
+        let (flag, val, callee, kind) = (ins[1], ins[2], ins[3], ins[4]);
+        let args: Vec<&str> = ins.iter().skip(6).copied().collect();
+        self.current_dst = val.to_string();
+        if kind == "unknown" {
+            return Err("a value of unknown kind meets a count".into());
+        }
+        let closure_call = self.f.kinds.get(callee).is_some_and(|k| *k == "closure");
+        let mut owned = true;
+        if let Some(row) = runtime_ownership(callee).filter(|_| !closure_call) {
+            for (i, a) in row.args.iter().enumerate() {
+                if *a == ArgOwnership::Consume && i < args.len() {
+                    self.take(st, args[i], callee)?;
+                }
+            }
+            if matches!(row.result.value, ResultValue::Borrow(_)) {
+                owned = false;
+            }
+        } else if !closure_call && !self.user_funcs.contains(callee) {
+            return Err("a call the checker has no summary for".into());
+        }
+        st.regs.insert(flag.to_string(), Val::Plain);
+        if !owned {
+            let v = if is_counted(kind) { Val::Obj(self.new_obj(st, 0)) } else { Val::Plain };
+            st.regs.insert(val.to_string(), v);
+            return Ok(());
+        }
+        let o = self.new_obj(st, 1);
+        st.regs.insert(val.to_string(), Val::Obj(o.clone()));
+        if !is_counted(kind) {
+            // a set flag means a plain ok payload, so no count
+            st.null_tests.insert(flag.to_string(), (o.clone(), false));
+            self.plain_ok_payloads.insert(o);
+        }
+        Ok(())
+    }
+
+    /// a return. `pair` is a `ret2`, whose payload is handed off whatever the
+    /// function's return kind, except a plain ok payload forwarded from a
+    /// pair call, which holds no count there.
+    fn ret(&mut self, ins: &[&str], st: &mut State, pair: bool) {
         if !st.emptied.is_empty() {
             self.problems.push("releases a field's value and returns without storing a new one (it dangles)".into());
         }
@@ -1131,9 +1274,12 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         // a function returning a tuple has `unknown` on its func line, but
         // its callers still take the result as owned, so a return hands off
         // one count either way
-        if ins.len() > 1 && (is_counted(self.f.ret_kind) || self.f.ret_kind == "unknown") {
+        if ins.len() > 1 && (pair || is_counted(self.f.ret_kind) || self.f.ret_kind == "unknown") {
             if let Val::Obj(o) = self.val(st, ins[1]) {
-                *counts.entry(o).or_insert(0) -= 1;
+                let forwarded_plain = pair && self.plain_ok_payloads.contains(&o) && counts.get(&o).copied().unwrap_or(0) == 0;
+                if !forwarded_plain {
+                    *counts.entry(o).or_insert(0) -= 1;
+                }
             }
         }
         // each global holding an object keeps one count of it

@@ -40,6 +40,7 @@ const SCALAR_KINDS: &[&str] = &["int", "bool", "float", "void", "uint", "byte", 
 /// instructions that make a plain value from plain operands
 const PLAIN_OPS: &[&str] = &[
     "iconst", "fconst", "add", "sub", "mul", "div", "mod", "lt", "gt", "lte", "gte", "eq", "neq",
+    "udiv", "urem", "ult", "ugt", "ulte", "ugte",
     "and", "or", "xor", "shl", "shr", "ushr", "not", "neg", "band", "bor", "bxor", "fadd", "fsub",
     "fmul", "fdiv", "flt", "fgt", "flte", "fgte", "feq", "fneq", "optflag", "funcref",
     "closure_ref", "strref",

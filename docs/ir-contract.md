@@ -96,6 +96,16 @@ eq|neq|lt|gt|lte|gte REG A B     result is 0 or 1. dispatches on operand kind:
                                  strings via the pith_cstring_* runtime helpers.
 ```
 
+```
+udiv|urem REG A B                unsigned division and remainder, for UInt and
+                                 UInt64; a zero divisor traps like `div`.
+ult|ugt|ulte|ugte REG A B        unsigned ordering, for the same two types.
+```
+
+UInt and UInt64 hold their values as the bits of an i64, so the emitter uses
+these for `/`, `%` and ordering on them; a value at or past 2^63 would read as
+negative under the signed forms.
+
 **strings**
 
 ```

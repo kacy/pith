@@ -1657,6 +1657,13 @@ fn emit_checked_int_div_or_mod(
     jump_with_i64_arg(builder, done, zero_result);
 
     builder.switch_to_block(after_zero_check);
+    // an unsigned division has no overflowing case
+    if op == "udiv" || op == "urem" {
+        let value = if op == "udiv" { builder.ins().udiv(a, b) } else { builder.ins().urem(a, b) };
+        jump_with_i64_arg(builder, done, value);
+        builder.switch_to_block(done);
+        return Ok(builder.block_params(done)[0]);
+    }
     let min_int = builder.ins().iconst(types::I64, i64::MIN);
     let is_min_int = builder.ins().icmp(IntCC::Equal, a, min_int);
     let is_minus_one = builder.ins().icmp_imm(IntCC::Equal, b, -1);
@@ -3023,6 +3030,40 @@ fn compile_ir_function(
                     regs.insert(reg, v);
                     kinds.clear(reg);
                 }
+            }
+
+            // UInt and UInt64 hold their values as the bits of an i64, so
+            // division and ordering need the unsigned forms
+            "udiv" | "urem" if parts.len() >= 4 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let a = get_reg(&regs, parts[2])?;
+                let b = get_reg(&regs, parts[3])?;
+                let v = emit_checked_int_div_or_mod(
+                    codegen,
+                    &mut builder,
+                    &mut func_ref_cache,
+                    runtime_funcs,
+                    parts[0],
+                    a,
+                    b,
+                )?;
+                regs.insert(reg, v);
+                kinds.clear(reg);
+            }
+
+            "ult" | "ugt" | "ulte" | "ugte" if parts.len() >= 4 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let a = get_reg(&regs, parts[2])?;
+                let b = get_reg(&regs, parts[3])?;
+                let cc = match parts[0] {
+                    "ult" => IntCC::UnsignedLessThan,
+                    "ugt" => IntCC::UnsignedGreaterThan,
+                    "ulte" => IntCC::UnsignedLessThanOrEqual,
+                    _ => IntCC::UnsignedGreaterThanOrEqual,
+                };
+                let cmp = builder.ins().icmp(cc, a, b);
+                regs.insert(reg, builder.ins().uextend(types::I64, cmp));
+                kinds.clear(reg);
             }
 
             "eq" | "neq" | "lt" | "gt" | "lte" | "gte" if parts.len() >= 4 => {

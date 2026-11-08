@@ -1,0 +1,31 @@
+# UInt and UInt64 keep their values as the bits of an i64. division,
+# remainder, ordering and printing used the signed forms, so a value at or
+# past 2^63 printed as negative, divided to the wrong answer and compared as
+# smaller than 2.
+struct Counter:
+    hits: UInt64
+
+fn larger(a: UInt64, b: UInt64) -> UInt64:
+    if a > b:
+        return a
+    return b
+
+fn main() -> Int:
+    big := UInt64(0 - 2)
+    two := UInt64(2)
+    print("value {big}")
+    print("div {big / two} mod {big % UInt64(10)}")
+    print("lt {two < big} gt {big > two} lte {big <= big} gte {two >= big}")
+    print("larger {larger(two, big)}")
+    mut n := UInt64(0 - 1)
+    n /= UInt64(16)
+    print("compound /= {n}")
+    m := UInt64(0 - 1)
+    print("remainder {m % UInt64(1000)}")
+    u := UInt(0 - 1)
+    print("UInt {u} / 3 = {u / UInt(3)}")
+    c := Counter(UInt64(0 - 5))
+    print("field {c.hits}")
+    # small values are unchanged
+    print("small {UInt64(7) / UInt64(2)} {UInt64(7) % UInt64(2)} {UInt64(3) < UInt64(4)}")
+    return 0

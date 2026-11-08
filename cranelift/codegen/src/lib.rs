@@ -53,6 +53,18 @@ pub fn create_codegen() -> Result<CodeGen, CompileError> {
     flag_builder
         .set("log2_min_function_alignment", "6")
         .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+    // a frame larger than the guard page below a green task's stack could
+    // step over it, and a write past the guard lands in whatever memory sits
+    // below instead of faulting. probes touch each page of a large frame on the
+    // way down, so the overflow hits the guard and is reported. inline, because
+    // the outline strategy calls a probe function the link does not provide;
+    // frames under the 4 KiB guard size get no probe at all.
+    flag_builder
+        .set("enable_probestack", "true")
+        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
+    flag_builder
+        .set("probestack_strategy", "inline")
+        .map_err(|e| CompileError::ModuleError(e.to_string()))?;
     // macos links everything position-independent and its ld rejects text
     // relocations outright, so absolute addressing in the text section (what
     // cranelift emits by default) fails to link. on aarch64 elf, cranelift's
@@ -133,5 +145,15 @@ mod tests {
     #[test]
     fn test_create_codegen() {
         assert!(create_codegen().is_ok());
+    }
+
+    #[test]
+    fn large_frames_are_probed_inline() {
+        use cranelift::codegen::settings::ProbestackStrategy;
+        let codegen = create_codegen().expect("codegen");
+        let flags = codegen.module.isa().flags();
+        assert!(flags.enable_probestack());
+        assert_eq!(flags.probestack_strategy(), ProbestackStrategy::Inline);
+        assert_eq!(flags.probestack_size_log2(), 12);
     }
 }

@@ -104,13 +104,28 @@ exit or only the failing one. see [docs/errors.md](docs/errors.md) and
 release pairs under a borrowed-by-default discipline
 ([docs/ownership.md](docs/ownership.md)), so there are no gc pauses and
 no runtime to tune. a struct graph breaks its own cycles with a `weak`
-field.
+field. a checker in ci follows every retain and release the compiler
+emits and fails the build when a function's counts do not balance on
+every path. over the test corpus it proves 97% of functions balanced and
+leaves the rest undecided ([docs/ir-contract.md](docs/ir-contract.md)).
+valgrind and leak-growth gates also run on every merge, and asan runs
+nightly ([docs/testing.md](docs/testing.md)).
 
 **concurrency is structured, and green by default.** `spawn` and
 `await` with `Task[T]`, channels, `select`, mutexes, wait groups,
 contexts and timers, on an m:n green runtime with an epoll reactor
 ([docs/concurrency.md](docs/concurrency.md)). the os-thread backend is
 one environment variable away.
+
+**shared state needs its lock, and the compiler checks.** a `guard`
+block ties a mutex to the data it protects, and touching that data
+outside a `locked` block on that mutex is a compile error. so is a
+mutable global, in a program that spawns, that is neither guarded nor
+`threadlocal`, and so is a spawn or channel send that would leave a
+collection reachable from two tasks. `pith lint` reports a call that
+parks while holding a mutex, two mutexes taken in opposite orders, and a
+call that retakes a mutex its caller holds
+([docs/concurrency.md](docs/concurrency.md)).
 
 **the tooling talks json.** `check`, `lint` and `doc` all take
 `--json`, every diagnostic has a stable code, `fmt` has one canonical

@@ -257,8 +257,13 @@ struct State {
 struct Canon {
     /// slot-held objects: count held, and whether a null may stand in
     objs: BTreeMap<Vec<String>, (i64, bool)>,
-    /// register-only objects that hold a count
+    /// register-only objects: the count each holds, which is 0 for a
+    /// borrowed value a later retain or release can still reach
     regobjs: BTreeMap<String, i64>,
+    /// register-only field reads: object key -> (field, read order)
+    reads: BTreeMap<String, (String, usize)>,
+    /// field reads that took a count of their own, by object key
+    counted_reads: BTreeSet<String>,
     /// what each live register refers to: an object's key, or "null"
     regs: BTreeMap<String, String>,
     nulls: BTreeSet<String>,
@@ -371,27 +376,38 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>, mismatches: &mut Vec<(Str
     out.nulls = a_nulls.intersection(&b_nulls).cloned().collect();
     let ids: BTreeSet<&String> = a.regobjs.keys().chain(b.regobjs.keys()).collect();
     for id in ids {
-        match (a.regobjs.get(id), b.regobjs.get(id)) {
+        let (x, y) = (a.regobjs.get(id).copied(), b.regobjs.get(id).copied());
+        match (x, y) {
             (Some(x), Some(y)) if x == y => {
-                out.regobjs.insert(id.clone(), *x);
+                out.regobjs.insert(id.clone(), x);
             }
-            (Some(x), Some(y)) => return Err(format!("register object {id} holds {x} on one path and {y} on the other")),
-            (Some(n), None) | (None, Some(n)) => {
+            (Some(x), Some(y)) if x != 0 && y != 0 => return Err(format!("register object {id} holds {x} on one path and {y} on the other")),
+            _ => {
+                // at most one side holds a count. the other side either never
+                // made the object or holds it borrowed, and either way holds
+                // no count of it there.
+                let (n, holder, other) = if x.unwrap_or(0) != 0 { (x.unwrap_or(0), a, b) } else { (y.unwrap_or(0), b, a) };
                 // a count one path holds in registers the other path settled to
                 // a null (a channel receive that brought nothing) is one count
                 // or nothing past the join, like a slot's
-                let (holder, other) = if a.regobjs.contains_key(id) { (a, b) } else { (b, a) };
                 let refs: Vec<&String> = holder.regs.iter().filter(|(_, k)| *k == id).map(|(r, _)| r).collect();
                 let settled = !refs.is_empty() && refs.iter().all(|r| other.regs.get(*r).is_some_and(|k| k == "null"));
-                if *n > 0 && settled {
-                    out.regobjs.insert(id.clone(), *n);
-                } else if *n > 0 {
+                if n > 0 && settled {
+                    out.regobjs.insert(id.clone(), n);
+                } else if n > 0 {
                     leaks.push(id.clone());
                 }
             }
-            (None, None) => {}
         }
     }
+    // a read survives where its object does, recorded the same way on both
+    // sides or on the only side that made it
+    for (id, read) in a.reads.iter().chain(b.reads.iter()) {
+        if out.regobjs.contains_key(id) {
+            out.reads.entry(id.clone()).or_insert_with(|| read.clone());
+        }
+    }
+    out.counted_reads = a.counted_reads.union(&b.counted_reads).filter(|o| out.regobjs.contains_key(*o)).cloned().collect();
     let obj_keys: HashSet<String> = out.objs.keys().map(|k| format!("@{}", k.join("|"))).collect();
     let live = |key: &String| key == "null" || out.regobjs.contains_key(key) || obj_keys.contains(key);
     // values the join made "one count or nothing"
@@ -574,9 +590,15 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                     out.objs.insert(names.clone(), (*n, maybe_null));
                     key_of.insert(o, format!("@{}", names.join("|")));
                 }
-            } else if *n != 0 && referenced.contains(o) {
-                out.regobjs.insert(o.clone(), *n);
-                key_of.insert(o, o.clone());
+            } else if referenced.contains(o) {
+                // a borrowed value keeps its place too: a retain or a release
+                // past the boundary has to find it, not a plain word. an
+                // object named for the slots that held it at an earlier
+                // boundary takes a key of its own, or it would be confused
+                // with what those slots hold now
+                let key = if o.starts_with('@') && !o.ends_with('~') { format!("{o}~") } else { o.clone() };
+                out.regobjs.insert(key.clone(), *n);
+                key_of.insert(o, key);
             } else if *n > 0 {
                 let from = self.origins.get(o).cloned().unwrap_or_else(|| o.clone());
                 self.problems.push(format!("a count is held by nothing at {at} (leak), from `{from}`"));
@@ -611,6 +633,19 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         for o in &st.none_is_null {
             if let Some(k) = key_of.get(o) {
                 out.none_is_null.insert(k.clone());
+            }
+        }
+        for (o, (field, seq)) in &st.field_of {
+            let Some(k) = key_of.get(o).filter(|k| out.regobjs.contains_key(*k)) else {
+                continue;
+            };
+            let (base, off) = field.rsplit_once(':').unwrap_or((field.as_str(), ""));
+            let base = key_of.get(&base.to_string()).cloned().unwrap_or_else(|| base.to_string());
+            out.reads.insert(k.clone(), (format!("{base}:{off}"), *seq));
+        }
+        for o in &st.counted_reads {
+            if let Some(k) = key_of.get(o).filter(|k| out.regobjs.contains_key(*k)) {
+                out.counted_reads.insert(k.clone());
             }
         }
         for o in &st.shells {
@@ -652,6 +687,10 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         for (id, n) in &canon.regobjs {
             st.counts.insert(id.clone(), *n);
         }
+        for (id, read) in &canon.reads {
+            st.field_of.insert(id.clone(), read.clone());
+        }
+        st.counted_reads = canon.counted_reads.iter().cloned().collect();
         for (r, key) in &canon.regs {
             let v = if key == "null" { Val::Null } else { Val::Obj(key.clone()) };
             st.regs.insert(r.clone(), v);
@@ -985,7 +1024,14 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                     // destructor and owns its payload, so freeing the box hands
                     // that count to the read (docs/ir-contract.md)
                     let name = ins.get(5).copied().unwrap_or("");
-                    if (name == "ok" || name == "err") && st.counts.get(&base).copied().unwrap_or(0) > 0 {
+                    // a box keeps `ok` in its second word and `err` in its
+                    // third, and only a tuple slot holds one: a struct of
+                    // the program's own may name a field `ok` too
+                    let box_slot = (name == "ok" && ins[3] == "8") || (name == "err" && ins[3] == "16");
+                    let in_struct_slot = st.slots.iter().any(|(s, v)| {
+                        matches!(v, Val::Obj(b) if *b == base) && self.f.kinds.get(s.as_str()).is_some_and(|k| *k != "tuple")
+                    });
+                    if box_slot && !in_struct_slot && st.counts.get(&base).copied().unwrap_or(0) > 0 {
                         st.shells.insert(base);
                         st.owned_fields.insert(field.clone());
                     }
@@ -1160,6 +1206,10 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         }
         if callee == "pith_struct_set_dtor" {
             if let Some(Val::Obj(o)) = args.first().map(|a| self.val(st, a)) {
+                // the destructor releases the fields from now on, so freeing
+                // the struct hands nobody a payload's count
+                let prefix = format!("{o}:");
+                st.owned_fields.retain(|f| !f.starts_with(&prefix));
                 st.shells.remove(&o);
             }
         }
@@ -1171,7 +1221,10 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             for (i, a) in row.args.iter().enumerate() {
                 if *a == ArgOwnership::Consume && i < args.len() {
                     self.take(st, args[i], callee)?;
-                    if callee == "pith_channel_send" || callee == "pith_channel_try_send" {
+                    // these keep the value only when they report success
+                    // (runtime_ownership.txt), so the failing side of a branch
+                    // on the result has the count back
+                    if callee == "pith_channel_send" || callee == "pith_channel_try_send" || callee == "pith_list_set_value_owned_checked" {
                         if let Val::Obj(o) = self.val(st, args[i]) {
                             st.cond_takes.insert(dst.to_string(), o);
                         }
@@ -1731,6 +1784,186 @@ endfunc
     #[test]
     fn a_retained_field_read_released_twice_is_reported() {
         let r = check(&FIELD_READ_ARG.replace("call 17 pith_cstring_release void 1 14\n", "call 17 pith_cstring_release void 1 14\ncall 18 pith_cstring_release void 1 14\n"));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+    // a struct read out of a fresh optional from a thread-local map,
+    // retained for a pair call and released after it
+    const OPT_PAYLOAD_ARG: &str = "
+func flush_state 1 result_reg
+param state
+iconst 1 0
+iconst 2 1
+ret2 2 1
+mark kind state State
+endfunc
+func flush_internal 1 result_reg
+param writer
+iconst 13 11
+funcref 14 tlsinit
+iconst 15 3
+call 12 pith_tls_get_or_init_tagged map_int 3 13 14 15
+load 16 writer
+field 17 16 0 int handle
+call 19 map_get_ikey_opt tuple 2 12 17
+optflag 20 19
+brif 20 L1127 L1128
+label L1127
+field 21 19 8 State value
+call 22 pith_struct_release void 1 19
+jmp L1129
+label L1128
+call 23 pith_struct_release void 1 19
+strref 24 m3s210
+iconst 25 0
+ret2 25 24
+label L1129
+call 26 pith_struct_retain void 1 21
+rcall 28 29 flush_state int 1 21
+call 30 pith_struct_release void 1 21
+ret2 28 29
+mark kind writer Writer
+endfunc
+";
+
+    #[test]
+    fn a_retained_optional_payload_released_once_balances() {
+        let r = check(OPT_PAYLOAD_ARG);
+        assert_eq!((r.passed, r.failed, r.undecided), (2, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_retained_optional_payload_never_released_is_reported() {
+        let r = check(&OPT_PAYLOAD_ARG.replace("call 30 pith_struct_release void 1 21\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+    #[test]
+    fn a_retained_optional_payload_released_twice_is_reported() {
+        let r = check(&OPT_PAYLOAD_ARG.replace("call 30 pith_struct_release void 1 21\n", "call 30 pith_struct_release void 1 21\ncall 31 pith_struct_release void 1 21\n"));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+    // a tuple that holds a count on one path and gets a destructor, and is
+    // built without one holding a null on the other: freeing it hands its
+    // payload to nobody, so a read of it taken before a later block holds
+    // no count
+    const DTOR_AFTER_STORE: &str = "
+func pick 1 int
+param flag
+load 1 flag
+brif 1 L1 L2
+label L1
+call 2 int_to_string string 1 1
+iconst 3 2
+call 4 pith_struct_alloc struct:tuple 1 3
+sstore 4 1 2
+funcref 5 dtor
+call 6 pith_struct_set_dtor void 2 4 5
+store picked 4
+jmp L3
+label L2
+iconst 7 0
+iconst 8 2
+call 9 pith_struct_alloc struct:tuple 1 8
+sstore 9 1 7
+store picked 9
+label L3
+load 10 picked
+field 11 10 8 string 1
+iconst 12 0
+brif 12 L4 L5
+label L4
+jmp L5
+label L5
+load 13 picked
+call 14 pith_struct_release void 1 13
+iconst 15 0
+ret 15
+mark kind picked tuple
+mark owns picked tuple
+endfunc
+";
+
+    #[test]
+    fn a_destructor_takes_over_a_shells_payload() {
+        let r = check(DTOR_AFTER_STORE);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    // a struct of the program's own with a field named `ok`, read across a
+    // block boundary: it is not a result box, so freeing the struct hands
+    // the read nothing
+    const STRUCT_FIELD_NAMED_OK: &str = "
+func tally 1 int
+param n
+call 1 make_metrics struct:Metrics 0
+store metrics 1
+load 2 metrics
+field 3 2 8 Counter ok
+iconst 4 1
+brif 4 L1 L2
+label L1
+jmp L2
+label L2
+call 5 pith_struct_retain void 1 3
+call 6 record void 1 3
+call 7 pith_struct_release void 1 3
+load 8 metrics
+call 9 pith_struct_release void 1 8
+iconst 10 0
+ret 10
+mark kind metrics Metrics
+mark owns metrics struct
+endfunc
+func make_metrics 0 struct:Metrics
+iconst 1 1
+call 2 pith_struct_alloc struct:Metrics 1 1
+ret 2
+endfunc
+func record 1 void
+param c
+iconst 1 0
+ret 1
+mark kind c Counter
+endfunc
+";
+
+    #[test]
+    fn a_struct_field_named_ok_is_not_a_result_box() {
+        let r = check(STRUCT_FIELD_NAMED_OK);
+        assert_eq!((r.passed, r.failed, r.undecided), (2, 0, 0), "{:?}", r);
+    }
+
+    // a checked owned store keeps the value only when it reports success:
+    // the miss arm releases what the store left behind
+    const CHECKED_OWNED_STORE: &str = "
+func put 2 result_reg
+param xs
+param i
+call 1 int_to_string string 1 i
+load 2 xs
+load 3 i
+call 4 pith_list_set_value_owned_checked int 3 2 3 1
+brif 4 L1 L2
+label L2
+call 5 pith_cstring_release void 1 1
+strref 6 m1s1
+iconst 7 0
+ret2 7 6
+label L1
+iconst 8 1
+iconst 9 0
+ret2 8 9
+mark kind xs list
+endfunc
+";
+
+    #[test]
+    fn a_checked_owned_store_gives_the_value_back_on_a_miss() {
+        let r = check(CHECKED_OWNED_STORE);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+        let r = check(&CHECKED_OWNED_STORE.replace("call 5 pith_cstring_release void 1 1\n", ""));
         assert_eq!(r.failed, 1, "{:?}", r);
     }
 

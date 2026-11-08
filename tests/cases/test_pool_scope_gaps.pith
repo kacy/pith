@@ -1,0 +1,33 @@
+# std.yaml and std.toml keep their nodes in parallel lists addressed through a
+# table of id segments, the way std.json does. a scope gives back the newest
+# nodes but not their ids, so later nodes sit past a gap. this checks the
+# three things that has to get right: the pool returns to its baseline, a
+# handle from a closed scope reads as missing rather than as a later
+# document's node, and a handle from before the scope still reads correctly
+# once the gap is behind it.
+import std.yaml as yaml
+import std.toml as toml
+
+fn main() -> Int:
+    q := chr(34)
+    kept_yaml := yaml.parse("name: kept\nport: 1")
+    kept_toml := toml.parse("name = " + q + "kept" + q + "\nport = 1")
+    yaml_base := yaml.pool_live_nodes()
+    toml_base := toml.pool_live_nodes()
+
+    yaml_scope := yaml.open_scope()
+    toml_scope := toml.open_scope()
+    gone_yaml := yaml.parse("name: gone\nitems:\n  - a\n  - b")
+    gone_toml := toml.parse("name = " + q + "gone" + q + "\n[t]\nk = 2\nitems = [1, 2]")
+    print("inside: {yaml.get_string(gone_yaml, "name")} {toml.get_string(gone_toml, "name")}")
+    toml.close_scope(toml_scope)
+    yaml.close_scope(yaml_scope)
+    print("reclaimed: yaml {yaml.pool_live_nodes() - yaml_base} toml {toml.pool_live_nodes() - toml_base}")
+    print("closed-scope handles: yaml [{yaml.get_string(gone_yaml, "name")}] toml [{toml.get_string(gone_toml, "name")}]")
+
+    after_yaml := yaml.parse("name: after\nport: 3")
+    after_toml := toml.parse("name = " + q + "after" + q + "\nport = 3")
+    print("across the gap: {yaml.get_string(kept_yaml, "name")} {yaml.get_int(kept_yaml, "port")} {toml.get_string(kept_toml, "name")} {toml.get_int(kept_toml, "port")}")
+    print("after the gap: {yaml.get_string(after_yaml, "name")} {yaml.get_int(after_yaml, "port")} {toml.get_string(after_toml, "name")} {toml.get_int(after_toml, "port")}")
+    print("stale reads still missing: [{yaml.get_string(gone_yaml, "name")}] [{toml.get_string(gone_toml, "name")}]")
+    return 0

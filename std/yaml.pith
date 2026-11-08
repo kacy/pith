@@ -79,22 +79,42 @@ fn yaml_decode_fail(message: String) -> YamlDecodeError:
 # document landed on that id next; leaving the counter alone costs nothing and
 # turns that mistake into a plain "invalid handle".
 threadlocal mut next_node_id: Int := 0
-threadlocal mut node_types: Map[Int, String] := {}
-threadlocal mut string_values: Map[Int, String] := {}
-threadlocal mut integer_values: Map[Int, Int] := {}
-threadlocal mut float_values: Map[Int, Float] := {}
-threadlocal mut boolean_values: Map[Int, Bool] := {}
 
-# Mapping children: flat append-only storage with offset/count.
+# node kinds, as stored in node_kinds.
+YAML_NULL := 0
+YAML_STRING := 1
+YAML_BOOL := 2
+YAML_INT := 3
+YAML_FLOAT := 4
+YAML_MAP := 5
+YAML_SEQ := 6
+
+# the pool keeps nodes in parallel lists, one slot per live node in id order,
+# the way std.json does. a node is its kind, one Int payload and a child count:
+# the value of an int, 0 or 1 for a bool, the bits of a float, the index of a
+# string's entry in node_strings, or the offset of a mapping's or sequence's
+# children in the flat lists below. a node used to take an entry in nine maps,
+# about 650 bytes a node, so a 4 MiB document near the node cap could hold
+# around 170 MB.
+threadlocal mut node_kinds: List[Int] := []
+threadlocal mut node_payloads: List[Int] := []
+threadlocal mut node_counts: List[Int] := []
+threadlocal mut node_strings: List[String] := []
+
+# Mapping children: flat append-only storage, a node's offset and count above.
 threadlocal mut map_keys_flat: List[String] := []
 threadlocal mut map_values_flat: List[Int] := []
-threadlocal mut map_key_offsets: Map[Int, Int] := {}
-threadlocal mut map_key_counts: Map[Int, Int] := {}
 
-# Sequence children: flat append-only storage with offset/count.
+# Sequence children: flat append-only storage, the same way.
 threadlocal mut seq_items_flat: List[Int] := []
-threadlocal mut seq_item_offsets: Map[Int, Int] := {}
-threadlocal mut seq_item_counts: Map[Int, Int] := {}
+
+# ids are dense except where a reclaim left a gap: a scope gives back the
+# newest nodes but not their ids, so the next node's id is past the gap. each
+# run of consecutive ids is a segment, the id of its first node and the slot
+# that node sits in. a reclaim only ever drops a suffix of the slots, so there
+# are rarely more than a couple of segments.
+threadlocal mut segment_ids: List[Int] := []
+threadlocal mut segment_slots: List[Int] := []
 
 # How many scopes open_scope() has handed out and not yet reclaimed.
 threadlocal mut open_scope_depth: Int := 0
@@ -102,20 +122,61 @@ threadlocal mut open_scope_depth: Int := 0
 # How many nodes the parse currently running has allocated, against MAX_NODES.
 threadlocal mut nodes_this_parse: Int := 0
 
-fn allocate_node(kind: String) -> Int:
-    idx := next_node_id
+# appends a node and returns its id.
+fn allocate_node(kind: Int, payload: Int, count: Int) -> Int:
+    node_id := next_node_id
     next_node_id = next_node_id + 1
     nodes_this_parse = nodes_this_parse + 1
-    node_types.insert(idx, kind)
-    string_values.insert(idx, "")
-    integer_values.insert(idx, 0)
-    float_values.insert(idx, 0.0)
-    boolean_values.insert(idx, false)
-    map_key_offsets.insert(idx, 0)
-    map_key_counts.insert(idx, 0)
-    seq_item_offsets.insert(idx, 0)
-    seq_item_counts.insert(idx, 0)
-    return idx
+    slot := node_kinds.len()
+    last := segment_ids.len() - 1
+    if last < 0 or segment_ids[last] + (slot - segment_slots[last]) != node_id:
+        segment_ids.push(node_id)
+        segment_slots.push(slot)
+    node_kinds.push(kind)
+    node_payloads.push(payload)
+    node_counts.push(count)
+    return node_id
+
+# the slot of a live node, or -1 for a handle that is not one.
+fn node_slot(handle: Int) -> Int:
+    count := segment_ids.len()
+    if count == 0 or handle < segment_ids[0]:
+        return 0 - 1
+    # the newest segment holds the handle in the common case
+    mut seg := count - 1
+    if handle < segment_ids[seg]:
+        # the last segment starting at or before the handle
+        mut lo := 0
+        mut hi := count - 1
+        while lo < hi:
+            mid := (lo + hi + 1) / 2
+            if segment_ids[mid] <= handle:
+                lo = mid
+            else:
+                hi = mid - 1
+        seg = lo
+    slot := segment_slots[seg] + (handle - segment_ids[seg])
+    mut end := node_kinds.len()
+    if seg + 1 < count:
+        end = segment_slots[seg + 1]
+    if slot >= end:
+        return 0 - 1
+    return slot
+
+# the payload and child count of a node already known to be live.
+fn node_payload(handle: Int) -> Int:
+    return node_payloads[node_slot(handle)]
+
+fn node_count(handle: Int) -> Int:
+    return node_counts[node_slot(handle)]
+
+fn truncate_ints(items: List[Int], len: Int):
+    while items.len() > len:
+        items.remove(items.len() - 1)
+
+fn truncate_strings(items: List[String], len: Int):
+    while items.len() > len:
+        items.remove(items.len() - 1)
 
 # ===============================================================
 # Node-pool reclamation
@@ -132,26 +193,36 @@ fn allocate_node(kind: String) -> Int:
 # lengths drops exactly the entries added since. safe once the struct is built:
 # its string fields are independent heap copies, not references into the pool.
 fn yaml_restore_to(node_id_mark: Int, map_flat_mark: Int, seq_flat_mark: Int):
-    mut node_id := next_node_id - 1
-    while node_id >= node_id_mark:
-        if node_types.contains_key(node_id):
-            node_types.remove(node_id)
-            string_values.remove(node_id)
-            integer_values.remove(node_id)
-            float_values.remove(node_id)
-            boolean_values.remove(node_id)
-            map_key_offsets.remove(node_id)
-            map_key_counts.remove(node_id)
-            seq_item_offsets.remove(node_id)
-            seq_item_counts.remove(node_id)
-        node_id = node_id - 1
+    # find the first slot whose id is at or past the mark, dropping the
+    # segments that lie wholly past it
+    mut cut := node_kinds.len()
+    while segment_ids.len() > 0:
+        last := segment_ids.len() - 1
+        if segment_ids[last] >= node_id_mark:
+            cut = segment_slots[last]
+            truncate_ints(segment_ids, last)
+            truncate_ints(segment_slots, last)
+        else:
+            within := segment_slots[last] + (node_id_mark - segment_ids[last])
+            if within < cut:
+                cut = within
+            break
+    if cut < node_kinds.len():
+        # strings were appended in node order, so the first dropped string
+        # node marks where node_strings is cut
+        mut slot := cut
+        while slot < node_kinds.len():
+            if node_kinds[slot] == YAML_STRING:
+                truncate_strings(node_strings, node_payloads[slot])
+                break
+            slot = slot + 1
+        truncate_ints(node_kinds, cut)
+        truncate_ints(node_payloads, cut)
+        truncate_ints(node_counts, cut)
     # map_keys_flat and map_values_flat grow in lockstep, so one mark covers both.
-    while map_keys_flat.len() > map_flat_mark:
-        map_keys_flat.remove(map_keys_flat.len() - 1)
-    while map_values_flat.len() > map_flat_mark:
-        map_values_flat.remove(map_values_flat.len() - 1)
-    while seq_items_flat.len() > seq_flat_mark:
-        seq_items_flat.remove(seq_items_flat.len() - 1)
+    truncate_strings(map_keys_flat, map_flat_mark)
+    truncate_ints(map_values_flat, map_flat_mark)
+    truncate_ints(seq_items_flat, seq_flat_mark)
 
 ## node-pool position a compiler-lowered typed decode rolls back to.
 pub fn pool_mark_node_id() -> Int:
@@ -201,14 +272,30 @@ pub fn close_scope(scope: YamlScope):
 ## how many nodes the pool currently holds. useful for asserting in a test that
 ## a parse loop gives its nodes back.
 pub fn pool_live_nodes() -> Int:
-    return node_types.len()
+    return node_kinds.len()
 
 # Returns a node's kind, or "" when the handle names no live node. A kind is
 # never empty, so one lookup answers both "does it exist" and "what is it".
 # node ids are never reused, so a handle left over from a reclaimed scope reads
 # as "no live node" rather than aliasing a later document's node.
 fn node_kind(handle: Int) -> String:
-    return node_types.get_default(handle, "")
+    slot := node_slot(handle)
+    if slot < 0:
+        return ""
+    kind := node_kinds[slot]
+    if kind == YAML_STRING:
+        return "string"
+    if kind == YAML_MAP:
+        return "map"
+    if kind == YAML_SEQ:
+        return "seq"
+    if kind == YAML_INT:
+        return "int"
+    if kind == YAML_BOOL:
+        return "bool"
+    if kind == YAML_FLOAT:
+        return "float"
+    return "null"
 
 # ===============================================================
 # Parser state
@@ -218,14 +305,30 @@ threadlocal mut parser_error: Bool := false
 threadlocal mut parser_message: String := ""
 threadlocal mut parser_depth: Int := 0
 
-# the scanned line table. three parallel lists rather than a list of structs
-# because the block-scalar reader needs the raw line while the structure walk
-# needs the comment-stripped one, and the sequence reader rewrites a line in
-# place (see parse_seq).
+# the scanned line table. parallel lists rather than a list of structs because
+# the sequence reader rewrites a line in place (see parse_seq). the structure
+# walk reads the comment-stripped text; the block-scalar reader needs the raw
+# line, which is kept as its span of the input rather than as a second copy of
+# every line. the table lives only for one parse.
 threadlocal mut line_indent: List[Int] := []
 threadlocal mut line_text: List[String] := []
-threadlocal mut line_raw: List[String] := []
+threadlocal mut line_starts: List[Int] := []
+threadlocal mut line_ends: List[Int] := []
+threadlocal mut scan_input: String := ""
 threadlocal mut line_pos: Int := 0
+
+# the raw text of line `index`, without its line ending.
+fn raw_line(index: Int) -> String:
+    return scan_input.substring(line_starts[index], line_ends[index])
+
+# drop the line table once a parse is over, so a long-running task does not
+# keep the last document's lines (and the document itself) alive.
+fn release_line_table():
+    line_indent.clear()
+    line_text.clear()
+    line_starts.clear()
+    line_ends.clear()
+    scan_input = ""
 
 # flow-collection scanner state, used only while a `{...}` or `[...]` is being
 # read out of a single line.
@@ -318,25 +421,24 @@ fn scan_lines(input: String) -> Bool:
     # cleared in place rather than reassigned: the line table is rebuilt on
     # every parse, and reusing the three lists keeps a parse-per-request loop
     # from handing the allocator three fresh lists each time round.
-    line_indent.clear()
-    line_text.clear()
-    line_raw.clear()
+    release_line_table()
+    scan_input = input
     line_pos = 0
     mut start := 0
     mut i := 0
     while i <= input.len():
         at_end := i == input.len()
         if at_end or input[i] == chr(10):
-            mut raw := input.substring(start, i)
-            if raw.len() > 0 and raw[raw.len() - 1] == chr(13):
-                raw = raw.substring(0, raw.len() - 1)
-            if not add_line(raw):
+            mut end := i
+            if end > start and input[end - 1] == chr(13):
+                end = end - 1
+            if not add_line(input.substring(start, end), start, end):
                 return false
             start = i + 1
         i = i + 1
     return true
 
-fn add_line(raw: String) -> Bool:
+fn add_line(raw: String, start: Int, end: Int) -> Bool:
     mut indent := 0
     while indent < raw.len() and raw[indent] == " ":
         indent = indent + 1
@@ -347,7 +449,8 @@ fn add_line(raw: String) -> Bool:
         return false
     line_indent.push(indent)
     line_text.push(strip_comment(raw.substring(indent, raw.len())).trim())
-    line_raw.push(raw)
+    line_starts.push(start)
+    line_ends.push(end)
     return true
 
 fn line_count() -> Int:
@@ -375,30 +478,25 @@ fn skip_blank_lines():
 # ===============================================================
 
 fn null_node() -> Int:
-    return allocate_node("null")
+    return allocate_node(YAML_NULL, 0, 0)
 
 fn string_node(value: String) -> Int:
     if value.len() > MAX_SCALAR_BYTES:
         yaml_fail("scalar of " + value.len().to_string() + " bytes exceeds the " + MAX_SCALAR_BYTES.to_string() + "-byte limit")
         return 0 - 1
-    idx := allocate_node("string")
-    string_values.insert(idx, value)
-    return idx
+    node_strings.push(value)
+    return allocate_node(YAML_STRING, node_strings.len() - 1, 0)
 
 fn bool_node(value: Bool) -> Int:
-    idx := allocate_node("bool")
-    boolean_values.insert(idx, value)
-    return idx
+    if value:
+        return allocate_node(YAML_BOOL, 1, 0)
+    return allocate_node(YAML_BOOL, 0, 0)
 
 fn int_node(value: Int) -> Int:
-    idx := allocate_node("int")
-    integer_values.insert(idx, value)
-    return idx
+    return allocate_node(YAML_INT, value, 0)
 
 fn float_node(value: Float) -> Int:
-    idx := allocate_node("float")
-    float_values.insert(idx, value)
-    return idx
+    return allocate_node(YAML_FLOAT, float_to_bits(value), 0)
 
 fn hex_digit_value(c: String) -> Int:
     if c >= "0" and c <= "9":
@@ -721,26 +819,18 @@ fn key_text(raw: String) -> String:
 # ===============================================================
 
 fn finish_map(keys_in: List[String], values_in: List[Int]) -> Int:
-    idx := allocate_node("map")
-    if keys_in.len() == 0:
-        return idx
-    map_key_offsets.insert(idx, map_keys_flat.len())
+    offset := map_keys_flat.len()
     for key in keys_in:
         map_keys_flat.push(key)
     for value in values_in:
         map_values_flat.push(value)
-    map_key_counts.insert(idx, keys_in.len())
-    return idx
+    return allocate_node(YAML_MAP, offset, keys_in.len())
 
 fn finish_seq(items: List[Int]) -> Int:
-    idx := allocate_node("seq")
-    if items.len() == 0:
-        return idx
-    seq_item_offsets.insert(idx, seq_items_flat.len())
+    offset := seq_items_flat.len()
     for item in items:
         seq_items_flat.push(item)
-    seq_item_counts.insert(idx, items.len())
-    return idx
+    return allocate_node(YAML_SEQ, offset, items.len())
 
 # guards against a document that is all structure and no content.
 fn over_budget() -> Bool:
@@ -924,7 +1014,7 @@ fn parse_block_scalar(parent_indent: Int, header: String) -> Int:
     mut content: List[String] := []
     mut block_indent := 0 - 1
     while line_pos < line_count():
-        raw := line_raw[line_pos]
+        raw := raw_line(line_pos)
         if raw.trim() == "":
             content.push("")
             line_pos = line_pos + 1
@@ -1225,8 +1315,10 @@ fn begin_parse(input: String) -> Bool:
 ## returns the first one; use parse_all for the rest.
 pub fn parse(input: String) -> Int:
     if not begin_parse(input):
+        release_line_table()
         return 0 - 1
     roots := parse_documents()
+    release_line_table()
     if parser_error or roots.len() == 0:
         return 0 - 1
     return roots[0]
@@ -1235,8 +1327,10 @@ pub fn parse(input: String) -> Int:
 ## root per document. returns -1 on failure.
 pub fn parse_all(input: String) -> Int:
     if not begin_parse(input):
+        release_line_table()
         return 0 - 1
     roots := parse_documents()
+    release_line_table()
     if parser_error:
         return 0 - 1
     return finish_seq(roots)
@@ -1528,8 +1622,8 @@ pub fn is_null(handle: Int) -> Bool:
 fn map_lookup(handle: Int, key: String) -> Int:
     if node_kind(handle) != "map":
         return 0 - 1
-    off := map_key_offsets[handle]
-    count := map_key_counts[handle]
+    off := node_payload(handle)
+    count := node_count(handle)
     mut i := 0
     while i < count:
         if map_keys_flat[off + i] == key:
@@ -1545,25 +1639,25 @@ fn map_lookup(handle: Int, key: String) -> Int:
 ## element, where there is no key to look the value up by.
 pub fn scalar_string(handle: Int) -> String:
     if node_kind(handle) == "string":
-        return string_values[handle]
+        return node_strings[node_payload(handle)]
     return ""
 
 ## the value of an int node, or 0 for anything else.
 pub fn scalar_int(handle: Int) -> Int:
     if node_kind(handle) == "int":
-        return integer_values[handle]
+        return node_payload(handle)
     return 0
 
 ## the value of a float node, or 0.0 for anything else.
 pub fn scalar_float(handle: Int) -> Float:
     if node_kind(handle) == "float":
-        return float_values[handle]
+        return float_from_bits(node_payload(handle))
     return 0.0
 
 ## the value of a bool node, or false for anything else.
 pub fn scalar_bool(handle: Int) -> Bool:
     if node_kind(handle) == "bool":
-        return boolean_values[handle]
+        return (node_payload(handle) != 0)
     return false
 
 # ===============================================================
@@ -1585,13 +1679,13 @@ pub fn require_string(handle: Int, key: String) -> String!YamlDecodeError:
         fail yaml_decode_fail("missing string field: " + key)
     if node_kind(node) != "string":
         fail yaml_decode_fail("expected string field: " + key)
-    return string_values[node]
+    return node_strings[node_payload(node)]
 
 ## a string field with a fallback used when it is missing or holds another kind.
 pub fn get_string_or(handle: Int, key: String, default_value: String) -> String:
     node := map_lookup(handle, key)
     if node_kind(node) == "string":
-        return string_values[node]
+        return node_strings[node_payload(node)]
     return default_value
 
 ## an int field, or 0 when it is missing or holds another kind.
@@ -1605,13 +1699,13 @@ pub fn require_int(handle: Int, key: String) -> Int!YamlDecodeError:
         fail yaml_decode_fail("missing int field: " + key)
     if node_kind(node) != "int":
         fail yaml_decode_fail("expected int field: " + key)
-    return integer_values[node]
+    return node_payload(node)
 
 ## an int field with a fallback used when it is missing or holds another kind.
 pub fn get_int_or(handle: Int, key: String, default_value: Int) -> Int:
     node := map_lookup(handle, key)
     if node_kind(node) == "int":
-        return integer_values[node]
+        return node_payload(node)
     return default_value
 
 ## a float field, or 0.0 when it is missing or holds another kind.
@@ -1622,7 +1716,7 @@ pub fn get_float(handle: Int, key: String) -> Float:
 pub fn get_float_or(handle: Int, key: String, default_value: Float) -> Float:
     node := map_lookup(handle, key)
     if node_kind(node) == "float":
-        return float_values[node]
+        return float_from_bits(node_payload(node))
     return default_value
 
 ## a bool field, or false when it is missing or holds another kind.
@@ -1636,13 +1730,13 @@ pub fn require_bool(handle: Int, key: String) -> Bool!YamlDecodeError:
         fail yaml_decode_fail("missing bool field: " + key)
     if node_kind(node) != "bool":
         fail yaml_decode_fail("expected bool field: " + key)
-    return boolean_values[node]
+    return (node_payload(node) != 0)
 
 ## a bool field with a fallback used when it is missing or holds another kind.
 pub fn get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
     node := map_lookup(handle, key)
     if node_kind(node) == "bool":
-        return boolean_values[node]
+        return (node_payload(node) != 0)
     return default_value
 
 ## a nested mapping by key, or -1 when it is missing or is not a mapping.
@@ -1670,8 +1764,8 @@ pub fn keys(handle: Int) -> List[String]:
     mut result: List[String] := []
     if node_kind(handle) != "map":
         return result
-    off := map_key_offsets[handle]
-    count := map_key_counts[handle]
+    off := node_payload(handle)
+    count := node_count(handle)
     mut i := 0
     while i < count:
         result.push(map_keys_flat[off + i])
@@ -1690,15 +1784,15 @@ pub fn has(handle: Int, key: String) -> Bool:
 pub fn array_len(handle: Int) -> Int:
     if node_kind(handle) != "seq":
         return 0
-    return seq_item_counts[handle]
+    return node_count(handle)
 
 ## the handle of a sequence element, or -1 when the index is out of bounds.
 pub fn array_get(handle: Int, index: Int) -> Int:
     if node_kind(handle) != "seq":
         return 0 - 1
-    if index < 0 or index >= seq_item_counts[handle]:
+    if index < 0 or index >= node_count(handle):
         return 0 - 1
-    return seq_items_flat[seq_item_offsets[handle] + index]
+    return seq_items_flat[node_payload(handle) + index]
 
 # ===============================================================
 # Public API — Typed decoding

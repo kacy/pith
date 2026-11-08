@@ -123,7 +123,7 @@ per-value destructor could never have helped here, because there is no value.
 | `bytes.ByteBuffer` | `free()`, or `take_bytes()` which consumes it | a heap allocation with no refcount behind it | safe |
 | `protobuf.Writer` | `free()` | the wrapped byte buffer | safe |
 | `crypto.ecdh.X25519KeyPair` | `close()` | the boxed private key and its registry entry | safe |
-| `json` / `toml` / `yaml` scopes | `close_scope(scope)` | every node parsed in the scope stays in nine threadlocal maps for the life of the task | safe |
+| `json` / `toml` / `yaml` scopes | `close_scope(scope)` | every node parsed in the scope stays in the threadlocal node pool for the life of the task | safe |
 
 ### registries with no closer at all
 

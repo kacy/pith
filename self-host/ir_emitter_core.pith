@@ -3366,7 +3366,7 @@ fn ir_bind_can_borrow_element(block: Node, pos: Int, body_idx: Int) -> Bool:
     val := get_node(parts.val_idx)
     mut src := ""
     mut loops_ok := false
-    if val.kind == "ident" and ir_name_is_threadlocal(val.value) and ir_threadlocal_kinds[val.value] == "string":
+    if val.kind == "ident" and ir_name_is_threadlocal(val.value) and ir_threadlocal_kinds[ir_tls_key(val.value)] == "string":
         # a threadlocal string: no other thread or task can reach this task's
         # slot, so only code in the range below could replace the value, and
         # a loop's back edge is safe as well
@@ -13477,10 +13477,11 @@ fn ir_emit_global_binding(node: Node, is_threadlocal: Bool):
         # so ir_emit_tls_thunks can generate its lazy per-thread initializer.
         # assign the slot once so re-processing the same global (across emission
         # passes) can never hand two access sites different slots.
-        if not ir_threadlocal_slots.contains_key(gname):
-            ir_threadlocal_slots.insert(gname, ir_next_tls_slot)
+        key := ir_tls_key(gname)
+        if not ir_threadlocal_slots.contains_key(key):
+            ir_threadlocal_slots.insert(key, ir_next_tls_slot)
             ir_next_tls_slot = ir_next_tls_slot + 1
-        ir_threadlocal_kinds.insert(gname, global_type)
+        ir_threadlocal_kinds.insert(key, global_type)
         return
     ir_emit("global " + ir_global_storage_symbol(gname) + " " + init_val)
     if ir_count_marks:
@@ -13527,16 +13528,16 @@ fn ir_emit_tls_thunks(root: Node):
 # thread's value (initializing it via the thunk on first access).
 fn ir_emit_tls_load(dest_r: Int, name: String):
     slot_r := ir_reg()
-    ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[name].to_string())
+    ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[ir_tls_key(name)].to_string())
     fr := ir_reg()
     ir_emit("funcref " + fr.to_string() + " __tlsinit_" + name)
     tag_r := ir_emit_tls_tag(name)
-    ir_emit("call " + dest_r.to_string() + " pith_tls_get_or_init_tagged " + ir_threadlocal_kinds[name] + " 3 " + slot_r.to_string() + " " + fr.to_string() + " " + tag_r.to_string())
+    ir_emit("call " + dest_r.to_string() + " pith_tls_get_or_init_tagged " + ir_threadlocal_kinds[ir_tls_key(name)] + " 3 " + slot_r.to_string() + " " + fr.to_string() + " " + tag_r.to_string())
 
 # write val_r into a threadlocal global for this thread.
 fn ir_emit_tls_store(name: String, val_r: Int):
     slot_r := ir_reg()
-    ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[name].to_string())
+    ir_emit("iconst " + slot_r.to_string() + " " + ir_threadlocal_slots[ir_tls_key(name)].to_string())
     tag_r := ir_emit_tls_tag(name)
     ir_emit("call " + ir_reg().to_string() + " pith_tls_set_tagged void 3 " + slot_r.to_string() + " " + val_r.to_string() + " " + tag_r.to_string())
 
@@ -13544,13 +13545,20 @@ fn ir_emit_tls_store(name: String, val_r: Int):
 # task's value so the count it holds is dropped when the task finishes
 fn ir_emit_tls_tag(name: String) -> Int:
     tag_r := ir_reg()
-    ir_emit("iconst " + tag_r.to_string() + " " + ir_element_tag_code(ir_rc_kind(ir_threadlocal_kinds[name])).to_string())
+    ir_emit("iconst " + tag_r.to_string() + " " + ir_element_tag_code(ir_rc_kind(ir_threadlocal_kinds[ir_tls_key(name)])).to_string())
     return tag_r
 
 # a name refers to a threadlocal global only when it is a recorded threadlocal
 # and not shadowed by a local of the same name in the current function.
 fn ir_name_is_threadlocal(name: String) -> Bool:
-    return ir_threadlocal_slots.contains_key(name) and not ir_name_is_func_local(name)
+    return ir_threadlocal_slots.contains_key(ir_tls_key(name)) and not ir_name_is_func_local(name)
+
+# the key a threadlocal's slot and kind are recorded under: the name within the
+# module that declares it. keyed by the bare name, a threadlocal of the same
+# name in two modules shared one slot, so std.json, std.toml and std.yaml all
+# read and wrote each other's parser state and scope depth.
+fn ir_tls_key(name: String) -> String:
+    return ir_current_module_path + "::" + name
 
 # emit a load of `name`, routing threadlocal globals through the tls runtime and
 # everything else (locals, plain globals) through the normal storage slot. a

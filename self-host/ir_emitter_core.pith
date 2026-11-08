@@ -5271,6 +5271,38 @@ fn ir_append_deferred_lambda_body():
         bodies.push(line)
     ir_lambda_bodies = bodies
 
+# the conversion that brings a value back into a narrow integer type's range,
+# or "" for a type whose arithmetic needs none. the ir computes in 64 bits, so
+# without it `Int8(127) + Int8(1)` held 128 and `UInt8(3) - UInt8(5)` held -2,
+# values their type cannot hold, which then failed to compare equal to the
+# wrapped value they stand for. the 64-bit types wrap on their own.
+fn ir_sized_int_narrow_fn(tid: Int) -> String:
+    if tid < 0:
+        return ""
+    name := get_type_name(tid)
+    if name == "Int8" or name == "Int16" or name == "Int32" or name == "UInt8" or name == "UInt16" or name == "UInt32":
+        return name
+    return ""
+
+# wrap `r`, the result of arithmetic typed `tid`, into that type's range.
+fn ir_narrow_to_tid(tid: Int, r: Int) -> Int:
+    narrow := ir_sized_int_narrow_fn(tid)
+    if narrow.len() == 0:
+        return r
+    out := ir_reg()
+    ir_emit_call1(out, narrow, "int", r)
+    return out
+
+# the arithmetic operators whose result can leave a narrow type's range.
+# comparisons yield a Bool, and the bit operations live in std.bits on Int.
+fn ir_op_can_overflow(op: String) -> Bool:
+    return op == "add" or op == "sub" or op == "mul" or op == "div" or op == "mod" or op == "negate"
+
+fn ir_narrow_sized_result(idx: Int, op: String, r: Int) -> Int:
+    if not ir_op_can_overflow(op):
+        return r
+    return ir_narrow_to_tid(c_get_expr_type(idx), r)
+
 fn ir_emit_unary_expr(node: Node) -> Int:
     operand_r := ir_expr(node.children[0])
     return ir_emit_unary_op(node.value, operand_r)
@@ -10266,6 +10298,9 @@ fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int
     delta_idx := ir_upsert_delta_idx(map_idx, key_idx, value_idx)
     if delta_idx < 0:
         return 0 - 1
+    # the fused add does not wrap a narrow integer value
+    if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+        return 0 - 1
     return ir_emit_map_upsert_call(map_idx, key_idx, delta_idx, obj_type)
 
 fn ir_emit_map_upsert_call(map_idx: Int, key_idx: Int, delta_idx: Int, obj_type: String) -> Int:
@@ -10294,6 +10329,8 @@ fn ir_try_emit_map_upsert_delta(target_idx: Int, delta_idx: Int) -> Int:
     if obj_type != "map" and obj_type != "map_int":
         return 0 - 1
     if ir_checked_index_type(target_idx) != "int":
+        return 0 - 1
+    if ir_sized_int_narrow_fn(c_get_expr_type(target_idx)).len() > 0:
         return 0 - 1
     if not ir_pure_read_expr(map_idx) or not ir_pure_read_expr(key_idx) or not ir_pure_read_expr(delta_idx):
         return 0 - 1
@@ -10350,8 +10387,9 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
         # plain word with no count to take or drop
         cur_r := ir_emit_index_read_at(target_idx, target, obj_r, idx_r, false)
         rhs_r := ir_expr(value_idx)
-        value_r = ir_reg()
-        ir_emit_simple_binary(value_r, compound_op, cur_r, rhs_r)
+        sum_r := ir_reg()
+        ir_emit_simple_binary(sum_r, compound_op, cur_r, rhs_r)
+        value_r = ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     else:
         value_r = ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # tagged containers retain stored elements in the runtime. a borrowed heap
@@ -10464,10 +10502,10 @@ fn ir_expr(idx: Int) -> Int:
         return ir_emit_ident_load(idx, "self")
 
     if node.kind == "unary":
-        return ir_emit_unary_expr(node)
+        return ir_narrow_sized_result(idx, node.value, ir_emit_unary_expr(node))
 
     if node.kind == "binary":
-        return ir_emit_binary_expr(node)
+        return ir_narrow_sized_result(idx, node.value, ir_emit_binary_expr(node))
 
     if node.kind == "call":
         return ir_emit_static_call(idx, node)
@@ -11407,8 +11445,9 @@ fn ir_emit_field_compound_assignment(target_idx: Int, value_idx: Int, compound_o
     cur := ir_reg()
     ir_emit_named_field_access(cur, obj_r, lookup_key, fname, ir_checked_struct_field_type(recv_idx, fname))
     rhs := ir_expr(value_idx)
-    res := ir_reg()
-    ir_emit_simple_binary(res, compound_op, cur, rhs)
+    sum_r := ir_reg()
+    ir_emit_simple_binary(sum_r, compound_op, cur, rhs)
+    res := ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + res.to_string())
     return true
 
@@ -11468,9 +11507,9 @@ fn ir_emit_compound_assignment(node: Node):
         cur := ir_reg()
         ir_emit_name_load(cur, name)
         rhs := ir_expr(node.children[1])
-        res := ir_reg()
-        ir_emit_simple_binary(res, compound_op, cur, rhs)
-        ir_emit_name_store(name, res)
+        sum_r := ir_reg()
+        ir_emit_simple_binary(sum_r, compound_op, cur, rhs)
+        ir_emit_name_store(name, ir_narrow_to_tid(c_get_expr_type(node.children[0]), sum_r))
 
 # emit a label and clear the return-tracking flag: a label starts a
 # fresh block, so whatever terminator came before it belongs to a

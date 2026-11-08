@@ -79,13 +79,17 @@ TLS_CONTENT_ALERT := 21
 TLS_CONTENT_HANDSHAKE := 22
 TLS_CONTENT_APPLICATION_DATA := 23
 
-# a read deadline for an accepted server connection. without it a client can
-# open a tls connection and then send nothing (or dribble ChangeCipherSpec /
-# handshake records slowly), pinning the pre-auth handshake indefinitely. the
-# deadline bounds the whole handshake — and the connection's later reads — to a
-# wall-clock window. it is not a substitute for running the handshake off the
+# the time an accepted server connection has to finish its handshake. without a
+# bound a client can open a tls connection and then send nothing, or dribble
+# its records a byte at a time, pinning the pre-auth handshake indefinitely.
+# the bound is one deadline for the whole handshake, reads and writes alike,
+# not a timeout per read, which a peer sending a byte just inside it could
+# stretch forever. it is not a substitute for running the handshake off the
 # accept loop: see accept_socket() and handshake() below.
 SERVER_HANDSHAKE_TIMEOUT_MS := 10000
+# the same bound for a handshake dial() runs. longer, because a client may
+# reach a distant or busy server, and the server side has its own bound.
+CLIENT_HANDSHAKE_TIMEOUT_MS := 30000
 TLS_HANDSHAKE_CLIENT_HELLO := 1
 TLS_HANDSHAKE_SERVER_HELLO := 2
 TLS_HANDSHAKE_NEW_SESSION_TICKET := 4
@@ -377,13 +381,15 @@ struct ConfigRecord:
     mut server_key_der: Bytes
     mut client_ca_pem: String
     mut client_ca_optional: Bool
+    # the whole handshake's time budget in milliseconds, 0 for the default
+    mut handshake_timeout_ms: Int
 
 fn empty_config_record() -> ConfigRecord:
     none_offered: List[String] := []
-    return ConfigRecord(roots_pem: "", alpn: none_offered, resumption_enabled: false, require_tls13: false, require_tls12: false, skip_verification: false, has_verify_connection: false, verify_connection: no_config_hook, has_server_selector: false, server_selector: no_config_hook, client_cert_pem: "", client_key_der: bytes.empty(), server_cert_pem: "", server_key_der: bytes.empty(), client_ca_pem: "", client_ca_optional: false)
+    return ConfigRecord(roots_pem: "", alpn: none_offered, resumption_enabled: false, require_tls13: false, require_tls12: false, skip_verification: false, has_verify_connection: false, verify_connection: no_config_hook, has_server_selector: false, server_selector: no_config_hook, client_cert_pem: "", client_key_der: bytes.empty(), server_cert_pem: "", server_key_der: bytes.empty(), client_ca_pem: "", client_ca_optional: false, handshake_timeout_ms: 0)
 
 fn copy_config_record(r: ConfigRecord) -> ConfigRecord:
-    return ConfigRecord(roots_pem: r.roots_pem, alpn: r.alpn, resumption_enabled: r.resumption_enabled, require_tls13: r.require_tls13, require_tls12: r.require_tls12, skip_verification: r.skip_verification, has_verify_connection: r.has_verify_connection, verify_connection: r.verify_connection, has_server_selector: r.has_server_selector, server_selector: r.server_selector, client_cert_pem: r.client_cert_pem, client_key_der: r.client_key_der, server_cert_pem: r.server_cert_pem, server_key_der: r.server_key_der, client_ca_pem: r.client_ca_pem, client_ca_optional: r.client_ca_optional)
+    return ConfigRecord(roots_pem: r.roots_pem, alpn: r.alpn, resumption_enabled: r.resumption_enabled, require_tls13: r.require_tls13, require_tls12: r.require_tls12, skip_verification: r.skip_verification, has_verify_connection: r.has_verify_connection, verify_connection: r.verify_connection, has_server_selector: r.has_server_selector, server_selector: r.server_selector, client_cert_pem: r.client_cert_pem, client_key_der: r.client_key_der, server_cert_pem: r.server_cert_pem, server_key_der: r.server_key_der, client_ca_pem: r.client_ca_pem, client_ca_optional: r.client_ca_optional, handshake_timeout_ms: r.handshake_timeout_ms)
 
 # add a config to the registry under the next handle.
 fn config_create(record: ConfigRecord) -> Config:
@@ -3242,11 +3248,30 @@ pub fn dial(host: String, port: Int) -> Conn!:
     defer config.close()
     return dial_with_config(host, port, host, config)
 
-# dial a tls server with an explicit server name and config.
+# dial a tls server with an explicit server name and config. the handshake has
+# CLIENT_HANDSHAKE_TIMEOUT_MS to finish, or the config's with_handshake_timeout
+# budget; the deadline is cleared once it does.
 pub fn dial_with_config(host: String, port: Int, server_name: String, config: Config) -> Conn!:
     if is_native_config(config):
-        return native_client_handshake(io.connect(host, port)!, server_name, config)
+        stream := io.connect(host, port)!
+        set_handshake_deadline(stream.fd, handshake_timeout(config, CLIENT_HANDSHAKE_TIMEOUT_MS))
+        conn := native_client_handshake(stream, server_name, config)!
+        set_handshake_deadline(stream.fd, 0)
+        return conn
     fail "native tls client config required"
+
+# the handshake budget the config names, or `default_ms`.
+fn handshake_timeout(config: Config, default_ms: Int) -> Int:
+    ms := config_record(config.handle).handshake_timeout_ms
+    if ms > 0:
+        return ms
+    return default_ms
+
+# bound every read and write on `fd` by one deadline `ms` from now, or clear
+# both with 0.
+fn set_handshake_deadline(fd: Int, ms: Int):
+    tcp_set_read_deadline(fd, ms)
+    tcp_set_write_deadline(fd, ms)
 
 # wrap an existing tcp stream as a tls client connection.
 pub fn client(stream: TcpStream, server_name: String, config: Config) -> Conn!:
@@ -3442,6 +3467,16 @@ impl Config:
         config_edit(self.handle, install)
         return self
 
+    # the time a handshake made with this config has to finish, in
+    # milliseconds, as one deadline over all of its reads and writes. a server
+    # defaults to SERVER_HANDSHAKE_TIMEOUT_MS and dial() to
+    # CLIENT_HANDSHAKE_TIMEOUT_MS; zero or less restores the default.
+    fn with_handshake_timeout(ms: Int) -> Config:
+        install := fn(r: ConfigRecord):
+            r.handshake_timeout_ms = ms
+        config_edit(self.handle, install)
+        return self
+
     fn with_verify_connection(verify: fn(ConnectionState) -> String) -> Config:
         hook := fn(ctx: ConfigHookContext) => ConfigHookResult(none, verify(ctx.state))
         install := fn(r: ConfigRecord):
@@ -3501,7 +3536,10 @@ impl Listener:
             # bound the handshake so a slow or silent client can't pin a server
             # task before it authenticates; handshake() clears this deadline once
             # the handshake completes so it does not cap application reads.
-            tcp_set_timeout(fd, SERVER_HANDSHAKE_TIMEOUT_MS)
+            config := listener_config(self.handle) catch:
+                set_handshake_deadline(fd, SERVER_HANDSHAKE_TIMEOUT_MS)
+                return fd
+            set_handshake_deadline(fd, handshake_timeout(config, SERVER_HANDSHAKE_TIMEOUT_MS))
             return fd
         fail "native tls listener not found"
 
@@ -3517,12 +3555,12 @@ impl Listener:
         # once the handshake fails there is no Conn for the caller to close.
         errdefer note_failed_handshake(fd)
         conn := native_server_handshake(TcpStream(fd), config)!
-        # accept_socket set a short read deadline to bound the handshake against a
-        # slow or silent client. clear it now that the handshake is done, so the
-        # connection's application reads are not silently capped at that window —
-        # a long-lived stream (grpc, websocket) or a slow client would otherwise
-        # be killed. an application that wants a read deadline sets its own.
-        tcp_set_timeout(fd, 0)
+        # accept_socket set a deadline to bound the handshake against a slow or
+        # silent client. clear it now that the handshake is done, so the
+        # connection's application reads and writes are not capped at that
+        # window: a long-lived stream (grpc, websocket) or a slow client would
+        # otherwise be killed. an application that wants a deadline sets its own.
+        set_handshake_deadline(fd, 0)
         return conn
 
     fn close():

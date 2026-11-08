@@ -1,0 +1,74 @@
+# a tls handshake has one deadline for the whole exchange. it used to be a
+# timeout per read, so a client that sent a byte just inside it could hold a
+# server's pre-auth handshake open for as long as it liked. this dribbles a
+# ClientHello a byte every 100 ms at a server whose budget is 400 ms, then
+# checks that a real handshake still works and that the deadline is gone once
+# it is done: the server waits past the budget before it answers.
+import std.bytes as bytes
+import std.net.tcp as tcp
+import std.net.tls as tls
+
+PORT := 20830
+CERT := "tests/live/fixtures/localhost.crt"
+KEY := "tests/live/fixtures/localhost.key"
+CA := "tests/live/fixtures/localhost-ca.crt"
+
+fn serve_one(listener: tls.Listener, out: Channel[String]):
+    fd := tls.accept_socket(listener) catch:
+        out.send("accept-error")
+        return
+    started := time()
+    conn := tls.handshake(listener, fd) catch:
+        elapsed := time() - started
+        if elapsed < 3000:
+            out.send("cut off")
+        else:
+            out.send("cut off late: {elapsed} ms")
+        return
+    # past the handshake budget: an application read or write is not capped
+    sleep(700)
+    conn.write("late hello") catch 0
+    got := conn.read(64) catch "read-error"
+    out.send("served: " + got)
+    conn.close()
+
+fn dribble():
+    fd := tcp.connect("127.0.0.1", PORT) catch:
+        return
+    # a tls record header for a handshake, then more of a hello, one byte at a time
+    hello := [22, 3, 1, 0, 200, 1, 0, 0, 196, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    for b in hello:
+        one := bytes.buffer()
+        one.write_byte(b) catch 0
+        tcp.write_all_bytes(fd, one.take_bytes()) catch:
+            break
+        sleep(100)
+    tcp.close(fd)
+
+fn next_result(results: Channel[String]) -> String:
+    if let v = results.recv():
+        return v
+    return "none"
+
+fn run() -> Int!:
+    server_cfg := tls.server_config(CERT, KEY)!.with_handshake_timeout(400)
+    listener := tls.listen("127.0.0.1", PORT, server_cfg)!
+    results := Channel[String](2)
+    spawn serve_one(listener, results)
+    dribble()
+    print(next_result(results))
+
+    spawn serve_one(listener, results)
+    client_cfg := tls.client_config_with_ca_file(CA)!.with_handshake_timeout(400)
+    conn := tls.dial_with_config("127.0.0.1", PORT, "localhost", client_cfg)!
+    print(conn.read(64) catch "client read error")
+    conn.write("bye") catch 0
+    print(next_result(results))
+    conn.close()
+    listener.close()
+    return 0
+
+fn main() -> Int:
+    return run() catch:
+        print("setup failed")
+        return 1

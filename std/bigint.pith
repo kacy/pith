@@ -644,7 +644,7 @@ fn sub_limbs(left: List[Int], right: List[Int]) -> List[Int]:
 # schoolbook multiplication. the accumulator peaks at
 # (BASE-1) + (BASE-1)^2 + (BASE-1), which is BASE^2 - 1 and so stays inside a
 # signed 64-bit Int with room to spare.
-fn mul_limbs(left: List[Int], right: List[Int]) -> List[Int]:
+fn mul_limbs_schoolbook(left: List[Int], right: List[Int]) -> List[Int]:
     mut out := zeros(left.len() + right.len())
     mut i := 0
     while i < left.len():
@@ -665,6 +665,79 @@ fn mul_limbs(left: List[Int], right: List[Int]) -> List[Int]:
                 k = k + 1
         i = i + 1
     return out
+
+# below this many limbs in the shorter operand the schoolbook loop wins: the
+# split, the three sums and the recombination cost more than they save.
+KARATSUBA_THRESHOLD := 40
+
+# the product of two magnitudes. schoolbook is quadratic, so at the size
+# ceiling one product took minutes; karatsuba replaces four half-size products
+# with three, which is about n^1.58.
+fn mul_limbs(left: List[Int], right: List[Int]) -> List[Int]:
+    short := min(left.len(), right.len())
+    long := max(left.len(), right.len())
+    if short < KARATSUBA_THRESHOLD:
+        return mul_limbs_schoolbook(left, right)
+    if long >= 2 * short:
+        # an unbalanced pair: multiply the short operand by each short-sized
+        # chunk of the long one, so every product below is balanced
+        mut wide := left
+        mut narrow := right
+        if right.len() > left.len():
+            wide = right
+            narrow = left
+        mut out := zeros(left.len() + right.len())
+        mut start := 0
+        while start < wide.len():
+            end := min(start + narrow.len(), wide.len())
+            add_shifted(out, mul_limbs(limb_range(wide, start, end), narrow), start)
+            start = end
+        return out
+    half := long / 2
+    low_left := limb_range(left, 0, min(half, left.len()))
+    high_left := limb_range(left, min(half, left.len()), left.len())
+    low_right := limb_range(right, 0, min(half, right.len()))
+    high_right := limb_range(right, min(half, right.len()), right.len())
+    low := mul_limbs(low_left, low_right)
+    high := mul_limbs(high_left, high_right)
+    # (a0 + a1)(b0 + b1) - a0 b0 - a1 b1 = a0 b1 + a1 b0, never negative
+    cross := sub_limbs(sub_limbs(mul_limbs(add_limbs(low_left, high_left), add_limbs(low_right, high_right)), low), high)
+    mut out := zeros(left.len() + right.len() + 1)
+    add_shifted(out, low, 0)
+    add_shifted(out, cross, half)
+    add_shifted(out, high, 2 * half)
+    return out
+
+# the limbs `source[start..end]`.
+fn limb_range(source: List[Int], start: Int, end: Int) -> List[Int]:
+    mut out: List[Int] := []
+    mut index := start
+    while index < end:
+        out.push(source[index])
+        index = index + 1
+    return out
+
+# add `addend` into `target` starting at limb `offset`, carrying upward. the
+# sum always fits `target`, but an addend can carry zero limbs past its end
+# (the cross term is as long as its operands allow, not as its value needs),
+# so those are skipped rather than written.
+fn add_shifted(target: List[Int], addend: List[Int], offset: Int):
+    mut top := addend.len()
+    while top > 0 and addend[top - 1] == 0:
+        top = top - 1
+    mut carry := 0
+    mut index := 0
+    while index < top or carry > 0:
+        mut total := target[offset + index] + carry
+        if index < top:
+            total = total + addend[index]
+        if total >= BIGINT_BASE:
+            target[offset + index] = total - BIGINT_BASE
+            carry = 1
+        else:
+            target[offset + index] = total
+            carry = 0
+        index = index + 1
 
 # multiply by a single limb, growing the result only when there is a carry out
 # of the top.
@@ -1052,3 +1125,22 @@ test "a value crosses to a float, losing precision where a float must":
     # past a float's range the value is the infinity of its sign
     assert_eq(float_to_bits(to_float(ten_pow(400)!)), 9218868437227405312)
     assert_eq(float_to_bits(to_float(negate(ten_pow(400)!))), 0 - 4503599627370496)
+
+test "large products take the karatsuba path and stay exact":
+    # (10^k - 1)^2 = 10^2k - 2 * 10^k + 1, which is k-1 nines, an eight,
+    # k-1 zeros and a one: 1000 digits is well past the threshold
+    nines := parse("9".repeat(1000))!
+    want := "9".repeat(999) + "8" + "0".repeat(999) + "1"
+    assert_eq(to_string(mul(nines, nines)), want)
+    # an unbalanced pair goes through the chunked path:
+    # (10^3000 - 1)(10^400 - 1) = 10^3400 - 10^3000 - 10^400 + 1
+    long := parse("9".repeat(3000))!
+    short := parse("9".repeat(400))!
+    unbalanced := "9".repeat(399) + "8" + "9".repeat(2600) + "0".repeat(399) + "1"
+    assert_eq(to_string(mul(long, short)), unbalanced)
+    # a product checks out against division, an independent algorithm
+    a := parse("31415926535".repeat(80))!
+    b := parse("27182818284".repeat(60))!
+    parts := divmod(mul(a, b), b)!
+    assert_eq(compare(parts.quotient, a), 0)
+    assert_eq(sign_of(parts.remainder), 0)

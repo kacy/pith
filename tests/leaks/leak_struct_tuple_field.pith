@@ -1,0 +1,33 @@
+# a struct with a tuple field. the field was recorded as a plain word, so the
+# struct got no destructor for it and every struct that died stranded its
+# tuple, about 110 bytes per round here; a store into the field stranded the
+# tuple it replaced as well.
+import leakprobe as probe
+
+struct Holder:
+    pair: (String, Int)
+    name: String
+
+struct Pt:
+    at: (Int, Int)
+
+fn make(i: Int) -> Holder:
+    return Holder((probe.fresh_string(i), i), probe.fresh_string(i))
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut total := 0
+    while i < n:
+        h := make(i)
+        total = total + h.pair.1
+        mut g := make(i)
+        g.pair = (probe.fresh_string(i + 1), 2)
+        total = total + g.pair.1
+        p := Pt((i, 2))
+        total = total + p.at.1
+        i = i + 1
+    if total == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

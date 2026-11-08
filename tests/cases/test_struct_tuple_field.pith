@@ -1,0 +1,51 @@
+# a struct field of tuple type is counted like any other heap field: the
+# struct's destructor releases it, a store releases the tuple it replaces, and
+# a read borrows it. before, the field was a plain word and every struct that
+# died stranded its tuple.
+struct Entry:
+    pair: (String, Int)
+    label: String
+
+struct Pt:
+    at: (Int, Int)
+
+struct Box[T]:
+    item: (T, Int)
+
+fn make(i: Int) -> Entry:
+    return Entry(("k" + i.to_string(), i), "e" + i.to_string())
+
+fn first(e: Entry) -> String:
+    return e.pair.0
+
+fn pair_of(e: Entry) -> (String, Int):
+    return e.pair
+
+fn main() -> Int:
+    e := make(1)
+    print("{e.pair.0} {e.pair.1} {e.label}")
+    mut m := make(2)
+    m.pair = ("swapped", 20)
+    print("{m.pair.0} {m.pair.1}")
+    print(first(m))
+    p := pair_of(m)
+    m.pair = ("again", 21)
+    print("{p.0} {p.1} {m.pair.0}")
+    name := m.pair.0
+    n := m.pair.1
+    print("{name} {n}")
+    mut entries: List[Entry] := []
+    mut i := 0
+    while i < 3:
+        entries.push(make(i))
+        i = i + 1
+    for x in entries:
+        print("{x.pair.0}={x.pair.1}")
+    pt := Pt((3, 4))
+    print("{pt.at.0 + pt.at.1}")
+    b := Box[String](("boxed", 7))
+    print("{b.item.0} {b.item.1}")
+    held := entries[1].pair
+    entries.clear()
+    print("{held.0} {held.1}")
+    return 0

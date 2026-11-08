@@ -213,6 +213,15 @@ the socket belongs to `handshake` once you pass it in. on success the returned
 before the error propagates, so a spawned task never leaks the socket of a
 client that never got past the handshake.
 
+a handshake has one deadline for the whole exchange, reads and writes alike: 10
+seconds from the accept on a server, and 30 seconds from the connect for
+`tls.dial` and `tls.dial_with_config`. a timeout per read would let a peer that
+sends a byte just inside it keep the handshake going forever. the deadline is
+cleared once the handshake finishes, so it never caps the connection's own
+reads. `config.with_handshake_timeout(ms)` changes the budget for handshakes
+made with that config. `tls.client(stream, ...)` wraps a stream the caller
+already holds and leaves its deadlines to the caller.
+
 a spawned task takes its arguments by value while the loop keeps using the
 listener, which is why the shape above passes `listener.handle` and rebuilds the
 listener with `tls.listener_from_handle` inside the task.

@@ -41,6 +41,10 @@ from std.iter import Iterator
 # large, but a message beyond this is corruption or an attack, not data.
 MAX_MESSAGE_LEN := 268435456 # 256 MiB
 
+# the most SCRAM iterations this client runs for a login, about seven seconds
+# of pbkdf2 here.
+MAX_SCRAM_ITERATIONS := 1000000
+
 # --- byte helpers ---
 
 # a 4-byte big-endian integer.
@@ -354,6 +358,11 @@ fn scram_client_final(server_first: String, client_first_bare: String, password:
     # captured ClientProof brute-forceable at one HMAC per guess.
     if iterations < 4096:
         fail "postgres: SCRAM iteration count " + iterations.to_string() + " is below the RFC 7677 minimum of 4096"
+    # the server names the count, and a hostile one could name the kdf's own
+    # ceiling and hold this task for over a minute. postgres defaults to 4096
+    # and a hardened server uses tens of thousands.
+    if iterations > MAX_SCRAM_ITERATIONS:
+        fail "postgres: SCRAM iteration count " + iterations.to_string() + " is above the client maximum of " + MAX_SCRAM_ITERATIONS.to_string()
 
     salt := encoding.b64_decode(salt_b64)!
     pw := bytes.from_string_utf8(password)
@@ -726,13 +735,15 @@ test "scram-sha-256 client-final matches the RFC 7677 vector":
     assert_eq(final.message, "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
     assert_eq(final.server_signature, "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=")
 
-test "scram rejects a mismatched nonce, a sub-4096 iteration count, and a server error":
+test "scram rejects a mismatched nonce, an iteration count out of range, and a server error":
     cfb := "n=user,r=clientnonce"
     salt := "W22ZaJ0SNY7soEsUEjb6gQ=="
     # a server nonce that does not extend the client nonce (relayed/forged)
     assert(scram_client_final("r=DIFFERENT,s=" + salt + ",i=4096", cfb, "pencil").is_err)
     # an iteration count below the RFC 7677 floor
     assert(scram_client_final("r=clientnonceX,s=" + salt + ",i=1", cfb, "pencil").is_err)
+    # an iteration count past the client cap is refused before any pbkdf2 runs
+    assert(scram_client_final("r=clientnonceX,s=" + salt + ",i=10000000", cfb, "pencil").is_err)
     # a SCRAM error in server-first-message surfaces, not a downstream failure
     assert(scram_client_final("e=unknown-user", cfb, "pencil").is_err)
     # a well-formed server-first still succeeds

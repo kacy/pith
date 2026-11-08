@@ -133,6 +133,17 @@ static NEXT_PROCESS_HANDLE: AtomicI64 = AtomicI64::new(1);
 static PROCESS_OUTPUT_HANDLES: OnceLock<Mutex<HashMap<i64, ProcessOutputHandle>>> = OnceLock::new();
 static NEXT_PROCESS_OUTPUT_HANDLE: AtomicI64 = AtomicI64::new(1);
 
+/// children whose handle was closed while they still ran. nobody can wait for
+/// them any more, and an exited child nobody waits for stays a zombie for the
+/// life of this process, so each later spawn and close reaps the ones that
+/// have exited since.
+static UNREAPED: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+fn reap_unreaped() {
+    // an error (no such child, say) means there is nothing left to reap
+    UNREAPED.lock().retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+}
+
 pub(crate) fn process_handles() -> &'static Mutex<HashMap<i64, ProcessHandle>> {
     PROCESS_HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -183,6 +194,7 @@ fn pith_store_process_handle(mut child: Child) -> i64 {
     // see signals::ignore_sigpipe. the child itself starts with the default
     // disposition: std resets SIGPIPE before it execs.
     crate::signals::ignore_sigpipe();
+    reap_unreaped();
     let handle = NEXT_PROCESS_HANDLE.fetch_add(1, Ordering::Relaxed);
     // the pipes are taken out of the `Child` here and owned as handles from
     // now on: `Child` never closes them again, and neither does `wait`.
@@ -563,11 +575,44 @@ pub extern "C" fn pith_process_close(handle: i64) {
             }
         }
     }
+    // a close does not stop the child, but once it exits someone has to reap
+    // it. one already reaped (`wait` ran, or `try_wait` saw it exit) is done.
+    if let Some(mut entry) = entry {
+        if let Ok(None) = entry.child.try_wait() {
+            UNREAPED.lock().push(entry.child);
+        }
+    }
+    reap_unreaped();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_closed_before_it_exits_is_reaped_later() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 0.05"])
+            .spawn()
+            .expect("sh should run");
+        let pid = child.id() as libc::pid_t;
+        let handle = pith_store_process_handle(child);
+        pith_process_close(handle);
+        let mut reaped = false;
+        for _ in 0..400 {
+            reap_unreaped();
+            if !UNREAPED.lock().iter().any(|c| c.id() as libc::pid_t == pid) {
+                reaped = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(reaped, "the closed child was never reaped");
+        // the pid is gone: a reaped child cannot be waited for again
+        // SAFETY: waitpid with WNOHANG on a pid this test spawned.
+        let rc = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(rc, -1);
+    }
 
     // unit tests never run on a green worker, so these exercise the inline arm
     // of the offload split; the pool arm is the same closure on another thread.

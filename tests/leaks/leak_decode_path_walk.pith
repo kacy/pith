@@ -1,0 +1,28 @@
+# a typed decode at a dotted path. the walk split the path into a list it
+# never released, and dropped each segment's result box without freeing it;
+# SHAPE=missing also fails on the last segment.
+import leakprobe as probe
+import std.toml as toml
+
+struct Server:
+    pub host: String
+    pub port: Int
+
+fn main():
+    n := probe.rounds()
+    shape := env("SHAPE")
+    mut path := "outer.inner"
+    if shape == "missing":
+        path = "outer.absent"
+    mut i := 0
+    mut c := 0
+    while i < n:
+        doc := "[outer.inner]\nhost = \"h" + i.to_string() + "\"\nport = 80\n"
+        r := toml.decode_text_path[Server](doc, path)
+        if r.is_ok:
+            c = c + r.ok.port
+        i = i + 1
+    if c == 0 - 1:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -1,0 +1,19 @@
+# interpolating a result straight from a call: the box was never released,
+# and a string payload was handed out as the converted part, so the fold's
+# release used the box's count. about 60 bytes leaked per result.
+import leakprobe as probe
+
+fn line(i: Int) -> Int:
+    s := "parsed: {parse_int("4" + i.to_string())} / {parse_int("x" + i.to_string())}"
+    return s.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut c := 0
+    while i < n:
+        c = c + line(i)
+        i = i + 1
+    if c == 0 - 1:
+        print("x")
+    print("{probe.peak_kb()}")

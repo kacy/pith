@@ -1,0 +1,20 @@
+# a match whose subject is a fresh result, bound bare in each arm: the box,
+# and its error string on the error arm, were never released.
+# `match parse_int(s): r if r.is_ok => ...` lost about 170 bytes a call.
+import leakprobe as probe
+
+fn matched(text: String) -> String:
+    match parse_int(text):
+        r if r.is_ok => "match ok " + r.ok.to_string()
+        r => "match err [" + r.err + "]"
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut c := 0
+    while i < n:
+        c = c + matched("12").len() + matched("x" + i.to_string()).len()
+        i = i + 1
+    if c == 0 - 1:
+        print("x")
+    print("{probe.peak_kb()}")

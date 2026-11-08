@@ -1,0 +1,46 @@
+# one name bound to a call's result in two branches. result types are not
+# interned, so the two binds carried two type ids for the same `Reply!`, the
+# emitter took them for different shapes, and the local fell back to a plain
+# shell release: the payload of every call, ok or error, was left behind.
+# std.net.grpc's unary call lost about 285 bytes a call this way.
+import leakprobe as probe
+
+struct Reply:
+    body: String
+
+struct Client:
+    base: Int
+
+impl Client:
+    fn request(i: Int) -> Reply!:
+        if (i + self.base) % 2 == 0:
+            fail "bad " + i.to_string()
+        return Reply("ok " + i.to_string())
+
+struct Conn:
+    client: Client
+
+impl Conn:
+    fn round(i: Int, traced: Bool) -> Int!:
+        if not traced:
+            resp := self.client.request(i)
+            if resp.is_err:
+                fail resp.err + "!"
+            return resp.ok.body.len()
+        resp := self.client.request(i)
+        if resp.is_err:
+            fail resp.err + "?"
+        return resp.ok.body.len()
+
+fn main():
+    n := probe.rounds()
+    conn := Conn(Client(0))
+    mut i := 0
+    mut c := 0
+    while i < n:
+        c = c + (conn.round(i, i % 5 == 0) catch 1)
+        i = i + 1
+    if c == 0 - 1:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

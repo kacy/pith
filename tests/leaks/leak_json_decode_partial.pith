@@ -1,0 +1,42 @@
+# a json decode of a struct with collection fields that fails on a later
+# field (SHAPE=late, at groups[1]) or inside the first one (SHAPE=early). the
+# fields decoded before the failure were never released: about 34 KB per
+# decode for the first document here.
+import leakprobe as probe
+import std.json as json
+
+struct Row:
+    pub id: Int
+    pub name: String
+
+struct Maybe:
+    pub cells: List[List[Int]]
+    pub scores: Map[String, Int]
+    pub rows: Map[String, Row]
+    pub lists: Map[String, List[Int]]
+    pub groups: List[Map[String, Int]]
+    pub note: String?
+
+fn main():
+    n := probe.rounds()
+    shape := env("SHAPE")
+    mut parts: List[String] := []
+    for k in 0..200:
+        parts.push("[1,2,3,4]")
+    big := parts.join(",")
+    o := chr(123)
+    c := chr(125)
+    mut i := 0
+    mut bad := 0
+    while i < n:
+        mut doc := o + "\"cells\": [" + big + "], \"scores\": " + o + "\"a\": 1" + c + ", \"rows\": " + o + c + ", \"lists\": " + o + c + ", \"groups\": [" + o + "\"g\": 1" + c + ", \"oops\"]" + c
+        if shape == "early":
+            doc = o + "\"cells\": [[1],[2],[3, \"x\"]], \"scores\": " + o + c + ", \"rows\": " + o + c + ", \"lists\": " + o + c + ", \"groups\": []" + c
+        r := json.decode_text[Maybe](doc)
+        if r.is_err:
+            bad = bad + 1
+        i = i + 1
+    if bad == 0 - 1:
+        print("x")
+    kb := probe.peak_kb()
+    print("{kb}")

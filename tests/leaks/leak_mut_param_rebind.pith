@@ -1,0 +1,34 @@
+# a `mut` parameter the body reassigns. the parameter was registered under its
+# flagged name (`p mut`), so the emitter never saw it as a parameter, never
+# made it own a count, and the value the reassignment stored was never
+# released: about 78 bytes a call here, and a P-384 key pair on every tls
+# hello retry that asked for that curve.
+import leakprobe as probe
+import std.bytes as bytes
+
+struct Pair:
+    handle: Int
+    key: Bytes
+
+fn rekey(i: Int, mut p: Pair) -> Int:
+    if i % 2 == 0:
+        p = Pair(i, bytes.from_string_utf8("k" + i.to_string()))
+    return p.key.len()
+
+fn rename(i: Int, mut s: String) -> Int:
+    if i % 3 == 0:
+        s = "n" + i.to_string()
+    return s.len()
+
+fn main():
+    n := probe.rounds()
+    base := Pair(0 - 1, bytes.from_string_utf8("x"))
+    mut i := 0
+    mut c := 0
+    while i < n:
+        c = c + rekey(i, base) + rename(i, "start")
+        i = i + 1
+    if c == 0 - 1:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

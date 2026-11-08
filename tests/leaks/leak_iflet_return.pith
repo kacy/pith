@@ -1,0 +1,25 @@
+# an if-let over a fresh optional whose body returns. the shell has to
+# outlive the binding (the payload is a tuple read through it), and the
+# early return skipped its release: about 100 bytes a call.
+import leakprobe as probe
+
+fn maybe_pair(i: Int) -> (Int, String)?:
+    if i % 3 == 0:
+        return none
+    return (i, "p" + i.to_string())
+
+fn named_pair(i: Int) -> String:
+    if let v = maybe_pair(i):
+        return "some:" + v.1
+    return "none"
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut c := 0
+    while i < n:
+        c = c + named_pair(i).len()
+        i = i + 1
+    if c == 0 - 1:
+        print("x")
+    print("{probe.peak_kb()}")

@@ -47,8 +47,8 @@ from ir_names import ir_import_target_name, ir_global_storage_symbol, ir_base_de
 from ir_method_tables import ir_func_returns, ir_impl_methods, ir_impl_method_owner, ir_impl_method_specializations, ir_impl_method_key, ir_impl_tid_key, ir_sanitize_symbol, ir_strip_type_args, ir_lookup_func_return, ir_is_declared_callable, ir_declared_callable_ir_retkind, ir_lookup_specialized_method, ir_register_one_specialized_method_name, ir_interface_decl_index, ir_assoc_bindings, ir_type_assoc_names, ir_resolve_assoc_type
 from ir_generics import ir_generic_decl_indices, ir_generic_decl_module_paths, ir_generic_specialization_by_symbol, ir_queue_generic_specialization_for_tids, ir_generic_specialization_subst_tids, ir_decode_generic_spec_subst_tids, ir_generic_specialization_keys, ir_generic_specialization_names, ir_generic_specialization_type_lists, ir_generic_emitted_specializations, ir_generic_method_owners, ir_generic_method_owner_param_counts, ir_generic_owner_param_count, ir_record_generic_function_decl, ir_record_generic_method_decl, ir_is_generic_function_name, ir_is_generic_method_name, ir_queue_generic_specialization
 # extracted lowering families (called through here, never back)
-from ir_match_emit import ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_set_match_pin, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
-from ir_decode_emit import ir_json_intern_nested_specs, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
+from ir_match_emit import ir_match_pattern_keeps_subject_free, ir_emit_match_cond, ir_emit_match_bindings, ir_emit_match_expr, ir_set_match_pin, ir_emit_if_expr, ir_emit_match_return, ir_function_tail_match, ir_unwrap_tail_match, ir_tail_match_node, ir_resolved_variant_kinds_for_tid
+from ir_decode_emit import ir_decode_last_args, ir_json_intern_nested_specs, ir_emit_config_decode_specialization_body, ir_emit_index_config_decode_call, ir_emit_json_decode_call, ir_emit_json_decode_file_call, ir_emit_json_decode_object_call, ir_emit_json_decode_object_specialization_body, ir_emit_json_decode_path_call, ir_emit_json_decode_path_specialization_body, ir_emit_json_decode_specialization_body, ir_emit_handle_decode_call, ir_emit_handle_decode_file_call, ir_emit_handle_decode_path_call, ir_emit_handle_decode_path_specialization_body, ir_emit_handle_decode_specialization_body, ir_emit_handle_decode_text_path_specialization_body, ir_emit_handle_decode_text_specialization_body
 # emission substrate: buffer, registers, call/label wrappers
 from ir_call_emit import ir_emit_call_text, ir_emit_call0, ir_emit_call1, ir_emit_call2, ir_emit_call3, ir_emit_call4, ir_emit_label, ir_last_was_ret
 from ir_ownership import ir_string_retain_reg, ir_string_release_reg, ir_rc_release_enabled, ir_kind_is_struct_header, ir_rc_retain_reg, ir_rc_release_reg, ir_rc_visit_reg, ir_kinded_code, ir_kinded_code_kind, ir_kinded_code_count, ir_kinded_tag_slot, ir_kinded_release_slot, ir_kinded_rebind
@@ -123,6 +123,76 @@ mut ir_inflight_saved_kinds: List[List[String]] := []
 fn ir_inflight_push(r: Int, kind: String):
     ir_inflight_regs.push(r)
     ir_inflight_kinds.push(kind)
+
+# take `r` out of the in-flight list wherever it is: pins are not always
+# released in the order they were taken
+fn ir_inflight_drop(r: Int):
+    mut i := ir_inflight_regs.len() - 1
+    while i >= 0:
+        if ir_inflight_regs[i] == r:
+            ir_inflight_regs.remove(i)
+            ir_inflight_kinds.remove(i)
+            return
+        i = i - 1
+
+# release an in-flight register by the kind it went in with. `result:TID` is a
+# result box this frame owns: it has no destructor, so its payload is dropped
+# with it (ir_emit_result_box_release).
+fn ir_release_inflight_kind(r: Int, kind: String):
+    if kind.starts_with("result:"):
+        ir_emit_result_box_release(r, parse_int(kind.substring(7, kind.len())) catch 0 - 1)
+        return
+    ir_rc_release_reg(r, kind)
+
+# the kind a match releases an owned fresh subject with after the taken arm,
+# when the release before the arm can't apply: the subject is a result (whose
+# bindings take no count) or an arm binds it bare, an alias of it. every arm
+# that binds it bare has to read only through the alias, the way a result
+# local's cascade requires (ir_tuple_uses_all_safe); then the subject is dead
+# once the arm's value is built. a result subject is released with its
+# payload (`result:TID`). "" when this does not apply.
+# `match parse_int(s): r if r.is_ok => ...; r => ...` leaked the box and its
+# error string every call.
+fn ir_match_alias_release(node: Node, subj_owned: Bool) -> String:
+    if not subj_owned or node.children.len() == 0:
+        return ""
+    tid := c_get_expr_type(node.children[0])
+    if tid < 0:
+        return ""
+    kind := ir_rc_kind(ir_checked_type(node.children[0]))
+    if kind.len() == 0:
+        return ""
+    info := get_type_info(tid)
+    if info.kind == "optional":
+        return ""
+    is_result := info.kind == "result"
+    mut has_bare := false
+    mut i := 1
+    while i < node.children.len():
+        arm := get_node(node.children[i])
+        if arm.children.len() > 0:
+            pat := get_node(arm.children[0])
+            if pat.kind == "pat_binding":
+                has_bare = true
+                mut j := 1
+                while j < arm.children.len():
+                    if not ir_tuple_uses_all_safe(arm.children[j], pat.value, is_result):
+                        return ""
+                    j = j + 1
+            elif not ir_match_pattern_keeps_subject_free(pat, false):
+                return ""
+        i = i + 1
+    if not is_result and not has_bare:
+        return ""
+    if is_result:
+        return "result:" + tid.to_string()
+    return kind
+
+fn ir_match_alias_track(r: Int, kind: String, entering: Bool):
+    if entering:
+        ir_inflight_push(r, kind)
+    else:
+        ir_inflight_drop(r)
 
 fn ir_inflight_pop():
     ir_inflight_regs.remove(ir_inflight_regs.len() - 1)
@@ -1340,6 +1410,10 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         return false
     if node.kind == "match_expr" or node.kind == "if_expr" or node.kind == "select_expr":
         return not ir_branch_values_are_owned(idx)
+    # `?` on a fresh optional takes a count on a counted payload before it
+    # frees the shell (ir_emit_optional_unwrap)
+    if node.kind == "unwrap" and node.children.len() > 0 and ir_unwrap_frees_shell(node.children[0]):
+        return false
     return true
 
 # a match or if expression stores each branch's value into one temp, and the
@@ -1367,7 +1441,11 @@ fn ir_branch_values_are_owned(idx: Int) -> Bool:
     for v in values:
         # a bare `none` branch lands a null, which holds no count to lend
         if not c_argument_widens_to_optional(v) and node_kind(v) != "none_lit":
-            if ir_infer_type(v) != want:
+            # the same counted kind is the same release: an empty `[]` infers
+            # `list` beside a `List[String]` whole, and refusing it made the
+            # whole a borrow whose retain stranded the fresh list
+            v_type := ir_infer_type(v)
+            if v_type != want and ir_rc_kind(v_type) != ir_rc_kind(want):
                 return false
             if not retains and ir_expr_is_borrowed(v) and not ir_select_value_is_binding(idx, v):
                 return false
@@ -1618,10 +1696,23 @@ fn ir_tuple_record_tid(name: String, val_idx: Int):
     if ir_expr_is_borrowed(val_idx) or not ir_shell_producer_transfers(val_idx):
         recorded = 0 - 1
     if ir_tuple_local_tid.contains_key(name):
-        if ir_tuple_local_tid[name] != recorded:
+        if not ir_tuple_tids_same_shape(ir_tuple_local_tid[name], recorded):
             ir_tuple_local_tid.insert(name, 0 - 1)
         return
     ir_tuple_local_tid.insert(name, recorded)
+
+# whether two binds of one name produce the same payload shape. result and
+# optional types are not interned, so `resp := c.get(a)` in two branches gives
+# two type ids for the same `Response!`; comparing ids alone marked the name
+# conflicting, and its plain shell release leaked the payload of every call.
+fn ir_tuple_tids_same_shape(a: Int, b: Int) -> Bool:
+    if a == b:
+        return true
+    if a < 0 or b < 0:
+        return false
+    if get_type_info(a).kind != get_type_info(b).kind:
+        return false
+    return ir_tuple_cascade_signature(a) == ir_tuple_cascade_signature(b)
 
 # the runtime getters that build an optional shell around a payload they do
 # NOT own a count on: the map's stored value, the list's element. the shell is
@@ -2902,7 +2993,7 @@ fn ir_emit_result_arg_release_helpers():
 # zero-stores each tracked name, so the loads are valid on every path.
 fn ir_emit_rc_cleanup(exclude: String):
     for r, ri in ir_inflight_regs:
-        ir_rc_release_reg(r, ir_inflight_kinds[ri])
+        ir_release_inflight_kind(r, ir_inflight_kinds[ri])
     mut i := 0
     while i < ir_rc_locals.len():
         name := ir_rc_locals[i]
@@ -3721,6 +3812,21 @@ fn ir_unpin_operand(reg: Int, kind: String):
     if kind.len() > 0:
         ir_rc_release_reg(reg, kind)
 
+# the same pin, kept in flight until ir_unpin_inflight: the expression it
+# guards can leave the function (an index miss, a `!`), and the early exit
+# releases the pin with the locals. `self.conns[self.choose()]` leaked the
+# pinned list on a miss.
+fn ir_pin_inflight(expr_idx: Int, reg: Int, later_drops: Bool) -> String:
+    kind := ir_pin_operand(expr_idx, reg, later_drops)
+    if kind.len() > 0:
+        ir_inflight_push(reg, kind)
+    return kind
+
+fn ir_unpin_inflight(reg: Int, kind: String):
+    if kind.len() > 0:
+        ir_inflight_drop(reg)
+    ir_unpin_operand(reg, kind)
+
 # the argument expressions of a call or method node from start_idx on, in the
 # order the collectors below evaluate them
 fn ir_call_operand_exprs(node: Node, start_idx: Int) -> List[Int]:
@@ -3763,6 +3869,7 @@ fn ir_callee_runs_user_code(callee_idx: Int) -> Bool:
 fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List[Int], pin: Bool, pins: List[String]) -> List[Int]:
     later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, start_idx))
     mut arg_regs: List[Int] := []
+    mut inflight := 0
     for child, i in node.children:
         if i < start_idx:
             continue
@@ -3779,6 +3886,9 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List
             arg_r := ir_emit_call_arg(expr_idx)
             ir_pin_arg(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
             arg_regs.push(arg_r)
+            if ir_inflight_operand(expr_idx, arg_r, pins[pins.len() - 1]):
+                inflight = inflight + 1
+    ir_inflight_pop_n(inflight)
     return arg_regs
 
 # owned string arguments (fresh chars from s[i], concat results, fresh
@@ -4757,6 +4867,21 @@ fn ir_release_owned_optional_operand(operand_idx: Int, shell_r: Int):
     if ir_optional_subject_is_owned(operand_idx):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", shell_r)
 
+# whether `?` on the optional at idx releases its shell once the payload is
+# out: a fresh one nothing else names (ir_optional_subject_is_owned). a weak
+# read has its own release above.
+fn ir_unwrap_frees_shell(idx: Int) -> Bool:
+    return ir_optional_subject_is_owned(idx) and not ir_node_is_weak_field_read(idx)
+
+# the rc kind of an optional type's payload, or "" for a plain one
+fn ir_optional_payload_rc_kind(opt_tid: Int) -> String:
+    if opt_tid < 0:
+        return ""
+    info := get_type_info(opt_tid)
+    if info.kind != "optional" or info.inner < 0:
+        return ""
+    return ir_rc_kind(ir_type_from_tid(info.inner))
+
 fn ir_emit_optional_unwrap(node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
     opt_tid := c_get_expr_type(node.children[0])
@@ -4771,9 +4896,21 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
     if weak_shell:
         # extracted the borrowed target above; the shell is now dead on this path.
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
+    elif ir_unwrap_frees_shell(node.children[0]):
+        # a fresh shell (a call's) dies here: `v := maybe(n)?` leaked one per
+        # call. a counted payload takes its own count first, since the shell
+        # releases its own with it, and the unwrap answers owned
+        # (ir_expr_is_borrowed).
+        payload_kind := ir_optional_payload_rc_kind(opt_tid)
+        if payload_kind.len() > 0:
+            ir_rc_retain_reg(decoded_r, payload_kind)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     ir_emit("jmp " + merge_l)
     ir_emit_label(none_l)
-    if weak_shell:
+    # a none is usually no allocation, but a bound `none` is a two-slot shell
+    # with its flag clear, and a function can hand one back; releasing a null
+    # does nothing
+    if weak_shell or ir_unwrap_frees_shell(node.children[0]):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", recv_r)
     if ir_emit_tests and ir_emitting_test_func:
         ir_test_assert_fail_return()
@@ -4797,6 +4934,7 @@ fn ir_emit_optional_unwrap(node: Node) -> Int:
 fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> List[Int]:
     later_drops := ir_later_operands_drop(ir_call_operand_exprs(node, 0))
     mut regs: List[Int] := []
+    mut inflight := 0
     for child, i in node.children:
         mut expr_idx := child
         if i > 0 and node_kind(child) == "arg":
@@ -4811,6 +4949,9 @@ fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> Lis
             r = ir_emit_call_arg(expr_idx)
         ir_pin_arg(expr_idx, r, pins, pin or later_drops[regs.len()])
         regs.push(r)
+        if ir_inflight_operand(expr_idx, r, pins[pins.len() - 1]):
+            inflight = inflight + 1
+    ir_inflight_pop_n(inflight)
     return regs
 
 # {x:8.2}-style parts: convert with precision when asked, then pad.
@@ -4920,7 +5061,11 @@ fn ir_string_interp_expr_part(expr_idx: Int) -> Int:
     if part_tid >= 0:
         part_info := get_type_info(part_tid)
         if part_info.kind == "result":
-            return ir_emit_result_value_to_string(part_r, part_tid)
+            # a fresh result box (a call's) dies once rendered, its payload
+            # with it: `"{parse_int(s)}"` leaked the box every time
+            text_r := ir_emit_result_value_to_string(part_r, part_tid)
+            ir_release_fresh_result_arg(expr_idx, part_r)
+            return text_r
         if part_info.kind == "optional":
             text_r := ir_emit_optional_value_to_string(part_r, part_tid)
             # a fresh shell (a call result, a weak read) is the part's own
@@ -5171,7 +5316,41 @@ fn ir_owned_operand_kind(expr_idx: Int, expr_type: String) -> String:
         return expr_type
     if ir_expr_is_fresh_string_index(expr_idx) or ir_expr_is_transferred_call_temp(expr_idx):
         return "string"
+    kind := ir_rc_kind(expr_type)
+    if ir_owned_arg_kind_releases(kind) and not ir_expr_is_borrowed(expr_idx):
+        return kind
     return ""
+
+# put the operand just emitted for a call in flight while the operands after
+# it are built, so a `!` among them that leaves the function releases it with
+# the locals: its own count when it is owned, or the pin's (`pin_kind`). the
+# answer is whether it went in, for ir_inflight_pop_n.
+# `token.sign(key()!)` leaked the receiver when key() failed.
+fn ir_inflight_operand(expr_idx: Int, r: Int, pin_kind: String) -> Bool:
+    mut kind := pin_kind
+    if kind.len() == 0:
+        kind = ir_owned_operand_kind(expr_idx, ir_infer_type(expr_idx))
+    if kind.len() == 0:
+        return false
+    ir_inflight_push(r, kind)
+    return true
+
+# a struct field's value holds a count once it is built (its own, or the
+# retain a borrowed one took), so it is in flight until the struct is
+# allocated: `Keys(derive(a)!, derive(b)!)` leaked the first key when the
+# second failed. an optional field is left out, as in the operand release.
+# the answer is 1 when it went in.
+fn ir_inflight_field_value(r: Int, kind: String) -> Int:
+    if kind.len() == 0 or kind == "tuple":
+        return 0
+    ir_inflight_push(r, kind)
+    return 1
+
+fn ir_inflight_pop_n(n: Int):
+    mut left := n
+    while left > 0:
+        ir_inflight_pop()
+        left = left - 1
 
 fn ir_release_owned_operand(expr_idx: Int, reg: Int, expr_type: String):
     if expr_type == "string" and not ir_expr_is_borrowed(expr_idx):
@@ -5733,6 +5912,9 @@ fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
             # boxed enum values are pointers; a raw eq is identity, not
             # equality; call the per-enum structural helper
             ir_emit_call2(r, "__enum_eq_" + ir_binary_enum_eq_name(node), "bool", left_r, right_r)
+            # a box built for the comparison (`s == Wrap.Plain`) dies with it
+            ir_release_owned_operand(node.children[0], left_r, left_type)
+            ir_release_owned_operand(node.children[1], right_r, right_type)
         else:
             ir_emit_simple_binary(r, "eq", left_r, right_r)
     elif op == "neq":
@@ -5742,6 +5924,8 @@ fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
             zr := ir_reg()
             ir_emit("iconst " + zr.to_string() + " 0")
             ir_emit("eq " + r.to_string() + " " + eq_r.to_string() + " " + zr.to_string())
+            ir_release_owned_operand(node.children[0], left_r, left_type)
+            ir_release_owned_operand(node.children[1], right_r, right_type)
         else:
             ir_emit_binary_neq(r, left_r, right_r, is_str_op, is_bytes_op)
             if is_str_op:
@@ -6332,10 +6516,16 @@ fn ir_emit_index_decode_call(idx: Int, node: Node, callee_idx: Int, callee_node:
     json_r := ir_emit_index_json_decode_call(idx, node, callee_idx)
     if json_r >= 0:
         return json_r
-    config_r := ir_emit_index_config_decode_call(idx, node, callee_idx, ir_expr, ir_emit_value_for_target)
-    if config_r >= 0:
-        return config_r
-    return ir_emit_index_handle_decode_call(idx, node, callee_idx, callee_node)
+    # the config and handle decodes read their arguments and leave them: an
+    # owned one dies with the decode like any call argument.
+    # `config.decode[T](config.from_map(m))` leaked the Config every time.
+    ir_decode_last_args = []
+    mut r := ir_emit_index_config_decode_call(idx, node, callee_idx, ir_expr, ir_emit_value_for_target)
+    if r < 0:
+        r = ir_emit_index_handle_decode_call(idx, node, callee_idx, callee_node)
+    if r >= 0:
+        ir_release_owned_args(node, 1, ir_decode_last_args)
+    return r
 
 fn ir_static_struct_init_call(idx: Int, node: Node, callee_name: String) -> Int:
     expr_tid := c_get_expr_type(idx)
@@ -6548,12 +6738,20 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
     # and may be reached from a test block or from ordinary code, and it has to
     # mean the same thing on both paths. a module that declares its own function
     # by one of these names keeps it; ir_is_declared_callable is that check.
+    # a passing assertion releases its owned arguments like any call: the
+    # failing path ends the process. `assert_eq(encoding.to_hex(tag), want)`
+    # leaked the hex string on every pass.
+    mut assert_r := 0 - 1
     if callee.name == "assert" and arg_regs.len() >= 1 and not ir_is_declared_callable("assert"):
-        return ir_emit_test_assert(node, arg_regs)
-    if callee.name == "assert_eq" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_eq"):
-        return ir_emit_test_assert_eq(node, arg_regs, true)
-    if callee.name == "assert_ne" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_ne"):
-        return ir_emit_test_assert_eq(node, arg_regs, false)
+        assert_r = ir_emit_test_assert(node, arg_regs)
+    elif callee.name == "assert_eq" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_eq"):
+        assert_r = ir_emit_test_assert_eq(node, arg_regs, true)
+    elif callee.name == "assert_ne" and arg_regs.len() >= 2 and not ir_is_declared_callable("assert_ne"):
+        assert_r = ir_emit_test_assert_eq(node, arg_regs, false)
+    if assert_r >= 0:
+        ir_release_owned_args(node, 1, arg_regs)
+        ir_unpin_args(arg_regs, arg_pins)
+        return assert_r
 
     mut r := ir_reg()
     uses_result_abi := ir_callee_uses_result_abi(callee, idx)
@@ -6590,11 +6788,14 @@ fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_tar
         return
     k_r := ir_expr(entry.children[0])
     k_pin := ir_pin_operand(entry.children[0], k_r, not ir_subtree_keeps_storage(entry.children[1], 0 - 1, 0 - 1))
+    key_inflight := ir_inflight_operand(entry.children[0], k_r, k_pin)
     # wrap the value to its declared kind so an optional value type
     # stores Some(v), not the raw v, the same fix collection element
     # literals need (a map literal typed Map[K, Int?] otherwise stored
     # bare ints and a later .value() dereferenced one as a heap tuple).
     v_r := ir_emit_value_for_target_inner(entry.children[1], val_target, val_inner)
+    if key_inflight:
+        ir_inflight_drop(k_r)
     # a heap value written straight into a literal is stored the same way one
     # written into `m[k]` is: the kind travels with it so the map owns what it
     # holds. without this `{k: inner}` left the map a bare handle whose only
@@ -6682,8 +6883,10 @@ fn ir_emit_map_literal(idx: Int, node: Node) -> Int:
         ir_emit_call0(map_r, "__map_new_str_val", "map")
     else:
         ir_emit_call0(map_r, "__map_new", "map")
+    ir_inflight_push(map_r, "map")
     for child in node.children:
         ir_emit_map_entry_insert(map_r, store_name, get_node(child), val_target, val_inner)
+    ir_inflight_drop(map_r)
     return map_r
 
 fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
@@ -6695,6 +6898,7 @@ fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
     if checked == "set_int" or checked == "set":
         literal_type = ir_bytes_keyed_type(idx, checked)
     ir_emit_call0(set_r, ir_set_new_name(literal_type), ir_normalize_collection_target(literal_type))
+    ir_inflight_push(set_r, "set")
     for child in node.children:
         elem_r := ir_expr(child)
         ir_emit_call2(ir_reg(), ir_set_add_name(literal_type), "void", set_r, elem_r)
@@ -6704,6 +6908,7 @@ fn ir_emit_set_literal(idx: Int, node: Node) -> Int:
         # path; the literal had no such path and stranded one element per
         # entry, which is why the same set built by adding was flat.
         ir_release_owned_operand(child, elem_r, ir_infer_type(child))
+    ir_inflight_drop(set_r)
     return set_r
 
 # the list store that carries the element's kind with it, or "" when this is
@@ -6931,6 +7136,9 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # at that owner's scope), so only release non-borrowed elements. untagged
     # (primitive) lists don't retain, so nothing to drop.
     retaining := ctor != "__list_new"
+    # the list is in flight while its elements are built: `[a()!, b()!]`
+    # leaked the list holding a's value when b failed
+    ir_inflight_push(list_r, "list")
     for child in node.children:
         elem_r := ir_emit_value_for_target_inner(child, elem_target, elem_inner)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
@@ -6940,6 +7148,7 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
         # once the list holds its own count.
         if retaining and (elem_kind == "tuple" or not ir_expr_is_borrowed(child)):
             ir_rc_release_reg(elem_r, elem_kind)
+    ir_inflight_drop(list_r)
     return list_r
 
 fn ir_emit_tuple_literal_stores(tuple_r: Int, elem_regs: List[Int], elem_nodes: List[Int]):
@@ -7053,6 +7262,7 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
     # every element is evaluated before the stores take their counts
     later_drops := ir_later_operands_drop(node.children)
     mut elem_pins: List[String] := []
+    mut inflight := 0
     for child, ci in node.children:
         cn := get_node(child)
         if cn.kind == "none_lit":
@@ -7065,7 +7275,10 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
             elem_r := ir_expr(child)
             elem_regs.push(elem_r)
             elem_pins.push(ir_pin_operand(child, elem_r, later_drops[ci]))
+            if ir_inflight_operand(child, elem_r, elem_pins[elem_pins.len() - 1]):
+                inflight = inflight + 1
         elem_nodes.push(child)
+    ir_inflight_pop_n(inflight)
     r := ir_reg()
     nf := ir_reg()
     ir_emit("iconst " + nf.to_string() + " " + elem_regs.len().to_string())
@@ -7183,6 +7396,11 @@ fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant
         # instance whose concrete types decide whether a payload is retained.
         kinds = ir_resolved_variant_kinds_for_tid(c_get_expr_type(idx), variant_key, ir_enum_payload_kinds[variant_key].split(","))
     r := ir_emit_variant_alloc(enum_name, variant_key, kinds.len(), c_get_expr_type(idx))
+    # the box is built before its payloads, so it is in flight while they
+    # are: `Reply.Integer(parse_int(body)!)` leaked the box when the parse
+    # failed. its destructor releases the payloads stored so far, and the
+    # slots not stored yet are still zero.
+    ir_inflight_push(r, "struct")
     mut i := 0
     while i < kinds.len():
         arg_idx := ir_method_call_arg_expr(node, i)
@@ -7202,6 +7420,7 @@ fn ir_emit_variant_construction(idx: Int, node: Node, enum_name: String, variant
                 ir_rc_retain_reg(arg_r, payload_kind)
             ir_emit("sstore " + r.to_string() + " " + (i + 1).to_string() + " " + arg_r.to_string())
         i = i + 1
+    ir_inflight_drop(r)
     return r
 
 # `pre_obj_r` is the receiver register when the caller already evaluated it (the
@@ -7846,6 +8065,16 @@ fn ir_emit_result_unwrap_or(idx: Int, node: Node) -> Int:
     ir_emit("load " + r.to_string() + " " + temp_name)
     return r
 
+# a result payload rendered as text the caller owns. a string payload renders
+# as itself, still the box's, so it takes a count of its own: the caller
+# releases what it gets back (an interpolation's fold does), and that release
+# used the box's count, so the box then held a freed string.
+fn ir_owned_payload_text(value_r: Int, value_tid: Int) -> Int:
+    text_r := ir_emit_stringify_value(value_r, value_tid)
+    if text_r == value_r and ir_type_from_tid(value_tid) == "string":
+        ir_string_retain_reg(text_r)
+    return text_r
+
 fn ir_emit_result_value_to_string(recv_r: Int, recv_tid: Int) -> Int:
     mut ok_tid := 0 - 1
     mut err_tid := 0 - 1
@@ -7862,11 +8091,11 @@ fn ir_emit_result_value_to_string(recv_r: Int, recv_tid: Int) -> Int:
     ir_emit("brif " + cond_r.to_string() + " " + ok_l + " " + err_l)
     ir_emit_label(ok_l)
     ok_r := ir_emit_result_value_field(recv_r, recv_tid, "ok")
-    ir_emit("store " + temp_name + " " + ir_emit_stringify_value(ok_r, ok_tid).to_string())
+    ir_emit("store " + temp_name + " " + ir_owned_payload_text(ok_r, ok_tid).to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(err_l)
     err_r := ir_emit_result_value_field(recv_r, recv_tid, "err")
-    ir_emit("store " + temp_name + " " + ir_emit_stringify_value(err_r, err_tid).to_string())
+    ir_emit("store " + temp_name + " " + ir_owned_payload_text(err_r, err_tid).to_string())
     ir_emit_label(merge_l)
     r := ir_reg()
     ir_emit("load " + r.to_string() + " " + temp_name)
@@ -7944,7 +8173,9 @@ fn ir_emit_stringify_value(value_r: Int, value_tid: Int) -> Int:
 fn ir_emit_result_to_string(node: Node) -> Int:
     recv_r := ir_expr(node.children[0])
     recv_tid := c_get_expr_type(node.children[0])
-    return ir_emit_result_value_to_string(recv_r, recv_tid)
+    text_r := ir_emit_result_value_to_string(recv_r, recv_tid)
+    ir_release_fresh_result_arg(node.children[0], recv_r)
+    return text_r
 
 fn ir_emit_named_handler_call(handler_idx: Int, arg_r: Int, ret_type: String) -> Int:
     handler_node := get_node(handler_idx)
@@ -9361,6 +9592,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
     total_fields := ir_ctor_field_count(sname, tid)
     mut field_regs: List[Int] := []
     mut field_idx := 0
+    mut inflight := 0
     while field_idx < total_fields:
         field_name := ir_ctor_field_name_at(sname, tid, field_idx)
         field_type := ir_ctor_field_type_name(sname, tid, field_name)
@@ -9386,6 +9618,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
             # ir_emit_value_for_target, so they must not be retained again.
             if named_field_kind.len() > 0 and named_field_kind != "tuple" and ir_expr_is_borrowed(value_node):
                 ir_rc_retain_reg(fr, named_field_kind)
+            inflight = inflight + ir_inflight_field_value(fr, named_field_kind)
             field_regs.push(fr)
         else:
             default_idx := ir_struct_field_default_node(sname, field_name)
@@ -9394,6 +9627,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
             else:
                 field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
+    ir_inflight_pop_n(inflight)
 
     r := ir_reg()
     field_count_r := ir_reg()
@@ -9409,6 +9643,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
         return ir_emit_struct_named_init(sname, arg_nodes, tid)
     mut field_regs: List[Int] := []
     mut field_idx := 0
+    mut inflight := 0
     while field_idx < arg_nodes.len():
         child := arg_nodes[field_idx]
         cn := get_node(child)
@@ -9428,8 +9663,10 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
         # tuple-typed (optional) field values arrive already owned; don't retain.
         if pos_field_kind.len() > 0 and pos_field_kind != "tuple" and ir_expr_is_borrowed(value_idx):
             ir_rc_retain_reg(fr, pos_field_kind)
+        inflight = inflight + ir_inflight_field_value(fr, pos_field_kind)
         field_regs.push(fr)
         field_idx = field_idx + 1
+    ir_inflight_pop_n(inflight)
     total_fields := ir_ctor_field_count(sname, tid)
     while field_idx < total_fields:
         field_name := ir_ctor_field_name_at(sname, tid, field_idx)
@@ -9722,20 +9959,25 @@ fn ir_emit_index_expr(idx: Int, node: Node) -> Int:
     # may have been its last owner; ir_expr_is_borrowed calls it owned to
     # match. before this every such read leaked the whole container.
     if ir_index_container_is_owned_temp(node.children[0]):
+        # the temporary is in flight while the key is built and the read
+        # can miss, both of which can leave the function
+        temp_kind := ir_rc_kind(ir_infer_type(node.children[0]))
+        ir_inflight_push(obj_r, temp_kind)
         read_r := ir_emit_index_read(idx, node, obj_r)
+        ir_inflight_drop(obj_r)
         if ir_index_reads_owned_element(idx):
             ir_rc_retain_reg(read_r, ir_rc_kind(ir_infer_type(idx)))
-        ir_rc_release_reg(obj_r, ir_rc_kind(ir_infer_type(node.children[0])))
+        ir_rc_release_reg(obj_r, temp_kind)
         return read_r
     # `o.items[shrink(o)]`: a key that can drop the container read before it
     # pins the container for the read. the element then takes a count of its
     # own before the pin goes, since the pin may have been the container's
     # last, and ir_index_read_is_pinned tells the consumer it arrives owned.
-    obj_pin := ir_pin_operand(node.children[0], obj_r, not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1))
+    obj_pin := ir_pin_inflight(node.children[0], obj_r, not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1))
     if obj_pin.len() > 0:
         read_r := ir_emit_index_read(idx, node, obj_r)
         ir_rc_retain_reg(read_r, ir_rc_kind(ir_infer_type(idx)))
-        ir_unpin_operand(obj_r, obj_pin)
+        ir_unpin_inflight(obj_r, obj_pin)
         return read_r
     return ir_emit_index_read(idx, node, obj_r)
 
@@ -10050,9 +10292,9 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
 
     later_drops := ir_later_operands_drop([target.children[0], target.children[1], value_idx])
     obj_r := ir_expr(target.children[0])
-    obj_pin := ir_pin_operand(target.children[0], obj_r, later_drops[0])
+    obj_pin := ir_pin_inflight(target.children[0], obj_r, later_drops[0])
     idx_r := ir_expr(target.children[1])
-    idx_pin := ir_pin_operand(target.children[1], idx_r, later_drops[1])
+    idx_pin := ir_pin_inflight(target.children[1], idx_r, later_drops[1])
     mut obj_type := ir_checked_type(target.children[0])
     mut value_type := ir_checked_index_type(target_idx)
     if obj_type.len() == 0:
@@ -10103,8 +10345,8 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
         tag_r := ir_emit_element_tag_const(idx_store_kind)
         ir_emit_call4(ir_reg(), idx_kind_store, "void", obj_r, idx_r, value_r, tag_r)
         ir_release_owned_index_key(target.children[1], idx_r)
-        ir_unpin_operand(obj_r, obj_pin)
-        ir_unpin_operand(idx_r, idx_pin)
+        ir_unpin_inflight(obj_r, obj_pin)
+        ir_unpin_inflight(idx_r, idx_pin)
         return true
     if not idx_borrowed and ir_container_store_takes_count(idx_store_kind):
         # `m[k] = "v-{i}"` builds a value nobody else tracks. the store takes
@@ -10131,8 +10373,8 @@ fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # different question: the container retains that, and it stays under the
     # container-store exception in docs/ownership.md.
     ir_release_owned_index_key(target.children[1], idx_r)
-    ir_unpin_operand(obj_r, obj_pin)
-    ir_unpin_operand(idx_r, idx_pin)
+    ir_unpin_inflight(obj_r, obj_pin)
+    ir_unpin_inflight(idx_r, idx_pin)
     return true
 
 # --- expression lowering ---
@@ -10420,15 +10662,15 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         if pin_kind.len() > 0:
             ir_set_match_pin(pin_name, pin_kind)
         if idx == ir_tail_match_node:
-            ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block, subj_owned)
+            ir_emit_match_return(idx, node, ir_expr, ir_emit_return_value, ir_block, subj_owned, ir_match_alias_release(node, subj_owned), ir_match_alias_track, ir_release_inflight_kind)
             return ir_zero_reg()
         # arm values go through the call-argument emitter: a plain value in
         # an arm the checker settled on an optional (`none => none; x => x`)
         # is recorded as widening, and the Some is built here rather than the
         # bare value landing in a slot every reader takes for a shell.
         if ir_branches_take_counts(idx):
-            return ir_emit_match_expr(idx, node, ir_emit_call_arg, ir_emit_owned_branch_value, ir_block, subj_owned)
-        return ir_emit_match_expr(idx, node, ir_emit_call_arg, ir_emit_call_arg, ir_block, subj_owned)
+            return ir_emit_match_expr(idx, node, ir_emit_call_arg, ir_emit_owned_branch_value, ir_block, subj_owned, ir_match_alias_release(node, subj_owned), ir_match_alias_track, ir_release_inflight_kind)
+        return ir_emit_match_expr(idx, node, ir_emit_call_arg, ir_emit_call_arg, ir_block, subj_owned, ir_match_alias_release(node, subj_owned), ir_match_alias_track, ir_release_inflight_kind)
     if kind == "if_expr":
         if ir_branches_take_counts(idx):
             return ir_emit_if_expr(node, ir_emit_call_arg, ir_emit_owned_branch_value)
@@ -11404,6 +11646,11 @@ fn ir_discard_chain_root(idx: Int) -> Int:
 fn ir_stmt_discards_owned_value(kind: String) -> Bool:
     if kind == "call" or kind == "method_call":
         return true
+    # a catch hands back an owned value on both arms (ir_expr_is_borrowed),
+    # so `compile(src) catch: return true` threw away a Template every time
+    # the compile succeeded
+    if kind == "catch_expr" or kind == "catch_block":
+        return true
     return kind == "try" or kind == "try_expr" or kind == "await"
 
 # the rc kinds a discarded statement value is the statement's to release. the
@@ -11599,7 +11846,16 @@ fn ir_emit_if_let_stmt(node: Node):
     early_release := owns_subject and ir_let_subject_releases_early(node.children[1])
     if early_release:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
+    # a shell that has to outlive the binding (the payload is read through
+    # it) is in flight while the body runs, so a body that returns releases
+    # it in the exit cleanup, after the returned value took its own count.
+    # `if let v = maybe_pair(i): return "some:" + v.1` leaked it every call.
+    late_shell := owns_subject and not early_release
+    if late_shell:
+        ir_inflight_push(subj_r, "tuple")
     ir_block(node.children[2])
+    if late_shell:
+        ir_inflight_drop(subj_r)
     if not ir_last_was_ret:
         ir_emit("jmp " + end_l)
     ir_emit_label(else_l)
@@ -12216,9 +12472,16 @@ fn ir_record_closure_param_return(param_idx: Int):
 
 fn ir_emit_named_param(name: String, param_type: String):
     r := ir_reg()
-    ir_var_regs.insert(name, r)
+    # a `mut` parameter's node value carries the flag (`p mut`), which the
+    # consumer reads off the param line. the name the body uses is the bare
+    # one: keyed with the flag, nothing could find the parameter, so a body
+    # that reassigned it never took ownership of the new value and leaked it.
+    mut bare := name
+    if bare.ends_with(" mut"):
+        bare = bare.substring(0, bare.len() - 4)
+    ir_var_regs.insert(bare, r)
     if param_type.len() > 0:
-        ir_var_types.insert(name, param_type)
+        ir_var_types.insert(bare, param_type)
     ir_emit("param " + name)
 
 fn ir_emit_fn_params(fn_idx: Int):

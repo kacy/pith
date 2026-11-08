@@ -150,7 +150,7 @@ fn predefined_tables() -> List[fse.FseTable]:
 # byte naming the only symbol, and needs no table — it borrows the shared
 # predefined table as a placeholder, the same way repeat mode borrows the
 # previous block's.
-fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, default_table: fse.FseTable, max_symbol: Int, prev: List[fse.FseTable], prev_rle: List[Int]) -> (fse.FseTable, Int, Int)!:
+fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, default_table: fse.FseTable, max_symbol: Int, max_log: Int, prev: List[fse.FseTable], prev_rle: List[Int]) -> (fse.FseTable, Int, Int)!:
     if mode == MODE_PREDEFINED:
         return (default_table, 0, -1)
     if mode == MODE_RLE:
@@ -158,7 +158,7 @@ fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, default_table: fse
             fail "zstd: truncated rle symbol"
         return (default_table, 1, data[pos])
     if mode == MODE_FSE:
-        desc := fse.read_ncount(data, pos, end, max_symbol)!
+        desc := fse.read_ncount(data, pos, end, max_symbol, max_log)!
         return (fse.build_decode_table(desc.counts, desc.log), desc.bytes_used, -1)
     # repeat mode: whatever this stream used in the previous block of the
     # frame, carried forward rather than re-described.
@@ -195,11 +195,11 @@ pub fn read_tables(data: Bytes, off: Int, end: Int, previous: List[SequenceTable
     mut pos := off + 1
     predef := predefined_tables()
     # the descriptions appear in this order regardless of the modes.
-    ll_built := build_for_mode(ll_mode, data, pos, end, predef[0], 35, prev_ll, prev_ll_rle)!
+    ll_built := build_for_mode(ll_mode, data, pos, end, predef[0], 35, 9, prev_ll, prev_ll_rle)!
     pos = pos + ll_built.1
-    of_built := build_for_mode(of_mode, data, pos, end, predef[1], 31, prev_of, prev_of_rle)!
+    of_built := build_for_mode(of_mode, data, pos, end, predef[1], 31, 8, prev_of, prev_of_rle)!
     pos = pos + of_built.1
-    ml_built := build_for_mode(ml_mode, data, pos, end, predef[2], 52, prev_ml, prev_ml_rle)!
+    ml_built := build_for_mode(ml_mode, data, pos, end, predef[2], 52, 9, prev_ml, prev_ml_rle)!
     pos = pos + ml_built.1
 
     tables := SequenceTables(ll_built.0, ml_built.0, of_built.0, ll_built.2, ml_built.2, of_built.2)

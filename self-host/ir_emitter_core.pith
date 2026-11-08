@@ -5164,6 +5164,15 @@ fn ir_binary_op_is_comparison(simple_op: String) -> Bool:
 # consumed it emits. this is the loop-condition reclaim: `while s[i] == ":"` builds a fresh
 # char every iteration, and the release lands in the same block as the
 # compare, so dominance is never in question.
+# the kind ir_release_owned_operand releases the operand at expr_idx under
+# when the value operator is done with it, or "" when it releases nothing
+fn ir_owned_operand_kind(expr_idx: Int, expr_type: String) -> String:
+    if (expr_type == "string" or expr_type == "bytes") and not ir_expr_is_borrowed(expr_idx):
+        return expr_type
+    if ir_expr_is_fresh_string_index(expr_idx) or ir_expr_is_transferred_call_temp(expr_idx):
+        return "string"
+    return ""
+
 fn ir_release_owned_operand(expr_idx: Int, reg: Int, expr_type: String):
     if expr_type == "string" and not ir_expr_is_borrowed(expr_idx):
         ir_string_release_reg(reg)
@@ -5577,7 +5586,18 @@ fn ir_emit_binary_expr(node: Node) -> Int:
         return ir_emit_short_circuit_logic(node)
     left_r := ir_emit_binary_operand(node.children[0], node.value)
     left_pin := ir_pin_operand(node.children[0], left_r, not ir_subtree_keeps_storage(node.children[1], 0 - 1, 0 - 1))
+    # the left operand's count, its own or a pin's, is in flight while the
+    # right operand is built: a `!` or an index miss in there leaves the
+    # function, and the early exit releases it with the locals.
+    # `n.to_string() + " " + xs[0]` leaked the left string when xs was empty.
+    mut left_kind := left_pin
+    if left_kind.len() == 0:
+        left_kind = ir_owned_operand_kind(node.children[0], ir_infer_type(node.children[0]))
+    if left_kind.len() > 0:
+        ir_inflight_push(left_r, left_kind)
     right_r := ir_emit_binary_operand(node.children[1], node.value)
+    if left_kind.len() > 0:
+        ir_inflight_pop()
     r := ir_reg()
     # Optional-typed `==` / `!=` compares by (is_some, value), not by pointer
     # identity, and has several shapes; try it before the value operators.

@@ -336,6 +336,7 @@ http.serve_connection_with(reader, writer, handler, config)!
 | `max_body_bytes` | `MAX_REQUEST_BODY` | the request body, declared or chunked, answered with `413` past it |
 | `keep_alives` | true | false closes the connection after every response |
 | `max_requests_per_conn` | 0 | close after this many responses; 0 for no limit |
+| `stream_request_bodies` | false | true hands the body to the handler as it arrives (see [streaming request bodies](#streaming-request-bodies)) |
 
 a timeout of 0 means none, so `server_config()` matches what the plain entry
 points (`serve_connection_fd`, `serve_connection_tls`, `serve_connection`) have
@@ -500,6 +501,71 @@ print(out.bytes().len().to_string())
 the streamed body size. the body itself goes straight into the writer.
 
 `send_into(...)` follows redirects the same way `send()` does.
+
+## streaming request bodies
+
+the server normally reads a request's whole body before the handler runs, up
+to `max_body_bytes`. with `with_stream_request_bodies(true)`, an http/1.1
+handler runs as soon as the head is in, with an empty `body`, and reads the
+body itself with `http.read_body_part(max)`. each call returns up to `max`
+bytes as soon as any arrive, sized or chunked, and an empty `Bytes` at the end:
+
+```pith
+fn save_body(path: String) -> Int!:
+    out := fs.create(path)!
+    defer out.close()
+    mut total := 0
+    while true:
+        part := http.read_body_part(65536)!
+        if part.is_empty():
+            return total
+        total = total + out.write_all_bytes(part)!
+    return total
+
+fn upload(req: http.HttpRequestBytes) -> http.HttpResponse:
+    if save_body("upload.bin").is_err:
+        return http.bad_request_response()
+    return http.no_content()
+
+config := http.server_config().with_stream_request_bodies(true)
+```
+
+`max_body_bytes` does not apply, since the handler decides how much it keeps.
+a body the handler leaves unread is drained after it returns, up to 256 KiB,
+so the next request on the connection is read from the right place. a body
+with more than that left, or one that failed partway, closes the connection
+after the response. an `Expect: 100-continue` request still gets its interim
+response before the handler runs.
+
+http/2 requests are read whole as before, and `read_body_part` returns empty
+for them, so a handler that serves both should read `req.body` when the first
+part comes back empty.
+
+## taking over a connection
+
+a handler can take the raw http/1.1 connection, to copy bytes between it and
+an upstream for a websocket or any other upgrade:
+
+```pith
+fn upgrade(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.take_connection(fn(read: fn(Int) -> Bytes!, write: fn(Bytes) -> Int!) -> Int! => relay(read, write))
+```
+
+the server sends nothing for that request. it clears the connection's read and
+write deadlines and calls the function on the same task with `read(n)`, which
+returns up to `n` bytes as soon as any arrive and an empty `Bytes` at the end
+of input, and `write(data)`, which sends all of `data`. the function writes
+whatever answer the protocol needs, such as a `101`, and the connection closes
+when it returns. it works the same over tls.
+
+call `read` only on the task the function runs on, because the connection's
+reader may already hold bytes that arrived behind the request head. `write`
+goes straight to the socket or the tls connection, so a task the function
+spawns, such as one copying the other direction, can call it.
+
+http/2 has no upgrade. there, and wherever a middleware replaced the handler's
+response, the `501` that `take_connection` returns is sent instead.
+`examples/gateway/tunnel.pith` uses this to proxy websockets.
 
 ## serving files and content
 

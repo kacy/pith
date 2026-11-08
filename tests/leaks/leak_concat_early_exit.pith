@@ -1,0 +1,28 @@
+# a concatenation whose right operand leaves the function: `xs[0]` on an empty
+# list fails out of a `T!` function. the string built on the left was released
+# by the concat that never ran, so every failure stranded it.
+import leakprobe as probe
+
+fn label(n: Int, xs: List[String]) -> Int!:
+    s := n.to_string() + " " + xs[0]
+    return s.len()
+
+fn tagged(n: Int, xs: List[String]) -> Int!:
+    return ("#" + n.to_string()).len() + xs[1].len()
+
+fn main():
+    n := probe.rounds()
+    empty: List[String] := []
+    one := ["a"]
+    mut i := 0
+    mut failures := 0
+    while i < n:
+        if label(i, empty).is_err:
+            failures = failures + 1
+        if tagged(i, one).is_err:
+            failures = failures + 1
+        i = i + 1
+    if failures == 0 - 1:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

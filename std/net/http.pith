@@ -1938,22 +1938,11 @@ fn decode_chunked(src: ByteSource, out: ByteBuffer, writer: BufferedBytesWriter,
         size_line := source_read_line(src, CHUNK_LINE_LIMIT)!
         size := chunk_size_from_line(size_line)!
         if size == 0:
-            mut trailer_bytes := 0
-            mut done := false
-            while not done:
-                line := source_read_line(src, CHUNK_LINE_LIMIT)!
-                trailer_bytes = trailer_bytes + line.len()
-                if trailer_bytes > MAX_HEADER_BYTES:
-                    fail HEADER_LIMIT_MESSAGE
-                done = chunk_trailer_ends(line, trailers)!
+            read_chunk_trailers(src, trailers)!
             if streaming:
                 writer.flush()!
             return total
-        excess = excess + size_line.len() + 2 - 16 - 2 * size
-        if excess < 0:
-            excess = 0
-        if excess > CHUNK_EXCESS_LIMIT:
-            fail bad_request("chunked body has too much framing for its data")
+        excess = charge_chunk_framing(excess, size_line, size)!
         # check the declared size before reading it, so a bogus chunk-size line
         # (e.g. 7fffffff) cannot force a huge allocation ahead of the cap
         if limit > 0 and size > limit - total:
@@ -1966,6 +1955,29 @@ fn decode_chunked(src: ByteSource, out: ByteBuffer, writer: BufferedBytesWriter,
         if chunk_line_content_end(source_read_line(src, CHUNK_LINE_LIMIT)!)! != 0:
             fail bad_request("chunk data is not followed by a line ending")
     return total
+
+# read the trailer section after the last chunk, up to the empty line that ends
+# it, within MAX_HEADER_BYTES.
+fn read_chunk_trailers(src: ByteSource, trailers: Map[String, String]) -> Int!:
+    mut trailer_bytes := 0
+    mut done := false
+    while not done:
+        line := source_read_line(src, CHUNK_LINE_LIMIT)!
+        trailer_bytes = trailer_bytes + line.len()
+        if trailer_bytes > MAX_HEADER_BYTES:
+            fail HEADER_LIMIT_MESSAGE
+        done = chunk_trailer_ends(line, trailers)!
+    return trailer_bytes
+
+# the framing a chunk adds to what earlier chunks have not earned (see
+# decode_chunked), failing once it passes CHUNK_EXCESS_LIMIT.
+fn charge_chunk_framing(excess: Int, size_line: Bytes, size: Int) -> Int!:
+    mut left := excess + size_line.len() + 2 - 16 - 2 * size
+    if left < 0:
+        left = 0
+    if left > CHUNK_EXCESS_LIMIT:
+        fail bad_request("chunked body has too much framing for its data")
+    return left
 
 fn read_chunked_from(src: ByteSource, limit: Int) -> Bytes!:
     out := bytes.buffer()
@@ -2958,6 +2970,167 @@ pub fn take_response_producer() -> fn(fn(Bytes) -> Int!) -> Int!:
         return pending.run
     return no_response_producer
 
+# --- streaming a request body ----------------------------------------------
+#
+# with ServerConfig.stream_request_bodies on, the http/1.1 server reads a
+# request's head and runs the handler before any of the body arrives. the
+# handler reads the body with read_body_part, piece by piece, so an upload can
+# go to disk or to an upstream without being held whole. what the handler
+# leaves unread is drained after it returns, up to BODY_DRAIN_LIMIT; a body
+# with more left than that, or one that failed to read, closes the connection
+# after the response instead of being taken for the next request.
+#
+# like the response producer, the body waits in a task-local value, so the
+# request type stays as it is.
+struct BodyStream:
+    src: ByteSource
+    chunked: Bool
+    # what is left of a sized body, or of the current chunk
+    remaining: Int
+    # framing the chunks have not earned yet (see decode_chunked)
+    excess: Int
+    # a chunk's data is followed by a line ending still to read
+    chunk_open: Bool
+    done: Bool
+    failed: Bool
+
+threadlocal mut pending_body: BodyStream? := none
+
+# what is drained of a body the handler did not read before the connection
+# takes another request. net/http drains 256 KiB the same way.
+BODY_DRAIN_LIMIT := 262144
+
+impl BodyStream:
+    fn read(max: Int) -> Bytes!:
+        if self.done or max <= 0:
+            return bytes.empty()
+        if self.chunked and self.remaining == 0:
+            if self.chunk_open:
+                if chunk_line_content_end(source_read_line(self.src, CHUNK_LINE_LIMIT)!)! != 0:
+                    fail bad_request("chunk data is not followed by a line ending")
+                self.chunk_open = false
+            size_line := source_read_line(self.src, CHUNK_LINE_LIMIT)!
+            size := chunk_size_from_line(size_line)!
+            if size == 0:
+                trailers: Map[String, String] := {}
+                read_chunk_trailers(self.src, trailers)!
+                self.done = true
+                return bytes.empty()
+            self.excess = charge_chunk_framing(self.excess, size_line, size)!
+            self.remaining = size
+            self.chunk_open = true
+        if self.remaining == 0:
+            self.done = true
+            return bytes.empty()
+        mut want := max
+        if want > self.remaining:
+            want = self.remaining
+        piece := source_read_available(self.src, want)!
+        if piece.is_empty():
+            fail "http: request body ended early"
+        self.remaining = self.remaining - piece.len()
+        if not self.chunked and self.remaining == 0:
+            self.done = true
+        return piece
+
+    # read and drop what is left, up to `limit` bytes. true when the body
+    # ended within it.
+    fn drain(limit: Int) -> Bool:
+        # a sized body with more left than the limit closes without waiting
+        # for bytes the client may never send
+        if not self.chunked and self.remaining > limit:
+            return false
+        mut dropped := 0
+        while not self.done:
+            if self.failed or dropped > limit:
+                return false
+            got := self.read(65536)
+            if got.is_err:
+                self.failed = true
+                return false
+            dropped = dropped + got.ok.len()
+        return true
+
+# the next part of the request body, at most `max` bytes, as soon as any of it
+# arrives; empty once the body has ended. with stream_request_bodies off, or on
+# http/2, the body is already in the request and this returns empty.
+pub fn read_body_part(max: Int) -> Bytes!:
+    if let body = pending_body:
+        got := body.read(max)
+        if got.is_err:
+            body.failed = true
+            fail got.err
+        return got.ok
+    return bytes.empty()
+
+# finish the body of the request this task just handled: drain what the
+# handler left and forget it. false when the connection cannot carry another
+# request after it.
+fn finish_request_body() -> Bool:
+    if let body = pending_body:
+        pending_body = none
+        return body.drain(BODY_DRAIN_LIMIT)
+    return true
+
+# --- taking over a connection ------------------------------------------------
+#
+# a handler that wants the raw connection, to copy bytes between it and an
+# upstream for a websocket or any other upgrade, returns take_connection(run).
+# the http/1.1 server sends nothing for that request. it clears the
+# connection's read and write deadlines and calls run on this same task with
+# two functions: read(n) returns up to n bytes as soon as any arrive, empty at
+# the end of input, and write(data) sends all of data at once. run writes
+# whatever answer the protocol needs, such as a 101, and the connection closes
+# when it returns.
+#
+# read belongs to the task run is called on: the connection's reader may hold
+# bytes that arrived behind the request head, and it lives with that task.
+# write goes straight to the socket or the tls connection, so a task run
+# spawns, such as one copying the other direction, can call it.
+#
+# http/2 has no upgrade, so there, and wherever a middleware replaced the
+# handler's response, the returned 501 is sent instead.
+struct ConnectionTaker:
+    run: fn(fn(Int) -> Bytes!, fn(Bytes) -> Int!) -> Int!
+
+threadlocal mut pending_taker: ConnectionTaker? := none
+
+# hand this request's connection to `run` (see above).
+pub fn take_connection(run: fn(fn(Int) -> Bytes!, fn(Bytes) -> Int!) -> Int!) -> HttpResponse:
+    pending_taker = ConnectionTaker(run)
+    return text(501, "this connection cannot be taken over")
+
+# run the taker a handler left on the connection it came in on. the request's
+# body, if it was being streamed, belongs to the taker now.
+fn run_connection_taker(src: ByteSource) -> Bool:
+    if let taker = pending_taker:
+        pending_taker = none
+        pending_body = none
+        arm_read_deadline_at(src, 0)
+        tcp_set_write_deadline(src.socket, 0)
+        read := fn(n: Int) -> Bytes!:
+            return source_read_available(src, n)!
+        write := fn(data: Bytes) -> Int!:
+            return write_connection(src, data)!
+        taker.run(read, write) catch 0
+        return true
+    return false
+
+# write all of `data` to the connection `src` reads, from any task: the tls
+# connection, or the socket itself. the server's buffered writer belongs to
+# the connection's own task, and every response it sent was flushed, so
+# nothing is waiting in it.
+fn write_connection(src: ByteSource, data: Bytes) -> Int!:
+    if src.use_tls:
+        return src.conn.write_all_bytes(data)
+    mut total := 0
+    while total < data.len():
+        wrote := tcp_write_bytes(src.socket, data.slice(total, data.len()))!
+        if wrote <= 0:
+            fail "http: connection write returned 0"
+        total = total + wrote
+    return total
+
 # one chunk of a chunked body, framed. an empty piece would end the body, so it
 # writes nothing.
 fn chunk_frame(data: Bytes) -> Bytes:
@@ -3057,42 +3230,52 @@ pub struct ServerConfig:
     pub keep_alives: Bool
     pub max_requests_per_conn: Int
     pub max_connections: Int
+    # when true, an http/1.1 handler reads the request body itself with
+    # read_body_part, as it arrives, and max_body_bytes does not apply.
+    pub stream_request_bodies: Bool
 
 # the default server configuration (see ServerConfig).
 pub fn server_config() -> ServerConfig:
-    return ServerConfig(0, 0, 0, 0, MAX_HEADER_BYTES, MAX_REQUEST_BODY, true, 0, 0)
+    return ServerConfig(0, 0, 0, 0, MAX_HEADER_BYTES, MAX_REQUEST_BODY, true, 0, 0, false)
 
 impl ServerConfig:
     fn with_read_header_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
+        return ServerConfig(ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
 
     fn with_read_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
+        return ServerConfig(self.read_header_timeout_ms, ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
 
     fn with_write_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
 
     fn with_idle_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
 
     fn with_max_header_bytes(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, limit, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, limit, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
 
     fn with_max_body_bytes(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, limit, self.keep_alives, self.max_requests_per_conn, self.max_connections)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, limit, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
 
     fn with_keep_alives(enabled: Bool) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, enabled, self.max_requests_per_conn, self.max_connections)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, enabled, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
 
     fn with_max_requests_per_conn(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, limit, self.max_connections)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, limit, self.max_connections, self.stream_request_bodies)
 
     # the head's time limit after the read_timeout_ms fallback.
 
     # how many connections std.web serves at once. past it a new connection is
     # refused with a 503. 0 means std.web's default.
     fn with_max_connections(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, limit)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, limit, self.stream_request_bodies)
+
+    # hand each http/1.1 request's body to its handler as it arrives, through
+    # read_body_part, instead of reading it whole first. the handler decides
+    # how much to keep, so max_body_bytes does not apply. http/2 requests are
+    # read whole as before.
+    fn with_stream_request_bodies(enabled: Bool) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, enabled)
 
     fn header_timeout() -> Int:
         if self.read_header_timeout_ms > 0:
@@ -3295,7 +3478,8 @@ fn read_server_request(conn: ServerConn, body_due: Int, rearm: Bool) -> ServerRe
     if raw.is_empty():
         return ServerRequest(empty_request(), true)
     parsed := parse_request_head(raw, true)!
-    check_declared_length(parsed, config.max_body_bytes)!
+    if not config.stream_request_bodies:
+        check_declared_length(parsed, config.max_body_bytes)!
     if config.write_timeout_ms > 0:
         tcp_set_write_deadline(src.socket, config.write_timeout_ms)
     has_body := parsed.chunked or parsed.content_length > 0
@@ -3306,6 +3490,9 @@ fn read_server_request(conn: ServerConn, body_due: Int, rearm: Bool) -> ServerRe
             source_write(src, conn.writer, bytes.from_string_utf8(CONTINUE_RESPONSE))!
     if rearm and has_body:
         arm_read_deadline_at(src, body_due)
+    if config.stream_request_bodies and has_body:
+        pending_body = BodyStream(src, parsed.chunked, parsed.content_length, 0, false, false, false)
+        return ServerRequest(request_from_head(parsed, bytes.empty())!, parsed.wants_close)
     return ServerRequest(request_from_head(parsed, read_request_body(src, parsed, config.max_body_bytes)!)!, parsed.wants_close)
 
 # like read_request_from, but the body goes to `writer` as it arrives, and the
@@ -6020,10 +6207,13 @@ fn serve_exchange(conn: ServerConn, served: Int, persistent: Bool) -> Exchange!:
     if req.head.is_empty() and req.method_text == "":
         return Exchange(0, false, "")
     resp := run_handler(conn.handler, req)
+    if run_connection_taker(src):
+        return Exchange(0, false, "")
+    body_finished := finish_request_body()
     mut connection := ""
     if persistent:
         last := not config.keep_alives or (config.max_requests_per_conn > 0 and served + 1 >= config.max_requests_per_conn)
-        connection = connection_value(got.ok.wants_close or last, req.version_text == "HTTP/1.0", resp)
+        connection = connection_value(got.ok.wants_close or last or not body_finished, req.version_text == "HTTP/1.0", resp)
     else:
         connection = standalone_connection(resp, "")
     if response_is_streaming():

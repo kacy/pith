@@ -32,7 +32,10 @@ const RETAINS: &[&str] = &[
     "pith_channel_retain",
 ];
 
-const SCALAR_KINDS: &[&str] = &["int", "bool", "float", "void", "uint", "byte", "char", "i32", "u8"];
+// a task handle is in the list too: the runtime keeps no count on it
+// (runtime_ownership.txt, pith_await and pith_task_detach), so a returned
+// handle that is awaited or detached has nothing to give back
+const SCALAR_KINDS: &[&str] = &["int", "bool", "float", "void", "uint", "byte", "char", "i32", "u8", "task"];
 
 /// instructions that make a plain value from plain operands
 const PLAIN_OPS: &[&str] = &[
@@ -1074,7 +1077,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 st.shells.remove(&o);
             }
         }
-        let result = if let Some(row) = runtime_ownership(callee) {
+        // a call through a fn value held in a slot of this function: a
+        // closure follows the user-function convention whatever it is named,
+        // even when the name is also a runtime function's (`write`)
+        let closure_call = self.f.kinds.get(callee).is_some_and(|k| *k == "closure");
+        let result = if let Some(row) = runtime_ownership(callee).filter(|_| !closure_call) {
             for (i, a) in row.args.iter().enumerate() {
                 if *a == ArgOwnership::Consume && i < args.len() {
                     self.take(st, args[i], callee)?;
@@ -1094,7 +1101,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 ResultValue::Own => Val::Obj(self.new_obj(st, 1)),
                 ResultValue::Borrow(_) => Val::Obj(self.new_obj(st, 0)),
             }
-        } else if self.user_funcs.contains(callee) {
+        } else if closure_call || self.user_funcs.contains(callee) {
             // a user function borrows its arguments and hands back a count
             // on a counted result
             if typ == "unknown" {
@@ -1655,6 +1662,70 @@ endfunc
     fn a_loop_that_keeps_a_count_each_pass_is_reported() {
         let r = check(&LOOP_RETAIN.replace("call 7 pith_list_release_handle void 1 4\n", ""));
         assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+
+    // a closure parameter named like a runtime function, called for a result
+    // that is only tested and then released
+    const CLOSURE_NAMED_WRITE: &str = "
+func pump 2 int
+param write
+param n
+load 2 n
+call 3 write tuple 1 2
+field 4 3 0 bool is_ok
+iconst 5 0
+eq 6 4 5
+call 7 __result_arg_release_0s_m12 void 1 3
+brif 6 L14 L15
+label L14
+iconst 8 1
+ret 8
+label L15
+iconst 9 0
+ret 9
+mark kind write closure
+mark kind n int
+endfunc
+";
+
+    #[test]
+    fn a_closure_named_like_a_runtime_function_hands_back_an_owned_result() {
+        let r = check(CLOSURE_NAMED_WRITE);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    #[test]
+    fn a_closure_result_never_released_is_a_leak() {
+        let r = check(&CLOSURE_NAMED_WRITE.replace("call 7 __result_arg_release_0s_m12 void 1 3\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+
+    // `await make_task(3)`: a task handle a call hands back carries no count
+    const AWAIT_RETURNED_TASK: &str = "
+func main 0 void
+iconst 1 3
+call 2 make_task task 1 1
+call 3 pith_await unknown 1 2
+store total 3
+iconst 8 0
+ret 8
+mark kind total int
+mark untracked total
+endfunc
+func make_task 1 task
+param n
+iconst 2 0
+ret 2
+mark kind n int
+endfunc
+";
+
+    #[test]
+    fn an_awaited_task_handle_holds_no_count() {
+        let r = check(AWAIT_RETURNED_TASK);
+        assert_eq!(r.failed, 0, "{:?}", r);
     }
 
     #[test]

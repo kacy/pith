@@ -194,22 +194,6 @@ pub fn report_error_with_fix_at(node_idx: Int, code: String, message: String, fi
 pub fn report_error_with_fix(code: String, message: String, fix: String):
     checker_record(checker_current_node, "error", code, message, fix)
 
-## record a warning at a node's position, into the same list the errors
-## go into — severity "warning" is all that distinguishes it, and
-## checker_reported_at_current only ever looks at errors, so a warning
-## here never suppresses a later error at the same line. no checker pass
-## calls this today; the E3xx warnings a user sees come from the
-## linter's own diagnostic list, not this one.
-pub fn report_warning_at(node_idx: Int, code: String, message: String):
-    checker_record(node_idx, "warning", code, message, "")
-
-## record a warning with no source position at all. unlike report_error
-## it ignores the current-node stamp entirely and always writes line 0,
-## column 0, so it renders with the file and message but no line and no
-## snippet. like report_warning_at, no checker pass calls it today.
-pub fn report_warning(code: String, message: String):
-    checker_record(0 - 1, "warning", code, message, "")
-
 # ---------------------------------------------------------------
 # snapshots
 # ---------------------------------------------------------------

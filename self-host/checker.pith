@@ -140,9 +140,6 @@ pub mut generic_declaration_map: Map[String, Int] := {}
 # see generic_base_identity for how the ambiguous ones are told apart.
 mut generic_base_first_module: Map[String, String] := {}
 mut ambiguous_generic_bases: Map[String, Bool] := {}
-# each qualified generic key back to the bare name it was built from, for the
-# few places that hold an identity and have to match it against a written name.
-mut generic_identity_bare_names: Map[String, String] := {}
 # the module each generic declaration was registered from, keyed by its AST
 # node index, so an instantiation can name the declaration it came from.
 mut generic_declaration_modules: Map[Int, String] := {}
@@ -233,7 +230,6 @@ pub fn initialize_checker(file_path: String):
     generic_declaration_map = {}
     generic_base_first_module = {}
     ambiguous_generic_bases = {}
-    generic_identity_bare_names = {}
     generic_declaration_modules = {}
     checker_interfaces_reset()
     implementation_set = {}
@@ -1412,8 +1408,6 @@ fn register_generic_declaration(name: String, node_idx: Int):
     key := module_generic_target_name(current_checker_module_path, name)
     generic_declaration_map.insert(key, node_idx)
     generic_declaration_modules.insert(node_idx, current_checker_module_path)
-    if key != name:
-        generic_identity_bare_names.insert(key, name)
     # a second module declaring a generic under this bare base name makes the
     # bare name ambiguous from here on. modules are checked one at a time, so
     # this is only settled once every module has registered — which is why the
@@ -1442,14 +1436,6 @@ pub fn generic_base_identity(module_path: String, name: String) -> String:
     if generic_declaration_map.contains_key(key):
         return key
     return name
-
-# the bare name a generic identity was built from, or the name unchanged when
-# it is already bare. for the callers that hold an identity and have to match
-# it against a name written in source, which never carries the module.
-pub fn generic_identity_bare_name(identity: String) -> String:
-    if generic_identity_bare_names.contains_key(identity):
-        return generic_identity_bare_names[identity]
-    return identity
 
 # the identity of the generic declaration at this AST node index, resolved
 # from the module it was registered in. instantiation names an instance from
@@ -8369,7 +8355,6 @@ pub struct CheckerSnapshot:
     pub generic_declaration_map: Map[String, Int]
     pub generic_base_first_module: Map[String, String]
     pub ambiguous_generic_bases: Map[String, Bool]
-    pub generic_identity_bare_names: Map[String, String]
     pub generic_declaration_modules: Map[Int, String]
     pub checking_test_decl: Bool
     pub implementation_set: Map[String, Int]
@@ -8435,7 +8420,6 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         generic_declaration_map: copy_map(generic_declaration_map),
         generic_base_first_module: copy_map(generic_base_first_module),
         ambiguous_generic_bases: copy_map(ambiguous_generic_bases),
-        generic_identity_bare_names: copy_map(generic_identity_bare_names),
         generic_declaration_modules: copy_map(generic_declaration_modules),
         checking_test_decl: checking_test_decl,
         implementation_set: copy_map(implementation_set),
@@ -8501,7 +8485,6 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     generic_declaration_map = copy_map(s.generic_declaration_map)
     generic_base_first_module = copy_map(s.generic_base_first_module)
     ambiguous_generic_bases = copy_map(s.ambiguous_generic_bases)
-    generic_identity_bare_names = copy_map(s.generic_identity_bare_names)
     generic_declaration_modules = copy_map(s.generic_declaration_modules)
     checking_test_decl = s.checking_test_decl
     implementation_set = copy_map(s.implementation_set)

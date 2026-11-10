@@ -82,19 +82,13 @@ fn arg_int(flag: String, fallback: Int) -> Int:
 # resource probes
 # ---------------------------------------------------------------
 
-# peak resident set in kB since the last reset, or -1 when /proc is missing.
-fn peak_rss_kb() -> Int:
+# a kB field of /proc/self/status, such as "VmHWM:" (the peak resident set
+# since the last reset) or "VmRSS:", or -1 when /proc is missing.
+fn status_kb(field: String) -> Int:
     text := fs.read("/proc/self/status") catch ""
     for line in text.split("\n"):
-        if line.starts_with("VmHWM:"):
-            return parse_int(line.substring(6, line.len()).replace("kB", "").trim()) catch -1
-    return -1
-
-fn current_rss_kb() -> Int:
-    text := fs.read("/proc/self/status") catch ""
-    for line in text.split("\n"):
-        if line.starts_with("VmRSS:"):
-            return parse_int(line.substring(6, line.len()).replace("kB", "").trim()) catch -1
+        if line.starts_with(field):
+            return parse_int(line.substring(field.len(), line.len()).replace("kB", "").trim()) catch -1
     return -1
 
 fn reset_peak_rss():
@@ -937,11 +931,11 @@ fn check_one(target: String, input: Bytes, budget: Budget, out_dir: String, tail
         run_input = with_tail(target, input, tail)
     fs.write_bytes(out_dir + "/cur-" + target, run_input) catch false
     reset_peak_rss()
-    base := current_rss_kb()
+    base := status_kb("VmRSS:")
     start := time.mono_nanos()
     result := run_target(target, run_input)
     elapsed_ms := (time.mono_nanos() - start) / 1000000
-    peak := peak_rss_kb()
+    peak := status_kb("VmHWM:")
     last_stats = elapsed_ms.to_string() + "ms, peak rss +" + (peak - base).to_string() + "kB"
     allowed_ms := budget.time_ms + input.len() / 1000
     if elapsed_ms > allowed_ms:

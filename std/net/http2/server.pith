@@ -242,15 +242,15 @@ impl ServerConn:
         locked self.hpack_mu:
             self.encoder.set_max_table_size(size)
 
-    # read one transport chunk: from the tcp socket or the tls session when live,
-    # otherwise nothing (the offline buffer is exhausted, which reads as
-    # end-of-stream).
     # the connection's socket, whichever transport it runs over.
     fn socket_fd() -> Int:
         if self.transport == TRANSPORT_TLS:
             return tls.Conn(self.tls_handle).socket()
         return self.fd
 
+    # read one transport chunk: from the tcp socket or the tls session when live,
+    # otherwise nothing (the offline buffer is exhausted, which reads as
+    # end-of-stream).
     fn recv_chunk() -> Bytes!:
         if self.transport == TRANSPORT_TCP:
             return tcp_read_bytes(self.fd, RECV_CHUNK)!

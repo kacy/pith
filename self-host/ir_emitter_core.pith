@@ -6203,10 +6203,13 @@ fn ir_higher_order_walk_list(list_r: Int, may_drop: Bool) -> Int:
     ir_emit_call3(copy_r, "list_slice_copy", "list", list_r, ir_zero_reg(), len_r)
     return copy_r
 
+# release the walked copy, the function argument's pin and the function
+# argument itself once the loop is done
 fn ir_higher_order_walk_done(walk_r: Int, may_drop: Bool, fn_idx: Int, fn_r: Int, fn_pin: String):
     if may_drop:
         ir_rc_release_reg(walk_r, "list")
     ir_unpin_operand(fn_r, fn_pin)
+    ir_release_higher_order_fn_arg(fn_idx, fn_r)
 
 # a lambda literal handed to a callee that only calls it (an open-coded map,
 # filter or reduce, or a parameter ir_record_closure_params proved local)
@@ -6311,7 +6314,6 @@ fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
 
     out_r := ir_emit_list_map_loop(list_r, ctor, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
     ir_higher_order_walk_done(list_r, may_drop, mapper_idx, mapper_r, mapper_pin)
-    ir_release_higher_order_fn_arg(mapper_idx, mapper_r)
     return out_r
 
 fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
@@ -6341,7 +6343,6 @@ fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
 
     out_r := ir_emit_list_filter_loop(list_r, ctor, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
     ir_higher_order_walk_done(list_r, may_drop, keep_idx, keep_r, keep_pin)
-    ir_release_higher_order_fn_arg(keep_idx, keep_r)
     return out_r
 
 fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
@@ -6369,7 +6370,6 @@ fn ir_emit_list_reduce_lowering(idx: Int, list_idx: Int, init_idx: Int, reducer_
 
     out_r := ir_emit_list_reduce_loop(list_r, reducer_name, acc_name, ir_retkind(elem_kind), ir_retkind(result_kind), ir_temp_name("__reduce_i"))
     ir_higher_order_walk_done(list_r, may_drop, reducer_idx, reducer_r, reducer_pin)
-    ir_release_higher_order_fn_arg(reducer_idx, reducer_r)
     return out_r
 
 fn ir_emit_higher_order_list_call(idx: Int, node: Node, callee_name: String) -> Int:

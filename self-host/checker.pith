@@ -140,9 +140,6 @@ pub mut generic_declaration_map: Map[String, Int] := {}
 # see generic_base_identity for how the ambiguous ones are told apart.
 mut generic_base_first_module: Map[String, String] := {}
 mut ambiguous_generic_bases: Map[String, Bool] := {}
-# each qualified generic key back to the bare name it was built from, for the
-# few places that hold an identity and have to match it against a written name.
-mut generic_identity_bare_names: Map[String, String] := {}
 # the module each generic declaration was registered from, keyed by its AST
 # node index, so an instantiation can name the declaration it came from.
 mut generic_declaration_modules: Map[Int, String] := {}
@@ -233,7 +230,6 @@ pub fn initialize_checker(file_path: String):
     generic_declaration_map = {}
     generic_base_first_module = {}
     ambiguous_generic_bases = {}
-    generic_identity_bare_names = {}
     generic_declaration_modules = {}
     checker_interfaces_reset()
     implementation_set = {}
@@ -1412,8 +1408,6 @@ fn register_generic_declaration(name: String, node_idx: Int):
     key := module_generic_target_name(current_checker_module_path, name)
     generic_declaration_map.insert(key, node_idx)
     generic_declaration_modules.insert(node_idx, current_checker_module_path)
-    if key != name:
-        generic_identity_bare_names.insert(key, name)
     # a second module declaring a generic under this bare base name makes the
     # bare name ambiguous from here on. modules are checked one at a time, so
     # this is only settled once every module has registered — which is why the
@@ -1442,14 +1436,6 @@ pub fn generic_base_identity(module_path: String, name: String) -> String:
     if generic_declaration_map.contains_key(key):
         return key
     return name
-
-# the bare name a generic identity was built from, or the name unchanged when
-# it is already bare. for the callers that hold an identity and have to match
-# it against a name written in source, which never carries the module.
-pub fn generic_identity_bare_name(identity: String) -> String:
-    if generic_identity_bare_names.contains_key(identity):
-        return generic_identity_bare_names[identity]
-    return identity
 
 # the identity of the generic declaration at this AST node index, resolved
 # from the module it was registered in. instantiation names an instance from
@@ -1654,8 +1640,10 @@ fn get_type_node_name_with_substitution(node: Node, subst_map: Map[String, Int])
         return build_interface_type_name(node.value, parts)
     return ""
 
-# extract the binding name from a binding value like "x" or "x mut"
-fn extract_binding_name(value: String) -> String:
+# the name a binding or parameter node declares. the parser stores the name
+# first, followed by any modifiers and a guard marker: "x", "x mut",
+# "cached guard:mu mut"
+pub fn extract_binding_name(value: String) -> String:
     mut i := 0
     while i < value.len():
         if ord(value[i]) == 32:
@@ -2195,10 +2183,10 @@ fn is_mutex_or_mutex_list(t: Int) -> Bool:
 # a call to a function declared `holding m` needs `m` held at the call. a
 # path rooted at `self` is read off the receiver, and one rooted at a
 # parameter off that argument.
-fn check_holding_call(call_idx: Int, def_key: Int, node: Node, scope_id: Int):
-    if definition_of.contains_key(def_key) == false:
+fn check_holding_call(call_idx: Int, node: Node, scope_id: Int):
+    decl_idx := called_declaration(call_idx)
+    if decl_idx < 0:
         return
-    decl_idx := definition_of[def_key]
     decl := get_node(decl_idx)
     if decl.kind != "fn_decl":
         return
@@ -3274,6 +3262,19 @@ pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
 pub fn get_definition_of() -> Map[Int, Int]:
     return definition_of
 
+# the declaration node a call or a method call resolved to, or -1. a call is
+# recorded under its callee and a method call under itself.
+pub fn called_declaration(idx: Int) -> Int:
+    node := get_node(idx)
+    mut key := 0 - 1
+    if node.kind == "call" and node.children.len() > 0:
+        key = node.children[0]
+    elif node.kind == "method_call":
+        key = idx
+    if key >= 0 and definition_of.contains_key(key):
+        return definition_of[key]
+    return 0 - 1
+
 # record a use-site -> declaration-node pair. -1 on either side means
 # the resolution has no source node (builtins), so nothing is recorded
 fn record_definition(use_idx: Int, decl_idx: Int):
@@ -3334,12 +3335,11 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         return check_if_expression(node, scope_id)
     if node.kind == "call":
         call_tid := check_function_call(node, scope_id)
-        if node.children.len() > 0:
-            check_holding_call(node_idx, node.children[0], node, scope_id)
+        check_holding_call(node_idx, node, scope_id)
         return call_tid
     if node.kind == "method_call":
         method_tid := check_method_call(node, scope_id)
-        check_holding_call(node_idx, node_idx, node, scope_id)
+        check_holding_call(node_idx, node, scope_id)
         return method_tid
     if node.kind == "field_access":
         return check_field_access_expression(node_idx, node, scope_id)
@@ -7646,14 +7646,7 @@ fn spawn_arg_shares_collection(expr_idx: Int) -> Bool:
     node := get_node(expr_idx)
     if node.kind != "ident" and node.kind != "field_access" and node.kind != "index":
         return false
-    tid := c_get_expr_type(expr_idx)
-    if tid < 0:
-        return false
-    kind := get_type_info(tid).kind
-    if kind == "list" or kind == "map" or kind == "set":
-        return true
-    mut seen: Map[Int, Bool] := {}
-    return struct_holds_unguarded_collection(tid, seen) != ""
+    return holds_shared_buffer_type(c_get_expr_type(expr_idx))
 
 # the first field path under a struct type that reaches a list, a map or a set
 # outside a `guard` block, or "". a struct field or an optional struct is
@@ -8369,7 +8362,6 @@ pub struct CheckerSnapshot:
     pub generic_declaration_map: Map[String, Int]
     pub generic_base_first_module: Map[String, String]
     pub ambiguous_generic_bases: Map[String, Bool]
-    pub generic_identity_bare_names: Map[String, String]
     pub generic_declaration_modules: Map[Int, String]
     pub checking_test_decl: Bool
     pub implementation_set: Map[String, Int]
@@ -8435,7 +8427,6 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         generic_declaration_map: copy_map(generic_declaration_map),
         generic_base_first_module: copy_map(generic_base_first_module),
         ambiguous_generic_bases: copy_map(ambiguous_generic_bases),
-        generic_identity_bare_names: copy_map(generic_identity_bare_names),
         generic_declaration_modules: copy_map(generic_declaration_modules),
         checking_test_decl: checking_test_decl,
         implementation_set: copy_map(implementation_set),
@@ -8501,7 +8492,6 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     generic_declaration_map = copy_map(s.generic_declaration_map)
     generic_base_first_module = copy_map(s.generic_base_first_module)
     ambiguous_generic_bases = copy_map(s.ambiguous_generic_bases)
-    generic_identity_bare_names = copy_map(s.generic_identity_bare_names)
     generic_declaration_modules = copy_map(s.generic_declaration_modules)
     checking_test_decl = s.checking_test_decl
     implementation_set = copy_map(s.implementation_set)
@@ -8555,7 +8545,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
 # both checks run after a body is checked, when every expression has a type.
 
 # the methods that change a list, a map or a set in place
-COLLECTION_MUTATORS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
+pub COLLECTION_MUTATORS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
 
 fn check_guard_rules(body_idx: Int):
     check_frozen_writes(body_idx)
@@ -8589,7 +8579,7 @@ fn check_frozen_writes(idx: Int):
 # whether a value of type `tid` reaches a buffer another task could change:
 # a collection, or a struct that reaches one outside a guard block
 fn holds_shared_buffer_type(tid: Int) -> Bool:
-    if is_error_type(tid):
+    if tid < 0 or is_error_type(tid):
         return false
     kind := get_type_info(tid).kind
     if kind == "list" or kind == "map" or kind == "set":
@@ -8641,18 +8631,9 @@ fn check_lock_escapes(idx: Int, fn_body: Int):
 fn collect_bound_names(idx: Int, out: Map[String, Bool]):
     node := get_node(idx)
     if node.kind == "binding" and node.value != "":
-        out.insert(bound_name(node.value), true)
+        out.insert(extract_binding_name(node.value), true)
     for child in node.children:
         collect_bound_names(child, out)
-
-fn bound_name(value: String) -> String:
-    mut rest := value
-    if rest.starts_with("mut "):
-        rest = rest.substring(4, rest.len())
-    sp := rest.index_of(" ")
-    if sp >= 0:
-        return rest.substring(0, sp)
-    return rest
 
 fn report_escape(at: Int, name: String, how: String):
     report_error_with_fix_at(at, "E276", "'" + name + "' is guarded, and " + how + ", so the buffer is reached after the lock is released", "copy what is needed inside the block, or declare the field `frozen` outside the guard block if it is never changed")

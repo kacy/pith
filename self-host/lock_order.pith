@@ -29,7 +29,7 @@
 
 from ast import Node, get_node
 from errors import Diagnostic
-from checker import c_get_expr_type, get_definition_of
+from checker import c_get_expr_type, called_declaration, extract_binding_name
 from types import get_type_info, get_type_name, is_error_type
 from driver import get_resolved_module_file, get_resolved_module_path
 
@@ -90,10 +90,9 @@ pub fn lint_lock_order(entry_root: Int, entry_path: String, import_roots: List[I
     g := LockGraph(fn_index: {}, fn_nodes: [], fn_modules: [], globals: {}, module_labels: labels, takes: [], callees: [], held_call_held: [], held_call_callee: [], held_call_module: [], held_call_line: [], held_call_col: [], edge_from: [], edge_to: [], edge_module: [], edge_line: [], edge_col: [], global_names: {}, sharded_names: {}, self_takes: [], method_call_callee: [], method_call_receiver: [], method_call_held: [], method_call_line: [], method_call_col: [], reentry_messages: [], reentry_lines: [], reentry_cols: [])
     for r, i in roots:
         collect_lock_functions(r, i, g)
-    definitions := get_definition_of()
     for idx, k in g.fn_nodes:
         held := holding_names(idx, g.fn_modules[k], g)
-        walk_locks(idx, k, held, holding_paths(idx), definitions, g)
+        walk_locks(idx, k, held, holding_paths(idx), g)
     close_takes(g)
     add_call_edges(g)
     check_method_reentry(g)
@@ -123,21 +122,11 @@ fn collect_lock_functions(idx: Int, module: Int, g: LockGraph):
         g.callees.push([])
         return
     if node.kind == "binding" and node.value != "":
-        g.globals.insert(module.to_string() + "\t" + binding_name(node.value), true)
+        g.globals.insert(module.to_string() + "\t" + extract_binding_name(node.value), true)
         return
     if node.kind == "module" or node.kind == "pub" or node.kind == "impl_decl":
         for child in node.children:
             collect_lock_functions(child, module, g)
-
-# the name a binding node declares: its value starts with the name
-fn binding_name(value: String) -> String:
-    mut rest := value
-    if rest.starts_with("mut "):
-        rest = rest.substring(4, rest.len())
-    sp := rest.index_of(" ")
-    if sp >= 0:
-        return rest.substring(0, sp)
-    return rest
 
 # the name of the mutex a `locked` or `holding` path takes, or "" when it has
 # none: a module global, a struct field, or an element of a sharded guard
@@ -203,16 +192,16 @@ fn holding_paths(idx: Int) -> List[String]:
 # walk function `k` with `held` the mutexes held at `idx`, and `held_paths`
 # the paths they were taken through, recording what it takes, what it calls,
 # and each mutex taken while another is held
-fn walk_locks(idx: Int, k: Int, held: List[String], held_paths: List[String], definitions: Map[Int, Int], g: LockGraph):
+fn walk_locks(idx: Int, k: Int, held: List[String], held_paths: List[String], g: LockGraph):
     node := get_node(idx)
     if node.kind == "lambda" or node.kind == "spawn":
         return
     module := g.fn_modules[k]
     if node.kind == "locked_stmt" and node.children.len() == 4:
-        walk_locks(node.children[0], k, held, held_paths, definitions, g)
+        walk_locks(node.children[0], k, held, held_paths, g)
         name := mutex_name(node.children[0], module, g)
         if name == "":
-            walk_locks(node.children[3], k, held, held_paths, definitions, g)
+            walk_locks(node.children[3], k, held, held_paths, g)
             return
         g.takes[k].insert(name, true)
         path := path_text(node.children[0])
@@ -229,15 +218,11 @@ fn walk_locks(idx: Int, k: Int, held: List[String], held_paths: List[String], de
         inner.push(name)
         mut inner_paths := copy_names(held_paths)
         inner_paths.push(path)
-        walk_locks(node.children[3], k, inner, inner_paths, definitions, g)
+        walk_locks(node.children[3], k, inner, inner_paths, g)
         return
-    mut def_key := 0 - 1
-    if node.kind == "call" and node.children.len() > 0:
-        def_key = node.children[0]
-    elif node.kind == "method_call":
-        def_key = idx
-    if def_key >= 0 and definitions.contains_key(def_key) and g.fn_index.contains_key(definitions[def_key]):
-        callee := g.fn_index[definitions[def_key]]
+    decl := called_declaration(idx)
+    if decl >= 0 and g.fn_index.contains_key(decl):
+        callee := g.fn_index[decl]
         g.callees[k].push(callee)
         if held.len() > 0:
             g.held_call_held.push(copy_names(held))
@@ -254,7 +239,7 @@ fn walk_locks(idx: Int, k: Int, held: List[String], held_paths: List[String], de
                     g.method_call_line.push(node.line)
                     g.method_call_col.push(node.col)
     for child in node.children:
-        walk_locks(child, k, held, held_paths, definitions, g)
+        walk_locks(child, k, held, held_paths, g)
 
 fn copy_names(names: List[String]) -> List[String]:
     mut out: List[String] := []

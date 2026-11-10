@@ -2116,13 +2116,23 @@ fn ir_borrow_param_recorded(sym: String, pos: Int, is_result: Bool) -> Bool:
 # keeps the cascade off for that argument.
 fn ir_record_borrow_params(root_idx: Int):
     ir_borrow_param_local = {}
+    ir_walk_module_fns(root_idx, false, ir_record_fn_borrow_params)
+
+# call `record` on each of this module's functions and each method of its
+# non-generic impl blocks, with the symbol it is emitted under and
+# ir_current_impl_type set to its impl type. a generic method is skipped, and
+# a generic function too unless `generic_fns` is set. true when any call
+# returned true.
+fn ir_walk_module_fns(root_idx: Int, generic_fns: Bool, record: fn(Int, String) -> Bool) -> Bool:
     saved_impl_type := ir_current_impl_type
+    mut changed := false
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
         if ir_is_fn_decl_kind(node.kind):
-            if not ir_has_generic_params(node):
+            if generic_fns or not ir_has_generic_params(node):
                 ir_current_impl_type = ""
-                ir_record_fn_borrow_params(item_idx, node.value)
+                if record(item_idx, node.value):
+                    changed = true
         elif node.kind == "impl_decl":
             impl_type := ir_impl_identity_type(node, ir_current_module_path)
             if impl_type.len() > 0 and not impl_type.contains("[") and not has_generic_declaration(impl_type):
@@ -2131,13 +2141,25 @@ fn ir_record_borrow_params(root_idx: Int):
                     method_idx := ir_unwrap_pub_child(child)
                     method_node := get_node(method_idx)
                     if method_node.kind == "fn_decl" and not ir_has_generic_params(method_node):
-                        ir_record_fn_borrow_params(method_idx, impl_type + "_" + method_node.value)
+                        if record(method_idx, impl_type + "_" + method_node.value):
+                            changed = true
     ir_current_impl_type = saved_impl_type
+    return changed
 
-fn ir_record_fn_borrow_params(decl_idx: Int, sym: String):
+# record a parameter under this module's symbol and, inside a module, under
+# the name an importer calls it by
+fn ir_record_borrow_param(sym: String, pos: Int, flavor: String):
+    key_tail := "/" + pos.to_string()
+    ir_borrow_param_local.insert(sym + key_tail, flavor)
+    if ir_current_module_path.len() > 0:
+        ir_borrow_param_exported.insert(ir_import_target_name(ir_current_module_path, sym) + key_tail, flavor)
+
+# true when this call recorded a parameter
+fn ir_record_fn_borrow_params(decl_idx: Int, sym: String) -> Bool:
     body_idx := ir_tuple_walk_fn_body(decl_idx)
     if body_idx < 0:
-        return
+        return false
+    mut added := false
     mut pos := 0
     for child in get_node(decl_idx).children:
         cn := get_node(child)
@@ -2151,11 +2173,10 @@ fn ir_record_fn_borrow_params(decl_idx: Int, sym: String):
                     flavor = "optional"
             if flavor.len() > 0 and cn.value.split(" ").len() == 1:
                 if ir_tuple_param_walk(sym, body_idx, cn.value, flavor == "result"):
-                    key_tail := "/" + pos.to_string()
-                    ir_borrow_param_local.insert(sym + key_tail, flavor)
-                    if ir_current_module_path.len() > 0:
-                        ir_borrow_param_exported.insert(ir_import_target_name(ir_current_module_path, sym) + key_tail, flavor)
+                    ir_record_borrow_param(sym, pos, flavor)
+                    added = true
             pos = pos + 1
+    return added
 
 # parameters of function type that a function only ever calls, or hands to a
 # parameter of some other function recorded the same way. a closure passed to
@@ -2167,27 +2188,9 @@ fn ir_record_fn_borrow_params(decl_idx: Int, sym: String):
 # never recorded. a generic function is recorded under its own name, which is
 # the name a call site resolves before it asks for a specialization.
 fn ir_record_closure_params(root_idx: Int):
-    saved_impl_type := ir_current_impl_type
     mut changed := true
     while changed:
-        changed = false
-        for item_idx in ir_root_items(root_idx):
-            node := get_node(item_idx)
-            if ir_is_fn_decl_kind(node.kind):
-                ir_current_impl_type = ""
-                if ir_record_fn_closure_params(item_idx, node.value):
-                    changed = true
-            elif node.kind == "impl_decl":
-                impl_type := ir_impl_identity_type(node, ir_current_module_path)
-                if impl_type.len() > 0 and not impl_type.contains("[") and not has_generic_declaration(impl_type):
-                    ir_current_impl_type = impl_type
-                    for child in node.children:
-                        method_idx := ir_unwrap_pub_child(child)
-                        method_node := get_node(method_idx)
-                        if method_node.kind == "fn_decl" and not ir_has_generic_params(method_node):
-                            if ir_record_fn_closure_params(method_idx, impl_type + "_" + method_node.value):
-                                changed = true
-    ir_current_impl_type = saved_impl_type
+        changed = ir_walk_module_fns(root_idx, true, ir_record_fn_closure_params)
 
 # true when this pass recorded a parameter that was not recorded before
 fn ir_record_fn_closure_params(decl_idx: Int, sym: String) -> Bool:
@@ -2204,9 +2207,7 @@ fn ir_record_fn_closure_params(decl_idx: Int, sym: String) -> Bool:
             if is_fn and not ir_borrow_param_local.contains_key(sym + key_tail) and not cn.value.contains(" "):
                 name := cn.value
                 if not ir_subtree_assigns_name(body_idx, name) and ir_count_name_nodes(body_idx, name) == ir_count_local_closure_uses(body_idx, name):
-                    ir_borrow_param_local.insert(sym + key_tail, "closure")
-                    if ir_current_module_path.len() > 0:
-                        ir_borrow_param_exported.insert(ir_import_target_name(ir_current_module_path, sym) + key_tail, "closure")
+                    ir_record_borrow_param(sym, pos, "closure")
                     added = true
             pos = pos + 1
     return added
@@ -2274,27 +2275,9 @@ fn ir_record_storage_keepers(root_idx: Int):
 # one fixed-point walk over the module's functions, filling the maps the
 # current pass names
 fn ir_record_keeper_passes(root_idx: Int):
-    saved_impl_type := ir_current_impl_type
     mut changed := true
     while changed:
-        changed = false
-        for item_idx in ir_root_items(root_idx):
-            node := get_node(item_idx)
-            if ir_is_fn_decl_kind(node.kind) and not ir_has_generic_params(node):
-                ir_current_impl_type = ""
-                if ir_record_storage_keeper(item_idx, node.value):
-                    changed = true
-            elif node.kind == "impl_decl":
-                impl_type := ir_impl_identity_type(node, ir_current_module_path)
-                if impl_type.len() > 0 and not impl_type.contains("[") and not has_generic_declaration(impl_type):
-                    ir_current_impl_type = impl_type
-                    for child in node.children:
-                        method_idx := ir_unwrap_pub_child(child)
-                        method_node := get_node(method_idx)
-                        if method_node.kind == "fn_decl" and not ir_has_generic_params(method_node):
-                            if ir_record_storage_keeper(method_idx, impl_type + "_" + method_node.value):
-                                changed = true
-    ir_current_impl_type = saved_impl_type
+        changed = ir_walk_module_fns(root_idx, false, ir_record_storage_keeper)
 
 # record one function when its body keeps storage and it is not recorded yet.
 # true when this call added it.
@@ -3769,16 +3752,6 @@ fn ir_reads_mutable_global(name: String) -> Bool:
         return true
     return sym == ir_global_storage_symbol(name) and ir_mutable_global_names.contains_key(name)
 
-# pin the argument just evaluated into `reg` when pin is set and it needs it,
-# and record the kind (or "") so ir_unpin_args can release it after the call.
-fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String], pin: Bool):
-    mut kind := ""
-    if pin:
-        kind = ir_arg_pin_kind(expr_idx)
-    if kind.len() > 0:
-        ir_rc_retain_reg(reg, kind)
-    pins.push(kind)
-
 # the same hazard without a user callee: an operand read out of storage is
 # still only a borrow when an operand evaluated after it runs code that can
 # drop its owner, and the operation reads it after that. `o.name +
@@ -3812,6 +3785,17 @@ fn ir_unpin_operand(reg: Int, kind: String):
     if kind.len() > 0:
         ir_rc_release_reg(reg, kind)
 
+# pin the operand just evaluated into `reg` when `pin` is set and it needs it,
+# record the kind (or "") in `pins` for ir_unpin_args, and put the operand in
+# flight (ir_inflight_operand). 1 when it went in flight, for
+# ir_inflight_pop_n.
+fn ir_pin_arg_inflight(expr_idx: Int, reg: Int, pins: List[String], pin: Bool) -> Int:
+    kind := ir_pin_operand(expr_idx, reg, pin)
+    pins.push(kind)
+    if ir_inflight_operand(expr_idx, reg, kind):
+        return 1
+    return 0
+
 # the same pin, kept in flight until ir_unpin_inflight: the expression it
 # guards can leave the function (an index miss, a `!`), and the early exit
 # releases the pin with the locals. `self.conns[self.choose()]` leaked the
@@ -3843,11 +3827,10 @@ fn ir_call_operand_exprs(node: Node, start_idx: Int) -> List[Int]:
         exprs.push(expr_idx)
     return exprs
 
-# release what ir_pin_arg retained. pins is aligned with regs.
+# release what ir_pin_operand retained. pins is aligned with regs.
 fn ir_unpin_args(regs: List[Int], pins: List[String]):
     for kind, i in pins:
-        if kind.len() > 0:
-            ir_rc_release_reg(regs[i], kind)
+        ir_unpin_operand(regs[i], kind)
 
 # true when calling the callee at callee_idx can run user code. a bare name
 # that is neither declared, nor imported, nor a variable holding a function
@@ -3884,10 +3867,8 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List
             pins.push("")
         else:
             arg_r := ir_emit_call_arg(expr_idx)
-            ir_pin_arg(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
+            inflight = inflight + ir_pin_arg_inflight(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
             arg_regs.push(arg_r)
-            if ir_inflight_operand(expr_idx, arg_r, pins[pins.len() - 1]):
-                inflight = inflight + 1
     ir_inflight_pop_n(inflight)
     return arg_regs
 
@@ -4949,10 +4930,8 @@ fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> Lis
             r = ir_expr(expr_idx)
         else:
             r = ir_emit_call_arg(expr_idx)
-        ir_pin_arg(expr_idx, r, pins, pin or later_drops[regs.len()])
+        inflight = inflight + ir_pin_arg_inflight(expr_idx, r, pins, pin or later_drops[regs.len()])
         regs.push(r)
-        if ir_inflight_operand(expr_idx, r, pins[pins.len() - 1]):
-            inflight = inflight + 1
     ir_inflight_pop_n(inflight)
     return regs
 
@@ -6224,10 +6203,13 @@ fn ir_higher_order_walk_list(list_r: Int, may_drop: Bool) -> Int:
     ir_emit_call3(copy_r, "list_slice_copy", "list", list_r, ir_zero_reg(), len_r)
     return copy_r
 
+# release the walked copy, the function argument's pin and the function
+# argument itself once the loop is done
 fn ir_higher_order_walk_done(walk_r: Int, may_drop: Bool, fn_idx: Int, fn_r: Int, fn_pin: String):
     if may_drop:
         ir_rc_release_reg(walk_r, "list")
     ir_unpin_operand(fn_r, fn_pin)
+    ir_release_higher_order_fn_arg(fn_idx, fn_r)
 
 # a lambda literal handed to a callee that only calls it (an open-coded map,
 # filter or reduce, or a parameter ir_record_closure_params proved local)
@@ -6332,7 +6314,6 @@ fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
 
     out_r := ir_emit_list_map_loop(list_r, ctor, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
     ir_higher_order_walk_done(list_r, may_drop, mapper_idx, mapper_r, mapper_pin)
-    ir_release_higher_order_fn_arg(mapper_idx, mapper_r)
     return out_r
 
 fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
@@ -6362,7 +6343,6 @@ fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
 
     out_r := ir_emit_list_filter_loop(list_r, ctor, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
     ir_higher_order_walk_done(list_r, may_drop, keep_idx, keep_r, keep_pin)
-    ir_release_higher_order_fn_arg(keep_idx, keep_r)
     return out_r
 
 fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
@@ -6390,7 +6370,6 @@ fn ir_emit_list_reduce_lowering(idx: Int, list_idx: Int, init_idx: Int, reducer_
 
     out_r := ir_emit_list_reduce_loop(list_r, reducer_name, acc_name, ir_retkind(elem_kind), ir_retkind(result_kind), ir_temp_name("__reduce_i"))
     ir_higher_order_walk_done(list_r, may_drop, reducer_idx, reducer_r, reducer_pin)
-    ir_release_higher_order_fn_arg(reducer_idx, reducer_r)
     return out_r
 
 fn ir_emit_higher_order_list_call(idx: Int, node: Node, callee_name: String) -> Int:
@@ -6835,11 +6814,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
             ir_emit_optional_attach_dtor(r, free_opt_kind)
     ir_release_owned_args(node, 1, arg_regs)
     ir_unpin_args(arg_regs, arg_pins)
-    if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
-        if ret_type != "float" and idx == ir_rcall_defer_idx:
-            return ir_emit_wrapped_legacy_pair(r, ret_type, callee.name)
-        return ir_emit_wrapped_legacy_result(r, ret_type, callee.name, idx)
-    return r
+    return ir_wrap_legacy_call_result(r, ret_type, callee.name, idx, uses_result_abi)
 
 # store_name is the plain store for the literal's key flavor (map_insert,
 # map_insert_ikey, map_insert_bkey); the value's kind and ownership may
@@ -7335,9 +7310,7 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
         else:
             elem_r := ir_expr(child)
             elem_regs.push(elem_r)
-            elem_pins.push(ir_pin_operand(child, elem_r, later_drops[ci]))
-            if ir_inflight_operand(child, elem_r, elem_pins[elem_pins.len() - 1]):
-                inflight = inflight + 1
+            inflight = inflight + ir_pin_arg_inflight(child, elem_r, elem_pins, later_drops[ci])
         elem_nodes.push(child)
     ir_inflight_pop_n(inflight)
     r := ir_reg()
@@ -7868,6 +7841,21 @@ fn ir_count_call_binds(idx: Int, name: String, inside_loop: Bool) -> Int:
     for child in node.children:
         n = n + ir_count_call_binds(child, name, in_loop)
     return n
+
+# whether a call the checker typed as a result came back from a legacy
+# single-register callee, whose value the caller has to wrap
+fn ir_legacy_call_result_wraps(idx: Int, uses_result_abi: Bool, ret_type: String) -> Bool:
+    return uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple"
+
+# the result of call `idx` in the shape the checker typed it: a legacy
+# single-register result wrapped as a pair or a box, or `r` unchanged when no
+# wrap applies
+fn ir_wrap_legacy_call_result(r: Int, ret_type: String, callee_name: String, idx: Int, uses_result_abi: Bool) -> Int:
+    if not ir_legacy_call_result_wraps(idx, uses_result_abi, ret_type):
+        return r
+    if ret_type != "float" and idx == ir_rcall_defer_idx:
+        return ir_emit_wrapped_legacy_pair(r, ret_type, callee_name)
+    return ir_emit_wrapped_legacy_result(r, ret_type, callee_name, idx)
 
 # hand a legacy single-register result straight to the pair handshake:
 # decode the sentinel into (flag, payload) registers with no box on either
@@ -8766,11 +8754,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         # plain static calls: owned string temps die with the call
         ir_release_owned_args(node, 1, arg_regs)
         ir_unpin_args(arg_regs, arg_pins)
-        if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
-            if ret_type != "float" and idx == ir_rcall_defer_idx:
-                return ir_emit_wrapped_legacy_pair(r, ret_type, call_name)
-            return ir_emit_wrapped_legacy_result(r, ret_type, call_name, idx)
-        return r
+        return ir_wrap_legacy_call_result(r, ret_type, call_name, idx, uses_result_abi)
     return 0 - 1
 
 # the general method dispatch: self-hosted list builtins, a call through a
@@ -8803,7 +8787,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             ir_emit("store " + tmp_name + " " + handle_r.to_string())
             # the closure runs user code, which can overwrite this field or
             # the fields its arguments were read from. so the handle and those
-            # arguments are pinned for the call, as ir_pin_arg does for any
+            # arguments are pinned for the call, as ir_pin_operand does for any
             # user callee; unpinned, `h.f = g` inside the closure freed the
             # environment it was still running in.
             ir_rc_retain_reg(handle_r, "closure")
@@ -8814,7 +8798,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 arg_idx := ir_method_call_arg_expr(node, ai)
                 arg_r := ir_emit_call_arg(arg_idx)
                 arg_regs.push(arg_r)
-                ir_pin_arg(arg_idx, arg_r, arg_pins, true)
+                arg_pins.push(ir_pin_operand(arg_idx, arg_r, true))
                 ai = ai + 1
             r := ir_reg()
             ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
@@ -8978,13 +8962,9 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             # classification rather than the void call's.
             if not ir_is_void_method(emit_name):
                 ir_rc_release_reg(obj_r, recv_kind)
-    if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
-        if ret_type != "float" and idx == ir_rcall_defer_idx:
-            return ir_emit_wrapped_legacy_pair(r, ret_type, emit_name)
-        return ir_emit_wrapped_legacy_result(r, ret_type, emit_name, idx)
-    if ir_is_void_method(emit_name):
+    if ir_is_void_method(emit_name) and not ir_legacy_call_result_wraps(idx, uses_result_abi, ret_type):
         return obj_r
-    return r
+    return ir_wrap_legacy_call_result(r, ret_type, emit_name, idx, uses_result_abi)
 
 # --- string interpolation ---
 fn ir_string_interp_part_reg(child: Int) -> Int:

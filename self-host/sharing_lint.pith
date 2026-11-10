@@ -22,13 +22,10 @@
 
 from ast import Node, get_node
 from errors import Diagnostic, has_errors
-from checker import c_get_expr_type, get_definition_of
+from checker import c_get_expr_type, called_declaration, extract_binding_name, COLLECTION_MUTATORS
 from types import get_type_info, get_type_name, is_error_type
 from driver import get_resolved_module_file, get_resolved_module_path
 from checker_methods import method_tid_key, has_method_declaration, get_method_declaration_index
-
-# method names that change a collection in place
-MUTATING_METHODS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
 
 # builtin values that synchronize themselves, or hold no shared buffer
 SELF_SYNCHRONIZED := ",AtomicInt,Mutex,WaitGroup,Semaphore,Channel,Task,"
@@ -73,7 +70,7 @@ pub fn lint_shared_globals(entry_root: Int, entry_path: String, import_roots: Li
     for found, i in written:
         for idx in found:
             node := get_node(idx)
-            name := binding_name(node.value)
+            name := extract_binding_name(node.value)
             out.push(Diagnostic("error", "E309", "'" + name + "' is a mut module global holding a shared buffer, written after module init, in a program that spawns tasks (" + spawn_at + ")", files[i], node.line, node.col, "declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init"))
     return out
 
@@ -90,7 +87,6 @@ struct ProgramFns:
     aliases: Map[String, Int]
     from_names: Map[String, Int]
     module_of: Map[Int, Int]
-    definitions: Map[Int, Int]
 
 # where the entry module (roots[0]) reaches a spawn, as "file:line", or ""
 fn reached_spawn(roots: List[Int], files: List[String]) -> String:
@@ -101,7 +97,7 @@ fn reached_spawn(roots: List[Int], files: List[String]) -> String:
             found := first_spawn(child)
             if found >= 0:
                 return files[0] + ":" + get_node(found).line.to_string()
-    fns := ProgramFns(nodes: [], modules: [], free_fns: {}, methods_by_name: {}, aliases: {}, from_names: {}, module_of: {}, definitions: get_definition_of())
+    fns := ProgramFns(nodes: [], modules: [], free_fns: {}, methods_by_name: {}, aliases: {}, from_names: {}, module_of: {})
     for r, i in roots:
         collect_functions(r, i, false, fns)
     record_imports(roots, fns)
@@ -184,21 +180,16 @@ fn record_imports(roots: List[Int], fns: ProgramFns):
 
 # the functions a subtree in `module` calls, appended to `out`, and the first
 # spawn in it, or -1. the walk stops at a spawn, since then the calls no longer
-# matter. the checker
-# records the declaration most calls resolve to; the module, import and
-# receiver-type lookups below cover the rest, such as a method called through
-# an interface.
+# matter. the checker records the declaration most calls resolve to; the
+# module, import and receiver-type lookups below cover the rest, such as a
+# method called through an interface.
 fn collect_call_targets(idx: Int, module: Int, fns: ProgramFns, out: List[Int]) -> Int:
     node := get_node(idx)
     if node.kind == "spawn":
         return idx
-    mut def_key := 0 - 1
-    if node.kind == "call" and node.children.len() > 0:
-        def_key = node.children[0]
-    elif node.kind == "method_call":
-        def_key = idx
-    if def_key >= 0 and fns.definitions.contains_key(def_key) and fns.module_of.contains_key(fns.definitions[def_key]):
-        out.push(fns.definitions[def_key])
+    decl := called_declaration(idx)
+    if decl >= 0 and fns.module_of.contains_key(decl):
+        out.push(decl)
     elif node.kind == "call" and node.children.len() > 0:
         callee := get_node(node.children[0])
         if callee.kind == "ident":
@@ -288,15 +279,9 @@ fn written_shared_globals(root_idx: Int) -> List[Int]:
         if kind != "binding" and kind != "threadlocal":
             collect_writes(idx, written)
     for idx in candidates:
-        if written.contains_key(binding_name(get_node(idx).value)):
+        if written.contains_key(extract_binding_name(get_node(idx).value)):
             reported.push(idx)
     return reported
-
-fn binding_name(value: String) -> String:
-    sp := value.index_of(" ")
-    if sp >= 0:
-        return value.substring(0, sp)
-    return value
 
 # whether a global's type is a list, a map, a set or a struct, read from the
 # type the checker recorded for its initializer
@@ -326,7 +311,7 @@ fn collect_writes(idx: Int, written: Map[String, Bool]):
         root := path_root(node.children[0])
         if root != "":
             written.insert(root, true)
-    if node.kind == "method_call" and node.children.len() >= 1 and MUTATING_METHODS.contains("," + node.value + ","):
+    if node.kind == "method_call" and node.children.len() >= 1 and COLLECTION_MUTATORS.contains("," + node.value + ","):
         root := path_root(node.children[0])
         if root != "":
             written.insert(root, true)

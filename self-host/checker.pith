@@ -1640,8 +1640,10 @@ fn get_type_node_name_with_substitution(node: Node, subst_map: Map[String, Int])
         return build_interface_type_name(node.value, parts)
     return ""
 
-# extract the binding name from a binding value like "x" or "x mut"
-fn extract_binding_name(value: String) -> String:
+# the name a binding or parameter node declares. the parser stores the name
+# first, followed by any modifiers and a guard marker: "x", "x mut",
+# "cached guard:mu mut"
+pub fn extract_binding_name(value: String) -> String:
     mut i := 0
     while i < value.len():
         if ord(value[i]) == 32:
@@ -2181,10 +2183,10 @@ fn is_mutex_or_mutex_list(t: Int) -> Bool:
 # a call to a function declared `holding m` needs `m` held at the call. a
 # path rooted at `self` is read off the receiver, and one rooted at a
 # parameter off that argument.
-fn check_holding_call(call_idx: Int, def_key: Int, node: Node, scope_id: Int):
-    if definition_of.contains_key(def_key) == false:
+fn check_holding_call(call_idx: Int, node: Node, scope_id: Int):
+    decl_idx := called_declaration(call_idx)
+    if decl_idx < 0:
         return
-    decl_idx := definition_of[def_key]
     decl := get_node(decl_idx)
     if decl.kind != "fn_decl":
         return
@@ -3260,6 +3262,19 @@ pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
 pub fn get_definition_of() -> Map[Int, Int]:
     return definition_of
 
+# the declaration node a call or a method call resolved to, or -1. a call is
+# recorded under its callee and a method call under itself.
+pub fn called_declaration(idx: Int) -> Int:
+    node := get_node(idx)
+    mut key := 0 - 1
+    if node.kind == "call" and node.children.len() > 0:
+        key = node.children[0]
+    elif node.kind == "method_call":
+        key = idx
+    if key >= 0 and definition_of.contains_key(key):
+        return definition_of[key]
+    return 0 - 1
+
 # record a use-site -> declaration-node pair. -1 on either side means
 # the resolution has no source node (builtins), so nothing is recorded
 fn record_definition(use_idx: Int, decl_idx: Int):
@@ -3320,12 +3335,11 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         return check_if_expression(node, scope_id)
     if node.kind == "call":
         call_tid := check_function_call(node, scope_id)
-        if node.children.len() > 0:
-            check_holding_call(node_idx, node.children[0], node, scope_id)
+        check_holding_call(node_idx, node, scope_id)
         return call_tid
     if node.kind == "method_call":
         method_tid := check_method_call(node, scope_id)
-        check_holding_call(node_idx, node_idx, node, scope_id)
+        check_holding_call(node_idx, node, scope_id)
         return method_tid
     if node.kind == "field_access":
         return check_field_access_expression(node_idx, node, scope_id)
@@ -8531,7 +8545,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
 # both checks run after a body is checked, when every expression has a type.
 
 # the methods that change a list, a map or a set in place
-COLLECTION_MUTATORS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
+pub COLLECTION_MUTATORS := ",push,pop,insert,remove,clear,set,sort,sort_by,reverse,extend,append,truncate,remove_at,push_front,pop_front,swap,fill,retain,drain,add,discard,put,"
 
 fn check_guard_rules(body_idx: Int):
     check_frozen_writes(body_idx)
@@ -8617,18 +8631,9 @@ fn check_lock_escapes(idx: Int, fn_body: Int):
 fn collect_bound_names(idx: Int, out: Map[String, Bool]):
     node := get_node(idx)
     if node.kind == "binding" and node.value != "":
-        out.insert(bound_name(node.value), true)
+        out.insert(extract_binding_name(node.value), true)
     for child in node.children:
         collect_bound_names(child, out)
-
-fn bound_name(value: String) -> String:
-    mut rest := value
-    if rest.starts_with("mut "):
-        rest = rest.substring(4, rest.len())
-    sp := rest.index_of(" ")
-    if sp >= 0:
-        return rest.substring(0, sp)
-    return rest
 
 fn report_escape(at: Int, name: String, how: String):
     report_error_with_fix_at(at, "E276", "'" + name + "' is guarded, and " + how + ", so the buffer is reached after the lock is released", "copy what is needed inside the block, or declare the field `frozen` outside the guard block if it is never changed")

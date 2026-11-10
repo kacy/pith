@@ -24,7 +24,7 @@ from ir_ast_helpers import ir_is_binding_kind
 from errors import Diagnostic
 from std.strings import lines_keep_empty
 from return_paths import missing_return_sites
-from checker import c_get_expr_type
+from checker import c_get_expr_type, extract_binding_name
 from types import get_type_info, is_error_type, lookup_qualified_type_id
 
 # ---------------------------------------------------------------
@@ -145,7 +145,7 @@ fn lint_top_level(node_idx: Int, source: String):
         # how this tree spells one — std, self-host, tools and bench all do.
         # flagging those as non-snake_case was the rule misreading a constant
         # as a variable, and it is why std/ could never be brought under lint.
-        name := l_extract_binding_name(inner.value)
+        name := extract_binding_name(inner.value)
         if not is_screaming_snake_case(name):
             check_snake_case(name, "constant", inner.line, inner.col)
     elif inner.kind == "test_decl":
@@ -378,19 +378,6 @@ fn lint_stmt_depth(node_idx: Int, depth: Int):
 fn is_line_indented(line: String, trimmed: String) -> Bool:
     return line.len() > trimmed.len()
 
-# extract the plain binding name from a value like "mut x" or "x"
-fn l_extract_binding_name(value: String) -> String:
-    if value.starts_with("mut "):
-        return value.substring(4, value.len())
-    # a `mut` binding stores its marker AFTER the name, so the leading strip
-    # above never fired for one and the name came out as "app_name mut" —
-    # which then failed the snake_case test on the space, reporting a casing
-    # problem that was really a parsing one. every `mut` module binding in the
-    # tree was flagged this way.
-    if value.contains(" "):
-        return value.split(" ")[0]
-    return value
-
 fn is_lowercase_char(c: Int) -> Bool:
     return c >= 97 and c <= 122
 
@@ -524,7 +511,7 @@ fn l_record_module_global(node_idx: Int):
         inner = get_node(inner.children[0])
     if not ir_is_binding_kind(inner.kind):
         return
-    name := l_extract_binding_name(inner.value)
+    name := extract_binding_name(inner.value)
     if name.len() > 0 and not l_module_globals.contains_key(name):
         l_module_globals.insert(name, inner.line)
 
@@ -544,9 +531,9 @@ fn l_report_shadowed_global(name: String, kind: String, line: Int, col: Int):
 fn lint_shadowed_globals(idx: Int):
     node := get_node(idx)
     if node.kind == "param":
-        l_report_shadowed_global(l_extract_binding_name(node.value), "parameter", node.line, node.col)
+        l_report_shadowed_global(extract_binding_name(node.value), "parameter", node.line, node.col)
     elif ir_is_binding_kind(node.kind):
-        l_report_shadowed_global(l_extract_binding_name(node.value), "binding", node.line, node.col)
+        l_report_shadowed_global(extract_binding_name(node.value), "binding", node.line, node.col)
     elif node.kind == "pat_binding":
         l_report_shadowed_global(node.value, "pattern binding", node.line, node.col)
     for child in node.children:
@@ -680,7 +667,7 @@ fn l_collect_resource_bindings(node_idx: Int, body_idx: Int):
     if node.kind == "binding" and node.children.len() > 0:
         label := l_init_resource_label(node.children[node.children.len() - 1])
         if label.len() > 0:
-            l_check_resource_binding(l_extract_binding_name(node.value), label, node.line, node.col, body_idx)
+            l_check_resource_binding(extract_binding_name(node.value), label, node.line, node.col, body_idx)
     for child in node.children:
         l_collect_resource_bindings(child, body_idx)
 

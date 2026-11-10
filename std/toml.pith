@@ -12,6 +12,7 @@
 import std.bytes as bytes
 import std.io as io
 import std.bits as bits
+from std.collections import truncate_list
 
 TOML_FILE_CHUNK_SIZE := 4096
 
@@ -204,26 +205,6 @@ fn push_array_element(handle: Int, val: Int):
         return
     array_items[entry].push(val)
 
-fn truncate_ints(items: List[Int], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_strings(items: List[String], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_int_lists(items: List[List[Int]], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_string_lists(items: List[List[String]], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_maps(items: List[Map[String, Int]], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
 # ===============================================================
 # Node-pool reclamation
 # ===============================================================
@@ -246,8 +227,8 @@ fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int
         last := segment_ids.len() - 1
         if segment_ids[last] >= node_id_mark:
             cut = segment_slots[last]
-            truncate_ints(segment_ids, last)
-            truncate_ints(segment_slots, last)
+            truncate_list(segment_ids, last)
+            truncate_list(segment_slots, last)
         else:
             within := segment_slots[last] + (node_id_mark - segment_ids[last])
             if within < cut:
@@ -271,15 +252,15 @@ fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int
             arrays_cut = node_payloads[slot]
         slot = slot + 1
     if strings_cut >= 0:
-        truncate_strings(node_strings, strings_cut)
+        truncate_list(node_strings, strings_cut)
     if tables_cut >= 0:
-        truncate_string_lists(table_keys, tables_cut)
-        truncate_int_lists(table_values, tables_cut)
-        truncate_maps(table_index, tables_cut)
+        truncate_list(table_keys, tables_cut)
+        truncate_list(table_values, tables_cut)
+        truncate_list(table_index, tables_cut)
     if arrays_cut >= 0:
-        truncate_int_lists(array_items, arrays_cut)
-    truncate_ints(node_kinds, cut)
-    truncate_ints(node_payloads, cut)
+        truncate_list(array_items, arrays_cut)
+    truncate_list(node_kinds, cut)
+    truncate_list(node_payloads, cut)
 
 # node-pool position a compiler-lowered typed decode rolls back to.
 pub fn pool_mark_node_id() -> Int:
@@ -458,33 +439,24 @@ fn is_number_char(c: String) -> Bool:
         return true
     return false
 
-fn parse_float_manual(s: String) -> Float:
-    # split on decimal point, compute integer + fractional parts
-    mut int_part := 0
-    mut frac_part := 0.0
-    mut frac_div := 1.0
-    mut neg := false
-    mut i := 0
-    mut in_frac := false
-    if s.len() > 0 and s[0] == "-":
-        neg = true
-        i = 1
-    if s.len() > 0 and s[0] == "+":
-        i = 1
+fn is_digit_at(s: String, i: Int) -> Bool:
+    return i >= 0 and i < s.len() and s[i] >= "0" and s[i] <= "9"
+
+# true when a float literal keeps the rules toml adds to what parse_float
+# takes: no leading zero in the integer part, and every "_" and "." between
+# two digits.
+fn float_literal_ok(s: String) -> Bool:
+    mut start := 0
+    if s.len() > 0 and (s[0] == "-" or s[0] == "+"):
+        start = 1
+    if s.len() > start + 1 and s[start] == "0" and (is_digit_at(s, start + 1) or s[start + 1] == "_"):
+        return false
+    mut i := start
     while i < s.len():
-        c := s[i]
-        if c == ".":
-            in_frac = true
-        if c >= "0" and c <= "9" and not in_frac:
-            int_part = int_part * 10 + (ord(c) - 48)
-        if c >= "0" and c <= "9" and in_frac:
-            frac_div = frac_div * 10.0
-            frac_part = frac_part + (ord(c) - 48).to_float() / frac_div
+        if (s[i] == "_" or s[i] == ".") and not (is_digit_at(s, i - 1) and is_digit_at(s, i + 1)):
+            return false
         i = i + 1
-    result := int_part.to_float() + frac_part
-    if neg:
-        return 0.0 - result
-    return result
+    return true
 
 # Main recursive value parser.
 # Guards nesting depth so a pathological "k = [[[[..." value fails cleanly
@@ -587,8 +559,14 @@ fn parse_value_node() -> Int:
             parser_position = parser_position + 1
         num_str := parser_input.substring(start, parser_position)
         if is_float:
-            idx := new_node(TOML_FLOAT, float_to_bits(parse_float_manual(num_str)))
-            return idx
+            if not float_literal_ok(num_str):
+                parser_error = true
+                return 0 - 1
+            # parse_float fails on an exponent past a Float's range
+            value := parse_float(num_str.replace("_", "")) catch:
+                parser_error = true
+                return 0 - 1
+            return new_node(TOML_FLOAT, float_to_bits(value))
         if not is_float:
             parsed := parse_int(num_str.replace("_", "")) catch:
                 parser_error = true

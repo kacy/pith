@@ -39,9 +39,7 @@ those inputs under `<out>/corpus/<target>` for later batches.
    protocol's own limits is reported as `unbounded-read`.
 
 each batch records at most three inputs of a kind, so a bug that many inputs
-hit does not bury the rest. `hits_known_bug` skips inputs that only re-find a
-hang already on file; delete its clauses as those bugs are fixed, or pass
-`--no-skip`.
+hit does not bury the rest.
 
 ## running it
 

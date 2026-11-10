@@ -2752,18 +2752,10 @@ fn strip_header_controls(text: String) -> String:
         i = i + 1
     return out.take_bytes().to_string_utf8() catch ""
 
+# serialize the head of a response written outside a keep-alive serve loop: a
+# Connection the handler set is kept, else the head says close.
 fn response_head_bytes(response: HttpResponse, content_length: Int, use_chunked: Bool) -> Bytes!:
-    return response_head_bytes_conn(response, content_length, use_chunked, "")!
-
-# serialize a response head with an explicit Connection value. `connection` is
-# how a keep-alive server names the disposition of the connection *without*
-# rebuilding the response to carry a Connection header. passing "keep-alive" or
-# "close" here writes exactly that line and drops any Connection the response's
-# own header map holds, so the caller decides keep-alive per request with no
-# per-request `HttpResponse` copy. an empty `connection` keeps the standalone
-# behavior: honor a Connection the handler set, else default to close.
-fn response_head_bytes_conn(response: HttpResponse, content_length: Int, use_chunked: Bool, connection: String) -> Bytes!:
-    return build_response_head(response, content_length, use_chunked, standalone_connection(response, connection), "", false)
+    return build_response_head(response, content_length, use_chunked, standalone_connection(response, ""), "", false)
 
 # the Connection value a response written outside a keep-alive serve loop
 # carries: the one asked for, else the handler's, else close.
@@ -3106,7 +3098,7 @@ fn run_connection_taker(src: ByteSource) -> Bool:
     if let taker = pending_taker:
         pending_taker = none
         pending_body = none
-        arm_read_deadline_at(src, 0)
+        tcp_set_read_deadline(src.socket, 0)
         tcp_set_write_deadline(src.socket, 0)
         read := fn(n: Int) -> Bytes!:
             return source_read_available(src, n)!
@@ -3141,13 +3133,10 @@ fn chunk_frame(data: Bytes) -> Bytes:
     return out.take_bytes()
 
 fn streamed_head_bytes(resp: HttpResponse, chunked: Bool, connection: String, is_head: Bool) -> Bytes!:
-    out := bytes.buffer_with_capacity(RESPONSE_HEAD_CAPACITY)
-    errdefer out.free()
     # the framing field takes the body's length from here, and a sized stream has
     # declared one
     declared := parse_int(header_lookup(resp.headers, "Content-Length").trim()) catch 0
-    write_response_head(out, resp, declared, chunked, connection, current_date_field(), is_head)!
-    return out.take_bytes()
+    return build_response_head(resp, declared, chunked, connection, current_date_field(), is_head)
 
 # send a streamed response on an http/1.1 connection: the head, then what the
 # producer writes. the answer is whether the body ended as framed, so the
@@ -3306,19 +3295,6 @@ fn server_conn(src: ByteSource, writer: BufferedBytesWriter, handler: fn(HttpReq
     if config.times_reads():
         opened = time_mod.mono_millis()
     return ServerConn(src, writer, handler, config, opened)
-
-# set the read deadline of a server connection to `due` on the mono_millis
-# clock, or clear it when `due` is 0. a due time already past still waits 1
-# ms, since 0 would mean no deadline at all.
-fn arm_read_deadline_at(src: ByteSource, due: Int):
-    if due <= 0:
-        tcp_set_read_deadline(src.socket, 0)
-        return
-    left := due - time_mod.mono_millis()
-    if left < 1:
-        tcp_set_read_deadline(src.socket, 1)
-        return
-    tcp_set_read_deadline(src.socket, left)
 
 # the read deadline `ms` from now, or none for 0, and when it falls due on the
 # mono_millis clock (0 for none). the clock is read first, so the runtime's
@@ -3489,7 +3465,7 @@ fn read_server_request(conn: ServerConn, body_due: Int, rearm: Bool) -> ServerRe
         if has_body:
             source_write(src, conn.writer, bytes.from_string_utf8(CONTINUE_RESPONSE))!
     if rearm and has_body:
-        arm_read_deadline_at(src, body_due)
+        arm_deadline_at(src.socket, body_due, true)
     if config.stream_request_bodies and has_body:
         pending_body = BodyStream(src, parsed.chunked, parsed.content_length, 0, false, false, false)
         return ServerRequest(request_from_head(parsed, bytes.empty())!, parsed.wants_close)
@@ -5538,7 +5514,7 @@ impl Client:
             if head.is_ok:
                 parsed := head.ok
                 # the time limit was for the head
-                arm_client_deadline(c.stream.fd, 0, true)
+                arm_deadline_at(c.stream.fd, 0, true)
                 resp := response_from_parsed(parsed, bytes.empty(), {})
                 mut length := -1
                 if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
@@ -5561,13 +5537,13 @@ impl Client:
         mut target := normalize_path(req.path)
         if route.absolute:
             target = "http://" + host_header_value(req.host, req.port, false) + target
-        arm_client_deadline(fd, deadline, false)
+        arm_deadline_at(fd, deadline, false)
         client_write(c, request_wire_bytes(req, target, connection, false)!, deadline)!
         src := wire_source(c)
         mut header_due := 0
         if self.response_header_timeout_ms > 0:
             header_due = time_mod.mono_millis() + self.response_header_timeout_ms
-        arm_client_deadline(fd, earliest_due(deadline, header_due), true)
+        arm_deadline_at(fd, earliest_due(deadline, header_due), true)
         arrived := source_wait_bytes(src) catch 0
         if arrived <= 0:
             fail client_timeout_failure(NO_RESPONSE_MESSAGE, deadline, header_due)
@@ -5700,8 +5676,8 @@ impl Client:
         stream := dialed!
         if not req.use_tls:
             return plain_wire(stream, key)
-        arm_client_deadline(stream.fd, deadline, true)
-        arm_client_deadline(stream.fd, deadline, false)
+        arm_deadline_at(stream.fd, deadline, true)
+        arm_deadline_at(stream.fd, deadline, false)
         if route.tunnel:
             opened := open_tunnel(stream, req)
             if opened.is_err:
@@ -5784,7 +5760,7 @@ impl Client:
             wire = request_head_bytes(req, target, connection, accept_gzip)!
         else:
             wire = request_wire_bytes(req, target, connection, accept_gzip)!
-        arm_client_deadline(fd, deadline, false)
+        arm_deadline_at(fd, deadline, false)
         client_write(c, wire, deadline)!
         src := wire_source(c)
         if expect:
@@ -5796,7 +5772,7 @@ impl Client:
         mut header_due := 0
         if self.response_header_timeout_ms > 0:
             header_due = time_mod.mono_millis() + self.response_header_timeout_ms
-        arm_client_deadline(fd, earliest_due(deadline, header_due), true)
+        arm_deadline_at(fd, earliest_due(deadline, header_due), true)
         arrived := source_wait_bytes(src) catch 0
         if arrived <= 0:
             fail client_timeout_failure(NO_RESPONSE_MESSAGE, deadline, header_due)
@@ -5814,7 +5790,7 @@ impl Client:
     # that is reassigned: a struct value copied into a mut binding and then
     # replaced leaks a reference per exchange.
     fn finish_exchange(src: ByteSource, req: ClientRequest, parsed: ResponseHead, writer: BufferedBytesWriter, streaming: Bool, deadline: Int, accept_gzip: Bool, body_sent: Bool) -> ClientResult!:
-        arm_client_deadline(src.socket, deadline, true)
+        arm_deadline_at(src.socket, deadline, true)
         trailers: Map[String, String] := {}
         mut body := bytes.empty()
         mut body_size := 0
@@ -5848,7 +5824,7 @@ impl Client:
     fn await_continue(src: ByteSource, req: ClientRequest, deadline: Int) -> ResponseHead!:
         send_body := ResponseHead(bytes.empty(), 0, 1, HTTP_RESPONSE_BODY_NONE, 0, false)
         due := earliest_due(deadline, time_mod.mono_millis() + self.expect_continue_timeout_ms)
-        arm_client_deadline(src.socket, due, true)
+        arm_deadline_at(src.socket, due, true)
         arrived := source_wait_bytes(src)
         if arrived.is_err:
             if deadline_passed(deadline):
@@ -5858,7 +5834,7 @@ impl Client:
             fail NO_RESPONSE_MESSAGE
         if (arrived!) <= 0:
             fail NO_RESPONSE_MESSAGE
-        arm_client_deadline(src.socket, deadline, true)
+        arm_deadline_at(src.socket, deadline, true)
         while true:
             got := read_request_head(src, self.max_response_header_bytes)
             if got.is_err:
@@ -5903,7 +5879,7 @@ fn earliest_due(a: Int, b: Int) -> Int:
 # set the read (or write) deadline of `fd` to `due` on the mono_millis clock,
 # or clear it when `due` is 0. a due time already past still waits 1 ms, since
 # 0 would mean no deadline at all.
-fn arm_client_deadline(fd: Int, due: Int, read: Bool):
+fn arm_deadline_at(fd: Int, due: Int, read: Bool):
     mut ms := 0
     if due > 0:
         ms = due - time_mod.mono_millis()
@@ -6172,7 +6148,7 @@ fn await_request(conn: ServerConn, served: Int) -> Int:
     if served == 0:
         if config.header_timeout() > 0:
             due = conn.opened_ms + config.header_timeout()
-            arm_read_deadline_at(conn.src, due)
+            arm_deadline_at(conn.src.socket, due, true)
     else:
         arm_read_deadline(conn.src, config.idle_timeout())
     arrived := source_wait_bytes(conn.src) catch 0

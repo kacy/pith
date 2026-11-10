@@ -54,7 +54,7 @@ fn declare_runtime_function(
 
 /// every name the IR may call a runtime function by
 pub fn runtime_function_keys() -> impl Iterator<Item = &'static str> {
-    ABI_RUNTIME_FUNCTIONS.iter().chain(COMPAT_RUNTIME_FUNCTIONS).map(|decl| decl.key)
+    ABI_RUNTIME_FUNCTIONS.iter().map(|decl| decl.key)
 }
 
 /// Import every runtime function in the generated table, keyed by the name
@@ -66,7 +66,7 @@ pub fn declare_runtime_functions(
     let mut funcs = HashMap::new();
     let mut declared: HashMap<&str, FuncId> = HashMap::new();
 
-    for decl in ABI_RUNTIME_FUNCTIONS.iter().chain(COMPAT_RUNTIME_FUNCTIONS) {
+    for decl in ABI_RUNTIME_FUNCTIONS.iter() {
         let fid = match declared.get(decl.symbol) {
             Some(&existing) => existing,
             None => {

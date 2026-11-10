@@ -31,31 +31,11 @@ use pith_runtime::collections::list::{
 };
 use std::collections::{HashMap, HashSet};
 
-#[cfg(pith_cranelift_new_api)]
-fn declare_i64_var(builder: &mut FunctionBuilder<'_>) -> Variable {
-    builder.declare_var(types::I64)
-}
-
-#[cfg(not(pith_cranelift_new_api))]
-fn declare_i64_var(builder: &mut FunctionBuilder<'_>, next_var_id: &mut u32) -> Variable {
-    let var = Variable::new((*next_var_id) as usize);
-    *next_var_id += 1;
-    builder.declare_var(var, types::I64);
-    var
-}
-
-/// Block arguments in the form this Cranelift version's branch builders
-/// take: `BlockArg`s from 0.130 on, plain values before.
-#[cfg(pith_cranelift_new_api)]
+/// Block arguments in the form Cranelift's branch builders take.
 fn block_args<const N: usize>(
     values: [Value; N],
 ) -> [cranelift::codegen::ir::instructions::BlockArg; N] {
     values.map(cranelift::codegen::ir::instructions::BlockArg::Value)
-}
-
-#[cfg(not(pith_cranelift_new_api))]
-fn block_args<const N: usize>(values: [Value; N]) -> [Value; N] {
-    values
 }
 
 fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Value) {
@@ -2783,8 +2763,6 @@ fn compile_ir_function(
     // target not yet seen is a forward jump (if/else/result merge, break) and is
     // correctly excluded.
     let mut defined_labels: HashSet<String> = HashSet::new();
-    #[cfg(not(pith_cranelift_new_api))]
-    let mut next_var_id: u32 = 0;
 
     if func_name == "main" {
         emit_main_prologue(
@@ -2801,10 +2779,7 @@ fn compile_ir_function(
 
     for (i, name) in param_names.iter().enumerate() {
         if i < block_params.len() {
-            #[cfg(pith_cranelift_new_api)]
-            let var = declare_i64_var(&mut builder);
-            #[cfg(not(pith_cranelift_new_api))]
-            let var = declare_i64_var(&mut builder, &mut next_var_id);
+            let var = builder.declare_var(types::I64);
             builder.def_var(var, block_params[i]);
             named_vars.insert(name.clone(), var);
             regs.insert(i, block_params[i]);
@@ -3729,10 +3704,7 @@ fn compile_ir_function(
                     let var = if let Some(&v) = named_vars.get(&name) {
                         v
                     } else {
-                        #[cfg(pith_cranelift_new_api)]
-                        let v = declare_i64_var(&mut builder);
-                        #[cfg(not(pith_cranelift_new_api))]
-                        let v = declare_i64_var(&mut builder, &mut next_var_id);
+                        let v = builder.declare_var(types::I64);
                         named_vars.insert(name, v);
                         v
                     };

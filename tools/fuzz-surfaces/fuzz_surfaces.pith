@@ -32,6 +32,7 @@ import std.compress.inflate as inflate
 import std.compress.zlib as zlib
 import std.compress.zstd as zstd
 import std.compress.zstd_pure_frame as zstd_pure
+import std.encoding as encoding
 import std.binary as binary
 import std.fs as fs
 import std.glob as glob
@@ -102,17 +103,7 @@ fn b(text: String) -> Bytes:
     return bytes.from_string_utf8(text)
 
 fn hex(text: String) -> Bytes:
-    return encoding_from_hex(text.replace(" ", ""))
-
-fn encoding_from_hex(text: String) -> Bytes:
-    out := bytes.buffer()
-    defer out.free()
-    mut i := 0
-    while i + 1 < text.len():
-        value := parse_int("0x" + text.substring(i, i + 2)) catch 0
-        out.write_byte(value) catch 0
-        i = i + 2
-    return out.bytes()
+    return encoding.from_hex(text.replace(" ", "")) catch bytes.empty()
 
 # arbitrary bytes as text: valid utf-8 passes through, anything else keeps
 # its ascii bytes and turns the rest into '?'. the text parsers only take

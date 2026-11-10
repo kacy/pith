@@ -31,31 +31,11 @@ use pith_runtime::collections::list::{
 };
 use std::collections::{HashMap, HashSet};
 
-#[cfg(pith_cranelift_new_api)]
-fn declare_i64_var(builder: &mut FunctionBuilder<'_>) -> Variable {
-    builder.declare_var(types::I64)
-}
-
-#[cfg(not(pith_cranelift_new_api))]
-fn declare_i64_var(builder: &mut FunctionBuilder<'_>, next_var_id: &mut u32) -> Variable {
-    let var = Variable::new((*next_var_id) as usize);
-    *next_var_id += 1;
-    builder.declare_var(var, types::I64);
-    var
-}
-
-/// Block arguments in the form this Cranelift version's branch builders
-/// take: `BlockArg`s from 0.130 on, plain values before.
-#[cfg(pith_cranelift_new_api)]
+/// Block arguments in the form Cranelift's branch builders take.
 fn block_args<const N: usize>(
     values: [Value; N],
 ) -> [cranelift::codegen::ir::instructions::BlockArg; N] {
     values.map(cranelift::codegen::ir::instructions::BlockArg::Value)
-}
-
-#[cfg(not(pith_cranelift_new_api))]
-fn block_args<const N: usize>(values: [Value; N]) -> [Value; N] {
-    values
 }
 
 fn jump_with_i64_arg(builder: &mut FunctionBuilder<'_>, block: Block, value: Value) {
@@ -672,8 +652,8 @@ fn inline_bytes_get(builder: &mut FunctionBuilder<'_>, bytes: Value, index: Valu
     let index_is_negative = builder.ins().icmp_imm(IntCC::SignedLessThan, index, 0);
     exit_if(builder, index_is_negative, done, [zero]);
 
-    let data_ptr = builder.ins().load(types::I64, MemFlags::new(), bytes, 0);
-    let len = builder.ins().load(types::I64, MemFlags::new(), bytes, 8);
+    let data_ptr = builder.ins().load(types::I64, MemFlags::new(), bytes, BYTES_DATA_PTR_OFFSET);
+    let len = builder.ins().load(types::I64, MemFlags::new(), bytes, BYTES_DATA_LEN_OFFSET);
     let out_of_bounds = builder
         .ins()
         .icmp(IntCC::UnsignedGreaterThanOrEqual, index, len);
@@ -876,52 +856,32 @@ fn inline_list_len(builder: &mut FunctionBuilder<'_>, list: Value, fallback: Fun
     join_with_fallback_call(builder, slow, done, fallback, &[list])
 }
 
-/// Inline `b.len()` (`pith_bytes_len`) as the same handle test the getters
-/// above use and one load of the length. A loop that tests `i < b.len()`
-/// makes this call once per pass, so the FFI call cost more than the loop
-/// body did. Everything the fast path does not accept, null included, goes
-/// to `fallback`, which answers 0 for a bad handle as it always has.
-fn inline_handle_len(
+/// Inline a one-word field read off a bytes handle (`b.len()`, the data
+/// pointer): the handle test the runtime makes,
+/// then one load at `field_offset`. Everything the fast path does not accept,
+/// null included, goes to `fallback`, which answers for a bad handle as it
+/// always has. A loop that tests `i < b.len()` makes this read once per pass,
+/// so the FFI call cost more than the loop body did.
+#[allow(clippy::too_many_arguments)]
+fn inline_handle_field(
     builder: &mut FunctionBuilder<'_>,
     handle: Value,
     align: i64,
     magic_offset: i32,
     magic: u32,
-    len_offset: i32,
+    field_offset: i32,
     fallback: FuncRef,
 ) -> Value {
     let (done, slow) = strict_path_blocks(builder);
 
-    // the handle test passes two values to `slow`; a length has no index,
-    // so the handle fills both slots
+    // the handle test passes two values to `slow`; a field read has no
+    // index, so the handle fills both slots
     branch_if_not_magic_handle(builder, handle, handle, align, magic_offset, magic, slow);
-    let len = builder
+    let field = builder
         .ins()
-        .load(types::I64, MemFlags::new(), handle, len_offset);
-    jump_with_i64_arg(builder, done, len);
+        .load(types::I64, MemFlags::new(), handle, field_offset);
+    jump_with_i64_arg(builder, done, field);
 
-    let handle = builder.block_params(slow)[0];
-    join_with_fallback_call(builder, slow, done, fallback, &[handle])
-}
-
-/// Inline `pith_bytes_data_ptr`: the handle test `pith_bytes_ref` makes,
-/// then the data pointer. A handle that fails the test goes to `fallback`,
-/// which answers 0 as it always does.
-fn inline_bytes_data_ptr(builder: &mut FunctionBuilder<'_>, handle: Value, fallback: FuncRef) -> Value {
-    let (done, slow) = strict_path_blocks(builder);
-    branch_if_not_magic_handle(
-        builder,
-        handle,
-        handle,
-        BYTES_HANDLE_ALIGN,
-        BYTES_MAGIC_OFFSET,
-        BYTES_MAGIC,
-        slow,
-    );
-    let ptr = builder
-        .ins()
-        .load(types::I64, MemFlags::new(), handle, BYTES_DATA_PTR_OFFSET);
-    jump_with_i64_arg(builder, done, ptr);
     let handle = builder.block_params(slow)[0];
     join_with_fallback_call(builder, slow, done, fallback, &[handle])
 }
@@ -986,6 +946,8 @@ fn closure_fn_ptr(
     let fallback = cached_func_ref(codegen, builder, func_ref_cache, fid);
     let (done, slow) = strict_path_blocks(builder);
 
+    // a zero fills the index slot of `slow`, which keeps the handle out of a
+    // second register on the cold edge
     let zero = builder.ins().iconst(types::I64, 0);
     branch_if_not_magic_handle(
         builder,
@@ -1123,14 +1085,14 @@ fn inline_bytes_read_word(
     // require the full window: off + 8 <= len. off is non-negative here, so
     // the add can only wrap for absurd offsets, which the unsigned compare
     // then routes to the slow path anyway.
-    let len = builder.ins().load(types::I64, MemFlags::new(), bytes, 8);
+    let len = builder.ins().load(types::I64, MemFlags::new(), bytes, BYTES_DATA_LEN_OFFSET);
     let off_p8 = builder.ins().iadd_imm(off, 8);
     let no_room = builder.ins().icmp(IntCC::UnsignedGreaterThan, off_p8, len);
     let read = builder.create_block();
     builder.ins().brif(no_room, slow, &[], read, &[]);
     builder.switch_to_block(read);
 
-    let data_ptr = builder.ins().load(types::I64, MemFlags::new(), bytes, 0);
+    let data_ptr = builder.ins().load(types::I64, MemFlags::new(), bytes, BYTES_DATA_PTR_OFFSET);
     let addr = builder.ins().iadd(data_ptr, off);
     let word = builder.ins().load(types::I64, MemFlags::new(), addr, 0);
     // keep the low `count` bytes: all-ones shifted down by (8 - count) * 8,
@@ -1350,7 +1312,15 @@ fn inline_runtime_call(
         // length itself.
         ("pith_bytes_data_ptr", 1) => {
             let fallback = runtime_ref(builder, fname)?;
-            inline_bytes_data_ptr(builder, args[0], fallback)
+            inline_handle_field(
+                builder,
+                args[0],
+                BYTES_HANDLE_ALIGN,
+                BYTES_MAGIC_OFFSET,
+                BYTES_MAGIC,
+                BYTES_DATA_PTR_OFFSET,
+                fallback,
+            )
         }
         ("pith_store_u64", 3) => {
             let addr = builder.ins().iadd(args[0], args[1]);
@@ -1388,7 +1358,7 @@ fn inline_runtime_call(
         }
         ("bytes_len", 1) => {
             let fallback = runtime_ref(builder, fname)?;
-            inline_handle_len(
+            inline_handle_field(
                 builder,
                 args[0],
                 BYTES_HANDLE_ALIGN,
@@ -1470,6 +1440,51 @@ fn green_preempt_enabled() -> bool {
 /// each field read or write. A default build emits none of this.
 fn quarantine_build() -> bool {
     pith_runtime::quarantine::enabled_by(std::env::var("PITH_QUARANTINE").ok().as_deref())
+}
+
+/// Floats travel as i64 bits in the IR. Bitcast each argument the callee's
+/// signature takes as an f64.
+fn bitcast_float_args(builder: &mut FunctionBuilder<'_>, fref: FuncRef, args: &mut [Value]) {
+    let sig_ref = builder.func.dfg.ext_funcs[fref].signature;
+    let floats: Vec<bool> = builder.func.dfg.signatures[sig_ref]
+        .params
+        .iter()
+        .map(|p| p.value_type == types::F64)
+        .collect();
+    for (arg, is_float) in args.iter_mut().zip(floats) {
+        if is_float {
+            *arg = builder.ins().bitcast(types::F64, MemFlags::new(), *arg);
+        }
+    }
+}
+
+/// The checks a struct field read or store makes before it touches memory:
+/// the quarantine test of the object, when quarantine is on, and the
+/// sanitizer hook for the field's address. A default build emits neither.
+#[allow(clippy::too_many_arguments)]
+fn emit_struct_access_checks(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    quarantine: bool,
+    sanitize: Option<SanitizeHooks>,
+    write: bool,
+    obj: Value,
+    offset: i32,
+) -> Result<(), CompileError> {
+    if quarantine {
+        let check = runtime_func_ref(
+            codegen,
+            builder,
+            func_ref_cache,
+            runtime_funcs,
+            "pith_quarantine_check_struct",
+        )?;
+        emit_quarantine_struct_check(builder, check, obj);
+    }
+    emit_sanitize_check(codegen, builder, func_ref_cache, sanitize, write, obj, offset);
+    Ok(())
 }
 
 /// The struct test a quarantine build makes before generated code touches a
@@ -1743,27 +1758,48 @@ fn decode_string_literal(line: &str) -> String {
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-/// One `func ... endfunc` block of the IR: its parameter names, in order,
-/// and its other lines. `start` is the line after the `func` header; the
-/// answer also gives the line after `endfunc`.
-fn function_body<'a>(lines: &[&'a str], start: usize) -> (Vec<String>, Vec<&'a str>, usize) {
-    let mut params: Vec<String> = Vec::new();
-    let mut body: Vec<&'a str> = Vec::new();
-    let mut i = start;
+/// One `func ... endfunc` block of the IR: its name, its declared return
+/// kind, its parameter names in order, and its other lines.
+struct IrFunction<'a> {
+    name: &'a str,
+    retkind: &'a str,
+    params: Vec<String>,
+    body: Vec<&'a str>,
+}
+
+/// Every function block in the stream, in order. A name defined twice (two
+/// modules emitting the same helper) appears twice; the first definition is
+/// the one compiled.
+fn ir_functions<'a>(lines: &[&'a str]) -> Vec<IrFunction<'a>> {
+    let mut out = Vec::new();
+    let mut i = 0;
     while i < lines.len() {
-        let parts: Vec<&str> = lines[i].split_whitespace().collect();
-        if !parts.is_empty() && parts[0] == "endfunc" {
-            i += 1;
-            break;
-        }
-        if !parts.is_empty() && parts[0] == "param" && parts.len() >= 2 {
-            params.push(parts[1].to_string());
-        } else {
-            body.push(lines[i]);
-        }
+        let mut header = lines[i].split_whitespace();
         i += 1;
+        if header.next() != Some("func") {
+            continue;
+        }
+        let Some(name) = header.next() else {
+            continue;
+        };
+        let retkind = header.nth(1).unwrap_or("");
+        let mut params: Vec<String> = Vec::new();
+        let mut body: Vec<&'a str> = Vec::new();
+        while i < lines.len() {
+            let mut parts = lines[i].split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("endfunc"), _) => {
+                    i += 1;
+                    break;
+                }
+                (Some("param"), Some(param)) => params.push(param.to_string()),
+                _ => body.push(lines[i]),
+            }
+            i += 1;
+        }
+        out.push(IrFunction { name, retkind, params, body });
     }
-    (params, body, i)
+    out
 }
 
 /// The functions a program can run: those reachable from main and the
@@ -1774,19 +1810,10 @@ fn function_body<'a>(lines: &[&'a str], start: usize) -> (Vec<String>, Vec<&'a s
 /// the copy of a method for an instance that never calls it. Those may call
 /// what does not exist for their types, so they are not compiled at all.
 /// IR without a main (a consumer unit test) keeps every function.
-fn live_functions(lines: &[&str]) -> Option<HashSet<String>> {
-    let mut bodies: HashMap<&str, Vec<&str>> = HashMap::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let parts: Vec<&str> = lines[i].split_whitespace().collect();
-        if parts.len() < 2 || parts[0] != "func" {
-            i += 1;
-            continue;
-        }
-        let (_, body, next) = function_body(lines, i + 1);
-        // the first definition is the one compiled
-        bodies.entry(parts[1]).or_insert(body);
-        i = next;
+fn live_functions(functions: &[IrFunction<'_>]) -> Option<HashSet<String>> {
+    let mut bodies: HashMap<&str, &[&str]> = HashMap::new();
+    for function in functions {
+        bodies.entry(function.name).or_insert(&function.body);
     }
     if !bodies.contains_key("main") {
         return None;
@@ -1802,7 +1829,7 @@ fn live_functions(lines: &[&str]) -> Option<HashSet<String>> {
         .collect();
     let mut live: HashSet<String> = work.iter().map(|name| name.to_string()).collect();
     while let Some(name) = work.pop() {
-        for line in &bodies[name] {
+        for line in bodies[name] {
             for token in line.split_whitespace().skip(1) {
                 if let Some((&callee, _)) = bodies.get_key_value(token) {
                     if live.insert(callee.to_string()) {
@@ -1815,9 +1842,8 @@ fn live_functions(lines: &[&str]) -> Option<HashSet<String>> {
     Some(live)
 }
 
-// the count checker's findings on stderr. it only reports for now: its
-// unbalanced functions are still being sorted into checker gaps and real
-// bugs, so they don't fail the build yet.
+// the count checker's findings on stderr. the compiler only reports them;
+// `make count-marks-check-only` fails CI on any unbalanced or borrow line.
 fn report_counts(report: &crate::count_check::CountReport) {
     eprintln!("{}", report.summary());
     for p in &report.problems {
@@ -1868,7 +1894,8 @@ pub fn compile_from_ir(
     // go before any pass reads the text, so they can't split a pattern the
     // rewrites below look for and change the code (see docs/ir-contract.md).
     let lines: Vec<&str> = ir_text.lines().filter(|line| !is_count_mark(line)).collect();
-    let live = live_functions(&lines);
+    let functions = ir_functions(&lines);
+    let live = live_functions(&functions);
     let is_live = |name: &str| live.as_ref().map_or(true, |set| set.contains(name));
     let mut declared_funcs: HashMap<String, FuncId> = HashMap::new();
     let mut string_data: Vec<(String, String)> = Vec::new();
@@ -2022,38 +2049,20 @@ pub fn compile_from_ir(
     // every function before any body compiles, since callers usually precede
     // the wrappers in the stream.
     let mut bits_aliases: HashMap<String, &'static str> = HashMap::new();
-    {
-        let mut j = 0;
-        while j < lines.len() {
-            let parts: Vec<&str> = lines[j].split_whitespace().collect();
-            if parts.is_empty() || parts[0] != "func" {
-                j += 1;
-                continue;
-            }
-            let fname = parts[1].to_string();
-            let (params, body, next) = function_body(&lines, j + 1);
-            j = next;
-            if let Some(op) = detect_bits_wrapper(&params, &body) {
-                bits_aliases.entry(fname).or_insert(op);
-            }
+    for function in &functions {
+        if let Some(op) = detect_bits_wrapper(&function.params, &function.body) {
+            bits_aliases.entry(function.name.to_string()).or_insert(op);
         }
     }
 
     // Pass 2: compile function bodies (first definition wins for duplicates)
     let mut compiled_funcs: HashSet<String> = HashSet::new();
     let mut built: Vec<(FuncId, String, Function)> = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        let parts: Vec<&str> = lines[i].split_whitespace().collect();
-        if parts.is_empty() || parts[0] != "func" {
-            i += 1;
-            continue;
-        }
-
-        let func_name = parts[1].to_string();
-        let func_retkind = parts.get(3).copied().unwrap_or("").to_string();
-        let (param_names, body_lines, next) = function_body(&lines, i + 1);
-        i = next;
+    for function in &functions {
+        let func_name = function.name.to_string();
+        let func_retkind = function.retkind.to_string();
+        let param_names = &function.params;
+        let body_lines = function.body.clone();
 
         // Compile this function (skip if already compiled from an earlier module)
         if compiled_funcs.contains(&func_name) {
@@ -2075,7 +2084,7 @@ pub fn compile_from_ir(
                 codegen,
                 &func_name,
                 &func_retkind,
-                &param_names,
+                param_names,
                 &body_lines,
                 runtime_funcs,
                 &declared_funcs,
@@ -2783,8 +2792,6 @@ fn compile_ir_function(
     // target not yet seen is a forward jump (if/else/result merge, break) and is
     // correctly excluded.
     let mut defined_labels: HashSet<String> = HashSet::new();
-    #[cfg(not(pith_cranelift_new_api))]
-    let mut next_var_id: u32 = 0;
 
     if func_name == "main" {
         emit_main_prologue(
@@ -2801,10 +2808,7 @@ fn compile_ir_function(
 
     for (i, name) in param_names.iter().enumerate() {
         if i < block_params.len() {
-            #[cfg(pith_cranelift_new_api)]
-            let var = declare_i64_var(&mut builder);
-            #[cfg(not(pith_cranelift_new_api))]
-            let var = declare_i64_var(&mut builder, &mut next_var_id);
+            let var = builder.declare_var(types::I64);
             builder.def_var(var, block_params[i]);
             named_vars.insert(name.clone(), var);
             regs.insert(i, block_params[i]);
@@ -3258,22 +3262,7 @@ fn compile_ir_function(
                         ))
                     })?;
                 let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
-                // Bitcast any f64 params to match the callee signature.
-                let sig_ref = builder.func.dfg.ext_funcs[fref].signature;
-                let param_types: Vec<types::Type> = builder.func.dfg.signatures[sig_ref]
-                    .params
-                    .iter()
-                    .map(|p| p.value_type)
-                    .collect();
-                for (i, arg) in args.iter_mut().enumerate() {
-                    if i < param_types.len() && param_types[i] == types::F64 {
-                        *arg = builder.ins().bitcast(
-                            types::F64,
-                            MemFlags::new(),
-                            *arg,
-                        );
-                    }
-                }
+                bitcast_float_args(&mut builder, fref, &mut args);
                 let call = builder.ins().call(fref, &args);
                 let results = builder.func.dfg.inst_results(call);
                 let &[flag_v, payload_v] = results else {
@@ -3558,7 +3547,6 @@ fn compile_ir_function(
 
                     if let Some(fid) = fid {
                         let fref = cached_func_ref(codegen, &mut builder, &mut func_ref_cache, fid);
-                        // Check function signature for f64 params and bitcast as needed
                         let sig_ref = builder.func.dfg.ext_funcs[fref].signature;
                         let sig = &builder.func.dfg.signatures[sig_ref];
                         // a callee that returns the register pair is reached
@@ -3571,19 +3559,8 @@ fn compile_ir_function(
                                 fname, func_name
                             )));
                         }
-                        let param_types: Vec<types::Type> =
-                            sig.params.iter().map(|p| p.value_type).collect();
                         let mut typed_args = args.clone();
-                        for (i, arg) in typed_args.iter_mut().enumerate() {
-                            if i < param_types.len() && param_types[i] == types::F64 {
-                                // Bitcast i64 → f64 for float params
-                                *arg = builder.ins().bitcast(
-                                    types::F64,
-                                    MemFlags::new(),
-                                    *arg,
-                                );
-                            }
-                        }
+                        bitcast_float_args(&mut builder, fref, &mut typed_args);
                         // a release of a handle that is still zero, such as
                         // the cleanup of a local an early return never
                         // assigned, is a no-op in the runtime. the inline
@@ -3729,10 +3706,7 @@ fn compile_ir_function(
                     let var = if let Some(&v) = named_vars.get(&name) {
                         v
                     } else {
-                        #[cfg(pith_cranelift_new_api)]
-                        let v = declare_i64_var(&mut builder);
-                        #[cfg(not(pith_cranelift_new_api))]
-                        let v = declare_i64_var(&mut builder, &mut next_var_id);
+                        let v = builder.declare_var(types::I64);
                         named_vars.insert(name, v);
                         v
                     };
@@ -3806,17 +3780,17 @@ fn compile_ir_function(
                     builder.switch_to_block(none_block);
                     jump_with_i64_arg(&mut builder, done, zero);
                     builder.switch_to_block(load_block);
-                    if quarantine {
-                        let check = runtime_func_ref(
-                            codegen,
-                            &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
-                            "pith_quarantine_check_struct",
-                        )?;
-                        emit_quarantine_struct_check(&mut builder, check, obj);
-                    }
-                    emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, false, obj, 8);
+                    emit_struct_access_checks(
+                        codegen,
+                        &mut builder,
+                        &mut func_ref_cache,
+                        runtime_funcs,
+                        quarantine,
+                        sanitize,
+                        false,
+                        obj,
+                        8,
+                    )?;
                     let payload = builder.ins().load(types::I64, MemFlags::new(), obj, 8);
                     jump_with_i64_arg(&mut builder, done, payload);
                     builder.switch_to_block(done);
@@ -3870,17 +3844,17 @@ fn compile_ir_function(
                         func_name, line
                     )));
                 };
-                if quarantine {
-                    let check = runtime_func_ref(
-                        codegen,
-                        &mut builder,
-                        &mut func_ref_cache,
-                        runtime_funcs,
-                        "pith_quarantine_check_struct",
-                    )?;
-                    emit_quarantine_struct_check(&mut builder, check, obj);
-                }
-                emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, false, obj, offset);
+                emit_struct_access_checks(
+                    codegen,
+                    &mut builder,
+                    &mut func_ref_cache,
+                    runtime_funcs,
+                    quarantine,
+                    sanitize,
+                    false,
+                    obj,
+                    offset,
+                )?;
                 let raw = builder.ins().load(types::I64, MemFlags::new(), obj, offset);
                 let zero = builder.ins().iconst(types::I64, 0);
                 let v = builder.ins().iadd(raw, zero);
@@ -4012,17 +3986,17 @@ fn compile_ir_function(
                 })?;
                 let val = get_reg(&regs, parts[3])?;
                 let offset = field_idx * 8;
-                if quarantine {
-                    let check = runtime_func_ref(
-                        codegen,
-                        &mut builder,
-                        &mut func_ref_cache,
-                        runtime_funcs,
-                        "pith_quarantine_check_struct",
-                    )?;
-                    emit_quarantine_struct_check(&mut builder, check, struct_val);
-                }
-                emit_sanitize_check(codegen, &mut builder, &mut func_ref_cache, sanitize, true, struct_val, offset);
+                emit_struct_access_checks(
+                    codegen,
+                    &mut builder,
+                    &mut func_ref_cache,
+                    runtime_funcs,
+                    quarantine,
+                    sanitize,
+                    true,
+                    struct_val,
+                    offset,
+                )?;
                 builder.ins().store(MemFlags::new(), val, struct_val, offset);
             }
 
@@ -4904,14 +4878,14 @@ mod tests {
                   func dead 0 int\ncall 1 deader int 0\nret 1\nendfunc\n\
                   func deader 0 int\niconst 1 0\nret 1\nendfunc\n";
         let lines: Vec<&str> = ir.lines().collect();
-        let live = live_functions(&lines).expect("main is present");
+        let live = live_functions(&ir_functions(&lines)).expect("main is present");
         let mut names: Vec<&str> = live.iter().map(String::as_str).collect();
         names.sort();
         assert_eq!(
             names,
             ["__init_globals", "cb", "deep", "m___cc_register_tracers_m0", "main"]
         );
-        assert!(live_functions(&["func helper 0 int", "endfunc"]).is_none());
+        assert!(live_functions(&ir_functions(&["func helper 0 int", "endfunc"])).is_none());
     }
 
     // every IR-declared function returns i64, so only the runtime table can

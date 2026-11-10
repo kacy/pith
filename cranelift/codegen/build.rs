@@ -1,69 +1,12 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rustc-check-cfg=cfg(pith_cranelift_new_api)");
-
-    let Some(lockfile) = workspace_lockfile() else {
-        return;
-    };
-    let Ok(contents) = fs::read_to_string(&lockfile) else {
-        return;
-    };
-    if uses_new_cranelift_api(&contents) {
-        println!("cargo:rustc-cfg=pith_cranelift_new_api");
-    }
-
     if let Err(err) = generate_runtime_table() {
         eprintln!("failed to generate runtime table: {err}");
         std::process::exit(1);
     }
-}
-
-fn workspace_lockfile() -> Option<PathBuf> {
-    let out_dir = PathBuf::from(std::env::var("OUT_DIR").ok()?);
-    for ancestor in out_dir.ancestors() {
-        if ancestor.file_name().and_then(|name| name.to_str()) == Some("target") {
-            let lockfile = ancestor.parent()?.join("Cargo.lock");
-            if lockfile.exists() {
-                return Some(lockfile);
-            }
-        }
-    }
-    None
-}
-
-fn uses_new_cranelift_api(lockfile: &str) -> bool {
-    let mut in_frontend = false;
-    for line in lockfile.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[[package]]" {
-            in_frontend = false;
-            continue;
-        }
-        if trimmed == "name = \"cranelift-frontend\"" {
-            in_frontend = true;
-            continue;
-        }
-        if in_frontend && trimmed.starts_with("version = ") {
-            let version = trimmed.trim_start_matches("version = ").trim_matches('"');
-            return version_is_new_api(version);
-        }
-    }
-    false
-}
-
-fn version_is_new_api(version: &str) -> bool {
-    let mut parts = version.split('.');
-    let major = parts
-        .next()
-        .and_then(|part| part.parse::<u32>().ok())
-        .unwrap_or(0);
-    let minor = parts
-        .next()
-        .and_then(|part| part.parse::<u32>().ok())
-        .unwrap_or(0);
-    major > 0 || minor >= 130
 }
 
 fn generate_runtime_table() -> Result<(), String> {
@@ -74,79 +17,56 @@ fn generate_runtime_table() -> Result<(), String> {
     let contents =
         fs::read_to_string(&abi_path).map_err(|e| format!("{}: {}", abi_path.display(), e))?;
 
-    let mut abi = String::new();
-    let mut compat = String::new();
+    let mut table = String::from("const ABI_RUNTIME_FUNCTIONS: &[RuntimeDecl] = &[\n");
+    let mut param_counts: BTreeMap<&str, usize> = BTreeMap::new();
     // FNV-1a over the entry lines, comments and blank lines left out. the
     // bootstrap seed and a built ir_driver carry it, so the cli can tell
     // when they were made against another table.
     let mut abi_hash: u64 = 0xcbf2_9ce4_8422_2325;
-    abi.push_str("const ABI_RUNTIME_FUNCTIONS: &[RuntimeDecl] = &[\n");
-    compat.push_str("const COMPAT_RUNTIME_FUNCTIONS: &[RuntimeDecl] = &[\n");
     for (line_no, raw_line) in contents.lines().enumerate() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        let at = |msg: &str| format!("{}:{}: {}", abi_path.display(), line_no + 1, msg);
         for byte in line.bytes().chain(std::iter::once(b'\n')) {
             abi_hash = (abi_hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
         }
         let parts: Vec<&str> = line.split('|').collect();
-        if parts.len() != 4 && parts.len() != 5 {
-            return Err(format!(
-                "{}:{}: expected 4 or 5 pipe-separated columns",
-                abi_path.display(),
-                line_no + 1
-            ));
+        if parts.len() != 4 {
+            return Err(at("expected 4 pipe-separated columns"));
         }
         let key = parts[0].trim();
         let symbol = parts[1].trim();
-        let params = parse_type_list(parts[2].trim())
-            .map_err(|err| format!("{}:{}: {}", abi_path.display(), line_no + 1, err))?;
-        let returns = parse_type_list(parts[3].trim())
-            .map_err(|err| format!("{}:{}: {}", abi_path.display(), line_no + 1, err))?;
+        let params = parse_type_list(parts[2].trim()).map_err(|err| at(&err))?;
+        let returns = parse_type_list(parts[3].trim()).map_err(|err| at(&err))?;
         // two returns are the register result pair, which the runtime hands
         // back as a two-word `#[repr(C)]` struct. only two integer words are
         // returned in registers the same way by the runtime's C ABI and by a
         // Cranelift signature on every supported target, so nothing else is
         // accepted.
         if returns.len() > 1 && returns != ["I64", "I64"] {
-            return Err(format!(
-                "{}:{}: a runtime function returns nothing, one value, or the pair I64,I64",
-                abi_path.display(),
-                line_no + 1
+            return Err(at(
+                "a runtime function returns nothing, one value, or the pair I64,I64",
             ));
         }
-        let class = if parts.len() == 5 {
-            parse_decl_class(parts[4].trim())
-                .map_err(|err| format!("{}:{}: {}", abi_path.display(), line_no + 1, err))?
-        } else {
-            RuntimeDeclClass::Abi
-        };
-        let target = match class {
-            RuntimeDeclClass::Abi => &mut abi,
-            RuntimeDeclClass::Compat => &mut compat,
-        };
-        target.push_str("    RuntimeDecl { key: \"");
-        target.push_str(key);
-        target.push_str("\", symbol: \"");
-        target.push_str(symbol);
-        target.push_str("\", params: ");
-        target.push_str(&format_type_slice(&params));
-        target.push_str(", returns: ");
-        target.push_str(&format_type_slice(&returns));
-        target.push_str(" },\n");
+        param_counts.insert(key, params.len());
+        table.push_str(&format!(
+            "    RuntimeDecl {{ key: \"{key}\", symbol: \"{symbol}\", params: {}, returns: {} }},\n",
+            format_type_slice(&params),
+            format_type_slice(&returns)
+        ));
     }
-    abi.push_str("];\n");
-    compat.push_str("];\n");
+    table.push_str("];\n");
     let out = format!(
-        "{abi}{compat}\n/// identifies the runtime function table this compiler was built\n\
+        "{table}\n/// identifies the runtime function table this compiler was built\n\
          /// against: a hash of cranelift/runtime-abi/runtime_functions.txt.\n\
          pub const RUNTIME_ABI: &str = \"{abi_hash:016x}\";\n"
     );
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").map_err(|e| e.to_string())?);
     fs::write(out_dir.join("runtime_table.rs"), out).map_err(|e| e.to_string())?;
-    generate_ownership_table(&manifest_dir, &contents)
+    generate_ownership_table(&manifest_dir, &param_counts)
 }
 
 // cranelift/runtime-abi/runtime_ownership.txt says what each runtime function
@@ -156,26 +76,11 @@ fn generate_runtime_table() -> Result<(), String> {
 // deciding its ownership.
 fn generate_ownership_table(
     manifest_dir: &std::path::Path,
-    abi_contents: &str,
+    param_counts: &BTreeMap<&str, usize>,
 ) -> Result<(), String> {
     let path = manifest_dir.join("../runtime-abi/runtime_ownership.txt");
     println!("cargo:rerun-if-changed={}", path.display());
     let contents = fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
-
-    let mut param_counts: std::collections::BTreeMap<&str, usize> =
-        std::collections::BTreeMap::new();
-    for line in abi_contents.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let parts: Vec<&str> = line.split('|').collect();
-        let count = if parts[2].trim().is_empty() {
-            0
-        } else {
-            parts[2].split(',').count()
-        };
-        param_counts.insert(parts[0].trim(), count);
-    }
 
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut table = String::from("const RUNTIME_OWNERSHIP: &[RuntimeOwnership] = &[\n");
@@ -276,20 +181,6 @@ fn parse_result_token(text: &str, nparams: usize) -> Result<String, String> {
     Ok(format!(
         "ResultOwnership {{ pair: {pair}, value: {value} }}"
     ))
-}
-
-#[derive(Clone, Copy)]
-enum RuntimeDeclClass {
-    Abi,
-    Compat,
-}
-
-fn parse_decl_class(text: &str) -> Result<RuntimeDeclClass, String> {
-    match text {
-        "abi" => Ok(RuntimeDeclClass::Abi),
-        "compat" => Ok(RuntimeDeclClass::Compat),
-        _ => Err(format!("unknown runtime decl class '{text}'")),
-    }
 }
 
 fn parse_type_list(text: &str) -> Result<Vec<&str>, String> {

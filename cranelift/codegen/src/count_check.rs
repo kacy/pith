@@ -645,9 +645,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             let Some(k) = key_of.get(o).filter(|k| out.regobjs.contains_key(*k)) else {
                 continue;
             };
-            let (base, off) = field.rsplit_once(':').unwrap_or((field.as_str(), ""));
-            let base = key_of.get(&base.to_string()).cloned().unwrap_or_else(|| base.to_string());
-            out.reads.insert(k.clone(), (format!("{base}:{off}"), *seq));
+            out.reads.insert(k.clone(), (rekey_field(&key_of, field), *seq));
         }
         for o in &st.counted_reads {
             if let Some(k) = key_of.get(o).filter(|k| out.regobjs.contains_key(*k)) {
@@ -666,9 +664,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             }
         }
         for field in &st.emptied {
-            let (base, off) = field.rsplit_once(':').unwrap_or((field.as_str(), ""));
-            let base = key_of.get(&base.to_string()).cloned().unwrap_or_else(|| base.to_string());
-            out.emptied.insert(format!("{base}:{off}"));
+            out.emptied.insert(rekey_field(&key_of, field));
         }
         out
     }
@@ -805,7 +801,6 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             // side holds none
             let last = blocks[b].last().copied().unwrap_or(&[]);
             if last.first() == Some(&"brif") && last.len() >= 4 && succ[b].len() == 2 {
-                // (object, count when the test is set, count when it isn't)
                 if let Some(obj) = st.cond_takes.get(last[1]).cloned() {
                     for (i, s) in succ[b].iter().enumerate() {
                         let mut side = st.clone();
@@ -819,6 +814,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                     }
                     continue;
                 }
+                // (object, count when the test is set, count when it isn't)
                 let mut settle: Option<(String, Option<i64>, Option<i64>)> = None;
                 if let Some((obj, set_means_there)) = st.null_tests.get(last[1]).cloned() {
                     // the null side holds no count; the other keeps its own
@@ -1540,6 +1536,14 @@ pub fn check_loop_borrows(lines: &[&str]) -> Vec<String> {
         }
     }
     problems
+}
+
+/// A `base:offset` field with its base object renamed to its canonical key,
+/// when it has one.
+fn rekey_field(key_of: &HashMap<&String, String>, field: &str) -> String {
+    let (base, off) = field.rsplit_once(':').unwrap_or((field, ""));
+    let base = key_of.get(&base.to_string()).cloned().unwrap_or_else(|| base.to_string());
+    format!("{base}:{off}")
 }
 
 #[cfg(test)]

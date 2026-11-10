@@ -7632,14 +7632,7 @@ fn spawn_arg_shares_collection(expr_idx: Int) -> Bool:
     node := get_node(expr_idx)
     if node.kind != "ident" and node.kind != "field_access" and node.kind != "index":
         return false
-    tid := c_get_expr_type(expr_idx)
-    if tid < 0:
-        return false
-    kind := get_type_info(tid).kind
-    if kind == "list" or kind == "map" or kind == "set":
-        return true
-    mut seen: Map[Int, Bool] := {}
-    return struct_holds_unguarded_collection(tid, seen) != ""
+    return holds_shared_buffer_type(c_get_expr_type(expr_idx))
 
 # the first field path under a struct type that reaches a list, a map or a set
 # outside a `guard` block, or "". a struct field or an optional struct is
@@ -8572,7 +8565,7 @@ fn check_frozen_writes(idx: Int):
 # whether a value of type `tid` reaches a buffer another task could change:
 # a collection, or a struct that reaches one outside a guard block
 fn holds_shared_buffer_type(tid: Int) -> Bool:
-    if is_error_type(tid):
+    if tid < 0 or is_error_type(tid):
         return false
     kind := get_type_info(tid).kind
     if kind == "list" or kind == "map" or kind == "set":

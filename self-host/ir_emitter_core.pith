@@ -3752,16 +3752,6 @@ fn ir_reads_mutable_global(name: String) -> Bool:
         return true
     return sym == ir_global_storage_symbol(name) and ir_mutable_global_names.contains_key(name)
 
-# pin the argument just evaluated into `reg` when pin is set and it needs it,
-# and record the kind (or "") so ir_unpin_args can release it after the call.
-fn ir_pin_arg(expr_idx: Int, reg: Int, pins: List[String], pin: Bool):
-    mut kind := ""
-    if pin:
-        kind = ir_arg_pin_kind(expr_idx)
-    if kind.len() > 0:
-        ir_rc_retain_reg(reg, kind)
-    pins.push(kind)
-
 # the same hazard without a user callee: an operand read out of storage is
 # still only a borrow when an operand evaluated after it runs code that can
 # drop its owner, and the operation reads it after that. `o.name +
@@ -3795,6 +3785,17 @@ fn ir_unpin_operand(reg: Int, kind: String):
     if kind.len() > 0:
         ir_rc_release_reg(reg, kind)
 
+# pin the operand just evaluated into `reg` when `pin` is set and it needs it,
+# record the kind (or "") in `pins` for ir_unpin_args, and put the operand in
+# flight (ir_inflight_operand). 1 when it went in flight, for
+# ir_inflight_pop_n.
+fn ir_pin_arg_inflight(expr_idx: Int, reg: Int, pins: List[String], pin: Bool) -> Int:
+    kind := ir_pin_operand(expr_idx, reg, pin)
+    pins.push(kind)
+    if ir_inflight_operand(expr_idx, reg, kind):
+        return 1
+    return 0
+
 # the same pin, kept in flight until ir_unpin_inflight: the expression it
 # guards can leave the function (an index miss, a `!`), and the early exit
 # releases the pin with the locals. `self.conns[self.choose()]` leaked the
@@ -3826,11 +3827,10 @@ fn ir_call_operand_exprs(node: Node, start_idx: Int) -> List[Int]:
         exprs.push(expr_idx)
     return exprs
 
-# release what ir_pin_arg retained. pins is aligned with regs.
+# release what ir_pin_operand retained. pins is aligned with regs.
 fn ir_unpin_args(regs: List[Int], pins: List[String]):
     for kind, i in pins:
-        if kind.len() > 0:
-            ir_rc_release_reg(regs[i], kind)
+        ir_unpin_operand(regs[i], kind)
 
 # true when calling the callee at callee_idx can run user code. a bare name
 # that is neither declared, nor imported, nor a variable holding a function
@@ -3867,10 +3867,8 @@ fn ir_collect_call_arg_regs(node: Node, start_idx: Int, local_fn_positions: List
             pins.push("")
         else:
             arg_r := ir_emit_call_arg(expr_idx)
-            ir_pin_arg(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
+            inflight = inflight + ir_pin_arg_inflight(expr_idx, arg_r, pins, pin or later_drops[arg_regs.len()])
             arg_regs.push(arg_r)
-            if ir_inflight_operand(expr_idx, arg_r, pins[pins.len() - 1]):
-                inflight = inflight + 1
     ir_inflight_pop_n(inflight)
     return arg_regs
 
@@ -4932,10 +4930,8 @@ fn ir_collect_method_call_regs(node: Node, pin: Bool, pins: List[String]) -> Lis
             r = ir_expr(expr_idx)
         else:
             r = ir_emit_call_arg(expr_idx)
-        ir_pin_arg(expr_idx, r, pins, pin or later_drops[regs.len()])
+        inflight = inflight + ir_pin_arg_inflight(expr_idx, r, pins, pin or later_drops[regs.len()])
         regs.push(r)
-        if ir_inflight_operand(expr_idx, r, pins[pins.len() - 1]):
-            inflight = inflight + 1
     ir_inflight_pop_n(inflight)
     return regs
 
@@ -7318,9 +7314,7 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
         else:
             elem_r := ir_expr(child)
             elem_regs.push(elem_r)
-            elem_pins.push(ir_pin_operand(child, elem_r, later_drops[ci]))
-            if ir_inflight_operand(child, elem_r, elem_pins[elem_pins.len() - 1]):
-                inflight = inflight + 1
+            inflight = inflight + ir_pin_arg_inflight(child, elem_r, elem_pins, later_drops[ci])
         elem_nodes.push(child)
     ir_inflight_pop_n(inflight)
     r := ir_reg()
@@ -8786,7 +8780,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             ir_emit("store " + tmp_name + " " + handle_r.to_string())
             # the closure runs user code, which can overwrite this field or
             # the fields its arguments were read from. so the handle and those
-            # arguments are pinned for the call, as ir_pin_arg does for any
+            # arguments are pinned for the call, as ir_pin_operand does for any
             # user callee; unpinned, `h.f = g` inside the closure freed the
             # environment it was still running in.
             ir_rc_retain_reg(handle_r, "closure")
@@ -8797,7 +8791,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 arg_idx := ir_method_call_arg_expr(node, ai)
                 arg_r := ir_emit_call_arg(arg_idx)
                 arg_regs.push(arg_r)
-                ir_pin_arg(arg_idx, arg_r, arg_pins, true)
+                arg_pins.push(ir_pin_operand(arg_idx, arg_r, true))
                 ai = ai + 1
             r := ir_reg()
             ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))

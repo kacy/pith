@@ -325,7 +325,8 @@ struct Poller {
     /// and does no i/o, ran about a third slower with every park in epoll.
     park: Mutex<()>,
     park_cv: Condvar,
-    /// the registry holds an fd or a deadline, so a poll can find something.
+    /// the registry holds a waiter, a deadline or a timer, so a poll can find
+    /// something.
     /// set under the lock after every change (`Inner::publish`). an idle worker
     /// checks it before polling, so a worker with no sockets and no sleepers
     /// pays no syscall and no lock on its way to park.
@@ -721,10 +722,10 @@ pub(crate) fn poll_ready(index: usize) -> bool {
 /// `notify` is called, or `timeout` runs out. returns true when the wait ran
 /// out with nothing to do.
 ///
-/// a worker with sockets or deadlines registered waits in `epoll_wait`. one
-/// with nothing registered waits on its condvar instead, which is the cheaper
-/// wake; nothing can register while it waits, because only the worker itself
-/// registers on its poller.
+/// a worker with waiters, deadlines or timers registered waits in
+/// `epoll_wait`. one with nothing registered waits on its condvar instead,
+/// which is the cheaper wake; nothing can register while it waits, because
+/// only the worker itself registers on its poller.
 pub(crate) fn idle_wait(index: usize, timeout: Duration) -> bool {
     let poller = poller(index);
     let woke = if poller.busy.load(AtomicOrdering::SeqCst) {

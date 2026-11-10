@@ -990,7 +990,7 @@ pub extern "C" fn pith_map_destructor(ptr: *mut u8) {
 // variants above.
 // ---------------------------------------------------------------------------
 
-/// Compute the byte length of a null-terminated C string (helper).
+/// Whether `PITH_MAP_TRACE` is set, read once.
 fn map_trace_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("PITH_MAP_TRACE").is_ok())

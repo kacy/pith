@@ -852,18 +852,23 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
     }
     acquire_last_count!(closure.ref_count);
     closure.release_captures();
+    retire_closure_shell(closure, handle);
+}
+
+/// The end of a closure whose captures are already released: scrub the
+/// magic so a stale handle fails closure_base, then free the shell. A
+/// closure that dies while the suspect buffer points at it parks its shell
+/// in the graveyard instead, so the buffered entry never dangles; the
+/// scrubbed magic keeps that handle from validating, and the next collection
+/// frees the shell.
+#[inline(always)]
+unsafe fn retire_closure_shell(closure: &PithClosure, handle: i64) {
     let buffered = closure
         .cycle_flags
         .load(Ordering::Relaxed)
         & CLOSURE_BUFFERED_FLAG
         != 0;
-    // scrub the magic so a stale handle fails closure_base before we
-    // hand the box back to the allocator.
     (handle as *mut u32).write(0);
-    // a closure that dies while the suspect buffer points at it keeps its
-    // shell: the captures above are already released, so deferring only the
-    // box drop to the graveyard leaks the shell until the collector frees it,
-    // and the scrubbed magic keeps the buffered handle from validating.
     if buffered && crate::cycle::cycle_gc_enabled() {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
         return;
@@ -976,23 +981,12 @@ pub(crate) unsafe fn cycle_closure_release_env(handle: i64) {
 /// Free a garbage closure's shell: the tail of `pith_closure_release` minus
 /// the environment release, which `cycle_closure_release_env` already ran.
 /// A shell whose buffered bit was set during teardown (a release hook fired
-/// on the collector thread) parks in the graveyard so the fresh suspect
-/// entry never dangles; the next collection frees it.
+/// on the collector thread) parks in the graveyard.
 pub(crate) unsafe fn cycle_closure_free_dead(handle: i64) {
     let Some(closure) = closure_base(handle) else {
         return;
     };
-    let buffered = closure
-        .cycle_flags
-        .load(Ordering::Relaxed)
-        & CLOSURE_BUFFERED_FLAG
-        != 0;
-    (handle as *mut u32).write(0);
-    if buffered && crate::cycle::cycle_gc_enabled() {
-        crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
-        return;
-    }
-    closure_free_shell(handle);
+    retire_closure_shell(closure, handle);
 }
 
 /// Drop a closure shell the graveyard parked. The magic is already scrubbed

@@ -432,8 +432,13 @@ fn write_id(store: Store, req: web.Request, now: Int) -> String holding session_
         return id
     return req.value(FRESH_KEY)
 
-fn warn_unattached():
-    log.root().target("web.session").error().msg("session used on a request the session middleware never saw")
+# log why a write or rotation refused, from its WRITE_ status. `refusal` ends
+# the message logged when the table is full.
+fn report_status(status: Int, refusal: String):
+    if status == WRITE_UNATTACHED:
+        log.root().target("web.session").error().msg("session used on a request the session middleware never saw")
+    elif status == WRITE_FULL:
+        log.root().target("web.session").error().int("limit", current_cap()).msg("this process is holding all the sessions it will; " + refusal)
 
 impl Store:
     # the value stored under `key`, or "" when this request has no session or
@@ -490,11 +495,8 @@ impl Store:
         mut status := WRITE_OK
         locked session_mu:
             status = self.write_locked(req, key, value, provisional)
-        if status == WRITE_UNATTACHED:
-            warn_unattached()
-            return false
-        if status == WRITE_FULL:
-            log.root().target("web.session").error().int("limit", current_cap()).msg("this process is holding all the sessions it will; not creating another")
+        if status != WRITE_OK:
+            report_status(status, "not creating another")
             return false
         return true
 
@@ -552,11 +554,8 @@ impl Store:
         mut status := WRITE_OK
         locked session_mu:
             status = self.rotate_locked(req)
-        if status == WRITE_UNATTACHED:
-            warn_unattached()
-            return false
-        if status == WRITE_FULL:
-            log.root().target("web.session").error().int("limit", current_cap()).msg("this process is holding all the sessions it will; not rotating")
+        if status != WRITE_OK:
+            report_status(status, "not rotating")
             return false
         return true
 

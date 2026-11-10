@@ -729,9 +729,6 @@ fn sha2_64_reference(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: 
 pub fn sha256(input: Bytes) -> String:
     return sha2_32(input, 1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225, 8, true)
 
-fn hash_sha256(input: Bytes) -> String:
-    return sha256(input)
-
 # compute a sha-256 digest and return raw bytes.
 pub fn sha256_bytes(input: Bytes) -> Bytes:
     return encoding.from_hex(sha256(input)) catch bytes.empty()
@@ -743,9 +740,6 @@ pub fn sha256_hex(input: Bytes) -> String:
 # hash a utf-8 string with sha-256.
 pub fn sha256_string(input: String) -> String:
     return sha256(bytes.from_string_utf8(input))
-
-fn hash_sha256_string(input: String) -> String:
-    return sha256_string(input)
 
 # compute a sha-224 digest and return it as lowercase hex.
 pub fn sha224(input: Bytes) -> String:
@@ -763,9 +757,6 @@ pub fn sha224_string(input: String) -> String:
 pub fn sha512(input: Bytes) -> String:
     return sha2_64(input, 7640891576956012808, -4942790177534073029, 4354685564936845355, -6534734903238641935, 5840696475078001361, -7276294671716946913, 2270897969802886507, 6620516959819538809, 8)
 
-fn hash_sha512(input: Bytes) -> String:
-    return sha512(input)
-
 # compute a sha-512 digest and return raw bytes.
 pub fn sha512_bytes(input: Bytes) -> Bytes:
     return encoding.from_hex(sha512(input)) catch bytes.empty()
@@ -777,9 +768,6 @@ pub fn sha512_hex(input: Bytes) -> String:
 # hash a utf-8 string with sha-512.
 pub fn sha512_string(input: String) -> String:
     return sha512(bytes.from_string_utf8(input))
-
-fn hash_sha512_string(input: String) -> String:
-    return sha512_string(input)
 
 # compute a sha-384 digest and return it as lowercase hex.
 pub fn sha384(input: Bytes) -> String:
@@ -842,15 +830,9 @@ fn fnv1a_reference(input: Bytes) -> Int:
         i = i + 1
     return h
 
-fn hash_fnv1a(input: Bytes) -> Int:
-    return fnv1a(input)
-
 # hash a utf-8 string with fnv-1a.
 pub fn fnv1a_string(input: String) -> Int:
     return fnv1a(bytes.from_string_utf8(input))
-
-fn hash_fnv1a_string(input: String) -> Int:
-    return fnv1a_string(input)
 
 # the sha-1 round constants, one per group of twenty rounds (fips 180-4
 # section 4.2.1).
@@ -1019,9 +1001,6 @@ fn sha1_reference(input: Bytes) -> String:
 
     return word32_to_hex(h0) + word32_to_hex(h1) + word32_to_hex(h2) + word32_to_hex(h3) + word32_to_hex(h4)
 
-fn hash_sha1(input: Bytes) -> String:
-    return sha1(input)
-
 # compute a sha-1 digest and return raw bytes.
 pub fn sha1_bytes(input: Bytes) -> Bytes:
     return encoding.from_hex(sha1(input)) catch bytes.empty()
@@ -1033,9 +1012,6 @@ pub fn sha1_hex(input: Bytes) -> String:
 ## hash a utf-8 string with sha-1.
 pub fn sha1_string(input: String) -> String:
     return sha1(bytes.from_string_utf8(input))
-
-fn hash_sha1_string(input: String) -> String:
-    return sha1_string(input)
 
 test "sha256 hashes bytes and strings":
     data := bytes.from_string_utf8("hello")

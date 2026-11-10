@@ -15,6 +15,7 @@ import std.fs as fs
 import std.os.path as os_path
 import std.bits as bits
 from std.bytes import ByteBuffer
+from std.collections import truncate_list
 
 JSON_FILE_CHUNK_SIZE := 4096
 
@@ -261,22 +262,6 @@ fn push_array_element(handle: Int, value: Int):
     if slot < 0 or node_kinds[slot] != JSON_ARRAY:
         return
     array_items[node_payloads[slot]].push(value)
-
-fn truncate_ints(items: List[Int], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_strings(items: List[String], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_int_lists(items: List[List[Int]], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_string_lists(items: List[List[String]], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
 
 # ===============================================================
 # Parser (Internal)
@@ -1586,8 +1571,8 @@ fn json_restore_to(node_id_mark: Int, array_len_mark: Int):
         last := segment_ids.len() - 1
         if segment_ids[last] >= node_id_mark:
             cut = segment_slots[last]
-            truncate_ints(segment_ids, last)
-            truncate_ints(segment_slots, last)
+            truncate_list(segment_ids, last)
+            truncate_list(segment_slots, last)
         else:
             within := segment_slots[last] + (node_id_mark - segment_ids[last])
             if within < cut:
@@ -1611,14 +1596,14 @@ fn json_restore_to(node_id_mark: Int, array_len_mark: Int):
             objects_cut = node_payloads[slot]
         slot = slot + 1
     if strings_cut >= 0:
-        truncate_strings(node_strings, strings_cut)
+        truncate_list(node_strings, strings_cut)
     if arrays_cut >= 0:
-        truncate_int_lists(array_items, arrays_cut)
+        truncate_list(array_items, arrays_cut)
     if objects_cut >= 0:
-        truncate_string_lists(object_key_lists, objects_cut)
-        truncate_int_lists(object_value_lists, objects_cut)
-    truncate_ints(node_kinds, cut)
-    truncate_ints(node_payloads, cut)
+        truncate_list(object_key_lists, objects_cut)
+        truncate_list(object_value_lists, objects_cut)
+    truncate_list(node_kinds, cut)
+    truncate_list(node_payloads, cut)
 
 # the typed decoders (decode[T], decode_text[T], ...) own the parse that fills
 # the node pool, then copy scalars and strings out into a concrete struct. once

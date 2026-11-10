@@ -19,6 +19,7 @@
 
 import std.io as io
 import std.bytes as bytes
+from std.collections import truncate_list
 
 YAML_FILE_CHUNK_SIZE := 4096
 
@@ -170,14 +171,6 @@ fn node_payload(handle: Int) -> Int:
 fn node_count(handle: Int) -> Int:
     return node_counts[node_slot(handle)]
 
-fn truncate_ints(items: List[Int], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_strings(items: List[String], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
 # ===============================================================
 # Node-pool reclamation
 # ===============================================================
@@ -200,8 +193,8 @@ fn yaml_restore_to(node_id_mark: Int, map_flat_mark: Int, seq_flat_mark: Int):
         last := segment_ids.len() - 1
         if segment_ids[last] >= node_id_mark:
             cut = segment_slots[last]
-            truncate_ints(segment_ids, last)
-            truncate_ints(segment_slots, last)
+            truncate_list(segment_ids, last)
+            truncate_list(segment_slots, last)
         else:
             within := segment_slots[last] + (node_id_mark - segment_ids[last])
             if within < cut:
@@ -213,16 +206,16 @@ fn yaml_restore_to(node_id_mark: Int, map_flat_mark: Int, seq_flat_mark: Int):
         mut slot := cut
         while slot < node_kinds.len():
             if node_kinds[slot] == YAML_STRING:
-                truncate_strings(node_strings, node_payloads[slot])
+                truncate_list(node_strings, node_payloads[slot])
                 break
             slot = slot + 1
-        truncate_ints(node_kinds, cut)
-        truncate_ints(node_payloads, cut)
-        truncate_ints(node_counts, cut)
+        truncate_list(node_kinds, cut)
+        truncate_list(node_payloads, cut)
+        truncate_list(node_counts, cut)
     # map_keys_flat and map_values_flat grow in lockstep, so one mark covers both.
-    truncate_strings(map_keys_flat, map_flat_mark)
-    truncate_ints(map_values_flat, map_flat_mark)
-    truncate_ints(seq_items_flat, seq_flat_mark)
+    truncate_list(map_keys_flat, map_flat_mark)
+    truncate_list(map_values_flat, map_flat_mark)
+    truncate_list(seq_items_flat, seq_flat_mark)
 
 ## node-pool position a compiler-lowered typed decode rolls back to.
 pub fn pool_mark_node_id() -> Int:

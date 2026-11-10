@@ -12,6 +12,7 @@
 import std.bytes as bytes
 import std.io as io
 import std.bits as bits
+from std.collections import truncate_list
 
 TOML_FILE_CHUNK_SIZE := 4096
 
@@ -204,26 +205,6 @@ fn push_array_element(handle: Int, val: Int):
         return
     array_items[entry].push(val)
 
-fn truncate_ints(items: List[Int], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_strings(items: List[String], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_int_lists(items: List[List[Int]], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_string_lists(items: List[List[String]], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
-fn truncate_maps(items: List[Map[String, Int]], len: Int):
-    while items.len() > len:
-        items.remove(items.len() - 1)
-
 # ===============================================================
 # Node-pool reclamation
 # ===============================================================
@@ -246,8 +227,8 @@ fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int
         last := segment_ids.len() - 1
         if segment_ids[last] >= node_id_mark:
             cut = segment_slots[last]
-            truncate_ints(segment_ids, last)
-            truncate_ints(segment_slots, last)
+            truncate_list(segment_ids, last)
+            truncate_list(segment_slots, last)
         else:
             within := segment_slots[last] + (node_id_mark - segment_ids[last])
             if within < cut:
@@ -271,15 +252,15 @@ fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int
             arrays_cut = node_payloads[slot]
         slot = slot + 1
     if strings_cut >= 0:
-        truncate_strings(node_strings, strings_cut)
+        truncate_list(node_strings, strings_cut)
     if tables_cut >= 0:
-        truncate_string_lists(table_keys, tables_cut)
-        truncate_int_lists(table_values, tables_cut)
-        truncate_maps(table_index, tables_cut)
+        truncate_list(table_keys, tables_cut)
+        truncate_list(table_values, tables_cut)
+        truncate_list(table_index, tables_cut)
     if arrays_cut >= 0:
-        truncate_int_lists(array_items, arrays_cut)
-    truncate_ints(node_kinds, cut)
-    truncate_ints(node_payloads, cut)
+        truncate_list(array_items, arrays_cut)
+    truncate_list(node_kinds, cut)
+    truncate_list(node_payloads, cut)
 
 # node-pool position a compiler-lowered typed decode rolls back to.
 pub fn pool_mark_node_id() -> Int:

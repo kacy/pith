@@ -113,20 +113,21 @@ pub unsafe fn bury(block: *mut u8, len: usize, magic: *mut u32, kind: Kind) -> b
     true
 }
 
-/// `bury` for a boxed value: drop what it owns in place, then quarantine
-/// the box's memory. The box is never freed.
+/// Free a boxed value. With quarantine on, drop what it owns in place and
+/// quarantine the box's memory, which is then never freed; otherwise drop
+/// the box.
 ///
 /// # Safety
 /// `ptr` must come from `Box::into_raw` and not be used as a box again;
 /// `magic` must point into it.
 #[inline(always)]
-pub unsafe fn bury_box<T>(ptr: *mut T, magic: *mut u32, kind: Kind) -> bool {
+pub unsafe fn free_box<T>(ptr: *mut T, magic: *mut u32, kind: Kind) {
     if !on() {
-        return false;
+        drop(Box::from_raw(ptr));
+        return;
     }
     std::ptr::drop_in_place(ptr);
     bury_now(ptr as *mut u8, std::mem::size_of::<T>(), magic, kind);
-    true
 }
 
 /// `bury` without the switch test, for a caller that has already made it.
@@ -277,7 +278,7 @@ fn free_sites() -> Option<&'static Sites> {
 }
 
 fn lock(sites: &Sites) -> std::sync::MutexGuard<'_, std::collections::HashMap<usize, std::backtrace::Backtrace>> {
-    sites.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::sync::lock(&sites)
 }
 
 #[cfg(test)]

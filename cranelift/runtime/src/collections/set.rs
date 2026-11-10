@@ -430,9 +430,7 @@ pub(crate) unsafe fn cycle_set_free_dead(handle: i64) {
 /// Free a dead set's box, or quarantine it.
 unsafe fn drop_set_shell(ptr: *mut SetImpl) {
     let magic = std::ptr::addr_of_mut!((*ptr).magic);
-    if !crate::quarantine::bury_box(ptr, magic, crate::quarantine::Kind::Set) {
-        drop(Box::from_raw(ptr));
-    }
+    crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::Set);
 }
 
 /// Convert set to list (for int elements)

@@ -100,7 +100,7 @@ impl Drop for AltStack {
             off.ss_flags = libc::SS_DISABLE;
             libc::sigaltstack(&off, std::ptr::null_mut());
         }
-        let mut spare = SPARE_ALT_STACKS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spare = crate::sync::lock(&SPARE_ALT_STACKS);
         if spare.len() < SPARE_ALT_STACKS_MAX {
             spare.push(std::mem::take(&mut self.buffer));
         }
@@ -176,9 +176,7 @@ fn install_alt_stack() -> Option<AltStack> {
     // had. the buffer is kept in the thread-local slot until thread exit, and
     // `AltStack::drop` disables it first.
     unsafe {
-        let spare = SPARE_ALT_STACKS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        let spare = crate::sync::lock(&SPARE_ALT_STACKS)
             .pop();
         let mut buffer = spare.unwrap_or_else(|| Vec::with_capacity(ALT_STACK_SIZE));
         let stack = libc::stack_t {

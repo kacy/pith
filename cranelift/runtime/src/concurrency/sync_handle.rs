@@ -158,9 +158,7 @@ unsafe fn release_count(h: &SyncHeader) {
 pub(crate) unsafe fn free_box<T>(p: *mut T) {
     let magic = std::ptr::addr_of_mut!((*(p as *mut SyncHeader)).magic);
     *magic = 0;
-    if !quarantine::bury_box(p, magic, quarantine::Kind::Sync) {
-        drop(Box::from_raw(p));
-    }
+    quarantine::free_box(p, magic, quarantine::Kind::Sync);
 }
 
 /// the count a blocking operation takes for itself before it waits, so the

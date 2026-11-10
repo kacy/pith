@@ -44,10 +44,7 @@ const RESET_SEQ: &[u8] = b"\x1b[?1049l\x1b[?25h\x1b[?1006l\x1b[?1002l\x1b[?2004l
 /// its original state afterwards, including the case where nothing was ever
 /// saved, which is already that state.
 fn restore_saved() -> bool {
-    let mut saved = match SAVED.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut saved = crate::sync::lock(&SAVED);
     match saved.take() {
         Some((fd, termios)) => {
             // SAFETY: writing back a termios we read from this same fd.
@@ -107,10 +104,7 @@ pub extern "C" fn pith_term_raw_enter(fd: i64) -> i64 {
         if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
             return 0;
         }
-        let mut saved = match SAVED.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut saved = crate::sync::lock(&SAVED);
         if saved.is_none() {
             *saved = Some((fd, saved_state));
         }
@@ -296,7 +290,7 @@ mod tests {
 
     #[test]
     fn raw_enter_and_restore_round_trip() {
-        let _guard = RAW_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::sync::lock(&RAW_LOCK);
         let (master, slave) = open_pty();
         let mut before: libc::termios = unsafe { std::mem::zeroed() };
         unsafe { assert_eq!(libc::tcgetattr(slave, &mut before), 0) };
@@ -348,7 +342,7 @@ mod tests {
 
     #[test]
     fn read_returns_data_timeout_and_eof() {
-        let _guard = RAW_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::sync::lock(&RAW_LOCK);
         let (master, slave) = open_pty();
         // raw mode, or the pty's canonical line buffer holds bytes until a
         // newline and the first read below times out instead of seeing data.
@@ -378,7 +372,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_is_a_byte_under_raw_mode() {
-        let _guard = RAW_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = crate::sync::lock(&RAW_LOCK);
         let (master, slave) = open_pty();
         assert_eq!(pith_term_raw_enter(slave as i64), 1);
         unsafe {

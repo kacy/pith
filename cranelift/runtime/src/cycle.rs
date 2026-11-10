@@ -75,17 +75,11 @@ pub static CYCLE_GRAVEYARD_DEFERRED: AtomicU64 = AtomicU64::new(0);
 // is still coherent, and the release paths must not turn that into a second
 // panic across the ffi boundary.
 fn lock_suspects() -> std::sync::MutexGuard<'static, Vec<(usize, u8)>> {
-    match SUSPECTS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::sync::lock(&SUSPECTS)
 }
 
 fn lock_graveyard() -> std::sync::MutexGuard<'static, Vec<(usize, u8)>> {
-    match GRAVEYARD.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::sync::lock(&GRAVEYARD)
 }
 
 /// Un-mark an object the buffer is giving up on (overflow, or a test drain).
@@ -168,10 +162,7 @@ static TRACERS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn lock_tracers() -> std::sync::MutexGuard<'static, HashMap<usize, usize>> {
-    match TRACERS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::sync::lock(&TRACERS)
 }
 
 /// Record a destructor's tracer twin. Called once per module from the
@@ -368,17 +359,11 @@ fn stop_timeout_ms() -> u64 {
 }
 
 fn lock_mutators() -> MutexGuard<'static, Vec<Arc<MutatorSlot>>> {
-    match MUTATORS.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::sync::lock(&MUTATORS)
 }
 
 fn lock_gate() -> MutexGuard<'static, ()> {
-    match GC_GATE.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::sync::lock(&GC_GATE)
 }
 
 /// the calling thread's handle on its own slot. dropping it, which the
@@ -721,10 +706,7 @@ pub(crate) fn with_world_stopped<F: FnOnce() -> R, R>(f: F) -> Option<R> {
     if !cycle_gc_enabled() {
         return None;
     }
-    let _one_stopper = match STOPPER.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let _one_stopper = crate::sync::lock(&STOPPER);
     if !pith_cycle_stop_the_world() {
         return None;
     }
@@ -1244,10 +1226,7 @@ static GC_CTRL_CV: Condvar = Condvar::new();
 static COLLECTOR_STARTED: AtomicBool = AtomicBool::new(false);
 
 fn lock_ctrl() -> MutexGuard<'static, GcControl> {
-    match GC_CTRL.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    }
+    crate::sync::lock(&GC_CTRL)
 }
 
 const COLLECT_BACKOFF_START: Duration = Duration::from_millis(10);
@@ -1439,10 +1418,7 @@ mod tests {
     };
 
     fn locked() -> std::sync::MutexGuard<'static, ()> {
-        match CYCLE_TEST_LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        }
+        crate::sync::lock(&CYCLE_TEST_LOCK)
     }
 
     #[test]
@@ -2021,7 +1997,7 @@ mod tests {
                 // wait that reads no heap handle, exit.
                 let _native = native_bracket();
                 let (lock, cv) = &*thread_release;
-                let mut go = lock.lock().unwrap_or_else(|p| p.into_inner());
+                let mut go = crate::sync::lock(lock);
                 while !*go {
                     go = cv.wait(go).unwrap_or_else(|p| p.into_inner());
                 }
@@ -2034,7 +2010,7 @@ mod tests {
         if !stop_eventually() {
             skip_congested("a_bracketed_wait_counts_as_stopped_and_the_exit_parks");
             let (lock, cv) = &*release;
-            *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            *crate::sync::lock(lock) = true;
             cv.notify_all();
             handle.join().expect("bracketed thread panicked");
             force_enabled_for_tests(false);
@@ -2047,7 +2023,7 @@ mod tests {
             // bracket runs.
             {
                 let (lock, cv) = &*release;
-                *lock.lock().unwrap_or_else(|p| p.into_inner()) = true;
+                *crate::sync::lock(lock) = true;
                 cv.notify_all();
             }
             await_state(&slot, MUTATOR_PARKED_FOR_GC);

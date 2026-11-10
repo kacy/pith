@@ -135,7 +135,7 @@ pub fn report_leaked_cstrings() {
     let Some(reg) = leak_scan_registry() else {
         return;
     };
-    let ptrs = reg.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let ptrs = crate::sync::lock(&reg);
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for &p in ptrs.iter() {
         unsafe {
@@ -200,8 +200,7 @@ unsafe fn alloc_cstring<const HOOKED: bool>(data_len: usize) -> *mut i8 {
         return data;
     }
     if let Some(reg) = leak_scan_registry() {
-        reg.lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::sync::lock(&reg)
             .push(data as usize);
     }
     data
@@ -1000,9 +999,7 @@ pub(crate) unsafe fn cycle_closure_free_dead(handle: i64) {
 /// and the captures already released, so only the box itself remains.
 pub(crate) unsafe fn cycle_drop_closure_shell(ptr: usize) {
     let closure = ptr as *mut PithClosure;
-    if !crate::quarantine::bury_box(closure, closure as *mut u32, crate::quarantine::Kind::Closure) {
-        drop(Box::from_raw(closure));
-    }
+    crate::quarantine::free_box(closure, closure as *mut u32, crate::quarantine::Kind::Closure);
 }
 
 #[cfg(test)]
@@ -3378,9 +3375,7 @@ thread_local! {
 /// owned. the claim runs under the registry lock. a released slot keeps its
 /// blocks, which is the point.
 fn adopt_pool_slot() -> *mut PoolSlot {
-    let mut registry = POOL_REGISTRY
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut registry = crate::sync::lock(&POOL_REGISTRY);
     for &slot in registry.slots.iter() {
         let owned = unsafe { &(*slot).owned };
         if owned

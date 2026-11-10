@@ -55,7 +55,7 @@ fn record_slow(kind: &'static str) {
     }
     let trace = std::backtrace::Backtrace::force_capture().to_string();
     let site = first_compiled_frame(&trace);
-    let mut sites = SITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut sites = crate::sync::lock(&SITES);
     *sites.get_or_insert_with(HashMap::new).entry((kind, site)).or_insert(0) += period;
 }
 
@@ -87,7 +87,7 @@ fn first_compiled_frame(trace: &str) -> String {
 }
 
 extern "C" fn report() {
-    let sites = SITES.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let sites = crate::sync::lock(&SITES);
     let Some(sites) = sites.as_ref() else {
         return;
     };

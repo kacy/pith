@@ -1667,9 +1667,7 @@ pub(crate) unsafe fn cycle_drop_list_shell(ptr: usize) {
 /// Free a dead list's box, or quarantine it.
 unsafe fn drop_list_shell(ptr: *mut ListImpl) {
     let magic = std::ptr::addr_of_mut!((*ptr).magic);
-    if !crate::quarantine::bury_box(ptr, magic, crate::quarantine::Kind::List) {
-        drop(Box::from_raw(ptr));
-    }
+    crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::List);
 }
 
 /// Retain a list handle: one more owner of this shared handle.

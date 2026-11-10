@@ -474,9 +474,7 @@ unsafe fn free_channel(p: *mut TaggedChannel) {
     // a stale handle must fail validation from here on
     (*p).magic = 0;
     let magic = std::ptr::addr_of_mut!((*p).magic);
-    if !crate::quarantine::bury_box(p, magic, crate::quarantine::Kind::Channel) {
-        drop(Box::from_raw(p));
-    }
+    crate::quarantine::free_box(p, magic, crate::quarantine::Kind::Channel);
     crate::perf_count(&crate::PERF_CHANNEL_FREES, 1);
     crate::perf_count(&crate::PERF_CHANNEL_FREED_BYTES, bytes);
     #[cfg(test)]
@@ -879,44 +877,38 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
     let green_task = green::current_task();
     let mut state = lock_state(&inner.state);
 
-    if state.closed {
-        return 0;
-    }
-
-    if state.capacity == 0 {
-        while !state.closed {
-            // offer the value as soon as the slot is free, not only once a
-            // receiver is parked: a receiver that polls (`try_recv`, which
-            // `select` and `recv_ctx` use) never parks, so a sender that
-            // waited for one never met it and the select ran to its
-            // timeout. the send still returns only once the value is taken.
-            if state.pending_value.is_none() {
-                let handoffs_before = state.deliveries;
-                state.pending_value = Some(value);
-                wake_receivers(inner, &mut state);
-                // count ourselves as a waiting sender while we wait for the
-                // receiver to take the value: the recv that takes it gates its
-                // wake on `sender_waiting`, so an uncounted sender here would
-                // never be notified (a hang on the rendezvous handshake).
-                state.sender_waiting += 1;
-                while !state.closed && state.pending_value.is_some() {
-                    state = block_on_channel(&park, inner, state, green_task, Role::Sender);
-                }
-                state.sender_waiting -= 1;
-                // delivered is the authority, not `closed`: a receiver may have
-                // taken the value and the channel closed before this sender got
-                // the lock back.
-                let delivered = state.deliveries != handoffs_before;
-                return if delivered { 1 } else { 0 };
-            }
+    // only an unbuffered channel gets here: a buffered one took the ring
+    // path above. a closed channel refuses the send.
+    while !state.closed {
+        // offer the value as soon as the slot is free, not only once a
+        // receiver is parked: a receiver that polls (`try_recv`, which
+        // `select` and `recv_ctx` use) never parks, so a sender that
+        // waited for one never met it and the select ran to its
+        // timeout. the send still returns only once the value is taken.
+        if state.pending_value.is_none() {
+            let handoffs_before = state.deliveries;
+            state.pending_value = Some(value);
+            wake_receivers(inner, &mut state);
+            // count ourselves as a waiting sender while we wait for the
+            // receiver to take the value: the recv that takes it gates its
+            // wake on `sender_waiting`, so an uncounted sender here would
+            // never be notified (a hang on the rendezvous handshake).
             state.sender_waiting += 1;
-            state = block_on_channel(&park, inner, state, green_task, Role::Sender);
+            while !state.closed && state.pending_value.is_some() {
+                state = block_on_channel(&park, inner, state, green_task, Role::Sender);
+            }
             state.sender_waiting -= 1;
+            // delivered is the authority, not `closed`: a receiver may have
+            // taken the value and the channel closed before this sender got
+            // the lock back.
+            let delivered = state.deliveries != handoffs_before;
+            return if delivered { 1 } else { 0 };
         }
-        return 0;
+        state.sender_waiting += 1;
+        state = block_on_channel(&park, inner, state, green_task, Role::Sender);
+        state.sender_waiting -= 1;
     }
 
-    // buffered sends never reach here: they took the ring path above.
     0
 }
 

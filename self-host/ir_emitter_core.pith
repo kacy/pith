@@ -6814,11 +6814,7 @@ fn ir_emit_static_call(idx: Int, node: Node) -> Int:
             ir_emit_optional_attach_dtor(r, free_opt_kind)
     ir_release_owned_args(node, 1, arg_regs)
     ir_unpin_args(arg_regs, arg_pins)
-    if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
-        if ret_type != "float" and idx == ir_rcall_defer_idx:
-            return ir_emit_wrapped_legacy_pair(r, ret_type, callee.name)
-        return ir_emit_wrapped_legacy_result(r, ret_type, callee.name, idx)
-    return r
+    return ir_wrap_legacy_call_result(r, ret_type, callee.name, idx, uses_result_abi)
 
 # store_name is the plain store for the literal's key flavor (map_insert,
 # map_insert_ikey, map_insert_bkey); the value's kind and ownership may
@@ -7846,6 +7842,21 @@ fn ir_count_call_binds(idx: Int, name: String, inside_loop: Bool) -> Int:
         n = n + ir_count_call_binds(child, name, in_loop)
     return n
 
+# whether a call the checker typed as a result came back from a legacy
+# single-register callee, whose value the caller has to wrap
+fn ir_legacy_call_result_wraps(idx: Int, uses_result_abi: Bool, ret_type: String) -> Bool:
+    return uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple"
+
+# the result of call `idx` in the shape the checker typed it: a legacy
+# single-register result wrapped as a pair or a box, or `r` unchanged when no
+# wrap applies
+fn ir_wrap_legacy_call_result(r: Int, ret_type: String, callee_name: String, idx: Int, uses_result_abi: Bool) -> Int:
+    if not ir_legacy_call_result_wraps(idx, uses_result_abi, ret_type):
+        return r
+    if ret_type != "float" and idx == ir_rcall_defer_idx:
+        return ir_emit_wrapped_legacy_pair(r, ret_type, callee_name)
+    return ir_emit_wrapped_legacy_result(r, ret_type, callee_name, idx)
+
 # hand a legacy single-register result straight to the pair handshake:
 # decode the sentinel into (flag, payload) registers with no box on either
 # arm. the err payload is the same static message string the box path
@@ -8743,11 +8754,7 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         # plain static calls: owned string temps die with the call
         ir_release_owned_args(node, 1, arg_regs)
         ir_unpin_args(arg_regs, arg_pins)
-        if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
-            if ret_type != "float" and idx == ir_rcall_defer_idx:
-                return ir_emit_wrapped_legacy_pair(r, ret_type, call_name)
-            return ir_emit_wrapped_legacy_result(r, ret_type, call_name, idx)
-        return r
+        return ir_wrap_legacy_call_result(r, ret_type, call_name, idx, uses_result_abi)
     return 0 - 1
 
 # the general method dispatch: self-hosted list builtins, a call through a
@@ -8955,13 +8962,9 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             # classification rather than the void call's.
             if not ir_is_void_method(emit_name):
                 ir_rc_release_reg(obj_r, recv_kind)
-    if uses_result_abi and ret_type != "tuple" and ir_checked_result_kind(idx) == "tuple":
-        if ret_type != "float" and idx == ir_rcall_defer_idx:
-            return ir_emit_wrapped_legacy_pair(r, ret_type, emit_name)
-        return ir_emit_wrapped_legacy_result(r, ret_type, emit_name, idx)
-    if ir_is_void_method(emit_name):
+    if ir_is_void_method(emit_name) and not ir_legacy_call_result_wraps(idx, uses_result_abi, ret_type):
         return obj_r
-    return r
+    return ir_wrap_legacy_call_result(r, ret_type, emit_name, idx, uses_result_abi)
 
 # --- string interpolation ---
 fn ir_string_interp_part_reg(child: Int) -> Int:

@@ -690,38 +690,6 @@ fn run_h2server(input: Bytes) -> Outcome:
     return Outcome("sent" + min(got, 1).to_string(), sent)
 
 # ---------------------------------------------------------------
-# known bugs
-# ---------------------------------------------------------------
-
-# true for an input that only re-finds a bug already on file, which would
-# otherwise hang every batch and leave no time for anything new. delete a
-# clause once its bug is fixed; --no-skip turns them all off.
-fn hits_known_bug(target: String, input: Bytes) -> Bool:
-    if target == "yaml":
-        # parse_float_manual loops once per unit of a decimal exponent, so
-        # 1e99999999999 never finishes
-        return long_exponent(input)
-    return false
-
-# an e or E, an optional sign, then seven or more digits (dots included:
-# 1e9.99999999999 hangs the same loop)
-fn long_exponent(input: Bytes) -> Bool:
-    mut i := 0
-    while i < input.len():
-        if input[i] == 101 or input[i] == 69:
-            mut j := i + 1
-            if j < input.len() and (input[j] == 43 or input[j] == 45):
-                j = j + 1
-            mut digits := 0
-            while j < input.len() and ((input[j] >= 48 and input[j] <= 57) or input[j] == 46):
-                digits = digits + 1
-                j = j + 1
-            if digits >= 7:
-                return true
-        i = i + 1
-    return false
-
-# ---------------------------------------------------------------
 # dispatch
 # ---------------------------------------------------------------
 
@@ -1020,8 +988,6 @@ fn main() -> Int!:
     deadline := time.mono_millis() + secs * 1000
     mut execs := 0
     mut added := 0
-    mut skipped := 0
-    skip_known := arg_int("--no-skip", 0) == 0
     # --deep 0 leaves out the megabyte-sized inputs (amplified slices and
     # stream tails), for a quick run
     deep := arg_int("--deep", 1) == 1
@@ -1032,9 +998,6 @@ fn main() -> Int!:
         amplified := deep and rand.int(0, AMPLIFY_EVERY - 1) == 0
         if amplified:
             input = amplify(input, rand.int(256, 1024) * 1024)
-        if skip_known and hits_known_bug(target, input):
-            skipped = skipped + 1
-            continue
         mut tail := 0
         if deep and read_budget(target) > 0 and rand.int(0, TAIL_EVERY - 1) == 0:
             # http1 alternates zeros and a repeated last line; the binary
@@ -1050,5 +1013,5 @@ fn main() -> Int!:
                 fs.write_bytes(corpus_dir + "/" + seed.to_string() + "-" + execs.to_string(), input) catch false
                 added = added + 1
         execs = execs + 1
-    print("fuzz-surfaces " + target + ": " + execs.to_string() + " execs, " + seen.len().to_string() + " outcomes, corpus " + corpus.len().to_string() + " (+" + added.to_string() + "), " + skipped.to_string() + " skipped as known bugs")
+    print("fuzz-surfaces " + target + ": " + execs.to_string() + " execs, " + seen.len().to_string() + " outcomes, corpus " + corpus.len().to_string() + " (+" + added.to_string() + ")")
     return 0

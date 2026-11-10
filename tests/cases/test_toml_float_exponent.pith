@@ -1,0 +1,19 @@
+# a toml float keeps its exponent, and a literal toml rules out is an error.
+#
+# the float parser used to skip the exponent's marker and read its digits as
+# more of the number, so `1e5` came out as 15.0 and `1.5E-3` as 1.53.
+
+import std.toml as toml
+
+fn main():
+    doc := toml.parse("a = 1e5\nb = 1.5E-3\nc = -2e+2\nd = 6.626e-34\ne = 1_000e2\nf = 3.14\ng = 1_000.5\nh = 2E0\n")
+    for key in ["a", "b", "c", "e", "f", "g", "h"]:
+        print(key + " = " + toml.get_float(doc, key).to_string())
+    d := toml.get_float(doc, "d")
+    print("d is exact: " + (d == (parse_float("6.626e-34") catch 0.0)).to_string())
+    print("d * 1e34 = " + (d * 10000000000000000000000000000000000.0).to_string())
+
+    # the first three are valid. then a dot or underscore with no digit on one
+    # side, a leading zero, and an exponent past a Float's range
+    for literal in ["0.5", "1e05", "-1_0.0_1", "1.", "1.e5", "+.5", "1_.5", "1__0.0", "1e_5", "01.5", "1e400", "1e99999999999", "1-2.3"]:
+        print(literal + ": " + toml.type_of(toml.parse("x = " + literal + "\n")))

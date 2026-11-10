@@ -461,9 +461,8 @@ fn wait_off_green(handle: i64) -> i64 {
                 }
                 return reap(handle);
             }
-            // no pidfd (an old kernel, or not linux): look again shortly,
-            // letting go of the lock in between.
-            ExitState::Unwatchable => std::thread::sleep(std::time::Duration::from_millis(2)),
+            // no pidfd (an old kernel, or not linux)
+            ExitState::Unwatchable => return poll_until_exit(handle),
         }
     }
 }
@@ -494,7 +493,7 @@ fn poll_until_exit(handle: i64) -> i64 {
                 return -1;
             };
             match entry.child.try_wait() {
-                Ok(Some(status)) => return status.code().unwrap_or(-1) as i64,
+                Ok(Some(status)) => return exit_code(status),
                 Ok(None) => {}
                 Err(_) => return -1,
             }
@@ -632,6 +631,17 @@ mod tests {
         cmd.args(["-c", "exit 5"]);
         assert_eq!(command_status(cmd).expect("sh should run").code(), Some(5));
         assert!(command_status(Command::new("/nonexistent-program")).is_none());
+    }
+
+    #[test]
+    fn a_wait_without_a_pidfd_reports_a_signal_death_as_128_plus_the_signal() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "kill -9 $$"])
+            .spawn()
+            .expect("sh should run");
+        let handle = pith_store_process_handle(child);
+        assert_eq!(poll_until_exit(handle), 137);
+        pith_process_close(handle);
     }
 
     #[test]

@@ -121,9 +121,7 @@ pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
     // scrub the magic so stale handles fail the validity check
     (*(handle as *mut PithBytes)).magic = 0;
     let ptr = handle as *mut PithBytes;
-    if !crate::quarantine::bury_box(ptr, std::ptr::addr_of_mut!((*ptr).magic), crate::quarantine::Kind::Bytes) {
-        drop(Box::from_raw(ptr));
-    }
+    crate::quarantine::free_box(ptr, std::ptr::addr_of_mut!((*ptr).magic), crate::quarantine::Kind::Bytes);
 }
 
 #[no_mangle]
@@ -461,9 +459,7 @@ pub unsafe extern "C" fn pith_byte_buffer_free(handle: i64) {
     (*(handle as *mut PithByteBuffer)).magic = 0;
     let ptr = handle as *mut PithByteBuffer;
     let magic = std::ptr::addr_of_mut!((*ptr).magic);
-    if !crate::quarantine::bury_box(ptr, magic, crate::quarantine::Kind::ByteBuffer) {
-        drop(Box::from_raw(ptr));
-    }
+    crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::ByteBuffer);
 }
 
 /// Allocate a fresh byte buffer.

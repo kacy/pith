@@ -1,13 +1,5 @@
 use crate::bytes::pith_bytes_ref;
 
-unsafe fn cstr_bytes<'a>(ptr: i64) -> &'a [u8] {
-    if ptr == 0 {
-        return &[];
-    }
-    let len = crate::string::pith_cstring_len(ptr as *const i8) as usize;
-    std::slice::from_raw_parts(ptr as *const u8, len)
-}
-
 fn skip_ws(input: &[u8], mut pos: usize) -> usize {
     while pos < input.len() && matches!(input[pos], b' ' | b'\t' | b'\n' | b'\r') {
         pos += 1;
@@ -1268,7 +1260,7 @@ pub unsafe extern "C" fn pith_json_fill_struct_lists(
 }
 
 unsafe fn nested_fill_root(bytes_handle: i64, spec_ptr: i64, struct_ptr: i64, check_utf8: i64, dtors: &NestedDtors) -> i64 {
-    let spec = cstr_bytes(spec_ptr);
+    let spec = crate::ffi_util::cstr_bytes(spec_ptr as *const i8).unwrap_or(&[]);
     let outcome: Result<(), Vec<u8>> = (|| {
         let Some(bytes) = pith_bytes_ref(bytes_handle) else {
             return Err(b"invalid json object".to_vec());

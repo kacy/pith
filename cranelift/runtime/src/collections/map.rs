@@ -887,9 +887,7 @@ pub(crate) unsafe fn cycle_drop_map_shell(ptr: usize) {
 /// Free a dead map's box, or quarantine it.
 unsafe fn drop_map_shell(ptr: *mut MapImpl) {
     let magic = std::ptr::addr_of_mut!((*ptr).magic);
-    if !crate::quarantine::bury_box(ptr, magic, crate::quarantine::Kind::Map) {
-        drop(Box::from_raw(ptr));
-    }
+    crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::Map);
 }
 
 /// Remove an int-keyed entry and hand its value, count included, to the
@@ -992,7 +990,7 @@ pub extern "C" fn pith_map_destructor(ptr: *mut u8) {
 // variants above.
 // ---------------------------------------------------------------------------
 
-/// Compute the byte length of a null-terminated C string (helper).
+/// Whether `PITH_MAP_TRACE` is set, read once.
 fn map_trace_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("PITH_MAP_TRACE").is_ok())
@@ -2277,10 +2275,7 @@ mod tests {
     #[test]
     #[ignore = "enables the collector flag; run serially via make test-cycle-gc"]
     fn buffered_map_dies_into_the_graveyard() {
-        let _guard = match crate::cycle::CYCLE_TEST_LOCK.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _guard = crate::sync::lock(&crate::cycle::CYCLE_TEST_LOCK);
         crate::cycle::force_enabled_for_tests(true);
         crate::cycle::reset_for_tests();
         unsafe {

@@ -21,7 +21,6 @@
 
 use crate::concurrency::green;
 use crate::concurrency::sync_handle::{self, BlockCount, SyncHeader, WAITGROUP_MAGIC};
-use crate::handle_registry::{self, HandleKind};
 use std::sync::{Condvar, Mutex, MutexGuard};
 
 /// WaitGroup state
@@ -46,16 +45,13 @@ pub struct PithWaitGroup {
 pub type PithWaitGroupHandle = PithWaitGroup;
 
 unsafe fn waitgroup_ref<'a>(handle: *mut PithWaitGroupHandle) -> Option<&'a PithWaitGroupHandle> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::WaitGroup) {
-        return None;
-    }
+    sync_handle::header_of(handle as *const (), WAITGROUP_MAGIC, crate::quarantine::Op::Use)?;
     Some(&*handle)
 }
 
 /// the last count is gone, so no task waits: a waiter holds a count of its
 /// own.
 pub(crate) unsafe fn free_waitgroup(p: *mut PithWaitGroup) {
-    handle_registry::unregister(p as *const (), HandleKind::WaitGroup);
     sync_handle::free_box(p);
 }
 
@@ -130,7 +126,6 @@ pub extern "C" fn pith_waitgroup_new() -> *mut PithWaitGroupHandle {
         lock: Mutex::new(state),
         cvar: Condvar::new(),
     }));
-    handle_registry::register(ptr as *const (), HandleKind::WaitGroup);
     ptr
 }
 

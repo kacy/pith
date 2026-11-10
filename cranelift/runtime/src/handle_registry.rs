@@ -15,9 +15,7 @@ pub(crate) enum HandleKind {
     List,
     Process,
     ProcessOutput,
-    Semaphore,
     Task,
-    WaitGroup,
     X25519Key,
 }
 
@@ -48,10 +46,7 @@ static HANDLES: LazyLock<[Shard; SHARDS]> =
 /// allocation addresses and small sequential ids across the shards.
 fn shard(key: usize) -> std::sync::MutexGuard<'static, HandleSet> {
     let index = (key as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SHARDS.trailing_zeros());
-    HANDLES[index as usize]
-        .0
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    crate::sync::lock(&HANDLES[index as usize].0)
 }
 
 pub(crate) fn register(ptr: *const (), kind: HandleKind) {

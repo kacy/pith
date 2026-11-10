@@ -8,6 +8,14 @@
 
 use std::sync::atomic::Ordering;
 
+/// lock a std mutex through poisoning. a panic on another thread must not
+/// wedge the runtime's bookkeeping, and none of the state behind these locks
+/// has an invariant a panic could break.
+#[inline]
+pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(not(all(test, loom)))]
 pub(crate) use std::sync::{atomic::AtomicU8, Mutex};
 

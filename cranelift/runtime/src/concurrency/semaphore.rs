@@ -27,7 +27,6 @@
 
 use crate::concurrency::green;
 use crate::concurrency::sync_handle::{self, BlockCount, SyncHeader, SEMAPHORE_MAGIC};
-use crate::handle_registry::{self, HandleKind};
 use std::collections::VecDeque;
 use std::sync::{Condvar, Mutex, MutexGuard};
 
@@ -55,16 +54,13 @@ pub struct PithSemaphore {
 pub type PithSemaphoreHandle = PithSemaphore;
 
 unsafe fn semaphore_ref<'a>(handle: *mut PithSemaphoreHandle) -> Option<&'a PithSemaphoreHandle> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::Semaphore) {
-        return None;
-    }
+    sync_handle::header_of(handle as *const (), SEMAPHORE_MAGIC, crate::quarantine::Op::Use)?;
     Some(&*handle)
 }
 
 /// the last count is gone, so no task waits: a waiter holds a count of its
 /// own.
 pub(crate) unsafe fn free_semaphore(p: *mut PithSemaphore) {
-    handle_registry::unregister(p as *const (), HandleKind::Semaphore);
     sync_handle::free_box(p);
 }
 
@@ -144,7 +140,6 @@ pub extern "C" fn pith_semaphore_new(initial: i64) -> *mut PithSemaphoreHandle {
         lock: Mutex::new(state),
         cvar: Condvar::new(),
     }));
-    handle_registry::register(ptr as *const (), HandleKind::Semaphore);
     ptr
 }
 

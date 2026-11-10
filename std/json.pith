@@ -503,15 +503,17 @@ fn json_byte_skip_whitespace(input: Bytes, pos: Int) -> Int:
         i = i + 1
     return i
 
-fn json_hex_digit_value(c: String) -> Int:
-    code := ord(c)
-    if code >= 48 and code <= 57:
-        return code - 48
-    if code >= 97 and code <= 102:
-        return code - 87
-    if code >= 65 and code <= 70:
-        return code - 55
-    return 0 - 1
+# the four hex digits at `at` in `text` as a code unit, or -1.
+fn json_text_hex4(text: String, at: Int) -> Int:
+    mut code := 0
+    mut d := 0
+    while d < 4:
+        digit := json_fill_hex_digit(ord(text[at + d]))
+        if digit < 0:
+            return -1
+        code = code * 16 + digit
+        d = d + 1
+    return code
 
 fn json_utf8_encode(code: Int) -> String:
     if code < 0x80:
@@ -555,28 +557,16 @@ fn json_unescape_text(raw: String) -> (String, Bool):
         elif e == "u":
             if i + 5 >= raw.len():
                 return (parts.join(""), false)
-            mut code := 0
-            mut d := 0
-            while d < 4:
-                digit := json_hex_digit_value(raw[i + 2 + d])
-                if digit < 0:
-                    return (parts.join(""), false)
-                code = code * 16 + digit
-                d = d + 1
+            mut code := json_text_hex4(raw, i + 2)
+            if code < 0:
+                return (parts.join(""), false)
             i = i + 6
             # a high surrogate must be followed by \u and a low surrogate;
             # the pair combines into one supplementary code point.
             if code >= 0xD800 and code <= 0xDBFF:
                 if i + 5 >= raw.len() or raw[i] != chr(92) or raw[i + 1] != "u":
                     return (parts.join(""), false)
-                mut low := 0
-                d = 0
-                while d < 4:
-                    digit := json_hex_digit_value(raw[i + 2 + d])
-                    if digit < 0:
-                        return (parts.join(""), false)
-                    low = low * 16 + digit
-                    d = d + 1
+                low := json_text_hex4(raw, i + 2)
                 if low < 0xDC00 or low > 0xDFFF:
                     return (parts.join(""), false)
                 code = 0x10000 + (code - 0xD800) * 1024 + (low - 0xDC00)

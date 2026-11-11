@@ -71,7 +71,7 @@ from ir_call_helpers import ir_join_arg_regs, ir_method_call_arg_regs, ir_call_a
 from ir_generics import ir_is_fn_decl_kind, ir_has_generic_params, ir_collect_generic_param_names, ir_param_name_at, ir_resolve_generic_module_call_name, ir_decode_type_list
 from ir_struct_layouts import ir_struct_layout_name_with_state
 from ir_control_helpers import IrIfBranch, IrForBindingNames, ir_stmt_is_expr, ir_collect_if_branch, ir_for_binding_names, ir_collect_bind_parts
-from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_map_upsert_add_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
+from ir_collection_helpers import ir_map_uses_int_keys, ir_set_new_name, ir_set_add_name, ir_lookup_map_value_type_for_expr_with_state, ir_index_get_call_name, ir_index_set_call_name, ir_map_upsert_add_call_name, ir_map_add_or_insert_call_name, ir_for_loop_item_call_name, ir_for_loop_item_return_kind, ir_for_iter_item_kind, ir_for_iter_conversion_call, ir_for_iter_conversion_return_kind, ir_for_len_call_name, ir_empty_collection_init_call_name, ir_normalize_collection_target
 from ir_field_helpers import ir_emit_tuple_field_access
 from ir_operator_helpers import ir_emit_unary_op, ir_emit_simple_binary, ir_is_float_arithmetic, ir_emit_float_binary, ir_binary_simple_ir_op, ir_compound_assignment_ir_op
 from ir_list_helpers import ir_is_list_runtime_type, ir_emit_list_map_loop, ir_emit_list_filter_loop, ir_emit_list_reduce_loop, ir_emit_list_is_empty, ir_emit_list_missing_index_result, ir_emit_list_index_search_loop, ir_emit_list_contains_from_index
@@ -10359,6 +10359,143 @@ fn ir_try_emit_map_upsert_method(idx: Int) -> Int:
         return 0 - 1
     return ir_try_emit_map_upsert_add(node.children[0], key_idx, value_idx)
 
+# --- the counting branch ---
+#
+# `if m.contains_key(k): m[k] += d else: m[k] = e` and its spellings: either
+# arm may be written as `m.insert(k, ...)`, `m[k] = ...` or (the update arm)
+# `m[k] += d`. On an integer-valued map with every operand a pure read, the
+# whole branch is one runtime call that hashes the key once and probes once.
+# The branch it replaces called contains_key and then the update or the
+# store, each with its own hash and probe. The operands are pure reads, so
+# evaluating d and e up front cannot be told apart from evaluating one of
+# them inside its arm.
+
+# the one statement a branch body holds, unwrapping block wrappers, or -1
+# when it holds anything other than exactly one statement.
+fn ir_single_stmt(idx: Int) -> Int:
+    kind := node_kind(idx)
+    if kind == "block" or kind == "then" or kind == "else" or kind == "body":
+        if node_child_count(idx) != 1:
+            return 0 - 1
+        return ir_single_stmt(node_child(idx, 0))
+    return idx
+
+# true when the statement assigns to `m[k]` for this map and key, with `=`
+# or with the compound operator `op` ("=" for a plain store).
+fn ir_stores_map_slot(stmt: Node, map_idx: Int, key_idx: Int, op: String) -> Bool:
+    if stmt.children.len() < 2:
+        return false
+    if stmt.kind == "assign":
+        if op != "=":
+            return false
+    elif stmt.kind == "assignment":
+        if stmt.value != op:
+            return false
+    else:
+        return false
+    target := get_node(stmt.children[0])
+    if target.kind != "index" or target.children.len() < 2:
+        return false
+    return ir_same_pure_read(target.children[0], map_idx) and ir_same_pure_read(target.children[1], key_idx)
+
+# the value `m.insert(k, v)` stores, for this map and key, or -1.
+fn ir_inserted_map_value(stmt: Node, map_idx: Int, key_idx: Int) -> Int:
+    if stmt.kind != "method_call" or ir_plain_method_name(stmt.value) != "insert" or stmt.children.len() != 3:
+        return 0 - 1
+    if not ir_same_pure_read(stmt.children[0], map_idx):
+        return 0 - 1
+    arg_key := ir_method_call_arg_expr(stmt, 0)
+    if arg_key < 0 or not ir_same_pure_read(arg_key, key_idx):
+        return 0 - 1
+    return ir_method_call_arg_expr(stmt, 1)
+
+# the delta the update arm adds to `m[k]`, or -1 when the arm is not an
+# integer update of that slot.
+fn ir_count_update_delta(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
+    stmt := get_node(stmt_idx)
+    mut value_idx := ir_inserted_map_value(stmt, map_idx, key_idx)
+    if value_idx < 0 and ir_stores_map_slot(stmt, map_idx, key_idx, "="):
+        value_idx = stmt.children[1]
+    if value_idx >= 0:
+        if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+            return 0 - 1
+        return ir_upsert_delta_idx(map_idx, key_idx, value_idx)
+    if not ir_stores_map_slot(stmt, map_idx, key_idx, "+="):
+        return 0 - 1
+    target_idx := stmt.children[0]
+    if ir_checked_index_type(target_idx) != "int":
+        return 0 - 1
+    if ir_sized_int_narrow_fn(c_get_expr_type(target_idx)).len() > 0:
+        return 0 - 1
+    if not ir_pure_read_expr(stmt.children[1]):
+        return 0 - 1
+    return stmt.children[1]
+
+# the value the insert arm stores under `m[k]`, or -1.
+fn ir_count_insert_value(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
+    stmt := get_node(stmt_idx)
+    mut value_idx := ir_inserted_map_value(stmt, map_idx, key_idx)
+    if value_idx < 0 and ir_stores_map_slot(stmt, map_idx, key_idx, "="):
+        value_idx = stmt.children[1]
+    if value_idx < 0 or not ir_pure_read_expr(value_idx):
+        return 0 - 1
+    if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+        return 0 - 1
+    return value_idx
+
+# emit the counting branch as one call, or return false to leave the if
+# statement to the general path.
+fn ir_try_emit_map_count_if(node: Node) -> Bool:
+    if ir_current_func_returns_result:
+        return false
+    mut cond_idx := 0 - 1
+    mut then_idx := 0 - 1
+    mut else_idx := 0 - 1
+    for child in node.children:
+        kind := node_kind(child)
+        if kind == "elif":
+            return false
+        if kind == "else":
+            else_idx = child
+        elif kind == "then" or kind == "block":
+            then_idx = child
+        elif cond_idx < 0:
+            cond_idx = child
+    if cond_idx < 0 or then_idx < 0 or else_idx < 0:
+        return false
+    cond := get_node(cond_idx)
+    if cond.kind != "method_call" or ir_plain_method_name(cond.value) != "contains_key" or cond.children.len() != 2:
+        return false
+    map_idx := cond.children[0]
+    key_idx := ir_method_call_arg_expr(cond, 0)
+    if key_idx < 0:
+        return false
+    obj_type := ir_infer_type(map_idx)
+    if obj_type != "map" and obj_type != "map_int":
+        return false
+    if not ir_pure_read_expr(map_idx) or not ir_pure_read_expr(key_idx):
+        return false
+    then_stmt := ir_single_stmt(then_idx)
+    else_stmt := ir_single_stmt(else_idx)
+    if then_stmt < 0 or else_stmt < 0:
+        return false
+    delta_idx := ir_count_update_delta(then_stmt, map_idx, key_idx)
+    if delta_idx < 0:
+        return false
+    init_idx := ir_count_insert_value(else_stmt, map_idx, key_idx)
+    if init_idx < 0:
+        return false
+    call_name := ir_map_add_or_insert_call_name(ir_bytes_keyed_type(map_idx, obj_type))
+    map_r := ir_expr(map_idx)
+    key_r := ir_expr(key_idx)
+    delta_r := ir_expr(delta_idx)
+    init_r := ir_expr(init_idx)
+    ir_emit_call4(ir_reg(), call_name, "void", map_r, key_r, delta_r, init_r)
+    # a pure-read key is never owned, so this is a no-op today; it matches
+    # the release the fused update does.
+    ir_release_owned_index_key(key_idx, key_r)
+    return true
+
 fn ir_emit_index_assignment(target_idx: Int, value_idx: Int) -> Bool:
     return ir_emit_index_store(target_idx, value_idx, "")
 
@@ -11766,6 +11903,8 @@ fn ir_kind_discards_at_statement(kind: String) -> Bool:
     return ir_kind_is_struct_header(kind)
 
 fn ir_emit_if_stmt(node: Node):
+    if ir_try_emit_map_count_if(node):
+        return
     mut elif_indices: List[Int] := []
     mut else_idx := 0 - 1
     for child in node.children:

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # run the cross-language benchmarks in bench/compare.list and print one table
-# of median wall times for pith, go and rust.
+# of median wall times for pith, go, rust, c and c++.
 #
 #   bench/compare.sh [name...]
 #
@@ -26,6 +26,7 @@
 #             9950x with its smt siblings)
 #   WORKERS   PITH_GREEN_WORKERS, GOMAXPROCS, TOKIO_WORKERS and
 #             TOKIO_WORKER_THREADS (default: 16)
+#   CC, CXX   c and c++ compilers (default: cc and c++)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -78,16 +79,19 @@ work_output() {
 #   go:<file or dir>         go build of a file, or of a module directory
 #   rustc:<file>             rustc -O of one file
 #   cargo:<dir>[:<binary>]   cargo build --release of a crate directory
+#   cc:<file>                $CC -O2 of one c file
+#   cxx:<file>               $CXX -O2 -std=c++20 of one c++ file
 #   -                        no arm
 build_arm() {
     local name=$1 spec=$2
     local out=$work/$name.$3
+    # a row may leave out an arm that another row of the same source builds
+    [ "$spec" = - ] && return 0
     if [ -n "${built[$out]:-}" ]; then
         echo "$out"
         return 0
     fi
     case $spec in
-    -) return 0 ;;
     pith)
         "$pith" build "bench/$name.pith" > /dev/null
         mv "bench/$name" "$out"
@@ -102,6 +106,8 @@ build_arm() {
         fi
         ;;
     rustc:*) rustc -O -o "$out" "${spec#rustc:}" 2> /dev/null ;;
+    cc:*) "${CC:-cc}" -O2 -o "$out" "${spec#cc:}" ;;
+    cxx:*) "${CXX:-c++}" -O2 -std=c++20 -o "$out" "${spec#cxx:}" ;;
     cargo:*)
         local rest=${spec#cargo:} dir bin
         dir=${rest%%:*}
@@ -122,7 +128,7 @@ wanted=" $* "
 names=()
 declare -A cmd args check built
 declare -A mismatch=()
-while IFS='|' read -r name a p g r c; do
+while IFS='|' read -r name a p g r cc cxx c; do
     name=$(echo "$name" | xargs)
     case $name in '' | '#'*) continue ;; esac
     if [ $# -gt 0 ] && [[ $wanted != *" $name "* ]] && [[ $wanted != *" ${name%%/*} "* ]]; then
@@ -133,20 +139,21 @@ while IFS='|' read -r name a p g r c; do
     check[$name]=$(echo "${c:-}" | xargs)
     src=${name%%/*}
     echo "building $name" >&2
-    for arm in pith go rust; do
-        case $arm in pith) spec=$p ;; go) spec=$g ;; rust) spec=$r ;; esac
-        cmd[$name,$arm]=$(build_arm "$src" "$(echo "$spec" | xargs)" "$arm")
+    for arm in pith go rust c cpp; do
+        case $arm in pith) spec=$p ;; go) spec=$g ;; rust) spec=$r ;; c) spec=$cc ;; cpp) spec=$cxx ;; esac
+        spec=$(echo "${spec:--}" | xargs)
+        cmd[$name,$arm]=$(build_arm "$src" "${spec:--}" "$arm")
         [ -n "${cmd[$name,$arm]}" ] && built[${cmd[$name,$arm]}]=1
     done
 done < "$list"
 
-arms=(pith go rust)
+arms=(pith go rust c cpp)
 declare -A times
 for name in "${names[@]}"; do
     # shellcheck disable=SC2086
     base=$(taskset -c "$cpus" ${cmd[$name,pith]} ${args[$name]} 2>&1 | work_output "${check[$name]}")
-    for arm in go rust; do
-        c=${cmd[$name,$arm]}
+    for arm in go rust c cpp; do
+        c=${cmd[$name,$arm]:-}
         [ -z "$c" ] && continue
         # shellcheck disable=SC2086
         got=$(taskset -c "$cpus" $c ${args[$name]} 2>&1 | work_output "${check[$name]}")
@@ -159,9 +166,9 @@ done
 
 for trial in $(seq "$trials"); do
     for name in "${names[@]}"; do
-        for i in 0 1 2; do
-            arm=${arms[$(((i + trial - 1) % 3))]}
-            c=${cmd[$name,$arm]}
+        for i in "${!arms[@]}"; do
+            arm=${arms[$(((i + trial - 1) % ${#arms[@]}))]}
+            c=${cmd[$name,$arm]:-}
             [ -z "$c" ] && continue
             t0=$(now_ms)
             # shellcheck disable=SC2086
@@ -175,8 +182,8 @@ for trial in $(seq "$trials"); do
 done
 
 echo
-echo "| benchmark | args | pith ms | go ms | rust ms | pith/go | pith/rust |"
-echo "|---|---|---:|---:|---:|---:|---:|"
+echo "| benchmark | args | pith ms | go ms | rust ms | c ms | c++ ms | pith/go | pith/rust | pith/c | pith/c++ |"
+echo "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
 for name in "${names[@]}"; do
     declare -A med=()
     for arm in "${arms[@]}"; do
@@ -186,9 +193,10 @@ for name in "${names[@]}"; do
         awk -v a="${med[pith]}" -v b="$1" 'BEGIN { if (b == "-" || b == 0) print "-"; else printf "%.2fx", a / b }'
     }
     mark() { [ -n "${mismatch[$name,$1]:-}" ] && echo '*' || true; }
-    printf '| %s | `%s` | %s | %s%s | %s%s | %s | %s |\n' "$name" "${args[$name]}" \
+    printf '| %s | `%s` | %s | %s%s | %s%s | %s%s | %s%s | %s | %s | %s | %s |\n' "$name" "${args[$name]}" \
         "${med[pith]}" "${med[go]}" "$(mark go)" "${med[rust]}" "$(mark rust)" \
-        "$(ratio "${med[go]}")" "$(ratio "${med[rust]}")"
+        "${med[c]}" "$(mark c)" "${med[cpp]}" "$(mark cpp)" \
+        "$(ratio "${med[go]}")" "$(ratio "${med[rust]}")" "$(ratio "${med[c]}")" "$(ratio "${med[cpp]}")"
 done
 if [ ${#mismatch[@]} -gt 0 ]; then
     echo

@@ -647,8 +647,13 @@ pub unsafe extern "C" fn pith_byte_buffer_write_word(handle: i64, word: i64, cou
         PERF_BYTE_BUFFER_WRITES += 1,
         PERF_BYTE_BUFFER_WRITE_BYTES += count as usize,
     );
-    let le = (word as u64).to_le_bytes();
-    buffer.data.extend_from_slice(&le[..count as usize]);
+    // store all eight bytes in one unaligned write and count only the low
+    // `count`; extend_from_slice with a run-time length is a memcpy call.
+    let data = &mut buffer.data;
+    data.reserve(8);
+    let len = data.len();
+    std::ptr::write_unaligned(data.as_mut_ptr().add(len).cast::<[u8; 8]>(), (word as u64).to_le_bytes());
+    data.set_len(len + count as usize);
     1
 }
 
@@ -778,6 +783,23 @@ mod tests {
             let mut slots = [0i64; 3];
             pith_store_u64(slots.as_mut_ptr() as i64, 8, -5);
             assert_eq!(slots, [0, -5, 0]);
+            pith_bytes_release(data);
+        }
+    }
+
+    #[test]
+    fn write_word_appends_only_the_low_count_bytes() {
+        unsafe {
+            let buf = pith_byte_buffer_new();
+            let word = i64::from_le_bytes(*b"abcdefgh");
+            assert_eq!(pith_byte_buffer_write_word(buf, word, 3), 1);
+            assert_eq!(pith_byte_buffer_write_word(buf, word, 8), 1);
+            assert_eq!(pith_byte_buffer_write_word(buf, word, 1), 1);
+            assert_eq!(pith_byte_buffer_write_word(buf, word, 0), 0);
+            assert_eq!(pith_byte_buffer_write_word(buf, word, 9), 0);
+            assert_eq!(pith_byte_buffer_write_word(0, word, 8), 0);
+            let data = pith_byte_buffer_take_bytes(buf);
+            assert_eq!(pith_bytes_ref(data).unwrap().data, b"abcabcdefgha");
             pith_bytes_release(data);
         }
     }

@@ -369,6 +369,39 @@ impl MapImpl {
         }
     }
 
+    /// Add `delta` to the word under `key` when the map holds it, or store
+    /// `init` there when it does not, and return the word now stored. This is
+    /// the counting shape `if m.contains_key(k): m[k] += d else: m[k] = e` in
+    /// one hash and one probe, where the unfused form paid two calls and two
+    /// probes. Like `upsert_add`, it is only reached for integer values.
+    fn add_or_insert(&mut self, key: &KeyRef<'_>, delta: i64, init: i64) -> i64 {
+        if let KeyRef::Int(n) = key {
+            if let Some(data) = &mut self.int_values8 {
+                let slot = data.entry(*n).and_modify(|v| *v = v.wrapping_add(delta)).or_insert(init);
+                return *slot;
+            }
+        }
+        match self.data.entry_ref(key) {
+            EntryRef::Occupied(mut entry) => match entry.get_mut() {
+                MapVal::Word(word) => {
+                    *word = word.wrapping_add(delta);
+                    *word
+                }
+                MapVal::Wide(_) => {
+                    eprintln!(
+                        "pith runtime error: map update on a map whose values are not word-sized"
+                    );
+                    // panic-guard: the fused update is emitted only for an integer-valued map, so a wide value here is a compiler bug with no correct answer.
+                    std::process::exit(1);
+                }
+            },
+            EntryRef::Vacant(entry) => {
+                entry.insert(MapVal::Word(init));
+                init
+            }
+        }
+    }
+
     fn remove(&mut self, key: &KeyRef<'_>) -> Option<MapVal> {
         self.data.remove(key)
     }
@@ -1244,6 +1277,82 @@ pub unsafe extern "C" fn pith_map_upsert_add_bkey(map_handle: i64, key: i64, del
         strict_miss("<not a bytes value>");
     };
     upsert_add_keyed(impl_ref, &map_key, delta)
+}
+
+unsafe fn add_or_insert_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>, delta: i64, init: i64) -> i64 {
+    if impl_ref.val_is_heap() {
+        eprintln!("pith runtime error: map update on a map whose values are reference-counted");
+        // panic-guard: the fused update is emitted only for an integer-valued map, so a counted value here is a compiler bug with no correct answer.
+        std::process::exit(1);
+    }
+    impl_ref.add_or_insert(map_key, delta, init)
+}
+
+/// Add `delta` to the value under a C-string key, or store `init` when the
+/// map does not hold the key, returning the value now stored.
+///
+/// The emitter calls this for `if m.contains_key(k): m[k] += d else: m[k] = e`
+/// (and the `insert` and `m[k] = m[k] + d` spellings of either arm) when the
+/// map, key, delta and initial value are side-effect-free reads and the
+/// map's values are integers.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+/// * `key` must be a valid null-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_add_or_insert_cstr(
+    map_handle: i64,
+    key: *const i8,
+    delta: i64,
+    init: i64,
+) -> i64 {
+    if key.is_null() {
+        eprintln!("pith runtime error: map key not found: <null>");
+        // panic-guard: a null map key is a program bug with no value to return.
+        std::process::exit(1);
+    }
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        eprintln!("pith runtime error: map indexing on invalid map handle");
+        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
+        std::process::exit(1);
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_add_or_insert");
+    crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
+    add_or_insert_keyed(impl_ref, &cstr_key_ref(key), delta, init)
+}
+
+/// The int-keyed twin of `pith_map_add_or_insert_cstr`.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_add_or_insert_ikey(map_handle: i64, key: i64, delta: i64, init: i64) -> i64 {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        eprintln!("pith runtime error: map indexing on invalid map handle");
+        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
+        std::process::exit(1);
+    };
+    crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
+    add_or_insert_keyed(impl_ref, &KeyRef::Int(key), delta, init)
+}
+
+/// The bytes-keyed twin of `pith_map_add_or_insert_cstr`. The key is borrowed
+/// for the call and copied only when it is inserted.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_add_or_insert_bkey(map_handle: i64, key: i64, delta: i64, init: i64) -> i64 {
+    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
+        eprintln!("pith runtime error: map indexing on invalid map handle");
+        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
+        std::process::exit(1);
+    };
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_add_or_insert_bkey");
+    let Some(map_key) = bytes_key_ref(key) else {
+        strict_miss("<not a bytes value>");
+    };
+    add_or_insert_keyed(impl_ref, &map_key, delta, init)
 }
 
 /// Get an i64 value by C-string key. Returns 0 if the key is not found.
@@ -2827,6 +2936,80 @@ mod tests {
                     pith_map_release_handle(bmap);
                 }
             }
+            crate::bytes::pith_bytes_release(bkey);
+        }
+    }
+
+    /// The counting update answers what the `contains_key` branch it replaces
+    /// answers: a held key gets the delta, wrapping like `add`, and a missing
+    /// key gets the initial value, for every key flavor. A miss on an int map
+    /// whose values are heap-free but not in the scalar fast path (a map built
+    /// before it learned its value size) takes the shared table, so that path
+    /// is covered by the string and bytes maps here.
+    #[test]
+    fn a_counting_update_adds_to_a_held_key_and_inserts_a_missing_one() {
+        unsafe {
+            let key = b"user-1000-region\0".as_ptr() as *const i8;
+            let other = b"user-1001-region\0".as_ptr() as *const i8;
+            let bkey = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
+            let bother = crate::bytes::pith_bytes_from_vec(b"user-1001-region".to_vec());
+            for (start, delta) in [(0i64, 1i64), (7, -9), (i64::MAX, 1), (i64::MIN, -1)] {
+                let expected = start.wrapping_add(delta);
+
+                let smap = pith_map_new_default().ptr as i64;
+                assert_eq!(pith_map_add_or_insert_cstr(smap, key, delta, start), start);
+                assert_eq!(pith_map_add_or_insert_cstr(smap, key, delta, 99), expected);
+                assert_eq!(pith_map_add_or_insert_cstr(smap, other, delta, 5), 5);
+                assert_eq!(pith_map_get_cstr_strict(smap, key), expected);
+                assert_eq!(pith_map_len_handle(smap), 2);
+                pith_map_release_handle(smap);
+
+                let imap = pith_map_new_int().ptr as i64;
+                assert_eq!(pith_map_add_or_insert_ikey(imap, 7, delta, start), start);
+                assert_eq!(pith_map_add_or_insert_ikey(imap, 7, delta, 99), expected);
+                assert_eq!(pith_map_add_or_insert_ikey(imap, 8, delta, 5), 5);
+                assert_eq!(pith_map_get_ikey_strict(imap, 7), expected);
+                assert_eq!(pith_map_len_handle(imap), 2);
+                pith_map_release_handle(imap);
+
+                let bmap = pith_map_new_bytes().ptr as i64;
+                assert_eq!(pith_map_add_or_insert_bkey(bmap, bkey, delta, start), start);
+                assert_eq!(pith_map_add_or_insert_bkey(bmap, bkey, delta, 99), expected);
+                assert_eq!(pith_map_add_or_insert_bkey(bmap, bother, delta, 5), 5);
+                assert_eq!(pith_map_get_bkey_strict(bmap, bkey), expected);
+                assert_eq!(pith_map_len_handle(bmap), 2);
+                pith_map_release_handle(bmap);
+            }
+            crate::bytes::pith_bytes_release(bkey);
+            crate::bytes::pith_bytes_release(bother);
+        }
+    }
+
+    /// A hit allocates nothing, and a miss allocates only the map's own copy
+    /// of a string or bytes key.
+    #[test]
+    fn a_counting_update_allocates_only_for_a_new_key() {
+        unsafe {
+            let key = b"user-1000-region\0".as_ptr() as *const i8;
+            let map = pith_map_new_default().ptr as i64;
+            pith_map_add_or_insert_cstr(map, key, 1, 1);
+            assert_eq!(allocations_during(|| { pith_map_add_or_insert_cstr(map, key, 1, 1); }), 0);
+            pith_map_release_handle(map);
+
+            let imap = pith_map_new_int().ptr as i64;
+            pith_map_add_or_insert_ikey(imap, 7, 1, 1);
+            assert_eq!(allocations_during(|| { pith_map_add_or_insert_ikey(imap, 7, 1, 1); }), 0);
+            pith_map_release_handle(imap);
+
+            // the first key also allocates the table, so one goes in first
+            let bfirst = crate::bytes::pith_bytes_from_vec(b"user-999-region".to_vec());
+            let bkey = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
+            let bmap = pith_map_new_bytes().ptr as i64;
+            pith_map_add_or_insert_bkey(bmap, bfirst, 1, 1);
+            assert_eq!(allocations_during(|| { pith_map_add_or_insert_bkey(bmap, bkey, 1, 1); }), 1);
+            assert_eq!(allocations_during(|| { pith_map_add_or_insert_bkey(bmap, bkey, 1, 1); }), 0);
+            pith_map_release_handle(bmap);
+            crate::bytes::pith_bytes_release(bfirst);
             crate::bytes::pith_bytes_release(bkey);
         }
     }

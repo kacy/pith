@@ -1,0 +1,147 @@
+# `if m.contains_key(k): m[k] += d else: m[k] = e` lowers to one runtime call
+# that adds to a held key or stores the initial value under a missing one,
+# with one hash and one probe. Either arm may be spelled with `insert` or an
+# index store, and the update arm also with `+=`.
+#
+# Every fused count is printed beside the same counting done through a
+# helper that reads into a local first, which the recognizer declines. The
+# shapes that must NOT fuse are here too: an `elif`, an arm with a second
+# statement, a key or an initial value that calls a function (the branch
+# evaluates each once, in its own arm), a map of strings, and a `T!`
+# function, where `m[k]` propagates a miss instead of aborting.
+
+struct Tally:
+    pub counts: Map[String, Int]
+
+fn count_via_local(mut m: Map[String, Int], key: String):
+    if m.contains_key(key):
+        old := m[key]
+        m.insert(key, old + 1)
+    else:
+        m.insert(key, 1)
+
+fn string_keys():
+    words := ["a", "b", "a", "c", "a", "b"]
+    mut by_insert: Map[String, Int] := {}
+    mut by_index: Map[String, Int] := {}
+    mut by_compound: Map[String, Int] := {}
+    mut control: Map[String, Int] := {}
+    for w in words:
+        if by_insert.contains_key(w):
+            by_insert.insert(w, by_insert[w] + 1)
+        else:
+            by_insert.insert(w, 1)
+        if by_index.contains_key(w):
+            by_index[w] = by_index[w] + 1
+        else:
+            by_index[w] = 1
+        if by_compound.contains_key(w):
+            by_compound[w] += 1
+        else:
+            by_compound.insert(w, 1)
+        count_via_local(control, w)
+    print("insert: {by_insert["a"]} {by_insert["b"]} {by_insert["c"]} {by_insert.len()}")
+    print("index: {by_index["a"]} {by_index["b"]} {by_index["c"]} {by_index.len()}")
+    print("compound: {by_compound["a"]} {by_compound["b"]} {by_compound["c"]} {by_compound.len()}")
+    print("control: {control["a"]} {control["b"]} {control["c"]} {control.len()}")
+
+# a delta and an initial value read from locals, and a negative delta
+fn int_keys():
+    step := 0 - 3
+    first := 100
+    mut m: Map[Int, Int] := {}
+    mut i := 0
+    while i < 10:
+        k := i % 4
+        if m.contains_key(k):
+            m[k] += step
+        else:
+            m[k] = first
+        i = i + 1
+    print("int: {m[0]} {m[1]} {m[2]} {m[3]} {m.len()}")
+
+fn bytes_keys():
+    alpha := bytes_from_string_utf8("alpha")
+    beta := bytes_from_string_utf8("beta")
+    mut m: Map[Bytes, Int] := {}
+    for key in [alpha, beta, alpha, alpha]:
+        if m.contains_key(key):
+            m.insert(key, m[key] + 2)
+        else:
+            m.insert(key, 10)
+    # the same content built again finds the same entry
+    again := bytes_from_string_utf8("beta")
+    if m.contains_key(again):
+        m[again] += 5
+    else:
+        m[again] = 0
+    print("bytes: {m[alpha]} {m[beta]} {m.len()}")
+
+# the map behind a field access is a pure read on every side
+fn field_map():
+    t := Tally({})
+    for w in ["x", "x", "y"]:
+        if t.counts.contains_key(w):
+            t.counts[w] += 1
+        else:
+            t.counts.insert(w, 1)
+    print("field: {t.counts["x"]} {t.counts["y"]} {t.counts.len()}")
+
+fn noisy(label: String, value: Int) -> Int:
+    print("call {label}")
+    return value
+
+# each of these keeps its branch, and so runs each call once, in its arm
+fn declined_shapes():
+    mut m: Map[String, Int] := {}
+    m.insert("held", 1)
+    for k in ["held", "new"]:
+        if m.contains_key(k):
+            m[k] += 1
+        elif k == "never":
+            m[k] = 0 - 1
+        else:
+            m[k] = 1
+    for k in ["held", "other"]:
+        if m.contains_key(k):
+            m[k] += 1
+            print("held {k}")
+        else:
+            m[k] = 1
+    for k in ["held", "third"]:
+        if m.contains_key(k):
+            m[k] += noisy("delta", 1)
+        else:
+            m[k] = noisy("init", 7)
+    print("declined: {m["held"]} {m["new"]} {m["other"]} {m["third"]} {m.len()}")
+
+fn string_values():
+    mut m: Map[String, String] := {}
+    for k in ["a", "a"]:
+        if m.contains_key(k):
+            m[k] = m[k] + "y"
+        else:
+            m[k] = "x"
+    print("string values: {m["a"]}")
+
+fn count_in_result_fn(mut m: Map[String, Int], key: String) -> Int!:
+    if m.contains_key(key):
+        m[key] = m[key] + 1
+    else:
+        m[key] = 1
+    return m[key]
+
+fn result_fn_count():
+    mut m: Map[String, Int] := {}
+    first := count_in_result_fn(m, "a") catch 0 - 1
+    second := count_in_result_fn(m, "a") catch 0 - 1
+    print("result fn: {first} {second} {m.len()}")
+
+fn main():
+    string_keys()
+    int_keys()
+    bytes_keys()
+    field_map()
+    declined_shapes()
+    string_values()
+    result_fn_count()

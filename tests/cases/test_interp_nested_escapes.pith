@@ -1,0 +1,21 @@
+# a string argument inside `{}` can be written two ways: with escaped
+# quotes, `{f(\"x\")}`, or with bare ones, `{f("x")}`. The escaped form's
+# `\"` and `\\` are undone before the expression is parsed. Inside a
+# bare-quoted literal the escapes belong to that literal and must survive:
+# `{s.index_of("\"")}` searches for a quote. They used to be undone there
+# too, which closed the literal early and searched for an empty string.
+
+fn show(a: String, b: Int) -> String:
+    return a + ":" + b.to_string()
+
+fn main():
+    m := {"a": 1}
+    s := "say \"hi\" \\ there"
+    print("escaped: {show(\"x\", 1)} {show(\"a\\\\b\", 2)}")
+    print("bare: {show("x", 1)} {m["a"]} {show("q\"q", 3)} {show("a\\b", 4)}")
+    print("search: {s.index_of("\"")} {s.index_of("\\")} {s.index_of("\"hi\"")}")
+    print("mixed: {show(\"x\", 1)} {s.index_of("\"")} {show(\"y\", 2)}")
+    # the same searches outside an interpolation, which must agree
+    quote_at := s.index_of("\"")
+    slash_at := s.index_of("\\")
+    print("direct: {quote_at} {slash_at}")

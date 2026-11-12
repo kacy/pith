@@ -4,7 +4,7 @@
 # the entry points are parse_with_file() and parse(); parse_main.pith is
 # a small command-line wrapper around them.
 
-from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr
+from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr, interp_escape_kind, INTERP_ESCAPE_COLLAPSED, INTERP_ESCAPE_KEPT
 from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value, node_kind
 from errors import Diagnostic
 
@@ -1302,22 +1302,26 @@ fn is_format_spec(spec: String) -> Bool:
 
 # where the character at `out_offset` of the unescaped fragment sits in
 # `raw`, the text the fragment was cut from. unescaping collapses `\"`
-# and `\\` to one character each, so every offset past one of those is
-# short by one in the fragment; walking the raw text the same way the
-# unescaper does gives the source offset back.
+# and `\\` to one character each outside a bare-quoted literal, so every
+# offset past one of those is short by one in the fragment; walking the raw
+# text the same way the unescaper does gives the source offset back.
 fn raw_offset_in_fragment(raw: String, out_offset: Int) -> Int:
     mut i := 0
     mut out := 0
+    mut in_literal := false
     while i < raw.len() and out < out_offset:
-        if ord(raw[i]) == 92 and i + 1 < raw.len():
-            nxt := raw[i + 1]
-            if ord(nxt) == 34 or ord(nxt) == 92:
-                i = i + 2
-            else:
-                i = i + 1
+        kind := interp_escape_kind(raw, i, in_literal)
+        if kind == INTERP_ESCAPE_COLLAPSED:
+            i = i + 2
+            out = out + 1
+        elif kind == INTERP_ESCAPE_KEPT:
+            i = i + 2
+            out = out + 2
         else:
+            if ord(raw[i]) == 34:
+                in_literal = not in_literal
             i = i + 1
-        out = out + 1
+            out = out + 1
     return i
 
 # parse the expression inside a `{}` interpolation.

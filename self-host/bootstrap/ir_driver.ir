@@ -205,6 +205,9 @@ global lexer___g_current_token_len 0
 global lexer___g_token_start_line 1
 global lexer___g_token_start_column 1
 global lexer___g_token_start_offset 0
+global lexer___g_INTERP_PLAIN 0
+global lexer___g_INTERP_ESCAPE_COLLAPSED 1
+global lexer___g_INTERP_ESCAPE_KEPT 2
 global lexer___g__tok_kinds list
 global lexer___g__tok_values list
 global lexer___g__tok_lines list
@@ -3240,127 +3243,179 @@ func lexer_unescape_interp_expr 1 string
 param text
 iconst 1 0
 store out 1
-iconst 2 0
-store ch 2
-iconst 3 0
-store nxt 3
-load 4 out
-strref 5 m0s69
-call 6 pith_cstring_release void 1 4
-store out 5
-iconst 7 0
-store i 7
+load 2 out
+strref 3 m0s69
+call 4 pith_cstring_release void 1 2
+store out 3
+iconst 5 0
+store i 5
+iconst 6 0
+store in_literal 6
 label L433
-load 8 i
-load 9 text
-call 10 pith_cstring_len int 1 9
-lt 11 8 10
-brif 11 L434 L435
+load 7 i
+load 8 text
+call 9 pith_cstring_len int 1 8
+lt 10 7 9
+brif 10 L434 L435
 label L434
-load 12 ch
-load 13 text
-load 14 i
-call 15 pith_cstring_char_at_strict string 2 13 14
-call 16 pith_cstring_release void 1 12
-store ch 15
-iconst 17 0
-store __and_17_439 17
-load 18 ch
-call 19 ord int 1 18
-iconst 20 92
-eq 21 19 20
-store __and_17_439 21
-brif 21 L439 L440
-label L439
-load 22 i
-iconst 23 1
-add 24 22 23
-load 25 text
-call 26 pith_cstring_len int 1 25
-lt 27 24 26
-store __and_17_439 27
-label L440
-load 28 __and_17_439
-brif 28 L437 L438
+load 11 text
+load 12 i
+load 13 in_literal
+call 14 lexer_interp_escape_kind int 3 11 12 13
+store kind 14
+load 15 kind
+load 16 lexer___g_INTERP_ESCAPE_COLLAPSED
+eq 17 15 16
+brif 17 L437 L438
 label L437
-load 29 nxt
-load 30 text
-load 31 i
-iconst 32 1
-add 33 31 32
-call 34 pith_cstring_char_at_strict string 2 30 33
-call 35 pith_cstring_release void 1 29
-store nxt 34
-iconst 36 0
-store __or_36_444 36
-load 37 nxt
-call 38 ord int 1 37
-iconst 39 34
-eq 40 38 39
-store __or_36_444 40
-brif 40 L445 L444
-label L444
-load 41 nxt
-call 42 ord int 1 41
-iconst 43 92
-eq 44 42 43
-store __or_36_444 44
-label L445
-load 45 __or_36_444
-brif 45 L442 L443
-label L442
-load 46 out
-load 47 nxt
-concat 48 46 47
-load 49 out
-call 50 pith_cstring_release void 1 49
-store out 48
-load 51 i
-iconst 52 2
-add 53 51 52
-store i 53
-jmp L441
-label L443
-load 54 out
-load 55 ch
-concat 56 54 55
-load 57 out
-call 58 pith_cstring_release void 1 57
-store out 56
-load 59 i
-iconst 60 1
-add 61 59 60
-store i 61
-label L441
+load 18 out
+load 19 text
+load 20 i
+iconst 21 1
+add 22 20 21
+call 23 pith_cstring_char_at_strict string 2 19 22
+concat 24 18 23
+call 25 pith_cstring_release void 1 23
+load 26 out
+call 27 pith_cstring_release void 1 26
+store out 24
+load 28 i
+iconst 29 2
+add 30 28 29
+store i 30
 jmp L436
 label L438
-load 62 out
-load 63 ch
-concat 64 62 63
-load 65 out
-call 66 pith_cstring_release void 1 65
-store out 64
-load 67 i
-iconst 68 1
-add 69 67 68
-store i 69
+load 31 kind
+load 32 lexer___g_INTERP_ESCAPE_KEPT
+eq 33 31 32
+brif 33 L439 L440
+label L439
+load 34 out
+load 35 text
+load 36 i
+call 37 pith_cstring_char_at_strict string 2 35 36
+concat 38 34 37
+call 39 pith_cstring_release void 1 37
+load 40 text
+load 41 i
+iconst 42 1
+add 43 41 42
+call 44 pith_cstring_char_at_strict string 2 40 43
+concat 45 38 44
+call 46 pith_cstring_release void 1 38
+call 47 pith_cstring_release void 1 44
+load 48 out
+call 49 pith_cstring_release void 1 48
+store out 45
+load 50 i
+iconst 51 2
+add 52 50 51
+store i 52
+jmp L436
+label L440
+load 53 text
+load 54 i
+call 55 pith_cstring_byte_at int 2 53 54
+iconst 56 34
+eq 57 55 56
+brif 57 L442 L443
+label L442
+load 58 in_literal
+iconst 60 1
+sub 59 60 58
+store in_literal 59
+jmp L441
+label L443
+label L441
+load 61 out
+load 62 text
+load 63 i
+call 64 pith_cstring_char_at_strict string 2 62 63
+concat 65 61 64
+call 66 pith_cstring_release void 1 64
+load 67 out
+call 68 pith_cstring_release void 1 67
+store out 65
+load 69 i
+iconst 70 1
+add 71 69 70
+store i 71
 label L436
 jmp L433
 label L435
-load 70 out
-load 71 ch
-call 72 pith_cstring_release void 1 71
-load 73 nxt
+load 72 out
+ret 72
+load 73 out
 call 74 pith_cstring_release void 1 73
-ret 70
-load 75 out
-call 76 pith_cstring_release void 1 75
-load 77 ch
-call 78 pith_cstring_release void 1 77
-load 79 nxt
-call 80 pith_cstring_release void 1 79
-iconst 81 0
-ret 81
+iconst 75 0
+ret 75
+endfunc
+func lexer_interp_escape_kind 3 int
+param text
+param i
+param in_literal
+iconst 3 0
+store __or_3_447 3
+load 4 text
+load 5 i
+call 6 pith_cstring_byte_at int 2 4 5
+iconst 7 92
+neq 8 6 7
+store __or_3_447 8
+brif 8 L448 L447
+label L447
+load 9 i
+iconst 10 1
+add 11 9 10
+load 12 text
+call 13 pith_cstring_len int 1 12
+gte 14 11 13
+store __or_3_447 14
+label L448
+load 15 __or_3_447
+brif 15 L445 L446
+label L445
+load 16 lexer___g_INTERP_PLAIN
+ret 16
+label L446
+label L444
+load 17 in_literal
+brif 17 L450 L451
+label L450
+load 18 lexer___g_INTERP_ESCAPE_KEPT
+ret 18
+label L451
+label L449
+load 19 text
+load 20 i
+iconst 21 1
+add 22 20 21
+call 23 pith_cstring_byte_at int 2 19 22
+store nxt 23
+iconst 24 0
+store __or_24_455 24
+load 25 nxt
+iconst 26 34
+eq 27 25 26
+store __or_24_455 27
+brif 27 L456 L455
+label L455
+load 28 nxt
+iconst 29 92
+eq 30 28 29
+store __or_24_455 30
+label L456
+load 31 __or_24_455
+brif 31 L453 L454
+label L453
+load 32 lexer___g_INTERP_ESCAPE_COLLAPSED
+ret 32
+label L454
+label L452
+load 33 lexer___g_INTERP_PLAIN
+ret 33
+iconst 34 0
+ret 34
 endfunc
 func lexer_queue_interpolation_token 6 void
 param kind
@@ -3401,21 +3456,21 @@ iconst 3 0
 store end_text 3
 iconst 4 0
 store mid_text 4
-label L446
+label L457
 load 5 lexer___g_current_position
 load 6 lexer___g_source
 call 7 pith_cstring_len int 1 6
 lt 8 5 7
-brif 8 L447 L448
-label L447
+brif 8 L458 L459
+label L458
 load 9 lexer___g_current_position
 call 10 lexer_source_char string 1 9
 call 11 lexer_is_lbrace bool 1 10
 call 12 pith_cstring_release void 1 10
 iconst 14 1
 sub 13 14 11
-brif 13 L450 L451
-label L450
+brif 13 L461 L462
+label L461
 load 15 input_char
 call 16 pith_cstring_release void 1 15
 load 17 expr_text
@@ -3428,8 +3483,8 @@ load 23 mid_text
 call 24 pith_cstring_release void 1 23
 iconst 25 0
 ret 25
-label L451
-label L449
+label L462
+label L460
 load 26 lexer___g_current_position
 iconst 27 1
 add 28 26 27
@@ -3450,42 +3505,42 @@ add 37 35 36
 store expression_column 37
 iconst 38 0
 store found_expr_end 38
-label L452
+label L463
 load 39 lexer___g_current_position
 load 40 lexer___g_source
 call 41 pith_cstring_len int 1 40
 lt 42 39 41
-brif 42 L453 L454
-label L453
+brif 42 L464 L465
+label L464
 load 43 found_expr_end
-brif 43 L456 L457
-label L456
-jmp L454
-label L457
-label L455
+brif 43 L467 L468
+label L467
+jmp L465
+label L468
+label L466
 load 44 input_char
 load 45 lexer___g_current_position
 call 46 lexer_source_char string 1 45
 call 47 pith_cstring_release void 1 44
 store input_char 46
 iconst 48 0
-store __and_48_461 48
+store __and_48_472 48
 load 49 input_char
 call 50 lexer_is_backslash bool 1 49
-store __and_48_461 50
-brif 50 L461 L462
-label L461
+store __and_48_472 50
+brif 50 L472 L473
+label L472
 load 51 lexer___g_current_position
 iconst 52 1
 add 53 51 52
 load 54 lexer___g_source
 call 55 pith_cstring_len int 1 54
 lt 56 53 55
-store __and_48_461 56
-label L462
-load 57 __and_48_461
-brif 57 L459 L460
-label L459
+store __and_48_472 56
+label L473
+load 57 __and_48_472
+brif 57 L470 L471
+label L470
 load 58 lexer___g_current_position
 iconst 59 2
 add 60 58 59
@@ -3494,12 +3549,12 @@ load 61 lexer___g_current_column
 iconst 62 2
 add 63 61 62
 store lexer___g_current_column 63
-jmp L458
-label L460
+jmp L469
+label L471
 load 64 input_char
 call 65 lexer_is_lbrace bool 1 64
-brif 65 L463 L464
-label L463
+brif 65 L474 L475
+label L474
 load 66 brace_depth
 iconst 67 1
 add 68 66 67
@@ -3512,12 +3567,12 @@ load 72 lexer___g_current_column
 iconst 73 1
 add 74 72 73
 store lexer___g_current_column 74
-jmp L458
-label L464
+jmp L469
+label L475
 load 75 input_char
 call 76 lexer_is_rbrace bool 1 75
-brif 76 L465 L466
-label L465
+brif 76 L476 L477
+label L476
 load 77 brace_depth
 iconst 78 1
 sub 79 77 78
@@ -3525,12 +3580,12 @@ store brace_depth 79
 load 80 brace_depth
 iconst 81 0
 eq 82 80 81
-brif 82 L468 L469
-label L468
+brif 82 L479 L480
+label L479
 iconst 83 1
 store found_expr_end 83
-jmp L467
-label L469
+jmp L478
+label L480
 load 84 lexer___g_current_position
 iconst 85 1
 add 86 84 85
@@ -3539,9 +3594,9 @@ load 87 lexer___g_current_column
 iconst 88 1
 add 89 87 88
 store lexer___g_current_column 89
-label L467
-jmp L458
-label L466
+label L478
+jmp L469
+label L477
 load 90 lexer___g_current_position
 iconst 91 1
 add 92 90 91
@@ -3550,9 +3605,9 @@ load 93 lexer___g_current_column
 iconst 94 1
 add 95 93 94
 store lexer___g_current_column 95
-label L458
-jmp L452
-label L454
+label L469
+jmp L463
+label L465
 load 96 expr_text
 load 97 lexer___g_source
 load 98 expression_start
@@ -3564,8 +3619,8 @@ load 102 expr_text
 call 103 pith_cstring_len int 1 102
 iconst 104 0
 gt 105 103 104
-brif 105 L471 L472
-label L471
+brif 105 L482 L483
+label L482
 strref 106 m0s68
 load 107 expr_text
 load 108 expression_line
@@ -3575,15 +3630,15 @@ load 111 expr_text
 call 112 pith_cstring_len int 1 111
 call 113 lexer_queue_interpolation_token void 6 106 107 108 109 110 112
 call 114 pith_cstring_release void 1 106
-jmp L470
-label L472
-label L470
+jmp L481
+label L483
+label L481
 load 115 lexer___g_current_position
 load 116 lexer___g_source
 call 117 pith_cstring_len int 1 116
 gte 118 115 117
-brif 118 L474 L475
-label L474
+brif 118 L485 L486
+label L485
 load 119 input_char
 call 120 pith_cstring_release void 1 119
 load 121 expr_text
@@ -3596,8 +3651,8 @@ load 127 mid_text
 call 128 pith_cstring_release void 1 127
 iconst 129 0
 ret 129
-label L475
-label L473
+label L486
+label L484
 load 130 lexer___g_current_position
 iconst 131 1
 add 132 130 131
@@ -3616,19 +3671,19 @@ add 140 138 139
 store middle_column 140
 iconst 141 0
 store found_middle_end 141
-label L476
+label L487
 load 142 lexer___g_current_position
 load 143 lexer___g_source
 call 144 pith_cstring_len int 1 143
 lt 145 142 144
-brif 145 L477 L478
-label L477
+brif 145 L488 L489
+label L488
 load 146 found_middle_end
-brif 146 L480 L481
-label L480
-jmp L478
-label L481
-label L479
+brif 146 L491 L492
+label L491
+jmp L489
+label L492
+label L490
 load 147 scan_char
 load 148 lexer___g_current_position
 call 149 lexer_source_char string 1 148
@@ -3636,16 +3691,16 @@ call 150 pith_cstring_release void 1 147
 store scan_char 149
 load 151 scan_char
 call 152 lexer_is_backslash bool 1 151
-brif 152 L483 L484
-label L483
+brif 152 L494 L495
+label L494
 load 153 lexer___g_current_position
 iconst 154 1
 add 155 153 154
 load 156 lexer___g_source
 call 157 pith_cstring_len int 1 156
 gte 158 155 157
-brif 158 L486 L487
-label L486
+brif 158 L497 L498
+label L497
 load 159 input_char
 call 160 pith_cstring_release void 1 159
 load 161 expr_text
@@ -3658,8 +3713,8 @@ load 167 mid_text
 call 168 pith_cstring_release void 1 167
 iconst 169 0
 ret 169
-label L487
-label L485
+label L498
+label L496
 load 170 lexer___g_current_position
 iconst 171 2
 add 172 170 171
@@ -3668,34 +3723,34 @@ load 173 lexer___g_current_column
 iconst 174 2
 add 175 173 174
 store lexer___g_current_column 175
-jmp L482
-label L484
+jmp L493
+label L495
 load 176 scan_char
 call 177 lexer_is_lbrace bool 1 176
-brif 177 L488 L489
-label L488
+brif 177 L499 L500
+label L499
 iconst 178 0
-store __and_178_493 178
+store __and_178_504 178
 load 179 lexer___g_current_position
 iconst 180 1
 add 181 179 180
 load 182 lexer___g_source
 call 183 pith_cstring_len int 1 182
 lt 184 181 183
-store __and_178_493 184
-brif 184 L493 L494
-label L493
+store __and_178_504 184
+brif 184 L504 L505
+label L504
 load 185 lexer___g_current_position
 iconst 186 1
 add 187 185 186
 call 188 lexer_source_char string 1 187
 call 189 lexer_is_lbrace bool 1 188
 call 190 pith_cstring_release void 1 188
-store __and_178_493 189
-label L494
-load 191 __and_178_493
-brif 191 L491 L492
-label L491
+store __and_178_504 189
+label L505
+load 191 __and_178_504
+brif 191 L502 L503
+label L502
 load 192 lexer___g_current_position
 iconst 193 2
 add 194 192 193
@@ -3704,29 +3759,29 @@ load 195 lexer___g_current_column
 iconst 196 2
 add 197 195 196
 store lexer___g_current_column 197
-jmp L490
-label L492
+jmp L501
+label L503
 iconst 198 1
 store found_middle_end 198
-label L490
-jmp L482
-label L489
+label L501
+jmp L493
+label L500
 load 199 scan_char
 call 200 lexer_is_quote bool 1 199
-brif 200 L495 L496
-label L495
+brif 200 L506 L507
+label L506
 iconst 201 1
 store found_middle_end 201
-jmp L482
-label L496
+jmp L493
+label L507
 load 202 scan_char
 call 203 lexer_is_newline_char bool 1 202
-brif 203 L497 L498
-label L497
+brif 203 L508 L509
+label L508
 iconst 204 1
 store found_middle_end 204
-jmp L482
-label L498
+jmp L493
+label L509
 load 205 lexer___g_current_position
 iconst 206 1
 add 207 205 206
@@ -3735,15 +3790,15 @@ load 208 lexer___g_current_column
 iconst 209 1
 add 210 208 209
 store lexer___g_current_column 210
-label L482
-jmp L476
-label L478
+label L493
+jmp L487
+label L489
 load 211 lexer___g_current_position
 load 212 lexer___g_source
 call 213 pith_cstring_len int 1 212
 gte 214 211 213
-brif 214 L500 L501
-label L500
+brif 214 L511 L512
+label L511
 load 215 input_char
 call 216 pith_cstring_release void 1 215
 load 217 expr_text
@@ -3756,14 +3811,14 @@ load 223 mid_text
 call 224 pith_cstring_release void 1 223
 iconst 225 0
 ret 225
-label L501
-label L499
+label L512
+label L510
 load 226 lexer___g_current_position
 call 227 lexer_source_char string 1 226
 call 228 lexer_is_quote bool 1 227
 call 229 pith_cstring_release void 1 227
-brif 228 L503 L504
-label L503
+brif 228 L514 L515
+label L514
 load 230 end_text
 load 231 lexer___g_source
 load 232 middle_start
@@ -3800,14 +3855,14 @@ load 259 mid_text
 call 260 pith_cstring_release void 1 259
 iconst 261 0
 ret 261
-label L504
-label L502
+label L515
+label L513
 load 262 lexer___g_current_position
 call 263 lexer_source_char string 1 262
 call 264 lexer_is_newline_char bool 1 263
 call 265 pith_cstring_release void 1 263
-brif 264 L506 L507
-label L506
+brif 264 L517 L518
+label L517
 load 266 input_char
 call 267 pith_cstring_release void 1 266
 load 268 expr_text
@@ -3820,8 +3875,8 @@ load 274 mid_text
 call 275 pith_cstring_release void 1 274
 iconst 276 0
 ret 276
-label L507
-label L505
+label L518
+label L516
 load 277 mid_text
 load 278 lexer___g_source
 load 279 middle_start
@@ -3838,8 +3893,8 @@ load 288 mid_text
 call 289 pith_cstring_len int 1 288
 call 290 lexer_queue_interpolation_token void 6 283 284 285 286 287 289
 call 291 pith_cstring_release void 1 283
-jmp L446
-label L448
+jmp L457
+label L459
 load 292 input_char
 call 293 pith_cstring_release void 1 292
 load 294 expr_text
@@ -3864,22 +3919,22 @@ load 4 character
 strref 5 m0s62
 call 6 pith_cstring_eq bool 2 4 5
 call 7 pith_cstring_release void 1 5
-brif 6 L509 L510
-label L509
+brif 6 L520 L521
+label L520
 load 8 lexer___g_current_position
 load 9 lexer___g_source
 call 10 pith_cstring_len int 1 9
 lt 11 8 10
-brif 11 L512 L513
-label L512
+brif 11 L523 L524
+label L523
 load 12 lexer___g_current_position
 call 13 lexer_source_char string 1 12
 strref 14 m0s22
 call 15 pith_cstring_eq bool 2 13 14
 call 16 pith_cstring_release void 1 13
 call 17 pith_cstring_release void 1 14
-brif 15 L515 L516
-label L515
+brif 15 L526 L527
+label L526
 load 18 lexer___g_current_position
 iconst 19 1
 add 20 18 19
@@ -3897,11 +3952,11 @@ load 29 character
 call 30 pith_cstring_release void 1 29
 iconst 31 0
 ret 31
-label L516
-label L514
-jmp L511
-label L513
-label L511
+label L527
+label L525
+jmp L522
+label L524
+label L522
 strref 32 m0s63
 strref 33 m0s62
 call 34 lexer_emit void 2 32 33
@@ -3911,28 +3966,28 @@ load 37 character
 call 38 pith_cstring_release void 1 37
 iconst 39 0
 ret 39
-label L510
-label L508
+label L521
+label L519
 load 40 character
 strref 41 m0s56
 call 42 pith_cstring_eq bool 2 40 41
 call 43 pith_cstring_release void 1 41
-brif 42 L518 L519
-label L518
+brif 42 L529 L530
+label L529
 load 44 lexer___g_current_position
 load 45 lexer___g_source
 call 46 pith_cstring_len int 1 45
 lt 47 44 46
-brif 47 L521 L522
-label L521
+brif 47 L532 L533
+label L532
 load 48 lexer___g_current_position
 call 49 lexer_source_char string 1 48
 strref 50 m0s29
 call 51 pith_cstring_eq bool 2 49 50
 call 52 pith_cstring_release void 1 49
 call 53 pith_cstring_release void 1 50
-brif 51 L524 L525
-label L524
+brif 51 L535 L536
+label L535
 load 54 lexer___g_current_position
 iconst 55 1
 add 56 54 55
@@ -3950,16 +4005,16 @@ load 65 character
 call 66 pith_cstring_release void 1 65
 iconst 67 0
 ret 67
-label L525
-label L523
+label L536
+label L534
 load 68 lexer___g_current_position
 call 69 lexer_source_char string 1 68
 strref 70 m0s22
 call 71 pith_cstring_eq bool 2 69 70
 call 72 pith_cstring_release void 1 69
 call 73 pith_cstring_release void 1 70
-brif 71 L527 L528
-label L527
+brif 71 L538 L539
+label L538
 load 74 lexer___g_current_position
 iconst 75 1
 add 76 74 75
@@ -3977,11 +4032,11 @@ load 85 character
 call 86 pith_cstring_release void 1 85
 iconst 87 0
 ret 87
-label L528
-label L526
-jmp L520
-label L522
-label L520
+label L539
+label L537
+jmp L531
+label L533
+label L531
 strref 88 m0s57
 strref 89 m0s56
 call 90 lexer_emit void 2 88 89
@@ -3991,28 +4046,28 @@ load 93 character
 call 94 pith_cstring_release void 1 93
 iconst 95 0
 ret 95
-label L519
-label L517
+label L530
+label L528
 load 96 character
 strref 97 m0s52
 call 98 pith_cstring_eq bool 2 96 97
 call 99 pith_cstring_release void 1 97
-brif 98 L530 L531
-label L530
+brif 98 L541 L542
+label L541
 load 100 lexer___g_current_position
 load 101 lexer___g_source
 call 102 pith_cstring_len int 1 101
 lt 103 100 102
-brif 103 L533 L534
-label L533
+brif 103 L544 L545
+label L544
 load 104 lexer___g_current_position
 call 105 lexer_source_char string 1 104
 strref 106 m0s22
 call 107 pith_cstring_eq bool 2 105 106
 call 108 pith_cstring_release void 1 105
 call 109 pith_cstring_release void 1 106
-brif 107 L536 L537
-label L536
+brif 107 L547 L548
+label L547
 load 110 lexer___g_current_position
 iconst 111 1
 add 112 110 111
@@ -4030,11 +4085,11 @@ load 121 character
 call 122 pith_cstring_release void 1 121
 iconst 123 0
 ret 123
-label L537
-label L535
-jmp L532
-label L534
-label L532
+label L548
+label L546
+jmp L543
+label L545
+label L543
 strref 124 m0s53
 strref 125 m0s52
 call 126 lexer_emit void 2 124 125
@@ -4044,28 +4099,28 @@ load 129 character
 call 130 pith_cstring_release void 1 129
 iconst 131 0
 ret 131
-label L531
-label L529
+label L542
+label L540
 load 132 character
 strref 133 m0s48
 call 134 pith_cstring_eq bool 2 132 133
 call 135 pith_cstring_release void 1 133
-brif 134 L539 L540
-label L539
+brif 134 L550 L551
+label L550
 load 136 lexer___g_current_position
 load 137 lexer___g_source
 call 138 pith_cstring_len int 1 137
 lt 139 136 138
-brif 139 L542 L543
-label L542
+brif 139 L553 L554
+label L553
 load 140 lexer___g_current_position
 call 141 lexer_source_char string 1 140
 strref 142 m0s22
 call 143 pith_cstring_eq bool 2 141 142
 call 144 pith_cstring_release void 1 141
 call 145 pith_cstring_release void 1 142
-brif 143 L545 L546
-label L545
+brif 143 L556 L557
+label L556
 load 146 lexer___g_current_position
 iconst 147 1
 add 148 146 147
@@ -4083,11 +4138,11 @@ load 157 character
 call 158 pith_cstring_release void 1 157
 iconst 159 0
 ret 159
-label L546
-label L544
-jmp L541
-label L543
-label L541
+label L557
+label L555
+jmp L552
+label L554
+label L552
 strref 160 m0s49
 strref 161 m0s48
 call 162 lexer_emit void 2 160 161
@@ -4097,14 +4152,14 @@ load 165 character
 call 166 pith_cstring_release void 1 165
 iconst 167 0
 ret 167
-label L540
-label L538
+label L551
+label L549
 load 168 character
 strref 169 m0s46
 call 170 pith_cstring_eq bool 2 168 169
 call 171 pith_cstring_release void 1 169
-brif 170 L548 L549
-label L548
+brif 170 L559 L560
+label L559
 strref 172 m0s47
 strref 173 m0s46
 call 174 lexer_emit void 2 172 173
@@ -4114,28 +4169,28 @@ load 177 character
 call 178 pith_cstring_release void 1 177
 iconst 179 0
 ret 179
-label L549
-label L547
+label L560
+label L558
 load 180 character
 strref 181 m0s22
 call 182 pith_cstring_eq bool 2 180 181
 call 183 pith_cstring_release void 1 181
-brif 182 L551 L552
-label L551
+brif 182 L562 L563
+label L562
 load 184 lexer___g_current_position
 load 185 lexer___g_source
 call 186 pith_cstring_len int 1 185
 lt 187 184 186
-brif 187 L554 L555
-label L554
+brif 187 L565 L566
+label L565
 load 188 lexer___g_current_position
 call 189 lexer_source_char string 1 188
 strref 190 m0s22
 call 191 pith_cstring_eq bool 2 189 190
 call 192 pith_cstring_release void 1 189
 call 193 pith_cstring_release void 1 190
-brif 191 L557 L558
-label L557
+brif 191 L568 L569
+label L568
 load 194 lexer___g_current_position
 iconst 195 1
 add 196 194 195
@@ -4153,16 +4208,16 @@ load 205 character
 call 206 pith_cstring_release void 1 205
 iconst 207 0
 ret 207
-label L558
-label L556
+label L569
+label L567
 load 208 lexer___g_current_position
 call 209 lexer_source_char string 1 208
 strref 210 m0s29
 call 211 pith_cstring_eq bool 2 209 210
 call 212 pith_cstring_release void 1 209
 call 213 pith_cstring_release void 1 210
-brif 211 L560 L561
-label L560
+brif 211 L571 L572
+label L571
 load 214 lexer___g_current_position
 iconst 215 1
 add 216 214 215
@@ -4180,11 +4235,11 @@ load 225 character
 call 226 pith_cstring_release void 1 225
 iconst 227 0
 ret 227
-label L561
-label L559
-jmp L553
-label L555
-label L553
+label L572
+label L570
+jmp L564
+label L566
+label L564
 strref 228 m0s41
 strref 229 m0s22
 call 230 lexer_emit void 2 228 229
@@ -4194,28 +4249,28 @@ load 233 character
 call 234 pith_cstring_release void 1 233
 iconst 235 0
 ret 235
-label L552
-label L550
+label L563
+label L561
 load 236 character
 strref 237 m0s37
 call 238 pith_cstring_eq bool 2 236 237
 call 239 pith_cstring_release void 1 237
-brif 238 L563 L564
-label L563
+brif 238 L574 L575
+label L574
 load 240 lexer___g_current_position
 load 241 lexer___g_source
 call 242 pith_cstring_len int 1 241
 lt 243 240 242
-brif 243 L566 L567
-label L566
+brif 243 L577 L578
+label L577
 load 244 lexer___g_current_position
 call 245 lexer_source_char string 1 244
 strref 246 m0s22
 call 247 pith_cstring_eq bool 2 245 246
 call 248 pith_cstring_release void 1 245
 call 249 pith_cstring_release void 1 246
-brif 247 L569 L570
-label L569
+brif 247 L580 L581
+label L580
 load 250 lexer___g_current_position
 iconst 251 1
 add 252 250 251
@@ -4233,11 +4288,11 @@ load 261 character
 call 262 pith_cstring_release void 1 261
 iconst 263 0
 ret 263
-label L570
-label L568
-jmp L565
-label L567
-label L565
+label L581
+label L579
+jmp L576
+label L578
+label L576
 strref 264 m0s38
 strref 265 m0s37
 call 266 lexer_emit void 2 264 265
@@ -4247,28 +4302,28 @@ load 269 character
 call 270 pith_cstring_release void 1 269
 iconst 271 0
 ret 271
-label L564
-label L562
+label L575
+label L573
 load 272 character
 strref 273 m0s33
 call 274 pith_cstring_eq bool 2 272 273
 call 275 pith_cstring_release void 1 273
-brif 274 L572 L573
-label L572
+brif 274 L583 L584
+label L583
 load 276 lexer___g_current_position
 load 277 lexer___g_source
 call 278 pith_cstring_len int 1 277
 lt 279 276 278
-brif 279 L575 L576
-label L575
+brif 279 L586 L587
+label L586
 load 280 lexer___g_current_position
 call 281 lexer_source_char string 1 280
 strref 282 m0s22
 call 283 pith_cstring_eq bool 2 281 282
 call 284 pith_cstring_release void 1 281
 call 285 pith_cstring_release void 1 282
-brif 283 L578 L579
-label L578
+brif 283 L589 L590
+label L589
 load 286 lexer___g_current_position
 iconst 287 1
 add 288 286 287
@@ -4286,11 +4341,11 @@ load 297 character
 call 298 pith_cstring_release void 1 297
 iconst 299 0
 ret 299
-label L579
-label L577
-jmp L574
-label L576
-label L574
+label L590
+label L588
+jmp L585
+label L587
+label L585
 strref 300 m0s34
 strref 301 m0s33
 call 302 lexer_emit void 2 300 301
@@ -4300,28 +4355,28 @@ load 305 character
 call 306 pith_cstring_release void 1 305
 iconst 307 0
 ret 307
-label L573
-label L571
+label L584
+label L582
 load 308 character
 strref 309 m0s29
 call 310 pith_cstring_eq bool 2 308 309
 call 311 pith_cstring_release void 1 309
-brif 310 L581 L582
-label L581
+brif 310 L592 L593
+label L592
 load 312 lexer___g_current_position
 load 313 lexer___g_source
 call 314 pith_cstring_len int 1 313
 lt 315 312 314
-brif 315 L584 L585
-label L584
+brif 315 L595 L596
+label L595
 load 316 lexer___g_current_position
 call 317 lexer_source_char string 1 316
 strref 318 m0s22
 call 319 pith_cstring_eq bool 2 317 318
 call 320 pith_cstring_release void 1 317
 call 321 pith_cstring_release void 1 318
-brif 319 L587 L588
-label L587
+brif 319 L598 L599
+label L598
 load 322 lexer___g_current_position
 iconst 323 1
 add 324 322 323
@@ -4339,11 +4394,11 @@ load 333 character
 call 334 pith_cstring_release void 1 333
 iconst 335 0
 ret 335
-label L588
-label L586
-jmp L583
-label L585
-label L583
+label L599
+label L597
+jmp L594
+label L596
+label L594
 strref 336 m0s30
 strref 337 m0s29
 call 338 lexer_emit void 2 336 337
@@ -4353,28 +4408,28 @@ load 341 character
 call 342 pith_cstring_release void 1 341
 iconst 343 0
 ret 343
-label L582
-label L580
+label L593
+label L591
 load 344 character
 strref 345 m0s25
 call 346 pith_cstring_eq bool 2 344 345
 call 347 pith_cstring_release void 1 345
-brif 346 L590 L591
-label L590
+brif 346 L601 L602
+label L601
 load 348 lexer___g_current_position
 load 349 lexer___g_source
 call 350 pith_cstring_len int 1 349
 lt 351 348 350
-brif 351 L593 L594
-label L593
+brif 351 L604 L605
+label L604
 load 352 lexer___g_current_position
 call 353 lexer_source_char string 1 352
 strref 354 m0s22
 call 355 pith_cstring_eq bool 2 353 354
 call 356 pith_cstring_release void 1 353
 call 357 pith_cstring_release void 1 354
-brif 355 L596 L597
-label L596
+brif 355 L607 L608
+label L607
 load 358 lexer___g_current_position
 iconst 359 1
 add 360 358 359
@@ -4392,11 +4447,11 @@ load 369 character
 call 370 pith_cstring_release void 1 369
 iconst 371 0
 ret 371
-label L597
-label L595
-jmp L592
-label L594
-label L592
+label L608
+label L606
+jmp L603
+label L605
+label L603
 strref 372 m0s26
 strref 373 m0s25
 call 374 lexer_emit void 2 372 373
@@ -4406,14 +4461,14 @@ load 377 character
 call 378 pith_cstring_release void 1 377
 iconst 379 0
 ret 379
-label L591
-label L589
+label L602
+label L600
 load 380 character
 strref 381 m0s23
 call 382 pith_cstring_eq bool 2 380 381
 call 383 pith_cstring_release void 1 381
-brif 382 L599 L600
-label L599
+brif 382 L610 L611
+label L610
 strref 384 m0s24
 strref 385 m0s23
 call 386 lexer_emit void 2 384 385
@@ -4423,34 +4478,34 @@ load 389 character
 call 390 pith_cstring_release void 1 389
 iconst 391 0
 ret 391
-label L600
-label L598
+label L611
+label L609
 load 392 character
 strref 393 m0s16
 call 394 pith_cstring_eq bool 2 392 393
 call 395 pith_cstring_release void 1 393
-brif 394 L602 L603
-label L602
+brif 394 L613 L614
+label L613
 iconst 396 0
-store __and_396_607 396
+store __and_396_618 396
 load 397 lexer___g_current_position
 load 398 lexer___g_source
 call 399 pith_cstring_len int 1 398
 lt 400 397 399
-store __and_396_607 400
-brif 400 L607 L608
-label L607
+store __and_396_618 400
+brif 400 L618 L619
+label L618
 load 401 lexer___g_current_position
 call 402 lexer_source_char string 1 401
 strref 403 m0s16
 call 404 pith_cstring_eq bool 2 402 403
 call 405 pith_cstring_release void 1 402
 call 406 pith_cstring_release void 1 403
-store __and_396_607 404
-label L608
-load 407 __and_396_607
-brif 407 L605 L606
-label L605
+store __and_396_618 404
+label L619
+load 407 __and_396_618
+brif 407 L616 L617
+label L616
 load 408 lexer___g_current_position
 iconst 409 1
 add 410 408 409
@@ -4460,25 +4515,25 @@ iconst 412 1
 add 413 411 412
 store lexer___g_current_column 413
 iconst 414 0
-store __and_414_612 414
+store __and_414_623 414
 load 415 lexer___g_current_position
 load 416 lexer___g_source
 call 417 pith_cstring_len int 1 416
 lt 418 415 417
-store __and_414_612 418
-brif 418 L612 L613
-label L612
+store __and_414_623 418
+brif 418 L623 L624
+label L623
 load 419 lexer___g_current_position
 call 420 lexer_source_char string 1 419
 strref 421 m0s22
 call 422 pith_cstring_eq bool 2 420 421
 call 423 pith_cstring_release void 1 420
 call 424 pith_cstring_release void 1 421
-store __and_414_612 422
-label L613
-load 425 __and_414_612
-brif 425 L610 L611
-label L610
+store __and_414_623 422
+label L624
+load 425 __and_414_623
+brif 425 L621 L622
+label L621
 load 426 lexer___g_current_position
 iconst 427 1
 add 428 426 427
@@ -4496,8 +4551,8 @@ load 437 character
 call 438 pith_cstring_release void 1 437
 iconst 439 0
 ret 439
-label L611
-label L609
+label L622
+label L620
 strref 440 m0s19
 strref 441 m0s18
 call 442 lexer_emit void 2 440 441
@@ -4507,8 +4562,8 @@ load 445 character
 call 446 pith_cstring_release void 1 445
 iconst 447 0
 ret 447
-label L606
-label L604
+label L617
+label L615
 strref 448 m0s17
 strref 449 m0s16
 call 450 lexer_emit void 2 448 449
@@ -4518,14 +4573,14 @@ load 453 character
 call 454 pith_cstring_release void 1 453
 iconst 455 0
 ret 455
-label L603
-label L601
+label L614
+label L612
 load 456 character
 strref 457 m0s14
 call 458 pith_cstring_eq bool 2 456 457
 call 459 pith_cstring_release void 1 457
-brif 458 L615 L616
-label L615
+brif 458 L626 L627
+label L626
 strref 460 m0s15
 strref 461 m0s14
 call 462 lexer_emit void 2 460 461
@@ -4535,14 +4590,14 @@ load 465 character
 call 466 pith_cstring_release void 1 465
 iconst 467 0
 ret 467
-label L616
-label L614
+label L627
+label L625
 load 468 character
 strref 469 m0s12
 call 470 pith_cstring_eq bool 2 468 469
 call 471 pith_cstring_release void 1 469
-brif 470 L618 L619
-label L618
+brif 470 L629 L630
+label L629
 load 472 lexer___g_group_depth
 iconst 473 1
 add 474 472 473
@@ -4556,26 +4611,26 @@ load 480 character
 call 481 pith_cstring_release void 1 480
 iconst 482 0
 ret 482
-label L619
-label L617
+label L630
+label L628
 load 483 character
 strref 484 m0s10
 call 485 pith_cstring_eq bool 2 483 484
 call 486 pith_cstring_release void 1 484
-brif 485 L621 L622
-label L621
+brif 485 L632 L633
+label L632
 load 487 lexer___g_group_depth
 iconst 488 0
 gt 489 487 488
-brif 489 L624 L625
-label L624
+brif 489 L635 L636
+label L635
 load 490 lexer___g_group_depth
 iconst 491 1
 sub 492 490 491
 store lexer___g_group_depth 492
-jmp L623
-label L625
-label L623
+jmp L634
+label L636
+label L634
 strref 493 m0s11
 strref 494 m0s10
 call 495 lexer_emit void 2 493 494
@@ -4585,14 +4640,14 @@ load 498 character
 call 499 pith_cstring_release void 1 498
 iconst 500 0
 ret 500
-label L622
-label L620
+label L633
+label L631
 load 501 character
 strref 502 m0s8
 call 503 pith_cstring_eq bool 2 501 502
 call 504 pith_cstring_release void 1 502
-brif 503 L627 L628
-label L627
+brif 503 L638 L639
+label L638
 load 505 lexer___g_group_depth
 iconst 506 1
 add 507 505 506
@@ -4606,26 +4661,26 @@ load 513 character
 call 514 pith_cstring_release void 1 513
 iconst 515 0
 ret 515
-label L628
-label L626
+label L639
+label L637
 load 516 character
 strref 517 m0s6
 call 518 pith_cstring_eq bool 2 516 517
 call 519 pith_cstring_release void 1 517
-brif 518 L630 L631
-label L630
+brif 518 L641 L642
+label L641
 load 520 lexer___g_group_depth
 iconst 521 0
 gt 522 520 521
-brif 522 L633 L634
-label L633
+brif 522 L644 L645
+label L644
 load 523 lexer___g_group_depth
 iconst 524 1
 sub 525 523 524
 store lexer___g_group_depth 525
-jmp L632
-label L634
-label L632
+jmp L643
+label L645
+label L643
 strref 526 m0s7
 strref 527 m0s6
 call 528 lexer_emit void 2 526 527
@@ -4635,12 +4690,12 @@ load 531 character
 call 532 pith_cstring_release void 1 531
 iconst 533 0
 ret 533
-label L631
-label L629
+label L642
+label L640
 load 534 character
 call 535 lexer_is_lbrace bool 1 534
-brif 535 L636 L637
-label L636
+brif 535 L647 L648
+label L647
 load 536 lexer___g_group_depth
 iconst 537 1
 add 538 536 537
@@ -4655,24 +4710,24 @@ load 545 character
 call 546 pith_cstring_release void 1 545
 iconst 547 0
 ret 547
-label L637
-label L635
+label L648
+label L646
 load 548 character
 call 549 lexer_is_rbrace bool 1 548
-brif 549 L639 L640
-label L639
+brif 549 L650 L651
+label L650
 load 550 lexer___g_group_depth
 iconst 551 0
 gt 552 550 551
-brif 552 L642 L643
-label L642
+brif 552 L653 L654
+label L653
 load 553 lexer___g_group_depth
 iconst 554 1
 sub 555 553 554
 store lexer___g_group_depth 555
-jmp L641
-label L643
-label L641
+jmp L652
+label L654
+label L652
 strref 556 m0s4
 load 557 lexer___g_RBRACE
 call 558 pith_cstring_retain void 1 557
@@ -4683,14 +4738,14 @@ load 562 character
 call 563 pith_cstring_release void 1 562
 iconst 564 0
 ret 564
-label L640
-label L638
+label L651
+label L649
 load 565 character
 strref 566 m0s2
 call 567 pith_cstring_eq bool 2 565 566
 call 568 pith_cstring_release void 1 566
-brif 567 L645 L646
-label L645
+brif 567 L656 L657
+label L656
 strref 569 m0s3
 strref 570 m0s2
 call 571 lexer_emit void 2 569 570
@@ -4700,8 +4755,8 @@ load 574 character
 call 575 pith_cstring_release void 1 574
 iconst 576 0
 ret 576
-label L646
-label L644
+label L657
+label L655
 strref 577 m0s1
 load 578 character
 call 579 lexer_emit void 2 577 578
@@ -4902,12 +4957,12 @@ iconst 33 0
 store __for_idx_0 33
 store __for_len_0 32
 store __for_iter_0 31
-label L647
+label L658
 load 34 __for_idx_0
 load 35 __for_len_0
 lt 36 34 35
-brif 36 L648 L650
-label L648
+brif 36 L659 L661
+label L659
 load 37 __for_iter_0
 load 38 __for_idx_0
 call 39 pith_list_get_value unknown 2 37 38
@@ -4936,13 +4991,13 @@ load 60 lexer___g__tok_lens
 load 61 __loopvar_0_tok
 field 62 61 40 int len
 call 63 pith_list_push_value void 2 60 62
-label L649
+label L660
 load 64 __for_idx_0
 iconst 65 1
 add 66 64 65
 store __for_idx_0 66
-jmp L647
-label L650
+jmp L658
+label L661
 iconst 67 0
 ret 67
 endfunc
@@ -4995,12 +5050,12 @@ iconst 38 0
 store __for_idx_1 38
 store __for_len_1 37
 store __for_iter_1 36
-label L651
+label L662
 load 39 __for_idx_1
 load 40 __for_len_1
 lt 41 39 40
-brif 41 L652 L654
-label L652
+brif 41 L663 L665
+label L663
 load 42 __for_iter_1
 load 43 __for_idx_1
 call 44 pith_list_get_value_unchecked string 2 42 43
@@ -5008,25 +5063,25 @@ store __loopvar_1_kind 44
 load 45 lexer___g__tok_kinds
 load 46 __loopvar_1_kind
 call 47 pith_list_push_value void 2 45 46
-label L653
+label L664
 load 48 __for_idx_1
 iconst 49 1
 add 50 48 49
 store __for_idx_1 50
-jmp L651
-label L654
+jmp L662
+label L665
 load 51 values
 call 52 pith_auto_len int 1 51
 iconst 53 0
 store __for_idx_2 53
 store __for_len_2 52
 store __for_iter_2 51
-label L655
+label L666
 load 54 __for_idx_2
 load 55 __for_len_2
 lt 56 54 55
-brif 56 L656 L658
-label L656
+brif 56 L667 L669
+label L667
 load 57 __for_iter_2
 load 58 __for_idx_2
 call 59 pith_list_get_value_unchecked string 2 57 58
@@ -5034,25 +5089,25 @@ store __loopvar_2_value 59
 load 60 lexer___g__tok_values
 load 61 __loopvar_2_value
 call 62 pith_list_push_value void 2 60 61
-label L657
+label L668
 load 63 __for_idx_2
 iconst 64 1
 add 65 63 64
 store __for_idx_2 65
-jmp L655
-label L658
+jmp L666
+label L669
 load 66 lines
 call 67 pith_auto_len int 1 66
 iconst 68 0
 store __for_idx_3 68
 store __for_len_3 67
 store __for_iter_3 66
-label L659
+label L670
 load 69 __for_idx_3
 load 70 __for_len_3
 lt 71 69 70
-brif 71 L660 L662
-label L660
+brif 71 L671 L673
+label L671
 load 72 __for_iter_3
 load 73 __for_idx_3
 call 74 pith_list_get_value unknown 2 72 73
@@ -5060,25 +5115,25 @@ store __loopvar_3_line 74
 load 75 lexer___g__tok_lines
 load 76 __loopvar_3_line
 call 77 pith_list_push_value void 2 75 76
-label L661
+label L672
 load 78 __for_idx_3
 iconst 79 1
 add 80 78 79
 store __for_idx_3 80
-jmp L659
-label L662
+jmp L670
+label L673
 load 81 cols
 call 82 pith_auto_len int 1 81
 iconst 83 0
 store __for_idx_4 83
 store __for_len_4 82
 store __for_iter_4 81
-label L663
+label L674
 load 84 __for_idx_4
 load 85 __for_len_4
 lt 86 84 85
-brif 86 L664 L666
-label L664
+brif 86 L675 L677
+label L675
 load 87 __for_iter_4
 load 88 __for_idx_4
 call 89 pith_list_get_value unknown 2 87 88
@@ -5086,25 +5141,25 @@ store __loopvar_4_col 89
 load 90 lexer___g__tok_cols
 load 91 __loopvar_4_col
 call 92 pith_list_push_value void 2 90 91
-label L665
+label L676
 load 93 __for_idx_4
 iconst 94 1
 add 95 93 94
 store __for_idx_4 95
-jmp L663
-label L666
+jmp L674
+label L677
 load 96 offsets
 call 97 pith_auto_len int 1 96
 iconst 98 0
 store __for_idx_5 98
 store __for_len_5 97
 store __for_iter_5 96
-label L667
+label L678
 load 99 __for_idx_5
 load 100 __for_len_5
 lt 101 99 100
-brif 101 L668 L670
-label L668
+brif 101 L679 L681
+label L679
 load 102 __for_iter_5
 load 103 __for_idx_5
 call 104 pith_list_get_value unknown 2 102 103
@@ -5112,25 +5167,25 @@ store __loopvar_5_off 104
 load 105 lexer___g__tok_offsets
 load 106 __loopvar_5_off
 call 107 pith_list_push_value void 2 105 106
-label L669
+label L680
 load 108 __for_idx_5
 iconst 109 1
 add 110 108 109
 store __for_idx_5 110
-jmp L667
-label L670
+jmp L678
+label L681
 load 111 lens
 call 112 pith_auto_len int 1 111
 iconst 113 0
 store __for_idx_6 113
 store __for_len_6 112
 store __for_iter_6 111
-label L671
+label L682
 load 114 __for_idx_6
 load 115 __for_len_6
 lt 116 114 115
-brif 116 L672 L674
-label L672
+brif 116 L683 L685
+label L683
 load 117 __for_iter_6
 load 118 __for_idx_6
 call 119 pith_list_get_value unknown 2 117 118
@@ -5138,13 +5193,13 @@ store __loopvar_6_ln 119
 load 120 lexer___g__tok_lens
 load 121 __loopvar_6_ln
 call 122 pith_list_push_value void 2 120 121
-label L673
+label L684
 load 123 __for_idx_6
 iconst 124 1
 add 125 123 124
 store __for_idx_6 125
-jmp L671
-label L674
+jmp L682
+label L685
 iconst 126 0
 ret 126
 endfunc
@@ -5196,10 +5251,10 @@ call 36 pith_list_release_handle void 1 34
 store tokens 35
 iconst 37 1
 store keep_going 37
-label L675
+label L686
 load 38 keep_going
-brif 38 L676 L677
-label L676
+brif 38 L687 L688
+label L687
 call 39 lexer_next_token void 0
 load 40 tokens
 load 41 lexer___g_current_token_kind
@@ -5243,15 +5298,15 @@ load 72 lexer___g_current_token_kind
 strref 73 m0s0
 call 74 pith_cstring_eq bool 2 72 73
 call 75 pith_cstring_release void 1 73
-brif 74 L679 L680
-label L679
+brif 74 L690 L691
+label L690
 iconst 76 0
 store keep_going 76
-jmp L678
-label L680
-label L678
-jmp L675
-label L677
+jmp L689
+label L691
+label L689
+jmp L686
+label L688
 load 77 tokens
 ret 77
 load 78 tokens
@@ -22557,11 +22612,11 @@ func parser_raw_offset_in_fragment 2 int
 param raw
 param out_offset
 iconst 2 0
-store nxt 2
+store i 2
 iconst 3 0
-store i 3
+store out 3
 iconst 4 0
-store out 4
+store in_literal 4
 label L711
 iconst 5 0
 store __and_5_714 5
@@ -22580,85 +22635,70 @@ label L715
 load 13 __and_5_714
 brif 13 L712 L713
 label L712
-iconst 14 0
-store __and_14_719 14
-load 15 raw
-load 16 i
-call 17 pith_cstring_byte_at int 2 15 16
-iconst 18 92
-eq 19 17 18
-store __and_14_719 19
-brif 19 L719 L720
-label L719
-load 20 i
-iconst 21 1
-add 22 20 21
-load 23 raw
-call 24 pith_cstring_len int 1 23
-lt 25 22 24
-store __and_14_719 25
-label L720
-load 26 __and_14_719
-brif 26 L717 L718
+load 14 raw
+load 15 i
+load 16 in_literal
+call 17 lexer_interp_escape_kind int 3 14 15 16
+store kind 17
+load 18 kind
+load 19 lexer___g_INTERP_ESCAPE_COLLAPSED
+eq 20 18 19
+brif 20 L717 L718
 label L717
-load 27 nxt
-load 28 raw
-load 29 i
-iconst 30 1
-add 31 29 30
-call 32 pith_cstring_char_at_strict string 2 28 31
-call 33 pith_cstring_release void 1 27
-store nxt 32
-iconst 34 0
-store __or_34_724 34
-load 35 nxt
-call 36 ord int 1 35
-iconst 37 34
-eq 38 36 37
-store __or_34_724 38
-brif 38 L725 L724
-label L724
-load 39 nxt
-call 40 ord int 1 39
-iconst 41 92
-eq 42 40 41
-store __or_34_724 42
-label L725
-load 43 __or_34_724
-brif 43 L722 L723
-label L722
-load 44 i
-iconst 45 2
-add 46 44 45
-store i 46
-jmp L721
-label L723
-load 47 i
-iconst 48 1
-add 49 47 48
-store i 49
-label L721
+load 21 i
+iconst 22 2
+add 23 21 22
+store i 23
+load 24 out
+iconst 25 1
+add 26 24 25
+store out 26
 jmp L716
 label L718
-load 50 i
-iconst 51 1
-add 52 50 51
-store i 52
+load 27 kind
+load 28 lexer___g_INTERP_ESCAPE_KEPT
+eq 29 27 28
+brif 29 L719 L720
+label L719
+load 30 i
+iconst 31 2
+add 32 30 31
+store i 32
+load 33 out
+iconst 34 2
+add 35 33 34
+store out 35
+jmp L716
+label L720
+load 36 raw
+load 37 i
+call 38 pith_cstring_byte_at int 2 36 37
+iconst 39 34
+eq 40 38 39
+brif 40 L722 L723
+label L722
+load 41 in_literal
+iconst 43 1
+sub 42 43 41
+store in_literal 42
+jmp L721
+label L723
+label L721
+load 44 i
+iconst 45 1
+add 46 44 45
+store i 46
+load 47 out
+iconst 48 1
+add 49 47 48
+store out 49
 label L716
-load 53 out
-iconst 54 1
-add 55 53 54
-store out 55
 jmp L711
 label L713
-load 56 i
-load 57 nxt
-call 58 pith_cstring_release void 1 57
-ret 56
-load 59 nxt
-call 60 pith_cstring_release void 1 59
-iconst 61 0
-ret 61
+load 50 i
+ret 50
+iconst 51 0
+ret 51
 endfunc
 func parser_parse_interp_expr 3 int
 param text
@@ -22727,17 +22767,17 @@ store __for_len_38 41
 store __for_iter_38 40
 iconst 43 0
 store __loopvar_38_tok 43
-label L726
+label L724
 load 44 __for_idx_38
 load 45 __for_len_38
 lt 46 44 45
-brif 46 L730 L729
-label L730
+brif 46 L728 L727
+label L728
 load 47 __for_iter_38
 call 48 pith_auto_len int 1 47
 lt 46 44 48
-brif 46 L727 L729
-label L727
+brif 46 L725 L727
+label L725
 load 49 __for_iter_38
 load 50 __for_idx_38
 call 51 pith_list_get_value unknown 2 49 50
@@ -22752,8 +22792,8 @@ load 56 __loopvar_38_tok
 field 57 56 16 int current_line
 iconst 58 1
 gt 59 57 58
-brif 59 L732 L733
-label L732
+brif 59 L730 L731
+label L730
 load 60 base_line
 load 61 __loopvar_38_tok
 field 62 61 16 int current_line
@@ -22764,8 +22804,8 @@ store tok_line_out 65
 load 66 __loopvar_38_tok
 field 67 66 24 int current_column
 store tok_col_out 67
-jmp L731
-label L733
+jmp L729
+label L731
 load 68 base_col
 load 69 text
 load 70 __loopvar_38_tok
@@ -22773,7 +22813,7 @@ field 71 70 32 int offset
 call 72 parser_raw_offset_in_fragment int 2 69 71
 add 73 68 72
 store tok_col_out 73
-label L731
+label L729
 load 74 sub_tokens
 load 75 __loopvar_38_tok
 field 76 75 0 string kind
@@ -22798,7 +22838,7 @@ sstore 87 5 86
 funcref 89 parser___dtor_Token
 call 90 pith_struct_set_dtor void 2 87 89
 call 91 pith_list_push_value_owned void 2 74 87
-label L728
+label L726
 load 92 __loopvar_38_tok
 call 93 pith_struct_release void 1 92
 iconst 94 0
@@ -22807,8 +22847,8 @@ load 95 __for_idx_38
 iconst 96 1
 add 97 95 96
 store __for_idx_38 97
-jmp L726
-label L729
+jmp L724
+label L727
 load 98 __loopvar_38_tok
 call 99 pith_struct_release void 1 98
 load 100 sub_tokens
@@ -22893,8 +22933,8 @@ strref 11 m8s90
 call 12 pith_cstring_eq bool 2 10 11
 call 13 pith_cstring_release void 1 10
 call 14 pith_cstring_release void 1 11
-brif 12 L735 L736
-label L735
+brif 12 L733 L734
+label L733
 call 15 parser_advance_token struct:Token 0
 call 16 pith_struct_release void 1 15
 strref 17 m8s267
@@ -22921,15 +22961,15 @@ call 37 pith_list_release_handle void 1 36
 load 38 patterns
 call 39 pith_list_release_handle void 1 38
 ret 19
-label L736
 label L734
+label L732
 call 40 parser__cur_tok_kind string 0
 strref 41 m8s76
 call 42 pith_cstring_eq bool 2 40 41
 call 43 pith_cstring_release void 1 40
 call 44 pith_cstring_release void 1 41
-brif 42 L738 L739
-label L738
+brif 42 L736 L737
+label L736
 load 45 _tv
 call 46 parser__cur_tok_value string 0
 call 47 pith_cstring_release void 1 45
@@ -22937,21 +22977,21 @@ store _tv 46
 call 48 parser_advance_token struct:Token 0
 call 49 pith_struct_release void 1 48
 iconst 50 0
-store __or_50_743 50
+store __or_50_741 50
 strref 51 m8s19
 call 52 parser_check bool 1 51
 call 53 pith_cstring_release void 1 51
-store __or_50_743 52
-brif 52 L744 L743
-label L743
+store __or_50_741 52
+brif 52 L742 L741
+label L741
 strref 54 m8s21
 call 55 parser_check bool 1 54
 call 56 pith_cstring_release void 1 54
-store __or_50_743 55
-label L744
-load 57 __or_50_743
-brif 57 L741 L742
-label L741
+store __or_50_741 55
+label L742
+load 57 __or_50_741
+brif 57 L739 L740
+label L739
 load 58 range_kind
 strref 59 m8s286
 call 60 pith_cstring_release void 1 58
@@ -22959,15 +22999,15 @@ store range_kind 59
 strref 61 m8s21
 call 62 parser_check bool 1 61
 call 63 pith_cstring_release void 1 61
-brif 62 L746 L747
-label L746
+brif 62 L744 L745
+label L744
 strref 64 m8s285
 load 65 range_kind
 call 66 pith_cstring_release void 1 65
 store range_kind 64
-jmp L745
-label L747
+jmp L743
 label L745
+label L743
 call 67 parser_advance_token struct:Token 0
 call 68 pith_struct_release void 1 67
 load 69 hi_val
@@ -23022,8 +23062,8 @@ call 113 pith_list_release_handle void 1 112
 load 114 patterns
 call 115 pith_list_release_handle void 1 114
 ret 96
-label L742
 label L740
+label L738
 strref 116 m8s283
 load 117 _tv
 call 118 parser_add_leaf_with_position int 2 116 117
@@ -23047,15 +23087,15 @@ call 135 pith_list_release_handle void 1 134
 load 136 patterns
 call 137 pith_list_release_handle void 1 136
 ret 118
-label L739
 label L737
+label L735
 call 138 parser__cur_tok_kind string 0
 strref 139 m8s77
 call 140 pith_cstring_eq bool 2 138 139
 call 141 pith_cstring_release void 1 138
 call 142 pith_cstring_release void 1 139
-brif 140 L749 L750
-label L749
+brif 140 L747 L748
+label L747
 load 143 _tv
 call 144 parser__cur_tok_value string 0
 call 145 pith_cstring_release void 1 143
@@ -23085,15 +23125,15 @@ call 167 pith_list_release_handle void 1 166
 load 168 patterns
 call 169 pith_list_release_handle void 1 168
 ret 150
-label L750
 label L748
+label L746
 call 170 parser__cur_tok_kind string 0
 strref 171 m8s74
 call 172 pith_cstring_eq bool 2 170 171
 call 173 pith_cstring_release void 1 170
 call 174 pith_cstring_release void 1 171
-brif 172 L752 L753
-label L752
+brif 172 L750 L751
+label L750
 load 175 _tv
 call 176 parser__cur_tok_value string 0
 call 177 pith_cstring_release void 1 175
@@ -23123,15 +23163,15 @@ call 199 pith_list_release_handle void 1 198
 load 200 patterns
 call 201 pith_list_release_handle void 1 200
 ret 182
-label L753
 label L751
+label L749
 call 202 parser__cur_tok_kind string 0
 strref 203 m8s280
 call 204 pith_cstring_eq bool 2 202 203
 call 205 pith_cstring_release void 1 202
 call 206 pith_cstring_release void 1 203
-brif 204 L755 L756
-label L755
+brif 204 L753 L754
+label L753
 call 207 parser_advance_token struct:Token 0
 call 208 pith_struct_release void 1 207
 strref 209 m8s277
@@ -23158,15 +23198,15 @@ call 229 pith_list_release_handle void 1 228
 load 230 patterns
 call 231 pith_list_release_handle void 1 230
 ret 211
-label L756
 label L754
+label L752
 call 232 parser__cur_tok_kind string 0
 strref 233 m8s278
 call 234 pith_cstring_eq bool 2 232 233
 call 235 pith_cstring_release void 1 232
 call 236 pith_cstring_release void 1 233
-brif 234 L758 L759
-label L758
+brif 234 L756 L757
+label L756
 call 237 parser_advance_token struct:Token 0
 call 238 pith_struct_release void 1 237
 strref 239 m8s277
@@ -23193,15 +23233,15 @@ call 259 pith_list_release_handle void 1 258
 load 260 patterns
 call 261 pith_list_release_handle void 1 260
 ret 241
-label L759
 label L757
+label L755
 call 262 parser__cur_tok_kind string 0
 strref 263 m8s275
 call 264 pith_cstring_eq bool 2 262 263
 call 265 pith_cstring_release void 1 262
 call 266 pith_cstring_release void 1 263
-brif 264 L761 L762
-label L761
+brif 264 L759 L760
+label L759
 call 267 parser_advance_token struct:Token 0
 call 268 pith_struct_release void 1 267
 strref 269 m8s274
@@ -23228,15 +23268,15 @@ call 289 pith_list_release_handle void 1 288
 load 290 patterns
 call 291 pith_list_release_handle void 1 290
 ret 271
-label L762
 label L760
+label L758
 call 292 parser__cur_tok_kind string 0
 strref 293 m8s89
 call 294 pith_cstring_eq bool 2 292 293
 call 295 pith_cstring_release void 1 292
 call 296 pith_cstring_release void 1 293
-brif 294 L764 L765
-label L764
+brif 294 L762 L763
+label L762
 load 297 type_tok
 call 298 parser_advance_token struct:Token 0
 call 299 pith_struct_release void 1 297
@@ -23244,8 +23284,8 @@ store type_tok 298
 strref 300 m8s17
 call 301 parser_check bool 1 300
 call 302 pith_cstring_release void 1 300
-brif 301 L767 L768
-label L767
+brif 301 L765 L766
+label L765
 call 303 parser_advance_token struct:Token 0
 call 304 pith_struct_release void 1 303
 load 305 variant_tok
@@ -23257,8 +23297,8 @@ store variant_tok 307
 strref 310 m8s13
 call 311 parser_check bool 1 310
 call 312 pith_cstring_release void 1 310
-brif 311 L770 L771
-label L770
+brif 311 L768 L769
+label L768
 call 313 parser_advance_token struct:Token 0
 call 314 pith_struct_release void 1 313
 load 315 fields
@@ -23270,25 +23310,25 @@ call 319 parser_check bool 1 318
 call 320 pith_cstring_release void 1 318
 iconst 322 1
 sub 321 322 319
-brif 321 L773 L774
-label L773
+brif 321 L771 L772
+label L771
 load 323 fields
 call 324 parser_parse_pattern int 0
 call 325 pith_list_push_value void 2 323 324
-label L775
+label L773
 strref 326 m8s15
 call 327 parser_match_tok bool 1 326
 call 328 pith_cstring_release void 1 326
-brif 327 L776 L777
-label L776
+brif 327 L774 L775
+label L774
 load 329 fields
 call 330 parser_parse_pattern int 0
 call 331 pith_list_push_value void 2 329 330
-jmp L775
-label L777
-jmp L772
-label L774
+jmp L773
+label L775
+jmp L770
 label L772
+label L770
 strref 332 m8s11
 call 333 parser_expect struct:Token 1 332
 call 334 pith_cstring_release void 1 332
@@ -23327,8 +23367,8 @@ call 366 pith_list_release_handle void 1 365
 load 367 patterns
 call 368 pith_list_release_handle void 1 367
 ret 348
-label L771
 label L769
+label L767
 load 369 empty
 call 370 pith_list_new_default list 0
 call 371 pith_list_release_handle void 1 369
@@ -23367,8 +23407,8 @@ call 402 pith_list_release_handle void 1 401
 load 403 patterns
 call 404 pith_list_release_handle void 1 403
 ret 384
-label L768
 label L766
+label L764
 strref 405 m8s272
 load 406 type_tok
 field 407 406 8 string value
@@ -23395,15 +23435,15 @@ call 427 pith_list_release_handle void 1 426
 load 428 patterns
 call 429 pith_list_release_handle void 1 428
 ret 409
-label L765
 label L763
+label L761
 call 430 parser__cur_tok_kind string 0
 strref 431 m8s13
 call 432 pith_cstring_eq bool 2 430 431
 call 433 pith_cstring_release void 1 430
 call 434 pith_cstring_release void 1 431
-brif 432 L779 L780
-label L779
+brif 432 L777 L778
+label L777
 call 435 parser_advance_token struct:Token 0
 call 436 pith_struct_release void 1 435
 load 437 patterns
@@ -23415,25 +23455,25 @@ call 441 parser_check bool 1 440
 call 442 pith_cstring_release void 1 440
 iconst 444 1
 sub 443 444 441
-brif 443 L782 L783
-label L782
+brif 443 L780 L781
+label L780
 load 445 patterns
 call 446 parser_parse_pattern int 0
 call 447 pith_list_push_value void 2 445 446
-label L784
+label L782
 strref 448 m8s15
 call 449 parser_match_tok bool 1 448
 call 450 pith_cstring_release void 1 448
-brif 449 L785 L786
-label L785
+brif 449 L783 L784
+label L783
 load 451 patterns
 call 452 parser_parse_pattern int 0
 call 453 pith_list_push_value void 2 451 452
-jmp L784
-label L786
-jmp L781
-label L783
+jmp L782
+label L784
+jmp L779
 label L781
+label L779
 strref 454 m8s11
 call 455 parser_expect struct:Token 1 454
 call 456 pith_cstring_release void 1 454
@@ -23464,15 +23504,15 @@ call 480 pith_list_release_handle void 1 479
 load 481 patterns
 call 482 pith_list_release_handle void 1 481
 ret 462
-label L780
 label L778
+label L776
 call 483 parser__cur_tok_kind string 0
 strref 484 m8s0
 call 485 pith_cstring_eq bool 2 483 484
 call 486 pith_cstring_release void 1 483
 call 487 pith_cstring_release void 1 484
-brif 485 L788 L789
-label L788
+brif 485 L786 L787
+label L786
 strref 488 m8s270
 strref 489 m8s269
 strref 490 m8s69
@@ -23480,8 +23520,8 @@ call 491 parser_parser_report_error_here void 3 488 489 490
 call 492 pith_cstring_release void 1 488
 call 493 pith_cstring_release void 1 489
 call 494 pith_cstring_release void 1 490
-jmp L787
-label L789
+jmp L785
+label L787
 call 495 parser__cur_tok_kind string 0
 strref 496 m8s1
 call 498 pith_cstring_eq bool 2 495 496
@@ -23489,8 +23529,8 @@ iconst 499 1
 sub 497 499 498
 call 500 pith_cstring_release void 1 495
 call 501 pith_cstring_release void 1 496
-brif 497 L790 L791
-label L790
+brif 497 L788 L789
+label L788
 strref 502 m8s195
 strref 503 m8s268
 call 504 parser__cur_tok_kind string 0
@@ -23502,9 +23542,9 @@ call 509 parser_parser_report_error_here void 3 502 505 508
 call 510 pith_cstring_release void 1 502
 call 511 pith_cstring_release void 1 505
 call 512 pith_cstring_release void 1 508
-jmp L787
-label L791
-label L787
+jmp L785
+label L789
+label L785
 call 513 parser_advance_token struct:Token 0
 call 514 pith_struct_release void 1 513
 strref 515 m8s267
@@ -23567,27 +23607,27 @@ load 9 stmts
 call 10 pith_list_new_default list 0
 call 11 pith_list_release_handle void 1 9
 store stmts 10
-label L792
+label L790
 iconst 12 0
-store __and_12_795 12
+store __and_12_793 12
 strref 13 m8s94
 call 14 parser_check bool 1 13
 call 15 pith_cstring_release void 1 13
 iconst 17 1
 sub 16 17 14
-store __and_12_795 16
-brif 16 L795 L796
-label L795
+store __and_12_793 16
+brif 16 L793 L794
+label L793
 strref 18 m8s0
 call 19 parser_check bool 1 18
 call 20 pith_cstring_release void 1 18
 iconst 22 1
 sub 21 22 19
-store __and_12_795 21
-label L796
-load 23 __and_12_795
-brif 23 L793 L794
-label L793
+store __and_12_793 21
+label L794
+load 23 __and_12_793
+brif 23 L791 L792
+label L791
 load 24 parser___g_current_token_position
 store before 24
 load 25 stmts
@@ -23596,8 +23636,8 @@ call 27 pith_list_push_value void 2 25 26
 load 28 parser___g_current_token_position
 load 29 before
 eq 30 28 29
-brif 30 L798 L799
-label L798
+brif 30 L796 L797
+label L796
 strref 31 m8s195
 strref 32 m8s266
 strref 33 m8s69
@@ -23614,12 +23654,12 @@ call 43 pith_cstring_release void 1 40
 call 44 pith_list_push_value void 2 38 41
 call 45 parser_advance_token struct:Token 0
 call 46 pith_struct_release void 1 45
-jmp L797
-label L799
+jmp L795
 label L797
+label L795
 call 47 parser_skip_newlines void 0
-jmp L792
-label L794
+jmp L790
+label L792
 strref 48 m8s94
 call 49 parser_expect struct:Token 1 48
 call 50 pith_cstring_release void 1 48
@@ -23644,179 +23684,179 @@ strref 1 m8s170
 call 2 pith_cstring_eq bool 2 0 1
 call 3 pith_cstring_release void 1 0
 call 4 pith_cstring_release void 1 1
-brif 2 L801 L802
-label L801
+brif 2 L799 L800
+label L799
 call 5 parser_parse_binding int 0
 ret 5
-label L802
 label L800
+label L798
 call 6 parser__cur_tok_kind string 0
 strref 7 m8s168
 call 8 pith_cstring_eq bool 2 6 7
 call 9 pith_cstring_release void 1 6
 call 10 pith_cstring_release void 1 7
-brif 8 L804 L805
-label L804
+brif 8 L802 L803
+label L802
 call 11 parser_parse_binding int 0
 ret 11
-label L805
 label L803
+label L801
 iconst 12 0
-store __and_12_809 12
+store __and_12_807 12
 call 13 parser__cur_tok_kind string 0
 strref 14 m8s89
 call 15 pith_cstring_eq bool 2 13 14
 call 16 pith_cstring_release void 1 13
 call 17 pith_cstring_release void 1 14
-store __and_12_809 15
-brif 15 L809 L810
-label L809
+store __and_12_807 15
+brif 15 L807 L808
+label L807
 call 18 parser__cur_tok_value string 0
 strref 19 m8s264
 call 20 pith_cstring_eq bool 2 18 19
 call 21 pith_cstring_release void 1 18
 call 22 pith_cstring_release void 1 19
-store __and_12_809 20
-label L810
-load 23 __and_12_809
-brif 23 L807 L808
-label L807
+store __and_12_807 20
+label L808
+load 23 __and_12_807
+brif 23 L805 L806
+label L805
 iconst 24 0
-store __or_24_814 24
+store __or_24_812 24
 iconst 25 1
 call 26 parser__peek_ahead_kind string 1 25
 strref 27 m8s89
 call 28 pith_cstring_eq bool 2 26 27
 call 29 pith_cstring_release void 1 26
 call 30 pith_cstring_release void 1 27
-store __or_24_814 28
-brif 28 L815 L814
-label L814
+store __or_24_812 28
+brif 28 L813 L812
+label L812
 iconst 31 1
 call 32 parser__peek_ahead_kind string 1 31
 strref 33 m8s263
 call 34 pith_cstring_eq bool 2 32 33
 call 35 pith_cstring_release void 1 32
 call 36 pith_cstring_release void 1 33
-store __or_24_814 34
-label L815
-load 37 __or_24_814
-brif 37 L812 L813
-label L812
+store __or_24_812 34
+label L813
+load 37 __or_24_812
+brif 37 L810 L811
+label L810
 call 38 parser_parse_locked_stmt int 0
 ret 38
-label L813
 label L811
-jmp L806
-label L808
+label L809
+jmp L804
 label L806
+label L804
 call 39 parser__cur_tok_kind string 0
 strref 40 m8s89
 call 41 pith_cstring_eq bool 2 39 40
 call 42 pith_cstring_release void 1 39
 call 43 pith_cstring_release void 1 40
-brif 41 L817 L818
-label L817
+brif 41 L815 L816
+label L815
 iconst 44 1
 call 45 parser__peek_ahead_kind string 1 44
 strref 46 m8s28
 call 47 pith_cstring_eq bool 2 45 46
 call 48 pith_cstring_release void 1 45
 call 49 pith_cstring_release void 1 46
-brif 47 L820 L821
-label L820
+brif 47 L818 L819
+label L818
 call 50 parser_parse_binding int 0
 ret 50
-label L821
 label L819
+label L817
 iconst 51 1
 call 52 parser__peek_ahead_kind string 1 51
 strref 53 m8s26
 call 54 pith_cstring_eq bool 2 52 53
 call 55 pith_cstring_release void 1 52
 call 56 pith_cstring_release void 1 53
-brif 54 L823 L824
-label L823
+brif 54 L821 L822
+label L821
 call 57 parser_parse_binding int 0
 ret 57
-label L824
 label L822
-jmp L816
-label L818
+label L820
+jmp L814
 label L816
+label L814
 call 58 parser__cur_tok_kind string 0
 strref 59 m8s262
 call 60 pith_cstring_eq bool 2 58 59
 call 61 pith_cstring_release void 1 58
 call 62 pith_cstring_release void 1 59
-brif 60 L826 L827
-label L826
+brif 60 L824 L825
+label L824
 call 63 parser_parse_if_stmt int 0
 ret 63
-label L827
 label L825
+label L823
 call 64 parser__cur_tok_kind string 0
 strref 65 m8s153
 call 66 pith_cstring_eq bool 2 64 65
 call 67 pith_cstring_release void 1 64
 call 68 pith_cstring_release void 1 65
-brif 66 L829 L830
-label L829
+brif 66 L827 L828
+label L827
 call 69 parser_parse_for_stmt int 0
 ret 69
-label L830
 label L828
+label L826
 call 70 parser__cur_tok_kind string 0
 strref 71 m8s261
 call 72 pith_cstring_eq bool 2 70 71
 call 73 pith_cstring_release void 1 70
 call 74 pith_cstring_release void 1 71
-brif 72 L832 L833
-label L832
+brif 72 L830 L831
+label L830
 call 75 parser_parse_while_stmt int 0
 ret 75
-label L833
 label L831
+label L829
 call 76 parser__cur_tok_kind string 0
 strref 77 m8s260
 call 78 pith_cstring_eq bool 2 76 77
 call 79 pith_cstring_release void 1 76
 call 80 pith_cstring_release void 1 77
-brif 78 L835 L836
-label L835
+brif 78 L833 L834
+label L833
 call 81 parser_parse_match_stmt int 0
 ret 81
-label L836
 label L834
+label L832
 call 82 parser__cur_tok_kind string 0
 strref 83 m8s259
 call 84 pith_cstring_eq bool 2 82 83
 call 85 pith_cstring_release void 1 82
 call 86 pith_cstring_release void 1 83
-brif 84 L838 L839
-label L838
+brif 84 L836 L837
+label L836
 call 87 parser_parse_return_stmt int 0
 ret 87
-label L839
 label L837
+label L835
 call 88 parser__cur_tok_kind string 0
 strref 89 m8s258
 call 90 pith_cstring_eq bool 2 88 89
 call 91 pith_cstring_release void 1 88
 call 92 pith_cstring_release void 1 89
-brif 90 L841 L842
-label L841
+brif 90 L839 L840
+label L839
 call 93 parser_parse_fail_stmt int 0
 ret 93
-label L842
 label L840
+label L838
 call 94 parser__cur_tok_kind string 0
 strref 95 m8s257
 call 96 pith_cstring_eq bool 2 94 95
 call 97 pith_cstring_release void 1 94
 call 98 pith_cstring_release void 1 95
-brif 96 L844 L845
-label L844
+brif 96 L842 L843
+label L842
 call 99 parser_advance_token struct:Token 0
 call 100 pith_struct_release void 1 99
 strref 101 m8s256
@@ -23825,15 +23865,15 @@ call 103 parser_add_leaf_with_position int 2 101 102
 call 104 pith_cstring_release void 1 101
 call 105 pith_cstring_release void 1 102
 ret 103
-label L845
 label L843
+label L841
 call 106 parser__cur_tok_kind string 0
 strref 107 m8s255
 call 108 pith_cstring_eq bool 2 106 107
 call 109 pith_cstring_release void 1 106
 call 110 pith_cstring_release void 1 107
-brif 108 L847 L848
-label L847
+brif 108 L845 L846
+label L845
 call 111 parser_advance_token struct:Token 0
 call 112 pith_struct_release void 1 111
 strref 113 m8s254
@@ -23842,30 +23882,30 @@ call 115 parser_add_leaf_with_position int 2 113 114
 call 116 pith_cstring_release void 1 113
 call 117 pith_cstring_release void 1 114
 ret 115
-label L848
 label L846
+label L844
 call 118 parser__cur_tok_kind string 0
 strref 119 m8s253
 call 120 pith_cstring_eq bool 2 118 119
 call 121 pith_cstring_release void 1 118
 call 122 pith_cstring_release void 1 119
-brif 120 L850 L851
-label L850
+brif 120 L848 L849
+label L848
 call 123 parser_parse_defer_stmt int 0
 ret 123
-label L851
 label L849
+label L847
 call 124 parser__cur_tok_kind string 0
 strref 125 m8s252
 call 126 pith_cstring_eq bool 2 124 125
 call 127 pith_cstring_release void 1 124
 call 128 pith_cstring_release void 1 125
-brif 126 L853 L854
-label L853
+brif 126 L851 L852
+label L851
 call 129 parser_parse_errdefer_stmt int 0
 ret 129
-label L854
 label L852
+label L850
 call 130 parser_parse_expr_stmt_or_assignment int 0
 ret 130
 iconst 131 0
@@ -24030,10 +24070,10 @@ iconst 0 0
 store ak 0
 iconst 1 2
 store i 1
-label L855
+label L853
 iconst 2 1
-brif 2 L856 L857
-label L856
+brif 2 L854 L855
+label L854
 load 3 ak
 load 4 i
 call 5 parser__peek_ahead_kind string 1 4
@@ -24043,189 +24083,189 @@ load 7 ak
 strref 8 m8s28
 call 9 pith_cstring_eq bool 2 7 8
 call 10 pith_cstring_release void 1 8
-brif 9 L859 L860
-label L859
+brif 9 L857 L858
+label L857
 iconst 11 1
 load 12 ak
 call 13 pith_cstring_release void 1 12
 ret 11
-label L860
 label L858
+label L856
 iconst 14 0
-store __or_14_864 14
+store __or_14_862 14
 iconst 15 0
-store __or_15_864 15
+store __or_15_862 15
 load 16 ak
 strref 17 m8s0
 call 18 pith_cstring_eq bool 2 16 17
 call 19 pith_cstring_release void 1 17
-store __or_15_864 18
-brif 18 L865 L864
-label L864
+store __or_15_862 18
+brif 18 L863 L862
+label L862
 load 20 ak
 strref 21 m8s93
 call 22 pith_cstring_eq bool 2 20 21
 call 23 pith_cstring_release void 1 21
-store __or_15_864 22
-label L865
-load 24 __or_15_864
-store __or_14_864 24
-brif 24 L867 L866
-label L866
+store __or_15_862 22
+label L863
+load 24 __or_15_862
+store __or_14_862 24
+brif 24 L865 L864
+label L864
 load 25 ak
 strref 26 m8s94
 call 27 pith_cstring_eq bool 2 25 26
 call 28 pith_cstring_release void 1 26
-store __or_14_864 27
-label L867
-load 29 __or_14_864
-brif 29 L862 L863
-label L862
+store __or_14_862 27
+label L865
+load 29 __or_14_862
+brif 29 L860 L861
+label L860
 iconst 30 0
 load 31 ak
 call 32 pith_cstring_release void 1 31
 ret 30
-label L863
 label L861
+label L859
 iconst 33 0
-store __or_33_871 33
+store __or_33_869 33
 iconst 34 0
-store __or_34_871 34
+store __or_34_869 34
 iconst 35 0
-store __or_35_871 35
+store __or_35_869 35
 iconst 36 0
-store __or_36_871 36
+store __or_36_869 36
 iconst 37 0
-store __or_37_871 37
+store __or_37_869 37
 iconst 38 0
-store __or_38_871 38
+store __or_38_869 38
 iconst 39 0
-store __or_39_871 39
+store __or_39_869 39
 iconst 40 0
-store __or_40_871 40
+store __or_40_869 40
 iconst 41 0
-store __or_41_871 41
+store __or_41_869 41
 iconst 42 0
-store __or_42_871 42
+store __or_42_869 42
 load 43 ak
 strref 44 m8s89
 call 45 pith_cstring_eq bool 2 43 44
 call 46 pith_cstring_release void 1 44
-store __or_42_871 45
-brif 45 L872 L871
-label L871
+store __or_42_869 45
+brif 45 L870 L869
+label L869
 load 47 ak
 strref 48 m8s9
 call 49 pith_cstring_eq bool 2 47 48
 call 50 pith_cstring_release void 1 48
-store __or_42_871 49
-label L872
-load 51 __or_42_871
-store __or_41_871 51
-brif 51 L874 L873
-label L873
+store __or_42_869 49
+label L870
+load 51 __or_42_869
+store __or_41_869 51
+brif 51 L872 L871
+label L871
 load 52 ak
 strref 53 m8s7
 call 54 pith_cstring_eq bool 2 52 53
 call 55 pith_cstring_release void 1 53
-store __or_41_871 54
-label L874
-load 56 __or_41_871
-store __or_40_871 56
-brif 56 L876 L875
-label L875
+store __or_41_869 54
+label L872
+load 56 __or_41_869
+store __or_40_869 56
+brif 56 L874 L873
+label L873
 load 57 ak
 strref 58 m8s13
 call 59 pith_cstring_eq bool 2 57 58
 call 60 pith_cstring_release void 1 58
-store __or_40_871 59
-label L876
-load 61 __or_40_871
-store __or_39_871 61
-brif 61 L878 L877
-label L877
+store __or_40_869 59
+label L874
+load 61 __or_40_869
+store __or_39_869 61
+brif 61 L876 L875
+label L875
 load 62 ak
 strref 63 m8s11
 call 64 pith_cstring_eq bool 2 62 63
 call 65 pith_cstring_release void 1 63
-store __or_39_871 64
-label L878
-load 66 __or_39_871
-store __or_38_871 66
-brif 66 L880 L879
-label L879
+store __or_39_869 64
+label L876
+load 66 __or_39_869
+store __or_38_869 66
+brif 66 L878 L877
+label L877
 load 67 ak
 strref 68 m8s15
 call 69 pith_cstring_eq bool 2 67 68
 call 70 pith_cstring_release void 1 68
-store __or_38_871 69
-label L880
-load 71 __or_38_871
-store __or_37_871 71
-brif 71 L882 L881
-label L881
+store __or_38_869 69
+label L878
+load 71 __or_38_869
+store __or_37_869 71
+brif 71 L880 L879
+label L879
 load 72 ak
 strref 73 m8s24
 call 74 pith_cstring_eq bool 2 72 73
 call 75 pith_cstring_release void 1 73
-store __or_37_871 74
-label L882
-load 76 __or_37_871
-store __or_36_871 76
-brif 76 L884 L883
-label L883
+store __or_37_869 74
+label L880
+load 76 __or_37_869
+store __or_36_869 76
+brif 76 L882 L881
+label L881
 load 77 ak
 strref 78 m8s38
 call 79 pith_cstring_eq bool 2 77 78
 call 80 pith_cstring_release void 1 78
-store __or_36_871 79
-label L884
-load 81 __or_36_871
-store __or_35_871 81
-brif 81 L886 L885
-label L885
+store __or_36_869 79
+label L882
+load 81 __or_36_869
+store __or_35_869 81
+brif 81 L884 L883
+label L883
 load 82 ak
 strref 83 m8s61
 call 84 pith_cstring_eq bool 2 82 83
 call 85 pith_cstring_release void 1 83
-store __or_35_871 84
-label L886
-load 86 __or_35_871
-store __or_34_871 86
-brif 86 L888 L887
-label L887
+store __or_35_869 84
+label L884
+load 86 __or_35_869
+store __or_34_869 86
+brif 86 L886 L885
+label L885
 load 87 ak
 strref 88 m8s158
 call 89 pith_cstring_eq bool 2 87 88
 call 90 pith_cstring_release void 1 88
-store __or_34_871 89
-label L888
-load 91 __or_34_871
-store __or_33_871 91
-brif 91 L890 L889
-label L889
+store __or_34_869 89
+label L886
+load 91 __or_34_869
+store __or_33_869 91
+brif 91 L888 L887
+label L887
 load 92 ak
 strref 93 m8s63
 call 94 pith_cstring_eq bool 2 92 93
 call 95 pith_cstring_release void 1 93
-store __or_33_871 94
-label L890
-load 96 __or_33_871
-brif 96 L869 L870
-label L869
+store __or_33_869 94
+label L888
+load 96 __or_33_869
+brif 96 L867 L868
+label L867
 load 97 i
 iconst 98 1
 add 99 97 98
 store i 99
-jmp L855
-label L870
+jmp L853
 label L868
+label L866
 iconst 100 0
 load 101 ak
 call 102 pith_cstring_release void 1 101
 ret 100
-jmp L855
-label L857
+jmp L853
+label L855
 load 103 ak
 call 104 pith_cstring_release void 1 103
 iconst 105 0
@@ -24245,23 +24285,23 @@ store is_weak 4
 strref 5 m8s170
 call 6 parser_match_tok bool 1 5
 call 7 pith_cstring_release void 1 5
-brif 6 L892 L893
-label L892
+brif 6 L890 L891
+label L890
 iconst 8 1
 store is_mut 8
-jmp L891
-label L893
+jmp L889
 label L891
+label L889
 strref 9 m8s168
 call 10 parser_match_tok bool 1 9
 call 11 pith_cstring_release void 1 9
-brif 10 L895 L896
-label L895
+brif 10 L893 L894
+label L893
 iconst 12 1
 store is_weak 12
-jmp L894
-label L896
+jmp L892
 label L894
+label L892
 load 13 name_tok
 strref 14 m8s89
 call 15 parser_expect struct:Token 1 14
@@ -24275,14 +24315,14 @@ store children 19
 strref 21 m8s26
 call 22 parser_match_tok bool 1 21
 call 23 pith_cstring_release void 1 21
-brif 22 L898 L899
-label L898
+brif 22 L896 L897
+label L896
 load 24 children
 call 25 parser_parse_type_expr int 0
 call 26 pith_list_push_value void 2 24 25
-jmp L897
-label L899
+jmp L895
 label L897
+label L895
 strref 27 m8s28
 call 28 parser_expect struct:Token 1 27
 call 29 pith_cstring_release void 1 27
@@ -24295,18 +24335,18 @@ strref 35 m8s69
 call 36 pith_cstring_release void 1 34
 store mod 35
 load 37 is_mut
-brif 37 L901 L902
-label L901
+brif 37 L899 L900
+label L899
 strref 38 m8s169
 load 39 mod
 call 40 pith_cstring_release void 1 39
 store mod 38
-jmp L900
-label L902
+jmp L898
 label L900
+label L898
 load 41 is_weak
-brif 41 L904 L905
-label L904
+brif 41 L902 L903
+label L902
 load 42 mod
 strref 43 m8s167
 concat 44 42 43
@@ -24314,9 +24354,9 @@ call 45 pith_cstring_release void 1 43
 load 46 mod
 call 47 pith_cstring_release void 1 46
 store mod 44
-jmp L903
-label L905
+jmp L901
 label L903
+label L901
 strref 48 m8s207
 load 49 name_tok
 field 50 49 8 string value
@@ -24358,73 +24398,73 @@ strref 7 m8s41
 call 8 pith_cstring_eq bool 2 6 7
 call 9 pith_cstring_release void 1 6
 call 10 pith_cstring_release void 1 7
-brif 8 L907 L908
-label L907
+brif 8 L905 L906
+label L905
 strref 11 m8s22
 load 12 op
 call 13 pith_cstring_release void 1 12
 store op 11
-jmp L906
-label L908
+jmp L904
+label L906
 call 14 parser__cur_tok_kind string 0
 strref 15 m8s65
 call 16 pith_cstring_eq bool 2 14 15
 call 17 pith_cstring_release void 1 14
 call 18 pith_cstring_release void 1 15
-brif 16 L909 L910
-label L909
+brif 16 L907 L908
+label L907
 strref 19 m8s64
 load 20 op
 call 21 pith_cstring_release void 1 20
 store op 19
-jmp L906
-label L910
+jmp L904
+label L908
 call 22 parser__cur_tok_kind string 0
 strref 23 m8s59
 call 24 pith_cstring_eq bool 2 22 23
 call 25 pith_cstring_release void 1 22
 call 26 pith_cstring_release void 1 23
-brif 24 L911 L912
-label L911
+brif 24 L909 L910
+label L909
 strref 27 m8s58
 load 28 op
 call 29 pith_cstring_release void 1 28
 store op 27
-jmp L906
-label L912
+jmp L904
+label L910
 call 30 parser__cur_tok_kind string 0
 strref 31 m8s55
 call 32 pith_cstring_eq bool 2 30 31
 call 33 pith_cstring_release void 1 30
 call 34 pith_cstring_release void 1 31
-brif 32 L913 L914
-label L913
+brif 32 L911 L912
+label L911
 strref 35 m8s54
 load 36 op
 call 37 pith_cstring_release void 1 36
 store op 35
-jmp L906
-label L914
+jmp L904
+label L912
 call 38 parser__cur_tok_kind string 0
 strref 39 m8s51
 call 40 pith_cstring_eq bool 2 38 39
 call 41 pith_cstring_release void 1 38
 call 42 pith_cstring_release void 1 39
-brif 40 L915 L916
-label L915
+brif 40 L913 L914
+label L913
 strref 43 m8s50
 load 44 op
 call 45 pith_cstring_release void 1 44
 store op 43
-jmp L906
-label L916
-label L906
+jmp L904
+label L914
+label L904
 load 46 op
 call 47 pith_cstring_len int 1 46
 iconst 48 0
 gt 49 47 48
-brif 49 L918 L919
-label L918
+brif 49 L916 L917
+label L916
 call 50 parser_advance_token struct:Token 0
 call 51 pith_struct_release void 1 50
 call 52 parser_parse_expression int 0
@@ -24447,8 +24487,8 @@ call 66 pith_cstring_release void 1 65
 load 67 children
 call 68 pith_list_release_handle void 1 67
 ret 63
-label L919
 label L917
+label L915
 load 69 expr
 load 70 op
 call 71 pith_cstring_release void 1 70
@@ -24476,8 +24516,8 @@ call 5 pith_struct_release void 1 4
 strref 6 m8s231
 call 7 parser_check bool 1 6
 call 8 pith_cstring_release void 1 6
-brif 7 L921 L922
-label L921
+brif 7 L919 L920
+label L919
 call 9 parser_parse_if_let_stmt int 0
 load 10 children
 call 11 pith_list_release_handle void 1 10
@@ -24488,8 +24528,8 @@ call 15 pith_list_release_handle void 1 14
 load 16 else_children
 call 17 pith_list_release_handle void 1 16
 ret 9
-label L922
 label L920
+label L918
 call 18 parser_parse_expression int 0
 store condition 18
 strref 19 m8s26
@@ -24518,12 +24558,12 @@ call 38 parser_add_node_with_position int 3 35 36 37
 call 39 pith_cstring_release void 1 35
 call 40 pith_cstring_release void 1 36
 call 41 pith_list_push_value void 2 34 38
-label L923
+label L921
 strref 42 m8s243
 call 43 parser_check bool 1 42
 call 44 pith_cstring_release void 1 42
-brif 43 L924 L925
-label L924
+brif 43 L922 L923
+label L922
 call 45 parser_advance_token struct:Token 0
 call 46 pith_struct_release void 1 45
 call 47 parser_parse_expression int 0
@@ -24550,13 +24590,13 @@ call 64 parser_add_node_with_position int 3 61 62 63
 call 65 pith_cstring_release void 1 61
 call 66 pith_cstring_release void 1 62
 call 67 pith_list_push_value void 2 60 64
-jmp L923
-label L925
+jmp L921
+label L923
 strref 68 m8s228
 call 69 parser_check bool 1 68
 call 70 pith_cstring_release void 1 68
-brif 69 L927 L928
-label L927
+brif 69 L925 L926
+label L925
 call 71 parser_advance_token struct:Token 0
 call 72 pith_struct_release void 1 71
 strref 73 m8s26
@@ -24579,9 +24619,9 @@ call 87 parser_add_node_with_position int 3 84 85 86
 call 88 pith_cstring_release void 1 84
 call 89 pith_cstring_release void 1 85
 call 90 pith_list_push_value void 2 83 87
-jmp L926
-label L928
+jmp L924
 label L926
+label L924
 strref 91 m8s240
 strref 92 m8s69
 load 93 children
@@ -24650,8 +24690,8 @@ store loop_idx 26
 strref 28 m8s15
 call 29 parser_match_tok bool 1 28
 call 30 pith_cstring_release void 1 28
-brif 29 L930 L931
-label L930
+brif 29 L928 L929
+label L928
 load 31 idx_tok
 strref 32 m8s89
 call 33 parser_expect struct:Token 1 32
@@ -24678,9 +24718,9 @@ call 51 parser_add_leaf_with_position int 2 47 49
 call 52 pith_cstring_release void 1 47
 call 53 pith_cstring_release void 1 49
 store loop_idx 51
-jmp L929
-label L931
+jmp L927
 label L929
+label L927
 strref 54 m8s236
 call 55 parser_expect struct:Token 1 54
 call 56 pith_cstring_release void 1 54
@@ -24688,21 +24728,21 @@ call 57 pith_struct_release void 1 55
 call 58 parser_parse_expression int 0
 store iterable 58
 iconst 59 0
-store __or_59_935 59
+store __or_59_933 59
 strref 60 m8s19
 call 61 parser_check bool 1 60
 call 62 pith_cstring_release void 1 60
-store __or_59_935 61
-brif 61 L936 L935
-label L935
+store __or_59_933 61
+brif 61 L934 L933
+label L933
 strref 63 m8s21
 call 64 parser_check bool 1 63
 call 65 pith_cstring_release void 1 63
-store __or_59_935 64
-label L936
-load 66 __or_59_935
-brif 66 L933 L934
-label L933
+store __or_59_933 64
+label L934
+load 66 __or_59_933
+brif 66 L931 L932
+label L931
 strref 67 m8s21
 call 68 parser_check bool 1 67
 call 69 pith_cstring_release void 1 67
@@ -24724,24 +24764,24 @@ strref 81 m8s235
 call 82 pith_cstring_release void 1 80
 store range_kind 81
 load 83 inclusive
-brif 83 L938 L939
-label L938
+brif 83 L936 L937
+label L936
 strref 84 m8s234
 load 85 range_kind
 call 86 pith_cstring_release void 1 85
 store range_kind 84
-jmp L937
-label L939
+jmp L935
 label L937
+label L935
 strref 87 m8s233
 load 88 range_kind
 load 89 range_children
 call 90 parser_add_node_with_position int 3 87 88 89
 call 91 pith_cstring_release void 1 87
 store iterable 90
-jmp L932
-label L934
+jmp L930
 label L932
+label L930
 strref 92 m8s26
 call 93 parser_expect struct:Token 1 92
 call 94 pith_cstring_release void 1 92
@@ -24762,14 +24802,14 @@ call 106 pith_list_push_value void 2 104 105
 load 107 loop_idx
 iconst 108 0
 gte 109 107 108
-brif 109 L941 L942
-label L941
+brif 109 L939 L940
+label L939
 load 110 children
 load 111 loop_idx
 call 112 pith_list_push_value void 2 110 111
-jmp L940
-label L942
+jmp L938
 label L940
+label L938
 strref 113 m8s232
 load 114 label
 load 115 children
@@ -24813,8 +24853,8 @@ call 3 pith_struct_release void 1 2
 strref 4 m8s231
 call 5 parser_check bool 1 4
 call 6 pith_cstring_release void 1 4
-brif 5 L944 L945
-label L944
+brif 5 L942 L943
+label L942
 call 7 parser_advance_token struct:Token 0
 call 8 pith_struct_release void 1 7
 call 9 parser_parse_pattern int 0
@@ -24852,8 +24892,8 @@ call 36 pith_list_release_handle void 1 35
 load 37 children
 call 38 pith_list_release_handle void 1 37
 ret 32
-label L945
 label L943
+label L941
 call 39 parser_parse_expression int 0
 store condition 39
 strref 40 m8s26
@@ -24920,8 +24960,8 @@ store children 15
 strref 23 m8s228
 call 24 parser_check bool 1 23
 call 25 pith_cstring_release void 1 23
-brif 24 L947 L948
-label L947
+brif 24 L945 L946
+label L945
 call 26 parser_advance_token struct:Token 0
 call 27 pith_struct_release void 1 26
 strref 28 m8s26
@@ -24931,9 +24971,9 @@ call 31 pith_struct_release void 1 29
 load 32 children
 call 33 parser_parse_block int 0
 call 34 pith_list_push_value void 2 32 33
-jmp L946
-label L948
+jmp L944
 label L946
+label L944
 strref 35 m8s227
 strref 36 m8s69
 load 37 children
@@ -24966,35 +25006,35 @@ call 5 parser__cur_tok_kind string 0
 call 6 pith_cstring_release void 1 4
 store next_kind 5
 iconst 7 0
-store __or_7_952 7
+store __or_7_950 7
 iconst 8 0
-store __or_8_952 8
+store __or_8_950 8
 load 9 next_kind
 strref 10 m8s93
 call 11 pith_cstring_eq bool 2 9 10
 call 12 pith_cstring_release void 1 10
-store __or_8_952 11
-brif 11 L953 L952
-label L952
+store __or_8_950 11
+brif 11 L951 L950
+label L950
 load 13 next_kind
 strref 14 m8s94
 call 15 pith_cstring_eq bool 2 13 14
 call 16 pith_cstring_release void 1 14
-store __or_8_952 15
-label L953
-load 17 __or_8_952
-store __or_7_952 17
-brif 17 L955 L954
-label L954
+store __or_8_950 15
+label L951
+load 17 __or_8_950
+store __or_7_950 17
+brif 17 L953 L952
+label L952
 load 18 next_kind
 strref 19 m8s0
 call 20 pith_cstring_eq bool 2 18 19
 call 21 pith_cstring_release void 1 19
-store __or_7_952 20
-label L955
-load 22 __or_7_952
-brif 22 L950 L951
-label L950
+store __or_7_950 20
+label L953
+load 22 __or_7_950
+brif 22 L948 L949
+label L948
 load 23 children
 call 24 pith_list_new_default list 0
 call 25 pith_list_release_handle void 1 23
@@ -25010,8 +25050,8 @@ call 33 pith_cstring_release void 1 32
 load 34 children
 call 35 pith_list_release_handle void 1 34
 ret 29
-label L951
 label L949
+label L947
 call 36 parser_parse_expression int 0
 store val 36
 load 37 children
@@ -25117,23 +25157,23 @@ call 28 pith_list_new_default list 0
 call 29 pith_list_release_handle void 1 27
 store decls 28
 call 30 parser_skip_newlines void 0
-label L956
+label L954
 iconst 31 0
-store __or_31_959 31
+store __or_31_957 31
 strref 32 m8s220
 call 33 parser_check bool 1 32
 call 34 pith_cstring_release void 1 32
-store __or_31_959 33
-brif 33 L960 L959
-label L959
+store __or_31_957 33
+brif 33 L958 L957
+label L957
 strref 35 m8s221
 call 36 parser_check bool 1 35
 call 37 pith_cstring_release void 1 35
-store __or_31_959 36
-label L960
-load 38 __or_31_959
-brif 38 L957 L958
-label L957
+store __or_31_957 36
+label L958
+load 38 __or_31_957
+brif 38 L955 L956
+label L955
 load 39 parser___g_current_token_position
 store before 39
 load 40 imports
@@ -25142,8 +25182,8 @@ call 42 pith_list_push_value void 2 40 41
 load 43 parser___g_current_token_position
 load 44 before
 eq 45 43 44
-brif 45 L962 L963
-label L962
+brif 45 L960 L961
+label L960
 strref 46 m8s195
 strref 47 m8s224
 strref 48 m8s69
@@ -25160,46 +25200,46 @@ call 58 pith_cstring_release void 1 55
 call 59 pith_list_push_value void 2 53 56
 call 60 parser_advance_token struct:Token 0
 call 61 pith_struct_release void 1 60
-jmp L961
-label L963
+jmp L959
 label L961
+label L959
 call 62 parser_skip_newlines void 0
-jmp L956
-label L958
-label L964
+jmp L954
+label L956
+label L962
 strref 63 m8s0
 call 64 parser_check bool 1 63
 call 65 pith_cstring_release void 1 63
 iconst 67 1
 sub 66 67 64
-brif 66 L965 L966
-label L965
+brif 66 L963 L964
+label L963
 call 68 parser_skip_newlines void 0
 strref 69 m8s0
 call 70 parser_check bool 1 69
 call 71 pith_cstring_release void 1 69
 iconst 73 1
 sub 72 73 70
-brif 72 L968 L969
-label L968
+brif 72 L966 L967
+label L966
 load 74 parser___g_current_token_position
 store before 74
 call 75 parser_at_guard_block bool 0
-brif 75 L971 L972
-label L971
+brif 75 L969 L970
+label L969
 load 76 decls
 call 77 parser_parse_module_guard_block void 1 76
-jmp L970
-label L972
+jmp L968
+label L970
 load 78 decls
 call 79 parser_parse_top_level_decl int 0
 call 80 pith_list_push_value void 2 78 79
-label L970
+label L968
 load 81 parser___g_current_token_position
 load 82 before
 eq 83 81 82
-brif 83 L974 L975
-label L974
+brif 83 L972 L973
+label L972
 strref 84 m8s195
 strref 85 m8s223
 strref 86 m8s69
@@ -25216,15 +25256,15 @@ call 96 pith_cstring_release void 1 93
 call 97 pith_list_push_value void 2 91 94
 call 98 parser_advance_token struct:Token 0
 call 99 pith_struct_release void 1 98
-jmp L973
-label L975
+jmp L971
 label L973
+label L971
 call 100 parser_skip_newlines void 0
-jmp L967
-label L969
+jmp L965
 label L967
-jmp L964
-label L966
+label L965
+jmp L962
+label L964
 load 101 children
 call 102 pith_list_new_default list 0
 call 103 pith_list_release_handle void 1 101
@@ -25235,12 +25275,12 @@ iconst 106 0
 store __for_idx_39 106
 store __for_len_39 105
 store __for_iter_39 104
-label L976
+label L974
 load 107 __for_idx_39
 load 108 __for_len_39
 lt 109 107 108
-brif 109 L977 L979
-label L977
+brif 109 L975 L977
+label L975
 load 110 __for_iter_39
 load 111 __for_idx_39
 call 112 pith_list_get_value unknown 2 110 111
@@ -25248,25 +25288,25 @@ store __loopvar_39_i 112
 load 113 children
 load 114 __loopvar_39_i
 call 115 pith_list_push_value void 2 113 114
-label L978
+label L976
 load 116 __for_idx_39
 iconst 117 1
 add 118 116 117
 store __for_idx_39 118
-jmp L976
-label L979
+jmp L974
+label L977
 load 119 decls
 call 120 pith_auto_len int 1 119
 iconst 121 0
 store __for_idx_40 121
 store __for_len_40 120
 store __for_iter_40 119
-label L980
+label L978
 load 122 __for_idx_40
 load 123 __for_len_40
 lt 124 122 123
-brif 124 L981 L983
-label L981
+brif 124 L979 L981
+label L979
 load 125 __for_iter_40
 load 126 __for_idx_40
 call 127 pith_list_get_value unknown 2 125 126
@@ -25274,13 +25314,13 @@ store __loopvar_40_d 127
 load 128 children
 load 129 __loopvar_40_d
 call 130 pith_list_push_value void 2 128 129
-label L982
+label L980
 load 131 __for_idx_40
 iconst 132 1
 add 133 131 132
 store __for_idx_40 133
-jmp L980
-label L983
+jmp L978
+label L981
 strref 134 m8s222
 strref 135 m8s69
 load 136 children
@@ -25321,8 +25361,8 @@ store n2 6
 strref 7 m8s221
 call 8 parser_check bool 1 7
 call 9 pith_cstring_release void 1 7
-brif 8 L985 L986
-label L985
+brif 8 L983 L984
+label L983
 call 10 parser_advance_token struct:Token 0
 call 11 pith_struct_release void 1 10
 load 12 path
@@ -25336,8 +25376,8 @@ call 18 pith_struct_release void 1 16
 strref 19 m8s53
 call 20 parser_check bool 1 19
 call 21 pith_cstring_release void 1 19
-brif 20 L988 L989
-label L988
+brif 20 L986 L987
+label L986
 call 22 parser_advance_token struct:Token 0
 call 23 pith_struct_release void 1 22
 load 24 parts
@@ -25372,8 +25412,8 @@ call 51 pith_struct_release void 1 50
 load 52 n2
 call 53 pith_struct_release void 1 52
 ret 37
-label L989
 label L987
+label L985
 load 54 names
 call 55 pith_list_new_cstr list 0
 call 56 pith_list_release_handle void 1 54
@@ -25395,8 +25435,8 @@ store alias 67
 strref 69 m8s218
 call 70 parser_match_tok bool 1 69
 call 71 pith_cstring_release void 1 69
-brif 70 L991 L992
-label L991
+brif 70 L989 L990
+label L989
 load 72 alias_tok
 strref 73 m8s89
 call 74 parser_expect struct:Token 1 73
@@ -25409,15 +25449,15 @@ call 79 pith_cstring_retain void 1 78
 load 80 alias
 call 81 pith_cstring_release void 1 80
 store alias 78
-jmp L990
-label L992
+jmp L988
 label L990
-label L993
+label L988
+label L991
 strref 82 m8s15
 call 83 parser_match_tok bool 1 82
 call 84 pith_cstring_release void 1 82
-brif 83 L994 L995
-label L994
+brif 83 L992 L993
+label L992
 load 85 n2
 strref 86 m8s89
 call 87 parser_expect struct:Token 1 86
@@ -25431,17 +25471,17 @@ call 93 pith_list_push_value void 2 90 92
 strref 94 m8s218
 call 95 parser_match_tok bool 1 94
 call 96 pith_cstring_release void 1 94
-brif 95 L997 L998
-label L997
+brif 95 L995 L996
+label L995
 strref 97 m8s89
 call 98 parser_expect struct:Token 1 97
 call 99 pith_cstring_release void 1 97
 call 100 pith_struct_release void 1 98
-jmp L996
-label L998
+jmp L994
 label L996
-jmp L993
-label L995
+label L994
+jmp L991
+label L993
 load 101 parts
 call 102 pith_list_new_cstr list 0
 load 103 path
@@ -25454,12 +25494,12 @@ iconst 108 0
 store __for_idx_41 108
 store __for_len_41 107
 store __for_iter_41 106
-label L999
+label L997
 load 109 __for_idx_41
 load 110 __for_len_41
 lt 111 109 110
-brif 111 L1000 L1002
-label L1000
+brif 111 L998 L1000
+label L998
 load 112 __for_iter_41
 load 113 __for_idx_41
 call 114 pith_list_get_value_unchecked string 2 112 113
@@ -25467,13 +25507,13 @@ store __loopvar_41_nm 114
 load 115 parts
 load 116 __loopvar_41_nm
 call 117 pith_list_push_value void 2 115 116
-label L1001
+label L999
 load 118 __for_idx_41
 iconst 119 1
 add 120 118 119
 store __for_idx_41 120
-jmp L999
-label L1002
+jmp L997
+label L1000
 strref 121 m8s219
 load 122 parts
 strref 123 m8s97
@@ -25497,8 +25537,8 @@ call 140 pith_struct_release void 1 139
 load 141 n2
 call 142 pith_struct_release void 1 141
 ret 126
-label L986
 label L984
+label L982
 call 143 parser_advance_token struct:Token 0
 call 144 pith_struct_release void 1 143
 load 145 path
@@ -25520,8 +25560,8 @@ load 157 path
 strref 158 m8s16
 call 159 pith_cstring_contains bool 2 157 158
 call 160 pith_cstring_release void 1 158
-brif 159 L1004 L1005
-label L1004
+brif 159 L1002 L1003
+label L1002
 load 161 path
 load 162 path
 strref 163 m8s16
@@ -25535,14 +25575,14 @@ call 170 pith_cstring_substring string 3 161 167 169
 load 171 alias
 call 172 pith_cstring_release void 1 171
 store alias 170
-jmp L1003
-label L1005
+jmp L1001
 label L1003
+label L1001
 strref 173 m8s218
 call 174 parser_match_tok bool 1 173
 call 175 pith_cstring_release void 1 173
-brif 174 L1007 L1008
-label L1007
+brif 174 L1005 L1006
+label L1005
 load 176 alias_tok
 strref 177 m8s89
 call 178 parser_expect struct:Token 1 177
@@ -25562,9 +25602,9 @@ call 190 pith_cstring_retain void 1 189
 load 191 alias
 call 192 pith_cstring_release void 1 191
 store alias 189
-jmp L1006
-label L1008
+jmp L1004
 label L1006
+label L1004
 load 193 parser___g_import_aliases
 load 194 alias
 iconst 195 1
@@ -25628,12 +25668,12 @@ field 10 9 8 string value
 call 11 pith_cstring_retain void 1 10
 call 12 pith_cstring_release void 1 8
 store path 10
-label L1009
+label L1007
 strref 13 m8s17
 call 14 parser_match_tok bool 1 13
 call 15 pith_cstring_release void 1 13
-brif 14 L1010 L1011
-label L1010
+brif 14 L1008 L1009
+label L1008
 load 16 next
 strref 17 m8s89
 call 18 parser_expect struct:Token 1 17
@@ -25651,8 +25691,8 @@ call 28 pith_cstring_release void 1 23
 load 29 path
 call 30 pith_cstring_release void 1 29
 store path 27
-jmp L1009
-label L1011
+jmp L1007
+label L1009
 load 31 path
 load 32 first
 call 33 pith_struct_release void 1 32
@@ -25672,7 +25712,7 @@ func parser_at_guard_block 0 bool
 iconst 0 0
 store after 0
 iconst 1 0
-store __or_1_1015 1
+store __or_1_1013 1
 call 2 parser__cur_tok_kind string 0
 strref 3 m8s89
 call 5 pith_cstring_eq bool 2 2 3
@@ -25680,9 +25720,9 @@ iconst 6 1
 sub 4 6 5
 call 7 pith_cstring_release void 1 2
 call 8 pith_cstring_release void 1 3
-store __or_1_1015 4
-brif 4 L1016 L1015
-label L1015
+store __or_1_1013 4
+brif 4 L1014 L1013
+label L1013
 call 9 parser__cur_tok_value string 0
 strref 10 m8s215
 call 12 pith_cstring_eq bool 2 9 10
@@ -25690,17 +25730,17 @@ iconst 13 1
 sub 11 13 12
 call 14 pith_cstring_release void 1 9
 call 15 pith_cstring_release void 1 10
-store __or_1_1015 11
-label L1016
-load 16 __or_1_1015
-brif 16 L1013 L1014
-label L1013
+store __or_1_1013 11
+label L1014
+load 16 __or_1_1013
+brif 16 L1011 L1012
+label L1011
 iconst 17 0
 load 18 after
 call 19 pith_cstring_release void 1 18
 ret 17
-label L1014
 label L1012
+label L1010
 iconst 20 1
 call 21 parser__peek_ahead_kind string 1 20
 strref 22 m8s89
@@ -25709,35 +25749,35 @@ iconst 25 1
 sub 23 25 24
 call 26 pith_cstring_release void 1 21
 call 27 pith_cstring_release void 1 22
-brif 23 L1018 L1019
-label L1018
+brif 23 L1016 L1017
+label L1016
 iconst 28 0
 load 29 after
 call 30 pith_cstring_release void 1 29
 ret 28
-label L1019
 label L1017
+label L1015
 load 31 after
 iconst 32 2
 call 33 parser__peek_ahead_kind string 1 32
 call 34 pith_cstring_release void 1 31
 store after 33
 iconst 35 0
-store __or_35_1020 35
+store __or_35_1018 35
 load 36 after
 strref 37 m8s26
 call 38 pith_cstring_eq bool 2 36 37
 call 39 pith_cstring_release void 1 37
-store __or_35_1020 38
-brif 38 L1021 L1020
-label L1020
+store __or_35_1018 38
+brif 38 L1019 L1018
+label L1018
 load 40 after
 strref 41 m8s9
 call 42 pith_cstring_eq bool 2 40 41
 call 43 pith_cstring_release void 1 41
-store __or_35_1020 42
-label L1021
-load 44 __or_35_1020
+store __or_35_1018 42
+label L1019
+load 44 __or_35_1018
 load 45 after
 call 46 pith_cstring_release void 1 45
 ret 44
@@ -25780,8 +25820,8 @@ store sp 21
 load 23 sp
 iconst 24 0
 gte 25 23 24
-brif 25 L1023 L1024
-label L1023
+brif 25 L1021 L1022
+label L1021
 load 26 value
 iconst 27 0
 load 28 sp
@@ -25797,9 +25837,9 @@ call 36 pith_cstring_substring string 3 32 33 35
 load 37 rest
 call 38 pith_cstring_release void 1 37
 store rest 36
-jmp L1022
-label L1024
+jmp L1020
 label L1022
+label L1020
 load 39 idx
 load 40 name
 strref 41 m8s214
@@ -25886,8 +25926,8 @@ store count 18
 strref 19 m8s9
 call 20 parser_match_tok bool 1 19
 call 21 pith_cstring_release void 1 19
-brif 20 L1026 L1027
-label L1026
+brif 20 L1024 L1025
+label L1024
 load 22 count_tok
 strref 23 m8s76
 call 24 parser_expect struct:Token 1 23
@@ -25901,8 +25941,8 @@ store count 29
 load 30 count
 iconst 31 1
 lt 32 30 31
-brif 32 L1029 L1030
-label L1029
+brif 32 L1027 L1028
+label L1027
 load 33 count_tok
 field 34 33 16 int current_line
 load 35 count_tok
@@ -25924,16 +25964,16 @@ call 50 pith_cstring_release void 1 38
 call 51 pith_cstring_release void 1 45
 iconst 52 1
 store count 52
-jmp L1028
-label L1030
+jmp L1026
 label L1028
+label L1026
 strref 53 m8s7
 call 54 parser_expect struct:Token 1 53
 call 55 pith_cstring_release void 1 53
 call 56 pith_struct_release void 1 54
-jmp L1025
-label L1027
+jmp L1023
 label L1025
+label L1023
 strref 57 m8s26
 call 58 parser_expect struct:Token 1 57
 call 59 pith_cstring_release void 1 57
@@ -25943,26 +25983,26 @@ store mutex 61
 load 62 count
 iconst 63 0
 lt 64 62 63
-brif 64 L1032 L1033
-label L1032
+brif 64 L1030 L1031
+label L1030
 load 65 line
 load 66 col
 call 67 parser_mutex_call_at int 2 65 66
 store mutex 67
-jmp L1031
-label L1033
+jmp L1029
+label L1031
 load 68 items
 call 69 pith_list_new_default list 0
 call 70 pith_list_release_handle void 1 68
 store items 69
 iconst 71 0
 store i 71
-label L1034
+label L1032
 load 72 i
 load 73 count
 lt 74 72 73
-brif 74 L1035 L1036
-label L1035
+brif 74 L1033 L1034
+label L1033
 load 75 items
 load 76 line
 load 77 col
@@ -25972,8 +26012,8 @@ load 80 i
 iconst 81 1
 add 82 80 81
 store i 82
-jmp L1034
-label L1036
+jmp L1032
+label L1034
 strref 83 m8s208
 strref 84 m8s69
 load 85 items
@@ -25983,7 +26023,7 @@ call 88 ast_add_node int 5 83 84 85 86 87
 call 89 pith_cstring_release void 1 83
 call 90 pith_cstring_release void 1 84
 store mutex 88
-label L1031
+label L1029
 load 91 mutex_children
 call 92 pith_list_new_default list 0
 load 93 mutex
@@ -26010,34 +26050,34 @@ strref 112 m8s96
 call 113 parser_expect struct:Token 1 112
 call 114 pith_cstring_release void 1 112
 call 115 pith_struct_release void 1 113
-label L1037
+label L1035
 iconst 116 0
-store __and_116_1040 116
+store __and_116_1038 116
 strref 117 m8s94
 call 118 parser_check bool 1 117
 call 119 pith_cstring_release void 1 117
 iconst 121 1
 sub 120 121 118
-store __and_116_1040 120
-brif 120 L1040 L1041
-label L1040
+store __and_116_1038 120
+brif 120 L1038 L1039
+label L1038
 strref 122 m8s0
 call 123 parser_check bool 1 122
 call 124 pith_cstring_release void 1 122
 iconst 126 1
 sub 125 126 123
-store __and_116_1040 125
-label L1041
-load 127 __and_116_1040
-brif 127 L1038 L1039
-label L1038
+store __and_116_1038 125
+label L1039
+load 127 __and_116_1038
+brif 127 L1036 L1037
+label L1036
 load 128 parser___g_current_token_position
 store before 128
 strref 129 m8s150
 call 130 parser_check bool 1 129
 call 131 pith_cstring_release void 1 129
-brif 130 L1043 L1044
-label L1043
+brif 130 L1041 L1042
+label L1041
 strref 132 m8s206
 strref 133 m8s205
 call 134 parser_guard_error_here void 2 132 133
@@ -26045,14 +26085,14 @@ call 135 pith_cstring_release void 1 132
 call 136 pith_cstring_release void 1 133
 call 137 parser_advance_token struct:Token 0
 call 138 pith_struct_release void 1 137
-jmp L1042
-label L1044
+jmp L1040
 label L1042
+label L1040
 strref 139 m8s170
 call 140 parser_check bool 1 139
 call 141 pith_cstring_release void 1 139
-brif 140 L1046 L1047
-label L1046
+brif 140 L1044 L1045
+label L1044
 call 142 parser_parse_binding int 0
 store b 142
 load 143 b
@@ -26064,28 +26104,28 @@ call 148 pith_cstring_release void 1 145
 load 149 decls
 load 150 b
 call 151 pith_list_push_value void 2 149 150
-jmp L1045
-label L1047
+jmp L1043
+label L1045
 strref 152 m8s204
 strref 153 m8s203
 call 154 parser_guard_error_here void 2 152 153
 call 155 pith_cstring_release void 1 152
 call 156 pith_cstring_release void 1 153
 call 157 parser_skip_to_line_end void 0
-label L1045
+label L1043
 load 158 parser___g_current_token_position
 load 159 before
 eq 160 158 159
-brif 160 L1049 L1050
-label L1049
+brif 160 L1047 L1048
+label L1047
 call 161 parser_advance_token struct:Token 0
 call 162 pith_struct_release void 1 161
-jmp L1048
-label L1050
+jmp L1046
 label L1048
+label L1046
 call 163 parser_skip_newlines void 0
-jmp L1037
-label L1039
+jmp L1035
+label L1037
 strref 164 m8s94
 call 165 parser_expect struct:Token 1 164
 call 166 pith_cstring_release void 1 164
@@ -26107,39 +26147,39 @@ iconst 1 0
 store n 1
 iconst 2 0
 store i 2
-label L1051
+label L1049
 load 3 i
 load 4 text
 call 5 pith_cstring_len int 1 4
 lt 6 3 5
-brif 6 L1052 L1053
-label L1052
+brif 6 L1050 L1051
+label L1050
 load 7 text
 load 8 i
 call 9 pith_cstring_byte_at int 2 7 8
 store c 9
 iconst 10 0
-store __or_10_1057 10
+store __or_10_1055 10
 load 11 c
 iconst 12 48
 lt 13 11 12
-store __or_10_1057 13
-brif 13 L1058 L1057
-label L1057
+store __or_10_1055 13
+brif 13 L1056 L1055
+label L1055
 load 14 c
 iconst 15 57
 gt 16 14 15
-store __or_10_1057 16
-label L1058
-load 17 __or_10_1057
-brif 17 L1055 L1056
-label L1055
+store __or_10_1055 16
+label L1056
+load 17 __or_10_1055
+brif 17 L1053 L1054
+label L1053
 iconst 18 0
 iconst 19 1
 sub 20 18 19
 ret 20
-label L1056
 label L1054
+label L1052
 load 21 n
 iconst 22 10
 mul 23 21 22
@@ -26152,8 +26192,8 @@ load 28 i
 iconst 29 1
 add 30 28 29
 store i 30
-jmp L1051
-label L1053
+jmp L1049
+label L1051
 load 31 n
 ret 31
 iconst 32 0
@@ -26184,44 +26224,44 @@ iconst 18 0
 ret 18
 endfunc
 func parser_skip_to_line_end 0 void
-label L1059
+label L1057
 iconst 0 0
-store __and_0_1062 0
+store __and_0_1060 0
 iconst 1 0
-store __and_1_1062 1
+store __and_1_1060 1
 strref 2 m8s93
 call 3 parser_check bool 1 2
 call 4 pith_cstring_release void 1 2
 iconst 6 1
 sub 5 6 3
-store __and_1_1062 5
-brif 5 L1062 L1063
-label L1062
+store __and_1_1060 5
+brif 5 L1060 L1061
+label L1060
 strref 7 m8s0
 call 8 parser_check bool 1 7
 call 9 pith_cstring_release void 1 7
 iconst 11 1
 sub 10 11 8
-store __and_1_1062 10
-label L1063
-load 12 __and_1_1062
-store __and_0_1062 12
-brif 12 L1064 L1065
-label L1064
+store __and_1_1060 10
+label L1061
+load 12 __and_1_1060
+store __and_0_1060 12
+brif 12 L1062 L1063
+label L1062
 strref 13 m8s94
 call 14 parser_check bool 1 13
 call 15 pith_cstring_release void 1 13
 iconst 17 1
 sub 16 17 14
-store __and_0_1062 16
-label L1065
-load 18 __and_0_1062
-brif 18 L1060 L1061
-label L1060
+store __and_0_1060 16
+label L1063
+load 18 __and_0_1060
+brif 18 L1058 L1059
+label L1058
 call 19 parser_advance_token struct:Token 0
 call 20 pith_struct_release void 1 19
-jmp L1059
-label L1061
+jmp L1057
+label L1059
 iconst 21 0
 ret 21
 endfunc
@@ -26237,25 +26277,25 @@ store is_pub 3
 strref 4 m8s150
 call 5 parser_match_tok bool 1 4
 call 6 pith_cstring_release void 1 4
-brif 5 L1067 L1068
-label L1067
+brif 5 L1065 L1066
+label L1065
 iconst 7 1
 store is_pub 7
-jmp L1066
-label L1068
+jmp L1064
 label L1066
+label L1064
 iconst 8 0
 store is_threadlocal 8
 strref 9 m8s201
 call 10 parser_match_tok bool 1 9
 call 11 pith_cstring_release void 1 9
-brif 10 L1070 L1071
-label L1070
+brif 10 L1068 L1069
+label L1068
 iconst 12 1
 store is_threadlocal 12
-jmp L1069
-label L1071
+jmp L1067
 label L1069
+label L1067
 load 13 cur_kind
 call 14 parser__cur_tok_kind string 0
 call 15 pith_cstring_release void 1 13
@@ -26266,121 +26306,121 @@ load 17 cur_kind
 strref 18 m8s158
 call 19 pith_cstring_eq bool 2 17 18
 call 20 pith_cstring_release void 1 18
-brif 19 L1073 L1074
-label L1073
+brif 19 L1071 L1072
+label L1071
 call 21 parser_parse_fn_decl int 0
 store decl 21
-jmp L1072
-label L1074
+jmp L1070
+label L1072
 load 22 cur_kind
 strref 23 m8s200
 call 24 pith_cstring_eq bool 2 22 23
 call 25 pith_cstring_release void 1 23
-brif 24 L1075 L1076
-label L1075
+brif 24 L1073 L1074
+label L1073
 call 26 parser_parse_struct_decl int 0
 store decl 26
-jmp L1072
-label L1076
+jmp L1070
+label L1074
 load 27 cur_kind
 strref 28 m8s199
 call 29 pith_cstring_eq bool 2 27 28
 call 30 pith_cstring_release void 1 28
-brif 29 L1077 L1078
-label L1077
+brif 29 L1075 L1076
+label L1075
 call 31 parser_parse_enum_decl int 0
 store decl 31
-jmp L1072
-label L1078
+jmp L1070
+label L1076
 load 32 cur_kind
 strref 33 m8s198
 call 34 pith_cstring_eq bool 2 32 33
 call 35 pith_cstring_release void 1 33
-brif 34 L1079 L1080
-label L1079
+brif 34 L1077 L1078
+label L1077
 call 36 parser_parse_interface_decl int 0
 store decl 36
-jmp L1072
-label L1080
+jmp L1070
+label L1078
 load 37 cur_kind
 strref 38 m8s197
 call 39 pith_cstring_eq bool 2 37 38
 call 40 pith_cstring_release void 1 38
-brif 39 L1081 L1082
-label L1081
+brif 39 L1079 L1080
+label L1079
 call 41 parser_parse_impl_decl int 0
 store decl 41
-jmp L1072
-label L1082
+jmp L1070
+label L1080
 load 42 cur_kind
 strref 43 m8s151
 call 44 pith_cstring_eq bool 2 42 43
 call 45 pith_cstring_release void 1 43
-brif 44 L1083 L1084
-label L1083
+brif 44 L1081 L1082
+label L1081
 call 46 parser_parse_type_alias_decl int 0
 store decl 46
-jmp L1072
-label L1084
+jmp L1070
+label L1082
 load 47 cur_kind
 strref 48 m8s196
 call 49 pith_cstring_eq bool 2 47 48
 call 50 pith_cstring_release void 1 48
-brif 49 L1085 L1086
-label L1085
+brif 49 L1083 L1084
+label L1083
 call 51 parser_parse_test_decl int 0
 store decl 51
-jmp L1072
-label L1086
+jmp L1070
+label L1084
 load 52 cur_kind
 strref 53 m8s170
 call 54 pith_cstring_eq bool 2 52 53
 call 55 pith_cstring_release void 1 53
-brif 54 L1087 L1088
-label L1087
+brif 54 L1085 L1086
+label L1085
 call 56 parser_parse_binding int 0
 store decl 56
-jmp L1072
-label L1088
+jmp L1070
+label L1086
 load 57 cur_kind
 strref 58 m8s89
 call 59 pith_cstring_eq bool 2 57 58
 call 60 pith_cstring_release void 1 58
-brif 59 L1089 L1090
-label L1089
+brif 59 L1087 L1088
+label L1087
 iconst 61 1
 call 62 parser__peek_ahead_kind string 1 61
 strref 63 m8s28
 call 64 pith_cstring_eq bool 2 62 63
 call 65 pith_cstring_release void 1 62
 call 66 pith_cstring_release void 1 63
-brif 64 L1092 L1093
-label L1092
+brif 64 L1090 L1091
+label L1090
 call 67 parser_parse_binding int 0
 store decl 67
-jmp L1091
-label L1093
+jmp L1089
+label L1091
 iconst 68 0
-store __and_68_1096 68
+store __and_68_1094 68
 iconst 69 1
 call 70 parser__peek_ahead_kind string 1 69
 strref 71 m8s26
 call 72 pith_cstring_eq bool 2 70 71
 call 73 pith_cstring_release void 1 70
 call 74 pith_cstring_release void 1 71
-store __and_68_1096 72
-brif 72 L1096 L1097
-label L1096
-call 75 parser_looks_like_binding bool 0
-store __and_68_1096 75
-label L1097
-load 76 __and_68_1096
-brif 76 L1094 L1095
+store __and_68_1094 72
+brif 72 L1094 L1095
 label L1094
+call 75 parser_looks_like_binding bool 0
+store __and_68_1094 75
+label L1095
+load 76 __and_68_1094
+brif 76 L1092 L1093
+label L1092
 call 77 parser_parse_binding int 0
 store decl 77
-jmp L1091
-label L1095
+jmp L1089
+label L1093
 strref 78 m8s195
 strref 79 m8s194
 strref 80 m8s69
@@ -26396,17 +26436,17 @@ call 89 parser_add_leaf_with_position int 2 87 88
 call 90 pith_cstring_release void 1 87
 call 91 pith_cstring_release void 1 88
 store decl 89
-label L1091
-jmp L1072
-label L1090
+label L1089
+jmp L1070
+label L1088
 load 92 cur_kind
 strref 93 m8s1
 call 95 pith_cstring_eq bool 2 92 93
 iconst 96 1
 sub 94 96 95
 call 97 pith_cstring_release void 1 93
-brif 94 L1099 L1100
-label L1099
+brif 94 L1097 L1098
+label L1097
 strref 98 m8s195
 strref 99 m8s194
 strref 100 m8s69
@@ -26414,9 +26454,9 @@ call 101 parser_parser_report_error_here void 3 98 99 100
 call 102 pith_cstring_release void 1 98
 call 103 pith_cstring_release void 1 99
 call 104 pith_cstring_release void 1 100
-jmp L1098
-label L1100
+jmp L1096
 label L1098
+label L1096
 call 105 parser_advance_token struct:Token 0
 call 106 pith_struct_release void 1 105
 strref 107 m8s123
@@ -26425,10 +26465,10 @@ call 109 parser_add_leaf_with_position int 2 107 108
 call 110 pith_cstring_release void 1 107
 call 111 pith_cstring_release void 1 108
 store decl 109
-label L1072
+label L1070
 load 112 is_threadlocal
-brif 112 L1102 L1103
-label L1102
+brif 112 L1100 L1101
+label L1100
 load 113 tl_children
 call 114 pith_list_new_default list 0
 load 115 decl
@@ -26442,12 +26482,12 @@ call 121 parser_add_node_with_position int 3 118 119 120
 call 122 pith_cstring_release void 1 118
 call 123 pith_cstring_release void 1 119
 store decl 121
-jmp L1101
-label L1103
+jmp L1099
 label L1101
+label L1099
 load 124 is_pub
-brif 124 L1105 L1106
-label L1105
+brif 124 L1103 L1104
+label L1103
 load 125 children
 call 126 pith_list_new_default list 0
 load 127 decl
@@ -26467,8 +26507,8 @@ call 139 pith_list_release_handle void 1 138
 load 140 children
 call 141 pith_list_release_handle void 1 140
 ret 133
-label L1106
 label L1104
+label L1102
 load 142 decl
 load 143 cur_kind
 call 144 pith_cstring_release void 1 143
@@ -26530,8 +26570,8 @@ store ret_node 29
 strref 30 m8s61
 call 31 parser_match_tok bool 1 30
 call 32 pith_cstring_release void 1 30
-brif 31 L1108 L1109
-label L1108
+brif 31 L1106 L1107
+label L1106
 call 33 parser_parse_type_expr int 0
 store ret 33
 load 34 ret_children
@@ -26547,9 +26587,9 @@ call 42 parser_add_node_with_position int 3 39 40 41
 call 43 pith_cstring_release void 1 39
 call 44 pith_cstring_release void 1 40
 store ret_node 42
-jmp L1107
-label L1109
+jmp L1105
 label L1107
+label L1105
 load 45 generics
 load 46 name_tok
 field 47 46 8 string value
@@ -26568,12 +26608,12 @@ iconst 57 0
 store __for_idx_42 57
 store __for_len_42 56
 store __for_iter_42 55
-label L1110
+label L1108
 load 58 __for_idx_42
 load 59 __for_len_42
 lt 60 58 59
-brif 60 L1111 L1113
-label L1111
+brif 60 L1109 L1111
+label L1109
 load 61 __for_iter_42
 load 62 __for_idx_42
 call 63 pith_list_get_value unknown 2 61 62
@@ -26581,25 +26621,25 @@ store __loopvar_42_g 63
 load 64 children
 load 65 __loopvar_42_g
 call 66 pith_list_push_value void 2 64 65
-label L1112
+label L1110
 load 67 __for_idx_42
 iconst 68 1
 add 69 67 68
 store __for_idx_42 69
-jmp L1110
-label L1113
+jmp L1108
+label L1111
 load 70 params
 call 71 pith_auto_len int 1 70
 iconst 72 0
 store __for_idx_43 72
 store __for_len_43 71
 store __for_iter_43 70
-label L1114
+label L1112
 load 73 __for_idx_43
 load 74 __for_len_43
 lt 75 73 74
-brif 75 L1115 L1117
-label L1115
+brif 75 L1113 L1115
+label L1113
 load 76 __for_iter_43
 load 77 __for_idx_43
 call 78 pith_list_get_value unknown 2 76 77
@@ -26607,35 +26647,35 @@ store __loopvar_43_p 78
 load 79 children
 load 80 __loopvar_43_p
 call 81 pith_list_push_value void 2 79 80
-label L1116
+label L1114
 load 82 __for_idx_43
 iconst 83 1
 add 84 82 83
 store __for_idx_43 84
-jmp L1114
-label L1117
+jmp L1112
+label L1115
 load 85 ret_node
 iconst 86 0
 gte 87 85 86
-brif 87 L1119 L1120
-label L1119
+brif 87 L1117 L1118
+label L1117
 load 88 children
 load 89 ret_node
 call 90 pith_list_push_value void 2 88 89
-jmp L1118
-label L1120
+jmp L1116
 label L1118
+label L1116
 load 91 holding_node
 iconst 92 0
 gte 93 91 92
-brif 93 L1122 L1123
-label L1122
+brif 93 L1120 L1121
+label L1120
 load 94 children
 load 95 holding_node
 call 96 pith_list_push_value void 2 94 95
-jmp L1121
-label L1123
+jmp L1119
 label L1121
+label L1119
 strref 97 m8s26
 call 98 parser_expect struct:Token 1 97
 call 99 pith_cstring_release void 1 97
@@ -26696,15 +26736,15 @@ func parser_parse_optional_holding 0 int
 iconst 0 0
 store paths 0
 iconst 1 0
-store __or_1_1127 1
+store __or_1_1125 1
 strref 2 m8s89
 call 3 parser_check bool 1 2
 call 4 pith_cstring_release void 1 2
 iconst 5 0
 eq 6 3 5
-store __or_1_1127 6
-brif 6 L1128 L1127
-label L1127
+store __or_1_1125 6
+brif 6 L1126 L1125
+label L1125
 call 7 parser__cur_tok_value string 0
 strref 8 m8s192
 call 10 pith_cstring_eq bool 2 7 8
@@ -26712,19 +26752,19 @@ iconst 11 1
 sub 9 11 10
 call 12 pith_cstring_release void 1 7
 call 13 pith_cstring_release void 1 8
-store __or_1_1127 9
-label L1128
-load 14 __or_1_1127
-brif 14 L1125 L1126
-label L1125
+store __or_1_1125 9
+label L1126
+load 14 __or_1_1125
+brif 14 L1123 L1124
+label L1123
 iconst 15 0
 iconst 16 1
 sub 17 15 16
 load 18 paths
 call 19 pith_list_release_handle void 1 18
 ret 17
-label L1126
 label L1124
+label L1122
 call 20 parser_advance_token struct:Token 0
 call 21 pith_struct_release void 1 20
 load 22 paths
@@ -26733,17 +26773,17 @@ call 24 parser_parse_expression int 0
 call 25 pith_list_push_value void 2 23 24
 call 26 pith_list_release_handle void 1 22
 store paths 23
-label L1129
+label L1127
 strref 27 m8s15
 call 28 parser_match_tok bool 1 27
 call 29 pith_cstring_release void 1 27
-brif 28 L1130 L1131
-label L1130
+brif 28 L1128 L1129
+label L1128
 load 30 paths
 call 31 parser_parse_expression int 0
 call 32 pith_list_push_value void 2 30 31
-jmp L1129
-label L1131
+jmp L1127
+label L1129
 strref 33 m8s192
 strref 34 m8s69
 load 35 paths
@@ -26768,15 +26808,15 @@ store extra 3
 iconst 4 0
 store gp 4
 iconst 5 0
-store __or_5_1135 5
+store __or_5_1133 5
 strref 6 m8s89
 call 7 parser_check bool 1 6
 call 8 pith_cstring_release void 1 6
 iconst 9 0
 eq 10 7 9
-store __or_5_1135 10
-brif 10 L1136 L1135
-label L1135
+store __or_5_1133 10
+brif 10 L1134 L1133
+label L1133
 call 11 parser__cur_tok_value string 0
 strref 12 m8s191
 call 14 pith_cstring_eq bool 2 11 12
@@ -26784,11 +26824,11 @@ iconst 15 1
 sub 13 15 14
 call 16 pith_cstring_release void 1 11
 call 17 pith_cstring_release void 1 12
-store __or_5_1135 13
-label L1136
-load 18 __or_5_1135
-brif 18 L1133 L1134
-label L1133
+store __or_5_1133 13
+label L1134
+load 18 __or_5_1133
+brif 18 L1131 L1132
+label L1131
 load 19 wn_tok
 call 20 pith_struct_release void 1 19
 load 21 extra
@@ -26797,16 +26837,16 @@ load 23 gp
 call 24 pith_struct_release void 1 23
 iconst 25 0
 ret 25
-label L1134
 label L1132
+label L1130
 call 26 parser_advance_token struct:Token 0
 call 27 pith_struct_release void 1 26
 iconst 28 1
 store more 28
-label L1137
+label L1135
 load 29 more
-brif 29 L1138 L1139
-label L1138
+brif 29 L1136 L1137
+label L1136
 load 30 wn_tok
 strref 31 m8s89
 call 32 parser_expect struct:Token 1 31
@@ -26830,17 +26870,17 @@ iconst 46 0
 store __for_idx_44 46
 store __for_len_44 45
 store __for_iter_44 43
-label L1140
+label L1138
 load 47 __for_idx_44
 load 48 __for_len_44
 lt 49 47 48
-brif 49 L1144 L1143
-label L1144
+brif 49 L1142 L1141
+label L1142
 load 50 __for_iter_44
 call 51 pith_auto_len int 1 50
 lt 49 47 51
-brif 49 L1141 L1143
-label L1141
+brif 49 L1139 L1141
+label L1139
 load 52 __for_iter_44
 load 53 __for_idx_44
 call 54 pith_list_get_value unknown 2 52 53
@@ -26853,36 +26893,36 @@ call 58 ast_get_node struct:Node 1 57
 call 59 pith_struct_release void 1 56
 store gp 58
 iconst 60 0
-store __and_60_1148 60
+store __and_60_1146 60
 iconst 61 0
-store __and_61_1148 61
+store __and_61_1146 61
 load 62 found
 iconst 63 0
 eq 64 62 63
-store __and_61_1148 64
-brif 64 L1148 L1149
-label L1148
+store __and_61_1146 64
+brif 64 L1146 L1147
+label L1146
 load 65 gp
 field 66 65 0 string kind
 strref 67 m8s179
 call 68 pith_cstring_eq bool 2 66 67
 call 69 pith_cstring_release void 1 67
-store __and_61_1148 68
-label L1149
-load 70 __and_61_1148
-store __and_60_1148 70
-brif 70 L1150 L1151
-label L1150
+store __and_61_1146 68
+label L1147
+load 70 __and_61_1146
+store __and_60_1146 70
+brif 70 L1148 L1149
+label L1148
 load 71 gp
 field 72 71 8 string value
 load 73 wn_tok
 field 74 73 8 string value
 call 75 pith_cstring_eq bool 2 72 74
-store __and_60_1148 75
-label L1151
-load 76 __and_60_1148
-brif 76 L1146 L1147
-label L1146
+store __and_60_1146 75
+label L1149
+load 76 __and_60_1146
+brif 76 L1144 L1145
+label L1144
 load 77 generics
 load 78 __loopvar_44_gp_i
 load 79 __loopvar_44_gp_idx
@@ -26891,23 +26931,23 @@ call 81 parser_merge_generic_param_bounds int 2 79 80
 call 82 pith_list_set_scalar_strict void 3 77 78 81
 iconst 83 1
 store found 83
-jmp L1145
-label L1147
+jmp L1143
 label L1145
-label L1142
+label L1143
+label L1140
 load 84 __for_idx_44
 iconst 85 1
 add 86 84 85
 store __for_idx_44 86
-jmp L1140
-label L1143
+jmp L1138
+label L1141
 load 87 __for_iter_44
 call 88 pith_list_release_handle void 1 87
 load 89 found
 iconst 90 0
 eq 91 89 90
-brif 91 L1153 L1154
-label L1153
+brif 91 L1151 L1152
+label L1151
 load 92 wn_tok
 field 93 92 16 int current_line
 load 94 wn_tok
@@ -26949,15 +26989,15 @@ call 129 parser_parser_report_error_at void 5 93 95 96 110 126
 call 130 pith_cstring_release void 1 96
 call 131 pith_cstring_release void 1 110
 call 132 pith_cstring_release void 1 126
-jmp L1152
-label L1154
+jmp L1150
 label L1152
+label L1150
 strref 133 m8s15
 call 134 parser_match_tok bool 1 133
 call 135 pith_cstring_release void 1 133
 store more 134
-jmp L1137
-label L1139
+jmp L1135
+label L1137
 load 136 wn_tok
 call 137 pith_struct_release void 1 136
 load 138 extra
@@ -26976,17 +27016,17 @@ call 3 parser_parse_type_expr int 0
 call 4 pith_list_push_value void 2 2 3
 call 5 pith_list_release_handle void 1 1
 store bounds 2
-label L1155
+label L1153
 strref 6 m8s63
 call 7 parser_match_tok bool 1 6
 call 8 pith_cstring_release void 1 6
-brif 7 L1156 L1157
-label L1156
+brif 7 L1154 L1155
+label L1154
 load 9 bounds
 call 10 parser_parse_type_expr int 0
 call 11 pith_list_push_value void 2 9 10
-jmp L1155
-label L1157
+jmp L1153
+label L1155
 load 12 bounds
 ret 12
 load 13 bounds
@@ -27018,12 +27058,12 @@ iconst 15 0
 store __for_idx_45 15
 store __for_len_45 14
 store __for_iter_45 12
-label L1158
+label L1156
 load 16 __for_idx_45
 load 17 __for_len_45
 lt 18 16 17
-brif 18 L1159 L1161
-label L1159
+brif 18 L1157 L1159
+label L1157
 load 19 __for_iter_45
 load 20 __for_idx_45
 call 21 pith_list_get_value unknown 2 19 20
@@ -27031,13 +27071,13 @@ store __loopvar_45_b 21
 load 22 merged
 load 23 __loopvar_45_b
 call 24 pith_list_push_value void 2 22 23
-label L1160
+label L1158
 load 25 __for_idx_45
 iconst 26 1
 add 27 25 26
 store __for_idx_45 27
-jmp L1158
-label L1161
+jmp L1156
+label L1159
 load 28 __for_iter_45
 call 29 pith_list_release_handle void 1 28
 load 30 extra
@@ -27046,12 +27086,12 @@ iconst 32 0
 store __for_idx_46 32
 store __for_len_46 31
 store __for_iter_46 30
-label L1162
+label L1160
 load 33 __for_idx_46
 load 34 __for_len_46
 lt 35 33 34
-brif 35 L1163 L1165
-label L1163
+brif 35 L1161 L1163
+label L1161
 load 36 __for_iter_46
 load 37 __for_idx_46
 call 38 pith_list_get_value unknown 2 36 37
@@ -27059,13 +27099,13 @@ store __loopvar_46_e 38
 load 39 merged
 load 40 __loopvar_46_e
 call 41 pith_list_push_value void 2 39 40
-label L1164
+label L1162
 load 42 __for_idx_46
 iconst 43 1
 add 44 42 43
 store __for_idx_46 44
-jmp L1162
-label L1165
+jmp L1160
+label L1163
 strref 45 m8s179
 load 46 gp
 field 47 46 8 string value
@@ -27105,12 +27145,12 @@ field 12 10 8 string value
 call 13 pith_cstring_retain void 1 12
 call 14 pith_struct_release void 1 10
 call 15 pith_list_push_value_owned void 2 8 12
-label L1166
+label L1164
 strref 16 m8s15
 call 17 parser_match_tok bool 1 16
 call 18 pith_cstring_release void 1 16
-brif 17 L1167 L1168
-label L1167
+brif 17 L1165 L1166
+label L1165
 load 19 names
 strref 20 m8s89
 call 21 parser_expect struct:Token 1 20
@@ -27119,8 +27159,8 @@ field 23 21 8 string value
 call 24 pith_cstring_retain void 1 23
 call 25 pith_struct_release void 1 21
 call 26 pith_list_push_value_owned void 2 19 23
-jmp L1166
-label L1168
+jmp L1164
+label L1166
 strref 27 m8s7
 call 28 parser_expect struct:Token 1 27
 call 29 pith_cstring_release void 1 27
@@ -27165,13 +27205,13 @@ store tags 12
 strref 13 m8s9
 call 14 parser_check bool 1 13
 call 15 pith_cstring_release void 1 13
-brif 14 L1170 L1171
-label L1170
+brif 14 L1168 L1169
+label L1168
 call 16 parser_parse_test_tags int 0
 store tags 16
-jmp L1169
-label L1171
+jmp L1167
 label L1169
+label L1167
 strref 17 m8s26
 call 18 parser_expect struct:Token 1 17
 call 19 pith_cstring_release void 1 17
@@ -27199,14 +27239,14 @@ call 37 pith_list_push_value void 2 30 34
 load 38 tags
 iconst 39 0
 gte 40 38 39
-brif 40 L1173 L1174
-label L1173
+brif 40 L1171 L1172
+label L1171
 load 41 children
 load 42 tags
 call 43 pith_list_push_value void 2 41 42
-jmp L1172
-label L1174
+jmp L1170
 label L1172
+label L1170
 strref 44 m8s183
 load 45 name_tok
 field 46 45 8 string value
@@ -27242,27 +27282,27 @@ call 4 parser_skip_newlines void 0
 strref 5 m8s11
 call 6 parser_check bool 1 5
 call 7 pith_cstring_release void 1 5
-brif 6 L1176 L1177
-label L1176
+brif 6 L1174 L1175
+label L1174
 load 8 params
 ret 8
-label L1177
 label L1175
+label L1173
 load 9 params
 call 10 parser_parse_param int 0
 call 11 pith_list_push_value void 2 9 10
-label L1178
+label L1176
 strref 12 m8s15
 call 13 parser_match_tok bool 1 12
 call 14 pith_cstring_release void 1 12
-brif 13 L1179 L1180
-label L1179
+brif 13 L1177 L1178
+label L1177
 call 15 parser_skip_newlines void 0
 load 16 params
 call 17 parser_parse_param int 0
 call 18 pith_list_push_value void 2 16 17
-jmp L1178
-label L1180
+jmp L1176
+label L1178
 call 19 parser_skip_newlines void 0
 load 20 params
 ret 20
@@ -27285,22 +27325,22 @@ store modifiers 4
 strref 6 m8s170
 call 7 parser_check bool 1 6
 call 8 pith_cstring_release void 1 6
-brif 7 L1182 L1183
-label L1182
+brif 7 L1180 L1181
+label L1180
 call 9 parser_advance_token struct:Token 0
 call 10 pith_struct_release void 1 9
 strref 11 m8s169
 load 12 modifiers
 call 13 pith_cstring_release void 1 12
 store modifiers 11
-jmp L1181
-label L1183
+jmp L1179
 label L1181
+label L1179
 strref 14 m8s182
 call 15 parser_check bool 1 14
 call 16 pith_cstring_release void 1 14
-brif 15 L1185 L1186
-label L1185
+brif 15 L1183 L1184
+label L1183
 call 17 parser_advance_token struct:Token 0
 call 18 pith_struct_release void 1 17
 load 19 modifiers
@@ -27310,9 +27350,9 @@ call 22 pith_cstring_release void 1 20
 load 23 modifiers
 call 24 pith_cstring_release void 1 23
 store modifiers 21
-jmp L1184
-label L1186
+jmp L1182
 label L1184
+label L1182
 load 25 name_tok
 strref 26 m8s89
 call 27 parser_expect struct:Token 1 26
@@ -27334,14 +27374,14 @@ store children 36
 strref 40 m8s41
 call 41 parser_match_tok bool 1 40
 call 42 pith_cstring_release void 1 40
-brif 41 L1188 L1189
-label L1188
+brif 41 L1186 L1187
+label L1186
 load 43 children
 call 44 parser_parse_expression int 0
 call 45 pith_list_push_value void 2 43 44
-jmp L1187
-label L1189
+jmp L1185
 label L1187
+label L1185
 strref 46 m8s180
 load 47 name_tok
 field 48 47 8 string value
@@ -27373,14 +27413,14 @@ store empty 0
 strref 1 m8s9
 call 2 parser_check bool 1 1
 call 3 pith_cstring_release void 1 1
-brif 2 L1191 L1192
-label L1191
+brif 2 L1189 L1190
+label L1189
 call 4 parser_parse_generic_params list 0
 load 5 empty
 call 6 pith_list_release_handle void 1 5
 ret 4
-label L1192
 label L1190
+label L1188
 load 7 empty
 call 8 pith_list_new_default list 0
 call 9 pith_list_release_handle void 1 7
@@ -27404,17 +27444,17 @@ store params 4
 load 6 params
 call 7 parser_parse_generic_param int 0
 call 8 pith_list_push_value void 2 6 7
-label L1193
+label L1191
 strref 9 m8s15
 call 10 parser_match_tok bool 1 9
 call 11 pith_cstring_release void 1 9
-brif 10 L1194 L1195
-label L1194
+brif 10 L1192 L1193
+label L1192
 load 12 params
 call 13 parser_parse_generic_param int 0
 call 14 pith_list_push_value void 2 12 13
-jmp L1193
-label L1195
+jmp L1191
+label L1193
 strref 15 m8s7
 call 16 parser_expect struct:Token 1 15
 call 17 pith_cstring_release void 1 15
@@ -27440,8 +27480,8 @@ store name_tok 4
 strref 7 m8s26
 call 8 parser_match_tok bool 1 7
 call 9 pith_cstring_release void 1 7
-brif 8 L1197 L1198
-label L1197
+brif 8 L1195 L1196
+label L1195
 strref 10 m8s179
 load 11 name_tok
 field 12 11 8 string value
@@ -27456,8 +27496,8 @@ call 20 pith_struct_release void 1 19
 load 21 empty
 call 22 pith_list_release_handle void 1 21
 ret 15
-label L1198
 label L1196
+label L1194
 load 23 empty
 call 24 pith_list_new_default list 0
 call 25 pith_list_release_handle void 1 23
@@ -27525,12 +27565,12 @@ iconst 31 0
 store __for_idx_47 31
 store __for_len_47 30
 store __for_iter_47 29
-label L1199
+label L1197
 load 32 __for_idx_47
 load 33 __for_len_47
 lt 34 32 33
-brif 34 L1200 L1202
-label L1200
+brif 34 L1198 L1200
+label L1198
 load 35 __for_iter_47
 load 36 __for_idx_47
 call 37 pith_list_get_value unknown 2 35 36
@@ -27538,57 +27578,57 @@ store __loopvar_47_g 37
 load 38 children
 load 39 __loopvar_47_g
 call 40 pith_list_push_value void 2 38 39
-label L1201
+label L1199
 load 41 __for_idx_47
 iconst 42 1
 add 43 41 42
 store __for_idx_47 43
-jmp L1199
-label L1202
+jmp L1197
+label L1200
 load 44 guard_fields
 call 45 pith_list_new_default list 0
 call 46 pith_list_release_handle void 1 44
 store guard_fields 45
-label L1203
+label L1201
 iconst 47 0
-store __and_47_1206 47
+store __and_47_1204 47
 strref 48 m8s94
 call 49 parser_check bool 1 48
 call 50 pith_cstring_release void 1 48
 iconst 52 1
 sub 51 52 49
-store __and_47_1206 51
-brif 51 L1206 L1207
-label L1206
+store __and_47_1204 51
+brif 51 L1204 L1205
+label L1204
 strref 53 m8s0
 call 54 parser_check bool 1 53
 call 55 pith_cstring_release void 1 53
 iconst 57 1
 sub 56 57 54
-store __and_47_1206 56
-label L1207
-load 58 __and_47_1206
-brif 58 L1204 L1205
-label L1204
+store __and_47_1204 56
+label L1205
+load 58 __and_47_1204
+brif 58 L1202 L1203
+label L1202
 load 59 parser___g_current_token_position
 store before 59
 call 60 parser_at_guard_block bool 0
-brif 60 L1209 L1210
-label L1209
+brif 60 L1207 L1208
+label L1207
 load 61 children
 load 62 guard_fields
 call 63 parser_parse_struct_guard_block void 2 61 62
-jmp L1208
-label L1210
+jmp L1206
+label L1208
 load 64 children
 call 65 parser_parse_struct_field int 0
 call 66 pith_list_push_value void 2 64 65
-label L1208
+label L1206
 load 67 parser___g_current_token_position
 load 68 before
 eq 69 67 68
-brif 69 L1212 L1213
-label L1212
+brif 69 L1210 L1211
+label L1210
 load 70 children
 strref 71 m8s123
 strref 72 m8s178
@@ -27598,12 +27638,12 @@ call 75 pith_cstring_release void 1 72
 call 76 pith_list_push_value void 2 70 73
 call 77 parser_advance_token struct:Token 0
 call 78 pith_struct_release void 1 77
-jmp L1211
-label L1213
+jmp L1209
 label L1211
+label L1209
 call 79 parser_skip_newlines void 0
-jmp L1203
-label L1205
+jmp L1201
+label L1203
 strref 80 m8s94
 call 81 parser_expect struct:Token 1 80
 call 82 pith_cstring_release void 1 80
@@ -27614,12 +27654,12 @@ iconst 86 0
 store __for_idx_48 86
 store __for_len_48 85
 store __for_iter_48 84
-label L1214
+label L1212
 load 87 __for_idx_48
 load 88 __for_len_48
 lt 89 87 88
-brif 89 L1215 L1217
-label L1215
+brif 89 L1213 L1215
+label L1213
 load 90 __for_iter_48
 load 91 __for_idx_48
 call 92 pith_list_get_value unknown 2 90 91
@@ -27627,13 +27667,13 @@ store __loopvar_48_g 92
 load 93 children
 load 94 __loopvar_48_g
 call 95 pith_list_push_value void 2 93 94
-label L1216
+label L1214
 load 96 __for_idx_48
 iconst 97 1
 add 98 96 97
 store __for_idx_48 98
-jmp L1214
-label L1217
+jmp L1212
+label L1215
 strref 99 m8s177
 load 100 name_tok
 field 101 100 8 string value
@@ -27686,8 +27726,8 @@ store col 14
 strref 15 m8s9
 call 16 parser_check bool 1 15
 call 17 pith_cstring_release void 1 15
-brif 16 L1219 L1220
-label L1219
+brif 16 L1217 L1218
+label L1217
 strref 18 m8s176
 strref 19 m8s175
 load 20 name_tok
@@ -27701,50 +27741,50 @@ call 27 pith_cstring_release void 1 24
 call 28 parser_guard_error_here void 2 18 25
 call 29 pith_cstring_release void 1 18
 call 30 pith_cstring_release void 1 25
-label L1221
+label L1219
 iconst 31 0
-store __and_31_1224 31
+store __and_31_1222 31
 iconst 32 0
-store __and_32_1224 32
+store __and_32_1222 32
 strref 33 m8s7
 call 34 parser_check bool 1 33
 call 35 pith_cstring_release void 1 33
 iconst 37 1
 sub 36 37 34
-store __and_32_1224 36
-brif 36 L1224 L1225
-label L1224
+store __and_32_1222 36
+brif 36 L1222 L1223
+label L1222
 strref 38 m8s93
 call 39 parser_check bool 1 38
 call 40 pith_cstring_release void 1 38
 iconst 42 1
 sub 41 42 39
-store __and_32_1224 41
-label L1225
-load 43 __and_32_1224
-store __and_31_1224 43
-brif 43 L1226 L1227
-label L1226
+store __and_32_1222 41
+label L1223
+load 43 __and_32_1222
+store __and_31_1222 43
+brif 43 L1224 L1225
+label L1224
 strref 44 m8s0
 call 45 parser_check bool 1 44
 call 46 pith_cstring_release void 1 44
 iconst 48 1
 sub 47 48 45
-store __and_31_1224 47
-label L1227
-load 49 __and_31_1224
-brif 49 L1222 L1223
-label L1222
+store __and_31_1222 47
+label L1225
+load 49 __and_31_1222
+brif 49 L1220 L1221
+label L1220
 call 50 parser_advance_token struct:Token 0
 call 51 pith_struct_release void 1 50
-jmp L1221
-label L1223
+jmp L1219
+label L1221
 strref 52 m8s7
 call 53 parser_match_tok bool 1 52
 call 54 pith_cstring_release void 1 52
-jmp L1218
-label L1220
+jmp L1216
 label L1218
+label L1216
 strref 55 m8s26
 call 56 parser_expect struct:Token 1 55
 call 57 pith_cstring_release void 1 55
@@ -27785,27 +27825,27 @@ strref 90 m8s96
 call 91 parser_expect struct:Token 1 90
 call 92 pith_cstring_release void 1 90
 call 93 pith_struct_release void 1 91
-label L1228
+label L1226
 iconst 94 0
-store __and_94_1231 94
+store __and_94_1229 94
 strref 95 m8s94
 call 96 parser_check bool 1 95
 call 97 pith_cstring_release void 1 95
 iconst 99 1
 sub 98 99 96
-store __and_94_1231 98
-brif 98 L1231 L1232
-label L1231
+store __and_94_1229 98
+brif 98 L1229 L1230
+label L1229
 strref 100 m8s0
 call 101 parser_check bool 1 100
 call 102 pith_cstring_release void 1 100
 iconst 104 1
 sub 103 104 101
-store __and_94_1231 103
-label L1232
-load 105 __and_94_1231
-brif 105 L1229 L1230
-label L1229
+store __and_94_1229 103
+label L1230
+load 105 __and_94_1229
+brif 105 L1227 L1228
+label L1227
 load 106 parser___g_current_token_position
 store before 106
 call 107 parser_parse_struct_field int 0
@@ -27822,16 +27862,16 @@ call 116 pith_list_push_value void 2 114 115
 load 117 parser___g_current_token_position
 load 118 before
 eq 119 117 118
-brif 119 L1234 L1235
-label L1234
+brif 119 L1232 L1233
+label L1232
 call 120 parser_advance_token struct:Token 0
 call 121 pith_struct_release void 1 120
-jmp L1233
-label L1235
+jmp L1231
 label L1233
+label L1231
 call 122 parser_skip_newlines void 0
-jmp L1228
-label L1230
+jmp L1226
+label L1228
 strref 123 m8s94
 call 124 parser_expect struct:Token 1 123
 call 125 pith_cstring_release void 1 123
@@ -27857,20 +27897,20 @@ store modifiers 4
 strref 6 m8s150
 call 7 parser_match_tok bool 1 6
 call 8 pith_cstring_release void 1 6
-brif 7 L1237 L1238
-label L1237
+brif 7 L1235 L1236
+label L1235
 strref 9 m8s171
 load 10 modifiers
 call 11 pith_cstring_release void 1 10
 store modifiers 9
-jmp L1236
-label L1238
+jmp L1234
 label L1236
+label L1234
 strref 12 m8s170
 call 13 parser_match_tok bool 1 12
 call 14 pith_cstring_release void 1 12
-brif 13 L1240 L1241
-label L1240
+brif 13 L1238 L1239
+label L1238
 load 15 modifiers
 strref 16 m8s169
 concat 17 15 16
@@ -27878,14 +27918,14 @@ call 18 pith_cstring_release void 1 16
 load 19 modifiers
 call 20 pith_cstring_release void 1 19
 store modifiers 17
-jmp L1239
-label L1241
+jmp L1237
 label L1239
+label L1237
 strref 21 m8s168
 call 22 parser_match_tok bool 1 21
 call 23 pith_cstring_release void 1 21
-brif 22 L1243 L1244
-label L1243
+brif 22 L1241 L1242
+label L1241
 load 24 modifiers
 strref 25 m8s167
 concat 26 24 25
@@ -27893,57 +27933,57 @@ call 27 pith_cstring_release void 1 25
 load 28 modifiers
 call 29 pith_cstring_release void 1 28
 store modifiers 26
-jmp L1242
-label L1244
+jmp L1240
 label L1242
+label L1240
 iconst 30 0
-store __and_30_1248 30
+store __and_30_1246 30
 iconst 31 0
-store __and_31_1248 31
+store __and_31_1246 31
 iconst 32 0
-store __and_32_1248 32
+store __and_32_1246 32
 call 33 parser__cur_tok_kind string 0
 strref 34 m8s89
 call 35 pith_cstring_eq bool 2 33 34
 call 36 pith_cstring_release void 1 33
 call 37 pith_cstring_release void 1 34
-store __and_32_1248 35
-brif 35 L1248 L1249
-label L1248
+store __and_32_1246 35
+brif 35 L1246 L1247
+label L1246
 call 38 parser__cur_tok_value string 0
 strref 39 m8s166
 call 40 pith_cstring_eq bool 2 38 39
 call 41 pith_cstring_release void 1 38
 call 42 pith_cstring_release void 1 39
-store __and_32_1248 40
-label L1249
-load 43 __and_32_1248
-store __and_31_1248 43
-brif 43 L1250 L1251
-label L1250
+store __and_32_1246 40
+label L1247
+load 43 __and_32_1246
+store __and_31_1246 43
+brif 43 L1248 L1249
+label L1248
 iconst 44 1
 call 45 parser__peek_ahead_kind string 1 44
 strref 46 m8s89
 call 47 pith_cstring_eq bool 2 45 46
 call 48 pith_cstring_release void 1 45
 call 49 pith_cstring_release void 1 46
-store __and_31_1248 47
-label L1251
-load 50 __and_31_1248
-store __and_30_1248 50
-brif 50 L1252 L1253
-label L1252
+store __and_31_1246 47
+label L1249
+load 50 __and_31_1246
+store __and_30_1246 50
+brif 50 L1250 L1251
+label L1250
 iconst 51 2
 call 52 parser__peek_ahead_kind string 1 51
 strref 53 m8s26
 call 54 pith_cstring_eq bool 2 52 53
 call 55 pith_cstring_release void 1 52
 call 56 pith_cstring_release void 1 53
-store __and_30_1248 54
-label L1253
-load 57 __and_30_1248
-brif 57 L1246 L1247
-label L1246
+store __and_30_1246 54
+label L1251
+load 57 __and_30_1246
+brif 57 L1244 L1245
+label L1244
 call 58 parser_advance_token struct:Token 0
 call 59 pith_struct_release void 1 58
 load 60 modifiers
@@ -27953,9 +27993,9 @@ call 63 pith_cstring_release void 1 61
 load 64 modifiers
 call 65 pith_cstring_release void 1 64
 store modifiers 62
-jmp L1245
-label L1247
+jmp L1243
 label L1245
+label L1243
 load 66 name_tok
 strref 67 m8s89
 call 68 parser_expect struct:Token 1 67
@@ -27977,14 +28017,14 @@ store children 77
 strref 81 m8s41
 call 82 parser_match_tok bool 1 81
 call 83 pith_cstring_release void 1 81
-brif 82 L1255 L1256
-label L1255
+brif 82 L1253 L1254
+label L1253
 load 84 children
 call 85 parser_parse_expression int 0
 call 86 pith_list_push_value void 2 84 85
-jmp L1254
-label L1256
+jmp L1252
 label L1254
+label L1252
 strref 87 m8s164
 load 88 name_tok
 field 89 88 8 string value
@@ -28051,12 +28091,12 @@ iconst 30 0
 store __for_idx_49 30
 store __for_len_49 29
 store __for_iter_49 28
-label L1257
+label L1255
 load 31 __for_idx_49
 load 32 __for_len_49
 lt 33 31 32
-brif 33 L1258 L1260
-label L1258
+brif 33 L1256 L1258
+label L1256
 load 34 __for_iter_49
 load 35 __for_idx_49
 call 36 pith_list_get_value unknown 2 34 35
@@ -28064,34 +28104,34 @@ store __loopvar_49_g 36
 load 37 children
 load 38 __loopvar_49_g
 call 39 pith_list_push_value void 2 37 38
-label L1259
+label L1257
 load 40 __for_idx_49
 iconst 41 1
 add 42 40 41
 store __for_idx_49 42
-jmp L1257
-label L1260
-label L1261
+jmp L1255
+label L1258
+label L1259
 iconst 43 0
-store __and_43_1264 43
+store __and_43_1262 43
 strref 44 m8s94
 call 45 parser_check bool 1 44
 call 46 pith_cstring_release void 1 44
 iconst 48 1
 sub 47 48 45
-store __and_43_1264 47
-brif 47 L1264 L1265
-label L1264
+store __and_43_1262 47
+brif 47 L1262 L1263
+label L1262
 strref 49 m8s0
 call 50 parser_check bool 1 49
 call 51 pith_cstring_release void 1 49
 iconst 53 1
 sub 52 53 50
-store __and_43_1264 52
-label L1265
-load 54 __and_43_1264
-brif 54 L1262 L1263
-label L1262
+store __and_43_1262 52
+label L1263
+load 54 __and_43_1262
+brif 54 L1260 L1261
+label L1260
 load 55 parser___g_current_token_position
 store before 55
 load 56 children
@@ -28100,8 +28140,8 @@ call 58 pith_list_push_value void 2 56 57
 load 59 parser___g_current_token_position
 load 60 before
 eq 61 59 60
-brif 61 L1267 L1268
-label L1267
+brif 61 L1265 L1266
+label L1265
 load 62 children
 strref 63 m8s123
 strref 64 m8s163
@@ -28111,12 +28151,12 @@ call 67 pith_cstring_release void 1 64
 call 68 pith_list_push_value void 2 62 65
 call 69 parser_advance_token struct:Token 0
 call 70 pith_struct_release void 1 69
-jmp L1266
-label L1268
+jmp L1264
 label L1266
+label L1264
 call 71 parser_skip_newlines void 0
-jmp L1261
-label L1263
+jmp L1259
+label L1261
 strref 72 m8s94
 call 73 parser_expect struct:Token 1 72
 call 74 pith_cstring_release void 1 72
@@ -28163,29 +28203,29 @@ store fields 8
 strref 10 m8s13
 call 11 parser_match_tok bool 1 10
 call 12 pith_cstring_release void 1 10
-brif 11 L1270 L1271
-label L1270
+brif 11 L1268 L1269
+label L1268
 load 13 fields
 call 14 parser_parse_type_expr int 0
 call 15 pith_list_push_value void 2 13 14
-label L1272
+label L1270
 strref 16 m8s15
 call 17 parser_match_tok bool 1 16
 call 18 pith_cstring_release void 1 16
-brif 17 L1273 L1274
-label L1273
+brif 17 L1271 L1272
+label L1271
 load 19 fields
 call 20 parser_parse_type_expr int 0
 call 21 pith_list_push_value void 2 19 20
-jmp L1272
-label L1274
+jmp L1270
+label L1272
 strref 22 m8s11
 call 23 parser_expect struct:Token 1 22
 call 24 pith_cstring_release void 1 22
 call 25 pith_struct_release void 1 23
-jmp L1269
-label L1271
+jmp L1267
 label L1269
+label L1267
 strref 26 m8s161
 load 27 name_tok
 field 28 27 8 string value
@@ -28247,12 +28287,12 @@ iconst 30 0
 store __for_idx_50 30
 store __for_len_50 29
 store __for_iter_50 28
-label L1275
+label L1273
 load 31 __for_idx_50
 load 32 __for_len_50
 lt 33 31 32
-brif 33 L1276 L1278
-label L1276
+brif 33 L1274 L1276
+label L1274
 load 34 __for_iter_50
 load 35 __for_idx_50
 call 36 pith_list_get_value unknown 2 34 35
@@ -28260,55 +28300,55 @@ store __loopvar_50_g 36
 load 37 children
 load 38 __loopvar_50_g
 call 39 pith_list_push_value void 2 37 38
-label L1277
+label L1275
 load 40 __for_idx_50
 iconst 41 1
 add 42 40 41
 store __for_idx_50 42
-jmp L1275
-label L1278
-label L1279
+jmp L1273
+label L1276
+label L1277
 iconst 43 0
-store __and_43_1282 43
+store __and_43_1280 43
 strref 44 m8s94
 call 45 parser_check bool 1 44
 call 46 pith_cstring_release void 1 44
 iconst 48 1
 sub 47 48 45
-store __and_43_1282 47
-brif 47 L1282 L1283
-label L1282
+store __and_43_1280 47
+brif 47 L1280 L1281
+label L1280
 strref 49 m8s0
 call 50 parser_check bool 1 49
 call 51 pith_cstring_release void 1 49
 iconst 53 1
 sub 52 53 50
-store __and_43_1282 52
-label L1283
-load 54 __and_43_1282
-brif 54 L1280 L1281
-label L1280
+store __and_43_1280 52
+label L1281
+load 54 __and_43_1280
+brif 54 L1278 L1279
+label L1278
 load 55 parser___g_current_token_position
 store before 55
 strref 56 m8s151
 call 57 parser_check bool 1 56
 call 58 pith_cstring_release void 1 56
-brif 57 L1285 L1286
-label L1285
+brif 57 L1283 L1284
+label L1283
 load 59 children
 call 60 parser_parse_assoc_type_decl int 0
 call 61 pith_list_push_value void 2 59 60
-jmp L1284
-label L1286
+jmp L1282
+label L1284
 load 62 children
 call 63 parser_parse_fn_sig int 0
 call 64 pith_list_push_value void 2 62 63
-label L1284
+label L1282
 load 65 parser___g_current_token_position
 load 66 before
 eq 67 65 66
-brif 67 L1288 L1289
-label L1288
+brif 67 L1286 L1287
+label L1286
 load 68 children
 strref 69 m8s123
 strref 70 m8s160
@@ -28318,12 +28358,12 @@ call 73 pith_cstring_release void 1 70
 call 74 pith_list_push_value void 2 68 71
 call 75 parser_advance_token struct:Token 0
 call 76 pith_struct_release void 1 75
-jmp L1287
-label L1289
+jmp L1285
 label L1287
+label L1285
 call 77 parser_skip_newlines void 0
-jmp L1279
-label L1281
+jmp L1277
+label L1279
 strref 78 m8s94
 call 79 parser_expect struct:Token 1 78
 call 80 pith_cstring_release void 1 78
@@ -28398,8 +28438,8 @@ store ret_node 31
 strref 32 m8s61
 call 33 parser_match_tok bool 1 32
 call 34 pith_cstring_release void 1 32
-brif 33 L1291 L1292
-label L1291
+brif 33 L1289 L1290
+label L1289
 call 35 parser_parse_type_expr int 0
 store ret 35
 load 36 ret_children
@@ -28415,9 +28455,9 @@ call 44 parser_add_node_with_position int 3 41 42 43
 call 45 pith_cstring_release void 1 41
 call 46 pith_cstring_release void 1 42
 store ret_node 44
-jmp L1290
-label L1292
+jmp L1288
 label L1290
+label L1288
 load 47 generics
 load 48 name_tok
 field 49 48 8 string value
@@ -28434,12 +28474,12 @@ iconst 58 0
 store __for_idx_51 58
 store __for_len_51 57
 store __for_iter_51 56
-label L1293
+label L1291
 load 59 __for_idx_51
 load 60 __for_len_51
 lt 61 59 60
-brif 61 L1294 L1296
-label L1294
+brif 61 L1292 L1294
+label L1292
 load 62 __for_iter_51
 load 63 __for_idx_51
 call 64 pith_list_get_value unknown 2 62 63
@@ -28447,25 +28487,25 @@ store __loopvar_51_g 64
 load 65 children
 load 66 __loopvar_51_g
 call 67 pith_list_push_value void 2 65 66
-label L1295
+label L1293
 load 68 __for_idx_51
 iconst 69 1
 add 70 68 69
 store __for_idx_51 70
-jmp L1293
-label L1296
+jmp L1291
+label L1294
 load 71 params
 call 72 pith_auto_len int 1 71
 iconst 73 0
 store __for_idx_52 73
 store __for_len_52 72
 store __for_iter_52 71
-label L1297
+label L1295
 load 74 __for_idx_52
 load 75 __for_len_52
 lt 76 74 75
-brif 76 L1298 L1300
-label L1298
+brif 76 L1296 L1298
+label L1296
 load 77 __for_iter_52
 load 78 __for_idx_52
 call 79 pith_list_get_value unknown 2 77 78
@@ -28473,29 +28513,29 @@ store __loopvar_52_p 79
 load 80 children
 load 81 __loopvar_52_p
 call 82 pith_list_push_value void 2 80 81
-label L1299
+label L1297
 load 83 __for_idx_52
 iconst 84 1
 add 85 83 84
 store __for_idx_52 85
-jmp L1297
-label L1300
+jmp L1295
+label L1298
 load 86 ret_node
 iconst 87 0
 gte 88 86 87
-brif 88 L1302 L1303
-label L1302
+brif 88 L1300 L1301
+label L1300
 load 89 children
 load 90 ret_node
 call 91 pith_list_push_value void 2 89 90
-jmp L1301
-label L1303
+jmp L1299
 label L1301
+label L1299
 strref 92 m8s26
 call 93 parser_match_tok bool 1 92
 call 94 pith_cstring_release void 1 92
-brif 93 L1305 L1306
-label L1305
+brif 93 L1303 L1304
+label L1303
 call 95 parser_parse_block int 0
 store body 95
 load 96 body_children
@@ -28533,8 +28573,8 @@ call 126 pith_list_release_handle void 1 125
 load 127 body_children
 call 128 pith_list_release_handle void 1 127
 ret 114
-label L1306
 label L1304
+label L1302
 strref 129 m8s154
 load 130 name_tok
 field 131 130 8 string value
@@ -28591,8 +28631,8 @@ store children 7
 strref 11 m8s153
 call 12 parser_match_tok bool 1 11
 call 13 pith_cstring_release void 1 11
-brif 12 L1308 L1309
-label L1308
+brif 12 L1306 L1307
+label L1306
 call 14 parser_parse_type_expr int 0
 store iface 14
 load 15 for_children
@@ -28609,9 +28649,9 @@ call 24 parser_add_node_with_position int 3 21 22 23
 call 25 pith_cstring_release void 1 21
 call 26 pith_cstring_release void 1 22
 call 27 pith_list_push_value void 2 20 24
-jmp L1307
-label L1309
+jmp L1305
 label L1307
+label L1305
 strref 28 m8s26
 call 29 parser_expect struct:Token 1 28
 call 30 pith_cstring_release void 1 28
@@ -28624,51 +28664,51 @@ strref 36 m8s96
 call 37 parser_expect struct:Token 1 36
 call 38 pith_cstring_release void 1 36
 call 39 pith_struct_release void 1 37
-label L1310
+label L1308
 iconst 40 0
-store __and_40_1313 40
+store __and_40_1311 40
 strref 41 m8s94
 call 42 parser_check bool 1 41
 call 43 pith_cstring_release void 1 41
 iconst 45 1
 sub 44 45 42
-store __and_40_1313 44
-brif 44 L1313 L1314
-label L1313
+store __and_40_1311 44
+brif 44 L1311 L1312
+label L1311
 strref 46 m8s0
 call 47 parser_check bool 1 46
 call 48 pith_cstring_release void 1 46
 iconst 50 1
 sub 49 50 47
-store __and_40_1313 49
-label L1314
-load 51 __and_40_1313
-brif 51 L1311 L1312
-label L1311
+store __and_40_1311 49
+label L1312
+load 51 __and_40_1311
+brif 51 L1309 L1310
+label L1309
 strref 52 m8s151
 call 53 parser_check bool 1 52
 call 54 pith_cstring_release void 1 52
-brif 53 L1316 L1317
-label L1316
+brif 53 L1314 L1315
+label L1314
 load 55 children
 call 56 parser_parse_assoc_type_bind int 0
 call 57 pith_list_push_value void 2 55 56
 call 58 parser_skip_newlines void 0
-jmp L1310
-label L1317
+jmp L1308
 label L1315
+label L1313
 iconst 59 0
 store method_pub 59
 strref 60 m8s150
 call 61 parser_match_tok bool 1 60
 call 62 pith_cstring_release void 1 60
-brif 61 L1319 L1320
-label L1319
+brif 61 L1317 L1318
+label L1317
 iconst 63 1
 store method_pub 63
-jmp L1318
-label L1320
+jmp L1316
 label L1318
+label L1316
 load 64 parser___g_current_token_position
 store before 64
 call 65 parser_parse_fn_decl int 0
@@ -28676,8 +28716,8 @@ store method 65
 load 66 parser___g_current_token_position
 load 67 before
 eq 68 66 67
-brif 68 L1322 L1323
-label L1322
+brif 68 L1320 L1321
+label L1320
 load 69 children
 strref 70 m8s123
 strref 71 m8s149
@@ -28688,12 +28728,12 @@ call 75 pith_list_push_value void 2 69 72
 call 76 parser_advance_token struct:Token 0
 call 77 pith_struct_release void 1 76
 call 78 parser_skip_newlines void 0
-jmp L1310
-label L1323
+jmp L1308
 label L1321
+label L1319
 load 79 method_pub
-brif 79 L1325 L1326
-label L1325
+brif 79 L1323 L1324
+label L1323
 load 80 pub_children
 call 81 pith_list_new_default list 0
 load 82 method
@@ -28708,15 +28748,15 @@ call 89 parser_add_node_with_position int 3 86 87 88
 call 90 pith_cstring_release void 1 86
 call 91 pith_cstring_release void 1 87
 call 92 pith_list_push_value void 2 85 89
-jmp L1324
-label L1326
+jmp L1322
+label L1324
 load 93 children
 load 94 method
 call 95 pith_list_push_value void 2 93 94
-label L1324
+label L1322
 call 96 parser_skip_newlines void 0
-jmp L1310
-label L1312
+jmp L1308
+label L1310
 strref 97 m8s94
 call 98 parser_expect struct:Token 1 97
 call 99 pith_cstring_release void 1 97
@@ -28780,12 +28820,12 @@ iconst 25 0
 store __for_idx_53 25
 store __for_len_53 24
 store __for_iter_53 23
-label L1327
+label L1325
 load 26 __for_idx_53
 load 27 __for_len_53
 lt 28 26 27
-brif 28 L1328 L1330
-label L1328
+brif 28 L1326 L1328
+label L1326
 load 29 __for_iter_53
 load 30 __for_idx_53
 call 31 pith_list_get_value unknown 2 29 30
@@ -28793,13 +28833,13 @@ store __loopvar_53_g 31
 load 32 children
 load 33 __loopvar_53_g
 call 34 pith_list_push_value void 2 32 33
-label L1329
+label L1327
 load 35 __for_idx_53
 iconst 36 1
 add 37 35 36
 store __for_idx_53 37
-jmp L1327
-label L1330
+jmp L1325
+label L1328
 strref 38 m8s146
 load 39 name_tok
 field 40 39 8 string value

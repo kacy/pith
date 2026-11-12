@@ -717,11 +717,21 @@ fn scan_string():
 
     emit("string_start", string_start_value)
 
+# what interp_escape_kind says about one character of an interpolation
+pub INTERP_PLAIN := 0
+pub INTERP_ESCAPE_COLLAPSED := 1
+pub INTERP_ESCAPE_KEPT := 2
+
 ## the raw text between {} keeps the backslash-escapes it needed to sit
 ## inside the surrounding string literal: `\"` for a string argument's
 ## quotes and `\\` for a literal backslash. undo those so the expression
 ## re-lexes as real code — without this, `f(\"x\", 1)` re-lexes as a
 ## single string argument and the call looks like it has one argument.
+##
+## a string argument may also be written with bare quotes, `{m["key"]}`.
+## inside one of those the escapes belong to the nested literal and stay as
+## written: `{s.index_of("\"")}` searches for a quote. collapsing them
+## there closed the literal early and left an empty string.
 ##
 ## the parser calls this, rather than the scan below doing it, because
 ## the parser is what maps a fragment token's offset back to the source:
@@ -730,20 +740,36 @@ fn scan_string():
 pub fn unescape_interp_expr(text: String) -> String:
     mut out := ""
     mut i := 0
+    mut in_literal := false
     while i < text.len():
-        ch := text[i]
-        if ord(ch) == 92 and i + 1 < text.len():
-            nxt := text[i + 1]
-            if ord(nxt) == 34 or ord(nxt) == 92:
-                out = out + nxt
-                i = i + 2
-            else:
-                out = out + ch
-                i = i + 1
+        kind := interp_escape_kind(text, i, in_literal)
+        if kind == INTERP_ESCAPE_COLLAPSED:
+            out = out + text[i + 1]
+            i = i + 2
+        elif kind == INTERP_ESCAPE_KEPT:
+            out = out + text[i] + text[i + 1]
+            i = i + 2
         else:
-            out = out + ch
+            if ord(text[i]) == 34:
+                in_literal = not in_literal
+            out = out + text[i]
             i = i + 1
     return out
+
+## what the character at `i` of an interpolation's raw text is to the
+## unescaper: a plain character, a `\"` or `\\` that collapses to its second
+## character, or an escape inside a bare-quoted literal that is kept whole.
+## `in_literal` is true between a bare quote and the one that closes it; the
+## caller flips it on every plain quote.
+pub fn interp_escape_kind(text: String, i: Int, in_literal: Bool) -> Int:
+    if ord(text[i]) != 92 or i + 1 >= text.len():
+        return INTERP_PLAIN
+    if in_literal:
+        return INTERP_ESCAPE_KEPT
+    nxt := ord(text[i + 1])
+    if nxt == 34 or nxt == 92:
+        return INTERP_ESCAPE_COLLAPSED
+    return INTERP_PLAIN
 
 # queue one piece of an interpolated string with the source span it was
 # cut from: `line`/`column` are 1-based and name its first character.

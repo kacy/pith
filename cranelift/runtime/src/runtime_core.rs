@@ -1355,6 +1355,44 @@ mod tests {
     }
 
     #[test]
+    fn a_join_writes_its_int_parts_in_decimal() {
+        unsafe {
+            let a = crate::pith_copy_bytes_to_cstring(b"id=");
+            let b = crate::pith_copy_bytes_to_cstring(b";");
+            let null = std::ptr::null();
+            let int = |n: i64| n as *const i8;
+            let ints = |bits: i64| bits << JOIN_INT_SHIFT;
+            for n in [0, 7, 10, 99, 100, -1, -10, 1234567890123, i64::MAX, i64::MIN] {
+                assert_eq!(int_text_len(n), n.to_string().len());
+                let joined = pith_concat_cstr_many(3 | ints(0b010), a, int(n), b, null, null, null, null, null);
+                assert_eq!(text(joined), format!("id={};", n));
+                assert_eq!(cstring_header_len(joined), Some(n.to_string().len() as i64 + 4));
+                pith_cstring_release(joined);
+            }
+            // an int part of 0 is text, where a null string part is empty
+            let zero = pith_concat_cstr_many(1 | ints(0b1), int(0), null, null, null, null, null, null, null);
+            assert_eq!(text(zero), "0");
+            // a bit past the count is ignored
+            let one = pith_concat_cstr_many(1 | ints(0b10), a, int(5), null, null, null, null, null, null);
+            assert_eq!(text(one), "id=");
+
+            // appended in place, and through the copy a shared base takes
+            let s = pith_copy_bytes_to_cstring(b"n");
+            let grown = pith_cstring_append_many(2 | ints(0b01), s, int(-42), b, null, null, null, null, null);
+            assert_eq!(grown as *const i8, s as *const i8, "still inside the size class");
+            assert_eq!(text(grown), "n-42;");
+            pith_cstring_retain(grown);
+            let copy = pith_cstring_append_many(2 | ints(0b10), grown, b, int(8), null, null, null, null, null);
+            assert_ne!(copy as *const i8, grown as *const i8);
+            assert_eq!(text(copy), "n-42;;8");
+            assert_eq!(text(grown), "n-42;");
+            for s in [zero, one, copy, grown, a, b] {
+                pith_cstring_release(s);
+            }
+        }
+    }
+
+    #[test]
     fn concat_many_joins_its_parts_like_a_chain_of_concats() {
         unsafe {
             let a = crate::pith_copy_bytes_to_cstring(b"ab");
@@ -1621,10 +1659,65 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
 /// splits a longer chain into calls of at most this many.
 pub const CONCAT_MANY_MAX: usize = 8;
 
-/// Join the first `count` of up to eight strings into one fresh string, the
+/// The first argument of the two join calls holds the part count in its low
+/// byte. Above that, bit `i` is set when part `i` is an Int to be written in
+/// decimal instead of a string, which is how `"id=" + n.to_string()` joins
+/// without first making a string for the number.
+pub const JOIN_INT_SHIFT: u32 = 8;
+
+/// Whether part `i` of a join is an Int, going by the call's Int bits.
+#[inline(always)]
+fn join_part_is_int(ints: u64, i: usize) -> bool {
+    ints >> i & 1 != 0
+}
+
+/// Fill `lens` with the byte length of each part and return their sum. A
+/// null string is empty. Inlined into both join calls so the parts stay in
+/// the caller's array: handing them over in a struct made the copy read back
+/// words that were still being stored.
+#[inline(always)]
+unsafe fn measure_join_parts(parts: &[*const i8], ints: u64, lens: &mut [usize; CONCAT_MANY_MAX]) -> usize {
+    let mut total = 0usize;
+    for (i, &part) in parts.iter().enumerate() {
+        lens[i] = if join_part_is_int(ints, i) {
+            int_text_len(part as i64)
+        } else if part.is_null() {
+            0
+        } else {
+            string::pith_cstring_len(part) as usize
+        };
+        total += lens[i];
+    }
+    total
+}
+
+/// Write every part, in order, starting at `dst`.
+#[inline(always)]
+unsafe fn write_join_parts(parts: &[*const i8], ints: u64, lens: &[usize; CONCAT_MANY_MAX], dst: *mut i8) {
+    let mut at = dst as *mut u8;
+    for (i, &part) in parts.iter().enumerate() {
+        if join_part_is_int(ints, i) {
+            write_int_text(part as i64, at, lens[i]);
+        } else if lens[i] > 0 {
+            std::ptr::copy_nonoverlapping(part as *const u8, at, lens[i]);
+        }
+        at = at.add(lens[i]);
+    }
+}
+
+/// Split a join call's first argument into its part count, capped at `max`,
+/// and its Int bits.
+fn join_count_and_ints(packed: i64, max: usize) -> (usize, u64) {
+    let count = ((packed & 0xff) as usize).min(max);
+    let ints = (packed as u64 >> JOIN_INT_SHIFT) & ((1 << count) - 1);
+    (count, ints)
+}
+
+/// Join the first `count` of up to eight parts into one fresh string, the
 /// way a chain of `pith_concat_cstr` calls would, with one allocation and one
-/// copy of each part instead of one per step. A null part is empty; with
-/// every part null the result is null, as `pith_concat_cstr(null, null)` is.
+/// copy of each part instead of one per step. `count` is packed as
+/// `JOIN_INT_SHIFT` describes. A null string part is empty; with every part a
+/// null string the result is null, as `pith_concat_cstr(null, null)` is.
 /// The consumer turns `a + b + c ...` into this.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -1639,27 +1732,16 @@ pub unsafe extern "C" fn pith_concat_cstr_many(
     s6: *const i8,
     s7: *const i8,
 ) -> *mut i8 {
+    let (count, ints) = join_count_and_ints(count, CONCAT_MANY_MAX);
     let all = [s0, s1, s2, s3, s4, s5, s6, s7];
-    let parts = &all[..(count.max(0) as usize).min(CONCAT_MANY_MAX)];
-    if parts.iter().all(|p| p.is_null()) {
+    let parts = &all[..count];
+    if ints == 0 && parts.iter().all(|p| p.is_null()) {
         return std::ptr::null_mut();
     }
     let mut lens = [0usize; CONCAT_MANY_MAX];
-    let mut total = 0usize;
-    for (i, &part) in parts.iter().enumerate() {
-        if !part.is_null() {
-            lens[i] = string::pith_cstring_len(part) as usize;
-            total += lens[i];
-        }
-    }
+    let total = measure_join_parts(parts, ints, &mut lens);
     let result = pith_alloc_cstring(total);
-    let mut at = 0usize;
-    for (i, &part) in parts.iter().enumerate() {
-        if lens[i] > 0 {
-            std::ptr::copy_nonoverlapping(part, result.add(at), lens[i]);
-            at += lens[i];
-        }
-    }
+    write_join_parts(parts, ints, &lens, result);
     result
 }
 
@@ -1667,13 +1749,15 @@ pub unsafe extern "C" fn pith_concat_cstr_many(
 pub const APPEND_MANY_MAX: usize = CONCAT_MANY_MAX - 1;
 
 /// `base` followed by the first `count` of up to seven parts, for
-/// `s = s + a + b ...` where `s` owns `base`. The call takes over the
-/// caller's count on `base`: the result carries it, and `base` must not be
-/// released afterwards. When that count is the only one, nothing else can
-/// see the string, so the parts are written in place, reallocating only when
-/// the new length leaves the size class (see `cstring_alloc_size`). A shared
-/// or literal base, or a part that is the base itself, gets a fresh string
-/// and the base loses the caller's count. A null part is empty.
+/// `s = s + a + b ...` where `s` owns `base`. `count` is packed as
+/// `JOIN_INT_SHIFT` describes, with bit 0 naming the first part after the
+/// base. The call takes over the caller's count on `base`: the result
+/// carries it, and `base` must not be released afterwards. When that count
+/// is the only one, nothing else can see the string, so the parts are
+/// written in place, reallocating only when the new length leaves the size
+/// class (see `cstring_alloc_size`). A shared or literal base, or a part
+/// that is the base itself, gets a fresh string and the base loses the
+/// caller's count. A null part is empty.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn pith_cstring_append_many(
@@ -1687,37 +1771,22 @@ pub unsafe extern "C" fn pith_cstring_append_many(
     s5: *const i8,
     s6: *const i8,
 ) -> *mut i8 {
+    let (count, ints) = join_count_and_ints(count, APPEND_MANY_MAX);
     let all = [s0, s1, s2, s3, s4, s5, s6];
-    let parts = &all[..(count.max(0) as usize).min(APPEND_MANY_MAX)];
-    let mut lens = [0usize; APPEND_MANY_MAX];
-    let mut added = 0usize;
-    for (i, &part) in parts.iter().enumerate() {
-        if !part.is_null() {
-            lens[i] = string::pith_cstring_len(part) as usize;
-            added += lens[i];
-        }
-    }
+    let parts = &all[..count];
+    let mut lens = [0usize; CONCAT_MANY_MAX];
+    let added = measure_join_parts(parts, ints, &mut lens);
+    // a string part that is the base itself would be read while it grows
+    let reads_base = parts.iter().enumerate().any(|(i, &part)| part == base && !join_part_is_int(ints, i));
     let header = cstring_base(base).filter(|&h| {
         cstring_refcount(h).load(Ordering::Acquire) == 1
-            && !parts.contains(&base)
+            && !reads_base
             && !cstring_debug_no_free()
             && leak_scan_registry().is_none()
     });
     let Some(mut header) = header else {
-        let mut joined = [std::ptr::null(); CONCAT_MANY_MAX];
-        joined[0] = base;
-        joined[1..=parts.len()].copy_from_slice(parts);
-        let fresh = pith_concat_cstr_many(
-            (parts.len() + 1) as i64,
-            joined[0],
-            joined[1],
-            joined[2],
-            joined[3],
-            joined[4],
-            joined[5],
-            joined[6],
-            joined[7],
-        );
+        let packed = (count + 1) as i64 | (ints << (JOIN_INT_SHIFT + 1)) as i64;
+        let fresh = pith_concat_cstr_many(packed, base, s0, s1, s2, s3, s4, s5, s6);
         pith_cstring_release(base);
         return fresh;
     };
@@ -1732,13 +1801,7 @@ pub unsafe extern "C" fn pith_cstring_append_many(
         }
     }
     let data = header.add(CSTRING_HEADER_SIZE) as *mut i8;
-    let mut at = len;
-    for (i, &part) in parts.iter().enumerate() {
-        if lens[i] > 0 {
-            std::ptr::copy_nonoverlapping(part, data.add(at), lens[i]);
-            at += lens[i];
-        }
-    }
+    write_join_parts(parts, ints, &lens, data.add(len));
     *data.add(new_len) = 0;
     (header.add(8) as *mut u64).write(new_len as u64);
     data
@@ -2879,38 +2942,72 @@ pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_cstr(n: i64) -> *mut i8 {
-    let mut buf = [0u8; 20];
-    let start = decimal_digits(n.unsigned_abs(), &mut buf);
-    if n >= 0 {
-        return pith_copy_bytes_to_cstring(&buf[start..]);
-    }
-    let digits = buf.len() - start;
-    let ptr = pith_alloc_cstring(digits + 1);
-    *(ptr as *mut u8) = b'-';
-    std::ptr::copy_nonoverlapping(buf[start..].as_ptr(), (ptr as *mut u8).add(1), digits);
+    let len = int_text_len(n);
+    let ptr = pith_alloc_cstring(len);
+    write_int_text(n, ptr as *mut u8, len);
     ptr
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_uint_to_cstr(n: i64) -> *mut i8 {
-    let mut buf = [0u8; 20];
-    let start = decimal_digits(n as u64, &mut buf);
-    pith_copy_bytes_to_cstring(&buf[start..])
+    let len = uint_text_len(n as u64);
+    let ptr = pith_alloc_cstring(len);
+    write_decimal_before(n as u64, (ptr as *mut u8).add(len));
+    ptr
 }
 
-/// Write `n` in decimal at the end of `buf` and return the index of its
-/// first digit. Formatting into a stack buffer leaves a number's text with
-/// one allocation, the string that holds it; `to_string` built a heap
-/// `String` first and copied out of it.
-fn decimal_digits(mut n: u64, buf: &mut [u8; 20]) -> usize {
-    let mut i = buf.len();
-    loop {
-        i -= 1;
-        buf[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        if n == 0 {
-            return i;
-        }
+/// The number of digits `n` has in decimal.
+#[inline]
+fn uint_text_len(n: u64) -> usize {
+    n.checked_ilog10().map_or(1, |d| d as usize + 1)
+}
+
+/// The number of bytes `n` takes in decimal, sign included.
+#[inline]
+fn int_text_len(n: i64) -> usize {
+    uint_text_len(n.unsigned_abs()) + usize::from(n < 0)
+}
+
+/// Write `n` in decimal into the `len` bytes at `dst`, where `len` is
+/// `int_text_len(n)`.
+#[inline]
+unsafe fn write_int_text(n: i64, dst: *mut u8, len: usize) {
+    write_decimal_before(n.unsigned_abs(), dst.add(len));
+    if n < 0 {
+        *dst = b'-';
+    }
+}
+
+/// "00", "01" ... "99", end to end.
+const DIGIT_PAIRS: [u8; 200] = {
+    let mut pairs = [0u8; 200];
+    let mut i = 0;
+    while i < 100 {
+        pairs[2 * i] = b'0' + (i / 10) as u8;
+        pairs[2 * i + 1] = b'0' + (i % 10) as u8;
+        i += 1;
+    }
+    pairs
+};
+
+/// Write the digits of `n` so that the last one sits just before `end`. The
+/// caller measured the number, so the digits go straight to their place: a
+/// number's text costs one allocation and no copy. Two digits per step
+/// halve the chain of divisions each digit waits on, which is what a
+/// conversion spends most of its time in.
+#[inline]
+unsafe fn write_decimal_before(mut n: u64, end: *mut u8) {
+    let mut at = end;
+    while n >= 100 {
+        let pair = (n % 100) as usize * 2;
+        n /= 100;
+        at = at.sub(2);
+        std::ptr::copy_nonoverlapping(DIGIT_PAIRS.as_ptr().add(pair), at, 2);
+    }
+    if n >= 10 {
+        std::ptr::copy_nonoverlapping(DIGIT_PAIRS.as_ptr().add(n as usize * 2), at.sub(2), 2);
+    } else {
+        *at.sub(1) = b'0' + n as u8;
     }
 }
 

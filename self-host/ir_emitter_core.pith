@@ -7140,6 +7140,42 @@ fn ir_list_ctor_for_elem_kind(elem_kind: String) -> String:
         return "__list_new_sync"
     return "__list_new"
 
+# the most elements one `pith_list_of` call takes
+IR_LIST_OF_MAX := 8
+
+# a literal of one to eight elements is a single `pith_list_of` call: the
+# runtime allocates the storage once at its final size instead of growing it
+# under a push per element. the call takes over the count on each element of
+# a counted kind, so a borrowed element is retained first and a fresh one is
+# left alone. the elements are built before the list exists, so each one is
+# in flight until the call: `[a()!, b()!]` must not strand a's value when b
+# fails. the retain is taken when the element is read and not at the call,
+# because a later element may be a call that drops the owner's count.
+fn ir_emit_small_list_literal(node: Node, elem_kind: String, elem_target: String, elem_inner: String) -> Int:
+    tag := ir_element_tag_code(elem_kind)
+    mut arg_regs: List[Int] := []
+    for child in node.children:
+        elem_r := ir_emit_value_for_target_inner(child, elem_target, elem_inner)
+        if tag != 0:
+            if ir_expr_is_borrowed(child):
+                ir_rc_retain_reg(elem_r, elem_kind)
+            ir_inflight_push(elem_r, elem_kind)
+        arg_regs.push(elem_r)
+    if tag != 0:
+        ir_inflight_pop_n(arg_regs.len())
+    tag_r := ir_reg()
+    ir_emit("iconst " + tag_r.to_string() + " " + tag.to_string())
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + arg_regs.len().to_string())
+    if arg_regs.len() < IR_LIST_OF_MAX:
+        zero_r := ir_reg()
+        ir_emit("iconst " + zero_r.to_string() + " 0")
+        while arg_regs.len() < IR_LIST_OF_MAX:
+            arg_regs.push(zero_r)
+    list_r := ir_reg()
+    ir_emit_call_text(list_r, "pith_list_of", "list", IR_LIST_OF_MAX + 2, " " + tag_r.to_string() + " " + count_r.to_string() + ir_join_arg_regs(arg_regs))
+    return list_r
+
 fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # a tagged list owns its heap elements: the runtime push retains, and
     # release cascades. the checker's type covers empty literals in any
@@ -7162,6 +7198,10 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
             elem_inner = ir_optional_inner_type_of_tid(info.inner)
     if elem_kind.len() == 0 and node.children.len() > 0:
         elem_kind = ir_rc_kind(ir_infer_type(node.children[0]))
+    # an optional element is a wrapper with its own release rule, so a
+    # literal of those keeps the push per element below
+    if node.children.len() > 0 and node.children.len() <= IR_LIST_OF_MAX and elem_kind != "tuple":
+        return ir_emit_small_list_literal(node, elem_kind, elem_target, elem_inner)
     list_r := ir_reg()
     ctor := ir_list_ctor_for_elem_kind(elem_kind)
     ir_emit_call0(list_r, ctor, "list")

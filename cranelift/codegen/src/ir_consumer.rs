@@ -2082,6 +2082,11 @@ pub fn compile_from_ir(
             Some(lines) => lines.iter().map(String::as_str).collect(),
             None => body_lines,
         };
+        let with_ints = fuse_int_parts(&body_lines);
+        let body_lines: Vec<&str> = match &with_ints {
+            Some(lines) => lines.iter().map(String::as_str).collect(),
+            None => body_lines,
+        };
         if let Some(&func_id) = declared_funcs.get(&func_name) {
             let func = compile_ir_function(
                 codegen,
@@ -3131,11 +3136,13 @@ fn compile_ir_function(
             }
 
             // `concatn dst count part...`, made by fuse_concat_chains: one
-            // pith_concat_cstr_many call for up to eight parts. a longer chain
+            // pith_concat_cstr_many call for up to eight parts. the count
+            // word may carry the Int bits fuse_int_parts set. a longer chain
             // joins eight at a time, each call's result leading the next and
             // released once that one has copied it.
             "concatn" if parts.len() >= 4 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
+                let ints = join_int_bits(parts[2]);
                 let mut values = Vec::with_capacity(parts.len() - 3);
                 for t in &parts[3..] {
                     values.push(get_reg(&regs, t)?);
@@ -3163,7 +3170,7 @@ fn compile_ir_function(
                     let mut group: Vec<Value> = acc.into_iter().collect();
                     group.extend_from_slice(&rest[..take]);
                     rest = &rest[take..];
-                    let count = builder.ins().iconst(types::I64, group.len() as i64);
+                    let count = builder.ins().iconst(types::I64, group.len() as i64 | ints);
                     let mut args = vec![count];
                     args.extend_from_slice(&group);
                     while args.len() < max + 1 {
@@ -3189,6 +3196,7 @@ fn compile_ir_function(
             // the previous result's count, so nothing is released here.
             "appendn" if parts.len() >= 5 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
+                let ints = join_int_bits(parts[2]);
                 let mut acc = get_reg(&regs, parts[3])?;
                 let mut values = Vec::with_capacity(parts.len() - 4);
                 for t in &parts[4..] {
@@ -3203,7 +3211,7 @@ fn compile_ir_function(
                 )?;
                 let max = pith_runtime::APPEND_MANY_MAX;
                 for group in values.chunks(max) {
-                    let count = builder.ins().iconst(types::I64, group.len() as i64);
+                    let count = builder.ins().iconst(types::I64, group.len() as i64 | ints);
                     let mut args = vec![count, acc];
                     args.extend_from_slice(group);
                     while args.len() < max + 2 {
@@ -4284,6 +4292,100 @@ impl RegKinds {
     }
 }
 
+/// Fold `n.to_string()` into the join that reads it, so `"id=" + n.to_string()`
+/// and `"id={n}"` write the number straight into the joined string instead of
+/// making a string for it first. The emitter lowers the conversion as
+/// `call R int_to_string string 1 X`, uses R as one part of a `concat`, and
+/// releases R afterwards. When R has no other mention and no label, branch or
+/// return sits between its definition and its release, the conversion and the
+/// release go away and the join takes X itself, marked as an Int in the count
+/// word (`pith_runtime::JOIN_INT_SHIFT`). A plain `concat` becomes a
+/// two-part `concatn`. A join of more parts than one runtime call takes is
+/// left alone, since the Int bits describe a single call.
+fn fuse_int_parts(body: &[&str]) -> Option<Vec<String>> {
+    let parsed: Vec<Vec<&str>> = body.iter().map(|l| l.split_whitespace().collect()).collect();
+    // R -> (line of its definition, X)
+    let mut made: HashMap<&str, (usize, &str)> = HashMap::new();
+    for (i, p) in parsed.iter().enumerate() {
+        if p.len() == 6 && p[0] == "call" && p[2] == "int_to_string" && p[4] == "1" && p[5].parse::<usize>().is_ok() {
+            made.insert(p[1], (i, p[5]));
+        }
+    }
+    if made.is_empty() {
+        return None;
+    }
+    let mut mentions: HashMap<&str, usize> = HashMap::new();
+    let mut release_lines: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut barriers_before = vec![0usize; parsed.len() + 1];
+    for (i, p) in parsed.iter().enumerate() {
+        for t in p.iter().skip(1) {
+            *mentions.entry(t).or_insert(0) += 1;
+        }
+        if p.len() == 6 && p[0] == "call" && p[2] == "pith_cstring_release" && p[4] == "1" {
+            release_lines.entry(p[5]).or_default().push(i);
+        }
+        let barrier = matches!(p.first(), Some(&"label" | &"brif" | &"jmp" | &"ret" | &"ret2"));
+        barriers_before[i + 1] = barriers_before[i] + usize::from(barrier);
+    }
+
+    let mut dropped = vec![false; parsed.len()];
+    let mut replaced: HashMap<usize, String> = HashMap::new();
+    for (j, p) in parsed.iter().enumerate() {
+        // (the tokens before the parts, the parts, the most one call takes)
+        let (head, parts, max) = match p.first() {
+            Some(&"concat") if p.len() == 4 => (vec!["concatn", p[1]], &p[2..], pith_runtime::CONCAT_MANY_MAX),
+            Some(&"concatn") if p.len() >= 5 => (vec!["concatn", p[1]], &p[3..], pith_runtime::CONCAT_MANY_MAX),
+            Some(&"appendn") if p.len() >= 5 => (vec!["appendn", p[1]], &p[4..], pith_runtime::APPEND_MANY_MAX),
+            _ => continue,
+        };
+        if parts.len() > max {
+            continue;
+        }
+        let mut ints = 0usize;
+        let mut joined: Vec<&str> = parts.to_vec();
+        for (i, part) in parts.iter().enumerate() {
+            let Some(&(made_at, number)) = made.get(part) else { continue };
+            let Some(&[released_at]) = release_lines.get(part).map(Vec::as_slice) else { continue };
+            if made_at < j
+                && j < released_at
+                && mentions.get(part).copied() == Some(3)
+                && barriers_before[released_at] == barriers_before[made_at]
+            {
+                ints |= 1 << i;
+                joined[i] = number;
+                dropped[made_at] = true;
+                dropped[released_at] = true;
+            }
+        }
+        if ints == 0 {
+            continue;
+        }
+        let count = parts.len() | ints << pith_runtime::JOIN_INT_SHIFT;
+        let base = if head[0] == "appendn" { format!(" {}", p[3]) } else { String::new() };
+        replaced.insert(j, format!("{} {} {}{} {}", head[0], head[1], count, base, joined.join(" ")));
+    }
+    if replaced.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(body.len());
+    for (i, line) in body.iter().enumerate() {
+        if let Some(rewritten) = replaced.get(&i) {
+            out.push(rewritten.clone());
+        } else if !dropped[i] {
+            out.push(line.to_string());
+        }
+    }
+    Some(out)
+}
+
+/// The Int bits of a `concatn` or `appendn` count word, already shifted into
+/// place for the runtime call. `fuse_int_parts` sets them only on a join that
+/// fits one call.
+fn join_int_bits(count_word: &str) -> i64 {
+    let word = count_word.parse::<i64>().unwrap_or(0);
+    word >> pith_runtime::JOIN_INT_SHIFT << pith_runtime::JOIN_INT_SHIFT
+}
+
 fn get_reg(regs: &HashMap<usize, Value>, s: &str) -> Result<Value, CompileError> {
     let reg = s.parse::<usize>().map_err(|_| {
         CompileError::ModuleError(format!("IR consumer: invalid register reference '{}'", s))
@@ -4368,6 +4470,78 @@ mod tests {
         assert!(appends(&SELF_APPEND.replace("store s 17", "store s 17\nstore t 17")).is_none());
         // no release of the old value: the local does not own it
         assert!(appends(&SELF_APPEND.replace("call 24 pith_cstring_release void 1 14\n", "")).is_none());
+    }
+
+    fn int_parts(body: &str) -> Option<Vec<String>> {
+        let lines: Vec<&str> = body.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        fuse_int_parts(&lines)
+    }
+
+    /// `"value-" + n.to_string()`, as the emitter lowers it.
+    const INT_CONCAT: &str = "
+        strref 4 m0s9
+        load 5 n
+        call 6 int_to_string string 1 5
+        concat 7 4 6
+        call 8 pith_cstring_release void 1 4
+        call 9 pith_cstring_release void 1 6
+        store label 7
+    ";
+
+    #[test]
+    fn a_converted_int_joins_as_a_number() {
+        let fused = int_parts(INT_CONCAT).expect("the conversion is folded in");
+        // two parts, the second an Int: 2 | 0b10 << 8
+        assert_eq!(
+            fused,
+            vec![
+                "strref 4 m0s9",
+                "load 5 n",
+                "concatn 7 514 4 5",
+                "call 8 pith_cstring_release void 1 4",
+                "store label 7",
+            ]
+        );
+    }
+
+    #[test]
+    fn int_parts_fold_into_a_fused_chain_and_an_append() {
+        let chain = "
+            call 4 int_to_string string 1 3
+            call 22 int_to_string string 1 21
+            concatn 23 5 2 4 8 12 22
+            call 7 pith_cstring_release void 1 4
+            call 25 pith_cstring_release void 1 22
+        ";
+        // parts 1 and 4 are Ints: 5 | 0b10010 << 8
+        assert_eq!(int_parts(chain).unwrap(), vec!["concatn 23 4613 2 3 8 12 21"]);
+        let append = "
+            call 16 int_to_string string 1 12
+            appendn 17 2 15 16 19
+            call 18 pith_cstring_release void 1 16
+        ";
+        // bit 0 is the first part after the base: 2 | 0b01 << 8
+        assert_eq!(int_parts(append).unwrap(), vec!["appendn 17 258 15 12 19"]);
+    }
+
+    #[test]
+    fn a_converted_int_with_another_reader_stays_a_string() {
+        // stored as well as joined, so the string has to exist
+        let stored = INT_CONCAT.replace("store label 7", "store label 7\nstore digits 6");
+        assert!(int_parts(&stored).is_none());
+        // released on the far side of a branch
+        let branched = INT_CONCAT.replace(
+            "call 9 pith_cstring_release void 1 6",
+            "brif 7 L1 L2\nlabel L1\ncall 9 pith_cstring_release void 1 6",
+        );
+        assert!(int_parts(&branched).is_none());
+        // more parts than one call takes
+        let long = "
+            call 4 int_to_string string 1 3
+            concatn 23 9 2 4 8 12 13 14 15 16 17
+            call 7 pith_cstring_release void 1 4
+        ";
+        assert!(int_parts(long).is_none());
     }
 
     #[test]

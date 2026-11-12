@@ -23,8 +23,8 @@
 # each row comes from the runtime source, not from how the emitter calls it.
 pith_runtime_error|-|-|-|never returns: prints and exits(1)
 pith_concat_cstr|b,b|own|runtime_core.rs:1608|fresh string (pith_strdup / pith_alloc_cstring); both inputs only read. Both null returns null
-pith_concat_cstr_many|-,b,b,b,b,b,b,b,b|own|runtime_core.rs:1640|first param is the part count; parts only read; fresh allocation, null when every part is null
-pith_cstring_append_many|-,c,b,b,b,b,b,b,b|own|runtime_core.rs:1679|base consumed: written in place (possibly realloc'd, old pointer invalid) when its count is 1, else a fresh concat is built and base is released (runtime_core.rs:1730). Result carries the count. Parts only read; a part equal to base forces the copy path
+pith_concat_cstr_many|-,b,b,b,b,b,b,b,b|own|runtime_core.rs:1724|first param is the part count with one bit per Int part above it; string parts only read; fresh allocation, null when every part is a null string
+pith_cstring_append_many|-,c,b,b,b,b,b,b,b|own|runtime_core.rs:1763|base consumed: written in place (possibly realloc'd, old pointer invalid) when its count is 1, else a fresh concat is built and base is released (runtime_core.rs:1790). Result carries the count. String parts only read, Int parts flagged in the first param; a part equal to base forces the copy path
 pith_cstring_retain|b|-|runtime_core.rs:248|retain: adds one count to a heap cstring; no-op for literals and null
 pith_display_list|b,-,-|own|runtime_core.rs:2984|fresh string; list and its elements only read. Internal leak: for elem_kind 1 display_value allocates via pith_float_to_cstr and never releases it (runtime_core.rs:2962)
 pith_list_retain_handle|b|-|list.rs:1677|retain: adds one count to arg 0 (no-op when the magic check fails)

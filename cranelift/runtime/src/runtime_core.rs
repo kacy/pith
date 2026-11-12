@@ -3125,6 +3125,37 @@ thread_local! {
     static TLS_GLOBALS: std::cell::RefCell<TlsMap> = const { std::cell::RefCell::new(TlsMap::new()) };
 }
 
+thread_local! {
+    /// The address of this thread's `TLS_GLOBALS` map once the thread has
+    /// used it, null before. A plain cell, so a read is one `%fs:`-relative
+    /// load: the fast paths below reach the map without the accessor call
+    /// and the `RefCell` bookkeeping. It is read afresh on every access and
+    /// never kept across pith code, so a task that resumes on another thread
+    /// reads that thread's cell.
+    static THREAD_TLS: std::cell::Cell<*mut TlsMap> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The map a threadlocal access goes to right now: the running green task's,
+/// or this thread's own once `thread_tls_install` has recorded it, or null.
+/// `CURRENT_TLS` is only ever set by the green scheduler, so there is no
+/// backend test here.
+#[inline(always)]
+fn active_tls_map() -> *mut TlsMap {
+    match crate::concurrency::green::current_task_tls() {
+        Some(map) => map,
+        None => THREAD_TLS.with(|c| c.get()),
+    }
+}
+
+/// Record this thread's map for `active_tls_map`. The address of
+/// `TLS_GLOBALS` is taken here, behind a call the optimizer cannot inline,
+/// like the other touches of it.
+#[inline(never)]
+fn thread_tls_install() {
+    let map = TLS_GLOBALS.with(|t| t.as_ptr());
+    THREAD_TLS.with(|c| c.set(map));
+}
+
 /// Under the green backend, the map backing the currently-running task's
 /// `threadlocal` globals, or `None` on the default os-thread path (and on any
 /// green worker moment with no task active). Returning `None` means the caller
@@ -3160,6 +3191,26 @@ pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64
 /// as `pith_tls_get_or_init`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_get_or_init_tagged(slot: i64, init_thunk: i64, tag: i64) -> i64 {
+    // the common read: the slot already holds a value. std.json reads its
+    // parser state through here on every byte, so this path is a cell load
+    // and a vector index, and everything else is out of line.
+    let map = active_tls_map();
+    if !map.is_null() {
+        // SAFETY: a task's map is owned by the running task and the thread's
+        // map by this thread; nothing else holds a borrow of either while
+        // pith code runs.
+        if let Some(v) = (*map).get(&slot) {
+            return v;
+        }
+    }
+    tls_get_or_init_slow(slot, init_thunk, tag)
+}
+
+/// The first read of a slot, which runs its initializer, and any read made
+/// before this thread's map is recorded.
+#[cold]
+#[inline(never)]
+unsafe fn tls_get_or_init_slow(slot: i64, init_thunk: i64, tag: i64) -> i64 {
     if let Some(map) = green_task_tls() {
         // SAFETY: `map` points into the `Box<TlsMap>` owned by the green task
         // currently running on this worker thread. `green` installs it around
@@ -3188,6 +3239,7 @@ pub unsafe extern "C" fn pith_tls_get_or_init_tagged(slot: i64, init_thunk: i64,
     // another access on this thread during the thunk can't have run (single
     // thread), so a plain insert is correct.
     tls_globals_set(slot, value, tag);
+    thread_tls_install();
     value
 }
 
@@ -3226,14 +3278,15 @@ pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
 /// as `pith_tls_set`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_set_tagged(slot: i64, value: i64, tag: i64) {
-    if let Some(map) = green_task_tls() {
-        // SAFETY: same as `pith_tls_get_or_init`. the pointer targets the
-        // running task's own map, valid and unaliased for this synchronous call
-        // on this worker thread. a single short-lived write borrow.
+    let map = active_tls_map();
+    if !map.is_null() {
+        // SAFETY: as in `pith_tls_get_or_init_tagged`: the running task's own
+        // map, or this thread's, with no other borrow live.
         (*map).insert(slot, value, tag);
         return;
     }
     tls_globals_set(slot, value, tag);
+    thread_tls_install();
 }
 
 // Small structs are allocated and freed constantly (the result box built for

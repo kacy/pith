@@ -200,6 +200,8 @@ fuzz_target!(|data| {
                     _ => -1,
                 };
                 assert_eq!(pith_runtime::pith_cstring_last_index_of(h.ptr(), n.ptr()), last);
+                let any = hc.iter().position(|b| nc.contains(b)).map_or(-1, |i| i as i64);
+                assert_eq!(pith_runtime::pith_cstring_index_of_any(h.ptr(), n.ptr()), any);
             }
             5 => {
                 let s = PStr::new(input.rest(), kind);

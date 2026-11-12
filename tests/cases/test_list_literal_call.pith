@@ -1,0 +1,62 @@
+# A list literal of one to eight elements is built by one runtime call that
+# takes over a count on each element. These cases cover what that changes:
+# elements read before the list exists, an element that fails after earlier
+# ones were built, and an element whose owner is replaced by a later one.
+
+struct Box:
+    pub name: String
+    pub items: List[String]
+
+mut current := "first-" + 1.to_string()
+
+fn replace_current() -> String:
+    current = "second-" + 2.to_string()
+    return current
+
+fn checked(n: Int) -> String!:
+    if n < 0:
+        fail "negative: " + n.to_string()
+    return "ok-" + n.to_string()
+
+fn pair(a: Int, b: Int) -> List[String]!:
+    return [checked(a)!, "mid", checked(b)!]
+
+fn describe(xs: List[String]) -> String:
+    mut out := xs.len().to_string() + ":"
+    for x in xs:
+        out = out + " " + x
+    return out
+
+fn main():
+    label := "label-" + 7.to_string()
+    print(describe(["a", "b", label]))
+    print(describe([label]))
+    print(describe([label, label, label, label, label, label, label, label]))
+    print(describe([label, "2", "3", "4", "5", "6", "7", "8", label]))
+
+    # the first element is read from a global the second one replaces
+    print(describe([current, replace_current()]))
+
+    print(describe(pair(1, 2) catch ["failed"]))
+    print(describe(pair(1, 0 - 2) catch ["failed"]))
+    print(describe(pair(0 - 1, 2) catch ["failed"]))
+
+    ints := [1, 2, 3]
+    floats := [1.5, 2.5]
+    flags := [true, false, true]
+    print("{ints.len()} {ints[2]} {floats[1]} {flags[1]}")
+
+    nested := [[label, "x"], ["y"], ints.map(fn(n: Int) => n.to_string())]
+    print("{nested.len()} {describe(nested[0])} {describe(nested[2])}")
+
+    boxes := [Box("one", [label]), Box("two", ["p", "q"])]
+    print("{boxes[0].name} {describe(boxes[0].items)} {boxes[1].name} {describe(boxes[1].items)}")
+
+    optional: List[Int?] := [1, none, 3]
+    print("{optional.len()} {optional[0].unwrap_or(0 - 1)} {optional[1].unwrap_or(0 - 1)}")
+
+    mut grown := ["seed"]
+    grown.push(label)
+    grown.push("tail")
+    print(describe(grown))
+    print(label)

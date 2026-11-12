@@ -85,6 +85,7 @@ pub const LIST_TYPE_TAG_PRIMITIVE: i32 = ListTypeTag::Primitive as i32;
 pub const LIST_HANDLE_ALIGN: i64 = std::mem::align_of::<ListImpl>() as i64;
 
 impl ListImpl {
+    #[inline(always)]
     fn new(elem_size: usize, type_tag: ListTypeTag) -> Self {
         crate::perf_count(&crate::PERF_LIST_NEWS, 1);
         crate::alloc_sites::record("list");
@@ -530,15 +531,60 @@ pub unsafe extern "C" fn pith_list_new_sync() -> PithList {
 pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithList {
     let tag = element_tag_from_code(type_tag);
 
-    let list_impl = ListImpl::new(elem_size as usize, tag);
-    let boxed = Box::new(list_impl);
-    let ptr = Box::into_raw(boxed) as *mut ();
+    // written straight into the allocation. building the struct on the
+    // stack and moving it into a box copies it in 16-byte pieces, each read
+    // back while the field stores it covers are still in flight.
+    let slot = Box::into_raw(Box::<ListImpl>::new_uninit()) as *mut ListImpl;
+    slot.write(ListImpl::new(elem_size as usize, tag));
+    let ptr = slot as *mut ();
     (*(ptr as *mut ListImpl)).identity = identity_tag(ptr);
     if crosses_page(ptr) {
         handle_registry::register(ptr as *const (), HandleKind::List);
     }
 
     PithList { ptr }
+}
+
+/// The most elements one `pith_list_of` call takes.
+pub const LIST_OF_MAX: usize = 8;
+
+/// A new list holding the first `count` of up to eight values, for a list
+/// literal: `["a", "b", label]` is one call instead of a constructor and a
+/// push per element. `type_tag` is the element tag code `pith_list_new`
+/// takes. The storage is allocated once at its final size. For a counted
+/// element kind the list takes over the count the caller holds on each
+/// value, the way `pith_list_push_value_owned` does, so the caller must not
+/// release them afterwards.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn pith_list_of(
+    type_tag: i64,
+    count: i64,
+    v0: i64,
+    v1: i64,
+    v2: i64,
+    v3: i64,
+    v4: i64,
+    v5: i64,
+    v6: i64,
+    v7: i64,
+) -> PithList {
+    let count = (count.max(0) as usize).min(LIST_OF_MAX);
+    let list = pith_list_new(8, type_tag as i32);
+    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    crate::perf_stats!(PERF_LIST_PUSHES += count);
+    let mut values: Vec<i64> = Vec::with_capacity(count);
+    // one store per value, from the register it arrived in. gathering them
+    // into an array and copying that reads the array back in wider pieces
+    // than it was written in, which stalls on every literal.
+    let slots = values.as_mut_ptr();
+    for (i, value) in [v0, v1, v2, v3, v4, v5, v6, v7].into_iter().enumerate().take(count) {
+        std::ptr::write_volatile(slots.add(i), value);
+    }
+    values.set_len(count);
+    impl_ref.values8 = values;
+    impl_ref.sync_value_view();
+    list
 }
 
 /// A per-process random key, so that no string can be written to pass for a
@@ -1731,6 +1777,38 @@ mod tests {
             assert_eq!(pith_auto_len(list.ptr as i64), 1);
             pith_list_release(list);
             assert!(!is_list_ptr(list.ptr));
+        }
+    }
+
+    #[test]
+    fn a_list_literal_call_takes_over_the_counts_on_its_values() {
+        unsafe {
+            let count_of = |s: *mut i8| crate::runtime_core::cstring_refcount_for_tests(s);
+            let s = crate::pith_copy_bytes_to_cstring(b"x");
+            // one count for each of the two elements, and one kept here
+            crate::pith_cstring_retain(s);
+            crate::pith_cstring_retain(s);
+            // the value past the count is not an element
+            let strings = pith_list_of(1, 2, s as i64, s as i64, 99, 0, 0, 0, 0, 0);
+            assert_eq!(pith_auto_len(strings.ptr as i64), 2);
+            assert_eq!(pith_list_get_value(strings, 1), s as i64);
+            assert_eq!(count_of(s), Some(3));
+            pith_list_release(strings);
+            assert_eq!(count_of(s), Some(1));
+            crate::pith_cstring_release(s);
+
+            let ints = pith_list_of(0, 8, 1, 2, 3, 4, 5, 6, 7, 8);
+            pith_list_push_value(ints, 9);
+            assert_eq!(pith_auto_len(ints.ptr as i64), 9);
+            assert_eq!(pith_list_get_value(ints, 7), 8);
+            assert_eq!(pith_list_get_value(ints, 8), 9);
+            pith_list_release(ints);
+
+            let empty = pith_list_of(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            assert_eq!(pith_auto_len(empty.ptr as i64), 0);
+            pith_list_push_value(empty, 5);
+            assert_eq!(pith_list_get_value(empty, 0), 5);
+            pith_list_release(empty);
         }
     }
 

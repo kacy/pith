@@ -115,6 +115,7 @@ pith_map_new_int||own|-|fresh int-key map, primitive values
 pith_map_new_cstr_val||own|-|fresh string-key map owning String values
 pith_map_new_int_cstr_val||own|-|fresh int-key map owning String values
 pith_set_new_default||own|-|fresh string set rc=1 (set.rs:173)
+pith_list_of|-,-,c,c,c,c,c,c,c,c|own|list.rs:560|fresh list rc=1 holding the first `count` values; params are the tag code, the count and up to eight values. A counted element kind takes over the caller's count on each value, like pith_list_push_value_owned; a primitive list holds no counts
 pith_list_push_value|b,b|-|list.rs:770|list retains the value with its element tag (list.rs:661-662); primitive list retains nothing
 pith_list_push_value_owned|b,c|-|list.rs:668|takes the caller's count only when the list is tagged; an untagged (Primitive) list takes nothing and the caller's count leaks (list.rs:673-676); invalid handle returns without taking it (leak)
 list_push_kind|b,b,-|-|list.rs:755|borrowed: list retains with its tag (adopting tag when empty and Primitive); if it cannot own the kind it adds an extra retain under arg 2's kind (leak, never a free). If the list holds a different heap kind it also retains under the list's own (wrong) tag (list.rs:758)

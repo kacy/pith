@@ -1,0 +1,50 @@
+# `"id=" + n.to_string()` and `"id={n}"` join the number without first
+# making a string for it. Each line below is built both ways, once with the
+# conversion written inline and once with it bound to a name first, which
+# keeps the separate string; the two must agree. The values cross every
+# digit count an Int has, both signs, and both ends of the range.
+
+fn inline_text(n: Int, tag: String) -> String:
+    return "<" + n.to_string() + "|" + tag + "|{n}>" + n.to_string()
+
+fn bound_text(n: Int, tag: String) -> String:
+    digits := n.to_string()
+    return "<" + digits + "|" + tag + "|" + digits + ">" + digits
+
+fn check(n: Int) -> Bool:
+    return inline_text(n, "t") == bound_text(n, "t") and inline_text(n, "") == bound_text(n, "")
+
+# `s = s + ...` grows the string in place; the numbers land in it too.
+fn grown(count: Int) -> String:
+    mut s := ""
+    mut i := 0 - 2
+    while i < count:
+        s = s + i.to_string() + ","
+        i = i + 1
+    return s
+
+# nine parts is more than one join call takes, so these stay strings
+fn long_join(n: Int) -> String:
+    return n.to_string() + "a" + n.to_string() + "b" + n.to_string() + "c" + n.to_string() + "d" + n.to_string()
+
+fn main():
+    mut ok := true
+    mut n := 1
+    mut steps := 0
+    while steps < 19:
+        ok = ok and check(n) and check(0 - n) and check(n - 1) and check(n + 1)
+        n = n * 10
+        steps = steps + 1
+    max := 9223372036854775807
+    ok = ok and check(max) and check(0 - max) and check(0 - max - 1) and check(0)
+    print("agree: {ok}")
+    print(inline_text(0, "zero"))
+    print(inline_text(0 - 45, "neg"))
+    print(inline_text(max, "max"))
+    print(inline_text(0 - max - 1, "min"))
+    print("" + 7.to_string())
+    print(12.to_string() + "")
+    print(grown(11))
+    print(long_join(0 - 30))
+    x := 5
+    print("{x}{x + 1}{x * 100}")

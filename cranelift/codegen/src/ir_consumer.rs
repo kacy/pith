@@ -107,6 +107,9 @@ fn join_with_fallback_call(
     fallback: FuncRef,
     args: &[Value],
 ) -> Value {
+    // the fallback is the rare case: laid out after the function's hot
+    // blocks, and weighed as cold when registers are assigned.
+    builder.set_cold_block(slow);
     builder.switch_to_block(slow);
     let call = builder.ins().call(fallback, args);
     let fallback_result = builder.func.dfg.first_result(call);

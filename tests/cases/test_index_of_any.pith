@@ -1,0 +1,39 @@
+# `s.index_of_any(set)` is the byte offset of the first byte of `s` that is
+# any byte of `set`, or -1. The runtime tests eight or sixteen bytes per
+# step, so the cases cross those widths: a match in the first block, in a
+# later one, in the last partial one, and none at all, for sets of one to
+# five bytes. Each answer is printed beside the smallest index_of over the
+# set's bytes, which must agree.
+
+fn slow(s: String, set: String) -> Int:
+    mut best := 0 - 1
+    mut i := 0
+    while i < set.len():
+        at := s.index_of(set.substring(i, i + 1))
+        if at >= 0 and (best < 0 or at < best):
+            best = at
+        i = i + 1
+    return best
+
+fn show(s: String, set: String):
+    print("{s.len()} [{set.len()}] {s.index_of_any(set)} {slow(s, set)}")
+
+fn main():
+    filler := "abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz"
+    sets := [",", ",;", ",\"\n", ";:|\t", ";:|\t\n,"]
+    for set in sets:
+        show("", set)
+        show(",", set)
+        show("plain", set)
+        show("a,b;c", set)
+        for cut in [7, 8, 9, 15, 16, 17, 31, 33, 60]:
+            base := filler.substring(0, cut)
+            show(base, set)
+            show(base + ";", set)
+            show(";" + base, set)
+            show(base.substring(0, cut / 2) + "," + base.substring(cut / 2, cut), set)
+    # an empty set matches nothing
+    quoted := "say \"hi\""
+    empty := "abc".index_of_any("")
+    at_quote := quoted.index_of_any("\"")
+    print("{empty} {at_quote}")

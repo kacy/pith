@@ -230,13 +230,15 @@ fn csv_row_from_bytes(data: Bytes, start: Int, end: Int) -> Row:
         quoted_fields.push(0)
     return Row(data, starts, ends, quoted_fields)
 
-fn csv_write_string(out: ByteBuffer, text: String) -> Int!:
-    return out.write_string_utf8(text)
-
+# a field in quotes, with each quote inside it doubled. most quoted fields
+# hold a comma or a newline and no quote, and those are written as they are:
+# `replace` would build a copy that differs in nothing.
 fn csv_write_escaped_field(out: ByteBuffer, field: String) -> Int!:
     mut total := out.write_byte(CSV_QUOTE)!
-    escaped := field.replace(chr(CSV_QUOTE), chr(CSV_QUOTE) + chr(CSV_QUOTE))
-    total = total + csv_write_string(out, escaped)!
+    if field.contains("\""):
+        total = total + out.write_string_utf8(field.replace("\"", "\"\""))!
+    else:
+        total = total + out.write_string_utf8(field)!
     return total + out.write_byte(CSV_QUOTE)!
 
 # true when a field has to be quoted: it holds a comma, a quote or a
@@ -254,7 +256,7 @@ fn encode_row_bytes_to(out: ByteBuffer, row: List[String]) -> Int!:
         if csv_field_needs_quoting(field):
             total = total + csv_write_escaped_field(out, field)!
         else:
-            total = total + csv_write_string(out, field)!
+            total = total + out.write_string_utf8(field)!
     return total
 
 fn csv_test_bool_word(value: Bool) -> String:

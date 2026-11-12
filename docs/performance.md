@@ -10,35 +10,34 @@ different hardware.
 
 ## where pith stands
 
-the current numbers are the 2026-11-05 suite run in
+the current numbers are the 2026-11-12 suite run in
 [bench/README.md](../bench/README.md): every benchmark against go 1.27 and
 rust 1.99 ports on a ryzen 9 9950x, pinned to one ccd, with every runner on
-one build (main after #1320). a few rows from it, as median wall time:
+one build (main after #1394). a few rows from it, as median wall time:
 
 | workload | pith | go | rust |
 |---|---:|---:|---:|
-| json decode, 20M small objects | 716 ms | 3562 ms | 1105 ms |
-| event ledger, 200k events | 72 ms | 95 ms | 50 ms |
-| channel fan-out, 1M messages | 40 ms | 49 ms | 471 ms |
-| closure error handling, 2M calls | 359 ms | 182 ms | 160 ms |
-| green fan-out, 2M tasks from main | 641 ms | 241 ms | 392 ms |
-| sha512, 256 MB | 434 ms | 189 ms | 210 ms |
-| http server at 256 connections | 1.92M req/s, p99 184 µs | 992k (net/http), 2.27M (minimal) | 1.75M (hyper), p99 275 µs |
-| api gateway, plain forwarding at 64 connections | 472k req/s, p99 259 µs | 280k (net/http), p99 880 µs | no port |
+| json decode, 20M small objects | 710 ms | 3523 ms | 1118 ms |
+| event ledger, 200k events | 65 ms | 95 ms | 51 ms |
+| channel fan-out, 1M messages | 40 ms | 49 ms | 465 ms |
+| closure error handling, 2M calls | 289 ms | 182 ms | 163 ms |
+| green fan-out, 2M tasks from main | 632 ms | 243 ms | 393 ms |
+| sha512, 256 MB | 432 ms | 190 ms | 210 ms |
+| http server at 256 connections | 1.92M req/s, p99 217 µs | 1.00M (net/http), 2.23M (minimal) | 1.74M (hyper), p99 285 µs |
+| api gateway, plain forwarding at 64 connections | 473k req/s, p99 253 µs | 283k (net/http), p99 900 µs | no port |
 
 pith is ahead of go on json decoding, substring search, the event ledger
-and catalog workloads, channels, spawning inside tasks, http latency and the
+and catalog workloads, csv encoding, map updates, channels, spawning inside tasks, http latency and the
 api gateway. it is behind go on closures, reference cycles, spawning from
 main, sha512 and concurrent grpc calls, and behind rust on most
 single-threaded compute. the list of the largest gaps, with their causes, is
 under "where pith stands" in bench/README.md.
 
-since the 2026-11-04 run, #1315 to #1319 took the api gateway's plain forwarding
+the 2026-11-05 run before this one followed #1315 to #1319, which took the api gateway's plain forwarding
 at 64 connections from 118k to 472k req/s, against go's 280k. #1316 is most of
 it: a mutex unlock no longer moves the woken task to another worker. its cost is
 that a task waiting on a mutex beside cpu-bound tasks on its worker waits longer.
-`json_decode_shapes/map` is 15% faster, and the other rows are within noise of the
-last run. examples/gateway/README.md and bench/README.md have the details.
+`json_decode_shapes/map` was 15% faster in that run. examples/gateway/README.md and bench/README.md have the details.
 
 ### the 2-core machine (july to september 2026)
 

@@ -348,8 +348,8 @@ one uncontended lock and unlock pair per access. measured on the ryzen 9
 9950x with a 20M-iteration loop, pinned to one core, an uncontended pair
 costs 8 ns (a compare-and-swap to take the lock and one swap to release it,
 on a line the core already owns). the contended cost is what `lock_sweep`
-measures: sixteen tasks on one mutex, 50M operations, 87 ms in the
-2026-11-05 run, against 61 ms for go.
+measures: sixteen tasks on one mutex, 50M operations, 74 ms in the
+2026-11-12 run, against 61 ms for go. that row has read 87 ms in earlier runs.
 
 where this could show in a benchmark:
 

@@ -60,34 +60,34 @@ could read it as a different path than the gateway checked.
 `bench/gateway_bench.sh` compares it with `bench/gateway.go`, the same gateway
 written with go's `net/http`. the gateway gets 16 hardware threads, and wrk and
 the backends get the rest. these are medians of 3 interleaved 8-second runs, from
-the 2026-11-05 suite run, on one machine over loopback.
+the 2026-11-12 suite run, on one machine over loopback.
 
 | scenario | connections | | ok req/s | p50 | p99 | failed | peak memory |
 |---|---:|---|---:|---:|---:|---:|---:|
-| plain | 64 | pith | 472k | 130 us | 0.26 ms | 0 | 13 MB |
-| | | go | 280k | 196 us | 0.88 ms | 0 | 27 MB |
-| plain | 256 | pith | 486k | 518 us | 1.00 ms | 0 | 17 MB |
-| | | go | 400k | 610 us | 3.84 ms | 0 | 44 MB |
-| plain | 1024 | pith | 467k | 2.09 ms | 4.59 ms | 0 | 31 MB |
-| | | go | 350k | 3.39 ms | 20.1 ms | 0 | 106 MB |
-| bearer token | 64 | pith | 150k | 416 us | 0.78 ms | 0 | 18 MB |
-| | | go | 93k | 595 us | 3.24 ms | 0 | 30 MB |
-| bearer token | 256 | pith | 152k | 1.66 ms | 3.02 ms | 0 | 22 MB |
-| | | go | 157k | 1.51 ms | 6.35 ms | 0 | 46 MB |
-| bearer token | 1024 | pith | 147k | 6.94 ms | 10.9 ms | 0 | 42 MB |
-| | | go | 148k | 6.55 ms | 19.7 ms | 0 | 115 MB |
-| backend killed mid-run | 64 | pith | 418k | 152 us | 0.28 ms | 0 | 13 MB |
-| | | go | 274k | 201 us | 0.78 ms | 0 | 29 MB |
-| backend killed mid-run | 256 | pith | 421k | 639 us | 1.00 ms | 0 | 18 MB |
-| | | go | 389k | 613 us | 3.40 ms | 0 | 44 MB |
-| backend killed mid-run | 1024 | pith | 399k | 2.44 ms | 3.83 ms | 0 | 37 MB |
-| | | go | 342k | 3.50 ms | 20.5 ms | 0 | 105 MB |
+| plain | 64 | pith | 473k | 130 us | 0.25 ms | 0 | 13 MB |
+| | | go | 283k | 193 us | 0.90 ms | 0 | 27 MB |
+| plain | 256 | pith | 490k | 516 us | 0.96 ms | 0 | 17 MB |
+| | | go | 398k | 652 us | 4.25 ms | 0 | 44 MB |
+| plain | 1024 | pith | 474k | 2.08 ms | 3.69 ms | 0 | 31 MB |
+| | | go | 346k | 3.50 ms | 20.9 ms | 0 | 108 MB |
+| bearer token | 64 | pith | 154k | 406 us | 0.76 ms | 0 | 18 MB |
+| | | go | 89k | 619 us | 3.33 ms | 0 | 31 MB |
+| bearer token | 256 | pith | 156k | 1.62 ms | 2.95 ms | 0 | 22 MB |
+| | | go | 157k | 1.52 ms | 6.59 ms | 0 | 44 MB |
+| bearer token | 1024 | pith | 151k | 6.79 ms | 11.3 ms | 0 | 42 MB |
+| | | go | 148k | 6.59 ms | 19.9 ms | 0 | 111 MB |
+| backend killed mid-run | 64 | pith | 425k | 150 us | 0.28 ms | 0 | 13 MB |
+| | | go | 273k | 205 us | 0.79 ms | 0 | 27 MB |
+| backend killed mid-run | 256 | pith | 430k | 605 us | 1.14 ms | 0 | 18 MB |
+| | | go | 393k | 621 us | 3.53 ms | 0 | 44 MB |
+| backend killed mid-run | 1024 | pith | 407k | 2.63 ms | 3.94 ms | 0 | 36 MB |
+| | | go | 339k | 3.59 ms | 21.5 ms | 0 | 101 MB |
 
 pith forwards plain requests 1.7x as fast as go at 64 connections, 1.2x at 256 and
-1.3x at 1024, with a p99 3.4 to 4.4x lower. with a token to check, where most of
-the time goes to es256 verification, pith is 1.6x ahead at 64 connections, go is
-3% ahead at 256, and the two are level at 1024. go's p50 is a little lower at 256
-and 1024, and pith's p99 is lower at all three. pith uses 40 to 70% less memory
+1.4x at 1024, with a p99 3.6 to 5.7x lower. with a token to check, where most of
+the time goes to es256 verification, pith is 1.7x ahead at 64 connections and
+the two are level at 256 and 1024. go's p50 is a little lower at 256 and 1024,
+and pith's p99 is lower at all three. pith uses 40 to 70% less memory
 throughout. neither lost a request when a backend died.
 
 the 2026-11-04 run had pith at 118k, 230k and 352k req/s on plain forwarding, so

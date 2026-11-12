@@ -138,7 +138,7 @@ seconds, and the entire self-hosted compiler in about 1.3.
 
 ## the numbers
 
-measured 2026-11-05 on a ryzen 9 9950x, every language pinned to the same
+measured 2026-11-12 on a ryzen 9 9950x, every language pinned to the same
 eight cores, against go 1.27 and rust 1.99 ports that do the same work and
 print the same checksums. the full tables, one row per benchmark, are in
 [bench/README.md](bench/README.md); the history and the profiling behind
@@ -146,40 +146,38 @@ them are in [docs/performance.md](docs/performance.md).
 
 | workload | pith | go | rust |
 |---|---:|---:|---:|
-| json decode, 20M small objects | **716 ms** | 3562 ms | 1105 ms |
-| substring search | **45 ms** | 221 ms | 223 ms |
-| channel fan-out, 1M messages | **40 ms** | 49 ms | 471 ms |
-| event ledger, 200k events (json, collections, crypto) | 72 ms | 95 ms | 50 ms |
-| sort 100k ints, 30 rounds | 313 ms | 511 ms | 60 ms |
-| csv encode | 416 ms | 309 ms | 130 ms |
-| error handling through closures | 359 ms | 182 ms | 160 ms |
-| sha256, 256 MB | 109 ms | 96 ms | 96 ms |
-| http server at 256 connections, req/s | 1.92M | 2.27M (minimal), 992k (net/http) | 1.75M (hyper) |
-| api gateway, plain forwarding at 64 / 1024 connections, req/s | **472k / 467k** | 280k / 350k (net/http) | no port |
+| json decode, 20M small objects | **710 ms** | 3523 ms | 1118 ms |
+| substring search | **45 ms** | 221 ms | 220 ms |
+| channel fan-out, 1M messages | **40 ms** | 49 ms | 465 ms |
+| event ledger, 200k events (json, collections, crypto) | 65 ms | 95 ms | 51 ms |
+| sort 100k ints, 30 rounds | 300 ms | 504 ms | 59 ms |
+| csv encode | 224 ms | 309 ms | 131 ms |
+| error handling through closures | 289 ms | 182 ms | 163 ms |
+| sha256, 256 MB | 110 ms | 95 ms | 97 ms |
+| http server at 256 connections, req/s | 1.92M | 2.23M (minimal), 1.00M (net/http) | 1.74M (hyper) |
+| api gateway, plain forwarding at 64 / 1024 connections, req/s | **473k / 474k** | 283k / 346k (net/http) | no port |
 
 - pith is faster than go on json decoding, text search, the event ledger
-  and catalog workloads, int sorting, channels, spawning and parallel
-  compute. it is faster than rust on half the json shapes, text search,
+  and catalog workloads, csv encoding, map updates, int sorting, channels,
+  spawning and parallel compute. it is faster than rust on half the json shapes, text search,
   channels, task churn and grpc calls. its http server handles more
   requests per second than hyper up to 256 connections, and has the lowest
   p99 latency of every go and rust server measured at every connection
   count.
 - `examples/gateway`, a reverse proxy with auth, retries and a circuit
   breaker, forwards 1.2 to 1.7x as many requests per second as the same
-  gateway in go's net/http, with a p99 3.4 to 4.4x lower and 40 to 70% less
+  gateway in go's net/http, with a p99 3.6 to 5.7x lower and 40 to 70% less
   memory. with es256 tokens to check, the two are level at 256 and 1024
   connections.
-- go is ahead on closures, reference cycles, task scheduling, string
-  building, string-keyed maps, concurrent grpc calls and raw http
-  throughput against a minimal server.
-- rust is ahead on most single-threaded compute, mostly by 1.4x to 5.9x.
-  the outlier is walking decoded json (9.0x).
+- go is ahead on closures, reference cycles, task scheduling, concurrent
+  grpc calls and raw http throughput against a minimal server.
+- rust is ahead on most single-threaded compute, mostly by 1.3x to 5.6x.
+  the outlier is walking decoded json (6.0x).
 
 these come from one machine, with clients and servers on the same box over
-loopback. the gateway has no rust port, and a day earlier go was 2.4x ahead
-of it. part of the change is a fix for a scheduler bug that starved new
-connections, and the change behind most of it makes a mutex wait longer when
-cpu-bound tasks share its worker. [examples/gateway/README.md](examples/gateway/README.md)
+loopback. the gateway has no rust port. one change behind its numbers makes
+a mutex wait longer when cpu-bound tasks share its worker.
+[examples/gateway/README.md](examples/gateway/README.md)
 has the details.
 
 ## what it does not do

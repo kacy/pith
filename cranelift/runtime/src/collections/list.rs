@@ -203,11 +203,15 @@ impl ListImpl {
         }
     }
 
+    #[inline(always)]
     fn push_value(&mut self, value: i64) {
         self.share_stored(value);
         if self.uses_value_storage() {
             self.values8.push(value);
-            self.sync_value_view();
+            // the view after a push is never empty, so this is
+            // sync_value_view without its branches
+            self.values8_len = self.values8.len();
+            self.values8_ptr = self.values8.as_ptr();
         } else {
             let bytes = value.to_ne_bytes();
             let elem_len = self.elem_size.min(bytes.len());
@@ -761,12 +765,15 @@ unsafe fn borrowed_store_retains(impl_ref: &mut ListImpl, value: i64, elem_tag: 
     }
 }
 
+#[inline(always)]
 unsafe fn push_value_inner(list: PithList, value: i64, takes_caller_count: bool) {
     let Some(impl_ref) = list_mut(list) else {
         return;
     };
     crate::perf_stats!(PERF_LIST_PUSHES += 1);
-    if !takes_caller_count {
+    // a list of plain values owns no counts, which is the common push: the
+    // retain is a call, so it is only made for a kind that has one
+    if !takes_caller_count && impl_ref.type_tag != ListTypeTag::Primitive {
         retain_element(impl_ref.type_tag, value);
     }
     impl_ref.push_value(value);

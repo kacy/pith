@@ -71,6 +71,19 @@ written the way a Go or Rust developer would write them. They use the standard
 library, plus a crate where Rust's standard library has no equivalent (serde_json,
 tokio, hyper, RustCrypto, crc32fast, ruzstd), or klauspost/compress for zstd in Go.
 
+The single-threaded rows also have C and C++ ports (`bench/<name>.c` and
+`.cpp`), built with `-O2` and nothing beyond the standard libraries. They are
+there to show how much room is left. `tight_loop`, `path_clean_count` and the
+`none`, `fnv1a` and `crc32` hash rows have only a C port, since the C++ code
+would be the same. `string_buffer` has only a C++ port, and only its `current`
+arm. The sha rows, the task and channel rows and the servers have none: they
+would need a library or a hand-written scheduler. Three caveats apply when
+reading the numbers. gcc and clang remove the `malloc` and `free` pair in
+`cyclic_graph.c` entirely, so its C++ port with `shared_ptr` is the fair row.
+`hash_kernels.c` computes crc32 with portable slicing-by-8 tables, without the
+carry-less multiply `crc32fast` uses. `generic_sort.c` uses `qsort`, which calls
+its comparator through a pointer.
+
 `bench/compare.sh` builds every arm, checks its output against Pith's, and runs
 interleaved rounds. The benchmark list, with arguments and build commands, is
 `bench/compare.list`:

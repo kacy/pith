@@ -48,6 +48,7 @@ allowed='pith_runtime::runtime_core::pool_slot_slow
 pith_runtime::runtime_core::tls_globals_get
 pith_runtime::runtime_core::tls_globals_set
 pith_runtime::runtime_core::take_thread_tls
+pith_runtime::runtime_core::thread_tls_install
 pith_runtime::cycle::traced_children_push
 pith_runtime::cycle::traced_children_take
 pith_runtime::share::thread_mark

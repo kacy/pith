@@ -487,16 +487,31 @@ pub extern "C" fn pith_byte_buffer_with_capacity(capacity: i64) -> i64 {
 /// append `bytes` to the buffer behind `handle`, returning the count appended
 /// (`0` for an empty slice, which is a success). the buffer handle is checked
 /// first, so an invalid one is what a call with two bad arguments reports.
-unsafe fn append_to_buffer(handle: i64, bytes: Option<&[u8]>, what: &str) -> Result<usize, String> {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return Err("invalid buffer handle".to_string());
-    };
-    let Some(bytes) = bytes else {
-        return Err(format!("invalid {what}"));
+///
+/// inlined into each entry point, with the failure text built out of line:
+/// the append is a few instructions, and as a call that hands back a
+/// `Result<usize, String>` it cost more than the copy it wraps.
+#[inline(always)]
+unsafe fn append_to_buffer(builtin: &str, handle: i64, bytes: Option<&[u8]>, what: &str) -> ResultPair {
+    let (Some(buffer), Some(bytes)) = (pith_byte_buffer_mut(handle), bytes) else {
+        return append_failure(builtin, handle, what);
     };
     crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += bytes.len());
     buffer.data.extend_from_slice(bytes);
-    Ok(bytes.len())
+    crate::ffi_util::result_ok(bytes.len() as i64)
+}
+
+/// the failed result of an append: an invalid buffer handle is reported
+/// before an invalid value.
+#[cold]
+#[inline(never)]
+unsafe fn append_failure(builtin: &str, handle: i64, what: &str) -> ResultPair {
+    let outcome = if pith_byte_buffer_mut(handle).is_none() {
+        Err("invalid buffer handle".to_string())
+    } else {
+        Err(format!("invalid {what}"))
+    };
+    write_result(builtin, outcome)
 }
 
 /// append a `Bytes` value to a buffer, as a result pair holding the count or
@@ -504,15 +519,14 @@ unsafe fn append_to_buffer(handle: i64, bytes: Option<&[u8]>, what: &str) -> Res
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_write(handle: i64, data: i64) -> ResultPair {
     let bytes = pith_bytes_ref(data).map(|bytes| bytes.data.as_slice());
-    write_result("byte_buffer_write", append_to_buffer(handle, bytes, "bytes value"))
+    append_to_buffer("byte_buffer_write", handle, bytes, "bytes value")
 }
 
 /// append a string's bytes to a buffer, as a result pair holding the count or
 /// the failure's reason: an invalid buffer handle or an invalid string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_write_string_utf8(handle: i64, s: *const i8) -> ResultPair {
-    let outcome = append_to_buffer(handle, cstr_bytes(s), "string");
-    write_result("byte_buffer_write_string_utf8", outcome)
+    append_to_buffer("byte_buffer_write_string_utf8", handle, cstr_bytes(s), "string")
 }
 
 #[no_mangle]

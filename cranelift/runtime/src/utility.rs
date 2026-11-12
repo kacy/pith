@@ -181,6 +181,140 @@ pub unsafe extern "C" fn pith_cstring_index_of(haystack: *const i8, needle: *con
     }
 }
 
+/// Offset of the first byte of `haystack` that equals any byte of `set`, or
+/// `None`. Eight bytes are tested per step: xor with a byte repeated across
+/// the word turns a match into a zero byte, and the usual zero-byte test
+/// finds it. That test can flag a byte above a real zero byte, never one
+/// below it, so the lowest flagged byte across all the set's bytes is a real
+/// match. On x86_64 a haystack of sixteen bytes or more takes the sse2
+/// version below. Sets longer than four bytes take a 256-bit table instead.
+pub(crate) fn find_any_byte(haystack: &[u8], set: &[u8]) -> Option<usize> {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    match set.len() {
+        0 => return None,
+        1 => return crate::substring::find(haystack, set),
+        2..=4 => {}
+        _ => {
+            let mut table = [0u64; 4];
+            for &b in set {
+                table[(b >> 6) as usize] |= 1 << (b & 63);
+            }
+            return haystack.iter().position(|&b| table[(b >> 6) as usize] >> (b & 63) & 1 != 0);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    if haystack.len() >= 16 {
+        return find_any_byte_sse2(haystack, set);
+    }
+    // unused slots repeat the first byte, so every set runs the same four
+    // tests with no loop over its length.
+    let mut splat = [LOW * set[0] as u64; 4];
+    for (slot, &b) in splat.iter_mut().zip(set) {
+        *slot = LOW * b as u64;
+    }
+    let hits = |w: u64| {
+        let mut hit = 0;
+        for s in splat {
+            let x = w ^ s;
+            hit |= x.wrapping_sub(LOW) & !x & HIGH;
+        }
+        hit
+    };
+    let mut words = haystack.chunks_exact(8);
+    let mut at = 0;
+    for word in &mut words {
+        let hit = hits(u64::from_le_bytes(word.try_into().unwrap_or([0; 8])));
+        if hit != 0 {
+            return Some(at + (hit.trailing_zeros() / 8) as usize);
+        }
+        at += 8;
+    }
+    let tail = words.remainder();
+    if tail.is_empty() {
+        return None;
+    }
+    // the last one to seven bytes. a haystack of eight or more is tested
+    // through its final eight bytes: the ones that overlap the word before
+    // were just found clean, so the lowest flag is still a real match. a
+    // shorter one is assembled into a word a byte at a time (a copy into a
+    // buffer would be a call, and reading the buffer back as a word stalls),
+    // and flags in the unused bytes are masked off.
+    let (word, base, live) = match haystack.last_chunk::<8>() {
+        Some(last) => (u64::from_le_bytes(*last), haystack.len() - 8, u64::MAX),
+        None => {
+            let mut word = 0;
+            for (i, &b) in tail.iter().enumerate() {
+                word |= (b as u64) << (8 * i);
+            }
+            (word, 0, u64::MAX >> (64 - 8 * tail.len()))
+        }
+    };
+    let hit = hits(word) & live;
+    if hit != 0 {
+        return Some(base + (hit.trailing_zeros() / 8) as usize);
+    }
+    None
+}
+
+/// `find_any_byte` for a haystack of sixteen bytes or more and a set of two to
+/// four: sixteen bytes per step, one compare per set byte. The last partial
+/// block is tested through the haystack's final sixteen bytes, and the ones
+/// that overlap the block before were just found clean.
+#[cfg(target_arch = "x86_64")]
+fn find_any_byte_sse2(haystack: &[u8], set: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::{
+        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8,
+    };
+    // sse2 is part of the x86_64 baseline, and every load below reads sixteen
+    // bytes that lie inside `haystack`.
+    unsafe {
+        let mut needles = [_mm_set1_epi8(set[0] as i8); 4];
+        for (slot, &b) in needles.iter_mut().zip(set) {
+            *slot = _mm_set1_epi8(b as i8);
+        }
+        let hits = |at: usize| {
+            let block = _mm_loadu_si128(haystack.as_ptr().add(at) as *const __m128i);
+            let any = _mm_or_si128(
+                _mm_or_si128(_mm_cmpeq_epi8(block, needles[0]), _mm_cmpeq_epi8(block, needles[1])),
+                _mm_or_si128(_mm_cmpeq_epi8(block, needles[2]), _mm_cmpeq_epi8(block, needles[3])),
+            );
+            _mm_movemask_epi8(any) as u32
+        };
+        let last = haystack.len() - 16;
+        let mut at = 0;
+        while at < last {
+            let hit = hits(at);
+            if hit != 0 {
+                return Some(at + hit.trailing_zeros() as usize);
+            }
+            at += 16;
+        }
+        let hit = hits(last);
+        if hit != 0 {
+            return Some(last + hit.trailing_zeros() as usize);
+        }
+        None
+    }
+}
+
+/// Byte offset of the first byte of `haystack` that is any of the bytes of
+/// `set`, or -1. One pass, where a `contains` per byte walks the string once
+/// for each. The set is read as bytes, so it is meant for ascii delimiters.
+///
+/// # Safety
+/// Both arguments must be null or valid null-terminated C strings
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_index_of_any(haystack: *const i8, set: *const i8) -> i64 {
+    let (Some(h_bytes), Some(set_bytes)) = (cstr_bytes(haystack), cstr_bytes(set)) else {
+        return -1;
+    };
+    match find_any_byte(h_bytes, set_bytes) {
+        Some(at) => at as i64,
+        None => -1,
+    }
+}
+
 /// 1 when needle occurs in haystack, else 0. An empty needle is contained
 /// in every string.
 ///
@@ -328,6 +462,39 @@ pub unsafe extern "C" fn pith_is_dir(path: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The word-at-a-time search has to agree with the obvious loop for every
+    /// set size, match position and tail length, including the bytes whose
+    /// neighbours make the zero-byte test over-report (a 0x01 above a match).
+    #[test]
+    fn find_any_byte_matches_a_byte_loop() {
+        let naive = |h: &[u8], set: &[u8]| h.iter().position(|b| set.contains(b));
+        let sets: [&[u8]; 6] = [b"", b",", b",\"", b",\"\n", b"\x00\x01\x80\xff", b",;:|\t\n"];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for len in 0..70 {
+            for _ in 0..200 {
+                let hay: Vec<u8> = (0..len)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        // a small alphabet, so the sets match often
+                        b"ab,\"\n\x00\x01\x02\x80\xff;x"[(state % 12) as usize]
+                    })
+                    .collect();
+                for set in sets {
+                    assert_eq!(find_any_byte(&hay, set), naive(&hay, set), "{hay:?} {set:?}");
+                }
+            }
+        }
+        unsafe {
+            let hay = b"plain,field\0".as_ptr() as *const i8;
+            assert_eq!(pith_cstring_index_of_any(hay, b"\"\n,\0".as_ptr() as *const i8), 5);
+            assert_eq!(pith_cstring_index_of_any(hay, b";\0".as_ptr() as *const i8), -1);
+            assert_eq!(pith_cstring_index_of_any(hay, b"\0".as_ptr() as *const i8), -1);
+            assert_eq!(pith_cstring_index_of_any(std::ptr::null(), hay), -1);
+        }
+    }
 
     #[test]
     fn utility_cstring_callers_handle_null_and_invalid_utf8() {

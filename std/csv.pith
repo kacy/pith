@@ -240,16 +240,11 @@ fn csv_write_escaped_field(out: ByteBuffer, field: String) -> Int!:
     return total + out.write_byte(CSV_QUOTE)!
 
 # true when a field has to be quoted: it holds a comma, a quote or a
-# newline. one pass over the field's bytes, read in place. the three
-# substring searches this replaces walked the field three times through a
-# runtime search that compares slice by slice, and built two one-character
-# strings per field to search for; on a ten-column row that was two thirds
-# of the encoder's instructions (docs/performance.md, 2026-09-10).
-# a field is quoted when it holds a comma, a quote or a newline. each check
-# is the runtime's substring search, which takes a one-byte needle to memchr,
-# so a field is scanned a word at a time instead of one byte per loop pass.
+# newline. index_of_any looks for all three in one pass over the field,
+# eight bytes at a time. three `contains` calls walked it three times and
+# were half of the encoder's instructions.
 fn csv_field_needs_quoting(field: String) -> Bool:
-    return field.contains(",") or field.contains("\"") or field.contains("\n")
+    return field.index_of_any(",\"\n") >= 0
 
 fn encode_row_bytes_to(out: ByteBuffer, row: List[String]) -> Int!:
     mut total := 0

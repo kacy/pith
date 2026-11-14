@@ -1,0 +1,20 @@
+# the root file declares a plain Pod and imports a generic Pod. each value
+# must reach its own methods, and `g.Pod[T]` must still name the generic.
+import clash_mixed_generic as g
+
+struct Pod:
+    n: Int
+
+impl Pod:
+    fn tag() -> String:
+        return "main pod {self.n}"
+
+fn main():
+    a := g.make(3)
+    print(a.tag())
+    b := Pod(4)
+    print(b.tag())
+    e := g.Pod[Int](1)
+    print(e.tag())
+    x: g.Pod[String] := g.make("q")
+    print(x.tag())

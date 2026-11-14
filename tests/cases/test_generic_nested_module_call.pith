@@ -1,0 +1,16 @@
+# a generic body in one module that calls a generic in another (#1095). the
+# specialization of the inner generic used to resolve its callee in the
+# main module's scope, so the call failed to compile: `call to unknown
+# function 'gather'` for a bare import, `unknown load source 'b'` for an
+# aliased one.
+from generic_nested_call_a import reverse_all, reverse_aliased
+
+fn main():
+    r := reverse_all(["a", "b", "c"])
+    print(r[0] + r[1] + r[2])
+    n := reverse_all([1, 2, 3])
+    print("{n[0]} {n[2]}")
+    q := reverse_aliased(["x", "y"])
+    print(q[0] + q[1])
+    m := reverse_aliased([7, 8, 9])
+    print("{m[0]}")

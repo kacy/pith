@@ -52,18 +52,10 @@ stale and a fix to it is welcome.
   binding a local of the same name in one function is E266. `pith lint` reports
   the shadowing as E308.
 - **same-named types in different modules**. two modules can each declare a
-  struct, plain or generic, with the same name, and each value dispatches to its
-  own module's methods. a second impl block that declares a method the struct
-  already has is E263 (an interface impl may repeat an inherent method of the
-  same name, as std/io does). three shapes still resolve by the bare name:
-  - a generic struct and a plain struct with the same name in two modules: a
-    method call on either runs the body from whichever module is imported last,
-    with no diagnostic. give them distinct names.
-  - a generic function whose signature names a generic its own module declares
-    (`iter.map_iter` returning `MapIter`) resolves that name in the caller, so a
-    caller that declares its own `MapIter` gets a compile error.
-  - two modules that each declare the same generic enum fail to compile
-    (`unknown load source` from the backend).
+  struct or enum, plain or generic, with the same name, and each value
+  dispatches to its own module's methods. a second impl block that declares a
+  method the struct already has is E263 (an interface impl may repeat an
+  inherent method of the same name, as std/io does).
 - **method syntax never reaches a free function**. there is no ufcs. a
   primitive receiver resolves builtins only, so `(1.5).to_int()` is the
   `Float` builtin even when a free `fn to_int` exists.
@@ -84,9 +76,6 @@ stale and a fix to it is welcome.
   specialization is type checked against its concrete types, so a body that is
   wrong for some type its bound admits is reported only when a caller reaches
   that type. `pith check` names the specialization (`... in bad[String]`).
-- **a generic function in another module, called from inside a generic body,
-  can fail to resolve at startup** (#1095). simple shapes work. a non-generic
-  wrapper in the calling module is the workaround.
 - **`spawn` with a builtin call in an argument fails to compile** (#1082).
   `spawn f(bit_and(x, y))` fails with `unknown load source`. bind the argument
   to a local first.

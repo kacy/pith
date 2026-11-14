@@ -143,6 +143,13 @@ mut ambiguous_generic_bases: Map[String, Bool] := {}
 # the module each generic declaration was registered from, keyed by its AST
 # node index, so an instantiation can name the declaration it came from.
 mut generic_declaration_modules: Map[Int, String] := {}
+# the plain (non-generic) struct and enum names each module declares, keyed
+# "module<TAB>name", and the first module to declare each name. a module's
+# own plain type shadows a generic of the same name from another module
+# (resolve_generic_declaration_key), and a generic whose name another module
+# gives a plain type is ambiguous (note_plain_type_declaration).
+mut module_plain_type_names: Map[String, Bool] := {}
+mut plain_type_first_module: Map[String, String] := {}
 mut checking_test_decl := false
 # impl set: "Type\tInterface" -> 1
 mut implementation_set: Map[String, Int] := {}
@@ -231,6 +238,8 @@ pub fn initialize_checker(file_path: String):
     generic_base_first_module = {}
     ambiguous_generic_bases = {}
     generic_declaration_modules = {}
+    module_plain_type_names = {}
+    plain_type_first_module = {}
     checker_interfaces_reset()
     implementation_set = {}
     interface_decl_index = {}
@@ -603,7 +612,14 @@ fn resolve_named_type(name: String) -> Int:
     return tid
 
 fn resolve_generic_type_from_node(node: Node) -> Int:
-    base := resolve_imported_type_name(node.value)
+    mut base := resolve_imported_type_name(node.value)
+    # `alias.Box[T]` names the aliased module's generic, which a plain type
+    # this module declares under the bare name must not shadow
+    parts := split_qualified_name(node.value)
+    if parts.1 != "" and module_aliases.contains_key(parts.0):
+        qualified := module_generic_target_name(module_aliases[parts.0], parts.1)
+        if generic_declaration_map.contains_key(qualified):
+            base = qualified
     mut type_args: List[Int] := []
     for child in node.children:
         type_args.push(resolve_type_implementation(child))
@@ -961,6 +977,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
     mut empty_bools: List[Bool] := []
     tid := add_type_info(ti_struct(base_name, empty_names, empty_ints, empty_bools, empty_bools))
     register_module_type_name(base_name, tid)
+    note_plain_type_declaration(base_name)
     define_binding_at(current_scope, base_name, tid, false, node_idx)
     # non-generic: resolve field types immediately
     mut field_names: List[String] := []
@@ -1030,6 +1047,7 @@ fn register_enum_declaration(node_idx: Int, node: Node):
             variant_types.push(vtypes)
     tid := add_type_info(ti_enum(base_name, variant_names, variant_types))
     register_module_type_name(base_name, tid)
+    note_plain_type_declaration(base_name)
     define_binding_at(current_scope, base_name, tid, false, node_idx)
 
 # ---------------------------------------------------------------
@@ -1417,8 +1435,24 @@ fn register_generic_declaration(name: String, node_idx: Int):
             ambiguous_generic_bases.insert(name, true)
     else:
         generic_base_first_module.insert(name, current_checker_module_path)
+    if plain_type_first_module.contains_key(name):
+        if plain_type_first_module[name] != current_checker_module_path:
+            ambiguous_generic_bases.insert(name, true)
     if current_checker_module_path.len() > 0 and generic_declaration_map.contains_key(name) == false:
         generic_declaration_map.insert(name, node_idx)
+
+# record a plain struct or enum this module declares. a generic of the same
+# name in another module makes that generic's bare name ambiguous, exactly as
+# a second generic would: its instances, methods and impls are then keyed by
+# its module's name, so the plain type's bare-name entries cannot answer for
+# them.
+fn note_plain_type_declaration(name: String):
+    module_plain_type_names.insert(current_checker_module_path + chr(9) + name, true)
+    if plain_type_first_module.contains_key(name) == false:
+        plain_type_first_module.insert(name, current_checker_module_path)
+    if generic_base_first_module.contains_key(name):
+        if generic_base_first_module[name] != current_checker_module_path:
+            ambiguous_generic_bases.insert(name, true)
 
 # the name every table keys a generic base by. a generic declaration has no
 # type id to key on — only its instances get one — so a struct's methods, its
@@ -1436,6 +1470,17 @@ pub fn generic_base_identity(module_path: String, name: String) -> String:
     if generic_declaration_map.contains_key(key):
         return key
     return name
+
+## true when the module at `module_path` ("" for the root file) itself
+## declares a generic struct, enum or function called `name`.
+pub fn module_declares_generic(module_path: String, name: String) -> Bool:
+    key := module_generic_target_name(module_path, name)
+    if generic_declaration_map.contains_key(key) == false:
+        return false
+    decl_idx := generic_declaration_map[key]
+    if generic_declaration_modules.contains_key(decl_idx) == false:
+        return false
+    return generic_declaration_modules[decl_idx] == module_path
 
 # the identity of the generic declaration at this AST node index, resolved
 # from the module it was registered in. instantiation names an instance from
@@ -1516,6 +1561,13 @@ fn resolve_generic_declaration_key(name: String) -> String:
         current_key := module_generic_target_name(current_checker_module_path, name)
         if generic_declaration_map.contains_key(current_key):
             return current_key
+    # a plain struct or enum this module declares is what its bare name means
+    # here, even when another module declares a generic of the same name.
+    # without this, the module's impl on its own plain type registered as an
+    # impl on the foreign generic, and a method call on either value ran
+    # whichever body was registered last.
+    if module_plain_type_names.contains_key(current_checker_module_path + chr(9) + name):
+        return ""
     if generic_declaration_map.contains_key(name):
         return name
     if current_checker_module_path.len() == 0:
@@ -1839,7 +1891,15 @@ fn check_implementation_declaration(node: Node):
     if method_start == 2 and iface_type_base_name(first_type_node) == "Drop":
         check_drop_implementation(node, concrete_name, method_start)
 
-    concrete_tid := lookup_type_id(concrete_name)
+    # the module's own declaration first: the global table holds whichever
+    # module registered the name last, which can be another module's plain
+    # struct while this impl is on this module's generic of the same name. a
+    # generic's bodies are checked per specialization, not here.
+    mut concrete_tid := resolve_type_name_module_scoped(concrete_name)
+    if concrete_tid < 0:
+        if has_generic_declaration(concrete_name):
+            return
+        concrete_tid = lookup_type_id(concrete_name)
     if concrete_tid < 0:
         return
 
@@ -8384,6 +8444,8 @@ pub struct CheckerSnapshot:
     pub generic_base_first_module: Map[String, String]
     pub ambiguous_generic_bases: Map[String, Bool]
     pub generic_declaration_modules: Map[Int, String]
+    pub module_plain_type_names: Map[String, Bool]
+    pub plain_type_first_module: Map[String, String]
     pub checking_test_decl: Bool
     pub implementation_set: Map[String, Int]
     pub interface_decl_index: Map[String, Int]
@@ -8449,6 +8511,8 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         generic_base_first_module: copy_map(generic_base_first_module),
         ambiguous_generic_bases: copy_map(ambiguous_generic_bases),
         generic_declaration_modules: copy_map(generic_declaration_modules),
+        module_plain_type_names: copy_map(module_plain_type_names),
+        plain_type_first_module: copy_map(plain_type_first_module),
         checking_test_decl: checking_test_decl,
         implementation_set: copy_map(implementation_set),
         interface_decl_index: copy_map(interface_decl_index),
@@ -8514,6 +8578,8 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     generic_base_first_module = copy_map(s.generic_base_first_module)
     ambiguous_generic_bases = copy_map(s.ambiguous_generic_bases)
     generic_declaration_modules = copy_map(s.generic_declaration_modules)
+    module_plain_type_names = copy_map(s.module_plain_type_names)
+    plain_type_first_module = copy_map(s.plain_type_first_module)
     checking_test_decl = s.checking_test_decl
     implementation_set = copy_map(s.implementation_set)
     interface_decl_index = copy_map(s.interface_decl_index)

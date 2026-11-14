@@ -1,0 +1,15 @@
+# test_mixed_generic_struct_clash with the plain module imported first. the
+# generic impl body used to be checked against the plain struct the global
+# type table held, and failed with E209.
+import clash_mixed_plain as p
+import clash_mixed_generic as g
+
+fn main():
+    a := g.make(3)
+    print(a.tag())
+    b := p.make(4)
+    print(b.tag())
+    e := g.Pod[Int](1)
+    print(e.tag())
+    x: g.Pod[String] := g.make("q")
+    print(x.tag())

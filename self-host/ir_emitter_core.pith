@@ -39,7 +39,7 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
-from checker import generic_base_identity, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import generic_base_identity, module_declares_generic, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -13250,6 +13250,10 @@ fn ir_impl_owner_tid(impl_type: String, module_path: String) -> Int:
     mut path := module_path
     if path.len() == 0:
         path = ir_current_module_path
+    # the module's own generic of this name has no tid, whatever plain struct
+    # another module registered under the bare name
+    if module_declares_generic(path, impl_type):
+        return 0 - 1
     if path.len() > 0:
         qualified := lookup_qualified_type_id(path, impl_type)
         if qualified >= 0:

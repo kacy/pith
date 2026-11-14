@@ -1,0 +1,29 @@
+# a generic function's signature names generic types its own module
+# declares. the caller here declares its own generic Wrap and MapIter, and
+# the library calls must still resolve `Wrap[T]` and `MapIter[I, U]` in the
+# declaring module. they used to resolve in the caller, which made the
+# map_iter call a compile error.
+import generic_sig_name_lib as lib
+import std.iter as iter
+
+struct Wrap[T]:
+    label: T
+
+impl Wrap:
+    fn show() -> String:
+        return "main wrap {self.label}"
+
+struct MapIter[T]:
+    n: T
+
+fn main():
+    w := lib.wrap(5)
+    print(w.show())
+    s := lib.wrap("hi")
+    print(s.show())
+    mine := Wrap[String]("own")
+    print(mine.show())
+    doubled := iter.to_list(iter.map_iter(iter.Range(0, 3), fn(x: Int) => x * 2))
+    print("{doubled}")
+    m := MapIter[Int](4)
+    print("{m.n}")

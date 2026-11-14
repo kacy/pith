@@ -4191,18 +4191,26 @@ fn check_generic_function_call_explicit(name: String, index_node: Node, arg_indi
         report_error("E207", "expected " + param_type_nodes.len().to_string() + " arguments, got " + arg_types.len().to_string())
         return TID_ERR
 
+    signature_scope := enter_signature_scope(decl_idx)
     mut ret_type := TID_VOID
     for child in decl_node.children:
         cn := get_node(child)
         if cn.kind == "returns":
             ret_type = resolve_type_with_substitution_map(cn.children[0], generic_params, subst_args)
+    mut concrete_params: List[Int] := []
+    for ptn in param_type_nodes:
+        if ptn >= 0:
+            concrete_params.push(resolve_type_with_substitution_map(ptn, generic_params, subst_args))
+        else:
+            concrete_params.push(TID_ERR)
+    leave_signature_scope(signature_scope)
 
     # same widening rule as the inferred path: a plain value satisfies an
     # optional parameter once the explicit type args make it concrete.
     mut vidx := 0
     for ptn in param_type_nodes:
         if ptn >= 0 and vidx < arg_types.len():
-            concrete := resolve_type_with_substitution_map(ptn, generic_params, subst_args)
+            concrete := concrete_params[vidx]
             if is_error_type(concrete) == false and is_error_type(arg_types[vidx]) == false:
                 if arg_types[vidx] != concrete:
                     if argument_widens_to_optional(argument_expression_index(arg_indices[vidx]), arg_types[vidx], concrete) == false:
@@ -5226,12 +5234,22 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
         return TID_ERR
     record_generic_call_subst(subst_args)
     queue_function_specialization(decl_idx, 0 - 1, subst_args)
-    # resolve return type with substitution
+    # resolve return type with substitution. the types come from the
+    # signature's own module, not the caller's: `MapIter[I, U]` in std.iter
+    # names std.iter's MapIter even when the caller declares one too.
+    signature_scope := enter_signature_scope(decl_idx)
     mut ret_type := TID_VOID
     for child in decl_node.children:
         cn := get_node(child)
         if cn.kind == "returns":
             ret_type = resolve_type_with_substitution_map(cn.children[0], generic_params, subst_args)
+    mut concrete_params: List[Int] := []
+    for ptn in param_type_nodes:
+        if ptn >= 0:
+            concrete_params.push(resolve_type_with_substitution_map(ptn, generic_params, subst_args))
+        else:
+            concrete_params.push(TID_ERR)
+    leave_signature_scope(signature_scope)
     # validate arg types against concrete param types. a plain value widens
     # into an optional parameter here the same way it does on the non-generic
     # paths — safe now that #148 made the specialization read the parameter's
@@ -5240,7 +5258,7 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
     for ptn in param_type_nodes:
         if ptn >= 0:
             if vidx < arg_types.len():
-                concrete := resolve_type_with_substitution_map(ptn, generic_params, subst_args)
+                concrete := concrete_params[vidx]
                 if is_error_type(concrete) == false:
                     if is_error_type(arg_types[vidx]) == false:
                         if arg_types[vidx] != concrete:

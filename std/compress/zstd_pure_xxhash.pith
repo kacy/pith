@@ -43,10 +43,10 @@ fn read32(data: Bytes, off: Int) -> Int:
     return bytes_read_word(data, off, 4)
 
 fn round(acc: Int, input: Int) -> Int:
-    return bits.rotl64(acc + input * prime2(), 31) * prime1()
+    return bits.rotl64(acc.wrapping_add(input.wrapping_mul(prime2())), 31).wrapping_mul(prime1())
 
 fn merge_round(acc: Int, val: Int) -> Int:
-    return bits.xor(acc, round(0, val)) * prime1() + prime4()
+    return bits.xor(acc, round(0, val)).wrapping_mul(prime1()).wrapping_add(prime4())
 
 ## the 64-bit xxhash of `data` under `seed`.
 pub fn xxh64(data: Bytes, seed: Int) -> Int:
@@ -61,51 +61,51 @@ pub fn xxh64(data: Bytes, seed: Int) -> Int:
         # frame decode. keep this in sync with round().
         p1 := prime1()
         p2 := prime2()
-        mut v1 := seed + p1 + p2
-        mut v2 := seed + p2
+        mut v1 := seed.wrapping_add(p1).wrapping_add(p2)
+        mut v2 := seed.wrapping_add(p2)
         mut v3 := seed
-        mut v4 := seed - p1
+        mut v4 := seed.wrapping_sub(p1)
         while pos + 32 <= n:
             # bits.rotl64 lowers to one rotate instruction
-            a1 := v1 + bytes_read_word(data, pos, 8) * p2
-            v1 = bits.rotl64(a1, 31) * p1
-            a2 := v2 + bytes_read_word(data, pos + 8, 8) * p2
-            v2 = bits.rotl64(a2, 31) * p1
-            a3 := v3 + bytes_read_word(data, pos + 16, 8) * p2
-            v3 = bits.rotl64(a3, 31) * p1
-            a4 := v4 + bytes_read_word(data, pos + 24, 8) * p2
-            v4 = bits.rotl64(a4, 31) * p1
+            a1 := v1.wrapping_add(bytes_read_word(data, pos, 8).wrapping_mul(p2))
+            v1 = bits.rotl64(a1, 31).wrapping_mul(p1)
+            a2 := v2.wrapping_add(bytes_read_word(data, pos + 8, 8).wrapping_mul(p2))
+            v2 = bits.rotl64(a2, 31).wrapping_mul(p1)
+            a3 := v3.wrapping_add(bytes_read_word(data, pos + 16, 8).wrapping_mul(p2))
+            v3 = bits.rotl64(a3, 31).wrapping_mul(p1)
+            a4 := v4.wrapping_add(bytes_read_word(data, pos + 24, 8).wrapping_mul(p2))
+            v4 = bits.rotl64(a4, 31).wrapping_mul(p1)
             pos = pos + 32
-        h = bits.rotl64(v1, 1) + bits.rotl64(v2, 7) + bits.rotl64(v3, 12) + bits.rotl64(v4, 18)
+        h = bits.rotl64(v1, 1).wrapping_add(bits.rotl64(v2, 7)).wrapping_add(bits.rotl64(v3, 12)).wrapping_add(bits.rotl64(v4, 18))
         h = merge_round(h, v1)
         h = merge_round(h, v2)
         h = merge_round(h, v3)
         h = merge_round(h, v4)
     else:
-        h = seed + prime5()
+        h = seed.wrapping_add(prime5())
 
-    h = h + n
+    h = h.wrapping_add(n)
 
     while pos + 8 <= n:
         h = bits.xor(h, round(0, read64(data, pos)))
-        h = bits.rotl64(h, 27) * prime1() + prime4()
+        h = bits.rotl64(h, 27).wrapping_mul(prime1()).wrapping_add(prime4())
         pos = pos + 8
 
     if pos + 4 <= n:
-        h = bits.xor(h, read32(data, pos) * prime1())
-        h = bits.rotl64(h, 23) * prime2() + prime3()
+        h = bits.xor(h, read32(data, pos).wrapping_mul(prime1()))
+        h = bits.rotl64(h, 23).wrapping_mul(prime2()).wrapping_add(prime3())
         pos = pos + 4
 
     while pos < n:
-        h = bits.xor(h, data[pos] * prime5())
-        h = bits.rotl64(h, 11) * prime1()
+        h = bits.xor(h, data[pos].wrapping_mul(prime5()))
+        h = bits.rotl64(h, 11).wrapping_mul(prime1())
         pos = pos + 1
 
     # avalanche
     h = bits.xor(h, bits.shr(h, 33))
-    h = h * prime2()
+    h = h.wrapping_mul(prime2())
     h = bits.xor(h, bits.shr(h, 29))
-    h = h * prime3()
+    h = h.wrapping_mul(prime3())
     h = bits.xor(h, bits.shr(h, 32))
     return h
 

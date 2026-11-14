@@ -58,6 +58,7 @@ pub mod alloc_sites;
 pub mod argon2;
 pub mod blake2b;
 pub mod blocking;
+pub(crate) mod overflow_trap;
 pub mod bytes;
 pub mod collections;
 pub mod concurrency;

@@ -5,7 +5,7 @@ knowing which is which is most of this page.
 
 | type | holds | exact | cost |
 | --- | --- | --- | --- |
-| `Int` | whole numbers, 64 bits, two's complement | until it overflows | a machine register |
+| `Int` | whole numbers, 64 bits, two's complement | yes; overflow stops the program | a machine register |
 | `Float` | ieee-754 binary double | no | a machine register |
 | `std.bigint.BigInt` | whole numbers, any size | yes | a heap value; one machine word of magnitude under 10^18 |
 | `std.decimal.Decimal` | decimal fractions, any size | yes | a heap value wrapping a BigInt |
@@ -14,6 +14,33 @@ the short version: `Int` for counts, indices, ids, and bytes. `Float` for
 measurements, ratios, and anything headed for a chart. `Decimal` for money, tax,
 invoice lines, and anything a person will later reconcile against a statement.
 `BigInt` when a whole number outgrows 64 bits.
+
+## overflow
+
+`+`, `-` and `*` on an `Int` stop the program when the result does not fit in
+64 bits, and so does `-x` on the most negative `Int`:
+
+```
+pith runtime error: integer overflow
+```
+
+`UInt` and `UInt64` stop the same way when a result leaves 0 to 2^64 - 1, so
+`UInt(3) - UInt(5)` is an error rather than a very large number. the narrower
+types (`Int8` through `UInt32`) keep wrapping into their range, which is what
+their arithmetic has always done.
+
+hashing, checksums and random number generators want the wrapping result. they
+ask for it by name:
+
+```pith
+h = h.wrapping_mul(1099511628211)
+seed = seed.wrapping_add(1)
+```
+
+`wrapping_add`, `wrapping_sub` and `wrapping_mul` take a value of the
+receiver's type and return one, wrapping at 64 bits for `Int`, `UInt` and
+`UInt64`, and into the type's range for the narrow ones. when the number is
+meant to grow without bound, use `std.bigint`.
 
 ## text to a number
 

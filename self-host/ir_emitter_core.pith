@@ -323,6 +323,7 @@ mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this mod
 mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
 mut ir_tuple_stack_cascade_sigs: List[String] := [] # the same, for stack boxes: the shell is not freed
 mut ir_result_arg_release_sigs: List[String] := [] # (ok,err) payload signatures needing a result-argument release helper
+mut ir_result_unshare_sigs: List[String] := [] # (ok,err) payload signatures needing a result-unshare helper
 # set when some optional in this module wraps a genuine tuple, which needs the
 # shell to release its payload. one walk serves every such shell: the payload
 # already carries its own destructor for its elements, so the shell's job is
@@ -630,6 +631,7 @@ fn ir_reset_type_state():
     ir_tuple_stack_cascade_sigs = []
     ir_kinded_release_used = false
     ir_result_arg_release_sigs = []
+    ir_result_unshare_sigs = []
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
     ir_struct_field_index_lookup.clear()
@@ -2622,8 +2624,8 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     # binding owns its own retained count (taken at bind, tracked by the
     # prepass, released by the exit cleanup), so the local stays the last
     # owner of the count the shell arrived with, the same contract as a
-    # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT
-    # match stays disqualifying: its binding path takes no count.
+    # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT match
+    # is judged below, since its binding takes no count.
     if not is_result and node.kind == "match_expr" and node.children.len() > 1:
         subj := get_node(node.children[0])
         if subj.kind == "ident" and subj.value == name:
@@ -2652,13 +2654,16 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
                         return false
                     li = li + 1
                 return true
-    if ir_tuple_walk_pair_callee:
-        if node.kind == "body" or node.kind == "block":
-            return ir_tuple_pair_block_safe(node, name)
-        if node.kind == "match_expr" and node.children.len() > 1:
-            subj := get_node(ir_unwrap_grouped(node.children[0]))
-            if subj.kind == "ident" and subj.value == name:
-                return ir_tuple_pair_match_safe(node, name)
+    if ir_tuple_walk_pair_callee and (node.kind == "body" or node.kind == "block"):
+        return ir_tuple_pair_block_safe(node, name)
+    # a match on a RESULT local binds the box itself to a bare arm binding,
+    # with no count of its own. the local stays the last owner as long as
+    # every arm reads the box, under either name, only through the uses the
+    # walk allows. a variant or literal pattern is refused.
+    if is_result and node.kind == "match_expr" and node.children.len() > 1:
+        subj := get_node(ir_unwrap_grouped(node.children[0]))
+        if subj.kind == "ident" and subj.value == name:
+            return ir_tuple_pair_match_safe(node, name)
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:
@@ -2970,6 +2975,92 @@ fn ir_emit_result_arg_release_helpers():
         ir_emit("jmp " + done_l)
         ir_emit_label(done_l)
         ir_emit_zero_ret_endfunc()
+
+# a result box handed back whole by a function that returns the box (the box
+# abi, which generic functions and interface impls always use) has to be one
+# the caller owns alone. every caller that opens a call's box takes the
+# payload's count over and frees the shell, which is right only when nothing
+# else holds the box. a box that also sits in a holder carries the payload
+# destructor (ir_attach_result_box_dtor), and the holder would release that
+# payload a second time. a forwarded parameter, field, element or shared local
+# is such a box, so where the count says it is shared this returns a fresh box
+# with its own count on the live payload and drops the count it was given on
+# the shared one. the register abi does the same when it returns a borrowed
+# box as the pair (ir_emit_return_box_as_pair).
+fn ir_emit_result_box_unshare(box_r: Int, tid: Int) -> Int:
+    sig := ir_tuple_cascade_signature(tid)
+    if sig == "00":
+        return box_r
+    if not ir_result_unshare_sigs.contains(sig):
+        ir_result_unshare_sigs.push(sig)
+    if not ir_tuple_stack_cascade_sigs.contains(sig):
+        ir_tuple_stack_cascade_sigs.push(sig)
+    r := ir_reg()
+    ir_emit_call1(r, ir_result_unshare_helper_name(sig), "tuple", box_r)
+    return r
+
+fn ir_result_unshare_helper_name(sig: String) -> String:
+    return "__result_unshare_" + sig + "_m" + ir_module_count.to_string()
+
+# one helper per (ok, err) payload signature ir_emit_result_box_unshare used
+# in this module: the box itself when its count is the caller's alone,
+# otherwise a fresh copy holding a count of its own on the live payload. the
+# shared box keeps its own count on the payload, and its remaining owners may
+# each release it plainly, so it takes the payload destructor
+# (ir_attach_result_box_dtor) before the count it was given is dropped: the
+# last owner's release then drops the payload too.
+fn ir_emit_result_unshare_helpers():
+    for sig in ir_result_unshare_sigs:
+        ok_kind := ir_tuple_dtor_code_kind(sig[0])
+        err_kind := ir_tuple_dtor_code_kind(sig.substring(1, 2))
+        ir_emit_func_header(ir_result_unshare_helper_name(sig), 1, "tuple")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        count_r := ir_reg()
+        ir_emit_call1(count_r, "pith_struct_strong_count", "int", pr)
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        sole_r := ir_reg()
+        ir_emit("eq " + sole_r.to_string() + " " + count_r.to_string() + " " + one_r.to_string())
+        keep_l := ir_label()
+        copy_l := ir_label()
+        ir_emit("brif " + sole_r.to_string() + " " + keep_l + " " + copy_l)
+        ir_emit_label(keep_l)
+        ir_emit("ret " + pr.to_string())
+        ir_emit_label(copy_l)
+        size_r := ir_reg()
+        ir_emit("iconst " + size_r.to_string() + " 3")
+        copy_r := ir_reg()
+        ir_emit_call1(copy_r, "pith_struct_alloc", "struct:tuple", size_r)
+        flag_r := ir_reg()
+        ir_emit("field " + flag_r.to_string() + " " + pr.to_string() + " 0 bool is_ok")
+        ok_r := ir_reg()
+        ir_emit("field " + ok_r.to_string() + " " + pr.to_string() + " 8 unknown ok")
+        err_r := ir_reg()
+        ir_emit("field " + err_r.to_string() + " " + pr.to_string() + " 16 unknown err")
+        ir_emit("sstore " + copy_r.to_string() + " 0 " + flag_r.to_string())
+        ir_emit("sstore " + copy_r.to_string() + " 1 " + ok_r.to_string())
+        ir_emit("sstore " + copy_r.to_string() + " 2 " + err_r.to_string())
+        ok_l := ir_label()
+        err_l := ir_label()
+        done_l := ir_label()
+        ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit_label(ok_l)
+        if ok_kind.len() > 0:
+            ir_rc_retain_reg(ok_r, ok_kind)
+        ir_emit("jmp " + done_l)
+        ir_emit_label(err_l)
+        if err_kind.len() > 0:
+            ir_rc_retain_reg(err_r, err_kind)
+        ir_emit("jmp " + done_l)
+        ir_emit_label(done_l)
+        dtor_r := ir_reg()
+        ir_emit("funcref " + dtor_r.to_string() + " " + ir_tuple_stack_cascade_helper_name(sig))
+        ir_emit_call2(ir_reg(), "pith_struct_set_dtor", "void", pr, dtor_r)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", pr)
+        ir_emit("ret " + copy_r.to_string())
+        ir_emit("endfunc")
 
 # release every rc local the function owns before a return, minus `exclude`,
 # the one being returned (its count transfers to the caller). the prologue
@@ -4216,8 +4307,9 @@ fn ir_record_struct_field(struct_name: String, field_names: List[String], field_
         # a closure field (fn_type) must be recorded too, or the struct's
         # destructor won't know to release it and the closure leaks. so must
         # a tuple field: unrecorded, it was a plain word, and the struct's
-        # last release stranded the tuple and everything in it.
-        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type" or type_node.kind == "tuple_type":
+        # last release stranded the tuple and everything in it. a result
+        # field is the same, with its box and payload.
+        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type" or type_node.kind == "tuple_type" or type_node.kind == "result_type":
             ir_struct_field_lookup.insert(struct_name + "." + field_name, ir_resolve_type_node(field_node.children[0]))
         if field_node.children.len() > 1:
             ir_struct_field_default_nodes.insert(struct_name + "." + field_name, field_node.children[1])
@@ -4779,6 +4871,36 @@ fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inne
         ir_emit_call0(r, empty_init_call, ir_normalize_collection_target(target_type))
         return r
     return ir_expr(val_idx)
+
+# emit a value bound for a holder: a struct field, or a list or map element.
+fn ir_emit_holder_value(val_idx: Int, target_type: String, target_inner: String) -> Int:
+    r := ir_emit_value_for_target_inner(val_idx, target_type, target_inner)
+    ir_attach_result_box_dtor(r, val_idx)
+    return r
+
+# a result box owns its payload but has no destructor, which is fine while a
+# local's cleanup releases the payload with it. a box that lands in a holder
+# is released by the holder's own walk, which frees the box and stranded the
+# payload (#1167). such a box takes the stack cascade's body as its
+# destructor: it releases the live payload and zeroes its slot, and leaves the
+# box to the runtime. a cascade or a fresh argument release that runs first
+# zeroes the slot as well, so the payload is released once either way. a
+# value widened to an optional is a fresh shell, not the box, and is left
+# alone.
+fn ir_attach_result_box_dtor(box_r: Int, val_idx: Int):
+    if val_idx < 0 or c_argument_widens_to_optional(val_idx):
+        return
+    tid := c_get_expr_type(val_idx)
+    if tid < 0 or get_type_info(tid).kind != "result":
+        return
+    sig := ir_tuple_cascade_signature(tid)
+    if sig == "00":
+        return
+    if not ir_tuple_stack_cascade_sigs.contains(sig):
+        ir_tuple_stack_cascade_sigs.push(sig)
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " " + ir_tuple_stack_cascade_helper_name(sig))
+    ir_emit_call2(ir_reg(), "pith_struct_set_dtor", "void", box_r, fr)
 
 # the empty-init target with the literal's key flavor applied: "set" becomes
 # "set_bytes" and "map" or "map_str_val" becomes "map_bytes" or
@@ -6871,7 +6993,7 @@ fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_tar
     # stores Some(v), not the raw v, the same fix collection element
     # literals need (a map literal typed Map[K, Int?] otherwise stored
     # bare ints and a later .value() dereferenced one as a heap tuple).
-    v_r := ir_emit_value_for_target_inner(entry.children[1], val_target, val_inner)
+    v_r := ir_emit_holder_value(entry.children[1], val_target, val_inner)
     if key_inflight:
         ir_inflight_drop(k_r)
     # a heap value written straight into a literal is stored the same way one
@@ -7197,7 +7319,7 @@ fn ir_emit_small_list_literal(node: Node, elem_kind: String, elem_target: String
     tag := ir_element_tag_code(elem_kind)
     mut arg_regs: List[Int] := []
     for child in node.children:
-        elem_r := ir_emit_value_for_target_inner(child, elem_target, elem_inner)
+        elem_r := ir_emit_holder_value(child, elem_target, elem_inner)
         if tag != 0:
             if ir_expr_is_borrowed(child):
                 ir_rc_retain_reg(elem_r, elem_kind)
@@ -7258,7 +7380,7 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # leaked the list holding a's value when b failed
     ir_inflight_push(list_r, "list")
     for child in node.children:
-        elem_r := ir_emit_value_for_target_inner(child, elem_target, elem_inner)
+        elem_r := ir_emit_holder_value(child, elem_target, elem_inner)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
         # an optional element's register is the wrapper ir_emit_value_for_target
         # built (or retained, for a passed-through optional), owned by this
@@ -8970,6 +9092,8 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 # whoever receives a sent value reads it from another task
                 if ir_is_channel_send_name(emit_name):
                     ir_emit_share_expr(arg_regs[store_value_pos], value_expr)
+                else:
+                    ir_attach_result_box_dtor(arg_regs[store_value_pos], value_expr)
     # a builtin method on a primitive receiver lowers to its runtime call
     # name here, not at ir_emit_call_text: that helper hands any name a user
     # function declares to that function, which is right for a free call and
@@ -9735,7 +9859,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
             else:
                 field_regs.push(ir_zero_reg())
         elif value_node >= 0:
-            fr := ir_emit_value_for_target_inner(value_node, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name))
+            fr := ir_emit_holder_value(value_node, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name))
             named_field_kind := ir_rc_kind(field_type)
             # tuple-typed (optional) field values arrive already owned from
             # ir_emit_value_for_target, so they must not be retained again.
@@ -9746,7 +9870,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
         else:
             default_idx := ir_struct_field_default_node(sname, field_name)
             if default_idx >= 0:
-                field_regs.push(ir_emit_value_for_target_inner(default_idx, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name)))
+                field_regs.push(ir_emit_holder_value(default_idx, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name)))
             else:
                 field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -9781,7 +9905,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
             field_regs.push(ir_emit_weak_payload(value_idx))
             field_idx = field_idx + 1
             continue
-        fr := ir_emit_value_for_target_inner(value_idx, ftype, ir_ctor_field_inner_type_name(sname, tid, field_name))
+        fr := ir_emit_holder_value(value_idx, ftype, ir_ctor_field_inner_type_name(sname, tid, field_name))
         pos_field_kind := ir_rc_kind(ftype)
         # tuple-typed (optional) field values arrive already owned; don't retain.
         if pos_field_kind.len() > 0 and pos_field_kind != "tuple" and ir_expr_is_borrowed(value_idx):
@@ -9795,7 +9919,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
         field_name := ir_ctor_field_name_at(sname, tid, field_idx)
         default_idx := ir_struct_field_default_node(sname, field_name)
         if default_idx >= 0:
-            field_regs.push(ir_emit_value_for_target_inner(default_idx, ir_ctor_field_type_name(sname, tid, field_name), ir_ctor_field_inner_type_name(sname, tid, field_name)))
+            field_regs.push(ir_emit_holder_value(default_idx, ir_ctor_field_type_name(sname, tid, field_name), ir_ctor_field_inner_type_name(sname, tid, field_name)))
         else:
             field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -10617,7 +10741,7 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
         ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(target_idx), compound_op), cur_r, rhs_r)
         value_r = ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     else:
-        value_r = ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
+        value_r = ir_emit_holder_value(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # tagged containers retain stored elements in the runtime. a borrowed heap
     # value carries its kind with it, so the container adopts it where it has
     # none and takes exactly one count either way. a list used to get a
@@ -11116,6 +11240,9 @@ pub fn ir_emit_return_value(expr_child: Int):
     # instead of on the shell (see ir_emit_return_box_as_pair).
     pair_forward := ir_current_func_return_kind == "result_reg" and result_kind == "tuple"
     mut pair_source := "fresh"
+    # a box returned whole that someone else may also hold (see
+    # ir_emit_result_box_unshare)
+    mut box_may_share := false
     # a returned tracked local transfers its count to the caller, so it
     # must be skipped in the exit cleanup. trust the tracked kind directly:
     # in a generic body the inferred type can miss (a tuple-lowered
@@ -11124,6 +11251,7 @@ pub fn ir_emit_return_value(expr_child: Int):
     if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
         exclude = expr_node.value
         pair_source = "local"
+        box_may_share = true
     else:
         # substitute struct params (T -> the concrete type) so a specialized
         # impl method returning a borrowed T still retains it. without this
@@ -11135,6 +11263,7 @@ pub fn ir_emit_return_value(expr_child: Int):
                 pair_source = "borrowed"
             else:
                 ir_rc_retain_reg(r, ret_kind)
+                box_may_share = true
     expr_tid := c_get_expr_type(expr_child)
     mut expr_kind := ""
     if expr_tid >= 0:
@@ -11200,6 +11329,8 @@ pub fn ir_emit_return_value(expr_child: Int):
             r = ir_emit_ok_result_tuple(ir_emit_optional_none_value())
         elif not ir_return_forwards_result(expr_kind, result_kind):
             r = ir_emit_ok_result_tuple(r)
+        elif box_may_share:
+            r = ir_emit_result_box_unshare(r, expr_tid)
     elif ir_current_func_return_kind == "result_reg":
         if pair_forward:
             # forwarding a whole result (`return other_fallible()`, `return
@@ -11631,7 +11762,7 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
         ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + old_w.to_string())
         ir_unpin_operand(obj_r, recv_pin)
         return true
-    value_r := ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
+    value_r := ir_emit_holder_value(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # a tuple-typed (optional) rhs is already owned from ir_emit_value_for_target,
     # so it must not be retained again; the old value is still released below, so
     # its payload is freed via the optional's destructor.
@@ -11840,7 +11971,7 @@ fn ir_stmt(idx: Int):
         # left alone, `mk(i).reverse()` roots at a call whose fresh container
         # nothing else names. every classification below reads the root.
         subject := ir_discard_chain_root(idx)
-        if ir_stmt_discards_owned_value(kind):
+        if ir_stmt_discards_owned_value(kind) or ir_discarded_branch_value_is_owned(subject):
             stmt_tid := c_get_expr_type(subject)
             # a discarded result box carries its payload: the box has no
             # destructor, so the payload is dropped explicitly or it leaks
@@ -11957,9 +12088,8 @@ fn ir_discard_chain_root(idx: Int) -> Int:
 # payload on with the box's count, and an `await` hands over the count the
 # task's thread produced. both are the transfer ir_expr_is_borrowed already
 # reads them as, and both reached this discard without a release before.
-# `catch`, `select` and `match` are deliberately absent: they normalize their
-# arms to owned through paths of their own, and only the string release below
-# covers them today.
+# a `match` and a `select` are absent because their value is owned only when
+# every arm hands one over, which ir_discarded_branch_value_is_owned asks.
 fn ir_stmt_discards_owned_value(kind: String) -> Bool:
     if kind == "call" or kind == "method_call":
         return true
@@ -11969,6 +12099,17 @@ fn ir_stmt_discards_owned_value(kind: String) -> Bool:
     if kind == "catch_expr" or kind == "catch_block":
         return true
     return kind == "try" or kind == "try_expr" or kind == "await"
+
+# whether a `match` or `select` thrown away at statement position left an
+# owned value in its temp. each arm stores its value there, and where every
+# arm is owned, or is retained on the way in, the temp holds a count nobody
+# else will release. a form with a borrowed arm left as is stays alone, since
+# releasing it would take a count its owner still holds.
+fn ir_discarded_branch_value_is_owned(idx: Int) -> Bool:
+    k := node_kind(idx)
+    if k != "match_expr" and k != "select_expr":
+        return false
+    return not ir_expr_is_borrowed(idx)
 
 # the rc kinds a discarded statement value is the statement's to release. the
 # containers, `bytes` and a struct or tuple header were the first set; a
@@ -14756,6 +14897,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_tuple_cascade_helpers()
     ir_emit_kinded_release_helper()
     ir_emit_result_arg_release_helpers()
+    ir_emit_result_unshare_helpers()
     ir_emit_optional_tuple_walks()
     # tracer registration after every destructor family above, so its pair
     # list covers the tuple and generic-instance twins too.

@@ -1,0 +1,89 @@
+# a `match`, `select` or `catch` thrown away at statement position. the value
+# each arm lands in the form's temp is owned (a fresh call result, or a borrow
+# retained on the way in), and nothing named the temp afterwards, so every
+# heap value but a caught string was stranded once per round. SHAPE picks
+# the form and the arm kind:
+#   1: match, List arms
+#   2: match, fresh String arms
+#   3: select, List arms
+#   4: select, fresh String arms
+#   5: catch, List fallback
+#   6: match, a borrowed List arm beside a fresh one
+import leakprobe as probe
+import std.concurrent
+
+fn mkl(i: Int) -> List[Int]:
+    return [i, i + 1, i + 2]
+
+fn mks(i: Int) -> String:
+    return "s-" + i.to_string()
+
+fn mkr(i: Int) -> List[Int]!:
+    if i % 2 == 1:
+        fail "e"
+    return mkl(i)
+
+fn match_list(i: Int) -> Int:
+    match i % 3:
+        0 => mkl(i)
+        _ => mkl(i + 1)
+    return 0
+
+fn match_string(i: Int) -> Int:
+    match i % 3:
+        0 => mks(i)
+        _ => mks(i + 1)
+    return 0
+
+fn select_list(i: Int) -> Int:
+    ch := Channel[Int](1)
+    if i % 2 == 0:
+        ch.send(i)
+    select:
+        v := ch.recv() => mkl(v.unwrap_or(0))
+        default => mkl(i)
+    return 0
+
+fn select_string(i: Int) -> Int:
+    ch := Channel[Int](1)
+    if i % 2 == 0:
+        ch.send(i)
+    select:
+        v := ch.recv() => mks(v.unwrap_or(0))
+        default => mks(i)
+    return 0
+
+fn catch_list(i: Int) -> Int:
+    mkr(i) catch [0]
+    return 0
+
+fn match_borrowed(i: Int) -> Int:
+    held := mkl(i)
+    match i % 2:
+        0 => held
+        _ => mkl(i + 1)
+    return held.len()
+
+fn main():
+    shape := env("SHAPE")
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        if shape == "1":
+            checksum = checksum + match_list(i)
+        elif shape == "2":
+            checksum = checksum + match_string(i)
+        elif shape == "3":
+            checksum = checksum + select_list(i)
+        elif shape == "4":
+            checksum = checksum + select_string(i)
+        elif shape == "5":
+            checksum = checksum + catch_list(i)
+        else:
+            checksum = checksum + match_borrowed(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

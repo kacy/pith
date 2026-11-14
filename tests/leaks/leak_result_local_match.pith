@@ -1,0 +1,83 @@
+# a result local that is the subject of a `match`. the arm binding is the box
+# itself and takes no count, but the local was still released with a plain
+# struct release, which frees the box and not the payload it owns, once per
+# call (#1150). the release decision is made once per name, so a later
+# binding of the same name in another branch leaked the same way. SHAPE picks
+# the payload and the arm:
+#   1: `(String?)!`, arms read only the flag
+#   2: `(Int, String)!`, arms read only the flag
+#   3: `String!`, arms read only the flag
+#   4: `String!`, an arm hands out the ok payload
+#   5: `String!`, a sibling branch binds the same name and reads it with catch
+import leakprobe as probe
+
+fn mk_opt(i: Int) -> (String?)!:
+    v: String? := "v" + i.to_string()
+    return v
+
+fn mk_pair(i: Int) -> (Int, String)!:
+    if i % 3 == 2:
+        fail "e" + i.to_string()
+    return (i, "p" + i.to_string())
+
+fn mk_str(i: Int) -> String!:
+    if i % 2 == 1:
+        fail "e" + i.to_string()
+    return "o" + i.to_string()
+
+fn opt_flag(i: Int) -> Int:
+    r := mk_opt(i)
+    return match r:
+        m if m.is_ok => 1
+        m => 0
+
+fn pair_flag(i: Int) -> Int:
+    r := mk_pair(i)
+    return match r:
+        m if m.is_ok => 1
+        _ => 0
+
+fn str_flag(i: Int) -> Int:
+    r := mk_str(i)
+    return match r:
+        m if m.is_ok => 1
+        m => 0
+
+fn str_payload(i: Int) -> Int:
+    r := mk_str(i)
+    s := match r:
+        m if m.is_ok => m.ok
+        m => m.err
+    return s.len()
+
+fn sibling(i: Int) -> Int:
+    if i % 2 == 0:
+        r := mk_str(i)
+        return match r:
+            m if m.is_ok => 1
+            m => 0
+    r := mk_str(i + 1)
+    s := r catch "none"
+    return s.len()
+
+fn main():
+    shape := env("SHAPE")
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        if shape == "1":
+            checksum = checksum + opt_flag(i)
+        elif shape == "2":
+            checksum = checksum + pair_flag(i)
+        elif shape == "3":
+            checksum = checksum + str_flag(i)
+        elif shape == "4":
+            checksum = checksum + str_payload(i)
+        else:
+            checksum = checksum + sibling(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

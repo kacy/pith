@@ -1,0 +1,62 @@
+# a `match` or `select` thrown away at statement position releases the value
+# its arms left in the temp. each row reads back what a wrong "owned" answer
+# would have freed: a live local one arm handed over as is, and the values
+# the fresh arms were built from.
+import std.concurrent
+
+struct Holder:
+    name: String
+    items: List[Int]
+
+fn mk(i: Int) -> List[Int]:
+    return [i, i + 1, i + 2]
+
+fn mks(i: Int) -> String:
+    return "s-" + i.to_string()
+
+fn mkh(i: Int) -> Holder:
+    return Holder("h-{i}", [i])
+
+fn mkr(i: Int) -> String!:
+    if i % 2 == 1:
+        fail "e-" + i.to_string()
+    return mks(i)
+
+fn mko(i: Int) -> String?:
+    if i % 2 == 1:
+        return none
+    return mks(i)
+
+fn main():
+    held := mk(10)
+    hs := mks(20)
+    hh := mkh(30)
+    mut i := 0
+    while i < 4:
+        match i % 2:
+            0 => held
+            _ => mk(i)
+        match i % 2:
+            0 => hs
+            _ => mks(i)
+        match i % 2:
+            0 => hh
+            _ => mkh(i)
+        match i:
+            0 => mkr(i)
+            _ => mkr(i + 1)
+        match i:
+            0 => mko(i)
+            _ => mko(i + 1)
+        ch := Channel[Int](1)
+        if i % 2 == 0:
+            ch.send(i)
+        select:
+            v := ch.recv() => mk(v.unwrap_or(0))
+            default => held
+        i = i + 1
+    print(held.len().to_string())
+    print(held[2].to_string())
+    print(hs)
+    print(hh.name)
+    print(hh.items[0].to_string())

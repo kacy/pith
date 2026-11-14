@@ -160,11 +160,6 @@ stale and a fix to it is welcome.
   module's structs as E306. an experimental cycle collector runs behind
   `PITH_CYCLE_GC=1`, off by default, with `std.concurrent.gc_collect()` to force
   a pass.
-- **known leaks**. each of these strands memory on every occurrence:
-  - a discarded `catch`, `select` or `match` expression releases only a string
-    result (#1091).
-  - a `T!` stored in a struct field or a list element (#1167).
-  - a match on a result local with a tuple payload (#1150).
 - **closing a channel can race a send**. a send that passes its closed check
   as another task closes the channel can enqueue a value nobody reads, and the
   send reports success. a channel costs about 416 bytes plus 16 bytes per

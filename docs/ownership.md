@@ -581,6 +581,13 @@ gaps, all bounded leaks rather than dangling pointers:
   and what happens to it from there is what has always happened to a
   kept result (see the entry below on results bound to a name). `tests/cases/test_result_arg_callee_spellings`
   reads back every spelling under valgrind with the freelist off.
+  a result box stored in a holder (a struct field, or a list or map
+  element) gets a destructor at the store: the stack cascade helper for its
+  signature, which releases the live payload and zeroes its slot, and
+  leaves the box itself to the runtime. the holder's release then drops the
+  payload along with the box. a cascade or a result-argument release that
+  runs first also zeroes the slot, so the payload is released exactly once
+  (#1167).
   tuple-typed registers the emitter cannot tie back to a literal still
   strand their box.
 - **a collection literal the checker cannot type builds an untagged

@@ -7263,6 +7263,18 @@ fn check_or_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
         else:
             check_pattern_match(alt, expected_type, scope_id)
 
+# whether a pattern's written enum name means the generic base an instance
+# was named from. the base is the bare name unless two modules declare it,
+# and then it is the declaring module's key, which the written name reaches
+# through the module's own generic declaration.
+fn generic_pattern_names_base(type_name: String, base: String) -> Bool:
+    if base == type_name:
+        return true
+    decl_idx := get_generic_declaration_index(type_name)
+    if decl_idx < 0:
+        return false
+    return generic_declaration_identity(decl_idx) == base
+
 fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     # value: "EnumName.VariantName"
     # children: sub-patterns for variant fields
@@ -7281,7 +7293,7 @@ fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     # check below.
     if expected_type >= 0:
         einfo := get_type_info(expected_type)
-        if einfo.kind == "enum" and extract_base_type_name(einfo.name) == type_name:
+        if einfo.kind == "enum" and generic_pattern_names_base(type_name, extract_base_type_name(einfo.name)):
             enum_tid = expected_type
     if enum_tid < 0:
         report_error("E202", "unknown type: " + type_name)

@@ -1,0 +1,19 @@
+# two modules that each declare the generic enum Opt, with the variants in a
+# different order. the program used to fail to compile with `unknown load
+# source` from the backend. each module's constructors and matches must use
+# its own declaration, including a generic constructor emitted in this
+# module, and a match here on an Opt imported by name.
+import clash_genum_a as a
+import clash_genum_b as b
+from clash_genum_a import Opt
+
+fn main():
+    print(a.read_a(a.some_a(4)))
+    print(a.read_a(a.none_a()))
+    print(a.read_a(a.wrap_a(5)))
+    print(b.read_b(b.some_b("x")))
+    print(b.read_b(b.none_b()))
+    print(b.read_b(b.wrap_b("y")))
+    match a.wrap_a(6):
+        Opt.Some(n) => print("main some {n}")
+        Opt.Nothing => print("main nothing")

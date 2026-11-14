@@ -4256,6 +4256,19 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool, module_path: String):
     # a generic enum base takes the same identity a generic struct base does,
     # so two modules declaring the same enum name keep their variants apart.
     sname := generic_base_identity(module_path, node.value)
+    variant_names := ir_record_enum_variants(node, sname)
+    # the module's own bodies write the bare name (`Opt.Some(v)`), so the
+    # module emitting its own declaration files it under that name as well.
+    # an importer's copy stays under the declaring module's key only, so the
+    # bare name keeps meaning the importer's own enum.
+    if emit_decl and sname != node.value:
+        _bare := ir_record_enum_variants(node, node.value)
+    if emit_decl:
+        ir_emit("struct " + sname + " " + variant_names.join(" "))
+
+# file one enum's variants, their payload kinds and its variant count under
+# `sname`, and answer the variant names in order.
+fn ir_record_enum_variants(node: Node, sname: String) -> List[String]:
     mut variant_names: List[String] := []
     for child in node.children:
         variant_node := ir_unwrap_pub_node(child)
@@ -4275,8 +4288,7 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool, module_path: String):
                 ir_boxed_enums.insert(sname, true)
     ir_enum_variant_lists.insert(sname, variant_names.join(","))
     ir_struct_names.insert(sname, variant_names.len())
-    if emit_decl:
-        ir_emit("struct " + sname + " " + variant_names.join(" "))
+    return variant_names
 
 # record the drop method of every `impl Drop for T` in a root, keyed by the
 # declaration node of the struct it names. the struct has to be declared in
@@ -4308,6 +4320,30 @@ fn ir_root_struct_decl_index(root_idx: Int, name: String) -> Int:
         if (cn.kind == "struct_decl" or cn.kind == "struct") and ir_base_decl_name(cn.value) == name:
             return item_idx
     return 0 - 1
+
+# a generic enum imported by name (`from m import Opt`) whose name a second
+# module also declares is held under m's key only, so this module's bare
+# `Opt.Some` patterns and constructors would find nothing. file it under the
+# bare name too, as the name means here.
+fn ir_collect_from_imported_enums(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind != "from_import":
+            continue
+        parts := node.value.split(" ")
+        if parts.len() < 2:
+            continue
+        module_root := ir_module_root_for_path(parts[0])
+        if module_root < 0:
+            continue
+        for decl_idx in ir_root_items(module_root):
+            decl := get_node(decl_idx)
+            if decl.kind != "enum_decl" and decl.kind != "enum":
+                continue
+            if not parts.contains(decl.value):
+                continue
+            if generic_base_identity(parts[0], decl.value) != decl.value:
+                _variants := ir_record_enum_variants(decl, decl.value)
 
 fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool, module_path: String):
     for item_idx in ir_root_items(root_idx):
@@ -13065,6 +13101,105 @@ fn ir_resolve_assoc_in_generic(type_name: String, params: List[String], concrete
         i = i + 1
     return type_name
 
+# the parsed root of a module in this build, or -1.
+fn ir_module_root_for_path(module_path: String) -> Int:
+    for path, i in ir_preloaded_import_paths:
+        if path == module_path:
+            return ir_preloaded_import_roots[i]
+    for path, i in ir_all_module_paths:
+        if path == module_path:
+            return ir_all_module_roots[i]
+    return 0 - 1
+
+# the enum table entries a specialization from another module replaced:
+# their keys, and the values they held before, for ir_restore_enum_tables.
+struct IrEnumTables:
+    names: List[String]
+    variant_keys: List[String]
+    boxed: Map[String, Bool]
+    variant_lists: Map[String, String]
+    struct_names: Map[String, Int]
+    payload_kinds: Map[String, String]
+    field_lookup: Map[String, String]
+    field_index_lookup: Map[String, String]
+
+# point the name tables at another module's, so a generic body that module
+# declares resolves its names the way its module does rather than the way the
+# instantiating module does: its imports, for `gather(xs)` and `b.gather(xs)`
+# (#1095), and the generic enums it declares under a name a second module
+# shares, which its body writes bare (`Opt.Some(v)`) and every other module
+# holds under the declaring module's key only. the caller saves and restores
+# the import tables; the enum entries come back from this call.
+fn ir_use_module_names(module_path: String) -> IrEnumTables:
+    mut saved := IrEnumTables([], [], {}, {}, {}, {}, {}, {})
+    if module_path.len() == 0 or module_path == ir_current_module_path:
+        return saved
+    root := ir_module_root_for_path(module_path)
+    if root < 0:
+        return saved
+    ir_import_renames = {}
+    ir_module_aliases = {}
+    for item_idx in ir_root_items(root):
+        ir_collect_import_item(get_node(item_idx))
+    for item_idx in ir_root_items(root):
+        node := get_node(item_idx)
+        if node.kind != "enum_decl" and node.kind != "enum":
+            continue
+        name := node.value
+        if generic_base_identity(module_path, name) == name:
+            continue
+        saved.names.push(name)
+        if ir_boxed_enums.contains_key(name):
+            saved.boxed.insert(name, ir_boxed_enums[name])
+        if ir_enum_variant_lists.contains_key(name):
+            saved.variant_lists.insert(name, ir_enum_variant_lists[name])
+        if ir_struct_names.contains_key(name):
+            saved.struct_names.insert(name, ir_struct_names[name])
+        for child in node.children:
+            variant_node := ir_unwrap_pub_node(child)
+            if variant_node.kind != "variant":
+                continue
+            key := name + "." + variant_node.value
+            saved.variant_keys.push(key)
+            if ir_enum_payload_kinds.contains_key(key):
+                saved.payload_kinds.insert(key, ir_enum_payload_kinds[key])
+            if ir_struct_field_lookup.contains_key(key):
+                saved.field_lookup.insert(key, ir_struct_field_lookup[key])
+            if ir_struct_field_index_lookup.contains_key(key):
+                saved.field_index_lookup.insert(key, ir_struct_field_index_lookup[key])
+        if ir_boxed_enums.contains_key(name):
+            ir_boxed_enums.remove(name)
+        _variants := ir_record_enum_variants(node, name)
+    return saved
+
+fn ir_restore_enum_tables(saved: IrEnumTables):
+    for name in saved.names:
+        if ir_boxed_enums.contains_key(name):
+            ir_boxed_enums.remove(name)
+        if saved.boxed.contains_key(name):
+            ir_boxed_enums.insert(name, saved.boxed[name])
+        if ir_enum_variant_lists.contains_key(name):
+            ir_enum_variant_lists.remove(name)
+        if saved.variant_lists.contains_key(name):
+            ir_enum_variant_lists.insert(name, saved.variant_lists[name])
+        if ir_struct_names.contains_key(name):
+            ir_struct_names.remove(name)
+        if saved.struct_names.contains_key(name):
+            ir_struct_names.insert(name, saved.struct_names[name])
+    for key in saved.variant_keys:
+        if ir_enum_payload_kinds.contains_key(key):
+            ir_enum_payload_kinds.remove(key)
+        if saved.payload_kinds.contains_key(key):
+            ir_enum_payload_kinds.insert(key, saved.payload_kinds[key])
+        if ir_struct_field_lookup.contains_key(key):
+            ir_struct_field_lookup.remove(key)
+        if saved.field_lookup.contains_key(key):
+            ir_struct_field_lookup.insert(key, saved.field_lookup[key])
+        if ir_struct_field_index_lookup.contains_key(key):
+            ir_struct_field_index_lookup.remove(key)
+        if saved.field_index_lookup.contains_key(key):
+            ir_struct_field_index_lookup.insert(key, saved.field_index_lookup[key])
+
 # emit the body of one queued generic specialization. `key` is the
 # tab-separated base name and type arguments ir_queue_generic_specialization
 # registered; the declaration is type-checked under those arguments and then
@@ -13153,6 +13288,9 @@ fn ir_emit_generic_specialization(key: String):
         ir_active_generic_module_path = ir_generic_decl_module_paths[base_name]
     else:
         ir_active_generic_module_path = ""
+    saved_import_renames := ir_import_renames
+    saved_module_aliases := ir_module_aliases
+    saved_enum_tables := ir_use_module_names(ir_active_generic_module_path)
     ir_prepare_func_emission(ret_type)
     # a return type written as the bare parameter (`-> T`) is an optional
     # whenever the type argument is one, and the return path must then forward
@@ -13212,6 +13350,9 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_params = saved_params
     ir_active_generic_concrete_types = saved_types
     ir_active_generic_module_path = saved_module_path
+    ir_import_renames = saved_import_renames
+    ir_module_aliases = saved_module_aliases
+    ir_restore_enum_tables(saved_enum_tables)
     ir_active_fn_bindings = saved_fn_bindings
     ir_current_impl_type = saved_impl_type
     ir_current_impl_subst_params = saved_impl_params
@@ -14484,6 +14625,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     while impl_i < method_roots.len():
         ir_collect_impl_methods(method_roots[impl_i], method_paths[impl_i])
         impl_i = impl_i + 1
+    ir_collect_from_imported_enums(root_idx)
 
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)

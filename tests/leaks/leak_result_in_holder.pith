@@ -1,0 +1,103 @@
+# a `T!` held by a struct field or a container element. the result box owns
+# its payload and has no destructor, so the holder's release freed the box
+# and nothing released the payload; a struct field was not even recorded, so
+# the box went too (#1167). SHAPE picks the holder:
+#   1: a struct field
+#   2: a list literal element
+#   3: a pushed list element
+#   4: a map value
+#   5: a field assigned over an earlier result
+#   6: a field built from a live local that is read afterwards
+#   7: a field forwarded out of a function and read beside its source
+#   8: an element forwarded by a plain and a generic function
+import leakprobe as probe
+
+struct Holder:
+    pub r: String!
+
+fn mk(i: Int) -> String!:
+    if i % 2 == 1:
+        fail "err-{i}"
+    return "payload-{i}"
+
+fn field_round(i: Int) -> Int:
+    h := Holder(mk(i))
+    return 0
+
+fn element_round(i: Int) -> Int:
+    rs := [mk(i), mk(i + 1)]
+    return rs.len()
+
+fn push_round(i: Int) -> Int:
+    mut rs: List[String!] := []
+    rs.push(mk(i))
+    rs.push(mk(i + 1))
+    return rs.len()
+
+fn map_round(i: Int) -> Int:
+    mut m: Map[String, String!] := {}
+    m.insert("a", mk(i))
+    m["b"] = mk(i + 1)
+    return m.len()
+
+fn assign_round(i: Int) -> Int:
+    mut h := Holder(mk(i))
+    h.r = mk(i + 1)
+    return 0
+
+fn shared_round(i: Int) -> Int:
+    r := mk(i)
+    h := Holder(r)
+    if r.is_ok and h.r.is_ok:
+        return r.ok.len() + h.r.ok.len()
+    return 0
+
+fn fwd_field(h: Holder) -> String!:
+    return h.r
+
+fn fwd_elem(rs: List[String!]) -> String!:
+    return rs[0]
+
+fn gfwd[T](rs: List[T!]) -> T!:
+    return rs[0]
+
+fn field_forward_round(i: Int) -> Int:
+    h := Holder(mk(i))
+    r := fwd_field(h)
+    if r.is_ok and h.r.is_ok:
+        return r.ok.len() + h.r.ok.len()
+    return 0
+
+fn element_forward_round(i: Int) -> Int:
+    rs := [mk(i), mk(i + 1)]
+    a := fwd_elem(rs) catch "a"
+    b := gfwd(rs) catch "b"
+    return a.len() + b.len()
+
+fn main():
+    shape := env("SHAPE")
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        if shape == "1":
+            checksum = checksum + field_round(i)
+        elif shape == "2":
+            checksum = checksum + element_round(i)
+        elif shape == "3":
+            checksum = checksum + push_round(i)
+        elif shape == "4":
+            checksum = checksum + map_round(i)
+        elif shape == "5":
+            checksum = checksum + assign_round(i)
+        elif shape == "6":
+            checksum = checksum + shared_round(i)
+        elif shape == "7":
+            checksum = checksum + field_forward_round(i)
+        else:
+            checksum = checksum + element_forward_round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

@@ -355,6 +355,16 @@ count of its own, left the caller's box and the returned payload sharing one
 count, and whichever was released first freed what the other still read
 (#1164).
 
+**a returned box belongs to the caller alone.** every caller that opens a
+call's box takes over the payload's count, which is correct only when
+nothing else holds the box. so a function that returns the box itself (the
+box abi, which generic functions and interface impls always use) and returns
+a box it does not fully own (a parameter, a field, an element, or a local
+whose count is shared) passes it through `__result_unshare_<ok><err>`. that
+helper returns the same box when the caller's count is the only one.
+otherwise it returns a fresh box holding its own count on the live payload,
+and drops the count on the shared box.
+
 **optional encoding.** a `T?` is the null pointer when it is none. a Some is
 a two-slot struct allocation holding 1 at offset 0 and the payload at offset
 8, and it may carry a destructor that releases the payload. a none costs no

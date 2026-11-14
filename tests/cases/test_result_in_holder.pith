@@ -1,0 +1,100 @@
+# a `T!` held by a struct field or a container element owns its payload, and
+# the holder's release now releases it (#1167). each row reads the payload
+# back through the holder after something else let go of the same box: a
+# live local that built the holder, a forward that handed the box back, a
+# generic forward (which always returns the box), a `!`, a `catch` and a
+# rebind over the field. a payload released too early prints another value
+# or fails under valgrind (MEMCHECK_CASES).
+
+struct Holder:
+    pub r: String!
+
+impl Holder:
+    fn get() -> String!:
+        return self.r
+
+struct Pair:
+    pub a: List[Int]!
+    pub b: Int!
+
+fn mk(i: Int) -> String!:
+    if i % 2 == 1:
+        fail "err-{i}"
+    return "payload-{i}"
+
+fn mkl(i: Int) -> List[Int]!:
+    if i % 2 == 1:
+        fail "lerr-{i}"
+    return [i, i + 1]
+
+fn mki(i: Int) -> Int!:
+    if i % 2 == 1:
+        fail "ierr-{i}"
+    return i * 10
+
+fn show(tag: String, r: String!):
+    if r.is_ok:
+        print("{tag} ok {r.ok}")
+    else:
+        print("{tag} err {r.err}")
+
+fn fwd_elem(rs: List[String!]) -> String!:
+    return rs[0]
+
+fn fwd_field(h: Holder) -> String!:
+    return h.r
+
+fn gfwd[T](rs: List[T!]) -> T!:
+    return rs[0]
+
+fn shared(i: Int):
+    r := mk(i)
+    h := Holder(r)
+    show("shared.local", r)
+    show("shared.field", h.r)
+
+fn forwards(i: Int) -> Int!:
+    rs := [mk(i), mk(i + 1)]
+    h := Holder(mk(i))
+    a := fwd_elem(rs) catch "caught"
+    b := fwd_field(h) catch "caught"
+    c := h.get() catch "caught"
+    d := gfwd(rs) catch "caught"
+    print("forwards {a} {b} {c} {d}")
+    show("forwards.elem", rs[0])
+    show("forwards.field", h.r)
+    s := fwd_elem(rs)!
+    return s.len()
+
+fn containers(i: Int):
+    mut rs: List[String!] := []
+    rs.push(mk(i))
+    rs.push(mk(i + 1))
+    mut m: Map[String, String!] := {}
+    m.insert("a", mk(i))
+    m["b"] = mk(i + 1)
+    show("list.0", rs[0])
+    show("list.1", rs[1])
+    show("map.a", m["a"])
+    show("map.b", m["b"])
+
+fn rebind(i: Int):
+    mut h := Holder(mk(i))
+    old := h.r
+    h.r = mk(i + 1)
+    show("rebind.old", old)
+    show("rebind.new", h.r)
+    p := Pair(mkl(i), mki(i))
+    if p.a.is_ok:
+        print("pair {p.a.ok.len()} {p.b catch 0}")
+    else:
+        print("pair {p.a.err} {p.b catch 0}")
+
+fn main():
+    mut i := 0
+    while i < 2:
+        shared(i)
+        print("forwards -> {forwards(i) catch 0 - 1}")
+        containers(i)
+        rebind(i)
+        i = i + 1

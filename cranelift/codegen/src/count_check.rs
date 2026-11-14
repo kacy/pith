@@ -58,6 +58,12 @@ fn is_emitted_release(callee: &str) -> bool {
     callee.contains("__tuple_cascade_") || callee.contains("__result_arg_release_") || callee.contains("__kinded_release_m")
 }
 
+/// the helper the emitter writes into each module to hand back a result box
+/// the caller owns alone (`ir_emit_result_box_unshare`)
+fn is_emitted_unshare(callee: &str) -> bool {
+    callee.contains("__result_unshare_")
+}
+
 /// a kind a generic body left unsubstituted, such as `T`: it may be counted
 /// or not, so the checker can't settle a count on it
 fn kind_of_text(kind: &str) -> &str {
@@ -1192,6 +1198,17 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             st.regs.insert(dst.to_string(), Val::Plain);
             return Ok(());
         }
+        // the emitted unshare takes the count it is handed on a result box
+        // and hands back a box the caller owns alone: the same one when that
+        // count was the only one, a fresh copy otherwise
+        if is_emitted_unshare(callee) {
+            if let Some(a) = args.first() {
+                self.take(st, a, callee)?;
+            }
+            let o = self.new_obj(st, 1);
+            st.regs.insert(dst.to_string(), Val::Obj(o));
+            return Ok(());
+        }
         if RETAINS.contains(&callee) {
             match self.val(st, args[0]) {
                 Val::Obj(o) => {
@@ -1461,7 +1478,7 @@ fn instruction_writes(
             let callee = if ins[0] == "call" { ins.get(2) } else { ins.get(3) };
             let Some(callee) = callee else { return true };
             // an emitted release helper drops only its own argument
-            if is_emitted_release(callee) || callee.contains("__tuple_stack_cascade_") {
+            if is_emitted_release(callee) || is_emitted_unshare(callee) || callee.contains("__tuple_stack_cascade_") {
                 return false;
             }
             if user.contains(callee) {
@@ -1938,6 +1955,30 @@ ret 1
 mark kind c Counter
 endfunc
 ";
+
+    // a borrowed result box returned whole goes through the unshare helper,
+    // which takes the count the return retained and hands back an owned box
+    const UNSHARE_RETURN: &str = "
+func first 1 tuple
+param rs
+load 1 rs
+iconst 2 0
+call 3 pith_list_get_value tuple 2 1 2
+call 4 pith_struct_retain void 1 3
+call 5 __result_unshare_s0_m0 tuple 1 3
+ret 5
+mark kind rs list
+endfunc
+";
+
+    #[test]
+    fn the_unshare_helper_takes_its_argument_and_hands_back_a_count() {
+        let r = check(UNSHARE_RETURN);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+        // without the retain the helper takes a count the function never had
+        let r = check(&UNSHARE_RETURN.replace("call 4 pith_struct_retain void 1 3\n", ""));
+        assert_eq!(r.failed, 1, "{:?}", r);
+    }
 
     #[test]
     fn a_struct_field_named_ok_is_not_a_result_box() {

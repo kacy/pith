@@ -148,6 +148,14 @@ cases=(
   tests/leaks/leak_fn_value
   tests/leaks/leak_task_result_payload
   tests/leaks/leak_result_extraction
+  "tests/leaks/leak_result_in_holder SHAPE=1"
+  "tests/leaks/leak_result_in_holder SHAPE=2"
+  "tests/leaks/leak_result_in_holder SHAPE=3"
+  "tests/leaks/leak_result_in_holder SHAPE=4"
+  "tests/leaks/leak_result_in_holder SHAPE=5"
+  "tests/leaks/leak_result_in_holder SHAPE=6"
+  "tests/leaks/leak_result_in_holder SHAPE=7"
+  "tests/leaks/leak_result_in_holder SHAPE=8"
   tests/leaks/leak_result_arg_borrow
   tests/leaks/leak_result_arg_box
   tests/leaks/leak_yaml_parse

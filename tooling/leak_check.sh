@@ -178,6 +178,7 @@ cases=(
   tests/leaks/leak_optional_plain_compare
   tests/leaks/leak_optional_match_payload
   tests/leaks/leak_argument_literal
+  tests/leaks/leak_assert_fresh_arg
   tests/leaks/leak_widened_store
   tests/leaks/leak_arena_truncate
   tests/leaks/leak_task_threadlocal

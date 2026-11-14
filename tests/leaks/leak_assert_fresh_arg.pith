@@ -1,0 +1,31 @@
+# a fresh value passed straight to a built-in assertion. a passing
+# `assert_eq(f(), want)` used to keep the string `f` handed back, one per
+# assertion (#1118); the assertion now releases its owned arguments like any
+# call. the fresh list rides the same path through the list comparison.
+import leakprobe as probe
+
+fn digest(i: Int) -> String:
+    return "d-" + i.to_string()
+
+fn mkl(i: Int) -> List[Int]:
+    return [i, i + 1]
+
+fn round(i: Int) -> Int:
+    want := "d-" + i.to_string()
+    assert_eq(digest(i), want)
+    assert_ne(digest(i + 1), want)
+    assert(digest(i) == want)
+    assert_eq(mkl(i), [i, i + 1])
+    return want.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

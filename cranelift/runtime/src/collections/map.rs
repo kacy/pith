@@ -2914,8 +2914,9 @@ mod tests {
 
     /// The fused update has to answer exactly what the read-then-store pair it
     /// replaces answers, for every key flavor and whatever the values are
-    /// doing: negative, zero, and wrapping past the end of the range the way
-    /// the `add` instruction does.
+    /// doing: negative, zero, and up to the ends of the Int range. A sum past
+    /// either end stops the program, like `+` on an Int (the abort goldens
+    /// cover that), so the pairs here are the ones that fit.
     #[test]
     fn a_fused_update_matches_the_pair_it_replaces() {
         unsafe {
@@ -2925,7 +2926,9 @@ mod tests {
             let bkey = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
             for start in starts {
                 for delta in deltas {
-                    let expected = start.wrapping_add(delta);
+                    let Some(expected) = start.checked_add(delta) else {
+                        continue;
+                    };
 
                     let smap = pith_map_new_default().ptr as i64;
                     pith_map_insert_cstr(smap, key, start);
@@ -2966,8 +2969,8 @@ mod tests {
             let other = b"user-1001-region\0".as_ptr() as *const i8;
             let bkey = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
             let bother = crate::bytes::pith_bytes_from_vec(b"user-1001-region".to_vec());
-            for (start, delta) in [(0i64, 1i64), (7, -9), (i64::MAX, 1), (i64::MIN, -1)] {
-                let expected = start.wrapping_add(delta);
+            for (start, delta) in [(0i64, 1i64), (7, -9), (i64::MAX, -1), (i64::MIN, 1)] {
+                let expected = start + delta;
 
                 let smap = pith_map_new_default().ptr as i64;
                 assert_eq!(pith_map_add_or_insert_cstr(smap, key, delta, start), start);

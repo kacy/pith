@@ -1116,6 +1116,33 @@ error[E313]: cannot assign into an index of a Bytes: the value is immutable
   fix: build a new value, or use a ByteBuffer for bytes that change
 ```
 
+### E314: an argument label that does not match its parameter
+
+arguments bind by position. a label on an argument (`scale(by: 2)`) is
+checked against the name of the parameter in that position, so a label that
+names a different parameter, or none, is refused rather than bound to the
+wrong one. a call through a function value takes no labels, since the value
+carries no parameter names.
+
+```
+error[E314]: argument label 'b' is in the position of parameter 'a'; arguments bind by position
+  5 |     print("{scaled(b: 1, a: 5)}")
+                         ^
+```
+
+### E315: an interface used as a value type
+
+an interface bounds a type parameter. it has no values of its own, so it
+cannot be the type of a parameter, a return or a field. take a type
+parameter bounded by the interface instead.
+
+```
+error[E315]: interface 'Shape' is not a value type
+  11 | fn show(x: Shape) -> Int:
+                  ^
+  fix: take a type parameter bounded by it, as in `fn f[T: Shape](x: T)`
+```
+
 ### E275 — a frozen field is changed
 
 a field declared `frozen` is set when its struct is built and never changed

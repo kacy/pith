@@ -4780,6 +4780,12 @@ fn ir_method_receiver_type(node: Node) -> String:
             return "channel:" + ir_type_from_tid(recv_info.inner)
         if recv_info.kind == "task" and recv_info.inner >= 0:
             return "task:" + ir_type_from_tid(recv_info.inner)
+        # a tag-only enum is an integer to the emitter, so its type name is
+        # lost in the conversion below and a method from its impl block would
+        # be emitted as a call to the bare method name.
+        if recv_info.kind == "enum" and ir_type_from_tid(recv_tid) == "int":
+            if ir_lookup_impl_method_name(recv_info.name, ir_plain_method_name(node.value)).len() > 0:
+                return recv_info.name
         # a bytes-keyed set or map dispatches to its own runtime entry
         # points; the flavor rides on the receiver type only here, where
         # the method name is picked, and is never a tracked kind

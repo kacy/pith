@@ -1,0 +1,24 @@
+# an interface bounds a type parameter and has no values of its own. a
+# parameter typed by one used to be accepted and then fail at its first use
+# with "Shape has no method 'area'".
+interface Shape:
+    fn area() -> Int
+
+struct Sq:
+    s: Int
+
+struct Drawing:
+    shapes: List[Shape]
+
+impl Shape for Sq:
+    fn area() -> Int:
+        return self.s * self.s
+
+fn show(x: Shape) -> Int:
+    return x.area()
+
+fn pick() -> Shape?:
+    return none
+
+fn main():
+    print("{show(Sq(3))}")

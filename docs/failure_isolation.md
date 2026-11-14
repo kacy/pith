@@ -165,8 +165,13 @@ rounds (bench sources are not in the tree):
 | pith: build a closure and `isolate_call` it | 20 ns |
 | pith: a failing `isolate_call`, message formatted and returned | 86 ns |
 
-the http benchmark numbers for the chosen design are in the pull request that
-added it, and the bar was a change under 2% on `bench/http_sweep.sh`.
+the bar was a change under 2% on `bench/http_sweep.sh`. the first version
+carried the handler's response out of the closure in a threadlocal, and cost
+4% to 7% of throughput at 256 and 1024 connections: a threadlocal store marks
+the value shared, so the whole response, headers and body, switched to atomic
+counts. carrying it in a small struct the closure captures brought the change
+under 2% at every connection count, within the run to run spread. the numbers
+are in the pull request that added it.
 
 ## the choice
 

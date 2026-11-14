@@ -6129,12 +6129,14 @@ fn run_handler(handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBy
 # handler held is not released and its defer blocks do not run; a Mutex it
 # still held is unlocked. docs/failure_isolation.md has the details.
 
-# the response of the handler running on this task, carried out of the closure
-# isolate_call runs.
-threadlocal mut isolated_response: HttpResponse? := none
+# carries the handler's response out of the closure isolate_call runs. a plain
+# struct rather than a threadlocal: a threadlocal store marks the response and
+# everything in it shared, which makes every later count on it atomic.
+struct HandlerResult:
+    response: HttpResponse?
 
-fn store_handler_response(handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> Int:
-    isolated_response = handler(req)
+fn store_handler_response(out: HandlerResult, handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> Int:
+    out.response = handler(req)
     return 1
 
 # the answer to a request whose handler stopped at a runtime error: a 500 that
@@ -6150,10 +6152,10 @@ pub fn report_handler_failure(req: HttpRequestBytes, failure: String):
 # run handler(req). a runtime error inside it is reported and answered with
 # failed(req, message) instead of stopping the process.
 pub fn call_isolated(handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes, failed: fn(HttpRequestBytes, String) -> HttpResponse) -> HttpResponse:
-    failure := isolate_call(fn() -> Int => store_handler_response(handler, req))
+    out := HandlerResult(none)
+    failure := isolate_call(fn() -> Int => store_handler_response(out, handler, req))
     if failure == "":
-        if let resp = isolated_response:
-            isolated_response = none
+        if let resp = out.response:
             return resp
     # a streamed body or a connection takeover the handler set up before it
     # failed belongs to the failed response, not to its answer

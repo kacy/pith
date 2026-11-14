@@ -38,6 +38,12 @@ fn get_div(req: web.Request) -> http.HttpResponse:
     zero := items.len() - 3
     return http.text(200, "{10 / zero}")
 
+# Int addition past the largest Int, which stops on overflow through a trap
+# the runtime turns into an error
+fn get_overflow(req: web.Request) -> http.HttpResponse:
+    big := 9223372036854775807
+    return http.text(200, "{big + req.param("n").len()}")
+
 # takes the lock and fails while holding it. the next request to take it only
 # gets it if the failure released it.
 fn get_locked(req: web.Request) -> http.HttpResponse:
@@ -53,7 +59,7 @@ fn get_counted(req: web.Request) -> http.HttpResponse:
     return http.text(200, "counted {n}")
 
 fn run_server():
-    app := web.new().get("/item/:i", get_item).get("/key/:k", get_key).get("/none", get_none).get("/div", get_div).get("/locked", get_locked).get("/counted", get_counted)
+    app := web.new().get("/item/:i", get_item).get("/key/:k", get_key).get("/none", get_none).get("/div", get_div).get("/overflow/:n", get_overflow).get("/locked", get_locked).get("/counted", get_counted)
     app.listen("127.0.0.1", PORT) catch 0
 
 fn read_all(fd: Int) -> String:
@@ -121,6 +127,8 @@ fn main():
     print("key: " + get("/key/zz").substring(0, 3))
     print("none: " + get("/none").substring(0, 3))
     print("div: " + get("/div").substring(0, 3))
+    print("overflow: " + get("/overflow/x").substring(0, 3))
+    print("overflow again: " + get("/overflow/xy").substring(0, 3))
     print("after: " + get("/key/a"))
     print("same connection: " + keep_alive_after_failure())
     mut i := 0

@@ -38,8 +38,8 @@
 # cranelift/codegen/src/ir_consumer.rs.
 
 # the front half of the compiler: ast, checker verdicts, type table
-from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
-from checker import generic_base_identity, module_declares_generic, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
+from checker import generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -78,6 +78,19 @@ from ir_list_helpers import ir_is_list_runtime_type, ir_emit_list_map_loop, ir_e
 from ir_result_flow import ir_emit_result_store_error_branch
 
 # --- per-function state: reset or rebuilt for every function emitted ---
+# loop counter steps that cannot overflow, by node index: the `i + 1` of an
+# `i = i + 1`, or the `i += 1` itself. see ir_mark_counter_steps.
+mut ir_counter_steps: Map[Int, Bool] := {}
+# the arena size ir_mark_index_offsets has scanned up to
+mut ir_index_offsets_scanned := 0
+# index offsets that may skip their check, offset node -> the indexed node.
+# the types are tested when the offset is emitted (ir_index_offset_unchecked),
+# since a generic body has none until it is specialized.
+mut ir_index_offset_targets: Map[Int, Int] := {}
+# set while one of those steps, or an index offset that skips its check, is
+# emitted, so ir_int_op hands back the plain op instead of the checked one
+mut ir_counter_step_active := false
+
 mut ir_map_value_types: Map[String, String] := {} # map variable name -> value type
 
 # declared return kinds of closure-typed parameters in the current
@@ -6102,7 +6115,7 @@ fn ir_int_checks_overflow(tid: Int) -> Bool:
 # of `+`, `-` and `*` for a type that stops on overflow (`addc`, or `uaddc`
 # for an unsigned word). anything else is the op itself.
 fn ir_int_op(tid: Int, op: String) -> String:
-    if (op == "add" or op == "sub" or op == "mul") and ir_int_checks_overflow(tid):
+    if (op == "add" or op == "sub" or op == "mul") and ir_int_checks_overflow(tid) and not ir_counter_step_active:
         if ir_is_unsigned_word(tid):
             return "u" + op + "c"
         return op + "c"
@@ -10892,6 +10905,11 @@ fn ir_expr(idx: Int) -> Int:
         return ir_narrow_sized_result(idx, node.value, ir_emit_unary_expr(node))
 
     if node.kind == "binary":
+        if ir_counter_steps.contains_key(idx) or ir_index_offset_unchecked(idx):
+            ir_counter_step_active = true
+            step_r := ir_emit_binary_expr(node)
+            ir_counter_step_active = false
+            return step_r
         return ir_narrow_sized_result(idx, node.value, ir_emit_binary_expr(node))
 
     if node.kind == "call":
@@ -12079,7 +12097,9 @@ fn ir_stmt(idx: Int):
         return
 
     if kind == "assignment":
+        ir_counter_step_active = ir_counter_steps.contains_key(idx)
         ir_emit_compound_assignment(node)
+        ir_counter_step_active = false
         return
 
     ir_stmt_control(idx, node)
@@ -12399,6 +12419,107 @@ fn ir_emit_while_let_stmt(node: Node):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     ir_last_was_ret = false
 
+# whether `idx` is a length: a `.len()` call, or a local bound once to one.
+# a length is far below the largest Int, so `i <= n` bounds i as tightly as
+# `i < n` does for the purpose of one step.
+fn ir_is_length_bound(idx: Int) -> Bool:
+    n := get_node(idx)
+    if n.kind == "method_call":
+        return ir_plain_method_name(n.value) == "len" and n.children.len() == 1
+    if n.kind != "ident":
+        return false
+    defs := get_definition_of()
+    if not defs.contains_key(idx):
+        return false
+    decl := get_node(defs[idx])
+    if decl.kind != "binding" or decl.value.contains(" mut") or decl.children.len() == 0:
+        return false
+    return ir_is_length_bound(decl.children[decl.children.len() - 1])
+
+# the Int locals a while condition bounds: "i+" for one bounded above
+# (`i < e`, `e > i`, or `i <= n` for a length n) and "i-" for one bounded
+# below (`i > e`, `e < i`), looking through `and`.
+fn ir_counter_candidates(cond_idx: Int, out: List[String]):
+    n := get_node(cond_idx)
+    if n.kind != "binary" or n.children.len() != 2:
+        return
+    if n.value == "and":
+        ir_counter_candidates(n.children[0], out)
+        ir_counter_candidates(n.children[1], out)
+        return
+    left := n.children[0]
+    right := n.children[1]
+    if n.value == "lt" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int":
+        out.push(node_value(left) + "+")
+    elif n.value == "gt" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int":
+        out.push(node_value(right) + "+")
+    elif n.value == "gt" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int":
+        out.push(node_value(left) + "-")
+    elif n.value == "lt" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int":
+        out.push(node_value(right) + "-")
+    elif n.value == "lte" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int" and ir_is_length_bound(right):
+        out.push(node_value(left) + "+")
+    elif n.value == "gte" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int" and ir_is_length_bound(left):
+        out.push(node_value(right) + "+")
+
+# the node to mark when assignment `idx` steps `name` by one in direction
+# `dir` ("+" or "-"): the binary of `i = i + 1`, or the `i += 1` itself.
+# -1 for any other assignment.
+fn ir_counter_step_node(idx: Int, name: String, dir: String) -> Int:
+    n := get_node(idx)
+    rhs := get_node(n.children[1])
+    if (n.value == dir + "=") and rhs.kind == "int_lit" and rhs.value == "1":
+        return idx
+    mut op := "add"
+    if dir == "-":
+        op = "sub"
+    if n.value == "=" and rhs.kind == "binary" and rhs.value == op and rhs.children.len() == 2:
+        if node_kind(rhs.children[0]) == "ident" and node_value(rhs.children[0]) == name and node_kind(rhs.children[1]) == "int_lit" and node_value(rhs.children[1]) == "1":
+            return n.children[1]
+    return 0 - 1
+
+# the assignments to `name` in a loop body, as the step nodes they would
+# mark, with -1 for one that cannot be marked: one that is not a step of
+# one, one inside a nested loop or a closure (which may run it more than
+# once between two tests of the condition), or a new binding of the name.
+fn ir_counter_assignments(idx: Int, name: String, dir: String, nested: Bool, out: List[Int]):
+    n := get_node(idx)
+    if n.kind == "binding" and n.value.split(" ")[0] == name:
+        out.push(0 - 1)
+    if n.kind == "for" or n.kind == "for_stmt":
+        names := ir_for_binding_names(n)
+        if names.value_name == name or names.index_name == name:
+            out.push(0 - 1)
+    if n.kind == "assignment" and n.children.len() == 2 and node_kind(n.children[0]) == "ident" and node_value(n.children[0]) == name:
+        if nested:
+            out.push(0 - 1)
+        else:
+            out.push(ir_counter_step_node(idx, name, dir))
+    inner := nested or n.kind == "lambda" or n.kind == "while" or n.kind == "while_stmt" or n.kind == "while_let" or n.kind == "for" or n.kind == "for_stmt"
+    for child in n.children:
+        ir_counter_assignments(child, name, dir, inner, out)
+
+# mark the counter steps of a while loop that cannot overflow. with `i < e`
+# tested before every iteration, i is below the largest Int when the body
+# starts, so one `i = i + 1` in it stays in range; `i > e` does the same for
+# `i - 1`. that holds only when the step is the one assignment to i the body
+# makes per test of the condition: a second step, or one in a nested loop,
+# could pass the bound. a local cannot change behind the loop's back, since
+# a closure cannot assign what it captures (E269), so the body is the only
+# place to look.
+fn ir_mark_counter_steps(cond_idx: Int, body_idx: Int):
+    mut candidates: List[String] := []
+    ir_counter_candidates(cond_idx, candidates)
+    for cand in candidates:
+        name := cand.substring(0, cand.len() - 1)
+        dir := cand.substring(cand.len() - 1, cand.len())
+        if ir_assign_targets_global_slot(name):
+            continue
+        mut found: List[Int] := []
+        ir_counter_assignments(body_idx, name, dir, false, found)
+        if found.len() == 1 and found[0] >= 0:
+            ir_counter_steps.insert(found[0], true)
+
 fn ir_emit_while_stmt(node: Node):
     head_label := ir_label()
     body_label := ir_label()
@@ -12411,6 +12532,7 @@ fn ir_emit_while_stmt(node: Node):
         ir_break_stack = ir_push_string(ir_break_stack, end_label)
         ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
         ir_defer_loop_enter()
+        ir_mark_counter_steps(node.children[0], node.children[1])
         ir_block(node.children[1])
         ir_defer_loop_exit()
         ir_break_stack.remove(ir_break_stack.len() - 1)
@@ -14724,7 +14846,38 @@ fn ir_collect_root_import_metadata(root_idx: Int):
     for root, i in ir_preloaded_import_roots:
         ir_collect_preloaded_root_metadata(root, ir_preloaded_import_paths[i])
 
+# an index `xs[i + 1]` or `xs[i - 1]` into a list, a Bytes or a String, with
+# a constant offset under 2^32, needs no overflow check of its own: a sum that
+# wrapped would land near the far end of the Int range, which the index's
+# bounds check refuses, so the program still stops. a map key has no bounds
+# check, and a wrapped key would read another entry, so it keeps the check.
+# nodes are scanned once, as each parse adds them to the arena, for the shape
+# alone; ir_index_offset_unchecked tests the types.
+fn ir_mark_index_offsets():
+    end := node_count()
+    mut idx := ir_index_offsets_scanned
+    while idx < end:
+        n := get_node(idx)
+        if n.kind == "index" and n.children.len() == 2:
+            offset := get_node(n.children[1])
+            if offset.kind == "binary" and (offset.value == "add" or offset.value == "sub") and offset.children.len() == 2:
+                lit := get_node(offset.children[1])
+                if lit.kind == "int_lit" and lit.value.len() < 10:
+                    ir_index_offset_targets.insert(n.children[1], n.children[0])
+        idx = idx + 1
+    ir_index_offsets_scanned = end
+
+fn ir_index_offset_unchecked(idx: Int) -> Bool:
+    if not ir_index_offset_targets.contains_key(idx):
+        return false
+    target_tid := c_get_expr_type(ir_index_offset_targets[idx])
+    target_name := get_type_name(target_tid)
+    if get_type_info(target_tid).kind != "list" and target_name != "Bytes" and target_name != "String":
+        return false
+    return get_type_name(c_get_expr_type(node_child(idx, 0))) == "Int"
+
 fn ir_collect_root_phase_one_metadata(root_idx: Int):
+    ir_mark_index_offsets()
     ir_func_returns.clear()
     ir_type_aliases = {}
     ir_generic_decl_indices = {}

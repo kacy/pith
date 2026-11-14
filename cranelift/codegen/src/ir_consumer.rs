@@ -1651,6 +1651,55 @@ fn emit_runtime_error_value(
     Ok(builder.func.dfg.first_result(call))
 }
 
+/// The plain opcode behind a checked one (`addc` -> `add`, `uaddc` -> `add`),
+/// or the opcode itself. A checked op on a string or float operand lowers as
+/// its plain form, which concatenates or promotes the way `add` always has.
+fn plain_arith_op(op: &str) -> &str {
+    match op {
+        "addc" | "uaddc" => "add",
+        "subc" | "usubc" => "sub",
+        "mulc" | "umulc" => "mul",
+        _ => op,
+    }
+}
+
+/// Integer `+`, `-` or `*` from source code: the result, with a branch to the
+/// integer-overflow runtime error when it does not fit. `addc`/`subc`/`mulc`
+/// check the signed range (Int) and `uaddc`/`usubc`/`umulc` the unsigned one
+/// (UInt, UInt64, whose values are the bits of an i64).
+fn emit_checked_int_arith(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    op: &str,
+    a: Value,
+    b: Value,
+) -> Result<Value, CompileError> {
+    let (value, overflowed) = match op {
+        "addc" => builder.ins().sadd_overflow(a, b),
+        "subc" => builder.ins().ssub_overflow(a, b),
+        "mulc" => builder.ins().smul_overflow(a, b),
+        "uaddc" => builder.ins().uadd_overflow(a, b),
+        "usubc" => builder.ins().usub_overflow(a, b),
+        "umulc" => builder.ins().umul_overflow(a, b),
+        _ => {
+            return Err(CompileError::ModuleError(format!(
+                "IR consumer: unsupported checked integer op '{op}'"
+            )))
+        }
+    };
+    let overflow_error = builder.create_block();
+    let done = builder.create_block();
+    builder.set_cold_block(overflow_error);
+    builder.ins().brif(overflowed, overflow_error, &[], done, &[]);
+    builder.switch_to_block(overflow_error);
+    emit_runtime_error_value(codegen, builder, func_ref_cache, runtime_funcs, 7)?;
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+    Ok(value)
+}
+
 fn emit_checked_int_div_or_mod(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
@@ -2694,7 +2743,7 @@ fn scan_float_vars(param_names: &[String], body_lines: &[&str]) -> HashSet<Strin
         // Propagate: if mul/div/add/sub uses a float reg, its result is float
         for line in body_lines.iter() {
             let p: Vec<&str> = line.split_whitespace().collect();
-            if p.len() >= 4 && matches!(p[0], "mul" | "div" | "add" | "sub") {
+            if p.len() >= 4 && matches!(plain_arith_op(p[0]), "mul" | "div" | "add" | "sub") {
                 let a_float = p[2]
                     .parse::<usize>()
                     .map_or(false, |r| float_source_regs.contains(&r));
@@ -2974,14 +3023,18 @@ fn compile_ir_function(
                 kinds.set(reg, "float");
             }
 
-            "add" | "sub" | "mul" | "div" | "mod" if parts.len() >= 4 => {
+            "add" | "sub" | "mul" | "div" | "mod" | "addc" | "subc" | "mulc" | "uaddc" | "usubc" | "umulc"
+                if parts.len() >= 4 =>
+            {
                 let reg = parse_reg(parts[1], line, func_name)?;
                 let a = get_reg(&regs, parts[2])?;
                 let b = get_reg(&regs, parts[3])?;
+                let checked = parts[0];
+                let op = plain_arith_op(checked);
                 // If `add` has a string operand, treat as concat (IR emitter
                 // sometimes emits `add` instead of `concat` when variable types
                 // aren't tracked across function boundaries)
-                if parts[0] == "add"
+                if op == "add"
                     && kinds.is_string(parts[2])
                     && kinds.is_string(parts[3])
                 {
@@ -2998,12 +3051,12 @@ fn compile_ir_function(
                     }
                     kinds.set(reg, "string");
                 // If operands are known floats, promote to float operation
-                } else if matches!(parts[0], "add" | "sub" | "mul" | "div")
+                } else if matches!(op, "add" | "sub" | "mul" | "div")
                     && (kinds.is_float(parts[2]) || kinds.is_float(parts[3]))
                 {
                     let fa = builder.ins().bitcast(types::F64, MemFlags::new(), a);
                     let fb = builder.ins().bitcast(types::F64, MemFlags::new(), b);
-                    let fv = match parts[0] {
+                    let fv = match op {
                         "add" => builder.ins().fadd(fa, fb),
                         "sub" => builder.ins().fsub(fa, fb),
                         "mul" => builder.ins().fmul(fa, fb),
@@ -3020,6 +3073,15 @@ fn compile_ir_function(
                     kinds.set(reg, "float");
                 } else {
                     let v = match parts[0] {
+                        "addc" | "subc" | "mulc" | "uaddc" | "usubc" | "umulc" => emit_checked_int_arith(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            checked,
+                            a,
+                            b,
+                        )?,
                         "add" => builder.ins().iadd(a, b),
                         "sub" => builder.ins().isub(a, b),
                         "mul" => builder.ins().imul(a, b),

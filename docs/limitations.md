@@ -43,7 +43,8 @@ stale and a fix to it is welcome.
 - **some runtime errors stop the process**. `xs[i]` and `xs[i] = v` out of
   range, `m[k]` on a missing key and `.value()` on a `none` print
   `pith runtime error: ...` and exit, except inside a `T!` function, where
-  they propagate as an error. division by zero exits in either case.
+  they propagate as an error. division by zero and integer overflow exit in
+  either case.
   `xs.get(i)` and `m.get(k)` return an optional, and `if let`, `match` and
   `unwrap_or` handle a `none` without stopping.
 - **a local that shadows a module global takes the name for the whole

@@ -5898,7 +5898,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         return check_bytes_method_call(method_name, arg_indices, scope_id)
     # primitive methods
     if is_integer_type(dispatch_type):
-        return check_int_method_call(method_name, arg_indices, scope_id)
+        return check_int_method_call(method_name, dispatch_type, arg_indices, scope_id)
     if dispatch_type == tid_float:
         return check_float_method_call(method_name, arg_indices, scope_id)
     if dispatch_type == tid_bool:
@@ -6234,7 +6234,7 @@ fn check_result_method_call(method: String, info: TypeInfo, args: List[Int], sco
 # primitive methods
 # ---------------------------------------------------------------
 
-fn check_int_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
+fn check_int_method_call(method: String, recv_tid: Int, args: List[Int], scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     tid_float := lookup_type_id("Float")
     if method == "to_string":
@@ -6243,6 +6243,12 @@ fn check_int_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
     if method == "to_float":
         expect_no_arguments(method, args)
         return tid_float
+    # `+`, `-` and `*` stop the program when the result does not fit. these
+    # wrap it into the type's range instead, for hashing and the other places
+    # where wrapping is the arithmetic intended.
+    if method == "wrapping_add" or method == "wrapping_sub" or method == "wrapping_mul":
+        expect_one_typed_argument(method, args, recv_tid, scope_id)
+        return recv_tid
     report_error("E209", "Int has no method '" + method + "'")
     return TID_ERR
 

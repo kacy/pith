@@ -338,6 +338,19 @@ impl MapImpl {
         self.data.get(key)
     }
 
+    /// `word + delta`, or the integer-overflow runtime error when the sum does
+    /// not fit. The fused update stands in for `m[k] + d` on an Int value,
+    /// which traps on overflow like any other Int `+`.
+    fn checked_word_add(word: i64, delta: i64) -> i64 {
+        match word.checked_add(delta) {
+            Some(sum) => sum,
+            None => unsafe {
+                crate::runtime_core::pith_runtime_error(7);
+                0
+            },
+        }
+    }
+
     /// Add `delta` to the word stored under `key` and return the new word, or
     /// `None` when the map does not hold the key.
     ///
@@ -350,13 +363,13 @@ impl MapImpl {
         if let KeyRef::Int(n) = key {
             if let Some(data) = &mut self.int_values8 {
                 let slot = data.get_mut(n)?;
-                *slot = slot.wrapping_add(delta);
+                *slot = Self::checked_word_add(*slot, delta);
                 return Some(*slot);
             }
         }
         match self.data.get_mut(key)? {
             MapVal::Word(word) => {
-                *word = word.wrapping_add(delta);
+                *word = Self::checked_word_add(*word, delta);
                 Some(*word)
             }
             MapVal::Wide(_) => {
@@ -377,14 +390,14 @@ impl MapImpl {
     fn add_or_insert(&mut self, key: &KeyRef<'_>, delta: i64, init: i64) -> i64 {
         if let KeyRef::Int(n) = key {
             if let Some(data) = &mut self.int_values8 {
-                let slot = data.entry(*n).and_modify(|v| *v = v.wrapping_add(delta)).or_insert(init);
+                let slot = data.entry(*n).and_modify(|v| *v = Self::checked_word_add(*v, delta)).or_insert(init);
                 return *slot;
             }
         }
         match self.data.entry_ref(key) {
             EntryRef::Occupied(mut entry) => match entry.get_mut() {
                 MapVal::Word(word) => {
-                    *word = word.wrapping_add(delta);
+                    *word = Self::checked_word_add(*word, delta);
                     *word
                 }
                 MapVal::Wide(_) => {

@@ -68,6 +68,12 @@ strref REG STRIDX           load a pointer to string literal STRIDX.
 ```
 add|sub|mul|div|mod REG A B   REG = A op B. div and mod are checked (a zero
                               divisor traps through the runtime, not silently).
+                              add, sub and mul wrap at 64 bits.
+addc|subc|mulc REG A B        REG = A op B for source arithmetic on an Int: a
+                              result outside the signed 64-bit range stops the
+                              program with the integer-overflow runtime error.
+uaddc|usubc|umulc REG A B     the same for UInt and UInt64, against the unsigned
+                              range.
 ```
 
 **float arithmetic**
@@ -76,7 +82,7 @@ add|sub|mul|div|mod REG A B   REG = A op B. div and mod are checked (a zero
 fadd|fsub|fmul|fdiv REG A B   float op on two float registers.
 ```
 
-`add|sub|mul|div` also lower as float ops when both operands are float registers —
+`add|sub|mul|div` (and the checked forms) also lower as float ops when both operands are float registers —
 the consumer tracks which registers hold floats and picks the instruction class
 accordingly.
 

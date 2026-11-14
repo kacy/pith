@@ -5439,6 +5439,13 @@ fn ir_narrow_to_tid(tid: Int, r: Int) -> Int:
     ir_emit_call1(out, narrow, "int", r)
     return out
 
+# whether the fused map update, which adds in the runtime with Int's
+# overflow check, must leave `m[k] + d` on a value of this type to the
+# general path: a narrow type wraps into its range there, and an unsigned
+# word checks the unsigned range.
+fn ir_fused_add_declines(tid: Int) -> Bool:
+    return ir_sized_int_narrow_fn(tid).len() > 0 or ir_is_unsigned_word(tid)
+
 # the arithmetic operators whose result can leave a narrow type's range.
 # comparisons yield a Bool, and the bit operations live in std.bits on Int.
 fn ir_op_can_overflow(op: String) -> Bool:
@@ -5451,6 +5458,13 @@ fn ir_narrow_sized_result(idx: Int, op: String, r: Int) -> Int:
 
 fn ir_emit_unary_expr(node: Node) -> Int:
     operand_r := ir_expr(node.children[0])
+    # `-x` on an Int is `0 - x`, which overflows for the most negative Int
+    if node.value == "negate" and ir_int_checks_overflow(c_get_expr_type(node.children[0])) and not ir_is_unsigned_word(c_get_expr_type(node.children[0])):
+        zero := ir_reg()
+        ir_emit("iconst " + zero.to_string() + " 0")
+        r := ir_reg()
+        ir_emit_simple_binary(r, "subc", zero, operand_r)
+        return r
     return ir_emit_unary_op(node.value, operand_r)
 
 fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Bool, is_bytes_op: Bool):
@@ -6074,8 +6088,24 @@ fn ir_is_unsigned_word(tid: Int) -> Bool:
     name := get_type_name(tid)
     return name == "UInt" or name == "UInt64"
 
-# the unsigned form of an integer op on a value of type `tid`, or the op itself.
-fn ir_unsigned_op(tid: Int, op: String) -> String:
+# whether arithmetic on a value of type `tid` stops on overflow: Int, and the
+# unsigned words. the narrow types wrap into their range instead (see
+# ir_sized_int_narrow_fn), and Float has no overflow to check.
+fn ir_int_checks_overflow(tid: Int) -> Bool:
+    if tid < 0:
+        return false
+    name := get_type_name(tid)
+    return name == "Int" or name == "Int64" or ir_is_unsigned_word(tid)
+
+# the op that computes `op` on values of type `tid`: the unsigned form of
+# division, remainder and ordering for an unsigned word, and the checked form
+# of `+`, `-` and `*` for a type that stops on overflow (`addc`, or `uaddc`
+# for an unsigned word). anything else is the op itself.
+fn ir_int_op(tid: Int, op: String) -> String:
+    if (op == "add" or op == "sub" or op == "mul") and ir_int_checks_overflow(tid):
+        if ir_is_unsigned_word(tid):
+            return "u" + op + "c"
+        return op + "c"
     if not ir_is_unsigned_word(tid):
         return op
     if op == "div" or op == "mod" or op == "lt" or op == "gt" or op == "lte" or op == "gte":
@@ -6086,9 +6116,9 @@ fn ir_unsigned_op(tid: Int, op: String) -> String:
 
 fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
     op := node.value
-    unsigned_op := ir_unsigned_op(c_get_expr_type(node.children[0]), op)
-    if unsigned_op != op:
-        ir_emit(unsigned_op + " " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+    int_op := ir_int_op(c_get_expr_type(node.children[0]), op)
+    if int_op != op:
+        ir_emit(int_op + " " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         return r
     left_type := ir_infer_type(node.children[0])
     right_type := ir_infer_type(node.children[1])
@@ -8829,6 +8859,14 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
         recv_tid := c_get_expr_type(node.children[0])
         if recv_tid >= 0:
             recv_info := get_type_info(recv_tid)
+            if recv_info.kind == "primitive" and (mname == "wrapping_add" or mname == "wrapping_sub" or mname == "wrapping_mul"):
+                # the plain op wraps at 64 bits; a narrow type then wraps
+                # into its own range the way its arithmetic always has
+                obj_r := ir_expr(node.children[0])
+                arg_r := ir_expr(ir_method_call_arg_expr(node, 0))
+                out_r := ir_reg()
+                ir_emit_simple_binary(out_r, mname.replace("wrapping_", ""), obj_r, arg_r)
+                return ir_narrow_to_tid(recv_tid, out_r)
             if recv_info.kind == "primitive" and mname == "to_string":
                 if recv_info.name == "UInt" or recv_info.name == "UInt8" or recv_info.name == "UInt16" or recv_info.name == "UInt32" or recv_info.name == "UInt64":
                     obj_r := ir_expr(node.children[0])
@@ -10511,8 +10549,7 @@ fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int
     delta_idx := ir_upsert_delta_idx(map_idx, key_idx, value_idx)
     if delta_idx < 0:
         return 0 - 1
-    # the fused add does not wrap a narrow integer value
-    if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+    if ir_fused_add_declines(c_get_expr_type(value_idx)):
         return 0 - 1
     return ir_emit_map_upsert_call(map_idx, key_idx, delta_idx, obj_type)
 
@@ -10543,7 +10580,7 @@ fn ir_try_emit_map_upsert_delta(target_idx: Int, delta_idx: Int) -> Int:
         return 0 - 1
     if ir_checked_index_type(target_idx) != "int":
         return 0 - 1
-    if ir_sized_int_narrow_fn(c_get_expr_type(target_idx)).len() > 0:
+    if ir_fused_add_declines(c_get_expr_type(target_idx)):
         return 0 - 1
     if not ir_pure_read_expr(map_idx) or not ir_pure_read_expr(key_idx) or not ir_pure_read_expr(delta_idx):
         return 0 - 1
@@ -10623,7 +10660,7 @@ fn ir_count_update_delta(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
     if value_idx < 0 and ir_stores_map_slot(stmt, map_idx, key_idx, "="):
         value_idx = stmt.children[1]
     if value_idx >= 0:
-        if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+        if ir_fused_add_declines(c_get_expr_type(value_idx)):
             return 0 - 1
         return ir_upsert_delta_idx(map_idx, key_idx, value_idx)
     if not ir_stores_map_slot(stmt, map_idx, key_idx, "+="):
@@ -10631,7 +10668,7 @@ fn ir_count_update_delta(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
     target_idx := stmt.children[0]
     if ir_checked_index_type(target_idx) != "int":
         return 0 - 1
-    if ir_sized_int_narrow_fn(c_get_expr_type(target_idx)).len() > 0:
+    if ir_fused_add_declines(c_get_expr_type(target_idx)):
         return 0 - 1
     if not ir_pure_read_expr(stmt.children[1]):
         return 0 - 1
@@ -10645,7 +10682,7 @@ fn ir_count_insert_value(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
         value_idx = stmt.children[1]
     if value_idx < 0 or not ir_pure_read_expr(value_idx):
         return 0 - 1
-    if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+    if ir_fused_add_declines(c_get_expr_type(value_idx)):
         return 0 - 1
     return value_idx
 
@@ -10738,7 +10775,7 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
         cur_r := ir_emit_index_read_at(target_idx, target, obj_r, idx_r, false)
         rhs_r := ir_expr(value_idx)
         sum_r := ir_reg()
-        ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(target_idx), compound_op), cur_r, rhs_r)
+        ir_emit_simple_binary(sum_r, ir_int_op(c_get_expr_type(target_idx), compound_op), cur_r, rhs_r)
         value_r = ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     else:
         value_r = ir_emit_holder_value(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
@@ -11803,7 +11840,7 @@ fn ir_emit_field_compound_assignment(target_idx: Int, value_idx: Int, compound_o
     ir_emit_named_field_access(cur, obj_r, lookup_key, fname, ir_checked_struct_field_type(recv_idx, fname))
     rhs := ir_expr(value_idx)
     sum_r := ir_reg()
-    ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(target_idx), compound_op), cur, rhs)
+    ir_emit_simple_binary(sum_r, ir_int_op(c_get_expr_type(target_idx), compound_op), cur, rhs)
     res := ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + res.to_string())
     return true
@@ -11865,7 +11902,7 @@ fn ir_emit_compound_assignment(node: Node):
         ir_emit_name_load(cur, name)
         rhs := ir_expr(node.children[1])
         sum_r := ir_reg()
-        ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(node.children[0]), compound_op), cur, rhs)
+        ir_emit_simple_binary(sum_r, ir_int_op(c_get_expr_type(node.children[0]), compound_op), cur, rhs)
         ir_emit_name_store(name, ir_narrow_to_tid(c_get_expr_type(node.children[0]), sum_r))
 
 # emit a label and clear the return-tracking flag: a label starts a

@@ -160,6 +160,12 @@ cases=(
   tests/leaks/leak_discarded_try_value
   tests/leaks/leak_discarded_await_value
   tests/leaks/leak_discarded_shared_result
+  "tests/leaks/leak_discarded_branch_value SHAPE=1"
+  "tests/leaks/leak_discarded_branch_value SHAPE=2"
+  "tests/leaks/leak_discarded_branch_value SHAPE=3"
+  "tests/leaks/leak_discarded_branch_value SHAPE=4"
+  "tests/leaks/leak_discarded_branch_value SHAPE=5"
+  "tests/leaks/leak_discarded_branch_value SHAPE=6"
   tests/leaks/leak_weak_field
   tests/leaks/leak_weak_read_off_temp
   tests/leaks/leak_weak_local

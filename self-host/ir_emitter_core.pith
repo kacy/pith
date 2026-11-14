@@ -11798,7 +11798,7 @@ fn ir_stmt(idx: Int):
         # left alone, `mk(i).reverse()` roots at a call whose fresh container
         # nothing else names. every classification below reads the root.
         subject := ir_discard_chain_root(idx)
-        if ir_stmt_discards_owned_value(kind):
+        if ir_stmt_discards_owned_value(kind) or ir_discarded_branch_value_is_owned(subject):
             stmt_tid := c_get_expr_type(subject)
             # a discarded result box carries its payload: the box has no
             # destructor, so the payload is dropped explicitly or it leaks
@@ -11915,9 +11915,8 @@ fn ir_discard_chain_root(idx: Int) -> Int:
 # payload on with the box's count, and an `await` hands over the count the
 # task's thread produced. both are the transfer ir_expr_is_borrowed already
 # reads them as, and both reached this discard without a release before.
-# `catch`, `select` and `match` are deliberately absent: they normalize their
-# arms to owned through paths of their own, and only the string release below
-# covers them today.
+# a `match` and a `select` are absent because their value is owned only when
+# every arm hands one over, which ir_discarded_branch_value_is_owned asks.
 fn ir_stmt_discards_owned_value(kind: String) -> Bool:
     if kind == "call" or kind == "method_call":
         return true
@@ -11927,6 +11926,17 @@ fn ir_stmt_discards_owned_value(kind: String) -> Bool:
     if kind == "catch_expr" or kind == "catch_block":
         return true
     return kind == "try" or kind == "try_expr" or kind == "await"
+
+# whether a `match` or `select` thrown away at statement position left an
+# owned value in its temp. each arm stores its value there, and where every
+# arm is owned, or is retained on the way in, the temp holds a count nobody
+# else will release. a form with a borrowed arm left as is stays alone, since
+# releasing it would take a count its owner still holds.
+fn ir_discarded_branch_value_is_owned(idx: Int) -> Bool:
+    k := node_kind(idx)
+    if k != "match_expr" and k != "select_expr":
+        return false
+    return not ir_expr_is_borrowed(idx)
 
 # the rc kinds a discarded statement value is the statement's to release. the
 # containers, `bytes` and a struct or tuple header were the first set; a

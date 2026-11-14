@@ -338,6 +338,19 @@ impl MapImpl {
         self.data.get(key)
     }
 
+    /// `word + delta`, or the integer-overflow runtime error when the sum does
+    /// not fit. The fused update stands in for `m[k] + d` on an Int value,
+    /// which traps on overflow like any other Int `+`.
+    fn checked_word_add(word: i64, delta: i64) -> i64 {
+        match word.checked_add(delta) {
+            Some(sum) => sum,
+            None => unsafe {
+                crate::runtime_core::pith_runtime_error(7);
+                0
+            },
+        }
+    }
+
     /// Add `delta` to the word stored under `key` and return the new word, or
     /// `None` when the map does not hold the key.
     ///
@@ -350,13 +363,13 @@ impl MapImpl {
         if let KeyRef::Int(n) = key {
             if let Some(data) = &mut self.int_values8 {
                 let slot = data.get_mut(n)?;
-                *slot = slot.wrapping_add(delta);
+                *slot = Self::checked_word_add(*slot, delta);
                 return Some(*slot);
             }
         }
         match self.data.get_mut(key)? {
             MapVal::Word(word) => {
-                *word = word.wrapping_add(delta);
+                *word = Self::checked_word_add(*word, delta);
                 Some(*word)
             }
             MapVal::Wide(_) => {
@@ -377,14 +390,14 @@ impl MapImpl {
     fn add_or_insert(&mut self, key: &KeyRef<'_>, delta: i64, init: i64) -> i64 {
         if let KeyRef::Int(n) = key {
             if let Some(data) = &mut self.int_values8 {
-                let slot = data.entry(*n).and_modify(|v| *v = v.wrapping_add(delta)).or_insert(init);
+                let slot = data.entry(*n).and_modify(|v| *v = Self::checked_word_add(*v, delta)).or_insert(init);
                 return *slot;
             }
         }
         match self.data.entry_ref(key) {
             EntryRef::Occupied(mut entry) => match entry.get_mut() {
                 MapVal::Word(word) => {
-                    *word = word.wrapping_add(delta);
+                    *word = Self::checked_word_add(*word, delta);
                     *word
                 }
                 MapVal::Wide(_) => {
@@ -2902,8 +2915,9 @@ mod tests {
 
     /// The fused update has to answer exactly what the read-then-store pair it
     /// replaces answers, for every key flavor and whatever the values are
-    /// doing: negative, zero, and wrapping past the end of the range the way
-    /// the `add` instruction does.
+    /// doing: negative, zero, and up to the ends of the Int range. A sum past
+    /// either end stops the program, like `+` on an Int (the abort goldens
+    /// cover that), so the pairs here are the ones that fit.
     #[test]
     fn a_fused_update_matches_the_pair_it_replaces() {
         unsafe {
@@ -2913,7 +2927,9 @@ mod tests {
             let bkey = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
             for start in starts {
                 for delta in deltas {
-                    let expected = start.wrapping_add(delta);
+                    let Some(expected) = start.checked_add(delta) else {
+                        continue;
+                    };
 
                     let smap = pith_map_new_default().ptr as i64;
                     pith_map_insert_cstr(smap, key, start);
@@ -2954,8 +2970,8 @@ mod tests {
             let other = b"user-1001-region\0".as_ptr() as *const i8;
             let bkey = crate::bytes::pith_bytes_from_vec(b"user-1000-region".to_vec());
             let bother = crate::bytes::pith_bytes_from_vec(b"user-1001-region".to_vec());
-            for (start, delta) in [(0i64, 1i64), (7, -9), (i64::MAX, 1), (i64::MIN, -1)] {
-                let expected = start.wrapping_add(delta);
+            for (start, delta) in [(0i64, 1i64), (7, -9), (i64::MAX, -1), (i64::MIN, 1)] {
+                let expected = start + delta;
 
                 let smap = pith_map_new_default().ptr as i64;
                 assert_eq!(pith_map_add_or_insert_cstr(smap, key, delta, start), start);

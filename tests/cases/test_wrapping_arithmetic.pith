@@ -1,0 +1,19 @@
+# `+`, `-` and `*` stop on overflow; the wrapping methods give the wrapped
+# result on purpose, at 64 bits for Int and the unsigned words and into the
+# range of a narrow type.
+fn main():
+    big := 9223372036854775807
+    small := 0 - big - 1
+    print("{big.wrapping_add(1) == small}")
+    print("{small.wrapping_sub(1) == big}")
+    print("{big.wrapping_mul(2)}")
+    print("{(1099511628211).wrapping_mul(1469598103934665603)}")
+    u := UInt(3)
+    print("{u.wrapping_sub(UInt(5))}")
+    print("{UInt(0).wrapping_sub(UInt(1)).wrapping_add(UInt(2))}")
+    n8 := Int8(127)
+    print("{n8.wrapping_add(Int8(1))}")
+    # arithmetic that stays in range is unchanged
+    print("{big - 1 + 1 == big}")
+    print("{small + 1 - 1 == small}")
+    print("{3037000499 * 3037000499}")

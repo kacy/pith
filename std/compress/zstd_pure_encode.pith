@@ -84,7 +84,7 @@ fn all_same(raw: Bytes, start: Int, end: Int) -> Bool:
         return end - start == 1
     first := raw[start]
     # eight-at-a-time: a word of the repeated byte against the data words.
-    pattern := first * 72340172838076673
+    pattern := first.wrapping_mul(72340172838076673)
     mut i := start
     while i + 8 <= end:
         if bytes.read_word(raw, i, 8) != pattern:
@@ -528,7 +528,7 @@ fn literals_section(lit: Bytes) -> Bytes!:
 # bits of a fibonacci-scaled product, `shift` of them discarded to land in
 # a table of 2^(32 - shift) buckets.
 fn hash4(word: Int, shift: Int) -> Int:
-    return bits.shr(bits.band(word * 2654435761, 4294967295), shift)
+    return bits.shr(bits.band(word.wrapping_mul(2654435761), 4294967295), shift)
 
 # how many hash buckets the match finder gets, and so how many zeros the
 # table costs to build. a bucket per input byte finds as much as a fixed

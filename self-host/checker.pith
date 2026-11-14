@@ -19,7 +19,7 @@
 
 from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
 from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
-from ast import Node, get_node
+from ast import Node, get_node, node_kind, node_value, node_child_count, node_child
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
@@ -143,6 +143,13 @@ mut ambiguous_generic_bases: Map[String, Bool] := {}
 # the module each generic declaration was registered from, keyed by its AST
 # node index, so an instantiation can name the declaration it came from.
 mut generic_declaration_modules: Map[Int, String] := {}
+# the plain (non-generic) struct and enum names each module declares, keyed
+# "module<TAB>name", and the first module to declare each name. a module's
+# own plain type shadows a generic of the same name from another module
+# (resolve_generic_declaration_key), and a generic whose name another module
+# gives a plain type is ambiguous (note_plain_type_declaration).
+mut module_plain_type_names: Map[String, Bool] := {}
+mut plain_type_first_module: Map[String, String] := {}
 mut checking_test_decl := false
 # impl set: "Type\tInterface" -> 1
 mut implementation_set: Map[String, Int] := {}
@@ -231,6 +238,8 @@ pub fn initialize_checker(file_path: String):
     generic_base_first_module = {}
     ambiguous_generic_bases = {}
     generic_declaration_modules = {}
+    module_plain_type_names = {}
+    plain_type_first_module = {}
     checker_interfaces_reset()
     implementation_set = {}
     interface_decl_index = {}
@@ -603,7 +612,14 @@ fn resolve_named_type(name: String) -> Int:
     return tid
 
 fn resolve_generic_type_from_node(node: Node) -> Int:
-    base := resolve_imported_type_name(node.value)
+    mut base := resolve_imported_type_name(node.value)
+    # `alias.Box[T]` names the aliased module's generic, which a plain type
+    # this module declares under the bare name must not shadow
+    parts := split_qualified_name(node.value)
+    if parts.1 != "" and module_aliases.contains_key(parts.0):
+        qualified := module_generic_target_name(module_aliases[parts.0], parts.1)
+        if generic_declaration_map.contains_key(qualified):
+            base = qualified
     mut type_args: List[Int] := []
     for child in node.children:
         type_args.push(resolve_type_implementation(child))
@@ -961,6 +977,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
     mut empty_bools: List[Bool] := []
     tid := add_type_info(ti_struct(base_name, empty_names, empty_ints, empty_bools, empty_bools))
     register_module_type_name(base_name, tid)
+    note_plain_type_declaration(base_name)
     define_binding_at(current_scope, base_name, tid, false, node_idx)
     # non-generic: resolve field types immediately
     mut field_names: List[String] := []
@@ -1030,6 +1047,7 @@ fn register_enum_declaration(node_idx: Int, node: Node):
             variant_types.push(vtypes)
     tid := add_type_info(ti_enum(base_name, variant_names, variant_types))
     register_module_type_name(base_name, tid)
+    note_plain_type_declaration(base_name)
     define_binding_at(current_scope, base_name, tid, false, node_idx)
 
 # ---------------------------------------------------------------
@@ -1417,8 +1435,24 @@ fn register_generic_declaration(name: String, node_idx: Int):
             ambiguous_generic_bases.insert(name, true)
     else:
         generic_base_first_module.insert(name, current_checker_module_path)
+    if plain_type_first_module.contains_key(name):
+        if plain_type_first_module[name] != current_checker_module_path:
+            ambiguous_generic_bases.insert(name, true)
     if current_checker_module_path.len() > 0 and generic_declaration_map.contains_key(name) == false:
         generic_declaration_map.insert(name, node_idx)
+
+# record a plain struct or enum this module declares. a generic of the same
+# name in another module makes that generic's bare name ambiguous, exactly as
+# a second generic would: its instances, methods and impls are then keyed by
+# its module's name, so the plain type's bare-name entries cannot answer for
+# them.
+fn note_plain_type_declaration(name: String):
+    module_plain_type_names.insert(current_checker_module_path + chr(9) + name, true)
+    if plain_type_first_module.contains_key(name) == false:
+        plain_type_first_module.insert(name, current_checker_module_path)
+    if generic_base_first_module.contains_key(name):
+        if generic_base_first_module[name] != current_checker_module_path:
+            ambiguous_generic_bases.insert(name, true)
 
 # the name every table keys a generic base by. a generic declaration has no
 # type id to key on — only its instances get one — so a struct's methods, its
@@ -1436,6 +1470,17 @@ pub fn generic_base_identity(module_path: String, name: String) -> String:
     if generic_declaration_map.contains_key(key):
         return key
     return name
+
+## true when the module at `module_path` ("" for the root file) itself
+## declares a generic struct, enum or function called `name`.
+pub fn module_declares_generic(module_path: String, name: String) -> Bool:
+    key := module_generic_target_name(module_path, name)
+    if generic_declaration_map.contains_key(key) == false:
+        return false
+    decl_idx := generic_declaration_map[key]
+    if generic_declaration_modules.contains_key(decl_idx) == false:
+        return false
+    return generic_declaration_modules[decl_idx] == module_path
 
 # the identity of the generic declaration at this AST node index, resolved
 # from the module it was registered in. instantiation names an instance from
@@ -1516,6 +1561,13 @@ fn resolve_generic_declaration_key(name: String) -> String:
         current_key := module_generic_target_name(current_checker_module_path, name)
         if generic_declaration_map.contains_key(current_key):
             return current_key
+    # a plain struct or enum this module declares is what its bare name means
+    # here, even when another module declares a generic of the same name.
+    # without this, the module's impl on its own plain type registered as an
+    # impl on the foreign generic, and a method call on either value ran
+    # whichever body was registered last.
+    if module_plain_type_names.contains_key(current_checker_module_path + chr(9) + name):
+        return ""
     if generic_declaration_map.contains_key(name):
         return name
     if current_checker_module_path.len() == 0:
@@ -1745,11 +1797,64 @@ fn check_top_level_declarations(node_idx: Int):
     else:
         check_declaration(node_idx)
 
+# the type node of the first interface named in a type annotation, or -1.
+# an interface is a bound for a type parameter and has no values of its own,
+# so a parameter, return or field typed by one was accepted here and then
+# failed at its first use with an error about a missing method or a
+# mismatched argument.
+fn interface_in_type(type_idx: Int) -> Int:
+    tn := get_node(type_idx)
+    if tn.kind == "type" and names_an_interface(tn.value):
+        return type_idx
+    for child in tn.children:
+        found := interface_in_type(child)
+        if found >= 0:
+            return found
+    return 0 - 1
+
+# whether a type name, resolved the way an annotation resolves it, lands on an
+# interface. the name alone is not enough: an interface is registered as a
+# struct with no fields, and another module may declare a real struct with
+# the same name (std/io's Reader interface and std/binary's Reader struct).
+fn names_an_interface(name: String) -> Bool:
+    if not has_interface_declaration(name):
+        return false
+    mut tid := resolve_type_name_module_scoped(name)
+    if tid < 0:
+        tid = lookup_type_id(resolve_imported_type_name(name))
+    return is_interface_type(tid)
+
+# whether a type id is an interface's: the zero-field struct an interface
+# declaration registers.
+fn is_interface_type(tid: Int) -> Bool:
+    if tid < 0:
+        return false
+    info := get_type_info(tid)
+    return info.kind == "struct" and info.fields.len() == 0 and has_interface_declaration(info.name)
+
+fn report_interface_value_type(type_idx: Int):
+    found := interface_in_type(type_idx)
+    if found < 0:
+        return
+    name := node_value(found)
+    report_error_with_fix_at(found, "E315", "interface '" + name + "' is not a value type", "take a type parameter bounded by it, as in `fn f[T: " + name + "](x: T)`")
+
+# the parameter, return and field annotations of one declaration.
+fn check_interface_value_types(node: Node):
+    for child in node.children:
+        kind := node_kind(child)
+        if (kind == "param" or kind == "returns" or kind == "field") and node_child_count(child) > 0:
+            report_interface_value_type(node_child(child, 0))
+        elif kind == "fn_decl" and node.kind == "impl_decl":
+            check_interface_value_types(get_node(child))
+
 fn check_declaration(node_idx: Int):
     node := get_node(node_idx)
     if node.kind == "threadlocal":
         check_declaration(node.children[0])
         return
+    if node.kind == "fn_decl" or node.kind == "impl_decl" or node.kind == "struct_decl":
+        check_interface_value_types(node)
     if node.kind == "fn_decl":
         check_function_declaration(node)
     elif node.kind == "binding":
@@ -1839,7 +1944,15 @@ fn check_implementation_declaration(node: Node):
     if method_start == 2 and iface_type_base_name(first_type_node) == "Drop":
         check_drop_implementation(node, concrete_name, method_start)
 
-    concrete_tid := lookup_type_id(concrete_name)
+    # the module's own declaration first: the global table holds whichever
+    # module registered the name last, which can be another module's plain
+    # struct while this impl is on this module's generic of the same name. a
+    # generic's bodies are checked per specialization, not here.
+    mut concrete_tid := resolve_type_name_module_scoped(concrete_name)
+    if concrete_tid < 0:
+        if has_generic_declaration(concrete_name):
+            return
+        concrete_tid = lookup_type_id(concrete_name)
     if concrete_tid < 0:
         return
 
@@ -2045,8 +2158,6 @@ fn check_statement(node_idx: Int, scope_id: Int):
     elif node.kind == "continue":
         if is_in_loop_scope(scope_id) == false:
             report_error("E215", "continue outside of loop")
-    elif node.kind == "match_expr":
-        check_match_expression(node_idx, scope_id)
     elif node.kind == "defer":
         check_defer_statement(node, scope_id)
     elif node.kind == "errdefer":
@@ -2179,6 +2290,48 @@ fn is_mutex_or_mutex_list(t: Int) -> Bool:
         return true
     info := get_type_info(t)
     return info.kind == "list" and get_type_name(info.inner) == "Mutex"
+
+# a labeled argument names the parameter it is passed to. arguments bind by
+# position, so a label must name the parameter in that position: a label that
+# names another parameter, or none of them, would otherwise bind silently to
+# the wrong one. a function value held in a local has no names to match, so a
+# label on a call through one is refused too. struct and variant constructors
+# check their own field names.
+fn check_argument_labels(call_idx: Int, node: Node):
+    mut labeled := false
+    for child, i in node.children:
+        if i > 0 and node_kind(child) == "arg" and node_value(child).len() > 0:
+            labeled = true
+    if not labeled:
+        return
+    decl_idx := called_declaration(call_idx)
+    if decl_idx < 0:
+        # a builtin, or a constructor reached through a module
+        # (`m.S(x: 1)`), which checks its own field names.
+        return
+    decl := get_node(decl_idx)
+    # a function value held in a local or a parameter has no names to match
+    is_value := decl.kind == "binding" or decl.kind == "param"
+    if decl.kind != "fn_decl" and not is_value:
+        return
+    mut params: List[String] := []
+    for child in decl.children:
+        if node_kind(child) == "param":
+            params.push(extract_binding_name(node_value(child)))
+    for child, i in node.children:
+        if i == 0 or node_kind(child) != "arg":
+            continue
+        label := node_value(child)
+        if label.len() == 0:
+            continue
+        pos := i - 1
+        if is_value:
+            report_error_at(child, "E314", "argument label '" + label + "' on a call through a function value, which has no parameter names")
+        elif pos < params.len() and params[pos] != label:
+            if params.contains(label):
+                report_error_at(child, "E314", "argument label '" + label + "' is in the position of parameter '" + params[pos] + "'; arguments bind by position")
+            else:
+                report_error_at(child, "E314", "no parameter named '" + label + "'; the parameter in this position is '" + params[pos] + "'")
 
 # a call to a function declared `holding m` needs `m` held at the call. a
 # path rooted at `self` is read off the receiver, and one rooted at a
@@ -3263,16 +3416,14 @@ pub fn get_definition_of() -> Map[Int, Int]:
     return definition_of
 
 # the declaration node a call or a method call resolved to, or -1. a call is
-# recorded under its callee and a method call under itself.
+# recorded under its callee, except a call to a generic function, which is
+# recorded under the call itself, as a method call is.
 pub fn called_declaration(idx: Int) -> Int:
     node := get_node(idx)
-    mut key := 0 - 1
-    if node.kind == "call" and node.children.len() > 0:
-        key = node.children[0]
-    elif node.kind == "method_call":
-        key = idx
-    if key >= 0 and definition_of.contains_key(key):
-        return definition_of[key]
+    if node.kind == "call" and node.children.len() > 0 and definition_of.contains_key(node.children[0]):
+        return definition_of[node.children[0]]
+    if (node.kind == "call" or node.kind == "method_call") and definition_of.contains_key(idx):
+        return definition_of[idx]
     return 0 - 1
 
 # record a use-site -> declaration-node pair. -1 on either side means
@@ -3336,10 +3487,12 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "call":
         call_tid := check_function_call(node, scope_id)
         check_holding_call(node_idx, node, scope_id)
+        check_argument_labels(node_idx, node)
         return call_tid
     if node.kind == "method_call":
         method_tid := check_method_call(node, scope_id)
         check_holding_call(node_idx, node, scope_id)
+        check_argument_labels(node_idx, node)
         return method_tid
     if node.kind == "field_access":
         return check_field_access_expression(node_idx, node, scope_id)
@@ -4191,18 +4344,26 @@ fn check_generic_function_call_explicit(name: String, index_node: Node, arg_indi
         report_error("E207", "expected " + param_type_nodes.len().to_string() + " arguments, got " + arg_types.len().to_string())
         return TID_ERR
 
+    signature_scope := enter_signature_scope(decl_idx)
     mut ret_type := TID_VOID
     for child in decl_node.children:
         cn := get_node(child)
         if cn.kind == "returns":
             ret_type = resolve_type_with_substitution_map(cn.children[0], generic_params, subst_args)
+    mut concrete_params: List[Int] := []
+    for ptn in param_type_nodes:
+        if ptn >= 0:
+            concrete_params.push(resolve_type_with_substitution_map(ptn, generic_params, subst_args))
+        else:
+            concrete_params.push(TID_ERR)
+    leave_signature_scope(signature_scope)
 
     # same widening rule as the inferred path: a plain value satisfies an
     # optional parameter once the explicit type args make it concrete.
     mut vidx := 0
     for ptn in param_type_nodes:
         if ptn >= 0 and vidx < arg_types.len():
-            concrete := resolve_type_with_substitution_map(ptn, generic_params, subst_args)
+            concrete := concrete_params[vidx]
             if is_error_type(concrete) == false and is_error_type(arg_types[vidx]) == false:
                 if arg_types[vidx] != concrete:
                     if argument_widens_to_optional(argument_expression_index(arg_indices[vidx]), arg_types[vidx], concrete) == false:
@@ -4390,7 +4551,9 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
                 if arg_type != expected:
                     if argument_widens_to_optional(arg_expr_idx, arg_type, expected) == false:
                         if collection_literal_matches_target(arg_expr_idx, expected, scope_id) == false:
-                            if types_structurally_equal(arg_type, expected) == false:
+                            # a parameter typed by an interface was refused
+                            # at its annotation (E315)
+                            if types_structurally_equal(arg_type, expected) == false and not is_interface_type(expected):
                                 report_error_at(arg_expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return fn_info.return_type
@@ -5226,12 +5389,22 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
         return TID_ERR
     record_generic_call_subst(subst_args)
     queue_function_specialization(decl_idx, 0 - 1, subst_args)
-    # resolve return type with substitution
+    # resolve return type with substitution. the types come from the
+    # signature's own module, not the caller's: `MapIter[I, U]` in std.iter
+    # names std.iter's MapIter even when the caller declares one too.
+    signature_scope := enter_signature_scope(decl_idx)
     mut ret_type := TID_VOID
     for child in decl_node.children:
         cn := get_node(child)
         if cn.kind == "returns":
             ret_type = resolve_type_with_substitution_map(cn.children[0], generic_params, subst_args)
+    mut concrete_params: List[Int] := []
+    for ptn in param_type_nodes:
+        if ptn >= 0:
+            concrete_params.push(resolve_type_with_substitution_map(ptn, generic_params, subst_args))
+        else:
+            concrete_params.push(TID_ERR)
+    leave_signature_scope(signature_scope)
     # validate arg types against concrete param types. a plain value widens
     # into an optional parameter here the same way it does on the non-generic
     # paths — safe now that #148 made the specialization read the parameter's
@@ -5240,7 +5413,7 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
     for ptn in param_type_nodes:
         if ptn >= 0:
             if vidx < arg_types.len():
-                concrete := resolve_type_with_substitution_map(ptn, generic_params, subst_args)
+                concrete := concrete_params[vidx]
                 if is_error_type(concrete) == false:
                     if is_error_type(arg_types[vidx]) == false:
                         if arg_types[vidx] != concrete:
@@ -5725,7 +5898,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
         return check_bytes_method_call(method_name, arg_indices, scope_id)
     # primitive methods
     if is_integer_type(dispatch_type):
-        return check_int_method_call(method_name, arg_indices, scope_id)
+        return check_int_method_call(method_name, dispatch_type, arg_indices, scope_id)
     if dispatch_type == tid_float:
         return check_float_method_call(method_name, arg_indices, scope_id)
     if dispatch_type == tid_bool:
@@ -5900,8 +6073,9 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                     return check_callable_type_with_args(recv_info.field_types[ffi], arg_indices, scope_id)
             ffi = ffi + 1
     # a table that recognized the method may have reported already;
-    # don't stack the generic "no method" on top of its specific error
-    if checker_reported_at_current() == false:
+    # don't stack the generic "no method" on top of its specific error. a
+    # receiver typed by an interface was refused at its annotation (E315).
+    if checker_reported_at_current() == false and not is_interface_type(receiver_type):
         report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "'")
     return TID_ERR
 
@@ -6060,7 +6234,7 @@ fn check_result_method_call(method: String, info: TypeInfo, args: List[Int], sco
 # primitive methods
 # ---------------------------------------------------------------
 
-fn check_int_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
+fn check_int_method_call(method: String, recv_tid: Int, args: List[Int], scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     tid_float := lookup_type_id("Float")
     if method == "to_string":
@@ -6069,6 +6243,12 @@ fn check_int_method_call(method: String, args: List[Int], scope_id: Int) -> Int:
     if method == "to_float":
         expect_no_arguments(method, args)
         return tid_float
+    # `+`, `-` and `*` stop the program when the result does not fit. these
+    # wrap it into the type's range instead, for hashing and the other places
+    # where wrapping is the arithmetic intended.
+    if method == "wrapping_add" or method == "wrapping_sub" or method == "wrapping_mul":
+        expect_one_typed_argument(method, args, recv_tid, scope_id)
+        return recv_tid
     report_error("E209", "Int has no method '" + method + "'")
     return TID_ERR
 
@@ -7185,6 +7365,18 @@ fn check_or_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
         else:
             check_pattern_match(alt, expected_type, scope_id)
 
+# whether a pattern's written enum name means the generic base an instance
+# was named from. the base is the bare name unless two modules declare it,
+# and then it is the declaring module's key, which the written name reaches
+# through the module's own generic declaration.
+fn generic_pattern_names_base(type_name: String, base: String) -> Bool:
+    if base == type_name:
+        return true
+    decl_idx := get_generic_declaration_index(type_name)
+    if decl_idx < 0:
+        return false
+    return generic_declaration_identity(decl_idx) == base
+
 fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     # value: "EnumName.VariantName"
     # children: sub-patterns for variant fields
@@ -7203,7 +7395,7 @@ fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     # check below.
     if expected_type >= 0:
         einfo := get_type_info(expected_type)
-        if einfo.kind == "enum" and extract_base_type_name(einfo.name) == type_name:
+        if einfo.kind == "enum" and generic_pattern_names_base(type_name, extract_base_type_name(einfo.name)):
             enum_tid = expected_type
     if enum_tid < 0:
         report_error("E202", "unknown type: " + type_name)
@@ -8366,6 +8558,8 @@ pub struct CheckerSnapshot:
     pub generic_base_first_module: Map[String, String]
     pub ambiguous_generic_bases: Map[String, Bool]
     pub generic_declaration_modules: Map[Int, String]
+    pub module_plain_type_names: Map[String, Bool]
+    pub plain_type_first_module: Map[String, String]
     pub checking_test_decl: Bool
     pub implementation_set: Map[String, Int]
     pub interface_decl_index: Map[String, Int]
@@ -8431,6 +8625,8 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         generic_base_first_module: copy_map(generic_base_first_module),
         ambiguous_generic_bases: copy_map(ambiguous_generic_bases),
         generic_declaration_modules: copy_map(generic_declaration_modules),
+        module_plain_type_names: copy_map(module_plain_type_names),
+        plain_type_first_module: copy_map(plain_type_first_module),
         checking_test_decl: checking_test_decl,
         implementation_set: copy_map(implementation_set),
         interface_decl_index: copy_map(interface_decl_index),
@@ -8496,6 +8692,8 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     generic_base_first_module = copy_map(s.generic_base_first_module)
     ambiguous_generic_bases = copy_map(s.ambiguous_generic_bases)
     generic_declaration_modules = copy_map(s.generic_declaration_modules)
+    module_plain_type_names = copy_map(s.module_plain_type_names)
+    plain_type_first_module = copy_map(s.plain_type_first_module)
     checking_test_decl = s.checking_test_decl
     implementation_set = copy_map(s.implementation_set)
     interface_decl_index = copy_map(s.interface_decl_index)

@@ -38,8 +38,8 @@
 # cranelift/codegen/src/ir_consumer.rs.
 
 # the front half of the compiler: ast, checker verdicts, type table
-from ast import get_node, node_kind, node_value, node_child, node_child_count, Node
-from checker import generic_base_identity, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
+from checker import generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -78,6 +78,19 @@ from ir_list_helpers import ir_is_list_runtime_type, ir_emit_list_map_loop, ir_e
 from ir_result_flow import ir_emit_result_store_error_branch
 
 # --- per-function state: reset or rebuilt for every function emitted ---
+# loop counter steps that cannot overflow, by node index: the `i + 1` of an
+# `i = i + 1`, or the `i += 1` itself. see ir_mark_counter_steps.
+mut ir_counter_steps: Map[Int, Bool] := {}
+# the arena size ir_mark_index_offsets has scanned up to
+mut ir_index_offsets_scanned := 0
+# index offsets that may skip their check, offset node -> the indexed node.
+# the types are tested when the offset is emitted (ir_index_offset_unchecked),
+# since a generic body has none until it is specialized.
+mut ir_index_offset_targets: Map[Int, Int] := {}
+# set while one of those steps, or an index offset that skips its check, is
+# emitted, so ir_int_op hands back the plain op instead of the checked one
+mut ir_counter_step_active := false
+
 mut ir_map_value_types: Map[String, String] := {} # map variable name -> value type
 
 # declared return kinds of closure-typed parameters in the current
@@ -323,6 +336,7 @@ mut ir_tuple_dtor_sigs: List[String] := [] # rc-element signatures seen this mod
 mut ir_tuple_cascade_sigs: List[String] := [] # (ok,err) payload signatures needing a cascade helper
 mut ir_tuple_stack_cascade_sigs: List[String] := [] # the same, for stack boxes: the shell is not freed
 mut ir_result_arg_release_sigs: List[String] := [] # (ok,err) payload signatures needing a result-argument release helper
+mut ir_result_unshare_sigs: List[String] := [] # (ok,err) payload signatures needing a result-unshare helper
 # set when some optional in this module wraps a genuine tuple, which needs the
 # shell to release its payload. one walk serves every such shell: the payload
 # already carries its own destructor for its elements, so the shell's job is
@@ -630,6 +644,7 @@ fn ir_reset_type_state():
     ir_tuple_stack_cascade_sigs = []
     ir_kinded_release_used = false
     ir_result_arg_release_sigs = []
+    ir_result_unshare_sigs = []
     ir_struct_names.clear()
     ir_struct_field_lookup.clear()
     ir_struct_field_index_lookup.clear()
@@ -2622,8 +2637,8 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     # binding owns its own retained count (taken at bind, tracked by the
     # prepass, released by the exit cleanup), so the local stays the last
     # owner of the count the shell arrived with, the same contract as a
-    # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT
-    # match stays disqualifying: its binding path takes no count.
+    # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT match
+    # is judged below, since its binding takes no count.
     if not is_result and node.kind == "match_expr" and node.children.len() > 1:
         subj := get_node(node.children[0])
         if subj.kind == "ident" and subj.value == name:
@@ -2652,13 +2667,16 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
                         return false
                     li = li + 1
                 return true
-    if ir_tuple_walk_pair_callee:
-        if node.kind == "body" or node.kind == "block":
-            return ir_tuple_pair_block_safe(node, name)
-        if node.kind == "match_expr" and node.children.len() > 1:
-            subj := get_node(ir_unwrap_grouped(node.children[0]))
-            if subj.kind == "ident" and subj.value == name:
-                return ir_tuple_pair_match_safe(node, name)
+    if ir_tuple_walk_pair_callee and (node.kind == "body" or node.kind == "block"):
+        return ir_tuple_pair_block_safe(node, name)
+    # a match on a RESULT local binds the box itself to a bare arm binding,
+    # with no count of its own. the local stays the last owner as long as
+    # every arm reads the box, under either name, only through the uses the
+    # walk allows. a variant or literal pattern is refused.
+    if is_result and node.kind == "match_expr" and node.children.len() > 1:
+        subj := get_node(ir_unwrap_grouped(node.children[0]))
+        if subj.kind == "ident" and subj.value == name:
+            return ir_tuple_pair_match_safe(node, name)
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:
@@ -2970,6 +2988,92 @@ fn ir_emit_result_arg_release_helpers():
         ir_emit("jmp " + done_l)
         ir_emit_label(done_l)
         ir_emit_zero_ret_endfunc()
+
+# a result box handed back whole by a function that returns the box (the box
+# abi, which generic functions and interface impls always use) has to be one
+# the caller owns alone. every caller that opens a call's box takes the
+# payload's count over and frees the shell, which is right only when nothing
+# else holds the box. a box that also sits in a holder carries the payload
+# destructor (ir_attach_result_box_dtor), and the holder would release that
+# payload a second time. a forwarded parameter, field, element or shared local
+# is such a box, so where the count says it is shared this returns a fresh box
+# with its own count on the live payload and drops the count it was given on
+# the shared one. the register abi does the same when it returns a borrowed
+# box as the pair (ir_emit_return_box_as_pair).
+fn ir_emit_result_box_unshare(box_r: Int, tid: Int) -> Int:
+    sig := ir_tuple_cascade_signature(tid)
+    if sig == "00":
+        return box_r
+    if not ir_result_unshare_sigs.contains(sig):
+        ir_result_unshare_sigs.push(sig)
+    if not ir_tuple_stack_cascade_sigs.contains(sig):
+        ir_tuple_stack_cascade_sigs.push(sig)
+    r := ir_reg()
+    ir_emit_call1(r, ir_result_unshare_helper_name(sig), "tuple", box_r)
+    return r
+
+fn ir_result_unshare_helper_name(sig: String) -> String:
+    return "__result_unshare_" + sig + "_m" + ir_module_count.to_string()
+
+# one helper per (ok, err) payload signature ir_emit_result_box_unshare used
+# in this module: the box itself when its count is the caller's alone,
+# otherwise a fresh copy holding a count of its own on the live payload. the
+# shared box keeps its own count on the payload, and its remaining owners may
+# each release it plainly, so it takes the payload destructor
+# (ir_attach_result_box_dtor) before the count it was given is dropped: the
+# last owner's release then drops the payload too.
+fn ir_emit_result_unshare_helpers():
+    for sig in ir_result_unshare_sigs:
+        ok_kind := ir_tuple_dtor_code_kind(sig[0])
+        err_kind := ir_tuple_dtor_code_kind(sig.substring(1, 2))
+        ir_emit_func_header(ir_result_unshare_helper_name(sig), 1, "tuple")
+        ir_emit("param p")
+        pr := ir_reg()
+        ir_emit("load " + pr.to_string() + " p")
+        count_r := ir_reg()
+        ir_emit_call1(count_r, "pith_struct_strong_count", "int", pr)
+        one_r := ir_reg()
+        ir_emit("iconst " + one_r.to_string() + " 1")
+        sole_r := ir_reg()
+        ir_emit("eq " + sole_r.to_string() + " " + count_r.to_string() + " " + one_r.to_string())
+        keep_l := ir_label()
+        copy_l := ir_label()
+        ir_emit("brif " + sole_r.to_string() + " " + keep_l + " " + copy_l)
+        ir_emit_label(keep_l)
+        ir_emit("ret " + pr.to_string())
+        ir_emit_label(copy_l)
+        size_r := ir_reg()
+        ir_emit("iconst " + size_r.to_string() + " 3")
+        copy_r := ir_reg()
+        ir_emit_call1(copy_r, "pith_struct_alloc", "struct:tuple", size_r)
+        flag_r := ir_reg()
+        ir_emit("field " + flag_r.to_string() + " " + pr.to_string() + " 0 bool is_ok")
+        ok_r := ir_reg()
+        ir_emit("field " + ok_r.to_string() + " " + pr.to_string() + " 8 unknown ok")
+        err_r := ir_reg()
+        ir_emit("field " + err_r.to_string() + " " + pr.to_string() + " 16 unknown err")
+        ir_emit("sstore " + copy_r.to_string() + " 0 " + flag_r.to_string())
+        ir_emit("sstore " + copy_r.to_string() + " 1 " + ok_r.to_string())
+        ir_emit("sstore " + copy_r.to_string() + " 2 " + err_r.to_string())
+        ok_l := ir_label()
+        err_l := ir_label()
+        done_l := ir_label()
+        ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit_label(ok_l)
+        if ok_kind.len() > 0:
+            ir_rc_retain_reg(ok_r, ok_kind)
+        ir_emit("jmp " + done_l)
+        ir_emit_label(err_l)
+        if err_kind.len() > 0:
+            ir_rc_retain_reg(err_r, err_kind)
+        ir_emit("jmp " + done_l)
+        ir_emit_label(done_l)
+        dtor_r := ir_reg()
+        ir_emit("funcref " + dtor_r.to_string() + " " + ir_tuple_stack_cascade_helper_name(sig))
+        ir_emit_call2(ir_reg(), "pith_struct_set_dtor", "void", pr, dtor_r)
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", pr)
+        ir_emit("ret " + copy_r.to_string())
+        ir_emit("endfunc")
 
 # release every rc local the function owns before a return, minus `exclude`,
 # the one being returned (its count transfers to the caller). the prologue
@@ -4216,8 +4320,9 @@ fn ir_record_struct_field(struct_name: String, field_names: List[String], field_
         # a closure field (fn_type) must be recorded too, or the struct's
         # destructor won't know to release it and the closure leaks. so must
         # a tuple field: unrecorded, it was a plain word, and the struct's
-        # last release stranded the tuple and everything in it.
-        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type" or type_node.kind == "tuple_type":
+        # last release stranded the tuple and everything in it. a result
+        # field is the same, with its box and payload.
+        if type_node.kind == "type" or type_node.kind == "generic_type" or type_node.kind == "optional_type" or type_node.kind == "fn_type" or type_node.kind == "tuple_type" or type_node.kind == "result_type":
             ir_struct_field_lookup.insert(struct_name + "." + field_name, ir_resolve_type_node(field_node.children[0]))
         if field_node.children.len() > 1:
             ir_struct_field_default_nodes.insert(struct_name + "." + field_name, field_node.children[1])
@@ -4256,6 +4361,19 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool, module_path: String):
     # a generic enum base takes the same identity a generic struct base does,
     # so two modules declaring the same enum name keep their variants apart.
     sname := generic_base_identity(module_path, node.value)
+    variant_names := ir_record_enum_variants(node, sname)
+    # the module's own bodies write the bare name (`Opt.Some(v)`), so the
+    # module emitting its own declaration files it under that name as well.
+    # an importer's copy stays under the declaring module's key only, so the
+    # bare name keeps meaning the importer's own enum.
+    if emit_decl and sname != node.value:
+        _bare := ir_record_enum_variants(node, node.value)
+    if emit_decl:
+        ir_emit("struct " + sname + " " + variant_names.join(" "))
+
+# file one enum's variants, their payload kinds and its variant count under
+# `sname`, and answer the variant names in order.
+fn ir_record_enum_variants(node: Node, sname: String) -> List[String]:
     mut variant_names: List[String] := []
     for child in node.children:
         variant_node := ir_unwrap_pub_node(child)
@@ -4275,8 +4393,7 @@ fn ir_collect_enum_decl(node: Node, emit_decl: Bool, module_path: String):
                 ir_boxed_enums.insert(sname, true)
     ir_enum_variant_lists.insert(sname, variant_names.join(","))
     ir_struct_names.insert(sname, variant_names.len())
-    if emit_decl:
-        ir_emit("struct " + sname + " " + variant_names.join(" "))
+    return variant_names
 
 # record the drop method of every `impl Drop for T` in a root, keyed by the
 # declaration node of the struct it names. the struct has to be declared in
@@ -4308,6 +4425,30 @@ fn ir_root_struct_decl_index(root_idx: Int, name: String) -> Int:
         if (cn.kind == "struct_decl" or cn.kind == "struct") and ir_base_decl_name(cn.value) == name:
             return item_idx
     return 0 - 1
+
+# a generic enum imported by name (`from m import Opt`) whose name a second
+# module also declares is held under m's key only, so this module's bare
+# `Opt.Some` patterns and constructors would find nothing. file it under the
+# bare name too, as the name means here.
+fn ir_collect_from_imported_enums(root_idx: Int):
+    for item_idx in ir_root_items(root_idx):
+        node := get_node(item_idx)
+        if node.kind != "from_import":
+            continue
+        parts := node.value.split(" ")
+        if parts.len() < 2:
+            continue
+        module_root := ir_module_root_for_path(parts[0])
+        if module_root < 0:
+            continue
+        for decl_idx in ir_root_items(module_root):
+            decl := get_node(decl_idx)
+            if decl.kind != "enum_decl" and decl.kind != "enum":
+                continue
+            if not parts.contains(decl.value):
+                continue
+            if generic_base_identity(parts[0], decl.value) != decl.value:
+                _variants := ir_record_enum_variants(decl, decl.value)
 
 fn ir_collect_struct_decls(root_idx: Int, emit_decl: Bool, module_path: String):
     for item_idx in ir_root_items(root_idx):
@@ -4744,6 +4885,36 @@ fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inne
         return r
     return ir_expr(val_idx)
 
+# emit a value bound for a holder: a struct field, or a list or map element.
+fn ir_emit_holder_value(val_idx: Int, target_type: String, target_inner: String) -> Int:
+    r := ir_emit_value_for_target_inner(val_idx, target_type, target_inner)
+    ir_attach_result_box_dtor(r, val_idx)
+    return r
+
+# a result box owns its payload but has no destructor, which is fine while a
+# local's cleanup releases the payload with it. a box that lands in a holder
+# is released by the holder's own walk, which frees the box and stranded the
+# payload (#1167). such a box takes the stack cascade's body as its
+# destructor: it releases the live payload and zeroes its slot, and leaves the
+# box to the runtime. a cascade or a fresh argument release that runs first
+# zeroes the slot as well, so the payload is released once either way. a
+# value widened to an optional is a fresh shell, not the box, and is left
+# alone.
+fn ir_attach_result_box_dtor(box_r: Int, val_idx: Int):
+    if val_idx < 0 or c_argument_widens_to_optional(val_idx):
+        return
+    tid := c_get_expr_type(val_idx)
+    if tid < 0 or get_type_info(tid).kind != "result":
+        return
+    sig := ir_tuple_cascade_signature(tid)
+    if sig == "00":
+        return
+    if not ir_tuple_stack_cascade_sigs.contains(sig):
+        ir_tuple_stack_cascade_sigs.push(sig)
+    fr := ir_reg()
+    ir_emit("funcref " + fr.to_string() + " " + ir_tuple_stack_cascade_helper_name(sig))
+    ir_emit_call2(ir_reg(), "pith_struct_set_dtor", "void", box_r, fr)
+
 # the empty-init target with the literal's key flavor applied: "set" becomes
 # "set_bytes" and "map" or "map_str_val" becomes "map_bytes" or
 # "map_bytes_str_val" when the checker typed the literal at val_idx as
@@ -4780,6 +4951,12 @@ fn ir_method_receiver_type(node: Node) -> String:
             return "channel:" + ir_type_from_tid(recv_info.inner)
         if recv_info.kind == "task" and recv_info.inner >= 0:
             return "task:" + ir_type_from_tid(recv_info.inner)
+        # a tag-only enum is an integer to the emitter, so its type name is
+        # lost in the conversion below and a method from its impl block would
+        # be emitted as a call to the bare method name.
+        if recv_info.kind == "enum" and ir_type_from_tid(recv_tid) == "int":
+            if ir_lookup_impl_method_name(recv_info.name, ir_plain_method_name(node.value)).len() > 0:
+                return recv_info.name
         # a bytes-keyed set or map dispatches to its own runtime entry
         # points; the flavor rides on the receiver type only here, where
         # the method name is picked, and is never a tracked kind
@@ -5275,6 +5452,13 @@ fn ir_narrow_to_tid(tid: Int, r: Int) -> Int:
     ir_emit_call1(out, narrow, "int", r)
     return out
 
+# whether the fused map update, which adds in the runtime with Int's
+# overflow check, must leave `m[k] + d` on a value of this type to the
+# general path: a narrow type wraps into its range there, and an unsigned
+# word checks the unsigned range.
+fn ir_fused_add_declines(tid: Int) -> Bool:
+    return ir_sized_int_narrow_fn(tid).len() > 0 or ir_is_unsigned_word(tid)
+
 # the arithmetic operators whose result can leave a narrow type's range.
 # comparisons yield a Bool, and the bit operations live in std.bits on Int.
 fn ir_op_can_overflow(op: String) -> Bool:
@@ -5287,6 +5471,13 @@ fn ir_narrow_sized_result(idx: Int, op: String, r: Int) -> Int:
 
 fn ir_emit_unary_expr(node: Node) -> Int:
     operand_r := ir_expr(node.children[0])
+    # `-x` on an Int is `0 - x`, which overflows for the most negative Int
+    if node.value == "negate" and ir_int_checks_overflow(c_get_expr_type(node.children[0])) and not ir_is_unsigned_word(c_get_expr_type(node.children[0])):
+        zero := ir_reg()
+        ir_emit("iconst " + zero.to_string() + " 0")
+        r := ir_reg()
+        ir_emit_simple_binary(r, "subc", zero, operand_r)
+        return r
     return ir_emit_unary_op(node.value, operand_r)
 
 fn ir_emit_binary_neq(result_reg: Int, left_r: Int, right_r: Int, is_str_op: Bool, is_bytes_op: Bool):
@@ -5910,8 +6101,24 @@ fn ir_is_unsigned_word(tid: Int) -> Bool:
     name := get_type_name(tid)
     return name == "UInt" or name == "UInt64"
 
-# the unsigned form of an integer op on a value of type `tid`, or the op itself.
-fn ir_unsigned_op(tid: Int, op: String) -> String:
+# whether arithmetic on a value of type `tid` stops on overflow: Int, and the
+# unsigned words. the narrow types wrap into their range instead (see
+# ir_sized_int_narrow_fn), and Float has no overflow to check.
+fn ir_int_checks_overflow(tid: Int) -> Bool:
+    if tid < 0:
+        return false
+    name := get_type_name(tid)
+    return name == "Int" or name == "Int64" or ir_is_unsigned_word(tid)
+
+# the op that computes `op` on values of type `tid`: the unsigned form of
+# division, remainder and ordering for an unsigned word, and the checked form
+# of `+`, `-` and `*` for a type that stops on overflow (`addc`, or `uaddc`
+# for an unsigned word). anything else is the op itself.
+fn ir_int_op(tid: Int, op: String) -> String:
+    if (op == "add" or op == "sub" or op == "mul") and ir_int_checks_overflow(tid) and not ir_counter_step_active:
+        if ir_is_unsigned_word(tid):
+            return "u" + op + "c"
+        return op + "c"
     if not ir_is_unsigned_word(tid):
         return op
     if op == "div" or op == "mod" or op == "lt" or op == "gt" or op == "lte" or op == "gte":
@@ -5922,9 +6129,9 @@ fn ir_unsigned_op(tid: Int, op: String) -> String:
 
 fn ir_emit_value_binary(node: Node, r: Int, left_r: Int, right_r: Int) -> Int:
     op := node.value
-    unsigned_op := ir_unsigned_op(c_get_expr_type(node.children[0]), op)
-    if unsigned_op != op:
-        ir_emit(unsigned_op + " " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
+    int_op := ir_int_op(c_get_expr_type(node.children[0]), op)
+    if int_op != op:
+        ir_emit(int_op + " " + r.to_string() + " " + left_r.to_string() + " " + right_r.to_string())
         return r
     left_type := ir_infer_type(node.children[0])
     right_type := ir_infer_type(node.children[1])
@@ -6829,7 +7036,7 @@ fn ir_emit_map_entry_insert(map_r: Int, store_name: String, entry: Node, val_tar
     # stores Some(v), not the raw v, the same fix collection element
     # literals need (a map literal typed Map[K, Int?] otherwise stored
     # bare ints and a later .value() dereferenced one as a heap tuple).
-    v_r := ir_emit_value_for_target_inner(entry.children[1], val_target, val_inner)
+    v_r := ir_emit_holder_value(entry.children[1], val_target, val_inner)
     if key_inflight:
         ir_inflight_drop(k_r)
     # a heap value written straight into a literal is stored the same way one
@@ -7155,7 +7362,7 @@ fn ir_emit_small_list_literal(node: Node, elem_kind: String, elem_target: String
     tag := ir_element_tag_code(elem_kind)
     mut arg_regs: List[Int] := []
     for child in node.children:
-        elem_r := ir_emit_value_for_target_inner(child, elem_target, elem_inner)
+        elem_r := ir_emit_holder_value(child, elem_target, elem_inner)
         if tag != 0:
             if ir_expr_is_borrowed(child):
                 ir_rc_retain_reg(elem_r, elem_kind)
@@ -7216,7 +7423,7 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     # leaked the list holding a's value when b failed
     ir_inflight_push(list_r, "list")
     for child in node.children:
-        elem_r := ir_emit_value_for_target_inner(child, elem_target, elem_inner)
+        elem_r := ir_emit_holder_value(child, elem_target, elem_inner)
         ir_emit_call2(ir_reg(), "__list_push", "void", list_r, elem_r)
         # an optional element's register is the wrapper ir_emit_value_for_target
         # built (or retained, for a passed-through optional), owned by this
@@ -8665,6 +8872,14 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
         recv_tid := c_get_expr_type(node.children[0])
         if recv_tid >= 0:
             recv_info := get_type_info(recv_tid)
+            if recv_info.kind == "primitive" and (mname == "wrapping_add" or mname == "wrapping_sub" or mname == "wrapping_mul"):
+                # the plain op wraps at 64 bits; a narrow type then wraps
+                # into its own range the way its arithmetic always has
+                obj_r := ir_expr(node.children[0])
+                arg_r := ir_expr(ir_method_call_arg_expr(node, 0))
+                out_r := ir_reg()
+                ir_emit_simple_binary(out_r, mname.replace("wrapping_", ""), obj_r, arg_r)
+                return ir_narrow_to_tid(recv_tid, out_r)
             if recv_info.kind == "primitive" and mname == "to_string":
                 if recv_info.name == "UInt" or recv_info.name == "UInt8" or recv_info.name == "UInt16" or recv_info.name == "UInt32" or recv_info.name == "UInt64":
                     obj_r := ir_expr(node.children[0])
@@ -8928,6 +9143,8 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
                 # whoever receives a sent value reads it from another task
                 if ir_is_channel_send_name(emit_name):
                     ir_emit_share_expr(arg_regs[store_value_pos], value_expr)
+                else:
+                    ir_attach_result_box_dtor(arg_regs[store_value_pos], value_expr)
     # a builtin method on a primitive receiver lowers to its runtime call
     # name here, not at ir_emit_call_text: that helper hands any name a user
     # function declares to that function, which is right for a free call and
@@ -9693,7 +9910,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
             else:
                 field_regs.push(ir_zero_reg())
         elif value_node >= 0:
-            fr := ir_emit_value_for_target_inner(value_node, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name))
+            fr := ir_emit_holder_value(value_node, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name))
             named_field_kind := ir_rc_kind(field_type)
             # tuple-typed (optional) field values arrive already owned from
             # ir_emit_value_for_target, so they must not be retained again.
@@ -9704,7 +9921,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
         else:
             default_idx := ir_struct_field_default_node(sname, field_name)
             if default_idx >= 0:
-                field_regs.push(ir_emit_value_for_target_inner(default_idx, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name)))
+                field_regs.push(ir_emit_holder_value(default_idx, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name)))
             else:
                 field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -9739,7 +9956,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
             field_regs.push(ir_emit_weak_payload(value_idx))
             field_idx = field_idx + 1
             continue
-        fr := ir_emit_value_for_target_inner(value_idx, ftype, ir_ctor_field_inner_type_name(sname, tid, field_name))
+        fr := ir_emit_holder_value(value_idx, ftype, ir_ctor_field_inner_type_name(sname, tid, field_name))
         pos_field_kind := ir_rc_kind(ftype)
         # tuple-typed (optional) field values arrive already owned; don't retain.
         if pos_field_kind.len() > 0 and pos_field_kind != "tuple" and ir_expr_is_borrowed(value_idx):
@@ -9753,7 +9970,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
         field_name := ir_ctor_field_name_at(sname, tid, field_idx)
         default_idx := ir_struct_field_default_node(sname, field_name)
         if default_idx >= 0:
-            field_regs.push(ir_emit_value_for_target_inner(default_idx, ir_ctor_field_type_name(sname, tid, field_name), ir_ctor_field_inner_type_name(sname, tid, field_name)))
+            field_regs.push(ir_emit_holder_value(default_idx, ir_ctor_field_type_name(sname, tid, field_name), ir_ctor_field_inner_type_name(sname, tid, field_name)))
         else:
             field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -10345,8 +10562,7 @@ fn ir_try_emit_map_upsert_add(map_idx: Int, key_idx: Int, value_idx: Int) -> Int
     delta_idx := ir_upsert_delta_idx(map_idx, key_idx, value_idx)
     if delta_idx < 0:
         return 0 - 1
-    # the fused add does not wrap a narrow integer value
-    if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+    if ir_fused_add_declines(c_get_expr_type(value_idx)):
         return 0 - 1
     return ir_emit_map_upsert_call(map_idx, key_idx, delta_idx, obj_type)
 
@@ -10377,7 +10593,7 @@ fn ir_try_emit_map_upsert_delta(target_idx: Int, delta_idx: Int) -> Int:
         return 0 - 1
     if ir_checked_index_type(target_idx) != "int":
         return 0 - 1
-    if ir_sized_int_narrow_fn(c_get_expr_type(target_idx)).len() > 0:
+    if ir_fused_add_declines(c_get_expr_type(target_idx)):
         return 0 - 1
     if not ir_pure_read_expr(map_idx) or not ir_pure_read_expr(key_idx) or not ir_pure_read_expr(delta_idx):
         return 0 - 1
@@ -10457,7 +10673,7 @@ fn ir_count_update_delta(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
     if value_idx < 0 and ir_stores_map_slot(stmt, map_idx, key_idx, "="):
         value_idx = stmt.children[1]
     if value_idx >= 0:
-        if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+        if ir_fused_add_declines(c_get_expr_type(value_idx)):
             return 0 - 1
         return ir_upsert_delta_idx(map_idx, key_idx, value_idx)
     if not ir_stores_map_slot(stmt, map_idx, key_idx, "+="):
@@ -10465,7 +10681,7 @@ fn ir_count_update_delta(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
     target_idx := stmt.children[0]
     if ir_checked_index_type(target_idx) != "int":
         return 0 - 1
-    if ir_sized_int_narrow_fn(c_get_expr_type(target_idx)).len() > 0:
+    if ir_fused_add_declines(c_get_expr_type(target_idx)):
         return 0 - 1
     if not ir_pure_read_expr(stmt.children[1]):
         return 0 - 1
@@ -10479,7 +10695,7 @@ fn ir_count_insert_value(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
         value_idx = stmt.children[1]
     if value_idx < 0 or not ir_pure_read_expr(value_idx):
         return 0 - 1
-    if ir_sized_int_narrow_fn(c_get_expr_type(value_idx)).len() > 0:
+    if ir_fused_add_declines(c_get_expr_type(value_idx)):
         return 0 - 1
     return value_idx
 
@@ -10572,10 +10788,10 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
         cur_r := ir_emit_index_read_at(target_idx, target, obj_r, idx_r, false)
         rhs_r := ir_expr(value_idx)
         sum_r := ir_reg()
-        ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(target_idx), compound_op), cur_r, rhs_r)
+        ir_emit_simple_binary(sum_r, ir_int_op(c_get_expr_type(target_idx), compound_op), cur_r, rhs_r)
         value_r = ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     else:
-        value_r = ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
+        value_r = ir_emit_holder_value(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # tagged containers retain stored elements in the runtime. a borrowed heap
     # value carries its kind with it, so the container adopts it where it has
     # none and takes exactly one count either way. a list used to get a
@@ -10689,6 +10905,11 @@ fn ir_expr(idx: Int) -> Int:
         return ir_narrow_sized_result(idx, node.value, ir_emit_unary_expr(node))
 
     if node.kind == "binary":
+        if ir_counter_steps.contains_key(idx) or ir_index_offset_unchecked(idx):
+            ir_counter_step_active = true
+            step_r := ir_emit_binary_expr(node)
+            ir_counter_step_active = false
+            return step_r
         return ir_narrow_sized_result(idx, node.value, ir_emit_binary_expr(node))
 
     if node.kind == "call":
@@ -11074,6 +11295,9 @@ pub fn ir_emit_return_value(expr_child: Int):
     # instead of on the shell (see ir_emit_return_box_as_pair).
     pair_forward := ir_current_func_return_kind == "result_reg" and result_kind == "tuple"
     mut pair_source := "fresh"
+    # a box returned whole that someone else may also hold (see
+    # ir_emit_result_box_unshare)
+    mut box_may_share := false
     # a returned tracked local transfers its count to the caller, so it
     # must be skipped in the exit cleanup. trust the tracked kind directly:
     # in a generic body the inferred type can miss (a tuple-lowered
@@ -11082,6 +11306,7 @@ pub fn ir_emit_return_value(expr_child: Int):
     if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
         exclude = expr_node.value
         pair_source = "local"
+        box_may_share = true
     else:
         # substitute struct params (T -> the concrete type) so a specialized
         # impl method returning a borrowed T still retains it. without this
@@ -11093,6 +11318,7 @@ pub fn ir_emit_return_value(expr_child: Int):
                 pair_source = "borrowed"
             else:
                 ir_rc_retain_reg(r, ret_kind)
+                box_may_share = true
     expr_tid := c_get_expr_type(expr_child)
     mut expr_kind := ""
     if expr_tid >= 0:
@@ -11158,6 +11384,8 @@ pub fn ir_emit_return_value(expr_child: Int):
             r = ir_emit_ok_result_tuple(ir_emit_optional_none_value())
         elif not ir_return_forwards_result(expr_kind, result_kind):
             r = ir_emit_ok_result_tuple(r)
+        elif box_may_share:
+            r = ir_emit_result_box_unshare(r, expr_tid)
     elif ir_current_func_return_kind == "result_reg":
         if pair_forward:
             # forwarding a whole result (`return other_fallible()`, `return
@@ -11589,7 +11817,7 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
         ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + old_w.to_string())
         ir_unpin_operand(obj_r, recv_pin)
         return true
-    value_r := ir_emit_value_for_target_inner(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
+    value_r := ir_emit_holder_value(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))
     # a tuple-typed (optional) rhs is already owned from ir_emit_value_for_target,
     # so it must not be retained again; the old value is still released below, so
     # its payload is freed via the optional's destructor.
@@ -11630,7 +11858,7 @@ fn ir_emit_field_compound_assignment(target_idx: Int, value_idx: Int, compound_o
     ir_emit_named_field_access(cur, obj_r, lookup_key, fname, ir_checked_struct_field_type(recv_idx, fname))
     rhs := ir_expr(value_idx)
     sum_r := ir_reg()
-    ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(target_idx), compound_op), cur, rhs)
+    ir_emit_simple_binary(sum_r, ir_int_op(c_get_expr_type(target_idx), compound_op), cur, rhs)
     res := ir_narrow_to_tid(c_get_expr_type(target_idx), sum_r)
     ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + res.to_string())
     return true
@@ -11692,7 +11920,7 @@ fn ir_emit_compound_assignment(node: Node):
         ir_emit_name_load(cur, name)
         rhs := ir_expr(node.children[1])
         sum_r := ir_reg()
-        ir_emit_simple_binary(sum_r, ir_unsigned_op(c_get_expr_type(node.children[0]), compound_op), cur, rhs)
+        ir_emit_simple_binary(sum_r, ir_int_op(c_get_expr_type(node.children[0]), compound_op), cur, rhs)
         ir_emit_name_store(name, ir_narrow_to_tid(c_get_expr_type(node.children[0]), sum_r))
 
 # emit a label and clear the return-tracking flag: a label starts a
@@ -11798,7 +12026,7 @@ fn ir_stmt(idx: Int):
         # left alone, `mk(i).reverse()` roots at a call whose fresh container
         # nothing else names. every classification below reads the root.
         subject := ir_discard_chain_root(idx)
-        if ir_stmt_discards_owned_value(kind):
+        if ir_stmt_discards_owned_value(kind) or ir_discarded_branch_value_is_owned(subject):
             stmt_tid := c_get_expr_type(subject)
             # a discarded result box carries its payload: the box has no
             # destructor, so the payload is dropped explicitly or it leaks
@@ -11869,7 +12097,9 @@ fn ir_stmt(idx: Int):
         return
 
     if kind == "assignment":
+        ir_counter_step_active = ir_counter_steps.contains_key(idx)
         ir_emit_compound_assignment(node)
+        ir_counter_step_active = false
         return
 
     ir_stmt_control(idx, node)
@@ -11915,9 +12145,8 @@ fn ir_discard_chain_root(idx: Int) -> Int:
 # payload on with the box's count, and an `await` hands over the count the
 # task's thread produced. both are the transfer ir_expr_is_borrowed already
 # reads them as, and both reached this discard without a release before.
-# `catch`, `select` and `match` are deliberately absent: they normalize their
-# arms to owned through paths of their own, and only the string release below
-# covers them today.
+# a `match` and a `select` are absent because their value is owned only when
+# every arm hands one over, which ir_discarded_branch_value_is_owned asks.
 fn ir_stmt_discards_owned_value(kind: String) -> Bool:
     if kind == "call" or kind == "method_call":
         return true
@@ -11927,6 +12156,17 @@ fn ir_stmt_discards_owned_value(kind: String) -> Bool:
     if kind == "catch_expr" or kind == "catch_block":
         return true
     return kind == "try" or kind == "try_expr" or kind == "await"
+
+# whether a `match` or `select` thrown away at statement position left an
+# owned value in its temp. each arm stores its value there, and where every
+# arm is owned, or is retained on the way in, the temp holds a count nobody
+# else will release. a form with a borrowed arm left as is stays alone, since
+# releasing it would take a count its owner still holds.
+fn ir_discarded_branch_value_is_owned(idx: Int) -> Bool:
+    k := node_kind(idx)
+    if k != "match_expr" and k != "select_expr":
+        return false
+    return not ir_expr_is_borrowed(idx)
 
 # the rc kinds a discarded statement value is the statement's to release. the
 # containers, `bytes` and a struct or tuple header were the first set; a
@@ -12179,6 +12419,107 @@ fn ir_emit_while_let_stmt(node: Node):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     ir_last_was_ret = false
 
+# whether `idx` is a length: a `.len()` call, or a local bound once to one.
+# a length is far below the largest Int, so `i <= n` bounds i as tightly as
+# `i < n` does for the purpose of one step.
+fn ir_is_length_bound(idx: Int) -> Bool:
+    n := get_node(idx)
+    if n.kind == "method_call":
+        return ir_plain_method_name(n.value) == "len" and n.children.len() == 1
+    if n.kind != "ident":
+        return false
+    defs := get_definition_of()
+    if not defs.contains_key(idx):
+        return false
+    decl := get_node(defs[idx])
+    if decl.kind != "binding" or decl.value.contains(" mut") or decl.children.len() == 0:
+        return false
+    return ir_is_length_bound(decl.children[decl.children.len() - 1])
+
+# the Int locals a while condition bounds: "i+" for one bounded above
+# (`i < e`, `e > i`, or `i <= n` for a length n) and "i-" for one bounded
+# below (`i > e`, `e < i`), looking through `and`.
+fn ir_counter_candidates(cond_idx: Int, out: List[String]):
+    n := get_node(cond_idx)
+    if n.kind != "binary" or n.children.len() != 2:
+        return
+    if n.value == "and":
+        ir_counter_candidates(n.children[0], out)
+        ir_counter_candidates(n.children[1], out)
+        return
+    left := n.children[0]
+    right := n.children[1]
+    if n.value == "lt" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int":
+        out.push(node_value(left) + "+")
+    elif n.value == "gt" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int":
+        out.push(node_value(right) + "+")
+    elif n.value == "gt" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int":
+        out.push(node_value(left) + "-")
+    elif n.value == "lt" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int":
+        out.push(node_value(right) + "-")
+    elif n.value == "lte" and node_kind(left) == "ident" and get_type_name(c_get_expr_type(left)) == "Int" and ir_is_length_bound(right):
+        out.push(node_value(left) + "+")
+    elif n.value == "gte" and node_kind(right) == "ident" and get_type_name(c_get_expr_type(right)) == "Int" and ir_is_length_bound(left):
+        out.push(node_value(right) + "+")
+
+# the node to mark when assignment `idx` steps `name` by one in direction
+# `dir` ("+" or "-"): the binary of `i = i + 1`, or the `i += 1` itself.
+# -1 for any other assignment.
+fn ir_counter_step_node(idx: Int, name: String, dir: String) -> Int:
+    n := get_node(idx)
+    rhs := get_node(n.children[1])
+    if (n.value == dir + "=") and rhs.kind == "int_lit" and rhs.value == "1":
+        return idx
+    mut op := "add"
+    if dir == "-":
+        op = "sub"
+    if n.value == "=" and rhs.kind == "binary" and rhs.value == op and rhs.children.len() == 2:
+        if node_kind(rhs.children[0]) == "ident" and node_value(rhs.children[0]) == name and node_kind(rhs.children[1]) == "int_lit" and node_value(rhs.children[1]) == "1":
+            return n.children[1]
+    return 0 - 1
+
+# the assignments to `name` in a loop body, as the step nodes they would
+# mark, with -1 for one that cannot be marked: one that is not a step of
+# one, one inside a nested loop or a closure (which may run it more than
+# once between two tests of the condition), or a new binding of the name.
+fn ir_counter_assignments(idx: Int, name: String, dir: String, nested: Bool, out: List[Int]):
+    n := get_node(idx)
+    if n.kind == "binding" and n.value.split(" ")[0] == name:
+        out.push(0 - 1)
+    if n.kind == "for" or n.kind == "for_stmt":
+        names := ir_for_binding_names(n)
+        if names.value_name == name or names.index_name == name:
+            out.push(0 - 1)
+    if n.kind == "assignment" and n.children.len() == 2 and node_kind(n.children[0]) == "ident" and node_value(n.children[0]) == name:
+        if nested:
+            out.push(0 - 1)
+        else:
+            out.push(ir_counter_step_node(idx, name, dir))
+    inner := nested or n.kind == "lambda" or n.kind == "while" or n.kind == "while_stmt" or n.kind == "while_let" or n.kind == "for" or n.kind == "for_stmt"
+    for child in n.children:
+        ir_counter_assignments(child, name, dir, inner, out)
+
+# mark the counter steps of a while loop that cannot overflow. with `i < e`
+# tested before every iteration, i is below the largest Int when the body
+# starts, so one `i = i + 1` in it stays in range; `i > e` does the same for
+# `i - 1`. that holds only when the step is the one assignment to i the body
+# makes per test of the condition: a second step, or one in a nested loop,
+# could pass the bound. a local cannot change behind the loop's back, since
+# a closure cannot assign what it captures (E269), so the body is the only
+# place to look.
+fn ir_mark_counter_steps(cond_idx: Int, body_idx: Int):
+    mut candidates: List[String] := []
+    ir_counter_candidates(cond_idx, candidates)
+    for cand in candidates:
+        name := cand.substring(0, cand.len() - 1)
+        dir := cand.substring(cand.len() - 1, cand.len())
+        if ir_assign_targets_global_slot(name):
+            continue
+        mut found: List[Int] := []
+        ir_counter_assignments(body_idx, name, dir, false, found)
+        if found.len() == 1 and found[0] >= 0:
+            ir_counter_steps.insert(found[0], true)
+
 fn ir_emit_while_stmt(node: Node):
     head_label := ir_label()
     body_label := ir_label()
@@ -12191,6 +12532,7 @@ fn ir_emit_while_stmt(node: Node):
         ir_break_stack = ir_push_string(ir_break_stack, end_label)
         ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
         ir_defer_loop_enter()
+        ir_mark_counter_steps(node.children[0], node.children[1])
         ir_block(node.children[1])
         ir_defer_loop_exit()
         ir_break_stack.remove(ir_break_stack.len() - 1)
@@ -13065,6 +13407,105 @@ fn ir_resolve_assoc_in_generic(type_name: String, params: List[String], concrete
         i = i + 1
     return type_name
 
+# the parsed root of a module in this build, or -1.
+fn ir_module_root_for_path(module_path: String) -> Int:
+    for path, i in ir_preloaded_import_paths:
+        if path == module_path:
+            return ir_preloaded_import_roots[i]
+    for path, i in ir_all_module_paths:
+        if path == module_path:
+            return ir_all_module_roots[i]
+    return 0 - 1
+
+# the enum table entries a specialization from another module replaced:
+# their keys, and the values they held before, for ir_restore_enum_tables.
+struct IrEnumTables:
+    names: List[String]
+    variant_keys: List[String]
+    boxed: Map[String, Bool]
+    variant_lists: Map[String, String]
+    struct_names: Map[String, Int]
+    payload_kinds: Map[String, String]
+    field_lookup: Map[String, String]
+    field_index_lookup: Map[String, String]
+
+# point the name tables at another module's, so a generic body that module
+# declares resolves its names the way its module does rather than the way the
+# instantiating module does: its imports, for `gather(xs)` and `b.gather(xs)`
+# (#1095), and the generic enums it declares under a name a second module
+# shares, which its body writes bare (`Opt.Some(v)`) and every other module
+# holds under the declaring module's key only. the caller saves and restores
+# the import tables; the enum entries come back from this call.
+fn ir_use_module_names(module_path: String) -> IrEnumTables:
+    mut saved := IrEnumTables([], [], {}, {}, {}, {}, {}, {})
+    if module_path.len() == 0 or module_path == ir_current_module_path:
+        return saved
+    root := ir_module_root_for_path(module_path)
+    if root < 0:
+        return saved
+    ir_import_renames = {}
+    ir_module_aliases = {}
+    for item_idx in ir_root_items(root):
+        ir_collect_import_item(get_node(item_idx))
+    for item_idx in ir_root_items(root):
+        node := get_node(item_idx)
+        if node.kind != "enum_decl" and node.kind != "enum":
+            continue
+        name := node.value
+        if generic_base_identity(module_path, name) == name:
+            continue
+        saved.names.push(name)
+        if ir_boxed_enums.contains_key(name):
+            saved.boxed.insert(name, ir_boxed_enums[name])
+        if ir_enum_variant_lists.contains_key(name):
+            saved.variant_lists.insert(name, ir_enum_variant_lists[name])
+        if ir_struct_names.contains_key(name):
+            saved.struct_names.insert(name, ir_struct_names[name])
+        for child in node.children:
+            variant_node := ir_unwrap_pub_node(child)
+            if variant_node.kind != "variant":
+                continue
+            key := name + "." + variant_node.value
+            saved.variant_keys.push(key)
+            if ir_enum_payload_kinds.contains_key(key):
+                saved.payload_kinds.insert(key, ir_enum_payload_kinds[key])
+            if ir_struct_field_lookup.contains_key(key):
+                saved.field_lookup.insert(key, ir_struct_field_lookup[key])
+            if ir_struct_field_index_lookup.contains_key(key):
+                saved.field_index_lookup.insert(key, ir_struct_field_index_lookup[key])
+        if ir_boxed_enums.contains_key(name):
+            ir_boxed_enums.remove(name)
+        _variants := ir_record_enum_variants(node, name)
+    return saved
+
+fn ir_restore_enum_tables(saved: IrEnumTables):
+    for name in saved.names:
+        if ir_boxed_enums.contains_key(name):
+            ir_boxed_enums.remove(name)
+        if saved.boxed.contains_key(name):
+            ir_boxed_enums.insert(name, saved.boxed[name])
+        if ir_enum_variant_lists.contains_key(name):
+            ir_enum_variant_lists.remove(name)
+        if saved.variant_lists.contains_key(name):
+            ir_enum_variant_lists.insert(name, saved.variant_lists[name])
+        if ir_struct_names.contains_key(name):
+            ir_struct_names.remove(name)
+        if saved.struct_names.contains_key(name):
+            ir_struct_names.insert(name, saved.struct_names[name])
+    for key in saved.variant_keys:
+        if ir_enum_payload_kinds.contains_key(key):
+            ir_enum_payload_kinds.remove(key)
+        if saved.payload_kinds.contains_key(key):
+            ir_enum_payload_kinds.insert(key, saved.payload_kinds[key])
+        if ir_struct_field_lookup.contains_key(key):
+            ir_struct_field_lookup.remove(key)
+        if saved.field_lookup.contains_key(key):
+            ir_struct_field_lookup.insert(key, saved.field_lookup[key])
+        if ir_struct_field_index_lookup.contains_key(key):
+            ir_struct_field_index_lookup.remove(key)
+        if saved.field_index_lookup.contains_key(key):
+            ir_struct_field_index_lookup.insert(key, saved.field_index_lookup[key])
+
 # emit the body of one queued generic specialization. `key` is the
 # tab-separated base name and type arguments ir_queue_generic_specialization
 # registered; the declaration is type-checked under those arguments and then
@@ -13153,6 +13594,9 @@ fn ir_emit_generic_specialization(key: String):
         ir_active_generic_module_path = ir_generic_decl_module_paths[base_name]
     else:
         ir_active_generic_module_path = ""
+    saved_import_renames := ir_import_renames
+    saved_module_aliases := ir_module_aliases
+    saved_enum_tables := ir_use_module_names(ir_active_generic_module_path)
     ir_prepare_func_emission(ret_type)
     # a return type written as the bare parameter (`-> T`) is an optional
     # whenever the type argument is one, and the return path must then forward
@@ -13212,6 +13656,9 @@ fn ir_emit_generic_specialization(key: String):
     ir_active_generic_params = saved_params
     ir_active_generic_concrete_types = saved_types
     ir_active_generic_module_path = saved_module_path
+    ir_import_renames = saved_import_renames
+    ir_module_aliases = saved_module_aliases
+    ir_restore_enum_tables(saved_enum_tables)
     ir_active_fn_bindings = saved_fn_bindings
     ir_current_impl_type = saved_impl_type
     ir_current_impl_subst_params = saved_impl_params
@@ -13250,6 +13697,10 @@ fn ir_impl_owner_tid(impl_type: String, module_path: String) -> Int:
     mut path := module_path
     if path.len() == 0:
         path = ir_current_module_path
+    # the module's own generic of this name has no tid, whatever plain struct
+    # another module registered under the bare name
+    if module_declares_generic(path, impl_type):
+        return 0 - 1
     if path.len() > 0:
         qualified := lookup_qualified_type_id(path, impl_type)
         if qualified >= 0:
@@ -14395,7 +14846,38 @@ fn ir_collect_root_import_metadata(root_idx: Int):
     for root, i in ir_preloaded_import_roots:
         ir_collect_preloaded_root_metadata(root, ir_preloaded_import_paths[i])
 
+# an index `xs[i + 1]` or `xs[i - 1]` into a list, a Bytes or a String, with
+# a constant offset under 2^32, needs no overflow check of its own: a sum that
+# wrapped would land near the far end of the Int range, which the index's
+# bounds check refuses, so the program still stops. a map key has no bounds
+# check, and a wrapped key would read another entry, so it keeps the check.
+# nodes are scanned once, as each parse adds them to the arena, for the shape
+# alone; ir_index_offset_unchecked tests the types.
+fn ir_mark_index_offsets():
+    end := node_count()
+    mut idx := ir_index_offsets_scanned
+    while idx < end:
+        n := get_node(idx)
+        if n.kind == "index" and n.children.len() == 2:
+            offset := get_node(n.children[1])
+            if offset.kind == "binary" and (offset.value == "add" or offset.value == "sub") and offset.children.len() == 2:
+                lit := get_node(offset.children[1])
+                if lit.kind == "int_lit" and lit.value.len() < 10:
+                    ir_index_offset_targets.insert(n.children[1], n.children[0])
+        idx = idx + 1
+    ir_index_offsets_scanned = end
+
+fn ir_index_offset_unchecked(idx: Int) -> Bool:
+    if not ir_index_offset_targets.contains_key(idx):
+        return false
+    target_tid := c_get_expr_type(ir_index_offset_targets[idx])
+    target_name := get_type_name(target_tid)
+    if get_type_info(target_tid).kind != "list" and target_name != "Bytes" and target_name != "String":
+        return false
+    return get_type_name(c_get_expr_type(node_child(idx, 0))) == "Int"
+
 fn ir_collect_root_phase_one_metadata(root_idx: Int):
+    ir_mark_index_offsets()
     ir_func_returns.clear()
     ir_type_aliases = {}
     ir_generic_decl_indices = {}
@@ -14480,6 +14962,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     while impl_i < method_roots.len():
         ir_collect_impl_methods(method_roots[impl_i], method_paths[impl_i])
         impl_i = impl_i + 1
+    ir_collect_from_imported_enums(root_idx)
 
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
@@ -14604,6 +15087,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_tuple_cascade_helpers()
     ir_emit_kinded_release_helper()
     ir_emit_result_arg_release_helpers()
+    ir_emit_result_unshare_helpers()
     ir_emit_optional_tuple_walks()
     # tracer registration after every destructor family above, so its pair
     # list covers the tuple and generic-instance twins too.

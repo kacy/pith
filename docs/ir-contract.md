@@ -68,6 +68,12 @@ strref REG STRIDX           load a pointer to string literal STRIDX.
 ```
 add|sub|mul|div|mod REG A B   REG = A op B. div and mod are checked (a zero
                               divisor traps through the runtime, not silently).
+                              add, sub and mul wrap at 64 bits.
+addc|subc|mulc REG A B        REG = A op B for source arithmetic on an Int: a
+                              result outside the signed 64-bit range stops the
+                              program with the integer-overflow runtime error.
+uaddc|usubc|umulc REG A B     the same for UInt and UInt64, against the unsigned
+                              range.
 ```
 
 **float arithmetic**
@@ -76,7 +82,7 @@ add|sub|mul|div|mod REG A B   REG = A op B. div and mod are checked (a zero
 fadd|fsub|fmul|fdiv REG A B   float op on two float registers.
 ```
 
-`add|sub|mul|div` also lower as float ops when both operands are float registers —
+`add|sub|mul|div` (and the checked forms) also lower as float ops when both operands are float registers —
 the consumer tracks which registers hold floats and picks the instruction class
 accordingly.
 
@@ -354,6 +360,16 @@ taking the payload out of a box that someone else still holds, without a
 count of its own, left the caller's box and the returned payload sharing one
 count, and whichever was released first freed what the other still read
 (#1164).
+
+**a returned box belongs to the caller alone.** every caller that opens a
+call's box takes over the payload's count, which is correct only when
+nothing else holds the box. so a function that returns the box itself (the
+box abi, which generic functions and interface impls always use) and returns
+a box it does not fully own (a parameter, a field, an element, or a local
+whose count is shared) passes it through `__result_unshare_<ok><err>`. that
+helper returns the same box when the caller's count is the only one.
+otherwise it returns a fresh box holding its own count on the live payload,
+and drops the count on the shared box.
 
 **optional encoding.** a `T?` is the null pointer when it is none. a Some is
 a two-slot struct allocation holding 1 at offset 0 and the payload at offset

@@ -1426,6 +1426,9 @@ MEMCHECK_CASES := \
 	tests/cases/test_enum_scope_release \
 	tests/cases/test_field_reassign_release tests/cases/test_discarded_result \
 	tests/cases/test_discarded_value_shapes \
+	tests/cases/test_discarded_branch_value \
+	tests/cases/test_result_local_match \
+	tests/cases/test_result_in_holder \
 	tests/cases/test_global_rebind_ownership \
 	tests/cases/test_generic_method_return tests/cases/test_generic_fnvalue_return \
 	tests/cases/test_generic_method_type_args tests/cases/test_generic_owner_generic_method \

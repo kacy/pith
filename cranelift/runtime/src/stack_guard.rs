@@ -112,6 +112,7 @@ impl Drop for AltStack {
 /// runtime is a static library with no startup hook of its own.
 #[no_mangle]
 pub extern "C" fn pith_runtime_start() {
+    crate::overflow_trap::install();
     #[cfg(not(any(pith_asan, pith_tsan)))]
     IS_MAIN.with(|m| m.set(true));
     enter_thread();

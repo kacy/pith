@@ -5,7 +5,7 @@
 #
 #   from std.algo import sort, sort_desc, sort_strings, binary_search, strcmp
 
-from std.collections import reversed, reversed_strings, sorted_positions
+from std.collections import reversed, reversed_strings, sorted_positions, gather_positions
 
 # ===============================================================
 # Sorting
@@ -134,23 +134,10 @@ pub fn sort_by_key[T](items: List[T], key: fn(T) -> String) -> List[T]:
     mut keys: List[String] := []
     for item in items:
         keys.push(key(item))
-    order := string_key_order(keys)
-    # the gather is written out here rather than calling
-    # std.collections.gather_positions: a generic body cannot call a generic
-    # function in another module — the specialization emits a call the compiler
-    # then fails to resolve at startup. string_key_order below is the same
-    # limitation worked around the other way, by putting the cross-module call
-    # in a body that is not itself generic.
-    mut out: List[T] := []
-    for pos in order:
-        out.push(items[pos])
-    return out
+    return gather_positions(items, sorted_positions(keys, string_less))
 
 fn string_less(left: String, right: String) -> Bool:
     return left < right
-
-fn string_key_order(keys: List[String]) -> List[Int]:
-    return sorted_positions(keys, string_less)
 
 ## sort by a string key, descending: the reverse of sort_by_key.
 ##

@@ -108,6 +108,16 @@ builtin spelling of `assert_eq`; the emitter has no type inference of its own.
 A request that arrives with no call node (a json or config decode target) is
 still keyed by emission kinds, and a body requested both ways is emitted once.
 
+A specialization is emitted in the module whose code instantiates it, which
+is often not the module that declares it. Its body still resolves names as
+its declaring module does: the emitter swaps in that module's imports while
+it emits the body, so a call to a third module's generic (`gather(xs)` or
+`b.gather(xs)`) lowers to that module's symbol. For this to work, the driver
+gives each module's emission the imports of every generic module it depends
+on. The checker also types the signature in the declaring module, so
+`iter.map_iter` returns std.iter's `MapIter` even when the caller declares its
+own `MapIter`.
+
 For a generic method of a generic struct the record is the whole key: the
 receiver instance's type arguments first, then the method's own. The symbol
 keeps the two lists apart by putting them where each already lives — the

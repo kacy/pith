@@ -148,6 +148,14 @@ cases=(
   tests/leaks/leak_fn_value
   tests/leaks/leak_task_result_payload
   tests/leaks/leak_result_extraction
+  "tests/leaks/leak_result_in_holder SHAPE=1"
+  "tests/leaks/leak_result_in_holder SHAPE=2"
+  "tests/leaks/leak_result_in_holder SHAPE=3"
+  "tests/leaks/leak_result_in_holder SHAPE=4"
+  "tests/leaks/leak_result_in_holder SHAPE=5"
+  "tests/leaks/leak_result_in_holder SHAPE=6"
+  "tests/leaks/leak_result_in_holder SHAPE=7"
+  "tests/leaks/leak_result_in_holder SHAPE=8"
   tests/leaks/leak_result_arg_borrow
   tests/leaks/leak_result_arg_box
   tests/leaks/leak_yaml_parse
@@ -160,6 +168,12 @@ cases=(
   tests/leaks/leak_discarded_try_value
   tests/leaks/leak_discarded_await_value
   tests/leaks/leak_discarded_shared_result
+  "tests/leaks/leak_discarded_branch_value SHAPE=1"
+  "tests/leaks/leak_discarded_branch_value SHAPE=2"
+  "tests/leaks/leak_discarded_branch_value SHAPE=3"
+  "tests/leaks/leak_discarded_branch_value SHAPE=4"
+  "tests/leaks/leak_discarded_branch_value SHAPE=5"
+  "tests/leaks/leak_discarded_branch_value SHAPE=6"
   tests/leaks/leak_weak_field
   tests/leaks/leak_weak_read_off_temp
   tests/leaks/leak_weak_local
@@ -172,6 +186,7 @@ cases=(
   tests/leaks/leak_optional_plain_compare
   tests/leaks/leak_optional_match_payload
   tests/leaks/leak_argument_literal
+  tests/leaks/leak_assert_fresh_arg
   tests/leaks/leak_widened_store
   tests/leaks/leak_arena_truncate
   tests/leaks/leak_task_threadlocal
@@ -200,6 +215,11 @@ cases=(
   tests/leaks/leak_threadlocal_fn_value
   tests/leaks/leak_concat_early_exit
   tests/leaks/leak_rebound_result_local
+  "tests/leaks/leak_result_local_match SHAPE=1"
+  "tests/leaks/leak_result_local_match SHAPE=2"
+  "tests/leaks/leak_result_local_match SHAPE=3"
+  "tests/leaks/leak_result_local_match SHAPE=4"
+  "tests/leaks/leak_result_local_match SHAPE=5"
   tests/leaks/leak_match_fresh_result
   tests/leaks/leak_interp_result
   "tests/leaks/leak_decode_missing_field SHAPE=toml"

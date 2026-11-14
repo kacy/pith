@@ -552,6 +552,63 @@ fn direct_module_roots(root: Int, roots_by_path: Map[String, Int]) -> List[Int]:
         deps.push(roots_by_path[mod_path])
     return deps
 
+fn has_generic_param(node_idx: Int) -> Bool:
+    for child in get_node(node_idx).children:
+        if get_node(child).kind == "generic_param":
+            return true
+    return false
+
+# true when a module declares anything another module's emission can
+# specialize: a generic function, struct or enum, or a method with type
+# parameters of its own.
+fn module_declares_generics(root: Int) -> Bool:
+    for child in get_node(root).children:
+        mut item := child
+        if get_node(item).kind == "pub" and get_node(item).children.len() > 0:
+            item = get_node(item).children[0]
+        if has_generic_param(item):
+            return true
+        if get_node(item).kind == "impl_decl":
+            for method in get_node(item).children:
+                mut method_idx := method
+                if get_node(method_idx).kind == "pub" and get_node(method_idx).children.len() > 0:
+                    method_idx = get_node(method_idx).children[0]
+                if has_generic_param(method_idx):
+                    return true
+    return false
+
+# the roots one module's emission needs: its direct imports, plus the
+# imports of every module whose generic bodies it may specialize. a generic
+# body is emitted in the module that instantiates it, so a call it makes into
+# a third module (#1095) needs that module's declarations as well. the extra
+# roots go first so a direct import's bare names still win.
+fn emission_module_roots(root: Int, roots_by_path: Map[String, Int]) -> List[Int]:
+    direct := direct_module_roots(root, roots_by_path)
+    mut seen: Map[Int, Bool] := {}
+    seen.insert(root, true)
+    for dep in direct:
+        seen.insert(dep, true)
+    mut extra: List[Int] := []
+    mut queue: List[Int] := []
+    for dep in direct:
+        if module_declares_generics(dep):
+            queue.push(dep)
+    mut i := 0
+    while i < queue.len():
+        for dep in direct_module_roots(queue[i], roots_by_path):
+            if seen.contains_key(dep):
+                continue
+            seen.insert(dep, true)
+            extra.push(dep)
+            if module_declares_generics(dep):
+                queue.push(dep)
+        i = i + 1
+    if extra.len() == 0:
+        return direct
+    for dep in direct:
+        extra.push(dep)
+    return extra
+
 # hand the emitter every module in the build, so impl-method collection can
 # see an impl block that lives a module away from both the struct's
 # declaration and the call site (std.io's impl FileStream, called on the
@@ -612,7 +669,7 @@ fn emit_combined_file(path: String, emit_tests: Bool, validate_combined: Bool) -
         if should_skip_imported_module(import_root):
             continue
         module_path := get_resolved_module_path(import_root)
-        module_deps := direct_module_roots(import_root, roots_by_path)
+        module_deps := emission_module_roots(import_root, roots_by_path)
         ir := emit_module_ir(import_root, module_deps, module_path, false)
         renamed := rename_import_ir(ir, module_path, i)
         for init_func in renamed.init_funcs:
@@ -621,7 +678,7 @@ fn emit_combined_file(path: String, emit_tests: Bool, validate_combined: Bool) -
     # the root module keeps its own names. imported modules are already emitted
     # with stable qualified symbols, so the only remaining combined-file tweak
     # is to inject any imported init calls into main.
-    mut main_ir := emit_module_ir(root, direct_module_roots(root, roots_by_path), "", emit_tests)
+    mut main_ir := emit_module_ir(root, emission_module_roots(root, roots_by_path), "", emit_tests)
     main_ir = rewrite_main_ir(main_ir, imported_init_funcs)
     all_ir.push(main_ir)
 

@@ -1651,6 +1651,155 @@ fn emit_runtime_error_value(
     Ok(builder.func.dfg.first_result(call))
 }
 
+/// The trap code an integer overflow raises; any nonzero user code works,
+/// since the runtime reads the faulting instruction rather than the code.
+const OVERFLOW_TRAP_CODE: u8 = 7;
+
+/// The plain opcode behind a checked one (`addc` -> `add`, `uaddc` -> `add`),
+/// or the opcode itself. A checked op on a string or float operand lowers as
+/// its plain form, which concatenates or promotes the way `add` always has.
+fn plain_arith_op(op: &str) -> &str {
+    match op {
+        "addc" | "uaddc" => "add",
+        "subc" | "usubc" => "sub",
+        "mulc" | "umulc" => "mul",
+        _ => op,
+    }
+}
+
+/// The value of an `iconst`, when `v` is one.
+fn iconst_of(func: &cranelift::codegen::ir::Function, v: Value) -> Option<i64> {
+    let cranelift::codegen::ir::ValueDef::Result(inst, _) = func.dfg.value_def(v) else {
+        return None;
+    };
+    match func.dfg.insts[inst] {
+        cranelift::codegen::ir::InstructionData::UnaryImm {
+            opcode: cranelift::codegen::ir::Opcode::Iconst,
+            imm,
+        } => Some(imm.bits()),
+        _ => None,
+    }
+}
+
+/// The range of `x` for which a checked op with one constant operand stays in
+/// range, as `(lo, hi)` in the op's own order (signed, or unsigned bits for the
+/// `u` forms), or `None` when every `x` overflows-free. `const_on_left` is set
+/// for `c - x`. Worked out in i128 so the bounds themselves cannot overflow.
+fn checked_operand_range(op: &str, c: i64, const_on_left: bool) -> Option<(i128, i128)> {
+    let (min, max, c) = if op.starts_with('u') {
+        (0i128, u64::MAX as i128, c as u64 as i128)
+    } else {
+        (i64::MIN as i128, i64::MAX as i128, c as i128)
+    };
+    let (lo, hi) = match (op, const_on_left) {
+        ("addc" | "uaddc", _) => (min - c, max - c),
+        ("subc" | "usubc", false) => (min + c, max + c),
+        ("subc" | "usubc", true) => (c - max, c - min),
+        ("mulc" | "umulc", _) => {
+            if c == 0 || c == 1 {
+                return None;
+            } else if c == -1 {
+                (-max, max)
+            } else if c > 1 {
+                // division truncates toward zero, which rounds the negative
+                // bound up and the positive one down: both inward, as needed
+                (min / c, max / c)
+            } else {
+                (max / c, min / c)
+            }
+        }
+        _ => return None,
+    };
+    let (lo, hi) = (lo.max(min), hi.min(max));
+    if lo == min && hi == max {
+        None
+    } else {
+        Some((lo, hi))
+    }
+}
+
+/// Integer `+`, `-` or `*` from source code: the result, with a branch to the
+/// integer-overflow runtime error when it does not fit. `addc`/`subc`/`mulc`
+/// check the signed range (Int) and `uaddc`/`usubc`/`umulc` the unsigned one
+/// (UInt, UInt64, whose values are the bits of an i64).
+///
+/// With a constant operand (`i + 1`, `n * 10`, `0 - x`) the check is a compare
+/// of the other operand against the range that cannot overflow, taken before a
+/// plain add or multiply. The overflow forms make x64 materialize the flag and
+/// test it, and a constant multiply in that form takes the slow one-operand
+/// `imul`; the compare fuses with its branch and leaves the arithmetic alone.
+fn emit_checked_int_arith(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    op: &str,
+    a: Value,
+    b: Value,
+) -> Result<Value, CompileError> {
+    let unsigned = op.starts_with('u');
+    let commutes = !matches!(op, "subc" | "usubc");
+    let constant = match (iconst_of(builder.func, a), iconst_of(builder.func, b)) {
+        (_, Some(c)) => Some((b, c, a, false)),
+        (Some(c), None) if commutes => Some((a, c, b, false)),
+        (Some(c), None) => Some((a, c, b, true)),
+        _ => None,
+    };
+    let plain = |builder: &mut FunctionBuilder<'_>| match plain_arith_op(op) {
+        "add" => builder.ins().iadd(a, b),
+        "sub" => builder.ins().isub(a, b),
+        _ => builder.ins().imul(a, b),
+    };
+    let mut computed = None;
+    let overflowed = if let Some((_, c, x, const_on_left)) = constant {
+        let Some((lo, hi)) = checked_operand_range(op, c, const_on_left) else {
+            return Ok(plain(builder));
+        };
+        let (min, max) = if unsigned { (0i128, u64::MAX as i128) } else { (i64::MIN as i128, i64::MAX as i128) };
+        let (below, above) = if unsigned {
+            (IntCC::UnsignedLessThan, IntCC::UnsignedGreaterThan)
+        } else {
+            (IntCC::SignedLessThan, IntCC::SignedGreaterThan)
+        };
+        if lo == min {
+            builder.ins().icmp_imm(above, x, hi as i64)
+        } else if hi == max {
+            builder.ins().icmp_imm(below, x, lo as i64)
+        } else {
+            // both ends: one unsigned compare of the distance from lo
+            let shifted = builder.ins().iadd_imm(x, (lo as i64).wrapping_neg());
+            builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, shifted, (hi - lo) as i64)
+        }
+    } else {
+        let (value, overflowed) = match op {
+            "addc" => builder.ins().sadd_overflow(a, b),
+            "subc" => builder.ins().ssub_overflow(a, b),
+            "mulc" => builder.ins().smul_overflow(a, b),
+            "uaddc" => builder.ins().uadd_overflow(a, b),
+            "usubc" => builder.ins().usub_overflow(a, b),
+            "umulc" => builder.ins().umul_overflow(a, b),
+            _ => {
+                return Err(CompileError::ModuleError(format!(
+                    "IR consumer: unsupported checked integer op '{op}'"
+                )))
+            }
+        };
+        computed = Some(value);
+        overflowed
+    };
+    // a trap, not a call to the runtime error: a call on the cold path makes
+    // every value live across the check survive a call, which costs spills
+    // in the hot loop around it (twice the instructions in a merge loop).
+    // the runtime turns the trap into the integer-overflow error
+    // (overflow_trap.rs).
+    builder.ins().trapnz(overflowed, cranelift::codegen::ir::TrapCode::unwrap_user(OVERFLOW_TRAP_CODE));
+    let _ = (codegen, func_ref_cache, runtime_funcs);
+    Ok(match computed {
+        Some(value) => value,
+        None => plain(builder),
+    })
+}
+
 fn emit_checked_int_div_or_mod(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
@@ -2694,7 +2843,7 @@ fn scan_float_vars(param_names: &[String], body_lines: &[&str]) -> HashSet<Strin
         // Propagate: if mul/div/add/sub uses a float reg, its result is float
         for line in body_lines.iter() {
             let p: Vec<&str> = line.split_whitespace().collect();
-            if p.len() >= 4 && matches!(p[0], "mul" | "div" | "add" | "sub") {
+            if p.len() >= 4 && matches!(plain_arith_op(p[0]), "mul" | "div" | "add" | "sub") {
                 let a_float = p[2]
                     .parse::<usize>()
                     .map_or(false, |r| float_source_regs.contains(&r));
@@ -2974,14 +3123,18 @@ fn compile_ir_function(
                 kinds.set(reg, "float");
             }
 
-            "add" | "sub" | "mul" | "div" | "mod" if parts.len() >= 4 => {
+            "add" | "sub" | "mul" | "div" | "mod" | "addc" | "subc" | "mulc" | "uaddc" | "usubc" | "umulc"
+                if parts.len() >= 4 =>
+            {
                 let reg = parse_reg(parts[1], line, func_name)?;
                 let a = get_reg(&regs, parts[2])?;
                 let b = get_reg(&regs, parts[3])?;
+                let checked = parts[0];
+                let op = plain_arith_op(checked);
                 // If `add` has a string operand, treat as concat (IR emitter
                 // sometimes emits `add` instead of `concat` when variable types
                 // aren't tracked across function boundaries)
-                if parts[0] == "add"
+                if op == "add"
                     && kinds.is_string(parts[2])
                     && kinds.is_string(parts[3])
                 {
@@ -2998,12 +3151,12 @@ fn compile_ir_function(
                     }
                     kinds.set(reg, "string");
                 // If operands are known floats, promote to float operation
-                } else if matches!(parts[0], "add" | "sub" | "mul" | "div")
+                } else if matches!(op, "add" | "sub" | "mul" | "div")
                     && (kinds.is_float(parts[2]) || kinds.is_float(parts[3]))
                 {
                     let fa = builder.ins().bitcast(types::F64, MemFlags::new(), a);
                     let fb = builder.ins().bitcast(types::F64, MemFlags::new(), b);
-                    let fv = match parts[0] {
+                    let fv = match op {
                         "add" => builder.ins().fadd(fa, fb),
                         "sub" => builder.ins().fsub(fa, fb),
                         "mul" => builder.ins().fmul(fa, fb),
@@ -3020,6 +3173,15 @@ fn compile_ir_function(
                     kinds.set(reg, "float");
                 } else {
                     let v = match parts[0] {
+                        "addc" | "subc" | "mulc" | "uaddc" | "usubc" | "umulc" => emit_checked_int_arith(
+                            codegen,
+                            &mut builder,
+                            &mut func_ref_cache,
+                            runtime_funcs,
+                            checked,
+                            a,
+                            b,
+                        )?,
                         "add" => builder.ins().iadd(a, b),
                         "sub" => builder.ins().isub(a, b),
                         "mul" => builder.ins().imul(a, b),

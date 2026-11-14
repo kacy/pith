@@ -411,9 +411,10 @@ fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
         else:
             sha_load_words64_tail(w, tail, block - full)
         # the same shape as sha2_32's rounds: sixteen written out, run five
-        # times over an eighty-round schedule held in sixteen locals. Int
-        # addition wraps at 64 bits, so no sum needs a mask, and bits.shr is a
-        # logical shift, so it is right on the negative half of the range.
+        # times over an eighty-round schedule held in sixteen locals. the sums
+        # use wrapping_add, which wraps at 64 bits, so none needs a mask, and
+        # bits.shr is a logical shift, so it is right on the negative half of
+        # the range.
         mut w0 := w[0]
         mut w1 := w[1]
         mut w2 := w[2]
@@ -441,95 +442,95 @@ fn sha2_64(input: Bytes, ih0: Int, ih1: Int, ih2: Int, ih3: Int, ih4: Int, ih5: 
         mut base := 0
         while base < 80:
             if base > 0:
-                w0 = w0 + bits.xor(bits.xor(bits.rotr64(w1, 1), bits.rotr64(w1, 8)), bits.shr(w1, 7)) + w9 + bits.xor(bits.xor(bits.rotr64(w14, 19), bits.rotr64(w14, 61)), bits.shr(w14, 6))
-            t0 := h + bits.xor(bits.xor(bits.rotr64(e, 14), bits.rotr64(e, 18)), bits.rotr64(e, 41)) + bits.xor(g, bits.band(e, bits.xor(f, g))) + k[base + 0] + w0
-            d = d + t0
-            h = t0 + bits.xor(bits.xor(bits.rotr64(a, 28), bits.rotr64(a, 34)), bits.rotr64(a, 39)) + bits.bor(bits.band(a, b), bits.band(c, bits.bor(a, b)))
+                w0 = w0.wrapping_add(bits.xor(bits.xor(bits.rotr64(w1, 1), bits.rotr64(w1, 8)), bits.shr(w1, 7))).wrapping_add(w9).wrapping_add(bits.xor(bits.xor(bits.rotr64(w14, 19), bits.rotr64(w14, 61)), bits.shr(w14, 6)))
+            t0 := h.wrapping_add(bits.xor(bits.xor(bits.rotr64(e, 14), bits.rotr64(e, 18)), bits.rotr64(e, 41))).wrapping_add(bits.xor(g, bits.band(e, bits.xor(f, g)))).wrapping_add(k[base + 0]).wrapping_add(w0)
+            d = d.wrapping_add(t0)
+            h = t0.wrapping_add(bits.xor(bits.xor(bits.rotr64(a, 28), bits.rotr64(a, 34)), bits.rotr64(a, 39))).wrapping_add(bits.bor(bits.band(a, b), bits.band(c, bits.bor(a, b))))
             if base > 0:
-                w1 = w1 + bits.xor(bits.xor(bits.rotr64(w2, 1), bits.rotr64(w2, 8)), bits.shr(w2, 7)) + w10 + bits.xor(bits.xor(bits.rotr64(w15, 19), bits.rotr64(w15, 61)), bits.shr(w15, 6))
-            t1 := g + bits.xor(bits.xor(bits.rotr64(d, 14), bits.rotr64(d, 18)), bits.rotr64(d, 41)) + bits.xor(f, bits.band(d, bits.xor(e, f))) + k[base + 1] + w1
-            c = c + t1
-            g = t1 + bits.xor(bits.xor(bits.rotr64(h, 28), bits.rotr64(h, 34)), bits.rotr64(h, 39)) + bits.bor(bits.band(h, a), bits.band(b, bits.bor(h, a)))
+                w1 = w1.wrapping_add(bits.xor(bits.xor(bits.rotr64(w2, 1), bits.rotr64(w2, 8)), bits.shr(w2, 7))).wrapping_add(w10).wrapping_add(bits.xor(bits.xor(bits.rotr64(w15, 19), bits.rotr64(w15, 61)), bits.shr(w15, 6)))
+            t1 := g.wrapping_add(bits.xor(bits.xor(bits.rotr64(d, 14), bits.rotr64(d, 18)), bits.rotr64(d, 41))).wrapping_add(bits.xor(f, bits.band(d, bits.xor(e, f)))).wrapping_add(k[base + 1]).wrapping_add(w1)
+            c = c.wrapping_add(t1)
+            g = t1.wrapping_add(bits.xor(bits.xor(bits.rotr64(h, 28), bits.rotr64(h, 34)), bits.rotr64(h, 39))).wrapping_add(bits.bor(bits.band(h, a), bits.band(b, bits.bor(h, a))))
             if base > 0:
-                w2 = w2 + bits.xor(bits.xor(bits.rotr64(w3, 1), bits.rotr64(w3, 8)), bits.shr(w3, 7)) + w11 + bits.xor(bits.xor(bits.rotr64(w0, 19), bits.rotr64(w0, 61)), bits.shr(w0, 6))
-            t2 := f + bits.xor(bits.xor(bits.rotr64(c, 14), bits.rotr64(c, 18)), bits.rotr64(c, 41)) + bits.xor(e, bits.band(c, bits.xor(d, e))) + k[base + 2] + w2
-            b = b + t2
-            f = t2 + bits.xor(bits.xor(bits.rotr64(g, 28), bits.rotr64(g, 34)), bits.rotr64(g, 39)) + bits.bor(bits.band(g, h), bits.band(a, bits.bor(g, h)))
+                w2 = w2.wrapping_add(bits.xor(bits.xor(bits.rotr64(w3, 1), bits.rotr64(w3, 8)), bits.shr(w3, 7))).wrapping_add(w11).wrapping_add(bits.xor(bits.xor(bits.rotr64(w0, 19), bits.rotr64(w0, 61)), bits.shr(w0, 6)))
+            t2 := f.wrapping_add(bits.xor(bits.xor(bits.rotr64(c, 14), bits.rotr64(c, 18)), bits.rotr64(c, 41))).wrapping_add(bits.xor(e, bits.band(c, bits.xor(d, e)))).wrapping_add(k[base + 2]).wrapping_add(w2)
+            b = b.wrapping_add(t2)
+            f = t2.wrapping_add(bits.xor(bits.xor(bits.rotr64(g, 28), bits.rotr64(g, 34)), bits.rotr64(g, 39))).wrapping_add(bits.bor(bits.band(g, h), bits.band(a, bits.bor(g, h))))
             if base > 0:
-                w3 = w3 + bits.xor(bits.xor(bits.rotr64(w4, 1), bits.rotr64(w4, 8)), bits.shr(w4, 7)) + w12 + bits.xor(bits.xor(bits.rotr64(w1, 19), bits.rotr64(w1, 61)), bits.shr(w1, 6))
-            t3 := e + bits.xor(bits.xor(bits.rotr64(b, 14), bits.rotr64(b, 18)), bits.rotr64(b, 41)) + bits.xor(d, bits.band(b, bits.xor(c, d))) + k[base + 3] + w3
-            a = a + t3
-            e = t3 + bits.xor(bits.xor(bits.rotr64(f, 28), bits.rotr64(f, 34)), bits.rotr64(f, 39)) + bits.bor(bits.band(f, g), bits.band(h, bits.bor(f, g)))
+                w3 = w3.wrapping_add(bits.xor(bits.xor(bits.rotr64(w4, 1), bits.rotr64(w4, 8)), bits.shr(w4, 7))).wrapping_add(w12).wrapping_add(bits.xor(bits.xor(bits.rotr64(w1, 19), bits.rotr64(w1, 61)), bits.shr(w1, 6)))
+            t3 := e.wrapping_add(bits.xor(bits.xor(bits.rotr64(b, 14), bits.rotr64(b, 18)), bits.rotr64(b, 41))).wrapping_add(bits.xor(d, bits.band(b, bits.xor(c, d)))).wrapping_add(k[base + 3]).wrapping_add(w3)
+            a = a.wrapping_add(t3)
+            e = t3.wrapping_add(bits.xor(bits.xor(bits.rotr64(f, 28), bits.rotr64(f, 34)), bits.rotr64(f, 39))).wrapping_add(bits.bor(bits.band(f, g), bits.band(h, bits.bor(f, g))))
             if base > 0:
-                w4 = w4 + bits.xor(bits.xor(bits.rotr64(w5, 1), bits.rotr64(w5, 8)), bits.shr(w5, 7)) + w13 + bits.xor(bits.xor(bits.rotr64(w2, 19), bits.rotr64(w2, 61)), bits.shr(w2, 6))
-            t4 := d + bits.xor(bits.xor(bits.rotr64(a, 14), bits.rotr64(a, 18)), bits.rotr64(a, 41)) + bits.xor(c, bits.band(a, bits.xor(b, c))) + k[base + 4] + w4
-            h = h + t4
-            d = t4 + bits.xor(bits.xor(bits.rotr64(e, 28), bits.rotr64(e, 34)), bits.rotr64(e, 39)) + bits.bor(bits.band(e, f), bits.band(g, bits.bor(e, f)))
+                w4 = w4.wrapping_add(bits.xor(bits.xor(bits.rotr64(w5, 1), bits.rotr64(w5, 8)), bits.shr(w5, 7))).wrapping_add(w13).wrapping_add(bits.xor(bits.xor(bits.rotr64(w2, 19), bits.rotr64(w2, 61)), bits.shr(w2, 6)))
+            t4 := d.wrapping_add(bits.xor(bits.xor(bits.rotr64(a, 14), bits.rotr64(a, 18)), bits.rotr64(a, 41))).wrapping_add(bits.xor(c, bits.band(a, bits.xor(b, c)))).wrapping_add(k[base + 4]).wrapping_add(w4)
+            h = h.wrapping_add(t4)
+            d = t4.wrapping_add(bits.xor(bits.xor(bits.rotr64(e, 28), bits.rotr64(e, 34)), bits.rotr64(e, 39))).wrapping_add(bits.bor(bits.band(e, f), bits.band(g, bits.bor(e, f))))
             if base > 0:
-                w5 = w5 + bits.xor(bits.xor(bits.rotr64(w6, 1), bits.rotr64(w6, 8)), bits.shr(w6, 7)) + w14 + bits.xor(bits.xor(bits.rotr64(w3, 19), bits.rotr64(w3, 61)), bits.shr(w3, 6))
-            t5 := c + bits.xor(bits.xor(bits.rotr64(h, 14), bits.rotr64(h, 18)), bits.rotr64(h, 41)) + bits.xor(b, bits.band(h, bits.xor(a, b))) + k[base + 5] + w5
-            g = g + t5
-            c = t5 + bits.xor(bits.xor(bits.rotr64(d, 28), bits.rotr64(d, 34)), bits.rotr64(d, 39)) + bits.bor(bits.band(d, e), bits.band(f, bits.bor(d, e)))
+                w5 = w5.wrapping_add(bits.xor(bits.xor(bits.rotr64(w6, 1), bits.rotr64(w6, 8)), bits.shr(w6, 7))).wrapping_add(w14).wrapping_add(bits.xor(bits.xor(bits.rotr64(w3, 19), bits.rotr64(w3, 61)), bits.shr(w3, 6)))
+            t5 := c.wrapping_add(bits.xor(bits.xor(bits.rotr64(h, 14), bits.rotr64(h, 18)), bits.rotr64(h, 41))).wrapping_add(bits.xor(b, bits.band(h, bits.xor(a, b)))).wrapping_add(k[base + 5]).wrapping_add(w5)
+            g = g.wrapping_add(t5)
+            c = t5.wrapping_add(bits.xor(bits.xor(bits.rotr64(d, 28), bits.rotr64(d, 34)), bits.rotr64(d, 39))).wrapping_add(bits.bor(bits.band(d, e), bits.band(f, bits.bor(d, e))))
             if base > 0:
-                w6 = w6 + bits.xor(bits.xor(bits.rotr64(w7, 1), bits.rotr64(w7, 8)), bits.shr(w7, 7)) + w15 + bits.xor(bits.xor(bits.rotr64(w4, 19), bits.rotr64(w4, 61)), bits.shr(w4, 6))
-            t6 := b + bits.xor(bits.xor(bits.rotr64(g, 14), bits.rotr64(g, 18)), bits.rotr64(g, 41)) + bits.xor(a, bits.band(g, bits.xor(h, a))) + k[base + 6] + w6
-            f = f + t6
-            b = t6 + bits.xor(bits.xor(bits.rotr64(c, 28), bits.rotr64(c, 34)), bits.rotr64(c, 39)) + bits.bor(bits.band(c, d), bits.band(e, bits.bor(c, d)))
+                w6 = w6.wrapping_add(bits.xor(bits.xor(bits.rotr64(w7, 1), bits.rotr64(w7, 8)), bits.shr(w7, 7))).wrapping_add(w15).wrapping_add(bits.xor(bits.xor(bits.rotr64(w4, 19), bits.rotr64(w4, 61)), bits.shr(w4, 6)))
+            t6 := b.wrapping_add(bits.xor(bits.xor(bits.rotr64(g, 14), bits.rotr64(g, 18)), bits.rotr64(g, 41))).wrapping_add(bits.xor(a, bits.band(g, bits.xor(h, a)))).wrapping_add(k[base + 6]).wrapping_add(w6)
+            f = f.wrapping_add(t6)
+            b = t6.wrapping_add(bits.xor(bits.xor(bits.rotr64(c, 28), bits.rotr64(c, 34)), bits.rotr64(c, 39))).wrapping_add(bits.bor(bits.band(c, d), bits.band(e, bits.bor(c, d))))
             if base > 0:
-                w7 = w7 + bits.xor(bits.xor(bits.rotr64(w8, 1), bits.rotr64(w8, 8)), bits.shr(w8, 7)) + w0 + bits.xor(bits.xor(bits.rotr64(w5, 19), bits.rotr64(w5, 61)), bits.shr(w5, 6))
-            t7 := a + bits.xor(bits.xor(bits.rotr64(f, 14), bits.rotr64(f, 18)), bits.rotr64(f, 41)) + bits.xor(h, bits.band(f, bits.xor(g, h))) + k[base + 7] + w7
-            e = e + t7
-            a = t7 + bits.xor(bits.xor(bits.rotr64(b, 28), bits.rotr64(b, 34)), bits.rotr64(b, 39)) + bits.bor(bits.band(b, c), bits.band(d, bits.bor(b, c)))
+                w7 = w7.wrapping_add(bits.xor(bits.xor(bits.rotr64(w8, 1), bits.rotr64(w8, 8)), bits.shr(w8, 7))).wrapping_add(w0).wrapping_add(bits.xor(bits.xor(bits.rotr64(w5, 19), bits.rotr64(w5, 61)), bits.shr(w5, 6)))
+            t7 := a.wrapping_add(bits.xor(bits.xor(bits.rotr64(f, 14), bits.rotr64(f, 18)), bits.rotr64(f, 41))).wrapping_add(bits.xor(h, bits.band(f, bits.xor(g, h)))).wrapping_add(k[base + 7]).wrapping_add(w7)
+            e = e.wrapping_add(t7)
+            a = t7.wrapping_add(bits.xor(bits.xor(bits.rotr64(b, 28), bits.rotr64(b, 34)), bits.rotr64(b, 39))).wrapping_add(bits.bor(bits.band(b, c), bits.band(d, bits.bor(b, c))))
             if base > 0:
-                w8 = w8 + bits.xor(bits.xor(bits.rotr64(w9, 1), bits.rotr64(w9, 8)), bits.shr(w9, 7)) + w1 + bits.xor(bits.xor(bits.rotr64(w6, 19), bits.rotr64(w6, 61)), bits.shr(w6, 6))
-            t8 := h + bits.xor(bits.xor(bits.rotr64(e, 14), bits.rotr64(e, 18)), bits.rotr64(e, 41)) + bits.xor(g, bits.band(e, bits.xor(f, g))) + k[base + 8] + w8
-            d = d + t8
-            h = t8 + bits.xor(bits.xor(bits.rotr64(a, 28), bits.rotr64(a, 34)), bits.rotr64(a, 39)) + bits.bor(bits.band(a, b), bits.band(c, bits.bor(a, b)))
+                w8 = w8.wrapping_add(bits.xor(bits.xor(bits.rotr64(w9, 1), bits.rotr64(w9, 8)), bits.shr(w9, 7))).wrapping_add(w1).wrapping_add(bits.xor(bits.xor(bits.rotr64(w6, 19), bits.rotr64(w6, 61)), bits.shr(w6, 6)))
+            t8 := h.wrapping_add(bits.xor(bits.xor(bits.rotr64(e, 14), bits.rotr64(e, 18)), bits.rotr64(e, 41))).wrapping_add(bits.xor(g, bits.band(e, bits.xor(f, g)))).wrapping_add(k[base + 8]).wrapping_add(w8)
+            d = d.wrapping_add(t8)
+            h = t8.wrapping_add(bits.xor(bits.xor(bits.rotr64(a, 28), bits.rotr64(a, 34)), bits.rotr64(a, 39))).wrapping_add(bits.bor(bits.band(a, b), bits.band(c, bits.bor(a, b))))
             if base > 0:
-                w9 = w9 + bits.xor(bits.xor(bits.rotr64(w10, 1), bits.rotr64(w10, 8)), bits.shr(w10, 7)) + w2 + bits.xor(bits.xor(bits.rotr64(w7, 19), bits.rotr64(w7, 61)), bits.shr(w7, 6))
-            t9 := g + bits.xor(bits.xor(bits.rotr64(d, 14), bits.rotr64(d, 18)), bits.rotr64(d, 41)) + bits.xor(f, bits.band(d, bits.xor(e, f))) + k[base + 9] + w9
-            c = c + t9
-            g = t9 + bits.xor(bits.xor(bits.rotr64(h, 28), bits.rotr64(h, 34)), bits.rotr64(h, 39)) + bits.bor(bits.band(h, a), bits.band(b, bits.bor(h, a)))
+                w9 = w9.wrapping_add(bits.xor(bits.xor(bits.rotr64(w10, 1), bits.rotr64(w10, 8)), bits.shr(w10, 7))).wrapping_add(w2).wrapping_add(bits.xor(bits.xor(bits.rotr64(w7, 19), bits.rotr64(w7, 61)), bits.shr(w7, 6)))
+            t9 := g.wrapping_add(bits.xor(bits.xor(bits.rotr64(d, 14), bits.rotr64(d, 18)), bits.rotr64(d, 41))).wrapping_add(bits.xor(f, bits.band(d, bits.xor(e, f)))).wrapping_add(k[base + 9]).wrapping_add(w9)
+            c = c.wrapping_add(t9)
+            g = t9.wrapping_add(bits.xor(bits.xor(bits.rotr64(h, 28), bits.rotr64(h, 34)), bits.rotr64(h, 39))).wrapping_add(bits.bor(bits.band(h, a), bits.band(b, bits.bor(h, a))))
             if base > 0:
-                w10 = w10 + bits.xor(bits.xor(bits.rotr64(w11, 1), bits.rotr64(w11, 8)), bits.shr(w11, 7)) + w3 + bits.xor(bits.xor(bits.rotr64(w8, 19), bits.rotr64(w8, 61)), bits.shr(w8, 6))
-            t10 := f + bits.xor(bits.xor(bits.rotr64(c, 14), bits.rotr64(c, 18)), bits.rotr64(c, 41)) + bits.xor(e, bits.band(c, bits.xor(d, e))) + k[base + 10] + w10
-            b = b + t10
-            f = t10 + bits.xor(bits.xor(bits.rotr64(g, 28), bits.rotr64(g, 34)), bits.rotr64(g, 39)) + bits.bor(bits.band(g, h), bits.band(a, bits.bor(g, h)))
+                w10 = w10.wrapping_add(bits.xor(bits.xor(bits.rotr64(w11, 1), bits.rotr64(w11, 8)), bits.shr(w11, 7))).wrapping_add(w3).wrapping_add(bits.xor(bits.xor(bits.rotr64(w8, 19), bits.rotr64(w8, 61)), bits.shr(w8, 6)))
+            t10 := f.wrapping_add(bits.xor(bits.xor(bits.rotr64(c, 14), bits.rotr64(c, 18)), bits.rotr64(c, 41))).wrapping_add(bits.xor(e, bits.band(c, bits.xor(d, e)))).wrapping_add(k[base + 10]).wrapping_add(w10)
+            b = b.wrapping_add(t10)
+            f = t10.wrapping_add(bits.xor(bits.xor(bits.rotr64(g, 28), bits.rotr64(g, 34)), bits.rotr64(g, 39))).wrapping_add(bits.bor(bits.band(g, h), bits.band(a, bits.bor(g, h))))
             if base > 0:
-                w11 = w11 + bits.xor(bits.xor(bits.rotr64(w12, 1), bits.rotr64(w12, 8)), bits.shr(w12, 7)) + w4 + bits.xor(bits.xor(bits.rotr64(w9, 19), bits.rotr64(w9, 61)), bits.shr(w9, 6))
-            t11 := e + bits.xor(bits.xor(bits.rotr64(b, 14), bits.rotr64(b, 18)), bits.rotr64(b, 41)) + bits.xor(d, bits.band(b, bits.xor(c, d))) + k[base + 11] + w11
-            a = a + t11
-            e = t11 + bits.xor(bits.xor(bits.rotr64(f, 28), bits.rotr64(f, 34)), bits.rotr64(f, 39)) + bits.bor(bits.band(f, g), bits.band(h, bits.bor(f, g)))
+                w11 = w11.wrapping_add(bits.xor(bits.xor(bits.rotr64(w12, 1), bits.rotr64(w12, 8)), bits.shr(w12, 7))).wrapping_add(w4).wrapping_add(bits.xor(bits.xor(bits.rotr64(w9, 19), bits.rotr64(w9, 61)), bits.shr(w9, 6)))
+            t11 := e.wrapping_add(bits.xor(bits.xor(bits.rotr64(b, 14), bits.rotr64(b, 18)), bits.rotr64(b, 41))).wrapping_add(bits.xor(d, bits.band(b, bits.xor(c, d)))).wrapping_add(k[base + 11]).wrapping_add(w11)
+            a = a.wrapping_add(t11)
+            e = t11.wrapping_add(bits.xor(bits.xor(bits.rotr64(f, 28), bits.rotr64(f, 34)), bits.rotr64(f, 39))).wrapping_add(bits.bor(bits.band(f, g), bits.band(h, bits.bor(f, g))))
             if base > 0:
-                w12 = w12 + bits.xor(bits.xor(bits.rotr64(w13, 1), bits.rotr64(w13, 8)), bits.shr(w13, 7)) + w5 + bits.xor(bits.xor(bits.rotr64(w10, 19), bits.rotr64(w10, 61)), bits.shr(w10, 6))
-            t12 := d + bits.xor(bits.xor(bits.rotr64(a, 14), bits.rotr64(a, 18)), bits.rotr64(a, 41)) + bits.xor(c, bits.band(a, bits.xor(b, c))) + k[base + 12] + w12
-            h = h + t12
-            d = t12 + bits.xor(bits.xor(bits.rotr64(e, 28), bits.rotr64(e, 34)), bits.rotr64(e, 39)) + bits.bor(bits.band(e, f), bits.band(g, bits.bor(e, f)))
+                w12 = w12.wrapping_add(bits.xor(bits.xor(bits.rotr64(w13, 1), bits.rotr64(w13, 8)), bits.shr(w13, 7))).wrapping_add(w5).wrapping_add(bits.xor(bits.xor(bits.rotr64(w10, 19), bits.rotr64(w10, 61)), bits.shr(w10, 6)))
+            t12 := d.wrapping_add(bits.xor(bits.xor(bits.rotr64(a, 14), bits.rotr64(a, 18)), bits.rotr64(a, 41))).wrapping_add(bits.xor(c, bits.band(a, bits.xor(b, c)))).wrapping_add(k[base + 12]).wrapping_add(w12)
+            h = h.wrapping_add(t12)
+            d = t12.wrapping_add(bits.xor(bits.xor(bits.rotr64(e, 28), bits.rotr64(e, 34)), bits.rotr64(e, 39))).wrapping_add(bits.bor(bits.band(e, f), bits.band(g, bits.bor(e, f))))
             if base > 0:
-                w13 = w13 + bits.xor(bits.xor(bits.rotr64(w14, 1), bits.rotr64(w14, 8)), bits.shr(w14, 7)) + w6 + bits.xor(bits.xor(bits.rotr64(w11, 19), bits.rotr64(w11, 61)), bits.shr(w11, 6))
-            t13 := c + bits.xor(bits.xor(bits.rotr64(h, 14), bits.rotr64(h, 18)), bits.rotr64(h, 41)) + bits.xor(b, bits.band(h, bits.xor(a, b))) + k[base + 13] + w13
-            g = g + t13
-            c = t13 + bits.xor(bits.xor(bits.rotr64(d, 28), bits.rotr64(d, 34)), bits.rotr64(d, 39)) + bits.bor(bits.band(d, e), bits.band(f, bits.bor(d, e)))
+                w13 = w13.wrapping_add(bits.xor(bits.xor(bits.rotr64(w14, 1), bits.rotr64(w14, 8)), bits.shr(w14, 7))).wrapping_add(w6).wrapping_add(bits.xor(bits.xor(bits.rotr64(w11, 19), bits.rotr64(w11, 61)), bits.shr(w11, 6)))
+            t13 := c.wrapping_add(bits.xor(bits.xor(bits.rotr64(h, 14), bits.rotr64(h, 18)), bits.rotr64(h, 41))).wrapping_add(bits.xor(b, bits.band(h, bits.xor(a, b)))).wrapping_add(k[base + 13]).wrapping_add(w13)
+            g = g.wrapping_add(t13)
+            c = t13.wrapping_add(bits.xor(bits.xor(bits.rotr64(d, 28), bits.rotr64(d, 34)), bits.rotr64(d, 39))).wrapping_add(bits.bor(bits.band(d, e), bits.band(f, bits.bor(d, e))))
             if base > 0:
-                w14 = w14 + bits.xor(bits.xor(bits.rotr64(w15, 1), bits.rotr64(w15, 8)), bits.shr(w15, 7)) + w7 + bits.xor(bits.xor(bits.rotr64(w12, 19), bits.rotr64(w12, 61)), bits.shr(w12, 6))
-            t14 := b + bits.xor(bits.xor(bits.rotr64(g, 14), bits.rotr64(g, 18)), bits.rotr64(g, 41)) + bits.xor(a, bits.band(g, bits.xor(h, a))) + k[base + 14] + w14
-            f = f + t14
-            b = t14 + bits.xor(bits.xor(bits.rotr64(c, 28), bits.rotr64(c, 34)), bits.rotr64(c, 39)) + bits.bor(bits.band(c, d), bits.band(e, bits.bor(c, d)))
+                w14 = w14.wrapping_add(bits.xor(bits.xor(bits.rotr64(w15, 1), bits.rotr64(w15, 8)), bits.shr(w15, 7))).wrapping_add(w7).wrapping_add(bits.xor(bits.xor(bits.rotr64(w12, 19), bits.rotr64(w12, 61)), bits.shr(w12, 6)))
+            t14 := b.wrapping_add(bits.xor(bits.xor(bits.rotr64(g, 14), bits.rotr64(g, 18)), bits.rotr64(g, 41))).wrapping_add(bits.xor(a, bits.band(g, bits.xor(h, a)))).wrapping_add(k[base + 14]).wrapping_add(w14)
+            f = f.wrapping_add(t14)
+            b = t14.wrapping_add(bits.xor(bits.xor(bits.rotr64(c, 28), bits.rotr64(c, 34)), bits.rotr64(c, 39))).wrapping_add(bits.bor(bits.band(c, d), bits.band(e, bits.bor(c, d))))
             if base > 0:
-                w15 = w15 + bits.xor(bits.xor(bits.rotr64(w0, 1), bits.rotr64(w0, 8)), bits.shr(w0, 7)) + w8 + bits.xor(bits.xor(bits.rotr64(w13, 19), bits.rotr64(w13, 61)), bits.shr(w13, 6))
-            t15 := a + bits.xor(bits.xor(bits.rotr64(f, 14), bits.rotr64(f, 18)), bits.rotr64(f, 41)) + bits.xor(h, bits.band(f, bits.xor(g, h))) + k[base + 15] + w15
-            e = e + t15
-            a = t15 + bits.xor(bits.xor(bits.rotr64(b, 28), bits.rotr64(b, 34)), bits.rotr64(b, 39)) + bits.bor(bits.band(b, c), bits.band(d, bits.bor(b, c)))
+                w15 = w15.wrapping_add(bits.xor(bits.xor(bits.rotr64(w0, 1), bits.rotr64(w0, 8)), bits.shr(w0, 7))).wrapping_add(w8).wrapping_add(bits.xor(bits.xor(bits.rotr64(w13, 19), bits.rotr64(w13, 61)), bits.shr(w13, 6)))
+            t15 := a.wrapping_add(bits.xor(bits.xor(bits.rotr64(f, 14), bits.rotr64(f, 18)), bits.rotr64(f, 41))).wrapping_add(bits.xor(h, bits.band(f, bits.xor(g, h)))).wrapping_add(k[base + 15]).wrapping_add(w15)
+            e = e.wrapping_add(t15)
+            a = t15.wrapping_add(bits.xor(bits.xor(bits.rotr64(b, 28), bits.rotr64(b, 34)), bits.rotr64(b, 39))).wrapping_add(bits.bor(bits.band(b, c), bits.band(d, bits.bor(b, c))))
             base = base + 16
 
-        h0 = h0 + a
-        h1 = h1 + b
-        h2 = h2 + c
-        h3 = h3 + d
-        h4 = h4 + e
-        h5 = h5 + f
-        h6 = h6 + g
-        h7 = h7 + h
+        h0 = h0.wrapping_add(a)
+        h1 = h1.wrapping_add(b)
+        h2 = h2.wrapping_add(c)
+        h3 = h3.wrapping_add(d)
+        h4 = h4.wrapping_add(e)
+        h5 = h5.wrapping_add(f)
+        h6 = h6.wrapping_add(g)
+        h7 = h7.wrapping_add(h)
         block = block + 128
 
     mut out := word64_to_hex(h0) + word64_to_hex(h1) + word64_to_hex(h2) + word64_to_hex(h3) + word64_to_hex(h4) + word64_to_hex(h5)
@@ -1097,7 +1098,7 @@ test "fnv1a word loop agrees with the byte-at-a-time definition":
 # kernel cross-checks below: the low byte of each step is the next byte.
 fn sha_test_content(seed: Int, want: Int) -> Bytes:
     buf := bytes.buffer()
-    mut state := bits.xor(88172645463325252, seed * 2654435761)
+    mut state := bits.xor(88172645463325252, seed.wrapping_mul(2654435761))
     mut filled := 0
     while filled < want:
         state = bits.xor(state, bits.shl(state, 13))

@@ -24,6 +24,7 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
         4 => "invalid allocation layout",
         5 => "call to a function the compiler could not resolve — a compiler bug, not a problem in your program",
         6 => "value() on none",
+        7 => "integer overflow",
         _ => "runtime error",
     };
     // a failed allocation and a compiler bug stop the program wherever they

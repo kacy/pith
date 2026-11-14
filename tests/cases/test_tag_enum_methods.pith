@@ -1,0 +1,54 @@
+# methods from an impl block on an enum whose variants carry no payload. such
+# an enum is an integer at run time, and a call on one used to compile and then
+# fail in the backend with a call to an unknown function.
+
+interface Describe:
+    fn describe() -> String
+
+enum Light:
+    Red
+    Yellow
+    Green
+
+impl Light:
+    fn next() -> Light:
+        if self == Light.Red:
+            return Light.Green
+        if self == Light.Green:
+            return Light.Yellow
+        return Light.Red
+
+    fn name() -> String:
+        if self == Light.Red:
+            return "red"
+        if self == Light.Yellow:
+            return "yellow"
+        return "green"
+
+    fn after(steps: Int) -> Light:
+        mut cur := self
+        mut i := 0
+        while i < steps:
+            cur = cur.next()
+            i = i + 1
+        return cur
+
+impl Describe for Light:
+    fn describe() -> String:
+        return "light " + self.name()
+
+struct Crossing:
+    light: Light
+
+fn main():
+    l := Light.Red
+    print(l.name())
+    print(l.next().name())
+    print(l.after(2).name())
+    print(l.describe())
+    c := Crossing(Light.Yellow)
+    print(c.light.name())
+    lights := [Light.Green, Light.Red]
+    print(lights[0].next().name())
+    for x in lights:
+        print(x.describe())

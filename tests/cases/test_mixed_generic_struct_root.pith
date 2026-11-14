@@ -1,0 +1,19 @@
+# the root file declares a generic Pod and imports a plain Pod. the root's
+# generic methods used to be filed under the plain struct's type id too, so
+# the plain values ran the generic body.
+import clash_mixed_plain as p
+
+struct Pod[T]:
+    v: T
+
+impl Pod:
+    fn tag() -> String:
+        return "main generic {self.v}"
+
+fn main():
+    a := Pod[Int](3)
+    print(a.tag())
+    b := p.make(4)
+    print(b.tag())
+    c := p.Pod(5)
+    print(c.tag())

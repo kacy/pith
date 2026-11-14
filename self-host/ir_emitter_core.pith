@@ -2622,8 +2622,8 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
     # binding owns its own retained count (taken at bind, tracked by the
     # prepass, released by the exit cleanup), so the local stays the last
     # owner of the count the shell arrived with, the same contract as a
-    # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT
-    # match stays disqualifying: its binding path takes no count.
+    # `.ok` read. arm bodies are judged by the ordinary rules. a RESULT match
+    # is judged below, since its binding takes no count.
     if not is_result and node.kind == "match_expr" and node.children.len() > 1:
         subj := get_node(node.children[0])
         if subj.kind == "ident" and subj.value == name:
@@ -2652,13 +2652,16 @@ fn ir_tuple_uses_all_safe(idx: Int, name: String, is_result: Bool) -> Bool:
                         return false
                     li = li + 1
                 return true
-    if ir_tuple_walk_pair_callee:
-        if node.kind == "body" or node.kind == "block":
-            return ir_tuple_pair_block_safe(node, name)
-        if node.kind == "match_expr" and node.children.len() > 1:
-            subj := get_node(ir_unwrap_grouped(node.children[0]))
-            if subj.kind == "ident" and subj.value == name:
-                return ir_tuple_pair_match_safe(node, name)
+    if ir_tuple_walk_pair_callee and (node.kind == "body" or node.kind == "block"):
+        return ir_tuple_pair_block_safe(node, name)
+    # a match on a RESULT local binds the box itself to a bare arm binding,
+    # with no count of its own. the local stays the last owner as long as
+    # every arm reads the box, under either name, only through the uses the
+    # walk allows. a variant or literal pattern is refused.
+    if is_result and node.kind == "match_expr" and node.children.len() > 1:
+        subj := get_node(ir_unwrap_grouped(node.children[0]))
+        if subj.kind == "ident" and subj.value == name:
+            return ir_tuple_pair_match_safe(node, name)
     for child_idx in node.children:
         child := get_node(child_idx)
         if child.kind == "ident" and child.value == name:

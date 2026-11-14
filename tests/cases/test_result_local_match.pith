@@ -1,0 +1,63 @@
+# a result local matched on and then read again. the local's exit cleanup
+# releases the payload with the box, so each row reads back what an arm took
+# from the box, and the local itself after the match, to show that nothing
+# was freed while still in use.
+
+fn mk_str(i: Int) -> String!:
+    if i % 2 == 1:
+        fail "e" + i.to_string()
+    return "o" + i.to_string()
+
+fn mk_pair(i: Int) -> (Int, String)!:
+    if i % 2 == 1:
+        fail "e" + i.to_string()
+    return (i, "p" + i.to_string())
+
+fn mk_opt(i: Int) -> (String?)!:
+    if i % 2 == 1:
+        return none
+    v: String? := "v" + i.to_string()
+    return v
+
+fn payload(i: Int) -> String:
+    r := mk_str(i)
+    s := match r:
+        m if m.is_ok => m.ok
+        m => m.err
+    return s + "/" + (r catch "caught")
+
+fn pair(i: Int) -> String:
+    r := mk_pair(i)
+    n := match r:
+        m if m.is_ok => m.ok.0
+        _ => 0 - 1
+    if r.is_ok:
+        return n.to_string() + " " + r.ok.1
+    return n.to_string() + " " + r.err
+
+fn opt(i: Int) -> String:
+    r := mk_opt(i)
+    flag := match r:
+        m if m.is_ok => "ok"
+        _ => "err"
+    if r.is_ok:
+        return flag + " " + r.ok.unwrap_or("none")
+    return flag
+
+fn sibling(i: Int) -> String:
+    if i % 2 == 0:
+        r := mk_str(i)
+        return match r:
+            m if m.is_ok => m.ok
+            m => m.err
+    r := mk_str(i)
+    return r catch "fallback"
+
+fn main():
+    mut i := 0
+    while i < 2:
+        print(payload(i))
+        print(pair(i))
+        print(opt(i))
+        print(sibling(i))
+        i = i + 1

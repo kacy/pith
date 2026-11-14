@@ -173,7 +173,6 @@ stale and a fix to it is welcome.
   a pass.
 - **known leaks**. each of these strands memory on every occurrence:
   - a `T!` stored in a struct field or a list element (#1167).
-  - a match on a result local with a tuple payload (#1150).
 - **closing a channel can race a send**. a send that passes its closed check
   as another task closes the channel can enqueue a value nobody reads, and the
   send reports success. a channel costs about 416 bytes plus 16 bytes per

@@ -207,6 +207,11 @@ cases=(
   tests/leaks/leak_threadlocal_fn_value
   tests/leaks/leak_concat_early_exit
   tests/leaks/leak_rebound_result_local
+  "tests/leaks/leak_result_local_match SHAPE=1"
+  "tests/leaks/leak_result_local_match SHAPE=2"
+  "tests/leaks/leak_result_local_match SHAPE=3"
+  "tests/leaks/leak_result_local_match SHAPE=4"
+  "tests/leaks/leak_result_local_match SHAPE=5"
   tests/leaks/leak_match_fresh_result
   tests/leaks/leak_interp_result
   "tests/leaks/leak_decode_missing_field SHAPE=toml"

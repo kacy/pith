@@ -19,7 +19,7 @@
 
 from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
 from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
-from ast import Node, get_node
+from ast import Node, get_node, node_kind, node_value, node_child_count, node_child
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
@@ -1745,11 +1745,64 @@ fn check_top_level_declarations(node_idx: Int):
     else:
         check_declaration(node_idx)
 
+# the type node of the first interface named in a type annotation, or -1.
+# an interface is a bound for a type parameter and has no values of its own,
+# so a parameter, return or field typed by one was accepted here and then
+# failed at its first use with an error about a missing method or a
+# mismatched argument.
+fn interface_in_type(type_idx: Int) -> Int:
+    tn := get_node(type_idx)
+    if tn.kind == "type" and names_an_interface(tn.value):
+        return type_idx
+    for child in tn.children:
+        found := interface_in_type(child)
+        if found >= 0:
+            return found
+    return 0 - 1
+
+# whether a type name, resolved the way an annotation resolves it, lands on an
+# interface. the name alone is not enough: an interface is registered as a
+# struct with no fields, and another module may declare a real struct with
+# the same name (std/io's Reader interface and std/binary's Reader struct).
+fn names_an_interface(name: String) -> Bool:
+    if not has_interface_declaration(name):
+        return false
+    mut tid := resolve_type_name_module_scoped(name)
+    if tid < 0:
+        tid = lookup_type_id(resolve_imported_type_name(name))
+    return is_interface_type(tid)
+
+# whether a type id is an interface's: the zero-field struct an interface
+# declaration registers.
+fn is_interface_type(tid: Int) -> Bool:
+    if tid < 0:
+        return false
+    info := get_type_info(tid)
+    return info.kind == "struct" and info.fields.len() == 0 and has_interface_declaration(info.name)
+
+fn report_interface_value_type(type_idx: Int):
+    found := interface_in_type(type_idx)
+    if found < 0:
+        return
+    name := node_value(found)
+    report_error_with_fix_at(found, "E315", "interface '" + name + "' is not a value type", "take a type parameter bounded by it, as in `fn f[T: " + name + "](x: T)`")
+
+# the parameter, return and field annotations of one declaration.
+fn check_interface_value_types(node: Node):
+    for child in node.children:
+        kind := node_kind(child)
+        if (kind == "param" or kind == "returns" or kind == "field") and node_child_count(child) > 0:
+            report_interface_value_type(node_child(child, 0))
+        elif kind == "fn_decl" and node.kind == "impl_decl":
+            check_interface_value_types(get_node(child))
+
 fn check_declaration(node_idx: Int):
     node := get_node(node_idx)
     if node.kind == "threadlocal":
         check_declaration(node.children[0])
         return
+    if node.kind == "fn_decl" or node.kind == "impl_decl" or node.kind == "struct_decl":
+        check_interface_value_types(node)
     if node.kind == "fn_decl":
         check_function_declaration(node)
     elif node.kind == "binding":
@@ -2179,6 +2232,48 @@ fn is_mutex_or_mutex_list(t: Int) -> Bool:
         return true
     info := get_type_info(t)
     return info.kind == "list" and get_type_name(info.inner) == "Mutex"
+
+# a labeled argument names the parameter it is passed to. arguments bind by
+# position, so a label must name the parameter in that position: a label that
+# names another parameter, or none of them, would otherwise bind silently to
+# the wrong one. a function value held in a local has no names to match, so a
+# label on a call through one is refused too. struct and variant constructors
+# check their own field names.
+fn check_argument_labels(call_idx: Int, node: Node):
+    mut labeled := false
+    for child, i in node.children:
+        if i > 0 and node_kind(child) == "arg" and node_value(child).len() > 0:
+            labeled = true
+    if not labeled:
+        return
+    decl_idx := called_declaration(call_idx)
+    if decl_idx < 0:
+        # a builtin, or a constructor reached through a module
+        # (`m.S(x: 1)`), which checks its own field names.
+        return
+    decl := get_node(decl_idx)
+    # a function value held in a local or a parameter has no names to match
+    is_value := decl.kind == "binding" or decl.kind == "param"
+    if decl.kind != "fn_decl" and not is_value:
+        return
+    mut params: List[String] := []
+    for child in decl.children:
+        if node_kind(child) == "param":
+            params.push(extract_binding_name(node_value(child)))
+    for child, i in node.children:
+        if i == 0 or node_kind(child) != "arg":
+            continue
+        label := node_value(child)
+        if label.len() == 0:
+            continue
+        pos := i - 1
+        if is_value:
+            report_error_at(child, "E314", "argument label '" + label + "' on a call through a function value, which has no parameter names")
+        elif pos < params.len() and params[pos] != label:
+            if params.contains(label):
+                report_error_at(child, "E314", "argument label '" + label + "' is in the position of parameter '" + params[pos] + "'; arguments bind by position")
+            else:
+                report_error_at(child, "E314", "no parameter named '" + label + "'; the parameter in this position is '" + params[pos] + "'")
 
 # a call to a function declared `holding m` needs `m` held at the call. a
 # path rooted at `self` is read off the receiver, and one rooted at a
@@ -3263,16 +3358,14 @@ pub fn get_definition_of() -> Map[Int, Int]:
     return definition_of
 
 # the declaration node a call or a method call resolved to, or -1. a call is
-# recorded under its callee and a method call under itself.
+# recorded under its callee, except a call to a generic function, which is
+# recorded under the call itself, as a method call is.
 pub fn called_declaration(idx: Int) -> Int:
     node := get_node(idx)
-    mut key := 0 - 1
-    if node.kind == "call" and node.children.len() > 0:
-        key = node.children[0]
-    elif node.kind == "method_call":
-        key = idx
-    if key >= 0 and definition_of.contains_key(key):
-        return definition_of[key]
+    if node.kind == "call" and node.children.len() > 0 and definition_of.contains_key(node.children[0]):
+        return definition_of[node.children[0]]
+    if (node.kind == "call" or node.kind == "method_call") and definition_of.contains_key(idx):
+        return definition_of[idx]
     return 0 - 1
 
 # record a use-site -> declaration-node pair. -1 on either side means
@@ -3336,10 +3429,12 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "call":
         call_tid := check_function_call(node, scope_id)
         check_holding_call(node_idx, node, scope_id)
+        check_argument_labels(node_idx, node)
         return call_tid
     if node.kind == "method_call":
         method_tid := check_method_call(node, scope_id)
         check_holding_call(node_idx, node, scope_id)
+        check_argument_labels(node_idx, node)
         return method_tid
     if node.kind == "field_access":
         return check_field_access_expression(node_idx, node, scope_id)
@@ -4390,7 +4485,9 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
                 if arg_type != expected:
                     if argument_widens_to_optional(arg_expr_idx, arg_type, expected) == false:
                         if collection_literal_matches_target(arg_expr_idx, expected, scope_id) == false:
-                            if types_structurally_equal(arg_type, expected) == false:
+                            # a parameter typed by an interface was refused
+                            # at its annotation (E315)
+                            if types_structurally_equal(arg_type, expected) == false and not is_interface_type(expected):
                                 report_error_at(arg_expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return fn_info.return_type
@@ -5900,8 +5997,9 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                     return check_callable_type_with_args(recv_info.field_types[ffi], arg_indices, scope_id)
             ffi = ffi + 1
     # a table that recognized the method may have reported already;
-    # don't stack the generic "no method" on top of its specific error
-    if checker_reported_at_current() == false:
+    # don't stack the generic "no method" on top of its specific error. a
+    # receiver typed by an interface was refused at its annotation (E315).
+    if checker_reported_at_current() == false and not is_interface_type(receiver_type):
         report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "'")
     return TID_ERR
 

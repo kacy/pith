@@ -77,9 +77,14 @@ fn report_split(bytes: &[u8], index: usize, start: i64, end: i64) -> ! {
         .map(|s| s.to_string())
         .unwrap_or_default();
 
-    eprintln!(
-        "pith runtime error: substring({}, {}) would split the character '{}' \
-         at byte {} (it occupies bytes {}..{})",
+    let message = format!(
+        "substring({}, {}) would split the character '{}' \
+         at byte {} (it occupies bytes {}..{})\n  \
+         a String is indexed in bytes, so a byte offset can land inside a \
+         multi-byte character. use std.text for character-aware work:\n    \
+         text.slice(s, a, b)         slice by character index\n    \
+         text.truncate(s, n)         keep n characters\n    \
+         text.truncate_bytes(s, n)   keep n bytes, ending on a boundary",
         start,
         end,
         character,
@@ -87,15 +92,9 @@ fn report_split(bytes: &[u8], index: usize, start: i64, end: i64) -> ! {
         lead,
         lead + width
     );
-    eprintln!(
-        "  a String is indexed in bytes, so a byte offset can land inside a \
-         multi-byte character. use std.text for character-aware work:"
-    );
-    eprintln!("    text.slice(s, a, b)         slice by character index");
-    eprintln!("    text.truncate(s, n)         keep n characters");
-    eprintln!("    text.truncate_bytes(s, n)   keep n bytes, ending on a boundary");
-    // panic-guard: byte slicing that would split a character; see the diagnostic above.
-    std::process::exit(1);
+    // `fail` skips this frame, so nothing it owns may be left to drop.
+    drop(character);
+    crate::failure::fail(message)
 }
 
 /// Extract substring from C string (start inclusive, end exclusive)
@@ -228,12 +227,10 @@ pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -
     };
     let len = bytes.len() as i64;
     if index < 0 || index >= len {
-        eprintln!(
-            "pith runtime error: string index out of bounds: {} for string of length {} (use .get(i) for Optional access)",
+        crate::failure::fail(format!(
+            "string index out of bounds: {} for string of length {} (use .get(i) for Optional access)",
             index, len
-        );
-        // panic-guard: strict string indexing out of bounds is a program bug with no value to return.
-        std::process::exit(1);
+        ));
     }
     let ptr = crate::pith_alloc_cstring(1);
     *ptr = bytes[index as usize] as i8;

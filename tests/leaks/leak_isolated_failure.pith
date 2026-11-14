@@ -1,0 +1,40 @@
+# the machinery of an isolated call costs nothing per call, failed or not.
+#
+# a runtime error inside isolate_call skips the frames between it and the call,
+# and whatever those frames owned is lost (docs/failure_isolation.md). what must
+# not leak is everything else: the frame, the failure message the call returns,
+# the closure, and the record of a Mutex the failed call held. each round makes
+# one call that returns, one that fails holding nothing of its own (the list it
+# indexes is the caller's), and one that fails holding a lock, which must come
+# back unlocked or the next round's lock() would hang.
+import leakprobe as probe
+
+items := [1, 2, 3]
+mu := Mutex()
+
+fn item(xs: List[Int], i: Int) -> Int:
+    return xs[i]
+
+fn locked_item(xs: List[Int], i: Int) -> Int:
+    mu.lock()
+    n := xs[i]
+    mu.unlock()
+    return n
+
+fn churn_round(i: Int) -> Int:
+    ok := isolate_call(fn() -> Int => item(items, 1))
+    failed := isolate_call(fn() -> Int => item(items, 3 + i % 5))
+    held := isolate_call(fn() -> Int => locked_item(items, 7))
+    return ok.len() + failed.len() + held.len()
+
+fn main():
+    n := probe.rounds()
+    mut total := 0
+    mut i := 0
+    while i < n:
+        total = total + churn_round(i)
+        i = i + 1
+    if total == 0:
+        print("no failures")
+    kb := probe.peak_kb()
+    print("{kb}")

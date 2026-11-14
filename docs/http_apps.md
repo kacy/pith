@@ -375,9 +375,12 @@ a handler cannot see that its client went away while it runs: the handler type
 carries no `Context`, and noticing a disconnect would take a second wait on the
 socket while the handler runs, which reads the next pipelined request if there
 is one. a handler has no way to fail either. it returns an `HttpResponse`, so an
-error becomes a response through `catch` as above, and a runtime error such as
-an index out of range stops the whole process, which net/http would turn into a
-`500` and a closed connection.
+error becomes a response through `catch` as above. a runtime error such as an
+index out of range fails that request alone: the server answers `500` and
+closes the connection, as net/http does after a panic, prints the error to
+stderr with the method and path, and goes on serving. the failed handler's
+`defer` blocks do not run and what it held is not freed; a `Mutex` it held is
+unlocked (docs/failure_isolation.md).
 
 ### what the server adds to a response
 

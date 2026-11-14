@@ -927,12 +927,10 @@ unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_c
 #[cold]
 #[inline(never)]
 fn strict_store_out_of_bounds(index: i64, len: i64) -> ! {
-    eprintln!(
-        "pith runtime error: list index out of bounds: {} for list of length {}",
+    crate::failure::fail(format!(
+        "list index out of bounds: {} for list of length {}",
         index, len
-    );
-    // panic-guard: an index store out of bounds is a program bug with nothing to write to.
-    std::process::exit(1);
+    ))
 }
 
 #[inline]
@@ -1236,12 +1234,10 @@ fn strict_index_bad_handle() -> ! {
 #[cold]
 #[inline(never)]
 fn strict_index_out_of_bounds(index: i64, len: i64) -> ! {
-    eprintln!(
-        "pith runtime error: list index out of bounds: {} for list of length {} (use .get(i) for Optional access)",
+    crate::failure::fail(format!(
+        "list index out of bounds: {} for list of length {} (use .get(i) for Optional access)",
         index, len
-    );
-    // panic-guard: strict list indexing out of bounds is a program bug with no value to return.
-    std::process::exit(1);
+    ))
 }
 
 #[cold]

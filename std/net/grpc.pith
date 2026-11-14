@@ -1399,7 +1399,16 @@ fn grpc_unframe_unary(body: Bytes) -> Bytes!GrpcError:
     return msg
 
 # the http/2 handler that turns one unary grpc request into one grpc response.
+# a runtime error inside the method fails the call with INTERNAL.
 fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.call_isolated(grpc_unary_response, req, grpc_failed_response)
+
+# the answer to a call whose method stopped at a runtime error. the message
+# goes to the server's stderr, not to the client.
+fn grpc_failed_response(req: http.HttpRequestBytes, failure: String) -> http.HttpResponse:
+    return error_response(GRPC_INTERNAL, "internal error")
+
+fn grpc_unary_response(req: http.HttpRequestBytes) -> http.HttpResponse:
     path := req.path() catch ""
     if begin_request_context(req):
         return expired_response()
@@ -1600,6 +1609,9 @@ pub fn serve_tls(host: String, port: Int, cert: String, key: String, dispatch: f
 mut grpc_body_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispatch
 
 fn grpc_serve_body_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.call_isolated(grpc_body_response, req, grpc_failed_response)
+
+fn grpc_body_response(req: http.HttpRequestBytes) -> http.HttpResponse:
     path := req.path() catch ""
     if begin_request_context(req):
         return expired_response()
@@ -1943,6 +1955,15 @@ fn grpc_serve_stream_handler(stream: h2server.ServerStream) -> Int:
     # shutdown can close it even if the handler never comes back.
     live := register_live_stream(call)
     defer forget_live_stream(live)
+    # a runtime error inside the method fails the call with INTERNAL. finish
+    # is a no-op when the method already finished before it failed.
+    failure := isolate_call(fn() -> Int => dispatch_stream(call))
+    if failure != "":
+        http.report_handler_failure(stream.request, failure)
+        call.finish(GRPC_INTERNAL, "internal error")
+    return 0
+
+fn dispatch_stream(call: GrpcStream) -> Int:
     result := grpc_stream_dispatch_fn(call.full_method(), call)
     if result.is_err:
         call.finish(result.err.status, result.err.message)

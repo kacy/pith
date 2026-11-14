@@ -958,7 +958,7 @@ fn handle_stream(server: Server, stream_id: Int, inbox: Channel[StreamEvent]):
         else:
             server.forget(stream_id)
         return
-    response := server.handler(result.ok)
+    response := http.call_isolated(server.handler, result.ok, http.handler_failed_response)
     if http.response_is_streaming():
         send_streamed_response(server, stream_id, result.ok, response)
         return
@@ -1010,7 +1010,13 @@ fn handle_streaming_stream(server: Server, stream_id: Int, inbox: Channel[Stream
     # END_STREAM on the request HEADERS means there is no body: the stream starts
     # out done and the handler's first recv_event() reports end-of-request.
     stream := ServerStream(server, stream_id, inbox, head.ok, first.end)
-    stream_handler_fn(stream)
+    # a runtime error inside the handler fails this stream alone: it is
+    # reported and the stream is reset (docs/failure_isolation.md).
+    failure := isolate_call(fn() -> Int => stream_handler_fn(stream))
+    if failure != "":
+        http.report_handler_failure(stream.request, failure)
+        server.reset(stream_id, frames.ERROR_INTERNAL_ERROR)
+        return
     server.forget(stream_id)
 
 # --- the reader task ---

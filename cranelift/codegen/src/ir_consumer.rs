@@ -3102,6 +3102,10 @@ fn compile_ir_function(
         // already in this set is a back-edge (see `defined_labels`).
         if parts[0] == "label" && parts.len() >= 2 {
             defined_labels.insert(parts[1].to_string());
+            // a label starts a block other paths jump to, which no earlier
+            // handle test dominates; this covers the label a terminated
+            // block skips to as well as a live one
+            forget_tested_closures();
         }
 
         // If current block is terminated, skip until next label
@@ -4374,7 +4378,6 @@ fn compile_ir_function(
             }
 
             "label" if parts.len() >= 2 => {
-                forget_tested_closures();
                 let block = labels[parts[1]];
                 if !terminated {
                     builder.ins().jump(block, &[]);

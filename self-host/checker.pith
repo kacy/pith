@@ -2291,6 +2291,14 @@ fn is_mutex_or_mutex_list(t: Int) -> Bool:
     info := get_type_info(t)
     return info.kind == "list" and get_type_name(info.inner) == "Mutex"
 
+# the names of a declaration's parameters, in order.
+fn declared_param_names(decl: Node) -> List[String]:
+    mut params: List[String] := []
+    for child in decl.children:
+        if node_kind(child) == "param":
+            params.push(extract_binding_name(node_value(child)))
+    return params
+
 # a labeled argument names the parameter it is passed to. arguments bind by
 # position, so a label must name the parameter in that position: a label that
 # names another parameter, or none of them, would otherwise bind silently to
@@ -2314,10 +2322,7 @@ fn check_argument_labels(call_idx: Int, node: Node):
     is_value := decl.kind == "binding" or decl.kind == "param"
     if decl.kind != "fn_decl" and not is_value:
         return
-    mut params: List[String] := []
-    for child in decl.children:
-        if node_kind(child) == "param":
-            params.push(extract_binding_name(node_value(child)))
+    params := declared_param_names(decl)
     for child, i in node.children:
         if i == 0 or node_kind(child) != "arg":
             continue
@@ -2344,15 +2349,12 @@ fn check_holding_call(call_idx: Int, node: Node, scope_id: Int):
     if decl.kind != "fn_decl":
         return
     mut holding := 0 - 1
-    mut params: List[String] := []
     for child in decl.children:
-        cn := get_node(child)
-        if cn.kind == "holding":
+        if node_kind(child) == "holding":
             holding = child
-        elif cn.kind == "param":
-            params.push(extract_binding_name(cn.value))
     if holding < 0:
         return
+    params := declared_param_names(decl)
     # a method call carries its receiver first; a plain call its callee
     mut args: List[Int] := []
     mut receiver := 0 - 1

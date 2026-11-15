@@ -1812,10 +1812,7 @@ fn checked_operand_range(op: &str, c: i64, const_on_left: bool) -> Option<(i128,
 /// test it, and a constant multiply in that form takes the slow one-operand
 /// `imul`; the compare fuses with its branch and leaves the arithmetic alone.
 fn emit_checked_int_arith(
-    codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
-    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
-    runtime_funcs: &HashMap<String, FuncId>,
     op: &str,
     a: Value,
     b: Value,
@@ -1876,7 +1873,6 @@ fn emit_checked_int_arith(
     // the runtime turns the trap into the integer-overflow error
     // (overflow_trap.rs).
     builder.ins().trapnz(overflowed, cranelift::codegen::ir::TrapCode::unwrap_user(OVERFLOW_TRAP_CODE));
-    let _ = (codegen, func_ref_cache, runtime_funcs);
     Ok(match computed {
         Some(value) => value,
         None => plain(builder),
@@ -3280,10 +3276,7 @@ fn compile_ir_function(
                 } else {
                     let v = match parts[0] {
                         "addc" | "subc" | "mulc" | "uaddc" | "usubc" | "umulc" => emit_checked_int_arith(
-                            codegen,
                             &mut builder,
-                            &mut func_ref_cache,
-                            runtime_funcs,
                             checked,
                             a,
                             b,

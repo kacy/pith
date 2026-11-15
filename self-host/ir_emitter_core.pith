@@ -89,7 +89,7 @@ mut ir_index_offsets_scanned := 0
 mut ir_index_offset_targets: Map[Int, Int] := {}
 # set while one of those steps, or an index offset that skips its check, is
 # emitted, so ir_int_op hands back the plain op instead of the checked one
-mut ir_counter_step_active := false
+mut ir_plain_int_arith := false
 
 mut ir_map_value_types: Map[String, String] := {} # map variable name -> value type
 
@@ -6115,7 +6115,7 @@ fn ir_int_checks_overflow(tid: Int) -> Bool:
 # of `+`, `-` and `*` for a type that stops on overflow (`addc`, or `uaddc`
 # for an unsigned word). anything else is the op itself.
 fn ir_int_op(tid: Int, op: String) -> String:
-    if (op == "add" or op == "sub" or op == "mul") and ir_int_checks_overflow(tid) and not ir_counter_step_active:
+    if (op == "add" or op == "sub" or op == "mul") and ir_int_checks_overflow(tid) and not ir_plain_int_arith:
         if ir_is_unsigned_word(tid):
             return "u" + op + "c"
         return op + "c"
@@ -10906,9 +10906,9 @@ fn ir_expr(idx: Int) -> Int:
 
     if node.kind == "binary":
         if ir_counter_steps.contains_key(idx) or ir_index_offset_unchecked(idx):
-            ir_counter_step_active = true
+            ir_plain_int_arith = true
             step_r := ir_emit_binary_expr(node)
-            ir_counter_step_active = false
+            ir_plain_int_arith = false
             return step_r
         return ir_narrow_sized_result(idx, node.value, ir_emit_binary_expr(node))
 
@@ -12097,9 +12097,9 @@ fn ir_stmt(idx: Int):
         return
 
     if kind == "assignment":
-        ir_counter_step_active = ir_counter_steps.contains_key(idx)
+        ir_plain_int_arith = ir_counter_steps.contains_key(idx)
         ir_emit_compound_assignment(node)
-        ir_counter_step_active = false
+        ir_plain_int_arith = false
         return
 
     ir_stmt_control(idx, node)

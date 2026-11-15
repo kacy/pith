@@ -901,6 +901,25 @@ fn inline_closure_get_env(
     slot: Value,
     fallback: FuncRef,
 ) -> Value {
+    // a closure body reading its own capture with a constant slot: the
+    // closure is the body's first parameter, and every call through a closure
+    // value tests the handle before it jumps here (`closure_fn_ptr`), so the
+    // test would only repeat that one; a constant slot inside the inline
+    // block cannot be spilled. what is left is the load. small closures are
+    // called in loops, where the repeated test was a third of the body.
+    if let Some(slot_index) = iconst_of(builder.func, slot) {
+        let own_env = builder.func.layout.entry_block().is_some_and(|entry| {
+            matches!(builder.func.dfg.value_def(closure), cranelift::codegen::ir::ValueDef::Param(block, 0) if block == entry)
+        });
+        if own_env && (0..PITH_CLOSURE_ENV_SLOTS as i64).contains(&slot_index) {
+            return builder.ins().load(
+                types::I64,
+                MemFlags::new(),
+                closure,
+                CLOSURE_ENV_OFFSET + (slot_index as i32) * 8,
+            );
+        }
+    }
     let (done, slow) = strict_path_blocks(builder);
 
     branch_if_not_magic_handle(
@@ -937,6 +956,44 @@ fn inline_closure_get_env(
 /// `pith_closure_get_fn`, which answers as it always has. Every call through a
 /// closure value made that FFI call before the indirect call itself.
 fn closure_fn_ptr(
+    codegen: &mut CodeGen,
+    builder: &mut FunctionBuilder<'_>,
+    func_ref_cache: &mut HashMap<FuncId, FuncRef>,
+    runtime_funcs: &HashMap<String, FuncId>,
+    closure: Value,
+    local: Option<&str>,
+) -> Value {
+    let key = match local {
+        Some(name) => format!("n:{name}"),
+        None => format!("v:{}", closure.as_u32()),
+    };
+    if let Some(fn_ptr) = TESTED_CLOSURES.with(|t| t.borrow().iter().find(|(k, _)| *k == key).map(|(_, f)| *f)) {
+        return fn_ptr;
+    }
+    let fn_ptr = closure_fn_ptr_tested(codegen, builder, func_ref_cache, runtime_funcs, closure);
+    TESTED_CLOSURES.with(|t| t.borrow_mut().push((key, fn_ptr)));
+    fn_ptr
+}
+
+thread_local! {
+    /// Closures whose handle test has passed since the last IR label, keyed
+    /// by the local that holds them (`n:name`) or by the value (`v:n`), with
+    /// the function pointer the test read. Every block the consumer makes
+    /// between two labels is dominated by the ones before it, so a second
+    /// call through the same closure there (`f(f(x))`) can reuse the first
+    /// test's answer. A local is keyed by name because each read of it in an
+    /// unsealed block is a new value. A local keeps its count until it is
+    /// stored to, which drops its entry, and a closure body cannot assign
+    /// what it captures, so the closure stays alive in between. Cleared at
+    /// each label and function.
+    static TESTED_CLOSURES: std::cell::RefCell<Vec<(String, Value)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn forget_tested_closures() {
+    TESTED_CLOSURES.with(|t| t.borrow_mut().clear());
+}
+
+fn closure_fn_ptr_tested(
     codegen: &mut CodeGen,
     builder: &mut FunctionBuilder<'_>,
     func_ref_cache: &mut HashMap<FuncId, FuncRef>,
@@ -979,9 +1036,10 @@ fn emit_closure_call(
     func_ref_cache: &mut HashMap<FuncId, FuncRef>,
     runtime_funcs: &HashMap<String, FuncId>,
     closure: Value,
+    local: Option<&str>,
     args: &[Value],
 ) -> Value {
-    let fn_ptr = closure_fn_ptr(codegen, builder, func_ref_cache, runtime_funcs, closure);
+    let fn_ptr = closure_fn_ptr(codegen, builder, func_ref_cache, runtime_funcs, closure, local);
     let mut sig = codegen.module.make_signature();
     sig.params.push(AbiParam::new(types::I64));
     for _ in args {
@@ -1000,6 +1058,16 @@ fn emit_closure_call(
 /// into the inline env. A closure is built with one of these per capture, so
 /// the FFI call was a large share of building a small one. A spilled slot and
 /// a bad handle go to `fallback`.
+/// Whether `v` is the address of a closure this function built on its own
+/// stack: such a handle is valid for the whole function, so its handle test
+/// can only pass.
+fn is_stack_built(func: &cranelift::codegen::ir::Function, v: Value) -> bool {
+    let cranelift::codegen::ir::ValueDef::Result(inst, _) = func.dfg.value_def(v) else {
+        return false;
+    };
+    func.dfg.insts[inst].opcode() == cranelift::codegen::ir::Opcode::StackAddr
+}
+
 fn inline_closure_set_env(
     builder: &mut FunctionBuilder<'_>,
     closure: Value,
@@ -1007,6 +1075,21 @@ fn inline_closure_set_env(
     value: Value,
     fallback: FuncRef,
 ) {
+    // filling in a closure built on this stack, at a constant slot inside the
+    // inline block: the handle test and the spill check cannot fail
+    if is_stack_built(builder.func, closure) {
+        if let Some(slot_index) = iconst_of(builder.func, slot) {
+            if (0..PITH_CLOSURE_ENV_SLOTS as i64).contains(&slot_index) {
+                builder.ins().store(
+                    MemFlags::new(),
+                    value,
+                    closure,
+                    CLOSURE_ENV_OFFSET + (slot_index as i32) * 8,
+                );
+                return;
+            }
+        }
+    }
     let done = builder.create_block();
     let slow = builder.create_block();
     builder.append_block_param(slow, types::I64);
@@ -1809,6 +1892,24 @@ fn emit_checked_int_div_or_mod(
     a: Value,
     b: Value,
 ) -> Result<Value, CompileError> {
+    // a constant divisor other than 0 and -1 can neither divide by zero nor
+    // overflow. without this the checks folded to constants but their
+    // branches stayed, two dead tests on every `i % 7`.
+    if let Some(d) = iconst_of(builder.func, b) {
+        if d != 0 && d != -1 {
+            return Ok(match op {
+                "div" => builder.ins().sdiv(a, b),
+                "mod" => builder.ins().srem(a, b),
+                "udiv" => builder.ins().udiv(a, b),
+                "urem" => builder.ins().urem(a, b),
+                _ => {
+                    return Err(CompileError::ModuleError(format!(
+                        "IR consumer: unsupported checked integer op '{op}'"
+                    )))
+                }
+            });
+        }
+    }
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
 
@@ -2928,6 +3029,7 @@ fn compile_ir_function(
     // Cache function references to avoid duplicate declarations
     let mut func_ref_cache: HashMap<FuncId, FuncRef> = HashMap::new();
 
+    forget_tested_closures();
     let entry_block = builder.create_block();
     builder.append_block_params_for_function_params(entry_block);
     builder.switch_to_block(entry_block);
@@ -3000,6 +3102,10 @@ fn compile_ir_function(
         // already in this set is a back-edge (see `defined_labels`).
         if parts[0] == "label" && parts.len() >= 2 {
             defined_labels.insert(parts[1].to_string());
+            // a label starts a block other paths jump to, which no earlier
+            // handle test dominates; this covers the label a terminated
+            // block skips to as well as a live one
+            forget_tested_closures();
         }
 
         // If current block is terminated, skip until next label
@@ -3809,6 +3915,7 @@ fn compile_ir_function(
                             &mut func_ref_cache,
                             runtime_funcs,
                             closure_handle,
+                            Some(fname),
                             &args,
                         );
                         regs.insert(reg, result);
@@ -3834,6 +3941,7 @@ fn compile_ir_function(
                             &mut func_ref_cache,
                             runtime_funcs,
                             closure_handle,
+                            None,
                             &args,
                         );
                         regs.insert(reg, result);
@@ -3855,6 +3963,8 @@ fn compile_ir_function(
 
             "store" if parts.len() >= 3 => {
                 let name = parts[1].to_string();
+                let stored = format!("n:{name}");
+                TESTED_CLOSURES.with(|t| t.borrow_mut().retain(|(k, _)| *k != stored));
                 let val = get_reg(&regs, parts[2])?;
                 // Propagate types through store
                 if let Ok(src_reg) = parts[2].parse::<usize>() {

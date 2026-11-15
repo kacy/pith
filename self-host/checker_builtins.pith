@@ -112,6 +112,9 @@ pub fn register_builtin_types(scope_id: Int):
     str_to_void := create_function_type([TID_STRING], TID_VOID)
     define_builtin_function("print", str_to_void)
     define_builtin_function("print_err", str_to_void)
+    # run a fn() -> Int and return "", or the message of the runtime error
+    # that stopped it, which then fails only this call (docs/failure_isolation.md).
+    define_builtin_function("isolate_call", create_function_type([create_function_type([], TID_INT)], TID_STRING))
     define_builtin_function("skip_test", str_to_void)
 
     # the name of the test currently running, or "" outside one. std.testing
@@ -336,6 +339,7 @@ pub fn register_builtin_types(scope_id: Int):
     fix_builtin_binding("fmt_float", [tid_float, tid_int], tid_string)
     fix_builtin_binding("print", [tid_string], tid_void)
     fix_builtin_binding("print_err", [tid_string], tid_void)
+    fix_builtin_binding("isolate_call", [add_type_info(ti_function([], tid_int))], tid_string)
     fix_builtin_binding("skip_test", [tid_string], tid_void)
     fix_builtin_binding("test_name", [], tid_string)
     fix_builtin_binding("exec", [tid_string], tid_int)

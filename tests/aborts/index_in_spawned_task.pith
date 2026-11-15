@@ -1,0 +1,13 @@
+# a runtime error in a spawned task that is not an http or grpc handler still
+# stops the whole program, as it does in main.
+fn item(xs: List[Int], i: Int) -> Int:
+    return xs[i]
+
+fn work(i: Int) -> Int:
+    xs := [1, 2]
+    return item(xs, i)
+
+fn main():
+    print("before")
+    t := spawn work(4)
+    print("after:{await t}")

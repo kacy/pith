@@ -1,0 +1,11 @@
+# a runtime error that an isolated call caught leaves nothing behind: the next
+# one, in main and outside any isolated call, still stops the program with the
+# usual diagnostic and status 1.
+fn item(xs: List[Int], i: Int) -> Int:
+    return xs[i]
+
+fn main():
+    xs := [1, 2]
+    failure := isolate_call(fn() -> Int => item(xs, 5))
+    print("isolated: {failure}")
+    print("after:{item(xs, 3)}")

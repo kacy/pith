@@ -285,12 +285,10 @@ pub unsafe extern "C" fn pith_bytes_get_strict(handle: i64, idx: i64) -> i64 {
     };
     let len = bytes.data.len() as i64;
     if idx < 0 || idx >= len {
-        eprintln!(
-            "pith runtime error: bytes index out of bounds: {} for bytes of length {}",
+        crate::failure::fail(format!(
+            "bytes index out of bounds: {} for bytes of length {}",
             idx, len
-        );
-        // panic-guard: strict bytes indexing out of bounds is a program bug with no value to return.
-        std::process::exit(1);
+        ));
     }
     bytes.data[idx as usize] as i64
 }

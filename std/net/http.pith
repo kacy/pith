@@ -6117,7 +6117,52 @@ pub fn wrap(handler: fn(HttpRequestBytes) -> HttpResponse, middleware: fn(fn(Htt
 fn run_handler(handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
     scope := json_mod.open_scope()
     defer json_mod.close_scope(scope)
-    return handler(req)
+    return call_isolated(handler, req, handler_failed_response)
+
+# --- failure isolation --------------------------------------------------------
+#
+# a runtime error inside a handler (an index out of range, a missing map key,
+# .value() on none, a division by zero) fails that request, not the server. the
+# handler runs under isolate_call, which returns the error's message instead of
+# exiting; the request is answered by the caller's failure response and the
+# message goes to stderr with the request's method and path. what the failed
+# handler held is not released and its defer blocks do not run; a Mutex it
+# still held is unlocked. docs/failure_isolation.md has the details.
+
+# carries the handler's response out of the closure isolate_call runs. a plain
+# struct rather than a threadlocal: a threadlocal store marks the response and
+# everything in it shared, which makes every later count on it atomic.
+struct HandlerResult:
+    response: HttpResponse?
+
+fn store_handler_response(out: HandlerResult, handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> Int:
+    out.response = handler(req)
+    return 1
+
+# the answer to a request whose handler stopped at a runtime error: a 500 that
+# closes the connection, since the failed handler may have left it mid-body.
+# http/2 drops the Connection header as hop-by-hop.
+pub fn handler_failed_response(req: HttpRequestBytes, failure: String) -> HttpResponse:
+    return server_error_response().header("Connection", "close")
+
+# write the stderr line for a runtime error that failed a request.
+pub fn report_handler_failure(req: HttpRequestBytes, failure: String):
+    print_err("pith runtime error in {req.method_text} {req.path_text}: {failure}")
+
+# run handler(req). a runtime error inside it is reported and answered with
+# failed(req, message) instead of stopping the process.
+pub fn call_isolated(handler: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes, failed: fn(HttpRequestBytes, String) -> HttpResponse) -> HttpResponse:
+    out := HandlerResult(none)
+    failure := isolate_call(fn() -> Int => store_handler_response(out, handler, req))
+    if failure == "":
+        if let resp = out.response:
+            return resp
+    # a streamed body or a connection takeover the handler set up before it
+    # failed belongs to the failed response, not to its answer
+    pending_producer = none
+    pending_taker = none
+    report_handler_failure(req, failure)
+    return failed(req, failure)
 
 # the outcome of serving one request: the bytes written, whether the
 # connection stays open for another, and the read failure that ended the

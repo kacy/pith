@@ -1,0 +1,15 @@
+# the os-thread backend keeps the isolated call's frame per thread: a failure
+# inside one is caught, and a later one in the same task, outside any isolated
+# call, still stops the program.
+fn item(xs: List[Int], i: Int) -> Int:
+    return xs[i]
+
+fn work(i: Int) -> Int:
+    xs := [1, 2]
+    failure := isolate_call(fn() -> Int => item(xs, i))
+    print("isolated: {failure}")
+    return item(xs, i)
+
+fn main():
+    t := spawn work(4)
+    print("after:{await t}")

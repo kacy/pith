@@ -27,9 +27,15 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
         7 => "integer overflow",
         _ => "runtime error",
     };
-    eprintln!("pith runtime error: {message}");
-    // panic-guard: the compiler's runtime-error trap; the program cannot continue past any of these.
-    std::process::exit(1);
+    // a failed allocation and a compiler bug stop the program wherever they
+    // happen. the rest are program errors, which an isolated call (an http
+    // handler, a grpc method) survives: see `failure`.
+    if matches!(code, 3..=5) {
+        eprintln!("pith runtime error: {message}");
+        // panic-guard: the compiler's runtime-error trap for conditions no caller can recover from.
+        std::process::exit(1);
+    }
+    crate::failure::fail(message.to_string())
 }
 
 pub(crate) fn pith_layout(size: usize, align: usize) -> Layout {
@@ -3159,11 +3165,17 @@ pub extern "C" fn pith_second(_a: i64, b: i64) -> i64 {
 #[derive(Default)]
 pub(crate) struct TlsMap {
     values: Vec<Option<(i64, u8)>>,
+    /// the innermost failure-isolation frame of the task that owns the map
+    /// (see `failure`), or 0. only a green task's map uses it.
+    pub(crate) isolation: usize,
 }
 
 impl TlsMap {
     pub(crate) const fn new() -> Self {
-        TlsMap { values: Vec::new() }
+        TlsMap {
+            values: Vec::new(),
+            isolation: 0,
+        }
     }
 
     #[inline]

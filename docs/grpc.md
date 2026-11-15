@@ -188,7 +188,10 @@ interleave however the conversation needs. the call also carries `metadata()`,
 `deadline_ms()`, and `finish(status, message)` for ending with a non-OK status
 mid-stream; a handler that fails before sending anything becomes a compact
 trailers-only error response. a message that fails to decode surfaces from
-`recv()` as `INVALID_ARGUMENT`.
+`recv()` as `INVALID_ARGUMENT`. a runtime error inside a handler (an index out
+of range, a missing map key, a division by zero) fails that call with
+`INTERNAL` and the message `internal error`; the error itself goes to the
+server's stderr, and the server keeps serving (docs/failure_isolation.md).
 
 pick the listener by the service's needs: `serve_Catalog` when every stream is
 bounded (the `List` shapes are the simplest to write), `serve_Catalog_streaming`

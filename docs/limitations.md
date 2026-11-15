@@ -47,6 +47,15 @@ stale and a fix to it is welcome.
   either case.
   `xs.get(i)` and `m.get(k)` return an optional, and `if let`, `match` and
   `unwrap_or` handle a `none` without stopping.
+
+  inside an http handler (std.net.http, std.web, the http/2 server) or a grpc
+  method, the same errors fail only that request: the client gets a 500, or
+  grpc status `INTERNAL`, the message goes to stderr with the request's method
+  and path, and the server keeps serving. what the failed handler held is not
+  freed and its `defer` blocks do not run, though a `Mutex` it held is
+  unlocked. an error in main or in any other task, a stack overflow and a
+  failed allocation still stop the process. docs/failure_isolation.md has the
+  details.
 - **a local that shadows a module global takes the name for the whole
   function**. the global is unreachable from that function, except on either
   side of a `for` loop whose variable shadows it. reading the global and then

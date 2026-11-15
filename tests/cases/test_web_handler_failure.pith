@@ -1,0 +1,141 @@
+# a runtime error inside a handler fails that request with a 500, and the server
+# goes on serving.
+#
+# before failure isolation an index out of range, a missing map key, .value() on
+# none or a division by zero anywhere in a handler printed its message and ended
+# the process, so one bad request took down every connection. this drives a
+# std.web app over a real socket: each kind of failure, then a plain request on a
+# new connection, then a burst of failures while a handler holds a Mutex, which
+# the failure has to give back or the next request that takes it would hang.
+
+import std.net.tcp as tcp
+import std.net.http as http
+import std.time as time
+import std.web as web
+
+PORT := 20971
+
+items := [1, 2, 3]
+counts_mu := Mutex()
+
+# the item at the index the parameter's length names, so /item/xxxxxxx asks
+# for one past the end.
+fn item_at(text: String) -> Int:
+    return items[text.len()]
+
+fn get_item(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "item {item_at(req.param("i"))}")
+
+fn get_key(req: web.Request) -> http.HttpResponse:
+    names: Map[String, String] := {"a": "alpha"}
+    return http.text(200, names[req.param("k")])
+
+fn get_none(req: web.Request) -> http.HttpResponse:
+    missing: Int? := none
+    return http.text(200, "{missing.value()}")
+
+fn get_div(req: web.Request) -> http.HttpResponse:
+    zero := items.len() - 3
+    return http.text(200, "{10 / zero}")
+
+# Int addition past the largest Int, which stops on overflow through a trap
+# the runtime turns into an error
+fn get_overflow(req: web.Request) -> http.HttpResponse:
+    big := 9223372036854775807
+    return http.text(200, "{big + req.param("n").len()}")
+
+# takes the lock and fails while holding it. the next request to take it only
+# gets it if the failure released it.
+fn get_locked(req: web.Request) -> http.HttpResponse:
+    counts_mu.lock()
+    n := items[9]
+    counts_mu.unlock()
+    return http.text(200, "{n}")
+
+fn get_counted(req: web.Request) -> http.HttpResponse:
+    counts_mu.lock()
+    n := items.len()
+    counts_mu.unlock()
+    return http.text(200, "counted {n}")
+
+fn run_server():
+    app := web.new().get("/item/:i", get_item).get("/key/:k", get_key).get("/none", get_none).get("/div", get_div).get("/overflow/:n", get_overflow).get("/locked", get_locked).get("/counted", get_counted)
+    app.listen("127.0.0.1", PORT) catch 0
+
+fn read_all(fd: Int) -> String:
+    mut buffer := ""
+    mut rounds := 0
+    while rounds < 64:
+        chunk := tcp.read(fd, 4096) catch ""
+        if chunk == "":
+            break
+        buffer = buffer + chunk
+        rounds = rounds + 1
+    return buffer
+
+# one request on its own connection: the status, the Connection header the
+# answer carried and the body.
+fn get(path: String) -> String:
+    fd_r := tcp.connect("127.0.0.1", PORT)
+    if fd_r.is_err:
+        return "CONNECT_ERR"
+    fd := fd_r.ok
+    tcp.set_timeout(fd, 5000)
+    tcp.write_all(fd, "GET " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n") catch 0
+    response := read_all(fd)
+    tcp.close(fd)
+    if response == "":
+        return "NO_RESPONSE"
+    status := response.substring(9, 12)
+    cut := response.index_of("\r\n\r\n")
+    if cut < 0:
+        return status
+    return status + " " + response.substring(cut + 4, response.len())
+
+fn wait_until_serving(timeout_ms: Int) -> String:
+    mut waited := 0
+    while waited < timeout_ms:
+        got := get("/item/x")
+        if got != "CONNECT_ERR":
+            return got
+        time.delay(25)
+        waited = waited + 25
+    return "CONNECT_ERR"
+
+# a second request on the connection that carried a failure: the 500 closes
+# it, so the server must not answer twice.
+fn keep_alive_after_failure() -> String:
+    fd_r := tcp.connect("127.0.0.1", PORT)
+    if fd_r.is_err:
+        return "CONNECT_ERR"
+    fd := fd_r.ok
+    tcp.set_timeout(fd, 5000)
+    one := "GET /item/xxxxxxx HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    two := "GET /item/x HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+    tcp.write_all(fd, one + two) catch 0
+    response := read_all(fd)
+    tcp.close(fd)
+    closes := response.contains("Connection: close") or response.contains("connection: close")
+    second := response.substring(12, response.len()).index_of("HTTP/1.1 ") >= 0
+    return "{response.substring(9, 12)} second answer={second} closes={closes}"
+
+fn main():
+    spawn run_server()
+    print("ready: " + wait_until_serving(10000))
+    print("index: " + get("/item/xxxxxxx").substring(0, 3))
+    print("after: " + get("/item/xx"))
+    print("key: " + get("/key/zz").substring(0, 3))
+    print("none: " + get("/none").substring(0, 3))
+    print("div: " + get("/div").substring(0, 3))
+    print("overflow: " + get("/overflow/x").substring(0, 3))
+    print("overflow again: " + get("/overflow/xy").substring(0, 3))
+    print("after: " + get("/key/a"))
+    print("same connection: " + keep_alive_after_failure())
+    mut i := 0
+    mut failed := 0
+    while i < 20:
+        if get("/locked").starts_with("500"):
+            failed = failed + 1
+        i = i + 1
+    print("locked failures: {failed}")
+    print("lock free: " + get("/counted"))

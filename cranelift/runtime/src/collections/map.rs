@@ -1078,13 +1078,14 @@ unsafe fn remove_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) {
 
 /// Exit with the structured diagnostic for a strict miss: `m[k]` on a key
 /// the map does not hold.
-fn strict_miss(key_display: &str) -> ! {
-    eprintln!(
-        "pith runtime error: map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
+///
+/// The caller passes the key's text by value: `fail` skips the caller's frame,
+/// so a string the caller still owned would never be freed.
+fn strict_miss(key_display: String) -> ! {
+    crate::failure::fail(format!(
+        "map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
         key_display
-    );
-    // panic-guard: a missing key under strict indexing is a program bug with no value to return.
-    std::process::exit(1);
+    ))
 }
 
 /// Insert an i64 value with a C-string key.
@@ -1219,7 +1220,7 @@ unsafe fn upsert_add_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>, delta: 
     }
     match impl_ref.upsert_add(map_key, delta) {
         Some(v) => v,
-        None => strict_miss(&map_key.display()),
+        None => strict_miss(map_key.display()),
     }
 }
 
@@ -1287,7 +1288,7 @@ pub unsafe extern "C" fn pith_map_upsert_add_bkey(map_handle: i64, key: i64, del
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_upsert_add_bkey");
     let Some(map_key) = bytes_key_ref(key) else {
-        strict_miss("<not a bytes value>");
+        strict_miss(String::from("<not a bytes value>"));
     };
     upsert_add_keyed(impl_ref, &map_key, delta)
 }
@@ -1363,7 +1364,7 @@ pub unsafe extern "C" fn pith_map_add_or_insert_bkey(map_handle: i64, key: i64, 
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_add_or_insert_bkey");
     let Some(map_key) = bytes_key_ref(key) else {
-        strict_miss("<not a bytes value>");
+        strict_miss(String::from("<not a bytes value>"));
     };
     add_or_insert_keyed(impl_ref, &map_key, delta, init)
 }
@@ -1449,7 +1450,7 @@ pub unsafe extern "C" fn pith_map_get_cstr_strict(map_handle: i64, key: *const i
     let map_key = cstr_key_ref(key);
     match get_keyed(impl_ref, &map_key) {
         Some(v) => v,
-        None => strict_miss(&map_key.display()),
+        None => strict_miss(map_key.display()),
     }
 }
 
@@ -1653,11 +1654,11 @@ pub unsafe extern "C" fn pith_map_get_bkey_strict(map_handle: i64, key: i64) -> 
     };
     require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_strict");
     let Some(map_key) = bytes_key_ref(key) else {
-        strict_miss("<not a bytes value>");
+        strict_miss(String::from("<not a bytes value>"));
     };
     match get_keyed(impl_ref, &map_key) {
         Some(v) => v,
-        None => strict_miss(&map_key.display()),
+        None => strict_miss(map_key.display()),
     }
 }
 

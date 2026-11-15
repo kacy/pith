@@ -61,6 +61,8 @@ pith_runtime::cycle::seed_node
 pith_runtime::cycle::children_of
 pith_runtime::cycle::collect
 pith_runtime::stack_guard::enter_thread
+pith_runtime::failure::thread_frame
+pith_runtime::failure::set_thread_frame
 std::sys::thread_local
 std::sync::once
 std::thread

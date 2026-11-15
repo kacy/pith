@@ -171,6 +171,8 @@ pub unsafe extern "C" fn pith_mutex_lock(handle: *mut PithMutexHandle) {
         Some(id) => lock_green(m, id),
         None => lock_os(m),
     }
+    // an isolated call that fails while holding the lock gives it back.
+    crate::failure::note_lock(handle as usize);
 }
 
 /// Unlock the mutex
@@ -182,6 +184,7 @@ pub unsafe extern "C" fn pith_mutex_unlock(handle: *mut PithMutexHandle) {
     let Some(m) = mutex_ref(handle) else {
         return;
     };
+    crate::failure::note_unlock(handle as usize);
     // wake any green tasks parked on this lock so they retry their acquire.
     // only a parked green task sets state 2, so an unlock with no one waiting
     // never takes the waiter lock. an os-thread waiter spins and needs no

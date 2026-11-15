@@ -1,0 +1,87 @@
+# a runtime error inside a grpc method fails that call with INTERNAL, and the
+# server goes on serving.
+#
+# a method that indexes past the end of a list used to end the whole process.
+# this runs a unary server and a streaming one, sends each a call whose method
+# fails, then a call that succeeds on the same connection.
+
+import std.net.grpc as grpc
+import std.bytes as bytes
+import std.time as time
+import std.net.tcp as tcp
+
+UNARY_PORT := 20973
+STREAM_PORT := 20975
+
+names := ["zero", "one"]
+
+# the name for the request's length: "x" is "one", and anything longer is past
+# the end of the list.
+fn name_for(request: Bytes) -> String:
+    return names[request.len()]
+
+fn unary_route(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
+    return bytes.from_string_utf8(name_for(request))
+
+fn stream_route(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+    step := call.recv_message()!
+    call.send_message(bytes.from_string_utf8(name_for(step.message)))
+    call.finish_ok()
+    return 0
+
+fn run_unary_server():
+    grpc.serve("127.0.0.1", UNARY_PORT, unary_route) catch 0
+
+fn run_stream_server():
+    grpc.serve_stream("127.0.0.1", STREAM_PORT, stream_route) catch 0
+
+fn wait_for_port(port: Int, timeout_ms: Int) -> Bool:
+    mut waited := 0
+    while waited < timeout_ms:
+        probe := tcp.connect("127.0.0.1", port)
+        if probe.is_ok:
+            tcp.close(probe.ok)
+            return true
+        time.delay(25)
+        waited = waited + 25
+    return false
+
+fn unary(conn: grpc.Conn, text: String) -> String:
+    reply := conn.unary("/t.Svc/Name", bytes.from_string_utf8(text))
+    if reply.is_err:
+        return "status {reply.err.status} {reply.err.message}"
+    return reply.ok.to_string_utf8() catch "?"
+
+fn streamed(conn: grpc.Conn, text: String) -> String:
+    opened := conn.bidi_stream("/t.Svc/Name")
+    if opened.is_err:
+        return "open failed"
+    bs := opened.ok
+    bs.send(bytes.from_string_utf8(text))
+    bs.close_send()
+    step := bs.recv()
+    if step.is_err:
+        return "status {step.err.status} {step.err.message}"
+    if step.ok.done:
+        return "no message"
+    return step.ok.message.to_string_utf8() catch "?"
+
+fn main():
+    spawn run_unary_server()
+    spawn run_stream_server()
+    if not wait_for_port(UNARY_PORT, 10000) or not wait_for_port(STREAM_PORT, 10000):
+        print("servers never started listening")
+        return
+    unary_conn := grpc.dial_h2c("127.0.0.1", UNARY_PORT)
+    stream_conn := grpc.dial_h2c("127.0.0.1", STREAM_PORT)
+    if unary_conn.is_err or stream_conn.is_err:
+        print("dial failed")
+        return
+    print("unary ok: " + unary(unary_conn.ok, "x"))
+    print("unary failing: " + unary(unary_conn.ok, "xxxxx"))
+    print("unary after: " + unary(unary_conn.ok, "x"))
+    print("stream ok: " + streamed(stream_conn.ok, "x"))
+    print("stream failing: " + streamed(stream_conn.ok, "xxxxx"))
+    print("stream after: " + streamed(stream_conn.ok, ""))
+    unary_conn.ok.close()
+    stream_conn.ok.close()

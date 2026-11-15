@@ -460,6 +460,10 @@ mut ir_current_func_optional_inner_kind := ""
 # `list[i]` should propagate a fail on miss (T! context) or fall through
 # to the loud-miss runtime (non-T! context).
 mut ir_current_func_returns_result := false
+# whether a miss (index, key, `.value()`) fails the current function. only a
+# String error can carry the miss message; a `T!E` function with any other E
+# stops with the runtime error instead, as a non-fallible function does.
+mut ir_current_func_miss_fails := false
 # the impl block's target type, set while a method body is being emitted, so
 # `self.field = ...` knows what struct fields to look up
 mut ir_current_impl_type := ""
@@ -668,6 +672,7 @@ fn ir_reset_type_state():
     ir_current_func_return_kind = ""
     ir_current_func_optional_inner_kind = ""
     ir_current_func_returns_result = false
+    ir_current_func_miss_fails = false
     ir_generic_decl_indices = {}
     ir_generic_decl_module_paths = {}
     ir_generic_method_owners = {}
@@ -4287,6 +4292,7 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     ir_prepare_func_emission(ret_type)
     ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
     ir_current_func_returns_result = ir_fn_returns_result(idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(idx)
     ir_current_impl_type = instance_type
     ir_current_impl_subst_params = params
     ir_current_impl_subst_args = arg_names
@@ -9479,7 +9485,9 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # lambda under a `-> T!` function used to build that function's error, which
     # the lambda's caller then read as its value.
     saved_returns_result := ir_current_func_returns_result
+    saved_miss_fails := ir_current_func_miss_fails
     ir_current_func_returns_result = ir_fn_returns_result(idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(idx)
     # nor do its defers: a `!` that failed in the lambda used to run them there,
     # and a plain defer then ran a second time when the function ended.
     saved_defers := ir_defers_enter_function()
@@ -9522,6 +9530,7 @@ fn ir_emit_lambda(idx: Int) -> Int:
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_emitting_main_body = saved_in_main
     ir_current_func_returns_result = saved_returns_result
+    ir_current_func_miss_fails = saved_miss_fails
     ir_defers_leave_function(saved_defers)
     ir_rc_locals = saved_string_locals
     ir_rc_local_kinds = saved_rc_kinds
@@ -9632,12 +9641,14 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     saved_rc_locals := ir_rc_locals
     saved_rc_kinds := ir_rc_local_kinds
     saved_returns_result := ir_current_func_returns_result
+    saved_miss_fails := ir_current_func_miss_fails
     saved_ret_kind := ir_current_func_return_kind
     saved_in_main := ir_emitting_main_body
     saved_defers := ir_defers_enter_function()
     ir_rc_locals = []
     ir_rc_local_kinds = []
     ir_current_func_returns_result = false
+    ir_current_func_miss_fails = false
     ir_current_func_return_kind = ""
     ir_emitting_main_body = false
 
@@ -9655,6 +9666,7 @@ fn ir_emit_spawn_wrapper(call_idx: Int) -> Int:
     ir_rc_locals = saved_rc_locals
     ir_rc_local_kinds = saved_rc_kinds
     ir_current_func_returns_result = saved_returns_result
+    ir_current_func_miss_fails = saved_miss_fails
     ir_current_func_return_kind = saved_ret_kind
     ir_emitting_main_body = saved_in_main
     ir_defers_leave_function(saved_defers)
@@ -10304,7 +10316,7 @@ fn ir_emit_index_read_at(idx: Int, node: Node, obj_r: Int, idx_r: Int, release_k
     # bytes-keyed map has its own entry points, though it is tracked as a
     # plain "map" everywhere else in this function
     keyed_type := ir_bytes_keyed_type(node.children[0], obj_type)
-    if ir_current_func_returns_result and ir_index_supports_propagate(keyed_type):
+    if ir_current_func_miss_fails and ir_index_supports_propagate(keyed_type):
         return ir_emit_index_expr_propagate(node.children[1], obj_r, idx_r, keyed_type, value_type, release_key)
     call_name := ir_index_get_call_name(keyed_type)
     if obj_type == "string":
@@ -10411,7 +10423,7 @@ fn ir_emit_optional_value_check(obj_r: Int):
     none_l := ir_label()
     ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
     ir_emit_label(none_l)
-    if ir_current_func_returns_result:
+    if ir_current_func_miss_fails:
         ir_emit_miss_return("value() on none")
     else:
         code_r := ir_reg()
@@ -10817,7 +10829,7 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
     # bad index fails the function instead: the store is a `_checked` one that
     # returns whether it stored, so the bounds test is the store's own.
     list_store := set_name == "pith_list_set_value"
-    checked_store := list_store and ir_current_func_returns_result
+    checked_store := list_store and ir_current_func_miss_fails
     mut owned_kind := ""
     if not idx_borrowed and ir_container_store_takes_count(idx_store_kind):
         owned_kind = idx_store_kind
@@ -13165,6 +13177,18 @@ fn ir_extract_optional_inner_type(fn_idx: Int) -> String:
 # true when the function declared at `fn_idx` returns a Result (T! or T!E).
 # used to decide whether index-expression codegen should propagate a fail
 # on miss.
+# true for `T!` and `T!String`: the function's error can hold a miss message.
+fn ir_fn_miss_fails(fn_idx: Int) -> Bool:
+    node := get_node(fn_idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "returns":
+            for returns_child in cn.children:
+                rn := get_node(returns_child)
+                if rn.kind == "result_type":
+                    return rn.children.len() < 2 or ir_resolve_type_node(rn.children[1]) == "string"
+    return false
+
 fn ir_fn_returns_result(fn_idx: Int) -> Bool:
     node := get_node(fn_idx)
     for child in node.children:
@@ -13611,6 +13635,7 @@ fn ir_emit_generic_specialization(key: String):
     if ir_current_func_optional_inner_kind.len() == 0:
         ir_current_func_optional_inner_kind = param_return_inner
     ir_current_func_returns_result = ir_fn_returns_result(decl_idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(decl_idx)
     if owner_type.len() > 0:
         ir_current_impl_type = owner_type
         ir_emit_func_header(spec_name, param_count + 1, ret_type)
@@ -13919,6 +13944,7 @@ fn ir_func(idx: Int):
     ir_current_arc_func = name
     ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
     ir_current_func_returns_result = ir_fn_returns_result(idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(idx)
     ir_emitting_main_body = name == "main"
     ir_emit_func_header(name, param_count, ret_type)
     ir_emit_fn_params(idx)
@@ -13956,6 +13982,7 @@ fn ir_impl_func(idx: Int, impl_type: String):
     # payload is reclaimed correctly for heap-typed bindings
     ir_current_func_optional_inner_kind = ir_resolve_assoc_type(impl_type, ir_extract_optional_inner_type(idx))
     ir_current_func_returns_result = ir_fn_returns_result(idx)
+    ir_current_func_miss_fails = ir_fn_miss_fails(idx)
     ir_current_impl_type = impl_type
     ir_current_arc_func = full_name
     ir_emit_func_header(full_name, param_count, emit_ret)

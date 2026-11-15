@@ -278,6 +278,13 @@ inside — no special operator required. (The propagated error carries a
 generic message, `index out of bounds` or `value() on none`; supply your own with an explicit
 `fail` when the caller needs one.)
 
+This applies only when the error type is a String: `T!` or `T!String`. A
+`T!E` function with a struct or enum `E` has no `E` to build from a miss, so
+there the miss stops the program as it does outside a fallible function. Use
+`.get(i)` or `.get(k)` and `fail` with your own `E` when the caller should
+handle it. Inside an isolated HTTP or gRPC handler, the stop fails that one
+request (see [failure isolation](failure_isolation.md)).
+
 ```pith
 fn config_value(cfg: Map[String, Int], key: String) -> Int!:
     return cfg[key]                              # propagates on miss

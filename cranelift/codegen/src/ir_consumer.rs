@@ -1058,6 +1058,16 @@ fn emit_closure_call(
 /// into the inline env. A closure is built with one of these per capture, so
 /// the FFI call was a large share of building a small one. A spilled slot and
 /// a bad handle go to `fallback`.
+/// Whether `v` is the address of a closure this function built on its own
+/// stack: such a handle is valid for the whole function, so its handle test
+/// can only pass.
+fn is_stack_built(func: &cranelift::codegen::ir::Function, v: Value) -> bool {
+    let cranelift::codegen::ir::ValueDef::Result(inst, _) = func.dfg.value_def(v) else {
+        return false;
+    };
+    func.dfg.insts[inst].opcode() == cranelift::codegen::ir::Opcode::StackAddr
+}
+
 fn inline_closure_set_env(
     builder: &mut FunctionBuilder<'_>,
     closure: Value,
@@ -1065,6 +1075,21 @@ fn inline_closure_set_env(
     value: Value,
     fallback: FuncRef,
 ) {
+    // filling in a closure built on this stack, at a constant slot inside the
+    // inline block: the handle test and the spill check cannot fail
+    if is_stack_built(builder.func, closure) {
+        if let Some(slot_index) = iconst_of(builder.func, slot) {
+            if (0..PITH_CLOSURE_ENV_SLOTS as i64).contains(&slot_index) {
+                builder.ins().store(
+                    MemFlags::new(),
+                    value,
+                    closure,
+                    CLOSURE_ENV_OFFSET + (slot_index as i32) * 8,
+                );
+                return;
+            }
+        }
+    }
     let done = builder.create_block();
     let slow = builder.create_block();
     builder.append_block_param(slow, types::I64);
@@ -1867,6 +1892,24 @@ fn emit_checked_int_div_or_mod(
     a: Value,
     b: Value,
 ) -> Result<Value, CompileError> {
+    // a constant divisor other than 0 and -1 can neither divide by zero nor
+    // overflow. without this the checks folded to constants but their
+    // branches stayed, two dead tests on every `i % 7`.
+    if let Some(d) = iconst_of(builder.func, b) {
+        if d != 0 && d != -1 {
+            return Ok(match op {
+                "div" => builder.ins().sdiv(a, b),
+                "mod" => builder.ins().srem(a, b),
+                "udiv" => builder.ins().udiv(a, b),
+                "urem" => builder.ins().urem(a, b),
+                _ => {
+                    return Err(CompileError::ModuleError(format!(
+                        "IR consumer: unsupported checked integer op '{op}'"
+                    )))
+                }
+            });
+        }
+    }
     let done = builder.create_block();
     builder.append_block_param(done, types::I64);
 

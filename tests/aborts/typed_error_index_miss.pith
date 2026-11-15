@@ -1,0 +1,19 @@
+# a `T!E` function whose E is not String has no error value to carry an index
+# miss, so the miss stops the program as it does outside a fallible function.
+# it used to return a malformed E whose first field read faulted (#1400).
+struct LookupError:
+    code: Int
+    message: String
+
+fn get(xs: List[Int], i: Int) -> Int!LookupError:
+    if i < 0:
+        fail LookupError(code: 1, message: "negative")
+    return xs[i]
+
+fn main():
+    xs := [1, 2, 3]
+    print("hit:{get(xs, 1).ok}")
+    neg := get(xs, 0 - 1)
+    print("fail:{neg.err.code} {neg.err.message}")
+    miss := get(xs, 7)
+    print("unreachable:{miss.is_err}")

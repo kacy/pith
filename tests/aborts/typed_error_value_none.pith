@@ -1,0 +1,12 @@
+# `.value()` on a none in a `T!E` function with a struct E stops the program
+# (#1400).
+struct LookupError:
+    message: String
+
+fn length(name: String?) -> Int!LookupError:
+    return name.value().len()
+
+fn main():
+    print("hit:{length("pith").ok}")
+    miss := length(none)
+    print("unreachable:{miss.is_err}")

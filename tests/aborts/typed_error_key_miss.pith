@@ -1,0 +1,12 @@
+# a map key miss in a `T!E` function with a struct E stops the program (#1400).
+struct LookupError:
+    message: String
+
+fn port(cfg: Map[String, Int], name: String) -> Int!LookupError:
+    return cfg[name]
+
+fn main():
+    cfg: Map[String, Int] := {"http": 80}
+    print("hit:{port(cfg, "http").ok}")
+    miss := port(cfg, "grpc")
+    print("unreachable:{miss.is_err}")

@@ -56,11 +56,11 @@ pub(crate) fn register(ptr: *const (), kind: HandleKind) {
     shard(ptr as usize).insert((ptr as usize, kind));
 }
 
-pub(crate) fn unregister(ptr: *const (), kind: HandleKind) {
+pub(crate) fn unregister(ptr: *const (), kind: HandleKind) -> bool {
     if ptr.is_null() {
-        return;
+        return false;
     }
-    shard(ptr as usize).remove(&(ptr as usize, kind));
+    shard(ptr as usize).remove(&(ptr as usize, kind))
 }
 
 pub(crate) fn is_valid(ptr: *const (), kind: HandleKind) -> bool {

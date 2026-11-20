@@ -1082,10 +1082,12 @@ unsafe fn remove_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) {
 /// The caller passes the key's text by value: `fail` skips the caller's frame,
 /// so a string the caller still owned would never be freed.
 fn strict_miss(key_display: String) -> ! {
-    crate::failure::fail(format!(
+    let message = format!(
         "map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
         key_display
-    ))
+    );
+    drop(key_display);
+    crate::failure::fail(message)
 }
 
 /// Insert an i64 value with a C-string key.
@@ -1881,14 +1883,7 @@ pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> 
     };
     match found {
         Some(v) => v,
-        None => {
-            eprintln!(
-                "pith runtime error: map key not found: {} (use .contains_key first, .get(k) for Optional, or .get_default(k, d) for a fallback)",
-                key
-            );
-            // panic-guard: a missing key under strict indexing is a program bug with no value to return.
-            std::process::exit(1);
-        }
+        None => strict_miss(key.to_string()),
     }
 }
 
@@ -3157,6 +3152,32 @@ mod tests {
             // "present, zero"
             assert_eq!(pith_map_get_ikey_opt(handle, 7), 0);
             pith_map_release(map);
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn strict_int_key_miss_is_caught_by_isolate_call() {
+        extern "C" fn miss(closure: i64) -> i64 {
+            unsafe {
+                let handle = crate::pith_closure_get_env(closure, 0);
+                pith_map_get_ikey_strict(handle, 99)
+            }
+        }
+        unsafe {
+            let map = pith_map_new_int().ptr as i64;
+            pith_map_insert_ikey(map, 1, 42);
+            let closure = crate::pith_closure_new(miss as *const () as usize as i64);
+            crate::pith_closure_set_env(closure, 0, map);
+            let msg_ptr = crate::failure::pith_isolate_call(closure);
+            let msg = std::ffi::CStr::from_ptr(msg_ptr).to_string_lossy().into_owned();
+            crate::pith_cstring_release(msg_ptr);
+            crate::pith_closure_release(closure);
+            pith_map_release_handle(map);
+            assert!(
+                msg.contains("map key not found: 99"),
+                "expected missing int key diagnostic, got: {msg}"
+            );
         }
     }
 }

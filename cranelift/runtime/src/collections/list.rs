@@ -163,10 +163,20 @@ impl ListImpl {
         }
     }
 
+    #[inline]
+    fn read_i64_padded(elem: &[u8]) -> i64 {
+        if elem.len() >= 8 {
+            unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) }
+        } else {
+            let mut buf = [0u8; 8];
+            buf[..elem.len()].copy_from_slice(elem);
+            i64::from_ne_bytes(buf)
+        }
+    }
+
     fn push(&mut self, elem: &[u8]) {
         if self.uses_value_storage() {
-            self.values8
-                .push(unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) });
+            self.values8.push(Self::read_i64_padded(elem));
             self.sync_value_view();
         } else {
             self.elements.push(elem.to_vec());
@@ -234,8 +244,7 @@ impl ListImpl {
         if self.uses_value_storage() {
             *self.values8.get_unchecked(index)
         } else {
-            let elem = self.elements.get_unchecked(index);
-            std::ptr::read_unaligned(elem.as_ptr() as *const i64)
+            Self::read_i64_padded(self.elements.get_unchecked(index))
         }
     }
 
@@ -243,17 +252,14 @@ impl ListImpl {
         if self.uses_value_storage() {
             self.values8.get(index).copied()
         } else {
-            self.elements
-                .get(index)
-                .map(|elem| unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) })
+            self.elements.get(index).map(|elem| Self::read_i64_padded(elem))
         }
     }
 
     fn set(&mut self, index: usize, elem: &[u8]) {
         if self.uses_value_storage() {
             if index < self.values8.len() {
-                self.values8[index] =
-                    unsafe { std::ptr::read_unaligned(elem.as_ptr() as *const i64) };
+                self.values8[index] = Self::read_i64_padded(elem);
             }
         } else if index < self.elements.len() {
             self.elements[index] = elem.to_vec();
@@ -699,10 +705,7 @@ pub unsafe extern "C" fn pith_list_push(list: *mut PithList, elem: *const u8, el
 
     // The list holds one count per heap element, released again when the
     // element leaves the list.
-    retain_element(
-        impl_ref.type_tag,
-        std::ptr::read_unaligned(elem as *const i64),
-    );
+    retain_element(impl_ref.type_tag, ListImpl::read_i64_padded(elem_slice));
 
     impl_ref.push(elem_slice);
 }
@@ -1401,15 +1404,12 @@ pub unsafe extern "C" fn pith_list_set(
         return false;
     }
 
-    // retain the incoming element before dropping the count on what it
-    // displaces, so `l[i] = l[i]` cannot free the value mid-assignment
-    retain_element(
-        impl_ref.type_tag,
-        std::ptr::read_unaligned(elem as *const i64),
-    );
-
     // Copy new element
     let elem_slice = std::slice::from_raw_parts(elem, elem_size as usize);
+
+    // retain the incoming element before dropping the count on what it
+    // displaces, so `l[i] = l[i]` cannot free the value mid-assignment
+    retain_element(impl_ref.type_tag, ListImpl::read_i64_padded(elem_slice));
 
     let displaced = displaced_element(impl_ref, index as usize);
     impl_ref.set(index as usize, elem_slice);
@@ -2196,4 +2196,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn narrow_elements_read_without_overread() {
+        unsafe {
+            let mut b_list = pith_list_new(1, 0);
+            let byte: u8 = 0x5a;
+            pith_list_push(&mut b_list, &byte as *const u8, 1);
+            let b_ref = list_ref(b_list).unwrap();
+            assert_eq!(b_ref.get_value(0), Some(0x5a));
+            assert_eq!(b_ref.get_value_unchecked(0), 0x5a);
+            let updated: u8 = 0xa5;
+            assert!(pith_list_set(b_list, 0, &updated as *const u8, 1));
+            assert_eq!(list_ref(b_list).unwrap().get_value(0), Some(0xa5));
+            pith_list_release(b_list);
+
+            let mut w_list = pith_list_new(4, 0);
+            let word: u32 = 0x1234_5678;
+            let bytes = word.to_ne_bytes();
+            pith_list_push(&mut w_list, bytes.as_ptr(), 4);
+            let expected = i64::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0]);
+            let w_ref = list_ref(w_list).unwrap();
+            assert_eq!(w_ref.get_value(0), Some(expected));
+            assert_eq!(w_ref.get_value_unchecked(0), expected);
+            pith_list_release(w_list);
+        }
+    }
 }

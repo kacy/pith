@@ -68,6 +68,14 @@ export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:detect_stack_use_after_retur
 export TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=0:report_signal_unsafe=0:history_size=4}"
 export PITH_STRUCT_FREELIST=0
 
+if [ -z "${ASAN_SYMBOLIZER_PATH:-}" ]; then
+  sym="$(command -v llvm-symbolizer 2>/dev/null || ls /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1 || true)"
+  if [ -n "$sym" ] && [ -x "$sym" ]; then
+    export ASAN_SYMBOLIZER_PATH="$sym"
+    export TSAN_SYMBOLIZER_PATH="${TSAN_SYMBOLIZER_PATH:-$sym}"
+  fi
+fi
+
 # --- one case, run by the parallel pass below and again by the retry ---
 # a sanitized binary keeps its symbols and runs to tens of megabytes, so each
 # case is built, run on every backend and deleted before the next one starts:
@@ -139,11 +147,17 @@ if [ ! -f "$rt" ]; then
 fi
 
 echo "--- building the runtime with -Zsanitizer=$sanitizer ---"
-flags="-Zsanitizer=$sanitizer -Cforce-frame-pointers=yes"
+# RUSTFLAGS replaces .cargo/config.toml's [build].rustflags rather than
+# appending to it, so carry -C relocation-model=pie explicitly: without it the
+# runtime falls back to dynamic-model TLS and green tasks that migrate across
+# workers read the previous worker's cells (causing races in failure::note_lock
+# and other cross-park paths).
+flags="-C relocation-model=pie -Zsanitizer=$sanitizer -Cforce-frame-pointers=yes"
 build_std=()
 [ "$kind" = tsan ] && build_std=(-Zbuild-std)
 RUSTC_BOOTSTRAP=1 RUSTFLAGS="$flags" cargo build --release -p pith-runtime \
   "${build_std[@]}" --target "$triple" --target-dir "$target_dir" --quiet
+bash tooling/check_tls_barriers.sh --dynamic-only "$runtime_lib"
 cat >"$wrapper" <<EOF
 #!/bin/sh
 # link with the sanitizer runtime that matches the rustc that built the archive

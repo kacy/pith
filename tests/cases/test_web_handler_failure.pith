@@ -30,6 +30,10 @@ fn get_key(req: web.Request) -> http.HttpResponse:
     names: Map[String, String] := {"a": "alpha"}
     return http.text(200, names[req.param("k")])
 
+fn get_int_key(req: web.Request) -> http.HttpResponse:
+    codes: Map[Int, String] := {1: "one"}
+    return http.text(200, codes[req.param("k").len()])
+
 fn get_none(req: web.Request) -> http.HttpResponse:
     missing: Int? := none
     return http.text(200, "{missing.value()}")
@@ -59,7 +63,7 @@ fn get_counted(req: web.Request) -> http.HttpResponse:
     return http.text(200, "counted {n}")
 
 fn run_server():
-    app := web.new().get("/item/:i", get_item).get("/key/:k", get_key).get("/none", get_none).get("/div", get_div).get("/overflow/:n", get_overflow).get("/locked", get_locked).get("/counted", get_counted)
+    app := web.new().get("/item/:i", get_item).get("/key/:k", get_key).get("/intkey/:k", get_int_key).get("/none", get_none).get("/div", get_div).get("/overflow/:n", get_overflow).get("/locked", get_locked).get("/counted", get_counted)
     app.listen("127.0.0.1", PORT) catch 0
 
 fn read_all(fd: Int) -> String:
@@ -125,6 +129,7 @@ fn main():
     print("index: " + get("/item/xxxxxxx").substring(0, 3))
     print("after: " + get("/item/xx"))
     print("key: " + get("/key/zz").substring(0, 3))
+    print("intkey: " + get("/intkey/zz").substring(0, 3))
     print("none: " + get("/none").substring(0, 3))
     print("div: " + get("/div").substring(0, 3))
     print("overflow: " + get("/overflow/x").substring(0, 3))

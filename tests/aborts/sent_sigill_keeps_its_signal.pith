@@ -1,0 +1,10 @@
+# a SIGILL sent to the process, rather than raised by an overflow trap, reaches
+# the overflow handler too. it is not a trap instruction, so the process must
+# still die by SIGILL instead of faulting inside the handler or continuing.
+import std.signal as signal
+
+fn main() -> Int!:
+    print("before")
+    signal.raise_self(4)
+    print("after")
+    return 0

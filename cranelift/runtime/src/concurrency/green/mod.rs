@@ -216,7 +216,8 @@ thread_local! {
 ///
 /// a task id is task-owned: reading it once at the top of a block site and
 /// carrying it across a park is right, and every block site does exactly that.
-#[inline]
+#[cfg_attr(any(pith_asan, pith_tsan), inline(never))]
+#[cfg_attr(not(any(pith_asan, pith_tsan)), inline)]
 pub(crate) fn current_task() -> Option<TaskId> {
     CURRENT_TASK.with(|c| c.get())
 }
@@ -242,7 +243,8 @@ pub(crate) fn task_stack_size() -> usize {
 /// netpoller keys its per-worker pollers by it. a worker index is
 /// thread-owned: it must not be carried across a park, and a caller that
 /// needs it after one calls this again.
-#[inline]
+#[cfg_attr(any(pith_asan, pith_tsan), inline(never))]
+#[cfg_attr(not(any(pith_asan, pith_tsan)), inline)]
 pub(crate) fn current_worker() -> Option<usize> {
     CURRENT_WORKER.with(|c| c.get())
 }
@@ -285,7 +287,8 @@ fn swap_task_identity(
 /// so it stays right across a park, even when the task resumes on another
 /// thread, and the `threadlocal` initializer thunk (pith code, which can
 /// park) may run between a read of this and the map insert that follows.
-#[inline]
+#[cfg_attr(any(pith_asan, pith_tsan), inline(never))]
+#[cfg_attr(not(any(pith_asan, pith_tsan)), inline)]
 pub(crate) fn current_task_tls() -> Option<*mut TlsMap> {
     let ptr = CURRENT_TLS.with(|c| c.get());
     if ptr.is_null() {

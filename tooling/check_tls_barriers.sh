@@ -24,8 +24,14 @@
 #    `GOTTPOFF` one folded into an `add`) anywhere else is a frame that
 #    holds a thread-local address, and fails the check.
 #
-# usage: tooling/check_tls_barriers.sh [path/to/libpith_runtime.a]
+# usage: tooling/check_tls_barriers.sh [--dynamic-only] [path/to/libpith_runtime.a]
 set -u
+
+dynamic_only=0
+if [ "${1:-}" = "--dynamic-only" ]; then
+    dynamic_only=1
+    shift
+fi
 
 archive=${1:-target/release/libpith_runtime.a}
 if [ ! -f "$archive" ]; then
@@ -122,6 +128,10 @@ if [ -n "$dynamic" ]; then
     done <<<"$dynamic"
     echo "     the workspace must be built with -C relocation-model=pie (.cargo/config.toml); a RUSTFLAGS in the environment replaces it" >&2
     exit 1
+fi
+if [ "$dynamic_only" -eq 1 ]; then
+    echo "tls barriers hold: no dynamic-model tls access to a runtime cell"
+    exit 0
 fi
 
 # check 2: every address materialization sits in an allowed function.

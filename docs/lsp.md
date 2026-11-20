@@ -426,11 +426,11 @@ are diagnostic latency only.
   are keyed on the call node at the call's closing token — is refused
   outright (null from both prepareRename and rename) rather than
   renamed partially, because editing the declaration but not such a
-  call site would break the program silently. a binding's declaration
-  identifier is found by scanning its declaring line for the first
-  whole-word occurrence of the name, which picks the wrong occurrence
-  in the pathological case of a declaration line reusing the name
-  earlier as a different symbol.
+  call site would break the program silently. a binding or parameter
+  declaration identifier is found by scanning its declaring line for
+  `name:` / `name :=` (falling back to the first whole-word
+  occurrence), which can still mis-locate in a pathological line that
+  reuses the same `name:` text earlier in a string literal.
 - code actions apply only fixes that name an exact mechanical edit;
   the one shape today is E216's "declare with 'mut'". prose-advice
   fixes produce no action, and a diagnostic the client echoes back
@@ -456,9 +456,6 @@ are diagnostic latency only.
   call node, which sits at the call's first token — the cursor
   resolves such a call from the receiver onward, while the cursor on
   the method name itself resolves the method by name.
-- a local binding's declaration node is its initializer's last token,
-  so definition and the includeDeclaration entry point at the
-  initializer on the binding line, not at the name.
 - method declarations inside `impl` blocks are located by their node
   position (the end of the method body), because the declaration-line
   scan only recognizes top-level declarations.

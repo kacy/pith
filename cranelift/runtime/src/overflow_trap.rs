@@ -58,23 +58,30 @@ unsafe fn is_trap_instruction(pc: *const u8) -> bool {
 }
 
 extern "C" fn on_sigill(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
-    // SAFETY: the kernel hands the handler a valid siginfo for SIGILL.
-    let pc = unsafe { (*info).si_addr() } as *const u8;
-    // SAFETY: see is_trap_instruction.
-    if unsafe { is_trap_instruction(pc) } {
+    // SAFETY: the kernel hands the handler a valid siginfo for SIGILL. a
+    // positive si_code is a fault the kernel raised, the only kind whose
+    // si_addr is an instruction address (external kill(pid, SIGILL) puts
+    // sender pid/uid in that union).
+    let (code, pc) = unsafe { ((*info).si_code, (*info).si_addr() as *const u8) };
+    // SAFETY: see is_trap_instruction; guarded by code > 0 above.
+    if code > 0 && unsafe { is_trap_instruction(pc) } {
         // SAFETY: the runtime's error trap; it does not return.
         unsafe {
             crate::runtime_core::pith_runtime_error(7);
         }
         return;
     }
-    // not ours: restore the default action and return, so the instruction
-    // faults again and the process dies of SIGILL as it would have.
+    // not ours: restore the default action and let the process die of SIGILL
+    // as it would have. a fault re-raises itself when the instruction runs
+    // again; a signal someone sent (code <= 0) does not, so send it again.
     // SAFETY: plain libc calls on locals.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = libc::SIG_DFL;
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(sig, &action, std::ptr::null_mut());
+        if code <= 0 {
+            libc::raise(sig);
+        }
     }
 }

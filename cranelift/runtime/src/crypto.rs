@@ -203,10 +203,9 @@ pub unsafe extern "C" fn pith_crypto_x25519_shared_secret(
 
 #[no_mangle]
 pub extern "C" fn pith_crypto_x25519_close(handle: i64) {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::X25519Key) {
+    if !handle_registry::unregister(handle as *const (), HandleKind::X25519Key) {
         return;
     }
-    handle_registry::unregister(handle as *const (), HandleKind::X25519Key);
     let _ = unsafe { Box::from_raw(handle as *mut PithX25519Key) };
 }
 
@@ -542,5 +541,26 @@ mod tests {
             assert_eq!(pith_crypto_x25519_shared_secret(handle, 0), 0);
         }
         pith_crypto_x25519_close(handle);
+    }
+
+    #[test]
+    fn concurrent_x25519_close_frees_once() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..64 {
+            let handle = pith_crypto_x25519_keygen();
+            assert!(handle > 0);
+            let barrier = Arc::new(Barrier::new(4));
+            let mut threads = Vec::new();
+            for _ in 0..4 {
+                let b = Arc::clone(&barrier);
+                threads.push(std::thread::spawn(move || {
+                    b.wait();
+                    pith_crypto_x25519_close(handle);
+                }));
+            }
+            for t in threads {
+                t.join().unwrap();
+            }
+        }
     }
 }

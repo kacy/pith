@@ -224,22 +224,26 @@ pub fn definition_location(uri: String, line0: Int, character: Int) -> Int:
 
 # the declaration node the cursor refers to: through a use under the
 # cursor when there is one, otherwise a declaration whose scanned
-# declaration line is the cursor's line (the cursor sits on the
-# declaration itself). -1 when neither matches.
+# identifier spans the cursor (so a function name and its parameters
+# on the same header line resolve independently). -1 when neither
+# matches.
 fn decl_node_at(path: String, pos: PithPos, word: String) -> Int:
     use_idx := use_node_at(path, pos, word)
     defs := get_definition_of()
     if use_idx >= 0:
         return defs[use_idx]
+    mut seen: Map[Int, Bool] := {}
     mut best := 0 - 1
     for key in defs.keys():
         decl_idx := defs[key]
-        if decl_idx == best:
+        if seen.contains_key(decl_idx):
             continue
+        seen.insert(decl_idx, true)
         site := decl_site(decl_idx)
-        if site.path == path and site.line == pos.line:
-            if best < 0 or decl_idx < best:
-                best = decl_idx
+        if site.path == path and site.line == pos.line and site.len > 0:
+            if pos.col >= site.col and pos.col < site.col + site.len:
+                if best < 0 or decl_idx < best:
+                    best = decl_idx
     return best
 
 # insertion sort by (path, line, col); reference lists are short.

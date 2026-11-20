@@ -15,12 +15,12 @@
 # documentSymbol uses, falling back to the raw node position when the
 # scan finds nothing.
 
-from checker import get_definition_of, c_get_expr_type
+from checker import get_definition_of, c_get_expr_type, extract_binding_name
 from checker_methods import all_method_keys
 from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
 from driver import file_for_node, dr_read_source
 from types import get_type_name, get_type_info, TID_ERR
-from ast import get_node, node_count
+from ast import Node, get_node, node_count
 from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line
 from lsp_features import analysis_is_checked, find_decl_position, token_length_at, bare_symbol_name, word_starts_at, word_col_in_line
 import std.json as json
@@ -71,10 +71,64 @@ fn location_json(site: Site) -> Int:
 fn is_named_decl(kind: String) -> Bool:
     return kind == "fn_decl" or kind == "struct_decl" or kind == "enum_decl" or kind == "interface_decl"
 
+# the 1-based line where a binding or parameter declares its name.
+# the parser stamps a binding with its initializer's last token and a
+# parameter with its type or default value's last token, so a
+# multi-line initializer or default lands below the declaring line;
+# the first child (type annotation or initializer expression) starts
+# on the declaring line itself.
+fn binding_decl_line(node: Node) -> Int:
+    if node.children.len() > 0:
+        first := get_node(node.children[0])
+        if first.line > 0 and first.line < node.line:
+            return first.line
+    return node.line
+
+# the first 1-based byte column where name occurs in a line as a
+# binding or parameter declaration — a whole identifier followed by
+# optional spaces and ':' (covering `name :=`, `name: Type`, and
+# `name: Type = default`), or 0 when no such site appears.
+fn binding_col_in_line(line_text: String, name: String) -> Int:
+    mut col := 1
+    while col + name.len() - 1 <= line_text.len():
+        if word_starts_at(line_text, col, name):
+            mut after := col - 1 + name.len()
+            while after < line_text.len() and ord(line_text[after]) == 32:
+                after = after + 1
+            if after < line_text.len() and ord(line_text[after]) == 58:
+                return col
+        col = col + 1
+    return 0
+
+# locate the declared identifier of a binding or parameter node on its
+# declaring line, returning line 0 when the name cannot be pinned.
+fn binding_decl_site(path: String, text: String, node: Node, name: String) -> Site:
+    if name == "":
+        return Site(path, 0, 0, 0)
+    line := binding_decl_line(node)
+    line_text := text_line(text, line - 1)
+    mut col := binding_col_in_line(line_text, name)
+    if col > 0:
+        return Site(path, line, col, name.len())
+    if word_starts_at(text_line(text, node.line - 1), node.col, name):
+        return Site(path, node.line, node.col, name.len())
+    col = word_col_in_line(line_text, name)
+    if col > 0:
+        return Site(path, line, col, name.len())
+    if line != node.line:
+        node_line_text := text_line(text, node.line - 1)
+        col = binding_col_in_line(node_line_text, name)
+        if col == 0:
+            col = word_col_in_line(node_line_text, name)
+        if col > 0:
+            return Site(path, node.line, col, name.len())
+    return Site(path, 0, 0, 0)
+
 # where a declaration lands for the editor: named declarations scan
-# their file for the declaring line, everything else (bindings, whose
-# decl node is the initializer) uses the node position itself, spanning
-# the token found there.
+# their file for the declaring line, bindings and parameters scan
+# their declaring line for their identifier, and everything else
+# (loop variables, pattern bindings) uses the node position itself,
+# spanning the token found there.
 fn decl_site(decl_idx: Int) -> Site:
     path := file_for_node(decl_idx)
     node := get_node(decl_idx)
@@ -84,6 +138,10 @@ fn decl_site(decl_idx: Int) -> Site:
         at := find_decl_position(text, node.kind, name)
         if at.line > 0:
             return Site(path, at.line, at.col, name.len())
+    elif node.kind == "binding" or node.kind == "param":
+        site := binding_decl_site(path, text, node, extract_binding_name(node.value))
+        if site.line > 0:
+            return site
     span := token_length_at(text_line(text, node.line - 1), node.col)
     return Site(path, node.line, node.col, span)
 
@@ -290,11 +348,19 @@ fn rename_sites(decl_idx: Int, name: String) -> List[Site]:
         if at.line == 0:
             return none_found
         sites.push(Site(decl_path, at.line, at.col, name.len()))
-    else:
-        col := word_col_in_line(text_line(decl_text, decl.line - 1), name)
-        if col == 0:
+    elif decl.kind == "binding" or decl.kind == "param":
+        site := binding_decl_site(decl_path, decl_text, decl, name)
+        if site.line == 0:
             return none_found
-        sites.push(Site(decl_path, decl.line, col, name.len()))
+        sites.push(site)
+    else:
+        if word_starts_at(text_line(decl_text, decl.line - 1), decl.col, name):
+            sites.push(Site(decl_path, decl.line, decl.col, name.len()))
+        else:
+            col := word_col_in_line(text_line(decl_text, decl.line - 1), name)
+            if col == 0:
+                return none_found
+            sites.push(Site(decl_path, decl.line, col, name.len()))
     return sites
 
 ## the range of the identifier a rename would edit, as a json handle,

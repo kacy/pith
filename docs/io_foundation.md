@@ -195,6 +195,36 @@ ending in any non-ascii character asks for the tail of a multi-byte character,
 which stops the process. a line ending in "é" is ordinary text and now reads
 back as ordinary text.
 
+at the end of input `read_line` returns `""`, the same value as an empty line.
+`read_line_opt` returns `(String?)!` instead: the line, or `none` once the
+input is used up. a last line with no terminator still comes back before the
+`none`. `read_line_opt_ctx` is the deadline-aware form.
+
+```pith
+while true:
+    line := reader.read_line_opt()!
+    if line == none:
+        break
+    handle(line.value())
+```
+
+## closing a child's stdin
+
+`ProcessStdin` implements `Closer`. `close()` closes the write end of the pipe,
+so a child that reads to the end of its input, like `sort` or `wc`, sees end of
+file and can finish. a write after the close fails, and a second close does
+nothing. a `BufferedWriter` over the pipe holds text until it flushes, so
+flush it before closing the stdin:
+
+```pith
+child := process.command("sort").start()!
+writer := io.buffered_writer(child.stdin(), 0)
+writer.write("pear\napple\n")!
+writer.flush()!
+child.stdin().close()
+sorted := child.stdout().read_all()!
+```
+
 ## a byte count is not a character boundary
 
 every transfer here is counted in bytes, because that is what a read and a write

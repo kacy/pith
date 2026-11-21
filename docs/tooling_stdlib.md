@@ -65,6 +65,12 @@ print(cli.flag_value(parsed, "check").to_string())
 print(cli.positional(parsed, 0))
 ```
 
+the first argument that is not an option or an option's value names the
+command. options declared on the app are accepted anywhere on the line, before
+or after the command, so an option every command takes is declared once. after
+the command, an option the command defines with the same name or short name
+takes precedence over the app's.
+
 this layer is for small pith tools that want options, flags, subcommands, and
 help text without each tool reimplementing the same argument loop.
 

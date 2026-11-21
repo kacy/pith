@@ -550,11 +550,25 @@ fn decode_Inventory_at(data: Bytes, depth: Int) -> Inventory!ProtoError:
             r.skip(tag.wire)!
     return m
 
+# one received Geometry.Corners response message. done means the server
+# has finished the stream (message is then an all-default Point).
+pub struct GeometryCornersReply:
+    pub done: Bool
+    pub message: Point
+
 # a typed server-stream of Point messages from Geometry.Corners.
 pub struct GeometryCornersCall:
     pub inner: grpc.ServerStream
 
 impl GeometryCornersCall:
+    # the next response message, decoded; blocks until it arrives. done
+    # marks the end of the stream; a non-OK status or a reset fails.
+    pub fn recv() -> GeometryCornersReply!grpc.GrpcError:
+        msg := self.inner.recv()!
+        decoded := decode_Point(msg.message)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Point failed")
+        return GeometryCornersReply(done: msg.done, message: decoded.ok)
     # gather and decode every response message.
     pub fn collect() -> List[Point]!grpc.GrpcError:
         items: List[Point] := []
@@ -591,6 +605,12 @@ impl GeometryAssembleCall:
     pub fn close():
         self.inner.close()
 
+# one received Geometry.Reflect response message. done means the server
+# has finished the stream (message is then an all-default Point).
+pub struct GeometryReflectReply:
+    pub done: Bool
+    pub message: Point
+
 # a typed bidirectional stream for Geometry.Reflect.
 pub struct GeometryReflectCall:
     pub inner: grpc.BidiStream
@@ -602,19 +622,22 @@ impl GeometryReflectCall:
     # half-close the request stream.
     pub fn close_send() -> Int:
         return self.inner.close_send()
-    # gather and decode every response message.
+    # the next response message, decoded; blocks until it arrives. done
+    # marks the end of the stream; a non-OK status or a reset fails.
+    pub fn recv() -> GeometryReflectReply!grpc.GrpcError:
+        msg := self.inner.recv()!
+        decoded := decode_Point(msg.message)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Point failed")
+        return GeometryReflectReply(done: msg.done, message: decoded.ok)
+    # gather and decode every remaining response message.
     pub fn collect() -> List[Point]!grpc.GrpcError:
         items: List[Point] := []
-        mut done := false
-        while not done:
-            msg := self.inner.recv()!
-            if msg.done:
-                done = true
-            else:
-                decoded := decode_Point(msg.message)
-                if decoded.is_err:
-                    fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: "grpc: decode Point failed")
-                items.push(decoded.ok)
+        while true:
+            got := self.recv()!
+            if got.done:
+                break
+            items.push(got.message)
         return items
     # release the stream and its concurrency slot; call once when done.
     pub fn close():
@@ -659,7 +682,7 @@ impl GeometryClient:
 # a server for the Geometry service. implement one handler per rpc and
 # hand them to serve_Geometry; the router deframes and decodes each
 # request, dispatches by method path, and frames the reply. a streamed
-# request arrives as a List, and a streamed reply is returned as one —
+# request arrives as a List, and a streamed reply is returned as one:
 # buffered end to end, so bounded streams only.
 fn _Geometry_Describe_unimpl(req: Point) -> Shape!grpc.GrpcError:
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "Describe not implemented")

@@ -1,53 +1,69 @@
-# a worker pool: fan work out to a few tasks over a channel, fan the results
-# back in over another. this is the shape the green backend is built for — many
-# small tasks handing values to each other — and it runs the same either way:
+# a worker pool: count the words in a batch of documents with four workers.
+#
+# the documents go out on one channel and the counts come back on another.
+# this is the shape the green backend is built for, many small tasks handing
+# values to each other, and it runs the same on either backend:
 #
 #     pith run examples/worker_pool.pith                # tasks share a worker pool (linux default)
 #     PITH_GREEN=0 pith run examples/worker_pool.pith   # one os thread per task
 #
-# the total is a sum, so it does not depend on which worker takes which job and
-# the output is identical on both backends.
+# which worker takes which document varies from run to run, so main reports
+# sums, which do not depend on the order the counts arrive in.
 
-# pull jobs off the shared channel until it drains, square each one, and push
-# the result back. a closed, empty channel returns none, which ends the loop.
-fn worker(jobs: Channel[Int], results: Channel[Int]):
-    while true:
-        if let job = jobs.recv():
-            results.send(job * job)
-        else:
-            break
+WORKERS := 4
+
+struct Count:
+    words: Int
+    longest: Int
+
+# take documents until the channel is closed and drained, then return how
+# many this worker handled.
+fn worker(docs: Channel[String], counts: Channel[Count]) -> Int:
+    mut handled := 0
+    while let doc = docs.recv():
+        words := doc.split(" ").filter(fn(w: String) => w != "")
+        longest := words.reduce(0, fn(best: Int, w: String) => if w.len() > best: w.len() else: best)
+        counts.send(Count(words: words.len(), longest: longest))
+        handled = handled + 1
+    return handled
+
+fn documents() -> List[String]:
+    mut docs: List[String] := []
+    for i in 0..20:
+        week := i + 1
+        docs.push("report {week} covers week {week} with nothing unusual to note")
+    docs.push("")
+    docs.push("an   extraordinarily   spaced   memo")
+    return docs
 
 fn main() -> Int!:
-    job_count := 20
-    worker_count := 4
+    docs := documents()
+    total_docs := docs.len()
+    queue := Channel[String](total_docs)
+    counts := Channel[Count](total_docs)
 
-    jobs := Channel[Int](job_count)
-    results := Channel[Int](job_count)
+    mut pool: List[Task[Int]] := []
+    for w in 0..WORKERS:
+        pool.push(spawn worker(queue, counts))
 
-    # start the workers; they block on recv until work shows up.
-    mut pool := []
-    mut w := 0
-    while w < worker_count:
-        pool.push(spawn worker(jobs, results))
-        w = w + 1
+    for doc in docs:
+        queue.send(doc)
+    # closing tells the workers there is no more work once the queue drains.
+    queue.close()
 
-    # hand out the work, then close so the workers know to stop.
-    mut n := 1
-    while n <= job_count:
-        jobs.send(n)
-        n = n + 1
-    jobs.close()
+    mut words := 0
+    mut longest := 0
+    for n in 0..total_docs:
+        c := counts.recv().unwrap_or(Count(words: 0, longest: 0))
+        words = words + c.words
+        longest = if c.longest > longest: c.longest else: longest
 
-    # collect one result per job, then wait for the workers to finish.
-    mut total := 0
-    mut got := 0
-    while got < job_count:
-        total = total + results.recv().unwrap_or(0)
-        got = got + 1
+    mut handled := 0
     for t in pool:
-        await t
+        handled = handled + await t
 
-    print("workers: {worker_count}")
-    print("jobs: {job_count}")
-    print("sum of squares: {total}")
+    print("workers:        {WORKERS}")
+    print("documents:      {handled}")
+    print("words:          {words}")
+    print("longest word:   {longest} letters")
     return 0

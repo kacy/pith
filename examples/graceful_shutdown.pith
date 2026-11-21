@@ -9,8 +9,8 @@
 #      when one arrives.
 #   2. a client starts a slow request, so there is real work in flight.
 #   3. the process sends itself a SIGTERM, standing in for the orchestrator.
-#   4. the listener stops accepting immediately — a new connection is refused —
-#      while the request already being served runs to completion.
+#   4. the listener stops accepting immediately, so a new connection is
+#      refused, while the request already being served runs to completion.
 #   5. listen() returns only after the drain finishes, reporting what was left
 #      unfinished. 0 means nothing was lost.
 #
@@ -45,11 +45,11 @@ fn make_app() -> web.App:
 # the client whose request is in flight across the shutdown. it starts before
 # the signal and finishes after it, so its success is the proof that a drain
 # does not sever work already accepted. it returns an Int only so its task can
-# be awaited — a void task has no handle to wait on, and this one has to be
-# waited for: see main.
+# be awaited: a void task has no handle to wait on, and this one has to be
+# waited for (see drive).
 fn slow_request() -> Int:
     body := http.get("127.0.0.1", PORT, "/slow") catch "<failed>"
-    print("  in-flight request finished: " + body)
+    print("  in-flight request finished: {body}")
     return 0
 
 # stand-in for the telemetry exporter. std.obs registers itself with
@@ -65,18 +65,16 @@ fn exporter():
 
 # wait until the server is genuinely accepting. listen() binds on the main
 # thread, so there is no handle to await here, and a fixed delay is only a guess
-# about how quickly a loaded machine gets there — one that a busy ci box loses,
-# taking the in-flight request with it. a probe connection is the honest test:
-# it succeeds the moment the socket is listening and not before.
+# about how quickly a loaded machine gets there, one that a busy ci box loses,
+# taking the in-flight request with it. a probe connection is the reliable
+# test: it succeeds the moment the socket is listening and not before.
 fn await_listening(port: Int) -> Bool:
-    mut waited := 0
-    while waited < 10000:
+    for attempt in 0..500:
         probe := tcp_connect("127.0.0.1", port)
         if probe.is_ok:
             tcp_close(probe.ok)
             return true
         time.delay(20)
-        waited = waited + 20
     return false
 
 # drive the whole scenario from a task while main serves.
@@ -84,9 +82,9 @@ fn drive() -> Int:
     if not await_listening(PORT):
         print("server never started listening")
         return 1
-    print("server listening on 127.0.0.1:" + PORT.to_string())
+    print("server listening on 127.0.0.1:{PORT}")
 
-    print("client: GET /slow (the handler takes " + HANDLER_MS.to_string() + "ms)")
+    print("client: GET /slow (the handler takes {HANDLER_MS}ms)")
     client := spawn slow_request()
     # let the request reach the handler, so it is genuinely mid-flight.
     time.delay(250)
@@ -100,7 +98,7 @@ fn drive() -> Int:
     # above has certainly reported in first.
     time.delay(600)
     refused := http.get("127.0.0.1", PORT, "/slow") catch "<connection refused>"
-    print("client: a NEW request after SIGTERM -> " + refused)
+    print("client: a NEW request after SIGTERM -> {refused}")
 
     # the drain waits for the server's handler, but nothing makes it wait for
     # the client that is reading the reply. wait here, so the in-flight request
@@ -116,7 +114,7 @@ fn main():
     # wiring; without it, SIGTERM keeps its default disposition and kills the
     # process mid-request.
     armed := shutdown.on_signals() catch 0
-    print("armed " + armed.to_string() + " shutdown signals")
+    print("armed {armed} shutdown signals")
 
     # register the stand-in exporter as shutdown work the drain must wait for.
     shutdown.expect_flush()
@@ -124,10 +122,10 @@ fn main():
     driver := spawn drive()
 
     # serves until the drain completes, then returns the work left unfinished.
-    left := make_app().listen("127.0.0.1", PORT) catch 0 - 1
+    left := make_app().listen("127.0.0.1", PORT) catch -1
     # the drain covers the server side; this covers the clients driving it, so
     # the last two lines cannot overtake the transcript above them.
     await driver
-    print("listen returned; unfinished work at the deadline: " + left.to_string())
+    print("listen returned; unfinished work at the deadline: {left}")
     if left == 0:
         print("clean shutdown: no request dropped, no telemetry lost")

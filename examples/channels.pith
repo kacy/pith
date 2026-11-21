@@ -1,32 +1,70 @@
-# channel communication between tasks
+# channels as a pipeline: an access log flows through three stages.
+#
+# a reader task sends raw lines, a parser task turns each line into a status
+# code, and main tallies the codes. each stage closes its output once its input
+# runs dry, so the end of the log travels down the pipeline as a closed channel
+# and every stage stops on its own. the last part uses `select` with a timeout,
+# for a consumer that must not wait forever on a quiet channel.
 
-fn producer(ch: Channel[Int], count: Int):
-    mut i := 0
-    while i < count:
-        ch.send(i)
-        i = i + 1
+fn access_log() -> List[String]:
+    return [
+        "GET /index.html 200",
+        "GET /missing 404",
+        "POST /login 200",
+        "GET /index.html 200",
+        "garbled line",
+        "POST /upload 500",
+        "GET /favicon.ico 404",
+    ]
+
+fn read_lines(lines: List[String], out: Channel[String]) -> Int:
+    for line in lines:
+        out.send(line)
+    out.close()
+    return lines.len()
+
+# returns how many lines it could not parse; the good ones go downstream.
+fn parse_statuses(lines: Channel[String], out: Channel[Int]) -> Int:
+    mut skipped := 0
+    while let line = lines.recv():
+        status := parse_int(line.split(" ").last().unwrap_or("")) catch:
+            skipped = skipped + 1
+            continue
+        out.send(status)
+    out.close()
+    return skipped
+
+fn class_of(status: Int) -> String:
+    if status >= 500:
+        return "server errors"
+    if status >= 400:
+        return "client errors"
+    return "ok"
 
 fn main() -> Int!:
-    ch := Channel[Int]()
+    # unbuffered: each send waits for the parser to take the line.
+    lines := Channel[String]()
+    # buffered: the parser can run a few codes ahead of the tally.
+    statuses := Channel[Int](4)
 
-    # send values from a spawned task
-    t := spawn producer(ch, 5)
+    reader := spawn read_lines(access_log(), lines)
+    parser := spawn parse_statuses(lines, statuses)
 
-    # receive the known number of values
-    mut total := 0
-    mut i := 0
-    while i < 5:
-        val := ch.recv()
-        total = total + val?
-        i = i + 1
+    mut counts: Map[String, Int] := {}
+    while let status = statuses.recv():
+        key := class_of(status)
+        counts[key] = counts.get(key).unwrap_or(0) + 1
 
-    await t
+    print("lines read:    {await reader}")
+    print("lines skipped: {await parser}")
+    for key in ["ok", "client errors", "server errors"]:
+        print("{key + ":":<14} {counts.get(key).unwrap_or(0)}")
 
-    print("received: 5")
-    print("total: {total}")
-    print("len after recv: {ch.len()}")
-
-    # test close
-    ch.close()
-    print("channel closed")
+    # a channel nobody writes to. select waits for whichever arm is ready
+    # first, and the timeout arm bounds the wait.
+    alerts := Channel[String]()
+    outcome := select:
+        alert := alerts.recv() => alert.unwrap_or("closed")
+        timeout 50 => "no alerts in 50ms"
+    print(outcome)
     return 0

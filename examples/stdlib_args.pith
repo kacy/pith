@@ -1,23 +1,31 @@
-from std.args import init, add_flag, add_option, add_positional
-from std.args import parse_list, get_flag, get_option, get_positional
-from std.args import has_errors, get_errors
+# std.args: declare a tool's flags, options and positionals, then parse.
+#
+# std.args keeps one parser per program: declare the arguments with the add_*
+# calls, parse once, and read the values anywhere. for a tool with
+# subcommands, or to parse more than one argument list, std.cli is the
+# stateless alternative (see stdlib_cli.pith).
 
-fn main():
-    init("testapp", "A test application")
-    add_flag("verbose", "v", "Enable verbose output")
-    add_option("output", "o", "Output file", "out.txt")
-    add_option("format", "f", "Output format", "json")
-    add_positional("input", "Input file")
-    parse_list(["--verbose", "-o", "result.csv", "-f", "csv", "data.pith"])
-    if get_flag("verbose"):
-        print("verbose: true")
-    else:
-        print("verbose: false")
-    print("output: {get_option("output")}")
-    print("format: {get_option("format")}")
-    print("input: {get_positional("input")}")
+from std.args import init, add_flag, add_option, add_positional, help_text
+from std.args import parse_list, get_flag, get_option, get_positional, has_errors, get_errors
+
+fn main() -> Int!:
+    init("thumbs", "make thumbnails of the images in a directory")
+    add_flag("dry-run", "n", "list what would be written")
+    add_option("size", "s", "longest edge in pixels", "256")
+    add_option("format", "f", "output format", "webp")
+    add_positional("dir", "directory of images")
+    print(help_text())
+    print("")
+
+    # a real tool calls parse(), which reads the process arguments. a fixed
+    # list keeps this output the same however the example is run.
+    parse_list(["-n", "--size", "128", "photos/"])
     if has_errors():
-        print("errors: yes")
-    else:
-        print("errors: none")
-    print("args tests passed")
+        print(get_errors())
+        return 2
+
+    size := parse_int(get_option("size")) catch:
+        fail "--size must be a number"
+    verb := if get_flag("dry-run"): "would write" else: "writing"
+    print("{verb} {size}px {get_option("format")} thumbnails for {get_positional("dir")}")
+    return 0

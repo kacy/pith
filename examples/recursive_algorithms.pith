@@ -1,104 +1,64 @@
-# recursive algorithms — fibonacci, sorting, tree traversal
-# exercises: recursion, lists, string building, nested function calls
+# recursion: functions that call themselves on a smaller piece of the input.
+#
+# three classics and a tree walk. gcd and fast power shrink a number each
+# call, quicksort splits a list around a pivot and sorts the halves, and a
+# directory walk adds up file sizes through any depth of folders. each has a
+# base case that stops the recursion; without one it would run until the
+# stack ran out.
 
-fn fib(n: Int) -> Int:
-    if n <= 1:
-        return n
-    return fib(n - 1) + fib(n - 2)
-
-fn factorial(n: Int) -> Int:
-    if n <= 1:
-        return 1
-    return n * factorial(n - 1)
+import std.fmt as fmt
 
 fn gcd(a: Int, b: Int) -> Int:
     if b == 0:
         return a
     return gcd(b, a % b)
 
-fn power(base: Int, exp: Int) -> Int:
-    if exp == 0:
+# squaring halves the exponent, so 2^62 takes about 6 multiplications
+fn power(base: Int, exponent: Int) -> Int:
+    if exponent == 0:
         return 1
-    if exp % 2 == 0:
-        half := power(base, exp / 2)
+    half := power(base, exponent / 2)
+    if exponent % 2 == 0:
         return half * half
-    return base * power(base, exp - 1)
+    return half * half * base
 
-# quicksort
-fn quicksort(arr: List[Int]) -> List[Int]:
-    if arr.len() <= 1:
-        return arr
-    pivot := arr[0]
-    mut less: List[Int] := []
-    mut equal: List[Int] := []
-    mut greater: List[Int] := []
-    mut i := 0
-    while i < arr.len():
-        if arr[i] < pivot:
-            less.push(arr[i])
-        elif arr[i] == pivot:
-            equal.push(arr[i])
-        else:
-            greater.push(arr[i])
-        i = i + 1
-    sorted_less := quicksort(less)
-    sorted_greater := quicksort(greater)
-    # concatenate
-    mut result: List[Int] := []
-    i = 0
-    while i < sorted_less.len():
-        result.push(sorted_less[i])
-        i = i + 1
-    i = 0
-    while i < equal.len():
-        result.push(equal[i])
-        i = i + 1
-    i = 0
-    while i < sorted_greater.len():
-        result.push(sorted_greater[i])
-        i = i + 1
-    return result
+fn quicksort(items: List[Int]) -> List[Int]:
+    if items.len() <= 1:
+        return items
+    pivot := items[0]
+    mut sorted := quicksort(items.filter(fn(item: Int) => item < pivot))
+    for item in items.filter(fn(item: Int) => item == pivot):
+        sorted.push(item)
+    for item in quicksort(items.filter(fn(item: Int) => item > pivot)):
+        sorted.push(item)
+    return sorted
 
-fn list_to_string(arr: List[Int]) -> String:
-    mut parts: List[String] := []
-    mut i := 0
-    while i < arr.len():
-        parts.push(arr[i].to_string())
-        i = i + 1
-    return "[{parts.join(", ")}]"
+# the tree is a map from each folder to the names inside it; a name with no
+# entry in the map is a file. a file's size is its own, and a folder's is the
+# sum of everything below it, however deep.
+fn total_bytes(name: String, children: Map[String, List[String]], sizes: Map[String, Int]) -> Int:
+    if let inside = children.get(name):
+        mut total := 0
+        for child in inside:
+            total += total_bytes(child, children, sizes)
+        return total
+    return sizes[name]
+
+fn print_tree(name: String, depth: Int, children: Map[String, List[String]], sizes: Map[String, Int]):
+    print("{"  ".repeat(depth)}{name} ({total_bytes(name, children, sizes)} bytes)")
+    for child in children.get(name).unwrap_or([]):
+        print_tree(child, depth + 1, children, sizes)
 
 fn main():
-    # fibonacci
-    mut fibs: List[String] := []
-    mut i := 0
-    while i < 10:
-        fibs.push(fib(i).to_string())
-        i = i + 1
-    print("fib(0..9): {fibs.join(", ")}")
+    print("gcd(1071, 462) = {gcd(1071, 462)}")
+    print("3^13 = {power(3, 13)}, 2^62 = {power(2, 62)}")
+    print("sorted: {fmt.ints(quicksort([38, 27, 43, 3, 9, 82, 10, 27]))}")
 
-    # factorial
-    print("5! = {factorial(5)}")
-    print("10! = {factorial(10)}")
-
-    # gcd
-    print("gcd(48, 18) = {gcd(48, 18)}")
-    print("gcd(100, 75) = {gcd(100, 75)}")
-
-    # power
-    print("2^10 = {power(2, 10)}")
-    print("3^5 = {power(3, 5)}")
-
-    # quicksort
-    unsorted := [38, 27, 43, 3, 9, 82, 10]
-    sorted := quicksort(unsorted)
-    print("sorted: {list_to_string(sorted)}")
-
-    # sort already sorted
-    already := [1, 2, 3, 4, 5]
-    print("already: {list_to_string(quicksort(already))}")
-
-    # sort reverse
-    rev := [5, 4, 3, 2, 1]
-    print("reverse: {list_to_string(quicksort(rev))}")
-
-    print("algorithms work")
+    children := {
+        "project/": ["README.md", "src/", "tests/"],
+        "src/": ["main.pith", "parser.pith", "std/"],
+        "std/": ["io.pith"],
+        "tests/": ["parser_test.pith"],
+    }
+    sizes := {"README.md": 2400, "main.pith": 5100, "parser.pith": 12800, "io.pith": 3300, "parser_test.pith": 4100}
+    print_tree("project/", 0, children, sizes)

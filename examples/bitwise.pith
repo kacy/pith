@@ -1,44 +1,60 @@
-# bitwise operations and ord/chr round-tripping
-# demonstrates: ord/chr conversion, bit manipulation, byte extraction
+# bitwise operations: masks, flags and packed fields.
+#
+# works with three things that are usually stored as bits: unix file
+# permissions, colors packed into one integer, and the ascii case bit. the
+# operations are the builtins bit_and, bit_or, bit_xor, bit_not, bit_shl and
+# bit_shr; std.fmt prints a number in octal, hex or binary.
+
+import std.fmt as fmt
+
+READ := 4
+WRITE := 2
+EXECUTE := 1
+
+# "rwxr-x---" to its numeric mode, three bits per group of three letters
+fn parse_mode(text: String) -> Int:
+    mut mode := 0
+    for character in text:
+        mode = bit_shl(mode, 1)
+        if character != "-":
+            mode = bit_or(mode, 1)
+    return mode
+
+# the permission bits for one class: 0 for owner, 1 for group, 2 for others
+fn class_bits(mode: Int, class_index: Int) -> Int:
+    return bit_and(bit_shr(mode, 3 * (2 - class_index)), 7)
+
+fn can(mode: Int, class_index: Int, permission: Int) -> Bool:
+    return bit_and(class_bits(mode, class_index), permission) != 0
+
+fn pack_rgb(red: Int, green: Int, blue: Int) -> Int:
+    return bit_or(bit_or(bit_shl(red, 16), bit_shl(green, 8)), blue)
+
+fn channel(color: Int, shift: Int) -> Int:
+    return bit_and(bit_shr(color, shift), 255)
+
+# ascii upper and lower case letters differ only in bit 5 (value 32)
+fn swap_case(text: String) -> String:
+    mut swapped := ""
+    for character in text:
+        if (character >= "a" and character <= "z") or (character >= "A" and character <= "Z"):
+            swapped = swapped + chr(bit_xor(ord(character), 32))
+        else:
+            swapped = swapped + character
+    return swapped
 
 fn main():
-    # ord and chr are inverses
-    print("ord A: {ord("A")}")
-    print("ord a: {ord("a")}")
-    print("ord 0: {ord("0")}")
-    print("chr 65: {chr(65)}")
-    print("roundtrip: {chr(ord("Z"))}")
+    mode := parse_mode("rwxr-x---")
+    print("rwxr-x--- is mode {fmt.oct(mode)} ({fmt.bin(mode)})")
+    print("group can read: {can(mode, 1, READ)}, others can read: {can(mode, 2, READ)}")
 
-    # bitwise AND
-    print("and ff 0f: {bit_and(0xFF, 0x0F)}")
-    print("and 12 10: {bit_and(12, 10)}")
+    # set a bit with or (others get read), clear bits with and-not (owner
+    # loses write and execute)
+    shared := bit_or(mode, READ)
+    locked := bit_and(shared, bit_not(bit_shl(WRITE + EXECUTE, 6)))
+    print("after sharing: {fmt.oct(shared)}, after locking the owner: {fmt.oct(locked)}")
 
-    # bitwise OR
-    print("or f0 0f: {bit_or(0xF0, 0x0F)}")
-    print("or 12 10: {bit_or(12, 10)}")
+    teal := pack_rgb(0, 128, 128)
+    print("teal is 0x{fmt.hex(teal)}: red {channel(teal, 16)}, green {channel(teal, 8)}, blue {channel(teal, 0)}")
 
-    # bitwise XOR
-    print("xor ff 0f: {bit_xor(0xFF, 0x0F)}")
-    print("xor 5 3: {bit_xor(5, 3)}")
-
-    # bitwise NOT (masked to 8 bits for readability)
-    print("not 0 masked: {bit_and(bit_not(0), 0xFF)}")
-
-    # shift left / right
-    print("shl 1 4: {bit_shl(1, 4)}")
-    print("shr 256 4: {bit_shr(256, 4)}")
-
-    # practical: extract bytes from a 16-bit value
-    original_value := 0xDEAD
-    low_byte := bit_and(original_value, 0xFF)
-    high_byte := bit_and(bit_shr(original_value, 8), 0xFF)
-    print("low byte: {low_byte}")
-    print("high byte: {high_byte}")
-
-    # reassemble the original value from its bytes
-    reassembled_value := bit_or(bit_shl(high_byte, 8), low_byte)
-    print("reassembled: {reassembled_value == 0xDEAD}")
-
-    # print_err goes to stderr (not captured in stdout diff)
-    print_err("this goes to stderr")
-    print("bitwise ok")
+    print(swap_case("Hello, Pith 2"))

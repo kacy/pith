@@ -1,23 +1,61 @@
-# a small left-to-right calculator over space-separated expressions
+# a small calculator: tokens to an enum, evaluation that can fail.
+#
+# evaluates space-separated expressions left to right, with no precedence:
+# "2 + 3 * 4" is 20. each operator becomes an Op, so evaluation is a match
+# the checker keeps complete, and any bad input (a word that is not a number,
+# an unknown operator, a division by zero) is a failed result with a message
+# rather than a crash.
 
-fn calc(input: String) -> Int!:
-    parts := input.split(" ")
-    mut acc := parse_int(parts[0])!
-    mut i := 1
-    while i + 1 < parts.len():
-        op := parts[i]
-        n := parse_int(parts[i + 1])!
-        if op == "+":
-            acc = acc + n
-        elif op == "-":
-            acc = acc - n
+enum Op:
+    Add
+    Subtract
+    Multiply
+    Divide
+
+impl Op:
+    fn symbol() -> String:
+        return match self:
+            Op.Add => "+"
+            Op.Subtract => "-"
+            Op.Multiply => "*"
+            Op.Divide => "/"
+
+fn parse_op(token: String) -> Op!:
+    for op in [Op.Add, Op.Subtract, Op.Multiply, Op.Divide]:
+        if op.symbol() == token:
+            return op
+    fail "unknown operator {token}"
+
+fn parse_number(token: String) -> Int!:
+    return parse_int(token) catch:
+        fail "not a number: {token}"
+
+fn apply(op: Op, left: Int, right: Int) -> Int!:
+    if op == Op.Divide and right == 0:
+        fail "division by zero"
+    return match op:
+        Op.Add => left + right
+        Op.Subtract => left - right
+        Op.Multiply => left * right
+        Op.Divide => left / right
+
+fn evaluate(expression: String) -> Int!:
+    tokens := expression.split(" ")
+    if tokens.len() % 2 == 0:
+        fail "expected a number after the last operator"
+    mut result := parse_number(tokens[0])!
+    # tokens come in operator, number pairs after the first number
+    mut position := 1
+    while position < tokens.len():
+        op := parse_op(tokens[position])!
+        result = apply(op, result, parse_number(tokens[position + 1])!)!
+        position += 2
+    return result
+
+fn main():
+    for expression in ["3 + 4", "2 + 3 * 4", "100 / 7 - 4", "8 / 0", "6 ^ 2", "5 + x", "1 +"]:
+        outcome := evaluate(expression)
+        if outcome.is_err:
+            print("{expression:<12} error: {outcome.err}")
         else:
-            fail "unknown operator: {op}"
-        i = i + 2
-    return acc
-
-fn main() -> Int!:
-    for expr in ["3 + 4", "10 - 3", "100 + 200 + 300", "50 - 20 + 5", "0 + 0"]:
-        result := calc(expr)!
-        print("{expr} = {result}")
-    return 0
+            print("{expression:<12} = {outcome.ok}")

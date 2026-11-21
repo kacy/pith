@@ -4513,7 +4513,7 @@ fn ir_collect_from_imported_enums(root_idx: Int):
         node := get_node(item_idx)
         if node.kind != "from_import":
             continue
-        parts := node.value.split(" ")
+        parts := ir_expand_wildcard_import(node.value, root_idx).split(" ")
         if parts.len() < 2:
             continue
         module_root := ir_module_root_for_path(parts[0])
@@ -13741,7 +13741,7 @@ fn ir_use_module_names(module_path: String) -> IrEnumTables:
     ir_import_renames = {}
     ir_module_aliases = {}
     for item_idx in ir_root_items(root):
-        ir_collect_import_item(get_node(item_idx))
+        ir_collect_import_item(get_node(item_idx), root)
     for item_idx in ir_root_items(root):
         node := get_node(item_idx)
         if node.kind != "enum_decl" and node.kind != "enum":
@@ -14274,11 +14274,45 @@ fn ir_type_alias_target(node: Node) -> String:
             return tn.value
     return ""
 
-fn ir_collect_import_item(node: Node):
+fn ir_collect_import_item(node: Node, root_idx: Int):
     if node.kind == "import":
         ir_register_import_alias(node.value)
     elif node.kind == "from_import":
-        ir_collect_from_import_renames(node.value)
+        ir_collect_from_import_renames(ir_expand_wildcard_import(node.value, root_idx))
+
+# the name a top-level declaration binds, or "" for one that binds none.
+fn ir_top_level_decl_name(node: Node) -> String:
+    if ir_is_fn_decl_kind(node.kind) or node.kind == "struct_decl" or node.kind == "struct" or node.kind == "enum_decl" or node.kind == "enum":
+        return ir_base_decl_name(node.value)
+    if ir_is_binding_kind(node.kind):
+        return ir_binding_name(node)
+    return ""
+
+# a from-import's value with a `*` spelled out as the names it brings in:
+# every public declaration of the module that `root_idx` does not declare
+# itself, since a module's own declaration shadows a wildcard import, as it
+# does in the checker. any other value comes back unchanged.
+fn ir_expand_wildcard_import(value: String, root_idx: Int) -> String:
+    parts := value.split(" ")
+    if parts.len() != 2 or parts[1] != "*":
+        return value
+    module_root := ir_module_root_for_path(parts[0])
+    if module_root < 0:
+        return value
+    mut local: Map[String, Bool] := {}
+    for item_idx in ir_root_items(root_idx):
+        name := ir_top_level_decl_name(get_node(item_idx))
+        if name.len() > 0:
+            local.insert(name, true)
+    mut names: List[String] := [parts[0]]
+    for child in get_node(module_root).children:
+        pub_node := get_node(child)
+        if pub_node.kind != "pub" or pub_node.children.len() == 0:
+            continue
+        name := ir_top_level_decl_name(get_node(pub_node.children[0]))
+        if name.len() > 0 and not local.contains_key(name):
+            names.push(name)
+    return names.join(" ")
 
 fn ir_register_alias_structs(root_idx: Int):
     for item_idx in ir_root_items(root_idx):
@@ -15197,7 +15231,7 @@ fn ir_collect_root_phase_one_metadata(root_idx: Int):
 
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
-        ir_collect_import_item(node)
+        ir_collect_import_item(node, root_idx)
         if node.kind == "type_alias":
             target := ir_type_alias_target(node)
             if target.len() > 0:

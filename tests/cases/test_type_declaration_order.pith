@@ -1,0 +1,38 @@
+# declaration order does not matter for types: a struct field may name a
+# struct or an enum declared further down (#1412), and an enum payload may
+# name the enum itself through a list.
+
+struct Head:
+    expect: Expectation
+    tail: Tail
+
+enum Expectation:
+    Nothing
+    Continue
+
+struct Tail:
+    size: Int
+
+enum Entry:
+    File(Int)
+    Folder(List[Entry])
+
+fn total(entry: Entry) -> Int:
+    match entry:
+        Entry.File(bytes) => bytes
+        Entry.Folder(children) => children.reduce(0, fn(sum: Int, child: Entry) => sum + total(child))
+
+fn depth(entry: Entry) -> Int:
+    match entry:
+        Entry.File(_) => 0
+        Entry.Folder(children) => 1 + children.reduce(0, fn(deepest: Int, child: Entry) => max(deepest, depth(child)))
+
+fn main():
+    head := Head(expect: Expectation.Continue, tail: Tail(size: 3))
+    print("{head.expect == Expectation.Continue} {head.tail.size}")
+    tree := Entry.Folder([Entry.File(2), Entry.Folder([Entry.File(3), Entry.File(4)]), Entry.Folder([])])
+    print("{total(tree)} bytes, depth {depth(tree)}")
+    mut sum := 0
+    for i in 0..500:
+        sum += total(Entry.Folder([Entry.File(i), Entry.Folder([Entry.File(1)])]))
+    print("{sum}")

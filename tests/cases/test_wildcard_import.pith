@@ -1,0 +1,18 @@
+# `from m import *` brings in every public name of m, for a std module and a
+# local one alike. names that are not also builtins used to fail at the
+# backend as calls to unknown functions.
+from std.math import *
+from std.fmt import *
+from import_shapes import *
+
+# a module's own declaration shadows a wildcard-imported one
+fn describe(shape: Shape) -> String:
+    return "local describe: {area(shape)}"
+
+fn main():
+    print("{log10(1000.0)} {PI():.4} {hypot(3.0, 4.0)} {degrees(PI()):.1}")
+    print(hex(255))
+    print(ints([1, 2, 3]))
+    square := Square(side: 3)
+    print("{area(Shape.Box(square))} {UNIT}")
+    print(describe(Shape.Dot))

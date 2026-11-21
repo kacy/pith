@@ -1,0 +1,19 @@
+# a struct with a fitting next() but no `impl Iterator for` block. the for
+# loop accepts it, but a function bounded on Iterator does not: interface
+# conformance is declared, never inferred from method names.
+from std.iter import to_list
+
+struct Counter:
+    cur: Int
+    hi: Int
+
+impl Counter:
+    fn next() -> Int?:
+        if self.cur >= self.hi:
+            return none
+        v := self.cur
+        self.cur += 1
+        return v
+
+fn main():
+    print("{to_list(Counter(cur: 0, hi: 3))}")

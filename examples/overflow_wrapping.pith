@@ -1,0 +1,101 @@
+# integer overflow: the trap, and the wrapping methods that opt out
+#
+# `+`, `-` and `*` on an Int stop the program when the result does not fit in
+# 64 bits:
+#
+#     big := 9223372036854775807
+#     print("{big + 1}")    # pith runtime error: integer overflow
+#
+# UInt and UInt64 stop the same way when a result leaves 0 to 2^64 - 1, so
+# `UInt(3) - UInt(5)` is an error, not a huge number. a silent wrap would turn
+# a balance or a length into garbage that flows on; stopping points at the line.
+#
+# some code wants the wrapped result: hashes, checksums, random number
+# generators, sequence numbers. they ask for it by name with wrapping_add,
+# wrapping_sub and wrapping_mul. this example shows each of those, plus the
+# two ways to avoid the trap when the number is real: check first, or use
+# std.bigint. nothing here overflows with plain arithmetic, so it runs to the
+# end. (inside an http or grpc handler the trap fails only that request; see
+# web_failure_isolation.pith.)
+
+import std.bigint as bigint
+
+# fnv-1a, 64 bits. the multiply is meant to wrap: the hash is the low 64 bits
+# of the product, so `h * FNV_PRIME` would stop on the second byte.
+# the offset basis 14695981039346656037 is above the largest Int, so it is
+# written as the Int with the same 64 bits, and main prints the result as a
+# UInt to match the published test vectors.
+FNV_OFFSET := -3750763034362895579
+FNV_PRIME := 1099511628211
+
+fn fnv1a64(text: String) -> Int:
+    mut h := FNV_OFFSET
+    for c in text:
+        h = bit_xor(h, ord(c))
+        h = h.wrapping_mul(FNV_PRIME)
+    return h
+
+# a linear congruential generator (knuth's mmix constants). the state is the
+# low 64 bits of `state * a + c`, so both steps wrap.
+struct Lcg:
+    state: Int
+
+fn next_roll(mut g: Lcg) -> Int:
+    g.state = g.state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
+    # the high bits of an lcg are the good ones. shift them down and keep a
+    # positive value in 1..6.
+    return bit_and(bit_shr(g.state, 33), 2147483647) % 6 + 1
+
+# a 32-bit sequence number that wraps back to 0, as tcp's does. a UInt32 is a
+# narrow type, so plain `+` wraps too; wrapping_add says it on purpose.
+fn next_seq(seq: UInt32) -> UInt32:
+    return seq.wrapping_add(UInt32(1))
+
+# the distance from `older` to `newer` across a wrap: wrapping_sub on UInt
+# gives the right answer where plain `-` would stop when newer < older.
+fn seq_gap(older: UInt, newer: UInt) -> UInt:
+    return newer.wrapping_sub(older)
+
+# when the sum is a real quantity, wrapping would hide the bug. check the
+# bound first and report it instead.
+MAX_INT := 9223372036854775807
+
+fn add_checked(a: Int, b: Int) -> Int?:
+    if b > 0 and a > MAX_INT - b:
+        return none
+    if b < 0 and a < (0 - MAX_INT - 1) - b:
+        return none
+    return a + b
+
+fn main():
+    print("fnv1a64(\"\") = {UInt(fnv1a64(""))}")
+    print("fnv1a64(\"a\") = {UInt(fnv1a64("a"))}")
+    print("fnv1a64(\"pith\") = {UInt(fnv1a64("pith"))}")
+
+    mut g := Lcg(state: 42)
+    mut rolls: List[Int] := []
+    for i in 0..8:
+        rolls.push(next_roll(g))
+    print("dice: {rolls}")
+
+    mut seq := UInt32(4294967294)
+    mut seen: List[UInt32] := []
+    for i in 0..4:
+        seen.push(seq)
+        seq = next_seq(seq)
+    print("sequence: {seen}")
+
+    near_max := UInt(0).wrapping_sub(UInt(3))
+    print("gap across the wrap: {seq_gap(near_max, UInt(2))}")
+
+    total := add_checked(MAX_INT - 10, 5)
+    print("checked sum: {total.unwrap_or(-1)}")
+    too_big := add_checked(MAX_INT - 10, 50)
+    print("checked sum past the max is none: {too_big == none}")
+
+    # a number that has to keep growing does not belong in an Int. 25! needs
+    # 84 bits; with Int the loop would stop at 21!.
+    mut fact := bigint.one()
+    for k in 1..26:
+        fact = bigint.mul(fact, bigint.from_int(k))
+    print("25! = {bigint.to_string(fact)}")

@@ -359,7 +359,7 @@ pub fn rescale(value: Decimal, target: Int, mode: Rounding) -> Decimal!:
     dropped := value.scale - target
     parts := bigint.divmod_pow10(value.unscaled, dropped)!
     mut quotient := parts.quotient
-    if rounds_away(mode, sign_of(value), quotient, parts.remainder, bigint.ten_pow(dropped)!):
+    if mode.rounds_away(sign_of(value), quotient, parts.remainder, bigint.ten_pow(dropped)!):
         quotient = step_away(quotient, sign_of(value))
     return Decimal(unscaled: quotient, scale: target)
 
@@ -413,7 +413,7 @@ pub fn div(left: Decimal, right: Decimal, target: Int, mode: Rounding) -> Decima
     parts := bigint.divmod(numerator, denominator)!
     result_sign := sign_of(left) * sign_of(right)
     mut quotient := parts.quotient
-    if rounds_away(mode, result_sign, quotient, parts.remainder, denominator):
+    if mode.rounds_away(result_sign, quotient, parts.remainder, denominator):
         quotient = step_away(quotient, result_sign)
     return Decimal(unscaled: quotient, scale: target)
 
@@ -594,22 +594,23 @@ fn check_scale(scale: Int) -> Bool!:
 fn is_digit_code(code: Int) -> Bool:
     return code >= 48 and code <= 57
 
-# does the dropped remainder push the magnitude one step further from zero?
-# `sign` is the sign of the whole result, which is what floor and ceiling turn
-# on; `quotient` is the kept magnitude, which is what half-even turns on.
-fn rounds_away(mode: Rounding, sign: Int, quotient: bigint.BigInt, remainder: bigint.BigInt, divisor: bigint.BigInt) -> Bool:
-    if bigint.is_zero(remainder):
-        return false
-    doubled := bigint.mul(bigint.abs(remainder), bigint.from_int(2))
-    order := bigint.compare(doubled, bigint.abs(divisor))
-    return match mode:
-        Rounding.Down => false
-        Rounding.Up => true
-        Rounding.Floor => sign < 0
-        Rounding.Ceiling => sign > 0
-        Rounding.HalfUp => order >= 0
-        Rounding.HalfDown => order > 0
-        Rounding.HalfEven => order > 0 or (order == 0 and not bigint.is_even(quotient))
+impl Rounding:
+    # does the dropped remainder push the magnitude one step further from zero?
+    # `sign` is the sign of the whole result, which is what floor and ceiling
+    # turn on; `quotient` is the kept magnitude, which is what half-even turns on.
+    fn rounds_away(sign: Int, quotient: bigint.BigInt, remainder: bigint.BigInt, divisor: bigint.BigInt) -> Bool:
+        if bigint.is_zero(remainder):
+            return false
+        doubled := bigint.mul(bigint.abs(remainder), bigint.from_int(2))
+        order := bigint.compare(doubled, bigint.abs(divisor))
+        return match self:
+            Rounding.Down => false
+            Rounding.Up => true
+            Rounding.Floor => sign < 0
+            Rounding.Ceiling => sign > 0
+            Rounding.HalfUp => order >= 0
+            Rounding.HalfDown => order > 0
+            Rounding.HalfEven => order > 0 or (order == 0 and not bigint.is_even(quotient))
 
 # move the kept magnitude one step away from zero, in the direction the whole
 # result sits — a quotient of zero still rounds to -1 when the value was

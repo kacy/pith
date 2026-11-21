@@ -236,11 +236,12 @@ pub fn blocking_deadline_exceeded() -> BlockingError:
 pub fn blocking_failed(message: String) -> BlockingError:
     return BlockingError(3, message)
 
-# convert a wait error into the blocking error shape used by io helpers.
-pub fn blocking_from_wait(err: WaitError) -> BlockingError:
-    if err == WaitError.DeadlineExceeded:
-        return blocking_deadline_exceeded()
-    return blocking_cancelled()
+impl WaitError:
+    # convert a wait error into the blocking error shape used by io helpers.
+    fn to_blocking() -> BlockingError:
+        if self == WaitError.DeadlineExceeded:
+            return blocking_deadline_exceeded()
+        return blocking_cancelled()
 
 impl Context:
     fn done() -> Channel[Bool]:
@@ -467,7 +468,7 @@ test "a deadline that has passed is observable without waiting for a task":
     # readings have to agree, because every caller checks is_cancelled()
     # and then asks error_code() why
     assert_eq(ctx.error_code(), 2)
-    assert(blocking_from_wait(context_wait_error(ctx)).is_deadline_exceeded())
+    assert(context_wait_error(ctx).to_blocking().is_deadline_exceeded())
 
 test "a deadline still ahead of us leaves the context live":
     ctx := with_deadline(background(), time.now() + 60000).0
@@ -495,5 +496,5 @@ test "concurrent blocking errors classify failures":
     assert_eq(deadline.message, "deadline exceeded")
     assert(failed.is_failed())
     assert_eq(failed.message, "boom")
-    assert(blocking_from_wait(WaitError.Cancelled).is_cancelled())
-    assert(blocking_from_wait(WaitError.DeadlineExceeded).is_deadline_exceeded())
+    assert(WaitError.Cancelled.to_blocking().is_cancelled())
+    assert(WaitError.DeadlineExceeded.to_blocking().is_deadline_exceeded())

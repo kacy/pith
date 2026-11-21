@@ -935,6 +935,11 @@ impl Conn:
 fn trailer(status: Int) -> List[hpack.HeaderField]:
     return [hpack.header_field("grpc-status", "{status}")]
 
+test "dial_pool refuses an empty pool before dialing":
+    # an empty pool would divide by zero picking a channel on the first rpc
+    assert(dial_pool("localhost", 1, 0).is_err)
+    assert(dial_pool("localhost", 1, -1).is_err)
+
 test "with_metadata appends extra pairs after the base grpc headers":
     extra := ["x-api-key", "secret", "x-tenant", "acme"]
     fields := with_metadata(grpc_headers(), extra)
@@ -1239,6 +1244,8 @@ impl PoolConn:
 # over tls, alpn "h2"). issue concurrent rpcs across it to use multiple cores;
 # n above the core count gives no further gain. close() shuts them all down.
 pub fn dial_pool(host: String, port: Int, n: Int) -> PoolConn!:
+    if n < 1:
+        fail "grpc pool needs at least one channel, got {n}"
     mut conns: List[Conn] := []
     mut i := 0
     while i < n:
@@ -1249,6 +1256,8 @@ pub fn dial_pool(host: String, port: Int, n: Int) -> PoolConn!:
 # like dial_pool but dialing each channel with the caller's tls `config` (which
 # must offer alpn "h2") — e.g. one trusting a private ca.
 pub fn dial_pool_with_config(host: String, port: Int, n: Int, config: tls.Config) -> PoolConn!:
+    if n < 1:
+        fail "grpc pool needs at least one channel, got {n}"
     mut conns: List[Conn] := []
     mut i := 0
     while i < n:

@@ -1,0 +1,77 @@
+# interface values: each conversion takes a count on the value it boxes (a
+# retain for a borrow, the transfer for a fresh value), and the box releases
+# it through its destructor. every conversion site and a dispatched call
+# returning a fresh string run once per round, so a missed release in any of
+# them grows the heap.
+import leakprobe as probe
+
+interface Shape:
+    fn area() -> Int
+    fn name() -> String
+    fn describe() -> String:
+        return "{self.name()}:{self.area()}"
+
+struct Sq:
+    s: Int
+
+struct Label:
+    text: String
+
+impl Shape for Sq:
+    fn area() -> Int:
+        return self.s * self.s
+    fn name() -> String:
+        return "sq"
+
+impl Shape for Label:
+    fn area() -> Int:
+        return self.text.len()
+    fn name() -> String:
+        return "label " + self.text
+
+struct Holder:
+    one: Shape
+    maybe: Shape?
+
+fn area_of(s: Shape) -> Int:
+    return s.area()
+
+fn make(i: Int) -> Shape:
+    if i % 2 == 0:
+        return Sq(s: i % 7)
+    return Label(text: "n" + i.to_string())
+
+fn maybe_make(i: Int) -> Shape!:
+    if i % 3 == 0:
+        fail "no " + i.to_string()
+    return make(i)
+
+fn round(i: Int) -> Int:
+    label := Label(text: "x" + i.to_string())
+    mut total := area_of(label) + area_of(Sq(s: 2))
+    held: Shape := label
+    total = total + held.describe().len()
+    xs: List[Shape] := [Sq(s: 1), label, make(i)]
+    for s in xs:
+        total = total + s.name().len()
+    m: Map[String, Shape] := {"a": label, "b": Sq(s: 3)}
+    total = total + m["a"].area()
+    h := Holder(one: label, maybe: make(i + 1))
+    total = total + h.one.area() + h.maybe.value().area()
+    total = total + (maybe_make(i) catch Sq(s: 1)).area()
+    mut cur: Shape := Sq(s: 1)
+    cur = make(i)
+    total = total + cur.area()
+    return total
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

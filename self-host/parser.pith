@@ -1680,15 +1680,15 @@ fn parse_if_stmt() -> Int:
 
 fn parse_for_stmt() -> Int:
     advance_token()
-    binding_tok := expect("identifier")
+    binding_name := parse_loop_binding_name()
 
-    mut label := binding_tok.value
-    mut loop_var := add_leaf_with_position("loop_var", binding_tok.value)
+    mut label := binding_name
+    mut loop_var := add_leaf_with_position("loop_var", binding_name)
     mut loop_idx := -1
     if match_tok("comma"):
-        idx_tok := expect("identifier")
-        label = binding_tok.value + ", " + idx_tok.value
-        loop_idx = add_leaf_with_position("loop_index", idx_tok.value)
+        idx_name := parse_loop_binding_name()
+        label = binding_name + ", " + idx_name
+        loop_idx = add_leaf_with_position("loop_index", idx_name)
 
     expect("kw_in")
     mut iterable := parse_expression()
@@ -1710,6 +1710,12 @@ fn parse_for_stmt() -> Int:
     if loop_idx >= 0:
         children.push(loop_idx)
     return add_node_with_position("for_stmt", label, children)
+
+# a loop variable or index: a name, or `_` when the loop does not use it
+fn parse_loop_binding_name() -> String:
+    if match_tok("underscore"):
+        return "_"
+    return expect("identifier").value
 
 fn parse_while_stmt() -> Int:
     advance_token()

@@ -225,7 +225,9 @@ if_let_stmt   = "if" , "let" , pattern , "=" , expression , ":" , block
 (* for iterates a value (any type providing `fn next() -> T?`) or a range. *)
 (* `..` is exclusive of the upper bound, `..=` inclusive. ranges appear    *)
 (* only in this position, not as free-standing expressions.                *)
-for_stmt      = "for" , IDENT , [ "," , IDENT ] , "in" , for_iterable , ":" , block ;
+(* `_` names a value or index the body does not use.                       *)
+for_stmt      = "for" , loop_name , [ "," , loop_name ] , "in" , for_iterable , ":" , block ;
+loop_name     = IDENT | "_" ;
 for_iterable  = expression , [ ( ".." | "..=" ) , expression ] ;
 
 while_stmt    = "while" , expression , ":" , block ;

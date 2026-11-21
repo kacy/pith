@@ -98,28 +98,32 @@ dispatches by method path, and encodes the reply. you never touch a byte:
 
 ```pith
 import catalog_gen as cat
+import std.algo as algo
 import std.net.grpc as grpc
 
-# a tiny in-memory catalog, seeded at startup.
-mut store: Map[String, cat.Product] := {}
+# seeded() builds a few products (see the example). the map is built once at
+# startup and never written after, so handler tasks read it without a lock.
+store := seeded()
 
 fn get_product(req: cat.GetProductRequest) -> cat.Product!grpc.GrpcError:
-    if not store.contains_key(req.sku):
-        fail grpc.GrpcError(status: grpc.GRPC_NOT_FOUND, message: "no product " + req.sku)
-    return store[req.sku]
+    if let product = store.get(req.sku):
+        return product
+    fail grpc.GrpcError(status: grpc.GRPC_NOT_FOUND, message: "no product {req.sku}")
 
 fn search(req: cat.SearchRequest) -> cat.SearchResponse!grpc.GrpcError:
-    if req.query.len() == 0:
+    if req.query == "":
         fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "query is required")
     mut hits: List[cat.Product] := []
-    for sku in store.keys():
-        p := store[sku]
-        if p.name.contains(req.query):
-            hits.push(p)
-    return cat.SearchResponse(products: hits, total: hits.len())
+    for sku in store:
+        if store[sku].name.contains(req.query):
+            hits.push(store[sku])
+    sorted := algo.sort_by_key(hits, fn(p: cat.Product) => p.name)
+    mut shown := sorted
+    if req.max_results > 0 and sorted.len() > req.max_results:
+        shown = sorted.slice(0, req.max_results)
+    return cat.SearchResponse(products: shown, total: sorted.len())
 
 fn main() -> Int!:
-    seed()
     cat.serve_Catalog("0.0.0.0", 50051, get_product, search)!
     return 0
 ```

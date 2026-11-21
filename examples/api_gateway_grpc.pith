@@ -1,8 +1,10 @@
-# api_gateway_grpc.pith: grpc through the gateway in examples/gateway/.
+# grpc through the gateway in examples/gateway/, end to end.
 #
-# the gateway forwards calls to services it has no generated code for, so this
-# backend speaks a made-up service in plain bytes. a process serves one grpc
-# dispatch, so the backend is this same program run again as a child.
+# this is the walkthrough for examples/gateway/grpc_proxy.pith, as
+# api_gateway.pith is for the http side. the gateway forwards calls for
+# services it has no generated code for, so the backend here speaks a made-up
+# service in plain bytes. a process serves one grpc dispatch, so the backend is
+# this same program started again as a child.
 #
 # Run:  pith run examples/api_gateway_grpc.pith
 
@@ -29,36 +31,37 @@ fn data(value: String) -> Bytes:
 # --- the backend, in the child process ---
 
 fn backend(method: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
-    if method == "/demo.Echo/Who":
-        fields := call.metadata()
-        mut subject := "nobody"
-        if fields.contains_key("x-auth-subject"):
-            subject = fields["x-auth-subject"]
-        mut tag := "none"
-        if fields.contains_key("x-tag"):
-            tag = fields["x-tag"]
-        call.recv_message()!
-        call.send_message(data("subject=" + subject + " tag=" + tag))
-        return 0
-    if method == "/demo.Echo/Upper":
-        step := call.recv_message()!
-        call.send_message(data(text(step.message).to_upper()))
-        return 0
-    if method == "/demo.Echo/Count":
-        step := call.recv_message()!
-        for i in 0..(parse_int(text(step.message)) catch 0):
-            call.send_message(data("tick " + i.to_string()))
-        return 0
-    if method == "/demo.Echo/Chat":
-        while true:
+    match method:
+        "/demo.Echo/Who" =>
+            # what the gateway passed on: the subject it verified, and the
+            # caller's own metadata
+            fields := call.metadata()
+            subject := fields.get("x-auth-subject").unwrap_or("nobody")
+            tag := fields.get("x-tag").unwrap_or("none")
+            call.recv_message()!
+            call.send_message(data("subject={subject} tag={tag}"))
+            return 0
+        "/demo.Echo/Upper" =>
             step := call.recv_message()!
-            if step.done:
-                return 0
-            call.send_message(data("heard " + text(step.message)))
-    if method == "/demo.Echo/Slow":
-        time.delay(2000)
-        return 0
-    fail grpc.GrpcError(grpc.GRPC_NOT_FOUND, "no such method here")
+            call.send_message(data(text(step.message).to_upper()))
+            return 0
+        "/demo.Echo/Count" =>
+            step := call.recv_message()!
+            for i in 0..(parse_int(text(step.message)) catch 0):
+                call.send_message(data("tick {i}"))
+            return 0
+        "/demo.Echo/Chat" =>
+            while true:
+                step := call.recv_message()!
+                if step.done:
+                    return 0
+                call.send_message(data("heard " + text(step.message)))
+            return 0
+        "/demo.Echo/Slow" =>
+            time.delay(2000)
+            return 0
+        _ =>
+            fail grpc.GrpcError(grpc.GRPC_NOT_FOUND, "no such method here")
 
 fn run_backend() -> Int:
     return grpc.serve_stream("127.0.0.1", BACKEND_PORT, backend) catch 1

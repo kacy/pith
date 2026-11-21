@@ -1,102 +1,93 @@
-# http app helpers — request helpers, response builders, and simple routing
+# testing an std.net.http handler in memory, with no socket.
+#
+# a handler is a plain function from HttpRequestBytes to HttpResponse, so a
+# test can build a request with the client builder, serve it with
+# http.serve_one over in-memory buffers, and parse the bytes that come back.
+# the wire format is the real one; only the transport is missing.
+#
+# the handler is a small item service: POST /items/:id takes a json body and
+# sets a cookie, GET /files/:name serves a file, and two middleware wrap it,
+# one refusing requests without a session cookie and one echoing a trace id.
+
 import std.bytes as bytes
 import std.fs as fs
 import std.io as io
 import std.json as json
 import std.net.http as http
-import std.time as time
-from std.net.http import ClientConn, HttpRequestBytes, HttpResponse
+from std.net.http import ClientRequest, HttpRequestBytes, HttpResponse
+
+FILES_ROOT := fs.make_temp_dir("pith-http-apps-") catch "/tmp"
+
+fn create_item(req: HttpRequestBytes) -> HttpResponse:
+    payload := req.body_json() catch:
+        return http.bad_request_response()
+    kind := json.object_get_string(payload, "kind")
+    if kind.len() == 0:
+        return http.response(422).json_body(json.of("error", "kind is required"))
+    out := json.make_object()
+    json.object_set(out, "id", json.make_string(req.path_param_or("/items/:id", "id", "")))
+    json.object_set(out, "kind", json.make_string(kind))
+    json.object_set(out, "draft", json.make_bool(req.has_query_param("draft") catch false))
+    return http.response(201).json_body(out).set_cookie(http.cookie("last_item", kind).path("/").http_only())
+
+fn serve_named_file(req: HttpRequestBytes) -> HttpResponse:
+    name := req.path_param_or("/files/:name", "name", "")
+    # serve_dir refuses a name that climbs out of the root.
+    return http.serve_dir(req, FILES_ROOT, name)
 
 fn app(req: HttpRequestBytes) -> HttpResponse:
     if http.post_route(req, "/items/:id") catch false:
-        payload := req.body_json_or(-1)
-        if payload < 0:
-            return http.bad_request_response()
-        out := json.make_object()
-        json.object_set(out, "id", json.make_string(req.path_param_or("/items/:id", "id", "")))
-        json.object_set(out, "mode", json.make_string(req.query_param_or("mode", "")))
-        json.object_set(out, "has_empty", json.make_bool(req.has_query_param("empty") catch false))
-        json.object_set(out, "kind", json.make_string(json.get_string(json.object_get(payload, "kind"))))
-        return http.response(201).json_body(out).header("X-Route", "item").set_cookie(http.cookie("session", "fresh").path("/").http_only())
+        return create_item(req)
+    if http.get_route(req, "/files/:name") catch false:
+        return serve_named_file(req)
     return http.not_found_response()
 
-fn auth_middleware(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
+fn require_session(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
     if not (req.has_cookie("session") catch false):
         return http.unauthorized_response()
     return next(req)
 
-fn trace_middleware(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
-    return next(req).header("X-Trace", req.header_or("X-Trace", "trace-generated"))
+fn echo_trace(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes) -> HttpResponse:
+    return next(req).header("X-Trace", req.header_or("X-Trace", "untraced"))
 
-fn build_payload() -> Int:
-    obj := json.make_object()
-    json.object_set(obj, "kind", json.make_string("item"))
-    json.object_set(obj, "count", json.make_int(2))
-    return obj
+# serve one request through `handler` entirely in memory.
+fn exchange(handler: fn(HttpRequestBytes) -> HttpResponse, req: ClientRequest) -> HttpResponse!:
+    request_reader := io.bytes_reader(req.to_bytes()!).buffered_chunked(64)
+    response_buffer := bytes.buffer()
+    http.serve_one(request_reader, response_buffer.buffered_chunked(64), handler)!
+    return http.parse_response_bytes(response_buffer.bytes())!
 
-fn temp_file_path(prefix: String, ext: String) -> String:
-    return "/tmp/{prefix}{time.now()}{ext}"
+fn show(label: String, resp: HttpResponse):
+    print("{label} -> {resp.status} {resp.body_text() catch ""}")
 
-fn demo_saved_download(output_path: String) -> String!:
-    download_req := http.get_request("example.com", 80, "/download")
-    response_reader := io.bytes_reader(http.text(200, "saved").to_bytes()!).buffered_chunked(4)
-    request_writer := bytes.buffer().buffered_chunked(4)
-    conn := ClientConn(io.from_fd(1), response_reader, request_writer)
-    conn.send_to_file(download_req, output_path)!
-    return ""
+# a request as the browser would send it, signed in with `session` unless
+# that is empty.
+fn signed_in(req: ClientRequest, session: String) -> ClientRequest:
+    if session.len() == 0:
+        return req
+    return req.cookie("session", session)
 
-fn main() -> String!:
-    mut req_builder := http.post_request("example.com", 80, "/items/42")
-    req_builder = req_builder.query_param("mode", "raw")
-    req_builder = req_builder.query_param("empty", "")
-    req_builder = req_builder.header("X-Test", "yes")
-    req_builder = req_builder.header("X-Trace", "trace-req")
-    req_builder = req_builder.cookie("session", "incoming")
-    req_builder = req_builder.json_body(build_payload())
-    req_bytes := req_builder.to_bytes()!
+fn main() -> Int!:
+    defer fs.remove_tree(FILES_ROOT)
+    fs.write("{FILES_ROOT}/notes.txt", "steep for three minutes\n")!
 
-    req := http.read_request_buffered_bytes(io.bytes_reader(req_bytes).buffered_chunked(4))!
-    print("method: {req.method()!}")
-    print("path: {req.path()!}")
-    print("mode: {req.query_param_or("mode", "")}")
-    print("parts: {req.path_parts()!.join(",")}")
-    print("cookie: {req.cookie_or("session", "missing")}")
+    # the trace middleware is outermost, so even a 401 carries the trace id.
+    handler := http.wrap(http.wrap(app, require_session), echo_trace)
 
-    out := bytes.buffer()
-    handled := app(req).header("X-Trace", req.header_or("X-Trace", "trace-generated"))
-    http.send_buffered(out.buffered_chunked(4), handled)!
-    resp := http.parse_response_bytes(out.bytes())!
-    body := resp.body_json()!
-    print("status: {resp.status_code()}")
-    print("success: {resp.is_success()}")
-    print("route: {resp.header_value("X-Route")}")
-    print("trace: {resp.header_value("X-Trace")}")
-    print("set-cookie: {resp.cookies()[0]}")
-    print("body id: {json.get_string(json.object_get(body, "id"))}")
-    print("body kind: {json.get_string(json.object_get(body, "kind"))}")
+    teapot := http.post_request("example.com", 80, "/items/42").query_param("draft", "").header("X-Trace", "t-100").json_body(json.of("kind", "teapot"))
+    created := exchange(handler, signed_in(teapot, "s-1"))!
+    show("create item", created)
+    print("  trace: {created.header_value("X-Trace")}")
+    print("  cookie: {created.cookies()[0]}")
 
-    html := http.html(200, "<h1>ok</h1>").to_string()!
-    print("html has status: {html.contains("200 OK")}")
-    redirect := http.redirect_response("/next").to_string()!
-    print("redirect has location: {redirect.contains("/next")}")
-    print("no content status: {http.no_content().status_code()}")
+    refused := exchange(handler, signed_in(teapot, ""))!
+    show("no session", refused)
+    print("  trace: {refused.header_value("X-Trace")}")
 
-    asset_path := temp_file_path("pith-http-apps-", ".html")
-    fs.write(asset_path, "<h1>asset</h1>")!
-    asset_out := bytes.buffer()
-    http.send_static_path(asset_out.buffered_chunked(5), http.response(200).keep_alive(), asset_path)!
-    asset_resp := http.parse_response_bytes(asset_out.bytes())!
-    print("static type: {asset_resp.header_value("Content-Type")}")
+    show("empty kind", exchange(handler, signed_in(http.post_request("example.com", 80, "/items/7").json_body(json.of("kind", "")), "s-1"))!)
+    show("not json", exchange(handler, signed_in(http.post_request("example.com", 80, "/items/7").text_body("teapot"), "s-1"))!)
 
-    download_out := bytes.buffer()
-    http.send_download_path(download_out.buffered_chunked(5), http.response(200).keep_alive(), asset_path, "asset.html")!
-    download_resp := http.parse_response_bytes(download_out.bytes())!
-    print("download disposition: {download_resp.header_value("Content-Disposition")}")
-
-    save_path := temp_file_path("pith-http-download-", ".txt")
-    demo_saved_download(save_path)!
-    print("saved body: {fs.read(save_path)!}")
-    fs.remove(save_path)
-    fs.remove(asset_path)
-    print("http apps work")
-    return ""
+    file := exchange(handler, signed_in(http.get_request("example.com", 80, "/files/notes.txt"), "s-1"))!
+    print("get file -> {file.status} {file.header_value("Content-Type")}: {file.body_text()!.trim()}")
+    show("missing file", exchange(handler, signed_in(http.get_request("example.com", 80, "/files/recipes.txt"), "s-1"))!)
+    return 0

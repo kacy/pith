@@ -75,6 +75,16 @@ pub fn set_node_value(idx: Int, value: String):
     n := nodes[idx]
     nodes[idx] = Node(n.kind, value, n.children, n.line, n.col, n.type_args)
 
+# add `child` as the last child of the node at `idx`. the checker uses it to
+# give a call the default arguments it leaves out.
+pub fn append_node_child(idx: Int, child: Int):
+    n := nodes[idx]
+    mut kids: List[Int] := []
+    for c in n.children:
+        kids.push(c)
+    kids.push(child)
+    nodes[idx] = Node(n.kind, n.value, kids, n.line, n.col, n.type_args)
+
 # how many nodes the arena holds. every parse appends contiguously, so
 # a count taken before and after a parse brackets that parse's nodes.
 pub fn node_count() -> Int:

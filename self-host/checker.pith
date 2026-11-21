@@ -19,7 +19,7 @@
 
 from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
 from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
-from ast import Node, get_node, node_kind, node_value, node_child_count, node_child, from_import_names, from_import_name_aliases, from_import_alias_receiver
+from ast import Node, get_node, node_kind, node_value, node_child_count, node_child, append_node_child, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
@@ -1982,6 +1982,7 @@ fn check_function_declaration(node: Node):
     # create function scope with return type
     fn_scope := create_function_scope(current_scope, fn_info.return_type)
     reset_fn_weak_tracking()
+    check_parameter_defaults(node, fn_info.param_types, fn_scope)
     # define parameters
     mut param_idx := 0
     for child in node.children:
@@ -2196,6 +2197,7 @@ fn check_method_body(type_name: String, type_tid: Int, node_idx: Int, node: Node
     ret_type := collect_function_return_type(node)
     method_scope := create_function_scope(current_scope, ret_type)
     reset_fn_weak_tracking()
+    check_parameter_defaults(node, param_types, method_scope)
     # bind self
     define_binding_at(method_scope, "self", type_tid, false, node_idx)
 
@@ -2397,6 +2399,93 @@ fn declared_param_names(decl: Node) -> List[String]:
         if node_kind(child) == "param":
             params.push(extract_binding_name(node_value(child)))
     return params
+
+# the "arg" node holding the default a parameter declares, or -1.
+fn parameter_default_argument(param_idx: Int) -> Int:
+    p := get_node(param_idx)
+    if p.children.len() > 1 and node_kind(p.children[1]) == "arg":
+        return p.children[1]
+    return 0 - 1
+
+# a call may leave out trailing arguments whose parameters declare a default.
+# each default's "arg" node is appended to the call node and to
+# `arg_indices`, so the count and type checks that follow and the emitter all
+# see the call with every argument. only a call that resolved to a function
+# or method declaration is filled: a function value carries no defaults.
+fn fill_default_arguments(call_idx: Int, decl_idx: Int, arg_indices: List[Int]):
+    if call_idx < 0 or decl_idx < 0:
+        return
+    call_kind := node_kind(call_idx)
+    if call_kind != "call" and call_kind != "method_call":
+        return
+    decl := get_node(decl_idx)
+    if decl.kind != "fn_decl":
+        return
+    mut params: List[Int] := []
+    for child in decl.children:
+        if node_kind(child) == "param":
+            params.push(child)
+    mut defaults: List[Int] := []
+    mut i := arg_indices.len()
+    while i < params.len():
+        default_arg := parameter_default_argument(params[i])
+        if default_arg < 0:
+            return
+        defaults.push(default_arg)
+        i = i + 1
+    for default_arg in defaults:
+        append_node_child(call_idx, default_arg)
+        arg_indices.push(default_arg)
+
+# a parameter's default is evaluated at every call that leaves it out, in the
+# caller, so it is kept to a value that means the same everywhere: a literal,
+# a negated number, `none`, or a variant of an enum that carries no payload.
+# the parameters with defaults come last, since arguments bind by position.
+fn check_parameter_defaults(decl_node: Node, param_types: List[Int], scope_id: Int):
+    mut param_idx := 0
+    mut default_seen := false
+    for child in decl_node.children:
+        if node_kind(child) != "param":
+            continue
+        default_arg := parameter_default_argument(child)
+        pname := extract_binding_name(node_value(child))
+        if default_arg < 0:
+            if default_seen:
+                report_error_with_fix_at(child, "E317", "parameter '" + pname + "' has no default but follows a parameter that has one", "give it a default, or move it before the parameters with defaults")
+        else:
+            default_seen = true
+            expr := node_child(default_arg, 0)
+            if not is_constant_default(expr):
+                report_error_with_fix_at(expr, "E317", "the default of parameter '" + pname + "' must be a literal, `none` or an enum variant without a payload", "pass the value at the call, or compute it in the body from an optional parameter")
+            elif param_idx < param_types.len() and not is_error_type(param_types[param_idx]):
+                param_tid := param_types[param_idx]
+                if node_kind(expr) == "none_lit":
+                    if get_type_info(param_tid).kind != "optional":
+                        report_error_at(expr, "E219", "the default of parameter '" + pname + "' is none, but its type " + get_type_name(param_tid) + " is not optional")
+                else:
+                    default_tid := c_check_expr(expr, scope_id)
+                    if not is_error_type(default_tid) and not types_compatible(default_tid, param_tid) and not types_compatible(default_tid, optional_inner_or_self(param_tid)):
+                        report_error_at(expr, "E219", "the default of parameter '" + pname + "' has type " + get_type_name(default_tid) + ", expected " + get_type_name(param_tid))
+        param_idx = param_idx + 1
+
+fn optional_inner_or_self(tid: Int) -> Int:
+    info := get_type_info(tid)
+    if info.kind == "optional":
+        return info.inner
+    return tid
+
+fn is_constant_default(expr: Int) -> Bool:
+    kind := node_kind(expr)
+    if kind == "int_lit" or kind == "float_lit" or kind == "string_lit" or kind == "bool_lit" or kind == "none_lit":
+        return true
+    if kind == "unary" and node_value(expr) == "negate":
+        inner := node_kind(node_child(expr, 0))
+        return inner == "int_lit" or inner == "float_lit"
+    if kind == "field_access" and node_child_count(expr) == 1 and node_kind(node_child(expr, 0)) == "ident":
+        tid := lookup_type_id(node_value(node_child(expr, 0)))
+        if tid >= 0 and get_type_info(tid).kind == "enum":
+            return true
+    return false
 
 # a labeled argument names the parameter it is passed to. arguments bind by
 # position, so a label must name the parameter in that position: a label that
@@ -4439,6 +4528,7 @@ fn check_generic_function_call_explicit(name: String, index_node: Node, arg_indi
     decl_idx := get_generic_declaration_index(name)
     if decl_idx < 0:
         return TID_ERR
+    fill_default_arguments(checker_current_node_index(), decl_idx, arg_indices)
     decl_node := get_node(decl_idx)
     generic_params := collect_generic_parameter_names(decl_node)
     mut subst_args: List[Int] := []
@@ -4664,6 +4754,8 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
     if fn_info.kind != "function":
         report_error("E208", "expression is not callable")
         return TID_ERR
+    call_idx := checker_current_node_index()
+    fill_default_arguments(call_idx, called_declaration(call_idx), arg_indices)
     # check arg count
     if arg_indices.len() != fn_info.param_types.len():
         report_error("E207", "expected " + fn_info.param_types.len().to_string() + " arguments, got " + arg_indices.len().to_string())
@@ -5469,6 +5561,7 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
 fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: Int) -> Int:
     decl_idx := get_generic_declaration_index(name)
     record_definition(checker_current_node_index(), decl_idx)
+    fill_default_arguments(checker_current_node_index(), decl_idx, arg_indices)
     decl_node := get_node(decl_idx)
     generic_params := collect_generic_parameter_names(decl_node)
     # evaluate all argument types
@@ -6122,6 +6215,7 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     key := user_method_declaration_key(dispatch_type, method_name)
     if key.len() > 0:
         record_definition(checker_current_node_index(), get_method_declaration_index(key))
+        fill_default_arguments(checker_current_node_index(), get_method_declaration_index(key), arg_indices)
         method_node := get_node(get_method_declaration_index(key))
         queue_dispatched_method(get_method_declaration_index(key), dispatch_type)
         # if the receiver is a generic struct instance, build a substitution
@@ -8554,6 +8648,7 @@ fn queue_dispatched_method(method_idx: Int, receiver_tid: Int):
 fn walk_specialized_body(decl_idx: Int, decl_node: Node, self_tid: Int, param_types: List[Int], ret_type: Int):
     fn_scope := create_function_scope(current_scope, ret_type)
     reset_fn_weak_tracking()
+    check_parameter_defaults(decl_node, param_types, fn_scope)
     if self_tid >= 0:
         define_binding_at(fn_scope, "self", self_tid, false, decl_idx)
     mut param_idx := 0

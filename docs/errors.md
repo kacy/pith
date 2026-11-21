@@ -1158,6 +1158,22 @@ error[E316]: interface 'Mapper' cannot be used as a value type: its method 'appl
   fix: take a type parameter bounded by it, as in `fn f[T: Mapper](x: T)`
 ```
 
+### E317: a parameter default that is not allowed
+
+a call may leave out a trailing parameter that declares a default
+(`fn scaled(x: Int, by: Int = 10)`, called as `scaled(3)`), and the default
+is passed in its place. the default is evaluated at each such call, so it has
+to mean the same thing everywhere: a literal, a negated number, `none` for an
+optional parameter, or an enum variant without a payload. arguments bind by
+position, so a parameter without a default cannot follow one that has one.
+
+```
+error[E317]: the default of parameter 'b' must be a literal, `none` or an enum variant without a payload
+  10 | fn computed(a: Int, b: Int = base()) -> Int:
+                                    ^
+  fix: pass the value at the call, or compute it in the body from an optional parameter
+```
+
 ### E275 — a frozen field is changed
 
 a field declared `frozen` is set when its struct is built and never changed

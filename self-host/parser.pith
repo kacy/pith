@@ -2231,9 +2231,12 @@ fn parse_param() -> Int:
 
     mut children: List[Int] := [type_node]
 
-    # default value
+    # a default value, held in the "arg" node a call that leaves the argument
+    # out is given in its place
     if match_tok("eq"):
-        children.push(parse_expression())
+        default_mark := current_token_position
+        mut default_children: List[Int] := [parse_expression()]
+        children.push(add_node_from_mark("arg", "", default_children, default_mark))
 
     return add_node_with_position("param", name_tok.value + modifiers, children)
 

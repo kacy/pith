@@ -314,6 +314,17 @@ way.
 ### E226 — interface constraint violation
 
 a type doesn't satisfy the interface bounds required by a generic parameter.
+a type implements an interface only through an `impl Iface for T` block;
+methods with the right names and signatures are not enough, so a struct
+with a bare `fn next() -> Int?` can drive a `for` loop but cannot be passed
+to `std.iter.to_list`. the fix line names the missing impl.
+
+```
+error[E226]: type 'Counter' does not implement interface 'Iterator'
+  19 |     print("{to_list(Counter(cur: 0, hi: 3))}")
+                   ^
+  fix: add `impl Iterator for Counter:`. methods with the right names do not satisfy an interface on their own
+```
 
 ### E227 — method not found
 

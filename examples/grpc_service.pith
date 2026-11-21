@@ -65,10 +65,9 @@ fn connect() -> grpc.Conn!:
 
 # make one call and describe its reply, or the status it failed with.
 fn call(conn: grpc.Conn, path: String, name: String) -> String:
-    reply := conn.unary(path, encode_text(name))
-    if reply.is_err:
-        return "{grpc.status_name(reply.err.status)}: {reply.err.message}"
-    return decode_text(reply.ok) catch "unreadable reply"
+    reply := conn.unary(path, encode_text(name)) catch err:
+        return "{grpc.status_name(err.status)}: {err.message}"
+    return decode_text(reply) catch "unreadable reply"
 
 fn main() -> Int!:
     spawn run_server()

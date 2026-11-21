@@ -32,11 +32,10 @@ fn main():
     print("still owed: {unpaid}")
 
     # reduce can build any value, here a map of totals per customer
-    add_order := fn(totals: Map[String, Int], order: Order) -> Map[String, Int]:
+    by_customer := paid.reduce({}, fn(totals: Map[String, Int], order: Order) -> Map[String, Int]:
         totals[order.customer] = totals.get(order.customer).unwrap_or(0) + order.cents
         return totals
-    empty: Map[String, Int] := {}
-    by_customer := paid.reduce(empty, add_order)
+    )
     for customer in ["ada", "grace", "linus"]:
         print("{customer:<6} {by_customer.get(customer).unwrap_or(0):>6}")
 

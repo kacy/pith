@@ -1,35 +1,46 @@
-# path manipulation examples
+# path_ops: taking file paths apart and putting them back with std.os.path.
+#
+# plans the output of a small static site build. each source file under
+# content/ maps to a page under public/: markdown becomes html, images are
+# copied as they are, and a path that climbs out of content/ is refused.
+# nothing here touches the disk; std.os.path only works on the strings.
+
 import std.os.path as path
 
+fn output_path(source_root: String, output_root: String, source: String) -> String!:
+    cleaned := path.clean(source)
+    relative := path.rel(source_root, cleaned)
+    if relative.starts_with(".."):
+        fail "{source} is outside {source_root}"
+    target := path.join(output_root, relative)
+    extension := path.ext(cleaned)
+    if extension == ".md":
+        return path.with_ext(target, ".html")
+    if [".png", ".jpg"].contains(extension):
+        return target
+    fail "no rule for {path.base(cleaned)}"
+
 fn main():
-    # join
-    joined := path.join("/home/user", "documents")
-    print(joined)
-    print(path.join_all(["/home", "user", "documents", "notes.txt"]))
-    print(path.clean("/home/user//docs/../downloads/"))
-    home_is_abs := path.is_abs("/home/user")
-    print(home_is_abs.to_string())
+    source_root := "/site/content"
+    output_root := "/site/public"
+    sources := [
+        "/site/content/index.md",
+        "/site/content/blog/2026/first-post.md",
+        "/site/content/blog//2026/./photo.jpg",
+        "/site/content/drafts/../about.md",
+        "/site/content/../secrets.env",
+        "/site/content/notes.txt",
+]
+    for source in sources:
+        planned := output_path(source_root, output_root, source)
+        if planned.is_err:
+            print("skip  {planned.err}")
+            continue
+        print("build {path.rel(output_root, planned.ok):<26} from {path.stem(source)}{path.ext(source)}")
 
-    # dir
-    directory_path := path.dir("/home/user/file.txt")
-    print(directory_path)
-
-    # base
-    base_name := path.base("/home/user/file.txt")
-    print(base_name)
-
-    # ext
-    extension := path.ext("/home/user/file.txt")
-    print(extension)
-
-    # stem
-    file_stem := path.stem("/home/user/file.txt")
-    print(file_stem)
-
-    # edge cases
-    print(path.dir("file.txt"))
-    print(path.base("file.txt"))
-    print(path.ext("noext"))
-    print(path.stem("noext"))
-    print(path.clean("alpha/./beta/../gamma"))
-    print("path ops work")
+    # the section a page belongs to is the first directory under the root
+    post := "/site/public/blog/2026/first-post.html"
+    section := path.parts(path.rel(output_root, post))[0]
+    print("")
+    print("{path.base(post)} is in section '{section}', directory {path.dir(post)}")
+    print("absolute: {path.is_abs(post)}, joined back: {path.join_all([output_root, "blog", "2026", "first-post.html"]) == post}")

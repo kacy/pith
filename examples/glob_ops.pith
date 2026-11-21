@@ -1,21 +1,39 @@
+# glob_ops: finding files by pattern with std.glob.
+#
+# lays out a small project in a temporary directory and collects what a
+# formatter should check: every .pith file, minus build output and generated
+# code. `**` matches any number of directories, and find skips directories
+# like target/ and .git/ unless told otherwise.
+
 import std.fs as fs
 import std.glob as glob
 import std.os.path as path
 
-fn main() -> String!:
-    root := fs.make_temp_dir("pith-glob-example-")!
-    src := path.join(root, "src")
-    ignored := path.join(root, "target")
-    fs.make_dirs(src)
-    fs.make_dirs(ignored)
-    fs.write(path.join(root, "main.pith"), "")!
-    fs.write(path.join(src, "lib.pith"), "")!
-    fs.write(path.join(ignored, "skip.pith"), "")!
+fn make_project(root: String) -> Int!:
+    for file in ["main.pith", "src/lib.pith", "src/net/http.pith", "src/gen/schema.pith", "target/cache.pith", "README.md"]:
+        full := path.join(root, file)
+        fs.make_dirs(path.dir(full))
+        fs.write(full, "")!
+    return 0
 
-    pattern := path.join(root, "**/*.pith")
-    matches := glob.find(root, [pattern])!
-    print("matches: {matches.len()}")
-    print("main matches: {glob.matches(pattern, path.join(root, "main.pith"))}")
-    print("target skipped: {(matches.len() == 2)}")
-    fs.remove_tree(root)
-    return ""
+fn relative_sorted(root: String, found: List[String]) -> String:
+    return found.map(fn(file: String) => path.rel(root, file)).sort().join(", ")
+
+fn main() -> Int!:
+    root := fs.make_temp_dir("pith-glob-example-")!
+    defer fs.remove_tree(root)
+    make_project(root)!
+
+    everything := glob.find(root, [path.join(root, "**/*.pith")])!
+    print("all sources: {relative_sorted(root, everything)}")
+
+    # generated code is excluded by a second pattern
+    options := glob.default_options()
+    to_format := glob.find_excluding(root, [path.join(root, "**/*.pith")], [path.join(root, "src/gen/**")], options)!
+    print("to format:   {relative_sorted(root, to_format)}")
+
+    # matches tests one path without touching the disk
+    pattern := "src/*.pith"
+    for candidate in ["src/lib.pith", "src/net/http.pith", "main.pith"]:
+        print("{pattern} matches {candidate}: {glob.matches(pattern, candidate)}")
+    return 0

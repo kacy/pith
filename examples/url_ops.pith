@@ -1,33 +1,50 @@
-# url parsing and percent-encoding
-from std.net.url import parse, scheme, host, port, path, query, fragment, to_string, encode, decode
+# url_ops: parsing and percent-encoding urls with std.net.url.
+#
+# sorts the links found on a page into internal and external ones, fills in
+# the default port a url leaves out, reads the parameters out of a query
+# string, and builds a search link whose query text is percent-encoded.
+
+import std.net.url as url
+
+fn effective_port(link: url.URL) -> Int:
+    if url.port(link) >= 0:
+        return url.port(link)
+    return if url.scheme(link) == "https": 443 else: 80
+
+fn query_params(link: url.URL) -> Map[String, String]:
+    mut params: Map[String, String] := {}
+    for pair in url.query(link).split("&"):
+        if pair.is_empty():
+            continue
+        equals := pair.index_of("=")
+        if equals < 0:
+            params[url.decode(pair)] = ""
+        else:
+            params[url.decode(pair.substring(0, equals))] = url.decode(pair.substring(equals + 1, pair.len()))
+    return params
 
 fn main():
-    # parse a full URL
-    full_url := parse("https://example.com:8080/api/v1?key=value#section")
-    print("scheme: {scheme(full_url)}")
-    print("host: {host(full_url)}")
-    print("port: {port(full_url)}")
-    print("path: {path(full_url)}")
-    print("query: {query(full_url)}")
-    print("fragment: {fragment(full_url)}")
+    site := "docs.example.com"
+    links := [
+        "https://docs.example.com/guide/intro#install",
+        "http://docs.example.com:8080/preview",
+        "https://cdn.example.net/app.js",
+        "https://docs.example.com/search?q=hello%20world&page=2",
+]
+    for raw in links:
+        link := url.parse(raw)
+        kind := if url.host(link) == site: "internal" else: "external"
+        anchor := if url.fragment(link).is_empty(): "" else: " #{url.fragment(link)}"
+        print("{kind:<8} {url.host(link)}:{effective_port(link)}{url.path(link)}{anchor}")
 
-    # reconstruct
-    print("full: {to_string(full_url)}")
+    search := url.parse(links[3])
+    params := query_params(search)
+    print("")
+    print("search for '{params["q"]}', page {params["page"]}")
 
-    # simple URL without port/query/fragment
-    simple_url := parse("http://localhost/index.html")
-    print("scheme2: {scheme(simple_url)}")
-    print("host2: {host(simple_url)}")
-    print("port2: {port(simple_url)}")
-    print("path2: {path(simple_url)}")
-
-    # percent encode/decode
-    encoded_string := encode("hello world & more")
-    print("encoded: {encoded_string}")
-    decoded_string := decode(encoded_string)
-    print("decoded: {decoded_string}")
-
-    # round-trip
-    original_text := "foo=bar baz&x=1+2"
-    roundtrip_result := decode(encode(original_text))
-    print("round-trip: {roundtrip_result}")
+    # a bare & would start a new parameter and a space is not allowed in a
+    # url at all, so the text is encoded before it goes in
+    wanted := "fish & chips"
+    built := "https://{site}/search?q={url.encode(wanted)}"
+    print("built: {built}")
+    print("round trip: {query_params(url.parse(built))["q"] == wanted}")

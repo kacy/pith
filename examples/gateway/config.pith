@@ -74,7 +74,7 @@ pub fn split_address(address: String) -> Address!:
     port := parse_int(rest.substring(colon + 1, rest.len())) catch 0
     if port < 1 or port > 65535:
         fail "upstream '" + address + "' has a bad port"
-    return Address(rest.substring(0, colon), port, use_tls)
+    return Address(host: rest.substring(0, colon), port: port, use_tls: use_tls)
 
 # a required string, with toml's typed error turned into this module's text.
 fn required_string(table: Int, key: String) -> String!:
@@ -86,10 +86,8 @@ fn required_string(table: Int, key: String) -> String!:
 fn string_list(table: Int, key: String) -> List[String]:
     mut out: List[String] := []
     array := toml.get_array(table, key)
-    mut i := 0
-    while i < toml.array_len(array):
+    for i in 0..toml.array_len(array):
         out.push(toml.array_string(array, i))
-        i = i + 1
     return out
 
 fn read_route(table: Int) -> Route!:
@@ -135,10 +133,8 @@ pub fn parse(text: String) -> Config!:
     auth := toml.get_table(root, "auth")
     mut routes: List[Route] := []
     tables := toml.get_array(root, "route")
-    mut i := 0
-    while i < toml.array_len(tables):
+    for i in 0..toml.array_len(tables):
         routes.push(read_route(toml.array_get(tables, i))!)
-        i = i + 1
     if routes.len() == 0:
         fail "no routes configured"
     grpc_upstreams := string_list(server, "grpc_upstreams")
@@ -158,7 +154,11 @@ pub fn parse(text: String) -> Config!:
         grpc_upstreams: grpc_upstreams,
         grpc_auth: toml.get_bool_or(server, "grpc_auth", false)
     )
-    identity := Auth(toml.get_string_or(auth, "jwks_url", ""), toml.get_string_or(auth, "issuer", ""), toml.get_string_or(auth, "audience", ""))
+    identity := Auth(
+        jwks_url: toml.get_string_or(auth, "jwks_url", ""),
+        issuer: toml.get_string_or(auth, "issuer", ""),
+        audience: toml.get_string_or(auth, "audience", "")
+    )
     if settings.grpc_port > 0 and grpc_upstreams.len() == 0:
         fail "grpc_port is set but grpc_upstreams is empty"
     if settings.grpc_auth and identity.jwks_url == "":
@@ -166,4 +166,4 @@ pub fn parse(text: String) -> Config!:
     for route in routes:
         if route.auth and identity.jwks_url == "":
             fail "route '" + route.name + "' requires auth but [auth] has no jwks_url"
-    return Config(settings, identity, routes)
+    return Config(server: settings, auth: identity, routes: routes)

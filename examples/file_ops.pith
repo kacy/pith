@@ -1,42 +1,73 @@
-# file operations — stream and path-based fs helpers
+# file streams: a sensor journal written, appended to and read back.
+#
+# fs.create, fs.open_append and fs.open return a FileStream. wrapping one in a
+# BufferedWriter turns many small writes into a few large ones, and wrapping
+# it in a BufferedReader reads it a line at a time. each stream is closed by a
+# `defer` placed right after it is opened, so every way out of a function
+# closes it, and the whole journal lives in a temp directory that main removes
+# on the way out.
 
 import std.fs as fs
+import std.os.path as path
 
-fn main() -> String!:
-    path := "/tmp/pith_test_file_ops.txt"
+struct Reading:
+    sensor: String
+    celsius: Int
 
-    # write through the shared file stream path
-    writer := fs.create(path)!
-    defer writer.close()
-    writer.write_all("hello from pith")!
-    print("write: ok")
+fn write_readings(file: String, readings: List[Reading]) -> Int!:
+    stream := fs.create(file)!
+    defer stream.close()
+    out := stream.buffered_writer()
+    defer out.close()
+    for r in readings:
+        out.write("{r.sensor},{r.celsius}\n")!
+    # a buffered writer holds text until it is flushed; closing drops it.
+    out.flush()!
+    return readings.len()
 
-    # read back through the same stream surface
-    reader := fs.open(path)!
-    defer reader.close()
-    content := reader.read_all()!
-    if content.contains("hello"):
-        print("read: ok")
+fn append_reading(file: String, r: Reading) -> Int!:
+    stream := fs.open_append(file)!
+    defer stream.close()
+    return stream.write_all("{r.sensor},{r.celsius}\n")!
 
-    # exists
-    if fs.exists(path):
-        print("exists: ok")
+fn parse_reading(line: String) -> Reading!:
+    fields := line.split(",")
+    if fields.len() != 2:
+        fail "expected sensor,celsius but got '{line}'"
+    return Reading(sensor: fields[0], celsius: parse_int(fields[1])!)
 
-    # read by size
-    size := content.len()
-    print("size: {size}")
+# read_line returns "" at the end of the file.
+fn summarize(file: String) -> String!:
+    stream := fs.open(file)!
+    defer stream.close()
+    lines := stream.buffered_reader()
+    defer lines.close()
+    mut count := 0
+    mut hottest := Reading(sensor: "", celsius: -273)
+    mut line := lines.read_line()!
+    while line != "":
+        r := parse_reading(line)!
+        count = count + 1
+        if r.celsius > hottest.celsius:
+            hottest = r
+        line = lines.read_line()!
+    return "{count} readings, hottest {hottest.sensor} at {hottest.celsius}C"
 
-    # clean up
-    fs.remove(path)
-    if not fs.exists(path):
-        print("remove: ok")
+fn main() -> Int!:
+    dir := fs.make_temp_dir("pith_file_ops_")!
+    defer fs.remove_tree(dir)
+    journal := path.join(dir, "journal.csv")
 
-    # stream a known file too
-    hello_reader := fs.open("examples/hello.pith")!
-    defer hello_reader.close()
-    hello := hello_reader.read_all()!
-    if hello.contains("greet"):
-        print("read hello.pith: ok")
+    morning := [Reading(sensor: "boiler", celsius: 61), Reading(sensor: "attic", celsius: 14), Reading(sensor: "porch", celsius: 9)]
+    print("wrote {write_readings(journal, morning)!} readings")
+    append_reading(journal, Reading(sensor: "boiler", celsius: 74))!
+    print("appended 1 reading")
+    print("journal: {fs.info(journal)!.size} bytes")
+    print(summarize(journal)!)
 
-    print("file ops work")
-    return ""
+    # a malformed line stops the summary with an error the caller can handle.
+    fs.append(journal, "porch;12\n")!
+    broken := summarize(journal)
+    if broken.is_err:
+        print("summary failed: {broken.err}")
+    return 0

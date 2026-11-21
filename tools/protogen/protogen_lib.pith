@@ -1143,6 +1143,36 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
 
     return strings.join_lines(lines)
 
+# the <Svc><Rpc>Reply struct a client recv() returns for a server-streaming or
+# bidi rpc: the client-side mirror of the server's <Svc><Rpc>Recv.
+fn gen_reply_struct_lines(svc: Service, rpc: Rpc) -> List[String]:
+    return [
+        "# one received {svc.name}.{rpc.name} response message. done means the server",
+        "# has finished the stream (message is then an all-default {rpc.resp_type}).",
+        "pub struct {svc.name}{rpc.name}Reply:",
+        "    pub done: Bool",
+        "    pub message: {rpc.resp_type}",
+        ""
+    ]
+
+# the typed recv() method of a server-streaming or bidi client handle. it wraps
+# the stream's own recv: done marks the end of the stream, and a non-OK
+# terminal status or a reset fails, as do bytes that do not decode (INTERNAL).
+fn gen_client_recv_lines(svc: Service, rpc: Rpc) -> List[String]:
+    q := chr(34)
+    reply := "{svc.name}{rpc.name}Reply"
+    resp := rpc.resp_type
+    return [
+        "    # the next response message, decoded; blocks until it arrives. done",
+        "    # marks the end of the stream; a non-OK status or a reset fails.",
+        "    pub fn recv() -> {reply}!grpc.GrpcError:",
+        "        msg := self.inner.recv()!",
+        "        decoded := decode_{resp}(msg.message)",
+        "        if decoded.is_err:",
+        "            fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {q}grpc: decode {resp} failed{q})",
+        "        return {reply}(done: msg.done, message: decoded.ok)"
+    ]
+
 # generate the typed client stubs for one service: a `<Svc>Client` wrapping a
 # grpc.Conn with a method per rpc, plus a handle struct for each streaming rpc.
 # the handle structs come first so the client impl can name them.
@@ -1158,12 +1188,17 @@ fn gen_service_lines(svc: Service, pkg: String) -> List[String]:
         req := rpc.req_type
         resp := rpc.resp_type
         derr := "{q}grpc: decode {resp} failed{q}"
+        if rpc.server_streaming:
+            for ln in gen_reply_struct_lines(svc, rpc):
+                out.push(ln)
         if rpc.server_streaming and not rpc.client_streaming:
             out.push("# a typed server-stream of {resp} messages from {svc.name}.{rpc.name}.")
             out.push("pub struct {handle}:")
             out.push("    pub inner: grpc.ServerStream")
             out.push("")
             out.push("impl {handle}:")
+            for ln in gen_client_recv_lines(svc, rpc):
+                out.push(ln)
             out.push("    # gather and decode every response message.")
             out.push("    pub fn collect() -> List[{resp}]!grpc.GrpcError:")
             out.push("        items: List[{resp}] := []")
@@ -1213,19 +1248,16 @@ fn gen_service_lines(svc: Service, pkg: String) -> List[String]:
             out.push("    # half-close the request stream.")
             out.push("    pub fn close_send() -> Int:")
             out.push("        return self.inner.close_send()")
-            out.push("    # gather and decode every response message.")
+            for ln in gen_client_recv_lines(svc, rpc):
+                out.push(ln)
+            out.push("    # gather and decode every remaining response message.")
             out.push("    pub fn collect() -> List[{resp}]!grpc.GrpcError:")
             out.push("        items: List[{resp}] := []")
-            out.push("        mut done := false")
-            out.push("        while not done:")
-            out.push("            msg := self.inner.recv()!")
-            out.push("            if msg.done:")
-            out.push("                done = true")
-            out.push("            else:")
-            out.push("                decoded := decode_{resp}(msg.message)")
-            out.push("                if decoded.is_err:")
-            out.push("                    fail grpc.GrpcError(status: grpc.GRPC_INTERNAL, message: {derr})")
-            out.push("                items.push(decoded.ok)")
+            out.push("        while true:")
+            out.push("            got := self.recv()!")
+            out.push("            if got.done:")
+            out.push("                break")
+            out.push("            items.push(got.message)")
             out.push("        return items")
             out.push("    # release the stream and its concurrency slot; call once when done.")
             out.push("    pub fn close():")
@@ -1294,7 +1326,7 @@ fn gen_server_lines(svc: Service, pkg: String) -> List[String]:
     out.push("# a server for the {svc.name} service. implement one handler per rpc and")
     out.push("# hand them to serve_{svc.name}; the router deframes and decodes each")
     out.push("# request, dispatches by method path, and frames the reply. a streamed")
-    out.push("# request arrives as a List, and a streamed reply is returned as one —")
+    out.push("# request arrives as a List, and a streamed reply is returned as one:")
     out.push("# buffered end to end, so bounded streams only.")
     for rpc in svc.rpcs:
         req_t := server_req_type(rpc)

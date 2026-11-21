@@ -392,6 +392,9 @@ test "the geometry service generates typed client stubs":
     assert(has(out, "pub fn Corners(req: Shape) -> GeometryCornersCall!grpc.GrpcError:"))
     assert(has(out, "self.conn.server_stream("))
     assert(has(out, "pub fn collect() -> List[Point]!grpc.GrpcError:"))
+    # and a typed per-message recv whose done flag marks the end of the stream
+    assert(has(out, "pub struct GeometryCornersReply:"))
+    assert(has(out, "pub fn recv() -> GeometryCornersReply!grpc.GrpcError:"))
     # every streaming handle releases its stream and slot through close()
     assert(has(out, "pub fn close():"))
     assert(has(out, "self.inner.close()"))
@@ -401,10 +404,16 @@ test "the geometry service generates typed client stubs":
     assert(has(out, "self.conn.client_stream("))
     assert(has(out, "pub fn recv_response() -> Shape!grpc.GrpcError:"))
 
-    # bidi: send / close_send / collect
+    # bidi: send / close_send / recv / collect, so a client can talk turn by turn
     assert(has(out, "pub struct GeometryReflectCall:"))
     assert(has(out, "self.conn.bidi_stream("))
     assert(has(out, "pub fn send(req: Point) -> Int:"))
+    assert(has(out, "pub struct GeometryReflectReply:"))
+    assert(has(out, "pub fn recv() -> GeometryReflectReply!grpc.GrpcError:"))
+    assert(has(out, "return GeometryReflectReply(done: msg.done, message: decoded.ok)"))
+    # a unary or client-streaming rpc has no reply stream, so no Reply struct
+    assert(not has(out, "GeometryDescribeReply"))
+    assert(not has(out, "GeometryAssembleReply"))
 
     # a unary rpc on the synthesized Empty wkt, client and server side
     assert(has(out, "pub fn Ping(req: Empty) -> Empty!grpc.GrpcError:"))

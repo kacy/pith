@@ -932,6 +932,13 @@ mark the back edge `weak` (see [ownership.md](ownership.md)). a `weak` field
 is not an edge, and neither is a function-typed field. a cycle that runs
 through another module's structs is not visible to the linter and passes.
 
+the warning is given at a field that names a struct directly or as an
+optional, since only such a field can be `weak`. a cycle made only of
+collection fields, such as a tree's `children: List[Entry]`, is not reported:
+a collection cannot be weak, and a tree closes a loop only if a node is put
+inside its own descendants. a parent pointer back up such a tree
+(`parent: Entry?`) is reported.
+
 ```
 warning[E306]: struct 'Node' holds a strong reference to itself through field 'next'; a cycle of strong references is never reclaimed
   3 |     next: Node?

@@ -1,16 +1,57 @@
-# environment and argument access
+# configuration from the environment: a service reads its settings at startup.
+#
+# std.env reads variables as optionals (`get`) or with a typed fallback
+# (`int_or`, `bool_or`, `str_or`), so a missing or malformed value falls back
+# to a default instead of stopping the service. a setting with no sensible
+# default is required: the service refuses to start without it.
+#
+# the deployment's environment is simulated with std.os.set_env, after the
+# names are cleared, so the output does not depend on the machine running it.
+
+import std.env as env
+import std.os as os
+
+struct Settings:
+    port: Int
+    workers: Int
+    debug: Bool
+    region: String
+    database_url: String
+
+fn load_settings() -> Settings!:
+    url := env.get("CHECKOUT_DATABASE_URL")
+    if url == none:
+        fail "CHECKOUT_DATABASE_URL is not set"
+    return Settings(
+        port: env.int_or("CHECKOUT_PORT", 8080),
+        workers: env.int_or("CHECKOUT_WORKERS", 4),
+        debug: env.bool_or("CHECKOUT_DEBUG", false),
+        region: env.str_or("CHECKOUT_REGION", "local"),
+        database_url: url?,
+    )
+
+fn show(label: String):
+    loaded := load_settings()
+    if loaded.is_err:
+        print("{label}: refusing to start: {loaded.err}")
+        return
+    settings := loaded.ok
+    print("{label}: {settings.database_url}")
+    print("    port {settings.port}, {settings.workers} workers, debug {settings.debug}, region {settings.region}")
 
 fn main():
-    # PATH should always exist
-    path := env("PATH")
-    print("has PATH: {path.len() > 0}")
+    names := ["CHECKOUT_DATABASE_URL", "CHECKOUT_PORT", "CHECKOUT_WORKERS", "CHECKOUT_DEBUG", "CHECKOUT_REGION"]
+    for name in names:
+        os.unset_env(name)
 
-    # nonexistent var returns empty
-    missing := env("PITH_NONEXISTENT_VAR_12345")
-    print("missing is empty: {missing.len() == 0}")
+    show("bare environment")
 
-    # args returns a list
-    a := args()
-    print("has args: {a.len() >= 0}")
+    os.set_env("CHECKOUT_DATABASE_URL", "postgres://db.internal/checkout")
+    show("defaults")
 
-    print("env ops work")
+    os.set_env("CHECKOUT_PORT", "9000")
+    os.set_env("CHECKOUT_DEBUG", "yes")
+    os.set_env("CHECKOUT_REGION", "eu-west")
+    # a typo in a number falls back rather than crashing the service.
+    os.set_env("CHECKOUT_WORKERS", "eight")
+    show("configured")

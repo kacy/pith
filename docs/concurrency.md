@@ -96,10 +96,10 @@ tcp stream waits can use the same context story through `std.io`:
 - `TcpStream.read_bytes_ctx(ctx, max_bytes)`
 - `TcpStream.write_ctx(ctx, data)`
 - `TcpStream.write_all_ctx(ctx, data)`
-- `BufferedTcpStream.read_ctx(ctx, max_bytes)`
-- `BufferedTcpStream.read_line_ctx(ctx)`
-- `BufferedTcpWriter.write_ctx(ctx, data)`
-- `BufferedTcpWriter.flush_ctx(ctx)`
+- `BufferedReader.read_ctx(ctx, max_bytes)`, from `stream.buffered_reader()`
+- `BufferedReader.read_line_ctx(ctx)`
+- `BufferedWriter.write_ctx(ctx, data)`, from `stream.buffered_writer()`
+- `BufferedWriter.flush_ctx(ctx)`
 
 process stdio can use the same pattern too:
 
@@ -109,10 +109,8 @@ process stdio can use the same pattern too:
 - `ProcessStderr.read_all_ctx(ctx)`
 - `ProcessStdin.write_ctx(ctx, data)`
 - `ProcessStdin.write_all_ctx(ctx, data)`
-- `BufferedProcessStdout.read_ctx(ctx, max_bytes)`
-- `BufferedProcessStdout.read_line_ctx(ctx)`
-- `BufferedProcessStderr.read_ctx(ctx, max_bytes)`
-- `BufferedProcessStderr.read_line_ctx(ctx)`
+- `BufferedReader.read_ctx(ctx, max_bytes)` and `read_line_ctx(ctx)`, from
+  `stdout.buffered()` or `stderr.buffered()`
 
 context cancellation is cooperative. cancelling a context stops the wait, not the task itself.
 

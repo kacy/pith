@@ -1,0 +1,39 @@
+# a closure stored in a struct field and called as `h.f(x)`, returning a
+# fresh String. the call result was classified as a borrow, so binding or
+# returning it retained a second count and leaked one string per call.
+import leakprobe as probe
+
+struct Holder:
+    f: fn(Int) -> String
+
+impl Holder:
+    fn apply(x: Int) -> String:
+        return self.f(x)
+
+    fn maybe(x: Int) -> String?:
+        if x < 0:
+            return none
+        return self.f(x)
+
+fn label(x: Int) -> String:
+    return "fn{x}"
+
+fn round(i: Int) -> Int:
+    h := Holder(f: fn(n: Int) => "n{n}")
+    direct := h.f(i)
+    via_method := h.apply(i + 1)
+    named := Holder(f: label).apply(i)
+    opt := h.maybe(i)
+    return direct.len() + via_method.len() + named.len() + opt.value().len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum += round(i)
+        i += 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

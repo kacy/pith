@@ -240,6 +240,10 @@ mut tt_qualified_names: Map[String, Int] := {}
 # it; builtins never enter. the emitter asks this when a struct reached through
 # another module's return type is missing from its own per-module map (#1057).
 mut tt_declared_names: Map[String, Int] := {}
+# the types the entry file declared, by bare name. the entry registers under
+# the empty module path, so it has no qualified view; the emitter asks this
+# when another module's emission needs the entry's own declaration.
+mut tt_entry_names: Map[String, Int] := {}
 
 # add a type to the table, return its id
 pub fn add_type_info(info: TypeInfo) -> Int:
@@ -261,6 +265,7 @@ pub fn register_type_name(name: String, tid: Int):
 pub fn register_qualified_type_name(module_path: String, name: String, tid: Int):
     tt_declared_names.insert(name, tid)
     if module_path.len() == 0:
+        tt_entry_names.insert(name, tid)
         return
     tt_qualified_names.insert(module_path + chr(9) + name, tid)
 
@@ -270,6 +275,13 @@ pub fn register_qualified_type_name(module_path: String, name: String, tid: Int)
 pub fn lookup_declared_type_id(name: String) -> Int:
     if tt_declared_names.contains_key(name):
         return tt_declared_names[name]
+    return -1
+
+# look up a type the entry file declared, by bare name; -1 when the entry
+# declared no type of that name.
+pub fn lookup_entry_type_id(name: String) -> Int:
+    if tt_entry_names.contains_key(name):
+        return tt_entry_names[name]
     return -1
 
 # look up a type by name, returns -1 if not found
@@ -478,6 +490,7 @@ pub fn initialize_type_table():
     tt_names = {}
     tt_qualified_names = {}
     tt_declared_names = {}
+    tt_entry_names = {}
     # primitives at known indices 0-14
     add_type_info(ti_primitive("Int"))
     register_type_name("Int", TID_INT)
@@ -531,11 +544,12 @@ pub struct TypeTableSnapshot:
     pub names: Map[String, Int]
     pub qualified_names: Map[String, Int]
     pub declared_names: Map[String, Int]
+    pub entry_names: Map[String, Int]
 
 # copy the table out. the live table keeps changing afterwards; the
 # snapshot does not.
 pub fn take_type_table_snapshot() -> TypeTableSnapshot:
-    return TypeTableSnapshot(copy_list(tt_types), copy_map(tt_names), copy_map(tt_qualified_names), copy_map(tt_declared_names))
+    return TypeTableSnapshot(copy_list(tt_types), copy_map(tt_names), copy_map(tt_qualified_names), copy_map(tt_declared_names), copy_map(tt_entry_names))
 
 # make the live table a copy of the snapshot. the snapshot itself is left
 # untouched, so it can be restored again after the next run.
@@ -544,3 +558,4 @@ pub fn restore_type_table_snapshot(s: TypeTableSnapshot):
     tt_names = copy_map(s.names)
     tt_qualified_names = copy_map(s.qualified_names)
     tt_declared_names = copy_map(s.declared_names)
+    tt_entry_names = copy_map(s.entry_names)

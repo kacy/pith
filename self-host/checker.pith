@@ -5440,7 +5440,10 @@ fn check_type_parameter_bounds(decl_node_idx: Int, subst_map: Map[String, Int]) 
                         # its methods dispatch
                         own_value := is_interface_value_type(inferred_tid) and extract_base_type_name(type_name) == extract_base_type_name(iface_name)
                         if not own_value and check_type_implements_interface(type_name, iface_name) == false:
-                            report_error("E226", "type '" + type_name + "' does not implement interface '" + iface_name + "'")
+                            # conformance is declared, never inferred from
+                            # matching method names
+                            fix := "add `impl " + extract_base_type_name(iface_name) + " for " + extract_base_type_name(type_name) + ":`. methods with the right names do not satisfy an interface on their own"
+                            report_error_with_fix("E226", "type '" + type_name + "' does not implement interface '" + iface_name + "'", fix)
                             ok = false
     return ok
 

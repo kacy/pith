@@ -1,25 +1,40 @@
+# uuid_ops: choosing and checking ids with std.uuid.
+#
+# gives ids to the pages a crawler visits. a v5 id is derived from the url,
+# so revisiting a page finds the same record; a v7 id starts with its
+# timestamp, so visit records sort by time; a v4 id is random, for a crawl
+# session nobody should guess. ids typed in by a person are checked and put
+# in canonical form before use.
+
 import std.uuid as uuid
 
 fn main() -> Int!:
-    random_seed(42)
+    print("page ids, derived from the url:")
+    for url in ["https://example.com/", "https://example.com/about", "https://example.com/"]:
+        print("  {uuid.v5(uuid.namespace_url(), url)}  {url}")
 
-    id1 := uuid.v4()!
-    id2 := uuid.v4()!
-    stable := uuid.v5(uuid.namespace_dns(), "www.example.com")
-    sortable1 := uuid.v7_at(1645557742000)!
-    sortable2 := uuid.v7_at(1645557742000)!
-    parsed := uuid.parse(stable).ok
+    # fixed timestamps stand in for the clock so the output is repeatable
+    first_visit := uuid.v7_at(1764000000000)!
+    second_visit := uuid.v7_at(1764000060000)!
+    print("")
+    # the first 48 bits are the timestamp; the rest is random
+    print("visit ids sort by time: {first_visit < second_visit}")
+    print("  {first_visit.substring(0, 13)}...")
+    print("  {second_visit.substring(0, 13)}...")
 
-    print("len: {id1.len()}")
-    print("v4 version: {id1[14]}")
-    print("v4 unique: {id1 != id2}")
-    print("v5 dns: {stable}")
-    print("v7 version: {sortable1[14]}")
-    print("v7 ordered: {sortable1 < sortable2}")
-    print("parse version: {parsed.version()}")
-    valid_upper := uuid.is_valid("2ED6657D-E927-568B-95E1-2665A8AEA6A2")
-    print("valid upper: {valid_upper}")
-    print("nil version: {uuid.nil().version()}")
-    print("max is max: {uuid.max().is_max()}")
-    print("uuid ops work")
+    # a random id is different every run, so only its shape is shown
+    session := uuid.v4()!
+    print("")
+    # the version is the first digit of the third group
+    print("session id: {session.len()} characters, version {session[14]}, valid {uuid.is_valid(session)}")
+
+    print("")
+    for typed in ["5A9E3C3E-6E1B-5C0B-8D8E-0F5B7C9A1D2E", "not-a-uuid", "00000000-0000-0000-0000-000000000000"]:
+        parsed := uuid.parse(typed) catch:
+            print("rejected: {typed}")
+            continue
+        if parsed.is_nil():
+            print("rejected: the nil uuid means no id at all")
+            continue
+        print("accepted: {parsed.to_string()} (version {parsed.version()})")
     return 0

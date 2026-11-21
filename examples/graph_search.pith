@@ -1,56 +1,57 @@
-# graph search — BFS on a small graph using adjacency map
-# exercises: maps, lists, while loops, string operations
+# graph_search: breadth-first search over an adjacency map.
+#
+# finds the route with the fewest stops between stations on a small metro
+# map. the graph is a Map from each station to its neighbours; the search
+# keeps a queue of stations to visit and, for each station it reaches, the
+# one it came from, so the route can be read back from the destination.
+
+fn metro() -> Map[String, List[String]]:
+    mut lines: Map[String, List[String]] := {}
+    connect(lines, ["harbor", "market", "center", "museum", "university"])
+    connect(lines, ["airport", "center", "stadium"])
+    connect(lines, ["market", "old town", "stadium", "zoo"])
+    return lines
+
+# a line is a chain of stations, each linked both ways to the next
+fn connect(lines: Map[String, List[String]], stops: List[String]):
+    for index in 1..stops.len():
+        link(lines, stops[index - 1], stops[index])
+        link(lines, stops[index], stops[index - 1])
+
+fn link(lines: Map[String, List[String]], origin: String, destination: String):
+    if not lines.contains_key(origin):
+        lines[origin] = []
+    lines[origin].push(destination)
+
+fn shortest_route(lines: Map[String, List[String]], start: String, goal: String) -> List[String]?:
+    mut came_from: Map[String, String] := {start: start}
+    mut queue := [start]
+    mut next_index := 0
+    while next_index < queue.len():
+        station := queue[next_index]
+        next_index += 1
+        if station == goal:
+            break
+        for neighbour in lines.get(station).unwrap_or([]):
+            if not came_from.contains_key(neighbour):
+                came_from[neighbour] = station
+                queue.push(neighbour)
+
+    if not came_from.contains_key(goal):
+        return none
+    mut route := [goal]
+    while route[route.len() - 1] != start:
+        route.push(came_from[route[route.len() - 1]])
+    route.reverse()
+    return route
 
 fn main():
-    # build adjacency as separate neighbor lists
-    mut a_neighbors: List[String] := ["B", "C"]
-    mut b_neighbors: List[String] := ["A", "D"]
-    mut c_neighbors: List[String] := ["A", "D", "F"]
-    mut d_neighbors: List[String] := ["B", "C", "E"]
-    mut e_neighbors: List[String] := ["D"]
-    mut f_neighbors: List[String] := ["C"]
-
-    # map node -> neighbors (stored as joined string for simplicity)
-    mut adj: Map[String, String] := {}
-    adj.insert("A", "B,C")
-    adj.insert("B", "A,D")
-    adj.insert("C", "A,D,F")
-    adj.insert("D", "B,C,E")
-    adj.insert("E", "D")
-    adj.insert("F", "C")
-
-    # BFS from A
-    mut visited: Map[String, Bool] := {}
-    mut queue: List[String] := []
-    mut order: List[String] := []
-
-    queue.push("A")
-    visited.insert("A", true)
-
-    while queue.len() > 0:
-        node := queue[0]
-        queue.remove(0)
-        order.push(node)
-
-        node_key := node
-        if adj.contains_key(node_key):
-            neighbor_str := adj[node_key]
-            neighbors := neighbor_str.split(",")
-            mut i := 0
-            while i < neighbors.len():
-                n := neighbors[i]
-                n_key := n
-                if not visited.contains_key(n_key):
-                    visited.insert(n, true)
-                    queue.push(n)
-                i = i + 1
-
-    print("bfs: {order.join(" -> ")}")
-    print("visited: {order.len()}")
-
-    # check connectivity
-    print("A visited: {visited.contains_key("A")}")
-    print("E visited: {visited.contains_key("E")}")
-    print("F visited: {visited.contains_key("F")}")
-
-    print("graph works")
+    lines := metro()
+    print("{lines.len()} stations")
+    trips := [("harbor", "zoo"), ("airport", "university"), ("museum", "museum"), ("zoo", "library")]
+    for trip in trips:
+        if let route = shortest_route(lines, trip.0, trip.1):
+            stops := route.len() - 1
+            print("{trip.0} to {trip.1}, {stops} stop(s): {route.join(" -> ")}")
+        else:
+            print("{trip.0} to {trip.1}: no route")

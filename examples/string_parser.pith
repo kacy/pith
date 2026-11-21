@@ -1,59 +1,115 @@
-# string parser — CSV parser and formatter
-# exercises: string splitting, loops, maps, string building
+# string_parser: a hand-written tokenizer and recursive-descent parser.
+#
+# evaluates arithmetic like "2 * (3 + 4) - 10 / 5". the tokenizer walks the
+# string one character at a time and produces enum values with payloads; the
+# parser has one function per precedence level, so `*` binds tighter than `+`
+# without any table. errors name the position where the input went wrong.
 
-fn parse_field(line: String, field_idx: Int) -> String:
-    parts := line.split(",")
-    if field_idx < parts.len():
-        return parts[field_idx].trim()
-    return ""
+enum Token:
+    Number(Int)
+    Op(String)
+    Open
+    Close
+    End
 
-fn count_fields(line: String) -> Int:
-    return line.split(",").len()
+struct Parser:
+    tokens: List[Token]
+    position: Int
+
+fn tokenize(source: String) -> List[Token]!:
+    mut tokens: List[Token] := []
+    mut number := ""
+    for ch, index in source + " ":
+        if "0123456789".contains(ch):
+            number = number + ch
+            continue
+        if not number.is_empty():
+            tokens.push(Token.Number(parse_int(number)!))
+            number = ""
+        if ch == " ":
+            continue
+        if "+-*/".contains(ch):
+            tokens.push(Token.Op(ch))
+        elif ch == "(":
+            tokens.push(Token.Open)
+        elif ch == ")":
+            tokens.push(Token.Close)
+        else:
+            fail "unexpected '{ch}' at column {index + 1}"
+    return tokens
+
+impl Parser:
+    # reading past the last token yields End rather than failing, so every
+    # caller handles running out of input in its own match
+    fn peek() -> Token:
+        return self.tokens.get(self.position).unwrap_or(Token.End)
+
+    # the next token if it is one of the given operators, or "" otherwise
+    fn next_op_in(ops: String) -> String:
+        if let Token.Op(op) = self.peek():
+            if ops.contains(op):
+                self.position += 1
+                return op
+        return ""
+
+    # expression := term (("+" | "-") term)*
+    fn expression() -> Int!:
+        mut value := self.term()!
+        while true:
+            op := self.next_op_in("+-")
+            if op.is_empty():
+                break
+            right := self.term()!
+            value = if op == "+": value + right else: value - right
+        return value
+
+    # term := factor (("*" | "/") factor)*
+    fn term() -> Int!:
+        mut value := self.factor()!
+        while true:
+            op := self.next_op_in("*/")
+            if op.is_empty():
+                break
+            right := self.factor()!
+            if op == "/" and right == 0:
+                fail "division by zero"
+            value = if op == "*": value * right else: value / right
+        return value
+
+    # factor := number | "(" expression ")"
+    fn factor() -> Int!:
+        token := self.peek()
+        self.position += 1
+        match token:
+            Token.Number(value) =>
+                return value
+            Token.Open =>
+                return self.closed_group()!
+            Token.Close =>
+                fail "unexpected ')'"
+            Token.Op(op) =>
+                fail "unexpected '{op}'"
+            Token.End =>
+                fail "expression ends too early"
+
+    fn closed_group() -> Int!:
+        value := self.expression()!
+        if let Token.Close = self.peek():
+            self.position += 1
+            return value
+        fail "missing ')'"
+
+fn evaluate(source: String) -> Int!:
+    parser := Parser(tokens: tokenize(source)!, position: 0)
+    value := parser.expression()!
+    if parser.position < parser.tokens.len():
+        fail "unexpected input after the expression"
+    return value
 
 fn main():
-    csv := "name,age,city\nalice,30,new york\nbob,25,london\ncarol,35,tokyo"
-    lines := csv.split("\n")
-    print("rows: {lines.len()}")
-    print("cols: {count_fields(lines[0])}")
-
-    # extract columns
-    mut names: List[String] := []
-    mut ages: List[String] := []
-    mut cities: List[String] := []
-    mut i := 0
-    while i < lines.len():
-        line := lines[i]
-        names.push(parse_field(line, 0))
-        ages.push(parse_field(line, 1))
-        cities.push(parse_field(line, 2))
-        i = i + 1
-    print("names: {names.join(", ")}")
-    print("ages: {ages.join(", ")}")
-    print("cities: {cities.join(", ")}")
-
-    # format as table
-    mut table_lines: List[String] := []
-    i = 0
-    while i < lines.len():
-        line := lines[i]
-        n := parse_field(line, 0)
-        a := parse_field(line, 1)
-        c := parse_field(line, 2)
-        table_lines.push("{n} | {a} | {c}")
-        i = i + 1
-    print(table_lines.join("\n"))
-
-    # reverse lookup via map
-    mut name_to_city: Map[String, String] := {}
-    i = 1
-    while i < lines.len():
-        n := parse_field(lines[i], 0)
-        c := parse_field(lines[i], 2)
-        name_to_city.insert(n, c)
-        i = i + 1
-    alice_key := "alice"
-    bob_key := "bob"
-    print("alice lives in: {name_to_city[alice_key]}")
-    print("bob lives in: {name_to_city[bob_key]}")
-
-    print("parser works")
+    for source in ["1 + 2 * 3", "2 * (3 + 4) - 10 / 5", "((7))", "8 / (4 - 4)", "3 + ", "2 $ 2", "(1 + 2"]:
+        result := evaluate(source)
+        if result.is_err:
+            print("{source:<22} error: {result.err}")
+        else:
+            print("{source:<22} = {result.ok}")

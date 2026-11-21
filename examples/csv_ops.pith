@@ -1,30 +1,54 @@
-# csv parsing and encoding
+# csv_ops: reading and writing CSV with std.csv.
+#
+# summarizes a month of expenses exported from a bank. parse_with_headers
+# turns each row into a map keyed by column name, quoted fields keep their
+# commas, and the summary is encoded back to CSV, saved, and read again.
 
 import std.csv as csv
 import std.fs as fs
 
-fn main() -> String!:
-    path := "/tmp/pith_csv_ops.csv"
-    data := "name,age,city\nalice,30,nyc\nbob,25,sf"
-    rows := csv.parse(data)
-    print("rows: {rows.len()}")
-    print("first: {rows[0].join("|")}")
-    print("second: {rows[1].join("|")}")
-    print("third: {rows[2].join("|")}")
+fn export_text() -> String:
+    return [
+        "date,payee,category,amount_cents",
+        "2026-11-02,corner cafe,food,450",
+        "2026-11-03,\"rail, regional\",travel,2380",
+        "2026-11-09,grocer,food,6215",
+        "2026-11-14,\"books \"\"n\"\" more\",leisure,1899",
+        "2026-11-20,grocer,food,4105",
+        "2026-11-28,taxi,travel,1720",
+].join("\n")
 
-    # encoding
-    mut r1: List[String] := ["x", "y"]
-    print("encoded: {csv.encode_row(r1)}")
+fn dollars(cents: Int) -> String:
+    return "{cents / 100}.{(cents % 100):02}"
 
-    # quoting
-    mut r2: List[String] := ["hello, world", "plain"]
-    print("quoted: {csv.encode_row(r2)}")
+fn main() -> Int!:
+    rows := csv.parse_with_headers(export_text())
+    print("{rows.len()} transactions")
 
-    # file-backed helpers use the same shared io layer now
-    print("saved: {csv.save(path, rows)!}")
-    loaded := csv.parse_file(path)!
-    print("loaded: {loaded[1].join("|")}")
-    fs.remove(path)
+    mut totals: Map[String, Int] := {}
+    mut largest := rows[0]
+    for row in rows:
+        cents := parse_int(row["amount_cents"])!
+        totals[row["category"]] = totals.get(row["category"]).unwrap_or(0) + cents
+        if cents > parse_int(largest["amount_cents"])!:
+            largest = row
 
-    print("csv ops work")
-    return ""
+    # a quoted field comes back without its quotes, commas and all
+    print("largest: {largest["payee"]} on {largest["date"]}, {dollars(parse_int(largest["amount_cents"])!)}")
+    print("")
+
+    mut summary: List[List[String]] := [["category", "total"]]
+    for category in totals.keys().sort():
+        print("{category:<8} {dollars(totals[category]):>7}")
+        summary.push([category, dollars(totals[category])])
+
+    # encode_row quotes only the fields that need it
+    print("")
+    print(csv.encode_row(["note", "food, mostly groceries"]))
+
+    path := "/tmp/pith_csv_ops_summary.csv"
+    defer fs.remove(path)
+    written := csv.save(path, summary)!
+    reloaded := csv.parse_file(path)!
+    print("saved {written} bytes, read back {reloaded.len() - 1} categories")
+    return 0

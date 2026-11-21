@@ -1,8 +1,10 @@
-# the compression family: gzip (rfc 1952, pure pith) and zstd (rfc 8878,
-# the reference codec in the runtime). the surfaces mirror each other —
-# compress, decompress, and a bounded decompress for untrusted input, where
-# the cap is enforced while decoding so a decompression bomb fails at the
-# limit instead of allocating its way there.
+# compression: gzip and zstd with std.compress.
+#
+# gzip (rfc 1952) is written in pith; zstd (rfc 8878) is the reference codec
+# in the runtime, with a pure-pith encoder and decoder beside it. the two
+# surfaces mirror each other: compress, decompress, and a bounded decompress
+# for untrusted input, where the cap is enforced while decoding so a
+# decompression bomb fails at the limit instead of allocating its way there.
 
 import std.bytes as bytes
 import std.compress.gzip as gzip
@@ -12,12 +14,10 @@ import std.compress.zstd_pure_frame as pure_frame
 
 fn main() -> Int!:
     # a repetitive payload, the shape compression is for
-    mut buf := bytes.buffer()
-    mut i := 0
-    while i < 200:
-        buf.write_string_utf8("the quick brown fox jumps over the lazy dog. ")
-        i = i + 1
-    raw := buf.take_bytes()
+    buffer := bytes.buffer()
+    for line in 0..200:
+        buffer.write_string_utf8("the quick brown fox jumps over the lazy dog. ")!
+    raw := buffer.take_bytes()
     print("raw: {raw.len()} bytes")
 
     gz := gzip.compress(raw)
@@ -34,10 +34,10 @@ fn main() -> Int!:
     # into 1000, and the decode fails at the cap rather than after it
     print("bounded refuses: {zstd.decompress_bounded(zs, 1000).is_err}")
 
-    # the same format implemented entirely in pith: frames from the pure
-    # encoder are read back by the reference codec, and the pure decoder
-    # reads reference frames — interop in both directions, not just a
-    # round trip through our own code
+    # the same format implemented entirely in pith. frames from the pure
+    # encoder are read back by the reference codec and the pure decoder reads
+    # reference frames, which tests interop in both directions rather than a
+    # round trip through one implementation
     pp := pure_encode.compress(raw)
     print("pure pith: {pp.len()} bytes, reference codec reads it: {zstd.decompress(pp)!.len() == raw.len()}")
     print("pure decoder reads reference frames: {pure_frame.decompress_bounded(zs, 100000)!.len() == raw.len()}")

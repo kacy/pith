@@ -1,4 +1,10 @@
-# crypto ops - hmac, hkdf, pbkdf2, and subtle comparison
+# crypto_ops: message authentication and key derivation.
+#
+# three jobs a web backend does with std.crypto: check that a webhook really
+# came from the sender who shares our secret (hmac), turn a password into a
+# slow-to-guess stored hash (pbkdf2), and split one master key into separate
+# keys for separate purposes (hkdf). comparisons of secret values go through
+# subtle.equal, which takes the same time whether or not they match.
 
 import std.bytes as bytes
 import std.crypto.hmac as hmac
@@ -6,27 +12,44 @@ import std.crypto.kdf as kdf
 import std.crypto.subtle as subtle
 import std.encoding as encoding
 
-fn main() -> String!:
-    key := bytes.from_string_utf8("key")
-    message := bytes.from_string_utf8("The quick brown fox jumps over the lazy dog")
-    mac := hmac.sha256(key, message)
-    print("hmac sha256: {encoding.to_hex(mac)}")
-    print("hmac verify: {hmac.verify_sha256(key, message, mac)}")
-    mac512 := hmac.sha512(key, message)
-    print("hmac sha512 prefix: {encoding.to_hex(mac512).substring(0, 32)}")
+fn text(value: String) -> Bytes:
+    return bytes.from_string_utf8(value)
 
-    ikm := encoding.from_hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b")!
-    salt := encoding.from_hex("000102030405060708090a0b0c")!
-    info := encoding.from_hex("f0f1f2f3f4f5f6f7f8f9")!
-    hkdf := kdf.hkdf_sha256(ikm, salt, info, 16)!
-    print("hkdf prefix: {encoding.to_hex(hkdf)}")
-    hkdf512 := kdf.hkdf_sha512(ikm, salt, info, 16)!
-    print("hkdf sha512 prefix: {encoding.to_hex(hkdf512)}")
+fn sign_webhook(secret: Bytes, body: String) -> String:
+    return encoding.to_hex(hmac.sha256(secret, text(body)))
 
-    derived := kdf.pbkdf2_sha256(bytes.from_string_utf8("password"), bytes.from_string_utf8("salt"), 2, 16)!
-    print("pbkdf2 prefix: {encoding.to_hex(derived)}")
-    derived512 := kdf.pbkdf2_sha512(bytes.from_string_utf8("password"), bytes.from_string_utf8("salt"), 2, 16)!
-    print("pbkdf2 sha512 prefix: {encoding.to_hex(derived512)}")
-    print("subtle equal: {subtle.equal(mac, mac)}")
-    print("crypto ops work")
-    return ""
+fn webhook_is_authentic(secret: Bytes, body: String, signature_hex: String) -> Bool:
+    claimed := encoding.from_hex(signature_hex) catch:
+        return false
+    return hmac.verify_sha256(secret, text(body), claimed)
+
+# real deployments use far more iterations; this keeps the example quick
+fn hash_password(password: String, salt: Bytes) -> Bytes!:
+    return kdf.pbkdf2_sha256(text(password), salt, 1000, 32)!
+
+fn main() -> Int!:
+    secret := text("whsec_shared_between_us")
+    body := "{{\"event\":\"invoice.paid\",\"amount\":4200}}"
+    signature := sign_webhook(secret, body)
+    print("signature: {signature}")
+    print("genuine body accepted:  {webhook_is_authentic(secret, body, signature)}")
+    print("edited body rejected:   {not webhook_is_authentic(secret, body.replace("4200", "9900"), signature)}")
+    print("malformed hex rejected: {not webhook_is_authentic(secret, body, "zz")}")
+
+    print("")
+    salt := text("per-user-salt-01")
+    stored := hash_password("correct horse battery staple", salt)!
+    print("stored hash: {encoding.to_hex(stored).substring(0, 32)}...")
+    for attempt in ["correct horse battery staple", "Correct horse battery staple"]:
+        matches := subtle.equal(hash_password(attempt, salt)!, stored)
+        print("login with '{attempt}': {matches}")
+
+    # one master key, two derived keys: a leak of one does not expose the other
+    print("")
+    master := encoding.from_hex("000102030405060708090a0b0c0d0e0f")!
+    encryption_key := kdf.hkdf_sha256(master, text("app-v1"), text("encryption"), 16)!
+    signing_key := kdf.hkdf_sha256(master, text("app-v1"), text("signing"), 16)!
+    print("encryption key: {encoding.to_hex(encryption_key)}")
+    print("signing key:    {encoding.to_hex(signing_key)}")
+    print("keys differ:    {not subtle.equal(encryption_key, signing_key)}")
+    return 0

@@ -1,54 +1,50 @@
-# test std.algo (sorting, searching) + std.collections (utilities)
+# stdlib_algo: sorting and searching with std.algo, plus the integer list
+# helpers in std.collections.
+#
+# grades one test for a class: sorted scores give the median and the top
+# three, binary search looks up a score, set-like helpers compare who sat the
+# test with who sat the retake, and chunks splits the class into study groups.
+
+import std.algo as algo
+import std.collections as collections
 import std.fmt as fmt
-from std.algo import sort, sort_desc, sort_strings, binary_search
-from std.collections import sum, min_of, max_of, reversed, product
-from std.collections import unique, without, intersection, difference
-from std.collections import slice, flatten, chunks, is_sorted, count
-from std.collections import take, drop, has, zip, enumerate, index_of
+
+fn median(sorted: List[Int]) -> Int:
+    middle := sorted.len() / 2
+    if sorted.len() % 2 == 1:
+        return sorted[middle]
+    return (sorted[middle - 1] + sorted[middle]) / 2
 
 fn main():
-    # sorting
-    print("sort: {fmt.ints(sort([3, 1, 4, 1, 5, 9, 2, 6]))}")
-    print("sort_desc: {fmt.ints(sort_desc([3, 1, 4, 1, 5]))}")
-    print("sort_strings: {sort_strings(["banana", "apple", "cherry"]).join(", ")}")
+    student_ids := [101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
+    scores := [72, 88, 45, 91, 60, 88, 100, 54, 79, 60]
 
-    # searching
-    sorted := sort([10, 30, 20, 40, 50])
-    print("binary_search 30: {binary_search(sorted, 30).unwrap_or(-1)}")
-    print("binary_search 99: {binary_search(sorted, 99).unwrap_or(-1)}")
-    print("index_of 20: {index_of([10, 20, 30], 20).unwrap_or(-1)}")
+    sorted := algo.sort(scores)
+    print("scores, low to high: {fmt.ints(sorted)}")
+    print("average {collections.sum(scores) / scores.len()}, median {median(sorted)}, range {collections.min_of(scores)}-{collections.max_of(scores)}")
+    print("top three: {fmt.ints(collections.take(algo.sort_desc(scores), 3))}")
+    print("distinct scores: {collections.unique(sorted).len()}, perfect scores: {collections.count(scores, 100)}")
 
-    # dedup and filtering
-    print("unique: {fmt.ints(unique([1, 1, 2, 2, 3, 3, 3]))}")
-    print("without 2: {fmt.ints(without([1, 2, 3, 2, 4], 2))}")
-    print("intersection: {fmt.ints(intersection([1, 2, 3, 4], [2, 4, 6]))}")
-    print("difference: {fmt.ints(difference([1, 2, 3, 4], [2, 4]))}")
+    pass_mark := 60
+    failed := sorted.filter(fn(score: Int) => score < pass_mark).len()
+    print("pass mark {pass_mark}: {sorted.len() - failed} passed, {failed} below")
+    print("passing scores: {fmt.ints(collections.drop(sorted, failed))}")
 
-    # transformation
-    print("reverse: {fmt.ints(reversed([1, 2, 3, 4, 5]))}")
-    print("slice 1..4: {fmt.ints(slice([10, 20, 30, 40, 50], 1, 4))}")
-    print("take 3: {fmt.ints(take([10, 20, 30, 40, 50], 3))}")
-    print("drop 2: {fmt.ints(drop([10, 20, 30, 40, 50], 2))}")
-    print("flatten: {fmt.ints([1, 2, 3, 4, 5, 6])}")
-    print("chunks: {fmt.nested_ints(chunks([1, 2, 3, 4, 5], 2))}")
+    # binary search needs sorted input and answers in log2(n) steps
+    for wanted in [79, 80]:
+        found := algo.binary_search(sorted, wanted)
+        print("anyone on exactly {wanted}: {found != none}")
 
-    # combining
-    print("zip: {zip([1, 2, 3], [10, 20, 30]).join(", ")}")
-    print("enumerate: {enumerate([10, 20, 30]).join(", ")}")
+    # who scored the first 88, by position in the original list
+    if let first_88 = collections.index_of(scores, 88):
+        print("first 88 by student {student_ids[first_88]}")
 
-    # aggregation
-    print("sum: {sum([1, 2, 3, 4, 5])}")
-    print("product: {product([2, 3, 4])}")
-    print("min: {min_of([5, 2, 8, 1, 9])}")
-    print("max: {max_of([5, 2, 8, 1, 9])}")
+    print("")
+    retake_ids := [103, 108, 111]
+    print("sat the retake too: {fmt.ints(collections.intersection(student_ids, retake_ids))}")
+    print("retake only: {fmt.ints(collections.difference(retake_ids, student_ids))}")
+    print("register in order: {collections.is_sorted(student_ids)}")
 
-    # queries
-    if has([1, 2, 3], 2):
-        print("has 2: true")
-    if is_sorted([1, 2, 3]):
-        print("is_sorted [1,2,3]: true")
-    if not is_sorted([3, 1, 2]):
-        print("is_sorted [3,1,2]: false")
-    print("count 2: {count([1, 2, 2, 3, 2], 2)}")
-
-    print("algo tests passed")
+    groups := collections.chunks(student_ids, 4)
+    print("study groups: {fmt.nested_ints(groups)}")
+    print("everyone placed: {collections.flatten(groups).len() == student_ids.len()}")

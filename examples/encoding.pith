@@ -1,47 +1,50 @@
-# encoding — base64 and hex encode/decode
-# demonstrates: bytes-first encoding with explicit utf-8 boundaries
+# encoding: base64, base32, hex and PEM with std.encoding.
+#
+# the text encodings an auth service uses every day: base64 for a Basic
+# authorization header, unpadded url-safe base64 for a token in a link,
+# base32 for an authenticator app's secret, hex for a fingerprint, and PEM
+# to wrap a key for a config file. each one turns bytes into text and back.
 
 import std.bytes as bytes
 import std.encoding as encoding
 
-fn run() -> String!:
-    raw := bytes.from_string_utf8("hello world")
-    encoded_base64 := encoding.b64_encode(raw)
-    print("base64 encode: {encoded_base64}")
+fn basic_auth_header(user: String, password: String) -> String:
+    return "Basic " + encoding.b64_encode(bytes.from_string_utf8("{user}:{password}"))
 
-    decoded_string := encoding.b64_decode(encoded_base64)!.to_string_utf8()!
-    print("base64 decode: {decoded_string}")
+fn parse_basic_auth(header: String) -> String!:
+    if not header.starts_with("Basic "):
+        fail "not a Basic header"
+    raw := encoding.b64_decode(header.substring(6, header.len()))!
+    return raw.to_string_utf8()!
 
-    print("base64 'a': {encoding.b64_encode(bytes.from_string_utf8("a"))}")
-    print("base64 'ab': {encoding.b64_encode(bytes.from_string_utf8("ab"))}")
-    print("base64 'abc': {encoding.b64_encode(bytes.from_string_utf8("abc"))}")
-    print("base64 raw: {encoding.b64_raw_encode(bytes.from_string_utf8("foobar"))}")
-    print("base64 url raw: {encoding.b64_url_raw_encode(bytes.from_string_utf8("??"))}")
+fn main() -> Int!:
+    header := basic_auth_header("ada", "correct horse")
+    print("authorization: {header}")
+    print("decoded back:  {parse_basic_auth(header)!}")
+    bad := parse_basic_auth("Basic not*base64")
+    print("garbage rejected: {bad.is_err}")
 
-    hex_encoded := encoding.to_hex(bytes.from_string_utf8("Hello"))
-    print("hex encode: {hex_encoded}")
-    print("hex upper: {encoding.to_hex_upper(bytes.from_string_utf8("Hello"))}")
+    # bytes that are not text, such as a random token, still need a text
+    # form; the url-safe alphabet avoids + and /, which links would mangle
+    token := bytes.buffer()
+    for value in [251, 255, 191, 0, 62, 63]:
+        token.write_byte(value)!
+    token_bytes := token.take_bytes()
+    print("")
+    print("token, standard base64: {encoding.b64_encode(token_bytes)}")
+    print("token, url-safe raw:    {encoding.b64_url_raw_encode(token_bytes)}")
+    print("token, hex:             {encoding.to_hex(token_bytes)}")
 
-    hex_decoded := encoding.from_hex(hex_encoded)!.to_string_utf8()!
-    print("hex decode: {hex_decoded}")
+    # base32 uses only capitals and digits 2-7, so a person can type it
+    secret := encoding.base32_encode(bytes.from_string_utf8("12345678901234567890"))
+    print("")
+    print("authenticator secret: {secret}")
+    print("round trip: {encoding.base32_decode(secret)!.to_string_utf8()! == "12345678901234567890"}")
+    print("fingerprint: {encoding.to_hex_upper(encoding.from_hex("a1b2c3d4")!)}")
 
-    base32_encoded := encoding.base32_encode(bytes.from_string_utf8("foobar"))
-    print("base32 encode: {base32_encoded}")
-    print("base32 decode: {encoding.base32_decode(base32_encoded)!.to_string_utf8()!}")
-
-    single_byte := bytes.buffer()
-    single_byte.write_byte(255)!
-    print("hex 0xff: {encoding.to_hex(single_byte.bytes())}")
-
-    pem := encoding.pem_encode("PITH DATA", bytes.from_string_utf8("hello"))
-    parsed := encoding.pem_decode(pem)!
-    print("pem kind: {parsed.kind}")
-    print("pem body: {parsed.body.to_string_utf8()!}")
-
-    original_text := "pith programming language"
-    roundtrip_result := encoding.b64_decode(encoding.b64_encode(bytes.from_string_utf8(original_text)))!.to_string_utf8()!
-    print("round-trip: {roundtrip_result}")
-    return ""
-
-fn main():
-    run()
+    pem := encoding.pem_encode("PITH TEST KEY", bytes.from_string_utf8("not a real key"))
+    print("")
+    print(pem.trim())
+    block := encoding.pem_decode(pem)!
+    print("label {block.kind}, {block.body.len()} bytes")
+    return 0

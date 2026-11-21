@@ -1,33 +1,65 @@
-# test std.math — pure Pith math library
-from std.math import PI, E, sin, cos, atan, asin, acos
-from std.math import exp, sqrt, pow_float
-from std.math import degrees, radians, abs_float, sign
+# stdlib_math: trigonometry, roots and powers with std.math.
+#
+# measures flights from london. the great-circle distance comes from the
+# haversine formula (sin, cos, asin, sqrt) and the initial heading from
+# atan2. a short compound-interest sum then shows pow_float, exp and log.
+# floats print at a fixed precision so the output is stable.
+
+import std.math as math
+
+struct City:
+    name: String
+    latitude: Float
+    longitude: Float
+
+EARTH_RADIUS_KM := 6371.0
+
+fn distance_km(a: City, b: City) -> Float:
+    lat1 := math.radians(a.latitude)
+    lat2 := math.radians(b.latitude)
+    dlat := lat2 - lat1
+    dlon := math.radians(b.longitude - a.longitude)
+    half_lat := math.sin(dlat / 2.0)
+    half_lon := math.sin(dlon / 2.0)
+    h := half_lat * half_lat + math.cos(lat1) * math.cos(lat2) * half_lon * half_lon
+    return 2.0 * EARTH_RADIUS_KM * math.asin(math.sqrt(h))
+
+# compass bearing in degrees, 0 = north, 90 = east
+fn heading(a: City, b: City) -> Float:
+    lat1 := math.radians(a.latitude)
+    lat2 := math.radians(b.latitude)
+    dlon := math.radians(b.longitude - a.longitude)
+    y := math.sin(dlon) * math.cos(lat2)
+    x := math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+    bearing := math.degrees(math.atan2(y, x))
+    return if bearing < 0.0: bearing + 360.0 else: bearing
+
+fn compass_point(bearing: Float) -> String:
+    points := ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    return points[((bearing + 22.5) / 45.0).to_int() % 8]
 
 fn main():
-    # constants
-    print("PI: {fmt_float(PI(), 6)}")
-    print("E: {fmt_float(E(), 6)}")
+    london := City(name: "london", latitude: 51.5074, longitude: -0.1278)
+    legs := [
+        City(name: "new york", latitude: 40.7128, longitude: -74.006),
+        City(name: "tokyo", latitude: 35.6762, longitude: 139.6503),
+        City(name: "sydney", latitude: -33.8688, longitude: 151.2093),
+]
+    for city in legs:
+        km := distance_km(london, city)
+        bearing := heading(london, city)
+        print("london -> {city.name:<9} {km:8.0} km, heading {bearing:5.1} ({compass_point(bearing)})")
 
-    # trig (use small values to avoid reduce_angle cross-module issues)
-    print("sin(1): {fmt_float(sin(1.0), 4)}")
-    print("cos(0): {fmt_float(cos(0.0), 4)}")
-    print("atan(1): {fmt_float(atan(1.0), 4)}")
-    print("asin(0.5): {fmt_float(asin(0.5), 4)}")
-    print("acos(0.5): {fmt_float(acos(0.5), 4)}")
+    # straight-line distance through the earth, for comparison with the arc
+    tokyo := legs[1]
+    arc := distance_km(london, tokyo)
+    chord := 2.0 * EARTH_RADIUS_KM * math.sin(arc / (2.0 * EARTH_RADIUS_KM))
+    print("")
+    print("through the earth to tokyo: {chord:.0} km, {(arc - chord):.0} km shorter")
 
-    # exp and sqrt
-    print("exp(1): {fmt_float(exp(1.0), 4)}")
-    print("exp(0): {fmt_float(exp(0.0), 4)}")
-    print("sqrt(25): {fmt_float(sqrt(25.0), 1)}")
-    print("pow(2,10): {fmt_float(pow_float(2.0, 10.0), 0)}")
-
-    # helpers
-    pi := PI()
-    print("degrees(pi): {fmt_float(degrees(pi), 1)}")
-    print("radians(180): {fmt_float(radians(180.0), 4)}")
-    print("abs(-2.5): {fmt_float(abs_float(0.0 - 2.5), 1)}")
-    print("sign(42): {fmt_float(sign(42.0), 1)}")
-    neg := -1.0
-    print("sign(-1): {fmt_float(sign(neg), 1)}")
-
-    print("math works")
+    # 1000 at 5% a year for 10 years, compounded yearly and continuously
+    yearly := 1000.0 * math.pow_float(1.05, 10.0)
+    continuous := 1000.0 * math.exp(0.05 * 10.0)
+    print("")
+    print("1000 at 5% for 10 years: {yearly:.2} yearly, {continuous:.2} continuously")
+    print("years to double at 5%: {math.log(2.0) / math.log(1.05):.1}")

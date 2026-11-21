@@ -1,56 +1,74 @@
-# string_collection_methods.pith — test new string and list methods
+# string_collection_methods: query methods shared by strings and lists, and
+# iterating a string character by character.
+#
+# checks a batch of sign-up forms. a username is walked with `for ch, i in`,
+# an email is split on its one "@", and the reserved names are a list asked
+# with contains and index_of. the accepted accounts print as a padded table.
+
+struct Signup:
+    username: String
+    email: String
+
+fn username_problem(name: String, reserved: List[String]) -> String?:
+    if name.is_empty():
+        return "username is empty"
+    if reserved.contains(name):
+        return "'{name}' is reserved (entry {reserved.index_of(name).unwrap_or(-1) + 1})"
+    for ch, i in name:
+        if i == 0 and "abcdefghijklmnopqrstuvwxyz".index_of(ch) < 0:
+            return "must start with a letter"
+        if "abcdefghijklmnopqrstuvwxyz0123456789_".index_of(ch) < 0:
+            return "'{ch}' at position {i} is not allowed"
+    return none
+
+fn email_problem(email: String) -> String?:
+    at := email.index_of("@")
+    if at <= 0 or at != email.last_index_of("@"):
+        return "needs exactly one @ with a name before it"
+    domain := email.substring(at + 1, email.len())
+    if not domain.contains(".") or domain.ends_with("."):
+        return "domain '{domain}' has no dot"
+    return none
+
+fn signup_problem(form: Signup, reserved: List[String]) -> String?:
+    if let reason = username_problem(form.username, reserved):
+        return reason
+    return email_problem(form.email)
 
 fn main():
-    # --- string methods ---
-    s := "hello world"
+    reserved := ["admin", "root", "support"]
+    forms := [
+        Signup(username: "ada_l", email: "ada@example.com"),
+        Signup(username: "root", email: "root@example.com"),
+        Signup(username: "9lives", email: "cat@example.com"),
+        Signup(username: "grace-h", email: "grace@example.com"),
+        Signup(username: "linus", email: "linus@@example.com"),
+        Signup(username: "ken", email: "ken@localhost"),
+        Signup(username: "margaret", email: "mh@example.gov"),
+        Signup(username: "barbara", email: "barbara@example.org"),
+        Signup(username: "dennis_r", email: "dmr@example.com"),
+]
 
-    # is_empty
-    print("is_empty('') = {"".is_empty()}")
-    print("is_empty('hi') = {"hi".is_empty()}")
+    mut accepted: List[Signup] := []
+    for form in forms:
+        if let reason = signup_problem(form, reserved):
+            print("rejected {form.username}: {reason}")
+        else:
+            accepted.push(form)
 
-    # index_of / last_index_of
-    print("index_of('o') = {s.index_of("o")}")
-    print("last_index_of('o') = {s.last_index_of("o")}")
-    print("index_of('xyz') = {s.index_of("xyz")}")
+    if accepted.is_empty():
+        print("nothing to create")
+        return
 
-    # repeat
-    print("repeat('ab', 3) = {"ab".repeat(3)}")
+    print("")
+    print("{"user".pad_right(10, " ")}{"domain".pad_left(14, " ")}")
+    print("-".repeat(24))
+    for form in accepted:
+        domain := form.email.substring(form.email.index_of("@") + 1, form.email.len())
+        print("{form.username.pad_right(10, ".")}{domain.pad_left(14, ".")}")
 
-    # pad_left / pad_right
-    print("pad_left('42', 5, '0') = {"42".pad_left(5, "0")}")
-    print("pad_right('hi', 6, '.') = {"hi".pad_right(6, ".")}")
-
-    # chars
-    chars := "abc".chars()
-    print("chars('abc') = {chars.join(", ")}")
-
-    # --- list methods ---
-    nums := [5, 3, 8, 1, 9, 2]
-
-    # index_of returns an Optional[Int] — unwrap_or(-1) preserves the
-    # historical "not found" marker for display.
-    print("nums.index_of(8) = {nums.index_of(8).unwrap_or(-1)}")
-    print("nums.index_of(99) = {nums.index_of(99).unwrap_or(-1)}")
-
-    # slice
-    mid := nums.slice(1, 4)
-    mut parts: List[String] := []
-    mut i := 0
-    while i < mid.len():
-        parts.push(mid[i].to_string())
-        i = i + 1
-    print("nums.slice(1,4) = [{parts.join(", ")}]")
-
-    # sort
-    sorted := nums.sort()
-    mut sorted_parts: List[String] := []
-    i = 0
-    while i < sorted.len():
-        sorted_parts.push(sorted[i].to_string())
-        i = i + 1
-    print("nums.sort() = [{sorted_parts.join(", ")}]")
-
-    # string list sort
-    words := ["banana", "apple", "cherry"]
-    sorted_words := words.sort()
-    print("words.sort() = [{sorted_words.join(", ")}]")
+    names := accepted.map(fn(form: Signup) => form.username).sort()
+    print("")
+    print("alphabetical: {names.join(", ")}")
+    print("first two invited: {names.slice(0, 2).join(", ")}")
+    print("initials: {names.map(fn(name: String) => name.chars()[0]).join("")}")

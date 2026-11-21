@@ -38,8 +38,11 @@
 # any number span (`3` widens to 3.0), a Bool field `true` or `false` by
 # prefix, a repeated key's last value wins (a string slot releases the
 # earlier string), and any bytes after the closing brace are not looked
-# at. a malformed document fails as "missing json field", a field that
-# never arrived as "missing json field: <name>", the first in
+# at. a document the decoder stops in fails with what std.json's
+# fill_malformed_error finds when it parses the input again (invalid
+# json and the byte the parser stopped at, a root that is not an object,
+# or an invalid object and the byte the decoder stopped at), and a field
+# that never arrived fails as "missing json field: <name>", the first in
 # declaration order. tests/cases/test_json_fill_struct_shapes and
 # test_json_fill_generated pin the shapes and the messages.
 
@@ -621,7 +624,7 @@ pub fn ir_emit_json_fill_flat(input_r: Int, struct_r: Int, fields: List[JsonFill
     ir_emit_label(bad_l)
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", ir_jf_load(v.obj))
     bad_err := ir_reg()
-    ir_emit_call_text(bad_err, malformed_fn, "struct", 0, "")
+    ir_emit_call_text(bad_err, malformed_fn, "struct", 2, " " + ir_jf_load(v.input).to_string() + " " + ir_jf_load(v.pos).to_string())
     ir_emit("store " + result_var + " " + ir_emit_err_result_tuple_raw(bad_err).to_string())
     ir_jf_jmp(end_l)
 

@@ -1442,10 +1442,27 @@ pub fn fill_skip_value(input: Bytes, pos: Int) -> Int:
 pub fn fill_missing_error(name: String) -> JsonDecodeError:
     return JsonDecodeError("missing json field: " + name)
 
-## The error the generated flat decoder returns for a malformed
-## document. Called only by compiler-generated code.
-pub fn fill_malformed_error() -> JsonDecodeError:
-    return JsonDecodeError("missing json field")
+## The error the generated flat decoder returns when it stops at byte
+## `pos` of `input`. The decoder does not know why it stopped, so the
+## document is parsed again here, off the path a well-formed one takes:
+## input the parser refuses is invalid json at the byte the parser stopped
+## at, and a root that is not an object says what it is. The parser takes
+## some documents the decoder does not (a value of the wrong type for its
+## field, an object cut off at the end), and those are an invalid object at
+## the byte the decoder stopped at. Called only by compiler-generated code.
+pub fn fill_malformed_error(input: Bytes, pos: Int) -> JsonDecodeError:
+    text := bytes.decode_utf8(input)
+    if text.is_err:
+        return JsonDecodeError("invalid json: " + text.err.message)
+    mark := pool_mark_node_id()
+    root := json_parse(text.ok)
+    if root < 0:
+        return JsonDecodeError("invalid json at byte {parser_position}")
+    kind := type_of(root)
+    json_restore_to(mark, 0)
+    if kind != "object":
+        return JsonDecodeError("expected a json object, got {kind}")
+    return JsonDecodeError("invalid json object at byte {pos}")
 
  # decodes json object bytes into a concrete struct.
  # this is lowered by the compiler so structs do not need runtime reflection.

@@ -151,7 +151,9 @@ a handler returns a response rather than propagating an error, so check
 `parsed.is_err` and answer with a 400 instead of using `!`. `req.is_json()` turns
 away anything that is not `application/json` before you even try to decode, and a
 malformed body still lands in the `is_err` branch, so both cases come back as a clean
-400.
+400. the error's message says which it was: `invalid json at byte 0` for a body
+that is not json, with the byte the parser stopped at, and `missing json field: age`
+for an object that leaves a field out.
 
 under the hood `web.parse[T]` is just `json.decode_text[T](req.body())`. reach for
 `json.decode_text` directly when you already have the body text and not a request.

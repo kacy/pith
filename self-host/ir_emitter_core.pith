@@ -40,7 +40,7 @@
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
 from checker import c_interface_coercion, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
-from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, TID_ERR, TID_NONE
+from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_import_target_name, ir_global_storage_symbol, ir_base_decl_name, ir_import_impl_method_name
@@ -516,6 +516,16 @@ mut ir_preloaded_import_paths: List[String] := []
 # graph or the call lowers to a name no function carries.
 mut ir_all_module_roots: List[Int] := []
 mut ir_all_module_paths: List[String] := []
+# the entry file's root, or -1. a generic struct's per-instance methods are
+# emitted in the module that declares the generic, so std.iter emits
+# MapIter[Countdown, Int].next for a Countdown the entry declared, and its
+# body calls Countdown's own methods. the entry is no module path in the
+# graph, so its impls are collected separately (ir_collect_entry_impls).
+mut ir_entry_root := 0 - 1
+# true while the entry's impls are collected during another module's
+# emission: the empty module path then names the entry, not the module
+# being emitted, when an impl target is resolved to its declaration.
+mut ir_collecting_entry_impls := false
 # the resolved module path of the module currently being emitted ("" for the
 # entry file). lets an impl target in this module resolve to the module's own
 # declaration even when another module registered the same name globally.
@@ -544,6 +554,11 @@ pub fn set_import_roots(roots: List[Int], paths: List[String]):
 pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
     ir_all_module_roots = roots
     ir_all_module_paths = paths
+
+# the entry file's root, so another module's emission can see the methods
+# the entry declares on its own types. set once per build; -1 leaves it out.
+pub fn set_entry_root(root: Int):
+    ir_entry_root = root
 
 # the resolved path of the module about to be emitted; "" for the entry
 # file. emit_ir does not clear it, so it holds the previous module's
@@ -13458,6 +13473,20 @@ fn ir_lookup_impl_method_for(recv_idx: Int, type_name: String, method_name: Stri
                 return ""
     return ir_lookup_impl_method_name(type_name, method_name)
 
+# the entry's interfaces, associated types and impl method signatures, when
+# another module is being emitted. they go in first, so every name-keyed entry
+# a module in the graph registers for the same bare name replaces them; only
+# the tid keys of the entry's own declarations keep pointing at the entry.
+# the entry's symbols carry no module prefix, so the empty path names them.
+fn ir_collect_entry_impls(root_idx: Int):
+    if ir_entry_root < 0 or ir_entry_root == root_idx:
+        return
+    ir_index_interfaces_in_root(ir_entry_root)
+    ir_collect_assoc_bindings_in_root(ir_entry_root, "")
+    ir_collecting_entry_impls = true
+    ir_collect_impl_methods(ir_entry_root, "")
+    ir_collecting_entry_impls = false
+
 fn ir_collect_impl_methods(root_idx: Int, module_path: String):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
@@ -13914,6 +13943,8 @@ fn ir_collect_impl_method_signatures(node: Node, module_path: String):
 fn ir_impl_owner_tid(impl_type: String, module_path: String) -> Int:
     if impl_type.contains("["):
         return 0 - 1
+    if ir_collecting_entry_impls:
+        return lookup_entry_type_id(impl_type)
     mut path := module_path
     if path.len() == 0:
         path = ir_current_module_path
@@ -15166,6 +15197,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     # index every interface (imports + root) before any impl signatures are
     # collected, so an impl can find its interface's defaults regardless of
     # declaration order across modules
+    ir_collect_entry_impls(root_idx)
     mut iface_i := 0
     while iface_i < method_roots.len():
         ir_index_interfaces_in_root(method_roots[iface_i])

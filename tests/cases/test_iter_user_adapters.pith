@@ -1,0 +1,53 @@
+# the std.iter adapters over iterators the user declares. the adapters'
+# per-instance methods are emitted in std.iter, so a source type declared in
+# the entry file needs the entry's impls visible there: map_iter over one
+# failed to build with "call to unknown function 'next'".
+from std.iter import Iterator, to_list, map_iter, filter_iter
+import iter_user_countdown as lib
+
+struct Countdown:
+    left: Int
+
+impl Iterator for Countdown:
+    type Item = Int
+
+    fn next() -> Item?:
+        if self.left == 0:
+            return none
+        self.left -= 1
+        return self.left
+
+# a source whose elements are strings, so the adapter's specialization
+# moves a heap value through each step
+struct Words:
+    items: List[String]
+    at: Int
+
+impl Iterator for Words:
+    type Item = String
+
+    fn next() -> Item?:
+        if self.at >= self.items.len():
+            return none
+        w := self.items[self.at]
+        self.at += 1
+        return w
+
+fn main():
+    print("{to_list(Countdown(left: 3))}")
+    print("{to_list(map_iter(Countdown(left: 3), fn(n: Int) => n * 10))}")
+    print("{to_list(filter_iter(Countdown(left: 5), fn(n: Int) => n % 2 == 0))}")
+    print("{to_list(filter_iter(map_iter(Countdown(left: 5), fn(n: Int) => n * 3), fn(n: Int) => n > 4))}")
+    print("{to_list(map_iter(filter_iter(Countdown(left: 5), fn(n: Int) => n > 1), fn(n: Int) => "#{n}"))}")
+    print("{to_list(map_iter(lib.Countdown(left: 3), fn(n: Int) => n + 100))}")
+    print("{to_list(filter_iter(map_iter(lib.Countdown(left: 4), fn(n: Int) => n * 2), fn(n: Int) => n != 2))}")
+    words := Words(items: ["a", "bb", "ccc"], at: 0)
+    print("{to_list(map_iter(words, fn(w: String) => w.len()))}")
+    print("{to_list(filter_iter(Words(items: ["x", "yy", "zzz"], at: 0), fn(w: String) => w.len() > 1))}")
+    mut total := 0
+    mut it := map_iter(Countdown(left: 4), fn(n: Int) => n * n)
+    mut v := it.next()
+    while v != none:
+        total += v.value()
+        v = it.next()
+    print("{total}")

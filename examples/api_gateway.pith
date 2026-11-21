@@ -1,8 +1,10 @@
-# api_gateway.pith: the gateway in examples/gateway/, end to end in one process.
+# the api gateway in examples/gateway/, end to end in one process.
 #
 # this starts a few small backends and an identity provider, puts the gateway in
 # front of them with a toml config, and sends it the requests a gateway exists
-# for. to run the same code as a server, see examples/gateway/main.pith.
+# for: routing, auth, rate limits, retries, a circuit breaker, health checks,
+# streaming and a graceful shutdown. each section prints what a client sees.
+# to run the same code as a server, see examples/gateway/main.pith.
 #
 # Run:  pith run examples/api_gateway.pith
 
@@ -47,10 +49,12 @@ canary_down := AtomicInt(0)
 # gateway that waited for the whole body would wait forever.
 feed_turn := Channel[Int](1)
 
+# what a backend saw of the request, so the output shows what the gateway
+# changed on the way through.
 fn describe(name: String, req: web.Request) -> http.HttpResponse:
     query := req.raw.query() catch ""
     subject := req.header("X-Auth-Subject")
-    mut line := name + " saw " + req.method() + " " + req.path()
+    mut line := "{name} saw {req.method()} {req.path()}"
     if query != "":
         line = line + "?" + query
     if subject != "":
@@ -59,7 +63,7 @@ fn describe(name: String, req: web.Request) -> http.HttpResponse:
     mut hop := req.header("X-Secret-Hop")
     if hop == "":
         hop = "none"
-    return http.text(200, line + " (hop header: " + hop + ")").set_cookie(http.cookie("backend", name)).set_cookie(http.cookie("seen", "yes")).header("X-Backend", name).header("X-Saw-Forwarded-For", req.header("X-Forwarded-For"))
+    return http.text(200, "{line} (hop header: {hop})").set_cookie(http.cookie("backend", name)).set_cookie(http.cookie("seen", "yes")).header("X-Backend", name).header("X-Saw-Forwarded-For", req.header("X-Forwarded-For"))
 
 fn serve_named(name: String, port: Int) -> Int:
     handler := fn(req: web.Request) => describe(name, req)
@@ -68,6 +72,7 @@ fn serve_named(name: String, port: Int) -> Int:
         app = app.handle(method, "/*rest", handler)
     return app.listen("127.0.0.1", port) catch 0
 
+# count the hit with compare_set, since handlers run on many tasks at once.
 fn answer_broken(req: web.Request) -> http.HttpResponse:
     mut seen := broken_hits.load()
     while not broken_hits.compare_set(seen, seen + 1):
@@ -115,9 +120,6 @@ fn serve_feed() -> Int:
 
 fn serve_secure() -> Int:
     return web.bare().get("/*rest", fn(req: web.Request) => http.text(200, "over tls, " + req.path())).listen_tls("127.0.0.1", SECURE_PORT, CERT_PATH, KEY_PATH) catch 0
-
-fn serve_identity() -> Int:
-    return identity.serve(IDENTITY_PORT)
 
 fn address(port: Int) -> String:
     return "\"127.0.0.1:" + port.to_string() + "\""
@@ -236,15 +238,16 @@ fn wait_for_status(path: String, status: Int) -> Bool:
         tries = tries + 1
     return false
 
-fn call_in_background(path: String) -> String:
-    return get(path)
-
-fn wait_for_port_once(port: Int) -> Bool:
+fn is_listening(port: Int) -> Bool:
     probe := tcp.connect("127.0.0.1", port)
     if probe.is_ok:
         tcp.close(probe.ok)
         return true
     return false
+
+fn section(title: String):
+    print("")
+    print("=== {title} ===")
 
 fn with_token(path: String, token: String) -> String:
     return call(request_to("GET", path).header("Authorization", "Bearer " + token))
@@ -254,7 +257,7 @@ fn main() -> Int!:
     spawn serve_named("green", GREEN_PORT)
     spawn serve_broken()
     spawn serve_slow()
-    spawn serve_identity()
+    spawn identity.serve(IDENTITY_PORT)
     spawn serve_canary()
     spawn serve_feed()
     spawn serve_secure()
@@ -269,8 +272,7 @@ fn main() -> Int!:
     print(get("/api/users/8"))
     print(get("/api/users"))
 
-    print("")
-    print("=== what crosses the gateway ===")
+    section("what crosses the gateway")
     print(call(request_to("GET", "/api/users/1").header("Connection", "X-Secret-Hop").header("X-Secret-Hop", "leaked")))
     print(call(request_to("GET", "/api/users/2").header("X-Auth-Subject", "forged").header("X-Secret-Hop", "kept")))
     kept := client.send(request_to("GET", "/api/users/3"))!
@@ -279,38 +281,32 @@ fn main() -> Int!:
     claimed := client.send(request_to("GET", "/api/users/4").header("X-Forwarded-For", "6.6.6.6"))!
     print("a claimed x-forwarded-for becomes: " + claimed.header_value("X-Saw-Forwarded-For"))
 
-    print("")
-    print("=== a path that means something else once decoded ===")
+    section("a path that means something else once decoded")
     dots := client.send(request_to("GET", "/api/users/%2e%2e/admin"))!
     print(dots.status.to_string() + " to " + dots.header_value("Location"))
     print(get("/api/users/a%2f..%2fb"))
 
-    print("")
-    print("=== bearer tokens checked at the edge ===")
+    section("bearer tokens checked at the edge")
     print(get("/account/me"))
     print(with_token("/account/me", "not-a-token"))
     print(with_token("/account/me", identity.token_for("someone", "billing")!))
     ada := identity.token_for("ada", identity.AUDIENCE)!
     print(with_token("/account/me", ada))
 
-    print("")
-    print("=== a rate limit per subject ===")
+    section("a rate limit per subject")
     print(with_token("/account/me", ada))
     print(with_token("/account/me", ada))
     print(with_token("/account/me", identity.token_for("grace", identity.AUDIENCE)!))
 
-    print("")
-    print("=== a rate limit per route ===")
+    section("a rate limit per route")
     for i in 0..3:
         print(get("/limited"))
 
-    print("")
-    print("=== a rate limit per client address ===")
+    section("a rate limit per client address")
     print(get("/per-address"))
     print(get("/per-address"))
 
-    print("")
-    print("=== a response relayed as it arrives ===")
+    section("a response relayed as it arrives")
     feed := client.open(request_to("GET", "/feed/events"))!
     print("content type: " + feed.content_type)
     for i in 0..FEED_PIECES:
@@ -323,35 +319,29 @@ fn main() -> Int!:
     print("bytes received: " + big.read_all(1048576)!.len().to_string())
     big.close()
 
-    print("")
-    print("=== an upstream reached over tls ===")
+    section("an upstream reached over tls")
     print(get("/secure/report"))
 
-    print("")
-    print("=== a request that is safe to repeat moves on ===")
+    section("a request that is safe to repeat moves on")
     print(get("/failover/a"))
     print(get("/failover/b"))
     print(get("/failover/c"))
 
-    print("")
-    print("=== a request that is not safe to repeat does not ===")
+    section("a request that is not safe to repeat does not")
     posted := call(request_to("POST", "/breaker/once").text_body("x"))
     print(posted)
 
-    print("")
-    print("=== a breaker stops the traffic ===")
+    section("a breaker stops the traffic")
     print(get("/breaker/a"))
     before := broken_hits.load()
     print(get("/breaker/b"))
     print(get("/breaker/c"))
     print("backend hits while open: " + (broken_hits.load() - before).to_string())
 
-    print("")
-    print("=== an upstream that takes too long ===")
+    section("an upstream that takes too long")
     print(get("/slow/report"))
 
-    print("")
-    print("=== a health check takes a backend out, and puts it back ===")
+    section("a health check takes a backend out, and puts it back")
     print(get("/canary/page"))
     canary_down.store(1)
     print("taken out: " + wait_for_status("/canary/page", 503).to_string())
@@ -359,8 +349,7 @@ fn main() -> Int!:
     canary_down.store(0)
     print("put back: " + wait_for_status("/canary/page", 200).to_string())
 
-    print("")
-    print("=== and the gateway reports on all of it ===")
+    section("and the gateway reports on all of it")
     print(get("/healthz"))
     metrics_text := text_of(client.send(request_to("GET", "/metrics"))!)
     for line in metrics_text.split("\n"):
@@ -371,13 +360,12 @@ fn main() -> Int!:
         if line.starts_with("gateway_upstream_healthy{{"):
             print(line)
 
-    print("")
-    print("=== a shutdown lets the request in flight finish ===")
-    in_flight := spawn call_in_background("/drain/report")
+    section("a shutdown lets the request in flight finish")
+    in_flight := spawn get("/drain/report")
     # long enough for the request to reach the slow backend.
     sleep(100)
     shutdown.request()
     print(await in_flight)
     print("gateway finished with unfinished work: " + (await gateway_done).to_string())
-    print("new connection refused: " + (not wait_for_port_once(GATEWAY_PORT)).to_string())
+    print("new connection refused: " + (not is_listening(GATEWAY_PORT)).to_string())
     return 0

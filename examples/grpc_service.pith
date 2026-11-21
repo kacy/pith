@@ -1,65 +1,81 @@
-# a grpc service over plaintext http/2 (h2c), server and client in one process.
+# a grpc service written by hand, with no generated code.
 #
-# the server routes each call by its /package.Service/Method path to one dispatch
-# handler and sends the reply back with the grpc-status trailer. the client dials
-# with grpc.dial_h2c (no tls) and makes two unary calls over the one connection: a
-# known method and an unknown one, which comes back as GRPC_UNIMPLEMENTED. the
-# messages are protobuf — field 1 is a string in both directions.
+# one dispatch function routes each call by its /package.Service/Method path,
+# and std.protobuf encodes the messages. examples/grpc_catalog.pith builds the
+# same kind of service from a .proto with tools/protogen, which is what a real
+# service would do; this is the layer that generated code sits on.
+#
+# the server speaks plaintext http/2 (h2c), and a client in the same process
+# makes its calls over one connection.
 
 import std.net.grpc as grpc
 import std.protobuf as protobuf
-import std.bytes as bytes
 import std.time as time
 
 PORT := 20251
 
-# read protobuf field 1 (a string) from a message, defaulting to "" if absent.
-fn read_name(message: Bytes) -> String!protobuf.ProtoError:
-    r := protobuf.reader(message)
-    mut name := ""
-    while not r.at_end():
-        tag := r.read_tag()!
+# both messages hold one string, in field 1:
+#
+#   message HelloRequest { string name = 1; }
+#   message HelloReply { string text = 1; }
+fn decode_text(message: Bytes) -> String!protobuf.ProtoError:
+    reader := protobuf.reader(message)
+    mut text := ""
+    while not reader.at_end():
+        tag := reader.read_tag()!
         if tag.field == 1:
-            name = r.read_string()!
+            text = reader.read_string()!
         else:
-            r.skip(tag.wire)!
-    return name
+            reader.skip(tag.wire)!
+    return text
 
-# encode a single string into protobuf field 1 — the request and reply shape.
-fn message_of(text: String) -> Bytes:
-    w := protobuf.writer()
-    w.write_string(1, text) catch false
-    out := w.bytes()
-    w.free()
+fn encode_text(text: String) -> Bytes:
+    writer := protobuf.writer()
+    writer.write_string(1, text) catch false
+    out := writer.bytes()
+    writer.free()
     return out
 
-# the service: one method, /greeter.Greeter/SayHello, greeting the caller by name.
-# an unknown path fails with GRPC_UNIMPLEMENTED, the standard grpc response.
+# the greeter service. the server answers an unknown path with the status
+# returned here, so a client can tell a missing method from a failed one.
 fn greeter(path: String, request: Bytes) -> Bytes!grpc.GrpcError:
-    if path != "/greeter.Greeter/SayHello":
-        fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method " + path)
-    name := read_name(request) catch "world"
-    return message_of("hello, " + name)
+    mut name := decode_text(request) catch:
+        fail grpc.GrpcError(grpc.GRPC_INVALID_ARGUMENT, "request is not a HelloRequest")
+    if name == "":
+        name = "world"
+    match path:
+        "/greeter.Greeter/SayHello" =>
+            return encode_text("hello, {name}")
+        "/greeter.Greeter/SayGoodbye" =>
+            return encode_text("goodbye, {name}")
+        _ =>
+            fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method {path}")
 
-fn run_server():
-    grpc.serve("127.0.0.1", PORT, greeter) catch 0
+fn run_server() -> Int:
+    return grpc.serve("127.0.0.1", PORT, greeter) catch 1
 
-# call `path` over `conn` and print the reply, or the grpc-status on failure.
-fn call(conn: grpc.Conn, path: String, name: String):
-    reply := conn.unary(path, message_of(name))
+# the server starts on its own task, so dial until it is listening.
+fn connect() -> grpc.Conn!:
+    for attempt in 0..200:
+        conn := grpc.dial_h2c("127.0.0.1", PORT) catch:
+            time.delay(10)
+            continue
+        return conn
+    fail "no server on port {PORT}"
+
+# make one call and describe its reply, or the status it failed with.
+fn call(conn: grpc.Conn, path: String, name: String) -> String:
+    reply := conn.unary(path, encode_text(name))
     if reply.is_err:
-        print(path + " -> error " + reply.err.status.to_string() + ": " + reply.err.message)
-    else:
-        print(path + " -> " + (read_name(reply.ok) catch "?"))
+        return "{grpc.status_name(reply.err.status)}: {reply.err.message}"
+    return decode_text(reply.ok) catch "unreadable reply"
 
-fn main():
+fn main() -> Int!:
     spawn run_server()
-    time.delay(400)
-    dialed := grpc.dial_h2c("127.0.0.1", PORT)
-    if dialed.is_err:
-        print("dial failed")
-        return
-    conn := dialed.ok
-    call(conn, "/greeter.Greeter/SayHello", "pith")
-    call(conn, "/greeter.Greeter/Unknown", "pith")
-    conn.close()
+    conn := connect()!
+    defer conn.close()
+    print("SayHello(pith)   -> " + call(conn, "/greeter.Greeter/SayHello", "pith"))
+    print("SayHello()       -> " + call(conn, "/greeter.Greeter/SayHello", ""))
+    print("SayGoodbye(pith) -> " + call(conn, "/greeter.Greeter/SayGoodbye", "pith"))
+    print("Wave(pith)       -> " + call(conn, "/greeter.Greeter/Wave", "pith"))
+    return 0

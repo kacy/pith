@@ -107,10 +107,11 @@ BODY_LIMIT_MESSAGE := "http: request body exceeds the maximum"
 # how a response's body is framed (rfc 9112 6.3), the `kind` of a ResponseHead:
 # no body, exactly Content-Length bytes, chunked, or everything until the
 # server closes the connection.
-HTTP_RESPONSE_BODY_NONE := 0
-HTTP_RESPONSE_BODY_EXACT := 1
-HTTP_RESPONSE_BODY_CHUNKED := 2
-HTTP_RESPONSE_BODY_UNTIL_CLOSE := 3
+enum BodyFraming:
+    NoBody
+    Exact
+    Chunked
+    UntilClose
 # raw request parts plus decoded helpers for bytes-first request handling.
 #
 # a request read off the wire decodes only its request line up front. the
@@ -1123,12 +1124,19 @@ fn request_error_status(message: String) -> Int:
         return 417
     return 0
 
+# what an Expect field asks for (rfc 9110 10.1.1): nothing, a 100 Continue
+# before the body, or something this server does not do.
+enum Expectation:
+    Nothing
+    Continue
+    Unsupported
+
 # a request head checked by parse_request_head. `head` starts at the request
 # line, and the offsets index it. the target's path is path_start..path_end
 # and its query query_start..target_end (query_start is -1 without a "?").
 # authority_start..authority_end is the authority of an absolute-form or
 # authority-form target, which replaces the Host field (rfc 9112 3.2.2), or -1.
-# `expect` is one of the EXPECT_ codes, and `wants_close` is whether the
+# `expect` is what the Expect field asks for, and `wants_close` is whether the
 # Connection field asks to close after this exchange (rfc 9112 9.3).
 # `chunked` is set whenever Transfer-Encoding is present: parse_request_head
 # refuses every coding list that does not end in a single chunked.
@@ -1144,14 +1152,8 @@ struct RequestHead:
     minor: Int
     content_length: Int
     chunked: Bool
-    expect: Int
+    expect: Expectation
     wants_close: Bool
-
-# what an Expect field asks for (rfc 9110 10.1.1): nothing, a 100 Continue
-# before the body, or something this server does not do.
-EXPECT_NONE := 0
-EXPECT_CONTINUE := 1
-EXPECT_OTHER := 2
 
 # whether the comma-separated list in data[start..end] holds `token`, compared
 # case-insensitively (rfc 9110 5.6.1). empty elements are skipped.
@@ -1287,7 +1289,7 @@ struct FieldScan:
     te_last_chunked: Bool
     te_chunked_count: Int
     te_other: Bool
-    expect: Int
+    expect: Expectation
     has_close: Bool
     has_keep_alive: Bool
 
@@ -1306,7 +1308,7 @@ fn scan_field_lines(head: Bytes, start: Int) -> FieldScan!:
     mut te_last_chunked := false
     mut te_chunked_count := 0
     mut te_other := false
-    mut expect := EXPECT_NONE
+    mut expect := Expectation.Nothing
     mut has_close := false
     mut has_keep_alive := false
     while true:
@@ -1385,10 +1387,10 @@ fn scan_field_lines(head: Bytes, start: Int) -> FieldScan!:
             has_close = has_close or list_has_token(head, value_start, value_end, "close")
             has_keep_alive = has_keep_alive or list_has_token(head, value_start, value_end, "keep-alive")
         elif name_len == 6 and header_name_matches(head, line_start, name_end, "expect") and value_end > value_start:
-            if expect != EXPECT_OTHER and header_name_matches(head, value_start, value_end, "100-continue"):
-                expect = EXPECT_CONTINUE
+            if expect != Expectation.Unsupported and header_name_matches(head, value_start, value_end, "100-continue"):
+                expect = Expectation.Continue
             else:
-                expect = EXPECT_OTHER
+                expect = Expectation.Unsupported
     return FieldScan(content_length, host_count, host_valid, te_seen, te_last_chunked, te_chunked_count, te_other, expect, has_close, has_keep_alive)
 
 # check a request head in one pass and record where its parts are, following
@@ -2135,15 +2137,15 @@ CLIENT_TIMEOUT_MESSAGE := "http: client timeout exceeded"
 HEADER_TIMEOUT_MESSAGE := "http: timeout awaiting response headers"
 
 # a response head checked by parse_response_head, with the framing of its body
-# (rfc 9112 6.3): `kind` is one of the HTTP_RESPONSE_BODY_ codes and
-# `content_length` the length an EXACT body has. `wants_close` is whether the
+# (rfc 9112 6.3): `kind` says how the body is framed and `content_length` is
+# the length an Exact body has. `wants_close` is whether the
 # connection cannot carry another exchange after this one: the response asks
 # to close, it is http/1.0 without keep-alive, or its body runs to the close.
 struct ResponseHead:
     head: Bytes
     status: Int
     minor: Int
-    kind: Int
+    kind: BodyFraming
     content_length: Int
     wants_close: Bool
 
@@ -2213,21 +2215,21 @@ fn parse_response_head(raw: Bytes, method: String) -> ResponseHead!:
     fields := scanned!
     if fields.te_seen and fields.content_length >= 0:
         fail RESPONSE_PREFIX + "both Transfer-Encoding and Content-Length"
-    mut kind := HTTP_RESPONSE_BODY_UNTIL_CLOSE
+    mut kind := BodyFraming.UntilClose
     mut length := 0
     mut closes := connection_closes(minor == 0, fields.has_close, fields.has_keep_alive)
     if method == "HEAD" or response_status_has_no_body(status):
-        kind = HTTP_RESPONSE_BODY_NONE
+        kind = BodyFraming.NoBody
     elif fields.te_seen:
         if not fields.te_last_chunked or fields.te_chunked_count > 1 or fields.te_other:
             fail RESPONSE_CODING_MESSAGE
-        kind = HTTP_RESPONSE_BODY_CHUNKED
+        kind = BodyFraming.Chunked
         # rfc 9112 6.1: chunked framing on an http/1.0 message is faulty, so
         # the connection is not trusted for another exchange
         if minor == 0:
             closes = true
     elif fields.content_length >= 0:
-        kind = HTTP_RESPONSE_BODY_EXACT
+        kind = BodyFraming.Exact
         length = fields.content_length
     else:
         closes = true
@@ -2263,18 +2265,20 @@ fn read_response_body_from(src: ByteSource, parsed: ResponseHead, trailers: Map[
 # a declared length is refused before any of it is read, and a chunked or
 # read-until-close body as soon as it passes the limit.
 fn read_response_body_raw(src: ByteSource, parsed: ResponseHead, trailers: Map[String, String], limit: Int) -> Bytes!:
-    if parsed.kind == HTTP_RESPONSE_BODY_CHUNKED:
-        out := bytes.buffer()
-        errdefer out.free()
-        decode_chunked(src, out, BufferedBytesWriter(0), false, limit, trailers)!
-        return out.take_bytes()
-    if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
-        if parsed.content_length > limit:
-            fail BODY_LIMIT_MESSAGE
-        return source_read_exact(src, parsed.content_length)
-    if parsed.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
-        return source_read_all_bounded(src, limit)
-    return bytes.empty()
+    match parsed.kind:
+        BodyFraming.Chunked =>
+            out := bytes.buffer()
+            errdefer out.free()
+            decode_chunked(src, out, BufferedBytesWriter(0), false, limit, trailers)!
+            return out.take_bytes()
+        BodyFraming.Exact =>
+            if parsed.content_length > limit:
+                fail BODY_LIMIT_MESSAGE
+            return source_read_exact(src, parsed.content_length)
+        BodyFraming.UntilClose =>
+            return source_read_all_bounded(src, limit)
+        BodyFraming.NoBody =>
+            return bytes.empty()
 
 # like read_response_body_from, but the body goes to `writer`. returns its
 # size.
@@ -2285,16 +2289,18 @@ fn stream_response_body_from(src: ByteSource, parsed: ResponseHead, writer: Buff
     return got!
 
 fn stream_response_body_raw(src: ByteSource, parsed: ResponseHead, writer: BufferedBytesWriter, trailers: Map[String, String]) -> Int!:
-    if parsed.kind == HTTP_RESPONSE_BODY_CHUNKED:
-        out := bytes.buffer()
-        defer out.free()
-        return decode_chunked(src, out, writer, true, 0, trailers)
-    if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
-        return source_stream_exact(src, writer, parsed.content_length)
-    if parsed.kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
-        return source_stream_all(src, writer)
-    writer.flush()!
-    return 0
+    match parsed.kind:
+        BodyFraming.Chunked =>
+            out := bytes.buffer()
+            defer out.free()
+            return decode_chunked(src, out, writer, true, 0, trailers)
+        BodyFraming.Exact =>
+            return source_stream_exact(src, writer, parsed.content_length)
+        BodyFraming.UntilClose =>
+            return source_stream_all(src, writer)
+        BodyFraming.NoBody =>
+            writer.flush()!
+            return 0
 
 fn response_from_parsed(parsed: ResponseHead, body: Bytes, trailers: Map[String, String]) -> HttpResponse:
     headers := response_headers_map(parsed.head)
@@ -2928,22 +2934,23 @@ pub fn redirect(url: String) -> String:
 # a handler returns a whole HttpResponse, which middleware can read and change.
 # to send a body as it is produced, a handler returns stream_response(head,
 # producer) instead. the head goes through the middleware like any response, and
-# the server then sends it and runs the producer on this same task, handing it a
-# function that writes one piece. http/1.1 frames the pieces as chunks unless the
-# head has a Content-Length, and http/2 sends them as DATA frames. a producer that
-# fails ends the response early so the client can tell it was cut short: the
-# connection closes on http/1.1 and the stream resets on http/2.
+# the server then sends it and runs the producer on this same task, handing it an
+# io.BytesWriter whose write_bytes sends one piece. http/1.1 frames the pieces as
+# chunks unless the head has a Content-Length, and http/2 sends them as DATA
+# frames. a producer that fails ends the response early so the client can tell it
+# was cut short: the connection closes on http/1.1 and the stream resets on
+# http/2.
 #
 # the producer waits in a task-local value rather than in HttpResponse, so the
 # response type and the code that copies it stay as they are. a middleware that
 # replaces the response after the handler ran should not call a streaming handler.
 struct ResponseProducer:
-    run: fn(fn(Bytes) -> Int!) -> Int!
+    run: fn(io.BytesWriter) -> Int!
 
 threadlocal mut pending_producer: ResponseProducer? := none
 
 # answer with `head` and a body `producer` writes piece by piece.
-pub fn stream_response(head: HttpResponse, producer: fn(fn(Bytes) -> Int!) -> Int!) -> HttpResponse:
+pub fn stream_response(head: HttpResponse, producer: fn(io.BytesWriter) -> Int!) -> HttpResponse:
     pending_producer = ResponseProducer(producer)
     return head
 
@@ -2951,12 +2958,12 @@ pub fn stream_response(head: HttpResponse, producer: fn(fn(Bytes) -> Int!) -> In
 pub fn response_is_streaming() -> Bool:
     return pending_producer != none
 
-fn no_response_producer(write: fn(Bytes) -> Int!) -> Int!:
+fn no_response_producer(out: io.BytesWriter) -> Int!:
     return 0
 
 # hand over the producer a handler left, clearing it. the http/2 server calls this
 # to run it over its own framing.
-pub fn take_response_producer() -> fn(fn(Bytes) -> Int!) -> Int!:
+pub fn take_response_producer() -> fn(io.BytesWriter) -> Int!:
     if let pending = pending_producer:
         pending_producer = none
         return pending.run
@@ -3070,27 +3077,44 @@ fn finish_request_body() -> Bool:
 # upstream for a websocket or any other upgrade, returns take_connection(run).
 # the http/1.1 server sends nothing for that request. it clears the
 # connection's read and write deadlines and calls run on this same task with
-# two functions: read(n) returns up to n bytes as soon as any arrive, empty at
-# the end of input, and write(data) sends all of data at once. run writes
+# the connection's two halves: an io.BytesReader whose read_bytes(n) returns up
+# to n bytes as soon as any arrive, empty at the end of input, and an
+# io.BytesWriter whose write_bytes(data) sends all of data at once. run writes
 # whatever answer the protocol needs, such as a 101, and the connection closes
 # when it returns.
 #
-# read belongs to the task run is called on: the connection's reader may hold
-# bytes that arrived behind the request head, and it lives with that task.
-# write goes straight to the socket or the tls connection, so a task run
-# spawns, such as one copying the other direction, can call it.
+# the reader belongs to the task run is called on: the connection's buffered
+# reader may hold bytes that arrived behind the request head, and it lives with
+# that task. the writer goes straight to the socket or the tls connection, so a
+# task run spawns, such as one copying the other direction, can use it.
 #
 # http/2 has no upgrade, so there, and wherever a middleware replaced the
 # handler's response, the returned 501 is sent instead.
 struct ConnectionTaker:
-    run: fn(fn(Int) -> Bytes!, fn(Bytes) -> Int!) -> Int!
+    run: fn(io.BytesReader, io.BytesWriter) -> Int!
 
 threadlocal mut pending_taker: ConnectionTaker? := none
 
 # hand this request's connection to `run` (see above).
-pub fn take_connection(run: fn(fn(Int) -> Bytes!, fn(Bytes) -> Int!) -> Int!) -> HttpResponse:
+pub fn take_connection(run: fn(io.BytesReader, io.BytesWriter) -> Int!) -> HttpResponse:
     pending_taker = ConnectionTaker(run)
     return text(501, "this connection cannot be taken over")
+
+# the read half of a taken connection.
+struct ConnectionReader:
+    src: ByteSource
+
+impl io.BytesReader for ConnectionReader:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return source_read_available(self.src, max_bytes)!
+
+# the write half of a taken connection, usable from any task.
+struct ConnectionWriter:
+    src: ByteSource
+
+impl io.BytesWriter for ConnectionWriter:
+    fn write_bytes(data: Bytes) -> Int!:
+        return write_connection(self.src, data)!
 
 # run the taker a handler left on the connection it came in on. the request's
 # body, if it was being streamed, belongs to the taker now.
@@ -3100,11 +3124,7 @@ fn run_connection_taker(src: ByteSource) -> Bool:
         pending_body = none
         tcp_set_read_deadline(src.socket, 0)
         tcp_set_write_deadline(src.socket, 0)
-        read := fn(n: Int) -> Bytes!:
-            return source_read_available(src, n)!
-        write := fn(data: Bytes) -> Int!:
-            return write_connection(src, data)!
-        taker.run(read, write) catch 0
+        taker.run(ConnectionReader(src), ConnectionWriter(src)) catch 0
         return true
     return false
 
@@ -3132,6 +3152,21 @@ fn chunk_frame(data: Bytes) -> Bytes:
     out.write_string_utf8("\r\n") catch 0
     return out.take_bytes()
 
+# what a producer writes a streamed http/1.1 body through: each piece goes to
+# the connection as it is, or framed as one chunk.
+struct StreamedBodyWriter:
+    src: ByteSource
+    writer: BufferedBytesWriter
+    chunked: Bool
+
+impl io.BytesWriter for StreamedBodyWriter:
+    fn write_bytes(data: Bytes) -> Int!:
+        if data.is_empty():
+            return 0
+        if self.chunked:
+            return source_write(self.src, self.writer, chunk_frame(data))!
+        return source_write(self.src, self.writer, data)!
+
 fn streamed_head_bytes(resp: HttpResponse, chunked: Bool, connection: String, is_head: Bool) -> Bytes!:
     # the framing field takes the body's length from here, and a sized stream has
     # declared one
@@ -3153,13 +3188,7 @@ fn write_streamed_response(src: ByteSource, writer: BufferedBytesWriter, req: Ht
     source_write(src, writer, streamed_head_bytes(resp, chunked, closing, is_head)!)!
     if is_head:
         return closing != "close"
-    write := fn(data: Bytes) -> Int!:
-        if data.is_empty():
-            return 0
-        if chunked:
-            return source_write(src, writer, chunk_frame(data))!
-        return source_write(src, writer, data)!
-    producer(write)!
+    producer(StreamedBodyWriter(src, writer, chunked))!
     if chunked:
         source_write(src, writer, bytes.from_string_utf8("0\r\n\r\n"))!
     return closing != "close"
@@ -3459,8 +3488,8 @@ fn read_server_request(conn: ServerConn, body_due: Int, rearm: Bool) -> ServerRe
     if config.write_timeout_ms > 0:
         tcp_set_write_deadline(src.socket, config.write_timeout_ms)
     has_body := parsed.chunked or parsed.content_length > 0
-    if parsed.minor >= 1 and parsed.expect != EXPECT_NONE:
-        if parsed.expect != EXPECT_CONTINUE:
+    if parsed.minor >= 1 and parsed.expect != Expectation.Nothing:
+        if parsed.expect != Expectation.Continue:
             fail EXPECTATION_MESSAGE
         if has_body:
             source_write(src, conn.writer, bytes.from_string_utf8(CONTINUE_RESPONSE))!
@@ -5517,7 +5546,7 @@ impl Client:
                 arm_deadline_at(c.stream.fd, 0, true)
                 resp := response_from_parsed(parsed, bytes.empty(), {})
                 mut length := -1
-                if parsed.kind == HTTP_RESPONSE_BODY_EXACT:
+                if parsed.kind == BodyFraming.Exact:
                     length = parsed.content_length
                 reusable := self.keep_alives and not parsed.wants_close and parsed.status != 101 and not request_prefers_close_header(req)
                 return OpenResponse(status: resp.status, content_type: resp.content_type, headers: resp.headers, set_cookie_headers: resp.set_cookie_headers, content_length: length, client: self, conn: c, src: wire_source(c), head: parsed, reusable: reusable, left: parsed.content_length, in_chunk: false, finished: false, closed: false)
@@ -5822,7 +5851,7 @@ impl Client:
     # wait ran out. any other head is the final response, which arrived before
     # the body was sent. other interim responses are read and dropped.
     fn await_continue(src: ByteSource, req: ClientRequest, deadline: Int) -> ResponseHead!:
-        send_body := ResponseHead(bytes.empty(), 0, 1, HTTP_RESPONSE_BODY_NONE, 0, false)
+        send_body := ResponseHead(bytes.empty(), 0, 1, BodyFraming.NoBody, 0, false)
         due := earliest_due(deadline, time_mod.mono_millis() + self.expect_continue_timeout_ms)
         arm_deadline_at(src.socket, due, true)
         arrived := source_wait_bytes(src)
@@ -5954,15 +5983,15 @@ impl OpenResponse:
         if self.finished:
             return bytes.empty()
         kind := self.head.kind
-        if kind == HTTP_RESPONSE_BODY_NONE:
+        if kind == BodyFraming.NoBody:
             self.finished = true
             return bytes.empty()
-        if kind == HTTP_RESPONSE_BODY_UNTIL_CLOSE:
+        if kind == BodyFraming.UntilClose:
             piece := source_read_available(self.src, OPEN_RESPONSE_READ_BYTES)!
             if piece.is_empty():
                 self.finished = true
             return piece
-        if kind == HTTP_RESPONSE_BODY_CHUNKED and not self.in_chunk:
+        if kind == BodyFraming.Chunked and not self.in_chunk:
             if not self.next_chunk()!:
                 self.finished = true
                 return bytes.empty()
@@ -5974,7 +6003,7 @@ impl OpenResponse:
             fail "http: response body ended early"
         self.left = self.left - piece.len()
         if self.left == 0:
-            if kind == HTTP_RESPONSE_BODY_EXACT:
+            if kind == BodyFraming.Exact:
                 self.finished = true
             else:
                 self.in_chunk = false
@@ -7063,18 +7092,18 @@ test "parse_response_head checks the status line":
 
 test "parse_response_head frames the body as rfc 9112 6.3 says":
     exact := response_head_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "GET")!
-    assert_eq(exact.kind, HTTP_RESPONSE_BODY_EXACT)
+    assert_eq(exact.kind, BodyFraming.Exact)
     assert_eq(exact.content_length, 5)
     assert(not exact.wants_close)
     chunked := response_head_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", "GET")!
-    assert_eq(chunked.kind, HTTP_RESPONSE_BODY_CHUNKED)
+    assert_eq(chunked.kind, BodyFraming.Chunked)
     until_close := response_head_of("HTTP/1.1 200 OK\r\n\r\n", "GET")!
-    assert_eq(until_close.kind, HTTP_RESPONSE_BODY_UNTIL_CLOSE)
+    assert_eq(until_close.kind, BodyFraming.UntilClose)
     assert(until_close.wants_close)
-    assert_eq(response_head_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "HEAD")!.kind, HTTP_RESPONSE_BODY_NONE)
-    assert_eq(response_head_of("HTTP/1.1 204 No Content\r\n\r\n", "GET")!.kind, HTTP_RESPONSE_BODY_NONE)
-    assert_eq(response_head_of("HTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\n", "GET")!.kind, HTTP_RESPONSE_BODY_NONE)
-    assert_eq(response_head_of("HTTP/1.1 100 Continue\r\n\r\n", "GET")!.kind, HTTP_RESPONSE_BODY_NONE)
+    assert_eq(response_head_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", "HEAD")!.kind, BodyFraming.NoBody)
+    assert_eq(response_head_of("HTTP/1.1 204 No Content\r\n\r\n", "GET")!.kind, BodyFraming.NoBody)
+    assert_eq(response_head_of("HTTP/1.1 304 Not Modified\r\nContent-Length: 9\r\n\r\n", "GET")!.kind, BodyFraming.NoBody)
+    assert_eq(response_head_of("HTTP/1.1 100 Continue\r\n\r\n", "GET")!.kind, BodyFraming.NoBody)
     assert(response_head_of("HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\n", "GET")!.wants_close)
     assert(not response_head_of("HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\n", "GET")!.wants_close)
     assert(response_head_of("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\n", "GET")!.wants_close)

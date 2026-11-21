@@ -5,10 +5,11 @@
 # leaves unread is drained, so the next request on the connection is read from
 # the right place, and one too large to drain closes the connection instead.
 #
-# http.take_connection hands the connection to a function with read and write,
-# here a toy upgrade that answers 101 and echoes upper-cased.
+# http.take_connection hands the connection to a function as a reader and a
+# writer, here a toy upgrade that answers 101 and echoes upper-cased.
 
 import std.net.http as http
+import std.io as io
 import std.net.tls as tls
 import std.bytes as bytes
 import std.time as time_mod
@@ -35,21 +36,21 @@ fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
         return http.take_connection(shout)
     return http.text(200, "ignored")
 
-# answer the upgrade, greet from another task (write works from any task),
-# then send back upper-cased whatever arrives until the client closes.
-fn shout(read: fn(Int) -> Bytes!, write: fn(Bytes) -> Int!) -> Int!:
-    write(bytes.from_string_utf8("HTTP/1.1 101 Switching Protocols\r\nUpgrade: shout\r\nConnection: Upgrade\r\n\r\n"))!
-    greeter := spawn greet(write)
+# answer the upgrade, greet from another task (the writer works from any
+# task), then send back upper-cased whatever arrives until the client closes.
+fn shout(r: io.BytesReader, w: io.BytesWriter) -> Int!:
+    w.write_bytes(bytes.from_string_utf8("HTTP/1.1 101 Switching Protocols\r\nUpgrade: shout\r\nConnection: Upgrade\r\n\r\n"))!
+    greeter := spawn greet(w)
     await greeter
     while true:
-        got := read(1024)!
+        got := r.read_bytes(1024)!
         if got.is_empty():
             return 0
-        write(bytes.from_string_utf8(got.to_string_utf8()!.to_upper()))!
+        w.write_bytes(bytes.from_string_utf8(got.to_string_utf8()!.to_upper()))!
     return 0
 
-fn greet(write: fn(Bytes) -> Int!) -> Int:
-    return write(bytes.from_string_utf8("ready;")) catch 0
+fn greet(w: io.BytesWriter) -> Int:
+    return w.write_bytes(bytes.from_string_utf8("ready;")) catch 0
 
 fn choose_port(start: Int) -> Int!:
     mut port := start

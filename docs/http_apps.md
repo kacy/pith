@@ -551,20 +551,31 @@ an upstream for a websocket or any other upgrade:
 
 ```pith
 fn upgrade(req: http.HttpRequestBytes) -> http.HttpResponse:
-    return http.take_connection(fn(read: fn(Int) -> Bytes!, write: fn(Bytes) -> Int!) -> Int! => relay(read, write))
+    return http.take_connection(relay)
+
+fn relay(r: io.BytesReader, w: io.BytesWriter) -> Int!:
+    w.write_bytes(bytes.from_string_utf8("HTTP/1.1 101 Switching Protocols\r\n\r\n"))!
+    while true:
+        got := r.read_bytes(4096)!
+        if got.is_empty():
+            return 0
+        w.write_bytes(got)!
+    return 0
 ```
 
 the server sends nothing for that request. it clears the connection's read and
-write deadlines and calls the function on the same task with `read(n)`, which
+write deadlines and calls the function on the same task with the connection's
+two halves, an `io.BytesReader` and an `io.BytesWriter`. `read_bytes(n)`
 returns up to `n` bytes as soon as any arrive and an empty `Bytes` at the end
-of input, and `write(data)`, which sends all of `data`. the function writes
+of input, and `write_bytes(data)` sends all of `data`. the function writes
 whatever answer the protocol needs, such as a `101`, and the connection closes
 when it returns. it works the same over tls.
 
-call `read` only on the task the function runs on, because the connection's
-reader may already hold bytes that arrived behind the request head. `write`
-goes straight to the socket or the tls connection, so a task the function
-spawns, such as one copying the other direction, can call it.
+use the reader only on the task the function runs on, because the
+connection's buffered reader may already hold bytes that arrived behind the
+request head. the writer goes straight to the socket or the tls connection, so
+a task the function spawns, such as one copying the other direction, can use
+it.
 
 http/2 has no upgrade. there, and wherever a middleware replaced the handler's
 response, the `501` that `take_connection` returns is sent instead.

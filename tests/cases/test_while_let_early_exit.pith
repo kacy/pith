@@ -1,0 +1,40 @@
+# a `while let` takes the optional its condition returns and releases it at
+# the end of each pass. a `!` that returns from the body and a `continue` that
+# skips the rest of it both used to bypass that release, leaking the shell
+# once per pass that left early.
+struct Feed:
+    items: List[String]
+    pos: Int
+
+impl Feed:
+    fn next_item() -> String?:
+        if self.pos >= self.items.len():
+            return none
+        self.pos += 1
+        return self.items[self.pos - 1]
+
+fn check(item: String) -> Int!:
+    if item == "bad":
+        fail "bad item"
+    return item.len()
+
+fn total(feed: Feed) -> Int!:
+    mut sum := 0
+    while let item = feed.next_item():
+        if item == "skip":
+            continue
+        sum += check(item)!
+    return sum
+
+fn main():
+    mut ok := 0
+    mut failed := 0
+    mut i := 0
+    while i < 2000:
+        good := Feed(items: ["ab", "skip", "cde", "skip"], pos: 0)
+        ok += total(good) catch 0
+        bad := Feed(items: ["ab", "bad", "cde"], pos: 0)
+        if total(bad).is_err:
+            failed += 1
+        i += 1
+    print("{ok} {failed}")

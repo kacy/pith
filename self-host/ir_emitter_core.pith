@@ -12580,16 +12580,27 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_emit_label(body_label)
     ir_last_was_ret = false
     ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
+    # `continue` comes back through next_label, which drops this iteration's
+    # shell first; jumping straight to the head skipped that release.
+    next_label := ir_label()
     ir_break_stack = ir_push_string(ir_break_stack, end_label)
-    ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
+    ir_continue_stack = ir_push_string(ir_continue_stack, next_label)
+    # the shell is in flight while the body runs, so a `!` or a `return` in
+    # the body releases it on the way out.
+    if owns_subject:
+        ir_inflight_push(subj_r, "tuple")
     ir_defer_loop_enter()
     ir_block(node.children[2])
     ir_defer_loop_exit()
+    if owns_subject:
+        ir_inflight_drop(subj_r)
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     # release this iteration's owned shell before looping (the body borrowed its
     # value); the shell that fails the condition is released after the loop.
     # a weak-read subject is one of these, a fresh shell per iteration.
+    ir_emit("jmp " + next_label)
+    ir_emit_label(next_label)
     if owns_subject:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     ir_emit("jmp " + head_label)

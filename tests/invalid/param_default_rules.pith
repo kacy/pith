@@ -1,0 +1,25 @@
+# a parameter's default is a constant, matches the parameter's type, and
+# only trailing parameters have one. a function value carries no defaults.
+
+fn base() -> Int:
+    return 2
+
+fn middle(a: Int = 1, b: Int) -> Int:
+    return a + b
+
+fn computed(a: Int, b: Int = base()) -> Int:
+    return a + b
+
+fn mistyped(a: Int, b: String = 3) -> String:
+    return "{a}{b}"
+
+fn not_optional(a: Int, b: Int = none) -> Int:
+    return a
+
+fn add(a: Int, b: Int = 3) -> Int:
+    return a + b
+
+fn main():
+    f := add
+    print("{f(1)}")
+    print("{middle(1, 2)} {computed(1)} {mistyped(1)} {not_optional(1)}")

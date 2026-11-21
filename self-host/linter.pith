@@ -404,6 +404,12 @@ fn is_alphanumeric_char(c: Int) -> Bool:
 # a function type — a closure value may capture a cycle, but a field's fn
 # type holds nothing by itself. a cycle through another module's structs is
 # not visible here and passes.
+#
+# a cycle is reported only at a field that names a struct directly or as an
+# optional, the only kind of field `weak` can mark. a cycle made only of
+# collection fields (`children: List[Entry]`) is the shape of a tree: a
+# collection cannot be weak, and a tree whose parents own their children
+# never closes a loop unless a node is put inside its own descendants.
 
 fn l_field_name(value: String) -> String:
     return value.split(" ")[0]
@@ -419,7 +425,19 @@ fn l_type_struct_refs(type_idx: Int, out: List[String]):
     for child in node.children:
         l_type_struct_refs(child, out)
 
-# the strong edges out of a struct, one "field:target" entry per reference.
+# the module-local struct a field type names directly or as an optional,
+# which a `weak` field can hold instead, or "".
+fn l_weakable_target(type_idx: Int) -> String:
+    mut node := get_node(type_idx)
+    if node.kind == "optional_type" and node.children.len() > 0:
+        node = get_node(node.children[0])
+    if node.kind == "type" and l_struct_decls.contains_key(node.value):
+        return node.value
+    return ""
+
+# the strong edges out of a struct, one "field:target:weakable" entry per
+# reference. weakable is "1" when the field names the target directly or as
+# an optional, so `weak` could mark it, and "0" through a collection.
 fn l_strong_edges(sname: String) -> List[String]:
     mut edges: List[String] := []
     decl := get_node(l_struct_decls[sname])
@@ -429,8 +447,12 @@ fn l_strong_edges(sname: String) -> List[String]:
             continue
         mut refs: List[String] := []
         l_type_struct_refs(field.children[0], refs)
+        weakable := l_weakable_target(field.children[0])
         for target in refs:
-            edges.push(l_field_name(field.value) + ":" + target)
+            mut flag := "0"
+            if target == weakable:
+                flag = "1"
+            edges.push(l_field_name(field.value) + ":" + target + ":" + flag)
     return edges
 
 # true when a strong path from `cur` reaches `origin`. `seen` holds every
@@ -452,6 +474,8 @@ fn lint_strong_cycles():
             parts := edge.split(":")
             fname := parts[0]
             target := parts[1]
+            if parts[2] != "1":
+                continue
             mut seen: List[String] := [sname, target]
             mut closes := target == sname
             if not closes:

@@ -1,0 +1,50 @@
+# a parameter with a default may be left out of a call: the call is given the
+# default in its place. this covers free functions, methods, generic
+# functions, functions of another module, labeled arguments, and every kind
+# of default (a literal, a negated number, none, a payload-free variant).
+import import_shapes as shapes
+
+enum Mode:
+    Fast
+    Slow(Int)
+
+struct Counter:
+    n: Int
+
+impl Counter:
+    fn bump(by: Int = 1, label: String = "bumped") -> String:
+        return "{label} {self.n + by}"
+
+fn add(a: Int, b: Int = 3) -> Int:
+    return a + b
+
+fn greet(name: String, greeting: String = "hello", times: Int = 1, shout: Bool = false, nick: String? = none, ratio: Float = -0.5, mode: Mode = Mode.Fast) -> String:
+    mut out := "{greeting} {name} x{times} {ratio}"
+    if shout:
+        out = out.to_upper()
+    if nick != none:
+        out = out + " aka {nick.value()}"
+    tail := match mode:
+        Mode.Fast => " fast"
+        Mode.Slow(n) => " slow {n}"
+    return out + tail
+
+fn pair[T](first: T, second: Int = 2) -> String:
+    return "{first} {second}"
+
+fn main():
+    print("{add(1)} {add(1, 4)} {add(a: 1)} {add(a: 1, b: 9)}")
+    print(greet("ann"))
+    print(greet("bob", "hi", 3, true, "bobby", 1.5, Mode.Slow(2)))
+    print(greet("cy", greeting: "hey"))
+    counter := Counter(n: 5)
+    print(counter.bump())
+    print(counter.bump(10))
+    print(counter.bump(by: 2, label: "up"))
+    print(pair("x"))
+    print(pair(4, 7))
+    print("{shapes.scaled(3)} / {shapes.scaled(3, 10)} / {shapes.scaled(3, 10, "mm")}")
+    mut total := 0
+    for i in 0..1000:
+        total += add(i)
+    print("{total}")

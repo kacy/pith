@@ -1,0 +1,25 @@
+# a module the import and default-argument tests bring in: a function, a
+# global, a struct and an enum, and one private helper.
+
+pub UNIT := "cm"
+
+pub struct Square:
+    side: Int
+
+pub enum Shape:
+    Dot
+    Box(Square)
+
+pub fn area(shape: Shape) -> Int:
+    match shape:
+        Shape.Dot => 0
+        Shape.Box(square) => scale(square.side)
+
+pub fn describe(shape: Shape) -> String:
+    return "a shape of {area(shape)} square {UNIT}"
+
+fn scale(side: Int) -> Int:
+    return side * side
+
+pub fn scaled(side: Int, factor: Int = 2, unit: String = "cm") -> String:
+    return "{side * factor} {unit}"

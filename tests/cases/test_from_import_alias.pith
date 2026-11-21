@@ -1,0 +1,27 @@
+# `from m import name as alias` binds the alias and not the name: the alias
+# reaches m's declaration even where this module declares the same name. it
+# works for a function (called or used as a value), a global, a struct and an
+# enum, in expressions, type annotations and match patterns.
+from std.math import degrees as to_degrees, sqrt
+from import_shapes import area as shape_area, UNIT as unit, Square as Tile, Shape as Form
+
+# this module's own `area`, which the alias must not reach
+fn area(side: Int) -> Int:
+    return side * 100
+
+fn label(form: Form) -> String:
+    match form:
+        Form.Dot => "dot"
+        Form.Box(tile) => "box of side {tile.side}"
+
+fn tile_of(side: Int) -> Tile:
+    return Tile(side: side)
+
+fn main():
+    print("{to_degrees(sqrt(4.0)):.2}")
+    convert := to_degrees
+    print("{convert(1.0):.2}")
+    forms: List[Form] := [Form.Dot, Form.Box(tile_of(3))]
+    for form in forms:
+        print("{label(form)}: {shape_area(form)} square {unit}")
+    print("local area: {area(3)}")

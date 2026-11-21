@@ -1,29 +1,36 @@
-# type conversions between primitives
+# type conversions: between Int, Float, Bool and String.
+#
+# reads order lines that arrive as text, converts each field to the type it
+# needs, and prints a summary. there are no implicit conversions: an Int
+# becomes a Float with to_float(), a Float becomes an Int with to_int()
+# (which truncates toward zero), and parsing text returns a result, because
+# the text may not be a number at all.
 
 fn main():
-    # int to string
-    number := 42
-    string_value := number.to_string()
-    print("int to string: {string_value}")
+    rows := ["widget,4,2.50,true", "gadget,two,9.99,false", "gizmo,1,12.75,false", "doohickey,3,abc,true"]
+    mut total := 0.0
+    mut items := 0
 
-    # int to float
-    float_value := number.to_float()
-    print("int to float: {float_value}")
+    for row in rows:
+        fields := row.split(",")
+        name := fields[0]
 
-    # float to string
-    pi_value := 3.14
-    print("float to string: {pi_value.to_string()}")
+        quantity := parse_int(fields[1]) catch:
+            print("{name}: skipped, quantity {fields[1]} is not a number")
+            continue
+        price := parse_float(fields[2]) catch:
+            print("{name}: skipped, price {fields[2]} is not a number")
+            continue
+        gift_wrap := fields[3] == "true"
 
-    # float to int (truncates)
-    print("float to int: {pi_value.to_int()}")
+        line := quantity.to_float() * price
+        total += line
+        items += quantity
+        print("{name}: {quantity} x {price:.2} = {line:.2}, gift wrap {gift_wrap}")
 
-    # bool to string
-    flag := true
-    print("bool to string: {flag.to_string()}")
+    # to_int truncates, so add 0.5 first to round to the nearest whole unit
+    print("items: {items}, total: {total:.2}, rounded: {(total + 0.5).to_int()}")
 
-    # parse_int returns a result — unwrap it, or fall back on bad input
-    print("parsed int: {parse_int("123").unwrap_or(0)}")
-    print("bad int: {parse_int("nope").unwrap_or(0)}")
-
-    # parse_float works the same way
-    print("parsed float: {parse_float("2.718").unwrap_or(0.0)}")
+    # to_string turns each of them back into text, here for a csv summary row
+    summary := [items.to_string(), total.to_string(), (items > 3).to_string()].join(",")
+    print("summary row: {summary}")

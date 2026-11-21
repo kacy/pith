@@ -1,68 +1,56 @@
-# optional types
+# optionals: T? for a value that may be absent, and the ways to read one.
+#
+# answers questions about a team directory. a lookup that misses returns
+# none instead of a sentinel like "" or -1, and the type says so: a
+# String? cannot be used as a String until the code has decided what an
+# empty one means.
 
-# an optional return signals "maybe no answer" without a sentinel value
-fn find_positive(n: Int) -> Int?:
-    if n > 0:
-        return n
+struct Member:
+    name: String
+    desk: Int?
+    # a field with an optional type can default to none
+    phone: String? = none
+
+fn find(members: List[Member], name: String) -> Member?:
+    for member in members:
+        if member.name == name:
+            return member
     return none
 
-# look up a value that might not be there
-fn lookup(scores: Map[String, Int], name: String) -> Int?:
-    return scores.get(name)
-
-# an optional parameter takes a bare none at the call site, and takes a plain
-# value too: `describe("ada", 95)` widens the 95 into the Some the body reads
-fn describe(label: String, score: Int?) -> String:
-    return "{label}: {score.unwrap_or(0)}"
-
-# an optional field can be left empty, and can default to empty
-struct Entry:
-    name: String
-    rank: Int?
-    note: String? = none
+# a plain value passed to an optional parameter is widened to a present one
+fn desk_label(desk: Int?) -> String:
+    return match desk:
+        none => "remote"
+        number => "desk {number}"
 
 fn main():
-    # if let runs the branch only when the optional has a value
-    if let n = find_positive(42):
-        print("found {n}")
-    if let n = find_positive(0 - 5):
-        print("found {n}")
-    else:
-        print("nothing positive")
+    members := [Member(name: "ada", desk: 12, phone: "555-0101"), Member(name: "grace", desk: none), Member(name: "linus", desk: 7)]
 
-    scores := {"ada": 95, "grace": 88}
-    # unwrap_or supplies a fallback when the key is missing
-    print("ada: {lookup(scores, "ada").unwrap_or(0)}")
-    print("carol: {lookup(scores, "carol").unwrap_or(0)}")
+    # if let runs the branch only when there is a value, and names it
+    for name in ["grace", "margaret"]:
+        if let member = find(members, name):
+            print("{name}: {desk_label(member.desk)}")
+        else:
+            print("{name}: not in the directory")
 
-    # match handles both cases explicitly
-    match lookup(scores, "grace"):
-        none => print("grace: unranked")
-        score => print("grace: {score}")
+    # unwrap_or supplies the value to use when there is none
+    for member in members:
+        print("{member.name:<6} phone {member.phone.unwrap_or("unlisted")}")
 
-    # none is a value you can write wherever an optional is expected: an
-    # argument, a struct field, a list element. it is only accepted there —
-    # `describe("x", none)` is fine, but a plain `Int` parameter rejects it.
-    print(describe("unranked", none))
-    print(describe("ada", lookup(scores, "ada")))
-    # widening goes the other way too: a plain Int satisfies an Int? parameter
-    print(describe("carol", 61))
+    # an optional interpolates as its value, or as `none`
+    print("ada's desk: {members[0].desk}, grace's desk: {members[1].desk}")
+    print("a plain Int widens: {desk_label(30)}")
 
-    entry := Entry("carol", none)
-    print("carol rank set: {entry.rank == none}, note set: {entry.note == none}")
+    # .get is the safe form of indexing, for maps and lists alike
+    extensions := {"ada": 4101, "linus": 4107}
+    # grace has no extension of her own, so calls go to the front desk
+    print("grace's extension: {extensions.get("grace").unwrap_or(4100)}")
+    print("a fourth member exists: {members.get(3) != none}")
 
-    # a list literal mixing none with values is a list of optionals
-    ranks: List[Int?] := [1, none, 3]
-    print("ranks: {ranks.len()}, second empty: {ranks[1] == none}")
-
-    # a container's store positions widen too, so a plain value goes straight
-    # in — no `T?` local first. the query positions do not: they compare
-    # against what the list already holds, and `ranks.contains(3)` reports.
-    mut more: List[Int?] := []
-    more.push(4)
-    more.push(none)
-    print("more: {more.len()}, first: {more[0].unwrap_or(0)}")
-
-    mut by_name: Map[String, Int?] := {}
-    by_name.insert("dana", 77)
-    print("dana: {by_name.get_default("dana", none).unwrap_or(0)}")
+    # a list of optionals keeps a slot for each missing value
+    desks: List[Int?] := members.map(fn(member: Member) => member.desk)
+    mut assigned := 0
+    for desk in desks:
+        if desk != none:
+            assigned += 1
+    print("{assigned} of {desks.len()} members have a desk")

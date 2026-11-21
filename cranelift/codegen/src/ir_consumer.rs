@@ -2898,12 +2898,17 @@ fn emit_main_prologue(
 }
 
 /// The named variables of a function body that hold a float. The IR does
-/// not type its variables, so this infers them: a variable stored from the
-/// result of a float instruction is a float, and so, conservatively, is
-/// every parameter of a function that does any float arithmetic; then
-/// three rounds propagate the kind through loads, integer-spelled
-/// arithmetic on a float operand, and stores.
-fn scan_float_vars(param_names: &[String], param_kinds: &[String], body_lines: &[&str]) -> HashSet<String> {
+/// not type its locals, so this infers them: a variable stored from the
+/// result of a float instruction is a float. A parameter is a float when its
+/// param line says `float`; one whose line names no kind is taken for a
+/// float when the function does any float arithmetic. Then three rounds
+/// propagate the kind through loads, integer-spelled arithmetic on a float
+/// operand, and stores.
+fn scan_float_vars(
+    param_names: &[String],
+    param_kinds: &[String],
+    body_lines: &[&str],
+) -> HashSet<String> {
     let mut float_vars: HashSet<String> = HashSet::new();
     let mut float_source_regs: HashSet<usize> = HashSet::new();
     for line in body_lines {

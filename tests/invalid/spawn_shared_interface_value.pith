@@ -1,0 +1,22 @@
+# an interface value may hold any type that implements it, so handing a held
+# one to a task is refused when any implementing type reaches a collection
+# outside a `guard` block (E248). a fresh conversion in the call is fine.
+interface Shape:
+    fn area() -> Int
+
+struct Bag:
+    items: List[Int]
+
+impl Shape for Bag:
+    fn area() -> Int:
+        return self.items.len()
+
+fn work(s: Shape) -> Int:
+    return s.area()
+
+fn main():
+    bag := Bag(items: [1, 2])
+    s: Shape := bag
+    t := spawn work(s)
+    bag.items.push(3)
+    print((await t).to_string())

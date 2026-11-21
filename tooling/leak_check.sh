@@ -263,6 +263,8 @@ cases=(
   tests/leaks/leak_json_fill_collections_fail
   tests/leaks/leak_json_node_collections
   tests/leaks/leak_closure_spill_capture
+  tests/leaks/leak_iter_user_adapters
+  tests/leaks/leak_closure_field_string
   tests/leaks/leak_tls_client_config
   tests/leaks/leak_tls12_client_auth
   tests/leaks/leak_tls_config_drop

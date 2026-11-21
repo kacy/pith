@@ -40,7 +40,7 @@
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
 from checker import c_interface_coercion, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
-from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, TID_ERR, TID_NONE
+from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
 from ir_names import ir_import_target_name, ir_global_storage_symbol, ir_base_decl_name, ir_import_impl_method_name
@@ -519,6 +519,16 @@ mut ir_preloaded_import_paths: List[String] := []
 # graph or the call lowers to a name no function carries.
 mut ir_all_module_roots: List[Int] := []
 mut ir_all_module_paths: List[String] := []
+# the entry file's root, or -1. a generic struct's per-instance methods are
+# emitted in the module that declares the generic, so std.iter emits
+# MapIter[Countdown, Int].next for a Countdown the entry declared, and its
+# body calls Countdown's own methods. the entry is no module path in the
+# graph, so its impls are collected separately (ir_collect_entry_impls).
+mut ir_entry_root := 0 - 1
+# true while the entry's impls are collected during another module's
+# emission: the empty module path then names the entry, not the module
+# being emitted, when an impl target is resolved to its declaration.
+mut ir_collecting_entry_impls := false
 # the resolved module path of the module currently being emitted ("" for the
 # entry file). lets an impl target in this module resolve to the module's own
 # declaration even when another module registered the same name globally.
@@ -547,6 +557,11 @@ pub fn set_import_roots(roots: List[Int], paths: List[String]):
 pub fn set_all_module_roots(roots: List[Int], paths: List[String]):
     ir_all_module_roots = roots
     ir_all_module_paths = paths
+
+# the entry file's root, so another module's emission can see the methods
+# the entry declares on its own types. set once per build; -1 leaves it out.
+pub fn set_entry_root(root: Int):
+    ir_entry_root = root
 
 # the resolved path of the module about to be emitted; "" for the entry
 # file. emit_ir does not clear it, so it holds the previous module's
@@ -1383,6 +1398,12 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         mname := ir_plain_method_name(node.value)
         recv_type := ir_method_receiver_type(node)
         if ir_lookup_impl_method_for(node.children[0], recv_type, mname).len() > 0:
+            return false
+        # a closure stored in a field returns under the same convention as
+        # any closure call, so its result arrives owned too. classified as a
+        # borrow, `self.f(x)` returning a fresh String was retained again and
+        # leaked once per call, which every map_iter producing strings hit.
+        if ir_method_call_is_closure_field(node, mname, recv_type):
             return false
         # a builtin that takes the count on its own result hands back an owned
         # value whichever branch it ran (ir_method_result_retains_over_args).
@@ -4273,6 +4294,40 @@ fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
             if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
                 ir_impl_func_specialized(method_idx, impl_type, instance_type_name, inst_tid, struct_params, arg_names)
 
+# the payload type of a `T?` return in one instance of a generic impl. the
+# written name is the impl's own associated type (`Item`), a type parameter
+# (`U`) or a parameter's associated type (`I.Item`), and each is replaced
+# through the instance's type arguments. left unsubstituted it has no rc
+# kind, so a returned Some carried no payload destructor and
+# `MapIter[Range, String].next` leaked every string it yielded.
+fn ir_specialized_optional_inner(idx: Int, inst_tid: Int) -> String:
+    return ir_instance_type_name(inst_tid, ir_extract_optional_inner_type(idx))
+
+# `name` as written inside the impl of a generic struct, resolved for the
+# instance `inst_tid`. a parameter's associated type recurses into the type
+# argument, so `I.Item` over `MapIter[Range, String]` answers String.
+fn ir_instance_type_name(inst_tid: Int, name: String) -> String:
+    if not struct_instance_base_name.contains_key(inst_tid) or not struct_instance_type_args.contains_key(inst_tid):
+        return name
+    base := struct_instance_base_name[inst_tid]
+    resolved := ir_resolve_assoc_type(base, name)
+    if not has_generic_declaration(base):
+        return resolved
+    params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
+    arg_tids := decode_tid_list(struct_instance_type_args[inst_tid])
+    parts := resolved.split(".")
+    for p, i in params:
+        if i >= arg_tids.len():
+            break
+        if resolved == p:
+            return ir_type_from_tid(arg_tids[i])
+        if parts.len() == 2 and parts[0] == p:
+            arg_tid := arg_tids[i]
+            if struct_instance_base_name.contains_key(arg_tid):
+                return ir_instance_type_name(arg_tid, parts[1])
+            return ir_resolve_assoc_type(ir_strip_type_args(get_type_name(arg_tid)), parts[1])
+    return resolved
+
 # emit one method of a generic impl for a single instance (`MapIter[Range,
 # Int, Int].next` as `MapIter_Range_int_int_next`), once per emit pass. the
 # instance's symbol is also recorded in ir_impl_method_specializations, with
@@ -4313,7 +4368,7 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     param_count := ir_param_count(idx) + 1
     ret_type := ir_extract_return_type(idx)
     ir_prepare_func_emission(ret_type)
-    ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
+    ir_current_func_optional_inner_kind = ir_specialized_optional_inner(idx, inst_tid)
     ir_current_func_returns_result = ir_fn_returns_result(idx)
     ir_current_func_miss_fails = ir_fn_miss_fails(idx)
     ir_current_impl_type = instance_type
@@ -9187,6 +9242,16 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         return ir_wrap_legacy_call_result(r, ret_type, call_name, idx, uses_result_abi)
     return 0 - 1
 
+# true when `recv.f(args)` calls a closure stored in recv's field `f`
+# rather than a method named `f`.
+fn ir_method_call_is_closure_field(node: Node, mname: String, obj_type: String) -> Bool:
+    cf_struct := ir_strip_type_args(obj_type)
+    if cf_struct.len() == 0:
+        return false
+    if not ir_struct_field_index_lookup.contains_key(cf_struct + "." + mname):
+        return false
+    return ir_lookup_impl_method_for(node.children[0], obj_type, mname).len() == 0
+
 # the general method dispatch: self-hosted list builtins, a call through a
 # closure-typed struct field, and finally an ordinary impl-method call with its
 # ARC bookkeeping (container-store retains, argument and receiver releases).
@@ -9204,42 +9269,39 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
     # `f := fn(...) ...; f(x)` gets, routing through pith_closure_get_fn. Covers
     # `self.f()` inside a generic impl and `h.f(x)` on any struct value; the
     # checker only reaches emission here when `f` is genuinely a fn-value field.
-    cf_struct := ir_strip_type_args(obj_type)
-    if cf_struct.len() > 0:
-        field_key := cf_struct + "." + mname
-        existing_method := ir_lookup_impl_method_for(node.children[0], obj_type, mname)
-        if ir_struct_field_index_lookup.contains_key(field_key) and existing_method.len() == 0:
-            recv_r := ir_expr(node.children[0])
-            field_idx := ir_unpack_field_index(ir_struct_field_index_lookup[field_key])
-            handle_r := ir_reg()
-            ir_emit("field " + handle_r.to_string() + " " + recv_r.to_string() + " " + (field_idx * 8).to_string() + " unknown " + mname)
-            tmp_name := ir_temp_name("__cl_field")
-            ir_emit("store " + tmp_name + " " + handle_r.to_string())
-            # the closure runs user code, which can overwrite this field or
-            # the fields its arguments were read from. so the handle and those
-            # arguments are pinned for the call, as ir_pin_operand does for any
-            # user callee; unpinned, `h.f = g` inside the closure freed the
-            # environment it was still running in.
-            ir_rc_retain_reg(handle_r, "closure")
-            ir_inflight_push(handle_r, "closure")
-            mut arg_regs: List[Int] := []
-            mut arg_pins: List[String] := []
-            mut ai := 0
-            while ai < node.children.len() - 1:
-                arg_idx := ir_method_call_arg_expr(node, ai)
-                arg_r := ir_emit_call_arg(arg_idx)
-                arg_regs.push(arg_r)
-                arg_pins.push(ir_pin_operand(arg_idx, arg_r, true))
-                ai = ai + 1
-            r := ir_reg()
-            ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
-            ir_release_owned_method_args(node, arg_regs, 0 - 1)
-            ir_unpin_args(arg_regs, arg_pins)
-            ir_inflight_drop(handle_r)
-            ir_rc_release_reg(handle_r, "closure")
-            if ir_field_receiver_is_owned_temp(node.children[0]):
-                ir_rc_release_reg(recv_r, ir_rc_kind(ir_infer_type(node.children[0])))
-            return r
+    if ir_method_call_is_closure_field(node, mname, obj_type):
+        field_key := ir_strip_type_args(obj_type) + "." + mname
+        recv_r := ir_expr(node.children[0])
+        field_idx := ir_unpack_field_index(ir_struct_field_index_lookup[field_key])
+        handle_r := ir_reg()
+        ir_emit("field " + handle_r.to_string() + " " + recv_r.to_string() + " " + (field_idx * 8).to_string() + " unknown " + mname)
+        tmp_name := ir_temp_name("__cl_field")
+        ir_emit("store " + tmp_name + " " + handle_r.to_string())
+        # the closure runs user code, which can overwrite this field or
+        # the fields its arguments were read from. so the handle and those
+        # arguments are pinned for the call, as ir_pin_operand does for any
+        # user callee; unpinned, `h.f = g` inside the closure freed the
+        # environment it was still running in.
+        ir_rc_retain_reg(handle_r, "closure")
+        ir_inflight_push(handle_r, "closure")
+        mut arg_regs: List[Int] := []
+        mut arg_pins: List[String] := []
+        mut ai := 0
+        while ai < node.children.len() - 1:
+            arg_idx := ir_method_call_arg_expr(node, ai)
+            arg_r := ir_emit_call_arg(arg_idx)
+            arg_regs.push(arg_r)
+            arg_pins.push(ir_pin_operand(arg_idx, arg_r, true))
+            ai = ai + 1
+        r := ir_reg()
+        ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
+        ir_release_owned_method_args(node, arg_regs, 0 - 1)
+        ir_unpin_args(arg_regs, arg_pins)
+        ir_inflight_drop(handle_r)
+        ir_rc_release_reg(handle_r, "closure")
+        if ir_field_receiver_is_owned_temp(node.children[0]):
+            ir_rc_release_reg(recv_r, ir_rc_kind(ir_infer_type(node.children[0])))
+        return r
     mut emit_name := ir_method_emit_name(mname, obj_type)
     if emit_name == "list_join" and ir_list_element_kind(node.children[0]) == "int":
         # list_join assumes string elements; Int lists need decimal formatting
@@ -13514,6 +13576,20 @@ fn ir_lookup_impl_method_for(recv_idx: Int, type_name: String, method_name: Stri
                 return ""
     return ir_lookup_impl_method_name(type_name, method_name)
 
+# the entry's interfaces, associated types and impl method signatures, when
+# another module is being emitted. they go in first, so every name-keyed entry
+# a module in the graph registers for the same bare name replaces them; only
+# the tid keys of the entry's own declarations keep pointing at the entry.
+# the entry's symbols carry no module prefix, so the empty path names them.
+fn ir_collect_entry_impls(root_idx: Int):
+    if ir_entry_root < 0 or ir_entry_root == root_idx:
+        return
+    ir_index_interfaces_in_root(ir_entry_root)
+    ir_collect_assoc_bindings_in_root(ir_entry_root, "")
+    ir_collecting_entry_impls = true
+    ir_collect_impl_methods(ir_entry_root, "")
+    ir_collecting_entry_impls = false
+
 fn ir_collect_impl_methods(root_idx: Int, module_path: String):
     for item_idx in ir_root_items(root_idx):
         node := get_node(item_idx)
@@ -13970,6 +14046,8 @@ fn ir_collect_impl_method_signatures(node: Node, module_path: String):
 fn ir_impl_owner_tid(impl_type: String, module_path: String) -> Int:
     if impl_type.contains("["):
         return 0 - 1
+    if ir_collecting_entry_impls:
+        return lookup_entry_type_id(impl_type)
     mut path := module_path
     if path.len() == 0:
         path = ir_current_module_path
@@ -15256,6 +15334,7 @@ fn ir_collect_root_phase_two_metadata(root_idx: Int):
     # index every interface (imports + root) before any impl signatures are
     # collected, so an impl can find its interface's defaults regardless of
     # declaration order across modules
+    ir_collect_entry_impls(root_idx)
     mut iface_i := 0
     while iface_i < method_roots.len():
         ir_index_interfaces_in_root(method_roots[iface_i])

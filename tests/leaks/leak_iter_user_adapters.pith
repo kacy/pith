@@ -1,0 +1,39 @@
+# std.iter adapters over an iterator the entry file declares, chained and
+# drained each round. the adapter specializations are emitted in std.iter
+# and call the entry's next(), so each round moves the source, the closures
+# and the strings they build through code from two modules.
+import leakprobe as probe
+from std.iter import Iterator, to_list, map_iter, filter_iter
+
+struct Countdown:
+    left: Int
+
+impl Iterator for Countdown:
+    type Item = Int
+
+    fn next() -> Item?:
+        if self.left == 0:
+            return none
+        self.left -= 1
+        return self.left
+
+fn round(i: Int) -> Int:
+    base := i % 7
+    labels := to_list(map_iter(filter_iter(Countdown(left: 8), fn(n: Int) => n > 2), fn(n: Int) => "n{n + base}"))
+    mut total := labels.len()
+    for l in labels:
+        total += l.len()
+    nums := to_list(filter_iter(map_iter(Countdown(left: 6), fn(n: Int) => n * base), fn(n: Int) => n % 2 == 0))
+    return total + nums.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum += round(i)
+        i += 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

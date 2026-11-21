@@ -1,50 +1,59 @@
-# test std.rand — random numbers, shuffle, choice, sample
+# stdlib_rand: seeded random numbers with std.rand.
+#
+# draws the winners of an office raffle. the generator is seeded, so the same
+# seed gives the same draw on every run: that is what makes a draw you can
+# publish and someone else can check. shuffle, sample and choice pick from
+# lists; int, roll and chance cover numbers; string makes a claim code.
+
 import std.fmt as fmt
-from std.rand import seed, int, shuffle, choice, sample, roll, chance
+import std.rand as rand
+
+struct Draw:
+    winners: List[Int]
+    grand_prize: String
+    claim_code: String
+
+fn draw(seed: Int, tickets: List[Int], prizes: List[String]) -> Draw:
+    rand.seed(seed)
+    winners := rand.sample(tickets, 3)
+    return Draw(winners: winners, grand_prize: rand.choice_string(prizes), claim_code: rand.string(8))
 
 fn main():
-    seed(42)
+    tickets := [101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
+    prizes := ["bicycle", "headphones", "coffee machine", "day off"]
 
-    # basic random
-    a := int(1, 10)
-    print("random int: {a}")
+    first := draw(2026, tickets, prizes)
+    print("seed 2026 winners: {fmt.ints(first.winners)}")
+    print("grand prize:       {first.grand_prize}")
+    print("claim code length: {first.claim_code.len()}")
 
-    # roll
-    d := roll(6)
-    print("roll d6: {d}")
+    # anyone with the seed can repeat the draw and get the same result
+    again := draw(2026, tickets, prizes)
+    same := fmt.ints(again.winners) == fmt.ints(first.winners) and again.claim_code == first.claim_code
+    print("repeat with seed 2026 matches: {same}")
+    other := draw(7, tickets, prizes)
+    print("seed 7 winners:    {fmt.ints(other.winners)}")
 
-    # choice
-    items := [10, 20, 30, 40, 50]
-    c := choice(items)
-    print("choice: {c}")
+    # the seating order for the prize table
+    rand.seed(2026)
+    print("")
+    print("seating order: {fmt.ints(rand.shuffle([1, 2, 3, 4, 5, 6]))}")
 
-    # shuffle
-    nums := [1, 2, 3, 4, 5]
-    shuffled := shuffle(nums)
-    print("shuffled: {fmt.ints(shuffled)}")
-    # verify same elements
-    mut sum_orig := 0
-    mut sum_shuf := 0
-    mut i := 0
-    while i < 5:
-        sum_orig = sum_orig + nums[i]
-        sum_shuf = sum_shuf + shuffled[i]
-        i = i + 1
-    if sum_orig == sum_shuf:
-        print("shuffle preserves sum: true")
+    # a tie for the last prize goes to dice, rerolled until someone wins
+    mut rounds := 0
+    mut alice := 0
+    mut bob := 0
+    while alice == bob:
+        alice = rand.roll(6)
+        bob = rand.roll(6)
+        rounds += 1
+    winner := if alice > bob: "alice" else: "bob"
+    print("tie-break: alice {alice}, bob {bob} after {rounds} round(s), {winner} wins")
 
-    # sample
-    s := sample([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 3)
-    print("sample 3: {fmt.ints(s)}")
-
-    # chance
-    seed(42)
+    # chance(30) is true about 30% of the time; over many trials it settles
     mut hits := 0
-    i = 0
-    while i < 100:
-        if chance(50):
-            hits = hits + 1
-        i = i + 1
-    print("chance(50) hits: {hits}")
-
-    print("rand tests passed")
+    for trial in 0..1000:
+        if rand.chance(30):
+            hits += 1
+    print("chance(30) over 1000 trials: {hits} hits")
+    print("door prize goes to ticket {rand.int(101, 110)}")

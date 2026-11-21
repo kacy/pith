@@ -187,6 +187,14 @@ mapping is applied.
 
 ```
 funcref REG NAME            REG = a pointer to function NAME.
+calli REG PTR RETKIND N ARG...
+                            call the function PTR points at with N
+                            arguments under the plain abi (i64 arguments,
+                            one i64 return); RETKIND types the result the
+                            way a call's does. a method call on an
+                            interface value lowers to one, through the
+                            method's slot (docs/interface_values.md). the
+                            count checker treats it as a user call.
 closure_ref REG NAME        REG = a closure value wrapping NAME.
 closure_stack REG NAME      the same closure, built in a stack slot of the
                             current frame. never retained, released or

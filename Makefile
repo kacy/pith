@@ -10,7 +10,7 @@ EXPLAIN_CASE_FAILURE := sh tooling/explain_case_failure.sh
 SEED_CHECK_TMP := target/seed-check.ir
 SEED_SMOKE_DIR := target/seed-smoke
 
-NONDETERMINISTIC_EXAMPLES := net_basics net_echo redis_client
+NONDETERMINISTIC_EXAMPLES := net_basics redis_client
 EXPECTED_EXAMPLES := $(filter-out $(addprefix examples/expected/,$(addsuffix .txt,$(NONDETERMINISTIC_EXAMPLES))),$(wildcard examples/expected/*.txt))
 SLOW_NATIVE_EXAMPLES := csv_ops http_api http_apps http_websocket_app websocket_chat websocket_echo
 REGRESSION_EXPECTED := $(wildcard tests/expected/*.txt)

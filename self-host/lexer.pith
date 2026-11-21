@@ -450,6 +450,15 @@ fn strip_digit_separators(text: String) -> String:
 fn scan_number():
     start := current_position
 
+    # a number right after a dot is a tuple index, so `pair.0.1` reads as two
+    # indexes rather than an index followed by the float `0.1`
+    if current_token_kind == "dot":
+        while current_position < source.len() and is_digit(source_char(current_position)):
+            current_position = current_position + 1
+            current_column = current_column + 1
+        emit("int_lit", source.substring(start, current_position))
+        return
+
     # check for hex, binary, octal prefixes
     if source_char(current_position) == "0":
         if current_position + 1 < source.len():

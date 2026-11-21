@@ -298,9 +298,13 @@ select_arm    = IDENT , ":=" , postfix_expr , "=>" , expression
 
 (* catch — fallback when the left side is a failed result. the block form
    runs the block on the error path instead of producing a value; the block
-   must end with return, fail, continue or break *)
+   must end with return, fail, continue or break. `catch err:` binds the
+   error, typed as the result's error type, for the block only. in a
+   statement header (`if`, `elif`, `while`, `for`, `match`, `locked`) the
+   colon belongs to the statement, so `if ready() catch flag:` keeps `flag`
+   as the fallback value *)
 catch_expr    = or_expr , { "catch" , or_expr }
-              | or_expr , "catch" , ":" , NEWLINE , INDENT , { statement } , DEDENT ;
+              | or_expr , "catch" , [ IDENT ] , ":" , NEWLINE , INDENT , { statement } , DEDENT ;
 or_expr       = and_expr , { "or" , and_expr } ;
 and_expr      = not_expr , { "and" , not_expr } ;
 not_expr      = "not" , not_expr | comparison ;

@@ -225,6 +225,9 @@ mut literal_targets: Map[Int, Int] := {}
 # binding is retyped. see refine_empty_literal_binding.
 mut open_empty_literal_bindings: Map[Int, Int] := {}
 
+# the error type of the `catch err:` block being checked
+mut caught_error_type := TID_ERR
+
 # ---------------------------------------------------------------
 # initialization
 # ---------------------------------------------------------------
@@ -3628,6 +3631,8 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         return check_catch_expression(node, scope_id)
     if node.kind == "catch_block":
         return check_catch_block(node, scope_id)
+    if node.kind == "caught_error":
+        return caught_error_type
     if node.kind == "select_expr":
         return check_select_expression(node, scope_id)
     if node.kind == "match_expr":
@@ -7130,7 +7135,12 @@ fn check_catch_block(node: Node, scope_id: Int) -> Int:
 
     block_node := get_node(node.children[1])
     block_scope := create_scope(scope_id)
+    # `catch err:` opens its block with a binding of err to a caught_error
+    # node, which takes the result's error type
+    saved_caught := caught_error_type
+    caught_error_type = result_info.value_type
     check_block_statement(block_node, block_scope)
+    caught_error_type = saved_caught
 
     if block_node.children.len() == 0:
         report_error("E253", "a catch block cannot be empty; it runs on the error path and must leave with return, fail, continue or break")

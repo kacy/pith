@@ -325,6 +325,16 @@ for line in lines:
         continue                       # skip the malformed row
 ```
 
+Name the error after `catch` when the block needs it. The name holds the
+result's error and is visible only inside the block:
+
+```pith
+for line in lines:
+    parsed := parse_row(line) catch err:
+        print("skipping row: {err}")
+        continue
+```
+
 When you want to _observe_ the miss without crashing or propagating —
 distinguishing "not present" from "present with value 0" — reach for
 the `.get()` methods, which return `T?`:

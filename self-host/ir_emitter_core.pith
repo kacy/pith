@@ -90,6 +90,9 @@ mut ir_index_offset_targets: Map[Int, Int] := {}
 # set while one of those steps, or an index offset that skips its check, is
 # emitted, so ir_int_op hands back the plain op instead of the checked one
 mut ir_plain_int_arith := false
+# the owned error of the `catch err:` block being emitted. the block's first
+# statement binds it, through a caught_error node.
+mut ir_caught_error_reg := 0
 
 mut ir_map_value_types: Map[String, String] := {} # map variable name -> value type
 
@@ -1309,6 +1312,9 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # ir_emit_catch_expr), so the result arrives owned. treating it as borrowed
     # makes the binding retain again and leaks the payload.
     if node.kind == "catch_expr" or node.kind == "catch_block":
+        return false
+    # the error a `catch err:` block binds arrives owned (ir_emit_catch_block)
+    if node.kind == "caught_error":
         return false
     # awaiting a task transfers the result's count out to the single awaiter:
     # the task's thread produced the value with count 1 and stored it raw in the
@@ -11245,9 +11251,13 @@ fn ir_emit_catch_block_pair(node: Node, flag_r: Int, val_r: Int) -> Int:
     ir_emit("store " + temp_name + " " + val_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(err_l)
-    err_kind := ir_rc_kind(ir_result_field_kind(result_tid, "err"))
-    if err_kind.len() > 0:
-        ir_rc_release_reg(val_r, err_kind)
+    if node.value.len() > 0:
+        # `catch err:` hands the owned error to the block's binding
+        ir_caught_error_reg = val_r
+    else:
+        err_kind := ir_rc_kind(ir_result_field_kind(result_tid, "err"))
+        if err_kind.len() > 0:
+            ir_rc_release_reg(val_r, err_kind)
     ir_block(node.children[1])
     ir_emit("jmp " + merge_l)
     ir_emit_label(merge_l)
@@ -11288,10 +11298,21 @@ fn ir_emit_catch_block(node: Node) -> Int:
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(err_l)
-    # the error is not consumed by the block (there is no binding for it in
-    # this form), so drop it before user code runs, unless the operand is a
-    # borrow, in which case the error and the shell stay with their owner.
-    if operand_class != "borrowed":
+    if node.value.len() > 0:
+        # `catch err:` binds the error, so the block's binding takes it
+        # owned: the shell's count moves over from an owned operand, and a
+        # borrowed operand's error gets a count of its own while the shell
+        # stays with its owner.
+        err_r := ir_emit_result_value_field(result_r, result_tid, "err")
+        if operand_class == "borrowed":
+            ir_rc_retain_reg(err_r, ir_rc_kind(ir_result_field_kind(result_tid, "err")))
+        else:
+            ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
+        ir_caught_error_reg = err_r
+    elif operand_class != "borrowed":
+        # the error is not consumed by the block, so drop it before user
+        # code runs, unless the operand is a borrow, in which case the error
+        # and the shell stay with their owner.
         ir_emit_release_result_error(result_r, result_tid)
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_block(node.children[1])
@@ -11396,6 +11417,8 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_catch_expr(node)
     if kind == "catch_block":
         return ir_emit_catch_block(node)
+    if kind == "caught_error":
+        return ir_caught_error_reg
 
     if kind == "select_expr":
         return ir_emit_select_expr(idx)

@@ -127,6 +127,10 @@ mut method_declared_kinds: Map[String, Bool] := {}
 # helpers stay private; without it every function in the shared name table was
 # reachable from anywhere.
 pub mut function_visibility_map: Map[String, Bool] := {}
+# the type ids predeclare_types gave this module's structs and enums, by
+# declaration node.
+mut predeclared_type_ids: Map[Int, Int] := {}
+
 mut struct_field_default_nodes: Map[String, Int] := {}
 # generic declaration key -> its declaration node. the key is the
 # module-qualified name (see module_generic_target_name); a declaration
@@ -243,6 +247,7 @@ pub fn initialize_checker(file_path: String):
     function_visibility_map = {}
     checker_methods_reset()
     struct_field_default_nodes = {}
+    predeclared_type_ids = {}
     generic_declaration_map = {}
     generic_base_first_module = {}
     ambiguous_generic_bases = {}
@@ -462,6 +467,10 @@ fn build_instantiated_type_name(base: String, type_args: List[Int]) -> String:
 # ---------------------------------------------------------------
 
 mut type_resolve_depth := 0
+# the type node being resolved, which an unknown name is reported at. type
+# annotations are resolved while registering declarations too, where no
+# expression is being checked to give the report a position.
+mut resolving_type_node := 0 - 1
 
 # resolve a type expression node to its type id. an active generic
 # substitution (active_subst_params) applies through resolve_named_type.
@@ -476,7 +485,10 @@ fn resolve_type_implementation(node_idx: Int) -> Int:
     node := get_node(node_idx)
     mut result := TID_ERR
     if node.kind == "type":
+        outer_type_node := resolving_type_node
+        resolving_type_node = node_idx
         result = resolve_named_type(node.value)
+        resolving_type_node = outer_type_node
     elif node.kind == "generic_type":
         result = resolve_generic_type_from_node(node)
     elif node.kind == "optional_type":
@@ -622,7 +634,10 @@ fn resolve_named_type(name: String) -> Int:
         recovered := resolve_type_by_module_basename(name)
         if recovered >= 0:
             return recovered
-        report_error("E202", "unknown type: " + name)
+        if resolving_type_node >= 0:
+            report_error_at(resolving_type_node, "E202", "unknown type: " + name)
+        else:
+            report_error("E202", "unknown type: " + name)
         return TID_ERR
     return tid
 
@@ -835,12 +850,47 @@ fn resolve_type_with_substitution_map(node_idx: Int, subst_params: List[String],
 # names below it as unknown.
 pub fn c_register_all(root_idx: Int):
     root := get_node(root_idx)
+    predeclare_types(root)
     for child in root.children:
         register_top_level_declarations(child)
     # with every interface and impl now registered, let impls inherit any
     # interface default methods they did not override
     for child in root.children:
         fill_interface_defaults_for(child)
+
+# give every plain struct and enum of the module its type id, with no fields
+# or variants yet, before any of them is registered. a field or a payload can
+# then name a type declared further down the file, or the enum it belongs to
+# (`Folder(List[Entry])`); registration fills each one in.
+fn predeclare_types(root: Node):
+    for child in root.children:
+        mut idx := child
+        if node_kind(idx) == "pub":
+            idx = node_child(idx, 0)
+        node := get_node(idx)
+        if node.kind != "struct_decl" and node.kind != "enum_decl":
+            continue
+        if is_reserved_type_name(node.value) or declaration_has_generic_params(node):
+            continue
+        mut empty_names: List[String] := []
+        mut empty_ints: List[Int] := []
+        mut empty_bools: List[Bool] := []
+        mut empty_payloads: List[List[Int]] := []
+        mut tid := 0
+        if node.kind == "struct_decl":
+            tid = add_type_info(ti_struct(node.value, empty_names, empty_ints, empty_bools, empty_bools))
+        else:
+            tid = add_type_info(ti_enum(node.value, empty_names, empty_payloads))
+        register_module_type_name(node.value, tid)
+        predeclared_type_ids.insert(idx, tid)
+
+# the type id predeclare_types gave a declaration, or a new one from `info`.
+fn declared_type_id(node_idx: Int, info: TypeInfo) -> Int:
+    if predeclared_type_ids.contains_key(node_idx):
+        tid := predeclared_type_ids[node_idx]
+        set_type_info(tid, info)
+        return tid
+    return add_type_info(info)
 
 fn register_top_level_declarations(node_idx: Int):
     node := get_node(node_idx)
@@ -994,7 +1044,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
     mut empty_names: List[String] := []
     mut empty_ints: List[Int] := []
     mut empty_bools: List[Bool] := []
-    tid := add_type_info(ti_struct(base_name, empty_names, empty_ints, empty_bools, empty_bools))
+    tid := declared_type_id(node_idx, ti_struct(base_name, empty_names, empty_ints, empty_bools, empty_bools))
     register_module_type_name(base_name, tid)
     note_plain_type_declaration(base_name)
     define_binding_at(current_scope, base_name, tid, false, node_idx)
@@ -1064,7 +1114,7 @@ fn register_enum_declaration(node_idx: Int, node: Node):
             for vc in cn.children:
                 vtypes.push(resolve_type_implementation(vc))
             variant_types.push(vtypes)
-    tid := add_type_info(ti_enum(base_name, variant_names, variant_types))
+    tid := declared_type_id(node_idx, ti_enum(base_name, variant_names, variant_types))
     register_module_type_name(base_name, tid)
     note_plain_type_declaration(base_name)
     define_binding_at(current_scope, base_name, tid, false, node_idx)

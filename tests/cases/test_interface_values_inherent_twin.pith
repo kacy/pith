@@ -1,0 +1,37 @@
+# a type whose own impl and interface impl both declare a fallible method of
+# the same name compiles both to one symbol. that symbol has to keep the boxed
+# result a call through an interface value expects; it used to take the
+# register pair from the type's own impl, and the dispatched call crashed.
+# std/io declares its streams this way.
+import std.io as io
+
+interface Target:
+    fn put(data: String) -> Int!
+
+struct Sink:
+    handle: Int
+
+impl Target for Sink:
+    fn put(data: String) -> Int!:
+        return data.len() + self.handle
+
+impl Sink:
+    fn put(data: String) -> Int!:
+        return data.len() + self.handle
+
+fn drain(r: io.Reader) -> String!:
+    mut out := ""
+    mut chunk := r.read(4)!
+    while chunk.len() > 0:
+        out = out + chunk
+        chunk = r.read(4)!
+    return out
+
+fn main() -> Int!:
+    print("{Sink(3).put("ab")!}")
+    t: Target := Sink(1)
+    print("{t.put("xy")!}")
+    print(drain(io.string_reader("held as a reader"))!)
+    w: io.Writer := io.string_buffer()
+    print("{w.write("abc")!}")
+    return 0

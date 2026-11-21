@@ -465,6 +465,8 @@ mut ir_interface_coercion_bypass: Map[Int, Bool] := {}
 # a small integer per concrete type converted to an interface, in first-use
 # order
 mut ir_interface_type_ids: Map[String, Int] := {}
+# methods of an interface impl, by symbol: they keep the boxed result abi
+mut ir_result_reg_blocked: Map[String, Bool] := {}
 mut ir_current_func_returns_result := false
 # whether a miss (index, key, `.value()`) fails the current function. only a
 # String error can carry the miss message; a `T!E` function with any other E
@@ -668,6 +670,7 @@ fn ir_reset_type_state():
     ir_func_returns.clear()
     ir_func_result_ok_kinds.clear()
     ir_result_reg_funcs.clear()
+    ir_result_reg_blocked = {}
     ir_rcall_defer_idx = 0 - 1
     ir_rcall_current_idx = 0 - 1
     ir_rcall_pair_ready = false
@@ -7948,7 +7951,20 @@ fn ir_method_result_ok_kind(impl_type: String, method_idx: Int) -> String:
 fn ir_maybe_register_result_reg_method(impl_node: Node, impl_type: String, method_idx: Int, method_node: Node, module_path: String):
     if not ir_result_reg_enabled():
         return
+    mut full_name := impl_type + "_" + method_node.value
+    if module_path.len() > 0:
+        full_name = ir_import_impl_method_name(module_path, impl_type, method_node.value)
+    # an interface impl's method keeps the boxed result: a call through an
+    # interface value (calli) expects it. a same-named method in the type's
+    # own impl compiles to the same symbol, so it must not take the register
+    # pair either, whichever of the two impls is registered first.
     if ir_impl_interface_base(impl_node).len() > 0:
+        ir_result_reg_blocked.insert(full_name, true)
+        if ir_result_reg_funcs.contains_key(full_name):
+            ir_result_reg_funcs.remove(full_name)
+            ir_func_result_ok_kinds.remove(full_name)
+        return
+    if ir_result_reg_blocked.contains_key(full_name):
         return
     if impl_type.contains("["):
         return
@@ -7962,9 +7978,6 @@ fn ir_maybe_register_result_reg_method(impl_node: Node, impl_type: String, metho
     for child_idx in method_node.children:
         if ir_node_contains_lambda_or_spawn(child_idx):
             return
-    mut full_name := impl_type + "_" + method_node.value
-    if module_path.len() > 0:
-        full_name = ir_import_impl_method_name(module_path, impl_type, method_node.value)
     ir_result_reg_funcs.insert(full_name, true)
     ir_func_result_ok_kinds.insert(full_name, ok_kind)
 
@@ -8841,7 +8854,6 @@ fn ir_is_channel_send_name(emit_name: String) -> Bool:
 # concrete type, slot 1 the concrete value, and slot 2 onwards one function
 # pointer per interface method, in declaration order. the box carries the
 # tuple destructor for its signature, which releases slot 1 by its kind.
-
 
 # the interface the value at idx converts to, or -1. the checker records a
 # conversion against the node, and a generic body is one node set walked per

@@ -48,13 +48,26 @@ threadlocal mut parser_position: Int := 0
 threadlocal mut parser_error: Bool := false
 threadlocal mut parser_depth: Int := 0
 
-# node kinds, as stored in node_kinds.
-TOML_STRING := 1
-TOML_BOOL := 2
-TOML_INT := 3
-TOML_FLOAT := 4
-TOML_TABLE := 5
-TOML_ARRAY := 6
+# the kind of a node, as stored in node_kinds. it has no payloads, so it is
+# a plain integer at run time.
+enum TomlKind:
+    String
+    Bool
+    Int
+    Float
+    Table
+    Array
+
+impl TomlKind:
+    # the name node_kind reports for this kind.
+    fn name() -> String:
+        return match self:
+            TomlKind.String => "string"
+            TomlKind.Bool => "bool"
+            TomlKind.Int => "int"
+            TomlKind.Float => "float"
+            TomlKind.Table => "table"
+            TomlKind.Array => "array"
 
 # the pool keeps nodes in parallel lists, one slot per live node in id order,
 # the way std.json does. a node is its kind and one Int payload: the value of an
@@ -65,7 +78,7 @@ TOML_ARRAY := 6
 # a table's children live in lists of its own rather than in one flat list: a
 # table gains keys after it is created, and a later header can reopen it, so
 # its children are not contiguous in parse order.
-threadlocal mut node_kinds: List[Int] := []
+threadlocal mut node_kinds: List[TomlKind] := []
 threadlocal mut node_payloads: List[Int] := []
 threadlocal mut node_strings: List[String] := []
 threadlocal mut table_keys: List[List[String]] := []
@@ -86,7 +99,7 @@ threadlocal mut segment_slots: List[Int] := []
 threadlocal mut open_scope_depth: Int := 0
 
 # appends a node and returns its id.
-fn new_node(kind: Int, payload: Int) -> Int:
+fn new_node(kind: TomlKind, payload: Int) -> Int:
     node_id := next_node_id
     next_node_id = next_node_id + 1
     slot := node_kinds.len()
@@ -100,7 +113,7 @@ fn new_node(kind: Int, payload: Int) -> Int:
 
 fn new_string_node(text: String) -> Int:
     node_strings.push(text)
-    return new_node(TOML_STRING, node_strings.len() - 1)
+    return new_node(TomlKind.String, node_strings.len() - 1)
 
 fn new_table_node() -> Int:
     mut keys: List[String] := []
@@ -109,12 +122,12 @@ fn new_table_node() -> Int:
     table_keys.push(keys)
     table_values.push(values)
     table_index.push(index)
-    return new_node(TOML_TABLE, table_keys.len() - 1)
+    return new_node(TomlKind.Table, table_keys.len() - 1)
 
 fn new_array_node() -> Int:
     mut items: List[Int] := []
     array_items.push(items)
-    return new_node(TOML_ARRAY, array_items.len() - 1)
+    return new_node(TomlKind.Array, array_items.len() - 1)
 
 # the slot of a live node, or -1 for a handle that is not one.
 fn node_slot(handle: Int) -> Int:
@@ -150,13 +163,13 @@ fn node_payload(handle: Int) -> Int:
 # other kind.
 fn table_entry(handle: Int) -> Int:
     slot := node_slot(handle)
-    if slot < 0 or node_kinds[slot] != TOML_TABLE:
+    if slot < 0 or node_kinds[slot] != TomlKind.Table:
         return 0 - 1
     return node_payloads[slot]
 
 fn array_entry(handle: Int) -> Int:
     slot := node_slot(handle)
-    if slot < 0 or node_kinds[slot] != TOML_ARRAY:
+    if slot < 0 or node_kinds[slot] != TomlKind.Array:
         return 0 - 1
     return node_payloads[slot]
 
@@ -244,11 +257,11 @@ fn toml_restore_to(node_id_mark: Int, table_flat_mark: Int, array_flat_mark: Int
     mut slot := cut
     while slot < node_kinds.len() and (strings_cut < 0 or tables_cut < 0 or arrays_cut < 0):
         kind := node_kinds[slot]
-        if kind == TOML_STRING and strings_cut < 0:
+        if kind == TomlKind.String and strings_cut < 0:
             strings_cut = node_payloads[slot]
-        elif kind == TOML_TABLE and tables_cut < 0:
+        elif kind == TomlKind.Table and tables_cut < 0:
             tables_cut = node_payloads[slot]
-        elif kind == TOML_ARRAY and arrays_cut < 0:
+        elif kind == TomlKind.Array and arrays_cut < 0:
             arrays_cut = node_payloads[slot]
         slot = slot + 1
     if strings_cut >= 0:
@@ -360,18 +373,7 @@ fn node_kind(handle: Int) -> String:
     slot := node_slot(handle)
     if slot < 0:
         return ""
-    kind := node_kinds[slot]
-    if kind == TOML_STRING:
-        return "string"
-    if kind == TOML_TABLE:
-        return "table"
-    if kind == TOML_ARRAY:
-        return "array"
-    if kind == TOML_INT:
-        return "int"
-    if kind == TOML_BOOL:
-        return "bool"
-    return "float"
+    return node_kinds[slot].name()
 
 # Looks up a direct key in a table and returns the child handle, or -1.
 fn table_lookup(handle: Int, key: String) -> Int:
@@ -502,11 +504,11 @@ fn parse_value_node() -> Int:
     # boolean true
     if literal_at(parser_position, "true"):
         parser_position = parser_position + 4
-        return new_node(TOML_BOOL, 1)
+        return new_node(TomlKind.Bool, 1)
     # boolean false
     if literal_at(parser_position, "false"):
         parser_position = parser_position + 5
-        return new_node(TOML_BOOL, 0)
+        return new_node(TomlKind.Bool, 0)
 
     # array
     if c == "[":
@@ -566,12 +568,12 @@ fn parse_value_node() -> Int:
             value := parse_float(num_str.replace("_", "")) catch:
                 parser_error = true
                 return 0 - 1
-            return new_node(TOML_FLOAT, float_to_bits(value))
+            return new_node(TomlKind.Float, float_to_bits(value))
         if not is_float:
             parsed := parse_int(num_str.replace("_", "")) catch:
                 parser_error = true
                 return 0 - 1
-            idx := new_node(TOML_INT, parsed)
+            idx := new_node(TomlKind.Int, parsed)
             return idx
 
     parser_error = true

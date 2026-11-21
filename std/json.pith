@@ -120,14 +120,28 @@ fn json_span_equals(input: Bytes, start: Int, end: Int, target: Bytes) -> Bool:
 # nothing and turns that mistake into a plain "invalid handle".
 threadlocal mut next_node_id: Int := 0
 
-# node kinds, as stored in node_kinds.
-JSON_NULL := 0
-JSON_BOOL := 1
-JSON_INT := 2
-JSON_FLOAT := 3
-JSON_STRING := 4
-JSON_ARRAY := 5
-JSON_OBJECT := 6
+# the kind of a node, as stored in node_kinds. it has no payloads, so it is
+# a plain integer at run time.
+enum JsonKind:
+    Null
+    Bool
+    Int
+    Float
+    String
+    Array
+    Object
+
+impl JsonKind:
+    # the name type_of reports for this kind.
+    fn name() -> String:
+        return match self:
+            JsonKind.Null => "null"
+            JsonKind.Bool => "bool"
+            JsonKind.Int => "int"
+            JsonKind.Float => "float"
+            JsonKind.String => "string"
+            JsonKind.Array => "array"
+            JsonKind.Object => "object"
 
 # the pool keeps nodes in parallel lists, one slot per live node in id
 # order. a node is its kind and one Int payload: the value of an int, 0 or
@@ -135,7 +149,7 @@ JSON_OBJECT := 6
 # index of its entry in node_strings, array_items or object_key_lists
 # and object_value_lists. a node used to take an entry in seven maps, which cost
 # hundreds of bytes per node: a 2 MB array of small ints peaked at 446 MB.
-threadlocal mut node_kinds: List[Int] := []
+threadlocal mut node_kinds: List[JsonKind] := []
 threadlocal mut node_payloads: List[Int] := []
 threadlocal mut node_strings: List[String] := []
 threadlocal mut array_items: List[List[Int]] := []
@@ -156,7 +170,7 @@ threadlocal mut segment_slots: List[Int] := []
 threadlocal mut open_scope_depth: Int := 0
 
 # appends a node and returns its id.
-fn new_node(kind: Int, payload: Int) -> Int:
+fn new_node(kind: JsonKind, payload: Int) -> Int:
     node_id := next_node_id
     next_node_id = next_node_id + 1
     slot := node_kinds.len()
@@ -170,24 +184,24 @@ fn new_node(kind: Int, payload: Int) -> Int:
 
 fn new_string_node(text: String) -> Int:
     node_strings.push(text)
-    return new_node(JSON_STRING, node_strings.len() - 1)
+    return new_node(JsonKind.String, node_strings.len() - 1)
 
 fn new_array_node() -> Int:
     mut items: List[Int] := []
     array_items.push(items)
-    return new_node(JSON_ARRAY, array_items.len() - 1)
+    return new_node(JsonKind.Array, array_items.len() - 1)
 
 fn new_object_node() -> Int:
     mut keys: List[String] := []
     mut values: List[Int] := []
     object_key_lists.push(keys)
     object_value_lists.push(values)
-    return new_node(JSON_OBJECT, object_key_lists.len() - 1)
+    return new_node(JsonKind.Object, object_key_lists.len() - 1)
 
 fn new_bool_node(value: Bool) -> Int:
     if value:
-        return new_node(JSON_BOOL, 1)
-    return new_node(JSON_BOOL, 0)
+        return new_node(JsonKind.Bool, 1)
+    return new_node(JsonKind.Bool, 0)
 
 # the slot of a live node, or -1 for a handle that is not one.
 fn node_slot(handle: Int) -> Int:
@@ -235,14 +249,14 @@ fn node_string(handle: Int) -> String:
 # of another kind reads as empty.
 fn array_children(handle: Int) -> List[Int]:
     slot := node_slot(handle)
-    if slot < 0 or node_kinds[slot] != JSON_ARRAY:
+    if slot < 0 or node_kinds[slot] != JsonKind.Array:
         mut none_items: List[Int] := []
         return none_items
     return array_items[node_payloads[slot]]
 
 fn object_entry_keys(handle: Int) -> List[String]:
     slot := node_slot(handle)
-    if slot < 0 or node_kinds[slot] != JSON_OBJECT:
+    if slot < 0 or node_kinds[slot] != JsonKind.Object:
         mut none_keys: List[String] := []
         return none_keys
     return object_key_lists[node_payloads[slot]]
@@ -250,7 +264,7 @@ fn object_entry_keys(handle: Int) -> List[String]:
 # Sets a key-value pair on an object node; ignored on any other handle.
 fn set_object_property(handle: Int, key: String, value: Int):
     slot := node_slot(handle)
-    if slot < 0 or node_kinds[slot] != JSON_OBJECT:
+    if slot < 0 or node_kinds[slot] != JsonKind.Object:
         return
     index := node_payloads[slot]
     object_key_lists[index].push(key)
@@ -259,7 +273,7 @@ fn set_object_property(handle: Int, key: String, value: Int):
 # Appends a value to an array node; ignored on any other handle.
 fn push_array_element(handle: Int, value: Int):
     slot := node_slot(handle)
-    if slot < 0 or node_kinds[slot] != JSON_ARRAY:
+    if slot < 0 or node_kinds[slot] != JsonKind.Array:
         return
     array_items[node_payloads[slot]].push(value)
 
@@ -324,34 +338,13 @@ fn is_valid_handle(handle: Int) -> Bool:
     return node_slot(handle) >= 0
 
 # Returns true if a handle is valid and has the requested node kind.
-fn handle_has_type(handle: Int, kind: Int) -> Bool:
+fn handle_has_type(handle: Int, kind: JsonKind) -> Bool:
     slot := node_slot(handle)
     return slot >= 0 and node_kinds[slot] == kind
 
-# the kind of a live node, or -1 for an invalid handle.
-fn node_kind(handle: Int) -> Int:
-    slot := node_slot(handle)
-    if slot < 0:
-        return 0 - 1
-    return node_kinds[slot]
-
-# the name type_of reports for a node kind.
-fn json_kind_name(kind: Int) -> String:
-    if kind == JSON_NULL:
-        return "null"
-    if kind == JSON_BOOL:
-        return "bool"
-    if kind == JSON_INT:
-        return "int"
-    if kind == JSON_FLOAT:
-        return "float"
-    if kind == JSON_STRING:
-        return "string"
-    if kind == JSON_ARRAY:
-        return "array"
-    if kind == JSON_OBJECT:
-        return "object"
-    return "invalid"
+# the kind of a node already known to be live.
+fn node_kind(handle: Int) -> JsonKind:
+    return node_kinds[node_slot(handle)]
 
 # Skips whitespace characters (space, tab, newline, carriage return)
 fn skip_whitespace():
@@ -969,7 +962,7 @@ fn parse_value_node() -> Int:
     # null
     if literal_at(parser_position, "null"):
         parser_position = parser_position + 4
-        return new_node(JSON_NULL, 0)
+        return new_node(JsonKind.Null, 0)
 
     # array
     if c == 91:
@@ -1047,12 +1040,12 @@ fn parse_value_node() -> Int:
             if not value.ok:
                 parser_error = true
                 return 0 - 1
-            return new_node(JSON_FLOAT, float_to_bits(value.value))
+            return new_node(JsonKind.Float, float_to_bits(value.value))
         if not is_float:
             parsed := parse_int(num_str) catch:
                 parser_error = true
                 return 0 - 1
-            return new_node(JSON_INT, parsed)
+            return new_node(JsonKind.Int, parsed)
 
     parser_error = true
     return 0 - 1
@@ -1578,11 +1571,11 @@ fn json_restore_to(node_id_mark: Int, array_len_mark: Int):
     mut slot := cut
     while slot < node_kinds.len() and (strings_cut < 0 or arrays_cut < 0 or objects_cut < 0):
         kind := node_kinds[slot]
-        if kind == JSON_STRING and strings_cut < 0:
+        if kind == JsonKind.String and strings_cut < 0:
             strings_cut = node_payloads[slot]
-        elif kind == JSON_ARRAY and arrays_cut < 0:
+        elif kind == JsonKind.Array and arrays_cut < 0:
             arrays_cut = node_payloads[slot]
-        elif kind == JSON_OBJECT and objects_cut < 0:
+        elif kind == JsonKind.Object and objects_cut < 0:
             objects_cut = node_payloads[slot]
         slot = slot + 1
     if strings_cut >= 0:
@@ -1628,14 +1621,17 @@ pub fn type_of(handle: Int) -> String:
     return json_type_of(handle)
 
 fn json_type_of(handle: Int) -> String:
-    return json_kind_name(node_kind(handle))
+    slot := node_slot(handle)
+    if slot < 0:
+        return "invalid"
+    return node_kinds[slot].name()
 
 # Returns the boolean value from a node. Returns false if not a boolean.
 pub fn get_bool(handle: Int) -> Bool:
     return json_get_bool(handle)
 
 fn json_get_bool(handle: Int) -> Bool:
-    if not handle_has_type(handle, JSON_BOOL):
+    if not handle_has_type(handle, JsonKind.Bool):
         return false
     return node_bool(handle)
 
@@ -1644,7 +1640,7 @@ pub fn get_int(handle: Int) -> Int:
     return json_get_int(handle)
 
 fn json_get_int(handle: Int) -> Int:
-    if handle_has_type(handle, JSON_INT):
+    if handle_has_type(handle, JsonKind.Int):
         return node_int(handle)
     return 0
 
@@ -1653,7 +1649,7 @@ pub fn get_float(handle: Int) -> Float:
     return json_get_float(handle)
 
 fn json_get_float(handle: Int) -> Float:
-    if handle_has_type(handle, JSON_FLOAT):
+    if handle_has_type(handle, JsonKind.Float):
         return node_float(handle)
     return 0.0
 
@@ -1662,7 +1658,7 @@ pub fn get_string(handle: Int) -> String:
     return json_get_string(handle)
 
 fn json_get_string(handle: Int) -> String:
-    if not handle_has_type(handle, JSON_STRING):
+    if not handle_has_type(handle, JsonKind.String):
         return ""
     return node_string(handle)
 
@@ -1698,7 +1694,7 @@ pub fn object_get(handle: Int, key: String) -> Int:
 
 fn json_object_get(handle: Int, key: String) -> Int:
     slot := node_slot(handle)
-    if slot < 0 or node_kinds[slot] != JSON_OBJECT:
+    if slot < 0 or node_kinds[slot] != JsonKind.Object:
         return 0 - 1
     index := node_payloads[slot]
     keys := object_key_lists[index]
@@ -1719,7 +1715,7 @@ fn json_object_has(handle: Int, key: String) -> Bool:
 
 # requires an object handle or returns a typed decode error.
 pub fn require_object_handle(handle: Int) -> Int!JsonDecodeError:
-    if handle_has_type(handle, JSON_OBJECT):
+    if handle_has_type(handle, JsonKind.Object):
         return handle
     fail json_invalid_object_error()
 
@@ -1730,7 +1726,7 @@ pub fn object_get_string(handle: Int, key: String) -> String:
 # gets a required string value by key from an object.
 pub fn object_require_string(handle: Int, key: String) -> String!JsonDecodeError:
     value := json_object_get(handle, key)
-    if handle_has_type(value, JSON_STRING):
+    if handle_has_type(value, JsonKind.String):
         return node_string(value)
     if value < 0:
         fail json_missing_field_error("string", key)
@@ -1739,7 +1735,7 @@ pub fn object_require_string(handle: Int, key: String) -> String!JsonDecodeError
 # Gets a string value by key from an object with a fallback.
 pub fn object_get_string_or(handle: Int, key: String, default_value: String) -> String:
     value := json_object_get(handle, key)
-    if not handle_has_type(value, JSON_STRING):
+    if not handle_has_type(value, JsonKind.String):
         return default_value
     return node_string(value)
 
@@ -1750,7 +1746,7 @@ pub fn object_get_int(handle: Int, key: String) -> Int:
 # gets a required int value by key from an object.
 pub fn object_require_int(handle: Int, key: String) -> Int!JsonDecodeError:
     value := json_object_get(handle, key)
-    if handle_has_type(value, JSON_INT):
+    if handle_has_type(value, JsonKind.Int):
         return node_int(value)
     if value < 0:
         fail json_missing_field_error("int", key)
@@ -1759,7 +1755,7 @@ pub fn object_require_int(handle: Int, key: String) -> Int!JsonDecodeError:
 # Gets an int value by key from an object with a fallback.
 pub fn object_get_int_or(handle: Int, key: String, default_value: Int) -> Int:
     value := json_object_get(handle, key)
-    if not handle_has_type(value, JSON_INT):
+    if not handle_has_type(value, JsonKind.Int):
         return default_value
     return node_int(value)
 
@@ -1772,9 +1768,9 @@ pub fn object_get_float(handle: Int, key: String) -> Float:
 # array or object under the key is a wrong-type error.
 pub fn object_require_float(handle: Int, key: String) -> Float!JsonDecodeError:
     value := json_object_get(handle, key)
-    if handle_has_type(value, JSON_FLOAT):
+    if handle_has_type(value, JsonKind.Float):
         return node_float(value)
-    if handle_has_type(value, JSON_INT):
+    if handle_has_type(value, JsonKind.Int):
         return node_int(value).to_float()
     if value < 0:
         fail json_missing_field_error("float", key)
@@ -1783,7 +1779,7 @@ pub fn object_require_float(handle: Int, key: String) -> Float!JsonDecodeError:
 # Gets a float value by key from an object with a fallback.
 pub fn object_get_float_or(handle: Int, key: String, default_value: Float) -> Float:
     value := json_object_get(handle, key)
-    if not handle_has_type(value, JSON_FLOAT):
+    if not handle_has_type(value, JsonKind.Float):
         return default_value
     return node_float(value)
 
@@ -1794,7 +1790,7 @@ pub fn object_get_bool(handle: Int, key: String) -> Bool:
 # gets a required bool value by key from an object.
 pub fn object_require_bool(handle: Int, key: String) -> Bool!JsonDecodeError:
     value := json_object_get(handle, key)
-    if handle_has_type(value, JSON_BOOL):
+    if handle_has_type(value, JsonKind.Bool):
         return node_bool(value)
     if value < 0:
         fail json_missing_field_error("bool", key)
@@ -1803,28 +1799,28 @@ pub fn object_require_bool(handle: Int, key: String) -> Bool!JsonDecodeError:
 # Gets a bool value by key from an object with a fallback.
 pub fn object_get_bool_or(handle: Int, key: String, default_value: Bool) -> Bool:
     value := json_object_get(handle, key)
-    if not handle_has_type(value, JSON_BOOL):
+    if not handle_has_type(value, JsonKind.Bool):
         return default_value
     return node_bool(value)
 
 # Gets an array handle by key from an object. Returns -1 if missing or wrong type.
 pub fn object_get_array(handle: Int, key: String) -> Int:
     value := json_object_get(handle, key)
-    if not handle_has_type(value, JSON_ARRAY):
+    if not handle_has_type(value, JsonKind.Array):
         return 0 - 1
     return value
 
 # Gets an object handle by key from an object. Returns -1 if missing or wrong type.
 pub fn object_get_object(handle: Int, key: String) -> Int:
     value := json_object_get(handle, key)
-    if not handle_has_type(value, JSON_OBJECT):
+    if not handle_has_type(value, JsonKind.Object):
         return 0 - 1
     return value
 
 # gets a required object handle by key from an object.
 pub fn object_require_object(handle: Int, key: String) -> Int!JsonDecodeError:
     value := json_object_get(handle, key)
-    if handle_has_type(value, JSON_OBJECT):
+    if handle_has_type(value, JsonKind.Object):
         return value
     if value < 0:
         fail json_missing_field_error("object", key)
@@ -1835,7 +1831,7 @@ pub fn object_require_object(handle: Int, key: String) -> Int!JsonDecodeError:
 # it holds anything but an array.
 pub fn object_require_array(handle: Int, key: String) -> Int!JsonDecodeError:
     value := json_object_get(handle, key)
-    if handle_has_type(value, JSON_ARRAY):
+    if handle_has_type(value, JsonKind.Array):
         return value
     if value < 0:
         fail json_missing_field_error("list", key)
@@ -1861,7 +1857,7 @@ pub fn element_decode_error(key: String, index: Int, err: JsonDecodeError) -> Js
 # field of structs on the node-pool path, before decode_object.
 pub fn require_object_element(arr: Int, key: String, index: Int) -> Int!JsonDecodeError:
     elem := json_array_get(arr, index)
-    if handle_has_type(elem, JSON_OBJECT):
+    if handle_has_type(elem, JsonKind.Object):
         return elem
     fail json_element_error("object", key, index)
 
@@ -1876,7 +1872,7 @@ pub fn object_require_int_list(handle: Int, key: String) -> List[Int]!JsonDecode
     mut i := 0
     while i < n:
         elem := json_array_get(arr, i)
-        if not handle_has_type(elem, JSON_INT):
+        if not handle_has_type(elem, JsonKind.Int):
             fail json_element_error("int", key, i)
         out.push(node_int(elem))
         i = i + 1
@@ -1891,7 +1887,7 @@ pub fn object_require_string_list(handle: Int, key: String) -> List[String]!Json
     mut i := 0
     while i < n:
         elem := json_array_get(arr, i)
-        if not handle_has_type(elem, JSON_STRING):
+        if not handle_has_type(elem, JsonKind.String):
             fail json_element_error("string", key, i)
         out.push(node_string(elem))
         i = i + 1
@@ -1906,7 +1902,7 @@ pub fn object_require_bool_list(handle: Int, key: String) -> List[Bool]!JsonDeco
     mut i := 0
     while i < n:
         elem := json_array_get(arr, i)
-        if not handle_has_type(elem, JSON_BOOL):
+        if not handle_has_type(elem, JsonKind.Bool):
             fail json_element_error("bool", key, i)
         out.push(json_get_bool(elem))
         i = i + 1
@@ -1922,9 +1918,9 @@ pub fn object_require_float_list(handle: Int, key: String) -> List[Float]!JsonDe
     mut i := 0
     while i < n:
         elem := json_array_get(arr, i)
-        if handle_has_type(elem, JSON_FLOAT):
+        if handle_has_type(elem, JsonKind.Float):
             out.push(node_float(elem))
-        elif handle_has_type(elem, JSON_INT):
+        elif handle_has_type(elem, JsonKind.Int):
             out.push(node_int(elem).to_float())
         else:
             fail json_element_error("float", key, i)
@@ -1939,7 +1935,7 @@ pub fn object_require_float_list(handle: Int, key: String) -> List[Float]!JsonDe
 # object_member_key and object_get.
 pub fn object_require_map(handle: Int, key: String) -> Int!JsonDecodeError:
     value := json_object_get(handle, key)
-    if handle_has_type(value, JSON_OBJECT):
+    if handle_has_type(value, JsonKind.Object):
         return value
     if value < 0:
         fail json_missing_field_error("map", key)
@@ -1972,49 +1968,49 @@ fn json_kind_error_at(kind: String, path: String) -> JsonDecodeError:
 # the general node builder of the typed decode lowering reads a list
 # element or a map value through these node_require accessors.
 pub fn node_require_int(node: Int, path: String) -> Int!JsonDecodeError:
-    if handle_has_type(node, JSON_INT):
+    if handle_has_type(node, JsonKind.Int):
         return node_int(node)
     fail json_kind_error_at("int", path)
 
 # the node at `path`, which must be a string: its value, or the kind error.
 pub fn node_require_string(node: Int, path: String) -> String!JsonDecodeError:
-    if handle_has_type(node, JSON_STRING):
+    if handle_has_type(node, JsonKind.String):
         return node_string(node)
     fail json_kind_error_at("string", path)
 
 # the node at `path`, which must be a bool: its value, or the kind error.
 pub fn node_require_bool(node: Int, path: String) -> Bool!JsonDecodeError:
-    if handle_has_type(node, JSON_BOOL):
+    if handle_has_type(node, JsonKind.Bool):
         return json_get_bool(node)
     fail json_kind_error_at("bool", path)
 
 # the node at `path`, which must be a number: its value as a Float, an
 # integer widened (`3` reads 3.0), or the kind error.
 pub fn node_require_float(node: Int, path: String) -> Float!JsonDecodeError:
-    if handle_has_type(node, JSON_FLOAT):
+    if handle_has_type(node, JsonKind.Float):
         return node_float(node)
-    if handle_has_type(node, JSON_INT):
+    if handle_has_type(node, JsonKind.Int):
         return node_int(node).to_float()
     fail json_kind_error_at("float", path)
 
 # the node at `path`, which must be an object to decode a struct from:
 # the handle, or "expected object element: <path>".
 pub fn node_require_object(node: Int, path: String) -> Int!JsonDecodeError:
-    if handle_has_type(node, JSON_OBJECT):
+    if handle_has_type(node, JsonKind.Object):
         return node
     fail json_kind_error_at("object", path)
 
 # the node at `path`, which must be an array to build a list from: the
 # handle, or "expected list element: <path>".
 pub fn node_require_array(node: Int, path: String) -> Int!JsonDecodeError:
-    if handle_has_type(node, JSON_ARRAY):
+    if handle_has_type(node, JsonKind.Array):
         return node
     fail json_kind_error_at("list", path)
 
 # the node at `path`, which must be an object to build a map from: the
 # handle, or "expected map element: <path>".
 pub fn node_require_map(node: Int, path: String) -> Int!JsonDecodeError:
-    if handle_has_type(node, JSON_OBJECT):
+    if handle_has_type(node, JsonKind.Object):
         return node
     fail json_kind_error_at("map", path)
 
@@ -2065,7 +2061,7 @@ pub fn make_null() -> Int:
     return json_make_null()
 
 fn json_make_null() -> Int:
-    return new_node(JSON_NULL, 0)
+    return new_node(JsonKind.Null, 0)
 
 # Creates a JSON boolean node with the given value.
 pub fn make_bool(val: Bool) -> Int:
@@ -2079,14 +2075,14 @@ pub fn make_int(val: Int) -> Int:
     return json_make_int(val)
 
 fn json_make_int(val: Int) -> Int:
-    return new_node(JSON_INT, val)
+    return new_node(JsonKind.Int, val)
 
 # Creates a JSON float node with the given value.
 pub fn make_float(val: Float) -> Int:
     return json_make_float(val)
 
 fn json_make_float(val: Float) -> Int:
-    return new_node(JSON_FLOAT, float_to_bits(val))
+    return new_node(JsonKind.Float, float_to_bits(val))
 
 # Creates a JSON string node with the given value.
 pub fn make_string(val: String) -> Int:
@@ -2190,19 +2186,19 @@ fn json_write(out: StringBuffer, handle: Int) -> Int!:
     if not is_valid_handle(handle):
         return out.write_all("null")
     kind := node_kind(handle)
-    if kind == JSON_NULL:
+    if kind == JsonKind.Null:
         return out.write_all("null")
-    if kind == JSON_BOOL:
+    if kind == JsonKind.Bool:
         if node_bool(handle):
             return out.write_all("true")
         return out.write_all("false")
-    if kind == JSON_INT:
+    if kind == JsonKind.Int:
         return out.write_all(node_int(handle).to_string())
-    if kind == JSON_FLOAT:
+    if kind == JsonKind.Float:
         return out.write_all(node_float(handle).to_string())
-    if kind == JSON_STRING:
+    if kind == JsonKind.String:
         return write_escaped_string(out, node_string(handle))
-    if kind == JSON_ARRAY:
+    if kind == JsonKind.Array:
         mut total := out.write_all("[")!
         items := array_children(handle)
         cnt := items.len()
@@ -2214,7 +2210,7 @@ fn json_write(out: StringBuffer, handle: Int) -> Int!:
             i = i + 1
         total = total + out.write_all("]")!
         return total
-    if kind == JSON_OBJECT:
+    if kind == JsonKind.Object:
         mut total := out.write_all(chr(123))!
         keys := json_object_keys(handle)
         mut i := 0
@@ -2260,19 +2256,19 @@ fn json_write_bytes(out: ByteBuffer, handle: Int) -> Int!:
     if not is_valid_handle(handle):
         return out.write_string_utf8("null")
     kind := node_kind(handle)
-    if kind == JSON_NULL:
+    if kind == JsonKind.Null:
         return out.write_string_utf8("null")
-    if kind == JSON_BOOL:
+    if kind == JsonKind.Bool:
         if node_bool(handle):
             return out.write_string_utf8("true")
         return out.write_string_utf8("false")
-    if kind == JSON_INT:
+    if kind == JsonKind.Int:
         return out.write_string_utf8(node_int(handle).to_string())
-    if kind == JSON_FLOAT:
+    if kind == JsonKind.Float:
         return out.write_string_utf8(node_float(handle).to_string())
-    if kind == JSON_STRING:
+    if kind == JsonKind.String:
         return write_escaped_bytes(out, node_string(handle))
-    if kind == JSON_ARRAY:
+    if kind == JsonKind.Array:
         mut total := out.write_byte(91)!
         items := array_children(handle)
         cnt := items.len()
@@ -2284,7 +2280,7 @@ fn json_write_bytes(out: ByteBuffer, handle: Int) -> Int!:
             i = i + 1
         total = total + out.write_byte(93)!
         return total
-    if kind == JSON_OBJECT:
+    if kind == JsonKind.Object:
         mut total := out.write_byte(123)!
         keys := json_object_keys(handle)
         mut i := 0

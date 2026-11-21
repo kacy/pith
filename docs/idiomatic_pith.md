@@ -341,6 +341,24 @@ use the built-in `assert` and `assert_eq` (which compares by value and reports
 decoded failures); keep golden stdout examples for end-to-end behavior. See
 [testing.md](testing.md) for the full picture.
 
+## interfaces: bound or value
+
+An interface works two ways. As a bound, `fn total[T: Shape](items: List[T])`
+is specialized for each `T`, and every item in one call has the same type. As
+a type, `fn total(items: List[Shape])` takes items of any mix of implementing
+types, and each method call is dispatched at run time.
+
+```pith
+shapes: List[Shape] := [Circle(r: 1.0), Square(side: 2.0)]
+for s in shapes:
+    print(s.name())
+```
+
+Use the bound when the items share a type or the call is hot; use the
+interface type when the values really are mixed (handlers, plugins, a scene of
+shapes). A conversion boxes the value, so it costs an allocation, and a call
+through it cannot be inlined. See [interface values](interface_values.md).
+
 ## packages
 
 `pith new <name>` should produce a project that can immediately run:

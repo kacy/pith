@@ -173,6 +173,20 @@ fn format_code_line(line: String) -> String:
         if i + 1 < line.len():
             next := line[i + 1]
 
+            # a range, `lo..hi` or `lo..=hi`, binds tight like a dot. read as
+            # a dot and then a lone `=`, the inclusive form came out as
+            # `lo.. = hi`, which no longer parses.
+            if ch == "." and next == ".":
+                output = trim_trailing_spaces(output)
+                i = i + 2
+                if i < line.len() and line[i] == "=":
+                    output = output + "..="
+                    i = i + 1
+                else:
+                    output = output + ".."
+                i = skip_leading_spaces(line, i)
+                continue
+
             # := — space around
             if ch == ":" and next == "=":
                 output = ensure_trailing_space(output)
@@ -496,3 +510,14 @@ test "a line ending in an operator keeps no trailing space":
     arm := "fn f(k: Int) -> Int:" + chr(10) + "    match k:" + chr(10) + "        1 =>" + chr(10) + "            return 2" + chr(10)
     assert(fmt_source(arm).contains("1 =>" + chr(10)))
     assert(not fmt_source(arm).contains(" " + chr(10)))
+
+test "a range keeps its operator tight, inclusive or not":
+    # `..=` used to be read as a dot pair followed by an assignment `=`, which
+    # came out as `1.. = 3` and no longer parsed.
+    nl := chr(10)
+    incl := fmt_source("fn f():" + nl + "    for n in 1..=3:" + nl + "        print(n)" + nl)
+    assert(incl.contains("for n in 1..=3:"))
+    assert(fmt_source(incl) == incl)
+    assert(fmt_source("fn f():" + nl + "    for n in 1 ..= 3:" + nl + "        print(n)" + nl).contains("1..=3"))
+    assert(fmt_source("fn f(xs: List[Int]):" + nl + "    for i in 0 .. xs.len():" + nl + "        print(i)" + nl).contains("0..xs.len()"))
+    assert(fmt_source("fn f(n: Int) -> Int:" + nl + "    match n:" + nl + "        0..=9 => 1" + nl + "        _ => 2" + nl).contains("0..=9 =>"))

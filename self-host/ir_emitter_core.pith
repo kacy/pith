@@ -4288,6 +4288,40 @@ fn ir_emit_impl_method_specializations(impl_node: Node, impl_type: String):
             if child_node.kind == "fn_decl" and not ir_has_generic_params(child_node):
                 ir_impl_func_specialized(method_idx, impl_type, instance_type_name, inst_tid, struct_params, arg_names)
 
+# the payload type of a `T?` return in one instance of a generic impl. the
+# written name is the impl's own associated type (`Item`), a type parameter
+# (`U`) or a parameter's associated type (`I.Item`), and each is replaced
+# through the instance's type arguments. left unsubstituted it has no rc
+# kind, so a returned Some carried no payload destructor and
+# `MapIter[Range, String].next` leaked every string it yielded.
+fn ir_specialized_optional_inner(idx: Int, inst_tid: Int) -> String:
+    return ir_instance_type_name(inst_tid, ir_extract_optional_inner_type(idx))
+
+# `name` as written inside the impl of a generic struct, resolved for the
+# instance `inst_tid`. a parameter's associated type recurses into the type
+# argument, so `I.Item` over `MapIter[Range, String]` answers String.
+fn ir_instance_type_name(inst_tid: Int, name: String) -> String:
+    if not struct_instance_base_name.contains_key(inst_tid) or not struct_instance_type_args.contains_key(inst_tid):
+        return name
+    base := struct_instance_base_name[inst_tid]
+    resolved := ir_resolve_assoc_type(base, name)
+    if not has_generic_declaration(base):
+        return resolved
+    params := collect_generic_parameter_names(get_node(get_generic_declaration_index(base)))
+    arg_tids := decode_tid_list(struct_instance_type_args[inst_tid])
+    parts := resolved.split(".")
+    for p, i in params:
+        if i >= arg_tids.len():
+            break
+        if resolved == p:
+            return ir_type_from_tid(arg_tids[i])
+        if parts.len() == 2 and parts[0] == p:
+            arg_tid := arg_tids[i]
+            if struct_instance_base_name.contains_key(arg_tid):
+                return ir_instance_type_name(arg_tid, parts[1])
+            return ir_resolve_assoc_type(ir_strip_type_args(get_type_name(arg_tid)), parts[1])
+    return resolved
+
 # emit one method of a generic impl for a single instance (`MapIter[Range,
 # Int, Int].next` as `MapIter_Range_int_int_next`), once per emit pass. the
 # instance's symbol is also recorded in ir_impl_method_specializations, with
@@ -4328,7 +4362,7 @@ fn ir_impl_func_specialized(idx: Int, base_impl_type: String, instance_type: Str
     param_count := ir_param_count(idx) + 1
     ret_type := ir_extract_return_type(idx)
     ir_prepare_func_emission(ret_type)
-    ir_current_func_optional_inner_kind = ir_extract_optional_inner_type(idx)
+    ir_current_func_optional_inner_kind = ir_specialized_optional_inner(idx, inst_tid)
     ir_current_func_returns_result = ir_fn_returns_result(idx)
     ir_current_func_miss_fails = ir_fn_miss_fails(idx)
     ir_current_impl_type = instance_type

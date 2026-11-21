@@ -1,0 +1,16 @@
+# a module global is held by the whole program, so handing it to a task or
+# sending it on a channel shares its buffer. E248 names the global.
+items := [1, 2, 3]
+totals: Map[String, Int] := {}
+
+fn total(xs: List[Int]) -> Int:
+    mut s := 0
+    for x in xs:
+        s += x
+    return s
+
+fn main() -> Int:
+    t := spawn total(items)
+    ch := Channel[Map[String, Int]](1)
+    ch.send(totals)
+    return await t

@@ -293,6 +293,15 @@ pub fn lookup_binding_index(scope_id: Int, name: String) -> Int:
         return lookup_binding_index(entry.parent, name)
     return -1
 
+## true when the name resolves, from this scope, to a binding declared at
+## module level: one in the root scope with a declaration node, which leaves
+## out the builtins registered there.
+pub fn binding_is_module_level(scope_id: Int, name: String) -> Bool:
+    index := lookup_binding_index(scope_id, name)
+    if index < 0 or binding_decl_nodes[index] < 0:
+        return false
+    return scope_entries[binding_scope_ids[index]].parent < 0
+
 ## replace the recorded type of an existing binding by arena index.
 pub fn set_binding_type_at(index: Int, type_id: Int):
     if index >= 0 and index < binding_types.len():

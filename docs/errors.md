@@ -512,6 +512,19 @@ error[E248]: a spawned task cannot take a list this scope still holds; both thre
                             ^
 ```
 
+a module global is refused too, and the message names it. the whole program
+holds a global, so a task handed one shares its buffer with every other task
+that reads it. a task can read the global itself without taking it as an
+argument; give it a copy when it needs its own list, and keep a global that
+tasks write in a `guard` block (docs/concurrency.md).
+
+```
+error[E248]: a spawned task cannot take the module global 'items', a list every task can reach; both would mutate the same buffer
+  10 |     t := spawn total(items)
+                            ^
+  fix: pass a copy (copy_list(items)), or let the task read the global itself and keep a global that tasks write in a `guard` block
+```
+
 a struct argument is refused the same way when one of its fields reaches a
 list, a map or a set outside a `guard` block, directly or through a nested
 struct or optional struct field. move the field into a `guard` block, or build

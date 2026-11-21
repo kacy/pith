@@ -1,0 +1,23 @@
+# an interface named through a module alias (io.BytesWriter) is a counted
+# box like any interface value. handed to a spawned task it takes a count
+# and is marked shared; it used to be copied with no count, which the count
+# checker reported as a leak and rc-check as an unshared cross-task retain.
+import std.io as io
+import std.bytes as bytes
+
+struct Sink:
+    base: Int
+
+impl io.BytesWriter for Sink:
+    fn write_bytes(data: Bytes) -> Int!:
+        return self.base + data.len()
+
+fn greet(w: io.BytesWriter) -> Int:
+    return w.write_bytes(bytes.from_string_utf8("hi")) catch 0
+
+fn run(w: io.BytesWriter) -> Int!:
+    t := spawn greet(w)
+    return await t
+
+fn main():
+    print((run(Sink(100)) catch -1).to_string())

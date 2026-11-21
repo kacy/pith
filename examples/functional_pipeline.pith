@@ -1,33 +1,45 @@
-# functional_pipeline.pith — data processing with parallel execution
-# Demonstrates: spawn/await, collections, and multi-stage processing
+# a processing pipeline with a parallel stage: filter, spawn, await, combine.
+#
+# finds how many primes lie below each requested limit. the first stage
+# drops bad requests, the second starts one task per request with spawn so
+# the counts run at the same time, and the last awaits them in request order
+# and combines the results. awaiting in the order the tasks were started
+# keeps the output the same from run to run, whichever task finishes first.
+
+fn is_prime(n: Int) -> Bool:
+    if n < 2:
+        return false
+    mut divisor := 2
+    while divisor * divisor <= n:
+        if n % divisor == 0:
+            return false
+        divisor += 1
+    return true
+
+fn count_primes_below(limit: Int) -> Int:
+    mut count := 0
+    for n in 2..limit:
+        if is_prime(n):
+            count += 1
+    return count
 
 fn main():
-    numbers := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    requests := [1000, -5, 20000, 50000, 0, 5000]
 
-    # stage 1: filter evens
-    mut evens: List[Int] := []
-    for n in numbers:
-        if n % 2 == 0:
-            evens.push(n)
-    print("stage 1: filtered to {evens.len()} even numbers")
+    # stage 1: keep the requests that make sense
+    limits := requests.filter(fn(limit: Int) => limit > 1)
+    print("stage 1: {limits.len()} of {requests.len()} requests are valid")
 
-    # stage 2: parallel processing with spawn/await
-    mut doubled: List[Int] := []
-    for n in evens:
-        task := spawn double(n)
-        doubled.push(await task)
-    print("stage 2: doubled {doubled.len()} values in parallel")
+    # stage 2: start every count before waiting on any of them
+    mut tasks := []
+    for limit in limits:
+        tasks.push(spawn count_primes_below(limit))
+    print("stage 2: started {tasks.len()} tasks")
 
-    # stage 3: compute sum
-    total := compute_sum(doubled)
-    print("stage 3: sum = {total}")
-    print("pipeline complete")
-
-fn double(n: Int) -> Int:
-    return n * 2
-
-fn compute_sum(input: List[Int]) -> Int:
+    # stage 3: collect in request order and combine
     mut total := 0
-    for n in input:
-        total = total + n
-    return total
+    for task, index in tasks:
+        count := await task
+        total += count
+        print("  primes below {limits[index]}: {count}")
+    print("stage 3: {total} primes counted in all")

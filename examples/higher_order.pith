@@ -1,41 +1,47 @@
-# higher-order functions — map, filter, reduce with builtin support
-# exercises: lambdas, closures, function composition, chaining
+# higher-order functions: functions that take or return other functions.
+#
+# cleans up a batch of sensor readings. small steps (convert, calibrate,
+# clamp) are plain functions, `compose` glues two of them into one, and the
+# built-in map, filter and reduce run a step over a whole list.
 
 import std.fmt as fmt
 
-fn apply_twice(x: Int, f: fn(Int) -> Int) -> Int:
-    return f(f(x))
+fn fahrenheit_to_celsius(tenths: Int) -> Int:
+    return (tenths - 320) * 5 / 9
+
+fn compose(first: fn(Int) -> Int, second: fn(Int) -> Int) -> fn(Int) -> Int:
+    return fn(value: Int) => second(first(value))
+
+# returns a function that adds a fixed offset, for a sensor that reads off
+fn offset_by(amount: Int) -> fn(Int) -> Int:
+    return fn(value: Int) => value + amount
+
+fn between(low: Int, high: Int) -> fn(Int) -> Bool:
+    return fn(value: Int) => value >= low and value <= high
+
+fn apply_times(value: Int, times: Int, step: fn(Int) -> Int) -> Int:
+    mut current := value
+    for i in 0..times:
+        current = step(current)
+    return current
 
 fn main():
-    nums := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    # readings in tenths of a degree fahrenheit; 9999 is a sensor glitch
+    raw := [698, 712, 9999, 655, 731, 704, -400]
 
-    # map: transform each element
-    doubled := map(nums, fn(x: Int) => x * 2)
-    print("doubled: {fmt.ints(doubled)}")
+    # one function out of two: convert first, then correct the offset
+    to_celsius := compose(fahrenheit_to_celsius, offset_by(-5))
+    plausible := between(-200, 500)
 
-    squared := map(nums, fn(x: Int) => x * x)
-    print("squared: {fmt.ints(squared)}")
+    celsius := filter(map(raw, to_celsius), plausible)
+    print("celsius (tenths): {fmt.ints(celsius)}")
 
-    # filter: keep elements matching predicate (non-zero = keep)
-    evens := filter(nums, fn(x: Int) => 1 - (x % 2))
-    print("evens: {fmt.ints(evens)}")
+    total := reduce(celsius, 0, fn(sum: Int, value: Int) => sum + value)
+    print("average: {total / celsius.len()} tenths")
 
-    big := filter(nums, fn(x: Int) => x / 6)
-    print("big (>5): {fmt.ints(big)}")
+    warmest := reduce(celsius, celsius[0], fn(best: Int, value: Int) => max(best, value))
+    print("warmest: {warmest} tenths")
 
-    # reduce: fold into single value
-    total := reduce(nums, 0, fn(acc: Int, x: Int) => acc + x)
-    print("sum: {total}")
-
-    sum_sq := reduce(map(nums, fn(x: Int) => x * x), 0, fn(acc: Int, x: Int) => acc + x)
-    print("sum of squares: {sum_sq}")
-
-    # apply_twice: function composition
-    result := apply_twice(3, fn(x: Int) => x * 2 + 1)
-    print("apply_twice(3, 2x+1): {result}")
-
-    # chain: filter then map
-    big_doubled := map(filter(nums, fn(x: Int) => x / 6), fn(x: Int) => x * 2)
-    print("big doubled: {fmt.ints(big_doubled)}")
-
-    print("higher order works")
+    # the same step applied over and over: three hours of 2% drift
+    drifted := apply_times(1000, 3, fn(value: Int) => value + value * 2 / 100)
+    print("1000 after three drift steps: {drifted}")

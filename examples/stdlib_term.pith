@@ -1,21 +1,43 @@
-# test std.term — terminal colors (test with stripped output)
-from std.term import red, green, yellow, blue, bold, dim, underline, strip
+# std.term colors: a test run summary that colors itself only on a terminal.
+#
+# red(), green() and the rest wrap text in ansi escape codes. those codes are
+# noise in a log file or a pipe, so a well-behaved tool colors its output only
+# when stdout is a terminal and otherwise strips them back out. run directly,
+# this prints in color; run with its output piped, as the example harness
+# does, it prints plain text.
+
+from std.term import red, green, yellow, bold, dim, strip
+from std.term.tty import is_tty
+
+enum Outcome:
+    Passed
+    Failed(String)
+    Skipped
+
+struct TestResult:
+    name: String
+    ms: Int
+    outcome: Outcome
+
+fn line(r: TestResult) -> String:
+    match r.outcome:
+        Outcome.Passed => "{green("PASS")} {r.name} {dim("({r.ms}ms)")}"
+        Outcome.Failed(why) => "{red("FAIL")} {r.name}: {why}"
+        Outcome.Skipped => "{yellow("SKIP")} {r.name}"
 
 fn main():
-    # verify strip removes ANSI codes
-    print("red: {strip(red("error"))}")
-    print("green: {strip(green("ok"))}")
-    print("yellow: {strip(yellow("warn"))}")
-    print("blue: {strip(blue("info"))}")
-    print("bold: {strip(bold("title"))}")
-    print("dim: {strip(dim("faded"))}")
-    print("underline: {strip(underline("link"))}")
-
-    # verify the colored versions contain the text
-    r := red("hello")
-    if r.contains("hello"):
-        print("contains text: true")
-    if r.len() > 5:
-        print("has ansi codes: true")
-
-    print("term works")
+    results := [
+        TestResult(name: "parses an empty config", ms: 3, outcome: Outcome.Passed),
+        TestResult(name: "rejects a negative port", ms: 2, outcome: Outcome.Failed("expected an error, got port -1")),
+        TestResult(name: "reads from the network", ms: 0, outcome: Outcome.Skipped),
+        TestResult(name: "merges two files", ms: 11, outcome: Outcome.Passed),
+    ]
+    colored := is_tty(1)
+    mut failed := 0
+    for r in results:
+        if let Outcome.Failed(why) = r.outcome:
+            failed = failed + 1
+        text := line(r)
+        print(if colored: text else: strip(text))
+    summary := bold("{results.len()} tests, {failed} failed")
+    print(if colored: summary else: strip(summary))

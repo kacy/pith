@@ -1,51 +1,62 @@
-# string methods and collection length
+# string_methods: the methods built into String.
+#
+# reads a few lines of an access log and reports on them. trim and split
+# break a line apart, starts_with and is_empty skip comments and blanks,
+# index_of, last_index_of and substring cut out a field, and to_upper and join
+# tidy the result for printing.
+
+struct Request:
+    method: String
+    path: String
+    status: Int
+    client: String
+
+# a line looks like `10.0.0.7 - GET /api/users?page=2 200`
+fn parse_line(line: String) -> Request!:
+    fields := line.trim().split(" ")
+    if fields.len() != 5 or fields[1] != "-":
+        fail "expected 5 fields, found {fields.len()}"
+    status := parse_int(fields[4])!
+    return Request(method: fields[2].to_upper(), path: fields[3], status: status, client: fields[0])
+
+# the path without its query string
+fn route(path: String) -> String:
+    query_start := path.index_of("?")
+    if query_start < 0:
+        return path
+    return path.substring(0, query_start)
+
+fn describe(request: Request) -> String:
+    kind := if request.status >= 500: "server error" elif request.status >= 400: "client error" else: "ok"
+    return "{request.method:<6} {route(request.path):<14} {request.status} {kind}"
 
 fn main():
-    # string length
-    name := "hello world"
-    print("length: {name.len()}")
+    log := [
+        "10.0.0.7 - get /api/users?page=2 200",
+        "  10.0.0.9 - POST /api/login 401",
+        "# rotated at midnight",
+        "10.0.0.7 - GET /static/app.js 200",
+        "garbage line",
+        "10.0.0.4 - DELETE /api/users/12 500",
+]
 
-    # search methods
-    print("contains 'world': {name.contains("world")}")
-    print("starts_with 'hello': {name.starts_with("hello")}")
-    print("ends_with 'world': {name.ends_with("world")}")
+    mut api_clients: List[String] := []
+    mut skipped: List[String] := []
+    for line in log:
+        if line.starts_with("#") or line.trim().is_empty():
+            continue
+        request := parse_line(line) catch:
+            skipped.push(line)
+            continue
+        print(describe(request))
+        if request.path.starts_with("/api/") and not api_clients.contains(request.client):
+            api_clients.push(request.client)
 
-    # transformation methods
-    greeting := "  hello  "
-    print("trimmed: '{greeting.trim()}'")
-    print("upper: {name.to_upper()}")
-    print("lower: {"HELLO".to_lower()}")
+    print("")
+    print("unparsed: {skipped.join(", ")}")
+    print("api clients: {api_clients.join(", ")}")
 
-    # split
-    csv := "a,b,c"
-    parts := csv.split(",")
-    print("split count: {parts.len()}")
-    print("first part: {parts[0]}")
-
-    # substring
-    sub := name.substring(0, 5)
-    print("substring: {sub}")
-
-    # string indexing
-    first := name[0]
-    fifth := name[4]
-    print("first char: {first}")
-    print("fifth char: {fifth}")
-
-    # replace
-    replaced := name.replace("world", "pith")
-    print("replaced: {replaced}")
-
-    # join
-    words := ["hello", "world", "from", "pith"]
-    joined := words.join(" ")
-    print("joined: {joined}")
-    print("csv join: {parts.join(",")}")
-
-    # collection lengths
-    numbers := [1, 2, 3, 4, 5]
-    ages := {"alice": 30, "bob": 25}
-    tags := {"rust", "zig", "pith"}
-    print("list len: {numbers.len()}")
-    print("map len: {ages.len()}")
-    print("set len: {tags.len()}")
+    # a client address is masked before it goes into a shared report
+    first := api_clients[0]
+    masked := first.substring(0, first.last_index_of(".")) + ".x"
+    print("first client, masked: {masked}")

@@ -1,45 +1,59 @@
-# a tiny web server with std.web.
+# a first std.web server: a home page and a greeting with a path parameter.
 #
-# the server itself is just build_app() plus listen(): a couple of routes, one
-# with a `:name` path parameter. in a real program main would end with
-#
-#     build_app().listen("0.0.0.0", 8080)!
-#
-# and stay up until you stop it. so this can run as a self-checking example, we
-# instead spawn the server, make a few requests against it, print the replies,
-# and exit.
-import std.web as web
+# a real program ends main with `build_app().listen("0.0.0.0", 8080)!` and
+# serves until it is stopped. this one starts the server on a background task,
+# sends it a few requests, prints what came back and exits, so its output can
+# be checked.
+
 import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
 
-# GET /hello/:name — greet whoever is named in the path.
+PORT := 18080
+
+fn home(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "welcome to pith")
+
 fn greet(req: web.Request) -> http.HttpResponse:
-    return http.text(200, "hello, " + req.param("name"))
+    return http.text(200, "hello, {req.param("name")}")
 
-# the whole application: a welcome page and the greeting route. routes are added
-# one per line because a builder chain has to stay on a single line.
 fn build_app() -> web.App:
     mut app := web.new()
-    app = app.get("/", fn(req: web.Request) => http.text(200, "welcome to pith"))
+    app = app.get("/", home)
     app = app.get("/hello/:name", greet)
     return app
 
-# run the server in the background so main can act as a client against it.
-fn serve_bg(port: Int) -> Int:
+fn serve(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
-# fetch a path and return just the response body, so we can print it.
-fn fetch(port: Int, path: String) -> String:
-    resp := http.get_request("127.0.0.1", port, path).send() catch:
-        return "no response"
-    return resp.body_text() catch ""
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
 
+# one request, summarized as the status line and body a client would see.
+fn show(method: String, path: String):
+    resp := http.request(method, "127.0.0.1", PORT, path).send() catch:
+        print("{method} {path}: no response")
+        return
+    body := resp.body_text() catch ""
+    print("{method} {path} -> {resp.status} {body}")
 
 fn main() -> Int!:
-    port := 18080
-    spawn serve_bg(port)
-    sleep(200)   # give the listener a moment to bind
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
 
-    print(fetch(port, "/"))
-    print(fetch(port, "/hello/ada"))
-    print(fetch(port, "/healthz"))
+    show("GET", "/")
+    show("GET", "/hello/ada")
+    # web.new() adds a health check for load balancers.
+    show("GET", "/healthz")
+    show("GET", "/nowhere")
+    # the path exists but takes only GET, so the router answers 405.
+    show("POST", "/")
     return 0

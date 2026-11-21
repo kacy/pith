@@ -1,133 +1,109 @@
-# a rolling deploy against a server whose streams never end.
+# a rolling deploy against a grpc server whose streams never end.
 #
 # a drain waits for work to finish. a server-streaming or bidi rpc that loops
 # forever never finishes, so it would outlast any grace period and be cut off
-# when the process goes — leaving its peer a truncated body with no grpc-status,
-# indistinguishable from a crash.
+# when the process exits. its peer would read a truncated body with no
+# grpc-status, which looks the same as a crash.
 #
-# the grace period is split in half to fix that. the first half is the handler's:
-# GrpcStream.closing() goes true the moment a drain starts, and a handler that
-# polls it ends its own stream with its own status. the second half is the
-# framework's: whatever is still open is finished with UNAVAILABLE, the
-# connections are wound down, and the drain completes.
+# so the grace period is split in two. the first half belongs to the handlers:
+# GrpcStream.closing() turns true when a drain starts, and a handler that checks
+# it ends its stream with its own status. the second half belongs to the
+# server: whatever is still open is finished with UNAVAILABLE, the connections
+# are wound down, and the drain completes.
 #
-# this example runs both handlers side by side over one connection and then
-# sends itself a SIGTERM, exactly as an orchestrator would:
+# this runs both kinds of handler over one connection, then sends itself a
+# SIGTERM the way an orchestrator would:
 #
-#   /demo.Feed/Polite  polls closing() and finishes itself  -> the stream ends OK
-#   /demo.Feed/Naive   ticks forever and never looks        -> UNAVAILABLE, cleanly
+#   /demo.Feed/Polite  checks closing() and finishes itself  -> ends OK
+#   /demo.Feed/Naive   never checks                          -> ends UNAVAILABLE
 #
-# the naive one is the point. it is the shape you get by accident, and it now
-# degrades instead of being severed.
-#
-# Run:  pith run examples/grpc_stream_shutdown.pith
+# the naive handler is the shape people write by accident. it still ends
+# cleanly, with a status its peer can read.
 
 import std.bytes as bytes
 import std.net.grpc as grpc
-import std.net.tcp as tcp
 import std.shutdown as shutdown
 import std.signal as signal
 import std.time as time
 
 PORT := 20263
 
-# short enough to keep the example quick, and still the same two halves a real
-# deployment gets: handlers own the first, the framework owns the second.
+# short enough to keep the example quick. a real deployment splits its grace
+# period the same way.
 GRACE_MS := 1200
 
-# how long a tick takes. small enough that both streams are visibly flowing
-# before the signal lands.
 TICK_MS := 25
 
-fn route(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
-    if path == "/demo.Feed/Polite":
-        # the pattern a long-lived handler should follow: one flag, checked
-        # between messages, and the stream ends on the handler's own terms.
-        while not call.closing():
-            call.send_message(bytes.from_string_utf8("tick"))
-            time.delay(TICK_MS)
-        call.finish_ok()
-        return 0
-    if path == "/demo.Feed/Naive":
-        # and the pattern you get without thinking about it. no exit at all.
-        while true:
-            call.send_message(bytes.from_string_utf8("tick"))
-            time.delay(TICK_MS)
-        return 0
-    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+fn tick(call: grpc.GrpcStream):
+    call.send_message(bytes.from_string_utf8("tick"))
+    time.delay(TICK_MS)
 
-# serve until the drain completes, then report what was left unfinished.
+fn feed(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+    match path:
+        "/demo.Feed/Polite" =>
+            # the pattern a long-lived handler should follow: check one flag
+            # between messages and end the stream on its own terms.
+            while not call.closing():
+                tick(call)
+            call.finish_ok()
+            return 0
+        "/demo.Feed/Naive" =>
+            while true:
+                tick(call)
+            return 0
+        _ =>
+            fail grpc.GrpcError(grpc.GRPC_UNIMPLEMENTED, "no method {path}")
+
+# serve until the drain completes. the result is how much work was left
+# unfinished when it did.
 fn run_server() -> Int:
-    return grpc.serve_stream("127.0.0.1", PORT, route) catch 0 - 1
+    return grpc.serve_stream("127.0.0.1", PORT, feed) catch -1
 
-# wait until the server is accepting before dialing. a flat sleep is a race the
-# server loses on a busy machine.
-fn wait_for_port(timeout_ms: Int) -> Bool:
-    mut waited := 0
-    while waited < timeout_ms:
-        probe := tcp.connect("127.0.0.1", PORT)
-        if probe.is_ok:
-            tcp.close(probe.ok)
-            return true
-        time.delay(25)
-        waited = waited + 25
-    return false
+# the server starts on its own task, so dial until it is listening.
+fn connect() -> grpc.Conn!:
+    for attempt in 0..200:
+        conn := grpc.dial_h2c("127.0.0.1", PORT) catch:
+            time.delay(10)
+            continue
+        return conn
+    fail "no server on port {PORT}"
 
-# read a stream to its end and say how it ended. "the deploy closed this" and
-# "the socket died" are both UNAVAILABLE, so the message is what separates them.
-fn report(label: String, stream: grpc.ServerStream):
+# read a stream to its end and say how it ended. a deploy closing the stream and
+# a dead socket are both UNAVAILABLE, so the message tells them apart.
+fn how_it_ended(stream: grpc.ServerStream) -> String:
     while true:
         step := stream.recv()
         if step.is_err:
-            print("  " + label + ": " + grpc.status_name(step.err.status) + " — " + step.err.message)
-            return
+            return "{grpc.status_name(step.err.status)}, {step.err.message}"
         if step.ok.done:
-            print("  " + label + ": stream ended OK")
-            return
+            return "ended OK"
+    return "ended OK"
 
-fn main():
+fn open_feed(conn: grpc.Conn, path: String) -> grpc.ServerStream!:
+    stream := conn.server_stream(path, bytes.empty()) catch:
+        fail "could not open {path}"
+    # read one tick, so neither stream ends merely because it never began
+    stream.recv() catch:
+        fail "{path} never started"
+    return stream
+
+fn main() -> Int!:
     shutdown.set_drain_deadline(GRACE_MS)
-    armed := shutdown.on_signals() catch 0
-    print("armed " + armed.to_string() + " shutdown signals")
-
+    shutdown.on_signals()!
     server := spawn run_server()
-    if not wait_for_port(10000):
-        print("server never started listening")
-        return
-    print("serving grpc on 127.0.0.1:" + PORT.to_string())
+    conn := connect()!
+    defer conn.close()
 
-    dialed := grpc.dial_h2c("127.0.0.1", PORT)
-    if dialed.is_err:
-        print("dial failed")
-        return
-    conn := dialed.ok
-    opened_polite := conn.server_stream("/demo.Feed/Polite", bytes.empty())
-    opened_naive := conn.server_stream("/demo.Feed/Naive", bytes.empty())
-    if opened_polite.is_err or opened_naive.is_err:
-        print("could not open the streams")
-        return
-    polite := opened_polite.ok
-    naive := opened_naive.ok
-
-    # read one tick off each, so neither ends merely because it never began.
-    first := polite.recv()
-    second := naive.recv()
-    if first.is_err or second.is_err:
-        print("neither stream started")
-        return
+    polite := open_feed(conn, "/demo.Feed/Polite")!
+    naive := open_feed(conn, "/demo.Feed/Naive")!
     print("both streams flowing")
 
     print("orchestrator: sending SIGTERM")
     signal.raise_self(signal.SIGTERM)
-
-    print("what each peer reads:")
-    report("polite", polite)
-    report("naive ", naive)
-
-    closed := grpc.streams_closed_by_shutdown()
-    print("rpcs the framework had to close: " + closed.to_string())
-    conn.close()
-
-    # 0 means every connection left the in-flight count inside the grace period —
-    # the naive handler is still looping, and the drain finished anyway.
-    print("unfinished work at the deadline: " + (await server).to_string())
+    print("polite: " + how_it_ended(polite))
+    print("naive:  " + how_it_ended(naive))
+    print("rpcs the server had to close: {grpc.streams_closed_by_shutdown()}")
+    # 0 means every connection finished inside the grace period, even with the
+    # naive handler still looping.
+    print("unfinished work at the deadline: {await server}")
+    return 0

@@ -1,27 +1,41 @@
-# expose pith metrics for prometheus.
+# metrics for prometheus: a request counter, an in-flight gauge and a latency
+# histogram, recorded over a small batch of requests and printed as the text a
+# scrape of /metrics returns.
 #
-# in a real app you spawn the endpoint and let prometheus scrape it:
+# in a real service the endpoint runs beside the app:
+#
 #     import std.prometheus as prometheus
-#     import std.shutdown as shutdown
 #     shutdown.on_signals() catch 0
 #     spawn prometheus.serve("0.0.0.0", 9464)
-# prometheus then GETs http://host:9464/metrics on its scrape interval, and on a
-# SIGTERM the endpoint stops accepting and finishes the scrape it is mid-way
-# through. here we just register a few labeled metrics and print exactly what a
-# scrape returns.
+#
+# prometheus then GETs http://host:9464/metrics on its scrape interval, and on
+# a SIGTERM the endpoint stops accepting and finishes the scrape in progress.
+
 import std.metrics as metrics
 
-fn main() -> Int!:
-    reqs := metrics.counter("http_requests_total")
-    reqs.labels(["route", "/api", "status", "200"]).add(3.0)
-    reqs.labels(["route", "/health", "status", "200"]).inc()
+struct Request:
+    route: String
+    status: Int
+    latency_ms: Int
 
-    metrics.gauge("inflight_requests").set(2.0)
+fn served() -> List[Request]:
+    return [
+        Request(route: "/api", status: 200, latency_ms: 12),
+        Request(route: "/api", status: 200, latency_ms: 85),
+        Request(route: "/api", status: 500, latency_ms: 310),
+        Request(route: "/health", status: 200, latency_ms: 1),
+    ]
 
-    lat := metrics.histogram("request_latency_ms")
-    lat.labels(["route", "/api"]).observe(12.0)
-    lat.labels(["route", "/api"]).observe(85.0)
+fn main():
+    requests := metrics.counter("http_requests_total").describe("requests served, by route and status", "")
+    in_flight := metrics.gauge("http_requests_in_flight").describe("requests being served now", "")
+    # buckets sized for this service: most answers land under 50ms.
+    latency := metrics.histogram("http_request_duration_ms").describe("time to answer", "ms").buckets([10.0, 50.0, 250.0])
 
-    # the text prometheus would receive from GET /metrics
+    for r in served():
+        in_flight.add(1.0)
+        requests.labels(["route", r.route, "status", "{r.status}"]).inc()
+        latency.labels(["route", r.route]).observe(r.latency_ms.to_float())
+        in_flight.add(-1.0)
+
     print(metrics.snapshot_text())
-    return 0

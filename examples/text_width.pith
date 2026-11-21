@@ -1,23 +1,26 @@
+# text_width: measuring text in terminal columns with std.text.width.
+#
 # display width is the terminal's unit of measure, and it is neither bytes
 # nor characters: 日本 is 6 bytes, 2 characters, and 4 columns. std.text.width
-# counts columns — grapheme-aware, so a flag pair is one cluster two columns
-# wide — and pads and truncates against that count, which is what makes
-# terminal tables line up when the data is not ascii.
+# counts columns, treating a grapheme cluster such as a flag as one unit two
+# columns wide, and pads and truncates against that count. that is what makes
+# a terminal table line up when the data is not ascii.
 import std.text as text
 import std.text.width as width
 
 fn main() -> Int!:
-    print("bytes chars cols  text")
-    for s in ["hello", "日本", "café", "ｗｉｄｅ"]:
-        cols := width.of(s)
-        chars := text.char_count(s)
-        print("{s.len()}     {chars}     {cols}     {s}")
-
     flag := text.encode(127482)! + text.encode(127480)!
-    print("flag: cols={width.of(flag)}")
+    samples := ["hello", "日本", "café", "ｗｉｄｅ", flag]
 
-    print("[" + width.pad_right("日", 6) + "]")
+    # the text column is padded by display width, so it lines up even though
+    # the samples differ in bytes and characters
+    print("{width.pad_right("text", 10)}bytes chars cols")
+    for sample in samples:
+        print("{width.pad_right(sample, 10)}{sample.len():>5} {text.char_count(sample):>5} {width.of(sample):>4}")
+
+    print("")
     print("[" + width.pad_left("ab", 6) + "]")
     print("[" + width.center("日本", 8) + "]")
-    print(width.truncate_to_with("日本語です", 7, "…"))
+    # a cut never splits a wide character, so it may fall short of the limit
+    print("[" + width.truncate_to_with("日本語です", 7, "…") + "]")
     return 0

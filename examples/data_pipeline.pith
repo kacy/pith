@@ -1,72 +1,69 @@
-# data pipeline — transform, filter, aggregate over structured data
-# exercises: structs, lists, maps, lambdas, closures, string methods, for loops
+# data_pipeline: filter, transform and aggregate a list of records.
+#
+# turns a quarter of raw sales lines into a report. each stage is a small
+# function built on the list methods (filter, map, reduce) and the grouping
+# helpers in std.collections, so the stages read top to bottom and each one
+# can be checked on its own.
 
 import std.collections as collections
-import std.fmt as fmt
 
-struct Record:
-    name: String
-    category: String
-    score: Int
+enum Status:
+    Paid
+    Refunded
+    Pending
 
-fn make_records() -> List[Record]:
-    mut records: List[Record] := []
-    records.push(Record("alice", "engineering", 92))
-    records.push(Record("bob", "marketing", 78))
-    records.push(Record("carol", "engineering", 88))
-    records.push(Record("dave", "marketing", 65))
-    records.push(Record("eve", "engineering", 95))
-    records.push(Record("frank", "sales", 72))
-    records.push(Record("grace", "engineering", 81))
-    records.push(Record("henry", "sales", 90))
-    return records
+struct Sale:
+    rep: String
+    region: String
+    cents: Int
+    status: Status
 
-fn filter_by_category(records: List[Record], cat: String) -> List[Record]:
-    return collections.filter_list(records, fn(record: Record) => record.category == cat)
+fn quarter() -> List[Sale]:
+    return [
+        Sale(rep: "alice", region: "north", cents: 120000, status: Status.Paid),
+        Sale(rep: "bob", region: "south", cents: 45000, status: Status.Paid),
+        Sale(rep: "carol", region: "north", cents: 98000, status: Status.Refunded),
+        Sale(rep: "dave", region: "south", cents: 61000, status: Status.Paid),
+        Sale(rep: "alice", region: "north", cents: 30500, status: Status.Pending),
+        Sale(rep: "erin", region: "west", cents: 150000, status: Status.Paid),
+        Sale(rep: "bob", region: "south", cents: 22000, status: Status.Paid),
+        Sale(rep: "carol", region: "north", cents: 87000, status: Status.Paid),
+]
 
-fn average_score(records: List[Record]) -> Int:
-    if records.len() == 0:
-        return 0
-    total := collections.fold_list(records, 0, fn(acc: Int, record: Record) => acc + record.score)
-    return total / records.len()
+# only money that has actually arrived counts toward the report
+fn is_booked(sale: Sale) -> Bool:
+    return match sale.status:
+        Status.Paid => true
+        Status.Refunded => false
+        Status.Pending => false
 
-fn max_score(records: List[Record]) -> Record:
-    return collections.max_by(records, fn(record: Record) => record.score) catch records[0]
+fn total(sales: List[Sale]) -> Int:
+    return sales.reduce(0, fn(sum: Int, sale: Sale) => sum + sale.cents)
 
-fn count_by_category(records: List[Record]) -> Map[String, Int]:
-    return collections.count_by(records, fn(record: Record) => record.category)
-
-fn names_list(records: List[Record]) -> String:
-    names := collections.map_list(records, fn(record: Record) => record.name)
-    return fmt.join_strings(names, ", ")
+fn dollars(cents: Int) -> String:
+    return "${cents / 100}"
 
 fn main():
-    records := make_records()
-    print("total records: {records.len()}")
+    all_sales := quarter()
+    booked := all_sales.filter(is_booked)
+    print("{booked.len()} of {all_sales.len()} sales booked, {dollars(total(booked))} in total")
 
-    # filter
-    eng := filter_by_category(records, "engineering")
-    eng_names := names_list(eng)
-    print("engineering count: {eng.len()}")
-    print("engineering names: {eng_names}")
+    print("")
+    print("by region")
+    by_region := collections.group_by(booked, fn(sale: Sale) => sale.region)
+    for region in by_region.keys().sort():
+        sales := by_region[region]
+        average := total(sales) / sales.len()
+        print("  {region:<6} {dollars(total(sales)):>8}  avg {dollars(average):>7}  ({sales.len()} booked)")
 
-    # aggregate
-    print("engineering avg: {average_score(eng)}")
-    best := max_score(eng)
-    print("engineering best: {best.name} ({best.score})")
+    print("")
+    print("by rep")
+    by_rep := collections.group_by(booked, fn(sale: Sale) => sale.rep)
+    rep_totals := by_rep.keys().sort().map(fn(rep: String) => (rep, total(by_rep[rep])))
+    ranked := collections.sorted_by(rep_totals, fn(a: (String, Int), b: (String, Int)) => a.1 > b.1)
+    for entry, index in ranked:
+        print("  {index + 1}. {entry.0:<6} {dollars(entry.1):>8}")
 
-    # count by category
-    counts := count_by_category(records)
-    engineering_count := counts["engineering"]
-    marketing_count := counts["marketing"]
-    sales_count := counts["sales"]
-    print("engineering: {engineering_count}")
-    print("marketing: {marketing_count}")
-    print("sales: {sales_count}")
-
-    # overall
-    print("overall avg: {average_score(records)}")
-    overall_best := max_score(records)
-    print("overall best: {overall_best.name} ({overall_best.score})")
-
-    print("pipeline works")
+    pending := all_sales.filter(fn(sale: Sale) => sale.status == Status.Pending)
+    print("")
+    print("awaiting payment: {pending.map(fn(sale: Sale) => "{sale.rep} {dollars(sale.cents)}").join(", ")}")

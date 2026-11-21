@@ -24,7 +24,7 @@ import std.web.session as session
 PORT := 18102
 
 # the secret keys the mac over the cookie. it belongs in the environment, and
-# it must be at least 32 bytes — store() refuses anything shorter.
+# it must be at least 32 bytes; store() refuses anything shorter.
 fn session_secret() -> Bytes:
     return bytes.from_string_utf8("a session secret kept out of the repo, 32+ bytes of it")
 
@@ -43,7 +43,7 @@ fn build_app(store: session.Store) -> web.App:
     visit := fn(req: web.Request):
         seen := next_visit(store, req)
         store.set(req, "visits", seen.to_string())
-        return http.text(200, "visit " + seen.to_string())
+        return http.text(200, "visit {seen}")
 
     # sign in: rotate first, then record who it is. rotating before the write
     # is the whole session fixation defence.
@@ -93,16 +93,14 @@ fn call(method: String, path: String, cookie: String) -> http.HttpResponse!:
         req = req.cookie(cookie.substring(0, cut), cookie.substring(cut + 1, cookie.len()))
     return req.send()!
 
-# connect until the accept loop answers, rather than sleeping a guess.
-fn wait_for_port(port: Int) -> Bool:
-    mut tries := 0
-    while tries < 500:
-        probe := tcp.connect("127.0.0.1", port)
-        if probe.is_ok:
-            tcp.close(probe.ok)
-            return true
-        sleep(10)
-        tries = tries + 1
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
     return false
 
 fn main() -> Int!:
@@ -113,34 +111,33 @@ fn main() -> Int!:
 
     port := PORT
     spawn serve_bg(store, port)
-    if not wait_for_port(port):
-        print("the server never came up")
-        return 1
+    if not wait_until_listening(port):
+        fail "the server never came up"
 
     print("=== an anonymous visitor ===")
     first := call("GET", "/visit", "")!
     held := cookie_pair(first)
     print("body:            " + first.body_text()!)
-    print("got a cookie:    " + (held.len() > 0).to_string())
+    print("got a cookie:    {held.len() > 0}")
     print("cookie flags:    " + cookie_flags(first))
-    print("sessions held:   " + store.count().to_string())
+    print("sessions held:   {store.count()}")
 
     print("")
     print("=== the browser sends it back ===")
     print("body:            " + call("GET", "/visit", held)!.body_text()!)
     print("who am i:        " + call("GET", "/me", held)!.body_text()!)
     # nothing about the session changed, so nothing is set again.
-    print("set again:       " + (cookie_pair(call("GET", "/me", held)!).len() > 0).to_string())
+    print("set again:       {cookie_pair(call("GET", "/me", held)!).len() > 0}")
 
     print("")
     print("=== signing in rotates the id ===")
     login := call("POST", "/login", held)!
     rotated := cookie_pair(login)
     print("body:            " + login.body_text()!)
-    print("a new cookie:    " + (rotated.len() > 0 and rotated != held).to_string())
+    print("a new cookie:    {rotated.len() > 0 and rotated != held}")
     print("contents kept:   " + call("GET", "/me", rotated)!.body_text()!)
     print("old id refused:  " + call("GET", "/me", held)!.body_text()!)
-    print("sessions held:   " + store.count().to_string())
+    print("sessions held:   {store.count()}")
 
     print("")
     print("=== a cookie nobody signed ===")
@@ -152,7 +149,7 @@ fn main() -> Int!:
     print("=== signing out ===")
     out := call("POST", "/logout", rotated)!
     print("body:            " + out.body_text()!)
-    print("cookie cleared:  " + cookie_flags(out).contains("Max-Age=0").to_string())
+    print("cookie cleared:  {cookie_flags(out).contains("Max-Age=0")}")
     print("id now means:    " + call("GET", "/me", rotated)!.body_text()!)
-    print("sessions held:   " + store.count().to_string())
+    print("sessions held:   {store.count()}")
     return 0

@@ -1,12 +1,47 @@
+# scanner_ops: reading structured text with std.text.scanner.
+#
+# parses a block of `name: value` headers. a cursor walks the text and
+# remembers the line and column it is on, so a malformed header is reported
+# at the exact place it goes wrong. take_while reads a name, starts_with and
+# advance step over the separator, and take_line reads the value.
+
 import std.text.scanner as scanner
 
-fn main():
-    source := "name: pith\nversion: 1"
-    key := scanner.take_until(scanner.new(source), ":")
-    line1 := scanner.take_line(scanner.new(source))
-    line2 := scanner.take_line(line1.cursor)
+struct Header:
+    name: String
+    value: String
 
-    print("key: {key.slice.text}")
-    print("line1: {line1.slice.text}")
-    print("line2: {line2.slice.text}")
-    print("done: {scanner.done(line2.cursor)}")
+fn is_name_char(ch: String) -> Bool:
+    return ch == "-" or "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".contains(ch)
+
+fn skip_spaces(cursor: scanner.Cursor) -> scanner.Cursor:
+    return scanner.take_while(cursor, fn(ch: String) => ch == " ").cursor
+
+fn parse_headers(source: String) -> List[Header]!:
+    mut headers: List[Header] := []
+    mut cursor := scanner.new(source)
+    while not scanner.done(cursor):
+        name := scanner.take_while(cursor, is_name_char)
+        if name.slice.text.is_empty():
+            fail "line {cursor.line}, column {cursor.col}: expected a header name, found '{scanner.peek(cursor)}'"
+        cursor = name.cursor
+        if not scanner.starts_with(cursor, ":"):
+            fail "line {cursor.line}, column {cursor.col}: expected ':' after '{name.slice.text}'"
+        value := scanner.take_line(skip_spaces(scanner.advance(cursor)))
+        headers.push(Header(name: name.slice.text.to_lower(), value: value.slice.text.trim()))
+        cursor = value.cursor
+    return headers
+
+fn main():
+    good := "Host: example.com\nContent-Type: text/plain\nX-Retries:   3\n"
+    headers := parse_headers(good) catch:
+        print("unexpected failure")
+        return
+    for header in headers:
+        print("{header.name:<14} = {header.value}")
+
+    print("")
+    for bad in ["Host: example.com\nBad Header: x\n", "Host example.com\n", "Host: a\n: no name\n"]:
+        result := parse_headers(bad)
+        if result.is_err:
+            print("error: {result.err}")

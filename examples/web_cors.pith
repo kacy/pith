@@ -9,9 +9,8 @@
 # cors.any_origin() is the public read-only api; cors.origins(list) is a
 # named allowlist; cors.credentialed_origins(list) is the one that lets the
 # browser attach a session cookie. only the third turns credentials on, and
-# it has no wildcard — so "reflect any origin and allow credentials", the
-# mistake that switches the same-origin policy off entirely, is not a thing
-# this api can be asked to do.
+# it has no wildcard. "reflect any origin and allow credentials", the mistake
+# that switches the same-origin policy off entirely, cannot be expressed.
 
 import std.net.http as http
 import std.net.tcp as tcp
@@ -52,29 +51,26 @@ fn call(method: String, origin: String, preflight_for: String) -> String!:
     resp := req.send()!
     allow := resp.header_value("Access-Control-Allow-Origin")
     if allow.len() > 0:
-        return resp.status.to_string() + ", allow-origin " + allow
+        return "{resp.status}, allow-origin {allow}"
     if origin.len() == 0:
-        return resp.status.to_string() + ", same origin, nothing to allow"
-    return resp.status.to_string() + ", no allow-origin: the browser blocks the read"
+        return "{resp.status}, same origin, nothing to allow"
+    return "{resp.status}, no allow-origin: the browser blocks the read"
 
-# connect until the accept loop answers, rather than sleeping a guess.
-fn wait_for_port(port: Int) -> Bool:
-    mut tries := 0
-    while tries < 500:
-        probe := tcp.connect("127.0.0.1", port)
-        if probe.is_ok:
-            tcp.close(probe.ok)
-            return true
-        sleep(10)
-        tries = tries + 1
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
     return false
 
 fn main() -> Int!:
     port := PORT
     spawn serve_bg(port)
-    if not wait_for_port(port):
-        print("the server never came up")
-        return 1
+    if not wait_until_listening(port):
+        fail "the server never came up"
 
     print("=== a real request ===")
     print("from the app origin:  " + call("GET", APP_ORIGIN, "")!)
@@ -98,13 +94,13 @@ fn main() -> Int!:
     print("=== headers page javascript may read off the real response ===")
     real := http.get_request("127.0.0.1", port, "/api/items").header("Origin", APP_ORIGIN).send()!
     print("expose:   " + real.header_value("Access-Control-Expose-Headers"))
-    # this policy is not a credentialed one, so the header is simply absent —
-    # and the browser will not attach the user's cookies to the call.
-    print("credentials header sent: " + (real.header_value("Access-Control-Allow-Credentials").len() > 0).to_string())
+    # this policy is not a credentialed one, so the header is absent and the
+    # browser will not attach the user's cookies to the call.
+    print("credentials header sent: {real.header_value("Access-Control-Allow-Credentials").len() > 0}")
 
     print("")
     print("=== a plain OPTIONS, which is not a preflight ===")
     plain := http.request("OPTIONS", "127.0.0.1", port, "/api/items").send()!
-    print("status:   " + plain.status.to_string())
+    print("status:   {plain.status}")
     print("allow:    " + plain.header_value("Allow"))
     return 0

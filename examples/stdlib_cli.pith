@@ -1,11 +1,45 @@
+# std.cli: a command-line spec with subcommands, parsed without global state.
+#
+# the spec is a plain value: an app and a list of commands, each with options
+# and positionals of its own. the command comes first on the line, and only
+# its own options apply after it, so an option every command takes is declared
+# once and listed on each. parse() takes the spec and an argument list and
+# returns the parsed values or a CliError, so one program can parse as many
+# lists as it likes. this one parses what a user of a small notes tool might
+# type.
+
 import std.cli as cli
 
-fn main():
-    fmt := cli.command("fmt", "format files", [cli.flag("check", "c", "check only")], ["pattern"])
-    spec := cli.app("pith-tool", "small tooling cli", [cli.option("jobs", "j", "parallel jobs", "1")], [], [fmt])
-    parsed := cli.parse(spec, ["fmt", "--check", "**/*.pith"]).ok
+fn notes_cli() -> cli.Cli:
+    file := cli.option("file", "f", "notes file", "notes.txt")
+    add := cli.command("add", "add a note", [file, cli.option("tag", "t", "tag the note", "")], ["text"])
+    list := cli.command("list", "list notes", [file, cli.flag("all", "a", "include archived notes"), cli.option("limit", "n", "show at most this many", "10")], [])
+    return cli.app("notes", "keep short notes", [], [], [add, list])
 
-    print("command: {parsed.command}")
-    print("check: {cli.flag_value(parsed, "check")}")
-    print("pattern: {cli.positional(parsed, 0)}")
-    print("help has command: {cli.help(spec).contains("fmt - format files")}")
+fn describe(parsed: cli.Parsed) -> String:
+    file := cli.string(parsed, "file")
+    if parsed.command == "add":
+        tag := cli.string(parsed, "tag")
+        tagged := if tag == "": "" else: " tagged {tag}"
+        return "add \"{cli.positional(parsed, 0)}\"{tagged} to {file}"
+    archived := if cli.flag_value(parsed, "all"): ", archived too" else: ""
+    return "list up to {cli.int_or(parsed, "limit", 10)} notes from {file}{archived}"
+
+fn main():
+    spec := notes_cli()
+    print(cli.help(spec))
+    print("")
+
+    invocations := [
+        ["add", "buy milk"],
+        ["add", "--file", "work.txt", "--tag", "urgent", "ship the release"],
+        ["list", "-a", "-n", "3"],
+        ["remove", "1"],
+        ["add"],
+    ]
+    for argv in invocations:
+        parsed := cli.parse(spec, argv)
+        if parsed.is_err:
+            print("notes {argv.join(" ")}: error: {parsed.err.message}")
+        else:
+            print("notes {argv.join(" ")}: {describe(parsed.ok)}")

@@ -1,22 +1,45 @@
-# hashing — SHA-256 and FNV-1a hash functions
-# demonstrates: hash consistency, determinism, and input sensitivity
+# hashing: content addressing with std.hash.
+#
+# stores uploaded files under the sha-256 of their contents, the way git and
+# most backup tools do. equal contents get the same address, so a duplicate
+# upload is detected without comparing files byte by byte, and changing a
+# single character changes the address completely. fnv-1a, which is fast but
+# not cryptographic, picks the storage shard.
 
 import std.bytes as bytes
 import std.hash as hash
 
+struct Upload:
+    name: String
+    contents: String
+
+fn shard(address: String, shard_count: Int) -> Int:
+    # fnv1a can come back negative as a signed Int, so fold it into range
+    value := hash.fnv1a_string(address) % shard_count
+    return if value < 0: value + shard_count else: value
+
 fn main():
-    print("sha256 empty: {hash.sha256(bytes.empty())}")
-    print("sha224 hello: {hash.sha224_string("hello")}")
-    print("sha256 hello: {hash.sha256_string("hello")}")
-    print("sha256 abc: {hash.sha256_string("abc")}")
-    print("sha256 bytes len: {hash.sha256_bytes(bytes.from_string_utf8("hello")).len()}")
+    uploads := [
+        Upload(name: "report.txt", contents: "quarterly numbers: up"),
+        Upload(name: "notes.txt", contents: "call the bank"),
+        Upload(name: "report-copy.txt", contents: "quarterly numbers: up"),
+        Upload(name: "report-v2.txt", contents: "quarterly numbers: Up"),
+]
 
-    hash_hello_first := hash.fnv1a_string("hello")
-    hash_hello_second := hash.fnv1a_string("hello")
-    hash_world := hash.fnv1a_string("world")
-    print("fnv1a consistent: {hash_hello_first == hash_hello_second}")
-    print("fnv1a differs: {hash_hello_first != hash_world}")
+    mut store: Map[String, String] := {}
+    for upload in uploads:
+        address := hash.sha256_string(upload.contents)
+        short := address.substring(0, 12)
+        if let existing = store.get(address):
+            print("{upload.name:<16} {short}  duplicate of {existing}")
+            continue
+        store[address] = upload.name
+        print("{upload.name:<16} {short}  stored on shard {shard(address, 4)}")
+    print("{uploads.len()} uploads, {store.len()} stored")
 
-    hash_pith_first := hash.sha256_string("pith")
-    hash_pith_second := hash.sha256_string("pith")
-    print("sha256 consistent: {hash_pith_first == hash_pith_second}")
+    # the empty input has a fixed, well-known digest, handy for spotting
+    # zero-byte files
+    print("")
+    print("sha-256 of nothing: {hash.sha256(bytes.empty())}")
+    print("raw digest length:  {hash.sha256_bytes(bytes.from_string_utf8("abc")).len()} bytes")
+    print("sha-224 of 'abc':   {hash.sha224_string("abc")}")

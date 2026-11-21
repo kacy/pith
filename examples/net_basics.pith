@@ -1,21 +1,31 @@
-# basic networking operations (non-concurrent)
+# a port checker: name resolution and connection attempts with std.net.
+#
+# it resolves a host name, then tries to connect to a few ports and reports
+# which accept a connection. a refused connection is an ordinary result here,
+# so each attempt is caught and reported rather than ending the program.
+#
+# the address localhost resolves to depends on the machine (127.0.0.1 or ::1),
+# so the Makefile does not compare this example's output.
 
-fn main():
-    # TCP listen and close
-    server := tcp_listen("127.0.0.1", 18438)
-    print("listen ok: {server.is_ok}")
-    if server.is_ok:
-        tcp_close(server.ok)
+import std.net.dns as dns
+import std.net.tcp as tcp
 
-    # TCP connect to non-existent server
-    bad := tcp_connect("127.0.0.1", 18439)
-    print("bad connect failed: {bad.is_err}")
+OPEN_PORT := 18438
+CLOSED_PORT := 18439
 
-    # DNS resolve
-    ip := dns_resolve("localhost")
-    if ip.is_ok:
-        print("localhost: {ip.ok}")
-    else:
-        print("localhost lookup failed")
+fn probe(host: String, port: Int) -> String:
+    fd := tcp.connect(host, port) catch:
+        return "closed"
+    tcp.close(fd)
+    return "open"
 
-    print("net basics work")
+fn main() -> Int!:
+    address := dns.resolve("localhost") catch "unresolved"
+    print("localhost resolves to {address}")
+
+    # something to find: a listener on one port and nothing on the next.
+    listener := tcp.listen("127.0.0.1", OPEN_PORT)!
+    defer tcp.close(listener)
+    for port in [OPEN_PORT, CLOSED_PORT]:
+        print("127.0.0.1:{port} is {probe("127.0.0.1", port)}")
+    return 0

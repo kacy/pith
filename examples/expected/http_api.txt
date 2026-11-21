@@ -1,8 +1,20 @@
-home: 200 (ok) - <h1>welcome</h1>
-user: 200 (ok) - user 42
-search: 200 (ok) - results for pith
-submit: 201 (ok) - stored: hello
-missing: 404 (not ok) - <h1>404 Not Found</h1>
-accept: application/json
-auth: Bearer token123
-q: lang
+GET / -> 200 text/html
+  <h1>tea shop</h1><p><a href="/export.csv">price list</a></p>
+GET /greet?name=ada -> 200 text/html
+  <h1>hello, ada!</h1>
+GET /greet?name=<script>alert(1)</script> -> 200 text/html
+  <h1>hello, &lt;script&gt;alert(1)&lt;/script&gt;!</h1>
+GET /link?to=javascript:alert(1) -> 200 text/html
+  <a href="about:blank">continue</a>
+GET /products/tea-02 -> 200 application/json
+  {"sku":"tea-02","name":"black tea","cents":390}
+GET /products/tea-99 -> 404 application/json
+  {"error":"no product tea-99"}
+GET /export.csv -> 200 text/csv
+  sku,name,cents
+  tea-01,green tea,450
+  tea-02,black tea,390
+  cup-01,mug,1200
+GET /shop -> 301, Location: /
+GET /nowhere -> 404 text/html
+  <h1>404 Not Found</h1>

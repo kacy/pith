@@ -1,18 +1,17 @@
-# bytes keys — a set and a map keyed by raw bytes, compared by content
+# bytes_keys: a set and a map keyed by raw bytes.
+#
+# counts the opcodes in a stream of protocol frames. a Set[Bytes] or a
+# Map[Bytes, V] compares keys by content, so a frame read off the wire finds
+# the entry stored under an equal key built somewhere else, and the container
+# keeps its own copy of each key.
 
 import std.bytes as bytes
 
 # frames as a protocol layer hands them over: raw bytes, some repeated
 fn frames() -> List[Bytes]:
-    out: List[Bytes] := []
-    out.push(bytes.from_string_utf8("PING"))
-    out.push(bytes.from_string_utf8("DATA"))
-    out.push(bytes.from_string_utf8("PING"))
-    out.push(bytes.from_string_utf8("PONG"))
-    return out
+    return ["PING", "DATA", "PING", "PONG", "DATA", "DATA"].map(fn(op: String) => bytes.from_string_utf8(op))
 
-fn main() -> String!:
-    # a name for each opcode, keyed by the opcode's bytes
+fn main() -> Int!:
     names: Map[Bytes, String] := {}
     names[bytes.from_string_utf8("PING")] = "ping"
     names[bytes.from_string_utf8("PONG")] = "pong"
@@ -20,20 +19,21 @@ fn main() -> String!:
     mut seen: Set[Bytes] := {}
     mut counts: Map[Bytes, Int] := {}
     for frame in frames():
-        # the key the map holds and the frame read off the wire are different
-        # objects; the lookup goes by content
-        counts[frame] = counts.get_default(frame, 0) + 1
+        counts[frame] = counts.get(frame).unwrap_or(0) + 1
+        label := names.get(frame).unwrap_or("unknown")
         if seen.contains(frame):
-            print("repeat: {names.get_default(frame, "?")}")
+            print("repeat {label}")
         else:
             seen.add(frame)
-            print("first: {names.get_default(frame, "?")}")
+            print("first  {label}")
 
-    print("distinct: {seen.len()}")
-    # a key assembled byte by byte still finds the entry
-    buf := bytes.buffer()
-    buf.write_string_utf8("PI")!
-    buf.write_string_utf8("NG")!
-    print("ping count: {counts[buf.take_bytes()]}")
-    print("data count: {counts[bytes.from_string_utf8("DATA")]}")
-    return ""
+    print("")
+    print("distinct opcodes: {seen.len()}")
+
+    # a key assembled piece by piece still finds the entry
+    key := bytes.buffer()
+    key.write_string_utf8("DA")!
+    key.write_string_utf8("TA")!
+    print("DATA frames: {counts[key.take_bytes()]}")
+    print("PING frames: {counts[bytes.from_string_utf8("PING")]}")
+    return 0

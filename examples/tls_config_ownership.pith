@@ -2,7 +2,7 @@
 #
 # a tls config is a handle into a registry that std.net.tls keeps for the life
 # of the process. it gives that slot back on its own when the last value naming
-# it goes away — Config implements Drop, so a config bound in a request handler
+# it goes away: Config implements Drop, so a config bound in a request handler
 # and forgotten closes when the handler returns. what the destructor does not
 # decide is when, and that is what an explicit close() is still for: whoever
 # builds a config decides when its slot goes back, and the destructor is the
@@ -22,8 +22,8 @@ import std.net.tls as tls
 CA_PATH := "tests/live/fixtures/localhost-ca.crt"
 
 # one request's worth of config: build it, hand it to the connection, give it
-# back. the defer says where — the config goes back on every exit from here,
-# including the ones a failing handshake takes — and without it the destructor
+# back. the defer says where: the config goes back on every exit from here,
+# including the ones a failing handshake takes. without it the destructor
 # would close the config at the same exits, since nothing else holds it.
 fn one_request(label: String) -> String!:
     config := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["h2"])
@@ -38,13 +38,10 @@ fn one_request(label: String) -> String!:
 fn main():
     print("tls config ownership")
 
-    # many configs over the same bundle. each is independent — one caller's
-    # with_alpn cannot reach another caller's config — but they share the parse.
-    mut i := 0
-    while i < 3:
-        line := one_request("request {i}") catch "request {i}: no ca bundle"
-        print(line)
-        i = i + 1
+    # many configs over the same bundle. each is independent (one caller's
+    # with_alpn cannot reach another caller's config), but they share the parse.
+    for i in 0..3:
+        print(one_request("request {i}") catch "request {i}: no ca bundle")
 
     # a config the caller keeps across several connections. the _with_config
     # entry points never close, precisely so this shape works; the caller closes

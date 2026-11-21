@@ -1,82 +1,167 @@
-# a small json api with std.web.
+# a json api with std.web: a small book catalog kept in memory.
 #
-# two routes tell the whole story: GET /users/:id echoes the path parameter
-# back as json, and POST /users reads a typed struct out of the request body
-# and echoes it back — or answers 400 when the body is missing or malformed.
+# GET /books lists the catalog, GET /books/:id reads one book, POST /books
+# decodes a typed struct from the body with web.parse, and DELETE /books/:id
+# removes one. every failure has its own status: 400 for a body that is not
+# json, 422 for a book that fails validation, 404 for an unknown id.
 #
-# in a real program main would end with build_app().listen(...) and stay up.
-# so this can run as a self-checking example, we instead spawn the server, make
-# a few requests against it (including a POST with a json body), print the
-# replies, and exit.
-import std.web as web
-import std.net.http as http
+# handlers run on many tasks at once, so the catalog sits in a guard block
+# and every handler that touches it takes the lock. main starts the server on
+# a background task and plays the client.
+
 import std.json as json
+import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
 
-# the shape we expect in a POST /users body. web.parse reads the fields straight
-# off the struct, so they have to be `pub`.
-struct NewUser:
-    pub name: String
-    pub age: Int
+PORT := 18082
 
-# encode a user back into json text for the response body.
-fn user_json(user: NewUser) -> String:
-    obj := json.make_object()
-    json.object_set(obj, "name", json.make_string(user.name))
-    json.object_set(obj, "age", json.make_int(user.age))
-    return json.encode(obj)
+struct Book:
+    id: Int
+    title: String
+    author: String
+    year: Int
 
-# GET /users/:id — echo the path parameter back as a small json object.
-fn show_user(req: web.Request) -> http.HttpResponse:
-    obj := json.make_object()
-    json.object_set(obj, "id", json.make_string(req.param("id")))
-    return http.json(200, json.encode(obj))
+impl Book:
+    fn to_json() -> Int:
+        obj := json.make_object()
+        json.object_set(obj, "id", json.make_int(self.id))
+        json.object_set(obj, "title", json.make_string(self.title))
+        json.object_set(obj, "author", json.make_string(self.author))
+        json.object_set(obj, "year", json.make_int(self.year))
+        return obj
 
-# POST /users — decode a NewUser from the json body and echo it back. is_json()
-# turns away anything that is not application/json, and a decode error (a
-# missing field or malformed json) becomes a 400 rather than a crash.
-fn create_user(req: web.Request) -> http.HttpResponse:
+# the shape of a POST /books body. web.parse fills the fields by name, so they
+# have to be pub.
+struct NewBook:
+    pub title: String
+    pub author: String
+    pub year: Int
+
+guard catalog_mu:
+    mut books: List[Book] := []
+    mut next_id: Int := 1
+
+fn error_json(status: Int, message: String) -> http.HttpResponse:
+    return http.response(status).json_body(json.of("error", message))
+
+fn validate(book: NewBook) -> String?:
+    if book.title.trim().len() == 0:
+        return "title is required"
+    if book.year < 1450 or book.year > 2100:
+        return "year {book.year} is out of range"
+    return none
+
+fn add_book(book: NewBook) -> Book:
+    locked catalog_mu:
+        added := Book(id: next_id, title: book.title, author: book.author, year: book.year)
+        books.push(added)
+        next_id += 1
+        return added
+
+fn find_book(id: Int) -> Book?:
+    locked catalog_mu:
+        for book in books:
+            if book.id == id:
+                return book
+    return none
+
+fn remove_book(id: Int) -> Bool:
+    locked catalog_mu:
+        for book, index in books:
+            if book.id == id:
+                books.remove(index)
+                return true
+    return false
+
+fn list_books(req: web.Request) -> http.HttpResponse:
+    out := json.make_array()
+    locked catalog_mu:
+        for book in books:
+            json.array_push(out, book.to_json())
+    return http.json_value(200, out)
+
+fn show_book(req: web.Request) -> http.HttpResponse:
+    id := parse_int(req.param("id")) catch:
+        return error_json(400, "id must be a number")
+    if let book = find_book(id):
+        return http.json_value(200, book.to_json())
+    return error_json(404, "no book {id}")
+
+fn create_book(req: web.Request) -> http.HttpResponse:
     if not req.is_json():
-        return http.bad_request_response()
-    parsed := web.parse[NewUser](req)
+        return error_json(415, "send application/json")
+    parsed := web.parse[NewBook](req)
     if parsed.is_err:
-        return http.bad_request_response()
-    return http.json(201, user_json(parsed.ok))
+        # the decode error names the field, which is what the caller needs.
+        return error_json(400, parsed.err.message)
+    book := parsed.ok
+    if let problem = validate(book):
+        return error_json(422, problem)
+    added := add_book(book)
+    return http.json_value(201, added.to_json()).header("Location", "/books/{added.id}")
 
-# the whole application: one route to read a user, one to create one. routes are
-# added one per line because a builder chain has to stay on a single line.
+fn delete_book(req: web.Request) -> http.HttpResponse:
+    id := parse_int(req.param("id")) catch:
+        return error_json(400, "id must be a number")
+    if not remove_book(id):
+        return error_json(404, "no book {id}")
+    return http.no_content()
+
 fn build_app() -> web.App:
     mut app := web.new()
-    app = app.get("/users/:id", show_user)
-    app = app.post("/users", create_user)
+    app = app.get("/books", list_books)
+    app = app.post("/books", create_book)
+    app = app.get("/books/:id", show_book)
+    app = app.delete("/books/:id", delete_book)
     return app
 
-# run the server in the background so main can act as a client against it.
-fn serve_bg(port: Int) -> Int:
+fn serve(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
-# fetch a path and return just the response body, so we can print it.
-fn get_body(port: Int, path: String) -> String:
-    resp := http.get_request("127.0.0.1", port, path).send() catch:
-        return "no response"
-    return resp.body_text() catch ""
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
 
-# POST a json body and return just the response body.
-fn post_json(port: Int, path: String, body: String) -> String:
-    resp := http.post_request("127.0.0.1", port, path).header("Content-Type", "application/json").body_text(body).send() catch:
-        return "no response"
-    return resp.body_text() catch ""
+fn show(req: http.ClientRequest, label: String):
+    resp := req.send() catch:
+        print("{label}: no response")
+        return
+    body := resp.body_text() catch ""
+    if body.len() == 0:
+        print("{label} -> {resp.status}")
+        return
+    print("{label} -> {resp.status} {body}")
+
+fn post_book(body: String) -> http.ClientRequest:
+    return http.post_request("127.0.0.1", PORT, "/books").header("Content-Type", "application/json").body_text(body)
 
 fn main() -> Int!:
-    port := 18082
-    spawn serve_bg(port)
-    sleep(200)   # give the listener a moment to bind
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
 
-    body := "{{\"name\":\"ada\",\"age\":36}}"
+    show(post_book("{{\"title\":\"Dune\",\"author\":\"Frank Herbert\",\"year\":1965}}"), "POST /books")
+    show(post_book("{{\"title\":\"Kindred\",\"author\":\"Octavia E. Butler\",\"year\":1979}}"), "POST /books")
+    show(http.get_request("127.0.0.1", PORT, "/books"), "GET /books")
+    show(http.get_request("127.0.0.1", PORT, "/books/2"), "GET /books/2")
+    show(http.get_request("127.0.0.1", PORT, "/books/9"), "GET /books/9")
 
-    # GET echoes the path parameter as json.
-    print(get_body(port, "/users/42"))
-    # POST decodes the body into a NewUser and echoes it back.
-    print(post_json(port, "/users", body))
-    # a malformed body is turned away with a 400.
-    print(post_json(port, "/users", "not json"))
+    print("")
+    show(post_book("not json"), "POST malformed")
+    show(post_book("{{\"title\":\"Dune\"}}"), "POST missing fields")
+    show(post_book("{{\"title\":\" \",\"author\":\"anon\",\"year\":2001}}"), "POST blank title")
+    show(post_book("{{\"title\":\"Scroll\",\"author\":\"anon\",\"year\":300}}"), "POST bad year")
+    show(http.post_request("127.0.0.1", PORT, "/books").text_body("Dune"), "POST as text")
+
+    print("")
+    show(http.request("DELETE", "127.0.0.1", PORT, "/books/1"), "DELETE /books/1")
+    show(http.request("DELETE", "127.0.0.1", PORT, "/books/1"), "DELETE /books/1")
+    show(http.get_request("127.0.0.1", PORT, "/books"), "GET /books")
     return 0

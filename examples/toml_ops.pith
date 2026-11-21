@@ -1,63 +1,66 @@
-# toml parsing
-import std.toml as toml
+# toml_ops: reading a package manifest with std.toml.
+#
+# writes a pith.toml-style manifest to a temporary file and loads it back:
+# the [package] table decodes into a struct, required keys fail with a
+# message, optional ones fall back to defaults, and the dependency table is
+# walked key by key.
+
 import std.fs as fs
+import std.os.path as path
+import std.toml as toml
 
-struct ServerConfig:
-    pub host: String
-    pub port: Int
+struct Package:
+    pub name: String
+    pub version: String
+    pub edition: Int = 2026
 
-fn main() -> String!:
-    path := "/tmp/pith_toml_ops.toml"
-
-    # build a TOML document, one line per entry
-    lines := [
-        "title = \"pith\"",
-        "version = 42",
-        "pi = 3.14",
-        "enabled = true",
-        "tags = [\"lang\", \"fast\"]",
+fn manifest_text() -> String:
+    return [
+        "[package]",
+        "name = \"ledger\"",
+        "version = \"0.4.1\"",
+        "authors = [\"ada\", \"grace\"]",
         "",
-        "[server]",
-        "host = \"localhost\"",
-        "port = 8080",
-    ]
-    doc := lines.join("\n") + "\n"
+        "[dependencies]",
+        "decimal = \"1.2\"",
+        "csv = \"0.9\"",
+        "",
+        "[build]",
+        "optimize = true",
+        "jobs = 8",
+].join("\n") + "\n"
 
-    root := toml.parse(doc)
-    print("type: {toml.type_of(root)}")
+fn main() -> Int!toml.TomlDecodeError:
+    dir := fs.make_temp_dir("pith-toml-example-") catch:
+        return 1
+    defer fs.remove_tree(dir)
+    manifest_path := path.join(dir, "pith.toml")
+    fs.write(manifest_path, manifest_text()) catch:
+        return 1
 
-    # basic values
-    print("title: {toml.get_string(root, "title")}")
-    print("version: {toml.get_int(root, "version")}")
-    print("pi: {toml.get_float(root, "pi")}")
-    print("enabled: {toml.get_bool(root, "enabled")}")
-    print("missing title: {toml.get_string_or(root, "missing_title", "n/a")}")
-    print("missing port: {toml.get_int_or(root, "missing_port", 9000)}")
+    package := toml.decode_file_path[Package](manifest_path, "package")!
+    print("{package.name} {package.version} (edition {package.edition})")
 
-    # has key
-    print("has title: {toml.has(root, "title")}")
-    print("has missing: {toml.has(root, "missing")}")
+    root := toml.parse_file(manifest_path)
+    authors := toml.get_array(toml.get_table(root, "package"), "authors")
+    mut names: List[String] := []
+    for index in 0..toml.array_len(authors):
+        names.push(toml.array_string(authors, index))
+    print("authors: {names.join(", ")}")
 
-    # array
-    tags := toml.get_array(root, "tags")
-    print("tags count: {toml.array_len(tags)}")
-    tag0 := toml.array_get(tags, 0)
-    print("tag 0 type: {toml.type_of(tag0)}")
+    print("dependencies:")
+    deps := toml.get_table(root, "dependencies")
+    for name in toml.keys(deps).sort():
+        print("  {name:<8} {toml.get_string(deps, name)}")
 
-    # sub-table
-    server := toml.get_table(root, "server")
-    print("server host: {toml.get_string(server, "host")}")
-    print("server port: {toml.get_int(server, "port")}")
-    typed_server := toml.decode[ServerConfig](server)
-    if typed_server.is_ok:
-        print("typed server: {typed_server.ok.host}:{typed_server.ok.port}")
+    build := toml.get_table(root, "build")
+    jobs := toml.get_int_or(build, "jobs", 1)
+    target := toml.get_string_or(build, "target", "native")
+    print("build: optimize={toml.get_bool(build, "optimize")}, {jobs} jobs, target {target}")
 
-    # keys
-    root_keys := toml.keys(root)
-    print("key count: {root_keys.len()}")
-
-    fs.write(path, doc)!
-    file_root := toml.parse_file(path)
-    print("file host: {toml.get_string(toml.get_table(file_root, "server"), "host")}")
-    fs.remove(path)
-    return ""
+    # a key the program cannot do without is required, and its absence is
+    # an error with a message the caller can report
+    license := toml.require_string(toml.get_table(root, "package"), "license")
+    if license.is_err:
+        print("cannot publish: {license.err.message}")
+    return 0

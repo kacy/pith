@@ -1,17 +1,43 @@
-# test std.test — the testing framework itself
-from std.testing import assert_eq, assert_ne, check_true, check_not
-from std.testing import assert_true, assert_false, assert_contains, done
+# stdlib_test: testing a small function with `test` blocks and std.testing.
+#
+# slugify turns a post title into the last part of its url. the `test` blocks
+# below sit next to it and run with `pith test examples/stdlib_test.pith`:
+# each runs in its own process and is reported by name, and the built-in
+# assert_eq ends only that one test when it fails. main runs checks through
+# std.testing instead, which prints a line per check, keeps going after a
+# failure, and totals the run in done().
+
+import std.testing as testing
+
+fn is_slug_char(ch: String) -> Bool:
+    return "abcdefghijklmnopqrstuvwxyz0123456789".contains(ch)
+
+fn slugify(title: String) -> String:
+    mut slug := ""
+    mut pending_dash := false
+    for ch in title.to_lower():
+        if not is_slug_char(ch):
+            pending_dash = not slug.is_empty()
+            continue
+        if pending_dash:
+            slug = slug + "-"
+            pending_dash = false
+        slug = slug + ch
+    return slug
+
+test "words are lowercased and joined with dashes":
+    assert_eq(slugify("Hello World"), "hello-world")
+
+test "runs of punctuation become one dash":
+    assert_eq(slugify("Pith 1.0 -- released!"), "pith-1-0-released")
+
+test "a title with nothing usable gives an empty slug":
+    assert(slugify("?!").is_empty())
 
 fn main():
-    assert_eq(1 + 1, 2)
-    assert_eq(10 * 3, 30)
-    assert_ne(1, 2)
-    assert_eq("hello", "hello")
-    assert_true("pith".starts_with("pit"))
-    assert_false("pith".contains("zig"))
-    assert_contains("hello pith", "pith")
-    check_true(10 > 5, "greater than")
-    check_not(3 > 7, "not greater")
-    assert_eq("hello".len(), 5)
-    assert_eq("HELLO".to_lower(), "hello")
-    done()
+    testing.check(slugify("Hello World"), "hello-world", "lowercase and dashes")
+    testing.check(slugify("  spaced   out  "), "spaced-out", "edges trimmed")
+    testing.check(slugify("C'est déjà l'été"), "c-est-d-j-l-t", "non-ascii letters dropped")
+    testing.check_true(slugify("?!").is_empty(), "nothing usable")
+    testing.check_not(slugify("a/b").contains("/"), "no slashes survive")
+    testing.done()

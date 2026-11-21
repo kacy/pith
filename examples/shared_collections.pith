@@ -1,19 +1,47 @@
-# local mutations on runtime-managed collections
+# collections are shared handles: a shopping cart, a snapshot, and a hand-off.
+#
+# a list, map or set is one buffer behind a handle. passing it to a function
+# passes the handle, so the function's changes are the caller's changes. a
+# snapshot that must not move is a copy. and a collection handed to another
+# task must be one this task lets go of: a copy, or a value built in the call,
+# since two tasks writing one buffer would corrupt it (the compiler refuses
+# the shared case with E248).
 
-fn main():
-    mut numbers := [1, 2, 3]
-    numbers.push(4)
-    numbers.push(5)
-    print("list len: {numbers.len()}")
-    print("list last: {numbers[numbers.len() - 1]}")
+import std.collections as collections
 
-    mut scores: Map[String, Int] := {}
-    scores.insert("alice", 10)
-    scores.insert("bob", 20)
-    print("map len: {scores.len()}")
-    print("alice score: {scores["alice"]}")
+struct Line:
+    sku: String
+    qty: Int
 
-    mut tags := {"base"}
-    tags.add("shared")
-    print("set has shared: {tags.contains("shared")}")
-    print("set len: {tags.len()}")
+fn add(cart: List[Line], sku: String, qty: Int):
+    cart.push(Line(sku: sku, qty: qty))
+
+fn units(cart: List[Line]) -> Int:
+    return cart.reduce(0, fn(total: Int, line: Line) => total + line.qty)
+
+# runs in its own task, over an order it owns outright.
+fn pack(order: List[Line], skus_in_stock: Set[String]) -> String:
+    missing := order.filter(fn(line: Line) => not skus_in_stock.contains(line.sku))
+    if missing.len() == 0:
+        return "packed {units(order)} units"
+    return "short on {missing.map(fn(line: Line) => line.sku).join(", ")}"
+
+fn main() -> Int!:
+    mut cart: List[Line] := []
+    add(cart, "kettle", 1)
+    add(cart, "mug", 4)
+    print("cart after two adds: {cart.len()} lines, {units(cart)} units")
+
+    # checkout freezes the order. the copy has its own buffer, so the shopper
+    # can keep editing the cart without changing what was ordered.
+    order := collections.copy_list(cart)
+    add(cart, "teapot", 1)
+    print("cart now:            {cart.len()} lines, {units(cart)} units")
+    print("order placed:        {order.len()} lines, {units(order)} units")
+
+    # the order goes to the packing task as a copy; the stock list is built in
+    # the call, so neither buffer is shared with main.
+    packing := spawn pack(collections.copy_list(order), {"kettle", "mug"})
+    print("warehouse: {await packing}")
+    print("warehouse: {await spawn pack(collections.copy_list(cart), {"kettle", "mug"})}")
+    return 0

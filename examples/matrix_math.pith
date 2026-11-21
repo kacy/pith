@@ -1,68 +1,94 @@
-# matrix math — 2D matrix operations using flat lists
-# exercises: range-for iteration, nested loops, function composition
+# matrix_math: a small integer matrix type with methods.
+#
+# a Matrix stores its cells in one flat list, row by row, and its methods
+# build new matrices rather than changing their receiver. two classic uses
+# follow: fibonacci numbers by raising [[1, 1], [1, 0]] to a power, and
+# counting walks in a graph by squaring its adjacency matrix.
 
-import std.fmt as fmt
+struct Matrix:
+    rows: Int
+    cols: Int
+    cells: List[Int]
 
-fn mat_get(data: List[Int], cols: Int, r: Int, c: Int) -> Int:
-    return data[r * cols + c]
+impl Matrix:
+    fn at(row: Int, col: Int) -> Int:
+        return self.cells[row * self.cols + col]
 
-fn mat_add(a: List[Int], b: List[Int], rows: Int, cols: Int) -> List[Int]:
-    mut result: List[Int] := []
-    for i in 0..rows * cols:
-        result.push(a[i] + b[i])
-    return result
+    fn times(other: Matrix) -> Matrix:
+        mut cells: List[Int] := []
+        for row in 0..self.rows:
+            for col in 0..other.cols:
+                mut sum := 0
+                for k in 0..self.cols:
+                    sum += self.at(row, k) * other.at(k, col)
+                cells.push(sum)
+        return Matrix(rows: self.rows, cols: other.cols, cells: cells)
 
-fn mat_mul(a: List[Int], b: List[Int], ar: Int, ac: Int, bc: Int) -> List[Int]:
-    mut result: List[Int] := []
-    for r in 0..ar:
-        for c in 0..bc:
-            mut sum := 0
-            for k in 0..ac:
-                sum = sum + mat_get(a, ac, r, k) * mat_get(b, bc, k, c)
-            result.push(sum)
-    return result
+    fn transposed() -> Matrix:
+        mut cells: List[Int] := []
+        for col in 0..self.cols:
+            for row in 0..self.rows:
+                cells.push(self.at(row, col))
+        return Matrix(rows: self.cols, cols: self.rows, cells: cells)
 
-fn mat_transpose(data: List[Int], rows: Int, cols: Int) -> List[Int]:
-    mut result: List[Int] := []
-    for c in 0..cols:
-        for r in 0..rows:
-            result.push(mat_get(data, cols, r, c))
-    return result
+    # squaring and halving the exponent needs about log2(n) multiplications
+    fn power(exponent: Int) -> Matrix:
+        mut result := identity(self.rows)
+        mut base := self
+        mut remaining := exponent
+        while remaining > 0:
+            if remaining % 2 == 1:
+                result = result.times(base)
+            remaining = remaining / 2
+            # squaring once more than needed would overflow for large powers
+            if remaining > 0:
+                base = base.times(base)
+        return result
 
-fn mat_trace(data: List[Int], n: Int) -> Int:
-    mut sum := 0
-    for i in 0..n:
-        sum = sum + mat_get(data, n, i, i)
-    return sum
+    fn show(indent: String):
+        for row in 0..self.rows:
+            mut line := indent
+            for col in 0..self.cols:
+                line = line + "{self.at(row, col):4}"
+            print(line)
+
+fn identity(size: Int) -> Matrix:
+    mut cells: List[Int] := []
+    for row in 0..size:
+        for col in 0..size:
+            cells.push(if row == col: 1 else: 0)
+    return Matrix(rows: size, cols: size, cells: cells)
 
 fn main():
-    a := [1, 2, 3, 4]
-    b := [5, 6, 7, 8]
+    step := Matrix(rows: 2, cols: 2, cells: [1, 1, 1, 0])
+    mut fibonacci: List[String] := []
+    for n in 1..13:
+        fibonacci.push(step.power(n).at(0, 1).to_string())
+    print("fibonacci: {fibonacci.join(" ")}")
+    print("fib(90) = {step.power(90).at(0, 1)}")
 
-    print("A = {fmt.int_grid(a, 2, 2)}")
-    print("B = {fmt.int_grid(b, 2, 2)}")
+    # one-way streets between four places: home, shop, park, school
+    places := ["home", "shop", "park", "school"]
+    streets := Matrix(rows: 4, cols: 4, cells: [
+        0, 1, 1, 0,
+        0, 0, 1, 1,
+        0, 0, 0, 1,
+        1, 0, 0, 0,
+])
+    print("")
+    print("streets:")
+    streets.show("  ")
+    two_hops := streets.power(2)
+    print("routes of exactly two streets:")
+    for origin, row in places:
+        for destination, col in places:
+            if two_hops.at(row, col) > 0:
+                print("  {origin} -> {destination}: {two_hops.at(row, col)}")
 
-    sum := mat_add(a, b, 2, 2)
-    print("A+B = {fmt.int_grid(sum, 2, 2)}")
-
-    prod := mat_mul(a, b, 2, 2, 2)
-    print("A*B = {fmt.int_grid(prod, 2, 2)}")
-
-    at := mat_transpose(a, 2, 2)
-    print("A^T = {fmt.int_grid(at, 2, 2)}")
-
-    print("trace(A) = {mat_trace(a, 2)}")
-    print("trace(A*B) = {mat_trace(prod, 2)}")
-
-    # 3x3 identity
-    id := [1, 0, 0, 0, 1, 0, 0, 0, 1]
-    print("I3 = {fmt.int_grid(id, 3, 3)}")
-    print("trace(I3) = {mat_trace(id, 3)}")
-
-    # 3x2 * 2x3
-    c := [1, 2, 3, 4, 5, 6]
-    d := [7, 8, 9, 10, 11, 12]
-    cd := mat_mul(c, d, 3, 2, 3)
-    print("C*D = {fmt.int_grid(cd, 3, 3)}")
-
-    print("matrix works")
+    # transposing reverses every street, which answers "who can reach me"
+    reverse := streets.transposed()
+    mut into_school: List[String] := []
+    for place, col in places:
+        if reverse.at(3, col) == 1:
+            into_school.push(place)
+    print("streets into school come from: {into_school.join(", ")}")

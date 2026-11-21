@@ -1,64 +1,57 @@
-# fs_ops.pith — test std.fs module
+# paths and directories: stage a small static site for release.
+#
+# std.fs works on whole files and directory trees, and std.os.path builds and
+# takes apart the paths. the example lays out a site's source, copies it into
+# a release directory, drops the drafts, writes a manifest atomically, and
+# prints what shipped. it all happens under one temp directory that main
+# removes on the way out, so it leaves nothing behind and reads the same on
+# every machine.
 
+import std.algo as algo
 import std.fs as fs
 import std.os.path as path
 
-fn do_test() -> String!:
-    root := fs.make_temp_dir("pith_fs_example_")!
-    src_root := path.join(root, "src")
-    copy_root := path.join(root, "copy")
-    tree_root := path.join(root, "tree_copy")
-    fs.make_dirs(src_root)
-    fs.make_dirs(path.join(src_root, "nested"))
-    text_path := path.join(src_root, "data.txt")
-    nested_path := path.join(path.join(src_root, "nested"), "leaf.txt")
-    fs.write(text_path, "hello from pith")!
-    fs.write(nested_path, "nested hello")!
+fn write_source(src: String) -> Int!:
+    pages := [
+        ("index.html", "<h1>welcome</h1>"),
+        ("about.html", "<p>about us</p>"),
+        ("drafts/launch.html", "<p>coming soon</p>"),
+        ("assets/site.css", "body {{ margin: 0 }}"),
+    ]
+    for page in pages:
+        target := path.join(src, page.0)
+        fs.make_dirs(path.dir(target))
+        fs.write(target, page.1)!
+    return pages.len()
 
-    # check existence
-    print("exists: {fs.exists(text_path)}")
-    print("is_dir: {fs.is_dir(text_path)}")
-    tmp_is_dir := fs.is_dir("/tmp")
-    print("is_dir /tmp: {tmp_is_dir}")
+# every file under root, as a path relative to it, in sorted order.
+fn files_under(root: String) -> List[String]!:
+    mut found: List[String] := []
+    for entry in fs.walk(root)!:
+        if not entry.is_dir:
+            found.push(path.rel(root, entry.path))
+    return algo.sort_strings(found)
 
-    # read it back with the whole-file helper
-    content := fs.read(text_path)!
-    print("content: {content}")
+fn main() -> Int!:
+    work := fs.make_temp_dir("pith_fs_ops_")!
+    defer fs.remove_tree(work)
+    src := path.join(work, "src")
+    release := path.join(work, "release")
 
-    # stream the same file through std.io
-    reader := fs.open(text_path)!
-    defer reader.close()
-    streamed := reader.read_all()!
-    print("streamed: {streamed}")
+    print("wrote {write_source(src)!} source files")
+    fs.copy_tree(src, release)!
 
-    # list directory
-    entries := fs.list("/tmp")
-    tmp_has_entries := entries.len() > 0
-    print("tmp has entries: {tmp_has_entries}")
+    # drafts stay in the source tree but never ship.
+    fs.remove_tree(path.join(release, "drafts"))
+    print("draft still in source: {fs.exists(path.join(src, "drafts/launch.html"))}")
 
-    # copy into a sibling directory and inspect the file
-    fs.make_dirs(copy_root)
-    copied_path := path.join(copy_root, "data.txt")
-    fs.copy(text_path, copied_path)!
-    info := fs.info(copied_path)!
-    print("copied exists: {info.exists}")
-    print("copied size: {info.size}")
+    shipped := files_under(release)!
+    # write_atomic renames a finished temp file into place, so a reader never
+    # sees half a manifest.
+    fs.write_atomic(path.join(release, "MANIFEST"), shipped.join("\n"))!
 
-    # recursive copy keeps nested files
-    fs.copy_tree(src_root, tree_root)!
-    print("tree copy: {fs.read(path.join(path.join(tree_root, "nested"), "leaf.txt"))!}")
-
-    # temp files are handy for scratch output
-    temp_file := fs.make_temp_file("pith_fs_example_", ".txt")!
-    print("temp exists: {fs.exists(temp_file)}")
-    fs.remove(temp_file)
-
-    # clean up
-    fs.remove_tree(root)
-    removed := fs.exists(root) == false
-    print("removed: {removed}")
-    return ""
-
-fn main() -> String!:
-    do_test()!
-    return ""
+    print("release:")
+    for name in files_under(release)!:
+        size := fs.size(path.join(release, name))!
+        print("  {name:<18} {size:>3} bytes")
+    return 0

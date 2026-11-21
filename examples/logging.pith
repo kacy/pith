@@ -1,54 +1,57 @@
-# structured logging examples
-import std.log as log
-import std.metrics as metrics
+# structured logging with std.log: a checkout service logs the orders it takes.
+#
+# a logger carries context, here the service name and a target, so every line
+# a handler writes is tagged without repeating it, and each event adds typed
+# fields of its own. the console format is for people and the json format is
+# for log pipelines. lines go to stderr and to a file in a temp directory,
+# which main reads back and prints. every line starts with a timestamp, which
+# main drops so the output is the same on every run.
+
 import std.fs as fs
+import std.log as log
+import std.os.path as path
 
-fn main() -> String!:
-    path := "/tmp/pith_logging.txt"
-    fs.remove(path)
-    log.set_console()
-    log.set_level(log.debug_level())
-    log.set_file(path)
-    log.info("server starting on port 8080")
-    log.warn("cache miss rate above threshold")
-    log.error("connection refused")
-    log.debug("request payload size: 1024 bytes")
-    log.clear_file()
-    content := fs.read(path)!
-    print("file has info: {content.contains("[INFO]")}")
-    print("file has error: {content.contains("[ERROR]")}")
-    fs.remove(path)
+struct Order:
+    id: Int
+    items: Int
+    total_cents: Int
 
-    json_path := "/tmp/pith_logging_json.txt"
-    fs.remove(json_path)
-    logger := log.root().json().file(json_path).with([log.str("service", "api")]).target("http").trace_context("trace-demo", "span-demo")
-    logger.info().int("port", 8080).bool("tls", false).duration_ms("elapsed_ms", 12).msg("server started")
-    json_content := fs.read(json_path)!
-    has_message := json_content.contains("\"message\":\"server started\"")
-    has_service := json_content.contains("\"service\":\"api\"")
-    has_trace := json_content.contains("\"trace_id\":\"trace-demo\"")
-    print("json has message: {has_message}")
-    print("json has service: {has_service}")
-    print("json has trace: {has_trace}")
-    fs.remove(json_path)
+fn take_order(logger: log.Logger, order: Order):
+    # below the logger's level, so it writes nothing.
+    logger.debug().int("order", order.id).msg("validating")
+    if order.items == 0:
+        logger.warn().int("order", order.id).msg("rejected an empty order")
+        return
+    logger.info().int("order", order.id).int("items", order.items).int("total_cents", order.total_cents).msg("order accepted")
 
-    trace_id := log.new_trace_id()!
-    span_id := log.new_span_id()!
-    print("trace ids look compact: {trace_id.len() == 32 and span_id.len() == 16 and not trace_id.contains("-") and not span_id.contains("-")}")
+# console lines open with the time and a space.
+fn without_timestamp(line: String) -> String:
+    return line.substring(line.index_of(" ") + 1, line.len())
 
-    metrics.reset()
-    requests := metrics.counter("requests total")
-    inflight := metrics.gauge("requests in flight")
-    latency := metrics.histogram("request latency ms")
-    requests.inc()
-    requests.add(2.0)
-    inflight.set(1.0)
-    inflight.add(-1.0)
-    latency.observe(12.0)
-    latency.observe(30.0)
-    snapshot := metrics.snapshot_text()
-    print("metrics has counter: {snapshot.contains("requests_total 3")}")
-    print("metrics has histogram: {snapshot.contains("request_latency_ms_count 2")}")
+# json lines open with a "time" field.
+fn without_time_field(line: String) -> String:
+    return "{{" + line.substring(line.index_of(",") + 1, line.len())
 
-    print("logging works")
-    return ""
+fn main() -> Int!:
+    dir := fs.make_temp_dir("pith_logging_")!
+    defer fs.remove_tree(dir)
+    console_path := path.join(dir, "checkout.log")
+    json_path := path.join(dir, "checkout.jsonl")
+
+    base := log.root().with([log.str("service", "checkout")]).target("orders").level(log.info_level())
+    orders := [Order(id: 101, items: 3, total_cents: 4200), Order(id: 102, items: 0, total_cents: 0)]
+    for order in orders:
+        take_order(base.console().file(console_path), order)
+
+    # a pipeline wants the trace context too, so a line can be joined to the
+    # request's spans.
+    traced := base.json().file(json_path).trace_context("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7")
+    take_order(traced, Order(id: 103, items: 1, total_cents: 999))
+
+    print("console:")
+    for line in fs.read(console_path)!.trim().split("\n"):
+        print("  {without_timestamp(line)}")
+    print("json:")
+    for line in fs.read(json_path)!.trim().split("\n"):
+        print("  {without_time_field(line)}")
+    return 0

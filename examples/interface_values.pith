@@ -1,0 +1,108 @@
+# interface values: one list, many types behind an interface
+#
+# an interface name is also a type. a `List[Notifier]` holds any mix of types
+# that implement Notifier, and a call on an element runs that element's own
+# method, picked at run time. the same goes for a struct field, a map value, a
+# parameter or a return type.
+#
+# the bracketed bound `fn f[T: Notifier](n: T)` is still the other form: it is
+# compiled once per concrete type, so it suits a hot call or values that share
+# one type. the interface type suits values that really are mixed, like the
+# delivery channels below. converting a value to an interface value boxes it,
+# which costs a small allocation.
+
+interface Notifier:
+    fn channel() -> String
+    fn deliver(msg: String) -> String
+    # a default method: an impl inherits it unless it writes its own. on an
+    # interface value it dispatches like any other method.
+    fn preview(msg: String) -> String:
+        return "[{self.channel()}] {self.deliver(msg)}"
+
+struct Email:
+    address: String
+
+impl Notifier for Email:
+    fn channel() -> String:
+        return "email"
+    fn deliver(msg: String) -> String:
+        return "to {self.address}: {msg}"
+
+struct Sms:
+    number: String
+    limit: Int
+
+# a text message is cut to the carrier's limit
+impl Notifier for Sms:
+    fn channel() -> String:
+        return "sms"
+    fn deliver(msg: String) -> String:
+        if msg.len() <= self.limit:
+            return "{self.number}: {msg}"
+        return "{self.number}: {msg.substring(0, self.limit)}..."
+
+struct Pager:
+    team: String
+
+# overrides the default preview: a pager shows only the team it woke up
+impl Notifier for Pager:
+    fn channel() -> String:
+        return "pager"
+    fn deliver(msg: String) -> String:
+        return "paging {self.team}"
+    fn preview(msg: String) -> String:
+        return "[pager] {self.team} on call"
+
+# an interface value as a struct field: the rule does not care which channel
+# it fires
+struct Rule:
+    min_level: Int
+    target: Notifier
+
+# a return type: the caller gets a Notifier without knowing which struct
+# was built. each return converts its own concrete value.
+fn from_config(kind: String, arg: String) -> Notifier:
+    if kind == "sms":
+        return Sms(number: arg, limit: 16)
+    if kind == "pager":
+        return Pager(team: arg)
+    return Email(address: arg)
+
+# a parameter of interface type: one compiled function serves every channel
+fn broadcast(targets: List[Notifier], msg: String):
+    for t in targets:
+        print(t.preview(msg))
+
+# the bound form, specialized per type. an interface value satisfies its own
+# bound, so this accepts both a plain Email and a Notifier.
+fn channel_of[T: Notifier](n: T) -> String:
+    return n.channel()
+
+fn main():
+    # a literal whose type is known converts each element on its own
+    targets: List[Notifier] := [Email(address: "ops@example.com"), Sms(number: "555-0100", limit: 16), Pager(team: "storage")]
+    broadcast(targets, "disk usage at 91 percent")
+
+    print("")
+    # interface values in struct fields, built from config strings
+    rules := [Rule(min_level: 1, target: from_config("email", "log@example.com")), Rule(min_level: 2, target: from_config("sms", "555-0199")), Rule(min_level: 3, target: from_config("pager", "database"))]
+    level := 2
+    for r in rules:
+        if level >= r.min_level:
+            print("level {level} -> {r.target.deliver("replica lag")}")
+
+    print("")
+    # a map from a name to whichever channel serves it
+    by_team: Map[String, Notifier] := {"web": Email(address: "web@example.com"), "db": Pager(team: "database")}
+    for team in ["db", "web"]:
+        print("{team}: {by_team[team].channel()}")
+
+    print("")
+    print("bound on a struct: {channel_of(Email(address: "a@example.com"))}")
+    print("bound on a value: {channel_of(targets[1])}")
+
+    # not every interface can be a value. an interface with type parameters
+    # (`Source[T]`), an associated type, or a method with type parameters of
+    # its own cannot: a caller holding the value could not name the types the
+    # call needs. writing such an interface as a type is error E316; it still
+    # works as a bound (see interface_features.pith).

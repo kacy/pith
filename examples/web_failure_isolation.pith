@@ -1,0 +1,105 @@
+# failure isolation: a runtime error in a handler fails one request, not the
+# server.
+#
+# outside a server, an index out of range, a missing map key, `.value()` on
+# none, a division by zero or an integer overflow prints
+# `pith runtime error: ...` and exits. inside an http handler (std.net.http,
+# std.web, http/2) the same error fails only that request: the client gets a
+# 500 with `Connection: close`, the server logs one line on stderr naming the
+# method and path, and it goes on serving. a grpc method fails its call with
+# INTERNAL the same way.
+#
+# the 500 is a last resort for a bug. the failed handler's frames are skipped,
+# so their `defer` blocks do not run and what they held is leaked. a handler
+# should still check its input and answer 400 or 404 itself.
+#
+# the example spawns a small order service, sends it requests that each hit a
+# different runtime error, then shows it still answers. the error lines go to
+# stderr; stdout has only the statuses.
+import std.web as web
+import std.net.http as http
+
+PORT := 18107
+
+prices: Map[String, Int] := {"tea": 450, "cake": 320}
+orders := ["tea", "cake", "tea"]
+
+struct LookupError:
+    sku: String
+
+# `T!` (or `T!String`) turns a miss into an error the caller can catch: the
+# index and key errors propagate instead of stopping.
+fn price_soft(sku: String) -> Int!:
+    return prices[sku]
+
+# with a struct error type there is no LookupError to build from a miss, so
+# `prices[sku]` stops here just as it would outside a fallible function. use
+# `.get(sku)` and `fail` to make it soft.
+fn price_strict(sku: String) -> Int!LookupError:
+    return prices[sku]
+
+# the "i know it is there" form. /orders/7 is out of range.
+fn get_order(req: web.Request) -> http.HttpResponse:
+    i := parse_int(req.param("id")) catch 0
+    return http.text(200, orders[i])
+
+# checks its input the soft way: a missing sku is a 404 the handler chose
+fn get_price(req: web.Request) -> http.HttpResponse:
+    p := price_soft(req.param("sku")) catch:
+        return http.text(404, "no such item")
+    return http.text(200, "{p}")
+
+# the strict lookup stops on a missing sku, so the server answers 500
+fn get_price_strict(req: web.Request) -> http.HttpResponse:
+    p := price_strict(req.param("sku")) catch:
+        return http.text(404, "no such item")
+    return http.text(200, "{p}")
+
+# /split/tea/0 divides by zero
+fn split_bill(req: web.Request) -> http.HttpResponse:
+    ways := parse_int(req.param("ways")) catch 1
+    return http.text(200, "{prices[req.param("sku")] / ways} each")
+
+# a quantity big enough to overflow the total stops the request, where a
+# wrapped total would have been a nonsense bill
+fn total(req: web.Request) -> http.HttpResponse:
+    qty := parse_int(req.param("qty")) catch 0
+    return http.text(200, "{prices[req.param("sku")] * qty}")
+
+fn build_app() -> web.App:
+    mut app := web.new()
+    app = app.get("/orders/:id", get_order)
+    app = app.get("/price/:sku", get_price)
+    app = app.get("/strict/:sku", get_price_strict)
+    app = app.get("/split/:sku/:ways", split_bill)
+    app = app.get("/total/:sku/:qty", total)
+    return app
+
+fn serve_bg(port: Int) -> Int:
+    return build_app().listen("127.0.0.1", port) catch 0
+
+# the status and body of one request
+fn fetch(path: String) -> String:
+    resp := http.get_request("127.0.0.1", PORT, path).send() catch:
+        return "{path}: no response"
+    body := resp.body_text() catch ""
+    if resp.status == 500:
+        # the generic error page; the runtime error stays in the server log
+        return "{path}: 500"
+    return "{path}: {resp.status} {body}"
+
+fn main():
+    spawn serve_bg(PORT)
+    sleep(200) # give the listener a moment to bind
+
+    print(fetch("/orders/1"))
+    print(fetch("/orders/7")) # index out of range
+    print(fetch("/price/scone")) # T! function: caught, 404
+    print(fetch("/strict/scone")) # T!LookupError function: stops, 500
+    print(fetch("/split/tea/3"))
+    print(fetch("/split/tea/0")) # division by zero
+    print(fetch("/total/cake/2"))
+    print(fetch("/total/cake/99999999999999999")) # integer overflow
+
+    # every failure above was one request. the server is still up.
+    print(fetch("/orders/2"))

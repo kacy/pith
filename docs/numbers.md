@@ -42,6 +42,9 @@ receiver's type and return one, wrapping at 64 bits for `Int`, `UInt` and
 `UInt64`, and into the type's range for the narrow ones. when the number is
 meant to grow without bound, use `std.bigint`.
 
+`examples/overflow_wrapping.pith` uses them for a hash, a random number
+generator and a sequence number, and checks a sum before it can overflow.
+
 ## text to a number
 
 `parse_int(text)` returns `Int!String` and `parse_float(text)` returns

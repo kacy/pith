@@ -205,6 +205,9 @@ a poor general `try`.
   text stays on the server.
 - the body is the server's generic 500 page and never contains the error.
 
+`examples/web_failure_isolation.pith` sends a std.web server one request for
+each kind of runtime error and shows it still serving afterwards.
+
 ### what is logged
 
 one line on stderr:

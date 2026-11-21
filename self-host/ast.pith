@@ -158,3 +158,52 @@ pub fn append_relocated_nodes(taken: List[Node], old_start: Int) -> Int:
             type_args = type_args + shift
         nodes.push(Node(n.kind, n.value, kids, n.line, n.col, type_args))
     return shift
+
+# a from-import node's value is the module path and then the names it lists,
+# space separated: "std.math sqrt degrees as to_degrees". a name imported
+# under another name is followed by `as` and that name. `*` stands alone.
+
+## the names a from-import value lists, in order, without the module path.
+pub fn from_import_names(value: String) -> List[String]:
+    parts := value.split(" ")
+    mut names: List[String] := []
+    mut i := 1
+    while i < parts.len():
+        if parts[i].len() > 0:
+            names.push(parts[i])
+        if i + 2 < parts.len() and parts[i + 1] == "as":
+            i = i + 3
+        else:
+            i = i + 1
+    return names
+
+## the name each of from_import_names is bound under in the importing
+## module: the `as` name, or "" for a name imported under its own name.
+pub fn from_import_name_aliases(value: String) -> List[String]:
+    parts := value.split(" ")
+    mut aliases: List[String] := []
+    mut i := 1
+    while i < parts.len():
+        if i + 2 < parts.len() and parts[i + 1] == "as":
+            aliases.push(parts[i + 2])
+            i = i + 3
+        else:
+            if parts[i].len() > 0:
+                aliases.push("")
+            i = i + 1
+    return aliases
+
+# `from m import f as g` reaches f the way `import m` would, through a
+# module alias only the parser writes: every `g` the parser reads becomes
+# `<receiver>.f`, so the checker and the emitter resolve it like any other
+# module member, and g's own name never collides with an f declared here.
+
+## the module alias an imported name bound under `alias` is reached through.
+pub fn from_import_alias_receiver(alias: String) -> String:
+    return "__as_" + alias
+
+## the `as` name behind a from_import_alias_receiver spelling, or "".
+pub fn from_import_alias_of_receiver(receiver: String) -> String:
+    if receiver.starts_with("__as_"):
+        return receiver.substring(5, receiver.len())
+    return ""

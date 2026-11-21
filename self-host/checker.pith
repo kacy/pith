@@ -19,7 +19,7 @@
 
 from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
 from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
-from ast import Node, get_node, node_kind, node_value, node_child_count, node_child
+from ast import Node, get_node, node_kind, node_value, node_child_count, node_child, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
@@ -371,9 +371,9 @@ pub fn process_import_aliases(root_idx: Int):
                         if current_checker_module_path.len() > 0:
                             index_wildcard_import_source(current_checker_module_path, mod_path)
                     else:
-                        mut pi := 1
-                        while pi < parts.len():
-                            imported_name := clean_import_part(parts[pi])
+                        import_aliases := from_import_name_aliases(value)
+                        for listed_name, pi in from_import_names(value):
+                            imported_name := clean_import_part(listed_name)
                             if imported_name.len() > 0:
                                 # a phantom import (a name the source module never
                                 # declares) otherwise sails through and dies much
@@ -395,10 +395,14 @@ pub fn process_import_aliases(root_idx: Int):
                                         declared = lookup_type_id(imported_name) >= 0
                                     if declared == false:
                                         report_error_with_fix_at(child, "E246", "'" + imported_name + "' is not declared by module '" + mod_path + "'", "import it from the module that defines it")
+                                if pi < import_aliases.len() and import_aliases[pi].len() > 0:
+                                    # reached through a module alias, see
+                                    # from_import_alias_receiver
+                                    register_import_alias(from_import_alias_receiver(import_aliases[pi]), mod_path)
+                                    continue
                                 generic_named_import_entries.push(current_checker_module_path + chr(9) + imported_name + chr(9) + mod_path)
                                 if current_checker_module_path.len() > 0:
                                     index_named_import_source(current_checker_module_path + chr(9) + imported_name, mod_path)
-                            pi = pi + 1
 
 # one type argument, spelled so the spelling names the type. get_type_name
 # answers with the bare kind for every unnamed composite — "List" for every

@@ -5,7 +5,7 @@
 # a small command-line wrapper around them.
 
 from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr, interp_escape_kind, INTERP_ESCAPE_COLLAPSED, INTERP_ESCAPE_KEPT
-from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value, node_kind
+from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value, node_kind, from_import_alias_receiver
 from errors import Diagnostic
 
 # ---------------------------------------------------------------
@@ -23,6 +23,10 @@ mut parser_diag_list: List[Diagnostic] := []
 # from `x.describe[T](v)`, a method called with them: see
 # method_type_args_follow.
 mut import_aliases: Map[String, Bool] := {}
+# the names this file's from-imports bind under `as`, each to the name it
+# imports: `from std.math import degrees as to_degrees` puts `to_degrees`
+# here. parse_primary rewrites every use; see from_import_alias_receiver.
+mut from_import_renames: Map[String, String] := {}
 
 fn _cur_tok_kind() -> String:
     tc := tok_count()
@@ -368,6 +372,8 @@ fn parse_base_type() -> Int:
     if _cur_tok_kind() == "identifier":
         name_tok := advance_token()
         mut type_name := name_tok.value
+        if from_import_renames.contains_key(type_name) and not check("dot"):
+            type_name = from_import_alias_receiver(type_name) + "." + from_import_renames[type_name]
         while match_tok("dot"):
             part_tok := expect("identifier")
             type_name = type_name + "." + part_tok.value
@@ -813,6 +819,22 @@ fn parse_arg() -> Int:
     mut pos_children: List[Int] := [pos_val]
     return add_node_from_mark("arg", "", pos_children, mark)
 
+# a use of a name a from-import bound under `as`: `to_degrees(x)` is read as
+# `<receiver>.degrees(x)` and a bare `to_degrees` as `<receiver>.degrees`,
+# through the module alias from_import_alias_receiver names.
+fn parse_from_import_alias_use(alias: String) -> Int:
+    mark := current_token_position
+    advance_token()
+    recv := add_leaf_from_mark("ident", from_import_alias_receiver(alias), mark)
+    mut children: List[Int] := [recv]
+    if check("lparen"):
+        advance_token()
+        for a in parse_arg_list():
+            children.push(a)
+        expect("rparen")
+        return add_node_from_mark("method_call", from_import_renames[alias], children, mark)
+    return add_node_from_mark("field_access", from_import_renames[alias], children, mark)
+
 fn parse_primary() -> Int:
     # token via _cur_tok_kind/_cur_tok_value
 
@@ -852,6 +874,8 @@ fn parse_primary() -> Int:
 
     if _cur_tok_kind() == "identifier":
         _tv := _cur_tok_value()
+        if from_import_renames.contains_key(_tv):
+            return parse_from_import_alias_use(_tv)
         advance_token()
         return add_leaf_with_position("ident", _tv)
 
@@ -1434,6 +1458,11 @@ fn parse_pattern() -> Int:
         if check("dot"):
             advance_token()
             variant_tok := expect("identifier")
+            # a pattern names its enum bare, so an enum imported under
+            # another name is matched under its own
+            mut enum_name := type_tok.value
+            if from_import_renames.contains_key(enum_name):
+                enum_name = from_import_renames[enum_name]
 
             if check("lparen"):
                 advance_token()
@@ -1443,10 +1472,10 @@ fn parse_pattern() -> Int:
                     while match_tok("comma"):
                         fields.push(parse_pattern())
                 expect("rparen")
-                return add_node_from_mark("pat_variant", type_tok.value + "." + variant_tok.value, fields, mark)
+                return add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, fields, mark)
 
             mut empty: List[Int] := []
-            return add_node_from_mark("pat_variant", type_tok.value + "." + variant_tok.value, empty, mark)
+            return add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, empty, mark)
 
         return add_leaf_with_position("pat_binding", type_tok.value)
 
@@ -1790,6 +1819,7 @@ pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
     parser_file_path = file_path
     parser_diag_list = []
     import_aliases = {}
+    from_import_renames = {}
 
     # a lexer error token is a hard lexical error. surface every one up
     # front: statement recovery skips stray tokens to the next newline,
@@ -1849,24 +1879,10 @@ fn parse_import_decl() -> Int:
             mut parts: List[String] := [path, "*"]
             return add_leaf_with_position("from_import", parts.join(" "))
 
-        mut names: List[String] := []
-        n := expect("identifier")
-        names.push(n.value)
-        # check for alias
-        mut alias := ""
-        if match_tok("kw_as"):
-            alias_tok := expect("identifier")
-            alias = alias_tok.value
-
-        while match_tok("comma"):
-            n2 := expect("identifier")
-            names.push(n2.value)
-            if match_tok("kw_as"):
-                expect("identifier")
-
         mut parts: List[String] := [path]
-        for nm in names:
-            parts.push(nm)
+        parse_from_import_name(parts)
+        while match_tok("comma"):
+            parse_from_import_name(parts)
         return add_leaf_with_position("from_import", parts.join(" "))
 
     # import path [as alias]
@@ -1884,6 +1900,16 @@ fn parse_import_decl() -> Int:
     import_aliases.insert(alias, true)
 
     return add_leaf_with_position("import", parts.join(" "))
+
+# one `name` or `name as alias` of a from-import, appended to `parts`.
+fn parse_from_import_name(parts: List[String]):
+    n := expect("identifier")
+    parts.push(n.value)
+    if match_tok("kw_as"):
+        alias_tok := expect("identifier")
+        parts.push("as")
+        parts.push(alias_tok.value)
+        from_import_renames.insert(alias_tok.value, n.value)
 
 fn parse_dotted_path() -> String:
     first := expect("identifier")

@@ -1,49 +1,78 @@
-# enum declarations with variant data
+# enums: tag-only enums with methods, and variants that carry data.
+#
+# drives a warehouse robot around a grid. a Heading has no payload and gets
+# its behavior from methods; a Command carries whatever data its variant
+# needs, and match takes it apart. the checker rejects a match that misses
+# a variant, so adding a command means the compiler lists every place to
+# update.
 
-enum Direction:
+enum Heading:
     North
-    South
     East
+    South
     West
 
-enum Shape:
-    Circle(Float)
-    Rectangle(Float, Float)
-    Point
+impl Heading:
+    fn turn_right() -> Heading:
+        return match self:
+            Heading.North => Heading.East
+            Heading.East => Heading.South
+            Heading.South => Heading.West
+            Heading.West => Heading.North
 
-enum Result:
-    Ok(Int)
-    Err(String)
+    fn turn_left() -> Heading:
+        return self.turn_right().turn_right().turn_right()
 
-# enums are registered as types. match expressions
-# validate variant patterns and arm type agreement. an enum whose variants
-# carry no payload can have methods in an impl block.
+    # one grid step in this direction, as (dx, dy)
+    fn step() -> (Int, Int):
+        return match self:
+            Heading.North => (0, 1)
+            Heading.East => (1, 0)
+            Heading.South => (0, -1)
+            Heading.West => (-1, 0)
 
-impl Direction:
-    fn describe() -> String:
-        match self:
-            Direction.North => "up"
-            Direction.South => "down"
-            Direction.East => "right"
-            Direction.West => "left"
+    fn name() -> String:
+        return match self:
+            Heading.North => "north"
+            Heading.East => "east"
+            Heading.South => "south"
+            Heading.West => "west"
 
-# payload-carrying variants are constructed like calls on the enum type
-# and destructured in match arms.
+enum Command:
+    Forward(Int)
+    Left
+    Right
+    Jump(Int, Int)
 
-fn area(s: Shape) -> Float:
-    match s:
-        Shape.Circle(r) => 3.14 * r * r
-        Shape.Rectangle(w, h) => w * h
-        Shape.Point => 0.0
+struct Robot:
+    x: Int
+    y: Int
+    heading: Heading
 
-fn outcome(r: Result) -> String:
-    match r:
-        Result.Ok(n) => "ok: {n}"
-        Result.Err(msg) => "err: {msg}"
+fn run(robot: Robot, command: Command):
+    match command:
+        Command.Forward(steps) =>
+            step := robot.heading.step()
+            robot.x += step.0 * steps
+            robot.y += step.1 * steps
+        Command.Left =>
+            robot.heading = robot.heading.turn_left()
+        Command.Right =>
+            robot.heading = robot.heading.turn_right()
+        Command.Jump(x, y) =>
+            robot.x = x
+            robot.y = y
+
+fn describe(command: Command) -> String:
+    return match command:
+        Command.Forward(steps) => "forward {steps}"
+        Command.Left => "turn left"
+        Command.Right => "turn right"
+        Command.Jump(x, y) => "jump to ({x}, {y})"
 
 fn main():
-    print(Direction.North.describe())
-    print("circle area = {area(Shape.Circle(1.0))}")
-    print("rect area = {area(Shape.Rectangle(2.0, 3.0))}")
-    print(outcome(Result.Ok(7)))
-    print(outcome(Result.Err("nope")))
+    robot := Robot(x: 0, y: 0, heading: Heading.North)
+    program := [Command.Forward(3), Command.Right, Command.Forward(2), Command.Jump(10, 10), Command.Left, Command.Left, Command.Forward(4)]
+    for command in program:
+        run(robot, command)
+        print("{describe(command):<16} at ({robot.x}, {robot.y}) facing {robot.heading.name()}")

@@ -1,26 +1,48 @@
-# tuples: group a few values without declaring a struct
+# tuples: return a few values together without declaring a struct.
+#
+# summarizes the durations of a batch of jobs. one helper splits seconds into
+# minutes and seconds, another returns the fastest and slowest job at once,
+# and a fallible one returns a tuple inside a result.
 
-# a plain tuple return
-fn swap(a: Int, b: Int) -> (Int, Int):
-    return (b, a)
+fn split_minutes(seconds: Int) -> (Int, Int):
+    return (seconds / 60, seconds % 60)
 
-# a fallible function can return a tuple too
-fn divmod(a: Int, b: Int) -> (Int, Int)!:
-    if b == 0:
-        fail "divide by zero"
-    return (a / b, a % b)
+fn format_duration(seconds: Int) -> String:
+    parts := split_minutes(seconds)
+    return "{parts.0}m{parts.1:02}s"
+
+# the fastest and slowest job, as (name, seconds) pairs
+fn extremes(jobs: List[(String, Int)]) -> ((String, Int), (String, Int)):
+    mut fastest := jobs[0]
+    mut slowest := jobs[0]
+    for job in jobs:
+        if job.1 < fastest.1:
+            fastest = job
+        if job.1 > slowest.1:
+            slowest = job
+    return (fastest, slowest)
+
+# the average and the remainder; an empty batch has no average
+fn average(jobs: List[(String, Int)]) -> (Int, Int)!:
+    if jobs.len() == 0:
+        fail "no jobs to average"
+    mut total := 0
+    for job in jobs:
+        total += job.1
+    return (total / jobs.len(), total % jobs.len())
 
 fn main():
-    # mixed-type tuple, accessed by position
-    pair := (1, "hello")
-    print("first {pair.0}, second {pair.1}")
+    jobs := [("backup", 754), ("reindex", 1290), ("thumbnails", 95), ("report", 412)]
+    for job in jobs:
+        print("{job.0:<11} {format_duration(job.1):>7}")
 
-    swapped := swap(10, 20)
-    print("swapped {swapped.0} {swapped.1}")
+    ends := extremes(jobs)
+    fastest := ends.0
+    slowest := ends.1
+    print("fastest: {fastest.0}, slowest: {slowest.0}")
 
-    # the ok case carries the tuple; the failing case takes the fallback
-    q := divmod(17, 5) catch (0, 0)
-    print("17 / 5 = {q.0} rem {q.1}")
+    mean := average(jobs) catch (0, 0)
+    print("average: {format_duration(mean.0)} (remainder {mean.1})")
 
-    safe := divmod(1, 0) catch (-1, -1)
-    print("1 / 0 caught, quotient {safe.0}")
+    empty := average([]) catch (-1, 0)
+    print("average of an empty batch: {empty.0}")

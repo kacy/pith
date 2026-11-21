@@ -1,55 +1,61 @@
-# stdlib collection utilities via import
-import std.fmt as fmt
-from std.collections import range, sum, max_of, min_of, reversed
-from std.collections import copy_list, group_by, count_by, set_union
-from std.collections import any, find, sort_by_key, min_by, max_by
+# stdlib_collections: the generic helpers in std.collections.
+#
+# builds the weekly report for a small basketball league from a flat list of
+# player lines: team totals with group_by, the leaders with sort_by_key and
+# max_by, and a few one-line questions answered with any, find_index and
+# count_by.
+
+import std.collections as collections
 
 struct Player:
-    pub name: String
-    pub team: String
+    name: String
+    team: String
+    points: Int
+    assists: Int
+
+fn season() -> List[Player]:
+    return [
+        Player(name: "ana", team: "hawks", points: 31, assists: 4),
+        Player(name: "ben", team: "otters", points: 12, assists: 9),
+        Player(name: "cyd", team: "hawks", points: 18, assists: 7),
+        Player(name: "dee", team: "otters", points: 27, assists: 3),
+        Player(name: "eli", team: "foxes", points: 9, assists: 11),
+        Player(name: "fay", team: "foxes", points: 22, assists: 5),
+        Player(name: "gus", team: "hawks", points: 6, assists: 2),
+]
+
+fn team_points(roster: List[Player]) -> Int:
+    return collections.sum(roster.map(fn(p: Player) => p.points))
 
 fn main():
-    r := range(1, 6)
-    print("range: {fmt.join_ints(r, ", ")}")
-    print("sum: {sum(r)}")
-    print("max: {max_of(r)}")
-    print("min: {min_of(r)}")
+    players := season()
 
-    rev := reversed(r)
-    print("reversed: {fmt.join_ints(rev, ", ")}")
+    print("team totals")
+    by_team := collections.group_by(players, fn(p: Player) => p.team)
+    for team in by_team.keys().sort():
+        roster := by_team[team]
+        names := roster.map(fn(p: Player) => p.name).join(", ")
+        print("  {team:<7} {team_points(roster):>3} pts  ({names})")
 
-    nums_copy := copy_list(r)
-    nums_copy.push(6)
-    print("copy_list keeps original: {r.len()}->{nums_copy.len()}")
+    # sort_by_key sorts ascending, so the leaders sit at the end
+    print("")
+    print("top scorers")
+    leaders := collections.sort_by_key(players, fn(p: Player) => p.points)
+    for rank in 0..3:
+        leader := leaders[leaders.len() - 1 - rank]
+        print("  {rank + 1}. {leader.name} {leader.points}")
 
-    mut players: List[Player] := []
-    players.push(Player("alice", "red"))
-    players.push(Player("bob", "blue"))
-    players.push(Player("carol", "red"))
-    by_team := group_by(players, fn(player: Player) => player.team)
-    red_players := by_team["red"]
-    mut red_names: List[String] := []
-    for player in red_players:
-        red_names.push(player.name)
-    print("group_by red: {red_names.join(", ")}")
+    playmaker := collections.max_by(players, fn(p: Player) => p.assists) catch players[0]
+    print("most assists: {playmaker.name} ({playmaker.assists})")
 
-    counts := count_by(players, fn(player: Player) => player.team)
-    blue_count := counts["blue"]
-    print("count_by blue: {blue_count}")
+    print("")
+    roster_sizes := collections.count_by(players, fn(p: Player) => p.team)
+    print("hawks roster size: {roster_sizes["hawks"]}")
+    print("anyone over 30: {collections.any(players, fn(p: Player) => p.points > 30)}")
+    if let first_double = collections.find_index(players, fn(p: Player) => p.assists >= 10):
+        print("first double-digit assists: {players[first_double].name}")
 
-    print("any blue: {any(players, fn(player: Player) => player.team == "blue")}")
-
-    alice := find(players, fn(player: Player) => player.name == "alice")
-    print("find alice: {alice.ok.team}")
-
-    ranked := sort_by_key(players, fn(player: Player) => player.name.len())
-    print("sort_by_key shortest: {ranked[0].name}")
-
-    first_red := min_by(players, fn(player: Player) => player.name.len())
-    last_red := max_by(players, fn(player: Player) => player.name.len())
-    print("min_by len: {first_red.ok.name}")
-    print("max_by len: {last_red.ok.name}")
-
-    merged := set_union({"red", "blue"}, {"blue", "green"})
-    print("set_union size: {merged.len()}")
-    print("stdlib collections work")
+    # sets answer "who is in either list" without duplicates
+    all_stars := {"ana", "dee"}
+    fan_votes := {"dee", "fay"}
+    print("all-star ballot: {collections.set_union(all_stars, fan_votes).len()} players")

@@ -1,45 +1,56 @@
-# collection methods — CRUD operations
+# collection_methods: lists, maps and sets through their built-in methods.
+#
+# runs the front desk of a small conference. a set holds who registered, a
+# list holds the waitlist in arrival order, and a map gives each guest a badge.
+# collection literals build all three, and the methods do the rest.
+
+fn print_sorted(label: String, names: List[String]):
+    print("{label}: {names.sort().join(", ")}")
 
 fn main():
-    # --- list ---
-    mut numbers := [1, 2, 3, 4, 5]
-    print("list len: {numbers.len()}")
-    print("list is_empty: {numbers.is_empty()}")
-    print("list contains 3: {numbers.contains(3)}")
+    mut registered := {"ada", "grace", "linus", "barbara", "ken"}
+    mut waitlist := ["dennis", "margaret", "alan"]
+    mut badges := {"ada": "speaker", "grace": "speaker", "linus": "staff"}
 
-    numbers.remove(0)
-    print("after remove(0): len={numbers.len()}")
+    # a cancellation frees a seat, and the first person waiting takes it
+    registered.remove("barbara")
+    if let promoted = waitlist.first():
+        waitlist.remove(0)
+        registered.add(promoted)
+        badges[promoted] = "attendee"
+        print("{promoted} moves off the waitlist, {waitlist.len()} still waiting")
 
-    numbers.reverse()
-    print("after reverse: first={numbers[0]}")
+    arrivals := ["grace", "mallory", "ada", "ken", "grace", "dennis"]
+    mut inside: List[String] := []
+    for name in arrivals:
+        if not registered.contains(name):
+            print("  {name:<8} turned away, not registered")
+            continue
+        if inside.contains(name):
+            print("  {name:<8} already inside")
+            continue
+        inside.push(name)
+        print("  {name:<8} checked in as {badges.get(name).unwrap_or("attendee")}")
 
-    numbers.clear()
-    print("after clear: is_empty={numbers.is_empty()}")
+    print("")
+    print_sorted("inside", inside)
 
-    # --- map ---
-    mut ages := {"alice": 30, "bob": 25, "charlie": 35}
-    print("map len: {ages.len()}")
-    print("map contains_key alice: {ages.contains_key("alice")}")
+    mut no_shows: List[String] := []
+    for name in registered:
+        if not inside.contains(name):
+            no_shows.push(name)
+    print_sorted("no-shows", no_shows)
 
-    ages.remove("bob")
-    print("after remove bob: len={ages.len()}")
+    # the last arrival is the first to hear about the evening session
+    inside.reverse()
+    print("callback order: {inside.join(", ")}")
 
-    keys := ages.keys()
-    print("keys count: {keys.len()}")
+    speakers := badges.keys().filter(fn(name: String) => badges[name] == "speaker")
+    print_sorted("speakers", speakers)
+    print("badges printed: {badges.len()}, staff on site: {badges.values().contains("staff")}")
 
-    values := ages.values()
-    print("values count: {values.len()}")
-
-    ages.clear()
-    print("after clear: is_empty={ages.is_empty()}")
-
-    # --- set ---
-    mut tags := {"rust", "zig", "pith"}
-    print("set len: {tags.len()}")
-    print("set contains pith: {tags.contains("pith")}")
-
-    tags.remove("zig")
-    print("after remove zig: len={tags.len()}")
-
-    tags.clear()
-    print("after clear: is_empty={tags.is_empty()}")
+    # at close of day the desk hands everything back
+    waitlist.clear()
+    badges.clear()
+    registered.clear()
+    print("desk closed: {waitlist.is_empty() and badges.is_empty() and registered.is_empty()}")

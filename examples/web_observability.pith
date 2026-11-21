@@ -1,60 +1,72 @@
-# observability out of the box with std.web.
+# metrics with no instrumentation code, from std.web.
 #
-# a server built with web.new() is instrumented for free: a built-in middleware
-# records a request counter, an in-flight gauge, and a duration histogram for
-# every route, and web.new() serves GET /metrics with the prometheus text of it
-# all. there is no instrumentation code below — the greet handler just returns a
-# greeting. we spawn the server, hit /greet a few times, scrape /metrics, and
-# read the request counter straight out of the exposition text to prove it
-# counted every request on its own.
-import std.web as web
+# an app built with web.new() wraps every route in a middleware that counts
+# requests, tracks the ones in flight and times them, labeled by method, route
+# pattern and status. it also serves GET /metrics in the prometheus text
+# format. the handlers below contain no metrics code; main sends a few
+# requests and then reads the counters back the way a scraper would.
+
 import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
 
-# GET /greet?name=... — a plain handler with no metrics code of its own.
+PORT := 18099
+
 fn greet(req: web.Request) -> http.HttpResponse:
-    return http.text(200, "hi, " + req.query_or("name", "world"))
+    return http.text(200, "hi, {req.query_or("name", "world")}")
 
-# the default (observable) app: one route, plus the /healthz and /metrics that
-# web.new() sets up for you.
+fn order(req: web.Request) -> http.HttpResponse:
+    id := parse_int(req.param("id")) catch:
+        return http.bad_request_response()
+    return http.text(200, "order {id}")
+
 fn build_app() -> web.App:
-    return web.new().get("/greet", greet)
+    mut app := web.new()
+    app = app.get("/greet", greet)
+    app = app.get("/orders/:id", order)
+    return app
 
-# run the server in the background so main can act as a client against it.
-fn serve_bg(port: Int) -> Int:
+fn serve(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
-# fetch a path and return just the response body, so we can print it.
-fn fetch(port: Int, path: String) -> String:
-    resp := http.get_request("127.0.0.1", port, path).send() catch:
-        return "no response"
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
+
+fn fetch(path: String) -> String:
+    resp := http.get_request("127.0.0.1", PORT, path).send() catch:
+        return ""
     return resp.body_text() catch ""
 
-# pull the value of the request-counter series whose labels contain `marker` out
-# of the prometheus text: find its line and return whatever follows "} ".
-fn counter_value(metrics_text: String, marker: String) -> String:
-    for line in metrics_text.split("\n"):
-        if line.starts_with("http_server_requests_total{{") and line.contains(marker):
-            close := line.index_of("}} ")
-            if close >= 0:
-                return line.substring(close + 2, line.len())
-    return "?"
+# the value of the request counter whose labels are exactly `labels`.
+fn request_count(metrics: String, labels: String) -> String:
+    series := "http_server_requests_total{{{labels}}} "
+    for line in metrics.split("\n"):
+        if line.starts_with(series):
+            return line.substring(series.len(), line.len())
+    return "0"
 
 fn main() -> Int!:
-    port := 18099
-    spawn serve_bg(port)
-    sleep(200)   # give the listener a moment to bind
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
 
-    # three requests to the same route — no instrumentation code anywhere.
-    mut last := ""
-    mut i := 0
-    while i < 3:
-        last = fetch(port, "/greet?name=ada")
-        i = i + 1
-    print("last response: " + last)
+    for name in ["ada", "grace", "edsger"]:
+        print(fetch("/greet?name={name}"))
+    for id in ["17", "18", "nineteen"]:
+        print(fetch("/orders/{id}"))
 
-    # scrape the endpoint web.new() serves for free and read the counter back.
-    metrics_text := fetch(port, "/metrics")
-    marker := "route=\"/greet\""
-    print("/metrics served: " + metrics_text.contains("# TYPE http_server_requests_total counter").to_string())
-    print("requests to /greet: " + counter_value(metrics_text, marker))
+    # the route label is the pattern, so /orders/17 and /orders/18 are one
+    # series and the label set stays small however many orders there are.
+    metrics := fetch("/metrics")
+    print("")
+    print("GET /greet 200:       {request_count(metrics, "method=\"GET\",route=\"/greet\",status=\"200\"")}")
+    print("GET /orders/:id 200:  {request_count(metrics, "method=\"GET\",route=\"/orders/:id\",status=\"200\"")}")
+    print("GET /orders/:id 400:  {request_count(metrics, "method=\"GET\",route=\"/orders/:id\",status=\"400\"")}")
     return 0

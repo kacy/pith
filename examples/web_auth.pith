@@ -1,70 +1,66 @@
 # password login and jwt-protected routes with std.web.
 #
-# the whole flow in one process: the login route checks an argon2id hash and
-# issues a token from the claims builder, and a group() guard verifies the
-# Authorization header for everything under /api. the client logs in, calls
-# a protected route, and shows what a missing, tampered and wrong-secret
-# token each get back.
+# POST /login checks an argon2id hash and issues a signed token. everything
+# under /api sits behind a group() guard that verifies the Authorization
+# header. the client logs in, calls a protected route, and shows what a
+# missing, tampered or wrongly signed token gets back.
 #
-# the guard is the part worth copying: it names the one algorithm it
-# accepts (the token's own header never picks the verifier), answers 401
-# from a catch block when anything fails, and hands the verified subject to
-# handlers on the request itself.
+# the guard is the part worth copying. it names the one algorithm it accepts,
+# so the token's own header never picks the verifier; any failure is a 401
+# from a catch block; and the verified subject reaches the handlers on the
+# request itself.
 
 import std.bytes as bytes
 import std.crypto.jwt as jwt
 import std.crypto.password as password
 import std.json as json
 import std.net.http as http
+import std.net.tcp as tcp
 import std.web as web
 
 PORT := 18093
 ISSUER := "example-auth"
 AUDIENCE := "example-api"
+PASSPHRASE := "correct horse battery staple"
 
-# in a real service this is a database row; the phc string carries its own
-# salt and parameters, so one column holds everything verify needs. a plain
-# module global, because every serving task must see the hash main wrote.
+# in a real service this is a database row. the phc string carries its own
+# salt and parameters, so one column holds everything verify needs. it is a
+# plain module global because every serving task must see the hash main wrote.
 mut stored_hash: String := ""
 
-# the hmac secret would come from the environment. it must be long enough
-# that guessing it is not easier than forging the signature.
+# the hmac secret comes from the environment in a real service. it must be
+# long enough that guessing it is no easier than forging a signature.
 fn signing_secret() -> Bytes:
     return bytes.from_string_utf8("an hs256 secret kept out of the repo, 32+ bytes of it")
 
 fn expected_claims() -> jwt.Options:
     return jwt.with_audience(jwt.with_issuer(jwt.default_options(), ISSUER), AUDIENCE)
 
-# POST /login: check the password, mint a one-hour token for the subject.
+fn issue_token(subject: String, secret: Bytes) -> String!:
+    return jwt.claims().issuer(ISSUER).audience(AUDIENCE).subject(subject).expires_in(3600).sign_hs256(secret)!
+
 fn handle_login(req: web.Request) -> http.HttpResponse:
     body := req.raw.body_json() catch:
         return http.bad_request_response()
-    user := json.get_string(json.object_get(body, "username"))
-    attempt := json.get_string(json.object_get(body, "password"))
-
-    # verify is deliberately a Bool: an unparseable stored hash counts as a
-    # failed login, never as an error a handler might read as "fine".
+    user := json.object_get_string(body, "username")
+    attempt := json.object_get_string(body, "password")
+    # verify returns a Bool: an unparseable stored hash is a failed login,
+    # never an error a handler might mistake for success.
     if user != "ada" or not password.verify(attempt, stored_hash):
         return http.unauthorized_response()
-
-    token := jwt.claims().issuer(ISSUER).audience(AUDIENCE).subject(user).expires_in(3600).sign_hs256(signing_secret()) catch:
+    token := issue_token(user, signing_secret()) catch:
         return http.server_error_response()
     return http.response(200).json_body(json.of("token", token))
 
-# the guard for everything under /api. it names the one algorithm it will
-# accept — the token's own header is never allowed to choose — and the
-# subject rides the request down to the handlers.
 fn require_token(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
     token := req.raw.bearer_token() catch:
         return http.unauthorized_response()
-    # the verify error says what failed (signature, expiry, audience...) —
-    # worth logging server-side, never worth echoing to the caller.
-    session := jwt.verify_hs256(token, signing_secret(), expected_claims()) catch:
+    # the verify error says what failed (signature, expiry, audience). that is
+    # worth logging on the server and never worth echoing to the caller.
+    claims := jwt.verify_hs256(token, signing_secret(), expected_claims()) catch:
         return http.unauthorized_response()
-    return next(req.with_value("user", session.subject()))
+    return next(req.with_value("user", claims.subject()))
 
-# a protected route: the guard has already verified the token and attached
-# the caller's subject to the request.
 fn handle_me(req: web.Request) -> http.HttpResponse:
     return http.response(200).json_body(json.of("user", req.value("user")))
 
@@ -75,49 +71,55 @@ fn build_app() -> web.App:
     app = app.get("/api/me", handle_me)
     return app
 
-fn serve_bg(port: Int) -> Int:
+fn serve(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
-fn login(port: Int, username: String, attempt: String) -> String!:
-    body := json.of_map({"username": username, "password": attempt})
-    resp := http.post_request("127.0.0.1", port, "/login").json_body(body).send()!
-    if resp.status != 200:
-        fail "login refused"
-    return json.get_string(json.object_get(resp.body_json()!, "token"))
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
 
-fn get_me(port: Int, token: String) -> String!:
-    mut req := http.get_request("127.0.0.1", port, "/api/me")
+fn login(attempt: String) -> http.HttpResponse!:
+    body := json.of_map({"username": "ada", "password": attempt})
+    return http.post_request("127.0.0.1", PORT, "/login").json_body(body).send()!
+
+fn call_me(label: String, token: String):
+    mut req := http.get_request("127.0.0.1", PORT, "/api/me")
     if token.len() > 0:
         req = req.bearer(token)
-    resp := req.send()!
-    if resp.status != 200:
-        return resp.status.to_string()
-    return resp.status.to_string() + " user=" + json.get_string(json.object_get(resp.body_json()!, "user"))
+    resp := req.send() catch:
+        print("{label}: no response")
+        return
+    print("{label} -> {resp.status} {resp.body_text() catch ""}")
+
+# flip the first character of the signature: the same claims under a
+# signature that no longer matches them.
+fn tamper(token: String) -> String:
+    cut := token.last_index_of(".") + 1
+    replacement := if token[cut] == "A": "B" else: "A"
+    return token.substring(0, cut) + replacement + token.substring(cut + 1, token.len())
 
 fn main() -> Int!:
-    # "register" the one user before serving. ~30ms of argon2id, once.
-    stored_hash = password.hash("correct horse battery staple")!
+    # register the one user before serving: about 30 ms of argon2id, once.
+    stored_hash = password.hash(PASSPHRASE)!
 
-    port := PORT
-    spawn serve_bg(port)
-    sleep(200)   # give the listener a moment to bind
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
 
-    print("wrong password: " + ((login(port, "ada", "guess") catch "") == "").to_string())
-    token := login(port, "ada", "correct horse battery staple")!
-    print("login issued a token: " + (token.split(".").len() == 3).to_string())
+    print("login, wrong password -> {login("guess")!.status}")
+    granted := login(PASSPHRASE)!
+    token := json.object_get_string(granted.body_json()!, "token")
+    print("login, right password -> {granted.status}, a token of {token.split(".").len()} parts")
 
-    print("no token: " + (get_me(port, "") catch "no response"))
-    print("with token: " + (get_me(port, token) catch "no response"))
-
-    # flip the first character of the signature: same claims, dead signature.
-    cut := token.last_index_of(".") + 1
-    mut swapped := "A"
-    if token[cut] == "A":
-        swapped = "B"
-    tampered := token.substring(0, cut) + swapped + token.substring(cut + 1, token.len())
-    print("tampered token: " + (get_me(port, tampered) catch "no response"))
-
-    # a token signed with a different secret fails the same way.
-    forged := jwt.claims().issuer(ISSUER).audience(AUDIENCE).subject("mallory").expires_in(3600).sign_hs256(bytes.from_string_utf8("some other secret, also 32 bytes or more!"))!
-    print("wrong secret: " + (get_me(port, forged) catch "no response"))
+    print("")
+    call_me("no token", "")
+    call_me("the issued token", token)
+    call_me("tampered signature", tamper(token))
+    call_me("signed with another secret", issue_token("mallory", bytes.from_string_utf8("some other secret, also 32 bytes or more!"))!)
     return 0

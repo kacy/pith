@@ -1,8 +1,8 @@
 # retry, rate limiting, and circuit breaking with std.resilience.
 #
 # these are the pieces a service composes around anything that can fail or
-# flood. the same retry curve backs off every retry loop in std — otlp
-# exports, tcp accept failures, grpc unary retries — and std.web wraps the
+# flood. the same retry curve backs off every retry loop in std (otlp
+# exports, tcp accept failures, grpc unary retries), and std.web wraps the
 # limiter and breaker into middleware (web.rate_limit, web.circuit), so the
 # behavior shown here standalone is exactly what a served app gets.
 
@@ -10,7 +10,7 @@ import std.resilience as resilience
 
 mut fetch_calls := 0
 
-# a dependency that fails twice and then recovers — the shape retries exist
+# a dependency that fails twice and then recovers: the shape retries exist
 # for.
 fn fetch_report() -> String!:
     fetch_calls = fetch_calls + 1
@@ -41,14 +41,10 @@ fn main() -> Int!:
     # fourth call is denied, and the bucket refills as time passes.
     limiter := resilience.rate_limiter(100, 3)
     mut allowed := 0
-    mut denied := 0
-    mut i := 0
-    while i < 4:
+    for call in 0..4:
         if limiter.allow():
             allowed = allowed + 1
-        else:
-            denied = denied + 1
-        i = i + 1
+    denied := 4 - allowed
     print("burst of 4: {allowed} allowed, {denied} denied")
     sleep(30)
     print("after refill: allowed={limiter.allow()}")

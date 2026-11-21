@@ -317,12 +317,12 @@ answer without building the body. `Allow` lists `HEAD` wherever it lists
 
 a handler can send its body as it is produced, which suits server-sent events and
 large downloads. return `http.stream_response` with the head and a function that
-writes the pieces:
+writes the pieces to the `io.BytesWriter` it is given:
 
 ```pith
-fn ticks(write: fn(Bytes) -> Int!) -> Int!:
+fn ticks(out: io.BytesWriter) -> Int!:
     for i in 0..3:
-        write(bytes.from_string_utf8("tick {i}\n"))!
+        out.write_bytes(bytes.from_string_utf8("tick {i}\n"))!
     return 0
 
 fn feed(req: web.Request) -> http.HttpResponse:

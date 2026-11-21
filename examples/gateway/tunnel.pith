@@ -9,6 +9,7 @@
 # a tls upstream is not tunnelled; the route answers 501 for an upgrade to one.
 
 import std.bytes as bytes
+import std.io as io
 import std.net.http as http
 import std.web as web
 
@@ -38,27 +39,24 @@ pub fn open(host: String, port: Int, target: String, headers: Map[String, String
     if sent.is_err:
         tcp_close(fd)
         return http.response(502).text_body("upstream unavailable")
-    return http.take_connection(fn(read: fn(Int) -> Bytes!, write: fn(Bytes) -> Int!) -> Int! => carry(fd, read, write))
+    upstream := io.from_fd(fd)
+    return http.take_connection(fn(client: io.BytesReader, reply: io.BytesWriter) -> Int! => carry(upstream, client, reply))
 
 # copy client to upstream on this task and upstream to client on another, until
 # the client closes; closing the upstream then ends the other direction.
-fn carry(fd: Int, read: fn(Int) -> Bytes!, write: fn(Bytes) -> Int!) -> Int!:
-    back := spawn upstream_to_client(fd, write)
-    while true:
-        got := read(TUNNEL_READ_BYTES) catch bytes.empty()
-        if got.is_empty():
-            break
-        if tcp_write_bytes(fd, got).is_err:
-            break
-    tcp_close(fd)
+fn carry(upstream: io.TcpStream, client: io.BytesReader, reply: io.BytesWriter) -> Int!:
+    back := spawn pipe(upstream, reply)
+    pipe(client, upstream)
+    upstream.close()
     await back
     return 0
 
-fn upstream_to_client(fd: Int, write: fn(Bytes) -> Int!) -> Int:
+# copy what `src` reads to `dst` until either one ends or fails.
+fn pipe(src: io.BytesReader, dst: io.BytesWriter) -> Int:
     while true:
-        got := tcp_read_bytes(fd, TUNNEL_READ_BYTES) catch bytes.empty()
+        got := src.read_bytes(TUNNEL_READ_BYTES) catch bytes.empty()
         if got.is_empty():
             return 0
-        if write(got).is_err:
+        if dst.write_bytes(got).is_err:
             return 0
     return 0

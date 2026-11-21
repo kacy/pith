@@ -12,7 +12,7 @@ import std.html as html
 greeting := "<h1>hello, " + html.escape(name) + "</h1>"
 ```
 
-`examples/http_server.pith` and `examples/http_websocket_app.pith` both render
+`examples/http_api.pith` and `examples/http_websocket_app.pith` both render
 a query parameter and both go through here.
 
 ## escape

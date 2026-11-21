@@ -7,11 +7,11 @@
 # server asks for a certificate too, verifies the chain the client sends against
 # a bundle of its own, and checks the client's signature over the handshake
 # transcript before the connection carries a byte of application data. what the
-# server gets out of it is an identity — the subject of a certificate one of its
-# own certificate authorities issued — instead of an ip address.
+# server gets out of it is an identity, the subject of a certificate one of its
+# own certificate authorities issued, instead of an ip address.
 #
 # these two peers negotiate tls 1.3, and the same three configurations work
-# unchanged over the 1.2 fallback — a `require_tls12()` on the client config
+# unchanged over the 1.2 fallback: a `require_tls12()` on the client config
 # runs the whole file through the 1.2 handshake with the same output.
 #
 # three configurations appear below, and they are the three worth knowing:
@@ -38,7 +38,7 @@ CLIENT_CERT := "tests/live/fixtures/clientcert-rsa.crt"
 CLIENT_KEY := "tests/live/fixtures/clientcert-rsa.key"
 
 # a certificate from an issuer this server's bundle does not contain. it is
-# well formed and correctly signed — by the wrong authority.
+# well formed and correctly signed, by the wrong authority.
 OTHER_CERT := "tests/live/fixtures/clientcert-rogue.crt"
 OTHER_KEY := "tests/live/fixtures/clientcert-rogue.key"
 
@@ -60,11 +60,11 @@ fn serve(listener: tls.Listener, out: Channel[String]):
     state := conn.state()
     mut who := "an unauthenticated client"
     if state.client_auth_verified:
-        who = state.peer_common_name + " (issued by " + state.peer_issuer_common_name + ")"
+        who = "{state.peer_common_name} (issued by {state.peer_issuer_common_name})"
     request := conn.read(64) catch ""
-    conn.write_all("hello, " + who) catch 0
+    conn.write_all("hello, {who}") catch 0
     conn.close()
-    out.send("    server: " + request + " from " + who)
+    out.send("    server: {request} from {who}")
 
 # one exchange: stand the server up on `server_cfg`, dial it with `client_cfg`,
 # and report both halves.
@@ -82,12 +82,12 @@ fn exchange(title: String, server_cfg: tls.Config, client_cfg: tls.Config):
 
     r := tls.dial_with_config("127.0.0.1", PORT, "localhost", client_cfg)
     if r.is_err:
-        print("    client: refused while shaking hands (" + r.err + ")")
+        print("    client: refused while shaking hands ({r.err})")
     else:
         conn := r.ok
         # on tls 1.3 the server checks the client's certificate after the
         # client's half of the handshake is done, so a refusal arrives on the
-        # first read rather than as a failed dial — as the server's alert when
+        # first read rather than as a failed dial: as the server's alert when
         # it gets there first, and as a closed socket when the reset beats it.
         # on the 1.2 fallback the dial itself fails. either way the connection
         # carries no application data, which is the part that matters.
@@ -99,7 +99,7 @@ fn exchange(title: String, server_cfg: tls.Config, client_cfg: tls.Config):
                 answer = read.ok
             else:
                 answer = "refused after the handshake"
-        print("    client: " + answer)
+        print("    client: {answer}")
         conn.close()
     if let line = out.recv():
         print(line)
@@ -112,7 +112,7 @@ fn requiring_server() -> tls.Config!:
     return tls.server_config(SERVER_CERT, SERVER_KEY)!.require_client_ca_file(CLIENT_CA)
 
 # a server that asks, and serves a client that has nothing to show. a
-# certificate that IS presented is verified either way — optional means the
+# certificate that IS presented is verified either way: optional means the
 # client may decline, not that a bad certificate is waved through.
 fn requesting_server() -> tls.Config!:
     return tls.server_config(SERVER_CERT, SERVER_KEY)!.request_client_ca_file(CLIENT_CA)

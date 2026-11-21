@@ -14,7 +14,7 @@ fn signing_secret() -> Bytes:
 fn register(secret: String) -> String!:
     # the defaults are owasp's argon2id parameters, around 30 ms per hash.
     stored := password.hash(secret)!
-    print("stored hash starts: " + stored.substring(0, 30))
+    print("stored hash starts: {stored.substring(0, 30)}")
     return stored
 
 fn log_in(attempt: String, stored: String) -> Bool:
@@ -27,33 +27,33 @@ fn issue(subject: String) -> String!:
 fn main() -> Int!:
     print("=== registering ===")
     stored := register("correct horse battery staple")!
-    print("right password: " + log_in("correct horse battery staple", stored).to_string())
-    print("wrong password: " + log_in("correct horse battery stapler", stored).to_string())
+    print("right password: {log_in("correct horse battery staple", stored)}")
+    print("wrong password: {log_in("correct horse battery stapler", stored)}")
 
     print("")
     print("=== raising the cost later ===")
     # a year on, the same hash checked against parameters that have moved.
     stronger := password.params(65536, 3, 4)
-    print("needs rehashing: " + password.needs_rehash(stored, stronger).to_string())
-    print("still fine today: " + password.needs_rehash(stored, password.default_params()).to_string())
+    print("needs rehashing: {password.needs_rehash(stored, stronger)}")
+    print("still fine today: {password.needs_rehash(stored, password.default_params())}")
 
     print("")
     print("=== issuing a session token ===")
     token := issue("u-1024")!
-    print("token fields: " + token.split(".").len().to_string())
+    print("token fields: {token.split(".").len()}")
 
     # the verifier names its algorithm and what it expects to find inside. it
     # never reads the algorithm off the token, which is what stops an attacker
     # re-signing one and choosing the verification path for you.
     expected := jwt.with_audience(jwt.with_issuer(jwt.default_options(), "pith-chat"), "chat")
     session := jwt.verify_hs256(token, signing_secret(), expected)!
-    print("subject: " + session.subject())
+    print("subject: {session.subject()}")
 
     print("")
     print("=== what gets turned away ===")
-    print("wrong secret: " + jwt.verify_hs256(token, bytes.from_string_utf8("guess"), expected).is_err.to_string())
-    print("wrong audience: " + jwt.verify_hs256(token, signing_secret(), jwt.with_audience(jwt.default_options(), "billing")).is_err.to_string())
-    print("expired two hours on: " + jwt.verify_hs256(token, signing_secret(), jwt.at_time(jwt.default_options(), time.unix() + 7200)).is_err.to_string())
+    print("wrong secret: {jwt.verify_hs256(token, bytes.from_string_utf8("guess"), expected).is_err}")
+    print("wrong audience: {jwt.verify_hs256(token, signing_secret(), jwt.with_audience(jwt.default_options(), "billing")).is_err}")
+    print("expired two hours on: {jwt.verify_hs256(token, signing_secret(), jwt.at_time(jwt.default_options(), time.unix() + 7200)).is_err}")
     # an HS256 token is refused by the rs256 path on its alg header alone.
-    print("hs256 token, rs256 verifier: " + jwt.verify_rs256(token, signing_secret(), expected).is_err.to_string())
+    print("hs256 token, rs256 verifier: {jwt.verify_rs256(token, signing_secret(), expected).is_err}")
     return 0

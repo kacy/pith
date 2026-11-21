@@ -1,29 +1,40 @@
-# stdlib_import.pith — test importing from std modules and using builtins
+# builtins and the standard library: what needs an import and what does not.
 #
-# Most math functions are builtins (no import needed):
-#   abs, min, max, clamp, pow, sqrt, floor, ceil, round
-#
-# std.math provides constants and helpers:
-from std.math import PI, E
+# compares savings plans. the common numeric helpers (abs, min, max, clamp,
+# pow, sqrt, floor, ceil, round) are builtins and need no import. anything
+# else comes from a std module, here the constant E from std.math for
+# interest compounded continuously, and std.fmt for printing a list.
+
+from std.math import E
+import std.fmt as fmt
+
+fn compound(principal: Float, rate: Float, periods_per_year: Int, years: Int) -> Float:
+    per_year := periods_per_year.to_float()
+    return principal * pow(1.0 + rate / per_year, per_year * years.to_float())
+
+fn continuous(principal: Float, rate: Float, years: Int) -> Float:
+    return principal * pow(E(), rate * years.to_float())
 
 fn main():
-    # integer builtins
-    print("abs(-5) = {abs(-5)}")
-    print("abs(3) = {abs(3)}")
-    print("min(3, 7) = {min(3, 7)}")
-    print("max(3, 7) = {max(3, 7)}")
-    print("clamp(15, 0, 10) = {clamp(15, 0, 10)}")
-    print("clamp(-3, 0, 10) = {clamp(-3, 0, 10)}")
-    print("clamp(5, 0, 10) = {clamp(5, 0, 10)}")
+    principal := 10000.0
+    rate := 0.05
+    years := 10
 
-    # float builtins
-    print("pow(2.0, 10.0) = {pow(2.0, 10.0)}")
-    print("sqrt(144.0) = {sqrt(144.0)}")
-    print("floor(3.7) = {floor(3.7)}")
-    print("ceil(3.2) = {ceil(3.2)}")
-    print("round(3.5) = {round(3.5)}")
-    print("round(3.4) = {round(3.4)}")
+    yearly := compound(principal, rate, 1, years)
+    monthly := compound(principal, rate, 12, years)
+    always := continuous(principal, rate, years)
+    print("yearly       {yearly:.2}")
+    print("monthly      {monthly:.2}")
+    print("continuously {always:.2}")
 
-    # constants from std.math
-    print("PI = {fmt_float(PI(), 5)}")
-    print("E = {fmt_float(E(), 5)}")
+    # whole currency units: round to nearest, or always down, or always up
+    print("rounded {round(monthly)}, floor {floor(monthly)}, ceil {ceil(monthly)}")
+
+    # the gap between the best and worst plan, in whole units
+    best := max(round(always).to_int(), round(yearly).to_int())
+    worst := min(round(always).to_int(), round(yearly).to_int())
+    print("best minus worst: {abs(worst - best)}")
+
+    # a risk score from the plan length, kept on a 1 to 5 scale
+    scores := [3, 10, 25].map(fn(plan_years: Int) => clamp(plan_years / 5, 1, 5))
+    print("risk scores for 3, 10 and 25 years: {fmt.ints(scores)}")

@@ -11,8 +11,8 @@ import std.concurrent as concurrent
 import std.os.process as process
 
 fn main() -> Int!:
-    # arguments go to the program as they are: no shell, so no quoting. the
-    # error type is ExitError rather than a string, so it is caught here.
+    # the arguments reach the program unchanged, since no shell parses them.
+    # the error type is ExitError rather than a string, so it is caught here.
     version := process.command("printf").args(["%s", "release 1.4.2"]).text_trimmed() catch:
         fail "could not read the version"
     print("building {version}")

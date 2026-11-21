@@ -1,26 +1,65 @@
-# method calls via impl blocks
+# methods: functions attached to a type with an impl block.
+#
+# a shopping cart that adds items, applies a coupon and prints a receipt.
+# inside a method, `self` is the value the method was called on. a method
+# that assigns to a field of self changes that value for every holder,
+# since structs are reference values.
 
-struct Point:
-    pub x: Int
-    pub y: Int
+struct Item:
+    name: String
+    cents: Int
+    quantity: Int
 
-impl Point:
-    fn distance_from_origin() -> Int:
-        return self.x + self.y
+impl Item:
+    fn subtotal() -> Int:
+        return self.cents * self.quantity
 
-    fn translate(dx: Int, dy: Int) -> Point:
-        return Point(self.x + dx, self.y + dy)
+struct Cart:
+    items: List[Item]
+    discount_percent: Int = 0
 
-interface Display:
-    fn show(x: String) -> String
+impl Cart:
+    # adding an item already in the cart raises its quantity instead
+    fn add(name: String, cents: Int, quantity: Int):
+        for item in self.items:
+            if item.name == name:
+                item.quantity += quantity
+                return
+        self.items.push(Item(name: name, cents: cents, quantity: quantity))
 
-impl Display for Point:
-    fn show(x: String) -> String:
-        return x
+    fn apply_coupon(code: String) -> Bool:
+        if code != "SPRING10":
+            return false
+        self.discount_percent = 10
+        return true
+
+    fn subtotal() -> Int:
+        return self.items.reduce(0, fn(sum: Int, item: Item) => sum + item.subtotal())
+
+    fn total() -> Int:
+        return self.subtotal() - self.subtotal() * self.discount_percent / 100
+
+    fn receipt() -> List[String]:
+        mut lines: List[String] := []
+        for item in self.items:
+            lines.push("{item.quantity} x {item.name:<10} {money(item.subtotal()):>8}")
+        if self.discount_percent > 0:
+            lines.push("discount {self.discount_percent}%")
+        lines.push("total {money(self.total()):>17}")
+        return lines
+
+fn money(cents: Int) -> String:
+    return "{cents / 100}.{cents % 100:02}"
 
 fn main():
-    point := Point(3, 4)
-    distance := point.distance_from_origin()
-    translated_point := point.translate(1, 2)
-    display_result := point.show("hello")
-    print(display_result)
+    cart := Cart(items: [])
+    cart.add("coffee", 1250, 1)
+    cart.add("mug", 899, 2)
+    cart.add("coffee", 1250, 1)
+
+    for code in ["FREESTUFF", "SPRING10"]:
+        outcome := if cart.apply_coupon(code): "applied" else: "rejected"
+        print("coupon {code}: {outcome}")
+
+    for line in cart.receipt():
+        print(line)

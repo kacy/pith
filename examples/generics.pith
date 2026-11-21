@@ -1,183 +1,107 @@
-# generic structs and enums
+# generics: structs, enums and functions written once for any element type.
+#
+# a few catalog helpers, pagination, search and price lists, used on two
+# unrelated product types. type arguments are inferred from the arguments
+# at each call; a bound such as `T: Priced` says which methods the body may
+# call on a T, and each type a function is used with gets its own compiled
+# copy.
 
-struct Pair[A, B]:
-    pub first: A
-    pub second: B
+interface Priced:
+    fn cents() -> Int
 
-struct Box[T]:
-    pub value: T
+interface Named:
+    fn label() -> String
 
-enum Option[T]:
-    Some(T)
-    None
+struct Book:
+    title: String
+    price: Int
 
-enum Either[L, R]:
-    Left(L)
-    Right(R)
+impl Priced for Book:
+    fn cents() -> Int:
+        return self.price
 
-# generic types are instantiated with concrete type arguments.
-# each unique combination produces a separate concrete type.
+impl Named for Book:
+    fn label() -> String:
+        return self.title
 
-fn show_pair(p: Pair[Int, String]) -> String:
-    return "({p.first}, {p.second})"
+struct Coffee:
+    origin: String
+    grams: Int
+    cents_per_100g: Int
 
-fn show_box(b: Box[Float]) -> String:
-    return "box of {b.value}"
+impl Priced for Coffee:
+    fn cents() -> Int:
+        return self.grams * self.cents_per_100g / 100
 
-# generic functions — type args are inferred from call-site arguments.
-# no need to write identity[Int](42), just identity(42).
+impl Named for Coffee:
+    fn label() -> String:
+        return "{self.origin} {self.grams}g"
 
-fn identity[T](x: T) -> T:
-    return x
+# a generic struct, and a generic enum
+struct Page[T]:
+    number: Int
+    items: List[T]
 
-fn second[A, B](x: A, y: B) -> B:
-    return y
+enum Lookup[T]:
+    Found(T)
+    Missing(String)
 
-# interface bounds constrain which types can be used as type arguments.
-# fn show[T: Display](x: T) means T must implement Display.
+impl Page:
+    # a method can take type parameters of its own: T comes from the page,
+    # U from the function passed in
+    fn map[U](convert: fn(T) -> U) -> Page[U]:
+        return Page(number: self.number, items: self.items.map(convert))
 
-interface Display:
-    fn show(x: String) -> String
+fn paginate[T](items: List[T], size: Int) -> List[Page[T]]:
+    mut pages: List[Page[T]] := []
+    for item, index in items:
+        if index % size == 0:
+            pages.push(Page(number: pages.len() + 1, items: []))
+        pages[pages.len() - 1].items.push(item)
+    return pages
 
-interface Hash:
-    fn hash(x: String) -> Int
+fn find[T](items: List[T], matches: fn(T) -> Bool, wanted: String) -> Lookup[T]:
+    for item in items:
+        if matches(item):
+            return Lookup.Found(item)
+    return Lookup.Missing(wanted)
 
-struct Point:
-    pub x: Int
-    pub y: Int
+fn total[T: Priced](items: List[T]) -> Int:
+    return items.reduce(0, fn(sum: Int, item: T) => sum + item.cents())
 
-impl Display for Point:
-    fn show(x: String) -> String:
-        return "point"
+# two bounds, written in a where clause, which reads better as they grow
+fn price_list[T](items: List[T]) -> List[String] where T: Priced + Named:
+    return items.map(fn(item: T) => "{item.label():<18} {money(item.cents()):>6}")
 
-impl Hash for Point:
-    fn hash(x: String) -> Int:
-        return 0
-
-# bounded generic function — T must implement Display
-fn show[T: Display](x: T) -> String:
-    return "shown"
-
-# multiple bounds — T must implement both Display and Hash
-fn show_and_hash[T: Display + Hash](x: T) -> String:
-    return "shown and hashed"
-
-# bounded generic struct — T must implement Display
-struct Wrapper[T: Display]:
-    pub value: T
-
-# a generic function can take an optional parameter alongside its type
-# parameter. every call site shares one specialization, and each reads the
-# optional from the declaration, so a literal `none` and a real `Int?` at
-# different call sites both answer correctly.
-fn label[T](tag: T, count: Int?) -> String:
-    if count == none:
-        return "{tag}: unknown"
-    return "{tag}: {count.unwrap_or(0)}"
+fn money(cents: Int) -> String:
+    return "{cents / 100}.{cents % 100:02}"
 
 fn main():
-    p: Pair[Int, String] := Pair(1, "hello")
-    b: Box[Float] := Box(3.14)
-    print("pair {show_pair(p)}")
-    print("{show_box(b)}")
+    books := [
+        Book(title: "the pith book", price: 3900),
+        Book(title: "systems notes", price: 2450),
+        Book(title: "small servers", price: 1800),
+    ]
+    coffee := [
+        Coffee(origin: "kenya", grams: 250, cents_per_100g: 640),
+        Coffee(origin: "peru", grams: 1000, cents_per_100g: 410),
+    ]
 
-    # generic function calls — T is inferred from the arguments
-    print("identity int {identity(42)}")
-    print("identity str {identity("hello")}")
-    print("second {second(1, "world")}")
+    for line in price_list(books):
+        print(line)
+    for line in price_list(coffee):
+        print(line)
+    print("books {money(total(books))}, coffee {money(total(coffee))}")
 
-    # bounded generic calls — Point implements Display and Hash
-    pt := Point(1, 2)
-    print("{show(pt)}")
-    print("{show_and_hash(pt)}")
+    for page in paginate(books, 2):
+        titles := page.map(fn(book: Book) => book.title)
+        print("page {titles.number}: {titles.items.join(", ")}")
 
-    # named fields work on generic structs too — the type arguments are
-    # inferred from the values, in any field order
-    named := Pair(second: "answer", first: 42)
-    print("named {show_pair(named)}")
+    for wanted in ["peru", "brazil"]:
+        match find(coffee, fn(bag: Coffee) => bag.origin == wanted, wanted):
+            Lookup.Found(bag) => print("found {bag.label()} at {money(bag.cents())}")
+            Lookup.Missing(name) => print("no coffee from {name}")
 
-    # an optional parameter of a generic function, written both ways
-    total: Int? := 7
-    print(label("apples", none))
-    print(label("pears", total))
-
-    # a generic enum constructs and matches like any other enum. a payload
-    # argument infers the instance; a payload-free variant takes it from
-    # the binding's annotation.
-    found := Option.Some(3)
-    match found:
-        Option.Some(n) => print("found {n}")
-        Option.None => print("found nothing")
-    missing: Option[Int] := Option.None
-    match missing:
-        Option.Some(n) => print("missing? {n}")
-        Option.None => print("missing")
-
-    # bounds have two spellings that mean the same thing: inline
-    # ([T: Sized]) and a where clause after the signature. the clause
-    # reads better once a function has several parameters or several
-    # bounds per parameter.
-    print(wingspan(Wing(feathers: 9)))
-
-    # a method may declare type parameters of its own, separate from any the
-    # type has. each call site infers them from its arguments and gets its own
-    # specialization, the same as a call to a free generic function.
-    ledger := Ledger(name: "log")
-    print(ledger.note(12))
-    print(ledger.note("open"))
-    print(ledger.measure(Wing(feathers: 4)))
-
-    # the type arguments can be written at the call instead, ahead of the
-    # parentheses. that is the only way to fix a parameter that appears in
-    # no argument, like the one `blank` only returns.
-    print(ledger.note[Int](13))
-    missing_count := ledger.blank[Int]()
-    if missing_count == none:
-        print("blank: nothing")
-
-    # a generic type's methods may carry type parameters of their own as
-    # well. the type's parameters are fixed by the receiver's instance and
-    # the method's by the call, and each combination is its own
-    # specialization: Box[Float].map to a String here, to an Int below.
-    label := fn(v: Float) -> String:
-        return "about {v}"
-    boxed_label := b.map(label)
-    print(boxed_label.value)
-    floor := fn(v: Float) -> Int:
-        return v.to_int()
-    boxed_floor := b.map(floor)
-    print("floor {boxed_floor.value}")
-
-struct Wing:
-    pub feathers: Int
-
-interface Sized:
-    fn size() -> Int
-
-impl Sized for Wing:
-    fn size() -> Int:
-        return self.feathers
-
-fn wingspan[T](v: T) -> String where T: Sized:
-    return "spans {v.size()}"
-
-struct Ledger:
-    pub name: String
-
-impl Ledger:
-    # T is fixed by the argument at each call site
-    fn note[T](value: T) -> String:
-        return self.name + ": " + value.to_string()
-
-    # a bound on the method's own type parameter, in the clause spelling
-    fn measure[T](v: T) -> String where T: Sized:
-        return self.name + " spans " + v.size().to_string()
-
-    # T appears in no argument, so a call has to write it: blank[Int]()
-    fn blank[T]() -> T?:
-        return none
-
-impl Box:
-    # U is fixed by the function passed in; T by the box it is called on
-    fn map[U](f: fn(T) -> U) -> Box[U]:
-        return Box(f(self.value))
+    # with no argument to infer T from, the call names it
+    empty := paginate[Book]([], 10)
+    print("pages for an empty shelf: {empty.len()}")

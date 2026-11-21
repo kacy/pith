@@ -66,16 +66,14 @@ fn show(p: geo.Point) -> String:
 fn show_all(points: List[geo.Point]) -> String:
     return points.map(show).join(" ")
 
-# send one point and read its reflection before the next is composed. the
-# generated client has no typed per-message recv for a bidi call, so this reads
-# through .inner (a grpc.BidiStream); collect() would wait for the whole stream.
+# send one point and read its reflection before the next is composed. recv()
+# returns one decoded reply at a time; collect() would wait for the whole stream.
 fn reflect_one(call: geo.GeometryReflectCall, point: geo.Point) -> geo.Point!grpc.GrpcError:
     call.send(point)
-    step := call.inner.recv()!
-    if step.done:
+    got := call.recv()!
+    if got.done:
         fail grpc.GrpcError(grpc.GRPC_UNAVAILABLE, "stream ended early")
-    return geo.decode_Point(step.message) catch:
-        fail grpc.GrpcError(grpc.GRPC_INTERNAL, "unreadable Point")
+    return got.message
 
 fn run_client(client: geo.GeometryClient) -> Int!grpc.GrpcError:
     print("describe -> " + client.Describe(geo.Point(x: 2, y: 3))!.name)
@@ -94,7 +92,7 @@ fn run_client(client: geo.GeometryClient) -> Int!grpc.GrpcError:
     for point in [geo.Point(x: 1, y: 2), geo.Point(x: 30, y: 40)]:
         print("reflect  -> {show(point)} becomes {show(reflect_one(mirror, point)!)}")
     mirror.close_send()
-    if mirror.inner.recv()!.done:
+    if mirror.recv()!.done:
         print("reflect  -> stream closed")
     return 0
 

@@ -70,17 +70,31 @@ fn cli_find_command(commands: List[Command], name: String) -> Command!CliError:
             return cmd
     fail cli_error("unknown command: " + name)
 
-fn cli_has_command(commands: List[Command], name: String) -> Bool:
-    for cmd in commands:
-        if cmd.name == name:
-            return true
-    return false
-
-fn cli_set_defaults(values: Map[String, String], options: List[Option]) -> Map[String, String]:
+# set each option's default unless the line already gave it a value. an
+# option with no default clears one an app option of the same name set.
+fn cli_set_defaults(values: Map[String, String], options: List[Option], given: Set[String]):
     for opt in options:
-        if opt.takes_value and opt.default_value != "":
-            values.insert(opt.name, opt.default_value)
-    return values
+        if not given.contains(opt.name):
+            if opt.takes_value and opt.default_value != "":
+                values.insert(opt.name, opt.default_value)
+            else:
+                values.remove(opt.name)
+
+# the options in scope after a command: the command's own, then each app
+# option the command does not redefine. a lookup takes the first match, so a
+# command's option also wins over an app option with the same short name.
+fn cli_command_scope(cmd: Command, app_options: List[Option]) -> List[Option]:
+    mut scope: List[Option] := []
+    for opt in cmd.options:
+        scope.push(opt)
+    for opt in app_options:
+        mut redefined := false
+        for own in cmd.options:
+            if own.name == opt.name:
+                redefined = true
+        if not redefined:
+            scope.push(opt)
+    return scope
 
 fn cli_eq_index(text: String) -> Int:
     mut i := 0
@@ -96,34 +110,25 @@ fn cli_check_required(values: Map[String, String], options: List[Option]) -> Boo
             fail cli_error("missing required option: --" + opt.name)
     return true
 
-# parse argv according to the cli spec.
+# parse argv according to the cli spec. the first argument that is not an
+# option or an option's value names the command, when the spec has commands.
+# app options are accepted anywhere on the line, before or after the command;
+# after it, an option the command defines with the same name takes precedence.
 pub fn parse(spec: Cli, argv: List[String]) -> Parsed!CliError:
     mut command_name := ""
     mut options := spec.options
     mut positional_names := spec.positionals
-    mut start := 0
-    if argv.len() > 0 and spec.commands.len() > 0:
-        first := argv[0]
-        if first.starts_with("-") == false:
-            if not cli_has_command(spec.commands, first):
-                fail cli_error("unknown command: " + first)
-            cmd := cli_find_command(spec.commands, first)!
-            command_name = cmd.name
-            options = cmd.options
-            positional_names = cmd.positionals
-            start = 1
-
     mut flags: Set[String] := {}
     mut values: Map[String, String] := {}
-    values = cli_set_defaults(values, options)
+    mut given: Set[String] := {}
+    cli_set_defaults(values, options, given)
     mut positionals: List[String] := []
     mut pending := ""
 
-    mut i := start
-    while i < argv.len():
-        arg := argv[i]
+    for arg in argv:
         if pending != "":
             values.insert(pending, arg)
+            given.add(pending)
             pending = ""
         elif arg.starts_with("--"):
             body := arg.substring(2, arg.len())
@@ -137,6 +142,7 @@ pub fn parse(spec: Cli, argv: List[String]) -> Parsed!CliError:
             if opt.takes_value:
                 if eq >= 0:
                     values.insert(opt.name, inline_value)
+                    given.add(opt.name)
                 else:
                     pending = opt.name
             else:
@@ -150,9 +156,14 @@ pub fn parse(spec: Cli, argv: List[String]) -> Parsed!CliError:
                 pending = opt.name
             else:
                 flags.add(opt.name)
+        elif command_name == "" and spec.commands.len() > 0 and not arg.starts_with("-"):
+            cmd := cli_find_command(spec.commands, arg)!
+            command_name = cmd.name
+            options = cli_command_scope(cmd, spec.options)
+            positional_names = cmd.positionals
+            cli_set_defaults(values, cmd.options, given)
         else:
             positionals.push(arg)
-        i = i + 1
 
     if pending != "":
         fail cli_error("missing value for option: --" + pending)
@@ -244,3 +255,47 @@ test "cli reports missing option values":
 
     assert(parsed.is_err)
     assert_eq(parsed.err.message, "missing value for option: --output")
+
+test "cli takes app options before or after the command":
+    verbose := flag("verbose", "v", "verbose output")
+    file := option("file", "f", "notes file", "notes.txt")
+    add := command("add", "add a note", [option("tag", "t", "tag", "")], ["text"])
+    spec := app("notes", "keep notes", [verbose, file], [], [add])
+
+    after := parse(spec, ["add", "--file", "work.txt", "-v", "milk", "--tag=home"])!
+    assert_eq(after.command, "add")
+    assert_eq(string(after, "file"), "work.txt")
+    assert(flag_value(after, "verbose"))
+    assert_eq(string(after, "tag"), "home")
+    assert_eq(positional(after, 0), "milk")
+
+    before := parse(spec, ["-f", "home.txt", "add", "milk"])!
+    assert_eq(before.command, "add")
+    assert_eq(string(before, "file"), "home.txt")
+    assert_eq(positional(before, 0), "milk")
+
+    defaulted := parse(spec, ["add", "milk"])!
+    assert_eq(string(defaulted, "file"), "notes.txt")
+
+    unknown := parse(spec, ["--file", "x", "remove"])
+    assert(unknown.is_err)
+    assert_eq(unknown.err.message, "unknown command: remove")
+
+test "cli lets a command's option shadow an app option of the same name":
+    app_file := option("file", "f", "app file", "app.txt")
+    own_file := required_option("file", "o", "command file")
+    run := command("run", "run it", [own_file, flag("force", "f", "force")], [])
+    spec := app("tool", "does work", [app_file], [], [run])
+
+    # before the command only the app's -f exists; after it, -f is the
+    # command's flag and --file is the command's required option.
+    parsed := parse(spec, ["-f", "early.txt", "run", "-f"])!
+    assert_eq(string(parsed, "file"), "early.txt")
+    assert(flag_value(parsed, "force"))
+
+    missing := parse(spec, ["run"])
+    assert(missing.is_err)
+    assert_eq(missing.err.message, "missing required option: --file")
+
+    given := parse(spec, ["run", "--file", "late.txt"])!
+    assert_eq(string(given, "file"), "late.txt")

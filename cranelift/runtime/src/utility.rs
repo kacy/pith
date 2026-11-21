@@ -1,15 +1,71 @@
 use crate::ffi_util::{cstr_bytes, cstr_str};
 
-/// The `format_time` builtin. It ignores the format string and returns the
-/// timestamp, given in milliseconds, as whole seconds in decimal.
+/// The `format_time` builtin. It formats a timestamp, given in milliseconds
+/// since the unix epoch, in UTC using a subset of strftime: `%Y` (year),
+/// `%m` `%d` `%H` `%M` `%S` (two digits each), `%F` (`%Y-%m-%d`), `%T`
+/// (`%H:%M:%S`), `%3f` (milliseconds, three digits) and `%%`. Any other
+/// `%` sequence is copied as written.
 ///
 /// # Safety
-/// fmt is never read.
+/// fmt must be null or a valid null-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, _fmt: *const i8) -> *mut i8 {
-    let secs = timestamp_ms / 1000;
-    let s = format!("{}", secs);
+pub unsafe extern "C" fn pith_format_time_fmt(timestamp_ms: i64, fmt: *const i8) -> *mut i8 {
+    let s = format_time_utc(timestamp_ms, cstr_bytes(fmt).unwrap_or(b""));
     crate::pith_copy_bytes_to_cstring(s.as_bytes())
+}
+
+/// Converts days since 1970-01-01 to a (year, month, day) civil date in the
+/// proleptic gregorian calendar.
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn format_time_utc(timestamp_ms: i64, fmt: &[u8]) -> String {
+    let secs = timestamp_ms.div_euclid(1000);
+    let millis = timestamp_ms.rem_euclid(1000);
+    let (year, month, day) = civil_from_days(secs.div_euclid(86_400));
+    let tod = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (tod / 3600, tod / 60 % 60, tod % 60);
+    let mut out = String::with_capacity(fmt.len() + 16);
+    let mut i = 0;
+    while i < fmt.len() {
+        let rest = &fmt[i..];
+        let (text, used) = match rest {
+            [b'%', b'Y', ..] => (format!("{year:04}"), 2),
+            [b'%', b'm', ..] => (format!("{month:02}"), 2),
+            [b'%', b'd', ..] => (format!("{day:02}"), 2),
+            [b'%', b'H', ..] => (format!("{hour:02}"), 2),
+            [b'%', b'M', ..] => (format!("{minute:02}"), 2),
+            [b'%', b'S', ..] => (format!("{second:02}"), 2),
+            [b'%', b'F', ..] => (format!("{year:04}-{month:02}-{day:02}"), 2),
+            [b'%', b'T', ..] => (format!("{hour:02}:{minute:02}:{second:02}"), 2),
+            [b'%', b'3', b'f', ..] => (format!("{millis:03}"), 3),
+            [b'%', b'%', ..] => ("%".to_string(), 2),
+            _ => {
+                // copy plain text up to the next '%' (or one '%' that starts
+                // no known sequence) unchanged, keeping utf-8 intact.
+                let end = rest[1..]
+                    .iter()
+                    .position(|&b| b == b'%')
+                    .map_or(rest.len(), |p| p + 1);
+                out.push_str(&String::from_utf8_lossy(&rest[..end]));
+                i += end;
+                continue;
+            }
+        };
+        out.push_str(&text);
+        i += used;
+    }
+    out
 }
 
 /// Write string to file path
@@ -462,6 +518,30 @@ pub unsafe extern "C" fn pith_is_dir(path: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_time_handles_the_strftime_subset() {
+        let f = |ms: i64, fmt: &str| format_time_utc(ms, fmt.as_bytes());
+        assert_eq!(f(0, "%Y-%m-%d %H:%M:%S"), "1970-01-01 00:00:00");
+        // 2024-02-29 13:45:07.089 utc, a leap day
+        let ms = 1_709_214_307_089;
+        assert_eq!(f(ms, "%Y-%m-%d %H:%M:%S"), "2024-02-29 13:45:07");
+        assert_eq!(f(ms, "%FT%T.%3fZ"), "2024-02-29T13:45:07.089Z");
+        assert_eq!(f(ms, "100%% at %H"), "100% at 13");
+        assert_eq!(f(ms, ""), "");
+        assert_eq!(f(ms, "%q %"), "%q %");
+        assert_eq!(f(ms, "zeit é %Y"), "zeit é 2024");
+        // before the epoch: one millisecond earlier is the last moment of 1969
+        assert_eq!(f(-1, "%F %T.%3f"), "1969-12-31 23:59:59.999");
+        assert_eq!(f(951_782_400_000, "%F"), "2000-02-29");
+        assert_eq!(f(4_107_542_400_000, "%F"), "2100-03-01");
+        unsafe {
+            let p = pith_format_time_fmt(0, b"%F\0".as_ptr() as *const i8);
+            assert_eq!(std::ffi::CStr::from_ptr(p).to_str().unwrap(), "1970-01-01");
+            let p = pith_format_time_fmt(0, std::ptr::null());
+            assert_eq!(std::ffi::CStr::from_ptr(p).to_str().unwrap(), "");
+        }
+    }
 
     /// The word-at-a-time search has to agree with the obvious loop for every
     /// set size, match position and tail length, including the bytes whose

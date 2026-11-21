@@ -1,0 +1,31 @@
+# a function that does float math used to have every parameter taken for a
+# Float, so `a * b` and `a - b` on two Int parameters were lowered as float
+# operations on their bit patterns (3 * 4 came out 0). and a Float parameter in
+# a function with no float literal was compared as an Int, so -1.0 < -2.0 came
+# out true. each parameter's kind now comes from its declared type.
+fn area(width: Int, height: Int) -> Int:
+    scale := 1.5
+    return width * height
+
+fn scaled(n: Int, factor: Float) -> Float:
+    return n.to_float() * factor
+
+fn smaller(a: Float, b: Float) -> Bool:
+    return a < b
+
+fn mix(count: Int, weight: Float, bias: Int) -> Float:
+    return (count - bias).to_float() * weight
+
+fn largest[T](xs: List[T], better: fn(T, T) -> Bool) -> T:
+    mut best := xs[0]
+    for x in xs:
+        if better(x, best):
+            best = x
+    return best
+
+fn main():
+    print("{area(3, 4)} {scaled(3, 2.5)} {smaller(-1.0, -2.0)} {smaller(-2.0, -1.0)}")
+    print("{mix(10, 0.5, 4)}")
+    halve := fn(x: Float) => x / 2.0
+    print("{halve(7.0)}")
+    print("{largest([1.5, -3.0, 9.25], fn(a: Float, b: Float) => a > b)} {largest([4, 11, 2], fn(a: Int, b: Int) => a > b)}")

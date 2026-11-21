@@ -13291,7 +13291,24 @@ fn ir_emit_named_param(name: String, param_type: String):
     ir_var_regs.insert(bare, r)
     if param_type.len() > 0:
         ir_var_types.insert(bare, param_type)
-    ir_emit("param " + name)
+    ir_emit("param " + name + ir_param_kind_suffix(param_type))
+
+# the word after a param line's name that tells the consumer whether the
+# parameter carries a Float: " float", " word" for a kind that is never one,
+# or "" when the type is not known here (the consumer then infers it from the
+# body). without it the consumer took every parameter of a function that did
+# any float math for a Float, and lowered `a * b` on two Ints as a float
+# multiply of their bit patterns.
+fn ir_param_kind_suffix(param_type: String) -> String:
+    if param_type == "float":
+        return " float"
+    if param_type == "int" or param_type == "bool" or param_type == "string" or param_type == "bytes" or param_type == "tuple" or param_type == "closure" or param_type == "channel" or param_type == "task":
+        return " word"
+    if param_type == "list" or param_type == "list_string" or param_type == "map" or param_type == "map_int" or param_type == "set" or param_type == "set_int":
+        return " word"
+    if param_type.starts_with("struct:") or param_type.starts_with("opaque:") or ir_struct_names.contains_key(param_type):
+        return " word"
+    return ""
 
 fn ir_emit_fn_params(fn_idx: Int):
     node := get_node(fn_idx)

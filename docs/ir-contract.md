@@ -38,7 +38,10 @@ these appear at module scope. the consumer reads them in the first pass.
 ```
 string N "content"          a string literal. N is its index; strref refers back to it.
 func NAME NPARAM RETTYPE     opens a function. NPARAM is the parameter count.
-param NAME                   names one parameter, in order (inside the func body).
+param NAME [KIND]            names one parameter, in order (inside the func body).
+                             KIND is `float` for a Float parameter and `word`
+                             for one that is never a Float; without it the
+                             consumer infers the kind from the body.
 endfunc                      closes the current function.
 struct NAME FIELD...         declares a struct's field layout.
 struct_alias ALIAS TARGET    makes ALIAS resolve to TARGET's layout.

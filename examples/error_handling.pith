@@ -1,44 +1,65 @@
-# result types and typed errors
+# error handling: results with a typed error, fail, !, catch and unwrap_or.
+#
+# validates server settings read from a config file. each check either
+# returns a value or fails with a ConfigError, an enum, so the caller can
+# tell a missing key from a bad number and print a precise message. bare
+# `T!` carries a String error; `T!ConfigError` carries this enum instead.
 
-struct ParseError:
-    message: String
+enum ConfigError:
+    Missing(String)
+    NotANumber(String, String)
+    OutOfRange(String, Int)
 
-struct AppError:
-    message: String
+impl ConfigError:
+    fn message() -> String:
+        return match self:
+            ConfigError.Missing(key) => "{key} is missing"
+            ConfigError.NotANumber(key, text) => "{key} is not a number: {text}"
+            ConfigError.OutOfRange(key, value) => "{key} is out of range: {value}"
 
-# bare `T!` still means `T!String`
-fn divide(a: Int, b: Int) -> Int!:
-    if b == 0:
-        fail "division by zero"
-    return a / b
+struct ServerConfig:
+    host: String
+    port: Int
+    workers: Int
 
-fn parse_port(text: String) -> Int!ParseError:
-    if text.len() == 0:
-        fail ParseError{"empty"}
-    if text == "8080":
-        return 8080
-    fail ParseError{"invalid port"}
+fn require(settings: Map[String, String], key: String) -> String!ConfigError:
+    if let value = settings.get(key):
+        return value
+    fail ConfigError.Missing(key)
 
-fn require_port(text: String) -> Int!ParseError:
-    return parse_port(text)!
+fn read_int(settings: Map[String, String], key: String, low: Int, high: Int) -> Int!ConfigError:
+    text := require(settings, key)!
+    # parse_int fails with a String; the block form of catch turns that into
+    # this function's own error type
+    value := parse_int(text) catch:
+        fail ConfigError.NotANumber(key, text)
+    if value < low or value > high:
+        fail ConfigError.OutOfRange(key, value)
+    return value
 
-fn wrap_parse_error(err: ParseError) -> Int!AppError:
-    fail AppError{"config: {err.message}"}
+# `!` returns the first failure to the caller unchanged
+fn load(settings: Map[String, String]) -> ServerConfig!ConfigError:
+    host := require(settings, "host")!
+    port := read_int(settings, "port", 1, 65535)!
+    # an optional setting: any failure falls back to the default
+    workers := read_int(settings, "workers", 1, 64) catch 4
+    return ServerConfig(host: host, port: port, workers: workers)
 
-fn main() -> Int!:
-    good_divide := divide(10, 2).unwrap_or(0)
-    fallback_divide := divide(10, 0) catch 99
-    required_port := require_port("8080") catch 0
+fn main():
+    files := [
+        {"host": "api.internal", "port": "8443", "workers": "16"},
+        {"host": "api.internal", "port": "8443"},
+        {"host": "api.internal", "port": "http"},
+        {"host": "api.internal", "port": "70000"},
+        {"port": "8443"},
+    ]
+    for settings, index in files:
+        result := load(settings)
+        if result.is_err:
+            print("config {index}: rejected, {result.err.message()}")
+            continue
+        config := result.ok
+        print("config {index}: {config.host}:{config.port} with {config.workers} workers")
 
-    print(good_divide.to_string())
-    print(fallback_divide.to_string())
-    print(required_port.to_string())
-
-    bad := parse_port("nope")
-    print(bad.is_err.to_string())
-    print(bad.err.message)
-
-    wrapped := parse_port("nope").or_else(wrap_parse_error)
-    print(wrapped.is_err.to_string())
-    print(wrapped.err.message)
-    return 0
+    # unwrap_or is the value form of a fallback for any result
+    print("default port: {parse_int("not set").unwrap_or(8080)}")

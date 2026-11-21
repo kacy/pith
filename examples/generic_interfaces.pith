@@ -1,25 +1,54 @@
-# generic interfaces participate in bounds
+# generic interfaces: an interface with a type parameter, used as a bound.
+#
+# `Ordered[T]` says a type can be compared with a T. a bound written
+# `T: Ordered[T]` asks for a type that compares with itself, so one
+# `earliest` function finds the lowest release version and the leftmost
+# point on a map. the bound can sit on a struct too, so an Earliest[T] only
+# exists for a T that has an order.
 
-interface Renderer[T]:
-    fn render(value: T) -> String
+interface Ordered[T]:
+    fn before(other: T) -> Bool
+
+struct Version:
+    major: Int
+    minor: Int
+    patch: Int
+
+impl Ordered[Version] for Version:
+    fn before(other: Version) -> Bool:
+        if self.major != other.major:
+            return self.major < other.major
+        if self.minor != other.minor:
+            return self.minor < other.minor
+        return self.patch < other.patch
 
 struct Point:
-    pub x: Int
-    pub y: Int
+    x: Int
+    y: Int
 
-impl Renderer[Point] for Point:
-    fn render(value: Point) -> String:
-        return "point"
+# left to right, then bottom to top
+impl Ordered[Point] for Point:
+    fn before(other: Point) -> Bool:
+        if self.x != other.x:
+            return self.x < other.x
+        return self.y < other.y
 
-fn show[T: Renderer[T]](value: T) -> String:
-    return "shown"
+struct Earliest[T: Ordered[T]]:
+    value: T
+    compared: Int
 
-struct Wrapper[T: Renderer[T]]:
-    pub value: T
+fn earliest[T: Ordered[T]](items: List[T]) -> Earliest[T]:
+    mut best := items[0]
+    for item in items:
+        if item.before(best):
+            best = item
+    return Earliest(value: best, compared: items.len())
 
 fn main():
-    pt := Point(3, 4)
-    wrapped: Wrapper[Point] := Wrapper(pt)
-    print(show(pt))
-    print(wrapped.value.x.to_string())
-    print("generic interfaces work")
+    releases := [Version(2, 1, 0), Version(1, 9, 4), Version(1, 10, 0), Version(1, 9, 12)]
+    oldest := earliest(releases)
+    print("oldest of {oldest.compared} releases: {oldest.value.major}.{oldest.value.minor}.{oldest.value.patch}")
+
+    stops := [Point(x: 4, y: 1), Point(x: -2, y: 7), Point(x: -2, y: 3), Point(x: 0, y: 0)]
+    leftmost := earliest(stops)
+    print("leftmost of {leftmost.compared} stops: x {leftmost.value.x}, y {leftmost.value.y}")

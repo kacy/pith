@@ -1,30 +1,52 @@
-# std.iter — the iterator protocol, lazily
+# iterators: the next() protocol, a hand-written iterator, and lazy adapters.
 #
-# Range is an iterator value: a for-loop drives it via the next() protocol,
-# and to_list drains it into a List. map_iter and filter_iter are lazy
-# adapters, so a chain is walked once with a single allocation at to_list.
+# reads a settings file one line at a time. any type with `fn next() -> T?`
+# drives a for loop; implementing std.iter's Iterator interface, which names
+# the element type, also lets the helpers in std.iter take it. the lazy
+# adapters (map_iter, filter_iter) wrap an iterator without building a list,
+# so a chain walks its source once and allocates only in to_list.
 
-from std.iter import Range, to_list, map_iter, filter_iter
+from std.iter import Iterator, Range, to_list, map_iter, filter_iter
+
+# hands out one line per call instead of splitting the whole text up front
+struct Lines:
+    text: String
+    position: Int = 0
+
+impl Iterator for Lines:
+    type Item = String
+
+    fn next() -> Item?:
+        if self.position >= self.text.len():
+            return none
+        start := self.position
+        mut end := start
+        while end < self.text.len() and self.text[end] != "\n":
+            end += 1
+        self.position = end + 1
+        return self.text.substring(start, end)
+
+fn is_setting(line: String) -> Bool:
+    trimmed := line.trim()
+    return trimmed.len() > 0 and not trimmed.starts_with("#")
 
 fn main():
-    # a for-loop drives a Range directly, no list in between
-    mut sum := 0
-    for x in Range(1, 6):
-        sum = sum + x
-    print("sum 1..6: {sum}")
+    text := "# limits\nmax_connections = 512\n\ntimeout_ms = 2500\n# retries\nretries = 3\n"
 
-    # to_list drains an iterator into a List
-    xs := to_list(Range(0, 5))
-    print("range as list: len {xs.len()}")
-    mut vals := ""
-    for x in xs:
-        vals = vals + x.to_string() + " "
-    print("values: {vals}")
+    # a for loop calls next() until it returns none
+    mut names: List[String] := []
+    for line in Lines(text: text):
+        if is_setting(line):
+            names.push(line.split("=")[0].trim())
+    print("settings: {names.join(", ")}")
 
-    # lazy fused chain: map then filter, walked once, one allocation at to_list
-    result := to_list(filter_iter(map_iter(Range(0, 6), fn(x: Int) => x * x), fn(x: Int) => x % 2 == 0))
-    print("even squares of 0..6: len {result.len()}")
-    mut rs := ""
-    for x in result:
-        rs = rs + x.to_string() + " "
-    print("even squares: {rs}")
+    # to_list drains an iterator; a second walk needs a fresh Lines, since
+    # next() moves the position forward
+    all_lines := to_list(Lines(text: text))
+    print("{all_lines.len()} lines, {names.len()} of them settings")
+
+    # Range is a [low, high) iterator value. nothing in this chain runs until
+    # to_list pulls, and each number goes through both steps before the next
+    squares := map_iter(Range(1, 10), fn(n: Int) => n * n)
+    even_squares := to_list(filter_iter(squares, fn(n: Int) => n % 2 == 0))
+    print("even squares below 100: {even_squares}")

@@ -1,48 +1,76 @@
-# defer: cleanup that runs on every exit, including the error path.
+# defer: cleanup that runs on every exit from a function.
 #
-# a File here stands in for any resource you must release. the point is
-# that `defer file.close()` sits right next to the open, and runs whether
-# the function returns normally, fails, or propagates an error with `!` —
-# so no exit can forget it.
+# writes reports to files. `defer file.close()` sits on the line after the
+# open, and runs whether the function returns normally, fails, or passes an
+# error up with `!`, so no exit can leak the file. several defers in one
+# block run last first, the reverse of the order they were written.
+#
+# a File here is an in-memory stand-in so the example runs on its own; the
+# shape is the same with std.fs.
 
-mut open_files := 0
+struct Disk:
+    open_files: Int = 0
 
 struct File:
-    pub name: String
+    disk: Disk
+    name: String
+    lines: Int = 0
 
-fn open(name: String) -> File:
-    open_files = open_files + 1
-    print("opened {name} (open={open_files})")
-    return File{name}
+impl Disk:
+    fn open(name: String) -> File:
+        self.open_files += 1
+        print("  open {name}")
+        return File(disk: self, name: name)
 
-fn close(f: File):
-    open_files = open_files - 1
-    print("closed {f.name} (open={open_files})")
+impl File:
+    fn write(line: String) -> Int!:
+        if line.len() == 0:
+            fail "empty line in {self.name}"
+        self.lines += 1
+        return line.len()
 
-# writing an empty line is treated as an error to show the failing path.
-fn write_line(f: File, line: String) -> Int!:
-    if line.len() == 0:
-        fail "refusing to write an empty line to {f.name}"
-    print("wrote to {f.name}: {line}")
-    return line.len()
+    fn close():
+        self.disk.open_files -= 1
+        print("  close {self.name}, lines written: {self.lines}")
 
-fn save(name: String, lines: List[String]) -> Int!:
-    f := open(name)
-    defer close(f)
+fn save(disk: Disk, name: String, lines: List[String]) -> Int!:
+    file := disk.open(name)
+    defer file.close()
 
-    mut total := 0
+    mut written := 0
     for line in lines:
-        total = total + write_line(f, line)!
-    return total
+        written += file.write(line)!
+    return written
+
+# two files open at once: the defers close them in reverse order
+fn copy_with_log(disk: Disk, lines: List[String]) -> Int!:
+    target := disk.open("copy.txt")
+    defer target.close()
+    log := disk.open("copy.log")
+    defer log.close()
+
+    for line in lines:
+        target.write(line)!
+        log.write("copied {line.len()} bytes")!
+    return lines.len()
+
+fn report(outcome: Int!, unit: String):
+    if outcome.is_err:
+        print("  failed: {outcome.err}")
+    else:
+        print("  {outcome.ok} {unit}")
 
 fn main():
-    # normal path: the defer closes the file after the last write
-    good := save("report.txt", ["alpha", "beta"]) catch -1
-    print("save returned {good}")
+    disk := Disk()
 
-    # error path: the second write fails, `!` propagates out of save, and
-    # the defer still closes the file on the way out
-    bad := save("broken.txt", ["ok", "", "never"]) catch -1
-    print("save returned {bad}")
+    print("save report.txt")
+    report(save(disk, "report.txt", ["alpha", "beta"]), "bytes")
 
-    print("files still open: {open_files}")
+    # the second write fails, `!` leaves save, and the defer still runs
+    print("save broken.txt")
+    report(save(disk, "broken.txt", ["ok", "", "never"]), "bytes")
+
+    print("copy")
+    report(copy_with_log(disk, ["one", "two"]), "lines copied")
+
+    print("files still open: {disk.open_files}")

@@ -1,46 +1,44 @@
-# functional list operations — map, filter, reduce as list methods
+# functional list methods: map, filter and reduce, chained.
+#
+# answers a few questions about a day of orders. each answer is one chain
+# that reads top to bottom: pick the orders that matter, turn each into the
+# number wanted, and fold the numbers into a result. none of the chains
+# changes the order list.
 
 import std.fmt as fmt
 
+struct Order:
+    customer: String
+    cents: Int
+    paid: Bool
+
 fn main():
-    nums := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    orders := [
+        Order(customer: "ada", cents: 4200, paid: true),
+        Order(customer: "grace", cents: 1500, paid: false),
+        Order(customer: "ada", cents: 800, paid: true),
+        Order(customer: "linus", cents: 12000, paid: true),
+        Order(customer: "grace", cents: 3300, paid: true),
+    ]
 
-    # map: transform each element
-    doubled := nums.map(fn(x: Int) => x * 2)
-    print("doubled: {fmt.ints(doubled)}")
+    paid := orders.filter(fn(order: Order) => order.paid)
+    revenue := paid.map(fn(order: Order) => order.cents).reduce(0, fn(sum: Int, cents: Int) => sum + cents)
+    print("paid orders: {paid.len()} of {orders.len()}, revenue {revenue}")
 
-    squared := nums.map(fn(x: Int) => x * x)
-    print("squared: {fmt.ints(squared)}")
+    large := orders.filter(fn(order: Order) => order.cents >= 3000).map(fn(order: Order) => order.customer)
+    print("large orders from: {fmt.join_strings(large, ", ")}")
 
-    # filter: keep elements matching predicate
-    evens := nums.filter(fn(x: Int) => x % 2 == 0)
-    print("evens: {fmt.ints(evens)}")
+    unpaid := orders.filter(fn(order: Order) => not order.paid).reduce(0, fn(sum: Int, order: Order) => sum + order.cents)
+    print("still owed: {unpaid}")
 
-    big := nums.filter(fn(x: Int) => x > 5)
-    print("big (>5): {fmt.ints(big)}")
+    # reduce can build any value, here a map of totals per customer
+    add_order := fn(totals: Map[String, Int], order: Order) -> Map[String, Int]:
+        totals[order.customer] = totals.get(order.customer).unwrap_or(0) + order.cents
+        return totals
+    empty: Map[String, Int] := {}
+    by_customer := paid.reduce(empty, add_order)
+    for customer in ["ada", "grace", "linus"]:
+        print("{customer:<6} {by_customer.get(customer).unwrap_or(0):>6}")
 
-    # reduce: fold into single value
-    total := nums.reduce(0, fn(acc: Int, x: Int) => acc + x)
-    print("sum: {total}")
-
-    small := [1, 2, 3, 4, 5]
-    product := small.reduce(1, fn(acc: Int, x: Int) => acc * x)
-    print("product 1-5: {product}")
-
-    # chaining reads left to right: filter then map
-    big_doubled := nums.filter(fn(x: Int) => x > 5).map(fn(x: Int) => x * 2)
-    print("big doubled: {fmt.ints(big_doubled)}")
-
-    # map.get_default for counters
-    mut counts: Map[String, Int] := {}
-    words := ["the", "cat", "sat", "on", "the", "mat", "the"]
-    mut i := 0
-    while i < words.len():
-        w := words[i]
-        cur := counts.get_default(w, 0)
-        counts.insert(w, cur + 1)
-        i = i + 1
-    print("the: {counts["the"]}")
-    print("cat: {counts["cat"]}")
-
-    print("functional works")
+    sizes := orders.map(fn(order: Order) => order.cents / 100)
+    print("order sizes in whole units: {fmt.ints(sizes)}")

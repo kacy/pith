@@ -80,12 +80,20 @@ fn channel_of[T: Notifier](n: T) -> String:
 
 fn main():
     # a literal whose type is known converts each element on its own
-    targets: List[Notifier] := [Email(address: "ops@example.com"), Sms(number: "555-0100", limit: 16), Pager(team: "storage")]
+    targets: List[Notifier] := [
+        Email(address: "ops@example.com"),
+        Sms(number: "555-0100", limit: 16),
+        Pager(team: "storage"),
+    ]
     broadcast(targets, "disk usage at 91 percent")
 
     print("")
     # interface values in struct fields, built from config strings
-    rules := [Rule(min_level: 1, target: from_config("email", "log@example.com")), Rule(min_level: 2, target: from_config("sms", "555-0199")), Rule(min_level: 3, target: from_config("pager", "database"))]
+    rules := [
+        Rule(min_level: 1, target: from_config("email", "log@example.com")),
+        Rule(min_level: 2, target: from_config("sms", "555-0199")),
+        Rule(min_level: 3, target: from_config("pager", "database")),
+    ]
     level := 2
     for r in rules:
         if level >= r.min_level:
@@ -93,7 +101,10 @@ fn main():
 
     print("")
     # a map from a name to whichever channel serves it
-    by_team: Map[String, Notifier] := {"web": Email(address: "web@example.com"), "db": Pager(team: "database")}
+    by_team: Map[String, Notifier] := {
+        "web": Email(address: "web@example.com"),
+        "db": Pager(team: "database"),
+    }
     for team in ["db", "web"]:
         print("{team}: {by_team[team].channel()}")
 

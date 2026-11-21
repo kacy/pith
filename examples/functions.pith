@@ -1,24 +1,41 @@
-# function declarations, calls, and return types
+# functions: parameters, return types, argument labels and if expressions.
+#
+# builds the lines of a small invoice. prices are kept in cents so the totals
+# stay exact, and one helper turns cents into a printable amount.
 
-fn add(a: Int, b: Int) -> Int:
-    return a + b
+fn line_total(quantity: Int, unit_cents: Int) -> Int:
+    return quantity * unit_cents
 
-fn greet(name: String) -> String:
-    return "hello, {name}!"
+fn apply_discount(cents: Int, percent: Int) -> Int:
+    return cents - cents * percent / 100
 
-fn is_positive(n: Int) -> Bool:
-    return n > 0
+fn format_cents(cents: Int) -> String:
+    return "{cents / 100}.{cents % 100:02}"
 
-fn negate(x: Float) -> Float:
-    return 0.0 - x
+fn is_free_shipping(subtotal_cents: Int) -> Bool:
+    return subtotal_cents >= 5000
 
-fn do_nothing():
-    return
+# a function with no return type returns nothing; it is called for its effect
+fn print_line(item: String, quantity: Int, cents: Int):
+    print("{item:<12} x{quantity:<3} {format_cents(cents):>8}")
 
 fn main():
-    sum := add(1, 2)
-    msg := greet("pith")
-    print(msg)
+    mut subtotal := 0
 
-    ok := is_positive(sum)
-    val := negate(3.14)
+    notebooks := line_total(3, 450)
+    print_line("notebook", 3, notebooks)
+    subtotal += notebooks
+
+    # a label names the parameter in that position, so a call with two Ints
+    # reads without the declaration, and the checker refuses a swapped pair
+    pens := apply_discount(line_total(quantity: 10, unit_cents: 120), percent: 25)
+    print_line("pen", 10, pens)
+    subtotal += pens
+
+    lamp := apply_discount(line_total(1, 3299), percent: 10)
+    print_line("desk lamp", 1, lamp)
+    subtotal += lamp
+
+    shipping := if is_free_shipping(subtotal): 0 else: 499
+    print("subtotal {format_cents(subtotal)}, shipping {format_cents(shipping)}")
+    print("total {format_cents(subtotal + shipping)}")

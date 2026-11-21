@@ -1,34 +1,41 @@
-# type alias examples
+# type aliases: a second name for an existing type.
+#
+# tracks response times per endpoint. the aliases name what a value means
+# (milliseconds, an endpoint path) and shorten the collection and function
+# types that would otherwise be repeated. an alias is the same type as the
+# one it names, so a Millis passes anywhere an Int does; it documents intent
+# rather than adding a check.
 
-type Meters = Int
-type Name = String
-type Flag = Bool
+type Millis = Int
+type Endpoint = String
+type Timings = Map[Endpoint, List[Millis]]
+type Budget = fn(Millis) -> Bool
 
-struct Point:
-    x: Int
-    y: Int
+fn record(timings: Timings, endpoint: Endpoint, elapsed: Millis):
+    if not timings.contains_key(endpoint):
+        timings[endpoint] = []
+    timings[endpoint].push(elapsed)
 
-type Location = Point
+fn slowest(samples: List[Millis]) -> Millis:
+    mut worst := 0
+    for sample in samples:
+        worst = max(worst, sample)
+    return worst
 
-fn distance(a: Meters, b: Meters) -> Meters:
-    if a > b:
-        return a - b
-    return b - a
-
-fn greet(name: Name) -> String:
-    return "hello, {name}"
+fn within(limit: Millis) -> Budget:
+    return fn(elapsed: Millis) => elapsed <= limit
 
 fn main():
-    d := distance(10, 3)
-    print(d.to_string())
+    mut timings: Map[Endpoint, List[Millis]] := {}
+    record(timings, "/login", 120)
+    record(timings, "/search", 340)
+    record(timings, "/login", 95)
+    record(timings, "/search", 910)
+    record(timings, "/health", 3)
+    record(timings, "/health", 4)
 
-    msg := greet("pith")
-    print(msg)
-
-    p := Location(1, 2)
-    print(p.x.to_string())
-
-    f: Flag := true
-    print(f.to_string())
-
-    print("type aliases work")
+    budget := within(500)
+    for endpoint in ["/health", "/login", "/search"]:
+        worst := slowest(timings[endpoint])
+        verdict := if budget(worst): "ok" else: "over budget"
+        print("{endpoint:<8} {timings[endpoint].len()} calls, slowest {worst} ms, {verdict}")

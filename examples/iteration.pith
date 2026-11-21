@@ -1,39 +1,52 @@
-# for loops and collection mutation
+# iteration: for loops over lists, ranges, strings, maps and sets.
+#
+# reports on a short access log: which lines mention an error, how often
+# each path was hit, and which clients were seen. maps and sets iterate in
+# no fixed order, so the report sorts their keys before printing them.
 
 fn main():
-    # list iteration
-    numbers := [10, 20, 30]
-    for n in numbers:
-        print("{n}")
+    log := [
+        "10.0.0.4 GET /index.html 200",
+        "10.0.0.7 GET /api/users 500",
+        "10.0.0.4 POST /api/users 201",
+        "10.0.0.9 GET /index.html 200",
+        "10.0.0.7 GET /api/users 503",
+    ]
 
-    # list iteration with index
-    names := ["alice", "bob", "charlie"]
-    for name, i in names:
-        print(name)
+    # the second name in a for loop is the position
+    for line, index in log:
+        status := line.split(" ")[3]
+        if status.starts_with("5"):
+            print("line {index + 1}: server error {status}")
 
-    # map iteration (iterates over keys)
-    ages := {"alice": 30, "bob": 25}
-    for key in ages:
-        print(key)
+    mut hits: Map[String, Int] := {}
+    mut clients: Set[String] := {}
+    for line in log:
+        fields := line.split(" ")
+        clients.add(fields[0])
+        hits[fields[2]] = hits.get(fields[2]).unwrap_or(0) + 1
 
-    # set iteration
-    tags := {"rust", "zig", "pith"}
-    for tag in tags:
-        print(tag)
+    # a for loop over a map visits its keys
+    mut paths: List[String] := []
+    for path in hits:
+        paths.push(path)
+    for path in paths.sort():
+        print("{path:<12} {hits[path]} hits")
 
-    # collection mutation — building up lists dynamically
-    mut items: List[Int] := []
-    items.push(1)
-    items.push(2)
-    items.push(3)
-    for n in items:
-        print("{n}")
+    mut addresses: List[String] := []
+    for client in clients:
+        addresses.push(client)
+    print("clients: {addresses.sort().join(", ")}")
 
-    # map mutation — inserting key-value pairs
-    mut scores: Map[String, Int] := {}
-    scores.insert("alice", 100)
-    scores.insert("bob", 85)
-    for key in scores:
-        print(key)
+    # a range counts without building a list; the upper bound is excluded
+    mut bar := ""
+    for i in 0..hits["/api/users"]:
+        bar = bar + "#"
+    print("/api/users {bar}")
 
-    print("iteration works")
+    # a string iterates character by character
+    mut digits := 0
+    for character in log[0]:
+        if character >= "0" and character <= "9":
+            digits += 1
+    print("digits in the first line: {digits}")

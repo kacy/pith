@@ -1,28 +1,47 @@
-# lambdas — non-capturing and capturing (closures)
+# lambdas: anonymous functions, in short and block form, and what they capture.
+#
+# prices a basket under a list of discount rules. each rule holds two
+# lambdas, one deciding whether it applies and one adjusting the price, so a
+# new rule is data rather than another branch in the pricing code.
 
-fn apply(x: Int, f: fn(Int) -> Int) -> Int:
-    return f(x)
+struct Rule:
+    name: String
+    applies: fn(Int) -> Bool
+    adjust: fn(Int) -> Int
+
+# a function can build and return a lambda; it keeps `percent` with it
+fn percent_off(percent: Int) -> fn(Int) -> Int:
+    return fn(cents: Int) => cents - cents * percent / 100
+
+fn price(cents: Int, rules: List[Rule]) -> Int:
+    mut current := cents
+    for rule in rules:
+        if rule.applies(current):
+            current = rule.adjust(current)
+            print("  {rule.name:<10} -> {current}")
+    return current
 
 fn main():
-    # non-capturing lambda
-    result := apply(5, fn(x: Int) => x * 2)
-    print(result.to_string())
+    bulk_threshold := 10000
 
-    # capturing lambda — single variable
-    y := 10
-    result2 := apply(5, fn(x: Int) => x + y)
-    print(result2.to_string())
+    # the block form takes statements and needs a return type
+    round_down := fn(cents: Int) -> Int:
+        remainder := cents % 100
+        return cents - remainder
 
-    # capturing lambda — multiple variables
-    a := 3
-    b := 7
-    result3 := apply(1, fn(x: Int) => x + a + b)
-    print(result3.to_string())
+    rules := [
+        Rule(name: "bulk", applies: fn(cents: Int) => cents >= bulk_threshold, adjust: percent_off(15)),
+        Rule(name: "member", applies: fn(cents: Int) => true, adjust: percent_off(5)),
+        Rule(name: "round", applies: fn(cents: Int) => cents % 100 != 0, adjust: round_down),
+    ]
 
-    # closure stored in a binding
-    offset := 100
-    add_offset := fn(x: Int) => x + offset
-    offset_result := apply(42, add_offset)
-    print(offset_result.to_string())
+    for basket in [12500, 4999]:
+        print("basket {basket}:")
+        print("  pays {price(basket, rules)}")
 
-    print("lambdas work")
+    # a lambda captures the value a variable had when the lambda was made,
+    # so changing the variable later does not change the lambda
+    mut fee := 300
+    add_fee := fn(cents: Int) => cents + fee
+    fee = 500
+    print("fee added: {add_fee(1000)}, fee now: {fee}")

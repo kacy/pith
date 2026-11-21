@@ -1,38 +1,51 @@
-# if/elif/else, while loops, nested scopes
+# control flow: if/elif/else, for and while loops, break and continue.
+#
+# scans a day of temperature readings from a server room. bad readings are
+# skipped, each good one is classified, and the scan stops at the first
+# reading hot enough to page someone. a while loop then works out how many
+# minutes the cooling needs at a fixed rate.
 
-fn classify(n: Int) -> String:
-    if n > 0:
-        return "positive"
-    elif n == 0:
-        return "zero"
+fn classify(celsius: Int) -> String:
+    if celsius < 18:
+        return "cold"
+    elif celsius <= 27:
+        return "normal"
+    elif celsius <= 35:
+        return "warm"
     else:
-        return "negative"
-
-fn abs(n: Int) -> Int:
-    if n > 0:
-        return n
-    else:
-        return 0 - n
-
-fn countdown(n: Int):
-    mut i := n
-    while i > 0:
-        i -= 1
-
-fn fizzbuzz(n: Int) -> String:
-    mut i := 1
-    mut result := ""
-    while i <= n:
-        # nested if inside a while loop
-        if i > 0:
-            result = "{result}."
-        i += 1
-    return result
+        return "critical"
 
 fn main():
-    label := classify(42)
-    print(label)
-    dist := abs(0 - 5)
-    countdown(3)
-    out := fizzbuzz(15)
-    print(out)
+    readings := [21, 22, -999, 24, 29, 31, -999, 38, 23]
+    mut checked := 0
+    mut warm_count := 0
+    mut alarm_temperature := 0
+
+    for celsius, hour in readings:
+        # the sensor reports -999 when it could not take a reading
+        if celsius == -999:
+            print("{hour:02}:00  no reading")
+            continue
+
+        checked += 1
+        label := classify(celsius)
+        print("{hour:02}:00  {celsius:>3} C  {label}")
+        if label == "warm":
+            warm_count += 1
+        elif label == "critical":
+            alarm_temperature = celsius
+            break
+
+    print("checked {checked} readings, {warm_count} warm")
+
+    if alarm_temperature == 0:
+        print("no alarm")
+        return
+
+    # cooling takes off 2 degrees a minute; count until the room is normal
+    mut temperature := alarm_temperature
+    mut minutes := 0
+    while classify(temperature) != "normal":
+        temperature -= 2
+        minutes += 1
+    print("alarm at {alarm_temperature} C, back to normal in {minutes} minutes")

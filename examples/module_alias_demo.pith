@@ -1,40 +1,38 @@
-# module_alias_demo.pith — demonstrates import patterns
-# shows: from_import, import with alias, and namespace usage
+# imports: a module under an alias, and single names brought into scope.
+#
+# plans a short delivery route. `import std.math as math` keeps the module's
+# names behind a prefix, so `math.atan2` says where it comes from. `from
+# std.math import hypot, degrees` brings those two names in unprefixed, which
+# reads better for names used often and unlikely to clash.
 
-# standard from_import - imports specific functions into current scope.
-# only names the module declares can be imported this way; abs, min, max
-# and clamp are builtins and need no import
-from std.math import sqrt, hypot
+import std.math as math
+from std.math import hypot, degrees
 
-# import with alias - creates a readable module namespace
-import std.math as math_lib
-import std.io as io
+struct Stop:
+    name: String
+    x: Float
+    y: Float
 
-fn test_direct_imports():
-    # functions imported directly into scope
-    print("hypot(3.0, 4.0) = {hypot(3.0, 4.0)}")
-    print("sqrt(16.0) = {sqrt(16.0)}")
+fn distance(from_stop: Stop, to_stop: Stop) -> Float:
+    return hypot(to_stop.x - from_stop.x, to_stop.y - from_stop.y)
 
-    # builtins, available without an import
-    result := abs(-42)
-    print("abs(-42) = {result}")
+# compass bearing in degrees, clockwise from north
+fn bearing(from_stop: Stop, to_stop: Stop) -> Float:
+    angle := degrees(math.atan2(to_stop.x - from_stop.x, to_stop.y - from_stop.y))
+    if angle < 0.0:
+        return angle + 360.0
+    return angle
 
-    min_val := min(10, 5)
-    max_val := max(10, 5)
-    print("min(10, 5) = {min_val}")
-    print("max(10, 5) = {max_val}")
-
-    clamped := clamp(15, 0, 10)
-    print("clamp(15, 0, 10) = {clamped}")
-
-fn main() -> Int!:
-    print("Module Import Patterns Demonstration")
-    print("====================================")
-    test_direct_imports()
-    print("Direct import tests passed!")
-    print("")
-    print("math_lib.abs_float(-12.5) = {math_lib.abs_float(-12.5)}")
-    reader := io.string_reader("module alias io")
-    defer reader.close()
-    print(reader.read_all()!)
-    return 0
+fn main():
+    route := [
+        Stop(name: "depot", x: 0.0, y: 0.0),
+        Stop(name: "bakery", x: 3.0, y: 4.0),
+        Stop(name: "school", x: 3.0, y: -2.0),
+        Stop(name: "depot", x: 0.0, y: 0.0),
+    ]
+    mut total := 0.0
+    for i in 1..route.len():
+        leg := distance(route[i - 1], route[i])
+        total += leg
+        print("{route[i - 1].name:>6} -> {route[i].name:<6} {leg:5.2} km, heading {bearing(route[i - 1], route[i]):5.1}")
+    print("route length: {total:.2} km")

@@ -1,34 +1,58 @@
-# struct declarations and field access
+# structs: declaring fields, building values, field defaults and updates.
+#
+# lays out boxes for a shipment: each box has a size and a weight, the
+# shipping options have defaults most orders keep, and a pallet collects the
+# boxes. structs are reference values, so a box changed through one name is
+# changed everywhere it is held.
 
-struct Point:
-    pub x: Int
-    pub y: Int
+struct Size:
+    width: Int
+    depth: Int
+    height: Int
 
-struct Color:
-    pub r: Int
-    pub g: Int
-    pub b: Int
+struct Parcel:
+    label: String
+    size: Size
+    grams: Int
 
-# structs pass by value and their fields are read directly
-fn describe_point(p: Point) -> String:
-    return "({p.x}, {p.y})"
+# fields with defaults can be left out when the struct is built
+struct ShippingOptions:
+    carrier: String = "post"
+    insured: Bool = false
+    signature: Bool = false
 
-fn is_bright(c: Color) -> Bool:
-    return c.r > 200 or c.g > 200 or c.b > 200
+struct Pallet:
+    parcels: List[Parcel]
+    max_grams: Int
 
-fn report(name: String, c: Color):
-    mut label := "bright"
-    if not is_bright(c):
-        label = "dim"
-    print("{name} ({c.r}, {c.g}, {c.b}) {label}")
+fn volume_litres(size: Size) -> Int:
+    return size.width * size.depth * size.height / 1000
+
+fn total_grams(pallet: Pallet) -> Int:
+    mut total := 0
+    for parcel in pallet.parcels:
+        total += parcel.grams
+    return total
+
+fn describe(options: ShippingOptions) -> String:
+    return "{options.carrier}, insured: {options.insured}, signature: {options.signature}"
 
 fn main():
-    # positional construction
-    origin := Point(0, 0)
-    # named construction reads well when there are several fields
-    corner := Point(x: 3, y: 4)
-    print("origin {describe_point(origin)}")
-    print("corner {describe_point(corner)}")
+    # positional construction is fine when the order is obvious; name the
+    # fields when several share a type
+    books := Parcel("books", Size(30, 20, 15), 6200)
+    lamp := Parcel(label: "lamp", size: Size(width: 40, depth: 40, height: 60), grams: 2100)
+    pallet := Pallet(parcels: [books, lamp], max_grams: 10000)
 
-    report("red", Color(r: 255, g: 0, b: 0))
-    report("slate", Color(r: 40, g: 44, b: 52))
+    for parcel in pallet.parcels:
+        print("{parcel.label:<6} {volume_litres(parcel.size):>3} l  {parcel.grams:>5} g")
+    print("pallet weight: {total_grams(pallet)} g of {pallet.max_grams} g")
+
+    # the pallet holds the same parcel as `books`, so the update shows there
+    books.grams = 7400
+    print("after repacking the books: {total_grams(pallet)} g")
+
+    standard := ShippingOptions()
+    fragile := ShippingOptions(insured: true, signature: true)
+    print("standard: {describe(standard)}")
+    print("fragile: {describe(fragile)}")

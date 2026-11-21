@@ -1,6 +1,41 @@
+# std.diagnostic: report problems in a file the way a compiler does.
+#
+# a tiny checker for "key = value" config files. each problem becomes a
+# diagnostic with a severity, a position, the offending line and, where there
+# is an obvious one, a suggested fix. the same diagnostics render two ways:
+# for a person at a terminal, and as json for an editor or a ci annotation.
+
 import std.diagnostic as diagnostic
+from std.diagnostic import Diagnostic
+
+KNOWN_KEYS := ["host", "port", "workers"]
+
+fn check_line(file: String, number: Int, line: String) -> Diagnostic?:
+    if line.trim() == "" or line.starts_with("#"):
+        return none
+    eq := line.index_of("=")
+    if eq < 0:
+        found := diagnostic.error("expected `key = value`")
+        return diagnostic.with_fix(diagnostic.with_span(found, file, number, line.len() + 1, line), "add `= <value>`")
+    key := line.substring(0, eq).trim()
+    if not KNOWN_KEYS.contains(key):
+        found := diagnostic.warning("unknown key `{key}` is ignored")
+        return diagnostic.with_span(found, file, number, 1, line)
+    if line.substring(eq + 1, line.len()).trim() == "":
+        found := diagnostic.error("`{key}` has no value")
+        return diagnostic.with_span(found, file, number, eq + 2, line)
+    return none
+
+fn check(file: String, text: String) -> List[Diagnostic]:
+    mut found: List[Diagnostic] := []
+    for line, i in text.split("\n"):
+        if let d = check_line(file, i + 1, line):
+            found.push(d)
+    return found
 
 fn main():
-    diag := diagnostic.with_fix(diagnostic.with_span(diagnostic.error("expected expression"), "main.pith", 3, 7, "value ="), "add an expression")
-    print(diagnostic.render(diag).contains("main.pith:3:7: error: expected expression").to_string())
-    print(diagnostic.render_json(diag).contains("\"severity\":\"error\"").to_string())
+    text := "# service config\nhost = example.com\nport\nworkres = 4\nworkers =\n"
+    problems := check("service.conf", text)
+    print(diagnostic.render_all(problems))
+    print("")
+    print(diagnostic.render_json(problems[0]))

@@ -58,10 +58,14 @@ pub fn ir_resolve_type_hint_with_state(type_name: String, type_aliases: Map[Stri
     if struct_names.contains_key(base):
         return base
     # an interface used as a value type is a counted box (see ir_type_from_tid)
-    # interfaces are registered by name only, not as declared types
-    iface_tid := lookup_type_id(resolved)
+    # interfaces are registered by name only, not as declared types, and
+    # under their bare name: `io.BytesWriter` is found as `BytesWriter`
+    mut iface_name := resolved
+    if lookup_type_id(iface_name) < 0 and iface_name.contains("."):
+        iface_name = iface_name.substring(iface_name.last_index_of(".") + 1, iface_name.len())
+    iface_tid := lookup_type_id(iface_name)
     if iface_tid >= 0 and c_is_interface_value_type(iface_tid):
-        return "struct:" + resolved
+        return "struct:" + iface_name
     return resolved
 
 # the kind string to write into emitted IR for a declared return or

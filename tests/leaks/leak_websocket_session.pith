@@ -1,14 +1,10 @@
-# a websocket session per round, torn down with close_now(). the session's
-# six threadlocal map entries had no removal path at all — a server upgrading
-# connections grew them per session, per os thread, for the life of the
-# process (issue #925). close_now() now deregisters the session, so this
-# stays flat; a teardown that misses one of the maps shows up as growth.
+# a websocket session per round, torn down with close_now(). the session used
+# to keep its state in six threadlocal maps that grew per session for the life
+# of the process (issue #925); it is now a counted struct, so this stays flat
+# as long as the session and what it holds are released with it.
 #
 # the buffered io pair and the cursor under the session are the caller's here
 # (from_buffered), so the round closes them itself, the way a server would.
-#
-# valgrind sees none of it: a stranded entry stays reachable from its
-# threadlocal map, so it reads as "still reachable" rather than lost.
 import leakprobe as probe
 import std.io as io
 import std.bytes as bytes

@@ -44,17 +44,21 @@ impl Parser:
     fn peek() -> Token:
         return self.tokens.get(self.position).unwrap_or(Token.End)
 
-    fn next_op_in(ops: String) -> String?:
+    # the next token if it is one of the given operators, or "" otherwise
+    fn next_op_in(ops: String) -> String:
         if let Token.Op(op) = self.peek():
             if ops.contains(op):
                 self.position += 1
                 return op
-        return none
+        return ""
 
     # expression := term (("+" | "-") term)*
     fn expression() -> Int!:
         mut value := self.term()!
-        while let op = self.next_op_in("+-"):
+        while true:
+            op := self.next_op_in("+-")
+            if op.is_empty():
+                break
             right := self.term()!
             value = if op == "+": value + right else: value - right
         return value
@@ -62,7 +66,10 @@ impl Parser:
     # term := factor (("*" | "/") factor)*
     fn term() -> Int!:
         mut value := self.factor()!
-        while let op = self.next_op_in("*/"):
+        while true:
+            op := self.next_op_in("*/")
+            if op.is_empty():
+                break
             right := self.factor()!
             if op == "/" and right == 0:
                 fail "division by zero"

@@ -1,35 +1,74 @@
-# bytes io — explicit bytes/text boundaries over file and process io
+# bytes_io: a small binary file format with std.bytes and std.fs.
+#
+# saves a list of notes as a length-prefixed binary file and loads it again.
+# text becomes bytes only at the edges: from_string_utf8 on the way out,
+# decode_utf8 on the way in, where invalid utf-8 is an error rather than a
+# garbled string. a ByteBuffer assembles the file and read_word reads the
+# little-endian length fields back.
 
 import std.bytes as bytes
 import std.fs as fs
 
-fn main() -> String!:
-    payload := bytes.from_string_utf8("pith bytes")
-    path := "/tmp/pith_bytes_example.bin"
+MAGIC := "NOTE"
 
-    out := fs.create(path)!
-    defer out.close()
-    print("wrote: {out.write_all_bytes(payload)!}")
+# file layout: the magic, then per note a 2-byte length and the utf-8 text
+fn encode_notes(notes: List[String]) -> Bytes!:
+    out := bytes.buffer()
+    out.write_string_utf8(MAGIC)!
+    for note in notes:
+        text := bytes.from_string_utf8(note)
+        out.write_word(text.len(), 2)
+        out.write(text)!
+    return out.take_bytes()
 
+fn decode_notes(data: Bytes) -> List[String]!:
+    if not bytes.starts_with(data, bytes.from_string_utf8(MAGIC)):
+        fail "not a notes file"
+    mut notes: List[String] := []
+    mut offset := MAGIC.len()
+    while offset < data.len():
+        if offset + 2 > data.len():
+            fail "truncated length at byte {offset}"
+        length := bytes.read_word(data, offset, 2)
+        start := offset + 2
+        if start + length > data.len():
+            fail "note at byte {offset} runs past the end"
+        note := bytes.decode_utf8(bytes.slice(data, start, start + length))
+        if note.is_err:
+            fail "note at byte {offset} is not utf-8"
+        notes.push(note.ok)
+        offset = start + length
+    return notes
+
+fn save(path: String, data: Bytes) -> Int!:
+    file := fs.create(path)!
+    defer file.close()
+    return file.write_all_bytes(data)!
+
+fn load(path: String) -> Bytes!:
     file := fs.open(path)!
     defer file.close()
-    raw := file.read_all_bytes()!
-    fs.remove(path)
+    return file.read_all_bytes()!
 
-    decoded := bytes.decode_utf8(raw)
-    print("len: {bytes.len(raw)}")
-    print("typed decode: {decoded.is_ok}")
-    print("text: {decoded.ok}")
+fn main() -> Int!:
+    notes := ["buy milk", "café at 10", "日本語のメモ"]
+    path := "/tmp/pith_bytes_io_notes.bin"
+    defer fs.remove(path)
 
-    invalid_buf := bytes.buffer()
-    invalid_buf.write_byte(255)!
-    invalid := bytes.decode_utf8(invalid_buf.bytes())
-    print("invalid decode: {invalid.is_err}")
+    data := encode_notes(notes)!
+    print("wrote {save(path, data)!} bytes for {notes.len()} notes")
+    for note in decode_notes(load(path)!)!:
+        print("  {note} ({bytes.from_string_utf8(note).len()} bytes)")
 
-    scratch := bytes.buffer()
-    scratch.write_string_utf8("hi")!
-    scratch.write_line_utf8("there")!
-    print("scratch ok: " + (scratch.bytes().to_string_utf8()! == "hithere\n").to_string())
-    scratch.reset()
-    print("scratch reset: {bytes.len(scratch.bytes())}")
-    return ""
+    # a damaged file is reported, not half-read
+    print("")
+    broken := bytes.buffer()
+    broken.write_string_utf8(MAGIC)!
+    broken.write_word(2, 2)
+    broken.write_byte(255)!
+    broken.write_byte(254)!
+    for sample in [bytes.from_string_utf8("PNG..."), bytes.slice(data, 0, 9), broken.take_bytes()]:
+        outcome := decode_notes(sample)
+        if outcome.is_err:
+            print("rejected: {outcome.err}")
+    return 0

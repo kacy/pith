@@ -1,67 +1,70 @@
-# one connection handler serving plain http and websocket upgrades.
+# one std.web app serving plain http and websocket upgrades.
 #
-# handle reads the request and decides: an upgrade on /ws becomes a websocket
-# session that echoes messages, /greet renders a page, and anything else is a
-# 404. it works on buffered readers and writers, so main drives it with
-# in-memory connections and reads back the bytes a client would receive.
+# /greet renders a page, /ws upgrades to a websocket session that echoes
+# messages, and anything else is a 404. the /ws route answers with
+# websocket.take_connection: once the handler returns, the server writes the
+# handshake and runs the session on the connection. a plain GET on /ws gets a
+# 400. main starts the server on a background task and plays the client.
 #
 # /greet puts a query parameter into html, so it escapes it with std.html.
 # the second greeting is the proof: a script tag comes back as text.
 
-import std.bytes as bytes
 import std.html as html
-import std.io as io
 import std.net.http as http
+import std.net.tcp as tcp
 import std.net.websocket as websocket
-from std.io import BufferedBytesReader, BufferedBytesWriter
-from std.net.http import HttpRequestBytes
+import std.web as web
 
-fn echo_session(ws: websocket.WebSocket) -> Int:
+PORT := 18113
+
+fn greet(req: web.Request) -> http.HttpResponse:
+    name := req.query_or("name", "stranger")
+    return http.html(200, "<h1>hello, {html.escape(name)}!</h1>")
+
+fn echo_session(ws: websocket.WebSocket) -> Int!:
     mut echoed := 0
     while true:
+        # recv_text fails once the client has sent its close frame.
         text := ws.recv_text() catch:
             break
-        ws.send_text("echo: {text}") catch:
-            break
+        ws.send_text("echo: {text}")!
         echoed += 1
     return echoed
 
-fn handle(reader: BufferedBytesReader, writer: BufferedBytesWriter) -> Int!:
-    req := http.read_request_buffered_bytes(reader)!
-    if websocket.is_upgrade_request(req) and req.matches_path("/ws")!:
-        return echo_session(websocket.accept_buffered(req, reader, writer)!)
-    if req.is_get("/greet")!:
-        name := req.query_param_or("name", "stranger")
-        return http.send_buffered(writer, http.html(200, "<h1>hello, {html.escape(name)}!</h1>"))!
-    return http.send_buffered(writer, http.not_found_response())!
+fn upgrade(req: web.Request) -> http.HttpResponse:
+    return websocket.take_connection(req.raw, echo_session)
 
-# run one connection: `inbound` is everything the client sends, and the
-# result is everything the server sent back.
-fn serve(inbound: Bytes) -> Bytes!:
-    out := bytes.buffer()
-    handle(io.bytes_reader(inbound).buffered_chunked(16), out.buffered_chunked(16))!
-    return out.bytes()
+fn serve(port: Int) -> Int:
+    app := web.new().get("/greet", greet).get("/ws", upgrade)
+    return app.listen("127.0.0.1", port) catch 0
+
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
 
 fn get(path: String) -> String!:
-    reply := serve(bytes.from_string_utf8("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n"))!
-    resp := http.parse_response_bytes(reply)!
+    resp := http.get_request("127.0.0.1", PORT, path).send()!
     return "{resp.status} {resp.body_text()!}"
 
-fn websocket_exchange(message: String) -> String!:
-    no_headers: Map[String, String] := {}
-    upgrade := websocket.client_request("example.com", "/ws", no_headers)!
-    frame := websocket.client_text_frame_bytes(message, bytes.from_string_utf8("m4sk"))!
-    reply := serve(bytes.concat(upgrade, frame))!
-
-    # the reply is the 101 handshake head, then the server's frames.
-    head_end := bytes.index_of(reply, bytes.from_string_utf8("\r\n\r\n")) + 4
-    status_line := reply.slice(0, head_end).to_string_utf8()!.split("\r\n")[0]
-    echoed := websocket.parse_frame(reply.slice(head_end, reply.len()))!
-    return "{status_line}, then {echoed.payload_text()!}"
-
 fn main() -> Int!:
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
+
     print("GET /greet?name=pith      -> {get("/greet?name=pith")!}")
     print("GET /greet?name=<script>  -> {get("/greet?name=<script>alert(1)</script>")!}")
-    print("GET /ws, upgraded         -> {websocket_exchange("pith")!}")
+    print("GET /ws, not upgraded     -> {get("/ws")!}")
     print("GET /missing              -> {get("/missing")!}")
+
+    ws := websocket.dial("127.0.0.1", PORT, "/ws")!
+    for message in ["pith", "websockets"]:
+        ws.send_text(message)!
+        print("websocket {message} -> {ws.recv_text()!}")
+    ws.close(1000, "done")!
     return 0

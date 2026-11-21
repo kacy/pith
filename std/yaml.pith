@@ -81,14 +81,28 @@ fn yaml_decode_fail(message: String) -> YamlDecodeError:
 # turns that mistake into a plain "invalid handle".
 threadlocal mut next_node_id: Int := 0
 
-# node kinds, as stored in node_kinds.
-YAML_NULL := 0
-YAML_STRING := 1
-YAML_BOOL := 2
-YAML_INT := 3
-YAML_FLOAT := 4
-YAML_MAP := 5
-YAML_SEQ := 6
+# the kind of a node, as stored in node_kinds. it has no payloads, so it is
+# a plain integer at run time.
+enum YamlKind:
+    Null
+    String
+    Bool
+    Int
+    Float
+    Map
+    Seq
+
+impl YamlKind:
+    # the name node_kind reports for this kind.
+    fn name() -> String:
+        return match self:
+            YamlKind.Null => "null"
+            YamlKind.String => "string"
+            YamlKind.Bool => "bool"
+            YamlKind.Int => "int"
+            YamlKind.Float => "float"
+            YamlKind.Map => "map"
+            YamlKind.Seq => "seq"
 
 # the pool keeps nodes in parallel lists, one slot per live node in id order,
 # the way std.json does. a node is its kind, one Int payload and a child count:
@@ -97,7 +111,7 @@ YAML_SEQ := 6
 # children in the flat lists below. a node used to take an entry in nine maps,
 # about 650 bytes a node, so a 4 MiB document near the node cap could hold
 # around 170 MB.
-threadlocal mut node_kinds: List[Int] := []
+threadlocal mut node_kinds: List[YamlKind] := []
 threadlocal mut node_payloads: List[Int] := []
 threadlocal mut node_counts: List[Int] := []
 threadlocal mut node_strings: List[String] := []
@@ -124,7 +138,7 @@ threadlocal mut open_scope_depth: Int := 0
 threadlocal mut nodes_this_parse: Int := 0
 
 # appends a node and returns its id.
-fn allocate_node(kind: Int, payload: Int, count: Int) -> Int:
+fn allocate_node(kind: YamlKind, payload: Int, count: Int) -> Int:
     node_id := next_node_id
     next_node_id = next_node_id + 1
     nodes_this_parse = nodes_this_parse + 1
@@ -205,7 +219,7 @@ fn yaml_restore_to(node_id_mark: Int, map_flat_mark: Int, seq_flat_mark: Int):
         # node marks where node_strings is cut
         mut slot := cut
         while slot < node_kinds.len():
-            if node_kinds[slot] == YAML_STRING:
+            if node_kinds[slot] == YamlKind.String:
                 truncate_list(node_strings, node_payloads[slot])
                 break
             slot = slot + 1
@@ -275,20 +289,7 @@ fn node_kind(handle: Int) -> String:
     slot := node_slot(handle)
     if slot < 0:
         return ""
-    kind := node_kinds[slot]
-    if kind == YAML_STRING:
-        return "string"
-    if kind == YAML_MAP:
-        return "map"
-    if kind == YAML_SEQ:
-        return "seq"
-    if kind == YAML_INT:
-        return "int"
-    if kind == YAML_BOOL:
-        return "bool"
-    if kind == YAML_FLOAT:
-        return "float"
-    return "null"
+    return node_kinds[slot].name()
 
 # ===============================================================
 # Parser state
@@ -471,25 +472,25 @@ fn skip_blank_lines():
 # ===============================================================
 
 fn null_node() -> Int:
-    return allocate_node(YAML_NULL, 0, 0)
+    return allocate_node(YamlKind.Null, 0, 0)
 
 fn string_node(value: String) -> Int:
     if value.len() > MAX_SCALAR_BYTES:
         yaml_fail("scalar of " + value.len().to_string() + " bytes exceeds the " + MAX_SCALAR_BYTES.to_string() + "-byte limit")
         return 0 - 1
     node_strings.push(value)
-    return allocate_node(YAML_STRING, node_strings.len() - 1, 0)
+    return allocate_node(YamlKind.String, node_strings.len() - 1, 0)
 
 fn bool_node(value: Bool) -> Int:
     if value:
-        return allocate_node(YAML_BOOL, 1, 0)
-    return allocate_node(YAML_BOOL, 0, 0)
+        return allocate_node(YamlKind.Bool, 1, 0)
+    return allocate_node(YamlKind.Bool, 0, 0)
 
 fn int_node(value: Int) -> Int:
-    return allocate_node(YAML_INT, value, 0)
+    return allocate_node(YamlKind.Int, value, 0)
 
 fn float_node(value: Float) -> Int:
-    return allocate_node(YAML_FLOAT, float_to_bits(value), 0)
+    return allocate_node(YamlKind.Float, float_to_bits(value), 0)
 
 fn hex_digit_value(c: String) -> Int:
     if c >= "0" and c <= "9":
@@ -817,13 +818,13 @@ fn finish_map(keys_in: List[String], values_in: List[Int]) -> Int:
         map_keys_flat.push(key)
     for value in values_in:
         map_values_flat.push(value)
-    return allocate_node(YAML_MAP, offset, keys_in.len())
+    return allocate_node(YamlKind.Map, offset, keys_in.len())
 
 fn finish_seq(items: List[Int]) -> Int:
     offset := seq_items_flat.len()
     for item in items:
         seq_items_flat.push(item)
-    return allocate_node(YAML_SEQ, offset, items.len())
+    return allocate_node(YamlKind.Seq, offset, items.len())
 
 # guards against a document that is all structure and no content.
 fn over_budget() -> Bool:

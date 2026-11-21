@@ -14,7 +14,7 @@
 import std.bytes as bytes
 import std.time as time
 from std.bytes import ByteBuffer
-from std.concurrent import Context, BlockingError, blocking_cancelled, blocking_deadline_exceeded, blocking_failed
+from std.concurrent import Context, BlockingError, blocking_cancelled, blocking_deadline_exceeded, blocking_failed, background
 
 DEFAULT_CHUNK_SIZE := 4096
 
@@ -1932,43 +1932,47 @@ fn buffered_text_read_ctx(reader: BufferedReader, ctx: Context, max_bytes: Int) 
         got = got + stop - at
     return join_parts(parts)
 
-fn buffered_text_read_line(reader: BufferedReader) -> String!:
+# the next line, or none at the end of input. read_line and read_line_opt
+# share this; read_line turns none into "".
+fn buffered_text_read_line(reader: BufferedReader) -> (String?)!:
     if not buffered_readers.contains_key(reader.handle):
-        return ""
+        return none
     state := buffered_readers[reader.handle]
 
     parts := empty_string_parts()
     while true:
         if state.cursor >= state.cache.len():
             if buffered_text_fill(state)! <= 0:
-                return join_parts(parts)
+                return line_at_end(parts)
         cursor := state.cursor
         data := state.cache
         newline := find_newline_from(data, cursor)
         if newline >= 0:
             parts.push(data.substring(cursor, newline))
             state.cursor = newline + 1
-            return trim_trailing_cr(join_parts(parts))
+            line: String? := trim_trailing_cr(join_parts(parts))
+            return line
         parts.push(data.substring(cursor, data.len()))
         buffered_reader_clear(state)
 
-fn buffered_text_read_line_ctx(reader: BufferedReader, ctx: Context) -> String!BlockingError:
+fn buffered_text_read_line_ctx(reader: BufferedReader, ctx: Context) -> (String?)!BlockingError:
     if not buffered_readers.contains_key(reader.handle):
-        return ""
+        return none
     state := buffered_readers[reader.handle]
 
     parts := empty_string_parts()
     while true:
         if state.cursor >= state.cache.len():
             if buffered_text_fill_ctx(state, ctx)! <= 0:
-                return join_parts(parts)
+                return line_at_end(parts)
         cursor := state.cursor
         data := state.cache
         newline := find_newline_from(data, cursor)
         if newline >= 0:
             parts.push(data.substring(cursor, newline))
             state.cursor = newline + 1
-            return trim_trailing_cr(join_parts(parts))
+            line: String? := trim_trailing_cr(join_parts(parts))
+            return line
         parts.push(data.substring(cursor, data.len()))
         buffered_reader_clear(state)
 
@@ -2046,6 +2050,15 @@ fn buffered_text_read_until_ctx(reader: BufferedReader, ctx: Context, sep: Strin
             return join_parts(parts)
     return join_parts(parts)
 
+# at end of input, the last line when it had no terminator, or none when
+# nothing was left. an empty line before the end was already returned at its
+# newline, so an empty rest here always means the end.
+fn line_at_end(parts: List[String]) -> String?:
+    rest := join_parts(parts)
+    if rest == "":
+        return none
+    return rest
+
 # at end of stream, move whatever is left in the buffer onto `parts`.
 fn buffered_text_take_rest(state: BufferedReaderState, parts: List[String]):
     if state.cache.len() > state.cursor:
@@ -2105,10 +2118,23 @@ impl BufferedReader:
     fn read_ctx(ctx: Context, max_bytes: Int) -> String!BlockingError:
         return buffered_text_read_ctx(self, ctx, max_bytes)
 
+    # the next line without its terminator, or "" at the end of input. an
+    # empty line also reads as "", so use read_line_opt to tell them apart.
     fn read_line() -> String!:
-        return buffered_text_read_line(self)
+        line := buffered_text_read_line(self)!
+        return line.unwrap_or("")
 
     fn read_line_ctx(ctx: Context) -> String!BlockingError:
+        line := buffered_text_read_line_ctx(self, ctx)!
+        return line.unwrap_or("")
+
+    # the next line without its terminator, or none at the end of input, so
+    # an empty line ("") and the end are different values. a last line with
+    # no terminator is still returned before the none.
+    fn read_line_opt() -> (String?)!:
+        return buffered_text_read_line(self)
+
+    fn read_line_opt_ctx(ctx: Context) -> (String?)!BlockingError:
         return buffered_text_read_line_ctx(self, ctx)
 
     fn read_until(sep: String) -> String!:
@@ -2278,6 +2304,13 @@ impl ProcessStdin:
 impl Writer for ProcessStdin:
     fn write(data: String) -> Int!:
         return process_stdin_write(self, data)
+
+impl Closer for ProcessStdin:
+    # close the write end of the child's stdin, so a child that reads to the
+    # end of its input (sort, wc) sees end of file. flush a buffered writer
+    # over it first. a later write fails, and a second close is a no-op.
+    fn close():
+        process_close_stdin(self.handle)
 
 impl BytesWriter for ProcessStdin:
     fn write_bytes(data: Bytes) -> Int!:
@@ -2684,6 +2717,32 @@ test "io buffered string readers split lines and separators":
     assert_eq(buffered.read_line()!, "alpha")
     assert_eq(buffered.read_line()!, "beta")
     assert_eq(buffered.read_until("ma")!, "gam")
+
+test "io buffered read_line_opt tells an empty line from the end":
+    nl := chr(10)
+    buffered := string_reader("one" + nl + nl + "three" + chr(13) + nl + "last").buffered_chunked(2)
+    mut lines: List[String] := []
+    while true:
+        line := buffered.read_line_opt()!
+        if line == none:
+            break
+        lines.push("[" + line.value() + "]")
+    assert_eq(lines.join(","), "[one],[],[three],[last]")
+    assert(buffered.read_line_opt()! == none)
+    assert_eq(buffered.read_line()!, "")
+
+    ends_with_newline := string_reader("a" + nl).buffered()
+    assert_eq(ends_with_newline.read_line_opt()!.value(), "a")
+    assert(ends_with_newline.read_line_opt()! == none)
+    assert(string_reader("").buffered().read_line_opt()! == none)
+
+    ctx := background()
+    blank := string_reader(nl).buffered()
+    assert_eq(blank.read_line_opt_ctx(ctx)!.value(), "")
+    assert(blank.read_line_opt_ctx(ctx)! == none)
+    assert_eq(blank.read_line_ctx(ctx)!, "")
+    blank.close()
+    assert(blank.read_line_opt()! == none)
 
 test "io buffered string writers flush by chunk size":
     out := string_buffer()

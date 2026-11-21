@@ -1,0 +1,23 @@
+# a call through a closure stored in a field pins the closure before its
+# arguments run. a `!` in an argument that returns early has to drop that pin;
+# it used to return holding it, leaking the closure once per failed call.
+import std.bytes as bytes
+
+struct Holder:
+    f: fn(String) -> Int
+
+fn call_it(h: Holder, got: Bytes) -> Int!:
+    return h.f(got.to_string_utf8()!)
+
+fn main():
+    raw := bytes.buffer()
+    raw.write_byte(255) catch 0
+    bad := raw.bytes()
+    mut failed := 0
+    mut i := 0
+    while i < 1000:
+        h := Holder(f: fn(s: String) => s.len() + i)
+        if call_it(h, bad).is_err:
+            failed = failed + 1
+        i = i + 1
+    print("{failed}")

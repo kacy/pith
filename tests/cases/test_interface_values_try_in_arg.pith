@@ -1,0 +1,32 @@
+# a call on an interface value pins its receiver before its arguments run. a
+# `!` in an argument that returns early has to drop that pin on the way out;
+# it used to return still holding it, so the receiver leaked once per failed
+# call.
+import std.io as io
+import std.bytes as bytes
+
+struct Sink:
+    base: Int
+
+impl io.BytesWriter for Sink:
+    fn write_bytes(data: Bytes) -> Int!:
+        return self.base + data.len()
+
+fn shout(got: Bytes, w: io.BytesWriter) -> Int!:
+    return w.write_bytes(bytes.from_string_utf8(got.to_string_utf8()!))!
+
+fn main():
+    good := bytes.from_string_utf8("ab")
+    raw := bytes.buffer()
+    raw.write_byte(255) catch 0
+    bad := raw.bytes()
+    mut total := 0
+    mut failed := 0
+    mut i := 0
+    while i < 1000:
+        w: io.BytesWriter := Sink(i)
+        total = total + (shout(good, w) catch 0)
+        if shout(bad, w).is_err:
+            failed = failed + 1
+        i = i + 1
+    print("{total} {failed}")

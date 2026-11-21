@@ -8944,8 +8944,11 @@ fn ir_emit_interface_method_call(idx: Int) -> Int:
         return 0 - 1
     recv_r := ir_expr(recv_idx)
     # the method runs user code that could drop the last other count on the
-    # receiver, so it is pinned for the call, as a closure field is
+    # receiver, so it is pinned for the call, as a closure field is. the pin
+    # is in flight while the arguments run, so a `!` among them that returns
+    # early releases it.
     ir_rc_retain_reg(recv_r, "struct")
+    ir_inflight_push(recv_r, "struct")
     value_r := ir_reg()
     ir_emit("field " + value_r.to_string() + " " + recv_r.to_string() + " 8 int value")
     fn_r := ir_reg()
@@ -8967,6 +8970,7 @@ fn ir_emit_interface_method_call(idx: Int) -> Int:
             plain_args.push(reg)
     ir_release_owned_method_args(node, plain_args, 0 - 1)
     ir_unpin_args(arg_regs, arg_pins)
+    ir_inflight_drop(recv_r)
     ir_rc_release_reg(recv_r, "struct")
     if ir_field_receiver_is_owned_temp(recv_idx):
         ir_rc_release_reg(recv_r, "struct")
@@ -9211,6 +9215,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             # user callee; unpinned, `h.f = g` inside the closure freed the
             # environment it was still running in.
             ir_rc_retain_reg(handle_r, "closure")
+            ir_inflight_push(handle_r, "closure")
             mut arg_regs: List[Int] := []
             mut arg_pins: List[String] := []
             mut ai := 0
@@ -9224,6 +9229,7 @@ fn ir_emit_general_method_call(idx: Int) -> Int:
             ir_emit("call " + r.to_string() + " " + tmp_name + " unknown " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
             ir_release_owned_method_args(node, arg_regs, 0 - 1)
             ir_unpin_args(arg_regs, arg_pins)
+            ir_inflight_drop(handle_r)
             ir_rc_release_reg(handle_r, "closure")
             if ir_field_receiver_is_owned_temp(node.children[0]):
                 ir_rc_release_reg(recv_r, ir_rc_kind(ir_infer_type(node.children[0])))

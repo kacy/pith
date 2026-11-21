@@ -1,7 +1,7 @@
 # generated from a .proto file by tools/protogen; do not edit by hand.
 # proto package: catalog
 
-from std.protobuf import ProtoError, writer, reader, WIRE_LEN
+from std.protobuf import ProtoError, writer, reader, WIRE_LEN, MAX_NESTING_DEPTH, nesting_error
 import std.bytes as bytes
 import std.net.grpc as grpc
 
@@ -41,6 +41,12 @@ pub fn encode_Product(m: Product) -> Bytes:
 
 # decode a Product from protobuf wire bytes.
 pub fn decode_Product(data: Bytes) -> Product!ProtoError:
+    return decode_Product_at(data, 0)!
+
+# decode a Product nested `depth` messages deep.
+fn decode_Product_at(data: Bytes, depth: Int) -> Product!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := Product(sku: "", name: "", price: 0.0, category: 0, tags: [], in_stock: false)
     r := reader(data)
     while not r.at_end():
@@ -76,6 +82,12 @@ pub fn encode_GetProductRequest(m: GetProductRequest) -> Bytes:
 
 # decode a GetProductRequest from protobuf wire bytes.
 pub fn decode_GetProductRequest(data: Bytes) -> GetProductRequest!ProtoError:
+    return decode_GetProductRequest_at(data, 0)!
+
+# decode a GetProductRequest nested `depth` messages deep.
+fn decode_GetProductRequest_at(data: Bytes, depth: Int) -> GetProductRequest!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := GetProductRequest(sku: "")
     r := reader(data)
     while not r.at_end():
@@ -104,6 +116,12 @@ pub fn encode_SearchRequest(m: SearchRequest) -> Bytes:
 
 # decode a SearchRequest from protobuf wire bytes.
 pub fn decode_SearchRequest(data: Bytes) -> SearchRequest!ProtoError:
+    return decode_SearchRequest_at(data, 0)!
+
+# decode a SearchRequest nested `depth` messages deep.
+fn decode_SearchRequest_at(data: Bytes, depth: Int) -> SearchRequest!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := SearchRequest(query: "", max_results: 0)
     r := reader(data)
     while not r.at_end():
@@ -134,12 +152,18 @@ pub fn encode_SearchResponse(m: SearchResponse) -> Bytes:
 
 # decode a SearchResponse from protobuf wire bytes.
 pub fn decode_SearchResponse(data: Bytes) -> SearchResponse!ProtoError:
+    return decode_SearchResponse_at(data, 0)!
+
+# decode a SearchResponse nested `depth` messages deep.
+fn decode_SearchResponse_at(data: Bytes, depth: Int) -> SearchResponse!ProtoError:
+    if depth > MAX_NESTING_DEPTH:
+        fail nesting_error()
     m := SearchResponse(products: [], total: 0)
     r := reader(data)
     while not r.at_end():
         tag := r.read_tag()!
         if tag.field == 1:
-            m.products.push(decode_Product(r.read_message()!)!)
+            m.products.push(decode_Product_at(r.read_message()!, depth + 1)!)
         elif tag.field == 2:
             m.total = r.read_int64()!
         else:
@@ -173,7 +197,7 @@ impl CatalogClient:
 # a server for the Catalog service. implement one handler per rpc and
 # hand them to serve_Catalog; the router deframes and decodes each
 # request, dispatches by method path, and frames the reply. a streamed
-# request arrives as a List, and a streamed reply is returned as one â
+# request arrives as a List, and a streamed reply is returned as one:
 # buffered end to end, so bounded streams only.
 fn _Catalog_GetProduct_unimpl(req: GetProductRequest) -> Product!grpc.GrpcError:
     fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "GetProduct not implemented")
@@ -218,3 +242,52 @@ pub fn serve_Catalog_tls(host: String, port: Int, cert: String, key: String, Get
     _Catalog_GetProduct_fn = GetProduct
     _Catalog_Search_fn = Search
     return grpc.serve_body_tls(host, port, cert, key, _Catalog_route)!
+
+# handler slots for the streaming rpcs; the unary rpcs share the buffered
+# serve_Catalog slots above. module globals, because grpc's dispatch is
+# a bare fn-value that cannot capture.
+
+# route one live rpc by its method path, driving the stream to completion.
+# a unary arm recvs the one request (requiring the client's half-close) and
+# sends the one reply; a streaming arm hands its typed ServerCall to the
+# installed handler. an error return becomes the grpc-status; a clean
+# return that never finished gets finish_ok from grpc.serve_stream.
+fn _Catalog_stream_route(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:
+    if path == "/catalog.Catalog/GetProduct":
+        first := call.recv_message()!
+        if not first.done:
+            second := call.recv_message()!
+            if not second.done:
+                fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "expected one request message")
+        decoded := decode_GetProductRequest(first.message)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode GetProductRequest failed")
+        call.send_message(encode_Product(_Catalog_GetProduct_fn(decoded.ok)!))
+        return 0
+    if path == "/catalog.Catalog/Search":
+        first := call.recv_message()!
+        if not first.done:
+            second := call.recv_message()!
+            if not second.done:
+                fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "expected one request message")
+        decoded := decode_SearchRequest(first.message)
+        if decoded.is_err:
+            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: "grpc: decode SearchRequest failed")
+        call.send_message(encode_SearchResponse(_Catalog_Search_fn(decoded.ok)!))
+        return 0
+    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: "no method " + path)
+
+# serve the whole Catalog service over one plaintext http/2 (h2c)
+# streaming listener. unary handlers keep the (Req) -> Resp shape; a
+# streaming rpc's handler drives its typed ServerCall incrementally.
+# blocks, accepting connections.
+pub fn serve_Catalog_streaming(host: String, port: Int, GetProduct: fn(GetProductRequest) -> Product!grpc.GrpcError, Search: fn(SearchRequest) -> SearchResponse!grpc.GrpcError) -> Int!:
+    _Catalog_GetProduct_fn = GetProduct
+    _Catalog_Search_fn = Search
+    return grpc.serve_stream(host, port, _Catalog_stream_route)!
+
+# like serve_Catalog_streaming, over http/2 with tls (alpn h2).
+pub fn serve_Catalog_streaming_tls(host: String, port: Int, cert: String, key: String, GetProduct: fn(GetProductRequest) -> Product!grpc.GrpcError, Search: fn(SearchRequest) -> SearchResponse!grpc.GrpcError) -> Int!:
+    _Catalog_GetProduct_fn = GetProduct
+    _Catalog_Search_fn = Search
+    return grpc.serve_stream_tls(host, port, cert, key, _Catalog_stream_route)!

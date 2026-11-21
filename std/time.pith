@@ -5,7 +5,7 @@
 #   mono_nanos() -> Int          monotonic timestamp in nanoseconds
 #   mono_millis() -> Int         monotonic timestamp in milliseconds
 #   delay(ms: Int)               sleep for the given milliseconds
-#   format_now() -> String       format the current time
+#   format_now() -> String       format the current time in utc
 
 fn time_now_ms() -> Int:
     return time()
@@ -38,9 +38,9 @@ pub fn mono_millis() -> Int:
 pub fn delay(ms: Int):
     sleep(ms)
 
-# format the current time as a human-readable string
+## format the current time in utc as "YYYY-MM-DD HH:MM:SS".
 pub fn format_now() -> String:
-    return format_time(time_now_ms(), "")
+    return format_time(time_now_ms(), "%Y-%m-%d %H:%M:%S")
 
 test "time now is monotonic over a zero delay":
     before := now()
@@ -52,3 +52,9 @@ test "time now is monotonic over a zero delay":
 
 test "time formats the current timestamp":
     assert(format_now().len() > 0)
+
+test "time format_time renders utc fields":
+    assert(format_time(1709214307089, "%Y-%m-%d %H:%M:%S") == "2024-02-29 13:45:07")
+    assert(format_time(0, "%FT%T.%3fZ") == "1970-01-01T00:00:00.000Z")
+    assert(format_time(0, "100%%") == "100%")
+    assert(format_now().len() == 19)

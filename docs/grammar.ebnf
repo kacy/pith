@@ -130,6 +130,10 @@ fn_decl       = "fn" , IDENT , [ generic_params ] , "(" , [ param_list ] , ")"
 (* the mutexes a caller must hold. `holding` is a keyword only here. *)
 holding       = "holding" , mutex_path , { "," , mutex_path } ;
 
+(* a call may leave out a trailing parameter that has a default, and the     *)
+(* default is passed in its place. a default is a literal, a negated number, *)
+(* `none` or an enum variant without a payload, and only trailing parameters *)
+(* have one (E317). a call through a function value passes every argument.  *)
 param_list    = param , { "," , param } ;
 param         = [ "mut" ] , [ "ref" ] , IDENT , ":" , type_expr , [ "=" , expression ] ;
 

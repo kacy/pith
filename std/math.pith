@@ -57,6 +57,12 @@ pub fn exp(x: Float) -> Float:
     if val < 0.0:
         val = 0.0 - val
         neg = true
+    # e^710 is past the largest float, and peeling a huge val one unit at a
+    # time would take forever.
+    if val > 710.0:
+        if neg:
+            return 0.0
+        return 1.0 / 0.0
     # reduce to |val| <= 1 by peeling off integer part
     # e = 2.71828182845904523536
     e_val := 2.71828182845904523536
@@ -78,20 +84,24 @@ pub fn exp(x: Float) -> Float:
         return 1.0 / result
     return result
 
-# Natural log via Halley's method
+# natural log: scale x into [1/e, e] by whole powers of e, counted in k, then
+# Halley's method finds log of what is left.
 pub fn log(x: Float) -> Float:
     if x <= 0.0:
         return 0.0 / 0.0
+    if x != x or x == 1.0 / 0.0:
+        return x
     e_val := 2.71828182845904523536
-    mut y := 0.0
+    mut k := 0.0
     mut val := x
     while val > e_val:
         val = val / e_val
-        y = y + 1.0
+        k = k + 1.0
     inv_e := 1.0 / e_val
     while val < inv_e:
         val = val * e_val
-        y = y - 1.0
+        k = k - 1.0
+    mut y := 0.0
     mut i := 0
     while i < 12:
         ey := exp(y)
@@ -99,7 +109,7 @@ pub fn log(x: Float) -> Float:
         denom := 2.0 * ey + diff
         y = y + 2.0 * diff / denom
         i = i + 1
-    return y
+    return k + y
 
 # log base 10.
 pub fn log10(x: Float) -> Float:
@@ -113,25 +123,62 @@ pub fn log2(x: Float) -> Float:
 # Power and Root
 # ===============================================================
 
-## Raise a float to a float exponent.
+## raise a float to a float exponent, following c pow: a zero exponent gives
+## 1.0, a zero base gives 0.0 for a positive exponent and infinity for a
+## negative one, and a negative base gives a result signed by the parity of
+## an integral exponent, or nan when the exponent is not integral.
 pub fn pow_float(base: Float, exponent: Float) -> Float:
-    if exponent == 0.0:
+    if exponent == 0.0 or base == 1.0:
         return 1.0
+    if base != base or exponent != exponent:
+        return 0.0 / 0.0
     if base == 0.0:
+        if exponent < 0.0:
+            return 1.0 / 0.0
         return 0.0
-    return exp(exponent * log(base))
+    integral := floor(exponent) == exponent
+    if base < 0.0 and not integral:
+        return 0.0 / 0.0
+    mut magnitude := 0.0
+    if integral and abs_float(exponent) < 1.0 / 0.0:
+        magnitude = pow_int_exponent(abs_float(base), exponent)
+    else:
+        magnitude = exp(exponent * log(abs_float(base)))
+    if base < 0.0 and exponent - 2.0 * floor(exponent / 2.0) == 1.0:
+        return 0.0 - magnitude
+    return magnitude
 
-# square root via newton iteration.
+# raise a positive base to an integral exponent by repeated squaring, which is
+# exact whenever the result is representable.
+fn pow_int_exponent(base: Float, exponent: Float) -> Float:
+    mut n := abs_float(exponent)
+    mut factor := base
+    mut result := 1.0
+    while n > 0.0:
+        half := floor(n / 2.0)
+        if n - 2.0 * half == 1.0:
+            result = result * factor
+        factor = factor * factor
+        n = half
+    if exponent < 0.0:
+        return 1.0 / result
+    return result
+
+# square root via newton iteration. starting at or above the root, each step
+# lowers the guess until it stops falling, which is the root.
 pub fn sqrt(x: Float) -> Float:
     if x <= 0.0:
         return 0.0
-    mut guess := x / 2.0
-    if guess < 1.0:
-        guess = 1.0
-    mut i := 0
-    while i < 20:
-        guess = (guess + x / guess) / 2.0
-        i = i + 1
+    if x != x or x == 1.0 / 0.0:
+        return x
+    mut guess := 1.0
+    if x > 1.0:
+        guess = x
+    while true:
+        next := (guess + x / guess) / 2.0
+        if next >= guess:
+            return guess
+        guess = next
     return guess
 
 # absolute value for floats.
@@ -219,12 +266,14 @@ pub fn atan2(y: Float, x: Float) -> Float:
         return 0.0 - pi / 2.0
     return 0.0
 
-# inverse sine.
+# inverse sine: pi/2 at 1.0, -pi/2 at -1.0, and nan outside [-1, 1].
 pub fn asin(x: Float) -> Float:
-    if abs_float(x) >= 1.0:
-        if x > 0.0:
-            return PI() / 2.0
-            return 0.0 - PI() / 2.0
+    if x == 1.0:
+        return PI() / 2.0
+    if x == -1.0:
+        return 0.0 - PI() / 2.0
+    if not (x > -1.0 and x < 1.0):
+        return 0.0 / 0.0
     return atan(x / sqrt(1.0 - x * x))
 
 # inverse cosine.
@@ -266,7 +315,30 @@ test "math constants and conversions are close":
 test "math exponent logs powers and roots are close":
     assert(abs_float(exp(1.0) - E()) < 0.001)
     assert(abs_float(sqrt(9.0) - 3.0) < 0.001)
+    assert(abs_float(sqrt(1.0e300) / 1.0e150 - 1.0) < 0.000000001)
+    assert(abs_float(sqrt(2.0) * sqrt(2.0) - 2.0) < 0.000000001)
+    assert(abs_float(log(8.0) - 3.0 * log(2.0)) < 0.000000001)
+    assert(abs_float(log(100.0) - 4.605170185988091) < 0.000000001)
+    assert(abs_float(log(0.01) + 4.605170185988091) < 0.000000001)
+    assert(abs_float(log10(1000.0) - 3.0) < 0.000000001)
     assert(abs_float(pow_float(2.0, 3.0) - 8.0) < 0.001)
+
+test "math pow_float handles negative and zero bases":
+    assert_eq(pow_float(-2.0, 3.0), -8.0)
+    assert_eq(pow_float(-2.0, 2.0), 4.0)
+    assert_eq(pow_float(-2.0, -1.0), -0.5)
+    assert_eq(pow_float(-2.0, 0.0), 1.0)
+    assert_eq(pow_float(2.0, 10.0), 1024.0)
+    assert_eq(pow_float(0.0, 2.0), 0.0)
+    assert_eq(pow_float(0.0, -1.0), 1.0 / 0.0)
+    assert_eq(pow_float(1.0, 0.0 / 0.0), 1.0)
+    nan := pow_float(-8.0, 1.0 / 3.0)
+    assert(nan != nan)
+    root := pow_float(8.0, 1.0 / 3.0)
+    assert(abs_float(root - 2.0) < 0.000001)
+    assert_eq(pow_float(-1.5, 3000000001.0), 0.0 - 1.0 / 0.0)
+    assert_eq(pow_float(2.0, 1.0 / 0.0), 1.0 / 0.0)
+    assert_eq(pow_float(0.5, 1.0 / 0.0), 0.0)
 
 test "math trig helpers are close":
     pi := PI()
@@ -276,6 +348,23 @@ test "math trig helpers are close":
     assert(abs_float(tan(pi / 4.0) - 1.0) < 0.001)
     assert(abs_float(atan(1.0) - pi / 4.0) < 0.001)
     assert(abs_float(atan2(1.0, 0.0) - pi / 2.0) < 0.001)
+
+test "math asin and acos cover the ends of their domain":
+    pi := PI()
+
+    assert_eq(asin(1.0), pi / 2.0)
+    assert_eq(asin(-1.0), 0.0 - pi / 2.0)
+    assert_eq(asin(0.0), 0.0)
+    assert(abs_float(asin(0.5) - pi / 6.0) < 0.000001)
+    assert(abs_float(asin(-0.5) + pi / 6.0) < 0.000001)
+    assert(abs_float(acos(-1.0) - pi) < 0.000001)
+    assert(abs_float(acos(1.0)) < 0.000001)
+    above := asin(1.5)
+    below := asin(-2.0)
+    outside := acos(3.0)
+    assert(above != above)
+    assert(below != below)
+    assert(outside != outside)
 
 test "math scalar helpers handle signs and triangles":
     assert_eq(sign(2.0), 1.0)

@@ -20,7 +20,7 @@
 # never reaches a spawn reports nothing. the pass reads the types the checker
 # already recorded, so it runs after a successful check.
 
-from ast import Node, get_node
+from ast import Node, get_node, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, has_errors
 from checker import c_get_expr_type, called_declaration, extract_binding_name, COLLECTION_MUTATORS
 from types import get_type_info, get_type_name, is_error_type
@@ -174,8 +174,11 @@ fn record_imports(roots: List[Int], fns: ProgramFns):
                     alias = parts[2]
                 fns.aliases.insert(i.to_string() + "\t" + alias, target)
             elif node.kind == "from_import":
-                for name, j in parts:
-                    if j > 0:
+                aliases := from_import_name_aliases(node.value)
+                for name, j in from_import_names(node.value):
+                    if j < aliases.len() and aliases[j].len() > 0:
+                        fns.aliases.insert(i.to_string() + "\t" + from_import_alias_receiver(aliases[j]), target)
+                    else:
                         fns.from_names.insert(i.to_string() + "\t" + name, target)
 
 # the functions a subtree in `module` calls, appended to `out`, and the first

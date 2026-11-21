@@ -33,32 +33,39 @@ fn quicksort(items: List[Int]) -> List[Int]:
         sorted.push(item)
     return sorted
 
-# the tree is a map from each folder to the names inside it; a name with no
-# entry in the map is a file. a file's size is its own, and a folder's is the
-# sum of everything below it, however deep.
-fn total_bytes(name: String, children: Map[String, List[String]], sizes: Map[String, Int]) -> Int:
-    if let inside = children.get(name):
-        mut total := 0
-        for child in inside:
-            total += total_bytes(child, children, sizes)
-        return total
-    return sizes[name]
+# a folder holds entries, and an entry is a file or another folder, so the
+# type refers to itself. a file's size is its own, and a folder's is the sum
+# of everything below it, however deep.
+enum Entry:
+    File(String, Int)
+    Folder(String, List[Entry])
 
-fn print_tree(name: String, depth: Int, children: Map[String, List[String]], sizes: Map[String, Int]):
-    print("{"  ".repeat(depth)}{name} ({total_bytes(name, children, sizes)} bytes)")
-    for child in children.get(name).unwrap_or([]):
-        print_tree(child, depth + 1, children, sizes)
+fn total_bytes(entry: Entry) -> Int:
+    match entry:
+        Entry.File(_, bytes) =>
+            return bytes
+        Entry.Folder(_, inside) =>
+            mut total := 0
+            for child in inside:
+                total += total_bytes(child)
+            return total
+
+fn print_tree(entry: Entry, depth: Int):
+    indent := "  ".repeat(depth)
+    match entry:
+        Entry.File(name, bytes) =>
+            print("{indent}{name} ({bytes} bytes)")
+        Entry.Folder(name, inside) =>
+            print("{indent}{name} ({total_bytes(entry)} bytes)")
+            for child in inside:
+                print_tree(child, depth + 1)
 
 fn main():
     print("gcd(1071, 462) = {gcd(1071, 462)}")
     print("3^13 = {power(3, 13)}, 2^62 = {power(2, 62)}")
     print("sorted: {fmt.ints(quicksort([38, 27, 43, 3, 9, 82, 10, 27]))}")
 
-    children := {
-        "project/": ["README.md", "src/", "tests/"],
-        "src/": ["main.pith", "parser.pith", "std/"],
-        "std/": ["io.pith"],
-        "tests/": ["parser_test.pith"],
-    }
-    sizes := {"README.md": 2400, "main.pith": 5100, "parser.pith": 12800, "io.pith": 3300, "parser_test.pith": 4100}
-    print_tree("project/", 0, children, sizes)
+    std_dir := Entry.Folder("std/", [Entry.File("io.pith", 3300)])
+    src := Entry.Folder("src/", [Entry.File("main.pith", 5100), Entry.File("parser.pith", 12800), std_dir])
+    tests := Entry.Folder("tests/", [Entry.File("parser_test.pith", 4100)])
+    print_tree(Entry.Folder("project/", [Entry.File("README.md", 2400), src, tests]), 0)

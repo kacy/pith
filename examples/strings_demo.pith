@@ -1,85 +1,72 @@
-# String library demonstration
+# strings_demo: the text helpers in std.strings.
 #
-# Shows usage of std/strings module functions
+# turns a markdown file into a table of contents. split_once and partition
+# read the front matter, trim_left_chars and collapse_whitespace clean up each
+# heading, title and center lay out the banner, and zfill and indent number
+# and nest the entries.
 
-from std.strings import is_digit, is_alpha, is_space
-from std.strings import trim_left, trim_right
-from std.strings import capitalize, title, swap_case
-from std.strings import count, split_lines, partition
-from std.strings import remove_prefix, remove_suffix, strip_prefix, strip_suffix
-from std.strings import reverse, center, zfill
-from std.strings import first_n, last_n
-from std.strings import split_nonempty, join_nonempty, unlines
-from std.strings import collapse_whitespace, starts_with_any, ends_with_any
-from std.strings import common_prefix, common_suffix, indent_nonempty
-import std.io as io
+import std.strings as strings
 
-fn print_line(label: String, value: String) -> String!:
-    out := io.string_buffer()
-    defer out.close()
-    out.write(label)!
-    out.write(value)!
-    print(out.string())
-    return ""
+struct Heading:
+    level: Int
+    text: String
 
-fn main() -> String!:
-    print("=== Character Classification ===")
-    print("is_digit('5'): {is_digit("5")}")
-    print("is_alpha('a'): {is_alpha("a")}")
-    print("is_space(' '): {is_space(" ")}")
+fn read_front_matter(block: String) -> Map[String, String]:
+    mut fields: Map[String, String] := {}
+    for line in strings.split_lines(block):
+        parts := strings.partition(line, ":")
+        if parts[1].is_empty():
+            continue
+        fields[parts[0].trim()] = parts[2].trim()
+    return fields
 
-    print("\n=== Trim Variants ===")
-    print_line("trim_left('  hello  '): '", "{trim_left("  hello  ")}'")!
-    print_line("trim_right('  hello  '): '", "{trim_right("  hello  ")}'")!
+fn read_headings(body: String) -> List[Heading]:
+    mut found: List[Heading] := []
+    for line in strings.split_lines(body):
+        if not line.starts_with("#"):
+            continue
+        text := strings.trim_left_chars(line, "#")
+        level := line.len() - text.len()
+        found.push(Heading(level: level, text: strings.collapse_whitespace(text)))
+    return found
 
-    print("\n=== Case Conversions ===")
-    print_line("capitalize('hello'): '", "{capitalize("hello")}'")!
-    print_line("title('hello world'): '", "{title("hello world")}'")!
-    print_line("swap_case('Hello'): '", "{swap_case("Hello")}'")!
+fn anchor(text: String) -> String:
+    return strings.split_nonempty(text.to_lower(), " ").join("-")
 
-    print("\n=== Counting ===")
-    print("count('hello hello', 'hello'): {count("hello hello", "hello")}")
+fn main():
+    document := strings.unlines([
+        "---",
+        "title: a field guide to pith",
+        "author: the docs team",
+        "---",
+        "# getting   started",
+        "some text",
+        "## install the toolchain",
+        "## hello,  world",
+        "# working with text",
+        "## strings and bytes",
+        "### when bytes are not text",
+        "# where to go next",
+])
 
-    print("\n=== Splitting ===")
-    mut lines := split_lines("line1\nline2\nline3")
-    print("split_lines result:")
-    for line in lines:
-        print("  - '{line}'")
+    # the front matter sits between the first two `---` lines
+    split := strings.split_once(strings.after(document, "---\n"), "---\n")
+    meta := read_front_matter(split.left)
+    # center pads both sides, and trailing blanks are noise in a terminal
+    print(strings.trim_right(strings.center(strings.title(meta["title"]), 44)))
+    print(strings.trim_right(strings.center("by " + meta["author"], 44)))
+    print("")
 
-    print("\n=== Partition ===")
-    mut parts := partition("key=value", "=")
-    print("partition('key=value', '='):")
-    print_line("  head: '", "{parts[0]}'")!
-    print_line("  sep: '", "{parts[1]}'")!
-    print_line("  tail: '", "{parts[2]}'")!
-
-    print("\n=== Removal ===")
-    print_line("remove_prefix('test.txt', 'test.'): '", "{remove_prefix("test.txt", "test.")}'")!
-    print_line("remove_suffix('image.png', '.png'): '", "{remove_suffix("image.png", ".png")}'")!
-    print_line("strip_prefix('prefix-value', 'prefix-'): '", "{strip_prefix("prefix-value", "prefix-")}'")!
-    print_line("strip_suffix('value.txt', '.txt'): '", "{strip_suffix("value.txt", ".txt")}'")!
-
-    print("\n=== Reversal ===")
-    print_line("reverse('hello'): '", "{reverse("hello")}'")!
-
-    print("\n=== Padding ===")
-    print_line("center('hi', 6): '", "{center("hi", 6)}'")!
-    print_line("zfill('42', 5): '", "{zfill("42", 5)}'")!
-
-    print("\n=== Extraction ===")
-    print_line("first_n('hello', 3): '", "{first_n("hello", 3)}'")!
-    print_line("last_n('hello', 2): '", "{last_n("hello", 2)}'")!
-
-    print("\n=== Text Helpers ===")
-    print_line("split_nonempty('a,,b,c,', ','): '", "{split_nonempty("a,,b,c,", ",").join("|")}'")!
-    print_line("join_nonempty(['a', '', 'b'], ','): '", "{join_nonempty(["a", "", "b"], ",")}'")!
-    print_line("unlines(['x', 'y']): '", "{unlines(["x", "y"])}'")!
-    print_line("collapse_whitespace(' a\\tb\\nc '): '", "{collapse_whitespace(" a{chr(9)}b{"\n"}c ")}'")!
-    print("starts_with_any('pith.toml'): {starts_with_any("pith.toml", ["pith", "zig"])}")
-    print("ends_with_any('archive.tar.gz'): {ends_with_any("archive.tar.gz", [".zip", ".gz"])}")
-    print_line("common_prefix([...]): '", "{common_prefix(["pith.toml", "pith.lock", "pith.json"])}'")!
-    print_line("common_suffix([...]): '", "{common_suffix(["build.log", "debug.log", "trace.log"])}'")!
-    print_line("indent_nonempty('a\\\\n\\\\nb', '> '): '", "{indent_nonempty("a{"\n"}{"\n"}b", "> ").replace("\n", "|")}'")!
-
-    print("\n=== All demonstrations complete! ===")
-    return ""
+    # one counter per heading level; a heading resets every level below it
+    mut counters := [0, 0, 0]
+    for heading in read_headings(split.right):
+        depth := heading.level - 1
+        counters[depth] = counters[depth] + 1
+        for deeper in depth + 1..counters.len():
+            counters[deeper] = 0
+        if depth == 0:
+            chapter := strings.zfill(counters[0].to_string(), 2)
+            print("{chapter}  {strings.capitalize(heading.text):<28}#{anchor(heading.text)}")
+            continue
+        number := strings.zfill(counters[0].to_string(), 2) + "." + counters.slice(1, depth + 1).map(fn(n: Int) => n.to_string()).join(".")
+        print(strings.indent("{number}  {heading.text}", strings.repeat("  ", depth)))

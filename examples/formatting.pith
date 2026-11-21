@@ -1,37 +1,56 @@
-# formatting.pith — test interpolation and std.fmt lightweight templates
+# formatting: format specs in interpolation, and the helpers in std.fmt.
+#
+# prints a directory listing in the style of `ls -l`. `{value:spec}` handles
+# width, alignment, zero fill and float precision; std.fmt adds number bases
+# (binary and octal permissions, hex checksums) and `{}` templates for text
+# that is chosen at run time, such as a message read from a translation file.
 
-from std.fmt import hex, oct, bin, float_fixed, format, format2, format3
+import std.fmt as fmt
+
+struct Entry:
+    name: String
+    mode: Int
+    size: Int
+    checksum: Int
+
+fn human_size(bytes: Int) -> String:
+    if bytes < 1024:
+        return "{bytes} B"
+    kib := bytes.to_float() / 1024.0
+    if kib < 1024.0:
+        return "{kib:.1} K"
+    return "{kib / 1024.0:.1} M"
+
+# each mode bit, highest first, is read, write or execute for owner, group
+# and others in turn
+fn permission_string(mode: Int) -> String:
+    bits := "{fmt.bin(mode):>09}"
+    mut letters := ""
+    for bit, i in bits:
+        letters = letters + (if bit == "1": "rwx"[i % 3] else: "-")
+    return letters
 
 fn main():
-    # a literal brace in a pith string is doubled — "{{}}" is the text {}
-    slot := "{{}}"
-    escaped_slots := "{{{{}}}}"
-    count := 3
-    ready := true
+    entries := [
+        Entry(name: "build.sh", mode: 0o755, size: 812, checksum: 0xbeef),
+        Entry(name: "notes.md", mode: 0o644, size: 20480, checksum: 0xbee),
+        Entry(name: "photo.jpg", mode: 0o600, size: 3355443, checksum: 0xf00d),
+        Entry(name: "secrets.env", mode: 0o400, size: 96, checksum: 0x7),
+]
 
-    # hex
-    print("hex(255) = {hex(255)}")
-    print("hex(0) = {hex(0)}")
-    print("hex(16) = {hex(16)}")
+    print("{"mode":<9} {"octal":<5} {"size":>8} {"sum":>6}  name")
+    mut total := 0
+    for entry in entries:
+        checksum := fmt.hex(entry.checksum)
+        print("{permission_string(entry.mode)} {fmt.oct(entry.mode):<5} {human_size(entry.size):>8} {checksum:>06}  {entry.name}")
+        total += entry.size
+    print("total {human_size(total)} in {entries.len()} files")
 
-    # octal
-    print("oct(8) = {oct(8)}")
-    print("oct(255) = {oct(255)}")
-
-    # binary
-    print("bin(0) = {bin(0)}")
-    print("bin(10) = {bin(10)}")
-    print("bin(255) = {bin(255)}")
-
-    # float formatting
-    print("float_fixed(3.14159, 2) = {float_fixed(3.14159, 2)}")
-    print("float_fixed(1.0, 4) = {float_fixed(1.0, 4)}")
-    print("float_fixed(0.1 + 0.2, 1) = {float_fixed(0.1 + 0.2, 1)}")
-
-    # direct interpolation is the default for plain output
-    print("count={count}, ready={ready}")
-
-    # lightweight templates
-    print(format2("pair(" + slot + ", " + slot + ")", "left", "right"))
-    print(format3(slot + " + " + slot + " = " + slot, "2", "3", "5"))
-    print(format("literal braces: " + escaped_slots + " and " + slot, ["done"]))
+    # a template is a plain string with `{}` slots. in source the braces are
+    # doubled, because a single `{` would start an interpolation.
+    print("")
+    summary := "{{}} of {{}} files are private"
+    private := entries.filter(fn(e: Entry) => e.mode % 0o100 == 0).len()
+    print(fmt.format2(summary, private.to_string(), entries.len().to_string()))
+    share := private.to_float() / entries.len().to_float() * 100.0
+    print(fmt.format1("that is {{}}%", fmt.float_fixed(share, 1)))

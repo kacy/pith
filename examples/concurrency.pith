@@ -1,88 +1,83 @@
-# spawn, await, select, and sync primitives
+# tasks, deadlines and shared state: a price check across several suppliers.
+#
+# main asks every supplier for a quote at once, one spawned task each, and
+# waits for the answers under a single deadline, so one slow supplier cannot
+# hold up the others. the tasks share a small ledger behind a lock, a
+# semaphore caps how many requests are open at a time, and a wait group lets
+# main wait for the stragglers it stopped waiting on before it reads the
+# ledger.
 
 import std.concurrent as concurrent
-import std.io as io
 import std.time as time
-from std.concurrent import await_ctx, recv_ctx, send_ctx
+from std.concurrent import await_ctx
 
-fn fetch(url: String) -> String:
-    return "response from {url}"
+struct Supplier:
+    name: String
+    price_cents: Int
+    latency_ms: Int
 
-fn compute(x: Int) -> Int:
-    return x * 2
+# the guard block ties these globals to ledger_mu: the compiler refuses any
+# read or write of them outside `locked ledger_mu:`.
+guard ledger_mu:
+    mut contacted: List[String] := []
+    mut open_now: Int := 0
+    mut most_open: Int := 0
 
-fn slow_compute(ms: Int, value: Int) -> Int:
-    time.delay(ms)
-    return value
+# the suppliers' api allows two open connections per client.
+MAX_OPEN := 2
+
+fn request_quote(s: Supplier, permits: Semaphore, finished: WaitGroup) -> Int:
+    defer finished.done()
+    permits.acquire()
+    defer permits.release()
+    locked ledger_mu:
+        contacted.push(s.name)
+        open_now = open_now + 1
+        if open_now > most_open:
+            most_open = open_now
+    # stands in for the network round trip.
+    time.delay(s.latency_ms)
+    locked ledger_mu:
+        open_now = open_now - 1
+    return s.price_cents
+
+fn dollars(cents: Int) -> String:
+    return "${cents / 100}.{cents % 100:02}"
 
 fn main() -> Int!:
-    # spawn wraps the return type in Task[T]
-    task := spawn fetch("https://example.com")
+    suppliers := [
+        Supplier(name: "acme", price_cents: 1299, latency_ms: 20),
+        Supplier(name: "globex", price_cents: 1149, latency_ms: 40),
+        Supplier(name: "initech", price_cents: 999, latency_ms: 1500),
+        Supplier(name: "umbrella", price_cents: 1225, latency_ms: 30),
+    ]
+    permits := Semaphore(MAX_OPEN)
+    finished := WaitGroup()
+    finished.add(suppliers.len())
 
-    # await unwraps Task[T] back to T
-    result := await task
-    print(result)
+    mut pending: List[Task[Int]] := []
+    for s in suppliers:
+        pending.push(spawn request_quote(s, permits, finished))
 
-    # spawn and await can be composed
-    value := await spawn compute(21)
-    print(value.to_string())
+    # one deadline for the whole round: every await below shares it.
+    deadline := concurrent.with_timeout(concurrent.background(), 500).0
+    mut best_name := ""
+    mut best_cents := 0
+    for task, i in pending:
+        name := suppliers[i].name
+        cents := await_ctx(task, deadline) catch:
+            print("{name:<9} no answer before the deadline")
+            continue
+        print("{name:<9} {dollars(cents)}")
+        if best_name == "" or cents < best_cents:
+            best_name = name
+            best_cents = cents
+    print("best quote: {best_name} at {dollars(best_cents)}")
 
-    # fan out over a list of tasks; the list needs no annotation, the
-    # first push names its element type
-    mut work := []
-    for n in 1..=3:
-        work.push(spawn compute(n))
-    mut doubled := []
-    for t in work:
-        doubled.push(await t)
-    print("doubled: {doubled[0]} {doubled[1]} {doubled[2]}")
-
-    jobs := Channel[Int](1)
-    jobs.send(7)
-    picked := select:
-        msg := jobs.recv() => msg?
-        default => 0
-    print("select picked: {picked}")
-
-    timeout_pair := concurrent.with_timeout(concurrent.background(), 5)
-    timeout_ctx := timeout_pair.0
-    slow_task := spawn slow_compute(20, 99)
-    timeout_result := await_ctx(slow_task, timeout_ctx)
-    print("await_ctx timed out: {timeout_result.is_err}")
-    slow_task.detach()
-
-    ready := Channel[Int](1)
-    queued := send_ctx(ready, concurrent.background(), 5)
-    print("send_ctx ok: {queued.is_ok and queued.ok}")
-    print("send_ctx buffered len: {ready.len()}")
-
-    closed := Channel[Int]()
-    closed.close()
-    closed_send := send_ctx(closed, concurrent.background(), 1)
-    print("send_ctx on closed: {closed_send.is_ok and closed_send.ok}")
-
-    recv_pair := concurrent.with_timeout(concurrent.background(), 5)
-    recv_result := recv_ctx(Channel[Int](), recv_pair.0)
-    print("recv_ctx timed out: {recv_result.is_err}")
-
-    tcp_pair := concurrent.with_timeout(concurrent.background(), 1)
-    time.delay(5)
-    tcp_result := io.from_fd(-1).read_ctx(tcp_pair.0, 8)
-    print("tcp read_ctx deadline: {tcp_result.is_err and tcp_result.err.is_deadline_exceeded()}")
-
-    # sync primitives
-    mu := Mutex()
-    mu.lock()
-    mu.unlock()
-
-    wg := WaitGroup()
-    wg.add(1)
-    wg.done()
-    wg.wait()
-
-    sem := Semaphore(10)
-    sem.acquire()
-    sem.release()
-
-    print("concurrency works")
+    # the deadline stopped the wait, not the task: the slow request still
+    # runs and still writes the ledger. wait for it before reading.
+    finished.wait()
+    locked ledger_mu:
+        print("suppliers contacted: {contacted.len()}")
+        print("open at once, at most: {most_open} (limit {MAX_OPEN})")
     return 0

@@ -42,6 +42,9 @@ const SCALAR_KINDS: &[&str] = &[
     "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
 ];
 
+/// the callee name a `calli` is checked under: no function can be named this
+const CALLI_CALLEE: &str = "<calli>";
+
 /// instructions that make a plain value from plain operands
 const PLAIN_OPS: &[&str] = &[
     "iconst", "fconst", "add", "sub", "mul", "div", "mod", "lt", "gt", "lte", "gte", "eq", "neq",
@@ -1092,6 +1095,13 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 Ok(false)
             }
             "call" if ins.len() >= 5 => self.call(ins, st).map(|_| false),
+            // `calli REG PTR KIND N ARGS`: a call through a function pointer,
+            // which follows the user-function convention
+            "calli" if ins.len() >= 5 => {
+                let mut as_call = vec!["call", ins[1], CALLI_CALLEE];
+                as_call.extend_from_slice(&ins[3..]);
+                self.call(&as_call, st).map(|_| false)
+            }
             "rcall" if ins.len() >= 6 => self.rcall(ins, st).map(|_| false),
             "ret2" if ins.len() >= 3 => {
                 self.ret(&["ret", ins[2]], st, true);
@@ -1265,7 +1275,7 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 ResultValue::Own => Val::Obj(self.new_obj(st, 1)),
                 ResultValue::Borrow(_) => Val::Obj(self.new_obj(st, 0)),
             }
-        } else if closure_call || self.user_funcs.contains(callee) {
+        } else if closure_call || callee == CALLI_CALLEE || self.user_funcs.contains(callee) {
             // a user function borrows its arguments and hands back a count
             // on a counted result
             if typ == "unknown" {
@@ -1475,6 +1485,8 @@ fn instruction_writes(
     match ins[0] {
         "sstore" => ins.len() < 2 || !fresh.contains(ins[1]),
         "store" if ins.len() >= 2 => globals.contains(ins[1]),
+        // a call through a function pointer may run anything
+        "calli" => true,
         "call" | "rcall" => {
             let callee = if ins[0] == "call" { ins.get(2) } else { ins.get(3) };
             let Some(callee) = callee else { return true };

@@ -500,6 +500,12 @@ hand the task a copy, build the value in the call, or use an atomic cell for
 a shared scalar. a fresh collection — a literal, a copy, a call result — is
 not shared and is allowed.
 
+an interface value can hold any type that implements its interface, so a held
+one is refused when any implementing type reaches a collection outside a
+`guard` block, even if the value at hand holds a type that does not. the
+message names the type and field (`Bag.items`). a conversion written in the
+call (`spawn work(Sq(s: 2))`) is fresh and allowed.
+
 ```
 error[E248]: a spawned task cannot take a list this scope still holds; both threads would mutate the same buffer
   6 |     t := spawn worker(data)
@@ -1130,17 +1136,26 @@ error[E314]: argument label 'b' is in the position of parameter 'a'; arguments b
                          ^
 ```
 
-### E315: an interface used as a value type
+### E315: retired
 
-an interface bounds a type parameter. it has no values of its own, so it
-cannot be the type of a parameter, a return or a field. take a type
-parameter bounded by the interface instead.
+E315 refused every interface used as a value type. Interfaces became value
+types (docs/interface_values.md), and the interfaces that still cannot be
+values are reported as E316.
+
+### E316: an interface that cannot be a value type
+
+an interface used as a type holds any value whose type implements it, and a
+call through it is dispatched at run time. the call has to know the method's
+whole signature without knowing the concrete type, so an interface with type
+parameters, with an associated type, or with a method that has type
+parameters of its own cannot be a value type. it can still bound a type
+parameter.
 
 ```
-error[E315]: interface 'Shape' is not a value type
-  11 | fn show(x: Shape) -> Int:
-                  ^
-  fix: take a type parameter bounded by it, as in `fn f[T: Shape](x: T)`
+error[E316]: interface 'Mapper' cannot be used as a value type: its method 'apply' has type parameters
+  8 |     m: Mapper
+           ^
+  fix: take a type parameter bounded by it, as in `fn f[T: Mapper](x: T)`
 ```
 
 ### E275 — a frozen field is changed

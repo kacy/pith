@@ -1,0 +1,19 @@
+# a call on an interface value can use only the interface's methods, even
+# when the concrete type has more.
+interface Shape:
+    fn area() -> Int
+
+struct Sq:
+    s: Int
+
+impl Shape for Sq:
+    fn area() -> Int:
+        return self.s * self.s
+
+impl Sq:
+    fn side() -> Int:
+        return self.s
+
+fn main():
+    x: Shape := Sq(s: 2)
+    print(x.side().to_string())

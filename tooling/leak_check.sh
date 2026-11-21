@@ -83,6 +83,7 @@ cases=(
   "tests/leaks/leak_result_forward_callee SHAPE=4"
   "tests/leaks/leak_result_forward_callee SHAPE=5"
   tests/leaks/leak_sort_engine
+  tests/leaks/leak_interface_values
   tests/leaks/leak_if_let_payload
   tests/leaks/leak_lambda_if_let
   tests/leaks/leak_lambda_locals

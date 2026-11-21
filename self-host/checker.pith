@@ -209,6 +209,15 @@ mut struct_field_frozen: Map[String, Bool] := {}
 # call name is resolved, so the decision is recorded here at the one place
 # that does know it. see argument_widens_to_optional.
 pub mut optional_widened_arguments: Map[Int, Bool] := {}
+# a value the emitter has to convert to an interface value, keyed by its
+# expression node, holding the interface's type id. recorded at the same
+# acceptance sites as optional_widened_arguments.
+pub mut interface_coercions: Map[Int, Int] := {}
+# the type a collection literal is about to be stored into, set by the site
+# before it checks the literal. a literal whose elements convert to an
+# interface value has no common element type of its own, so it takes the
+# target's.
+mut literal_targets: Map[Int, Int] := {}
 # bindings declared from an empty collection literal with no annotation
 # (`mut tasks := []`), keyed by binding arena index, valued with the
 # literal's node index. such a binding has no element type yet; the
@@ -259,6 +268,8 @@ pub fn initialize_checker(file_path: String):
     struct_field_frozen = {}
     locked_paths = []
     optional_widened_arguments = {}
+    interface_coercions = {}
+    literal_targets = {}
     open_empty_literal_bindings = {}
     module_aliases = {}
     generic_named_import_entries = []
@@ -718,6 +729,10 @@ fn resolve_generic_type(base: String, type_args: List[Int]) -> Int:
     if has_generic_declaration(base):
         decl_idx := get_generic_declaration_index(base)
         return instantiate_generic_type(decl_idx, type_args)
+    # a generic interface written as a type: the annotation check reports it
+    # (E316), since it cannot be a value type
+    if has_interface_declaration(base) and lookup_type_id(base) >= 0:
+        return lookup_type_id(base)
     report_error("E202", "unknown generic type: " + base)
     return TID_ERR
 
@@ -1797,14 +1812,11 @@ fn check_top_level_declarations(node_idx: Int):
     else:
         check_declaration(node_idx)
 
-# the type node of the first interface named in a type annotation, or -1.
-# an interface is a bound for a type parameter and has no values of its own,
-# so a parameter, return or field typed by one was accepted here and then
-# failed at its first use with an error about a missing method or a
-# mismatched argument.
+# the type node of the first interface in a type annotation that cannot be
+# used as a value type, or -1.
 fn interface_in_type(type_idx: Int) -> Int:
     tn := get_node(type_idx)
-    if tn.kind == "type" and names_an_interface(tn.value):
+    if (tn.kind == "type" or tn.kind == "generic_type") and names_an_interface(tn.value) and interface_value_blocker(tn.value).len() > 0:
         return type_idx
     for child in tn.children:
         found := interface_in_type(child)
@@ -1832,12 +1844,94 @@ fn is_interface_type(tid: Int) -> Bool:
     info := get_type_info(tid)
     return info.kind == "struct" and info.fields.len() == 0 and has_interface_declaration(info.name)
 
+# the interface_decl node for an interface type name, or -1.
+fn interface_declaration_node(name: String) -> Int:
+    base := extract_base_type_name(name)
+    if interface_decl_index.contains_key(base):
+        return interface_decl_index[base]
+    return 0 - 1
+
+# why an interface cannot be a value type, or "" when it can. a call through
+# an interface value has to know the method's whole signature without the
+# concrete type, which rules out type parameters on the interface or on a
+# method, and associated types.
+fn interface_value_blocker(name: String) -> String:
+    decl := interface_declaration_node(name)
+    if decl < 0:
+        return ""
+    node := get_node(decl)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "generic_param":
+            return "it has type parameters"
+        if cn.kind == "assoc_type":
+            return "it has an associated type '" + cn.value + "'"
+        if (cn.kind == "fn_sig" or cn.kind == "fn_decl") and declaration_has_generic_params(cn):
+            return "its method '" + cn.value + "' has type parameters"
+    return ""
+
+# a type id that is an interface usable as a value type.
+fn is_interface_value_type(tid: Int) -> Bool:
+    return is_interface_type(tid) and interface_value_blocker(get_type_info(tid).name).len() == 0
+
+pub fn c_is_interface_value_type(tid: Int) -> Bool:
+    return is_interface_value_type(tid)
+
+# the interface a value converts to at this expression, or -1.
+pub fn c_interface_coercion(expr_idx: Int) -> Int:
+    if interface_coercions.contains_key(expr_idx):
+        return interface_coercions[expr_idx]
+    return 0 - 1
+
+# accept a concrete value where an interface value is expected and record the
+# conversion for the emitter. the value's type must implement the interface.
+fn interface_value_accepts(value_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
+    if value_idx < 0 or actual_tid < 0 or expected_tid < 0 or actual_tid == expected_tid:
+        return false
+    if is_error_type(actual_tid) or is_none_type(actual_tid):
+        return false
+    if not is_interface_value_type(expected_tid):
+        return false
+    if is_interface_type(actual_tid):
+        return false
+    if not type_implements_interface_value(get_type_name(actual_tid), get_type_info(expected_tid).name):
+        return false
+    interface_coercions.insert(value_idx, expected_tid)
+    return true
+
+# the types with an impl of the interface named `iface_name`, by type id.
+fn interface_implementer_tids(iface_name: String) -> List[Int]:
+    mut tids: List[Int] := []
+    base := extract_base_type_name(iface_name)
+    for key in implementation_set.keys():
+        parts := key.split(chr(9))
+        if parts.len() != 2:
+            continue
+        named := parts[1]
+        if named != base and not named.ends_with("." + base):
+            continue
+        tid := lookup_type_id(parts[0])
+        if tid >= 0 and not tids.contains(tid):
+            tids.push(tid)
+    return tids
+
+# whether a type implements an interface named by its bare name. an impl
+# written against an imported interface (`impl shapes.Shape for Tri`) is
+# filed under the qualified name, so each module alias in scope is tried too.
+fn type_implements_interface_value(type_name: String, iface_name: String) -> Bool:
+    if check_type_implements_interface(type_name, iface_name):
+        return true
+    for alias in module_aliases.keys():
+        if check_type_implements_interface(type_name, alias + "." + iface_name):
+            return true
+    return false
+
 fn report_interface_value_type(type_idx: Int):
     found := interface_in_type(type_idx)
     if found < 0:
         return
     name := node_value(found)
-    report_error_with_fix_at(found, "E315", "interface '" + name + "' is not a value type", "take a type parameter bounded by it, as in `fn f[T: " + name + "](x: T)`")
+    report_error_with_fix_at(found, "E316", "interface '" + name + "' cannot be used as a value type: " + interface_value_blocker(name), "take a type parameter bounded by it, as in `fn f[T: " + name + "](x: T)`")
 
 # the parameter, return and field annotations of one declaration.
 fn check_interface_value_types(node: Node):
@@ -2575,6 +2669,8 @@ fn value_matches_optional_target(value_idx: Int, actual_tid: Int, expected_tid: 
 fn argument_widens_to_optional(expr_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
     if expr_idx < 0 or actual_tid < 0 or expected_tid < 0:
         return false
+    if interface_value_accepts(expr_idx, actual_tid, expected_tid):
+        return true
     if actual_tid == expected_tid:
         return false
     if is_error_type(actual_tid) or is_error_type(expected_tid):
@@ -2591,7 +2687,9 @@ fn argument_widens_to_optional(expr_idx: Int, actual_tid: Int, expected_tid: Int
     if expected_info.kind != "optional" or expected_info.inner < 0:
         return false
     if actual_tid != expected_info.inner and types_structurally_equal(actual_tid, expected_info.inner) == false:
-        return false
+        # a concrete value into an optional interface converts, then wraps
+        if not interface_value_accepts(expr_idx, actual_tid, expected_info.inner):
+            return false
     optional_widened_arguments.insert(expr_idx, true)
     return true
 
@@ -2610,7 +2708,14 @@ pub fn c_argument_widens_to_optional(expr_idx: Int) -> Bool:
 # an `Int??`) still needs its shell, since by kind it already looks like one
 # (#1051).
 fn optional_target_accepts_value(value_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
+    if interface_value_accepts(value_idx, actual_tid, expected_tid):
+        return true
     if value_matches_optional_target(value_idx, actual_tid, expected_tid) == false:
+        # a concrete value into an optional interface converts, then wraps
+        if expected_tid >= 0 and get_type_info(expected_tid).kind == "optional":
+            if interface_value_accepts(value_idx, actual_tid, get_type_info(expected_tid).inner):
+                optional_widened_arguments.insert(value_idx, true)
+                return true
         return false
     argument_widens_to_optional(value_idx, actual_tid, expected_tid)
     return true
@@ -2751,11 +2856,15 @@ fn literal_element_coerces(value_idx: Int, expected_tid: Int, scope_id: Int) -> 
         inner_type := c_check_expr(value_idx, scope_id)
         if is_error_type(inner_type):
             return false
-        return inner_type == expected_info.inner or types_compatible(inner_type, expected_info.inner)
+        if inner_type == expected_info.inner or types_compatible(inner_type, expected_info.inner):
+            return true
+        # the container's type wraps the element; only the conversion is
+        # recorded here
+        return interface_value_accepts(value_idx, inner_type, expected_info.inner)
     actual := c_check_expr(value_idx, scope_id)
     if is_error_type(actual):
         return false
-    return types_compatible(actual, expected_tid)
+    return types_compatible(actual, expected_tid) or interface_value_accepts(value_idx, actual, expected_tid)
 
 # true when a collection literal can validly build the expected
 # collection type, allowing optional wrapping of its leaves but
@@ -2883,6 +2992,7 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
         # has type annotation
         annotated := resolve_type_implementation(node.children[0])
         val_node := get_node(node.children[1])
+        note_literal_target(node.children[1], annotated)
         mut val_type := c_check_expr(node.children[1], scope_id)
         if is_error_type(annotated) == false:
             # an empty collection literal types as an error on its own;
@@ -3082,6 +3192,7 @@ fn check_return_statement(node: Node, scope_id: Int):
         if expected != TID_VOID:
             report_error("E200", "return type mismatch: expected " + get_type_name(expected) + ", got Void")
         return
+    note_literal_target(node.children[0], expected)
     actual := c_check_expr(node.children[0], scope_id)
     actual_node := get_node(node.children[0])
     exp_info := get_type_info(expected)
@@ -3119,6 +3230,14 @@ fn check_return_statement(node: Node, scope_id: Int):
         if actual == exp_info.inner or types_structurally_equal(actual, exp_info.inner):
             argument_widens_to_optional(node.children[0], actual, expected)
             return
+    # a concrete value returned as an interface value, plain, optional or as
+    # a result's payload
+    if interface_value_accepts(node.children[0], actual, expected):
+        return
+    if exp_info.kind == "optional" and argument_widens_to_optional(node.children[0], actual, expected):
+        return
+    if exp_info.kind == "result" and interface_value_accepts(node.children[0], actual, exp_info.inner):
+        return
     # check structural equality (tuples)
     if types_structurally_equal(actual, expected):
         return
@@ -3521,8 +3640,16 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         locked_paths = saved_locked
         return lambda_tid
     if node.kind == "list":
+        if literal_targets.contains_key(node_idx):
+            target := check_interface_collection_literal(node_idx, literal_targets[node_idx], scope_id)
+            if target >= 0:
+                return target
         return check_list_expression(node, scope_id)
     if node.kind == "map":
+        if literal_targets.contains_key(node_idx):
+            target := check_interface_collection_literal(node_idx, literal_targets[node_idx], scope_id)
+            if target >= 0:
+                return target
         return check_map_expression(node, scope_id)
     if node.kind == "set":
         return check_set_expression(node, scope_id)
@@ -4544,6 +4671,8 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
         if arg_node.kind == "arg":
             if arg_node.children.len() > 0:
                 arg_expr_idx = arg_node.children[0]
+        if idx < fn_info.param_types.len():
+            note_literal_target(arg_expr_idx, fn_info.param_types[idx])
         arg_type := c_check_expr(arg_expr_idx, scope_id)
         if idx < fn_info.param_types.len():
             propagate_empty_argument_collection_type(arg_expr_idx, fn_info.param_types[idx], arg_type, scope_id)
@@ -4553,9 +4682,9 @@ fn check_callable_type_with_args(callee_type: Int, arg_indices: List[Int], scope
                 if arg_type != expected:
                     if argument_widens_to_optional(arg_expr_idx, arg_type, expected) == false:
                         if collection_literal_matches_target(arg_expr_idx, expected, scope_id) == false:
-                            # a parameter typed by an interface was refused
-                            # at its annotation (E315)
-                            if types_structurally_equal(arg_type, expected) == false and not is_interface_type(expected):
+                            # a parameter typed by an interface that cannot be
+                            # a value was refused at its annotation (E316)
+                            if types_structurally_equal(arg_type, expected) == false and not (is_interface_type(expected) and not is_interface_value_type(expected)):
                                 report_error_at(arg_expr_idx, "E219", "argument type mismatch: expected " + get_type_name(expected) + ", got " + get_type_name(arg_type))
         idx = idx + 1
     return fn_info.return_type
@@ -4642,6 +4771,8 @@ fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_i
         if arg_node.kind == "arg":
             if arg_node.children.len() > 0:
                 arg_expr_idx = arg_node.children[0]
+        if idx < info.field_types.len():
+            note_literal_target(arg_expr_idx, info.field_types[idx])
         arg_type := c_check_expr(arg_expr_idx, scope_id)
         # an empty collection literal types as an error on its own; against a
         # field it takes the field's type, and the cache entry is what tells the
@@ -5158,7 +5289,10 @@ fn check_type_parameter_bounds(decl_node_idx: Int, subst_map: Map[String, Int]) 
                         report_error("E226", "unknown interface '" + iface_name + "' in bound for '" + param_name + "'")
                         ok = false
                     else:
-                        if check_type_implements_interface(type_name, iface_name) == false:
+                        # an interface value satisfies its own interface:
+                        # its methods dispatch
+                        own_value := is_interface_value_type(inferred_tid) and extract_base_type_name(type_name) == extract_base_type_name(iface_name)
+                        if not own_value and check_type_implements_interface(type_name, iface_name) == false:
                             report_error("E226", "type '" + type_name + "' does not implement interface '" + iface_name + "'")
                             ok = false
     return ok
@@ -5973,6 +6107,11 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
                 return receiver_type
             vi = vi + 1
 
+    # a method called on an interface value dispatches at run time; the
+    # interface's own declaration gives the signature
+    if is_interface_value_type(dispatch_type):
+        return check_interface_method_call(dispatch_type, method_name, arg_indices, scope_id)
+
     # user-defined methods
     type_name := get_type_name(dispatch_type)
     key := user_method_declaration_key(dispatch_type, method_name)
@@ -6053,6 +6192,8 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             if method_args_prechecked:
                 atype = c_get_expr_type(arg_expr)
             else:
+                if aidx < param_types.len():
+                    note_literal_target(arg_expr, param_types[aidx])
                 atype = c_check_expr(arg_expr, scope_id)
             if aidx < param_types.len():
                 propagate_empty_argument_collection_type(arg_expr, param_types[aidx], atype, scope_id)
@@ -6076,10 +6217,53 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
             ffi = ffi + 1
     # a table that recognized the method may have reported already;
     # don't stack the generic "no method" on top of its specific error. a
-    # receiver typed by an interface was refused at its annotation (E315).
+    # receiver typed by an interface that cannot be a value was refused at its
+    # annotation (E316).
     if checker_reported_at_current() == false and not is_interface_type(receiver_type):
         report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "'")
     return TID_ERR
+
+# the method `method_name` an interface declares, as its fn_decl index, or -1.
+fn interface_method_declaration(iface_tid: Int, method_name: String) -> Int:
+    decl := interface_declaration_node(get_type_info(iface_tid).name)
+    if decl < 0:
+        return 0 - 1
+    for child in get_node(decl).children:
+        cn := get_node(child)
+        if (cn.kind == "fn_sig" or cn.kind == "fn_decl") and cn.value == method_name:
+            return child
+    return 0 - 1
+
+# a call on an interface value: the arguments are checked against the
+# interface's declaration of the method, and the call has its return type.
+fn check_interface_method_call(iface_tid: Int, method_name: String, arg_indices: List[Int], scope_id: Int) -> Int:
+    method_idx := interface_method_declaration(iface_tid, method_name)
+    if method_idx < 0:
+        report_error("E209", "interface " + get_type_name(iface_tid) + " has no method '" + method_name + "'")
+        return TID_ERR
+    record_definition(checker_current_node_index(), method_idx)
+    method_node := get_node(method_idx)
+    signature_scope := enter_signature_scope(method_idx)
+    param_types := collect_function_param_types(method_node)
+    ret_type := collect_function_return_type(method_node)
+    leave_signature_scope(signature_scope)
+    if arg_indices.len() != param_types.len():
+        report_error("E207", method_name + " expects " + param_types.len().to_string() + " arguments, got " + arg_indices.len().to_string())
+        return TID_ERR
+    for ai, i in arg_indices:
+        arg_expr := argument_expression_index(ai)
+        note_literal_target(arg_expr, param_types[i])
+        atype := c_check_expr(arg_expr, scope_id)
+        propagate_empty_argument_collection_type(arg_expr, param_types[i], atype, scope_id)
+        if is_error_type(atype) or atype == param_types[i]:
+            continue
+        if argument_widens_to_optional(arg_expr, atype, param_types[i]):
+            continue
+        if collection_literal_matches_target(arg_expr, param_types[i], scope_id):
+            continue
+        if types_structurally_equal(atype, param_types[i]) == false:
+            report_error("E219", "argument type mismatch: expected " + get_type_name(param_types[i]) + ", got " + get_type_name(atype))
+    return ret_type
 
 # ---------------------------------------------------------------
 # string methods
@@ -6928,7 +7112,7 @@ fn check_catch_expression(node: Node, scope_id: Int) -> Int:
         fallback_type = c_get_expr_type(node.children[1])
     if is_error_type(fallback_type):
         return TID_ERR
-    if types_compatible(fallback_type, result_info.inner) == false:
+    if types_compatible(fallback_type, result_info.inner) == false and not interface_value_accepts(node.children[1], fallback_type, result_info.inner):
         report_error("E219", "catch fallback type mismatch: expected " + get_type_name(result_info.inner) + ", got " + get_type_name(fallback_type))
         return TID_ERR
     return result_info.inner
@@ -7632,6 +7816,50 @@ fn element_type_with_none(elem_type: Int) -> Int:
         return elem_type
     return add_type_info(ti_optional(elem_type))
 
+# note the type a value is about to be stored into, when the value is a
+# collection literal (see literal_targets).
+fn note_literal_target(value_idx: Int, target_tid: Int):
+    if value_idx < 0 or target_tid < 0:
+        return
+    kind := node_kind(value_idx)
+    if kind == "list" or kind == "map":
+        literal_targets.insert(value_idx, target_tid)
+
+# a non-empty list or map literal stored into a List or Map whose elements
+# are interface values (a `List[Shape]` or `Map[K, Shape]`). each element is
+# checked against the element type and converted; the literal takes the
+# target's type. -1 when the target is not that shape, so the ordinary check
+# runs.
+fn check_interface_collection_literal(literal_idx: Int, target_tid: Int, scope_id: Int) -> Int:
+    node := get_node(literal_idx)
+    if node.children.len() == 0:
+        return 0 - 1
+    info := get_type_info(target_tid)
+    if node.kind == "list" and info.kind == "list" and is_interface_value_type(info.inner):
+        for child in node.children:
+            check_interface_element(child, info.inner, scope_id)
+        expression_type_cache.insert(literal_idx, target_tid)
+        return target_tid
+    if node.kind == "map" and info.kind == "map" and is_interface_value_type(info.value_type):
+        for entry_idx in node.children:
+            entry := get_node(entry_idx)
+            if entry.kind == "entry" and entry.children.len() >= 2:
+                kt := c_check_expr(entry.children[0], scope_id)
+                if is_error_type(kt) == false and types_compatible(kt, info.key_type) == false:
+                    report_error_at(entry.children[0], "E223", "map key type mismatch: expected " + get_type_name(info.key_type) + ", got " + get_type_name(kt))
+                check_interface_element(entry.children[1], info.value_type, scope_id)
+        expression_type_cache.insert(literal_idx, target_tid)
+        return target_tid
+    return 0 - 1
+
+fn check_interface_element(value_idx: Int, iface_tid: Int, scope_id: Int):
+    actual := c_check_expr(value_idx, scope_id)
+    if is_error_type(actual) or actual == iface_tid:
+        return
+    if interface_value_accepts(value_idx, actual, iface_tid):
+        return
+    report_error_at(value_idx, "E219", "element type mismatch: expected " + get_type_name(iface_tid) + ", got " + get_type_name(actual))
+
 fn check_list_expression(node: Node, scope_id: Int) -> Int:
     tid_err := lookup_type_id("<error>")
     if node.children.len() == 0:
@@ -7855,6 +8083,14 @@ fn struct_holds_unguarded_collection(tid: Int, seen: Map[Int, Bool]) -> String:
     if info.kind != "struct" or seen.contains_key(tid):
         return ""
     seen.insert(tid, true)
+    # an interface value may hold any type that implements it, so it shares a
+    # buffer when any of them does
+    if is_interface_value_type(tid):
+        for impl_tid in interface_implementer_tids(info.name):
+            inner := struct_holds_unguarded_collection(impl_tid, seen)
+            if inner != "":
+                return get_type_name(impl_tid) + "." + inner
+        return ""
     for fname, i in info.fields:
         if struct_field_guards.contains_key(tid.to_string() + "." + fname) or struct_field_frozen.contains_key(tid.to_string() + "." + fname):
             continue
@@ -8578,6 +8814,7 @@ pub struct CheckerSnapshot:
     pub expression_type_cache: Map[Int, Int]
     pub definition_of: Map[Int, Int]
     pub optional_widened_arguments: Map[Int, Bool]
+    pub interface_coercions: Map[Int, Int]
     pub open_empty_literal_bindings: Map[Int, Int]
     pub type_resolve_depth: Int
     pub c_module_global_names: List[String]
@@ -8645,6 +8882,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         expression_type_cache: copy_map(expression_type_cache),
         definition_of: copy_map(definition_of),
         optional_widened_arguments: copy_map(optional_widened_arguments),
+        interface_coercions: copy_map(interface_coercions),
         open_empty_literal_bindings: copy_map(open_empty_literal_bindings),
         type_resolve_depth: type_resolve_depth,
         c_module_global_names: copy_list(c_module_global_names),
@@ -8712,6 +8950,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     expression_type_cache = copy_map(s.expression_type_cache)
     definition_of = copy_map(s.definition_of)
     optional_widened_arguments = copy_map(s.optional_widened_arguments)
+    interface_coercions = copy_map(s.interface_coercions)
     open_empty_literal_bindings = copy_map(s.open_empty_literal_bindings)
     type_resolve_depth = s.type_resolve_depth
     c_module_global_names = copy_list(s.c_module_global_names)

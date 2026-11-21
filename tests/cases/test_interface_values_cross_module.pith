@@ -1,0 +1,22 @@
+# an interface declared in another module: a local type implements it
+# under its qualified name, and values of both types share one list.
+import iface_value_mod_shapes as shapes
+
+struct Tri:
+    b: Int
+    h: Int
+
+impl shapes.Shape for Tri:
+    fn area() -> Int:
+        return self.b * self.h / 2
+    fn name() -> String:
+        return "tri"
+
+fn describe(s: shapes.Shape) -> String:
+    return "{s.name()} {s.area()}"
+
+fn main():
+    xs: List[shapes.Shape] := [shapes.Sq(s: 3), Tri(b: 4, h: 5)]
+    print(shapes.total(xs).to_string())
+    for x in xs:
+        print(describe(x))

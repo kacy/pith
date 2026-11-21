@@ -4154,6 +4154,36 @@ fn compile_ir_function(
                 kinds.clear(reg);
             }
 
+            // `calli REG PTR RETKIND NARGS ARG...`: a call through a function
+            // pointer, under the plain abi (i64 arguments, one i64 return)
+            "calli" if parts.len() >= 5 => {
+                let reg = parse_reg(parts[1], line, func_name)?;
+                let fn_ptr = get_reg(&regs, parts[2])?;
+                let retkind = parts[3];
+                let nargs = parts[4].parse::<usize>().map_err(|_| {
+                    CompileError::ModuleError(format!("ir consumer: malformed calli in {}: {}", func_name, line))
+                })?;
+                if parts.len() < 5 + nargs {
+                    return Err(CompileError::ModuleError(format!(
+                        "ir consumer: calli is missing arguments in {}: {}",
+                        func_name, line
+                    )));
+                }
+                let mut args = Vec::with_capacity(nargs);
+                for j in 0..nargs {
+                    args.push(get_reg(&regs, parts[5 + j])?);
+                }
+                let mut sig = codegen.module.make_signature();
+                for _ in 0..nargs {
+                    sig.params.push(AbiParam::new(types::I64));
+                }
+                sig.returns.push(AbiParam::new(types::I64));
+                let sig_ref = builder.import_signature(sig);
+                let call = builder.ins().call_indirect(sig_ref, fn_ptr, &args);
+                regs.insert(reg, builder.func.dfg.first_result(call));
+                kinds.set(reg, retkind);
+            }
+
             "closure_ref" if parts.len() >= 3 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
                 let fname = parts[2];

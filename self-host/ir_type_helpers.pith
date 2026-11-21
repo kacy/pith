@@ -6,8 +6,8 @@
 # forms: given a node, a tid, or a name, what kind is it?
 
 from ast import get_node, Node
-from checker import c_get_expr_type
-from types import get_type_info, lookup_declared_type_id
+from checker import c_get_expr_type, c_is_interface_value_type
+from types import get_type_info, lookup_declared_type_id, lookup_type_id
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_string_returning_method
 
 # turn a type name as it was written into an emission kind, taking the
@@ -57,6 +57,11 @@ pub fn ir_resolve_type_hint_with_state(type_name: String, type_aliases: Map[Stri
         base = base.substring(0, base.index_of("["))
     if struct_names.contains_key(base):
         return base
+    # an interface used as a value type is a counted box (see ir_type_from_tid)
+    # interfaces are registered by name only, not as declared types
+    iface_tid := lookup_type_id(resolved)
+    if iface_tid >= 0 and c_is_interface_value_type(iface_tid):
+        return "struct:" + resolved
     return resolved
 
 # the kind string to write into emitted IR for a declared return or
@@ -197,6 +202,11 @@ pub fn ir_type_from_tid(tid: Int) -> String:
             vi = vi + 1
         return "int"
     if info.kind == "struct":
+        # an interface value is a counted tuple-shaped box (see
+        # docs/interface_values.md); the prefix makes it a struct handle to
+        # the count code, which releases it through its attached destructor
+        if c_is_interface_value_type(tid):
+            return "struct:" + info.name
         return info.name
     if info.kind == "channel":
         return "channel"

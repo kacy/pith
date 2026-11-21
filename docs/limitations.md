@@ -66,6 +66,13 @@ stale and a fix to it is welcome.
   dispatches to its own module's methods. a second impl block that declares a
   method the struct already has is E263 (an interface impl may repeat an
   inherent method of the same name, as std/io does).
+- **interface values have no downcasts or equality**. a value of an
+  interface type cannot be tested for or converted back to its concrete type,
+  and `==` on two of them compares identity. an interface with type
+  parameters or associated types, or with a method that has type parameters,
+  cannot be a value type (E316). a generic struct cannot implement an
+  interface yet, as a bound or as a value (`impl Shape for Box[T]` is not
+  matched). see docs/interface_values.md.
 - **method syntax never reaches a free function**. there is no ufcs. a
   primitive receiver resolves builtins only, so `(1.5).to_int()` is the
   `Float` builtin even when a free `fn to_int` exists.

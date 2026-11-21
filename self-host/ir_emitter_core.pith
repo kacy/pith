@@ -39,7 +39,7 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
-from checker import generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import c_interface_coercion, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -459,6 +459,12 @@ mut ir_current_func_optional_inner_kind := ""
 # T!E). used by the index expression codegen to decide whether `map[k]` /
 # `list[i]` should propagate a fail on miss (T! context) or fall through
 # to the loud-miss runtime (non-T! context).
+# nodes whose conversion is being emitted: inside it the node is its plain
+# concrete value
+mut ir_interface_coercion_bypass: Map[Int, Bool] := {}
+# a small integer per concrete type converted to an interface, in first-use
+# order
+mut ir_interface_type_ids: Map[String, Int] := {}
 mut ir_current_func_returns_result := false
 # whether a miss (index, key, `.value()`) fails the current function. only a
 # String error can carry the miss message; a `T!E` function with any other E
@@ -643,6 +649,7 @@ fn ir_reset_type_state():
     ir_reset_dtor_memo()
     ir_tracer_memo = {}
     ir_tuple_dtor_sigs = []
+    ir_interface_coercion_bypass = {}
     ir_optional_tuple_dtor_needed = false
     ir_tuple_cascade_sigs = []
     ir_tuple_stack_cascade_sigs = []
@@ -1251,6 +1258,9 @@ fn ir_name_is_weak_read(name: String) -> Bool:
 # call ahead of the builtin fresh-string list), and reordering them changes
 # what the emitter emits.
 fn ir_expr_is_borrowed(idx: Int) -> Bool:
+    # a conversion builds a fresh interface value
+    if ir_interface_coercion(idx) >= 0:
+        return false
     node := get_node(idx)
     # a string literal is its own buffer, and the runtime makes retain on one
     # a no-op anyway.
@@ -1350,6 +1360,10 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # `mod.fn(...) -> String` call, which url.decode turned into ~64
         # bytes per http request once #839 put it on the request path.
         if ir_resolve_module_alias_method_call_name(idx).len() > 0:
+            return false
+        # a call on an interface value reaches a user method, under the same
+        # return convention
+        if node.children.len() > 0 and c_is_interface_value_type(c_get_expr_type(node.children[0])):
             return false
         # a user-defined method already settled its result's ownership on the
         # way out: it retains a returned borrow and transfers a fresh value, so
@@ -4746,6 +4760,9 @@ fn ir_infer_type(idx: Int) -> String:
     # asking its type is a normal question with an unknown answer
     if idx < 0:
         return ""
+    iface := ir_interface_coercion(idx)
+    if iface >= 0:
+        return "struct:" + get_type_info(iface).name
     checked := ir_checked_type(idx)
     if checked.len() > 0:
         return checked
@@ -8816,6 +8833,133 @@ fn ir_is_channel_send_name(emit_name: String) -> Bool:
     return emit_name == "try_send" or emit_name == "pith_channel_try_send"
 
 # --- method call dispatch ---
+# ---------------------------------------------------------------
+# interface values (docs/interface_values.md)
+# ---------------------------------------------------------------
+#
+# an interface value is a tuple-shaped box: slot 0 holds a type id for the
+# concrete type, slot 1 the concrete value, and slot 2 onwards one function
+# pointer per interface method, in declaration order. the box carries the
+# tuple destructor for its signature, which releases slot 1 by its kind.
+
+
+# the interface the value at idx converts to, or -1. the checker records a
+# conversion against the node, and a generic body is one node set walked per
+# specialization, so the record only applies where the value's type in the
+# specialization being emitted is concrete: at `T = Shape` the value is
+# already the interface value.
+fn ir_interface_coercion(idx: Int) -> Int:
+    if idx < 0 or ir_interface_coercion_bypass.contains_key(idx):
+        return 0 - 1
+    iface := c_interface_coercion(idx)
+    if iface < 0:
+        return 0 - 1
+    actual := c_get_expr_type(idx)
+    if actual < 0 or actual == iface or c_is_interface_value_type(actual):
+        return 0 - 1
+    return iface
+
+# the methods of an interface, in declaration order: the slot layout.
+fn ir_interface_method_names(iface_name: String) -> List[String]:
+    mut names: List[String] := []
+    base := ir_strip_type_args(iface_name)
+    if not ir_interface_decl_index.contains_key(base):
+        return names
+    for child in get_node(ir_interface_decl_index[base]).children:
+        cn := get_node(child)
+        if cn.kind == "fn_sig" or cn.kind == "fn_decl":
+            names.push(cn.value)
+    return names
+
+fn ir_interface_type_id(concrete: String) -> Int:
+    if not ir_interface_type_ids.contains_key(concrete):
+        ir_interface_type_ids.insert(concrete, ir_interface_type_ids.len() + 1)
+    return ir_interface_type_ids[concrete]
+
+# build the interface value for the expression at idx, which the checker
+# recorded as a conversion. the concrete value moves into slot 1 when the
+# expression owns it and is retained when it is a borrow.
+fn ir_emit_interface_value(idx: Int) -> Int:
+    iface_name := get_type_info(c_interface_coercion(idx)).name
+    concrete := get_type_info(c_get_expr_type(idx)).name
+    ir_interface_coercion_bypass.insert(idx, true)
+    inner_r := ir_expr(idx)
+    inner_kind := ir_rc_kind(ir_infer_type(idx))
+    borrowed := ir_expr_is_borrowed(idx)
+    ir_interface_coercion_bypass.remove(idx)
+    if inner_kind.len() > 0 and borrowed:
+        ir_rc_retain_reg(inner_r, inner_kind)
+    methods := ir_interface_method_names(iface_name)
+    count_r := ir_reg()
+    ir_emit("iconst " + count_r.to_string() + " " + (methods.len() + 2).to_string())
+    r := ir_reg()
+    ir_emit_call1(r, "__struct_alloc", "struct:tuple", count_r)
+    id_r := ir_reg()
+    ir_emit("iconst " + id_r.to_string() + " " + ir_interface_type_id(concrete).to_string())
+    ir_emit("sstore " + r.to_string() + " 0 " + id_r.to_string())
+    ir_emit("sstore " + r.to_string() + " 1 " + inner_r.to_string())
+    mut sig := "0" + ir_tuple_elem_code(inner_kind)
+    for m, i in methods:
+        fr := ir_reg()
+        ir_emit("funcref " + fr.to_string() + " " + ir_lookup_impl_method_name(concrete, m))
+        ir_emit("sstore " + r.to_string() + " " + (i + 2).to_string() + " " + fr.to_string())
+        sig = sig + "0"
+    if ir_tuple_sig_has_rc(sig):
+        if not ir_tuple_dtor_sigs.contains(sig):
+            ir_tuple_dtor_sigs.push(sig)
+        dtor_r := ir_reg()
+        ir_emit("funcref " + dtor_r.to_string() + " " + ir_tuple_dtor_name(sig))
+        ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + r.to_string() + " " + dtor_r.to_string())
+    return r
+
+# a method call on an interface value: load the method's pointer from its
+# slot and call it with the concrete value as the receiver. -1 when the
+# receiver is not an interface value.
+fn ir_emit_interface_method_call(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.children.len() == 0:
+        return 0 - 1
+    recv_idx := node.children[0]
+    recv_tid := c_get_expr_type(recv_idx)
+    if recv_tid < 0 or not c_is_interface_value_type(recv_tid):
+        return 0 - 1
+    mname := ir_plain_method_name(node_value(idx))
+    mut slot := 0 - 1
+    for m, i in ir_interface_method_names(get_type_info(recv_tid).name):
+        if m == mname:
+            slot = i
+    if slot < 0:
+        return 0 - 1
+    recv_r := ir_expr(recv_idx)
+    # the method runs user code that could drop the last other count on the
+    # receiver, so it is pinned for the call, as a closure field is
+    ir_rc_retain_reg(recv_r, "struct")
+    value_r := ir_reg()
+    ir_emit("field " + value_r.to_string() + " " + recv_r.to_string() + " 8 int value")
+    fn_r := ir_reg()
+    ir_emit("field " + fn_r.to_string() + " " + recv_r.to_string() + " " + ((slot + 2) * 8).to_string() + " int slot")
+    mut arg_regs: List[Int] := [value_r]
+    mut arg_pins: List[String] := [""]
+    mut ai := 0
+    while ai < node.children.len() - 1:
+        arg_idx := ir_method_call_arg_expr(node, ai)
+        arg_r := ir_emit_call_arg(arg_idx)
+        arg_regs.push(arg_r)
+        arg_pins.push(ir_pin_operand(arg_idx, arg_r, true))
+        ai = ai + 1
+    r := ir_reg()
+    ir_emit("calli " + r.to_string() + " " + fn_r.to_string() + " " + ir_retkind(ir_infer_type(idx)) + " " + arg_regs.len().to_string() + ir_join_arg_regs(arg_regs))
+    mut plain_args: List[Int] := []
+    for reg, i in arg_regs:
+        if i > 0:
+            plain_args.push(reg)
+    ir_release_owned_method_args(node, plain_args, 0 - 1)
+    ir_unpin_args(arg_regs, arg_pins)
+    ir_rc_release_reg(recv_r, "struct")
+    if ir_field_receiver_is_owned_temp(recv_idx):
+        ir_rc_release_reg(recv_r, "struct")
+    return r
+
 fn ir_emit_method_call(idx: Int) -> Int:
     # a method call is lowered by a handful of specialized emitters tried in
     # order; each returns a register or -1 ("not my shape, keep looking"). the
@@ -8833,6 +8977,9 @@ fn ir_emit_method_call(idx: Int) -> Int:
     variant_r := ir_emit_variant_ctor_method(idx)
     if variant_r >= 0:
         return variant_r
+    iface_r := ir_emit_interface_method_call(idx)
+    if iface_r >= 0:
+        return iface_r
     typed_r := ir_emit_typed_receiver_method(idx)
     if typed_r >= 0:
         return typed_r
@@ -10884,6 +11031,8 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
 # handled inline; anything with control flow or ownership subtlety
 # gets its own ir_emit_* function below.
 fn ir_expr(idx: Int) -> Int:
+    if ir_interface_coercion(idx) >= 0:
+        return ir_emit_interface_value(idx)
     node := get_node(idx)
 
     if node.kind == "int_lit" or node.kind == "int" or node.kind == "integer":

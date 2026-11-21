@@ -1,0 +1,109 @@
+# interface values: an interface used as a type holds any type that
+# implements it, and its methods dispatch at run time
+# (docs/interface_values.md). every place a value can convert is here: an
+# argument, a method argument, an annotated binding, a reassignment, a return,
+# a result and an optional, a catch fallback, a struct field, list and map
+# literals, and a push.
+interface Shape:
+    fn area() -> Int
+    fn name() -> String
+    fn describe() -> String:
+        return "{self.name()} of area {self.area()}"
+
+struct Sq:
+    s: Int
+
+struct Label:
+    text: String
+    size: Int
+
+impl Shape for Sq:
+    fn area() -> Int:
+        return self.s * self.s
+    fn name() -> String:
+        return "square"
+
+impl Shape for Label:
+    fn area() -> Int:
+        return self.text.len() * self.size
+    fn name() -> String:
+        return "label '{self.text}'"
+    fn describe() -> String:
+        return "a label"
+
+struct Canvas:
+    shapes: List[Shape]
+    selected: Shape?
+
+struct Board:
+    items: List[Shape]
+
+impl Board:
+    fn add(s: Shape):
+        self.items.push(s)
+    fn total() -> Int:
+        return total(self.items)
+
+fn passthrough(s: Shape) -> Shape:
+    return s
+
+fn total(shapes: List[Shape]) -> Int:
+    mut sum := 0
+    for s in shapes:
+        sum = sum + s.area()
+    return sum
+
+fn largest(shapes: List[Shape]) -> Shape?:
+    mut best: Shape? := none
+    mut best_area := 0 - 1
+    for s in shapes:
+        if s.area() > best_area:
+            best_area = s.area()
+            best = s
+    return best
+
+fn make(kind: String) -> Shape!:
+    if kind == "sq":
+        return Sq(s: 4)
+    if kind == "label":
+        return Label(text: "hi", size: 3)
+    fail "unknown shape {kind}"
+
+fn main():
+    shapes: List[Shape] := [Sq(s: 3), Label(text: "abc", size: 2)]
+    print("total {total(shapes)}")
+    for s in shapes:
+        print(s.describe())
+    big := largest(shapes)
+    if big != none:
+        print("largest: {big.value().name()}")
+    owned := Label(text: "own" + "ed", size: 1)
+    one: Shape := owned
+    print(one.name())
+    c := Canvas(shapes: shapes, selected: Sq(s: 2))
+    print("canvas {c.shapes.len()} {c.selected.value().area()}")
+    by_name: Map[String, Shape] := {"a": Sq(s: 5), "b": Label(text: "x", size: 9)}
+    print("map {by_name["a"].area()} {by_name["b"].name()}")
+    print((make("sq") catch Sq(s: 0)).area().to_string())
+    m := make("label")
+    if m.is_ok:
+        print(m.ok.describe())
+    bad := make("circle")
+    print(bad.is_err.to_string())
+    mut grow: List[Shape] := []
+    mut i := 0
+    while i < 3:
+        grow.push(Label(text: "n{i}", size: i))
+        i = i + 1
+    print("grow {total(grow)}")
+    mut cur: Shape := Sq(s: 1)
+    print(cur.name())
+    cur = Label(text: "re", size: 2)
+    print(cur.name())
+    print(passthrough(cur).area().to_string())
+    mut board := Board(items: [])
+    board.add(Sq(s: 6))
+    board.add(cur)
+    print("board {board.total()}")
+    same := cur
+    print((same == cur).to_string())

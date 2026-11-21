@@ -1,0 +1,84 @@
+# interface values beyond the conversion sites: stores into a field, a list
+# element and a map entry; a closure capture and a function-typed parameter;
+# Float arguments and a fallible method through dispatch; an interface value
+# satisfying its own bound; a generic body that converts at a concrete type
+# and passes an interface value through at the interface type; and a fresh
+# conversion handed to a spawned task.
+interface Shape:
+    fn area() -> Int
+    fn name() -> String
+
+struct Sq:
+    s: Int
+
+impl Shape for Sq:
+    fn area() -> Int:
+        return self.s * self.s
+    fn name() -> String:
+        return "sq"
+
+struct Label:
+    text: String
+
+impl Shape for Label:
+    fn area() -> Int:
+        return self.text.len()
+    fn name() -> String:
+        return self.text
+
+interface Meas:
+    fn ratio(k: Float) -> Float
+    fn checked(n: Int) -> Int!
+
+struct M:
+    base: Float
+
+impl Meas for M:
+    fn ratio(k: Float) -> Float:
+        return self.base * k
+    fn checked(n: Int) -> Int!:
+        if n < 0:
+            fail "negative"
+        return n * 2
+
+struct C:
+    sel: Shape
+
+fn bounded[T: Shape](x: T) -> Int:
+    return x.area()
+
+fn as_shape[T: Shape](x: T) -> Shape:
+    return x
+
+fn apply(g: fn(Shape) -> Int, x: Shape) -> Int:
+    return g(x)
+
+fn twice(s: Shape) -> Int:
+    return s.area() * 2
+
+fn work(s: Shape) -> Int:
+    return s.area()
+
+fn main():
+    mut c := C(sel: Sq(s: 2))
+    c.sel = Label(text: "abc")
+    print(c.sel.area().to_string())
+    mut xs: List[Shape] := [Sq(s: 1)]
+    xs[0] = Label(text: "ab")
+    print(xs[0].name())
+    mut m: Map[String, Shape] := {}
+    m["a"] = Sq(s: 4)
+    m.insert("b", Label(text: "xyz"))
+    print("{m["a"].area()} {m["b"].area()}")
+    held: Shape := Label(text: "hey")
+    f := fn() => held.area()
+    print(f().to_string())
+    print(apply(twice, Sq(s: 3)).to_string())
+    meas: Meas := M(base: 1.5)
+    print(meas.ratio(2.0).to_string())
+    print((meas.checked(4) catch 0).to_string())
+    print((meas.checked(0 - 1) catch 0 - 9).to_string())
+    print(bounded(held).to_string())
+    print("{as_shape(Sq(s: 3)).area()} {as_shape(held).name()}")
+    t := spawn work(Sq(s: 5))
+    print((await t).to_string())

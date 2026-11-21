@@ -15,6 +15,10 @@ struct Ladder:
 fn reach(ladder: Ladder, foot_m: Float) -> Float:
     return sqrt(pow(ladder.length_m, 2.0) - pow(foot_m, 2.0))
 
+# the angle between the ladder and the ground, in degrees
+fn angle(ladder: Ladder, foot_m: Float) -> Float:
+    return degrees(acos(foot_m / ladder.length_m))
+
 fn main():
     ladders := [Ladder(name: "step", length_m: 2.5), Ladder(name: "extension", length_m: 6.0)]
     windows := [2.1, 4.8, 5.9]
@@ -27,8 +31,11 @@ fn main():
         for window in windows:
             if height >= window:
                 reachable.push("{window:.1} m")
-        print("{ladder.name:<9} reaches {height:.2} m, windows: {reachable.len()} ({reachable.join(", ")})")
+        print("{ladder.name:<9} reaches {height:.2} m at {angle(ladder, foot):.1} degrees, windows: {reachable.len()} ({reachable.join(", ")})")
 
     # standing it steeper gains height, at some cost in safety
     steep := reach(ladders[1], 1.0)
-    print("extension with its foot at 1.0 m reaches {steep:.2} m, top window: {steep >= windows[2]}")
+    print("extension with its foot at 1.0 m reaches {steep:.2} m at {angle(ladders[1], 1.0):.1} degrees, top window: {steep >= windows[2]}")
+
+    # the rule of thumb is about 75 degrees; check it from the slope alone
+    print("a 4 in 1 slope stands at {degrees(atan2(4.0, 1.0)):.1} degrees")

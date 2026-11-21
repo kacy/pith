@@ -3,9 +3,8 @@
 # grpc.serve collects a whole request before the handler runs, so a handler
 # could not answer message 1 while the client is still deciding on message 2.
 # grpc.serve_stream hands the dispatch a live GrpcStream instead: recv_message()
-# returns each message as it arrives and send_message() replies at once. the
-# client here reads each answer before it sends the next line, which only works
-# because of that.
+# returns each message as it arrives and send_message() replies at once, so the
+# client here can read each answer before it sends the next line.
 #
 # the service is a small help desk bot. messages are protobuf with one string in
 # field 1, both ways. examples/grpc_reflect.pith does the same through generated

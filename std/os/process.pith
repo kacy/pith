@@ -11,7 +11,7 @@
 #   code := process.run_shell("ls -la")
 
 from std.io import ProcessStdin, ProcessStdout, ProcessStderr
-from std.concurrent import Context, BlockingError, WaitError, blocking_failed, blocking_from_wait
+from std.concurrent import Context, BlockingError, WaitError, blocking_failed
 from std.collections import copy_list
 import std.bytes as bytes
 import std.time as time
@@ -181,7 +181,7 @@ pub fn output_ctx(cmd: Command, ctx: Context) -> Output!BlockingError:
         process.wait()
         await stdout_task
         await stderr_task
-        fail blocking_from_wait(wait_result.err)
+        fail wait_result.err.to_blocking()
     # both readers are awaited before either result is checked, so a failed
     # stdout read does not leave the stderr reader running unawaited.
     stdout := await stdout_task

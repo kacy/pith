@@ -16,14 +16,16 @@ enum Result:
     Err(String)
 
 # enums are registered as types. match expressions
-# validate variant patterns and arm type agreement.
+# validate variant patterns and arm type agreement. an enum whose variants
+# carry no payload can have methods in an impl block.
 
-fn describe_direction(d: Direction) -> String:
-    match d:
-        Direction.North => "up"
-        Direction.South => "down"
-        Direction.East => "right"
-        Direction.West => "left"
+impl Direction:
+    fn describe() -> String:
+        match self:
+            Direction.North => "up"
+            Direction.South => "down"
+            Direction.East => "right"
+            Direction.West => "left"
 
 # payload-carrying variants are constructed like calls on the enum type
 # and destructured in match arms.
@@ -40,7 +42,7 @@ fn outcome(r: Result) -> String:
         Result.Err(msg) => "err: {msg}"
 
 fn main():
-    print(describe_direction(Direction.North))
+    print(Direction.North.describe())
     print("circle area = {area(Shape.Circle(1.0))}")
     print("rect area = {area(Shape.Rectangle(2.0, 3.0))}")
     print(outcome(Result.Ok(7)))

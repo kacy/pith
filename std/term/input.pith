@@ -479,7 +479,7 @@ fn code_name(code: KeyCode) -> String:
 pub fn describe(ev: Event) -> String:
     return match ev:
         Event.KeyPress(k) => "key:" + key_name(k)
-        Event.Mouse(m) => "mouse:" + mouse_kind_name(m.kind) + ":{m.button}@{m.col},{m.row}" + mods_suffix(m.mods)
+        Event.Mouse(m) => "mouse:" + m.kind.name() + ":{m.button}@{m.col},{m.row}" + mods_suffix(m.mods)
         Event.Paste(s) => "paste:{s.len()} bytes"
         Event.Resize(cols, rows) => "resize:{cols}x{rows}"
         Event.FocusIn => "focus:in"
@@ -487,14 +487,15 @@ pub fn describe(ev: Event) -> String:
         Event.Signal(n) => "signal:{n}"
         Event.Closed => "closed"
 
-fn mouse_kind_name(kind: MouseKind) -> String:
-    return match kind:
-        MouseKind.Press => "press"
-        MouseKind.Release => "release"
-        MouseKind.Drag => "drag"
-        MouseKind.Move => "move"
-        MouseKind.ScrollUp => "scrollup"
-        MouseKind.ScrollDown => "scrolldown"
+impl MouseKind:
+    fn name() -> String:
+        return match self:
+            MouseKind.Press => "press"
+            MouseKind.Release => "release"
+            MouseKind.Drag => "drag"
+            MouseKind.Move => "move"
+            MouseKind.ScrollUp => "scrollup"
+            MouseKind.ScrollDown => "scrolldown"
 
 fn mods_suffix(mods: Int) -> String:
     if mods == 0:

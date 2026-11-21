@@ -61,6 +61,21 @@ seniors := records.filter(fn(r: Record) => r.years >= 5)
 total := records.reduce(0, fn(acc: Int, r: Record) => acc + r.score)
 ```
 
+When the callback needs more than one expression, write it as a block lambda
+in place. The body goes on the lines below the header, and the call continues
+on the first line indented less than the body:
+
+```pith
+by_team := records.reduce({}, fn(acc: Map[String, Int], r: Record) -> Map[String, Int]:
+    mut out := acc
+    out[r.team] = out.get(r.team).unwrap_or(0) + r.score
+    return out
+)
+```
+
+An empty `{}` or `[]` accumulator takes its type from the callback's first
+parameter.
+
 The free-function forms in `std.collections` (`map_list`, `filter_list`,
 `fold_list`, `max_by`, …) are still there when you already hold a
 function and want to pipe it, or when you need a helper the method

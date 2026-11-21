@@ -139,6 +139,17 @@ mut indent_stack: List[Int] := [0]
 mut group_depth := 0
 mut pending_dedents := 0
 
+# a block lambda written inside a group, as in `xs.map(fn(x: Int):` with the
+# body on the lines below. lambda_header_depths holds the group depth of
+# each `fn` seen inside a group whose header has not ended yet, innermost
+# last. when such a header ends in a colon at the end of its line, the
+# lexer leaves group mode for the body: the block's depth and the indent
+# stack height are saved, and layout tokens come back until a line dedents
+# past the body, which closes the block and resumes the group.
+mut lambda_header_depths: List[Int] := []
+mut lambda_block_depths: List[Int] := []
+mut lambda_block_heights: List[Int] := []
+
 # pending tokens from string interpolation.
 #
 # the queue is filled while the whole interpolated string is scanned and
@@ -264,6 +275,55 @@ fn emit(kind: String, value: String):
     if length < 0:
         length = 0
     current_token_len = length
+    track_group_lambda(kind)
+
+# follow block lambda headers inside a group; see lambda_header_depths
+fn track_group_lambda(kind: String):
+    if kind == "kw_fn":
+        if group_depth > 0:
+            lambda_header_depths.push(group_depth)
+        return
+    if lambda_header_depths.len() == 0:
+        return
+    if kind == "rparen" or kind == "rbracket" or kind == "rbrace":
+        while lambda_header_depths.len() > 0 and lambda_header_depths[lambda_header_depths.len() - 1] > group_depth:
+            lambda_header_depths.remove(lambda_header_depths.len() - 1)
+        return
+    if lambda_header_depths[lambda_header_depths.len() - 1] != group_depth:
+        return
+    if kind == "comma" or kind == "fat_arrow":
+        lambda_header_depths.remove(lambda_header_depths.len() - 1)
+        return
+    if kind == "colon" and is_blank_line():
+        lambda_header_depths.remove(lambda_header_depths.len() - 1)
+        lambda_block_depths.push(group_depth)
+        lambda_block_heights.push(indent_stack.len())
+        group_depth = 0
+
+# a line that dedents past the body of a block lambda opened inside a group
+# closes the body and goes back to the group. returns true when it emitted
+# the closing dedent.
+fn close_group_lambda(level: Int) -> Bool:
+    if lambda_block_heights.len() == 0:
+        return false
+    height := lambda_block_heights[lambda_block_heights.len() - 1]
+    if indent_stack.len() == height:
+        # the body's first line, unless it is not indented at all
+        if level > indent_stack[height - 1]:
+            return false
+    elif level >= indent_stack[height]:
+        return false
+    dedents := indent_stack.len() - height
+    while indent_stack.len() > height:
+        indent_stack.remove(indent_stack.len() - 1)
+    group_depth = lambda_block_depths[lambda_block_depths.len() - 1]
+    lambda_block_depths.remove(lambda_block_depths.len() - 1)
+    lambda_block_heights.remove(lambda_block_heights.len() - 1)
+    if dedents == 0:
+        return false
+    pending_dedents = dedents - 1
+    emit("dedent", "")
+    return true
 
 fn next_token():
     # synthetic tokens — dedents, queued interpolation pieces, indent,
@@ -333,6 +393,13 @@ fn next_token():
             return
 
         level := measure_indent()
+        if close_group_lambda(level):
+            return
+        if group_depth > 0:
+            # a block lambda with no indented body; back in the group
+            skip_spaces()
+            next_token()
+            return
         current_indent := indent_stack[indent_stack.len() - 1]
 
         if level > current_indent:
@@ -1080,6 +1147,9 @@ pub fn init_lexer(src: String):
     done = false
     indent_stack = [0]
     group_depth = 0
+    lambda_header_depths = []
+    lambda_block_depths = []
+    lambda_block_heights = []
     pending_token_kinds = []
     pending_token_values = []
     pending_token_lines = []

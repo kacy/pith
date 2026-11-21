@@ -1,9 +1,9 @@
 # the elm architecture in std.term.app: a model struct, an event handler
-# that dispatches keys to messages, an update that folds them, and a view.
+# that maps keys to messages, an update that folds them, and a view.
 # app.run() would drive this against a real terminal; here app.drive() runs
-# the exact same cycle over a scripted event list and returns every frame —
-# which is why an application built this way is testable in ci, and why
-# this example is deterministic.
+# the same cycle over a scripted list of key presses and returns every frame,
+# which is why an application built this way is testable in ci, and why this
+# example is deterministic.
 import std.term.app as app
 from std.term.app import App, Cmd
 import std.term.input as input
@@ -25,20 +25,9 @@ impl App for Counter:
         return app.nothing[CounterMsg]()
 
     fn on_event(ev: Event) -> Cmd[CounterMsg]:
-        match ev:
-            Event.KeyPress(k) =>
-                name := input.key_name(k)
-                if name == "+":
-                    return self.update(CounterMsg.Inc)
-                if name == "-":
-                    return self.update(CounterMsg.Dec)
-                if name == "r":
-                    return self.update(CounterMsg.Reset)
-                if name == "q":
-                    return self.update(CounterMsg.Halt)
-                return app.nothing[CounterMsg]()
-            _ =>
-                return app.nothing[CounterMsg]()
+        if let Event.KeyPress(k) = ev:
+            if let msg = key_message(input.key_name(k)):
+                return self.update(msg)
         return app.nothing[CounterMsg]()
 
     fn update(msg: CounterMsg) -> Cmd[CounterMsg]:
@@ -55,6 +44,15 @@ impl App for Counter:
 
     fn view() -> String:
         return "count: {self.count}   (+/- change, r reset, q quit)"
+
+# the keys the counter answers to; any other key is ignored.
+fn key_message(name: String) -> CounterMsg?:
+    return match name:
+        "+" => CounterMsg.Inc
+        "-" => CounterMsg.Dec
+        "r" => CounterMsg.Reset
+        "q" => CounterMsg.Halt
+        _ => none
 
 fn press(name: String) -> Event:
     return Event.KeyPress(input.Key(code: input.KeyCode.Char(name), mods: 0))

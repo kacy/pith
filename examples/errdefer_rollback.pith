@@ -1,57 +1,69 @@
-# errdefer: cleanup that runs only on the error path.
+# errdefer: cleanup that runs only when a function leaves through an error.
 #
-# a transaction is the classic case. you begin it, do the work, and commit.
-# if a step fails the change must roll back — but a successful commit must
-# NOT be undone. `errdefer rollback(tx)` runs on exactly the error exits (a
-# `fail` or an `!` that propagates) and stays out of the way on success.
+# moves money between two accounts inside a transaction. the transfer
+# begins a transaction, registers `errdefer tx.rollback()` right after, and
+# commits at the end. a failed step (a `fail`, or a `!` that propagates)
+# rolls the transaction back; a successful commit is left alone, which a
+# plain defer would not do.
 #
-# the store here is in memory so the example is self-contained, but the
-# shape is the one you'd write against std.db: begin, errdefer rollback,
-# work, commit.
+# the store is in memory so the example runs on its own, but the shape is the
+# one to write against std.db: begin, errdefer rollback, work, commit.
 
-mut balance := 100
-mut open_tx := 0
+struct Store:
+    balances: Map[String, Int]
+    open_transactions: Int = 0
 
 struct Tx:
-    pub staged: Int
+    store: Store
+    # changes are staged here and applied to the store only on commit
+    staged: Map[String, Int]
 
-fn begin() -> Tx:
-    open_tx = open_tx + 1
-    print("begin (balance={balance}, open={open_tx})")
-    return Tx{balance}
+impl Store:
+    fn begin() -> Tx:
+        self.open_transactions += 1
+        return Tx(store: self, staged: {})
 
-fn commit(tx: Tx):
-    balance = tx.staged
-    open_tx = open_tx - 1
-    print("commit (balance={balance}, open={open_tx})")
+impl Tx:
+    fn balance(account: String) -> Int!:
+        if let staged = self.staged.get(account):
+            return staged
+        if let current = self.store.balances.get(account):
+            return current
+        fail "no account named {account}"
 
-fn rollback(tx: Tx):
-    open_tx = open_tx - 1
-    print("rollback (balance={balance}, open={open_tx})")
+    fn adjust(account: String, cents: Int) -> Int!:
+        updated := self.balance(account)! + cents
+        if updated < 0:
+            fail "{account} would be overdrawn by {-updated}"
+        self.staged[account] = updated
+        return updated
 
-# stage a withdrawal on the transaction; fails if it would overdraw.
-fn withdraw(tx: Tx, amount: Int) -> Tx!:
-    if amount > tx.staged:
-        fail "insufficient funds"
-    remaining := tx.staged - amount
-    print("withdraw {amount} (staged {tx.staged} -> {remaining})")
-    return Tx{remaining}
+    fn commit():
+        for account in self.staged.keys():
+            self.store.balances[account] = self.staged[account]
+        self.store.open_transactions -= 1
 
-fn transfer(amount: Int) -> Int!:
-    tx := begin()
-    errdefer rollback(tx)
+    fn rollback():
+        print("  rolled back")
+        self.store.open_transactions -= 1
 
-    staged := withdraw(tx, amount)!
-    commit(staged)
-    return staged.staged
+fn transfer(store: Store, source: String, target: String, cents: Int) -> Int!:
+    tx := store.begin()
+    errdefer tx.rollback()
+
+    tx.adjust(source, -cents)!
+    tx.adjust(target, cents)!
+    tx.commit()
+    return cents
 
 fn main():
-    print("--- succeeds: commit, no rollback ---")
-    a := transfer(30) catch -1
-    print("transfer returned {a}")
-
-    print("--- fails: errdefer rolls back ---")
-    b := transfer(500) catch -1
-    print("transfer returned {b}")
-
-    print("balance={balance}, open transactions={open_tx}")
+    store := Store(balances: {"alice": 10000, "bob": 2500})
+    attempts := [("alice", "bob", 3000), ("bob", "alice", 9000), ("alice", "carol", 500)]
+    for attempt in attempts:
+        print("transfer {attempt.2} from {attempt.0} to {attempt.1}")
+        moved := transfer(store, attempt.0, attempt.1, attempt.2)
+        if moved.is_err:
+            print("  failed: {moved.err}")
+        else:
+            print("  done")
+        print("  alice {store.balances["alice"]}, bob {store.balances["bob"]}, open transactions {store.open_transactions}")

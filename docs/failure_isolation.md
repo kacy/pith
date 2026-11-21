@@ -1,9 +1,10 @@
 # failure isolation
 
 a pith runtime error (an index out of range, a missing map key, `.value()` on
-`none`, a division by zero, and integer overflow once it lands) prints
-`pith runtime error: ...` and exits with status 1. inside a `T!` function the
-index, key and value errors propagate as errors instead, but a handler returns
+`none`, a division by zero, an integer overflow) prints
+`pith runtime error: ...` and exits with status 1. inside a `T!` or `T!String`
+function the index, key and value errors propagate as errors instead, but a
+handler returns
 an `HttpResponse`, so in a server one bad request ends the process and every
 connection it was serving.
 

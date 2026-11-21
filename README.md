@@ -75,7 +75,9 @@ enums carry payloads and `match` takes them apart. errors are values:
 a fallback. a function that cannot fail cannot pretend otherwise.
 interpolation takes format specs. there is no null and there are no
 exceptions. an out-of-range index or a missing map key propagates as
-an error inside a `T!` function and stops the process outside one.
+an error inside a `T!` or `T!String` function and stops the process
+elsewhere. integer arithmetic traps on overflow; `wrapping_add`,
+`wrapping_sub` and `wrapping_mul` opt out ([docs/numbers.md](docs/numbers.md)).
 
 ## why you might want it
 
@@ -99,6 +101,12 @@ an identical compiler, verified on every merge.
 to inspect a failure, and `defer` / `errdefer` run cleanup on every
 exit or only the failing one. see [docs/errors.md](docs/errors.md) and
 [docs/defer.md](docs/defer.md).
+
+**one bad request does not take down the server.** a runtime error
+inside an http or grpc handler, such as an out-of-range index, a
+missing map key, a division by zero or an integer overflow, fails that
+request with a 500 (`INTERNAL` for grpc) and the server keeps serving
+([docs/failure_isolation.md](docs/failure_isolation.md)).
 
 **memory is managed at compile time.** the compiler emits retain and
 release pairs under a borrowed-by-default discipline

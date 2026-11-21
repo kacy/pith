@@ -10,7 +10,7 @@
 #
 #   code := process.run_shell("ls -la")
 
-from std.io import ProcessStdin, ProcessStdout, ProcessStderr
+from std.io import ProcessStdin, ProcessStdout, ProcessStderr, buffered_writer
 from std.concurrent import Context, BlockingError, WaitError, blocking_failed
 from std.collections import copy_list
 import std.bytes as bytes
@@ -278,3 +278,25 @@ test "process output helpers classify status":
 
 test "process shell helpers capture output":
     assert(output_shell("printf shell")! == "shell")
+
+test "process stdin close lets a child read to the end":
+    nl := chr(10)
+    child := command("sort").start()!
+    child.stdin().write_all("pear" + nl + "apple" + nl + "fig" + nl)!
+    child.stdin().close()
+    child.stdin().close()
+    assert(child.stdin().write("late").is_err)
+    assert_eq(child.stdout().read_all()!, "apple" + nl + "fig" + nl + "pear" + nl)
+    assert_eq(child.wait(), 0)
+    child.close()
+
+test "process stdin takes a buffered writer that flushes before the close":
+    counter := command("wc").arg("-l").start()!
+    writer := buffered_writer(counter.stdin(), 0)
+    writer.write("one" + chr(10) + "two" + chr(10))!
+    writer.flush()!
+    writer.close()
+    counter.stdin().close()
+    assert_eq(counter.stdout().read_all()!.trim(), "2")
+    assert_eq(counter.wait(), 0)
+    counter.close()

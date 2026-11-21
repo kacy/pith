@@ -239,6 +239,39 @@ status code and message — the same `NOT_FOUND` your handler raised arrives her
 `!` only propagates an error of the enclosing function's error type, and
 `dial_h2c` fails with a `String` rather than a `GrpcError`.
 
+### streaming calls
+
+a streaming rpc's client method returns a typed `<Svc><Rpc>Call` handle. on the
+request side, `send(req)` encodes and frames one message and `close_send()`
+half-closes. on the response side, `recv()` reads one reply,
+`recv_response()` reads the single reply of a client-streaming rpc, and
+`collect()` gathers every remaining reply into a `List`. every handle has a
+`close()` that releases the stream; call it once you are done.
+
+`recv()` is on the server-streaming and bidi handles. it blocks for the next
+response and returns a `<Svc><Rpc>Reply`, the client-side mirror of the
+server's `<Svc><Rpc>Recv`. `done` is false with the decoded `message`, or true
+once the server has finished the stream with OK (`message` is then an
+all-default value). a non-OK status or a reset fails with the `GrpcError`,
+and a reply that does not decode fails with `INTERNAL`. a bidi client can use
+`recv()` to talk turn by turn, reading each answer before it composes the next
+request:
+
+```pith
+# rpc Chat(stream Note) returns (stream Note)
+fn ask(chat: cat.CatalogChatCall, note: cat.Note) -> cat.Note!grpc.GrpcError:
+    chat.send(note)
+    got := chat.recv()!
+    if got.done:
+        fail grpc.GrpcError(grpc.GRPC_UNAVAILABLE, "stream ended early")
+    return got.message
+```
+
+`collect()` waits for the whole stream, so use it only when the server ends the
+stream on its own: a server-streaming reply, or a bidi call after
+`close_send()`. `examples/grpc_reflect.pith` drives all four call shapes this
+way.
+
 ## tls
 
 serve over tls with a cert and key; dial with a tls config that offers alpn `h2`:
@@ -432,9 +465,6 @@ rpcs the framework had to close; anything but `0` names a handler to fix. see
 
 ## what isn't here yet
 
-- **generated streaming is server-side.** the generated *client* still collects
-  a response stream (`collect()`) or reaches through `.inner` for per-message
-  reads; a typed incremental client handle is not generated yet.
 - **protogen doesn't cover** proto2, `bool`/`fixed` map keys, repeated
   `sint`/`fixed`/`float`/`double` fields, or the well-known types beyond
   Timestamp, Duration, Empty, and the wrappers (no Any, Struct, FieldMask, …).

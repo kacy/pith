@@ -3,7 +3,7 @@
 # renders a parsed AST (arena-indexed nodes) as indented text,
 # matching the output format of `pith parse` exactly.
 
-from ast import get_node
+from ast import get_node, from_import_names, from_import_name_aliases
 
 # ---------------------------------------------------------------
 # indentation helper
@@ -248,35 +248,20 @@ fn print_import(idx: Int, indent: Int):
 
 fn print_from_import(idx: Int, indent: Int):
     node := get_node(idx)
-    # value is "path name1 name2 ..."
-    # need to format as "from path import name1, name2"
-    parts := node.value
-    # find first space to split path from names
-    mut first_space := 0 - 1
-    for ch, si in parts:
-        if ch == " ":
-            first_space = si
-            break
-    if first_space < 0:
-        print_line(indent, "from " + parts + " import")
-        return
-
-    path := parts.substring(0, first_space)
-    names_str := parts.substring(first_space + 1, parts.len())
-
-    # split names by space and join with ", "
+    # value is "path name1 name2 as alias2 ...", printed as
+    # "from path import name1, name2 as alias2"
+    path := node.value.split(" ")[0]
+    aliases := from_import_name_aliases(node.value)
     mut names: List[String] := []
-    mut start := 0
-    for ch, ni in names_str:
-        if ch == " ":
-            if ni > start:
-                names.push(names_str.substring(start, ni))
-            start = ni + 1
-    if start < names_str.len():
-        names.push(names_str.substring(start, names_str.len()))
-
-    label := "from " + path + " import " + names.join(", ")
-    print_line(indent, label)
+    for name, i in from_import_names(node.value):
+        if i < aliases.len() and aliases[i].len() > 0:
+            names.push(name + " as " + aliases[i])
+        else:
+            names.push(name)
+    if names.len() == 0:
+        print_line(indent, "from " + path + " import")
+        return
+    print_line(indent, "from " + path + " import " + names.join(", "))
 
 # ---------------------------------------------------------------
 # bindings

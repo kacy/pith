@@ -1808,10 +1808,16 @@ cli-regressions-only:
 	case "$$lint_out" in *'"code":"E300"'*'"line":0'*) echo "FAIL lint --json positions"; fail=$$((fail+1));; *'"code":"E300"'*'"line":'*) pass=$$((pass+1)); echo "ok   lint --json positions";; *) echo "FAIL lint --json positions"; fail=$$((fail+1));; esac; \
 	printf 'struct Node:\n    next: Node?\n\nfn main():\n    return\n' > "$$tmpdir/lint_cycle.pith"; \
 	printf 'struct Node:\n    weak next: Node?\n\nfn main():\n    return\n' > "$$tmpdir/lint_weak.pith"; \
+	printf 'struct Entry:\n    children: List[Entry]\n\nfn main():\n    return\n' > "$$tmpdir/lint_tree.pith"; \
+	printf 'struct Shelf:\n    books: List[Book]\n\nstruct Book:\n    shelf: Shelf?\n\nfn main():\n    return\n' > "$$tmpdir/lint_back_edge.pith"; \
 	set +e; \
 	cyc_out=$$(./target/release/pith lint --json "$$tmpdir/lint_cycle.pith" 2>/dev/null); \
 	weak_out=$$(./target/release/pith lint --json "$$tmpdir/lint_weak.pith" 2>/dev/null); \
+	tree_out=$$(./target/release/pith lint --json "$$tmpdir/lint_tree.pith" 2>/dev/null); \
+	back_out=$$(./target/release/pith lint --json "$$tmpdir/lint_back_edge.pith" 2>/dev/null); \
 	set -e; \
+	case "$$tree_out" in *'"code":"E306"'*) echo "FAIL lint tree exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint tree exempt";; esac; \
+	case "$$back_out" in *'"code":"E306"'*'"line":5'*) pass=$$((pass+1)); echo "ok   lint back edge through a list";; *) echo "FAIL lint back edge through a list"; fail=$$((fail+1));; esac; \
 	case "$$cyc_out" in *'"code":"E306"'*) pass=$$((pass+1)); echo "ok   lint strong cycle";; *) echo "FAIL lint strong cycle"; fail=$$((fail+1));; esac; \
 	case "$$weak_out" in *'"code":"E306"'*) echo "FAIL lint weak edge exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint weak edge exempt";; esac; \
 	printf 'pub fn top() -> Int:\n    return 1\n' > "$$tmpdir/lint_first_line.pith"; \

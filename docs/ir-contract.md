@@ -250,7 +250,8 @@ mark untracked NAME         NAME is never released by the cleanup.
 a function's `kind`, `owns`, `mixed` and `untracked` marks come just before
 its `endfunc`. a loop's marks come where the loop sets up its slots. a
 slot with no mark is one the emitter made for a scalar, such as the flag a
-short-circuit `and` keeps. functions the emitter makes itself, such as
+short-circuit `and` keeps. an enum with no payload variant is marked `int`,
+since it lowers to an integer tag. functions the emitter makes itself, such as
 destructors and enum equality, carry none.
 
 a user function borrows every parameter: the caller keeps its count. a

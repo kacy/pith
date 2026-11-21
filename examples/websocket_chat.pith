@@ -95,7 +95,9 @@ fn connect(name: String) -> websocket.WebSocket!:
     return ws
 
 # say our lines, then read until every member's lines have arrived. the joins
-# of members who came later arrive first.
+# of members who came later arrive first. a member who finished first may
+# already have left, and when that news arrives depends on timing, so leaves
+# are not recorded.
 fn chat(name: String, ws: websocket.WebSocket, said: List[String]) -> Seen!:
     mut joins := ["* {name} joined"]
     for line in said:
@@ -103,9 +105,9 @@ fn chat(name: String, ws: websocket.WebSocket, said: List[String]) -> Seen!:
     mut lines: List[String] := []
     while lines.len() < MEMBERS * LINES_EACH:
         text := ws.recv_text()!
-        if text.starts_with("* "):
+        if text.ends_with(" joined"):
             joins.push(text)
-        else:
+        elif not text.ends_with(" left"):
             lines.push(text)
     ws.close(1000, "bye")!
     return Seen(joins: joins, lines: lines.sort())
@@ -134,7 +136,8 @@ fn main() -> Int!:
         clients.push(spawn chat(name, sessions[i], script(name)))
     mut transcripts: List[String] := []
     for name, i in names:
-        seen := (await clients[i])!
+        finished := await clients[i]
+        seen := finished!
         print("{name} saw {seen.joins.join(", ")}")
         transcripts.push(seen.lines.join("\n"))
 

@@ -147,20 +147,33 @@ around tiny structs that only hold handles into that state. structs are shared
 now (a field written through one copy is visible through every other), so the
 handle tables are no longer required, but the adapters still use them.
 
-## the buffered text readers are one reader
+## the buffered readers and writers hold an interface value
 
-`BufferedStringReader`, `BufferedTcpStream`, `BufferedFileReader`,
-`BufferedProcessStdout` and `BufferedProcessStderr` are five wrapper types over
-one implementation. they differ in exactly one thing — which function a refill
-calls to get the next chunk — so a reader carries a source tag and there is a
-single `read`, `read_line` and `read_until` rather than five copies of each.
+a buffered text reader is one type, `BufferedReader`, whatever it reads from.
+its source is an interface value of type `TextSource`, which has two methods:
+`read_chunk` for a plain read of raw bytes and `read_chunk_ctx` for the same
+read with a context. a refill calls one of them through the interface, and
+nothing else in `read`, `read_line` or `read_until` depends on the source. the
+writer side is the same: `BufferedWriter` flushes into a `TextTarget`, which
+has `write_all` and `write_all_ctx`. the bytes side uses the existing
+interfaces: `BufferedBytesReader` reads from a `BytesReader` and
+`BufferedBytesWriter` writes to a `BytesWriter`.
 
-the deadline-aware reads are the one split that is real. `read_ctx`,
-`read_line_ctx` and `read_until_ctx` return a different error type, and the
-context has to reach the source read itself, since waiting for a chunk is the
-only part of a buffered read that can block. so those are a second
-implementation, and a string reader and a file — neither of which blocks — do
-not offer them.
+a new source or target needs only an impl of the interface; `buffered_reader`,
+`buffered_writer`, `buffered_bytes_reader` and `buffered_bytes_writer` take
+any value that implements it. dispatching through the interface costs one
+indirect call per fill or flush.
+
+`TextSource` does not reuse `BytesReader`'s method name because one type cannot
+declare the same method in two interface impls, and the streams already
+implement `BytesReader`.
+
+the deadline-aware reads and writes (`read_ctx`, `read_line_ctx`,
+`read_until_ctx`, `write_ctx`, `flush_ctx`) are a second implementation,
+because they return a different error type and the context has to reach the
+source read itself. every buffered reader and writer offers them. a string, a
+string buffer and a file never block, so their `_ctx` calls check the context
+once and then do the plain call.
 
 two properties are worth knowing when reading that code, because both are easy
 to lose:

@@ -1,0 +1,95 @@
+# the buffered text reader and writer hold their source and target as
+# interface values, so a type outside std.io becomes a source or a target
+# with nothing but an impl. this covers a user-defined source and target,
+# the deadline-aware calls on them, and a buffered writer over a child's
+# stdin, which has no buffered method of its own.
+
+import std.concurrent as concurrent
+import std.io as io
+import std.bytes as bytes
+from std.concurrent import Context, BlockingError
+
+# a source that hands out its text three bytes at a time, however much is
+# asked for, and counts how often it was read.
+struct Drip:
+    text: String
+    at: Int
+    reads: Int
+
+impl io.TextSource for Drip:
+    fn read_chunk(max_bytes: Int) -> Bytes!:
+        self.reads = self.reads + 1
+        mut end := self.at + 3
+        if end > max_bytes + self.at:
+            end = max_bytes + self.at
+        if end > self.text.len():
+            end = self.text.len()
+        chunk := self.text.substring(self.at, end)
+        self.at = end
+        return bytes.from_string_utf8(chunk)
+
+    fn read_chunk_ctx(ctx: Context, max_bytes: Int) -> Bytes!BlockingError:
+        if ctx.is_cancelled():
+            fail concurrent.blocking_cancelled()
+        chunk := self.read_chunk(max_bytes)
+        if chunk.is_err:
+            fail concurrent.blocking_failed(chunk.err)
+        return chunk.ok
+
+# a target that records every flush it receives.
+struct Log:
+    entries: List[String]
+
+impl io.TextTarget for Log:
+    fn write_all(data: String) -> Int!:
+        self.entries.push(data)
+        return data.len()
+
+    fn write_all_ctx(ctx: Context, data: String) -> Int!BlockingError:
+        if ctx.is_cancelled():
+            fail concurrent.blocking_cancelled()
+        self.entries.push(data)
+        return data.len()
+
+fn main() -> Int!:
+    drip := Drip("alpha\nbeta|gamma\r\ndelta", 0, 0)
+    reader := io.buffered_reader(drip, 64)
+    print("line=[" + reader.read_line()! + "]")
+    print("until=[" + reader.read_until("|")! + "]")
+    bg := concurrent.background()
+    ctx_line := reader.read_line_ctx(bg)
+    print("ctx_line ok=" + ctx_line.is_ok.to_string() + " [" + ctx_line.ok + "]")
+    print("rest=[" + reader.read(100)! + "]")
+    print("eof=[" + reader.read_line()! + "]")
+    print("reads=" + drip.reads.to_string())
+    reader.close()
+    print("closed=[" + reader.read(4)! + "]")
+
+    cancelled := concurrent.with_cancel(bg)
+    cancelled.1.cancel()
+    fresh := io.buffered_reader(Drip("x\ny", 0, 0), 8)
+    cancelled_read := fresh.read_line_ctx(cancelled.0)
+    print("cancelled read err=" + cancelled_read.is_err.to_string())
+
+    log := Log([])
+    writer := io.buffered_writer(log, 4)
+    writer.write("ab")!
+    print("held=" + log.entries.len().to_string())
+    writer.write("cd")!
+    print("ctx write ok=" + writer.write_ctx(bg, "e").is_ok.to_string())
+    print("ctx flush ok=" + writer.flush_ctx(bg).is_ok.to_string())
+    print("flushed=" + log.entries.join(","))
+    writer.close()
+    print("after close=" + writer.write("zz")!.to_string())
+
+    proc := io.spawn_process("head -c 8")!
+    stdin := proc.stdin()
+    piped := io.buffered_writer(stdin, 5)
+    piped.write("one\n")!
+    piped.write("two\n")!
+    piped.flush()!
+    piped.close()
+    print("child=[" + proc.stdout().read_all()! + "]")
+    print("exit=" + proc.wait().to_string())
+    proc.close()
+    return 0

@@ -68,6 +68,9 @@ The rules:
   implementation, including a default method the impl did not override.
 - Two interface values compare with `==` by identity, as structs do now.
 
+`examples/interface_values.pith` uses an interface as a list element, a
+struct field, a map value and a return type.
+
 ## which interfaces can be values
 
 An interface can be used as a value type only if every method can be called

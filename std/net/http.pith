@@ -30,7 +30,7 @@ import std.time as time_mod
 import std.trace as trace
 import std.uuid as uuid
 from std.concurrent import Context, BlockingError, blocking_cancelled, blocking_deadline_exceeded, blocking_failed
-from std.io import BufferedBytesReader, BufferedBytesWriter, BufferedStringReader, TcpStream, FileStream
+from std.io import BufferedBytesReader, BufferedBytesWriter, BufferedReader, TcpStream, FileStream
 import std.io as io
 # ===============================================================
 # MIME Types
@@ -3496,7 +3496,7 @@ fn read_request_into(src: ByteSource, writer: BufferedBytesWriter) -> StreamedHt
 # instead of buffering forever, and the buffered reader's cursor makes the
 # per-character reads linear, not quadratic. end of stream returns what
 # arrived, and a CR before the newline is dropped, exactly like `read_line`.
-fn read_head_line_bounded(reader: BufferedStringReader, cap: Int) -> String!:
+fn read_head_line_bounded(reader: BufferedReader, cap: Int) -> String!:
     mut parts: List[String] := []
     mut pending := 0
     while true:
@@ -3519,7 +3519,7 @@ fn read_head_line_bounded(reader: BufferedStringReader, cap: Int) -> String!:
             fail HEADER_LIMIT_MESSAGE
     return ""
 
-fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpRequestBytes!:
+fn read_request_from_buffered_string(reader: BufferedReader) -> HttpRequestBytes!:
     crlf := chr(13) + chr(10)
     request_line := read_head_line_bounded(reader, MAX_HEADER_BYTES)!
     if request_line == "":
@@ -3549,7 +3549,7 @@ fn read_request_from_buffered_string(reader: BufferedStringReader) -> HttpReques
 # reads one request from a buffered string reader and packs it into the legacy
 # string form. the head is bounded by MAX_HEADER_BYTES like every other request
 # reader here: a head that exceeds it fails, even as one endless CRLF-less line.
-pub fn read_request_buffered(reader: BufferedStringReader) -> String!:
+pub fn read_request_buffered(reader: BufferedReader) -> String!:
     return pack_request(read_request_from_buffered_string(reader)!)
 # reads one request from a file descriptor and packs it into the legacy string form.
 pub fn read_request(fd: Int) -> String!:

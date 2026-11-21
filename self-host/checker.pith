@@ -3353,6 +3353,12 @@ fn check_let_pattern(pat_idx: Int, subj_idx: Int, branch_scope: Int, outer_scope
         return
     pat := get_node(pat_idx)
     if pat.kind == "pat_variant":
+        # on an optional enum the variant pattern matches the payload of a
+        # some: `if let Shape.Circle(r) = maybe_shape`
+        info := get_type_info(subj_type)
+        if info.kind == "optional" and info.inner >= 0 and get_type_info(info.inner).kind == "enum":
+            check_pattern_match(pat_idx, info.inner, branch_scope)
+            return
         check_pattern_match(pat_idx, subj_type, branch_scope)
         return
     if pat.kind == "pat_binding":

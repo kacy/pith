@@ -1,90 +1,89 @@
-# json_ops.pith — test std.json parse and encode
+# json_ops: reading and writing JSON with std.json.
+#
+# handles order webhooks from a shop. a well-formed body decodes straight into
+# typed structs; a malformed one is rejected with the reason. the reply is
+# built node by node and encoded, and an archived copy goes to disk and back.
 
-import std.json as json
 import std.fs as fs
-import std.fmt as fmt
+import std.json as json
 
-struct ToolInfo:
-    pub name: String
-    pub version: Int
-    pub active: Bool
+# json.decode fills public fields by name; a field with a default may be
+# missing from the body
+struct Item:
+    pub sku: String
+    pub quantity: Int
+    pub unit_cents: Int
 
-fn main() -> String!:
-    path := "/tmp/pith_json_ops.json"
+struct Order:
+    pub id: Int
+    pub customer: String
+    pub items: List[Item]
+    pub gift_wrap: Bool = false
 
-    # a literal brace in a pith string is doubled, since a single { starts
-    # an interpolation
-    input := "{{\"name\":\"pith\",\"version\":1,\"active\":true,\"tags\":[\"lang\",\"fast\"]}}"
-    root := json.parse(input)
-    print("type = {json.type_of(root)}")
+# the archived copy only needs two of the receipt's fields; the rest are skipped
+struct ArchivedReceipt:
+    pub order: Int
+    pub total_cents: Int
 
-    # extract fields
-    print("name = {json.object_get_string(root, "name")}")
-    print("version = {json.object_get_int(root, "version")}")
-    print("active = {json.object_get_bool(root, "active")}")
-    print("missing = {json.object_get_string_or(root, "missing", "n/a")}")
+fn order_total(order: Order) -> Int:
+    return order.items.reduce(0, fn(sum: Int, item: Item) => sum + item.quantity * item.unit_cents)
 
-    shallow := "{{\"name\":\"pith\",\"version\":1,\"active\":true}}"
-    info := json.decode_text[ToolInfo](shallow)
-    if info.is_ok:
-        print("decoded = {info.ok.name}@{info.ok.version}")
+# the reply the shop expects, built as a tree and encoded once
+fn receipt(order: Order) -> Int:
+    skus := json.make_array()
+    for item in order.items:
+        json.array_push(skus, json.make_string(item.sku))
+    reply := json.make_object()
+    json.object_set(reply, "order", json.make_int(order.id))
+    json.object_set(reply, "status", json.make_string("accepted"))
+    json.object_set(reply, "total_cents", json.make_int(order_total(order)))
+    json.object_set(reply, "skus", skus)
+    return reply
 
-    # array access
-    tags := json.object_get_array(root, "tags")
-    print("tags.len = {json.array_len(tags)}")
-    print("tags[0] = {json.get_string(json.array_get(tags, 0))}")
-    print("tags[1] = {json.get_string(json.array_get(tags, 1))}")
+fn handle(body: String) -> String:
+    decoded := json.decode_text[Order](body)
+    if decoded.is_err:
+        return "rejected: {decoded.err.message}"
+    order := decoded.ok
+    wrap := if order.gift_wrap: ", gift wrapped" else: ""
+    print("order {order.id} for {order.customer}: {order.items.len()} line(s){wrap}")
+    return json.encode(receipt(order))
 
-    # key queries
-    print("has name = {json.object_has(root, "name")}")
-    print("has missing = {json.object_has(root, "missing")}")
+fn main() -> Int!json.JsonDecodeError:
+    # a literal brace in a pith string is doubled, since { starts interpolation
+    bodies := [
+        "{{\"id\": 1001, \"customer\": \"ada\", \"items\": [{{\"sku\": \"tea\", \"quantity\": 2, \"unit_cents\": 450}}, {{\"sku\": \"mug\", \"quantity\": 1, \"unit_cents\": 1200}}]}}",
+        "{{\"id\": 1002, \"customer\": \"grace\", \"gift_wrap\": true, \"items\": [{{\"sku\": \"pot\", \"quantity\": 1, \"unit_cents\": 3000}}]}}",
+        "{{\"id\": \"1003\", \"customer\": \"linus\", \"items\": []}}",
+]
+    mut replies: List[String] := []
+    for body in bodies:
+        reply := handle(body)
+        print("  -> {reply}")
+        replies.push(reply)
 
-    names := json.object_keys(root)
-    print("keys = {fmt.join_strings(names, ", ")}")
+    # the tree API reads a document whose shape is not fixed ahead of time
+    print("")
+    event := json.parse("{{\"type\": \"refund\", \"order\": 1001, \"amount_cents\": 450, \"note\": null}}")
+    print("event type: {json.object_get_string(event, "type")}")
+    print("fields: {json.object_keys(event).join(", ")}")
+    print("note is {json.type_of(json.object_get(event, "note"))}")
+    print("reason: {json.object_get_string_or(event, "reason", "none given")}")
 
-    # parse numbers
-    nums := json.parse("[42, 3.14, -7, 0]")
-    print("nums type = {json.type_of(nums)}")
-    print("nums[0] = {json.get_int(json.array_get(nums, 0))}")
-    print("nums[1] = {json.get_float(json.array_get(nums, 1))}")
+    # archive a receipt and read it back as a typed value
+    path := "/tmp/pith_json_ops_receipt.json"
+    defer fs.remove(path)
+    json.save(path, json.parse(replies[1]))
+    archived := json.decode_file[ArchivedReceipt](path)!
+    print("archived order {archived.order}: {archived.total_cents} cents")
 
-    # build and encode JSON
-    obj := json.make_object()
-    json.object_set(obj, "tool", json.make_string("pith"))
-    json.object_set(obj, "year", json.make_int(2026))
-    arr := json.make_array()
-    json.array_push(arr, json.make_int(1))
-    json.array_push(arr, json.make_int(2))
-    json.array_push(arr, json.make_int(3))
-    json.object_set(obj, "items", arr)
-    print("encoded = {json.encode(obj)}")
-    print("saved = {json.save(path, obj)}")
-
-    loaded := json.parse_file(path)
-    print("file tool = {json.object_get_string(loaded, "tool")}")
-
-    # null and bool
-    print("null type = {json.type_of(json.parse("null"))}")
-    print("true type = {json.type_of(json.parse("true"))}")
-
-    # invalid parse
-    bad := json.parse("not json")
-    print("bad parse = {bad}")
-
-    # parsing in a loop: a scope hands the nodes back so a long-lived task does
-    # not keep every document it has ever seen. http and http/2 servers already
-    # scope each request, so this is for parses you drive yourself.
+    # nodes live in a pool. a loop that parses many documents opens a scope
+    # per pass so it does not keep every document it has ever seen; http
+    # servers already do this for each request.
     before := json.pool_live_nodes()
-    mut total := 0
-    mut i := 0
-    while i < 100:
+    for index in 0..100:
         scope := json.open_scope()
-        doc := json.parse("[1, 2, 3]")
-        total = total + json.array_len(doc)
+        json.parse(bodies[index % 2])
         json.close_scope(scope)
-        i = i + 1
-    print("scanned = {total}")
-    print("nodes left over = {json.pool_live_nodes() - before}")
-
-    fs.remove(path)
-    return ""
+    print("nodes left after 100 parses: {json.pool_live_nodes() - before}")
+    return 0

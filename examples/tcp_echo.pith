@@ -1,38 +1,86 @@
-# tcp echo — start a server, connect a client, echo a message
+# a tcp echo server with std.net.tcp, serving each client on its own task.
+#
+# the server accepts connections in a loop and spawns a task per client, so a
+# slow client never holds up the others. each task reads a line at a time and
+# writes it back until the client hangs up. main starts the server, connects
+# three clients at once, and prints what each got back.
 
 import std.net.tcp as tcp
 
-fn server(port: Int) -> String!:
-    server_fd := tcp.listen("127.0.0.1", port)!
-    defer tcp.close(server_fd)
-    client_fd := tcp.accept(server_fd)!
-    defer tcp.close(client_fd)
-    msg := tcp.read(client_fd, 1024)!
-    # write_all keeps going after a short write; write would drop the remainder.
-    tcp.write_all(client_fd, msg)!
-    return ""
+PORT := 19876
 
-fn run() -> String!:
-    # dns resolve
-    resolved_ip := dns_resolve("localhost")!
-    print("resolved localhost: {resolved_ip}")
+# tcp delivers a stream of bytes, not messages, so one read can hold part of
+# a line or several lines. a LineReader keeps what it has read past the end of
+# the current line for the next call.
+struct LineReader:
+    fd: Int
+    mut pending: String = ""
 
-    # start server in background
-    port := 19876
-    server_task := spawn server(port)
+impl LineReader:
+    # the next line with its newline, or "" once the peer has hung up.
+    fn next_line() -> String!:
+        while self.pending.index_of("\n") < 0:
+            chunk := tcp.read(self.fd, 1024)!
+            if chunk.len() == 0:
+                return ""
+            self.pending = self.pending + chunk
+        cut := self.pending.index_of("\n") + 1
+        line := self.pending.substring(0, cut)
+        self.pending = self.pending.substring(cut, self.pending.len())
+        return line
 
-    # small delay to let server bind
-    sleep(100)
+fn echo_client(fd: Int) -> Int!:
+    defer tcp.close(fd)
+    reader := LineReader(fd: fd)
+    mut echoed := 0
+    while true:
+        line := reader.next_line()!
+        if line.len() == 0:
+            return echoed
+        # write_all, not write: one write can stop short when the socket's send
+        # buffer fills, and the rest would be lost.
+        tcp.write_all(fd, line)!
+        echoed += 1
+    return echoed
 
-    # connect and exchange data
-    connection_fd := tcp.connect("127.0.0.1", port)!
-    defer tcp.close(connection_fd)
-    tcp.write_all(connection_fd, "hello from pith")!
-    response := tcp.read(connection_fd, 1024)!
-    print("echo response: {response}")
+fn serve(port: Int) -> Int!:
+    listener := tcp.listen("127.0.0.1", port)!
+    defer tcp.close(listener)
+    while true:
+        client := tcp.accept(listener)!
+        spawn echo_client(client)
+    return 0
 
-    await server_task
-    return ""
+# connect until the listener answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
 
-fn main():
-    run()
+# send each line and collect the echoes on one connection.
+fn converse(name: String, lines: List[String]) -> String!:
+    fd := tcp.connect("127.0.0.1", PORT)!
+    defer tcp.close(fd)
+    reader := LineReader(fd: fd)
+    mut replies: List[String] := []
+    for line in lines:
+        tcp.write_all(fd, "{line}\n")!
+        replies.push(reader.next_line()!.trim())
+    return "{name} heard: {replies.join(" | ")}"
+
+fn main() -> Int!:
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
+
+    # three clients at once, each on its own connection and its own task.
+    ada := spawn converse("ada", ["hello", "is this thing on?"])
+    grace := spawn converse("grace", ["ping", "ping again", "and once more"])
+    edsger := spawn converse("edsger", ["goto considered harmful"])
+    for task in [ada, grace, edsger]:
+        print((await task)!)
+    return 0

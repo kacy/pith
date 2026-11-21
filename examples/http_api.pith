@@ -1,51 +1,139 @@
-# std.net.http — build requests with the client builder, route them on
-# the server side, and inspect typed responses.
+# an http server on std.net.http alone, without std.web's router.
+#
+# the accept loop, the per-connection task and the routing are all written
+# out: one task per connection runs http.serve_connection_fd, which reads
+# requests and hands each to `route`. routes match on method and path with
+# http's route helpers. std.web does all this for you; this is the layer
+# underneath, for when you want to own it.
+#
+# anything the caller controls goes through std.html before it reaches a page
+# and through std.json's builder before it reaches a json body. pasting it
+# into either format is how a server ends up serving the caller's script to
+# the next visitor.
 
-import std.net.http as http
+import std.bytes as bytes
+import std.html as html
 import std.io as io
+import std.json as json
+import std.net.http as http
+import std.net.tcp as tcp
+from std.net.http import HttpRequestBytes, HttpResponse
 
-# parse wire bytes into the typed, method-style request.
-fn parse(wire: Bytes) -> http.HttpRequestBytes!:
-    return http.read_request_buffered_bytes(io.bytes_reader(wire).buffered_chunked(64))
+PORT := 18110
 
-# a tiny router: dispatch on method and path, return a typed response.
-fn route(req: http.HttpRequestBytes) -> http.HttpResponse!:
-    method := req.method()!
-    path := req.path()!
-    if method == "GET" and path == "/":
-        return http.html(200, "<h1>welcome</h1>")
-    if method == "GET" and path.starts_with("/users/"):
-        id := req.path_param_or("/users/:id", "id", "?")
-        return http.text(200, "user {id}")
-    if method == "GET" and path == "/search":
-        q := req.query_param_or("q", "everything")
-        return http.text(200, "results for {q}")
-    if method == "POST" and path == "/submit":
-        body := req.body_text_or("")
-        return http.text(201, "stored: {body}")
-    return http.not_found_response()
+struct Product:
+    sku: String
+    name: String
+    cents: Int
 
-# route one built request and print a one-line summary of the response.
-fn serve(label: String, req: http.ClientRequest) -> Int!:
-    response := route(parse(req.to_bytes()!)!)!
-    mut status := "ok"
-    if not response.is_success():
-        status = "not ok"
-    body := response.body_bytes().to_string_utf8()!
-    print("{label}: {response.status_code()} ({status}) - {body}")
+fn catalog() -> List[Product]:
+    return [
+        Product(sku: "tea-01", name: "green tea", cents: 450),
+        Product(sku: "tea-02", name: "black tea", cents: 390),
+        Product(sku: "cup-01", name: "mug", cents: 1200),
+    ]
+
+fn find_product(sku: String) -> Product?:
+    for product in catalog():
+        if product.sku == sku:
+            return product
+    return none
+
+fn home() -> HttpResponse:
+    return http.html(200, "<h1>tea shop</h1><p><a href=\"/export.csv\">price list</a></p>")
+
+fn greet(req: HttpRequestBytes) -> HttpResponse:
+    name := req.query_param_or("name", "stranger")
+    return http.html(200, "<h1>hello, {html.escape(name)}!</h1>")
+
+# a url in an href needs more than escaping, since "javascript:alert(1)" has
+# nothing to escape. escape_url refuses the scheme as well.
+fn link(req: HttpRequestBytes) -> HttpResponse:
+    target := req.query_param_or("to", "/")
+    return http.html(200, "<a href=\"{html.escape_url(target)}\">continue</a>")
+
+fn product_json(req: HttpRequestBytes) -> HttpResponse:
+    sku := req.path_param_or("/products/:sku", "sku", "")
+    if let product = find_product(sku):
+        obj := json.make_object()
+        json.object_set(obj, "sku", json.make_string(product.sku))
+        json.object_set(obj, "name", json.make_string(product.name))
+        json.object_set(obj, "cents", json.make_int(product.cents))
+        return http.json_value(200, obj)
+    return http.response(404).json_body(json.of("error", "no product {sku}"))
+
+fn write_csv(out: io.BytesWriter) -> Int!:
+    out.write_bytes(bytes.from_string_utf8("sku,name,cents\n"))!
+    for product in catalog():
+        out.write_bytes(bytes.from_string_utf8("{product.sku},{product.name},{product.cents}\n"))!
     return 0
 
-fn main() -> Int!:
-    serve("home", http.get_request("example.com", 80, "/"))!
-    serve("user", http.get_request("example.com", 80, "/users/42"))!
-    serve("search", http.get_request("example.com", 80, "/search?q=pith"))!
-    serve("submit", http.post_request("example.com", 80, "/submit").text_body("hello"))!
-    serve("missing", http.get_request("example.com", 80, "/nope"))!
+# streamed: the body is written row by row after the head goes out, so an
+# export of any size never sits whole in memory.
+fn export_csv() -> HttpResponse:
+    return http.stream_response(http.response(200).content_type("text/csv"), write_csv)
 
-    # a request also carries headers and auth, read back the same way.
-    signed := http.get_request("example.com", 80, "/search?q=lang").accept("application/json").bearer("token123")
-    req := parse(signed.to_bytes()!)!
-    print("accept: {req.header_or("Accept", "-")}")
-    print("auth: {req.header_or("Authorization", "-")}")
-    print("q: {req.query_param_or("q", "-")}")
+fn route(req: HttpRequestBytes) -> HttpResponse:
+    if http.get_route(req, "/") catch false:
+        return home()
+    if http.get_route(req, "/greet") catch false:
+        return greet(req)
+    if http.get_route(req, "/link") catch false:
+        return link(req)
+    if http.get_route(req, "/products/:sku") catch false:
+        return product_json(req)
+    if http.get_route(req, "/export.csv") catch false:
+        return export_csv()
+    if http.get_route(req, "/shop") catch false:
+        return http.redirect_response("/")
+    return http.not_found_response()
+
+fn serve(port: Int) -> Int!:
+    listener := tcp.listen("127.0.0.1", port)!
+    defer tcp.close(listener)
+    while true:
+        client := tcp.accept(listener)!
+        # one task per connection, so a slow client holds up only itself.
+        # serve_connection_fd closes the socket when the client is done.
+        spawn http.serve_connection_fd(client, route)
+    return 0
+
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
+
+fn show(path: String):
+    resp := http.get_request("127.0.0.1", PORT, path).no_redirects().send() catch:
+        print("GET {path}: no response")
+        return
+    body := resp.body_text() catch ""
+    location := resp.header_value("Location")
+    if location.len() > 0:
+        print("GET {path} -> {resp.status}, Location: {location}")
+        return
+    print("GET {path} -> {resp.status} {resp.header_value("Content-Type")}")
+    for line in body.trim().split("\n"):
+        print("  {line}")
+
+fn main() -> Int!:
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
+
+    show("/")
+    show("/greet?name=ada")
+    # the script tag arrives as text, so a browser shows it instead of running it.
+    show("/greet?name=<script>alert(1)</script>")
+    show("/link?to=javascript:alert(1)")
+    show("/products/tea-02")
+    show("/products/tea-99")
+    show("/export.csv")
+    show("/shop")
+    show("/nowhere")
     return 0

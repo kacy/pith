@@ -1,61 +1,98 @@
-# HTTP request parsing and response building (inline, no imports)
+# parsing an http/1.1 request by hand, with no imports.
+#
+# std.net.http does this for real. writing it out shows the shape of the
+# format: a request line, header lines up to a blank line, then a body whose
+# length the Content-Length header gives. each way a request can be malformed
+# is a variant of ParseError, so a server can match on it to pick a status.
+
+CRLF := "\r\n"
+
+enum ParseError:
+    NoHeaderEnd
+    BadRequestLine(String)
+    UnsupportedVersion(String)
+    BadHeader(String)
+    BodyLength(Int, Int)
+
+struct Header:
+    name: String
+    value: String
 
 struct Request:
     method: String
-    path: String
-    version: String
+    target: String
+    headers: List[Header]
     body: String
-    header_count: Int
 
-fn parse_request(raw: String) -> Request:
-    nl := "\n"
-    mut header_part := raw
-    mut body := ""
-    mut i := 0
-    while i < raw.len() - 1:
-        if raw[i] == nl and i + 1 < raw.len() and raw[i + 1] == nl:
-            header_part = raw.substring(0, i)
-            body = raw.substring(i + 2, raw.len())
-            break
-        i = i + 1
-    lines := header_part.split(nl)
-    mut method := "GET"
-    mut path := "/"
-    mut version := "HTTP/1.1"
-    mut hdr_count := 0
-    if lines.len() > 0:
-        request_line := lines[0].trim()
-        parts := request_line.split(" ")
-        if parts.len() >= 1:
-            method = parts[0]
-        if parts.len() >= 2:
-            path = parts[1]
-        if parts.len() >= 3:
-            version = parts[2]
-        hdr_count = lines.len() - 1
-    return Request(method, path, version, body, hdr_count)
+impl Request:
+    # header names are case-insensitive.
+    fn header(name: String) -> String?:
+        wanted := name.to_lower()
+        for header in self.headers:
+            if header.name.to_lower() == wanted:
+                return header.value
+        return none
 
-fn respond(status: Int, body: String) -> String:
-    return "HTTP/1.1 {status} OK{"\n"}{body}"
+    fn path() -> String:
+        cut := self.target.index_of("?")
+        if cut < 0:
+            return self.target
+        return self.target.substring(0, cut)
+
+fn describe(err: ParseError) -> String:
+    return match err:
+        ParseError.NoHeaderEnd => "400: the head never ends"
+        ParseError.BadRequestLine(line) => "400: bad request line '{line}'"
+        ParseError.UnsupportedVersion(version) => "505: version {version} is not supported"
+        ParseError.BadHeader(line) => "400: bad header '{line}'"
+        ParseError.BodyLength(declared, actual) => "400: Content-Length says {declared}, body has {actual}"
+
+fn parse_request_line(line: String) -> List[String]!ParseError:
+    parts := line.split(" ")
+    if parts.len() != 3 or parts[0].len() == 0 or not parts[1].starts_with("/"):
+        fail ParseError.BadRequestLine(line)
+    if parts[2] != "HTTP/1.1" and parts[2] != "HTTP/1.0":
+        fail ParseError.UnsupportedVersion(parts[2])
+    return parts
+
+fn parse_header(line: String) -> Header!ParseError:
+    colon := line.index_of(":")
+    # a name with spaces in it is how request smuggling starts, so refuse it.
+    if colon <= 0 or line.substring(0, colon).contains(" "):
+        fail ParseError.BadHeader(line)
+    return Header(name: line.substring(0, colon), value: line.substring(colon + 1, line.len()).trim())
+
+fn parse_request(raw: String) -> Request!ParseError:
+    head_end := raw.index_of(CRLF + CRLF)
+    if head_end < 0:
+        fail ParseError.NoHeaderEnd
+    lines := raw.substring(0, head_end).split(CRLF)
+    request_line := parse_request_line(lines[0])!
+
+    mut headers: List[Header] := []
+    for line in lines.slice(1, lines.len()):
+        headers.push(parse_header(line)!)
+
+    request := Request(method: request_line[0], target: request_line[1], headers: headers, body: raw.substring(head_end + 4, raw.len()))
+    declared := parse_int(request.header("Content-Length").unwrap_or("0")) catch -1
+    if declared != request.body.len():
+        fail ParseError.BodyLength(declared, request.body.len())
+    return request
+
+fn report(raw: String):
+    parsed := parse_request(raw)
+    if parsed.is_err:
+        print("rejected  {describe(parsed.err)}")
+        return
+    request := parsed.ok
+    host := request.header("host").unwrap_or("(no host)")
+    print("accepted  {request.method} {request.path()} on {host}, {request.headers.len()} headers, body '{request.body}'")
 
 fn main():
-    # parse a GET request
-    nl := "\n"
-    raw := "GET /api/users HTTP/1.1{nl}Host: example.com{nl}{nl}"
-    req := parse_request(raw)
-    print("method: {req.method}")
-    print("path: {req.path}")
-    print("headers: {req.header_count}")
-
-    # parse a POST with body
-    raw2 := "POST /login HTTP/1.1{nl}Content-Type: json{nl}{nl}hello body"
-    req2 := parse_request(raw2)
-    print("post method: {req2.method}")
-    print("post body: {req2.body}")
-
-    # build response
-    resp := respond(200, "hello")
-    has_status := resp.contains("200")
-    print("has 200: {has_status}")
-
-    print("http parsing works")
+    report("GET /api/users?page=2 HTTP/1.1{CRLF}Host: example.com{CRLF}Accept: */*{CRLF}{CRLF}")
+    report("POST /login HTTP/1.1{CRLF}Host: example.com{CRLF}Content-Type: text/plain{CRLF}Content-Length: 9{CRLF}{CRLF}user=ada&")
+    report("GET /api/users HTTP/1.1{CRLF}Host: example.com{CRLF}")
+    report("GET api/users HTTP/1.1{CRLF}{CRLF}")
+    report("GET / HTTP/2.0{CRLF}{CRLF}")
+    report("GET / HTTP/1.1{CRLF}Bad Header: x{CRLF}{CRLF}")
+    report("POST /upload HTTP/1.1{CRLF}Content-Length: 50{CRLF}{CRLF}short")

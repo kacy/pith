@@ -250,8 +250,9 @@ fn user_json(user: NewUser) -> String:
 ```
 
 `examples/web_json_api.pith` is a complete, self-checking version of this: a
-`GET /users/:id` that echoes the path parameter as json and a `POST /users` that
-decodes a `NewUser` from the body and echoes it back.
+small book catalog with routes to list, read, create and delete. `POST /books`
+decodes a `NewBook` from the body and answers 400, 415 or 422 when the body is
+not json, not sent as json, or not a valid book.
 
 ## the json node pool
 
@@ -382,8 +383,8 @@ and the response comes back the other way. middleware wraps every route, includi
 default `GET /healthz`.
 
 write middleware as a named function, as above. `examples/web_middleware.pith` is a
-complete, self-checking example: two middleware bracket the response body with markers
-so the nesting is visible in the output.
+complete, self-checking example: an app-wide middleware adds a header to every
+response, including the 401 that an api key check bound to `/admin` returns.
 
 two middleware come built: `web.rate_limit(limiter)` answers 429 when a shared
 token bucket runs dry, and `web.circuit(breaker)` answers 503 while a circuit
@@ -1090,7 +1091,7 @@ argon2id, a session, a csrf token and a guard — and drives a login, a protecte
 and a sign-out through it. `examples/web_observability.pith` does the
 same and then scrapes `/metrics` to show the request counter the framework kept on its
 own. `examples/web_h2.pith` serves
-the same kind of app over http/2 (h2c) and drives it with a small built-in h2c client.
+the same kind of app over http/2 (h2c) and drives it with the `std.net.http2` client.
 `bench/web_hello.pith` is the same idea as a real blocking server, wired up for
 `bench/http_bench.sh`. `examples/graceful_shutdown.pith` serves, signals itself,
 and prints the drain outcome.

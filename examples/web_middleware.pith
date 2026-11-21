@@ -1,53 +1,80 @@
-# middleware with std.web.
+# middleware with std.web: code that runs around every handler.
 #
-# middleware wraps every matched route in an onion. each one takes `next` (the
-# rest of the chain) and the request, and returns a response, so it can run code
-# before or after next, or answer on its own without calling next at all. the
-# first middleware registered runs outermost: it sees the request first and the
-# response last.
+# a middleware takes `next`, the rest of the chain, and the request. it can
+# work before calling next (check an api key), after it (add a header to the
+# response), or not call next at all and answer itself (a 401).
 #
-# to make the ordering visible, the two middleware here bracket the response body
-# with a marker. a real middleware would log the request, start a timer, check
-# auth, and so on. as with web_hello, we spawn the server, make a request against
-# it, print the reply, and exit so this can run as a self-checking example.
-import std.web as web
+# the first middleware registered runs outermost. here stamp_version wraps
+# everything, so even the 401 that the api key check returns carries the
+# version header. require_api_key is bound to /admin with group(), so the
+# public routes never see it.
+
 import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
 
-# outermost middleware: wraps the response body in [ ... ]. registered first.
-fn outer(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
-    return http.text(200, "[" + (next(req).body_text() catch "") + "]")
+PORT := 18081
+API_VERSION := "2"
 
-# inner middleware: wraps the response body in ( ... ). registered second.
-fn inner(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
-    return http.text(200, "(" + (next(req).body_text() catch "") + ")")
+# in a real service these live in a database or a secret store.
+API_KEYS: Map[String, String] := {"k-7f3a": "ada", "k-91c2": "grace"}
 
-# the application: two middleware wrapping a single route. because outer is
-# registered first it ends up outermost, so a body of "home" comes back as
-# "[(home)]" — outer(inner(home)).
+# after: every response leaves with the api version on it.
+fn stamp_version(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    return next(req).header("X-Api-Version", API_VERSION)
+
+# before: refuse a request without a known key, and tell the handler who the
+# caller is by attaching it to the request.
+fn require_api_key(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -> http.HttpResponse:
+    if let owner = API_KEYS.get(req.header("X-Api-Key")):
+        return next(req.with_value("owner", owner))
+    return http.unauthorized_response()
+
+fn status(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "up")
+
+fn admin_stats(req: web.Request) -> http.HttpResponse:
+    return http.text(200, "stats for {req.value("owner")}")
+
 fn build_app() -> web.App:
     mut app := web.new()
-    app = app.use_mw(outer)
-    app = app.use_mw(inner)
-    app = app.get("/", fn(req: web.Request) => http.text(200, "home"))
+    app = app.use_mw(stamp_version)
+    app = app.get("/status", status)
+    app = app.group("/admin", require_api_key)
+    app = app.get("/admin/stats", admin_stats)
     return app
 
-# run the server in the background so main can act as a client against it.
-fn serve_bg(port: Int) -> Int:
+fn serve(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
-# fetch a path and return just the response body, so we can print it.
-fn fetch(port: Int, path: String) -> String:
-    resp := http.get_request("127.0.0.1", port, path).send() catch:
-        return "no response"
-    return resp.body_text() catch ""
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
+
+fn show(label: String, path: String, api_key: String):
+    mut req := http.get_request("127.0.0.1", PORT, path)
+    if api_key.len() > 0:
+        req = req.header("X-Api-Key", api_key)
+    resp := req.send() catch:
+        print("{label}: no response")
+        return
+    body := resp.body_text() catch ""
+    print("{label} -> {resp.status} {body} (api {resp.header_value("X-Api-Version")})")
 
 fn main() -> Int!:
-    port := 18081
-    spawn serve_bg(port)
-    sleep(200)   # give the listener a moment to bind
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
 
-    # "[(home)]" proves both middleware ran and outer wrapped inner.
-    print(fetch(port, "/"))
-    # the default health check is wrapped too: "[(ok)]".
-    print(fetch(port, "/healthz"))
+    show("public status", "/status", "")
+    show("admin, no key", "/admin/stats", "")
+    show("admin, unknown key", "/admin/stats", "k-0000")
+    show("admin, ada's key", "/admin/stats", "k-7f3a")
+    show("admin, grace's key", "/admin/stats", "k-91c2")
     return 0

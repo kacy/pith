@@ -16,8 +16,9 @@
 # the example spawns a small order service, sends it requests that each hit a
 # different runtime error, then shows it still answers. the error lines go to
 # stderr; stdout has only the statuses.
-import std.web as web
 import std.net.http as http
+import std.net.tcp as tcp
+import std.web as web
 
 PORT := 18107
 
@@ -40,8 +41,8 @@ fn price_strict(sku: String) -> Int!LookupError:
 
 # the "i know it is there" form. /orders/7 is out of range.
 fn get_order(req: web.Request) -> http.HttpResponse:
-    i := parse_int(req.param("id")) catch 0
-    return http.text(200, orders[i])
+    index := parse_int(req.param("id")) catch 0
+    return http.text(200, orders[index])
 
 # checks its input the soft way: a missing sku is a 404 the handler chose
 fn get_price(req: web.Request) -> http.HttpResponse:
@@ -78,6 +79,16 @@ fn build_app() -> web.App:
 fn serve_bg(port: Int) -> Int:
     return build_app().listen("127.0.0.1", port) catch 0
 
+# connect until the accept loop answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
+
 # the status and body of one request
 fn fetch(path: String) -> String:
     resp := http.get_request("127.0.0.1", PORT, path).send() catch:
@@ -88,9 +99,10 @@ fn fetch(path: String) -> String:
         return "{path}: 500"
     return "{path}: {resp.status} {body}"
 
-fn main():
+fn main() -> Int!:
     spawn serve_bg(PORT)
-    sleep(200) # give the listener a moment to bind
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
 
     print(fetch("/orders/1"))
     print(fetch("/orders/7")) # index out of range
@@ -103,3 +115,4 @@ fn main():
 
     # every failure above was one request. the server is still up.
     print(fetch("/orders/2"))
+    return 0

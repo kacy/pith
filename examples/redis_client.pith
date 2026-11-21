@@ -1,43 +1,64 @@
-# using the redis client (std.redis).
+# counting page views in redis with std.redis.
 #
-# a real program connects to a redis server and issues commands. to keep this
-# example self-contained, it first spins up a tiny stand-in server on loopback
-# that replays canned RESP responses — enough to exercise the client without a
-# running redis. against a real server you would just call redis.connect and
-# skip the mock entirely.
+# the client connects, counts visits per page with INCR, remembers the last
+# visitor with SET and GET, lists the counters with KEYS, and resets one with
+# DEL. so the example runs without a redis server, main first starts a stand-in
+# on loopback that answers each command with a recorded reply. against a real
+# server, drop the stand-in and point redis.connect at it.
 
-import std.redis as redis
 import std.net.tcp as tcp
+import std.redis as redis
 
-# a stand-in redis: accept one connection, then reply to each command in turn
-# with a pre-baked RESP response. it does not parse the requests — the client
-# sends them in a fixed order, so canned replies are enough.
-fn fake_redis(port: Int, replies: List[String]) -> Int!:
-    server := tcp_listen("127.0.0.1", port)!
-    defer tcp_close(server)
-    conn := tcp_accept(server)!
-    defer tcp_close(conn)
-    for reply in replies:
-        request := tcp_read(conn, 4096)!
+PORT := 17654
+
+# the replies a real redis would send, in RESP, one per command main sends.
+REPLIES := [
+    "+PONG\r\n",
+    ":1\r\n",
+    ":2\r\n",
+    ":1\r\n",
+    "+OK\r\n",
+    "$3\r\nada\r\n",
+    "*2\r\n$11\r\nviews:/home\r\n$12\r\nviews:/about\r\n",
+    ":1\r\n",
+    ":0\r\n",
+]
+
+# the stand-in does not parse requests: the client sends them in a known
+# order, so answering each with the next recorded reply is enough.
+fn stand_in_redis(port: Int) -> Int!:
+    listener := tcp.listen("127.0.0.1", port)!
+    defer tcp.close(listener)
+    conn := tcp.accept(listener)!
+    defer tcp.close(conn)
+    for reply in REPLIES:
+        tcp.read(conn, 4096)!
         tcp.write_all(conn, reply)!
-    return 0
+    return REPLIES.len()
+
+# the stand-in accepts exactly one connection, so retry the connect itself
+# instead of probing the port first.
+fn connect_when_ready(port: Int) -> redis.Client!:
+    for attempt in 0..100:
+        client := redis.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        return client
+    fail "nothing is listening on port {port}"
 
 fn main() -> Int!:
-    port := 17654
-    # one canned RESP reply per command main sends below, in order.
-    server := spawn fake_redis(port, ["+PONG\r\n", "+OK\r\n", "$5\r\nhello\r\n", ":1\r\n", ":2\r\n", ":1\r\n", "*2\r\n$8\r\ngreeting\r\n$7\r\ncounter\r\n", ":1\r\n"])
-    sleep(200)
+    server := spawn stand_in_redis(PORT)
+    client := connect_when_ready(PORT)!
+    defer client.close()
 
-    c := redis.connect("127.0.0.1", port)!
-    defer c.close()
-    print("ping: {c.ping()!}")
-    print("set: {c.set("greeting", "hello")!}")
-    print("get: {c.get("greeting")!}")
-    print("incr: {c.incr("counter")!}")
-    print("incr: {c.incr("counter")!}")
-    print("exists: {c.exists("greeting")!}")
-    print("keys: {c.keys("*")!.len()}")
-    print("del: {c.del("greeting")!}")
+    print("ping: {client.ping()!}")
+    for page in ["/home", "/home", "/about"]:
+        print("views of {page}: {client.incr("views:{page}")!}")
+    client.set("last_visitor", "ada")!
+    print("last visitor: {client.get("last_visitor")!}")
+    print("counters: {client.keys("views:*")!.join(", ")}")
+    print("reset /about: {client.del("views:/about")!} key removed")
+    print("/about still counted: {client.exists("views:/about")!}")
 
     await server
     return 0

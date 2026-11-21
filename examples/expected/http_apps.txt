@@ -1,19 +1,9 @@
-method: POST
-path: /items/42
-mode: raw
-parts: items,42
-cookie: incoming
-status: 201
-success: true
-route: item
-trace: trace-req
-set-cookie: session=fresh; Path=/; HttpOnly
-body id: 42
-body kind: item
-html has status: true
-redirect has location: true
-no content status: 204
-static type: text/html
-download disposition: attachment; filename="asset.html"
-saved body: saved
-http apps work
+create item -> 201 {"id":"42","kind":"teapot","draft":true}
+  trace: t-100
+  cookie: last_item=teapot; Path=/; HttpOnly
+no session -> 401 Unauthorized
+  trace: t-100
+empty kind -> 422 {"error":"kind is required"}
+not json -> 400 Bad Request
+get file -> 200 text/plain: steep for three minutes
+missing file -> 404 <h1>404 Not Found</h1>

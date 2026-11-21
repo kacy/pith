@@ -1,20 +1,63 @@
-# websocket session api over buffered bytes
+# a websocket echo server and client over a real socket.
+#
+# the server accepts a tcp connection, completes the websocket handshake with
+# websocket.accept, and echoes each text message until the client closes. the
+# client dials with websocket.dial, which sends the upgrade request and checks
+# the server's answer, then talks in messages rather than bytes.
 
-import std.bytes as bytes
-import std.io as io
+import std.net.tcp as tcp
 import std.net.websocket as websocket
 
+PORT := 18111
+
+fn echo_until_closed(ws: websocket.WebSocket) -> Int:
+    defer ws.close_now()
+    mut echoed := 0
+    while true:
+        # recv_text fails once the client has sent its close frame.
+        text := ws.recv_text() catch:
+            break
+        ws.send_text("echo: {text}") catch:
+            break
+        echoed += 1
+    return echoed
+
+# serve the first client that completes a handshake and report how many
+# messages it echoed.
+fn serve_one_session(port: Int) -> Int!:
+    listener := tcp.listen("127.0.0.1", port)!
+    defer tcp.close(listener)
+    while true:
+        fd := tcp.accept(listener)!
+        # the readiness probe in main connects and hangs up without a
+        # handshake, so a failed upgrade just moves on to the next client.
+        ws := websocket.accept(fd) catch:
+            tcp.close(fd)
+            continue
+        return echo_until_closed(ws)
+    return 0
+
+# connect until the listener answers, rather than sleeping for a guess.
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
+
 fn main() -> Int!:
-    inbound := bytes.buffer()
-    inbound.write(websocket.text_frame_bytes("pith")!)!
+    server := spawn serve_one_session(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
 
-    outbound := bytes.buffer()
-    ws := websocket.from_buffered(io.bytes_reader(inbound.bytes()).buffered_chunked(4), outbound.buffered_chunked(4), true)
+    ws := websocket.dial("127.0.0.1", PORT, "/echo")!
+    for message in ["hello", "how are you?", "goodbye"]:
+        ws.send_text(message)!
+        print(ws.recv_text()!)
+    ws.close(1000, "done")!
 
-    text := ws.recv_text()!
-    ws.send_text("echo:{text}")!
-
-    echoed := websocket.read_frame_buffered(io.bytes_reader(outbound.bytes()).buffered_chunked(4))!
-    print(text)
-    print(echoed.payload_text()!)
+    echoed := (await server)!
+    print("the server echoed {echoed} messages")
     return 0

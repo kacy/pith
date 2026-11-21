@@ -1,29 +1,77 @@
-# websocket chat flow over buffered sessions
+# a chat room relaying messages between websocket sessions.
+#
+# each member's first message is the name it joins with, and every later
+# message is broadcast to the whole room. the sessions run over in-memory
+# buffers rather than sockets: each client's frames are written up front and
+# everything the server sends is collected, so the relay can be followed from
+# both sides. websocket_echo shows a session over a real socket.
+
 import std.bytes as bytes
 import std.io as io
 import std.net.websocket as websocket
-fn chat_client_wire(name: String, message: String) -> Bytes!:
+from std.bytes import ByteBuffer
+
+struct Member:
+    mut name: String
+    ws: websocket.WebSocket
+    # every frame the server sent this member, as the client would receive it.
+    received: ByteBuffer
+
+struct Room:
+    members: List[Member]
+
+impl Room:
+    # a session's first message is the name it joins with.
+    fn join(member: Member) -> Int!:
+        member.name = member.ws.recv_text()!
+        self.members.push(member)
+        return self.broadcast("* {member.name} joined")!
+
+    fn broadcast(text: String) -> Int!:
+        for member in self.members:
+            member.ws.send_text(text)!
+        return self.members.len()
+
+# a client that joins as `name` and then says each line of `lines`. clients
+# mask what they send, so each frame carries a mask key.
+fn client_frames(name: String, lines: List[String]) -> Bytes!:
     wire := bytes.buffer()
-    wire.write(websocket.client_text_frame_bytes(name, bytes.from_string_utf8("abcd"))!)!
-    wire.write(websocket.client_text_frame_bytes(message, bytes.from_string_utf8("wxyz"))!)!
+    wire.write(websocket.client_text_frame_bytes(name, bytes.from_string_utf8("k3y1"))!)!
+    for line in lines:
+        wire.write(websocket.client_text_frame_bytes(line, bytes.from_string_utf8("k3y2"))!)!
     return wire.bytes()
+
+fn connect(name: String, lines: List[String]) -> Member!:
+    inbound := io.bytes_reader(client_frames(name, lines)!).buffered_chunked(64)
+    received := bytes.buffer()
+    ws := websocket.from_buffered(inbound, received.buffered_chunked(64), false)
+    return Member(name: "", ws: ws, received: received)
+
+# what a client saw, one line per message.
+fn transcript(member: Member) -> List[String]!:
+    reader := io.bytes_reader(member.received.bytes()).buffered_chunked(64)
+    mut lines: List[String] := []
+    while true:
+        frame := websocket.read_frame_buffered(reader) catch:
+            break
+        lines.push(frame.payload_text()!)
+    return lines
+
 fn main() -> Int!:
-    left_out := bytes.buffer()
-    right_out := bytes.buffer()
-    left := websocket.from_buffered(io.bytes_reader(chat_client_wire("left", "hello from left")!).buffered_chunked(4), left_out.buffered_chunked(4), false)
-    right := websocket.from_buffered(io.bytes_reader(chat_client_wire("right", "hello from right")!).buffered_chunked(4), right_out.buffered_chunked(4), false)
-    left_name := left.recv_text()!
-    right_name := right.recv_text()!
-    left.send_text("welcome {left_name}")!
-    right.send_text("welcome {right_name}")!
-    left_msg := left.recv_text()!
-    right.send_text("{left_name}: {left_msg}")!
-    right_msg := right.recv_text()!
-    left.send_text("{right_name}: {right_msg}")!
-    left_reader := io.bytes_reader(left_out.bytes()).buffered_chunked(4)
-    right_reader := io.bytes_reader(right_out.bytes()).buffered_chunked(4)
-    print(websocket.read_frame_buffered(left_reader)!.payload_text()!)
-    print(websocket.read_frame_buffered(right_reader)!.payload_text()!)
-    print(websocket.read_frame_buffered(right_reader)!.payload_text()!)
-    print(websocket.read_frame_buffered(left_reader)!.payload_text()!)
+    alice := connect("alice", ["hi everyone", "anyone up for lunch?"])!
+    bob := connect("bob", ["hello alice", "sure, at noon"])!
+    room := Room(members: [])
+    room.join(alice)!
+    room.join(bob)!
+
+    # alternate turns, so the conversation reads in order.
+    for turn in 0..2:
+        for member in room.members:
+            said := member.ws.recv_text()!
+            room.broadcast("{member.name}: {said}")!
+
+    for member in room.members:
+        print("--- what {member.name} saw")
+        for line in transcript(member)!:
+            print(line)
     return 0

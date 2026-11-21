@@ -1,45 +1,43 @@
-# process management with std.os.process
+# child processes with std.os.process: the steps of a small deploy script.
+#
+# a Command is built up (arguments, environment, working directory) and then
+# run in the way the caller needs: `text_trimmed` for a command whose output is
+# the answer, `output_checked` for one whose failure must stop the script,
+# `output_ctx` with a deadline for one that might hang, and `start` for a
+# child to stream text through. every command here is a posix tool, so the
+# output is the same on any unix machine.
 
-import std.os as os
+import std.concurrent as concurrent
 import std.os.process as process
 
 fn main() -> Int!:
-    print("which sh: {(os.which("sh") != "")}")
+    # arguments go to the program as they are: no shell, so no quoting. the
+    # error type is ExitError rather than a string, so it is caught here.
+    version := process.command("printf").args(["%s", "release 1.4.2"]).text_trimmed() catch:
+        fail "could not read the version"
+    print("building {version}")
 
-    pwd_out := process.command("pwd").cwd("/tmp").output_checked()
-    pwd_status := pwd_out.ok.status
-    pwd_text := pwd_out.ok.stdout_trimmed()
-    print("pwd status: {pwd_status}")
-    print("pwd: {pwd_text}")
-    print("pwd success: {pwd_out.ok.success()}")
+    # the child gets its own environment additions and working directory.
+    where := process.command("sh").args(["-c", "echo \"$STAGE in $(pwd)\""]).env("STAGE", "staging").cwd("/").text_trimmed() catch "an unknown stage"
+    print("deploying to {where}")
 
-    env_out := process.command("env").env("PITH_PROCESS_EXAMPLE", "hello world").output()!
-    env_seen := env_out.stdout.contains("PITH_PROCESS_EXAMPLE=hello world")
-    print("env seen: {env_seen}")
-    print("env success: {env_out.success()}")
+    # a failing step: the error carries the exit status and what went to stderr.
+    migrate := process.command("sh").args(["-c", "echo 'migration 7 failed: lock timeout' >&2; exit 3"]).output_checked()
+    if migrate.is_err:
+        print("migrate exited {migrate.err.status}: {migrate.err.stderr.trim()}")
 
-    quiet_code := process.command("printf").arg("").run()!
-    print("quiet run: {quiet_code}")
+    # a step that hangs is killed when its deadline passes.
+    deadline := concurrent.with_timeout(concurrent.background(), 200).0
+    health := process.command("sleep").arg("10").output_ctx(deadline)
+    if health.is_err:
+        print("health check: no answer in 200ms, killed it")
 
-    failing_out := process.command("ls").arg("/nonexistent_path_xyz").output()!
-    has_stderr := failing_out.stderr_trimmed().len() > 0
-    ls_failed := failing_out.failed()
-    print("stderr: {has_stderr}")
-    print("ls failed: {ls_failed}")
-    checked_fail := process.command("ls").arg("/nonexistent_path_xyz").output_checked()
-    print("checked fail: {checked_fail.is_err}")
-
-    child := process.command("head").args(["-c", "5"]).start()!
+    # stream text through a running child: head passes on the first two lines
+    # and exits, which ends its output.
+    child := process.command("head").args(["-n", "2"]).start()!
     defer child.close()
-    child.stdin().write_all("abcdef")!
-    streamed := child.stdout().read_all()!
-    child_exit := child.wait()
-    print("streamed: {streamed}")
-    print("child exit: {child_exit}")
-
-    shell_command := "printf shell-ok"
-    shell_output := process.output_shell(shell_command)!
-    print("shell output: {shell_output}")
-    trimmed := process.command("printf").arg("trimmed").text_trimmed().ok
-    print("trimmed text: {trimmed}")
+    child.stdin().write_all("web-1 ready\nweb-2 ready\nweb-3 ready\n")!
+    first_two := child.stdout().read_all()!
+    print("first hosts up: {first_two.trim().split("\n").join(", ")}")
+    print("head exited {child.wait()}")
     return 0

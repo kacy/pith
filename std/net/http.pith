@@ -2928,22 +2928,23 @@ pub fn redirect(url: String) -> String:
 # a handler returns a whole HttpResponse, which middleware can read and change.
 # to send a body as it is produced, a handler returns stream_response(head,
 # producer) instead. the head goes through the middleware like any response, and
-# the server then sends it and runs the producer on this same task, handing it a
-# function that writes one piece. http/1.1 frames the pieces as chunks unless the
-# head has a Content-Length, and http/2 sends them as DATA frames. a producer that
-# fails ends the response early so the client can tell it was cut short: the
-# connection closes on http/1.1 and the stream resets on http/2.
+# the server then sends it and runs the producer on this same task, handing it an
+# io.BytesWriter whose write_bytes sends one piece. http/1.1 frames the pieces as
+# chunks unless the head has a Content-Length, and http/2 sends them as DATA
+# frames. a producer that fails ends the response early so the client can tell it
+# was cut short: the connection closes on http/1.1 and the stream resets on
+# http/2.
 #
 # the producer waits in a task-local value rather than in HttpResponse, so the
 # response type and the code that copies it stay as they are. a middleware that
 # replaces the response after the handler ran should not call a streaming handler.
 struct ResponseProducer:
-    run: fn(fn(Bytes) -> Int!) -> Int!
+    run: fn(io.BytesWriter) -> Int!
 
 threadlocal mut pending_producer: ResponseProducer? := none
 
 # answer with `head` and a body `producer` writes piece by piece.
-pub fn stream_response(head: HttpResponse, producer: fn(fn(Bytes) -> Int!) -> Int!) -> HttpResponse:
+pub fn stream_response(head: HttpResponse, producer: fn(io.BytesWriter) -> Int!) -> HttpResponse:
     pending_producer = ResponseProducer(producer)
     return head
 
@@ -2951,12 +2952,12 @@ pub fn stream_response(head: HttpResponse, producer: fn(fn(Bytes) -> Int!) -> In
 pub fn response_is_streaming() -> Bool:
     return pending_producer != none
 
-fn no_response_producer(write: fn(Bytes) -> Int!) -> Int!:
+fn no_response_producer(out: io.BytesWriter) -> Int!:
     return 0
 
 # hand over the producer a handler left, clearing it. the http/2 server calls this
 # to run it over its own framing.
-pub fn take_response_producer() -> fn(fn(Bytes) -> Int!) -> Int!:
+pub fn take_response_producer() -> fn(io.BytesWriter) -> Int!:
     if let pending = pending_producer:
         pending_producer = none
         return pending.run
@@ -3070,27 +3071,44 @@ fn finish_request_body() -> Bool:
 # upstream for a websocket or any other upgrade, returns take_connection(run).
 # the http/1.1 server sends nothing for that request. it clears the
 # connection's read and write deadlines and calls run on this same task with
-# two functions: read(n) returns up to n bytes as soon as any arrive, empty at
-# the end of input, and write(data) sends all of data at once. run writes
+# the connection's two halves: an io.BytesReader whose read_bytes(n) returns up
+# to n bytes as soon as any arrive, empty at the end of input, and an
+# io.BytesWriter whose write_bytes(data) sends all of data at once. run writes
 # whatever answer the protocol needs, such as a 101, and the connection closes
 # when it returns.
 #
-# read belongs to the task run is called on: the connection's reader may hold
-# bytes that arrived behind the request head, and it lives with that task.
-# write goes straight to the socket or the tls connection, so a task run
-# spawns, such as one copying the other direction, can call it.
+# the reader belongs to the task run is called on: the connection's buffered
+# reader may hold bytes that arrived behind the request head, and it lives with
+# that task. the writer goes straight to the socket or the tls connection, so a
+# task run spawns, such as one copying the other direction, can use it.
 #
 # http/2 has no upgrade, so there, and wherever a middleware replaced the
 # handler's response, the returned 501 is sent instead.
 struct ConnectionTaker:
-    run: fn(fn(Int) -> Bytes!, fn(Bytes) -> Int!) -> Int!
+    run: fn(io.BytesReader, io.BytesWriter) -> Int!
 
 threadlocal mut pending_taker: ConnectionTaker? := none
 
 # hand this request's connection to `run` (see above).
-pub fn take_connection(run: fn(fn(Int) -> Bytes!, fn(Bytes) -> Int!) -> Int!) -> HttpResponse:
+pub fn take_connection(run: fn(io.BytesReader, io.BytesWriter) -> Int!) -> HttpResponse:
     pending_taker = ConnectionTaker(run)
     return text(501, "this connection cannot be taken over")
+
+# the read half of a taken connection.
+struct ConnectionReader:
+    src: ByteSource
+
+impl io.BytesReader for ConnectionReader:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return source_read_available(self.src, max_bytes)!
+
+# the write half of a taken connection, usable from any task.
+struct ConnectionWriter:
+    src: ByteSource
+
+impl io.BytesWriter for ConnectionWriter:
+    fn write_bytes(data: Bytes) -> Int!:
+        return write_connection(self.src, data)!
 
 # run the taker a handler left on the connection it came in on. the request's
 # body, if it was being streamed, belongs to the taker now.
@@ -3100,11 +3118,7 @@ fn run_connection_taker(src: ByteSource) -> Bool:
         pending_body = none
         tcp_set_read_deadline(src.socket, 0)
         tcp_set_write_deadline(src.socket, 0)
-        read := fn(n: Int) -> Bytes!:
-            return source_read_available(src, n)!
-        write := fn(data: Bytes) -> Int!:
-            return write_connection(src, data)!
-        taker.run(read, write) catch 0
+        taker.run(ConnectionReader(src), ConnectionWriter(src)) catch 0
         return true
     return false
 
@@ -3132,6 +3146,21 @@ fn chunk_frame(data: Bytes) -> Bytes:
     out.write_string_utf8("\r\n") catch 0
     return out.take_bytes()
 
+# what a producer writes a streamed http/1.1 body through: each piece goes to
+# the connection as it is, or framed as one chunk.
+struct StreamedBodyWriter:
+    src: ByteSource
+    writer: BufferedBytesWriter
+    chunked: Bool
+
+impl io.BytesWriter for StreamedBodyWriter:
+    fn write_bytes(data: Bytes) -> Int!:
+        if data.is_empty():
+            return 0
+        if self.chunked:
+            return source_write(self.src, self.writer, chunk_frame(data))!
+        return source_write(self.src, self.writer, data)!
+
 fn streamed_head_bytes(resp: HttpResponse, chunked: Bool, connection: String, is_head: Bool) -> Bytes!:
     # the framing field takes the body's length from here, and a sized stream has
     # declared one
@@ -3153,13 +3182,7 @@ fn write_streamed_response(src: ByteSource, writer: BufferedBytesWriter, req: Ht
     source_write(src, writer, streamed_head_bytes(resp, chunked, closing, is_head)!)!
     if is_head:
         return closing != "close"
-    write := fn(data: Bytes) -> Int!:
-        if data.is_empty():
-            return 0
-        if chunked:
-            return source_write(src, writer, chunk_frame(data))!
-        return source_write(src, writer, data)!
-    producer(write)!
+    producer(StreamedBodyWriter(src, writer, chunked))!
     if chunked:
         source_write(src, writer, bytes.from_string_utf8("0\r\n\r\n"))!
     return closing != "close"

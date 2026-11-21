@@ -7,6 +7,7 @@
 # Run:  pith run examples/api_gateway.pith
 
 import std.bytes as bytes
+import std.io as io
 import std.net.http as http
 import std.net.tcp as tcp
 import std.shutdown as shutdown
@@ -95,16 +96,16 @@ fn answer_health(req: web.Request) -> http.HttpResponse:
 fn serve_canary() -> Int:
     return web.bare().get("/health", answer_health).get("/*rest", fn(req: web.Request) => http.text(200, "canary")).listen("127.0.0.1", CANARY_PORT) catch 0
 
-fn feed_pieces(write: fn(Bytes) -> Int!) -> Int!:
+fn feed_pieces(out: io.BytesWriter) -> Int!:
     for i in 0..FEED_PIECES:
-        write(bytes.from_string_utf8("event " + i.to_string() + "\n"))!
+        out.write_bytes(bytes.from_string_utf8("event " + i.to_string() + "\n"))!
         feed_turn.recv()
     return 0
 
-fn big_body(write: fn(Bytes) -> Int!) -> Int!:
+fn big_body(out: io.BytesWriter) -> Int!:
     piece := bytes.from_string_utf8("0123456789".repeat(10000))
     for i in 0..3:
-        write(piece)!
+        out.write_bytes(piece)!
     return 0
 
 fn serve_feed() -> Int:

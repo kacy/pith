@@ -7,6 +7,7 @@
 # whole, which is the common case and the cheaper one.
 
 import std.bytes as bytes
+import std.io as io
 import std.metrics as metrics
 import std.net.http as http
 import std.net.url as url
@@ -120,14 +121,14 @@ fn relayed_head(answer: http.OpenResponse, body: Bytes, keep_length: Bool) -> ht
 
 # copy an upstream's body to the client as it arrives, ending once a shutdown has
 # used up its grace for streams.
-fn pump_body(answer: http.OpenResponse, write: fn(Bytes) -> Int!) -> Int!:
+fn pump_body(answer: http.OpenResponse, out: io.BytesWriter) -> Int!:
     defer answer.close()
     mut total := 0
     while true:
         piece := answer.read()!
         if piece.is_empty():
             return total
-        write(piece)!
+        out.write_bytes(piece)!
         total = total + piece.len()
         if shutdown.stream_deadline_passed():
             fail "shutting down"
@@ -160,8 +161,8 @@ fn read_whole(answer: http.OpenResponse, method: String) -> http.HttpResponse:
     return relayed_head(answer, body.ok, method == "HEAD")
 
 fn relay_as_it_comes(answer: http.OpenResponse) -> http.HttpResponse:
-    pump := fn(write: fn(Bytes) -> Int!) -> Int!:
-        return pump_body(answer, write)!
+    pump := fn(out: io.BytesWriter) -> Int!:
+        return pump_body(answer, out)!
     return http.stream_response(relayed_head(answer, bytes.empty(), true), pump)
 
 # one upstream's metrics, looked up once so a request does not build label lists.

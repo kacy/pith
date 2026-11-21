@@ -2,6 +2,7 @@
 # same way. the two sides take turns: each piece is held back until the client
 # says it has the one before, so nothing can pass by being buffered whole.
 import std.bytes as bytes
+import std.io as io
 import std.net.http as http
 import std.net.tcp as tcp
 import std.web as web
@@ -14,25 +15,25 @@ client_saw := Channel[Int](1)
 fn text(data: String) -> Bytes:
     return bytes.from_string_utf8(data)
 
-fn ticks(write: fn(Bytes) -> Int!) -> Int!:
+fn ticks(out: io.BytesWriter) -> Int!:
     for i in 0..PIECES:
-        write(text("tick " + i.to_string() + "\n"))!
+        out.write_bytes(text("tick " + i.to_string() + "\n"))!
         client_saw.recv()
     return 0
 
 fn turn_by_turn(req: web.Request) -> http.HttpResponse:
     return http.stream_response(http.response(200).content_type("text/plain").header("X-Streamed", "yes"), ticks)
 
-fn sized_body(write: fn(Bytes) -> Int!) -> Int!:
-    write(text("12345"))!
-    write(text("67890"))!
+fn sized_body(out: io.BytesWriter) -> Int!:
+    out.write_bytes(text("12345"))!
+    out.write_bytes(text("67890"))!
     return 0
 
 fn sized(req: web.Request) -> http.HttpResponse:
     return http.stream_response(http.response(200).header("Content-Length", "10"), sized_body)
 
-fn cut_off(write: fn(Bytes) -> Int!) -> Int!:
-    write(text("partial"))!
+fn cut_off(out: io.BytesWriter) -> Int!:
+    out.write_bytes(text("partial"))!
     fail "the source went away"
 
 fn broken(req: web.Request) -> http.HttpResponse:

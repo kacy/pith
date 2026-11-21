@@ -1038,10 +1038,16 @@ fn parse_match_arm() -> Int:
 
     expect("fat_arrow")
 
-    # body: inline expression or block
+    # body: inline expression or block. an inline return, fail, break or
+    # continue is a one-statement block, so `Err(e) => fail e` reads the way
+    # the block form does
     if check("newline"):
         body := parse_block()
         children.push(body)
+    elif check("kw_return") or check("kw_fail") or check("kw_break") or check("kw_continue"):
+        stmt := parse_statement()
+        mut stmts: List[Int] := [stmt]
+        children.push(add_node_at_node("block", "", stmts, stmt))
     else:
         body_expr := parse_expression()
         mut body_children: List[Int] := [body_expr]

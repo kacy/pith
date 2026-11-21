@@ -239,7 +239,10 @@ mutex_path    = ( IDENT | "self" ) , { "." , IDENT | "[" , ( IDENT | INT ) , "]"
 match_stmt    = "match" , expression , ":" , NEWLINE
               , INDENT , { match_arm , NEWLINE } , DEDENT ;
 
-match_arm     = arm_pattern , [ "if" , expression ] , "=>" , ( expression | block ) ;
+(* an arm body that leaves (return, fail, break, continue) may sit on the  *)
+(* arm's line, as `Err(e) => fail e`; it runs as a one-statement block.    *)
+match_arm     = arm_pattern , [ "if" , expression ] , "=>" , ( expression | arm_exit | block ) ;
+arm_exit      = return_stmt | fail_stmt | break_stmt | continue_stmt ;
 
 return_stmt   = "return" , [ expression ] ;
 fail_stmt     = "fail" , expression ;

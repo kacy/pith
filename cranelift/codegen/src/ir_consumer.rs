@@ -2013,6 +2013,9 @@ struct IrFunction<'a> {
     name: &'a str,
     retkind: &'a str,
     params: Vec<String>,
+    /// what each param line says about the parameter's kind: "float",
+    /// "word" (never a Float), or "" when the emitter did not know
+    param_kinds: Vec<String>,
     body: Vec<&'a str>,
 }
 
@@ -2033,6 +2036,7 @@ fn ir_functions<'a>(lines: &[&'a str]) -> Vec<IrFunction<'a>> {
         };
         let retkind = header.nth(1).unwrap_or("");
         let mut params: Vec<String> = Vec::new();
+        let mut param_kinds: Vec<String> = Vec::new();
         let mut body: Vec<&'a str> = Vec::new();
         while i < lines.len() {
             let mut parts = lines[i].split_whitespace();
@@ -2041,12 +2045,19 @@ fn ir_functions<'a>(lines: &[&'a str]) -> Vec<IrFunction<'a>> {
                     i += 1;
                     break;
                 }
-                (Some("param"), Some(param)) => params.push(param.to_string()),
+                (Some("param"), Some(param)) => {
+                    params.push(param.to_string());
+                    let kind = match lines[i].split_whitespace().last() {
+                        Some(k @ ("float" | "word")) => k,
+                        _ => "",
+                    };
+                    param_kinds.push(kind.to_string());
+                }
                 _ => body.push(lines[i]),
             }
             i += 1;
         }
-        out.push(IrFunction { name, retkind, params, body });
+        out.push(IrFunction { name, retkind, params, param_kinds, body });
     }
     out
 }
@@ -2311,6 +2322,7 @@ pub fn compile_from_ir(
         let func_name = function.name.to_string();
         let func_retkind = function.retkind.to_string();
         let param_names = &function.params;
+        let param_kinds = &function.param_kinds;
         let body_lines = function.body.clone();
 
         // Compile this function (skip if already compiled from an earlier module)
@@ -2339,6 +2351,7 @@ pub fn compile_from_ir(
                 &func_name,
                 &func_retkind,
                 param_names,
+                param_kinds,
                 &body_lines,
                 runtime_funcs,
                 &declared_funcs,
@@ -2885,12 +2898,17 @@ fn emit_main_prologue(
 }
 
 /// The named variables of a function body that hold a float. The IR does
-/// not type its variables, so this infers them: a variable stored from the
-/// result of a float instruction is a float, and so, conservatively, is
-/// every parameter of a function that does any float arithmetic; then
-/// three rounds propagate the kind through loads, integer-spelled
-/// arithmetic on a float operand, and stores.
-fn scan_float_vars(param_names: &[String], body_lines: &[&str]) -> HashSet<String> {
+/// not type its locals, so this infers them: a variable stored from the
+/// result of a float instruction is a float. A parameter is a float when its
+/// param line says `float`; one whose line names no kind is taken for a
+/// float when the function does any float arithmetic. Then three rounds
+/// propagate the kind through loads, integer-spelled arithmetic on a float
+/// operand, and stores.
+fn scan_float_vars(
+    param_names: &[String],
+    param_kinds: &[String],
+    body_lines: &[&str],
+) -> HashSet<String> {
     let mut float_vars: HashSet<String> = HashSet::new();
     let mut float_source_regs: HashSet<usize> = HashSet::new();
     for line in body_lines {
@@ -2914,15 +2932,25 @@ fn scan_float_vars(param_names: &[String], body_lines: &[&str]) -> HashSet<Strin
             _ => {}
         }
     }
-    // If function has any float operations, mark all params as float.
-    // This is conservative but correct for math functions.
+    // a param line that names its kind settles it. a parameter whose kind the
+    // emitter did not know (a lambda's, say) is taken for a Float when the
+    // body does float math: wrong for an Int beside it, so it is only the
+    // fallback. taking every parameter of such a function for a Float lowered
+    // `a * b` on two Ints as a float multiply of their bit patterns.
     let has_float_ops = body_lines.iter().any(|line| {
         let p: Vec<&str> = line.split_whitespace().collect();
         !p.is_empty() && matches!(p[0], "fconst" | "fmul" | "fadd" | "fsub" | "fdiv")
     });
-    if has_float_ops {
-        for name in param_names {
-            float_vars.insert(name.clone());
+    for (i, name) in param_names.iter().enumerate() {
+        match param_kinds.get(i).map(String::as_str) {
+            Some("float") => {
+                float_vars.insert(name.clone());
+            }
+            Some("word") => {}
+            _ if has_float_ops => {
+                float_vars.insert(name.clone());
+            }
+            _ => {}
         }
     }
     for _ in 0..3 {
@@ -3000,6 +3028,7 @@ fn compile_ir_function(
     func_name: &str,
     func_retkind: &str,
     param_names: &[String],
+    param_kinds: &[String],
     body_lines: &[&str],
     runtime_funcs: &HashMap<String, FuncId>,
     declared_funcs: &HashMap<String, FuncId>,
@@ -3070,7 +3099,7 @@ fn compile_ir_function(
         }
     }
 
-    let mut float_vars = scan_float_vars(param_names, body_lines);
+    let mut float_vars = scan_float_vars(param_names, param_kinds, body_lines);
 
     let (labels, loop_exits) = create_label_blocks(&mut builder, body_lines);
 
@@ -4974,6 +5003,7 @@ mod tests {
                 &mut codegen,
                 "main",
                 "int",
+                &[],
                 &[],
                 &lines,
                 &runtime_funcs,

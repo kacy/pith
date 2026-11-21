@@ -12580,16 +12580,27 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_emit_label(body_label)
     ir_last_was_ret = false
     ir_emit_let_bindings(node.children[0], subj_r, node.children[1])
+    # `continue` comes back through next_label, which drops this iteration's
+    # shell first; jumping straight to the head skipped that release.
+    next_label := ir_label()
     ir_break_stack = ir_push_string(ir_break_stack, end_label)
-    ir_continue_stack = ir_push_string(ir_continue_stack, head_label)
+    ir_continue_stack = ir_push_string(ir_continue_stack, next_label)
+    # the shell is in flight while the body runs, so a `!` or a `return` in
+    # the body releases it on the way out.
+    if owns_subject:
+        ir_inflight_push(subj_r, "tuple")
     ir_defer_loop_enter()
     ir_block(node.children[2])
     ir_defer_loop_exit()
+    if owns_subject:
+        ir_inflight_drop(subj_r)
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     # release this iteration's owned shell before looping (the body borrowed its
     # value); the shell that fails the condition is released after the loop.
     # a weak-read subject is one of these, a fresh shell per iteration.
+    ir_emit("jmp " + next_label)
+    ir_emit_label(next_label)
     if owns_subject:
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", subj_r)
     ir_emit("jmp " + head_label)
@@ -13280,7 +13291,24 @@ fn ir_emit_named_param(name: String, param_type: String):
     ir_var_regs.insert(bare, r)
     if param_type.len() > 0:
         ir_var_types.insert(bare, param_type)
-    ir_emit("param " + name)
+    ir_emit("param " + name + ir_param_kind_suffix(param_type))
+
+# the word after a param line's name that tells the consumer whether the
+# parameter carries a Float: " float", " word" for a kind that is never one,
+# or "" when the type is not known here (the consumer then infers it from the
+# body). without it the consumer took every parameter of a function that did
+# any float math for a Float, and lowered `a * b` on two Ints as a float
+# multiply of their bit patterns.
+fn ir_param_kind_suffix(param_type: String) -> String:
+    if param_type == "float":
+        return " float"
+    if param_type == "int" or param_type == "bool" or param_type == "string" or param_type == "bytes" or param_type == "tuple" or param_type == "closure" or param_type == "channel" or param_type == "task":
+        return " word"
+    if param_type == "list" or param_type == "list_string" or param_type == "map" or param_type == "map_int" or param_type == "set" or param_type == "set_int":
+        return " word"
+    if param_type.starts_with("struct:") or param_type.starts_with("opaque:") or ir_struct_names.contains_key(param_type):
+        return " word"
+    return ""
 
 fn ir_emit_fn_params(fn_idx: Int):
     node := get_node(fn_idx)

@@ -174,6 +174,9 @@ pub struct ClientRequest:
     # the most a buffered response body may hold, or 0 for the client's limit
     # (MAX_RESPONSE_BODY outside a Client). set with with_max_response_body_bytes.
     pub max_response_body_bytes: Int
+    # optional TLS SNI / certificate verification hostname when dialing a
+    # different address in `host` (e.g. --resolve / --connect-to). empty means `host`.
+    pub server_name: String
 
 # a reusable plain http client connection.
 pub struct ClientConn:
@@ -3863,17 +3866,16 @@ fn http_date_seconds(year: Int, month_name: String, day: Int, clock: String) -> 
     days := datetime.to_timestamp(datetime.date(year, month, day)) / 1000
     return days + hour * 3600 + minute * 60 + second
 
-# parse an http date (rfc 9110 5.6.7) into unix seconds. all three forms a
-# recipient must accept are read: IMF-fixdate ("Sun, 06 Nov 1994 08:49:37
-# GMT"), the obsolete rfc 850 form ("Sunday, 06-Nov-94 08:49:37 GMT", a
-# two-digit year from 69 meaning 19xx) and asctime ("Sun Nov  6 08:49:37
-# 1994").
+# parse an http date (rfc 9110 5.6.7) into unix seconds. accepts IMF-fixdate
+# ("Sun, 06 Nov 1994 08:49:37 GMT"), rfc 850 ("Sunday, 06-Nov-94 08:49:37 GMT",
+# two-digit year >= 69 meaning 19xx), Netscape 4-digit hyphenated cookie dates
+# ("Wed, 21-Oct-2035 07:28:00 GMT"), and asctime ("Sun Nov  6 08:49:37 1994").
 pub fn parse_http_date(text: String) -> Int!:
     value := text.trim()
     comma := value.index_of(",")
     if comma == 3 and value.len() == 29 and value.ends_with(" GMT") and value[4] == " " and value[7] == " " and value[11] == " " and value[16] == " ":
         return http_date_seconds(small_decimal(value.substring(12, 16)), value.substring(8, 11), small_decimal(value.substring(5, 7)), value.substring(17, 25))
-    if comma > 3:
+    if comma >= 3:
         rest := value.substring(comma + 1, value.len())
         if rest.len() == 23 and rest[0] == " " and rest[3] == "-" and rest[7] == "-" and rest[10] == " " and rest.ends_with(" GMT"):
             mut year := small_decimal(rest.substring(8, 10))
@@ -3882,6 +3884,8 @@ pub fn parse_http_date(text: String) -> Int!:
             elif year >= 69:
                 year = year + 1900
             return http_date_seconds(year, rest.substring(4, 7), small_decimal(rest.substring(1, 3)), rest.substring(11, 19))
+        if rest.len() == 25 and rest[0] == " " and rest[3] == "-" and rest[7] == "-" and rest[12] == " " and rest.ends_with(" GMT"):
+            return http_date_seconds(small_decimal(rest.substring(8, 12)), rest.substring(4, 7), small_decimal(rest.substring(1, 3)), rest.substring(13, 21))
     if comma < 0 and value.len() == 24 and value[3] == " " and value[7] == " " and value[10] == " " and value[19] == " ":
         return http_date_seconds(small_decimal(value.substring(20, 24)), value.substring(4, 7), small_decimal(value.substring(8, 10).trim()), value.substring(11, 19))
     fail "invalid http date: " + value
@@ -4308,7 +4312,7 @@ pub fn read_response_tls_into(conn: tls.Conn, writer: BufferedBytesWriter) -> St
 # starts building an outbound request.
 pub fn request(method: String, host: String, port: Int, url_path: String) -> ClientRequest:
     mut headers: Map[String, String] := {}
-    return ClientRequest(method, host, port, normalize_path(url_path), headers, bytes.empty(), false, -1, 0, 0)
+    return ClientRequest(method, host, port, normalize_path(url_path), headers, bytes.empty(), false, -1, 0, 0, "")
 
 # starts a get request builder.
 pub fn get_request(host: String, port: Int, url_path: String) -> ClientRequest:
@@ -4328,11 +4332,11 @@ pub fn delete_request(host: String, port: Int, url_path: String) -> ClientReques
 
 # starts building an outbound https request on port 443.
 pub fn https_request(method: String, host: String, url_path: String) -> ClientRequest:
-    return ClientRequest(method, host, 443, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0)
+    return ClientRequest(method, host, 443, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0, "")
 
 # starts building an outbound https request on an explicit port.
 pub fn https_request_port(method: String, host: String, port: Int, url_path: String) -> ClientRequest:
-    return ClientRequest(method, host, port, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0)
+    return ClientRequest(method, host, port, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0, "")
 
 # starts a get https request builder.
 pub fn get_https_request(host: String, url_path: String) -> ClientRequest:
@@ -4608,10 +4612,12 @@ fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
     if resp.status != 307 and resp.status != 308:
         next_body = bytes.empty()
         next_headers = header_without(header_without(next_headers, "Content-Type"), "Transfer-Encoding")
+    mut next_sni := req.server_name
     if request_origin_changed(req, next_use_tls, next_host, next_port):
         next_headers = header_without(next_headers, "Authorization")
         next_headers = header_without(next_headers, "Cookie")
-    return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes)
+        next_sni = ""
+    return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, next_sni)
 
 # one http/1.1 client connection: a plain socket with its buffered reader and
 # writer, or a tls session over the socket. `key` names the origin it was
@@ -4729,7 +4735,7 @@ fn send_request_following_redirects_with_tls_config(req: ClientRequest, tls_conf
 # the tls send path shared by send_tls_with_config and its traced wrapper: force
 # tls on, then dispatch to the plain-host redirect path or a single sni request.
 fn send_tls_request(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
-    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes)
+    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, server_name)
     if server_name != req.host:
         return send_request_wire(current, server_name, config)
     return send_request_following_redirects_with_tls_config(current, config)
@@ -4830,7 +4836,7 @@ pub fn end_server_span(span: trace.Span, status: Int):
 # response handed to redirect_request carries only its status and fields.
 fn streamed_redirect_request(current: ClientRequest, resp: StreamedHttpResponse, redirects_left: Int) -> ClientRequest!:
     next := redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
-    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left, next.max_response_body_bytes)
+    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left, next.max_response_body_bytes, next.server_name)
 
 fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     mut current := req
@@ -4864,9 +4870,16 @@ fn send_request_following_redirects_into_with_tls_config(req: ClientRequest, tls
         redirects_left = redirects_left - 1
         current = streamed_redirect_request(current, resp, redirects_left)!
 
+# the TLS SNI hostname to present and verify for `req`: `req.server_name` when
+# explicitly overridden, otherwise `req.host`.
+fn request_tls_server_name(req: ClientRequest) -> String:
+    if req.server_name != "":
+        return req.server_name
+    return req.host
+
 impl ClientRequest:
     fn header(name: String, value: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn keep_alive() -> ClientRequest:
         return self.header("Connection", "keep-alive")
@@ -4875,13 +4888,13 @@ impl ClientRequest:
         return self.header("Connection", "close")
 
     fn with_timeout(ms: Int) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn follow_redirects(limit: Int) -> ClientRequest:
         mut next_limit := limit
         if next_limit < 0:
             next_limit = 0
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, next_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, next_limit, self.max_response_body_bytes, self.server_name)
 
     fn no_redirects() -> ClientRequest:
         return self.follow_redirects(0)
@@ -4889,10 +4902,14 @@ impl ClientRequest:
     # the most this request's buffered response body may hold, in place of the
     # client's limit or MAX_RESPONSE_BODY.
     fn with_max_response_body_bytes(limit: Int) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, limit)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, limit, self.server_name)
+
+    # override the TLS SNI and certificate hostname while dialing `self.host`.
+    fn with_server_name(name: String) -> ClientRequest:
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, name)
 
     fn query_param(name: String, value: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn query_params(values: Map[String, String]) -> ClientRequest:
         mut next := self
@@ -4901,10 +4918,10 @@ impl ClientRequest:
         return next
 
     fn body_text(text: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text), self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text), self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn body_bytes(data: Bytes) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn text_body(text: String) -> ClientRequest:
         return self.body_text(text)
@@ -4995,7 +5012,7 @@ impl ClientRequest:
         return self.send_tls_into_with_config(self.host, config, writer)
 
     fn send_tls_into_with_config(server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, server_name)
         if server_name == self.host:
             return send_request_following_redirects_into_with_tls_config(current, config, writer)
         return send_request_wire_into(current, server_name, config, writer, false)
@@ -5220,7 +5237,7 @@ pub fn new_request(method: String, raw_url: String) -> ClientRequest!:
     query_text := url_mod.query(parsed)
     if query_text != "":
         target = target + "?" + query_text
-    return ClientRequest(method, host, port, normalize_path(target), {}, bytes.empty(), use_tls, -1, 0, 0)
+    return ClientRequest(method, host, port, normalize_path(target), {}, bytes.empty(), use_tls, -1, 0, 0, "")
 
 # the pool key of an origin.
 fn origin_key(use_tls: Bool, host: String, port: Int) -> String:
@@ -5366,7 +5383,7 @@ fn apply_route_proxy_auth(req: ClientRequest, route: ClientRoute) -> ClientReque
         for k in req.headers:
             if k.to_lower() != "proxy-authorization":
                 next_headers.insert(k, req.headers[k])
-        return ClientRequest(req.method, req.host, req.port, req.path, next_headers, req.body, req.use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes)
+        return ClientRequest(req.method, req.host, req.port, req.path, next_headers, req.body, req.use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, req.server_name)
     if route.absolute and route.proxy_auth != "" and header_lookup(req.headers, "Proxy-Authorization") == "":
         return req.header("Proxy-Authorization", route.proxy_auth)
     return req
@@ -5702,8 +5719,11 @@ impl Client:
         mut proxy := self.proxy_url
         if proxy == "" and self.env_proxy:
             proxy = proxy_from_env(req.use_tls, req.host, req.port)
+        mut base_key := origin_key(req.use_tls, req.host, req.port)
+        if req.use_tls and req.server_name != "" and req.server_name.to_lower() != req.host.to_lower():
+            base_key = base_key + " sni=" + req.server_name.to_lower()
         if proxy == "":
-            return ClientRoute(origin_key(req.use_tls, req.host, req.port), req.host, req.port, false, false, "")
+            return ClientRoute(base_key, req.host, req.port, false, false, "")
         target := parse_proxy_target(proxy)!
         proxy_host := target.0
         proxy_port := target.1
@@ -5714,7 +5734,7 @@ impl Client:
         if proxy_auth != "":
             via = via + " auth=" + proxy_auth
         if req.use_tls:
-            return ClientRoute(origin_key(true, req.host, req.port) + " via " + via, proxy_host, proxy_port, false, true, proxy_auth)
+            return ClientRoute(base_key + " via " + via, proxy_host, proxy_port, false, true, proxy_auth)
         # every plain request through one proxy can share its connections
         return ClientRoute(via, proxy_host, proxy_port, true, false, proxy_auth)
 
@@ -5779,15 +5799,16 @@ impl Client:
     # run the tls handshake over a new connection, with tls_config or the
     # default config. the stream is closed when it fails.
     fn handshake(stream: TcpStream, req: ClientRequest, key: String) -> WireConn!:
+        sni := request_tls_server_name(req)
         if self.tls_config.handle >= 0:
-            return tls_wire(stream, req.host, self.tls_config, key)
+            return tls_wire(stream, sni, self.tls_config, key)
         made := tls.client_config()
         if made.is_err:
             stream.close()
             fail made.err
         config := made!
         defer config.close()
-        return tls_wire(stream, req.host, config, key)
+        return tls_wire(stream, sni, config, key)
 
     # keep `c` for another request, or close it when its origin already has
     # max_idle_conns_per_host idle connections.
@@ -7253,14 +7274,14 @@ test "response headers keep the last of a repeated name, in any case":
     assert(not headers.contains_key("x-a"))
 
 test "a request head reads each field the request names, in any case":
-    plain := ClientRequest("GET", "h.test", 8080, "/", {}, bytes.empty(), false, 0, 0, 0)
+    plain := ClientRequest("GET", "h.test", 8080, "/", {}, bytes.empty(), false, 0, 0, 0, "")
     head := request_head_bytes(plain, "/", "keep-alive", true)!.to_string_utf8() catch ""
     assert(head.contains("Host: h.test:8080"))
     assert(head.contains("Connection: keep-alive"))
     assert(head.contains("Accept-Encoding: gzip"))
     assert(not head.contains("Transfer-Encoding"))
 
-    named := ClientRequest("POST", "h.test", 80, "/", {"hOsT": "other.test", "connection": "close", "accept-encoding": "br", "transfer-encoding": "Chunked", "content-length": "9"}, bytes.from_string_utf8("x"), false, 0, 0, 0)
+    named := ClientRequest("POST", "h.test", 80, "/", {"hOsT": "other.test", "connection": "close", "accept-encoding": "br", "transfer-encoding": "Chunked", "content-length": "9"}, bytes.from_string_utf8("x"), false, 0, 0, 0, "")
     assert(request_sends_chunked(named))
     written := request_head_bytes(named, "/", "keep-alive", true)!.to_string_utf8() catch ""
     assert(written.contains("hOsT: other.test"))
@@ -7272,14 +7293,14 @@ test "a request head reads each field the request names, in any case":
     assert(not written.contains("Content-Length"))
 
     # however a request spells its framing fields, head and body agree.
-    mixed := ClientRequest("POST", "h.test", 80, "/", {"Transfer-Encoding": "gzip", "transfer-encoding": "chunked", "TRANSFER-ENCODING": "identity"}, bytes.from_string_utf8("x"), false, 0, 0, 0)
+    mixed := ClientRequest("POST", "h.test", 80, "/", {"Transfer-Encoding": "gzip", "transfer-encoding": "chunked", "TRANSFER-ENCODING": "identity"}, bytes.from_string_utf8("x"), false, 0, 0, 0, "")
     mixed_head := request_head_bytes(mixed, "/", "", false)!.to_string_utf8() catch ""
     body := request_body_bytes(mixed).to_string_utf8() catch ""
     assert_eq(mixed_head.contains("Transfer-Encoding: chunked"), body != "x")
     assert_eq(mixed_head.contains("Content-Length: 1"), body == "x")
 
     # an empty value counts as not naming the field.
-    blank := ClientRequest("GET", "h.test", 80, "/", {"Host": "", "Connection": ""}, bytes.empty(), false, 0, 0, 0)
+    blank := ClientRequest("GET", "h.test", 80, "/", {"Host": "", "Connection": ""}, bytes.empty(), false, 0, 0, 0, "")
     filled := request_head_bytes(blank, "/", "close", false)!.to_string_utf8() catch ""
     assert(filled.contains("Host: h.test"))
     assert(filled.contains("Connection: close"))
@@ -7309,3 +7330,27 @@ test "proxy target parses userinfo and CONNECT emits Proxy-Authorization":
     plain_req := get_request("example.com", 80, "/")
     with_auth := apply_route_proxy_auth(plain_req, plain_route)
     assert_eq(header_lookup(with_auth.headers, "Proxy-Authorization"), auth)
+
+test "with_server_name overrides TLS SNI and isolates pool keys":
+    c := client()
+    r1 := https_request_port("GET", "127.0.0.1", 8443, "/").with_server_name("a.example.test").header("Host", "a.example.test")
+    r2 := https_request_port("GET", "127.0.0.1", 8443, "/").with_server_name("b.example.test").header("Host", "b.example.test")
+    r_def := https_request_port("GET", "127.0.0.1", 8443, "/")
+
+    assert_eq(request_tls_server_name(r1), "a.example.test")
+    assert_eq(request_tls_server_name(r2), "b.example.test")
+    assert_eq(request_tls_server_name(r_def), "127.0.0.1")
+
+    k1 := c.route_for(r1)!.key
+    k2 := c.route_for(r2)!.key
+    k_def := c.route_for(r_def)!.key
+    assert(k1 != k2)
+    assert(k1 != k_def)
+    assert(k1.contains("sni=a.example.test"))
+
+test "parse_http_date accepts 4-digit hyphenated cookie dates":
+    ts1 := parse_http_date("Wed, 21 Oct 2035 07:28:00 GMT")!
+    ts2 := parse_http_date("Wed, 21-Oct-2035 07:28:00 GMT")!
+    ts3 := parse_http_date("Wednesday, 21-Oct-2035 07:28:00 GMT")!
+    assert_eq(ts1, ts2)
+    assert_eq(ts1, ts3)

@@ -1,0 +1,151 @@
+# a tls connection or listener that nobody closes gives its socket and its
+# session state back when the last value naming it goes away.
+#
+# the client half dials a local listener ROUNDS times and drops every Conn
+# without close(). each server task reads until the peer goes away and closes
+# its side, so once the churn settles the process holds exactly the
+# descriptors it held before it: the listener, the runtime's own, and nothing
+# per connection. before tls.Conn implemented Drop, every round left one
+# client socket and one session entry behind for the life of the process.
+#
+# the listener half binds and drops listeners the same way, and checks that a
+# dropped listener's port no longer accepts.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.net.tcp as tcp
+import std.net.tls as tls
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+ROUNDS := 10000
+LISTENER_ROUNDS := 500
+
+# find a free loopback port so repeated runs never collide with TIME_WAIT.
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn open_fds() -> Int:
+    return fs.list("/proc/self/fd").len()
+
+# wait for the count to come back down to `want`, for the server tasks still
+# winding down; returns the last count seen.
+fn settle(want: Int) -> Int:
+    mut n := open_fds()
+    mut waited := 0
+    while n > want and waited < 10000:
+        sleep(20)
+        waited = waited + 20
+        n = open_fds()
+    return n
+
+# the count once it has stopped moving.
+fn steady() -> Int:
+    mut last := open_fds()
+    sleep(50)
+    mut n := open_fds()
+    while n != last:
+        last = n
+        sleep(50)
+        n = open_fds()
+    return n
+
+fn serve_conn(listener: tls.Listener, fd: Int):
+    conn := listener.handshake(fd) catch:
+        return
+    while true:
+        got := conn.read_bytes(4096) catch bytes.empty()
+        if got.is_empty():
+            break
+    conn.close()
+
+fn run_server(listener: tls.Listener):
+    while true:
+        fd := listener.accept_socket() catch:
+            return
+        spawn serve_conn(listener, fd)
+
+# one round: dial, say something, and let the Conn go without close().
+fn dial_and_drop(port: Int, cfg: tls.Config) -> Bool:
+    conn := tls.dial_with_config("127.0.0.1", port, "localhost", cfg) catch:
+        return false
+    conn.write_all("x") catch 0
+    return true
+
+fn conn_churn(cfg: tls.Config) -> Int!:
+    port := choose_port(23110)!
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!
+    listener := tls.listen("127.0.0.1", port, server_cfg)!
+    spawn run_server(listener)
+    # a first round warms the session cache and the runtime's own descriptors.
+    dial_and_drop(port, cfg)
+    before := steady()
+    mut dialed := 0
+    mut i := 0
+    while i < ROUNDS:
+        if dial_and_drop(port, cfg):
+            dialed = dialed + 1
+        i = i + 1
+    after := settle(before)
+    print("dropped {dialed} of {ROUNDS} tls conns; descriptors grew by {after - before}")
+    return 0
+
+# close() then drop is a no-op, and so is a second close().
+fn close_then_drop(cfg: tls.Config) -> Int!:
+    port := choose_port(23330)!
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!
+    listener := tls.listen("127.0.0.1", port, server_cfg)!
+    spawn run_server(listener)
+    before := steady()
+    conn := tls.dial_with_config("127.0.0.1", port, "localhost", cfg)!
+    shared := conn
+    conn.close()
+    conn.close()
+    print("after close the socket is {conn.socket()} and reads fail: {conn.read_bytes(1).is_err}")
+    print("a value sharing it sees the same: {shared.socket()}")
+    print("no_conn owns nothing: {tls.no_conn().socket()}")
+    tls.no_conn().close()
+    after := settle(before)
+    print("close, close, drop: descriptors grew by {after - before}")
+    return 0
+
+fn bind_and_drop(port: Int, cfg: tls.Config) -> Bool:
+    listener := tls.listen("127.0.0.1", port, cfg) catch:
+        return false
+    return listener.handle > 0
+
+fn listener_churn() -> Int!:
+    port := choose_port(23550)!
+    cfg := tls.server_config(CERT_PATH, KEY_PATH)!
+    configs := tls.open_server_configs()
+    before := open_fds()
+    mut bound := 0
+    mut i := 0
+    while i < LISTENER_ROUNDS:
+        if bind_and_drop(port, cfg):
+            bound = bound + 1
+        i = i + 1
+    after := open_fds()
+    print("dropped {bound} of {LISTENER_ROUNDS} tls listeners; descriptors grew by {after - before}")
+    print("open server configs grew by {tls.open_server_configs() - configs}")
+    refused := tcp.connect("127.0.0.1", port)
+    print("a dropped listener's port refuses: {refused.is_err}")
+    if refused.is_ok:
+        tcp.close(refused.ok)
+    return 0
+
+fn main() -> Int!:
+    cfg := tls.client_config_with_ca_file(CA_PATH)!
+    conn_churn(cfg)!
+    close_then_drop(cfg)!
+    listener_churn()!
+    return 0

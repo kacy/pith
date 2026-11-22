@@ -1,0 +1,19 @@
+# a generic struct whose field is another generic struct (`inner: Guard[T]`)
+# infers its parameter from the instance it is given, at top level and inside
+# a generic body. the constructor target check refused both (E222).
+struct Guard[T]:
+    pub id: Int
+    pub v: T
+
+struct Outer[T]:
+    pub inner: Guard[T]
+
+fn nest[T](id: Int, v: T) -> Int:
+    o := Outer(Guard(id, v))
+    return o.inner.id
+
+fn main():
+    o := Outer(Guard(1, "a"))
+    print(o.inner.v)
+    print("{nest(2, [1, 2])}")
+    print("{nest(3, "b")}")

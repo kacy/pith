@@ -5362,6 +5362,14 @@ fn unify_field_type_against_arg(field_node_idx: Int, arg_tid: Int, generic_param
                 if fnode.children.len() == 1:
                     unify_field_type_against_arg(fnode.children[0], arg_info.inner, generic_params, subst_map)
             return
+        # a field typed by another generic struct (`inner: Guard[T]`) given
+        # an instance of it: each written argument matches the instance's own
+        if struct_instance_base_name.contains_key(arg_tid) and struct_instance_type_args.contains_key(arg_tid):
+            if extract_base_type_name(struct_instance_base_name[arg_tid]) == fnode.value:
+                inst_args := decode_tid_list(struct_instance_type_args[arg_tid])
+                for c, ci in fnode.children:
+                    if ci < inst_args.len():
+                        unify_field_type_against_arg(c, inst_args[ci], generic_params, subst_map)
         return
     if fnode.kind == "optional_type":
         if arg_info.kind == "optional":

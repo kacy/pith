@@ -358,3 +358,26 @@ test "bytes index_of and starts_with":
     assert(not starts_with(data, from_string_utf8("length")))
     assert(starts_with(data, empty()))
     assert(not starts_with(empty(), from_string_utf8("x")))
+
+# a buffer given up by take_bytes() and one freed twice: the destructors that
+# follow must find nothing to free, and a buffer made after them is intact.
+fn spent_buffers() -> Bytes!:
+    taken := buffer()
+    taken.write_string_utf8("taken")!
+    out := taken.take_bytes()
+    assert_eq(taken.take_bytes().len(), 0)
+    freed := buffer()
+    freed.write_string_utf8("freed")!
+    freed.free()
+    freed.free()
+    assert_eq(freed.len(), 0)
+    return out
+
+test "byte buffers taken or freed are not freed again by the destructor":
+    keep := buffer()
+    keep.write_string_utf8("keep")!
+    assert_eq(spent_buffers()!.to_string_utf8()!, "taken")
+    after := buffer()
+    after.write_string_utf8("after")!
+    assert_eq(keep.bytes().to_string_utf8()!, "keep")
+    assert_eq(after.bytes().to_string_utf8()!, "after")

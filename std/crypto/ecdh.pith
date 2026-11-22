@@ -107,3 +107,15 @@ test "p256 rejects a peer key from the wrong curve":
     assert(p.shared_secret(x.public_key).is_err)
     p.close()
     x.close()
+
+test "a closed key pair is closed once, and its destructor does nothing more":
+    first := x25519_keypair()!
+    first.close()
+    first.close()
+    assert_eq(first.handle, 0 - 1)
+    assert(first.shared_secret(first.public_key).is_err)
+    # a key made after the close can be given the freed key's address; the
+    # first pair's destructor must not free it
+    second := x25519_keypair()!
+    peer := x25519_keypair()!
+    assert_eq(second.shared_secret(peer.public_key)!.len(), 32)

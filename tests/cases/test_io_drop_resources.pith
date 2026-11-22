@@ -1,0 +1,108 @@
+# std resources that are dropped without close() give back what they hold.
+#
+# each section builds and abandons many values and counts this process's open
+# file descriptors before and after, so a destructor that misses one shows as
+# growth. a FileStream closes its file, a Process closes its pipes (its pipe
+# views keep it alive until they go too), and a WebSocket over its own socket
+# closes the socket. a close() followed by the destructor, and a second
+# close(), are no-ops. a reader handed to another task and closed or dropped
+# there leaves that task's own readers alone.
+import std.fs as fs
+import std.io as io
+import std.net.tcp as tcp
+import std.net.websocket as websocket
+import std.os.process as process
+
+PORT := 20891
+SESSIONS := 200
+
+fn open_fds() -> Int:
+    return fs.list("/proc/self/fd").len()
+
+fn files(path: String) -> Int:
+    mut read := 0
+    for i in 0..10000:
+        f := fs.open(path) catch:
+            return 0 - 1
+        read = read + (f.read(4) catch "").len()
+    return read
+
+fn files_closed_first(path: String) -> Int:
+    mut ok := 0
+    for i in 0..1000:
+        f := fs.open(path) catch:
+            return 0 - 1
+        f.close()
+        f.close()
+        if f.read(4).is_err:
+            ok = ok + 1
+    return ok
+
+fn children() -> Int:
+    mut done := 0
+    for i in 0..200:
+        child := process.command("true").start() catch:
+            return 0 - 1
+        if child.wait() == 0:
+            done = done + 1
+    return done
+
+# a pipe view outlives the Process it came from.
+fn view_outlives_process() -> String!:
+    out := process.command("printf").arg("from the child").start()!.stdout()
+    return out.read_all()
+
+fn serve(listener: Int, count: Int) -> Int!:
+    defer tcp.close(listener)
+    mut served := 0
+    for i in 0..count:
+        ws := websocket.accept(tcp.accept(listener)!)!
+        ws.send_text("hi")!
+        served = served + 1
+    return served
+
+fn sessions(count: Int) -> Int!:
+    listener := tcp.listen("127.0.0.1", PORT)!
+    server := spawn serve(listener, count)
+    mut got := 0
+    for i in 0..count:
+        ws := websocket.dial("127.0.0.1", PORT, "/")!
+        if ws.recv_text()! == "hi":
+            got = got + 1
+    (await server)!
+    return got
+
+fn foreign_close(foreign: io.StringReader) -> String:
+    mine := io.string_reader("mine")
+    foreign.close()
+    return mine.read_all() catch "error"
+
+fn foreign_drop(foreign: io.StringReader) -> String:
+    mine := io.string_reader("mine")
+    if foreign.read(1).is_err:
+        return "error"
+    return mine.read_all() catch "error"
+
+fn main() -> Int!:
+    path := "tests/cases/test_io_drop_resources.pith"
+    before := open_fds()
+    print("files read: {files(path)}")
+    print("files fds flat: {open_fds() <= before}")
+    print("closed then dropped: {files_closed_first(path)}")
+
+    print("children waited: {children()}")
+    print("children fds flat: {open_fds() <= before}")
+    print("view read: {view_outlives_process()!}")
+
+    # the first sessions start the runtime's network reactor, whose own fds
+    # stay open, so the count is taken after a warm-up round.
+    print("warm-up sessions: {sessions(10)!}")
+    warm := open_fds()
+    print("sessions: {sessions(SESSIONS)!}")
+    print("sessions fds flat: {open_fds() <= warm}")
+
+    r := io.string_reader("main")
+    print("task after foreign close: {await spawn foreign_close(r)}")
+    print("main after foreign close: {r.read_all() catch "error"}")
+    print("task after foreign drop: {await spawn foreign_drop(io.string_reader("theirs"))}")
+    return 0

@@ -53,6 +53,8 @@ cases=(
   tests/leaks/leak_io_text_registry
   tests/leaks/leak_string_buffer_build
   tests/leaks/leak_websocket_session
+  tests/leaks/leak_io_registry_drop
+  tests/leaks/leak_byte_buffer_drop
   tests/leaks/leak_returned_shell_dtor
   tests/leaks/leak_weak_if_let_shell
   tests/leaks/leak_match_call_subject

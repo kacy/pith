@@ -3021,3 +3021,58 @@ test "io string buffer survives repeated create, write and close cycles":
         total = total + out.len()
         cycle = cycle + 1
     assert(total > 200 * 33 * 4)
+
+# how many entries the registries hold on this task, across every map.
+fn registry_entries() -> Int:
+    return string_reader_data.len() + string_reader_offsets.len() + string_buffer_stores.len() + bytes_reader_data.len() + bytes_reader_offsets.len() + buffered_bytes_readers.len() + buffered_bytes_writers.len() + buffered_readers.len() + buffered_writers.len()
+
+# one of each registry type, used and then let go without a close or a free.
+fn abandon_one_of_each(i: Int) -> Int!:
+    reader := string_reader("abc-{i}")
+    buf := string_buffer()
+    buf.write("x")!
+    cursor := bytes_reader(bytes.from_string_utf8("abc"))
+    text := string_reader("one two").buffered()
+    out := string_buffer().buffered()
+    out.write("unflushed")!
+    raw := bytes_reader(bytes.from_string_utf8("raw")).buffered()
+    sink := bytes.buffer().buffered()
+    sink.write_bytes(bytes.from_string_utf8("unflushed"))!
+    return reader.read(2)!.len() + cursor.read_bytes(1)!.len() + text.read(3)!.len() + raw.read_bytes(1)!.len()
+
+test "io values dropped without close give their entries back":
+    before := registry_entries()
+    mut total := 0
+    for i in 0..1000:
+        total = total + abandon_one_of_each(i)!
+    assert_eq(total, 7000)
+    assert_eq(registry_entries(), before)
+
+# close a reader and let it die while another is open: the destructor after the
+# close, and the second close, must leave the other reader alone.
+fn close_twice_then_drop(keep: StringReader) -> String!:
+    gone := string_reader("gone")
+    gone.close()
+    gone.close()
+    return keep.read(4)!
+
+test "io close then drop, and a second close, are no-ops":
+    keep := string_reader("keep reading")
+    assert_eq(close_twice_then_drop(keep)!, "keep")
+    assert_eq(keep.read_all()!, " reading")
+    buf := string_buffer()
+    buf.write("held")!
+    buf.close()
+    buf.close()
+    assert_eq(buf.string(), "")
+
+# a buffered writer's destructor does not flush: what it held is lost, as it
+# is when close() runs first.
+fn abandon_writer(target: StringBuffer):
+    writer := target.buffered()
+    writer.write("never flushed") catch 0
+
+test "io a dropped buffered writer does not flush":
+    target := string_buffer()
+    abandon_writer(target)
+    assert_eq(target.string(), "")

@@ -1,0 +1,15 @@
+# a generic struct can implement Drop, but a generic enum cannot, any more
+# than a plain one: its destructor releases tagged payloads, not fields.
+enum Holder[T]:
+    Empty
+    Full(T)
+
+impl Drop for Holder:
+    fn drop():
+        print("gone")
+
+fn main():
+    h: Holder[Int] := Holder.Full(1)
+    match h:
+        Holder.Full(v) => print("{v}")
+        Holder.Empty => print("empty")

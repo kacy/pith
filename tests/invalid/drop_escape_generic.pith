@@ -1,0 +1,20 @@
+# a generic struct's drop is held to the same rule as any other: its body is
+# checked against the instances the program builds, and a method it lends
+# self to is followed there. here the method stores its receiver, so the
+# value outlives the drop that frees it.
+struct Box[T]:
+    v: T
+
+mut keep: List[Box[Int]] := []
+
+impl Box:
+    fn store():
+        keep.push(self)
+
+impl Drop for Box:
+    fn drop():
+        self.store()
+
+fn main():
+    b := Box(1)
+    print("{b.v}")

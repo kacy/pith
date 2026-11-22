@@ -1,0 +1,41 @@
+# a generic struct that implements Drop, built and dropped every round over
+# three type arguments. each value registers an entry in a module registry
+# and its drop removes it, so the registry and the peak stay flat only when
+# every instance's destructor calls its own drop and then releases the
+# payload the type argument names (a string, a list). before generic structs
+# could implement Drop the registry grew by three entries a round.
+import leakprobe as probe
+
+mut registry: Map[Int, String] := {}
+mut next_id := 0
+
+struct Lease[T]:
+    pub id: Int
+    pub v: T
+
+impl Drop for Lease:
+    fn drop():
+        registry.remove(self.id)
+
+fn lease[T](v: T) -> Lease[T]:
+    next_id = next_id + 1
+    registry.insert(next_id, "lease " + next_id.to_string())
+    return Lease(next_id, v)
+
+fn round(i: Int) -> Int:
+    a := lease(i)
+    b := lease("round " + i.to_string())
+    held := [lease([i, i + 1])]
+    return a.v + b.v.len() + held.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0 or registry.len() != 0:
+        print("registry holds {registry.len()}")
+    kb := probe.peak_kb()
+    print("{kb}")

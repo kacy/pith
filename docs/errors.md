@@ -893,16 +893,17 @@ generic body was before the check existed.
 destructor it attaches to every `T` it builds, when the last value naming the
 struct goes away (see docs/ownership.md, "destructors"). the impl has to be a
 shape that destructor can call: `T` must be a struct, declared in the module
-the impl is written in, and not generic — the destructor is generated per
-declaration and spells the method symbol from the declaring module, and a
-generic struct's destructor is generated per instance with no place for the
-call. the impl must declare `fn drop()` with no parameters and no return
-value, since the runtime hands it the bare pointer and reads nothing back, and
-nothing else beside it.
+the impl is written in. the destructor spells the method symbol from the
+declaring module, and an enum, generic or not, releases tagged payloads rather
+than fields. a generic struct is allowed: each instance gets its own destructor,
+which calls the `drop` checked against that instance's type arguments. the impl
+must declare `fn drop()` with no parameters and no return value, since the
+runtime hands it the bare pointer and reads nothing back, and nothing else
+beside it.
 
 ```
-error[E268]: impl Drop for Guard: a generic struct cannot implement Drop
 error[E268]: impl Drop for Shape: only a struct can implement Drop
+error[E268]: impl Drop for Bag: Drop must be implemented in the module that declares the struct
 error[E268]: impl Drop for Slot: drop() takes no parameters
 error[E268]: impl Drop for Slot: the impl may only declare drop(), not 'close'
 error[E268]: impl Drop for Slot: the impl must declare fn drop()
@@ -1370,6 +1371,11 @@ it to a builtin or anything else whose body the checker cannot follow. the
 message names the chain of calls down to the use that lets it escape. the
 field values `drop` copies out are ordinary values and may go anywhere (see
 docs/ownership.md, "destructors").
+
+the `drop` of a generic struct is checked the same way. its body has concrete
+types only per instance, so the checker walks it against every instance the
+program builds and then applies this rule once, after the first instance. a
+generic struct that no code ever builds has no destructor and is not checked.
 
 ```
 error[E318]: `self` escapes drop: it is passed to 'remember', where it is passed to 'store', where at line 20 it is passed to 'push', whose body the checker cannot follow; the value is freed when drop returns

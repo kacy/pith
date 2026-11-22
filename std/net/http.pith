@@ -322,11 +322,6 @@ fn download_file_response(response: HttpResponse, file_path: String, download_na
 fn output_file_writer(file: FileStream) -> BufferedBytesWriter:
     return file.buffered_bytes_writer_chunked(HTTP_FILE_STREAM_CHUNK_SIZE)
 
-fn finish_output_file_writer(file: FileStream, writer: BufferedBytesWriter) -> Int!:
-    writer.flush()!
-    file.close()
-    return 0
-
 fn trim_quotes(value: String) -> String:
     if value.len() >= 2 and value[0] == chr(34) and value[value.len() - 1] == chr(34):
         return value.substring(1, value.len() - 1)
@@ -5007,9 +5002,11 @@ impl ClientRequest:
 
     fn send_to_file(output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_into(writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
     fn send_tls_to_file(output_path: String) -> StreamedHttpResponse!:
@@ -5019,9 +5016,11 @@ impl ClientRequest:
 
     fn send_tls_to_file_with_config(server_name: String, config: tls.Config, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_tls_into_with_config(server_name, config, writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
     fn send_bytes() -> Bytes!:
@@ -5058,9 +5057,11 @@ impl ClientConn:
 
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_into(req, writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
 impl TlsClientConn:
@@ -5077,9 +5078,11 @@ impl TlsClientConn:
 
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_into(req, writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
 # ===============================================================
@@ -5254,10 +5257,25 @@ struct ClientRoute:
     port: Int
     absolute: Bool
     tunnel: Bool
+    proxy_auth: String
 
-# the host and port of a proxy url, "http://host:port" or "host:port". the
-# port defaults to 80. a proxy that is not plain http is refused.
-fn parse_proxy_address(proxy: String) -> (String, Int)!:
+# build a Basic Proxy-Authorization value from URL userinfo ("user:pass" or "user").
+fn proxy_basic_auth_header(userinfo: String) -> String:
+    if userinfo == "":
+        return ""
+    colon := userinfo.index_of(":")
+    mut creds := ""
+    if colon < 0:
+        creds = url_mod.decode_path(userinfo) + ":"
+    else:
+        u := url_mod.decode_path(userinfo.substring(0, colon))
+        p := url_mod.decode_path(userinfo.substring(colon + 1, userinfo.len()))
+        creds = u + ":" + p
+    return "Basic " + encoding.b64_encode(bytes.from_string_utf8(creds))
+
+# the host, port, and optional userinfo of a proxy url, "http://[user:pass@]host:port"
+# or "host:port". the port defaults to 80. a proxy that is not plain http is refused.
+fn parse_proxy_target(proxy: String) -> (String, Int, String)!:
     mut text := proxy.trim()
     if text.index_of("://") < 0:
         text = "http://" + text
@@ -5270,7 +5288,13 @@ fn parse_proxy_address(proxy: String) -> (String, Int)!:
     mut port := url_mod.port(parsed)
     if port < 0:
         port = 80
-    return (host, port)
+    return (host, port, url_mod.userinfo(parsed))
+
+# the host and port of a proxy url, "http://host:port" or "host:port". the
+# port defaults to 80. a proxy that is not plain http is refused.
+fn parse_proxy_address(proxy: String) -> (String, Int)!:
+    target := parse_proxy_target(proxy)!
+    return (target.0, target.1)
 
 # the first of two environment variables that is set and not empty.
 fn env_either(upper: String, lower: String) -> String:
@@ -5333,6 +5357,32 @@ fn proxy_for(proxy: String, no_proxy: String, host: String, port: Int) -> String
             return ""
     return proxy
 
+# return `req` with Proxy-Authorization added for plain proxy requests when the
+# proxy url carried credentials, or removed inside an HTTPS CONNECT tunnel so
+# proxy credentials are never sent to the origin server.
+fn apply_route_proxy_auth(req: ClientRequest, route: ClientRoute) -> ClientRequest:
+    if route.tunnel and header_lookup(req.headers, "Proxy-Authorization") != "":
+        mut next_headers: Map[String, String] := {}
+        for k in req.headers:
+            if k.to_lower() != "proxy-authorization":
+                next_headers.insert(k, req.headers[k])
+        return ClientRequest(req.method, req.host, req.port, req.path, next_headers, req.body, req.use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes)
+    if route.absolute and route.proxy_auth != "" and header_lookup(req.headers, "Proxy-Authorization") == "":
+        return req.header("Proxy-Authorization", route.proxy_auth)
+    return req
+
+# format the CONNECT request head for an HTTPS proxy tunnel, including
+# Proxy-Authorization when credentials are supplied.
+fn connect_tunnel_request_bytes(req: ClientRequest, proxy_auth: String) -> Bytes:
+    authority := host_header_value(req.host, 0, false) + ":" + req.port.to_string()
+    safe_authority := strip_header_controls(authority)
+    crlf := chr(13) + chr(10)
+    mut head := "CONNECT " + safe_authority + " HTTP/1.1" + crlf + "Host: " + safe_authority + crlf
+    if proxy_auth != "":
+        head = head + "Proxy-Authorization: " + strip_header_controls(proxy_auth) + crlf
+    head = head + crlf
+    return bytes.from_string_utf8(head)
+
 # ask the proxy on `stream` for a tunnel to the request's origin (rfc 9110
 # 9.3.6) and read its answer. anything but a 2xx fails, with the status.
 # the answer is read a byte at a time, so nothing past its head is taken off
@@ -5340,10 +5390,8 @@ fn proxy_for(proxy: String, no_proxy: String, host: String, port: Int) -> String
 # for as each byte lands, the way io.head_end finds it (LF LF or LF CR LF):
 # appending to a growing value and rescanning it from the start made a
 # proxy's long head cost the square of its length.
-fn open_tunnel(stream: TcpStream, req: ClientRequest) -> Int!:
-    authority := host_header_value(req.host, 0, false) + ":" + req.port.to_string()
-    crlf := chr(13) + chr(10)
-    stream.write_all_bytes(bytes.from_string_utf8("CONNECT " + strip_header_controls(authority) + " HTTP/1.1" + crlf + "Host: " + strip_header_controls(authority) + crlf + crlf))!
+fn open_tunnel(stream: TcpStream, req: ClientRequest, proxy_auth: String) -> Int!:
+    stream.write_all_bytes(connect_tunnel_request_bytes(req, proxy_auth))!
     buf := bytes.buffer()
     defer buf.free()
     mut prev := 0 - 1
@@ -5478,9 +5526,11 @@ impl Client:
     # send `req` and write the body of the final response to a file.
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_into(req, writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
     fn get(raw_url: String) -> HttpResponse!:
@@ -5569,8 +5619,9 @@ impl Client:
         mut target := normalize_path(req.path)
         if route.absolute:
             target = "http://" + host_header_value(req.host, req.port, false) + target
+        wire_req := apply_route_proxy_auth(req, route)
         arm_deadline_at(fd, deadline, false)
-        client_write(c, request_wire_bytes(req, target, connection, false)!, deadline)!
+        client_write(c, request_wire_bytes(wire_req, target, connection, false)!, deadline)!
         src := wire_source(c)
         mut header_due := 0
         if self.response_header_timeout_ms > 0:
@@ -5652,15 +5703,20 @@ impl Client:
         if proxy == "" and self.env_proxy:
             proxy = proxy_from_env(req.use_tls, req.host, req.port)
         if proxy == "":
-            return ClientRoute(origin_key(req.use_tls, req.host, req.port), req.host, req.port, false, false)
-        address := parse_proxy_address(proxy)!
-        proxy_host := address.0
-        proxy_port := address.1
-        via := "proxy http://" + proxy_host.to_lower() + ":" + proxy_port.to_string()
+            return ClientRoute(origin_key(req.use_tls, req.host, req.port), req.host, req.port, false, false, "")
+        target := parse_proxy_target(proxy)!
+        proxy_host := target.0
+        proxy_port := target.1
+        mut proxy_auth := header_lookup(req.headers, "Proxy-Authorization")
+        if proxy_auth == "" and target.2 != "":
+            proxy_auth = proxy_basic_auth_header(target.2)
+        mut via := "proxy http://" + proxy_host.to_lower() + ":" + proxy_port.to_string()
+        if proxy_auth != "":
+            via = via + " auth=" + proxy_auth
         if req.use_tls:
-            return ClientRoute(origin_key(true, req.host, req.port) + " via " + via, proxy_host, proxy_port, false, true)
+            return ClientRoute(origin_key(true, req.host, req.port) + " via " + via, proxy_host, proxy_port, false, true, proxy_auth)
         # every plain request through one proxy can share its connections
-        return ClientRoute(via, proxy_host, proxy_port, true, false)
+        return ClientRoute(via, proxy_host, proxy_port, true, false, proxy_auth)
 
     # an idle connection for `route` that can carry a request, or a new one.
     fn conn_for(req: ClientRequest, route: ClientRoute, deadline: Int) -> WireConn!:
@@ -5711,7 +5767,7 @@ impl Client:
         arm_deadline_at(stream.fd, deadline, true)
         arm_deadline_at(stream.fd, deadline, false)
         if route.tunnel:
-            opened := open_tunnel(stream, req)
+            opened := open_tunnel(stream, req, route.proxy_auth)
             if opened.is_err:
                 stream.close()
                 fail client_timeout_failure(opened.err, deadline, 0)
@@ -5787,12 +5843,13 @@ impl Client:
         mut target := normalize_path(req.path)
         if route.absolute:
             target = "http://" + host_header_value(req.host, req.port, false) + target
-        expect := self.expect_continue_timeout_ms > 0 and request_expects_continue(req) and not req.body.is_empty()
+        wire_req := apply_route_proxy_auth(req, route)
+        expect := self.expect_continue_timeout_ms > 0 and request_expects_continue(wire_req) and not wire_req.body.is_empty()
         mut wire := bytes.empty()
         if expect:
-            wire = request_head_bytes(req, target, connection, accept_gzip)!
+            wire = request_head_bytes(wire_req, target, connection, accept_gzip)!
         else:
-            wire = request_wire_bytes(req, target, connection, accept_gzip)!
+            wire = request_wire_bytes(wire_req, target, connection, accept_gzip)!
         arm_deadline_at(fd, deadline, false)
         client_write(c, wire, deadline)!
         src := wire_source(c)
@@ -7226,3 +7283,29 @@ test "a request head reads each field the request names, in any case":
     filled := request_head_bytes(blank, "/", "close", false)!.to_string_utf8() catch ""
     assert(filled.contains("Host: h.test"))
     assert(filled.contains("Connection: close"))
+
+test "proxy target parses userinfo and CONNECT emits Proxy-Authorization":
+    target := parse_proxy_target("http://alice:s3cr3t@proxy.test:3128")!
+    assert_eq(target.0, "proxy.test")
+    assert_eq(target.1, 3128)
+    assert_eq(target.2, "alice:s3cr3t")
+    auth := proxy_basic_auth_header(target.2)
+    assert_eq(auth, "Basic YWxpY2U6czNjcjN0")
+
+    req := https_request_port("GET", "api.example.com", 443, "/v1").header("Proxy-Authorization", auth)
+    connect_wire := connect_tunnel_request_bytes(req, auth).to_string_utf8()!
+    assert_eq(connect_wire, "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\nProxy-Authorization: Basic YWxpY2U6czNjcjN0\r\n\r\n")
+
+    plain_connect := connect_tunnel_request_bytes(req, "").to_string_utf8()!
+    assert_eq(plain_connect, "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+
+    # inside a TLS tunnel, Proxy-Authorization must not be forwarded to the origin.
+    tunnel_route := ClientRoute("k", "proxy.test", 3128, false, true, auth)
+    stripped := apply_route_proxy_auth(req, tunnel_route)
+    assert_eq(header_lookup(stripped.headers, "Proxy-Authorization"), "")
+
+    # on a plain HTTP proxy request, proxy URL credentials populate Proxy-Authorization.
+    plain_route := ClientRoute("k", "proxy.test", 3128, true, false, auth)
+    plain_req := get_request("example.com", 80, "/")
+    with_auth := apply_route_proxy_auth(plain_req, plain_route)
+    assert_eq(header_lookup(with_auth.headers, "Proxy-Authorization"), auth)

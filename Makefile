@@ -1561,8 +1561,8 @@ memcheck-only:
 # tooling/leak_check.sh and docs/ownership.md.
 
 # --- sanitizers ---
-# the regression corpus and the std tests against a runtime built with
-# AddressSanitizer or ThreadSanitizer on both backends, failing
+# the regression corpus, the deterministic examples and the std tests against
+# a runtime built with AddressSanitizer or ThreadSanitizer on both backends, failing
 # on any report. slower than the rest of the suite, so the nightly workflow
 # runs these rather than every push. how they work, and what generated code
 # they cannot see, is in tooling/sanitize.sh.

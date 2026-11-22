@@ -1,0 +1,82 @@
+# a result box that more than one owner holds carries the payload destructor:
+# a holder gives it one when the box goes into a list, and the unshare a
+# forwarding function runs gives it one when it copies the box for its
+# caller. two things went wrong around that.
+#
+# a box with that destructor could still be handed to a caller as its sole
+# owner, once the other owners had let go: the unshare returned it unchanged
+# when the count was the caller's alone, and the register return took its
+# payload and freed the shell. the caller takes the payload's count over and
+# frees the shell, so the destructor released the payload under it, and the
+# caller read freed memory (`h` and `g` below).
+#
+# and a result local the cascade walk refused, because some use might share
+# the box (an argument to a closure, a forwarding call), was released as a
+# bare shell at the function's exit. when nothing had given that box a
+# destructor, its payload leaked (`via_closure`). the exit now drops the
+# count the way a fresh argument does: with the payload when the count is the
+# last one. runs under valgrind with the freelist off (MEMCHECK_CASES).
+
+fn mk(i: Int) -> String!:
+    if i < 0:
+        fail "e{i}"
+    return "p{i}"
+
+fn mk_pair(i: Int) -> (Int, String)!:
+    if i < 0:
+        fail "e{i}"
+    return (i, "p{i}")
+
+fn pair_forward(x: (Int, String)!) -> (Int, String)!:
+    return x
+
+fn pair_text(x: (Int, String)!) -> String:
+    if x.is_err:
+        return x.err
+    v := x catch (0, "")
+    return v.1 + "/" + v.0.to_string()
+
+# the box goes into a list and comes back out through the register return
+fn g(i: Int) -> String!:
+    pf := mk(i)
+    xs: List[String!] := [pf]
+    if xs.len() != 1:
+        fail "lost"
+    return pf
+
+# the same through the box return, which runs the unshare
+fn h(i: Int) -> (Int, String)!:
+    pf := mk_pair(i)
+    xs: List[(Int, String)!] := [pf]
+    if xs.len() != 1:
+        fail "lost"
+    return pf
+
+# a forwarding call gives `pf` the destructor, then `pf` is returned alone
+fn kept(i: Int) -> (Int, String)!:
+    pf := mk_pair(i)
+    other := pair_forward(pf)
+    if other.ok.1 != pf.ok.1:
+        fail "differ"
+    return pf
+
+fn via_closure(i: Int, f: fn((Int, String)!) -> String) -> Int:
+    pf := mk_pair(i)
+    n := pf.ok.1.len()
+    return n + f(pf).len()
+
+fn forwarded_twice(i: Int) -> String:
+    pf := pair_forward(mk_pair(i))
+    return "{pf.ok.0} {pf.ok.1} {pair_text(pf)} {pair_text(pair_forward(pf))}"
+
+fn main():
+    print((g(3) catch "x") + " " + (h(4) catch (0, "x")).1 + " " + (kept(5) catch (0, "x")).1)
+    print("{via_closure(6, pair_text)} {forwarded_twice(7)}")
+    mut total := 0
+    for i in 0..200:
+        total = total + (g(i) catch "x").len()
+        total = total + (h(i) catch (0, "x")).1.len()
+        total = total + (kept(i) catch (0, "x")).1.len()
+        total = total + via_closure(i, pair_text)
+        total = total + forwarded_twice(i).len()
+    print("total {total}")

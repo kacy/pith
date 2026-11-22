@@ -1,0 +1,42 @@
+# two result shapes that left a payload behind on every call.
+#
+# a result local the cascade walk refuses, because one of its uses might
+# share the box (here, an argument to a closure), was released as a bare
+# shell at the function's exit, and its payload went with nobody. the exit
+# now drops the payload with the box when this count is the box's last.
+#
+# a `catch` used straight as the receiver of `unwrap_or` hands out an owned
+# optional, which the extraction did not free.
+import leakprobe as probe
+
+fn mk_pair(i: Int) -> (Int, String)!:
+    if i < 0:
+        fail "e{i}"
+    return (i, "p{i}")
+
+fn pair_len(x: (Int, String)!) -> Int:
+    return (x catch (0, "")).1.len()
+
+fn via_closure(i: Int, f: fn((Int, String)!) -> Int) -> Int:
+    pf := mk_pair(i)
+    return pf.ok.1.len() + f(pf)
+
+fn maybe(i: Int) -> String?!:
+    if i < 0:
+        fail "neg"
+    return "m{i}"
+
+fn churn_round(i: Int):
+    mut n := via_closure(i, pair_len)
+    n = n + (maybe(i) catch none).unwrap_or("none").len()
+    if n < 0:
+        print("impossible")
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

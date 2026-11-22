@@ -587,7 +587,13 @@ gaps, all bounded leaks rather than dangling pointers:
   leaves the box itself to the runtime. the holder's release then drops the
   payload along with the box. a cascade or a result-argument release that
   runs first also zeroes the slot, so the payload is released exactly once
-  (#1167).
+  (#1167). the unshare a forwarding function runs on a shared box gives
+  that box the same destructor. when its only owner later returns such a
+  box, the destructor is cleared first: in the unshare when the caller
+  holds the only count, and in the register return when it takes the
+  payload. the caller takes over the payload's count and frees the shell,
+  so a destructor left in place would release the payload while the
+  caller still uses it.
   tuple-typed registers the emitter cannot tie back to a literal still
   strand their box.
 - **a collection literal the checker cannot type builds an untagged
@@ -642,9 +648,16 @@ gaps, all bounded leaks rather than dangling pointers:
   imports, so the record is always there for an imported callee. while
   a module's records are being made, a call to one of its own methods
   whose record is not made yet answers "not safe". a named argument to one of these callees stays on
-  the leak side, since the record is by position. any other use leaks as
-  before — returned whole, bound by `if let`, or captured by a closure,
-  which takes the shell and not the payload.
+  the leak side, since the record is by position. for an optional, any
+  other use leaks as before: returned whole, bound by `if let`, or
+  captured by a closure, which takes the shell and not the payload. a
+  RESULT local that owns its payload (bound from a call, an await or a
+  match) and fails the walk releases it at the function's exit the way a
+  fresh argument does: through `__result_arg_release_<ok><err>`, which
+  drops the payload only when the local's count is the box's last. a box
+  some other owner still holds keeps its payload for that owner. a rebind
+  still releases the old box as a bare shell, since an alias of its
+  payload may be read after the rebind.
   an extraction *inside* the callee (`o.unwrap_or(d)`, `o.value()`) does
   not disqualify the argument: on a parameter subject it retains what it
   hands out, so the caller stays the payload's owner. one more shape

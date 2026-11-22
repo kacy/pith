@@ -410,8 +410,10 @@ lambda        = "fn" , "(" , [ param_list ] , ")" , "=>" , expression       (* s
 (* ------------------------------------------------------------------ *)
 
 type_expr     = base_type , [ "?" ]          (* T? = Option[T] *)
-              | base_type , "!" , [ type_expr ]  (* T! = Result[T, Error], T!E = Result[T, E] *)
+              | base_type , [ "?" ] , "!" , [ type_expr ]  (* T! = Result[T, Error], T!E = Result[T, E] *)
               ;
+
+(* `T?!` is a result whose payload is `T?`, the same type as `(T?)!`. *)
 
 base_type     = qualified_type , [ "[" , type_list , "]" ]   (* named or generic: Map[String, Int] *)
               | "(" , type_expr , ")"                (* grouping: (fn(Int) -> Int)? *)

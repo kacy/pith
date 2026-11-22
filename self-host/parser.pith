@@ -335,13 +335,16 @@ fn skip_newlines():
 
 fn parse_type_expr() -> Int:
     mark := current_token_position
-    base := parse_base_type()
+    mut base := parse_base_type()
 
-    # optional: T?
+    # optional: T?. a `!` after it makes a result over the optional, so
+    # `T?!` reads the same as `(T?)!`.
     if check("question"):
         advance_token()
         mut children: List[Int] := [base]
-        return add_node_from_mark("optional_type", "", children, mark)
+        base = add_node_from_mark("optional_type", "", children, mark)
+        if not check("bang"):
+            return base
 
     # result: T! or T!E
     if check("bang"):

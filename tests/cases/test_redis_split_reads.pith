@@ -68,8 +68,10 @@ fn render(reply: Reply) -> String:
 # rejected limit are compared as text like everything else.
 fn run_script(port: Int, script: List[String], piece: Int) -> List[String]!:
     listener := tcp_listen("127.0.0.1", port)!
-    # the stub reads the script on another task, so it gets its own copy.
-    task := spawn serve(listener, copy_list(script), piece)
+    # the stub reads the script on another task, so it gets its own copy,
+    # made here: a spawn evaluates its arguments on the new task.
+    own := copy_list(script)
+    task := spawn serve(listener, own, piece)
     client := redis.connect("127.0.0.1", port)!
     mut out: List[String] := []
     mut i := 0

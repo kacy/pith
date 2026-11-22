@@ -60,8 +60,13 @@ pub fn build(cfg: config.Config) -> web.App!:
             if route.subject_rate_per_second > 0:
                 app = app.group(route.prefix, limits.per_subject(limits.caller_limits(route.subject_rate_per_second, route.subject_rate_burst)))
         if route.health_path != "":
+            # a spawn evaluates its arguments on the new task, so the settings
+            # are read here rather than from the route as the loop goes on
+            route_name := pool.route
+            health_path := route.health_path
+            interval := route.health_interval_ms
             for target in pool.upstreams:
-                spawn upstream.health_loop(pool.route, target, route.health_path, route.health_interval_ms, prober)
+                spawn upstream.health_loop(route_name, target, health_path, interval, prober)
     return app
 
 fn run_grpc_listener(host: String, port: Int, tls_cert: String, tls_key: String, dispatch: fn(String, grpc.GrpcStream) -> Int!grpc.GrpcError) -> Int!:
@@ -89,7 +94,13 @@ pub fn listen(cfg: config.Config, app: web.App) -> Int!:
     if cfg.server.grpc_port == 0:
         return serve_http(cfg, app)!
     forwarder := grpc_proxy.proxy(cfg)!
-    grpc_done := spawn serve_grpc(cfg.server.host, cfg.server.grpc_port, cfg.server.tls_cert, cfg.server.tls_key, forwarder)
+    # read on this task: a spawn evaluates its arguments on the new one
+    server := cfg.server
+    host := server.host
+    grpc_port := server.grpc_port
+    tls_cert := server.tls_cert
+    tls_key := server.tls_key
+    grpc_done := spawn serve_grpc(host, grpc_port, tls_cert, tls_key, forwarder)
     unfinished := serve_http(cfg, app)!
     return unfinished + await grpc_done
 

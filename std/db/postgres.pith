@@ -134,11 +134,22 @@ fn pin_connection(pool_handle: Int) -> Int!:
         handle := pins.len() - 1
         return handle
 
-# the pinned connection for a handle. only call it while the pin is live (its
-# callers all guard with pin_finished first); a finished pin has cleared it.
-fn pin_conn(handle: Int) -> postgres.Conn:
+# take the pinned connection out of its pin for one statement. only call it
+# while the pin is live (its callers all guard with pin_finished first); a
+# finished pin has cleared it. the pin holds no connection until pin_put hands
+# it back, so two tasks using one Tx or Stmt at once never share it: the
+# second stops on the empty pin instead.
+fn pin_take(handle: Int) -> postgres.Conn:
     locked pins_mu:
-        return pins[handle].conn.value()
+        found := pins[handle].conn
+        pins[handle].conn = none
+        return found.value()
+
+# hand the connection back to its pin once the statement is done. the pin
+# keeps it, so the caller does not use it again.
+fn pin_put(handle: Int, conn: postgres.Conn):
+    locked pins_mu:
+        pins[handle].conn = conn
 
 # whether the pinned connection has ended (committed, closed, or discarded).
 fn pin_finished(handle: Int) -> Bool:
@@ -214,7 +225,9 @@ impl Tx:
     fn run_query(text: String, params: List[String]) -> List[sql.Row]!:
         if pin_finished(self.handle):
             fail "db.postgres: transaction already finished"
-        attempt := postgres.query_params(pin_conn(self.handle), text, params)
+        conn := pin_take(self.handle)
+        attempt := postgres.query_params(conn, text, params)
+        pin_put(self.handle, conn)
         if attempt.is_err:
             pin_mark_broken(self.handle)
             fail attempt.err
@@ -226,7 +239,9 @@ impl Tx:
     fn run_exec(text: String, params: List[String]) -> db.ExecResult!:
         if pin_finished(self.handle):
             fail "db.postgres: transaction already finished"
-        attempt := postgres.exec_params(pin_conn(self.handle), text, params)
+        conn := pin_take(self.handle)
+        attempt := postgres.exec_params(conn, text, params)
+        pin_put(self.handle, conn)
         if attempt.is_err:
             pin_mark_broken(self.handle)
             fail attempt.err
@@ -241,7 +256,9 @@ impl Tx:
         if pin_broken(self.handle):
             pin_discard(self.handle)
             fail "db.postgres: transaction has a failed statement; rolled back"
-        committed := postgres.exec(pin_conn(self.handle), "commit")
+        conn := pin_take(self.handle)
+        committed := postgres.exec(conn, "commit")
+        pin_put(self.handle, conn)
         if committed.is_err:
             pin_discard(self.handle)
             fail committed.err
@@ -258,7 +275,9 @@ impl Tx:
         if pin_broken(self.handle):
             pin_discard(self.handle)
             return
-        rolled := postgres.exec(pin_conn(self.handle), "rollback")
+        conn := pin_take(self.handle)
+        rolled := postgres.exec(conn, "rollback")
+        pin_put(self.handle, conn)
         if rolled.is_err:
             pin_discard(self.handle)
             return
@@ -295,7 +314,9 @@ impl Stmt:
     fn run_query(params: List[String]) -> List[sql.Row]!:
         if pin_finished(self.handle):
             fail "db.postgres: prepared statement already closed"
-        attempt := postgres.query_prepared(pin_conn(self.handle), PREPARED_NAME, params)
+        conn := pin_take(self.handle)
+        attempt := postgres.query_prepared(conn, PREPARED_NAME, params)
+        pin_put(self.handle, conn)
         if attempt.is_err:
             pin_mark_broken(self.handle)
             fail attempt.err
@@ -307,7 +328,9 @@ impl Stmt:
     fn run_exec(params: List[String]) -> db.ExecResult!:
         if pin_finished(self.handle):
             fail "db.postgres: prepared statement already closed"
-        attempt := postgres.exec_prepared(pin_conn(self.handle), PREPARED_NAME, params)
+        conn := pin_take(self.handle)
+        attempt := postgres.exec_prepared(conn, PREPARED_NAME, params)
+        pin_put(self.handle, conn)
         if attempt.is_err:
             pin_mark_broken(self.handle)
             fail attempt.err
@@ -321,7 +344,9 @@ impl Stmt:
         if pin_broken(self.handle):
             pin_discard(self.handle)
             return
-        freed := postgres.exec(pin_conn(self.handle), "deallocate {PREPARED_NAME}")
+        conn := pin_take(self.handle)
+        freed := postgres.exec(conn, "deallocate {PREPARED_NAME}")
+        pin_put(self.handle, conn)
         if freed.is_err:
             pin_discard(self.handle)
             return
@@ -404,7 +429,9 @@ impl Db:
         # if BEGIN fails the pinned connection never becomes a live transaction,
         # so discard it; on success the Tx keeps the pin and this does not run.
         errdefer pin_discard(handle)
-        started := postgres.exec(pin_conn(handle), "begin")
+        conn := pin_take(handle)
+        started := postgres.exec(conn, "begin")
+        pin_put(handle, conn)
         if started.is_err:
             fail started.err
         return Tx(handle: handle)
@@ -415,7 +442,9 @@ impl Db:
     pub fn prepare(text: String) -> Stmt!:
         handle := pin_connection(self.handle)!
         errdefer pin_discard(handle)
-        prepared := postgres.prepare(pin_conn(handle), PREPARED_NAME, text)
+        conn := pin_take(handle)
+        prepared := postgres.prepare(conn, PREPARED_NAME, text)
+        pin_put(handle, conn)
         if prepared.is_err:
             fail prepared.err
         return Stmt(handle: handle)

@@ -541,8 +541,8 @@ STREAM_UNARY := 4
 # on a STREAM_UNARY event, which carries a whole unary response at once.
 pub struct StreamEvent:
     pub kind: Int
-    pub headers: List[hpack.HeaderField]
-    pub trailers: List[hpack.HeaderField]
+    pub frozen headers: List[hpack.HeaderField]
+    pub frozen trailers: List[hpack.HeaderField]
     pub data: Bytes
     pub end: Bool
     pub error_code: Int
@@ -1113,8 +1113,8 @@ fn handle_goaway(client: Client, ga: frames.GoawayFrame) -> Bool!:
                     client.send_windows.remove(sid)
             else:
                 survivors.push(sid)
-        client.active = survivors
         remaining := survivors.len()
+        client.active = survivors
         return remaining > 0
     # nothing left to wait for: the connection is done.
 

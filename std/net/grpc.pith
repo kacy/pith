@@ -169,12 +169,12 @@ impl Conn:
     ## metadata still goes through the *_with_headers forms, and is appended
     ## after these, so a call can add to them but not silently drop them.
     pub fn set_credentials(metadata: List[String]):
+        mut present := 0
+        if metadata.len() > 0:
+            present = 1
         locked self.credentials_mu:
             self.credentials = metadata
-            if metadata.len() > 0:
-                self.has_credentials.store(1)
-            else:
-                self.has_credentials.store(0)
+            self.has_credentials.store(present)
 
     # this channel's credentials followed by `extra`, which is what every call
     # actually sends.
@@ -696,8 +696,9 @@ pub struct StreamReader:
         mut trailers: List[hpack.HeaderField]
 
 fn new_stream_reader() -> StreamReader:
-    empty: List[hpack.HeaderField] := []
-    return StreamReader(deframer: new_deframer(), done: false, headers: empty, trailers: empty)
+    headers: List[hpack.HeaderField] := []
+    trailers: List[hpack.HeaderField] := []
+    return StreamReader(deframer: new_deframer(), done: false, headers: headers, trailers: trailers)
 
 impl StreamReader:
     # apply one stream event: a HEADERS block is stored as the response headers or,
@@ -707,11 +708,14 @@ impl StreamReader:
         if ev.is_reset():
             fail GrpcError(GRPC_INTERNAL, "grpc: stream reset (error code {ev.error_code})")
         if ev.is_headers():
+            # the event's list is frozen and may be shared with other events,
+            # so the guarded fields take a copy of their own
+            fields := ev.headers.slice(0, ev.headers.len())
             locked self.headers_mu:
-                if has_header(ev.headers, "grpc-status"):
-                    self.trailers = ev.headers
+                if has_header(fields, "grpc-status"):
+                    self.trailers = fields
                 else:
-                    self.headers = ev.headers
+                    self.headers = fields
             if ev.end:
                 self.done = true
         elif ev.is_data():

@@ -44,7 +44,10 @@ fn describe(reply: Reply) -> String:
 # would print nothing after the command that carried it.
 fn run(port: Int, script: List[String]) -> List[String]!:
     listener := tcp_listen("127.0.0.1", port)!
-    task := spawn serve(listener, copy_list(script))
+    # the stub gets its own copy of the script, made here: a spawn evaluates
+    # its arguments on the new task, which would read `script` with this one.
+    own := copy_list(script)
+    task := spawn serve(listener, own)
     client := redis.connect("127.0.0.1", port)!
     mut out: List[String] := []
     mut i := 0

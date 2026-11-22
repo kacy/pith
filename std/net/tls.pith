@@ -365,8 +365,8 @@ struct ConfigHookResult:
 #
 # a record is never changed once it is in the registry: config_edit changes a
 # fresh copy and stores the copy. so a record that config_record hands out can
-# be read off the lock while another task edits or closes the config. copies
-# share the alpn list, which is safe because nothing changes it in place either.
+# be read off the lock while another task edits or closes the config. a copy
+# takes its own alpn list, so no record shares a buffer with another.
 struct ConfigRecord:
     mut roots_pem: String
     mut alpn: List[String]
@@ -392,7 +392,7 @@ fn empty_config_record() -> ConfigRecord:
     return ConfigRecord(roots_pem: "", alpn: none_offered, resumption_enabled: false, require_tls13: false, require_tls12: false, skip_verification: false, has_verify_connection: false, verify_connection: no_config_hook, has_server_selector: false, server_selector: no_config_hook, client_cert_pem: "", client_key_der: bytes.empty(), server_cert_pem: "", server_key_der: bytes.empty(), client_ca_pem: "", client_ca_optional: false, handshake_timeout_ms: 0)
 
 fn copy_config_record(r: ConfigRecord) -> ConfigRecord:
-    return ConfigRecord(roots_pem: r.roots_pem, alpn: r.alpn, resumption_enabled: r.resumption_enabled, require_tls13: r.require_tls13, require_tls12: r.require_tls12, skip_verification: r.skip_verification, has_verify_connection: r.has_verify_connection, verify_connection: r.verify_connection, has_server_selector: r.has_server_selector, server_selector: r.server_selector, client_cert_pem: r.client_cert_pem, client_key_der: r.client_key_der, server_cert_pem: r.server_cert_pem, server_key_der: r.server_key_der, client_ca_pem: r.client_ca_pem, client_ca_optional: r.client_ca_optional, handshake_timeout_ms: r.handshake_timeout_ms)
+    return ConfigRecord(roots_pem: r.roots_pem, alpn: r.alpn.slice(0, r.alpn.len()), resumption_enabled: r.resumption_enabled, require_tls13: r.require_tls13, require_tls12: r.require_tls12, skip_verification: r.skip_verification, has_verify_connection: r.has_verify_connection, verify_connection: r.verify_connection, has_server_selector: r.has_server_selector, server_selector: r.server_selector, client_cert_pem: r.client_cert_pem, client_key_der: r.client_key_der, server_cert_pem: r.server_cert_pem, server_key_der: r.server_key_der, client_ca_pem: r.client_ca_pem, client_ca_optional: r.client_ca_optional, handshake_timeout_ms: r.handshake_timeout_ms)
 
 # add a config to the registry under the next handle.
 fn config_create(record: ConfigRecord) -> Config:
@@ -419,16 +419,17 @@ fn config_open(handle: Int) -> Bool:
         found := native_configs.contains_key(handle)
         return found
 
-# change a config. `edit` sets fields on a copy of the record, and the copy
-# replaces it, all under the lock, so two setters on one config cannot lose each
-# other's change. a closed config has no record, so the edit is skipped rather
-# than leaving a partial record behind.
+# change a config. `edit` sets fields on a copy of the record, and a copy of
+# that replaces it, all under the lock, so two setters on one config cannot
+# lose each other's change. the record the registry keeps is one `edit` never
+# saw, so nothing `edit` kept a handle to reaches it. a closed config has no
+# record, so the edit is skipped rather than leaving a partial record behind.
 fn config_edit(handle: Int, edit: fn(ConfigRecord)):
     locked native_config_mu:
         if native_configs.contains_key(handle):
             next := copy_config_record(native_configs[handle])
             edit(next)
-            native_configs.insert(handle, next)
+            native_configs.insert(handle, copy_config_record(next))
 
 fn config_close(handle: Int):
     locked native_config_mu:

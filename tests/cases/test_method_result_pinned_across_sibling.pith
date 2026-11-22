@@ -1,0 +1,68 @@
+# a value read through a builtin method, and then a sibling operand that
+# drops the storage it came from: `to_string` on a String is the receiver
+# itself, a list search reads the list after its target runs, and a reduce
+# reads the list after its initial value runs. each dropping call allocates
+# strings of the same size afterwards, so a freed read comes back as filler.
+struct O:
+    mut name: String
+    mut items: List[String]
+
+fn churn() -> List[String]:
+    mut junk: List[String] := []
+    mut i := 0
+    while i < 50:
+        junk.push("filler-{i}-x")
+        i = i + 1
+    return junk
+
+fn wipe(o: O) -> String:
+    o.items = ["other" + "-list"]
+    o.name = "replaced" + "-name"
+    j := churn()
+    return "!"
+
+fn wipe_int(o: O) -> Int:
+    w := wipe(o)
+    return 1
+
+fn two(a: String, b: String) -> String:
+    return a + b
+
+fn reset(o: O):
+    o.items = ["a" + "-item", "b" + "-item"]
+    o.name = "hello" + "-world"
+
+fn main() -> Int:
+    o := O(name: "", items: [])
+    mut round := 0
+    while round < 20:
+        reset(o)
+        a := two(o.name.to_string(), wipe(o))
+        reset(o)
+        b := two(o.items[0].to_string(), wipe(o))
+        reset(o)
+        c := o.name.to_string() + wipe(o)
+        reset(o)
+        d := "{o.name.to_string()}{wipe(o)}"
+        reset(o)
+        t := (o.name.to_string(), wipe(o))
+        reset(o)
+        e := o.name.to_string().contains(wipe(o))
+        reset(o)
+        f := o.items.contains(wipe(o))
+        reset(o)
+        g := o.items.index_of(wipe(o)).unwrap_or(9)
+        reset(o)
+        h := o.items.reduce(wipe_int(o), fn(acc: Int, x: String) -> Int => acc + x.len())
+        if round == 0:
+            print("argument: {a}")
+            print("element: {b}")
+            print("concat: {c}")
+            print("interp: {d}")
+            print("tuple: {t.0}")
+            print("receiver: {e}")
+            print("contains: {f}")
+            print("index_of: {g}")
+            print("reduce: {h}")
+        round = round + 1
+    return 0

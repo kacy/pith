@@ -3825,6 +3825,13 @@ fn ir_task_owner_escapes(idx: Int, parent_idx: Int, names: List[String], escaped
     elif node.kind == "assign":
         if names.contains(node.value) and (in_lambda or node.children.len() != 1 or node_kind(node.children[0]) != "spawn"):
             escaped.push(node.value)
+    elif node.kind == "assignment" and node.children.len() == 2 and node_kind(node.children[0]) == "ident" and names.contains(node_value(node.children[0])):
+        # `t = spawn f()` keeps the handle in its local, which the rebind
+        # detaches the old one for. any other assignment to it lets it out.
+        if in_lambda or node.value != "=" or node_kind(node.children[1]) != "spawn":
+            escaped.push(node_value(node.children[0]))
+        ir_task_owner_escapes(node.children[1], idx, names, escaped, in_lambda)
+        return
     elif node.kind != "method_call" and node.kind != "field_access" and node.value.len() > 0:
         # a loop, pattern or parameter binding of the same name is another
         # variable, and the slot cannot tell the two apart.
@@ -12256,6 +12263,9 @@ fn ir_emit_compound_assignment(node: Node):
             return
         tn := get_node(node.children[0])
         name := tn.value
+        if tn.kind == "ident" and ir_task_owner_locals.contains(name):
+            ir_emit_task_owner_rebind(name, node.children[1])
+            return
         target_type := ir_checked_target_type(node.children[0], name)
         if tn.kind == "ident" and ir_name_is_kinded(name):
             ir_emit_kinded_assign(name, node.children[1], target_type, ir_optional_inner_type_of_tid(c_get_expr_type(node.children[0])))

@@ -3036,7 +3036,9 @@ fn abandon_one_of_each(i: Int) -> Int!:
     out := string_buffer().buffered()
     out.write("unflushed")!
     raw := bytes_reader(bytes.from_string_utf8("raw")).buffered()
-    sink := bytes.buffer().buffered()
+    target := bytes.buffer()
+    defer target.free()
+    sink := target.buffered()
     sink.write_bytes(bytes.from_string_utf8("unflushed"))!
     return reader.read(2)!.len() + cursor.read_bytes(1)!.len() + text.read(3)!.len() + raw.read_bytes(1)!.len()
 

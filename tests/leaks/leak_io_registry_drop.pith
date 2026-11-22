@@ -32,7 +32,11 @@ fn round(i: Int) -> Int:
     breader := io.bytes_reader(bytes.from_string_utf8("one two")).buffered()
     third := breader.read_bytes(3) catch bytes.empty()
 
-    bwriter := bytes.buffer().buffered()
+    # a ByteBuffer has no destructor yet, so the buffer under the writer is
+    # freed by hand once the writer is done with it
+    sink := bytes.buffer()
+    defer sink.free()
+    bwriter := sink.buffered()
     bwriter.write_bytes(bytes.from_string_utf8("z")) catch 0
 
     return first.len() + chunk.len() + second.len() + third.len()

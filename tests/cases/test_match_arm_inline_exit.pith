@@ -1,0 +1,54 @@
+# a match arm can be a one-line return, fail, break or continue, written
+# the way an expression arm is.
+
+enum Step:
+    Value(Int)
+    Stop(String)
+    Skip
+
+fn total(steps: List[Step]) -> Int!:
+    mut sum := 0
+    for s in steps:
+        match s:
+            Step.Value(v) =>
+                sum += v
+            Step.Skip => continue
+            Step.Stop(msg) => fail msg
+    return sum
+
+fn first_value(steps: List[Step]) -> Int:
+    for s in steps:
+        match s:
+            Step.Value(v) => return v
+            Step.Stop(_) => break
+            Step.Skip => continue
+    return -1
+
+fn label(n: Int) -> String:
+    match n:
+        0 => return "zero"
+        _ if n < 0 => return "negative"
+        _ => return "positive"
+
+# a value match whose last arm leaves instead of producing a value
+fn parse(s: String) -> Int!:
+    n := match s:
+        "one" => 1
+        "two" => 2
+        _ => fail "unknown {s}"
+    return n * 10
+
+fn main():
+    a := total([Step.Value(1), Step.Skip, Step.Value(2)]) catch -1
+    b := total([Step.Value(1), Step.Stop("bad")]) catch -1
+    print("{a} {b}")
+    c := first_value([Step.Skip, Step.Value(7)])
+    d := first_value([Step.Stop("x"), Step.Value(7)])
+    print("{c} {d}")
+    print("{label(0)} {label(-3)} {label(4)}")
+    p := parse("two") catch -1
+    q := parse("three") catch -1
+    print("{p} {q}")
+    err := total([Step.Stop("stopped here")])
+    if err.is_err:
+        print(err.err)

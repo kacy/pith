@@ -41,10 +41,8 @@ fn receipt(order: Order) -> Int:
     return reply
 
 fn handle(body: String) -> String:
-    decoded := json.decode_text[Order](body)
-    if decoded.is_err:
-        return "rejected: {decoded.err.message}"
-    order := decoded.ok
+    order := json.decode_text[Order](body) catch err:
+        return "rejected: {err.message}"
     wrap := if order.gift_wrap: ", gift wrapped" else: ""
     print("order {order.id} for {order.customer}: {order.items.len()} line(s){wrap}")
     return json.encode(receipt(order))

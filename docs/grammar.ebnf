@@ -222,14 +222,17 @@ if_stmt       = "if" , expression , ":" , block
               , [ "else" , ":" , block ] ;
 
 (* one-pattern conditional. a variant pattern destructures like a match   *)
-(* arm; a bare binding unwraps an optional subject.                       *)
+(* arm; on an optional enum subject it matches the payload of a some, and  *)
+(* a none takes the else. a bare binding unwraps an optional subject.     *)
 if_let_stmt   = "if" , "let" , pattern , "=" , expression , ":" , block
               , [ "else" , ":" , block ] ;
 
 (* for iterates a value (any type providing `fn next() -> T?`) or a range. *)
 (* `..` is exclusive of the upper bound, `..=` inclusive. ranges appear    *)
 (* only in this position, not as free-standing expressions.                *)
-for_stmt      = "for" , IDENT , [ "," , IDENT ] , "in" , for_iterable , ":" , block ;
+(* `_` names a value or index the body does not use.                       *)
+for_stmt      = "for" , loop_name , [ "," , loop_name ] , "in" , for_iterable , ":" , block ;
+loop_name     = IDENT | "_" ;
 for_iterable  = expression , [ ( ".." | "..=" ) , expression ] ;
 
 while_stmt    = "while" , expression , ":" , block ;
@@ -243,7 +246,10 @@ mutex_path    = ( IDENT | "self" ) , { "." , IDENT | "[" , ( IDENT | INT ) , "]"
 match_stmt    = "match" , expression , ":" , NEWLINE
               , INDENT , { match_arm , NEWLINE } , DEDENT ;
 
-match_arm     = arm_pattern , [ "if" , expression ] , "=>" , ( expression | block ) ;
+(* an arm body that leaves (return, fail, break, continue) may sit on the  *)
+(* arm's line, as `Err(e) => fail e`; it runs as a one-statement block.    *)
+match_arm     = arm_pattern , [ "if" , expression ] , "=>" , ( expression | arm_exit | block ) ;
+arm_exit      = return_stmt | fail_stmt | break_stmt | continue_stmt ;
 
 return_stmt   = "return" , [ expression ] ;
 fail_stmt     = "fail" , expression ;
@@ -297,9 +303,13 @@ select_arm    = IDENT , ":=" , postfix_expr , "=>" , expression
 
 (* catch — fallback when the left side is a failed result. the block form
    runs the block on the error path instead of producing a value; the block
-   must end with return, fail, continue or break *)
+   must end with return, fail, continue or break. `catch err:` binds the
+   error, typed as the result's error type, for the block only. in a
+   statement header (`if`, `elif`, `while`, `for`, `match`, `locked`) the
+   colon belongs to the statement, so `if ready() catch flag:` keeps `flag`
+   as the fallback value *)
 catch_expr    = or_expr , { "catch" , or_expr }
-              | or_expr , "catch" , ":" , NEWLINE , INDENT , { statement } , DEDENT ;
+              | or_expr , "catch" , [ IDENT ] , ":" , NEWLINE , INDENT , { statement } , DEDENT ;
 or_expr       = and_expr , { "or" , and_expr } ;
 and_expr      = not_expr , { "and" , not_expr } ;
 not_expr      = "not" , not_expr | comparison ;
@@ -326,6 +336,8 @@ call          = "(" , [ arg_list ] , ")" ;
 (* `to_list[Counter, Int](c)`.                                            *)
 index         = "[" , expression , { "," , expression } , "]" ;
 field_access  = "." , ( IDENT | INT_LIT ) ;   (* `.name` or tuple `.0` *)
+(* digits right after a dot always lex as an INT_LIT, so `pair.0.1` is two  *)
+(* tuple indexes, never an index followed by the float `0.1`.              *)
 method_call   = "." , IDENT , [ type_args ] , "(" , [ arg_list ] , ")" ;
 
 (* a method's own type arguments, `x.describe[Int](v)`. the bracket after   *)
@@ -378,6 +390,19 @@ match_expr    = "match" , expression , ":" , NEWLINE
 (* lambdas *)
 lambda        = "fn" , "(" , [ param_list ] , ")" , "=>" , expression       (* short form *)
               | "fn" , "(" , [ param_list ] , ")" , ":" , block ;           (* block form *)
+
+(* a block lambda may be a call argument or sit anywhere else inside a     *)
+(* group. when its header ends the line, layout tokens return for the      *)
+(* body, and the first line indented less than the body closes it and      *)
+(* goes back to the group, so the call continues on that line:             *)
+(*                                                                         *)
+(*     ys := xs.map(fn(x: Int) -> Int:                                     *)
+(*         y := x * 2                                                      *)
+(*         return y + 1                                                    *)
+(*     )                                                                   *)
+(*     r := apply(fn(x: Int) -> Int:                                       *)
+(*         return x + 1                                                    *)
+(*     , 3)                                                                *)
 
 
 (* ------------------------------------------------------------------ *)

@@ -464,6 +464,20 @@ pub fn parse_expression() -> Int:
     recursion_depth = recursion_depth - 1
     return left
 
+# set while a statement header (`if`, `while`, `for`, `match` and the like)
+# is parsed, where the colon after the expression opens the statement's own
+# block: `if ready() catch flag:` is a condition with a fallback, not a
+# catch that names its error.
+mut in_header_expression := false
+
+# an expression that ends at the colon of a statement header
+fn parse_header_expression() -> Int:
+    saved := in_header_expression
+    in_header_expression = true
+    expr := parse_expression()
+    in_header_expression = saved
+    return expr
+
 fn parse_catch_expression() -> Int:
     mark := current_token_position
     mut left := parse_or_expression()
@@ -479,6 +493,20 @@ fn parse_catch_expression() -> Int:
             block := parse_block()
             mut block_children: List[Int] := [left, block]
             return add_node_from_mark("catch_block", "", block_children, mark)
+        # `catch err:` names the error for the block. the block opens with a
+        # binding of that name to the caught error, so the name is an
+        # ordinary local everywhere after the parser.
+        if not in_header_expression and check("identifier") and _peek_ahead_kind(1) == "colon" and _peek_ahead_kind(2) == "newline":
+            name_mark := current_token_position
+            name_tok := advance_token()
+            advance_token()
+            caught := add_leaf_from_mark("caught_error", "", name_mark)
+            mut bind_children: List[Int] := [caught]
+            binding := add_node_from_mark("binding", name_tok.value, bind_children, name_mark)
+            mut prefix: List[Int] := [binding]
+            block := parse_block_after(prefix)
+            mut block_children: List[Int] := [left, block]
+            return add_node_from_mark("catch_block", name_tok.value, block_children, mark)
         fallback := parse_or_expression()
         mut children: List[Int] := [left, fallback]
         left = add_node_from_mark("catch_expr", "", children, mark)
@@ -998,7 +1026,7 @@ fn parse_map_or_set_literal() -> Int:
 fn parse_if_expr() -> Int:
     mark := current_token_position
     advance_token()
-    condition := parse_expression()
+    condition := parse_header_expression()
     expect("colon")
     then_expr := parse_expression()
 
@@ -1008,7 +1036,7 @@ fn parse_if_expr() -> Int:
     while check("kw_elif"):
         elif_mark := current_token_position
         advance_token()
-        elif_cond := parse_expression()
+        elif_cond := parse_header_expression()
         expect("colon")
         elif_expr := parse_expression()
         mut elif_children: List[Int] := [elif_cond, elif_expr]
@@ -1024,7 +1052,7 @@ fn parse_if_expr() -> Int:
 fn parse_match_expr() -> Int:
     mark := current_token_position
     advance_token()
-    subject := parse_expression()
+    subject := parse_header_expression()
     expect("colon")
     expect("newline")
     expect("indent")
@@ -1062,10 +1090,16 @@ fn parse_match_arm() -> Int:
 
     expect("fat_arrow")
 
-    # body: inline expression or block
+    # body: inline expression or block. an inline return, fail, break or
+    # continue is a one-statement block, so `Err(e) => fail e` reads the way
+    # the block form does
     if check("newline"):
         body := parse_block()
         children.push(body)
+    elif check("kw_return") or check("kw_fail") or check("kw_break") or check("kw_continue"):
+        stmt := parse_statement()
+        mut stmts: List[Int] := [stmt]
+        children.push(add_node_at_node("block", "", stmts, stmt))
     else:
         body_expr := parse_expression()
         mut body_children: List[Int] := [body_expr]
@@ -1503,10 +1537,19 @@ fn parse_pattern() -> Int:
 # ---------------------------------------------------------------
 
 fn parse_block() -> Int:
+    mut stmts: List[Int] := []
+    return parse_block_after(stmts)
+
+# a block whose statements follow the given ones
+fn parse_block_after(prefix: List[Int]) -> Int:
     expect("newline")
     expect("indent")
+    # a block inside a header (a block lambda argument) has statements of
+    # its own
+    saved_header := in_header_expression
+    in_header_expression = false
 
-    mut stmts: List[Int] := []
+    mut stmts: List[Int] := prefix
     while not check("dedent") and not check("eof"):
         before := current_token_position
         stmts.push(parse_statement())
@@ -1516,6 +1559,7 @@ fn parse_block() -> Int:
             advance_token()
         skip_newlines()
     expect("dedent")
+    in_header_expression = saved_header
 
     return add_node_with_position("block", "", stmts)
 
@@ -1588,7 +1632,7 @@ fn parse_defer_stmt() -> Int:
 # a defer of the block, so every exit edge a defer covers also unlocks.
 fn parse_locked_stmt() -> Int:
     advance_token()
-    mutex := parse_expression()
+    mutex := parse_header_expression()
     expect("colon")
     body := parse_block()
     at := get_node(mutex)
@@ -1674,7 +1718,7 @@ fn parse_if_stmt() -> Int:
     advance_token()
     if check("kw_let"):
         return parse_if_let_stmt()
-    condition := parse_expression()
+    condition := parse_header_expression()
     expect("colon")
     then_block := parse_block()
 
@@ -1685,7 +1729,7 @@ fn parse_if_stmt() -> Int:
     # elif branches
     while check("kw_elif"):
         advance_token()
-        elif_cond := parse_expression()
+        elif_cond := parse_header_expression()
         expect("colon")
         elif_block := parse_block()
         mut elif_children: List[Int] := [elif_cond, elif_block]
@@ -1703,23 +1747,23 @@ fn parse_if_stmt() -> Int:
 
 fn parse_for_stmt() -> Int:
     advance_token()
-    binding_tok := expect("identifier")
+    binding_name := parse_loop_binding_name()
 
-    mut label := binding_tok.value
-    mut loop_var := add_leaf_with_position("loop_var", binding_tok.value)
+    mut label := binding_name
+    mut loop_var := add_leaf_with_position("loop_var", binding_name)
     mut loop_idx := -1
     if match_tok("comma"):
-        idx_tok := expect("identifier")
-        label = binding_tok.value + ", " + idx_tok.value
-        loop_idx = add_leaf_with_position("loop_index", idx_tok.value)
+        idx_name := parse_loop_binding_name()
+        label = binding_name + ", " + idx_name
+        loop_idx = add_leaf_with_position("loop_index", idx_name)
 
     expect("kw_in")
-    mut iterable := parse_expression()
+    mut iterable := parse_header_expression()
     # range iteration: `for i in lo..hi` (exclusive) or `lo..=hi` (inclusive)
     if check("dotdot") or check("dotdoteq"):
         inclusive := check("dotdoteq")
         advance_token()
-        upper := parse_expression()
+        upper := parse_header_expression()
         mut range_children: List[Int] := [iterable, upper]
         mut range_kind := "exclusive"
         if inclusive:
@@ -1734,18 +1778,24 @@ fn parse_for_stmt() -> Int:
         children.push(loop_idx)
     return add_node_with_position("for_stmt", label, children)
 
+# a loop variable or index: a name, or `_` when the loop does not use it
+fn parse_loop_binding_name() -> String:
+    if match_tok("underscore"):
+        return "_"
+    return expect("identifier").value
+
 fn parse_while_stmt() -> Int:
     advance_token()
     if check("kw_let"):
         advance_token()
         pattern := parse_pattern()
         expect("eq")
-        subject := parse_expression()
+        subject := parse_header_expression()
         expect("colon")
         body := parse_block()
         mut let_children: List[Int] := [pattern, subject, body]
         return add_node_with_position("while_let", "", let_children)
-    condition := parse_expression()
+    condition := parse_header_expression()
     expect("colon")
     body := parse_block()
 
@@ -1758,7 +1808,7 @@ fn parse_if_let_stmt() -> Int:
     advance_token()
     pattern := parse_pattern()
     expect("eq")
-    subject := parse_expression()
+    subject := parse_header_expression()
     expect("colon")
     then_block := parse_block()
     mut children: List[Int] := [pattern, subject, then_block]

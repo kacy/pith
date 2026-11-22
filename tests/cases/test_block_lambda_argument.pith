@@ -1,0 +1,63 @@
+# a block lambda can be written inline as a call argument. its body sits on
+# the lines below the header, and the call goes on once a line dedents past
+# the body.
+
+fn apply(f: fn(Int) -> Int, x: Int) -> Int:
+    return f(x)
+
+fn apply_both(f: fn(Int) -> Int, g: fn(Int) -> Int, x: Int) -> Int:
+    return g(f(x))
+
+fn main():
+    xs := [1, 2, 3]
+    ys := xs.map(fn(x: Int) -> Int:
+        y := x * 2
+        return y + 1
+    )
+    print("{ys}")
+
+    # more arguments after the body, on the closing line
+    r := apply(fn(x: Int) -> Int:
+        return x + 1
+    , 3)
+    print("{r}")
+
+    # the call spread over lines, the lambda between other arguments
+    base := 10
+    s := apply_both(
+        fn(x: Int) -> Int:
+            if x > 2:
+                return x * base
+            return x
+        ,
+        fn(x: Int) -> Int => x - 1,
+        4
+    )
+    print("{s}")
+
+    # two block lambdas in one call
+    t := apply_both(fn(x: Int) -> Int:
+        return x + 100
+    , fn(x: Int) -> Int:
+        return x * 2
+    , 1)
+    print("{t}")
+
+    # a block lambda inside another one's body
+    total := xs.reduce(0, fn(acc: Int, x: Int) -> Int:
+        doubled := apply(fn(v: Int) -> Int:
+            w := v * 2
+            return w
+        , x)
+        return acc + doubled
+    )
+    print("{total}")
+
+    # a statement after the call lexes normally again
+    evens := xs.filter(fn(x: Int) -> Bool:
+        return x % 2 == 0
+    )
+    for e in evens:
+        print("even {e}")
+    pairs := {"a": 1, "b": 2}
+    print("{pairs.len()}")

@@ -1,0 +1,57 @@
+# a collection alias annotates locals, parameters, fields, returns and list
+# elements like the type it names: each one is counted and released, so the
+# count checker finds every function here balanced. an aliased map local
+# used to keep the alias name as its kind and was never released.
+
+type Timings = Map[String, Int]
+type Names = List[String]
+type Ids = Set[Int]
+
+struct Report:
+    timings: Timings
+    names: Names
+
+fn local_map(n: Int) -> Int:
+    mut timings: Timings := {}
+    timings["a"] = n
+    timings["b"] = n + 1
+    return timings.len()
+
+fn names_of(n: Int) -> Names:
+    mut out: Names := []
+    out.push("x{n}")
+    out.push("y{n}")
+    return out
+
+fn total(t: Timings) -> Int:
+    mut s := 0
+    for v in t.values():
+        s = s + v
+    return s
+
+fn report(n: Int) -> Report:
+    mut t: Timings := {}
+    t["k{n}"] = n
+    return Report(timings: t, names: names_of(n))
+
+fn nested(n: Int) -> Int:
+    mut all: List[Timings] := []
+    mut t: Timings := {}
+    t["z"] = n
+    all.push(t)
+    all.push({})
+    return all.len() + all[0]["z"]
+
+fn ids(n: Int) -> Ids:
+    mut s: Ids := {}
+    s.add(n)
+    s.add(n + 1)
+    return s
+
+fn main():
+    print("{local_map(3)}")
+    print(names_of(4).join(","))
+    r := report(5)
+    print("{total(r.timings)} {r.names.len()}")
+    print("{nested(6)}")
+    print("{ids(7).len()}")

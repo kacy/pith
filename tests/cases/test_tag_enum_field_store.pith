@@ -1,0 +1,36 @@
+# an enum with no payload lowers to an integer tag. storing one into a struct
+# field, a list element or a map value takes no count, and the count checker
+# reads it as an int: it used to read the enum name as a counted struct and
+# report the field store as giving up a count it never held.
+
+enum Kind:
+    Number
+    Name
+
+struct Node:
+    kind: Kind
+    label: String
+
+fn make(kind: Kind) -> Node:
+    return Node(kind: kind, label: "n")
+
+fn wrap(kind: Kind) -> List[Node]:
+    mut nodes: List[Node] := []
+    nodes.push(Node(kind: kind, label: "w"))
+    return nodes
+
+fn kinds(kind: Kind) -> List[Kind]:
+    mut out: List[Kind] := []
+    out.push(kind)
+    out.push(Kind.Number)
+    return out
+
+fn swap(mut node: Node, kind: Kind) -> Node:
+    node.kind = kind
+    return node
+
+fn main():
+    print("{make(Kind.Name).kind == Kind.Name} {wrap(Kind.Number).len()}")
+    print("{kinds(Kind.Name).len()} {kinds(Kind.Name)[0] == Kind.Name}")
+    n := swap(make(Kind.Name), Kind.Number)
+    print("{n.kind == Kind.Number} {n.label}")

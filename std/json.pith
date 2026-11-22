@@ -1341,8 +1341,9 @@ fn json_fill_skip_number(input: Bytes, pos: Int) -> Int:
     return end
 
 # the parser's value grammar for a value nobody keeps, at nesting level
-# `depth`: a missing comma or colon is taken, and an array or object may
-# run off the end of the input. -1 when it is malformed or too deep.
+# `depth`: every comma and colon is required, an array or object must be
+# closed, and a comma before the closer is refused. -1 when it is malformed
+# or too deep.
 fn json_fill_skip_nested(input: Bytes, pos: Int, depth: Int) -> Int:
     if depth > FILL_MAX_DEPTH:
         return -1
@@ -1356,48 +1357,33 @@ fn json_fill_skip_nested(input: Bytes, pos: Int, depth: Int) -> Int:
         return i + 4
     if json_byte_match_literal(input, i, "false"):
         return i + 5
-    if b == 91:
+    if b == 91 or b == 123:
+        close := b + 2
         i = json_byte_skip_whitespace(input, i + 1)
-        if i < input.len() and input[i] == 93:
+        if i < input.len() and input[i] == close:
             return i + 1
-        while i < input.len() and input[i] != 93:
-            i = json_fill_skip_nested(input, i, depth + 1)
-            if i < 0:
-                return -1
-            i = json_byte_skip_whitespace(input, i)
-            if i < input.len() and input[i] == 44:
-                i = i + 1
-            i = json_byte_skip_whitespace(input, i)
-        if i < input.len():
-            i = i + 1
-        return i
-    if b == 123:
-        i = json_byte_skip_whitespace(input, i + 1)
-        if i < input.len() and input[i] == 125:
-            return i + 1
-        mut done := false
-        while i < input.len() and not done:
-            i = json_byte_skip_whitespace(input, i)
-            if i >= input.len() or input[i] != 34:
-                return -1
-            i = json_fill_skip_string(input, i)
-            if i < 0:
-                return -1
-            i = json_byte_skip_whitespace(input, i)
-            if i < input.len() and input[i] == 58:
+        while true:
+            if b == 123:
+                if i >= input.len() or input[i] != 34:
+                    return -1
+                i = json_fill_skip_string(input, i)
+                if i < 0:
+                    return -1
+                i = json_byte_skip_whitespace(input, i)
+                if i >= input.len() or input[i] != 58:
+                    return -1
                 i = i + 1
             i = json_fill_skip_nested(input, i, depth + 1)
             if i < 0:
                 return -1
             i = json_byte_skip_whitespace(input, i)
-            if i < input.len() and input[i] == 44:
-                i = i + 1
-            i = json_byte_skip_whitespace(input, i)
-            if i < input.len() and input[i] == 125:
-                done = true
-        if i < input.len() and input[i] == 125:
-            i = i + 1
-        return i
+            if i >= input.len():
+                return -1
+            if input[i] == close:
+                return i + 1
+            if input[i] != 44:
+                return -1
+            i = json_byte_skip_whitespace(input, i + 1)
     if json_byte_is_digit(b) or b == 45 or b == 43:
         return json_fill_skip_number(input, i)
     return -1

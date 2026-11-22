@@ -120,8 +120,8 @@ struct SpecCursor {
 // mirrors that parser rather than the generated flat decoder
 // (self-host/ir_json_fill_emit.pith, for a struct of scalars alone),
 // which keeps the grammar of the flat filler it replaced: string escapes are
-// decoded, a colon or a comma may be missing, an object or array may run
-// off the end of the input, a number is an int only when it has no `.`,
+// decoded, every colon and comma is required, an object or array must be
+// closed and takes no trailing comma, a number is an int only when it has no `.`,
 // `e` or `E`, an int past the parser's bound fails the whole parse, and a
 // literal is matched by prefix. the messages name the field's kind the way
 // the accessors did ("missing string field: city") and come in the
@@ -574,58 +574,75 @@ fn nested_skip_value(input: &[u8], pos: usize, depth: usize) -> Result<usize, Ne
     Err(NestedAbort::Malformed)
 }
 
-/// The parser's array branch: elements separated by optional commas, the
-/// closing bracket optional at the end of the input.
+/// What follows a value inside an array or object: a comma with more to
+/// come, or the closing byte.
+enum NestedSep {
+    /// a comma; the position is the first byte after it that is not space
+    More(usize),
+    /// the closing byte; the position is the one after it
+    Closed(usize),
+}
+
+/// The separator after a value that ends at `pos`, in a container closed by
+/// `close`. Anything else, the end of the input included, is malformed,
+/// as it is to the node parser. The object and map fill loops spell this
+/// out in place: through this helper the nested decode bench ran 4% slower,
+/// while the list loop runs 6% slower without it.
+#[inline(always)]
+fn nested_after_value(input: &[u8], pos: usize, close: u8) -> Result<NestedSep, NestedAbort> {
+    let pos = skip_ws(input, pos);
+    match input.get(pos) {
+        Some(&b',') => Ok(NestedSep::More(skip_ws(input, pos + 1))),
+        Some(&c) if c == close => Ok(NestedSep::Closed(pos + 1)),
+        _ => Err(NestedAbort::Malformed),
+    }
+}
+
+/// The position after the colon that must follow an object key ending at
+/// `pos`.
+#[inline(always)]
+fn nested_expect_colon(input: &[u8], pos: usize) -> Result<usize, NestedAbort> {
+    let pos = skip_ws(input, pos);
+    if input.get(pos) == Some(&b':') {
+        Ok(pos + 1)
+    } else {
+        Err(NestedAbort::Malformed)
+    }
+}
+
+/// The parser's array branch for an array nobody keeps.
 fn nested_skip_array(input: &[u8], pos: usize, depth: usize) -> Result<usize, NestedAbort> {
     let mut pos = skip_ws(input, pos + 1);
-    if pos < input.len() && input[pos] == b']' {
+    if input.get(pos) == Some(&b']') {
         return Ok(pos + 1);
     }
-    while pos < input.len() && input[pos] != b']' {
+    loop {
         pos = nested_skip_value(input, pos, depth + 1)?;
-        pos = skip_ws(input, pos);
-        if pos < input.len() && input[pos] == b',' {
-            pos += 1;
+        match nested_after_value(input, pos, b']')? {
+            NestedSep::More(next) => pos = next,
+            NestedSep::Closed(end) => return Ok(end),
         }
-        pos = skip_ws(input, pos);
     }
-    if pos < input.len() {
-        pos += 1;
-    }
-    Ok(pos)
 }
 
 /// The parser's object branch for an object nobody keeps.
 fn nested_skip_object(input: &[u8], pos: usize, depth: usize) -> Result<usize, NestedAbort> {
     let mut pos = skip_ws(input, pos + 1);
-    if pos < input.len() && input[pos] == b'}' {
+    if input.get(pos) == Some(&b'}') {
         return Ok(pos + 1);
     }
-    let mut done = false;
-    while pos < input.len() && !done {
-        pos = skip_ws(input, pos);
-        if pos >= input.len() || input[pos] != b'"' {
+    loop {
+        if input.get(pos) != Some(&b'"') {
             return Err(NestedAbort::Malformed);
         }
         let (_, after_key) = nested_read_string(input, pos)?;
-        pos = skip_ws(input, after_key);
-        if pos < input.len() && input[pos] == b':' {
-            pos += 1;
-        }
+        pos = nested_expect_colon(input, after_key)?;
         pos = nested_skip_value(input, pos, depth + 1)?;
-        pos = skip_ws(input, pos);
-        if pos < input.len() && input[pos] == b',' {
-            pos += 1;
-        }
-        pos = skip_ws(input, pos);
-        if pos < input.len() && input[pos] == b'}' {
-            done = true;
+        match nested_after_value(input, pos, b'}')? {
+            NestedSep::More(next) => pos = next,
+            NestedSep::Closed(end) => return Ok(end),
         }
     }
-    if pos < input.len() && input[pos] == b'}' {
-        pos += 1;
-    }
-    Ok(pos)
 }
 
 /// The outcome of one object fill: the position after the object and, when
@@ -741,16 +758,12 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
     if done {
         pos += 1;
     }
-    while pos < input.len() && !done {
-        pos = skip_ws(input, pos);
-        if pos >= input.len() || input[pos] != b'"' {
+    while !done {
+        if input.get(pos) != Some(&b'"') {
             return Err(NestedAbort::Malformed);
         }
         let (key, after_key) = nested_read_string(input, pos)?;
-        pos = skip_ws(input, after_key);
-        if pos < input.len() && input[pos] == b':' {
-            pos += 1;
-        }
+        pos = nested_expect_colon(input, after_key)?;
         if inner_depth > NESTED_MAX_DEPTH {
             return Err(NestedAbort::TooDeep);
         }
@@ -899,13 +912,13 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
             }
         }
         pos = skip_ws(input, pos);
-        if pos < input.len() && input[pos] == b',' {
-            pos += 1;
-        }
-        pos = skip_ws(input, pos);
-        if pos < input.len() && input[pos] == b'}' {
-            done = true;
-            pos += 1;
+        match input.get(pos) {
+            Some(&b',') => pos = skip_ws(input, pos + 1),
+            Some(&b'}') => {
+                pos += 1;
+                done = true;
+            }
+            _ => return Err(NestedAbort::Malformed),
         }
     }
 
@@ -936,8 +949,8 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
 
 /// Fill `list` from the array opening at `pos` (the byte is `[`), one
 /// element per `elem` spec, pushing each as it is built. The grammar is
-/// the node parser's array branch: elements separated by optional commas,
-/// the closing bracket optional at the end of the input. Returns the
+/// the node parser's array branch: elements separated by commas, with no
+/// trailing comma, and the closing bracket required. Returns the
 /// position after the array and the first element error by position, if
 /// any; like a field error it waits with the caller, because a malformed
 /// byte anywhere in the document outranks it. Elements after a failed one
@@ -953,7 +966,10 @@ unsafe fn nested_fill_list(input: &[u8], pos: usize, elem: &[u8], path: &[u8], l
         return Ok((pos + 1, None));
     }
     let mut index = 0usize;
-    while pos < input.len() && input[pos] != b']' {
+    loop {
+        if pos >= input.len() {
+            return Err(NestedAbort::Malformed);
+        }
         if elem_depth > NESTED_MAX_DEPTH {
             return Err(NestedAbort::TooDeep);
         }
@@ -961,17 +977,12 @@ unsafe fn nested_fill_list(input: &[u8], pos: usize, elem: &[u8], path: &[u8], l
         if first_err.is_none() {
             first_err = elem_err;
         }
-        pos = skip_ws(input, end);
-        if pos < input.len() && input[pos] == b',' {
-            pos += 1;
+        match nested_after_value(input, end, b']')? {
+            NestedSep::More(next) => pos = next,
+            NestedSep::Closed(after) => return Ok((after, first_err)),
         }
-        pos = skip_ws(input, pos);
         index += 1;
     }
-    if pos < input.len() {
-        pos += 1;
-    }
-    Ok((pos, first_err))
 }
 
 /// Read one array element at `pos` (not whitespace, not the end) by the
@@ -1086,16 +1097,12 @@ unsafe fn nested_fill_map(input: &[u8], pos: usize, elem: &[u8], path: &[u8], ma
     if done {
         pos += 1;
     }
-    while pos < input.len() && !done {
-        pos = skip_ws(input, pos);
-        if pos >= input.len() || input[pos] != b'"' {
+    while !done {
+        if input.get(pos) != Some(&b'"') {
             return Err(NestedAbort::Malformed);
         }
         let (key, after_key) = nested_read_string(input, pos)?;
-        pos = skip_ws(input, after_key);
-        if pos < input.len() && input[pos] == b':' {
-            pos += 1;
-        }
+        pos = nested_expect_colon(input, after_key)?;
         if member_depth > NESTED_MAX_DEPTH {
             return Err(NestedAbort::TooDeep);
         }
@@ -1110,13 +1117,13 @@ unsafe fn nested_fill_map(input: &[u8], pos: usize, elem: &[u8], path: &[u8], ma
             deferred.push((key.into_owned(), msg));
         }
         pos = skip_ws(input, end);
-        if pos < input.len() && input[pos] == b',' {
-            pos += 1;
-        }
-        pos = skip_ws(input, pos);
-        if pos < input.len() && input[pos] == b'}' {
-            done = true;
-            pos += 1;
+        match input.get(pos) {
+            Some(&b',') => pos = skip_ws(input, pos + 1),
+            Some(&b'}') => {
+                pos += 1;
+                done = true;
+            }
+            _ => return Err(NestedAbort::Malformed),
         }
     }
     Ok((pos, deferred.into_iter().next().map(|(_, msg)| msg)))

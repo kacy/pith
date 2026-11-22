@@ -10,7 +10,7 @@
 # expected output was generated on the runtime before the nested filler
 # existed, so every line here is that behaviour pinned: a nested struct,
 # a doubly nested one, a repeated nested key, unknown keys holding
-# arrays and objects, the parser's lenient grammar, and each error in
+# arrays and objects, the parser's strict grammar, and each error in
 # turn. the list shapes and the optional nested field decode through
 # the node pool still and are pinned the same way.
 
@@ -117,7 +117,8 @@ fn main() -> Int:
     escaped := obj(q("name") + ":" + escaped_name + "," + dq + "ad" + bs + "u0064r" + dq + ":" + obj(q("city") + ":" + dq + "t" + bs + "tab" + dq + "," + q("zip") + ":1") + "," + q("score") + ":1")
     show_nested("escaped", json.decode_text[Nested](escaped))
 
-    # the parser's grammar: a missing colon, a missing comma, a trailing comma, no closing braces
+    # the parser's grammar refuses a missing colon, a missing comma, a
+    # trailing comma and a missing closing brace, and so does the filler
     show_nested("no_colon", json.decode_text[Nested](obj(q("name") + " " + q("a") + "," + q("addr") + ":" + paris + "," + q("score") + ":1")))
     show_nested("no_comma", json.decode_text[Nested](obj(q("name") + ":" + q("a") + " " + q("addr") + ":" + obj(q("city") + ":" + q("p") + " " + q("zip") + ":1") + " " + q("score") + ":1")))
     show_nested("trailing_comma", json.decode_text[Nested](obj(q("name") + ":" + q("a") + "," + q("addr") + ":" + obj(q("city") + ":" + q("p") + "," + q("zip") + ":1,") + "," + q("score") + ":1,")))

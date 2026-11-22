@@ -21,8 +21,11 @@ import std.bytes as bytes
 # a parsed url. the components live in the struct itself rather than a shared
 # node pool, so a url is self-contained and safe to build and read from
 # separate threads concurrently. port is -1 when the url has no explicit port.
+# bracketed ipv6 literals like "[::1]" are stored without brackets in `host`
+# so sockets can dial `host` directly; to_string() re-brackets them.
 pub struct URL:
     pub scheme: String
+    pub userinfo: String
     pub host: String
     pub port: Int
     pub path: String
@@ -48,9 +51,11 @@ fn first_delim_index(s: String, start: Int, len: Int, a: Int, b: Int, c: Int) ->
     return len
 
 # Parses a URL string into its components.
-# Supports: scheme://host:port/path?query#fragment
+# Supports: scheme://[userinfo@]host[:port]/path?query#fragment, including
+# bracketed IPv6 host literals like http://[::1]:8080/path.
 pub fn parse(input: String) -> URL:
     mut r_scheme := ""
+    mut r_userinfo := ""
     mut r_host := ""
     mut r_port := 0 - 1
     mut r_path := ""
@@ -70,38 +75,72 @@ pub fn parse(input: String) -> URL:
         r_scheme = input.substring(0, scheme_end)
         pos = scheme_end + 3
 
-    # host: up to / ? # or end
-    host_start := pos
+    # authority: up to / ? # or end
+    auth_start := pos
     host_end := first_delim_index(input, pos, input.len(), ord("/"), ord("?"), ord("#"))
 
-    # check for port in host portion
-    mut colon := 0 - 1
-    i = host_start
+    # optional userinfo before the last '@' inside the authority
+    mut at := 0 - 1
+    i = auth_start
     while i < host_end:
-        if input[i] == ":":
-            colon = i
-            break
+        if ord(input[i]) == ord("@"):
+            at = i
         i = i + 1
+    mut host_start := auth_start
+    if at >= auth_start:
+        r_userinfo = input.substring(auth_start, at)
+        host_start = at + 1
+
+    # host and optional :port; bracketed IPv6 literals ([::1]:8080) keep their
+    # colons inside the brackets rather than splitting on the first ':'.
+    mut colon := 0 - 1
+    if host_start < host_end and ord(input[host_start]) == ord("["):
+        mut close := 0 - 1
+        i = host_start + 1
+        while i < host_end:
+            if ord(input[i]) == ord("]"):
+                close = i
+                break
+            i = i + 1
+        if close > host_start:
+            r_host = input.substring(host_start + 1, close)
+            if close + 1 < host_end and ord(input[close + 1]) == ord(":"):
+                colon = close + 1
+        else:
+            r_host = input.substring(host_start, host_end)
+    else:
+        i = host_start
+        while i < host_end:
+            if ord(input[i]) == ord(":"):
+                colon = i
+                break
+            i = i + 1
+        if colon >= 0:
+            r_host = input.substring(host_start, colon)
+        else:
+            r_host = input.substring(host_start, host_end)
+
     if colon >= 0:
-        r_host = input.substring(host_start, colon)
-        # parse port number. valid ports are 0-65535; anything larger (or a
-        # value crafted to overflow) is rejected and leaves port unset (-1)
-        # rather than wrapping into a bogus in-range number.
+        # parse port number. valid ports are 0-65535 and must consist solely of
+        # ASCII digits; empty, non-digit, or out-of-range ports leave port unset (-1).
         mut port_val := 0
+        mut port_digits := 0
         mut port_valid := true
         i = colon + 1
         while i < host_end:
             b := ord(input[i])
             if b >= ord("0") and b <= ord("9"):
+                port_digits = port_digits + 1
                 if port_val > 65535:
                     port_valid = false
                 else:
                     port_val = port_val * 10 + (b - ord("0"))
+            else:
+                port_valid = false
+                break
             i = i + 1
-        if port_valid and port_val <= 65535:
+        if port_valid and port_digits > 0 and port_val <= 65535:
             r_port = port_val
-    if colon < 0:
-        r_host = input.substring(host_start, host_end)
     pos = host_end
 
     # path: up to ? # or end
@@ -123,7 +162,7 @@ pub fn parse(input: String) -> URL:
         pos = pos + 1
         r_fragment = input.substring(pos, input.len())
 
-    return URL(scheme: r_scheme, host: r_host, port: r_port, path: r_path, query: r_query, fragment: r_fragment)
+    return URL(scheme: r_scheme, userinfo: r_userinfo, host: r_host, port: r_port, path: r_path, query: r_query, fragment: r_fragment)
 
 # ===============================================================
 # URL Component Accessors
@@ -134,7 +173,11 @@ pub fn parse(input: String) -> URL:
 pub fn scheme(u: URL) -> String:
     return u.scheme
 
-# Returns the hostname (e.g., "example.com").
+# Returns the userinfo component (e.g., "user:pass"), or "" if absent.
+pub fn userinfo(u: URL) -> String:
+    return u.userinfo
+
+# Returns the hostname (e.g., "example.com" or "::1").
 # Returns empty string if parse failed or no host.
 pub fn host(u: URL) -> String:
     return u.host
@@ -183,7 +226,12 @@ pub fn to_string(u: URL) -> String:
     mut result := ""
     if u.scheme.len() > 0:
         result = result + u.scheme + "://"
-    result = result + u.host
+    if u.userinfo.len() > 0:
+        result = result + u.userinfo + "@"
+    if u.host.index_of(":") >= 0 and not u.host.starts_with("["):
+        result = result + "[" + u.host + "]"
+    else:
+        result = result + u.host
     if u.port >= 0:
         result = result + ":" + u.port.to_string()
     result = result + u.path
@@ -353,6 +401,37 @@ fn concurrent_url_worker(rounds: Int) -> Int:
             ok = ok + 1
         i = i + 1
     return ok
+
+test "url parse handles userinfo, bracketed ipv6, and invalid ports":
+    with_auth := parse("https://alice:s3cr3t@api.example.com:8443/v1?x=1")
+    assert_eq(scheme(with_auth), "https")
+    assert_eq(userinfo(with_auth), "alice:s3cr3t")
+    assert_eq(host(with_auth), "api.example.com")
+    assert_eq(port(with_auth), 8443)
+    assert_eq(path(with_auth), "/v1")
+    assert_eq(to_string(with_auth), "https://alice:s3cr3t@api.example.com:8443/v1?x=1")
+
+    v6 := parse("http://[::1]:8080/health")
+    assert_eq(scheme(v6), "http")
+    assert_eq(userinfo(v6), "")
+    assert_eq(host(v6), "::1")
+    assert_eq(port(v6), 8080)
+    assert_eq(path(v6), "/health")
+    assert_eq(to_string(v6), "http://[::1]:8080/health")
+
+    v6_auth := parse("http://bob:pw@[2001:db8::1]/status")
+    assert_eq(userinfo(v6_auth), "bob:pw")
+    assert_eq(host(v6_auth), "2001:db8::1")
+    assert_eq(port(v6_auth), 0 - 1)
+    assert_eq(to_string(v6_auth), "http://bob:pw@[2001:db8::1]/status")
+
+    bad_port := parse("http://example.com:80abc/path")
+    assert_eq(host(bad_port), "example.com")
+    assert_eq(port(bad_port), 0 - 1)
+
+    empty_port := parse("http://example.com:/path")
+    assert_eq(host(empty_port), "example.com")
+    assert_eq(port(empty_port), 0 - 1)
 
 test "url parsing is safe from concurrent threads":
     mut tasks := []

@@ -165,23 +165,35 @@ struct BufferedReader:
 struct BufferedWriter:
     pub handle: Int
 
+# a view of a socket. it does not own the socket and has no destructor: std
+# builds one over a handle other code owns (std.net.tls, the database drivers,
+# from_fd), so whoever opened the socket closes it.
 struct TcpStream:
     pub fd: Int
 
 struct FileStream:
     pub handle: Int
 
+# the child process a Process and its pipe views stand for. the process and
+# every view share one of these, so the child is closed when the last of them
+# dies: a pipe view outlives a Process that went out of scope. closing gives
+# back the runtime's entry and the pipe fds. it neither waits for the child nor
+# kills it: a child still running is reaped without blocking once it exits.
+pub struct ProcessHandle:
+    pub id: Int
+
+# a child process started by spawn_process.
 struct Process:
-    pub handle: Int
+    pub handle: ProcessHandle
 
 struct ProcessStdin:
-    pub handle: Int
+    pub handle: ProcessHandle
 
 struct ProcessStdout:
-    pub handle: Int
+    pub handle: ProcessHandle
 
 struct ProcessStderr:
-    pub handle: Int
+    pub handle: ProcessHandle
 
 impl StringReader:
     fn read(max_bytes: Int) -> String!:
@@ -208,6 +220,11 @@ impl Closer for StringReader:
     # input; a second close is a no-op.
     fn close():
         close_string_reader_state(self.handle)
+
+# a reader nobody closes gives its entries back when its last value dies.
+impl Drop for StringReader:
+    fn drop():
+        self.close()
 
 impl StringBuffer:
     fn write(data: String) -> Int!:
@@ -253,6 +270,11 @@ impl Closer for StringBuffer:
     fn close():
         close_string_buffer_state(self.handle)
 
+# a buffer nobody closes frees its storage when its last value dies.
+impl Drop for StringBuffer:
+    fn drop():
+        self.close()
+
 impl BytesCursor:
     fn read_bytes(max_bytes: Int) -> Bytes!:
         return bytes_cursor_read(self, max_bytes)
@@ -281,6 +303,11 @@ impl Closer for BytesCursor:
     # over. a closed cursor reads as end of input; a second close is a no-op.
     fn close():
         close_bytes_cursor_state(self.handle)
+
+# a cursor nobody closes gives its entries back when its last value dies.
+impl Drop for BytesCursor:
+    fn drop():
+        self.close()
 
 impl BytesWriter for ByteBuffer:
     fn write_bytes(data: Bytes) -> Int!:
@@ -354,6 +381,13 @@ impl BufferedBytesReader:
     fn free():
         free_buffered_bytes_reader(self)
 
+# a reader nobody frees gives its entry back when its last value dies. the
+# source is released with the entry, so a source with a destructor of its own,
+# such as a file, closes then if nothing else holds it.
+impl Drop for BufferedBytesReader:
+    fn drop():
+        self.free()
+
 # what a buffered reader holds now, or what one read of its source brings, up to
 # `max_bytes`. empty at end of input. unlike read_bytes this does not wait for
 # `max_bytes` to arrive, which is what a stream of small pieces needs.
@@ -393,6 +427,14 @@ impl BufferedBytesWriter:
 
     fn free():
         free_buffered_bytes_writer(self)
+
+# a writer nobody frees gives its entry back when its last value dies. this
+# does not flush: a flush is a write that can block, and a destructor can run
+# on any task at any point, so what is still buffered is dropped, as it is when
+# free() runs first. flush() before letting a writer go.
+impl Drop for BufferedBytesWriter:
+    fn drop():
+        self.free()
 
 impl BytesWriter for BufferedBytesWriter:
     fn write_bytes(data: Bytes) -> Int!:
@@ -504,7 +546,7 @@ fn file_stream_close(stream: FileStream):
 
 # spawn a shell command and return a process handle.
 pub fn spawn_process(command: String) -> Process!:
-    return Process(process_spawn(command)!)
+    return Process(ProcessHandle(process_spawn(command)!))
 
 fn process_stdin(process: Process) -> ProcessStdin:
     return ProcessStdin(process.handle)
@@ -516,13 +558,13 @@ fn process_stderr(process: Process) -> ProcessStderr:
     return ProcessStderr(process.handle)
 
 fn process_stdin_write_bytes(writer: ProcessStdin, data: Bytes) -> Int!:
-    return process_write_bytes(writer.handle, data)
+    return process_write_bytes(writer.handle.id, data)
 
 fn process_stdout_read_bytes(reader: ProcessStdout, max_bytes: Int) -> Bytes!:
-    return process_read_bytes(reader.handle, max_bytes)
+    return process_read_bytes(reader.handle.id, max_bytes)
 
 fn process_stderr_read_bytes(reader: ProcessStderr, max_bytes: Int) -> Bytes!:
-    return process_read_err_bytes(reader.handle, max_bytes)
+    return process_read_err_bytes(reader.handle.id, max_bytes)
 
 fn process_stdin_write_worker(writer: ProcessStdin, data: String) -> Int!:
     return process_stdin_write(writer, data)
@@ -543,13 +585,13 @@ fn process_stderr_read_bytes_worker(reader: ProcessStderr, max_bytes: Int) -> By
     return process_stderr_read_bytes(reader, max_bytes)
 
 fn wait_process(process: Process) -> Int:
-    return process_wait(process.handle)
+    return process_wait(process.handle.id)
 
 fn kill_process(process: Process) -> Bool:
-    return process_kill(process.handle)
+    return process_kill(process.handle.id)
 
 fn close_process(process: Process):
-    process_close(process.handle)
+    process.handle.close()
 
 fn empty_string_parts() -> List[String]:
     return []
@@ -2162,6 +2204,11 @@ impl Closer for BufferedReader:
     fn close():
         buffered_readers.remove(self.handle)
 
+# a reader nobody closes gives its entry back when its last value dies.
+impl Drop for BufferedReader:
+    fn drop():
+        self.close()
+
 impl BufferedWriter:
     fn write(data: String) -> Int!:
         return buffered_text_write(self, data)
@@ -2195,6 +2242,13 @@ impl Closer for BufferedWriter:
     # close reports nothing written, and a second close is a no-op.
     fn close():
         buffered_writers.remove(self.handle)
+
+# a writer nobody closes gives its entry back when its last value dies,
+# without a flush (see BufferedBytesWriter's destructor): unflushed text is
+# lost, as it is with close(). flush() before letting a writer go.
+impl Drop for BufferedWriter:
+    fn drop():
+        self.close()
 
 # the text sources and targets. a string reader's data is already text, so it
 # slices on a character boundary itself and what it hands over is always
@@ -2312,7 +2366,7 @@ impl Closer for ProcessStdin:
     # end of its input (sort, wc) sees end of file. flush a buffered writer
     # over it first. a later write fails, and a second close is a no-op.
     fn close():
-        process_close_stdin(self.handle)
+        process_close_stdin(self.handle.id)
 
 impl BytesWriter for ProcessStdin:
     fn write_bytes(data: Bytes) -> Int!:
@@ -2466,6 +2520,19 @@ impl Process:
 impl Closer for Process:
     fn close():
         close_process(self)
+
+impl ProcessHandle:
+    # give back the runtime's entry for the child and close its pipes, which
+    # ends a read another task is parked in. a second close is a no-op: process
+    # ids are never reissued.
+    fn close():
+        process_close(self.id)
+
+# the child is closed when the last Process or pipe view naming it dies. this
+# is close(), so it does not wait for the child or kill it.
+impl Drop for ProcessHandle:
+    fn drop():
+        self.close()
 
 impl TcpStream:
     fn read(max_bytes: Int) -> String!:
@@ -2667,6 +2734,14 @@ impl BytesWriter for FileStream:
 impl Closer for FileStream:
     fn close():
         file_stream_close(self)
+
+# a file nobody closes is closed when its last value dies. a file handle is
+# never reissued, so a close() before that leaves the destructor nothing to do.
+# a file is unbuffered here: every write has reached the os by the time it
+# returns, so nothing is lost.
+impl Drop for FileStream:
+    fn drop():
+        self.close()
 
 ## Read a line from standard input
 pub fn prompt() -> String:

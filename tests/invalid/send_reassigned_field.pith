@@ -1,0 +1,17 @@
+# a struct sent over a channel while the sender keeps it and goes on
+# reassigning its string field (E248)
+struct Msg:
+    body: String
+
+fn consume(ch: Channel[Msg]) -> Int:
+    m := ch.recv().value()
+    return m.body.len()
+
+fn main() -> Int!:
+    ch := Channel[Msg](4)
+    m := Msg(body: "first")
+    t := spawn consume(ch)
+    ch.send(m)
+    m.body = "rewritten after the send"
+    print("{await t}")
+    return 0

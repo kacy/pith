@@ -448,11 +448,25 @@ fn validate_combined_ir_contract(ir: String):
         line_no = line_no + 1
 
     line_no = 1
+    # the current function's params and stored locals. the consumer resolves a
+    # called name to a local before a function, so a call through a parameter
+    # that shares a function's name (`dispatch(path, body)` with an entry fn
+    # `dispatch`) is a closure call, not a call to that function.
+    mut locals: Map[String, Bool] := {}
     for line in lines:
+        if line.starts_with("func "):
+            locals = {}
+        elif line.starts_with("param ") or line.starts_with("store "):
+            local_parts := line.split(" ")
+            if local_parts.len() >= 2:
+                locals.insert(local_parts[1], true)
         if not line.starts_with("call ") and not line.starts_with("rcall ") and not line.starts_with("field ") and not line.starts_with("strref "):
             line_no = line_no + 1
             continue
         parts := line.split(" ")
+        if parts[0] == "call" and parts.len() >= 3 and locals.contains_key(parts[2]):
+            line_no = line_no + 1
+            continue
         validate_call_retkind(line_no, parts, struct_names, func_kinds)
         validate_rcall_contract(line_no, parts, func_kinds)
         validate_field_contract(line_no, line, parts)
@@ -697,8 +711,16 @@ fn main() -> Int:
     validate_combined := parsed.validate_combined
     count_mode := env("PITH_CHECK_COUNTS")
     set_count_marks(count_mode == "1" or count_mode == "2" or count_mode == "only")
-    if emit_combined:
-        emit_combined_file(path, emit_tests, validate_combined)
-    else:
-        emit_single_file(path, emit_tests)
+    # a failure that reaches here, such as an error rendering a diagnostic,
+    # has printed nothing, so it is reported rather than ending with no ir and
+    # a clean exit
+    emitted := emit_single_file_or_combined(path, emit_tests, emit_combined, validate_combined)
+    if emitted.is_err:
+        print("ir_driver: {emitted.err}")
+        return 1
     return 0
+
+fn emit_single_file_or_combined(path: String, emit_tests: Bool, emit_combined: Bool, validate_combined: Bool) -> String!:
+    if emit_combined:
+        return emit_combined_file(path, emit_tests, validate_combined)!
+    return emit_single_file(path, emit_tests)!

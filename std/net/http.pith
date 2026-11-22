@@ -5424,9 +5424,7 @@ impl Client:
         return next
 
     fn with_proxy(proxy: String) -> Client:
-        next := self.copy()
-        next.proxy_url = proxy
-        return next
+        return self.copy_with(proxy, self.tls_config)
 
     fn with_env_proxy(enabled: Bool) -> Client:
         next := self.copy()
@@ -5434,9 +5432,7 @@ impl Client:
         return next
 
     fn with_tls_config(config: tls.Config) -> Client:
-        next := self.copy()
-        next.tls_config = config
-        return next
+        return self.copy_with(self.proxy_url, config)
 
     fn with_max_response_header_bytes(limit: Int) -> Client:
         next := self.copy()
@@ -5450,7 +5446,14 @@ impl Client:
 
     # the same settings and the same idle connections.
     fn copy() -> Client:
-        return Client(self.timeout_ms, self.dial_timeout_ms, self.response_header_timeout_ms, self.max_idle_conns_per_host, self.idle_conn_timeout_ms, self.max_redirects, self.keep_alives, self.compression, self.expect_continue_timeout_ms, self.proxy_url, self.env_proxy, self.tls_config, self.max_response_header_bytes, self.max_response_body_bytes, self.pool)
+        return self.copy_with(self.proxy_url, self.tls_config)
+
+    # copy() with another proxy and tls config. the string and the config are
+    # set here, when the copy is built, rather than assigned afterwards: a
+    # client is shared between tasks, and a field no code reassigns is one
+    # every task may read.
+    fn copy_with(proxy_url: String, tls_config: tls.Config) -> Client:
+        return Client(self.timeout_ms, self.dial_timeout_ms, self.response_header_timeout_ms, self.max_idle_conns_per_host, self.idle_conn_timeout_ms, self.max_redirects, self.keep_alives, self.compression, self.expect_continue_timeout_ms, proxy_url, self.env_proxy, tls_config, self.max_response_header_bytes, self.max_response_body_bytes, self.pool)
 
     # send `req` and read the whole response, following redirects.
     fn send(req: ClientRequest) -> HttpResponse!:

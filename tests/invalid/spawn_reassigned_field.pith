@@ -1,0 +1,21 @@
+# two tasks share a struct and one reassigns its string field while the other
+# reads it. the write releases the old string while the reader may be taking
+# its own count on it (E248)
+struct Holder:
+    name: String
+
+fn writer(h: Holder, n: Int) -> Int:
+    for i in 0..n:
+        h.name = "value {i}"
+    return 0
+
+fn reader(h: Holder) -> Int:
+    return h.name.len()
+
+fn main() -> Int!:
+    h := Holder(name: "start")
+    a := spawn writer(h, 10)
+    b := spawn reader(h)
+    await a
+    print("{await b}")
+    return 0

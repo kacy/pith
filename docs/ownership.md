@@ -910,7 +910,15 @@ the rule: **do not share a mutable collection across tasks — pass data
 through a channel instead.** the checker enforces it at a `spawn`
 argument and a channel send (E248), for a collection and for a struct whose
 fields reach one outside a `guard` block, and for a global through the
-sharing rule (E309). a send hands over the handle, so the value sent must be
+sharing rule (E309).
+
+the field itself is a pointer too. reassigning a field that holds a counted
+value releases the old value, and a task reading the field at that moment may
+be taking a count on memory that is being freed. so the same checks refuse a
+struct whose fields reach a counted field that some code reassigns after the
+struct is built, unless the field is in a `guard` block. a field no code
+reassigns is settled and behaves like a `frozen` one. a field holding a
+number or a flag is exempt. a send hands over the handle, so the value sent must be
 one the sender does not keep: built in the call, or an independent copy
 (`std.collections.copy_list` and friends).
 

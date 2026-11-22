@@ -14,7 +14,6 @@ struct Child:
     n: Int
 
 struct Holder:
-    mut child: Child?
     weak w: Child?
 
 fn reader(ch: Channel[Holder]) -> Int:
@@ -37,15 +36,15 @@ fn reader(ch: Channel[Holder]) -> Int:
 
 fn writer(ch: Channel[Holder], rounds: Int) -> Int:
     mut i := 0
-    mut keep: List[Holder] := []
+    # the children's only strong owners. dropping one from the list drops
+    # the last strong count while the reader may still be reading its weak
+    # field.
+    mut keep: List[Child] := []
     while i < rounds:
         c := Child(name: "child-" + i.to_string(), n: i)
-        h := Holder(child: c, w: c)
-        keep.push(h)
-        ch.send(h)
+        keep.push(c)
+        ch.send(Holder(w: c))
         if keep.len() > 3:
-            old := keep[0]
-            old.child = none
             keep.remove(0)
         i = i + 1
     ch.close()

@@ -1,0 +1,82 @@
+# a reassigned counted field is found through every path a handed-over value
+# reaches it by: a nested struct, an optional, an enum payload, a tuple, a map
+# element, an interface value's implementer, and a generic struct, where a
+# write through one instance counts for all of them (E248)
+struct Inner:
+    label: String
+
+struct Outer:
+    inner: Inner
+
+struct MaybeOuter:
+    inner: Inner?
+
+enum Slot:
+    Empty
+    Full(Inner)
+
+struct Box[T]:
+    item: T
+    note: String
+
+interface Named:
+    fn name() -> String
+
+struct Tag:
+    text: String
+
+impl Named for Tag:
+    fn name() -> String:
+        return self.text
+
+fn relabel(i: Inner):
+    i.label = "changed"
+
+fn renote(b: Box[String]):
+    b.note = "changed"
+
+fn retag(t: Tag):
+    t.text = "changed"
+
+fn use_outer(o: Outer) -> Int:
+    return 0
+
+fn use_maybe(o: MaybeOuter) -> Int:
+    return 0
+
+fn use_slot(s: Slot) -> Int:
+    return 0
+
+fn use_pair(p: (Int, Inner)) -> Int:
+    return 0
+
+fn use_inner(i: Inner) -> Int:
+    return 0
+
+fn use_box(b: Box[Int]) -> Int:
+    return 0
+
+fn use_named(n: Named) -> Int:
+    return 0
+
+fn main() -> Int!:
+    inner := Inner(label: "a")
+    relabel(inner)
+    renote(Box[String](item: "x", note: "y"))
+    retag(Tag(text: "t"))
+    outer := Outer(inner: inner)
+    maybe := MaybeOuter(inner: inner)
+    slot := Slot.Full(inner)
+    pair := (1, inner)
+    table: Map[String, Inner] := {"k": inner}
+    box := Box[Int](item: 1, note: "n")
+    named: Named := Tag(text: "u")
+    t1 := spawn use_outer(outer)
+    t2 := spawn use_maybe(maybe)
+    t3 := spawn use_slot(slot)
+    t4 := spawn use_pair(pair)
+    t5 := spawn use_inner(table["k"])
+    t6 := spawn use_box(box)
+    t7 := spawn use_named(named)
+    print("{await t1 + await t2 + await t3 + await t4 + await t5 + await t6 + await t7}")
+    return 0

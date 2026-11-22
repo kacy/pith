@@ -107,18 +107,26 @@ pub struct Response:
 # `buf` and records writes in `sent`, which the tests drive. `buf` and `pos` are
 # the receive buffer coalescing partial socket reads (frames can span reads), and
 # the encoder/decoder carry the two hpack dynamic tables.
+#
+# a Client's reader and writer tasks share the connection. the receive buffer
+# belongs to whichever task reads frames, an inline caller or the reader task,
+# and read_mu is held for each frame it reads. one task reads at a time, so the
+# lock is never contended; it is what lets the checker see that a task replacing
+# `buf` cannot free the buffer another task is slicing.
 pub struct Connection:
     mut tls_handle: Int
     mut live: Bool
-    mut buf: Bytes
-    mut pos: Int
     mut next_stream_id: Int
-    mut sent: Bytes
     # true for an h2c (plaintext) connection: the handle is a raw socket fd and
     # transport i/o goes through tcp rather than the tls session.
     mut plaintext: Bool
     # the most a unary response body may hold (see MAX_RESPONSE_BODY).
     mut max_response_body: Int
+    guard read_mu:
+        mut buf: Bytes
+        mut pos: Int
+    guard sent_mu:
+        mut sent: Bytes
     guard hpack_mu:
         mut encoder: hpack.Encoder
         mut decoder: hpack.Decoder
@@ -204,7 +212,7 @@ impl Connection:
     # a frame can be sliced out in one piece rather than copying its header and
     # payload separately; the consumed prefix is dropped only when a new chunk is
     # pulled, so steady-state reading does not re-concat the buffer per frame.
-    fn fill(n: Int) -> Int!:
+    fn fill(n: Int) -> Int! holding self.read_mu:
         have := self.buf.len() - self.pos
         if have >= n:
             return 0
@@ -237,11 +245,13 @@ impl Connection:
     # payload slices and no concat to rejoin them. the codec's reader then parses
     # and bounds-checks it.
     fn read_frame() -> frames.Frame!:
-        self.fill(9)!
-        total := frames.frame_total(self.buf, self.pos, frames.DEFAULT_MAX_FRAME_SIZE)!
-        self.fill(total)!
-        full := self.buf.slice(self.pos, self.pos + total)
-        self.pos = self.pos + total
+        mut full := bytes.empty()
+        locked self.read_mu:
+            self.fill(9)!
+            total := frames.frame_total(self.buf, self.pos, frames.DEFAULT_MAX_FRAME_SIZE)!
+            self.fill(total)!
+            full = self.buf.slice(self.pos, self.pos + total)
+            self.pos = self.pos + total
         return frames.read_frame(binary.reader(full), frames.DEFAULT_MAX_FRAME_SIZE)!
 
     # write raw bytes to the transport (tcp for h2c, the tls session otherwise),
@@ -251,8 +261,14 @@ impl Connection:
             if self.plaintext:
                 return tcp.write_all_bytes(self.tls_handle, data)!
             return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
-        self.sent = bytes.concat(self.sent, data)
+        locked self.sent_mu:
+            self.sent = bytes.concat(self.sent, data)
         return data.len()
+
+    # everything an offline connection has sent so far.
+    fn sent_bytes() -> Bytes:
+        locked self.sent_mu:
+            return self.sent
 
     # serialize and send one frame.
     fn send_frame(frame: frames.Frame) -> Int!:
@@ -1919,7 +1935,7 @@ fn header_block(fields: List[hpack.HeaderField]) -> Bytes:
 
 # collect the WINDOW_UPDATE frames recorded in a connection's sent stream.
 fn sent_window_updates(conn: Connection) -> List[frames.WindowUpdateFrame]!:
-    reader := binary.reader(conn.sent)
+    reader := binary.reader(conn.sent_bytes())
     mut updates: List[frames.WindowUpdateFrame] := []
     while binary.remaining(reader) > 0:
         frame := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
@@ -1929,7 +1945,7 @@ fn sent_window_updates(conn: Connection) -> List[frames.WindowUpdateFrame]!:
 
 # collect the PING frames recorded in a connection's sent stream.
 fn sent_pings(conn: Connection) -> List[frames.PingFrame]!:
-    reader := binary.reader(conn.sent)
+    reader := binary.reader(conn.sent_bytes())
     mut pings: List[frames.PingFrame] := []
     while binary.remaining(reader) > 0:
         frame := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
@@ -1981,7 +1997,7 @@ test "the read loop acks server SETTINGS before the response":
     response := conn.read_response(1)!
     assert_eq(response.status, 204)
     # a SETTINGS ack must have gone back to the peer.
-    reader := binary.reader(conn.sent)
+    reader := binary.reader(conn.sent_bytes())
     ack := frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!
     settings := frames.parse_settings(ack)!
     assert(settings.ack)
@@ -2046,7 +2062,7 @@ test "the read loop refuses a body past the limit and cancels the stream":
     assert_eq(result.err, RESPONSE_BODY_LIMIT)
     # the consumed bytes are granted back on the connection and the stream is
     # cancelled, so the connection can carry the next request.
-    reader := binary.reader(conn.sent)
+    reader := binary.reader(conn.sent_bytes())
     update := frames.parse_window_update(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
     assert_eq(update.stream_id, 0)
     assert_eq(update.increment, 10)
@@ -2619,7 +2635,7 @@ test "drain_coalesced merges queued frames into one buffer in fifo order":
 # --- inline fast-path tests ---
 #
 # these drive the fast path over an offline connection: the request frames are
-# recorded in conn.sent and the response is read out of a preloaded frame buffer,
+# recorded in conn.sent_bytes() and the response is read out of a preloaded frame buffer,
 # so a whole unary round-trip runs synchronously on the caller with no reader or
 # writer task. the promotion tests then check the one-way latch and its send-window
 # bookkeeping without needing a live socket.

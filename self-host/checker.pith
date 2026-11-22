@@ -24,7 +24,7 @@ from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types, builtin_scope_id, set_builtin_scope_id
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error_at_name, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot, checker_note_alias_module
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error_at_name, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_is_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot, checker_note_alias_module
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration, take_interfaces_snapshot, restore_interfaces_snapshot
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner, MethodsSnapshot, take_methods_snapshot, restore_methods_snapshot
 from return_paths import missing_return_sites
@@ -207,6 +207,20 @@ mut locked_paths: List[String] := []
 mut struct_field_guards: Map[String, String] := {}
 # "<struct type id>.<field>" for each field declared `frozen`
 mut struct_field_frozen: Map[String, Bool] := {}
+# weak fields, keyed like the frozen ones. a weak field's load and store are
+# each one step under the runtime's weak lock, so a task may reassign one
+# while another reads it, and the shared-field rule leaves them out.
+mut struct_field_weak: Map[String, Bool] := {}
+# the fields some code assigns after their struct is built (`x.f = v`,
+# `self.f += v`), keyed by field_write_key, with the first such site as
+# "file:line". a counted field not in here is settled: it holds the value it
+# was built with for good, so any task may read it.
+mut struct_field_writes: Map[String, String] := {}
+# values handed to another task, or carried out of a lock, whose type may reach
+# a reassigned field. whether one does depends on every module's writes, so
+# shared_field_errors judges them once the whole program is checked.
+mut shared_field_sites: List[SharedFieldSite] := []
+mut shared_field_site_seen: Map[String, Bool] := {}
 # argument expressions the checker accepted by widening a plain value into
 # the optional its parameter declares (`f(3)` against `fn f(x: Int?)`).
 # the emitter has no view of a callee's declared parameter types once the
@@ -274,6 +288,10 @@ pub fn initialize_checker(file_path: String):
     definition_of = {}
     struct_field_guards = {}
     struct_field_frozen = {}
+    struct_field_weak = {}
+    struct_field_writes = {}
+    shared_field_sites = []
+    shared_field_site_seen = {}
     locked_paths = []
     optional_widened_arguments = {}
     interface_coercions = {}
@@ -1088,6 +1106,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
                 field_types.push(ftid)
                 if cn.value.contains(" weak"):
                     check_weak_field(fname, ftid)
+                    struct_field_weak.insert(tid.to_string() + "." + fname, true)
                 if cn.children.len() > 1:
                     default_tid := c_check_expr(cn.children[1], current_scope)
                     if optional_target_accepts_value(cn.children[1], default_tid, ftid):
@@ -3257,6 +3276,8 @@ fn check_assignment(node: Node, scope_id: Int):
             return
     target_type := c_check_expr(target_idx, scope_id)
     val_type := c_check_expr(value_idx, scope_id)
+    if target_node.kind == "field_access" and target_node.children.len() >= 1:
+        note_field_write(c_get_expr_type(target_node.children[0]), target_node.value, target_idx)
     # a String and a Bytes value are immutable, and nothing in the runtime
     # stores into one. the store used to compile as a list store and stop at
     # run time with "invalid list handle".
@@ -8256,6 +8277,9 @@ fn check_spawn_shared_collections(call_node: Node, first_arg: Int, scope_id: Int
 # that this scope still holds a handle to. `refused` starts the message.
 fn report_shared_handoff(expr_idx: Int, refused: String, scope_id: Int):
     if not spawn_arg_shares_collection(expr_idx):
+        kind := get_node(expr_idx).kind
+        if kind == "ident" or kind == "field_access" or kind == "index":
+            note_shared_field_site(expr_idx, "E248", refused)
         return
     tid := c_get_expr_type(expr_idx)
     kind := get_type_info(tid).kind
@@ -8313,6 +8337,161 @@ fn struct_holds_unguarded_collection(tid: Int, seen: Map[Int, Bool]) -> String:
         if inner != "":
             return fname + "." + inner
     return ""
+
+# ---------------------------------------------------------------
+# reassigned fields shared across tasks (E248, E276)
+# ---------------------------------------------------------------
+#
+# a counted value (a string, a struct, an optional, a handle) lives in a field
+# as one pointer. a task that reassigns the field releases the old value while
+# a task reading the field may be taking its own count on it, so two tasks that
+# reach the same struct, one writing a counted field and one reading it, can
+# free a value twice or read freed memory. a field is settled when no code in
+# the program assigns it after its struct is built: it holds its first value
+# for good, the way a `frozen` field does, and any task may read it. a field in
+# a `guard` block is reached under its lock. a scalar field holds no pointer,
+# so a race on one is a logic error, not a memory error, and is allowed.
+#
+# so a value handed to another task, or carried out of a lock, is refused when
+# its fields reach a counted field that is neither settled nor guarded. the
+# writes come from every module, so the sites are recorded while each body is
+# checked and judged by shared_field_errors once the whole program is checked.
+
+struct SharedFieldSite:
+    at: Int
+    tid: Int
+    code: String
+    lead: String
+    file: String
+
+# the key a field write is recorded under: the struct's type id, or the
+# declaration for an instance of a generic struct, so a write through any
+# instance counts for all of them
+fn field_write_key(tid: Int, fname: String) -> String:
+    if struct_instance_decl_idx.contains_key(tid):
+        return "d" + struct_instance_decl_idx[tid].to_string() + "." + fname
+    return tid.to_string() + "." + fname
+
+fn note_field_write(receiver_tid: Int, fname: String, at: Int):
+    if receiver_tid < 0 or is_error_type(receiver_tid) or get_type_info(receiver_tid).kind != "struct":
+        return
+    key := field_write_key(receiver_tid, fname)
+    if not struct_field_writes.contains_key(key):
+        struct_field_writes.insert(key, checker_current_file_path() + ":" + get_node(at).line.to_string())
+
+# record a value shared with another task whose type could reach a reassigned
+# field. `lead` starts the message.
+fn note_shared_field_site(at: Int, code: String, lead: String):
+    if not checker_is_reporting():
+        return
+    tid := c_get_expr_type(at)
+    if tid < 0 or is_error_type(tid):
+        return
+    kind := get_type_info(tid).kind
+    if kind != "struct" and kind != "optional" and kind != "enum" and kind != "tuple":
+        return
+    key := at.to_string() + ":" + tid.to_string() + ":" + code
+    if shared_field_site_seen.contains_key(key):
+        return
+    shared_field_site_seen.insert(key, true)
+    shared_field_sites.push(SharedFieldSite(at: at, tid: tid, code: code, lead: lead, file: checker_current_file_path()))
+
+## whether a value of this type is a counted pointer: a string, bytes, a
+## struct, a handle, an optional, a result, a tuple, a function value, a
+## collection, or an enum with a payload. a number, a bool and a tag-only enum
+## are plain values.
+pub fn is_counted_type(tid: Int) -> Bool:
+    if tid < 0 or is_error_type(tid) or is_none_type(tid):
+        return false
+    info := get_type_info(tid)
+    if info.kind == "primitive":
+        return tid == TID_STRING or tid == TID_BYTES
+    if info.kind == "enum":
+        for payload in info.variant_types:
+            if payload.len() > 0:
+                return true
+        return false
+    return true
+
+# the first path under a type to a counted field that some code reassigns and
+# that is neither guarded nor frozen, with the field's write key, or ("", "").
+# struct fields, optional and collection elements, tuple elements, enum
+# payloads and an interface's implementers are followed, each struct once.
+fn reassigned_counted_field(tid: Int, seen: Map[Int, Bool]) -> (String, String):
+    none_found := ("", "")
+    if tid < 0 or is_error_type(tid):
+        return none_found
+    info := get_type_info(tid)
+    if (info.kind == "optional" or info.kind == "list" or info.kind == "set") and info.inner >= 0:
+        return reassigned_counted_field(info.inner, seen)
+    if info.kind == "map":
+        return reassigned_counted_field(info.value_type, seen)
+    if info.kind == "tuple":
+        for elem, i in info.elements:
+            found := reassigned_counted_field(elem, seen)
+            if found.0 != "":
+                return (i.to_string() + "." + found.0, found.1)
+        return none_found
+    if info.kind != "enum" and info.kind != "struct":
+        return none_found
+    if seen.contains_key(tid):
+        return none_found
+    seen.insert(tid, true)
+    if info.kind == "enum":
+        for payload, i in info.variant_types:
+            for ptid in payload:
+                found := reassigned_counted_field(ptid, seen)
+                if found.0 != "":
+                    return (info.variants[i] + "." + found.0, found.1)
+        return none_found
+    if is_interface_value_type(tid):
+        for impl_tid in interface_implementer_tids(info.name):
+            found := reassigned_counted_field(impl_tid, seen)
+            if found.0 != "":
+                return (get_type_name(impl_tid) + "." + found.0, found.1)
+        return none_found
+    for fname, i in info.fields:
+        fkey := tid.to_string() + "." + fname
+        if struct_field_guards.contains_key(fkey) or struct_field_frozen.contains_key(fkey) or struct_field_weak.contains_key(fkey):
+            continue
+        ftid := info.field_types[i]
+        key := field_write_key(tid, fname)
+        if struct_field_writes.contains_key(key) and is_counted_type(ftid):
+            return (fname, key)
+        found := reassigned_counted_field(ftid, seen)
+        if found.0 != "":
+            return (fname + "." + found.0, found.1)
+    return none_found
+
+## the first field under a type that some code reassigns, is counted, and is
+## neither guarded nor frozen, as "path (file:line)" with the first write, or
+## "". see reassigned_counted_field.
+pub fn reassigned_field_of(tid: Int) -> String:
+    mut seen: Map[Int, Bool] := {}
+    found := reassigned_counted_field(tid, seen)
+    if found.0 == "":
+        return ""
+    return "'" + found.0 + "' is reassigned at " + struct_field_writes[found.1]
+
+## the E248 and E276 errors for values shared with another task that reach a
+## counted field the program reassigns. run once every module is checked,
+## since a write in any module unsettles a field.
+pub fn shared_field_errors() -> List[Diagnostic]:
+    mut out: List[Diagnostic] := []
+    for site in shared_field_sites:
+        mut seen: Map[Int, Bool] := {}
+        found := reassigned_counted_field(site.tid, seen)
+        if found.0 == "":
+            continue
+        written_at := struct_field_writes[found.1]
+        segments := found.0.split(".")
+        field := segments[segments.len() - 1]
+        node := get_node(site.at)
+        if site.code == "E248":
+            out.push(Diagnostic("error", "E248", site.lead + " this " + get_type_name(site.tid) + ": its field '" + found.0 + "' is reassigned at " + written_at + ", and a write while the other task reads it frees the value being read", site.file, node.line, node.col, "move '" + field + "' into a `guard` block, stop reassigning it once the value is built, or hand over a copy built in the call"))
+        else:
+            out.push(Diagnostic("error", site.code, site.lead + ", and its field '" + found.0 + "' is reassigned at " + written_at + ", so a write under the lock frees the value read after the block", site.file, node.line, node.col, "copy what is needed inside the block, move '" + field + "' into a `guard` block, or stop reassigning it once the value is built"))
+    return out
 
 fn check_await_expression(node: Node, scope_id: Int) -> Int:
     if node.children.len() < 1:
@@ -8379,6 +8558,8 @@ fn instantiate_generic_struct_type(decl_idx: Int, type_args: List[Int]) -> Int:
             is_mut := cn.value.contains(" mut")
             if cn.value.contains(" frozen"):
                 struct_field_frozen.insert(tid.to_string() + "." + fname, true)
+            if cn.value.contains(" weak"):
+                struct_field_weak.insert(tid.to_string() + "." + fname, true)
             field_names.push(fname)
             field_pub.push(is_pub)
             field_mut.push(is_mut)
@@ -9036,6 +9217,12 @@ pub struct CheckerSnapshot:
     pub checker_lambda_depth: Int
     pub checker_lambda_scope: Int
     pub lambda_inferred_return: Int
+    pub struct_field_guards: Map[String, String]
+    pub struct_field_frozen: Map[String, Bool]
+    pub struct_field_weak: Map[String, Bool]
+    pub struct_field_writes: Map[String, String]
+    pub shared_field_sites: List[SharedFieldSite]
+    pub shared_field_site_seen: Map[String, Bool]
 
 # copy the checker's state out. the live state keeps changing
 # afterwards; the snapshot does not.
@@ -9103,7 +9290,13 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         fn_weak_names: copy_list(fn_weak_names),
         checker_lambda_depth: checker_lambda_depth,
         checker_lambda_scope: checker_lambda_scope,
-        lambda_inferred_return: lambda_inferred_return)
+        lambda_inferred_return: lambda_inferred_return,
+        struct_field_guards: copy_map(struct_field_guards),
+        struct_field_frozen: copy_map(struct_field_frozen),
+        struct_field_weak: copy_map(struct_field_weak),
+        struct_field_writes: copy_map(struct_field_writes),
+        shared_field_sites: copy_list(shared_field_sites),
+        shared_field_site_seen: copy_map(shared_field_site_seen))
 
 # make the live state a copy of the snapshot, leaving the snapshot as
 # it was so it can be restored again after the next run.
@@ -9172,6 +9365,12 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     checker_lambda_depth = s.checker_lambda_depth
     checker_lambda_scope = s.checker_lambda_scope
     lambda_inferred_return = s.lambda_inferred_return
+    struct_field_guards = copy_map(s.struct_field_guards)
+    struct_field_frozen = copy_map(s.struct_field_frozen)
+    struct_field_weak = copy_map(s.struct_field_weak)
+    struct_field_writes = copy_map(s.struct_field_writes)
+    shared_field_sites = copy_list(s.shared_field_sites)
+    shared_field_site_seen = copy_map(s.shared_field_site_seen)
 
 # ---------------------------------------------------------------
 # frozen guarded fields (E275) and handles that leave a lock (E276)
@@ -9296,18 +9495,24 @@ fn check_escape_sites(idx: Int, inner: Map[String, Bool], locked_idx: Int, fn_bo
     node := get_node(idx)
     if node.kind == "assignment" and node.children.len() >= 2:
         name := escaping_guarded_read(node.children[1])
-        if name != "" and not block_replaces(block, node.children[1]):
-            target := get_node(node.children[0])
-            if target.kind != "ident" or not inner.contains_key(target.value):
+        target := get_node(node.children[0])
+        if not block_replaces(block, node.children[1]) and (target.kind != "ident" or not inner.contains_key(target.value)):
+            if name != "":
                 report_escape(node.children[1], name, "this stores its value where it outlives the block")
+            else:
+                note_guarded_escape(node.children[1], "this stores its value where it outlives the block")
     elif node.kind == "return" and node.children.len() >= 1:
         name := escaping_guarded_read(node.children[0])
         if name != "":
             report_escape(node.children[0], name, "this returns its value out of the block")
+        else:
+            note_guarded_escape(node.children[0], "this returns its value out of the block")
     elif node.kind == "lambda":
         captured := first_guarded_read(idx)
         if captured >= 0:
             report_escape(captured, escaping_guarded_read(captured), "a closure made inside the block captures it")
+        else:
+            note_captured_guarded_reads(idx)
         return
     for child in node.children:
         check_escape_sites(child, inner, locked_idx, fn_body, block)
@@ -9329,6 +9534,22 @@ fn assigns_path(idx: Int, path: String, read_idx: Int) -> Bool:
         if assigns_path(child, path, read_idx):
             return true
     return false
+
+# a guarded read leaving its block whose value holds no collection may still
+# reach a reassigned field, which shared_field_errors judges later
+fn note_guarded_escape(idx: Int, how: String):
+    kind := get_node(idx).kind
+    if kind != "ident" and kind != "field_access" and kind != "index":
+        return
+    name := guarded_segment(idx)
+    if name != "":
+        note_shared_field_site(idx, "E276", "'" + name + "' is guarded, and " + how)
+
+# every guarded read a closure made inside the block captures
+fn note_captured_guarded_reads(idx: Int):
+    note_guarded_escape(idx, "a closure made inside the block captures it")
+    for child in get_node(idx).children:
+        note_captured_guarded_reads(child)
 
 # the first guarded read under a node, or -1
 fn first_guarded_read(idx: Int) -> Int:

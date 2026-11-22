@@ -1466,6 +1466,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_tail_match_defer \
 	tests/cases/test_argument_literal_ownership \
 	tests/cases/test_borrowed_operand_extraction \
+	tests/cases/test_method_result_pinned_across_sibling \
+	tests/cases/test_higher_order_owned_counts \
 	tests/cases/test_unwrap_or_borrowed_fallback \
 	tests/cases/test_borrowed_list_element tests/cases/test_borrowed_threadlocal_string \
 	tests/cases/test_stack_closure \

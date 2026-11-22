@@ -198,6 +198,7 @@ cases=(
   tests/leaks/leak_json_parse_restore
   tests/leaks/leak_json_parse_decode_list
   tests/leaks/leak_toml_parse_restore
+  tests/leaks/leak_higher_order_chain
   tests/leaks/leak_pad_result
   tests/leaks/leak_imported_global_store
   tests/leaks/leak_temporary_container_reads

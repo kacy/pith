@@ -1,0 +1,14 @@
+# a generic function's body is judged by the declared types of what its
+# closures capture: here a parameter declared as a list (E248)
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn fan[T](xs: List[T]) -> Int:
+    work := fn() -> Int => xs.len()
+    t := spawn run(work)
+    return await t
+
+fn main() -> Int!:
+    mut xs: List[Int] := [1]
+    print("{fan(xs)}")
+    return 0

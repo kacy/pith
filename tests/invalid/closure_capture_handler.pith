@@ -1,0 +1,14 @@
+# a request handler runs on the task serving each connection, so a handler that
+# captures a list shares it with every one of them (E248)
+import std.net.http
+import std.net.tcp
+
+fn main() -> Int!:
+    mut seen: List[String] := []
+    handler := fn(req: http.HttpRequestBytes) -> http.HttpResponse:
+        seen.push(req.path_text)
+        return http.text(200, "seen {seen.len()}")
+    listener := tcp.listen("127.0.0.1", 0)!
+    client := tcp.accept(listener)!
+    spawn http.serve_connection_fd(client, handler)
+    return 0

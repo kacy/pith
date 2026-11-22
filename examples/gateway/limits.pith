@@ -13,15 +13,15 @@ import auth
 MAX_TRACKED_CALLERS := 100000
 
 pub struct CallerLimits:
-    mu: Mutex
     per_second: Int
     burst: Int
-    mut buckets: Map[String, resilience.Limiter]
+    guard mu:
+        mut buckets: Map[String, resilience.Limiter]
 
 # one token bucket per caller, each refilled at `per_second` up to `burst`.
 pub fn caller_limits(per_second: Int, burst: Int) -> CallerLimits:
     empty: Map[String, resilience.Limiter] := {}
-    return CallerLimits(Mutex(), per_second, burst, empty)
+    return CallerLimits(per_second, burst, empty)
 
 impl CallerLimits:
     fn bucket(caller: String) -> resilience.Limiter:

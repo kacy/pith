@@ -205,6 +205,12 @@ stale and a fix to it is welcome.
   share its worker. building with `PITH_GREEN_PREEMPT=0` removes the check,
   and with it the guarantee. the preemption request flag is process-global, so
   every running task takes a slow path when any one task overruns (#1089).
+- **the closure sharing rule reads types, so a generic body is judged by its
+  annotations**. a closure made inside a generic function is checked against
+  the declared types of what it captures: a parameter or local annotated as a
+  list, a map or a set is refused, but an unannotated local or a struct there
+  is not judged (E248). a call through a function value is followed to any
+  closure parameter and any closure result, not to the one closure it calls.
 - **a blocked pipe read under `PITH_GREEN=0` ignores a close**. closing a
   child's pipe from another task fails every later call on the handle, but a
   read already blocked in the kernel returns only when the child writes or

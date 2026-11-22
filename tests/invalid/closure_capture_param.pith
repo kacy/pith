@@ -1,0 +1,11 @@
+# the closure reaches the task through a parameter: `go` spawns whatever it is
+# given, so every closure passed to it must be task-safe (E248)
+fn go(f: fn() -> Int) -> Task[Int]:
+    return spawn f()
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    t := go(fn() -> Int => xs.len())
+    xs.push("main")
+    print("{await t}")
+    return 0

@@ -605,7 +605,33 @@ error[E248]: a spawned task cannot take this Holder: its field 'name' is reassig
 
 a lock taken by hand, with `lock()` and `unlock()` or a `compare_set` spin,
 does not count, since the checker cannot see which fields it covers. put the
-field in a `guard` block. a builder that sets a field after building the
+field in a `guard` block.
+
+a closure captures each value it uses by handle, so the same rule applies to
+what a closure captures when the closure can run on another task. the
+checker follows every function value through the whole program: a closure
+reaches another task when it is a spawn's argument or callee, a sent value, a
+value a module global holds in a program that spawns, a field of a struct
+that crosses to a task, a capture of another closure that does, or when it
+flows into a parameter, a field, a local or a function result that reaches
+one of those. such a closure may not capture a collection, or a struct that
+reaches one outside a `guard` block or reaches a counted field some code
+reassigns. a closure that stays on the task that made it, such as one passed
+to `map`, may capture anything. the message names the capture and the path
+to the task.
+
+```
+error[E248]: a closure that reaches another task cannot capture 'seen' (a list), which the scope that made the closure still holds; the closure reaches the task through parameter 'handler' of 'get', then parameter 'handler' of 'handle', then ... a spawn at std/web.pith:758
+  9 |         seen.push(req.path)
+              ^
+  fix: build the value inside the closure, hand the task a copy, or keep it in a `guard` block
+```
+
+request handlers are the usual case: `std.web`, `std.net.http`,
+`std.net.http2` and `std.net.grpc` run a handler on the task serving each
+connection. keep state the handler changes in a `guard` block, and state it
+only reads in a `frozen` field. a generic function's body is not judged, since
+its types are known only per instance. a builder that sets a field after building the
 struct unsettles the field too, so build the struct with every field in the
 constructor call, as `std.net.http`'s `Client.copy_with` does.
 
@@ -1327,6 +1353,15 @@ outside a guard block, is reached safely only while its mutex is held. inside
 `locked`, its value may not be stored in a variable declared outside the
 block, returned from the block, or captured by a closure made in the block:
 each keeps a handle to the buffer after the lock is released.
+
+a name bound inside the block to a guarded value is guarded too, for the rest
+of the block: a local bound to it (`list := self.idle[key]`), a loop variable
+over it, an `if let` or `while let` binding of it, the result of a builtin
+accessor on it (`get`, `first`, `last`, `unwrap`, `unwrap_or`, `expect`,
+`values`), and the result of a function that returns one of its parameters
+when a guarded value is passed in. storing such a value back under the same
+guard (`rooms[name] = room`) is not an escape. a copy (`list.slice(0,
+list.len())`, `copy_list`) is a new buffer and may leave.
 
 a block that moves the value out and gives the field a new one, `out =
 self.items` then `self.items = []`, is a take and is allowed, since the guard

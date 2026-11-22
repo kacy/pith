@@ -1,0 +1,14 @@
+# a closure that captures a struct whose string field some code reassigns: a
+# write frees the string the task may be reading (E248)
+struct Holder:
+    name: String
+
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn main() -> Int!:
+    h := Holder(name: "start")
+    t := spawn run(fn() -> Int => h.name.len())
+    h.name = "changed"
+    print("{await t}")
+    return 0

@@ -1,0 +1,64 @@
+# a name bound inside `locked` to a guarded value reaches the guarded value for
+# the rest of the block (E276). these are the uses that stay allowed: reading
+# and changing it inside the block, storing it back under the same guard,
+# taking an element out of it that holds no collection, and copying it out.
+struct Conn:
+    fd: Int
+    reused: Bool
+
+struct Room:
+    name: String
+    members: List[String]
+
+guard mu:
+    mut idle: Map[String, List[Conn]] := {}
+    mut rooms: Map[String, Room] := {}
+
+fn put(key: String, c: Conn):
+    locked mu:
+        if not idle.contains_key(key):
+            idle.insert(key, [])
+        list := idle[key]
+        list.push(c)
+
+# the shape of std.net.http's conn_for: the element is taken out of the list
+# under the lock, and holds no collection, so it may leave the block
+fn take(key: String) -> Conn?:
+    mut found: Conn? := none
+    locked mu:
+        if idle.contains_key(key):
+            list := idle[key]
+            n := list.len()
+            if n > 0:
+                found = list[n - 1]
+                list.remove(n - 1)
+    return found
+
+fn join(room_name: String, member: String):
+    locked mu:
+        room := rooms.get(room_name).unwrap_or(Room(room_name, []))
+        room.members.push(member)
+        rooms[room_name] = room
+
+fn members(room_name: String) -> List[String]:
+    locked mu:
+        if let room = rooms.get(room_name):
+            return room.members.slice(0, room.members.len())
+    return []
+
+fn worker(id: Int) -> Int:
+    for i in 0..200:
+        put("k", Conn(fd: id * 1000 + i, reused: false))
+        join("lobby", "w{id}-{i}")
+        if let c = take("k"):
+            c.reused = true
+    return 0
+
+fn main() -> Int!:
+    mut tasks: List[Task[Int]] := []
+    for id in 0..4:
+        tasks.push(spawn worker(id))
+    for t in tasks:
+        await t
+    print("{members("lobby").len()}")
+    return 0

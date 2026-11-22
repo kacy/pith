@@ -10,8 +10,10 @@
 # whose value reaches a struct field some code reassigns is reported too (see
 # shared_field_errors in checker.pith). this pass reports the rest as errors,
 # naming the global and one spawn in the program. it also adds the checker's
-# E248 and E276 errors for reassigned fields, which need every module's writes. `pith check`, `build`, `run` and `test` run it
-# after the checker, and `pith lint` reports it as well.
+# E248 and E276 errors for reassigned fields, which need every module's writes,
+# and the E248 errors for closures that reach another task (see the end of this
+# file). `pith check`, `build`, `run` and `test` run it after the checker, and
+# `pith lint` reports it as well.
 #
 # the pass runs over the whole program `pith lint` loaded: the entry module and
 # everything it imports, so a library global is reported when a program that
@@ -27,7 +29,7 @@
 
 from ast import Node, get_node, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, has_errors
-from checker import c_get_expr_type, called_declaration, extract_binding_name, COLLECTION_MUTATORS, is_counted_type, shared_field_errors, reassigned_field_of
+from checker import c_get_expr_type, called_declaration, extract_binding_name, COLLECTION_MUTATORS, is_counted_type, shared_field_errors, reassigned_field_of, get_definition_of, field_write_key, capture_refusal, interface_value_implementers, parse_integer_string
 from types import get_type_info, get_type_name, is_error_type, is_none_type
 from driver import get_resolved_module_file, get_resolved_module_path
 from checker_methods import method_tid_key, has_method_declaration, get_method_declaration_index
@@ -45,6 +47,13 @@ pub fn add_sharing_errors(diags: List[Diagnostic], entry_root: Int, entry_path: 
     if has_errors(diags):
         return diags
     for d in shared_field_errors():
+        diags.push(d)
+    mut roots: List[Int] := [entry_root]
+    mut files: List[String] := [entry_path]
+    for r in import_roots:
+        roots.push(r)
+        files.push(get_resolved_module_file(r))
+    for d in closure_sharing_errors(roots, files):
         diags.push(d)
     for d in lint_shared_globals(entry_root, entry_path, import_roots):
         diags.push(d)
@@ -116,10 +125,7 @@ fn reached_spawn(roots: List[Int], files: List[String]) -> String:
             found := first_spawn(child)
             if found >= 0:
                 return files[0] + ":" + get_node(found).line.to_string()
-    fns := ProgramFns(nodes: [], modules: [], free_fns: {}, methods_by_name: {}, aliases: {}, from_names: {}, module_of: {})
-    for r, i in roots:
-        collect_functions(r, i, false, fns)
-    record_imports(roots, fns)
+    fns := build_program_fns(roots)
     # a depth-first search from the entry's functions. a function's calls are
     # resolved only when the search reaches it, and the search ends at the
     # first spawn, so a function visited without one cannot reach one.
@@ -209,6 +215,16 @@ fn collect_call_targets(idx: Int, module: Int, fns: ProgramFns, out: List[Int]) 
     node := get_node(idx)
     if node.kind == "spawn":
         return idx
+    resolve_call(idx, module, fns, out)
+    for child in node.children:
+        found := collect_call_targets(child, module, fns, out)
+        if found >= 0:
+            return found
+    return 0 - 1
+
+# the functions a call or a method call in `module` may run, appended to `out`
+fn resolve_call(idx: Int, module: Int, fns: ProgramFns, out: List[Int]):
+    node := get_node(idx)
     decl := called_declaration(idx)
     if decl >= 0 and fns.module_of.contains_key(decl):
         out.push(decl)
@@ -223,11 +239,6 @@ fn collect_call_targets(idx: Int, module: Int, fns: ProgramFns, out: List[Int]) 
     elif node.kind == "method_call" and node.children.len() > 0:
         if not push_module_call(module, node.children[0], node.value, fns, out):
             push_method(node.children[0], node.value, fns, out)
-    for child in node.children:
-        found := collect_call_targets(child, module, fns, out)
-        if found >= 0:
-            return found
-    return 0 - 1
 
 fn push_free_fn(module: Int, name: String, fns: ProgramFns, out: List[Int]):
     key := module.to_string() + "\t" + name
@@ -392,3 +403,534 @@ fn path_root(idx: Int) -> String:
     if (node.kind == "index" or node.kind == "field_access") and node.children.len() >= 1:
         return path_root(node.children[0])
     return ""
+
+# ---------------------------------------------------------------
+# closures that reach another task (E248)
+# ---------------------------------------------------------------
+#
+# a closure captures each outer value by handle, so a closure that captures a
+# list and then runs on another task shares that list's buffer with the scope
+# that made it, the way a held spawn argument does. a closure is task-safe
+# when every value it captures would pass the handoff rule as a held argument:
+# no collection outside a `guard` block and no counted field that some code
+# reassigns (capture_refusal in checker.pith). this pass refuses a closure
+# that is not task-safe and whose value can reach another task.
+#
+# a function value reaches another task when it is a spawn's argument, callee
+# or receiver, a sent value, a value a module global holds in a program that
+# spawns, a field of a struct that crosses tasks, a capture of a closure that
+# crosses, or flows into a parameter, a field, a local or a function result
+# that reaches one. the pass records, for every slot a value can flow into
+# (a local or parameter by its declaration node "n<idx>", a struct field by
+# its write key "f<key>", a function's result "r<idx>", "ru" for what any
+# closure returns, and "u" for the arguments of calls through a function
+# value), the expressions that flow in.
+# then it marks slots from the sinks to a fixed point: a marked slot marks the
+# expressions flowing into it, and a marked expression marks the slot it
+# reads. a value of a struct type that crosses marks every field of that type
+# holding a function value, through nested structs, collections and the
+# implementers of an interface value.
+#
+# the pass reads the expression types the checker recorded. a generic
+# function's body has none, since its types are recorded per instance and
+# dropped, so a capture there is judged by its declared type alone.
+
+struct TaskFlow:
+    fns: ProgramFns
+    files: List[String]
+    defs: Map[Int, Int]
+    sources: Map[String, List[Int]]
+    reaching: Map[String, String]
+    marked: Map[Int, Bool]
+    crossing: Map[Int, Bool]
+    call_targets: Map[Int, List[Int]]
+    roots: List[Int]
+    root_why: List[String]
+    spawns: List[Int]
+    globals: Map[Int, String]
+    lambda_file: Map[Int, String]
+    lambda_params: Map[Int, Bool]
+    param_owner: Map[Int, String]
+    param_fn: Map[Int, Int]
+    value_fns: Map[Int, Bool]
+    judged: Map[Int, Bool]
+    out: List[Diagnostic]
+
+# the methods that store an argument into the collection they are called on
+STORING_METHODS := ",push,insert,set,push_front,append,extend,put,add,"
+
+# the declaration kinds a name can resolve to that hold no value of their own
+NAMED_DECLS := ",fn_decl,struct_decl,enum_decl,interface_decl,test_decl,"
+
+fn build_program_fns(roots: List[Int]) -> ProgramFns:
+    fns := ProgramFns(nodes: [], modules: [], free_fns: {}, methods_by_name: {}, aliases: {}, from_names: {}, module_of: {})
+    for r, i in roots:
+        collect_functions(r, i, false, fns)
+    record_imports(roots, fns)
+    return fns
+
+## the E248 errors for closures that capture a shared value and can reach
+## another task, over the program rooted at `roots` (the entry first), read
+## from `files`.
+pub fn closure_sharing_errors(roots: List[Int], files: List[String]) -> List[Diagnostic]:
+    mut none_found: List[Diagnostic] := []
+    # a program with no spawn runs on one task, and most programs have none
+    mut spawns := false
+    for r in roots:
+        if not spawns and first_spawn(r) >= 0:
+            spawns = true
+    if not spawns:
+        return none_found
+    flow := TaskFlow(fns: build_program_fns(roots), files: files, defs: get_definition_of(), sources: {}, reaching: {}, marked: {}, crossing: {}, call_targets: {}, roots: [], root_why: [], spawns: [], globals: {}, lambda_file: {}, lambda_params: {}, param_owner: {}, param_fn: {}, value_fns: {}, judged: {}, out: [])
+    for r, i in roots:
+        flow_module(flow, r, i)
+    if flow.spawns.len() == 0:
+        return flow.out
+    # a program that spawns shares its module globals with every task
+    for g in flow.globals.keys():
+        mark_slot(flow, "n" + g.to_string(), "the module global '" + flow.globals[g] + "', which every task can reach")
+    for e, i in flow.roots:
+        mark_expr(flow, e, flow.root_why[i])
+    return flow.out
+
+fn flow_module(flow: TaskFlow, root: Int, module: Int):
+    for child in get_node(root).children:
+        mut idx := child
+        if get_node(idx).kind == "pub" and get_node(idx).children.len() > 0:
+            idx = get_node(idx).children[0]
+        node := get_node(idx)
+        if node.kind == "binding":
+            flow.globals.insert(idx, extract_binding_name(node.value))
+            flow_walk(flow, idx, module, "")
+        elif node.kind == "fn_decl" or node.kind == "test_decl":
+            flow_fn(flow, idx, module)
+        elif node.kind == "impl_decl":
+            for m in node.children:
+                if get_node(m).kind == "fn_decl":
+                    flow_fn(flow, m, module)
+
+fn flow_fn(flow: TaskFlow, idx: Int, module: Int):
+    node := get_node(idx)
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            flow.param_owner.insert(child, "'" + node.value + "'")
+            flow.param_fn.insert(child, idx)
+        elif cn.kind == "body" or cn.kind == "block":
+            flow_walk(flow, child, module, "r" + idx.to_string())
+
+# add `expr` to the values flowing into `slot`
+fn add_flow(flow: TaskFlow, slot: String, expr: Int):
+    if slot == "" or expr < 0 or not may_hold_function(expr):
+        return
+    if flow.sources.contains_key(slot):
+        flow.sources[slot].push(expr)
+    else:
+        flow.sources.insert(slot, [expr])
+
+# whether an expression's value may be or hold a function value: a closure, a
+# value whose type holds one, or one with no recorded type. only these are
+# followed, since a struct's function fields are reached through its type.
+fn may_hold_function(expr: Int) -> Bool:
+    tid := c_get_expr_type(expr)
+    return is_error_type(tid) or holds_function_type(tid) or get_node(expr).kind == "lambda"
+
+# the slot an assignment target or a storing method's receiver writes: a local
+# or parameter, a struct field, or the container at the root of an index, or ""
+fn path_slot(flow: TaskFlow, idx: Int) -> String:
+    node := get_node(idx)
+    if node.kind == "ident" or node.kind == "self":
+        if flow.defs.contains_key(idx):
+            return "n" + flow.defs[idx].to_string()
+        return ""
+    if node.kind == "field_access" and node.children.len() >= 1:
+        tid := c_get_expr_type(node.children[0])
+        if is_error_type(tid) or get_type_info(tid).kind != "struct":
+            return ""
+        return "f" + field_write_key(tid, node.value)
+    if node.kind == "index" and node.children.len() >= 1:
+        return path_slot(flow, node.children[0])
+    return ""
+
+# every node under a pattern takes the subject's value
+fn bind_pattern(flow: TaskFlow, pat: Int, subject: Int):
+    add_flow(flow, "n" + pat.to_string(), subject)
+    for child in get_node(pat).children:
+        bind_pattern(flow, child, subject)
+
+fn flow_walk(flow: TaskFlow, idx: Int, module: Int, ret_slot: String):
+    node := get_node(idx)
+    kind := node.kind
+    if kind == "lambda":
+        flow.lambda_file.insert(idx, flow.files[module])
+        for child in node.children:
+            cn := get_node(child)
+            if cn.kind == "param":
+                flow.lambda_params.insert(child, true)
+                flow.param_owner.insert(child, "a closure")
+            elif cn.kind == "body" and cn.children.len() > 0:
+                add_flow(flow, "ru", cn.children[0])
+            flow_walk(flow, child, module, "ru")
+        return
+    if kind == "binding" and node.children.len() > 0:
+        add_flow(flow, "n" + idx.to_string(), node.children[node.children.len() - 1])
+    elif kind == "assignment" and node.children.len() >= 2:
+        add_flow(flow, path_slot(flow, node.children[0]), node.children[1])
+    elif kind == "return" and node.children.len() >= 1:
+        add_flow(flow, ret_slot, node.children[0])
+    elif kind == "for_stmt" and node.children.len() >= 3:
+        add_flow(flow, "n" + node.children[2].to_string(), node.children[0])
+    elif (kind == "if_let" or kind == "while_let") and node.children.len() >= 2:
+        bind_pattern(flow, node.children[0], node.children[1])
+    elif (kind == "match" or kind == "match_expr") and node.children.len() >= 1:
+        for arm in node.children:
+            an := get_node(arm)
+            if an.kind == "arm" and an.children.len() > 0:
+                bind_pattern(flow, an.children[0], node.children[0])
+    elif kind == "spawn" and node.children.len() >= 1:
+        flow.spawns.push(idx)
+        flow_spawn(flow, node.children[0], flow.files[module] + ":" + node.line.to_string())
+    elif kind == "call" or kind == "method_call":
+        flow_call(flow, idx, module)
+    elif kind == "ident" and flow.defs.contains_key(idx) and get_node(flow.defs[idx]).kind == "fn_decl":
+        # a named function used as a value; a callee is skipped below
+        flow.value_fns.insert(flow.defs[idx], true)
+    for child, i in node.children:
+        if i == 0 and kind == "call" and get_node(child).kind == "ident":
+            continue
+        flow_walk(flow, child, module, ret_slot)
+
+# the expression an argument node carries
+fn arg_value(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.kind == "arg" and node.children.len() > 0:
+        return node.children[0]
+    return idx
+
+# a spawned call: its callee when it is a function value, its receiver, and
+# its arguments all reach the new task
+fn flow_spawn(flow: TaskFlow, call_idx: Int, at: String):
+    call := get_node(call_idx)
+    why := "a spawn at " + at
+    for child, i in call.children:
+        if i == 0 and call.kind == "call":
+            if is_function_value_call(flow, call_idx):
+                flow.roots.push(child)
+                flow.root_why.push(why)
+            continue
+        flow.roots.push(arg_value(child))
+        flow.root_why.push(why)
+
+fn flow_call(flow: TaskFlow, idx: Int, module: Int):
+    node := get_node(idx)
+    if node.children.len() == 0:
+        return
+    receiver_tid := c_get_expr_type(node.children[0])
+    if node.kind == "method_call":
+        rkind := get_type_info(receiver_tid).kind
+        if rkind == "channel" and (node.value == "send" or node.value == "try_send") and node.children.len() >= 2:
+            flow.roots.push(arg_value(node.children[1]))
+            flow.root_why.push("a channel send at " + flow.files[module] + ":" + node.line.to_string())
+            return
+        if (rkind == "list" or rkind == "map" or rkind == "set") and STORING_METHODS.contains("," + node.value + ","):
+            slot := path_slot(flow, node.children[0])
+            for child, i in node.children:
+                if i >= 1:
+                    add_flow(flow, slot, arg_value(child))
+            return
+    if is_function_value_call(flow, idx):
+        for child, i in node.children:
+            if i >= 1:
+                add_flow(flow, "u", arg_value(child))
+        return
+    if is_struct_literal(idx):
+        flow_struct_literal(flow, idx)
+        return
+    # a call is resolved only when a function value can flow through it: into
+    # a parameter, or out as its result
+    mut carries := may_hold_function(idx)
+    for child, i in node.children:
+        if i >= 1 and may_hold_function(arg_value(child)):
+            carries = true
+    if not carries:
+        return
+    mut targets: List[Int] := []
+    resolve_call(idx, module, flow.fns, targets)
+    flow.call_targets.insert(idx, targets)
+    for target in targets:
+        mut params: List[Int] := []
+        for child in get_node(target).children:
+            if get_node(child).kind == "param":
+                params.push(child)
+        if node.kind == "method_call":
+            add_flow(flow, "n" + target.to_string(), node.children[0])
+        for child, i in node.children:
+            if i < 1:
+                continue
+            p := param_for_arg(params, child, i - 1)
+            if p >= 0:
+                add_flow(flow, "n" + p.to_string(), arg_value(child))
+
+# whether a call goes through a function value: a closure or a function held
+# in a local, a parameter, a field or an element, rather than a named function
+fn is_function_value_call(flow: TaskFlow, idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "call" or node.children.len() == 0:
+        return false
+    callee := node.children[0]
+    if get_node(callee).kind == "ident":
+        return flow.defs.contains_key(callee) and get_node(flow.defs[callee]).kind != "fn_decl"
+    if called_declaration(idx) >= 0:
+        return false
+    return get_type_info(c_get_expr_type(callee)).kind == "function"
+
+# whether a call builds a struct: its callee names the struct type it returns
+fn is_struct_literal(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "call" or node.children.len() == 0:
+        return false
+    tid := c_get_expr_type(idx)
+    if is_error_type(tid) or get_type_info(tid).kind != "struct":
+        return false
+    callee := get_node(node.children[0])
+    mut name := get_type_name(tid)
+    bracket := name.index_of("[")
+    if bracket >= 0:
+        name = name.substring(0, bracket)
+    return name == callee.value or name.ends_with("." + callee.value)
+
+# the parameter an argument binds: by name for a named argument, else by
+# position, or -1
+fn param_for_arg(params: List[Int], arg: Int, pos: Int) -> Int:
+    an := get_node(arg)
+    if an.kind == "arg" and an.value != "":
+        for p in params:
+            if extract_binding_name(get_node(p).value) == an.value:
+                return p
+        return 0 - 1
+    if pos < params.len():
+        return params[pos]
+    return 0 - 1
+
+# a struct built in a call: each argument flows into its field
+fn flow_struct_literal(flow: TaskFlow, idx: Int):
+    tid := c_get_expr_type(idx)
+    if is_error_type(tid) or get_type_info(tid).kind != "struct":
+        return
+    info := get_type_info(tid)
+    for child, i in get_node(idx).children:
+        if i == 0:
+            continue
+        an := get_node(child)
+        mut fname := ""
+        if an.kind == "arg" and an.value != "":
+            fname = an.value
+        elif i - 1 < info.fields.len():
+            fname = info.fields[i - 1]
+        if fname != "":
+            add_flow(flow, "f" + field_write_key(tid, fname), arg_value(child))
+
+# how a reason reads once a value flows through `slot` on its way to a task
+fn slot_reason(flow: TaskFlow, slot: String, why: String) -> String:
+    mut step := ""
+    if slot.starts_with("n"):
+        idx := parse_slot_index(slot)
+        if flow.param_owner.contains_key(idx):
+            step = "parameter '" + extract_binding_name(get_node(idx).value) + "' of " + flow.param_owner[idx]
+    elif slot.starts_with("f"):
+        step = "field '" + slot_field_name(slot) + "'"
+    elif slot.starts_with("r"):
+        name := get_node(parse_slot_index(slot)).value
+        if name != "":
+            step = "the result of '" + name + "'"
+    if step == "":
+        return why
+    # the steps nearest the closure and the task itself are the useful ones
+    hops := why.split(", then ")
+    if hops.len() >= 3:
+        mut last := hops[hops.len() - 1]
+        if last.starts_with("... "):
+            last = last.substring(4, last.len())
+        return step + ", then " + hops[0] + ", then ... " + last
+    return step + ", then " + why
+
+fn parse_slot_index(slot: String) -> Int:
+    return parse_integer_string(slot.substring(1, slot.len()))
+
+# the field a "f<key>" slot names
+fn slot_field_name(slot: String) -> String:
+    parts := slot.split(".")
+    return parts[parts.len() - 1]
+
+fn mark_slot(flow: TaskFlow, slot: String, why: String):
+    if slot == "" or flow.reaching.contains_key(slot):
+        return
+    flow.reaching.insert(slot, why)
+    # a parameter of a closure, or of a function used as a value, takes the
+    # arguments of every call through a function value
+    if slot.starts_with("n"):
+        idx := parse_slot_index(slot)
+        if flow.lambda_params.contains_key(idx) or (flow.param_fn.contains_key(idx) and flow.value_fns.contains_key(flow.param_fn[idx])):
+            mark_slot(flow, "u", why)
+    if not flow.sources.contains_key(slot):
+        return
+    reason := slot_reason(flow, slot, why)
+    for e in flow.sources[slot]:
+        mark_expr(flow, e, reason)
+
+fn mark_expr(flow: TaskFlow, idx: Int, why: String):
+    if idx < 0 or flow.marked.contains_key(idx):
+        return
+    flow.marked.insert(idx, true)
+    tid := c_get_expr_type(idx)
+    mark_type(flow, tid, why)
+    node := get_node(idx)
+    kind := node.kind
+    # only a function value, or a container of one, is followed back to where
+    # it came from; a struct's function fields were marked by its type. an
+    # untyped expression is followed too, since nothing rules it out.
+    if kind != "lambda" and not is_error_type(tid) and not holds_function_type(tid):
+        return
+    if kind == "lambda":
+        judge_closure(flow, idx, why)
+        return
+    if kind == "ident" or kind == "self":
+        if flow.defs.contains_key(idx):
+            decl := flow.defs[idx]
+            if kind == "self" or not NAMED_DECLS.contains("," + get_node(decl).kind + ","):
+                mark_slot(flow, "n" + decl.to_string(), why)
+        return
+    if kind == "field_access":
+        mark_slot(flow, path_slot(flow, idx), why)
+        return
+    if kind == "index" and node.children.len() >= 1:
+        mark_expr(flow, node.children[0], why)
+        return
+    if kind == "call" or kind == "method_call":
+        if flow.call_targets.contains_key(idx) and flow.call_targets[idx].len() > 0:
+            for target in flow.call_targets[idx]:
+                mark_slot(flow, "r" + target.to_string(), why)
+            return
+        # a call through a function value may return what any closure returns
+        if is_function_value_call(flow, idx):
+            mark_slot(flow, "ru", why)
+            return
+        # a builtin method such as `unwrap` or `get` hands back part of its
+        # receiver or an argument
+        if kind == "method_call":
+            for child in node.children:
+                mark_expr(flow, arg_value(child), why)
+        return
+    if kind == "spawn" or kind == "binding" or kind == "assignment" or kind == "for_stmt" or kind == "while_stmt":
+        return
+    if kind == "block" and node.children.len() > 0:
+        mark_expr(flow, node.children[node.children.len() - 1], why)
+        return
+    for child in node.children:
+        mark_expr(flow, child, why)
+
+# a value of type `tid` crosses to another task: every field of a struct it
+# reaches that holds a function value reaches the task too
+fn mark_type(flow: TaskFlow, tid: Int, why: String):
+    if tid < 0 or is_error_type(tid) or is_none_type(tid):
+        return
+    info := get_type_info(tid)
+    if (info.kind == "optional" or info.kind == "list" or info.kind == "set") and info.inner >= 0:
+        mark_type(flow, info.inner, why)
+        return
+    if info.kind == "map":
+        mark_type(flow, info.value_type, why)
+        return
+    if info.kind == "tuple":
+        for elem in info.elements:
+            mark_type(flow, elem, why)
+        return
+    if (info.kind != "struct" and info.kind != "enum") or flow.crossing.contains_key(tid):
+        return
+    flow.crossing.insert(tid, true)
+    if info.kind == "enum":
+        for payload in info.variant_types:
+            for ptid in payload:
+                mark_type(flow, ptid, why)
+        return
+    for impl_tid in interface_value_implementers(tid):
+        mark_type(flow, impl_tid, why)
+    for fname, i in info.fields:
+        ftid := info.field_types[i]
+        if holds_function_type(ftid):
+            mark_slot(flow, "f" + field_write_key(tid, fname), "a " + get_type_name(tid) + " that reaches " + why)
+        mark_type(flow, ftid, why)
+
+# whether a value of this type is or directly holds a function value
+fn holds_function_type(tid: Int) -> Bool:
+    if tid < 0 or is_error_type(tid):
+        return false
+    info := get_type_info(tid)
+    if info.kind == "function":
+        return true
+    if (info.kind == "optional" or info.kind == "list" or info.kind == "set") and info.inner >= 0:
+        return holds_function_type(info.inner)
+    if info.kind == "map":
+        return holds_function_type(info.value_type)
+    if info.kind == "tuple":
+        for elem in info.elements:
+            if holds_function_type(elem):
+                return true
+    return false
+
+# refuse a closure that reaches another task when it captures a value the
+# handoff rule refuses, and mark what it captures as crossing too
+fn judge_closure(flow: TaskFlow, lam: Int, why: String):
+    if flow.judged.contains_key(lam):
+        return
+    flow.judged.insert(lam, true)
+    mut inside: Map[Int, Bool] := {}
+    collect_subtree(lam, inside)
+    mut captures: List[Int] := []
+    collect_captures(flow, lam, inside, captures)
+    mut reported := false
+    for use in captures:
+        if not reported:
+            mut refusal := capture_refusal(c_get_expr_type(use))
+            if refusal == "" and is_error_type(c_get_expr_type(use)):
+                refusal = declared_collection(flow.defs[use])
+            if refusal != "":
+                reported = true
+                node := get_node(use)
+                mut name := node.value
+                if node.kind == "self":
+                    name = "self"
+                flow.out.push(Diagnostic("error", "E248", "a closure that reaches another task cannot capture '" + name + "' (" + refusal + "), which the scope that made the closure still holds; the closure reaches the task through " + why, flow.lambda_file[lam], node.line, node.col, "build the value inside the closure, hand the task a copy, or keep it in a `guard` block"))
+    for use in captures:
+        mark_expr(flow, use, "a capture of a closure that reaches " + why)
+
+# a generic function's body has no recorded types, so a capture there is judged
+# by its declaration: a parameter or a local annotated as a list, a map or a
+# set, as "a list" and so on, or ""
+fn declared_collection(decl: Int) -> String:
+    node := get_node(decl)
+    if node.kind != "param" and node.kind != "binding":
+        return ""
+    for child in node.children:
+        if get_node(child).kind == "generic_type":
+            name := get_node(child).value
+            if name == "List" or name == "Map" or name == "Set":
+                return "a " + name.to_lower()
+    return ""
+
+fn collect_subtree(idx: Int, out: Map[Int, Bool]):
+    out.insert(idx, true)
+    for child in get_node(idx).children:
+        collect_subtree(child, out)
+
+# the uses under a closure of names declared outside it: locals and
+# parameters of the enclosing function, not module globals or functions
+fn collect_captures(flow: TaskFlow, idx: Int, inside: Map[Int, Bool], out: List[Int]):
+    node := get_node(idx)
+    if (node.kind == "ident" or node.kind == "self") and flow.defs.contains_key(idx):
+        decl := flow.defs[idx]
+        if not inside.contains_key(decl) and not flow.globals.contains_key(decl):
+            if node.kind == "self" or not NAMED_DECLS.contains("," + get_node(decl).kind + ","):
+                out.push(idx)
+    for child in node.children:
+        collect_captures(flow, child, inside, out)

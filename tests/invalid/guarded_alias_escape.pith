@@ -1,0 +1,19 @@
+# a local bound inside `locked` to a guarded list reaches the list, so storing
+# it outside the block keeps a handle after the lock is released (E276)
+struct Box:
+    guard mu:
+        mut items: Map[String, List[String]]
+
+fn outside(b: Box) -> Int:
+    mut kept: List[String] := []
+    locked b.mu:
+        list := b.items["k"]
+        kept = list
+    kept.push("unlocked")
+    return kept.len()
+
+fn main() -> Int!:
+    mut start: Map[String, List[String]] := {}
+    start.insert("k", [])
+    print("{outside(Box(start))}")
+    return 0

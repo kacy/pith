@@ -221,6 +221,13 @@ mut struct_field_writes: Map[String, String] := {}
 # shared_field_errors judges them once the whole program is checked.
 mut shared_field_sites: List[SharedFieldSite] := []
 mut shared_field_site_seen: Map[String, Bool] := {}
+# names bound inside a `locked` block from a guarded value: a local, a loop
+# variable or a pattern binding, by declaration node, with the guarded name it
+# reads. the name reaches the guarded value for the rest of the block.
+mut guarded_aliases: Map[Int, String] := {}
+# whether a function returns one of its parameters, or a path through one, by
+# declaration node
+mut returns_parameter_cache: Map[Int, Bool] := {}
 # argument expressions the checker accepted by widening a plain value into
 # the optional its parameter declares (`f(3)` against `fn f(x: Int?)`).
 # the emitter has no view of a callee's declared parameter types once the
@@ -290,6 +297,8 @@ pub fn initialize_checker(file_path: String):
     struct_field_frozen = {}
     struct_field_weak = {}
     struct_field_writes = {}
+    guarded_aliases = {}
+    returns_parameter_cache = {}
     shared_field_sites = []
     shared_field_site_seen = {}
     locked_paths = []
@@ -2819,6 +2828,9 @@ fn check_holding_call(call_idx: Int, node: Node, scope_id: Int):
                 if pname == root and pi < args.len():
                     source = args[pi]
         mut path := need
+        # an argument is wrapped in an "arg" node, a named one included
+        if source >= 0 and get_node(source).kind == "arg" and get_node(source).children.len() > 0:
+            source = get_node(source).children[0]
         if source >= 0:
             src := locked_path_text(source)
             if src == "":
@@ -7301,7 +7313,8 @@ fn check_field_access_expression(node_idx: Int, node: Node, scope_id: Int) -> In
     report_error("E209", get_type_name(obj_type) + " has no field '" + field_name + "'")
     return TID_ERR
 
-fn parse_integer_string(s: String) -> Int:
+## the non-negative decimal integer a string spells, or -1 when it is empty.
+pub fn parse_integer_string(s: String) -> Int:
     # simple integer parser for tuple field indices
     if s.len() == 0:
         return -1
@@ -8546,7 +8559,7 @@ struct SharedFieldSite:
 # the key a field write is recorded under: the struct's type id, or the
 # declaration for an instance of a generic struct, so a write through any
 # instance counts for all of them
-fn field_write_key(tid: Int, fname: String) -> String:
+pub fn field_write_key(tid: Int, fname: String) -> String:
     if struct_instance_decl_idx.contains_key(tid):
         return "d" + struct_instance_decl_idx[tid].to_string() + "." + fname
     return tid.to_string() + "." + fname
@@ -8651,6 +8664,33 @@ pub fn reassigned_field_of(tid: Int) -> String:
     if found.0 == "":
         return ""
     return "'" + found.0 + "' is reassigned at " + struct_field_writes[found.1]
+
+## why a closure that runs on another task may not capture a value of this
+## type, as a phrase naming the type ("a list", "a Bag whose field ..."), or
+## "" when it may. the capture is held by the scope that made the closure, so
+## it is judged like a held spawn argument: no collection outside a `guard`
+## block, and no counted field that some code reassigns.
+pub fn capture_refusal(tid: Int) -> String:
+    if tid < 0 or is_error_type(tid):
+        return ""
+    kind := get_type_info(tid).kind
+    if kind == "list" or kind == "map" or kind == "set":
+        return "a " + kind
+    mut seen: Map[Int, Bool] := {}
+    path := struct_holds_unguarded_collection(tid, seen)
+    if path != "":
+        return "a " + get_type_name(tid) + " whose field '" + path + "' is a collection outside a `guard` block"
+    reassigned := reassigned_field_of(tid)
+    if reassigned != "":
+        return "a " + get_type_name(tid) + " whose field " + reassigned
+    return ""
+
+## the struct types an interface value type may hold, or [] for any other type
+pub fn interface_value_implementers(tid: Int) -> List[Int]:
+    if tid < 0 or is_error_type(tid) or not is_interface_value_type(tid):
+        mut none_found: List[Int] := []
+        return none_found
+    return interface_implementer_tids(get_type_info(tid).name)
 
 ## the E248 and E276 errors for values shared with another task that reach a
 ## counted field the program reassigns. run once every module is checked,
@@ -9619,11 +9659,19 @@ fn holds_shared_buffer_type(tid: Int) -> Bool:
     mut seen: Map[Int, Bool] := {}
     return struct_holds_unguarded_collection(tid, seen) != ""
 
+# the builtin methods that hand back part of their receiver
+ELEMENT_ACCESSORS := ",get,first,last,unwrap,unwrap_or,expect,values,"
+
+# the expressions that can read a guarded value: a path, or a call that hands
+# back part of a guarded argument
+fn reads_through_path(idx: Int) -> Bool:
+    kind := get_node(idx).kind
+    return kind == "ident" or kind == "field_access" or kind == "index" or kind == "method_call" or kind == "call"
+
 # the guarded name a path reads, when the path reads a guarded field or a
 # guarded global and its value holds a shared buffer, or ""
 fn escaping_guarded_read(idx: Int) -> String:
-    node := get_node(idx)
-    if node.kind != "ident" and node.kind != "field_access" and node.kind != "index":
+    if not reads_through_path(idx):
         return ""
     if not holds_shared_buffer_type(c_get_expr_type(idx)):
         return ""
@@ -9634,10 +9682,14 @@ fn guarded_segment(idx: Int) -> String:
     node := get_node(idx)
     if node.kind == "ident":
         if definition_of.contains_key(idx):
+            if guarded_aliases.contains_key(definition_of[idx]):
+                return guarded_aliases[definition_of[idx]]
             decl := get_node(definition_of[idx])
             if decl.kind == "binding" and guard_of_value(decl.value) != "":
                 return node.value
         return ""
+    if node.kind == "method_call" or node.kind == "call":
+        return guarded_call_segment(idx)
     if node.kind == "field_access" and node.children.len() >= 1:
         tid := c_get_expr_type(node.children[0])
         if not is_error_type(tid) and struct_field_guards.contains_key(tid.to_string() + "." + node.value):
@@ -9646,6 +9698,84 @@ fn guarded_segment(idx: Int) -> String:
     if node.kind == "index" and node.children.len() >= 1:
         return guarded_segment(node.children[0])
     return ""
+
+# the guarded name a call's result reads: a builtin accessor such as `get` or
+# `unwrap` on a guarded receiver, or a function that returns one of its
+# parameters given a guarded argument. a copy (`copy_list`) returns no
+# parameter, so its result is not guarded.
+fn guarded_call_segment(idx: Int) -> String:
+    node := get_node(idx)
+    decl := called_declaration(idx)
+    if decl < 0:
+        if node.kind == "method_call" and node.children.len() > 0 and ELEMENT_ACCESSORS.contains("," + node.value + ","):
+            return guarded_segment(node.children[0])
+        return ""
+    if get_node(decl).kind != "fn_decl" or not returns_parameter(decl):
+        return ""
+    for child, i in node.children:
+        if i == 0 and node.kind == "call":
+            continue
+        mut arg := child
+        if get_node(arg).kind == "arg" and get_node(arg).children.len() > 0:
+            arg = get_node(arg).children[0]
+        found := guarded_segment(arg)
+        if found != "":
+            return found
+    return ""
+
+# whether a function returns a parameter, `self`, or a path through one
+fn returns_parameter(decl: Int) -> Bool:
+    if returns_parameter_cache.contains_key(decl):
+        return returns_parameter_cache[decl]
+    returns_parameter_cache.insert(decl, false)
+    found := returns_parameter_in(get_node(decl), decl)
+    returns_parameter_cache.insert(decl, found)
+    return found
+
+fn returns_parameter_in(node: Node, decl: Int) -> Bool:
+    if node.kind == "lambda":
+        return false
+    if node.kind == "return" and node.children.len() > 0:
+        root := path_root_node(node.children[0])
+        if root >= 0 and definition_of.contains_key(root):
+            target := definition_of[root]
+            if target == decl or get_node(target).kind == "param":
+                return true
+    for child in node.children:
+        if returns_parameter_in(get_node(child), decl):
+            return true
+    return false
+
+# the ident or `self` at the root of `a`, `a.f` or `a[k]`, or -1
+fn path_root_node(idx: Int) -> Int:
+    node := get_node(idx)
+    if node.kind == "ident" or node.kind == "self":
+        return idx
+    if (node.kind == "field_access" or node.kind == "index") and node.children.len() >= 1:
+        return path_root_node(node.children[0])
+    return 0 - 1
+
+# a name bound inside a `locked` block from a guarded value reaches it for the
+# rest of the block: a local bound to it, a loop variable over it, or a
+# pattern binding of it
+fn note_guarded_alias_at(idx: Int, node: Node):
+    if node.kind == "binding" and node.children.len() > 0:
+        name := guarded_segment(node.children[node.children.len() - 1])
+        if name != "":
+            guarded_aliases.insert(idx, name)
+    elif node.kind == "for_stmt" and node.children.len() >= 3:
+        name := guarded_segment(node.children[0])
+        if name != "":
+            guarded_aliases.insert(node.children[2], name)
+    elif (node.kind == "if_let" or node.kind == "while_let") and node.children.len() >= 2:
+        name := guarded_segment(node.children[1])
+        if name != "":
+            alias_pattern(node.children[0], name)
+
+fn alias_pattern(idx: Int, name: String):
+    guarded_aliases.insert(idx, name)
+    for child in get_node(idx).children:
+        alias_pattern(child, name)
 
 # walk a function body, checking each `locked` block's body for a guarded
 # handle that leaves it
@@ -9672,10 +9802,14 @@ fn report_escape(at: Int, name: String, how: String):
 
 fn check_escape_sites(idx: Int, inner: Map[String, Bool], locked_idx: Int, fn_body: Int, block: Int):
     node := get_node(idx)
+    note_guarded_alias_at(idx, node)
     if node.kind == "assignment" and node.children.len() >= 2:
         name := escaping_guarded_read(node.children[1])
         target := get_node(node.children[0])
-        if not block_replaces(block, node.children[1]) and (target.kind != "ident" or not inner.contains_key(target.value)):
+        # storing a guarded value back under the same guard keeps it there
+        source := guarded_segment(node.children[1])
+        stays := source != "" and guarded_segment(node.children[0]) == source
+        if not stays and not block_replaces(block, node.children[1]) and (target.kind != "ident" or not inner.contains_key(target.value)):
             if name != "":
                 report_escape(node.children[1], name, "this stores its value where it outlives the block")
             else:
@@ -9717,8 +9851,7 @@ fn assigns_path(idx: Int, path: String, read_idx: Int) -> Bool:
 # a guarded read leaving its block whose value holds no collection may still
 # reach a reassigned field, which shared_field_errors judges later
 fn note_guarded_escape(idx: Int, how: String):
-    kind := get_node(idx).kind
-    if kind != "ident" and kind != "field_access" and kind != "index":
+    if not reads_through_path(idx):
         return
     name := guarded_segment(idx)
     if name != "":

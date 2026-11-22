@@ -932,7 +932,8 @@ on that buffer.
 the rule: **do not share a mutable collection across tasks — pass data
 through a channel instead.** the checker enforces it at a `spawn`
 argument and a channel send (E248), for a collection and for a struct whose
-fields reach one outside a `guard` block, and for a global through the
+fields reach one outside a `guard` block, for a closure that can reach
+another task and captures such a value, and for a global through the
 sharing rule (E309).
 
 the field itself is a pointer too. reassigning a field that holds a counted

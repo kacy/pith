@@ -377,12 +377,18 @@ impl KeySet:
 # storing new text drops the entry, and a parse only stores its result if the
 # text it read is still current. nothing changes a key set once it is stored
 # here, and `Cache.keys` gives callers their own copy, so tasks can share one.
+# the set is held `frozen` in a StoredKeys, which is what lets a verify read it
+# after the lock is released.
+
+# a parsed key set as the cache stores it. nothing changes it once it is built.
+struct StoredKeys:
+    frozen set: KeySet
 
 guard jwks_mu:
     mut next_cache_handle := 1
     mut cached_document: Map[Int, String] := {}
     mut cached_at: Map[Int, Int] := {}
-    mut parsed_keys: Map[Int, KeySet] := {}
+    mut parsed_keys: Map[Int, StoredKeys] := {}
     mut refreshed_at: Map[Int, Int] := {}
 
 # a key set fetched from `url` and kept for a while. build one at startup and
@@ -444,23 +450,23 @@ impl Cache:
     fn keys() -> KeySet!:
         shared := self.shared_keys()!
         mut copied: List[Key] := []
-        for key in shared.keys:
+        for key in shared.set.keys:
             copied.push(key)
         return KeySet(copied)
 
     # the key set every verify reads. `keys` hands callers a copy, so nothing
     # outside this module can change what later verifies accept.
-    fn shared_keys() -> KeySet!:
+    fn shared_keys() -> StoredKeys!:
         locked jwks_mu:
             if parsed_keys.contains_key(self.handle) and time.unix() - cached_at[self.handle] < self.ttl_v:
                 held := parsed_keys[self.handle]
                 return held
         text := self.document(false)!
-        set := parse(text)!
+        stored := StoredKeys(parse(text)!)
         locked jwks_mu:
             if cached_document.contains_key(self.handle) and cached_document[self.handle] == text:
-                parsed_keys.insert(self.handle, set)
-        return set
+                parsed_keys.insert(self.handle, stored)
+        return stored
 
     # fetch now, whatever the ttl says, and return what came back. reach for
     # it when something outside told you the issuer rotated.
@@ -473,7 +479,7 @@ impl Cache:
     # a stream of invented `kid`s becomes a stream of refusals rather than a
     # stream of requests at the issuer.
     fn verify(token: String, options: jwt.Options) -> jwt.Verified!:
-        set := self.shared_keys()!
+        set := self.shared_keys()!.set
         kid := token_kid(token)
         if kid.len() == 0 or set.has(kid):
             return set.verify_named(kid, token, options)!

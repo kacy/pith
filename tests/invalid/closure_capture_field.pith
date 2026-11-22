@@ -1,0 +1,16 @@
+# the closure reaches the task as a field of a struct handed to it (E248)
+struct Job:
+    f: fn() -> Int
+
+fn run(j: Job) -> Int:
+    return j.f()
+
+fn main() -> Int!:
+    mut counts: Map[String, Int] := {}
+    work := fn() -> Int:
+        counts.insert("task", 1)
+        return counts.len()
+    t := spawn run(Job(f: work))
+    counts.insert("main", 2)
+    print("{await t}")
+    return 0

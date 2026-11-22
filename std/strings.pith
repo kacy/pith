@@ -387,6 +387,23 @@ pub fn split_n(s: String, sep: String, max_splits: Int) -> List[String]:
     result.push(s.substring(start, s.len()))
     return result
 
+# splits `s` on every occurrence of `sep`, preserving empty segments on
+# leading, trailing, or consecutive separators (unlike String.split, which drops them).
+pub fn split_keep_empty(s: String, sep: String) -> List[String]:
+    if sep.len() == 0:
+        return [s]
+
+    mut result: List[String] := []
+    mut start := 0
+    while true:
+        found := index_of_from(s, sep, start)
+        if found < 0:
+            break
+        result.push(s.substring(start, found))
+        start = found + sep.len()
+    result.push(s.substring(start, s.len()))
+    return result
+
 fn partition_at(s: String, sep: String, pos: Int) -> List[String]:
     if sep.len() == 0 or pos < 0:
         return [s, "", ""]
@@ -792,3 +809,13 @@ test "split_n stops after max_splits and keeps empty fields":
     assert_eq(split_n("é.ü", ".", 3).join("|"), "é|ü")
     assert_eq(split_n("a.b", ".", 0).join("|"), "a.b")
     assert_eq(split_n("a.b", "", 3).join("|"), "a.b")
+
+test "split_keep_empty preserves leading, trailing, and consecutive empty fields":
+    assert_eq(split_keep_empty("a,,b", ",").join("|"), "a||b")
+    assert_eq(split_keep_empty(",a,", ",").join("|"), "|a|")
+    assert_eq(split_keep_empty(",", ",").len(), 2)
+    assert_eq(split_keep_empty("", ",").len(), 1)
+    assert_eq(split_keep_empty("", ",")[0], "")
+    assert_eq(split_keep_empty("a----b", "--").join("|"), "a||b")
+    assert_eq(split_keep_empty("abc", ",").join("|"), "abc")
+    assert_eq(split_keep_empty("a,b", "").join("|"), "a,b")

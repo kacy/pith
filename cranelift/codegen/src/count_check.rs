@@ -924,8 +924,13 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 *n -= 1;
                 // a plain release frees the shell alone and its payloads pass
                 // to whoever read them out; an emitted release helper drops
-                // them with it
-                if *n == 0 && st.shells.contains(&o) && !is_emitted_release(why) {
+                // them with it, and the emitted unshare hands the box on with
+                // its payload still in it
+                if *n == 0
+                    && st.shells.contains(&o)
+                    && !is_emitted_release(why)
+                    && !is_emitted_unshare(why)
+                {
                     let prefix = format!("{o}:");
                     let readers: Vec<String> = st
                         .field_of
@@ -1234,7 +1239,10 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             st.regs.insert(dst.to_string(), Val::Plain);
             return Ok(());
         }
-        if callee == "pith_struct_set_dtor" {
+        // a null destructor clears one (`ir_emit_clear_result_box_dtor`) and
+        // leaves the shell as it was
+        let dtor_cleared = args.get(1).is_some_and(|a| self.val(st, a) == Val::Null);
+        if callee == "pith_struct_set_dtor" && !dtor_cleared {
             if let Some(Val::Obj(o)) = args.first().map(|a| self.val(st, a)) {
                 // the destructor releases the fields from now on, so freeing
                 // the struct hands nobody a payload's count
@@ -1991,6 +1999,65 @@ endfunc
         // without the retain the helper takes a count the function never had
         let r = check(&UNSHARE_RETURN.replace("call 4 pith_struct_retain void 1 3\n", ""));
         assert_eq!(r.failed, 1, "{:?}", r);
+    }
+
+    // a local box whose `ok` was read, then returned through the unshare: the
+    // payload leaves inside the box, so the read is handed no count
+    const UNSHARE_AFTER_OK_READ: &str = "
+func kept 1 tuple
+param i
+call 1 mk_pair tuple 1 i
+store pf 1
+load 2 pf
+field 3 2 8 tuple ok
+field 4 3 8 string 1
+call 5 pith_print_cstr unknown 1 4
+load 6 pf
+call 7 __result_unshare_ps_m0 tuple 1 6
+ret 7
+mark kind i int
+mark kind pf tuple
+mark owns pf tuple
+endfunc
+func mk_pair 1 tuple
+param i
+iconst 1 3
+call 2 pith_struct_alloc struct:tuple 1 1
+ret 2
+endfunc
+";
+
+    #[test]
+    fn the_unshare_hands_the_payload_on_inside_the_box() {
+        let r = check(UNSHARE_AFTER_OK_READ);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    // clearing a box's destructor (a null one) leaves it a shell: freeing it
+    // still hands the read payload to the reader, who must give it up
+    const DTOR_CLEARED: &str = "
+func take 1 string
+param i
+call 1 mk tuple 1 i
+field 2 1 8 string ok
+iconst 3 0
+call 4 pith_struct_set_dtor void 2 1 3
+call 5 pith_struct_release void 1 1
+ret 2
+mark kind i int
+endfunc
+func mk 1 tuple
+param i
+iconst 1 3
+call 2 pith_struct_alloc struct:tuple 1 1
+ret 2
+endfunc
+";
+
+    #[test]
+    fn a_cleared_destructor_leaves_the_box_a_shell() {
+        let r = check(DTOR_CLEARED);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
     }
 
     #[test]

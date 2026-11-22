@@ -52,6 +52,10 @@ error[E200]: return type mismatch: expected Int, got none
   fix: return a value, or declare the return type Int?
 ```
 
+a function declared `-> T?!` (the same type as `(T?)!`) accepts a plain `T`,
+`none` or a `T?` as its ok value: `return name` with `name: String` widens to
+`Some(name)` inside the ok result, the way it does in a `-> T?` function.
+
 ### E201 — undefined variable
 
 a variable or function name was used but never defined.

@@ -2860,6 +2860,22 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
             return
     ir_rc_release_reg(r, kind)
 
+# a result local that owns its payload (ir_tuple_record_tid kept its type) but
+# failed the cascade walk, because some use may share the box. at the
+# function's exit it drops its count the way a fresh argument does: the
+# payload goes with the box when this count is the last, and stays with the
+# other holder otherwise. a plain release freed the shell alone and leaked
+# the payload whenever nothing had given the box a destructor (a box handed
+# to a closure). a rebind keeps the plain release: an alias of the old
+# payload may still be read after it.
+fn ir_result_local_releases_by_count(kind: String, name: String) -> Bool:
+    if kind != "tuple" or ir_tuple_cascade_names.contains(name) or ir_stack_tuple_names.contains(name):
+        return false
+    if not ir_tuple_local_tid.contains_key(name):
+        return false
+    tid := ir_tuple_local_tid[name]
+    return tid >= 0 and get_type_info(tid).kind == "result" and ir_tuple_local_has_rc_payload(tid)
+
 # whether a bare-name assignment writes a module-level global's slot. that
 # slot owns a count on whatever it holds. nothing else releases it, not the
 # function's exit cleanup (globals are not locals) and not the store itself,
@@ -3094,6 +3110,7 @@ fn ir_emit_result_unshare_helpers():
         copy_l := ir_label()
         ir_emit("brif " + sole_r.to_string() + " " + keep_l + " " + copy_l)
         ir_emit_label(keep_l)
+        ir_emit_clear_result_box_dtor(pr)
         ir_emit("ret " + pr.to_string())
         ir_emit_label(copy_l)
         size_r := ir_reg()
@@ -3129,6 +3146,15 @@ fn ir_emit_result_unshare_helpers():
         ir_emit("ret " + copy_r.to_string())
         ir_emit("endfunc")
 
+# a box handed to a caller as its sole owner must not carry the payload
+# destructor an earlier share gave it (the unshare above, or a holder's
+# ir_attach_result_box_dtor): the caller takes the payload's count over and
+# frees the shell, and the destructor would release the payload under it.
+fn ir_emit_clear_result_box_dtor(box_r: Int):
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit_call2(ir_reg(), "pith_struct_set_dtor", "void", box_r, zero_r)
+
 # release every rc local the function owns before a return, minus `exclude`,
 # the one being returned (its count transfers to the caller). the prologue
 # zero-stores each tracked name, so the loads are valid on every path.
@@ -3144,7 +3170,10 @@ fn ir_emit_rc_cleanup(exclude: String):
         if name != exclude and ir_rc_release_enabled(kind):
             r := ir_reg()
             ir_emit_local_slot_load(r, name)
-            ir_rc_release_local(r, kind, name)
+            if ir_result_local_releases_by_count(kind, name):
+                ir_emit_result_box_release(r, ir_tuple_local_tid[name])
+            else:
+                ir_rc_release_local(r, kind, name)
         i = i + 1
     # a kinded local releases what the last binding on the path taken left in
     # its slot, under the kind that binding recorded. a return never
@@ -4906,8 +4935,8 @@ fn ir_kind_is_owned_optional_payload(kind: String) -> Bool:
 # build a Some that owns its payload. the payload arrives owned either way: a
 # fresh value carries its own count, and a borrowed one is retained here to pair
 # with the destructor's release.
-fn ir_emit_owned_some_taking(value_r: Int, val_idx: Int, payload_kind: String, dtor_kind: String) -> Int:
-    if ir_expr_is_borrowed(val_idx):
+fn ir_emit_owned_some_taking(value_r: Int, val_idx: Int, payload_kind: String, dtor_kind: String, retain_borrowed: Bool) -> Int:
+    if retain_borrowed and ir_expr_is_borrowed(val_idx):
         ir_rc_retain_reg(value_r, payload_kind)
     return ir_emit_optional_owned_some(value_r, dtor_kind)
 
@@ -4945,22 +4974,29 @@ fn ir_emit_optional_for_target(val_idx: Int, vn: Node, target_inner: String) -> 
             if ir_expr_is_borrowed(val_idx):
                 ir_rc_retain_reg(value_r, "tuple")
             return value_r
+    return ir_emit_some_over(value_r, val_idx, true)
+
+# build the Some for a value widening into an optional. the shell owns a heap
+# payload; `retain_borrowed` says whether a borrowed value still needs its own
+# count, which a return site has already taken.
+fn ir_emit_some_over(value_r: Int, val_idx: Int, retain_borrowed: Bool) -> Int:
+    actual_tid := c_get_expr_type(val_idx)
     # an optional handed to a deeper optional (`x: Int?` into an `Int??`): the
     # inner shell is the payload, and the outer shell owns it the way it owns
     # a tuple payload. the checker's record brought the value here; without it
     # the kind test above called the inner shell the outer one (#1051).
     if actual_tid >= 0 and get_type_info(actual_tid).kind == "optional":
         ir_optional_tuple_dtor_needed = true
-        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", "tuple")
+        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", "tuple", retain_borrowed)
     payload_kind := ir_rc_kind(ir_infer_type(val_idx))
     if ir_kind_is_owned_optional_payload(payload_kind):
-        return ir_emit_owned_some_taking(value_r, val_idx, payload_kind, payload_kind)
+        return ir_emit_owned_some_taking(value_r, val_idx, payload_kind, payload_kind, retain_borrowed)
     # a genuine tuple payload owns whatever its elements hold. the signature
     # names the destructor emitted for that shape, and is "" for anything that
     # is not a tuple, so it decides on its own.
     tuple_kind := ir_optional_tuple_payload_kind(actual_tid)
     if tuple_kind.len() > 0:
-        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", tuple_kind)
+        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", tuple_kind, retain_borrowed)
     return ir_emit_optional_some_value(value_r)
 
 fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inner: String) -> Int:
@@ -10323,11 +10359,10 @@ fn ir_emit_try_expr(node: Node) -> Int:
                     ir_emit("iconst " + zero_flag2_r.to_string() + " 0")
                     ir_emit("ret2 " + zero_flag2_r.to_string() + " " + err_r.to_string())
                 else:
-                    fresh_err_r := ir_emit_err_result_tuple(err_r)
                     ir_defer_emit_to_function_frame(true)
                     ir_emit_rc_cleanup("")
                     ir_emit_main_error_report(err_r, err_kind == "string")
-                    ir_emit("ret " + fresh_err_r.to_string())
+                    ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
             elif ir_current_func_return_kind == "result_reg":
                 # the enclosing function returns the pair: take the error out
                 # of the owned box, free the shell, and propagate via ret2.
@@ -10345,9 +10380,9 @@ fn ir_emit_try_expr(node: Node) -> Int:
                 ir_defer_emit_to_function_frame(true)
                 ir_emit_rc_cleanup("")
                 if ir_emitting_main_body:
-                    report_err_r := ir_emit_result_value_field(val_r, operand_tid, "err")
-                    ir_emit_main_error_report(report_err_r, ir_rc_kind(ir_result_field_kind(operand_tid, "err")) == "string")
-                ir_emit("ret " + val_r.to_string())
+                    ir_emit_main_box_error_exit(val_r, operand_tid)
+                else:
+                    ir_emit("ret " + val_r.to_string())
             ir_emit_label(merge_l)
             return decoded_r
         mut cond_r := val_r
@@ -10415,11 +10450,10 @@ fn ir_emit_try_pair(operand_idx: Int, flag_r: Int, val_r: Int) -> Int:
         ir_emit("iconst " + zero_r.to_string() + " 0")
         ir_emit("ret2 " + zero_r.to_string() + " " + val_r.to_string())
     else:
-        fresh_err_r := ir_emit_err_result_tuple(val_r)
         ir_defer_emit_to_function_frame(true)
         ir_emit_rc_cleanup("")
         ir_emit_main_error_report(val_r, ir_rc_kind(ir_result_field_kind(operand_tid, "err")) == "string")
-        ir_emit("ret " + fresh_err_r.to_string())
+        ir_emit("ret " + ir_emit_err_result_tuple(val_r).to_string())
     ir_emit_label(merge_l)
     return val_r
 
@@ -10460,11 +10494,12 @@ fn ir_emit_fail_expr(node: Node) -> Int:
             ir_emit("iconst " + zero_r.to_string() + " 0")
             ir_emit("ret2 " + zero_r.to_string() + " " + err_r.to_string())
         else:
-            tuple_r := ir_emit_err_result_tuple(err_r)
             ir_defer_emit_to_function_frame(true)
             ir_emit_rc_cleanup(exclude)
+            # main's report ends the process, so the box is built after it:
+            # one built first was still live at the exit
             ir_emit_main_error_report(err_r, ir_infer_type(node.children[0]) == "string")
-            ir_emit("ret " + tuple_r.to_string())
+            ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
     elif ir_current_func_return_kind == "result_reg":
         ir_defer_emit_to_function_frame(true)
         ir_emit_rc_cleanup("")
@@ -11248,13 +11283,22 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         return ir_emit_field_access(idx, node, obj_r)
     return ir_emit_field_access(idx, node, 0 - 1)
 
-fn ir_emit_await_expr(node: Node) -> Int:
+fn ir_emit_await_expr(idx: Int, node: Node) -> Int:
     if node.children.len() == 0:
         return ir_zero_reg()
     task_r := ir_expr(node.children[0])
     r := ir_reg()
-    ir_emit_call1(r, "await", "unknown", task_r)
+    ir_emit_call1(r, "await", ir_await_retkind(idx), task_r)
     return r
+
+# the kind an await's value is typed with. a task returning a result hands
+# back its box, typed `tuple` so the count checker sees the box it opens.
+# anything else stays `unknown`, which the backend treats as a plain i64.
+fn ir_await_retkind(idx: Int) -> String:
+    tid := c_get_expr_type(idx)
+    if tid >= 0 and get_type_info(tid).kind == "result":
+        return "tuple"
+    return "unknown"
 
 # release a result's error value when it is being discarded. the result
 # tuple is a shell with no destructor, so releasing the tuple frees only
@@ -11488,7 +11532,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_spawn_expr(node)
 
     if kind == "await":
-        return ir_emit_await_expr(node)
+        return ir_emit_await_expr(idx, node)
 
     if kind == "unwrap":
         return ir_emit_optional_unwrap(node)
@@ -11575,10 +11619,12 @@ pub fn ir_emit_return_value(expr_child: Int):
     mut exclude := ""
     expr_node := get_node(expr_child)
     result_kind := ir_expr_result_kind(expr_child)
+    # a plain value widening into a `T?!` payload (check_return_statement)
+    widened_payload := ir_current_func_optional_inner_kind.len() == 0 and c_argument_widens_to_optional(expr_child)
     # a whole result returned under the register abi leaves as its payload,
     # not as the box, so a borrowed box takes its count on the payload
     # instead of on the shell (see ir_emit_return_box_as_pair).
-    pair_forward := ir_current_func_return_kind == "result_reg" and result_kind == "tuple"
+    pair_forward := ir_current_func_return_kind == "result_reg" and result_kind == "tuple" and not widened_payload
     mut pair_source := "fresh"
     # a box returned whole that someone else may also hold (see
     # ir_emit_result_box_unshare)
@@ -11608,6 +11654,12 @@ pub fn ir_emit_return_value(expr_child: Int):
     mut expr_kind := ""
     if expr_tid >= 0:
         expr_kind = get_type_info(expr_tid).kind
+    if widened_payload:
+        # a plain value returned from a `T?!` function: the checker recorded
+        # it widening into the ok type, so the Some goes inside the ok box.
+        # the value is owned by now (see `exclude` and the retain above).
+        r = ir_emit_some_over(r, expr_child, false)
+        expr_kind = "optional"
     if ir_current_func_optional_inner_kind.len() > 0:
         # is the returned expression already an optional (so forward it),
         # or the inner value (so wrap in Some)? the checker knows in the
@@ -11659,6 +11711,9 @@ pub fn ir_emit_return_value(expr_child: Int):
                 r = ir_emit_optional_owned_some(r, ret_payload_kind)
             else:
                 r = ir_emit_optional_some_value(r)
+    elif ir_current_func_return_kind == "tuple" and ir_emitting_main_body and ir_current_func_returns_result:
+        ir_emit_main_result_return(r, expr_node.kind == "none_lit", ir_return_forwards_result(expr_kind, result_kind), expr_tid, exclude)
+        return
     elif ir_current_func_return_kind == "tuple":
         # a result return: forward a whole result, wrap anything else as the
         # ok payload. the checker can only have accepted `return none` here
@@ -11689,6 +11744,47 @@ pub fn ir_emit_return_value(expr_child: Int):
     ir_emit_rc_cleanup(exclude)
     ir_emit("ret " + r.to_string())
     ir_last_was_ret = true
+
+# a return from `fn main() -> T!`. the entry glue exits 0 and drops what main
+# returns, so main settles its result here instead of building a box nobody
+# frees: a forwarded result that holds an error is reported, and
+# pith_main_error_exit ends the process with status 1; otherwise the value is
+# released. `return f()` with a failing `f` used to exit 0 without a word.
+fn ir_emit_main_result_return(r: Int, is_none: Bool, forwards: Bool, expr_tid: Int, exclude: String):
+    ir_defer_emit_to_function_frame(false)
+    ir_emit_rc_cleanup(exclude)
+    if forwards:
+        ok_l := ir_label()
+        err_l := ir_label()
+        flag_r := ir_emit_result_flag_field(r, "is_ok")
+        ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit_label(err_l)
+        ir_emit_main_box_error_exit(r, expr_tid)
+        ir_emit_label(ok_l)
+        ir_emit_result_box_release(r, expr_tid)
+    elif not is_none:
+        ok_kind := ir_result_payload_rc_kind(0 - 1, "ok")
+        if ok_kind.len() > 0:
+            ir_rc_release_reg(r, ok_kind)
+    ir_emit_main_zero_ret()
+    ir_last_was_ret = true
+
+# main's exit through a result box that holds an error, owned by this frame.
+# the error outlives the box it came in, so the box goes first and nothing
+# but the error is live when the report ends the process.
+fn ir_emit_main_box_error_exit(box_r: Int, box_tid: Int):
+    err_r := ir_emit_result_value_field(box_r, box_tid, "err")
+    err_kind := ir_rc_kind(ir_result_field_kind(box_tid, "err"))
+    ir_rc_retain_reg(err_r, err_kind)
+    ir_emit_result_box_release(box_r, box_tid)
+    ir_emit_main_error_report(err_r, err_kind == "string")
+    ir_rc_release_reg(err_r, err_kind)
+    ir_emit_main_zero_ret()
+
+fn ir_emit_main_zero_ret():
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("ret " + zero_r.to_string())
 
 # whether a value returned from a function declared `-> T!` is already the
 # result (forward it) or its ok payload (wrap it). the ir result kind cannot
@@ -11814,6 +11910,9 @@ fn ir_emit_pair_payload_return(box_r: Int, slot: String, kind: String, source: S
         ir_rc_retain_reg(val_r, kind)
         ir_emit_pair_ret(box_r, true, flag, val_r)
         ir_emit_label(take_l)
+        # the payload leaves with the box's count, so the shell is freed
+        # without the destructor a share may have given it
+        ir_emit_clear_result_box_dtor(box_r)
     elif source == "borrowed":
         ir_rc_retain_reg(val_r, kind)
         ir_emit_pair_ret(box_r, false, flag, val_r)
@@ -12608,8 +12707,10 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
     if node.kind == "grouped" and node.children.len() > 0:
         return ir_optional_subject_is_owned(node.children[0])
     kind := node.kind
-    # a weak read's shell owns the count its upgrade took (ir_emit_weak_read)
-    if kind == "await" or ir_node_is_weak_field_read(idx):
+    # a weak read's shell owns the count its upgrade took (ir_emit_weak_read),
+    # and a catch hands out an owned value on both arms (ir_emit_catch_expr):
+    # `(f() catch none).unwrap_or(d)` left that shell behind
+    if kind == "await" or kind == "catch_expr" or kind == "catch_block" or ir_node_is_weak_field_read(idx):
         return true
     if kind != "call" and kind != "method_call":
         return false

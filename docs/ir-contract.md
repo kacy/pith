@@ -292,7 +292,10 @@ one count, the ok value's or the error's, and a plain ok payload holds it
 only when the flag is clear. it reads a result box's `ok` or `err` slot as a
 payload the box hands over when it is freed, an optional's `optval` as a
 field read, and a channel receive's flag as a null test that follows the
-value into locals.
+value into locals. a box passed to the emitted unshare keeps its payload,
+and so does one released through an emitted release helper; a destructor
+set to null leaves the box a shell. an `await` of a task returning `T!` is
+typed `tuple`, so the box it hands back is counted like a call's.
 
 the checker was tested by mutation: delete one release, or duplicate one, in
 a function it balances, and see whether it flags that function. on
@@ -379,9 +382,17 @@ nothing else holds the box. so a function that returns the box itself (the
 box abi, which generic functions and interface impls always use) and returns
 a box it does not fully own (a parameter, a field, an element, or a local
 whose count is shared) passes it through `__result_unshare_<ok><err>`. that
-helper returns the same box when the caller's count is the only one.
-otherwise it returns a fresh box holding its own count on the live payload,
-and drops the count on the shared box.
+helper returns the same box when the caller's count is the only one, with
+its destructor cleared. otherwise it returns a fresh box holding its own
+count on the live payload, gives the shared box the payload destructor, and
+drops the count on it. the register return clears the destructor the same
+way when a local's box is its own and the payload leaves with its count.
+
+**main's result.** the entry glue exits 0 and ignores what `main` returns,
+so a `fn main() -> T!` settles its result before the `ret`: it releases an
+ok value, and a returned result that holds an error is reported through
+`pith_main_error_exit`, which exits with status 1. a `fail` or a `!` in main
+reports the same way, before any box is built.
 
 **optional encoding.** a `T?` is the null pointer when it is none. a Some is
 a two-slot struct allocation holding 1 at offset 0 and the payload at offset

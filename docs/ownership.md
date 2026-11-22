@@ -632,7 +632,15 @@ gaps, all bounded leaks rather than dangling pointers:
   map value) is built from that recorded type rather than from the
   holder's container kind alone, and a target that is an optional
   container (`m: Map[String, String]?`, `return {}` from a
-  `-> Set[String]?`) records the container inside it. the safety net for
+  `-> Set[String]?`) records the container inside it. the same recorded
+  type reaches an empty literal nested in a returned literal
+  (`return [{}]`), a tuple element (`({}, 1)`) and a generic function's
+  argument. a generic struct built as `Bag()` takes its instance from the
+  place it is stored into, so its `= {}` and `= []` defaults are built
+  from that instance's field types, inside a generic body too; with no
+  such place the constructor is refused (E222), and a generic struct's
+  field default that names a type parameter must be one an instance can
+  build from its own field type (E317). the safety net for
   anything that still slips through is the store: an untagged list or map
   handed a container, struct, `Bytes` or closure adopts that kind at the
   first store and owns it from then on. string values are the one kind
@@ -641,8 +649,10 @@ gaps, all bounded leaks rather than dangling pointers:
   borrowed string put into it, and reads it after its owner frees it.
   `Saved(lists: {})` built exactly that map until the holder path read
   the recorded type. the count checker reports a borrowed counted value
-  stored into a container built untagged in the same function
-  (`check_untagged_stores` in `cranelift/codegen/src/count_check/`).
+  stored into a container built untagged in the same function, and any
+  struct built over an unresolved type parameter (`Bag[<error>]`), whose
+  defaults are stored into elsewhere (`check_untagged_stores` in
+  `cranelift/codegen/src/count_check/`).
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a

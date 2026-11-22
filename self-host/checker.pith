@@ -1081,9 +1081,11 @@ fn register_struct_declaration(node_idx: Int, node: Node):
         report_error_at(node_idx, "E250", "'" + name + "' is a builtin type name and cannot be used as a struct name")
         return
     if declaration_has_generic_params(node):
+        generic_params := collect_generic_parameter_names(node)
         for child in node.children:
             if get_node(child).kind == "field" and guard_of_value(get_node(child).value) != "":
                 report_error_at(node_idx, "E274", "a guard block is not allowed in a generic struct")
+            check_generic_field_default(child, generic_params)
         register_generic_declaration(name, node_idx)
         define_binding_at(current_scope, name, TID_ERR, false, node_idx)
         return
@@ -1124,6 +1126,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
                     check_weak_field(fname, ftid)
                     struct_field_weak.insert(tid.to_string() + "." + fname, true)
                 if cn.children.len() > 1:
+                    note_literal_target(cn.children[1], ftid)
                     default_tid := c_check_expr(cn.children[1], current_scope)
                     # `= {}` takes the field's type, as a constructor argument does
                     if is_error_type(default_tid):
@@ -2762,6 +2765,45 @@ fn optional_inner_or_self(tid: Int) -> Int:
         return info.inner
     return tid
 
+# a generic struct's field default is one expression shared by every
+# instance, and the emitter builds it per instance only when it is an empty
+# `[]` or `{}` into a container field (from the instance's field type) or
+# `none` into an optional one. any other default of a field whose type names
+# a type parameter would carry the one type the declaration gave it into
+# every instance: `b: Bag[T] = Bag()` built a Bag over the error type, whose
+# containers took no count of what was stored into them.
+fn check_generic_field_default(field_idx: Int, generic_params: List[String]):
+    field := get_node(field_idx)
+    if field.kind != "field" or field.children.len() < 2:
+        return
+    type_idx := field.children[0]
+    expr := field.children[1]
+    if not type_node_mentions(type_idx, generic_params):
+        return
+    kind := node_kind(expr)
+    type_kind := node_kind(type_idx)
+    if (kind == "list" or kind == "map" or kind == "set") and node_child_count(expr) == 0 and type_kind == "generic_type":
+        base := node_value(type_idx)
+        if base == "List" or base == "Map" or base == "Set":
+            return
+    if kind == "none_lit" and type_kind == "optional_type":
+        return
+    report_error_with_fix_at(expr, "E317", "the default of field '" + extract_field_name(field.value) + "' names a type parameter, so it must be an empty `[]` or `{{}}` for a container or `none` for an optional", "pass the value when constructing, or build it in a function that returns the struct")
+
+# whether a written type names one of `params`
+fn type_node_mentions(idx: Int, params: List[String]) -> Bool:
+    if idx < 0:
+        return false
+    node := get_node(idx)
+    if node.kind == "type":
+        for p in params:
+            if node.value == p or node.value.starts_with(p + "."):
+                return true
+    for child in node.children:
+        if type_node_mentions(child, params):
+            return true
+    return false
+
 fn is_constant_default(expr: Int) -> Bool:
     kind := node_kind(expr)
     if kind == "int_lit" or kind == "float_lit" or kind == "string_lit" or kind == "bool_lit" or kind == "none_lit":
@@ -3489,6 +3531,8 @@ fn check_assignment(node: Node, scope_id: Int):
             report_error_with_fix("E269", "cannot assign to '" + target_node.value + "' inside a closure: a closure captures a copy, so the variable outside would not change", "return the new value from the closure, or keep the state in a struct field or a collection the closure can update")
             return
     target_type := c_check_expr(target_idx, scope_id)
+    if node.value == "=":
+        note_literal_target(value_idx, target_type)
     val_type := c_check_expr(value_idx, scope_id)
     if target_node.kind == "field_access" and target_node.children.len() >= 1:
         note_field_write(c_get_expr_type(target_node.children[0]), target_node.value, target_idx)
@@ -3610,6 +3654,16 @@ fn check_return_statement(node: Node, scope_id: Int):
                 return
     if actual_node.kind == "none_lit":
         if exp_info.kind == "optional":
+            return
+    # a literal with elements takes the declared type through every nested
+    # literal, as it does under an annotated binding. `return [{}]` from a
+    # `-> List[Map[String, String]]` otherwise built an inner map that took
+    # no count of the strings stored into it.
+    if actual_node.kind == "list" or actual_node.kind == "map" or actual_node.kind == "set":
+        mut literal_target := expected
+        if exp_info.kind == "result":
+            literal_target = exp_info.inner
+        if collection_literal_matches_target(node.children[0], literal_target, scope_id):
             return
     if is_error_type(actual):
         return
@@ -4070,7 +4124,7 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     if node.kind == "set":
         return check_set_expression(node, scope_id)
     if node.kind == "tuple":
-        return check_tuple_expression(node, scope_id)
+        return check_tuple_expression(node_idx, node, scope_id)
     if node.kind == "struct_init":
         return check_struct_initialization(node, scope_id)
     if node.kind == "spawn":
@@ -5159,6 +5213,7 @@ fn check_named_struct_constructor(name: String, struct_tid: Int, info: TypeInfo,
     for fld in info.fields:
         if provided.contains_key(fld):
             expr := provided[fld]
+            note_literal_target(expr, info.field_types[idx])
             arg_type := c_check_expr(expr, scope_id)
             if is_error_type(arg_type):
                 propagate_empty_collection_literal(expr, info.field_types[idx])
@@ -5273,6 +5328,23 @@ fn unify_field_type_against_arg(field_node_idx: Int, arg_tid: Int, generic_param
 # the type of the value a named-field call gives to `fname`, or -1 when
 # the field is not named (it either has a default or the call is invalid,
 # and the concrete constructor check reports that precisely).
+# note each constructor argument's field type in `info` as its target
+fn note_struct_argument_targets(info: TypeInfo, arg_indices: List[Int]):
+    for ai, i in arg_indices:
+        an := get_node(ai)
+        if an.kind != "arg" or an.children.len() == 0:
+            if i < info.field_types.len():
+                note_literal_target(ai, info.field_types[i])
+            continue
+        mut fidx := i
+        if an.value.len() > 0:
+            fidx = 0 - 1
+            for fname, j in info.fields:
+                if fname == an.value:
+                    fidx = j
+        if fidx >= 0 and fidx < info.field_types.len():
+            note_literal_target(an.children[0], info.field_types[fidx])
+
 fn named_arg_type_for_field(arg_indices: List[Int], fname: String, scope_id: Int) -> Int:
     for ai in arg_indices:
         an := get_node(ai)
@@ -5287,6 +5359,17 @@ fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_
     decl_node := get_node(decl_idx)
     generic_params := collect_generic_parameter_names(decl_node)
     named := struct_args_are_named(arg_indices)
+    call_idx := checker_current_node_index()
+    # a parameter no argument fixes, as in `b: Bag[String] := Bag()`, takes
+    # the instance the call is stored into, and the arguments are stored into
+    # that instance's fields. without it the instance named the error type,
+    # and a `m: Map[String, T] = {}` default built a map that took no count
+    # of the strings stored into it.
+    target := generic_struct_target(call_idx, decl_idx)
+    mut target_args: List[Int] := []
+    if target >= 0 and struct_instance_type_args.contains_key(target):
+        target_args = decode_tid_list(struct_instance_type_args[target])
+        note_struct_argument_targets(get_type_info(target), arg_indices)
     # collect field type nodes and names from the declaration, in order.
     mut field_type_nodes: List[Int] := []
     mut field_names: List[String] := []
@@ -5333,11 +5416,18 @@ fn check_generic_struct_constructor(name: String, arg_indices: List[Int], scope_
         return TID_ERR
     # build type_args list in order of generic_params
     mut type_args: List[Int] := []
-    for gp in generic_params:
+    for gp, gi in generic_params:
         if subst_map.contains_key(gp):
             type_args.push(subst_map[gp])
+        elif gi < target_args.len():
+            type_args.push(target_args[gi])
         else:
-            type_args.push(TID_ERR)
+            # an instance over the error type builds its `= {}` and `= []`
+            # defaults as containers that own nothing, so a parameter that
+            # neither an argument nor the target fixes is an error, as it is
+            # for a generic function
+            report_error_with_fix_at(call_idx, "E222", "cannot infer type parameter " + gp + " of '" + name + "' from this constructor", "name the type, as " + name + "[...](), or store the value where its type is declared")
+            return TID_ERR
     # instantiate the struct and reuse the concrete constructor checks
     struct_tid := instantiate_generic_struct_type(decl_idx, type_args)
     if struct_tid < 0:
@@ -5970,6 +6060,10 @@ fn check_generic_function_call(name: String, arg_indices: List[Int], scope_id: I
             if vidx < arg_types.len():
                 concrete := concrete_params[vidx]
                 if is_error_type(concrete) == false:
+                    # an empty literal, or one with an empty literal inside,
+                    # checks as the error type; it takes the parameter's type
+                    # here, as it does for a plain function's argument
+                    propagate_empty_argument_collection_type(arg_indices[vidx], concrete, arg_types[vidx], scope_id)
                     if is_error_type(arg_types[vidx]) == false:
                         if arg_types[vidx] != concrete:
                             if argument_widens_to_optional(argument_expression_index(arg_indices[vidx]), arg_types[vidx], concrete) == false:
@@ -7206,6 +7300,7 @@ fn expect_two_typed_arguments(method: String, args: List[Int], first: Int, secon
 
 fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     expr_idx := argument_expression_index(arg_idx)
+    note_literal_target(expr_idx, expected)
     actual := c_check_expr(expr_idx, scope_id)
     propagate_empty_argument_collection_type(arg_idx, expected, actual, scope_id)
     if is_error_type(actual) == false:
@@ -7227,6 +7322,7 @@ fn check_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
 # rejected as types (E254) before any store or search could ask for widening.
 fn check_widened_argument_type(arg_idx: Int, expected: Int, scope_id: Int):
     expr_idx := argument_expression_index(arg_idx)
+    note_literal_target(expr_idx, expected)
     actual := c_check_expr(expr_idx, scope_id)
     propagate_empty_argument_collection_type(arg_idx, expected, actual, scope_id)
     if is_error_type(actual):
@@ -8218,7 +8314,14 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
         if body_node.kind == "body":
             # short-form lambda: body wraps a single expression
             if body_node.children.len() > 0:
-                ret_type = c_check_expr(body_node.children[0], lambda_scope)
+                value_idx := body_node.children[0]
+                note_literal_target(value_idx, declared_return)
+                ret_type = c_check_expr(value_idx, lambda_scope)
+                # a literal body takes the declared return type, as a return
+                # statement's literal does
+                if declared_return >= 0 and (node_kind(value_idx) == "list" or node_kind(value_idx) == "map" or node_kind(value_idx) == "set"):
+                    if collection_literal_matches_target(value_idx, declared_return, lambda_scope):
+                        ret_type = declared_return
                 if declared_return >= 0:
                     if is_error_type(ret_type) == false and types_structurally_equal(ret_type, declared_return) == false:
                         report_error("E200", "lambda return type mismatch: expected " + get_type_name(declared_return) + ", got " + get_type_name(ret_type))
@@ -8263,13 +8366,64 @@ fn element_type_with_none(elem_type: Int) -> Int:
     return add_type_info(ti_optional(elem_type))
 
 # note the type a value is about to be stored into, when the value is a
-# collection literal (see literal_targets).
+# collection literal or a call that may construct a generic struct (see
+# literal_targets).
 fn note_literal_target(value_idx: Int, target_tid: Int):
     if value_idx < 0 or target_tid < 0:
         return
     kind := node_kind(value_idx)
-    if kind == "list" or kind == "map":
+    if kind == "call" or kind == "method_call":
         literal_targets.insert(value_idx, target_tid)
+        return
+    if kind == "if_expr":
+        for child in get_node(value_idx).children:
+            note_literal_target(child, target_tid)
+        return
+    # an inline `=> expr` arm wraps its value in a body node
+    if kind == "body":
+        if node_child_count(value_idx) > 0:
+            note_literal_target(node_child(value_idx, 0), target_tid)
+        return
+    # each arm's value is the match's value; its last child is the value
+    if kind == "match_expr":
+        for arm_idx in get_node(value_idx).children:
+            arm := get_node(arm_idx)
+            if arm.kind == "arm" and arm.children.len() > 0:
+                note_literal_target(arm.children[arm.children.len() - 1], target_tid)
+        return
+    # a literal's elements are stored into the target's element positions
+    mut info := get_type_info(target_tid)
+    if info.kind == "optional" and info.inner >= 0 and (kind == "list" or kind == "map" or kind == "set" or kind == "tuple"):
+        info = get_type_info(info.inner)
+    if kind == "list" or kind == "map" or kind == "tuple":
+        literal_targets.insert(value_idx, target_tid)
+    node := get_node(value_idx)
+    if (kind == "list" or kind == "set") and (info.kind == "list" or info.kind == "set"):
+        for child in node.children:
+            note_literal_target(child, info.inner)
+    elif kind == "map" and info.kind == "map":
+        for entry_idx in node.children:
+            entry := get_node(entry_idx)
+            if entry.kind == "entry" and entry.children.len() >= 2:
+                note_literal_target(entry.children[1], info.value_type)
+    elif kind == "tuple" and info.kind == "tuple":
+        for child, i in node.children:
+            if i < info.elements.len():
+                note_literal_target(child, info.elements[i])
+
+# the instance of generic struct `decl_idx` a constructor call is stored
+# into, through an optional, or -1 when its target is not one
+fn generic_struct_target(call_idx: Int, decl_idx: Int) -> Int:
+    if not literal_targets.contains_key(call_idx):
+        return 0 - 1
+    mut target := literal_targets[call_idx]
+    if target >= 0 and get_type_info(target).kind == "optional":
+        target = get_type_info(target).inner
+    if target < 0 or not struct_instance_decl_idx.contains_key(target):
+        return 0 - 1
+    if struct_instance_decl_idx[target] != decl_idx:
+        return 0 - 1
+    return target
 
 # a non-empty list or map literal stored into a List or Map whose elements
 # are interface values (a `List[Shape]` or `Map[K, Shape]`). each element is
@@ -8398,10 +8552,26 @@ fn check_set_expression(node: Node, scope_id: Int) -> Int:
 
 # a bare `none` element carries TID_NONE, which the structural comparison
 # accepts against a declared `T?` element and rejects against every other.
-fn check_tuple_expression(node: Node, scope_id: Int) -> Int:
+fn check_tuple_expression(node_idx: Int, node: Node, scope_id: Int) -> Int:
+    # the tuple type the value is stored into, when one was noted
+    mut target_elems: List[Int] := []
+    if literal_targets.contains_key(node_idx):
+        mut info := get_type_info(literal_targets[node_idx])
+        if info.kind == "optional" and info.inner >= 0:
+            info = get_type_info(info.inner)
+        if info.kind == "tuple":
+            target_elems = info.elements
     mut elems: List[Int] := []
-    for child in node.children:
-        elems.push(c_check_expr(child, scope_id))
+    for child, i in node.children:
+        mut elem := c_check_expr(child, scope_id)
+        # an empty literal element takes the target element's container type,
+        # so `({}, 1)` stored into a (Map[String, String], Int) builds a map
+        # that owns its strings
+        kind := node_kind(child)
+        if is_error_type(elem) and i < target_elems.len() and (kind == "list" or kind == "map" or kind == "set"):
+            if get_type_info(target_elems[i]).kind != "optional" and collection_literal_coerces(child, target_elems[i], scope_id):
+                elem = c_get_expr_type(child)
+        elems.push(elem)
     return add_type_info(ti_tuple(elems))
 
 fn check_struct_initialization(node: Node, scope_id: Int) -> Int:

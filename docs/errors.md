@@ -1307,6 +1307,29 @@ error[E317]: the default of parameter 'b' must be a literal, `none` or an enum v
   fix: pass the value at the call, or compute it in the body from an optional parameter
 ```
 
+### E318: a drop method that lets self escape
+
+the runtime frees a struct that implements `Drop` as soon as its `drop`
+method returns, so a reference to `self` that outlives the call would point at
+freed memory. a `drop` body may use `self` to read and write its fields, as the
+receiver of a method call, and as a call argument. a method or function that
+`self` is lent to is held to the same rule for its receiver or that parameter,
+through every call it makes, and a local bound straight from `self`
+(`me := self`) counts as `self`. everything else is refused: storing it in a
+field, a global, a container or a channel, returning it, building a struct,
+list or optional around it, capturing it in a closure or a `spawn`, and passing
+it to a builtin or anything else whose body the checker cannot follow. the
+message names the chain of calls down to the use that lets it escape. the
+field values `drop` copies out are ordinary values and may go anywhere (see
+docs/ownership.md, "destructors").
+
+```
+error[E318]: `self` escapes drop: it is passed to 'remember', where it is passed to 'store', where at line 20 it is passed to 'push', whose body the checker cannot follow; the value is freed when drop returns
+  26 |         self.remember()
+               ^
+  fix: use self only to read and write its fields and to call methods that do the same; copy out the field values that must outlive it
+```
+
 ### E275 — a frozen field is changed
 
 a field declared `frozen` is set when its struct is built and never changed

@@ -1,0 +1,30 @@
+# self lent to a function or a method is held to the drop rule inside that
+# body too: a callee that stores its parameter, or a method that stores its
+# receiver, two calls down, lets the value escape.
+struct Node:
+    name: String
+
+mut keep: List[Node] := []
+
+fn stash(n: Node):
+    keep.push(n)
+
+fn pass_along(first: Int, n: Node):
+    stash(n)
+
+impl Node:
+    fn remember():
+        self.store()
+
+    fn store():
+        keep.push(self)
+
+impl Drop for Node:
+    fn drop():
+        pass_along(1, self)
+        pass_along(first: 2, n: self)
+        self.remember()
+
+fn main():
+    n := Node(name: "n")
+    print(n.name)

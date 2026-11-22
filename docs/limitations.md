@@ -99,8 +99,8 @@ stale and a fix to it is welcome.
   `spawn f(bit_and(x, y))` fails with `unknown load source`. bind the argument
   to a local first.
 - **destructor limits**. a generic struct cannot implement `Drop` (E268), and a
-  `drop` that lets `self` escape leaves a dangling reference rather than being
-  refused. see docs/ownership.md.
+  garbage cycle that runs through a `Drop` struct is not collected by the
+  cycle collector: it leaks. see docs/ownership.md.
 
 ## standard library
 

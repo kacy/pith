@@ -1,0 +1,18 @@
+# a drop that stores self in a field, its own or another value's, keeps a
+# reference to a value that is freed when drop returns.
+struct Node:
+    name: String
+    mut me: Node?
+    mut other: Registry
+
+struct Registry:
+    mut last: Node?
+
+impl Drop for Node:
+    fn drop():
+        self.me = self
+        self.other.last = self
+
+fn main():
+    n := Node(name: "n", me: none, other: Registry(last: none))
+    print(n.name)

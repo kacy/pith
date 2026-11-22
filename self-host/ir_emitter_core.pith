@@ -15673,6 +15673,12 @@ fn ir_emit_cc_register_tracers():
             continue
         if not ir_struct_needs_dtor(sname):
             continue
+        # a destructor that runs a user drop is named to the collector, which
+        # leaves a garbage cycle through it alone (cycle.rs keep_user_drops)
+        if ir_struct_drop_symbol(sname).len() > 0:
+            dr := ir_reg()
+            ir_emit("funcref " + dr.to_string() + " __dtor_" + sname)
+            ir_emit_call1(ir_reg(), "pith_cc_register_user_drop", "void", dr)
         if not ir_struct_needs_tracer(sname):
             continue
         ir_emit_cc_register_pair("__dtor_" + sname, "__cc_trace_" + sname)

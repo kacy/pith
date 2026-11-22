@@ -1,0 +1,16 @@
+# a local bound from self stands for the same value, so it may not escape
+# either.
+struct Node:
+    name: String
+
+mut keep: List[Node] := []
+
+impl Drop for Node:
+    fn drop():
+        me := self
+        mut again: Node := me
+        keep.push(again)
+
+fn main():
+    n := Node(name: "n")
+    print(n.name)

@@ -1,0 +1,21 @@
+# building a value around self, a struct, a list, an optional or a tuple,
+# gives the new value a reference that outlives the drop.
+struct Node:
+    name: String
+
+struct Holder:
+    inner: Node
+
+mut holders: List[Holder] := []
+mut lists: List[List[Node]] := []
+mut maybe: Node? := none
+
+impl Drop for Node:
+    fn drop():
+        holders.push(Holder(inner: self))
+        lists.push([self])
+        maybe = self
+
+fn main():
+    n := Node(name: "n")
+    print(n.name)

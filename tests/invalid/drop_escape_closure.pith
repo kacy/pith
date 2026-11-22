@@ -1,0 +1,18 @@
+# a closure or a spawn captures self, and the capture can outlive the drop
+# that made it, even when the body only reads a field.
+struct Node:
+    name: String
+
+mut later: List[fn() -> String] := []
+
+fn show(n: Node):
+    print(n.name)
+
+impl Drop for Node:
+    fn drop():
+        later.push(fn() => self.name)
+        spawn show(self)
+
+fn main():
+    n := Node(name: "n")
+    print(n.name)

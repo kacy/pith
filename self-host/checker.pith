@@ -1837,6 +1837,7 @@ pub fn c_check_all(root_idx: Int):
     root := get_node(root_idx)
     for child in root.children:
         check_top_level_declarations(child)
+    check_drop_escapes(root)
 
 # every module-level binding this file declares, by name. collected before
 # any body is checked, so a global written below the function that shadows it
@@ -2244,6 +2245,165 @@ fn check_drop_implementation(node: Node, concrete_name: String, method_start: In
             report_error("E268", prefix + "drop() returns nothing")
     if found == false:
         report_error("E268", prefix + "the impl must declare fn drop()")
+
+# E318: a `drop` that lets `self` escape. the runtime frees the struct as
+# soon as drop returns, so any reference to it kept past that point dangles.
+# a drop body may use `self` only as the base of a field read or write, as
+# the receiver of a method call, or as a call argument, and the method or
+# function it is lent to is held to the same rule for its receiver or that
+# parameter, through any depth of calls. a local bound straight from `self`
+# (`me := self`) follows the same rule. everything else is refused: storing
+# it in a field, global, container or channel, returning it, building a
+# value around it, capturing it in a closure or a spawn, and lending it to
+# a callee whose body the checker cannot follow, such as a builtin.
+#
+# the rule is a whole-module pass after pass 2, so every call in a body it
+# follows already has its declaration resolved.
+
+# the reason the innermost refusal gave, for the call site that lent self
+mut drop_escape_reason: String := ""
+# callee checks already made, keyed "decl:name": 1 lends safely or is being
+# checked (a recursive call assumes it does), 2 lets the value escape
+mut drop_escape_memo: Map[String, Int] := {}
+mut drop_escape_memo_reason: Map[String, String] := {}
+
+fn check_drop_escapes(root: Node):
+    drop_escape_memo = {}
+    drop_escape_memo_reason = {}
+    for child in root.children:
+        mut cn := get_node(child)
+        if cn.kind == "pub":
+            cn = get_node(cn.children[0])
+        if cn.kind != "impl_decl" or cn.children.len() < 3:
+            continue
+        if get_node(cn.children[1]).kind != "for_type" or iface_type_base_name(get_node(cn.children[0])) != "Drop":
+            continue
+        for m in cn.children:
+            mn := get_node(m)
+            body := drop_escape_body(mn)
+            if mn.value == "drop" and body >= 0:
+                drop_escape_walk(body, ["self"], false, true)
+
+# the body of a function declaration, or -1
+fn drop_escape_body(node: Node) -> Int:
+    if node.kind != "fn_decl":
+        return 0 - 1
+    for c in node.children:
+        if get_node(c).kind == "body":
+            return c
+    return 0 - 1
+
+fn drop_escape_is_alias(node: Node, aliases: List[String]) -> Bool:
+    if node.kind == "self":
+        return aliases.contains("self")
+    return node.kind == "ident" and aliases.contains(node.value)
+
+# refuse a use. in the drop body itself (`top`) the error is reported there
+# and the walk goes on; inside a callee the reason is kept for the call site.
+fn drop_escape_refuse(idx: Int, top: Bool, what: String, with_line: Bool) -> Bool:
+    if top:
+        report_error_with_fix_at(idx, "E318", "`self` escapes drop: it " + what + "; the value is freed when drop returns", "use self only to read and write its fields and to call methods that do the same; copy out the field values that must outlive it")
+        return true
+    drop_escape_reason = "it " + what
+    if with_line:
+        drop_escape_reason = "at line " + get_node(idx).line.to_string() + " it " + what
+    return false
+
+# walk an expression or statement with `aliases` the names that stand for
+# the dying value. false (only below the top) means it escapes.
+fn drop_escape_walk(idx: Int, aliases: List[String], closure: Bool, top: Bool) -> Bool:
+    node := get_node(idx)
+    if drop_escape_is_alias(node, aliases):
+        if closure:
+            return drop_escape_refuse(idx, top, "is captured by a closure or a spawn", true)
+        return drop_escape_refuse(idx, top, "is used as a value", true)
+    if node.kind == "lambda" or node.kind == "spawn":
+        return drop_escape_children(node, 0, aliases, true, top)
+    if closure == false and node.children.len() > 0 and drop_escape_is_alias(get_node(node.children[0]), aliases):
+        if node.kind == "field_access":
+            return true
+        if node.kind == "method_call":
+            if not drop_escape_lend(idx, called_declaration(idx), "self", node.value, top):
+                return false
+            return drop_escape_args(idx, node, aliases, top)
+        if node.kind == "assignment" and node.children.len() == 2:
+            # rebinding a local that held self keeps nothing
+            return drop_escape_walk(node.children[1], aliases, closure, top)
+    if closure == false and node.kind == "binding" and node.children.len() > 0:
+        if drop_escape_is_alias(get_node(node.children[node.children.len() - 1]), aliases):
+            aliases.push(extract_binding_name(node.value))
+            return true
+    if closure == false and (node.kind == "call" or node.kind == "method_call") and node.children.len() > 0:
+        if not drop_escape_walk(node.children[0], aliases, closure, top):
+            return false
+        return drop_escape_args(idx, node, aliases, top)
+    return drop_escape_children(node, 0, aliases, closure, top)
+
+fn drop_escape_children(node: Node, start: Int, aliases: List[String], closure: Bool, top: Bool) -> Bool:
+    mut i := start
+    while i < node.children.len():
+        if not drop_escape_walk(node.children[i], aliases, closure, top):
+            return false
+        i = i + 1
+    return true
+
+# the arguments of a call outside any closure: an argument that is the
+# dying value is lent to the parameter in its position (a label must match
+# the position, E314)
+fn drop_escape_args(idx: Int, node: Node, aliases: List[String], top: Bool) -> Bool:
+    decl := called_declaration(idx)
+    mut i := 1
+    while i < node.children.len():
+        arg := get_node(node.children[i])
+        mut expr := node.children[i]
+        if arg.kind == "arg" and arg.children.len() > 0:
+            expr = arg.children[0]
+        if drop_escape_is_alias(get_node(expr), aliases):
+            if not drop_escape_lend(expr, decl, drop_escape_param_name(decl, i - 1), drop_escape_callee_name(node), top):
+                return false
+        elif not drop_escape_walk(expr, aliases, false, top):
+            return false
+        i = i + 1
+    return true
+
+fn drop_escape_callee_name(node: Node) -> String:
+    if node.kind == "method_call":
+        return node.value
+    callee := get_node(node.children[0])
+    if callee.kind == "ident":
+        return callee.value
+    return "the callee"
+
+# the name of a function declaration's parameter at `pos`, or ""
+fn drop_escape_param_name(decl: Int, pos: Int) -> String:
+    if decl < 0:
+        return ""
+    mut k := 0
+    for c in get_node(decl).children:
+        cn := get_node(c)
+        if cn.kind == "param":
+            if k == pos:
+                return extract_binding_name(cn.value)
+            k = k + 1
+    return ""
+
+# lend the dying value to parameter `pname` of declaration `decl` (`self`
+# for a method's receiver): fine when that body keeps to the same rule
+fn drop_escape_lend(site: Int, decl: Int, pname: String, callee: String, top: Bool) -> Bool:
+    mut body := 0 - 1
+    if decl >= 0:
+        body = drop_escape_body(get_node(decl))
+    if body < 0 or pname == "":
+        return drop_escape_refuse(site, top, "is passed to '" + callee + "', whose body the checker cannot follow", true)
+    key := decl.to_string() + ":" + pname
+    if not drop_escape_memo.contains_key(key):
+        drop_escape_memo.insert(key, 1)
+        if not drop_escape_walk(body, [pname], false, false):
+            drop_escape_memo.insert(key, 2)
+            drop_escape_memo_reason.insert(key, drop_escape_reason)
+    if drop_escape_memo[key] == 1:
+        return true
+    return drop_escape_refuse(site, top, "is passed to '" + callee + "', where " + drop_escape_memo_reason[key], false)
 
 # whether the module being checked declares a struct under `name` itself,
 # as opposed to seeing one through an import. walks the module's own root,

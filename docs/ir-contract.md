@@ -317,12 +317,15 @@ value it shares with a local. a count given up that a path never held is
 reported even when a later join leaves the function otherwise unsettled.
 
 the checker was tested by mutation: delete one release, or duplicate one, in
-a function it balances, and see whether it flags that function. on
-`examples/api_gateway`, where 3579 functions balance, it caught 299 of 300
-mutants and 499 of 500 over two seeds; on `tests/cases/test_process_command`
-it caught all 300. the misses are a doubled release of a channel receive's
-optional after it was stored, and a deleted release of a result box after its
-`ok` payload was read.
+a function it balances, and see whether it flags that function. a mutant
+that releases a null (a local not yet assigned on that path) changes nothing
+and is left out of the score; a retain put before the release tells which
+those are, since the checker reports the extra count only on a value that
+holds one. on `examples/api_gateway`, where 3522 functions balance, it caught
+233 of 233 such mutants and 413 of 413 over two seeds; on
+`tests/cases/test_process_command` it caught 298 of 298. before the doubled
+release that unsettles a later join was reported, the gateway scores were
+248 of 249 and 426 of 427, and 296 of 298.
 
 marks generate no code. the consumer drops every `mark` line before its first
 pass, so a mark can't split a pattern its rewrites match, and a build with

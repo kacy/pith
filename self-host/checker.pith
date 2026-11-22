@@ -207,6 +207,10 @@ mut locked_paths: List[String] := []
 mut struct_field_guards: Map[String, String] := {}
 # "<struct type id>.<field>" for each field declared `frozen`
 mut struct_field_frozen: Map[String, Bool] := {}
+# weak fields, keyed like the frozen ones. a weak field's load and store are
+# each one step under the runtime's weak lock, so a task may reassign one
+# while another reads it, and the shared-field rule leaves them out.
+mut struct_field_weak: Map[String, Bool] := {}
 # the fields some code assigns after their struct is built (`x.f = v`,
 # `self.f += v`), keyed by field_write_key, with the first such site as
 # "file:line". a counted field not in here is settled: it holds the value it
@@ -284,6 +288,7 @@ pub fn initialize_checker(file_path: String):
     definition_of = {}
     struct_field_guards = {}
     struct_field_frozen = {}
+    struct_field_weak = {}
     struct_field_writes = {}
     shared_field_sites = []
     shared_field_site_seen = {}
@@ -1101,6 +1106,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
                 field_types.push(ftid)
                 if cn.value.contains(" weak"):
                     check_weak_field(fname, ftid)
+                    struct_field_weak.insert(tid.to_string() + "." + fname, true)
                 if cn.children.len() > 1:
                     default_tid := c_check_expr(cn.children[1], current_scope)
                     if optional_target_accepts_value(cn.children[1], default_tid, ftid):
@@ -8445,7 +8451,8 @@ fn reassigned_counted_field(tid: Int, seen: Map[Int, Bool]) -> (String, String):
                 return (get_type_name(impl_tid) + "." + found.0, found.1)
         return none_found
     for fname, i in info.fields:
-        if struct_field_guards.contains_key(tid.to_string() + "." + fname) or struct_field_frozen.contains_key(tid.to_string() + "." + fname):
+        fkey := tid.to_string() + "." + fname
+        if struct_field_guards.contains_key(fkey) or struct_field_frozen.contains_key(fkey) or struct_field_weak.contains_key(fkey):
             continue
         ftid := info.field_types[i]
         key := field_write_key(tid, fname)
@@ -8551,6 +8558,8 @@ fn instantiate_generic_struct_type(decl_idx: Int, type_args: List[Int]) -> Int:
             is_mut := cn.value.contains(" mut")
             if cn.value.contains(" frozen"):
                 struct_field_frozen.insert(tid.to_string() + "." + fname, true)
+            if cn.value.contains(" weak"):
+                struct_field_weak.insert(tid.to_string() + "." + fname, true)
             field_names.push(fname)
             field_pub.push(is_pub)
             field_mut.push(is_mut)
@@ -9210,6 +9219,7 @@ pub struct CheckerSnapshot:
     pub lambda_inferred_return: Int
     pub struct_field_guards: Map[String, String]
     pub struct_field_frozen: Map[String, Bool]
+    pub struct_field_weak: Map[String, Bool]
     pub struct_field_writes: Map[String, String]
     pub shared_field_sites: List[SharedFieldSite]
     pub shared_field_site_seen: Map[String, Bool]
@@ -9283,6 +9293,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         lambda_inferred_return: lambda_inferred_return,
         struct_field_guards: copy_map(struct_field_guards),
         struct_field_frozen: copy_map(struct_field_frozen),
+        struct_field_weak: copy_map(struct_field_weak),
         struct_field_writes: copy_map(struct_field_writes),
         shared_field_sites: copy_list(shared_field_sites),
         shared_field_site_seen: copy_map(shared_field_site_seen))
@@ -9356,6 +9367,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     lambda_inferred_return = s.lambda_inferred_return
     struct_field_guards = copy_map(s.struct_field_guards)
     struct_field_frozen = copy_map(s.struct_field_frozen)
+    struct_field_weak = copy_map(s.struct_field_weak)
     struct_field_writes = copy_map(s.struct_field_writes)
     shared_field_sites = copy_list(s.shared_field_sites)
     shared_field_site_seen = copy_map(s.shared_field_site_seen)

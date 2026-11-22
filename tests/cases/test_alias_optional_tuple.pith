@@ -1,0 +1,58 @@
+# an alias of an optional, a tuple or a function type lowers exactly as the
+# type it names, in a local, a parameter, a field and a return. the emitter
+# used to read the alias name as an unknown, uncounted kind: the local was
+# never released and the return took a count nobody gave back.
+
+type MaybeName = String?
+type Pair = (String, Int)
+type Op = fn(Int) -> Int
+type Name = String
+type MaybeAlias = Name?
+
+struct Entry:
+    name: MaybeName
+    pair: Pair
+    op: Op
+
+fn maybe(n: Int) -> MaybeName:
+    mut m: MaybeName := none
+    if n % 2 == 0:
+        m = "n{n}"
+    return m
+
+fn maybe_via(n: Int) -> MaybeAlias:
+    if n > 0:
+        return "v{n}"
+    return none
+
+fn pair(n: Int) -> Pair:
+    p: Pair := ("p{n}", n)
+    return p
+
+fn op_for(k: Int) -> Op:
+    f: Op := fn(x: Int) => x + k
+    return f
+
+fn describe(name: MaybeName, p: Pair) -> String:
+    if let n = name:
+        return "{n}/{p.0}/{p.1}"
+    return "none/{p.0}/{p.1}"
+
+fn entry(n: Int) -> Entry:
+    return Entry(name: maybe(n), pair: pair(n), op: op_for(n))
+
+fn main():
+    print(describe(maybe(4), pair(7)))
+    print(describe(maybe(3), pair(1)))
+    print(maybe_via(2).unwrap_or("empty"))
+    print(maybe_via(0).unwrap_or("empty"))
+    print("{op_for(3)(1)}")
+    e := entry(6)
+    print("{describe(e.name, e.pair)} {e.op(10)}")
+    mut total := 0
+    for i in 0..200:
+        x := entry(i)
+        if let n = x.name:
+            total += n.len()
+        total += x.pair.1 + x.op(1)
+    print("{total}")

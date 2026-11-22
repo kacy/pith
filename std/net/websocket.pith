@@ -18,7 +18,7 @@ import std.net.http as http
 import std.io as io
 import std.text.scanner as scanner
 from std.bytes import ByteBuffer
-from std.io import BufferedBytesReader, BufferedBytesWriter, TcpStream
+from std.io import BufferedBytesReader, BufferedBytesWriter, BytesReader, BytesWriter, TcpStream
 from std.net.http import HttpRequestBytes
 # ===============================================================
 # WebSocket Constants
@@ -51,29 +51,28 @@ MAX_MESSAGE_FRAGMENTS := 262144
 # server is not answering the handshake.
 pub MAX_HANDSHAKE_HEAD_BYTES := 65536
 WS_CLOSE_MESSAGE_TOO_BIG := 1009
-WS_CLOSE_NONE := 0
-WS_CLOSE_TCP := 1
-# a WebSocket is only a handle; its state lives in these per-thread maps, one
-# entry per handle in each. register_websocket_state fills them and close_now
-# removes them all. a handle missing from websocket_closed_flags reads as
-# closed, so deregistering is what closes a session and the stored value stays
-# false while it is open.
-threadlocal mut next_websocket_handle: Int := 1
-threadlocal mut websocket_reader_handles: Map[Int, Int] := {}
-threadlocal mut websocket_writer_handles: Map[Int, Int] := {}
-threadlocal mut websocket_client_flags: Map[Int, Bool] := {}
-threadlocal mut websocket_closed_flags: Map[Int, Bool] := {}
-threadlocal mut websocket_close_kinds: Map[Int, Int] := {}
-threadlocal mut websocket_close_handles: Map[Int, Int] := {}
 # one parsed websocket frame.
 pub struct WebSocketFrame:
     pub fin: Bool
     pub opcode: Int
     pub masked: Bool
     pub payload: Bytes
-# a websocket connection backed by buffered readers and writers.
+# a websocket session. the read half belongs to the task that receives: a
+# message is reassembled from several reads, so two tasks reading one session
+# would split its frames between them. any task may send. a message goes out
+# as one write under `send_mu`, so messages sent from several tasks at once
+# never interleave on the wire, and `closed` is an atomic so a close on one task
+# is seen by every other. a session that dialed or accepted its own socket
+# holds it in `owned` and closes it with the session; over a reader and writer
+# the caller handed in, closing marks the session closed and leaves the
+# transport to the caller.
 pub struct WebSocket:
-    pub handle: Int
+    reader: BytesReader
+    writer: BytesWriter
+    client: Bool
+    owned: TcpStream?
+    closed: AtomicInt
+    send_mu: Mutex
 struct WebSocketMessage:
     pub opcode: Int
     pub payload: Bytes
@@ -257,40 +256,41 @@ fn validate_upgrade_response(head: Bytes, key: Bytes) -> Bool!:
     if not header_has_token(bytes.from_string_utf8(response_header(head, "Connection")), "upgrade"):
         return false
     return response_header(head, "Sec-WebSocket-Accept") == compute_accept_bytes(key)!
-fn next_websocket_id() -> Int:
-    handle := next_websocket_handle
-    next_websocket_handle = next_websocket_handle + 1
-    return handle
-fn register_websocket_state(reader: BufferedBytesReader, writer: BufferedBytesWriter, is_client: Bool, close_kind: Int, close_handle: Int) -> WebSocket:
-    handle := next_websocket_id()
-    websocket_reader_handles.insert(handle, reader.handle)
-    websocket_writer_handles.insert(handle, writer.handle)
-    websocket_client_flags.insert(handle, is_client)
-    websocket_closed_flags.insert(handle, false)
-    websocket_close_kinds.insert(handle, close_kind)
-    websocket_close_handles.insert(handle, close_handle)
-    return WebSocket(handle)
-fn register_websocket(stream: TcpStream, is_client: Bool) -> WebSocket:
-    return register_websocket_state(stream.buffered_bytes_reader_chunked(1), stream.buffered_bytes_writer(), is_client, WS_CLOSE_TCP, stream.fd)
-# wraps existing buffered io as a websocket connection.
+fn new_session(reader: BytesReader, writer: BytesWriter, is_client: Bool, owned: TcpStream?) -> WebSocket:
+    return WebSocket(reader, writer, is_client, owned, AtomicInt(0), Mutex())
+
+# a session over its own socket reads and writes the socket directly. a frame
+# is written whole, and a read asks for the bytes the frame still needs, so a
+# buffer in between would save no syscalls.
+fn socket_session(stream: TcpStream, is_client: Bool) -> WebSocket:
+    return new_session(stream, stream, is_client, stream)
+
+# a buffered writer handed to a session: each frame is flushed as it is
+# written, so a message never waits in the buffer.
+struct FlushingWriter:
+    inner: BufferedBytesWriter
+
+impl BytesWriter for FlushingWriter:
+    fn write_bytes(data: Bytes) -> Int!:
+        wrote := self.inner.write_bytes(data)!
+        ensure_writer_flushed(self.inner)!
+        return wrote
+
+## wraps existing buffered io as a websocket connection. the caller keeps the
+## reader and writer and frees them after the session closes. a buffered
+## reader or writer lives with the task that made it, so a session built this
+## way is used on that task only; `from_io` over a transport any task can
+## write to makes a session other tasks can send on.
 pub fn from_buffered(reader: BufferedBytesReader, writer: BufferedBytesWriter, is_client: Bool) -> WebSocket:
-    return register_websocket_state(reader, writer, is_client, WS_CLOSE_NONE, 0)
-fn websocket_reader(ws: WebSocket) -> BufferedBytesReader:
-    return BufferedBytesReader(websocket_reader_handles[ws.handle])
-fn websocket_writer(ws: WebSocket) -> BufferedBytesWriter:
-    return BufferedBytesWriter(websocket_writer_handles[ws.handle])
-fn websocket_is_client(ws: WebSocket) -> Bool:
-    if websocket_client_flags.contains_key(ws.handle):
-        return websocket_client_flags[ws.handle]
-    return false
-fn websocket_close_kind(ws: WebSocket) -> Int:
-    if websocket_close_kinds.contains_key(ws.handle):
-        return websocket_close_kinds[ws.handle]
-    return WS_CLOSE_NONE
-fn websocket_close_handle(ws: WebSocket) -> Int:
-    if websocket_close_handles.contains_key(ws.handle):
-        return websocket_close_handles[ws.handle]
-    return 0
+    return new_session(reader, FlushingWriter(writer), is_client, none)
+
+## wraps a reader and a writer as a websocket connection, with no handshake.
+## `write_bytes` must send all of its data, as a socket's and
+## `http.take_connection`'s writers do. the caller owns the transport: closing
+## the session marks it closed and leaves the reader and writer alone.
+pub fn from_io(reader: BytesReader, writer: BytesWriter, is_client: Bool) -> WebSocket:
+    return new_session(reader, writer, is_client, none)
+
 fn ensure_writer_flushed(writer: BufferedBytesWriter) -> Int!:
     flushed := writer.flush()
     if flushed.is_err:
@@ -321,7 +321,7 @@ pub fn dial_with_headers(host: String, port: Int, path: String, headers: Map[Str
     response_head := read_http_head(head_reader)!
     if not validate_upgrade_response(response_head, bytes.from_string_utf8(key_text))!:
         fail "invalid websocket handshake response"
-    return register_websocket(conn, true)
+    return socket_session(conn, true)
 # upgrades an accepted http connection to a websocket.
 pub fn upgrade(fd: Int, req: HttpRequestBytes) -> WebSocket!:
     response := upgrade_response(req)!
@@ -332,7 +332,7 @@ pub fn upgrade(fd: Int, req: HttpRequestBytes) -> WebSocket!:
     defer writer.free()
     writer.write_bytes(response)!
     ensure_writer_flushed(writer)!
-    return register_websocket(stream, false)
+    return socket_session(stream, false)
 # reads a request from a socket and upgrades it to a websocket.
 pub fn accept(fd: Int) -> WebSocket!:
     req := http.read_request_bytes(fd)!
@@ -343,6 +343,28 @@ pub fn accept_buffered(req: HttpRequestBytes, reader: BufferedBytesReader, write
     writer.write_bytes(response)!
     ensure_writer_flushed(writer)!
     return from_buffered(reader, writer, false)
+## upgrades a request read off a reader and a writer, such as the two halves
+## `http.take_connection` hands over, to a websocket. the writer may be used
+## from any task when the transport allows it.
+pub fn accept_io(req: HttpRequestBytes, reader: BytesReader, writer: BytesWriter) -> WebSocket!:
+    writer.write_bytes(upgrade_response(req)!)!
+    return from_io(reader, writer, false)
+## answers a std.net.http or std.web handler's request with a websocket
+## session: return it from the handler, and once the handler returns, the
+## server writes the handshake and calls `session` on the connection's task.
+## the connection closes when `session` returns. a request that is not a
+## websocket upgrade gets a 400 instead.
+##
+##   fn chat(req: web.Request) -> http.HttpResponse:
+##       return websocket.take_connection(req.raw, serve_member)
+pub fn take_connection(req: HttpRequestBytes, session: fn(WebSocket) -> Int!) -> http.HttpResponse:
+    if not is_upgrade_request(req):
+        return http.text(400, "expected a websocket upgrade")
+    return http.take_connection(fn(reader: BytesReader, writer: BytesWriter) -> Int! => run_taken(req, reader, writer, session))
+fn run_taken(req: HttpRequestBytes, reader: BytesReader, writer: BytesWriter, session: fn(WebSocket) -> Int!) -> Int!:
+    ws := accept_io(req, reader, writer)!
+    defer ws.close_now()
+    return session(ws)
 fn should_handle_route(req: HttpRequestBytes, path: String) -> Bool!:
     if not req.is_get(path)!:
         return false
@@ -520,7 +542,7 @@ fn validate_frame_rules(first_byte: Int, fin: Bool, opcode: Int, payload: Bytes)
         fail "unsupported websocket opcode"
     return opcode
 fn validate_frame_direction(ws: WebSocket, frame: WebSocketFrame) -> Int!:
-    if websocket_is_client(ws):
+    if ws.client:
         if frame.masked:
             fail "server websocket frames must not be masked"
         return 0
@@ -546,6 +568,14 @@ pub fn parse_frame(data: Bytes) -> WebSocketFrame!:
 pub fn frame_bytes(opcode: Int, payload: Bytes) -> Bytes!:
     return frame_bytes_with_fin(opcode, payload, true)
 fn frame_bytes_with_fin(opcode: Int, payload: Bytes, fin: Bool) -> Bytes!:
+    buf := bytes.buffer_with_capacity(payload.len() + 10)
+    defer buf.free()
+    append_frame(buf, opcode, payload, fin, bytes.empty())!
+    return buf.bytes()
+
+# append one frame to `buf`: masked with `mask_key` when it is not empty, as a
+# client's frames are, and unmasked when it is.
+fn append_frame(buf: ByteBuffer, opcode: Int, payload: Bytes, fin: Bool, mask_key: Bytes) -> Int!:
     if is_control_opcode(opcode):
         if not fin:
             fail "websocket control frames must be final"
@@ -554,12 +584,15 @@ fn frame_bytes_with_fin(opcode: Int, payload: Bytes, fin: Bool) -> Bytes!:
     mut first := bits.band(opcode, 15)
     if fin:
         first = bits.bor(first, 128)
-    buf := bytes.buffer_with_capacity(payload.len() + 10)
-    defer buf.free()
     buf.write_byte(first)!
-    append_frame_length(buf, payload.len(), false)!
-    buf.write(payload)!
-    return buf.bytes()
+    masked := not mask_key.is_empty()
+    append_frame_length(buf, payload.len(), masked)!
+    if not masked:
+        buf.write(payload)!
+        return 0
+    buf.write(mask_key)!
+    buf.write(apply_mask(payload, mask_key)!)!
+    return 0
 # builds one text frame from a string.
 pub fn text_frame_bytes(text: String) -> Bytes!:
     return frame_bytes(OP_TEXT, bytes.from_string_utf8(text))
@@ -579,20 +612,11 @@ fn close_payload(code: Int, reason: String) -> Bytes!:
 pub fn masked_frame_bytes(opcode: Int, payload: Bytes, mask_key: Bytes) -> Bytes!:
     return masked_frame_bytes_with_fin(opcode, payload, mask_key, true)
 fn masked_frame_bytes_with_fin(opcode: Int, payload: Bytes, mask_key: Bytes, fin: Bool) -> Bytes!:
-    if is_control_opcode(opcode):
-        if not fin:
-            fail "websocket control frames must be final"
-        if payload.len() > MAX_CONTROL_PAYLOAD:
-            fail "websocket control frame payload too large"
-    mut first := bits.band(opcode, 15)
-    if fin:
-        first = bits.bor(first, 128)
+    if mask_key.len() != 4:
+        fail "websocket mask key must be 4 bytes"
     buf := bytes.buffer_with_capacity(payload.len() + 14)
     defer buf.free()
-    buf.write_byte(first)!
-    append_frame_length(buf, payload.len(), true)!
-    buf.write(mask_key)!
-    buf.write(apply_mask(payload, mask_key)!)!
+    append_frame(buf, opcode, payload, fin, mask_key)!
     return buf.bytes()
 # builds one masked client text frame.
 pub fn client_text_frame_bytes(text: String, mask_key: Bytes) -> Bytes!:
@@ -606,20 +630,27 @@ pub fn pong_frame(payload: Bytes) -> Bytes!:
 # builds one close frame with a code and reason.
 pub fn close_frame(code: Int, reason: String) -> Bytes!:
     return frame_bytes(OP_CLOSE, close_payload(code, reason)!)
-fn read_exact_bytes(reader: BufferedBytesReader, count: Int) -> Bytes!:
+# read exactly `count` bytes. the first read usually brings them all, and then
+# no buffer is needed.
+fn read_exact_bytes(reader: BytesReader, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
+    first := reader.read_bytes(count)!
+    if first.is_empty():
+        fail "websocket frame truncated"
+    if first.len() == count:
+        return first
     buf := bytes.buffer_with_capacity(count)
     defer buf.free()
-    while buf.bytes().len() < count:
-        remaining := count - buf.bytes().len()
-        chunk := reader.read_bytes(remaining)!
+    buf.write(first)!
+    while buf.len() < count:
+        chunk := reader.read_bytes(count - buf.len())!
         if chunk.is_empty():
             fail "websocket frame truncated"
         buf.write(chunk)!
     return buf.bytes()
-# reads one full websocket frame from a buffered reader.
-pub fn read_frame_buffered(reader: BufferedBytesReader) -> WebSocketFrame!:
+## reads one full websocket frame from a reader, buffered or not.
+pub fn read_frame_buffered(reader: BytesReader) -> WebSocketFrame!:
     start := read_exact_bytes(reader, 2)!
     mut extra_header := frame_extended_length_size(start[1])!
     if frame_is_masked(start[1]):
@@ -628,17 +659,27 @@ pub fn read_frame_buffered(reader: BufferedBytesReader) -> WebSocketFrame!:
     payload_len := frame_payload_length(header)!
     payload := read_exact_bytes(reader, payload_len)!
     return parse_frame(header.concat(payload))
+# append one frame of this session's: a client masks each frame with a fresh
+# key, a server sends it as is.
+fn append_session_frame(ws: WebSocket, buf: ByteBuffer, opcode: Int, payload: Bytes, fin: Bool) -> Int!:
+    if ws.client:
+        return append_frame(buf, opcode, payload, fin, random_mask_key()!)
+    return append_frame(buf, opcode, payload, fin, bytes.empty())
+
+# write the frames in `wire` as one write, holding the session's send lock so a
+# message sent from another task cannot land in the middle of them.
+fn transmit(ws: WebSocket, wire: Bytes) -> Int!:
+    locked ws.send_mu:
+        if ws.is_closed():
+            fail "websocket is closed"
+        ws.writer.write_bytes(wire)!
+    return wire.len()
+
 fn send_frame(ws: WebSocket, opcode: Int, payload: Bytes, fin: Bool) -> Int!:
-    if ws.is_closed():
-        fail "websocket is closed"
-    writer := websocket_writer(ws)
-    mut frame := bytes.empty()
-    if websocket_is_client(ws):
-        frame = masked_frame_bytes_with_fin(opcode, payload, random_mask_key()!, fin)!
-    else:
-        frame = frame_bytes_with_fin(opcode, payload, fin)!
-    writer.write_bytes(frame)!
-    ensure_writer_flushed(writer)!
+    buf := bytes.buffer_with_capacity(payload.len() + 14)
+    defer buf.free()
+    append_session_frame(ws, buf, opcode, payload, fin)!
+    transmit(ws, buf.bytes())!
     return payload.len()
 
 fn handle_control_frame(ws: WebSocket, frame: WebSocketFrame) -> Bool!:
@@ -674,9 +715,8 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
     # every exit. the returned message copies its bytes, so freeing after is safe.
     defer message_buf.free()
     mut fragments := 0
-    reader := websocket_reader(ws)
     while true:
-        frame := read_frame_buffered(reader)!
+        frame := read_frame_buffered(ws.reader)!
         validate_frame_direction(ws, frame)!
         if handle_control_frame(ws, frame)!:
             continue
@@ -697,19 +737,24 @@ fn receive_message(ws: WebSocket) -> WebSocketMessage!:
         message_buf.write(frame.payload)!
         fragments = fragments + 1
         enforce_message_limits(ws, message_buf, fragments)!
+# send one message, split into fragments of DEFAULT_MESSAGE_FRAGMENT_SIZE. the
+# fragments are built into one buffer and go out in one write.
 fn send_message(ws: WebSocket, opcode: Int, payload: Bytes) -> Int!:
     if payload.len() <= DEFAULT_MESSAGE_FRAGMENT_SIZE:
         return send_frame(ws, opcode, payload, true)
-    first_end := DEFAULT_MESSAGE_FRAGMENT_SIZE
-    send_frame(ws, opcode, payload.slice(0, first_end), false)!
-    mut offset := first_end
+    fragments := (payload.len() + DEFAULT_MESSAGE_FRAGMENT_SIZE - 1) / DEFAULT_MESSAGE_FRAGMENT_SIZE
+    buf := bytes.buffer_with_capacity(payload.len() + fragments * 8)
+    defer buf.free()
+    mut offset := 0
+    mut frame_opcode := opcode
     while offset < payload.len():
         mut end := offset + DEFAULT_MESSAGE_FRAGMENT_SIZE
         if end > payload.len():
             end = payload.len()
-        fin := end == payload.len()
-        send_frame(ws, OP_CONTINUATION, payload.slice(offset, end), fin)!
+        append_session_frame(ws, buf, frame_opcode, payload.slice(offset, end), end == payload.len())!
+        frame_opcode = OP_CONTINUATION
         offset = end
+    transmit(ws, buf.bytes())!
     return payload.len()
 impl WebSocket:
     fn recv() -> Bytes!:
@@ -728,10 +773,9 @@ impl WebSocket:
         return send_frame(self, OP_PING, data, true)
     fn pong(data: Bytes) -> Int!:
         return send_frame(self, OP_PONG, data, true)
-    # send a close frame with the given code and reason, then tear the session
-    # down. a failed write does not keep the session registered: the registry
-    # entries are dropped either way, so a broken peer cannot strand them. a
-    # second close returns 0.
+    # send a close frame with the given code and reason, then close the
+    # session. a failed write still closes it, so a broken peer cannot keep it
+    # open. a second close returns 0.
     fn close(code: Int, reason: String) -> Int!:
         if self.is_closed():
             return 0
@@ -739,27 +783,16 @@ impl WebSocket:
         wrote := send_frame(self, OP_CLOSE, payload, true)
         self.close_now()
         return wrote!
-    # tear the session down without a close frame: drop all six registry
-    # entries and, for a session that owns its transport, free its buffered io
-    # and close the socket. a deregistered session reads as closed, so a
-    # second call is a no-op.
+    # close the session without a close frame. a session that owns its socket
+    # closes it, which also ends a read another task is blocked in. only the
+    # first close does anything, whichever task makes it.
     fn close_now():
-        if self.is_closed():
+        if not self.closed.compare_set(0, 1):
             return
-        if websocket_close_kind(self) == WS_CLOSE_TCP:
-            websocket_reader(self).free()
-            websocket_writer(self).free()
-            TcpStream(websocket_close_handle(self)).close()
-        websocket_reader_handles.remove(self.handle)
-        websocket_writer_handles.remove(self.handle)
-        websocket_client_flags.remove(self.handle)
-        websocket_closed_flags.remove(self.handle)
-        websocket_close_kinds.remove(self.handle)
-        websocket_close_handles.remove(self.handle)
+        if let stream = self.owned:
+            stream.close()
     fn is_closed() -> Bool:
-        if websocket_closed_flags.contains_key(self.handle):
-            return websocket_closed_flags[self.handle]
-        return true
+        return self.closed.load() != 0
 
 test "websocket computes handshake accept values":
     key := "dGhlIHNhbXBsZSBub25jZQ=="
@@ -852,7 +885,7 @@ test "websocket receive rejects a message past the size cap":
     # the peer was told the message was too big (a close frame was written).
     assert(sink.bytes().len() > 0)
 
-test "websocket close_now deregisters the session":
+test "websocket close_now closes the session":
     frame_data := text_frame_bytes("ping")!
     cursor := io.bytes_reader(frame_data)
     reader := cursor.buffered_chunked(64)
@@ -864,9 +897,6 @@ test "websocket close_now deregisters the session":
     assert_eq(got.to_string_utf8()!, "ping")
     ws.close_now()
     assert(ws.is_closed())
-    # the registry entries themselves are gone, not just flagged.
-    assert(not websocket_reader_handles.contains_key(ws.handle))
-    assert(not websocket_closed_flags.contains_key(ws.handle))
     # a second close is a no-op, and a closed session refuses io.
     ws.close_now()
     assert(ws.send_text("late").is_err)
@@ -875,7 +905,7 @@ test "websocket close_now deregisters the session":
     cursor.close()
     sink.free()
 
-test "websocket close sends a close frame and deregisters":
+test "websocket close sends a close frame and closes":
     cursor := io.bytes_reader(bytes.empty())
     reader := cursor.buffered_chunked(64)
     sink := bytes.buffer()
@@ -884,7 +914,7 @@ test "websocket close sends a close frame and deregisters":
     wrote := ws.close(1000, "bye")!
     assert(wrote > 0)
     assert(ws.is_closed())
-    # the second close finds a deregistered session and reports nothing sent.
+    # the second close finds the session closed and reports nothing sent.
     assert_eq(ws.close(1000, "again")!, 0)
     frame := parse_frame(sink.bytes())!
     assert(frame.is_close())

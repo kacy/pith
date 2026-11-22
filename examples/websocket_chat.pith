@@ -1,77 +1,152 @@
-# a chat room relaying messages between websocket sessions.
+# a chat room relaying messages between websocket sessions over real sockets.
 #
-# each member's first message is the name it joins with, and every later
-# message is broadcast to the whole room. the sessions run over in-memory
-# buffers rather than sockets: each client's frames are written up front and
-# everything the server sends is collected, so the relay can be followed from
-# both sides. websocket_echo shows a session over a real socket.
+# every connection runs on a task of its own. a member's first message is the
+# name it joins with, and every later message goes to the whole room: the task
+# that read it sends it on every member's session, including sessions other
+# tasks accepted. a session's sends take a lock of their own, so two members
+# talking at once never mix their frames on a third member's connection.
+#
+# main plays three clients. they join one at a time, then talk all at once, so
+# the order lines arrive in differs between runs; each client sorts what it
+# received before printing.
 
-import std.bytes as bytes
-import std.io as io
+import std.collections as collections
+import std.net.tcp as tcp
 import std.net.websocket as websocket
-from std.bytes import ByteBuffer
+
+PORT := 18112
+MEMBERS := 3
+LINES_EACH := 2
 
 struct Member:
-    mut name: String
+    id: Int
+    name: String
     ws: websocket.WebSocket
-    # every frame the server sent this member, as the client would receive it.
-    received: ByteBuffer
 
-struct Room:
-    members: List[Member]
+# the room, in join order. tasks join and leave at any time, so it sits under
+# a lock.
+guard room_mu:
+    mut members: List[Member] := []
 
-impl Room:
-    # a session's first message is the name it joins with.
-    fn join(member: Member) -> Int!:
-        member.name = member.ws.recv_text()!
-        self.members.push(member)
-        return self.broadcast("* {member.name} joined")!
+fn join(member: Member):
+    locked room_mu:
+        members.push(member)
 
-    fn broadcast(text: String) -> Int!:
-        for member in self.members:
-            member.ws.send_text(text)!
-        return self.members.len()
+fn leave(id: Int):
+    locked room_mu:
+        members = members.filter(fn(m: Member) -> Bool => m.id != id)
 
-# a client that joins as `name` and then says each line of `lines`. clients
-# mask what they send, so each frame carries a mask key.
-fn client_frames(name: String, lines: List[String]) -> Bytes!:
-    wire := bytes.buffer()
-    wire.write(websocket.client_text_frame_bytes(name, bytes.from_string_utf8("k3y1"))!)!
-    for line in lines:
-        wire.write(websocket.client_text_frame_bytes(line, bytes.from_string_utf8("k3y2"))!)!
-    return wire.bytes()
+# send `text` to every member. the list is copied under the lock and the sends
+# happen outside it, so a slow connection does not hold up a join or a leave.
+# a member whose connection is closing just misses the line.
+fn broadcast(text: String):
+    mut snapshot: List[Member] := []
+    locked room_mu:
+        snapshot = collections.copy_list(members)
+    for member in snapshot:
+        member.ws.send_text(text) catch 0
 
-fn connect(name: String, lines: List[String]) -> Member!:
-    inbound := io.bytes_reader(client_frames(name, lines)!).buffered_chunked(64)
-    received := bytes.buffer()
-    ws := websocket.from_buffered(inbound, received.buffered_chunked(64), false)
-    return Member(name: "", ws: ws, received: received)
-
-# what a client saw, one line per message.
-fn transcript(member: Member) -> List[String]!:
-    reader := io.bytes_reader(member.received.bytes()).buffered_chunked(64)
-    mut lines: List[String] := []
+# one connection, from the handshake to the leave. returns how many lines the
+# member said.
+fn serve_member(id: Int, fd: Int) -> Int:
+    ws := websocket.accept(fd) catch:
+        tcp.close(fd)
+        return 0
+    defer ws.close_now()
+    name := ws.recv_text() catch:
+        return 0
+    join(Member(id: id, name: name, ws: ws))
+    broadcast("* {name} joined")
+    mut said := 0
     while true:
-        frame := websocket.read_frame_buffered(reader) catch:
+        # recv_text fails once the client has sent its close frame.
+        text := ws.recv_text() catch:
             break
-        lines.push(frame.payload_text()!)
-    return lines
+        broadcast("{name}: {text}")
+        said += 1
+    leave(id)
+    broadcast("* {name} left")
+    return said
+
+# accept `count` members, each on its own task, and wait for all of them.
+fn serve_room(listener: Int, count: Int) -> Int!:
+    defer tcp.close(listener)
+    mut tasks: List[Task[Int]] := []
+    for id in 0..count:
+        fd := tcp.accept(listener)!
+        tasks.push(spawn serve_member(id, fd))
+    mut said := 0
+    for t in tasks:
+        said += await t
+    return said
+
+# a client's view of the room: the joins it saw and the chat lines it got.
+struct Seen:
+    joins: List[String]
+    lines: List[String]
+
+# join as `name` and wait to see our own join, so members join in order.
+fn connect(name: String) -> websocket.WebSocket!:
+    ws := websocket.dial("127.0.0.1", PORT, "/chat")!
+    ws.send_text(name)!
+    while true:
+        if ws.recv_text()! == "* {name} joined":
+            return ws
+    return ws
+
+# say our lines, then read until every member's lines have arrived. the joins
+# of members who came later arrive first. a member who finished first may
+# already have left, and when that news arrives depends on timing, so leaves
+# are not recorded.
+fn chat(name: String, ws: websocket.WebSocket, said: List[String]) -> Seen!:
+    mut joins := ["* {name} joined"]
+    for line in said:
+        ws.send_text(line)!
+    mut lines: List[String] := []
+    while lines.len() < MEMBERS * LINES_EACH:
+        text := ws.recv_text()!
+        if text.ends_with(" joined"):
+            joins.push(text)
+        elif not text.ends_with(" left"):
+            lines.push(text)
+    ws.close(1000, "bye")!
+    return Seen(joins: joins, lines: lines.sort())
+
+# what each member says.
+fn script(name: String) -> List[String]:
+    if name == "alice":
+        return ["hi all", "lunch at noon?"]
+    if name == "bob":
+        return ["hello", "noon works"]
+    return ["hey", "count me in"]
 
 fn main() -> Int!:
-    alice := connect("alice", ["hi everyone", "anyone up for lunch?"])!
-    bob := connect("bob", ["hello alice", "sure, at noon"])!
-    room := Room(members: [])
-    room.join(alice)!
-    room.join(bob)!
+    # listen before the server task starts, so a client can dial at once.
+    listener := tcp.listen("127.0.0.1", PORT)!
+    server := spawn serve_room(listener, MEMBERS)
 
-    # alternate turns, so the conversation reads in order.
-    for turn in 0..2:
-        for member in room.members:
-            said := member.ws.recv_text()!
-            room.broadcast("{member.name}: {said}")!
+    names := ["alice", "bob", "carol"]
+    mut sessions: List[websocket.WebSocket] := []
+    for name in names:
+        sessions.push(connect(name)!)
 
-    for member in room.members:
-        print("--- what {member.name} saw")
-        for line in transcript(member)!:
-            print(line)
+    # every client reads and writes on a task of its own from here.
+    mut clients: List[Task[Seen!]] := []
+    for name, i in names:
+        clients.push(spawn chat(name, sessions[i], script(name)))
+    mut transcripts: List[String] := []
+    for name, i in names:
+        finished := await clients[i]
+        seen := finished!
+        print("{name} saw {seen.joins.join(", ")}")
+        transcripts.push(seen.lines.join("\n"))
+
+    if transcripts[1] == transcripts[0] and transcripts[2] == transcripts[0]:
+        print("every member got the same lines:")
+        print(transcripts[0])
+    else:
+        print("the members got different lines")
+
+    said := (await server)!
+    print("the room relayed {said} lines")
     return 0

@@ -93,7 +93,7 @@ fn create_book(req: web.Request) -> http.HttpResponse:
         return error_json(415, "send application/json")
     parsed := web.parse[NewBook](req)
     if parsed.is_err:
-        # the decode error names the field, which is what the caller needs.
+        # the decode error says what is wrong: not json, or which field is missing.
         return error_json(400, parsed.err.message)
     book := parsed.ok
     if let problem = validate(book):

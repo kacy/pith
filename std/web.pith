@@ -331,8 +331,9 @@ impl Request:
 
 # decode the request body as json into a typed struct `T` — the one-liner most
 # json handlers reach for. it forwards to json.decode_text, so `T`'s fields must
-# be `pub` and the body must be a json object with matching fields; a missing
-# field or malformed json comes back as a JsonDecodeError. a handler returns a
+# be `pub` and the body must be a json object with matching fields. a body that
+# is not json comes back as a JsonDecodeError that says so, with the byte the
+# parse stopped at, and a missing field as one that names the field. a handler returns a
 # response rather than propagating, so check the result's `.is_err` and answer
 # with a 400 instead of using `!`:
 #
@@ -1168,6 +1169,10 @@ test "web.parse decodes a valid json body into a typed struct":
 test "web.parse reports an error for a malformed json body":
     parsed := parse[ParsedUser](request_with_body("not json"))
     assert(parsed.is_err)
+    # the error says the body is not json, rather than naming a field.
+    assert_eq(parsed.err.message, "invalid json at byte 0")
+    missing := parse[ParsedUser](request_with_body(chr(123) + chr(125)))
+    assert_eq(missing.err.message, "missing json field: name")
 
 # a trivial handler used by the observability tests.
 fn ping(req: Request) -> http.HttpResponse:

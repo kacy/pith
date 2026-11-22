@@ -203,8 +203,10 @@ keep one: send a value built in the call, or an independent copy
 (`std.collections.copy_list` and friends). the checker enforces this for a
 `spawn` argument and for a channel `send` or `try_send`: a collection the
 current scope still holds reports E248, and so does a struct whose fields
-reach a collection outside a `guard` block. a global is covered by the
-sharing rule (E309).
+reach a collection outside a `guard` block. a module global collection
+passed to `spawn` or sent is refused as well, since the program still holds
+it: a task reads the global directly, or takes a copy. writing a global from
+several tasks is covered by the sharing rule (E309).
 
 when a channel is the wrong shape — a registry every request reads and a
 few requests write, a counter, a cap on how many things run at once — reach

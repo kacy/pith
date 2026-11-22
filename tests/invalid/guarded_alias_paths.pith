@@ -1,0 +1,24 @@
+# the other ways a name inside `locked` reaches a guarded value: a loop
+# variable over it, an `if let` binding of it, a builtin accessor on it, and a
+# function that returns its argument (E276)
+guard mu:
+    mut groups: List[List[Int]] := [[1], [2]]
+    mut named: Map[String, List[Int]] := {}
+
+fn same(xs: List[Int]) -> List[Int]:
+    return xs
+
+fn main() -> Int!:
+    mut a: List[Int] := []
+    mut b: List[Int] := []
+    mut c: List[Int] := []
+    mut d: List[Int] := []
+    locked mu:
+        for g in groups:
+            a = g
+        if let found = named.get("k"):
+            b = found
+        c = groups.get(0).unwrap_or([])
+        d = same(groups[0])
+    print("{a.len()} {b.len()} {c.len()} {d.len()}")
+    return 0

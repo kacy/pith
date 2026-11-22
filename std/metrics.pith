@@ -291,14 +291,15 @@ fn buckets_for(bare: String) -> List[Float]:
 # metric's boundaries stay stable once observations start. it hands back the
 # boundaries in force afterwards — the caller's own list the first time, the
 # earlier one after that — so a caller does not need a second lock to find out
-# whether it won.
+# whether it won. the answer is a copy: the registered list is guarded, and a
+# handle to it read after the lock is released would race a writer.
 fn register_buckets(bare: String, bounds: List[Float]) -> List[Float]:
     shard := shard_of(bare)
     locked shard_mu[shard]:
         if not histogram_bucket_defs[shard].contains_key(bare):
             histogram_bucket_defs[shard].insert(bare, bounds)
         effective := histogram_bucket_defs[shard][bare]
-        return effective
+        return effective.slice(0, effective.len())
 
 # a stable, human-readable rendering of a float bound or value: whole numbers
 # print without a trailing ".0" (so a bucket reads le="5", a count reads "3"),

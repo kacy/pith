@@ -12,6 +12,14 @@
 //! slots and struct fields, and reports a plain store of a counted value into
 //! one. A store that carries the value's kind (`map_insert_kind`) lets the
 //! container adopt it, so only the plain stores are checked.
+//!
+//! It also reports a struct built over the error type (`struct:Bag[<error>]`):
+//! an instance whose type parameter the checker never fixed. Its `= {}` and
+//! `= []` defaults are built untagged, and the stores into them happen in
+//! other functions, where the per-function walk above cannot follow them. A
+//! generic owner's method is also emitted once as an unspecialized template
+//! that nothing calls, so only a function that some instruction names, or
+//! `main`, is reported.
 
 use super::{is_counted, kind_of_text};
 use std::collections::{HashMap, HashSet};
@@ -44,6 +52,15 @@ pub fn check_untagged_stores(lines: &[&str]) -> Vec<String> {
     let mut globals: HashMap<&str, &str> = HashMap::new();
     let mut kinds: HashMap<&str, &str> = HashMap::new();
     let mut body: Vec<Vec<&str>> = Vec::new();
+    let mut error_structs: Vec<(&str, String)> = Vec::new();
+    // every name an instruction mentions: a call, a funcref, a closure
+    let mut named: HashSet<&str> = HashSet::new();
+    for line in lines {
+        let mut words = line.split_whitespace();
+        if !matches!(words.next(), Some("func") | Some("mark") | None) {
+            named.extend(words);
+        }
+    }
     for line in lines {
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts.first() {
@@ -66,9 +83,25 @@ pub fn check_untagged_stores(lines: &[&str]) -> Vec<String> {
                 for p in check_function(&body, &kinds) {
                     problems.push(format!("{name}: {p}"));
                 }
+                for ins in &body {
+                    if ins[0] == "call"
+                        && ins.len() >= 4
+                        && ins[2] == "pith_struct_alloc"
+                        && ins[3].contains("<error>")
+                    {
+                        error_structs.push((name, ins.join(" ")));
+                    }
+                }
             }
             Some(&"mark") | None => {}
             Some(_) => body.push(parts),
+        }
+    }
+    for (name, ins) in error_structs {
+        if name == "main" || named.contains(name) {
+            problems.push(format!(
+                "{name}: `{ins}` builds a struct over an unresolved type parameter, whose container defaults take no count of what is stored into them"
+            ));
         }
     }
     problems
@@ -224,6 +257,41 @@ mod tests {
     #[test]
     fn a_borrowed_string_stored_into_a_tagged_field_map_is_fine() {
         assert!(check(&field_store("pith_map_new_cstr_val")).is_empty());
+    }
+
+    // b := Bag() in a generic body, before the instance came from its target
+    #[test]
+    fn a_struct_built_over_the_error_type_is_reported() {
+        let ir = "
+            func make__string 0 struct:Bag
+            call 0 pith_map_new_default map 0
+            iconst 2 1
+            call 1 pith_struct_alloc struct:Bag[<error>] 1 2
+            sstore 1 0 0
+            ret 1
+            endfunc
+            func main 0 void
+            call 3 make__string struct:Bag 0
+            ret
+            endfunc
+        ";
+        let problems = check(ir);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("Bag[<error>]"), "{problems:?}");
+    }
+
+    // a generic owner's unspecialized method template, which nothing calls
+    #[test]
+    fn an_uncalled_template_over_the_error_type_is_not_reported() {
+        let ir = "
+            func Pair__swapped 1 struct:Pair
+            param self
+            iconst 6 2
+            call 5 pith_struct_alloc struct:Pair[<error>] 1 6
+            ret 5
+            endfunc
+        ";
+        assert!(check(ir).is_empty());
     }
 
     #[test]

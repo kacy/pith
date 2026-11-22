@@ -1,0 +1,55 @@
+# a plain value or a literal with elements stored into a tuple slot whose
+# type is optional is wrapped in its Some, as an argument to an optional
+# parameter is. these used to be refused with a mismatch that named both
+# types "tuple". each shape stores a string borrowed from a struct field,
+# overwrites the field, and reads the copy back.
+
+struct Src:
+    name: String
+
+fn filled() -> (List[String]?, Int):
+    return (["x"], 1)
+
+fn wrapped(xs: List[String]) -> (List[String]?, Int):
+    return (xs, 1)
+
+fn absent() -> (List[String]?, Int):
+    return (none, 1)
+
+fn counted() -> (Int?, Int):
+    return (3, 1)
+
+fn named(s: String) -> (String?, Int):
+    return (s, 1)
+
+fn put_list(t: (List[String]?, Int), src: Src):
+    if let xs = t.0:
+        xs.push(src.name)
+
+fn show_list(label: String, t: (List[String]?, Int)):
+    if let xs = t.0:
+        print(label + ": {xs.len()} " + xs[xs.len() - 1])
+    else:
+        print(label + ": none")
+
+fn main():
+    src := Src(name: "field value {5} on the heap")
+    f := filled()
+    put_list(f, src)
+    base: List[String] := ["x"]
+    w := wrapped(base)
+    put_list(w, src)
+    other: List[String] := ["y"]
+    bw: (List[String]?, Int) := (other, 2)
+    put_list(bw, src)
+    n := absent()
+    s := named(src.name)
+    src.name = "replaced {7} on the heap"
+    show_list("literal with elements", f)
+    show_list("plain value", w)
+    show_list("bound value", bw)
+    show_list("none", n)
+    if let v = counted().0:
+        print("int: {v}")
+    if let v = s.0:
+        print("string: " + v)

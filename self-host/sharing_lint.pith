@@ -18,15 +18,19 @@
 #
 # the pass runs over the whole program `pith lint` loaded: the entry module and
 # everything it imports, so a library global is reported when a program that
-# spawns uses it. a program spawns when something in the entry module reaches a
-# spawn: a function spawns if its body holds one or calls a function that
-# spawns. a call is resolved the way the checker resolves it: a plain name to
-# the module's own function or a `from` import, `alias.f` through the import,
-# and a method through its receiver's type. a method on a receiver whose type
-# does not name the declaration, such as an interface, counts every method of
-# that name. a call through a function value is not followed. a program that
-# never reaches a spawn reports nothing. the pass reads the types the checker
-# already recorded, so it runs after a successful check.
+# spawns uses it. a program spawns when the entry module's functions or any
+# module's top level (its globals' initializers and field defaults) reach a
+# spawn: code reaches a spawn if it holds one, or calls or names a function
+# that reaches one. a call is resolved the way the checker resolves it: a
+# plain name to the module's own function or a `from` import, `alias.f`
+# through the import, and a method through its receiver's type. a method on a
+# receiver whose type does not name the declaration, such as an interface,
+# counts every method of that name. a function named without being called
+# (`f := lib.launch`, a field or an argument holding it, a closure calling it)
+# counts as reached where it is named, since the value can be called anywhere
+# it goes. a program that never reaches a spawn reports nothing. the pass
+# reads the types the checker already recorded, so it runs after a successful
+# check.
 
 from ast import Node, get_node, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, has_errors
@@ -56,9 +60,9 @@ pub fn add_sharing_errors(diags: List[Diagnostic], entry_root: Int, entry_path: 
         files.push(get_resolved_module_file(r))
     for d in closure_sharing_errors(roots, files):
         diags.push(d)
-    # like E309, the buffer rules apply to a program whose entry reaches a
-    # spawn; a library that spawns somewhere the program never calls does
-    # not make it share anything
+    # like E309, the buffer rules apply to a program that reaches a spawn; a
+    # library that spawns in a function the program never calls or names
+    # does not make it share anything
     if program_has_spawn(roots) and reached_spawn(roots, files) != "":
         # the globals E309 reports for a direct write are not reported again
         mut written: List[Int] := []
@@ -134,21 +138,33 @@ struct ProgramFns:
     aliases: Map[String, Int]
     from_names: Map[String, Int]
     module_of: Map[Int, Int]
+    defs: Map[Int, Int]
 
-# where the entry module (roots[0]) reaches a spawn, as "file:line", or ""
+# where the program reaches a spawn, as "file:line", or "": from the entry
+# module's (roots[0]) functions, or from any module's top level, whose
+# globals are built when the program starts
 fn reached_spawn(roots: List[Int], files: List[String]) -> String:
-    # a spawn at the entry's top level, outside any function
-    entry := get_node(roots[0])
-    for child in entry.children:
-        if get_node(child).kind != "fn_decl" and get_node(child).kind != "impl_decl":
-            found := first_spawn(child)
-            if found >= 0:
-                return files[0] + ":" + get_node(found).line.to_string()
     fns := build_program_fns(roots)
-    # a depth-first search from the entry's functions. a function's calls are
-    # resolved only when the search reaches it, and the search ends at the
-    # first spawn, so a function visited without one cannot reach one.
+    # a depth-first search. a function's calls are resolved only when the
+    # search reaches it, and the search ends at the first spawn, so a
+    # function visited without one cannot reach one.
     mut visited: Map[Int, Bool] := {}
+    for r, module in roots:
+        for child in get_node(r).children:
+            mut top := child
+            if get_node(top).kind == "pub" and get_node(top).children.len() > 0:
+                top = get_node(top).children[0]
+            kind := get_node(top).kind
+            if kind == "fn_decl" or kind == "impl_decl" or kind == "test_decl":
+                continue
+            mut targets: List[Int] := []
+            found := collect_call_targets(top, module, fns, targets)
+            if found >= 0:
+                return files[module] + ":" + get_node(found).line.to_string()
+            for target in targets:
+                reached := spawn_reached_from(target, fns, files, visited)
+                if reached != "":
+                    return reached
     for idx, k in fns.nodes:
         if fns.modules[k] == 0:
             found := spawn_reached_from(idx, fns, files, visited)
@@ -235,6 +251,7 @@ fn collect_call_targets(idx: Int, module: Int, fns: ProgramFns, out: List[Int]) 
     if node.kind == "spawn":
         return idx
     resolve_call(idx, module, fns, out)
+    resolve_function_name(idx, module, fns, out)
     for child in node.children:
         found := collect_call_targets(child, module, fns, out)
         if found >= 0:
@@ -258,6 +275,26 @@ fn resolve_call(idx: Int, module: Int, fns: ProgramFns, out: List[Int]):
     elif node.kind == "method_call" and node.children.len() > 0:
         if not push_module_call(module, node.children[0], node.value, fns, out):
             push_method(node.children[0], node.value, fns, out)
+
+# a function named by a plain name or `alias.f`, called or not. a name the
+# checker resolved goes to its declaration; any other name that matches a
+# function of the module, a `from` import or an import alias counts too, so
+# a local that shadows a function only makes the search wider.
+fn resolve_function_name(idx: Int, module: Int, fns: ProgramFns, out: List[Int]):
+    node := get_node(idx)
+    if node.kind == "ident":
+        if fns.defs.contains_key(idx) and fns.module_of.contains_key(fns.defs[idx]):
+            out.push(fns.defs[idx])
+        push_free_fn(module, node.value, fns, out)
+        key := module.to_string() + "\t" + node.value
+        if fns.from_names.contains_key(key):
+            push_free_fn(fns.from_names[key], node.value, fns, out)
+    elif node.kind == "field_access" and node.children.len() > 0:
+        if not push_module_call(module, node.children[0], node.value, fns, out):
+            # a method taken as a value
+            tid := c_get_expr_type(idx)
+            if not is_error_type(tid) and get_type_info(tid).kind == "function":
+                push_method(node.children[0], node.value, fns, out)
 
 fn push_free_fn(module: Int, name: String, fns: ProgramFns, out: List[Int]):
     key := module.to_string() + "\t" + name
@@ -482,7 +519,7 @@ STORING_METHODS := ",push,insert,set,push_front,append,extend,put,add,"
 NAMED_DECLS := ",fn_decl,struct_decl,enum_decl,interface_decl,test_decl,"
 
 fn build_program_fns(roots: List[Int]) -> ProgramFns:
-    fns := ProgramFns(nodes: [], modules: [], free_fns: {}, methods_by_name: {}, aliases: {}, from_names: {}, module_of: {})
+    fns := ProgramFns(nodes: [], modules: [], free_fns: {}, methods_by_name: {}, aliases: {}, from_names: {}, module_of: {}, defs: get_definition_of())
     for r, i in roots:
         collect_functions(r, i, false, fns)
     record_imports(roots, fns)

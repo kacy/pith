@@ -56,7 +56,10 @@ pub fn add_sharing_errors(diags: List[Diagnostic], entry_root: Int, entry_path: 
         files.push(get_resolved_module_file(r))
     for d in closure_sharing_errors(roots, files):
         diags.push(d)
-    if program_has_spawn(roots):
+    # like E309, the buffer rules apply to a program whose entry reaches a
+    # spawn; a library that spawns somewhere the program never calls does
+    # not make it share anything
+    if program_has_spawn(roots) and reached_spawn(roots, files) != "":
         # the globals E309 reports for a direct write are not reported again
         mut written: List[Int] := []
         for r in roots:

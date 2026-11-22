@@ -10,7 +10,7 @@
 #
 #   code := process.run_shell("ls -la")
 
-from std.io import ProcessStdin, ProcessStdout, ProcessStderr, buffered_writer
+from std.io import ProcessHandle, ProcessStdin, ProcessStdout, ProcessStderr, buffered_writer
 from std.concurrent import Context, BlockingError, WaitError, blocking_failed
 from std.collections import copy_list
 import std.bytes as bytes
@@ -24,9 +24,13 @@ pub struct Command:
     pub env_keys: List[String]
     pub env_values: List[String]
 
-# a running child process handle.
+# a running child process. it shares the child with the pipe views its
+# stdin(), stdout() and stderr() return, and the child is closed when the last
+# of them dies (see std.io.ProcessHandle): close() says when, and a process
+# nobody closes no longer leaks its entry and pipe fds. neither waits for the
+# child or kills it.
 pub struct Process:
-    pub handle: Int
+    pub handle: ProcessHandle
 
 # captured process output. status is the exit code, or 128 plus the signal
 # number when a signal ended the child, as a shell reports it.
@@ -127,7 +131,7 @@ pub fn wait_ctx(process: Process, ctx: Context) -> Int!WaitError:
 # starts a process without waiting for it.
 pub fn start(cmd: Command) -> Process!:
     handle := process_spawn_argv(cmd.program, cmd.argv, cmd.cwd_path, cmd.env_keys, cmd.env_values)!
-    return Process(handle)
+    return Process(ProcessHandle(handle))
 
 # runs a command and returns its exit status.
 pub fn run(cmd: Command) -> Int!:
@@ -203,16 +207,16 @@ impl Process:
         return ProcessStderr(self.handle)
 
     fn wait() -> Int:
-        return process_wait(self.handle)
+        return process_wait(self.handle.id)
 
     fn wait_ctx(ctx: Context) -> Int!WaitError:
         return wait_ctx(self, ctx)
 
     fn kill() -> Bool:
-        return process_kill(self.handle)
+        return process_kill(self.handle.id)
 
     fn close():
-        process_close(self.handle)
+        self.handle.close()
 
 # the pipe methods (ProcessStdin's write family, and the read family of
 # ProcessStdout and ProcessStderr) are declared once in std.io, the
@@ -239,7 +243,7 @@ impl Output:
 
 # starts a shell command as a child process.
 pub fn start_shell(command_text: String) -> Process!:
-    return Process(process_spawn(command_text)!)
+    return Process(ProcessHandle(process_spawn(command_text)!))
 
 # runs a shell command and returns its exit status, or 128 plus the signal
 # number when a signal ended it.

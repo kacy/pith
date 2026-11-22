@@ -4,9 +4,11 @@
 
 import std.bytes as bytes
 
-# an ephemeral x25519 keypair for one key agreement.
+# an ephemeral x25519 keypair for one key agreement. the private key is freed
+# by close() or when the last value naming the pair dies. close() leaves
+# `handle` at -1, which is also what a pair built over no key holds.
 pub struct X25519KeyPair:
-    pub handle: Int
+    pub mut handle: Int
     pub public_key: Bytes
 
 # generate a fresh x25519 ephemeral key pair.
@@ -43,8 +45,20 @@ impl X25519KeyPair:
     fn shared_secret(peer_public_key: Bytes) -> Bytes!:
         return x25519_shared_secret(self, peer_public_key)
 
+    # free the private key. a second close is a no-op. the key's handle is its
+    # address, which a later key can be given once this one is freed, so the
+    # pair forgets it here rather than relying on the runtime to know it.
     fn close():
-        crypto_x25519_close(self.handle)
+        handle := self.handle
+        if handle < 0:
+            return
+        self.handle = 0 - 1
+        crypto_x25519_close(handle)
+
+# a pair nobody closes frees its private key when its last value dies.
+impl Drop for X25519KeyPair:
+    fn drop():
+        self.close()
 
 test "p-384 key agreement derives the same 48-byte secret on both ends":
     alice := p384_keypair()!
@@ -93,3 +107,15 @@ test "p256 rejects a peer key from the wrong curve":
     assert(p.shared_secret(x.public_key).is_err)
     p.close()
     x.close()
+
+test "a closed key pair is closed once, and its destructor does nothing more":
+    first := x25519_keypair()!
+    first.close()
+    first.close()
+    assert_eq(first.handle, 0 - 1)
+    assert(first.shared_secret(first.public_key).is_err)
+    # a key made after the close can be given the freed key's address; the
+    # first pair's destructor must not free it
+    second := x25519_keypair()!
+    peer := x25519_keypair()!
+    assert_eq(second.shared_secret(peer.public_key)!.len(), 32)

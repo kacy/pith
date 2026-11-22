@@ -1,6 +1,6 @@
 use crate::string;
 use std::alloc::{alloc, Layout};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     // the length is already known, so allocate the headered cstring directly.
@@ -4380,6 +4380,72 @@ pub unsafe extern "C" fn pith_struct_weak_upgrade(ptr: i64) -> i64 {
     } else {
         0
     }
+}
+
+/// Striped locks that pair a weak field's read with a store into the same
+/// field. The field holds a weak count on its target, and that count is all
+/// that keeps a dead target's header allocated. A reader that loaded the
+/// pointer and a store in another task that dropped the field's weak count
+/// before the reader's upgrade left the upgrade reading a freed header. Under
+/// the lock the store waits until the reader has its strong count.
+static WEAK_FIELD_LOCKS: [AtomicBool; 64] = [const { AtomicBool::new(false) }; 64];
+
+struct WeakFieldGuard(&'static AtomicBool);
+
+impl WeakFieldGuard {
+    fn lock(slot: i64) -> Self {
+        let lock = &WEAK_FIELD_LOCKS[((slot as u64 >> 3) % 64) as usize];
+        let mut spins = 0u32;
+        while lock
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        WeakFieldGuard(lock)
+    }
+}
+
+impl Drop for WeakFieldGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Read a weak field of the struct at `holder`, `offset` bytes into it, and
+/// upgrade it: the target with one new strong count, or 0. See
+/// `WEAK_FIELD_LOCKS` for why the load and the upgrade are one step.
+///
+/// # Safety
+/// holder must be a live struct with a weak field at offset.
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_weak_load_field(holder: i64, offset: i64) -> i64 {
+    let slot = holder + offset;
+    let _guard = WeakFieldGuard::lock(slot);
+    let target = (*(slot as *const AtomicI64)).load(Ordering::Acquire);
+    pith_struct_weak_upgrade(target)
+}
+
+/// Store `target`, on which the caller took a weak count, into the weak field
+/// of the struct at `holder`, `offset` bytes into it, and drop the weak count
+/// the field held on its old target.
+///
+/// # Safety
+/// holder must be a live struct with a weak field at offset; target a struct
+/// or 0.
+#[no_mangle]
+pub unsafe extern "C" fn pith_struct_weak_store_field(holder: i64, offset: i64, target: i64) {
+    let slot = holder + offset;
+    let old = {
+        let _guard = WeakFieldGuard::lock(slot);
+        (*(slot as *const AtomicI64)).swap(target, Ordering::AcqRel)
+    };
+    pith_struct_weak_release(old);
 }
 
 /// The upgrade itself, on a struct's strong count and flag word: add one to

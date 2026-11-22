@@ -1383,7 +1383,6 @@ MEMCHECK_OSTHREAD_CASES := \
 MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
 	tests/cases/test_drop_lend \
-	tests/cases/test_struct_empty_map_field \
 	tests/cases/test_result_box_shared_release \
 	tests/cases/test_optional_result_plain_payload \
 	tests/cases/test_crosskind_binding_release \
@@ -1468,6 +1467,8 @@ MEMCHECK_CASES := \
 	tests/cases/test_tail_match_defer \
 	tests/cases/test_argument_literal_ownership \
 	tests/cases/test_borrowed_operand_extraction \
+	tests/cases/test_method_result_pinned_across_sibling \
+	tests/cases/test_higher_order_owned_counts \
 	tests/cases/test_unwrap_or_borrowed_fallback \
 	tests/cases/test_borrowed_list_element tests/cases/test_borrowed_threadlocal_string \
 	tests/cases/test_stack_closure \

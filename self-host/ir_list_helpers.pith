@@ -3,6 +3,7 @@
 from ir_builder import ir_emit, ir_reg, ir_label
 from ir_call_helpers import ir_emit_call_text_raw, ir_emit_call0_raw, ir_emit_call1_raw, ir_emit_call2_raw
 from ir_optionals import ir_emit_value_eq_for_tid
+from ir_ownership import ir_rc_release_reg
 
 fn ir_emit_list_loop_step(idx_name: String, i_r: Int, loop_l: String):
     one_r := ir_reg()
@@ -98,7 +99,10 @@ pub fn ir_emit_list_filter_loop(list_r: Int, ctor: String, keep_name: String, re
 ## returns a register holding the final load of acc_name. unlike map and
 ## filter it builds no container, so no ownership question arises here;
 ## whatever the reducer returns simply becomes the next accumulator.
-pub fn ir_emit_list_reduce_loop(list_r: Int, reducer_name: String, acc_name: String, elem_kind: String, result_kind: String, idx_name: String) -> Int:
+## `acc_rc` is the accumulator's rc kind, or "" when it holds no count: the
+## slot owns one count of its value, and each step releases the value the
+## reducer was handed once the reducer has returned its successor.
+pub fn ir_emit_list_reduce_loop(list_r: Int, reducer_name: String, acc_name: String, elem_kind: String, result_kind: String, acc_rc: String, idx_name: String) -> Int:
     len_r := ir_reg()
     ir_emit_call1_raw(len_r, "pith_list_len", "int", list_r)
     zero_r := ir_reg()
@@ -122,6 +126,8 @@ pub fn ir_emit_list_reduce_loop(list_r: Int, reducer_name: String, acc_name: Str
     next_acc_r := ir_reg()
     ir_emit_call_text_raw(next_acc_r, reducer_name, result_kind, 2, " " + acc_r.to_string() + " " + item_r.to_string())
     ir_emit("store " + acc_name + " " + next_acc_r.to_string())
+    if acc_rc.len() > 0:
+        ir_rc_release_reg(acc_r, acc_rc)
     ir_emit_list_loop_step(idx_name, i_r, loop_l)
     ir_emit("label " + done_l)
     out_r := ir_reg()

@@ -66,6 +66,17 @@ pub fn truncate_list[T](items: List[T], len: Int):
     while items.len() > len:
         items.remove(items.len() - 1)
 
+# remove the last item and return it, or none for an empty list. a value
+# taken this way is no longer in the list, so a pool guarded by a lock can
+# hand it out and the lock no longer reaches it.
+pub fn pop_last[T](items: List[T]) -> T?:
+    n := items.len()
+    if n == 0:
+        return none
+    last := items[n - 1]
+    items.remove(n - 1)
+    return last
+
 # map a list of strings to a new list of strings.
 pub fn map_strings(items: List[String], mapper: fn(String) -> String) -> List[String]:
     mut result: List[String] := []

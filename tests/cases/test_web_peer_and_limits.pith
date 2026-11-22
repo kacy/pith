@@ -78,8 +78,7 @@ fn main() -> Int!:
     # this client offers no alpn, and the listener offers h2 and http/1.1
     spawn serve_tls()
     wait_for_port(TLS_PORT)
-    secure := http.client()
-    secure.tls_config = tls.client_config_with_ca_file(CA_PATH)!
+    secure := http.client().with_tls_config(tls.client_config_with_ca_file(CA_PATH)!)
     over_tls := secure.send(http.https_request_port("GET", "localhost", TLS_PORT, "/who"))!
     print("peer ip over tls: " + bytes.to_string_utf8(over_tls.body)!)
 

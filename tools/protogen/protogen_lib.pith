@@ -818,11 +818,12 @@ fn encode_field(f: Field, message_names: List[String], enum_names: List[String])
     out.push("        w.{method}({num}, {fref}) catch false")
     return out
 
-# the decode arm for one field. `first` picks `if` vs `elif` for the dispatch.
+# the decode arm for one field, decoding into the field's local (see
+# decode_local). `first` picks `if` vs `elif` for the dispatch.
 fn decode_field(f: Field, first: Bool, message_names: List[String], enum_names: List[String]) -> List[String]!ParseError:
     out: List[String] := []
     num := "{f.number}"
-    fref := "m.{f.name}"
+    fref := decode_local(f.name)
     mut keyword := "elif"
     if first:
         keyword = "if"
@@ -925,8 +926,15 @@ fn decode_map_field(mf: MapField, first: Bool, message_names: List[String], enum
         out.push("                    {mv} = {er}.{vread}()!")
     out.push("                else:")
     out.push("                    {er}.skip({et}.wire)!")
-    out.push("            m.{mf.name}.insert({mk}, {mv})")
+    out.push("            {decode_local(mf.name)}.insert({mk}, {mv})")
     return out
+
+# the local a decoder reads one member into. the decoder builds the message
+# from its locals once the whole input is read, rather than building a default
+# message and assigning its fields: a message field no code reassigns after
+# the message is built is one any task may read (E248).
+fn decode_local(name: String) -> String:
+    return "f_{name}"
 
 # the enum + constructor lines for one oneof group, emitted just before the
 # containing struct. constructors exist because cross-module enum-variant
@@ -992,10 +1000,10 @@ fn decode_oneof_field(ename: String, oname: String, f: Field, first: Bool, messa
     out.push("        {keyword} tag.field == {num}:")
     if is_message(f.ptype, message_names):
         tn := simple_name(f.ptype)
-        out.push("            m.{oname} = {ename}.{variant}(decode_{tn}_at(r.read_message()!, depth + 1)!)")
+        out.push("            {decode_local(oname)} = {ename}.{variant}(decode_{tn}_at(r.read_message()!, depth + 1)!)")
     else:
         rmethod := read_method(f.ptype, enum_names)
-        out.push("            m.{oname} = {ename}.{variant}(r.{rmethod}()!)")
+        out.push("            {decode_local(oname)} = {ename}.{variant}(r.{rmethod}()!)")
     return out
 
 # generate the full pith module for a parsed proto file.
@@ -1062,16 +1070,21 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
             lines.push("    pub {o.name}: {ename}")
         lines.push("")
 
-        # a default-valued constructor value, for decode to start from
+        # decode starts each member's local at its default value and builds
+        # the message from the locals at the end
+        locals: List[String] := []
         ctor_args: List[String] := []
         for f in m.fields:
             dv := default_value(f, message_names, enum_names)
-            ctor_args.push("{f.name}: {dv}")
+            locals.push("    mut {decode_local(f.name)}: {pith_type(f, message_names, enum_names)} := {dv}")
+            ctor_args.push("{f.name}: {decode_local(f.name)}")
         for mf in m.maps:
-            ctor_args.push("{mf.name}: {empty_map}")
+            locals.push("    mut {decode_local(mf.name)}: {map_pith_type(mf, message_names, enum_names)} := {empty_map}")
+            ctor_args.push("{mf.name}: {decode_local(mf.name)}")
         for o in m.oneofs:
             ename := oneof_enum_name(m.name, o)
-            ctor_args.push("{o.name}: {ename}.{ename}Unset")
+            locals.push("    mut {decode_local(o.name)}: {ename} := {ename}.{ename}Unset")
+            ctor_args.push("{o.name}: {decode_local(o.name)}")
         mut ctor := strings.join_nonempty(ctor_args, ", ")
         if no_members:
             ctor = "_empty: false"
@@ -1106,7 +1119,8 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
         lines.push("fn decode_{m.name}_at(data: Bytes, depth: Int) -> {m.name}!ProtoError:")
         lines.push("    if depth > MAX_NESTING_DEPTH:")
         lines.push("        fail nesting_error()")
-        lines.push("    m := {m.name}({ctor})")
+        for ln in locals:
+            lines.push(ln)
         lines.push("    r := reader(data)")
         lines.push("    while not r.at_end():")
         lines.push("        tag := r.read_tag()!")
@@ -1130,7 +1144,7 @@ pub fn generate(pf: ProtoFile) -> String!ParseError:
                     first = false
             lines.push("        else:")
             lines.push("            r.skip(tag.wire)!")
-        lines.push("    return m")
+        lines.push("    return {m.name}({ctor})")
         lines.push("")
 
     for svc in pf.services:
@@ -1305,12 +1319,10 @@ fn gen_service_lines(svc: Service, pkg: String) -> List[String]:
     out.push("")
     return out
 
-# generate server-side stubs for one service: a settable handler slot per rpc, a
-# body-level router that deframes/decodes each request and dispatches by method
-# path, and serve_<Svc>/serve_<Svc>_tls that install the handlers and start
-# grpc.serve_body. the handlers live in module globals because grpc's dispatch is
-# a bare fn-value that cannot capture; a pith closure cannot either. the handler
-# shape follows the rpc: unary (Req) -> Resp, server-streaming (Req) ->
+# generate server-side stubs for one service: a body-level router that
+# deframes/decodes each request and dispatches by method path to the handler
+# passed for it, and serve_<Svc>/serve_<Svc>_tls that start grpc.serve_body with
+# a dispatch closing over the handlers. the handler shape follows the rpc: unary (Req) -> Resp, server-streaming (Req) ->
 # List[Resp], client-streaming (List[Req]) -> Resp, bidi (List[Req]) ->
 # List[Resp]. every streamed side is buffered — the whole request and reply pass
 # through memory — which fits bounded streams, not endless ones.
@@ -1328,15 +1340,13 @@ fn gen_server_lines(svc: Service, pkg: String) -> List[String]:
     out.push("# request, dispatches by method path, and frames the reply. a streamed")
     out.push("# request arrives as a List, and a streamed reply is returned as one:")
     out.push("# buffered end to end, so bounded streams only.")
-    for rpc in svc.rpcs:
-        req_t := server_req_type(rpc)
-        resp_t := server_resp_type(rpc)
-        out.push("fn _{svc.name}_{rpc.name}_unimpl(req: {req_t}) -> {resp_t}!grpc.GrpcError:")
-        out.push("    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: {q}{rpc.name} not implemented{q})")
-        out.push("mut _{svc.name}_{rpc.name}_fn: fn({req_t}) -> {resp_t}!grpc.GrpcError := _{svc.name}_{rpc.name}_unimpl")
-    out.push("")
-
-    out.push("fn _{svc.name}_route(path: String, body: Bytes) -> Bytes!grpc.GrpcError:")
+    mut params := ""
+    mut route_params := ""
+    for rpc, i in svc.rpcs:
+        handler_t := "fn({server_req_type(rpc)}) -> {server_resp_type(rpc)}!grpc.GrpcError"
+        params = params + list_sep(i) + "{rpc.name}: {handler_t}"
+        route_params = route_params + list_sep(i) + "handle_{rpc.name}: {handler_t}"
+    out.push("fn _{svc.name}_route(path: String, body: Bytes, {route_params}) -> Bytes!grpc.GrpcError:")
     for rpc in svc.rpcs:
         req := rpc.req_type
         resp := rpc.resp_type
@@ -1364,35 +1374,42 @@ fn gen_server_lines(svc: Service, pkg: String) -> List[String]:
         if rpc.client_streaming:
             arg = "requests"
         if rpc.server_streaming:
-            out.push("        replies := _{svc.name}_{rpc.name}_fn({arg})!")
+            out.push("        replies := handle_{rpc.name}({arg})!")
             out.push("        mut framed: List[Bytes] := []")
             out.push("        for reply in replies:")
             out.push("            framed.push(encode_{resp}(reply))")
             out.push("        return grpc.frame_messages(framed)")
         else:
-            out.push("        return grpc.frame_one(encode_{resp}(_{svc.name}_{rpc.name}_fn({arg})!))")
+            out.push("        return grpc.frame_one(encode_{resp}(handle_{rpc.name}({arg})!))")
     out.push("    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: {q}no method {q} + path)")
     out.push("")
 
-    mut params := ""
-    for rpc, i in svc.rpcs:
-        if i > 0:
-            params = params + ", "
-        params = params + "{rpc.name}: fn({server_req_type(rpc)}) -> {server_resp_type(rpc)}!grpc.GrpcError"
-
+    out.push("# the body-level dispatch routing to these handlers.")
+    out.push("fn _{svc.name}_dispatch({params}) -> fn(String, Bytes) -> Bytes!grpc.GrpcError:")
+    out.push("    return fn(path: String, body: Bytes) -> Bytes!grpc.GrpcError => _{svc.name}_route(path, body, {rpc_names(svc)})")
+    out.push("")
     out.push("# serve {svc.name} over plaintext http/2 (h2c). pass one handler per rpc.")
     out.push("pub fn serve_{svc.name}(host: String, port: Int, {params}) -> Int!:")
-    for rpc in svc.rpcs:
-        out.push("    _{svc.name}_{rpc.name}_fn = {rpc.name}")
-    out.push("    return grpc.serve_body(host, port, _{svc.name}_route)!")
+    out.push("    return grpc.serve_body(host, port, _{svc.name}_dispatch({rpc_names(svc)}))!")
     out.push("")
     out.push("# serve {svc.name} over http/2 with tls (alpn h2).")
     out.push("pub fn serve_{svc.name}_tls(host: String, port: Int, cert: String, key: String, {params}) -> Int!:")
-    for rpc in svc.rpcs:
-        out.push("    _{svc.name}_{rpc.name}_fn = {rpc.name}")
-    out.push("    return grpc.serve_body_tls(host, port, cert, key, _{svc.name}_route)!")
+    out.push("    return grpc.serve_body_tls(host, port, cert, key, _{svc.name}_dispatch({rpc_names(svc)}))!")
     out.push("")
     return out
+
+# ", " before every item of a generated list but the first
+fn list_sep(i: Int) -> String:
+    if i > 0:
+        return ", "
+    return ""
+
+# the service's rpc names, comma-separated: the generated handler arguments
+fn rpc_names(svc: Service) -> String:
+    mut names := ""
+    for rpc, i in svc.rpcs:
+        names = names + list_sep(i) + rpc.name
+    return names
 
 # the server handler's request type: the message, or a List of it when the
 # client streams.
@@ -1426,10 +1443,10 @@ fn stream_handler_type(svc: Service, rpc: Rpc) -> String:
     return "fn({rpc.req_type}) -> {rpc.resp_type}!grpc.GrpcError"
 
 # generate the incremental streaming server for one service: a typed
-# <Svc><Rpc>ServerCall per streaming rpc, handler slots for them, a stream-level
-# router, and serve_<Svc>_streaming/_tls over grpc.serve_stream. one listener
-# serves the whole service — unary rpcs reuse the buffered handler slots (the
-# router recvs the one request and sends the one reply), while a streaming rpc's
+# <Svc><Rpc>ServerCall per streaming rpc, a stream-level router, and
+# serve_<Svc>_streaming/_tls over grpc.serve_stream. one listener serves the
+# whole service — a unary rpc keeps the buffered handler shape (the router recvs
+# the one request and sends the one reply), while a streaming rpc's
 # handler drives its ServerCall message by message, so nothing is buffered end
 # to end and interactive or endless streams work.
 fn gen_streaming_server_lines(svc: Service, pkg: String) -> List[String]:
@@ -1441,7 +1458,7 @@ fn gen_streaming_server_lines(svc: Service, pkg: String) -> List[String]:
     if svc.rpcs.len() == 0:
         return out
 
-    # the typed stream wrappers come before the handler slots that name them:
+    # the typed stream wrappers come before the router that names them:
     # pith resolves types in file order.
     for rpc in svc.rpcs:
         if not is_streaming(rpc):
@@ -1493,27 +1510,18 @@ fn gen_streaming_server_lines(svc: Service, pkg: String) -> List[String]:
         out.push("        return self.inner.closing()")
         out.push("")
 
-    out.push("# handler slots for the streaming rpcs; the unary rpcs share the buffered")
-    out.push("# serve_{svc.name} slots above. module globals, because grpc's dispatch is")
-    out.push("# a bare fn-value that cannot capture.")
-    for rpc in svc.rpcs:
-        if not is_streaming(rpc):
-            continue
-        wrapper := "{svc.name}{rpc.name}ServerCall"
-        mut params := "call: {wrapper}"
-        if rpc.server_streaming and not rpc.client_streaming:
-            params = "req: {rpc.req_type}, call: {wrapper}"
-        out.push("fn _{svc.name}_{rpc.name}_stream_unimpl({params}) -> Int!grpc.GrpcError:")
-        out.push("    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: {q}{rpc.name} not implemented{q})")
-        out.push("mut _{svc.name}_{rpc.name}_stream_fn: {stream_handler_type(svc, rpc)} := _{svc.name}_{rpc.name}_stream_unimpl")
-    out.push("")
+    mut params := ""
+    mut route_params := ""
+    for rpc, i in svc.rpcs:
+        params = params + list_sep(i) + "{rpc.name}: {stream_handler_type(svc, rpc)}"
+        route_params = route_params + list_sep(i) + "handle_{rpc.name}: {stream_handler_type(svc, rpc)}"
 
     out.push("# route one live rpc by its method path, driving the stream to completion.")
     out.push("# a unary arm recvs the one request (requiring the client's half-close) and")
     out.push("# sends the one reply; a streaming arm hands its typed ServerCall to the")
-    out.push("# installed handler. an error return becomes the grpc-status; a clean")
+    out.push("# handler passed for it. an error return becomes the grpc-status; a clean")
     out.push("# return that never finished gets finish_ok from grpc.serve_stream.")
-    out.push("fn _{svc.name}_stream_route(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError:")
+    out.push("fn _{svc.name}_stream_route(path: String, call: grpc.GrpcStream, {route_params}) -> Int!grpc.GrpcError:")
     for rpc in svc.rpcs:
         req := rpc.req_type
         resp := rpc.resp_type
@@ -1521,7 +1529,7 @@ fn gen_streaming_server_lines(svc: Service, pkg: String) -> List[String]:
         derr := "{q}grpc: decode {req} failed{q}"
         out.push("    if path == {q}/{svc_path}/{rpc.name}{q}:")
         if rpc.client_streaming:
-            out.push("        return _{svc.name}_{rpc.name}_stream_fn({wrapper}(inner: call))!")
+            out.push("        return handle_{rpc.name}({wrapper}(inner: call))!")
         else:
             # exactly one request message; an empty (done) first read is an
             # all-default request, matching the buffered router.
@@ -1534,38 +1542,26 @@ fn gen_streaming_server_lines(svc: Service, pkg: String) -> List[String]:
             out.push("        if decoded.is_err:")
             out.push("            fail grpc.GrpcError(status: grpc.GRPC_INVALID_ARGUMENT, message: {derr})")
             if rpc.server_streaming:
-                out.push("        return _{svc.name}_{rpc.name}_stream_fn(decoded.ok, {wrapper}(inner: call))!")
+                out.push("        return handle_{rpc.name}(decoded.ok, {wrapper}(inner: call))!")
             else:
-                out.push("        call.send_message(encode_{resp}(_{svc.name}_{rpc.name}_fn(decoded.ok)!))")
+                out.push("        call.send_message(encode_{resp}(handle_{rpc.name}(decoded.ok)!))")
                 out.push("        return 0")
     out.push("    fail grpc.GrpcError(status: grpc.GRPC_UNIMPLEMENTED, message: {q}no method {q} + path)")
     out.push("")
 
-    mut params := ""
-    for rpc, i in svc.rpcs:
-        if i > 0:
-            params = params + ", "
-        params = params + "{rpc.name}: {stream_handler_type(svc, rpc)}"
-
+    out.push("# the stream-level dispatch routing to these handlers.")
+    out.push("fn _{svc.name}_stream_dispatch({params}) -> fn(String, grpc.GrpcStream) -> Int!grpc.GrpcError:")
+    out.push("    return fn(path: String, call: grpc.GrpcStream) -> Int!grpc.GrpcError => _{svc.name}_stream_route(path, call, {rpc_names(svc)})")
+    out.push("")
     out.push("# serve the whole {svc.name} service over one plaintext http/2 (h2c)")
     out.push("# streaming listener. unary handlers keep the (Req) -> Resp shape; a")
     out.push("# streaming rpc's handler drives its typed ServerCall incrementally.")
     out.push("# blocks, accepting connections.")
     out.push("pub fn serve_{svc.name}_streaming(host: String, port: Int, {params}) -> Int!:")
-    for rpc in svc.rpcs:
-        if is_streaming(rpc):
-            out.push("    _{svc.name}_{rpc.name}_stream_fn = {rpc.name}")
-        else:
-            out.push("    _{svc.name}_{rpc.name}_fn = {rpc.name}")
-    out.push("    return grpc.serve_stream(host, port, _{svc.name}_stream_route)!")
+    out.push("    return grpc.serve_stream(host, port, _{svc.name}_stream_dispatch({rpc_names(svc)}))!")
     out.push("")
     out.push("# like serve_{svc.name}_streaming, over http/2 with tls (alpn h2).")
     out.push("pub fn serve_{svc.name}_streaming_tls(host: String, port: Int, cert: String, key: String, {params}) -> Int!:")
-    for rpc in svc.rpcs:
-        if is_streaming(rpc):
-            out.push("    _{svc.name}_{rpc.name}_stream_fn = {rpc.name}")
-        else:
-            out.push("    _{svc.name}_{rpc.name}_fn = {rpc.name}")
-    out.push("    return grpc.serve_stream_tls(host, port, cert, key, _{svc.name}_stream_route)!")
+    out.push("    return grpc.serve_stream_tls(host, port, cert, key, _{svc.name}_stream_dispatch({rpc_names(svc)}))!")
     out.push("")
     return out

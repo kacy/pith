@@ -281,11 +281,13 @@ generation, for tools that want only the report.
 
 the build itself never fails on a finding. `make count-marks-check-only`,
 which ci runs, checks every corpus program and example and fails on any
-unbalanced function or borrow finding. a function the checker can't settle,
-such as one holding a weak reference, is counted as undecided and doesn't
-fail the target. over the corpus, 7051 distinct functions balance and 194
-are undecided; the rest of the undecided are values of unknown kind, calls
-with no summary, weak references and locals whose kind changes by path.
+unbalanced function or borrow finding. a function the checker can't settle
+is counted as undecided and doesn't fail the target. over the corpus, 7490
+distinct functions balance and 41 are undecided: 17 locals whose kind
+changes by path, 7 slots read past a join that dropped them, 5 joins of
+match or rebinding temps, 5 calls of a generic method on `T` (`to_string`,
+`next`), 4 values of a kind no instruction settles and 3 JSON decoders' raw
+word slots.
 
 the checker models the register-pair abi (`rcall`, `ret2`): the payload holds
 one count, the ok value's or the error's, and a plain ok payload holds it
@@ -297,13 +299,33 @@ and so does one released through an emitted release helper; a destructor
 set to null leaves the box a shell. an `await` of a task returning `T!` is
 typed `tuple`, so the box it hands back is counted like a call's.
 
+a few facts come from the instructions rather than the marks. a register
+the function retains or releases by name holds a counted value, even where
+its kind is a generic body's `T`, and so does one stored into an unmarked
+temp a counted register is later loaded from. a call through a slot the
+function stores to, such as the temp an open-coded `map` keeps its function
+in, is a closure call under the user-function convention. a function the
+program defines wins over a runtime function of the same name, as it does in
+the consumer. a weak upgrade (`pith_struct_weak_upgrade`,
+`pith_struct_weak_load_field`) hands back a strong count or a null, and a
+value a weak count was taken on (`pith_struct_weak_retain`) is stored into a
+weak field or a weak capture without a strong one; weak counts themselves are
+left out. an optional given a destructor after its payload was read and
+retained (`m.get(k)` kept as an optional) takes that count. where two paths
+meet, an unmarked temp that holds a count of its own is one more owner of the
+value it shares with a local. a count given up that a path never held is
+reported even when a later join leaves the function otherwise unsettled.
+
 the checker was tested by mutation: delete one release, or duplicate one, in
-a function it balances, and see whether it flags that function. on
-`examples/api_gateway`, where 3579 functions balance, it caught 299 of 300
-mutants and 499 of 500 over two seeds; on `tests/cases/test_process_command`
-it caught all 300. the misses are a doubled release of a channel receive's
-optional after it was stored, and a deleted release of a result box after its
-`ok` payload was read.
+a function it balances, and see whether it flags that function. a mutant
+that releases a null (a local not yet assigned on that path) changes nothing
+and is left out of the score; a retain put before the release tells which
+those are, since the checker reports the extra count only on a value that
+holds one. on `examples/api_gateway`, where 3522 functions balance, it caught
+233 of 233 such mutants and 413 of 413 over two seeds; on
+`tests/cases/test_process_command` it caught 298 of 298. before the doubled
+release that unsettles a later join was reported, the gateway scores were
+248 of 249 and 426 of 427, and 296 of 298.
 
 marks generate no code. the consumer drops every `mark` line before its first
 pass, so a mark can't split a pattern its rewrites match, and a build with

@@ -194,6 +194,21 @@ pub fn ir_emit_optional_some_value(value_r: Int) -> Int:
 pub fn ir_emit_weak_read(raw_r: Int) -> Int:
     alive_r := ir_reg()
     ir_emit("call " + alive_r.to_string() + " pith_struct_weak_upgrade int 1 " + raw_r.to_string())
+    return ir_emit_weak_shell(alive_r)
+
+# the same read of a weak struct field, `offset` bytes into the struct in
+# obj_r. the load and the upgrade are one runtime step, so a store into the
+# field from another task cannot free the old target's header between them
+# (pith_struct_weak_load_field).
+pub fn ir_emit_weak_field_read(obj_r: Int, offset: Int) -> Int:
+    off_r := ir_reg()
+    ir_emit("iconst " + off_r.to_string() + " " + offset.to_string())
+    alive_r := ir_reg()
+    ir_emit("call " + alive_r.to_string() + " pith_struct_weak_load_field int 2 " + obj_r.to_string() + " " + off_r.to_string())
+    return ir_emit_weak_shell(alive_r)
+
+# the optional around an upgraded target: Some owning the count, or none
+fn ir_emit_weak_shell(alive_r: Int) -> Int:
     tmp := ir_new_temp_name("weak_read")
     ir_emit("store " + tmp + " " + alive_r.to_string())
     some_l := ir_label()

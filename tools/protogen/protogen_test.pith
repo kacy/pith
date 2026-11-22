@@ -421,8 +421,8 @@ test "the geometry service generates typed client stubs":
 
 # the streaming server: serve_Geometry_streaming serves every rpc on one
 # grpc.serve_stream listener. each streaming rpc gets a typed ServerCall whose
-# recv decodes and whose send encodes; unary rpcs reuse the buffered handler
-# slots. (the generated code itself is compiled by the sample_gen import above,
+# recv decodes and whose send encodes; unary rpcs keep the buffered handler
+# shape. (the generated code itself is compiled by the sample_gen import above,
 # which type-checks it against std.net.grpc.)
 test "the geometry service generates streaming server stubs":
     read := fs.read("tools/protogen/sample.proto")
@@ -455,9 +455,10 @@ test "the geometry service generates streaming server stubs":
 
     # unary rpcs ride the same listener with their buffered handler shape
     assert(has(out, "pub fn serve_Geometry_streaming(host: String, port: Int, Describe: fn(Point) -> Shape!grpc.GrpcError"))
-    assert(has(out, "_Geometry_Describe_fn = Describe"))
-    assert(has(out, "grpc.serve_stream(host, port, _Geometry_stream_route)"))
-    assert(has(out, "grpc.serve_stream_tls(host, port, cert, key, _Geometry_stream_route)"))
+    assert(has(out, "grpc.serve_stream(host, port, _Geometry_stream_dispatch(Describe, Corners, Assemble, Reflect, Ping))"))
+    assert(has(out, "grpc.serve_stream_tls(host, port, cert, key, _Geometry_stream_dispatch(Describe, Corners, Assemble, Reflect, Ping))"))
+    # the handlers reach the router through the dispatch closure, not globals
+    assert(not has(out, "mut _Geometry_"))
 
 # n nested empty Node messages, built in one pass rather than by re-wrapping a
 # payload n times (which would be quadratic). level i's length is 1 for the tag

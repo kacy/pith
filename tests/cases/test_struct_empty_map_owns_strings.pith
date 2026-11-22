@@ -1,0 +1,33 @@
+# a struct field built from an empty `{}` is a map that owns a count on each
+# string stored in it. it used to be built as an untyped map that took none,
+# so a string copied in from another map was freed when that map replaced
+# its entry, and the copy read freed memory (the emitter's own enum tables
+# hit this on test_generic_enum_name_clash).
+mut table: Map[String, String] := {}
+
+struct Saved:
+    names: List[String]
+    lists: Map[String, String]
+
+fn save(name: String) -> Saved:
+    saved := Saved([], {})
+    saved.names.push(name)
+    saved.lists.insert(name, table[name])
+    return saved
+
+fn save_named(name: String) -> Saved:
+    saved := Saved(names: [], lists: {})
+    saved.lists.insert(name, table[name])
+    return saved
+
+fn main():
+    mut total := 0
+    for i in 0..2000:
+        table.insert("k", ["a", "b", i.to_string()].join(","))
+        a := save("k")
+        b := save_named("k")
+        table.insert("k", ["c", "d", i.to_string()].join(","))
+        total = total + a.lists["k"].len() + b.lists["k"].len()
+        if a.lists["k"] != "a,b,{i}" or b.lists["k"] != "a,b,{i}":
+            print("wrong at {i}")
+    print("{total}")

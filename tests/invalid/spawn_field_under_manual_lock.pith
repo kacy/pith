@@ -1,0 +1,31 @@
+# a field written under a lock the program takes by hand, with lock() and
+# unlock() or a compare_set spin, is not one the checker can see is guarded,
+# so the struct cannot be shared (E248). a `guard` block is the form it
+# checks.
+struct Holder:
+    mu: Mutex
+    flag: AtomicInt
+    msg: String
+    cell: AtomicInt
+
+fn writer(h: Holder):
+    h.mu.lock()
+    h.msg = "replaced"
+    h.mu.unlock()
+    while not h.flag.compare_set(0, 1):
+        continue
+    h.cell = AtomicInt(1)
+    h.flag.store(0)
+
+fn reader(h: Holder) -> Int:
+    h.mu.lock()
+    n := h.msg.len()
+    h.mu.unlock()
+    return n + h.cell.load()
+
+fn main():
+    h := Holder(mu: Mutex(), flag: AtomicInt(0), msg: "start", cell: AtomicInt(0))
+    w := spawn writer(h)
+    r := spawn reader(h)
+    await w
+    print("{await r}")

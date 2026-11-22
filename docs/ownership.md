@@ -130,6 +130,13 @@ call arguments:
   receiver, and the container, key and receiver of a store. for example,
   `o.name + rename(o)`, `m.insert(o.name, rename(o))` and
   `h.o.name = swap(h)` each freed the read before it was used
+- a builtin method result the emitter classifies as borrowed is pinned
+  the same way. `s.to_string()` on a String is `s` itself, so it is pinned
+  when `s` would be: `f(o.name.to_string(), rename(o))` freed the name
+  under the argument. a list search (`o.items.contains(rename(o))`,
+  `index_of`) pins its list against its target, and a reduce whose
+  initial value can drop storage walks a copy of its list, as it does
+  when its function can
 - an assignment reads the value it replaces only after the new value has
   been evaluated and has taken its count. `o.name = rename(o)` used to read
   the old name first, and `rename` had already released it, so the store
@@ -267,6 +274,17 @@ lambdas and function values:
   a copy of the list, which counts every element, and pins the function.
   without the copy, `o.items.map(f)` where `f` replaces `o.items` freed the
   list in the middle of the walk
+- a list nothing else holds (`xs.map(f)` as the receiver of `.filter(g)`,
+  a literal, a call result) can't be dropped by anyone, so it is walked as
+  it is and released once the walk is done. it used to be walked and never
+  released, so every chained `map`, `filter` and `reduce` leaked its
+  receiver
+- a reduce's accumulator holds one count of its value. a borrowed initial
+  value takes one before the walk, and each step releases the value it
+  handed the function once the function has returned the next one, so the
+  result arrives owned. the steps released nothing, which leaked every
+  intermediate value, and a reduce over an empty list handed back a
+  borrowed initial value as if it were owned
 
 ## container flavors
 
@@ -805,6 +823,16 @@ later retain could revive a target another task had just destroyed, and
 classifying the read as borrowed once freed the target twice or leaked one
 optional per bound read.
 
+the field's own weak count is what keeps a dead target's header allocated,
+so a store into the field and a read of it in another task must not
+interleave. the read loads the pointer and upgrades it in one runtime call
+(`pith_struct_weak_load_field`), and the store swaps in the new pointer in
+another (`pith_struct_weak_store_field`) before it drops the old weak
+count. both take the same striped lock, so a store waits until a reader
+that loaded the old pointer has its strong count. a separate load and
+upgrade let a store free the header between the two, and the upgrade then
+read freed memory (`tests/cases/test_weak_field_store_across_tasks`).
+
 every consumer treats the read as that fresh optional. a local, a field, a
 struct construction, a list or map store and a return keep the count for as
 long as they hold the optional. a test against `none`, an extraction
@@ -898,7 +926,15 @@ the rule: **do not share a mutable collection across tasks — pass data
 through a channel instead.** the checker enforces it at a `spawn`
 argument and a channel send (E248), for a collection and for a struct whose
 fields reach one outside a `guard` block, and for a global through the
-sharing rule (E309). a send hands over the handle, so the value sent must be
+sharing rule (E309).
+
+the field itself is a pointer too. reassigning a field that holds a counted
+value releases the old value, and a task reading the field at that moment may
+be taking a count on memory that is being freed. so the same checks refuse a
+struct whose fields reach a counted field that some code reassigns after the
+struct is built, unless the field is in a `guard` block. a field no code
+reassigns is settled and behaves like a `frozen` one. a field holding a
+number or a flag is exempt. a send hands over the handle, so the value sent must be
 one the sender does not keep: built in the call, or an independent copy
 (`std.collections.copy_list` and friends).
 

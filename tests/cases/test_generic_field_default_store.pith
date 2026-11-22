@@ -1,0 +1,27 @@
+# a generic struct's `= {}` and `= []` defaults are built from the instance's
+# field types, so a Bag[String] owns the strings stored into its containers
+# and reads them back after their source is overwritten.
+
+struct Bag[T]:
+    first: T
+    m: Map[String, T] = {}
+    l: List[T] = []
+    k: Map[Bytes, T] = {}
+
+struct Src:
+    name: String
+
+fn main():
+    src := Src(name: "field value {5} on the heap")
+    b := Bag(first: "x")
+    b.m.insert("a", src.name)
+    b.l.push(src.name)
+    b.k.insert(bytes_from_string_utf8("key"), src.name)
+    src.name = "replaced {7} on the heap"
+    print(b.m["a"])
+    print(b.l[0])
+    print(b.k[bytes_from_string_utf8("key")])
+    n := Bag(first: 1)
+    n.m.insert("a", 3)
+    n.l.push(4)
+    print((n.m["a"] + n.l[0]).to_string())

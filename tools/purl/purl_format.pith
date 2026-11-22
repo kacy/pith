@@ -1,0 +1,413 @@
+# purl_format — body assembly (-d/-F), write-out (-w), Content-Disposition
+# filename parsing (-J), and curl exit-code classification.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.net.http as http
+import std.net.url as url
+import std.os.path as path_mod
+from purl_args import DataPart, FormSpec, read_stdin_bytes
+
+# Metrics captured for one transfer and exposed via -w / --write-out.
+pub struct TransferMetrics:
+    pub http_code: Int
+    pub content_type: String
+    pub size_download: Int
+    pub size_upload: Int
+    pub size_header: Int
+    pub size_request: Int
+    pub time_total_ms: Int
+    pub time_starttransfer_ms: Int
+    pub time_namelookup_ms: Int
+    pub url_effective: String
+    pub redirect_url: String
+    pub num_redirects: Int
+    pub http_version: String
+    pub scheme: String
+    pub remote_ip: String
+    pub remote_port: Int
+    pub filename_effective: String
+    pub response_headers: Map[String, String]
+    pub exitcode: Int
+    pub errormsg: String
+
+# Strip CR and LF bytes from data (curl's -d @file / --data-ascii behavior).
+fn strip_crlf_bytes(data: Bytes) -> Bytes:
+    out := bytes.buffer_with_capacity(data.len())
+    defer out.free()
+    mut i := 0
+    while i < data.len():
+        b := data[i]
+        if b != 10 and b != 13:
+            out.write_byte(b) catch 0
+        i = i + 1
+    return out.bytes()
+
+# Read file bytes or cached stdin when `path` is "-".
+fn read_source_bytes(path: String, stdin_cache: Bytes?) -> (Bytes, Bytes?)!:
+    if path == "-":
+        if let cached = stdin_cache:
+            return (cached, stdin_cache)
+        loaded := read_stdin_bytes()
+        next_cache: Bytes? := loaded
+        return (loaded, next_cache)
+    got := fs.read_bytes(path)
+    if got.is_err:
+        fail "purl: read error: failed to open '{path}': {got.err}"
+    return (got.ok, stdin_cache)
+
+# Encode one --data-urlencode argument per curl's 5 syntax forms:
+#   content | =content | name=content | @filename | name@filename
+fn encode_data_urlencode(raw: String, stdin_cache: Bytes?) -> (String, Bytes?)!:
+    eq := raw.index_of("=")
+    at := raw.index_of("@")
+
+    # Decide which special form comes first.
+    if eq == 0:
+        return (url.encode(raw.substring(1, raw.len())), stdin_cache)
+    if at == 0:
+        loaded := read_source_bytes(raw.substring(1, raw.len()), stdin_cache)!
+        text := loaded.0.to_string_utf8() catch ""
+        return (url.encode(text), loaded.1)
+    if eq > 0 and (at < 0 or eq < at):
+        name := raw.substring(0, eq)
+        val := raw.substring(eq + 1, raw.len())
+        return (name + "=" + url.encode(val), stdin_cache)
+    if at > 0 and (eq < 0 or at < eq):
+        name := raw.substring(0, at)
+        file_path := raw.substring(at + 1, raw.len())
+        loaded := read_source_bytes(file_path, stdin_cache)!
+        text := loaded.0.to_string_utf8() catch ""
+        return (name + "=" + url.encode(text), loaded.1)
+    return (url.encode(raw), stdin_cache)
+
+# Assemble the request body from all -d / --data* / --json parts.
+# Multiple --data* parts join with "&"; multiple --json parts concatenate directly.
+pub fn build_data_body(parts: List[DataPart], is_json: Bool, stdin_cache: Bytes?) -> (Bytes, Bytes?)!:
+    out := bytes.buffer()
+    defer out.free()
+    mut cache := stdin_cache
+    mut first := true
+
+    for part in parts:
+        if not first and not is_json:
+            out.write_byte(38)!
+        first = false
+
+        if part.kind == "raw":
+            out.write(bytes.from_string_utf8(part.value))!
+        elif part.kind == "binary" or part.kind == "json":
+            if part.value.starts_with("@"):
+                loaded := read_source_bytes(part.value.substring(1, part.value.len()), cache)!
+                cache = loaded.1
+                out.write(loaded.0)!
+            else:
+                out.write(bytes.from_string_utf8(part.value))!
+        elif part.kind == "urlencode":
+            enc := encode_data_urlencode(part.value, cache)!
+            cache = enc.1
+            out.write(bytes.from_string_utf8(enc.0))!
+        else:
+            # ascii (-d / --data / --data-ascii)
+            if part.value.starts_with("@"):
+                loaded := read_source_bytes(part.value.substring(1, part.value.len()), cache)!
+                cache = loaded.1
+                out.write(strip_crlf_bytes(loaded.0))!
+            else:
+                out.write(bytes.from_string_utf8(part.value))!
+
+    return (out.bytes(), cache)
+
+# Strip optional surrounding double quotes from a multipart parameter value.
+fn unquote(text: String) -> String:
+    t := text.trim()
+    if t.len() >= 2 and ord(t[0]) == 34 and ord(t[t.len() - 1]) == 34:
+        return t.substring(1, t.len() - 1)
+    return t
+
+# Parse -F / --form / --form-string specs into std.net.http MultipartPart entries.
+pub fn build_multipart_parts(forms: List[FormSpec], stdin_cache: Bytes?) -> (List[http.MultipartPart], Bytes?)!:
+    mut parts: List[http.MultipartPart] := []
+    mut cache := stdin_cache
+
+    for spec in forms:
+        eq := spec.raw.index_of("=")
+        if eq <= 0:
+            fail "purl: malformed form field '{spec.raw}' (expected name=value)"
+        name := spec.raw.substring(0, eq)
+        rest := spec.raw.substring(eq + 1, spec.raw.len())
+
+        if spec.is_string:
+            parts.push(http.multipart_field(name, rest))
+            continue
+
+        # Split optional ;type=... and ;filename=... suffixes.
+        segs := rest.split(";")
+        main_val := segs[0]
+        mut custom_type := ""
+        mut custom_filename := ""
+        mut si := 1
+        while si < segs.len():
+            seg := segs[si].trim()
+            seq := seg.index_of("=")
+            if seq > 0:
+                sk := seg.substring(0, seq).trim().to_lower()
+                sv := unquote(seg.substring(seq + 1, seg.len()))
+                if sk == "type":
+                    custom_type = sv
+                elif sk == "filename":
+                    custom_filename = sv
+            si = si + 1
+
+        if main_val.starts_with("@"):
+            file_path := unquote(main_val.substring(1, main_val.len()))
+            loaded := read_source_bytes(file_path, cache)!
+            cache = loaded.1
+            mut fname := custom_filename
+            if fname == "":
+                if file_path == "-":
+                    fname = "stdin"
+                else:
+                    fname = path_mod.base(file_path)
+            mut ctype := custom_type
+            if ctype == "":
+                if file_path != "-":
+                    ctype = http.content_type_for_path(file_path)
+                if ctype == "" or ctype == http.MIME_BINARY:
+                    ctype = http.detect_content_type(loaded.0)
+            parts.push(http.multipart_file(name, fname, ctype, loaded.0))
+        elif main_val.starts_with("<"):
+            file_path := unquote(main_val.substring(1, main_val.len()))
+            loaded := read_source_bytes(file_path, cache)!
+            cache = loaded.1
+            text := loaded.0.to_string_utf8() catch ""
+            parts.push(http.multipart_field(name, text))
+        else:
+            parts.push(http.multipart_field(name, main_val))
+
+    return (parts, cache)
+
+# Format milliseconds as curl-style seconds with 6 decimal places ("0.012000").
+fn format_ms_as_seconds(ms: Int) -> String:
+    mut safe_ms := ms
+    if safe_ms < 0:
+        safe_ms = 0
+    secs := safe_ms / 1000
+    rem := safe_ms % 1000
+    mut pad := ""
+    if rem < 10:
+        pad = "00"
+    elif rem < 100:
+        pad = "0"
+    return "{secs}.{pad}{rem}000"
+
+# Compute average download speed in bytes/second as an integer string.
+fn format_speed(bytes_count: Int, ms: Int) -> String:
+    if bytes_count <= 0:
+        return "0"
+    if ms <= 0:
+        return (bytes_count * 1000).to_string()
+    return ((bytes_count * 1000) / ms).to_string()
+
+# Format a 3-digit status code ("000", "200", "404").
+fn format_status_3(code: Int) -> String:
+    if code <= 0:
+        return "000"
+    if code < 10:
+        return "00" + code.to_string()
+    if code < 100:
+        return "0" + code.to_string()
+    return code.to_string()
+
+# Render TransferMetrics as JSON for -w '%{json}'.
+fn metrics_to_json(m: TransferMetrics) -> String:
+    obj := json.make_object()
+    json.object_set(obj, "content_type", json.make_string(m.content_type))
+    json.object_set(obj, "errormsg", json.make_string(m.errormsg))
+    json.object_set(obj, "exitcode", json.make_int(m.exitcode))
+    json.object_set(obj, "filename_effective", json.make_string(m.filename_effective))
+    json.object_set(obj, "http_code", json.make_int(m.http_code))
+    json.object_set(obj, "http_version", json.make_string(m.http_version))
+    json.object_set(obj, "num_redirects", json.make_int(m.num_redirects))
+    json.object_set(obj, "redirect_url", json.make_string(m.redirect_url))
+    json.object_set(obj, "remote_ip", json.make_string(m.remote_ip))
+    json.object_set(obj, "remote_port", json.make_int(m.remote_port))
+    json.object_set(obj, "response_code", json.make_int(m.http_code))
+    json.object_set(obj, "scheme", json.make_string(m.scheme))
+    json.object_set(obj, "size_download", json.make_int(m.size_download))
+    json.object_set(obj, "size_header", json.make_int(m.size_header))
+    json.object_set(obj, "size_request", json.make_int(m.size_request))
+    json.object_set(obj, "size_upload", json.make_int(m.size_upload))
+    json.object_set(obj, "speed_download", json.make_int(parse_int(format_speed(m.size_download, m.time_total_ms)) catch 0))
+    json.object_set(obj, "time_namelookup", json.make_float(m.time_namelookup_ms.to_float() / 1000.0))
+    json.object_set(obj, "time_starttransfer", json.make_float(m.time_starttransfer_ms.to_float() / 1000.0))
+    json.object_set(obj, "time_total", json.make_float(m.time_total_ms.to_float() / 1000.0))
+    json.object_set(obj, "url_effective", json.make_string(m.url_effective))
+    return json.encode(obj)
+
+# Resolve one write-out variable name.
+fn lookup_write_out_var(name: String, m: TransferMetrics) -> String:
+    if name == "http_code" or name == "response_code":
+        return format_status_3(m.http_code)
+    if name == "content_type":
+        return m.content_type
+    if name == "size_download":
+        return m.size_download.to_string()
+    if name == "size_upload":
+        return m.size_upload.to_string()
+    if name == "size_header":
+        return m.size_header.to_string()
+    if name == "size_request":
+        return m.size_request.to_string()
+    if name == "time_total":
+        return format_ms_as_seconds(m.time_total_ms)
+    if name == "time_starttransfer":
+        return format_ms_as_seconds(m.time_starttransfer_ms)
+    if name == "time_namelookup":
+        return format_ms_as_seconds(m.time_namelookup_ms)
+    if name == "speed_download":
+        return format_speed(m.size_download, m.time_total_ms)
+    if name == "url_effective":
+        return m.url_effective
+    if name == "redirect_url":
+        return m.redirect_url
+    if name == "num_redirects":
+        return m.num_redirects.to_string()
+    if name == "http_version":
+        return m.http_version
+    if name == "scheme":
+        return m.scheme
+    if name == "remote_ip":
+        return m.remote_ip
+    if name == "remote_port":
+        return m.remote_port.to_string()
+    if name == "filename_effective":
+        return m.filename_effective
+    if name == "exitcode":
+        return m.exitcode.to_string()
+    if name == "errormsg":
+        return m.errormsg
+    if name == "json":
+        return metrics_to_json(m)
+    return ""
+
+# Expand a curl -w / --write-out format string (supports @file, escapes, and %{var}).
+pub fn format_write_out(raw_template: String, m: TransferMetrics) -> String!:
+    mut tpl := raw_template
+    if tpl.starts_with("@"):
+        path := tpl.substring(1, tpl.len())
+        if path == "-":
+            tpl = read_stdin_bytes().to_string_utf8() catch ""
+        else:
+            tpl = fs.read(path)!
+
+    mut parts: List[String] := []
+    mut i := 0
+    n := tpl.len()
+    while i < n:
+        c := ord(tpl[i])
+        if c == 92 and i + 1 < n:
+            nxt := tpl[i + 1]
+            if nxt == "n":
+                parts.push(chr(10))
+            elif nxt == "r":
+                parts.push(chr(13))
+            elif nxt == "t":
+                parts.push(chr(9))
+            else:
+                parts.push(nxt)
+            i = i + 2
+            continue
+        if c == 37 and i + 1 < n:
+            nxt_code := ord(tpl[i + 1])
+            if nxt_code == 37:
+                parts.push("%")
+                i = i + 2
+                continue
+            if i + 7 < n and tpl.substring(i, i + 8) == "%header" + chr(123):
+                mut end_h := i + 8
+                while end_h < n and ord(tpl[end_h]) != 125:
+                    end_h = end_h + 1
+                if end_h < n:
+                    hkey := tpl.substring(i + 8, end_h).to_lower()
+                    if m.response_headers.contains_key(hkey):
+                        parts.push(m.response_headers[hkey])
+                    i = end_h + 1
+                    continue
+            if nxt_code == 123:
+                mut end := i + 2
+                while end < n and ord(tpl[end]) != 125:
+                    end = end + 1
+                if end < n:
+                    var_name := tpl.substring(i + 2, end)
+                    if var_name == "onerror":
+                        if m.exitcode == 0:
+                            return parts.join("")
+                    else:
+                        parts.push(lookup_write_out_var(var_name, m))
+                    i = end + 1
+                    continue
+        parts.push(tpl[i])
+        i = i + 1
+    return parts.join("")
+
+# Extract a safe basename from a Content-Disposition header for -J / --remote-header-name.
+# Returns "" if no filename parameter is present or the name is unsafe.
+pub fn extract_content_disposition_filename(header: String) -> String:
+    if header == "":
+        return ""
+    for part in header.split(";"):
+        trimmed := part.trim()
+        eq := trimmed.index_of("=")
+        if eq <= 0:
+            continue
+        key := trimmed.substring(0, eq).trim().to_lower()
+        if key == "filename":
+            raw_val := unquote(trimmed.substring(eq + 1, trimmed.len()))
+            return sanitize_download_filename(raw_val)
+    return ""
+
+# Strip path separators and reject "." / ".." so a server cannot escape the output directory.
+fn sanitize_download_filename(raw: String) -> String:
+    mut name := raw.trim()
+    slash := name.last_index_of("/")
+    if slash >= 0:
+        name = name.substring(slash + 1, name.len())
+    bslash := name.last_index_of(chr(92))
+    if bslash >= 0:
+        name = name.substring(bslash + 1, name.len())
+    if name == "" or name == "." or name == "..":
+        return ""
+    return name
+
+# Map an internal error string to a standard curl exit code.
+pub fn classify_error_exit_code(err: String) -> Int:
+    lower := err.to_lower()
+    if lower.contains("unsupported protocol"):
+        return 1
+    if lower.contains("malformed url"):
+        return 3
+    if lower.contains("dns") or lower.contains("resolve") or lower.contains("name or service not known") or lower.contains("nodename"):
+        return 6
+    if lower.contains("timeout") or lower.contains("timed out") or lower.contains("deadline"):
+        return 28
+    if lower.contains("too many redirects") or lower.contains("stopped after"):
+        return 47
+    if lower.contains("certificate") or lower.contains("x509") or lower.contains("verify") or lower.contains("unknown ca") or lower.contains("hostname mismatch") or lower.contains("expired"):
+        return 60
+    if lower.contains("tls") or lower.contains("handshake") or lower.contains("ssl"):
+        return 35
+    if lower.contains("closed the connection before responding") or lower.contains("empty reply"):
+        return 52
+    if lower.contains("read error"):
+        return 26
+    if lower.contains("write error"):
+        return 23
+    if lower.contains("gzip") or lower.contains("zlib") or lower.contains("zstd") or lower.contains("inflate") or lower.contains("content-encoding"):
+        return 61
+    if lower.contains("max-filesize") or lower.contains("maximum file size") or lower.contains("response body exceeds"):
+        return 63
+    if lower.contains("connect") or lower.contains("refused") or lower.contains("unreachable"):
+        return 7
+    return 56

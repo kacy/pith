@@ -1,0 +1,280 @@
+# purl_test — unit tests for purl's URL parser, cookie jar, CLI parser,
+# config tokenizer, body/multipart builders, write-out formatter, and exit codes.
+
+import std.net.http2.frames as h2frames
+import std.net.http2.hpack as h2hpack
+import std.net.http2.connection as h2conn
+import std.bytes as bytes
+import std.fs as fs
+import std.json as json
+import std.os.path as path_mod
+from purl_url import parse_target_url, request_target, authority_header, effective_url, origin_changed, append_query, resolve_redirect, remote_filename, split_userinfo
+from purl_cookies import new_jar, store_set_cookie, cookie_header_for, load_cookie_file, save_cookie_file, parse_http_expires
+from purl_args import DataPart, FormSpec, parse_tokens_standalone, parse_seconds_to_ms, parse_byte_size, tokenize_config
+from purl_auth import lookup_netrc, md5_hex, build_digest_header_with_cnonce, sign_aws_sigv4_at
+from purl_format import TransferMetrics, build_data_body, build_multipart_parts, format_write_out, extract_content_disposition_filename, classify_error_exit_code
+from purl_glob import expand_url, substitute_output_template
+
+test "purl_url parses full, schemeless, userinfo, ipv6, and file urls":
+    u1 := parse_target_url("https://example.com:8443/api/v1?a=1&b=2#top", "http")!
+    assert_eq(u1.scheme, "https")
+    assert_eq(u1.host, "example.com")
+    assert_eq(u1.port, 8443)
+    assert_eq(request_target(u1), "/api/v1?a=1&b=2")
+    assert_eq(authority_header(u1), "example.com:8443")
+    assert_eq(effective_url(u1), "https://example.com:8443/api/v1?a=1&b=2")
+
+    u2 := parse_target_url("example.com/hello", "http")!
+    assert_eq(u2.scheme, "http")
+    assert_eq(u2.host, "example.com")
+    assert_eq(u2.port, 80)
+    assert_eq(authority_header(u2), "example.com")
+
+    u3 := parse_target_url("localhost:8080/ping", "http")!
+    assert_eq(u3.scheme, "http")
+    assert_eq(u3.host, "localhost")
+    assert_eq(u3.port, 8080)
+    assert_eq(u3.path, "/ping")
+
+    u4 := parse_target_url("http://alice:s%40cret@api.test:9000/me", "http")!
+    assert_eq(u4.host, "api.test")
+    assert_eq(u4.port, 9000)
+    creds := split_userinfo(u4.userinfo)
+    assert_eq(creds.0, "alice")
+    assert_eq(creds.1, "s@cret")
+    assert_eq(effective_url(u4), "http://api.test:9000/me")
+
+    u5 := parse_target_url("http://[::1]:8080/v6", "http")!
+    assert_eq(u5.host, "::1")
+    assert_eq(u5.port, 8080)
+    assert_eq(authority_header(u5), "[::1]:8080")
+    assert_eq(effective_url(u5), "http://[::1]:8080/v6")
+
+    u6 := parse_target_url("file:///tmp/hello%20world.txt", "http")!
+    assert_eq(u6.scheme, "file")
+    assert_eq(u6.path, "/tmp/hello world.txt")
+
+    assert(parse_target_url("ftp://example.com/a", "http").is_err)
+    assert(parse_target_url("http://example.com:99999/a", "http").is_err)
+    assert(parse_target_url("http://example.com:80abc/a", "http").is_err)
+
+test "purl_url resolves relative, root, protocol-relative, and cross-origin redirects":
+    base := parse_target_url("https://a.example.com/dir/sub/page.html?x=1", "http")!
+
+    r1 := resolve_redirect(base, "../other?y=2#frag")!
+    assert_eq(effective_url(r1), "https://a.example.com/dir/other?y=2")
+    assert(not origin_changed(base, r1))
+
+    r2 := resolve_redirect(base, "/root/path")!
+    assert_eq(effective_url(r2), "https://a.example.com/root/path")
+
+    r3 := resolve_redirect(base, "//b.example.com/next")!
+    assert_eq(effective_url(r3), "https://b.example.com/next")
+    assert(origin_changed(base, r3))
+
+    r4 := resolve_redirect(base, "?onlyquery=1")!
+    assert_eq(effective_url(r4), "https://a.example.com/dir/sub/page.html?onlyquery=1")
+
+    q := append_query(base, "k=v")
+    assert_eq(q.query, "x=1&k=v")
+    assert_eq(remote_filename(base), "page.html")
+    assert_eq(remote_filename(parse_target_url("https://a.example.com/dir/", "http")!), "")
+
+test "purl_cookies stores, matches, expires, and persists netscape jars":
+    jar := new_jar()
+    store_set_cookie(jar, "sid=abc123; Path=/; HttpOnly", "api.example.com", "/login")
+    store_set_cookie(jar, "theme=dark; Domain=.example.com; Path=/app; Secure", "api.example.com", "/app/home")
+    store_set_cookie(jar, "temp=gone; Path=/; Max-Age=0", "api.example.com", "/")
+
+    assert_eq(cookie_header_for(jar, "api.example.com", "/app/page", true), "sid=abc123; theme=dark")
+    # Secure cookie must not be sent over plain HTTP.
+    assert_eq(cookie_header_for(jar, "api.example.com", "/app/page", false), "sid=abc123")
+    # Subdomain receives domain cookie but not host-only sid.
+    assert_eq(cookie_header_for(jar, "web.example.com", "/app/page", true), "theme=dark")
+    # Non-matching path skips /app cookie.
+    assert_eq(cookie_header_for(jar, "api.example.com", "/other", true), "sid=abc123")
+
+    tmp := fs.make_temp_dir("purl-cookie-test-")!
+    jar_path := path_mod.join(tmp, "cookies.txt")
+    save_cookie_file(jar, jar_path)!
+
+    jar2 := new_jar()
+    loaded := load_cookie_file(jar2, jar_path)!
+    assert_eq(loaded, 2)
+    assert_eq(cookie_header_for(jar2, "api.example.com", "/app/page", true), "sid=abc123; theme=dark")
+    assert(fs.remove_tree(tmp))
+
+test "purl_args parses combined short flags, attached values, negations, config, and --next":
+    p1 := parse_tokens_standalone(["-fsSL", "-XPOST", "-HContent-Type: application/json", "-oout.txt", "https://example.com"])
+    assert_eq(p1.error_msg, "")
+    assert_eq(p1.specs.len(), 1)
+    s := p1.specs[0]
+    assert(s.fail_on_http)
+    assert(s.silent)
+    assert(s.show_error)
+    assert(s.follow_redirects)
+    assert_eq(s.method, "POST")
+    assert_eq(s.headers.len(), 1)
+    assert_eq(s.headers[0], "Content-Type: application/json")
+    assert_eq(s.outputs[0], "out.txt")
+    assert_eq(s.urls[0], "https://example.com")
+
+    p2 := parse_tokens_standalone(["-L", "--no-location", "--max-time=1.25", "--http2", "http://a", "--next", "-I", "http://b"])
+    assert_eq(p2.error_msg, "")
+    assert_eq(p2.specs.len(), 2)
+    assert(not p2.specs[0].follow_redirects)
+    assert_eq(p2.specs[0].max_time_ms, 1250)
+    assert_eq(p2.specs[0].http_version, "2")
+    assert(p2.specs[1].head_only)
+    assert_eq(p2.specs[1].urls[0], "http://b")
+
+    assert_eq(parse_seconds_to_ms("2")!, 2000)
+    assert_eq(parse_seconds_to_ms("0.5")!, 500)
+    assert_eq(parse_seconds_to_ms("1.234")!, 1234)
+    assert(parse_seconds_to_ms("-1").is_err)
+
+    cfg := "# comment\nurl = \"https://example.com/a\"\nheader = \"X-Test: hello world\"\n-L\n"
+    toks := tokenize_config(cfg)
+    assert_eq(toks.len(), 5)
+    assert_eq(toks[0], "--url")
+    assert_eq(toks[1], "https://example.com/a")
+    assert_eq(toks[2], "--header")
+    assert_eq(toks[3], "X-Test: hello world")
+    assert_eq(toks[4], "-L")
+
+test "purl_format builds data bodies, multipart parts, write-out strings, and exit codes":
+    tmp := fs.make_temp_dir("purl-fmt-test-")!
+    sample := path_mod.join(tmp, "payload.txt")
+    fs.write(sample, "line1\r\nline2\n")!
+
+    # -d strips CR/LF from @file and joins multiple -d with '&'
+    d1 := build_data_body([DataPart("ascii", "a=1"), DataPart("ascii", "@" + sample), DataPart("raw", "@literal"), DataPart("urlencode", "q=a b")], false, none)!
+    assert_eq(d1.0.to_string_utf8()!, "a=1&line1line2&@literal&q=a%20b")
+
+    # --data-binary preserves CR/LF
+    d2 := build_data_body([DataPart("binary", "@" + sample)], false, none)!
+    assert_eq(d2.0.to_string_utf8()!, "line1\r\nline2\n")
+
+    # -F multipart file upload and --form-string
+    mp := build_multipart_parts([FormSpec("title=@notfile", true), FormSpec("doc=@" + sample + ";filename=custom.txt;type=text/plain", false)], none)!
+    assert_eq(mp.0.len(), 2)
+    assert_eq(mp.0[0].name, "title")
+    assert_eq(mp.0[0].body.to_string_utf8()!, "@notfile")
+    assert_eq(mp.0[1].name, "doc")
+    assert_eq(mp.0[1].filename, "custom.txt")
+    assert_eq(mp.0[1].content_type, "text/plain")
+
+    # -w write-out formatting + JSON output + %header{name} + %% escape + %{onerror}
+    mut hdrs: Map[String, String] := {}
+    hdrs.insert("content-type", "application/json")
+    hdrs.insert("x-trace-id", "abc-9")
+    m := TransferMetrics(200, "application/json", 42, 10, 120, 80, 150, 140, 5, "https://ex.test/ok", "", 1, "1.1", "HTTPS", "127.0.0.1", 443, "out.json", hdrs, 0, "")
+    wo := format_write_out("code=%{{http_code}} size=%{{size_download}} time=%{{time_total}} dns=%{{time_namelookup}} ip=%{{remote_ip}} file=%{{filename_effective}} hdr=%header{{X-Trace-Id}} pct=%%\\n%{{onerror}}ERR", m)!
+    assert_eq(wo, "code=200 size=42 time=0.150000 dns=0.005000 ip=127.0.0.1 file=out.json hdr=abc-9 pct=%\n")
+
+    jwo := format_write_out("%{{json}}", m)!
+    parsed_j := json.parse(jwo)
+    assert_eq(json.get_int(json.object_get(parsed_j, "http_code")), 200)
+    assert_eq(json.get_string(json.object_get(parsed_j, "url_effective")), "https://ex.test/ok")
+    assert_eq(json.get_string(json.object_get(parsed_j, "remote_ip")), "127.0.0.1")
+
+    # Content-Disposition sanitization blocks directory traversal
+    assert_eq(extract_content_disposition_filename("attachment; filename=\"../../etc/passwd\""), "passwd")
+    assert_eq(extract_content_disposition_filename("attachment; filename=report.pdf"), "report.pdf")
+    assert_eq(extract_content_disposition_filename("attachment; filename=\"..\""), "")
+
+    # Exit code classification
+    assert_eq(classify_error_exit_code("purl: unsupported protocol 'ftp'"), 1)
+    assert_eq(classify_error_exit_code("purl: malformed url: bad port"), 3)
+    assert_eq(classify_error_exit_code("http: client timeout exceeded"), 28)
+    assert_eq(classify_error_exit_code("tls: certificate expired"), 60)
+    assert_eq(classify_error_exit_code("http: server closed the connection before responding"), 52)
+    assert_eq(classify_error_exit_code("purl: unrecognized content-encoding 'br'"), 61)
+    assert_eq(classify_error_exit_code("purl: maximum file size exceeded"), 63)
+
+    assert(fs.remove_tree(tmp))
+
+test "purl_glob expands sets, numeric/char ranges, captures, and preserves ipv6":
+    g1 := expand_url("http://ex.test/{{a,b}}/[01-03:2]", false)!
+    assert_eq(g1.len(), 4)
+    assert_eq(g1[0].url, "http://ex.test/a/01")
+    assert_eq(substitute_output_template("out_#1_#2.txt", g1[0].captures), "out_a_01.txt")
+    assert_eq(g1[3].url, "http://ex.test/b/03")
+    assert_eq(substitute_output_template("out_#1_#2.txt", g1[3].captures), "out_b_03.txt")
+
+    g2 := expand_url("http://ex.test/[a-e:2]", false)!
+    assert_eq(g2.len(), 3)
+    assert_eq(g2[0].url, "http://ex.test/a")
+    assert_eq(g2[1].url, "http://ex.test/c")
+    assert_eq(g2[2].url, "http://ex.test/e")
+
+    # IPv6 host bracket stays literal; globoff disables expansion.
+    v6 := expand_url("http://[::1]:8080/ping", false)!
+    assert_eq(v6.len(), 1)
+    assert_eq(v6[0].url, "http://[::1]:8080/ping")
+
+    off := expand_url("http://ex.test/{{a,b}}", true)!
+    assert_eq(off.len(), 1)
+    assert_eq(off[0].url, "http://ex.test/{{a,b}}")
+
+    assert(expand_url("http://ex.test/[9-1]", false).is_err)
+
+test "purl_auth computes MD5, HTTP Digest, AWS SigV4, and parses netrc + cookie Expires":
+    # RFC 1321 MD5 test vectors
+    assert_eq(md5_hex(""), "d41d8cd98f00b204e9800998ecf8427e")
+    assert_eq(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72")
+    assert_eq(md5_hex("message digest"), "f96b697d7cb7938d525a2f31aaf161d0")
+
+    # RFC 2617 / 7616 Digest Auth (MD5 and SHA-256)
+    d_md5 := build_digest_header_with_cnonce("Digest realm=\"testrealm@host.com\", qop=\"auth\", nonce=\"dcd98b7102dd2f0e8b11d0f600bfb0c093\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"", "Mufasa", "Circle Of Life", "GET", "/dir/index.html", "0a4f113b")!
+    assert(d_md5.contains("response=\"6629fae49393a05397450978507c4ef1\""))
+    assert(d_md5.contains("opaque=\"5ccc069c403ebaf9f0171e9517f40e41\""))
+
+    d_sha := build_digest_header_with_cnonce("Digest realm=\"purl\", qop=\"auth\", algorithm=SHA-256, nonce=\"abc\"", "alice", "secret", "GET", "/priv", "11223344")!
+    assert(d_sha.contains("algorithm=SHA-256"))
+    assert(d_sha.contains("qop=auth"))
+
+    # AWS SigV4 deterministic signing (official AWS SigV4 timestamp 2015-08-30T12:36:00Z = 1440938160)
+    u := parse_target_url("https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08", "https")!
+    mut h: Map[String, String] := {}
+    sign_aws_sigv4_at("aws:amz:us-east-1:iam", "AKIDEXAMPLE", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", "GET", u, h, bytes.empty(), 1440938160)!
+    assert_eq(h["X-Amz-Date"], "20150830T123600Z")
+    assert_eq(h["X-Amz-Content-Sha256"], "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    assert(h["Authorization"].starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/iam/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature="))
+
+    # .netrc lookup (exact machine wins over default; macdef skipped)
+    tmp := fs.make_temp_dir("purl-netrc-test-")!
+    nrc := path_mod.join(tmp, "netrc")
+    fs.write(nrc, "machine api.example.com\n  login alice\n  password \"s p\"\nmacdef init\n  ignored line\n\ndefault login guest password anon\n")!
+    c1 := lookup_netrc("api.example.com", nrc)
+    assert(c1 != none)
+    if let got1 = c1:
+        assert_eq(got1.login, "alice")
+        assert_eq(got1.password, "s p")
+    c2 := lookup_netrc("other.example.com", nrc)
+    assert(c2 != none)
+    if let got2 = c2:
+        assert_eq(got2.login, "guest")
+        assert_eq(got2.password, "anon")
+    assert(fs.remove_tree(tmp))
+
+    # Cookie HTTP-date Expires parsing (RFC 1123 and RFC 850)
+    assert_eq(parse_http_expires("Wed, 21 Oct 2015 07:28:00 GMT"), 1445412480)
+    assert_eq(parse_http_expires("Wed, 21-Oct-2015 07:28:00 GMT"), 1445412480)
+    jar := new_jar()
+    store_set_cookie(jar, "old=1; Path=/; Expires=Wed, 21 Oct 2015 07:28:00 GMT", "ex.test", "/")
+    store_set_cookie(jar, "fresh=2; Path=/; Expires=Wed, 21 Oct 2035 07:28:00 GMT", "ex.test", "/")
+    assert_eq(cookie_header_for(jar, "ex.test", "/", false), "fresh=2")
+
+    # Byte size parser + new CLI flags
+    assert_eq(parse_byte_size("512")!, 512)
+    assert_eq(parse_byte_size("10k")!, 10240)
+    assert_eq(parse_byte_size("2M")!, 2097152)
+    p := parse_tokens_standalone(["-Z", "--parallel-max", "8", "-g", "-n", "--digest", "--aws-sigv4", "aws:amz:us-west-2:s3", "--resolve", "a:80:127.0.0.1", "--connect-to", "a:80:127.0.0.1:8080", "--etag-save", "e.txt", "--etag-compare", "e.txt", "-z", "f.txt", "--max-filesize", "4k", "http://a/"])
+    assert_eq(p.error_msg, "")
+    assert(p.parallel)
+    assert_eq(p.parallel_max, 8)
+    assert(p.specs[0].globoff)
+    assert(p.specs[0].netrc)
+    assert(p.specs[0].use_digest)
+    assert_eq(p.specs[0].max_filesize, 4096)

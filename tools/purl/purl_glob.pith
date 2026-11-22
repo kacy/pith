@@ -1,0 +1,251 @@
+# purl_glob — curl-compatible URL globbing ({a,b,c}, [1-10], [01-05], [a-z],
+# [1-10:2]) and output filename capture substitution (-o "out_#1_#2.txt").
+#
+# Preserves IPv6 bracketed host literals like http://[::1]:8080/ untouched,
+# and supports backslash escapes (\{, \[) and -g / --globoff.
+
+# One expanded URL along with its captured glob values (1-indexed via #1, #2, ...).
+pub struct ExpandedUrl:
+    pub url: String
+    pub captures: List[String]
+
+# Maximum expanded URLs from one glob pattern (safety guard against accidental explosions).
+MAX_GLOB_EXPANSION := 4096
+
+# True when text is non-empty ASCII digits.
+fn is_all_digits(text: String) -> Bool:
+    if text.len() == 0:
+        return false
+    mut i := 0
+    while i < text.len():
+        c := ord(text[i])
+        if c < 48 or c > 57:
+            return false
+        i = i + 1
+    return true
+
+# Zero-pad a non-negative integer to at least `width` digits.
+fn zero_pad(n: Int, width: Int) -> String:
+    mut s := n.to_string()
+    while s.len() < width:
+        s = "0" + s
+    return s
+
+# True when `[` at `bracket_pos` is the host part of an IPv6 authority (contains ':' and no '-').
+fn is_ipv6_host_bracket(pattern: String, bracket_pos: Int, close_pos: Int) -> Bool:
+    # IPv6 host literals appear right at start, after "://", or after "@".
+    mut at_host := bracket_pos == 0
+    if bracket_pos >= 3 and pattern.substring(bracket_pos - 3, bracket_pos) == "://":
+        at_host = true
+    elif bracket_pos >= 1 and pattern[bracket_pos - 1] == "@":
+        at_host = true
+    if not at_host:
+        return false
+    inside := pattern.substring(bracket_pos + 1, close_pos)
+    return inside.contains(":") and not inside.contains("-")
+
+# Parse a `[...]` range specification: `1-5`, `01-05`, `1-10:2`, `a-z`, `a-z:2`.
+# Returns empty list when the bracket contents are not a valid glob range.
+fn expand_range(spec: String) -> List[String]:
+    mut out: List[String] := []
+    dash := spec.index_of("-")
+    if dash <= 0 or dash >= spec.len() - 1:
+        return out
+
+    start_str := spec.substring(0, dash)
+    mut end_str := spec.substring(dash + 1, spec.len())
+    mut step := 1
+
+    colon := end_str.index_of(":")
+    if colon >= 0:
+        step_str := end_str.substring(colon + 1, end_str.len())
+        end_str = end_str.substring(0, colon)
+        if not is_all_digits(step_str):
+            return out
+        step = parse_int(step_str) catch 0
+        if step <= 0:
+            return out
+
+    # Numeric range: [0-9]+ - [0-9]+
+    if is_all_digits(start_str) and is_all_digits(end_str):
+        start_val := parse_int(start_str) catch -1
+        end_val := parse_int(end_str) catch -1
+        if start_val < 0 or end_val < start_val:
+            return out
+        mut pad_width := 0
+        if start_str.len() > 1 and start_str.starts_with("0"):
+            pad_width = start_str.len()
+        mut cur := start_val
+        while cur <= end_val and out.len() < MAX_GLOB_EXPANSION:
+            if pad_width > 0:
+                out.push(zero_pad(cur, pad_width))
+            else:
+                out.push(cur.to_string())
+            cur = cur + step
+        return out
+
+    # Single-character ASCII letter range: [a-z] or [A-Z]
+    if start_str.len() == 1 and end_str.len() == 1:
+        s_code := ord(start_str[0])
+        e_code := ord(end_str[0])
+        lower_ok := s_code >= 97 and s_code <= 122 and e_code >= s_code and e_code <= 122
+        upper_ok := s_code >= 65 and s_code <= 90 and e_code >= s_code and e_code <= 90
+        if lower_ok or upper_ok:
+            mut c := s_code
+            while c <= e_code and out.len() < MAX_GLOB_EXPANSION:
+                out.push(chr(c))
+                c = c + step
+            return out
+
+    return out
+
+# Split `{a,b,c}` body on unescaped commas.
+fn split_set_items(body: String) -> List[String]:
+    mut items: List[String] := []
+    mut cur: List[String] := []
+    mut i := 0
+    while i < body.len():
+        c := ord(body[i])
+        if c == 92 and i + 1 < body.len():
+            cur.push(body[i + 1])
+            i = i + 2
+            continue
+        if c == 44:
+            items.push(cur.join(""))
+            cur = []
+            i = i + 1
+            continue
+        cur.push(body[i])
+        i = i + 1
+    items.push(cur.join(""))
+    return items
+
+# Copy a List[String] and append one value.
+fn append_capture(base: List[String], val: String) -> List[String]:
+    mut next: List[String] := []
+    for item in base:
+        next.push(item)
+    next.push(val)
+    return next
+
+# Find the index of unescaped `target_byte` starting at `start`, or -1.
+fn find_unescaped(text: String, start: Int, target_byte: Int) -> Int:
+    mut i := start
+    while i < text.len():
+        c := ord(text[i])
+        if c == 92 and i + 1 < text.len():
+            i = i + 2
+            continue
+        if c == target_byte:
+            return i
+        i = i + 1
+    return 0 - 1
+
+# Expand curl URL globs (`{a,b}` and `[1-5]`, `[01-05]`, `[a-z]`, `[1-10:2]`).
+# When `globoff` is true, returns the literal URL untouched.
+pub fn expand_url(pattern: String, globoff: Bool) -> List[ExpandedUrl]!:
+    if globoff:
+        empty_caps: List[String] := []
+        return [ExpandedUrl(pattern, empty_caps)]
+
+    # Build a sequence of literal/choice segments; each choice segment also records captures.
+    mut seg_choices: List[List[String]] := []
+    mut seg_is_glob: List[Bool] := []
+    mut lit: List[String] := []
+    mut i := 0
+    n := pattern.len()
+
+    while i < n:
+        c := ord(pattern[i])
+        if c == 92 and i + 1 < n:
+            nxt_code := ord(pattern[i + 1])
+            if nxt_code == 123 or nxt_code == 125 or nxt_code == 91 or nxt_code == 93 or nxt_code == 92:
+                lit.push(pattern[i + 1])
+                i = i + 2
+                continue
+            lit.push(pattern[i])
+            i = i + 1
+            continue
+
+        if c == 123:
+            close := find_unescaped(pattern, i + 1, 125)
+            if close < 0:
+                fail "purl: malformed url: unmatched open brace in '{pattern}'"
+            if lit.len() > 0:
+                seg_choices.push([lit.join("")])
+                seg_is_glob.push(false)
+                lit = []
+            items := split_set_items(pattern.substring(i + 1, close))
+            seg_choices.push(items)
+            seg_is_glob.push(true)
+            i = close + 1
+            continue
+
+        if c == 91:
+            close := find_unescaped(pattern, i + 1, 93)
+            if close < 0:
+                fail "purl: malformed url: unmatched '[' in '{pattern}'"
+            if is_ipv6_host_bracket(pattern, i, close):
+                lit.push(pattern.substring(i, close + 1))
+                i = close + 1
+                continue
+            range_items := expand_range(pattern.substring(i + 1, close))
+            if range_items.len() == 0:
+                fail "purl: malformed url: invalid glob range '[{pattern.substring(i + 1, close)}]'"
+            if lit.len() > 0:
+                seg_choices.push([lit.join("")])
+                seg_is_glob.push(false)
+                lit = []
+            seg_choices.push(range_items)
+            seg_is_glob.push(true)
+            i = close + 1
+            continue
+
+        lit.push(pattern[i])
+        i = i + 1
+
+    if lit.len() > 0:
+        seg_choices.push([lit.join("")])
+        seg_is_glob.push(false)
+
+    # Cartesian product across all segments.
+    mut results: List[ExpandedUrl] := [ExpandedUrl("", [])]
+    mut si := 0
+    while si < seg_choices.len():
+        choices := seg_choices[si]
+        is_glob := seg_is_glob[si]
+        mut next_results: List[ExpandedUrl] := []
+        for cur in results:
+            for ch in choices:
+                if next_results.len() >= MAX_GLOB_EXPANSION:
+                    fail "purl: url glob expansion exceeds limit ({MAX_GLOB_EXPANSION})"
+                mut next_caps := cur.captures
+                if is_glob:
+                    next_caps = append_capture(cur.captures, ch)
+                next_results.push(ExpandedUrl(cur.url + ch, next_caps))
+        results = next_results
+        si = si + 1
+
+    return results
+
+# Substitute `#1`, `#2`, ... in an output path template using glob captures.
+pub fn substitute_output_template(template: String, captures: List[String]) -> String:
+    if captures.len() == 0 or not template.contains("#"):
+        return template
+    mut parts: List[String] := []
+    mut i := 0
+    n := template.len()
+    while i < n:
+        if ord(template[i]) == 35 and i + 1 < n:
+            mut j := i + 1
+            while j < n and ord(template[j]) >= 48 and ord(template[j]) <= 57:
+                j = j + 1
+            if j > i + 1:
+                idx := (parse_int(template.substring(i + 1, j)) catch 0) - 1
+                if idx >= 0 and idx < captures.len():
+                    parts.push(captures[idx])
+                    i = j
+                    continue
+        parts.push(template[i])
+        i = i + 1
+    return parts.join("")

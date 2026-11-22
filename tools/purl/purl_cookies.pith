@@ -1,0 +1,318 @@
+# purl_cookies — HTTP cookie store and Netscape cookie jar support (-b / -c).
+#
+# Supports loading and saving Mozilla/Netscape cookies.txt jars, parsing
+# Set-Cookie response headers (Path, Domain, Max-Age, Secure, HttpOnly),
+# and matching outbound cookies across redirect hops.
+
+import std.bytes as bytes
+import std.datetime as datetime
+import std.fs as fs
+import std.time as time
+
+# One stored HTTP cookie.
+pub struct CookieEntry:
+    pub domain: String
+    pub include_subdomains: Bool
+    pub path: String
+    pub secure: Bool
+    pub http_only: Bool
+    pub expires: Int
+    pub name: String
+    pub value: String
+
+# Mutable in-memory cookie jar.
+pub struct CookieJar:
+    pub mut entries: List[CookieEntry]
+
+# Create an empty cookie jar.
+pub fn new_jar() -> CookieJar:
+    empty: List[CookieEntry] := []
+    return CookieJar(empty)
+
+# Default cookie path derived from the request path (RFC 6265 5.1.4).
+fn default_cookie_path(req_path: String) -> String:
+    if req_path == "" or not req_path.starts_with("/"):
+        return "/"
+    slash := req_path.last_index_of("/")
+    if slash <= 0:
+        return "/"
+    return req_path.substring(0, slash)
+
+# Normalize a domain for matching (lowercase, strip leading dot).
+fn normalize_domain(domain: String) -> String:
+    mut d := domain.trim().to_lower()
+    while d.starts_with("."):
+        d = d.substring(1, d.len())
+    return d
+
+# True when `host` matches cookie `entry` domain rules.
+fn domain_matches(host: String, entry: CookieEntry) -> Bool:
+    h := host.to_lower()
+    d := entry.domain.to_lower()
+    if h == d:
+        return true
+    if entry.include_subdomains and h.ends_with("." + d):
+        return true
+    return false
+
+# True when `req_path` matches cookie `cookie_path` (RFC 6265 5.1.4).
+fn path_matches(req_path: String, cookie_path: String) -> Bool:
+    mut p := req_path
+    if p == "":
+        p = "/"
+    if p == cookie_path:
+        return true
+    if cookie_path == "/":
+        return p.starts_with("/")
+    if p.starts_with(cookie_path):
+        if cookie_path.ends_with("/"):
+            return true
+        if p.len() > cookie_path.len() and p[cookie_path.len()] == "/":
+            return true
+    return false
+
+# Insert or replace a cookie entry with the same (domain, path, name).
+# Removes the entry instead when `delete_it` is true.
+fn upsert_cookie(jar: CookieJar, item: CookieEntry, delete_it: Bool):
+    mut next: List[CookieEntry] := []
+    for existing in jar.entries:
+        same := existing.domain == item.domain and existing.path == item.path and existing.name == item.name
+        if not same:
+            next.push(existing)
+    if not delete_it:
+        next.push(item)
+    jar.entries = next
+
+# Map a 3-letter English month abbreviation to 1..12, or 0 if unknown.
+fn month_from_short(name: String) -> Int:
+    m := name.to_lower()
+    if m == "jan":
+        return 1
+    if m == "feb":
+        return 2
+    if m == "mar":
+        return 3
+    if m == "apr":
+        return 4
+    if m == "may":
+        return 5
+    if m == "jun":
+        return 6
+    if m == "jul":
+        return 7
+    if m == "aug":
+        return 8
+    if m == "sep":
+        return 9
+    if m == "oct":
+        return 10
+    if m == "nov":
+        return 11
+    if m == "dec":
+        return 12
+    return 0
+
+# Parse an HTTP cookie Expires date (RFC 1123 or RFC 850) into Unix seconds, or -1.
+# Examples: "Wed, 21 Oct 2035 07:28:00 GMT", "Wed, 21-Oct-2035 07:28:00 GMT".
+pub fn parse_http_expires(raw: String) -> Int:
+    mut text := raw.trim()
+    comma := text.index_of(",")
+    if comma >= 0:
+        text = text.substring(comma + 1, text.len()).trim()
+
+    # Split on spaces and hyphens to handle both "21 Oct 2035" and "21-Oct-2035".
+    mut tokens: List[String] := []
+    for sp in text.split(" "):
+        t := sp.trim()
+        if t == "":
+            continue
+        if t.contains("-") and not t.contains(":"):
+            for dp in t.split("-"):
+                dt := dp.trim()
+                if dt != "":
+                    tokens.push(dt)
+        else:
+            tokens.push(t)
+
+    if tokens.len() < 4:
+        return 0 - 1
+    day_val := parse_int(tokens[0]) catch 0
+    mon_val := month_from_short(tokens[1])
+    mut year_val := parse_int(tokens[2]) catch 0
+    if year_val > 0 and year_val < 100:
+        if year_val >= 70:
+            year_val = year_val + 1900
+        else:
+            year_val = year_val + 2000
+
+    hms := tokens[3].split(":")
+    if hms.len() != 3:
+        return 0 - 1
+    hh := parse_int(hms[0]) catch -1
+    mm := parse_int(hms[1]) catch -1
+    ss := parse_int(hms[2]) catch -1
+    if day_val < 1 or day_val > 31 or mon_val < 1 or year_val < 1970:
+        return 0 - 1
+    if hh < 0 or hh > 23 or mm < 0 or mm > 59 or ss < 0 or ss > 60:
+        return 0 - 1
+
+    d := datetime.date(year_val, mon_val, day_val)
+    if not datetime.is_valid(d):
+        return 0 - 1
+    base_secs := datetime.to_timestamp(d) / 1000
+    return base_secs + hh * 3600 + mm * 60 + ss
+
+# Parse one Set-Cookie header value and update `jar`.
+pub fn store_set_cookie(jar: CookieJar, header_value: String, req_host: String, req_path: String):
+    parts := header_value.split(";")
+    if parts.len() == 0:
+        return
+    first := parts[0].trim()
+    eq := first.index_of("=")
+    if eq <= 0:
+        return
+    name := first.substring(0, eq).trim()
+    value := first.substring(eq + 1, first.len()).trim()
+    if name == "":
+        return
+
+    mut domain := req_host.to_lower()
+    mut include_subdomains := false
+    mut cookie_path := default_cookie_path(req_path)
+    mut secure := false
+    mut http_only := false
+    mut expires := 0
+    mut has_max_age := false
+    mut delete_it := false
+
+    mut i := 1
+    while i < parts.len():
+        attr := parts[i].trim()
+        if attr != "":
+            aeq := attr.index_of("=")
+            if aeq < 0:
+                lower_flag := attr.to_lower()
+                if lower_flag == "secure":
+                    secure = true
+                elif lower_flag == "httponly":
+                    http_only = true
+            else:
+                k := attr.substring(0, aeq).trim().to_lower()
+                v := attr.substring(aeq + 1, attr.len()).trim()
+                if k == "domain":
+                    norm := normalize_domain(v)
+                    if norm != "":
+                        req_lower := req_host.to_lower()
+                        if req_lower == norm or req_lower.ends_with("." + norm):
+                            domain = norm
+                            include_subdomains = true
+                elif k == "path":
+                    if v.starts_with("/"):
+                        cookie_path = v
+                elif k == "max-age":
+                    secs := parse_int(v) catch -999999
+                    if secs != -999999:
+                        has_max_age = true
+                        if secs <= 0:
+                            delete_it = true
+                            expires = 1
+                        else:
+                            expires = time.unix() + secs
+                elif k == "expires" and not has_max_age:
+                    exp_ts := parse_http_expires(v)
+                    if exp_ts >= 0:
+                        expires = exp_ts
+                        if exp_ts <= time.unix():
+                            delete_it = true
+        i = i + 1
+
+    entry := CookieEntry(domain, include_subdomains, cookie_path, secure, http_only, expires, name, value)
+    upsert_cookie(jar, entry, delete_it)
+
+# Load a Netscape / Mozilla cookies.txt file into `jar`.
+# Returns the number of cookie entries loaded.
+pub fn load_cookie_file(jar: CookieJar, file_path: String) -> Int!:
+    raw := fs.read(file_path)!
+    mut loaded := 0
+    tab := chr(9)
+    for raw_line in raw.split("\n"):
+        mut line := raw_line.trim()
+        if line == "":
+            continue
+        mut http_only := false
+        if line.starts_with("#HttpOnly_"):
+            http_only = true
+            line = line.substring(10, line.len())
+        elif line.starts_with("#"):
+            continue
+        cols := line.split(tab)
+        if cols.len() < 7:
+            continue
+        domain := normalize_domain(cols[0])
+        if domain == "":
+            continue
+        include_sub := cols[1].trim().to_upper() == "TRUE"
+        mut cookie_path := cols[2].trim()
+        if cookie_path == "":
+            cookie_path = "/"
+        secure := cols[3].trim().to_upper() == "TRUE"
+        expires := parse_int(cols[4].trim()) catch 0
+        name := cols[5]
+        value := cols[6]
+        if name == "":
+            continue
+        entry := CookieEntry(domain, include_sub, cookie_path, secure, http_only, expires, name, value)
+        upsert_cookie(jar, entry, false)
+        loaded = loaded + 1
+    return loaded
+
+# Serialize `jar` in Netscape cookies.txt format.
+pub fn format_cookie_jar(jar: CookieJar) -> String:
+    tab := chr(9)
+    nl := chr(10)
+    mut out := "# Netscape HTTP Cookie File" + nl
+    out = out + "# Generated by purl" + nl + nl
+    now_unix := time.unix()
+    for c in jar.entries:
+        if c.expires > 0 and c.expires <= now_unix:
+            continue
+        mut dom_col := c.domain
+        if c.include_subdomains:
+            dom_col = "." + dom_col
+        if c.http_only:
+            dom_col = "#HttpOnly_" + dom_col
+        mut sub_col := "FALSE"
+        if c.include_subdomains:
+            sub_col = "TRUE"
+        mut sec_col := "FALSE"
+        if c.secure:
+            sec_col = "TRUE"
+        out = out + dom_col + tab + sub_col + tab + c.path + tab + sec_col + tab + c.expires.to_string() + tab + c.name + tab + c.value + nl
+    return out
+
+# Write `jar` to `file_path` (or stdout when `file_path` is "-").
+pub fn save_cookie_file(jar: CookieJar, file_path: String) -> Int!:
+    text := format_cookie_jar(jar)
+    if file_path == "-":
+        n := term_write(1, bytes.from_string_utf8(text))
+        if n < 0:
+            fail "failed writing cookie jar to stdout"
+        return n
+    fs.write(file_path, text)!
+    return text.len()
+
+# Build the Cookie header value ("a=1; b=2") matching `host`, `req_path`, and `is_https`.
+pub fn cookie_header_for(jar: CookieJar, host: String, req_path: String, is_https: Bool) -> String:
+    now_unix := time.unix()
+    mut pairs: List[String] := []
+    for c in jar.entries:
+        if c.expires > 0 and c.expires <= now_unix:
+            continue
+        if c.secure and not is_https:
+            continue
+        if not domain_matches(host, c):
+            continue
+        if not path_matches(req_path, c.path):
+            continue
+        pairs.push(c.name + "=" + c.value)
+    return pairs.join("; ")

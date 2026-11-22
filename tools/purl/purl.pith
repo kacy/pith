@@ -1,0 +1,123 @@
+# purl — a curl replica written in Pith on top of Pith's standard library.
+#
+#   pith build tools/purl/purl.pith
+#   ./tools/purl/purl -fsSL https://example.com
+#
+# Supports HTTP/1.1, HTTPS (TLS 1.2/1.3), HTTP/2 (h2 and h2c), file://,
+# redirects, cookies, auth, JSON/form/multipart uploads, compression,
+# retries, proxies, config files, write-out formatting, and curl exit codes.
+
+import std.net.http2.frames as h2frames
+import std.net.http2.hpack as h2hpack
+import std.net.http2.connection as h2conn
+from purl_args import parse_cli
+from purl_client import execute_cli
+
+PURL_VERSION := "purl 0.1.0 (pith)"
+
+fn print_version():
+    print(PURL_VERSION)
+    print("Protocols: http https file")
+    print("Features: HTTP/1.1 HTTP/2 TLS1.2 TLS1.3 gzip deflate zstd cookies proxy digest aws-sigv4 netrc glob parallel stream")
+
+fn print_help():
+    print("Usage: purl [options...] <url> [url...]")
+    print(" -A, --user-agent <name>       Send User-Agent <name> to server")
+    print(" -b, --cookie <data|file>      Send cookies from string/file")
+    print(" -c, --cookie-jar <file>       Write cookies to <file> after operation")
+    print(" -C, --continue-at <offset|->  Resumed transfer offset")
+    print(" -d, --data <data>             HTTP POST data (@file, @- for stdin)")
+    print("     --data-raw <data>         HTTP POST data, '@' allowed literally")
+    print("     --data-binary <data>      HTTP POST binary data")
+    print("     --data-urlencode <data>   HTTP POST data URL encoded")
+    print("     --json <data>             HTTP POST JSON with JSON headers")
+    print(" -D, --dump-header <file>      Write received headers to <file>")
+    print(" -e, --referer <url>           Referer URL (supports ;auto)")
+    print(" -f, --fail                    Fail silently (exit 22) on HTTP errors")
+    print("     --fail-with-body          Fail (exit 22) on HTTP errors but save body")
+    print(" -F, --form <name=content>     Specify multipart MIME data")
+    print("     --form-string <name=val>  Specify multipart string data")
+    print(" -g, --globoff                 Disable URL globbing ({{}} and [])")
+    print(" -G, --get                     Put -d data in the URL query string")
+    print(" -H, --header <header|@file>   Pass custom header(s) to server")
+    print(" -i, --include                 Include protocol response headers in output")
+    print(" -I, --head                    Show document info only (HEAD)")
+    print(" -J, --remote-header-name      Use Content-Disposition filename with -O")
+    print(" -k, --insecure                Allow insecure TLS connections")
+    print(" -K, --config <file>           Read config from <file> ('-' for stdin)")
+    print(" -L, --location                Follow redirects")
+    print("     --location-trusted        Follow redirects and forward credentials")
+    print("     --max-redirs <num>        Maximum redirects allowed (default: 50)")
+    print(" -m, --max-time <seconds>      Maximum time allowed for transfer")
+    print("     --connect-timeout <secs>  Maximum time allowed for connection")
+    print("     --max-filesize <bytes>    Maximum file size to download (exit 63)")
+    print(" -n, --netrc                   Read credentials from ~/.netrc")
+    print("     --netrc-optional          Use ~/.netrc or URL; don't fail if missing")
+    print("     --netrc-file <file>       Specify netrc file for credentials")
+    print(" -o, --output <file>           Write to file instead of stdout (#1 glob vars)")
+    print(" -O, --remote-name             Write output to file named like remote file")
+    print("     --output-dir <dir>        Directory to save files in")
+    print("     --create-dirs             Create necessary local directory hierarchy")
+    print(" -q, --disable                 Disable ~/.purlrc (must be first option)")
+    print(" -r, --range <range>           Retrieve only bytes within <range>")
+    print("     --resolve <h:p:addr>      Resolve host+port to this address")
+    print("     --connect-to <h1:p1:h2:p2> Connect to host2:port2 instead of host1:port1")
+    print(" -s, --silent                  Silent mode")
+    print(" -S, --show-error              Show error even when -s is used")
+    print(" -T, --upload-file <file>      Transfer local file via PUT ('-' for stdin)")
+    print(" -u, --user <user[:password]>  Server user and password (Basic/Digest/SigV4)")
+    print(" -U, --proxy-user <user:pass>  Proxy user and password (Basic auth)")
+    print("     --digest                  Use HTTP Digest authentication (MD5/SHA-256)")
+    print("     --aws-sigv4 <p1[:p2[:r[:s]]]> Sign request with AWS SigV4")
+    print("     --oauth2-bearer <token>   OAuth 2 Bearer Token")
+    print(" -v, --verbose                 Make the operation more talkative")
+    print(" -w, --write-out <format>      Output transfer metrics after completion")
+    print(" -x, --proxy <[proto://]h[:p]> Use HTTP proxy")
+    print("     --noproxy <hosts>         Comma-separated hosts bypassing proxy")
+    print(" -X, --request <method>        Specify request method to use")
+    print(" -z, --time-cond <file|date>   Transfer based on a time condition")
+    print("     --etag-compare <file>     Pass ETag from <file> as If-None-Match")
+    print("     --etag-save <file>        Save response ETag header to <file>")
+    print(" -Z, --parallel                Perform transfers in parallel")
+    print("     --parallel-max <num>      Maximum concurrent transfers (default: 50)")
+    print("     --compressed              Request and decode gzip/deflate/zstd")
+    print("     --cacert <file>           CA certificate to verify peer against")
+    print("     --cert <file>             Client certificate file (PEM)")
+    print("     --key <file>              Client private key file (PKCS#8 PEM)")
+    print("     --tlsv1.2 / --tlsv1.3     Pin TLS version")
+    print("     --http1.1 / --http2       Select HTTP protocol version")
+    print("     --http2-prior-knowledge   Use plaintext HTTP/2 (h2c)")
+    print("     --retry <num>             Retry transient errors")
+    print("     --retry-delay <secs>      Wait time between retries")
+    print("     --retry-max-time <secs>   Retry only within this period")
+    print("     --retry-all-errors        Retry all errors")
+    print("     --retry-connrefused       Retry on connection refused")
+    print(" -:, --next                    Make next URL use its own set of options")
+    print(" -h, --help                    Show this help message")
+    print(" -V, --version                 Show version number and quit")
+
+fn main():
+    parsed := parse_cli(args())
+    if parsed.error_msg != "":
+        print_err("purl: {parsed.error_msg}")
+        print_err("purl: try 'purl --help' for more information")
+        exit(2)
+    if parsed.show_help:
+        print_help()
+        return
+    if parsed.show_version:
+        print_version()
+        return
+
+    mut has_any_url := false
+    for s in parsed.specs:
+        if s.urls.len() > 0:
+            has_any_url = true
+    if not has_any_url:
+        print_err("purl: no URL specified")
+        print_err("purl: try 'purl --help' for more information")
+        exit(2)
+
+    code := execute_cli(parsed)
+    if code != 0:
+        exit(code)

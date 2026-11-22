@@ -1,0 +1,553 @@
+# purl_auth — .netrc credential lookup (-n/--netrc/--netrc-file), HTTP Digest
+# authentication (--digest, RFC 7616 MD5 and SHA-256), and AWS SigV4 request
+# signing (--aws-sigv4) built on std.hash, std.crypto.hmac, std.crypto.random,
+# std.datetime, and std.bits.
+
+import std.bits as bits
+import std.bytes as bytes
+import std.crypto.hmac as hmac
+import std.crypto.random as random
+import std.datetime as datetime
+import std.encoding as encoding
+import std.fs as fs
+import std.hash as hash
+import std.net.url as url
+import std.os as os
+import std.os.path as path_mod
+import std.time as time
+from purl_url import ParsedUrl, authority_header
+
+# ===============================================================
+# .netrc Lookup (-n / --netrc / --netrc-file)
+# ===============================================================
+
+# A username/password pair resolved from .netrc.
+pub struct NetrcCreds:
+    pub login: String
+    pub password: String
+
+# Split `text` on '\n' while preserving empty lines (unlike String.split, which skips empty segments).
+fn split_lines_keep_empty(text: String) -> List[String]:
+    mut lines: List[String] := []
+    mut start := 0
+    mut i := 0
+    n := text.len()
+    while i < n:
+        if ord(text[i]) == 10:
+            lines.push(text.substring(start, i))
+            start = i + 1
+        i = i + 1
+    lines.push(text.substring(start, n))
+    return lines
+
+# Tokenize a .netrc file into whitespace-delimited tokens, honoring quoted strings
+# and skipping `macdef` bodies (which run through the next blank line).
+fn tokenize_netrc(text: String) -> List[String]:
+    mut tokens: List[String] := []
+    mut in_macdef := false
+    for raw_line in split_lines_keep_empty(text):
+        trimmed := raw_line.trim()
+        if in_macdef:
+            if trimmed == "":
+                in_macdef = false
+            continue
+        if trimmed == "" or trimmed.starts_with("#"):
+            continue
+        mut pos := 0
+        n := trimmed.len()
+        while pos < n:
+            while pos < n and (ord(trimmed[pos]) == 32 or ord(trimmed[pos]) == 9):
+                pos = pos + 1
+            if pos >= n:
+                break
+            if ord(trimmed[pos]) == 35:
+                break
+            mut tok := ""
+            if ord(trimmed[pos]) == 34:
+                pos = pos + 1
+                mut parts: List[String] := []
+                while pos < n and ord(trimmed[pos]) != 34:
+                    if ord(trimmed[pos]) == 92 and pos + 1 < n:
+                        parts.push(trimmed[pos + 1])
+                        pos = pos + 2
+                    else:
+                        parts.push(trimmed[pos])
+                        pos = pos + 1
+                if pos < n and ord(trimmed[pos]) == 34:
+                    pos = pos + 1
+                tok = parts.join("")
+            else:
+                start := pos
+                while pos < n and ord(trimmed[pos]) != 32 and ord(trimmed[pos]) != 9:
+                    pos = pos + 1
+                tok = trimmed.substring(start, pos)
+            if tok == "macdef":
+                in_macdef = true
+                break
+            tokens.push(tok)
+    return tokens
+
+# Resolve login/password for `host` from `netrc_path` (defaults to ~/.netrc when empty).
+# Exact `machine <host>` entries win over `default`. Returns none if no match exists.
+pub fn lookup_netrc(host: String, netrc_path: String) -> NetrcCreds?:
+    mut target := netrc_path
+    if target == "":
+        home := os.home_dir()
+        if home == "":
+            return none
+        target = path_mod.join(home, ".netrc")
+    if not fs.is_file(target):
+        return none
+    raw := fs.read(target) catch ""
+    if raw == "":
+        return none
+
+    tokens := tokenize_netrc(raw)
+    want := host.to_lower()
+
+    # Track current machine entry and fallback `default` entry.
+    mut cur_is_match := false
+    mut cur_is_default := false
+    mut match_login := ""
+    mut match_pass := ""
+    mut has_match := false
+    mut def_login := ""
+    mut def_pass := ""
+    mut has_def := false
+
+    mut i := 0
+    while i < tokens.len():
+        tok := tokens[i]
+        if tok == "machine":
+            if i + 1 < tokens.len():
+                mhost := tokens[i + 1].to_lower()
+                cur_is_match = mhost == want
+                cur_is_default = false
+                if cur_is_match:
+                    has_match = true
+                    match_login = ""
+                    match_pass = ""
+                i = i + 2
+                continue
+        elif tok == "default":
+            cur_is_match = false
+            cur_is_default = true
+            has_def = true
+            def_login = ""
+            def_pass = ""
+            i = i + 1
+            continue
+        elif tok == "login" and i + 1 < tokens.len():
+            if cur_is_match:
+                match_login = tokens[i + 1]
+            elif cur_is_default:
+                def_login = tokens[i + 1]
+            i = i + 2
+            continue
+        elif tok == "password" and i + 1 < tokens.len():
+            if cur_is_match:
+                match_pass = tokens[i + 1]
+            elif cur_is_default:
+                def_pass = tokens[i + 1]
+            i = i + 2
+            continue
+        elif tok == "account" and i + 1 < tokens.len():
+            i = i + 2
+            continue
+        i = i + 1
+
+    if has_match and match_login != "":
+        return NetrcCreds(match_login, match_pass)
+    if has_def and def_login != "":
+        return NetrcCreds(def_login, def_pass)
+    return none
+
+# ===============================================================
+# Pure-Pith MD5 (RFC 1321) for legacy HTTP Digest Auth
+# ===============================================================
+
+MD5_SHIFT := [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21]
+
+MD5_K := [0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391]
+
+fn write_u32_le(buf: bytes.ByteBuffer, v: Int):
+    buf.write_byte(bits.mask8(v)) catch 0
+    buf.write_byte(bits.mask8(bits.shr(v, 8))) catch 0
+    buf.write_byte(bits.mask8(bits.shr(v, 16))) catch 0
+    buf.write_byte(bits.mask8(bits.shr(v, 24))) catch 0
+
+fn read_u32_le(data: Bytes, off: Int) -> Int:
+    b0 := data[off]
+    b1 := bits.shl(data[off + 1], 8)
+    b2 := bits.shl(data[off + 2], 16)
+    b3 := bits.shl(data[off + 3], 24)
+    return bits.bor(bits.bor(b0, b1), bits.bor(b2, b3))
+
+# Compute lowercase hex MD5 digest of `text` (RFC 1321).
+pub fn md5_hex(text: String) -> String:
+    input := bytes.from_string_utf8(text)
+    orig_len := input.len()
+    padded := bytes.buffer_with_capacity(orig_len + 72)
+    defer padded.free()
+    padded.write(input) catch 0
+    padded.write_byte(0x80) catch 0
+    while padded.len() % 64 != 56:
+        padded.write_byte(0) catch 0
+    bit_len := orig_len * 8
+    write_u32_le(padded, bits.mask32(bit_len))
+    write_u32_le(padded, bits.mask32(bits.shr(bit_len, 32)))
+    msg := padded.bytes()
+
+    mut a0 := 0x67452301
+    mut b0 := 0xefcdab89
+    mut c0 := 0x98badcfe
+    mut d0 := 0x10325476
+
+    mut offset := 0
+    while offset < msg.len():
+        mut m: List[Int] := []
+        mut wi := 0
+        while wi < 16:
+            m.push(read_u32_le(msg, offset + wi * 4))
+            wi = wi + 1
+
+        mut a := a0
+        mut b := b0
+        mut c := c0
+        mut d := d0
+
+        mut i := 0
+        while i < 64:
+            mut f := 0
+            mut g := 0
+            if i < 16:
+                f = bits.bor(bits.band(b, c), bits.band(bits.mask32(bits.invert(b)), d))
+                g = i
+            elif i < 32:
+                f = bits.bor(bits.band(d, b), bits.band(bits.mask32(bits.invert(d)), c))
+                g = (5 * i + 1) % 16
+            elif i < 48:
+                f = bits.xor(bits.xor(b, c), d)
+                g = (3 * i + 5) % 16
+            else:
+                f = bits.xor(c, bits.bor(b, bits.mask32(bits.invert(d))))
+                g = (7 * i) % 16
+
+            f = bits.add32(bits.add32(f, a), bits.add32(MD5_K[i], m[g]))
+            a = d
+            d = c
+            c = b
+            b = bits.add32(b, bits.rotl32(f, MD5_SHIFT[i]))
+            i = i + 1
+
+        a0 = bits.add32(a0, a)
+        b0 = bits.add32(b0, b)
+        c0 = bits.add32(c0, c)
+        d0 = bits.add32(d0, d)
+        offset = offset + 64
+
+    out := bytes.buffer_with_capacity(16)
+    defer out.free()
+    write_u32_le(out, a0)
+    write_u32_le(out, b0)
+    write_u32_le(out, c0)
+    write_u32_le(out, d0)
+    return encoding.to_hex(out.bytes())
+
+# ===============================================================
+# HTTP Digest Authentication (--digest, RFC 7616)
+# ===============================================================
+
+# Parse `WWW-Authenticate: Digest k1="v1", k2=v2, ...` into lowercase key -> value.
+pub fn parse_digest_challenge(header: String) -> Map[String, String]:
+    mut params: Map[String, String] := {}
+    trimmed := header.trim()
+    lower := trimmed.to_lower()
+    idx := lower.index_of("digest ")
+    if idx < 0:
+        return params
+    mut pos := idx + 7
+    n := trimmed.len()
+    while pos < n:
+        while pos < n and (ord(trimmed[pos]) == 32 or ord(trimmed[pos]) == 9 or ord(trimmed[pos]) == 44):
+            pos = pos + 1
+        if pos >= n:
+            break
+        k_start := pos
+        while pos < n and ord(trimmed[pos]) != 61 and ord(trimmed[pos]) != 44:
+            pos = pos + 1
+        if pos >= n or ord(trimmed[pos]) != 61:
+            break
+        key := trimmed.substring(k_start, pos).trim().to_lower()
+        pos = pos + 1
+        mut val := ""
+        if pos < n and ord(trimmed[pos]) == 34:
+            pos = pos + 1
+            mut parts: List[String] := []
+            while pos < n and ord(trimmed[pos]) != 34:
+                if ord(trimmed[pos]) == 92 and pos + 1 < n:
+                    parts.push(trimmed[pos + 1])
+                    pos = pos + 2
+                else:
+                    parts.push(trimmed[pos])
+                    pos = pos + 1
+            if pos < n and ord(trimmed[pos]) == 34:
+                pos = pos + 1
+            val = parts.join("")
+        else:
+            v_start := pos
+            while pos < n and ord(trimmed[pos]) != 44 and ord(trimmed[pos]) != 32:
+                pos = pos + 1
+            val = trimmed.substring(v_start, pos).trim()
+        if key != "":
+            params.insert(key, val)
+    return params
+
+fn digest_hash(algo_upper: String, data: String) -> String!:
+    if algo_upper == "SHA-256" or algo_upper == "SHA-256-SESS":
+        return hash.sha256_string(data)
+    if algo_upper == "MD5" or algo_upper == "MD5-SESS" or algo_upper == "":
+        return md5_hex(data)
+    fail "purl: unsupported digest algorithm '{algo_upper}'"
+
+fn qop_has_auth(qop_raw: String) -> Bool:
+    for item in qop_raw.split(","):
+        if item.trim().to_lower() == "auth":
+            return true
+    return false
+
+# Build a `Digest ...` Authorization header value using an explicit `cnonce` (for tests).
+pub fn build_digest_header_with_cnonce(challenge: String, username: String, password: String, method: String, uri: String, cnonce: String) -> String!:
+    params := parse_digest_challenge(challenge)
+    if not params.contains_key("realm") or not params.contains_key("nonce"):
+        fail "purl: digest challenge missing realm or nonce"
+    realm := params["realm"]
+    nonce := params["nonce"]
+    mut algo := "MD5"
+    if params.contains_key("algorithm") and params["algorithm"] != "":
+        algo = params["algorithm"].to_upper()
+
+    mut ha1 := digest_hash(algo, "{username}:{realm}:{password}")!
+    if algo.ends_with("-SESS"):
+        ha1 = digest_hash(algo, "{ha1}:{nonce}:{cnonce}")!
+    ha2 := digest_hash(algo, "{method}:{uri}")!
+
+    qop_raw := params.get("qop").unwrap_or("")
+    use_auth_qop := qop_has_auth(qop_raw)
+    nc := "00000001"
+
+    mut resp_hash := ""
+    if use_auth_qop:
+        resp_hash = digest_hash(algo, "{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}")!
+    else:
+        resp_hash = digest_hash(algo, "{ha1}:{nonce}:{ha2}")!
+
+    dq := chr(34)
+    mut hdr := "Digest username=" + dq + username + dq
+    hdr = hdr + ", realm=" + dq + realm + dq
+    hdr = hdr + ", nonce=" + dq + nonce + dq
+    hdr = hdr + ", uri=" + dq + uri + dq
+    if params.contains_key("algorithm") and params["algorithm"] != "":
+        hdr = hdr + ", algorithm=" + algo
+    if use_auth_qop:
+        hdr = hdr + ", qop=auth, nc=" + nc + ", cnonce=" + dq + cnonce + dq
+    if params.contains_key("opaque") and params["opaque"] != "":
+        hdr = hdr + ", opaque=" + dq + params["opaque"] + dq
+    hdr = hdr + ", response=" + dq + resp_hash + dq
+    return hdr
+
+# Build a `Digest ...` Authorization header value with a cryptographically random cnonce.
+pub fn build_digest_header(challenge: String, username: String, password: String, method: String, uri: String) -> String!:
+    rand_bytes := random.bytes(8)!
+    cnonce := encoding.to_hex(rand_bytes)
+    return build_digest_header_with_cnonce(challenge, username, password, method, uri, cnonce)
+
+# ===============================================================
+# AWS Signature Version 4 (--aws-sigv4)
+# ===============================================================
+
+fn pad2(n: Int) -> String:
+    if n < 10:
+        return "0" + n.to_string()
+    return n.to_string()
+
+fn pad4(n: Int) -> String:
+    mut s := n.to_string()
+    while s.len() < 4:
+        s = "0" + s
+    return s
+
+# Format unix seconds as (YYYYMMDD, YYYYMMDDTHHMMSSZ) in UTC.
+fn utc_sigv4_timestamps(unix_secs: Int) -> (String, String):
+    d := datetime.from_timestamp(unix_secs * 1000)
+    y := pad4(datetime.year(d))
+    mo := pad2(datetime.month(d))
+    da := pad2(datetime.day(d))
+    day_secs := unix_secs % 86400
+    hh := pad2(day_secs / 3600)
+    mm := pad2((day_secs % 3600) / 60)
+    ss := pad2(day_secs % 60)
+    datestamp := "{y}{mo}{da}"
+    amz_date := "{datestamp}T{hh}{mm}{ss}Z"
+    return (datestamp, amz_date)
+
+# Uppercase hex percent-encoding required by AWS SigV4 (RFC 3986 unreserved stays literal).
+fn sigv4_uri_encode(text: String, encode_slash: Bool) -> String:
+    hex := "0123456789ABCDEF"
+    raw := bytes.from_string_utf8(text)
+    out := bytes.buffer_with_capacity(raw.len())
+    defer out.free()
+    mut i := 0
+    while i < raw.len():
+        b := raw[i]
+        unreserved := (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 45 or b == 95 or b == 46 or b == 126
+        if unreserved or (not encode_slash and b == 47):
+            out.write_byte(b) catch 0
+        else:
+            out.write_byte(37) catch 0
+            out.write_byte(ord(hex[b / 16])) catch 0
+            out.write_byte(ord(hex[b % 16])) catch 0
+        i = i + 1
+    return out.bytes().to_string_utf8() catch ""
+
+# Insertion-sort a List[String] lexicographically (ASCII byte order).
+fn sort_strings_asc(items: List[String]) -> List[String]:
+    mut arr: List[String] := []
+    for item in items:
+        arr.push(item)
+    mut i := 1
+    while i < arr.len():
+        key := arr[i]
+        mut j := i - 1
+        while j >= 0 and arr[j] > key:
+            arr[j + 1] = arr[j]
+            j = j - 1
+        arr[j + 1] = key
+        i = i + 1
+    return arr
+
+# Canonicalize query string for AWS SigV4: decode, re-encode with uppercase hex, sort.
+fn canonical_query_string(raw_query: String) -> String:
+    if raw_query == "":
+        return ""
+    mut encoded_pairs: List[String] := []
+    for part in raw_query.split("&"):
+        if part == "":
+            continue
+        eq := part.index_of("=")
+        if eq < 0:
+            k := sigv4_uri_encode(url.decode(part), true)
+            encoded_pairs.push(k + "=")
+        else:
+            k := sigv4_uri_encode(url.decode(part.substring(0, eq)), true)
+            v := sigv4_uri_encode(url.decode(part.substring(eq + 1, part.len())), true)
+            encoded_pairs.push(k + "=" + v)
+    return sort_strings_asc(encoded_pairs).join("&")
+
+# Parse `--aws-sigv4 "provider1[:provider2[:region[:service]]]"` into (p1, p2, region, service).
+fn parse_sigv4_param(param: String, host: String) -> (String, String, String, String):
+    parts := param.split(":")
+    mut p1 := "aws"
+    mut p2 := "amz"
+    mut region := ""
+    mut service := ""
+    if parts.len() >= 1 and parts[0].trim() != "":
+        p1 = parts[0].trim().to_lower()
+    if parts.len() >= 2 and parts[1].trim() != "":
+        p2 = parts[1].trim().to_lower()
+    else:
+        p2 = p1
+    if parts.len() >= 3 and parts[2].trim() != "":
+        region = parts[2].trim()
+    if parts.len() >= 4 and parts[3].trim() != "":
+        service = parts[3].trim()
+
+    # Infer service/region from hostname like `<service>.<region>.amazonaws.com` when omitted.
+    if service == "" or region == "":
+        hparts := host.to_lower().split(".")
+        if hparts.len() >= 4:
+            if service == "":
+                service = hparts[0]
+            if region == "":
+                region = hparts[1]
+    if region == "":
+        region = "us-east-1"
+    if service == "":
+        service = "s3"
+    return (p1, p2, region, service)
+
+# Sign `headers` in place using AWS Signature Version 4 at explicit `unix_secs` (testable).
+pub fn sign_aws_sigv4_at(sigv4_param: String, access_key: String, secret_key: String, method: String, u: ParsedUrl, headers: Map[String, String], body: Bytes, unix_secs: Int) -> Int!:
+    if access_key == "" or secret_key == "":
+        fail "purl: --aws-sigv4 requires credentials via -u ACCESS_KEY:SECRET_KEY"
+    cfg := parse_sigv4_param(sigv4_param, u.host)
+    p1 := cfg.0
+    p2 := cfg.1
+    region := cfg.2
+    service := cfg.3
+
+    ts := utc_sigv4_timestamps(unix_secs)
+    datestamp := ts.0
+    amz_date := ts.1
+    payload_hash := hash.sha256_hex(body)
+
+    date_hdr := "x-" + p2 + "-date"
+    sha_hdr := "x-" + p2 + "-content-sha256"
+
+    # Build lowercase map of headers to sign (always including host, date, and payload hash).
+    mut lower_map: Map[String, String] := {}
+    mut has_host := false
+    for k in headers:
+        lk := k.to_lower()
+        if lk == "authorization":
+            continue
+        if lk == "host":
+            has_host = true
+        lower_map.insert(lk, headers[k].trim())
+    if not has_host:
+        lower_map.insert("host", authority_header(u))
+    lower_map.insert(date_hdr, amz_date)
+    lower_map.insert(sha_hdr, payload_hash)
+
+    mut key_list: List[String] := []
+    for k in lower_map:
+        key_list.push(k)
+    sorted_keys := sort_strings_asc(key_list)
+
+    mut canon_hdrs := ""
+    for k in sorted_keys:
+        canon_hdrs = canon_hdrs + k + ":" + lower_map[k] + "\n"
+    signed_headers := sorted_keys.join(";")
+
+    mut raw_path := u.path
+    if raw_path == "":
+        raw_path = "/"
+    canon_uri := sigv4_uri_encode(url.decode_path(raw_path), false)
+    canon_query := canonical_query_string(u.query)
+    canon_req := method + "\n" + canon_uri + "\n" + canon_query + "\n" + canon_hdrs + "\n" + signed_headers + "\n" + payload_hash
+
+    algo_name := p1.to_upper() + "4-HMAC-SHA256"
+    scope := "{datestamp}/{region}/{service}/{p1}4_request"
+    string_to_sign := algo_name + "\n" + amz_date + "\n" + scope + "\n" + hash.sha256_string(canon_req)
+
+    k_secret := bytes.from_string_utf8(p1.to_upper() + "4" + secret_key)
+    k_date := hmac.sha256(k_secret, bytes.from_string_utf8(datestamp))
+    k_region := hmac.sha256(k_date, bytes.from_string_utf8(region))
+    k_service := hmac.sha256(k_region, bytes.from_string_utf8(service))
+    k_signing := hmac.sha256(k_service, bytes.from_string_utf8(p1 + "4_request"))
+    signature := hmac.sha256_hex(k_signing, bytes.from_string_utf8(string_to_sign))
+
+    auth_val := "{algo_name} Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
+    headers.insert("X-" + capitalize_first(p2) + "-Date", amz_date)
+    headers.insert("X-" + capitalize_first(p2) + "-Content-Sha256", payload_hash)
+    headers.insert("Authorization", auth_val)
+    return 0
+
+fn capitalize_first(text: String) -> String:
+    if text == "":
+        return ""
+    return text.substring(0, 1).to_upper() + text.substring(1, text.len())
+
+# Sign `headers` in place using AWS Signature Version 4 with the current wall clock.
+pub fn sign_aws_sigv4(sigv4_param: String, access_key: String, secret_key: String, method: String, u: ParsedUrl, headers: Map[String, String], body: Bytes) -> Int!:
+    return sign_aws_sigv4_at(sigv4_param, access_key, secret_key, method, u, headers, body, time.unix())

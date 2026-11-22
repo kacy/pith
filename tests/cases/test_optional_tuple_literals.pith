@@ -1,0 +1,76 @@
+# an empty literal stored into a tuple slot whose type is optional is built
+# from the optional's inner type and wrapped in its Some. it used to be stored
+# as a bare untagged container where the optional's shell belongs, and the
+# unwrap read the container as the shell. each shape stores a string borrowed
+# from a struct field into the container it unwraps, overwrites the field,
+# and reads the copy back.
+
+struct Src:
+    name: String
+
+struct Holder:
+    t: (Map[String, String]?, Int)
+
+fn made() -> (Map[String, String]?, Int):
+    return ({}, 1)
+
+fn listed() -> (List[String]?, Int):
+    return ([], 1)
+
+fn passed(t: (Map[String, String]?, Int)) -> (Map[String, String]?, Int):
+    return t
+
+fn made_of[T]() -> (List[T]?, Int):
+    return ([], 1)
+
+fn put_map(t: (Map[String, String]?, Int), src: Src):
+    if let m = t.0:
+        m.insert("a", src.name)
+
+fn put_list(t: (List[String]?, Int), src: Src):
+    if let xs = t.0:
+        xs.push(src.name)
+
+fn show_map(label: String, t: (Map[String, String]?, Int)):
+    if let m = t.0:
+        print(label + ": " + m["a"])
+    else:
+        print(label + ": none")
+
+fn show_list(label: String, t: (List[String]?, Int)):
+    if let xs = t.0:
+        print(label + ": {xs.len()} " + xs[xs.len() - 1])
+    else:
+        print(label + ": none")
+
+fn main():
+    src := Src(name: "field value {5} on the heap")
+    r := made()
+    put_map(r, src)
+    b: (Map[String, String]?, Int) := ({}, 1)
+    put_map(b, src)
+    a := passed(({}, 1))
+    put_map(a, src)
+    h := Holder(t: ({}, 1))
+    put_map(h.t, src)
+    l := listed()
+    put_list(l, src)
+    elems: List[(List[String]?, Int)] := [([], 1)]
+    put_list(elems[0], src)
+    vals: Map[String, (List[String]?, Int)] := {"k": ([], 1)}
+    put_list(vals["k"], src)
+    g := made_of[String]()
+    put_list(g, src)
+    mut asg: (List[String]?, Int) := (none, 0)
+    asg = ([], 1)
+    put_list(asg, src)
+    src.name = "replaced {7} on the heap"
+    show_map("returned map", r)
+    show_map("bound map", b)
+    show_map("argument", a)
+    show_map("struct field", h.t)
+    show_list("returned list", l)
+    show_list("list element", elems[0])
+    show_list("map value", vals["k"])
+    show_list("generic return", g)
+    show_list("assignment", asg)

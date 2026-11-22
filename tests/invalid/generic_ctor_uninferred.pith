@@ -1,0 +1,17 @@
+# a generic struct constructor whose arguments do not fix its type parameter,
+# and whose value is not stored where its type is declared, cannot pick an
+# instance. building one over an unknown type made `= {}` a map that took no
+# count of what was stored into it (E222).
+
+struct Bag[T]:
+    m: Map[String, T] = {}
+
+struct Holder[T]:
+    m: Map[String, T]
+
+fn main():
+    b := Bag()
+    b.m.insert("a", "x")
+    h := Holder(m: {})
+    print(b.m["a"])
+    print("{h.m.len()}")

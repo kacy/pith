@@ -291,7 +291,21 @@ error[E221]: describe expects 1 type arguments, got 2
 
 ### E222 — generic type inference failure
 
-the compiler couldn't infer the type arguments for a generic type.
+the compiler couldn't infer the type arguments for a generic function or
+type. a generic struct constructor takes its type arguments from its
+arguments, or else from the type of the place it is stored into: an annotated
+binding, a return, a parameter, a field, an element of a typed literal, or an
+assignment. `b: Bag[String] := Bag()` builds a `Bag[String]`, while `b :=
+Bag()` with nothing to fix `T` is refused, since its `= {}` and `= []`
+defaults would be built over an unknown type and own nothing stored into
+them.
+
+```
+error[E222]: cannot infer type parameter T of 'Bag' from this constructor
+  13 |     b := Bag()
+                ^
+  fix: name the type, as Bag[...](), or store the value where its type is declared
+```
 
 ### E223 — collection type inference error
 
@@ -559,6 +573,10 @@ one is refused when any implementing type reaches a collection outside a
 `guard` block, even if the value at hand holds a type that does not. the
 message names the type and field (`Bag.items`). a conversion written in the
 call (`spawn work(Sq(s: 2))`) is fresh and allowed.
+
+these rules apply in a program that spawns, as E309 defines it. that includes
+a program whose only spawn is in a function it reaches through a function
+value (`f := lib.launch`, then `f(xs)`).
 
 ```
 error[E248]: a spawned task cannot take this value: it shares a buffer with 'data', which this scope uses again, and both tasks would reach it
@@ -1197,11 +1215,17 @@ error[E309]: 'names' is a module global every task can reach, and its buffer is 
 
 the rule covers the whole program the file loads, so a library global is
 reported when a program that spawns uses it. a program spawns when a function
-in the entry file holds a `spawn`, or calls one that does. a call is resolved
-to its module's function, its import or, for a method, its receiver's type; a
-method on a receiver whose type does not say whose method it is, such as an
-interface, counts every method of that name. a call through a function value
-is not followed. a write is an assignment rooted at the global (`g = x`,
+in the entry file, or the top level of any module it loads (a global's
+initializer, a field default), holds a `spawn` or reaches a function that
+does. code reaches a function by calling it or by naming it without a call:
+`f := lib.launch`, a struct field or a global holding it, an argument passing
+it. a named function may be called wherever the value goes, so it counts as
+reached where it is named. a call is resolved to its module's function, its
+import or, for a method, its receiver's type; a method on a receiver whose
+type does not say whose method it is, such as an interface, counts every
+method of that name. a library that spawns in a function the program never
+calls or names does not make the program spawn. a write is an assignment
+rooted at the global (`g = x`,
 `g[k] = x`, `g.f = x`) or a call of a mutating method on it (`push`, `insert`,
 `remove`, `clear` and the like), through the global's name or any other.
 
@@ -1341,7 +1365,7 @@ error[E316]: interface 'Mapper' cannot be used as a value type: its method 'appl
   fix: take a type parameter bounded by it, as in `fn f[T: Mapper](x: T)`
 ```
 
-### E317: a parameter default that is not allowed
+### E317: a parameter or field default that is not allowed
 
 a call may leave out a trailing parameter that declares a default
 (`fn scaled(x: Int, by: Int = 10)`, called as `scaled(3)`), and the default
@@ -1355,6 +1379,20 @@ error[E317]: the default of parameter 'b' must be a literal, `none` or an enum v
   10 | fn computed(a: Int, b: Int = base()) -> Int:
                                     ^
   fix: pass the value at the call, or compute it in the body from an optional parameter
+```
+
+a generic struct's field default is one expression that every instance
+shares. when the field's type names a type parameter, each instance builds
+the default from its own field type, which works for an empty `[]` or `{}`
+into a container field and `none` into an optional one. any other default of
+such a field, such as a constructor call or a literal with elements, would
+carry one type into every instance, so it is refused.
+
+```
+error[E317]: the default of field 'bag' names a type parameter, so it must be an empty `[]` or `{}` for a container or `none` for an optional
+  12 |     bag: Bag[T] = Bag()
+                         ^
+  fix: pass the value when constructing, or build it in a function that returns the struct
 ```
 
 ### E318: a drop method that lets self escape

@@ -1,0 +1,120 @@
+# a generic struct constructor whose arguments do not fix its type parameter
+# takes the instance it is stored into, so a Bag[String] built as `Bag()` owns
+# the strings stored into its `= {}` and `= []` defaults. each shape below
+# stores a string borrowed from a struct field, overwrites the field, and
+# reads the copy back.
+
+struct Bag[T]:
+    m: Map[String, T] = {}
+    l: List[T] = []
+
+struct Outer[T]:
+    inner: Bag[T]
+
+struct Box:
+    mut b: Bag[String]
+
+struct Src:
+    name: String
+
+# built inside a generic body, where T is known per specialization
+fn made[T]() -> Bag[T]:
+    return Bag()
+
+fn filled[T](v: T) -> Bag[T]:
+    b: Bag[T] := Bag()
+    b.m.insert("a", v)
+    b.l.push(v)
+    return b
+
+fn nested[T]() -> Outer[T]:
+    return Outer(inner: Bag())
+
+fn listed[T]() -> List[Bag[T]]:
+    l: List[Bag[T]] := []
+    l.push(Bag())
+    return l
+
+fn keyed[T]() -> Map[String, Bag[T]]:
+    m: Map[String, Bag[T]] := {}
+    m.insert("k", Bag())
+    return m
+
+fn through_closure[T]() -> Bag[T]:
+    f := fn() -> Bag[T]:
+        return Bag()
+    return f()
+
+fn maybe[T]() -> Bag[T]?:
+    return Bag()
+
+fn chosen(k: Int) -> Bag[String]:
+    return match k:
+        0 => Bag()
+        _ => Bag()
+
+impl Bag:
+    fn fresh() -> Bag[T]:
+        return Bag()
+
+fn show(label: String, v: String):
+    print(label + ": " + v)
+
+fn main():
+    src := Src(name: "field value {5} on the heap")
+    b1: Bag[String] := made[String]()
+    b1.m.insert("a", src.name)
+    b1.l.push(src.name)
+    b2 := filled(src.name)
+    o := nested[String]()
+    o.inner.m.insert("a", src.name)
+    l := listed[String]()
+    l[0].m.insert("a", src.name)
+    k := keyed[String]()
+    k["k"].m.insert("a", src.name)
+    c := through_closure[String]()
+    c.m.insert("a", src.name)
+    mb := maybe[String]().unwrap_or(Bag())
+    mb.m.insert("a", src.name)
+    d: Bag[String] := Bag()
+    d.m.insert("a", src.name)
+    lit: List[Bag[String]] := [Bag()]
+    lit[0].m.insert("a", src.name)
+    mut asg: Bag[String] := Bag()
+    asg = Bag()
+    asg.m.insert("a", src.name)
+    x := Box(b: Bag())
+    x.b = Bag()
+    x.b.m.insert("a", src.name)
+    t: (Bag[String], Int) := (Bag(), 1)
+    t.0.m.insert("a", src.name)
+    ch := Channel[Bag[String]](1)
+    ch.send(Bag())
+    sent := ch.recv().unwrap_or(Bag())
+    sent.m.insert("a", src.name)
+    short := fn() -> Bag[String] => Bag()
+    s := short()
+    s.m.insert("a", src.name)
+    picked := chosen(1)
+    picked.m.insert("a", src.name)
+    fr := d.fresh()
+    fr.m.insert("a", src.name)
+    src.name = "replaced {7} on the heap"
+    show("generic return", b1.m["a"])
+    show("generic return list", b1.l[0])
+    show("generic local", b2.m["a"])
+    show("generic local list", b2.l[0])
+    show("generic field", o.inner.m["a"])
+    show("generic push", l[0].m["a"])
+    show("generic insert", k["k"].m["a"])
+    show("generic closure", c.m["a"])
+    show("generic optional", mb.m["a"])
+    show("binding", d.m["a"])
+    show("list element", lit[0].m["a"])
+    show("assignment", asg.m["a"])
+    show("field assignment", x.b.m["a"])
+    show("tuple element", t.0.m["a"])
+    show("channel send", sent.m["a"])
+    show("short lambda", s.m["a"])
+    show("match arm", picked.m["a"])
+    show("owner method", fr.m["a"])

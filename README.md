@@ -5,8 +5,10 @@
 
 a small language for writing servers. python-shaped syntax, native
 binaries, result types instead of exceptions, reference counting
-instead of a garbage collector. the compiler is written in pith, and
-so is the standard library: the tls 1.2 and 1.3 protocol, the http/2
+instead of a garbage collector, and memory safe across tasks: the
+compiler refuses a program that would let two tasks change one
+buffer. the compiler is written in pith, and so is the standard
+library: the tls 1.2 and 1.3 protocol, the http/2
 client and server, the postgres and mysql wire protocols, the regex
 engine, gzip. when something goes wrong in the stack, you can read the
 code that did it.

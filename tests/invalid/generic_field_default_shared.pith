@@ -1,0 +1,19 @@
+# a generic struct's field default is one expression for every instance, so
+# a default of a field whose type names a type parameter must be one the
+# instance can build from its own field type: `[]` or `{}` for a container,
+# `none` for an optional. a constructor or a literal with elements would carry
+# one type into every instance (E317).
+
+struct Bag[T]:
+    m: Map[String, T] = {}
+
+struct Grid[T]:
+    rows: List[Map[String, T]] = [{}]
+    bag: Bag[T] = Bag()
+    fine: List[T] = []
+    maybe: T? = none
+    count: Int = 0
+
+fn main():
+    g: Grid[String] := Grid()
+    print("{g.rows.len()}")

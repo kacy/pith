@@ -11,14 +11,14 @@ import std.net.http2.frames as h2frames
 import std.net.http2.hpack as h2hpack
 import std.net.http2.connection as h2conn
 from purl_args import parse_cli
-from purl_client import execute_all
+from purl_client import execute_cli
 
 PURL_VERSION := "purl 0.1.0 (pith)"
 
 fn print_version():
     print(PURL_VERSION)
     print("Protocols: http https file")
-    print("Features: HTTP/1.1 HTTP/2 TLS1.2 TLS1.3 gzip deflate zstd cookies proxy")
+    print("Features: HTTP/1.1 HTTP/2 TLS1.2 TLS1.3 gzip deflate zstd cookies proxy digest aws-sigv4 netrc glob parallel stream")
 
 fn print_help():
     print("Usage: purl [options...] <url> [url...]")
@@ -37,6 +37,7 @@ fn print_help():
     print("     --fail-with-body          Fail (exit 22) on HTTP errors but save body")
     print(" -F, --form <name=content>     Specify multipart MIME data")
     print("     --form-string <name=val>  Specify multipart string data")
+    print(" -g, --globoff                 Disable URL globbing ({{}} and [])")
     print(" -G, --get                     Put -d data in the URL query string")
     print(" -H, --header <header|@file>   Pass custom header(s) to server")
     print(" -i, --include                 Include protocol response headers in output")
@@ -49,23 +50,36 @@ fn print_help():
     print("     --max-redirs <num>        Maximum redirects allowed (default: 50)")
     print(" -m, --max-time <seconds>      Maximum time allowed for transfer")
     print("     --connect-timeout <secs>  Maximum time allowed for connection")
-    print(" -o, --output <file>           Write to file instead of stdout")
+    print("     --max-filesize <bytes>    Maximum file size to download (exit 63)")
+    print(" -n, --netrc                   Read credentials from ~/.netrc")
+    print("     --netrc-optional          Use ~/.netrc or URL; don't fail if missing")
+    print("     --netrc-file <file>       Specify netrc file for credentials")
+    print(" -o, --output <file>           Write to file instead of stdout (#1 glob vars)")
     print(" -O, --remote-name             Write output to file named like remote file")
     print("     --output-dir <dir>        Directory to save files in")
     print("     --create-dirs             Create necessary local directory hierarchy")
     print(" -q, --disable                 Disable ~/.purlrc (must be first option)")
     print(" -r, --range <range>           Retrieve only bytes within <range>")
+    print("     --resolve <h:p:addr>      Resolve host+port to this address")
+    print("     --connect-to <h1:p1:h2:p2> Connect to host2:port2 instead of host1:port1")
     print(" -s, --silent                  Silent mode")
     print(" -S, --show-error              Show error even when -s is used")
     print(" -T, --upload-file <file>      Transfer local file via PUT ('-' for stdin)")
-    print(" -u, --user <user[:password]>  Server user and password (Basic auth)")
+    print(" -u, --user <user[:password]>  Server user and password (Basic/Digest/SigV4)")
     print(" -U, --proxy-user <user:pass>  Proxy user and password (Basic auth)")
+    print("     --digest                  Use HTTP Digest authentication (MD5/SHA-256)")
+    print("     --aws-sigv4 <p1[:p2[:r[:s]]]> Sign request with AWS SigV4")
     print("     --oauth2-bearer <token>   OAuth 2 Bearer Token")
     print(" -v, --verbose                 Make the operation more talkative")
     print(" -w, --write-out <format>      Output transfer metrics after completion")
     print(" -x, --proxy <[proto://]h[:p]> Use HTTP proxy")
     print("     --noproxy <hosts>         Comma-separated hosts bypassing proxy")
     print(" -X, --request <method>        Specify request method to use")
+    print(" -z, --time-cond <file|date>   Transfer based on a time condition")
+    print("     --etag-compare <file>     Pass ETag from <file> as If-None-Match")
+    print("     --etag-save <file>        Save response ETag header to <file>")
+    print(" -Z, --parallel                Perform transfers in parallel")
+    print("     --parallel-max <num>      Maximum concurrent transfers (default: 50)")
     print("     --compressed              Request and decode gzip/deflate/zstd")
     print("     --cacert <file>           CA certificate to verify peer against")
     print("     --cert <file>             Client certificate file (PEM)")
@@ -104,6 +118,6 @@ fn main():
         print_err("purl: try 'purl --help' for more information")
         exit(2)
 
-    code := execute_all(parsed.specs)
+    code := execute_cli(parsed)
     if code != 0:
         exit(code)

@@ -64,7 +64,7 @@ H2C_PORT=18904
 H2_PORT=18905
 PROXY_PORT=18906
 
-start_server http "$HTTP_PORT" 100
+start_server http "$HTTP_PORT" 200
 start_server tls "$TLS_PORT" 20 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key"
 start_server tls "$MTLS_PORT" 10 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key" "$FIXTURES/clientcert-ca.crt"
 start_server h2c "$H2C_PORT" 10
@@ -339,6 +339,86 @@ assert_eq "malformed URL exit 3" "$rc3" "3"
 assert_eq "connection refused exit 7" "$rc7" "7"
 assert_eq "unwritable output exit 23" "$rc23" "23"
 assert_eq "missing @file exit 26" "$rc26" "26"
+
+# 33. Streaming -o download (64 KiB) + --max-filesize exit 63
+"$PURL" -s -o "$TMPDIR/big.bin" "$BASE/big"
+big_sz=$(wc -c < "$TMPDIR/big.bin" | tr -d ' ')
+assert_eq "streaming -o 64KiB download" "$big_sz" "65536"
+
+set +e
+"$PURL" -s --max-filesize 10k -o "$TMPDIR/toobig.bin" "$BASE/big" 2>/dev/null
+rc63=$?
+set -e
+assert_eq "--max-filesize exit 63" "$rc63" "63"
+if [ ! -e "$TMPDIR/toobig.bin" ]; then
+    pass "--max-filesize removes partial file"
+else
+    fail "--max-filesize removes partial file" "partial file was left behind"
+fi
+
+# 34. URL globbing ({a,b,c}, [1-3]) with #1 output capture substitution + -g globoff
+"$PURL" -s -o "$TMPDIR/glob_#1.txt" "$BASE/item/{alpha,beta,gamma}"
+assert_eq "glob #1 alpha" "$(cat "$TMPDIR/glob_alpha.txt")" "item=alpha"
+assert_eq "glob #1 beta" "$(cat "$TMPDIR/glob_beta.txt")" "item=beta"
+assert_eq "glob #1 gamma" "$(cat "$TMPDIR/glob_gamma.txt")" "item=gamma"
+
+out=$("$PURL" -s -g "$BASE/echo?raw={a,b}")
+assert_contains "-g globoff keeps braces" "$out" '"query":"raw={a,b}"'
+
+# 35. Parallel transfers (-Z / --parallel) over URL glob range
+"$PURL" -s -Z --parallel-max 4 -o "$TMPDIR/par_#1.txt" "$BASE/item/[01-04]"
+assert_eq "-Z parallel item 01" "$(cat "$TMPDIR/par_01.txt")" "item=01"
+assert_eq "-Z parallel item 02" "$(cat "$TMPDIR/par_02.txt")" "item=02"
+assert_eq "-Z parallel item 03" "$(cat "$TMPDIR/par_03.txt")" "item=03"
+assert_eq "-Z parallel item 04" "$(cat "$TMPDIR/par_04.txt")" "item=04"
+
+# 36. --resolve (HTTP) and --connect-to (HTTPS with real SNI + cert verification!)
+out=$("$PURL" -s --resolve "virtual.local:$HTTP_PORT:127.0.0.1" "http://virtual.local:$HTTP_PORT/echo")
+assert_contains "--resolve HTTP preserves Host" "$out" "\"host\":\"virtual.local:$HTTP_PORT\""
+
+out=$("$PURL" -s --connect-to "localhost:443:127.0.0.1:$TLS_PORT" --cacert "$FIXTURES/localhost-ca.crt" "https://localhost/hello")
+assert_eq "--connect-to HTTPS with SNI verification" "$out" "hello from purl"
+
+# 37. .netrc (--netrc-file)
+cat > "$TMPDIR/test.netrc" <<EOF
+machine 127.0.0.1 login alice password secret
+EOF
+out=$("$PURL" -s --netrc-file "$TMPDIR/test.netrc" "$BASE/echo")
+assert_contains "--netrc-file Basic auth" "$out" '"authorization":"Basic YWxpY2U6c2VjcmV0"'
+
+# 38. HTTP Digest Auth (--digest SHA-256 and MD5)
+out=$("$PURL" -s --digest -u "alice:secret" "$BASE/digest-sha256")
+assert_eq "--digest SHA-256" "$out" "digest-ok-SHA-256"
+
+out=$("$PURL" -s --digest -u "alice:secret" "$BASE/digest-md5")
+assert_eq "--digest MD5" "$out" "digest-ok-MD5"
+
+# 39. AWS SigV4 (--aws-sigv4)
+out=$("$PURL" -s --aws-sigv4 "aws:amz:us-east-1:s3" -u "AKIAEXAMPLE:secretkey123" "$BASE/echo")
+assert_contains "--aws-sigv4 Authorization" "$out" 'AWS4-HMAC-SHA256 Credential=AKIAEXAMPLE/'
+assert_contains "--aws-sigv4 scope" "$out" '/us-east-1/s3/aws4_request'
+assert_contains "--aws-sigv4 X-Amz-Date" "$out" '"x_amz_date":"20'
+assert_contains "--aws-sigv4 X-Amz-Content-Sha256" "$out" 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
+# 40. ETag caching (--etag-save / --etag-compare) and time-cond (-z)
+out=$("$PURL" -s --etag-save "$TMPDIR/etag.txt" "$BASE/etag")
+assert_eq "--etag-save body" "$out" "etag-body-v1"
+assert_eq "--etag-save file" "$(cat "$TMPDIR/etag.txt")" '"v1-etag"'
+
+code=$("$PURL" -s --etag-compare "$TMPDIR/etag.txt" -o /dev/null -w '%{http_code}' "$BASE/etag")
+assert_eq "--etag-compare returns 304" "$code" "304"
+
+printf 'ref' > "$TMPDIR/mtime.ref"
+out=$("$PURL" -s -z "$TMPDIR/mtime.ref" "$BASE/echo")
+assert_contains "-z file sends If-Modified-Since" "$out" '"if_modified_since":"'
+assert_contains "-z file uses GMT date" "$out" 'GMT"'
+
+out=$("$PURL" -s -z "-$TMPDIR/mtime.ref" "$BASE/echo")
+assert_contains "-z -file sends If-Unmodified-Since" "$out" '"if_unmodified_since":"'
+
+# 41. -w %{remote_ip} & %{time_namelookup}
+out=$("$PURL" -s -o /dev/null -w '%{remote_ip}|%{time_namelookup}' "$BASE/hello")
+assert_contains "-w remote_ip" "$out" "127.0.0.1|"
 
 printf '\nIntegration summary: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

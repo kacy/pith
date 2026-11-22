@@ -21,17 +21,30 @@ import std.net.http as http
 import std.net.tls as tls
 import std.time as time
 from std.net.http import HttpRequestBytes, HttpResponse
+from purl_auth import build_digest_header_with_cnonce, parse_digest_challenge
 
-mut flaky_counter: Int := 0
+flaky_counter := AtomicInt(0)
+
+fn atomic_inc(counter: AtomicInt) -> Int:
+    while true:
+        cur := counter.load()
+        if counter.compare_set(cur, cur + 1):
+            return cur + 1
+    return 0
 
 fn echo_json_response(req: HttpRequestBytes) -> HttpResponse:
     obj := json.make_object()
     json.object_set(obj, "method", json.make_string(req.method() catch ""))
     json.object_set(obj, "path", json.make_string(req.path() catch ""))
     json.object_set(obj, "query", json.make_string(req.query() catch ""))
+    json.object_set(obj, "host", json.make_string(req.header_or("Host", "")))
     json.object_set(obj, "content_type", json.make_string(req.header_or("Content-Type", "")))
     json.object_set(obj, "user_agent", json.make_string(req.header_or("User-Agent", "")))
     json.object_set(obj, "authorization", json.make_string(req.header_or("Authorization", "")))
+    json.object_set(obj, "x_amz_date", json.make_string(req.header_or("X-Amz-Date", "")))
+    json.object_set(obj, "x_amz_sha", json.make_string(req.header_or("X-Amz-Content-Sha256", "")))
+    json.object_set(obj, "if_modified_since", json.make_string(req.header_or("If-Modified-Since", "")))
+    json.object_set(obj, "if_unmodified_since", json.make_string(req.header_or("If-Unmodified-Since", "")))
     json.object_set(obj, "cookie", json.make_string(req.header_or("Cookie", "")))
     json.object_set(obj, "referer", json.make_string(req.header_or("Referer", "")))
     json.object_set(obj, "x_custom", json.make_string(req.header_or("X-Custom", "")))
@@ -89,10 +102,45 @@ fn route(req: HttpRequestBytes) -> HttpResponse:
         return http.no_content()
 
     if path == "/flaky":
-        flaky_counter = flaky_counter + 1
-        if flaky_counter < 3:
+        count := atomic_inc(flaky_counter)
+        if count < 3:
             return http.text(503, "try again")
         return http.text(200, "recovered")
+
+    if path == "/big":
+        buf := bytes.buffer_with_capacity(65536)
+        defer buf.free()
+        chunk := bytes.from_string_utf8("0123456789abcdef")
+        mut i := 0
+        while i < 4096:
+            buf.write(chunk) catch 0
+            i = i + 1
+        return http.response(200).content_type("application/octet-stream").bytes_body(buf.bytes())
+
+    if path == "/etag":
+        inm := req.header_or("If-None-Match", "").trim()
+        if inm == "\"v1-etag\"":
+            return http.response(304).header("ETag", "\"v1-etag\"")
+        return http.text(200, "etag-body-v1").header("ETag", "\"v1-etag\"")
+
+    if path == "/digest-sha256" or path == "/digest-md5":
+        mut algo := "SHA-256"
+        if path == "/digest-md5":
+            algo = "MD5"
+        challenge := "Digest realm=\"purl\", qop=\"auth\", algorithm=" + algo + ", nonce=\"fixednonce123\""
+        auth_hdr := req.header_or("Authorization", "")
+        if not auth_hdr.to_lower().starts_with("digest "):
+            return http.text(401, "digest required").header("WWW-Authenticate", challenge)
+        got_params := parse_digest_challenge(auth_hdr)
+        cnonce := got_params.get("cnonce").unwrap_or("")
+        expected := build_digest_header_with_cnonce(challenge, "alice", "secret", method, path, cnonce) catch ""
+        exp_params := parse_digest_challenge(expected)
+        if got_params.get("response").unwrap_or("") == exp_params.get("response").unwrap_or("") and exp_params.contains_key("response"):
+            return http.text(200, "digest-ok-" + algo)
+        return http.text(401, "digest mismatch").header("WWW-Authenticate", challenge)
+
+    if path.starts_with("/item/"):
+        return http.text(200, "item=" + path.substring(6, path.len()))
 
     if path == "/slow":
         time.delay(350)
@@ -152,6 +200,12 @@ fn proxy_route(req: HttpRequestBytes) -> HttpResponse:
     json.object_set(obj, "host", json.make_string(req.header_or("Host", "")))
     return http.json(200, json.encode(obj))
 
+fn serve_http_conn(fd: Int, wg: WaitGroup) -> Int:
+    defer wg.done()
+    tcp_set_timeout(fd, 5000)
+    http.serve_connection_fd(fd, route) catch 0
+    return 0
+
 fn main() -> Int!:
     argv := args()
     if argv.len() < 4:
@@ -163,12 +217,14 @@ fn main() -> Int!:
 
     if mode == "http":
         fd := tcp_listen("127.0.0.1", port)!
+        wg := WaitGroup()
         mut served := 0
         while served < max_conns:
             client := tcp_accept(fd)!
-            tcp_set_timeout(client, 5000)
-            http.serve_connection_fd(client, route) catch 0
+            wg.add(1)
+            spawn serve_http_conn(client, wg)
             served = served + 1
+        wg.wait()
         tcp_close(fd)
         return 0
 

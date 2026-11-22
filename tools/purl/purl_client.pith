@@ -1,9 +1,10 @@
 # purl_client — HTTP/1.1, HTTPS, HTTP/2, and file:// transfer engine for purl.
 #
 # Built directly on Pith's standard library: std.net.http (Client, connection
-# pooling, proxies, multipart, timeouts), std.net.http2.connection (native h2
-# and h2c), std.net.tls (TLS 1.2/1.3, custom CAs, mTLS, verify hooks),
-# std.compress.{gzip,zlib,inflate,zstd}, std.fs, std.os, and std.time.
+# pooling, streaming send_to_file, proxies, multipart, timeouts, response body
+# caps), std.net.http2.connection (native h2 and h2c), std.net.tls (TLS 1.2/1.3,
+# custom CAs, mTLS, verify hooks), std.net.dns, std.compress.{gzip,zlib,inflate,zstd},
+# std.fs, std.os, std.time, and Pith's green-thread concurrency (spawn/Semaphore).
 
 # Import http2 codec modules before std.net.http / std.net.tls so std.binary
 # keeps a single type identity in the self-hosted checker.
@@ -17,14 +18,17 @@ import std.compress.zlib as zlib
 import std.compress.zstd as zstd
 import std.encoding as encoding
 import std.fs as fs
+import std.net.dns as dns
 import std.net.http as http
 import std.net.tls as tls
 import std.os as os
 import std.os.path as path_mod
 import std.time as time
-from purl_args import RequestSpec
+from purl_args import RequestSpec, ParsedCli, parse_tokens_standalone
+from purl_auth import lookup_netrc, build_digest_header, sign_aws_sigv4
 from purl_cookies import CookieJar, new_jar, load_cookie_file, save_cookie_file, store_set_cookie, cookie_header_for
 from purl_format import TransferMetrics, build_data_body, build_multipart_parts, format_write_out, extract_content_disposition_filename, classify_error_exit_code
+from purl_glob import ExpandedUrl, expand_url, substitute_output_template
 from purl_url import ParsedUrl, parse_target_url, request_target, authority_header, effective_url, origin_changed, append_query, resolve_redirect, remote_filename, split_userinfo
 
 PURL_USER_AGENT := "purl/0.1.0"
@@ -38,6 +42,8 @@ struct HopResponse:
     header_values: List[String]
     set_cookies: List[String]
     body: Bytes
+    streamed_size: Int
+    was_streamed: Bool
 
 # Write raw bytes to stdout (fd 1).
 fn write_stdout_bytes(data: Bytes) -> Int!:
@@ -238,7 +244,16 @@ fn from_http1_response(resp: http.HttpResponse) -> HopResponse:
     for k in resp.headers:
         names.push(k)
         values.push(resp.headers[k])
-    return HopResponse("1.1", resp.status, resp.content_type, names, values, resp.set_cookie_headers, resp.body)
+    return HopResponse("1.1", resp.status, resp.content_type, names, values, resp.set_cookie_headers, resp.body, resp.body.len(), false)
+
+# Convert a streamed HTTP/1.1 StreamedHttpResponse into a uniform HopResponse.
+fn from_streamed_response(resp: http.StreamedHttpResponse) -> HopResponse:
+    mut names: List[String] := []
+    mut values: List[String] := []
+    for k in resp.headers:
+        names.push(k)
+        values.push(resp.headers[k])
+    return HopResponse("1.1", resp.status, resp.content_type, names, values, resp.set_cookie_headers, bytes.empty(), resp.body_size, true)
 
 # Convert an HTTP/2 connection.Response into a uniform HopResponse.
 fn from_http2_response(resp: h2conn.Response) -> HopResponse:
@@ -257,7 +272,7 @@ fn from_http2_response(resp: h2conn.Response) -> HopResponse:
         else:
             names.push(f.name)
             values.push(f.value)
-    return HopResponse("2", resp.status, content_type, names, values, set_cookies, resp.body)
+    return HopResponse("2", resp.status, content_type, names, values, set_cookies, resp.body, resp.body.len(), false)
 
 # True when `host` matches a comma-separated --noproxy list.
 fn host_in_noproxy(noproxy: String, host: String) -> Bool:
@@ -277,28 +292,187 @@ fn host_in_noproxy(noproxy: String, host: String) -> Bool:
             return true
     return false
 
-# Execute one HTTP/1.1 hop using std.net.http.Client.
-fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, method: String, target: String, headers: Map[String, String], body: Bytes) -> HopResponse!:
-    mut req := http.request(method, u.host, u.port, target)
+# Strip surrounding `[...]` brackets from an IPv6 literal if present.
+fn strip_brackets(addr: String) -> String:
+    t := addr.trim()
+    if t.starts_with("[") and t.ends_with("]") and t.len() >= 2:
+        return t.substring(1, t.len() - 1)
+    return t
+
+# Evaluate --connect-to (HOST1:PORT1:HOST2:PORT2) and --resolve (HOST:PORT:ADDR) rules.
+# Returns (dial_host, dial_port, overridden).
+fn resolve_dial_target(spec: RequestSpec, u: ParsedUrl) -> (String, Int, Bool):
+    mut dial_host := u.host
+    mut dial_port := u.port
+    mut overridden := false
+    u_host_lower := u.host.to_lower()
+
+    # Apply --connect-to first (host/port rewriting).
+    for rule in spec.connect_tos:
+        parts := rule.split(":")
+        if parts.len() == 4:
+            h1 := parts[0].trim().to_lower()
+            p1_str := parts[1].trim()
+            h2 := parts[2].trim()
+            p2_str := parts[3].trim()
+            host_ok := h1 == "" or h1 == "*" or h1 == u_host_lower
+            mut port_ok := p1_str == "" or p1_str == "*"
+            if not port_ok:
+                p1 := parse_int(p1_str) catch -1
+                port_ok = p1 == u.port
+            if host_ok and port_ok:
+                if h2 != "":
+                    dial_host = h2
+                if p2_str != "":
+                    p2 := parse_int(p2_str) catch 0
+                    if p2 > 0:
+                        dial_port = p2
+                overridden = true
+                break
+
+    # Apply --resolve rules (HOST:PORT:ADDR, supporting IPv6 bracketed ADDR).
+    for rule in spec.resolves:
+        c1 := rule.index_of(":")
+        if c1 <= 0:
+            continue
+        rest1 := rule.substring(c1 + 1, rule.len())
+        c2 := rest1.index_of(":")
+        if c2 <= 0:
+            continue
+        r_host := rule.substring(0, c1).trim().to_lower()
+        r_port := parse_int(rest1.substring(0, c2).trim()) catch -1
+        r_addr := strip_brackets(rest1.substring(c2 + 1, rest1.len()))
+        # Take the first comma-separated address if multiple are supplied.
+        comma := r_addr.index_of(",")
+        mut first_addr := r_addr
+        if comma >= 0:
+            first_addr = strip_brackets(r_addr.substring(0, comma))
+        if first_addr == "":
+            continue
+        if (r_host == "*" or r_host == dial_host.to_lower()) and r_port == dial_port:
+            dial_host = first_addr
+            overridden = true
+            break
+
+    return (dial_host, dial_port, overridden)
+
+# True when text looks like an IPv4 or IPv6 literal (no DNS lookup needed).
+fn is_ip_literal(host: String) -> Bool:
+    if host.contains(":"):
+        return true
+    mut dots := 0
+    mut i := 0
+    while i < host.len():
+        c := ord(host[i])
+        if c == 46:
+            dots = dots + 1
+        elif c < 48 or c > 57:
+            return false
+        i = i + 1
+    return dots == 3
+
+# Resolve `dial_host` via std.net.dns for -v and -w %{remote_ip} / %{time_namelookup}.
+fn measure_dns_lookup(dial_host: String, use_proxy: Bool) -> (String, Int):
+    if use_proxy:
+        return ("", 0)
+    if is_ip_literal(dial_host):
+        return (dial_host, 0)
+    t0 := time.mono_millis()
+    ip := dns.resolve(dial_host) catch ""
+    elapsed := time.mono_millis() - t0
+    return (ip, elapsed)
+
+# Ensure parent directories exist for `out_path` when --create-dirs is enabled.
+fn prepare_output_parent(spec: RequestSpec, out_path: String):
+    if spec.create_dirs and out_path != "":
+        parent := path_mod.dir(out_path)
+        if parent != "" and parent != ".":
+            fs.make_dirs(parent)
+
+# Execute one HTTP/1.1 hop using std.net.http.Client (or ClientRequest.send_tls_with_config
+# when --resolve / --connect-to overrides the dial address under HTTPS).
+# When `stream_file` is non-empty, streams the response body directly to disk.
+fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, method: String, target: String, headers: Map[String, String], body: Bytes, stream_file: String) -> HopResponse!:
+    mut req := http.request(method, dial_host, dial_port, target)
     if u.scheme == "https":
-        req = http.https_request_port(method, u.host, u.port, target)
+        req = http.https_request_port(method, dial_host, dial_port, target)
+    if dial_overridden and not has_header_ci(headers, "Host"):
+        req = req.header("Host", authority_header(u))
     for k in headers:
         req = req.header(k, headers[k])
     if not body.is_empty():
         req = req.body_bytes(body)
+    if spec.max_time_ms > 0:
+        req = req.with_timeout(spec.max_time_ms)
 
     if spec.verbose:
-        write_stderr_line("* Trying {u.host}:{u.port}...")
+        if remote_ip != "" and remote_ip != dial_host:
+            write_stderr_line("* Trying {remote_ip}:{dial_port} ({dial_host})...")
+        else:
+            write_stderr_line("* Trying {dial_host}:{dial_port}...")
         log_verbose_request(method, target, "HTTP/1.1", authority_header(u), headers, body.len())
 
+    # Streaming path: write response body straight to file without buffering in RAM.
+    if stream_file != "":
+        prepare_output_parent(spec, stream_file)
+        probe := fs.create(stream_file)
+        if probe.is_err:
+            fail "purl: write error: failed to open '{stream_file}': {probe.err}"
+        probe.ok.close()
+        if dial_overridden and u.scheme == "https":
+            cfg := build_tls_config(spec, false)!
+            defer cfg.close()
+            streamed_res := req.send_tls_to_file_with_config(u.host, cfg, stream_file)
+            if streamed_res.is_err:
+                if fs.is_file(stream_file):
+                    fs.remove(stream_file)
+                fail streamed_res.err
+            streamed := streamed_res.ok
+            if spec.max_filesize > 0 and streamed.body_size > spec.max_filesize:
+                if fs.is_file(stream_file):
+                    fs.remove(stream_file)
+                fail "purl: maximum file size exceeded ({streamed.body_size} > {spec.max_filesize})"
+            hop := from_streamed_response(streamed)
+            if spec.verbose:
+                log_verbose_response(hop)
+            return hop
+        streamed_res := client.send_to_file(req, stream_file)
+        if streamed_res.is_err:
+            if fs.is_file(stream_file):
+                fs.remove(stream_file)
+            fail streamed_res.err
+        streamed := streamed_res.ok
+        if spec.max_filesize > 0 and streamed.body_size > spec.max_filesize:
+            if fs.is_file(stream_file):
+                fs.remove(stream_file)
+            fail "purl: maximum file size exceeded ({streamed.body_size} > {spec.max_filesize})"
+        hop := from_streamed_response(streamed)
+        if spec.verbose:
+            log_verbose_response(hop)
+        return hop
+
+    # Buffered path.
+    if dial_overridden and u.scheme == "https":
+        cfg := build_tls_config(spec, false)!
+        defer cfg.close()
+        resp := req.send_tls_with_config(u.host, cfg)!
+        if spec.max_filesize > 0 and resp.body.len() > spec.max_filesize:
+            fail "purl: maximum file size exceeded ({resp.body.len()} > {spec.max_filesize})"
+        hop := from_http1_response(resp)
+        if spec.verbose:
+            log_verbose_response(hop)
+        return hop
+
     resp := client.send(req)!
+    if spec.max_filesize > 0 and resp.body.len() > spec.max_filesize:
+        fail "purl: maximum file size exceeded ({resp.body.len()} > {spec.max_filesize})"
     hop := from_http1_response(resp)
     if spec.verbose:
         log_verbose_response(hop)
     return hop
 
 # Execute one HTTP/2 hop using std.net.http2.connection (h2 over TLS or h2c).
-fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, method: String, target: String, headers: Map[String, String], body: Bytes, prior_knowledge: Bool) -> HopResponse!:
+fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, method: String, target: String, headers: Map[String, String], body: Bytes, prior_knowledge: Bool) -> HopResponse!:
     mut extra: List[h2hpack.HeaderField] := []
     for k in headers:
         lower := k.to_lower()
@@ -311,13 +485,15 @@ fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, method: String, target: Strin
 
     authority := authority_header(u)
     if spec.verbose:
-        write_stderr_line("* Trying {u.host}:{u.port} (HTTP/2)...")
+        write_stderr_line("* Trying {dial_host}:{dial_port} (HTTP/2)...")
         log_verbose_request(method, target, "HTTP/2", authority, headers, body.len())
 
     if prior_knowledge and u.scheme == "http":
-        h2c := h2conn.open_h2c(u.host, u.port)!
+        h2c := h2conn.open_h2c(dial_host, dial_port)!
         defer h2c.close()
         raw := h2c.request_with_timeout(method, authority, target, extra, body, spec.max_time_ms)!
+        if spec.max_filesize > 0 and raw.body.len() > spec.max_filesize:
+            fail "purl: maximum file size exceeded ({raw.body.len()} > {spec.max_filesize})"
         hop := from_http2_response(raw)
         if spec.verbose:
             log_verbose_response(hop)
@@ -325,9 +501,11 @@ fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, method: String, target: Strin
 
     cfg := build_tls_config(spec, true)!
     defer cfg.close()
-    h2 := h2conn.open_with_config(u.host, u.port, cfg)!
+    h2 := h2conn.open_with_config(dial_host, dial_port, cfg)!
     defer h2.close()
     raw := h2.request_with_timeout(method, authority, target, extra, body, spec.max_time_ms)!
+    if spec.max_filesize > 0 and raw.body.len() > spec.max_filesize:
+        fail "purl: maximum file size exceeded ({raw.body.len()} > {spec.max_filesize})"
     hop := from_http2_response(raw)
     if spec.verbose:
         log_verbose_response(hop)
@@ -371,13 +549,13 @@ fn is_retryable_error(spec: RequestSpec, code: Int) -> Bool:
         return true
     return false
 
-# Resolve output file path for URL index `url_index`, or "" for stdout.
-fn resolve_output_path(spec: RequestSpec, url_index: Int, u: ParsedUrl, resp: HopResponse) -> String!:
+# Resolve output file path for one transfer (honoring glob #1/#2 captures), or "" for stdout.
+fn resolve_output_path(spec: RequestSpec, explicit_output: String, u: ParsedUrl, resp: HopResponse) -> String!:
     mut out_path := ""
-    if url_index < spec.outputs.len():
-        out_path = spec.outputs[url_index]
-        if out_path == "-":
+    if explicit_output != "":
+        if explicit_output == "-":
             return ""
+        out_path = explicit_output
     elif spec.remote_name or spec.remote_name_all:
         mut fname := ""
         if spec.remote_header_name:
@@ -393,14 +571,30 @@ fn resolve_output_path(spec: RequestSpec, url_index: Int, u: ParsedUrl, resp: Ho
             out_path = path_mod.join(spec.output_dir, out_path)
     return out_path
 
+# Predict a concrete file path before sending when safe for direct send_to_file streaming.
+fn streamable_output_path(spec: RequestSpec, explicit_output: String, u: ParsedUrl, resume_offset: Int) -> String:
+    if spec.http_version != "1.1":
+        return ""
+    if spec.follow_redirects or spec.include_headers or spec.head_only or spec.compressed or spec.use_digest or resume_offset > 0:
+        return ""
+    if u.scheme != "http" and u.scheme != "https":
+        return ""
+    mut out_path := ""
+    if explicit_output != "" and explicit_output != "-":
+        out_path = explicit_output
+    elif (spec.remote_name or spec.remote_name_all) and not spec.remote_header_name:
+        out_path = remote_filename(u)
+    if out_path == "":
+        return ""
+    if spec.output_dir != "" and not path_mod.is_abs(out_path):
+        out_path = path_mod.join(spec.output_dir, out_path)
+    return out_path
+
 # Write output bytes to `out_path` (creating parent dirs if --create-dirs, appending if `append_mode`).
 fn write_output_target(spec: RequestSpec, out_path: String, data: Bytes, append_mode: Bool) -> Int!:
     if out_path == "":
         return write_stdout_bytes(data)!
-    if spec.create_dirs:
-        parent := path_mod.dir(out_path)
-        if parent != "" and parent != ".":
-            fs.make_dirs(parent)
+    prepare_output_parent(spec, out_path)
     if append_mode:
         ok := fs.append_bytes(out_path, data)
         if ok.is_err:
@@ -420,11 +614,13 @@ fn make_http_client(spec: RequestSpec, has_tls_cfg: Bool, tls_cfg: tls.Config) -
         c = c.with_dial_timeout(spec.connect_timeout_ms)
     if spec.proxy != "":
         c = c.with_proxy(spec.proxy)
+    if spec.max_filesize > 0:
+        c = c.with_max_response_body_bytes(spec.max_filesize)
     if has_tls_cfg:
         c = c.with_tls_config(tls_cfg)
     return c
 
-# Build initial request headers + body for one transfer.
+# Build initial request headers + body + credentials for one transfer.
 struct PreparedRequest:
     method: String
     url: ParsedUrl
@@ -432,9 +628,19 @@ struct PreparedRequest:
     body: Bytes
     auto_referer: Bool
     resume_offset: Int
+    explicit_output: String
+    auth_user: String
+    auth_pass: String
+    has_auth_creds: Bool
     stdin_cache: Bytes?
 
-fn prepare_request(spec: RequestSpec, raw_url: String, url_index: Int, stdin_cache: Bytes?) -> PreparedRequest!:
+fn split_user_pass(spec_user: String) -> (String, String):
+    colon := spec_user.index_of(":")
+    if colon < 0:
+        return (spec_user, "")
+    return (spec_user.substring(0, colon), spec_user.substring(colon + 1, spec_user.len()))
+
+fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, stdin_cache: Bytes?) -> PreparedRequest!:
     mut parsed := parse_target_url(raw_url, spec.proto_default)!
     mut cache := stdin_cache
     mut body := bytes.empty()
@@ -466,7 +672,6 @@ fn prepare_request(spec: RequestSpec, raw_url: String, url_index: Int, stdin_cac
             method = "POST"
         built := build_multipart_parts(spec.forms, cache)!
         cache = built.1
-        # Use std.net.http's own multipart encoder via ClientRequest.multipart_body!
         tmp_req := http.request(method, parsed.host, parsed.port, "/").multipart_body(built.0)!
         body = tmp_req.body
         multipart_ct = get_header_ci(tmp_req.headers, "Content-Type")
@@ -522,16 +727,35 @@ fn prepare_request(spec: RequestSpec, raw_url: String, url_index: Int, stdin_cac
         else:
             set_header_ci(headers, "Referer", spec.referer)
 
+    # Conditional ETag (--etag-compare) and time condition (-z / --time-cond).
+    if spec.etag_compare != "" and fs.is_file(spec.etag_compare):
+        etag_val := (fs.read(spec.etag_compare) catch "").trim()
+        if etag_val != "":
+            set_header_ci(headers, "If-None-Match", etag_val)
+
+    if spec.time_cond != "":
+        mut tc := spec.time_cond.trim()
+        mut hdr_name := "If-Modified-Since"
+        if tc.starts_with("-"):
+            hdr_name = "If-Unmodified-Since"
+            tc = tc.substring(1, tc.len()).trim()
+        if tc != "":
+            if fs.is_file(tc):
+                mtime := fs.modified(tc) catch -1
+                if mtime >= 0:
+                    set_header_ci(headers, hdr_name, http.http_date(mtime))
+            else:
+                set_header_ci(headers, hdr_name, tc)
+
     # Range (-r) and Resume (-C).
     mut resume_offset := 0
     if spec.range != "":
         set_header_ci(headers, "Range", "bytes=" + spec.range)
     elif spec.continue_at != "":
         if spec.continue_at == "-":
-            # Auto-detect size of existing output file.
             mut target_file := ""
-            if url_index < spec.outputs.len() and spec.outputs[url_index] != "-":
-                target_file = spec.outputs[url_index]
+            if explicit_output != "" and explicit_output != "-":
+                target_file = explicit_output
             elif spec.remote_name or spec.remote_name_all:
                 target_file = remote_filename(parsed)
             if target_file != "" and spec.output_dir != "" and not path_mod.is_abs(target_file):
@@ -547,18 +771,32 @@ fn prepare_request(spec: RequestSpec, raw_url: String, url_index: Int, stdin_cac
                 resume_offset = off
                 set_header_ci(headers, "Range", "bytes={off}-")
 
-    # Authentication: -u, --oauth2-bearer, or URL userinfo.
+    # Resolve credentials: -u, URL userinfo, or .netrc (-n / --netrc-optional / --netrc-file).
+    mut auth_user := ""
+    mut auth_pass := ""
+    mut has_auth_creds := false
     if spec.user != "":
-        colon := spec.user.index_of(":")
-        mut auth_raw := spec.user
-        if colon < 0:
-            auth_raw = spec.user + ":"
-        set_header_ci(headers, "Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(auth_raw)))
-    elif spec.bearer != "":
-        set_header_ci(headers, "Authorization", "Bearer " + spec.bearer)
+        pair := split_user_pass(spec.user)
+        auth_user = pair.0
+        auth_pass = pair.1
+        has_auth_creds = true
     elif parsed.userinfo != "":
         pair := split_userinfo(parsed.userinfo)
-        auth_raw := pair.0 + ":" + pair.1
+        auth_user = pair.0
+        auth_pass = pair.1
+        has_auth_creds = true
+    elif spec.netrc or spec.netrc_optional or spec.netrc_file != "":
+        found := lookup_netrc(parsed.host, spec.netrc_file)
+        if let creds = found:
+            auth_user = creds.login
+            auth_pass = creds.password
+            has_auth_creds = true
+
+    # Attach immediate auth unless --digest or --aws-sigv4 handles auth per hop.
+    if spec.bearer != "":
+        set_header_ci(headers, "Authorization", "Bearer " + spec.bearer)
+    elif has_auth_creds and not spec.use_digest and spec.aws_sigv4 == "":
+        auth_raw := auth_user + ":" + auth_pass
         set_header_ci(headers, "Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(auth_raw)))
 
     # Proxy-Authorization for plain HTTP proxy requests (-U / --proxy-user).
@@ -573,7 +811,7 @@ fn prepare_request(spec: RequestSpec, raw_url: String, url_index: Int, stdin_cac
     for hspec in spec.headers:
         apply_header_spec(headers, hspec)
 
-    return PreparedRequest(method, parsed, headers, body, auto_referer, resume_offset, cache)
+    return PreparedRequest(method, parsed, headers, body, auto_referer, resume_offset, explicit_output, auth_user, auth_pass, has_auth_creds, cache)
 
 # Wrapper to read stdin bytes (kept local so purl_client can satisfy -T -).
 fn purl_args_read_stdin() -> Bytes:
@@ -628,9 +866,10 @@ struct AttemptOutcome:
     final_body: Bytes
     all_headers_text: String
     resume_append: Bool
+    streamed_path: String
 
 fn empty_hop() -> HopResponse:
-    return HopResponse("1.1", 0, "", [], [], [], bytes.empty())
+    return HopResponse("1.1", 0, "", [], [], [], bytes.empty(), 0, false)
 
 fn lower_header_map(resp: HopResponse) -> Map[String, String]:
     mut out: Map[String, String] := {}
@@ -644,7 +883,7 @@ fn lower_header_map(resp: HopResponse) -> Map[String, String]:
 
 fn empty_metrics(u: ParsedUrl, code: Int, err: String) -> TransferMetrics:
     empty_hdrs: Map[String, String] := {}
-    return TransferMetrics(0, "", 0, 0, 0, 0, 0, 0, effective_url(u), "", 0, "1.1", u.scheme.to_upper(), u.port, "", empty_hdrs, code, err)
+    return TransferMetrics(0, "", 0, 0, 0, 0, 0, 0, 0, effective_url(u), "", 0, "1.1", u.scheme.to_upper(), "", u.port, "", empty_hdrs, code, err)
 
 # True when a proxy is active for `u` (explicit -x or environment proxy, not excluded by --noproxy).
 fn has_active_proxy(spec: RequestSpec, u: ParsedUrl) -> Bool:
@@ -661,22 +900,22 @@ fn has_active_proxy(spec: RequestSpec, u: ParsedUrl) -> Bool:
     return false
 
 # Dispatch one hop over HTTP/2 (h2c or h2 with HTTP/1.1 fallback) or HTTP/1.1.
-# When a proxy is active, route through HTTP/1.1 so std.net.http's proxy/CONNECT path is used.
-fn dispatch_hop(client: http.Client, spec: RequestSpec, cur_url: ParsedUrl, cur_method: String, target: String, hop_headers: Map[String, String], cur_body: Bytes) -> HopResponse!:
-    if not has_active_proxy(spec, cur_url):
+fn dispatch_hop(client: http.Client, spec: RequestSpec, cur_url: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, cur_method: String, target: String, hop_headers: Map[String, String], cur_body: Bytes, stream_file: String) -> HopResponse!:
+    proxy_on := has_active_proxy(spec, cur_url)
+    if not proxy_on and stream_file == "":
         if spec.http_version == "2-prior" and cur_url.scheme == "http":
-            return send_http2_hop(spec, cur_url, cur_method, target, hop_headers, cur_body, true)
-        if spec.http_version == "2" and cur_url.scheme == "https":
-            h2_try := send_http2_hop(spec, cur_url, cur_method, target, hop_headers, cur_body, false)
+            return send_http2_hop(spec, cur_url, dial_host, dial_port, cur_method, target, hop_headers, cur_body, true)
+        if spec.http_version == "2" and cur_url.scheme == "https" and not dial_overridden:
+            h2_try := send_http2_hop(spec, cur_url, dial_host, dial_port, cur_method, target, hop_headers, cur_body, false)
             if h2_try.is_err and h2_try.err.contains("did not negotiate h2"):
                 if spec.verbose:
                     write_stderr_line("* ALPN: falling back to HTTP/1.1")
-                return send_http1_hop(client, spec, cur_url, cur_method, target, hop_headers, cur_body)
+                return send_http1_hop(client, spec, cur_url, dial_host, dial_port, dial_overridden, remote_ip, cur_method, target, hop_headers, cur_body, "")
             return h2_try
     mut hop_client := client
     if spec.noproxy != "" and host_in_noproxy(spec.noproxy, cur_url.host):
         hop_client = client.with_proxy("").with_env_proxy(false)
-    return send_http1_hop(hop_client, spec, cur_url, cur_method, target, hop_headers, cur_body)
+    return send_http1_hop(hop_client, spec, cur_url, dial_host, dial_port, dial_overridden, remote_ip, cur_method, target, hop_headers, cur_body, stream_file)
 
 fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, prep: PreparedRequest) -> AttemptOutcome:
     started_ms := time.mono_millis()
@@ -684,6 +923,9 @@ fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, pr
     mut cur_method := prep.method
     mut cur_headers := clone_headers(prep.headers)
     mut cur_body := prep.body
+    mut digest_tried := false
+    mut last_ip := ""
+    mut dns_ms := 0
 
     # Fast path for file:// URLs using std.fs.
     if cur_url.scheme == "file":
@@ -692,46 +934,74 @@ fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, pr
         empty_hdrs: Map[String, String] := {}
         if loaded.is_err:
             msg := "couldn't open file {cur_url.path}: {loaded.err}"
-            m := TransferMetrics(0, "", 0, 0, 0, 0, elapsed, elapsed, effective_url(cur_url), "", 0, "", "FILE", 0, "", empty_hdrs, 37, msg)
-            return AttemptOutcome(37, msg, 0, m, empty_hop(), cur_url, bytes.empty(), "", false)
+            m := TransferMetrics(0, "", 0, 0, 0, 0, elapsed, elapsed, 0, effective_url(cur_url), "", 0, "", "FILE", "", 0, "", empty_hdrs, 37, msg)
+            return AttemptOutcome(37, msg, 0, m, empty_hop(), cur_url, bytes.empty(), "", false, "")
         fbody := loaded.ok
-        hop := HopResponse("", 0, "", [], [], [], fbody)
-        m := TransferMetrics(0, "", fbody.len(), 0, 0, 0, elapsed, elapsed, effective_url(cur_url), "", 0, "", "FILE", 0, "", empty_hdrs, 0, "")
-        return AttemptOutcome(0, "", 0, m, hop, cur_url, fbody, "", false)
+        hop := HopResponse("", 0, "", [], [], [], fbody, fbody.len(), false)
+        m := TransferMetrics(0, "", fbody.len(), 0, 0, 0, elapsed, elapsed, 0, effective_url(cur_url), "", 0, "", "FILE", "", 0, "", empty_hdrs, 0, "")
+        return AttemptOutcome(0, "", 0, m, hop, cur_url, fbody, "", false, "")
 
     mut hops := 0
     mut all_headers_text := ""
     mut last_req_size := 0
 
     while true:
-        # Prepare per-hop target and headers.
         mut target := request_target(cur_url)
         if hops == 0 and spec.request_target != "":
             target = spec.request_target
 
+        # Apply --connect-to and --resolve rules for this hop.
+        dial_info := resolve_dial_target(spec, cur_url)
+        dial_host := dial_info.0
+        dial_port := dial_info.1
+        dial_overridden := dial_info.2
+
+        dns_res := measure_dns_lookup(dial_host, has_active_proxy(spec, cur_url))
+        last_ip = dns_res.0
+        if hops == 0:
+            dns_ms = dns_res.1
+
         hop_headers := clone_headers(cur_headers)
         attach_cookies(spec, jar, cur_url, hop_headers)
+
+        # Sign with AWS SigV4 per hop if requested.
+        if spec.aws_sigv4 != "":
+            sig_res := sign_aws_sigv4(spec.aws_sigv4, prep.auth_user, prep.auth_pass, cur_method, cur_url, hop_headers, cur_body)
+            if sig_res.is_err:
+                elapsed := time.mono_millis() - started_ms
+                empty_hdrs: Map[String, String] := {}
+                m := TransferMetrics(0, "", 0, cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, dns_ms, effective_url(cur_url), "", hops, spec.http_version, cur_url.scheme.to_upper(), last_ip, dial_port, "", empty_hdrs, 2, sig_res.err)
+                return AttemptOutcome(2, sig_res.err, 0, m, empty_hop(), cur_url, bytes.empty(), all_headers_text, false, "")
+
         last_req_size = estimate_request_size(cur_method, target, hop_headers, cur_body.len())
 
-        # Choose HTTP/2 vs HTTP/1.1.
-        hop_res := dispatch_hop(client, spec, cur_url, cur_method, target, hop_headers, cur_body)
+        stream_path := streamable_output_path(spec, prep.explicit_output, cur_url, prep.resume_offset)
+        hop_res := dispatch_hop(client, spec, cur_url, dial_host, dial_port, dial_overridden, last_ip, cur_method, target, hop_headers, cur_body, stream_path)
 
         if hop_res.is_err:
             elapsed := time.mono_millis() - started_ms
             code := classify_error_exit_code(hop_res.err)
             empty_hdrs: Map[String, String] := {}
-            m := TransferMetrics(0, "", 0, cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, effective_url(cur_url), "", hops, spec.http_version, cur_url.scheme.to_upper(), cur_url.port, "", empty_hdrs, code, hop_res.err)
-            return AttemptOutcome(code, hop_res.err, 0, m, empty_hop(), cur_url, bytes.empty(), all_headers_text, false)
+            m := TransferMetrics(0, "", 0, cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, dns_ms, effective_url(cur_url), "", hops, spec.http_version, cur_url.scheme.to_upper(), last_ip, dial_port, "", empty_hdrs, code, hop_res.err)
+            return AttemptOutcome(code, hop_res.err, 0, m, empty_hop(), cur_url, bytes.empty(), all_headers_text, false, "")
 
         resp := hop_res.ok
         head_text := format_response_head(resp)
         all_headers_text = all_headers_text + head_text
 
-        # Store any Set-Cookie headers in the jar (even across redirect hops).
         for sc in resp.set_cookies:
             store_set_cookie(jar, sc, cur_url.host, cur_url.path)
 
-        # Compute redirect_url if Location is present.
+        # HTTP Digest Auth challenge-response on 401 when --digest is active.
+        if spec.use_digest and not digest_tried and resp.status == 401 and prep.has_auth_creds:
+            www_auth := hop_header(resp, "WWW-Authenticate")
+            if www_auth.to_lower().contains("digest "):
+                digest_tried = true
+                auth_res := build_digest_header(www_auth, prep.auth_user, prep.auth_pass, cur_method, target)
+                if auth_res.is_ok:
+                    set_header_ci(cur_headers, "Authorization", auth_res.ok)
+                    continue
+
         mut resolved_redir := ""
         loc := hop_header(resp, "Location")
         if loc != "":
@@ -744,21 +1014,20 @@ fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, pr
             if spec.max_redirs >= 0 and hops >= spec.max_redirs:
                 elapsed := time.mono_millis() - started_ms
                 msg := "Maximum ({spec.max_redirs}) redirects followed"
-                m := TransferMetrics(resp.status, resp.content_type, resp.body.len(), cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, effective_url(cur_url), resolved_redir, hops, resp.http_version, cur_url.scheme.to_upper(), cur_url.port, "", lower_header_map(resp), 47, msg)
-                return AttemptOutcome(47, msg, 0, m, resp, cur_url, bytes.empty(), all_headers_text, false)
+                m := TransferMetrics(resp.status, resp.content_type, resp.body.len(), cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, dns_ms, effective_url(cur_url), resolved_redir, hops, resp.http_version, cur_url.scheme.to_upper(), last_ip, dial_port, "", lower_header_map(resp), 47, msg)
+                return AttemptOutcome(47, msg, 0, m, resp, cur_url, bytes.empty(), all_headers_text, false, "")
 
             next_url_res := resolve_redirect(cur_url, loc)
             if next_url_res.is_err:
                 elapsed := time.mono_millis() - started_ms
                 code := classify_error_exit_code(next_url_res.err)
-                m := TransferMetrics(resp.status, resp.content_type, 0, cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, effective_url(cur_url), "", hops, resp.http_version, cur_url.scheme.to_upper(), cur_url.port, "", lower_header_map(resp), code, next_url_res.err)
-                return AttemptOutcome(code, next_url_res.err, 0, m, resp, cur_url, bytes.empty(), all_headers_text, false)
+                m := TransferMetrics(resp.status, resp.content_type, 0, cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, dns_ms, effective_url(cur_url), "", hops, resp.http_version, cur_url.scheme.to_upper(), last_ip, dial_port, "", lower_header_map(resp), code, next_url_res.err)
+                return AttemptOutcome(code, next_url_res.err, 0, m, resp, cur_url, bytes.empty(), all_headers_text, false, "")
 
             next_url := next_url_res.ok
             if spec.verbose:
                 write_stderr_line("* Issue another request to this URL: '{effective_url(next_url)}'")
 
-            # Decide whether method/body survive the redirect (matching curl's --post301/302/303).
             mut keep_post := false
             if resp.status == 307 or resp.status == 308:
                 keep_post = true
@@ -776,10 +1045,8 @@ fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, pr
                 remove_header_ci(cur_headers, "Content-Length")
                 remove_header_ci(cur_headers, "Transfer-Encoding")
 
-            # Strip Authorization on cross-origin redirect unless --location-trusted.
             if origin_changed(cur_url, next_url) and not spec.location_trusted:
                 remove_header_ci(cur_headers, "Authorization")
-            # Drop any Host header bound to the old origin.
             if origin_changed(cur_url, next_url):
                 remove_header_ci(cur_headers, "Host")
 
@@ -788,33 +1055,44 @@ fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, pr
 
             cur_url = next_url
             hops = hops + 1
+            digest_tried = false
             continue
 
-        # Final response: optionally decompress.
-        decoded_res := maybe_decompress(spec, resp)
-        elapsed := time.mono_millis() - started_ms
-        if decoded_res.is_err:
-            code := classify_error_exit_code(decoded_res.err)
-            m := TransferMetrics(resp.status, resp.content_type, resp.body.len(), cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, effective_url(cur_url), resolved_redir, hops, resp.http_version, cur_url.scheme.to_upper(), cur_url.port, "", lower_header_map(resp), code, decoded_res.err)
-            return AttemptOutcome(code, decoded_res.err, 0, m, resp, cur_url, bytes.empty(), all_headers_text, false)
+        # Final response: optionally decompress (skipped if already streamed to disk).
+        mut final_body := resp.body
+        mut dl_size := resp.streamed_size
+        if not resp.was_streamed:
+            decoded_res := maybe_decompress(spec, resp)
+            elapsed_dec := time.mono_millis() - started_ms
+            if decoded_res.is_err:
+                code := classify_error_exit_code(decoded_res.err)
+                m := TransferMetrics(resp.status, resp.content_type, resp.body.len(), cur_body.len(), all_headers_text.len(), last_req_size, elapsed_dec, elapsed_dec, dns_ms, effective_url(cur_url), resolved_redir, hops, resp.http_version, cur_url.scheme.to_upper(), last_ip, dial_port, "", lower_header_map(resp), code, decoded_res.err)
+                return AttemptOutcome(code, decoded_res.err, 0, m, resp, cur_url, bytes.empty(), all_headers_text, false, "")
+            final_body = decoded_res.ok
+            dl_size = final_body.len()
 
-        final_body := decoded_res.ok
+        elapsed := time.mono_millis() - started_ms
         retry_after := parse_int(hop_header(resp, "Retry-After").trim()) catch 0
         mut exit_code := 0
         mut err_msg := ""
         if (spec.fail_on_http or spec.fail_with_body) and resp.status >= 400:
             exit_code = 22
             err_msg = "The requested URL returned error: {resp.status}"
+            if resp.was_streamed and spec.fail_on_http and not spec.fail_with_body and stream_path != "" and fs.is_file(stream_path):
+                fs.remove(stream_path)
 
         resume_append := prep.resume_offset > 0 and resp.status == 206
-        m := TransferMetrics(resp.status, resp.content_type, final_body.len(), cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, effective_url(cur_url), resolved_redir, hops, resp.http_version, cur_url.scheme.to_upper(), cur_url.port, "", lower_header_map(resp), exit_code, err_msg)
-        return AttemptOutcome(exit_code, err_msg, retry_after, m, resp, cur_url, final_body, all_headers_text, resume_append)
+        mut streamed_to := ""
+        if resp.was_streamed:
+            streamed_to = stream_path
+        m := TransferMetrics(resp.status, resp.content_type, dl_size, cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, dns_ms, effective_url(cur_url), resolved_redir, hops, resp.http_version, cur_url.scheme.to_upper(), last_ip, dial_port, streamed_to, lower_header_map(resp), exit_code, err_msg)
+        return AttemptOutcome(exit_code, err_msg, retry_after, m, resp, cur_url, final_body, all_headers_text, resume_append, streamed_to)
 
-    return AttemptOutcome(56, "unexpected redirect loop exit", 0, empty_metrics(cur_url, 56, "unexpected loop exit"), empty_hop(), cur_url, bytes.empty(), all_headers_text, false)
+    return AttemptOutcome(56, "unexpected redirect loop exit", 0, empty_metrics(cur_url, 56, "unexpected loop exit"), empty_hop(), cur_url, bytes.empty(), all_headers_text, false, "")
 
-# Execute one URL within a RequestSpec, including retries, header dump, output, and write-out.
-fn execute_url(spec: RequestSpec, client: http.Client, jar: CookieJar, raw_url: String, url_index: Int, stdin_cache: Bytes?) -> (Int, Bytes?):
-    prep_res := prepare_request(spec, raw_url, url_index, stdin_cache)
+# Execute one concrete URL within a RequestSpec (retries, header dump, etag save, output, write-out).
+fn execute_url(spec: RequestSpec, client: http.Client, jar: CookieJar, raw_url: String, explicit_output: String, stdin_cache: Bytes?) -> (Int, Bytes?):
+    prep_res := prepare_request(spec, raw_url, explicit_output, stdin_cache)
     if prep_res.is_err:
         code := classify_error_exit_code(prep_res.err)
         report_error(spec, code, prep_res.err)
@@ -847,11 +1125,19 @@ fn execute_url(spec: RequestSpec, client: http.Client, jar: CookieJar, raw_url: 
         attempt = attempt + 1
         outcome = run_single_attempt(spec, client, jar, prep)
 
+    # Save ETag (--etag-save) on successful 2xx responses.
+    if spec.etag_save != "" and outcome.final_resp.status >= 200 and outcome.final_resp.status < 300:
+        etag := hop_header(outcome.final_resp, "ETag")
+        if etag != "":
+            prepare_output_parent(spec, spec.etag_save)
+            fs.write(spec.etag_save, etag + "\n") catch false
+
     # Dump headers (-D) if requested and any headers were received.
     if spec.dump_header != "" and outcome.all_headers_text != "":
         if spec.dump_header == "-":
             write_stdout_str(outcome.all_headers_text) catch 0
         else:
+            prepare_output_parent(spec, spec.dump_header)
             dumped := fs.write(spec.dump_header, outcome.all_headers_text)
             if dumped.is_err:
                 report_error(spec, 23, "failed writing header dump '{spec.dump_header}': {dumped.err}")
@@ -860,14 +1146,14 @@ fn execute_url(spec: RequestSpec, client: http.Client, jar: CookieJar, raw_url: 
     mut final_code := outcome.exit_code
     mut final_err := outcome.err_msg
     mut metrics := outcome.metrics
-    mut effective_file := ""
+    mut effective_file := outcome.streamed_path
 
-    # Decide whether to emit headers/body.
+    # Decide whether to emit headers/body (skip body write when already streamed to disk).
     suppress_body := spec.fail_on_http and not spec.fail_with_body and outcome.final_resp.status >= 400
     transport_failed := outcome.exit_code != 0 and outcome.exit_code != 22
 
-    if not transport_failed and not suppress_body:
-        out_path_res := resolve_output_path(spec, url_index, outcome.final_url, outcome.final_resp)
+    if not transport_failed and not suppress_body and outcome.streamed_path == "":
+        out_path_res := resolve_output_path(spec, explicit_output, outcome.final_url, outcome.final_resp)
         if out_path_res.is_err:
             final_code = 23
             final_err = out_path_res.err
@@ -891,7 +1177,7 @@ fn execute_url(spec: RequestSpec, client: http.Client, jar: CookieJar, raw_url: 
 
     if final_code != 0:
         report_error(spec, final_code, final_err)
-    metrics = TransferMetrics(metrics.http_code, metrics.content_type, metrics.size_download, metrics.size_upload, metrics.size_header, metrics.size_request, metrics.time_total_ms, metrics.time_starttransfer_ms, metrics.url_effective, metrics.redirect_url, metrics.num_redirects, metrics.http_version, metrics.scheme, metrics.remote_port, effective_file, metrics.response_headers, final_code, final_err)
+    metrics = TransferMetrics(metrics.http_code, metrics.content_type, metrics.size_download, metrics.size_upload, metrics.size_header, metrics.size_request, metrics.time_total_ms, metrics.time_starttransfer_ms, metrics.time_namelookup_ms, metrics.url_effective, metrics.redirect_url, metrics.num_redirects, metrics.http_version, metrics.scheme, metrics.remote_ip, metrics.remote_port, effective_file, metrics.response_headers, final_code, final_err)
 
     # Emit -w / --write-out after transfer output.
     if spec.write_out != "":
@@ -905,8 +1191,22 @@ fn execute_url(spec: RequestSpec, client: http.Client, jar: CookieJar, raw_url: 
 
     return (final_code, prep.stdin_cache)
 
-# Execute all RequestSpecs (from one invocation, including --next groups).
-# Returns the curl-compatible exit code (0 on full success, last non-zero error otherwise).
+# Build the concrete (url, output_path) list for one RequestSpec after glob expansion.
+fn expand_spec_targets(spec: RequestSpec) -> List[(String, String)]!:
+    mut out: List[(String, String)] := []
+    mut raw_idx := 0
+    while raw_idx < spec.urls.len():
+        mut out_tpl := ""
+        if raw_idx < spec.outputs.len():
+            out_tpl = spec.outputs[raw_idx]
+        expanded := expand_url(spec.urls[raw_idx], spec.globoff)!
+        for item in expanded:
+            resolved_out := substitute_output_template(out_tpl, item.captures)
+            out.push((item.url, resolved_out))
+        raw_idx = raw_idx + 1
+    return out
+
+# Execute all RequestSpecs sequentially (default mode).
 pub fn execute_all(specs: List[RequestSpec]) -> Int:
     mut overall_code := 0
     mut stdin_cache: Bytes? := none
@@ -915,17 +1215,23 @@ pub fn execute_all(specs: List[RequestSpec]) -> Int:
         if spec.urls.len() == 0:
             continue
 
-        # Load cookie jar for this request group.
+        targets_res := expand_spec_targets(spec)
+        if targets_res.is_err:
+            code := classify_error_exit_code(targets_res.err)
+            report_error(spec, code, targets_res.err)
+            overall_code = code
+            continue
+        targets := targets_res.ok
+
         jar := new_jar()
         for cf in spec.cookie_files:
             if fs.is_file(cf):
                 load_cookie_file(jar, cf) catch 0
 
-        # Check whether any URL uses HTTPS with custom TLS config / verbose TLS reporting.
         mut needs_tls_cfg := false
         if spec.insecure or spec.cacert != "" or spec.cert != "" or spec.tls_version != "" or spec.verbose:
-            for u in spec.urls:
-                if u.starts_with("https://") or spec.proto_default == "https" or spec.follow_redirects:
+            for pair in targets:
+                if pair.0.starts_with("https://") or spec.proto_default == "https" or spec.follow_redirects:
                     needs_tls_cfg = true
 
         mut has_tls_cfg := false
@@ -942,23 +1248,70 @@ pub fn execute_all(specs: List[RequestSpec]) -> Int:
 
         client := make_http_client(spec, has_tls_cfg, tls_cfg)
 
-        mut idx := 0
-        while idx < spec.urls.len():
-            res := execute_url(spec, client, jar, spec.urls[idx], idx, stdin_cache)
+        for pair in targets:
+            res := execute_url(spec, client, jar, pair.0, pair.1, stdin_cache)
             stdin_cache = res.1
             if res.0 != 0:
                 overall_code = res.0
-            idx = idx + 1
 
         client.close_idle_connections()
         if has_tls_cfg:
             tls_cfg.close()
 
-        # Persist cookie jar (-c) after completing the spec's transfers.
         if spec.cookie_jar != "":
             saved := save_cookie_file(jar, spec.cookie_jar)
             if saved.is_err:
                 report_error(spec, 23, "failed saving cookie jar '{spec.cookie_jar}': {saved.err}")
                 overall_code = 23
 
+    return overall_code
+
+# Worker task for -Z / --parallel: parses an isolated option token list and runs one transfer.
+# Taking a freshly constructed List[String] and a Semaphore keeps every worker 100% isolated
+# under Pith's task-sharing rules (no shared mutable structs or buffers across tasks).
+fn parallel_worker(sem: Semaphore, worker_tokens: List[String]) -> Int:
+    defer sem.release()
+    parsed := parse_tokens_standalone(worker_tokens)
+    if parsed.error_msg != "":
+        write_stderr_line("purl: {parsed.error_msg}")
+        return 2
+    return execute_all(parsed.specs)
+
+# Execute all transfers from a parsed CLI invocation, running concurrently when -Z / --parallel is set.
+pub fn execute_cli(parsed: ParsedCli) -> Int:
+    if not parsed.parallel:
+        return execute_all(parsed.specs)
+
+    mut limit := parsed.parallel_max
+    if limit <= 0:
+        limit = 50
+    sem := Semaphore(limit)
+    mut tasks: List[Task[Int]] := []
+    mut overall_code := 0
+
+    for spec in parsed.specs:
+        if spec.urls.len() == 0:
+            continue
+        targets_res := expand_spec_targets(spec)
+        if targets_res.is_err:
+            code := classify_error_exit_code(targets_res.err)
+            report_error(spec, code, targets_res.err)
+            overall_code = code
+            continue
+        for pair in targets_res.ok:
+            mut job_tokens: List[String] := []
+            for tok in spec.opt_tokens:
+                job_tokens.push(tok)
+            job_tokens.push("--globoff")
+            if pair.1 != "":
+                job_tokens.push("--output")
+                job_tokens.push(pair.1)
+            job_tokens.push(pair.0)
+            sem.acquire()
+            tasks.push(spawn parallel_worker(sem, job_tokens))
+
+    for t in tasks:
+        rc := await t
+        if rc != 0 and overall_code == 0:
+            overall_code = rc
     return overall_code

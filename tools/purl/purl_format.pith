@@ -19,11 +19,13 @@ pub struct TransferMetrics:
     pub size_request: Int
     pub time_total_ms: Int
     pub time_starttransfer_ms: Int
+    pub time_namelookup_ms: Int
     pub url_effective: String
     pub redirect_url: String
     pub num_redirects: Int
     pub http_version: String
     pub scheme: String
+    pub remote_ip: String
     pub remote_port: Int
     pub filename_effective: String
     pub response_headers: Map[String, String]
@@ -229,6 +231,7 @@ fn metrics_to_json(m: TransferMetrics) -> String:
     json.object_set(obj, "http_version", json.make_string(m.http_version))
     json.object_set(obj, "num_redirects", json.make_int(m.num_redirects))
     json.object_set(obj, "redirect_url", json.make_string(m.redirect_url))
+    json.object_set(obj, "remote_ip", json.make_string(m.remote_ip))
     json.object_set(obj, "remote_port", json.make_int(m.remote_port))
     json.object_set(obj, "response_code", json.make_int(m.http_code))
     json.object_set(obj, "scheme", json.make_string(m.scheme))
@@ -237,6 +240,7 @@ fn metrics_to_json(m: TransferMetrics) -> String:
     json.object_set(obj, "size_request", json.make_int(m.size_request))
     json.object_set(obj, "size_upload", json.make_int(m.size_upload))
     json.object_set(obj, "speed_download", json.make_int(parse_int(format_speed(m.size_download, m.time_total_ms)) catch 0))
+    json.object_set(obj, "time_namelookup", json.make_float(m.time_namelookup_ms.to_float() / 1000.0))
     json.object_set(obj, "time_starttransfer", json.make_float(m.time_starttransfer_ms.to_float() / 1000.0))
     json.object_set(obj, "time_total", json.make_float(m.time_total_ms.to_float() / 1000.0))
     json.object_set(obj, "url_effective", json.make_string(m.url_effective))
@@ -260,6 +264,8 @@ fn lookup_write_out_var(name: String, m: TransferMetrics) -> String:
         return format_ms_as_seconds(m.time_total_ms)
     if name == "time_starttransfer":
         return format_ms_as_seconds(m.time_starttransfer_ms)
+    if name == "time_namelookup":
+        return format_ms_as_seconds(m.time_namelookup_ms)
     if name == "speed_download":
         return format_speed(m.size_download, m.time_total_ms)
     if name == "url_effective":
@@ -272,6 +278,8 @@ fn lookup_write_out_var(name: String, m: TransferMetrics) -> String:
         return m.http_version
     if name == "scheme":
         return m.scheme
+    if name == "remote_ip":
+        return m.remote_ip
     if name == "remote_port":
         return m.remote_port.to_string()
     if name == "filename_effective":
@@ -398,6 +406,8 @@ pub fn classify_error_exit_code(err: String) -> Int:
         return 23
     if lower.contains("gzip") or lower.contains("zlib") or lower.contains("zstd") or lower.contains("inflate") or lower.contains("content-encoding"):
         return 61
+    if lower.contains("max-filesize") or lower.contains("maximum file size") or lower.contains("response body exceeds"):
+        return 63
     if lower.contains("connect") or lower.contains("refused") or lower.contains("unreachable"):
         return 7
     return 56

@@ -82,6 +82,19 @@ pub struct RequestSpec:
     pub mut raw_output: Bool
     pub mut no_keepalive: Bool
     pub mut expect100_timeout_ms: Int
+    pub mut globoff: Bool
+    pub mut netrc: Bool
+    pub mut netrc_optional: Bool
+    pub mut netrc_file: String
+    pub mut use_digest: Bool
+    pub mut aws_sigv4: String
+    pub mut resolves: List[String]
+    pub mut connect_tos: List[String]
+    pub mut etag_save: String
+    pub mut etag_compare: String
+    pub mut time_cond: String
+    pub mut max_filesize: Int
+    pub mut opt_tokens: List[String]
 
 # Top-level result of parsing argv (plus any -K config files).
 pub struct ParsedCli:
@@ -89,6 +102,8 @@ pub struct ParsedCli:
     pub show_help: Bool
     pub show_version: Bool
     pub disable_rc: Bool
+    pub parallel: Bool
+    pub parallel_max: Int
     pub error_msg: String
 
 # Construct a RequestSpec initialized to curl defaults.
@@ -100,7 +115,32 @@ pub fn default_spec() -> RequestSpec:
     cookies_inline: List[String] := []
     cookie_files: List[String] := []
     outputs: List[String] := []
-    return RequestSpec(urls, "", false, false, headers, data_parts, false, forms, "", "", "", "", false, "", cookies_inline, cookie_files, "", "", "", false, false, 50, false, false, false, outputs, false, false, false, "", false, false, "", false, false, false, false, false, "", false, false, "", "", "", "", "1.1", 0, 0, "", "", "", 0, 0, 0, false, false, "http", "", false, false, 1000)
+    resolves: List[String] := []
+    connect_tos: List[String] := []
+    opt_tokens: List[String] := []
+    return RequestSpec(urls, "", false, false, headers, data_parts, false, forms, "", "", "", "", false, "", cookies_inline, cookie_files, "", "", "", false, false, 50, false, false, false, outputs, false, false, false, "", false, false, "", false, false, false, false, false, "", false, false, "", "", "", "", "1.1", 0, 0, "", "", "", 0, 0, 0, false, false, "http", "", false, false, 1000, false, false, false, "", false, "", resolves, connect_tos, "", "", "", 0, opt_tokens)
+
+# Parse a byte size string with optional k/m/g suffix (e.g. "1024", "10k", "5M") into bytes.
+pub fn parse_byte_size(raw: String) -> Int!:
+    s := raw.trim()
+    if s == "":
+        fail "invalid byte size: empty"
+    last := s.substring(s.len() - 1, s.len()).to_lower()
+    mut mult := 1
+    mut num_str := s
+    if last == "k":
+        mult = 1024
+        num_str = s.substring(0, s.len() - 1)
+    elif last == "m":
+        mult = 1048576
+        num_str = s.substring(0, s.len() - 1)
+    elif last == "g":
+        mult = 1073741824
+        num_str = s.substring(0, s.len() - 1)
+    n := parse_int(num_str) catch -1
+    if n < 0:
+        fail "invalid byte size: '{raw}'"
+    return n * mult
 
 # Parse a non-negative decimal seconds string ("5", "1.5", "0.25") into milliseconds.
 pub fn parse_seconds_to_ms(raw: String) -> Int!:
@@ -216,7 +256,7 @@ pub fn tokenize_config(text: String) -> List[String]:
 
 # True when short flag character `ch` expects a parameter value.
 fn short_takes_value(ch: String) -> Bool:
-    return ch == "X" or ch == "H" or ch == "d" or ch == "F" or ch == "T" or ch == "o" or ch == "D" or ch == "u" or ch == "U" or ch == "A" or ch == "e" or ch == "b" or ch == "c" or ch == "m" or ch == "w" or ch == "x" or ch == "r" or ch == "C" or ch == "K" or ch == "E"
+    return ch == "X" or ch == "H" or ch == "d" or ch == "F" or ch == "T" or ch == "o" or ch == "D" or ch == "u" or ch == "U" or ch == "A" or ch == "e" or ch == "b" or ch == "c" or ch == "m" or ch == "w" or ch == "x" or ch == "r" or ch == "C" or ch == "K" or ch == "E" or ch == "z"
 
 # True when long option name (without leading "--") expects a parameter value.
 fn long_takes_value(name: String) -> Bool:
@@ -233,6 +273,8 @@ fn long_takes_value(name: String) -> Bool:
     if name == "retry" or name == "retry-delay" or name == "retry-max-time" or name == "proto-default" or name == "request-target":
         return true
     if name == "url" or name == "config" or name == "expect100-timeout" or name == "socks4" or name == "socks5" or name == "socks5-hostname":
+        return true
+    if name == "parallel-max" or name == "netrc-file" or name == "aws-sigv4" or name == "resolve" or name == "connect-to" or name == "etag-save" or name == "etag-compare" or name == "time-cond" or name == "max-filesize":
         return true
     return false
 
@@ -320,6 +362,12 @@ fn short_to_long(ch: String) -> String:
         return "progress-bar"
     if ch == "g":
         return "globoff"
+    if ch == "Z":
+        return "parallel"
+    if ch == "n":
+        return "netrc"
+    if ch == "z":
+        return "time-cond"
     if ch == "4":
         return "ipv4"
     if ch == "0":
@@ -333,10 +381,18 @@ struct ParseState:
     mut show_help: Bool
     mut show_version: Bool
     mut disable_rc: Bool
+    mut parallel: Bool
+    mut parallel_max: Int
     mut config_depth: Int
 
-fn apply_option(st: ParseState, name: String, value: String) -> Int!:
+fn apply_option(st: ParseState, name: String, value: String, has_value: Bool) -> Int!:
     cur := st.cur
+    # Record per-spec option tokens (excluding urls/outputs/parallel/config/next)
+    # so -Z parallel workers can cleanly re-parse an isolated RequestSpec per URL.
+    if name != "url" and name != "output" and name != "config" and name != "next" and name != "parallel" and name != "no-parallel" and name != "parallel-max" and name != "parallel-immediate" and name != "help" and name != "version" and name != "disable":
+        cur.opt_tokens.push("--" + name)
+        if has_value:
+            cur.opt_tokens.push(value)
     if name == "help":
         st.show_help = true
         return 0
@@ -612,6 +668,62 @@ fn apply_option(st: ParseState, name: String, value: String) -> Int!:
     if name == "expect100-timeout":
         cur.expect100_timeout_ms = parse_seconds_to_ms(value)!
         return 0
+    if name == "globoff":
+        cur.globoff = true
+        return 0
+    if name == "no-globoff":
+        cur.globoff = false
+        return 0
+    if name == "parallel":
+        st.parallel = true
+        return 0
+    if name == "no-parallel":
+        st.parallel = false
+        return 0
+    if name == "parallel-max":
+        n := parse_int(value) catch 0
+        if n <= 0:
+            fail "invalid --parallel-max value: '{value}'"
+        st.parallel_max = n
+        return 0
+    if name == "parallel-immediate":
+        return 0
+    if name == "netrc":
+        cur.netrc = true
+        return 0
+    if name == "netrc-optional":
+        cur.netrc_optional = true
+        return 0
+    if name == "netrc-file":
+        cur.netrc_file = value
+        return 0
+    if name == "digest":
+        cur.use_digest = true
+        return 0
+    if name == "no-digest":
+        cur.use_digest = false
+        return 0
+    if name == "aws-sigv4":
+        cur.aws_sigv4 = value
+        return 0
+    if name == "resolve":
+        cur.resolves.push(value)
+        return 0
+    if name == "connect-to":
+        cur.connect_tos.push(value)
+        return 0
+    if name == "etag-save":
+        cur.etag_save = value
+        return 0
+    if name == "etag-compare":
+        cur.etag_compare = value
+        return 0
+    if name == "time-cond":
+        cur.time_cond = value
+        return 0
+    if name == "max-filesize":
+        cur.max_filesize = parse_byte_size(value)!
+        return 0
     if name == "config":
         if st.config_depth >= 8:
             fail "config file nesting too deep"
@@ -625,7 +737,7 @@ fn apply_option(st: ParseState, name: String, value: String) -> Int!:
         st.config_depth = st.config_depth - 1
         return 0
     # Harmless curl script-compatibility flags accepted as no-ops.
-    if name == "progress-bar" or name == "no-progress-meter" or name == "no-buffer" or name == "globoff" or name == "ipv4" or name == "tcp-nodelay" or name == "http1.0" or name == "anyauth" or name == "basic":
+    if name == "progress-bar" or name == "no-progress-meter" or name == "no-buffer" or name == "ipv4" or name == "tcp-nodelay" or name == "http1.0" or name == "anyauth" or name == "basic":
         return 0
     fail "option --{name}: unknown option"
 
@@ -648,16 +760,16 @@ fn parse_tokens(st: ParseState, tokens: List[String]) -> Int!:
             if eq >= 0:
                 opt_name := body.substring(0, eq)
                 opt_val := body.substring(eq + 1, body.len())
-                apply_option(st, opt_name, opt_val)!
+                apply_option(st, opt_name, opt_val, true)!
                 i = i + 1
             else:
                 if long_takes_value(body):
                     if i + 1 >= tokens.len():
                         fail "option --{body}: requires parameter"
-                    apply_option(st, body, tokens[i + 1])!
+                    apply_option(st, body, tokens[i + 1], true)!
                     i = i + 2
                 else:
-                    apply_option(st, body, "")!
+                    apply_option(st, body, "", false)!
                     i = i + 1
             continue
         if tok.starts_with("-") and tok.len() > 1:
@@ -671,16 +783,16 @@ fn parse_tokens(st: ParseState, tokens: List[String]) -> Int!:
                     if j + 1 < tok.len():
                         # Attached parameter value, e.g. -XPOST, -oout.txt, -H"Foo: 1".
                         attached := tok.substring(j + 1, tok.len())
-                        apply_option(st, long_name, attached)!
+                        apply_option(st, long_name, attached, true)!
                         j = tok.len()
                     else:
                         if i + 1 >= tokens.len():
                             fail "option -{ch}: requires parameter"
-                        apply_option(st, long_name, tokens[i + 1])!
+                        apply_option(st, long_name, tokens[i + 1], true)!
                         i = i + 1
                         j = tok.len()
                 else:
-                    apply_option(st, long_name, "")!
+                    apply_option(st, long_name, "", false)!
                     j = j + 1
             i = i + 1
             continue
@@ -706,7 +818,7 @@ pub fn parse_cli(argv: List[String]) -> ParsedCli:
             skip_rc = true
 
     specs_init: List[RequestSpec] := []
-    st := ParseState(specs_init, default_spec(), false, false, skip_rc, 0)
+    st := ParseState(specs_init, default_spec(), false, false, skip_rc, false, 50, 0)
 
     if not skip_rc:
         home := os.home_dir()
@@ -717,22 +829,22 @@ pub fn parse_cli(argv: List[String]) -> ParsedCli:
                 if rc_text != "":
                     rc_res := parse_tokens(st, tokenize_config(rc_text))
                     if rc_res.is_err:
-                        return ParsedCli([], false, false, false, rc_res.err)
+                        return ParsedCli([], false, false, false, false, 50, rc_res.err)
 
     res := parse_tokens(st, raw_tokens)
     if res.is_err:
-        return ParsedCli([], false, false, st.disable_rc, res.err)
+        return ParsedCli([], false, false, st.disable_rc, st.parallel, st.parallel_max, res.err)
 
     st.specs.push(st.cur)
-    return ParsedCli(st.specs, st.show_help, st.show_version, st.disable_rc, "")
+    return ParsedCli(st.specs, st.show_help, st.show_version, st.disable_rc, st.parallel, st.parallel_max, "")
 
 # Parse raw option tokens without argv[0] and without reading ~/.purlrc.
-# Intended for unit tests.
+# Intended for unit tests and isolated parallel workers.
 pub fn parse_tokens_standalone(tokens: List[String]) -> ParsedCli:
     specs_init: List[RequestSpec] := []
-    st := ParseState(specs_init, default_spec(), false, false, true, 0)
+    st := ParseState(specs_init, default_spec(), false, false, true, false, 50, 0)
     res := parse_tokens(st, tokens)
     if res.is_err:
-        return ParsedCli([], false, false, true, res.err)
+        return ParsedCli([], false, false, true, false, 50, res.err)
     st.specs.push(st.cur)
-    return ParsedCli(st.specs, st.show_help, st.show_version, true, "")
+    return ParsedCli(st.specs, st.show_help, st.show_version, true, st.parallel, st.parallel_max, "")

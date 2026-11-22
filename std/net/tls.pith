@@ -239,6 +239,11 @@ pub struct Config:
 pub struct Conn:
     pub handle: Int
 
+# the one Conn that names no session (see no_conn). a placeholder is built on
+# hot paths (every plaintext http request's byte source holds one), so it is
+# shared rather than allocated and dropped per use.
+NO_CONN := Conn(0)
+
 # summary of one negotiated tls connection.
 pub struct ConnectionState:
     pub version: Int
@@ -3166,7 +3171,7 @@ fn native_conn_close(handle: Int):
 # connection already closed or released is not in the map, and this does
 # nothing.
 fn native_conn_release(handle: Int):
-    if not native_conn_has(handle):
+    if handle == 0 or not native_conn_has(handle):
         return
     tcp_close(native_conn_get(handle).fd)
     native_conn_drop(handle)
@@ -3318,7 +3323,7 @@ pub fn client(stream: TcpStream, server_name: String, config: Config) -> Conn!:
 # driver's connection before or without tls) holds this one on the others.
 # session handles start far above 0, so this never names a live session.
 pub fn no_conn() -> Conn:
-    return Conn(0)
+    return NO_CONN
 
 # Listen for TLS connections on host:port. The listener borrows `config` rather
 # than taking ownership — close the config only after the listener and its

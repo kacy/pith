@@ -24,7 +24,7 @@ from ir_ast_helpers import ir_is_binding_kind
 from errors import Diagnostic
 from std.strings import lines_keep_empty
 from return_paths import missing_return_sites
-from checker import c_get_expr_type, extract_binding_name
+from checker import c_get_expr_type, extract_binding_name, type_implements_drop
 from types import get_type_info, is_error_type, lookup_qualified_type_id
 
 # ---------------------------------------------------------------
@@ -575,10 +575,12 @@ fn lint_shadowed_globals(idx: Int):
 #
 # the rule is deliberately narrow, because a false positive on a resource
 # that is closed somewhere the linter cannot see is worse than no rule at
-# all. it reports only when BOTH hold:
+# all. it reports only when ALL of these hold:
 #
 #   - the binding's initializer is a call to a constructor on the short
 #     list below, reached through `!`/`?` and any chain of builder methods
+#   - the value it builds is not of a type that implements Drop, whose
+#     destructor releases the resource at scope end anyway
 #   - every later mention of the name is the receiver of a method that is
 #     not a closer
 #
@@ -597,17 +599,19 @@ fn lint_shadowed_globals(idx: Int):
 # the label to name in the diagnostic, or "" when this call does not build
 # a resource the caller has to close.
 #
-# the list is empty for now. it held the three std.net.tls config builders,
-# and a tls config implements Drop: a config built and never closed gives
-# its registry slot back when the last value naming it goes away
-# (docs/ownership.md, "destructors"), so the shape this rule reported is no
-# longer a leak. the rule stays for the std types that still close by hand
-# (docs/destructors_roadmap.md); each is added here as it is audited onto
-# the list rather than the destructor, under the bar set above.
+# the tls config builders stay on the list although a tls config implements
+# Drop: the type check in l_check_resource_binding is what keeps them quiet,
+# so a type moved onto the destructor needs no edit here. the parser scopes
+# have no destructor and no method that consumes them, so a scope opened and
+# never closed holds every node parsed after it until the process exits.
 fn l_resource_ctor_label(module_path: String, fn_name: String) -> String:
-    if module_path.len() == 0 or fn_name.len() == 0:
+    if module_path == "std.net.tls":
+        if fn_name == "client_config" or fn_name == "client_config_with_ca_file" or fn_name == "server_config":
+            return "tls." + fn_name + "()"
         return ""
-    # no constructor qualifies today; see the note above.
+    if module_path == "std.json" or module_path == "std.toml" or module_path == "std.yaml":
+        if fn_name == "open_scope":
+            return module_path.substring(4, module_path.len()) + ".open_scope()"
     return ""
 
 # the closers std spells. a receiver use of any of these is enough to
@@ -683,14 +687,18 @@ fn l_check_resource_binding(name: String, label: String, line: Int, col: Int, bo
     if l_resource_escaped or l_resource_closed:
         return
     message := "'" + name + "' is built by " + label + " and never closed; the resource behind the handle is not reclaimed when the binding goes out of scope"
-    fix := "close it on every exit -- `defer " + name + ".close()` next to the build; see docs/destructors_roadmap.md"
+    mut closer := name + ".close()"
+    if label.ends_with(".open_scope()"):
+        closer = label.substring(0, label.len() - 13) + ".close_scope(" + name + ")"
+    fix := "close it on every exit -- `defer " + closer + "` next to the build; see docs/destructors_roadmap.md"
     l_diagnostics.push(Diagnostic("warning", "E307", message, l_file, line, col, fix))
 
 fn l_collect_resource_bindings(node_idx: Int, body_idx: Int):
     node := get_node(node_idx)
     if node.kind == "binding" and node.children.len() > 0:
-        label := l_init_resource_label(node.children[node.children.len() - 1])
-        if label.len() > 0:
+        init_idx := node.children[node.children.len() - 1]
+        label := l_init_resource_label(init_idx)
+        if label.len() > 0 and not type_implements_drop(c_get_expr_type(init_idx)):
             l_check_resource_binding(extract_binding_name(node.value), label, node.line, node.col, body_idx)
     for child in node.children:
         l_collect_resource_bindings(child, body_idx)

@@ -1495,6 +1495,11 @@ fn check_type_implements_interface(type_name: String, iface_name: String) -> Boo
     key := type_base + chr(9) + iface_base
     return implementation_set.contains_key(key)
 
+## whether the type `tid` names implements Drop, so its destructor gives back
+## what it holds when the last value naming it goes away.
+pub fn type_implements_drop(tid: Int) -> Bool:
+    return tid >= 0 and check_type_implements_interface(get_type_name(tid), "Drop")
+
 fn build_interface_type_name(base: String, args: List[String]) -> String:
     mut result := base + "["
     mut first := true

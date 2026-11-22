@@ -2144,6 +2144,9 @@ pub fn compile_from_ir(
         for p in crate::count_check::check_loop_borrows(&raw) {
             eprintln!("  borrow: {p}");
         }
+        for p in crate::count_check::check_untagged_stores(&raw) {
+            eprintln!("  borrow: {p}");
+        }
         // `only` is for tools that want the report and nothing else, such as
         // the mutation run that checks the checker
         if count_mode == "only" {

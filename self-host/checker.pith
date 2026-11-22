@@ -1109,6 +1109,9 @@ fn register_struct_declaration(node_idx: Int, node: Node):
                     struct_field_weak.insert(tid.to_string() + "." + fname, true)
                 if cn.children.len() > 1:
                     default_tid := c_check_expr(cn.children[1], current_scope)
+                    # `= {}` takes the field's type, as a constructor argument does
+                    if is_error_type(default_tid):
+                        propagate_empty_collection_literal(cn.children[1], ftid)
                     if optional_target_accepts_value(cn.children[1], default_tid, ftid):
                         struct_field_default_nodes.insert(base_name + "." + fname, cn.children[1])
                     elif is_error_type(default_tid) == false and default_tid != ftid:
@@ -2937,6 +2940,14 @@ fn propagate_expected_collection_type(literal_idx: Int, expected_tid: Int):
         return
     node := get_node(literal_idx)
     expected_info := get_type_info(expected_tid)
+    # a literal stored where an optional container goes builds the container,
+    # and the emitter wraps it in the Some. without the inner type `{}` for a
+    # Map[String, String]? field built a map that owned none of its strings,
+    # and for a Set[String]? field it built a map.
+    if expected_info.kind == "optional" and expected_info.inner >= 0:
+        if node.kind == "list" or node.kind == "map" or node.kind == "set":
+            propagate_expected_collection_type(literal_idx, expected_info.inner)
+        return
     if node.kind == "list" and expected_info.kind == "list":
         expression_type_cache.insert(literal_idx, expected_tid)
         for child in node.children:
@@ -3385,6 +3396,14 @@ fn check_return_statement(node: Node, scope_id: Int):
         if actual_node.children.len() == 0 and is_error_type(actual):
             if exp_info.kind == "list" or exp_info.kind == "map" or exp_info.kind == "set":
                 expression_type_cache.insert(node.children[0], expected)
+                return
+            # into an optional return the literal builds the inner container
+            # and widens into the Some, like any other plain value
+            if exp_info.kind == "optional" and exp_info.inner >= 0:
+                propagate_expected_collection_type(node.children[0], expected)
+                literal_tid := c_get_expr_type(node.children[0])
+                if is_error_type(literal_tid) == false:
+                    argument_widens_to_optional(node.children[0], literal_tid, expected)
                 return
     if actual_node.kind == "none_lit":
         if exp_info.kind == "optional":

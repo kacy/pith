@@ -627,15 +627,22 @@ gaps, all bounded leaks rather than dangling pointers:
   an argument literal that HAS elements but checks as an error because an
   empty literal is nested inside (`f([[]])`) runs the same element-checked
   coercion an assignment uses, so the declared type is recorded through
-  every nested literal and the inner list is tagged. the safety net for
-  anything that still slips through is the store: an untagged list handed
-  a container, struct, `Bytes` or closure adopts that kind at the first
-  store and owns it from then on, the same second chance a map has —
-  string elements are the one kind the second chance does not cover,
-  because string stores stay on the constructor path. an empty *map*
-  literal is not on this list at all: its values are counted from the
-  store rather than the constructor, so `f({})` owns what is put into it
-  whatever the checker managed to record.
+  every nested literal and the inner list is tagged. a literal written
+  into a holder (a struct field or its `= {}` default, a list element, a
+  map value) is built from that recorded type rather than from the
+  holder's container kind alone, and a target that is an optional
+  container (`m: Map[String, String]?`, `return {}` from a
+  `-> Set[String]?`) records the container inside it. the safety net for
+  anything that still slips through is the store: an untagged list or map
+  handed a container, struct, `Bytes` or closure adopts that kind at the
+  first store and owns it from then on. string values are the one kind
+  the second chance does not cover, because string stores stay on the
+  constructor path: an untagged `Map[String, String]` takes no count of a
+  borrowed string put into it, and reads it after its owner frees it.
+  `Saved(lists: {})` built exactly that map until the holder path read
+  the recorded type. the count checker reports a borrowed counted value
+  stored into a container built untagged in the same function
+  (`check_untagged_stores` in `cranelift/codegen/src/count_check/`).
 - **a result or optional bound to a name can leak its payload.** `T!` and
   `T?` lower to a three-slot value, and releasing one frees those slots
   without dropping the payload they own. a local whose every use is a

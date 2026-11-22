@@ -933,8 +933,12 @@ the rule: **do not share a mutable collection across tasks — pass data
 through a channel instead.** the checker enforces it at a `spawn`
 argument and a channel send (E248), for a collection and for a struct whose
 fields reach one outside a `guard` block, for a closure that can reach
-another task and captures such a value, and for a global through the
-sharing rule (E309).
+another task and captures such a value, for a value stored into a guarded
+collection (E276), and for a global through the sharing rule (E309). it
+follows a buffer through every name and call that can reach it: a value
+handed over, sent or stored under a lock must hold nothing another name
+still reaches, and a global or a frozen field may not be changed in place
+through any name.
 
 the field itself is a pointer too. reassigning a field that holds a counted
 value releases the old value, and a task reading the field at that moment may
@@ -943,8 +947,10 @@ struct whose fields reach a counted field that some code reassigns after the
 struct is built, unless the field is in a `guard` block. a field no code
 reassigns is settled and behaves like a `frozen` one. a field holding a
 number or a flag is exempt. a send hands over the handle, so the value sent must be
-one the sender does not keep: built in the call, or an independent copy
-(`std.collections.copy_list` and friends).
+one the sender does not keep: built in the call, a local the sender does not
+use again, or an independent copy (`std.collections.copy_list` and friends).
+a spawn evaluates its arguments on the new task, so a copy made in a spawn's
+arguments reads the original there; make it before the spawn.
 
 ### frozen fields
 
@@ -961,10 +967,13 @@ struct Router:
 ```
 
 std.web's router, a request's header and query maps, a metrics series' labels
-and an http/2 pool's connection list are frozen. the check follows paths: a
-copy of the value taken out of the field and changed through the copy's name
-is not seen, so keep a frozen value read-only wherever it goes. `frozen` is a
-word only before a field name, so a variable named `frozen` still works.
+and an http/2 pool's connection list are frozen. in a program that spawns
+tasks, the value is followed past the field too: changing it through a local
+it was copied into, a parameter it was passed as, or a value that holds it is
+refused (E275), and so is storing it into a value a caller handed in. a
+frozen field may hold a module global's buffer, or another frozen field's,
+since no name may change either. `frozen` is a word only before a field
+name, so a variable named `frozen` still works.
 
 ## finding a use after free
 

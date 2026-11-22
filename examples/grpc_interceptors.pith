@@ -84,10 +84,9 @@ fn connect() -> grpc.Conn!:
 
 # call once and describe what came back.
 fn say_hello(conn: grpc.Conn, name: String) -> String:
-    reply := conn.unary("/demo.Greeter/Hello", encode_text(name))
-    if reply.is_err:
-        return grpc.status_name(reply.err.status)
-    return decode_text(reply.ok) catch "unreadable reply"
+    reply := conn.unary("/demo.Greeter/Hello", encode_text(name)) catch err:
+        return grpc.status_name(err.status)
+    return decode_text(reply) catch "unreadable reply"
 
 fn main() -> Int!:
     spawn run_server()

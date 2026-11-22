@@ -229,6 +229,9 @@ mut literal_targets: Map[Int, Int] := {}
 # binding is retyped. see refine_empty_literal_binding.
 mut open_empty_literal_bindings: Map[Int, Int] := {}
 
+# the error type of the `catch err:` block being checked
+mut caught_error_type := TID_ERR
+
 # ---------------------------------------------------------------
 # initialization
 # ---------------------------------------------------------------
@@ -3493,6 +3496,12 @@ fn check_let_pattern(pat_idx: Int, subj_idx: Int, branch_scope: Int, outer_scope
         return
     pat := get_node(pat_idx)
     if pat.kind == "pat_variant":
+        # on an optional enum the variant pattern matches the payload of a
+        # some: `if let Shape.Circle(r) = maybe_shape`
+        info := get_type_info(subj_type)
+        if info.kind == "optional" and info.inner >= 0 and get_type_info(info.inner).kind == "enum":
+            check_pattern_match(pat_idx, info.inner, branch_scope)
+            return
         check_pattern_match(pat_idx, subj_type, branch_scope)
         return
     if pat.kind == "pat_binding":
@@ -3771,6 +3780,8 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         return check_catch_expression(node, scope_id)
     if node.kind == "catch_block":
         return check_catch_block(node, scope_id)
+    if node.kind == "caught_error":
+        return caught_error_type
     if node.kind == "select_expr":
         return check_select_expression(node, scope_id)
     if node.kind == "match_expr":
@@ -5170,30 +5181,48 @@ fn check_list_reduce_builtin(arg_indices: List[Int], scope_id: Int) -> Int:
         report_error("E207", "reduce expects 3 arguments, got " + arg_indices.len().to_string())
         return TID_ERR
     list_tid := c_check_expr(call_arg_expr_index(arg_indices[0]), scope_id)
-    init_tid := c_check_expr(call_arg_expr_index(arg_indices[1]), scope_id)
-    fn_tid := c_check_expr(call_arg_expr_index(arg_indices[2]), scope_id)
     if is_error_type(list_tid):
-        return TID_ERR
-    if is_error_type(init_tid):
-        return TID_ERR
-    if is_error_type(fn_tid):
         return TID_ERR
     list_info := get_type_info(list_tid)
     if list_info.kind != "list":
         report_error("E219", "reduce expects a List as the first argument, got " + get_type_name(list_tid))
         return TID_ERR
+    return check_reduce_arguments(list_info.inner, arg_indices[1], arg_indices[2], "third", scope_id)
+
+# the accumulator and callback of both reduce forms. the callback is checked
+# first, so an empty accumulator literal (`{}`, `[]`) takes its type from the
+# callback's first parameter, the way an empty literal argument takes its
+# parameter's type at an ordinary call.
+fn check_reduce_arguments(elem: Int, init_arg: Int, fn_arg: Int, fn_position: String, scope_id: Int) -> Int:
+    fn_tid := c_check_expr(call_arg_expr_index(fn_arg), scope_id)
+    init_idx := call_arg_expr_index(init_arg)
+    mut init_tid := c_check_expr(init_idx, scope_id)
+    if is_error_type(fn_tid):
+        return TID_ERR
     fn_info := get_type_info(fn_tid)
     if fn_info.kind != "function":
-        report_error("E208", "reduce expects a function as the third argument")
+        report_error("E208", "reduce expects a function as the " + fn_position + " argument")
         return TID_ERR
     if fn_info.param_types.len() != 2:
         report_error("E207", "reduce callback expects 2 parameters, got " + fn_info.param_types.len().to_string())
         return TID_ERR
+    if is_error_type(init_tid):
+        propagate_empty_argument_collection_type(init_arg, fn_info.param_types[0], init_tid, scope_id)
+        if expression_type_cache.contains_key(init_idx):
+            init_tid = expression_type_cache[init_idx]
+        if is_error_type(init_tid):
+            # an empty literal the parameter cannot type (`{}` for an Int
+            # accumulator) has no error of its own yet; anything else
+            # reported where it failed
+            init_node := get_node(init_idx)
+            if init_node.children.len() == 0 and (init_node.kind == "list" or init_node.kind == "map" or init_node.kind == "set"):
+                report_error_at(init_idx, "E219", "the empty reduce accumulator cannot take the callback's accumulator type " + get_type_name(fn_info.param_types[0]))
+            return TID_ERR
     if types_structurally_equal(fn_info.param_types[0], init_tid) == false:
         report_error("E219", "reduce accumulator parameter mismatch: expected " + get_type_name(init_tid) + ", got " + get_type_name(fn_info.param_types[0]))
         return TID_ERR
-    if types_structurally_equal(fn_info.param_types[1], list_info.inner) == false:
-        report_error("E219", "reduce element parameter mismatch: expected " + get_type_name(list_info.inner) + ", got " + get_type_name(fn_info.param_types[1]))
+    if types_structurally_equal(fn_info.param_types[1], elem) == false:
+        report_error("E219", "reduce element parameter mismatch: expected " + get_type_name(elem) + ", got " + get_type_name(fn_info.param_types[1]))
         return TID_ERR
     if types_structurally_equal(fn_info.return_type, init_tid) == false:
         report_error("E219", "reduce callback return mismatch: expected " + get_type_name(init_tid) + ", got " + get_type_name(fn_info.return_type))
@@ -5250,29 +5279,7 @@ fn check_list_reduce_method(info: TypeInfo, args: List[Int], scope_id: Int) -> I
     if args.len() != 2:
         report_error("E207", "reduce expects 2 arguments, got " + args.len().to_string())
         return TID_ERR
-    init_tid := c_check_expr(call_arg_expr_index(args[0]), scope_id)
-    fn_tid := c_check_expr(call_arg_expr_index(args[1]), scope_id)
-    if is_error_type(init_tid):
-        return TID_ERR
-    if is_error_type(fn_tid):
-        return TID_ERR
-    fn_info := get_type_info(fn_tid)
-    if fn_info.kind != "function":
-        report_error("E208", "reduce expects a function as the second argument")
-        return TID_ERR
-    if fn_info.param_types.len() != 2:
-        report_error("E207", "reduce callback expects 2 parameters, got " + fn_info.param_types.len().to_string())
-        return TID_ERR
-    if types_structurally_equal(fn_info.param_types[0], init_tid) == false:
-        report_error("E219", "reduce accumulator parameter mismatch: expected " + get_type_name(init_tid) + ", got " + get_type_name(fn_info.param_types[0]))
-        return TID_ERR
-    if types_structurally_equal(fn_info.param_types[1], info.inner) == false:
-        report_error("E219", "reduce element parameter mismatch: expected " + get_type_name(info.inner) + ", got " + get_type_name(fn_info.param_types[1]))
-        return TID_ERR
-    if types_structurally_equal(fn_info.return_type, init_tid) == false:
-        report_error("E219", "reduce callback return mismatch: expected " + get_type_name(init_tid) + ", got " + get_type_name(fn_info.return_type))
-        return TID_ERR
-    return init_tid
+    return check_reduce_arguments(info.inner, args[0], args[1], "second", scope_id)
 
 # ---------------------------------------------------------------
 # interface bounds checking
@@ -7285,7 +7292,12 @@ fn check_catch_block(node: Node, scope_id: Int) -> Int:
 
     block_node := get_node(node.children[1])
     block_scope := create_scope(scope_id)
+    # `catch err:` opens its block with a binding of err to a caught_error
+    # node, which takes the result's error type
+    saved_caught := caught_error_type
+    caught_error_type = result_info.value_type
     check_block_statement(block_node, block_scope)
+    caught_error_type = saved_caught
 
     if block_node.children.len() == 0:
         report_error("E253", "a catch block cannot be empty; it runs on the error path and must leave with return, fail, continue or break")

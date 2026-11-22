@@ -67,20 +67,17 @@ fn stock_note(product: cat.Product) -> String:
     return "out of stock"
 
 fn lookup(client: cat.CatalogClient, sku: String):
-    found := client.GetProduct(cat.GetProductRequest(sku: sku))
-    if found.is_err:
-        print("{sku}: {grpc.status_name(found.err.status)}, {found.err.message}")
+    product := client.GetProduct(cat.GetProductRequest(sku: sku)) catch err:
+        print("{sku}: {grpc.status_name(err.status)}, {err.message}")
         return
-    product := found.ok
     print("{sku}: {product.name}, ${product.price:.2}, {stock_note(product)}")
 
 fn find(client: cat.CatalogClient, query: String, max_results: Int):
-    found := client.Search(cat.SearchRequest(query: query, max_results: max_results))
-    if found.is_err:
-        print("search '{query}': {grpc.status_name(found.err.status)}, {found.err.message}")
+    found := client.Search(cat.SearchRequest(query: query, max_results: max_results)) catch err:
+        print("search '{query}': {grpc.status_name(err.status)}, {err.message}")
         return
-    print("search '{query}': {found.ok.total} matches, showing {found.ok.products.len()}")
-    for product in found.ok.products:
+    print("search '{query}': {found.total} matches, showing {found.products.len()}")
+    for product in found.products:
         print("  {product.sku}  {product.name}")
 
 fn main() -> Int!:

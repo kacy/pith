@@ -90,6 +90,9 @@ mut ir_index_offset_targets: Map[Int, Int] := {}
 # set while one of those steps, or an index offset that skips its check, is
 # emitted, so ir_int_op hands back the plain op instead of the checked one
 mut ir_plain_int_arith := false
+# the owned error of the `catch err:` block being emitted. the block's first
+# statement binds it, through a caught_error node.
+mut ir_caught_error_reg := 0
 
 mut ir_map_value_types: Map[String, String] := {} # map variable name -> value type
 
@@ -1329,6 +1332,9 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
     # ir_emit_catch_expr), so the result arrives owned. treating it as borrowed
     # makes the binding retain again and leaks the payload.
     if node.kind == "catch_expr" or node.kind == "catch_block":
+        return false
+    # the error a `catch err:` block binds arrives owned (ir_emit_catch_block)
+    if node.kind == "caught_error":
         return false
     # awaiting a task transfers the result's count out to the single awaiter:
     # the task's thread produced the value with count 1 and stored it raw in the
@@ -11312,9 +11318,13 @@ fn ir_emit_catch_block_pair(node: Node, flag_r: Int, val_r: Int) -> Int:
     ir_emit("store " + temp_name + " " + val_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(err_l)
-    err_kind := ir_rc_kind(ir_result_field_kind(result_tid, "err"))
-    if err_kind.len() > 0:
-        ir_rc_release_reg(val_r, err_kind)
+    if node.value.len() > 0:
+        # `catch err:` hands the owned error to the block's binding
+        ir_caught_error_reg = val_r
+    else:
+        err_kind := ir_rc_kind(ir_result_field_kind(result_tid, "err"))
+        if err_kind.len() > 0:
+            ir_rc_release_reg(val_r, err_kind)
     ir_block(node.children[1])
     ir_emit("jmp " + merge_l)
     ir_emit_label(merge_l)
@@ -11355,10 +11365,21 @@ fn ir_emit_catch_block(node: Node) -> Int:
     ir_emit("store " + temp_name + " " + ok_value_r.to_string())
     ir_emit("jmp " + merge_l)
     ir_emit_label(err_l)
-    # the error is not consumed by the block (there is no binding for it in
-    # this form), so drop it before user code runs, unless the operand is a
-    # borrow, in which case the error and the shell stay with their owner.
-    if operand_class != "borrowed":
+    if node.value.len() > 0:
+        # `catch err:` binds the error, so the block's binding takes it
+        # owned: the shell's count moves over from an owned operand, and a
+        # borrowed operand's error gets a count of its own while the shell
+        # stays with its owner.
+        err_r := ir_emit_result_value_field(result_r, result_tid, "err")
+        if operand_class == "borrowed":
+            ir_rc_retain_reg(err_r, ir_rc_kind(ir_result_field_kind(result_tid, "err")))
+        else:
+            ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
+        ir_caught_error_reg = err_r
+    elif operand_class != "borrowed":
+        # the error is not consumed by the block, so drop it before user
+        # code runs, unless the operand is a borrow, in which case the error
+        # and the shell stay with their owner.
         ir_emit_release_result_error(result_r, result_tid)
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", result_r)
     ir_block(node.children[1])
@@ -11463,6 +11484,8 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_catch_expr(node)
     if kind == "catch_block":
         return ir_emit_catch_block(node)
+    if kind == "caught_error":
+        return ir_caught_error_reg
 
     if kind == "select_expr":
         return ir_emit_select_expr(idx)
@@ -12454,16 +12477,49 @@ fn ir_emit_if_stmt(node: Node):
 # if let / while let share the match machinery: a variant pattern uses the
 # match condition and binding emitters, a bare binding tests an optional's
 # flag and extracts its value.
-fn ir_emit_let_cond(pat_idx: Int, subj_r: Int) -> Int:
+fn ir_emit_let_cond(pat_idx: Int, subj_r: Int, subj_idx: Int) -> Int:
     pat := get_node(pat_idx)
     if pat.kind == "pat_binding":
         r := ir_reg()
         ir_emit_optional_none_compare(r, "neq", subj_r)
         return r
+    if ir_let_unwraps_variant(pat_idx, subj_idx):
+        # a variant pattern on an optional enum matches only a some whose
+        # payload is that variant. a none's payload reads as 0, which is no
+        # enum to test, so the variant test runs on the some branch only.
+        temp := ir_new_temp_name("let_variant")
+        some_r := ir_reg()
+        ir_emit_optional_none_compare(some_r, "neq", subj_r)
+        ir_emit("store " + temp + " " + some_r.to_string())
+        test_l := ir_label()
+        done_l := ir_label()
+        ir_emit("brif " + some_r.to_string() + " " + test_l + " " + done_l)
+        ir_emit_label(test_l)
+        payload_r := ir_optional_value_field(subj_r, c_get_expr_type(subj_idx))
+        ir_emit("store " + temp + " " + ir_emit_match_cond(pat_idx, payload_r).to_string())
+        ir_emit("jmp " + done_l)
+        ir_emit_label(done_l)
+        r := ir_reg()
+        ir_emit("load " + r.to_string() + " " + temp)
+        return r
     return ir_emit_match_cond(pat_idx, subj_r)
+
+# a variant pattern whose subject is an optional: the pattern applies to the
+# payload (see check_let_pattern)
+fn ir_let_unwraps_variant(pat_idx: Int, subj_idx: Int) -> Bool:
+    if get_node(pat_idx).kind != "pat_variant":
+        return false
+    tid := c_get_expr_type(subj_idx)
+    return tid >= 0 and get_type_info(tid).kind == "optional"
 
 fn ir_emit_let_bindings(pat_idx: Int, subj_r: Int, subj_idx: Int):
     pat := get_node(pat_idx)
+    if ir_let_unwraps_variant(pat_idx, subj_idx):
+        # the payload is a borrow of the shell; the match binders give each
+        # rc binding its own count, as they do on a plain enum subject
+        payload_r := ir_optional_value_field(subj_r, c_get_expr_type(subj_idx))
+        ir_emit_match_bindings(pat_idx, payload_r, "")
+        return
     if pat.kind == "pat_binding":
         subj_tid := c_get_expr_type(subj_idx)
         val_r := ir_optional_value_field(subj_r, subj_tid)
@@ -12594,7 +12650,7 @@ fn ir_emit_if_let_stmt(node: Node):
     # once at the merge (mirroring the for-each next() path) instead of
     # leaking one shell per evaluation.
     owns_subject := ir_optional_subject_is_owned(node.children[1])
-    cond_r := ir_emit_let_cond(node.children[0], subj_r)
+    cond_r := ir_emit_let_cond(node.children[0], subj_r, node.children[1])
     then_l := ir_label()
     else_l := ir_label()
     end_l := ir_label()
@@ -12642,7 +12698,7 @@ fn ir_emit_while_let_stmt(node: Node):
     ir_getter_consumed_idx = node.children[1]
     subj_r := ir_expr(node.children[1])
     owns_subject := ir_optional_subject_is_owned(node.children[1])
-    cond_r := ir_emit_let_cond(node.children[0], subj_r)
+    cond_r := ir_emit_let_cond(node.children[0], subj_r, node.children[1])
     ir_emit("brif " + cond_r.to_string() + " " + body_label + " " + end_label)
     ir_emit_label(body_label)
     ir_last_was_ret = false

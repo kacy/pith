@@ -19,7 +19,9 @@ stale and a fix to it is welcome.
   `Float` subject is E228. use a guard instead: `n if n < 0 => ...`.
 - **`if let` and `while let` are statements**. neither works as an expression,
   and the let position takes a variant pattern or an optional binding only. a
-  literal (`if let 3 = f():`) is E245.
+  literal (`if let 3 = f():`) is E245. a variant pattern on an optional enum
+  matches the payload (`if let Shape.Circle(r) = maybe_shape:`), but `match`
+  does not unwrap that way: match the optional with a binding arm first.
 - **an unannotated `none` takes its type from the first assignment**.
   `mut x := none` followed by `x = 5` makes `x` an `Int?`, and a later
   `x = "s"` is rejected. annotate the binding when the first assignment is far

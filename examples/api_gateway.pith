@@ -203,11 +203,10 @@ fn gateway_config() -> String:
     ].join("\n")
 
 fn serve_gateway(toml_text: String) -> Int:
-    result := server.run(toml_text)
-    if result.is_err:
-        print("gateway: " + result.err)
+    code := server.run(toml_text) catch err:
+        print("gateway: " + err)
         return 1
-    return result.ok
+    return code
 
 client := http.client().with_max_redirects(0)
 
@@ -215,10 +214,9 @@ fn text_of(response: http.HttpResponse) -> String:
     return bytes.to_string_utf8(response.body) catch ""
 
 fn call(req: http.ClientRequest) -> String:
-    sent := client.send(req)
-    if sent.is_err:
-        return "failed: " + sent.err
-    return sent.ok.status.to_string() + " " + text_of(sent.ok)
+    sent := client.send(req) catch err:
+        return "failed: " + err
+    return sent.status.to_string() + " " + text_of(sent)
 
 fn request_to(method: String, path: String) -> http.ClientRequest:
     return http.request(method, "127.0.0.1", GATEWAY_PORT, path)

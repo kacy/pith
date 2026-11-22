@@ -1,0 +1,26 @@
+# an empty accumulator literal passed to reduce takes its type from the
+# callback's first parameter, in both the method and the free form.
+
+fn count_len(acc: Map[String, Int], s: String) -> Map[String, Int]:
+    mut m := acc
+    m[s] = s.len()
+    return m
+
+fn collect_len(acc: List[Int], s: String) -> List[Int]:
+    mut out := acc
+    out.push(s.len())
+    return out
+
+fn add_word(acc: Set[String], s: String) -> Set[String]:
+    mut out := acc
+    out.add(s)
+    return out
+
+fn main():
+    words := ["a", "bb", "a", "ccc"]
+    lens := words.reduce({}, count_len)
+    print("{lens.len()} {lens["ccc"]}")
+    all := reduce(words, [], collect_len)
+    print("{all}")
+    unique := words.reduce({}, add_word)
+    print("{unique.len()}")

@@ -5022,21 +5022,26 @@ fn ir_emit_some_over(value_r: Int, val_idx: Int, retain_borrowed: Bool) -> Int:
         return ir_emit_owned_some_taking(value_r, val_idx, "tuple", tuple_kind, retain_borrowed)
     return ir_emit_optional_some_value(value_r)
 
+# true when val_idx is an empty collection literal the checker gave a
+# collection type, so its own emission picks the tagged constructor.
+fn ir_empty_literal_is_typed(val_idx: Int, vn: Node) -> Bool:
+    if vn.children.len() != 0:
+        return false
+    if vn.kind != "list" and vn.kind != "map" and vn.kind != "set":
+        return false
+    checked := ir_checked_type(val_idx)
+    return checked.starts_with("list") or checked.starts_with("map") or checked.starts_with("set")
+
 fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inner: String) -> Int:
     vn := get_node(val_idx)
     if target_type == "tuple":
         return ir_emit_optional_for_target(val_idx, vn, target_inner)
-    if vn.kind == "list" and vn.children.len() == 0:
-        if ir_checked_type(val_idx).starts_with("list"):
-            return ir_expr(val_idx)
-    # an empty `{}` the checker typed as a map builds through the map literal
-    # path, which reads the value type off the checked type. the bare target
-    # here says only "map", and a struct field built from it as
-    # `S(table: {})` got a map that took no count on the strings stored in
-    # it, so a string copied in from another map was freed under it.
-    if vn.kind == "map" and vn.children.len() == 0:
-        if ir_checked_type(val_idx).starts_with("map"):
-            return ir_expr(val_idx)
+    # an empty literal the checker typed builds from that type, which knows
+    # the element and value types; the target name below is only the
+    # container kind. a `{}` field of a Map[String, String] built from the
+    # name alone was a map that owned none of the strings stored into it.
+    if ir_empty_literal_is_typed(val_idx, vn):
+        return ir_expr(val_idx)
     empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), ir_bytes_keyed_target(val_idx, target_type))
     if empty_init_call.len() > 0:
         r := ir_reg()
@@ -10228,6 +10233,16 @@ fn ir_ctor_field_inner_type_name(sname: String, tid: Int, field_name: String) ->
                     return ir_optional_inner_type_of_tid(info.field_types[i])
     return ""
 
+# the checked type id of a constructed field, or -1
+fn ir_ctor_field_tid(sname: String, tid: Int, field_name: String) -> Int:
+    if tid >= 0:
+        info := get_type_info(tid)
+        if info.kind == "struct":
+            for name, i in info.fields:
+                if name == field_name and i < info.field_types.len():
+                    return info.field_types[i]
+    return 0 - 1
+
 fn ir_ctor_field_type_name(sname: String, tid: Int, field_name: String) -> String:
     if tid >= 0:
         info := get_type_info(tid)
@@ -10236,6 +10251,34 @@ fn ir_ctor_field_type_name(sname: String, tid: Int, field_name: String) -> Strin
                 if name == field_name and i < info.field_types.len():
                     return ir_type_from_tid(info.field_types[i])
     return ir_struct_field_type_name(sname, field_name)
+
+# a field's `= {}` or `= []` default. the declaration is shared by every
+# instance of a generic struct, so the literal's own checked type can name a
+# type parameter (`m: Map[String, T] = {}`); the instance's field type is the
+# concrete one, and it picks the container, so a Bag[String] owns its strings.
+fn ir_emit_field_default(sname: String, tid: Int, field_name: String, default_idx: Int) -> Int:
+    field_tid := ir_ctor_field_tid(sname, tid, field_name)
+    vn := get_node(default_idx)
+    if field_tid >= 0 and vn.children.len() == 0 and (vn.kind == "list" or vn.kind == "map"):
+        info := get_type_info(field_tid)
+        if vn.kind == "list" and info.kind == "list" and info.inner >= 0:
+            r := ir_reg()
+            ir_emit_call0(r, ir_list_ctor_for_elem_kind(ir_rc_kind(ir_type_from_tid(info.inner))), "list")
+            return r
+        if vn.kind == "map" and info.kind == "map" and info.value_type >= 0:
+            mut target := ir_type_from_tid(field_tid)
+            if info.key_type >= 0:
+                key_info := get_type_info(info.key_type)
+                if key_info.kind == "primitive" and key_info.name == "Bytes":
+                    target = "map_bytes"
+            if ir_rc_kind(ir_type_from_tid(info.value_type)) == "string":
+                target = target + "_str_val"
+            ctor := ir_empty_collection_init_call_name("map", 0, target)
+            if ctor.len() > 0:
+                r := ir_reg()
+                ir_emit_call0(r, ctor, ir_normalize_collection_target(target))
+                return r
+    return ir_emit_holder_value(default_idx, ir_ctor_field_type_name(sname, tid, field_name), ir_ctor_field_inner_type_name(sname, tid, field_name))
 
 # emit a struct built with named fields (`Point(x: 3, y: 4)`). fields can be
 # given in any order and any defaulted field may be omitted, so we walk the
@@ -10278,7 +10321,7 @@ fn ir_emit_struct_named_init(sname: String, arg_nodes: List[Int], tid: Int) -> I
         else:
             default_idx := ir_struct_field_default_node(sname, field_name)
             if default_idx >= 0:
-                field_regs.push(ir_emit_holder_value(default_idx, field_type, ir_ctor_field_inner_type_name(sname, tid, field_name)))
+                field_regs.push(ir_emit_field_default(sname, tid, field_name, default_idx))
             else:
                 field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -10327,7 +10370,7 @@ fn ir_emit_struct_positional_init(sname: String, arg_nodes: List[Int], tid: Int)
         field_name := ir_ctor_field_name_at(sname, tid, field_idx)
         default_idx := ir_struct_field_default_node(sname, field_name)
         if default_idx >= 0:
-            field_regs.push(ir_emit_holder_value(default_idx, ir_ctor_field_type_name(sname, tid, field_name), ir_ctor_field_inner_type_name(sname, tid, field_name)))
+            field_regs.push(ir_emit_field_default(sname, tid, field_name, default_idx))
         else:
             field_regs.push(ir_zero_reg())
         field_idx = field_idx + 1
@@ -11195,6 +11238,7 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
         ir_release_owned_index_key(target.children[1], idx_r)
         ir_unpin_inflight(obj_r, obj_pin)
         ir_unpin_inflight(idx_r, idx_pin)
+        ir_release_owned_store_receiver(target.children[0], obj_r)
         return true
     if not idx_borrowed and ir_container_store_takes_count(idx_store_kind):
         # `m[k] = "v-{i}"` builds a value nobody else tracks. the store takes
@@ -11223,7 +11267,17 @@ fn ir_emit_index_store(target_idx: Int, value_idx: Int, compound_op: String) -> 
     ir_release_owned_index_key(target.children[1], idx_r)
     ir_unpin_inflight(obj_r, obj_pin)
     ir_unpin_inflight(idx_r, idx_pin)
+    ir_release_owned_store_receiver(target.children[0], obj_r)
     return true
+
+# a container an index store wrote through that nothing else holds a count
+# for, such as `h.items()[0] = v` or `o.value()[k] = v`, is released once the
+# store is done. the method-call stores drop such a receiver at the statement;
+# the index store kept it, and leaked the container with everything in it.
+fn ir_release_owned_store_receiver(recv_idx: Int, obj_r: Int):
+    recv_kind := ir_rc_kind(ir_infer_type(recv_idx))
+    if recv_kind.len() > 0 and not ir_expr_is_borrowed(recv_idx):
+        ir_rc_release_reg(obj_r, recv_kind)
 
 # --- expression lowering ---
 #

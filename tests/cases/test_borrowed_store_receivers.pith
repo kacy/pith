@@ -1,0 +1,2454 @@
+# a borrowed string stored into a container keeps its own count, whatever
+# spelling reaches the container and whatever spelling the value is read
+# through. every value is read back after the place it came from is
+# overwritten, which frees the old string unless the store took a count.
+# an empty `{}` in a struct field, a list element or a map value used to
+# build a map that owned none of its strings.
+
+struct Src:
+    name: String
+
+struct Holder:
+    m: Map[String, String]
+    l: List[String]
+    s: Set[String]
+
+struct Defaults:
+    m: Map[String, String] = {}
+    l: List[String] = []
+    s: Set[String] = {}
+
+struct Outer:
+    inner: Holder
+
+struct Maybe:
+    m: Map[String, String]?
+    l: List[String]?
+    s: Set[String]?
+
+struct Nest:
+    ms: List[Map[String, String]]
+    ls: List[List[String]]
+    ss: List[Set[String]]
+
+struct NestMap:
+    ms: Map[String, Map[String, String]]
+    ls: Map[String, List[String]]
+    ss: Map[String, Set[String]]
+
+impl Holder:
+    fn get_m() -> Map[String, String]:
+        return self.m
+
+    fn get_l() -> List[String]:
+        return self.l
+
+    fn get_s() -> Set[String]:
+        return self.s
+
+fn make_m() -> Map[String, String]:
+    return {}
+
+fn make_opt_m() -> Map[String, String]?:
+    return {}
+
+fn make_l() -> List[String]:
+    return []
+
+fn make_opt_l() -> List[String]?:
+    return []
+
+fn make_s() -> Set[String]:
+    return {}
+
+fn make_opt_s() -> Set[String]?:
+    return {}
+
+mut g_name := ""
+
+fn heap(tag: String) -> String:
+    return "{tag} value {tag.len()} on the heap"
+
+fn local_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    mut r: Map[String, String] := {}
+    r.insert("k0", src.name)
+    r.insert("k1", table["k"])
+    r.insert("k2", xs[0])
+    r.insert("k3", g_name)
+    r.insert("k4", p)
+    for v in ys:
+        r.insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("local_map_insert")
+    print(r["k0"])
+    print(r["k1"])
+    print(r["k2"])
+    print(r["k3"])
+    print(r["k4"])
+    print(r["k5"])
+
+fn local_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    mut r: Map[String, String] := {}
+    r["k0"] = src.name
+    r["k1"] = table["k"]
+    r["k2"] = xs[0]
+    r["k3"] = g_name
+    r["k4"] = p
+    for v in ys:
+        r["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("local_map_index_store")
+    print(r["k0"])
+    print(r["k1"])
+    print(r["k2"])
+    print(r["k3"])
+    print(r["k4"])
+    print(r["k5"])
+
+fn local_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    mut r: List[String] := []
+    r.push(src.name)
+    r.push(table["k"])
+    r.push(xs[0])
+    r.push(g_name)
+    r.push(p)
+    for v in ys:
+        r.push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("local_list_push")
+    for got in r:
+        print(got)
+
+fn local_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    mut r: List[String] := []
+    r.insert(0, src.name)
+    r.insert(0, table["k"])
+    r.insert(0, xs[0])
+    r.insert(0, g_name)
+    r.insert(0, p)
+    for v in ys:
+        r.insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("local_list_insert")
+    for got in r:
+        print(got)
+
+fn local_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    mut r: List[String] := []
+    for _ in 0..6:
+        r.push("seed")
+    r[0] = src.name
+    r[1] = table["k"]
+    r[2] = xs[0]
+    r[3] = g_name
+    r[4] = p
+    for v in ys:
+        r[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("local_list_index_store")
+    for got in r:
+        print(got)
+
+fn local_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    mut r: Set[String] := {}
+    r.add(src.name)
+    r.add(table["k"])
+    r.add(xs[0])
+    r.add(g_name)
+    r.add(p)
+    for v in ys:
+        r.add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("local_set_add")
+    print(r.contains(heap("field")).to_string())
+    print(r.contains(heap("map_index")).to_string())
+    print(r.contains(heap("list_index")).to_string())
+    print(r.contains(heap("global")).to_string())
+    print(r.contains(heap("param")).to_string())
+    print(r.contains(heap("for_var")).to_string())
+
+fn named_field_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.m.insert("k0", src.name)
+    h.m.insert("k1", table["k"])
+    h.m.insert("k2", xs[0])
+    h.m.insert("k3", g_name)
+    h.m.insert("k4", p)
+    for v in ys:
+        h.m.insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("named_field_map_insert")
+    print(h.m["k0"])
+    print(h.m["k1"])
+    print(h.m["k2"])
+    print(h.m["k3"])
+    print(h.m["k4"])
+    print(h.m["k5"])
+
+fn named_field_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.m["k0"] = src.name
+    h.m["k1"] = table["k"]
+    h.m["k2"] = xs[0]
+    h.m["k3"] = g_name
+    h.m["k4"] = p
+    for v in ys:
+        h.m["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("named_field_map_index_store")
+    print(h.m["k0"])
+    print(h.m["k1"])
+    print(h.m["k2"])
+    print(h.m["k3"])
+    print(h.m["k4"])
+    print(h.m["k5"])
+
+fn named_field_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.l.push(src.name)
+    h.l.push(table["k"])
+    h.l.push(xs[0])
+    h.l.push(g_name)
+    h.l.push(p)
+    for v in ys:
+        h.l.push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("named_field_list_push")
+    for got in h.l:
+        print(got)
+
+fn named_field_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.l.insert(0, src.name)
+    h.l.insert(0, table["k"])
+    h.l.insert(0, xs[0])
+    h.l.insert(0, g_name)
+    h.l.insert(0, p)
+    for v in ys:
+        h.l.insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("named_field_list_insert")
+    for got in h.l:
+        print(got)
+
+fn named_field_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    for _ in 0..6:
+        h.l.push("seed")
+    h.l[0] = src.name
+    h.l[1] = table["k"]
+    h.l[2] = xs[0]
+    h.l[3] = g_name
+    h.l[4] = p
+    for v in ys:
+        h.l[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("named_field_list_index_store")
+    for got in h.l:
+        print(got)
+
+fn named_field_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.s.add(src.name)
+    h.s.add(table["k"])
+    h.s.add(xs[0])
+    h.s.add(g_name)
+    h.s.add(p)
+    for v in ys:
+        h.s.add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("named_field_set_add")
+    print(h.s.contains(heap("field")).to_string())
+    print(h.s.contains(heap("map_index")).to_string())
+    print(h.s.contains(heap("list_index")).to_string())
+    print(h.s.contains(heap("global")).to_string())
+    print(h.s.contains(heap("param")).to_string())
+    print(h.s.contains(heap("for_var")).to_string())
+
+fn positional_field_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder({}, [], {})
+    h.m.insert("k0", src.name)
+    h.m.insert("k1", table["k"])
+    h.m.insert("k2", xs[0])
+    h.m.insert("k3", g_name)
+    h.m.insert("k4", p)
+    for v in ys:
+        h.m.insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("positional_field_map_insert")
+    print(h.m["k0"])
+    print(h.m["k1"])
+    print(h.m["k2"])
+    print(h.m["k3"])
+    print(h.m["k4"])
+    print(h.m["k5"])
+
+fn positional_field_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder({}, [], {})
+    h.m["k0"] = src.name
+    h.m["k1"] = table["k"]
+    h.m["k2"] = xs[0]
+    h.m["k3"] = g_name
+    h.m["k4"] = p
+    for v in ys:
+        h.m["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("positional_field_map_index_store")
+    print(h.m["k0"])
+    print(h.m["k1"])
+    print(h.m["k2"])
+    print(h.m["k3"])
+    print(h.m["k4"])
+    print(h.m["k5"])
+
+fn positional_field_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder({}, [], {})
+    h.l.push(src.name)
+    h.l.push(table["k"])
+    h.l.push(xs[0])
+    h.l.push(g_name)
+    h.l.push(p)
+    for v in ys:
+        h.l.push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("positional_field_list_push")
+    for got in h.l:
+        print(got)
+
+fn positional_field_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder({}, [], {})
+    h.l.insert(0, src.name)
+    h.l.insert(0, table["k"])
+    h.l.insert(0, xs[0])
+    h.l.insert(0, g_name)
+    h.l.insert(0, p)
+    for v in ys:
+        h.l.insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("positional_field_list_insert")
+    for got in h.l:
+        print(got)
+
+fn positional_field_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder({}, [], {})
+    for _ in 0..6:
+        h.l.push("seed")
+    h.l[0] = src.name
+    h.l[1] = table["k"]
+    h.l[2] = xs[0]
+    h.l[3] = g_name
+    h.l[4] = p
+    for v in ys:
+        h.l[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("positional_field_list_index_store")
+    for got in h.l:
+        print(got)
+
+fn positional_field_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder({}, [], {})
+    h.s.add(src.name)
+    h.s.add(table["k"])
+    h.s.add(xs[0])
+    h.s.add(g_name)
+    h.s.add(p)
+    for v in ys:
+        h.s.add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("positional_field_set_add")
+    print(h.s.contains(heap("field")).to_string())
+    print(h.s.contains(heap("map_index")).to_string())
+    print(h.s.contains(heap("list_index")).to_string())
+    print(h.s.contains(heap("global")).to_string())
+    print(h.s.contains(heap("param")).to_string())
+    print(h.s.contains(heap("for_var")).to_string())
+
+fn default_field_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    d := Defaults()
+    d.m.insert("k0", src.name)
+    d.m.insert("k1", table["k"])
+    d.m.insert("k2", xs[0])
+    d.m.insert("k3", g_name)
+    d.m.insert("k4", p)
+    for v in ys:
+        d.m.insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("default_field_map_insert")
+    print(d.m["k0"])
+    print(d.m["k1"])
+    print(d.m["k2"])
+    print(d.m["k3"])
+    print(d.m["k4"])
+    print(d.m["k5"])
+
+fn default_field_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    d := Defaults()
+    d.m["k0"] = src.name
+    d.m["k1"] = table["k"]
+    d.m["k2"] = xs[0]
+    d.m["k3"] = g_name
+    d.m["k4"] = p
+    for v in ys:
+        d.m["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("default_field_map_index_store")
+    print(d.m["k0"])
+    print(d.m["k1"])
+    print(d.m["k2"])
+    print(d.m["k3"])
+    print(d.m["k4"])
+    print(d.m["k5"])
+
+fn default_field_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    d := Defaults()
+    d.l.push(src.name)
+    d.l.push(table["k"])
+    d.l.push(xs[0])
+    d.l.push(g_name)
+    d.l.push(p)
+    for v in ys:
+        d.l.push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("default_field_list_push")
+    for got in d.l:
+        print(got)
+
+fn default_field_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    d := Defaults()
+    d.l.insert(0, src.name)
+    d.l.insert(0, table["k"])
+    d.l.insert(0, xs[0])
+    d.l.insert(0, g_name)
+    d.l.insert(0, p)
+    for v in ys:
+        d.l.insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("default_field_list_insert")
+    for got in d.l:
+        print(got)
+
+fn default_field_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    d := Defaults()
+    for _ in 0..6:
+        d.l.push("seed")
+    d.l[0] = src.name
+    d.l[1] = table["k"]
+    d.l[2] = xs[0]
+    d.l[3] = g_name
+    d.l[4] = p
+    for v in ys:
+        d.l[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("default_field_list_index_store")
+    for got in d.l:
+        print(got)
+
+fn default_field_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    d := Defaults()
+    d.s.add(src.name)
+    d.s.add(table["k"])
+    d.s.add(xs[0])
+    d.s.add(g_name)
+    d.s.add(p)
+    for v in ys:
+        d.s.add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("default_field_set_add")
+    print(d.s.contains(heap("field")).to_string())
+    print(d.s.contains(heap("map_index")).to_string())
+    print(d.s.contains(heap("list_index")).to_string())
+    print(d.s.contains(heap("global")).to_string())
+    print(d.s.contains(heap("param")).to_string())
+    print(d.s.contains(heap("for_var")).to_string())
+
+fn nested_field_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    o := Outer(inner: Holder(m: {}, l: [], s: {}))
+    o.inner.m.insert("k0", src.name)
+    o.inner.m.insert("k1", table["k"])
+    o.inner.m.insert("k2", xs[0])
+    o.inner.m.insert("k3", g_name)
+    o.inner.m.insert("k4", p)
+    for v in ys:
+        o.inner.m.insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("nested_field_map_insert")
+    print(o.inner.m["k0"])
+    print(o.inner.m["k1"])
+    print(o.inner.m["k2"])
+    print(o.inner.m["k3"])
+    print(o.inner.m["k4"])
+    print(o.inner.m["k5"])
+
+fn nested_field_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    o := Outer(inner: Holder(m: {}, l: [], s: {}))
+    o.inner.m["k0"] = src.name
+    o.inner.m["k1"] = table["k"]
+    o.inner.m["k2"] = xs[0]
+    o.inner.m["k3"] = g_name
+    o.inner.m["k4"] = p
+    for v in ys:
+        o.inner.m["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("nested_field_map_index_store")
+    print(o.inner.m["k0"])
+    print(o.inner.m["k1"])
+    print(o.inner.m["k2"])
+    print(o.inner.m["k3"])
+    print(o.inner.m["k4"])
+    print(o.inner.m["k5"])
+
+fn nested_field_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    o := Outer(inner: Holder(m: {}, l: [], s: {}))
+    o.inner.l.push(src.name)
+    o.inner.l.push(table["k"])
+    o.inner.l.push(xs[0])
+    o.inner.l.push(g_name)
+    o.inner.l.push(p)
+    for v in ys:
+        o.inner.l.push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("nested_field_list_push")
+    for got in o.inner.l:
+        print(got)
+
+fn nested_field_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    o := Outer(inner: Holder(m: {}, l: [], s: {}))
+    o.inner.l.insert(0, src.name)
+    o.inner.l.insert(0, table["k"])
+    o.inner.l.insert(0, xs[0])
+    o.inner.l.insert(0, g_name)
+    o.inner.l.insert(0, p)
+    for v in ys:
+        o.inner.l.insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("nested_field_list_insert")
+    for got in o.inner.l:
+        print(got)
+
+fn nested_field_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    o := Outer(inner: Holder(m: {}, l: [], s: {}))
+    for _ in 0..6:
+        o.inner.l.push("seed")
+    o.inner.l[0] = src.name
+    o.inner.l[1] = table["k"]
+    o.inner.l[2] = xs[0]
+    o.inner.l[3] = g_name
+    o.inner.l[4] = p
+    for v in ys:
+        o.inner.l[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("nested_field_list_index_store")
+    for got in o.inner.l:
+        print(got)
+
+fn nested_field_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    o := Outer(inner: Holder(m: {}, l: [], s: {}))
+    o.inner.s.add(src.name)
+    o.inner.s.add(table["k"])
+    o.inner.s.add(xs[0])
+    o.inner.s.add(g_name)
+    o.inner.s.add(p)
+    for v in ys:
+        o.inner.s.add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("nested_field_set_add")
+    print(o.inner.s.contains(heap("field")).to_string())
+    print(o.inner.s.contains(heap("map_index")).to_string())
+    print(o.inner.s.contains(heap("list_index")).to_string())
+    print(o.inner.s.contains(heap("global")).to_string())
+    print(o.inner.s.contains(heap("param")).to_string())
+    print(o.inner.s.contains(heap("for_var")).to_string())
+
+fn list_index_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rs: List[Map[String, String]] := [{}]
+    rs[0].insert("k0", src.name)
+    rs[0].insert("k1", table["k"])
+    rs[0].insert("k2", xs[0])
+    rs[0].insert("k3", g_name)
+    rs[0].insert("k4", p)
+    for v in ys:
+        rs[0].insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_index_map_insert")
+    print(rs[0]["k0"])
+    print(rs[0]["k1"])
+    print(rs[0]["k2"])
+    print(rs[0]["k3"])
+    print(rs[0]["k4"])
+    print(rs[0]["k5"])
+
+fn list_index_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rs: List[Map[String, String]] := [{}]
+    rs[0]["k0"] = src.name
+    rs[0]["k1"] = table["k"]
+    rs[0]["k2"] = xs[0]
+    rs[0]["k3"] = g_name
+    rs[0]["k4"] = p
+    for v in ys:
+        rs[0]["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_index_map_index_store")
+    print(rs[0]["k0"])
+    print(rs[0]["k1"])
+    print(rs[0]["k2"])
+    print(rs[0]["k3"])
+    print(rs[0]["k4"])
+    print(rs[0]["k5"])
+
+fn list_index_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rs: List[List[String]] := [[]]
+    rs[0].push(src.name)
+    rs[0].push(table["k"])
+    rs[0].push(xs[0])
+    rs[0].push(g_name)
+    rs[0].push(p)
+    for v in ys:
+        rs[0].push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_index_list_push")
+    for got in rs[0]:
+        print(got)
+
+fn list_index_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rs: List[List[String]] := [[]]
+    rs[0].insert(0, src.name)
+    rs[0].insert(0, table["k"])
+    rs[0].insert(0, xs[0])
+    rs[0].insert(0, g_name)
+    rs[0].insert(0, p)
+    for v in ys:
+        rs[0].insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_index_list_insert")
+    for got in rs[0]:
+        print(got)
+
+fn list_index_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rs: List[List[String]] := [[]]
+    for _ in 0..6:
+        rs[0].push("seed")
+    rs[0][0] = src.name
+    rs[0][1] = table["k"]
+    rs[0][2] = xs[0]
+    rs[0][3] = g_name
+    rs[0][4] = p
+    for v in ys:
+        rs[0][5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_index_list_index_store")
+    for got in rs[0]:
+        print(got)
+
+fn list_index_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rs: List[Set[String]] := [{}]
+    rs[0].add(src.name)
+    rs[0].add(table["k"])
+    rs[0].add(xs[0])
+    rs[0].add(g_name)
+    rs[0].add(p)
+    for v in ys:
+        rs[0].add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_index_set_add")
+    print(rs[0].contains(heap("field")).to_string())
+    print(rs[0].contains(heap("map_index")).to_string())
+    print(rs[0].contains(heap("list_index")).to_string())
+    print(rs[0].contains(heap("global")).to_string())
+    print(rs[0].contains(heap("param")).to_string())
+    print(rs[0].contains(heap("for_var")).to_string())
+
+fn map_index_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rm: Map[String, Map[String, String]] := {"a": {}}
+    rm["a"].insert("k0", src.name)
+    rm["a"].insert("k1", table["k"])
+    rm["a"].insert("k2", xs[0])
+    rm["a"].insert("k3", g_name)
+    rm["a"].insert("k4", p)
+    for v in ys:
+        rm["a"].insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_index_map_insert")
+    print(rm["a"]["k0"])
+    print(rm["a"]["k1"])
+    print(rm["a"]["k2"])
+    print(rm["a"]["k3"])
+    print(rm["a"]["k4"])
+    print(rm["a"]["k5"])
+
+fn map_index_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rm: Map[String, Map[String, String]] := {"a": {}}
+    rm["a"]["k0"] = src.name
+    rm["a"]["k1"] = table["k"]
+    rm["a"]["k2"] = xs[0]
+    rm["a"]["k3"] = g_name
+    rm["a"]["k4"] = p
+    for v in ys:
+        rm["a"]["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_index_map_index_store")
+    print(rm["a"]["k0"])
+    print(rm["a"]["k1"])
+    print(rm["a"]["k2"])
+    print(rm["a"]["k3"])
+    print(rm["a"]["k4"])
+    print(rm["a"]["k5"])
+
+fn map_index_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rm: Map[String, List[String]] := {"a": []}
+    rm["a"].push(src.name)
+    rm["a"].push(table["k"])
+    rm["a"].push(xs[0])
+    rm["a"].push(g_name)
+    rm["a"].push(p)
+    for v in ys:
+        rm["a"].push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_index_list_push")
+    for got in rm["a"]:
+        print(got)
+
+fn map_index_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rm: Map[String, List[String]] := {"a": []}
+    rm["a"].insert(0, src.name)
+    rm["a"].insert(0, table["k"])
+    rm["a"].insert(0, xs[0])
+    rm["a"].insert(0, g_name)
+    rm["a"].insert(0, p)
+    for v in ys:
+        rm["a"].insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_index_list_insert")
+    for got in rm["a"]:
+        print(got)
+
+fn map_index_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rm: Map[String, List[String]] := {"a": []}
+    for _ in 0..6:
+        rm["a"].push("seed")
+    rm["a"][0] = src.name
+    rm["a"][1] = table["k"]
+    rm["a"][2] = xs[0]
+    rm["a"][3] = g_name
+    rm["a"][4] = p
+    for v in ys:
+        rm["a"][5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_index_list_index_store")
+    for got in rm["a"]:
+        print(got)
+
+fn map_index_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    rm: Map[String, Set[String]] := {"a": {}}
+    rm["a"].add(src.name)
+    rm["a"].add(table["k"])
+    rm["a"].add(xs[0])
+    rm["a"].add(g_name)
+    rm["a"].add(p)
+    for v in ys:
+        rm["a"].add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_index_set_add")
+    print(rm["a"].contains(heap("field")).to_string())
+    print(rm["a"].contains(heap("map_index")).to_string())
+    print(rm["a"].contains(heap("list_index")).to_string())
+    print(rm["a"].contains(heap("global")).to_string())
+    print(rm["a"].contains(heap("param")).to_string())
+    print(rm["a"].contains(heap("for_var")).to_string())
+
+fn optional_field_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    op := Maybe(m: {}, l: [], s: {})
+    op.m.value().insert("k0", src.name)
+    op.m.value().insert("k1", table["k"])
+    op.m.value().insert("k2", xs[0])
+    op.m.value().insert("k3", g_name)
+    op.m.value().insert("k4", p)
+    for v in ys:
+        op.m.value().insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_field_map_insert")
+    print(op.m.value()["k0"])
+    print(op.m.value()["k1"])
+    print(op.m.value()["k2"])
+    print(op.m.value()["k3"])
+    print(op.m.value()["k4"])
+    print(op.m.value()["k5"])
+
+fn optional_field_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    op := Maybe(m: {}, l: [], s: {})
+    op.m.value()["k0"] = src.name
+    op.m.value()["k1"] = table["k"]
+    op.m.value()["k2"] = xs[0]
+    op.m.value()["k3"] = g_name
+    op.m.value()["k4"] = p
+    for v in ys:
+        op.m.value()["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_field_map_index_store")
+    print(op.m.value()["k0"])
+    print(op.m.value()["k1"])
+    print(op.m.value()["k2"])
+    print(op.m.value()["k3"])
+    print(op.m.value()["k4"])
+    print(op.m.value()["k5"])
+
+fn optional_field_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    op := Maybe(m: {}, l: [], s: {})
+    op.l.value().push(src.name)
+    op.l.value().push(table["k"])
+    op.l.value().push(xs[0])
+    op.l.value().push(g_name)
+    op.l.value().push(p)
+    for v in ys:
+        op.l.value().push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_field_list_push")
+    for got in op.l.value():
+        print(got)
+
+fn optional_field_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    op := Maybe(m: {}, l: [], s: {})
+    op.l.value().insert(0, src.name)
+    op.l.value().insert(0, table["k"])
+    op.l.value().insert(0, xs[0])
+    op.l.value().insert(0, g_name)
+    op.l.value().insert(0, p)
+    for v in ys:
+        op.l.value().insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_field_list_insert")
+    for got in op.l.value():
+        print(got)
+
+fn optional_field_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    op := Maybe(m: {}, l: [], s: {})
+    for _ in 0..6:
+        op.l.value().push("seed")
+    op.l.value()[0] = src.name
+    op.l.value()[1] = table["k"]
+    op.l.value()[2] = xs[0]
+    op.l.value()[3] = g_name
+    op.l.value()[4] = p
+    for v in ys:
+        op.l.value()[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_field_list_index_store")
+    for got in op.l.value():
+        print(got)
+
+fn optional_field_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    op := Maybe(m: {}, l: [], s: {})
+    op.s.value().add(src.name)
+    op.s.value().add(table["k"])
+    op.s.value().add(xs[0])
+    op.s.value().add(g_name)
+    op.s.value().add(p)
+    for v in ys:
+        op.s.value().add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_field_set_add")
+    print(op.s.value().contains(heap("field")).to_string())
+    print(op.s.value().contains(heap("map_index")).to_string())
+    print(op.s.value().contains(heap("list_index")).to_string())
+    print(op.s.value().contains(heap("global")).to_string())
+    print(op.s.value().contains(heap("param")).to_string())
+    print(op.s.value().contains(heap("for_var")).to_string())
+
+fn method_result_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.get_m().insert("k0", src.name)
+    h.get_m().insert("k1", table["k"])
+    h.get_m().insert("k2", xs[0])
+    h.get_m().insert("k3", g_name)
+    h.get_m().insert("k4", p)
+    for v in ys:
+        h.get_m().insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("method_result_map_insert")
+    print(h.get_m()["k0"])
+    print(h.get_m()["k1"])
+    print(h.get_m()["k2"])
+    print(h.get_m()["k3"])
+    print(h.get_m()["k4"])
+    print(h.get_m()["k5"])
+
+fn method_result_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.get_m()["k0"] = src.name
+    h.get_m()["k1"] = table["k"]
+    h.get_m()["k2"] = xs[0]
+    h.get_m()["k3"] = g_name
+    h.get_m()["k4"] = p
+    for v in ys:
+        h.get_m()["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("method_result_map_index_store")
+    print(h.get_m()["k0"])
+    print(h.get_m()["k1"])
+    print(h.get_m()["k2"])
+    print(h.get_m()["k3"])
+    print(h.get_m()["k4"])
+    print(h.get_m()["k5"])
+
+fn method_result_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.get_l().push(src.name)
+    h.get_l().push(table["k"])
+    h.get_l().push(xs[0])
+    h.get_l().push(g_name)
+    h.get_l().push(p)
+    for v in ys:
+        h.get_l().push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("method_result_list_push")
+    for got in h.get_l():
+        print(got)
+
+fn method_result_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.get_l().insert(0, src.name)
+    h.get_l().insert(0, table["k"])
+    h.get_l().insert(0, xs[0])
+    h.get_l().insert(0, g_name)
+    h.get_l().insert(0, p)
+    for v in ys:
+        h.get_l().insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("method_result_list_insert")
+    for got in h.get_l():
+        print(got)
+
+fn method_result_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    for _ in 0..6:
+        h.get_l().push("seed")
+    h.get_l()[0] = src.name
+    h.get_l()[1] = table["k"]
+    h.get_l()[2] = xs[0]
+    h.get_l()[3] = g_name
+    h.get_l()[4] = p
+    for v in ys:
+        h.get_l()[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("method_result_list_index_store")
+    for got in h.get_l():
+        print(got)
+
+fn method_result_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    h := Holder(m: {}, l: [], s: {})
+    h.get_s().add(src.name)
+    h.get_s().add(table["k"])
+    h.get_s().add(xs[0])
+    h.get_s().add(g_name)
+    h.get_s().add(p)
+    for v in ys:
+        h.get_s().add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("method_result_set_add")
+    print(h.get_s().contains(heap("field")).to_string())
+    print(h.get_s().contains(heap("map_index")).to_string())
+    print(h.get_s().contains(heap("list_index")).to_string())
+    print(h.get_s().contains(heap("global")).to_string())
+    print(h.get_s().contains(heap("param")).to_string())
+    print(h.get_s().contains(heap("for_var")).to_string())
+
+fn fn_result_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    r := make_m()
+    r.insert("k0", src.name)
+    r.insert("k1", table["k"])
+    r.insert("k2", xs[0])
+    r.insert("k3", g_name)
+    r.insert("k4", p)
+    for v in ys:
+        r.insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("fn_result_map_insert")
+    print(r["k0"])
+    print(r["k1"])
+    print(r["k2"])
+    print(r["k3"])
+    print(r["k4"])
+    print(r["k5"])
+
+fn fn_result_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    r := make_m()
+    r["k0"] = src.name
+    r["k1"] = table["k"]
+    r["k2"] = xs[0]
+    r["k3"] = g_name
+    r["k4"] = p
+    for v in ys:
+        r["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("fn_result_map_index_store")
+    print(r["k0"])
+    print(r["k1"])
+    print(r["k2"])
+    print(r["k3"])
+    print(r["k4"])
+    print(r["k5"])
+
+fn fn_result_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    r := make_l()
+    r.push(src.name)
+    r.push(table["k"])
+    r.push(xs[0])
+    r.push(g_name)
+    r.push(p)
+    for v in ys:
+        r.push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("fn_result_list_push")
+    for got in r:
+        print(got)
+
+fn fn_result_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    r := make_l()
+    r.insert(0, src.name)
+    r.insert(0, table["k"])
+    r.insert(0, xs[0])
+    r.insert(0, g_name)
+    r.insert(0, p)
+    for v in ys:
+        r.insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("fn_result_list_insert")
+    for got in r:
+        print(got)
+
+fn fn_result_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    r := make_l()
+    for _ in 0..6:
+        r.push("seed")
+    r[0] = src.name
+    r[1] = table["k"]
+    r[2] = xs[0]
+    r[3] = g_name
+    r[4] = p
+    for v in ys:
+        r[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("fn_result_list_index_store")
+    for got in r:
+        print(got)
+
+fn fn_result_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    r := make_s()
+    r.add(src.name)
+    r.add(table["k"])
+    r.add(xs[0])
+    r.add(g_name)
+    r.add(p)
+    for v in ys:
+        r.add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("fn_result_set_add")
+    print(r.contains(heap("field")).to_string())
+    print(r.contains(heap("map_index")).to_string())
+    print(r.contains(heap("list_index")).to_string())
+    print(r.contains(heap("global")).to_string())
+    print(r.contains(heap("param")).to_string())
+    print(r.contains(heap("for_var")).to_string())
+
+fn optional_local_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    ol: Map[String, String]? := {}
+    ol.value().insert("k0", src.name)
+    ol.value().insert("k1", table["k"])
+    ol.value().insert("k2", xs[0])
+    ol.value().insert("k3", g_name)
+    ol.value().insert("k4", p)
+    for v in ys:
+        ol.value().insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_local_map_insert")
+    print(ol.value()["k0"])
+    print(ol.value()["k1"])
+    print(ol.value()["k2"])
+    print(ol.value()["k3"])
+    print(ol.value()["k4"])
+    print(ol.value()["k5"])
+
+fn optional_local_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    ol: Map[String, String]? := {}
+    ol.value()["k0"] = src.name
+    ol.value()["k1"] = table["k"]
+    ol.value()["k2"] = xs[0]
+    ol.value()["k3"] = g_name
+    ol.value()["k4"] = p
+    for v in ys:
+        ol.value()["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_local_map_index_store")
+    print(ol.value()["k0"])
+    print(ol.value()["k1"])
+    print(ol.value()["k2"])
+    print(ol.value()["k3"])
+    print(ol.value()["k4"])
+    print(ol.value()["k5"])
+
+fn optional_local_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    ol: List[String]? := []
+    ol.value().push(src.name)
+    ol.value().push(table["k"])
+    ol.value().push(xs[0])
+    ol.value().push(g_name)
+    ol.value().push(p)
+    for v in ys:
+        ol.value().push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_local_list_push")
+    for got in ol.value():
+        print(got)
+
+fn optional_local_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    ol: List[String]? := []
+    ol.value().insert(0, src.name)
+    ol.value().insert(0, table["k"])
+    ol.value().insert(0, xs[0])
+    ol.value().insert(0, g_name)
+    ol.value().insert(0, p)
+    for v in ys:
+        ol.value().insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_local_list_insert")
+    for got in ol.value():
+        print(got)
+
+fn optional_local_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    ol: List[String]? := []
+    for _ in 0..6:
+        ol.value().push("seed")
+    ol.value()[0] = src.name
+    ol.value()[1] = table["k"]
+    ol.value()[2] = xs[0]
+    ol.value()[3] = g_name
+    ol.value()[4] = p
+    for v in ys:
+        ol.value()[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_local_list_index_store")
+    for got in ol.value():
+        print(got)
+
+fn optional_local_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    ol: Set[String]? := {}
+    ol.value().add(src.name)
+    ol.value().add(table["k"])
+    ol.value().add(xs[0])
+    ol.value().add(g_name)
+    ol.value().add(p)
+    for v in ys:
+        ol.value().add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_local_set_add")
+    print(ol.value().contains(heap("field")).to_string())
+    print(ol.value().contains(heap("map_index")).to_string())
+    print(ol.value().contains(heap("list_index")).to_string())
+    print(ol.value().contains(heap("global")).to_string())
+    print(ol.value().contains(heap("param")).to_string())
+    print(ol.value().contains(heap("for_var")).to_string())
+
+fn optional_fn_result_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    orr := make_opt_m()
+    orr.value().insert("k0", src.name)
+    orr.value().insert("k1", table["k"])
+    orr.value().insert("k2", xs[0])
+    orr.value().insert("k3", g_name)
+    orr.value().insert("k4", p)
+    for v in ys:
+        orr.value().insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_fn_result_map_insert")
+    print(orr.value()["k0"])
+    print(orr.value()["k1"])
+    print(orr.value()["k2"])
+    print(orr.value()["k3"])
+    print(orr.value()["k4"])
+    print(orr.value()["k5"])
+
+fn optional_fn_result_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    orr := make_opt_m()
+    orr.value()["k0"] = src.name
+    orr.value()["k1"] = table["k"]
+    orr.value()["k2"] = xs[0]
+    orr.value()["k3"] = g_name
+    orr.value()["k4"] = p
+    for v in ys:
+        orr.value()["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_fn_result_map_index_store")
+    print(orr.value()["k0"])
+    print(orr.value()["k1"])
+    print(orr.value()["k2"])
+    print(orr.value()["k3"])
+    print(orr.value()["k4"])
+    print(orr.value()["k5"])
+
+fn optional_fn_result_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    orr := make_opt_l()
+    orr.value().push(src.name)
+    orr.value().push(table["k"])
+    orr.value().push(xs[0])
+    orr.value().push(g_name)
+    orr.value().push(p)
+    for v in ys:
+        orr.value().push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_fn_result_list_push")
+    for got in orr.value():
+        print(got)
+
+fn optional_fn_result_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    orr := make_opt_l()
+    orr.value().insert(0, src.name)
+    orr.value().insert(0, table["k"])
+    orr.value().insert(0, xs[0])
+    orr.value().insert(0, g_name)
+    orr.value().insert(0, p)
+    for v in ys:
+        orr.value().insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_fn_result_list_insert")
+    for got in orr.value():
+        print(got)
+
+fn optional_fn_result_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    orr := make_opt_l()
+    for _ in 0..6:
+        orr.value().push("seed")
+    orr.value()[0] = src.name
+    orr.value()[1] = table["k"]
+    orr.value()[2] = xs[0]
+    orr.value()[3] = g_name
+    orr.value()[4] = p
+    for v in ys:
+        orr.value()[5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_fn_result_list_index_store")
+    for got in orr.value():
+        print(got)
+
+fn optional_fn_result_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    orr := make_opt_s()
+    orr.value().add(src.name)
+    orr.value().add(table["k"])
+    orr.value().add(xs[0])
+    orr.value().add(g_name)
+    orr.value().add(p)
+    for v in ys:
+        orr.value().add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("optional_fn_result_set_add")
+    print(orr.value().contains(heap("field")).to_string())
+    print(orr.value().contains(heap("map_index")).to_string())
+    print(orr.value().contains(heap("list_index")).to_string())
+    print(orr.value().contains(heap("global")).to_string())
+    print(orr.value().contains(heap("param")).to_string())
+    print(orr.value().contains(heap("for_var")).to_string())
+
+fn list_in_field_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    n := Nest(ms: [{}], ls: [[]], ss: [{}])
+    n.ms[0].insert("k0", src.name)
+    n.ms[0].insert("k1", table["k"])
+    n.ms[0].insert("k2", xs[0])
+    n.ms[0].insert("k3", g_name)
+    n.ms[0].insert("k4", p)
+    for v in ys:
+        n.ms[0].insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_in_field_map_insert")
+    print(n.ms[0]["k0"])
+    print(n.ms[0]["k1"])
+    print(n.ms[0]["k2"])
+    print(n.ms[0]["k3"])
+    print(n.ms[0]["k4"])
+    print(n.ms[0]["k5"])
+
+fn list_in_field_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    n := Nest(ms: [{}], ls: [[]], ss: [{}])
+    n.ms[0]["k0"] = src.name
+    n.ms[0]["k1"] = table["k"]
+    n.ms[0]["k2"] = xs[0]
+    n.ms[0]["k3"] = g_name
+    n.ms[0]["k4"] = p
+    for v in ys:
+        n.ms[0]["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_in_field_map_index_store")
+    print(n.ms[0]["k0"])
+    print(n.ms[0]["k1"])
+    print(n.ms[0]["k2"])
+    print(n.ms[0]["k3"])
+    print(n.ms[0]["k4"])
+    print(n.ms[0]["k5"])
+
+fn list_in_field_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    n := Nest(ms: [{}], ls: [[]], ss: [{}])
+    n.ls[0].push(src.name)
+    n.ls[0].push(table["k"])
+    n.ls[0].push(xs[0])
+    n.ls[0].push(g_name)
+    n.ls[0].push(p)
+    for v in ys:
+        n.ls[0].push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_in_field_list_push")
+    for got in n.ls[0]:
+        print(got)
+
+fn list_in_field_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    n := Nest(ms: [{}], ls: [[]], ss: [{}])
+    n.ls[0].insert(0, src.name)
+    n.ls[0].insert(0, table["k"])
+    n.ls[0].insert(0, xs[0])
+    n.ls[0].insert(0, g_name)
+    n.ls[0].insert(0, p)
+    for v in ys:
+        n.ls[0].insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_in_field_list_insert")
+    for got in n.ls[0]:
+        print(got)
+
+fn list_in_field_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    n := Nest(ms: [{}], ls: [[]], ss: [{}])
+    for _ in 0..6:
+        n.ls[0].push("seed")
+    n.ls[0][0] = src.name
+    n.ls[0][1] = table["k"]
+    n.ls[0][2] = xs[0]
+    n.ls[0][3] = g_name
+    n.ls[0][4] = p
+    for v in ys:
+        n.ls[0][5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_in_field_list_index_store")
+    for got in n.ls[0]:
+        print(got)
+
+fn list_in_field_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    n := Nest(ms: [{}], ls: [[]], ss: [{}])
+    n.ss[0].add(src.name)
+    n.ss[0].add(table["k"])
+    n.ss[0].add(xs[0])
+    n.ss[0].add(g_name)
+    n.ss[0].add(p)
+    for v in ys:
+        n.ss[0].add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("list_in_field_set_add")
+    print(n.ss[0].contains(heap("field")).to_string())
+    print(n.ss[0].contains(heap("map_index")).to_string())
+    print(n.ss[0].contains(heap("list_index")).to_string())
+    print(n.ss[0].contains(heap("global")).to_string())
+    print(n.ss[0].contains(heap("param")).to_string())
+    print(n.ss[0].contains(heap("for_var")).to_string())
+
+fn map_in_field_map_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    nm := NestMap(ms: {"a": {}}, ls: {"a": []}, ss: {"a": {}})
+    nm.ms["a"].insert("k0", src.name)
+    nm.ms["a"].insert("k1", table["k"])
+    nm.ms["a"].insert("k2", xs[0])
+    nm.ms["a"].insert("k3", g_name)
+    nm.ms["a"].insert("k4", p)
+    for v in ys:
+        nm.ms["a"].insert("k5", v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_in_field_map_insert")
+    print(nm.ms["a"]["k0"])
+    print(nm.ms["a"]["k1"])
+    print(nm.ms["a"]["k2"])
+    print(nm.ms["a"]["k3"])
+    print(nm.ms["a"]["k4"])
+    print(nm.ms["a"]["k5"])
+
+fn map_in_field_map_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    nm := NestMap(ms: {"a": {}}, ls: {"a": []}, ss: {"a": {}})
+    nm.ms["a"]["k0"] = src.name
+    nm.ms["a"]["k1"] = table["k"]
+    nm.ms["a"]["k2"] = xs[0]
+    nm.ms["a"]["k3"] = g_name
+    nm.ms["a"]["k4"] = p
+    for v in ys:
+        nm.ms["a"]["k5"] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_in_field_map_index_store")
+    print(nm.ms["a"]["k0"])
+    print(nm.ms["a"]["k1"])
+    print(nm.ms["a"]["k2"])
+    print(nm.ms["a"]["k3"])
+    print(nm.ms["a"]["k4"])
+    print(nm.ms["a"]["k5"])
+
+fn map_in_field_list_push(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    nm := NestMap(ms: {"a": {}}, ls: {"a": []}, ss: {"a": {}})
+    nm.ls["a"].push(src.name)
+    nm.ls["a"].push(table["k"])
+    nm.ls["a"].push(xs[0])
+    nm.ls["a"].push(g_name)
+    nm.ls["a"].push(p)
+    for v in ys:
+        nm.ls["a"].push(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_in_field_list_push")
+    for got in nm.ls["a"]:
+        print(got)
+
+fn map_in_field_list_insert(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    nm := NestMap(ms: {"a": {}}, ls: {"a": []}, ss: {"a": {}})
+    nm.ls["a"].insert(0, src.name)
+    nm.ls["a"].insert(0, table["k"])
+    nm.ls["a"].insert(0, xs[0])
+    nm.ls["a"].insert(0, g_name)
+    nm.ls["a"].insert(0, p)
+    for v in ys:
+        nm.ls["a"].insert(0, v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_in_field_list_insert")
+    for got in nm.ls["a"]:
+        print(got)
+
+fn map_in_field_list_index_store(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    nm := NestMap(ms: {"a": {}}, ls: {"a": []}, ss: {"a": {}})
+    for _ in 0..6:
+        nm.ls["a"].push("seed")
+    nm.ls["a"][0] = src.name
+    nm.ls["a"][1] = table["k"]
+    nm.ls["a"][2] = xs[0]
+    nm.ls["a"][3] = g_name
+    nm.ls["a"][4] = p
+    for v in ys:
+        nm.ls["a"][5] = v
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_in_field_list_index_store")
+    for got in nm.ls["a"]:
+        print(got)
+
+fn map_in_field_set_add(src: Src, other: Src, p: String):
+    mut table: Map[String, String] := {"k": heap("map_index")}
+    mut xs: List[String] := [heap("list_index")]
+    mut ys: List[String] := [heap("for_var")]
+    g_name = heap("global")
+    nm := NestMap(ms: {"a": {}}, ls: {"a": []}, ss: {"a": {}})
+    nm.ss["a"].add(src.name)
+    nm.ss["a"].add(table["k"])
+    nm.ss["a"].add(xs[0])
+    nm.ss["a"].add(g_name)
+    nm.ss["a"].add(p)
+    for v in ys:
+        nm.ss["a"].add(v)
+    src.name = heap("gone")
+    table["k"] = heap("gone")
+    xs[0] = heap("gone")
+    g_name = heap("gone")
+    other.name = heap("gone")
+    ys[0] = heap("gone")
+    print("map_in_field_set_add")
+    print(nm.ss["a"].contains(heap("field")).to_string())
+    print(nm.ss["a"].contains(heap("map_index")).to_string())
+    print(nm.ss["a"].contains(heap("list_index")).to_string())
+    print(nm.ss["a"].contains(heap("global")).to_string())
+    print(nm.ss["a"].contains(heap("param")).to_string())
+    print(nm.ss["a"].contains(heap("for_var")).to_string())
+
+fn main():
+    mut src := Src(name: "")
+    mut other := Src(name: "")
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    local_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    local_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    local_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    local_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    local_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    local_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    named_field_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    named_field_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    named_field_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    named_field_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    named_field_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    named_field_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    positional_field_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    positional_field_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    positional_field_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    positional_field_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    positional_field_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    positional_field_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    default_field_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    default_field_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    default_field_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    default_field_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    default_field_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    default_field_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    nested_field_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    nested_field_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    nested_field_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    nested_field_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    nested_field_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    nested_field_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_index_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_index_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_index_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_index_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_index_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_index_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_index_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_index_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_index_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_index_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_index_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_index_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_field_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_field_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_field_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_field_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_field_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_field_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    method_result_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    method_result_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    method_result_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    method_result_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    method_result_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    method_result_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    fn_result_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    fn_result_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    fn_result_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    fn_result_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    fn_result_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    fn_result_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_local_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_local_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_local_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_local_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_local_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_local_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_fn_result_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_fn_result_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_fn_result_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_fn_result_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_fn_result_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    optional_fn_result_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_in_field_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_in_field_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_in_field_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_in_field_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_in_field_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    list_in_field_set_add(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_in_field_map_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_in_field_map_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_in_field_list_push(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_in_field_list_insert(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_in_field_list_index_store(src, other, other.name)
+    src = Src(name: heap("field"))
+    other = Src(name: heap("param"))
+    map_in_field_set_add(src, other, other.name)

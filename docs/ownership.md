@@ -748,10 +748,11 @@ it checks are E268:
   the struct. the destructor is generated per declaration and spells the
   method symbol from the declaring module, which is also what keeps two
   modules' same-named structs from trading cleanup.
-- a generic struct cannot. its destructor is generated per instance from
-  the resolved field kinds, and there is no place in that body for a
-  method call yet. wrap the generic in a concrete struct if you need
-  both.
+- a generic struct can. each instance gets its own destructor, which
+  calls the `drop` checked against that instance's type arguments, so
+  `Guard[String]` and `Guard[List[Int]]` each run the body as written for
+  their own `T`. an enum cannot, generic or not: its destructor releases
+  tagged payloads rather than fields.
 - the impl declares exactly `fn drop()`, with no parameters and no
   return value, and nothing else beside it. the runtime calls it with the
   bare pointer and reads nothing back.
@@ -799,6 +800,8 @@ and that is the shape every `Drop` type in std has.
 `tests/cases/test_drop_hook` pins where the hook fires (scope exit, a
 rebind, a list or a struct field dying, a value returned to a caller),
 `tests/cases/test_drop_lend` what a `drop` body may still do with `self`,
+`tests/cases/test_drop_generic` the same points for a generic struct over
+several type arguments and across modules,
 `tests/invalid/drop_escape_*` the escapes E318 refuses, and
 `tests/leaks/leak_tls_config_drop` pins that a tls config built and never
 closed no longer holds its registry slot.

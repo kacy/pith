@@ -1,0 +1,115 @@
+# a generic struct that implements Drop runs the drop specialized for each of
+# its instances: every instance gets its own destructor, and that destructor
+# calls the method body checked against the instance's type arguments. the
+# hook fires at the same points as for a plain struct: scope exit, a rebind,
+# removal from a list or a map, a list or map being cleared, and inside the
+# body of another generic function or struct. an instance built in another
+# module (drop_generic_helper) over this module's types does the same, and so
+# does one built through the module alias (`helper.Slot(...)`), which used to
+# skip the instance destructor and release the field values it had stored.
+import drop_generic_helper as helper
+
+struct Point:
+    pub x: Int
+    pub y: Int
+
+struct Guard[T]:
+    pub id: Int
+    pub v: T
+
+impl Guard:
+    fn show() -> String:
+        return "guard {self.id}"
+
+impl Drop for Guard:
+    fn drop():
+        print("drop {self.id}: {self.describe()}")
+
+# a method the drop calls, specialized per instance like drop itself
+impl Guard:
+    fn describe() -> String:
+        return "{self.v}"
+
+# a generic Drop struct whose drop reads the type argument's own method
+struct Sized[T]:
+    pub v: T
+
+impl Drop for Sized:
+    fn drop():
+        print("sized drop {self.v.len()}")
+
+# a generic struct whose drop never reads the parameter, used over a struct
+struct Tagged[T]:
+    pub tag: String
+    pub v: T
+
+impl Drop for Tagged:
+    fn drop():
+        print("tagged {self.tag} dropped")
+
+struct Outer[T]:
+    pub inner: Guard[T]
+
+fn wrap[T](id: Int, v: T) -> Guard[T]:
+    return Guard(id, v)
+
+fn nest[T](id: Int, v: T) -> Int:
+    o := Outer(Guard(id, v))
+    print("nested {o.inner.id}")
+    return o.inner.id
+
+fn scope_exit():
+    a := Guard(1, 10)
+    b := Guard(2, "two")
+    c := Tagged("point", Point(3, 4))
+    print("{a.show()} {b.show()} {c.tag} {c.v.x}")
+
+fn rebind():
+    mut g := Guard(4, "first")
+    g = Guard(5, "second")
+    print("holding {g.id}")
+
+fn in_list():
+    mut xs: List[Guard[String]] := [Guard(6, "six"), Guard(7, "seven")]
+    xs.remove(0)
+    print("after remove {xs.len()}")
+    xs.clear()
+    print("after clear")
+
+fn in_map():
+    mut m: Map[String, Guard[Int]] := {}
+    m.insert("a", Guard(8, 80))
+    m.insert("b", Guard(9, 90))
+    m.remove("a")
+    print("after map remove {m.len()}")
+    m.clear()
+    print("after map clear")
+
+fn list_payload():
+    s := Sized([1, 2, 3])
+    print("sized {s.v.len()}")
+
+fn imported():
+    p := helper.make_slot("point", Point(1, 2))
+    print("slot {p.label} {p.value.y}")
+    mut q := helper.make_slot("int", 7)
+    q = helper.make_slot("text", 8)
+    print("slot {q.label} {q.value}")
+    # built through the module alias, with fresh strings the instance owns
+    d := helper.Slot("direct " + 1.to_string(), "value " + 2.to_string())
+    print("slot {d.label} {d.value}")
+
+fn main():
+    scope_exit()
+    rebind()
+    in_list()
+    in_map()
+    list_payload()
+    w := wrap(10, "wrapped")
+    print("wrapped {w.id}")
+    print("nest {nest(11, "deep")}")
+    print("nest {nest(12, 12)}")
+    print("nest {nest(13, [1, 2])}")
+    imported()
+    print("slot drops {helper.slot_drops}")
+    print("end")

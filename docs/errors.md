@@ -911,16 +911,17 @@ generic body was before the check existed.
 destructor it attaches to every `T` it builds, when the last value naming the
 struct goes away (see docs/ownership.md, "destructors"). the impl has to be a
 shape that destructor can call: `T` must be a struct, declared in the module
-the impl is written in, and not generic — the destructor is generated per
-declaration and spells the method symbol from the declaring module, and a
-generic struct's destructor is generated per instance with no place for the
-call. the impl must declare `fn drop()` with no parameters and no return
-value, since the runtime hands it the bare pointer and reads nothing back, and
-nothing else beside it.
+the impl is written in. the destructor spells the method symbol from the
+declaring module, and an enum, generic or not, releases tagged payloads rather
+than fields. a generic struct is allowed: each instance gets its own destructor,
+which calls the `drop` checked against that instance's type arguments. the impl
+must declare `fn drop()` with no parameters and no return value, since the
+runtime hands it the bare pointer and reads nothing back, and nothing else
+beside it.
 
 ```
-error[E268]: impl Drop for Guard: a generic struct cannot implement Drop
 error[E268]: impl Drop for Shape: only a struct can implement Drop
+error[E268]: impl Drop for Bag: Drop must be implemented in the module that declares the struct
 error[E268]: impl Drop for Slot: drop() takes no parameters
 error[E268]: impl Drop for Slot: the impl may only declare drop(), not 'close'
 error[E268]: impl Drop for Slot: the impl must declare fn drop()
@@ -1116,13 +1117,15 @@ slot behind it, so the slot is held until the process exits with no other
 diagnostic. pair the build with a `defer` close (see [defer.md](defer.md)), or
 close it explicitly.
 
-the constructor list is empty at the moment. it held the three `std.net.tls`
-config builders, and a tls config now implements `Drop` (docs/ownership.md,
-"destructors"): a config built and never closed gives its slot back when the
-last value naming it goes away, so the shape this rule reported is no longer a
-leak. the rule stays for the std types that still close by hand, which
-docs/destructors_roadmap.md lists; an entry is added when one of them is
-audited onto the list rather than the destructor.
+the rule does not fire for a value whose type implements `Drop`
+(docs/ownership.md, "destructors"): its destructor gives the resource back when
+the last value naming it goes away, so a value left to the end of its scope is
+not a leak. the `std.net.tls` config builders are on the constructor list and
+stay quiet for that reason. the parser scopes (`json.open_scope()`,
+`toml.open_scope()`, `yaml.open_scope()`) have no destructor: a scope opened and
+never closed holds every node parsed after it, so the rule reports one, with
+`defer json.close_scope(scope)` as the fix. a std type that later implements
+`Drop` goes quiet without a change to the list.
 
 the rule is deliberately narrow, because a false positive on a resource that is
 closed elsewhere is worse than no rule. it reports only when every later mention
@@ -1139,14 +1142,13 @@ closing it — `bytes.ByteBuffer` is excluded for exactly that reason, since
 `take_bytes()` frees the buffer as it takes its contents. the survey behind the
 list is in [destructors_roadmap.md](destructors_roadmap.md).
 
-the message names the constructor, as it did for a tls config before the
-destructor:
+the message names the constructor and the closer to defer:
 
 ```
-warning[E307]: 'config' is built by tls.client_config() and never closed; the resource behind the handle is not reclaimed when the binding goes out of scope
-  7 |     config := tls.client_config()!
-                                       ^
-  fix: close it on every exit -- `defer config.close()` next to the build; see docs/destructors_roadmap.md
+warning[E307]: 'scope' is built by json.open_scope() and never closed; the resource behind the handle is not reclaimed when the binding goes out of scope
+  4 |     scope := json.open_scope()
+                                   ^
+  fix: close it on every exit -- `defer json.close_scope(scope)` next to the build; see docs/destructors_roadmap.md
 ```
 
 ### E308 — binding shadows a module global (warning)
@@ -1408,6 +1410,11 @@ it to a builtin or anything else whose body the checker cannot follow. the
 message names the chain of calls down to the use that lets it escape. the
 field values `drop` copies out are ordinary values and may go anywhere (see
 docs/ownership.md, "destructors").
+
+the `drop` of a generic struct is checked the same way. its body has concrete
+types only per instance, so the checker walks it against every instance the
+program builds and then applies this rule once, after the first instance. a
+generic struct that no code ever builds has no destructor and is not checked.
 
 ```
 error[E318]: `self` escapes drop: it is passed to 'remember', where it is passed to 'store', where at line 20 it is passed to 'push', whose body the checker cannot follow; the value is freed when drop returns

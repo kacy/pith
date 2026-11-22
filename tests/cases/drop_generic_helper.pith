@@ -1,0 +1,20 @@
+# a generic struct that implements Drop, imported by test_drop_generic. the
+# importing module builds instances over its own types, so the destructor it
+# attaches has to reach the drop this module specializes for them.
+
+## counts how many Slot values have been dropped.
+pub mut slot_drops := 0
+
+## Slot holds one value under a label.
+pub struct Slot[T]:
+    pub label: String
+    pub value: T
+
+impl Drop for Slot:
+    fn drop():
+        slot_drops = slot_drops + 1
+        print("slot {self.label} dropped")
+
+## a slot holding `value` under `label`.
+pub fn make_slot[T](label: String, value: T) -> Slot[T]:
+    return Slot(label, value)

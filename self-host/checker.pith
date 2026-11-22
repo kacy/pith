@@ -86,6 +86,12 @@ pub mut generic_call_subst: Map[Int, String] := {}
 mut generic_body_worklist: List[String] := []
 mut generic_body_queued: Map[String, Bool] := {}
 mut generic_body_checked: Map[String, Bool] := {}
+# the drop method of each generic struct that implements Drop, mapped to the
+# struct's declaration, and whether its escape walk has run. a generic body
+# is checked only per instance, so the calls it makes resolve only after an
+# instance has been walked (check_generic_drops).
+mut generic_drop_decls: Map[Int, Int] := {}
+mut generic_drop_walked: Map[Int, Bool] := {}
 # how many distinct type sets each declaration has been queued at. past
 # generic_body_spec_limit the declaration is reported once (E267) and queued
 # no further: `f[T]` calling `f[List[T]]` would otherwise never stop.
@@ -328,6 +334,8 @@ pub fn initialize_checker(file_path: String):
     generic_body_queued = {}
     generic_body_checked = {}
     generic_body_spec_counts = {}
+    generic_drop_decls = {}
+    generic_drop_walked = {}
     struct_instance_decl_idx = {}
     impl_method_modules = {}
     signature_alias_tables = {}
@@ -1490,6 +1498,11 @@ fn check_type_implements_interface(type_name: String, iface_name: String) -> Boo
     key := type_base + chr(9) + iface_base
     return implementation_set.contains_key(key)
 
+## whether the type `tid` names implements Drop, so its destructor gives back
+## what it holds when the last value naming it goes away.
+pub fn type_implements_drop(tid: Int) -> Bool:
+    return tid >= 0 and check_type_implements_interface(get_type_name(tid), "Drop")
+
 fn build_interface_type_name(base: String, args: List[String]) -> String:
     mut result := base + "["
     mut first := true
@@ -2213,22 +2226,25 @@ fn check_implementation_declaration(node: Node):
 # `impl Drop for T` is the destructor hook (docs/ownership.md): the emitter
 # calls T's `drop` from the destructor it attaches at construction, so the
 # impl has to be a shape that destructor can call. T must be a struct the
-# current module declares — the destructor is generated per declaration and
-# spells the method symbol from the declaring module, a generic struct has
-# one destructor per instance with no place for the call, and an enum
-# releases tagged payloads rather than fields — and the impl must provide
+# current module declares (the destructor spells the method symbol from the
+# declaring module, and an enum releases tagged payloads rather than fields).
+# a generic struct is allowed: each instance gets its own destructor, which
+# calls that instance's specialized drop. the impl must provide
 # exactly `fn drop()`: no parameters, no return, since the runtime hands the
 # body the bare pointer and reads nothing back. `Drop` is a language-level
 # interface, so no declaration of it is needed or looked for.
 fn check_drop_implementation(node: Node, concrete_name: String, method_start: Int):
     prefix := "impl Drop for " + concrete_name + ": "
+    mut is_struct := false
     if has_generic_declaration(concrete_name):
-        report_error("E268", prefix + "a generic struct cannot implement Drop")
-        return
-    tid := lookup_type_id(concrete_name)
-    if tid < 0:
-        return
-    if get_type_info(tid).kind != "struct":
+        decl_kind := get_node(get_generic_declaration_index(concrete_name)).kind
+        is_struct = decl_kind == "struct_decl" or decl_kind == "struct"
+    else:
+        tid := lookup_type_id(concrete_name)
+        if tid < 0:
+            return
+        is_struct = get_type_info(tid).kind == "struct"
+    if not is_struct:
         report_error("E268", prefix + "only a struct can implement Drop")
         return
     if module_declares_struct(concrete_name) == false:
@@ -2288,11 +2304,46 @@ fn check_drop_escapes(root: Node):
             continue
         if get_node(cn.children[1]).kind != "for_type" or iface_type_base_name(get_node(cn.children[0])) != "Drop":
             continue
+        target := get_type_node_name(get_node(get_node(cn.children[1]).children[0]))
         for m in cn.children:
             mn := get_node(m)
             body := drop_escape_body(mn)
-            if mn.value == "drop" and body >= 0:
+            if mn.value != "drop" or body < 0:
+                continue
+            if has_generic_declaration(target):
+                generic_drop_decls.insert(m, get_generic_declaration_index(target))
+            else:
                 drop_escape_walk(body, ["self"], false, true)
+
+# the drop of a generic struct runs for every instance the program builds, so
+# its body is walked against each of them, and once one walk has recorded
+# what its calls resolve to, the escape walk above runs over it in the
+# declaring module. called after each module's generic worklist drains, since
+# a later module can build the first instance.
+fn check_generic_drops():
+    if generic_drop_decls.len() == 0 or generic_body_check_mode == "off":
+        return
+    for m in generic_drop_decls.keys():
+        for tid in generic_drop_instances(m):
+            queue_method_specialization(m, tid)
+    drain_generic_body_worklist()
+    for m in generic_drop_decls.keys():
+        if generic_drop_walked.contains_key(m) or generic_drop_instances(m).len() == 0:
+            continue
+        generic_drop_walked.insert(m, true)
+        drop_escape_memo = {}
+        drop_escape_memo_reason = {}
+        prev := enter_module_context(declaration_module(m))
+        drop_escape_walk(drop_escape_body(get_node(m)), ["self"], false, true)
+        enter_module_context(prev)
+
+# the instances built so far of the struct whose drop is `m`
+fn generic_drop_instances(m: Int) -> List[Int]:
+    mut out: List[Int] := []
+    for tid in struct_instance_tids:
+        if struct_instance_decl_idx.contains_key(tid) and struct_instance_decl_idx[tid] == generic_drop_decls[m]:
+            out.push(tid)
+    return out
 
 # the body of a function declaration, or -1
 fn drop_escape_body(node: Node) -> Int:
@@ -5311,6 +5362,14 @@ fn unify_field_type_against_arg(field_node_idx: Int, arg_tid: Int, generic_param
                 if fnode.children.len() == 1:
                     unify_field_type_against_arg(fnode.children[0], arg_info.inner, generic_params, subst_map)
             return
+        # a field typed by another generic struct (`inner: Guard[T]`) given
+        # an instance of it: each written argument matches the instance's own
+        if struct_instance_base_name.contains_key(arg_tid) and struct_instance_type_args.contains_key(arg_tid):
+            if extract_base_type_name(struct_instance_base_name[arg_tid]) == fnode.value:
+                inst_args := decode_tid_list(struct_instance_type_args[arg_tid])
+                for c, ci in fnode.children:
+                    if ci < inst_args.len():
+                        unify_field_type_against_arg(c, inst_args[ci], generic_params, subst_map)
         return
     if fnode.kind == "optional_type":
         if arg_info.kind == "optional":
@@ -9210,6 +9269,7 @@ pub fn c_run(root_idx: Int, file_path: String) -> List[Diagnostic]:
     c_register_all(root_idx)
     c_check_all(root_idx)
     drain_generic_body_worklist()
+    check_generic_drops()
     return checker_get_diagnostics()
 
 # run checker passes on a single module without re-initializing.
@@ -9221,6 +9281,7 @@ pub fn c_run_module(root_idx: Int) -> List[Diagnostic]:
     c_register_all(root_idx)
     c_check_all(root_idx)
     drain_generic_body_worklist()
+    check_generic_drops()
     module_aliases = saved_aliases
     return checker_get_diagnostics()
 
@@ -9650,6 +9711,8 @@ pub struct CheckerSnapshot:
     pub generic_body_queued: Map[String, Bool]
     pub generic_body_checked: Map[String, Bool]
     pub generic_body_spec_counts: Map[Int, Int]
+    pub generic_drop_decls: Map[Int, Int]
+    pub generic_drop_walked: Map[Int, Bool]
     pub struct_instance_decl_idx: Map[Int, Int]
     pub impl_method_modules: Map[Int, String]
     pub checker_module_roots: Map[String, Int]
@@ -9724,6 +9787,8 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         generic_body_queued: copy_map(generic_body_queued),
         generic_body_checked: copy_map(generic_body_checked),
         generic_body_spec_counts: copy_map(generic_body_spec_counts),
+        generic_drop_decls: copy_map(generic_drop_decls),
+        generic_drop_walked: copy_map(generic_drop_walked),
         struct_instance_decl_idx: copy_map(struct_instance_decl_idx),
         impl_method_modules: copy_map(impl_method_modules),
         checker_module_roots: copy_map(checker_module_roots),
@@ -9798,6 +9863,8 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     generic_body_queued = copy_map(s.generic_body_queued)
     generic_body_checked = copy_map(s.generic_body_checked)
     generic_body_spec_counts = copy_map(s.generic_body_spec_counts)
+    generic_drop_decls = copy_map(s.generic_drop_decls)
+    generic_drop_walked = copy_map(s.generic_drop_walked)
     struct_instance_decl_idx = copy_map(s.struct_instance_decl_idx)
     impl_method_modules = copy_map(s.impl_method_modules)
     checker_module_roots = copy_map(s.checker_module_roots)

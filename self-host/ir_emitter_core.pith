@@ -506,6 +506,11 @@ mut ir_generic_enum_dtor_kinds: Map[String, String] := {}
 # "weak" for a weak field, "-" for a field that releases nothing.
 mut ir_generic_struct_dtor_base: Map[String, String] := {}
 mut ir_generic_struct_dtor_kinds: Map[String, String] := {}
+# the specialized drop method an instance destructor calls at its head, for a
+# generic struct that implements Drop. the drop body depends on the type
+# arguments, so these instances are keyed by the method symbol as well as by
+# the field kinds.
+mut ir_generic_struct_dtor_drop: Map[String, String] := {}
 # the tids of the match subjects enclosing the rc prepass walk, innermost
 # last, so a nested variant pattern can resolve a generic enum's payload
 # kinds against the instance being matched.
@@ -9336,21 +9341,19 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         # gets its destructor. the generic function-call path below would instead
         # emit a backend constructor call and then release the owned args the
         # struct just stored, dropping a fresh heap value (e.g. `body: bytes...`).
+        # a generic struct's checked type names the instance (`Box[String]`),
+        # which is also the name the same-module path builds under, so the
+        # instance destructor is attached either way.
         alias_expr_tid := c_get_expr_type(idx)
-        mut ctor_tid := 0 - 1
-        mut builds_struct := false
         if alias_expr_tid >= 0:
             alias_expr_info := get_type_info(alias_expr_tid)
-            if alias_expr_info.kind == "struct" and alias_expr_info.name == call_name:
-                builds_struct = true
-                ctor_tid = alias_expr_tid
-        if builds_struct:
-            mut ctor_args: List[Int] := []
-            for child, ci in node.children:
-                if ci == 0:
-                    continue
-                ctor_args.push(child)
-            return ir_emit_struct_positional_init(call_name, ctor_args, ctor_tid)
+            if alias_expr_info.kind == "struct" and ir_struct_base_name(alias_expr_info.name) == call_name:
+                mut ctor_args: List[Int] := []
+                for child, ci in node.children:
+                    if ci == 0:
+                        continue
+                    ctor_args.push(child)
+                return ir_emit_struct_positional_init(alias_expr_info.name, ctor_args, alias_expr_tid)
         if ir_is_generic_function_name(call_name):
             generic_ret_type := ir_infer_type(idx)
             mut no_explicit_types: List[String] := []
@@ -14987,7 +14990,10 @@ fn ir_generic_struct_instance_dtor(sname: String, tid: Int) -> String:
                 else:
                     parts.push("-")
         i = i + 1
-    if not resolved_any:
+    # a Drop struct needs its own destructor for every instance, since each
+    # one calls the drop specialized for its type arguments
+    drop_sym := ir_generic_struct_instance_drop(base, tid)
+    if not resolved_any and drop_sym.len() == 0:
         return ""
     # a field that releases nothing is spelled "-" rather than left blank, in
     # the signature and in the symbol alike: reading the signature back splits
@@ -14999,10 +15005,22 @@ fn ir_generic_struct_instance_dtor(sname: String, tid: Int) -> String:
             sym_parts.push("void")
         else:
             sym_parts.push(part)
-    sym := ir_sanitize_symbol(base + "__" + sym_parts.join("__"))
+    mut sym := ir_sanitize_symbol(base + "__" + sym_parts.join("__"))
+    if drop_sym.len() > 0:
+        sym = ir_sanitize_symbol(sym + "__drop__" + drop_sym)
+        ir_generic_struct_dtor_drop.insert(sym, drop_sym)
     ir_generic_struct_dtor_base.insert(sym, base)
     ir_generic_struct_dtor_kinds.insert(sym, parts.join(";"))
     return sym
+
+# the specialized drop method of one instance of a generic struct that
+# implements Drop, or "" for a struct without one or a tid that names no
+# instance (that construction keeps the shared destructor, which calls the
+# unspecialized method).
+fn ir_generic_struct_instance_drop(base: String, tid: Int) -> String:
+    if ir_struct_drop_symbol(base).len() == 0 or not struct_instance_base_name.contains_key(tid):
+        return ""
+    return ir_lookup_specialized_method(get_type_name(tid), "drop")
 
 # attach the type's destructor to a freshly built struct so its rc
 # fields release when the struct dies
@@ -15156,6 +15174,10 @@ fn ir_emit_generic_struct_instance_dtors():
         base := ir_generic_struct_dtor_base[sym]
         kinds := ir_generic_struct_dtor_kinds[sym].split(";")
         pr := ir_emit_rc_walk_header("__dtor_" + sym)
+        # the instance's drop runs first, with every field live, as in
+        # ir_emit_struct_walks
+        if ir_generic_struct_dtor_drop.contains_key(sym):
+            ir_emit("call " + ir_reg().to_string() + " " + ir_generic_struct_dtor_drop[sym] + " unknown 1 " + pr.to_string())
         mut i := 0
         while i < kinds.len():
             if kinds[i] == "weak":
@@ -15687,12 +15709,8 @@ fn ir_emit_cc_register_tracers():
             continue
         if not ir_struct_needs_dtor(sname):
             continue
-        # a destructor that runs a user drop is named to the collector, which
-        # leaves a garbage cycle through it alone (cycle.rs keep_user_drops)
         if ir_struct_drop_symbol(sname).len() > 0:
-            dr := ir_reg()
-            ir_emit("funcref " + dr.to_string() + " __dtor_" + sname)
-            ir_emit_call1(ir_reg(), "pith_cc_register_user_drop", "void", dr)
+            ir_emit_cc_register_user_drop("__dtor_" + sname)
         if not ir_struct_needs_tracer(sname):
             continue
         ir_emit_cc_register_pair("__dtor_" + sname, "__cc_trace_" + sname)
@@ -15710,10 +15728,19 @@ fn ir_emit_cc_register_tracers():
             continue
         ir_emit_cc_register_pair(ir_tuple_dtor_name(sig), ir_tuple_tracer_name(sig))
     for sym in ir_generic_struct_dtor_base.keys().sort():
+        if ir_generic_struct_dtor_drop.contains_key(sym):
+            ir_emit_cc_register_user_drop("__dtor_" + sym)
         if not ir_generic_struct_instance_needs_tracer(sym):
             continue
         ir_emit_cc_register_pair("__dtor_" + sym, "__cc_trace_" + sym)
     ir_emit_zero_ret_endfunc()
+
+# name a destructor that runs a user drop to the collector, which leaves a
+# garbage cycle through it alone (cycle.rs keep_user_drops)
+fn ir_emit_cc_register_user_drop(dtor: String):
+    dr := ir_reg()
+    ir_emit("funcref " + dr.to_string() + " " + dtor)
+    ir_emit_call1(ir_reg(), "pith_cc_register_user_drop", "void", dr)
 
 # the emission phase of emit_ir for the module being lowered, in output
 # order: globals and their init, the walks for the types the module
@@ -15725,6 +15752,7 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_generic_enum_dtor_kinds = {}
     ir_generic_struct_dtor_base = {}
     ir_generic_struct_dtor_kinds = {}
+    ir_generic_struct_dtor_drop = {}
     ir_emit_global_bindings(root)
     ir_emit_tls_thunks(root)
     ir_emit_init_globals(root)

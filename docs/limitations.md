@@ -98,9 +98,12 @@ stale and a fix to it is welcome.
 - **`spawn` with a builtin call in an argument fails to compile** (#1082).
   `spawn f(bit_and(x, y))` fails with `unknown load source`. bind the argument
   to a local first.
-- **destructor limits**. a generic struct cannot implement `Drop` (E268), and a
-  garbage cycle that runs through a `Drop` struct is not collected by the
-  cycle collector: it leaks. see docs/ownership.md.
+- **destructor limits**. a garbage cycle that runs through a `Drop` struct is
+  not collected by the cycle collector: it leaks. a struct literal is not
+  refused outside its module even when its fields are private, so code can
+  still build a second value over a live handle (`redis.Client(fd: 5, ...)`)
+  whose destructor then closes the first one's resource. see
+  docs/ownership.md.
 
 ## standard library
 
@@ -108,11 +111,19 @@ stale and a fix to it is welcome.
   to 1.2 with ecdhe and aead suites only, refusing anything older.
   `require_tls13()` locks a config to 1.3. the 1.2 path does client
   certificates but no session resumption or renegotiation.
-- **most resource types close by hand**. `std.net.tls.Config` is the only std
-  type that implements `Drop`. files, processes, connections, listeners,
-  websocket sessions, grpc streams, buffered readers and writers and database
-  handles still need `close()`; `pith lint` flags a local one that is never
-  closed (E307). docs/destructors_roadmap.md tracks the rest.
+- **a destructor is a backstop for `close()`**. files, processes, io readers,
+  writers and buffers, tls connections and listeners, http and http/2
+  connections, websocket sessions and database connections, transactions and
+  statements release what they hold when their last value dies. a destructor
+  does no network i/o, so a tls connection dropped without `close()` sends no
+  close_notify, a dropped websocket sends no close frame, a buffered writer
+  dropped without `flush()` loses what it held, and a dropped `std.db`
+  transaction is rolled back by closing its connection. call `close()` where
+  the peer must see a clean end. three types still close by hand only:
+  `std.bytes.ByteBuffer` (`free()` or `take_bytes()`), grpc streams, and an
+  `http2.Client`, which its own reader and writer tasks keep alive. `pith
+  lint` flags a local of a type without a destructor that is never closed
+  (E307). docs/destructors_roadmap.md tracks the rest.
 - **testing has no benchmarks**. `pith test` runs `test` blocks with
   `--filter`, `--tag`, `--exclude-tag` and `--json`, and `std/testing` adds
   assertions, fixtures and parameterized cases, but there is no benchmark

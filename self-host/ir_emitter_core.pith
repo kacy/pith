@@ -10343,11 +10343,10 @@ fn ir_emit_try_expr(node: Node) -> Int:
                     ir_emit("iconst " + zero_flag2_r.to_string() + " 0")
                     ir_emit("ret2 " + zero_flag2_r.to_string() + " " + err_r.to_string())
                 else:
-                    fresh_err_r := ir_emit_err_result_tuple(err_r)
                     ir_defer_emit_to_function_frame(true)
                     ir_emit_rc_cleanup("")
                     ir_emit_main_error_report(err_r, err_kind == "string")
-                    ir_emit("ret " + fresh_err_r.to_string())
+                    ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
             elif ir_current_func_return_kind == "result_reg":
                 # the enclosing function returns the pair: take the error out
                 # of the owned box, free the shell, and propagate via ret2.
@@ -10365,9 +10364,9 @@ fn ir_emit_try_expr(node: Node) -> Int:
                 ir_defer_emit_to_function_frame(true)
                 ir_emit_rc_cleanup("")
                 if ir_emitting_main_body:
-                    report_err_r := ir_emit_result_value_field(val_r, operand_tid, "err")
-                    ir_emit_main_error_report(report_err_r, ir_rc_kind(ir_result_field_kind(operand_tid, "err")) == "string")
-                ir_emit("ret " + val_r.to_string())
+                    ir_emit_main_box_error_exit(val_r, operand_tid)
+                else:
+                    ir_emit("ret " + val_r.to_string())
             ir_emit_label(merge_l)
             return decoded_r
         mut cond_r := val_r
@@ -10435,11 +10434,10 @@ fn ir_emit_try_pair(operand_idx: Int, flag_r: Int, val_r: Int) -> Int:
         ir_emit("iconst " + zero_r.to_string() + " 0")
         ir_emit("ret2 " + zero_r.to_string() + " " + val_r.to_string())
     else:
-        fresh_err_r := ir_emit_err_result_tuple(val_r)
         ir_defer_emit_to_function_frame(true)
         ir_emit_rc_cleanup("")
         ir_emit_main_error_report(val_r, ir_rc_kind(ir_result_field_kind(operand_tid, "err")) == "string")
-        ir_emit("ret " + fresh_err_r.to_string())
+        ir_emit("ret " + ir_emit_err_result_tuple(val_r).to_string())
     ir_emit_label(merge_l)
     return val_r
 
@@ -10480,11 +10478,12 @@ fn ir_emit_fail_expr(node: Node) -> Int:
             ir_emit("iconst " + zero_r.to_string() + " 0")
             ir_emit("ret2 " + zero_r.to_string() + " " + err_r.to_string())
         else:
-            tuple_r := ir_emit_err_result_tuple(err_r)
             ir_defer_emit_to_function_frame(true)
             ir_emit_rc_cleanup(exclude)
+            # main's report ends the process, so the box is built after it:
+            # one built first was still live at the exit
             ir_emit_main_error_report(err_r, ir_infer_type(node.children[0]) == "string")
-            ir_emit("ret " + tuple_r.to_string())
+            ir_emit("ret " + ir_emit_err_result_tuple(err_r).to_string())
     elif ir_current_func_return_kind == "result_reg":
         ir_defer_emit_to_function_frame(true)
         ir_emit_rc_cleanup("")
@@ -11696,6 +11695,9 @@ pub fn ir_emit_return_value(expr_child: Int):
                 r = ir_emit_optional_owned_some(r, ret_payload_kind)
             else:
                 r = ir_emit_optional_some_value(r)
+    elif ir_current_func_return_kind == "tuple" and ir_emitting_main_body and ir_current_func_returns_result:
+        ir_emit_main_result_return(r, expr_node.kind == "none_lit", ir_return_forwards_result(expr_kind, result_kind), expr_tid, exclude)
+        return
     elif ir_current_func_return_kind == "tuple":
         # a result return: forward a whole result, wrap anything else as the
         # ok payload. the checker can only have accepted `return none` here
@@ -11726,6 +11728,47 @@ pub fn ir_emit_return_value(expr_child: Int):
     ir_emit_rc_cleanup(exclude)
     ir_emit("ret " + r.to_string())
     ir_last_was_ret = true
+
+# a return from `fn main() -> T!`. the entry glue exits 0 and drops what main
+# returns, so main settles its result here instead of building a box nobody
+# frees: a forwarded result that holds an error is reported, and
+# pith_main_error_exit ends the process with status 1; otherwise the value is
+# released. `return f()` with a failing `f` used to exit 0 without a word.
+fn ir_emit_main_result_return(r: Int, is_none: Bool, forwards: Bool, expr_tid: Int, exclude: String):
+    ir_defer_emit_to_function_frame(false)
+    ir_emit_rc_cleanup(exclude)
+    if forwards:
+        ok_l := ir_label()
+        err_l := ir_label()
+        flag_r := ir_emit_result_flag_field(r, "is_ok")
+        ir_emit("brif " + flag_r.to_string() + " " + ok_l + " " + err_l)
+        ir_emit_label(err_l)
+        ir_emit_main_box_error_exit(r, expr_tid)
+        ir_emit_label(ok_l)
+        ir_emit_result_box_release(r, expr_tid)
+    elif not is_none:
+        ok_kind := ir_result_payload_rc_kind(0 - 1, "ok")
+        if ok_kind.len() > 0:
+            ir_rc_release_reg(r, ok_kind)
+    ir_emit_main_zero_ret()
+    ir_last_was_ret = true
+
+# main's exit through a result box that holds an error, owned by this frame.
+# the error outlives the box it came in, so the box goes first and nothing
+# but the error is live when the report ends the process.
+fn ir_emit_main_box_error_exit(box_r: Int, box_tid: Int):
+    err_r := ir_emit_result_value_field(box_r, box_tid, "err")
+    err_kind := ir_rc_kind(ir_result_field_kind(box_tid, "err"))
+    ir_rc_retain_reg(err_r, err_kind)
+    ir_emit_result_box_release(box_r, box_tid)
+    ir_emit_main_error_report(err_r, err_kind == "string")
+    ir_rc_release_reg(err_r, err_kind)
+    ir_emit_main_zero_ret()
+
+fn ir_emit_main_zero_ret():
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit("ret " + zero_r.to_string())
 
 # whether a value returned from a function declared `-> T!` is already the
 # result (forward it) or its ok payload (wrap it). the ir result kind cannot

@@ -196,7 +196,7 @@ which stops the process. a line ending in "é" is ordinary text and now reads
 back as ordinary text.
 
 at the end of input `read_line` returns `""`, the same value as an empty line.
-`read_line_opt` returns `(String?)!` instead: the line, or `none` once the
+`read_line_opt` returns `String?!` instead: the line, or `none` once the
 input is used up. a last line with no terminator still comes back before the
 `none`. `read_line_opt_ctx` is the deadline-aware form.
 

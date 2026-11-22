@@ -1934,7 +1934,7 @@ fn buffered_text_read_ctx(reader: BufferedReader, ctx: Context, max_bytes: Int) 
 
 # the next line, or none at the end of input. read_line and read_line_opt
 # share this; read_line turns none into "".
-fn buffered_text_read_line(reader: BufferedReader) -> (String?)!:
+fn buffered_text_read_line(reader: BufferedReader) -> String?!:
     if not buffered_readers.contains_key(reader.handle):
         return none
     state := buffered_readers[reader.handle]
@@ -1950,12 +1950,11 @@ fn buffered_text_read_line(reader: BufferedReader) -> (String?)!:
         if newline >= 0:
             parts.push(data.substring(cursor, newline))
             state.cursor = newline + 1
-            line: String? := trim_trailing_cr(join_parts(parts))
-            return line
+            return trim_trailing_cr(join_parts(parts))
         parts.push(data.substring(cursor, data.len()))
         buffered_reader_clear(state)
 
-fn buffered_text_read_line_ctx(reader: BufferedReader, ctx: Context) -> (String?)!BlockingError:
+fn buffered_text_read_line_ctx(reader: BufferedReader, ctx: Context) -> String?!BlockingError:
     if not buffered_readers.contains_key(reader.handle):
         return none
     state := buffered_readers[reader.handle]
@@ -1971,8 +1970,7 @@ fn buffered_text_read_line_ctx(reader: BufferedReader, ctx: Context) -> (String?
         if newline >= 0:
             parts.push(data.substring(cursor, newline))
             state.cursor = newline + 1
-            line: String? := trim_trailing_cr(join_parts(parts))
-            return line
+            return trim_trailing_cr(join_parts(parts))
         parts.push(data.substring(cursor, data.len()))
         buffered_reader_clear(state)
 
@@ -2131,10 +2129,10 @@ impl BufferedReader:
     # the next line without its terminator, or none at the end of input, so
     # an empty line ("") and the end are different values. a last line with
     # no terminator is still returned before the none.
-    fn read_line_opt() -> (String?)!:
+    fn read_line_opt() -> String?!:
         return buffered_text_read_line(self)
 
-    fn read_line_opt_ctx(ctx: Context) -> (String?)!BlockingError:
+    fn read_line_opt_ctx(ctx: Context) -> String?!BlockingError:
         return buffered_text_read_line_ctx(self, ctx)
 
     fn read_until(sep: String) -> String!:

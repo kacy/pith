@@ -3367,6 +3367,11 @@ fn check_return_statement(node: Node, scope_id: Int):
             return
         if types_structurally_equal(actual, exp_info.inner):
             return
+        # a plain value as the payload of a `T?!` return widens into the
+        # optional first, recorded like any other widening so the emitter
+        # builds the some inside the ok box
+        if get_type_info(exp_info.inner).kind == "optional" and argument_widens_to_optional(node.children[0], actual, exp_info.inner):
+            return
     # allow returning inner type from optional-returning function. the
     # return is recorded as widening, the same record an argument or a
     # binding leaves, because the emitter cannot always tell from the

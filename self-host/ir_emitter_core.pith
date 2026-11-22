@@ -4906,8 +4906,8 @@ fn ir_kind_is_owned_optional_payload(kind: String) -> Bool:
 # build a Some that owns its payload. the payload arrives owned either way: a
 # fresh value carries its own count, and a borrowed one is retained here to pair
 # with the destructor's release.
-fn ir_emit_owned_some_taking(value_r: Int, val_idx: Int, payload_kind: String, dtor_kind: String) -> Int:
-    if ir_expr_is_borrowed(val_idx):
+fn ir_emit_owned_some_taking(value_r: Int, val_idx: Int, payload_kind: String, dtor_kind: String, retain_borrowed: Bool) -> Int:
+    if retain_borrowed and ir_expr_is_borrowed(val_idx):
         ir_rc_retain_reg(value_r, payload_kind)
     return ir_emit_optional_owned_some(value_r, dtor_kind)
 
@@ -4945,22 +4945,29 @@ fn ir_emit_optional_for_target(val_idx: Int, vn: Node, target_inner: String) -> 
             if ir_expr_is_borrowed(val_idx):
                 ir_rc_retain_reg(value_r, "tuple")
             return value_r
+    return ir_emit_some_over(value_r, val_idx, true)
+
+# build the Some for a value widening into an optional. the shell owns a heap
+# payload; `retain_borrowed` says whether a borrowed value still needs its own
+# count, which a return site has already taken.
+fn ir_emit_some_over(value_r: Int, val_idx: Int, retain_borrowed: Bool) -> Int:
+    actual_tid := c_get_expr_type(val_idx)
     # an optional handed to a deeper optional (`x: Int?` into an `Int??`): the
     # inner shell is the payload, and the outer shell owns it the way it owns
     # a tuple payload. the checker's record brought the value here; without it
     # the kind test above called the inner shell the outer one (#1051).
     if actual_tid >= 0 and get_type_info(actual_tid).kind == "optional":
         ir_optional_tuple_dtor_needed = true
-        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", "tuple")
+        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", "tuple", retain_borrowed)
     payload_kind := ir_rc_kind(ir_infer_type(val_idx))
     if ir_kind_is_owned_optional_payload(payload_kind):
-        return ir_emit_owned_some_taking(value_r, val_idx, payload_kind, payload_kind)
+        return ir_emit_owned_some_taking(value_r, val_idx, payload_kind, payload_kind, retain_borrowed)
     # a genuine tuple payload owns whatever its elements hold. the signature
     # names the destructor emitted for that shape, and is "" for anything that
     # is not a tuple, so it decides on its own.
     tuple_kind := ir_optional_tuple_payload_kind(actual_tid)
     if tuple_kind.len() > 0:
-        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", tuple_kind)
+        return ir_emit_owned_some_taking(value_r, val_idx, "tuple", tuple_kind, retain_borrowed)
     return ir_emit_optional_some_value(value_r)
 
 fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inner: String) -> Int:
@@ -11559,10 +11566,12 @@ pub fn ir_emit_return_value(expr_child: Int):
     mut exclude := ""
     expr_node := get_node(expr_child)
     result_kind := ir_expr_result_kind(expr_child)
+    # a plain value widening into a `T?!` payload (check_return_statement)
+    widened_payload := ir_current_func_optional_inner_kind.len() == 0 and c_argument_widens_to_optional(expr_child)
     # a whole result returned under the register abi leaves as its payload,
     # not as the box, so a borrowed box takes its count on the payload
     # instead of on the shell (see ir_emit_return_box_as_pair).
-    pair_forward := ir_current_func_return_kind == "result_reg" and result_kind == "tuple"
+    pair_forward := ir_current_func_return_kind == "result_reg" and result_kind == "tuple" and not widened_payload
     mut pair_source := "fresh"
     # a box returned whole that someone else may also hold (see
     # ir_emit_result_box_unshare)
@@ -11592,6 +11601,12 @@ pub fn ir_emit_return_value(expr_child: Int):
     mut expr_kind := ""
     if expr_tid >= 0:
         expr_kind = get_type_info(expr_tid).kind
+    if widened_payload:
+        # a plain value returned from a `T?!` function: the checker recorded
+        # it widening into the ok type, so the Some goes inside the ok box.
+        # the value is owned by now (see `exclude` and the retain above).
+        r = ir_emit_some_over(r, expr_child, false)
+        expr_kind = "optional"
     if ir_current_func_optional_inner_kind.len() > 0:
         # is the returned expression already an optional (so forward it),
         # or the inner value (so wrap in Some)? the checker knows in the

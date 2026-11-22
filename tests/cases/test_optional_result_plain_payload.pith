@@ -1,0 +1,95 @@
+# a function declared `-> T?!` returns a result whose payload is `T?`. the
+# spelling used to stop the parser at the `!` (E240), so it had to be written
+# `(T?)!`, and a plain `T` returned from such a function was refused with
+# E200 ("expected result, got String"), so every return built a `T?` local
+# first. both now work: `T?!` and `T?!E` read as `(T?)!` and `(T?)!E`, and a
+# plain value widens to `Some(v)` inside the ok result, the way it widens in a
+# `-> T?` function.
+#
+# each producer is read back through `catch none` and `unwrap_or`, for a
+# String, Int, struct, tuple and List payload, under both result abis: a
+# string or int payload travels in registers and a tuple or struct one in the
+# box. runs under valgrind with the freelist off (MEMCHECK_CASES).
+
+struct Pt:
+    x: Int
+    s: String
+
+fn str_of(k: Int) -> String?!:
+    if k < 0:
+        fail "neg {k}"
+    if k == 0:
+        return none
+    name := "s{k}"
+    return name
+
+fn str_lit(k: Int) -> String?!String:
+    if k < 0:
+        fail "neg {k}"
+    return "lit{k}"
+
+fn int_of(k: Int) -> Int?!:
+    if k < 0:
+        fail "neg {k}"
+    if k == 0:
+        return none
+    return k * 10
+
+fn pt_of(k: Int) -> Pt?!:
+    if k < 0:
+        fail "neg {k}"
+    if k == 0:
+        return none
+    return Pt(x: k, s: "pt{k}")
+
+fn pair_of(k: Int) -> (Int, String)?!:
+    if k < 0:
+        fail "neg {k}"
+    if k == 0:
+        return none
+    return (k, "pair{k}")
+
+fn list_of(k: Int) -> List[Int]?!:
+    if k < 0:
+        fail "neg {k}"
+    if k == 0:
+        return none
+    xs := [k, k + 1]
+    return xs
+
+fn param_of(s: String) -> String?!:
+    if s == "":
+        return none
+    return s
+
+fn relay(k: Int) -> String?!:
+    v := str_of(k)!
+    return v
+
+fn row(k: Int) -> String:
+    a := (str_of(k) catch none).unwrap_or("-")
+    b := (str_lit(k) catch none).unwrap_or("-")
+    c := (int_of(k) catch none).unwrap_or(0)
+    p := pt_of(k) catch none
+    mut d := "-"
+    if let q = p:
+        d = "{q.x}:{q.s}"
+    t := pair_of(k) catch none
+    mut e := "-"
+    if let u = t:
+        e = "{u.0}:{u.1}"
+    xs := (list_of(k) catch none).unwrap_or([])
+    f := (param_of(a) catch none).unwrap_or("-")
+    g := (relay(k) catch none).unwrap_or("-")
+    return "{a} {b} {c} {d} {e} {xs.len()} {f} {g}"
+
+fn main():
+    for k in -1..3:
+        print(row(k))
+    mut total := 0
+    for i in 0..200:
+        total = total + row(i % 4).len()
+    print("total {total}")
+    r := str_of(-5)
+    if r.is_err:
+        print("err {r.err}")

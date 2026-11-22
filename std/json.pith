@@ -964,58 +964,67 @@ fn parse_value_node() -> Int:
         parser_position = parser_position + 4
         return new_node(JsonKind.Null, 0)
 
-    # array
+    # array. after each element the next byte must be a comma or the closing
+    # bracket; anything else, the end of the input included, fails the parse
+    # with parser_position on that byte. a comma before the bracket (`[1,]`)
+    # fails too, because the value parser then finds `]`.
     if c == 91:
         parser_position = parser_position + 1
         arr := new_array_node()
         skip_whitespace()
-        if parser_position < parser_input.len() and byte_at(parser_position) == 93:
+        if byte_at(parser_position) == 93:
             parser_position = parser_position + 1
             return arr
-        while parser_position < parser_input.len() and byte_at(parser_position) != 93:
+        while true:
             val := parse_value()
             if parser_error:
                 return 0 - 1
             push_array_element(arr, val)
             skip_whitespace()
-            if parser_position < parser_input.len() and byte_at(parser_position) == 44:
+            sep := byte_at(parser_position)
+            if sep == 93:
                 parser_position = parser_position + 1
-            skip_whitespace()
-        if parser_position < parser_input.len():
+                return arr
+            if sep != 44:
+                parser_error = true
+                return 0 - 1
             parser_position = parser_position + 1
-        return arr
 
-    # object
+    # object. each member is a string key, a colon and a value, followed by a
+    # comma or the closing brace, with the same failure rule as arrays.
     if c == 123:
         parser_position = parser_position + 1
         obj := new_object_node()
         skip_whitespace()
-        if parser_position < parser_input.len() and byte_at(parser_position) == 125:
+        if byte_at(parser_position) == 125:
             parser_position = parser_position + 1
             return obj
-        mut done := false
-        while parser_position < parser_input.len() and not done and not parser_error:
+        while true:
             skip_whitespace()
-            if parser_position >= parser_input.len() or byte_at(parser_position) != 34:
+            if byte_at(parser_position) != 34:
                 parser_error = true
                 return 0 - 1
             key := parse_string_raw()
+            if parser_error:
+                return 0 - 1
             skip_whitespace()
-            if parser_position < parser_input.len() and byte_at(parser_position) == 58:
-                parser_position = parser_position + 1
+            if byte_at(parser_position) != 58:
+                parser_error = true
+                return 0 - 1
+            parser_position = parser_position + 1
             val := parse_value()
             if parser_error:
                 return 0 - 1
             set_object_property(obj, key, val)
             skip_whitespace()
-            if parser_position < parser_input.len() and byte_at(parser_position) == 44:
+            sep := byte_at(parser_position)
+            if sep == 125:
                 parser_position = parser_position + 1
-            skip_whitespace()
-            if parser_position < parser_input.len() and byte_at(parser_position) == 125:
-                done = true
-        if parser_position < parser_input.len() and byte_at(parser_position) == 125:
+                return obj
+            if sep != 44:
+                parser_error = true
+                return 0 - 1
             parser_position = parser_position + 1
-        return obj
 
     # number (int or float)
     if (c >= 48 and c <= 57) or c == 45 or c == 43:
@@ -1446,10 +1455,11 @@ pub fn fill_missing_error(name: String) -> JsonDecodeError:
 ## `pos` of `input`. The decoder does not know why it stopped, so the
 ## document is parsed again here, off the path a well-formed one takes:
 ## input the parser refuses is invalid json at the byte the parser stopped
-## at, and a root that is not an object says what it is. The parser takes
-## some documents the decoder does not (a value of the wrong type for its
-## field, an object cut off at the end), and those are an invalid object at
-## the byte the decoder stopped at. Called only by compiler-generated code.
+## at (for a document cut off at the end, its length), and a root that is
+## not an object says what it is. The parser takes some documents the
+## decoder does not (a value of the wrong type for its field), and those are
+## an invalid object at the byte the decoder stopped at. Called only by
+## compiler-generated code.
 pub fn fill_malformed_error(input: Bytes, pos: Int) -> JsonDecodeError:
     text := bytes.decode_utf8(input)
     if text.is_err:
@@ -1479,7 +1489,10 @@ pub fn parse_bytes_required(input: Bytes) -> Int!JsonDecodeError:
     text := bytes.decode_utf8(input)
     if text.is_err:
         fail JsonDecodeError(text.err.message)
-    return parse(text.ok)
+    root := parse(text.ok)
+    if root < 0:
+        fail JsonDecodeError("invalid json at byte {parser_position}")
+    return root
 
  # decodes a parsed json object handle into a concrete struct.
  # this is lowered by the compiler so structs do not need runtime reflection.
@@ -2498,6 +2511,54 @@ test "json rejects an unterminated string":
     assert(parse(dq + "bare-unclosed") < 0)
     # the well-formed counterpart still parses
     assert(parse(dq + "ok" + dq) >= 0)
+
+test "json rejects unterminated and malformed containers":
+    lb := chr(123)
+    rb := chr(125)
+    dq := chr(34)
+    a := dq + "a" + dq
+    # unterminated array, object and nested containers
+    assert(parse("[1, 2") < 0)
+    assert(parse("[") < 0)
+    assert(parse("[1,") < 0)
+    assert(parse(lb + a + ": 1") < 0)
+    assert(parse(lb) < 0)
+    assert(parse(lb + a) < 0)
+    assert(parse(lb + a + ":") < 0)
+    assert(parse("[[1, 2]") < 0)
+    assert(parse("[" + lb + a + ": [1]" + rb) < 0)
+    assert(parse(lb + a + ": [1, 2" + rb) < 0)
+    # a string left open inside a container
+    assert(parse("[" + dq + "x") < 0)
+    assert(parse(lb + a + ": " + dq + "x" + rb) < 0)
+    # a trailing comma, a missing comma and a missing colon (rfc 8259)
+    assert(parse("[1, 2,]") < 0)
+    assert(parse(lb + a + ": 1," + rb) < 0)
+    assert(parse("[1 2]") < 0)
+    assert(parse(lb + a + " 1" + rb) < 0)
+    assert(parse(lb + a + ": 1 " + dq + "b" + dq + ": 2" + rb) < 0)
+    # mismatched closers
+    assert(parse("[1" + rb) < 0)
+    assert(parse(lb + a + ": 1]") < 0)
+    # the well-formed counterparts still parse
+    assert(array_len(parse("[1, 2]")) == 2)
+    assert(array_len(parse(" [ ] ")) == 0)
+    assert(object_get_int(parse(lb + " " + a + " : 1 " + rb), "a") == 1)
+    assert(type_of(parse(lb + rb)) == "object")
+
+test "json parse errors report the byte where the parse stopped":
+    lb := chr(123)
+    dq := chr(34)
+    # an unterminated container stops at the end of the input
+    cut := bytes.from_string_utf8(lb + dq + "a" + dq + ": [1, 2")
+    assert_eq(fill_malformed_error(cut, 0).message, "invalid json at byte 11")
+    # a missing comma stops on the byte that should have been one
+    gap := bytes.from_string_utf8("[1 2]")
+    assert_eq(fill_malformed_error(gap, 0).message, "invalid json at byte 3")
+    required := parse_bytes_required(bytes.from_string_utf8("[1, 2"))
+    assert(required.is_err)
+    assert_eq(required.err.message, "invalid json at byte 5")
+    assert(parse_bytes_required(bytes.from_string_utf8("[1, 2]")).is_ok)
 
 test "json parses nested arrays without interleaving corruption":
     # a child array parsed between two parent pushes must not land inside the

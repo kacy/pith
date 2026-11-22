@@ -1896,6 +1896,12 @@ test "yaml rejects tabs and unterminated quotes":
     assert(parse("a: " + dq + "unclosed") < 0)
     assert(parse("a: [1, 2") < 0)
     assert(last_error().contains("flow"))
+    # unterminated flow mappings and nested collections fail the same way
+    assert(parse("a: " + chr(123) + "b: 1") < 0)
+    assert(last_error().contains("unterminated flow mapping"))
+    assert(parse("a: [[1], 2") < 0)
+    assert(parse("a: [" + chr(123) + "b: 1]") < 0)
+    assert(parse("a: [1, " + dq + "x]") < 0)
     assert(parse("a: 1") >= 0)
     assert_eq(last_error(), "")
 

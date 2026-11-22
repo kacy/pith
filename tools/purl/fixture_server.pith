@@ -1,0 +1,225 @@
+# fixture_server — local multi-protocol HTTP/1.1, TLS, mTLS, HTTP/2 (h2 + h2c),
+# and HTTP proxy test server for purl's end-to-end integration test suite.
+#
+# Usage:
+#   fixture_server http <port> <max_conns>
+#   fixture_server tls <port> <max_conns> <cert> <key> [client_ca]
+#   fixture_server h2c <port> <max_conns>
+#   fixture_server h2 <port> <max_conns> <cert> <key>
+#   fixture_server proxy <port> <max_conns>
+
+import std.net.http2.frames as h2frames
+import std.net.http2.hpack as h2hpack
+import std.net.http2.connection as h2conn
+import std.net.http2.server as h2server
+import std.bytes as bytes
+import std.compress.gzip as gzip
+import std.compress.zlib as zlib
+import std.compress.zstd as zstd
+import std.json as json
+import std.net.http as http
+import std.net.tls as tls
+import std.time as time
+from std.net.http import HttpRequestBytes, HttpResponse
+
+mut flaky_counter: Int := 0
+
+fn echo_json_response(req: HttpRequestBytes) -> HttpResponse:
+    obj := json.make_object()
+    json.object_set(obj, "method", json.make_string(req.method() catch ""))
+    json.object_set(obj, "path", json.make_string(req.path() catch ""))
+    json.object_set(obj, "query", json.make_string(req.query() catch ""))
+    json.object_set(obj, "content_type", json.make_string(req.header_or("Content-Type", "")))
+    json.object_set(obj, "user_agent", json.make_string(req.header_or("User-Agent", "")))
+    json.object_set(obj, "authorization", json.make_string(req.header_or("Authorization", "")))
+    json.object_set(obj, "cookie", json.make_string(req.header_or("Cookie", "")))
+    json.object_set(obj, "referer", json.make_string(req.header_or("Referer", "")))
+    json.object_set(obj, "x_custom", json.make_string(req.header_or("X-Custom", "")))
+    json.object_set(obj, "body", json.make_string(req.body_text_or("")))
+    return http.json(200, json.encode(obj))
+
+fn route(req: HttpRequestBytes) -> HttpResponse:
+    path := req.path() catch "/"
+    method := req.method() catch "GET"
+
+    if path == "/hello":
+        return http.text(200, "hello from purl")
+
+    if path == "/echo" or path.starts_with("/upload"):
+        return echo_json_response(req)
+
+    if path == "/binary":
+        buf := bytes.buffer()
+        defer buf.free()
+        buf.write_byte(0) catch 0
+        buf.write_byte(1) catch 0
+        buf.write_byte(2) catch 0
+        buf.write_byte(255) catch 0
+        return http.response(200).content_type(http.MIME_BINARY).bytes_body(buf.bytes())
+
+    if path == "/redirect/1":
+        return http.response(302).header("Location", "/redirect/2").set_cookie(http.cookie("hop1", "alpha").path("/"))
+
+    if path == "/redirect/2":
+        return http.response(301).header("Location", "/redirect/final").set_cookie(http.cookie("hop2", "beta").path("/"))
+
+    if path == "/redirect/final":
+        return echo_json_response(req)
+
+    if path == "/redirect-307":
+        return http.response(307).header("Location", "/echo")
+
+    if path == "/redirect-302":
+        return http.response(302).header("Location", "/echo")
+
+    if path == "/redirect-loop":
+        return http.response(302).header("Location", "/redirect-loop")
+
+    if path == "/redirect-cross":
+        port_q := req.query_param_or("port", "18901")
+        return http.response(302).header("Location", "http://localhost:{port_q}/echo")
+
+    if path == "/status/404":
+        return http.text(404, "missing page body")
+
+    if path == "/status/500":
+        return http.text(500, "server error body")
+
+    if path == "/status/204":
+        return http.no_content()
+
+    if path == "/flaky":
+        flaky_counter = flaky_counter + 1
+        if flaky_counter < 3:
+            return http.text(503, "try again")
+        return http.text(200, "recovered")
+
+    if path == "/slow":
+        time.delay(350)
+        return http.text(200, "slow-ok")
+
+    if path == "/gzip":
+        payload := gzip.compress_string("compressed via gzip payload")
+        return http.response(200).content_type("text/plain").header("Content-Encoding", "gzip").bytes_body(payload)
+
+    if path == "/deflate":
+        payload := zlib.compress_string("compressed via deflate payload")
+        return http.response(200).content_type("text/plain").header("Content-Encoding", "deflate").bytes_body(payload)
+
+    if path == "/zstd":
+        payload := zstd.compress_string("compressed via zstd payload")
+        return http.response(200).content_type("text/plain").header("Content-Encoding", "zstd").bytes_body(payload)
+
+    if path == "/multipart" and method == "POST":
+        parts := req.multipart_parts() catch []
+        arr := json.make_array()
+        for p in parts:
+            item := json.make_object()
+            json.object_set(item, "name", json.make_string(p.name))
+            json.object_set(item, "filename", json.make_string(p.filename))
+            json.object_set(item, "content_type", json.make_string(p.content_type))
+            json.object_set(item, "body", json.make_string(p.body.to_string_utf8() catch ""))
+            json.array_push(arr, item)
+        return http.json(200, json.encode(arr))
+
+    if path == "/download":
+        full := "0123456789abcdef"
+        range_hdr := req.header_or("Range", "")
+        if range_hdr.starts_with("bytes="):
+            spec := range_hdr.substring(6, range_hdr.len())
+            dash := spec.index_of("-")
+            if dash >= 0:
+                start := parse_int(spec.substring(0, dash)) catch 0
+                mut end_idx := full.len()
+                end_text := spec.substring(dash + 1, spec.len()).trim()
+                if end_text != "":
+                    end_idx = (parse_int(end_text) catch (full.len() - 1)) + 1
+                if start >= 0 and start < full.len() and end_idx <= full.len() and end_idx > start:
+                    slice := full.substring(start, end_idx)
+                    return http.text(206, slice).header("Content-Disposition", "attachment; filename=\"report.txt\"").header("Content-Range", "bytes {start}-{end_idx - 1}/{full.len()}")
+        return http.text(200, full).header("Content-Disposition", "attachment; filename=\"report.txt\"")
+
+    if path == "/cookie-set":
+        return http.text(200, "cookies-set").set_cookie(http.cookie("session", "xyz99").path("/").http_only()).set_cookie(http.cookie("prefs", "compact").path("/"))
+
+    return http.not_found_response()
+
+fn proxy_route(req: HttpRequestBytes) -> HttpResponse:
+    obj := json.make_object()
+    json.object_set(obj, "proxied", json.make_bool(true))
+    json.object_set(obj, "method", json.make_string(req.method() catch ""))
+    json.object_set(obj, "path", json.make_string(req.path() catch ""))
+    json.object_set(obj, "host", json.make_string(req.header_or("Host", "")))
+    return http.json(200, json.encode(obj))
+
+fn main() -> Int!:
+    argv := args()
+    if argv.len() < 4:
+        print_err("usage: fixture_server <http|tls|h2c|h2|proxy> <port> <max_conns> [cert] [key] [client_ca]")
+        exit(2)
+    mode := argv[1]
+    port := parse_int(argv[2]) catch 18900
+    max_conns := parse_int(argv[3]) catch 20
+
+    if mode == "http":
+        fd := tcp_listen("127.0.0.1", port)!
+        mut served := 0
+        while served < max_conns:
+            client := tcp_accept(fd)!
+            tcp_set_timeout(client, 5000)
+            http.serve_connection_fd(client, route) catch 0
+            served = served + 1
+        tcp_close(fd)
+        return 0
+
+    if mode == "proxy":
+        fd := tcp_listen("127.0.0.1", port)!
+        mut served := 0
+        while served < max_conns:
+            client := tcp_accept(fd)!
+            tcp_set_timeout(client, 5000)
+            http.serve_connection_fd(client, proxy_route) catch 0
+            served = served + 1
+        tcp_close(fd)
+        return 0
+
+    if mode == "h2c":
+        fd := tcp_listen("127.0.0.1", port)!
+        mut served := 0
+        while served < max_conns:
+            client := tcp_accept(fd)!
+            tcp_set_timeout(client, 5000)
+            h2server.serve_h2c_connection(client, route)
+            served = served + 1
+        tcp_close(fd)
+        return 0
+
+    if mode == "tls" or mode == "h2":
+        if argv.len() < 6:
+            print_err("tls/h2 mode requires <cert> <key> [client_ca]")
+            exit(2)
+        cert_path := argv[4]
+        key_path := argv[5]
+        mut cfg := tls.server_config(cert_path, key_path)!
+        if mode == "h2":
+            cfg = cfg.with_alpn(["h2", "http/1.1"])
+        if argv.len() >= 7 and argv[6] != "":
+            cfg = cfg.require_client_ca_file(argv[6])!
+        listener := tls.listen("127.0.0.1", port, cfg)!
+        mut served := 0
+        while served < max_conns:
+            conn_res := tls.accept(listener)
+            served = served + 1
+            if conn_res.is_err:
+                continue
+            conn := conn_res.ok
+            if mode == "h2" and conn.negotiated_protocol() == "h2":
+                h2server.serve_h2_tls_connection(conn, route)
+            else:
+                http.serve_connection_tls(conn, route) catch 0
+        cfg.close()
+        return 0
+
+    print_err("unknown mode: {mode}")
+    exit(2)
+    return 0

@@ -1,0 +1,738 @@
+# purl_args — curl-compatible CLI argument and config-file parser.
+#
+# Supports combined short flags (-fsSL, -iL, -svk), attached short option
+# values (-XPOST, -oout.txt, -H"Accept: */*"), --opt=val and --opt val forms,
+# --no-<flag> negations, -K / --config files, and --next / -: request groups.
+
+import std.bytes as bytes
+import std.fs as fs
+import std.os as os
+import std.os.path as path_mod
+
+# One body data piece from -d / --data* / --json.
+pub struct DataPart:
+    pub kind: String
+    pub value: String
+
+# One multipart form entry from -F / --form / --form-string.
+pub struct FormSpec:
+    pub raw: String
+    pub is_string: Bool
+
+# Options for one request group (separated by --next / -:).
+pub struct RequestSpec:
+    pub mut urls: List[String]
+    pub mut method: String
+    pub mut head_only: Bool
+    pub mut use_get: Bool
+    pub mut headers: List[String]
+    pub mut data_parts: List[DataPart]
+    pub mut is_json: Bool
+    pub mut forms: List[FormSpec]
+    pub mut upload_file: String
+    pub mut user: String
+    pub mut bearer: String
+    pub mut user_agent: String
+    pub mut user_agent_set: Bool
+    pub mut referer: String
+    pub mut cookies_inline: List[String]
+    pub mut cookie_files: List[String]
+    pub mut cookie_jar: String
+    pub mut range: String
+    pub mut continue_at: String
+    pub mut follow_redirects: Bool
+    pub mut location_trusted: Bool
+    pub mut max_redirs: Int
+    pub mut post301: Bool
+    pub mut post302: Bool
+    pub mut post303: Bool
+    pub mut outputs: List[String]
+    pub mut remote_name: Bool
+    pub mut remote_name_all: Bool
+    pub mut remote_header_name: Bool
+    pub mut output_dir: String
+    pub mut create_dirs: Bool
+    pub mut include_headers: Bool
+    pub mut dump_header: String
+    pub mut silent: Bool
+    pub mut show_error: Bool
+    pub mut fail_on_http: Bool
+    pub mut fail_with_body: Bool
+    pub mut verbose: Bool
+    pub mut write_out: String
+    pub mut compressed: Bool
+    pub mut insecure: Bool
+    pub mut cacert: String
+    pub mut cert: String
+    pub mut key: String
+    pub mut tls_version: String
+    pub mut http_version: String
+    pub mut max_time_ms: Int
+    pub mut connect_timeout_ms: Int
+    pub mut proxy: String
+    pub mut proxy_user: String
+    pub mut noproxy: String
+    pub mut retry: Int
+    pub mut retry_delay_ms: Int
+    pub mut retry_max_time_ms: Int
+    pub mut retry_all_errors: Bool
+    pub mut retry_connrefused: Bool
+    pub mut proto_default: String
+    pub mut request_target: String
+    pub mut raw_output: Bool
+    pub mut no_keepalive: Bool
+    pub mut expect100_timeout_ms: Int
+
+# Top-level result of parsing argv (plus any -K config files).
+pub struct ParsedCli:
+    pub specs: List[RequestSpec]
+    pub show_help: Bool
+    pub show_version: Bool
+    pub disable_rc: Bool
+    pub error_msg: String
+
+# Construct a RequestSpec initialized to curl defaults.
+pub fn default_spec() -> RequestSpec:
+    urls: List[String] := []
+    headers: List[String] := []
+    data_parts: List[DataPart] := []
+    forms: List[FormSpec] := []
+    cookies_inline: List[String] := []
+    cookie_files: List[String] := []
+    outputs: List[String] := []
+    return RequestSpec(urls, "", false, false, headers, data_parts, false, forms, "", "", "", "", false, "", cookies_inline, cookie_files, "", "", "", false, false, 50, false, false, false, outputs, false, false, false, "", false, false, "", false, false, false, false, false, "", false, false, "", "", "", "", "1.1", 0, 0, "", "", "", 0, 0, 0, false, false, "http", "", false, false, 1000)
+
+# Parse a non-negative decimal seconds string ("5", "1.5", "0.25") into milliseconds.
+pub fn parse_seconds_to_ms(raw: String) -> Int!:
+    s := raw.trim()
+    if s == "":
+        fail "invalid duration: empty"
+    dot := s.index_of(".")
+    if dot < 0:
+        whole := parse_int(s) catch -1
+        if whole < 0:
+            fail "invalid duration: '{raw}'"
+        return whole * 1000
+    mut whole := 0
+    if dot > 0:
+        whole = parse_int(s.substring(0, dot)) catch -1
+        if whole < 0:
+            fail "invalid duration: '{raw}'"
+    frac_str := s.substring(dot + 1, s.len())
+    mut frac_ms := 0
+    mut scale := 100
+    mut i := 0
+    while i < frac_str.len():
+        c := ord(frac_str[i])
+        if c < 48 or c > 57:
+            fail "invalid duration: '{raw}'"
+        if scale > 0:
+            frac_ms = frac_ms + (c - 48) * scale
+            scale = scale / 10
+        i = i + 1
+    return whole * 1000 + frac_ms
+
+# Read all bytes from stdin (fd 0).
+pub fn read_stdin_bytes() -> Bytes:
+    buf := bytes.buffer()
+    defer buf.free()
+    while true:
+        chunk := term_read(0, 65536, -1)
+        if chunk.is_err:
+            break
+        if chunk.ok.len() == 0:
+            break
+        buf.write(chunk.ok) catch 0
+    return buf.bytes()
+
+# Parse a curl config file (-K / --config) into argv-style tokens.
+# Handles `#` comments, `key = value`, `-X POST`, and double-quoted strings with escapes.
+pub fn tokenize_config(text: String) -> List[String]:
+    mut tokens: List[String] := []
+    for raw_line in text.split("\n"):
+        line := raw_line.trim()
+        if line == "" or line.starts_with("#"):
+            continue
+        # Parse option token and optional value token on the line.
+        mut pos := 0
+        n := line.len()
+        # First token: option name (stops at whitespace, '=', or ':').
+        mut key_start := pos
+        while pos < n:
+            c := ord(line[pos])
+            if c == 32 or c == 9 or c == 61 or c == 58:
+                break
+            pos = pos + 1
+        raw_key := line.substring(key_start, pos)
+        if raw_key == "":
+            continue
+        mut opt_tok := raw_key
+        if not raw_key.starts_with("-"):
+            opt_tok = "--" + raw_key
+        tokens.push(opt_tok)
+
+        # Skip whitespace and optional '=' or ':' separator.
+        while pos < n and (ord(line[pos]) == 32 or ord(line[pos]) == 9):
+            pos = pos + 1
+        if pos < n and (ord(line[pos]) == 61 or ord(line[pos]) == 58):
+            pos = pos + 1
+            while pos < n and (ord(line[pos]) == 32 or ord(line[pos]) == 9):
+                pos = pos + 1
+
+        if pos >= n:
+            continue
+
+        # Parse parameter value (quoted or unquoted).
+        if ord(line[pos]) == 34:
+            pos = pos + 1
+            mut val_parts: List[String] := []
+            while pos < n:
+                ch := ord(line[pos])
+                if ch == 92 and pos + 1 < n:
+                    nxt := line[pos + 1]
+                    if nxt == "n":
+                        val_parts.push(chr(10))
+                    elif nxt == "r":
+                        val_parts.push(chr(13))
+                    elif nxt == "t":
+                        val_parts.push(chr(9))
+                    else:
+                        val_parts.push(nxt)
+                    pos = pos + 2
+                elif ch == 34:
+                    pos = pos + 1
+                    break
+                else:
+                    val_parts.push(line[pos])
+                    pos = pos + 1
+            tokens.push(val_parts.join(""))
+        else:
+            # Unquoted value runs to whitespace or end of line.
+            mut val_start := pos
+            while pos < n and ord(line[pos]) != 32 and ord(line[pos]) != 9:
+                pos = pos + 1
+            tokens.push(line.substring(val_start, pos))
+    return tokens
+
+# True when short flag character `ch` expects a parameter value.
+fn short_takes_value(ch: String) -> Bool:
+    return ch == "X" or ch == "H" or ch == "d" or ch == "F" or ch == "T" or ch == "o" or ch == "D" or ch == "u" or ch == "U" or ch == "A" or ch == "e" or ch == "b" or ch == "c" or ch == "m" or ch == "w" or ch == "x" or ch == "r" or ch == "C" or ch == "K" or ch == "E"
+
+# True when long option name (without leading "--") expects a parameter value.
+fn long_takes_value(name: String) -> Bool:
+    if name == "request" or name == "header" or name == "data" or name == "data-ascii" or name == "data-raw" or name == "data-binary" or name == "data-urlencode" or name == "json":
+        return true
+    if name == "form" or name == "form-string" or name == "upload-file" or name == "output" or name == "output-dir" or name == "dump-header":
+        return true
+    if name == "user" or name == "proxy-user" or name == "oauth2-bearer" or name == "user-agent" or name == "referer" or name == "cookie" or name == "cookie-jar":
+        return true
+    if name == "max-time" or name == "connect-timeout" or name == "max-redirs" or name == "write-out" or name == "proxy" or name == "noproxy":
+        return true
+    if name == "range" or name == "continue-at" or name == "cacert" or name == "cert" or name == "key" or name == "tls-max":
+        return true
+    if name == "retry" or name == "retry-delay" or name == "retry-max-time" or name == "proto-default" or name == "request-target":
+        return true
+    if name == "url" or name == "config" or name == "expect100-timeout" or name == "socks4" or name == "socks5" or name == "socks5-hostname":
+        return true
+    return false
+
+# Map a short option character to its canonical long option name.
+fn short_to_long(ch: String) -> String:
+    if ch == "X":
+        return "request"
+    if ch == "I":
+        return "head"
+    if ch == "G":
+        return "get"
+    if ch == "H":
+        return "header"
+    if ch == "d":
+        return "data"
+    if ch == "F":
+        return "form"
+    if ch == "T":
+        return "upload-file"
+    if ch == "o":
+        return "output"
+    if ch == "O":
+        return "remote-name"
+    if ch == "J":
+        return "remote-header-name"
+    if ch == "i":
+        return "include"
+    if ch == "D":
+        return "dump-header"
+    if ch == "s":
+        return "silent"
+    if ch == "S":
+        return "show-error"
+    if ch == "f":
+        return "fail"
+    if ch == "v":
+        return "verbose"
+    if ch == "L":
+        return "location"
+    if ch == "k":
+        return "insecure"
+    if ch == "u":
+        return "user"
+    if ch == "U":
+        return "proxy-user"
+    if ch == "1":
+        return "tlsv1"
+    if ch == "2":
+        return "sslv2"
+    if ch == "3":
+        return "sslv3"
+    if ch == "A":
+        return "user-agent"
+    if ch == "e":
+        return "referer"
+    if ch == "b":
+        return "cookie"
+    if ch == "c":
+        return "cookie-jar"
+    if ch == "m":
+        return "max-time"
+    if ch == "w":
+        return "write-out"
+    if ch == "x":
+        return "proxy"
+    if ch == "r":
+        return "range"
+    if ch == "C":
+        return "continue-at"
+    if ch == "K":
+        return "config"
+    if ch == "E":
+        return "cert"
+    if ch == "h":
+        return "help"
+    if ch == "V":
+        return "version"
+    if ch == "q":
+        return "disable"
+    if ch == ":":
+        return "next"
+    if ch == "N":
+        return "no-buffer"
+    if ch == "#":
+        return "progress-bar"
+    if ch == "g":
+        return "globoff"
+    if ch == "4":
+        return "ipv4"
+    if ch == "0":
+        return "http1.0"
+    return ""
+
+# Mutable parser state shared across argv and -K config expansions.
+struct ParseState:
+    mut specs: List[RequestSpec]
+    mut cur: RequestSpec
+    mut show_help: Bool
+    mut show_version: Bool
+    mut disable_rc: Bool
+    mut config_depth: Int
+
+fn apply_option(st: ParseState, name: String, value: String) -> Int!:
+    cur := st.cur
+    if name == "help":
+        st.show_help = true
+        return 0
+    if name == "version":
+        st.show_version = true
+        return 0
+    if name == "disable":
+        st.disable_rc = true
+        return 0
+    if name == "next":
+        st.specs.push(st.cur)
+        st.cur = default_spec()
+        return 0
+    if name == "url":
+        cur.urls.push(value)
+        return 0
+    if name == "request":
+        cur.method = value
+        return 0
+    if name == "head":
+        cur.head_only = true
+        return 0
+    if name == "no-head":
+        cur.head_only = false
+        return 0
+    if name == "get":
+        cur.use_get = true
+        return 0
+    if name == "no-get":
+        cur.use_get = false
+        return 0
+    if name == "header":
+        if value.starts_with("@"):
+            hdr_path := value.substring(1, value.len())
+            raw := fs.read(hdr_path)!
+            for line in raw.split("\n"):
+                trimmed := line.trim()
+                if trimmed != "":
+                    cur.headers.push(trimmed)
+        else:
+            cur.headers.push(value)
+        return 0
+    if name == "data" or name == "data-ascii":
+        cur.data_parts.push(DataPart("ascii", value))
+        return 0
+    if name == "data-raw":
+        cur.data_parts.push(DataPart("raw", value))
+        return 0
+    if name == "data-binary":
+        cur.data_parts.push(DataPart("binary", value))
+        return 0
+    if name == "data-urlencode":
+        cur.data_parts.push(DataPart("urlencode", value))
+        return 0
+    if name == "json":
+        cur.is_json = true
+        cur.data_parts.push(DataPart("json", value))
+        return 0
+    if name == "form":
+        cur.forms.push(FormSpec(value, false))
+        return 0
+    if name == "form-string":
+        cur.forms.push(FormSpec(value, true))
+        return 0
+    if name == "upload-file":
+        cur.upload_file = value
+        return 0
+    if name == "user":
+        cur.user = value
+        return 0
+    if name == "oauth2-bearer":
+        cur.bearer = value
+        return 0
+    if name == "user-agent":
+        cur.user_agent = value
+        cur.user_agent_set = true
+        return 0
+    if name == "referer":
+        cur.referer = value
+        return 0
+    if name == "cookie":
+        if value.contains("="):
+            cur.cookies_inline.push(value)
+        else:
+            cur.cookie_files.push(value)
+        return 0
+    if name == "cookie-jar":
+        cur.cookie_jar = value
+        return 0
+    if name == "range":
+        cur.range = value
+        return 0
+    if name == "continue-at":
+        cur.continue_at = value
+        return 0
+    if name == "location":
+        cur.follow_redirects = true
+        return 0
+    if name == "no-location":
+        cur.follow_redirects = false
+        return 0
+    if name == "location-trusted":
+        cur.follow_redirects = true
+        cur.location_trusted = true
+        return 0
+    if name == "max-redirs":
+        n := parse_int(value) catch -999999
+        if n == -999999:
+            fail "invalid --max-redirs value: '{value}'"
+        cur.max_redirs = n
+        return 0
+    if name == "post301":
+        cur.post301 = true
+        return 0
+    if name == "post302":
+        cur.post302 = true
+        return 0
+    if name == "post303":
+        cur.post303 = true
+        return 0
+    if name == "output":
+        cur.outputs.push(value)
+        return 0
+    if name == "remote-name":
+        cur.remote_name = true
+        return 0
+    if name == "no-remote-name":
+        cur.remote_name = false
+        return 0
+    if name == "remote-name-all":
+        cur.remote_name_all = true
+        return 0
+    if name == "remote-header-name":
+        cur.remote_header_name = true
+        return 0
+    if name == "output-dir":
+        cur.output_dir = value
+        return 0
+    if name == "create-dirs":
+        cur.create_dirs = true
+        return 0
+    if name == "include":
+        cur.include_headers = true
+        return 0
+    if name == "no-include":
+        cur.include_headers = false
+        return 0
+    if name == "dump-header":
+        cur.dump_header = value
+        return 0
+    if name == "silent":
+        cur.silent = true
+        return 0
+    if name == "no-silent":
+        cur.silent = false
+        return 0
+    if name == "show-error":
+        cur.show_error = true
+        return 0
+    if name == "no-show-error":
+        cur.show_error = false
+        return 0
+    if name == "fail":
+        cur.fail_on_http = true
+        return 0
+    if name == "no-fail":
+        cur.fail_on_http = false
+        return 0
+    if name == "fail-with-body":
+        cur.fail_with_body = true
+        return 0
+    if name == "verbose":
+        cur.verbose = true
+        return 0
+    if name == "no-verbose":
+        cur.verbose = false
+        return 0
+    if name == "write-out":
+        cur.write_out = value
+        return 0
+    if name == "compressed":
+        cur.compressed = true
+        return 0
+    if name == "no-compressed":
+        cur.compressed = false
+        return 0
+    if name == "insecure":
+        cur.insecure = true
+        return 0
+    if name == "no-insecure":
+        cur.insecure = false
+        return 0
+    if name == "cacert":
+        cur.cacert = value
+        return 0
+    if name == "cert":
+        cur.cert = value
+        return 0
+    if name == "key":
+        cur.key = value
+        return 0
+    if name == "tlsv1.2":
+        cur.tls_version = "1.2"
+        return 0
+    if name == "tlsv1.3":
+        cur.tls_version = "1.3"
+        return 0
+    if name == "tls-max":
+        if value == "1.2" or value == "1.3":
+            cur.tls_version = value
+            return 0
+        fail "unsupported --tls-max version: '{value}' (supported: 1.2, 1.3)"
+    if name == "http1.1":
+        cur.http_version = "1.1"
+        return 0
+    if name == "http2":
+        cur.http_version = "2"
+        return 0
+    if name == "http2-prior-knowledge":
+        cur.http_version = "2-prior"
+        return 0
+    if name == "max-time":
+        cur.max_time_ms = parse_seconds_to_ms(value)!
+        return 0
+    if name == "connect-timeout":
+        cur.connect_timeout_ms = parse_seconds_to_ms(value)!
+        return 0
+    if name == "proxy":
+        cur.proxy = value
+        return 0
+    if name == "proxy-user":
+        cur.proxy_user = value
+        return 0
+    if name == "noproxy":
+        cur.noproxy = value
+        return 0
+    if name == "tlsv1" or name == "tlsv1.0" or name == "tlsv1.1" or name == "sslv2" or name == "sslv3":
+        fail "option --{name}: TLS versions older than 1.2 are not supported (use --tlsv1.2 or --tlsv1.3)"
+    if name == "http3" or name == "http3-only":
+        fail "option --{name}: HTTP/3 (QUIC) is not supported yet"
+    if name == "socks4" or name == "socks5" or name == "socks5-hostname":
+        fail "option --{name}: SOCKS proxies are not supported yet (use an HTTP proxy with -x)"
+    if name == "retry":
+        n := parse_int(value) catch -1
+        if n < 0:
+            fail "invalid --retry value: '{value}'"
+        cur.retry = n
+        return 0
+    if name == "retry-delay":
+        cur.retry_delay_ms = parse_seconds_to_ms(value)!
+        return 0
+    if name == "retry-max-time":
+        cur.retry_max_time_ms = parse_seconds_to_ms(value)!
+        return 0
+    if name == "retry-all-errors":
+        cur.retry_all_errors = true
+        return 0
+    if name == "retry-connrefused":
+        cur.retry_connrefused = true
+        return 0
+    if name == "proto-default":
+        cur.proto_default = value.to_lower()
+        return 0
+    if name == "request-target":
+        cur.request_target = value
+        return 0
+    if name == "raw":
+        cur.raw_output = true
+        return 0
+    if name == "no-keepalive":
+        cur.no_keepalive = true
+        return 0
+    if name == "expect100-timeout":
+        cur.expect100_timeout_ms = parse_seconds_to_ms(value)!
+        return 0
+    if name == "config":
+        if st.config_depth >= 8:
+            fail "config file nesting too deep"
+        mut content := ""
+        if value == "-":
+            content = read_stdin_bytes().to_string_utf8() catch ""
+        else:
+            content = fs.read(value)!
+        st.config_depth = st.config_depth + 1
+        parse_tokens(st, tokenize_config(content))!
+        st.config_depth = st.config_depth - 1
+        return 0
+    # Harmless curl script-compatibility flags accepted as no-ops.
+    if name == "progress-bar" or name == "no-progress-meter" or name == "no-buffer" or name == "globoff" or name == "ipv4" or name == "tcp-nodelay" or name == "http1.0" or name == "anyauth" or name == "basic":
+        return 0
+    fail "option --{name}: unknown option"
+
+fn parse_tokens(st: ParseState, tokens: List[String]) -> Int!:
+    mut i := 0
+    mut positional_only := false
+    while i < tokens.len():
+        tok := tokens[i]
+        if positional_only:
+            st.cur.urls.push(tok)
+            i = i + 1
+            continue
+        if tok == "--":
+            positional_only = true
+            i = i + 1
+            continue
+        if tok.starts_with("--"):
+            body := tok.substring(2, tok.len())
+            eq := body.index_of("=")
+            if eq >= 0:
+                opt_name := body.substring(0, eq)
+                opt_val := body.substring(eq + 1, body.len())
+                apply_option(st, opt_name, opt_val)!
+                i = i + 1
+            else:
+                if long_takes_value(body):
+                    if i + 1 >= tokens.len():
+                        fail "option --{body}: requires parameter"
+                    apply_option(st, body, tokens[i + 1])!
+                    i = i + 2
+                else:
+                    apply_option(st, body, "")!
+                    i = i + 1
+            continue
+        if tok.starts_with("-") and tok.len() > 1:
+            mut j := 1
+            while j < tok.len():
+                ch := tok[j]
+                long_name := short_to_long(ch)
+                if long_name == "":
+                    fail "option -{ch}: unknown option"
+                if short_takes_value(ch):
+                    if j + 1 < tok.len():
+                        # Attached parameter value, e.g. -XPOST, -oout.txt, -H"Foo: 1".
+                        attached := tok.substring(j + 1, tok.len())
+                        apply_option(st, long_name, attached)!
+                        j = tok.len()
+                    else:
+                        if i + 1 >= tokens.len():
+                            fail "option -{ch}: requires parameter"
+                        apply_option(st, long_name, tokens[i + 1])!
+                        i = i + 1
+                        j = tok.len()
+                else:
+                    apply_option(st, long_name, "")!
+                    j = j + 1
+            i = i + 1
+            continue
+        # Bare positional argument is a URL.
+        st.cur.urls.push(tok)
+        i = i + 1
+    return 0
+
+# Parse full CLI arguments (including argv[0] program name).
+# Loads ~/.purlrc when present unless -q / --disable is the first option.
+pub fn parse_cli(argv: List[String]) -> ParsedCli:
+    mut raw_tokens: List[String] := []
+    mut idx := 1
+    while idx < argv.len():
+        raw_tokens.push(argv[idx])
+        idx = idx + 1
+
+    # Check curl's -q / --disable rule: disables rc file when given as first arg.
+    mut skip_rc := false
+    if raw_tokens.len() > 0:
+        first := raw_tokens[0]
+        if first == "-q" or first == "--disable" or first == "-h" or first == "--help" or first == "-V" or first == "--version":
+            skip_rc = true
+
+    specs_init: List[RequestSpec] := []
+    st := ParseState(specs_init, default_spec(), false, false, skip_rc, 0)
+
+    if not skip_rc:
+        home := os.home_dir()
+        if home != "":
+            rc_path := path_mod.join(home, ".purlrc")
+            if fs.is_file(rc_path):
+                rc_text := fs.read(rc_path) catch ""
+                if rc_text != "":
+                    rc_res := parse_tokens(st, tokenize_config(rc_text))
+                    if rc_res.is_err:
+                        return ParsedCli([], false, false, false, rc_res.err)
+
+    res := parse_tokens(st, raw_tokens)
+    if res.is_err:
+        return ParsedCli([], false, false, st.disable_rc, res.err)
+
+    st.specs.push(st.cur)
+    return ParsedCli(st.specs, st.show_help, st.show_version, st.disable_rc, "")
+
+# Parse raw option tokens without argv[0] and without reading ~/.purlrc.
+# Intended for unit tests.
+pub fn parse_tokens_standalone(tokens: List[String]) -> ParsedCli:
+    specs_init: List[RequestSpec] := []
+    st := ParseState(specs_init, default_spec(), false, false, true, 0)
+    res := parse_tokens(st, tokens)
+    if res.is_err:
+        return ParsedCli([], false, false, true, res.err)
+    st.specs.push(st.cur)
+    return ParsedCli(st.specs, st.show_help, st.show_version, true, "")

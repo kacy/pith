@@ -133,7 +133,9 @@ fn main() -> Int!:
     # every client reads and writes on a task of its own from here.
     mut clients: List[Task[Seen!]] := []
     for name, i in names:
-        clients.push(spawn chat(name, sessions[i], script(name)))
+        # taken here: a spawn evaluates its arguments on the new task
+        session := sessions[i]
+        clients.push(spawn chat(name, session, script(name)))
     mut transcripts: List[String] := []
     for name, i in names:
         seen := (await clients[i])!

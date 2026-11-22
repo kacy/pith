@@ -1,0 +1,24 @@
+# a module global holding a list, in a program that spawns, may not be
+# changed in place through any name: directly though it is not `mut`
+# (E309), through a local alias (E309), and through a handle a function or a
+# task returns (E309)
+items: List[String] := []
+names: List[String] := []
+table: List[String] := []
+
+fn get_table() -> List[String]:
+    return table
+
+fn reader() -> Int:
+    return items.len() + names.len() + table.len()
+
+fn main() -> Int!:
+    t := spawn reader()
+    items.push("direct")
+    mut xs := names
+    xs.push("alias")
+    u := spawn get_table()
+    ys := await u
+    ys.push("returned")
+    print("{await t}")
+    return 0

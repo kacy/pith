@@ -1,0 +1,13 @@
+# a spawn evaluates its arguments on the new task, so a copy made in the
+# call reads the list there while this task keeps pushing to it (E248)
+from std.collections import copy_list
+
+fn total(xs: List[String]) -> Int:
+    return xs.len()
+
+fn main() -> Int!:
+    mut xs: List[String] := ["a"]
+    t := spawn total(copy_list(xs))
+    xs.push("b")
+    print("{await t}")
+    return 0

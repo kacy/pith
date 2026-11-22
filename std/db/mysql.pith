@@ -135,11 +135,22 @@ fn pin_connection(pool_handle: Int) -> Int!:
         handle := pins.len() - 1
         return handle
 
-# the pinned connection for a handle. only call it while the pin is live (its
-# callers all guard with pin_finished first); a finished pin has cleared it.
-fn pin_conn(handle: Int) -> mysql.Conn:
+# take the pinned connection out of its pin for one statement. only call it
+# while the pin is live (its callers all guard with pin_finished first); a
+# finished pin has cleared it. the pin holds no connection until pin_put hands
+# it back, so two tasks using one Tx or Stmt at once never share it: the
+# second stops on the empty pin instead.
+fn pin_take(handle: Int) -> mysql.Conn:
     locked pins_mu:
-        return pins[handle].conn.value()
+        found := pins[handle].conn
+        pins[handle].conn = none
+        return found.value()
+
+# hand the connection back to its pin once the statement is done. the pin
+# keeps it, so the caller does not use it again.
+fn pin_put(handle: Int, conn: mysql.Conn):
+    locked pins_mu:
+        pins[handle].conn = conn
 
 # whether the pinned connection has ended (committed, closed, or discarded).
 fn pin_finished(handle: Int) -> Bool:
@@ -228,7 +239,9 @@ impl Tx:
     fn run_query(text: String, params: List[String]) -> List[sql.Row]!:
         if pin_finished(self.handle):
             fail "db.mysql: transaction already finished"
-        attempt := gather(pin_conn(self.handle), text, params)
+        conn := pin_take(self.handle)
+        attempt := gather(conn, text, params)
+        pin_put(self.handle, conn)
         if attempt.is_err:
             pin_mark_broken(self.handle)
             fail attempt.err
@@ -237,7 +250,9 @@ impl Tx:
     fn run_exec(text: String, params: List[String]) -> db.ExecResult!:
         if pin_finished(self.handle):
             fail "db.mysql: transaction already finished"
-        attempt := apply(pin_conn(self.handle), text, params)
+        conn := pin_take(self.handle)
+        attempt := apply(conn, text, params)
+        pin_put(self.handle, conn)
         if attempt.is_err:
             pin_mark_broken(self.handle)
             fail attempt.err
@@ -252,7 +267,9 @@ impl Tx:
         if pin_broken(self.handle):
             pin_discard(self.handle)
             fail "db.mysql: transaction has a failed statement; rolled back"
-        committed := mysql.query(pin_conn(self.handle), "commit")
+        conn := pin_take(self.handle)
+        committed := mysql.query(conn, "commit")
+        pin_put(self.handle, conn)
         if committed.is_err:
             pin_discard(self.handle)
             fail committed.err
@@ -269,7 +286,9 @@ impl Tx:
         if pin_broken(self.handle):
             pin_discard(self.handle)
             return
-        rolled := mysql.query(pin_conn(self.handle), "rollback")
+        conn := pin_take(self.handle)
+        rolled := mysql.query(conn, "rollback")
+        pin_put(self.handle, conn)
         if rolled.is_err:
             pin_discard(self.handle)
             return
@@ -308,7 +327,9 @@ impl Stmt:
     fn run_query(params: List[String]) -> List[sql.Row]!:
         if pin_finished(self.handle):
             fail "db.mysql: prepared statement already closed"
-        attempt := mysql.query_prepared(pin_conn(self.handle), prepared_stmt(self.slot), params)
+        conn := pin_take(self.handle)
+        attempt := mysql.query_prepared(conn, prepared_stmt(self.slot), params)
+        pin_put(self.handle, conn)
         if attempt.is_err:
             pin_mark_broken(self.handle)
             fail attempt.err
@@ -320,7 +341,9 @@ impl Stmt:
     fn run_exec(params: List[String]) -> db.ExecResult!:
         if pin_finished(self.handle):
             fail "db.mysql: prepared statement already closed"
-        attempt := mysql.exec_prepared_info(pin_conn(self.handle), prepared_stmt(self.slot), params)
+        conn := pin_take(self.handle)
+        attempt := mysql.exec_prepared_info(conn, prepared_stmt(self.slot), params)
+        pin_put(self.handle, conn)
         if attempt.is_err:
             pin_mark_broken(self.handle)
             fail attempt.err
@@ -336,7 +359,9 @@ impl Stmt:
         if pin_broken(self.handle):
             pin_discard(self.handle)
             return
-        freed := mysql.close_stmt(pin_conn(self.handle), prepared_stmt(self.slot))
+        conn := pin_take(self.handle)
+        freed := mysql.close_stmt(conn, prepared_stmt(self.slot))
+        pin_put(self.handle, conn)
         if freed.is_err:
             pin_discard(self.handle)
             return
@@ -416,7 +441,9 @@ impl Db:
         # if BEGIN fails the pinned connection never becomes a live transaction,
         # so discard it; on success the Tx keeps the pin and this does not run.
         errdefer pin_discard(handle)
-        started := mysql.query(pin_conn(handle), "begin")
+        conn := pin_take(handle)
+        started := mysql.query(conn, "begin")
+        pin_put(handle, conn)
         if started.is_err:
             fail started.err
         return Tx(handle: handle)
@@ -427,7 +454,9 @@ impl Db:
     pub fn prepare(text: String) -> Stmt!:
         handle := pin_connection(self.handle)!
         errdefer pin_discard(handle)
-        attempt := mysql.prepare(pin_conn(handle), text)
+        conn := pin_take(handle)
+        attempt := mysql.prepare(conn, text)
+        pin_put(handle, conn)
         if attempt.is_err:
             fail attempt.err
         slot := register_prepared(attempt.ok)

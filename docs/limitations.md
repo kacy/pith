@@ -205,12 +205,18 @@ stale and a fix to it is welcome.
   share its worker. building with `PITH_GREEN_PREEMPT=0` removes the check,
   and with it the guarantee. the preemption request flag is process-global, so
   every running task takes a slow path when any one task overruns (#1089).
-- **the closure sharing rule reads types, so a generic body is judged by its
-  annotations**. a closure made inside a generic function is checked against
-  the declared types of what it captures: a parameter or local annotated as a
-  list, a map or a set is refused, but an unannotated local or a struct there
-  is not judged (E248). a call through a function value is followed to any
-  closure parameter and any closure result, not to the one closure it calls.
+- **a call through a function value is followed to every closure**. the
+  sharing rules (E248, E276) send its arguments to any closure parameter and
+  take its result from any closure result, not from the one closure it
+  calls, so an argument passed through a function value counts as kept where
+  the checker cannot follow it. `std.net.tls`'s `config_edit` stores a copy
+  of the record its edit closure changed for this reason.
+- **the sharing rules are flow-insensitive within a function**. a local
+  counts as used again after a handoff when its name appears later in the
+  source, outside another branch of the same `if` or `match` and before any
+  `return` that follows the handoff, and as changed when it is changed
+  anywhere in the function. reorder the code, or read what is needed before
+  the handoff.
 - **a blocked pipe read under `PITH_GREEN=0` ignores a close**. closing a
   child's pipe from another task fails every later call on the handle, but a
   read already blocked in the kernel returns only when the child writes or

@@ -1,0 +1,29 @@
+# a call result is fresh only when it holds no buffer the caller still
+# reaches: a function that returns its parameter (E248), and one that builds a
+# struct around it (E248)
+struct Box:
+    items: List[String]
+
+fn id(x: List[String]) -> List[String]:
+    return x
+
+fn wrap(x: List[String]) -> Box:
+    return Box(items: x)
+
+fn worker(xs: List[String]) -> Int:
+    xs.push("task")
+    return xs.len()
+
+fn boxed(b: Box) -> Int:
+    b.items.push("task")
+    return b.items.len()
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    t := spawn worker(id(xs))
+    u := spawn boxed(wrap(xs))
+    xs.push("main")
+    n := await t
+    m := await u
+    print("{n} {m}")
+    return 0

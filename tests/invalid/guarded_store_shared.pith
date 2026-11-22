@@ -1,0 +1,27 @@
+# a value stored into a guarded collection must be fresh: a list the scope
+# uses again after the block (E276), and a parameter of a function whose
+# caller uses the argument again (E276)
+guard mu:
+    mut cache: List[List[String]] := []
+
+fn keep(v: List[String]):
+    locked mu:
+        cache.push(v)
+
+fn worker() -> Int:
+    locked mu:
+        if cache.len() > 0:
+            cache[0].push("task")
+    return 0
+
+fn main() -> Int!:
+    mut v: List[String] := []
+    locked mu:
+        cache.push(v)
+    mut w: List[String] := []
+    keep(w)
+    t := spawn worker()
+    v.push("main")
+    w.push("main")
+    print("{await t}")
+    return 0

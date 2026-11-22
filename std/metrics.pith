@@ -282,10 +282,11 @@ fn default_histogram_buckets() -> List[Float]:
 fn buckets_for(bare: String) -> List[Float]:
     shard := shard_of(bare)
     locked shard_mu[shard]:
-        mut out := default_histogram_buckets()
         if histogram_bucket_defs[shard].contains_key(bare):
-            out = histogram_bucket_defs[shard][bare]
-        return out
+            # a copy: the registered list is guarded
+            found := histogram_bucket_defs[shard][bare]
+            return found.slice(0, found.len())
+        return default_histogram_buckets()
 
 # register custom bucket boundaries for a bare metric, first call wins so a
 # metric's boundaries stay stable once observations start. it hands back the

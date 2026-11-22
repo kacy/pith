@@ -525,10 +525,34 @@ os threads. reference counts are atomic, but a list, map, or set is an
 unsynchronized buffer behind a handle, so passing one the current scope still
 holds lets both mutate the same buffer. the same holds for a value sent
 through a channel: the receiver gets the handle, not a copy, so `send` and
-`try_send` are checked like a spawn's arguments.
-hand the task a copy, build the value in the call, or use an atomic cell for
-a shared scalar. a fresh collection — a literal, a copy, a call result — is
-not shared and is allowed.
+`try_send` are checked like a spawn's arguments. a tuple, an optional or an
+enum payload holding a collection counts as the collection.
+
+a value may cross only when nothing else holds what it holds:
+
+- a value built in the call is fresh when what it is built from is: a
+  literal, a struct or an enum variant built from fresh parts, or the result
+  of a function whose result holds no buffer of its arguments, of a global or
+  of anything the checker cannot follow. `Box(items: xs)` holds `xs`, and so
+  does the result of a function that returns its parameter or builds a struct
+  around it. a copy is fresh as far as it copies: `copy_list` of a
+  `List[Int]` is fresh, while a copy of a `List[List[Int]]` shares the inner
+  lists.
+- a local is moved when the scope does not use it again and nothing else
+  holds it: no other local, field or closure, and no loop or closure around
+  the handoff that the local was declared outside of, since that hands the
+  same buffer over once per pass. a use in another branch of the same `if` or
+  `match`, or after a `return` that follows the handoff, does not count; a
+  use in a closure, a `defer` or an `errdefer` does, wherever it is written.
+- a parameter can be moved the same way. the function then keeps what it is
+  handed, and each call to it is judged as a handoff of its argument.
+
+a spawn evaluates its arguments on the new task, so an argument that reads a
+local, such as `spawn total(copy_list(xs))`, reads `xs` there while this
+scope may change it. it is refused unless the local is moved or nothing
+changes it; make the copy before the spawn and hand over the copy. a field
+path or an element (`acct.inbox`, `xs[0]`) is judged by its type, since the
+value that holds it still does.
 
 an interface value can hold any type that implements its interface, so a held
 one is refused when any implementing type reaches a collection outside a
@@ -537,29 +561,37 @@ message names the type and field (`Bag.items`). a conversion written in the
 call (`spawn work(Sq(s: 2))`) is fresh and allowed.
 
 ```
-error[E248]: a spawned task cannot take a list this scope still holds; both threads would mutate the same buffer
+error[E248]: a spawned task cannot take this value: it shares a buffer with 'data', which this scope uses again, and both tasks would reach it
   6 |     t := spawn worker(data)
                             ^
+  fix: hand over a value nothing else holds: build it in the call, or move a local the scope does not use again
+```
+
+```
+error[E248]: a spawned task evaluates its arguments itself, so this one reads a buffer it shares with 'xs', which this scope uses again, while this scope may still change it
+  10 |     t := spawn total(copy_list(xs))
+                                     ^
+  fix: compute the value before the spawn and hand over the result, or move a local the scope does not use again
 ```
 
 a module global is refused too, and the message names it. the whole program
 holds a global, so a task handed one shares its buffer with every other task
 that reads it. a task can read the global itself without taking it as an
-argument; give it a copy when it needs its own list, and keep a global that
-tasks write in a `guard` block (docs/concurrency.md).
+argument, and keep a global that tasks write in a `guard` block
+(docs/concurrency.md).
 
 ```
 error[E248]: a spawned task cannot take the module global 'items', a list every task can reach; both would mutate the same buffer
   10 |     t := spawn total(items)
                             ^
-  fix: pass a copy (copy_list(items)), or let the task read the global itself and keep a global that tasks write in a `guard` block
+  fix: let the task read the global itself, and keep a global that tasks write in a `guard` block
 ```
 
 a struct argument is refused the same way when one of its fields reaches a
 list, a map or a set outside a `guard` block, directly or through a nested
-struct or optional struct field. move the field into a `guard` block, or build
-the struct in the spawn's arguments, or the send's, so the other task holds
-the only reference.
+struct, an optional, a tuple or an enum payload. move the field into a
+`guard` block, or build the struct from fresh parts in the call, or move a
+local holding it, so the other task holds the only reference.
 
 ```
 error[E248]: a spawned task cannot take this Account: its field 'inbox.messages' is a collection outside a `guard` block, and both threads would reach the same buffer
@@ -598,7 +630,7 @@ and the first assignment the program makes to that field.
 
 ```
 error[E248]: a spawned task cannot take this Holder: its field 'name' is reassigned at app.pith:9, and a write while the other task reads it frees the value being read
-  17 |     a := spawn writer(h, 10)
+  17 |     a := spawn writer(app.holder, 10)
                              ^
   fix: move 'name' into a `guard` block, stop reassigning it once the value is built, or hand over a copy built in the call
 ```
@@ -616,9 +648,12 @@ that crosses to a task, a capture of another closure that does, or when it
 flows into a parameter, a field, a local or a function result that reaches
 one of those. such a closure may not capture a collection, or a struct that
 reaches one outside a `guard` block or reaches a counted field some code
-reassigns. a closure that stays on the task that made it, such as one passed
-to `map`, may capture anything. the message names the capture and the path
-to the task.
+reassigns. a closure a spawned function returns was made on that task and
+runs on the one that awaits it, so it is judged the same way. a closure made
+in a generic function is judged by the types its captures take in each
+specialization the program uses. a closure that stays on the task that made
+it, such as one passed to `map`, may capture anything. the message names the
+capture and the path to the task.
 
 ```
 error[E248]: a closure that reaches another task cannot capture 'seen' (a list), which the scope that made the closure still holds; the closure reaches the task through parameter 'handler' of 'get', then parameter 'handler' of 'handle', then ... a spawn at std/web.pith:758
@@ -630,8 +665,7 @@ error[E248]: a closure that reaches another task cannot capture 'seen' (a list),
 request handlers are the usual case: `std.web`, `std.net.http`,
 `std.net.http2` and `std.net.grpc` run a handler on the task serving each
 connection. keep state the handler changes in a `guard` block, and state it
-only reads in a `frozen` field. a generic function's body is not judged, since
-its types are known only per instance. a builder that sets a field after building the
+only reads in a `frozen` field. a builder that sets a field after building the
 struct unsettles the field too, so build the struct with every field in the
 constructor call, as `std.net.http`'s `Client.copy_with` does.
 
@@ -1144,6 +1178,21 @@ a global, `mut` or not, is also refused when its value reaches a counted field
 that some code reassigns (see E248): every task can reach the global, and the
 write frees the value another task reads.
 
+a global holding a list, a map, a set or a struct that reaches one, `mut` or
+not, may not be changed in place through any name either: not directly
+(`items.push(x)` on a global that is not `mut`), not through a local it was
+copied into, not through a handle a function or a task returns, and not by a
+function it is passed to. nor may its buffer be stored into a value a caller
+handed in, or go where the checker cannot follow it. a global only read needs
+no lock.
+
+```
+error[E309]: 'names' is a module global every task can reach, and its buffer is changed in place at app.pith:19, in a program that spawns tasks
+  6 | names: List[String] := []
+                             ^
+  fix: declare it in a `guard` block, mark it `threadlocal`, or change a copy
+```
+
 the rule covers the whole program the file loads, so a library global is
 reported when a program that spawns uses it. a program spawns when a function
 in the entry file holds a `spawn`, or calls one that does. a call is resolved
@@ -1152,8 +1201,7 @@ method on a receiver whose type does not say whose method it is, such as an
 interface, counts every method of that name. a call through a function value
 is not followed. a write is an assignment rooted at the global (`g = x`,
 `g[k] = x`, `g.f = x`) or a call of a mutating method on it (`push`, `insert`,
-`remove`, `clear` and the like). a write made through a function that takes the
-collection as an argument is not seen.
+`remove`, `clear` and the like), through the global's name or any other.
 
 a global that is built once and only read afterwards needs no lock. build it in
 its own initializer, `catalog := seeded()`, rather than in a function called
@@ -1339,6 +1387,19 @@ one of its elements, or calling a method that changes it in place (`push`,
 refused. build a new struct with the changed value, or drop `frozen` and keep
 the field in a `guard` block.
 
+in a program that spawns tasks, a frozen field's value may not be changed
+through another name either: a local the value was copied into, a parameter
+it was passed as, or a value that holds it. nor may it be stored into a value
+a caller handed in, or go where the checker cannot follow it, such as a
+closure's argument.
+
+```
+error[E275]: 'rows' is frozen, and its value is changed in place through another name, while another task may be reading it
+  13 |     xs.push("main")
+           ^
+  fix: change a copy, or move the field into a `guard` block
+```
+
 ```
 error[E275]: 'routes' is frozen, so it cannot be changed in place
   8 |     r.routes.push("/admin")
@@ -1358,15 +1419,38 @@ a name bound inside the block to a guarded value is guarded too, for the rest
 of the block: a local bound to it (`list := self.idle[key]`), a loop variable
 over it, an `if let` or `while let` binding of it, the result of a builtin
 accessor on it (`get`, `first`, `last`, `unwrap`, `unwrap_or`, `expect`,
-`values`), and the result of a function that returns one of its parameters
-when a guarded value is passed in. storing such a value back under the same
-guard (`rooms[name] = room`) is not an escape. a copy (`list.slice(0,
-list.len())`, `copy_list`) is a new buffer and may leave.
+`value`, `values`), and the result of a function that returns one of its
+parameters when a guarded value is passed in. a value that holds a guarded
+buffer some other way, such as a struct a call builds around it, may not
+leave the block either. storing such a value back under the same guard
+(`rooms[name] = room`) is not an escape. a copy (`list.slice(0,
+list.len())`, or `copy_list` of a list whose elements hold no buffer) is a
+new buffer and may leave.
 
 a block that moves the value out and gives the field a new one, `out =
 self.items` then `self.items = []`, is a take and is allowed, since the guard
-no longer reaches the old buffer. a value that never changes after it is
-built belongs in a `frozen` field instead of a guard.
+no longer reaches the old buffer. so is reading an element and removing it
+in the same block (`v = xs[k]` then `xs.remove(k)`), and `take` on a guarded
+map. a value that never changes after it is built belongs in a `frozen`
+field instead of a guard.
+
+a value stored into a guarded collection is reached under the lock from then
+on, so nothing outside the lock may still hold it. it must be fresh or a
+moved local, as for a value handed to another task (see E248): built in the
+call, or a local the scope does not use again after the store. a parameter
+stored this way makes each call judge its argument the same way, so a pool's
+`release(conn)` refuses a caller that keeps using `conn`. a guarded field set
+when its struct is built, and a guarded global's initializer, are judged as
+stores. a value read under the same guard may be stored back; a guard that
+holds such a value may then hold one buffer twice, so a value taken out of it
+is not counted as fresh.
+
+```
+error[E276]: 'cache' is guarded, and this stores a value that shares a buffer with 'v', which this scope uses again, so the buffer is reached outside the lock
+  16 |         cache.push(v)
+                          ^
+  fix: store a copy, or build the value inside the block
+```
 
 the same applies to a guarded struct, optional, tuple or enum whose fields
 reach a counted field that some code reassigns (see E248). a task that writes

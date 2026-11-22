@@ -1,0 +1,41 @@
+# a literal built in a spawn's arguments or a send holds the buffers of what
+# it is built from: a struct, a list, an interface value, and an enum payload
+# around a list the scope uses again (E248)
+struct Box:
+    items: List[String]
+
+interface Sink:
+    fn put(s: String) -> Int
+
+impl Sink for Box:
+    fn put(s: String) -> Int:
+        self.items.push(s)
+        return self.items.len()
+
+enum Msg:
+    Data(List[String])
+    Empty
+
+fn boxed(b: Box) -> Int:
+    return b.items.len()
+
+fn nested(xss: List[List[String]]) -> Int:
+    return xss.len()
+
+fn sink(k: Sink) -> Int:
+    return k.put("task")
+
+fn message(m: Msg) -> Int:
+    return 0
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    a := spawn boxed(Box(items: xs))
+    b := spawn nested([xs])
+    c := spawn sink(Box(items: xs))
+    d := spawn message(Msg.Data(xs))
+    ch := Channel[Box](1)
+    ch.send(Box(items: xs))
+    xs.push("main")
+    print("{await a} {await b} {await c} {await d}")
+    return 0

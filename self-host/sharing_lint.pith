@@ -11,9 +11,10 @@
 # shared_field_errors in checker.pith). this pass reports the rest as errors,
 # naming the global and one spawn in the program. it also adds the checker's
 # E248 and E276 errors for reassigned fields, which need every module's writes,
-# and the E248 errors for closures that reach another task (see the end of this
-# file). `pith check`, `build`, `run` and `test` run it after the checker, and
-# `pith lint` reports it as well.
+# the E248 errors for closures that reach another task, and the errors for
+# buffers a call, a literal or another name shares with another task (see the
+# last two sections of this file). `pith check`, `build`, `run` and `test` run
+# it after the checker, and `pith lint` reports it as well.
 #
 # the pass runs over the whole program `pith lint` loaded: the entry module and
 # everything it imports, so a library global is reported when a program that
@@ -29,7 +30,7 @@
 
 from ast import Node, get_node, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, has_errors
-from checker import c_get_expr_type, called_declaration, extract_binding_name, COLLECTION_MUTATORS, is_counted_type, shared_field_errors, reassigned_field_of, get_definition_of, field_write_key, capture_refusal, interface_value_implementers, parse_integer_string
+from checker import c_get_expr_type, called_declaration, extract_binding_name, COLLECTION_MUTATORS, is_counted_type, shared_field_errors, reassigned_field_of, get_definition_of, field_write_key, capture_refusal, interface_value_implementers, parse_integer_string, c_generic_node_tids, guarded_segment, holds_shared_buffer_type, is_frozen_field, is_guarded_field, block_replaces
 from types import get_type_info, get_type_name, is_error_type, is_none_type
 from driver import get_resolved_module_file, get_resolved_module_path
 from checker_methods import method_tid_key, has_method_declaration, get_method_declaration_index
@@ -55,9 +56,27 @@ pub fn add_sharing_errors(diags: List[Diagnostic], entry_root: Int, entry_path: 
         files.push(get_resolved_module_file(r))
     for d in closure_sharing_errors(roots, files):
         diags.push(d)
+    # like E309, the buffer rules apply to a program whose entry reaches a
+    # spawn; a library that spawns somewhere the program never calls does
+    # not make it share anything
+    if program_has_spawn(roots) and reached_spawn(roots, files) != "":
+        # the globals E309 reports for a direct write are not reported again
+        mut written: List[Int] := []
+        for r in roots:
+            for g in written_shared_globals(r):
+                written.push(g)
+        for d in alias_sharing_errors(roots, files, written):
+            diags.push(d)
     for d in lint_shared_globals(entry_root, entry_path, import_roots):
         diags.push(d)
     return diags
+
+# whether any module of the program holds a spawn
+fn program_has_spawn(roots: List[Int]) -> Bool:
+    for r in roots:
+        if first_spawn(r) >= 0:
+            return true
+    return false
 
 ## the E309 errors for the program rooted at `entry_root`, read from
 ## `entry_path`, with `import_roots` the modules it loaded.
@@ -417,10 +436,10 @@ fn path_root(idx: Int) -> String:
 # that is not task-safe and whose value can reach another task.
 #
 # a function value reaches another task when it is a spawn's argument, callee
-# or receiver, a sent value, a value a module global holds in a program that
-# spawns, a field of a struct that crosses tasks, a capture of a closure that
-# crosses, or flows into a parameter, a field, a local or a function result
-# that reaches one. the pass records, for every slot a value can flow into
+# or receiver, a spawned call's result, a sent value, a value a module global
+# holds in a program that spawns, a field of a struct that crosses tasks, a
+# capture of a closure that crosses, or flows into a parameter, a field, a
+# local or a function result that reaches one. the pass records, for every slot a value can flow into
 # (a local or parameter by its declaration node "n<idx>", a struct field by
 # its write key "f<key>", a function's result "r<idx>", "ru" for what any
 # closure returns, and "u" for the arguments of calls through a function
@@ -432,8 +451,8 @@ fn path_root(idx: Int) -> String:
 # implementers of an interface value.
 #
 # the pass reads the expression types the checker recorded. a generic
-# function's body has none, since its types are recorded per instance and
-# dropped, so a capture there is judged by its declared type alone.
+# function's body has none of its own, so a capture there is judged by the
+# types it took in each specialization the check walked.
 
 struct TaskFlow:
     fns: ProgramFns
@@ -475,11 +494,7 @@ fn build_program_fns(roots: List[Int]) -> ProgramFns:
 pub fn closure_sharing_errors(roots: List[Int], files: List[String]) -> List[Diagnostic]:
     mut none_found: List[Diagnostic] := []
     # a program with no spawn runs on one task, and most programs have none
-    mut spawns := false
-    for r in roots:
-        if not spawns and first_spawn(r) >= 0:
-            spawns = true
-    if not spawns:
+    if not program_has_spawn(roots):
         return none_found
     flow := TaskFlow(fns: build_program_fns(roots), files: files, defs: get_definition_of(), sources: {}, reaching: {}, marked: {}, crossing: {}, call_targets: {}, roots: [], root_why: [], spawns: [], globals: {}, lambda_file: {}, lambda_params: {}, param_owner: {}, param_fn: {}, value_fns: {}, judged: {}, out: [])
     for r, i in roots:
@@ -608,10 +623,13 @@ fn arg_value(idx: Int) -> Int:
     return idx
 
 # a spawned call: its callee when it is a function value, its receiver, and
-# its arguments all reach the new task
+# its arguments all reach the new task. its result is made on the new task and
+# reaches the one that awaits it, the way a sent value does.
 fn flow_spawn(flow: TaskFlow, call_idx: Int, at: String):
     call := get_node(call_idx)
     why := "a spawn at " + at
+    flow.roots.push(call_idx)
+    flow.root_why.push("the result of the task spawned at " + at)
     for child, i in call.children:
         if i == 0 and call.kind == "call":
             if is_function_value_call(flow, call_idx):
@@ -671,15 +689,18 @@ fn flow_call(flow: TaskFlow, idx: Int, module: Int):
             if p >= 0:
                 add_flow(flow, "n" + p.to_string(), arg_value(child))
 
+fn is_function_value_call(flow: TaskFlow, idx: Int) -> Bool:
+    return calls_function_value(flow.defs, idx)
+
 # whether a call goes through a function value: a closure or a function held
 # in a local, a parameter, a field or an element, rather than a named function
-fn is_function_value_call(flow: TaskFlow, idx: Int) -> Bool:
+fn calls_function_value(defs: Map[Int, Int], idx: Int) -> Bool:
     node := get_node(idx)
     if node.kind != "call" or node.children.len() == 0:
         return false
     callee := node.children[0]
     if get_node(callee).kind == "ident":
-        return flow.defs.contains_key(callee) and get_node(flow.defs[callee]).kind != "fn_decl"
+        return defs.contains_key(callee) and get_node(defs[callee]).kind != "fn_decl"
     if called_declaration(idx) >= 0:
         return false
     return get_type_info(c_get_expr_type(callee)).kind == "function"
@@ -893,7 +914,7 @@ fn judge_closure(flow: TaskFlow, lam: Int, why: String):
         if not reported:
             mut refusal := capture_refusal(c_get_expr_type(use))
             if refusal == "" and is_error_type(c_get_expr_type(use)):
-                refusal = declared_collection(flow.defs[use])
+                refusal = generic_capture_refusal(flow, use)
             if refusal != "":
                 reported = true
                 node := get_node(use)
@@ -903,10 +924,25 @@ fn judge_closure(flow: TaskFlow, lam: Int, why: String):
                 flow.out.push(Diagnostic("error", "E248", "a closure that reaches another task cannot capture '" + name + "' (" + refusal + "), which the scope that made the closure still holds; the closure reaches the task through " + why, flow.lambda_file[lam], node.line, node.col, "build the value inside the closure, hand the task a copy, or keep it in a `guard` block"))
     for use in captures:
         mark_expr(flow, use, "a capture of a closure that reaches " + why)
+        for tid in c_generic_node_tids(use):
+            mark_type(flow, tid, "a capture of a closure that reaches " + why)
 
-# a generic function's body has no recorded types, so a capture there is judged
-# by its declaration: a parameter or a local annotated as a list, a map or a
-# set, as "a list" and so on, or ""
+# a generic function's body keeps no expression types, so a capture there is
+# judged by the type it took in each specialization the check walked, with
+# " in <type>" naming the one refused. a body no specialization walked is
+# judged by the capture's declaration.
+fn generic_capture_refusal(flow: TaskFlow, use: Int) -> String:
+    tids := c_generic_node_tids(use)
+    if tids.len() == 0:
+        return declared_collection(flow.defs[use])
+    for tid in tids:
+        refusal := capture_refusal(tid)
+        if refusal != "":
+            return refusal
+    return ""
+
+# a capture's declaration: a parameter or a local annotated as a list, a map or
+# a set, as "a list" and so on, or ""
 fn declared_collection(decl: Int) -> String:
     node := get_node(decl)
     if node.kind != "param" and node.kind != "binding":
@@ -934,3 +970,1443 @@ fn collect_captures(flow: TaskFlow, idx: Int, inside: Map[Int, Bool], out: List[
                 out.push(idx)
     for child in node.children:
         collect_captures(flow, child, inside, out)
+
+# ---------------------------------------------------------------
+# buffers that a call, a literal or another name shares (E248, E275, E276, E309)
+# ---------------------------------------------------------------
+#
+# the checker judges a value handed to another task by its type when the
+# value is a name or a path. a call result or a literal is judged here: it is
+# fresh only when it holds no buffer that something else still reaches.
+# `Box(items: xs)` shares `xs`, and so does a function that returns its
+# parameter or copies a list handle into the struct it builds. a module
+# global and a frozen field are shared by every task, so neither may be
+# changed in place through any name, and a value stored into a guarded
+# collection must not stay reachable outside the lock.
+#
+# so this pass follows buffers through every function of a program that
+# spawns. within a function, the locals that may hold the same buffer form a
+# group: a binding, an assignment, a loop variable, a pattern binding or a
+# part read out of another group joins it. a store (`out.push(v)`,
+# `out.f = v`) and a literal (`Box(items: v)`, `[v]`) record that one group
+# holds another's buffers, and a part read out of a holder joins what it
+# holds. each group collects where its buffers come from: a parameter, self,
+# a module global, a frozen field, a guarded or threadlocal global, or a
+# value the pass cannot follow (a call through a function value, an awaited
+# result, an argument a closure is called with). a function's summary says
+# which of its parameters it changes in place, lets escape, or stores
+# another value into, and where the buffers of its result come from, those
+# it returns whole apart from those its result only holds. a call applies the
+# callee's summary to its arguments, and the summaries are computed to a
+# fixed point over the program. a holder whose elements hold no buffer at the
+# caller's type, such as the `List[Int]` that `copy_list` returns, holds
+# nothing the caller can share.
+#
+# then, in a program that spawns:
+# - a spawn's argument or a sent value that is a call or a literal must hold
+#   no buffer of a local, a parameter or a global (E248).
+# - a value stored into a guarded collection must be fresh, or a local made
+#   inside the `locked` block that nothing else holds (E276).
+# - a module global outside a guard block and not threadlocal, holding a
+#   buffer, may not be changed in place through any name, let escape where
+#   the pass cannot follow it, or be stored into a parameter's value (E309).
+# - a frozen field's value may not be changed in place, let escape, or be
+#   stored into a parameter's value through another name (E275).
+
+# where an expression's buffers come from. `locals` and `sources` it is or is
+# a part of; `held_locals` and `held_sources` it only holds as elements or
+# fields. `part` is set when the value may be a part of what the locals hold
+# rather than the locals' own buffer. a source is "p<k>" (the k-th
+# parameter, in a summary), "s" (self, in a summary), "g<decl>" (a module
+# global), "t<decl>" (a guarded or threadlocal global), "z<type>.<field>" (a
+# frozen field), "q" (a guarded field) or "x" (a value the pass cannot
+# follow).
+struct Roots:
+    locals: List[Int]
+    sources: List[String]
+    held_locals: List[Int]
+    held_sources: List[String]
+    part: Bool
+
+# a function's effect on its parameters ("p<k>" and "s") and the sources of
+# its result: `direct` the result is or is a part of, `content` the result
+# only holds. `consumed` maps a parameter the function hands to another task
+# or stores under a lock to the error a caller gets for passing a shared one.
+struct AliasSummary:
+    direct: List[String]
+    content: List[String]
+    mutated: List[String]
+    escaped: List[String]
+    stores: Map[String, List[String]]
+    consumed: Map[String, String]
+    sig: String
+
+# one thing a function body does with a value. `a` and `b` are nodes:
+# - "alias": a local `a` takes `b`; "part": a local `a` takes a part of `b`;
+#   "take": a local `a` takes `b` out of a guard that no longer holds it
+# - "store": the container `a` takes `b`; "mutate": `a` is changed in place;
+#   "escape": `b` goes where the pass cannot follow
+# - "call": `a` is a call to functions with summaries; "return": `b` is
+#   returned; "task_result": `a` is a spawned call whose result the awaiting
+#   task takes
+# - "handoff": `b` crosses to another task, `what` starting the message;
+#   "task_read": a spawn's argument `a` reads the local `b` on the new task
+# - "guarded": `b` is stored into the guarded `a` inside the `locked` block
+#   `block`; "guarded_init": `b` sets the guarded field or global `what` when
+#   it is built
+struct AliasEvent:
+    kind: String
+    a: Int
+    b: Int
+    site: Int
+    block: Int
+    what: String
+
+struct AliasBody:
+    decl: Int
+    module: Int
+    events: List[AliasEvent]
+    initial: Map[Int, String]
+    parents: Map[Int, Int]
+
+struct AliasFlow:
+    fns: ProgramFns
+    files: List[String]
+    defs: Map[Int, Int]
+    globals: Map[Int, String]
+    global_file: Map[Int, String]
+    opaque: Map[Int, String]
+    skip_globals: Map[Int, Bool]
+    bodies: List[AliasBody]
+    summaries: Map[Int, AliasSummary]
+    targets: Map[Int, List[Int]]
+    params_of: Map[Int, List[Int]]
+    callers: Map[Int, List[Int]]
+    shares: Map[Int, Bool]
+    block_nodes: Map[Int, Map[Int, Bool]]
+    reported: Map[String, Bool]
+    aliasing_guards: Map[String, Bool]
+    out: List[Diagnostic]
+
+# the state of one function's solve: the groups as a union-find over
+# declaration nodes, and what each local was found to hold and do
+struct AliasSolve:
+    parent: Map[Int, Int]
+    roots: Map[Int, Roots]
+    srcs: Map[Int, List[String]]
+    held_srcs: Map[Int, List[String]]
+    holders: List[Int]
+    held: List[Int]
+    muts: Map[Int, Int]
+    deep_muts: Map[Int, Int]
+    escs: Map[Int, Int]
+    direct_mut: Map[String, Int]
+    direct_esc: Map[String, Int]
+    guarded_stores: List[AliasEvent]
+
+# the builtin methods that take their result out of the receiver
+REMOVING_METHODS := ",remove,take,pop,pop_front,remove_at,"
+
+# the builtin methods whose result is a part of their receiver or an argument
+PART_ACCESSORS := ",get,first,last,unwrap,unwrap_or,expect,value,or_else,get_default,remove,take,reduce,pop,pop_front,remove_at,"
+
+## the E248, E275, E276 and E309 errors for buffers a call, a literal or an
+## alias shares with another task, over the program rooted at `roots` (the
+## entry first), read from `files`. `skip` holds the globals E309 already
+## reports for a direct write.
+pub fn alias_sharing_errors(roots: List[Int], files: List[String], skip: List[Int]) -> List[Diagnostic]:
+    mut skip_globals: Map[Int, Bool] := {}
+    for g in skip:
+        skip_globals.insert(g, true)
+    af := AliasFlow(fns: build_program_fns(roots), files: files, defs: get_definition_of(), globals: {}, global_file: {}, opaque: {}, skip_globals: skip_globals, bodies: [], summaries: {}, targets: {}, params_of: {}, callers: {}, shares: {}, block_nodes: {}, reported: {}, aliasing_guards: {}, out: [])
+    for r, i in roots:
+        note_alias_globals(af, r, i)
+    for idx, k in af.fns.nodes:
+        add_alias_body(af, idx, af.fns.modules[k])
+    for r, i in roots:
+        add_global_inits(af, r, i)
+    note_aliasing_guards(af)
+    # the summaries, to a fixed point: a changed summary queues its callers
+    mut queue: List[Int] := []
+    mut queued: Map[Int, Bool] := {}
+    for b, i in af.bodies:
+        queue.push(i)
+        queued.insert(i, true)
+    mut at := 0
+    while at < queue.len():
+        bi := queue[at]
+        at = at + 1
+        queued.insert(bi, false)
+        body := af.bodies[bi]
+        summary := alias_solve(af, body, false)
+        if af.summaries.contains_key(body.decl) and af.summaries[body.decl].sig == summary.sig:
+            continue
+        af.summaries.insert(body.decl, summary)
+        if af.callers.contains_key(body.decl):
+            for c in af.callers[body.decl]:
+                if not queued[c]:
+                    queued.insert(c, true)
+                    queue.push(c)
+    for body in af.bodies:
+        alias_solve(af, body, true)
+    return af.out
+
+# the module's globals: those holding a buffer, outside a guard block and not
+# threadlocal, are followed as "g" sources; guarded and threadlocal ones as
+# "t" sources, which no task shares but which are not fresh either
+fn note_alias_globals(af: AliasFlow, root: Int, module: Int):
+    for child in get_node(root).children:
+        mut idx := child
+        if get_node(idx).kind == "pub" and get_node(idx).children.len() > 0:
+            idx = get_node(idx).children[0]
+        node := get_node(idx)
+        if node.kind == "threadlocal":
+            af.opaque.insert(idx, "h")
+            for inner in node.children:
+                af.opaque.insert(inner, "h")
+        elif node.kind == "binding" and node.children.len() > 0:
+            if node.value.contains(" guard:"):
+                af.opaque.insert(idx, "t")
+            elif node_may_share(af, node.children[node.children.len() - 1]):
+                af.globals.insert(idx, extract_binding_name(node.value))
+                af.global_file.insert(idx, af.files[module])
+
+fn add_alias_body(af: AliasFlow, idx: Int, module: Int):
+    node := get_node(idx)
+    body := AliasBody(decl: idx, module: module, events: [], initial: {}, parents: {})
+    body.initial.insert(idx, "s")
+    mut k := 0
+    for child in node.children:
+        cn := get_node(child)
+        if cn.kind == "param":
+            body.initial.insert(child, "p" + k.to_string())
+            k = k + 1
+        elif cn.kind == "body" or cn.kind == "block":
+            alias_collect(af, body, child, false, 0 - 1)
+    af.bodies.push(body)
+
+# a module's global initializers run once, and each value they build is held
+# by a global every task reaches
+fn add_global_inits(af: AliasFlow, root: Int, module: Int):
+    body := AliasBody(decl: root, module: module, events: [], initial: {}, parents: {})
+    for child in get_node(root).children:
+        mut idx := child
+        if get_node(idx).kind == "pub" and get_node(idx).children.len() > 0:
+            idx = get_node(idx).children[0]
+        node := get_node(idx)
+        if node.kind == "binding" and node.children.len() > 0:
+            value := node.children[node.children.len() - 1]
+            alias_collect(af, body, value, false, 0 - 1)
+            if node.value.contains(" guard:"):
+                push_alias_event(body, "guarded_init", 0 - 1, value, value, 0 - 1, extract_binding_name(node.value))
+            else:
+                push_alias_event(body, "escape", 0 - 1, value, value, 0 - 1, "")
+    af.bodies.push(body)
+
+fn push_alias_event(body: AliasBody, kind: String, a: Int, b: Int, site: Int, block: Int, what: String):
+    body.events.push(AliasEvent(kind: kind, a: a, b: b, site: site, block: block, what: what))
+
+fn push_guarded_store(af: AliasFlow, body: AliasBody, target: Int, value: Int, site: Int, block: Int):
+    push_alias_event(body, "guarded", target, value, site, block, "")
+
+# a value stored into a guarded collection may be one read under the same
+# guard, which stays there. that may leave the guard holding one buffer twice,
+# so a value taken out of such a guard is not fresh. a guard is noted when a
+# value stored into it reads it, directly or through a local assigned from
+# it; a store that reads it some other way, such as through a call, is
+# refused.
+fn note_aliasing_guards(af: AliasFlow):
+    for body in af.bodies:
+        mut assigned: Map[Int, List[Int]] := {}
+        for ev in body.events:
+            if ev.kind == "alias" or ev.kind == "part" or ev.kind == "take":
+                if assigned.contains_key(ev.a):
+                    assigned[ev.a].push(ev.b)
+                else:
+                    assigned.insert(ev.a, [ev.b])
+        for ev in body.events:
+            if ev.kind == "guarded":
+                guard := guarded_segment(ev.a)
+                mut seen: Map[Int, Bool] := {}
+                if reads_guard(af, ev.b, guard, assigned, seen):
+                    af.aliasing_guards.insert(guard, true)
+
+fn reads_guard(af: AliasFlow, idx: Int, guard: String, assigned: Map[Int, List[Int]], seen: Map[Int, Bool]) -> Bool:
+    node := get_node(idx)
+    if (node.kind == "field_access" or node.kind == "ident") and guarded_segment(idx) == guard:
+        return true
+    if node.kind == "ident" and af.defs.contains_key(idx):
+        d := af.defs[idx]
+        if assigned.contains_key(d) and not seen.contains_key(d):
+            seen.insert(d, true)
+            for v in assigned[d]:
+                if reads_guard(af, v, guard, assigned, seen):
+                    return true
+    for child in node.children:
+        if reads_guard(af, child, guard, assigned, seen):
+            return true
+    return false
+
+# a value handed to another task. it is refused unless nothing else holds
+# what it holds, so the handoff needs no escape of its own.
+fn push_handoff(body: AliasBody, value: Int, block: Int, what: String):
+    push_alias_event(body, "handoff", 0 - 1, value, value, block, what)
+
+# each local a spawn's argument reads, outside a closure (which the closure
+# rule judges)
+fn push_task_reads(af: AliasFlow, body: AliasBody, arg: Int, idx: Int, block: Int):
+    node := get_node(idx)
+    if node.kind == "lambda":
+        return
+    if (node.kind == "ident" or node.kind == "self") and af.defs.contains_key(idx) and not names_global(af, idx):
+        push_alias_event(body, "task_read", arg, idx, idx, block, "")
+    for child in node.children:
+        push_task_reads(af, body, arg, child, block)
+
+# every node under a pattern takes a part of the subject
+fn alias_pattern(body: AliasBody, pat: Int, subject: Int, block: Int):
+    push_alias_event(body, "part", pat, subject, pat, block, "")
+    for child in get_node(pat).children:
+        alias_pattern(body, child, subject, block)
+
+# whether an ident names a module global, guarded, threadlocal or followed
+fn names_global(af: AliasFlow, idx: Int) -> Bool:
+    if not af.defs.contains_key(idx):
+        return false
+    d := af.defs[idx]
+    return af.globals.contains_key(d) or af.opaque.contains_key(d)
+
+fn alias_collect(af: AliasFlow, body: AliasBody, idx: Int, in_lambda: Bool, block: Int):
+    node := get_node(idx)
+    kind := node.kind
+    if kind == "lambda":
+        # a closure's parameters take whatever it is called with
+        for child in node.children:
+            if get_node(child).kind == "param":
+                body.initial.insert(child, "x")
+            alias_collect(af, body, child, true, block)
+        return
+    if kind == "locked_stmt" and node.children.len() == 4:
+        for child, i in node.children:
+            if i == 3:
+                alias_collect(af, body, child, in_lambda, child)
+            else:
+                alias_collect(af, body, child, in_lambda, block)
+        return
+    if kind == "spawn" and node.children.len() >= 1:
+        call := get_node(node.children[0])
+        for child, i in call.children:
+            if i == 0 and call.kind == "call":
+                continue
+            value := arg_value(child)
+            push_handoff(body, value, block, "a spawned task cannot take")
+            # the task evaluates its arguments itself, so whatever they read
+            # it reads on the new task
+            if get_node(value).kind != "ident" and get_node(value).kind != "self":
+                push_task_reads(af, body, value, value, block)
+        # the task's result reaches the task that awaits it
+        if note_call_targets(af, body, node.children[0]):
+            push_alias_event(body, "task_result", node.children[0], 0 - 1, idx, block, "")
+        for child, i in call.children:
+            if i == 0 and call.kind == "call" and get_node(child).kind == "ident":
+                continue
+            alias_collect(af, body, child, in_lambda, block)
+        return
+    if kind == "binding" and node.children.len() > 0:
+        value := node.children[node.children.len() - 1]
+        push_alias_event(body, local_take_kind(value, block), idx, value, idx, block, "")
+    elif kind == "assignment" and node.children.len() >= 2:
+        target := node.children[0]
+        value := node.children[1]
+        tn := get_node(target)
+        if tn.kind == "ident" and af.defs.contains_key(target) and not names_global(af, target):
+            push_alias_event(body, local_take_kind(value, block), af.defs[target], value, idx, block, "")
+        elif block >= 0 and guarded_segment(target) != "":
+            push_guarded_store(af, body, target, value, idx, block)
+        else:
+            push_alias_event(body, "store", target, value, idx, block, "")
+    elif kind == "return" and node.children.len() >= 1:
+        if in_lambda:
+            push_alias_event(body, "escape", 0 - 1, node.children[0], idx, block, "")
+        else:
+            push_alias_event(body, "return", 0 - 1, node.children[0], idx, block, "")
+    elif kind == "for_stmt" and node.children.len() >= 3:
+        alias_pattern(body, node.children[2], node.children[0], block)
+    elif (kind == "if_let" or kind == "while_let") and node.children.len() >= 2:
+        alias_pattern(body, node.children[0], node.children[1], block)
+    elif (kind == "match" or kind == "match_expr") and node.children.len() >= 1:
+        for arm in node.children:
+            an := get_node(arm)
+            if an.kind == "arm" and an.children.len() > 0:
+                alias_pattern(body, an.children[0], node.children[0], block)
+    elif kind == "call" or kind == "method_call":
+        alias_call_events(af, body, idx, block)
+    for child, i in node.children:
+        if i == 0 and kind == "call" and get_node(child).kind == "ident":
+            continue
+        alias_collect(af, body, child, in_lambda, block)
+
+# how a local takes a value: "take" for a guarded path its `locked` block
+# then empties, else as alias_kind_of says
+fn local_take_kind(value: Int, block: Int) -> String:
+    if block >= 0 and guarded_segment(value) != "" and block_replaces(block, value):
+        return "take"
+    return alias_kind_of(value)
+
+# a local bound to a name takes that name's buffer whole; bound to anything
+# else, it may take a part of it
+fn alias_kind_of(value: Int) -> String:
+    kind := get_node(value).kind
+    if kind == "ident" or kind == "self":
+        return "alias"
+    return "part"
+
+fn alias_call_events(af: AliasFlow, body: AliasBody, idx: Int, block: Int):
+    node := get_node(idx)
+    if node.children.len() == 0:
+        return
+    if calls_function_value(af.defs, idx):
+        # the closure called may keep what it is given
+        for child, i in node.children:
+            if i >= 1:
+                push_alias_event(body, "escape", 0 - 1, arg_value(child), idx, block, "")
+        return
+    if node.kind == "method_call":
+        receiver := node.children[0]
+        rkind := receiver_kind(receiver)
+        if rkind == "channel" and (node.value == "send" or node.value == "try_send"):
+            for child, i in node.children:
+                if i >= 1:
+                    push_handoff(body, arg_value(child), block, "a channel send cannot hand over")
+            return
+        if rkind == "list" or rkind == "map" or rkind == "set":
+            guarded := block >= 0 and guarded_segment(receiver) != ""
+            if STORING_METHODS.contains("," + node.value + ","):
+                for child, i in node.children:
+                    if i >= 1:
+                        if guarded:
+                            push_guarded_store(af, body, receiver, arg_value(child), idx, block)
+                        else:
+                            push_alias_event(body, "store", receiver, arg_value(child), idx, block, "")
+            elif COLLECTION_MUTATORS.contains("," + node.value + ",") and not guarded:
+                push_alias_event(body, "mutate", receiver, 0 - 1, idx, block, "")
+            return
+        if rkind != "" and BUILTIN_RECEIVER_KINDS.contains("," + rkind + ","):
+            return
+    if note_call_targets(af, body, idx):
+        push_alias_event(body, "call", idx, 0 - 1, idx, block, "")
+        return
+    # a struct literal keeps nothing, but a guarded field it sets is reached
+    # under a lock from then on, so its value must be fresh
+    if is_struct_literal(idx):
+        tid := c_get_expr_type(idx)
+        info := get_type_info(tid)
+        for child, i in node.children:
+            if i >= 1:
+                an := get_node(child)
+                mut fname := ""
+                if an.kind == "arg" and an.value != "":
+                    fname = an.value
+                elif i - 1 < info.fields.len():
+                    fname = info.fields[i - 1]
+                if fname != "" and is_guarded_field(tid, fname):
+                    push_alias_event(body, "guarded_init", 0 - 1, arg_value(child), idx, block, fname)
+        return
+    # an enum variant or a builtin function keeps nothing. a method on a
+    # value whose type names no declaration may keep its receiver and
+    # arguments.
+    if node.kind == "method_call" and receiver_kind(node.children[0]) == "":
+        for child in node.children:
+            push_alias_event(body, "escape", 0 - 1, arg_value(child), idx, block, "")
+
+# resolve the functions a call may run, recording the body being collected as
+# their caller; false when it runs none the program declares
+fn note_call_targets(af: AliasFlow, body: AliasBody, idx: Int) -> Bool:
+    mut targets: List[Int] := []
+    resolve_call(idx, body.module, af.fns, targets)
+    if targets.len() == 0:
+        return false
+    af.targets.insert(idx, targets)
+    for t in targets:
+        if not af.params_of.contains_key(t):
+            mut params: List[Int] := []
+            for child in get_node(t).children:
+                if get_node(child).kind == "param":
+                    params.push(child)
+            af.params_of.insert(t, params)
+        if af.callers.contains_key(t):
+            af.callers[t].push(af.bodies.len())
+        else:
+            af.callers.insert(t, [af.bodies.len()])
+    return true
+
+# the kind of type a node has in every typing the check gave it, or "" when
+# it has none or they differ
+fn receiver_kind(idx: Int) -> String:
+    tids := node_tids(idx)
+    if tids.len() == 0:
+        return ""
+    kind := get_type_info(tids[0]).kind
+    for t in tids:
+        if get_type_info(t).kind != kind:
+            return ""
+    return kind
+
+# the types the check gave a node: the one it recorded, or for a node of a
+# generic body the one from each specialization it walked
+fn node_tids(idx: Int) -> List[Int]:
+    tid := c_get_expr_type(idx)
+    if not is_error_type(tid):
+        return [tid]
+    return c_generic_node_tids(idx)
+
+# whether a value of this type can hold a buffer another name reaches: a
+# collection, a value reaching one outside a guard block, or a value reaching
+# a counted field some code reassigns
+fn type_shares(af: AliasFlow, tid: Int) -> Bool:
+    if tid < 0 or is_error_type(tid) or is_none_type(tid):
+        return false
+    if af.shares.contains_key(tid):
+        return af.shares[tid]
+    found := holds_shared_buffer_type(tid) or reassigned_field_of(tid) != ""
+    af.shares.insert(tid, found)
+    return found
+
+# whether an expression may hold such a buffer: an untyped one may
+fn node_may_share(af: AliasFlow, idx: Int) -> Bool:
+    tids := node_tids(idx)
+    if tids.len() == 0:
+        return true
+    for t in tids:
+        if type_shares(af, t):
+            return true
+    return false
+
+# whether a container's elements hold no buffer at every type the node took,
+# so whatever it holds is a plain value
+fn content_safe(af: AliasFlow, idx: Int) -> Bool:
+    tids := node_tids(idx)
+    if tids.len() == 0:
+        return false
+    for t in tids:
+        info := get_type_info(t)
+        if info.kind == "list" or info.kind == "set" or info.kind == "optional":
+            if info.inner >= 0 and type_shares(af, info.inner):
+                return false
+        elif info.kind == "map":
+            if type_shares(af, info.key_type) or type_shares(af, info.value_type):
+                return false
+        elif type_shares(af, t):
+            return false
+    return true
+
+fn empty_roots() -> Roots:
+    return Roots(locals: [], sources: [], held_locals: [], held_sources: [], part: false)
+
+fn alias_roots(af: AliasFlow, st: AliasSolve, idx: Int) -> Roots:
+    if idx < 0:
+        return empty_roots()
+    if st.roots.contains_key(idx):
+        return st.roots[idx]
+    r := empty_roots()
+    collect_roots(af, idx, r)
+    st.roots.insert(idx, r)
+    return r
+
+fn push_local(list: List[Int], l: Int):
+    if not list.contains(l):
+        list.push(l)
+
+fn push_source(list: List[String], s: String):
+    if not list.contains(s):
+        list.push(s)
+
+# add `other` to `into`, all of it held when `held` is set
+fn merge_roots(into: Roots, other: Roots, held: Bool):
+    for l in other.locals:
+        if held:
+            push_local(into.held_locals, l)
+        else:
+            push_local(into.locals, l)
+    for s in other.sources:
+        if held:
+            push_source(into.held_sources, s)
+        else:
+            push_source(into.sources, s)
+    for l in other.held_locals:
+        push_local(into.held_locals, l)
+    for s in other.held_sources:
+        push_source(into.held_sources, s)
+    if other.part and not held:
+        into.part = true
+
+fn collect_roots(af: AliasFlow, idx: Int, r: Roots):
+    if not node_may_share(af, idx):
+        return
+    node := get_node(idx)
+    kind := node.kind
+    if kind == "self" or kind == "ident":
+        if not af.defs.contains_key(idx):
+            return
+        d := af.defs[idx]
+        if af.globals.contains_key(d):
+            push_source(r.sources, "g" + d.to_string())
+            return
+        if af.opaque.contains_key(d):
+            push_source(r.sources, af.opaque[d] + d.to_string())
+            return
+        dk := get_node(d).kind
+        if kind == "self" or not (NAMED_DECLS.contains("," + dk + ",") or dk == "import" or dk == "from_import" or dk == "module"):
+            push_local(r.locals, d)
+        return
+    if kind == "field_access" and node.children.len() >= 1:
+        base := node.children[0]
+        for t in node_tids(base):
+            if get_type_info(t).kind == "struct":
+                if is_frozen_field(t, node.value):
+                    push_source(r.sources, "z" + t.to_string() + "." + node.value)
+                    return
+                if is_guarded_field(t, node.value):
+                    push_source(r.sources, "q" + node.value)
+        part_roots(af, base, r)
+        return
+    if kind == "index" and node.children.len() >= 1:
+        part_roots(af, node.children[0], r)
+        return
+    if kind == "call" or kind == "method_call":
+        call_roots(af, idx, r)
+        return
+    if kind == "await":
+        push_source(r.sources, "x")
+        return
+    if kind == "lambda" or kind == "spawn":
+        return
+    if kind == "list" or kind == "map" or kind == "set" or kind == "tuple" or kind == "struct_init" or kind == "entry":
+        for child in node.children:
+            sub := empty_roots()
+            collect_roots(af, child, sub)
+            merge_roots(r, sub, true)
+        return
+    if kind == "block" and node.children.len() > 0:
+        collect_roots(af, node.children[node.children.len() - 1], r)
+        return
+    if kind == "match_expr" or kind == "arm":
+        for child, i in node.children:
+            if i >= 1:
+                collect_roots(af, child, r)
+        return
+    for child in node.children:
+        collect_roots(af, child, r)
+
+# a part read out of `base`: what the base holds, the base's own buffer, or a
+# part of either
+fn part_roots(af: AliasFlow, base: Int, r: Roots):
+    sub := empty_roots()
+    collect_roots(af, base, sub)
+    for l in sub.locals:
+        push_local(r.locals, l)
+    for l in sub.held_locals:
+        push_local(r.locals, l)
+    for s in sub.sources:
+        push_source(r.sources, s)
+    for s in sub.held_sources:
+        push_source(r.sources, s)
+    r.part = true
+
+fn call_roots(af: AliasFlow, idx: Int, r: Roots):
+    node := get_node(idx)
+    if calls_function_value(af.defs, idx):
+        push_source(r.sources, "x")
+        return
+    if af.targets.contains_key(idx):
+        content_kept := not content_safe(af, idx)
+        for t in af.targets[idx]:
+            if af.summaries.contains_key(t):
+                s := af.summaries[t]
+                for src in s.direct:
+                    map_summary_source(af, idx, t, src, r, false)
+                if content_kept:
+                    for src in s.content:
+                        map_summary_source(af, idx, t, src, r, true)
+        return
+    if node.kind == "method_call" and node.children.len() > 0:
+        rkind := receiver_kind(node.children[0])
+        if rkind == "channel" and (node.value == "recv" or node.value == "try_recv"):
+            return
+        if PART_ACCESSORS.contains("," + node.value + ","):
+            # a value taken out of a guarded collection is no longer in it,
+            # and was fresh when it was stored, so nothing else holds it
+            guard := guarded_segment(node.children[0])
+            if REMOVING_METHODS.contains("," + node.value + ",") and guard != "" and not af.aliasing_guards.contains_key(guard):
+                return
+            for child in node.children:
+                part_roots(af, arg_value(child), r)
+            return
+        if rkind == "":
+            push_source(r.sources, "x")
+            return
+        if content_safe(af, idx):
+            return
+    # a struct literal, an enum variant, or a new container a builtin made:
+    # it holds its arguments' buffers. a frozen field holding a module
+    # global's or another frozen field's buffer shares it safely: no name may
+    # change either.
+    for child, i in node.children:
+        if i == 0 and node.kind == "call":
+            continue
+        sub := empty_roots()
+        collect_roots(af, arg_value(child), sub)
+        if not (frozen_literal_field(idx, child, i) and only_unchanging_sources(sub)):
+            merge_roots(r, sub, true)
+
+# whether a struct literal's argument sets a frozen field
+fn frozen_literal_field(idx: Int, arg: Int, pos: Int) -> Bool:
+    if not is_struct_literal(idx):
+        return false
+    tid := c_get_expr_type(idx)
+    info := get_type_info(tid)
+    an := get_node(arg)
+    mut fname := ""
+    if an.kind == "arg" and an.value != "":
+        fname = an.value
+    elif pos - 1 < info.fields.len():
+        fname = info.fields[pos - 1]
+    return fname != "" and is_frozen_field(tid, fname)
+
+# whether every buffer a value holds belongs to a module global or a frozen
+# field, which no name may change
+fn only_unchanging_sources(r: Roots) -> Bool:
+    if r.locals.len() > 0 or r.held_locals.len() > 0:
+        return false
+    for s in r.sources:
+        if not s.starts_with("g") and not s.starts_with("z"):
+            return false
+    for s in r.held_sources:
+        if not s.starts_with("g") and not s.starts_with("z"):
+            return false
+    return true
+
+# one source of a callee's result, seen from the call
+fn map_summary_source(af: AliasFlow, call: Int, target: Int, src: String, r: Roots, held: Bool):
+    if src == "s" or src.starts_with("p"):
+        arg := call_arg(af, call, target, src)
+        if arg < 0:
+            return
+        sub := empty_roots()
+        collect_roots(af, arg, sub)
+        # a callee returning its parameter may return a part of it
+        sub.part = true
+        merge_roots(r, sub, held)
+        return
+    if held:
+        push_source(r.held_sources, src)
+    else:
+        push_source(r.sources, src)
+
+# the argument a call passes for a callee's parameter "p<k>" or its receiver
+# "s", or -1
+fn call_arg(af: AliasFlow, call: Int, target: Int, key: String) -> Int:
+    node := get_node(call)
+    if key == "s":
+        if node.kind == "method_call" and node.children.len() > 0:
+            return node.children[0]
+        return 0 - 1
+    k := parse_integer_string(key.substring(1, key.len()))
+    if not af.params_of.contains_key(target):
+        return 0 - 1
+    params := af.params_of[target]
+    if k >= params.len():
+        return 0 - 1
+    for child, i in node.children:
+        if i >= 1 and param_for_arg(params, child, i - 1) == params[k]:
+            return arg_value(child)
+    return 0 - 1
+
+fn uf_find(st: AliasSolve, l: Int) -> Int:
+    if not st.parent.contains_key(l):
+        st.parent.insert(l, l)
+        return l
+    mut at := l
+    while st.parent[at] != at:
+        at = st.parent[at]
+    mut walk := l
+    while st.parent[walk] != at:
+        next := st.parent[walk]
+        st.parent.insert(walk, at)
+        walk = next
+    return at
+
+# join two groups; true when they were apart
+fn uf_union(st: AliasSolve, a: Int, b: Int) -> Bool:
+    ra := uf_find(st, a)
+    rb := uf_find(st, b)
+    if ra == rb:
+        return false
+    st.parent.insert(rb, ra)
+    return true
+
+fn add_local_source(table: Map[Int, List[String]], l: Int, src: String):
+    if table.contains_key(l):
+        push_source(table[l], src)
+    else:
+        table.insert(l, [src])
+
+fn mark_site(table: Map[Int, Int], l: Int, site: Int):
+    if not table.contains_key(l):
+        table.insert(l, site)
+
+fn mark_source_site(table: Map[String, Int], src: String, site: Int):
+    if not table.contains_key(src):
+        table.insert(src, site)
+
+# `rv` is stored into the container `rr`
+fn apply_store(st: AliasSolve, rr: Roots, rv: Roots, site: Int):
+    mark_mutated(st, rr, site)
+    if rr.locals.len() > 0:
+        for h in rr.locals:
+            for d in rv.locals:
+                st.holders.push(h)
+                st.held.push(d)
+            for d in rv.held_locals:
+                st.holders.push(h)
+                st.held.push(d)
+            for s in rv.sources:
+                add_local_source(st.held_srcs, h, s)
+            for s in rv.held_sources:
+                add_local_source(st.held_srcs, h, s)
+        return
+    # a container outside the function's locals: the value is now a part of
+    # it, and reachable from wherever it is
+    mark_escaped(st, rv, site)
+    for s in rr.sources:
+        for l in rv.locals:
+            add_local_source(st.srcs, l, s)
+
+fn mark_mutated(st: AliasSolve, r: Roots, site: Int):
+    for l in r.locals:
+        if r.part:
+            mark_site(st.deep_muts, l, site)
+        else:
+            mark_site(st.muts, l, site)
+    for s in r.sources:
+        mark_source_site(st.direct_mut, s, site)
+
+fn mark_escaped(st: AliasSolve, r: Roots, site: Int):
+    for l in r.locals:
+        mark_site(st.escs, l, site)
+    for l in r.held_locals:
+        mark_site(st.escs, l, site)
+    for s in r.sources:
+        mark_source_site(st.direct_esc, s, site)
+    for s in r.held_sources:
+        mark_source_site(st.direct_esc, s, site)
+
+fn is_guarded_arg(arg: Int, block: Int) -> Bool:
+    return block >= 0 and guarded_segment(arg) != ""
+
+# a call applies its callee's summary to what it passes
+fn apply_call(af: AliasFlow, st: AliasSolve, ev: AliasEvent):
+    call := ev.a
+    for t in af.targets[call]:
+        if not af.summaries.contains_key(t):
+            continue
+        s := af.summaries[t]
+        for key in s.mutated:
+            arg := call_arg(af, call, t, key)
+            if arg >= 0 and not is_guarded_arg(arg, ev.block):
+                r := alias_roots(af, st, arg)
+                # the callee may change any part of what it was handed
+                deep := Roots(locals: r.locals, sources: r.sources, held_locals: r.held_locals, held_sources: r.held_sources, part: true)
+                mark_mutated(st, deep, ev.site)
+        for key in s.escaped:
+            arg := call_arg(af, call, t, key)
+            if arg >= 0:
+                mark_escaped(st, alias_roots(af, st, arg), ev.site)
+        for key in s.stores.keys():
+            arg := call_arg(af, call, t, key)
+            if arg < 0 or content_safe(af, arg):
+                continue
+            guarded := is_guarded_arg(arg, ev.block)
+            for src in s.stores[key]:
+                if src == "s" or src.starts_with("p"):
+                    value := call_arg(af, call, t, src)
+                    if value >= 0:
+                        if guarded:
+                            st.guarded_stores.push(AliasEvent(kind: "guarded", a: arg, b: value, site: ev.site, block: ev.block, what: ""))
+                        else:
+                            apply_store(st, alias_roots(af, st, arg), alias_roots(af, st, value), ev.site)
+                elif not guarded:
+                    for h in alias_roots(af, st, arg).locals:
+                        add_local_source(st.held_srcs, h, src)
+
+fn alias_solve(af: AliasFlow, body: AliasBody, report: Bool) -> AliasSummary:
+    st := AliasSolve(parent: {}, roots: {}, srcs: {}, held_srcs: {}, holders: [], held: [], muts: {}, deep_muts: {}, escs: {}, direct_mut: {}, direct_esc: {}, guarded_stores: [])
+    for l in body.initial.keys():
+        uf_find(st, l)
+        add_local_source(st.srcs, l, body.initial[l])
+    for ev in body.events:
+        if ev.kind == "take" and not af.aliasing_guards.contains_key(guarded_segment(ev.b)):
+            # a value taken out of a guard was fresh when it was stored, and
+            # the guard no longer holds it
+            uf_find(st, ev.a)
+        elif ev.kind == "alias" or ev.kind == "part" or ev.kind == "take":
+            r := alias_roots(af, st, ev.b)
+            uf_find(st, ev.a)
+            for l in r.locals:
+                uf_union(st, ev.a, l)
+            for s in r.sources:
+                add_local_source(st.srcs, ev.a, s)
+            for l in r.held_locals:
+                st.holders.push(ev.a)
+                st.held.push(l)
+            for s in r.held_sources:
+                add_local_source(st.held_srcs, ev.a, s)
+        elif ev.kind == "store":
+            apply_store(st, alias_roots(af, st, ev.a), alias_roots(af, st, ev.b), ev.site)
+        elif ev.kind == "mutate":
+            mark_mutated(st, alias_roots(af, st, ev.a), ev.site)
+        elif ev.kind == "escape":
+            mark_escaped(st, alias_roots(af, st, ev.b), ev.site)
+        elif ev.kind == "call":
+            apply_call(af, st, ev)
+        elif ev.kind == "guarded":
+            st.guarded_stores.push(ev)
+        elif ev.kind == "task_result":
+            # a global's or a frozen field's buffer a task returns reaches
+            # the task that awaits it, which may change it
+            for t in af.targets[ev.a]:
+                if af.summaries.contains_key(t):
+                    for src in af.summaries[t].direct:
+                        mark_source_site(st.direct_esc, src, ev.site)
+                    for src in af.summaries[t].content:
+                        mark_source_site(st.direct_esc, src, ev.site)
+    # a part read out of a group joins every group it holds
+    mut changed := true
+    while changed:
+        changed = false
+        for ev in body.events:
+            if ev.kind == "part" or (ev.kind == "take" and af.aliasing_guards.contains_key(guarded_segment(ev.b))) or (ev.kind == "alias" and alias_roots(af, st, ev.b).part):
+                for l in alias_roots(af, st, ev.b).locals:
+                    for h, i in st.holders:
+                        if uf_find(st, h) == uf_find(st, l) and uf_union(st, ev.a, st.held[i]):
+                            changed = true
+    groups := alias_groups(st)
+    consumed := judge_sinks(af, body, st, groups, report)
+    summary := summarize(af, body, st, groups, consumed)
+    if report:
+        report_alias_errors(af, body, st, groups)
+    return summary
+
+# the solved groups, by their root: each one's own sources, the sources of
+# everything it holds as well, and where it was changed in place, changed
+# through a part, or let escape
+struct AliasGroups:
+    own: Map[Int, List[String]]
+    all: Map[Int, List[String]]
+    mutated: Map[Int, Int]
+    deep: Map[Int, Bool]
+    escaped: Map[Int, Int]
+    members: Map[Int, List[Int]]
+
+fn alias_groups(st: AliasSolve) -> AliasGroups:
+    g := AliasGroups(own: {}, all: {}, mutated: {}, deep: {}, escaped: {}, members: {})
+    for l in st.parent.keys():
+        root := uf_find(st, l)
+        if g.members.contains_key(root):
+            g.members[root].push(l)
+        else:
+            g.members.insert(root, [l])
+    for l in st.srcs.keys():
+        root := uf_find(st, l)
+        for s in st.srcs[l]:
+            add_local_source(g.own, root, s)
+            add_local_source(g.all, root, s)
+    for l in st.held_srcs.keys():
+        root := uf_find(st, l)
+        for s in st.held_srcs[l]:
+            add_local_source(g.all, root, s)
+    for l in st.muts.keys():
+        mark_site(g.mutated, uf_find(st, l), st.muts[l])
+    for l in st.deep_muts.keys():
+        root := uf_find(st, l)
+        mark_site(g.mutated, root, st.deep_muts[l])
+        g.deep.insert(root, true)
+    for l in st.escs.keys():
+        mark_site(g.escaped, uf_find(st, l), st.escs[l])
+    # a holder reaches everything it holds: their sources are its sources,
+    # its escape is theirs, and a change through a part of it may change them
+    mut changed := true
+    while changed:
+        changed = false
+        for h, i in st.holders:
+            hr := uf_find(st, h)
+            dr := uf_find(st, st.held[i])
+            if hr == dr:
+                continue
+            for s in list_of(g.all, dr):
+                if not list_of(g.all, hr).contains(s):
+                    add_local_source(g.all, hr, s)
+                    changed = true
+            if g.escaped.contains_key(hr) and not g.escaped.contains_key(dr):
+                g.escaped.insert(dr, g.escaped[hr])
+                changed = true
+            if g.deep.contains_key(hr) and not g.deep.contains_key(dr):
+                g.deep.insert(dr, true)
+                mark_site(g.mutated, dr, g.mutated[hr])
+                changed = true
+    return g
+
+fn list_of(table: Map[Int, List[String]], key: Int) -> List[String]:
+    if table.contains_key(key):
+        return table[key]
+    mut none_found: List[String] := []
+    return none_found
+
+fn is_param_source(src: String) -> Bool:
+    return src == "s" or src.starts_with("p")
+
+fn summarize(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, consumed: Map[String, String]) -> AliasSummary:
+    s := AliasSummary(direct: [], content: [], mutated: [], escaped: [], stores: {}, consumed: consumed, sig: "")
+    for root in g.members.keys():
+        for src in list_of(g.own, root):
+            if is_param_source(src):
+                if g.mutated.contains_key(root):
+                    push_source(s.mutated, src)
+                if g.escaped.contains_key(root):
+                    push_source(s.escaped, src)
+                for other in list_of(g.all, root):
+                    if other != src:
+                        if not s.stores.contains_key(src):
+                            mut stored: List[String] := []
+                            s.stores.insert(src, stored)
+                        push_source(s.stores[src], other)
+    for ev in body.events:
+        if ev.kind == "return":
+            r := alias_roots(af, st, ev.b)
+            for src in r.sources:
+                push_source(s.direct, src)
+            for src in r.held_sources:
+                push_source(s.content, src)
+            for l in r.locals:
+                root := uf_find(st, l)
+                own := list_of(g.own, root)
+                for src in own:
+                    push_source(s.direct, src)
+                for src in list_of(g.all, root):
+                    if r.part:
+                        push_source(s.direct, src)
+                    elif not own.contains(src):
+                        push_source(s.content, src)
+                if g.escaped.contains_key(root):
+                    push_source(s.direct, "x")
+            for l in r.held_locals:
+                root := uf_find(st, l)
+                for src in list_of(g.all, root):
+                    push_source(s.content, src)
+                if g.escaped.contains_key(root):
+                    push_source(s.content, "x")
+    mut keys: List[String] := []
+    for k in s.stores.keys():
+        keys.push(k + "=" + s.stores[k].sort().join(","))
+    for k in consumed.keys():
+        keys.push(k + ":" + consumed[k])
+    s.sig = s.direct.sort().join(",") + ";" + s.content.sort().join(",") + ";" + s.mutated.sort().join(",") + ";" + s.escaped.sort().join(",") + ";" + keys.sort().join(" ")
+    return s
+
+fn local_name(d: Int) -> String:
+    node := get_node(d)
+    if node.kind == "fn_decl":
+        return "self"
+    if node.kind == "binding" or node.kind == "param":
+        return extract_binding_name(node.value)
+    return node.value
+
+# the name of the global a "g", "t" or "h" source names
+fn source_global_name(src: String) -> String:
+    d := parse_integer_string(src.substring(1, src.len()))
+    mut node := get_node(d)
+    if node.kind == "threadlocal" and node.children.len() > 0:
+        node = get_node(node.children[0])
+    return extract_binding_name(node.value)
+
+# whether a value may hold a source and still count as fresh: the guard it is
+# stored back under, or with `guard` "*", a module global or a frozen field,
+# which a task may read since no name changes them
+fn allowed_source(src: String, guard: String) -> Bool:
+    if guard == "*":
+        return src.starts_with("g") or src.starts_with("z")
+    return source_of_guard(src, guard)
+
+# whether a source is the buffer of the guarded field or guarded global `guard`
+fn source_of_guard(src: String, guard: String) -> Bool:
+    if src.starts_with("q"):
+        return src == "q" + guard
+    return src.starts_with("t") and source_global_name(src) == guard
+
+fn describe_source(af: AliasFlow, src: String) -> String:
+    if src.starts_with("g") or src.starts_with("t") or src.starts_with("h"):
+        return "the module global '" + source_global_name(src) + "'"
+    if src.starts_with("z"):
+        return "the frozen field '" + slot_field_name(src) + "'"
+    if src.starts_with("q"):
+        return "the guarded field '" + src.substring(1, src.len()) + "'"
+    return "a value the checker cannot follow (from a call through a function value, an awaited task, or a closure's argument)"
+
+# what makes a value shared rather than fresh, as a phrase, or ""
+fn first_shared(af: AliasFlow, r: Roots) -> String:
+    for l in r.locals:
+        return "'" + local_name(l) + "', which this scope still holds"
+    for l in r.held_locals:
+        return "'" + local_name(l) + "', which this scope still holds"
+    for s in r.sources:
+        return describe_source(af, s)
+    for s in r.held_sources:
+        return describe_source(af, s)
+    return ""
+
+fn inside_block(af: AliasFlow, block: Int, idx: Int) -> Bool:
+    if not af.block_nodes.contains_key(block):
+        mut nodes: Map[Int, Bool] := {}
+        collect_subtree(block, nodes)
+        af.block_nodes.insert(block, nodes)
+    return af.block_nodes[block].contains_key(idx)
+
+# why a value handed to another task, or stored into a guarded collection,
+# is shared rather than fresh, or "". a value is fresh when it holds no
+# buffer of a global, a guarded field or a value the pass cannot follow, and
+# each local it holds is moved: nothing else holds it and it is not used
+# again. a parameter or self may be moved too, which the function's callers
+# then judge at each call: its name goes into `consumed`. a local is used
+# again when a name of its group appears after the value (not in another
+# branch of the same `if` or `match`, and not past a `return` that follows
+# the value), inside a closure, or when the value sits in a loop or a closure
+# the local was declared outside of, which hands the same buffer over once
+# per pass.
+fn shared_refusal(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, value: Int, consumed: List[String], guard: String) -> String:
+    r := alias_roots(af, st, value)
+    for src in r.sources:
+        if not allowed_source(src, guard):
+            return describe_source(af, src)
+    for src in r.held_sources:
+        if not allowed_source(src, guard):
+            return describe_source(af, src)
+    # the groups the value reaches, and every group they hold
+    mut groups: List[Int] := []
+    for l in r.locals:
+        push_local(groups, uf_find(st, l))
+    for l in r.held_locals:
+        push_local(groups, uf_find(st, l))
+    mut at := 0
+    while at < groups.len():
+        for h, i in st.holders:
+            if uf_find(st, h) == groups[at]:
+                push_local(groups, uf_find(st, st.held[i]))
+        at = at + 1
+    mut moved: List[String] := []
+    for root in groups:
+        mut members: List[Int] := [root]
+        if g.members.contains_key(root):
+            members = g.members[root]
+        name := "'" + local_name(members[0]) + "'"
+        mut own_params: List[String] := []
+        for m in members:
+            if body.initial.contains_key(m):
+                if body.initial[m] == "x":
+                    return "'" + local_name(m) + "', a closure's argument, which its caller still holds"
+                push_source(own_params, body.initial[m])
+        for src in list_of(g.all, root):
+            if not own_params.contains(src) and not allowed_source(src, guard):
+                return describe_source(af, src)
+        if g.escaped.contains_key(root):
+            return name + ", which is also stored where the checker cannot follow it"
+        for h, i in st.holders:
+            if uf_find(st, st.held[i]) == root and not groups.contains(uf_find(st, h)):
+                return name + ", which '" + local_name(h) + "' also holds"
+        if used_again(af, body, members, value):
+            return name + ", which this scope uses again"
+        for src in own_params:
+            push_source(moved, src)
+    for src in moved:
+        push_source(consumed, src)
+    return ""
+
+# whether a group of locals is used again once `value` is handed over
+fn used_again(af: AliasFlow, body: AliasBody, members: List[Int], value: Int) -> Bool:
+    if body.parents.len() == 0:
+        note_parents(body.decl, body.parents)
+    # a loop or a closure around the value that does not hold a member's
+    # declaration hands that member over more than once. on the way up, note
+    # which child of each ancestor leads to the value, and the innermost
+    # ancestor that returns after it: nothing outside that one runs after
+    # the value.
+    mut path: Map[Int, Int] := {}
+    mut limit := 0 - 1
+    mut at := value
+    while body.parents.contains_key(at):
+        parent := body.parents[at]
+        path.insert(parent, at)
+        if limit < 0 and returns_after(parent, at):
+            limit = parent
+        kind := get_node(parent).kind
+        if kind == "for_stmt" or kind == "while_stmt" or kind == "while_let" or kind == "lambda":
+            for m in members:
+                if not inside_block(af, parent, m):
+                    return true
+        at = parent
+    mut inside: Map[Int, Bool] := {}
+    collect_subtree(value, inside)
+    mut uses: List[Int] := []
+    mut closure_uses: List[Int] := []
+    collect_uses(af, body.decl, members, inside, 0 - 1, value, uses, closure_uses)
+    # a use inside a closure the value is not in may run at any time
+    if closure_uses.len() > 0:
+        return true
+    node := get_node(value)
+    for u in uses:
+        un := get_node(u)
+        if un.line > node.line or (un.line == node.line and un.col > node.col):
+            if (limit < 0 or inside_block(af, limit, u)) and not exclusive_branches(body, path, u):
+                return true
+    return false
+
+# whether a statement after `child` among `parent`'s children returns or fails
+fn returns_after(parent: Int, child: Int) -> Bool:
+    mut seen := false
+    for c in get_node(parent).children:
+        if seen:
+            kind := get_node(c).kind
+            if kind == "return" or kind == "fail":
+                return true
+        if c == child:
+            seen = true
+    return false
+
+# whether `use` sits in another branch of an `if` or a `match` than the
+# value whose path up the tree `path` records
+fn exclusive_branches(body: AliasBody, path: Map[Int, Int], use: Int) -> Bool:
+    mut at := use
+    while body.parents.contains_key(at):
+        parent := body.parents[at]
+        if path.contains_key(parent):
+            kind := get_node(parent).kind
+            branching := kind == "if_stmt" or kind == "if_expr" or kind == "match" or kind == "match_expr"
+            return branching and path[parent] != at
+        at = parent
+    return false
+
+fn note_parents(idx: Int, parents: Map[Int, Int]):
+    for child in get_node(idx).children:
+        parents.insert(child, idx)
+        note_parents(child, parents)
+
+# the uses of a group's members outside `skip`, in `out`, or in
+# `closure_uses` when inside a closure, a `defer` or an `errdefer` that does
+# not hold `value`: those run later than they read
+fn collect_uses(af: AliasFlow, idx: Int, members: List[Int], skip: Map[Int, Bool], lambda: Int, value: Int, out: List[Int], closure_uses: List[Int]):
+    node := get_node(idx)
+    if (node.kind == "ident" or node.kind == "self") and not skip.contains_key(idx) and af.defs.contains_key(idx) and members.contains(af.defs[idx]):
+        if lambda >= 0 and not inside_block(af, lambda, value):
+            closure_uses.push(idx)
+        else:
+            out.push(idx)
+    mut inner := lambda
+    if node.kind == "lambda" or node.kind == "defer" or node.kind == "errdefer":
+        inner = idx
+    for child in node.children:
+        collect_uses(af, child, members, skip, inner, value, out, closure_uses)
+
+# why a value stored into a guarded collection is shared, or "". a value read
+# under the same guard stays there, when note_aliasing_guards saw it.
+fn guarded_store_refusal(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, ev: AliasEvent, consumed: List[String]) -> String:
+    mut guard := guarded_segment(ev.a)
+    if not af.aliasing_guards.contains_key(guard):
+        guard = ""
+    return shared_refusal(af, body, st, g, ev.b, consumed, guard)
+
+# judge each value the body hands to another task, stores into a guarded
+# collection, or passes to a parameter its callee keeps that way, reporting
+# the shared ones when `report` is set. the result maps each parameter of
+# this body that is moved so ("p<k>" or "s") to the error its callers get.
+fn judge_sinks(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, report: Bool) -> Map[String, String]:
+    mut consumed: Map[String, String] := {}
+    mut refused: Map[Int, Bool] := {}
+    file := af.files[body.module]
+    for ev in body.events:
+        if ev.kind == "handoff":
+            # a field or an element is judged by the checker, by its type, and
+            # so is a module global
+            kind := get_node(ev.b).kind
+            if kind != "field_access" and kind != "index" and kind != "lambda" and not names_global(af, ev.b) and node_may_share(af, ev.b):
+                mut moved: List[String] := []
+                what := shared_refusal(af, body, st, g, ev.b, moved, "")
+                if what == "":
+                    note_consumed(consumed, moved, "E248")
+                else:
+                    refused.insert(ev.b, true)
+                    if report:
+                        node := get_node(ev.b)
+                        af.out.push(Diagnostic("error", "E248", ev.what + " this value: it shares a buffer with " + what + ", and both tasks would reach it", file, node.line, node.col, "hand over a value nothing else holds: build it in the call, or move a local the scope does not use again"))
+        elif ev.kind == "task_read" and not refused.contains_key(ev.a) and node_may_share(af, ev.b):
+            # what the task reads must be moved, or be a value nothing
+            # changes, which both tasks may read at once
+            mut moved: List[String] := []
+            what := shared_refusal(af, body, st, g, ev.b, moved, "*")
+            if what == "":
+                note_consumed(consumed, moved, "E248")
+            elif report and not read_only_local(st, g, alias_roots(af, st, ev.b), body):
+                refused.insert(ev.a, true)
+                node := get_node(ev.b)
+                af.out.push(Diagnostic("error", "E248", "a spawned task evaluates its arguments itself, so this one reads a buffer it shares with " + what + ", while this scope may still change it", file, node.line, node.col, "compute the value before the spawn and hand over the result, or move a local the scope does not use again"))
+        elif ev.kind == "guarded_init" and node_may_share(af, ev.b):
+            mut moved: List[String] := []
+            what := shared_refusal(af, body, st, g, ev.b, moved, "")
+            if what == "":
+                note_consumed(consumed, moved, "E276")
+            elif report:
+                node := get_node(ev.b)
+                af.out.push(Diagnostic("error", "E276", "'" + ev.what + "' is guarded, and the value this builds it with shares a buffer with " + what + ", so the buffer is reached outside the lock", file, node.line, node.col, "build the value in the call, or store a copy"))
+        elif ev.kind == "call":
+            for t in af.targets[ev.a]:
+                if af.summaries.contains_key(t):
+                    kept := af.summaries[t].consumed
+                    for key in kept.keys():
+                        arg := call_arg(af, ev.a, t, key)
+                        if arg >= 0 and node_may_share(af, arg):
+                            mut moved: List[String] := []
+                            what := shared_refusal(af, body, st, g, arg, moved, "")
+                            if what == "":
+                                note_consumed(consumed, moved, kept[key])
+                            elif report:
+                                mut where := "hands it to another task"
+                                if kept[key] == "E276":
+                                    where = "stores it under a lock"
+                                node := get_node(arg)
+                                af.out.push(Diagnostic("error", kept[key], "'" + get_node(t).value + "' " + where + ", so it must hold no buffer anything else reaches, and this argument shares one with " + what, file, node.line, node.col, "pass a value nothing else holds, or a copy"))
+    if report:
+        report_lock_leaks(af, body, st, g)
+    for ev in st.guarded_stores:
+        if node_may_share(af, ev.b):
+            mut moved: List[String] := []
+            why := guarded_store_refusal(af, body, st, g, ev, moved)
+            if why == "":
+                note_consumed(consumed, moved, "E276")
+            elif report:
+                node := get_node(ev.b)
+                af.out.push(Diagnostic("error", "E276", "'" + guarded_segment(ev.a) + "' is guarded, and this stores a value that shares a buffer with " + why + ", so the buffer is reached outside the lock", file, node.line, node.col, "store a copy, or build the value inside the block"))
+    return consumed
+
+# a value returned out of a `locked` block, or stored in a local declared
+# outside it, that holds a guarded buffer reaches it after the lock is
+# released (E276). the checker judges a path or a call that returns its
+# argument; this covers a value that holds the buffer some other way, such as
+# a struct a call builds around it or a local that took one.
+fn report_lock_leaks(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups):
+    for ev in body.events:
+        mut how := ""
+        if ev.block >= 0 and ev.kind == "return":
+            how = "this returns it out of the block"
+        elif ev.block >= 0 and (ev.kind == "alias" or ev.kind == "part") and not inside_block(af, ev.block, ev.a):
+            how = "this stores it where it outlives the block"
+        if how != "" and guarded_segment(ev.b) == "" and node_may_share(af, ev.b):
+            guarded := guarded_source(af, st, g, alias_roots(af, st, ev.b))
+            if guarded != "":
+                node := get_node(ev.b)
+                af.out.push(Diagnostic("error", "E276", "this value holds " + describe_source(af, guarded) + ", and " + how + ", so the buffer is reached after the lock is released", af.files[body.module], node.line, node.col, "copy what is needed inside the block"))
+
+# the first guarded buffer a value holds, as a source, or ""
+fn guarded_source(af: AliasFlow, st: AliasSolve, g: AliasGroups, r: Roots) -> String:
+    mut found: List[String] := []
+    for src in r.sources:
+        found.push(src)
+    for src in r.held_sources:
+        found.push(src)
+    for l in r.locals:
+        for src in list_of(g.all, uf_find(st, l)):
+            found.push(src)
+    for l in r.held_locals:
+        for src in list_of(g.all, uf_find(st, l)):
+            found.push(src)
+    for src in found:
+        if src.starts_with("q") or src.starts_with("t"):
+            return src
+    return ""
+
+# whether a value reaches only locals of this function that nothing changes
+# in place, lets escape, or holds from outside: two tasks may read such a
+# value at once
+fn read_only_local(st: AliasSolve, g: AliasGroups, r: Roots, body: AliasBody) -> Bool:
+    if r.sources.len() > 0 or r.held_sources.len() > 0:
+        return false
+    mut groups: List[Int] := []
+    for l in r.locals:
+        push_local(groups, uf_find(st, l))
+    for l in r.held_locals:
+        push_local(groups, uf_find(st, l))
+    mut at := 0
+    while at < groups.len():
+        for h, i in st.holders:
+            if uf_find(st, h) == groups[at]:
+                push_local(groups, uf_find(st, st.held[i]))
+        at = at + 1
+    for root in groups:
+        if g.mutated.contains_key(root) or g.escaped.contains_key(root):
+            return false
+        for src in list_of(g.all, root):
+            if not src.starts_with("g") and not src.starts_with("z"):
+                return false
+        if g.members.contains_key(root):
+            for m in g.members[root]:
+                if body.initial.contains_key(m):
+                    return false
+        for h, i in st.holders:
+            if uf_find(st, st.held[i]) == root and not groups.contains(uf_find(st, h)):
+                return false
+    return true
+
+fn note_consumed(consumed: Map[String, String], moved: List[String], code: String):
+    for src in moved:
+        if not consumed.contains_key(src):
+            consumed.insert(src, code)
+
+fn report_alias_errors(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups):
+    file := af.files[body.module]
+    for root in g.members.keys():
+        own := list_of(g.own, root)
+        if g.mutated.contains_key(root):
+            for src in own:
+                report_shared_change(af, body, src, g.mutated[root], "is changed in place")
+        if g.escaped.contains_key(root):
+            for src in own:
+                report_shared_change(af, body, src, g.escaped[root], "is handed where the checker cannot follow it")
+        # a value another function handed in now holds the shared buffer
+        mut param_held := false
+        for src in own:
+            if is_param_source(src):
+                param_held = true
+        if param_held:
+            for src in list_of(g.all, root):
+                if not own.contains(src):
+                    report_shared_change(af, body, src, body.decl, "is stored into a value '" + get_node(body.decl).value + "' was handed")
+    for src in st.direct_mut.keys():
+        report_shared_change(af, body, src, st.direct_mut[src], "is changed in place")
+    for src in st.direct_esc.keys():
+        report_shared_change(af, body, src, st.direct_esc[src], "is handed where the checker cannot follow it")
+
+# a module global or a frozen field whose buffer `how` at `site`
+fn report_shared_change(af: AliasFlow, body: AliasBody, src: String, site: Int, how: String):
+    if not src.starts_with("g") and not src.starts_with("z"):
+        return
+    if af.reported.contains_key(src):
+        return
+    at := af.files[body.module] + ":" + get_node(site).line.to_string()
+    if src.starts_with("g"):
+        d := parse_integer_string(src.substring(1, src.len()))
+        if af.skip_globals.contains_key(d):
+            return
+        af.reported.insert(src, true)
+        node := get_node(d)
+        af.out.push(Diagnostic("error", "E309", "'" + af.globals[d] + "' is a module global every task can reach, and its buffer " + how + " at " + at + ", in a program that spawns tasks", af.global_file[d], node.line, node.col, "declare it in a `guard` block, mark it `threadlocal`, or change a copy"))
+        return
+    af.reported.insert(src, true)
+    node := get_node(site)
+    af.out.push(Diagnostic("error", "E275", "'" + slot_field_name(src) + "' is frozen, and its value " + how + " through another name, while another task may be reading it", af.files[body.module], node.line, node.col, "change a copy, or move the field into a `guard` block"))

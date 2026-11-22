@@ -1,0 +1,25 @@
+# a tuple, an optional or an enum holding a list is shared like the list
+# (E248)
+enum Msg:
+    Data(List[String])
+    Empty
+
+fn pair(p: (List[String], Int)) -> Int:
+    return p.1
+
+fn maybe(o: List[String]?) -> Int:
+    return 0
+
+fn message(m: Msg) -> Int:
+    return 0
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    p := (xs, 1)
+    o: List[String]? := xs
+    m := Msg.Data(xs)
+    a := spawn pair(p)
+    b := spawn maybe(o)
+    c := spawn message(m)
+    print("{await a} {await b} {await c}")
+    return 0

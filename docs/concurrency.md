@@ -199,14 +199,23 @@ concurrent mutation races on that buffer.
 
 pass data between tasks through a channel rather than sharing a
 mutable collection. a channel hands over the handle, so the sender must not
-keep one: send a value built in the call, or an independent copy
-(`std.collections.copy_list` and friends). the checker enforces this for a
-`spawn` argument and for a channel `send` or `try_send`: a collection the
-current scope still holds reports E248, and so does a struct whose fields
-reach a collection outside a `guard` block. a module global collection
-passed to `spawn` or sent is refused as well, since the program still holds
-it: a task reads the global directly, or takes a copy. writing a global from
-several tasks is covered by the sharing rule (E309).
+keep one: send a value built in the call, a local it does not use again, or
+an independent copy (`std.collections.copy_list` and friends). the checker
+enforces this for a `spawn` argument and for a channel `send` or `try_send`
+(E248). a value crosses when nothing else holds what it holds: it is built
+from fresh parts, or it is a local that nothing else holds and that the scope
+does not use again after the handoff (a use in another branch of the same
+`if`, or after a `return`, does not count). a call result counts as fresh
+only when the function builds it from fresh parts: one that returns its
+parameter, or builds a struct around it, hands back the argument's buffer. a
+module global collection passed to `spawn` or sent is refused as well, since
+the program still holds it: a task reads the global directly. writing a
+global from several tasks is covered by the sharing rule (E309).
+
+a spawn evaluates its arguments on the new task. so `spawn total(copy_list(xs))`
+copies `xs` there, while this task may still be pushing to it, and it is
+refused unless the scope does not use `xs` again. make the copy first and
+hand it over: `own := copy_list(xs)` then `spawn total(own)`.
 
 a struct field that holds a string, a struct, an optional or another counted
 value is one pointer, and a task that reassigns it frees the old value while
@@ -224,8 +233,10 @@ a closure captures the values it uses by handle, so a closure that runs on
 another task shares what it captured with the scope that made it. the checker
 follows each function value to the places it can run: a spawn's argument,
 callee or receiver, a sent value, a module global, a field of a struct that
-crosses to a task, a capture of a closure that crosses, and any parameter,
-field or result that flows into one of those, across the whole program. a
+crosses to a task, a capture of a closure that crosses, the result of a
+spawned call, and any parameter, field or result that flows into one of
+those, across the whole program. a closure made in a generic function is
+judged by the types its captures take in each specialization. a
 closure that can reach another task must capture only what a spawn argument
 could carry: no collection outside a `guard` block, and no struct with such a
 collection or with a counted field some code reassigns (E248). a request
@@ -302,7 +313,10 @@ in a program that spawns tasks, a `mut` global that is written after module
 init and holds a collection, a struct or another counted value (a string, an
 optional, a function value) must be in a `guard` block or `threadlocal`, and
 the compiler refuses one that is neither (E309). a global whose struct fields
-some code reassigns is refused the same way, `mut` or not.
+some code reassigns is refused the same way, `mut` or not, and so is a global
+collection, `mut` or not, that some code changes in place through any name:
+its own, a local it was copied into, or a handle a function returns. a global
+only read needs no lock.
 
 a value read inside `locked` stays there: storing a guarded collection in
 a variable declared outside the block, returning it, or capturing it in a
@@ -311,9 +325,16 @@ unlock. so is a guarded struct with a counted field that some code reassigns.
 a name bound inside the block to a guarded value counts as the guarded value
 for the rest of the block: a local (`list := self.idle[key]`), a loop
 variable over it, an `if let` binding of it, the result of `get` or `unwrap`
-on it, and the result of a function that returns its argument. moving it out
-and giving the field a new value, as a drain does, is allowed, and so is
-storing it back under the same guard. data that is built once and only read after belongs in a `frozen`
+on it, the result of a function that returns its argument, and any value
+built around it. moving it out and giving the field a new value, as a drain
+does, is allowed, as is reading an element and removing it in the same block,
+and so is storing it back under the same guard.
+
+the other way round, a value stored into a guarded collection must not stay
+reachable outside the lock (E276). it is built in the call, or a local the
+scope does not use again after the store. a pool's `release(conn)` keeps what
+it is handed, so its callers hand over a connection they are done with; one
+that keeps using it is refused. data that is built once and only read after belongs in a `frozen`
 field (see docs/ownership.md), which any task reads with no lock.
 
 `guard shard_mu[8]:` declares a list of eight mutexes, for state split into

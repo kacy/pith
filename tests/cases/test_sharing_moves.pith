@@ -1,0 +1,114 @@
+# the forms the buffer sharing rules accept, run across tasks. a value handed
+# to a task, sent, or stored under a lock may be built fresh in place, come
+# from a call that builds it fresh, or be a local this scope moves: nothing
+# else holds it and it is not used again. a parameter may be moved too, and
+# its callers then pass a fresh or moved value. a module global holding a
+# list and a frozen field are shared by every task, and stay correct as long
+# as no name changes them.
+from std.collections import copy_list
+
+struct Box:
+    items: List[String]
+
+struct Table:
+    frozen rows: List[String]
+    frozen extra: List[String]
+
+struct Shelf:
+    guard mu:
+        mut boxes: Map[String, Box]
+
+NAMES: List[String] := ["ada", "bo", "cy"]
+NONE_YET: List[String] := []
+
+fn fill(n: Int) -> List[String]:
+    mut out: List[String] := []
+    for i in 0..n:
+        out.push("item {i}")
+    return out
+
+fn boxed(b: Box) -> Int:
+    b.items.push("task")
+    return b.items.len()
+
+fn total(xs: List[Int]) -> Int:
+    mut t := 0
+    for x in xs:
+        t = t + x
+    return t
+
+fn name_letters() -> Int:
+    mut n := 0
+    for name in NAMES:
+        n = n + name.len()
+    return n
+
+fn table_size(t: Table) -> Int:
+    return t.rows.len() + t.extra.len()
+
+fn receive(ch: Channel[Box]) -> Int:
+    mut n := 0
+    while let b = ch.recv():
+        n = n + boxed(b)
+    return n
+
+impl Shelf:
+    # keeps the box it is handed, so a caller passes one it no longer uses
+    fn put(key: String, b: Box):
+        locked self.mu:
+            if not self.boxes.contains_key(key):
+                self.boxes.insert(key, b)
+                return
+        b.items.clear()
+
+    # a box taken out of the guarded map is no longer in it
+    fn take(key: String) -> Box?:
+        locked self.mu:
+            return self.boxes.take(key)
+
+fn send_two(ch: Channel[Box], first: Bool):
+    xs := fill(2)
+    if first:
+        ch.send(Box(items: xs))
+    else:
+        print("kept {xs.len()}")
+
+fn main() -> Int!:
+    # built in the call, or by a call that builds it fresh
+    a := spawn boxed(Box(items: ["x"]))
+    b := spawn boxed(Box(items: fill(3)))
+    # a local moved into the task: not used again
+    ys := fill(4)
+    c := spawn boxed(Box(items: ys))
+    # a copy of a list of numbers holds no buffer of the original. the copy
+    # is made before the spawn: a spawn evaluates its arguments on the new
+    # task, which would read `nums` while this task pushes to it.
+    nums: List[Int] := [1, 2, 3]
+    copied := copy_list(nums)
+    d := spawn total(copied)
+    nums.push(4)
+    # a list moved whole
+    mine: List[Int] := [5, 6]
+    m := spawn total(mine)
+    # a global and frozen fields only read
+    e := spawn name_letters()
+    table := Table(rows: NAMES, extra: NONE_YET)
+    f := spawn table_size(table)
+    # sends: a moved local, and one in exclusive branches
+    ch := Channel[Box](4)
+    r := spawn receive(ch)
+    zs := fill(1)
+    ch.send(Box(items: zs))
+    send_two(ch, true)
+    send_two(ch, false)
+    ch.close()
+    # a guarded store of a moved local, through a method that keeps it
+    shelf := Shelf(boxes: {})
+    kept := Box(items: fill(2))
+    shelf.put("k", kept)
+    shelf.put("k", Box(items: fill(5)))
+    mut taken := 0
+    if let got = shelf.take("k"):
+        taken = got.items.len()
+    print("{await a} {await b} {await c} {await d} {await m} {nums.len()} {await e} {await f} {await r} {taken}")
+    return 0

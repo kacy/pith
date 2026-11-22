@@ -5756,17 +5756,18 @@ impl Client:
             c.writer.free()
             idle = WireConn(c.stream, BufferedBytesReader(0), BufferedBytesWriter(0), c.tls_conn, false, c.key, 0, false)
         idle.idle_since = time_mod.mono_millis()
-        mut keep := false
+        key := c.key
+        # once the connection is in the pool another task may take it, so
+        # nothing here touches it after the push
         locked self.pool.mu:
             mut list: List[WireConn] := []
-            if self.pool.idle.contains_key(c.key):
-                list = self.pool.idle[c.key]
-            keep = list.len() < self.max_idle_conns_per_host
-            if keep:
+            if self.pool.idle.contains_key(key):
+                list = self.pool.idle[key]
+            if list.len() < self.max_idle_conns_per_host:
                 list.push(idle)
-                self.pool.idle[c.key] = list
-        if not keep:
-            wire_close(idle)
+                self.pool.idle[key] = list
+                return
+        wire_close(idle)
 
     # write `req` on `c` and read its response. the body is streamed into
     # `writer` when `streaming` is set, except a redirect's, which the caller

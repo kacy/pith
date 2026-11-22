@@ -1,0 +1,15 @@
+# a frozen field's list changed through another name while a task reads it
+# (E275)
+struct Table:
+    frozen rows: List[String]
+
+fn reader(t: Table) -> Int:
+    return t.rows.len()
+
+fn main() -> Int!:
+    t := Table(rows: [])
+    task := spawn reader(t)
+    xs := t.rows
+    xs.push("main")
+    print("{await task}")
+    return 0

@@ -34,7 +34,6 @@ import std.net.tcp as tcp
 import std.net.tls as tls
 from std.io import TcpStream
 from std.iter import Iterator
-from std.collections import pop_last
 
 # backend messages come off an untrusted socket, so the frame length the server
 # advertises is bounded before it drives a read: a hostile or MITM'd peer must
@@ -642,7 +641,12 @@ impl Pool:
         self.slots.recv()
         mut reused: Conn? := none
         locked self.mu:
-            reused = pop_last(self.idle)
+            n := self.idle.len()
+            if n > 0:
+                # taken out, so the pool no longer reaches it
+                last := n - 1
+                reused = self.idle[last]
+                self.idle.remove(last)
         if reused != none:
             return reused?
         fresh := connect(self.host, self.port, self.user, self.password, self.database)
@@ -654,15 +658,15 @@ impl Pool:
     # return a connection for reuse, or close it if the pool is already full,
     # then hand its slot back. the idle list is updated before the slot returns,
     # so an acquirer woken by that slot finds the connection waiting for it and
-    # does not open a redundant one.
+    # does not open a redundant one. a kept connection is not touched again
+    # once it is in the idle list, which another task may take it from.
     pub fn release(conn: Conn):
-        mut keep := false
         locked self.mu:
-            keep = self.idle.len() < self.max_open
-            if keep:
+            if self.idle.len() < self.max_open:
                 self.idle.push(conn)
-        if not keep:
-            conn.close()
+                self.slots.send(true)
+                return
+        conn.close()
         self.slots.send(true)
 
     # close a checked-out connection that must not go back into rotation (it is

@@ -7,28 +7,35 @@
 # its parent. this example builds and evaluates `add(1 + 2, x)` with those
 # two structures, and caches each node's value in an Int-keyed map.
 
+# what a node is. the tag is a plain enum, so every node has the same shape
+enum Kind:
+    Number
+    Name
+    Plus
+    Call
+
 # children are indices into the arena, not nodes
-enum Node:
-    Number(Int)
-    Name(String)
-    Plus(Int, Int)
-    Call(String, List[Int])
+struct Node:
+    kind: Kind
+    value: String
+    children: List[Int]
 
 struct Arena:
     nodes: List[Node]
 
 impl Arena:
     # returns the new node's index, which is how everything else refers to it
-    fn add(node: Node) -> Int:
-        self.nodes.push(node)
+    fn add(kind: Kind, value: String, children: List[Int]) -> Int:
+        self.nodes.push(Node(kind: kind, value: value, children: children))
         return self.nodes.len() - 1
 
     fn render(index: Int) -> String:
-        return match self.nodes[index]:
-            Node.Number(value) => value.to_string()
-            Node.Name(name) => name
-            Node.Plus(left, right) => "({self.render(left)} + {self.render(right)})"
-            Node.Call(name, arguments) => "{name}({arguments.map(fn(argument: Int) => self.render(argument)).join(", ")})"
+        node := self.nodes[index]
+        return match node.kind:
+            Kind.Number => node.value
+            Kind.Name => node.value
+            Kind.Plus => "({self.render(node.children[0])} + {self.render(node.children[1])})"
+            Kind.Call => "{node.value}({node.children.map(fn(child: Int) => self.render(child)).join(", ")})"
 
 struct Scope:
     parent: Int
@@ -46,27 +53,28 @@ fn lookup(scopes: List[Scope], scope_index: Int, name: String) -> Int?:
 fn evaluate(arena: Arena, index: Int, scopes: List[Scope], scope_index: Int, cache: Map[Int, Int]) -> Int!:
     if let cached = cache.get(index):
         return cached
+    node := arena.nodes[index]
     mut value := 0
-    match arena.nodes[index]:
-        Node.Number(number) =>
-            value = number
-        Node.Name(name) =>
-            value = lookup(scopes, scope_index, name)?
-        Node.Plus(left, right) =>
-            value = evaluate(arena, left, scopes, scope_index, cache)! + evaluate(arena, right, scopes, scope_index, cache)!
-        Node.Call(_, arguments) =>
-            for argument in arguments:
-                value += evaluate(arena, argument, scopes, scope_index, cache)!
+    match node.kind:
+        Kind.Number =>
+            value = parse_int(node.value)!
+        Kind.Name =>
+            value = lookup(scopes, scope_index, node.value)?
+        Kind.Plus =>
+            value = evaluate(arena, node.children[0], scopes, scope_index, cache)! + evaluate(arena, node.children[1], scopes, scope_index, cache)!
+        Kind.Call =>
+            for child in node.children:
+                value += evaluate(arena, child, scopes, scope_index, cache)!
     cache[index] = value
     return value
 
 fn main():
     arena := Arena(nodes: [])
-    one := arena.add(Node.Number(1))
-    two := arena.add(Node.Number(2))
-    sum := arena.add(Node.Plus(one, two))
-    x := arena.add(Node.Name("x"))
-    root := arena.add(Node.Call("add", [sum, x]))
+    one := arena.add(Kind.Number, "1", [])
+    two := arena.add(Kind.Number, "2", [])
+    sum := arena.add(Kind.Plus, "", [one, two])
+    x := arena.add(Kind.Name, "x", [])
+    root := arena.add(Kind.Call, "add", [sum, x])
     print("expression: {arena.render(root)}, {arena.nodes.len()} nodes")
 
     # the module scope, a function inside it, and a block inside that
@@ -83,7 +91,7 @@ fn main():
     print("cached nodes: {cache.len()}, node {sum} is {cache[sum]}")
 
     # a name that no scope defines makes evaluation fail rather than guess
-    z := arena.add(Node.Name("z"))
-    missing := arena.add(Node.Call("add", [one, z]))
+    z := arena.add(Kind.Name, "z", [])
+    missing := arena.add(Kind.Call, "add", [one, z])
     result := evaluate(arena, missing, scopes, 2, cache)
     print("evaluating {arena.render(missing)} fails: {result.is_err}")

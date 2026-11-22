@@ -1,0 +1,57 @@
+# a local annotated with an alias of a collection type (`type Timings =
+# Map[String, Int]`) was never released. the emitter dropped an alias whose
+# target was a generic type, so the local kept the alias name as its kind,
+# which is not a counted kind: the exit cleanup skipped it and a returned one
+# took an extra count. each shape here leaked its container every round.
+import leakprobe as probe
+
+type Timings = Map[String, Int]
+type Names = List[String]
+
+struct Report:
+    timings: Timings
+    names: Names
+
+fn local_map(i: Int) -> Int:
+    mut timings: Timings := {}
+    timings["a-" + i.to_string()] = i
+    return timings.len()
+
+fn returned_list(i: Int) -> Names:
+    mut out: Names := []
+    out.push("x-" + i.to_string())
+    return out
+
+fn sum(t: Timings) -> Int:
+    mut s := 0
+    for v in t.values():
+        s = s + v
+    return s
+
+fn field_store(i: Int) -> Report:
+    mut t: Timings := {}
+    t["k-" + i.to_string()] = i
+    return Report(timings: t, names: returned_list(i))
+
+fn list_of_alias(i: Int) -> Int:
+    mut all: List[Timings] := []
+    mut t: Timings := {}
+    t["z-" + i.to_string()] = i
+    all.push(t)
+    return all.len()
+
+fn round(i: Int) -> Int:
+    r := field_store(i)
+    return local_map(i) + returned_list(i).len() + sum(r.timings) + r.names.len() + list_of_alias(i)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

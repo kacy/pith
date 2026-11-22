@@ -60,7 +60,7 @@ from ir_ast_helpers import ir_list_contains, ir_unwrap_pub_node, ir_unwrap_pub_c
 from ir_capture import ir_capture_find_free_vars
 from return_paths import statement_always_leaves
 from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_decode_result_value, ir_emit_result_flag_field, ir_emit_result_error_message, ir_emit_result_value_field, ir_result_field_kind
-from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_optional_value_as, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read
+from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_optional_value_as, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read, ir_emit_weak_field_read
 from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
@@ -1460,8 +1460,12 @@ fn ir_expr_is_borrowed(idx: Int) -> Bool:
         # fresh buffer, so it is borrowed exactly when the receiver is. as a
         # fresh name it classified owned, and `take(s.to_string())` released
         # a String parameter its caller still held: a use after free.
-        if mname == "to_string" and node.children.len() > 0 and ir_expr_is_string_receiver(node.children[0]):
+        if ir_is_string_to_string(idx):
             return ir_expr_is_borrowed(node.children[0])
+        # a reduce hands back its accumulator, which holds a count of its own
+        # (ir_emit_list_reduce_lowering)
+        if mname == "reduce":
+            return false
         return not ir_string_method_returns_fresh(mname)
     # a payload-free variant written bare (`Holder.Empty`, or the alias-
     # qualified `mod.Holder.Empty`) parses as a field access but mints a
@@ -1643,6 +1647,13 @@ fn ir_expr_is_string_receiver(idx: Int) -> Bool:
         return false
     info := get_type_info(tid)
     return info.kind == "primitive" and info.name == "String"
+
+# whether idx is `s.to_string()` on a String, which lowers to `s` itself
+fn ir_is_string_to_string(idx: Int) -> Bool:
+    node := get_node(idx)
+    if node.kind != "method_call" or node.children.len() == 0 or ir_plain_method_name(node.value) != "to_string":
+        return false
+    return ir_expr_is_string_receiver(node.children[0])
 
 # every method STRING_RETURNING_METHODS names builds a new string (each one's
 # row in runtime_ownership.txt says `own`), plus the few that list leaves out.
@@ -3922,13 +3933,18 @@ fn ir_arg_pin_kind(expr_idx: Int) -> String:
     if c_argument_widens_to_optional(expr_idx) or not ir_expr_is_borrowed(expr_idx):
         return ""
     mut read_idx := expr_idx
-    while node_kind(read_idx) == "grouped" and get_node(read_idx).children.len() > 0:
+    # `s.to_string()` on a String is the receiver itself (see
+    # ir_expr_is_borrowed), so it needs a pin exactly when the receiver does.
+    # `f(o.name.to_string(), rename(o))` freed the name under the argument.
+    while ir_is_string_to_string(read_idx) or (node_kind(read_idx) == "grouped" and get_node(read_idx).children.len() > 0):
         read_idx = get_node(read_idx).children[0]
     read_kind := node_kind(read_idx)
+    # any other borrowed method result is a builtin's view into storage this
+    # frame does not own, so it is pinned like a field or element read
     if read_kind == "ident":
         if not ir_reads_mutable_global(get_node(read_idx).value):
             return ""
-    elif read_kind != "field_access" and read_kind != "index":
+    elif read_kind != "field_access" and read_kind != "index" and read_kind != "method_call":
         return ""
     kind := ir_rc_kind(ir_infer_type(read_idx))
     if kind == "weak":
@@ -6551,9 +6567,11 @@ fn ir_higher_order_fn_may_drop(fn_idx: Int) -> Bool:
     return true
 
 # the list an open-coded loop walks: the list itself, or a copy when the
-# function may drop it (above)
-fn ir_higher_order_walk_list(list_r: Int, may_drop: Bool) -> Int:
-    if not may_drop:
+# function may drop it (above). a list nothing else holds (`xs.map(f)` as the
+# receiver of `.filter(g)`) can't be dropped by anyone, so it is walked as it
+# is and released once the walk is done (ir_higher_order_walk_done).
+fn ir_higher_order_walk_list(list_idx: Int, list_r: Int, may_drop: Bool) -> Int:
+    if not ir_higher_order_walks_copy(list_idx, may_drop):
         return list_r
     len_r := ir_reg()
     ir_emit_call1(len_r, "pith_list_len", "int", list_r)
@@ -6561,11 +6579,17 @@ fn ir_higher_order_walk_list(list_r: Int, may_drop: Bool) -> Int:
     ir_emit_call3(copy_r, "list_slice_copy", "list", list_r, ir_zero_reg(), len_r)
     return copy_r
 
-# release the walked copy, the function argument's pin and the function
-# argument itself once the loop is done
-fn ir_higher_order_walk_done(walk_r: Int, may_drop: Bool, fn_idx: Int, fn_r: Int, fn_pin: String):
-    if may_drop:
+fn ir_higher_order_walks_copy(list_idx: Int, may_drop: Bool) -> Bool:
+    return may_drop and ir_expr_is_borrowed(list_idx)
+
+# release the walked copy or the owned list, the function argument's pin and
+# the function argument itself once the loop is done. the owned list was
+# never released, so `xs.map(f).filter(g)` leaked the mapped list.
+fn ir_higher_order_walk_done(list_idx: Int, walk_r: Int, may_drop: Bool, fn_idx: Int, fn_r: Int, fn_pin: String):
+    if ir_higher_order_walks_copy(list_idx, may_drop):
         ir_rc_release_reg(walk_r, "list")
+    else:
+        ir_release_owned_operand(list_idx, walk_r, ir_infer_type(list_idx))
     ir_unpin_operand(fn_r, fn_pin)
     ir_release_higher_order_fn_arg(fn_idx, fn_r)
 
@@ -6649,7 +6673,7 @@ fn ir_fn_bindings_by_param(key: String, decl_idx: Int) -> Map[String, String]:
 
 fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
     may_drop := ir_higher_order_fn_may_drop(mapper_idx)
-    list_r := ir_higher_order_walk_list(ir_expr(list_idx), may_drop)
+    list_r := ir_higher_order_walk_list(list_idx, ir_expr(list_idx), may_drop)
     mapper_r := ir_emit_local_fn_arg(mapper_idx)
     mapper_pin := ir_pin_operand(mapper_idx, mapper_r, may_drop)
     mapper_name := ir_temp_name("__map_fn")
@@ -6671,7 +6695,7 @@ fn ir_emit_list_map_lowering(idx: Int, list_idx: Int, mapper_idx: Int) -> Int:
     ctor := ir_list_ctor_for_elem_kind(result_elem_kind)
 
     out_r := ir_emit_list_map_loop(list_r, ctor, mapper_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_retkind(mapped_kind), ir_temp_name("__map_i"))
-    ir_higher_order_walk_done(list_r, may_drop, mapper_idx, mapper_r, mapper_pin)
+    ir_higher_order_walk_done(list_idx, list_r, may_drop, mapper_idx, mapper_r, mapper_pin)
     return out_r
 
 fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
@@ -6681,7 +6705,7 @@ fn ir_emit_list_filter_call(idx: Int, node: Node) -> Int:
 
 fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
     may_drop := ir_higher_order_fn_may_drop(keep_idx)
-    list_r := ir_higher_order_walk_list(ir_expr(list_idx), may_drop)
+    list_r := ir_higher_order_walk_list(list_idx, ir_expr(list_idx), may_drop)
     keep_r := ir_emit_local_fn_arg(keep_idx)
     keep_pin := ir_pin_operand(keep_idx, keep_r, may_drop)
     keep_name := ir_temp_name("__filter_fn")
@@ -6700,7 +6724,7 @@ fn ir_emit_list_filter_lowering(idx: Int, list_idx: Int, keep_idx: Int) -> Int:
     ctor := ir_list_ctor_for_elem_kind(ir_rc_kind(elem_kind))
 
     out_r := ir_emit_list_filter_loop(list_r, ctor, keep_name, ir_retkind(result_kind), ir_retkind(elem_kind), ir_temp_name("__filter_i"))
-    ir_higher_order_walk_done(list_r, may_drop, keep_idx, keep_r, keep_pin)
+    ir_higher_order_walk_done(list_idx, list_r, may_drop, keep_idx, keep_r, keep_pin)
     return out_r
 
 fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
@@ -6709,25 +6733,37 @@ fn ir_emit_list_reduce_call(idx: Int, node: Node) -> Int:
     return ir_emit_list_reduce_lowering(idx, ir_call_arg_expr_index(node.children[1]), ir_call_arg_expr_index(node.children[2]), ir_call_arg_expr_index(node.children[3]))
 
 fn ir_emit_list_reduce_lowering(idx: Int, list_idx: Int, init_idx: Int, reducer_idx: Int) -> Int:
-    may_drop := ir_higher_order_fn_may_drop(reducer_idx)
-    list_r := ir_higher_order_walk_list(ir_expr(list_idx), may_drop)
+    # the initial value runs after the list is read, so one that can drop the
+    # list (`o.items.reduce(reset(o), f)`) needs the walked copy too
+    may_drop := ir_higher_order_fn_may_drop(reducer_idx) or not ir_subtree_keeps_storage(init_idx, 0 - 1, 0 - 1)
+    list_r := ir_higher_order_walk_list(list_idx, ir_expr(list_idx), may_drop)
     init_r := ir_expr(init_idx)
     reducer_r := ir_emit_local_fn_arg(reducer_idx)
     reducer_pin := ir_pin_operand(reducer_idx, reducer_r, may_drop)
     reducer_name := ir_temp_name("__reduce_fn")
     acc_name := ir_temp_name("__reduce_acc")
-    ir_emit("store " + reducer_name + " " + reducer_r.to_string())
-    ir_emit("store " + acc_name + " " + init_r.to_string())
-
     elem_kind := ir_list_element_kind(list_idx)
     mut result_kind := ir_checked_type(idx)
     if result_kind.len() == 0:
         result_kind = ir_infer_type(init_idx)
     if result_kind.len() == 0:
         result_kind = "unknown"
+    # the accumulator owns one count of its value: a borrowed initial value
+    # takes one here, and each step gives the old value's back once the
+    # reducer has returned the new one. the steps released nothing, so every
+    # intermediate accumulator leaked, and an empty list handed back a
+    # borrowed initial value as if it were owned. an optional stays out, as
+    # in ir_owned_arg_kind_releases.
+    mut acc_rc := ir_rc_kind(result_kind)
+    if acc_rc == "tuple" or acc_rc == "weak":
+        acc_rc = ""
+    if acc_rc.len() > 0 and ir_expr_is_borrowed(init_idx):
+        ir_rc_retain_reg(init_r, acc_rc)
+    ir_emit("store " + reducer_name + " " + reducer_r.to_string())
+    ir_emit("store " + acc_name + " " + init_r.to_string())
 
-    out_r := ir_emit_list_reduce_loop(list_r, reducer_name, acc_name, ir_retkind(elem_kind), ir_retkind(result_kind), ir_temp_name("__reduce_i"))
-    ir_higher_order_walk_done(list_r, may_drop, reducer_idx, reducer_r, reducer_pin)
+    out_r := ir_emit_list_reduce_loop(list_r, reducer_name, acc_name, ir_retkind(elem_kind), ir_retkind(result_kind), acc_rc, ir_temp_name("__reduce_i"))
+    ir_higher_order_walk_done(list_idx, list_r, may_drop, reducer_idx, reducer_r, reducer_pin)
     return out_r
 
 fn ir_emit_higher_order_list_call(idx: Int, node: Node, callee_name: String) -> Int:
@@ -6795,6 +6831,9 @@ fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
     list_idx := node.children[0]
     target_idx := ir_method_call_arg_expr(node, 0)
     list_r := ir_expr(list_idx)
+    # a list read out of storage has to outlive a target that can drop it:
+    # `o.items.contains(rename(o))` scanned a freed list
+    list_pin := ir_pin_inflight(list_idx, list_r, not ir_subtree_keeps_storage(target_idx, 0 - 1, 0 - 1))
     target_r := ir_emit_call_arg(target_idx)
     mut elem_kind := ir_list_element_kind(list_idx)
     if obj_type == "list_string":
@@ -6821,6 +6860,7 @@ fn ir_emit_list_index_search(node: Node, obj_type: String) -> Int:
     # alone. the scan returns an index, never an element, so nothing it hands
     # out depends on the list living on.
     ir_release_owned_operand(list_idx, list_r, ir_infer_type(list_idx))
+    ir_unpin_inflight(list_r, list_pin)
     return out_r
 
 fn ir_emit_list_contains_method(node: Node, obj_type: String) -> Int:
@@ -7896,19 +7936,19 @@ fn ir_emit_field_access(idx: Int, node: Node, pre_obj_r: Int) -> Int:
         if checked_r >= 0:
             return checked_r
     field_type := ir_checked_struct_field_type(recv_idx, fname)
-    ir_emit_named_field_access(r, obj_r, lk, fname, field_type)
     # a weak field's slot holds the bare target pointer; synthesize the optional
     # the rest of the pipeline expects, resolving liveness so a reclaimed target
     # reads back as none.
-    if lk.len() > fname.len() + 1:
+    if lk.len() > fname.len() + 1 and ir_struct_field_index_lookup.contains_key(lk):
         weak_struct := lk.substring(0, lk.len() - fname.len() - 1)
         if ir_struct_field_is_weak(weak_struct, fname):
-            weak_r := ir_emit_weak_read(r)
+            weak_r := ir_emit_weak_field_read(obj_r, ir_unpack_field_index(ir_struct_field_index_lookup[lk]) * 8)
             # the shell is fresh and owns the count its upgrade took, so it
             # needs no count to outlive the receiver; only the receiver's
             # count is dropped
             ir_release_owned_field_receiver(recv_idx, obj_r, weak_r, "")
             return weak_r
+    ir_emit_named_field_access(r, obj_r, lk, fname, field_type)
     ir_release_owned_field_receiver(recv_idx, obj_r, r, ir_rc_kind(field_type))
     return r
 
@@ -9196,10 +9236,10 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
                 # without touching the count its owner still needs.
                 ir_getter_consumed_idx = node.children[0]
                 obj_r := ir_expr(node.children[0])
-                ir_emit_optional_value_check(obj_r)
+                owns_subject := ir_optional_subject_is_owned(node.children[0])
+                ir_emit_optional_value_check(obj_r, owns_subject)
                 val_r := ir_optional_value_field(obj_r, recv_tid)
                 inner_kind := ir_rc_kind(ir_type_from_tid(recv_info.inner))
-                owns_subject := ir_optional_subject_is_owned(node.children[0])
                 if ir_extraction_retains(node.children[0], inner_kind, owns_subject):
                     ir_rc_retain_reg(val_r, inner_kind)
                 # a fresh shell (a call or method result) is this expression's
@@ -10713,13 +10753,17 @@ fn ir_emit_miss_return(message: String):
 # is no shell to free on that path. the payload read used to run
 # unconditionally, handing back 0, "" or a null struct handle that faulted on
 # its first field read.
-fn ir_emit_optional_value_check(obj_r: Int):
+# `owns_shell` says the optional is this expression's own (a fresh one), so
+# a miss that fails the function frees it first
+fn ir_emit_optional_value_check(obj_r: Int, owns_shell: Bool):
     flag_r := ir_optional_flag_field(obj_r)
     some_l := ir_label()
     none_l := ir_label()
     ir_emit("brif " + flag_r.to_string() + " " + some_l + " " + none_l)
     ir_emit_label(none_l)
     if ir_current_func_miss_fails:
+        if owns_shell:
+            ir_emit_call1(ir_reg(), "pith_struct_release", "void", obj_r)
         ir_emit_miss_return("value() on none")
     else:
         code_r := ir_reg()
@@ -12196,16 +12240,16 @@ fn ir_emit_field_assignment(target_idx: Int, value_idx: Int) -> Bool:
     # a weak field stores the bare target pointer: drop the old weak reference,
     # take a new one, and never touch the strong count. no owning tuple is
     # involved, so the strong release/retain dance below is skipped entirely.
-    # the old reference is read after the new value, as below.
+    # the old reference is read after the new value, as below, and the swap
+    # and the release are one runtime step that a weak read in another task
+    # can't fall between (pith_struct_weak_store_field).
     weak_struct := lookup_key.substring(0, lookup_key.len() - fname.len() - 1)
     if ir_struct_field_is_weak(weak_struct, fname):
         new_w := ir_emit_weak_payload(value_idx)
-        old_w := ir_reg()
-        ir_emit_named_field_access(old_w, obj_r, lookup_key, fname, value_type)
         ir_emit_share_into(obj_r, new_w, "struct")
-        ir_emit("sstore " + obj_r.to_string() + " " + field_index.to_string() + " " + new_w.to_string())
-        rel_r := ir_reg()
-        ir_emit("call " + rel_r.to_string() + " pith_struct_weak_release void 1 " + old_w.to_string())
+        off_r := ir_reg()
+        ir_emit("iconst " + off_r.to_string() + " " + (field_index * 8).to_string())
+        ir_emit_call3(ir_reg(), "pith_struct_weak_store_field", "void", obj_r, off_r, new_w)
         ir_unpin_operand(obj_r, recv_pin)
         return true
     value_r := ir_emit_holder_value(value_idx, value_type, ir_optional_inner_type_of_tid(c_get_expr_type(target_idx)))

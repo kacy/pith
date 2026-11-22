@@ -1,0 +1,29 @@
+# a map, filter or reduce over a list nothing else holds walked it and never
+# released it, so `xs.map(f).filter(g)` leaked the mapped list. a reduce
+# never released the accumulator it handed the reducer, so every step but
+# the last leaked its value.
+import leakprobe as probe
+
+fn to_len(s: String) -> Int:
+    return s.len()
+
+fn add_len(acc: Map[String, Int], s: String) -> Map[String, Int]:
+    mut m := acc
+    m[s] = s.len()
+    return m
+
+fn churn_round(i: Int):
+    src: List[String] := ["alpha-{i}", "be", "gamma"]
+    kept := src.map(to_len).filter(fn(n: Int) -> Bool => n > 2)
+    total := src.map(to_len).reduce(0, fn(acc: Int, n: Int) -> Int => acc + n)
+    joined := src.reduce("", fn(acc: String, s: String) -> String => acc + s)
+    lens := src.reduce({}, add_len)
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    while i < n:
+        churn_round(i)
+        i = i + 1
+    kb := probe.peak_kb()
+    print("{kb}")

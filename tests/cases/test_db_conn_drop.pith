@@ -30,6 +30,7 @@ PG_POOL_PORT := 24614
 MY_POOL_PORT := 24615
 
 CHURN := 3000
+WARMUP := 50
 
 fn open_fds() -> Int:
     return fs.list("/proc/self/fd").len()
@@ -260,24 +261,29 @@ fn my_commit_tx(handle: mydb.Db) -> Int:
 fn main() -> Int!:
     pg_listener := tcp_listen("127.0.0.1", PG_PORT)!
     pg_task := spawn pg_serve(pg_listener, false)
+    # the first dial opens the runtime's own descriptors (the reactor, the
+    # resolver), so a few rounds run before the count is taken.
+    warm := pg_churn(WARMUP)
     before := open_fds()
-    pg_opened := pg_churn(CHURN)
+    pg_opened := warm + pg_churn(CHURN - WARMUP)
     print("postgres: {pg_opened} connections dropped, fds {growth(before, open_fds())}")
     tcp_close(pg_listener)
     print("postgres stub served {await pg_task}")
 
     my_listener := tcp_listen("127.0.0.1", MY_PORT)!
     my_task := spawn my_serve(my_listener, false)
+    warm_my := my_churn(WARMUP)
     before_my := open_fds()
-    my_opened := my_churn(CHURN)
+    my_opened := warm_my + my_churn(CHURN - WARMUP)
     print("mysql: {my_opened} connections dropped, fds {growth(before_my, open_fds())}")
     tcp_close(my_listener)
     print("mysql stub served {await my_task}")
 
     rd_listener := tcp_listen("127.0.0.1", RD_PORT)!
     rd_task := spawn rd_serve(rd_listener)
+    warm_rd := rd_churn(WARMUP)
     before_rd := open_fds()
-    rd_answered := rd_churn(CHURN)
+    rd_answered := warm_rd + rd_churn(CHURN - WARMUP)
     print("redis: {rd_answered} clients dropped, fds {growth(before_rd, open_fds())}")
     print("redis close twice then drop, next client: {rd_close_then_drop()}")
     tcp_close(rd_listener)

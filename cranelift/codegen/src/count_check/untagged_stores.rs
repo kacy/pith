@@ -12,6 +12,11 @@
 //! slots and struct fields, and reports a plain store of a counted value into
 //! one. A store that carries the value's kind (`map_insert_kind`) lets the
 //! container adopt it, so only the plain stores are checked.
+//!
+//! It also reports a struct built over the error type (`struct:Bag[<error>]`):
+//! an instance whose type parameter the checker never fixed. Its `= {}` and
+//! `= []` defaults are built untagged, and the stores into them happen in
+//! other functions, where the per-function walk above cannot follow them.
 
 use super::{is_counted, kind_of_text};
 use std::collections::{HashMap, HashSet};
@@ -152,6 +157,17 @@ fn check_function(body: &[Vec<&str>], kinds: &HashMap<&str, &str>) -> Vec<String
     }
     let mut problems = Vec::new();
     for ins in body {
+        if ins[0] == "call"
+            && ins.len() >= 4
+            && ins[2] == "pith_struct_alloc"
+            && ins[3].contains("<error>")
+        {
+            problems.push(format!(
+                "`{}` builds a struct over an unresolved type parameter, whose container defaults take no count of what is stored into them",
+                ins.join(" ")
+            ));
+            continue;
+        }
         if ins[0] != "call" || ins.len() < 5 {
             continue;
         }
@@ -224,6 +240,23 @@ mod tests {
     #[test]
     fn a_borrowed_string_stored_into_a_tagged_field_map_is_fine() {
         assert!(check(&field_store("pith_map_new_cstr_val")).is_empty());
+    }
+
+    // b := Bag() in a generic body, before the instance came from its target
+    #[test]
+    fn a_struct_built_over_the_error_type_is_reported() {
+        let ir = "
+            func make__string 0 struct:Bag
+            call 0 pith_map_new_default map 0
+            iconst 2 1
+            call 1 pith_struct_alloc struct:Bag[<error>] 1 2
+            sstore 1 0 0
+            ret 1
+            endfunc
+        ";
+        let problems = check(ir);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("Bag[<error>]"), "{problems:?}");
     }
 
     #[test]

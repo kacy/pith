@@ -1,0 +1,14 @@
+# a tls.Conn owns its session and closes it when it dies, so std no longer
+# rebuilds one from a bare handle: a second Conn over the same handle would
+# close the session out from under the first. conn_from_handle and
+# listener_from_handle are gone; hold the Conn or the Listener itself.
+import std.net.tls as tls
+
+fn reopen(conn: tls.Conn) -> tls.Conn:
+    return tls.conn_from_handle(conn.handle)
+
+fn relisten(listener: tls.Listener) -> tls.Listener:
+    return tls.listener_from_handle(listener.handle)
+
+fn main():
+    print("unreachable")

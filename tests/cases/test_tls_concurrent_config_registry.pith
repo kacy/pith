@@ -32,8 +32,8 @@ ROUNDS := 60000
 DIALERS := 6
 CONFIGS_PER_DIALER := 3
 
-fn serve_conn(listener_handle: Int, fd: Int):
-    conn_r := tls.listener_from_handle(listener_handle).handshake(fd)
+fn serve_conn(listener: tls.Listener, fd: Int):
+    conn_r := listener.handshake(fd)
     if conn_r.is_err:
         return
     conn := conn_r.ok
@@ -44,13 +44,12 @@ fn serve_conn(listener_handle: Int, fd: Int):
     conn.write_all("echo:" + msg_r.ok) catch 0
     conn.close()
 
-fn run_server(listener_handle: Int):
-    listener := tls.listener_from_handle(listener_handle)
+fn run_server(listener: tls.Listener):
     while true:
         fd_r := listener.accept_socket()
         if fd_r.is_err:
             return
-        spawn serve_conn(listener_handle, fd_r.ok)
+        spawn serve_conn(listener, fd_r.ok)
 
 # write to the registry without pause: set an alpn list, set the resumption
 # flag, drop the alpn list again. every round is three map operations on maps
@@ -112,7 +111,7 @@ fn main() -> Int!:
     # bind before any client task starts, so a dial can never race the bind.
     server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["pith.rpc"])
     listener := tls.listen("127.0.0.1", PORT, server_cfg)!
-    spawn run_server(listener.handle)
+    spawn run_server(listener)
 
     total_configs := DIALERS * CONFIGS_PER_DIALER
     handles := Channel[Int](total_configs)

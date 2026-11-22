@@ -226,10 +226,16 @@ guard native_session_mu:
 pub struct Config:
     pub handle: Int
 
-# An established TLS connection. It is a handle, cheap to copy, and safe to share
-# across tasks under one contract: at most one reader and one writer at a time
-# (the two directions run concurrently). read_bytes/write_bytes below carry the
-# per-call details.
+# An established TLS connection. Copying a Conn copies a reference to one
+# value, so it is cheap and safe to share across tasks under one contract: at
+# most one reader and one writer at a time (the two directions run
+# concurrently). read_bytes/write_bytes below carry the per-call details.
+#
+# a Conn owns its session and its socket. close() sends close_notify and
+# releases both; a Conn nobody closed releases them without the alert when the
+# last value naming it goes away (Conn implements Drop). `handle` identifies
+# the session and must not be used to build a second Conn: that one would
+# close the session out from under the first when it died.
 pub struct Conn:
     pub handle: Int
 
@@ -263,6 +269,9 @@ pub struct ConnectionState:
 # block, so no task reads one while another frees it.
 struct NativeConnState:
     fd: Int
+    # the stream the handshake ran over, held so the connection's reads and
+    # writes reuse it rather than building a new TcpStream over `fd` per call.
+    stream: TcpStream
     cipher: Int
     cache_key: String
     resumption_master_secret: Bytes
@@ -1190,7 +1199,7 @@ fn lookup_resumable_client_session(cache_key: String) -> CachedSession:
         return session
 
 fn allocate_native_conn(stream: TcpStream, version: Int, cipher: Int, read_keys: tls13.TrafficKeys, write_keys: tls13.TrafficKeys, read_seq: Int, write_seq: Int, cache_key: String, resumption_master_secret: Bytes, state: ConnectionState, read_secret: Bytes, write_secret: Bytes) -> Conn:
-    cs := NativeConnState(fd: stream.fd, cipher: cipher, cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, failed: false, key_update_responded: false, read_key: read_keys.key, read_iv: read_keys.iv, read_seq: read_seq, pending: bytes.empty(), handshake_tail: bytes.empty(), read_secret: read_secret, key_updates_received: 0, write_key: write_keys.key, write_iv: write_keys.iv, write_seq: write_seq, write_secret: write_secret)
+    cs := NativeConnState(fd: stream.fd, stream: stream, cipher: cipher, cache_key: cache_key, resumption_master_secret: resumption_master_secret, state: copy_connection_state(state), version: version, failed: false, key_update_responded: false, read_key: read_keys.key, read_iv: read_keys.iv, read_seq: read_seq, pending: bytes.empty(), handshake_tail: bytes.empty(), read_secret: read_secret, key_updates_received: 0, write_key: write_keys.key, write_iv: write_keys.iv, write_seq: write_seq, write_secret: write_secret)
     return Conn(native_conn_register(cs))
 
 # write a plaintext fatal alert before tearing a handshake down, so the peer
@@ -2917,7 +2926,7 @@ fn send_conn_fatal_alert(cs: NativeConnState, description: Int) -> Int!:
         seq := cs.write_seq
         cs.write_seq = seq + 1
         record := seal_conn_record(cs.version, cs.cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_ALERT, alert.bytes())!
-        native_write_all(TcpStream(cs.fd), record)!
+        native_write_all(cs.stream, record)!
         return 0
 
     # read one record on an established connection, answering an oversized or
@@ -2980,7 +2989,7 @@ fn read_conn_records(handle: Int, cs: NativeConnState, size: Int, lead: Bytes) -
     if lead.is_empty():
         fail "unexpected eof"
     mut next_lead := lead
-    stream := TcpStream(cs.fd)
+    stream := cs.stream
     cipher := cs.cipher
     # per-read DoS guards: a peer streaming empty records or warning alerts
     # costs a decrypt each without ever yielding data, so both are capped
@@ -3106,7 +3115,7 @@ fn native_conn_write_bytes(handle: Int, data: Bytes) -> Int!:
         errdefer cs.failed = true
         if cs.failed:
             fail "tls connection is unusable after an earlier record error"
-        stream := TcpStream(cs.fd)
+        stream := cs.stream
         cipher := cs.cipher
         mut count := data.len()
         if count > TLS_MAX_PLAINTEXT_RECORD:
@@ -3140,7 +3149,7 @@ fn send_close_notify(cs: NativeConnState) -> Int!:
         seq := cs.write_seq
         cs.write_seq = seq + 1
         record := seal_conn_record(cs.version, cs.cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_ALERT, alert.bytes())!
-        native_write_all(TcpStream(cs.fd), record)!
+        native_write_all(cs.stream, record)!
         return 0
 
 fn native_conn_close(handle: Int):
@@ -3149,6 +3158,17 @@ fn native_conn_close(handle: Int):
     cs := native_conn_get(handle)
     send_close_notify(cs) catch 0
     tcp_close(cs.fd)
+    native_conn_drop(handle)
+
+# release a connection without a word to the peer: close the socket and drop
+# the registry entry. this is what Conn.drop runs, so it does no network i/o
+# and takes no lock held across i/o (the shard lock guards only the map). a
+# connection already closed or released is not in the map, and this does
+# nothing.
+fn native_conn_release(handle: Int):
+    if not native_conn_has(handle):
+        return
+    tcp_close(native_conn_get(handle).fd)
     native_conn_drop(handle)
 
 # rotate our send keys to the next generation (RFC 8446 §7.2): announce the
@@ -3166,7 +3186,7 @@ fn rotate_send_keys(cs: NativeConnState, cipher: Int, request_peer_update: Bool)
         seq := cs.write_seq
         cs.write_seq = seq + 1
         record := seal_conn_record(cs.version, cipher, cs.write_key, cs.write_iv, seq, TLS_CONTENT_HANDSHAKE, update)!
-        native_write_all(TcpStream(cs.fd), record)!
+        native_write_all(cs.stream, record)!
         next_secret := tls13.next_application_traffic_secret_for_cipher(cipher, cs.write_secret)!
         keys := traffic_keys_for_cipher(cipher, next_secret)!
         cs.write_key = keys.key
@@ -3293,13 +3313,12 @@ pub fn client(stream: TcpStream, server_name: String, config: Config) -> Conn!:
         return native_client_handshake(stream, server_name, config)
     fail "native tls client config required"
 
-# rebuild a Conn from a handle taken from `conn.handle`. all connection state
-# lives in handle-keyed tables, so a Conn is just its handle — this lets a
-# caller stash the handle as a plain Int (for example in a driver's connection
-# struct) and recover a usable Conn later, sidestepping storing the struct in an
-# optional field.
-pub fn conn_from_handle(handle: Int) -> Conn:
-    return Conn(handle)
+# a Conn that names no session: every read and write on it fails, and close()
+# and its drop do nothing. a struct that holds a Conn only on some paths (a
+# driver's connection before or without tls) holds this one on the others.
+# session handles start far above 0, so this never names a live session.
+pub fn no_conn() -> Conn:
+    return Conn(0)
 
 # Listen for TLS connections on host:port. The listener borrows `config` rather
 # than taking ownership — close the config only after the listener and its
@@ -3318,7 +3337,7 @@ pub fn listen(host: String, port: Int, config: Config) -> Listener!:
 # that serves a single client. a server with an accept loop wants the two halves
 # separately — see accept_socket() and handshake().
 pub fn accept(listener: Listener) -> Conn!:
-    return Listener(listener.handle).accept()
+    return listener.accept()
 
 # accept the next tcp connection on a tls listener without handshaking it.
 #
@@ -3328,7 +3347,7 @@ pub fn accept(listener: Listener) -> Conn!:
 # SERVER_HANDSHAKE_TIMEOUT_MS window, and lets one failed handshake take the
 # loop down with it.
 pub fn accept_socket(listener: Listener) -> Int!:
-    return Listener(listener.handle).accept_socket()
+    return listener.accept_socket()
 
 # run the tls server handshake on a socket that came from accept_socket().
 #
@@ -3336,14 +3355,12 @@ pub fn accept_socket(listener: Listener) -> Int!:
 # Conn.close() releases it, and on failure it is closed here before the error
 # propagates, so a caller that spawns one of these per connection never leaks an
 # fd to a client that never gets past the handshake.
+#
+# an accept loop that spawns a task per connection passes the Listener itself
+# to the task. a spawn shares the value rather than copying it, so the task and
+# the loop name one listener, and it stays open until both are done with it.
 pub fn handshake(listener: Listener, fd: Int) -> Conn!:
-    return Listener(listener.handle).handshake(fd)
-
-# rebuild a Listener from its handle. an accept loop that spawns a task per
-# connection passes the handle rather than the struct, because a spawned task
-# takes its arguments by value and the loop keeps using the listener.
-pub fn listener_from_handle(handle: Int) -> Listener:
-    return Listener(handle)
+    return listener.handshake(fd)
 
 # forget a listener's tls config without touching its socket.
 #
@@ -3583,6 +3600,15 @@ impl Listener:
             return
         return
 
+# a listener nobody closed gives back its socket and its config binding when
+# the last value naming it goes away. close() is idempotent, so a listener
+# closed (or released through release_listener_config and std.shutdown) first
+# costs nothing here. the config is released after the lock is dropped (see
+# drop_listener_config), so this can run Config.drop without deadlocking.
+impl Drop for Listener:
+    fn drop():
+        self.close()
+
 impl Conn:
     fn state() -> ConnectionState:
         if native_conn_has(self.handle):
@@ -3738,10 +3764,21 @@ impl Conn:
             return false
         return tcp_shutdown(native_conn_get(self.handle).fd) == 1
 
+    # send close_notify, then close the socket and drop the session state. a
+    # second close, or a close on no_conn(), does nothing.
     fn close():
         if is_native_conn(self.handle):
             native_conn_close(self.handle)
             return
+
+# a connection nobody closed releases its socket and session state when the
+# last value naming it goes away. this sends no close_notify: a drop can run
+# on any thread, in the middle of a hot path or the cycle collector's sweep,
+# and must not block on the network. a peer therefore sees a bare tcp close,
+# which it may treat as a truncation; call close() when that matters.
+impl Drop for Conn:
+    fn drop():
+        native_conn_release(self.handle)
 
 fn verify_state_accept(state: ConnectionState) -> String:
     if state.version != 772:

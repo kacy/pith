@@ -5756,9 +5756,25 @@ fn ir_owned_arg_kind_releases(arg_kind: String) -> Bool:
 # out from under it. the plain release has neither problem, because it never
 # touches the payload directly.
 fn ir_release_fresh_optional_arg(expr_idx: Int, reg: Int):
-    if not ir_expr_is_fresh_optional_shell(expr_idx):
+    if not ir_expr_is_fresh_optional_shell(expr_idx) and not ir_expr_is_fresh_tuple(expr_idx):
         return
     ir_emit_call1(ir_reg(), "pith_struct_release", "void", reg)
+
+# a tuple a call returns (`show(pair(i))`) is fresh on the same terms as an
+# optional shell: the callee's parameter borrows it and every way to keep it
+# takes a count, so this frame's count is the last one to drop. the release
+# goes through the tuple's destructor, which drops its members. without it,
+# each such call stranded the tuple.
+fn ir_expr_is_fresh_tuple(expr_idx: Int) -> Bool:
+    if expr_idx < 0:
+        return false
+    en := get_node(expr_idx)
+    if en.kind != "call" and en.kind != "method_call" and en.kind != "await":
+        return false
+    if ir_value_extraction_is_uncounted(expr_idx):
+        return false
+    tid := c_get_expr_type(expr_idx)
+    return tid >= 0 and get_type_info(tid).kind == "tuple"
 
 # a fresh result box written straight into a call argument (`take(r())`
 # against `fn take(x: Int!)`) dies with the call it fed on the same terms as

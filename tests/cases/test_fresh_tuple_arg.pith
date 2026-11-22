@@ -1,0 +1,42 @@
+# a tuple a call returns, passed straight into another call, dies with that
+# call: the callee borrows it, and every way to keep it (a forwarding return,
+# a struct field, a list push, a map store, a closure parameter) takes a count
+# of its own. each argument here used to strand its tuple.
+
+struct Holder:
+    p: (String, Int)
+
+fn pair(n: Int) -> (String, Int):
+    return ("p{n}", n)
+
+fn forward(p: (String, Int)) -> (String, Int):
+    return p
+
+fn show(p: (String, Int)) -> String:
+    return "{p.0}/{p.1}"
+
+fn wrap(p: (String, Int)) -> Holder:
+    return Holder(p: p)
+
+fn store(mut xs: List[(String, Int)], p: (String, Int)):
+    xs.push(p)
+
+fn keep_map(mut m: Map[String, (String, Int)], p: (String, Int)):
+    m[p.0] = p
+
+fn main():
+    mut xs: List[(String, Int)] := []
+    mut m: Map[String, (String, Int)] := {}
+    mut hs: List[Holder] := []
+    mut total := 0
+    for i in 0..300:
+        total += show(forward(pair(i))).len()
+        store(xs, pair(i))
+        xs.push(pair(i))
+        keep_map(m, pair(i))
+        hs.push(wrap(pair(i)))
+        h := wrap(forward(pair(i)))
+        total += h.p.1
+        f := fn(p: (String, Int)) => p.1
+        total += f(pair(i))
+    print("{total} {xs.len()} {m.len()} {hs.len()} {xs[5].0} {m["p7"].1} {hs[9].p.0}")

@@ -146,11 +146,12 @@ each `service Foo { ... }` becomes a `FooClient` wrapping a `grpc.Conn`, with a
 typed method per rpc that encodes the request and decodes the reply:
 
 - unary `rpc Bar(Req) returns (Resp)` → `client.Bar(req: Req) -> Resp!`
-- server-streaming `returns (stream Resp)` → a handle with `collect() -> List[Resp]!`
+- server-streaming `returns (stream Resp)` → a handle with `recv() -> FooBarReply!`
+  and `collect() -> List[Resp]!`
 - client-streaming `(stream Req)` → a handle with `send(req)`, `close_send()`,
   `recv_response() -> Resp!`
 - bidi `(stream Req) returns (stream Resp)` → a handle with `send(req)`,
-  `close_send()`, `collect() -> List[Resp]!`
+  `close_send()`, `recv() -> FooBarReply!`, `collect() -> List[Resp]!`
 
 ```
 conn := grpc.dial("localhost", 50051)!
@@ -158,8 +159,12 @@ client := new_FooClient(conn)
 resp := client.Bar(Req(...))!
 ```
 
-the streaming handles wrap `std.net.grpc`'s `ServerStream` / `ClientStream` /
-`BidiStream`; reach through `.inner` for incremental, non-collecting access.
+`recv()` reads one response at a time. `FooBarReply` has `done` (the server
+finished the stream with OK; `message` is then all-default) and `message`, the
+decoded `Resp`. a non-OK status or a reset fails, and so does a reply that does
+not decode (`INTERNAL`). the streaming handles wrap `std.net.grpc`'s
+`ServerStream`, `ClientStream` and `BidiStream`, which stay reachable through
+`.inner`.
 
 ## server
 

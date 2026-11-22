@@ -1,20 +1,18 @@
 # std.cli: a command-line spec with subcommands, parsed without global state.
 #
 # the spec is a plain value: an app and a list of commands, each with options
-# and positionals of its own. the command comes first on the line, and only
-# its own options apply after it, so an option every command takes is declared
-# once and listed on each. parse() takes the spec and an argument list and
-# returns the parsed values or a CliError, so one program can parse as many
-# lists as it likes. this one parses what a user of a small notes tool might
-# type.
+# and positionals of its own. an option every command takes is declared once
+# on the app and is accepted before or after the command. parse() takes the
+# spec and an argument list and returns the parsed values or a CliError, so
+# one program can parse as many lists as it likes. this one parses what a user
+# of a small notes tool might type.
 
 import std.cli as cli
 
 fn notes_cli() -> cli.Cli:
-    file := cli.option("file", "f", "notes file", "notes.txt")
-    add := cli.command("add", "add a note", [file, cli.option("tag", "t", "tag the note", "")], ["text"])
-    list := cli.command("list", "list notes", [file, cli.flag("all", "a", "include archived notes"), cli.option("limit", "n", "show at most this many", "10")], [])
-    return cli.app("notes", "keep short notes", [], [], [add, list])
+    add := cli.command("add", "add a note", [cli.option("tag", "t", "tag the note", "")], ["text"])
+    list := cli.command("list", "list notes", [cli.flag("all", "a", "include archived notes"), cli.option("limit", "n", "show at most this many", "10")], [])
+    return cli.app("notes", "keep short notes", [cli.option("file", "f", "notes file", "notes.txt")], [], [add, list])
 
 fn describe(parsed: cli.Parsed) -> String:
     file := cli.string(parsed, "file")
@@ -33,7 +31,7 @@ fn main():
     invocations := [
         ["add", "buy milk"],
         ["add", "--file", "work.txt", "--tag", "urgent", "ship the release"],
-        ["list", "-a", "-n", "3"],
+        ["-f", "home.txt", "list", "-a", "-n", "3"],
         ["remove", "1"],
         ["add"],
     ]

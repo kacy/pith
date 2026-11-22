@@ -8,31 +8,40 @@ value's type provides
 fn next() -> T?
 ```
 
-then `for x in value:` drives it — the loop pulls until `next()`
-returns `none`. The lazy adapters in `std.iter` take any value with
-that shape, so once your struct has a `next`, you can chain
-`map_iter` / `filter_iter` over it without writing anything extra.
+then `for x in value:` drives it: the loop pulls until `next()`
+returns `none`. The `std.iter` functions (`to_list`, `map_iter`,
+`filter_iter`) are bounded on the `Iterator` interface, and a type
+satisfies an interface only through an `impl` block. So a type passed to
+them needs `impl Iterator for T` with the element type bound as
+`type Item`. Passing a struct that only has a matching `next` is error
+E226.
 
 ## the protocol
 
-Any struct that implements `next() -> T?` is an iterator:
+A struct that implements `Iterator` works with both the for loop and the
+adapters:
 
 ```pith
+from std.iter import Iterator, to_list, map_iter
+
 struct Counter:
     cur: Int
     hi: Int
 
-impl Counter:
-    fn next() -> Int?:
+impl Iterator for Counter:
+    type Item = Int
+
+    fn next() -> Item?:
         if self.cur >= self.hi:
             return none
         v := self.cur
-        self.cur = self.cur + 1
+        self.cur += 1
         return v
 
 fn main():
-    for v in Counter(0, 5):
+    for v in Counter(cur: 0, hi: 3):
         print("{v}")
+    print("{to_list(map_iter(Counter(cur: 0, hi: 3), fn(n: Int) => n * 10))}")
 ```
 
 Two things to keep in mind:
@@ -40,8 +49,8 @@ Two things to keep in mind:
 - `next()` is destructive. The receiver's state advances each call, so
   iterating a value twice in a row will see an empty sequence the
   second time. Construct a fresh one if you need to walk again.
-- The element type comes from `T?` in the signature. Returning `none`
-  ends the loop; returning a wrapped value yields it to the loop body.
+- The element type is `Item`, and `next` returns `Item?`. Returning
+  `none` ends the loop; returning a value yields it to the loop body.
 
 ## range-for
 
@@ -163,6 +172,6 @@ Use `for i in 0..n:` for counted loops over integers — it doesn't
 allocate. Use `xs.map(...)` / `xs.filter(...)` when you're transforming
 a list and want the result list right there. Reach for the `std.iter`
 adapters when fusion matters (long sources, multiple stages, early
-termination, non-list inputs). And write your own `fn next() -> T?`
-when the source is yours and has state that doesn't fit any of the
-above — cursors, channels, parsers.
+termination, non-list inputs). And write your own
+`impl Iterator for T` when the source is yours and has state that does
+not fit any of the above, such as cursors, channels or parsers.

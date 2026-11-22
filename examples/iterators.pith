@@ -34,16 +34,16 @@ fn main():
     text := "# limits\nmax_connections = 512\n\ntimeout_ms = 2500\n# retries\nretries = 3\n"
 
     # a for loop calls next() until it returns none
-    mut names: List[String] := []
-    for line in Lines(text: text):
-        if is_setting(line):
-            names.push(line.split("=")[0].trim())
-    print("settings: {names.join(", ")}")
+    mut line_count := 0
+    for _line in Lines(text: text):
+        line_count += 1
 
-    # to_list drains an iterator; a second walk needs a fresh Lines, since
-    # next() moves the position forward
-    all_lines := to_list(Lines(text: text))
-    print("{all_lines.len()} lines, {names.len()} of them settings")
+    # the adapters take Lines like any other iterator. a second walk needs a
+    # fresh Lines, since next() moves the position forward
+    settings := filter_iter(Lines(text: text), is_setting)
+    names := to_list(map_iter(settings, fn(line: String) => line.split("=")[0].trim()))
+    print("settings: {names.join(", ")}")
+    print("{line_count} lines, {names.len()} of them settings")
 
     # Range is a [low, high) iterator value. nothing in this chain runs until
     # to_list pulls, and each number goes through both steps before the next

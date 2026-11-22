@@ -553,6 +553,28 @@ pub extern "C" fn pith_process_kill(handle: i64) -> i64 {
     }
 }
 
+/// close our end of a child's stdin pipe, so a child that reads to the end of
+/// its input (`sort`, `wc`) sees end of file. returns 1 when this call closed
+/// it, 0 when it was already closed, never captured, or the handle is unknown,
+/// so a second close is harmless. a later write fails as for a child with no
+/// stdin pipe.
+#[no_mangle]
+pub extern "C" fn pith_process_close_stdin(handle: i64) -> i64 {
+    if !handle_registry::is_valid_id(handle, HandleKind::Process) {
+        return 0;
+    }
+    // take the handle out under the lock and retire it after, as
+    // `pith_process_close` does, so a parked writer is woken without the lock.
+    let pipe_handle = match process_handles().lock().get_mut(&handle) {
+        Some(entry) => entry.pipes[Pipe::Stdin as usize].take(),
+        None => None,
+    };
+    match pipe_handle {
+        Some(pipe_handle) => i64::from(fd_handle::close(pipe_handle)),
+        None => 0,
+    }
+}
+
 /// Close and forget a process handle
 #[no_mangle]
 pub extern "C" fn pith_process_close(handle: i64) {
@@ -587,6 +609,27 @@ pub extern "C" fn pith_process_close(handle: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_stdin_lets_a_child_read_to_the_end() {
+        use crate::process_io::{pith_process_read, pith_process_write};
+        use std::ffi::CStr;
+
+        let handle = unsafe { pith_process_spawn(c"wc -l".as_ptr()) };
+        assert_ne!(handle, 0);
+        let written = unsafe { pith_process_write(handle, c"a\nb\nc\n".as_ptr()) };
+        assert_eq!(written.is_ok, 1);
+        assert_eq!(pith_process_close_stdin(handle), 1);
+        assert_eq!(pith_process_close_stdin(handle), 0);
+        let written = unsafe { pith_process_write(handle, c"d\n".as_ptr()) };
+        assert_eq!(written.is_ok, 0);
+        let out = unsafe { pith_process_read(handle, 4096) };
+        let text = unsafe { CStr::from_ptr(out) }.to_str().unwrap();
+        assert_eq!(text.trim(), "3");
+        assert_eq!(pith_process_wait(handle), 0);
+        pith_process_close(handle);
+        assert_eq!(pith_process_close_stdin(handle), 0);
+    }
 
     #[test]
     fn a_child_closed_before_it_exits_is_reaped_later() {

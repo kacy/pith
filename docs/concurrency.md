@@ -208,6 +208,18 @@ passed to `spawn` or sent is refused as well, since the program still holds
 it: a task reads the global directly, or takes a copy. writing a global from
 several tasks is covered by the sharing rule (E309).
 
+a struct field that holds a string, a struct, an optional or another counted
+value is one pointer, and a task that reassigns it frees the old value while
+another task may be reading it. so a struct handed to a task is also refused
+when it reaches such a field and some code in the program reassigns that
+field after the struct is built (E248). a field no code reassigns is settled,
+and every task may read it. a field in a `guard` block is written under its
+lock. a number or a flag is exempt, since a race on one frees nothing. most
+shared structs need no change, because a config, a client or a connection is
+built once with every field in the constructor call and keeps its changing
+parts in a `guard` block. the ones to restructure set a field from a builder
+after the struct is built, or write it under a lock taken by hand.
+
 when a channel is the wrong shape — a registry every request reads and a
 few requests write, a counter, a cap on how many things run at once — reach
 for a lock. the primitives below are built in: they need no import, and
@@ -270,14 +282,16 @@ adds a `pick` mutex field after the others, defaulting to a new one, so a
 constructor call leaves it out; the fields under it are reached through
 `locked p.pick:`, or `locked self.pick:` in a method.
 
-in a program that spawns tasks, a `mut` global collection that is written
-after module init must be in a `guard` block or `threadlocal`, and the
-compiler refuses one that is neither (E309).
+in a program that spawns tasks, a `mut` global that is written after module
+init and holds a collection, a struct or another counted value (a string, an
+optional, a function value) must be in a `guard` block or `threadlocal`, and
+the compiler refuses one that is neither (E309). a global whose struct fields
+some code reassigns is refused the same way, `mut` or not.
 
 a value read inside `locked` stays there: storing a guarded collection in
 a variable declared outside the block, returning it, or capturing it in a
 closure is refused (E276), since the handle would reach the buffer after the
-unlock. moving it out and giving the field a new value, as a drain does, is
+unlock. so is a guarded struct with a counted field that some code reassigns. moving it out and giving the field a new value, as a drain does, is
 allowed. data that is built once and only read after belongs in a `frozen`
 field (see docs/ownership.md), which any task reads with no lock.
 

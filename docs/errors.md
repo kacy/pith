@@ -518,7 +518,7 @@ error[E247]: cannot find module 'fs'
              ^
 ```
 
-### E248 — collection shared with another task
+### E248 — a value shared with another task
 
 a spawned task runs concurrently with the scope that spawned it, on a pool of
 os threads. reference counts are atomic, but a list, map, or set is an
@@ -567,6 +567,44 @@ error[E248]: a spawned task cannot take this Account: its field 'inbox.messages'
                             ^
   fix: move the field into a `guard` block, or hand the task its own copy
 ```
+
+a struct is also refused when one of its fields holds a counted value and
+some code reassigns that field. a counted value is a string, bytes, a struct,
+an optional, a tuple, a function value, an interface value, an enum with a
+payload, or a handle such as a `Channel`, a `Mutex` or a `Task`, and the field
+holds it as one pointer. a task that assigns the field releases the old value
+while another task reading the field may be taking its own count on it, which
+frees the value twice or reads freed memory. any field can be assigned, so the
+checker looks at whether some code does.
+
+- a field is settled when no code anywhere in the program assigns it after
+  its struct is built: no `x.f = v`, `x.f += v` or `self.f = v`, in any
+  module. the receiver's type decides, so a write through any value of the
+  struct counts, and a write through one instance of a generic struct counts
+  for every instance. a settled field keeps the value it was built with, and
+  any task may read it, as with a `frozen` field.
+- a field in a `guard` block is reached under its lock and does not count.
+- a field holding a number, a `Bool` or a tag-only enum does not count. two
+  tasks writing one race on the value, which is a logic error, but no memory
+  is freed.
+
+the walk is the one used for collections: struct fields, optional and
+collection elements, tuple elements, enum payloads, and every type that
+implements an interface value's interface. the message names the field path
+and the first assignment the program makes to that field.
+
+```
+error[E248]: a spawned task cannot take this Holder: its field 'name' is reassigned at app.pith:9, and a write while the other task reads it frees the value being read
+  17 |     a := spawn writer(h, 10)
+                             ^
+  fix: move 'name' into a `guard` block, stop reassigning it once the value is built, or hand over a copy built in the call
+```
+
+a lock taken by hand, with `lock()` and `unlock()` or a `compare_set` spin,
+does not count, since the checker cannot see which fields it covers. put the
+field in a `guard` block. a builder that sets a field after building the
+struct unsettles the field too, so build the struct with every field in the
+constructor call, as `std.net.http`'s `Client.copy_with` does.
 
 ### E249 — weak field must be an optional struct
 
@@ -1062,11 +1100,20 @@ warning[E308]: binding 'items' shadows the module global declared on line 1; the
 ### E309 — an unguarded shared global in a program that spawns
 
 a `mut` module global that holds a list, a map, a set or a struct is one buffer
-every task can reach, and two tasks writing it at once corrupt it. in a program
-that spawns tasks, `pith check`, `build`, `run` and `test` refuse each such
-global that is written after module init and is neither declared in a `guard`
-block nor `threadlocal`, and `pith lint` reports it as well. the error names
-one spawn the program reaches.
+every task can reach, and two tasks writing it at once corrupt it. a `mut`
+global of another counted type (a string, bytes, an optional, a tuple, a
+function value, an enum with a payload) is one pointer, and a write releases
+the old value while another task may be reading it. in a program that spawns
+tasks, `pith check`, `build`, `run` and `test` refuse each such global that is
+written after module init and is neither declared in a `guard` block nor
+`threadlocal`, and `pith lint` reports it as well. the error names one spawn
+the program reaches. a `Mutex`, `AtomicInt`, `WaitGroup`, `Semaphore`,
+`Channel` or `Task` global synchronizes itself, so for one of those only an
+assignment of a new handle counts as a write.
+
+a global, `mut` or not, is also refused when its value reaches a counted field
+that some code reassigns (see E248): every task can reach the global, and the
+write frees the value another task reads.
 
 the rule covers the whole program the file loads, so a library global is
 reported when a program that spawns uses it. a program spawns when a function
@@ -1087,6 +1134,13 @@ from `main`, and drop the `mut`.
 error[E309]: 'hits' is a mut module global holding a shared buffer, written after module init, in a program that spawns tasks (app.pith:7)
   1 | mut hits: Map[String, Int] := {}
                                      ^
+  fix: declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init
+```
+
+```
+error[E309]: 'current' is a mut module global holding a counted value, which a write releases while another task may be reading it, written after module init, in a program that spawns tasks (app.pith:9)
+  1 | mut current: String := "start"
+                             ^
   fix: declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init
 ```
 
@@ -1252,6 +1306,18 @@ a block that moves the value out and gives the field a new one, `out =
 self.items` then `self.items = []`, is a take and is allowed, since the guard
 no longer reaches the old buffer. a value that never changes after it is
 built belongs in a `frozen` field instead of a guard.
+
+the same applies to a guarded struct, optional, tuple or enum whose fields
+reach a counted field that some code reassigns (see E248). a task that writes
+that field under the lock frees the value the copy outside the block still
+reads.
+
+```
+error[E276]: 'item' is guarded, and this stores its value where it outlives the block, and its field 'name' is reassigned at app.pith:13, so a write under the lock frees the value read after the block
+  19 |         out = b.item
+                       ^
+  fix: copy what is needed inside the block, move 'name' into a `guard` block, or stop reassigning it once the value is built
+```
 
 ```
 error[E276]: 'messages' is guarded, and this returns its value out of the block, so the buffer is reached after the lock is released

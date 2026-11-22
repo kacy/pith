@@ -195,7 +195,7 @@ handshake reads from the network:
 listener := tls.listen(host, port, config)!
 while true:
     fd := tls.accept_socket(listener)!
-    spawn serve(tls.listener_from_handle(listener.handle), fd)
+    spawn serve(listener, fd)
 ```
 
 `accept_socket` returns the raw socket without handshaking it, and
@@ -222,9 +222,31 @@ reads. `config.with_handshake_timeout(ms)` changes the budget for handshakes
 made with that config. `tls.client(stream, ...)` wraps a stream the caller
 already holds and leaves its deadlines to the caller.
 
-a spawned task takes its arguments by value while the loop keeps using the
-listener, which is why the shape above passes `listener.handle` and rebuilds the
-listener with `tls.listener_from_handle` inside the task.
+the shape above passes the listener itself to the task. a spawn shares the
+value with the loop, so the task and the loop name one listener, and it stays
+open until both are done with it.
+
+## who closes a connection
+
+a `Conn` owns its session and its socket, and a `Listener` owns its socket and
+its binding to the config. `close()` is still the way to say when they go:
+`Conn.close()` sends close_notify before it closes the socket, so the peer can
+tell a clean end from a cut connection. a second `close()` does nothing.
+
+a value nobody closes is released when the last value naming it goes away,
+because both types implement `Drop`. a dropped `Conn` closes its socket and
+drops its session state without sending close_notify, since a destructor can
+run on any thread and must not wait on the network. a peer reading to the end
+of a stream therefore sees a truncation rather than a clean close. call
+`close()` when that matters.
+
+so that one value owns one session, std no longer builds a `Conn` or a
+`Listener` from a bare handle (`conn_from_handle` and `listener_from_handle`
+are gone). a struct that keeps a connection holds the `Conn` itself. one that
+has a connection only on some paths holds `tls.no_conn()` on the others, a
+`Conn` that names no session: its reads fail and its close does nothing. do not
+write `tls.Conn(handle)` either, because a second `Conn` over a live handle
+closes the session when it dies while the first still uses it.
 
 a failed handshake is dropped without a log line, because a log line per failure
 is a way for anyone with a socket to fill your disk. what it leaves behind is a

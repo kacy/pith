@@ -57,7 +57,7 @@ unsafe fn is_trap_instruction(pc: *const u8) -> bool {
     }
 }
 
-extern "C" fn on_sigill(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+extern "C" fn on_sigill(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     // SAFETY: the kernel hands the handler a valid siginfo for SIGILL. a
     // positive si_code is a fault the kernel raised, the only kind whose
     // si_addr is an instruction address (external kill(pid, SIGILL) puts
@@ -65,6 +65,21 @@ extern "C" fn on_sigill(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
     let (code, pc) = unsafe { ((*info).si_code, (*info).si_addr() as *const u8) };
     // SAFETY: see is_trap_instruction; guarded by code > 0 above.
     if code > 0 && unsafe { is_trap_instruction(pc) } {
+        // the error path leaves the handler without a sigreturn, so the mask
+        // the kernel or a sanitizer set for the handler would stay in force.
+        // SA_NODEFER keeps SIGILL out of it in a plain build, but tsan runs
+        // every handler with all signals blocked, and the next overflow on
+        // the same thread (a green worker running another task) was then
+        // a blocked SIGILL, which the kernel turns into a kill. put back the
+        // mask the faulting code ran with, as sigreturn would.
+        // SAFETY: an SA_SIGINFO handler's third argument is the ucontext of
+        // the interrupted code.
+        unsafe {
+            let uc = ctx as *const libc::ucontext_t;
+            if !uc.is_null() {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &(*uc).uc_sigmask, std::ptr::null_mut());
+            }
+        }
         // SAFETY: the runtime's error trap; it does not return.
         unsafe {
             crate::runtime_core::pith_runtime_error(7);

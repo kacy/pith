@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 #
 # the sanitizer gate. builds the runtime with AddressSanitizer or
-# ThreadSanitizer, links every regression case and every std test file
-# against it, and fails on any report.
+# ThreadSanitizer, links every regression case, every deterministic example
+# and every std test file against it, and fails on any report.
 #
-#   tooling/sanitize.sh asan            # corpus and std tests, both backends
-#   tooling/sanitize.sh tsan corpus     # corpus only
+#   tooling/sanitize.sh asan            # corpus, examples and std tests,
+#                                       # both backends
+#   tooling/sanitize.sh tsan corpus     # corpus only (or examples, std)
 #   tooling/sanitize.sh asan setup      # only build the runtime and the
 #                                       # linker wrapper, and print both paths
 #
@@ -36,7 +37,7 @@ case "$kind" in
     sanitizer=thread
     ;;
   *)
-    echo "usage: tooling/sanitize.sh asan|tsan [corpus|std|all|setup]" >&2
+    echo "usage: tooling/sanitize.sh asan|tsan [corpus|examples|std|all|setup]" >&2
     exit 2
     ;;
 esac
@@ -65,7 +66,12 @@ measures_memory=(
 )
 
 export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:detect_stack_use_after_return=0:allocator_may_return_null=1}"
-export TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=0:report_signal_unsafe=0:history_size=4}"
+# tsan's thread leak report is off: on the os-thread backend a task whose
+# handle was stored or passed on and never awaited (a deadline that gave up on
+# it, an http/2 connection's reader) is still unjoined at exit by design. a
+# handle the compiler should have detached shows up in the leak gate instead
+# (tests/leaks/leak_spawn_rebind).
+export TSAN_OPTIONS="${TSAN_OPTIONS:-halt_on_error=0:report_signal_unsafe=0:report_thread_leaks=0:history_size=4}"
 export PITH_STRUCT_FREELIST=0
 
 if [ -z "${ASAN_SYMBOLIZER_PATH:-}" ]; then
@@ -76,14 +82,20 @@ if [ -z "${ASAN_SYMBOLIZER_PATH:-}" ]; then
   fi
 fi
 
+# examples whose output changes from run to run, as in the Makefile
+nondeterministic_examples=(net_basics redis_client)
+
 # --- one case, run by the parallel pass below and again by the retry ---
+# a case is a path without `.pith`, under tests/cases/ or examples/, and its
+# expected output sits in the expected/ directory beside it.
 # a sanitized binary keeps its symbols and runs to tens of megabytes, so each
 # case is built, run on every backend and deleted before the next one starts:
 # building the whole corpus first needs more disk than a runner has.
 # prints one "ok", "FAIL" or "REPORT" line per backend.
 check_case() {
-  local work="$1" name="$2" backends="$3" exe="$1/tests/cases/$2"
-  if ! CC="$wrapper" PITH_KEEP_SYMBOLS=1 PITH_RUNTIME_LIB="$runtime_lib"       timeout 300 "$pith" build "$exe.pith" >/dev/null 2>&1; then
+  local work="$1" name="$2" backends="$3" exe="$1/$2"
+  if ! CC="$wrapper" PITH_KEEP_SYMBOLS=1 PITH_RUNTIME_LIB="$runtime_lib" \
+      timeout 300 "$pith" build "$exe.pith" >/dev/null 2>&1; then
     echo "FAIL $name build"
     rm -f "$exe" "$exe.o"
     return
@@ -95,18 +107,21 @@ check_case() {
 }
 
 run_case() {
-  local work="$1" name="$2" backend="$3" green=1 out log
+  local work="$1" name="$2" backend="$3" green=1 out log tag dir expected
   [ "$backend" = os ] && green=0
-  out="$work/$name.$backend.out"
-  log="$work/$name.$backend.log"
-  if ! PITH_GREEN="$green" timeout 600 "$work/tests/cases/$name" >"$out" 2>"$log"; then
+  tag="$(echo "$name" | tr / _)"
+  dir="$(dirname "$name")"
+  expected="${dir%/cases}/expected/$(basename "$name").txt"
+  out="$work/$tag.$backend.out"
+  log="$work/$tag.$backend.log"
+  if ! PITH_GREEN="$green" timeout 600 "$work/$name" >"$out" 2>"$log"; then
     :  # the exit code is judged by the expected output below
   fi
   if grep -q -E '^==[0-9]+==ERROR: (Address|Thread)Sanitizer|^WARNING: ThreadSanitizer' "$log"; then
     echo "REPORT $name $backend"
-  elif [[ " ${measures_memory[*]} " == *" $name "* ]]; then
+  elif [[ " ${measures_memory[*]} " == *" $(basename "$name") "* ]]; then
     echo "ok $name $backend"
-  elif [ "$(cat "$out")" != "$(cat "tests/expected/$name.txt")" ]; then
+  elif [ "$(cat "$out")" != "$(cat "$expected")" ]; then
     echo "FAIL $name $backend"
   else
     echo "ok $name $backend"
@@ -183,7 +198,19 @@ if [ "$scope" = all ] || [ "$scope" = corpus ]; then
   git ls-files -z tests/cases | xargs -0 cp --parents -t "$work"
   for expected in tests/expected/*.txt; do
     name="$(basename "$expected" .txt)"
-    [ -f "tests/cases/$name.pith" ] && echo "$name"
+    [ -f "tests/cases/$name.pith" ] && echo "tests/cases/$name"
+  done | xargs -P "$jobs" -I{} "$0" "$kind" --case "$work" {} "$backends" >>"$results"
+fi
+
+if [ "$scope" = all ] || [ "$scope" = examples ]; then
+  echo "--- examples ($backends) ---"
+  # the http, grpc, websocket and worker pool examples are most of the
+  # programs here that run tasks against each other
+  git ls-files -z examples | xargs -0 cp --parents -t "$work"
+  for expected in examples/expected/*.txt; do
+    name="$(basename "$expected" .txt)"
+    [[ " ${nondeterministic_examples[*]} " == *" $name "* ]] && continue
+    [ -f "examples/$name.pith" ] && echo "examples/$name"
   done | xargs -P "$jobs" -I{} "$0" "$kind" --case "$work" {} "$backends" >>"$results"
 fi
 

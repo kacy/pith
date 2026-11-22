@@ -30,7 +30,7 @@
 //! atomic load and a predicted branch, the same shape as the perf-stats gate.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -175,6 +175,21 @@ pub extern "C" fn pith_cc_register_tracer(dtor: i64, tracer: i64) {
         return;
     }
     lock_tracers().insert(dtor as usize, tracer as usize);
+}
+
+// the destructors that run a user `drop` method. a garbage cycle through one
+// of these is left alone: its drop could reach the other members through
+// their strong fields and store one where it outlives the pass that frees
+// them all, so the collector leaks that cycle rather than collect it.
+static USER_DROPS: LazyLock<Mutex<HashSet<usize>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Record that a destructor runs a user `drop` method. Called from the same
+/// generated registration body as `pith_cc_register_tracer`.
+#[no_mangle]
+pub extern "C" fn pith_cc_register_user_drop(dtor: i64) {
+    if dtor != 0 {
+        crate::sync::lock(&USER_DROPS).insert(dtor as usize);
+    }
 }
 
 /// The tracer registered for a destructor, if it has one. A `None` means the
@@ -1002,6 +1017,34 @@ unsafe fn scan_black(nodes: &mut HashMap<usize, Node>, root: usize) {
     }
 }
 
+/// Blacken every white struct whose destructor runs a user `drop`, and
+/// everything it reaches. what stays white is then reachable only from other
+/// whites without user code, so no `drop` runs while a white is guarded and
+/// can reach one through a strong field: a cycle through a `Drop` struct
+/// leaks instead. a drop that runs from an ordinary release during teardown
+/// cannot reach a white strongly either, since a white has no owner outside
+/// the whites, and its weak reads refuse a white (see `guard_white`).
+unsafe fn keep_user_drops(nodes: &mut HashMap<usize, Node>) {
+    let user_drops = crate::sync::lock(&USER_DROPS);
+    if user_drops.is_empty() {
+        return;
+    }
+    let pinned: Vec<usize> = nodes
+        .iter()
+        .filter(|(&ptr, node)| {
+            node.color == Color::White
+                && node.kind == CHILD_KIND_STRUCT
+                && user_drops
+                    .contains(&(crate::runtime_core::cycle_struct_dtor_slot(ptr as i64) as usize))
+        })
+        .map(|(&ptr, _)| ptr)
+        .collect();
+    drop(user_drops);
+    for ptr in pinned {
+        scan_black(nodes, ptr);
+    }
+}
+
 // a teardown guard far above any real count: added to every white's real
 // counter before destruction, so a release arriving from another dying
 // object decrements a huge number instead of ever reaching a death path
@@ -1010,9 +1053,13 @@ const WHITE_GUARD: i64 = 1 << 30;
 
 unsafe fn guard_white(ptr: usize, kind: u8) {
     match kind {
-        CHILD_KIND_STRUCT => {
-            crate::runtime_core::cycle_struct_guard_strong(ptr as i64, WHITE_GUARD as u32)
-        }
+        // a struct takes the destructor guard instead, which a weak upgrade
+        // refuses: a drop running during teardown must not revive a white
+        // through a weak reference, since its shell is freed below.
+        CHILD_KIND_STRUCT => crate::runtime_core::cycle_struct_guard_strong(
+            ptr as i64,
+            crate::runtime_core::STRUCT_DTOR_GUARD,
+        ),
         CHILD_KIND_CLOSURE => {
             crate::runtime_core::cycle_closure_guard_strong(ptr as i64, WHITE_GUARD)
         }
@@ -1153,6 +1200,7 @@ pub(crate) unsafe fn collect() {
     for &(ptr, _) in &roots {
         scan(&mut nodes, ptr);
     }
+    keep_user_drops(&mut nodes);
     let whites: Vec<(usize, u8)> = nodes
         .iter()
         .filter(|(_, node)| node.color == Color::White)
@@ -2390,6 +2438,72 @@ mod tests {
             pith_struct_weak_release(b);
             force_enabled_for_tests(false);
             reset_for_tests();
+        }
+    }
+
+    /// `ring_dtor` under another address, registered as running a user drop.
+    unsafe extern "C" fn user_drop_ring_dtor(ptr: i64) {
+        ring_dtor(ptr);
+    }
+
+    #[test]
+    #[ignore = "stops the world or spawns the collector; run serially via make test-cycle-gc"]
+    fn a_garbage_ring_through_a_user_drop_is_left_alone() {
+        let _guard = locked();
+        force_enabled_for_tests(true);
+        set_stop_timeout_for_tests(50);
+        reset_for_tests();
+        unsafe {
+            pith_cc_register_tracer(
+                user_drop_ring_dtor as usize as i64,
+                ring_tracer as usize as i64,
+            );
+            pith_cc_register_user_drop(user_drop_ring_dtor as usize as i64);
+            let (a, b) = build_garbage_ring();
+            pith_struct_set_dtor(a, user_drop_ring_dtor as usize as i64);
+            pith_struct_release(a);
+
+            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+            if !collect_eventually() {
+                skip_congested("collection test");
+                return;
+            }
+            assert_eq!(
+                crate::runtime_core::cycle_struct_alive(a),
+                Some(true),
+                "a runs a user drop: kept"
+            );
+            assert_eq!(
+                crate::runtime_core::cycle_struct_alive(b),
+                Some(true),
+                "reached from a: kept"
+            );
+            assert_eq!(
+                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+                0
+            );
+
+            // break the ring by hand so the test leaves nothing behind
+            *(a as *mut i64) = 0;
+            pith_struct_release(b);
+            pith_struct_weak_release(a);
+            pith_struct_weak_release(b);
+            force_enabled_for_tests(false);
+            reset_for_tests();
+        }
+    }
+
+    #[test]
+    fn a_weak_upgrade_refuses_a_guarded_white_struct() {
+        unsafe {
+            let s = pith_struct_alloc(1);
+            guard_white(s as usize, CHILD_KIND_STRUCT);
+            assert_eq!(pith_struct_weak_upgrade(s), 0, "a white is being torn down");
+            // the guard is 2^31 on a u32 count, so a second one wraps it off
+            guard_white(s as usize, CHILD_KIND_STRUCT);
+            assert_eq!(pith_struct_weak_upgrade(s), s, "unguarded again");
+            pith_struct_release(s);
+            pith_struct_release(s);
         }
     }
 

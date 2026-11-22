@@ -312,6 +312,7 @@ cases=(
   "tests/leaks/leak_map_value_cycle PITH_CYCLE_GC=1"
   tests/leaks/leak_aliased_collection
   tests/leaks/leak_result_local_shared_box
+  tests/leaks/leak_alias_optional_tuple
 )
 
 # a case file that never made it into the list above measures nothing and says

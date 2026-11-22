@@ -1,0 +1,19 @@
+# a method that returns self hands its caller a reference to the value, so
+# drop cannot call it: what it gets back outlives the free.
+struct Node:
+    name: String
+
+mut keep: List[Node] := []
+
+impl Node:
+    fn itself() -> Node:
+        return self
+
+impl Drop for Node:
+    fn drop():
+        kept := self.itself()
+        keep.push(kept)
+
+fn main():
+    n := Node(name: "n")
+    print(n.name)

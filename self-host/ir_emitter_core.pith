@@ -9327,21 +9327,19 @@ fn ir_emit_module_alias_method(idx: Int) -> Int:
         # gets its destructor. the generic function-call path below would instead
         # emit a backend constructor call and then release the owned args the
         # struct just stored, dropping a fresh heap value (e.g. `body: bytes...`).
+        # a generic struct's checked type names the instance (`Box[String]`),
+        # which is also the name the same-module path builds under, so the
+        # instance destructor is attached either way.
         alias_expr_tid := c_get_expr_type(idx)
-        mut ctor_tid := 0 - 1
-        mut builds_struct := false
         if alias_expr_tid >= 0:
             alias_expr_info := get_type_info(alias_expr_tid)
-            if alias_expr_info.kind == "struct" and alias_expr_info.name == call_name:
-                builds_struct = true
-                ctor_tid = alias_expr_tid
-        if builds_struct:
-            mut ctor_args: List[Int] := []
-            for child, ci in node.children:
-                if ci == 0:
-                    continue
-                ctor_args.push(child)
-            return ir_emit_struct_positional_init(call_name, ctor_args, ctor_tid)
+            if alias_expr_info.kind == "struct" and ir_struct_base_name(alias_expr_info.name) == call_name:
+                mut ctor_args: List[Int] := []
+                for child, ci in node.children:
+                    if ci == 0:
+                        continue
+                    ctor_args.push(child)
+                return ir_emit_struct_positional_init(alias_expr_info.name, ctor_args, alias_expr_tid)
         if ir_is_generic_function_name(call_name):
             generic_ret_type := ir_infer_type(idx)
             mut no_explicit_types: List[String] := []

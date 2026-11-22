@@ -4,7 +4,9 @@
 # hook fires at the same points as for a plain struct: scope exit, a rebind,
 # removal from a list or a map, a list or map being cleared, and inside the
 # body of another generic function or struct. an instance built in another
-# module (drop_generic_helper) over this module's types does the same.
+# module (drop_generic_helper) over this module's types does the same, and so
+# does one built through the module alias (`helper.Slot(...)`), which used to
+# skip the instance destructor and release the field values it had stored.
 import drop_generic_helper as helper
 
 struct Point:
@@ -93,6 +95,9 @@ fn imported():
     mut q := helper.make_slot("int", 7)
     q = helper.make_slot("text", 8)
     print("slot {q.label} {q.value}")
+    # built through the module alias, with fresh strings the instance owns
+    d := helper.Slot("direct " + 1.to_string(), "value " + 2.to_string())
+    print("slot {d.label} {d.value}")
 
 fn main():
     scope_exit()

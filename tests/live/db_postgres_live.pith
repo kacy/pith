@@ -7,6 +7,7 @@
 import std.postgres as postgres
 import std.sql as sql
 import std.decimal as decimal
+import std.fs as fs
 
 fn open_or_skip() -> postgres.Conn:
     attempt := postgres.connect("127.0.0.1", 5432, "pith", "pith_pw", "pithtest")
@@ -116,3 +117,21 @@ test "a numeric NaN keeps its text rather than turning into a zero":
         got = row.text("odd")
     conn.close()
     assert_eq(got, "NaN")
+
+# open a connection, run one query and let it go without close().
+fn dropped_round() -> Bool!:
+    conn := postgres.connect("127.0.0.1", 5432, "pith", "pith_pw", "pithtest")!
+    postgres.query(conn, "select 1")!
+    return true
+
+test "a connection dropped without close gives its socket back":
+    probe := open_or_skip()
+    probe.close()
+    # more rounds than the default max_connections of 100: a connection that
+    # kept its socket would hold a server slot, and the dials past it fail.
+    before := fs.list("/proc/self/fd").len()
+    mut i := 0
+    while i < 150:
+        dropped_round()!
+        i = i + 1
+    assert(fs.list("/proc/self/fd").len() - before <= 2)

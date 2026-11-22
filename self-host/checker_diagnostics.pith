@@ -143,6 +143,54 @@ pub fn checker_reported_at_current() -> Bool:
             return true
     return false
 
+# `from m import f as g` reaches f through a module alias only the parser
+# writes (see from_import_alias_receiver), so a message built from the
+# rewritten tree would show `__as_g.f` where the source says `g`, or
+# `__as_g` where it means the module m. the receiver's module is noted here
+# when the checker registers it, and checker_record puts back what the
+# user wrote.
+mut checker_alias_modules: Map[String, String] := {}
+
+## note the module a from-import alias receiver reaches, so a message that
+## names the receiver can name the module instead.
+pub fn checker_note_alias_module(receiver: String, module_path: String):
+    checker_alias_modules.insert(receiver, module_path)
+
+fn is_message_ident_byte(b: Int) -> Bool:
+    return (b >= 97 and b <= 122) or (b >= 65 and b <= 90) or (b >= 48 and b <= 57) or b == 95
+
+# the end of the identifier that starts at `at`.
+fn message_ident_end(message: String, at: Int) -> Int:
+    mut end := at
+    while end < message.len() and is_message_ident_byte(ord(message[end])):
+        end = end + 1
+    return end
+
+# the message with every alias receiver spelled as the source spells it:
+# `__as_g.f` as `g`, and a bare `__as_g` as the module it reaches.
+fn message_without_alias_receivers(message: String) -> String:
+    mut at := message.index_of("__as_")
+    if at < 0:
+        return message
+    mut out := ""
+    mut rest := message
+    while at >= 0:
+        out = out + rest.substring(0, at)
+        end := message_ident_end(rest, at)
+        alias := rest.substring(at + 5, end)
+        if end < rest.len() and ord(rest[end]) == 46:
+            out = out + alias
+            rest = rest.substring(message_ident_end(rest, end + 1), rest.len())
+        else:
+            receiver := rest.substring(at, end)
+            if checker_alias_modules.contains_key(receiver):
+                out = out + checker_alias_modules[receiver]
+            else:
+                out = out + alias
+            rest = rest.substring(end, rest.len())
+        at = rest.index_of("__as_")
+    return out + rest
+
 # every report lands here. applies the switches above in order: nothing
 # records while reporting is off; a dedup scope drops a repeat of a
 # (node, code) pair; the suffix joins the message; an error takes the
@@ -159,7 +207,7 @@ fn checker_record(node_idx: Int, severity: String, code: String, message: String
     if severity == "error" and checker_severity_override.len() > 0:
         recorded_severity = checker_severity_override
     pos := checker_node_position(node_idx)
-    checker_diagnostics.push(Diagnostic(recorded_severity, code, message + checker_message_suffix, checker_file_path, pos.0, pos.1, fix))
+    checker_diagnostics.push(Diagnostic(recorded_severity, code, message_without_alias_receivers(message) + checker_message_suffix, checker_file_path, pos.0, pos.1, fix))
 
 ## report an error against a specific AST node, for a site that holds
 ## the offending node but is not the node currently being checked — an

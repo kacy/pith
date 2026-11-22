@@ -1,0 +1,47 @@
+# map, filter and reduce over a list nothing else holds, and reduce's
+# accumulator. the mapped list in `xs.map(f).filter(g)` was never released,
+# a reduce leaked every intermediate accumulator, and a reduce over an empty
+# list handed back its borrowed initial value as if it were owned, which the
+# free-function form then released (a use after free). each shape runs many
+# times so a leak shows under valgrind.
+fn to_c(x: Int) -> Int:
+    return x - 32
+
+fn plausible(x: Int) -> Bool:
+    return x > 0
+
+fn add_len(acc: Map[String, Int], s: String) -> Map[String, Int]:
+    mut m := acc
+    m[s] = s.len()
+    return m
+
+fn join_all(xs: List[String], start: String) -> String:
+    return xs.reduce(start, fn(a: String, x: String) -> String => a + x)
+
+fn main() -> Int:
+    raw := [40, 50, 10, 90]
+    words := ["a", "bb", "a", "ccc"]
+    empty: List[String] := []
+    check := plausible
+    start := "s" + "-"
+    mut total := 0
+    mut last := ""
+    mut i := 0
+    while i < 200:
+        a := filter(map(raw, to_c), check)
+        b := raw.map(to_c).filter(fn(x: Int) -> Bool => x > 0)
+        c := raw.map(to_c).reduce(0, fn(acc: Int, x: Int) -> Int => acc + x)
+        s := words.reduce("", fn(acc: String, x: String) -> String => acc + x)
+        m := words.reduce({}, add_len)
+        e := empty.reduce(start, fn(acc: String, x: String) -> String => acc + x)
+        f := join_all(words, start)
+        g := join_all(empty, start)
+        h := reduce(words, start, fn(acc: String, x: String) -> String => acc + x)
+        k := reduce(empty, start, fn(acc: String, x: String) -> String => acc + x)
+        total = total + a.len() + b.len() + c + s.len() + m.len() + e.len() + f.len() + g.len() + h.len() + k.len()
+        last = "{s} {e} {f} {g} {h} {k}"
+        i = i + 1
+    print("{total}")
+    print(last)
+    print(start)
+    return 0

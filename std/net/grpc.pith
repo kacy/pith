@@ -40,11 +40,6 @@
 # dial a plaintext server with dial_h2c (no tls); dial a tls server with dial or
 # dial_with_config.
 #
-# the handler lives in a module global, so there is one grpc server per process —
-# the usual shape, one service binary per endpoint. that is a deliberate limit: a
-# pith closure cannot capture a fn-value, so the handler cannot be threaded in any
-# other way.
-#
 # serving a streaming rpc: serve_body/serve_body_tls take a BODY-level dispatch
 # — raw framed bytes in and out — so one dispatch can carry unary and buffered
 # streaming methods side by side, in either direction (unframe_messages /
@@ -689,7 +684,10 @@ pub struct StreamMessage:
 # when the stream ends. transport-independent — a live stream and the offline
 # tests both drive it the same way.
 pub struct StreamReader:
-    mut deframer: Deframer
+    # the stream is shared with the task that sends on it, so the deframer,
+    # which only the receiving task uses, sits under recv_mu
+    guard recv_mu:
+        deframer: Deframer
     mut done: Bool
     # a bidi stream sends on one task and receives on another, so the header
     # blocks sit under headers_mu
@@ -718,16 +716,19 @@ impl StreamReader:
                 self.done = true
         elif ev.is_data():
             if ev.data.len() > 0:
-                self.deframer.push(ev.data)
+                locked self.recv_mu:
+                    self.deframer.push(ev.data)
             if ev.end:
                 self.done = true
         return 0
 
     fn ready() -> Bool:
-        return self.deframer.ready()
+        locked self.recv_mu:
+            return self.deframer.ready()
 
     fn take() -> Bytes!GrpcError:
-        return self.deframer.next()!
+        locked self.recv_mu:
+            return self.deframer.next()!
 
     fn finished() -> Bool:
         return self.done
@@ -1273,11 +1274,9 @@ pub fn dial_pool_with_config(host: String, port: Int, n: Int, config: tls.Config
 # server with a handler that deframes the request, dispatches by path, frames
 # the reply, and sets the trailer.
 #
-# the dispatch fn lives in a module global because a pith closure cannot capture
-# a fn-value, so there is one grpc server per process — the common case, one
-# service binary per endpoint. a generated <Service>Server provides the dispatch
-# (routing each path to a typed handler); a hand-written server can match paths
-# itself.
+# the http/2 handler captures the dispatch, so one process can run several grpc
+# servers. a generated <Service>Server provides the dispatch (routing each path
+# to a typed handler); a hand-written server can match paths itself.
 
 GRPC_CONTENT_TYPE := "application/grpc"
 
@@ -1363,20 +1362,6 @@ fn error_response(status: Int, message: String) -> http.HttpResponse:
 fn expired_response() -> http.HttpResponse:
     return error_response(GRPC_DEADLINE_EXCEEDED, EXPIRED_ON_ARRIVAL)
 
-# the process-wide unary dispatch, and the same for the body-level and streaming
-# forms further down. all three are shared and unlocked, and safe because of
-# where they are written: each is assigned as the first statement of the serve()
-# call that installs it, and that call then blocks in the accept loop for the
-# life of the process. so the write happens before the listener exists, let
-# alone the first request task, and nothing writes them again. the cost is one
-# dispatch per process — two concurrent serve() calls would fight over the slot,
-# which is the same single-handler constraint std.net.http2.server documents for
-# its streaming handler.
-mut grpc_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispatch
-
-fn grpc_no_dispatch(path: String, request: Bytes) -> Bytes!GrpcError:
-    fail GrpcError(GRPC_UNIMPLEMENTED, "no grpc dispatch registered")
-
 fn grpc_ok_trailers() -> Map[String, String]:
     return grpc_status_trailers(GRPC_OK, "")
 
@@ -1407,17 +1392,19 @@ fn grpc_unframe_unary(body: Bytes) -> Bytes!GrpcError:
         fail GrpcError(GRPC_INVALID_ARGUMENT, "grpc: unary request carried more than one message")
     return msg
 
-# the http/2 handler that turns one unary grpc request into one grpc response.
-# a runtime error inside the method fails the call with INTERNAL.
-fn grpc_serve_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
-    return http.call_isolated(grpc_unary_response, req, grpc_failed_response)
+# the http/2 handler that turns one unary grpc request into one grpc response
+# from `dispatch`. a runtime error inside the method fails the call with
+# INTERNAL.
+fn grpc_serve_handler(dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> fn(http.HttpRequestBytes) -> http.HttpResponse:
+    respond := fn(req: http.HttpRequestBytes) -> http.HttpResponse => grpc_unary_response(req, dispatch)
+    return fn(req: http.HttpRequestBytes) -> http.HttpResponse => http.call_isolated(respond, req, grpc_failed_response)
 
 # the answer to a call whose method stopped at a runtime error. the message
 # goes to the server's stderr, not to the client.
 fn grpc_failed_response(req: http.HttpRequestBytes, failure: String) -> http.HttpResponse:
     return error_response(GRPC_INTERNAL, "internal error")
 
-fn grpc_unary_response(req: http.HttpRequestBytes) -> http.HttpResponse:
+fn grpc_unary_response(req: http.HttpRequestBytes, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> http.HttpResponse:
     path := req.path() catch ""
     if begin_request_context(req):
         return expired_response()
@@ -1428,7 +1415,7 @@ fn grpc_unary_response(req: http.HttpRequestBytes) -> http.HttpResponse:
         # compressed message is UNIMPLEMENTED. INTERNAL for all of them would
         # tell a client to retry a request that will never succeed.
         return error_response(request.err.status, request.err.message)
-    result := grpc_dispatch_fn(path, request.ok)
+    result := dispatch(path, request.ok)
     if result.is_err:
         return error_response(result.err.status, result.err.message)
     framed := frame_message(result.ok)
@@ -1589,13 +1576,11 @@ pub fn server_fault(status: Int) -> Bool:
 # is never severed by the drain itself — which for a streaming method means the
 # stream runs to its trailers rather than dying mid-exchange.
 pub fn serve(host: String, port: Int, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
-    grpc_dispatch_fn = dispatch
-    return h2server.listen_h2c(host, port, grpc_serve_handler)!
+    return h2server.listen_h2c(host, port, grpc_serve_handler(dispatch))!
 
 # serve grpc over http/2 with tls (alpn "h2"). drains on shutdown like serve().
 pub fn serve_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
-    grpc_dispatch_fn = dispatch
-    return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_handler)!
+    return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_handler(dispatch))!
 
 # --- body-level serving (streaming-capable dispatch) --------------------------
 #
@@ -1613,18 +1598,16 @@ pub fn serve_tls(host: String, port: Int, cert: String, key: String, dispatch: f
 # such a handler should watch std.shutdown.requested() and finish its stream
 # when it goes true, rather than relying on the deadline to cut it off.
 
-# installed by serve_body / serve_body_tls; see grpc_dispatch_fn above for why
-# this needs no lock.
-mut grpc_body_dispatch_fn: fn(String, Bytes) -> Bytes!GrpcError := grpc_no_dispatch
+# the http/2 handler for a body-level `dispatch`, like grpc_serve_handler.
+fn grpc_serve_body_handler(dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> fn(http.HttpRequestBytes) -> http.HttpResponse:
+    respond := fn(req: http.HttpRequestBytes) -> http.HttpResponse => grpc_body_response(req, dispatch)
+    return fn(req: http.HttpRequestBytes) -> http.HttpResponse => http.call_isolated(respond, req, grpc_failed_response)
 
-fn grpc_serve_body_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
-    return http.call_isolated(grpc_body_response, req, grpc_failed_response)
-
-fn grpc_body_response(req: http.HttpRequestBytes) -> http.HttpResponse:
+fn grpc_body_response(req: http.HttpRequestBytes, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> http.HttpResponse:
     path := req.path() catch ""
     if begin_request_context(req):
         return expired_response()
-    result := grpc_body_dispatch_fn(path, req.body_bytes())
+    result := dispatch(path, req.body_bytes())
     if result.is_err:
         return error_response(result.err.status, result.err.message)
     return http.response(200).content_type(GRPC_CONTENT_TYPE).with_body_bytes(result.ok).with_trailers(grpc_ok_trailers())
@@ -1672,13 +1655,11 @@ pub fn frame_one(message: Bytes) -> Bytes:
 # receives the raw framed request body and returns the raw framed response body,
 # so its methods can be unary or streaming (buffered). blocks.
 pub fn serve_body(host: String, port: Int, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
-    grpc_body_dispatch_fn = dispatch
-    return h2server.listen_h2c(host, port, grpc_serve_body_handler)!
+    return h2server.listen_h2c(host, port, grpc_serve_body_handler(dispatch))!
 
 # like serve_body, over http/2 with tls (alpn "h2").
 pub fn serve_body_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, Bytes) -> Bytes!GrpcError) -> Int!:
-    grpc_body_dispatch_fn = dispatch
-    return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_body_handler)!
+    return h2server.listen_h2_tls(host, port, cert, key, grpc_serve_body_handler(dispatch))!
 
 # --- streaming serving (incremental) ------------------------------------------
 #
@@ -1700,7 +1681,10 @@ pub fn serve_body_tls(host: String, port: Int, cert: String, key: String, dispat
 # trailers-only error response from finish().
 pub struct GrpcStream:
     stream: h2server.ServerStream
-    mut deframer: Deframer
+    # a handler may send from one task while it receives on another, so the
+    # deframer the receiving side uses sits under recv_mu
+    guard recv_mu:
+        deframer: Deframer
     # the absolute request deadline (a time.mono_millis() timestamp, 0 = none),
     # anchored when the request arrived rather than when the handler asks.
     deadline: Int
@@ -1758,8 +1742,9 @@ impl GrpcStream:
     # and with GRPC_UNAVAILABLE once a drain has taken the stream over.
     pub fn recv_message() -> StreamMessage!GrpcError:
         while true:
-            if self.deframer.ready():
-                return StreamMessage(false, self.deframer.next()!)
+            locked self.recv_mu:
+                if self.deframer.ready():
+                    return StreamMessage(false, self.deframer.next()!)
             if self.request_done:
                 return StreamMessage(true, bytes.empty())
             # never park waiting on the peer once the framework's half of the
@@ -1780,7 +1765,8 @@ impl GrpcStream:
                 fail GrpcError(GRPC_CANCELLED, "grpc: stream reset by the client")
             if ev.is_data():
                 if ev.data.len() > 0:
-                    self.deframer.push(ev.data)
+                    locked self.recv_mu:
+                        self.deframer.push(ev.data)
             # a HEADERS event after the body began is request trailers; grpc
             # requests carry nothing there, so only its end flag matters.
             if ev.end:
@@ -1938,21 +1924,15 @@ fn start_stream_drain_watch():
     # shutdown flag, so under the green runtime it holds no worker.
     spawn stream_drain_watch()
 
-# the stream dispatch lives in a module global for the same reason the unary
-# dispatch does: a pith closure cannot capture a fn-value, so there is one
-# streaming grpc server per process. the streaming serve calls install it; see
-# grpc_dispatch_fn above for why it needs no lock.
-mut grpc_stream_dispatch_fn: fn(String, GrpcStream) -> Int!GrpcError := grpc_no_stream_dispatch
-
-fn grpc_no_stream_dispatch(path: String, call: GrpcStream) -> Int!GrpcError:
-    fail GrpcError(GRPC_UNIMPLEMENTED, "no grpc stream dispatch registered")
-
 # the h2-level streaming handler: wrap the stream, dispatch by path, and make
 # sure the rpc is finished when the dispatch returns — a forgotten finish would
 # leave the client waiting forever. an error return becomes the grpc-status (a
 # trailers-only response when nothing was sent yet); a clean return that never
 # called finish gets finish_ok.
-fn grpc_serve_stream_handler(stream: h2server.ServerStream) -> Int:
+fn grpc_serve_stream_handler(dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> fn(h2server.ServerStream) -> Int:
+    return fn(stream: h2server.ServerStream) -> Int => grpc_serve_stream(stream, dispatch)
+
+fn grpc_serve_stream(stream: h2server.ServerStream, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int:
     expired := begin_request_context(stream.request)
     sent_headers := AtomicInt(0)
     finished := AtomicInt(0)
@@ -1966,14 +1946,14 @@ fn grpc_serve_stream_handler(stream: h2server.ServerStream) -> Int:
     defer forget_live_stream(live)
     # a runtime error inside the method fails the call with INTERNAL. finish
     # is a no-op when the method already finished before it failed.
-    failure := isolate_call(fn() -> Int => dispatch_stream(call))
+    failure := isolate_call(fn() -> Int => dispatch_stream(call, dispatch))
     if failure != "":
         http.report_handler_failure(stream.request, failure)
         call.finish(GRPC_INTERNAL, "internal error")
     return 0
 
-fn dispatch_stream(call: GrpcStream) -> Int:
-    result := grpc_stream_dispatch_fn(call.full_method(), call)
+fn dispatch_stream(call: GrpcStream, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int:
+    result := dispatch(call.full_method(), call)
     if result.is_err:
         call.finish(result.err.status, result.err.message)
     else:
@@ -1989,15 +1969,13 @@ fn dispatch_stream(call: GrpcStream) -> Int:
 # one that does not is closed with UNAVAILABLE at the midpoint of the grace
 # period rather than severed at the end of it — see the drain section above.
 pub fn serve_stream(host: String, port: Int, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int!:
-    grpc_stream_dispatch_fn = dispatch
     start_stream_drain_watch()
-    return h2server.listen_h2c_streaming(host, port, grpc_serve_stream_handler)!
+    return h2server.listen_h2c_streaming(host, port, grpc_serve_stream_handler(dispatch))!
 
 # like serve_stream, over http/2 with tls (alpn "h2").
 pub fn serve_stream_tls(host: String, port: Int, cert: String, key: String, dispatch: fn(String, GrpcStream) -> Int!GrpcError) -> Int!:
-    grpc_stream_dispatch_fn = dispatch
     start_stream_drain_watch()
-    return h2server.listen_h2_tls_streaming(host, port, cert, key, grpc_serve_stream_handler)!
+    return h2server.listen_h2_tls_streaming(host, port, cert, key, grpc_serve_stream_handler(dispatch))!
 
 # --- server request context --------------------------------------------------
 

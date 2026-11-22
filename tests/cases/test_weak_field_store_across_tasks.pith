@@ -1,0 +1,43 @@
+# one task stores into a weak field of a shared struct while another reads
+# the same field. each store drops the field's weak count on the old target,
+# whose strong owner is already gone, so that count is all that keeps the
+# target's header allocated. the read loaded the pointer and upgraded it in
+# two steps, and a store between them freed the header the upgrade then read
+# (every run under PITH_QUARANTINE=1). the load and the upgrade, and the swap
+# and the release, are now each one step under the same lock.
+#
+# a race, so a pass is evidence rather than proof.
+
+struct Child:
+    name: String
+    n: Int
+
+struct Holder:
+    weak w: Child?
+
+fn writer(h: Holder, rounds: Int) -> Int:
+    mut i := 0
+    while i < rounds:
+        c := Child(name: "child-" + i.to_string(), n: i)
+        h.w = c
+        i = i + 1
+    h.w = none
+    return i
+
+fn reader(h: Holder, rounds: Int) -> Int:
+    mut torn := 0
+    mut i := 0
+    while i < rounds:
+        if let c = h.w:
+            if c.name != "child-" + c.n.to_string():
+                torn = torn + 1
+        i = i + 1
+    return torn
+
+fn main():
+    h := Holder(w: none)
+    w := spawn writer(h, 300000)
+    r := spawn reader(h, 600000)
+    n := await w
+    t := await r
+    print("wrote {n}, torn reads {t}")

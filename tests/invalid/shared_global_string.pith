@@ -1,0 +1,21 @@
+# a `mut` global of a counted type that tasks write: a string, an optional, a
+# function value and a handle each live in the global as one pointer, and a
+# write releases the old value while another task may be reading it (E309)
+mut current: String := "start"
+mut last: Int? := none
+mut hook: fn(Int) -> Int := plain
+mut cell: AtomicInt := AtomicInt(0)
+
+fn plain(x: Int) -> Int:
+    return x
+
+fn writer(i: Int) -> Int:
+    current = "value {i}"
+    last = i
+    hook = fn(x: Int) => x + i
+    cell = AtomicInt(i)
+    return 0
+
+fn main():
+    t := spawn writer(1)
+    print("{current.len()} {last.unwrap_or(0)} {hook(1)} {cell.load()} {await t}")

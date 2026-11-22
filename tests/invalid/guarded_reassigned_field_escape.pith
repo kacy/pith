@@ -1,0 +1,31 @@
+# a guarded struct read inside `locked` and kept after the block, while
+# another task reassigns one of its string fields under the lock: the write
+# frees the string the copy outside the lock still reads (E276)
+struct Item:
+    name: String
+
+struct Box:
+    mu: Mutex
+    guard mu:
+        item: Item
+
+fn writer(b: Box):
+    locked b.mu:
+        b.item.name = "replaced"
+
+fn reader(b: Box) -> Int:
+    mut out := Item(name: "")
+    locked b.mu:
+        out = b.item
+    return out.name.len()
+
+fn take(b: Box) -> Item:
+    locked b.mu:
+        return b.item
+
+fn main():
+    b := Box(mu: Mutex(), item: Item(name: "start"))
+    w := spawn writer(b)
+    r := spawn reader(b)
+    await w
+    print("{await r} {take(b).name}")

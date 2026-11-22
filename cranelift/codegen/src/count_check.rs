@@ -35,6 +35,19 @@ const RETAINS: &[&str] = &[
     "pith_channel_retain",
 ];
 
+/// the plain releases: each gives up one count of its argument
+const RELEASES: &[&str] = &[
+    "pith_cstring_release",
+    "pith_list_release_handle",
+    "pith_map_release_handle",
+    "pith_set_release_handle",
+    "pith_closure_release",
+    "pith_struct_release",
+    "pith_bytes_release",
+    "pith_sync_release",
+    "pith_channel_release",
+];
+
 // a task handle is in the list too: the runtime keeps no count on it
 // (runtime_ownership.txt, pith_await and pith_task_detach), so a returned
 // handle that is awaited or detached has nothing to give back
@@ -187,7 +200,27 @@ pub fn check_counts(lines: &[&str]) -> CountReport {
             continue;
         }
         let mut checker = FuncCheck::new(f, &globals, &user_funcs);
-        match checker.run() {
+        let outcome = checker.run();
+        // a count given up that the path never held is a finding even when a
+        // later join leaves the rest of the function unsettled: the doubled
+        // release is what made the paths disagree
+        let over: Vec<String> = checker
+            .problems
+            .iter()
+            .filter(|p| {
+                p.contains("doesn't hold")
+                    || p.contains("given up twice")
+                    || p.contains("more than it took")
+            })
+            .cloned()
+            .collect();
+        match outcome {
+            Err(_) if !over.is_empty() => {
+                report.failed += 1;
+                for p in over {
+                    report.problems.push(format!("{}: {}", f.name, p));
+                }
+            }
             Err(reason) => {
                 report.undecided += 1;
                 if !checker.join_detail.is_empty() {
@@ -393,6 +426,20 @@ fn join(a: &Canon, b: &Canon, leaks: &mut Vec<String>, mismatches: &mut Vec<(Str
         return Err(format!("nulls differ: {:?} vs {:?}", a_nulls, b_nulls));
     }
     out.nulls = a_nulls.intersection(&b_nulls).cloned().collect();
+    // a view slot that aliases an owned slot on one path and borrows a value
+    // of its own on the other (`mut cur := cursor`, then `cur` reassigned in
+    // a loop) still holds a borrow past the join, with no count of its own
+    for (x, y) in [(a, b), (b, a)] {
+        for view in x.aliases.keys() {
+            let own = vec![view.clone()];
+            if !out.aliases.contains_key(view)
+                && y.objs.get(&own).is_some_and(|v| v.0 == 0)
+                && !out.objs.contains_key(&own)
+            {
+                out.objs.insert(own, (0, false));
+            }
+        }
+    }
     let ids: BTreeSet<&String> = a.regobjs.keys().chain(b.regobjs.keys()).collect();
     for id in ids {
         let (x, y) = (a.regobjs.get(id).copied(), b.regobjs.get(id).copied());
@@ -478,12 +525,72 @@ struct FuncCheck<'a, 'f> {
     reads: usize,
     /// what disagreed at the join that left the function undecided
     join_detail: String,
+    /// registers a retain or a plain release names: a value of a kind the
+    /// marks leave open (a generic body's `T`) that the emitter counts
+    counted_regs: HashSet<&'a str>,
+    /// the slots this function stores to: a call through one is a call of
+    /// the closure it holds
+    stored_slots: HashSet<&'a str>,
+    /// registers a weak count was taken on: a store of one into a weak field
+    /// or a weak capture hands over that weak count, not a strong one
+    weak_regs: HashSet<&'a str>,
 }
 
 impl<'a, 'f> FuncCheck<'a, 'f> {
-    fn new(f: &'f Func<'a>, globals: &'f HashMap<&'a str, &'a str>, user_funcs: &'f HashSet<&'a str>) -> Self {
-        let mut c = FuncCheck { f, globals, user_funcs, scalar_temps: HashSet::new(), consts: HashMap::new(), plain_ok_payloads: HashSet::new(), problems: Vec::new(), origins: HashMap::new(), current: String::new(), current_dst: String::new(), reads: 0, join_detail: String::new() };
+    fn new(
+        f: &'f Func<'a>,
+        globals: &'f HashMap<&'a str, &'a str>,
+        user_funcs: &'f HashSet<&'a str>,
+    ) -> Self {
+        let mut c = FuncCheck {
+            f,
+            globals,
+            user_funcs,
+            scalar_temps: HashSet::new(),
+            consts: HashMap::new(),
+            plain_ok_payloads: HashSet::new(),
+            problems: Vec::new(),
+            origins: HashMap::new(),
+            current: String::new(),
+            current_dst: String::new(),
+            reads: 0,
+            join_detail: String::new(),
+            counted_regs: HashSet::new(),
+            stored_slots: HashSet::new(),
+            weak_regs: HashSet::new(),
+        };
         c.scalar_temps = c.infer_scalar_temps();
+        for ins in &f.body {
+            if ins[0] == "call"
+                && ins.len() >= 6
+                && (RETAINS.contains(&ins[2]) || RELEASES.contains(&ins[2]))
+            {
+                c.counted_regs.insert(ins[5]);
+            } else if ins[0] == "store" && ins.len() >= 3 {
+                c.stored_slots.insert(ins[1]);
+            }
+            if ins[0] == "call" && ins.len() >= 6 && ins[2] == "pith_struct_weak_retain" {
+                c.weak_regs.insert(ins[5]);
+            }
+        }
+        // and a value stored into an unmarked slot that a counted register
+        // is later loaded from (an awaited `T` kept in a temp, then released)
+        let counted_slots: HashSet<&str> = f
+            .body
+            .iter()
+            .filter(|ins| {
+                ins[0] == "load"
+                    && ins.len() >= 3
+                    && c.counted_regs.contains(ins[1])
+                    && f.kinds.get(ins[2]).map_or(true, |k| *k == "unknown")
+            })
+            .map(|ins| ins[2])
+            .collect();
+        for ins in &f.body {
+            if ins[0] == "store" && ins.len() >= 3 && counted_slots.contains(ins[1]) {
+                c.counted_regs.insert(ins[2]);
+            }
+        }
         c.consts = f.body.iter().filter(|ins| ins[0] == "iconst" && ins.len() >= 3).map(|ins| (ins[1], ins[2])).collect();
         c
     }
@@ -591,7 +698,24 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         for (o, n) in &st.counts {
             if let Some(names) = holders.get(o) {
                 let maybe_null = st.maybe_null.contains(o);
-                let owners: Vec<&String> = names.iter().filter(|s| self.class_of(s) == SlotClass::Holder).collect();
+                let mut owners: Vec<&String> = names
+                    .iter()
+                    .filter(|s| self.class_of(s) == SlotClass::Holder)
+                    .collect();
+                // an emitter temp that carries a count of its own, such as the
+                // slot an `unwrap_or` or a match leaves its value in before the
+                // binding retains it, counts as one more owner when the count
+                // says every such temp holds one
+                let carriers: Vec<&String> = names
+                    .iter()
+                    .filter(|s| self.class_of(s) == SlotClass::Carrier)
+                    .collect();
+                if !owners.is_empty()
+                    && !carriers.is_empty()
+                    && *n == (owners.len() + carriers.len()) as i64
+                {
+                    owners.extend(carriers);
+                }
                 if names.len() >= 2 && !owners.is_empty() && *n == owners.len() as i64 {
                     // several slots share one value and each owned slot has a
                     // count of its own (`name = value` with a retain): each
@@ -737,6 +861,20 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         for p in &self.f.params {
             match self.class_of(p) {
                 SlotClass::Scalar => {}
+                // a parameter of an open kind the body retains or releases
+                // is a counted one, and borrowed like any other
+                SlotClass::Carrier
+                    if self.f.body.iter().any(|ins| {
+                        ins[0] == "load"
+                            && ins.len() >= 3
+                            && ins[2] == *p
+                            && self.counted_regs.contains(ins[1])
+                    }) =>
+                {
+                    let o = format!("param:{p}");
+                    st.counts.insert(o.clone(), 0);
+                    st.slots.insert(p.to_string(), Val::Obj(o));
+                }
                 SlotClass::Carrier => {
                     st.slots.insert(p.to_string(), Val::Unknown);
                 }
@@ -1031,9 +1169,10 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 Ok(false)
             }
             "field" if ins.len() >= 5 => {
-                let v = if kind_of_text(ins[4]) == "unknown" {
+                let counted = self.counted_regs.contains(ins[1]);
+                let v = if kind_of_text(ins[4]) == "unknown" && !counted {
                     Val::Unknown
-                } else if is_counted(ins[4]) {
+                } else if counted || is_counted(ins[4]) {
                     let o = self.new_obj(st, 0);
                     // a read names its field by byte offset, a store by index
                     let index = ins[3].parse::<i64>().map(|b| b / 8).unwrap_or(-1);
@@ -1064,6 +1203,8 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 st.regs.insert(ins[1].to_string(), v);
                 Ok(false)
             }
+            // a weak field keeps the weak count taken for it
+            "sstore" if ins.len() >= 4 && self.weak_regs.contains(ins[3]) => Ok(false),
             "sstore" if ins.len() >= 4 => {
                 let field = format!("{}:{}", self.base_key(st, ins[1]), ins[2]);
                 let into_shell = matches!(self.val(st, ins[1]), Val::Obj(ref b) if st.shells.contains(b));
@@ -1118,9 +1259,10 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
             // `optval REG OPT KIND NAME`: the payload of an optional, read
             // the way a field is (slot 1 of the shell), or 0 for none
             "optval" if ins.len() >= 4 => {
-                let v = if kind_of_text(ins[3]) == "unknown" {
+                let counted = self.counted_regs.contains(ins[1]);
+                let v = if kind_of_text(ins[3]) == "unknown" && !counted {
                     Val::Unknown
-                } else if is_counted(ins[3]) {
+                } else if counted || is_counted(ins[3]) {
                     let o = self.new_obj(st, 0);
                     let field = format!("{}:1", self.base_key(st, ins[2]));
                     self.reads += 1;
@@ -1170,13 +1312,31 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         counted.then(|| format!("tls:{slot}"))
     }
 
+    /// a call through a fn value in a slot follows the user-function
+    /// convention whatever the slot is named, even when the name is also a
+    /// runtime function's (`write`): a local or a global marked `closure`, or
+    /// an emitter temp this function stores the value in (`__map_fn_L3`)
+    fn is_closure_call(&self, callee: &str) -> bool {
+        if self.kind_of(callee).is_some_and(|k| k == "closure") {
+            return true;
+        }
+        self.stored_slots.contains(callee)
+            && !self.user_funcs.contains(callee)
+            && runtime_ownership(callee).is_none()
+    }
+
     fn call(&mut self, ins: &[&str], st: &mut State) -> Result<(), String> {
         let (dst, callee, typ) = (ins[1], ins[2], ins[3]);
         let args: Vec<&str> = ins.iter().skip(5).copied().collect();
-        // a weak reference keeps a second count the checker doesn't model
-        // yet, and an upgrade turns it into a strong one
-        if callee.starts_with("pith_struct_weak_") {
-            return Err("a weak reference".into());
+        // a weak count is a second count the checker leaves out: it never
+        // keeps the value alive. an upgrade hands back a strong count on the
+        // target, or a null when it is gone, which a branch on the result
+        // settles the way it settles any null test. the ir types the upgrade
+        // `int`, since its result is tested before it is used.
+        if callee == "pith_struct_weak_upgrade" || callee == "pith_struct_weak_load_field" {
+            let o = self.new_obj(st, 1);
+            st.regs.insert(dst.to_string(), Val::Obj(o));
+            return Ok(());
         }
         if callee.contains("__tuple_stack_cascade_") {
             st.regs.insert(dst.to_string(), Val::Plain);
@@ -1250,17 +1410,41 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 // the destructor releases the fields from now on, so freeing
                 // the struct hands nobody a payload's count
                 let prefix = format!("{o}:");
+                let payload = format!("{o}:1");
+                let owned = st.owned_fields.contains(&payload);
                 st.owned_fields.retain(|f| !f.starts_with(&prefix));
                 st.shells.remove(&o);
+                // an optional the function keeps around a borrowed element
+                // (`m.get(k)` bound or returned) has its payload read and
+                // retained, then the destructor: the shell takes that count
+                if !owned {
+                    let reader = st
+                        .field_of
+                        .iter()
+                        .filter(|(r, (f, _))| {
+                            *f == payload && st.counts.get(*r).copied().unwrap_or(0) > 0
+                        })
+                        .max_by_key(|(_, (_, seq))| *seq)
+                        .map(|(r, _)| r.clone());
+                    if let Some(r) = reader {
+                        *st.counts.entry(r.clone()).or_insert(0) -= 1;
+                        st.counted_reads.remove(&r);
+                    }
+                }
             }
         }
-        // a call through a fn value held in a slot of this function: a
-        // closure follows the user-function convention whatever it is named,
-        // even when the name is also a runtime function's (`write`)
-        let closure_call = self.f.kinds.get(callee).is_some_and(|k| *k == "closure");
-        let result = if let Some(row) = runtime_ownership(callee).filter(|_| !closure_call) {
+        let closure_call = self.is_closure_call(callee);
+        // a function the program defines wins over a runtime function of
+        // the same name, as it does in the consumer: a user `second` is not
+        // the runtime's `second`, which borrows its result
+        let result = if let Some(row) =
+            runtime_ownership(callee).filter(|_| !closure_call && !self.user_funcs.contains(callee))
+        {
             for (i, a) in row.args.iter().enumerate() {
-                if *a == ArgOwnership::Consume && i < args.len() {
+                // a weak capture (tag 8) takes over a weak count
+                let weak_capture = callee == "pith_closure_set_env_rc"
+                    && self.weak_regs.contains(args.get(i).copied().unwrap_or(""));
+                if *a == ArgOwnership::Consume && i < args.len() && !weak_capture {
                     self.take(st, args[i], callee)?;
                     // these keep the value only when they report success
                     // (runtime_ownership.txt), so the failing side of a branch
@@ -1278,7 +1462,9 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
                 _ if SCALAR_KINDS.contains(&typ) => Val::Plain,
                 // an await of an unknown kind may be an Int; a count on it
                 // can't be settled either way
-                ResultValue::Own if typ == "unknown" => Val::Unknown,
+                ResultValue::Own if typ == "unknown" && !self.counted_regs.contains(dst) => {
+                    Val::Unknown
+                }
                 // a row that can't name where its counted result is borrowed
                 // from (the thread-local getters hand back the slot's value)
                 ResultValue::Plain if is_counted(typ) => Val::Obj(self.new_obj(st, 0)),
@@ -1289,9 +1475,9 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         } else if closure_call || callee == CALLI_CALLEE || self.user_funcs.contains(callee) {
             // a user function borrows its arguments and hands back a count
             // on a counted result
-            if typ == "unknown" {
+            if typ == "unknown" && !self.counted_regs.contains(dst) {
                 Val::Unknown
-            } else if is_counted(typ) {
+            } else if typ == "unknown" || is_counted(typ) {
                 Val::Obj(self.new_obj(st, 1))
             } else {
                 Val::Plain
@@ -1327,9 +1513,11 @@ impl<'a, 'f> FuncCheck<'a, 'f> {
         if kind == "unknown" {
             return Err("a value of unknown kind meets a count".into());
         }
-        let closure_call = self.f.kinds.get(callee).is_some_and(|k| *k == "closure");
+        let closure_call = self.is_closure_call(callee);
         let mut owned = true;
-        if let Some(row) = runtime_ownership(callee).filter(|_| !closure_call) {
+        if let Some(row) =
+            runtime_ownership(callee).filter(|_| !closure_call && !self.user_funcs.contains(callee))
+        {
             for (i, a) in row.args.iter().enumerate() {
                 if *a == ArgOwnership::Consume && i < args.len() {
                     self.take(st, args[i], callee)?;
@@ -2625,5 +2813,437 @@ endfunc
     fn a_function_without_marks_is_left_out() {
         let r = check("func helper 1 void\nparam p\niconst 1 0\nret 1\nendfunc\n");
         assert_eq!(r.unmarked, 1);
+    }
+
+    // the same IR with one line deleted or doubled
+    fn without(ir: &str, line: &str) -> String {
+        assert!(ir.contains(&format!("{line}\n")), "{line}");
+        ir.replacen(&format!("{line}\n"), "", 1)
+    }
+
+    fn doubled(ir: &str, line: &str) -> String {
+        assert!(ir.contains(&format!("{line}\n")), "{line}");
+        let mut parts: Vec<&str> = line.split(' ').collect();
+        parts[1] = "999";
+        ir.replacen(
+            &format!("{line}\n"),
+            &format!("{line}\n{}\n", parts.join(" ")),
+            1,
+        )
+    }
+
+    // a program's own `second` shadows the runtime's, which borrows its
+    // result: the call hands back a count like any user call
+    const USER_SHADOWS_RUNTIME: &str = "
+func second 1 struct:Node
+param a
+load 1 a
+call 2 pith_struct_retain void 1 1
+ret 1
+mark kind a Node
+endfunc
+func main 1 int
+param a
+load 2 a
+call 3 second struct:Node 1 2
+call 4 pith_struct_release void 1 3
+iconst 5 0
+ret 5
+mark kind a Node
+endfunc
+";
+
+    #[test]
+    fn a_user_function_named_like_a_runtime_function_hands_back_a_count() {
+        let r = check(USER_SHADOWS_RUNTIME);
+        assert_eq!((r.passed, r.failed, r.undecided), (2, 0, 0), "{:?}", r);
+        assert_eq!(
+            check(&without(
+                USER_SHADOWS_RUNTIME,
+                "call 4 pith_struct_release void 1 3"
+            ))
+            .failed,
+            1
+        );
+    }
+
+    // fn apply(xs: List[Int], f: fn(Int) -> String) -> Int: an open-coded map
+    // keeps the function in an emitter temp and calls through it
+    const CALL_THROUGH_TEMP: &str = "
+func apply 2 int
+param x
+param f
+load 1 f
+store __map_fn_L3 1
+load 2 x
+call 3 __map_fn_L3 string 1 2
+call 4 pith_cstring_len int 1 3
+call 5 pith_cstring_release void 1 3
+ret 4
+mark kind x int
+mark kind f closure
+endfunc
+";
+
+    #[test]
+    fn a_call_through_a_temp_holding_a_closure_follows_the_user_convention() {
+        let r = check(CALL_THROUGH_TEMP);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+        assert_eq!(
+            check(&without(
+                CALL_THROUGH_TEMP,
+                "call 5 pith_cstring_release void 1 3"
+            ))
+            .failed,
+            1
+        );
+        assert_eq!(
+            check(&doubled(
+                CALL_THROUGH_TEMP,
+                "call 5 pith_cstring_release void 1 3"
+            ))
+            .failed,
+            1
+        );
+    }
+
+    // fn forward(x: T!) -> T! in a generic body: the payload's kind is `T`,
+    // and the retain says it is counted. without the retain the kind stays
+    // open and the function undecided, so only a doubled one is a finding
+    const GENERIC_FORWARD: &str = "
+func forward 1 result_reg
+param x word
+load 1 x
+field 2 1 0 bool is_ok
+brif 2 L0 L1
+label L0
+field 3 1 8 unknown ok
+call 4 pith_cstring_retain void 1 3
+iconst 5 1
+ret2 5 3
+label L1
+field 6 1 16 unknown err
+call 7 pith_cstring_retain void 1 6
+iconst 8 0
+ret2 8 6
+mark kind x tuple
+endfunc
+";
+
+    #[test]
+    fn a_value_of_an_open_kind_the_body_retains_is_counted() {
+        let r = check(GENERIC_FORWARD);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+        assert_eq!(
+            check(&doubled(
+                GENERIC_FORWARD,
+                "call 4 pith_cstring_retain void 1 3"
+            ))
+            .failed,
+            1
+        );
+        assert_eq!(
+            check(&doubled(
+                GENERIC_FORWARD,
+                "call 7 pith_cstring_retain void 1 6"
+            ))
+            .failed,
+            1
+        );
+    }
+
+    // `m.get(k)` kept as an optional: the payload is retained and the shell
+    // takes that count with its destructor
+    const KEPT_GETTER: &str = "
+func known 1 tuple
+param key word
+load 1 __g_series
+load 2 key
+call 3 map_get_opt tuple 2 1 2
+optval 4 3 unknown value
+call 5 pith_struct_retain void 1 4
+funcref 6 __opt_dtor_struct
+call 7 pith_struct_set_dtor void 2 3 6
+ret 3
+mark kind key string
+endfunc
+";
+
+    #[test]
+    fn a_kept_optional_takes_the_count_of_its_retained_payload() {
+        let r = check(&format!("mark global __g_series map\n{KEPT_GETTER}"));
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+        let doubled_retain = doubled(KEPT_GETTER, "call 5 pith_struct_retain void 1 4");
+        assert_eq!(
+            check(&format!("mark global __g_series map\n{doubled_retain}")).failed,
+            1
+        );
+    }
+
+    // a weak field read: the upgrade hands back a strong count or a null,
+    // and the optional built around it owns that count
+    const WEAK_FIELD_READ: &str = "
+func parent_value 1 int
+param c word
+load 1 c
+iconst 2 16
+call 3 pith_struct_weak_load_field int 2 1 2
+store __weak_read_1 3
+brif 3 L1 L2
+label L1
+iconst 4 1
+iconst 5 2
+call 6 pith_struct_alloc tuple 1 5
+sstore 6 0 4
+sstore 6 1 3
+funcref 7 __opt_dtor_struct
+call 8 pith_struct_set_dtor void 2 6 7
+store __weak_read_1 6
+jmp L2
+label L2
+load 9 __weak_read_1
+call 10 pith_struct_release void 1 9
+iconst 11 0
+ret 11
+mark kind c Node
+endfunc
+";
+
+    #[test]
+    fn a_weak_read_owns_the_count_its_upgrade_took() {
+        let r = check(WEAK_FIELD_READ);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+        assert_eq!(
+            check(&without(
+                WEAK_FIELD_READ,
+                "call 10 pith_struct_release void 1 9"
+            ))
+            .failed,
+            1
+        );
+        assert_eq!(
+            check(&doubled(
+                WEAK_FIELD_READ,
+                "call 10 pith_struct_release void 1 9"
+            ))
+            .failed,
+            1
+        );
+    }
+
+    // a weak field stored into a fresh struct keeps a weak count, not a
+    // strong one
+    const WEAK_FIELD_INIT: &str = "
+func make_child 1 struct:Node
+param p word
+load 1 p
+call 2 pith_struct_weak_retain void 1 1
+iconst 3 1
+call 4 pith_struct_alloc struct:Node 1 3
+sstore 4 0 1
+ret 4
+mark kind p Node
+endfunc
+";
+
+    #[test]
+    fn a_weak_field_store_hands_over_no_strong_count() {
+        let r = check(WEAK_FIELD_INIT);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+    }
+
+    // `x := o.unwrap_or(fb)`: the temp holds one count on each path, and on
+    // the fallback path it shares the value with `fb`, which holds its own
+    const UNWRAP_OR_TEMP: &str = "
+func pick 1 int
+param o word
+iconst 1 0
+store fb 1
+load 2 fb
+call 3 int_to_string string 1 2
+store fb 3
+load 4 o
+optflag 5 4
+brif 5 L1 L2
+label L1
+optval 6 4 string value
+call 7 pith_cstring_retain void 1 6
+store __unwrap_or_1 6
+jmp L3
+label L2
+load 8 fb
+call 9 pith_cstring_retain void 1 8
+store __unwrap_or_1 8
+label L3
+load 10 __unwrap_or_1
+store x 10
+load 11 x
+call 12 pith_cstring_len int 1 11
+load 13 fb
+call 14 pith_cstring_release void 1 13
+load 15 x
+call 16 pith_cstring_release void 1 15
+ret 12
+mark kind o tuple
+mark kind fb string
+mark kind x string
+mark owns fb string
+mark owns x string
+endfunc
+";
+
+    #[test]
+    fn a_temp_holding_its_own_count_joins_a_path_where_it_shares_an_owned_value() {
+        let r = check(UNWRAP_OR_TEMP);
+        assert_eq!((r.passed, r.failed, r.undecided), (1, 0, 0), "{:?}", r);
+        assert_eq!(
+            check(&without(
+                UNWRAP_OR_TEMP,
+                "call 16 pith_cstring_release void 1 15"
+            ))
+            .failed,
+            1
+        );
+        assert_eq!(
+            check(&doubled(
+                UNWRAP_OR_TEMP,
+                "call 14 pith_cstring_release void 1 13"
+            ))
+            .failed,
+            1
+        );
+    }
+
+    // `mut cur := cursor` and `cur = advance(cur)` in a loop: `cursor` aliases
+    // `cur` before the loop and borrows on its own after a pass
+    const CURSOR_LOOP: &str = "
+func walk 1 struct:Cursor
+param cursor word
+iconst 1 0
+store cur 1
+load 2 cur
+load 3 cursor
+call 4 pith_struct_retain void 1 3
+call 5 pith_struct_release void 1 2
+store cur 3
+label L1
+load 6 cur
+call 7 done bool 1 6
+brif 7 L3 L2
+label L2
+load 8 cur
+call 9 advance struct:Cursor 1 8
+load 10 cur
+call 11 pith_struct_release void 1 10
+store cur 9
+jmp L1
+label L3
+load 12 cursor
+call 13 pith_struct_retain void 1 12
+load 14 cur
+call 15 pith_struct_release void 1 14
+ret 12
+mark kind cursor Cursor
+mark kind cur Cursor
+mark owns cur struct
+endfunc
+func done 1 bool
+param c word
+iconst 1 1
+ret 1
+mark kind c Cursor
+endfunc
+func advance 1 struct:Cursor
+param c word
+load 1 c
+call 2 pith_struct_retain void 1 1
+ret 1
+mark kind c Cursor
+endfunc
+";
+
+    #[test]
+    fn a_parameter_copied_into_a_rebound_local_stays_readable_past_the_loop() {
+        let r = check(CURSOR_LOOP);
+        assert_eq!((r.passed, r.failed, r.undecided), (3, 0, 0), "{:?}", r);
+        assert_eq!(
+            check(&without(
+                CURSOR_LOOP,
+                "call 11 pith_struct_release void 1 10"
+            ))
+            .failed,
+            1
+        );
+        assert_eq!(
+            check(&without(
+                CURSOR_LOOP,
+                "call 13 pith_struct_retain void 1 12"
+            ))
+            .failed,
+            1
+        );
+    }
+
+    // `mut data := arrived`, replaced on one path: the replace releases the
+    // parameter's retained copy. doubling that release made the paths
+    // disagree at the join, and the function was left undecided instead of
+    // reported (a mutation miss in std.io's buffered_text_decode)
+    const REPLACED_COPY: &str = "
+func keep 1 int
+param arrived word
+iconst 1 0
+store data 1
+load 2 data
+load 3 arrived
+call 4 pith_bytes_retain void 1 3
+call 5 pith_bytes_release void 1 2
+store data 3
+call 6 flag bool 0
+brif 6 L1 L2
+label L1
+call 7 fresh bytes 0
+load 8 data
+call 9 pith_bytes_release void 1 8
+store data 7
+jmp L2
+label L2
+load 10 data
+call 11 pith_bytes_release void 1 10
+iconst 12 0
+ret 12
+mark kind arrived bytes
+mark kind data bytes
+mark owns data bytes
+endfunc
+func flag 0 bool
+iconst 1 1
+ret 1
+mark kind x int
+endfunc
+func fresh 0 bytes
+iconst 2 16
+call 1 secure_random_bytes bytes 1 2
+ret 1
+mark kind x int
+endfunc
+";
+
+    #[test]
+    fn a_doubled_release_that_unsettles_a_later_join_is_still_reported() {
+        let r = check(REPLACED_COPY);
+        assert_eq!((r.passed, r.failed, r.undecided), (3, 0, 0), "{:?}", r);
+        let r = check(&doubled(
+            REPLACED_COPY,
+            "call 9 pith_bytes_release void 1 8",
+        ));
+        assert_eq!((r.failed, r.undecided), (1, 0), "{:?}", r);
+        assert_eq!(
+            check(&without(
+                REPLACED_COPY,
+                "call 9 pith_bytes_release void 1 8"
+            ))
+            .failed,
+            1
+        );
     }
 }

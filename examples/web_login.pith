@@ -27,10 +27,6 @@ PORT := 18106
 USERNAME := "ada"
 SECRET := "correct horse battery staple"
 
-# in a real service this is a database row. the phc string carries its own
-# salt and parameters, so one column holds everything verify needs.
-mut stored_hash := ""
-
 fn session_secret() -> Bytes:
     return bytes.from_string_utf8("a session secret kept out of the repo, 32+ bytes of it")
 
@@ -41,8 +37,10 @@ fn login_page(protection: csrf.Guard) -> fn(web.Request) -> http.HttpResponse:
 
 # the login itself. the password check belongs to the application, since
 # std.web.auth deliberately has no user table, and sign_in is the one line
-# that turns a checked password into a session.
-fn check_login(guard: auth.Guard, req: web.Request) -> http.HttpResponse:
+# that turns a checked password into a session. in a real service the stored
+# hash is a database row. the phc string carries its own salt and parameters,
+# so one column holds everything verify needs.
+fn check_login(guard: auth.Guard, stored_hash: String, req: web.Request) -> http.HttpResponse:
     body := req.raw.body_json() catch:
         return http.bad_request_response()
     user := json.get_string(json.object_get(body, "username"))
@@ -56,22 +54,22 @@ fn check_login(guard: auth.Guard, req: web.Request) -> http.HttpResponse:
         return http.text(503, "try again shortly")
     return http.text(200, "signed in")
 
-fn login(guard: auth.Guard) -> fn(web.Request) -> http.HttpResponse:
-    return fn(req: web.Request) => check_login(guard, req)
+fn login(guard: auth.Guard, stored_hash: String) -> fn(web.Request) -> http.HttpResponse:
+    return fn(req: web.Request) => check_login(guard, stored_hash, req)
 
 fn logout(guard: auth.Guard) -> fn(web.Request) -> http.HttpResponse:
     return fn(req: web.Request):
         guard.sign_out(req)
         return http.text(200, "signed out")
 
-fn build_app(store: session.Store, protection: csrf.Guard, guard: auth.Guard) -> web.App:
+fn build_app(store: session.Store, protection: csrf.Guard, guard: auth.Guard, stored_hash: String) -> web.App:
     mut app := web.bare()
     # outermost first: the session has to exist before csrf can find its
     # token in it, and before the guard can read who the caller is.
     app = app.use_mw(session.middleware(store))
     app = app.use_mw(csrf.middleware(protection))
     app = app.get("/login", login_page(protection))
-    app = app.post("/login", login(guard))
+    app = app.post("/login", login(guard, stored_hash))
     app = app.post("/logout", logout(guard))
     # everything under /app needs a signed-in session; the two routes above
     # and /healthz stay open, without an allowlist buried inside a guard.
@@ -79,8 +77,8 @@ fn build_app(store: session.Store, protection: csrf.Guard, guard: auth.Guard) ->
     app = app.get("/app/me", fn(req: web.Request) => http.text(200, "hello " + req.value(auth.REQUEST_VALUE)))
     return app
 
-fn serve_bg(store: session.Store, protection: csrf.Guard, guard: auth.Guard, port: Int) -> Int:
-    return build_app(store, protection, guard).listen("127.0.0.1", port) catch 0
+fn serve_bg(store: session.Store, protection: csrf.Guard, guard: auth.Guard, stored_hash: String, port: Int) -> Int:
+    return build_app(store, protection, guard, stored_hash).listen("127.0.0.1", port) catch 0
 
 # connect until the accept loop answers, rather than sleeping for a guess.
 fn wait_until_listening(port: Int) -> Bool:
@@ -136,14 +134,14 @@ fn csrf_token_for(cookie: String) -> String!:
 
 fn main() -> Int!:
     # register the one user before serving: about 30 ms of argon2id, once.
-    stored_hash = password.hash(SECRET)!
+    stored_hash := password.hash(SECRET)!
 
     store := session.store(session_secret())!.insecure_over_http().ttl(3600)
     protection := csrf.guard(store)
     guard := auth.guard(store)
 
     port := PORT
-    spawn serve_bg(store, protection, guard, port)
+    spawn serve_bg(store, protection, guard, stored_hash, port)
     if not wait_until_listening(port):
         fail "the server never came up"
 

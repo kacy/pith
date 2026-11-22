@@ -21,6 +21,7 @@ import std.net.tcp as tcp
 import std.net.tls as tls
 from std.io import TcpStream
 from std.iter import Iterator
+from std.collections import pop_last
 
 # --- byte helpers (mysql is little-endian) ---
 
@@ -799,10 +800,7 @@ impl Pool:
         self.slots.recv()
         mut reused: Conn? := none
         locked self.mu:
-            n := self.idle.len()
-            if n > 0:
-                reused = self.idle[n - 1]
-                self.idle = self.idle.slice(0, n - 1)
+            reused = pop_last(self.idle)
         if reused != none:
             return reused?
         fresh := connect(self.host, self.port, self.user, self.password, self.database)

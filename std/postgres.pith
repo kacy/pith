@@ -34,6 +34,7 @@ import std.net.tcp as tcp
 import std.net.tls as tls
 from std.io import TcpStream
 from std.iter import Iterator
+from std.collections import pop_last
 
 # backend messages come off an untrusted socket, so the frame length the server
 # advertises is bounded before it drives a read: a hostile or MITM'd peer must
@@ -641,10 +642,7 @@ impl Pool:
         self.slots.recv()
         mut reused: Conn? := none
         locked self.mu:
-            n := self.idle.len()
-            if n > 0:
-                reused = self.idle[n - 1]
-                self.idle = self.idle.slice(0, n - 1)
+            reused = pop_last(self.idle)
         if reused != none:
             return reused?
         fresh := connect(self.host, self.port, self.user, self.password, self.database)

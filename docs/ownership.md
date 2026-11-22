@@ -771,16 +771,25 @@ stands: an explicit `close()` still says *when* the resource goes back,
 which matters for a server config a listener is still handshaking on,
 and the destructor covers the caller that forgot or took an error exit
 past the call. a closer backed by a map removal is idempotent for free,
-and that is the shape every `Drop` type in std has. a closer that frees
-memory by address, such as `ByteBuffer.free()` or an ecdh key pair's
-`close()`, cannot lean on the runtime to recognise the address a second
-time, because a later allocation can be given it. those record the close in
-the value itself (the handle goes to 0 or -1), so the destructor after a
-close finds nothing to free.
+and that is the shape every `Drop` type in std has. an ecdh key pair's
+`close()` frees memory by address, and a later key can be given the same
+address, so the runtime cannot tell a second close from a close of the new
+key. the pair records the close in the value itself (its handle goes to -1),
+so the destructor after a close finds nothing to free.
 
-the io readers, writers and buffers, files, processes, byte buffers, ecdh
-key pairs and websocket sessions implement `Drop` this way; docs/io_foundation.md
-lists what each one releases.
+`std.bytes.ByteBuffer` would need the same record and has no destructor
+yet. `take_bytes()` hands its storage over and frees the box, so the buffer
+has to remember that it is spent, and writing that down is a field store in
+`free()`. the count checker (`count-marks-check-only`) cannot tell a store
+to an `Int` field from one that drops a counted value, so every list loop
+that can reach `free()` would fail its borrow check. the buffer can take a
+destructor once the checker can tell the two apart, or once `take_bytes()`
+leaves an empty box behind for the destructor to free. a `ByteArray` has
+no `take_bytes()` and does free its storage on drop.
+
+the io readers, writers and buffers, files, processes, byte arrays, ecdh
+key pairs and websocket sessions implement `Drop`; docs/io_foundation.md
+lists what each io type releases.
 
 `tests/cases/test_drop_hook` pins where the hook fires (scope exit, a
 rebind, a list or a struct field dying, a value returned to a caller),
@@ -788,8 +797,8 @@ rebind, a list or a struct field dying, a value returned to a caller),
 `tests/invalid/drop_escape_*` the escapes E318 refuses, and
 `tests/leaks/leak_tls_config_drop` pins that a tls config built and never
 closed no longer holds its registry slot. `tests/leaks/leak_io_registry_drop`
-and `tests/leaks/leak_byte_buffer_drop` do the same for the io registries,
-byte buffers and key pairs, and `tests/cases/test_io_drop_resources` counts
+and `tests/leaks/leak_byte_array_drop` do the same for the io registries,
+byte arrays and key pairs, and `tests/cases/test_io_drop_resources` counts
 open fds around files, child processes and websocket sessions that are
 never closed.
 

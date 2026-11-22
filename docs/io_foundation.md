@@ -163,7 +163,8 @@ so a value nobody closed releases what it holds when its last value dies:
   `ProcessHandle`, so the child is closed when the last of them dies. a view
   outlives the `Process` it came from. closing does not wait for the child or
   kill it, and a child still running is reaped without blocking once it exits.
-- `std.bytes.ByteBuffer` and `ByteArray` free their storage.
+- `std.bytes.ByteArray` frees its storage. a `ByteBuffer` does not yet (see
+  docs/ownership.md), so `free()` or `take_bytes()` it.
 
 a destructor does no io. a buffered writer that dies with text in it drops the
 text, as `close()` does: call `flush()` first. a file is unbuffered, so its

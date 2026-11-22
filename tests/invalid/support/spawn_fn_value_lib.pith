@@ -1,0 +1,17 @@
+# a library whose one spawn is reached through `launch`. the spawned task and
+# the caller both push to the list they were handed.
+
+fn churn(xs: List[String]) -> Int:
+    mut i := 0
+    while i < 1000:
+        xs.push("item {i}")
+        if xs.len() > 64:
+            xs.clear()
+        i = i + 1
+    return xs.len()
+
+## spawn a task over `xs` and churn it here as well
+pub fn launch(xs: List[String]) -> Int:
+    t := spawn churn(xs)
+    churn(xs)
+    return await t

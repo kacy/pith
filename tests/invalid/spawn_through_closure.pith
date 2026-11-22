@@ -1,0 +1,11 @@
+# the spawn is reached through a closure that calls `launch`, and through a
+# function passed as an argument and called by the callee (E248).
+import support.spawn_fn_value_lib as lib
+
+fn apply(f: fn(List[String]) -> Int, xs: List[String]) -> Int:
+    return f(xs)
+
+fn main():
+    xs: List[String] := []
+    g := fn(ys: List[String]) -> Int => lib.launch(ys)
+    print("{apply(g, xs)}")

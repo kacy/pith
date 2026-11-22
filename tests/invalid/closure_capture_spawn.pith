@@ -1,0 +1,16 @@
+# a closure that captures a list and runs on another task shares the list's
+# buffer with the scope that made it, which keeps pushing to it (E248)
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    work := fn() -> Int:
+        for i in 0..1000:
+            xs.push("task {i}")
+        return xs.len()
+    t := spawn run(work)
+    for i in 0..1000:
+        xs.push("main {i}")
+    print("{await t} {xs.len()}")
+    return 0

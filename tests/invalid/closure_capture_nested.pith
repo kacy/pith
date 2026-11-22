@@ -1,0 +1,12 @@
+# an inner closure captured by one that crosses to a task crosses with it (E248)
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    inner := fn() -> Int => xs.len()
+    outer := fn() -> Int => inner() + 1
+    t := spawn run(outer)
+    xs.push("main")
+    print("{await t}")
+    return 0

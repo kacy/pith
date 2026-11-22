@@ -1,0 +1,53 @@
+# the closures the closure sharing rule (E248) still accepts. a closure that
+# runs on another task may capture numbers, strings, values in a guard block
+# and frozen fields; a closure that captures a list is fine as long as it
+# stays on the task that made it; and a closure a task builds for itself may
+# capture whatever that task holds.
+struct Settings:
+    frozen names: List[String]
+    label: String
+
+struct Counter:
+    guard mu:
+        mut seen: List[Int]
+
+struct Job:
+    f: fn() -> Int
+
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn run_job(j: Job) -> Int:
+    return j.f()
+
+# builds a list on its own task and a closure over it that never leaves
+fn local_sum(n: Int) -> Int:
+    mut xs: List[Int] := []
+    for i in 0..n:
+        xs.push(i)
+    total := fn() -> Int:
+        mut t := 0
+        for x in xs:
+            t += x
+        return t
+    return total()
+
+fn main() -> Int!:
+    base := 40
+    word := "pith"
+    settings := Settings(names: ["a", "b", "c"], label: "cfg")
+    counter := Counter(seen: [])
+    plain := spawn run(fn() -> Int => base + word.len())
+    frozen := spawn run(fn() -> Int => settings.names.len() + settings.label.len())
+    guarded := spawn run_job(Job(f: fn() -> Int:
+        locked counter.mu:
+            counter.seen.push(1)
+            return counter.seen.len()
+    ))
+    own := spawn local_sum(5)
+    # a closure over a held list is fine while it stays on this task
+    mut xs: List[Int] := [1, 2, 3]
+    doubled := xs.map(fn(x: Int) -> Int => x * 2 + xs.len())
+    xs.push(4)
+    print("{await plain} {await frozen} {await guarded} {await own} {doubled.len()} {xs.len()}")
+    return 0

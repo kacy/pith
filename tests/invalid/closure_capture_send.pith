@@ -1,0 +1,18 @@
+# a struct sent on a channel carries its closure to the receiving task (E248)
+struct Job:
+    f: fn() -> Int
+
+fn worker(jobs: Channel[Job]) -> Int:
+    if let j = jobs.recv():
+        return j.f()
+    return 0
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    jobs := Channel[Job](1)
+    t := spawn worker(jobs)
+    work := fn() -> Int => xs.len()
+    jobs.send(Job(f: work))
+    xs.push("main")
+    print("{await t}")
+    return 0

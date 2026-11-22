@@ -11239,13 +11239,22 @@ fn ir_emit_field_access_expr(idx: Int, node: Node) -> Int:
         return ir_emit_field_access(idx, node, obj_r)
     return ir_emit_field_access(idx, node, 0 - 1)
 
-fn ir_emit_await_expr(node: Node) -> Int:
+fn ir_emit_await_expr(idx: Int, node: Node) -> Int:
     if node.children.len() == 0:
         return ir_zero_reg()
     task_r := ir_expr(node.children[0])
     r := ir_reg()
-    ir_emit_call1(r, "await", "unknown", task_r)
+    ir_emit_call1(r, "await", ir_await_retkind(idx), task_r)
     return r
+
+# the kind an await's value is typed with. a task returning a result hands
+# back its box, typed `tuple` so the count checker sees the box it opens.
+# anything else stays `unknown`, which the backend treats as a plain i64.
+fn ir_await_retkind(idx: Int) -> String:
+    tid := c_get_expr_type(idx)
+    if tid >= 0 and get_type_info(tid).kind == "result":
+        return "tuple"
+    return "unknown"
 
 # release a result's error value when it is being discarded. the result
 # tuple is a shell with no destructor, so releasing the tuple frees only
@@ -11479,7 +11488,7 @@ fn ir_expr_complex(idx: Int, node: Node) -> Int:
         return ir_emit_spawn_expr(node)
 
     if kind == "await":
-        return ir_emit_await_expr(node)
+        return ir_emit_await_expr(idx, node)
 
     if kind == "unwrap":
         return ir_emit_optional_unwrap(node)

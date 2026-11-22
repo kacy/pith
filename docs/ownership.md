@@ -5,6 +5,16 @@ are small, but they are load-bearing: every leak, dangling pointer,
 and double free the emitter has ever produced traces back to one of
 them being broken somewhere.
 
+## what is guaranteed
+
+a program that compiles never reads freed memory, frees a value twice, or
+writes past a buffer, including when several tasks run at once. three
+things fall outside that guarantee: a strong cycle with no `weak` edge
+leaks, some runtime errors (an index out of range outside a `T!`
+function, a stack overflow) stop the process, and a send that races a
+channel close can lose its value. docs/concurrency.md lists the rules the
+compiler enforces on values that tasks share.
+
 ## the model
 
 heap strings carry a refcount in their header

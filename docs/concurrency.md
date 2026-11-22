@@ -361,6 +361,8 @@ mutex a task already holds deadlocks it.
 
 - `counter.load()`
 - `counter.store(n)`
+- `counter.fetch_add(delta)` — atomically adds `delta` and returns the previous value
+- `counter.fetch_sub(delta)` — atomically subtracts `delta` and returns the previous value
 - `counter.compare_set(expected, new)` — sets and returns `true` only if the
   value was `expected`, which is how you elect exactly one winner among racing
   tasks. `std.concurrent` uses it so a deadline and a manual cancel settle on

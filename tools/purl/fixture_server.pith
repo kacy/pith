@@ -25,13 +25,6 @@ from purl_auth import build_digest_header_with_cnonce, parse_digest_challenge
 
 flaky_counter := AtomicInt(0)
 
-fn atomic_inc(counter: AtomicInt) -> Int:
-    while true:
-        cur := counter.load()
-        if counter.compare_set(cur, cur + 1):
-            return cur + 1
-    return 0
-
 fn echo_json_response(req: HttpRequestBytes) -> HttpResponse:
     obj := json.make_object()
     json.object_set(obj, "method", json.make_string(req.method() catch ""))
@@ -102,7 +95,7 @@ fn route(req: HttpRequestBytes) -> HttpResponse:
         return http.no_content()
 
     if path == "/flaky":
-        count := atomic_inc(flaky_counter)
+        count := flaky_counter.fetch_add(1) + 1
         if count < 3:
             return http.text(503, "try again")
         return http.text(200, "recovered")

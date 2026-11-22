@@ -196,6 +196,10 @@ fn message_without_alias_receivers(message: String) -> String:
 # (node, code) pair; the suffix joins the message; an error takes the
 # override severity when one is set.
 fn checker_record(node_idx: Int, severity: String, code: String, message: String, fix: String):
+    checker_record_at(node_idx, checker_node_position(node_idx), severity, code, message, fix)
+
+# checker_record at an explicit position rather than the node's start.
+fn checker_record_at(node_idx: Int, pos: (Int, Int), severity: String, code: String, message: String, fix: String):
     if checker_reporting_enabled == false:
         return
     if checker_dedup_active:
@@ -206,7 +210,6 @@ fn checker_record(node_idx: Int, severity: String, code: String, message: String
     mut recorded_severity := severity
     if severity == "error" and checker_severity_override.len() > 0:
         recorded_severity = checker_severity_override
-    pos := checker_node_position(node_idx)
     checker_diagnostics.push(Diagnostic(recorded_severity, code, message_without_alias_receivers(message) + checker_message_suffix, checker_file_path, pos.0, pos.1, fix))
 
 ## report an error against a specific AST node, for a site that holds
@@ -216,6 +219,16 @@ fn checker_record(node_idx: Int, severity: String, code: String, message: String
 ## file and message with no line number and no source snippet.
 pub fn report_error_at(node_idx: Int, code: String, message: String):
     checker_record(node_idx, "error", code, message, "")
+
+## report an error at the name a node carries rather than at its start:
+## the member of `Local.Nope` or `Local.Nope(1)`, the variant of a
+## variant pattern. for any other node this is report_error_at.
+pub fn report_error_at_name(node_idx: Int, code: String, message: String):
+    if node_idx < 0:
+        checker_record(node_idx, "error", code, message, "")
+        return
+    node := get_node(node_idx)
+    checker_record_at(node_idx, (node.name_line, node.name_col), "error", code, message, "")
 
 ## report an error at whatever node checking is currently inside. this
 ## is the common form: the statement and expression walkers stamp the

@@ -5,7 +5,7 @@
 # a small command-line wrapper around them.
 
 from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr, interp_escape_kind, INTERP_ESCAPE_COLLAPSED, INTERP_ESCAPE_KEPT
-from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value, node_kind, from_import_alias_receiver
+from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value, set_node_name_position, node_kind, from_import_alias_receiver
 from errors import Diagnostic
 
 # ---------------------------------------------------------------
@@ -706,6 +706,7 @@ fn parse_postfix() -> Int:
                     for a in call_args:
                         children.push(a)
                     expr = add_node_from_mark("method_call", name_tok.value, children, mark)
+                    set_node_name_position(expr, name_tok.current_line, name_tok.current_column)
                 elif check("lbracket") and method_type_args_follow(expr):
                     # method call with written type arguments: expr.name[T](args).
                     # the receiver and the arguments sit where every method call
@@ -724,10 +725,12 @@ fn parse_postfix() -> Int:
                         children.push(a)
                     pos := position_from_mark(mark)
                     expr = add_node_with_type_args("method_call", name_tok.value, children, type_args, pos.0, pos.1)
+                    set_node_name_position(expr, name_tok.current_line, name_tok.current_column)
                 else:
                     # field access: expr.name
                     mut children: List[Int] := [expr]
                     expr = add_node_from_mark("field_access", name_tok.value, children, mark)
+                    set_node_name_position(expr, name_tok.current_line, name_tok.current_column)
 
         elif kind == "lbrace":
             # struct init: TypeName{...}
@@ -1509,10 +1512,14 @@ fn parse_pattern() -> Int:
                     while match_tok("comma"):
                         fields.push(parse_pattern())
                 expect("rparen")
-                return add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, fields, mark)
+                pat := add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, fields, mark)
+                set_node_name_position(pat, variant_tok.current_line, variant_tok.current_column)
+                return pat
 
             mut empty: List[Int] := []
-            return add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, empty, mark)
+            pat := add_node_from_mark("pat_variant", enum_name + "." + variant_tok.value, empty, mark)
+            set_node_name_position(pat, variant_tok.current_line, variant_tok.current_column)
+            return pat
 
         return add_leaf_with_position("pat_binding", type_tok.value)
 
@@ -1932,11 +1939,16 @@ fn parse_import_decl() -> Int:
             mut parts: List[String] := [path, "*"]
             return add_leaf_with_position("from_import", parts.join(" "))
 
+        # each listed name also gets an "import_name" leaf child at its own
+        # token, so a diagnostic about one name points at that name rather
+        # than at the end of the line
         mut parts: List[String] := [path]
-        parse_from_import_name(parts)
+        mut names: List[Int] := []
+        parse_from_import_name(parts, names)
         while match_tok("comma"):
-            parse_from_import_name(parts)
-        return add_leaf_with_position("from_import", parts.join(" "))
+            parse_from_import_name(parts, names)
+        pos := get_current_position()
+        return add_node("from_import", parts.join(" "), names, pos.0, pos.1)
 
     # import path [as alias]
     advance_token()
@@ -1954,10 +1966,12 @@ fn parse_import_decl() -> Int:
 
     return add_leaf_with_position("import", parts.join(" "))
 
-# one `name` or `name as alias` of a from-import, appended to `parts`.
-fn parse_from_import_name(parts: List[String]):
+# one `name` or `name as alias` of a from-import, appended to `parts`, with
+# a leaf for the name appended to `names`.
+fn parse_from_import_name(parts: List[String], names: List[Int]):
     n := expect("identifier")
     parts.push(n.value)
+    names.push(add_leaf("import_name", n.value, n.current_line, n.current_column))
     if match_tok("kw_as"):
         alias_tok := expect("identifier")
         parts.push("as")

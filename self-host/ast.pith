@@ -37,6 +37,12 @@
 # children[0] and its arguments after it, and every walker that reads them
 # by position sees a call with written type arguments exactly as it sees
 # one without.
+#
+# name_line and name_col are where the name in `value` was written, for a
+# node whose name is not its first token: the member of a field access or
+# method call (`Local.Nope`) and the variant of a variant pattern. they
+# equal line and col for every other node. a diagnostic about the name
+# itself (an unknown variant) points there instead of at the receiver.
 pub struct Node:
     pub kind: String
     pub value: String
@@ -44,26 +50,28 @@ pub struct Node:
     pub line: Int
     pub col: Int
     pub type_args: Int
+    pub name_line: Int
+    pub name_col: Int
 
 # global node arena — all nodes live here
 mut nodes: List[Node] := []
 
 # add a node with children, return its index
 pub fn add_node(kind: String, value: String, children: List[Int], line: Int, col: Int) -> Int:
-    nodes.push(Node(kind, value, children, line, col, 0 - 1))
+    nodes.push(Node(kind, value, children, line, col, 0 - 1, line, col))
     return nodes.len() - 1
 
 # add a node that also carries written type arguments: `type_args` is the
 # index of the "type_args" node they were parsed into. only a method call
 # is built this way.
 pub fn add_node_with_type_args(kind: String, value: String, children: List[Int], type_args: Int, line: Int, col: Int) -> Int:
-    nodes.push(Node(kind, value, children, line, col, type_args))
+    nodes.push(Node(kind, value, children, line, col, type_args, line, col))
     return nodes.len() - 1
 
 # add a leaf node (no children), return its index
 pub fn add_leaf(kind: String, value: String, line: Int, col: Int) -> Int:
     mut empty: List[Int] := []
-    nodes.push(Node(kind, value, empty, line, col, 0 - 1))
+    nodes.push(Node(kind, value, empty, line, col, 0 - 1, line, col))
     return nodes.len() - 1
 
 # retrieve a node by index
@@ -73,7 +81,7 @@ pub fn get_node(idx: Int) -> Node:
 # replace a node's value, keeping everything else about it.
 pub fn set_node_value(idx: Int, value: String):
     n := nodes[idx]
-    nodes[idx] = Node(n.kind, value, n.children, n.line, n.col, n.type_args)
+    nodes[idx] = Node(n.kind, value, n.children, n.line, n.col, n.type_args, n.name_line, n.name_col)
 
 # add `child` as the last child of the node at `idx`. the checker uses it to
 # give a call the default arguments it leaves out.
@@ -83,7 +91,12 @@ pub fn append_node_child(idx: Int, child: Int):
     for c in n.children:
         kids.push(c)
     kids.push(child)
-    nodes[idx] = Node(n.kind, n.value, kids, n.line, n.col, n.type_args)
+    nodes[idx] = Node(n.kind, n.value, kids, n.line, n.col, n.type_args, n.name_line, n.name_col)
+
+# record where the name a node carries was written. see Node.
+pub fn set_node_name_position(idx: Int, line: Int, col: Int):
+    n := nodes[idx]
+    nodes[idx] = Node(n.kind, n.value, n.children, n.line, n.col, n.type_args, line, col)
 
 # how many nodes the arena holds. every parse appends contiguously, so
 # a count taken before and after a parse brackets that parse's nodes.
@@ -166,7 +179,7 @@ pub fn append_relocated_nodes(taken: List[Node], old_start: Int) -> Int:
         mut type_args := n.type_args
         if type_args >= 0:
             type_args = type_args + shift
-        nodes.push(Node(n.kind, n.value, kids, n.line, n.col, type_args))
+        nodes.push(Node(n.kind, n.value, kids, n.line, n.col, type_args, n.name_line, n.name_col))
     return shift
 
 # a from-import node's value is the module path and then the names it lists,

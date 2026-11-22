@@ -10,6 +10,27 @@ from checker import c_get_expr_type, c_is_interface_value_type
 from types import get_type_info, lookup_declared_type_id, lookup_type_id
 from ir_metadata import ir_is_float_returning_func, ir_is_bool_returning_func, ir_is_int_returning_func, ir_is_string_returning_func, ir_is_bytes_returning_func, ir_is_list_returning_func, ir_is_list_string_returning_func, ir_is_string_returning_method
 
+## alias name -> the target's type node, for every type alias of the module
+## being emitted. filled by ir_collect_type_aliases before anything resolves
+## an annotation.
+pub mut ir_type_alias_nodes: Map[String, Int] := {}
+
+## the type node an annotation stands for: the alias's target when the node
+## names a type alias, followed through aliases of aliases, else the node
+## itself. a site that reads an annotation's form (an optional, a tuple, a
+## function type, a result) looks at this node, so `x: MaybeName` with
+## `type MaybeName = String?` lowers exactly as `x: String?` does.
+pub fn ir_alias_target_node(type_idx: Int) -> Int:
+    mut idx := type_idx
+    mut hops := 0
+    while idx >= 0 and hops < 16:
+        tn := get_node(idx)
+        if tn.kind != "type" or not ir_type_alias_nodes.contains_key(tn.value):
+            return idx
+        idx = ir_type_alias_nodes[tn.value]
+        hops = hops + 1
+    return idx
+
 # turn a type name as it was written into an emission kind, taking the
 # alias and struct tables explicitly so it works before global emitter
 # state is populated (ir_resolve_type_hint is the wrapper that reads

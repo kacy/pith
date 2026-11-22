@@ -147,6 +147,37 @@ around tiny structs that only hold handles into that state. structs are shared
 now (a field written through one copy is visible through every other), so the
 handle tables are no longer required, but the adapters still use them.
 
+## what a value releases when it dies
+
+`close()` and `free()` are still how you say when a stream is done. each of
+these types also implements `Drop` (see "destructors" in docs/ownership.md),
+so a value nobody closed releases what it holds when its last value dies:
+
+- `StringReader`, `StringBuffer`, `BytesCursor`, `BufferedReader`,
+  `BufferedWriter`, `BufferedBytesReader` and `BufferedBytesWriter` give back
+  their registry entries, and a string buffer frees its storage. a buffered
+  reader or writer releases its source or target with the entry, so a file
+  under it closes then if nothing else holds the file.
+- `FileStream` closes its file.
+- a `Process` and its `stdin()`, `stdout()` and `stderr()` views share one
+  `ProcessHandle`, so the child is closed when the last of them dies. a view
+  outlives the `Process` it came from. closing does not wait for the child or
+  kill it, and a child still running is reaped without blocking once it exits.
+- `std.bytes.ByteBuffer` and `ByteArray` free their storage.
+
+a destructor does no io. a buffered writer that dies with text in it drops the
+text, as `close()` does: call `flush()` first. a file is unbuffered, so its
+writes have already reached the os.
+
+`TcpStream` has no destructor. it is a view of a socket, and std builds one
+over sockets that other code owns, so whoever opened the socket closes it.
+
+the registry handles come from one process-wide counter. a value can die on a
+task other than the one that built it, and its destructor then looks in that
+task's registry, where it finds nothing and does nothing, which is also what a
+`close()` on that task does. the entry it was built with stays in the first
+task's registry until that task ends.
+
 ## the buffered readers and writers hold an interface value
 
 a buffered text reader is one type, `BufferedReader`, whatever it reads from.

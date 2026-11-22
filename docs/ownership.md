@@ -771,14 +771,27 @@ stands: an explicit `close()` still says *when* the resource goes back,
 which matters for a server config a listener is still handshaking on,
 and the destructor covers the caller that forgot or took an error exit
 past the call. a closer backed by a map removal is idempotent for free,
-and that is the shape every `Drop` type in std has.
+and that is the shape every `Drop` type in std has. a closer that frees
+memory by address, such as `ByteBuffer.free()` or an ecdh key pair's
+`close()`, cannot lean on the runtime to recognise the address a second
+time, because a later allocation can be given it. those record the close in
+the value itself (the handle goes to 0 or -1), so the destructor after a
+close finds nothing to free.
+
+the io readers, writers and buffers, files, processes, byte buffers, ecdh
+key pairs and websocket sessions implement `Drop` this way; docs/io_foundation.md
+lists what each one releases.
 
 `tests/cases/test_drop_hook` pins where the hook fires (scope exit, a
 rebind, a list or a struct field dying, a value returned to a caller),
 `tests/cases/test_drop_lend` what a `drop` body may still do with `self`,
 `tests/invalid/drop_escape_*` the escapes E318 refuses, and
 `tests/leaks/leak_tls_config_drop` pins that a tls config built and never
-closed no longer holds its registry slot.
+closed no longer holds its registry slot. `tests/leaks/leak_io_registry_drop`
+and `tests/leaks/leak_byte_buffer_drop` do the same for the io registries,
+byte buffers and key pairs, and `tests/cases/test_io_drop_resources` counts
+open fds around files, child processes and websocket sessions that are
+never closed.
 
 ## weak references
 

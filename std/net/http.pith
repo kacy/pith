@@ -175,13 +175,19 @@ pub struct ClientRequest:
     # (MAX_RESPONSE_BODY outside a Client). set with with_max_response_body_bytes.
     pub max_response_body_bytes: Int
 
-# a reusable plain http client connection.
+# a reusable plain http client connection. it owns its stream: close() gives
+# back the socket and the reader's and writer's registry entries, and a
+# ClientConn nobody closed closes its socket when the last value naming it
+# goes away (ClientConn implements Drop). anything still in the writer's buffer
+# is lost then, as it is on a skipped close; send() flushes every request.
 pub struct ClientConn:
     pub stream: TcpStream
     pub reader: BufferedBytesReader
     pub writer: BufferedBytesWriter
 
-# a reusable tls http client connection.
+# a reusable tls http client connection. the tls.Conn it holds releases its
+# session and socket when the last value naming it goes away, so a
+# TlsClientConn nobody closed leaks nothing; close() also sends close_notify.
 pub struct TlsClientConn:
     pub conn: tls.Conn
 
@@ -1809,7 +1815,7 @@ struct ByteSource:
     socket: Int
 
 fn buffered_source(reader: BufferedBytesReader) -> ByteSource:
-    return ByteSource(reader, tls.Conn(0), false, 0)
+    return ByteSource(reader, tls.no_conn(), false, 0)
 
 fn tls_source(conn: tls.Conn) -> ByteSource:
     return ByteSource(BufferedBytesReader(0), conn, true, 0)
@@ -4639,7 +4645,7 @@ fn no_tls_config() -> tls.Config:
     return tls.Config(0 - 1)
 
 fn plain_wire(stream: TcpStream, key: String) -> WireConn:
-    return WireConn(stream, stream.buffered_bytes_reader_chunked(4096), stream.buffered_bytes_writer(), tls.Conn(0), false, key, 0, false)
+    return WireConn(stream, stream.buffered_bytes_reader_chunked(4096), stream.buffered_bytes_writer(), tls.no_conn(), false, key, 0, false)
 
 # run the tls handshake over `stream`. the stream is closed when it fails.
 fn tls_wire(stream: TcpStream, server_name: String, config: tls.Config, key: String) -> WireConn!:
@@ -5063,6 +5069,14 @@ impl ClientConn:
         finish_output_file_writer(file, writer)!
         return streamed
 
+# the socket only: the reader's and writer's entries live in the registry of
+# the task that built them, and a drop can run on another task, where the same
+# numbers name someone else's reader. they go when that task ends. a second
+# close of the socket, after close(), does nothing.
+impl Drop for ClientConn:
+    fn drop():
+        self.stream.close()
+
 impl TlsClientConn:
     fn send(req: ClientRequest) -> HttpResponse!:
         self.conn.write_all_bytes(req.to_bytes()!)!
@@ -5086,10 +5100,24 @@ impl TlsClientConn:
 # Client
 # ===============================================================
 
-# the idle connections of a client, by origin.
+# the idle connections of a client, by origin. every copy of a Client shares
+# one pool, and the pool owns what is in it: a connection goes in by moving
+# its values in (put_idle) and comes out the same way (conn_for), so the
+# request that handed one in can end without closing it.
 struct ConnPool:
     guard mu:
         mut idle: Map[String, List[WireConn]]
+
+# when the last client sharing the pool goes away, its idle plain sockets are
+# closed here. an idle tls connection needs nothing: its tls.Conn dies with
+# the map and releases itself. no close_notify is sent either way.
+impl Drop for ConnPool:
+    fn drop():
+        locked self.mu:
+            for key in self.idle:
+                for c in self.idle[key]:
+                    if not c.use_tls:
+                        tcp_close(c.stream.fd)
 
 # an http/1.1 client in the shape of net/http's Client and Transport: it keeps
 # connections alive and reuses them per origin, follows redirects, and bounds
@@ -5667,7 +5695,7 @@ impl Client:
         key := route.key
         while true:
             mut found := false
-            mut c := WireConn(TcpStream(0), BufferedBytesReader(0), BufferedBytesWriter(0), tls.Conn(0), false, key, 0, false)
+            mut c := WireConn(TcpStream(0), BufferedBytesReader(0), BufferedBytesWriter(0), tls.no_conn(), false, key, 0, false)
             locked self.pool.mu:
                 if self.pool.idle.contains_key(key):
                     list := self.pool.idle[key]
@@ -6339,7 +6367,7 @@ pub fn serve_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
     defer tcp_close(fd)
     defer writer.free()
     defer reader.free()
-    return serve_single(server_conn(ByteSource(reader, tls.Conn(0), false, fd), writer, handler, server_config()))
+    return serve_single(server_conn(ByteSource(reader, tls.no_conn(), false, fd), writer, handler, server_config()))
 
 # serves requests from one client fd until the connection closes.
 pub fn serve_connection_fd(fd: Int, handler: fn(HttpRequestBytes) -> HttpResponse) -> Int!:
@@ -6351,7 +6379,7 @@ pub fn serve_connection_fd_with(fd: Int, handler: fn(HttpRequestBytes) -> HttpRe
     stream := io.from_fd(fd)
     reader := stream.buffered_bytes_reader_chunked(512)
     writer := stream.buffered_bytes_writer()
-    written := serve_requests(server_conn(ByteSource(reader, tls.Conn(0), false, fd), writer, handler, config)) catch 0
+    written := serve_requests(server_conn(ByteSource(reader, tls.no_conn(), false, fd), writer, handler, config)) catch 0
     # the registry entries die with the connection, not the process
     reader.free()
     writer.free()
@@ -6809,7 +6837,7 @@ test "http client requests can stream responses into files":
     raw := "HTTP/1.1 200 OK" + crlf + "Content-Length: 11" + crlf + "Connection: close" + crlf + crlf + "hello world"
     file_path := "/tmp/pith-http-download-" + time_mod.now().to_string() + ".txt"
     request_buf := bytes.buffer()
-    conn := ClientConn(io.from_fd(1), io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(4), request_buf.buffered_chunked(4))
+    conn := ClientConn(io.from_fd(-1), io.bytes_reader(bytes.from_string_utf8(raw)).buffered_chunked(4), request_buf.buffered_chunked(4))
 
     streamed := conn.send_to_file(get_request("example.test", 80, "/download"), file_path)!
 

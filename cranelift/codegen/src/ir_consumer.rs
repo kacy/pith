@@ -4340,8 +4340,13 @@ fn compile_ir_function(
 
             "ret" if parts.len() >= 2 => {
                 if func_name == "main" {
-                    let zero = builder.ins().iconst(types::I64, 0);
-                    builder.ins().return_(&[zero]);
+                    if func_retkind == "int" {
+                        let val = get_reg(&regs, parts[1])?;
+                        builder.ins().return_(&[val]);
+                    } else {
+                        let zero = builder.ins().iconst(types::I64, 0);
+                        builder.ins().return_(&[zero]);
+                    }
                 } else {
                     let val = get_reg(&regs, parts[1])?;
                     builder.ins().return_(&[val]);

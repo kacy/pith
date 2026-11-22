@@ -1,8 +1,7 @@
-# `fn main() -> T!` hands its result to the entry glue, which exits 0 and
-# drops it. the box main built for that return was never freed, so every
-# program with a result-returning main lost one block at exit (valgrind:
-# 56 bytes definitely lost). main now settles its own result: an ok value is
-# released, and a forwarded error is reported with exit status 1 (see
+# `fn main() -> T!` settles its own result rather than returning a box nobody
+# frees (valgrind: 56 bytes definitely lost): an ok `Int` is returned as the
+# process exit status, any other ok payload is released before exiting 0, and a
+# forwarded error is reported with exit status 1 (see
 # tests/aborts/main_forwards_error.pith).
 fn mk_pair(i: Int) -> (Int, String)!:
     if i < 0:
@@ -26,4 +25,4 @@ fn main() -> Int!:
     w := pf!
     print("{w.0} {w.1}")
     print("{total(10)!}")
-    return total(3)
+    return total(0)

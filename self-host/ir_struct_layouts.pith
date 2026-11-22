@@ -2,7 +2,7 @@
 
 from ast import get_node
 from ir_ast_helpers import ir_unwrap_pub_node
-from ir_type_helpers import ir_resolve_type_hint_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid
+from ir_type_helpers import ir_resolve_type_hint_with_state, ir_resolve_generic_type_node, ir_resolve_result_type_kind, ir_type_from_tid, ir_alias_target_node
 from types import get_type_info, lookup_type_id
 
 # the name a struct annotation's layout is registered under. every
@@ -75,7 +75,7 @@ pub fn ir_struct_field_type_name_with_state(struct_name: String, field_name: Str
     return ""
 
 fn ir_struct_resolve_type_node(type_idx: Int, type_aliases: Map[String, String], struct_names: Map[String, Int]) -> String:
-    type_node := get_node(type_idx)
+    type_node := get_node(ir_alias_target_node(type_idx))
     if type_node.kind == "type":
         return ir_resolve_type_hint_with_state(type_node.value, type_aliases, struct_names)
     if type_node.kind == "generic_type":

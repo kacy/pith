@@ -1,0 +1,45 @@
+# an alias of an optional or a tuple type (`type MaybeName = String?`,
+# `type Pair = (String, Int)`) annotating a local, a field or a return used to
+# lower as an unknown, uncounted kind: the local was never released and the
+# return took a count nobody gave back. a tuple a call returned, passed
+# straight into another call, was stranded the same way, aliased or not.
+import leakprobe as probe
+
+type MaybeName = String?
+type Pair = (String, Int)
+
+struct Entry:
+    name: MaybeName
+    pair: Pair
+
+fn maybe(i: Int) -> MaybeName:
+    mut m: MaybeName := none
+    if i % 2 == 0:
+        m = "n-" + i.to_string()
+    return m
+
+fn pair(i: Int) -> Pair:
+    p: Pair := ("p-" + i.to_string(), i)
+    return p
+
+fn show(p: Pair) -> Int:
+    return p.0.len() + p.1
+
+fn round(i: Int) -> Int:
+    e := Entry(name: maybe(i), pair: pair(i))
+    mut total := show(pair(i)) + e.pair.1
+    if let n = e.name:
+        total = total + n.len()
+    return total
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut checksum := 0
+    while i < n:
+        checksum = checksum + round(i)
+        i = i + 1
+    if checksum == 0 - 999:
+        print("impossible")
+    kb := probe.peak_kb()
+    print("{kb}")

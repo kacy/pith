@@ -2,10 +2,15 @@
 #
 # in a program that spawns tasks, a `mut` module global that holds a list, a
 # map, a set or a struct is one buffer every task can reach. two tasks writing
-# it at once corrupt it, and a reader can see it torn. so each such global has
-# to be one of: declared in a `guard` block, `threadlocal`, or never written
-# after module init. this pass reports the rest as errors, naming the global
-# and one spawn in the program. `pith check`, `build`, `run` and `test` run it
+# it at once corrupt it, and a reader can see it torn. a `mut` global of any
+# other counted type (a string, an optional, a function value) is one pointer,
+# and a write releases the old value while another task may be reading it. so
+# each such global has to be one of: declared in a `guard` block,
+# `threadlocal`, or never written after module init. a global, `mut` or not,
+# whose value reaches a struct field some code reassigns is reported too (see
+# shared_field_errors in checker.pith). this pass reports the rest as errors,
+# naming the global and one spawn in the program. it also adds the checker's
+# E248 and E276 errors for reassigned fields, which need every module's writes. `pith check`, `build`, `run` and `test` run it
 # after the checker, and `pith lint` reports it as well.
 #
 # the pass runs over the whole program `pith lint` loaded: the entry module and
@@ -22,8 +27,8 @@
 
 from ast import Node, get_node, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, has_errors
-from checker import c_get_expr_type, called_declaration, extract_binding_name, COLLECTION_MUTATORS
-from types import get_type_info, get_type_name, is_error_type
+from checker import c_get_expr_type, called_declaration, extract_binding_name, COLLECTION_MUTATORS, is_counted_type, shared_field_errors, reassigned_field_of
+from types import get_type_info, get_type_name, is_error_type, is_none_type
 from driver import get_resolved_module_file, get_resolved_module_path
 from checker_methods import method_tid_key, has_method_declaration, get_method_declaration_index
 
@@ -39,6 +44,8 @@ BUILTIN_RECEIVER_KINDS := ",channel,list,map,optional,primitive,result,set,task,
 pub fn add_sharing_errors(diags: List[Diagnostic], entry_root: Int, entry_path: String, import_roots: List[Int]) -> List[Diagnostic]:
     if has_errors(diags):
         return diags
+    for d in shared_field_errors():
+        diags.push(d)
     for d in lint_shared_globals(entry_root, entry_path, import_roots):
         diags.push(d)
     return diags
@@ -56,12 +63,15 @@ pub fn lint_shared_globals(entry_root: Int, entry_path: String, import_roots: Li
     # module's top level, and most programs have none, which spares them the
     # spawn search over every function
     mut written: List[List[Int]] := []
+    mut reaching: List[List[Int]] := []
     mut any := false
     for r in roots:
         found := written_shared_globals(r)
-        if found.len() > 0:
+        through := globals_reaching_reassigned_fields(r, found)
+        if found.len() > 0 or through.len() > 0:
             any = true
         written.push(found)
+        reaching.push(through)
     if not any:
         return out
     spawn_at := reached_spawn(roots, files)
@@ -71,7 +81,16 @@ pub fn lint_shared_globals(entry_root: Int, entry_path: String, import_roots: Li
         for idx in found:
             node := get_node(idx)
             name := extract_binding_name(node.value)
-            out.push(Diagnostic("error", "E309", "'" + name + "' is a mut module global holding a shared buffer, written after module init, in a program that spawns tasks (" + spawn_at + ")", files[i], node.line, node.col, "declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init"))
+            mut holding := "a shared buffer"
+            if shared_global_kind(node) != "buffer":
+                holding = "a counted value, which a write releases while another task may be reading it"
+            out.push(Diagnostic("error", "E309", "'" + name + "' is a mut module global holding " + holding + ", written after module init, in a program that spawns tasks (" + spawn_at + ")", files[i], node.line, node.col, "declare it in a `guard` block, mark it `threadlocal`, or stop writing it after init"))
+    for found, i in reaching:
+        for idx in found:
+            node := get_node(idx)
+            name := extract_binding_name(node.value)
+            field := reassigned_field_of(c_get_expr_type(node.children[node.children.len() - 1]))
+            out.push(Diagnostic("error", "E309", "'" + name + "' is a module global every task can reach, and its field " + field + ", in a program that spawns tasks (" + spawn_at + "); a write frees the value another task may be reading", files[i], node.line, node.col, "declare it in a `guard` block, mark it `threadlocal`, or stop reassigning the field once the value is built"))
     return out
 
 # the program's functions, for the spawn search below. `nodes[k]` is a
@@ -260,6 +279,7 @@ fn written_shared_globals(root_idx: Int) -> List[Int]:
     root := get_node(root_idx)
     mut reported: List[Int] := []
     mut candidates: List[Int] := []
+    mut replace_only: Map[Int, Bool] := {}
     for child in root.children:
         mut node := get_node(child)
         mut idx := child
@@ -268,11 +288,15 @@ fn written_shared_globals(root_idx: Int) -> List[Int]:
             node = get_node(idx)
         # a threadlocal global is wrapped, and is one copy per thread
         if node.kind == "binding" and node.value.contains(" mut") and not node.value.contains(" guard:"):
-            if holds_shared_buffer(node):
+            how := shared_global_kind(node)
+            if how != "":
                 candidates.push(idx)
+                if how == "handle":
+                    replace_only.insert(idx, true)
     if candidates.len() == 0:
         return reported
     mut written: Map[String, Bool] := {}
+    mut replaced: Map[String, Bool] := {}
     for child in root.children:
         mut idx := child
         if get_node(idx).kind == "pub" and get_node(idx).children.len() > 0:
@@ -280,46 +304,85 @@ fn written_shared_globals(root_idx: Int) -> List[Int]:
         # a global's own initializer runs at module init, before any task
         kind := get_node(idx).kind
         if kind != "binding" and kind != "threadlocal":
-            collect_writes(idx, written)
+            collect_writes(idx, written, replaced)
     for idx in candidates:
-        if written.contains_key(extract_binding_name(get_node(idx).value)):
+        name := extract_binding_name(get_node(idx).value)
+        if replace_only.contains_key(idx):
+            if replaced.contains_key(name):
+                reported.push(idx)
+        elif written.contains_key(name):
             reported.push(idx)
     return reported
 
-# whether a global's type is a list, a map, a set or a struct, read from the
-# type the checker recorded for its initializer
-fn holds_shared_buffer(node: Node) -> Bool:
+# the module's globals, `mut` or not, neither guarded nor threadlocal and not
+# already in `reported`, whose value reaches a counted field that some code in
+# the program reassigns. any task can read a global, so a write to that field
+# from one task frees the value another is reading.
+fn globals_reaching_reassigned_fields(root_idx: Int, reported: List[Int]) -> List[Int]:
+    mut out: List[Int] := []
+    for child in get_node(root_idx).children:
+        mut idx := child
+        if get_node(idx).kind == "pub" and get_node(idx).children.len() > 0:
+            idx = get_node(idx).children[0]
+        node := get_node(idx)
+        if node.kind != "binding" or node.value.contains(" guard:") or node.children.len() == 0 or reported.contains(idx):
+            continue
+        tid := c_get_expr_type(node.children[node.children.len() - 1])
+        if not is_error_type(tid) and reassigned_field_of(tid) != "":
+            out.push(idx)
+    return out
+
+# how a global's value is shared, read from the type the checker recorded for
+# its initializer: "buffer" for a collection or a struct, which a write changes
+# in place; "handle" for a channel, a task or a synchronizing primitive, which
+# only an assignment of a new handle changes; "value" for any other counted
+# value (a string, an optional, a tuple, an enum with a payload, a function),
+# which a new value replaces and releases while a reader may hold it; "" for a
+# plain number or flag
+fn shared_global_kind(node: Node) -> String:
     if node.children.len() == 0:
-        return false
+        return ""
     tid := c_get_expr_type(node.children[node.children.len() - 1])
     if is_error_type(tid):
-        return false
+        return ""
+    # `mut g: T? := none` records the none type for its initializer
+    if is_none_type(tid):
+        return "value"
     info := get_type_info(tid)
     if info.kind == "list" or info.kind == "map" or info.kind == "set":
-        return true
+        return "buffer"
+    if info.kind == "channel" or info.kind == "task":
+        return "handle"
     if info.kind == "struct":
         base := get_type_name(tid)
         bracket := base.index_of("[")
         mut bare := base
         if bracket >= 0:
             bare = base.substring(0, bracket)
-        return not SELF_SYNCHRONIZED.contains("," + bare + ",")
-    return false
+        if SELF_SYNCHRONIZED.contains("," + bare + ","):
+            return "handle"
+        return "buffer"
+    if is_counted_type(tid):
+        return "value"
+    return ""
 
 # the names of the module globals a subtree writes: an assignment rooted at
-# the name (`g = x`, `g[k] = x`, `g.f = x`) or a mutating method called on it
-fn collect_writes(idx: Int, written: Map[String, Bool]):
+# the name (`g = x`, `g[k] = x`, `g.f = x`) or a mutating method called on it.
+# `replaced` gets the names assigned whole (`g = x`).
+fn collect_writes(idx: Int, written: Map[String, Bool], replaced: Map[String, Bool]):
     node := get_node(idx)
     if node.kind == "assignment" and node.children.len() >= 1:
         root := path_root(node.children[0])
         if root != "":
             written.insert(root, true)
+        if get_node(node.children[0]).kind == "ident":
+            replaced.insert(get_node(node.children[0]).value, true)
     if node.kind == "method_call" and node.children.len() >= 1 and COLLECTION_MUTATORS.contains("," + node.value + ","):
         root := path_root(node.children[0])
         if root != "":
             written.insert(root, true)
     for child in node.children:
-        collect_writes(child, written)
+        collect_writes(child, written, replaced)
 
 # the variable at the root of `g`, `g[k]` or `g.f`, or ""
 fn path_root(idx: Int) -> String:

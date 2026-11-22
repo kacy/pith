@@ -8,10 +8,11 @@
 struct Leaf:
     n: Int
 
+# `next` is set when a node is built and never reassigned, so the tasks a node
+# reaches may all read it
 struct Node:
     leaf: Leaf
-    mut next: Node?
-    weak back: Node?
+    next: Node?
     # several tasks walk one node, so its list sits under items_mu
     guard items_mu:
         items: List[Leaf]
@@ -27,7 +28,10 @@ guard box_mu:
     mut shared_box := Box(held: none, leaves: [], table: {})
 
 fn make(n: Int) -> Node:
-    return Node(leaf: Leaf(n: n), next: none, back: none, items: [Leaf(n: n * 2)])
+    return make_with(n, none)
+
+fn make_with(n: Int, next: Node?) -> Node:
+    return Node(leaf: Leaf(n: n), next: next, items: [Leaf(n: n * 2)])
 
 fn walk(node: Node) -> Int:
     mut total := node.leaf.n
@@ -47,10 +51,7 @@ fn captured(node: Node) -> Int:
 fn producer(ch: Channel[Node], count: Int) -> Int:
     mut i := 0
     while i < count:
-        a := make(i)
-        b := make(i + 100)
-        a.next = b
-        b.back = a
+        a := make_with(i, make(i + 100))
         ch.send(a)
         i = i + 1
     ch.close()
@@ -66,17 +67,11 @@ fn consumer(ch: Channel[Node]) -> Int:
         node := got.value()
         kept.push(node)
         total = total + walk(node)
-        if node.next != none:
-            back := node.next.value().back
-            if back != none:
-                total = total + back.value().leaf.n
     return total + kept.len()
 
 # a task's result, read by its awaiter
 fn build(n: Int) -> Node:
-    root := make(n)
-    root.next = make(n + 1)
-    return root
+    return make_with(n, make(n + 1))
 
 # writes through a module global and through a shared struct's fields and
 # containers, from many tasks. the struct each write stores is built here,
@@ -110,18 +105,24 @@ fn run_with(f: fn(Int) -> Int, x: Int) -> Int:
     return f(x)
 
 # a module global holding a function value: the closure it is given captures
-# a struct, and other tasks call it
+# a struct, and other tasks call it. installing a handler replaces the value
+# other tasks read, so the global sits under a lock.
 fn plain(x: Int) -> Int:
     return x
 
-mut handler: fn(Int) -> Int := plain
+guard handler_mu:
+    mut handler: fn(Int) -> Int := plain
 
 fn install(n: Int):
     captured_node := make(n)
-    handler = fn(x: Int) => x + walk(captured_node)
+    locked handler_mu:
+        handler = fn(x: Int) => x + walk(captured_node)
 
 fn call_handler(x: Int) -> Int:
-    return handler(x)
+    mut f: fn(Int) -> Int := plain
+    locked handler_mu:
+        f = handler
+    return f(x)
 
 fn main() -> Int:
     root := build(1)

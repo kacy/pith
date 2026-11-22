@@ -1,0 +1,106 @@
+# the shapes the shared-field rule (E248, E276, E309) still accepts. a
+# counted field no code reassigns after its struct is built is settled, and
+# every task may read it; a scalar field may be written from any task, since a
+# race on a number frees nothing; a field in a guard block is written under its
+# lock; a reassigned field of another struct with the same name does not count;
+# and a global that tasks write sits in a guard block or is threadlocal.
+struct Config:
+    name: String
+    tags: Inner?
+    # a counter tasks bump with no lock: a logic race, not a memory one
+    hits: Int
+
+struct Inner:
+    label: String
+
+struct Other:
+    name: String
+
+# reassigned, but only under the store's lock
+struct Note:
+    label: String
+
+struct Store:
+    mu: Mutex
+    guard mu:
+        current: String
+        item: Note
+
+guard log_mu:
+    mut last_line: String := ""
+
+threadlocal mut scratch: String := ""
+
+fn rename(o: Other):
+    o.name = "renamed"
+
+fn read_config(c: Config, n: Int) -> Int:
+    mut total := 0
+    for i in 0..n:
+        c.hits = c.hits + 1
+        total = total + c.name.len()
+        if c.tags != none:
+            total = total + c.tags.value().label.len()
+    return total
+
+fn write_store(s: Store, n: Int) -> Int:
+    for i in 0..n:
+        locked s.mu:
+            s.current = "value " + (i % 10).to_string()
+            s.item.label = "label " + (i % 10).to_string()
+    return n
+
+fn read_store(s: Store, n: Int) -> Int:
+    mut total := 0
+    for i in 0..n:
+        locked s.mu:
+            total = total + s.current.len() + s.item.label.len()
+    return total
+
+fn log(i: Int) -> Int:
+    scratch = "line {i}"
+    locked log_mu:
+        last_line = scratch
+    return scratch.len()
+
+fn consume(ch: Channel[Config]) -> Int:
+    mut total := 0
+    while true:
+        got := ch.recv()
+        if got == none:
+            break
+        total = total + got.value().name.len()
+    return total
+
+fn main() -> Int!:
+    other := Other(name: "x")
+    rename(other)
+    c := Config(name: "service", tags: Inner(label: "blue"), hits: 0)
+    a := spawn read_config(c, 1000)
+    b := spawn read_config(c, 1000)
+    print("config {await a} {await b}")
+
+    s := Store(mu: Mutex(), current: "start", item: Note(label: "start"))
+    w := spawn write_store(s, 1000)
+    r := spawn read_store(s, 1000)
+    await w
+    print("store read {(await r) > 0}")
+    locked s.mu:
+        print("store {s.current} {s.item.label}")
+
+    ch := Channel[Config](4)
+    t := spawn consume(ch)
+    for i in 0..3:
+        ch.send(c)
+    ch.close()
+    print("sent {await t}")
+
+    mut logs: List[Task[Int]] := []
+    for i in 0..4:
+        logs.push(spawn log(i))
+    mut lens := 0
+    for task in logs:
+        lens = lens + await task
+    print("logged {lens}")
+    print("renamed {other.name}")
+    return 0

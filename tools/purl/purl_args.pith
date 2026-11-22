@@ -6,6 +6,7 @@
 
 import std.bytes as bytes
 import std.fs as fs
+import std.io as io
 import std.os as os
 import std.os.path as path_mod
 
@@ -172,18 +173,9 @@ pub fn parse_seconds_to_ms(raw: String) -> Int!:
         i = i + 1
     return whole * 1000 + frac_ms
 
-# Read all bytes from stdin (fd 0).
+# Read all bytes from stdin (fd 0) via std.io.
 pub fn read_stdin_bytes() -> Bytes:
-    buf := bytes.buffer()
-    defer buf.free()
-    while true:
-        chunk := term_read(0, 65536, -1)
-        if chunk.is_err:
-            break
-        if chunk.ok.len() == 0:
-            break
-        buf.write(chunk.ok) catch 0
-    return buf.bytes()
+    return io.read_stdin_bytes() catch bytes.empty()
 
 # Parse a curl config file (-K / --config) into argv-style tokens.
 # Handles `#` comments, `key = value`, `-X POST`, and double-quoted strings with escapes.

@@ -23,7 +23,24 @@ DEFAULT_CHUNK_SIZE := 4096
 # task, so its entries are never shared and need no lock. a process-wide mutex
 # used to wrap every buffer access anyway; at 32 workers an http server spent
 # most of its time queued on it.
-threadlocal mut next_string_reader_handle: Int := 1
+#
+# the handles that key them come from one process-wide counter, so a handle
+# names an entry in exactly one task's maps. a value can still die on another
+# task than the one that built it (it was handed through a channel, or a
+# spawned task held the last count), and its destructor then looks the handle
+# up in that task's maps. with a counter per task, the same number named that
+# task's own reader and the destructor closed it. with one counter it finds
+# nothing there and does nothing, which is what a close on that task does too.
+IO_HANDLES := AtomicInt(1)
+
+# the next registry handle. never reissued, and never 0.
+fn next_io_handle() -> Int:
+    while true:
+        handle := IO_HANDLES.load()
+        if IO_HANDLES.compare_set(handle, handle + 1):
+            return handle
+    return 0
+
 threadlocal mut string_reader_data: Map[Int, String] := {}
 threadlocal mut string_reader_offsets: Map[Int, Int] := {}
 
@@ -33,10 +50,8 @@ threadlocal mut string_reader_offsets: Map[Int, Int] := {}
 # of n bytes copies O(n) bytes in total; string() copies the whole content
 # out once per call. the map owns the byte buffer: the entry's removal on
 # close() is what frees it.
-threadlocal mut next_string_buffer_handle: Int := 1
 threadlocal mut string_buffer_stores: Map[Int, Int] := {}
 
-threadlocal mut next_bytes_reader_handle: Int := 1
 threadlocal mut bytes_reader_data: Map[Int, Bytes] := {}
 threadlocal mut bytes_reader_offsets: Map[Int, Int] := {}
 
@@ -92,10 +107,8 @@ struct BufferedBytesWriterState:
     chunk_size: Int
     cache: Bytes
 
-threadlocal mut next_buffered_bytes_reader_handle: Int := 1
 threadlocal mut buffered_bytes_readers: Map[Int, BufferedBytesReaderState] := {}
 
-threadlocal mut next_buffered_bytes_writer_handle: Int := 1
 threadlocal mut buffered_bytes_writers: Map[Int, BufferedBytesWriterState] := {}
 
 # a buffered text reader's state. a reader over a string, a socket, a file or
@@ -125,10 +138,8 @@ struct BufferedWriterState:
     chunk_size: Int
     cache: String
 
-threadlocal mut next_buffered_reader_handle: Int := 1
 threadlocal mut buffered_readers: Map[Int, BufferedReaderState] := {}
 
-threadlocal mut next_buffered_writer_handle: Int := 1
 threadlocal mut buffered_writers: Map[Int, BufferedWriterState] := {}
 
 struct StringReader:
@@ -406,32 +417,28 @@ pub fn bytes_reader(data: Bytes) -> BytesCursor:
 # a buffered reader over any bytes source. it reads `chunk_size` bytes at a
 # time, or the default chunk size when that is 0 or less.
 pub fn buffered_bytes_reader(source: BytesReader, chunk_size: Int) -> BufferedBytesReader:
-    handle := next_buffered_bytes_reader_handle
-    next_buffered_bytes_reader_handle = handle + 1
+    handle := next_io_handle()
     buffered_bytes_readers.insert(handle, BufferedBytesReaderState(source, normalized_chunk_size(chunk_size), bytes.empty()))
     return BufferedBytesReader(handle)
 
 # a buffered writer over any bytes target. it flushes once it holds
 # `chunk_size` bytes, or the default chunk size when that is 0 or less.
 pub fn buffered_bytes_writer(target: BytesWriter, chunk_size: Int) -> BufferedBytesWriter:
-    handle := next_buffered_bytes_writer_handle
-    next_buffered_bytes_writer_handle = handle + 1
+    handle := next_io_handle()
     buffered_bytes_writers.insert(handle, BufferedBytesWriterState(target, normalized_chunk_size(chunk_size), bytes.empty()))
     return BufferedBytesWriter(handle)
 
 # a buffered text reader over any text source, filling `chunk_size` bytes at a
 # time.
 pub fn buffered_reader(source: TextSource, chunk_size: Int) -> BufferedReader:
-    handle := next_buffered_reader_handle
-    next_buffered_reader_handle = handle + 1
+    handle := next_io_handle()
     buffered_readers.insert(handle, BufferedReaderState(source, normalized_chunk_size(chunk_size), "", 0, bytes.empty()))
     return BufferedReader(handle)
 
 # a buffered text writer over any text target, flushing once it holds
 # `chunk_size` bytes.
 pub fn buffered_writer(target: TextTarget, chunk_size: Int) -> BufferedWriter:
-    handle := next_buffered_writer_handle
-    next_buffered_writer_handle = handle + 1
+    handle := next_io_handle()
     buffered_writers.insert(handle, BufferedWriterState(target, normalized_chunk_size(chunk_size), ""))
     return BufferedWriter(handle)
 
@@ -871,21 +878,18 @@ fn tcp_stream_write_ctx(stream: TcpStream, ctx: Context, data: String) -> Int!Bl
     return tcp_stream_write_bytes_ctx(stream, ctx, encode_utf8(data))
 
 fn allocate_string_reader_handle(data: String) -> Int:
-    handle := next_string_reader_handle
-    next_string_reader_handle = next_string_reader_handle + 1
+    handle := next_io_handle()
     string_reader_data.insert(handle, data)
     string_reader_offsets.insert(handle, 0)
     return handle
 
 fn allocate_string_buffer_handle() -> Int:
-    handle := next_string_buffer_handle
-    next_string_buffer_handle = next_string_buffer_handle + 1
+    handle := next_io_handle()
     string_buffer_stores.insert(handle, byte_buffer_new())
     return handle
 
 fn allocate_bytes_reader_handle(data: Bytes) -> Int:
-    handle := next_bytes_reader_handle
-    next_bytes_reader_handle = next_bytes_reader_handle + 1
+    handle := next_io_handle()
     bytes_reader_data.insert(handle, data)
     bytes_reader_offsets.insert(handle, 0)
     return handle

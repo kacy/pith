@@ -46,6 +46,12 @@ pub fn default_options() -> Options:
 
 # an open terminal session: the merged event stream, the last known size,
 # and a buffered writer. create with open() or open_with(); always close().
+#
+# a Terminal has no destructor, and one would never run: the reader and signal
+# tasks hold the session until close() stops them, so its last count cannot
+# drop while it is open. close() also writes the leave sequence and waits for
+# both tasks, which a destructor must not do. raw mode has its own backstop
+# instead: entering it arms an exit hook that restores the terminal.
 pub struct Terminal:
     pub events: Channel[Event]
     mut cols: Int

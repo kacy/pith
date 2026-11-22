@@ -24,7 +24,7 @@ from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types, builtin_scope_id, set_builtin_scope_id
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot, checker_note_alias_module
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error_at_name, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot, checker_note_alias_module
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration, take_interfaces_snapshot, restore_interfaces_snapshot
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner, MethodsSnapshot, take_methods_snapshot, restore_methods_snapshot
 from return_paths import missing_return_sites
@@ -335,6 +335,17 @@ pub fn set_checker_file_path(file_path: String):
 pub fn register_import_alias(alias: String, module_path: String):
     module_aliases.insert(alias, module_path)
 
+# the node of the `pi`th name a from-import lists, for a diagnostic about
+# that name. `import_idx` is the import or the `pub` wrapping it; an import
+# node without name leaves answers with itself.
+fn from_import_name_node(import_idx: Int, pi: Int) -> Int:
+    mut node := get_node(import_idx)
+    if node.kind == "pub" and node.children.len() > 0:
+        node = get_node(node.children[0])
+    if pi < node.children.len():
+        return node.children[pi]
+    return import_idx
+
 # Process import declarations from AST and register aliases
 pub fn process_import_aliases(root_idx: Int):
     root := get_node(root_idx)
@@ -402,7 +413,7 @@ pub fn process_import_aliases(root_idx: Int):
                                     if declared == false:
                                         declared = lookup_type_id(imported_name) >= 0
                                     if declared == false:
-                                        report_error_with_fix_at(child, "E246", "'" + imported_name + "' is not declared by module '" + mod_path + "'", "import it from the module that defines it")
+                                        report_error_with_fix_at(from_import_name_node(child, pi), "E246", "'" + imported_name + "' is not declared by module '" + mod_path + "'", "import it from the module that defines it")
                                 if pi < import_aliases.len() and import_aliases[pi].len() > 0:
                                     # reached through a module alias, see
                                     # from_import_alias_receiver
@@ -6122,8 +6133,12 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     if recv_node.kind == "ident" and has_generic_declaration(recv_node.value):
         gdecl_idx := get_generic_declaration_index(recv_node.value)
         gdecl := get_node(gdecl_idx)
-        if gdecl.kind == "enum_decl" and enum_decl_has_variant(gdecl, method_name):
-            return check_generic_enum_variant_construction(gdecl_idx, method_name, arg_indices, scope_id)
+        if gdecl.kind == "enum_decl":
+            if enum_decl_has_variant(gdecl, method_name):
+                return check_generic_enum_variant_construction(gdecl_idx, method_name, arg_indices, scope_id)
+            if has_method_declaration(recv_node.value + "." + method_name) == false:
+                report_error_at_name(checker_current_node_index(), "E212", recv_node.value + " has no variant or method '" + method_name + "'")
+                return TID_ERR
 
     mut receiver_type := c_check_expr(node.children[0], scope_id)
     if is_error_type(receiver_type) and recv_node.kind == "ident":
@@ -6381,7 +6396,11 @@ fn check_method_call(node: Node, scope_id: Int) -> Int:
     # receiver typed by an interface that cannot be a value was refused at its
     # annotation (E316).
     if checker_reported_at_current() == false and not is_interface_type(receiver_type):
-        report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "'")
+        if recv_info.kind == "enum":
+            # `Local.Nope(1)` reads as a variant constructor, so name both
+            report_error_at_name(checker_current_node_index(), "E212", get_type_name(receiver_type) + " has no variant or method '" + method_name + "'")
+        else:
+            report_error("E209", get_type_name(receiver_type) + " has no method '" + method_name + "'")
     return TID_ERR
 
 # the method `method_name` an interface declares, as its fn_decl index, or -1.
@@ -7020,6 +7039,15 @@ fn check_field_access_expression(node_idx: Int, node: Node, scope_id: Int) -> In
             report_error("E209", "module '" + obj_name + "' has no function '" + field_name + "'")
             return TID_ERR
 
+    # a generic enum's bare name checks as the error type (only instances
+    # are registered), so its variant has to be checked against the
+    # declaration before that
+    if obj_node.kind == "ident" and has_generic_declaration(obj_node.value):
+        gdecl := get_node(get_generic_declaration_index(obj_node.value))
+        if gdecl.kind == "enum_decl" and enum_decl_has_variant(gdecl, field_name) == false:
+            report_error_at_name(node_idx, "E212", obj_node.value + " has no variant '" + field_name + "'")
+            return TID_ERR
+
     obj_type := c_check_expr(obj_node_idx, scope_id)
     if is_error_type(obj_type):
         return TID_ERR
@@ -7057,10 +7085,13 @@ fn check_field_access_expression(node_idx: Int, node: Node, scope_id: Int) -> In
             return obj_info.value_type
         report_error("E209", "result has no field '" + field_name + "'")
         return TID_ERR
-    # enum variant access (e.g. Shape.Circle) — for match patterns
+    # a payload-free variant (Shape.Dot). any other name is refused here:
+    # it used to type as the enum and reach the emitter, which had no
+    # variant to lower it to.
     if obj_info.kind == "enum":
-        # this is typically used in patterns, not field access
-        # but allow it for enum variant references
+        if obj_info.variants.contains(field_name) == false:
+            report_error_at_name(node_idx, "E212", get_type_name(obj_type) + " has no variant '" + field_name + "'")
+            return TID_ERR
         return obj_type
     report_error("E209", get_type_name(obj_type) + " has no field '" + field_name + "'")
     return TID_ERR
@@ -7679,7 +7710,7 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     if pat.kind == "pat_none":
         return
     if pat.kind == "pat_variant":
-        check_variant_pattern_match(pat, expected_type, scope_id)
+        check_variant_pattern_match(pat_idx, pat, expected_type, scope_id)
         return
     if pat.kind == "pat_or":
         check_or_pattern_match(pat, expected_type, scope_id)
@@ -7729,7 +7760,7 @@ fn generic_pattern_names_base(type_name: String, base: String) -> Bool:
         return false
     return generic_declaration_identity(decl_idx) == base
 
-fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
+fn check_variant_pattern_match(pat_idx: Int, pat: Node, expected_type: Int, scope_id: Int):
     # value: "EnumName.VariantName"
     # children: sub-patterns for variant fields
     parts := split_qualified_name(pat.value)
@@ -7793,7 +7824,7 @@ fn check_variant_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
                     fidx = fidx + 1
         vidx = vidx + 1
     if found == false:
-        report_error("E212", type_name + " has no variant '" + variant_name + "'")
+        report_error_at_name(pat_idx, "E212", type_name + " has no variant '" + variant_name + "'")
 
 fn check_tuple_pattern_match(pat: Node, expected_type: Int, scope_id: Int):
     info := get_type_info(expected_type)

@@ -2860,6 +2860,22 @@ fn ir_rc_release_local(r: Int, kind: String, name: String):
             return
     ir_rc_release_reg(r, kind)
 
+# a result local that owns its payload (ir_tuple_record_tid kept its type) but
+# failed the cascade walk, because some use may share the box. at the
+# function's exit it drops its count the way a fresh argument does: the
+# payload goes with the box when this count is the last, and stays with the
+# other holder otherwise. a plain release freed the shell alone and leaked
+# the payload whenever nothing had given the box a destructor (a box handed
+# to a closure). a rebind keeps the plain release: an alias of the old
+# payload may still be read after it.
+fn ir_result_local_releases_by_count(kind: String, name: String) -> Bool:
+    if kind != "tuple" or ir_tuple_cascade_names.contains(name) or ir_stack_tuple_names.contains(name):
+        return false
+    if not ir_tuple_local_tid.contains_key(name):
+        return false
+    tid := ir_tuple_local_tid[name]
+    return tid >= 0 and get_type_info(tid).kind == "result" and ir_tuple_local_has_rc_payload(tid)
+
 # whether a bare-name assignment writes a module-level global's slot. that
 # slot owns a count on whatever it holds. nothing else releases it, not the
 # function's exit cleanup (globals are not locals) and not the store itself,
@@ -3094,6 +3110,7 @@ fn ir_emit_result_unshare_helpers():
         copy_l := ir_label()
         ir_emit("brif " + sole_r.to_string() + " " + keep_l + " " + copy_l)
         ir_emit_label(keep_l)
+        ir_emit_clear_result_box_dtor(pr)
         ir_emit("ret " + pr.to_string())
         ir_emit_label(copy_l)
         size_r := ir_reg()
@@ -3129,6 +3146,15 @@ fn ir_emit_result_unshare_helpers():
         ir_emit("ret " + copy_r.to_string())
         ir_emit("endfunc")
 
+# a box handed to a caller as its sole owner must not carry the payload
+# destructor an earlier share gave it (the unshare above, or a holder's
+# ir_attach_result_box_dtor): the caller takes the payload's count over and
+# frees the shell, and the destructor would release the payload under it.
+fn ir_emit_clear_result_box_dtor(box_r: Int):
+    zero_r := ir_reg()
+    ir_emit("iconst " + zero_r.to_string() + " 0")
+    ir_emit_call2(ir_reg(), "pith_struct_set_dtor", "void", box_r, zero_r)
+
 # release every rc local the function owns before a return, minus `exclude`,
 # the one being returned (its count transfers to the caller). the prologue
 # zero-stores each tracked name, so the loads are valid on every path.
@@ -3144,7 +3170,10 @@ fn ir_emit_rc_cleanup(exclude: String):
         if name != exclude and ir_rc_release_enabled(kind):
             r := ir_reg()
             ir_emit_local_slot_load(r, name)
-            ir_rc_release_local(r, kind, name)
+            if ir_result_local_releases_by_count(kind, name):
+                ir_emit_result_box_release(r, ir_tuple_local_tid[name])
+            else:
+                ir_rc_release_local(r, kind, name)
         i = i + 1
     # a kinded local releases what the last binding on the path taken left in
     # its slot, under the kind that binding recorded. a return never
@@ -11822,6 +11851,9 @@ fn ir_emit_pair_payload_return(box_r: Int, slot: String, kind: String, source: S
         ir_rc_retain_reg(val_r, kind)
         ir_emit_pair_ret(box_r, true, flag, val_r)
         ir_emit_label(take_l)
+        # the payload leaves with the box's count, so the shell is freed
+        # without the destructor a share may have given it
+        ir_emit_clear_result_box_dtor(box_r)
     elif source == "borrowed":
         ir_rc_retain_reg(val_r, kind)
         ir_emit_pair_ret(box_r, false, flag, val_r)
@@ -12616,8 +12648,10 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
     if node.kind == "grouped" and node.children.len() > 0:
         return ir_optional_subject_is_owned(node.children[0])
     kind := node.kind
-    # a weak read's shell owns the count its upgrade took (ir_emit_weak_read)
-    if kind == "await" or ir_node_is_weak_field_read(idx):
+    # a weak read's shell owns the count its upgrade took (ir_emit_weak_read),
+    # and a catch hands out an owned value on both arms (ir_emit_catch_expr):
+    # `(f() catch none).unwrap_or(d)` left that shell behind
+    if kind == "await" or kind == "catch_expr" or kind == "catch_block" or ir_node_is_weak_field_read(idx):
         return true
     if kind != "call" and kind != "method_call":
         return false

@@ -1,6 +1,6 @@
 name: sanitizers
-# the regression corpus and the std tests against a sanitized runtime. too
-# slow for every push, so this runs nightly and on demand; see
+# the regression corpus, the examples and the std tests against a sanitized
+# runtime. too slow for every push, so this runs nightly and on demand; see
 # tooling/sanitize.sh for what it covers.
 on:
   schedule:
@@ -25,8 +25,30 @@ jobs:
       - name: build the ir driver from the seed
         run: ./target/release/pith run examples/hello.pith > /dev/null
 
-      - name: corpus and std tests under asan
+      - name: corpus, examples and std tests under asan
         run: make sanitize-asan-only
+
+  # the same programs under the race detector. tsan rebuilds std with
+  # -Zbuild-std, which needs the rust-src component.
+  tsan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: rust source for build-std
+        run: rustup component add rust-src
+
+      - name: build
+        run: cargo build --release
+
+      - name: build the ir driver from the seed
+        run: ./target/release/pith run examples/hello.pith > /dev/null
+
+      - name: corpus, examples and std tests under tsan
+        run: make sanitize-tsan-only
 
   # programs pithgen generates from fresh seeds every night, built against the
   # asan runtime and run on both backends with the freelist on and off. each

@@ -5006,6 +5006,14 @@ fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inne
     if vn.kind == "list" and vn.children.len() == 0:
         if ir_checked_type(val_idx).starts_with("list"):
             return ir_expr(val_idx)
+    # an empty `{}` the checker typed as a map builds through the map literal
+    # path, which reads the value type off the checked type. the bare target
+    # here says only "map", and a struct field built from it as
+    # `S(table: {})` got a map that took no count on the strings stored in
+    # it, so a string copied in from another map was freed under it.
+    if vn.kind == "map" and vn.children.len() == 0:
+        if ir_checked_type(val_idx).starts_with("map"):
+            return ir_expr(val_idx)
     empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), ir_bytes_keyed_target(val_idx, target_type))
     if empty_init_call.len() > 0:
         r := ir_reg()

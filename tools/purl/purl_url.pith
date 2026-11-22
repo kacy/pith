@@ -1,0 +1,283 @@
+# purl_url — URL parsing, normalization, and redirect resolution for purl.
+#
+# Built on std.net.url and std.net.http.clean_path, with extra handling for
+# curl-style inputs that std.net.url does not cover yet: omitted schemes
+# ("example.com/a", "localhost:8080/x"), embedded userinfo ("user:pass@host"),
+# bracketed IPv6 literals ("http://[::1]:8080/"), and file:// URLs.
+
+import std.net.url as url
+import std.net.http as http
+
+# A normalized request URL with extracted authority components.
+pub struct ParsedUrl:
+    pub scheme: String
+    pub userinfo: String
+    pub host: String
+    pub port: Int
+    pub path: String
+    pub query: String
+    pub fragment: String
+
+# Return the default TCP port for http (80) or https (443), or 0 otherwise.
+pub fn default_port(scheme: String) -> Int:
+    lower := scheme.to_lower()
+    if lower == "https":
+        return 443
+    if lower == "http":
+        return 80
+    return 0
+
+# True when a string contains only ASCII digits and is non-empty.
+fn is_digits(text: String) -> Bool:
+    if text.len() == 0:
+        return false
+    mut i := 0
+    while i < text.len():
+        c := ord(text[i])
+        if c < 48 or c > 57:
+            return false
+        i = i + 1
+    return true
+
+# True when a string is a valid RFC 3986 scheme name (ALPHA *(ALPHA / DIGIT / "+" / "-" / ".")).
+fn is_scheme_name(text: String) -> Bool:
+    if text.len() == 0:
+        return false
+    first := ord(text[0])
+    is_alpha := (first >= 65 and first <= 90) or (first >= 97 and first <= 122)
+    if not is_alpha:
+        return false
+    mut i := 1
+    while i < text.len():
+        c := ord(text[i])
+        ok := (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 43 or c == 45 or c == 46
+        if not ok:
+            return false
+        i = i + 1
+    return true
+
+# Find the index of the first delimiter character ('/', '?', '#') from `start`.
+fn authority_end_index(text: String, start: Int) -> Int:
+    mut i := start
+    while i < text.len():
+        c := ord(text[i])
+        if c == 47 or c == 63 or c == 35:
+            return i
+        i = i + 1
+    return text.len()
+
+# Split an authority string (`[userinfo@]host[:port]` or `[userinfo@][ipv6][:port]`)
+# into (userinfo, host, port). Fails on malformed host or invalid port.
+fn split_authority(authority: String, scheme: String) -> (String, String, Int)!:
+    if authority == "":
+        fail "purl: malformed url: empty host"
+
+    mut userinfo := ""
+    mut hostport := authority
+    at := authority.last_index_of("@")
+    if at >= 0:
+        userinfo = authority.substring(0, at)
+        hostport = authority.substring(at + 1, authority.len())
+
+    if hostport == "":
+        fail "purl: malformed url: empty host"
+
+    mut host := ""
+    mut port := default_port(scheme)
+
+    if hostport.starts_with("["):
+        close := hostport.index_of("]")
+        if close <= 1:
+            fail "purl: malformed url: invalid ipv6 literal"
+        host = hostport.substring(1, close)
+        rest := hostport.substring(close + 1, hostport.len())
+        if rest != "":
+            if not rest.starts_with(":"):
+                fail "purl: malformed url: unexpected text after ipv6 literal"
+            port_text := rest.substring(1, rest.len())
+            if not is_digits(port_text):
+                fail "purl: malformed url: invalid port '{port_text}'"
+            parsed_port := parse_int(port_text) catch -1
+            if parsed_port <= 0 or parsed_port > 65535:
+                fail "purl: malformed url: port out of range '{port_text}'"
+            port = parsed_port
+    else:
+        colon := hostport.index_of(":")
+        if colon >= 0:
+            if colon != hostport.last_index_of(":"):
+                fail "purl: malformed url: unbracketed ipv6 address"
+            host = hostport.substring(0, colon)
+            port_text := hostport.substring(colon + 1, hostport.len())
+            if port_text != "":
+                if not is_digits(port_text):
+                    fail "purl: malformed url: invalid port '{port_text}'"
+                parsed_port := parse_int(port_text) catch -1
+                if parsed_port <= 0 or parsed_port > 65535:
+                    fail "purl: malformed url: port out of range '{port_text}'"
+                port = parsed_port
+        else:
+            host = hostport
+
+    if host == "":
+        fail "purl: malformed url: empty host"
+    return (userinfo, host, port)
+
+# Parse a user-supplied curl URL. Prepends `default_scheme` (normally "http")
+# when no scheme is present. Supports http://, https://, and file://.
+pub fn parse_target_url(raw_input: String, default_scheme: String) -> ParsedUrl!:
+    trimmed := raw_input.trim()
+    if trimmed == "":
+        fail "purl: malformed url: empty url"
+
+    mut scheme := ""
+    mut rest := trimmed
+    scheme_sep := trimmed.index_of("://")
+    if scheme_sep > 0:
+        candidate := trimmed.substring(0, scheme_sep)
+        if is_scheme_name(candidate):
+            scheme = candidate.to_lower()
+            rest = trimmed.substring(scheme_sep + 3, trimmed.len())
+    if scheme == "":
+        mut fallback := default_scheme.to_lower()
+        if fallback == "":
+            fallback = "http"
+        scheme = fallback
+
+    if scheme == "file":
+        # file:///abs/path or file://localhost/abs/path
+        mut file_path := rest
+        if file_path.starts_with("localhost/"):
+            file_path = file_path.substring(9, file_path.len())
+        if file_path == "":
+            fail "purl: malformed url: empty file path"
+        return ParsedUrl("file", "", "localhost", 0, url.decode_path(file_path), "", "")
+
+    if scheme != "http" and scheme != "https":
+        fail "purl: unsupported protocol '{scheme}'"
+
+    auth_end := authority_end_index(rest, 0)
+    authority := rest.substring(0, auth_end)
+    tail := rest.substring(auth_end, rest.len())
+
+    auth_parts := split_authority(authority, scheme)!
+    userinfo := auth_parts.0
+    host := auth_parts.1
+    port := auth_parts.2
+
+    # Delegate path/query/fragment splitting to std.net.url on a clean synthetic authority.
+    parsed := url.parse("{scheme}://placeholder{tail}")
+    mut req_path := url.path(parsed)
+    if req_path == "":
+        req_path = "/"
+    query_str := url.query(parsed)
+    frag_str := url.fragment(parsed)
+    return ParsedUrl(scheme, userinfo, host, port, req_path, query_str, frag_str)
+
+# Return the HTTP request-target ("/path" or "/path?query").
+pub fn request_target(u: ParsedUrl) -> String:
+    mut p := u.path
+    if p == "":
+        p = "/"
+    if u.query != "":
+        return p + "?" + u.query
+    return p
+
+# Return the Host / :authority value (bracketed IPv6, plus :port when non-default).
+pub fn authority_header(u: ParsedUrl) -> String:
+    mut host_part := u.host
+    if host_part.index_of(":") >= 0 and not host_part.starts_with("["):
+        host_part = "[" + host_part + "]"
+    if u.port > 0 and u.port != default_port(u.scheme):
+        return host_part + ":" + u.port.to_string()
+    return host_part
+
+# Reconstruct the normalized effective URL (credentials omitted, fragment omitted).
+pub fn effective_url(u: ParsedUrl) -> String:
+    if u.scheme == "file":
+        return "file://" + u.path
+    return u.scheme + "://" + authority_header(u) + request_target(u)
+
+# True when two URLs differ in scheme, host (case-insensitive), or port.
+pub fn origin_changed(a: ParsedUrl, b: ParsedUrl) -> Bool:
+    return a.scheme != b.scheme or a.host.to_lower() != b.host.to_lower() or a.port != b.port
+
+# Append an already-encoded query fragment (e.g. from -G -d) to a ParsedUrl.
+pub fn append_query(u: ParsedUrl, extra: String) -> ParsedUrl:
+    if extra == "":
+        return u
+    mut next_query := extra
+    if u.query != "":
+        next_query = u.query + "&" + extra
+    return ParsedUrl(u.scheme, u.userinfo, u.host, u.port, u.path, next_query, u.fragment)
+
+# Resolve an HTTP Location header against the current URL per RFC 3986.
+pub fn resolve_redirect(base: ParsedUrl, raw_location: String) -> ParsedUrl!:
+    mut loc := raw_location.trim()
+    if loc == "":
+        fail "purl: empty redirect location"
+
+    # Strip fragment before resolving.
+    hash := loc.index_of("#")
+    if hash >= 0:
+        loc = loc.substring(0, hash)
+    if loc == "":
+        return ParsedUrl(base.scheme, base.userinfo, base.host, base.port, base.path, base.query, "")
+
+    if loc.starts_with("//"):
+        return parse_target_url(base.scheme + ":" + loc, base.scheme)!
+
+    scheme_sep := loc.index_of("://")
+    if scheme_sep > 0 and is_scheme_name(loc.substring(0, scheme_sep)):
+        return parse_target_url(loc, base.scheme)!
+
+    mut next_path := base.path
+    mut next_query := ""
+
+    if loc.starts_with("?"):
+        next_query = loc.substring(1, loc.len())
+    else:
+        mut rel_path := loc
+        q_pos := loc.index_of("?")
+        if q_pos >= 0:
+            rel_path = loc.substring(0, q_pos)
+            next_query = loc.substring(q_pos + 1, loc.len())
+
+        if rel_path.starts_with("/"):
+            next_path = rel_path
+        else:
+            slash := base.path.last_index_of("/")
+            if slash < 0:
+                next_path = "/" + rel_path
+            else:
+                next_path = base.path.substring(0, slash + 1) + rel_path
+
+    if not http.path_is_clean(next_path):
+        next_path = http.clean_path(next_path)
+
+    return ParsedUrl(base.scheme, base.userinfo, base.host, base.port, next_path, next_query, "")
+
+# Derive the local filename for -O / --remote-name from a URL path.
+# Returns "" when the URL has no filename component (e.g. ends with "/").
+pub fn remote_filename(u: ParsedUrl) -> String:
+    p := u.path
+    if p == "" or p.ends_with("/"):
+        return ""
+    slash := p.last_index_of("/")
+    mut name := p
+    if slash >= 0:
+        name = p.substring(slash + 1, p.len())
+    decoded := url.decode_path(name)
+    if decoded == "" or decoded == "." or decoded == "..":
+        return ""
+    if decoded.contains("/"):
+        return ""
+    return decoded
+
+# Decode embedded URL userinfo ("user:pass") into (user, password).
+pub fn split_userinfo(userinfo: String) -> (String, String):
+    colon := userinfo.index_of(":")
+    if colon < 0:
+        return (url.decode_path(userinfo), "")
+    user_part := userinfo.substring(0, colon)
+    pass_part := userinfo.substring(colon + 1, userinfo.len())
+    return (url.decode_path(user_part), url.decode_path(pass_part))

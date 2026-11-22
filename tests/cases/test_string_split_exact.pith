@@ -1,0 +1,20 @@
+# String.split_exact preserves empty segments on leading, trailing, and
+# consecutive delimiters (unlike String.split, which drops them).
+
+fn main() -> Int:
+    p1 := "a,,b".split_exact(",")
+    print("{p1.len()}: {p1.join("|")}")
+
+    p2 := ",a,b,".split_exact(",")
+    print("{p2.len()}: {p2.join("|")}")
+
+    nl := chr(10)
+    p3 := ("line1" + nl + nl + "line2").split_exact(nl)
+    print("{p3.len()}: {p3.join("|")}")
+
+    p4 := "".split_exact(",")
+    print("{p4.len()}: [{p4[0]}]")
+
+    p5 := "a----b".split_exact("--")
+    print("{p5.len()}: {p5.join("|")}")
+    return 0

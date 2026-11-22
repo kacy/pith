@@ -132,11 +132,7 @@ pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i
 }
 
 /// Split a string by delimiter and return as a PithList of strings
-///
-/// # Safety
-/// Both s and delim must be valid null-terminated C strings
-#[no_mangle]
-pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i8) -> PithList {
+unsafe fn split_to_list_inner(s: *const i8, delim: *const i8, keep_empty: bool) -> PithList {
     use crate::collections::list::pith_list_new;
 
     let (Some(s_slice), Some(delim_slice)) = (cstr_bytes(s), cstr_bytes(delim)) else {
@@ -145,7 +141,7 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
     let s_len = s_slice.len();
     let delim_len = delim_slice.len();
 
-    if s_len == 0 {
+    if s_len == 0 && !keep_empty {
         return pith_list_new(8, 1);
     }
 
@@ -153,9 +149,7 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
     // list is the sole owner of its parts
     let list = pith_list_new(8, 1);
     let push_part = |part: &[u8]| {
-        // empty parts are dropped: "a,,b" splits to two parts, and a leading
-        // or trailing delimiter adds nothing
-        if part.is_empty() {
+        if !keep_empty && part.is_empty() {
             return;
         }
         // the fresh part's one count moves into the list
@@ -176,6 +170,25 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
     push_part(&s_slice[start..]);
 
     list
+}
+
+/// Split string into a list of strings by delimiter, dropping empty parts.
+///
+/// # Safety
+/// Both s and delim must be valid null-terminated C strings
+#[no_mangle]
+pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i8) -> PithList {
+    split_to_list_inner(s, delim, false)
+}
+
+/// Split string into a list of strings by delimiter, preserving empty parts on
+/// leading, trailing, and consecutive delimiters.
+///
+/// # Safety
+/// Both s and delim must be valid null-terminated C strings
+#[no_mangle]
+pub unsafe extern "C" fn pith_string_split_exact_to_list(s: *const i8, delim: *const i8) -> PithList {
+    split_to_list_inner(s, delim, true)
 }
 
 /// Trim ASCII whitespace from both ends of a C string.
@@ -711,5 +724,34 @@ mod tests {
             split("data//north/./users/../users/17.json", "/"),
             vec!["data", "north", ".", "users", "..", "users", "17.json"]
         );
+    }
+
+    fn split_exact(text: &str, delim: &str) -> Vec<String> {
+        use crate::collections::list::{pith_list_get_value, pith_list_len, pith_list_release};
+        let t = std::ffi::CString::new(text).unwrap();
+        let d = std::ffi::CString::new(delim).unwrap();
+        unsafe {
+            let list = pith_string_split_exact_to_list(t.as_ptr(), d.as_ptr());
+            let mut parts = Vec::new();
+            for i in 0..pith_list_len(list) {
+                let part = pith_list_get_value(list, i) as *const i8;
+                parts.push(String::from_utf8(cstr_bytes(part).unwrap().to_vec()).unwrap());
+            }
+            pith_list_release(list);
+            parts
+        }
+    }
+
+    #[test]
+    fn split_exact_edge_cases() {
+        assert_eq!(split_exact("abc", ""), vec!["abc"]);
+        assert_eq!(split_exact("", ""), vec![""]);
+        assert_eq!(split_exact("", ","), vec![""]);
+        assert_eq!(split_exact(",", ","), vec!["", ""]);
+        assert_eq!(split_exact(",a,b,", ","), vec!["", "a", "b", ""]);
+        assert_eq!(split_exact("a,,b", ","), vec!["a", "", "b"]);
+        assert_eq!(split_exact("a\n\nb", "\n"), vec!["a", "", "b"]);
+        assert_eq!(split_exact("a----b", "--"), vec!["a", "", "b"]);
+        assert_eq!(split_exact("aaa", "aa"), vec!["", "a"]);
     }
 }

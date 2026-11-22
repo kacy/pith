@@ -5006,6 +5006,13 @@ fn ir_emit_value_for_target_inner(val_idx: Int, target_type: String, target_inne
     if vn.kind == "list" and vn.children.len() == 0:
         if ir_checked_type(val_idx).starts_with("list"):
             return ir_expr(val_idx)
+    # an empty map literal the checker typed builds from that type, which
+    # knows whether the map owns a count per string value. the target kind
+    # alone says only "map", and a map built from it took no count for a
+    # string stored later, so the string could be freed while still in it.
+    if vn.kind == "map" and vn.children.len() == 0:
+        if ir_checked_type(val_idx).starts_with("map"):
+            return ir_expr(val_idx)
     empty_init_call := ir_empty_collection_init_call_name(vn.kind, vn.children.len(), ir_bytes_keyed_target(val_idx, target_type))
     if empty_init_call.len() > 0:
         r := ir_reg()

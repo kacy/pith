@@ -1,0 +1,22 @@
+# an empty map literal given to a struct field of type Map[String, String],
+# by position or by name, builds a map that owns a count per string value.
+# it used to build an untagged map, so a string read out of another map and
+# stored into it was freed when that other map replaced it.
+struct Saved:
+    lists: Map[String, String]
+
+struct Named:
+    mut count: Int
+    lists: Map[String, String]
+
+fn main():
+    mut table: Map[String, String] := {}
+    table.insert("a", "old " + 1.to_string())
+    saved := Saved({})
+    named := Named(count: 0, lists: {})
+    saved.lists.insert("a", table["a"])
+    named.lists.insert("a", table["a"])
+    table.insert("a", "fresh " + 2.to_string())
+    print(saved.lists["a"])
+    print(named.lists["a"])
+    print(table["a"])

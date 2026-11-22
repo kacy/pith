@@ -24,7 +24,7 @@ from errors import Diagnostic, render_diagnostics_json
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types, builtin_scope_id, set_builtin_scope_id
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot, checker_note_alias_module
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration, take_interfaces_snapshot, restore_interfaces_snapshot
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner, MethodsSnapshot, take_methods_snapshot, restore_methods_snapshot
 from return_paths import missing_return_sites
@@ -406,7 +406,9 @@ pub fn process_import_aliases(root_idx: Int):
                                 if pi < import_aliases.len() and import_aliases[pi].len() > 0:
                                     # reached through a module alias, see
                                     # from_import_alias_receiver
-                                    register_import_alias(from_import_alias_receiver(import_aliases[pi]), mod_path)
+                                    receiver := from_import_alias_receiver(import_aliases[pi])
+                                    register_import_alias(receiver, mod_path)
+                                    checker_note_alias_module(receiver, mod_path)
                                     continue
                                 generic_named_import_entries.push(current_checker_module_path + chr(9) + imported_name + chr(9) + mod_path)
                                 if current_checker_module_path.len() > 0:

@@ -19,8 +19,8 @@ struct Counter:
 
 fn holder(c: Counter, ready: Channel[Int], gate: Channel[Int], wg: WaitGroup):
     c.mu.lock()
-    ready.send(0)          # announce: the mutex is now held
-    gate.recv()            # keep holding while parked, forcing contenders to wait
+    ready.send(0) # announce: the mutex is now held
+    gate.recv() # keep holding while parked, forcing contenders to wait
     c.value = c.value + 100
     c.mu.unlock()
     wg.done()
@@ -44,14 +44,14 @@ fn main() -> Int!:
     wg.add(n + 1)
 
     spawn holder(c, ready, gate, wg)
-    ready.recv()           # wait until the holder actually holds the mutex
+    ready.recv() # wait until the holder actually holds the mutex
 
     mut i := 0
     while i < n:
         spawn bumper(c, wg, times)
         i = i + 1
 
-    gate.send(0)           # release the holder; contenders can now make progress
+    gate.send(0) # release the holder; contenders can now make progress
     wg.wait()
 
     total := c.value

@@ -399,6 +399,18 @@ fn skip_line():
     if parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
         parser_position = parser_position + 1
 
+# Skips the blanks, newlines and comments allowed between array values
+fn skip_array_space():
+    while parser_position < parser_input.len():
+        skip_whitespace()
+        c := get_char_at(parser_position)
+        if c == chr(10):
+            parser_position = parser_position + 1
+        elif c == "#":
+            skip_comment()
+        else:
+            return
+
 # Returns true if character is valid in a bare key
 fn is_key_char(c: String) -> Bool:
     if c >= "a" and c <= "z":
@@ -510,43 +522,29 @@ fn parse_value_node() -> Int:
         parser_position = parser_position + 5
         return new_node(TomlKind.Bool, 0)
 
-    # array
+    # array. values may sit on several lines with comments between them, and
+    # a comma may follow the last one. after each value the next token must
+    # be a comma or the closing bracket; anything else, the end of the input
+    # included, fails the parse.
     if c == "[":
         parser_position = parser_position + 1
         arr := new_array_node()
-        skip_whitespace()
-        mut iterations := 0
-        mut last_pos := parser_position
-        while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
-            iterations = iterations + 1
-            # Safety: prevent infinite loops on malformed input
-            if iterations > 10000:
-                parser_error = true
-                return 0 - 1
-            # Ensure we're making progress
-            if parser_position == last_pos and iterations > 1:
-                parser_error = true
-                return 0 - 1
-            last_pos = parser_position
-            skip_whitespace()
-            if parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
+        while true:
+            skip_array_space()
+            if get_char_at(parser_position) == "]":
                 parser_position = parser_position + 1
-            if parser_position < parser_input.len() and get_char_at(parser_position) == "#":
-                skip_comment()
-            if parser_position < parser_input.len() and get_char_at(parser_position) != "]" and get_char_at(parser_position) != chr(10) and get_char_at(parser_position) != "#":
-                val := parse_value()
-                if parser_error:
-                    return 0 - 1
-                push_array_element(arr, val)
-                skip_whitespace()
-                if parser_position < parser_input.len() and get_char_at(parser_position) == ",":
-                    parser_position = parser_position + 1
-                skip_whitespace()
-                while parser_position < parser_input.len() and get_char_at(parser_position) == chr(10):
-                    parser_position = parser_position + 1
-        if parser_position < parser_input.len():
-            parser_position = parser_position + 1
-        return arr
+                return arr
+            val := parse_value()
+            if parser_error:
+                return 0 - 1
+            push_array_element(arr, val)
+            skip_array_space()
+            sep := get_char_at(parser_position)
+            if sep == ",":
+                parser_position = parser_position + 1
+            elif sep != "]":
+                parser_error = true
+                return 0 - 1
 
     # number (int or float)
     if (c >= "0" and c <= "9") or c == "-" or c == "+":
@@ -684,11 +682,13 @@ fn toml_parse(input: String) -> Int:
                 parser_position = parser_position + 1
             skip_whitespace()
             start := parser_position
-            while parser_position < parser_input.len() and get_char_at(parser_position) != "]":
+            while parser_position < parser_input.len() and get_char_at(parser_position) != "]" and get_char_at(parser_position) != chr(10):
                 parser_position = parser_position + 1
+            # a header closes on its own line
+            if get_char_at(parser_position) != "]":
+                return 0 - 1
             section := parser_input.substring(start, parser_position)
-            if parser_position < parser_input.len():
-                parser_position = parser_position + 1
+            parser_position = parser_position + 1
             if is_array:
                 if parser_position >= parser_input.len() or get_char_at(parser_position) != "]":
                     return 0 - 1
@@ -703,8 +703,9 @@ fn toml_parse(input: String) -> Int:
         if c != chr(10) and c != "#" and c != "[":
             key := parse_key()
             skip_whitespace()
-            if parser_position < parser_input.len() and get_char_at(parser_position) == "=":
-                parser_position = parser_position + 1
+            if parser_error or get_char_at(parser_position) != "=":
+                return 0 - 1
+            parser_position = parser_position + 1
             val := parse_value()
             if parser_error:
                 return 0 - 1
@@ -1297,6 +1298,32 @@ test "toml rejects an unterminated string":
     assert(parse(dq + "unclosed-key") < 0)
     # the well-formed value still parses
     assert(parse("k = " + dq + "ok" + dq) >= 0)
+
+test "toml rejects unterminated arrays and headers":
+    nl := chr(10)
+    dq := chr(34)
+    # an array left open, at the end of the input or before the next key
+    assert(parse("a = [1, 2") < 0)
+    assert(parse("a = [") < 0)
+    assert(parse("a = [[1, 2]") < 0)
+    assert(parse("a = [1," + nl + "2" + nl + "b = 3") < 0)
+    # a string left open inside an array
+    assert(parse("a = [1, " + dq + "x]") < 0)
+    # values need a comma between them, and a comma needs a value before it
+    assert(parse("a = [1 2]") < 0)
+    assert(parse("a = [1, , 2]") < 0)
+    assert(parse("a = [,]") < 0)
+    # a table header has to close on its own line
+    assert(parse("[tbl" + nl + "x = 1") < 0)
+    assert(parse("[[tbl" + nl + "x = 1") < 0)
+    # a key needs its `=`
+    assert(parse("a 1") < 0)
+    # the well-formed shapes still parse: a trailing comma, values across
+    # lines, and comments between them are all valid toml
+    assert_eq(array_len(get_array(parse("a = [1, 2,]"), "a")), 2)
+    assert_eq(array_len(get_array(parse("a = [" + nl + "  1, # one" + nl + "  2" + nl + "]"), "a")), 2)
+    assert_eq(array_len(get_array(parse("a = [[1, 2], []]"), "a")), 2)
+    assert_eq(array_len(get_array(parse("a = []"), "a")), 0)
 
 test "toml parses tables and arrays":
     doc := "[server]" + chr(10) + "host = " + chr(34) + "localhost" + chr(34) + chr(10) + "ports = [8000, 9000]"

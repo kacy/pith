@@ -174,7 +174,8 @@ fn main() -> Int:
     # values under unknown keys
     show_num("skip_scalars", json.decode_text[Num](obj(q("a") + ":1.5e3," + q("b") + ":-2," + q("c") + ":null," + q("d") + ":" + q("x" + bs + "q") + "," + q("n") + ":1")))
     show_num("skip_nested", json.decode_text[Num](obj(q("a") + ":" + obj(q("x") + ":[1,2," + obj(q("y") + ":[]") + "]," + q("z") + ":" + obj("")) + "," + q("n") + ":2")))
-    show_num("skip_lenient", json.decode_text[Num](obj(q("a") + ":[1 2 3]," + q("b") + ":" + obj(q("x") + " 1 " + q("y") + ":2") + "," + q("n") + ":3")))
+    # a missing comma or colon under an unknown key is refused
+    show_num("skip_strict", json.decode_text[Num](obj(q("a") + ":[1 2 3]," + q("b") + ":" + obj(q("x") + " 1 " + q("y") + ":2") + "," + q("n") + ":3")))
     show_num("skip_bad_escape", json.decode_text[Num](obj(q("a") + ":[" + q("x" + bs + "q") + "]," + q("n") + ":4")))
     show_num("skip_lone_surrogate", json.decode_text[Num](obj(q("a") + ":[" + q(bs + "ud800") + "]," + q("n") + ":5")))
     show_num("skip_pair", json.decode_text[Num](obj(q("a") + ":[" + q(bs + "ud83d" + bs + "ude00") + "]," + q("n") + ":6")))

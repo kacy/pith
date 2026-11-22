@@ -5,8 +5,8 @@
 # and matching outbound cookies across redirect hops.
 
 import std.bytes as bytes
-import std.datetime as datetime
 import std.fs as fs
+import std.net.http as http
 import std.time as time
 
 # One stored HTTP cookie.
@@ -83,84 +83,10 @@ fn upsert_cookie(jar: CookieJar, item: CookieEntry, delete_it: Bool):
         next.push(item)
     jar.entries = next
 
-# Map a 3-letter English month abbreviation to 1..12, or 0 if unknown.
-fn month_from_short(name: String) -> Int:
-    m := name.to_lower()
-    if m == "jan":
-        return 1
-    if m == "feb":
-        return 2
-    if m == "mar":
-        return 3
-    if m == "apr":
-        return 4
-    if m == "may":
-        return 5
-    if m == "jun":
-        return 6
-    if m == "jul":
-        return 7
-    if m == "aug":
-        return 8
-    if m == "sep":
-        return 9
-    if m == "oct":
-        return 10
-    if m == "nov":
-        return 11
-    if m == "dec":
-        return 12
-    return 0
-
-# Parse an HTTP cookie Expires date (RFC 1123 or RFC 850) into Unix seconds, or -1.
-# Examples: "Wed, 21 Oct 2035 07:28:00 GMT", "Wed, 21-Oct-2035 07:28:00 GMT".
+# Parse an HTTP cookie Expires date (RFC 1123, RFC 850, Netscape 4-digit, or asctime)
+# into Unix seconds via std.net.http.parse_http_date, or -1 if invalid.
 pub fn parse_http_expires(raw: String) -> Int:
-    mut text := raw.trim()
-    comma := text.index_of(",")
-    if comma >= 0:
-        text = text.substring(comma + 1, text.len()).trim()
-
-    # Split on spaces and hyphens to handle both "21 Oct 2035" and "21-Oct-2035".
-    mut tokens: List[String] := []
-    for sp in text.split(" "):
-        t := sp.trim()
-        if t == "":
-            continue
-        if t.contains("-") and not t.contains(":"):
-            for dp in t.split("-"):
-                dt := dp.trim()
-                if dt != "":
-                    tokens.push(dt)
-        else:
-            tokens.push(t)
-
-    if tokens.len() < 4:
-        return 0 - 1
-    day_val := parse_int(tokens[0]) catch 0
-    mon_val := month_from_short(tokens[1])
-    mut year_val := parse_int(tokens[2]) catch 0
-    if year_val > 0 and year_val < 100:
-        if year_val >= 70:
-            year_val = year_val + 1900
-        else:
-            year_val = year_val + 2000
-
-    hms := tokens[3].split(":")
-    if hms.len() != 3:
-        return 0 - 1
-    hh := parse_int(hms[0]) catch -1
-    mm := parse_int(hms[1]) catch -1
-    ss := parse_int(hms[2]) catch -1
-    if day_val < 1 or day_val > 31 or mon_val < 1 or year_val < 1970:
-        return 0 - 1
-    if hh < 0 or hh > 23 or mm < 0 or mm > 59 or ss < 0 or ss > 60:
-        return 0 - 1
-
-    d := datetime.date(year_val, mon_val, day_val)
-    if not datetime.is_valid(d):
-        return 0 - 1
-    base_secs := datetime.to_timestamp(d) / 1000
-    return base_secs + hh * 3600 + mm * 60 + ss
+    return http.parse_http_date(raw) catch (0 - 1)
 
 # Parse one Set-Cookie header value and update `jar`.
 pub fn store_set_cookie(jar: CookieJar, header_value: String, req_host: String, req_path: String):

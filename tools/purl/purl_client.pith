@@ -389,13 +389,15 @@ fn prepare_output_parent(spec: RequestSpec, out_path: String):
         if parent != "" and parent != ".":
             fs.make_dirs(parent)
 
-# Execute one HTTP/1.1 hop using std.net.http.Client (or ClientRequest.send_tls_with_config
-# when --resolve / --connect-to overrides the dial address under HTTPS).
+# Execute one HTTP/1.1 hop using std.net.http.Client (including --resolve /
+# --connect-to SNI override via ClientRequest.with_server_name).
 # When `stream_file` is non-empty, streams the response body directly to disk.
 fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, method: String, target: String, headers: Map[String, String], body: Bytes, stream_file: String) -> HopResponse!:
     mut req := http.request(method, dial_host, dial_port, target)
     if u.scheme == "https":
         req = http.https_request_port(method, dial_host, dial_port, target)
+        if dial_overridden:
+            req = req.with_server_name(u.host)
     if dial_overridden and not has_header_ci(headers, "Host"):
         req = req.header("Host", authority_header(u))
     for k in headers:
@@ -419,23 +421,6 @@ fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_hos
         if probe.is_err:
             fail "purl: write error: failed to open '{stream_file}': {probe.err}"
         probe.ok.close()
-        if dial_overridden and u.scheme == "https":
-            cfg := build_tls_config(spec, false)!
-            defer cfg.close()
-            streamed_res := req.send_tls_to_file_with_config(u.host, cfg, stream_file)
-            if streamed_res.is_err:
-                if fs.is_file(stream_file):
-                    fs.remove(stream_file)
-                fail streamed_res.err
-            streamed := streamed_res.ok
-            if spec.max_filesize > 0 and streamed.body_size > spec.max_filesize:
-                if fs.is_file(stream_file):
-                    fs.remove(stream_file)
-                fail "purl: maximum file size exceeded ({streamed.body_size} > {spec.max_filesize})"
-            hop := from_streamed_response(streamed)
-            if spec.verbose:
-                log_verbose_response(hop)
-            return hop
         streamed_res := client.send_to_file(req, stream_file)
         if streamed_res.is_err:
             if fs.is_file(stream_file):
@@ -452,17 +437,6 @@ fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_hos
         return hop
 
     # Buffered path.
-    if dial_overridden and u.scheme == "https":
-        cfg := build_tls_config(spec, false)!
-        defer cfg.close()
-        resp := req.send_tls_with_config(u.host, cfg)!
-        if spec.max_filesize > 0 and resp.body.len() > spec.max_filesize:
-            fail "purl: maximum file size exceeded ({resp.body.len()} > {spec.max_filesize})"
-        hop := from_http1_response(resp)
-        if spec.verbose:
-            log_verbose_response(hop)
-        return hop
-
     resp := client.send(req)!
     if spec.max_filesize > 0 and resp.body.len() > spec.max_filesize:
         fail "purl: maximum file size exceeded ({resp.body.len()} > {spec.max_filesize})"
@@ -799,8 +773,8 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
         auth_raw := auth_user + ":" + auth_pass
         set_header_ci(headers, "Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(auth_raw)))
 
-    # Proxy-Authorization for plain HTTP proxy requests (-U / --proxy-user).
-    if spec.proxy_user != "" and parsed.scheme == "http":
+    # Proxy-Authorization for HTTP proxies and HTTPS CONNECT tunnels (-U / --proxy-user).
+    if spec.proxy_user != "":
         pcolon := spec.proxy_user.index_of(":")
         mut pauth := spec.proxy_user
         if pcolon < 0:

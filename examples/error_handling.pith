@@ -54,11 +54,9 @@ fn main():
         {"port": "8443"},
     ]
     for settings, index in files:
-        result := load(settings)
-        if result.is_err:
-            print("config {index}: rejected, {result.err.message()}")
+        config := load(settings) catch err:
+            print("config {index}: rejected, {err.message()}")
             continue
-        config := result.ok
         print("config {index}: {config.host}:{config.port} with {config.workers} workers")
 
     # unwrap_or is the value form of a fallback for any result

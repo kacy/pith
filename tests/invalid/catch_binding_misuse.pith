@@ -1,0 +1,21 @@
+# the error a `catch err:` block binds lives in that block only, and the
+# block must still leave.
+
+fn parse(s: String) -> Int!:
+    if s == "":
+        fail "empty"
+    return s.len()
+
+fn falls_through(s: String) -> Int:
+    v := parse(s) catch err:
+        print(err)
+    return v
+
+fn out_of_scope(s: String) -> String:
+    v := parse(s) catch err:
+        return "bad"
+    return "{v} {err}"
+
+fn main():
+    print("{falls_through("x")}")
+    print(out_of_scope("x"))

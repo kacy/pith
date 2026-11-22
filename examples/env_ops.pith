@@ -31,11 +31,9 @@ fn load_settings() -> Settings!:
     )
 
 fn show(label: String):
-    loaded := load_settings()
-    if loaded.is_err:
-        print("{label}: refusing to start: {loaded.err}")
+    settings := load_settings() catch err:
+        print("{label}: refusing to start: {err}")
         return
-    settings := loaded.ok
     print("{label}: {settings.database_url}")
     print("    port {settings.port}, {settings.workers} workers, debug {settings.debug}, region {settings.region}")
 

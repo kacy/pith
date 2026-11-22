@@ -170,6 +170,9 @@ for line in lines:
     rows.push(row)
 ```
 
+name the error when the block uses it, as in `catch err:`. the name is bound
+to the result's error inside the block only.
+
 put cleanup for the error path in an `errdefer` right after the acquisition,
 instead of repeating it before every `fail`. use `defer` when the cleanup runs
 on every exit. see [defer.md](defer.md) for the rules.

@@ -1,0 +1,91 @@
+# a variant pattern in `if let` or `while let` on an optional enum matches
+# the payload of a some, so `if let Shape.Circle(r) = maybe` needs no
+# separate unwrap. a none and a some of another variant both take the else.
+
+enum Shape:
+    Circle(Float)
+    Rect(Int, Int)
+    Named(String)
+
+enum Light:
+    Red
+    Green
+
+fn pick(n: Int) -> Shape?:
+    if n == 0:
+        return Shape.Circle(1.5)
+    if n == 1:
+        return Shape.Rect(2, 3)
+    if n == 2:
+        return Shape.Named("tri{n}")
+    return none
+
+fn light(n: Int) -> Light?:
+    if n == 0:
+        return Light.Red
+    if n == 1:
+        return Light.Green
+    return none
+
+fn describe(n: Int) -> String:
+    if let Shape.Named(name) = pick(n):
+        return "named {name}"
+    if let Shape.Rect(w, h) = pick(n):
+        return "rect {w * h}"
+    return "other"
+
+struct Queue:
+    items: List[Shape]
+    pos: Int
+
+impl Queue:
+    fn next() -> Shape?:
+        if self.pos >= self.items.len():
+            return none
+        s := self.items[self.pos]
+        self.pos += 1
+        return s
+
+fn main():
+    # a stored optional is a borrow
+    maybe := pick(0)
+    if let Shape.Circle(r) = maybe:
+        print("circle {r}")
+    else:
+        print("not a circle")
+    if let Shape.Rect(w, _) = maybe:
+        print("rect {w}")
+    else:
+        print("not a rect")
+
+    # a fresh optional from a call, each outcome
+    mut i := 0
+    while i < 4:
+        print(describe(i))
+        i += 1
+
+    # a tag-only enum
+    if let Light.Green = light(1):
+        print("green")
+    if let Light.Green = light(0):
+        print("wrong")
+    else:
+        print("red is not green")
+    if let Light.Red = light(5):
+        print("wrong")
+    else:
+        print("no light")
+
+    # while let stops at the first item that is not the variant
+    q := Queue(items: [Shape.Named("a"), Shape.Named("b"), Shape.Circle(2.5), Shape.Named("c")], pos: 0)
+    while let Shape.Named(name) = q.next():
+        print("queued {name}")
+    print("stopped at {q.pos}")
+
+    # a plain enum subject and a bare binding are unchanged
+    if let Shape.Rect(w, h) = Shape.Rect(4, 5):
+        print("plain {w + h}")
+    if let s = pick(2):
+        match s:
+            Shape.Named(name) => print("bound {name}")
+            _ => print("bound other")

@@ -80,11 +80,9 @@ fn parse_request(raw: String) -> Request!ParseError:
     return request
 
 fn report(raw: String):
-    parsed := parse_request(raw)
-    if parsed.is_err:
-        print("rejected  {describe(parsed.err)}")
+    request := parse_request(raw) catch err:
+        print("rejected  {describe(err)}")
         return
-    request := parsed.ok
     host := request.header("host").unwrap_or("(no host)")
     print("accepted  {request.method} {request.path()} on {host}, {request.headers.len()} headers, body '{request.body}'")
 

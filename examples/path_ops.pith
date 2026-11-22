@@ -32,11 +32,10 @@ fn main():
         "/site/content/notes.txt",
 ]
     for source in sources:
-        planned := output_path(source_root, output_root, source)
-        if planned.is_err:
-            print("skip  {planned.err}")
+        planned := output_path(source_root, output_root, source) catch err:
+            print("skip  {err}")
             continue
-        print("build {path.rel(output_root, planned.ok):<26} from {path.stem(source)}{path.ext(source)}")
+        print("build {path.rel(output_root, planned):<26} from {path.stem(source)}{path.ext(source)}")
 
     # the section a page belongs to is the first directory under the root
     post := "/site/public/blog/2026/first-post.html"

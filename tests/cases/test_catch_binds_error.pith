@@ -1,0 +1,107 @@
+# `catch err:` binds the error for the block. the block runs on the error
+# path and must leave, as the unnamed `catch:` block does.
+
+struct ParseError:
+    message: String
+    line: Int
+
+enum Kind:
+    Missing
+    Bad(String)
+
+fn parse(s: String) -> Int!:
+    if s == "":
+        fail "empty input"
+    if s == "x":
+        fail "not a number: {s}"
+    return s.len()
+
+fn parse_line(s: String, line: Int) -> Int!ParseError:
+    if s == "":
+        fail ParseError{"empty", line}
+    return s.len()
+
+fn classify(s: String) -> Int!Kind:
+    if s == "":
+        fail Kind.Missing
+    if s == "?":
+        fail Kind.Bad(s)
+    return 1
+
+fn total(lines: List[String]) -> Int:
+    mut sum := 0
+    mut i := 0
+    for s in lines:
+        i += 1
+        v := parse_line(s, i) catch err:
+            print("line {err.line}: {err.message}")
+            continue
+        sum += v
+    return sum
+
+fn first_good(items: List[String]) -> String:
+    for s in items:
+        v := parse(s) catch e:
+            print("skip: {e}")
+            continue
+        return "{s}={v}"
+    return "none"
+
+# the error goes back out with fail, wrapped
+fn checked(s: String) -> Int!:
+    v := parse(s) catch err:
+        fail "checked: {err}"
+    return v * 2
+
+# a stored result is caught from a variable: the error is a borrow there
+fn from_stored(s: String) -> String:
+    r := parse(s)
+    v := r catch err:
+        return "stored error: {err}"
+    return "stored ok {v}"
+
+fn describe(k: Kind) -> String:
+    match k:
+        Kind.Missing => return "missing"
+        Kind.Bad(text) => return "bad {text}"
+
+fn kind_name(s: String) -> String:
+    n := classify(s) catch k:
+        return describe(k)
+    return "ok {n}"
+
+fn ready(s: String) -> Bool!:
+    if s == "":
+        fail "empty"
+    return true
+
+fn main():
+    print("{total(["ab", "", "abc", ""])}")
+    print(first_good(["", "x", "four"]))
+    print("{checked("abc") catch -1}")
+    c := checked("x")
+    if c.is_err:
+        print(c.err)
+    print(from_stored("pq"))
+    print(from_stored(""))
+    print(kind_name(""))
+    print(kind_name("?"))
+    print(kind_name("ok"))
+    mut n := 0
+    while n < 3:
+        n += 1
+        v := parse("") catch err:
+            print("{n}: {err}")
+            break
+        print("{v}")
+    # in a statement header the name after catch is still a fallback value
+    fallback := false
+    if ready("") catch fallback:
+        print("ready")
+    else:
+        print("not ready")
+    # the plain forms are unchanged
+    a := parse("") catch 0
+    b := parse("abc") catch:
+        return
+    print("{a} {b}")

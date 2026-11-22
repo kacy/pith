@@ -265,9 +265,12 @@ fn format_code_line(line: String) -> String:
                         output = output + " "
             continue
 
-        # comma — no space before, space after
+        # comma: no space before, space after. like a closing delimiter it
+        # never trims into the indentation: a line can start with the comma
+        # that follows a block lambda argument.
         if ch == ",":
-            output = trim_trailing_spaces(output)
+            if output.len() > indent_len:
+                output = trim_trailing_spaces(output)
             output = output + ","
             i = i + 1
             i = skip_leading_spaces(line, i)
@@ -501,6 +504,15 @@ test "a line that starts with a closing delimiter keeps its indentation":
     assert(fmt_source(out) == out)
     # a closing delimiter after other text still drops the space before it
     assert(fmt_source("fn h() -> Int:" + chr(10) + "    return g(1 )" + chr(10)).contains("g(1)"))
+
+test "a line that starts with a comma keeps its indentation":
+    # the comma after a block lambda argument opens the line that goes on
+    # with the call
+    nl := chr(10)
+    call := "fn f() -> Int:" + nl + "    return apply(fn(x: Int) -> Int:" + nl + "        return x" + nl + "    , 3)" + nl
+    out := fmt_source(call)
+    assert(out.contains(nl + "    , 3)" + nl))
+    assert(fmt_source("fn h() -> Int:" + nl + "    return g(1 , 2)" + nl).contains("g(1, 2)"))
 
 test "a line ending in an operator keeps no trailing space":
     # the spacing pass puts a space after an operator before it knows whether

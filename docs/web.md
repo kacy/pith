@@ -151,7 +151,9 @@ a handler returns a response rather than propagating an error, so check
 `parsed.is_err` and answer with a 400 instead of using `!`. `req.is_json()` turns
 away anything that is not `application/json` before you even try to decode, and a
 malformed body still lands in the `is_err` branch, so both cases come back as a clean
-400.
+400. the error's message says which it was: `invalid json at byte 0` for a body
+that is not json, with the byte the parser stopped at, and `missing json field: age`
+for an object that leaves a field out.
 
 under the hood `web.parse[T]` is just `json.decode_text[T](req.body())`. reach for
 `json.decode_text` directly when you already have the body text and not a request.
@@ -348,6 +350,46 @@ while true:
         break
     use(piece)
 ```
+
+### websockets
+
+a route upgrades to a websocket session by returning
+`websocket.take_connection` with the request and the function that runs the
+session:
+
+```pith
+import std.net.websocket as websocket
+
+fn echo(ws: websocket.WebSocket) -> Int!:
+    while true:
+        text := ws.recv_text() catch:
+            break
+        ws.send_text("echo: {text}")!
+    return 0
+
+fn upgrade(req: web.Request) -> http.HttpResponse:
+    return websocket.take_connection(req.raw, echo)
+
+app := web.new().get("/ws", upgrade)
+```
+
+once the handler returns, the server writes the `101` handshake and calls the
+session function on the connection's task, over the reader and writer
+`http.take_connection` hands over (see docs/http_apps.md). the connection
+closes when the function returns. a request that is not a websocket upgrade
+gets a `400` instead. `websocket.accept_io(req, reader, writer)` is the same
+upgrade for code that already holds an `io.BytesReader` and an
+`io.BytesWriter`.
+
+a session can be shared between tasks. any task may call `send`,
+`send_text`, `ping` or `close` on it, and each message goes out under a lock
+the session holds, so two tasks sending at once never mix their frames.
+receiving stays with one task at a time: a message can span several frames,
+and two tasks reading would split them. a chat room keeps its members'
+sessions in a `guard` block and sends each line on all of them from the task
+that read it, as `examples/websocket_chat.pith` does. a session made with
+`websocket.from_buffered` writes through a buffered writer, which belongs to
+the task that made it, so use that session on that task only.
 
 ## middleware
 

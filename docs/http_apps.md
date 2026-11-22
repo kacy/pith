@@ -581,6 +581,12 @@ http/2 has no upgrade. there, and wherever a middleware replaced the handler's
 response, the `501` that `take_connection` returns is sent instead.
 `examples/gateway/tunnel.pith` uses this to proxy websockets.
 
+to serve a websocket session yourself, return
+`websocket.take_connection(req, session)` from `std.net.websocket`. it checks
+that the request is an upgrade (a `400` if not), writes the handshake over the
+taken connection and runs `session` with a `websocket.WebSocket`.
+`examples/http_websocket_app.pith` does this from a std.web route.
+
 ## serving files and content
 
 `http.serve_file(req, path)` answers a request with a file, and

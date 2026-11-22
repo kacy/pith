@@ -1,0 +1,48 @@
+# a websocket session accepted on one task is usable from others: two tasks
+# send on it at once while the accepting task waits. each message spans several
+# fragments, so a frame from one sender landing between another's fragments
+# would break the message; the client checks every message arrives whole.
+import std.net.tcp as tcp
+import std.net.websocket as websocket
+
+PORT := 20886
+EACH := 100
+
+# a message of 200 copies of `letter`, which goes out as four fragments.
+fn message(letter: String) -> String:
+    return letter.repeat(200)
+
+fn send_many(ws: websocket.WebSocket, letter: String) -> Int!:
+    for i in 0..EACH:
+        ws.send_text(message(letter))!
+    return EACH
+
+fn serve(listener: Int) -> Int!:
+    defer tcp.close(listener)
+    ws := websocket.accept(tcp.accept(listener)!)!
+    a := spawn send_many(ws, "a")
+    b := spawn send_many(ws, "b")
+    sent := (await a)! + (await b)!
+    ws.close(1000, "done")!
+    return sent
+
+fn main() -> Int!:
+    listener := tcp.listen("127.0.0.1", PORT)!
+    server := spawn serve(listener)
+    ws := websocket.dial("127.0.0.1", PORT, "/")!
+    mut a_count := 0
+    mut b_count := 0
+    mut broken := 0
+    while true:
+        text := ws.recv_text() catch:
+            break
+        if text == message("a"):
+            a_count += 1
+        elif text == message("b"):
+            b_count += 1
+        else:
+            broken += 1
+    print("from a: {a_count}, from b: {b_count}, broken: {broken}")
+    print("server sent {(await server)!}")
+    print("closed: {ws.is_closed()}")
+    return 0

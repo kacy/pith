@@ -9,7 +9,7 @@ escaped_key err: missing json field: n
 escaped_key_then_real ok: 6
 key_with_quote ok: 7
 empty_key ok: 8
-unterminated_key err: missing json field
+unterminated_key err: invalid json at byte 22
 quote_at_0 ok: len 0 ""
 slash_at_0 ok: len 6 "\"tail"
 slashes_at_0 ok: len 2 "\\"
@@ -66,8 +66,8 @@ slash_at_17 ok: len 23 "abcdefghijklmnopq\"tail"
 slashes_at_17 ok: len 19 "abcdefghijklmnopq\\"
 escape_run ok: len 32 "\n\t\u0041\\\"0123456789abcdef\/"
 bad_escape_kept_raw ok: len 6 "\q\u12"
-trailing_backslash err: missing json field
-unterminated_long err: missing json field
+trailing_backslash err: invalid json at byte 24
+unterminated_long err: invalid json at byte 32
 utf8 ok: len 26 "café € 😀 ünïcödé"
 raw_bytes ok: len 2 "ab"
 invalid_utf8 ok: len 10
@@ -81,14 +81,14 @@ int 9223372036854775808 ok: 9223372036854775807
 int 99999999999999999999999 ok: 9223372036854775807
 int -9223372036854775808 ok: -9223372036854775807
 int -99999999999999999999 ok: -9223372036854775807
-int 1e3 err: missing json field
-int 1.0 err: missing json field
-int +5 err: missing json field
-int - err: missing json field
-int --1 err: missing json field
-int 12x err: missing json field
-int 0x10 err: missing json field
-int_at_end err: missing json field
+int 1e3 err: invalid json object at byte 6
+int 1.0 err: invalid json object at byte 6
+int +5 err: invalid json object at byte 5
+int - err: invalid json at byte 6
+int --1 err: invalid json at byte 8
+int 12x err: invalid json at byte 7
+int 0x10 err: invalid json at byte 6
+int_at_end err: invalid json object at byte 7
 float 3 ok: 3 sign +
 float -0.0 ok: 0 sign -
 float 0.1 ok: 0.1 sign +
@@ -96,46 +96,46 @@ float 1e3 ok: 1000 sign +
 float 2.5E-3 ok: 0.0025 sign +
 float 1.7976931348623157e308 ok: 179769313486231570814527423731704356798070567525844996598917476803157260780028538760589558632766878171540458953514382464234321326889464182768467546703537516986049910576551282076245490090389328944075868508455133942304583236903222948165808559332123348274797826204144723168738177180919299881250404026184124858368 sign +
 float 5e-324 ok: 0 sign +
-float 1e309 err: missing json field
-float -1e309 err: missing json field
+float 1e309 err: invalid json at byte 10
+float -1e309 err: invalid json at byte 11
 float 1e-400 ok: 0 sign +
-float .5 err: missing json field
-float 1.5.5 err: missing json field
-float 1e err: missing json field
-float +1 err: missing json field
-float - err: missing json field
-float 1-2 err: missing json field
+float .5 err: invalid json at byte 5
+float 1.5.5 err: invalid json at byte 10
+float 1e err: invalid json at byte 7
+float +1 err: invalid json object at byte 5
+float - err: invalid json at byte 6
+float 1-2 err: invalid json at byte 8
 float 0.30000000000000004 ok: 0.3 sign +
 true_false ok: true 1
 false ok: false 2
-prefix_trailing err: missing json field
-short err: missing json field
-false_at_end err: missing json field
-capital err: missing json field
+prefix_trailing err: invalid json at byte 10
+short err: invalid json at byte 12
+false_at_end err: invalid json object at byte 17
+capital err: invalid json at byte 6
 skip_scalars ok: 1
 skip_nested ok: 2
 skip_lenient ok: 3
-skip_bad_escape err: missing json field
-skip_lone_surrogate err: missing json field
+skip_bad_escape err: invalid json at byte 11
+skip_lone_surrogate err: invalid json at byte 14
 skip_pair ok: 6
-skip_big_int err: missing json field
+skip_big_int err: invalid json at byte 27
 skip_big_float ok: 8
 skip_plus ok: 9
-skip_plus_top err: missing json field
+skip_plus_top err: invalid json object at byte 5
 skip_depth_127 ok: 11
-skip_depth_128 err: missing json field
-skip_depth_deep err: missing json field
-skip_unclosed err: missing json field
-skip_bad_literal err: missing json field
-skip_unclosed_string err: missing json field
-skip_trailing_backslash err: missing json field
-skip_number_at_end err: missing json field
+skip_depth_128 err: invalid json at byte 132
+skip_depth_deep err: invalid json at byte 132
+skip_unclosed err: invalid json object at byte 16
+skip_bad_literal err: invalid json at byte 5
+skip_unclosed_string err: invalid json at byte 16
+skip_trailing_backslash err: invalid json at byte 18
+skip_number_at_end err: invalid json object at byte 19
 tabs_newlines ok: 16
 trailing_garbage ok: 17
 empty_object err: missing json field: n
-empty_input err: missing json field
-only_space err: missing json field
-array err: missing json field
-vertical_tab err: missing json field
-double_comma err: missing json field
-missing_comma err: missing json field
+empty_input err: invalid json at byte 0
+only_space err: invalid json at byte 3
+array err: expected a json object, got array
+vertical_tab err: invalid json at byte 1
+double_comma err: invalid json at byte 8
+missing_comma err: invalid json object at byte 7

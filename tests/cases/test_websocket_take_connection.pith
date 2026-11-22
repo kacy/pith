@@ -1,0 +1,54 @@
+# a std.web route upgrades to a std websocket session with
+# websocket.take_connection, which runs the session over the io.BytesReader and
+# io.BytesWriter that http.take_connection hands over. a plain GET on the same
+# route gets a 400.
+import std.net.http as http
+import std.net.tcp as tcp
+import std.net.websocket as websocket
+import std.web as web
+
+PORT := 20885
+
+fn echo(ws: websocket.WebSocket) -> Int!:
+    mut n := 0
+    while true:
+        text := ws.recv_text() catch:
+            break
+        ws.send_text("echo {n}: {text}")!
+        n += 1
+    return n
+
+fn upgrade(req: web.Request) -> http.HttpResponse:
+    return websocket.take_connection(req.raw, echo)
+
+fn serve(port: Int) -> Int:
+    app := web.new().get("/ws", upgrade)
+    return app.listen("127.0.0.1", port) catch 0
+
+fn wait_until_listening(port: Int) -> Bool:
+    for attempt in 0..500:
+        probe := tcp.connect("127.0.0.1", port) catch:
+            sleep(10)
+            continue
+        tcp.close(probe)
+        return true
+    return false
+
+fn main() -> Int!:
+    spawn serve(PORT)
+    if not wait_until_listening(PORT):
+        fail "the server never came up"
+
+    plain := http.get_request("127.0.0.1", PORT, "/ws").send()!
+    print("plain GET /ws -> {plain.status} {plain.body_text()!}")
+
+    ws := websocket.dial("127.0.0.1", PORT, "/ws")!
+    ws.send_text("hello")!
+    print(ws.recv_text()!)
+    # longer than one fragment, so the reply is reassembled from several frames.
+    long := "0123456789".repeat(20)
+    ws.send_text(long)!
+    reply := ws.recv_text()!
+    print("long echo intact: {reply == "echo 1: " + long}")
+    ws.close(1000, "done")!
+    return 0

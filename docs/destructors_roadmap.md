@@ -247,8 +247,8 @@ releases it, which at zero would re-enter the release and run the destructor
 again. `pith_struct_release` runs the destructor under a guard count of one,
 the same guard the collector's teardown applies, so the pairs inside the body
 balance and nothing inside it can reach zero; `self` is an ordinary borrowed
-parameter, in no cleanup list. a `drop` that lets `self` escape is documented
-as undefined rather than caught.
+parameter, in no cleanup list. a `drop` that lets `self` escape is refused
+at compile time (E318).
 
 ## the options
 

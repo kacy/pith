@@ -714,19 +714,33 @@ zero, calls the struct's destructor pointer, and the generated body calls
 field is still live while `drop` runs, so it can read them. the same body
 runs when a value dies inside a container, an optional, a struct field or
 a closure environment, because the destructor pointer sits in the object's
-header rather than on any binding. the cycle collector runs it too, for a
-struct freed as a member of a garbage cycle, on the collector's thread and
-in the collector's order. a `Drop` struct whose fields hold no counted
-values has no tracer, so it is a leaf to the collector and can never be a
-cycle member itself; the collector only reaches it through a member's
-field release, which is an ordinary release.
+header rather than on any binding. the cycle collector does not run it
+for a member of a garbage cycle: it frees every member of a cycle in one
+pass, and a `drop` that ran inside that pass could reach another member
+through a strong field and keep it past the free. so a garbage cycle that
+runs through a `Drop` struct is left alone and leaks, along with
+everything that struct reaches. a `Drop` struct the collector reaches
+only through a cycle member's field, outside any cycle, dies by an
+ordinary release when that member is freed, and its `drop` runs then. a
+weak reference read during that pass answers none for a cycle member,
+the same as for a value whose `drop` is running.
 
-two rules for a `drop` body. it may bind or pass `self`: the runtime runs
-the destructor under a guard count of one, so the retain and release a
-bind takes balance inside the body instead of re-entering the release at
-zero. it must not let `self` escape, though. storing it in a container or
-a global leaves a reference to memory that is freed the moment `drop`
-returns. and it should be idempotent with the type's explicit closer.
+two rules for a `drop` body. first, `self` must not escape it, since the
+value is freed the moment `drop` returns, and the checker refuses any use
+that could keep it (E318). a `drop` body may use `self` to read and write
+its fields, as the receiver of a method call, and as an argument, and the
+method or function it is lent to is checked under the same rule for its
+receiver or that parameter, through every call it makes. a local bound
+straight from `self` (`me := self`) counts as `self`. what is refused:
+storing it in a field, a global, a container or a channel, returning it,
+building a value around it, capturing it in a closure or a `spawn`, and
+passing it to a builtin or anything else whose body the checker cannot
+follow. the values a `drop` copies out of the fields are ordinary values
+and may go anywhere. the runtime runs the destructor under a guard count,
+so the retain and release a bind or a call takes balance inside the body
+instead of re-entering the release at zero, and a weak reference to the
+value read inside its own `drop` answers none. second, `drop` should be
+idempotent with the type's explicit closer.
 std's rule is that whoever builds a resource closes it, and that rule
 stands: an explicit `close()` still says *when* the resource goes back,
 which matters for a server config a listener is still handshaking on,
@@ -735,7 +749,9 @@ past the call. a closer backed by a map removal is idempotent for free,
 and that is the shape every `Drop` type in std has.
 
 `tests/cases/test_drop_hook` pins where the hook fires (scope exit, a
-rebind, a list or a struct field dying, a value returned to a caller), and
+rebind, a list or a struct field dying, a value returned to a caller),
+`tests/cases/test_drop_lend` what a `drop` body may still do with `self`,
+`tests/invalid/drop_escape_*` the escapes E318 refuses, and
 `tests/leaks/leak_tls_config_drop` pins that a tls config built and never
 closed no longer holds its registry slot.
 

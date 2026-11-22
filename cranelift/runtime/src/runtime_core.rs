@@ -4160,8 +4160,8 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
         // guard count, as the cycle collector's teardown does: every pair
         // inside it balances back to the guard, and no release inside can
         // reach zero. the value is freed below whatever the count reads
-        // afterwards; a `drop` that lets `self` escape leaves a dangling
-        // reference, which is documented rather than guarded.
+        // afterwards, which is sound because the checker refuses a `drop`
+        // that lets `self` escape (E318).
         //
         // the guard is `STRUCT_DTOR_GUARD` rather than one, so a weak upgrade
         // racing the destructor can tell it from a live count and refuse it.

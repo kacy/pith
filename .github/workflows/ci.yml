@@ -212,8 +212,12 @@ jobs:
       - name: check pith formatting
         run: |
           # std/ nests to std/net/http2, deeper than a `std/**/*.pith` glob
-          # reaches without globstar, so the file list comes from find.
-          for f in $(find self-host std tools bench -name '*.pith' | sort); do
+          # reaches without globstar, so the file list comes from find. the
+          # two lsp fixtures are misformatted on purpose: the lsp tests format
+          # them.
+          for f in $(find self-host std tools tooling bench examples tests -name '*.pith' \
+              -not -path tests/lsp/fixtures/misformat.pith \
+              -not -path tests/lsp/fixtures/multibyte_misformat.pith | sort); do
             ./self-host/pith_main fmt --check "$f"
             if [ $? -ne 0 ]; then
               echo "FAIL $f not formatted"

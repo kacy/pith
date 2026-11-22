@@ -19,6 +19,9 @@
 use crate::runtime_ownership::{runtime_ownership, ArgOwnership, ResultValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+mod untagged_stores;
+pub use untagged_stores::check_untagged_stores;
+
 /// retains are `b` in the ownership table; the checker knows them by name
 const RETAINS: &[&str] = &[
     "pith_cstring_retain",

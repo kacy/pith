@@ -220,6 +220,22 @@ built once with every field in the constructor call and keeps its changing
 parts in a `guard` block. the ones to restructure set a field from a builder
 after the struct is built, or write it under a lock taken by hand.
 
+a closure captures the values it uses by handle, so a closure that runs on
+another task shares what it captured with the scope that made it. the checker
+follows each function value to the places it can run: a spawn's argument,
+callee or receiver, a sent value, a module global, a field of a struct that
+crosses to a task, a capture of a closure that crosses, and any parameter,
+field or result that flows into one of those, across the whole program. a
+closure that can reach another task must capture only what a spawn argument
+could carry: no collection outside a `guard` block, and no struct with such a
+collection or with a counted field some code reassigns (E248). a request
+handler is the common case: `std.web`, `std.net.http`, `std.net.http2` and
+`std.net.grpc` run a handler on the task serving each connection, so a
+handler that captures a list the program keeps pushing to is refused. keep
+that state in a `guard` block, or in a `frozen` field if it is built once.
+a closure that stays on the task that made it, such as one passed to `map`,
+may capture anything.
+
 when a channel is the wrong shape — a registry every request reads and a
 few requests write, a counter, a cap on how many things run at once — reach
 for a lock. the primitives below are built in: they need no import, and
@@ -291,8 +307,13 @@ some code reassigns is refused the same way, `mut` or not.
 a value read inside `locked` stays there: storing a guarded collection in
 a variable declared outside the block, returning it, or capturing it in a
 closure is refused (E276), since the handle would reach the buffer after the
-unlock. so is a guarded struct with a counted field that some code reassigns. moving it out and giving the field a new value, as a drain does, is
-allowed. data that is built once and only read after belongs in a `frozen`
+unlock. so is a guarded struct with a counted field that some code reassigns.
+a name bound inside the block to a guarded value counts as the guarded value
+for the rest of the block: a local (`list := self.idle[key]`), a loop
+variable over it, an `if let` binding of it, the result of `get` or `unwrap`
+on it, and the result of a function that returns its argument. moving it out
+and giving the field a new value, as a drain does, is allowed, and so is
+storing it back under the same guard. data that is built once and only read after belongs in a `frozen`
 field (see docs/ownership.md), which any task reads with no lock.
 
 `guard shard_mu[8]:` declares a list of eight mutexes, for state split into

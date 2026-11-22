@@ -1382,6 +1382,7 @@ MEMCHECK_OSTHREAD_CASES := \
 
 MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
+	tests/cases/test_drop_lend \
 	tests/cases/test_result_box_shared_release \
 	tests/cases/test_optional_result_plain_payload \
 	tests/cases/test_crosskind_binding_release \

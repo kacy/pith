@@ -1,0 +1,18 @@
+# a drop that stores self in a global, a container or a channel keeps a
+# reference to a value that is freed when drop returns.
+struct Node:
+    name: String
+
+mut keep: List[Node] := []
+mut by_name: Map[String, Node] := {}
+out := Channel[Node](4)
+
+impl Drop for Node:
+    fn drop():
+        keep.push(self)
+        by_name.insert(self.name, self)
+        out.send(self)
+
+fn main():
+    n := Node(name: "n")
+    print(n.name)

@@ -1,0 +1,68 @@
+# what a drop body may still do with self under E318: read and write its
+# fields, call its methods, bind it to a local, and lend it to functions
+# and methods that only read it, through any depth of calls and through
+# recursion. the values it copies out of the fields may outlive it.
+struct Child:
+    id: Int
+    weak parent: Node?
+
+struct Node:
+    name: String
+    mut count: Int
+    mut parts: List[String]
+    mut child: Child?
+
+mut log: List[String] := []
+
+fn describe(n: Node, tag: String) -> String:
+    return tag + ":" + n.name + "/" + n.count.to_string()
+
+fn describe_twice(tag: String, n: Node) -> String:
+    return describe(n, tag) + "," + describe(n, tag + "2")
+
+fn count_down(n: Node, left: Int):
+    if left > 0:
+        n.count = n.count + 1
+        count_down(n, left - 1)
+
+impl Node:
+    fn record(note: String):
+        self.parts.push(note)
+        log.push(note + " " + self.name)
+
+    fn summary() -> String:
+        return describe_twice("s", self) + " parts=" + self.parts.len().to_string()
+
+    fn settle(left: Int):
+        if left > 0:
+            self.count = self.count + 1
+            self.settle(left - 1)
+
+impl Drop for Node:
+    fn drop():
+        self.record("dropping")
+        self.settle(2)
+        count_down(self, 3)
+        me := self
+        log.push(describe(me, "me"))
+        log.push(self.summary())
+        log.push("names {self.name} {me.name}")
+        # a weak reference back to the dying value reads none: the runtime
+        # refuses to upgrade it while the destructor runs
+        if let c = self.child:
+            if let back = c.parent:
+                log.push("resurrected " + back.name)
+            else:
+                log.push("weak back pointer reads none")
+
+fn make(name: String):
+    n := Node(name: name, count: 0, parts: [], child: none)
+    c := Child(id: 1, parent: none)
+    c.parent = n
+    n.child = c
+    n.record("made")
+
+fn main():
+    make("node " + 7.to_string())
+    for line in log:
+        print(line)

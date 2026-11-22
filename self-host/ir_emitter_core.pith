@@ -7638,14 +7638,23 @@ fn ir_emit_list_literal(idx: Int, node: Node) -> Int:
     ir_inflight_drop(list_r)
     return list_r
 
+# the rc kind a tuple literal's element slot holds. an element the checker
+# widened into an optional slot holds the Some shell built around it, which
+# the literal owns, not the value's own kind.
+fn ir_tuple_elem_kind(elem_idx: Int) -> String:
+    if c_argument_widens_to_optional(elem_idx):
+        return "tuple"
+    return ir_rc_kind(ir_infer_type(elem_idx))
+
 fn ir_emit_tuple_literal_stores(tuple_r: Int, elem_regs: List[Int], elem_nodes: List[Int]):
     for elem_reg, i in elem_regs:
         if i < elem_nodes.len():
-            tuple_kind := ir_rc_kind(ir_infer_type(elem_nodes[i]))
+            tuple_kind := ir_tuple_elem_kind(elem_nodes[i])
             # a fresh element transfers its count into the tuple; only a
             # borrow needs a retain, mirroring struct construction. the
-            # tuple's destructor releases the slot on free either way.
-            if tuple_kind.len() > 0 and ir_expr_is_borrowed(elem_nodes[i]):
+            # tuple's destructor releases the slot on free either way. a
+            # widened element is the shell built for it, which is fresh.
+            if tuple_kind.len() > 0 and ir_expr_is_borrowed(elem_nodes[i]) and not c_argument_widens_to_optional(elem_nodes[i]):
                 ir_rc_retain_reg(elem_reg, tuple_kind)
         ir_emit("sstore " + tuple_r.to_string() + " " + i.to_string() + " " + elem_reg.to_string())
 
@@ -7701,7 +7710,7 @@ fn ir_tuple_dtor_code_kind(code: String) -> String:
 fn ir_tuple_dtor_signature(elem_nodes: List[Int]) -> String:
     mut sig := ""
     for child in elem_nodes:
-        sig = sig + ir_tuple_elem_code(ir_rc_kind(ir_infer_type(child)))
+        sig = sig + ir_tuple_elem_code(ir_tuple_elem_kind(child))
     return sig
 
 # module-suffixed so each module carries its own copy, exactly like the
@@ -7757,6 +7766,11 @@ fn ir_emit_tuple_literal(node: Node) -> Int:
             # optional none rather than a bare zero, so element reads go
             # through the optional machinery.
             elem_regs.push(ir_emit_optional_none_value())
+            elem_pins.push("")
+        elif c_argument_widens_to_optional(child):
+            # a plain value stored into an optional slot is wrapped in its
+            # Some, as an argument to an optional parameter is
+            elem_regs.push(ir_emit_value_for_target(child, "tuple"))
             elem_pins.push("")
         else:
             elem_r := ir_expr(child)

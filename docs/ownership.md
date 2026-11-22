@@ -635,7 +635,10 @@ gaps, all bounded leaks rather than dangling pointers:
   `-> Set[String]?`) records the container inside it. the same recorded
   type reaches an empty literal nested in a returned literal
   (`return [{}]`), a tuple element (`({}, 1)`) and a generic function's
-  argument. a generic struct built as `Bag()` takes its instance from the
+  argument. a value stored into an optional tuple slot, as in `({}, 1)`
+  for a `(Map[String, String]?, Int)`, is wrapped in its Some the way an
+  argument to an optional parameter is, and the literal is built from the
+  optional's inner type. a generic struct built as `Bag()` takes its instance from the
   place it is stored into, so its `= {}` and `= []` defaults are built
   from that instance's field types, inside a generic body too; with no
   such place the constructor is refused (E222), and a generic struct's

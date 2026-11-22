@@ -8552,6 +8552,27 @@ fn check_set_expression(node: Node, scope_id: Int) -> Int:
 
 # a bare `none` element carries TID_NONE, which the structural comparison
 # accepts against a declared `T?` element and rejects against every other.
+# the type a tuple literal's element takes in the slot `target` it is stored
+# into. an empty literal takes the slot's container type, so `({}, 1)` stored
+# into a (Map[String, String], Int) builds a map that owns its strings. a
+# plain value or a literal stored into an optional slot is recorded as
+# widened, so the emitter wraps it in its Some as it does for an optional
+# parameter; the literal is built from the optional's inner type. without
+# that `({}, 1)` into a (Map[String, String]?, Int) stored a bare untagged
+# map where the optional's shell belongs.
+fn tuple_element_into_target(child: Int, elem: Int, target: Int, scope_id: Int) -> Int:
+    kind := node_kind(child)
+    optional := get_type_info(target).kind == "optional"
+    if kind == "list" or kind == "map" or kind == "set":
+        if (is_error_type(elem) or optional) and collection_literal_coerces(child, target, scope_id):
+            if optional:
+                return target
+            return c_get_expr_type(child)
+        return elem
+    if optional and argument_widens_to_optional(child, elem, target):
+        return target
+    return elem
+
 fn check_tuple_expression(node_idx: Int, node: Node, scope_id: Int) -> Int:
     # the tuple type the value is stored into, when one was noted
     mut target_elems: List[Int] := []
@@ -8564,13 +8585,8 @@ fn check_tuple_expression(node_idx: Int, node: Node, scope_id: Int) -> Int:
     mut elems: List[Int] := []
     for child, i in node.children:
         mut elem := c_check_expr(child, scope_id)
-        # an empty literal element takes the target element's container type,
-        # so `({}, 1)` stored into a (Map[String, String], Int) builds a map
-        # that owns its strings
-        kind := node_kind(child)
-        if is_error_type(elem) and i < target_elems.len() and (kind == "list" or kind == "map" or kind == "set"):
-            if get_type_info(target_elems[i]).kind != "optional" and collection_literal_coerces(child, target_elems[i], scope_id):
-                elem = c_get_expr_type(child)
+        if i < target_elems.len():
+            elem = tuple_element_into_target(child, elem, target_elems[i], scope_id)
         elems.push(elem)
     return add_type_info(ti_tuple(elems))
 

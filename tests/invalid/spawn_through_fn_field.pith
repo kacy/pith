@@ -1,0 +1,13 @@
+# the spawn is reached through a function a struct field holds: the program
+# names `launch` when it builds the Job, which counts as reaching it (E248).
+import support.spawn_fn_value_lib as lib
+
+struct Job:
+    run: fn(List[String]) -> Int
+
+fn start(job: Job, xs: List[String]) -> Int:
+    return job.run(xs)
+
+fn main():
+    xs: List[String] := []
+    print("{start(Job(run: lib.launch), xs)}")

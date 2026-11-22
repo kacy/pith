@@ -1,0 +1,88 @@
+# an empty literal returned from a function that returns a result, nested
+# in a returned literal, a tuple element, or a generic function's argument
+# takes its container type from the declared type, so the inner container owns the strings stored into it. each shape
+# stores a string borrowed from a struct field, overwrites the field, and
+# reads the copy back.
+
+struct Src:
+    name: String
+
+fn names() -> List[String]!:
+    return []
+
+fn table() -> Map[String, String]!:
+    return {}
+
+fn rows() -> List[Map[String, String]]:
+    return [{}]
+
+fn groups() -> Map[String, List[String]]:
+    return {"k": []}
+
+fn pair() -> (Map[String, String], Int):
+    return ({}, 1)
+
+fn rows_of[T]() -> List[Map[String, T]]:
+    return [{}]
+
+fn rows_or_fail[T]() -> List[Map[String, T]]!:
+    return [{}]
+
+fn rows_maybe[T]() -> List[Map[String, T]]?:
+    return [{}]
+
+fn groups_of[T]() -> Map[String, List[T]]:
+    return {"k": []}
+
+fn fill[T](l: List[Map[String, T]], v: T) -> List[Map[String, T]]:
+    l[0].insert("a", v)
+    return l
+
+fn filled[T](v: T) -> List[Map[String, T]]:
+    return fill([{}], v)
+
+fn paired[T](v: T) -> (Map[String, T], Int):
+    t: (Map[String, T], Int) := ({}, 1)
+    t.0.insert("a", v)
+    return t
+
+fn show(label: String, v: String):
+    print(label + ": " + v)
+
+fn main():
+    src := Src(name: "field value {5} on the heap")
+    nl := names() catch []
+    nl.push(src.name)
+    tb := table() catch {}
+    tb.insert("a", src.name)
+    r := rows()
+    r[0].insert("a", src.name)
+    g := groups()
+    g["k"].push(src.name)
+    p := pair()
+    p.0.insert("a", src.name)
+    local: (List[String], Int) := ([], 2)
+    local.0.push(src.name)
+    rg := rows_of[String]()
+    rg[0].insert("a", src.name)
+    rf := rows_or_fail[String]() catch []
+    rf[0].insert("a", src.name)
+    rm := rows_maybe[String]().unwrap_or([])
+    rm[0].insert("a", src.name)
+    gg := groups_of[String]()
+    gg["k"].push(src.name)
+    fl := filled(src.name)
+    pg := paired(src.name)
+    src.name = "replaced {7} on the heap"
+    show("empty list from a result", nl[0])
+    show("empty map from a result", tb["a"])
+    show("returned list of maps", r[0]["a"])
+    show("returned map of lists", g["k"][0])
+    show("returned tuple", p.0["a"])
+    show("tuple binding", local.0[0])
+    show("generic list of maps", rg[0]["a"])
+    show("generic result", rf[0]["a"])
+    show("generic optional", rm[0]["a"])
+    show("generic map of lists", gg["k"][0])
+    show("generic argument", fl[0]["a"])
+    show("generic tuple", pg.0["a"])

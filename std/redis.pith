@@ -78,15 +78,20 @@ fn reply_is_error(r: Reply) -> Bool:
 # got. the cursor is what keeps the client linear: consuming a line or a
 # payload only moves `pos`, and the bytes already consumed are dropped in one
 # step when the next read comes in, so no byte of a reply is copied twice.
+#
+# a Client is the one owner of its socket: nothing rebuilds one from a bare
+# fd, so closing or dropping it cannot reach a socket another value uses.
+# `closed` records that close() or the destructor ran.
 pub struct Client:
     fd: Int
     mut buf: Bytes
     mut pos: Int
+    mut closed: Bool
 
 # open a connection to a redis server.
 pub fn connect(host: String, port: Int) -> Client!:
     fd := tcp_connect(host, port)!
-    return Client(fd: fd, buf: bytes.empty(), pos: 0)
+    return Client(fd: fd, buf: bytes.empty(), pos: 0, closed: false)
 
 impl Client:
     # bytes read off the socket that the parser has not consumed yet.
@@ -278,8 +283,12 @@ impl Client:
             Reply.Array(items) => items
             _ => []
 
-    # close the connection.
+    # close the connection. redis needs no goodbye, so this only closes the
+    # socket, and a second call does nothing.
     pub fn close():
+        if self.closed:
+            return
+        self.closed = true
         tcp_close(self.fd)
 
     # --- typed helpers over `command` ---
@@ -331,11 +340,19 @@ impl Client:
     pub fn keys(pattern: String) -> List[String]!:
         return self.command_list(["KEYS", pattern])!
 
+# a client nobody closed closes its socket when the last value naming it goes,
+# the backstop for a caller that forgot close() or took an error exit past it.
+# closing a socket writes nothing, so the destructor is close() itself.
+impl Drop for Client:
+    fn drop():
+        self.close()
+
 # --- connection pool ---
 
 # a small connection pool: hand out live clients and take them back for reuse,
 # so callers skip the tcp connect on every command. it keeps up to `max_idle`
-# clients around; extras are closed on release.
+# clients around; extras are closed on release. a pool nobody closes needs no
+# destructor of its own: its idle clients close from theirs when it goes.
 pub struct Pool:
     mut idle: List[Client]
     host: String
@@ -368,3 +385,12 @@ impl Pool:
         for client in self.idle:
             client.close()
         self.idle = []
+
+test "close records that it ran, so a second close and the drop do nothing":
+    # fd -1 names no socket, so tcp_close on it is a no-op either way; what is
+    # checked is the flag a later close and the destructor read.
+    client := Client(fd: -1, buf: bytes.empty(), pos: 0, closed: false)
+    client.close()
+    assert(client.closed)
+    client.close()
+    assert(client.closed)

@@ -14,9 +14,13 @@ the emitter was to running user cleanup, the recommendation made at the time,
 and the staged plan that came out of it. the hook exists now: a struct can
 `impl Drop`, its `drop` runs from the destructor the compiler already
 attaches, and `std.net.tls.Config` is the first std type on it (the mechanism
-is described in docs/ownership.md, "destructors"). the survey and the stage
-plan below are kept current, because every other type in the survey still
-closes by hand and the plan says in what order that changes.
+is described in docs/ownership.md, "destructors"). since then most of std has
+moved onto it: io readers, writers and buffers, files, processes, byte arrays,
+ecdh key pairs, websocket sessions, tls connections and listeners, http and
+http/2 connections, the http client's idle pool, and the database connections,
+transactions and statements. the survey below records what each type lost
+when a close was skipped before that; stage 2 says which types are done and
+which still close by hand.
 
 ## the survey
 
@@ -369,12 +373,13 @@ the diagnostic makes the badly-written case visible.
 
 ## staged plan
 
-### stage 0 — a lint for a resource that is built and abandoned — done, now empty
+### stage 0: a lint for a resource that is built and abandoned (done)
 
 E307, in `self-host/linter.pith`. it reports a locally-built resource that is
-never closed and never handed off. its constructor list held the three tls
-config builders and is empty now that `Config` closes itself; the rule stays
-for a type audited onto the list rather than the hook. deliberately narrow: the binding's
+never closed and never handed off. its constructor list holds the tls config
+builders and the json, toml and yaml `open_scope()`. a constructor whose result
+type implements `Drop` is skipped, so the tls builders stay quiet and a type
+moved onto the destructor goes quiet without an edit to the list. deliberately narrow: the binding's
 initializer must be a call to a known resource constructor, reached through `!`
 and any chain of builder methods, and the name must be used *only* as the
 receiver of methods that do not close it. any other use — passed as an argument,
@@ -401,7 +406,24 @@ specialization that skipped scope-exit cleanup are closed; a generic body is
 typed per instantiation before it is emitted, and docs/ownership.md records
 the shapes that pin it.
 
-### stage 2 — make std's resource types single-owner — `Config` done
+### stage 2: make std's resource types single-owner (mostly done)
+
+status: done for `Config`; the io readers, writers, buffers and cursors, files
+and processes (through a shared `io.ProcessHandle` that pipe views keep
+alive), `ByteArray` and `X25519KeyPair`; websocket sessions (no close frame on
+drop); `tls.Conn` and `tls.Listener` (`conn_from_handle` and
+`listener_from_handle` were removed, and a dropped conn sends no close_notify);
+`http.ClientConn`, `http2.Connection`, the h2 server connection and the http
+client's idle pool; `postgres.Conn`, `mysql.Conn`, `redis.Client`, and
+`std.db`'s `Tx` and `Stmt`, which own their pin, and `Db`, which holds its
+pool (the module-global pool and pin registries are gone). io registry handles
+come from one process-wide counter, so a drop on another task finds nothing.
+still by hand: `ByteBuffer`, whose destructor waits on the count checker
+telling an `Int` field store from a counted one; grpc streams, which need a
+release on `http2.Stream` that sends no reset frame; `http2.Client`, which its
+reader and writer tasks hold; `term.session.Terminal`, whose tasks hold it and
+whose close writes to the tty; and `TcpStream`, which is a view of a socket
+another value owns. the text below is the plan as it was written.
 
 stop reconstructing a wrapper struct from a raw handle, so that one live value
 names one live resource, then put the type on the hook. `std.net.tls.Config`
@@ -454,8 +476,8 @@ pointer, the way tracers already are: `ir_struct_needs_dtor` answers true for
 a `Drop` struct, the generated destructor calls the method at its head, the
 runtime runs the body under a guard count, and the tracer registration is
 unchanged because the method adds no edges. the checker refuses the shapes the
-destructor cannot call (E268): an enum, a generic struct, an impl outside the
-declaring module, or a `drop` with parameters or a return value.
+destructor cannot call (E268): an enum, an impl outside the declaring
+module, or a `drop` with parameters or a return value.
 
 the collector question was decided the plain way: a `drop` runs wherever the
 release runs, the collector's sweep included. a `Drop` struct with no counted
@@ -463,6 +485,10 @@ fields is a leaf, so the sweep only reaches it through a member's field
 release, which is an ordinary release on the collector's thread. refusing to
 run it there would trade a cleanup on an unchosen thread for no cleanup.
 
-what is left on the compiler side: a generic struct on the hook (the
-per-instance destructor needs the call spliced in), and the bounded leaks
-above, which are being closed one shape at a time.
+a generic struct is on the hook: each instance gets its own destructor,
+keyed by its field kinds and its specialized drop symbol, which calls the drop
+checked against that instance's type arguments. the checker walks a generic
+drop against every instance built and applies E318 after the first. what is
+left on the compiler side: the bounded leaks above, and refusing a struct
+literal with private fields outside its module, so a second value cannot be
+built over a live handle.

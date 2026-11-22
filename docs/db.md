@@ -204,6 +204,13 @@ out of protocol sync, so `rollback` discards the connection instead of returning
 it to the pool, and a `commit` on that transaction fails rather than pretending
 to succeed.
 
+a `Tx` that goes away without `commit` or `rollback` is rolled back by its
+destructor. the destructor cannot send `rollback`, because it must not do
+network i/o, so it closes the pinned connection instead and returns its slot to
+the pool. the server rolls back a transaction whose client has gone. this is a
+backstop: the connection is lost rather than reused, so finish a transaction
+explicitly on every path you can.
+
 `Tx` exposes the same `query` and `exec` as `Db`, so typed reads and
 `ExecResult` writes work exactly as they do outside a transaction.
 
@@ -223,9 +230,11 @@ stmt.close()
 ```
 
 a `Stmt` holds its connection for its whole lifetime, so close it when you are
-done — a long-lived one keeps a connection out of the pool. reach for a prepared
-statement on a hot path; plain `query`/`exec` already bind parameters safely for
-everything else.
+done — a long-lived one keeps a connection out of the pool. a `Stmt` that goes
+away without `close` has its connection closed by its destructor, which frees
+the statement on the server and returns the slot, but loses the connection.
+reach for a prepared statement on a hot path; plain `query`/`exec` already bind
+parameters safely for everything else.
 
 ## pooling and concurrency
 
@@ -239,6 +248,14 @@ the pool is guarded by a mutex, so many green tasks can share one `Db` and call
 `query`/`exec` concurrently. at most `pool` of them hold a connection at a time;
 the rest wait their turn. `close` drains the pool, closing every idle
 connection.
+
+a `Db` that is never closed still gives its sockets back. when the last copy
+of it goes (and every `Tx` and `Stmt` opened from it), the pool goes too, and
+each idle connection closes its socket from its own destructor. the same holds
+for a connection from `std.postgres`, `std.mysql` or `std.redis` used directly:
+dropping it without `close` closes its socket. a destructor never writes to the
+socket, so a tls connection closed that way sends no close_notify; call `close`
+for a clean shutdown.
 
 ## observability
 

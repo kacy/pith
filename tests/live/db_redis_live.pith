@@ -5,6 +5,7 @@
 # run with: pith test tests/live/db_redis_live.pith
 
 import std.redis as redis
+import std.fs as fs
 
 fn open_or_skip() -> redis.Client:
     attempt := redis.connect("127.0.0.1", 6379)
@@ -48,3 +49,20 @@ test "incr on a non-integer value surfaces an error":
     result := client.incr("pith:test:notanumber")
     client.del("pith:test:notanumber")!
     assert(result.is_err)
+
+# open a client, ping and let it go without close().
+fn dropped_round() -> Bool!:
+    client := redis.connect("127.0.0.1", 6379)!
+    client.ping()!
+    return true
+
+test "a client dropped without close gives its socket back":
+    probe := open_or_skip()
+    probe.close()
+    probe.close()
+    before := fs.list("/proc/self/fd").len()
+    mut i := 0
+    while i < 2000:
+        dropped_round()!
+        i = i + 1
+    assert(fs.list("/proc/self/fd").len() - before <= 2)

@@ -1,0 +1,54 @@
+# the io registries with every close() and free() left out.
+#
+# leak_io_text_registry is the annotated shape: build, use, close. this is the
+# same churn, plus the buffered bytes reader and writer, with the closers
+# missing, which is what a handler that forgot them or took an error exit past
+# them looks like. each of these types implements Drop, so its entries go back
+# when its last value dies at the end of the round and the maps stay flat.
+# before the destructors each round stranded about a dozen map entries for the
+# life of the task.
+import leakprobe as probe
+import std.io as io
+import std.bytes as bytes
+
+fn round(i: Int) -> Int:
+    reader := io.string_reader("abcdef-{i}")
+    first := reader.read(4) catch ""
+
+    buf := io.string_buffer()
+    buf.write("x-{i}") catch 0
+
+    cursor := io.bytes_reader(bytes.from_string_utf8("abc"))
+    chunk := cursor.read_bytes(2) catch bytes.empty()
+
+    # the source is held by the buffered reader's entry as well, so this also
+    # checks that the entry's release lets the source go
+    buffered := io.string_reader("hello world {i}").buffered()
+    second := buffered.read(5) catch ""
+
+    writer := io.string_buffer().buffered()
+    writer.write("y") catch 0
+
+    breader := io.bytes_reader(bytes.from_string_utf8("one two")).buffered()
+    third := breader.read_bytes(3) catch bytes.empty()
+
+    # a ByteBuffer has no destructor yet, so the buffer under the writer is
+    # freed by hand once the writer is done with it
+    sink := bytes.buffer()
+    defer sink.free()
+    bwriter := sink.buffered()
+    bwriter.write_bytes(bytes.from_string_utf8("z")) catch 0
+
+    return first.len() + chunk.len() + second.len() + third.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

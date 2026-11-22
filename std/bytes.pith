@@ -14,11 +14,14 @@ fn byte_buffer_handle(capacity: Int) -> Int:
 pub struct Utf8DecodeError:
     pub message: String
 
-# growable byte buffer for incremental writes.
+# growable byte buffer for incremental writes. free it with free(), or hand
+# its storage over with take_bytes(); it has no destructor (see
+# docs/ownership.md, "destructors").
 pub struct ByteBuffer:
     pub handle: Int
 
-# packed mutable byte storage for algorithms that need in-place state.
+# packed mutable byte storage for algorithms that need in-place state. the
+# storage is freed when the last value naming the array dies.
 pub struct ByteArray:
     pub handle: Int
 
@@ -228,6 +231,11 @@ impl ByteArray:
 
     fn clear():
         byte_buffer_clear(self.handle)
+
+# an array has no free() of its own: its storage goes when its last value dies.
+impl Drop for ByteArray:
+    fn drop():
+        byte_buffer_free(self.handle)
 
 test "bytes helpers wrap raw byte operations":
     data := from_string_utf8("pith")

@@ -794,6 +794,16 @@ impl WebSocket:
     fn is_closed() -> Bool:
         return self.closed.load() != 0
 
+# a session nobody closes is closed when its last value dies, as close_now()
+# closes it: a session that owns its socket closes the socket, and no close
+# frame goes out, since a destructor does no network io. the peer sees the
+# connection end without a close handshake, as it would from a crash. close()
+# first to send one. a session over a transport the caller handed in only
+# marks itself closed.
+impl Drop for WebSocket:
+    fn drop():
+        self.close_now()
+
 test "websocket computes handshake accept values":
     key := "dGhlIHNhbXBsZSBub25jZQ=="
     response := handshake_response(key)!

@@ -748,10 +748,11 @@ it checks are E268:
   the struct. the destructor is generated per declaration and spells the
   method symbol from the declaring module, which is also what keeps two
   modules' same-named structs from trading cleanup.
-- a generic struct cannot. its destructor is generated per instance from
-  the resolved field kinds, and there is no place in that body for a
-  method call yet. wrap the generic in a concrete struct if you need
-  both.
+- a generic struct can. each instance gets its own destructor, which
+  calls the `drop` checked against that instance's type arguments, so
+  `Guard[String]` and `Guard[List[Int]]` each run the body as written for
+  their own `T`. an enum cannot, generic or not: its destructor releases
+  tagged payloads rather than fields.
 - the impl declares exactly `fn drop()`, with no parameters and no
   return value, and nothing else beside it. the runtime calls it with the
   bare pointer and reads nothing back.
@@ -794,14 +795,38 @@ stands: an explicit `close()` still says *when* the resource goes back,
 which matters for a server config a listener is still handshaking on,
 and the destructor covers the caller that forgot or took an error exit
 past the call. a closer backed by a map removal is idempotent for free,
-and that is the shape every `Drop` type in std has.
+and that is the shape every `Drop` type in std has. an ecdh key pair's
+`close()` frees memory by address, and a later key can be given the same
+address, so the runtime cannot tell a second close from a close of the new
+key. the pair records the close in the value itself (its handle goes to -1),
+so the destructor after a close finds nothing to free.
+
+`std.bytes.ByteBuffer` would need the same record and has no destructor
+yet. `take_bytes()` hands its storage over and frees the box, so the buffer
+has to remember that it is spent, and writing that down is a field store in
+`free()`. the count checker (`count-marks-check-only`) cannot tell a store
+to an `Int` field from one that drops a counted value, so every list loop
+that can reach `free()` would fail its borrow check. the buffer can take a
+destructor once the checker can tell the two apart, or once `take_bytes()`
+leaves an empty box behind for the destructor to free. a `ByteArray` has
+no `take_bytes()` and does free its storage on drop.
+
+the io readers, writers and buffers, files, processes, byte arrays, ecdh
+key pairs and websocket sessions implement `Drop`; docs/io_foundation.md
+lists what each io type releases.
 
 `tests/cases/test_drop_hook` pins where the hook fires (scope exit, a
 rebind, a list or a struct field dying, a value returned to a caller),
 `tests/cases/test_drop_lend` what a `drop` body may still do with `self`,
+`tests/cases/test_drop_generic` the same points for a generic struct over
+several type arguments and across modules,
 `tests/invalid/drop_escape_*` the escapes E318 refuses, and
 `tests/leaks/leak_tls_config_drop` pins that a tls config built and never
-closed no longer holds its registry slot.
+closed no longer holds its registry slot. `tests/leaks/leak_io_registry_drop`
+and `tests/leaks/leak_byte_array_drop` do the same for the io registries,
+byte arrays and key pairs, and `tests/cases/test_io_drop_resources` counts
+open fds around files, child processes and websocket sessions that are
+never closed.
 
 ## weak references
 

@@ -775,8 +775,8 @@ fn handle_tls_conn(app: App, conn: tls.Conn):
 # listen_tls, so the handshake runs here rather than in the accept loop: a client
 # that never finishes one only ever costs itself, and a client that fails one
 # does not end the loop. tls.handshake closes the socket on its own failure.
-fn handshake_and_serve_tls_conn(app: App, listener_handle: Int, fd: Int) -> Bool!:
-    handle_tls_conn(app, tls.handshake(tls.listener_from_handle(listener_handle), fd)!)
+fn handshake_and_serve_tls_conn(app: App, listener: tls.Listener, fd: Int) -> Bool!:
+    handle_tls_conn(app, tls.handshake(listener, fd)!)
     return true
 
 # release a tls listener at the end of an accept loop, in the two halves a
@@ -791,20 +791,20 @@ fn release_tls_listener(listener: tls.Listener):
 # the concurrency slot taken for it at the accept: a handshake interrupted
 # mid-shutdown is still a client waiting, and a handshake that never finishes is
 # still a connection occupying the server.
-fn handle_tls_socket(app: App, listener_handle: Int, fd: Int):
+fn handle_tls_socket(app: App, listener: tls.Listener, fd: Int):
     defer shutdown.leave()
     defer release_connection_slot()
-    handshake_and_serve_tls_conn(app, listener_handle, fd) catch false
+    handshake_and_serve_tls_conn(app, listener, fd) catch false
 
 # hand an accepted tls socket to its own task, counted in the drain from the
 # accept — see spawn_conn for why the count cannot wait for the task to start,
 # and for why reaching MAX_CONNECTIONS refuses rather than stalls the loop.
-fn spawn_tls_conn(app: App, listener_handle: Int, fd: Int):
+fn spawn_tls_conn(app: App, listener: tls.Listener, fd: Int):
     if not claim_connection_slot(app.config):
         refuse_tls_conn(fd)
         return
     shutdown.enter()
-    spawn handle_tls_socket(app, listener_handle, fd)
+    spawn handle_tls_socket(app, listener, fd)
 
 impl App:
     # the router this app answers with.
@@ -1001,7 +1001,7 @@ impl App:
                 tcp.back_off_after_accept_failure(failures, accepted.err)!
                 continue
             failures = 0
-            spawn_tls_conn(app, listener.handle, accepted.ok)
+            spawn_tls_conn(app, listener, accepted.ok)
         # free the port before draining (see the plaintext listener above), but
         # only the port. the listener's binding to the tls config outlives the
         # accept loop, because a connection accepted a moment before the
@@ -1508,7 +1508,7 @@ test "an accepted tls connection is in the drain count before its handshake star
         served.push(accepted.ok)
         i = i + 1
     for fd in served:
-        spawn_tls_conn(app, listener.handle, fd)
+        spawn_tls_conn(app, listener, fd)
     # a connection still mid-handshake when a shutdown lands is a client waiting
     # for an answer, so it counts from the accept like any other.
     assert_eq(shutdown.inflight(), 4)
@@ -1651,7 +1651,7 @@ test "a tls connection holds a slot through its handshake and is refused past th
     # handshake has read a byte — a client that never completes one is still a
     # connection the server is carrying.
     mut clients: List[Int] := []
-    spawn_tls_conn(app, listener.handle, tls_socket_pair(listener, 19013, clients))
+    spawn_tls_conn(app, listener, tls_socket_pair(listener, 19013, clients))
     assert_eq(live_connections.load() - baseline, 1)
     assert_eq(shutdown.inflight(), 1)
     # the handshake fails once its peer is gone, and that path gives the slot
@@ -1666,7 +1666,7 @@ test "a tls connection holds a slot through its handshake and is refused past th
     mut refused_clients: List[Int] := []
     server_fd := tls_socket_pair(listener, 19013, refused_clients)
     refused_before := metrics.counter(OBS_CONNECTIONS_REFUSED).value()
-    spawn_tls_conn(app, listener.handle, server_fd)
+    spawn_tls_conn(app, listener, server_fd)
     # no task, no drain count, and no handshake — the certificate work is exactly
     # what the cap is refusing to spend.
     assert_eq(shutdown.inflight(), 0)

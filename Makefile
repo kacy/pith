@@ -1394,6 +1394,7 @@ MEMCHECK_OSTHREAD_CASES := \
 MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
 	tests/cases/test_drop_lend \
+	tests/cases/test_drop_generic \
 	tests/cases/test_result_box_shared_release \
 	tests/cases/test_optional_result_plain_payload \
 	tests/cases/test_crosskind_binding_release \
@@ -1849,6 +1850,14 @@ cli-regressions-only:
 	closed_out=$$(./target/release/pith lint --json "$$tmpdir/lint_closed.pith" 2>/dev/null); \
 	handoff_out=$$(./target/release/pith lint --json "$$tmpdir/lint_handoff.pith" 2>/dev/null); \
 	set -e; \
+	printf 'import std.json as json\n\nfn parse_one(text: String) -> Int:\n    scope := json.open_scope()\n    root := json.parse(text)\n    return 0\n\nfn main():\n    n := parse_one("1")\n    print("{n}")\n' > "$$tmpdir/lint_scope.pith"; \
+	printf 'import std.json as json\n\nfn parse_one(text: String) -> Int:\n    scope := json.open_scope()\n    defer json.close_scope(scope)\n    root := json.parse(text)\n    return 0\n\nfn main():\n    n := parse_one("1")\n    print("{n}")\n' > "$$tmpdir/lint_scope_closed.pith"; \
+	set +e; \
+	scope_out=$$(./target/release/pith lint --json "$$tmpdir/lint_scope.pith" 2>/dev/null); \
+	scope_closed_out=$$(./target/release/pith lint --json "$$tmpdir/lint_scope_closed.pith" 2>/dev/null); \
+	set -e; \
+	case "$$scope_out" in *'"code":"E307"'*) pass=$$((pass+1)); echo "ok   lint unclosed resource without drop";; *) echo "FAIL lint unclosed resource without drop"; fail=$$((fail+1));; esac; \
+	case "$$scope_closed_out" in *'"code":"E307"'*) echo "FAIL lint closed scope exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint closed scope exempt";; esac; \
 	case "$$open_out" in *'"code":"E307"'*) echo "FAIL lint drop type exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint drop type exempt";; esac; \
 	case "$$closed_out" in *'"code":"E307"'*) echo "FAIL lint deferred close exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint deferred close exempt";; esac; \
 	case "$$handoff_out" in *'"code":"E307"'*) echo "FAIL lint handed-off resource exempt"; fail=$$((fail+1));; *) pass=$$((pass+1)); echo "ok   lint handed-off resource exempt";; esac; \

@@ -27,8 +27,8 @@ PORT := 20791
 WORKERS := 40
 DIALS_PER_WORKER := 3
 
-fn serve_conn(listener_handle: Int, fd: Int):
-    conn_r := tls.listener_from_handle(listener_handle).handshake(fd)
+fn serve_conn(listener: tls.Listener, fd: Int):
+    conn_r := listener.handshake(fd)
     if conn_r.is_err:
         return
     conn := conn_r.ok
@@ -39,13 +39,12 @@ fn serve_conn(listener_handle: Int, fd: Int):
     conn.write_all("echo:" + msg_r.ok) catch 0
     conn.close()
 
-fn run_server(listener_handle: Int):
-    listener := tls.listener_from_handle(listener_handle)
+fn run_server(listener: tls.Listener):
     while true:
         fd_r := listener.accept_socket()
         if fd_r.is_err:
             return
-        spawn serve_conn(listener_handle, fd_r.ok)
+        spawn serve_conn(listener, fd_r.ok)
 
 fn dial_once(cfg: tls.Config, tag: String) -> Bool:
     conn_r := tls.dial_with_config("127.0.0.1", PORT, "localhost", cfg)
@@ -91,7 +90,7 @@ fn main() -> Int!:
     # accept loop picks it up. no sleeps, no readiness polling needed.
     server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.enable_session_resumption()
     listener := tls.listen("127.0.0.1", PORT, server_cfg)!
-    spawn run_server(listener.handle)
+    spawn run_server(listener)
 
     # each worker gets its own config, so each has its own client cache key.
     # the configs are built here rather than in the workers because the config

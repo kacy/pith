@@ -53,6 +53,8 @@ cases=(
   tests/leaks/leak_io_text_registry
   tests/leaks/leak_string_buffer_build
   tests/leaks/leak_websocket_session
+  tests/leaks/leak_io_registry_drop
+  tests/leaks/leak_byte_array_drop
   tests/leaks/leak_returned_shell_dtor
   tests/leaks/leak_weak_if_let_shell
   tests/leaks/leak_match_call_subject
@@ -130,6 +132,7 @@ cases=(
   tests/leaks/leak_generic_call_shapes
   tests/leaks/leak_generic_boundary
   tests/leaks/leak_generic_owner_method
+  tests/leaks/leak_generic_drop
   tests/leaks/leak_container_rebind
   tests/leaks/leak_optional_string_payload
   tests/leaks/leak_optional_literal_elements

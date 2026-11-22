@@ -1,0 +1,36 @@
+# byte arrays and ecdh key pairs with every close() left out.
+#
+# a ByteArray owns runtime storage with no count behind it, and an ecdh key
+# pair owns a boxed private key, so until each implemented Drop a value that
+# was never freed held its storage for the life of the process. a ByteArray
+# has no closer at all, so every one leaked. some pairs are closed first, so
+# the destructor that follows must find nothing left to free.
+import leakprobe as probe
+import std.bytes as bytes
+import std.crypto.ecdh as ecdh
+
+fn round(i: Int) -> Int:
+    arr := bytes.array_filled(64, 7) catch bytes.array()
+    big := bytes.array_with_capacity(256)
+    big.push(i % 256) catch 0
+
+    mut keys := 0
+    if i % 16 == 0:
+        pair := ecdh.x25519_keypair()
+        if pair.is_ok:
+            keys = pair.ok.public_key.len()
+            if i % 32 == 0:
+                pair.ok.close()
+    return arr.len() + big.len() + keys
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut acc := 0
+    while i < n:
+        acc = acc + round(i)
+        i = i + 1
+    if acc < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

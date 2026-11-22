@@ -1,0 +1,17 @@
+# a local declared outside a loop and handed over inside it is handed over
+# once per pass, so it is not moved (E248)
+struct Box:
+    items: List[String]
+
+fn boxed(b: Box) -> Int:
+    b.items.push("task")
+    return b.items.len()
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    mut tasks: List[Task[Int]] := []
+    for i in 0..4:
+        tasks.push(spawn boxed(Box(items: xs)))
+    for t in tasks:
+        print("{await t}")
+    return 0

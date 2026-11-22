@@ -1,0 +1,19 @@
+# a closure made in a generic body captures a struct holding a list (E248)
+struct Bag:
+    items: List[String]
+
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn grow[T](b: Bag, x: T) -> Int:
+    work := fn() -> Int:
+        b.items.push("task")
+        return b.items.len()
+    t := spawn run(work)
+    b.items.push("main")
+    return await t
+
+fn main() -> Int!:
+    b := Bag(items: [])
+    print("{grow(b, 1)}")
+    return 0

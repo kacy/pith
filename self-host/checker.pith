@@ -228,6 +228,11 @@ mut guarded_aliases: Map[Int, String] := {}
 # whether a function returns one of its parameters, or a path through one, by
 # declaration node
 mut returns_parameter_cache: Map[Int, Bool] := {}
+# the types each node of a generic body took in the specializations the check
+# walked. a generic body keeps no expression types of its own, so the sharing
+# pass reads these to judge what the body shares with another task.
+mut generic_node_tids: Map[Int, List[Int]] := {}
+mut recording_generic_types := false
 # argument expressions the checker accepted by widening a plain value into
 # the optional its parameter declares (`f(3)` against `fn f(x: Int?)`).
 # the emitter has no view of a callee's declared parameter types once the
@@ -299,6 +304,8 @@ pub fn initialize_checker(file_path: String):
     struct_field_writes = {}
     guarded_aliases = {}
     returns_parameter_cache = {}
+    generic_node_tids = {}
+    recording_generic_types = false
     shared_field_sites = []
     shared_field_site_seen = {}
     locked_paths = []
@@ -2642,6 +2649,30 @@ fn check_body_holding(decl: Node, body_idx: Int, scope_id: Int):
     check_function_body(body_idx, scope_id)
     locked_paths = saved
     check_guard_rules(body_idx)
+    if recording_generic_types:
+        record_generic_types(body_idx)
+
+# add the types one specialization gave a generic body's nodes to the ones the
+# others gave
+fn record_generic_types(idx: Int):
+    if expression_type_cache.contains_key(idx):
+        tid := expression_type_cache[idx]
+        if not is_error_type(tid):
+            if generic_node_tids.contains_key(idx):
+                if not generic_node_tids[idx].contains(tid):
+                    generic_node_tids[idx].push(tid)
+            else:
+                generic_node_tids.insert(idx, [tid])
+    for child in get_node(idx).children:
+        record_generic_types(child)
+
+## the types a node of a generic body took in each specialization the check
+## walked, or [] for a node outside a generic body or one never walked
+pub fn c_generic_node_tids(idx: Int) -> List[Int]:
+    if generic_node_tids.contains_key(idx):
+        return generic_node_tids[idx]
+    mut none_found: List[Int] := []
+    return none_found
 
 fn is_mutex_or_mutex_list(t: Int) -> Bool:
     if get_type_name(t) == "Mutex":
@@ -8468,6 +8499,12 @@ fn check_spawn_shared_collections(call_node: Node, first_arg: Int, scope_id: Int
 # E248 for a value handed to another task, by `spawn` or by a channel send,
 # that this scope still holds a handle to. `refused` starts the message.
 fn report_shared_handoff(expr_idx: Int, refused: String, scope_id: Int):
+    node := get_node(expr_idx)
+    # a local or a parameter handed over whole may be moved: nothing else holds
+    # it and the scope does not use it again. the sharing pass judges that
+    # (alias_sharing_errors in sharing_lint.pith), with the whole program.
+    if (node.kind == "ident" and not binding_is_module_level(scope_id, node.value)) or node.kind == "self":
+        return
     if not spawn_arg_shares_collection(expr_idx):
         kind := get_node(expr_idx).kind
         if kind == "ident" or kind == "field_access" or kind == "index":
@@ -8475,20 +8512,22 @@ fn report_shared_handoff(expr_idx: Int, refused: String, scope_id: Int):
         return
     tid := c_get_expr_type(expr_idx)
     kind := get_type_info(tid).kind
-    node := get_node(expr_idx)
     # a module global is held by the whole program, so handing it over shares
     # its buffer as surely as handing over a local does. the message names
     # the global, since nothing in the function looks like it holds it.
-    if node.kind == "ident" and binding_is_module_level(scope_id, node.value):
+    if node.kind == "ident":
         what := "the module global '" + node.value + "'"
         if kind == "list" or kind == "map" or kind == "set":
-            report_error_with_fix_at(expr_idx, "E248", refused + " " + what + ", a " + kind + " every task can reach; both would mutate the same buffer", "pass a copy (copy_" + kind + "(" + node.value + ")), or let the task read the global itself and keep a global that tasks write in a `guard` block")
+            report_error_with_fix_at(expr_idx, "E248", refused + " " + what + ", a " + kind + " every task can reach; both would mutate the same buffer", "let the task read the global itself, and keep a global that tasks write in a `guard` block")
             return
     if kind == "list" or kind == "map" or kind == "set":
         report_error_with_fix_at(expr_idx, "E248", refused + " a " + kind + " this scope still holds; both threads would mutate the same buffer", "pass a copy (copy_" + kind + "), or build the value in the call")
         return
     mut seen: Map[Int, Bool] := {}
-    path := struct_holds_unguarded_collection(tid, seen)
+    path := buffer_path(tid, seen)
+    if path == ".":
+        report_error_with_fix_at(expr_idx, "E248", refused + " this " + get_type_name(tid) + ", which holds a collection this scope still holds; both threads would mutate the same buffer", "hand over a copy built in the call")
+        return
     report_error_with_fix_at(expr_idx, "E248", refused + " this " + get_type_name(tid) + ": its field '" + path + "' is a collection outside a `guard` block, and both threads would reach the same buffer", "move the field into a `guard` block, or hand over a copy built in the call")
 
 # true when the argument names a collection some other scope keeps a
@@ -8500,35 +8539,55 @@ fn spawn_arg_shares_collection(expr_idx: Int) -> Bool:
         return false
     return holds_shared_buffer_type(c_get_expr_type(expr_idx))
 
-# the first field path under a struct type that reaches a list, a map or a set
-# outside a `guard` block, or "". a struct field or an optional struct is
-# followed into, once per type.
-fn struct_holds_unguarded_collection(tid: Int, seen: Map[Int, Bool]) -> String:
+# the path under a type to a list, a map or a set outside a `guard` block, or
+# "" when it reaches none. the path is "." when the type is a collection or
+# wraps one with no field on the way (an optional list). struct fields,
+# optional elements, tuple elements, enum payloads and the implementers of an
+# interface value are followed, each struct and enum once.
+fn buffer_path(tid: Int, seen: Map[Int, Bool]) -> String:
+    if tid < 0 or is_error_type(tid):
+        return ""
     info := get_type_info(tid)
+    if info.kind == "list" or info.kind == "map" or info.kind == "set":
+        return "."
     if info.kind == "optional" and info.inner >= 0:
-        return struct_holds_unguarded_collection(info.inner, seen)
-    if info.kind != "struct" or seen.contains_key(tid):
+        return buffer_path(info.inner, seen)
+    if info.kind == "tuple":
+        for elem, i in info.elements:
+            inner := buffer_path(elem, seen)
+            if inner != "":
+                return join_buffer_path(i.to_string(), inner)
+        return ""
+    if (info.kind != "struct" and info.kind != "enum") or seen.contains_key(tid):
         return ""
     seen.insert(tid, true)
+    if info.kind == "enum":
+        for payload, i in info.variant_types:
+            for ptid in payload:
+                inner := buffer_path(ptid, seen)
+                if inner != "":
+                    return join_buffer_path(info.variants[i], inner)
+        return ""
     # an interface value may hold any type that implements it, so it shares a
     # buffer when any of them does
     if is_interface_value_type(tid):
         for impl_tid in interface_implementer_tids(info.name):
-            inner := struct_holds_unguarded_collection(impl_tid, seen)
+            inner := buffer_path(impl_tid, seen)
             if inner != "":
-                return get_type_name(impl_tid) + "." + inner
+                return join_buffer_path(get_type_name(impl_tid), inner)
         return ""
     for fname, i in info.fields:
         if struct_field_guards.contains_key(tid.to_string() + "." + fname) or struct_field_frozen.contains_key(tid.to_string() + "." + fname):
             continue
-        ftid := info.field_types[i]
-        fkind := get_type_info(ftid).kind
-        if fkind == "list" or fkind == "map" or fkind == "set":
-            return fname
-        inner := struct_holds_unguarded_collection(ftid, seen)
+        inner := buffer_path(info.field_types[i], seen)
         if inner != "":
-            return fname + "." + inner
+            return join_buffer_path(fname, inner)
     return ""
+
+fn join_buffer_path(head: String, rest: String) -> String:
+    if rest == ".":
+        return head
+    return head + "." + rest
 
 # ---------------------------------------------------------------
 # reassigned fields shared across tasks (E248, E276)
@@ -8677,13 +8736,23 @@ pub fn capture_refusal(tid: Int) -> String:
     if kind == "list" or kind == "map" or kind == "set":
         return "a " + kind
     mut seen: Map[Int, Bool] := {}
-    path := struct_holds_unguarded_collection(tid, seen)
+    path := buffer_path(tid, seen)
+    if path == ".":
+        return "a " + get_type_name(tid) + " holding a collection"
     if path != "":
         return "a " + get_type_name(tid) + " whose field '" + path + "' is a collection outside a `guard` block"
     reassigned := reassigned_field_of(tid)
     if reassigned != "":
         return "a " + get_type_name(tid) + " whose field " + reassigned
     return ""
+
+## whether a struct type's field is declared `frozen`
+pub fn is_frozen_field(tid: Int, fname: String) -> Bool:
+    return struct_field_frozen.contains_key(tid.to_string() + "." + fname)
+
+## whether a struct type's field is declared in a `guard` block
+pub fn is_guarded_field(tid: Int, fname: String) -> Bool:
+    return struct_field_guards.contains_key(tid.to_string() + "." + fname)
 
 ## the struct types an interface value type may hold, or [] for any other type
 pub fn interface_value_implementers(tid: Int) -> List[Int]:
@@ -9331,6 +9400,7 @@ fn drain_generic_body_worklist():
     if generic_body_check_mode == "count":
         prev_severity = checker_set_severity_override("warning")
     checker_begin_dedup()
+    recording_generic_types = true
     mut i := 0
     while i < generic_body_worklist.len():
         entry := generic_body_worklist[i]
@@ -9340,6 +9410,7 @@ fn drain_generic_body_worklist():
             check_worklist_entry(entry)
     generic_body_worklist = []
     generic_body_queued = {}
+    recording_generic_types = false
     checker_end_dedup()
     if generic_body_check_mode == "count":
         checker_set_severity_override(prev_severity)
@@ -9648,19 +9719,17 @@ fn check_frozen_writes(idx: Int):
     for child in node.children:
         check_frozen_writes(child)
 
-# whether a value of type `tid` reaches a buffer another task could change:
-# a collection, or a struct that reaches one outside a guard block
-fn holds_shared_buffer_type(tid: Int) -> Bool:
+## whether a value of type `tid` reaches a buffer another task could change:
+## a collection, or a struct, tuple, optional or enum that reaches one outside
+## a guard block
+pub fn holds_shared_buffer_type(tid: Int) -> Bool:
     if tid < 0 or is_error_type(tid):
         return false
-    kind := get_type_info(tid).kind
-    if kind == "list" or kind == "map" or kind == "set":
-        return true
     mut seen: Map[Int, Bool] := {}
-    return struct_holds_unguarded_collection(tid, seen) != ""
+    return buffer_path(tid, seen) != ""
 
 # the builtin methods that hand back part of their receiver
-ELEMENT_ACCESSORS := ",get,first,last,unwrap,unwrap_or,expect,values,"
+ELEMENT_ACCESSORS := ",get,first,last,unwrap,unwrap_or,expect,value,values,"
 
 # the expressions that can read a guarded value: a path, or a call that hands
 # back part of a guarded argument
@@ -9677,8 +9746,8 @@ fn escaping_guarded_read(idx: Int) -> String:
         return ""
     return guarded_segment(idx)
 
-# the first guarded field or guarded global a path passes through, or ""
-fn guarded_segment(idx: Int) -> String:
+## the first guarded field or guarded global a path passes through, or ""
+pub fn guarded_segment(idx: Int) -> String:
     node := get_node(idx)
     if node.kind == "ident":
         if definition_of.contains_key(idx):
@@ -9758,10 +9827,12 @@ fn path_root_node(idx: Int) -> Int:
 # a name bound inside a `locked` block from a guarded value reaches it for the
 # rest of the block: a local bound to it, a loop variable over it, or a
 # pattern binding of it
-fn note_guarded_alias_at(idx: Int, node: Node):
+fn note_guarded_alias_at(idx: Int, node: Node, block: Int):
     if node.kind == "binding" and node.children.len() > 0:
-        name := guarded_segment(node.children[node.children.len() - 1])
-        if name != "":
+        value := node.children[node.children.len() - 1]
+        name := guarded_segment(value)
+        # a value the block takes out of its guard is no longer guarded
+        if name != "" and not block_replaces(block, value):
             guarded_aliases.insert(idx, name)
     elif node.kind == "for_stmt" and node.children.len() >= 3:
         name := guarded_segment(node.children[0])
@@ -9802,7 +9873,7 @@ fn report_escape(at: Int, name: String, how: String):
 
 fn check_escape_sites(idx: Int, inner: Map[String, Bool], locked_idx: Int, fn_body: Int, block: Int):
     node := get_node(idx)
-    note_guarded_alias_at(idx, node)
+    note_guarded_alias_at(idx, node, block)
     if node.kind == "assignment" and node.children.len() >= 2:
         name := escaping_guarded_read(node.children[1])
         target := get_node(node.children[0])
@@ -9830,13 +9901,34 @@ fn check_escape_sites(idx: Int, inner: Map[String, Bool], locked_idx: Int, fn_bo
     for child in node.children:
         check_escape_sites(child, inner, locked_idx, fn_body, block)
 
-# whether the block assigns the path read at `read_idx` a new value, which
-# makes reading it out a take
-fn block_replaces(block: Int, read_idx: Int) -> Bool:
+## whether a `locked` block takes the value read at `read_idx` out of its
+## guard: it assigns the path a new value, or removes the element read
+## (`v = xs[k]` then `xs.remove(k)`)
+pub fn block_replaces(block: Int, read_idx: Int) -> Bool:
     path := locked_path_text(read_idx)
     if path == "":
         return false
-    return assigns_path(block, path, read_idx)
+    if assigns_path(block, path, read_idx):
+        return true
+    node := get_node(read_idx)
+    if node.kind == "index" and node.children.len() == 2:
+        return removes_element(block, locked_path_text(node.children[0]), get_node(node.children[1]).value)
+    return false
+
+# whether a subtree calls `remove(key)` on the list at `path`
+fn removes_element(idx: Int, path: String, key: String) -> Bool:
+    node := get_node(idx)
+    if node.kind == "method_call" and node.value == "remove" and node.children.len() == 2 and locked_path_text(node.children[0]) == path:
+        arg_idx := node.children[1]
+        mut arg := get_node(arg_idx)
+        if arg.kind == "arg" and arg.children.len() > 0:
+            arg = get_node(arg.children[0])
+        if (arg.kind == "ident" or arg.kind == "int_lit") and arg.value == key:
+            return true
+    for child in node.children:
+        if removes_element(child, path, key):
+            return true
+    return false
 
 fn assigns_path(idx: Int, path: String, read_idx: Int) -> Bool:
     node := get_node(idx)

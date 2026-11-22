@@ -1,8 +1,16 @@
 # a value sent through a channel reaches the receiving task, so a list or a
-# struct reaching one that the sender still holds is refused (E248)
+# struct reaching one that the sender uses again is refused (E248)
 struct Batch:
     id: Int
     rows: List[Int]
+
+fn drain(lists: Channel[List[Int]], batches: Channel[Batch]) -> Int:
+    mut n := 0
+    if let xs = lists.recv():
+        n = n + xs.len()
+    if let b = batches.recv():
+        n = n + b.rows.len()
+    return n
 
 fn main() -> Int!:
     lists := Channel[List[Int]](1)
@@ -11,5 +19,8 @@ fn main() -> Int!:
     lists.send(data)
     b := Batch(id: 1, rows: [4])
     batches.try_send(b)
+    t := spawn drain(lists, batches)
     print(data.len().to_string())
+    print(b.rows.len().to_string())
+    print((await t).to_string())
     return 0

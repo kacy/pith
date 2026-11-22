@@ -1,0 +1,19 @@
+# a closure returned as a task's result was made on that task and runs on
+# the one that awaits it, so it is judged like a sent value (E248)
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn make() -> fn() -> Int:
+    mut xs: List[String] := []
+    return fn() -> Int:
+        xs.push("item")
+        return xs.len()
+
+fn main() -> Int!:
+    t := spawn make()
+    f := await t
+    t2 := spawn run(f)
+    n := f()
+    m := await t2
+    print("{n} {m}")
+    return 0

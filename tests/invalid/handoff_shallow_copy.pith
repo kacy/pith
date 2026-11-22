@@ -1,0 +1,14 @@
+# a shallow copy of a list of lists shares the inner lists (E248)
+from std.collections import copy_list
+
+fn worker(xss: List[List[String]]) -> Int:
+    xss[0].push("task")
+    return xss.len()
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    mut xss: List[List[String]] := [xs]
+    t := spawn worker(copy_list(xss))
+    xs.push("main")
+    print("{await t}")
+    return 0

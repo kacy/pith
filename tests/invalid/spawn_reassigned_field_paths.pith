@@ -1,7 +1,8 @@
 # a reassigned counted field is found through every path a handed-over value
 # reaches it by: a nested struct, an optional, an enum payload, a tuple, a map
 # element, an interface value's implementer, and a generic struct, where a
-# write through one instance counts for all of them (E248)
+# write through one instance counts for all of them (E248). each value is
+# still held by another name or used again, so none of them is moved.
 struct Inner:
     label: String
 
@@ -78,5 +79,6 @@ fn main() -> Int!:
     t5 := spawn use_inner(table["k"])
     t6 := spawn use_box(box)
     t7 := spawn use_named(named)
+    print("{box.note} {named.name()}")
     print("{await t1 + await t2 + await t3 + await t4 + await t5 + await t6 + await t7}")
     return 0

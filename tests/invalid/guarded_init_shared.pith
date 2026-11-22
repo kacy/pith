@@ -1,0 +1,18 @@
+# a guarded field set when its struct is built takes a list the scope uses
+# again, which then reaches the list outside the lock (E276)
+struct Registry:
+    guard mu:
+        items: List[String]
+
+fn worker(r: Registry) -> Int:
+    locked r.mu:
+        r.items.push("task")
+    return 0
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    r := Registry(items: xs)
+    t := spawn worker(r)
+    xs.push("main")
+    print("{await t}")
+    return 0

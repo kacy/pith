@@ -1,0 +1,18 @@
+# a closure made in a generic body is judged by the types its captures take
+# in each specialization: an unannotated local holding a list (E248)
+fn run(f: fn() -> Int) -> Int:
+    return f()
+
+fn fan[T](xs: List[T], item: T) -> Int:
+    ys := xs
+    work := fn() -> Int:
+        ys.push(item)
+        return ys.len()
+    t := spawn run(work)
+    xs.push(item)
+    return await t
+
+fn main() -> Int!:
+    mut xs: List[String] := []
+    print("{fan(xs, "a")}")
+    return 0

@@ -39,7 +39,7 @@ fn temp_file_path(prefix: String, ext: String) -> String:
 fn save_demo_download(output_path: String) -> String!:
     response_reader := io.bytes_reader(http.text(200, "saved").to_bytes()!).buffered_chunked(4)
     request_writer := bytes.buffer().buffered_chunked(4)
-    conn := ClientConn(io.from_fd(1), response_reader, request_writer)
+    conn := ClientConn(io.from_fd(-1), response_reader, request_writer)
     conn.send_to_file(http.get_request("example.test", 80, "/download"), output_path)!
     return ""
 

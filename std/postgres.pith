@@ -94,20 +94,20 @@ struct Message:
 
 # an open connection to a postgres server; `buf` holds bytes read past the
 # current message. when `secure` is set the socket was upgraded by connect_tls
-# and all reads and writes go through the tls session identified by `tls_handle`.
+# and all reads and writes go through the tls session in `tls_conn`.
 pub struct Conn:
     fd: Int
     mut buf: Bytes
     mut pos: Int
     secure: Bool
-    tls_handle: Int
+    tls_conn: tls.Conn
 
 impl Conn:
     # read one chunk from the transport: the tls session when secure, the plain
     # socket otherwise.
     fn recv_chunk() -> Bytes!:
         if self.secure:
-            return tls.conn_from_handle(self.tls_handle).read_bytes(4096)!
+            return self.tls_conn.read_bytes(4096)!
         return tcp_read_bytes(self.fd, 4096)!
 
     # read exactly `n` bytes, pulling more from the transport as needed. the
@@ -149,7 +149,7 @@ impl Conn:
     # socket otherwise.
     fn send_raw(data: Bytes) -> Int!:
         if self.secure:
-            return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
+            return self.tls_conn.write_all_bytes(data)!
         return tcp.write_all_bytes(self.fd, data)!
 
     # frame and send a message. a `type_byte` of 0 omits the type prefix, as the
@@ -165,7 +165,7 @@ impl Conn:
     # close the connection.
     pub fn close():
         if self.secure:
-            tls.conn_from_handle(self.tls_handle).close()
+            self.tls_conn.close()
         tcp_close(self.fd)
 
 # a string followed by a null terminator, the wire's cstring form.
@@ -199,7 +199,7 @@ fn error_text(payload: Bytes) -> String:
 # open a connection and complete the startup handshake and authentication.
 pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
     fd := tcp_connect(host, port)!
-    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_handle: 0)
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_conn: tls.no_conn())
     # the conn now owns the socket, but nothing closes it until the caller does.
     # if the handshake fails the caller never sees this conn, so close the socket
     # here rather than leak it on every failed dial.
@@ -234,13 +234,13 @@ pub fn connect_tls(host: String, port: Int, user: String, password: String, data
         tcp_close(fd)
         fail session_result.err
     session := session_result.ok
-    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: true, tls_handle: session.handle)
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: true, tls_conn: session)
     # from here the tls session owns the socket and will close it. on a failed
     # handshake close through the session once — not conn.close(), which would
     # also tcp_close the same fd a second time.
     started := conn.handshake(user, password, database)
     if started.is_err:
-        tls.conn_from_handle(session.handle).close()
+        session.close()
         fail started.err
     return conn
 
@@ -805,12 +805,12 @@ test "read_message rejects a length below its own header":
     # would ask recv_exact for a negative payload. the frame is pre-buffered,
     # so no real socket is touched.
     framed := bytes.concat(bytes.from_string_utf8("E"), be32(3))
-    conn := Conn(fd: -1, buf: framed, pos: 0, secure: false, tls_handle: 0)
+    conn := Conn(fd: -1, buf: framed, pos: 0, secure: false, tls_conn: tls.no_conn())
     assert(conn.read_message().is_err)
 
 test "read_message rejects a length beyond the cap":
     # a frame length just past MAX_MESSAGE_LEN must be refused before it drives
     # a read. the frame is pre-buffered, so no real socket is touched.
     framed := bytes.concat(bytes.from_string_utf8("D"), be32(MAX_MESSAGE_LEN + 1))
-    conn := Conn(fd: -1, buf: framed, pos: 0, secure: false, tls_handle: 0)
+    conn := Conn(fd: -1, buf: framed, pos: 0, secure: false, tls_conn: tls.no_conn())
     assert(conn.read_message().is_err)

@@ -197,7 +197,7 @@ fn raw_item(wire: Bytes) -> Outbound:
 
 # an http/2 connection over one transport. it mirrors the client's Connection but
 # reads requests rather than responses. `transport` selects the byte transport:
-# TRANSPORT_TCP uses `fd` (cleartext h2c), TRANSPORT_TLS uses `tls_handle` (h2
+# TRANSPORT_TCP uses `fd` (cleartext h2c), TRANSPORT_TLS uses `tls_conn` (h2
 # over tls), and TRANSPORT_OFFLINE preloads `buf` with a constructed request
 # stream and records writes into `sent` so the frame tests drive the codec with
 # no socket. `buf`/`pos` coalesce partial reads (a frame can span reads). the
@@ -208,10 +208,15 @@ fn raw_item(wire: Bytes) -> Outbound:
 # buffer sits under read_mu, which the reader holds for each frame. only the
 # reader takes it, so it is never contended; it is what lets the checker see
 # that no other task reaches `buf` while the reader replaces it.
+#
+# the tls session belongs to the caller that handed it in (serve_h2_tls_*), and
+# an h2c socket to the caller of serve_h2c_*; both serve paths close the
+# connection on their way out. the drop below is the backstop for an h2c
+# socket; a tls session releases itself through tls.Conn's own drop.
 struct ServerConn:
-    mut fd: Int
-    mut tls_handle: Int
-    mut transport: Int
+    fd: Int
+    tls_conn: tls.Conn
+    transport: Int
     guard read_mu:
         mut buf: Bytes
         mut pos: Int
@@ -223,17 +228,16 @@ struct ServerConn:
 
 # build a live server connection over an accepted cleartext tcp socket (h2c).
 fn new_live_server_conn(fd: Int) -> ServerConn:
-    return ServerConn(fd: fd, tls_handle: 0, transport: TRANSPORT_TCP, buf: bytes.empty(), pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
+    return ServerConn(fd: fd, tls_conn: tls.no_conn(), transport: TRANSPORT_TCP, buf: bytes.empty(), pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
-# build a live server connection over an accepted tls session (h2 via alpn). the
-# handle addresses the same tls session the h2 client reads and writes over.
-fn new_tls_server_conn(handle: Int) -> ServerConn:
-    return ServerConn(fd: 0, tls_handle: handle, transport: TRANSPORT_TLS, buf: bytes.empty(), pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
+# build a live server connection over an accepted tls session (h2 via alpn).
+fn new_tls_server_conn(session: tls.Conn) -> ServerConn:
+    return ServerConn(fd: 0, tls_conn: session, transport: TRANSPORT_TLS, buf: bytes.empty(), pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # build an offline server connection that reads `data` as if it arrived from a
 # client. used by the tests to drive the reader over a constructed frame stream.
 fn server_conn_from_bytes(data: Bytes) -> ServerConn:
-    return ServerConn(fd: 0, tls_handle: 0, transport: TRANSPORT_OFFLINE, buf: data, pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
+    return ServerConn(fd: 0, tls_conn: tls.no_conn(), transport: TRANSPORT_OFFLINE, buf: data, pos: 0, sent: bytes.empty(), encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 impl ServerConn:
     # the hpack encoder and decoder, under hpack_mu: the reader decodes, and
@@ -253,7 +257,7 @@ impl ServerConn:
     # the connection's socket, whichever transport it runs over.
     fn socket_fd() -> Int:
         if self.transport == TRANSPORT_TLS:
-            return tls.Conn(self.tls_handle).socket()
+            return self.tls_conn.socket()
         return self.fd
 
     # read one transport chunk: from the tcp socket or the tls session when live,
@@ -263,7 +267,7 @@ impl ServerConn:
         if self.transport == TRANSPORT_TCP:
             return tcp_read_bytes(self.fd, RECV_CHUNK)!
         if self.transport == TRANSPORT_TLS:
-            return tls.conn_from_handle(self.tls_handle).read_bytes(RECV_CHUNK)!
+            return self.tls_conn.read_bytes(RECV_CHUNK)!
         return bytes.empty()
 
     # ensure at least `n` unread bytes are buffered, pulling transport chunks as
@@ -330,7 +334,7 @@ impl ServerConn:
         if self.transport == TRANSPORT_TCP:
             return tcp.write_all_bytes(self.fd, data)!
         if self.transport == TRANSPORT_TLS:
-            return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
+            return self.tls_conn.write_all_bytes(data)!
         locked self.sent_mu:
             self.sent = bytes.concat(self.sent, data)
         return data.len()
@@ -380,14 +384,21 @@ impl ServerConn:
         if self.transport == TRANSPORT_TCP:
             tcp_shutdown(self.fd)
         elif self.transport == TRANSPORT_TLS:
-            tls.conn_from_handle(self.tls_handle).shutdown_transport()
+            self.tls_conn.shutdown_transport()
 
-    # close the underlying transport.
+    # close the underlying transport. a second close does nothing.
     fn close():
         if self.transport == TRANSPORT_TCP:
             tcp_close(self.fd)
         elif self.transport == TRANSPORT_TLS:
-            tls.conn_from_handle(self.tls_handle).close()
+            self.tls_conn.close()
+
+# an h2c connection nobody closed gives back its socket when the last value
+# naming it goes away. no GOAWAY: a drop must not do network i/o.
+impl Drop for ServerConn:
+    fn drop():
+        if self.transport == TRANSPORT_TCP:
+            tcp_close(self.fd)
 
 # the SETTINGS frame the server opens with: it advertises the concurrent-stream
 # cap, the default flow-control window, and the default max frame size (so a
@@ -1443,7 +1454,7 @@ fn serve_h2_tls_session(tls_conn: tls.Conn, handlers: Handlers):
     if tls_conn.negotiated_protocol() != "h2":
         tls_conn.close()
         return
-    conn := new_tls_server_conn(tls_conn.handle)
+    conn := new_tls_server_conn(tls_conn)
     run_connection(conn, handlers) catch false
     conn.close()
 
@@ -1458,8 +1469,8 @@ fn release_tls_listener(listener: tls.Listener):
 # handshake an accepted socket and serve it. split out from serve_h2_tls_slot so
 # the failure path is a plain `!` — a handshake that fails closes the socket and
 # leaves nothing for the caller to clean up.
-fn handshake_and_serve_h2_tls(listener_handle: Int, fd: Int, handlers: Handlers) -> Bool!:
-    serve_h2_tls_session(tls.handshake(tls.listener_from_handle(listener_handle), fd)!, handlers)
+fn handshake_and_serve_h2_tls(listener: tls.Listener, fd: Int, handlers: Handlers) -> Bool!:
+    serve_h2_tls_session(tls.handshake(listener, fd)!, handlers)
     return true
 
 # handshake_and_serve_h2_tls with the accept loop's permit released at the end.
@@ -1468,19 +1479,19 @@ fn handshake_and_serve_h2_tls(listener_handle: Int, fd: Int, handlers: Handlers)
 # back on the handshake's failure path too. a client that can leak one permit per
 # connection stops the server accepting after MAX_CONNECTIONS attempts, which is
 # the same denial of service the accept loop was fixed for, only slower.
-fn serve_h2_tls_slot(listener_handle: Int, fd: Int, handlers: Handlers):
+fn serve_h2_tls_slot(listener: tls.Listener, fd: Int, handlers: Handlers):
     defer shutdown.leave()
     defer connection_slots.release()
-    handshake_and_serve_h2_tls(listener_handle, fd, handlers) catch false
+    handshake_and_serve_h2_tls(listener, fd, handlers) catch false
 
 # hand an accepted tls socket to its own task, permit and drain count taken here
 # on the accept loop — see spawn_h2c_conn for why the count cannot wait for the
 # task to start. a connection still mid-handshake when a shutdown lands is a
 # client waiting for an answer, so it counts from the accept like any other.
-fn spawn_h2_tls_conn(listener_handle: Int, fd: Int, handlers: Handlers):
+fn spawn_h2_tls_conn(listener: tls.Listener, fd: Int, handlers: Handlers):
     connection_slots.acquire()
     shutdown.enter()
-    spawn serve_h2_tls_slot(listener_handle, fd, handlers)
+    spawn serve_h2_tls_slot(listener, fd, handlers)
 
 # bind host:port for http/2 over tls and serve forever. it builds a tls server
 # config from the pem `cert`/`key` files, offers alpn "h2" (and "http/1.1", which
@@ -1521,7 +1532,7 @@ fn listen_h2_tls_loop(host: String, port: Int, cert: String, key: String, handle
             tcp.back_off_after_accept_failure(failures, accepted.err)!
             continue
         failures = 0
-        spawn_h2_tls_conn(listener.handle, accepted.ok, handlers)
+        spawn_h2_tls_conn(listener, accepted.ok, handlers)
     # free the port before draining (see listen_h2c above), but only the port.
     # the listener's binding to the tls config outlives the accept loop: a
     # connection accepted a moment before the shutdown has not necessarily
@@ -2113,7 +2124,7 @@ test "an accepted tls connection is in the drain count before its handshake star
         served.push(accepted.ok)
         i = i + 1
     for fd in served:
-        spawn_h2_tls_conn(listener.handle, fd, buffered(ok_handler))
+        spawn_h2_tls_conn(listener, fd, buffered(ok_handler))
     # a connection still mid-handshake is a client waiting for an answer, and it
     # counts from the accept — not from whenever the runtime starts its task.
     assert_eq(shutdown.inflight(), 4)

@@ -101,9 +101,9 @@ pub struct Response:
 
 # --- connection ---
 
-# a synchronous http/2 connection over one transport. the handle addresses the
-# tls session over tls, or the raw socket fd when `plaintext` (h2c); `live` marks
-# it connected either way. when not live the connection reads from a preloaded
+# a synchronous http/2 connection over one transport: the tls session in
+# `tls_conn`, or the raw socket `fd` when `plaintext` (h2c); `live` marks it
+# connected either way. when not live the connection reads from a preloaded
 # `buf` and records writes in `sent`, which the tests drive. `buf` and `pos` are
 # the receive buffer coalescing partial socket reads (frames can span reads), and
 # the encoder/decoder carry the two hpack dynamic tables.
@@ -113,11 +113,16 @@ pub struct Response:
 # and read_mu is held for each frame it reads. one task reads at a time, so the
 # lock is never contended; it is what lets the checker see that a task replacing
 # `buf` cannot free the buffer another task is slicing.
+#
+# the connection owns its transport. close() releases it, and a connection
+# nobody closed releases it when the last value naming it goes away: the tls
+# session through tls.Conn's own drop, an h2c socket through Connection's.
 pub struct Connection:
-    mut tls_handle: Int
+    tls_conn: tls.Conn
+    fd: Int
     mut live: Bool
     mut next_stream_id: Int
-    # true for an h2c (plaintext) connection: the handle is a raw socket fd and
+    # true for an h2c (plaintext) connection: `fd` is a raw socket and
     # transport i/o goes through tcp rather than the tls session.
     mut plaintext: Bool
     # the most a unary response body may hold (see MAX_RESPONSE_BODY).
@@ -131,18 +136,18 @@ pub struct Connection:
         mut encoder: hpack.Encoder
         mut decoder: hpack.Decoder
 
-# build a live connection over an established tls session handle.
-fn new_live_connection(handle: Int) -> Connection:
-    return Connection(tls_handle: handle, live: true, buf: bytes.empty(), pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: false, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
+# build a live connection over an established tls session.
+fn new_live_connection(session: tls.Conn) -> Connection:
+    return Connection(tls_conn: session, fd: 0, live: true, buf: bytes.empty(), pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: false, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # build a live h2c (plaintext) connection over an open socket fd.
 fn new_h2c_connection(fd: Int) -> Connection:
-    return Connection(tls_handle: fd, live: true, buf: bytes.empty(), pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: true, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
+    return Connection(tls_conn: tls.no_conn(), fd: fd, live: true, buf: bytes.empty(), pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: true, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, true), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # build an offline connection that reads `data` as if it arrived from a peer.
 # used by the tests to drive the read loop over a constructed frame stream.
 fn connection_from_frames(data: Bytes) -> Connection:
-    return Connection(tls_handle: 0, live: false, buf: data, pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: false, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
+    return Connection(tls_conn: tls.no_conn(), fd: 0, live: false, buf: data, pos: 0, next_stream_id: 1, sent: bytes.empty(), plaintext: false, max_response_body: MAX_RESPONSE_BODY, encoder: hpack.new_encoder(hpack.DEFAULT_HEADER_TABLE_SIZE, false), decoder: hpack.new_decoder(hpack.DEFAULT_HEADER_TABLE_SIZE))
 
 # the SETTINGS frame the client opens with: no server push, the default window,
 # and the default max frame size (so a peer must not send larger frames).
@@ -203,8 +208,8 @@ impl Connection:
     fn recv_chunk() -> Bytes!:
         if self.live:
             if self.plaintext:
-                return tcp_read_bytes(self.tls_handle, 16384)!
-            return tls.conn_from_handle(self.tls_handle).read_bytes(16384)!
+                return tcp_read_bytes(self.fd, 16384)!
+            return self.tls_conn.read_bytes(16384)!
         return bytes.empty()
 
     # ensure at least `n` unread bytes are buffered, pulling transport chunks as
@@ -259,8 +264,8 @@ impl Connection:
     fn send(data: Bytes) -> Int!:
         if self.live:
             if self.plaintext:
-                return tcp.write_all_bytes(self.tls_handle, data)!
-            return tls.conn_from_handle(self.tls_handle).write_all_bytes(data)!
+                return tcp.write_all_bytes(self.fd, data)!
+            return self.tls_conn.write_all_bytes(data)!
         locked self.sent_mu:
             self.sent = bytes.concat(self.sent, data)
         return data.len()
@@ -411,22 +416,31 @@ impl Connection:
     fn shutdown_transport():
         if self.live:
             if self.plaintext:
-                tcp_shutdown(self.tls_handle)
+                tcp_shutdown(self.fd)
             else:
-                tls.conn_from_handle(self.tls_handle).shutdown_transport()
+                self.tls_conn.shutdown_transport()
 
     # the most a response body read on this connection may hold, in place of
     # MAX_RESPONSE_BODY.
     pub fn set_max_response_body_bytes(limit: Int):
         self.max_response_body = limit
 
-    # close the underlying transport.
+    # close the underlying transport. a second close does nothing.
     pub fn close():
         if self.live:
             if self.plaintext:
-                tcp_close(self.tls_handle)
+                tcp_close(self.fd)
             else:
-                tls.conn_from_handle(self.tls_handle).close()
+                self.tls_conn.close()
+
+# a connection nobody closed gives back an h2c socket when the last value
+# naming it goes away. a tls session needs nothing here: the tls.Conn in
+# `tls_conn` dies with this value and releases itself. no GOAWAY is sent; a
+# drop must not do network i/o.
+impl Drop for Connection:
+    fn drop():
+        if self.live and self.plaintext:
+            tcp_close(self.fd)
 
 # open a connection to `host`:`port` using the caller's tls `config` and run the
 # handshake. the config must offer alpn "h2"; use this to trust a private ca or
@@ -437,7 +451,7 @@ pub fn connect_with_config(host: String, port: Int, config: tls.Config) -> Conne
     if negotiated != "h2":
         session.close()
         fail "http2: server did not negotiate h2 (alpn '{negotiated}')"
-    conn := new_live_connection(session.handle)
+    conn := new_live_connection(session)
     conn.handshake()!
     return conn
 
@@ -445,7 +459,7 @@ pub fn connect_with_config(host: String, port: Int, config: tls.Config) -> Conne
 # roots, and run the handshake. fails if the peer does not negotiate http/2.
 pub fn connect(host: String, port: Int) -> Connection!:
     # this call built the config, so this call closes it. the Connection keeps
-    # only the tls session handle; the config is read during the handshake and
+    # only the tls session; the config is read during the handshake and
     # not after it. a caller that brings its own config keeps ownership of it,
     # which is why connect_with_config does not close.
     config := tls.client_config()!.with_alpn(["h2"])

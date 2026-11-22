@@ -65,7 +65,7 @@ fn tunneled(req: http.HttpRequestBytes) -> http.HttpResponse:
 # a plain request is answered with what the proxy saw. a CONNECT is answered
 # 200, then the connection becomes a tls server, unless the target is
 # refused.test, which is refused with 407.
-fn proxy_conn(listener_handle: Int, fd: Int) -> Int:
+fn proxy_conn(listener: tls.Listener, fd: Int) -> Int:
     while true:
         head := read_head(fd)
         if head == "":
@@ -81,7 +81,7 @@ fn proxy_conn(listener_handle: Int, fd: Int) -> Int:
                 tcp_write(fd, "HTTP/1.1 407 Proxy Authentication Required\r\n" + pad.repeat(4000) + "Content-Length: 0\r\n\r\n") catch 0
                 break
             tcp_write(fd, "HTTP/1.1 200 Connection established\r\n\r\n") catch 0
-            conn := tls.handshake(tls.listener_from_handle(listener_handle), fd) catch tls.Conn(0)
+            conn := tls.handshake(listener, fd) catch tls.no_conn()
             if conn.handle != 0:
                 http.serve_connection_tls(conn, tunneled) catch 0
                 conn.close()
@@ -92,12 +92,11 @@ fn proxy_conn(listener_handle: Int, fd: Int) -> Int:
     return 0
 
 fn proxy_loop(listener: tls.Listener, count: Count) -> Int:
-    handle := listener.handle
     while true:
         fd := tls.accept_socket(listener) catch 0
         if fd > 0:
             bump(count)
-            spawn proxy_conn(handle, fd)
+            spawn proxy_conn(listener, fd)
     return 0
 
 fn show(resp: http.HttpResponse!) -> String:

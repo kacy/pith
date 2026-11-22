@@ -1,0 +1,125 @@
+# an http/2 Connection that nobody closes gives its transport back.
+#
+# an h2c connection closes its socket in Connection's own drop, and one over
+# tls through the tls.Conn it holds. every round dials, makes one request and
+# drops the connection without close(); the servers close their side when the
+# client's goes, so once the churn settles the process holds the descriptors
+# it held before.
+
+import std.fs as fs
+import std.net.http as http
+import std.net.http2.connection as http2
+import std.net.http2.server as server
+import std.net.tls as tls
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+H2C_ROUNDS := 10000
+TLS_ROUNDS := 1000
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn open_fds() -> Int:
+    return fs.list("/proc/self/fd").len()
+
+fn settle(want: Int) -> Int:
+    mut n := open_fds()
+    mut waited := 0
+    while n > want and waited < 10000:
+        sleep(20)
+        waited = waited + 20
+        n = open_fds()
+    return n
+
+fn steady() -> Int:
+    mut last := open_fds()
+    sleep(50)
+    mut n := open_fds()
+    while n != last:
+        last = n
+        sleep(50)
+        n = open_fds()
+    return n
+
+fn ok(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.text(200, "ok")
+
+fn serve_h2c(fd: Int):
+    server.serve_h2c_connection(fd, ok)
+
+fn h2c_server(lfd: Int):
+    while true:
+        fd := tcp_accept(lfd) catch:
+            return
+        spawn serve_h2c(fd)
+
+fn serve_h2(listener: tls.Listener, fd: Int):
+    conn := listener.handshake(fd) catch:
+        return
+    server.serve_h2_tls_connection(conn, ok)
+
+fn h2_server(listener: tls.Listener):
+    while true:
+        fd := listener.accept_socket() catch:
+            return
+        spawn serve_h2(listener, fd)
+
+fn h2c_round(port: Int) -> Bool:
+    conn := http2.connect_h2c("127.0.0.1", port) catch:
+        return false
+    resp := conn.request_get("127.0.0.1", "/") catch:
+        return false
+    return resp.status == 200
+
+fn h2_round(port: Int, cfg: tls.Config) -> Bool:
+    conn := http2.connect_with_config("localhost", port, cfg) catch:
+        return false
+    resp := conn.request_get("localhost", "/") catch:
+        return false
+    return resp.status == 200
+
+fn main() -> Int!:
+    port := choose_port(24110)!
+    lfd := tcp_listen("127.0.0.1", port)!
+    spawn h2c_server(lfd)
+    h2c_round(port)
+    before := steady()
+    mut good := 0
+    mut i := 0
+    while i < H2C_ROUNDS:
+        if h2c_round(port):
+            good = good + 1
+        i = i + 1
+    after := settle(before)
+    print("h2c: {good} of {H2C_ROUNDS} answered and dropped; descriptors grew by {after - before}")
+
+    closed := http2.connect_h2c("127.0.0.1", port)!
+    closed.close()
+    closed.close()
+
+    tls_port := choose_port(24330)!
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!.with_alpn(["h2"])
+    listener := tls.listen("127.0.0.1", tls_port, server_cfg)!
+    spawn h2_server(listener)
+    cfg := tls.client_config_with_ca_file(CA_PATH)!.with_alpn(["h2"])
+    h2_round(tls_port, cfg)
+    tls_before := steady()
+    good = 0
+    i = 0
+    while i < TLS_ROUNDS:
+        if h2_round(tls_port, cfg):
+            good = good + 1
+        i = i + 1
+    tls_after := settle(tls_before)
+    print("h2 over tls: {good} of {TLS_ROUNDS} answered and dropped; descriptors grew by {tls_after - tls_before}")
+    return 0

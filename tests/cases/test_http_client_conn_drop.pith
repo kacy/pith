@@ -1,0 +1,191 @@
+# http client connections that nobody closes give their sockets back.
+#
+# a ClientConn owns its stream, a TlsClientConn its tls.Conn, and a Client's
+# idle pool the connections parked in it, so each releases its sockets when
+# the last value naming it goes away. every round below drops one without a
+# close; the server closes its side when the client's goes, so once the churn
+# settles the process holds the descriptors it held before.
+#
+# the pool case also checks the other direction: a request hands its
+# connection to the pool when it ends, and the pool's copy must keep it open,
+# so the next request reuses it rather than dialing again.
+
+import std.fs as fs
+import std.net.http as http
+import std.net.tls as tls
+
+CERT_PATH := "tests/live/fixtures/localhost.crt"
+KEY_PATH := "tests/live/fixtures/localhost.key"
+CA_PATH := "tests/live/fixtures/localhost-ca.crt"
+
+CONN_ROUNDS := 10000
+POOL_ROUNDS := 2000
+TLS_ROUNDS := 1000
+
+# how many connections the plain server has accepted.
+mut accepted := AtomicInt(0)
+
+fn choose_port(start: Int) -> Int!:
+    mut port := start
+    while port < start + 200:
+        probe := tcp_listen("127.0.0.1", port)
+        if probe.is_ok:
+            tcp_close(probe.ok)
+            return port
+        port = port + 1
+    fail "no free tcp port"
+
+fn open_fds() -> Int:
+    return fs.list("/proc/self/fd").len()
+
+fn settle(want: Int) -> Int:
+    mut n := open_fds()
+    mut waited := 0
+    while n > want and waited < 10000:
+        sleep(20)
+        waited = waited + 20
+        n = open_fds()
+    return n
+
+fn steady() -> Int:
+    mut last := open_fds()
+    sleep(50)
+    mut n := open_fds()
+    while n != last:
+        last = n
+        sleep(50)
+        n = open_fds()
+    return n
+
+fn ok(req: http.HttpRequestBytes) -> http.HttpResponse:
+    return http.text(200, "ok")
+
+fn count_accept():
+    mut done := false
+    while not done:
+        current := accepted.load()
+        done = accepted.compare_set(current, current + 1)
+
+fn serve_plain(fd: Int):
+    http.serve_connection_fd(fd, ok) catch 0
+
+fn plain_server(lfd: Int):
+    while true:
+        fd := tcp_accept(lfd) catch:
+            return
+        count_accept()
+        spawn serve_plain(fd)
+
+fn serve_tls(listener: tls.Listener, fd: Int):
+    conn := listener.handshake(fd) catch:
+        return
+    http.serve_connection_tls(conn, ok) catch 0
+    conn.close()
+
+fn tls_server(listener: tls.Listener):
+    while true:
+        fd := listener.accept_socket() catch:
+            return
+        spawn serve_tls(listener, fd)
+
+# one ClientConn, one request, no close.
+fn conn_round(port: Int) -> Bool:
+    conn := http.connect_client("127.0.0.1", port) catch:
+        return false
+    resp := conn.send(http.get_request("127.0.0.1", port, "/")) catch:
+        return false
+    return resp.status == 200
+
+# one Client, one request that leaves its connection in the pool, no close.
+fn pool_round(url: String) -> Bool:
+    c := http.client()
+    resp := c.get(url) catch:
+        return false
+    return resp.status == 200 and c.idle_connections() == 1
+
+fn tls_pool_round(url: String, cfg: tls.Config) -> Bool:
+    c := http.client().with_tls_config(cfg)
+    resp := c.get(url) catch:
+        return false
+    return resp.status == 200 and c.idle_connections() == 1
+
+fn tls_conn_round(port: Int, cfg: tls.Config) -> Bool:
+    conn := http.connect_tls_client_with_config("127.0.0.1", port, "localhost", cfg) catch:
+        return false
+    resp := conn.send(http.get_request("localhost", port, "/")) catch:
+        return false
+    return resp.status == 200
+
+fn main() -> Int!:
+    port := choose_port(23710)!
+    lfd := tcp_listen("127.0.0.1", port)!
+    spawn plain_server(lfd)
+    url := "http://127.0.0.1:{port}/"
+    conn_round(port)
+    pool_round(url)
+
+    before := steady()
+    mut good := 0
+    mut i := 0
+    while i < CONN_ROUNDS:
+        if conn_round(port):
+            good = good + 1
+        i = i + 1
+    after := settle(before)
+    print("ClientConn: {good} of {CONN_ROUNDS} answered and dropped; descriptors grew by {after - before}")
+
+    good = 0
+    i = 0
+    while i < POOL_ROUNDS:
+        if pool_round(url):
+            good = good + 1
+        i = i + 1
+    after_pool := settle(before)
+    print("Client pool: {good} of {POOL_ROUNDS} answered and dropped; descriptors grew by {after_pool - before}")
+
+    # the request's own value dies when it hands the connection to the pool;
+    # the pool's copy keeps it open, so three requests make one connection.
+    shared := http.client()
+    first_accepts := accepted.load()
+    mut answered := 0
+    i = 0
+    while i < 3:
+        resp := shared.get(url) catch http.text(599, "")
+        if resp.status == 200:
+            answered = answered + 1
+        i = i + 1
+    print("pooled: {answered} answered over {accepted.load() - first_accepts} connection, {shared.idle_connections()} idle")
+    shared.close_idle_connections()
+    shared.close_idle_connections()
+
+    # close then drop, and a second close, do nothing more.
+    closed := http.connect_client("127.0.0.1", port)!
+    closed.close()
+    closed.close()
+
+    tls_port := choose_port(23930)!
+    server_cfg := tls.server_config(CERT_PATH, KEY_PATH)!
+    listener := tls.listen("127.0.0.1", tls_port, server_cfg)!
+    spawn tls_server(listener)
+    cfg := tls.client_config_with_ca_file(CA_PATH)!
+    tls_url := "https://localhost:{tls_port}/"
+    tls_pool_round(tls_url, cfg)
+    tls_conn_round(tls_port, cfg)
+    tls_before := steady()
+    good = 0
+    i = 0
+    while i < TLS_ROUNDS:
+        if tls_pool_round(tls_url, cfg):
+            good = good + 1
+        i = i + 1
+    after_tls_pool := settle(tls_before)
+    print("Client pool over tls: {good} of {TLS_ROUNDS} answered and dropped; descriptors grew by {after_tls_pool - tls_before}")
+    good = 0
+    i = 0
+    while i < TLS_ROUNDS:
+        if tls_conn_round(tls_port, cfg):
+            good = good + 1
+        i = i + 1
+    after_tls := settle(tls_before)
+    print("TlsClientConn: {good} of {TLS_ROUNDS} answered and dropped; descriptors grew by {after_tls - tls_before}")
+    return 0

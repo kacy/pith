@@ -23,11 +23,6 @@ ISSUER := "example-auth"
 AUDIENCE := "example-api"
 PASSPHRASE := "correct horse battery staple"
 
-# in a real service this is a database row. the phc string carries its own
-# salt and parameters, so one column holds everything verify needs. it is a
-# plain module global because every serving task must see the hash main wrote.
-mut stored_hash: String := ""
-
 # the hmac secret comes from the environment in a real service. it must be
 # long enough that guessing it is no easier than forging a signature.
 fn signing_secret() -> Bytes:
@@ -39,7 +34,9 @@ fn expected_claims() -> jwt.Options:
 fn issue_token(subject: String, secret: Bytes) -> String!:
     return jwt.claims().issuer(ISSUER).audience(AUDIENCE).subject(subject).expires_in(3600).sign_hs256(secret)!
 
-fn handle_login(req: web.Request) -> http.HttpResponse:
+# in a real service the stored hash is a database row. the phc string carries
+# its own salt and parameters, so one column holds everything verify needs.
+fn handle_login(stored_hash: String, req: web.Request) -> http.HttpResponse:
     body := req.raw.body_json() catch:
         return http.bad_request_response()
     user := json.object_get_string(body, "username")
@@ -64,15 +61,15 @@ fn require_token(next: fn(web.Request) -> http.HttpResponse, req: web.Request) -
 fn handle_me(req: web.Request) -> http.HttpResponse:
     return http.response(200).json_body(json.of("user", req.value("user")))
 
-fn build_app() -> web.App:
+fn build_app(stored_hash: String) -> web.App:
     mut app := web.new()
-    app = app.post("/login", handle_login)
+    app = app.post("/login", fn(req: web.Request) => handle_login(stored_hash, req))
     app = app.group("/api", require_token)
     app = app.get("/api/me", handle_me)
     return app
 
-fn serve(port: Int) -> Int:
-    return build_app().listen("127.0.0.1", port) catch 0
+fn serve(port: Int, stored_hash: String) -> Int:
+    return build_app(stored_hash).listen("127.0.0.1", port) catch 0
 
 # connect until the accept loop answers, rather than sleeping for a guess.
 fn wait_until_listening(port: Int) -> Bool:
@@ -106,9 +103,9 @@ fn tamper(token: String) -> String:
 
 fn main() -> Int!:
     # register the one user before serving: about 30 ms of argon2id, once.
-    stored_hash = password.hash(PASSPHRASE)!
+    stored_hash := password.hash(PASSPHRASE)!
 
-    spawn serve(PORT)
+    spawn serve(PORT, stored_hash)
     if not wait_until_listening(PORT):
         fail "the server never came up"
 

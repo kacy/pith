@@ -52,8 +52,8 @@ pub struct Terminal:
     mut rows: Int
     mut running: Bool
     mut closed: Bool
-    mut reader: Task[Int]
-    mut waiter: Task[Int]
+    # the reader and signal tasks, done once each has stopped
+    stopped: WaitGroup
     # fixed when the session opens; the reader task reads them
     frozen opts: Options
     # the queued output
@@ -83,17 +83,11 @@ pub fn open_with(opts: Options) -> Terminal!:
     for s in opts.signals:
         armed.push(s)
     signal.notify(armed)!
-    t := Terminal(events: Channel[Event](64), cols: dims.0, rows: dims.1, running: true, closed: false, opts: opts, pending_out: [], reader: spawn placeholder_task(), waiter: spawn placeholder_task())
-    r := spawn reader_loop(t)
-    w := spawn signal_loop(t)
-    t.reader = r
-    t.waiter = w
+    t := Terminal(events: Channel[Event](64), cols: dims.0, rows: dims.1, running: true, closed: false, opts: opts, pending_out: [], stopped: WaitGroup())
+    t.stopped.add(2)
+    spawn reader_loop(t)
+    spawn signal_loop(t)
     return t
-
-# a placeholder task so the struct fields are never unset; it finishes
-# immediately and is replaced before open_with returns.
-fn placeholder_task() -> Int:
-    return 0
 
 # the escape sequences a session's options turn on, in one write.
 fn enter_sequence(opts: Options) -> String:
@@ -128,6 +122,7 @@ fn leave_sequence(opts: Options) -> String:
 # ambiguity via flush; a failed read means the terminal is gone, which ends
 # the stream with one Closed.
 fn reader_loop(t: Terminal) -> Int:
+    defer t.stopped.done()
     p := input.parser()
     while t.running:
         mut wait_ms := IDLE_READ_MS
@@ -152,6 +147,7 @@ fn reader_loop(t: Terminal) -> Int:
 # (and the session's cols/rows updated first, so size() is fresh by the time
 # the event is read); any other armed signal is passed through.
 fn signal_loop(t: Terminal) -> Int:
+    defer t.stopped.done()
     while t.running:
         sig := signal.wait(IDLE_READ_MS)
         if sig <= 0:
@@ -206,8 +202,7 @@ impl Terminal:
             self.pending_out = []
         tty.write_str(leave_sequence(self.opts)) catch 0
         tty.restore()
-        await self.reader
-        await self.waiter
+        self.stopped.wait()
 
 test "open fails cleanly when stdin is not a terminal":
     # the fork-per-test harness runs with stdin piped, so the real open path

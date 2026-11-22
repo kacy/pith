@@ -346,11 +346,14 @@ fn parse_type_expr() -> Int:
         if not check("bang"):
             return base
 
-    # result: T! or T!E
+    # result: T! or T!E. `holding` and `where` after a bare `T!` start the
+    # signature's next clause, not an error type.
     if check("bang"):
         advance_token()
         next_kind := _cur_tok_kind()
-        if next_kind == "identifier" or next_kind == "kw_fn" or next_kind == "lparen":
+        next_value := _cur_tok_value()
+        clause := next_kind == "identifier" and (next_value == "holding" or next_value == "where")
+        if (next_kind == "identifier" and not clause) or next_kind == "kw_fn" or next_kind == "lparen":
             err_type := parse_type_expr()
             mut children: List[Int] := [base, err_type]
             return add_node_from_mark("result_type", "", children, mark)

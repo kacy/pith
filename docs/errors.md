@@ -182,7 +182,18 @@ an enum variant pattern was used on a non-enum type.
 
 ### E212 — unknown variant
 
-an enum variant name doesn't exist on the enum type.
+an enum variant name doesn't exist on the enum type. the check covers a
+payload-free variant (`Color.Teal`), a variant constructor (`Shape.Square(2)`)
+and a variant pattern in a match or `if let`, for an enum declared locally,
+reached through a module alias (`m.Color.Teal`) or imported under another name.
+the caret points at the variant name. a call that matches neither a variant
+nor a method of the enum reports "has no variant or method".
+
+```
+error[E212]: Color has no variant 'Teal'
+  6 |     c := Color.Teal
+                     ^
+```
 
 ### E213 — wrong field count in pattern
 
@@ -482,8 +493,12 @@ a `from` import must name something its source module actually declares
 at the top level. a wrong module name in an import otherwise compiles
 clean and dies much later as a silent unknown call in the backend.
 
+the caret points at the undeclared name, wherever it sits in the list.
+
 ```
 error[E246]: 'imaginary_helper' is not declared by module 'helper'
+  1 | from helper import imaginary_helper, real_helper
+                         ^
 ```
 
 ### E247 — cannot find module

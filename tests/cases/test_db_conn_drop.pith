@@ -1,0 +1,348 @@
+# a database connection dropped without close() closes its socket, and a
+# transaction or prepared statement dropped without commit, rollback or close
+# gives its pinned connection up and returns the pool slot.
+#
+# loopback stubs stand in for the servers: a postgres one that accepts the
+# login and answers every query or sync with CommandComplete and
+# ReadyForQuery, a mysql one that answers every command with an OK packet, and
+# a redis one that answers every command with +PONG. each serves connections
+# one at a time until its listener closes, and reports how many it took.
+#
+# the open descriptors are counted from /proc/self/fd before and after each
+# churn. the stubs close their own side of each connection, so what stays open
+# afterwards is the client side. before the destructors every dropped
+# connection kept its socket, and the counts grew by the number of rounds.
+
+import std.bits as bits
+import std.bytes as bytes
+import std.db.mysql as mydb
+import std.db.postgres as pgdb
+import std.fs as fs
+import std.mysql as mysql
+import std.net.tcp as tcp
+import std.postgres as postgres
+import std.redis as redis
+
+PG_PORT := 24611
+MY_PORT := 24612
+RD_PORT := 24613
+PG_POOL_PORT := 24614
+MY_POOL_PORT := 24615
+
+CHURN := 3000
+WARMUP := 50
+
+fn open_fds() -> Int:
+    return fs.list("/proc/self/fd").len()
+
+# how a count of descriptors moved, coarse enough that a stub's own socket
+# still open at the moment of counting does not show.
+fn growth(before: Int, after: Int) -> String:
+    if after - before <= 4:
+        return "flat"
+    return "grew by {after - before}"
+
+fn byte1(value: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(value) catch 0
+    return out.take_bytes()
+
+fn be32(n: Int) -> Bytes:
+    out := bytes.buffer()
+    out.write_byte(bits.mask8(bits.shr(n, 24))) catch 0
+    out.write_byte(bits.mask8(bits.shr(n, 16))) catch 0
+    out.write_byte(bits.mask8(bits.shr(n, 8))) catch 0
+    out.write_byte(bits.mask8(n)) catch 0
+    return out.take_bytes()
+
+fn le(value: Int, width: Int) -> Bytes:
+    out := bytes.buffer()
+    mut i := 0
+    while i < width:
+        out.write_byte(bits.band(bits.shr(value, i * 8), 255)) catch 0
+        i = i + 1
+    return out.take_bytes()
+
+fn cat(parts: List[Bytes]) -> Bytes:
+    out := bytes.buffer()
+    for part in parts:
+        out.write(part) catch 0
+    return out.take_bytes()
+
+fn str(text: String) -> Bytes:
+    return bytes.from_string_utf8(text)
+
+fn cstr(text: String) -> Bytes:
+    return cat([str(text), byte1(0)])
+
+fn pg_msg(mtype: Int, payload: Bytes) -> Bytes:
+    return cat([byte1(mtype), be32(payload.len() + 4), payload])
+
+fn my_packet(seq: Int, payload: Bytes) -> Bytes:
+    return cat([le(payload.len(), 3), byte1(seq), payload])
+
+# a mysql 4.1 handshake greeting offering mysql_native_password.
+fn my_greeting() -> Bytes:
+    return cat([byte1(10), cstr("5.7.0-stub"), le(1, 4), str("12345678"), byte1(0), le(0, 2), byte1(45), le(0, 2), le(0, 2), byte1(21), cat([le(0, 8), le(0, 2)]), str("901234567890"), byte1(0), cstr("mysql_native_password")])
+
+# an OK packet: no rows, no id, autocommit status, no warnings.
+fn my_ok(seq: Int) -> Bytes:
+    return my_packet(seq, cat([byte1(0), byte1(0), byte1(0), le(2, 2), le(0, 2)]))
+
+# answer every complete simple query ('Q') or sync ('S') in `pending` with
+# CommandComplete and ReadyForQuery, and return the bytes of any partial
+# message left over.
+fn pg_answer(conn: Int, pending: Bytes) -> Bytes!:
+    mut off := 0
+    while pending.len() - off >= 5:
+        mtype := pending[off]
+        size := bits.shl(pending[off + 1], 24) + bits.shl(pending[off + 2], 16) + bits.shl(pending[off + 3], 8) + pending[off + 4]
+        if pending.len() - off < size + 1:
+            break
+        if mtype == 81 or mtype == 83:
+            tcp.write_all_bytes(conn, cat([pg_msg(67, cstr("OK")), pg_msg(90, str("I"))]))!
+        off = off + size + 1
+    return pending.slice(off, pending.len())
+
+# serve logins one connection at a time until the listener closes. with `hold`
+# each connection then answers queries until the client goes; without it the
+# stub hangs up right after the login, as a churn needs.
+fn pg_serve(listener: Int, hold: Bool) -> Int:
+    mut served := 0
+    while true:
+        accepted := tcp_accept(listener)
+        if accepted.is_err:
+            return served
+        conn := accepted.ok
+        served = served + 1
+        startup := tcp_read_bytes(conn, 4096) catch bytes.empty()
+        wrote := tcp.write_all_bytes(conn, cat([pg_msg(82, be32(0)), pg_msg(90, str("I"))])) catch 0
+        if startup.len() + wrote < 0:
+            print("unreachable")
+        mut pending := bytes.empty()
+        while hold:
+            chunk := tcp_read_bytes(conn, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                break
+            pending = pg_answer(conn, pending.concat(chunk)) catch bytes.empty()
+        tcp_close(conn)
+    return served
+
+fn my_serve(listener: Int, hold: Bool) -> Int:
+    mut served := 0
+    while true:
+        accepted := tcp_accept(listener)
+        if accepted.is_err:
+            return served
+        conn := accepted.ok
+        served = served + 1
+        greeted := tcp.write_all_bytes(conn, my_packet(0, my_greeting())) catch 0
+        response := tcp_read_bytes(conn, 4096) catch bytes.empty()
+        wrote := tcp.write_all_bytes(conn, my_ok(2)) catch 0
+        if greeted + response.len() + wrote < 0:
+            print("unreachable")
+        while hold:
+            chunk := tcp_read_bytes(conn, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                break
+            answered := tcp.write_all_bytes(conn, my_ok(1)) catch 0
+            if answered < 0:
+                print("unreachable")
+        tcp_close(conn)
+    return served
+
+fn rd_serve(listener: Int) -> Int:
+    mut served := 0
+    while true:
+        accepted := tcp_accept(listener)
+        if accepted.is_err:
+            return served
+        conn := accepted.ok
+        served = served + 1
+        while true:
+            chunk := tcp_read_bytes(conn, 4096) catch bytes.empty()
+            if chunk.len() == 0:
+                break
+            answered := tcp.write_all_bytes(conn, str("+PONG\r\n")) catch 0
+            if answered < 0:
+                print("unreachable")
+        tcp_close(conn)
+    return served
+
+# one connection per round, each dropped without close().
+fn pg_churn(rounds: Int) -> Int:
+    mut opened := 0
+    mut i := 0
+    while i < rounds:
+        connected := postgres.connect("127.0.0.1", PG_PORT, "user", "pw", "db")
+        if connected.is_ok:
+            opened = opened + 1
+        i = i + 1
+    return opened
+
+fn my_churn(rounds: Int) -> Int:
+    mut opened := 0
+    mut i := 0
+    while i < rounds:
+        connected := mysql.connect("127.0.0.1", MY_PORT, "user", "pw", "db")
+        if connected.is_ok:
+            opened = opened + 1
+        i = i + 1
+    return opened
+
+fn rd_churn(rounds: Int) -> Int:
+    mut answered := 0
+    mut i := 0
+    while i < rounds:
+        client := redis.connect("127.0.0.1", RD_PORT) catch:
+            i = i + 1
+            continue
+        pong := client.ping() catch ""
+        if pong == "PONG":
+            answered = answered + 1
+        i = i + 1
+    return answered
+
+# close() twice, then drop the value once a second client is open. the second
+# client may get the same descriptor number the first one had, and the first
+# one's destructor must not close it.
+fn rd_close_then_drop() -> String:
+    mut first: redis.Client? := redis.connect("127.0.0.1", RD_PORT) catch:
+        return "connect failed"
+    first.value().ping() catch ""
+    first.value().close()
+    first.value().close()
+    second := redis.connect("127.0.0.1", RD_PORT) catch:
+        return "connect failed"
+    first = none
+    return second.ping() catch "lost"
+
+# acquire and release from a pool, returning nothing: the caller's count on
+# the connection dies here, and the pool's count must keep it open.
+fn pg_pool_round(pool: postgres.Pool) -> Int:
+    conn := pool.acquire() catch:
+        return 0
+    done := postgres.exec(conn, "select 1") catch -1
+    pool.release(conn)
+    return done + 1
+
+# begin a transaction and drop it without commit or rollback.
+fn pg_abandon_tx(handle: pgdb.Db) -> Int:
+    t := handle.begin() catch:
+        return 0
+    t.exec("update t set n = n + 1", []) catch:
+        return 0
+    return 1
+
+fn pg_abandon_stmt(handle: pgdb.Db) -> Int:
+    s := handle.prepare("select 1") catch:
+        return 0
+    return 1
+
+fn pg_commit_tx(handle: pgdb.Db) -> Int:
+    t := handle.begin() catch:
+        return 0
+    t.commit() catch:
+        return 0
+    return 1
+
+fn my_abandon_tx(handle: mydb.Db) -> Int:
+    t := handle.begin() catch:
+        return 0
+    return 1
+
+fn my_commit_tx(handle: mydb.Db) -> Int:
+    t := handle.begin() catch:
+        return 0
+    t.commit() catch:
+        return 0
+    return 1
+
+fn main() -> Int!:
+    pg_listener := tcp_listen("127.0.0.1", PG_PORT)!
+    pg_task := spawn pg_serve(pg_listener, false)
+    # the first dial opens the runtime's own descriptors (the reactor, the
+    # resolver), so a few rounds run before the count is taken.
+    warm := pg_churn(WARMUP)
+    before := open_fds()
+    pg_opened := warm + pg_churn(CHURN - WARMUP)
+    print("postgres: {pg_opened} connections dropped, fds {growth(before, open_fds())}")
+    tcp_close(pg_listener)
+    print("postgres stub served {await pg_task}")
+
+    my_listener := tcp_listen("127.0.0.1", MY_PORT)!
+    my_task := spawn my_serve(my_listener, false)
+    warm_my := my_churn(WARMUP)
+    before_my := open_fds()
+    my_opened := warm_my + my_churn(CHURN - WARMUP)
+    print("mysql: {my_opened} connections dropped, fds {growth(before_my, open_fds())}")
+    tcp_close(my_listener)
+    print("mysql stub served {await my_task}")
+
+    rd_listener := tcp_listen("127.0.0.1", RD_PORT)!
+    rd_task := spawn rd_serve(rd_listener)
+    warm_rd := rd_churn(WARMUP)
+    before_rd := open_fds()
+    rd_answered := warm_rd + rd_churn(CHURN - WARMUP)
+    print("redis: {rd_answered} clients dropped, fds {growth(before_rd, open_fds())}")
+    print("redis close twice then drop, next client: {rd_close_then_drop()}")
+    tcp_close(rd_listener)
+    rd_served := await rd_task
+    print("redis stub served {rd_served}")
+
+    # a pool keeps the connection a caller released: one login for every
+    # round, and the caller's count dying does not close it.
+    pool_listener := tcp_listen("127.0.0.1", PG_POOL_PORT)!
+    pool_task := spawn pg_serve(pool_listener, true)
+    pool := postgres.pool("127.0.0.1", PG_POOL_PORT, "user", "pw", "db", 1)
+    mut rounds := 0
+    mut i := 0
+    while i < 50:
+        rounds = rounds + pg_pool_round(pool)
+        i = i + 1
+    pool.close()
+    tcp_close(pool_listener)
+    print("postgres pool: {rounds} rounds on {await pool_task} login")
+
+    # with a cap of one, a transaction or statement that kept its slot would
+    # block the next begin forever. each dropped one closes its connection, so
+    # the stub sees a fresh login for each; a committed one goes back to the
+    # pool and is reused.
+    tx_listener := tcp_listen("127.0.0.1", PG_POOL_PORT)!
+    tx_task := spawn pg_serve(tx_listener, true)
+    handle := pgdb.open("postgres://user:pw@127.0.0.1:{PG_POOL_PORT}/db?pool=1")!
+    before_tx := open_fds()
+    mut abandoned := 0
+    i = 0
+    while i < 200:
+        abandoned = abandoned + pg_abandon_tx(handle) + pg_abandon_stmt(handle)
+        i = i + 1
+    mut committed := 0
+    i = 0
+    while i < 20:
+        committed = committed + pg_commit_tx(handle)
+        i = i + 1
+    print("postgres db: {abandoned} dropped, {committed} committed, fds {growth(before_tx, open_fds())}")
+    handle.close()
+    tcp_close(tx_listener)
+    print("postgres db stub served {await tx_task} logins")
+
+    my_tx_listener := tcp_listen("127.0.0.1", MY_POOL_PORT)!
+    my_tx_task := spawn my_serve(my_tx_listener, true)
+    my_handle := mydb.open("mysql://user:pw@127.0.0.1:{MY_POOL_PORT}/db?pool=1")!
+    before_my_tx := open_fds()
+    mut my_abandoned := 0
+    i = 0
+    while i < 200:
+        my_abandoned = my_abandoned + my_abandon_tx(my_handle)
+        i = i + 1
+    mut my_committed := 0
+    i = 0
+    while i < 20:
+        my_committed = my_committed + my_commit_tx(my_handle)
+        i = i + 1
+    print("mysql db: {my_abandoned} dropped, {my_committed} committed, fds {growth(before_my_tx, open_fds())}")
+    my_handle.close()
+    tcp_close(my_tx_listener)
+    print("mysql db stub served {await my_tx_task} logins")
+    return 0

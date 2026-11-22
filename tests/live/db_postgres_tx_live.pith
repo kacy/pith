@@ -79,3 +79,31 @@ test "a prepared statement runs many times with different params":
 
     handle.exec("drop table db_tx_pg", [])!
     handle.close()
+
+# begin a transfer and let the Tx go without commit or rollback.
+fn abandon_transfer(handle: db.Db) -> Bool!:
+    t := handle.begin()!
+    t.exec("update db_tx_pg set balance = balance - $1 where id = $2", ["40", "1"])!
+    return true
+
+# prepare a statement and let the Stmt go without close.
+fn abandon_statement(handle: db.Db) -> Bool!:
+    stmt := handle.prepare("select balance from db_tx_pg where id = $1")!
+    stmt.query(["1"])!
+    return true
+
+test "a transaction or statement dropped without finishing is rolled back and frees its slot":
+    probe := open_or_skip()
+    probe.close()
+    # one slot: if a dropped Tx or Stmt kept it, the next call would wait for
+    # it forever.
+    handle := db.open("postgres://pith:pith_pw@127.0.0.1:5432/pithtest?pool=1")!
+    seed_accounts(handle)!
+
+    abandon_transfer(handle)!
+    assert_eq(balance(handle, "1")!, 100)
+    abandon_statement(handle)!
+    assert_eq(balance(handle, "2")!, 0)
+
+    handle.exec("drop table db_tx_pg", [])!
+    handle.close()

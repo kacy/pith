@@ -103,21 +103,27 @@ impl Reader:
 # --- connection ---
 
 # an open connection to a mysql/mariadb server; `buf` holds bytes read past
-# the current packet.
+# the current packet. `session` is set once connect_tls has upgraded the
+# socket, and from then on all reads and writes go through it.
+#
+# a Conn is the one owner of its socket and its tls session: nothing rebuilds
+# one from a bare handle, so closing or dropping it cannot reach a socket some
+# other value still uses. `closed` records that close() or the destructor ran,
+# so a second close and a drop after close() do nothing.
 pub struct Conn:
     fd: Int
     mut buf: Bytes
     mut pos: Int
-    mut secure: Bool
-    mut tls_conn: tls.Conn
+    mut session: tls.Conn?
     mut last_seq: Int
+    mut closed: Bool
 
 impl Conn:
-    # read one chunk from the transport: the tls session when secure, the plain
-    # socket otherwise.
+    # read one chunk from the transport: the tls session when there is one,
+    # the plain socket otherwise.
     fn recv_chunk() -> Bytes!:
-        if self.secure:
-            return self.tls_conn.read_bytes(4096)!
+        if self.session != none:
+            return self.session.value().read_bytes(4096)!
         return tcp_read_bytes(self.fd, 4096)!
 
     # read exactly `n` bytes. the unconsumed tail moves into a growable buffer
@@ -148,11 +154,11 @@ impl Conn:
         self.last_seq = bytes.get(head, 3)
         return self.recv_exact(length)!
 
-    # write raw bytes to the transport: the tls session when secure, the plain
-    # socket otherwise.
+    # write raw bytes to the transport: the tls session when there is one,
+    # the plain socket otherwise.
     fn send_raw(data: Bytes) -> Int!:
-        if self.secure:
-            return self.tls_conn.write_all_bytes(data)!
+        if self.session != none:
+            return self.session.value().write_all_bytes(data)!
         return tcp.write_all_bytes(self.fd, data)!
 
     fn send_packet(seq: Int, payload: Bytes) -> Int!:
@@ -170,11 +176,35 @@ impl Conn:
         out.write(payload) catch 0
         return self.send_raw(out.take_bytes())!
 
-    # close the connection.
+    # close the connection: end the tls session (with its close_notify alert)
+    # when there is one, then close the socket. a second call does nothing.
     pub fn close():
-        if self.secure:
-            self.tls_conn.close()
+        if self.closed:
+            return
+        self.closed = true
+        if self.session != none:
+            self.session.value().close()
         tcp_close(self.fd)
+
+    # close the socket without writing to it, for the destructor and for a
+    # pool or pin that gives a connection up from one. the tls session sends no
+    # close_notify and no COM_QUIT goes out; the server sees the socket close,
+    # and ends the session (and rolls back any open transaction) itself. the
+    # session's own state goes when its value is released, which this Conn
+    # holds the last count of.
+    fn abandon():
+        if self.closed:
+            return
+        self.closed = true
+        tcp_close(self.fd)
+
+# a connection nobody closed closes its socket when the last value naming it
+# goes. this is the backstop for a caller that forgot close() or took an error
+# exit past it; close() is still the way to end a session cleanly, since the
+# destructor does no network i/o and so sends no tls close_notify.
+impl Drop for Conn:
+    fn drop():
+        self.abandon()
 
 # base capabilities: PROTOCOL_41 | SECURE_CONNECTION | PLUGIN_AUTH |
 # CONNECT_WITH_DB | LONG_PASSWORD. DEPRECATE_EOF is left off so the server frames
@@ -224,7 +254,7 @@ fn err_text(payload: Bytes) -> String:
 # open a connection and complete the handshake and authentication.
 pub fn connect(host: String, port: Int, user: String, password: String, database: String) -> Conn!:
     fd := tcp_connect(host, port)!
-    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_conn: tls.no_conn(), last_seq: 0)
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, session: none, last_seq: 0, closed: false)
     # the conn owns the socket but nothing closes it until the caller does. a
     # failed greeting or auth never reaches the caller, so close it here rather
     # than leak the socket on every failed dial (the conn is plain, so close()
@@ -244,7 +274,7 @@ pub fn connect(host: String, port: Int, user: String, password: String, database
 # handshake response carrying only the capability flags with CLIENT_SSL set.
 pub fn connect_tls(host: String, port: Int, user: String, password: String, database: String, server_name: String, config: tls.Config) -> Conn!:
     fd := tcp_connect(host, port)!
-    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, secure: false, tls_conn: tls.no_conn(), last_seq: 0)
+    conn := Conn(fd: fd, buf: bytes.empty(), pos: 0, session: none, last_seq: 0, closed: false)
     # the conn is plain until the tls upgrade lands, so every failure up to that
     # point closes it with conn.close() (a single tcp_close on the fd).
     greeting := conn.read_packet()
@@ -271,14 +301,13 @@ pub fn connect_tls(host: String, port: Int, user: String, password: String, data
         # the tls upgrade never completed, so the fd is still a plain socket.
         conn.close()
         fail session_result.err
-    session := session_result.ok
-    conn.secure = true
-    conn.tls_conn = session
-    # from here the tls session owns the socket. on a failed auth close through
-    # the session once — not conn.close(), which would tcp_close the fd twice.
+    conn.session = session_result.ok
+    # from here the conn owns the socket and the session. a second tcp_close
+    # of the same handle is a no-op, so close() may end the session and then
+    # close the socket the session already closed.
     started := conn.authenticate(greeting.ok, user, password, database, 2)
     if started.is_err:
-        session.close()
+        conn.close()
         fail started.err
     return conn
 
@@ -290,7 +319,7 @@ impl Conn:
         salt := parse_salt(greeting)!
         plugin := parse_auth_plugin(greeting)!
         mut caps := CAPS_BASE
-        if self.secure:
+        if self.session != none:
             caps = caps + CAP_SSL
         scramble := scramble_for(plugin, password, salt)
 
@@ -339,7 +368,7 @@ impl Conn:
                 if sub == 3:
                     continue
                 elif sub == 4:
-                    if not self.secure:
+                    if self.session == none:
                         fail "mysql: caching_sha2_password full auth needs tls"
                     self.send_packet(self.last_seq + 1, cstring_bytes(password))!
                 else:
@@ -834,7 +863,18 @@ impl Pool:
         conn.close()
         self.slots.send(true)
 
-    # close every idle connection.
+    # give up a checked-out connection without any network i/o: close its
+    # socket and hand its slot back. a destructor uses this, since it must not
+    # write to a socket. the slot channel always has room for the token being
+    # returned, so the send never waits.
+    pub fn abandon(conn: Conn):
+        conn.abandon()
+        self.slots.send(true)
+
+    # close every idle connection. a pool nobody closes needs no destructor of
+    # its own: when it goes, its idle list goes, and each connection in it
+    # closes its socket from its own destructor. a connection still checked out
+    # is its holder's to release, close or drop.
     pub fn close():
         mut idle: List[Conn] := []
         locked self.mu:
@@ -902,3 +942,13 @@ test "an unparseable number keeps its text rather than fabricating a zero":
     assert_eq(row.as_text(0), "nonsense")
     assert_eq(row.as_text(1), "nonsense")
     assert_eq(row.as_text(2), "nonsense")
+
+test "close records that it ran, so a second close and the drop do nothing":
+    # fd -1 names no socket, so tcp_close on it is a no-op either way; what is
+    # checked is the flag every later close and the destructor read.
+    conn := Conn(fd: -1, buf: bytes.empty(), pos: 0, session: none, last_seq: 0, closed: false)
+    conn.close()
+    assert(conn.closed)
+    conn.close()
+    conn.abandon()
+    assert(conn.closed)

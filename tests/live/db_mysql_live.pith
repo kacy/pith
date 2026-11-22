@@ -6,6 +6,7 @@
 import std.mysql as mysql
 import std.sql as sql
 import std.decimal as decimal
+import std.fs as fs
 
 # run a statement that returns no rows through a prepared execute, which is the
 # only exec surface std.mysql exposes.
@@ -83,3 +84,21 @@ test "a decimal survives a write and a read back, in both protocols":
     conn.close()
     assert_eq(text_protocol, ["12345678901234567.8900000000", "-0.0000000001"])
     assert_eq(binary_protocol, ["12345678901234567.8900000000", "-0.0000000001"])
+
+# open a connection, run one query and let it go without close().
+fn dropped_round() -> Bool!:
+    conn := mysql.connect("127.0.0.1", 3306, "pith", "pith_pw", "pithtest")!
+    mysql.query(conn, "select 1")!
+    return true
+
+test "a connection dropped without close gives its socket back":
+    probe := open_or_skip()
+    probe.close()
+    # more rounds than the default max_connections of 151: a connection that
+    # kept its socket would hold a server slot, and the dials past it fail.
+    before := fs.list("/proc/self/fd").len()
+    mut i := 0
+    while i < 200:
+        dropped_round()!
+        i = i + 1
+    assert(fs.list("/proc/self/fd").len() - before <= 2)

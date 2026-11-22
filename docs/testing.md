@@ -395,13 +395,14 @@ other kinds of test, all wired through the `Makefile`:
 - **invalid access** — `make memcheck` runs a curated set under valgrind, so an
   arc regression that double-frees or reads freed memory is caught before it
   lands.
-- **sanitizers** — `make sanitize-asan` links the whole regression corpus and
-  every std test file against a runtime built with AddressSanitizer and runs
+- **sanitizers** — `make sanitize-asan` links the whole regression corpus,
+  the deterministic examples (http, grpc, websocket, worker pools) and every
+  std test file against a runtime built with AddressSanitizer and runs
   them on both backends with the struct freelist off; `make sanitize-tsan`
   does the same with ThreadSanitizer. valgrind misses a freed
   struct the freelist hands straight back out, which is how a double free in
   a weak field read went unseen, and these do not. the nightly `sanitizers`
-  workflow runs the asan gate. the gate builds with `PITH_SANITIZE`, so the
+  workflow runs both gates. the gate builds with `PITH_SANITIZE`, so the
   field and global accesses generated code makes are checked too. details are
   in `tooling/sanitize.sh`.
 - **the nightly hunt** — the same workflow spends about two hours generating
@@ -501,8 +502,9 @@ that keeps filling up looks exactly like a leak.
 ## sanitizers
 
 threadsanitizer and addresssanitizer both run pith programs on either backend.
-the nightly `sanitizers` workflow runs the asan gate over the corpus and the
-std tests (`make sanitize-asan`, above); this section is the recipe for one
+the nightly `sanitizers` workflow runs both gates over the corpus, the
+examples and the std tests (`make sanitize-asan` and `make sanitize-tsan`,
+above); this section is the recipe for one
 program by hand. they need a runtime built with the sanitizer, and
 the stable toolchain accepts `-Zsanitizer` only with `RUSTC_BOOTSTRAP=1`:
 
@@ -553,8 +555,9 @@ a sanitized build differs from a plain one in three places:
 tsan reports a `thread leak` for a task on the os-thread backend whose handle
 was passed on or stored and was never awaited before the process exits. a
 discarded `spawn` and a handle left unawaited in a local are detached
-automatically. `TSAN_OPTIONS=report_thread_leaks=0` turns those
-off.
+automatically, and so is a handle whose local is assigned a new `spawn`.
+`TSAN_OPTIONS=report_thread_leaks=0` turns those off, and the gate runs with
+it.
 
 ## on the roadmap
 

@@ -1,0 +1,36 @@
+# a task-owning local bound to a second `spawn` before the first was
+# awaited. the first handle has no other name after `t = spawn ...`, so the
+# assignment has to detach it. it used to keep only the `:=` form: a plain
+# `=` took the general assignment path, the handle stayed in the task slab
+# for good, and on the os-thread backend its thread was never joined or
+# detached (tsan reported it as a thread leak).
+#
+# the first task of each round reports on a channel before main spawns the
+# next round, so at most two tasks are alive at once whatever the scheduler
+# does, and the peak is the same at 200k and 800k rounds.
+import leakprobe as probe
+
+fn work(done: Channel[Int], n: Int) -> Int:
+    done.send(1)
+    return n
+
+fn quick(n: Int) -> Int:
+    return n
+
+fn round(done: Channel[Int], i: Int) -> Int:
+    mut t := spawn work(done, i)
+    t = spawn quick(i)
+    done.recv()
+    return await t
+
+fn main():
+    n := probe.rounds()
+    done := Channel[Int](1)
+    mut i := 0
+    mut sum := 0
+    while i < n:
+        sum = sum + round(done, i) % 2
+        i = i + 1
+    if sum < 0:
+        print("unreachable")
+    print("{probe.peak_kb()}")

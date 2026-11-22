@@ -36,7 +36,9 @@ CA := "tests/live/fixtures/localhost-ca.crt"
 # to completion on a broken build; a healthy one leaves after a turn or two.
 POLL_TURNS := 500
 
-mut server_returned := false
+# set by the server task and polled by main, so it lives behind a lock.
+guard returned_mu:
+    mut server_returned := false
 
 fn hello(req: web.Request) -> http.HttpResponse:
     return http.text(200, "hello")
@@ -47,7 +49,8 @@ fn hello(req: web.Request) -> http.HttpResponse:
 fn serve_bg() -> Int:
     app := web.new().get("/", hello)
     code := app.listen_tls("127.0.0.1", PORT, CERT, KEY) catch 0
-    server_returned = true
+    locked returned_mu:
+        server_returned = true
     return code
 
 # connect to the listener, retrying until it is bound. returns -1 if it never
@@ -75,7 +78,10 @@ fn wait_for_inflight() -> Bool:
 fn wait_for_server_return() -> Bool:
     mut turns := 0
     while turns < POLL_TURNS:
-        if server_returned:
+        mut done := false
+        locked returned_mu:
+            done = server_returned
+        if done:
             return true
         turns = turns + 1
         time.delay(10)

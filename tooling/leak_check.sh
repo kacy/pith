@@ -164,6 +164,8 @@ cases=(
   tests/leaks/leak_none_lowering
   tests/leaks/leak_optional_arg
   tests/leaks/leak_discarded_spawn
+  tests/leaks/leak_spawn_rebind
+  "tests/leaks/leak_spawn_rebind PITH_GREEN=0"
   tests/leaks/leak_discarded_void_chain
   tests/leaks/leak_discarded_closure
   tests/leaks/leak_discarded_try_value

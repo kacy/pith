@@ -1,6 +1,11 @@
 # a search runs the vm once over the input, not once per start offset.
 # `[a-z]+@` over a long run of letters with no `@` used to take time
 # quadratic in the length (81 s at 32 KB); one pass takes milliseconds.
+#
+# find_all and replace_all are linear as well. they used to run one search
+# per match, and a search only ends once no thread that outranks the
+# match is alive. for `.*y|x` over a run of `x` the `.*y` thread lives to
+# the end, so every search read the rest of the input: 6.4 s at 8 KB.
 
 import std.regex as regex
 import std.time as time
@@ -19,4 +24,15 @@ fn main() -> Int!:
     print("within bound: {elapsed < 2000}")
     tail := re.find(input + "@")
     print("tail match: {tail.value().start}-{tail.value().stop}")
+
+    xs := "x".repeat(64000)
+    t1 := time.now()
+    mut counts: List[String] := []
+    for pattern in [".*y|x", "(x+x+)+y|x", "[a-z]*@|[a-z]", "(?:xx?){{1,10}}y|x"]:
+        counts.push(regex.compile(pattern)!.find_all(xs).len().to_string())
+    replaced := regex.compile(".*y|x")!.replace_all(xs, "ab")
+    iter_elapsed := time.now() - t1
+    print("find_all counts: {counts.join(" ")}")
+    print("replace_all length: {replaced.len()}")
+    print("iteration within bound: {iter_elapsed < 4000}")
     return 0

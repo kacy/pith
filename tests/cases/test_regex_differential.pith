@@ -2,6 +2,10 @@
 # against the engine it replaced, which ran the vm once per start offset,
 # over random patterns and inputs: find, captures and find_all must agree
 # exactly, spans and groups included.
+#
+# find_all no longer runs a search per match. it walks a table of which
+# instructions can still reach a match, so the old one-search-per-match
+# loop below checks it too.
 
 import std.regex as regex
 
@@ -137,19 +141,28 @@ fn group_text(input: String, slots: List[Int], ngroups: Int) -> String:
         g = g + 1
     return out.join("|")
 
+# one search per match, as go's regexp iterates: an empty match moves the
+# next search one byte on, and an empty match where the previous match
+# ended is dropped.
 fn old_find_all(re: regex.Regex, input: String) -> String:
     mut out: List[String] := []
     mut start := 0
+    mut prev_end := 0 - 1
     while start <= input.len():
         slots := old_search(re, input, start)
         if slots.len() < 2:
             return out.join(" ")
         stop := slots[1]
-        out.push("{slots[0]}-{stop}")
-        if stop == slots[0]:
-            start = stop + 1
+        mut accept := true
+        if stop == start:
+            if slots[0] == prev_end:
+                accept = false
+            start = start + 1
         else:
             start = stop
+        prev_end = stop
+        if accept:
+            out.push("{slots[0]}-{stop}")
     return out.join(" ")
 
 fn new_find_all(re: regex.Regex, input: String) -> String:
@@ -166,8 +179,8 @@ fn next_int(r: Rng, bound: Int) -> Int:
     return (r.state / 65536) % bound
 
 fn random_pattern(r: Rng) -> String:
-    atoms := ["a", "b", "c", ".", "[ab]", "[^a]", "\\d", "\\w", "^", "$", "(a|b)", "(ab|a)", "(a*)", "(b+|)", "x", "1"]
-    quants := ["", "", "", "*", "+", "?"]
+    atoms := ["a", "b", "c", ".", "[ab]", "[^a]", "\\d", "\\w", "^", "$", "(a|b)", "(ab|a)", "(a*)", "(b+|)", "x", "1", "(?:ab|b)", "a?b*", "{{"]
+    quants := ["", "", "", "*", "+", "?", "{{2}}", "{{0,2}}", "{{1,}}"]
     mut parts: List[String] := []
     count := 1 + next_int(r, 5)
     mut i := 0

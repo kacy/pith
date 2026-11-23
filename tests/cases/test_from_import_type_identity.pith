@@ -1,0 +1,36 @@
+# Canonical module-scoped type identity for `from <mod> import <Type>` and
+# entry-file struct declarations, independent of import order when another
+# module declares a struct with the same bare name (e.g. std.binary.Reader vs
+# std.protobuf.Reader, and local Event vs clash_event_a/b.Event).
+
+from std.binary import Reader, reader, read_u8
+import std.bytes as bytes
+import std.protobuf as pb
+import clash_event_a
+import clash_event_b
+
+struct Event:
+    label: String
+
+fn read_first_byte(r: Reader) -> Int:
+    return read_u8(r) catch -1
+
+fn describe_local(e: Event) -> String:
+    return "local:" + e.label
+
+fn main() -> Int:
+    b := bytes.from_string_utf8("A")
+    br := reader(b)
+    print("bin=" + read_first_byte(br).to_string())
+
+    pr := pb.reader(bytes.empty())
+    print("pb_eof=" + pr.at_end().to_string())
+
+    ev := Event("mine")
+    print(describe_local(ev))
+
+    ea := clash_event_a.at("hit", 42)
+    eb := clash_event_b.published("jobs", "done")
+    print("a=" + ea.name + ":" + ea.time_ns.to_string())
+    print("b=" + eb.topic + ":" + eb.payload)
+    return 0

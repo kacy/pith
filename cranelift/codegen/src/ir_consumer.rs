@@ -2062,6 +2062,88 @@ fn ir_functions<'a>(lines: &[&'a str]) -> Vec<IrFunction<'a>> {
     out
 }
 
+/// Match a 3-line cycle-collector tracer registration inside a
+/// `*__cc_register_tracers*` function:
+///   funcref <r1> <dtor>
+///   funcref <r2> <tracer>
+///   call <r3> pith_cc_register_tracer void 2 <r1> <r2>
+fn match_cc_register_tracer<'a>(lines: &[&'a str], i: usize) -> Option<(&'a str, &'a str)> {
+    if i + 2 >= lines.len() {
+        return None;
+    }
+    let p0: Vec<&str> = lines[i].split_whitespace().collect();
+    let p1: Vec<&str> = lines[i + 1].split_whitespace().collect();
+    let p2: Vec<&str> = lines[i + 2].split_whitespace().collect();
+    if p0.len() == 3
+        && p0[0] == "funcref"
+        && p1.len() == 3
+        && p1[0] == "funcref"
+        && p2.len() == 7
+        && p2[0] == "call"
+        && p2[2] == "pith_cc_register_tracer"
+        && p2[4] == "2"
+        && p2[5] == p0[1]
+        && p2[6] == p1[1]
+    {
+        Some((p0[2], p1[2]))
+    } else {
+        None
+    }
+}
+
+/// Match a 2-line user-drop registration inside a `*__cc_register_tracers*`
+/// function:
+///   funcref <r1> <dtor>
+///   call <r2> pith_cc_register_user_drop void 1 <r1>
+fn match_cc_register_user_drop<'a>(lines: &[&'a str], i: usize) -> Option<&'a str> {
+    if i + 1 >= lines.len() {
+        return None;
+    }
+    let p0: Vec<&str> = lines[i].split_whitespace().collect();
+    let p1: Vec<&str> = lines[i + 1].split_whitespace().collect();
+    if p0.len() == 3
+        && p0[0] == "funcref"
+        && p1.len() == 6
+        && p1[0] == "call"
+        && p1[2] == "pith_cc_register_user_drop"
+        && p1[4] == "1"
+        && p1[5] == p0[1]
+    {
+        Some(p0[2])
+    } else {
+        None
+    }
+}
+
+/// Keep only cycle-collector registrations whose destructor function is live.
+/// A destructor that no reachable function references can never be attached to
+/// a runtime object, so registering its tracer or user-drop is dead work that
+/// would otherwise pull hundreds of unreachable dtors/tracers into every binary.
+fn filter_tracer_reg_body<'a>(body: &[&'a str], live: &HashSet<String>) -> Vec<&'a str> {
+    let mut out = Vec::with_capacity(body.len());
+    let mut i = 0;
+    while i < body.len() {
+        if let Some((dtor, _tracer)) = match_cc_register_tracer(body, i) {
+            if live.contains(dtor) {
+                out.push(body[i]);
+                out.push(body[i + 1]);
+                out.push(body[i + 2]);
+            }
+            i += 3;
+        } else if let Some(dtor) = match_cc_register_user_drop(body, i) {
+            if live.contains(dtor) {
+                out.push(body[i]);
+                out.push(body[i + 1]);
+            }
+            i += 2;
+        } else {
+            out.push(body[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// The functions a program can run: those reachable from main and the
 /// startup functions its prologue calls, through any token of a body that
 /// names another function (a call, an rcall, a funcref, a closure). Only
@@ -2069,6 +2151,8 @@ fn ir_functions<'a>(lines: &[&'a str]) -> Vec<IrFunction<'a>> {
 /// bodies nobody calls: the unspecialized template of a generic method and
 /// the copy of a method for an instance that never calls it. Those may call
 /// what does not exist for their types, so they are not compiled at all.
+/// Inside `*__cc_register_tracers*`, a tracer/user-drop registration only
+/// becomes live once its destructor is referenced by live code.
 /// IR without a main (a consumer unit test) keeps every function.
 fn live_functions(functions: &[IrFunction<'_>]) -> Option<HashSet<String>> {
     let mut bodies: HashMap<&str, &[&str]> = HashMap::new();
@@ -2078,25 +2162,79 @@ fn live_functions(functions: &[IrFunction<'_>]) -> Option<HashSet<String>> {
     if !bodies.contains_key("main") {
         return None;
     }
-    let mut work: Vec<&str> = bodies
-        .keys()
-        .copied()
-        .filter(|name| {
-            *name == "main"
-                || name.starts_with("__init_globals")
-                || name.contains("__cc_register_tracers")
-        })
+    let mut tracer_regs: Vec<&str> = Vec::new();
+    let mut work: Vec<&str> = Vec::new();
+    for &name in bodies.keys() {
+        if name.contains("__cc_register_tracers") {
+            tracer_regs.push(name);
+        } else if name == "main" || name.starts_with("__init_globals") {
+            work.push(name);
+        }
+    }
+    let mut live: HashSet<String> = work
+        .iter()
+        .chain(tracer_regs.iter())
+        .map(|name| name.to_string())
         .collect();
-    let mut live: HashSet<String> = work.iter().map(|name| name.to_string()).collect();
-    while let Some(name) = work.pop() {
-        for line in bodies[name] {
-            for token in line.split_whitespace().skip(1) {
-                if let Some((&callee, _)) = bodies.get_key_value(token) {
-                    if live.insert(callee.to_string()) {
-                        work.push(callee);
+    // Scan any non-registration lines inside `*__cc_register_tracers*` up front
+    // so conservative fallback keeps unexpected calls alive.
+    for &reg_fn in &tracer_regs {
+        let body = bodies[reg_fn];
+        let mut i = 0;
+        while i < body.len() {
+            if match_cc_register_tracer(body, i).is_some() {
+                i += 3;
+            } else if match_cc_register_user_drop(body, i).is_some() {
+                i += 2;
+            } else {
+                for token in body[i].split_whitespace().skip(1) {
+                    if let Some((&callee, _)) = bodies.get_key_value(token) {
+                        if live.insert(callee.to_string()) {
+                            work.push(callee);
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+    }
+    loop {
+        while let Some(name) = work.pop() {
+            for line in bodies[name] {
+                for token in line.split_whitespace().skip(1) {
+                    if let Some((&callee, _)) = bodies.get_key_value(token) {
+                        if live.insert(callee.to_string()) {
+                            work.push(callee);
+                        }
                     }
                 }
             }
+        }
+        // Activate tracer functions only for destructors that live code actually uses.
+        let mut added = false;
+        for &reg_fn in &tracer_regs {
+            let body = bodies[reg_fn];
+            let mut i = 0;
+            while i < body.len() {
+                if let Some((dtor, tracer)) = match_cc_register_tracer(body, i) {
+                    if live.contains(dtor) {
+                        if let Some((&callee, _)) = bodies.get_key_value(tracer) {
+                            if live.insert(callee.to_string()) {
+                                work.push(callee);
+                                added = true;
+                            }
+                        }
+                    }
+                    i += 3;
+                } else if match_cc_register_user_drop(body, i).is_some() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if !added {
+            break;
         }
     }
     Some(live)
@@ -2160,6 +2298,46 @@ pub fn compile_from_ir(
     let functions = ir_functions(&lines);
     let live = live_functions(&functions);
     let is_live = |name: &str| live.as_ref().map_or(true, |set| set.contains(name));
+
+    // When dead-function elimination is active (`main` is present), track which
+    // globals and string literals live functions actually reference so unused
+    // globals and dead `.rodata` string literals are omitted.
+    let (live_globals, mut live_strings): (Option<HashSet<String>>, Option<HashSet<String>>) =
+        if let Some(ref live_set) = live {
+            let mut g_used: HashSet<String> = HashSet::new();
+            let mut s_used: HashSet<String> = HashSet::new();
+            let mut seen_funcs: HashSet<&str> = HashSet::new();
+            for function in &functions {
+                if !live_set.contains(function.name) || !seen_funcs.insert(function.name) {
+                    continue;
+                }
+                let filtered: Vec<&str>;
+                let body: &[&str] = if function.name.contains("__cc_register_tracers") {
+                    filtered = filter_tracer_reg_body(&function.body, live_set);
+                    &filtered
+                } else {
+                    &function.body
+                };
+                for line in body {
+                    let mut parts = line.split_whitespace();
+                    let Some(op) = parts.next() else { continue };
+                    if op == "strref" {
+                        let _reg = parts.next();
+                        if let Some(sid) = parts.next() {
+                            s_used.insert(sid.to_string());
+                        }
+                    } else {
+                        for tok in parts {
+                            g_used.insert(tok.to_string());
+                        }
+                    }
+                }
+            }
+            (Some(g_used), Some(s_used))
+        } else {
+            (None, None)
+        };
+
     let mut declared_funcs: HashMap<String, FuncId> = HashMap::new();
     let mut string_data: Vec<(String, String)> = Vec::new();
     // the struct names (and aliases) the IR declares: a call to one is its
@@ -2207,7 +2385,10 @@ pub fn compile_from_ir(
             }
             "global" if parts.len() >= 3 => {
                 let gname = parts[1].to_string();
-                if !global_data.contains_key(&gname) {
+                let global_is_live = live_globals
+                    .as_ref()
+                    .map_or(true, |set| set.contains(&gname));
+                if global_is_live && !global_data.contains_key(&gname) {
                     let init_kind = parts[2];
                     use cranelift_module::DataDescription;
                     // Rename global if it conflicts with a function name
@@ -2246,6 +2427,9 @@ pub fn compile_from_ir(
                     // Track str: globals that need runtime initialization
                     if init_kind.starts_with("str:") {
                         let str_id = &init_kind[4..]; // e.g., "m0s0"
+                        if let Some(ref mut s_used) = live_strings {
+                            s_used.insert(str_id.to_string());
+                        }
                         str_globals.push((gname.clone(), str_id.to_string()));
                         string_global_names.insert(gname);
                     }
@@ -2296,14 +2480,26 @@ pub fn compile_from_ir(
         }
     }
 
-    // Declare string literal data
+    // Declare live string literal data, deduplicating identical static `.rodata`
+    // payloads across modules (literals are immutable with static magic).
     let mut string_lits: HashMap<String, DataId> = HashMap::new();
+    let mut content_to_data: HashMap<&str, DataId> = HashMap::new();
     for (idx, content) in &string_data {
+        if let Some(ref s_used) = live_strings {
+            if !s_used.contains(idx.as_str()) {
+                continue;
+            }
+        }
         if !string_lits.contains_key(idx) {
-            let name = format!("__irstr_{}", idx);
-            let data_id = crate::declare_string_data(&mut codegen.module, &name, content)
-                .map_err(|e| CompileError::ModuleError(format!("string data: {:?}", e)))?;
-            string_lits.insert(idx.clone(), data_id);
+            if let Some(&existing_id) = content_to_data.get(content.as_str()) {
+                string_lits.insert(idx.clone(), existing_id);
+            } else {
+                let name = format!("__irstr_{}", idx);
+                let data_id = crate::declare_string_data(&mut codegen.module, &name, content)
+                    .map_err(|e| CompileError::ModuleError(format!("string data: {:?}", e)))?;
+                content_to_data.insert(content.as_str(), data_id);
+                string_lits.insert(idx.clone(), data_id);
+            }
         }
     }
 
@@ -2326,7 +2522,12 @@ pub fn compile_from_ir(
         let func_retkind = function.retkind.to_string();
         let param_names = &function.params;
         let param_kinds = &function.param_kinds;
-        let body_lines = function.body.clone();
+        let body_lines: Vec<&str> = match &live {
+            Some(live_set) if func_name.contains("__cc_register_tracers") => {
+                filter_tracer_reg_body(&function.body, live_set)
+            }
+            _ => function.body.clone(),
+        };
 
         // Compile this function (skip if already compiled from an earlier module)
         if compiled_funcs.contains(&func_name) {
@@ -5396,6 +5597,61 @@ mod tests {
             ["__init_globals", "cb", "deep", "m___cc_register_tracers_m0", "main"]
         );
         assert!(live_functions(&ir_functions(&["func helper 0 int", "endfunc"])).is_none());
+    }
+
+    #[test]
+    fn cc_tracer_registration_keeps_only_live_destructors() {
+        let ir = "func main 0 int\nfuncref 1 __dtor_Used\nret 1\nendfunc\n\
+                  func __dtor_Used 1 void\nparam p\nret 0\nendfunc\n\
+                  func __cc_trace_Used 1 void\nparam p\nret 0\nendfunc\n\
+                  func __dtor_Unused 1 void\nparam p\nret 0\nendfunc\n\
+                  func __cc_trace_Unused 1 void\nparam p\nret 0\nendfunc\n\
+                  func m___cc_register_tracers_m0 0 int\n\
+                  funcref 1 __dtor_Used\n\
+                  funcref 2 __cc_trace_Used\n\
+                  call 3 pith_cc_register_tracer void 2 1 2\n\
+                  funcref 4 __dtor_Unused\n\
+                  funcref 5 __cc_trace_Unused\n\
+                  call 6 pith_cc_register_tracer void 2 4 5\n\
+                  funcref 7 __dtor_Unused\n\
+                  call 8 pith_cc_register_user_drop void 1 7\n\
+                  iconst 9 0\n\
+                  ret 9\n\
+                  endfunc\n";
+        let lines: Vec<&str> = ir.lines().collect();
+        let funcs = ir_functions(&lines);
+        let live = live_functions(&funcs).expect("main is present");
+        assert!(live.contains("__dtor_Used"));
+        assert!(live.contains("__cc_trace_Used"));
+        assert!(!live.contains("__dtor_Unused"));
+        assert!(!live.contains("__cc_trace_Unused"));
+        let reg = funcs
+            .iter()
+            .find(|f| f.name == "m___cc_register_tracers_m0")
+            .unwrap();
+        let filtered = filter_tracer_reg_body(&reg.body, &live);
+        assert_eq!(filtered.len(), 5);
+        assert!(filtered[0].contains("__dtor_Used"));
+        assert!(filtered[1].contains("__cc_trace_Used"));
+        assert!(filtered[2].contains("pith_cc_register_tracer"));
+    }
+
+    #[test]
+    fn dead_strings_pruned_and_duplicate_live_strings_compile() {
+        compile_with_runtime_for_ir(
+            "string m0s0 \"shared\"\n\
+             string m1s0 \"shared\"\n\
+             string m2s0 \"dead string never used\"\n\
+             global g_dead 42\n\
+             global g_dead_str str:m2s0\n\
+             func main 0 int\n\
+             strref 1 m0s0\n\
+             strref 2 m1s0\n\
+             iconst 3 0\n\
+             ret 3\n\
+             endfunc\n",
+        )
+        .expect("live deduplicated strings and pruned dead globals should compile cleanly");
     }
 
     // every IR-declared function returns i64, so only the runtime table can

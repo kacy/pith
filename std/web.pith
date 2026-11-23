@@ -62,15 +62,23 @@ import std.shutdown as shutdown
 # forever.
 CONNECTION_TIMEOUT_MS := 5000
 
+# how long a request body may take once its head is in. without a total, a
+# client that sends one body byte every few seconds never trips the per-read
+# bound and holds its connection slot for as long as it likes, and
+# max_connections of them shut the server out. 60 s moves the default 10 mb
+# body at about 170 kb/s; an app that takes larger or slower uploads raises it
+# with read_body_timeout_ms.
+BODY_TIMEOUT_MS := 60000
+
 # the ServerConfig a new App starts with: http.server_config() with
-# read_header_timeout_ms and idle_timeout_ms at CONNECTION_TIMEOUT_MS. net/http
-# leaves every timeout off by default, which lets a client that sends one byte
-# at a time hold a connection forever; std.web does not. read_timeout_ms and
-# write_timeout_ms stay off, so a large upload or a slow reader is not cut off
-# at a fixed total, but each read still has to make progress within
-# CONNECTION_TIMEOUT_MS. change any of it with App.with_config.
+# read_header_timeout_ms and idle_timeout_ms at CONNECTION_TIMEOUT_MS and
+# read_body_timeout_ms at BODY_TIMEOUT_MS. net/http leaves every timeout off by
+# default, which lets a client that sends one byte at a time hold a connection
+# forever; std.web does not. read_timeout_ms and write_timeout_ms stay off, and
+# each read still has to make progress within CONNECTION_TIMEOUT_MS. change any
+# of it with App.with_config.
 pub fn server_config() -> http.ServerConfig:
-    return http.server_config().with_read_header_timeout(CONNECTION_TIMEOUT_MS).with_idle_timeout(CONNECTION_TIMEOUT_MS)
+    return http.server_config().with_read_header_timeout(CONNECTION_TIMEOUT_MS).with_idle_timeout(CONNECTION_TIMEOUT_MS).with_read_body_timeout(BODY_TIMEOUT_MS)
 
 # bound each read on a connection by itself: no read may wait longer than
 # CONNECTION_TIMEOUT_MS for its next byte, or the longest read timeout `config`
@@ -1679,10 +1687,11 @@ test "a tls connection holds a slot through its handshake and is refused past th
     config.close()
     shutdown.reset()
 
-test "a new app starts with the read-header and idle deadlines on":
+test "a new app starts with the read-header, idle and body deadlines on":
     config := new().config
     assert_eq(config.read_header_timeout_ms, CONNECTION_TIMEOUT_MS)
     assert_eq(config.idle_timeout_ms, CONNECTION_TIMEOUT_MS)
+    assert_eq(config.read_body_timeout_ms, BODY_TIMEOUT_MS)
     assert_eq(config.read_timeout_ms, 0)
     assert_eq(config.max_body_bytes, http.MAX_REQUEST_BODY)
 

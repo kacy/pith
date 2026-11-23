@@ -24,9 +24,24 @@ fn route(req: http.HttpRequestBytes) -> http.HttpResponse:
     path := req.path() catch "?"
     if path == "/echo":
         return http.text(200, req.body_text() catch "?")
+    if path == "/stream":
+        return read_streamed()
     if path == "/big":
         return http.response(200).with_body_bytes(big_body())
     return http.text(200, "ok")
+
+# read a streamed body to its end. a read past the body deadline fails with
+# http.BODY_TIMEOUT_MESSAGE, which this handler answers with 408.
+fn read_streamed() -> http.HttpResponse:
+    while true:
+        part := http.read_body_part(4096)
+        if part.is_err:
+            if part.err == http.BODY_TIMEOUT_MESSAGE:
+                return http.text(408, "body timed out")
+            return http.text(500, part.err)
+        if part.ok.is_empty():
+            return http.text(200, "read")
+    return http.text(500, "?")
 
 # 64 mb, more than a loopback socket's buffers hold, so a client that never
 # reads leaves the server's write waiting.
@@ -120,6 +135,19 @@ fn slow_body_case() -> Int!:
     config := http.server_config().with_read_timeout(300)
     port := start_server(22810, config)!
     print("slow body: " + drip(port, "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\n")!)
+    return 0
+
+# read_body_timeout_ms bounds the body on its own, counted from the end of the
+# head, whether the body is sized, chunked, or streamed by the handler.
+fn body_deadline_case() -> Int!:
+    config := http.server_config().with_read_body_timeout(300)
+    port := start_server(22910, config)!
+    print("body deadline, sized: " + drip(port, "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\n")!)
+    print("body deadline, chunked: " + drip(port, "POST /echo HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n1000\r\n")!)
+    streamed := start_server(22960, config.with_stream_request_bodies(true))!
+    print("body deadline, streamed: " + drip(streamed, "POST /stream HTTP/1.1\r\nHost: h\r\nContent-Length: 1000\r\n\r\n")!)
+    # a body that arrives in time is not affected
+    exchange("body deadline, prompt body", "POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n\r\nabcd", config)!
     return 0
 
 # a connection that never sends a byte is closed at the head deadline with no
@@ -270,6 +298,7 @@ fn main() -> Int!:
     keep_alive_case()!
     slowloris_case()!
     slow_body_case()!
+    body_deadline_case()!
     idle_case()!
     write_timeout_case()!
     tls_case()!

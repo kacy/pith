@@ -3636,7 +3636,7 @@ fn compile_ir_function(
             // released once that one has copied it.
             "concatn" if parts.len() >= 4 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
-                let ints = join_int_bits(parts[2]);
+                let ints = join_int_bits(parts[2], parts.len() - 3, pith_runtime::CONCAT_MANY_MAX);
                 let mut values = Vec::with_capacity(parts.len() - 3);
                 for t in &parts[3..] {
                     values.push(get_reg(&regs, t)?);
@@ -3690,7 +3690,7 @@ fn compile_ir_function(
             // the previous result's count, so nothing is released here.
             "appendn" if parts.len() >= 5 => {
                 let reg = parse_reg(parts[1], line, func_name)?;
-                let ints = join_int_bits(parts[2]);
+                let ints = join_int_bits(parts[2], parts.len() - 4, pith_runtime::APPEND_MANY_MAX);
                 let mut acc = get_reg(&regs, parts[3])?;
                 let mut values = Vec::with_capacity(parts.len() - 4);
                 for t in &parts[4..] {
@@ -4913,8 +4913,12 @@ fn fuse_int_parts(body: &[&str]) -> Option<Vec<String>> {
 
 /// The Int bits of a `concatn` or `appendn` count word, already shifted into
 /// place for the runtime call. `fuse_int_parts` sets them only on a join that
-/// fits one call.
-fn join_int_bits(count_word: &str) -> i64 {
+/// fits one call, so a join of more than `max` parts has none. Its count word
+/// is the plain part count, and a count of 256 or more reaches the Int bits.
+fn join_int_bits(count_word: &str, parts: usize, max: usize) -> i64 {
+    if parts > max {
+        return 0;
+    }
     let word = count_word.parse::<i64>().unwrap_or(0);
     word >> pith_runtime::JOIN_INT_SHIFT << pith_runtime::JOIN_INT_SHIFT
 }

@@ -17,7 +17,7 @@
 # prefix from when every module shared one flat symbol namespace; newer
 # code does not follow it.
 
-from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
+from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
 from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, binding_is_module_level, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
 from ast import Node, get_node, node_kind, node_value, node_child_count, node_child, append_node_child, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, render_diagnostics_json
@@ -618,9 +618,23 @@ fn resolve_type_name_module_scoped(name: String) -> Int:
         if by_import_name >= 0:
             return by_import_name
         return lookup_qualified_type_id(module_path, member)
-    if member == "" and current_checker_module_path.len() > 0:
-        # a bare name — prefer the current module's own declaration.
-        return lookup_qualified_type_id(current_checker_module_path, name)
+    if member == "":
+        # a bare name — prefer the current module's (or entry file's) own
+        # declaration, then any type brought in by `from mod import Type` or
+        # `from mod import *`, so a module checked later that declares a
+        # same-named struct cannot hijack the global name table.
+        if current_checker_module_path.len() > 0:
+            own := lookup_qualified_type_id(current_checker_module_path, name)
+            if own >= 0:
+                return own
+        else:
+            own := lookup_entry_type_id(name)
+            if own >= 0:
+                return own
+        for src in bare_name_import_sources(name):
+            by_src := lookup_qualified_type_id(src, name)
+            if by_src >= 0:
+                return by_src
     return -1
 
 # last resort for an `alias.Type` whose alias is not one of ours. it happens
@@ -8227,7 +8241,9 @@ fn check_variant_pattern_match(pat_idx: Int, pat: Node, expected_type: Int, scop
         return
     type_name := parts.0
     variant_name := parts.1
-    mut enum_tid := lookup_type_id(type_name)
+    mut enum_tid := resolve_type_name_module_scoped(type_name)
+    if enum_tid < 0:
+        enum_tid = lookup_type_id(type_name)
     # a generic enum registers only its instances (Opt[Int]), never the bare
     # base, so a pattern's `Opt.Some` finds nothing by name and used to die
     # here with "unknown type". the subject already names the instance, and
@@ -8713,7 +8729,9 @@ fn check_tuple_expression(node_idx: Int, node: Node, scope_id: Int) -> Int:
 fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
     # node.value contains the struct type name
     struct_name := node.value
-    struct_tid := lookup_type_id(struct_name)
+    mut struct_tid := resolve_type_name_module_scoped(struct_name)
+    if struct_tid < 0:
+        struct_tid = lookup_type_id(struct_name)
     if struct_tid < 0:
         report_error("E202", "unknown type: " + struct_name)
         return TID_ERR

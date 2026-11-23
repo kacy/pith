@@ -1,0 +1,22 @@
+# a guarded collection passed to a function value, which may keep it (E276)
+guard mu:
+    mut items: List[Int] := []
+
+fn pusher(n: Int) -> Int:
+    for i in 0..n:
+        locked mu:
+            items.push(i)
+    return n
+
+fn feed(sink: fn(List[Int]) -> Int) -> Int:
+    mut n := 0
+    locked mu:
+        n = sink(items)
+    return n
+
+fn main() -> Int!:
+    a := spawn pusher(100)
+    n := feed(fn(xs: List[Int]) => xs.len())
+    r := await a
+    print("{r} {n}")
+    return 0

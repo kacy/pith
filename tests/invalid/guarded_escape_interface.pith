@@ -1,0 +1,30 @@
+# a guarded collection passed to an interface method whose implementation
+# stores it in a field of a struct that outlives the block (E276)
+interface Sink:
+    fn take(x: List[Int])
+
+struct Keep:
+    store: List[List[Int]]
+
+impl Sink for Keep:
+    fn take(x: List[Int]):
+        self.store.push(x)
+
+guard mu:
+    mut items: List[Int] := []
+
+fn pusher(n: Int) -> Int:
+    for i in 0..n:
+        locked mu:
+            items.push(i)
+    return n
+
+fn main() -> Int!:
+    k := Keep(store: [])
+    s: Sink := k
+    a := spawn pusher(100)
+    locked mu:
+        s.take(items)
+    r := await a
+    print("{r} {k.store[0].len()}")
+    return 0

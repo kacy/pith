@@ -1,0 +1,19 @@
+# a guarded collection pushed into a list declared outside the `locked` block
+# reaches its buffer after the lock is released (E276)
+guard mu:
+    mut items: List[String] := []
+
+fn pusher(n: Int) -> Int:
+    for i in 0..n:
+        locked mu:
+            items.push("item-{i}")
+    return n
+
+fn main() -> Int!:
+    a := spawn pusher(100)
+    mut got: List[List[String]] := []
+    locked mu:
+        got.push(items)
+    n := await a
+    print("{n} {got[0].len()}")
+    return 0

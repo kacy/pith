@@ -246,7 +246,9 @@ request side, `send(req)` encodes and frames one message and `close_send()`
 half-closes. on the response side, `recv()` reads one reply,
 `recv_response()` reads the single reply of a client-streaming rpc, and
 `collect()` gathers every remaining reply into a `List`. every handle has a
-`close()` that releases the stream; call it once you are done.
+`close()` that releases the stream; call it once you are done. a handle dropped
+without `close()` releases the stream as well. if the rpc was still running,
+the drop also resets it, provided the connection's send queue has room.
 
 `recv()` is on the server-streaming and bidi handles. it blocks for the next
 response and returns a `<Svc><Rpc>Reply`, the client-side mirror of the

@@ -113,17 +113,19 @@ stale and a fix to it is welcome.
   certificates but no session resumption or renegotiation.
 - **a destructor is a backstop for `close()`**. files, processes, io readers,
   writers and buffers, tls connections and listeners, http and http/2
-  connections, websocket sessions and database connections, transactions and
-  statements release what they hold when their last value dies. a destructor
-  does no network i/o, so a tls connection dropped without `close()` sends no
-  close_notify, a dropped websocket sends no close frame, a buffered writer
-  dropped without `flush()` loses what it held, and a dropped `std.db`
-  transaction is rolled back by closing its connection. call `close()` where
-  the peer must see a clean end. three types still close by hand only:
-  `std.bytes.ByteBuffer` (`free()` or `take_bytes()`), grpc streams, and an
-  `http2.Client`, which its own reader and writer tasks keep alive. `pith
-  lint` flags a local of a type without a destructor that is never closed
-  (E307). docs/destructors_roadmap.md tracks the rest.
+  connections, http/2 and grpc streams, websocket sessions and database
+  connections, transactions and statements release what they hold when their
+  last value dies. a destructor does no network i/o, so a tls connection
+  dropped without `close()` sends no close_notify, a dropped websocket sends no
+  close frame, a buffered writer dropped without `flush()` loses what it held,
+  and a dropped `std.db` transaction is rolled back by closing its connection.
+  a dropped stream that is still open queues its reset only when the
+  connection's send queue has room. call `close()` where the peer must see a
+  clean end. two types still close by hand only: `std.bytes.ByteBuffer`
+  (`free()` or `take_bytes()`) and an `http2.Client`, which its own reader and
+  writer tasks keep alive. `pith lint` flags a local of a type without a
+  destructor that is never closed (E307). docs/destructors_roadmap.md tracks
+  the rest.
 - **testing has no benchmarks**. `pith test` runs `test` blocks with
   `--filter`, `--tag`, `--exclude-tag` and `--json`, and `std/testing` adds
   assertions, fixtures and parameterized cases, but there is no benchmark
@@ -173,8 +175,7 @@ stale and a fix to it is welcome.
 - **a declaration or a statement points at its last token**. an expression,
   type or pattern diagnostic points at where it starts, but one about a
   function or a statement names the line of its last token: a duplicate method
-  is reported on the last line of its body. go-to-definition on a local lands
-  on the end of its initializer (#1158).
+  is reported on the last line of its body.
 - **no package registry**. dependencies are local path entries in
   `pith.toml`. `pith package lock` and `pith package install` work on those
   paths, but nothing fetches over the network.

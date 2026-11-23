@@ -39,7 +39,7 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
-from checker import c_interface_coercion, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import c_interface_coercion, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_argument_widens_to_result, c_result_widening_target, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -1774,11 +1774,14 @@ fn ir_defer_emit_for_loop_jump():
 # borrowed. cascading one of those releases the container's own count on an
 # element it is still holding.
 fn ir_tuple_record_tid(name: String, val_idx: Int):
-    tid := c_get_expr_type(val_idx)
+    mut tid := c_result_widening_target(val_idx)
+    widened_res := tid >= 0
+    if not widened_res:
+        tid = c_get_expr_type(val_idx)
     if tid < 0:
         return
     mut recorded := tid
-    if ir_expr_is_borrowed(val_idx) or not ir_shell_producer_transfers(val_idx):
+    if not widened_res and (ir_expr_is_borrowed(val_idx) or not ir_shell_producer_transfers(val_idx)):
         recorded = 0 - 1
     if ir_tuple_local_tid.contains_key(name):
         if not ir_tuple_tids_same_shape(ir_tuple_local_tid[name], recorded):
@@ -4989,6 +4992,18 @@ fn ir_value_is_already_the_optional(val_idx: Int, actual_info: TypeInfo, target_
 # the argument position has no target to consult and leans on the checker's
 # record instead.
 fn ir_emit_optional_for_target(val_idx: Int, vn: Node, target_inner: String) -> Int:
+    if c_argument_widens_to_result(val_idx):
+        mut ok_r := 0
+        if vn.kind == "none_lit":
+            ok_r = ir_emit_optional_none_value()
+        elif c_argument_widens_to_optional(val_idx):
+            ok_r = ir_emit_some_over(ir_expr(val_idx), val_idx, true)
+        else:
+            ok_r = ir_expr(val_idx)
+            ok_kind := ir_rc_kind(ir_infer_type(val_idx))
+            if ok_kind.len() > 0 and ir_expr_is_borrowed(val_idx):
+                ir_rc_retain_reg(ok_r, ok_kind)
+        return ir_emit_ok_result_tuple(ok_r)
     if vn.kind == "none_lit":
         return ir_emit_optional_none_value()
     value_r := ir_expr(val_idx)

@@ -1,0 +1,69 @@
+# Optional widening inside Result-wrapped tuples (e.g. `-> (Bytes, Bytes?)!`)
+# and Ok-widening into Result-typed bindings/assignments (`mut r: T! := v`).
+
+import std.bytes as bytes
+
+fn pair_bytes(b: Bytes, keep: Bool) -> (Bytes, Bytes?)!:
+    if b.len() == 0:
+        fail "empty"
+    if keep:
+        return (b, b)
+    return (b, none)
+
+fn pair_strings(s: String) -> (String, String?)!:
+    return (s + "!", s)
+
+fn fail_int() -> Int!:
+    fail "nope"
+
+fn fail_str() -> String!:
+    fail "bad"
+
+fn main() -> Int:
+    b := bytes.from_string_utf8("abc")
+    p1 := pair_bytes(b, true) catch (bytes.empty(), none)
+    print("p1=" + (p1.0.to_string_utf8() catch "") + ":" + (p1.1.unwrap_or(bytes.empty()).to_string_utf8() catch ""))
+
+    p2 := pair_bytes(b, false) catch (bytes.empty(), none)
+    print("p2=" + (p2.0.to_string_utf8() catch "") + ":" + (p2.1 == none).to_string())
+
+    ps := pair_strings("hi") catch ("", none)
+    print("ps=" + ps.0 + ":" + ps.1.unwrap_or(""))
+
+    mut ri: Int! := 42
+    print("ri1=" + (ri catch 0).to_string())
+    ri = 99
+    print("ri2=" + (ri catch 0).to_string())
+    ri = fail_int()
+    print("ri3=" + ri.err)
+
+    local_s := "hello"
+    mut rs: String! := local_s
+    print("rs1=" + (rs catch ""))
+    rs = local_s + "-world"
+    print("rs2=" + (rs catch ""))
+    rs = fail_str()
+    print("rs3=" + rs.err)
+
+    mut ro: Int?! := 7
+    print("ro1=" + (ro catch none).unwrap_or(0).to_string())
+    ro = none
+    print("ro2=" + ((ro catch none) == none).to_string())
+    ro = 11
+    print("ro3=" + (ro catch none).unwrap_or(0).to_string())
+
+    mut rt: (Int, Int?)! := (1, 2)
+    tval := rt catch (0, none)
+    print("rt=" + tval.0.to_string() + ":" + tval.1.unwrap_or(0).to_string())
+
+    # Churn heap payloads to verify balanced refcounting across rebinds.
+    mut i := 0
+    mut total := 0
+    while i < 20:
+        mut loop_r: String! := "item-" + i.to_string()
+        loop_r = local_s
+        pair := pair_strings("v" + i.to_string()) catch ("", none)
+        total = total + (loop_r catch "").len() + pair.0.len() + pair.1.unwrap_or("").len()
+        i = i + 1
+    print("churn=" + total.to_string())
+    return 0

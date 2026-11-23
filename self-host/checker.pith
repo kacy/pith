@@ -245,6 +245,10 @@ mut recording_generic_types := false
 # call name is resolved, so the decision is recorded here at the one place
 # that does know it. see argument_widens_to_optional.
 pub mut optional_widened_arguments: Map[Int, Bool] := {}
+# expressions accepted by widening a plain value into a Result-typed binding or
+# assignment target (`mut r: Int! := 42`, `r = 99`), mapped to the Result's
+# target type id so the emitter builds an owning Ok box and cascades its payload.
+pub mut result_widened_arguments: Map[Int, Int] := {}
 # a value the emitter has to convert to an interface value, keyed by its
 # expression node, holding the interface's type id. recorded at the same
 # acceptance sites as optional_widened_arguments.
@@ -316,6 +320,7 @@ pub fn initialize_checker(file_path: String):
     shared_field_site_seen = {}
     locked_paths = []
     optional_widened_arguments = {}
+    result_widened_arguments = {}
     interface_coercions = {}
     literal_targets = {}
     open_empty_literal_bindings = {}
@@ -3176,6 +3181,45 @@ fn argument_widens_to_optional(expr_idx: Int, actual_tid: Int, expected_tid: Int
 pub fn c_argument_widens_to_optional(expr_idx: Int) -> Bool:
     return optional_widened_arguments.contains_key(expr_idx)
 
+# does the emitter have to wrap this expression in Ok(v) for a Result target?
+pub fn c_argument_widens_to_result(expr_idx: Int) -> Bool:
+    return result_widened_arguments.contains_key(expr_idx)
+
+# the Result target type id for an expression widened to Ok(v), or -1.
+pub fn c_result_widening_target(expr_idx: Int) -> Int:
+    if result_widened_arguments.contains_key(expr_idx):
+        return result_widened_arguments[expr_idx]
+    return 0 - 1
+
+# accept a plain value (or an optional-widening inner value) into a Result
+# binding or assignment target, recording it so the emitter builds an Ok box.
+fn result_target_accepts_value(value_idx: Int, actual_tid: Int, expected_tid: Int) -> Bool:
+    if value_idx < 0 or actual_tid < 0 or expected_tid < 0:
+        return false
+    if is_error_type(actual_tid) or is_error_type(expected_tid):
+        return false
+    expected_info := get_type_info(expected_tid)
+    if expected_info.kind != "result" or expected_info.inner < 0:
+        return false
+    if get_type_info(actual_tid).kind == "result":
+        return false
+    ok_tid := expected_info.inner
+    if is_none_type(actual_tid):
+        if get_type_info(ok_tid).kind == "optional":
+            result_widened_arguments.insert(value_idx, expected_tid)
+            return true
+        return false
+    if actual_tid == ok_tid or types_structurally_equal(actual_tid, ok_tid):
+        result_widened_arguments.insert(value_idx, expected_tid)
+        return true
+    if get_type_info(ok_tid).kind == "optional" and argument_widens_to_optional(value_idx, actual_tid, ok_tid):
+        result_widened_arguments.insert(value_idx, expected_tid)
+        return true
+    if interface_value_accepts(value_idx, actual_tid, ok_tid):
+        result_widened_arguments.insert(value_idx, expected_tid)
+        return true
+    return false
+
 # accept a value into an optional target and record what the emitter has to
 # build for it. the two answers differ: `none` and a value that is already the
 # optional arrive in the right shape and are recorded as nothing, while a
@@ -3503,6 +3547,9 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
             if optional_target_accepts_value(node.children[1], val_type, annotated):
                 define_binding_at(scope_id, name, annotated, is_mut, node_idx)
                 return
+            if result_target_accepts_value(node.children[1], val_type, annotated):
+                define_binding_at(scope_id, name, annotated, is_mut, node_idx)
+                return
             if is_error_type(val_type) == false:
                 if annotated != val_type:
                     if types_structurally_equal(annotated, val_type):
@@ -3635,6 +3682,8 @@ fn check_assignment(node: Node, scope_id: Int):
     # `Int?` holding 5 answered 0, with no diagnostic anywhere.
     if op == "=":
         if optional_target_accepts_value(value_idx, val_type, target_type):
+            return
+        if result_target_accepts_value(value_idx, val_type, target_type):
             return
         if collection_literal_matches_target(value_idx, target_type, scope_id):
             return
@@ -8458,6 +8507,8 @@ fn note_literal_target(value_idx: Int, target_tid: Int):
         return
     # a literal's elements are stored into the target's element positions
     mut info := get_type_info(target_tid)
+    if info.kind == "result" and info.inner >= 0 and (kind == "list" or kind == "map" or kind == "set" or kind == "tuple"):
+        info = get_type_info(info.inner)
     if info.kind == "optional" and info.inner >= 0 and (kind == "list" or kind == "map" or kind == "set" or kind == "tuple"):
         info = get_type_info(info.inner)
     if kind == "list" or kind == "map" or kind == "tuple":
@@ -8477,11 +8528,13 @@ fn note_literal_target(value_idx: Int, target_tid: Int):
                 note_literal_target(child, info.elements[i])
 
 # the instance of generic struct `decl_idx` a constructor call is stored
-# into, through an optional, or -1 when its target is not one
+# into, through a result or optional, or -1 when its target is not one
 fn generic_struct_target(call_idx: Int, decl_idx: Int) -> Int:
     if not literal_targets.contains_key(call_idx):
         return 0 - 1
     mut target := literal_targets[call_idx]
+    if target >= 0 and get_type_info(target).kind == "result":
+        target = get_type_info(target).inner
     if target >= 0 and get_type_info(target).kind == "optional":
         target = get_type_info(target).inner
     if target < 0 or not struct_instance_decl_idx.contains_key(target):
@@ -8643,6 +8696,8 @@ fn check_tuple_expression(node_idx: Int, node: Node, scope_id: Int) -> Int:
     mut target_elems: List[Int] := []
     if literal_targets.contains_key(node_idx):
         mut info := get_type_info(literal_targets[node_idx])
+        if info.kind == "result" and info.inner >= 0:
+            info = get_type_info(info.inner)
         if info.kind == "optional" and info.inner >= 0:
             info = get_type_info(info.inner)
         if info.kind == "tuple":
@@ -9752,6 +9807,7 @@ pub struct CheckerSnapshot:
     pub expression_type_cache: Map[Int, Int]
     pub definition_of: Map[Int, Int]
     pub optional_widened_arguments: Map[Int, Bool]
+    pub result_widened_arguments: Map[Int, Int]
     pub interface_coercions: Map[Int, Int]
     pub open_empty_literal_bindings: Map[Int, Int]
     pub type_resolve_depth: Int
@@ -9828,6 +9884,7 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         expression_type_cache: copy_map(expression_type_cache),
         definition_of: copy_map(definition_of),
         optional_widened_arguments: copy_map(optional_widened_arguments),
+        result_widened_arguments: copy_map(result_widened_arguments),
         interface_coercions: copy_map(interface_coercions),
         open_empty_literal_bindings: copy_map(open_empty_literal_bindings),
         type_resolve_depth: type_resolve_depth,
@@ -9904,6 +9961,7 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     expression_type_cache = copy_map(s.expression_type_cache)
     definition_of = copy_map(s.definition_of)
     optional_widened_arguments = copy_map(s.optional_widened_arguments)
+    result_widened_arguments = copy_map(s.result_widened_arguments)
     interface_coercions = copy_map(s.interface_coercions)
     open_empty_literal_bindings = copy_map(s.open_empty_literal_bindings)
     type_resolve_depth = s.type_resolve_depth

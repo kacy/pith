@@ -25,8 +25,9 @@ These should remain Rust for the foreseeable future:
 
 The desired end state is not zero Rust. It is a thin Rust backend/runtime with
 the language, compiler policy, and most standard-library logic living in Pith.
-TLS already follows that line: it lives in `std.net.tls`, `std.net.tls13`, and
-the Pith-side crypto helpers rather than in a Rust runtime module.
+TLS already follows that line: it lives in `std.net.tls`, `std.net.tls13`,
+`std.net.tls12`, and the Pith-side crypto helpers rather than in a Rust runtime
+module.
 
 ## Migration Phases (done)
 

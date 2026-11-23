@@ -989,10 +989,10 @@ the 503 is best-effort. closing a socket that still holds unread data resets it
 rather than finishing it cleanly, and a client that gets a reset drops what it had
 buffered — so a peer that had already sent its request, which is most of them when
 a cap is firing, sees a connection error instead of the status line. draining the
-request first is what would fix that, and it cannot be done without a read that
-has no deadline under the green runtime, which would park the accept loop for
-good. so treat the refusal metric as the signal and the 503 as a courtesy to the
-clients that happen to be waiting.
+request first is what would fix that, and even a bounded read would hold the
+accept loop for up to its deadline against every silent peer, breaking the
+property that the accept loop never waits. so treat the refusal metric as the
+signal and the 503 as a courtesy to the clients that happen to be waiting.
 
 this is deliberately not what the http/2 server does, which waits for a
 connection to end before accepting another. the difference is the protocol. an

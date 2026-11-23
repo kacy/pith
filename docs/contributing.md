@@ -3,7 +3,7 @@
 ## minimum setup
 
 - install rust/cargo
-- install a C toolchain with `gcc`
+- install a C toolchain (`cc` / `$CC`, e.g. gcc or clang)
 - work from the repo root
 - prefer the self-hosted compiler for feature work
 - keep the Cranelift backend and self-hosted frontend healthy together
@@ -66,7 +66,7 @@ make bootstrap
 - IR lowering and native code generation: `cranelift/codegen/src/`
 - self-hosted implementation: `self-host/`
 - runtime support: `cranelift/runtime/src/`
-- native tls and higher-level protocol work: `std/net/tls.pith`, `std/net/tls13.pith`, `std/net/http.pith`, `std/net/websocket.pith`
+- native tls and higher-level protocol work: `std/net/tls.pith`, `std/net/tls13.pith`, `std/net/tls12.pith`, `std/net/http.pith`, `std/net/http2/*.pith`, `std/net/grpc.pith`, `std/net/websocket.pith`
 - language and diagnostic docs: `docs/`
 
 ## common validation commands

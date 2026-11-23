@@ -13,8 +13,8 @@ something is wrong.
 
 1. **it never goes quiet.** for any input, `check` exits 0 or 1 with a
    message. a crash, a hang, or an empty-handed exit is a bug.
-2. **formatting is a fixed point.** anything that parses formats
-   idempotently, and the formatted output still parses.
+2. **formatting is a fixed point.** anything that checks clean formats
+   idempotently, and the formatted output still checks clean.
 3. **checked means buildable.** a program the checker accepts must
    compile. a clean check followed by a failed build is a silent seam
    — the class this harness exists to find.
@@ -40,9 +40,10 @@ exact program that triggered them, ready to minimize.
 ## two halves
 
 the **generated** half builds small programs from the grammar out.
-most don't type-check, which is fine — the point is that parse, fmt,
-and check survive anything. this half is the ci gate: seeded and
-green.
+most don't type-check, which is fine — the point is that lex, parse,
+and check survive anything (with `fmt` and `build` exercised on programs
+that check clean). `make fuzz-check` runs both halves plus `tools/fuzz-tls`
+with a fixed seed.
 
 the **mutation** half takes working programs from `tests/cases` and
 damages them the way a hasty edit might — dropping lines, splicing in

@@ -204,9 +204,12 @@ and the `call` and `direct` phases of `closure_calls` fold away.
 
 - Closures: Go's escape analysis keeps the closures in `closure_calls` and
   `closure_error` on the stack, and Rust closures are unboxed. Pith builds a
-  closure in a stack slot only when the function that makes it calls it by
-  name. A closure passed to another function, as in `apply_twice`, is still
-  allocated on the heap. Most of those rows measure that difference.
+  closure in a stack slot when it is called by name or passed as a lambda
+  literal to a call-only parameter (`closure_stack`), while a closure returned
+  from a function (such as `make_adder` in `closure_error`) or otherwise
+  escaping is still allocated on the heap. `closure_calls` mainly measures
+  stack-closure setup and indirect dispatch; `closure_error` also pays the heap
+  allocation of returned closures.
 - Hashes and checksums: all three languages use SHA-NI for sha256 and
   pclmulqdq for crc32. In Pith, the padding, the tail and a portable block
   loop are Pith code, and only the loop over whole blocks is in the
@@ -338,9 +341,10 @@ concurrency 1, HTTP latency and the API gateway. Its HTTP server also handles
 more requests per second than hyper up to 256 connections. It trails Rust on
 most compute rows, often by 2x or more. The largest gaps come from these:
 
-- heap-allocated closures (`closure_calls`, `closure_error`): a closure
-  passed to another function is built on the heap even when it never
-  escapes
+- indirect closure dispatch and escaping closures (`closure_calls`,
+  `closure_error`): non-escaping lambdas passed to call-only parameters use a
+  stack slot, but closures returned from a function still allocate on the heap
+  and indirect calls are not inlined
 - sha512 in portable Pith, about 2.3x Go
 - per-object allocation and refcount cost (`cyclic_graph`, `task_churn`); a
   some optional built outside a getter still gets a heap shell
@@ -1060,9 +1064,9 @@ pith build bench/substring_search.pith
 ./bench/substring_search 2000 all comma   # one needle over every cell
 ```
 
-The per-cell instruction counts of the old search, the `memchr` search that
-replaced it, and the libc `memmem` alternative it was measured against are in
-`docs/performance.md`.
+The per-cell instruction counts of the old search, the libc `memmem` search that
+replaced it (since joined by an SSE2 prefilter), and the `memchr` alternative it
+was measured against are in `docs/performance.md`.
 
 ## measuring: instruction counts over wall time
 

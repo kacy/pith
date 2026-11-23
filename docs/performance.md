@@ -155,7 +155,7 @@ cannot land on two workers cannot land split. defaulting to one would hard-code
 that workaround into every program, and would charge every genuinely parallel
 workload 1.77x to do it — trading the point of an M:N runtime for a bug
 mitigation. **the default stays `available_parallelism`.** the channel numbers
-are a reason to fix placement (see the migration note in `green.rs`), not a
+are a reason to fix placement (see `concurrency/green/mod.rs` and `wake.rs`), not a
 reason to change the default.
 
 `PITH_GREEN_WORKERS=1` remains the right answer for a process that is known to
@@ -2923,28 +2923,22 @@ optimization (a closure arena or escape analysis) and only worth it if
 a real workload still shows the box allocation now that the lock is
 gone.
 
-### stage B — the same lock on `AtomicInt` and the other primitives
+### stage B — the same lock on `AtomicInt` and the other primitives (landed for sync primitives and channels)
 
-`AtomicInt` (added for thread-safe contexts) went onto the registry
-too, mirroring `Semaphore`. contexts are not a hot loop today, so it is
-not proven costly — but it is the identical one-line-per-callsite
-conversion and worth doing in the same pass. `Channel`, `Task`,
-`Process`, `Semaphore`, `WaitGroup` also use the registry (`Mutex` and
-`Channel` no longer do — both validate through their own magic tag);
-most are created rarely, but channel send/recv could be hot in
-channel-heavy code and deserves a measurement before converting. the
-end state is that nothing validates a live handle through a global
-lock.
+`AtomicInt`, `Mutex`, `Semaphore`, `WaitGroup`, and `Channel` have since moved
+off the global handle registry onto their own magic headers
+(`concurrency/sync_handle.rs` and `concurrency/channel.rs`). only `List` (the
+page-crossing fallback), `Process`, `ProcessOutput`, `Task`, and `X25519Key`
+remain in `HandleKind` (`handle_registry.rs`).
 
 ### order and stopping rule
 
 stage A landed first and alone — the measured win, its valgrind +
 suite pass the gate for touching the others. that took the benchmark
-total from 543ms to 178ms. stage B stays open and stays conditional:
-convert a primitive only where a benchmark shows the lock (a channel
-microbench for `Channel`, the context path for `AtomicInt`), not for
-symmetry. the remaining gap to go's ~57ms total is now the error phase
-and the per-closure box, not the lock.
+total from 543ms to 178ms. the remaining gap to go's ~57ms total was the error
+phase and the per-closure box, not the lock. (later work also replaced the
+`closure_base` / `struct_base` helpers with closure-scoped `with_*` validators
+and landed stage B for the sync primitives and channels above.)
 
 ## how to rerun
 

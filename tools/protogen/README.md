@@ -235,9 +235,11 @@ runs all four shapes through one streaming listener.
 
 ## not yet supported
 
-a clear error names these: `bool`/`fixed` map keys, proto2, repeated
-`sint`/`fixed`/`float`/`double`, and the well-known types beyond the list
-above (`Any`, `Struct`/`Value`/`ListValue`, `FieldMask`, ...).
+a clear error names these: `bool`/`fixed` map keys, repeated
+`bool`/`sint`/`fixed`/`float`/`double`, and the well-known types beyond the list
+above (`Any`, `Struct`/`Value`/`ListValue`, `FieldMask`, ...). the `syntax`
+header is not enforced, and proto2-only constructs (such as `required` fields)
+are not supported.
 
 ## example
 

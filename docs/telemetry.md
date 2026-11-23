@@ -284,7 +284,7 @@ transports.
 ### transports
 
 `http/protobuf` (the default) POSTs protobuf to `/v1/traces` and `/v1/metrics`,
-optionally gzip-compressed. `grpc` makes a unary call to the collector's
+optionally gzip- or zstd-compressed. `grpc` makes a unary call to the collector's
 `TraceService`/`MetricsService` `Export` methods carrying the identical protobuf,
 with the auth headers as grpc metadata. the grpc transport is tls-only: the
 exporter dials with `grpc.dial` and never with `grpc.dial_h2c`, so a `grpc`

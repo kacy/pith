@@ -36,14 +36,14 @@ and [docs/concurrency.md](docs/concurrency.md) lists the sharing rules.
 
 every pull request and every push to main runs:
 
-- the count checker (`make count-marks-check`). it fails the build if
+- the count checker (`make count-marks-check-only`). it fails the build if
   the retains and releases the compiler placed do not balance.
 - valgrind memcheck over a curated set of programs, and leak-growth
   checks that fail if memory use grows over repeated runs.
-- `make check-no-panics`, which scans the rust runtime for `panic!`,
-  `.unwrap()`, `expect(`, `process::exit`, `transmute` and similar
-  calls. each one must carry a comment that explains why it cannot be
-  reached or why stopping is correct.
+- `make check-no-panics`, which scans the rust runtime and backend for `panic!`,
+  `.unwrap()`, `expect(`, `transmute` and similar calls (plus `process::exit`
+  in the runtime and codegen crates). each one must carry a comment that
+  explains why it cannot be reached or why stopping is correct.
 - the bootstrap fixed point: the compiler builds itself and the output
   must match.
 
@@ -67,7 +67,8 @@ there is no cap on indentation depth, string interpolation or source
 file size. some pathological inputs still crash the compiler by
 overflowing its stack: about 100,000 nested unary minus signs, a binary
 expression with about 50,000 terms, or a source file of about 20 MB.
-a file that is not valid utf-8 fails with only `read_file failed`.
+a file that is not valid utf-8 fails with only `read_file failed`
+(or `error: cannot read <path>` in `check`/`fmt`/`lint`/`doc`).
 these are bugs, and reports are welcome.
 
 ## runtime failures in servers
@@ -98,7 +99,7 @@ task the handler spawned. see
   `SameSite=Lax`. the csrf middleware requires a token on unsafe
   methods.
 - http/1.1: a request with both `Content-Length` and
-  `Transfer-Encoding`, duplicate or conflicting `Content-Length`, or
+  `Transfer-Encoding`, conflicting `Content-Length`, or
   obsolete header folding is refused. oversized bodies, oversized
   headers and slow headers get 413, 431 and 408.
 - http/2: at most 128 concurrent streams per connection, capped

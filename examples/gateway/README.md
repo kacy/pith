@@ -1,6 +1,6 @@
 # api gateway
 
-an api gateway in about 850 lines of pith, with no dependencies. it builds to one
+an api gateway in about 980 lines of pith, with no dependencies. it builds to one
 static binary. the tls, http/2, grpc, jwt and metrics code it runs on is all
 standard library that you can read.
 
@@ -35,7 +35,7 @@ pith run examples/api_gateway_grpc.pith
 
 the gateway removes headers a client should not control before forwarding. that
 covers hop-by-hop headers, anything the `Connection` header names,
-`X-Auth-Subject` and the `X-Forwarded-*` family. it then sets `X-Forwarded-For` to
+`X-Auth-Subject`, `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto`. it then sets `X-Forwarded-For` to
 the client's address, or adds to the value already there with
 `trust_forwarded_for`, for a gateway behind a load balancer. a path with an encoded slash or
 backslash in a segment gets a 400, because a backend that decodes before routing
@@ -49,10 +49,12 @@ could read it as a different path than the gateway checked.
 | `upstream.pith` | the pool, the choice of upstream, and health checks |
 | `proxy.pith` | forwarding one http request, with its retries |
 | `auth.pith` | checking bearer tokens |
-| `limits.pith` | the per-subject rate limit |
+| `limits.pith` | per-subject and per-client-address rate limits |
+| `tunnel.pith` | websocket upgrade tunnelling |
 | `grpc_proxy.pith` | forwarding grpc calls |
 | `server.pith` | turning a config into listeners |
 | `main.pith` | the executable |
+| `gateway.toml` | sample configuration |
 | `demo_identity.pith`, `demo_fixture.pith` | an identity provider for the walkthroughs and the benchmark |
 
 ## how it compares
@@ -116,7 +118,7 @@ gateway does not.
 ## what it does not do
 
 - **a request body is buffered**, up to `max_body_bytes`, which keeps it in hand
-  for a retry. an upload larger than memory should allows will not work through
+  for a retry. an upload larger than memory allows will not work through
   it. std can hand a body to the handler as it arrives
   (`ServerConfig.with_stream_request_bodies`), but a streamed body can't be sent
   twice, so the gateway keeps buffering.

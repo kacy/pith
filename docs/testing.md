@@ -135,8 +135,8 @@ table of pairs:
 a body that answers yes or no reports its label and nothing else. when the two
 values are worth seeing, check them with `std.testing`'s assertions inside the
 body and return `true`: the check prints both sides and `each` names the row it
-belonged to underneath. a multi-line body is bound to a name first, because a
-`fn(x):` block does not fit inside an argument list:
+belonged to underneath. a multi-line body can be written inline inside the call
+or bound to a name first for readability:
 
 ```pith
 from std.testing import case, each, check
@@ -228,7 +228,7 @@ $ pith test std/mysql.pith --filter scramble
   mysql_native_password scramble matches a known vector ... ok
   caching_sha2_password scramble matches a known vector ... ok
 
-2 passed, 0 failed, 6 filtered out
+2 passed, 0 failed, 7 filtered out
 ```
 
 the filter also reads from the `PITH_TEST_FILTER` environment variable, which is
@@ -384,14 +384,17 @@ other kinds of test, all wired through the `Makefile`:
   TIME_WAIT for a minute; a listen on that number fails with EADDRINUSE until
   it expires, even with SO_REUSEADDR set. `make check-test-ports` enforces the
   rule.
-- **rejected programs** — files under `tests/invalid/` (and `tests/invalid_parse/`)
-  that must fail to compile, guarding error messages and negative cases. run with
-  `make check-invalid`.
+- **rejected programs** — files under `tests/invalid/` (run with
+  `make check-invalid`) and `tests/invalid_parse/` (run with
+  `make check-parse-invalid`) that must fail to compile, guarding error
+  messages and negative cases.
 - **live servers** — integration tests under `tests/live/` that need a real
-  server and are run on demand. the database ones (`db_postgres_live`,
-  `db_mysql_live`, `db_redis_live`) are `test` blocks that `skip_test` when their
-  server is not reachable, so `make db-live-tests` stays green with or without a
-  running server and verifies the drivers where one exists.
+  server and are run on demand. the seven database files (`db_postgres_live`,
+  `db_mysql_live`, `db_redis_live`, `db_postgres_pool_live`,
+  `db_mysql_pool_live`, `db_postgres_tx_live`, `db_mysql_tx_live`) are `test`
+  blocks that `skip_test` when their server is not reachable, so
+  `make db-live-tests` stays green with or without a running server and verifies
+  the drivers where one exists.
 - **invalid access** — `make memcheck` runs a curated set under valgrind, so an
   arc regression that double-frees or reads freed memory is caught before it
   lands.
@@ -430,7 +433,8 @@ other kinds of test, all wired through the `Makefile`:
 ## the crash guard
 
 the rust runtime is linked into every pith program, so a panic in it is a crash
-in somebody's server. `make check-no-panics` scans `cranelift/*/src` for the
+in somebody's server. `make check-no-panics` scans `cranelift/*/src` and
+`cranelift/codegen/build.rs` for the
 constructs that stop a process — `panic!`, `unreachable!`, `.unwrap()`,
 `.expect(...)` — plus `std::mem::transmute`, `std::mem::forget` and
 `from_utf8_unchecked`, which reinterpret memory and want the same scrutiny. `std::process::exit` is scanned
@@ -449,7 +453,8 @@ the marker moves with the code. the gate also reports a marker whose next line
 is not a guarded site, so a marker left behind by a deleted trap is a failure
 too.
 
-test code is skipped: `#[cfg(test)]` items are compiled out of the shipped
+test code is skipped: `tests.rs` files, `*/loom_models/*`, and `#[cfg(test)]`
+items are compiled out of the shipped
 runtime, and an `.unwrap()` in a test is how a test reports failure. the skip
 runs from the attribute line to the closing brace at the attribute's own
 indentation; an item whose brace never turns up is reported rather than
@@ -490,8 +495,8 @@ of them still moves the peak by twelve megabytes over the extra rounds. noise on
 a flat case measures under two hundred kilobytes run to run. 2 mb sits an order
 of magnitude above the noise and well under the smallest real signal. a case that
 clears the limit is measured again before it is called a failure, so one spike on
-a loaded machine cannot turn the gate red by itself. the whole target takes about
-ten seconds.
+a loaded machine cannot turn the gate red by itself. each unique `.pith` file is
+compiled once in parallel, then every entry is measured serially.
 
 to add a case, drop a `.pith` file in `tests/leaks/` that imports `leakprobe`,
 runs its churn `probe.rounds()` times, and prints `probe.peak_kb()` and nothing
@@ -509,7 +514,7 @@ program by hand. they need a runtime built with the sanitizer, and
 the stable toolchain accepts `-Zsanitizer` only with `RUSTC_BOOTSTRAP=1`:
 
 ```sh
-RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zsanitizer=thread -Cforce-frame-pointers=yes" \
+RUSTC_BOOTSTRAP=1 RUSTFLAGS="-C relocation-model=pie -Zsanitizer=thread -Cforce-frame-pointers=yes" \
   cargo build --release -p pith-runtime -Zbuild-std \
   --target x86_64-unknown-linux-gnu --target-dir target/tsan
 ```

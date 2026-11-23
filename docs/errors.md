@@ -1138,9 +1138,8 @@ builder methods back to the constructor, so
 
 the constructor list is short on purpose. an entry has to be a call whose result
 the caller owns, on a type with no method that consumes the receiver instead of
-closing it — `bytes.ByteBuffer` is excluded for exactly that reason, since
-`take_bytes()` frees the buffer as it takes its contents. the survey behind the
-list is in [destructors_roadmap.md](destructors_roadmap.md).
+closing it, and a type with a destructor needs no entry at all. the survey
+behind the list is in [destructors_roadmap.md](destructors_roadmap.md).
 
 the message names the constructor and the closer to defer:
 

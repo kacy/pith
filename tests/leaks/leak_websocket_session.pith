@@ -13,7 +13,7 @@ import std.net.websocket as websocket
 fn round(frame_data: Bytes):
     cursor := io.bytes_reader(frame_data)
     reader := cursor.buffered_chunked(64)
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered()
     ws := websocket.from_buffered(reader, writer, true)
     # bound, not discarded: a Bytes dropped at statement position is a
@@ -24,7 +24,6 @@ fn round(frame_data: Bytes):
     reader.free()
     writer.free()
     cursor.close()
-    sink.free()
     if got.len() < 0:
         return
 

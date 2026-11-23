@@ -25,8 +25,7 @@ fn round(wire: Bytes) -> Int:
     defer cursor.close()
     reader := cursor.buffered_chunked(256)
     defer reader.free()
-    sink := bytes.buffer()
-    defer sink.free()
+    sink := io.memory_writer()
     writer := sink.buffered()
     defer writer.free()
     return http.serve_connection(reader, writer, handle) catch 0

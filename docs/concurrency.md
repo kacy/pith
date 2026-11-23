@@ -212,6 +212,12 @@ module global collection passed to `spawn` or sent is refused as well, since
 the program still holds it: a task reads the global directly. writing a
 global from several tasks is covered by the sharing rule (E309).
 
+`std.bytes.ByteBuffer` and `ByteArray` count as collections here, although
+their handle is an `Int`. neither can become an interface value, which would
+hide the buffer from these checks (E248); `io.memory_writer()` is the
+in-memory `BytesWriter` that several tasks may share, since its bytes sit
+behind a lock.
+
 a spawn evaluates its arguments on the new task. so `spawn total(copy_list(xs))`
 copies `xs` there, while this task may still be pushing to it, and it is
 refused unless the scope does not use `xs` again. make the copy first and

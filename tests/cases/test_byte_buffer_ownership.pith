@@ -1,0 +1,54 @@
+# a ByteBuffer frees its storage when its last value dies. free() and
+# take_bytes() hand the contents back early and leave a buffer that still
+# works, so no handle a program can name ever points at freed memory. a buffer
+# handed to a task whole moves there; a writer several tasks share is
+# io.memory_writer(), whose bytes sit behind a lock. valgrind-gated in
+# MEMCHECK_CASES.
+import std.bytes as bytes
+import std.io as io
+from std.bytes import ByteBuffer
+from std.io import MemoryWriter
+
+fn fill(b: ByteBuffer, n: Int) -> Int!:
+    for i in 0..n:
+        b.write_byte(65 + i % 26)!
+    return b.len()
+
+fn shout(w: MemoryWriter, word: String, n: Int) -> Int!:
+    for i in 0..n:
+        w.write_bytes(bytes.from_string_utf8(word))!
+    return n
+
+fn churn(rounds: Int) -> Int!:
+    mut total := 0
+    for i in 0..rounds:
+        b := bytes.buffer_with_capacity(64)
+        b.write_string_utf8("round {i}")!
+        total = total + b.len()
+    return total
+
+fn main() -> Int!:
+    b := bytes.buffer()
+    b.write_string_utf8("hello")!
+    b.free()
+    print("after free: {b.len()}")
+    b.write_string_utf8("again")!
+    print("reused: {b.string()}")
+    taken := b.take_bytes()
+    print("taken: {taken.to_string_utf8()!}, left {b.len()}")
+    b.write_byte(33)!
+    print("after take: {b.string()}")
+    alias := b
+    alias.write_byte(63)!
+    print("one buffer, two names: {b.string()}")
+
+    moved := spawn fill(bytes.buffer(), 1000)
+    print("moved to a task: {(await moved)!}")
+
+    w := io.memory_writer()
+    a := spawn shout(w, "ab", 500)
+    c := spawn shout(w, "cde", 500)
+    print("shared writer: {(await a)! + (await c)!} writes, {w.len()} bytes")
+
+    print("churned: {churn(2000)!}")
+    return 0

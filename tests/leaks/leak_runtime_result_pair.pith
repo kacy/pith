@@ -7,6 +7,7 @@
 # those positions once, so a missed release on any of them grows the peak.
 import leakprobe as probe
 import std.bytes as bytes
+from std.bytes import ByteBuffer
 import std.env as env
 
 fn take(r: Int!) -> Int:
@@ -57,19 +58,18 @@ fn float_round(text: String) -> Int:
     parse_float(text)
     return acc
 
-fn buffer_through(buf: Int, data: Bytes) -> Int!:
-    return byte_buffer_write(buf, data)! + byte_buffer_write_string_utf8(buf, "ab")!
+fn buffer_through(buf: ByteBuffer, data: Bytes) -> Int!:
+    return buf.write(data)! + buf.write_string_utf8("ab")!
 
-fn buffer_round(buf: Int, data: Bytes) -> Int:
+fn buffer_round(buf: ByteBuffer, data: Bytes) -> Int:
     mut acc := buffer_through(buf, data) catch 2
-    acc = acc + (byte_buffer_write_string_utf8(buf, "xyz") catch 1)
-    acc = acc + byte_buffer_write(buf, data).unwrap_or(4)
-    local := byte_buffer_write_string_utf8(buf, "q")
+    acc = acc + (buf.write_string_utf8("xyz") catch 1)
+    acc = acc + buf.write(data).unwrap_or(4)
+    local := buf.write_string_utf8("q")
     acc = acc + take(local)
-    acc = acc + take(byte_buffer_write(buf, data))
-    byte_buffer_write_string_utf8(buf, "")
-    if buf != 0:
-        byte_buffer_clear(buf)
+    acc = acc + take(buf.write(data))
+    buf.write_string_utf8("")
+    buf.clear()
     return acc
 
 fn file_through(h: Int, data: Bytes) -> Int!:
@@ -96,7 +96,7 @@ fn stream_round(fd: Int, child: Int, data: Bytes) -> Int:
     acc = acc + take(local)
     return acc
 
-fn shape(s: Int, i: Int, buf: Int, sink: Int, closed: Int, child: Int, data: Bytes) -> Int:
+fn shape(s: Int, i: Int, buf: ByteBuffer, sink: Int, closed: Int, child: Int, data: Bytes) -> Int:
     if s == 1:
         return int_round((i % 1000).to_string())
     if s == 2:
@@ -108,7 +108,9 @@ fn shape(s: Int, i: Int, buf: Int, sink: Int, closed: Int, child: Int, data: Byt
     if s == 5:
         return buffer_round(buf, data)
     if s == 6:
-        return buffer_round(0, data)
+        # a buffer can no longer be named by a bad handle, so this shape
+        # churns a fresh buffer each round and its destructor with it
+        return buffer_round(bytes.buffer(), data)
     if s == 7:
         return file_round(sink, data)
     if s == 8:
@@ -117,7 +119,7 @@ fn shape(s: Int, i: Int, buf: Int, sink: Int, closed: Int, child: Int, data: Byt
 
 fn main():
     s := env.int_or("SHAPE", 1)
-    buf := byte_buffer_new()
+    buf := bytes.buffer()
     sink := file_open_write("/dev/null") catch -1
     closed := file_open_write("/dev/null") catch -1
     file_close(closed)
@@ -132,6 +134,5 @@ fn main():
     if acc < 0:
         print("unreachable")
     file_close(sink)
-    byte_buffer_free(buf)
     kb := probe.peak_kb()
     print("{kb}")

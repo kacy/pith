@@ -369,7 +369,7 @@ fn run_http1(input: Bytes) -> Outcome:
 fn run_websocket(input: Bytes) -> Outcome:
     cursor := io.bytes_reader(input)
     reader := cursor.buffered_chunked(rand.int(1, 4) * 1021)
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered_chunked(4096)
     ws := websocket.from_buffered(reader, writer, false)
     mut sig := ""
@@ -385,7 +385,6 @@ fn run_websocket(input: Bytes) -> Outcome:
     ws.close_now()
     io.free_buffered_bytes_reader(reader)
     io.free_buffered_bytes_writer(writer)
-    sink.free()
     cursor.close()
     return Outcome(sig, input.len() - left)
 

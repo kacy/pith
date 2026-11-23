@@ -50,7 +50,7 @@ threadlocal mut string_reader_offsets: Map[Int, Int] := {}
 # of n bytes copies O(n) bytes in total; string() copies the whole content
 # out once per call. the map owns the byte buffer: the entry's removal on
 # close() is what frees it.
-threadlocal mut string_buffer_stores: Map[Int, Int] := {}
+threadlocal mut string_buffer_stores: Map[Int, ByteBuffer] := {}
 
 threadlocal mut bytes_reader_data: Map[Int, Bytes] := {}
 threadlocal mut bytes_reader_offsets: Map[Int, Int] := {}
@@ -319,6 +319,43 @@ impl ByteBuffer:
 
     fn write_n_bytes(data: Bytes, count: Int) -> Int!:
         return write_n_bytes(self, data, count)
+
+# an in-memory BytesWriter. a ByteBuffer cannot become a BytesWriter value
+# (the sharing checks could not follow it to another task), so this is the
+# writer to hand to code that takes one: its bytes sit behind a lock, and a
+# writer several tasks reach stays sound.
+pub struct MemoryWriter:
+    guard mu:
+        buf: ByteBuffer
+
+# an empty in-memory writer.
+pub fn memory_writer() -> MemoryWriter:
+    return MemoryWriter(bytes.buffer())
+
+impl BytesWriter for MemoryWriter:
+    fn write_bytes(data: Bytes) -> Int!:
+        locked self.mu:
+            return self.buf.write(data)
+
+impl MemoryWriter:
+    # a copy of everything written so far.
+    fn bytes() -> Bytes:
+        locked self.mu:
+            return self.buf.bytes()
+
+    fn len() -> Int:
+        locked self.mu:
+            return self.buf.len()
+
+    # everything written so far as a string, copied verbatim with nothing
+    # decoded.
+    fn string() -> String:
+        locked self.mu:
+            return self.buf.string()
+
+    fn clear():
+        locked self.mu:
+            self.buf.clear()
 
     fn buffered() -> BufferedBytesWriter:
         return buffered_bytes_writer(self, DEFAULT_CHUNK_SIZE)
@@ -599,7 +636,7 @@ fn empty_string_parts() -> List[String]:
 fn string_buffer_len(buf: StringBuffer) -> Int:
     if not string_buffer_stores.contains_key(buf.handle):
         return 0
-    return byte_buffer_len(string_buffer_stores[buf.handle])
+    return string_buffer_stores[buf.handle].len()
 
 # the accumulated text as a fresh string: one copy of the storage, taken
 # verbatim (the buffer holds whatever bytes were written, valid utf-8 or
@@ -608,7 +645,7 @@ fn string_buffer_len(buf: StringBuffer) -> Int:
 fn string_buffer_string(buf: StringBuffer) -> String:
     if not string_buffer_stores.contains_key(buf.handle):
         return ""
-    return byte_buffer_string(string_buffer_stores[buf.handle])
+    return string_buffer_stores[buf.handle].string()
 
 fn string_buffer_write_line(buf: StringBuffer, data: String) -> Int!:
     wrote := string_buffer_write_internal(buf, data)
@@ -625,7 +662,7 @@ fn string_buffer_reset(buf: StringBuffer):
     # cleared and refilled in a loop stops allocating after the first fill.
     if not string_buffer_stores.contains_key(buf.handle):
         return
-    byte_buffer_clear(string_buffer_stores[buf.handle])
+    string_buffer_stores[buf.handle].clear()
 
 fn string_buffer_clear(buf: StringBuffer):
     string_buffer_reset(buf)
@@ -927,7 +964,7 @@ fn allocate_string_reader_handle(data: String) -> Int:
 
 fn allocate_string_buffer_handle() -> Int:
     handle := next_io_handle()
-    string_buffer_stores.insert(handle, byte_buffer_new())
+    string_buffer_stores.insert(handle, bytes.buffer())
     return handle
 
 fn allocate_bytes_reader_handle(data: Bytes) -> Int:
@@ -963,7 +1000,6 @@ fn close_string_reader_state(handle: Int):
 fn close_string_buffer_state(handle: Int):
     if not string_buffer_stores.contains_key(handle):
         return
-    byte_buffer_free(string_buffer_stores[handle])
     string_buffer_stores.remove(handle)
 
 fn close_bytes_cursor_state(handle: Int):
@@ -1343,7 +1379,7 @@ fn string_buffer_write_internal(buf: StringBuffer, data: String) -> Int!:
         return 0
     # the bytes go straight into the storage; nothing is allocated for the
     # write itself, and the builtin answers with the count it appended.
-    return byte_buffer_write_string_utf8(string_buffer_stores[buf.handle], data)
+    return string_buffer_stores[buf.handle].write_string_utf8(data)
 
 fn bytes_after_write(data: Bytes, wrote: Int) -> Bytes:
     if wrote >= data.len():
@@ -2967,7 +3003,7 @@ test "io buffered string writers flush by chunk size":
 
 test "io buffered byte streams handle separators and flushes":
     reader := bytes_reader(bytes.from_string_utf8("a,b,c")).buffered_chunked(2)
-    out := bytes.buffer()
+    out := memory_writer()
     writer := out.buffered_chunked(4)
 
     assert_eq(reader.read_until_bytes(bytes.from_string_utf8(","))!.to_string_utf8()!, "a")
@@ -3167,8 +3203,7 @@ fn abandon_one_of_each(i: Int) -> Int!:
     out := string_buffer().buffered()
     out.write("unflushed")!
     raw := bytes_reader(bytes.from_string_utf8("raw")).buffered()
-    target := bytes.buffer()
-    defer target.free()
+    target := memory_writer()
     sink := target.buffered()
     sink.write_bytes(bytes.from_string_utf8("unflushed"))!
     return reader.read(2)!.len() + cursor.read_bytes(1)!.len() + text.read(3)!.len() + raw.read_bytes(1)!.len()

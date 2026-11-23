@@ -121,9 +121,8 @@ stale and a fix to it is welcome.
   and a dropped `std.db` transaction is rolled back by closing its connection.
   a dropped stream that is still open queues its reset only when the
   connection's send queue has room. call `close()` where the peer must see a
-  clean end. two types still close by hand only: `std.bytes.ByteBuffer`
-  (`free()` or `take_bytes()`) and an `http2.Client`, which its own reader and
-  writer tasks keep alive. `pith lint` flags a local of a type without a
+  clean end. one type still closes by hand only: an `http2.Client`, which its
+  own reader and writer tasks keep alive. `pith lint` flags a local of a type without a
   destructor that is never closed (E307). docs/destructors_roadmap.md tracks
   the rest.
 - **testing has no benchmarks**. `pith test` runs `test` blocks with

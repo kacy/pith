@@ -15,9 +15,9 @@
 //! closed and its number reused while the syscall is inside; a process handle
 //! closed meanwhile makes the call fail rather than read another fd.
 
-use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::bytes::{pith_bytes_from_vec, with_bytes};
 use crate::fd_handle::{self, FdKind, Guard};
-use crate::ffi_util::{cstr_bytes, write_result, ResultPair};
+use crate::ffi_util::{with_cstr_bytes, write_result, ResultPair};
 use crate::fdio;
 use crate::handle_registry::{is_valid_id, HandleKind};
 use crate::process::{process_handles, Pipe};
@@ -76,10 +76,8 @@ fn write_stdin(handle: i64, data: &[u8]) -> Result<usize, fdio::WriteError> {
 }
 
 /// a chunk as a pith C string: null on failure, an empty string on eof.
-///
-/// # Safety
-/// the returned pointer is owned by the caller and freed with `pith_free`.
-unsafe fn read_as_cstring(handle: i64, pipe: Pipe, max_bytes: i64) -> *mut i8 {
+/// The returned pointer is owned by the caller and freed with `pith_free`.
+fn read_as_cstring(handle: i64, pipe: Pipe, max_bytes: i64) -> *mut i8 {
     match read_pipe(handle, pipe, max_bytes) {
         PipeRead::Data(buf) if buf.is_empty() => crate::pith_cstring_empty(),
         PipeRead::Data(buf) => crate::pith_copy_bytes_to_cstring(&buf),
@@ -123,20 +121,18 @@ pub unsafe extern "C" fn pith_process_read_err_bytes(handle: i64, max_bytes: i64
 /// reason. the bytes go out as they are, valid utf-8 or not.
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_write(handle: i64, data: *const i8) -> ResultPair {
-    let outcome = match cstr_bytes(data) {
-        Some(text) => write_stdin(handle, text),
-        None => Err("invalid string".to_string()),
-    };
+    // SAFETY: Caller guarantees `data` is null or a valid null-terminated C string.
+    let outcome = unsafe { with_cstr_bytes(data, |text| write_stdin(handle, text)) }
+        .unwrap_or_else(|| Err("invalid string".to_string()));
     write_result("process_write", outcome)
 }
 
 /// the `Bytes` form of `pith_process_write`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_process_write_bytes(handle: i64, data: i64) -> ResultPair {
-    let outcome = match pith_bytes_ref(data) {
-        Some(bytes) => write_stdin(handle, &bytes.data),
-        None => Err("invalid bytes value".to_string()),
-    };
+    // SAFETY: `with_bytes` validates `data` before borrowing its slice.
+    let outcome = unsafe { with_bytes(data, |bytes| write_stdin(handle, bytes)) }
+        .unwrap_or_else(|| Err("invalid bytes value".to_string()));
     write_result("process_write_bytes", outcome)
 }
 

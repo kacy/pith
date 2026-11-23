@@ -499,7 +499,8 @@ impl MapImpl {
             return;
         }
         if let Some(raw) = val.word() {
-            release_element(self.val_tag, raw);
+            // SAFETY: Map owns one count per stored heap value of `self.val_tag`.
+            unsafe { release_element(self.val_tag, raw) };
         }
     }
 
@@ -511,7 +512,8 @@ impl MapImpl {
         if !self.val_is_heap() {
             return;
         }
-        retain_element(self.val_tag, raw);
+        // SAFETY: Caller passes a handle matching `self.val_tag`.
+        unsafe { retain_element(self.val_tag, raw) };
     }
 
     /// Drop the map's count on every stored value, for clear and free.
@@ -523,7 +525,8 @@ impl MapImpl {
             return;
         }
         for val in self.data.values() {
-            self.release_value(val);
+            // SAFETY: Each value in `self.data` is owned by this map.
+            unsafe { self.release_value(val) };
         }
     }
 }
@@ -536,7 +539,8 @@ const MAP_MAGIC: u32 = 0x504d4150;
 /// per access. Freed maps get their magic scrubbed in pith_map_free.
 #[inline]
 unsafe fn map_magic_ok(ptr: *const ()) -> bool {
-    map_magic_ok_for(ptr, crate::quarantine::Op::Use)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { map_magic_ok_for(ptr, crate::quarantine::Op::Use) }
 }
 
 /// `map_magic_ok`, naming what the caller does with the map in a quarantine
@@ -544,35 +548,121 @@ unsafe fn map_magic_ok(ptr: *const ()) -> bool {
 #[inline(always)]
 unsafe fn map_magic_ok_for(ptr: *const (), op: crate::quarantine::Op) -> bool {
     handle_registry::plausibly_aligned::<MapImpl>(ptr)
-        && crate::quarantine::magic_is(std::ptr::addr_of!((*(ptr as *const MapImpl)).magic), MAP_MAGIC, op)
+        && unsafe {
+            // SAFETY: Alignment verified above; `magic_is` reads the magic field to validate.
+            crate::quarantine::magic_is(
+                std::ptr::addr_of!((*(ptr as *const MapImpl)).magic),
+                MAP_MAGIC,
+                op,
+            )
+        }
 }
 
-unsafe fn map_ref<'a>(map: PithMap) -> Option<&'a MapImpl> {
-    if !map_magic_ok(map.ptr as *const ()) {
+/// Validate `map` and borrow its `MapImpl` immutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_map_ref<R>(map: PithMap, f: impl FnOnce(&MapImpl) -> R) -> Option<R> {
+    if !unsafe { map_magic_ok(map.ptr as *const ()) } {
         return None;
     }
-    Some(&*(map.ptr as *const MapImpl))
+    // SAFETY: Magic check validated pointer; borrow is scoped to `f`.
+    let impl_ref = unsafe { &*(map.ptr as *const MapImpl) };
+    Some(f(impl_ref))
 }
 
-unsafe fn map_mut<'a>(map: PithMap) -> Option<&'a mut MapImpl> {
-    if !map_magic_ok(map.ptr as *const ()) {
+/// Validate `map` and borrow its `MapImpl` mutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_map_mut<R>(map: PithMap, f: impl FnOnce(&mut MapImpl) -> R) -> Option<R> {
+    if !unsafe { map_magic_ok(map.ptr as *const ()) } {
         return None;
     }
-    Some(&mut *(map.ptr as *mut MapImpl))
+    // SAFETY: Magic check validated pointer; caller ensures exclusive access for `f`.
+    let impl_mut = unsafe { &mut *(map.ptr as *mut MapImpl) };
+    Some(f(impl_mut))
 }
 
-unsafe fn map_ref_from_handle<'a>(handle: i64) -> Option<&'a MapImpl> {
-    if !map_magic_ok(handle as *const ()) {
-        return None;
-    }
-    Some(&*(handle as *const MapImpl))
+/// Validate `handle` and borrow its `MapImpl` immutably for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_map_ref_handle<R>(
+    handle: i64,
+    f: impl FnOnce(&MapImpl) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_map_ref(PithMap { ptr: handle as *mut () }, f) }
 }
 
-unsafe fn map_mut_from_handle<'a>(handle: i64) -> Option<&'a mut MapImpl> {
-    if !map_magic_ok(handle as *const ()) {
+/// Validate `handle` and borrow its `MapImpl` mutably for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_map_mut_handle<R>(
+    handle: i64,
+    f: impl FnOnce(&mut MapImpl) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_map_mut(PithMap { ptr: handle as *mut () }, f) }
+}
+
+/// Validate two maps and borrow both immutably for the duration of `f`.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn with_map_ref2<R>(
+    a: PithMap,
+    b: PithMap,
+    f: impl FnOnce(&MapImpl, &MapImpl) -> R,
+) -> Option<R> {
+    if !unsafe { map_magic_ok(a.ptr as *const ()) }
+        || !unsafe { map_magic_ok(b.ptr as *const ()) }
+    {
         return None;
     }
-    Some(&mut *(handle as *mut MapImpl))
+    // SAFETY: Both pointers passed magic validation and both borrows are shared (`&MapImpl`),
+    // so aliasing `a.ptr == b.ptr` is sound.
+    let a_ref = unsafe { &*(a.ptr as *const MapImpl) };
+    let b_ref = unsafe { &*(b.ptr as *const MapImpl) };
+    Some(f(a_ref, b_ref))
+}
+
+/// Validate `dst` (mutable) and `src` (shared) without aliasing UB.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn with_map_mut_and_ref<R>(
+    dst: PithMap,
+    src: PithMap,
+    on_distinct: impl FnOnce(&mut MapImpl, &MapImpl) -> R,
+    on_same: impl FnOnce(&mut MapImpl) -> R,
+) -> Option<R> {
+    if !unsafe { map_magic_ok(dst.ptr as *const ()) } {
+        return None;
+    }
+    if dst.ptr == src.ptr {
+        // SAFETY: `dst` validated; only one `&mut` reference is minted.
+        let same = unsafe { &mut *(dst.ptr as *mut MapImpl) };
+        return Some(on_same(same));
+    }
+    if !unsafe { map_magic_ok(src.ptr as *const ()) } {
+        return None;
+    }
+    // SAFETY: `dst` and `src` are both valid and distinct pointers.
+    let dst_mut = unsafe { &mut *(dst.ptr as *mut MapImpl) };
+    let src_ref = unsafe { &*(src.ptr as *const MapImpl) };
+    Some(on_distinct(dst_mut, src_ref))
+}
+
+/// Borrow a non-null C-string key as `KeyRef::Str` for the duration of `f`.
+/// Nothing is copied; the borrow cannot escape `f`.
+#[inline(always)]
+unsafe fn with_cstr_key<R>(key: *const i8, f: impl FnOnce(&KeyRef<'_>) -> R) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller; borrow is scoped to `f`.
+    unsafe { crate::ffi_util::with_cstr_bytes(key, |bytes| f(&KeyRef::Str(bytes))) }
+}
+
+/// Borrow a bytes handle's content as `KeyRef::Bytes` for the duration of `f`.
+/// A null handle is the empty value, matching `pith_bytes_eq`.
+#[inline(always)]
+unsafe fn with_bytes_key<R>(key: i64, f: impl FnOnce(&KeyRef<'_>) -> R) -> Option<R> {
+    if key == 0 {
+        return Some(f(&KeyRef::Bytes(&[])));
+    }
+    // SAFETY: `with_bytes` validates `key` and scopes the borrowed slice to `f`.
+    unsafe { crate::bytes::with_bytes(key, |bytes| f(&KeyRef::Bytes(bytes))) }
 }
 
 /// Create a new empty map
@@ -584,13 +674,13 @@ unsafe fn map_mut_from_handle<'a>(handle: i64) -> Option<&'a mut MapImpl> {
 /// Create a new string-key map with default settings
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new_default() -> PithMap {
-    pith_map_new(1, 8, 0) // string keys, 8-byte values, not heap
+    pith_map_new_tagged(1, 8, ListTypeTag::Primitive as i32) // string keys, 8-byte values, not heap
 }
 
 /// Create a new int-key map with default settings
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new_int() -> PithMap {
-    pith_map_new(0, 8, 0) // int keys, 8-byte values, not heap
+    pith_map_new_tagged(0, 8, ListTypeTag::Primitive as i32) // int keys, 8-byte values, not heap
 }
 
 /// String-key map that owns cstring values: insert retains; overwrite,
@@ -598,26 +688,26 @@ pub unsafe extern "C" fn pith_map_new_int() -> PithMap {
 /// Map[String, String].
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new_cstr_val() -> PithMap {
-    pith_map_new(1, 8, 1)
+    pith_map_new_tagged(1, 8, ListTypeTag::String as i32)
 }
 
 /// Int-key map that owns cstring values (Map[Int, String]).
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new_int_cstr_val() -> PithMap {
-    pith_map_new(0, 8, 1)
+    pith_map_new_tagged(0, 8, ListTypeTag::String as i32)
 }
 
 /// Bytes-key map with 8-byte values it owns no counts on (Map[Bytes, Int]);
 /// a heap value kind is learned at the first kind-carrying store.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new_bytes() -> PithMap {
-    pith_map_new(2, 8, 0)
+    pith_map_new_tagged(2, 8, ListTypeTag::Primitive as i32)
 }
 
 /// Bytes-key map that owns cstring values (Map[Bytes, String]).
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_new_bytes_cstr_val() -> PithMap {
-    pith_map_new(2, 8, 1)
+    pith_map_new_tagged(2, 8, ListTypeTag::String as i32)
 }
 
 #[no_mangle]
@@ -638,7 +728,7 @@ pub unsafe extern "C" fn pith_map_new(key_type: i32, val_size: i64, val_is_heap:
 /// Create a map whose values are of a named heap kind, or `Primitive` for a
 /// map that owns no value counts. The tag codes are the element-tag codes
 /// `pith_list_new` uses.
-unsafe fn pith_map_new_tagged(key_type: i32, val_size: i64, val_tag: i32) -> PithMap {
+fn pith_map_new_tagged(key_type: i32, val_size: i64, val_tag: i32) -> PithMap {
     let map_impl = MapImpl::new(
         KeyType::from_code(key_type),
         val_size as usize,
@@ -666,21 +756,74 @@ pub(crate) unsafe fn new_string_keyed_handle(val_tag: ListTypeTag) -> i64 {
 /// # Safety
 /// `map_handle` must be a live string-keyed map; `value` must be of the
 /// map's value kind.
-pub(crate) unsafe fn insert_bytes_key(map_handle: i64, key: &[u8], value: i64, takes_caller_count: bool) {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return;
+pub(crate) unsafe fn insert_bytes_key(
+    map_handle: i64,
+    key: &[u8],
+    value: i64,
+    takes_caller_count: bool,
+) {
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
+        // SAFETY: Caller guarantees `value` matches the map's value kind.
+        unsafe { insert_keyed(impl_ref, &KeyRef::Str(key), value, takes_caller_count) };
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
-    insert_keyed(impl_ref, &KeyRef::Str(key), value, takes_caller_count);
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) };
 }
 
 /// Get map length
 #[no_mangle]
 pub extern "C" fn pith_map_len(map: PithMap) -> i64 {
-    unsafe {
-        map_ref(map)
-            .map(|impl_ref| impl_ref.len() as i64)
-            .unwrap_or(0)
+    // SAFETY: `with_map_ref` validates `map` before reading its length.
+    unsafe { with_map_ref(map, |impl_ref| impl_ref.len() as i64) }.unwrap_or(0)
+}
+
+#[inline(always)]
+unsafe fn map_insert_int_impl(impl_ref: &mut MapImpl, key: i64, value: *const u8, val_size: i64) {
+    crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
+
+    // Verify value size matches
+    if impl_ref.val_size != val_size as usize {
+        eprintln!("pith: map value size mismatch");
+        return;
+    }
+
+    // Verify key type
+    if !matches!(impl_ref.key_type, KeyType::Int) {
+        eprintln!("pith: map key type mismatch (expected int)");
+        return;
+    }
+
+    // Copy value data
+    // SAFETY: Caller guarantees `value` points to `val_size` readable bytes.
+    let val_slice = unsafe { std::slice::from_raw_parts(value, val_size as usize) };
+    if impl_ref.uses_int_values8() {
+        crate::perf_count(&crate::PERF_MAP_INT_FAST_INSERTS, 1);
+        let int_value = i64::from_le_bytes(val_slice[..8].try_into().unwrap_or([0u8; 8]));
+        impl_ref.insert_int_value(key, int_value);
+        return;
+    }
+    crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
+    // the only caller that can supply a value that is not one word, so the
+    // only place a boxed value is built. A value size of 8 stores inline
+    // like every other entry point.
+    let stored = MapVal::from_bytes(val_slice);
+
+    // The map owns one count per stored heap value, read out of the same
+    // word release_value drops it from.
+    // (the retain must stay gated on the value tag: magic-checking an
+    // arbitrary integer dereferences value-16, which faults on values
+    // that resemble unmapped addresses.)
+    if let Some(raw) = stored.word() {
+        // SAFETY: Caller passes a handle matching `impl_ref.val_tag` when heap-valued.
+        unsafe { impl_ref.retain_value(raw) };
+    }
+
+    // Retain before insert, release the displaced value after: `m[k] = m[k]`
+    // must not drop the last count before the new one is taken.
+    if let Some(old) = impl_ref.insert(&KeyRef::Int(key), stored) {
+        // SAFETY: `old` was owned by `impl_ref`.
+        unsafe { impl_ref.release_value(&old) };
     }
 }
 
@@ -700,51 +843,21 @@ pub unsafe extern "C" fn pith_map_insert_int(
         return;
     }
 
-    let Some(impl_ref) = map_mut(*map) else {
-        return;
+    // SAFETY: `map` is non-null per caller contract.
+    let map_val = unsafe { *map };
+    // SAFETY: `with_map_mut` validates `map_val`; `value` is readable for `val_size` bytes.
+    unsafe {
+        with_map_mut(map_val, |impl_ref| {
+            map_insert_int_impl(impl_ref, key, value, val_size)
+        })
     };
-    crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
+}
 
-    // Verify value size matches
-    if impl_ref.val_size != val_size as usize {
-        eprintln!("pith: map value size mismatch");
-        return;
-    }
-
-    // Verify key type
-    if !matches!(impl_ref.key_type, KeyType::Int) {
-        eprintln!("pith: map key type mismatch (expected int)");
-        return;
-    }
-
-    // Copy value data
-    let val_slice = std::slice::from_raw_parts(value, val_size as usize);
-    if impl_ref.uses_int_values8() {
-        crate::perf_count(&crate::PERF_MAP_INT_FAST_INSERTS, 1);
-        let int_value = i64::from_le_bytes(val_slice[..8].try_into().unwrap_or([0u8; 8]));
-        impl_ref.insert_int_value(key, int_value);
-        return;
-    }
-    crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
-    // the only caller that can supply a value that is not one word, so the
-    // only place a boxed value is built. A value size of 8 stores inline
-    // like every other entry point.
-    let stored = MapVal::from_bytes(val_slice);
-
-    // The map owns one count per stored heap value, read out of the same
-    // word release_value drops it from.
-    // (the retain must stay gated on the value tag: magic-checking an
-    // arbitrary integer dereferences value-16, which faults on values
-    // that resemble unmapped addresses.)
-    if let Some(raw) = stored.word() {
-        impl_ref.retain_value(raw);
-    }
-
-    // Retain before insert, release the displaced value after: `m[k] = m[k]`
-    // must not drop the last count before the new one is taken.
-    if let Some(old) = impl_ref.insert(&KeyRef::Int(key), stored) {
-        impl_ref.release_value(&old);
-    }
+#[inline(always)]
+unsafe fn map_clear_impl(impl_ref: &mut MapImpl) {
+    // SAFETY: `impl_ref` owns one count per stored heap value.
+    unsafe { impl_ref.release_all_values() };
+    impl_ref.clear();
 }
 
 /// Clear all entries from map
@@ -754,28 +867,29 @@ pub unsafe extern "C" fn pith_map_clear(map: *mut PithMap) {
         return;
     }
 
-    let Some(impl_ref) = map_mut(*map) else {
-        return;
-    };
-
-    impl_ref.release_all_values();
-    impl_ref.clear();
+    // SAFETY: `map` is non-null per caller contract.
+    let map_val = unsafe { *map };
+    // SAFETY: `with_map_mut` validates `map_val` before clearing it.
+    unsafe { with_map_mut(map_val, |impl_ref| map_clear_impl(impl_ref)) };
 }
 
 /// Release map and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_release(map: PithMap) {
-    if !map_magic_ok_for(map.ptr as *const (), crate::quarantine::Op::Release) {
+    // SAFETY: `map_magic_ok_for` validates alignment and magic word.
+    if !unsafe { map_magic_ok_for(map.ptr as *const (), crate::quarantine::Op::Release) } {
         return;
     }
-    let impl_ref = &mut *(map.ptr as *mut MapImpl);
+    // SAFETY: Magic validated; only atomic fields are accessed while shared.
+    let impl_ref = unsafe { &*(map.ptr as *const MapImpl) };
     // cycle-gc suspect hook, before our count is given up: while we still
     // hold it the map cannot die under the hook (see `maybe_suspect_struct`
     // in runtime_core for why the ordering matters).
     if crate::cycle::cycle_gc_enabled()
         && impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed) > 1
     {
-        maybe_suspect_map(impl_ref, map.ptr as usize);
+        // SAFETY: Caller still holds a strong count so `map` stays live across the hook.
+        unsafe { maybe_suspect_map(impl_ref, map.ptr as usize) };
     }
     let prev = impl_ref
         .rc
@@ -790,26 +904,29 @@ pub unsafe extern "C" fn pith_map_release(map: PithMap) {
     }
     acquire_last_count!(impl_ref.rc);
 
-    impl_ref.release_all_values();
-
-    // Free the map implementation. Scrub the magic first so any handle
-    // that outlives the map fails the fast validity check.
-    (*(map.ptr as *mut MapImpl)).magic = 0;
-    // a map that dies while the suspect buffer points at it keeps its shell:
-    // the values are already released and the handle no longer validates
-    // anywhere, so deferring the box drop to the graveyard leaks only the
-    // impl struct until the collector frees it.
-    if crate::cycle::cycle_gc_enabled()
+    // SAFETY: Last strong count observed with acquire; exclusive access to release values.
+    unsafe { impl_ref.release_all_values() };
+    let buffered = crate::cycle::cycle_gc_enabled()
         && impl_ref
             .cycle_flags
             .load(std::sync::atomic::Ordering::Relaxed)
             & 1
-            != 0
-    {
+            != 0;
+
+    // Free the map implementation. Scrub the magic first so any handle
+    // that outlives the map fails the fast validity check.
+    // SAFETY: `impl_ref` borrow ended above; exclusive ownership of `map.ptr`.
+    unsafe { (*(map.ptr as *mut MapImpl)).magic = 0 };
+    // a map that dies while the suspect buffer points at it keeps its shell:
+    // the values are already released and the handle no longer validates
+    // anywhere, so deferring the box drop to the graveyard leaks only the
+    // impl struct until the collector frees it.
+    if buffered {
         crate::cycle::graveyard_defer(map.ptr as usize, crate::cycle::CYCLE_KIND_MAP);
         return;
     }
-    drop_map_shell(map.ptr as *mut MapImpl);
+    // SAFETY: Last owner, magic scrubbed, not deferred to graveyard.
+    unsafe { drop_map_shell(map.ptr as *mut MapImpl) };
 }
 
 /// Mark a map as a cycle suspect and hand it to the buffer. Cold and
@@ -825,17 +942,20 @@ unsafe fn maybe_suspect_map(impl_ref: &MapImpl, ptr: usize) {
     {
         return; // already buffered
     }
-    crate::cycle::cycle_suspect(ptr, crate::cycle::CYCLE_KIND_MAP);
+    // SAFETY: Caller holds a strong count on `ptr` so it stays live across `cycle_suspect`.
+    unsafe { crate::cycle::cycle_suspect(ptr, crate::cycle::CYCLE_KIND_MAP) };
 }
 
 /// Drop a map's buffered mark (overflow, or a collector drain). Magic-
 /// checked, so a map that already died and was freed is a no-op.
 pub(crate) unsafe fn cycle_clear_map_buffered(handle: i64) {
-    if let Some(impl_ref) = map_ref_from_handle(handle) {
+    let clear = |impl_ref: &MapImpl| {
         impl_ref
             .cycle_flags
             .fetch_and(!1, std::sync::atomic::Ordering::Relaxed);
-    }
+    };
+    // SAFETY: `with_map_ref_handle` validates `handle` before clearing its buffered bit.
+    unsafe { with_map_ref_handle(handle, clear) };
 }
 
 // --- collector-facing accessors ---------------------------------------------
@@ -847,17 +967,20 @@ pub(crate) unsafe fn cycle_clear_map_buffered(handle: i64) {
 /// The map's current reference count, or `None` when the handle no longer
 /// validates (the map died into the graveyard).
 pub(crate) unsafe fn cycle_map_strong_count(handle: i64) -> Option<u32> {
-    map_ref_from_handle(handle)
-        .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
+    let read_rc = |impl_ref: &MapImpl| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `with_map_ref_handle` validates `handle` before reading its refcount.
+    unsafe { with_map_ref_handle(handle, read_rc) }
 }
 
 /// Add `delta` to the reference count: the collector's teardown guard.
 pub(crate) unsafe fn cycle_map_guard_strong(handle: i64, delta: u32) {
-    if let Some(impl_ref) = map_ref_from_handle(handle) {
+    let bump = |impl_ref: &MapImpl| {
         impl_ref
             .rc
             .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
-    }
+    };
+    // SAFETY: `with_map_ref_handle` validates `handle` before updating its refcount.
+    unsafe { with_map_ref_handle(handle, bump) };
 }
 
 /// Report every value the map owns a count on, as (value, child code).
@@ -865,22 +988,21 @@ pub(crate) unsafe fn cycle_map_guard_strong(handle: i64, delta: u32) {
 /// value side has edges; the scalar fast path stores raw ints and owns none.
 /// Mark the map shared (see `share.rs`); true when this call set the mark.
 pub(crate) unsafe fn map_mark_shared(handle: i64) -> bool {
-    match map_ref_from_handle(handle) {
-        Some(impl_ref) => {
-            impl_ref
-                .cycle_flags
-                .fetch_or(crate::share::CONTAINER_SHARED_FLAG, std::sync::atomic::Ordering::Release)
-                & crate::share::CONTAINER_SHARED_FLAG
-                == 0
-        }
-        None => false,
-    }
+    let mark = |impl_ref: &MapImpl| {
+        impl_ref
+            .cycle_flags
+            .fetch_or(
+                crate::share::CONTAINER_SHARED_FLAG,
+                std::sync::atomic::Ordering::Release,
+            )
+            & crate::share::CONTAINER_SHARED_FLAG
+            == 0
+    };
+    // SAFETY: `with_map_ref_handle` validates `handle` before setting its shared flag.
+    unsafe { with_map_ref_handle(handle, mark) }.unwrap_or(false)
 }
 
-pub(crate) unsafe fn cycle_map_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
-    let Some(impl_ref) = map_ref_from_handle(handle) else {
-        return;
-    };
+fn visit_map_children(impl_ref: &MapImpl, f: &mut dyn FnMut(i64, u8)) {
     let Some(code) = crate::collections::list::cycle_child_code(impl_ref.val_tag) else {
         return;
     };
@@ -892,15 +1014,17 @@ pub(crate) unsafe fn cycle_map_children(handle: i64, f: &mut dyn FnMut(i64, u8))
     }
 }
 
+pub(crate) unsafe fn cycle_map_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
+    // SAFETY: `with_map_ref_handle` validates `handle` before iterating its values.
+    unsafe { with_map_ref_handle(handle, |impl_ref| visit_map_children(impl_ref, f)) };
+}
+
 /// The destruction body of a garbage map: drop the count it holds on every
 /// value, then empty the storage so the shell free below can never release
 /// them a second time.
 pub(crate) unsafe fn cycle_map_release_values(handle: i64) {
-    let Some(impl_ref) = map_mut_from_handle(handle) else {
-        return;
-    };
-    impl_ref.release_all_values();
-    impl_ref.clear();
+    // SAFETY: Collector holds the world stopped; `with_map_mut_handle` validates `handle`.
+    unsafe { with_map_mut_handle(handle, |impl_ref| map_clear_impl(impl_ref)) };
 }
 
 /// Free a garbage map's shell: the tail of `pith_map_release` minus the value
@@ -908,32 +1032,49 @@ pub(crate) unsafe fn cycle_map_release_values(handle: i64) {
 /// during teardown parks in the graveyard so the fresh suspect entry never
 /// dangles.
 pub(crate) unsafe fn cycle_map_free_dead(handle: i64) {
-    let Some(impl_ref) = map_ref_from_handle(handle) else {
+    let read_buffered = |impl_ref: &MapImpl| {
+        impl_ref
+            .cycle_flags
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 1
+            != 0
+    };
+    // SAFETY: `with_map_ref_handle` validates `handle` and scopes the borrow before free.
+    let Some(buffered) = (unsafe { with_map_ref_handle(handle, read_buffered) }) else {
         return;
     };
-    let buffered = impl_ref
-        .cycle_flags
-        .load(std::sync::atomic::Ordering::Relaxed)
-        & 1
-        != 0;
-    (*(handle as *mut MapImpl)).magic = 0;
+    // SAFETY: Borrow ended above; collector owns this dead map exclusively.
+    unsafe { (*(handle as *mut MapImpl)).magic = 0 };
     if buffered && crate::cycle::cycle_gc_enabled() {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_MAP);
         return;
     }
-    drop_map_shell(handle as *mut MapImpl);
+    // SAFETY: Magic scrubbed and not deferred to graveyard.
+    unsafe { drop_map_shell(handle as *mut MapImpl) };
 }
 
 /// Drop a map shell the graveyard parked: values already released, magic
 /// already scrubbed, registry entry already gone; only the box remains.
 pub(crate) unsafe fn cycle_drop_map_shell(ptr: usize) {
-    drop_map_shell(ptr as *mut MapImpl);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { drop_map_shell(ptr as *mut MapImpl) };
 }
 
 /// Free a dead map's box, or quarantine it.
 unsafe fn drop_map_shell(ptr: *mut MapImpl) {
-    let magic = std::ptr::addr_of_mut!((*ptr).magic);
-    crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::Map);
+    // SAFETY: Caller passes a valid `Box::into_raw` `MapImpl` pointer to free or quarantine.
+    unsafe {
+        let magic = std::ptr::addr_of_mut!((*ptr).magic);
+        crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::Map);
+    }
+}
+
+#[inline(always)]
+fn map_take_ikey_impl(impl_ref: &mut MapImpl, key: i64) -> i64 {
+    if impl_ref.uses_int_values8() {
+        return impl_ref.remove_int_value(key).unwrap_or(0);
+    }
+    take_keyed(impl_ref, &KeyRef::Int(key))
 }
 
 /// Remove an int-keyed entry and hand its value, count included, to the
@@ -946,13 +1087,9 @@ unsafe fn drop_map_shell(ptr: *mut MapImpl) {
 /// rejects garbage).
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_take_ikey(map_handle: i64, key: i64) -> i64 {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return 0;
-    };
-    if impl_ref.uses_int_values8() {
-        return impl_ref.remove_int_value(key).unwrap_or(0);
-    }
-    take_keyed(impl_ref, &KeyRef::Int(key))
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, |impl_ref| map_take_ikey_impl(impl_ref, key)) }
+        .unwrap_or(0)
 }
 
 /// String-keyed take: remove and transfer the value's count to the caller.
@@ -961,11 +1098,13 @@ pub unsafe extern "C" fn pith_map_take_ikey(map_handle: i64, key: i64) -> i64 {
 /// map_handle must be a valid map handle; key a valid cstring.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_take(map_handle: i64, key: *const i8) -> i64 {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return 0;
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_take");
+        // SAFETY: `with_cstr_key` rejects null and scopes the borrowed key bytes.
+        unsafe { with_cstr_key(key, |map_key| take_keyed(impl_ref, map_key)) }.unwrap_or(0)
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_take");
-    take_keyed(impl_ref, &cstr_key_ref(key))
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) }.unwrap_or(0)
 }
 
 /// Bytes-keyed take: remove and transfer the value's count to the caller.
@@ -974,19 +1113,19 @@ pub unsafe extern "C" fn pith_map_take(map_handle: i64, key: *const i8) -> i64 {
 /// map_handle must be a valid map handle; key a bytes handle or null.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_take_bkey(map_handle: i64, key: i64) -> i64 {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return 0;
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_take_bkey");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        unsafe { with_bytes_key(key, |map_key| take_keyed(impl_ref, map_key)) }.unwrap_or(0)
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_take_bkey");
-    let Some(map_key) = bytes_key_ref(key) else {
-        return 0;
-    };
-    take_keyed(impl_ref, &map_key)
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) }.unwrap_or(0)
 }
 
 /// Remove an entry and hand its value's count to the caller: the map's
 /// count leaves with the value instead of being released here.
-unsafe fn take_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> i64 {
+#[inline(always)]
+fn take_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> i64 {
     impl_ref
         .remove(map_key)
         .and_then(|val| val.word())
@@ -997,8 +1136,9 @@ unsafe fn take_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_retain_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_MAP_RETAIN);
-    if map_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) {
-        (*(handle as *const MapImpl))
+    // SAFETY: Magic check validates handle before atomic retain increment.
+    if unsafe { map_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) } {
+        unsafe { &*(handle as *const MapImpl) }
             .rc
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1008,9 +1148,12 @@ pub unsafe extern "C" fn pith_map_retain_handle(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_release_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_MAP_RELEASE);
-    pith_map_release(PithMap {
-        ptr: handle as *mut (),
-    });
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        pith_map_release(PithMap {
+            ptr: handle as *mut (),
+        });
+    }
 }
 
 /// Destructor for map elements in collections
@@ -1022,10 +1165,9 @@ pub extern "C" fn pith_map_destructor(ptr: *mut u8) {
         return;
     }
 
-    unsafe {
-        let map = ptr as *const PithMap;
-        pith_map_release(*map);
-    }
+    let map = ptr as *const PithMap;
+    // SAFETY: Caller guarantees `ptr` points to a valid `PithMap`.
+    unsafe { pith_map_release(*map) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,37 +1184,18 @@ fn map_trace_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("PITH_MAP_TRACE").is_ok())
 }
 
-/// Borrow a c-string key: walk it for its length and hand back the caller's
-/// own bytes. Nothing is copied, so the borrow is only good for the length of
-/// the call that took it.
-unsafe fn cstr_key_ref<'a>(key: *const i8) -> KeyRef<'a> {
-    // a heap string's length is one header read; only a literal is scanned
-    let len = crate::string::pith_cstring_len(key) as usize;
-    KeyRef::Str(std::slice::from_raw_parts(key as *const u8, len))
-}
-
-/// Borrow a bytes handle's buffer as a key, or `None` for a handle that is not
-/// a live bytes object. A null handle is the empty value, which `pith_bytes_eq`
-/// already treats as equal to an empty bytes object. The handle is only read:
-/// the map keeps its own copy of the content and never a count on the caller's
-/// object, and the caller's object is alive for the whole of the entry point
-/// that borrowed it, so the borrow must not outlive that call.
-unsafe fn bytes_key_ref<'a>(key: i64) -> Option<KeyRef<'a>> {
-    if key == 0 {
-        return Some(KeyRef::Bytes(&[]));
-    }
-    crate::bytes::pith_bytes_ref(key).map(|b| KeyRef::Bytes(b.data.as_slice()))
-}
-
 /// The stored word under `map_key`, or `None` on a miss.
-unsafe fn get_keyed(impl_ref: &MapImpl, map_key: &KeyRef<'_>) -> Option<i64> {
+#[inline(always)]
+fn get_keyed(impl_ref: &MapImpl, map_key: &KeyRef<'_>) -> Option<i64> {
     impl_ref.get(map_key).and_then(|val| val.word())
 }
 
 /// Drop the entry under `map_key`, releasing the map's count on its value.
+#[inline(always)]
 unsafe fn remove_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>) {
     if let Some(old) = impl_ref.remove(map_key) {
-        impl_ref.release_value(&old);
+        // SAFETY: `old` was owned by `impl_ref`.
+        unsafe { impl_ref.release_value(&old) };
     }
 }
 
@@ -1090,6 +1213,22 @@ fn strict_miss(key_display: String) -> ! {
     crate::failure::fail(message)
 }
 
+#[cold]
+#[inline(never)]
+fn null_map_key_exit() -> ! {
+    eprintln!("pith runtime error: map key not found: <null>");
+    // panic-guard: a null map key is a program bug with no value to return.
+    std::process::exit(1);
+}
+
+#[cold]
+#[inline(never)]
+fn invalid_map_handle_exit() -> ! {
+    eprintln!("pith runtime error: map indexing on invalid map handle");
+    // panic-guard: strict map indexing or fused update on an invalid handle is a program bug with no value to return.
+    std::process::exit(1);
+}
+
 /// Insert an i64 value with a C-string key.
 ///
 /// # Safety
@@ -1097,7 +1236,8 @@ fn strict_miss(key_display: String) -> ! {
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, value: i64) {
-    insert_cstr_inner(map_handle, key, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_cstr_inner(map_handle, key, value, false) };
 }
 
 /// Insert a value the caller owns under a C-string key. The map takes the
@@ -1111,7 +1251,8 @@ pub unsafe extern "C" fn pith_map_insert_cstr(map_handle: i64, key: *const i8, v
 /// * `key` must be a valid null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_cstr_owned(map_handle: i64, key: *const i8, value: i64) {
-    insert_cstr_inner(map_handle, key, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_cstr_inner(map_handle, key, value, true) };
 }
 
 /// Insert a borrowed value of a named heap kind. The map learns the kind
@@ -1131,11 +1272,14 @@ pub unsafe extern "C" fn pith_map_insert_cstr_kind(
     value: i64,
     val_tag: i64,
 ) {
-    let owns = map_adopt_value_tag(map_handle, val_tag);
+    // SAFETY: `map_adopt_value_tag` validates `map_handle`.
+    let owns = unsafe { map_adopt_value_tag(map_handle, val_tag) };
     if !owns {
-        retain_element(element_tag_from_code(val_tag as i32), value);
+        // SAFETY: Caller passes a value matching `val_tag`.
+        unsafe { retain_element(element_tag_from_code(val_tag as i32), value) };
     }
-    insert_cstr_inner(map_handle, key, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_cstr_inner(map_handle, key, value, false) };
 }
 
 /// Insert an owned value of a named heap kind: the map takes the caller's
@@ -1152,46 +1296,66 @@ pub unsafe extern "C" fn pith_map_insert_cstr_owned_kind(
     value: i64,
     val_tag: i64,
 ) {
-    map_adopt_value_tag(map_handle, val_tag);
-    insert_cstr_inner(map_handle, key, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        map_adopt_value_tag(map_handle, val_tag);
+        insert_cstr_inner(map_handle, key, value, true);
+    }
 }
 
 /// Let a map learn the heap kind of the values being stored into it.
 /// Returns true when the map owns a count on that kind afterwards.
 unsafe fn map_adopt_value_tag(map_handle: i64, val_tag: i64) -> bool {
-    match map_mut_from_handle(map_handle) {
-        Some(impl_ref) => impl_ref.adopt_value_tag(element_tag_from_code(val_tag as i32)),
-        None => false,
-    }
+    let tag = element_tag_from_code(val_tag as i32);
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before updating its tag.
+    unsafe { with_map_mut_handle(map_handle, |impl_ref| impl_ref.adopt_value_tag(tag)) }
+        .unwrap_or(false)
 }
 
-unsafe fn insert_cstr_inner(map_handle: i64, key: *const i8, value: i64, takes_caller_count: bool) {
+#[inline(always)]
+unsafe fn insert_cstr_inner(
+    map_handle: i64,
+    key: *const i8,
+    value: i64,
+    takes_caller_count: bool,
+) {
     if key.is_null() {
         return;
     }
 
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return;
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
+        crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
+        let do_insert = |map_key: &KeyRef<'_>| {
+            // SAFETY: Caller passes a value matching the map's value kind.
+            unsafe { insert_keyed(impl_ref, map_key, value, takes_caller_count) };
+        };
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_key(key, do_insert) };
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_insert");
-    crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
-    insert_keyed(impl_ref, &cstr_key_ref(key), value, takes_caller_count);
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) };
 }
 
+#[inline(always)]
 unsafe fn insert_bkey_inner(map_handle: i64, key: i64, value: i64, takes_caller_count: bool) {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return;
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_insert_bkey");
+        let do_insert = |map_key: &KeyRef<'_>| {
+            // SAFETY: Caller passes a value matching the map's value kind.
+            unsafe { insert_keyed(impl_ref, map_key, value, takes_caller_count) };
+        };
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        unsafe { with_bytes_key(key, do_insert) };
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_insert_bkey");
-    let Some(map_key) = bytes_key_ref(key) else {
-        return;
-    };
-    insert_keyed(impl_ref, &map_key, value, takes_caller_count);
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) };
 }
 
 /// Store `value` under `map_key`. the map retains the incoming value when it
 /// owns heap values, and drops its count on whatever that displaces. an owned
 /// value arrives with the caller's count, which the map keeps as its own.
+#[inline(always)]
 unsafe fn insert_keyed(
     impl_ref: &mut MapImpl,
     map_key: &KeyRef<'_>,
@@ -1200,21 +1364,24 @@ unsafe fn insert_keyed(
 ) {
     if impl_ref.val_is_heap() {
         if !takes_caller_count {
-            impl_ref.retain_value(value);
+            // SAFETY: Caller passes a handle matching `impl_ref.val_tag`.
+            unsafe { impl_ref.retain_value(value) };
         }
         if map_trace_enabled() {
             eprintln!("map_ins {} -> {:p}", map_key.display(), value as *const i8);
         }
     }
     if let Some(old) = impl_ref.insert(map_key, MapVal::Word(value)) {
-        impl_ref.release_value(&old);
+        // SAFETY: `old` was owned by `impl_ref`.
+        unsafe { impl_ref.release_value(&old) };
     }
 }
 
 /// Body of the fused update: add `delta` to the value under a borrowed key and
 /// hand back the new value. A key the map does not hold takes the same exit
 /// `m[k]` takes, because the strict get this replaces is what would have run.
-unsafe fn upsert_add_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>, delta: i64) -> i64 {
+#[inline(always)]
+fn upsert_add_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>, delta: i64) -> i64 {
     if impl_ref.val_is_heap() {
         eprintln!("pith runtime error: map update on a map whose values are reference-counted");
         // panic-guard: the fused update is emitted only for an integer-valued map, so a counted value here is a compiler bug with no correct answer.
@@ -1244,18 +1411,20 @@ pub unsafe extern "C" fn pith_map_upsert_add_cstr(
     delta: i64,
 ) -> i64 {
     if key.is_null() {
-        eprintln!("pith runtime error: map key not found: <null>");
-        // panic-guard: a null map key is a program bug with no value to return.
-        std::process::exit(1);
+        null_map_key_exit();
     }
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_upsert_add");
+        crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_key(key, |map_key| upsert_add_keyed(impl_ref, map_key, delta)) }
+            .unwrap_or(0)
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_upsert_add");
-    crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
-    upsert_add_keyed(impl_ref, &cstr_key_ref(key), delta)
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    match unsafe { with_map_mut_handle(map_handle, run) } {
+        Some(v) => v,
+        None => invalid_map_handle_exit(),
+    }
 }
 
 /// Add `delta` to the value under an integer key, returning the new value.
@@ -1265,13 +1434,15 @@ pub unsafe extern "C" fn pith_map_upsert_add_cstr(
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_upsert_add_ikey(map_handle: i64, key: i64, delta: i64) -> i64 {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
+    let run = |impl_ref: &mut MapImpl| {
+        crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
+        upsert_add_keyed(impl_ref, &KeyRef::Int(key), delta)
     };
-    crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
-    upsert_add_keyed(impl_ref, &KeyRef::Int(key), delta)
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    match unsafe { with_map_mut_handle(map_handle, run) } {
+        Some(v) => v,
+        None => invalid_map_handle_exit(),
+    }
 }
 
 /// Add `delta` to the value under a bytes key, returning the new value. The
@@ -1283,19 +1454,23 @@ pub unsafe extern "C" fn pith_map_upsert_add_ikey(map_handle: i64, key: i64, del
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_upsert_add_bkey(map_handle: i64, key: i64, delta: i64) -> i64 {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_upsert_add_bkey");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        match unsafe { with_bytes_key(key, |map_key| upsert_add_keyed(impl_ref, map_key, delta)) } {
+            Some(v) => v,
+            None => strict_miss(String::from("<not a bytes value>")),
+        }
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_upsert_add_bkey");
-    let Some(map_key) = bytes_key_ref(key) else {
-        strict_miss(String::from("<not a bytes value>"));
-    };
-    upsert_add_keyed(impl_ref, &map_key, delta)
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    match unsafe { with_map_mut_handle(map_handle, run) } {
+        Some(v) => v,
+        None => invalid_map_handle_exit(),
+    }
 }
 
-unsafe fn add_or_insert_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>, delta: i64, init: i64) -> i64 {
+#[inline(always)]
+fn add_or_insert_keyed(impl_ref: &mut MapImpl, map_key: &KeyRef<'_>, delta: i64, init: i64) -> i64 {
     if impl_ref.val_is_heap() {
         eprintln!("pith runtime error: map update on a map whose values are reference-counted");
         // panic-guard: the fused update is emitted only for an integer-valued map, so a counted value here is a compiler bug with no correct answer.
@@ -1323,18 +1498,24 @@ pub unsafe extern "C" fn pith_map_add_or_insert_cstr(
     init: i64,
 ) -> i64 {
     if key.is_null() {
-        eprintln!("pith runtime error: map key not found: <null>");
-        // panic-guard: a null map key is a program bug with no value to return.
-        std::process::exit(1);
+        null_map_key_exit();
     }
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_add_or_insert");
+        crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe {
+            with_cstr_key(key, |map_key| {
+                add_or_insert_keyed(impl_ref, map_key, delta, init)
+            })
+        }
+        .unwrap_or(0)
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_add_or_insert");
-    crate::perf_stats!(PERF_MAP_STRING_INSERTS += 1);
-    add_or_insert_keyed(impl_ref, &cstr_key_ref(key), delta, init)
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    match unsafe { with_map_mut_handle(map_handle, run) } {
+        Some(v) => v,
+        None => invalid_map_handle_exit(),
+    }
 }
 
 /// The int-keyed twin of `pith_map_add_or_insert_cstr`.
@@ -1342,14 +1523,21 @@ pub unsafe extern "C" fn pith_map_add_or_insert_cstr(
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn pith_map_add_or_insert_ikey(map_handle: i64, key: i64, delta: i64, init: i64) -> i64 {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
+pub unsafe extern "C" fn pith_map_add_or_insert_ikey(
+    map_handle: i64,
+    key: i64,
+    delta: i64,
+    init: i64,
+) -> i64 {
+    let run = |impl_ref: &mut MapImpl| {
+        crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
+        add_or_insert_keyed(impl_ref, &KeyRef::Int(key), delta, init)
     };
-    crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
-    add_or_insert_keyed(impl_ref, &KeyRef::Int(key), delta, init)
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    match unsafe { with_map_mut_handle(map_handle, run) } {
+        Some(v) => v,
+        None => invalid_map_handle_exit(),
+    }
 }
 
 /// The bytes-keyed twin of `pith_map_add_or_insert_cstr`. The key is borrowed
@@ -1358,17 +1546,40 @@ pub unsafe extern "C" fn pith_map_add_or_insert_ikey(map_handle: i64, key: i64, 
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
-pub unsafe extern "C" fn pith_map_add_or_insert_bkey(map_handle: i64, key: i64, delta: i64, init: i64) -> i64 {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: a fused update on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
+pub unsafe extern "C" fn pith_map_add_or_insert_bkey(
+    map_handle: i64,
+    key: i64,
+    delta: i64,
+    init: i64,
+) -> i64 {
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_add_or_insert_bkey");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        match unsafe {
+            with_bytes_key(key, |map_key| {
+                add_or_insert_keyed(impl_ref, map_key, delta, init)
+            })
+        } {
+            Some(v) => v,
+            None => strict_miss(String::from("<not a bytes value>")),
+        }
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_add_or_insert_bkey");
-    let Some(map_key) = bytes_key_ref(key) else {
-        strict_miss(String::from("<not a bytes value>"));
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    match unsafe { with_map_mut_handle(map_handle, run) } {
+        Some(v) => v,
+        None => invalid_map_handle_exit(),
+    }
+}
+
+#[inline(always)]
+fn map_get_cstr_traced(impl_ref: &MapImpl, map_key: &KeyRef<'_>) -> i64 {
+    let Some(v) = get_keyed(impl_ref, map_key) else {
+        return 0;
     };
-    add_or_insert_keyed(impl_ref, &map_key, delta, init)
+    if impl_ref.val_is_heap() && map_trace_enabled() {
+        eprintln!("map_get {} -> {:p}", map_key.display(), v as *const i8);
+    }
+    v
 }
 
 /// Get an i64 value by C-string key. Returns 0 if the key is not found.
@@ -1382,19 +1593,14 @@ pub unsafe extern "C" fn pith_map_get_cstr(map_handle: i64, key: *const i8) -> i
         return 0;
     }
 
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return 0;
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_get");
+        crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_key(key, |map_key| map_get_cstr_traced(impl_ref, map_key)) }.unwrap_or(0)
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_get");
-    crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    let map_key = cstr_key_ref(key);
-    let Some(v) = get_keyed(impl_ref, &map_key) else {
-        return 0;
-    };
-    if impl_ref.val_is_heap() && map_trace_enabled() {
-        eprintln!("map_get {} -> {:p}", map_key.display(), v as *const i8);
-    }
-    v
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, run) }.unwrap_or(0)
 }
 
 /// Get an i64 value by C-string key, wrapped in an Optional tuple. Returns
@@ -1408,23 +1614,35 @@ unsafe fn map_get_cstr(map_handle: i64, key: *const i8) -> Option<i64> {
     if key.is_null() {
         return None;
     }
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return None;
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_opt");
+        crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_key(key, |map_key| get_keyed(impl_ref, map_key)) }.flatten()
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_opt");
-    crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    get_keyed(impl_ref, &cstr_key_ref(key))
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, run) }.flatten()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_cstr_opt(map_handle: i64, key: *const i8) -> i64 {
-    optional_from(map_get_cstr(map_handle, key))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_from(unsafe { map_get_cstr(map_handle, key) })
 }
 
 /// `pith_map_get_cstr_opt` as a register pair; see `optional_pair`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_cstr_opt_pair(map_handle: i64, key: *const i8) -> ResultPair {
-    optional_pair(map_get_cstr(map_handle, key))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_pair(unsafe { map_get_cstr(map_handle, key) })
+}
+
+#[inline(always)]
+fn get_keyed_strict(impl_ref: &MapImpl, map_key: &KeyRef<'_>) -> i64 {
+    match get_keyed(impl_ref, map_key) {
+        Some(v) => v,
+        None => strict_miss(map_key.display()),
+    }
 }
 
 /// Get an i64 value by C-string key. If the key is not present, prints a
@@ -1438,21 +1656,18 @@ pub unsafe extern "C" fn pith_map_get_cstr_opt_pair(map_handle: i64, key: *const
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_cstr_strict(map_handle: i64, key: *const i8) -> i64 {
     if key.is_null() {
-        eprintln!("pith runtime error: map key not found: <null>");
-        // panic-guard: a null map key is a program bug with no value to return.
-        std::process::exit(1);
+        null_map_key_exit();
     }
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: strict map indexing on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_strict");
+        crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_key(key, |map_key| get_keyed_strict(impl_ref, map_key)) }.unwrap_or(0)
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_strict");
-    crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    let map_key = cstr_key_ref(key);
-    match get_keyed(impl_ref, &map_key) {
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    match unsafe { with_map_ref_handle(map_handle, run) } {
         Some(v) => v,
-        None => strict_miss(map_key.display()),
+        None => invalid_map_handle_exit(),
     }
 }
 
@@ -1467,16 +1682,16 @@ pub unsafe extern "C" fn pith_map_contains_cstr(map_handle: i64, key: *const i8)
         return 0;
     }
 
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return 0;
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_contains_key");
+        crate::perf_stats!(PERF_MAP_STRING_CONTAINS += 1);
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        let found = unsafe { with_cstr_key(key, |map_key| impl_ref.contains_key(map_key)) }
+            .unwrap_or(false);
+        i64::from(found)
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_contains_key");
-    crate::perf_stats!(PERF_MAP_STRING_CONTAINS += 1);
-    if impl_ref.contains_key(&cstr_key_ref(key)) {
-        1
-    } else {
-        0
-    }
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before probing it.
+    unsafe { with_map_ref_handle(map_handle, run) }.unwrap_or(0)
 }
 
 /// Get value by C-string key with a default if not found.
@@ -1489,28 +1704,37 @@ pub unsafe extern "C" fn pith_map_get_default_cstr(
     if key.is_null() {
         return default;
     }
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return default;
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_default");
+        crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_key(key, |map_key| get_keyed(impl_ref, map_key)) }.flatten()
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_get_default");
-    crate::perf_stats!(PERF_MAP_STRING_GETS += 1);
-    get_keyed(impl_ref, &cstr_key_ref(key)).unwrap_or(default)
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, run) }
+        .flatten()
+        .unwrap_or(default)
+}
+
+#[inline(always)]
+fn map_get_ikey_impl(impl_ref: &MapImpl, key: i64) -> Option<i64> {
+    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
+    if impl_ref.uses_int_values8() {
+        crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
+        impl_ref.get_int_value(key)
+    } else {
+        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
+        get_keyed(impl_ref, &KeyRef::Int(key))
+    }
 }
 
 /// Get value by integer key with a default if not found.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_default_ikey(map_handle: i64, key: i64, default: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return default;
-    };
-    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
-    if impl_ref.uses_int_values8() {
-        crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
-        impl_ref.get_int_value(key).unwrap_or(default)
-    } else {
-        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        get_keyed(impl_ref, &KeyRef::Int(key)).unwrap_or(default)
-    }
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, |impl_ref| map_get_ikey_impl(impl_ref, key)) }
+        .flatten()
+        .unwrap_or(default)
 }
 
 /// Remove an entry by C-string key.
@@ -1524,12 +1748,18 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
         return;
     }
 
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return;
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::String, "map_remove");
+        crate::perf_stats!(PERF_MAP_STRING_REMOVES += 1);
+        let do_remove = |map_key: &KeyRef<'_>| {
+            // SAFETY: Displaced entry is owned by `impl_ref`.
+            unsafe { remove_keyed(impl_ref, map_key) };
+        };
+        // SAFETY: `key` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_key(key, do_remove) };
     };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_remove");
-    crate::perf_stats!(PERF_MAP_STRING_REMOVES += 1);
-    remove_keyed(impl_ref, &cstr_key_ref(key));
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1551,7 +1781,8 @@ pub unsafe extern "C" fn pith_map_remove_cstr(map_handle: i64, key: *const i8) {
 /// * `key` must be a bytes handle or null.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_bkey(map_handle: i64, key: i64, value: i64) {
-    insert_bkey_inner(map_handle, key, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_bkey_inner(map_handle, key, value, false) };
 }
 
 /// Insert a value the caller owns under a bytes key; see
@@ -1562,7 +1793,8 @@ pub unsafe extern "C" fn pith_map_insert_bkey(map_handle: i64, key: i64, value: 
 /// * `key` must be a bytes handle or null.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_bkey_owned(map_handle: i64, key: i64, value: i64) {
-    insert_bkey_inner(map_handle, key, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_bkey_inner(map_handle, key, value, true) };
 }
 
 /// Insert a borrowed value of a named heap kind under a bytes key; see
@@ -1578,11 +1810,14 @@ pub unsafe extern "C" fn pith_map_insert_bkey_kind(
     value: i64,
     val_tag: i64,
 ) {
-    let owns = map_adopt_value_tag(map_handle, val_tag);
+    // SAFETY: `map_adopt_value_tag` validates `map_handle`.
+    let owns = unsafe { map_adopt_value_tag(map_handle, val_tag) };
     if !owns {
-        retain_element(element_tag_from_code(val_tag as i32), value);
+        // SAFETY: Caller passes a value matching `val_tag`.
+        unsafe { retain_element(element_tag_from_code(val_tag as i32), value) };
     }
-    insert_bkey_inner(map_handle, key, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_bkey_inner(map_handle, key, value, false) };
 }
 
 /// Insert an owned value of a named heap kind under a bytes key; see
@@ -1598,8 +1833,11 @@ pub unsafe extern "C" fn pith_map_insert_bkey_owned_kind(
     value: i64,
     val_tag: i64,
 ) {
-    map_adopt_value_tag(map_handle, val_tag);
-    insert_bkey_inner(map_handle, key, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        map_adopt_value_tag(map_handle, val_tag);
+        insert_bkey_inner(map_handle, key, value, true);
+    }
 }
 
 /// Get a value by bytes key. Returns 0 if the key is not found.
@@ -1608,12 +1846,14 @@ pub unsafe extern "C" fn pith_map_insert_bkey_owned_kind(
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_bkey(map_handle: i64, key: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return 0;
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        unsafe { with_bytes_key(key, |map_key| get_keyed(impl_ref, map_key)) }.flatten()
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey");
-    bytes_key_ref(key)
-        .and_then(|map_key| get_keyed(impl_ref, &map_key))
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, run) }
+        .flatten()
         .unwrap_or(0)
 }
 
@@ -1623,23 +1863,26 @@ pub unsafe extern "C" fn pith_map_get_bkey(map_handle: i64, key: i64) -> i64 {
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 unsafe fn map_get_bkey(map_handle: i64, key: i64) -> Option<i64> {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return None;
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_opt");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        unsafe { with_bytes_key(key, |map_key| get_keyed(impl_ref, map_key)) }.flatten()
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_opt");
-    let found = bytes_key_ref(key).and_then(|map_key| get_keyed(impl_ref, &map_key));
-    found
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, run) }.flatten()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_bkey_opt(map_handle: i64, key: i64) -> i64 {
-    optional_from(map_get_bkey(map_handle, key))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_from(unsafe { map_get_bkey(map_handle, key) })
 }
 
 /// `pith_map_get_bkey_opt` as a register pair; see `optional_pair`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_bkey_opt_pair(map_handle: i64, key: i64) -> ResultPair {
-    optional_pair(map_get_bkey(map_handle, key))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_pair(unsafe { map_get_bkey(map_handle, key) })
 }
 
 /// Get a value by bytes key, exiting with a diagnostic on a miss: the
@@ -1649,18 +1892,18 @@ pub unsafe extern "C" fn pith_map_get_bkey_opt_pair(map_handle: i64, key: i64) -
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_bkey_strict(map_handle: i64, key: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: strict map indexing on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_strict");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        match unsafe { with_bytes_key(key, |map_key| get_keyed_strict(impl_ref, map_key)) } {
+            Some(v) => v,
+            None => strict_miss(String::from("<not a bytes value>")),
+        }
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_bkey_strict");
-    let Some(map_key) = bytes_key_ref(key) else {
-        strict_miss(String::from("<not a bytes value>"));
-    };
-    match get_keyed(impl_ref, &map_key) {
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    match unsafe { with_map_ref_handle(map_handle, run) } {
         Some(v) => v,
-        None => strict_miss(map_key.display()),
+        None => invalid_map_handle_exit(),
     }
 }
 
@@ -1670,14 +1913,15 @@ pub unsafe extern "C" fn pith_map_get_bkey_strict(map_handle: i64, key: i64) -> 
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_contains_bkey(map_handle: i64, key: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return 0;
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_contains_bkey");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        let found = unsafe { with_bytes_key(key, |map_key| impl_ref.contains_key(map_key)) }
+            .unwrap_or(false);
+        i64::from(found)
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_contains_bkey");
-    match bytes_key_ref(key) {
-        Some(map_key) if impl_ref.contains_key(&map_key) => 1,
-        _ => 0,
-    }
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before probing it.
+    unsafe { with_map_ref_handle(map_handle, run) }.unwrap_or(0)
 }
 
 /// Get value by bytes key with a default if not found.
@@ -1686,12 +1930,14 @@ pub unsafe extern "C" fn pith_map_contains_bkey(map_handle: i64, key: i64) -> i6
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_default_bkey(map_handle: i64, key: i64, default: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return default;
+    let run = |impl_ref: &MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_default_bkey");
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        unsafe { with_bytes_key(key, |map_key| get_keyed(impl_ref, map_key)) }.flatten()
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_get_default_bkey");
-    bytes_key_ref(key)
-        .and_then(|map_key| get_keyed(impl_ref, &map_key))
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, run) }
+        .flatten()
         .unwrap_or(default)
 }
 
@@ -1701,13 +1947,33 @@ pub unsafe extern "C" fn pith_map_get_default_bkey(map_handle: i64, key: i64, de
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_remove_bkey(map_handle: i64, key: i64) {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return;
+    let run = |impl_ref: &mut MapImpl| {
+        require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_remove_bkey");
+        let do_remove = |map_key: &KeyRef<'_>| {
+            // SAFETY: Displaced entry is owned by `impl_ref`.
+            unsafe { remove_keyed(impl_ref, map_key) };
+        };
+        // SAFETY: `with_bytes_key` validates `key` and scopes its borrowed slice.
+        unsafe { with_bytes_key(key, do_remove) };
     };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_remove_bkey");
-    if let Some(map_key) = bytes_key_ref(key) {
-        remove_keyed(impl_ref, &map_key);
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, run) };
+}
+
+fn map_keys_bkey_impl(impl_ref: &MapImpl) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
+
+    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_keys_bkey");
+    // SAFETY: Allocates a fresh bytes-tagged list.
+    let list = unsafe { pith_list_new(8, 5) };
+    for key in impl_ref.keys() {
+        if let MapKey::Bytes(bytes) = key {
+            let handle = crate::bytes::pith_bytes_from_vec(bytes);
+            // SAFETY: `list` is freshly allocated and `handle` is an owned bytes handle.
+            unsafe { pith_list_push_value_owned(list, handle) };
+        }
     }
+    list.ptr as i64
 }
 
 /// Return all bytes keys as a bytes-tagged list of fresh bytes objects the
@@ -1717,20 +1983,9 @@ pub unsafe extern "C" fn pith_map_remove_bkey(map_handle: i64, key: i64) {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_keys_bkey(map_handle: i64) -> i64 {
-    use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
-
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        let empty = pith_list_new(8, 0);
-        return empty.ptr as i64;
-    };
-    require_key_flavor(impl_ref.key_type, KeyType::Bytes, "map_keys_bkey");
-    let list = pith_list_new(8, 5);
-    for key in impl_ref.keys() {
-        if let MapKey::Bytes(bytes) = key {
-            pith_list_push_value_owned(list, crate::bytes::pith_bytes_from_vec(bytes));
-        }
-    }
-    list.ptr as i64
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before iterating its keys.
+    unsafe { with_map_ref_handle(map_handle, map_keys_bkey_impl) }
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) }.ptr as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -1743,7 +1998,8 @@ pub unsafe extern "C" fn pith_map_keys_bkey(map_handle: i64) -> i64 {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: i64) {
-    insert_ikey_inner(map_handle, key, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_ikey_inner(map_handle, key, value, false) };
 }
 
 /// Insert a value the caller owns under an integer key. The map takes the
@@ -1754,7 +2010,8 @@ pub unsafe extern "C" fn pith_map_insert_ikey(map_handle: i64, key: i64, value: 
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_insert_ikey_owned(map_handle: i64, key: i64, value: i64) {
-    insert_ikey_inner(map_handle, key, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_ikey_inner(map_handle, key, value, true) };
 }
 
 /// Int-keyed borrowed store of a named heap kind; see
@@ -1769,11 +2026,14 @@ pub unsafe extern "C" fn pith_map_insert_ikey_kind(
     value: i64,
     val_tag: i64,
 ) {
-    let owns = map_adopt_value_tag(map_handle, val_tag);
+    // SAFETY: `map_adopt_value_tag` validates `map_handle`.
+    let owns = unsafe { map_adopt_value_tag(map_handle, val_tag) };
     if !owns {
-        retain_element(element_tag_from_code(val_tag as i32), value);
+        // SAFETY: Caller passes a value matching `val_tag`.
+        unsafe { retain_element(element_tag_from_code(val_tag as i32), value) };
     }
-    insert_ikey_inner(map_handle, key, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_ikey_inner(map_handle, key, value, false) };
 }
 
 /// Int-keyed owned store of a named heap kind; see
@@ -1788,14 +2048,20 @@ pub unsafe extern "C" fn pith_map_insert_ikey_owned_kind(
     value: i64,
     val_tag: i64,
 ) {
-    map_adopt_value_tag(map_handle, val_tag);
-    insert_ikey_inner(map_handle, key, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        map_adopt_value_tag(map_handle, val_tag);
+        insert_ikey_inner(map_handle, key, value, true);
+    }
 }
 
-unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_count: bool) {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return;
-    };
+#[inline(always)]
+unsafe fn insert_ikey_impl(
+    impl_ref: &mut MapImpl,
+    key: i64,
+    value: i64,
+    takes_caller_count: bool,
+) {
     crate::perf_stats!(PERF_MAP_INT_INSERTS += 1);
     if impl_ref.uses_int_values8() {
         crate::perf_count(&crate::PERF_MAP_INT_FAST_INSERTS, 1);
@@ -1803,12 +2069,24 @@ unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
     } else {
         crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_INSERTS, 1);
         if !takes_caller_count {
-            impl_ref.retain_value(value);
+            // SAFETY: Caller passes a handle matching `impl_ref.val_tag`.
+            unsafe { impl_ref.retain_value(value) };
         }
         if let Some(old) = impl_ref.insert(&KeyRef::Int(key), MapVal::Word(value)) {
-            impl_ref.release_value(&old);
+            // SAFETY: `old` was owned by `impl_ref`.
+            unsafe { impl_ref.release_value(&old) };
         }
     }
+}
+
+#[inline(always)]
+unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_count: bool) {
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe {
+        with_map_mut_handle(map_handle, |impl_ref| {
+            insert_ikey_impl(impl_ref, key, value, takes_caller_count)
+        })
+    };
 }
 
 /// Get an i64 value by integer key. Returns 0 if the key is not found.
@@ -1817,18 +2095,10 @@ unsafe fn insert_ikey_inner(map_handle: i64, key: i64, value: i64, takes_caller_
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return 0;
-    };
-    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
-
-    if impl_ref.uses_int_values8() {
-        crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
-        impl_ref.get_int_value(key).unwrap_or(0)
-    } else {
-        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        get_keyed(impl_ref, &KeyRef::Int(key)).unwrap_or(0)
-    }
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, |impl_ref| map_get_ikey_impl(impl_ref, key)) }
+        .flatten()
+        .unwrap_or(0)
 }
 
 /// Get an i64 value by integer key, wrapped in an Optional tuple. Returns
@@ -1837,28 +2107,22 @@ pub unsafe extern "C" fn pith_map_get_ikey(map_handle: i64, key: i64) -> i64 {
 /// # Safety
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 unsafe fn map_get_ikey(map_handle: i64, key: i64) -> Option<i64> {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return None;
-    };
-    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
-    if impl_ref.uses_int_values8() {
-        crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
-        impl_ref.get_int_value(key)
-    } else {
-        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        get_keyed(impl_ref, &KeyRef::Int(key))
-    }
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    unsafe { with_map_ref_handle(map_handle, |impl_ref| map_get_ikey_impl(impl_ref, key)) }
+        .flatten()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_ikey_opt(map_handle: i64, key: i64) -> i64 {
-    optional_from(map_get_ikey(map_handle, key))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_from(unsafe { map_get_ikey(map_handle, key) })
 }
 
 /// `pith_map_get_ikey_opt` as a register pair; see `optional_pair`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_ikey_opt_pair(map_handle: i64, key: i64) -> ResultPair {
-    optional_pair(map_get_ikey(map_handle, key))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_pair(unsafe { map_get_ikey(map_handle, key) })
 }
 
 /// Strict integer-key lookup for `map[k]`. Aborts with a structured
@@ -1868,18 +2132,11 @@ pub unsafe extern "C" fn pith_map_get_ikey_opt_pair(map_handle: i64, key: i64) -
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        eprintln!("pith runtime error: map indexing on invalid map handle");
-        // panic-guard: strict map indexing on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
-    };
-    crate::perf_stats!(PERF_MAP_INT_GETS += 1);
-    let found = if impl_ref.uses_int_values8() {
-        crate::perf_count(&crate::PERF_MAP_INT_FAST_GETS, 1);
-        impl_ref.get_int_value(key)
-    } else {
-        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_GETS, 1);
-        get_keyed(impl_ref, &KeyRef::Int(key))
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading from it.
+    let Some(found) = (unsafe {
+        with_map_ref_handle(map_handle, |impl_ref| map_get_ikey_impl(impl_ref, key))
+    }) else {
+        invalid_map_handle_exit();
     };
     match found {
         Some(v) => v,
@@ -1887,15 +2144,8 @@ pub unsafe extern "C" fn pith_map_get_ikey_strict(map_handle: i64, key: i64) -> 
     }
 }
 
-/// Check if an integer key exists in the map. Returns 1 if present, 0 otherwise.
-///
-/// # Safety
-/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
-#[no_mangle]
-pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return 0;
-    };
+#[inline(always)]
+fn map_contains_ikey_impl(impl_ref: &MapImpl, key: i64) -> i64 {
     crate::perf_stats!(PERF_MAP_INT_CONTAINS += 1);
 
     let contains = if impl_ref.uses_int_values8() {
@@ -1906,10 +2156,32 @@ pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i6
         impl_ref.contains_key(&KeyRef::Int(key))
     };
 
-    if contains {
-        1
+    i64::from(contains)
+}
+
+/// Check if an integer key exists in the map. Returns 1 if present, 0 otherwise.
+///
+/// # Safety
+/// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
+#[no_mangle]
+pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i64 {
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before probing it.
+    unsafe { with_map_ref_handle(map_handle, |impl_ref| map_contains_ikey_impl(impl_ref, key)) }
+        .unwrap_or(0)
+}
+
+#[inline(always)]
+unsafe fn map_remove_ikey_impl(impl_ref: &mut MapImpl, key: i64) {
+    crate::perf_stats!(PERF_MAP_INT_REMOVES += 1);
+    if impl_ref.uses_int_values8() {
+        crate::perf_count(&crate::PERF_MAP_INT_FAST_REMOVES, 1);
+        impl_ref.remove_int_value(key);
     } else {
-        0
+        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_REMOVES, 1);
+        if let Some(old) = impl_ref.remove(&KeyRef::Int(key)) {
+            // SAFETY: `old` was owned by `impl_ref`.
+            unsafe { impl_ref.release_value(&old) };
+        }
     }
 }
 
@@ -1919,18 +2191,44 @@ pub unsafe extern "C" fn pith_map_contains_ikey(map_handle: i64, key: i64) -> i6
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return;
-    };
-    crate::perf_stats!(PERF_MAP_INT_REMOVES += 1);
-    if impl_ref.uses_int_values8() {
-        crate::perf_count(&crate::PERF_MAP_INT_FAST_REMOVES, 1);
-        impl_ref.remove_int_value(key);
-    } else {
-        crate::perf_count(&crate::PERF_MAP_INT_FALLBACK_REMOVES, 1);
-        if let Some(old) = impl_ref.remove(&KeyRef::Int(key)) {
-            impl_ref.release_value(&old);
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before mutating it.
+    unsafe { with_map_mut_handle(map_handle, |impl_ref| map_remove_ikey_impl(impl_ref, key)) };
+}
+
+unsafe fn display_map_impl(impl_ref: &MapImpl, key_kind: i64, val_kind: i64, out: &mut String) {
+    let mut entries: Vec<(String, i64)> = Vec::new();
+    if let Some(fast) = &impl_ref.int_values8 {
+        for (k, v) in fast {
+            entries.push((k.to_string(), *v));
         }
+        entries.sort_by(|a, b| {
+            a.0.parse::<i64>()
+                .unwrap_or(0)
+                .cmp(&b.0.parse::<i64>().unwrap_or(0))
+        });
+    } else {
+        for (k, val) in &impl_ref.data {
+            let key_text = match k {
+                MapKey::Int(n) => n.to_string(),
+                MapKey::String(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                MapKey::Bytes(_) => k.display(),
+            };
+            entries.push((key_text, val.word().unwrap_or(0)));
+        }
+        if key_kind == 0 {
+            entries.sort_by_key(|e| e.0.parse::<i64>().unwrap_or(0));
+        } else {
+            entries.sort();
+        }
+    }
+    for (i, (k, raw)) in entries.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(k);
+        out.push_str(": ");
+        // SAFETY: Caller guarantees `val_kind` matches the map's stored values.
+        unsafe { crate::display_value_for_map(out, *raw, val_kind) };
     }
 }
 
@@ -1940,41 +2238,12 @@ pub unsafe extern "C" fn pith_map_remove_ikey(map_handle: i64, key: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_display_map(handle: i64, key_kind: i64, val_kind: i64) -> i64 {
     let mut out = String::from("{");
-    if let Some(impl_ref) = map_ref_from_handle(handle) {
-        let mut entries: Vec<(String, i64)> = Vec::new();
-        if let Some(fast) = &impl_ref.int_values8 {
-            for (k, v) in fast {
-                entries.push((k.to_string(), *v));
-            }
-            entries.sort_by(|a, b| {
-                a.0.parse::<i64>()
-                    .unwrap_or(0)
-                    .cmp(&b.0.parse::<i64>().unwrap_or(0))
-            });
-        } else {
-            for (k, val) in &impl_ref.data {
-                let key_text = match k {
-                    MapKey::Int(n) => n.to_string(),
-                    MapKey::String(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-                    MapKey::Bytes(_) => k.display(),
-                };
-                entries.push((key_text, val.word().unwrap_or(0)));
-            }
-            if key_kind == 0 {
-                entries.sort_by_key(|e| e.0.parse::<i64>().unwrap_or(0));
-            } else {
-                entries.sort();
-            }
-        }
-        for (i, (k, raw)) in entries.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            out.push_str(k);
-            out.push_str(": ");
-            crate::display_value_for_map(&mut out, *raw, val_kind);
-        }
-    }
+    // SAFETY: `with_map_ref_handle` validates `handle`; `val_kind` matches stored values.
+    unsafe {
+        with_map_ref_handle(handle, |impl_ref| {
+            display_map_impl(impl_ref, key_kind, val_kind, &mut out)
+        })
+    };
     out.push('}');
     crate::pith_copy_bytes_to_cstring(out.as_bytes()) as i64
 }
@@ -1985,9 +2254,30 @@ pub unsafe extern "C" fn pith_display_map(handle: i64, key_kind: i64, val_kind: 
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_len_handle(map_handle: i64) -> i64 {
-    map_ref_from_handle(map_handle)
-        .map(|impl_ref| impl_ref.len() as i64)
-        .unwrap_or(0)
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before reading its length.
+    unsafe { with_map_ref_handle(map_handle, |impl_ref| impl_ref.len() as i64) }.unwrap_or(0)
+}
+
+fn map_keys_cstr_impl(impl_ref: &MapImpl) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value};
+
+    require_key_flavor(impl_ref.key_type, KeyType::String, "map_keys");
+    // string-tagged: the list owns the freshly copied key strings
+    // SAFETY: Allocates a fresh string-tagged list.
+    let list = unsafe { pith_list_new(8, 1) };
+
+    for key in impl_ref.stored_keys() {
+        if let MapKey::String(bytes) = key {
+            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
+            // SAFETY: `list` and `ptr` are freshly allocated handles.
+            unsafe {
+                pith_list_push_value(list, ptr as i64);
+                crate::pith_cstring_release(ptr as *const i8);
+            }
+        }
+    }
+
+    list.ptr as i64
 }
 
 /// Return all keys as a PithList of C-string pointers (each element is an i64
@@ -1998,21 +2288,22 @@ pub unsafe extern "C" fn pith_map_len_handle(map_handle: i64) -> i64 {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before iterating its keys.
+    unsafe { with_map_ref_handle(map_handle, map_keys_cstr_impl) }
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) }.ptr as i64)
+}
+
+fn map_keys_ikey_impl(impl_ref: &MapImpl) -> i64 {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
 
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        let empty = pith_list_new(8, 0);
-        return empty.ptr as i64;
-    };
-    require_key_flavor(impl_ref.key_type, KeyType::String, "map_keys");
-    // string-tagged: the list owns the freshly copied key strings
-    let list = pith_list_new(8, 1);
+    // int-tagged: 8-byte, non-heap values, matching pith_map_values_handle
+    // SAFETY: Allocates a fresh primitive list.
+    let list = unsafe { pith_list_new(8, 0) };
 
-    for key in impl_ref.stored_keys() {
-        if let MapKey::String(bytes) = key {
-            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
-            pith_list_push_value(list, ptr as i64);
-            crate::pith_cstring_release(ptr as *const i8);
+    for key in impl_ref.keys() {
+        if let MapKey::Int(k) = key {
+            // SAFETY: `list` is freshly allocated and primitive-tagged.
+            unsafe { pith_list_push_value(list, k) };
         }
     }
 
@@ -2028,22 +2319,9 @@ pub unsafe extern "C" fn pith_map_keys_cstr(map_handle: i64) -> i64 {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_keys_ikey(map_handle: i64) -> i64 {
-    use crate::collections::list::{pith_list_new, pith_list_push_value};
-
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        let empty = pith_list_new(8, 0);
-        return empty.ptr as i64;
-    };
-    // int-tagged: 8-byte, non-heap values, matching pith_map_values_handle
-    let list = pith_list_new(8, 0);
-
-    for key in impl_ref.keys() {
-        if let MapKey::Int(k) = key {
-            pith_list_push_value(list, k);
-        }
-    }
-
-    list.ptr as i64
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before iterating its keys.
+    unsafe { with_map_ref_handle(map_handle, map_keys_ikey_impl) }
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) }.ptr as i64)
 }
 
 /// Clear all entries from map (handle-based API).
@@ -2052,11 +2330,8 @@ pub unsafe extern "C" fn pith_map_keys_ikey(map_handle: i64) -> i64 {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_clear_handle(map_handle: i64) {
-    let Some(impl_ref) = map_mut_from_handle(map_handle) else {
-        return;
-    };
-    impl_ref.release_all_values();
-    impl_ref.clear();
+    // SAFETY: `with_map_mut_handle` validates `map_handle` before clearing it.
+    unsafe { with_map_mut_handle(map_handle, |impl_ref| map_clear_impl(impl_ref)) };
 }
 
 /// Check if map is empty (handle-based API). Returns 1 if empty, 0 otherwise.
@@ -2065,14 +2340,29 @@ pub unsafe extern "C" fn pith_map_clear_handle(map_handle: i64) {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_is_empty_handle(map_handle: i64) -> i64 {
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        return 1;
-    };
-    if impl_ref.len() == 0 {
-        1
-    } else {
-        0
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before checking its length.
+    let empty = unsafe { with_map_ref_handle(map_handle, |impl_ref| impl_ref.len() == 0) }
+        .unwrap_or(true);
+    i64::from(empty)
+}
+
+fn map_values_impl(impl_ref: &MapImpl) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value};
+
+    // a heap-valued map hands out its stored handles, so the list has to
+    // carry the map's own value tag: push takes a count of its own and the
+    // list's free cascades it back. an untagged list would leave the caller
+    // holding raw pointers the map is free to evict and release out from
+    // under.
+    // SAFETY: Allocates a fresh list tagged with `impl_ref.val_tag`.
+    let list = unsafe { pith_list_new(8, impl_ref.val_tag as i32) };
+
+    for v in impl_ref.value_words() {
+        // SAFETY: `list` is freshly allocated and `v` matches `impl_ref.val_tag`.
+        unsafe { pith_list_push_value(list, v) };
     }
+
+    list.ptr as i64
 }
 
 /// Return all values as a PithList (handle-based API). The PithList pointer
@@ -2082,24 +2372,9 @@ pub unsafe extern "C" fn pith_map_is_empty_handle(map_handle: i64) -> i64 {
 /// * `map_handle` must be a valid `MapImpl` pointer cast to i64.
 #[no_mangle]
 pub unsafe extern "C" fn pith_map_values_handle(map_handle: i64) -> i64 {
-    use crate::collections::list::{pith_list_new, pith_list_push_value};
-
-    let Some(impl_ref) = map_ref_from_handle(map_handle) else {
-        let empty = pith_list_new(8, 0);
-        return empty.ptr as i64;
-    };
-    // a heap-valued map hands out its stored handles, so the list has to
-    // carry the map's own value tag: push takes a count of its own and the
-    // list's free cascades it back. an untagged list would leave the caller
-    // holding raw pointers the map is free to evict and release out from
-    // under.
-    let list = pith_list_new(8, impl_ref.val_tag as i32);
-
-    for v in impl_ref.value_words() {
-        pith_list_push_value(list, v);
-    }
-
-    list.ptr as i64
+    // SAFETY: `with_map_ref_handle` validates `map_handle` before iterating its values.
+    unsafe { with_map_ref_handle(map_handle, map_values_impl) }
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) }.ptr as i64)
 }
 
 #[cfg(test)]
@@ -2128,11 +2403,15 @@ mod tests {
     /// A string-valued int-key map holding one value the caller has already
     /// let go of, so the map's count is the only one left.
     unsafe fn map_owning_one_value(text: &[u8]) -> (i64, *mut i8) {
-        let handle = pith_map_new_int_cstr_val().ptr as i64;
         let s = crate::pith_copy_bytes_to_cstring(text);
-        pith_map_insert_ikey(handle, 1, s as i64);
-        crate::pith_cstring_release(s);
-        assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+        let (handle, rc) = unsafe {
+            let handle = pith_map_new_int_cstr_val().ptr as i64;
+            pith_map_insert_ikey(handle, 1, s as i64);
+            crate::pith_cstring_release(s);
+            let rc = crate::cstring_refcount_for_tests(s);
+            (handle, rc)
+        };
+        assert_eq!(rc, Some(1));
         (handle, s)
     }
 
@@ -2237,14 +2516,17 @@ mod tests {
     /// magic scrubbed, so its length reads back as 0 rather than 1.
     unsafe fn one_element_list() -> i64 {
         use crate::collections::list::{pith_list_new_cstr, pith_list_push_value};
-        let list = pith_list_new_cstr();
         let s = crate::pith_copy_bytes_to_cstring(b"elem");
-        pith_list_push_value(list, s as i64);
-        crate::pith_cstring_release(s);
+        let list = unsafe {
+            let list = pith_list_new_cstr();
+            pith_list_push_value(list, s as i64);
+            crate::pith_cstring_release(s);
+            list
+        };
         list.ptr as i64
     }
 
-    unsafe fn list_is_alive(handle: i64) -> bool {
+    fn list_is_alive(handle: i64) -> bool {
         use crate::collections::list::{pith_list_len, PithList};
         pith_list_len(PithList {
             ptr: handle as *mut (),
@@ -2295,10 +2577,10 @@ mod tests {
             use crate::collections::list::pith_list_release_handle;
 
             let handle = pith_map_new_int().ptr as i64;
-            assert!(map_ref_from_handle(handle).unwrap().uses_int_values8());
+            assert!(with_map_ref_handle(handle, MapImpl::uses_int_values8).unwrap());
             let list = one_element_list();
             pith_map_insert_ikey_kind(handle, 7, list, ListTypeTag::List as i64);
-            assert!(!map_ref_from_handle(handle).unwrap().uses_int_values8());
+            assert!(!with_map_ref_handle(handle, MapImpl::uses_int_values8).unwrap());
             assert_eq!(pith_map_get_ikey(handle, 7), list);
             assert_eq!(pith_map_len_handle(handle), 1);
 
@@ -2501,7 +2783,7 @@ mod tests {
             };
             assert_eq!(crate::collections::list::pith_list_len(list_handle), 3);
             let first = crate::collections::list::pith_list_get_value(list_handle, 0);
-            assert!(crate::bytes::pith_bytes_ref(first).is_some());
+            assert!(crate::bytes::with_bytes(first, |_| ()).is_some());
             assert!(first != from_vec && first != sibling && first != empty);
             crate::collections::list::pith_list_release_handle(list);
 
@@ -2519,8 +2801,11 @@ mod tests {
             assert_eq!(pith_map_len_handle(map), 1);
 
             for h in [from_vec, from_str, sibling, empty, absent] {
-                let b = crate::bytes::pith_bytes_ref(h).expect("the map never took a count");
-                assert_eq!(b.rc.load(std::sync::atomic::Ordering::Relaxed), 1);
+                let rc = crate::bytes::with_bytes_obj(h, |b| {
+                    b.rc.load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .expect("the map never took a count");
+                assert_eq!(rc, 1);
                 crate::bytes::pith_bytes_release(h);
             }
             for v in [v1, v2, v3] {
@@ -2646,7 +2931,7 @@ mod tests {
 
     /// A c-string key one byte longer than the one already stored must not
     /// find it. The borrowed probe carries its own length, and this is the
-    /// shape a length mistake in `cstr_key_ref` would show up as.
+    /// shape a length mistake in `with_cstr_key` would show up as.
     #[test]
     fn a_borrowed_cstr_key_carries_its_length() {
         unsafe {
@@ -3178,6 +3463,59 @@ mod tests {
                 msg.contains("map key not found: 99"),
                 "expected missing int key diagnostic, got: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn with_map_mut_and_ref_handles_self_aliasing_and_distinct_maps() {
+        unsafe {
+            let a = pith_map_new_int();
+            let b = pith_map_new_int();
+            pith_map_insert_ikey(a.ptr as i64, 1, 10);
+            pith_map_insert_ikey(b.ptr as i64, 2, 20);
+
+            // distinct maps merge via `on_distinct`
+            let distinct = with_map_mut_and_ref(
+                a,
+                b,
+                |dst, src| {
+                    if let Some(src_fast) = &src.int_values8 {
+                        for (&k, &v) in src_fast {
+                            dst.insert_int_value(k, v);
+                        }
+                    }
+                    "distinct"
+                },
+                |_| "same",
+            );
+            assert_eq!(distinct, Some("distinct"));
+            assert_eq!(pith_map_len(a), 2);
+            assert_eq!(pith_map_get_ikey(a.ptr as i64, 2), 20);
+
+            // self-aliasing takes `on_same` with a single `&mut MapImpl`
+            let same = with_map_mut_and_ref(
+                a,
+                a,
+                |_, _| "distinct",
+                |map| {
+                    map.insert_int_value(3, 30);
+                    "same"
+                },
+            );
+            assert_eq!(same, Some("same"));
+            assert_eq!(pith_map_get_ikey(a.ptr as i64, 3), 30);
+
+            // invalid handles return None
+            assert!(with_map_mut_and_ref(bogus_map(), a, |_, _| (), |_| ()).is_none());
+            assert!(with_map_mut_and_ref(a, bogus_map(), |_, _| (), |_| ()).is_none());
+
+            // shared ref2 handles both distinct and aliased maps
+            assert_eq!(with_map_ref2(a, b, |x, y| (x.len(), y.len())), Some((3, 1)));
+            assert_eq!(with_map_ref2(a, a, |x, y| x.len() + y.len()), Some(6));
+            assert!(with_map_ref2(a, bogus_map(), |_, _| ()).is_none());
+
+            pith_map_release(a);
+            pith_map_release(b);
         }
     }
 }

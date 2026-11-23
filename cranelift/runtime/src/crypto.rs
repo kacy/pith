@@ -1,4 +1,4 @@
-use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::bytes::{pith_bytes_from_vec, with_bytes, with_bytes2, with_bytes3, with_bytes4};
 use crate::handle_registry::{self, HandleKind};
 use ring::{aead, agreement, rand, signature};
 use std::fs;
@@ -8,22 +8,29 @@ struct PithX25519Key {
     public_key: Vec<u8>,
 }
 
-unsafe fn bytes_slice<'a>(handle: i64) -> Option<&'a [u8]> {
-    Some(pith_bytes_ref(handle)?.data.as_slice())
-}
-
-unsafe fn x25519_key_ref<'a>(handle: i64) -> Option<&'a PithX25519Key> {
+/// Validate `handle` as a `PithX25519Key` and borrow it immutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_x25519_key_ref<R>(handle: i64, f: impl FnOnce(&PithX25519Key) -> R) -> Option<R> {
     if !handle_registry::is_valid(handle as *const (), HandleKind::X25519Key) {
         return None;
     }
-    Some(&*(handle as *const PithX25519Key))
+    // SAFETY: Handle validated in registry; caller keeps handle live for the duration of `f`.
+    let key = unsafe { &*(handle as *const PithX25519Key) };
+    Some(f(key))
 }
 
-unsafe fn x25519_key_mut<'a>(handle: i64) -> Option<&'a mut PithX25519Key> {
+/// Validate `handle` as a `PithX25519Key` and borrow it mutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_x25519_key_mut<R>(
+    handle: i64,
+    f: impl FnOnce(&mut PithX25519Key) -> R,
+) -> Option<R> {
     if !handle_registry::is_valid(handle as *const (), HandleKind::X25519Key) {
         return None;
     }
-    Some(&mut *(handle as *mut PithX25519Key))
+    // SAFETY: Handle validated in registry; caller ensures exclusive access for `f`.
+    let key = unsafe { &mut *(handle as *mut PithX25519Key) };
+    Some(f(key))
 }
 
 /// an AEAD key and nonce from raw bytes, or `None` for a key of the wrong
@@ -41,14 +48,13 @@ fn aead_key_nonce(
     Some((aead::LessSafeKey::new(unbound), nonce))
 }
 
-/// encrypt `plaintext` and append the tag. every argument is a bytes handle;
-/// the result is a bytes handle, or 0 when any input is invalid.
-unsafe fn seal(alg: &'static aead::Algorithm, key: i64, nonce: i64, aad: i64, plaintext: i64) -> i64 {
-    let (Some(key), Some(nonce), Some(aad), Some(plaintext)) =
-        (bytes_slice(key), bytes_slice(nonce), bytes_slice(aad), bytes_slice(plaintext))
-    else {
-        return 0;
-    };
+fn seal_impl(
+    alg: &'static aead::Algorithm,
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> i64 {
     let Some((key, nonce)) = aead_key_nonce(alg, key, nonce) else {
         return 0;
     };
@@ -62,15 +68,13 @@ unsafe fn seal(alg: &'static aead::Algorithm, key: i64, nonce: i64, aad: i64, pl
     pith_bytes_from_vec(out)
 }
 
-/// check the tag and decrypt `ciphertext`. every argument is a bytes handle;
-/// the result is a bytes handle, or 0 when any input is invalid or the tag
-/// does not match.
-unsafe fn open(alg: &'static aead::Algorithm, key: i64, nonce: i64, aad: i64, ciphertext: i64) -> i64 {
-    let (Some(key), Some(nonce), Some(aad), Some(ciphertext)) =
-        (bytes_slice(key), bytes_slice(nonce), bytes_slice(aad), bytes_slice(ciphertext))
-    else {
-        return 0;
-    };
+fn open_impl(
+    alg: &'static aead::Algorithm,
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+) -> i64 {
     let Some((key, nonce)) = aead_key_nonce(alg, key, nonce) else {
         return 0;
     };
@@ -81,33 +85,17 @@ unsafe fn open(alg: &'static aead::Algorithm, key: i64, nonce: i64, aad: i64, ci
     pith_bytes_from_vec(plain.to_vec())
 }
 
-/// 1 when `sig` is a valid signature of `message` under `public_key`, else 0.
-/// every argument is a bytes handle; an invalid one verifies nothing.
-unsafe fn verify(
+fn verify_impl(
     alg: &'static dyn signature::VerificationAlgorithm,
-    public_key: i64,
-    message: i64,
-    sig: i64,
+    public_key: &[u8],
+    message: &[u8],
+    sig: &[u8],
 ) -> i64 {
-    let (Some(public_key), Some(message), Some(sig)) =
-        (bytes_slice(public_key), bytes_slice(message), bytes_slice(sig))
-    else {
-        return 0;
-    };
     let key = signature::UnparsedPublicKey::new(alg, public_key);
-    if key.verify(message, sig).is_ok() {
-        1
-    } else {
-        0
-    }
+    i64::from(key.verify(message, sig).is_ok())
 }
 
-/// sign `message` with an RSA key in pkcs#8 form. both arguments are bytes
-/// handles; the result is a bytes handle, or 0 on an invalid input.
-unsafe fn sign_rsa(encoding: &'static dyn signature::RsaEncoding, pkcs8: i64, message: i64) -> i64 {
-    let (Some(pkcs8), Some(message)) = (bytes_slice(pkcs8), bytes_slice(message)) else {
-        return 0;
-    };
+fn sign_rsa_impl(encoding: &'static dyn signature::RsaEncoding, pkcs8: &[u8], message: &[u8]) -> i64 {
     let Ok(key_pair) = signature::RsaKeyPair::from_pkcs8(pkcs8) else {
         return 0;
     };
@@ -119,15 +107,11 @@ unsafe fn sign_rsa(encoding: &'static dyn signature::RsaEncoding, pkcs8: i64, me
     pith_bytes_from_vec(sig)
 }
 
-/// sign `message` with an ECDSA key in pkcs#8 form. both arguments are bytes
-/// handles; the result is a bytes handle, or 0 on an invalid input. the
-/// per-signature nonce comes from the system rng inside ring and is never
-/// chosen here, which is what keeps ecdsa keys from leaking through a
-/// repeated nonce.
-unsafe fn sign_ecdsa(alg: &'static signature::EcdsaSigningAlgorithm, pkcs8: i64, message: i64) -> i64 {
-    let (Some(pkcs8), Some(message)) = (bytes_slice(pkcs8), bytes_slice(message)) else {
-        return 0;
-    };
+fn sign_ecdsa_impl(
+    alg: &'static signature::EcdsaSigningAlgorithm,
+    pkcs8: &[u8],
+    message: &[u8],
+) -> i64 {
     let rng = rand::SystemRandom::new();
     let Ok(key_pair) = signature::EcdsaKeyPair::from_pkcs8(alg, pkcs8, &rng) else {
         return 0;
@@ -136,6 +120,120 @@ unsafe fn sign_ecdsa(alg: &'static signature::EcdsaSigningAlgorithm, pkcs8: i64,
         return 0;
     };
     pith_bytes_from_vec(sig.as_ref().to_vec())
+}
+
+fn sign_ed25519_impl(pkcs8: &[u8], message: &[u8]) -> i64 {
+    let Ok(key_pair) = signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8) else {
+        return 0;
+    };
+    pith_bytes_from_vec(key_pair.sign(message).as_ref().to_vec())
+}
+
+fn x25519_public_key_impl(key: &PithX25519Key) -> i64 {
+    pith_bytes_from_vec(key.public_key.clone())
+}
+
+fn x25519_shared_secret_impl(key: &mut PithX25519Key, peer: &[u8]) -> i64 {
+    let Some(private_key) = key.key.take() else {
+        return 0;
+    };
+    let peer_key = agreement::UnparsedPublicKey::new(private_key.algorithm(), peer);
+    agreement::agree_ephemeral(private_key, &peer_key, |secret| {
+        pith_bytes_from_vec(secret.to_vec())
+    })
+    .unwrap_or(0)
+}
+
+fn blake2b_impl(data: &[u8], key: &[u8], out_len: i64) -> i64 {
+    if out_len < 1 || out_len > crate::blake2b::MAX_OUT_LEN as i64 {
+        return 0;
+    }
+    match crate::blake2b::hash(out_len as usize, key, data) {
+        Some(digest) => pith_bytes_from_vec(digest),
+        None => 0,
+    }
+}
+
+fn argon2id_impl(
+    password: &[u8],
+    salt: &[u8],
+    passes: i64,
+    memory_kib: i64,
+    lanes: i64,
+    out_len: i64,
+) -> i64 {
+    // the argon2 module re-validates ranges; these checks only make the
+    // i64 -> u32/usize conversions safe
+    if passes < 0 || memory_kib < 0 || lanes < 0 || out_len < 0 {
+        return 0;
+    }
+    if passes > u32::MAX as i64 || memory_kib > u32::MAX as i64 || lanes > u32::MAX as i64 {
+        return 0;
+    }
+    match crate::argon2::argon2id(
+        password,
+        salt,
+        b"",
+        b"",
+        passes as u32,
+        memory_kib as u32,
+        lanes as u32,
+        out_len as usize,
+    ) {
+        Ok(tag) => pith_bytes_from_vec(tag),
+        Err(_) => 0,
+    }
+}
+
+/// encrypt `plaintext` and append the tag. every argument is a bytes handle;
+/// the result is a bytes handle, or 0 when any input is invalid.
+unsafe fn seal(alg: &'static aead::Algorithm, key: i64, nonce: i64, aad: i64, plaintext: i64) -> i64 {
+    // SAFETY: All four handles are validated by `with_bytes4` before borrowing their slices.
+    unsafe { with_bytes4(key, nonce, aad, plaintext, |k, n, a, p| seal_impl(alg, k, n, a, p)) }
+        .unwrap_or(0)
+}
+
+/// check the tag and decrypt `ciphertext`. every argument is a bytes handle;
+/// the result is a bytes handle, or 0 when any input is invalid or the tag
+/// does not match.
+unsafe fn open(alg: &'static aead::Algorithm, key: i64, nonce: i64, aad: i64, ciphertext: i64) -> i64 {
+    // SAFETY: All four handles are validated by `with_bytes4` before borrowing their slices.
+    unsafe {
+        with_bytes4(key, nonce, aad, ciphertext, |k, n, a, c| {
+            open_impl(alg, k, n, a, c)
+        })
+    }
+    .unwrap_or(0)
+}
+
+/// 1 when `sig` is a valid signature of `message` under `public_key`, else 0.
+/// every argument is a bytes handle; an invalid one verifies nothing.
+unsafe fn verify(
+    alg: &'static dyn signature::VerificationAlgorithm,
+    public_key: i64,
+    message: i64,
+    sig: i64,
+) -> i64 {
+    // SAFETY: All three handles are validated by `with_bytes3` before borrowing their slices.
+    unsafe { with_bytes3(public_key, message, sig, |pk, m, s| verify_impl(alg, pk, m, s)) }
+        .unwrap_or(0)
+}
+
+/// sign `message` with an RSA key in pkcs#8 form. both arguments are bytes
+/// handles; the result is a bytes handle, or 0 on an invalid input.
+unsafe fn sign_rsa(encoding: &'static dyn signature::RsaEncoding, pkcs8: i64, message: i64) -> i64 {
+    // SAFETY: Both handles are validated by `with_bytes2` before borrowing their slices.
+    unsafe { with_bytes2(pkcs8, message, |k, m| sign_rsa_impl(encoding, k, m)) }.unwrap_or(0)
+}
+
+/// sign `message` with an ECDSA key in pkcs#8 form. both arguments are bytes
+/// handles; the result is a bytes handle, or 0 on an invalid input. the
+/// per-signature nonce comes from the system rng inside ring and is never
+/// chosen here, which is what keeps ecdsa keys from leaking through a
+/// repeated nonce.
+unsafe fn sign_ecdsa(alg: &'static signature::EcdsaSigningAlgorithm, pkcs8: i64, message: i64) -> i64 {
+    // SAFETY: Both handles are validated by `with_bytes2` before borrowing their slices.
+    unsafe { with_bytes2(pkcs8, message, |k, m| sign_ecdsa_impl(alg, k, m)) }.unwrap_or(0)
 }
 
 fn ecdh_keygen(alg: &'static agreement::Algorithm) -> i64 {
@@ -174,10 +272,8 @@ pub extern "C" fn pith_crypto_p384_keygen() -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_x25519_public_key(handle: i64) -> i64 {
-    let Some(key) = x25519_key_ref(handle) else {
-        return 0;
-    };
-    pith_bytes_from_vec(key.public_key.clone())
+    // SAFETY: `handle` is validated by `with_x25519_key_ref` before borrowing.
+    unsafe { with_x25519_key_ref(handle, x25519_public_key_impl) }.unwrap_or(0)
 }
 
 #[no_mangle]
@@ -185,19 +281,14 @@ pub unsafe extern "C" fn pith_crypto_x25519_shared_secret(
     handle: i64,
     peer_public_key: i64,
 ) -> i64 {
-    let Some(peer) = bytes_slice(peer_public_key) else {
-        return 0;
-    };
-    let Some(key) = x25519_key_mut(handle) else {
-        return 0;
-    };
-    let Some(private_key) = key.key.take() else {
-        return 0;
-    };
-    let peer_key = agreement::UnparsedPublicKey::new(private_key.algorithm(), peer);
-    agreement::agree_ephemeral(private_key, &peer_key, |secret| {
-        pith_bytes_from_vec(secret.to_vec())
-    })
+    // SAFETY: `peer_public_key` (`PithBytes`) and `handle` (`PithX25519Key`) are
+    // distinct handle types validated before borrowing.
+    unsafe {
+        with_bytes(peer_public_key, |peer| {
+            with_x25519_key_mut(handle, |key| x25519_shared_secret_impl(key, peer))
+        })
+    }
+    .flatten()
     .unwrap_or(0)
 }
 
@@ -206,6 +297,7 @@ pub extern "C" fn pith_crypto_x25519_close(handle: i64) {
     if !handle_registry::unregister(handle as *const (), HandleKind::X25519Key) {
         return;
     }
+    // SAFETY: `unregister` succeeded once for a Box allocated by `ecdh_keygen`.
     let _ = unsafe { Box::from_raw(handle as *mut PithX25519Key) };
 }
 
@@ -216,7 +308,8 @@ pub unsafe extern "C" fn pith_crypto_aes_256_gcm_seal(
     aad: i64,
     plaintext: i64,
 ) -> i64 {
-    seal(&aead::AES_256_GCM, key, nonce, aad, plaintext)
+    // SAFETY: Handles validated inside `seal`.
+    unsafe { seal(&aead::AES_256_GCM, key, nonce, aad, plaintext) }
 }
 
 #[no_mangle]
@@ -226,7 +319,8 @@ pub unsafe extern "C" fn pith_crypto_aes_256_gcm_open(
     aad: i64,
     ciphertext: i64,
 ) -> i64 {
-    open(&aead::AES_256_GCM, key, nonce, aad, ciphertext)
+    // SAFETY: Handles validated inside `open`.
+    unsafe { open(&aead::AES_256_GCM, key, nonce, aad, ciphertext) }
 }
 
 #[no_mangle]
@@ -236,7 +330,8 @@ pub unsafe extern "C" fn pith_crypto_aes_128_gcm_seal(
     aad: i64,
     plaintext: i64,
 ) -> i64 {
-    seal(&aead::AES_128_GCM, key, nonce, aad, plaintext)
+    // SAFETY: Handles validated inside `seal`.
+    unsafe { seal(&aead::AES_128_GCM, key, nonce, aad, plaintext) }
 }
 
 #[no_mangle]
@@ -246,7 +341,8 @@ pub unsafe extern "C" fn pith_crypto_aes_128_gcm_open(
     aad: i64,
     ciphertext: i64,
 ) -> i64 {
-    open(&aead::AES_128_GCM, key, nonce, aad, ciphertext)
+    // SAFETY: Handles validated inside `open`.
+    unsafe { open(&aead::AES_128_GCM, key, nonce, aad, ciphertext) }
 }
 
 #[no_mangle]
@@ -256,7 +352,8 @@ pub unsafe extern "C" fn pith_crypto_chacha20_poly1305_seal(
     aad: i64,
     plaintext: i64,
 ) -> i64 {
-    seal(&aead::CHACHA20_POLY1305, key, nonce, aad, plaintext)
+    // SAFETY: Handles validated inside `seal`.
+    unsafe { seal(&aead::CHACHA20_POLY1305, key, nonce, aad, plaintext) }
 }
 
 #[no_mangle]
@@ -266,7 +363,8 @@ pub unsafe extern "C" fn pith_crypto_chacha20_poly1305_open(
     aad: i64,
     ciphertext: i64,
 ) -> i64 {
-    open(&aead::CHACHA20_POLY1305, key, nonce, aad, ciphertext)
+    // SAFETY: Handles validated inside `open`.
+    unsafe { open(&aead::CHACHA20_POLY1305, key, nonce, aad, ciphertext) }
 }
 
 #[no_mangle]
@@ -275,7 +373,8 @@ pub unsafe extern "C" fn pith_crypto_verify_ed25519(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::ED25519, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::ED25519, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -284,7 +383,8 @@ pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p256_sha256_asn1(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::ECDSA_P256_SHA256_ASN1, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::ECDSA_P256_SHA256_ASN1, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -293,7 +393,8 @@ pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p256_sha384_asn1(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::ECDSA_P256_SHA384_ASN1, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::ECDSA_P256_SHA384_ASN1, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -302,7 +403,8 @@ pub unsafe extern "C" fn pith_crypto_verify_ecdsa_p384_sha384_asn1(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::ECDSA_P384_SHA384_ASN1, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::ECDSA_P384_SHA384_ASN1, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -311,7 +413,8 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha256(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::RSA_PKCS1_2048_8192_SHA256, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::RSA_PKCS1_2048_8192_SHA256, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -320,7 +423,8 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha384(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::RSA_PKCS1_2048_8192_SHA384, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::RSA_PKCS1_2048_8192_SHA384, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -329,7 +433,8 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha256(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::RSA_PSS_2048_8192_SHA256, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::RSA_PSS_2048_8192_SHA256, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -338,7 +443,8 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha384(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::RSA_PSS_2048_8192_SHA384, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::RSA_PSS_2048_8192_SHA384, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -347,7 +453,8 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pss_sha512(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::RSA_PSS_2048_8192_SHA512, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::RSA_PSS_2048_8192_SHA512, public_key, message, sig) }
 }
 
 #[no_mangle]
@@ -356,42 +463,50 @@ pub unsafe extern "C" fn pith_crypto_verify_rsa_pkcs1_sha512(
     message: i64,
     sig: i64,
 ) -> i64 {
-    verify(&signature::RSA_PKCS1_2048_8192_SHA512, public_key, message, sig)
+    // SAFETY: Handles validated inside `verify`.
+    unsafe { verify(&signature::RSA_PKCS1_2048_8192_SHA512, public_key, message, sig) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_rsa(&signature::RSA_PSS_SHA256, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_rsa`.
+    unsafe { sign_rsa(&signature::RSA_PSS_SHA256, pkcs8, message) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha384_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_rsa(&signature::RSA_PSS_SHA384, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_rsa`.
+    unsafe { sign_rsa(&signature::RSA_PSS_SHA384, pkcs8, message) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pss_sha512_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_rsa(&signature::RSA_PSS_SHA512, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_rsa`.
+    unsafe { sign_rsa(&signature::RSA_PSS_SHA512, pkcs8, message) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha384_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_rsa(&signature::RSA_PKCS1_SHA384, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_rsa`.
+    unsafe { sign_rsa(&signature::RSA_PKCS1_SHA384, pkcs8, message) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha512_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_rsa(&signature::RSA_PKCS1_SHA512, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_rsa`.
+    unsafe { sign_rsa(&signature::RSA_PKCS1_SHA512, pkcs8, message) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p384_sha384_asn1_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_ecdsa(&signature::ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_ecdsa`.
+    unsafe { sign_ecdsa(&signature::ECDSA_P384_SHA384_ASN1_SIGNING, pkcs8, message) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_rsa(&signature::RSA_PKCS1_SHA256, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_rsa`.
+    unsafe { sign_rsa(&signature::RSA_PKCS1_SHA256, pkcs8, message) }
 }
 
 /// Sign `message` with an ed25519 private key in pkcs#8 form. The
@@ -403,13 +518,8 @@ pub unsafe extern "C" fn pith_crypto_sign_rsa_pkcs1_sha256_pkcs8(pkcs8: i64, mes
 /// signature handle, or 0 on a malformed key.
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_ed25519_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    let (Some(pkcs8), Some(message)) = (bytes_slice(pkcs8), bytes_slice(message)) else {
-        return 0;
-    };
-    let Ok(key_pair) = signature::Ed25519KeyPair::from_pkcs8_maybe_unchecked(pkcs8) else {
-        return 0;
-    };
-    pith_bytes_from_vec(key_pair.sign(message).as_ref().to_vec())
+    // SAFETY: Both handles are validated by `with_bytes2` before borrowing their slices.
+    unsafe { with_bytes2(pkcs8, message, sign_ed25519_impl) }.unwrap_or(0)
 }
 
 /// Sign `message` with a p-256 private key in pkcs#8 form. Uses the FIXED
@@ -417,7 +527,8 @@ pub unsafe extern "C" fn pith_crypto_sign_ed25519_pkcs8(pkcs8: i64, message: i64
 /// carries, rather than asn.1 der. Returns 0 on a malformed key.
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_ecdsa(&signature::ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_ecdsa`.
+    unsafe { sign_ecdsa(&signature::ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8, message) }
 }
 
 /// Sign `message` with an ECDSA P-256 key (SHA-256), producing an ASN.1 DER
@@ -426,7 +537,8 @@ pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_pkcs8(pkcs8: i64, me
 /// key.
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_asn1_pkcs8(pkcs8: i64, message: i64) -> i64 {
-    sign_ecdsa(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, message)
+    // SAFETY: Handles validated inside `sign_ecdsa`.
+    unsafe { sign_ecdsa(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, message) }
 }
 
 /// BLAKE2b digest of `data`, keyed when `key` is non-empty. `out_len` selects
@@ -434,19 +546,8 @@ pub unsafe extern "C" fn pith_crypto_sign_ecdsa_p256_sha256_asn1_pkcs8(pkcs8: i6
 /// input.
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_blake2b(data: i64, key: i64, out_len: i64) -> i64 {
-    let Some(data) = bytes_slice(data) else {
-        return 0;
-    };
-    let Some(key) = bytes_slice(key) else {
-        return 0;
-    };
-    if out_len < 1 || out_len > crate::blake2b::MAX_OUT_LEN as i64 {
-        return 0;
-    }
-    match crate::blake2b::hash(out_len as usize, key, data) {
-        Some(digest) => pith_bytes_from_vec(digest),
-        None => 0,
-    }
+    // SAFETY: Both handles are validated by `with_bytes2` before borrowing their slices.
+    unsafe { with_bytes2(data, key, |d, k| blake2b_impl(d, k, out_len)) }.unwrap_or(0)
 }
 
 /// Argon2id tag for `password` and `salt` with the given time cost (passes),
@@ -461,33 +562,13 @@ pub unsafe extern "C" fn pith_crypto_argon2id(
     lanes: i64,
     out_len: i64,
 ) -> i64 {
-    let Some(password) = bytes_slice(password) else {
-        return 0;
-    };
-    let Some(salt) = bytes_slice(salt) else {
-        return 0;
-    };
-    // the argon2 module re-validates ranges; these checks only make the
-    // i64 -> u32/usize conversions safe
-    if passes < 0 || memory_kib < 0 || lanes < 0 || out_len < 0 {
-        return 0;
+    // SAFETY: Both handles are validated by `with_bytes2` before borrowing their slices.
+    unsafe {
+        with_bytes2(password, salt, |pw, s| {
+            argon2id_impl(pw, s, passes, memory_kib, lanes, out_len)
+        })
     }
-    if passes > u32::MAX as i64 || memory_kib > u32::MAX as i64 || lanes > u32::MAX as i64 {
-        return 0;
-    }
-    match crate::argon2::argon2id(
-        password,
-        salt,
-        b"",
-        b"",
-        passes as u32,
-        memory_kib as u32,
-        lanes as u32,
-        out_len as usize,
-    ) {
-        Ok(tag) => pith_bytes_from_vec(tag),
-        Err(_) => 0,
-    }
+    .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -511,11 +592,11 @@ pub extern "C" fn pith_os_cert_roots_pem() -> *mut i8 {
                 .windows(27)
                 .any(|window| window == b"-----BEGIN CERTIFICATE-----")
             {
-                return unsafe { crate::pith_copy_bytes_to_cstring(&data) };
+                return crate::pith_copy_bytes_to_cstring(&data);
             }
         }
     }
-    unsafe { crate::pith_cstring_empty() }
+    crate::pith_cstring_empty()
 }
 
 #[cfg(test)]

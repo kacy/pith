@@ -89,13 +89,43 @@ fn lock_graveyard() -> std::sync::MutexGuard<'static, Vec<(usize, u8)>> {
 unsafe fn discard_suspect(ptr: usize, kind: u8) {
     match kind {
         CYCLE_KIND_STRUCT => {
-            crate::runtime_core::cycle_clear_struct_buffered(ptr as i64);
-            crate::runtime_core::pith_struct_weak_release(ptr as i64);
+            // SAFETY: Caller guarantees `ptr` came from a buffered struct entry.
+            unsafe {
+                crate::runtime_core::cycle_clear_struct_buffered(ptr as i64);
+                crate::runtime_core::pith_struct_weak_release(ptr as i64);
+            }
         }
-        CYCLE_KIND_CLOSURE => crate::runtime_core::cycle_clear_closure_buffered(ptr as i64),
-        CYCLE_KIND_LIST => crate::collections::list::cycle_clear_list_buffered(ptr as i64),
-        CYCLE_KIND_MAP => crate::collections::map::cycle_clear_map_buffered(ptr as i64),
+        CYCLE_KIND_CLOSURE => {
+            // SAFETY: Caller guarantees `ptr` came from a buffered closure entry.
+            unsafe { crate::runtime_core::cycle_clear_closure_buffered(ptr as i64) }
+        }
+        CYCLE_KIND_LIST => {
+            // SAFETY: Caller guarantees `ptr` came from a buffered list entry.
+            unsafe { crate::collections::list::cycle_clear_list_buffered(ptr as i64) }
+        }
+        CYCLE_KIND_MAP => {
+            // SAFETY: Caller guarantees `ptr` came from a buffered map entry.
+            unsafe { crate::collections::map::cycle_clear_map_buffered(ptr as i64) }
+        }
         _ => {}
+    }
+}
+
+fn admit_suspect(ptr: usize, kind: u8) -> Option<usize> {
+    let mut suspects = lock_suspects();
+    if suspects.len() < CYCLE_SUSPECT_CAP {
+        suspects.push((ptr, kind));
+        CYCLE_SUSPECTS_BUFFERED.fetch_add(1, Ordering::Relaxed);
+        Some(suspects.len())
+    } else {
+        None
+    }
+}
+
+fn wake_collector_if_needed(len: usize) {
+    ensure_collector_thread();
+    if len >= collect_threshold() {
+        GC_CTRL_CV.notify_all();
     }
 }
 
@@ -112,28 +142,16 @@ unsafe fn discard_suspect(ptr: usize, kind: u8) {
 #[cold]
 #[inline(never)]
 pub(crate) unsafe fn cycle_suspect(ptr: usize, kind: u8) {
-    let admitted_len = {
-        let mut suspects = lock_suspects();
-        if suspects.len() < CYCLE_SUSPECT_CAP {
-            suspects.push((ptr, kind));
-            CYCLE_SUSPECTS_BUFFERED.fetch_add(1, Ordering::Relaxed);
-            Some(suspects.len())
-        } else {
-            None
-        }
-    };
     // outside the buffer lock: the collector wake path takes its own lock,
     // and holding both here would order them against the collector's
     // wait-for-work, which reads the buffer length under the control lock.
-    let Some(len) = admitted_len else {
+    let Some(len) = admit_suspect(ptr, kind) else {
         CYCLE_SUSPECTS_OVERFLOWED.fetch_add(1, Ordering::Relaxed);
-        discard_suspect(ptr, kind);
+        // SAFETY: Caller guarantees `ptr` was just marked buffered and stays alive.
+        unsafe { discard_suspect(ptr, kind) };
         return;
     };
-    ensure_collector_thread();
-    if len >= collect_threshold() {
-        GC_CTRL_CV.notify_all();
-    }
+    wake_collector_if_needed(len);
 }
 
 /// Park a dead closure/list/map shell for the collector to free. Called from
@@ -225,7 +243,8 @@ pub extern "C" fn pith_cc_visit(child: i64, kind: i64) {
     }
     let hook = VISIT_HOOK.load(Ordering::Acquire);
     if hook != 0 {
-        // the release/acquire pair orders the hook store before its first use.
+        // SAFETY: the release/acquire pair orders the hook store before its first use,
+        // and `install_visit_hook` only publishes `extern "C" fn(i64, i64)` addresses.
         // panic-guard: the only writer is install_visit_hook, whose contract pins the fn shape, so the address is always a valid visitor.
         let visit: extern "C" fn(i64, i64) = unsafe { std::mem::transmute(hook) };
         visit(child, kind);
@@ -239,10 +258,25 @@ pub extern "C" fn pith_cc_visit(child: i64, kind: i64) {
     }
 }
 
+/// Invoke a compiler-emitted tracer twin registered beside a struct's destructor.
+///
+/// # Safety
+/// `tracer` must be a registered `extern "C" fn(i64)` tracer matching `ptr`'s struct
+/// layout, and `ptr` must be a live struct pointer.
+#[inline(always)]
+unsafe fn invoke_tracer(tracer: usize, ptr: i64) {
+    // SAFETY: `tracer` was registered by `pith_cc_register_tracer` as a tracer twin.
+    // panic-guard: calling a compiler-emitted tracer twin registered beside its destructor.
+    let trace: unsafe extern "C" fn(i64) = unsafe { std::mem::transmute(tracer) };
+    // SAFETY: Caller guarantees `ptr` is a live struct matching `tracer`.
+    unsafe { trace(ptr) };
+}
+
 /// The children a struct's tracer reports, weak fields included (kind 8), for
 /// the shared-marking walk. A struct without a tracer reports none.
 pub(crate) unsafe fn struct_children(ptr: i64, f: &mut dyn FnMut(i64, u8)) {
-    let dtor = crate::runtime_core::cycle_struct_dtor_slot(ptr);
+    // SAFETY: Caller guarantees `ptr` is a live struct pointer.
+    let dtor = unsafe { crate::runtime_core::cycle_struct_dtor_slot(ptr) };
     if dtor == 0 {
         return;
     }
@@ -250,9 +284,8 @@ pub(crate) unsafe fn struct_children(ptr: i64, f: &mut dyn FnMut(i64, u8)) {
         return;
     };
     traced_children_take();
-    // panic-guard: calling a compiler-emitted tracer twin registered beside its destructor.
-    let trace: extern "C" fn(i64) = std::mem::transmute(tracer);
-    trace(ptr);
+    // SAFETY: `tracer` is registered for `ptr`'s destructor and `ptr` is live.
+    unsafe { invoke_tracer(tracer, ptr) };
     for (child, kind) in traced_children_take() {
         f(child, kind as u8);
     }
@@ -815,20 +848,39 @@ extern "C" fn collector_visit(child: i64, kind: i64) {
 unsafe fn real_strong_count(ptr: usize, kind: u8) -> Option<i64> {
     match kind {
         CHILD_KIND_STRUCT => {
-            crate::runtime_core::cycle_struct_strong_count(ptr as i64).map(i64::from)
+            // SAFETY: Caller holds STW and `ptr` came from a root or traced struct edge.
+            unsafe { crate::runtime_core::cycle_struct_strong_count(ptr as i64) }.map(i64::from)
         }
-        CHILD_KIND_CLOSURE => crate::runtime_core::cycle_closure_strong_count(ptr as i64),
+        CHILD_KIND_CLOSURE => {
+            // SAFETY: Caller holds STW and `ptr` came from a root or traced closure edge.
+            unsafe { crate::runtime_core::cycle_closure_strong_count(ptr as i64) }
+        }
         CHILD_KIND_LIST => {
-            crate::collections::list::cycle_list_strong_count(ptr as i64).map(i64::from)
+            // SAFETY: Caller holds STW and `ptr` came from a root or traced list edge.
+            unsafe { crate::collections::list::cycle_list_strong_count(ptr as i64) }.map(i64::from)
         }
         CHILD_KIND_MAP => {
-            crate::collections::map::cycle_map_strong_count(ptr as i64).map(i64::from)
+            // SAFETY: Caller holds STW and `ptr` came from a root or traced map edge.
+            unsafe { crate::collections::map::cycle_map_strong_count(ptr as i64) }.map(i64::from)
         }
         CHILD_KIND_SET => {
-            crate::collections::set::cycle_set_strong_count(ptr as i64).map(i64::from)
+            // SAFETY: Caller holds STW and `ptr` came from a traced set edge.
+            unsafe { crate::collections::set::cycle_set_strong_count(ptr as i64) }.map(i64::from)
         }
         _ => None,
     }
+}
+
+#[inline(always)]
+fn is_cycle_child_kind(kind: u8) -> bool {
+    matches!(
+        kind,
+        CHILD_KIND_LIST
+            | CHILD_KIND_MAP
+            | CHILD_KIND_SET
+            | CHILD_KIND_STRUCT
+            | CHILD_KIND_CLOSURE
+    )
 }
 
 /// Every rc edge out of the object, as (child pointer, child kind). One
@@ -844,50 +896,35 @@ unsafe fn real_strong_count(ptr: usize, kind: u8) -> Option<i64> {
 unsafe fn children_of(ptr: usize, kind: u8) -> Vec<(usize, u8)> {
     let mut children: Vec<(usize, u8)> = Vec::new();
     let mut push = |child: i64, child_kind: u8| {
-        if child != 0
-            && matches!(
-                child_kind,
-                CHILD_KIND_LIST
-                    | CHILD_KIND_MAP
-                    | CHILD_KIND_SET
-                    | CHILD_KIND_STRUCT
-                    | CHILD_KIND_CLOSURE
-            )
-        {
+        if child != 0 && is_cycle_child_kind(child_kind) {
             children.push((child as usize, child_kind));
         }
     };
     match kind {
         CHILD_KIND_STRUCT => {
-            let dtor = crate::runtime_core::cycle_struct_dtor_slot(ptr as i64);
-            if dtor == 0 {
-                return children;
-            }
-            let Some(tracer) = tracer_for_dtor(dtor as usize) else {
-                return children;
-            };
-            // panic-guard: calling a compiler-emitted tracer twin registered beside its destructor.
-            let trace: extern "C" fn(i64) = std::mem::transmute(tracer);
-            trace(ptr as i64);
-            let reported = TRACED_CHILDREN.with(|buffer| std::mem::take(&mut *buffer.borrow_mut()));
-            for (child, child_kind) in reported {
-                push(child, child_kind as u8);
+            // SAFETY: Caller holds STW and `ptr` validated as a live struct.
+            let dtor = unsafe { crate::runtime_core::cycle_struct_dtor_slot(ptr as i64) };
+            if dtor != 0 {
+                if let Some(tracer) = tracer_for_dtor(dtor as usize) {
+                    // SAFETY: `tracer` is registered for `ptr`'s destructor and `ptr` is live.
+                    unsafe { invoke_tracer(tracer, ptr as i64) };
+                    for (child, child_kind) in traced_children_take() {
+                        push(child, child_kind as u8);
+                    }
+                }
             }
         }
         CHILD_KIND_CLOSURE => {
-            crate::runtime_core::cycle_closure_children(ptr as i64, &mut |child, tag| {
-                push(child, tag);
-            });
+            // SAFETY: Caller holds STW and `ptr` validated as a live closure.
+            unsafe { crate::runtime_core::cycle_closure_children(ptr as i64, &mut push) };
         }
         CHILD_KIND_LIST => {
-            crate::collections::list::cycle_list_children(ptr as i64, &mut |child, code| {
-                push(child, code);
-            });
+            // SAFETY: Caller holds STW and `ptr` validated as a live list.
+            unsafe { crate::collections::list::cycle_list_children(ptr as i64, &mut push) };
         }
         CHILD_KIND_MAP => {
-            crate::collections::map::cycle_map_children(ptr as i64, &mut |child, code| {
-                push(child, code);
-            });
+            // SAFETY: Caller holds STW and `ptr` validated as a live map.
+            unsafe { crate::collections::map::cycle_map_children(ptr as i64, &mut push) };
         }
         _ => {}
     }
@@ -923,10 +960,12 @@ unsafe fn seed_node(nodes: &mut HashMap<usize, Node>, ptr: usize, kind: u8) -> b
     if nodes.contains_key(&ptr) {
         return true;
     }
-    let Some(count) = real_strong_count(ptr, kind) else {
+    // SAFETY: Caller holds STW and `ptr` came from a validated root or traced edge.
+    let Some(count) = (unsafe { real_strong_count(ptr, kind) }) else {
         return false;
     };
-    let children = children_of(ptr, kind);
+    // SAFETY: `ptr` just validated via `real_strong_count` under STW.
+    let children = unsafe { children_of(ptr, kind) };
     nodes.insert(
         ptr,
         Node {
@@ -943,7 +982,11 @@ unsafe fn seed_node(nodes: &mut HashMap<usize, Node>, ptr: usize, kind: u8) -> b
 /// from the trial count of every edge target. after every root is walked,
 /// each node's trial count is its real count minus the edges internal to
 /// the candidate graph.
-unsafe fn mark_gray(nodes: &mut HashMap<usize, Node>, root: usize) {
+fn mark_gray(
+    nodes: &mut HashMap<usize, Node>,
+    root: usize,
+    seed: &mut impl FnMut(&mut HashMap<usize, Node>, usize, u8) -> bool,
+) {
     let mut stack = vec![root];
     while let Some(ptr) = stack.pop() {
         let children = match nodes.get_mut(&ptr) {
@@ -954,7 +997,7 @@ unsafe fn mark_gray(nodes: &mut HashMap<usize, Node>, root: usize) {
             _ => continue,
         };
         for (child, child_kind) in children {
-            if !seed_node(nodes, child, child_kind) {
+            if !seed(nodes, child, child_kind) {
                 continue;
             }
             // seeded just above, so the lookup can only hit.
@@ -973,7 +1016,7 @@ unsafe fn mark_gray(nodes: &mut HashMap<usize, Node>, root: usize) {
 /// candidate graph: re-blacken it and everything it reaches, restoring the
 /// counts MarkGray subtracted. a gray node at zero or below goes white and
 /// its children are scanned in turn.
-unsafe fn scan(nodes: &mut HashMap<usize, Node>, root: usize) {
+fn scan(nodes: &mut HashMap<usize, Node>, root: usize) {
     let mut stack = vec![root];
     while let Some(ptr) = stack.pop() {
         let Some(node) = nodes.get_mut(&ptr) else {
@@ -996,7 +1039,7 @@ unsafe fn scan(nodes: &mut HashMap<usize, Node>, root: usize) {
 
 /// ScanBlack: blacken everything reachable from a node with external owners,
 /// re-incrementing each edge target's trial count exactly once per edge.
-unsafe fn scan_black(nodes: &mut HashMap<usize, Node>, root: usize) {
+fn scan_black(nodes: &mut HashMap<usize, Node>, root: usize) {
     let mut stack = vec![root];
     while let Some(ptr) = stack.pop() {
         let children = match nodes.get_mut(&ptr) {
@@ -1024,7 +1067,7 @@ unsafe fn scan_black(nodes: &mut HashMap<usize, Node>, root: usize) {
 /// leaks instead. a drop that runs from an ordinary release during teardown
 /// cannot reach a white strongly either, since a white has no owner outside
 /// the whites, and its weak reads refuse a white (see `guard_white`).
-unsafe fn keep_user_drops(nodes: &mut HashMap<usize, Node>) {
+fn keep_user_drops(nodes: &mut HashMap<usize, Node>, mut dtor_slot: impl FnMut(usize) -> u64) {
     let user_drops = crate::sync::lock(&USER_DROPS);
     if user_drops.is_empty() {
         return;
@@ -1034,8 +1077,7 @@ unsafe fn keep_user_drops(nodes: &mut HashMap<usize, Node>) {
         .filter(|(&ptr, node)| {
             node.color == Color::White
                 && node.kind == CHILD_KIND_STRUCT
-                && user_drops
-                    .contains(&(crate::runtime_core::cycle_struct_dtor_slot(ptr as i64) as usize))
+                && user_drops.contains(&(dtor_slot(ptr) as usize))
         })
         .map(|(&ptr, _)| ptr)
         .collect();
@@ -1043,6 +1085,30 @@ unsafe fn keep_user_drops(nodes: &mut HashMap<usize, Node>) {
     for ptr in pinned {
         scan_black(nodes, ptr);
     }
+}
+
+/// Run the Bacon-Rajan trial-deletion phases (MarkGray, Scan, user-drop pin)
+/// over `roots` and return the garbage `(ptr, kind)` white set.
+fn run_trial_deletion(
+    roots: &[(usize, u8)],
+    mut seed: impl FnMut(&mut HashMap<usize, Node>, usize, u8) -> bool,
+    dtor_slot: impl FnMut(usize) -> u64,
+) -> Vec<(usize, u8)> {
+    let mut nodes: HashMap<usize, Node> = HashMap::new();
+    for &(ptr, kind) in roots {
+        if seed(&mut nodes, ptr, kind) {
+            mark_gray(&mut nodes, ptr, &mut seed);
+        }
+    }
+    for &(ptr, _) in roots {
+        scan(&mut nodes, ptr);
+    }
+    keep_user_drops(&mut nodes, dtor_slot);
+    nodes
+        .iter()
+        .filter(|(_, node)| node.color == Color::White)
+        .map(|(&ptr, node)| (ptr, node.kind))
+        .collect()
 }
 
 // a teardown guard far above any real count: added to every white's real
@@ -1056,21 +1122,36 @@ unsafe fn guard_white(ptr: usize, kind: u8) {
         // a struct takes the destructor guard instead, which a weak upgrade
         // refuses: a drop running during teardown must not revive a white
         // through a weak reference, since its shell is freed below.
-        CHILD_KIND_STRUCT => crate::runtime_core::cycle_struct_guard_strong(
-            ptr as i64,
-            crate::runtime_core::STRUCT_DTOR_GUARD,
-        ),
+        CHILD_KIND_STRUCT => {
+            // SAFETY: `ptr` is a validated white struct under STW.
+            unsafe {
+                crate::runtime_core::cycle_struct_guard_strong(
+                    ptr as i64,
+                    crate::runtime_core::STRUCT_DTOR_GUARD,
+                );
+            }
+        }
         CHILD_KIND_CLOSURE => {
-            crate::runtime_core::cycle_closure_guard_strong(ptr as i64, WHITE_GUARD)
+            // SAFETY: `ptr` is a validated white closure under STW.
+            unsafe { crate::runtime_core::cycle_closure_guard_strong(ptr as i64, WHITE_GUARD) };
         }
         CHILD_KIND_LIST => {
-            crate::collections::list::cycle_list_guard_strong(ptr as i64, WHITE_GUARD as u32)
+            // SAFETY: `ptr` is a validated white list under STW.
+            unsafe {
+                crate::collections::list::cycle_list_guard_strong(ptr as i64, WHITE_GUARD as u32);
+            }
         }
         CHILD_KIND_MAP => {
-            crate::collections::map::cycle_map_guard_strong(ptr as i64, WHITE_GUARD as u32)
+            // SAFETY: `ptr` is a validated white map under STW.
+            unsafe {
+                crate::collections::map::cycle_map_guard_strong(ptr as i64, WHITE_GUARD as u32);
+            }
         }
         CHILD_KIND_SET => {
-            crate::collections::set::cycle_set_guard_strong(ptr as i64, WHITE_GUARD as u32)
+            // SAFETY: `ptr` is a validated white set under STW.
+            unsafe {
+                crate::collections::set::cycle_set_guard_strong(ptr as i64, WHITE_GUARD as u32);
+            }
         }
         _ => {}
     }
@@ -1082,11 +1163,26 @@ unsafe fn guard_white(ptr: usize, kind: u8) {
 /// fresh suspects. both are fine, because no buffer lock is held here.
 unsafe fn destroy_white(ptr: usize, kind: u8) {
     match kind {
-        CHILD_KIND_STRUCT => crate::runtime_core::cycle_struct_run_dtor(ptr as i64),
-        CHILD_KIND_CLOSURE => crate::runtime_core::cycle_closure_release_env(ptr as i64),
-        CHILD_KIND_LIST => crate::collections::list::cycle_list_release_elements(ptr as i64),
-        CHILD_KIND_MAP => crate::collections::map::cycle_map_release_values(ptr as i64),
-        CHILD_KIND_SET => crate::collections::set::cycle_set_release_elements(ptr as i64),
+        CHILD_KIND_STRUCT => {
+            // SAFETY: All whites are guarded under STW; safe to run struct destructor.
+            unsafe { crate::runtime_core::cycle_struct_run_dtor(ptr as i64) }
+        }
+        CHILD_KIND_CLOSURE => {
+            // SAFETY: All whites are guarded under STW; safe to release closure env.
+            unsafe { crate::runtime_core::cycle_closure_release_env(ptr as i64) }
+        }
+        CHILD_KIND_LIST => {
+            // SAFETY: All whites are guarded under STW; safe to release list elements.
+            unsafe { crate::collections::list::cycle_list_release_elements(ptr as i64) }
+        }
+        CHILD_KIND_MAP => {
+            // SAFETY: All whites are guarded under STW; safe to release map values.
+            unsafe { crate::collections::map::cycle_map_release_values(ptr as i64) }
+        }
+        CHILD_KIND_SET => {
+            // SAFETY: All whites are guarded under STW; safe to release set elements.
+            unsafe { crate::collections::set::cycle_set_release_elements(ptr as i64) }
+        }
         _ => {}
     }
 }
@@ -1095,11 +1191,107 @@ unsafe fn destroy_white(ptr: usize, kind: u8) {
 /// destruction body it already ran.
 unsafe fn free_white_shell(ptr: usize, kind: u8) {
     match kind {
-        CHILD_KIND_STRUCT => crate::runtime_core::cycle_struct_free_dead(ptr as i64),
-        CHILD_KIND_CLOSURE => crate::runtime_core::cycle_closure_free_dead(ptr as i64),
-        CHILD_KIND_LIST => crate::collections::list::cycle_list_free_dead(ptr as i64),
-        CHILD_KIND_MAP => crate::collections::map::cycle_map_free_dead(ptr as i64),
-        CHILD_KIND_SET => crate::collections::set::cycle_set_free_dead(ptr as i64),
+        CHILD_KIND_STRUCT => {
+            // SAFETY: All white destruction bodies completed under STW; safe to free dead struct.
+            unsafe { crate::runtime_core::cycle_struct_free_dead(ptr as i64) }
+        }
+        CHILD_KIND_CLOSURE => {
+            // SAFETY: All white destruction bodies completed under STW; safe to free dead closure.
+            unsafe { crate::runtime_core::cycle_closure_free_dead(ptr as i64) }
+        }
+        CHILD_KIND_LIST => {
+            // SAFETY: All white destruction bodies completed under STW; safe to free dead list.
+            unsafe { crate::collections::list::cycle_list_free_dead(ptr as i64) }
+        }
+        CHILD_KIND_MAP => {
+            // SAFETY: All white destruction bodies completed under STW; safe to free dead map.
+            unsafe { crate::collections::map::cycle_map_free_dead(ptr as i64) }
+        }
+        CHILD_KIND_SET => {
+            // SAFETY: All white destruction bodies completed under STW; safe to free dead set.
+            unsafe { crate::collections::set::cycle_set_free_dead(ptr as i64) }
+        }
+        _ => {}
+    }
+}
+
+/// Validate one drained suspect under STW, clearing its buffered bit.
+/// Returns `Some((child_kind, is_live_struct))` if the suspect is live and
+/// should enter the candidate root set; dead structs have their buffer weak
+/// count released immediately.
+unsafe fn validate_suspect(ptr: usize, kind: u8) -> Option<(u8, bool)> {
+    match kind {
+        CYCLE_KIND_STRUCT => {
+            // SAFETY: Caller holds STW and `ptr` is a buffered struct with a held weak count.
+            match unsafe { crate::runtime_core::cycle_struct_alive(ptr as i64) } {
+                Some(true) => {
+                    // SAFETY: Struct header is live and buffered.
+                    unsafe { crate::runtime_core::cycle_clear_struct_buffered(ptr as i64) };
+                    Some((CHILD_KIND_STRUCT, true))
+                }
+                Some(false) => {
+                    // the value died while buffered: nothing to collect, the
+                    // buffer's weak count is all that held the header.
+                    // SAFETY: Struct header is alive via the buffer's weak count.
+                    unsafe {
+                        crate::runtime_core::cycle_clear_struct_buffered(ptr as i64);
+                        crate::runtime_core::pith_struct_weak_release(ptr as i64);
+                    }
+                    None
+                }
+                None => None,
+            }
+        }
+        CYCLE_KIND_CLOSURE => {
+            // SAFETY: Caller holds STW and `ptr` came from a buffered closure entry.
+            if unsafe { crate::runtime_core::cycle_closure_strong_count(ptr as i64) }.is_some() {
+                // SAFETY: Closure validated live above.
+                unsafe { crate::runtime_core::cycle_clear_closure_buffered(ptr as i64) };
+                Some((CHILD_KIND_CLOSURE, false))
+            } else {
+                // scrubbed magic: the object died into the graveyard, whose
+                // snapshot below frees the shell.
+                None
+            }
+        }
+        CYCLE_KIND_LIST => {
+            // SAFETY: Caller holds STW and `ptr` came from a buffered list entry.
+            if unsafe { crate::collections::list::cycle_list_strong_count(ptr as i64) }.is_some() {
+                // SAFETY: List validated live above.
+                unsafe { crate::collections::list::cycle_clear_list_buffered(ptr as i64) };
+                Some((CHILD_KIND_LIST, false))
+            } else {
+                None
+            }
+        }
+        CYCLE_KIND_MAP => {
+            // SAFETY: Caller holds STW and `ptr` came from a buffered map entry.
+            if unsafe { crate::collections::map::cycle_map_strong_count(ptr as i64) }.is_some() {
+                // SAFETY: Map validated live above.
+                unsafe { crate::collections::map::cycle_clear_map_buffered(ptr as i64) };
+                Some((CHILD_KIND_MAP, false))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+unsafe fn drop_parked_shell(ptr: usize, kind: u8) {
+    match kind {
+        CYCLE_KIND_CLOSURE => {
+            // SAFETY: `ptr` is a fully destructed closure shell parked in the graveyard.
+            unsafe { crate::runtime_core::cycle_drop_closure_shell(ptr) }
+        }
+        CYCLE_KIND_LIST => {
+            // SAFETY: `ptr` is a fully destructed list shell parked in the graveyard.
+            unsafe { crate::collections::list::cycle_drop_list_shell(ptr) }
+        }
+        CYCLE_KIND_MAP => {
+            // SAFETY: `ptr` is a fully destructed map shell parked in the graveyard.
+            unsafe { crate::collections::map::cycle_drop_map_shell(ptr) }
+        }
         _ => {}
     }
 }
@@ -1150,62 +1342,28 @@ pub(crate) unsafe fn collect() {
     // and the held count is what guarantees the header outlives every phase.
     let mut root_struct_weaks: Vec<i64> = Vec::new();
     for (ptr, kind) in drained {
-        match kind {
-            CYCLE_KIND_STRUCT => match crate::runtime_core::cycle_struct_alive(ptr as i64) {
-                Some(true) => {
-                    crate::runtime_core::cycle_clear_struct_buffered(ptr as i64);
-                    root_struct_weaks.push(ptr as i64);
-                    roots.push((ptr, CHILD_KIND_STRUCT));
-                }
-                Some(false) => {
-                    // the value died while buffered: nothing to collect, the
-                    // buffer's weak count is all that held the header.
-                    crate::runtime_core::cycle_clear_struct_buffered(ptr as i64);
-                    crate::runtime_core::pith_struct_weak_release(ptr as i64);
-                }
-                None => {}
-            },
-            CYCLE_KIND_CLOSURE => {
-                if crate::runtime_core::cycle_closure_strong_count(ptr as i64).is_some() {
-                    crate::runtime_core::cycle_clear_closure_buffered(ptr as i64);
-                    roots.push((ptr, CHILD_KIND_CLOSURE));
-                }
-                // scrubbed magic: the object died into the graveyard, whose
-                // snapshot below frees the shell.
+        // SAFETY: World is stopped and `drained` holds buffer-invariant entries.
+        if let Some((child_kind, is_struct)) = unsafe { validate_suspect(ptr, kind) } {
+            if is_struct {
+                root_struct_weaks.push(ptr as i64);
             }
-            CYCLE_KIND_LIST => {
-                if crate::collections::list::cycle_list_strong_count(ptr as i64).is_some() {
-                    crate::collections::list::cycle_clear_list_buffered(ptr as i64);
-                    roots.push((ptr, CHILD_KIND_LIST));
-                }
-            }
-            CYCLE_KIND_MAP => {
-                if crate::collections::map::cycle_map_strong_count(ptr as i64).is_some() {
-                    crate::collections::map::cycle_clear_map_buffered(ptr as i64);
-                    roots.push((ptr, CHILD_KIND_MAP));
-                }
-            }
-            _ => {}
+            roots.push((ptr, child_kind));
         }
     }
     CYCLE_ROOTS_EXAMINED.fetch_add(roots.len() as u64, Ordering::Relaxed);
 
     // 2-3. trial deletion over the graph the roots reach.
-    let mut nodes: HashMap<usize, Node> = HashMap::new();
-    for &(ptr, kind) in &roots {
-        if seed_node(&mut nodes, ptr, kind) {
-            mark_gray(&mut nodes, ptr);
-        }
-    }
-    for &(ptr, _) in &roots {
-        scan(&mut nodes, ptr);
-    }
-    keep_user_drops(&mut nodes);
-    let whites: Vec<(usize, u8)> = nodes
-        .iter()
-        .filter(|(_, node)| node.color == Color::White)
-        .map(|(&ptr, node)| (ptr, node.kind))
-        .collect();
+    let whites = run_trial_deletion(
+        &roots,
+        |nodes, ptr, kind| {
+            // SAFETY: World is stopped; `ptr` came from a validated root or traced edge.
+            unsafe { seed_node(nodes, ptr, kind) }
+        },
+        |ptr| {
+            // SAFETY: World is stopped and `ptr` is a validated white struct node.
+            unsafe { crate::runtime_core::cycle_struct_dtor_slot(ptr as i64) }
+        },
+    );
 
     // 4. free the whites: guard every real count first so teardown can never
     // recursively free a member, then run every destruction body, then free
@@ -1213,13 +1371,16 @@ pub(crate) unsafe fn collect() {
     // touch any other white, so no white's shell may go before the last
     // body has run.
     for &(ptr, kind) in &whites {
-        guard_white(ptr, kind);
+        // SAFETY: `ptr` is a validated white garbage object under STW.
+        unsafe { guard_white(ptr, kind) };
     }
     for &(ptr, kind) in &whites {
-        destroy_white(ptr, kind);
+        // SAFETY: All whites are guarded; teardown releases edges safely under STW.
+        unsafe { destroy_white(ptr, kind) };
     }
     for &(ptr, kind) in &whites {
-        free_white_shell(ptr, kind);
+        // SAFETY: All white destruction bodies completed; safe to free shells.
+        unsafe { free_white_shell(ptr, kind) };
     }
     CYCLE_WHITES_FREED.fetch_add(whites.len() as u64, Ordering::Relaxed);
 
@@ -1227,12 +1388,8 @@ pub(crate) unsafe fn collect() {
     // whose buffer entries were discarded in the drain above.
     CYCLE_GRAVEYARD_FREED.fetch_add(parked.len() as u64, Ordering::Relaxed);
     for (ptr, kind) in parked {
-        match kind {
-            CYCLE_KIND_CLOSURE => crate::runtime_core::cycle_drop_closure_shell(ptr),
-            CYCLE_KIND_LIST => crate::collections::list::cycle_drop_list_shell(ptr),
-            CYCLE_KIND_MAP => crate::collections::map::cycle_drop_map_shell(ptr),
-            _ => {}
-        }
+        // SAFETY: `parked` was snapshotted before teardown; its entries were drained above.
+        unsafe { drop_parked_shell(ptr, kind) };
     }
 
     // 6. drop the buffer's weak count on every drained live struct root. a
@@ -1240,7 +1397,8 @@ pub(crate) unsafe fn collect() {
     // white had its shell freed above, and this lets outstanding weak
     // references (or nothing) decide when the header goes.
     for ptr in root_struct_weaks {
-        crate::runtime_core::pith_struct_weak_release(ptr);
+        // SAFETY: Each entry owns one weak count held by the drained suspect buffer.
+        unsafe { crate::runtime_core::pith_struct_weak_release(ptr) };
     }
 
     CYCLE_COLLECTIONS.fetch_add(1, Ordering::Relaxed);
@@ -1304,6 +1462,7 @@ fn collector_main() {
     let mut backoff = COLLECT_BACKOFF_START;
     loop {
         let force_goal = wait_for_work();
+        // SAFETY: `with_world_stopped` holds every registered mutator stopped while `collect` runs.
         let stopped = with_world_stopped(|| unsafe { collect() }).is_some();
         finish_forced(force_goal, stopped);
         if stopped {
@@ -1447,6 +1606,7 @@ pub(crate) fn graveyard_count_for_tests(ptr: usize) -> usize {
 pub(crate) fn reset_for_tests() {
     let entries = std::mem::take(&mut *lock_suspects());
     for (ptr, kind) in entries {
+        // SAFETY: Each entry came from the suspect buffer with a matching kind.
         unsafe { discard_suspect(ptr, kind) };
     }
     lock_graveyard().clear();
@@ -1542,26 +1702,25 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(false);
         reset_for_tests();
-        unsafe {
-            let s = pith_struct_alloc(2);
-            pith_struct_retain(s);
-            pith_struct_release(s); // 2 -> 1: would buffer with the flag on
-            assert_eq!(struct_dead_word_for_tests(s), 0);
-            assert_eq!(struct_weak_count_for_tests(s), 1);
-            assert_eq!(suspect_count_for_tests(s as usize), 0);
-            pith_struct_release(s); // frees normally
 
-            let list = crate::collections::list::pith_list_new(8, 0);
-            pith_list_retain_handle(list.ptr as i64);
-            pith_list_release(list);
-            assert_eq!(
-                suspect_count_for_tests(list.ptr as usize),
-                0,
-                "flag off must keep the buffer empty"
-            );
-            pith_list_release(list); // frees normally, no graveyard
-            assert_eq!(graveyard_count_for_tests(list.ptr as usize), 0);
-        }
+        let s = unsafe { pith_struct_alloc(2) };
+        unsafe { pith_struct_retain(s) };
+        unsafe { pith_struct_release(s) }; // 2 -> 1: would buffer with the flag on
+        assert_eq!(unsafe { struct_dead_word_for_tests(s) }, 0);
+        assert_eq!(unsafe { struct_weak_count_for_tests(s) }, 1);
+        assert_eq!(suspect_count_for_tests(s as usize), 0);
+        unsafe { pith_struct_release(s) }; // frees normally
+
+        let list = unsafe { crate::collections::list::pith_list_new(8, 0) };
+        unsafe { pith_list_retain_handle(list.ptr as i64) };
+        unsafe { pith_list_release(list) };
+        assert_eq!(
+            suspect_count_for_tests(list.ptr as usize),
+            0,
+            "flag off must keep the buffer empty"
+        );
+        unsafe { pith_list_release(list) }; // frees normally, no graveyard
+        assert_eq!(graveyard_count_for_tests(list.ptr as usize), 0);
         assert_eq!(suspects_len_for_tests(), 0);
     }
 
@@ -1571,28 +1730,27 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
-        unsafe {
-            let s = pith_struct_alloc(2);
-            pith_struct_retain(s);
-            pith_struct_retain(s); // strong 3
-            pith_struct_release(s); // 3 -> 2: buffered
-            assert_eq!(suspect_count_for_tests(s as usize), 1);
-            assert_eq!(
-                struct_dead_word_for_tests(s),
-                2,
-                "buffered bit set, not dead"
-            );
-            assert_eq!(struct_weak_count_for_tests(s), 2, "buffer holds one weak");
-            pith_struct_release(s); // 2 -> 1: already buffered, no second entry
-            assert_eq!(suspect_count_for_tests(s as usize), 1);
-            assert_eq!(struct_weak_count_for_tests(s), 2);
 
-            force_enabled_for_tests(false);
-            reset_for_tests(); // clears the bit, drops the buffer's weak
-            assert_eq!(struct_dead_word_for_tests(s), 0);
-            assert_eq!(struct_weak_count_for_tests(s), 1);
-            pith_struct_release(s);
-        }
+        let s = unsafe { pith_struct_alloc(2) };
+        unsafe { pith_struct_retain(s) };
+        unsafe { pith_struct_retain(s) }; // strong 3
+        unsafe { pith_struct_release(s) }; // 3 -> 2: buffered
+        assert_eq!(suspect_count_for_tests(s as usize), 1);
+        assert_eq!(
+            unsafe { struct_dead_word_for_tests(s) },
+            2,
+            "buffered bit set, not dead"
+        );
+        assert_eq!(unsafe { struct_weak_count_for_tests(s) }, 2, "buffer holds one weak");
+        unsafe { pith_struct_release(s) }; // 2 -> 1: already buffered, no second entry
+        assert_eq!(suspect_count_for_tests(s as usize), 1);
+        assert_eq!(unsafe { struct_weak_count_for_tests(s) }, 2);
+
+        force_enabled_for_tests(false);
+        reset_for_tests(); // clears the bit, drops the buffer's weak
+        assert_eq!(unsafe { struct_dead_word_for_tests(s) }, 0);
+        assert_eq!(unsafe { struct_weak_count_for_tests(s) }, 1);
+        unsafe { pith_struct_release(s) };
     }
 
     #[test]
@@ -1601,21 +1759,20 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
-        unsafe {
-            let s = pith_struct_alloc(1);
-            pith_struct_retain(s);
-            pith_struct_release(s); // 2 -> 1: buffered, weak now 2
-            pith_struct_release(s); // 1 -> 0: dies while buffered
-                                    // dead bit and buffered bit both set; the buffer's weak count
-                                    // is the only thing keeping the header alive.
-            assert_eq!(struct_dead_word_for_tests(s), 3);
-            assert_eq!(struct_weak_count_for_tests(s), 1);
-            assert_eq!(pith_struct_weak_upgrade(s), 0, "dead reads as none");
-            assert_eq!(suspect_count_for_tests(s as usize), 1);
 
-            force_enabled_for_tests(false);
-            reset_for_tests(); // drops the buffer's weak: header freed here
-        }
+        let s = unsafe { pith_struct_alloc(1) };
+        unsafe { pith_struct_retain(s) };
+        unsafe { pith_struct_release(s) }; // 2 -> 1: buffered, weak now 2
+        unsafe { pith_struct_release(s) }; // 1 -> 0: dies while buffered
+                                           // dead bit and buffered bit both set; the buffer's weak count
+                                           // is the only thing keeping the header alive.
+        assert_eq!(unsafe { struct_dead_word_for_tests(s) }, 3);
+        assert_eq!(unsafe { struct_weak_count_for_tests(s) }, 1);
+        assert_eq!(unsafe { pith_struct_weak_upgrade(s) }, 0, "dead reads as none");
+        assert_eq!(suspect_count_for_tests(s as usize), 1);
+
+        force_enabled_for_tests(false);
+        reset_for_tests(); // drops the buffer's weak: header freed here
     }
 
     #[test]
@@ -1624,21 +1781,20 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
-        unsafe {
-            let s = pith_struct_alloc(1);
-            pith_struct_weak_retain(s);
-            pith_struct_retain(s);
-            pith_struct_release(s); // buffered, still alive
-            assert_eq!(struct_dead_word_for_tests(s), 2);
-            assert_eq!(pith_struct_weak_upgrade(s), s, "buffered but alive");
-            pith_struct_release(s); // the upgrade's count
-            pith_struct_release(s); // dies buffered
-            assert_eq!(pith_struct_weak_upgrade(s), 0, "buffered and dead");
-            pith_struct_weak_release(s);
 
-            force_enabled_for_tests(false);
-            reset_for_tests();
-        }
+        let s = unsafe { pith_struct_alloc(1) };
+        unsafe { pith_struct_weak_retain(s) };
+        unsafe { pith_struct_retain(s) };
+        unsafe { pith_struct_release(s) }; // buffered, still alive
+        assert_eq!(unsafe { struct_dead_word_for_tests(s) }, 2);
+        assert_eq!(unsafe { pith_struct_weak_upgrade(s) }, s, "buffered but alive");
+        unsafe { pith_struct_release(s) }; // the upgrade's count
+        unsafe { pith_struct_release(s) }; // dies buffered
+        assert_eq!(unsafe { pith_struct_weak_upgrade(s) }, 0, "buffered and dead");
+        unsafe { pith_struct_weak_release(s) };
+
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]
@@ -1647,36 +1803,35 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
-        unsafe {
-            // a struct element observed through a weak reference proves the
-            // list's death still cascades into its elements.
-            let elem = pith_struct_alloc(1);
-            pith_struct_weak_retain(elem);
 
-            let list = crate::collections::list::pith_list_new(8, 4); // struct elements
-            pith_list_push_value(list, elem); // list retains
-            pith_struct_release(elem); // list holds the only strong count
-            assert_eq!(pith_struct_weak_upgrade(elem), elem);
-            pith_struct_release(elem); // the upgrade's count
+        // a struct element observed through a weak reference proves the
+        // list's death still cascades into its elements.
+        let elem = unsafe { pith_struct_alloc(1) };
+        unsafe { pith_struct_weak_retain(elem) };
 
-            pith_list_retain_handle(list.ptr as i64);
-            pith_list_release(list); // 2 -> 1: buffered
-            assert_eq!(suspect_count_for_tests(list.ptr as usize), 1);
-            pith_list_release(list); // 1 -> 0: dies buffered
+        let list = unsafe { crate::collections::list::pith_list_new(8, 4) }; // struct elements
+        unsafe { pith_list_push_value(list, elem) }; // list retains
+        unsafe { pith_struct_release(elem) }; // list holds the only strong count
+        assert_eq!(unsafe { pith_struct_weak_upgrade(elem) }, elem);
+        unsafe { pith_struct_release(elem) }; // the upgrade's count
 
-            assert_eq!(graveyard_count_for_tests(list.ptr as usize), 1);
-            assert_eq!(pith_struct_weak_upgrade(elem), 0, "element was released");
-            assert_eq!(
-                pith_list_len(list),
-                0,
-                "magic scrubbed: handle no longer validates"
-            );
-            pith_list_retain_handle(list.ptr as i64); // must be a no-op, not a revival
+        unsafe { pith_list_retain_handle(list.ptr as i64) };
+        unsafe { pith_list_release(list) }; // 2 -> 1: buffered
+        assert_eq!(suspect_count_for_tests(list.ptr as usize), 1);
+        unsafe { pith_list_release(list) }; // 1 -> 0: dies buffered
 
-            pith_struct_weak_release(elem);
-            force_enabled_for_tests(false);
-            reset_for_tests();
-        }
+        assert_eq!(graveyard_count_for_tests(list.ptr as usize), 1);
+        assert_eq!(unsafe { pith_struct_weak_upgrade(elem) }, 0, "element was released");
+        assert_eq!(
+            pith_list_len(list),
+            0,
+            "magic scrubbed: handle no longer validates"
+        );
+        unsafe { pith_list_retain_handle(list.ptr as i64) }; // must be a no-op, not a revival
+
+        unsafe { pith_struct_weak_release(elem) };
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]
@@ -1685,29 +1840,28 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
-        unsafe {
-            let captured = pith_struct_alloc(1);
-            pith_struct_weak_retain(captured);
 
-            let closure = pith_closure_new(0x1000);
-            // tag 6 = struct, per the closure env tag codes; ownership of the
-            // strong count transfers into the closure.
-            pith_closure_set_env_rc(closure, 0, captured, 6);
+        let captured = unsafe { pith_struct_alloc(1) };
+        unsafe { pith_struct_weak_retain(captured) };
 
-            pith_closure_retain(closure);
-            pith_closure_release(closure); // 2 -> 1: buffered
-            assert!(closure_buffered_for_tests(closure));
-            assert_eq!(suspect_count_for_tests(closure as usize), 1);
-            pith_closure_release(closure); // 1 -> 0: dies buffered
+        let closure = pith_closure_new(0x1000);
+        // tag 6 = struct, per the closure env tag codes; ownership of the
+        // strong count transfers into the closure.
+        unsafe { pith_closure_set_env_rc(closure, 0, captured, 6) };
 
-            assert_eq!(graveyard_count_for_tests(closure as usize), 1);
-            assert_eq!(pith_struct_weak_upgrade(captured), 0, "capture was released");
-            assert_eq!(pith_closure_get_fn(closure), 0, "magic scrubbed");
+        unsafe { pith_closure_retain(closure) };
+        unsafe { pith_closure_release(closure) }; // 2 -> 1: buffered
+        assert!(unsafe { closure_buffered_for_tests(closure) });
+        assert_eq!(suspect_count_for_tests(closure as usize), 1);
+        unsafe { pith_closure_release(closure) }; // 1 -> 0: dies buffered
 
-            pith_struct_weak_release(captured);
-            force_enabled_for_tests(false);
-            reset_for_tests();
-        }
+        assert_eq!(graveyard_count_for_tests(closure as usize), 1);
+        assert_eq!(unsafe { pith_struct_weak_upgrade(captured) }, 0, "capture was released");
+        assert_eq!(unsafe { pith_closure_get_fn(closure) }, 0, "magic scrubbed");
+
+        unsafe { pith_struct_weak_release(captured) };
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]
@@ -1716,38 +1870,37 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
-        unsafe {
-            let mut kept = Vec::new();
-            while suspects_len_for_tests() < CYCLE_SUSPECT_CAP {
-                let s = pith_struct_alloc(1);
-                pith_struct_retain(s);
-                pith_struct_release(s); // buffered
-                kept.push(s);
-            }
 
-            let overflowed_before = CYCLE_SUSPECTS_OVERFLOWED.load(Ordering::Relaxed);
-            let victim = pith_struct_alloc(1);
-            pith_struct_retain(victim);
-            pith_struct_release(victim); // buffer full: turned away
-            assert_eq!(
-                suspect_count_for_tests(victim as usize),
-                0,
-                "no push at cap"
-            );
-            assert_eq!(struct_dead_word_for_tests(victim), 0, "bit cleared again");
-            assert_eq!(
-                struct_weak_count_for_tests(victim),
-                1,
-                "weak released again"
-            );
-            assert!(CYCLE_SUSPECTS_OVERFLOWED.load(Ordering::Relaxed) > overflowed_before);
+        let mut kept = Vec::new();
+        while suspects_len_for_tests() < CYCLE_SUSPECT_CAP {
+            let s = unsafe { pith_struct_alloc(1) };
+            unsafe { pith_struct_retain(s) };
+            unsafe { pith_struct_release(s) }; // buffered
+            kept.push(s);
+        }
 
-            force_enabled_for_tests(false);
-            reset_for_tests();
-            pith_struct_release(victim);
-            for s in kept {
-                pith_struct_release(s);
-            }
+        let overflowed_before = CYCLE_SUSPECTS_OVERFLOWED.load(Ordering::Relaxed);
+        let victim = unsafe { pith_struct_alloc(1) };
+        unsafe { pith_struct_retain(victim) };
+        unsafe { pith_struct_release(victim) }; // buffer full: turned away
+        assert_eq!(
+            suspect_count_for_tests(victim as usize),
+            0,
+            "no push at cap"
+        );
+        assert_eq!(unsafe { struct_dead_word_for_tests(victim) }, 0, "bit cleared again");
+        assert_eq!(
+            unsafe { struct_weak_count_for_tests(victim) },
+            1,
+            "weak released again"
+        );
+        assert!(CYCLE_SUSPECTS_OVERFLOWED.load(Ordering::Relaxed) > overflowed_before);
+
+        force_enabled_for_tests(false);
+        reset_for_tests();
+        unsafe { pith_struct_release(victim) };
+        for s in kept {
+            unsafe { pith_struct_release(s) };
         }
     }
 
@@ -1839,38 +1992,37 @@ mod tests {
         let _guard = locked();
         force_enabled_for_tests(true);
         reset_for_tests();
-        unsafe {
-            let s = pith_struct_alloc(1);
-            for _ in 0..8 {
-                pith_struct_retain(s); // strong 9: one per releasing step + ours
-            }
-            let a = std::thread::spawn(move || {
-                for _ in 0..4 {
-                    pith_struct_release(s);
-                }
-            });
-            let b = std::thread::spawn(move || {
-                for _ in 0..4 {
-                    pith_struct_release(s);
-                }
-            });
-            a.join().expect("releasing thread panicked");
-            b.join().expect("releasing thread panicked");
 
-            assert_eq!(pith_struct_weak_upgrade(s), s, "still alive: we hold a count");
-            pith_struct_release(s); // the upgrade's count
-            assert_eq!(
-                suspect_count_for_tests(s as usize),
-                1,
-                "one entry, many releases"
-            );
-            assert_eq!(struct_dead_word_for_tests(s), 2);
-            assert_eq!(struct_weak_count_for_tests(s), 2);
-
-            force_enabled_for_tests(false);
-            reset_for_tests();
-            pith_struct_release(s);
+        let s = unsafe { pith_struct_alloc(1) };
+        for _ in 0..8 {
+            unsafe { pith_struct_retain(s) }; // strong 9: one per releasing step + ours
         }
+        let a = std::thread::spawn(move || {
+            for _ in 0..4 {
+                unsafe { pith_struct_release(s) };
+            }
+        });
+        let b = std::thread::spawn(move || {
+            for _ in 0..4 {
+                unsafe { pith_struct_release(s) };
+            }
+        });
+        a.join().expect("releasing thread panicked");
+        b.join().expect("releasing thread panicked");
+
+        assert_eq!(unsafe { pith_struct_weak_upgrade(s) }, s, "still alive: we hold a count");
+        unsafe { pith_struct_release(s) }; // the upgrade's count
+        assert_eq!(
+            suspect_count_for_tests(s as usize),
+            1,
+            "one entry, many releases"
+        );
+        assert_eq!(unsafe { struct_dead_word_for_tests(s) }, 2);
+        assert_eq!(unsafe { struct_weak_count_for_tests(s) }, 2);
+
+        force_enabled_for_tests(false);
+        reset_for_tests();
+        unsafe { pith_struct_release(s) };
     }
 
     // --- stop-the-world tests ----------------------------------------------
@@ -2307,9 +2459,9 @@ mod tests {
 
     /// dtor for a one-field box whose field holds another struct.
     unsafe extern "C" fn ring_dtor(ptr: i64) {
-        let field = *(ptr as *const i64);
+        let field = unsafe { *(ptr as *const i64) };
         if field != 0 {
-            pith_struct_release(field);
+            unsafe { pith_struct_release(field) };
         }
     }
 
@@ -2321,9 +2473,9 @@ mod tests {
 
     /// dtor for a one-field box whose field holds a closure.
     unsafe extern "C" fn holder_dtor(ptr: i64) {
-        let closure = *(ptr as *const i64);
+        let closure = unsafe { *(ptr as *const i64) };
         if closure != 0 {
-            pith_closure_release(closure);
+            unsafe { pith_closure_release(closure) };
         }
     }
 
@@ -2351,16 +2503,55 @@ mod tests {
     /// and no external count remains once the builder's is dropped.
     unsafe fn build_garbage_ring() -> (i64, i64) {
         pith_cc_register_tracer(ring_dtor as usize as i64, ring_tracer as usize as i64);
-        let a = pith_struct_alloc(1);
-        let b = pith_struct_alloc(1);
-        pith_struct_set_dtor(a, ring_dtor as usize as i64);
-        pith_struct_set_dtor(b, ring_dtor as usize as i64);
-        *(a as *mut i64) = b; // our count on b transfers into a's field
-        pith_struct_retain(a);
-        *(b as *mut i64) = a; // b's edge holds its own count on a
-        pith_struct_weak_retain(a);
-        pith_struct_weak_retain(b);
+        let a = unsafe { pith_struct_alloc(1) };
+        let b = unsafe { pith_struct_alloc(1) };
+        unsafe {
+            pith_struct_set_dtor(a, ring_dtor as usize as i64);
+            pith_struct_set_dtor(b, ring_dtor as usize as i64);
+            *(a as *mut i64) = b; // our count on b transfers into a's field
+            pith_struct_retain(a);
+            *(b as *mut i64) = a; // b's edge holds its own count on a
+            pith_struct_weak_retain(a);
+            pith_struct_weak_retain(b);
+        }
         (a, b)
+    }
+
+    #[test]
+    fn trial_deletion_graph_separates_garbage_cycles_from_live_roots() {
+        // Pure-Rust synthetic graph test (no raw pointers):
+        // - Cycle 1 <-> 2 with counts (1, 1) -> garbage (both white)
+        // - Cycle 3 <-> 4 with counts (2, 1) -> externally rooted at 3 (both black)
+        let graph: HashMap<usize, (i64, Vec<(usize, u8)>)> = HashMap::from([
+            (1, (1, vec![(2, CHILD_KIND_STRUCT)])),
+            (2, (1, vec![(1, CHILD_KIND_STRUCT)])),
+            (3, (2, vec![(4, CHILD_KIND_STRUCT)])),
+            (4, (1, vec![(3, CHILD_KIND_STRUCT)])),
+        ]);
+        let mut whites = run_trial_deletion(
+            &[(1, CHILD_KIND_STRUCT), (3, CHILD_KIND_STRUCT)],
+            |nodes, ptr, kind| {
+                if nodes.contains_key(&ptr) {
+                    return true;
+                }
+                let Some((count, children)) = graph.get(&ptr) else {
+                    return false;
+                };
+                nodes.insert(
+                    ptr,
+                    Node {
+                        kind,
+                        count: *count,
+                        color: Color::Fresh,
+                        children: children.clone(),
+                    },
+                );
+                true
+            },
+            |_| 0,
+        );
+        whites.sort_unstable();
+        assert_eq!(whites, vec![(1, CHILD_KIND_STRUCT), (2, CHILD_KIND_STRUCT)]);
     }
 
     #[test]
@@ -2370,36 +2561,39 @@ mod tests {
         force_enabled_for_tests(true);
         set_stop_timeout_for_tests(50);
         reset_for_tests();
-        unsafe {
-            let (a, b) = build_garbage_ring();
-            pith_struct_release(a); // the last external count: garbage now
-            assert_eq!(suspect_count_for_tests(a as usize), 1);
-            assert_eq!(crate::runtime_core::cycle_struct_alive(a), Some(true), "the ring still holds it");
 
-            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
-            if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_upgrade(a), 0, "ring member a reclaimed");
-            assert_eq!(pith_struct_weak_upgrade(b), 0, "ring member b reclaimed");
-            assert_eq!(
-                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
-                2,
-                "exactly the two ring members were freed"
-            );
+        let (a, b) = unsafe { build_garbage_ring() };
+        unsafe { pith_struct_release(a) }; // the last external count: garbage now
+        assert_eq!(suspect_count_for_tests(a as usize), 1);
+        assert_eq!(
+            unsafe { crate::runtime_core::cycle_struct_alive(a) },
+            Some(true),
+            "the ring still holds it"
+        );
 
-            // a second pass drains the teardown's fresh suspects and finds
-            // nothing more to free: collected exactly once.
-            if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(
-                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
-                2,
-                "nothing was freed twice"
-            );
+        let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+        if !collect_eventually() { skip_congested("collection test"); return; }
+        assert_eq!(unsafe { pith_struct_weak_upgrade(a) }, 0, "ring member a reclaimed");
+        assert_eq!(unsafe { pith_struct_weak_upgrade(b) }, 0, "ring member b reclaimed");
+        assert_eq!(
+            CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+            2,
+            "exactly the two ring members were freed"
+        );
 
-            pith_struct_weak_release(a);
-            pith_struct_weak_release(b);
-            force_enabled_for_tests(false);
-            reset_for_tests();
-        }
+        // a second pass drains the teardown's fresh suspects and finds
+        // nothing more to free: collected exactly once.
+        if !collect_eventually() { skip_congested("collection test"); return; }
+        assert_eq!(
+            CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+            2,
+            "nothing was freed twice"
+        );
+
+        unsafe { pith_struct_weak_release(a) };
+        unsafe { pith_struct_weak_release(b) };
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]
@@ -2409,41 +2603,48 @@ mod tests {
         force_enabled_for_tests(true);
         set_stop_timeout_for_tests(50);
         reset_for_tests();
-        unsafe {
-            let (a, b) = build_garbage_ring();
-            pith_struct_retain(a); // the "stack" reference keeping it alive
-            pith_struct_release(a); // buffers a, but a real owner remains
 
-            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
-            if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(crate::runtime_core::cycle_struct_alive(a), Some(true), "externally owned: kept");
-            assert_eq!(crate::runtime_core::cycle_struct_alive(b), Some(true), "reached only from a: kept");
-            assert_eq!(
-                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
-                0,
-                "a reachable ring frees nothing"
-            );
+        let (a, b) = unsafe { build_garbage_ring() };
+        unsafe { pith_struct_retain(a) }; // the "stack" reference keeping it alive
+        unsafe { pith_struct_release(a) }; // buffers a, but a real owner remains
 
-            // the owner lets go: the same ring is garbage on the next pass.
-            pith_struct_release(a);
-            if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_upgrade(a), 0);
-            assert_eq!(pith_struct_weak_upgrade(b), 0);
-            assert_eq!(
-                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
-                2
-            );
+        let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+        if !collect_eventually() { skip_congested("collection test"); return; }
+        assert_eq!(
+            unsafe { crate::runtime_core::cycle_struct_alive(a) },
+            Some(true),
+            "externally owned: kept"
+        );
+        assert_eq!(
+            unsafe { crate::runtime_core::cycle_struct_alive(b) },
+            Some(true),
+            "reached only from a: kept"
+        );
+        assert_eq!(
+            CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+            0,
+            "a reachable ring frees nothing"
+        );
 
-            pith_struct_weak_release(a);
-            pith_struct_weak_release(b);
-            force_enabled_for_tests(false);
-            reset_for_tests();
-        }
+        // the owner lets go: the same ring is garbage on the next pass.
+        unsafe { pith_struct_release(a) };
+        if !collect_eventually() { skip_congested("collection test"); return; }
+        assert_eq!(unsafe { pith_struct_weak_upgrade(a) }, 0);
+        assert_eq!(unsafe { pith_struct_weak_upgrade(b) }, 0);
+        assert_eq!(
+            CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+            2
+        );
+
+        unsafe { pith_struct_weak_release(a) };
+        unsafe { pith_struct_weak_release(b) };
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     /// `ring_dtor` under another address, registered as running a user drop.
     unsafe extern "C" fn user_drop_ring_dtor(ptr: i64) {
-        ring_dtor(ptr);
+        unsafe { ring_dtor(ptr) };
     }
 
     #[test]
@@ -2453,58 +2654,55 @@ mod tests {
         force_enabled_for_tests(true);
         set_stop_timeout_for_tests(50);
         reset_for_tests();
-        unsafe {
-            pith_cc_register_tracer(
-                user_drop_ring_dtor as usize as i64,
-                ring_tracer as usize as i64,
-            );
-            pith_cc_register_user_drop(user_drop_ring_dtor as usize as i64);
-            let (a, b) = build_garbage_ring();
-            pith_struct_set_dtor(a, user_drop_ring_dtor as usize as i64);
-            pith_struct_release(a);
 
-            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
-            if !collect_eventually() {
-                skip_congested("collection test");
-                return;
-            }
-            assert_eq!(
-                crate::runtime_core::cycle_struct_alive(a),
-                Some(true),
-                "a runs a user drop: kept"
-            );
-            assert_eq!(
-                crate::runtime_core::cycle_struct_alive(b),
-                Some(true),
-                "reached from a: kept"
-            );
-            assert_eq!(
-                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
-                0
-            );
+        pith_cc_register_tracer(
+            user_drop_ring_dtor as usize as i64,
+            ring_tracer as usize as i64,
+        );
+        pith_cc_register_user_drop(user_drop_ring_dtor as usize as i64);
+        let (a, b) = unsafe { build_garbage_ring() };
+        unsafe { pith_struct_set_dtor(a, user_drop_ring_dtor as usize as i64) };
+        unsafe { pith_struct_release(a) };
 
-            // break the ring by hand so the test leaves nothing behind
-            *(a as *mut i64) = 0;
-            pith_struct_release(b);
-            pith_struct_weak_release(a);
-            pith_struct_weak_release(b);
-            force_enabled_for_tests(false);
-            reset_for_tests();
+        let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+        if !collect_eventually() {
+            skip_congested("collection test");
+            return;
         }
+        assert_eq!(
+            unsafe { crate::runtime_core::cycle_struct_alive(a) },
+            Some(true),
+            "a runs a user drop: kept"
+        );
+        assert_eq!(
+            unsafe { crate::runtime_core::cycle_struct_alive(b) },
+            Some(true),
+            "reached from a: kept"
+        );
+        assert_eq!(
+            CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+            0
+        );
+
+        // break the ring by hand so the test leaves nothing behind
+        unsafe { *(a as *mut i64) = 0 };
+        unsafe { pith_struct_release(b) };
+        unsafe { pith_struct_weak_release(a) };
+        unsafe { pith_struct_weak_release(b) };
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]
     fn a_weak_upgrade_refuses_a_guarded_white_struct() {
-        unsafe {
-            let s = pith_struct_alloc(1);
-            guard_white(s as usize, CHILD_KIND_STRUCT);
-            assert_eq!(pith_struct_weak_upgrade(s), 0, "a white is being torn down");
-            // the guard is 2^31 on a u32 count, so a second one wraps it off
-            guard_white(s as usize, CHILD_KIND_STRUCT);
-            assert_eq!(pith_struct_weak_upgrade(s), s, "unguarded again");
-            pith_struct_release(s);
-            pith_struct_release(s);
-        }
+        let s = unsafe { pith_struct_alloc(1) };
+        unsafe { guard_white(s as usize, CHILD_KIND_STRUCT) };
+        assert_eq!(unsafe { pith_struct_weak_upgrade(s) }, 0, "a white is being torn down");
+        // the guard is 2^31 on a u32 count, so a second one wraps it off
+        unsafe { guard_white(s as usize, CHILD_KIND_STRUCT) };
+        assert_eq!(unsafe { pith_struct_weak_upgrade(s) }, s, "unguarded again");
+        unsafe { pith_struct_release(s) };
+        unsafe { pith_struct_release(s) };
     }
 
     #[test]
@@ -2514,27 +2712,30 @@ mod tests {
         force_enabled_for_tests(true);
         set_stop_timeout_for_tests(50);
         reset_for_tests();
-        unsafe {
-            // no destructor, so no tracer: the collector sees a leaf with a
-            // real external count and must leave it alone.
-            let s = pith_struct_alloc(2);
-            pith_struct_weak_retain(s);
-            pith_struct_retain(s);
-            pith_struct_release(s); // buffered, still owned by us
 
-            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
-            if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(crate::runtime_core::cycle_struct_alive(s), Some(true), "leaf with an owner: kept");
-            assert_eq!(
-                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
-                0
-            );
+        // no destructor, so no tracer: the collector sees a leaf with a
+        // real external count and must leave it alone.
+        let s = unsafe { pith_struct_alloc(2) };
+        unsafe { pith_struct_weak_retain(s) };
+        unsafe { pith_struct_retain(s) };
+        unsafe { pith_struct_release(s) }; // buffered, still owned by us
 
-            pith_struct_weak_release(s);
-            pith_struct_release(s);
-            force_enabled_for_tests(false);
-            reset_for_tests();
-        }
+        let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+        if !collect_eventually() { skip_congested("collection test"); return; }
+        assert_eq!(
+            unsafe { crate::runtime_core::cycle_struct_alive(s) },
+            Some(true),
+            "leaf with an owner: kept"
+        );
+        assert_eq!(
+            CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+            0
+        );
+
+        unsafe { pith_struct_weak_release(s) };
+        unsafe { pith_struct_release(s) };
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]
@@ -2544,32 +2745,31 @@ mod tests {
         force_enabled_for_tests(true);
         set_stop_timeout_for_tests(50);
         reset_for_tests();
-        unsafe {
-            pith_cc_register_tracer(holder_dtor as usize as i64, holder_tracer as usize as i64);
-            let s = pith_struct_alloc(1);
-            pith_struct_set_dtor(s, holder_dtor as usize as i64);
-            let c = pith_closure_new(0x1000);
-            pith_struct_retain(s);
-            pith_closure_set_env_rc(c, 0, s, 6); // closure captures the struct
-            *(s as *mut i64) = c; // the struct's field owns the closure back
-            pith_struct_weak_retain(s);
 
-            pith_struct_release(s); // the last external count: garbage now
-            assert_eq!(suspect_count_for_tests(s as usize), 1);
+        pith_cc_register_tracer(holder_dtor as usize as i64, holder_tracer as usize as i64);
+        let s = unsafe { pith_struct_alloc(1) };
+        unsafe { pith_struct_set_dtor(s, holder_dtor as usize as i64) };
+        let c = pith_closure_new(0x1000);
+        unsafe { pith_struct_retain(s) };
+        unsafe { pith_closure_set_env_rc(c, 0, s, 6) }; // closure captures the struct
+        unsafe { *(s as *mut i64) = c }; // the struct's field owns the closure back
+        unsafe { pith_struct_weak_retain(s) };
 
-            let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
-            if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(pith_struct_weak_upgrade(s), 0, "struct half reclaimed");
-            assert_eq!(pith_closure_get_fn(c), 0, "closure half no longer validates");
-            assert_eq!(
-                CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
-                2
-            );
+        unsafe { pith_struct_release(s) }; // the last external count: garbage now
+        assert_eq!(suspect_count_for_tests(s as usize), 1);
 
-            pith_struct_weak_release(s);
-            force_enabled_for_tests(false);
-            reset_for_tests();
-        }
+        let whites_before = CYCLE_WHITES_FREED.load(Ordering::Relaxed);
+        if !collect_eventually() { skip_congested("collection test"); return; }
+        assert_eq!(unsafe { pith_struct_weak_upgrade(s) }, 0, "struct half reclaimed");
+        assert_eq!(unsafe { pith_closure_get_fn(c) }, 0, "closure half no longer validates");
+        assert_eq!(
+            CYCLE_WHITES_FREED.load(Ordering::Relaxed) - whites_before,
+            2
+        );
+
+        unsafe { pith_struct_weak_release(s) };
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]
@@ -2579,23 +2779,22 @@ mod tests {
         force_enabled_for_tests(true);
         set_stop_timeout_for_tests(50);
         reset_for_tests();
-        unsafe {
-            let list = crate::collections::list::pith_list_new(8, 0);
-            pith_list_retain_handle(list.ptr as i64);
-            pith_list_release(list); // 2 -> 1: buffered
-            pith_list_release(list); // 1 -> 0: dies into the graveyard
-            assert_eq!(graveyard_count_for_tests(list.ptr as usize), 1);
 
-            if !collect_eventually() { skip_congested("collection test"); return; }
-            assert_eq!(
-                graveyard_count_for_tests(list.ptr as usize),
-                0,
-                "the parked shell was freed"
-            );
+        let list = unsafe { crate::collections::list::pith_list_new(8, 0) };
+        unsafe { pith_list_retain_handle(list.ptr as i64) };
+        unsafe { pith_list_release(list) }; // 2 -> 1: buffered
+        unsafe { pith_list_release(list) }; // 1 -> 0: dies into the graveyard
+        assert_eq!(graveyard_count_for_tests(list.ptr as usize), 1);
 
-            force_enabled_for_tests(false);
-            reset_for_tests();
-        }
+        if !collect_eventually() { skip_congested("collection test"); return; }
+        assert_eq!(
+            graveyard_count_for_tests(list.ptr as usize),
+            0,
+            "the parked shell was freed"
+        );
+
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]
@@ -2605,26 +2804,25 @@ mod tests {
         force_enabled_for_tests(true);
         set_stop_timeout_for_tests(50);
         reset_for_tests();
-        unsafe {
-            let (a, b) = build_garbage_ring();
-            pith_struct_release(a);
 
-            // retried because unrelated test threads may hold running
-            // mutator slots for a while, exactly like collect_eventually.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            let mut forced_ok = false;
-            while !forced_ok && Instant::now() < deadline {
-                forced_ok = pith_cycle_gc_collect_now() == 1;
-            }
-            assert!(forced_ok, "the forced collection must eventually run");
-            assert_eq!(pith_struct_weak_upgrade(a), 0);
-            assert_eq!(pith_struct_weak_upgrade(b), 0);
+        let (a, b) = unsafe { build_garbage_ring() };
+        unsafe { pith_struct_release(a) };
 
-            pith_struct_weak_release(a);
-            pith_struct_weak_release(b);
-            force_enabled_for_tests(false);
-            reset_for_tests();
+        // retried because unrelated test threads may hold running
+        // mutator slots for a while, exactly like collect_eventually.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut forced_ok = false;
+        while !forced_ok && Instant::now() < deadline {
+            forced_ok = pith_cycle_gc_collect_now() == 1;
         }
+        assert!(forced_ok, "the forced collection must eventually run");
+        assert_eq!(unsafe { pith_struct_weak_upgrade(a) }, 0);
+        assert_eq!(unsafe { pith_struct_weak_upgrade(b) }, 0);
+
+        unsafe { pith_struct_weak_release(a) };
+        unsafe { pith_struct_weak_release(b) };
+        force_enabled_for_tests(false);
+        reset_for_tests();
     }
 
     #[test]

@@ -107,16 +107,15 @@ pub(super) fn split_handle(handle: i64) -> Option<(usize, u32)> {
 /// `closure_handle` must be a valid closure handle or 0 (validated downstream).
 pub(crate) unsafe fn spawn(closure_handle: i64) -> i64 {
     match backend() {
-        Backend::OsThread => task::os_thread_spawn(closure_handle),
-        Backend::Green => green::green_spawn(closure_handle),
+        // SAFETY: Preconditions forwarded from caller.
+        Backend::OsThread => unsafe { task::os_thread_spawn(closure_handle) },
+        // SAFETY: Preconditions forwarded from caller.
+        Backend::Green => unsafe { green::green_spawn(closure_handle) },
     }
 }
 
 /// Await a task and return its result.
-///
-/// # Safety
-/// `task_handle` must be a task handle from `spawn` or garbage (validated).
-pub(crate) unsafe fn await_task(task_handle: i64) -> i64 {
+pub(crate) fn await_task(task_handle: i64) -> i64 {
     match backend() {
         Backend::OsThread => task::os_thread_await(task_handle),
         // an os-thread caller blocks on the task's condvar; a green task

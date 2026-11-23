@@ -5,20 +5,10 @@
 //! a protocol needs. the pith-facing surface (std/compress/zstd.pith)
 //! mirrors gzip's, including the bounded decompress.
 
-use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::bytes::{pith_bytes_from_vec, with_bytes};
 use std::io::Read;
 
-unsafe fn bytes_slice<'a>(handle: i64) -> Option<&'a [u8]> {
-    Some(pith_bytes_ref(handle)?.data.as_slice())
-}
-
-/// Compress `data` at `level` (1..=22; out-of-range clamps to the default 3).
-/// Returns a bytes handle, or 0 on an invalid input handle.
-#[no_mangle]
-pub unsafe extern "C" fn pith_zstd_compress(data: i64, level: i64) -> i64 {
-    let Some(input) = bytes_slice(data) else {
-        return 0;
-    };
+fn zstd_compress_impl(input: &[u8], level: i64) -> i64 {
     let level = if (1..=22).contains(&level) { level as i32 } else { 3 };
     match zstd::bulk::compress(input, level) {
         Ok(out) => pith_bytes_from_vec(out),
@@ -26,16 +16,7 @@ pub unsafe extern "C" fn pith_zstd_compress(data: i64, level: i64) -> i64 {
     }
 }
 
-/// Decompress a zstd frame, refusing to produce more than `max_out` bytes.
-/// The cap is enforced during streaming decode, not after: a decompression
-/// bomb fails at the limit without the memory ever being allocated. Returns
-/// a bytes handle, or 0 on a malformed frame, an invalid handle, or a
-/// too-large output.
-#[no_mangle]
-pub unsafe extern "C" fn pith_zstd_decompress(data: i64, max_out: i64) -> i64 {
-    let Some(input) = bytes_slice(data) else {
-        return 0;
-    };
+fn zstd_decompress_impl(input: &[u8], max_out: i64) -> i64 {
     if max_out <= 0 {
         return 0;
     }
@@ -54,4 +35,23 @@ pub unsafe extern "C" fn pith_zstd_decompress(data: i64, max_out: i64) -> i64 {
         return 0;
     }
     pith_bytes_from_vec(out)
+}
+
+/// Compress `data` at `level` (1..=22; out-of-range clamps to the default 3).
+/// Returns a bytes handle, or 0 on an invalid input handle.
+#[no_mangle]
+pub unsafe extern "C" fn pith_zstd_compress(data: i64, level: i64) -> i64 {
+    // SAFETY: `data` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(data, |input| zstd_compress_impl(input, level)) }.unwrap_or(0)
+}
+
+/// Decompress a zstd frame, refusing to produce more than `max_out` bytes.
+/// The cap is enforced during streaming decode, not after: a decompression
+/// bomb fails at the limit without the memory ever being allocated. Returns
+/// a bytes handle, or 0 on a malformed frame, an invalid handle, or a
+/// too-large output.
+#[no_mangle]
+pub unsafe extern "C" fn pith_zstd_decompress(data: i64, max_out: i64) -> i64 {
+    // SAFETY: `data` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(data, |input| zstd_decompress_impl(input, max_out)) }.unwrap_or(0)
 }

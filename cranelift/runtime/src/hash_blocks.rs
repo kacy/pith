@@ -8,8 +8,37 @@
 //! no carry-less multiply, CRC or SHA instructions, so Pith code cannot emit
 //! them itself.
 
-use crate::bytes::pith_bytes_ref;
-use crate::collections::list::primitive_words_mut;
+use crate::bytes::with_bytes;
+use crate::collections::list::with_primitive_words_mut;
+
+#[inline(always)]
+fn crc32_fold_slice(crc: i64, bytes: &[u8], len: i64) -> i64 {
+    if len < 64 || len % 16 != 0 || len as u64 > bytes.len() as u64 {
+        return -1;
+    }
+    match crc32_hw(crc as u32, &bytes[..len as usize]) {
+        Some(folded) => folded as i64,
+        None => -1,
+    }
+}
+
+#[inline(always)]
+fn sha256_blocks_slice(words: &mut [i64], bytes: &[u8], blocks: i64) -> i64 {
+    if words.len() != 8 || blocks < 0 || (blocks as u64).saturating_mul(64) > bytes.len() as u64 {
+        return 0;
+    }
+    let mut h = [0u32; 8];
+    for (out, &word) in h.iter_mut().zip(words.iter()) {
+        *out = word as u32;
+    }
+    if !sha256_hw(&mut h, &bytes[..blocks as usize * 64]) {
+        return 0;
+    }
+    for (word, &out) in words.iter_mut().zip(h.iter()) {
+        *word = out as i64;
+    }
+    1
+}
 
 /// Fold `len` bytes from the start of `data` into the CRC-32 (IEEE)
 /// register `crc`, as std.checksum keeps it: inverted, before the final
@@ -18,16 +47,8 @@ use crate::collections::list::primitive_words_mut;
 /// out of range, and the caller then runs its own loop.
 #[no_mangle]
 pub unsafe extern "C" fn pith_crc32_fold(crc: i64, data: i64, len: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(data) else {
-        return -1;
-    };
-    if len < 64 || len % 16 != 0 || len as u64 > bytes.data.len() as u64 {
-        return -1;
-    }
-    match crc32_hw(crc as u32, &bytes.data[..len as usize]) {
-        Some(folded) => folded as i64,
-        None => -1,
-    }
+    // SAFETY: `data` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(data, |bytes| crc32_fold_slice(crc, bytes, len)) }.unwrap_or(-1)
 }
 
 /// Run the SHA-256 compression function over `blocks` 64-byte blocks from
@@ -37,26 +58,15 @@ pub unsafe extern "C" fn pith_crc32_fold(crc: i64, data: i64, len: i64) -> i64 {
 /// caller then runs its own loop with the state unchanged.
 #[no_mangle]
 pub unsafe extern "C" fn pith_sha256_blocks(state: i64, data: i64, blocks: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(data) else {
-        return 0;
-    };
-    let Some(words) = primitive_words_mut(state) else {
-        return 0;
-    };
-    if words.len() != 8 || blocks < 0 || (blocks as u64).saturating_mul(64) > bytes.data.len() as u64 {
-        return 0;
+    // SAFETY: `data` (`PithBytes`) and `state` (`ListImpl`) are distinct handle types
+    // validated before borrowing their slices.
+    unsafe {
+        with_bytes(data, |bytes| {
+            with_primitive_words_mut(state, |words| sha256_blocks_slice(words, bytes, blocks))
+        })
     }
-    let mut h = [0u32; 8];
-    for (out, &word) in h.iter_mut().zip(words.iter()) {
-        *out = word as u32;
-    }
-    if !sha256_hw(&mut h, &bytes.data[..blocks as usize * 64]) {
-        return 0;
-    }
-    for (word, &out) in words.iter_mut().zip(h.iter()) {
-        *word = out as i64;
-    }
-    1
+    .flatten()
+    .unwrap_or(0)
 }
 
 /// Fold `data` (a multiple of 16 bytes, at least 64) into the CRC-32
@@ -139,9 +149,13 @@ mod x86 {
     }
 
     #[target_feature(enable = "pclmulqdq,sse2,sse4.1")]
-    unsafe fn crc32_fold_impl(crc: u32, data: &[u8]) -> u32 {
-        let mut chunks = data.chunks_exact(16).map(|c| _mm_loadu_si128(c.as_ptr() as *const __m128i));
-        let mut next = || chunks.next().unwrap_or_else(|| _mm_setzero_si128());
+    fn crc32_fold_impl(crc: u32, data: &[u8]) -> u32 {
+        let mut chunks = data.chunks_exact(16).map(|c| {
+            // SAFETY: `c` is a 16-byte slice; unaligned load reads within it.
+            unsafe { _mm_loadu_si128(c.as_ptr() as *const __m128i) }
+        });
+        let zero = _mm_setzero_si128();
+        let mut next = || chunks.next().unwrap_or(zero);
         let blocks = data.len() / 16;
 
         // four lanes of 128 bits, each folded forward by 512 bits per step
@@ -183,7 +197,7 @@ mod x86 {
     }
 
     #[target_feature(enable = "pclmulqdq,sse2")]
-    unsafe fn fold(a: __m128i, b: __m128i, keys: __m128i) -> __m128i {
+    fn fold(a: __m128i, b: __m128i, keys: __m128i) -> __m128i {
         let lo = _mm_clmulepi64_si128(a, keys, 0x00);
         let hi = _mm_clmulepi64_si128(a, keys, 0x11);
         _mm_xor_si128(_mm_xor_si128(b, lo), hi)
@@ -197,11 +211,16 @@ mod x86 {
     }
 
     #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
-    unsafe fn sha256_blocks_impl(state: &mut [u32; 8], data: &[u8]) {
+    fn sha256_blocks_impl(state: &mut [u32; 8], data: &[u8]) {
         // big-endian words: reverse the bytes of each 32-bit lane
         let swap = _mm_set_epi64x(0x0c0d_0e0f_0809_0a0b, 0x0405_0607_0001_0203);
-        let dcba = _mm_loadu_si128(state.as_ptr() as *const __m128i);
-        let hgfe = _mm_loadu_si128(state.as_ptr().add(4) as *const __m128i);
+        // SAFETY: `state` has 8 `u32` elements (two 16-byte unaligned loads).
+        let (dcba, hgfe) = unsafe {
+            (
+                _mm_loadu_si128(state.as_ptr() as *const __m128i),
+                _mm_loadu_si128(state.as_ptr().add(4) as *const __m128i),
+            )
+        };
 
         // sha256rnds2 wants the state as (a, b, e, f) and (c, d, g, h)
         let cdab = _mm_shuffle_epi32(dcba, 0xb1);
@@ -211,12 +230,21 @@ mod x86 {
 
         for block in data.chunks_exact(64) {
             let (abef_in, cdgh_in) = (abef, cdgh);
-            let at = block.as_ptr() as *const __m128i;
+            // SAFETY: `block` is 64 bytes (four 16-byte unaligned loads).
+            let raw = unsafe {
+                let at = block.as_ptr() as *const __m128i;
+                [
+                    _mm_loadu_si128(at),
+                    _mm_loadu_si128(at.add(1)),
+                    _mm_loadu_si128(at.add(2)),
+                    _mm_loadu_si128(at.add(3)),
+                ]
+            };
             let mut w = [
-                _mm_shuffle_epi8(_mm_loadu_si128(at), swap),
-                _mm_shuffle_epi8(_mm_loadu_si128(at.add(1)), swap),
-                _mm_shuffle_epi8(_mm_loadu_si128(at.add(2)), swap),
-                _mm_shuffle_epi8(_mm_loadu_si128(at.add(3)), swap),
+                _mm_shuffle_epi8(raw[0], swap),
+                _mm_shuffle_epi8(raw[1], swap),
+                _mm_shuffle_epi8(raw[2], swap),
+                _mm_shuffle_epi8(raw[3], swap),
             ];
             for i in 0..16 {
                 // w[i % 4] holds words 4i - 16 .. 4i - 13 until it is replaced
@@ -228,7 +256,8 @@ mod x86 {
                     );
                     w[i % 4] = _mm_sha256msg2_epu32(t, w[(i + 3) % 4]);
                 }
-                let k = _mm_loadu_si128(K256.as_ptr().add(i * 4) as *const __m128i);
+                // SAFETY: `K256` has 64 `u32` elements and `i * 4 + 4 <= 64`.
+                let k = unsafe { _mm_loadu_si128(K256.as_ptr().add(i * 4) as *const __m128i) };
                 let wk = _mm_add_epi32(w[i % 4], k);
                 cdgh = _mm_sha256rnds2_epu32(cdgh, abef, wk);
                 abef = _mm_sha256rnds2_epu32(abef, cdgh, _mm_shuffle_epi32(wk, 0x0e));
@@ -241,8 +270,11 @@ mod x86 {
         let dchg = _mm_shuffle_epi32(cdgh, 0xb1);
         let dcba = _mm_blend_epi16(feba, dchg, 0xf0);
         let hgef = _mm_alignr_epi8(dchg, feba, 8);
-        _mm_storeu_si128(state.as_mut_ptr() as *mut __m128i, dcba);
-        _mm_storeu_si128(state.as_mut_ptr().add(4) as *mut __m128i, hgef);
+        // SAFETY: `state` has 8 `u32` elements (two 16-byte unaligned stores).
+        unsafe {
+            _mm_storeu_si128(state.as_mut_ptr() as *mut __m128i, dcba);
+            _mm_storeu_si128(state.as_mut_ptr().add(4) as *mut __m128i, hgef);
+        }
     }
 }
 
@@ -260,7 +292,7 @@ mod arm {
     }
 
     #[target_feature(enable = "crc")]
-    unsafe fn crc32_fold_impl(mut crc: u32, data: &[u8]) -> u32 {
+    fn crc32_fold_impl(mut crc: u32, data: &[u8]) -> u32 {
         for word in data.chunks_exact(8) {
             let mut le = [0u8; 8];
             le.copy_from_slice(word);
@@ -272,23 +304,37 @@ mod arm {
     /// Compress the 64-byte blocks of `data` into `state`. The caller has
     /// checked for the sha2 extension.
     pub(super) fn sha256_blocks(state: &mut [u32; 8], data: &[u8]) {
-        // SAFETY: the caller checked the CPU feature.
+        // SAFETY: the caller checked the CPU feature (NEON is baseline on aarch64).
         unsafe { sha256_blocks_impl(state, data) }
     }
 
-    #[target_feature(enable = "sha2")]
-    unsafe fn sha256_blocks_impl(state: &mut [u32; 8], data: &[u8]) {
-        let mut abcd = vld1q_u32(state.as_ptr());
-        let mut efgh = vld1q_u32(state.as_ptr().add(4));
+    #[target_feature(enable = "neon,sha2")]
+    fn sha256_blocks_impl(state: &mut [u32; 8], data: &[u8]) {
+        // SAFETY: `state` has 8 `u32` elements (two 16-byte loads).
+        let (mut abcd, mut efgh) = unsafe {
+            (
+                vld1q_u32(state.as_ptr()),
+                vld1q_u32(state.as_ptr().add(4)),
+            )
+        };
         for block in data.chunks_exact(64) {
             let (abcd_in, efgh_in) = (abcd, efgh);
-            let at = block.as_ptr();
+            // SAFETY: `block` is 64 bytes (four 16-byte loads).
+            let raw = unsafe {
+                let at = block.as_ptr();
+                [
+                    vld1q_u8(at),
+                    vld1q_u8(at.add(16)),
+                    vld1q_u8(at.add(32)),
+                    vld1q_u8(at.add(48)),
+                ]
+            };
             // big-endian words: reverse the bytes of each 32-bit lane
             let mut w = [
-                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(at))),
-                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(at.add(16)))),
-                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(at.add(32)))),
-                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(at.add(48)))),
+                vreinterpretq_u32_u8(vrev32q_u8(raw[0])),
+                vreinterpretq_u32_u8(vrev32q_u8(raw[1])),
+                vreinterpretq_u32_u8(vrev32q_u8(raw[2])),
+                vreinterpretq_u32_u8(vrev32q_u8(raw[3])),
             ];
             for i in 0..16 {
                 // w[i % 4] holds words 4i - 16 .. 4i - 13 until it is replaced
@@ -300,7 +346,9 @@ mod arm {
                         w[(i + 3) % 4],
                     );
                 }
-                let wk = vaddq_u32(w[i % 4], vld1q_u32(K256.as_ptr().add(i * 4)));
+                // SAFETY: `K256` has 64 `u32` elements and `i * 4 + 4 <= 64`.
+                let k = unsafe { vld1q_u32(K256.as_ptr().add(i * 4)) };
+                let wk = vaddq_u32(w[i % 4], k);
                 let abcd_before = abcd;
                 abcd = vsha256hq_u32(abcd, efgh, wk);
                 efgh = vsha256h2q_u32(efgh, abcd_before, wk);
@@ -308,8 +356,11 @@ mod arm {
             abcd = vaddq_u32(abcd, abcd_in);
             efgh = vaddq_u32(efgh, efgh_in);
         }
-        vst1q_u32(state.as_mut_ptr(), abcd);
-        vst1q_u32(state.as_mut_ptr().add(4), efgh);
+        // SAFETY: `state` has 8 `u32` elements (two 16-byte stores).
+        unsafe {
+            vst1q_u32(state.as_mut_ptr(), abcd);
+            vst1q_u32(state.as_mut_ptr().add(4), efgh);
+        }
     }
 }
 

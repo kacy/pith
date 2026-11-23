@@ -58,15 +58,11 @@ pub struct PithMutex {
 
 pub type PithMutexHandle = PithMutex;
 
-unsafe fn mutex_ref<'a>(handle: *mut PithMutexHandle) -> Option<&'a PithMutex> {
-    sync_handle::header_of(handle as *const (), MUTEX_MAGIC, crate::quarantine::Op::Use)?;
-    Some(&*(handle as *const PithMutex))
-}
-
 /// the last count is gone: nothing can be parked on the lock, since a parked
 /// task holds a count of its own.
 pub(crate) unsafe fn free_mutex(p: *mut PithMutex) {
-    sync_handle::free_box(p);
+    // SAFETY: Caller guarantees `p` is an unowned `PithMutex` from `Box::into_raw`.
+    unsafe { sync_handle::free_box(p) };
 }
 
 fn lock_waiters(m: &PithMutex) -> std::sync::MutexGuard<'_, Vec<usize>> {
@@ -156,23 +152,63 @@ pub extern "C" fn pith_mutex_new() -> *mut PithMutexHandle {
     }))
 }
 
-/// Lock the mutex
-///
-/// # Safety
-/// handle must be a valid mutex handle obtained from pith_mutex_new
-#[no_mangle]
-pub unsafe extern "C" fn pith_mutex_lock(handle: *mut PithMutexHandle) {
-    let Some(m) = mutex_ref(handle) else {
-        return;
-    };
+#[cold]
+#[inline(never)]
+fn lock_contended(m: &PithMutex) {
     // inside a green task, park on contention. otherwise (main thread,
     // os-thread backend) spin, then yield the thread.
     match green::current_task() {
         Some(id) => lock_green(m, id),
         None => lock_os(m),
     }
+}
+
+#[cold]
+#[inline(never)]
+fn unlock_wake_waiters(m: &PithMutex) {
+    let mut waiters = lock_waiters(m);
+    for id in waiters.drain(..) {
+        green::wake_in_place(id);
+    }
+}
+
+#[inline(always)]
+fn lock_mutex(m: &PithMutex, handle_addr: usize) {
+    if !try_acquire(m) {
+        lock_contended(m);
+    }
     // an isolated call that fails while holding the lock gives it back.
-    crate::failure::note_lock(handle as usize);
+    crate::failure::note_lock(handle_addr);
+}
+
+#[inline(always)]
+fn unlock_mutex(m: &PithMutex, handle_addr: usize) {
+    crate::failure::note_unlock(handle_addr);
+    // wake any green tasks parked on this lock so they retry their acquire.
+    // only a parked green task sets state 2, so an unlock with no one waiting
+    // never takes the waiter lock. an os-thread waiter spins and needs no
+    // signal.
+    if m.state.swap(0, Ordering::Release) == 2 {
+        unlock_wake_waiters(m);
+    }
+}
+
+/// Lock the mutex
+///
+/// # Safety
+/// handle must be a valid mutex handle obtained from pith_mutex_new
+#[no_mangle]
+pub unsafe extern "C" fn pith_mutex_lock(handle: *mut PithMutexHandle) {
+    let addr = handle as usize;
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithMutex`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            MUTEX_MAGIC,
+            crate::quarantine::Op::Use,
+            |m| lock_mutex(m, addr),
+        )
+    };
 }
 
 /// Unlock the mutex
@@ -181,26 +217,36 @@ pub unsafe extern "C" fn pith_mutex_lock(handle: *mut PithMutexHandle) {
 /// handle must be a valid locked mutex handle
 #[no_mangle]
 pub unsafe extern "C" fn pith_mutex_unlock(handle: *mut PithMutexHandle) {
-    let Some(m) = mutex_ref(handle) else {
-        return;
+    let addr = handle as usize;
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithMutex`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            MUTEX_MAGIC,
+            crate::quarantine::Op::Use,
+            |m| unlock_mutex(m, addr),
+        )
     };
-    crate::failure::note_unlock(handle as usize);
-    // wake any green tasks parked on this lock so they retry their acquire.
-    // only a parked green task sets state 2, so an unlock with no one waiting
-    // never takes the waiter lock. an os-thread waiter spins and needs no
-    // signal.
-    if m.state.swap(0, Ordering::Release) == 2 {
-        let mut waiters = lock_waiters(m);
-        for id in waiters.drain(..) {
-            green::wake_in_place(id);
-        }
-    }
+}
+
+#[cfg(test)]
+fn mutex_green_waiters_len(m: &PithMutex) -> usize {
+    lock_waiters(m).len()
 }
 
 /// how many green waiter entries the mutex lists.
 #[cfg(test)]
 pub(crate) unsafe fn green_waiters_for_tests(handle: *mut PithMutexHandle) -> usize {
-    mutex_ref(handle).map_or(0, |m| lock_waiters(m).len())
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithMutex`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            MUTEX_MAGIC,
+            crate::quarantine::Op::Use,
+            mutex_green_waiters_len,
+        )
+    }
+    .unwrap_or(0)
 }
 
 #[cfg(test)]

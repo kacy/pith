@@ -1,23 +1,10 @@
-use crate::ffi_util::{result_err, result_ok, ResultPair};
+use crate::ffi_util::{result_err, result_ok, with_cstr_bytes, with_cstr_str, ResultPair};
+use std::mem::MaybeUninit;
 
-unsafe fn parse_error(message: &[u8]) -> ResultPair {
-    result_err(message)
-}
-
-/// Parse a string to an int, as the (is_ok, payload) register pair: the value,
-/// or an owned message (`invalid integer`, `integer overflow`).
-///
-/// # Safety
-/// s must be a valid null-terminated C string
-#[no_mangle]
-pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> ResultPair {
-    if s.is_null() {
-        return parse_error(b"invalid integer");
-    }
-    let len = crate::string::pith_cstring_len(s) as usize;
-    let slice = std::slice::from_raw_parts(s as *const u8, len);
+#[inline(always)]
+fn parse_int_impl(slice: &[u8]) -> ResultPair {
     let mut start = 0;
-    let mut end = len;
+    let mut end = slice.len();
     while start < end && slice[start].is_ascii_whitespace() {
         start += 1;
     }
@@ -25,7 +12,7 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> ResultPair {
         end -= 1;
     }
     if start == end {
-        return parse_error(b"invalid integer");
+        return result_err(b"invalid integer");
     }
     let mut pos = start;
     let mut negative = false;
@@ -33,7 +20,7 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> ResultPair {
         negative = slice[pos] == b'-';
         pos += 1;
         if pos == end {
-            return parse_error(b"invalid integer");
+            return result_err(b"invalid integer");
         }
     }
     let limit = if negative {
@@ -45,11 +32,11 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> ResultPair {
     while pos < end {
         let digit = slice[pos];
         if !digit.is_ascii_digit() {
-            return parse_error(b"invalid integer");
+            return result_err(b"invalid integer");
         }
         let digit_value = (digit - b'0') as u64;
         if value > (limit - digit_value) / 10 {
-            return parse_error(b"integer overflow");
+            return result_err(b"integer overflow");
         }
         value = value * 10 + digit_value;
         pos += 1;
@@ -66,34 +53,11 @@ pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> ResultPair {
     result_ok(parsed)
 }
 
-/// Parse a string to a float, as the (is_ok, payload) register pair that
-/// parse_int returns, with the payload holding the f64's bit pattern so every
-/// value, a signed zero included, round-trips.
-///
-/// The text is trimmed of whitespace and converted by std's
-/// `f64::from_str`: an optional sign, digits with an optional fraction
-/// (`5`, `5.`, `.5`, `5.25`) and an optional exponent. A value too small
-/// for the type rounds to a zero of the text's sign and is a success. The
-/// failures are text that is not a number (`invalid float`), an exponent
-/// past the type's range (`float out of range`), and the spellings of a
-/// NaN or an infinity (`float is not finite`), because a parsed float is
-/// always finite.
-///
-/// # Safety
-/// s must be a valid null-terminated C string
-#[no_mangle]
-pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> ResultPair {
-    if s.is_null() {
-        return parse_error(b"invalid float");
-    }
-    let len = crate::string::pith_cstring_len(s) as usize;
-    let slice = std::slice::from_raw_parts(s as *const u8, len);
-    let Ok(text) = std::str::from_utf8(slice) else {
-        return parse_error(b"invalid float");
-    };
+#[inline(always)]
+fn parse_float_impl(text: &str) -> ResultPair {
     let text = text.trim();
     let Ok(value) = text.parse::<f64>() else {
-        return parse_error(b"invalid float");
+        return result_err(b"invalid float");
     };
     if !value.is_finite() {
         // from_str spells a NaN or an infinity with letters, so text with
@@ -102,28 +66,17 @@ pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> ResultPair {
             .bytes()
             .any(|b| b.is_ascii_alphabetic() && b != b'e' && b != b'E')
         {
-            return parse_error(b"float is not finite");
+            return result_err(b"float is not finite");
         }
-        return parse_error(b"float out of range");
+        return result_err(b"float out of range");
     }
     result_ok(value.to_bits() as i64)
 }
 
-/// Base64-encode a C string into a new C string.
-///
-/// # Safety
-/// s must be a valid null-terminated C string
-#[no_mangle]
-pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
-    if s.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let len = crate::string::pith_cstring_len(s) as usize;
-    let input = std::slice::from_raw_parts(s as *const u8, len);
-
+fn b64_encode_impl(input: &[u8]) -> *mut i8 {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out: Vec<u8> = Vec::with_capacity((len + 2) / 3 * 4 + 1);
+    let len = input.len();
+    let mut out: Vec<u8> = Vec::with_capacity((len + 2) / 3 * 4);
     let mut i = 0;
     while i < len {
         let b0 = input[i];
@@ -145,9 +98,85 @@ pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
 
         i += 3;
     }
-    out.push(0);
 
-    crate::pith_copy_bytes_to_cstring(&out[..out.len() - 1])
+    crate::pith_copy_bytes_to_cstring(&out)
+}
+
+fn hex_encode_impl(input: &[u8]) -> *mut i8 {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let out_len = input.len() * 2;
+    // SAFETY: `pith_alloc_cstring(out_len)` returns a fresh writable buffer of
+    // `out_len` bytes (plus trailing NUL) that we exclusively own.
+    let ptr = unsafe { crate::pith_alloc_cstring(out_len) };
+    // SAFETY: `ptr` points to `out_len` writable (uninitialized) bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, out_len) };
+    for (chunk, &byte) in out.chunks_exact_mut(2).zip(input) {
+        chunk[0].write(HEX[(byte >> 4) as usize]);
+        chunk[1].write(HEX[(byte & 0xf) as usize]);
+    }
+    ptr
+}
+
+fn from_hex_impl(input: &[u8]) -> *mut i8 {
+    if input.len() % 2 != 0 {
+        return std::ptr::null_mut();
+    }
+    let out_len = input.len() / 2;
+    // SAFETY: `pith_alloc_cstring(out_len)` returns a fresh writable buffer of
+    // `out_len` bytes (plus trailing NUL) that we exclusively own.
+    let ptr = unsafe { crate::pith_alloc_cstring(out_len) };
+    // SAFETY: `ptr` points to `out_len` writable (uninitialized) bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, out_len) };
+    for (slot, pair) in out.iter_mut().zip(input.chunks_exact(2)) {
+        let hi = hex_digit(pair[0]);
+        let lo = hex_digit(pair[1]);
+        slot.write((hi << 4) | lo);
+    }
+    ptr
+}
+
+/// Parse a string to an int, as the (is_ok, payload) register pair: the value,
+/// or an owned message (`invalid integer`, `integer overflow`).
+///
+/// # Safety
+/// s must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn pith_parse_int(s: *const i8) -> ResultPair {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, parse_int_impl) }
+        .unwrap_or_else(|| result_err(b"invalid integer"))
+}
+
+/// Parse a string to a float, as the (is_ok, payload) register pair that
+/// parse_int returns, with the payload holding the f64's bit pattern so every
+/// value, a signed zero included, round-trips.
+///
+/// The text is trimmed of whitespace and converted by std's
+/// `f64::from_str`: an optional sign, digits with an optional fraction
+/// (`5`, `5.`, `.5`, `5.25`) and an optional exponent. A value too small
+/// for the type rounds to a zero of the text's sign and is a success. The
+/// failures are text that is not a number (`invalid float`), an exponent
+/// past the type's range (`float out of range`), and the spellings of a
+/// NaN or an infinity (`float is not finite`), because a parsed float is
+/// always finite.
+///
+/// # Safety
+/// s must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn pith_parse_float(s: *const i8) -> ResultPair {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_str(s, parse_float_impl) }
+        .unwrap_or_else(|| result_err(b"invalid float"))
+}
+
+/// Base64-encode a C string into a new C string.
+///
+/// # Safety
+/// s must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, b64_encode_impl) }.unwrap_or(std::ptr::null_mut())
 }
 
 /// Hex-encode a C string into a new C string.
@@ -156,22 +185,8 @@ pub unsafe extern "C" fn pith_b64_encode(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
-    if s.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let len = crate::string::pith_cstring_len(s) as usize;
-    let input = std::slice::from_raw_parts(s as *const u8, len);
-    let ptr = crate::pith_alloc_cstring(len * 2) as *mut u8;
-
-    for (i, &byte) in input.iter().enumerate() {
-        let hi = (byte >> 4) as usize;
-        let lo = (byte & 0xf) as usize;
-        const HEX: &[u8] = b"0123456789abcdef";
-        *ptr.add(i * 2) = HEX[hi];
-        *ptr.add(i * 2 + 1) = HEX[lo];
-    }
-    ptr as *mut i8
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, hex_encode_impl) }.unwrap_or(std::ptr::null_mut())
 }
 
 /// Decode a hex string back to the original string
@@ -180,24 +195,8 @@ pub unsafe extern "C" fn pith_hex_encode(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string of hex digits
 #[no_mangle]
 pub unsafe extern "C" fn pith_from_hex(s: *const i8) -> *mut i8 {
-    if s.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let len = crate::string::pith_cstring_len(s) as usize;
-    if len % 2 != 0 {
-        return std::ptr::null_mut();
-    }
-    let input = std::slice::from_raw_parts(s as *const u8, len);
-    let out_len = len / 2;
-    let ptr = crate::pith_alloc_cstring(out_len) as *mut u8;
-
-    for i in 0..out_len {
-        let hi = hex_digit(input[i * 2]);
-        let lo = hex_digit(input[i * 2 + 1]);
-        *ptr.add(i) = (hi << 4) | lo;
-    }
-    ptr as *mut i8
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, from_hex_impl) }.unwrap_or(std::ptr::null_mut())
 }
 
 fn hex_digit(b: u8) -> u8 {

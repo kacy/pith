@@ -121,7 +121,7 @@ pub extern "C" fn pith_green_cross_thread_probe() -> i64 {
         Err(_) => encode_probe(n, None, None, false),
     };
     // the task is done and nobody awaits it: give its block back.
-    let _ = unsafe { green_await(make_handle(id, generation)) };
+    let _ = green_await(make_handle(id, generation));
     result
 }
 

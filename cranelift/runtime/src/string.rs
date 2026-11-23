@@ -34,20 +34,36 @@ pub static EMPTY_STRING: PithString = PithString {
     is_heap: false,
 };
 
-/// Borrow a PithString's bytes as &str without copying.
+/// Borrow a PithString's bytes as `&str` for the duration of `f` without copying.
 ///
-/// Falls back to "" on invalid utf-8, matching what the old arc round-trip
+/// Falls back to `""` on invalid utf-8, matching what the old arc round-trip
 /// did. The runtime only constructs valid utf-8, so the check is a guard,
 /// not a code path programs rely on.
 ///
 /// # Safety
-/// The PithString's ptr/len must describe live memory.
-unsafe fn as_str<'a>(s: &PithString) -> &'a str {
+/// The PithString's ptr/len must describe live memory for the duration of `f`.
+#[inline(always)]
+unsafe fn with_pith_str<R>(s: &PithString, f: impl FnOnce(&str) -> R) -> R {
     if s.len <= 0 || s.ptr.is_null() {
-        return "";
+        return f("");
     }
-    let slice = std::slice::from_raw_parts(s.ptr, s.len as usize);
-    std::str::from_utf8(slice).unwrap_or("")
+    // SAFETY: Caller guarantees `s.ptr` is readable for `s.len` bytes for `f`.
+    let slice = unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) };
+    f(std::str::from_utf8(slice).unwrap_or(""))
+}
+
+/// Borrow two PithStrings as `&str` for the duration of `f`.
+///
+/// # Safety
+/// Both PithStrings' ptr/len must describe live memory for the duration of `f`.
+#[inline(always)]
+unsafe fn with_pith_str2<R>(
+    a: &PithString,
+    b: &PithString,
+    f: impl FnOnce(&str, &str) -> R,
+) -> R {
+    // SAFETY: Preconditions forwarded from caller; both borrows are shared.
+    unsafe { with_pith_str(a, |a_str| with_pith_str(b, |b_str| f(a_str, b_str))) }
 }
 
 /// Allocate one runtime buffer and copy `text` into it.
@@ -63,7 +79,9 @@ pub fn pith_from_str(text: &str) -> PithString {
 
     let len = text.len();
     let layout = crate::pith_layout(len, 1);
+    // SAFETY: `layout` has non-zero size (`text` is non-empty) and alignment 1.
     let ptr = unsafe { crate::pith_alloc(layout) };
+    // SAFETY: `ptr` is freshly allocated with `len` writable bytes and does not alias `text`.
     unsafe {
         std::ptr::copy_nonoverlapping(text.as_bytes().as_ptr(), ptr, len);
     }
@@ -73,6 +91,29 @@ pub fn pith_from_str(text: &str) -> PithString {
         len: len as i64,
         is_heap: true,
     }
+}
+
+#[inline(always)]
+fn string_from_utf8_bytes(slice: &[u8]) -> PithString {
+    match std::str::from_utf8(slice) {
+        Ok(text) => pith_from_str(text),
+        Err(_) => EMPTY_STRING,
+    }
+}
+
+#[inline(always)]
+fn substring_impl(text: &str, start: i64, end: i64) -> PithString {
+    // .get() rather than slice syntax: a range that lands inside a utf-8
+    // sequence yields "" instead of a panic.
+    match text.get(start as usize..end as usize) {
+        Some(substr) => pith_from_str(substr),
+        None => EMPTY_STRING,
+    }
+}
+
+#[inline(always)]
+fn trim_impl(text: &str) -> PithString {
+    pith_from_str(text.trim())
 }
 
 /// Create a new heap-allocated string by copying data
@@ -85,11 +126,9 @@ pub unsafe extern "C" fn pith_string_new(data: *const u8, len: i64) -> PithStrin
         return EMPTY_STRING;
     }
 
-    let slice = std::slice::from_raw_parts(data, len as usize);
-    match std::str::from_utf8(slice) {
-        Ok(text) => pith_from_str(text),
-        Err(_) => EMPTY_STRING,
-    }
+    // SAFETY: Caller guarantees `data` is readable for `len` bytes.
+    let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    string_from_utf8_bytes(slice)
 }
 
 /// Create a string from a C string (null-terminated)
@@ -100,14 +139,17 @@ pub unsafe extern "C" fn pith_string_from_cstr(cstr: *const i8) -> PithString {
     }
 
     // Manual strlen
-    let mut len = 0;
+    let mut len = 0i64;
     let mut p = cstr;
-    while *p != 0 {
+    // SAFETY: Caller guarantees `cstr` points to a NUL-terminated C string.
+    while unsafe { *p } != 0 {
         len += 1;
-        p = p.add(1);
+        // SAFETY: Advancing within the NUL-terminated C string.
+        p = unsafe { p.add(1) };
     }
 
-    pith_string_new(cstr as *const u8, len)
+    // SAFETY: `cstr` was measured to be readable for `len` bytes.
+    unsafe { pith_string_new(cstr as *const u8, len) }
 }
 
 /// Retain a string.
@@ -136,7 +178,8 @@ pub unsafe extern "C" fn pith_string_release(s: PithString) {
 
     // Free the allocated memory
     let layout = crate::pith_layout(s.len as usize, 1);
-    dealloc(s.ptr as *mut u8, layout);
+    // SAFETY: Caller transfers ownership of a heap buffer allocated by `pith_from_str`.
+    unsafe { dealloc(s.ptr as *mut u8, layout) };
 }
 
 /// Get string length in bytes
@@ -152,12 +195,8 @@ pub unsafe extern "C" fn pith_string_substring(s: PithString, start: i64, end: i
         return EMPTY_STRING;
     }
 
-    // .get() rather than slice syntax: a range that lands inside a utf-8
-    // sequence yields "" instead of a panic.
-    match as_str(&s).get(start as usize..end as usize) {
-        Some(substr) => pith_from_str(substr),
-        None => EMPTY_STRING,
-    }
+    // SAFETY: Caller guarantees `s` describes live memory for this call.
+    unsafe { with_pith_str(&s, |text| substring_impl(text, start, end)) }
 }
 
 /// Check if string contains substring
@@ -170,7 +209,8 @@ pub extern "C" fn pith_string_contains(haystack: PithString, needle: PithString)
         return false;
     }
 
-    unsafe { as_str(&haystack).contains(as_str(&needle)) }
+    // SAFETY: Caller guarantees both `PithString`s describe live memory for this call.
+    unsafe { with_pith_str2(&haystack, &needle, |h, n| h.contains(n)) }
 }
 
 /// Check if string starts with prefix
@@ -183,7 +223,8 @@ pub extern "C" fn pith_string_starts_with(s: PithString, prefix: PithString) -> 
         return true;
     }
 
-    unsafe { as_str(&s).starts_with(as_str(&prefix)) }
+    // SAFETY: Caller guarantees both `PithString`s describe live memory for this call.
+    unsafe { with_pith_str2(&s, &prefix, |text, p| text.starts_with(p)) }
 }
 
 /// Check if string ends with suffix
@@ -196,7 +237,8 @@ pub extern "C" fn pith_string_ends_with(s: PithString, suffix: PithString) -> bo
         return true;
     }
 
-    unsafe { as_str(&s).ends_with(as_str(&suffix)) }
+    // SAFETY: Caller guarantees both `PithString`s describe live memory for this call.
+    unsafe { with_pith_str2(&s, &suffix, |text, suf| text.ends_with(suf)) }
 }
 
 /// Trim whitespace from both ends
@@ -206,7 +248,8 @@ pub unsafe extern "C" fn pith_string_trim(s: PithString) -> PithString {
         return EMPTY_STRING;
     }
 
-    pith_from_str(as_str(&s).trim())
+    // SAFETY: Caller guarantees `s` describes live memory for this call.
+    unsafe { with_pith_str(&s, trim_impl) }
 }
 
 /// The byte length of a cstring: read from the header when it has one,
@@ -216,22 +259,24 @@ pub extern "C" fn pith_cstring_len(cstr: *const i8) -> i64 {
     if cstr.is_null() {
         return 0;
     }
-    unsafe {
-        // heap cstrings carry their length in the refcount header, which
-        // turns every s.len(), including loops over multi-megabyte
-        // strings, into one read instead of a strlen
-        if let Some(len) = crate::cstring_header_len(cstr) {
-            return len;
-        }
-        crate::runtime_core::cstring_check_freed(cstr);
-        let mut len = 0i64;
-        let mut p = cstr;
-        while *p != 0 {
-            len += 1;
-            p = p.add(1);
-        }
-        len
+    // heap cstrings carry their length in the refcount header, which
+    // turns every s.len(), including loops over multi-megabyte
+    // strings, into one read instead of a strlen
+    // SAFETY: `cstr` is non-null; `cstring_header_len` validates alignment and magic.
+    if let Some(len) = unsafe { crate::cstring_header_len(cstr) } {
+        return len;
     }
+    // SAFETY: Under quarantine, reports if `cstr` points to a freed heap string.
+    unsafe { crate::runtime_core::cstring_check_freed(cstr) };
+    let mut len = 0i64;
+    let mut p = cstr;
+    // SAFETY: Caller guarantees `cstr` points to a NUL-terminated C string.
+    while unsafe { *p } != 0 {
+        len += 1;
+        // SAFETY: Advancing within the NUL-terminated C string.
+        p = unsafe { p.add(1) };
+    }
+    len
 }
 
 /// ABI wrapper for pith_string_contains - takes pointers to PithStrings
@@ -243,15 +288,9 @@ pub extern "C" fn pith_string_contains_ptr(
     if haystack_ptr.is_null() || needle_ptr.is_null() {
         return 0;
     }
-    unsafe {
-        let haystack = &*haystack_ptr;
-        let needle = &*needle_ptr;
-        if pith_string_contains(*haystack, *needle) {
-            1
-        } else {
-            0
-        }
-    }
+    // SAFETY: Non-null pointers to valid `PithString` values guaranteed by caller.
+    let (haystack, needle) = unsafe { (*haystack_ptr, *needle_ptr) };
+    i64::from(pith_string_contains(haystack, needle))
 }
 
 /// ABI wrapper for pith_string_starts_with
@@ -263,13 +302,9 @@ pub extern "C" fn pith_string_starts_with_ptr(
     if s_ptr.is_null() || prefix_ptr.is_null() {
         return 0;
     }
-    unsafe {
-        if pith_string_starts_with(*s_ptr, *prefix_ptr) {
-            1
-        } else {
-            0
-        }
-    }
+    // SAFETY: Non-null pointers to valid `PithString` values guaranteed by caller.
+    let (s, prefix) = unsafe { (*s_ptr, *prefix_ptr) };
+    i64::from(pith_string_starts_with(s, prefix))
 }
 
 #[cfg(test)]

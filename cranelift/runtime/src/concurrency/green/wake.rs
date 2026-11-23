@@ -221,8 +221,9 @@ pub(crate) fn wake_with<F: FnOnce() -> Option<i64>>(id: TaskId, fetch: F) {
     // until the task is enqueued (below) and resumed: a Parked task is in no
     // queue, and every other waker now reads Ready and no-ops. see the field
     // doc on `SyncBlock::handoff` for the publication argument.
+    let value = fetch();
     // SAFETY: exclusive by the claim, as documented on the field.
-    unsafe { *block.handoff.get() = fetch() };
+    unsafe { *block.handoff.get() = value };
     match owner {
         Some(w) => enqueue_woken(w, id),
         None => enqueue_fresh(id),

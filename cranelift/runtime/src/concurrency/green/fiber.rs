@@ -147,11 +147,9 @@ impl Fiber {
         #[cfg(not(pith_asan))]
         let _ = stack;
         #[cfg(pith_tsan)]
-        // SAFETY: plain tsan bookkeeping; the fiber is destroyed by `retire`.
-        unsafe {
-            if self.fiber.get().is_null() {
-                self.fiber.set(__tsan_create_fiber(0));
-            }
+        if self.fiber.get().is_null() {
+            // SAFETY: plain tsan bookkeeping; the fiber is destroyed by `retire`.
+            self.fiber.set(unsafe { __tsan_create_fiber(0) });
         }
     }
 
@@ -257,12 +255,12 @@ impl Fiber {
     #[inline(always)]
     pub(super) fn retire(&self) {
         #[cfg(pith_tsan)]
-        // SAFETY: the task's body has finished and `back` has restored the
-        // worker's fiber, so nothing runs on this one again.
-        unsafe {
+        {
             let fiber = self.fiber.replace(std::ptr::null_mut());
             if !fiber.is_null() {
-                __tsan_destroy_fiber(fiber);
+                // SAFETY: the task's body has finished and `back` has restored the
+                // worker's fiber, so nothing runs on this one again.
+                unsafe { __tsan_destroy_fiber(fiber) };
             }
         }
     }

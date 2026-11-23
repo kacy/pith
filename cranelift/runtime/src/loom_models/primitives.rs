@@ -67,13 +67,16 @@ fn loom_mutex_two_green_tasks() {
         let other = Arc::clone(&m);
         let t = thread::spawn(move || {
             other.lock(1);
+            // SAFETY: Protected by `PithMutex::lock`.
             other.guarded.with_mut(|n| unsafe { *n += 1 });
             other.unlock();
         });
         m.lock(0);
+        // SAFETY: Protected by `PithMutex::lock`.
         m.guarded.with_mut(|n| unsafe { *n += 1 });
         m.unlock();
         t.join().unwrap();
+        // SAFETY: Both threads finished; read of `guarded` is exclusive.
         assert_eq!(m.guarded.with(|n| unsafe { *n }), 2);
     });
 }

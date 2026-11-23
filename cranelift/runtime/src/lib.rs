@@ -13,6 +13,7 @@
 //! via a C-compatible FFI boundary.
 
 #![allow(clippy::missing_safety_doc)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
 /// Stop the process with a diagnostic, the way every other runtime trap does.
 ///

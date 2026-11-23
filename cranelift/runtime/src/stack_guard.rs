@@ -93,13 +93,12 @@ const SPARE_ALT_STACKS_MAX: usize = 64;
 #[cfg(not(any(pith_asan, pith_tsan)))]
 impl Drop for AltStack {
     fn drop(&mut self) {
+        // SAFETY: `libc::stack_t` is a C POD struct valid to zero-initialize.
+        let mut off: libc::stack_t = unsafe { std::mem::zeroed() };
+        off.ss_flags = libc::SS_DISABLE;
         // SAFETY: disables this thread's alternate stack, which is this
         // buffer, before the buffer is handed on or freed.
-        unsafe {
-            let mut off: libc::stack_t = std::mem::zeroed();
-            off.ss_flags = libc::SS_DISABLE;
-            libc::sigaltstack(&off, std::ptr::null_mut());
-        }
+        unsafe { libc::sigaltstack(&off, std::ptr::null_mut()) };
         let mut spare = crate::sync::lock(&SPARE_ALT_STACKS);
         if spare.len() < SPARE_ALT_STACKS_MAX {
             spare.push(std::mem::take(&mut self.buffer));
@@ -146,24 +145,27 @@ pub fn enter_thread() {
 /// what was there for faults that are not overflows.
 #[cfg(not(any(pith_asan, pith_tsan)))]
 fn install_handlers() {
-    // SAFETY: plain libc calls on locals. `PREVIOUS` is written here, once,
-    // as each handler goes in. in a program this runs from
-    // `pith_runtime_start`, before main has started any other thread, so no
-    // handler on another thread can read it mid-write.
-    unsafe {
-        let page = libc::sysconf(libc::_SC_PAGESIZE);
-        if page > 0 {
-            PAGE_SIZE.store(page as usize, Ordering::Relaxed);
-        }
-        for (i, &sig) in FAULT_SIGNALS.iter().enumerate() {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_fault as *const () as usize;
+    // SAFETY: `sysconf(_SC_PAGESIZE)` has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page > 0 {
+        PAGE_SIZE.store(page as usize, Ordering::Relaxed);
+    }
+    for (i, &sig) in FAULT_SIGNALS.iter().enumerate() {
+        // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = on_fault as *const () as usize;
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
+        // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: plain libc calls on stack-local structs initialized with a valid handler.
+        let installed = unsafe {
             libc::sigemptyset(&mut action.sa_mask);
-            action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
-            let mut previous: libc::sigaction = std::mem::zeroed();
-            if libc::sigaction(sig, &action, &mut previous) == 0 {
-                (*std::ptr::addr_of_mut!(PREVIOUS))[i] = Some(previous);
-            }
+            libc::sigaction(sig, &action, &mut previous) == 0
+        };
+        if installed {
+            // SAFETY: `PREVIOUS` is written here once via `Once::call_once`, before any
+            // other thread is spawned from `pith_runtime_start`, and only read thereafter.
+            unsafe { (*std::ptr::addr_of_mut!(PREVIOUS))[i] = Some(previous) };
         }
     }
 }
@@ -173,28 +175,26 @@ fn install_handlers() {
 /// the common case: the call that installs the stack also returns the old one.
 #[cfg(not(any(pith_asan, pith_tsan)))]
 fn install_alt_stack() -> Option<AltStack> {
-    // SAFETY: sets this thread's alternate stack, or puts back the one it
-    // had. the buffer is kept in the thread-local slot until thread exit, and
-    // `AltStack::drop` disables it first.
-    unsafe {
-        let spare = crate::sync::lock(&SPARE_ALT_STACKS)
-            .pop();
-        let mut buffer = spare.unwrap_or_else(|| Vec::with_capacity(ALT_STACK_SIZE));
-        let stack = libc::stack_t {
-            ss_sp: buffer.as_mut_ptr().cast(),
-            ss_flags: 0,
-            ss_size: ALT_STACK_SIZE,
-        };
-        let mut previous: libc::stack_t = std::mem::zeroed();
-        if libc::sigaltstack(&stack, &mut previous) != 0 {
-            return None;
-        }
-        if previous.ss_flags & libc::SS_DISABLE == 0 {
-            libc::sigaltstack(&previous, std::ptr::null_mut());
-            return None;
-        }
-        Some(AltStack { buffer })
+    let spare = crate::sync::lock(&SPARE_ALT_STACKS).pop();
+    let mut buffer = spare.unwrap_or_else(|| Vec::with_capacity(ALT_STACK_SIZE));
+    let stack = libc::stack_t {
+        ss_sp: buffer.as_mut_ptr().cast(),
+        ss_flags: 0,
+        ss_size: ALT_STACK_SIZE,
+    };
+    // SAFETY: `libc::stack_t` is a C POD struct valid to zero-initialize.
+    let mut previous: libc::stack_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `buffer` has capacity `ALT_STACK_SIZE` and stays pinned in thread-local
+    // `ALT_STACK` until `AltStack::drop` disables it.
+    if unsafe { libc::sigaltstack(&stack, &mut previous) } != 0 {
+        return None;
     }
+    if previous.ss_flags & libc::SS_DISABLE == 0 {
+        // SAFETY: Restores the existing alternate stack returned by `sigaltstack`.
+        unsafe { libc::sigaltstack(&previous, std::ptr::null_mut()) };
+        return None;
+    }
+    Some(AltStack { buffer })
 }
 
 /// the range of addresses below this thread's stack whose fault means an
@@ -242,32 +242,36 @@ fn main_thread_guard(page: usize) -> (usize, usize) {
 /// below it.
 #[cfg(all(target_os = "linux", not(any(pith_asan, pith_tsan))))]
 fn thread_stack_low() -> Option<(usize, usize)> {
-    // SAFETY: `pthread_getattr_np` fills an attribute object we own, which is
-    // read and then destroyed.
-    unsafe {
-        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
-            return None;
-        }
-        let mut addr: *mut libc::c_void = std::ptr::null_mut();
-        let mut size = 0usize;
-        let mut guard = 0usize;
-        let ok = libc::pthread_attr_getstack(&attr, &mut addr, &mut size) == 0
+    // SAFETY: `pthread_attr_t` is an opaque C struct initialized by `pthread_getattr_np`.
+    let mut attr: libc::pthread_attr_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `pthread_getattr_np` initializes `attr` for the calling thread.
+    if unsafe { libc::pthread_getattr_np(libc::pthread_self(), &mut attr) } != 0 {
+        return None;
+    }
+    let mut addr: *mut libc::c_void = std::ptr::null_mut();
+    let mut size = 0usize;
+    let mut guard = 0usize;
+    // SAFETY: `attr` was initialized by `pthread_getattr_np` and is destroyed before returning.
+    let ok = unsafe {
+        let got = libc::pthread_attr_getstack(&attr, &mut addr, &mut size) == 0
             && libc::pthread_attr_getguardsize(&attr, &mut guard) == 0;
         libc::pthread_attr_destroy(&mut attr);
-        ok.then_some((addr as usize, guard))
-    }
+        got
+    };
+    ok.then_some((addr as usize, guard))
 }
 
 #[cfg(all(target_os = "macos", not(any(pith_asan, pith_tsan))))]
 fn thread_stack_low() -> Option<(usize, usize)> {
     // SAFETY: both calls only read the calling thread's own attributes.
-    unsafe {
+    let (top, size) = unsafe {
         let this = libc::pthread_self();
-        let top = libc::pthread_get_stackaddr_np(this) as usize;
-        let size = libc::pthread_get_stacksize_np(this);
-        Some((top - size, PAGE_SIZE.load(Ordering::Relaxed)))
-    }
+        (
+            libc::pthread_get_stackaddr_np(this) as usize,
+            libc::pthread_get_stacksize_np(this),
+        )
+    };
+    Some((top - size, PAGE_SIZE.load(Ordering::Relaxed)))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", pith_asan, pith_tsan)))]
@@ -306,18 +310,23 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, _context: *
     }
     // not an overflow: put back what was there and let the fault happen again.
     let index = if sig == libc::SIGSEGV { 0 } else { 1 };
-    // SAFETY: `PREVIOUS` was written as this handler went in and is
-    // never written again. `sigaction` and `raise` are async-signal-safe.
-    unsafe {
-        match (*std::ptr::addr_of!(PREVIOUS))[index] {
-            Some(previous) => libc::sigaction(sig, &previous, std::ptr::null_mut()),
-            None => libc::signal(sig, libc::SIG_DFL) as libc::c_int,
-        };
-        // a fault re-raises itself when the instruction runs again; a signal
-        // someone sent does not, so send it again.
-        if code <= 0 {
-            libc::raise(sig);
+    // SAFETY: `PREVIOUS` was written once as this handler went in and is never written again.
+    let previous = unsafe { (*std::ptr::addr_of!(PREVIOUS))[index] };
+    match previous {
+        Some(previous) => {
+            // SAFETY: `sigaction` is async-signal-safe and `previous` is a saved disposition.
+            unsafe { libc::sigaction(sig, &previous, std::ptr::null_mut()) };
         }
+        None => {
+            // SAFETY: restoring `SIG_DFL` is async-signal-safe.
+            unsafe { libc::signal(sig, libc::SIG_DFL) };
+        }
+    }
+    // a fault re-raises itself when the instruction runs again; a signal
+    // someone sent does not, so send it again.
+    if code <= 0 {
+        // SAFETY: `raise` is async-signal-safe.
+        unsafe { libc::raise(sig) };
     }
 }
 

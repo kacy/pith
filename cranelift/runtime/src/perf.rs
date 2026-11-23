@@ -235,6 +235,7 @@ fn ensure_perf_report_registered() {
     if PERF_STATS_REGISTERED.swap(true, Ordering::Relaxed) {
         return;
     }
+    // SAFETY: `pith_perf_dump_stats_at_exit` is a valid `extern "C" fn()` registered once at exit.
     unsafe {
         libc::atexit(pith_perf_dump_stats_at_exit);
     }

@@ -3,51 +3,100 @@
 //! These are used by modules that need to convert between Rust strings
 //! and C strings at the runtime FFI boundary.
 
-/// Borrow bytes from a null-terminated C string pointer.
+/// Borrow bytes from a null-terminated C string pointer for the duration of `f`.
+///
+/// The borrow cannot escape the closure, preventing dangling references across
+/// handle release or mutation.
 ///
 /// # Safety
-/// `ptr` must be either null or a valid pointer to a null-terminated string.
-/// Rust cannot validate arbitrary non-null pointers, so callers must still
-/// uphold pointer validity before crossing this FFI boundary.
-pub unsafe fn cstr_bytes<'a>(ptr: *const i8) -> Option<&'a [u8]> {
+/// `ptr` must be either null or a valid pointer to a null-terminated string
+/// that remains immutable for the duration of `f`.
+#[inline(always)]
+pub unsafe fn with_cstr_bytes<R>(ptr: *const i8, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
     if ptr.is_null() {
         return None;
     }
-
     let len = crate::string::pith_cstring_len(ptr) as usize;
-    Some(std::slice::from_raw_parts(ptr as *const u8, len))
+    // SAFETY: Caller guarantees `ptr` points to a readable, null-terminated C string
+    // of length `len` that stays immutable for the duration of `f`.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    Some(f(bytes))
 }
 
-/// Borrow UTF-8 text from a null-terminated C string pointer.
+/// Borrow bytes from two null-terminated C string pointers for the duration of `f`.
 ///
 /// # Safety
-/// Same requirements as [`cstr_bytes`].
-pub unsafe fn cstr_str<'a>(ptr: *const i8) -> Option<&'a str> {
-    let bytes = cstr_bytes(ptr)?;
-    std::str::from_utf8(bytes).ok()
+/// Both pointers must be null or valid pointers to null-terminated strings that
+/// remain immutable for the duration of `f`.
+#[inline(always)]
+pub unsafe fn with_cstr_bytes2<R>(
+    a: *const i8,
+    b: *const i8,
+    f: impl FnOnce(&[u8], &[u8]) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_cstr_bytes(a, |a_bytes| with_cstr_bytes(b, |b_bytes| f(a_bytes, b_bytes))) }
+        .flatten()
 }
 
-/// Borrow UTF-8 text from a C string, defaulting to empty text on failure.
+/// Borrow UTF-8 text from a null-terminated C string pointer for the duration of `f`.
+///
+/// Returns `None` if `ptr` is null or not valid UTF-8.
 ///
 /// # Safety
-/// Same requirements as [`cstr_bytes`].
-pub unsafe fn cstr_str_or_empty<'a>(ptr: *const i8) -> &'a str {
-    cstr_str(ptr).unwrap_or("")
+/// Same requirements as [`with_cstr_bytes`].
+#[inline(always)]
+pub unsafe fn with_cstr_str<R>(ptr: *const i8, f: impl FnOnce(&str) -> R) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_cstr_bytes(ptr, |bytes| std::str::from_utf8(bytes).ok().map(f)) }.flatten()
+}
+
+/// Borrow UTF-8 text from two null-terminated C string pointers for the duration of `f`.
+///
+/// Returns `None` if either pointer is null or not valid UTF-8.
+///
+/// # Safety
+/// Same requirements as [`with_cstr_bytes2`].
+#[inline(always)]
+pub unsafe fn with_cstr_str2<R>(
+    a: *const i8,
+    b: *const i8,
+    f: impl FnOnce(&str, &str) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_cstr_str(a, |a_str| with_cstr_str(b, |b_str| f(a_str, b_str))) }.flatten()
+}
+
+/// Borrow UTF-8 text from a C string for the duration of `f`, passing `""` on null
+/// or invalid UTF-8.
+///
+/// # Safety
+/// Same requirements as [`with_cstr_bytes`].
+#[inline(always)]
+pub unsafe fn with_cstr_str_or_empty<R>(ptr: *const i8, f: impl FnOnce(&str) -> R) -> R {
+    if ptr.is_null() {
+        return f("");
+    }
+    let len = crate::string::pith_cstring_len(ptr) as usize;
+    // SAFETY: Caller guarantees `ptr` points to a readable, null-terminated C string
+    // of length `len` that stays immutable for the duration of `f`.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    f(std::str::from_utf8(bytes).unwrap_or(""))
 }
 
 /// Copy UTF-8 text from a C string into an owned Rust string.
 ///
 /// # Safety
-/// Same requirements as [`cstr_bytes`].
+/// Same requirements as [`with_cstr_str`].
 pub unsafe fn cstr_string(ptr: *const i8) -> Option<String> {
-    Some(cstr_str(ptr)?.to_string())
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_cstr_str(ptr, str::to_owned) }
 }
 
 /// Allocate a new null-terminated C string from a Rust `&str`.
 ///
-/// # Safety
-/// The caller is responsible for eventually freeing the returned pointer.
-pub unsafe fn alloc_cstring(s: &str) -> *mut i8 {
+/// The caller owns the returned pith string handle.
+pub fn alloc_cstring(s: &str) -> *mut i8 {
     crate::pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
@@ -86,10 +135,7 @@ pub fn result_ok(value: i64) -> ResultPair {
 }
 
 /// A failed result carrying a copy of `message`, which the caller then owns.
-///
-/// # Safety
-/// Allocates the message through the pith runtime.
-pub unsafe fn result_err(message: &[u8]) -> ResultPair {
+pub fn result_err(message: &[u8]) -> ResultPair {
     ResultPair {
         is_ok: 0,
         payload: crate::pith_copy_bytes_to_cstring(message) as i64,
@@ -100,10 +146,7 @@ pub unsafe fn result_err(message: &[u8]) -> ResultPair {
 /// `"<builtin> failed: <reason>"` on failure. The prefix is the message the
 /// compiler synthesized for these builtins before they reported their own
 /// reason, so a caller matching on it still matches.
-///
-/// # Safety
-/// Allocates the error message through the pith runtime; see [`result_err`].
-pub unsafe fn write_result(builtin: &str, outcome: Result<usize, String>) -> ResultPair {
+pub fn write_result(builtin: &str, outcome: Result<usize, String>) -> ResultPair {
     match outcome {
         Ok(count) => result_ok(count as i64),
         Err(reason) => result_err(format!("{builtin} failed: {reason}").as_bytes()),
@@ -122,8 +165,12 @@ pub(crate) unsafe fn unbox_result(pair: ResultPair) -> Result<i64, String> {
     }
     let err = pair.payload as *const std::os::raw::c_char;
     assert!(!err.is_null(), "a failed result carries no message");
-    let text = std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned();
-    crate::pith_cstring_release(err);
+    // SAFETY: Failed ResultPair carries an owned pith C string.
+    let text = unsafe { std::ffi::CStr::from_ptr(err) }
+        .to_string_lossy()
+        .into_owned();
+    // SAFETY: Caller transferred ownership of the error string in `pair`.
+    unsafe { crate::pith_cstring_release(err) };
     Err(text)
 }
 
@@ -133,12 +180,11 @@ mod tests {
 
     #[test]
     fn null_cstring_returns_safe_defaults() {
-        unsafe {
-            assert!(cstr_bytes(std::ptr::null()).is_none());
-            assert!(cstr_str(std::ptr::null()).is_none());
-            assert_eq!(cstr_str_or_empty(std::ptr::null()), "");
-            assert!(cstr_string(std::ptr::null()).is_none());
-        }
+        let null = std::ptr::null();
+        assert!(unsafe { with_cstr_bytes(null, |b| b.to_vec()) }.is_none());
+        assert!(unsafe { with_cstr_str(null, str::to_owned) }.is_none());
+        assert_eq!(unsafe { with_cstr_str_or_empty(null, str::to_owned) }, "");
+        assert!(unsafe { cstr_string(null) }.is_none());
     }
 
     #[test]
@@ -146,12 +192,10 @@ mod tests {
         let invalid = [0xffu8, 0x00];
         let ptr = invalid.as_ptr() as *const i8;
 
-        unsafe {
-            assert_eq!(cstr_bytes(ptr), Some(&invalid[..1]));
-            assert!(cstr_str(ptr).is_none());
-            assert_eq!(cstr_str_or_empty(ptr), "");
-            assert!(cstr_string(ptr).is_none());
-        }
+        assert_eq!(unsafe { with_cstr_bytes(ptr, |b| b.to_vec()) }, Some(invalid[..1].to_vec()));
+        assert!(unsafe { with_cstr_str(ptr, str::to_owned) }.is_none());
+        assert_eq!(unsafe { with_cstr_str_or_empty(ptr, str::to_owned) }, "");
+        assert!(unsafe { cstr_string(ptr) }.is_none());
     }
 
     #[test]
@@ -159,11 +203,193 @@ mod tests {
         let valid = b"pith\0";
         let ptr = valid.as_ptr() as *const i8;
 
-        unsafe {
-            assert_eq!(cstr_bytes(ptr), Some(&valid[..4]));
-            assert_eq!(cstr_str(ptr), Some("pith"));
-            assert_eq!(cstr_str_or_empty(ptr), "pith");
-            assert_eq!(cstr_string(ptr), Some("pith".to_string()));
+        assert_eq!(unsafe { with_cstr_bytes(ptr, |b| b.to_vec()) }, Some(valid[..4].to_vec()));
+        assert_eq!(unsafe { with_cstr_str(ptr, str::to_owned) }, Some("pith".to_string()));
+        assert_eq!(unsafe { with_cstr_str_or_empty(ptr, str::to_owned) }, "pith");
+        assert_eq!(unsafe { cstr_string(ptr) }, Some("pith".to_string()));
+    }
+
+    #[test]
+    fn with_cstr_bytes_handles_null_invalid_and_valid() {
+        let null = std::ptr::null();
+        let invalid = [0xffu8, 0xfe, 0x00];
+        let empty = b"\0";
+        let valid = b"pith\0";
+
+        let mut called = false;
+        assert_eq!(
+            unsafe {
+                with_cstr_bytes(null, |b| {
+                    called = true;
+                    b.len()
+                })
+            },
+            None
+        );
+        assert!(!called);
+
+        let inv_ptr = invalid.as_ptr() as *const i8;
+        assert_eq!(
+            unsafe { with_cstr_bytes(inv_ptr, |b| b.to_vec()) },
+            Some(vec![0xff, 0xfe])
+        );
+
+        let empty_ptr = empty.as_ptr() as *const i8;
+        assert_eq!(unsafe { with_cstr_bytes(empty_ptr, <[u8]>::len) }, Some(0));
+
+        let valid_ptr = valid.as_ptr() as *const i8;
+        assert_eq!(
+            unsafe { with_cstr_bytes(valid_ptr, |b| b.to_vec()) },
+            Some(b"pith".to_vec())
+        );
+    }
+
+    #[test]
+    fn with_cstr_bytes2_handles_null_invalid_and_valid() {
+        let null = std::ptr::null();
+        let a = b"hello\0";
+        let b = b"world\0";
+        let invalid = [0x80u8, 0x00];
+        let a_ptr = a.as_ptr() as *const i8;
+        let b_ptr = b.as_ptr() as *const i8;
+        let inv_ptr = invalid.as_ptr() as *const i8;
+
+        let mut called = false;
+        assert_eq!(
+            unsafe {
+                with_cstr_bytes2(null, b_ptr, |x, y| {
+                    called = true;
+                    x.len() + y.len()
+                })
+            },
+            None
+        );
+        assert_eq!(
+            unsafe {
+                with_cstr_bytes2(a_ptr, null, |x, y| {
+                    called = true;
+                    x.len() + y.len()
+                })
+            },
+            None
+        );
+        assert_eq!(
+            unsafe {
+                with_cstr_bytes2(null, null, |x, y| {
+                    called = true;
+                    x.len() + y.len()
+                })
+            },
+            None
+        );
+        assert!(!called);
+
+        assert_eq!(
+            unsafe { with_cstr_bytes2(inv_ptr, b_ptr, |x, y| (x.to_vec(), y.to_vec())) },
+            Some((vec![0x80], b"world".to_vec()))
+        );
+        assert_eq!(
+            unsafe { with_cstr_bytes2(a_ptr, b_ptr, |x, y| (x.to_vec(), y.to_vec())) },
+            Some((b"hello".to_vec(), b"world".to_vec()))
+        );
+    }
+
+    #[test]
+    fn with_cstr_str_handles_null_invalid_and_valid() {
+        let null = std::ptr::null();
+        let invalid = [0xffu8, 0x00];
+        let empty = b"\0";
+        let valid = b"pith\0";
+        let inv_ptr = invalid.as_ptr() as *const i8;
+        let empty_ptr = empty.as_ptr() as *const i8;
+        let valid_ptr = valid.as_ptr() as *const i8;
+
+        let mut called = false;
+        assert_eq!(
+            unsafe {
+                with_cstr_str(null, |s| {
+                    called = true;
+                    s.len()
+                })
+            },
+            None
+        );
+        assert_eq!(
+            unsafe {
+                with_cstr_str(inv_ptr, |s| {
+                    called = true;
+                    s.len()
+                })
+            },
+            None
+        );
+        assert!(!called);
+
+        assert_eq!(
+            unsafe { with_cstr_str(empty_ptr, str::to_owned) },
+            Some(String::new())
+        );
+        assert_eq!(
+            unsafe { with_cstr_str(valid_ptr, str::to_owned) },
+            Some("pith".to_string())
+        );
+    }
+
+    #[test]
+    fn with_cstr_str2_handles_null_invalid_and_valid() {
+        let null = std::ptr::null();
+        let invalid = [0xffu8, 0x00];
+        let a = b"foo\0";
+        let b = b"bar\0";
+        let inv_ptr = invalid.as_ptr() as *const i8;
+        let a_ptr = a.as_ptr() as *const i8;
+        let b_ptr = b.as_ptr() as *const i8;
+
+        let mut called = false;
+        for (lhs, rhs) in [
+            (null, b_ptr),
+            (a_ptr, null),
+            (null, null),
+            (inv_ptr, b_ptr),
+            (a_ptr, inv_ptr),
+        ] {
+            assert_eq!(
+                unsafe {
+                    with_cstr_str2(lhs, rhs, |x, y| {
+                        called = true;
+                        format!("{x}:{y}")
+                    })
+                },
+                None
+            );
         }
+        assert!(!called);
+
+        assert_eq!(
+            unsafe { with_cstr_str2(a_ptr, b_ptr, |x, y| format!("{x}:{y}")) },
+            Some("foo:bar".to_string())
+        );
+    }
+
+    #[test]
+    fn with_cstr_str_or_empty_handles_null_invalid_and_valid() {
+        let null = std::ptr::null();
+        let invalid = [0xffu8, 0x00];
+        let empty = b"\0";
+        let valid = b"pith\0";
+
+        assert_eq!(unsafe { with_cstr_str_or_empty(null, str::to_owned) }, "");
+        assert_eq!(
+            unsafe { with_cstr_str_or_empty(invalid.as_ptr() as *const i8, str::to_owned) },
+            ""
+        );
+        assert_eq!(
+            unsafe { with_cstr_str_or_empty(empty.as_ptr() as *const i8, str::to_owned) },
+            ""
+        );
+        assert_eq!(
+            unsafe { with_cstr_str_or_empty(valid.as_ptr() as *const i8, str::to_owned) },
+            "pith"
+        );
     }
 }

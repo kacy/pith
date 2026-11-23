@@ -5,7 +5,7 @@
 
 use crate::handle_registry::{self, HandleKind};
 use crate::ffi_util::ResultPair;
-use crate::runtime_core::{optional_from, optional_pair, optional_tuple};
+use crate::runtime_core::{optional_from, optional_pair};
 
 /// FFI-compatible list handle
 #[repr(C)]
@@ -80,7 +80,7 @@ pub const LIST_IMPL_TYPE_TAG_OFFSET: i32 = std::mem::offset_of!(ListImpl, type_t
 /// The Primitive tag's discriminant, for the codegen fast path: primitive
 /// elements carry no counts, so an in-bounds store needs no retain/release.
 pub const LIST_TYPE_TAG_PRIMITIVE: i32 = ListTypeTag::Primitive as i32;
-/// The alignment `list_ref` requires of a handle before it reads the magic
+/// The alignment `with_list_ref` requires of a handle before it reads the magic
 /// word; the codegen's strict `xs[i]` fast path applies the same test.
 pub const LIST_HANDLE_ALIGN: i64 = std::mem::align_of::<ListImpl>() as i64;
 
@@ -242,9 +242,12 @@ impl ListImpl {
 
     unsafe fn get_value_unchecked(&self, index: usize) -> i64 {
         if self.uses_value_storage() {
-            *self.values8.get_unchecked(index)
+            // SAFETY: Caller guarantees `index < self.len()`.
+            unsafe { *self.values8.get_unchecked(index) }
         } else {
-            Self::read_i64_padded(self.elements.get_unchecked(index))
+            // SAFETY: Caller guarantees `index < self.len()`.
+            let elem = unsafe { self.elements.get_unchecked(index) };
+            Self::read_i64_padded(elem)
         }
     }
 
@@ -339,16 +342,17 @@ pub(crate) unsafe fn retain_element(tag: ListTypeTag, raw: i64) {
     match tag {
         ListTypeTag::String => {
             crate::perf_count(&crate::PERF_CSTRING_RETAINS_PUSH, 1);
-            crate::pith_cstring_retain(raw as *const i8)
+            // SAFETY: Caller guarantees `raw` is a valid cstring handle for this tag.
+            unsafe { crate::pith_cstring_retain(raw as *const i8) };
         }
-        ListTypeTag::List => pith_list_retain_handle(raw),
-        ListTypeTag::Map => crate::collections::map::pith_map_retain_handle(raw),
-        ListTypeTag::Struct => crate::runtime_core::pith_struct_retain(raw),
-        ListTypeTag::Bytes => crate::bytes::pith_bytes_retain(raw),
-        ListTypeTag::Closure => crate::runtime_core::pith_closure_retain(raw),
-        ListTypeTag::Set => crate::collections::set::pith_set_retain_handle(raw),
-        ListTypeTag::Channel => crate::concurrency::channel::pith_channel_retain(raw),
-        ListTypeTag::Sync => crate::concurrency::sync_handle::pith_sync_retain(raw),
+        ListTypeTag::List => unsafe { pith_list_retain_handle(raw) },
+        ListTypeTag::Map => unsafe { crate::collections::map::pith_map_retain_handle(raw) },
+        ListTypeTag::Struct => unsafe { crate::runtime_core::pith_struct_retain(raw) },
+        ListTypeTag::Bytes => unsafe { crate::bytes::pith_bytes_retain(raw) },
+        ListTypeTag::Closure => unsafe { crate::runtime_core::pith_closure_retain(raw) },
+        ListTypeTag::Set => unsafe { crate::collections::set::pith_set_retain_handle(raw) },
+        ListTypeTag::Channel => unsafe { crate::concurrency::channel::pith_channel_retain(raw) },
+        ListTypeTag::Sync => unsafe { crate::concurrency::sync_handle::pith_sync_retain(raw) },
         ListTypeTag::Primitive => {}
     }
 }
@@ -373,22 +377,23 @@ unsafe fn release_all_elements(impl_ref: &ListImpl) {
     for i in 0..impl_ref.len() {
         if let Some(raw) = impl_ref.get_value(i) {
             crate::perf_count(&crate::PERF_LIST_CASCADE_RELEASES, 1);
-            release_element(impl_ref.type_tag, raw);
+            // SAFETY: List owns one count per stored heap element.
+            unsafe { release_element(impl_ref.type_tag, raw) };
         }
     }
 }
 
 pub(crate) unsafe fn release_element(tag: ListTypeTag, raw: i64) {
     match tag {
-        ListTypeTag::String => crate::pith_cstring_release(raw as *const i8),
-        ListTypeTag::List => pith_list_release_handle(raw),
-        ListTypeTag::Map => crate::collections::map::pith_map_release_handle(raw),
-        ListTypeTag::Struct => crate::runtime_core::pith_struct_release(raw),
-        ListTypeTag::Bytes => crate::bytes::pith_bytes_release(raw),
-        ListTypeTag::Closure => crate::runtime_core::pith_closure_release(raw),
-        ListTypeTag::Set => crate::collections::set::pith_set_release_handle(raw),
-        ListTypeTag::Channel => crate::concurrency::channel::pith_channel_release(raw),
-        ListTypeTag::Sync => crate::concurrency::sync_handle::pith_sync_release(raw),
+        ListTypeTag::String => unsafe { crate::pith_cstring_release(raw as *const i8) },
+        ListTypeTag::List => unsafe { pith_list_release_handle(raw) },
+        ListTypeTag::Map => unsafe { crate::collections::map::pith_map_release_handle(raw) },
+        ListTypeTag::Struct => unsafe { crate::runtime_core::pith_struct_release(raw) },
+        ListTypeTag::Bytes => unsafe { crate::bytes::pith_bytes_release(raw) },
+        ListTypeTag::Closure => unsafe { crate::runtime_core::pith_closure_release(raw) },
+        ListTypeTag::Set => unsafe { crate::collections::set::pith_set_release_handle(raw) },
+        ListTypeTag::Channel => unsafe { crate::concurrency::channel::pith_channel_release(raw) },
+        ListTypeTag::Sync => unsafe { crate::concurrency::sync_handle::pith_sync_release(raw) },
         ListTypeTag::Primitive => {}
     }
 }
@@ -400,7 +405,8 @@ pub(crate) unsafe fn release_element(tag: ListTypeTag, raw: i64) {
 /// unacceptable (pith_auto_len).
 #[inline]
 unsafe fn list_magic_ok(ptr: *const ()) -> bool {
-    list_magic_ok_for(ptr, crate::quarantine::Op::Use)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { list_magic_ok_for(ptr, crate::quarantine::Op::Use) }
 }
 
 /// `list_magic_ok`, naming what the caller does with the list in a
@@ -408,46 +414,159 @@ unsafe fn list_magic_ok(ptr: *const ()) -> bool {
 #[inline(always)]
 unsafe fn list_magic_ok_for(ptr: *const (), op: crate::quarantine::Op) -> bool {
     handle_registry::plausibly_aligned::<ListImpl>(ptr)
-        && crate::quarantine::magic_is(std::ptr::addr_of!((*(ptr as *const ListImpl)).magic), LIST_MAGIC, op)
+        && unsafe {
+            // SAFETY: Alignment verified above; `magic_is` reads the magic field to validate.
+            crate::quarantine::magic_is(
+                std::ptr::addr_of!((*(ptr as *const ListImpl)).magic),
+                LIST_MAGIC,
+                op,
+            )
+        }
 }
 
-unsafe fn list_ref<'a>(list: PithList) -> Option<&'a ListImpl> {
-    if !list_magic_ok(list.ptr as *const ()) {
+/// Validate `list` and borrow its `ListImpl` immutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_list_ref<R>(list: PithList, f: impl FnOnce(&ListImpl) -> R) -> Option<R> {
+    // SAFETY: Magic check validates pointer before dereference; borrow is scoped to `f`.
+    if !unsafe { list_magic_ok(list.ptr as *const ()) } {
         return None;
     }
-    Some(&*(list.ptr as *const ListImpl))
+    let impl_ref = unsafe { &*(list.ptr as *const ListImpl) };
+    Some(f(impl_ref))
 }
 
-unsafe fn list_mut<'a>(list: PithList) -> Option<&'a mut ListImpl> {
-    if !list_magic_ok(list.ptr as *const ()) {
+/// Validate `list` and borrow its `ListImpl` mutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_list_mut<R>(list: PithList, f: impl FnOnce(&mut ListImpl) -> R) -> Option<R> {
+    // SAFETY: Magic check validates pointer before dereference; caller ensures exclusive access for `f`.
+    if !unsafe { list_magic_ok(list.ptr as *const ()) } {
         return None;
     }
-    Some(&mut *(list.ptr as *mut ListImpl))
+    let impl_mut = unsafe { &mut *(list.ptr as *mut ListImpl) };
+    Some(f(impl_mut))
 }
 
-pub(crate) unsafe fn list_ref_from_handle<'a>(handle: i64) -> Option<&'a ListImpl> {
-    if !list_magic_ok(handle as *const ()) {
-        return None;
-    }
-    Some(&*(handle as *const ListImpl))
+/// Validate `handle` and borrow its `ListImpl` immutably for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_list_ref_handle<R>(
+    handle: i64,
+    f: impl FnOnce(&ListImpl) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_list_ref(PithList { ptr: handle as *mut () }, f) }
 }
 
-/// The elements of a list of plain eight-byte values (Ints, Floats, Bools),
-/// for runtime code that reads and writes them in place. None for any other
-/// list, or a handle that is not a list.
-pub(crate) unsafe fn primitive_words_mut<'a>(handle: i64) -> Option<&'a mut [i64]> {
-    let list = list_mut_from_handle(handle)?;
-    if list.type_tag != ListTypeTag::Primitive || !list.uses_value_storage() {
-        return None;
-    }
-    Some(&mut list.values8[..])
+/// Validate `handle` and borrow its `ListImpl` mutably for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_list_mut_handle<R>(
+    handle: i64,
+    f: impl FnOnce(&mut ListImpl) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_list_mut(PithList { ptr: handle as *mut () }, f) }
 }
 
-pub(crate) unsafe fn list_mut_from_handle<'a>(handle: i64) -> Option<&'a mut ListImpl> {
-    if !list_magic_ok(handle as *const ()) {
+/// Validate two lists and borrow both immutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_list_ref2<R>(
+    a: PithList,
+    b: PithList,
+    f: impl FnOnce(&ListImpl, &ListImpl) -> R,
+) -> Option<R> {
+    if !unsafe { list_magic_ok(a.ptr as *const ()) }
+        || !unsafe { list_magic_ok(b.ptr as *const ()) }
+    {
         return None;
     }
-    Some(&mut *(handle as *mut ListImpl))
+    // SAFETY: Both pointers passed magic validation and both borrows are shared (`&ListImpl`),
+    // so aliasing `a.ptr == b.ptr` is sound.
+    let a_ref = unsafe { &*(a.ptr as *const ListImpl) };
+    let b_ref = unsafe { &*(b.ptr as *const ListImpl) };
+    Some(f(a_ref, b_ref))
+}
+
+/// Validate two list handles and borrow both immutably for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_list_ref2_handle<R>(
+    a: i64,
+    b: i64,
+    f: impl FnOnce(&ListImpl, &ListImpl) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        with_list_ref2(
+            PithList { ptr: a as *mut () },
+            PithList { ptr: b as *mut () },
+            f,
+        )
+    }
+}
+
+/// Validate `dst` (mutable) and `src` (shared) without aliasing UB.
+///
+/// When `dst` and `src` point to the same list, invokes `on_same` with a single `&mut ListImpl`
+/// instead of minting overlapping `&mut` and `&` references.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn with_list_mut_and_ref<R>(
+    dst: PithList,
+    src: PithList,
+    on_distinct: impl FnOnce(&mut ListImpl, &ListImpl) -> R,
+    on_same: impl FnOnce(&mut ListImpl) -> R,
+) -> Option<R> {
+    if !unsafe { list_magic_ok(dst.ptr as *const ()) } {
+        return None;
+    }
+    if dst.ptr == src.ptr {
+        // SAFETY: `dst` validated; only one `&mut` reference is minted.
+        let same = unsafe { &mut *(dst.ptr as *mut ListImpl) };
+        return Some(on_same(same));
+    }
+    if !unsafe { list_magic_ok(src.ptr as *const ()) } {
+        return None;
+    }
+    // SAFETY: `dst` and `src` are both valid and distinct pointers.
+    let dst_mut = unsafe { &mut *(dst.ptr as *mut ListImpl) };
+    let src_ref = unsafe { &*(src.ptr as *const ListImpl) };
+    Some(on_distinct(dst_mut, src_ref))
+}
+
+/// Borrow the elements of a primitive 8-byte list mutably for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_primitive_words_mut<R>(
+    handle: i64,
+    f: impl FnOnce(&mut [i64]) -> R,
+) -> Option<R> {
+    let body = |list: &mut ListImpl| {
+        if list.type_tag != ListTypeTag::Primitive || !list.uses_value_storage() {
+            return None;
+        }
+        Some(f(&mut list.values8[..]))
+    };
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_list_mut_handle(handle, body) }.flatten()
+}
+
+#[inline(always)]
+fn list_new_impl(elem_size: i64, type_tag: i32) -> PithList {
+    let tag = element_tag_from_code(type_tag);
+
+    // written straight into the allocation. building the struct on the
+    // stack and moving it into a box copies it in 16-byte pieces, each read
+    // back while the field stores it covers are still in flight.
+    let slot = Box::into_raw(Box::<ListImpl>::new_uninit()) as *mut ListImpl;
+    let ptr = slot as *mut ();
+    let id = identity_tag(ptr);
+    // SAFETY: `slot` is freshly allocated and exclusively owned; writing initializes it.
+    unsafe {
+        slot.write(ListImpl::new(elem_size as usize, tag));
+        (*slot).identity = id;
+    }
+    if crosses_page(ptr) {
+        handle_registry::register(ptr as *const (), HandleKind::List);
+    }
+
+    PithList { ptr }
 }
 
 /// Create a new empty list
@@ -458,26 +577,26 @@ pub(crate) unsafe fn list_mut_from_handle<'a>(handle: i64) -> Option<&'a mut Lis
 /// Create a new list with default element size (8 bytes, primitive)
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_default() -> PithList {
-    pith_list_new(8, 0)
+    list_new_impl(8, 0)
 }
 
 /// Create a list that owns cstring elements: push/insert retain, remove and
 /// free release. The emitter uses this for List[String].
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_cstr() -> PithList {
-    pith_list_new(8, 1)
+    list_new_impl(8, 1)
 }
 
 /// List of list handles (List[List[T]]): elements retain/release recursively.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_nested_list() -> PithList {
-    pith_list_new(8, 2)
+    list_new_impl(8, 2)
 }
 
 /// List of map handles (List[Map[K, V]]).
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_nested_map() -> PithList {
-    pith_list_new(8, 3)
+    list_new_impl(8, 3)
 }
 
 /// List that owns struct-handle elements (List[SomeStruct]): push/insert
@@ -486,7 +605,7 @@ pub unsafe extern "C" fn pith_list_new_nested_map() -> PithList {
 /// a variable or another list is not double-freed.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_struct() -> PithList {
-    pith_list_new(8, 4)
+    list_new_impl(8, 4)
 }
 
 /// List that owns Bytes elements (List[Bytes]): push/insert retain, and the
@@ -495,7 +614,7 @@ pub unsafe extern "C" fn pith_list_new_struct() -> PithList {
 /// not own and the element was freed out from under it at scope exit.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_bytes() -> PithList {
-    pith_list_new(8, 5)
+    list_new_impl(8, 5)
 }
 
 /// List that owns closure elements (List[fn(...) -> T]): push/insert retain,
@@ -505,7 +624,7 @@ pub unsafe extern "C" fn pith_list_new_bytes() -> PithList {
 /// was freed at the call site while the list still pointed at it.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_closure() -> PithList {
-    pith_list_new(8, 6)
+    list_new_impl(8, 6)
 }
 
 /// List that owns set elements (List[Set[T]]): push/insert retain, and the
@@ -516,39 +635,26 @@ pub unsafe extern "C" fn pith_list_new_closure() -> PithList {
 /// safely release into.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_set() -> PithList {
-    pith_list_new(8, 7)
+    list_new_impl(8, 7)
 }
 
 /// a list of channel handles owns one count per element, like a list of any
 /// other counted handle; without the tag it held handles it did not own.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_channel() -> PithList {
-    pith_list_new(8, 8)
+    list_new_impl(8, 8)
 }
 
 /// a list of sync primitive handles (Mutex, WaitGroup, Semaphore, AtomicInt)
 /// owns one count per element, like a list of channels.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new_sync() -> PithList {
-    pith_list_new(8, 9)
+    list_new_impl(8, 9)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_new(elem_size: i64, type_tag: i32) -> PithList {
-    let tag = element_tag_from_code(type_tag);
-
-    // written straight into the allocation. building the struct on the
-    // stack and moving it into a box copies it in 16-byte pieces, each read
-    // back while the field stores it covers are still in flight.
-    let slot = Box::into_raw(Box::<ListImpl>::new_uninit()) as *mut ListImpl;
-    slot.write(ListImpl::new(elem_size as usize, tag));
-    let ptr = slot as *mut ();
-    (*(ptr as *mut ListImpl)).identity = identity_tag(ptr);
-    if crosses_page(ptr) {
-        handle_registry::register(ptr as *const (), HandleKind::List);
-    }
-
-    PithList { ptr }
+    list_new_impl(elem_size, type_tag)
 }
 
 /// The most elements one `pith_list_of` call takes.
@@ -576,18 +682,25 @@ pub unsafe extern "C" fn pith_list_of(
     v7: i64,
 ) -> PithList {
     let count = (count.max(0) as usize).min(LIST_OF_MAX);
-    let list = pith_list_new(8, type_tag as i32);
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    let list = list_new_impl(8, type_tag as i32);
     crate::perf_stats!(PERF_LIST_PUSHES += count);
     let mut values: Vec<i64> = Vec::with_capacity(count);
     // one store per value, from the register it arrived in. gathering them
     // into an array and copying that reads the array back in wider pieces
     // than it was written in, which stalls on every literal.
     let slots = values.as_mut_ptr();
-    for (i, value) in [v0, v1, v2, v3, v4, v5, v6, v7].into_iter().enumerate().take(count) {
-        std::ptr::write_volatile(slots.add(i), value);
+    for (i, value) in [v0, v1, v2, v3, v4, v5, v6, v7]
+        .into_iter()
+        .enumerate()
+        .take(count)
+    {
+        // SAFETY: `values` has capacity `count` and `i < count`.
+        unsafe { std::ptr::write_volatile(slots.add(i), value) };
     }
-    values.set_len(count);
+    // SAFETY: The first `count` elements were initialized above.
+    unsafe { values.set_len(count) };
+    // SAFETY: `list` was freshly allocated above and is exclusively owned.
+    let impl_ref = unsafe { &mut *(list.ptr as *mut ListImpl) };
     impl_ref.values8 = values;
     impl_ref.sync_value_view();
     list
@@ -625,7 +738,8 @@ fn crosses_page(ptr: *const ()) -> bool {
 /// Forget a list that is being freed: clear the identity word and drop the
 /// registry entry a page-crossing list has.
 unsafe fn retire_identity(ptr: *mut ()) {
-    (*(ptr as *mut ListImpl)).identity = 0;
+    // SAFETY: Caller has validated `ptr` as a live `ListImpl` being torn down.
+    unsafe { (*(ptr as *mut ListImpl)).identity = 0 };
     if crosses_page(ptr) {
         handle_registry::unregister(ptr as *const (), HandleKind::List);
     }
@@ -634,11 +748,8 @@ unsafe fn retire_identity(ptr: *mut ()) {
 /// Get list length
 #[no_mangle]
 pub extern "C" fn pith_list_len(list: PithList) -> i64 {
-    unsafe {
-        list_ref(list)
-            .map(|impl_ref| impl_ref.len() as i64)
-            .unwrap_or(0)
-    }
+    // SAFETY: `with_list_ref` validates `list` before reading its length.
+    unsafe { with_list_ref(list, |impl_ref| impl_ref.len() as i64) }.unwrap_or(0)
 }
 
 /// Check if a raw pointer really is a ListImpl. The magic word rejects
@@ -679,6 +790,28 @@ pub extern "C" fn pith_auto_len(ptr: i64) -> i64 {
     }
 }
 
+#[inline(always)]
+unsafe fn list_push_bytes_impl(impl_ref: &mut ListImpl, elem: *const u8, elem_size: i64) {
+    crate::perf_stats!(PERF_LIST_PUSHES += 1);
+
+    // Verify element size matches
+    if impl_ref.elem_size != elem_size as usize {
+        eprintln!("pith: list element size mismatch");
+        return;
+    }
+
+    // Copy element data
+    // SAFETY: Caller guarantees `elem` points to `elem_size` readable bytes.
+    let elem_slice = unsafe { std::slice::from_raw_parts(elem, elem_size as usize) };
+
+    // The list holds one count per heap element, released again when the
+    // element leaves the list.
+    // SAFETY: Heap elements carry a valid handle for `impl_ref.type_tag`.
+    unsafe { retain_element(impl_ref.type_tag, ListImpl::read_i64_padded(elem_slice)) };
+
+    impl_ref.push(elem_slice);
+}
+
 /// Push element to end of list
 ///
 /// # Safety
@@ -689,25 +822,10 @@ pub unsafe extern "C" fn pith_list_push(list: *mut PithList, elem: *const u8, el
         return;
     }
 
-    let Some(impl_ref) = list_mut(*list) else {
-        return;
-    };
-    crate::perf_stats!(PERF_LIST_PUSHES += 1);
-
-    // Verify element size matches
-    if impl_ref.elem_size != elem_size as usize {
-        eprintln!("pith: list element size mismatch");
-        return;
-    }
-
-    // Copy element data
-    let elem_slice = std::slice::from_raw_parts(elem, elem_size as usize);
-
-    // The list holds one count per heap element, released again when the
-    // element leaves the list.
-    retain_element(impl_ref.type_tag, ListImpl::read_i64_padded(elem_slice));
-
-    impl_ref.push(elem_slice);
+    // SAFETY: `list` is non-null per caller contract.
+    let list_val = unsafe { *list };
+    // SAFETY: `with_list_mut` validates `list_val`; `elem` is readable for `elem_size` bytes.
+    unsafe { with_list_mut(list_val, |impl_ref| list_push_bytes_impl(impl_ref, elem, elem_size)) };
 }
 
 /// Push an i64-sized value into a list using the list handle directly.
@@ -715,7 +833,8 @@ pub unsafe extern "C" fn pith_list_push(list: *mut PithList, elem: *const u8, el
 /// its own count and the list takes one of its own.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_push_value(list: PithList, value: i64) {
-    push_value_inner(list, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { push_value_inner(list, value, false) };
 }
 
 /// Push a value the caller owns and is about to stop tracking: a freshly
@@ -729,7 +848,16 @@ pub unsafe extern "C" fn pith_list_push_value(list: PithList, value: i64) {
 /// is why the ownership decision lives here and not in the emitter.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_push_value_owned(list: PithList, value: i64) {
-    push_value_inner(list, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { push_value_inner(list, value, true) };
+}
+
+#[inline(always)]
+unsafe fn push_value_kind_impl(impl_ref: &mut ListImpl, value: i64, elem_tag: i64) {
+    crate::perf_stats!(PERF_LIST_PUSHES += 1);
+    // SAFETY: Caller passes a value matching `elem_tag`.
+    unsafe { borrowed_store_retains(impl_ref, value, elem_tag) };
+    impl_ref.push_value(value);
 }
 
 /// Push a borrowed value of a named heap kind. The list adopts the kind when
@@ -740,12 +868,16 @@ pub unsafe extern "C" fn pith_list_push_value_owned(list: PithList, value: i64) 
 /// * `list` must be a valid list handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_push_value_kind(list: PithList, value: i64, elem_tag: i64) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
-    };
-    crate::perf_stats!(PERF_LIST_PUSHES += 1);
-    borrowed_store_retains(impl_ref, value, elem_tag);
-    impl_ref.push_value(value);
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe { with_list_mut(list, |impl_ref| push_value_kind_impl(impl_ref, value, elem_tag)) };
+}
+
+#[inline(always)]
+unsafe fn insert_value_kind_impl(impl_ref: &mut ListImpl, index: i64, value: i64, elem_tag: i64) {
+    crate::perf_stats!(PERF_LIST_INSERTS += 1);
+    // SAFETY: Caller passes a value matching `elem_tag`.
+    unsafe { borrowed_store_retains(impl_ref, value, elem_tag) };
+    impl_ref.insert_value_at(index.max(0) as usize, value);
 }
 
 /// Insert a borrowed value of a named heap kind at an index.
@@ -759,12 +891,31 @@ pub unsafe extern "C" fn pith_list_insert_value_kind(
     value: i64,
     elem_tag: i64,
 ) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe {
+        with_list_mut(list, |impl_ref| {
+            insert_value_kind_impl(impl_ref, index, value, elem_tag)
+        })
     };
-    crate::perf_stats!(PERF_LIST_INSERTS += 1);
-    borrowed_store_retains(impl_ref, value, elem_tag);
-    impl_ref.insert_value_at(index.max(0) as usize, value);
+}
+
+#[inline(always)]
+unsafe fn set_value_kind_impl(impl_ref: &mut ListImpl, index: i64, value: i64, elem_tag: i64) {
+    crate::perf_stats!(PERF_LIST_SETS += 1);
+    let idx = index as usize;
+    if idx >= impl_ref.len() {
+        return;
+    }
+    // retain before dropping the count on what this displaces, so `l[i] = l[i]`
+    // cannot free the value mid-assignment.
+    // SAFETY: Caller passes a value matching `elem_tag`.
+    unsafe { borrowed_store_retains(impl_ref, value, elem_tag) };
+    let displaced = displaced_element(impl_ref, idx);
+    impl_ref.set_value(idx, value);
+    if let Some(raw) = displaced {
+        // SAFETY: `displaced` was an element owned by `impl_ref`.
+        unsafe { release_element(impl_ref.type_tag, raw) };
+    }
 }
 
 /// Overwrite an element with a borrowed value of a named heap kind. An index
@@ -780,22 +931,12 @@ pub unsafe extern "C" fn pith_list_set_value_kind(
     value: i64,
     elem_tag: i64,
 ) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe {
+        with_list_mut(list, |impl_ref| {
+            set_value_kind_impl(impl_ref, index, value, elem_tag)
+        })
     };
-    crate::perf_stats!(PERF_LIST_SETS += 1);
-    let idx = index as usize;
-    if idx >= impl_ref.len() {
-        return;
-    }
-    // retain before dropping the count on what this displaces, so `l[i] = l[i]`
-    // cannot free the value mid-assignment.
-    borrowed_store_retains(impl_ref, value, elem_tag);
-    let displaced = displaced_element(impl_ref, idx);
-    impl_ref.set_value(idx, value);
-    if let Some(raw) = displaced {
-        release_element(impl_ref.type_tag, raw);
-    }
 }
 
 /// The counts a borrowed value needs before it is stored under `elem_tag`.
@@ -808,24 +949,30 @@ pub unsafe extern "C" fn pith_list_set_value_kind(
 unsafe fn borrowed_store_retains(impl_ref: &mut ListImpl, value: i64, elem_tag: i64) {
     let tag = element_tag_from_code(elem_tag as i32);
     let owns = impl_ref.adopt_element_tag(tag);
-    retain_element(impl_ref.type_tag, value);
+    // SAFETY: Caller passes a value matching `tag` (and `impl_ref.type_tag` if adopted).
+    unsafe { retain_element(impl_ref.type_tag, value) };
     if !owns {
-        retain_element(tag, value);
+        // SAFETY: Caller passes a value matching `tag`.
+        unsafe { retain_element(tag, value) };
     }
 }
 
 #[inline(always)]
-unsafe fn push_value_inner(list: PithList, value: i64, takes_caller_count: bool) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
-    };
+unsafe fn push_value_impl(impl_ref: &mut ListImpl, value: i64, takes_caller_count: bool) {
     crate::perf_stats!(PERF_LIST_PUSHES += 1);
     // a list of plain values owns no counts, which is the common push: the
     // retain is a call, so it is only made for a kind that has one
     if !takes_caller_count && impl_ref.type_tag != ListTypeTag::Primitive {
-        retain_element(impl_ref.type_tag, value);
+        // SAFETY: Caller passes a value matching `impl_ref.type_tag`.
+        unsafe { retain_element(impl_ref.type_tag, value) };
     }
     impl_ref.push_value(value);
+}
+
+#[inline(always)]
+unsafe fn push_value_inner(list: PithList, value: i64, takes_caller_count: bool) {
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe { with_list_mut(list, |impl_ref| push_value_impl(impl_ref, value, takes_caller_count)) };
 }
 
 /// Insert an element at an index, shifting the tail right. A negative
@@ -833,7 +980,8 @@ unsafe fn push_value_inner(list: PithList, value: i64, takes_caller_count: bool)
 /// takes an owner's count for tagged element kinds, like push.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_insert_value(list: PithList, index: i64, value: i64) {
-    insert_value_inner(list, index, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_value_inner(list, index, value, false) };
 }
 
 /// Insert a value the caller owns and is about to stop tracking. The list
@@ -843,24 +991,39 @@ pub unsafe extern "C" fn pith_list_insert_value(list: PithList, index: i64, valu
 /// outstanding rather than leaving the list pointing at a freed element.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_insert_value_owned(list: PithList, index: i64, value: i64) {
-    insert_value_inner(list, index, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { insert_value_inner(list, index, value, true) };
+}
+
+#[inline(always)]
+unsafe fn insert_value_impl(
+    impl_ref: &mut ListImpl,
+    index: i64,
+    value: i64,
+    takes_caller_count: bool,
+) {
+    crate::perf_stats!(PERF_LIST_INSERTS += 1);
+    if !takes_caller_count {
+        // SAFETY: Caller passes a value matching `impl_ref.type_tag`.
+        unsafe { retain_element(impl_ref.type_tag, value) };
+    }
+    impl_ref.insert_value_at(index.max(0) as usize, value);
 }
 
 unsafe fn insert_value_inner(list: PithList, index: i64, value: i64, takes_caller_count: bool) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe {
+        with_list_mut(list, |impl_ref| {
+            insert_value_impl(impl_ref, index, value, takes_caller_count)
+        })
     };
-    crate::perf_stats!(PERF_LIST_INSERTS += 1);
-    if !takes_caller_count {
-        retain_element(impl_ref.type_tag, value);
-    }
-    impl_ref.insert_value_at(index.max(0) as usize, value);
 }
 
 /// Set element at index (value-based API, stores i64).
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: i64) {
-    set_value_inner(list, index, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { set_value_inner(list, index, value, false) };
 }
 
 /// Set element at index with a value the caller owns. The list takes the
@@ -868,7 +1031,22 @@ pub unsafe extern "C" fn pith_list_set_value(list: PithList, index: i64, value: 
 /// `pith_list_push_value_owned` performs.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_value_owned(list: PithList, index: i64, value: i64) {
-    set_value_inner(list, index, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { set_value_inner(list, index, value, true) };
+}
+
+#[inline(always)]
+unsafe fn set_scalar_impl(impl_ref: &mut ListImpl, index: i64, value: i64) {
+    if impl_ref.type_tag != ListTypeTag::Primitive {
+        // SAFETY: Preconditions forwarded from caller; reuse the active `&mut ListImpl`.
+        unsafe { set_value_impl(impl_ref, index, value, false) };
+        return;
+    }
+    crate::perf_stats!(PERF_LIST_SETS += 1);
+    let idx = index as usize;
+    if idx < impl_ref.len() {
+        impl_ref.set_value(idx, value);
+    }
 }
 
 /// Set an element the compiler knows is a scalar (an Int, Float, Bool or a
@@ -879,31 +1057,25 @@ pub unsafe extern "C" fn pith_list_set_value_owned(list: PithList, index: i64, v
 /// which a scalar never goes into, would still take the counting path.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_scalar(list: PithList, index: i64, value: i64) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
-    };
-    if impl_ref.type_tag != ListTypeTag::Primitive {
-        set_value_inner(list, index, value, false);
-        return;
-    }
-    crate::perf_stats!(PERF_LIST_SETS += 1);
-    let idx = index as usize;
-    if idx < impl_ref.len() {
-        impl_ref.set_value(idx, value);
-    }
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe { with_list_mut(list, |impl_ref| set_scalar_impl(impl_ref, index, value)) };
 }
 
-unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_count: bool) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
-    };
+#[inline(always)]
+unsafe fn set_value_impl(
+    impl_ref: &mut ListImpl,
+    index: i64,
+    value: i64,
+    takes_caller_count: bool,
+) {
     crate::perf_stats!(PERF_LIST_SETS += 1);
     let idx = index as usize;
     if idx >= impl_ref.len() {
         // an index outside the list stores nothing, so an owned value the
         // caller handed over has nobody else to release it.
         if takes_caller_count {
-            release_element(impl_ref.type_tag, value);
+            // SAFETY: Caller transferred ownership of `value` matching `impl_ref.type_tag`.
+            unsafe { release_element(impl_ref.type_tag, value) };
         }
         return;
     }
@@ -912,13 +1084,24 @@ unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_c
     // an owned value is a buffer nobody else holds, so it can never be
     // what it displaces and needs no count of its own.
     if !takes_caller_count {
-        retain_element(impl_ref.type_tag, value);
+        // SAFETY: Caller passes a value matching `impl_ref.type_tag`.
+        unsafe { retain_element(impl_ref.type_tag, value) };
     }
     let displaced = displaced_element(impl_ref, idx);
     impl_ref.set_value(idx, value);
     if let Some(raw) = displaced {
-        release_element(impl_ref.type_tag, raw);
+        // SAFETY: `displaced` was an element owned by `impl_ref`.
+        unsafe { release_element(impl_ref.type_tag, raw) };
     }
+}
+
+unsafe fn set_value_inner(list: PithList, index: i64, value: i64, takes_caller_count: bool) {
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe {
+        with_list_mut(list, |impl_ref| {
+            set_value_impl(impl_ref, index, value, takes_caller_count)
+        })
+    };
 }
 
 // The strict stores behind `xs[i] = v`. The stores above ignore an index
@@ -938,10 +1121,10 @@ fn strict_store_out_of_bounds(index: i64, len: i64) -> ! {
 
 #[inline]
 unsafe fn check_store_index(list: PithList, index: i64) {
-    let Some(impl_ref) = list_ref(list) else {
+    // SAFETY: `with_list_ref` validates `list` before reading its length.
+    let Some(len) = (unsafe { with_list_ref(list, |impl_ref| impl_ref.len() as i64) }) else {
         strict_index_bad_handle();
     };
-    let len = impl_ref.len() as i64;
     if index < 0 || index >= len {
         strict_store_out_of_bounds(index, len);
     }
@@ -949,20 +1132,29 @@ unsafe fn check_store_index(list: PithList, index: i64) {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_value_strict(list: PithList, index: i64, value: i64) {
-    check_store_index(list, index);
-    set_value_inner(list, index, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        check_store_index(list, index);
+        set_value_inner(list, index, value, false);
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_value_owned_strict(list: PithList, index: i64, value: i64) {
-    check_store_index(list, index);
-    set_value_inner(list, index, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        check_store_index(list, index);
+        set_value_inner(list, index, value, true);
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_scalar_strict(list: PithList, index: i64, value: i64) {
-    check_store_index(list, index);
-    pith_list_set_scalar(list, index, value);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        check_store_index(list, index);
+        pith_list_set_scalar(list, index, value);
+    }
 }
 
 // The checked stores behind `xs[i] = v` inside a fallible function, where a
@@ -975,15 +1167,19 @@ pub unsafe extern "C" fn pith_list_set_scalar_strict(list: PithList, index: i64,
 
 /// Whether `index` is inside the list behind `list`; false for a dead handle.
 unsafe fn store_index_in_bounds(list: PithList, index: i64) -> bool {
-    list_ref(list).is_some_and(|impl_ref| index >= 0 && (index as usize) < impl_ref.len())
+    // SAFETY: `with_list_ref` validates `list` before checking bounds.
+    unsafe { with_list_ref(list, |impl_ref| index >= 0 && (index as usize) < impl_ref.len()) }
+        .unwrap_or(false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_value_checked(list: PithList, index: i64, value: i64) -> i64 {
-    if !store_index_in_bounds(list, index) {
+    // SAFETY: Preconditions forwarded from caller.
+    if !unsafe { store_index_in_bounds(list, index) } {
         return 0;
     }
-    set_value_inner(list, index, value, false);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { set_value_inner(list, index, value, false) };
     1
 }
 
@@ -993,19 +1189,23 @@ pub unsafe extern "C" fn pith_list_set_value_owned_checked(
     index: i64,
     value: i64,
 ) -> i64 {
-    if !store_index_in_bounds(list, index) {
+    // SAFETY: Preconditions forwarded from caller.
+    if !unsafe { store_index_in_bounds(list, index) } {
         return 0;
     }
-    set_value_inner(list, index, value, true);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { set_value_inner(list, index, value, true) };
     1
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_set_scalar_checked(list: PithList, index: i64, value: i64) -> i64 {
-    if !store_index_in_bounds(list, index) {
+    // SAFETY: Preconditions forwarded from caller.
+    if !unsafe { store_index_in_bounds(list, index) } {
         return 0;
     }
-    pith_list_set_scalar(list, index, value);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { pith_list_set_scalar(list, index, value) };
     1
 }
 
@@ -1018,64 +1218,98 @@ pub unsafe extern "C" fn pith_list_set_value_kind_strict(
     value: i64,
     elem_tag: i64,
 ) {
-    check_store_index(list, index);
-    pith_list_set_value_kind(list, index, value, elem_tag);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        check_store_index(list, index);
+        pith_list_set_value_kind(list, index, value, elem_tag);
+    }
 }
 
-/// Join a list of C string pointers with a separator.
-/// Returns a newly allocated C string.
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut i8 {
-    let Some(impl_ref) = list_ref(list) else {
-        return std::ptr::null_mut();
-    };
-    if impl_ref.len() == 0 {
-        return crate::pith_cstring_empty();
-    }
-
-    let sep_len = if sep.is_null() {
-        0usize
-    } else {
-        crate::string::pith_cstring_len(sep) as usize
-    };
-
+unsafe fn list_join_impl(impl_ref: &ListImpl, sep: &[u8]) -> *mut i8 {
+    let count = impl_ref.len();
     let mut total_len = 0usize;
-    let mut i = 0usize;
-    while i < impl_ref.len() {
+    for i in 0..count {
         if let Some(raw) = impl_ref.get_value(i) {
             let ptr_val = raw as *const i8;
             if !ptr_val.is_null() {
                 total_len += crate::string::pith_cstring_len(ptr_val) as usize;
             }
         }
-        if i + 1 < impl_ref.len() {
-            total_len += sep_len;
+        if i + 1 < count {
+            total_len += sep.len();
         }
-        i += 1;
     }
 
-    let out = crate::pith_alloc_cstring(total_len);
+    // SAFETY: Allocates a headered C string of `total_len` bytes plus trailing NUL.
+    let out = unsafe { crate::pith_alloc_cstring(total_len) };
 
     let mut write = 0usize;
-    let mut i = 0usize;
-    while i < impl_ref.len() {
+    for i in 0..count {
         if let Some(raw) = impl_ref.get_value(i) {
             let ptr_val = raw as *const i8;
             if !ptr_val.is_null() {
                 let len = crate::string::pith_cstring_len(ptr_val) as usize;
-                std::ptr::copy_nonoverlapping(ptr_val as *const u8, out.add(write) as *mut u8, len);
+                // SAFETY: `ptr_val` is a readable C string of `len` bytes and `out + write..+len` fits in `total_len`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ptr_val as *const u8,
+                        out.add(write) as *mut u8,
+                        len,
+                    );
+                }
                 write += len;
             }
         }
-        if i + 1 < impl_ref.len() && sep_len > 0 {
-            std::ptr::copy_nonoverlapping(sep as *const u8, out.add(write) as *mut u8, sep_len);
-            write += sep_len;
+        if i + 1 < count && !sep.is_empty() {
+            // SAFETY: `out + write..+sep.len()` fits in `total_len`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(sep.as_ptr(), out.add(write) as *mut u8, sep.len());
+            }
+            write += sep.len();
         }
-        i += 1;
     }
 
-    *out.add(write) = 0;
+    // SAFETY: `write == total_len` and `pith_alloc_cstring` reserves the trailing NUL byte.
+    unsafe { *out.add(write) = 0 };
     out
+}
+
+/// Join a list of C string pointers with a separator.
+/// Returns a newly allocated C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut i8 {
+    let run = |impl_ref: &ListImpl| {
+        if impl_ref.len() == 0 {
+            return crate::pith_cstring_empty();
+        }
+        if sep.is_null() {
+            // SAFETY: Caller guarantees list elements are null or valid C strings.
+            unsafe { list_join_impl(impl_ref, &[]) }
+        } else {
+            // SAFETY: `sep` is non-null C string; list elements are valid C strings.
+            unsafe {
+                crate::ffi_util::with_cstr_bytes(sep, |sep_bytes| {
+                    list_join_impl(impl_ref, sep_bytes)
+                })
+            }
+            .unwrap_or(std::ptr::null_mut())
+        }
+    };
+    // SAFETY: `with_list_ref` validates `list` before reading from it.
+    unsafe { with_list_ref(list, run) }.unwrap_or(std::ptr::null_mut())
+}
+
+fn list_join_int_impl(impl_ref: &ListImpl, sep_str: &str) -> *mut i8 {
+    let mut out = String::new();
+    for i in 0..impl_ref.len() {
+        if let Some(raw) = impl_ref.get_value(i) {
+            if i > 0 {
+                out.push_str(sep_str);
+            }
+            out.push_str(&raw.to_string());
+        }
+    }
+    crate::pith_copy_bytes_to_cstring(out.as_bytes())
 }
 
 /// Join a list of Int elements with a separator, formatting each as decimal.
@@ -1083,30 +1317,37 @@ pub unsafe extern "C" fn pith_list_join(list: PithList, sep: *const i8) -> *mut 
 /// Returns a newly allocated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_join_int(list: PithList, sep: *const i8) -> *mut i8 {
-    let Some(impl_ref) = list_ref(list) else {
-        return std::ptr::null_mut();
-    };
-
-    let sep_str = if sep.is_null() {
-        ""
-    } else {
-        let len = crate::string::pith_cstring_len(sep) as usize;
-        std::str::from_utf8(std::slice::from_raw_parts(sep as *const u8, len)).unwrap_or("")
-    };
-
-    let mut out = String::new();
-    let mut i = 0usize;
-    while i < impl_ref.len() {
-        if let Some(raw) = impl_ref.get_value(i) {
-            if i > 0 {
-                out.push_str(sep_str);
-            }
-            out.push_str(&raw.to_string());
+    let run = |impl_ref: &ListImpl| {
+        // SAFETY: `sep` is null or a valid C string per caller contract.
+        unsafe {
+            crate::ffi_util::with_cstr_str_or_empty(sep, |sep_str| {
+                list_join_int_impl(impl_ref, sep_str)
+            })
         }
-        i += 1;
+    };
+    // SAFETY: `with_list_ref` validates `list` before reading from it.
+    unsafe { with_list_ref(list, run) }.unwrap_or(std::ptr::null_mut())
+}
+
+#[inline(always)]
+unsafe fn list_pop_impl(impl_ref: &mut ListImpl, elem_size: i64, out: *mut u8) -> bool {
+    if impl_ref.elem_size != elem_size as usize {
+        eprintln!("pith: list element size mismatch");
+        return false;
     }
 
-    crate::pith_copy_bytes_to_cstring(out.as_bytes())
+    match impl_ref.pop() {
+        Some(elem_data) => {
+            // Copy to output buffer
+            // SAFETY: Caller guarantees `out` is writable for `elem_size == elem_data.len()` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len()) };
+
+            // The list's count transfers to the caller with the element,
+            // so there is no release here.
+            true
+        }
+        None => false,
+    }
 }
 
 /// Pop element from end of list
@@ -1118,26 +1359,21 @@ pub unsafe extern "C" fn pith_list_pop(list: *mut PithList, elem_size: i64, out:
         return false;
     }
 
-    let Some(impl_ref) = list_mut(*list) else {
-        return false;
-    };
+    // SAFETY: `list` is non-null per caller contract.
+    let list_val = unsafe { *list };
+    // SAFETY: `with_list_mut` validates `list_val`; `out` is writable for `elem_size` bytes.
+    unsafe { with_list_mut(list_val, |impl_ref| list_pop_impl(impl_ref, elem_size, out)) }
+        .unwrap_or(false)
+}
 
-    if impl_ref.elem_size != elem_size as usize {
-        eprintln!("pith: list element size mismatch");
-        return false;
+#[inline(always)]
+fn list_get_opt_impl(impl_ref: &ListImpl, index: i64) -> Option<i64> {
+    if index < 0 || index >= impl_ref.len() as i64 || impl_ref.elem_size != 8 {
+        return None;
     }
-
-    match impl_ref.pop() {
-        Some(elem_data) => {
-            // Copy to output buffer
-            std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len());
-
-            // The list's count transfers to the caller with the element,
-            // so there is no release here.
-            true
-        }
-        None => false,
-    }
+    crate::perf_stats!(PERF_LIST_GETS += 1);
+    // SAFETY: `0 <= index < impl_ref.len()` checked above.
+    Some(unsafe { impl_ref.get_value_unchecked(index as usize) })
 }
 
 /// Get element at index wrapped in an Optional tuple. Returns `Some(value)`
@@ -1148,17 +1384,20 @@ pub unsafe extern "C" fn pith_list_pop(list: *mut PithList, elem_size: i64, out:
 /// * `list` must be a valid `PithList` handle or all-zero.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_get_opt(list: PithList, index: i64) -> i64 {
-    let Some(impl_ref) = list_ref(list) else {
-        return optional_tuple(false, 0);
-    };
-    if index < 0 || index >= impl_ref.len() as i64 {
-        return optional_tuple(false, 0);
-    }
-    if impl_ref.elem_size != 8 {
-        return optional_tuple(false, 0);
+    // SAFETY: `with_list_ref` validates `list` before reading from it.
+    let found = unsafe { with_list_ref(list, |impl_ref| list_get_opt_impl(impl_ref, index)) }
+        .flatten();
+    optional_from(found)
+}
+
+#[inline(always)]
+fn list_first_impl(impl_ref: &ListImpl) -> Option<i64> {
+    if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
+        return None;
     }
     crate::perf_stats!(PERF_LIST_GETS += 1);
-    optional_tuple(true, impl_ref.get_value_unchecked(index as usize))
+    // SAFETY: `impl_ref.len() > 0` checked above.
+    Some(unsafe { impl_ref.get_value_unchecked(0) })
 }
 
 /// Return the first element of the list wrapped in an Optional tuple, or
@@ -1167,25 +1406,31 @@ pub unsafe extern "C" fn pith_list_get_opt(list: PithList, index: i64) -> i64 {
 /// # Safety
 /// * `list` must be a valid `PithList` handle or all-zero.
 unsafe fn list_first(list: PithList) -> Option<i64> {
-    let Some(impl_ref) = list_ref(list) else {
-        return None;
-    };
-    if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
-        return None;
-    }
-    crate::perf_stats!(PERF_LIST_GETS += 1);
-    Some(impl_ref.get_value_unchecked(0))
+    // SAFETY: `with_list_ref` validates `list` before reading from it.
+    unsafe { with_list_ref(list, list_first_impl) }.flatten()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_first_opt(list: PithList) -> i64 {
-    optional_from(list_first(list))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_from(unsafe { list_first(list) })
 }
 
 /// `pith_list_first_opt` as a register pair; see `optional_pair`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_first_opt_pair(list: PithList) -> ResultPair {
-    optional_pair(list_first(list))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_pair(unsafe { list_first(list) })
+}
+
+#[inline(always)]
+fn list_last_impl(impl_ref: &ListImpl) -> Option<i64> {
+    if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
+        return None;
+    }
+    crate::perf_stats!(PERF_LIST_GETS += 1);
+    // SAFETY: `impl_ref.len() > 0` checked above.
+    Some(unsafe { impl_ref.get_value_unchecked(impl_ref.len() - 1) })
 }
 
 /// Return the last element of the list wrapped in an Optional tuple, or
@@ -1194,25 +1439,21 @@ pub unsafe extern "C" fn pith_list_first_opt_pair(list: PithList) -> ResultPair 
 /// # Safety
 /// * `list` must be a valid `PithList` handle or all-zero.
 unsafe fn list_last(list: PithList) -> Option<i64> {
-    let Some(impl_ref) = list_ref(list) else {
-        return None;
-    };
-    if impl_ref.len() == 0 || impl_ref.elem_size != 8 {
-        return None;
-    }
-    crate::perf_stats!(PERF_LIST_GETS += 1);
-    Some(impl_ref.get_value_unchecked(impl_ref.len() - 1))
+    // SAFETY: `with_list_ref` validates `list` before reading from it.
+    unsafe { with_list_ref(list, list_last_impl) }.flatten()
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_last_opt(list: PithList) -> i64 {
-    optional_from(list_last(list))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_from(unsafe { list_last(list) })
 }
 
 /// `pith_list_last_opt` as a register pair; see `optional_pair`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_last_opt_pair(list: PithList) -> ResultPair {
-    optional_pair(list_last(list))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_pair(unsafe { list_last(list) })
 }
 
 /// Strict pointer-sized indexed access for `list[i]`. Aborts with a
@@ -1254,11 +1495,8 @@ fn strict_index_bad_elem_size(elem_size: usize) -> ! {
     std::process::exit(1);
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_get_value_strict(list: PithList, index: i64) -> i64 {
-    let Some(impl_ref) = list_ref(list) else {
-        strict_index_bad_handle();
-    };
+#[inline(always)]
+fn list_get_value_strict_impl(impl_ref: &ListImpl, index: i64) -> i64 {
     crate::perf_stats!(PERF_LIST_GETS += 1);
     let len = impl_ref.len() as i64;
     if index < 0 || index >= len {
@@ -1267,16 +1505,21 @@ pub unsafe extern "C" fn pith_list_get_value_strict(list: PithList, index: i64) 
     if impl_ref.elem_size != 8 {
         strict_index_bad_elem_size(impl_ref.elem_size);
     }
-    impl_ref.get_value_unchecked(index as usize)
+    // SAFETY: `0 <= index < len` checked above.
+    unsafe { impl_ref.get_value_unchecked(index as usize) }
 }
 
-/// Get element at index for pointer-sized elements (returns i64 directly)
-/// Returns 0 if out of bounds or on error
 #[no_mangle]
-pub unsafe extern "C" fn pith_list_get_value(list: PithList, index: i64) -> i64 {
-    let Some(impl_ref) = list_ref(list) else {
-        return 0;
-    };
+pub unsafe extern "C" fn pith_list_get_value_strict(list: PithList, index: i64) -> i64 {
+    // SAFETY: `with_list_ref` validates `list` before reading from it.
+    match unsafe { with_list_ref(list, |impl_ref| list_get_value_strict_impl(impl_ref, index)) } {
+        Some(v) => v,
+        None => strict_index_bad_handle(),
+    }
+}
+
+#[inline(always)]
+fn list_get_value_impl(impl_ref: &ListImpl, index: i64) -> i64 {
     crate::perf_stats!(
         PERF_LIST_GETS += 1,
         PERF_LIST_GET_VALUE_CALLS += 1,
@@ -1293,20 +1536,20 @@ pub unsafe extern "C" fn pith_list_get_value(list: PithList, index: i64) -> i64 
     }
 
     crate::perf_count(&crate::PERF_LIST_GET_ELEM8, 1);
-    impl_ref.get_value_unchecked(index as usize)
+    // SAFETY: `0 <= index < impl_ref.len()` checked above.
+    unsafe { impl_ref.get_value_unchecked(index as usize) }
 }
 
-/// Get element at index for pointer-sized elements without an upper-bound check.
-/// This is used only in compiler-generated loops that already guard the index.
+/// Get element at index for pointer-sized elements (returns i64 directly)
+/// Returns 0 if out of bounds or on error
 #[no_mangle]
-pub unsafe extern "C" fn pith_list_get_value_unchecked(list: PithList, index: i64) -> i64 {
-    if index < 0 {
-        return 0;
-    }
+pub unsafe extern "C" fn pith_list_get_value(list: PithList, index: i64) -> i64 {
+    // SAFETY: `with_list_ref` validates `list` before reading from it.
+    unsafe { with_list_ref(list, |impl_ref| list_get_value_impl(impl_ref, index)) }.unwrap_or(0)
+}
 
-    let Some(impl_ref) = list_ref(list) else {
-        return 0;
-    };
+#[inline(always)]
+fn list_get_value_unchecked_impl(impl_ref: &ListImpl, index: i64) -> i64 {
     crate::perf_stats!(
         PERF_LIST_GETS += 1,
         PERF_LIST_GET_VALUE_CALLS += 1,
@@ -1322,26 +1565,30 @@ pub unsafe extern "C" fn pith_list_get_value_unchecked(list: PithList, index: i6
     }
 
     crate::perf_count(&crate::PERF_LIST_GET_ELEM8, 1);
-    impl_ref.get_value_unchecked(index as usize)
+    // SAFETY: `0 <= index < impl_ref.len()` checked by caller and above.
+    unsafe { impl_ref.get_value_unchecked(index as usize) }
 }
 
-/// Get element at index (copies to out buffer)
-///
-/// Returns true if successful, false if index out of bounds
+/// Get element at index for pointer-sized elements without an upper-bound check.
+/// This is used only in compiler-generated loops that already guard the index.
 #[no_mangle]
-pub unsafe extern "C" fn pith_list_get(
-    list: PithList,
+pub unsafe extern "C" fn pith_list_get_value_unchecked(list: PithList, index: i64) -> i64 {
+    if index < 0 {
+        return 0;
+    }
+
+    // SAFETY: `with_list_ref` validates `list` before reading from it.
+    unsafe { with_list_ref(list, |impl_ref| list_get_value_unchecked_impl(impl_ref, index)) }
+        .unwrap_or(0)
+}
+
+#[inline(always)]
+unsafe fn list_get_bytes_impl(
+    impl_ref: &ListImpl,
     index: i64,
     elem_size: i64,
     out: *mut u8,
 ) -> bool {
-    if out.is_null() {
-        return false;
-    }
-
-    let Some(impl_ref) = list_ref(list) else {
-        return false;
-    };
     crate::perf_stats!(PERF_LIST_GETS += 1, PERF_LIST_GET_BYTES_CALLS += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
@@ -1361,9 +1608,11 @@ pub unsafe extern "C" fn pith_list_get(
     match impl_ref.get_value(index as usize) {
         Some(value) => {
             if elem_size == 8 {
-                std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), out, 8);
+                // SAFETY: Caller guarantees `out` is writable for 8 bytes.
+                unsafe { std::ptr::copy_nonoverlapping(value.to_ne_bytes().as_ptr(), out, 8) };
             } else if let Some(elem_data) = impl_ref.elements.get(index as usize) {
-                std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len());
+                // SAFETY: Caller guarantees `out` is writable for `elem_size == elem_data.len()` bytes.
+                unsafe { std::ptr::copy_nonoverlapping(elem_data.as_ptr(), out, elem_data.len()) };
             } else {
                 return false;
             }
@@ -1374,6 +1623,65 @@ pub unsafe extern "C" fn pith_list_get(
         }
         None => false,
     }
+}
+
+/// Get element at index (copies to out buffer)
+///
+/// Returns true if successful, false if index out of bounds
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_get(
+    list: PithList,
+    index: i64,
+    elem_size: i64,
+    out: *mut u8,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+
+    // SAFETY: `with_list_ref` validates `list`; `out` is writable for `elem_size` bytes.
+    unsafe {
+        with_list_ref(list, |impl_ref| {
+            list_get_bytes_impl(impl_ref, index, elem_size, out)
+        })
+    }
+    .unwrap_or(false)
+}
+
+#[inline(always)]
+unsafe fn list_set_bytes_impl(
+    impl_ref: &mut ListImpl,
+    index: i64,
+    elem: *const u8,
+    elem_size: i64,
+) -> bool {
+    crate::perf_stats!(PERF_LIST_SETS += 1);
+
+    if index < 0 || index >= impl_ref.len() as i64 {
+        return false;
+    }
+
+    if impl_ref.elem_size != elem_size as usize {
+        eprintln!("pith: list element size mismatch");
+        return false;
+    }
+
+    // Copy new element
+    // SAFETY: Caller guarantees `elem` points to `elem_size` readable bytes.
+    let elem_slice = unsafe { std::slice::from_raw_parts(elem, elem_size as usize) };
+
+    // retain the incoming element before dropping the count on what it
+    // displaces, so `l[i] = l[i]` cannot free the value mid-assignment
+    // SAFETY: Heap elements carry a valid handle for `impl_ref.type_tag`.
+    unsafe { retain_element(impl_ref.type_tag, ListImpl::read_i64_padded(elem_slice)) };
+
+    let displaced = displaced_element(impl_ref, index as usize);
+    impl_ref.set(index as usize, elem_slice);
+    if let Some(raw) = displaced {
+        // SAFETY: `displaced` was an element owned by `impl_ref`.
+        unsafe { release_element(impl_ref.type_tag, raw) };
+    }
+    true
 }
 
 /// Set element at index (copies from elem buffer)
@@ -1390,10 +1698,18 @@ pub unsafe extern "C" fn pith_list_set(
         return false;
     }
 
-    let Some(impl_ref) = list_mut(list) else {
-        return false;
-    };
-    crate::perf_stats!(PERF_LIST_SETS += 1);
+    // SAFETY: `with_list_mut` validates `list`; `elem` is readable for `elem_size` bytes.
+    unsafe {
+        with_list_mut(list, |impl_ref| {
+            list_set_bytes_impl(impl_ref, index, elem, elem_size)
+        })
+    }
+    .unwrap_or(false)
+}
+
+#[inline(always)]
+unsafe fn list_remove_bytes_impl(impl_ref: &mut ListImpl, index: i64, elem_size: i64) -> bool {
+    crate::perf_stats!(PERF_LIST_REMOVES += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
         return false;
@@ -1404,17 +1720,11 @@ pub unsafe extern "C" fn pith_list_set(
         return false;
     }
 
-    // Copy new element
-    let elem_slice = std::slice::from_raw_parts(elem, elem_size as usize);
-
-    // retain the incoming element before dropping the count on what it
-    // displaces, so `l[i] = l[i]` cannot free the value mid-assignment
-    retain_element(impl_ref.type_tag, ListImpl::read_i64_padded(elem_slice));
-
     let displaced = displaced_element(impl_ref, index as usize);
-    impl_ref.set(index as usize, elem_slice);
+    impl_ref.remove(index as usize);
     if let Some(raw) = displaced {
-        release_element(impl_ref.type_tag, raw);
+        // SAFETY: `displaced` was an element owned by `impl_ref`.
+        unsafe { release_element(impl_ref.type_tag, raw) };
     }
     true
 }
@@ -1428,26 +1738,32 @@ pub unsafe extern "C" fn pith_list_remove(list: *mut PithList, index: i64, elem_
         return false;
     }
 
-    let Some(impl_ref) = list_mut(*list) else {
-        return false;
-    };
+    // SAFETY: `list` is non-null per caller contract.
+    let list_val = unsafe { *list };
+    // SAFETY: `with_list_mut` validates `list_val` before mutating it.
+    unsafe {
+        with_list_mut(list_val, |impl_ref| {
+            list_remove_bytes_impl(impl_ref, index, elem_size)
+        })
+    }
+    .unwrap_or(false)
+}
+
+#[inline(always)]
+unsafe fn list_remove_value_impl(impl_ref: &mut ListImpl, index: i64) -> i64 {
     crate::perf_stats!(PERF_LIST_REMOVES += 1);
 
     if index < 0 || index >= impl_ref.len() as i64 {
-        return false;
-    }
-
-    if impl_ref.elem_size != elem_size as usize {
-        eprintln!("pith: list element size mismatch");
-        return false;
+        return 0;
     }
 
     let displaced = displaced_element(impl_ref, index as usize);
     impl_ref.remove(index as usize);
     if let Some(raw) = displaced {
-        release_element(impl_ref.type_tag, raw);
+        // SAFETY: `displaced` was an element owned by `impl_ref`.
+        unsafe { release_element(impl_ref.type_tag, raw) };
     }
-    true
+    1
 }
 
 /// Remove the element at `index`, with the list handle passed by value
@@ -1455,44 +1771,36 @@ pub unsafe extern "C" fn pith_list_remove(list: *mut PithList, index: i64, elem_
 /// removed and 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_remove_value(list: PithList, index: i64) -> i64 {
-    let Some(impl_ref) = list_mut(list) else {
-        return 0;
-    };
-    crate::perf_stats!(PERF_LIST_REMOVES += 1);
+    // SAFETY: `with_list_mut` validates `list` before mutating it.
+    unsafe { with_list_mut(list, |impl_ref| list_remove_value_impl(impl_ref, index)) }.unwrap_or(0)
+}
 
-    if index < 0 || index >= impl_ref.len() as i64 {
-        return 0;
-    }
-
-    let displaced = displaced_element(impl_ref, index as usize);
-    impl_ref.remove(index as usize);
-    if let Some(raw) = displaced {
-        release_element(impl_ref.type_tag, raw);
-    }
-    1
+#[inline(always)]
+unsafe fn list_clear_impl(impl_ref: &mut ListImpl) {
+    // SAFETY: `impl_ref` owns one count per stored heap element.
+    unsafe { release_all_elements(impl_ref) };
+    impl_ref.clear();
 }
 
 /// Clear all elements from list (by-value variant)
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_clear_value(list: PithList) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
-    };
+    // SAFETY: `with_list_mut` validates `list` before clearing it.
+    unsafe { with_list_mut(list, |impl_ref| list_clear_impl(impl_ref)) };
+}
 
-    release_all_elements(impl_ref);
-    impl_ref.clear();
+fn list_reverse_value_impl(impl_ref: &mut ListImpl) {
+    let len = impl_ref.len();
+    for i in 0..len / 2 {
+        impl_ref.swap(i, len - 1 - i);
+    }
 }
 
 /// Reverse the list in place, with the handle passed by value.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_reverse_value(list: PithList) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
-    };
-    let len = impl_ref.len();
-    for i in 0..len / 2 {
-        impl_ref.swap(i, len - 1 - i);
-    }
+    // SAFETY: `with_list_mut` validates `list` before reversing it.
+    unsafe { with_list_mut(list, list_reverse_value_impl) };
 }
 
 /// Clear all elements from list
@@ -1502,20 +1810,13 @@ pub unsafe extern "C" fn pith_list_clear(list: *mut PithList) {
         return;
     }
 
-    let Some(impl_ref) = list_mut(*list) else {
-        return;
-    };
-
-    release_all_elements(impl_ref);
-    impl_ref.clear();
+    // SAFETY: `list` is non-null per caller contract.
+    let list_val = unsafe { *list };
+    // SAFETY: `with_list_mut` validates `list_val` before clearing it.
+    unsafe { with_list_mut(list_val, |impl_ref| list_clear_impl(impl_ref)) };
 }
 
-/// Reverse list elements in-place
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_reverse(list: PithList) {
-    let Some(impl_ref) = list_mut(list) else {
-        return;
-    };
+fn list_reverse_impl(impl_ref: &mut ListImpl) {
     if impl_ref.uses_value_storage() {
         impl_ref.values8.reverse();
         impl_ref.sync_value_view();
@@ -1524,20 +1825,30 @@ pub unsafe extern "C" fn pith_list_reverse(list: PithList) {
     }
 }
 
+/// Reverse list elements in-place
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_reverse(list: PithList) {
+    // SAFETY: `with_list_mut` validates `list` before reversing it.
+    unsafe { with_list_mut(list, list_reverse_impl) };
+}
+
 /// Release list and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_release(list: PithList) {
-    if !list_magic_ok_for(list.ptr as *const (), crate::quarantine::Op::Release) {
+    // SAFETY: `list_magic_ok_for` validates alignment and magic word.
+    if !unsafe { list_magic_ok_for(list.ptr as *const (), crate::quarantine::Op::Release) } {
         return;
     }
-    let impl_ref = &mut *(list.ptr as *mut ListImpl);
+    // SAFETY: Magic validated; only atomic fields are accessed while shared.
+    let impl_ref = unsafe { &*(list.ptr as *const ListImpl) };
     // cycle-gc suspect hook, before our count is given up: while we still
     // hold it the list cannot die under the hook (see `maybe_suspect_struct`
     // in runtime_core for why the ordering matters).
     if crate::cycle::cycle_gc_enabled()
         && impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed) > 1
     {
-        maybe_suspect_list(impl_ref, list.ptr as usize);
+        // SAFETY: Caller still holds a strong count so `list` stays live across the hook.
+        unsafe { maybe_suspect_list(impl_ref, list.ptr as usize) };
     }
     let prev = impl_ref
         .rc
@@ -1554,28 +1865,33 @@ pub unsafe extern "C" fn pith_list_release(list: PithList) {
     acquire_last_count!(impl_ref.rc);
 
     // Last count: release the elements this list owns, then free.
-    release_all_elements(impl_ref);
+    // SAFETY: Last strong count observed with acquire; exclusive access to release elements.
+    unsafe { release_all_elements(impl_ref) };
+    let buffered = crate::cycle::cycle_gc_enabled()
+        && impl_ref
+            .cycle_flags
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 1
+            != 0;
 
     // Scrub the magic first so any handle that outlives the list fails the
     // fast validity check.
-    (*(list.ptr as *mut ListImpl)).magic = 0;
-    retire_identity(list.ptr);
+    // SAFETY: `impl_ref` borrow ended above; exclusive ownership of `list.ptr`.
+    unsafe {
+        (*(list.ptr as *mut ListImpl)).magic = 0;
+        retire_identity(list.ptr);
+    }
     crate::perf_count(&crate::PERF_LIST_FREES, 1);
     // a list that dies while the suspect buffer points at it keeps its shell:
     // the elements are already released and the handle no longer validates
     // anywhere, so deferring the box drop to the graveyard leaks only the
     // impl struct until the collector frees it.
-    if crate::cycle::cycle_gc_enabled()
-        && impl_ref
-            .cycle_flags
-            .load(std::sync::atomic::Ordering::Relaxed)
-            & 1
-            != 0
-    {
+    if buffered {
         crate::cycle::graveyard_defer(list.ptr as usize, crate::cycle::CYCLE_KIND_LIST);
         return;
     }
-    drop_list_shell(list.ptr as *mut ListImpl);
+    // SAFETY: Last owner, magic scrubbed, identity retired, not deferred to graveyard.
+    unsafe { drop_list_shell(list.ptr as *mut ListImpl) };
 }
 
 /// Mark a list as a cycle suspect and hand it to the buffer. Cold and
@@ -1591,17 +1907,20 @@ unsafe fn maybe_suspect_list(impl_ref: &ListImpl, ptr: usize) {
     {
         return; // already buffered
     }
-    crate::cycle::cycle_suspect(ptr, crate::cycle::CYCLE_KIND_LIST);
+    // SAFETY: Caller holds a strong count on `ptr` so it stays live across `cycle_suspect`.
+    unsafe { crate::cycle::cycle_suspect(ptr, crate::cycle::CYCLE_KIND_LIST) };
 }
 
 /// Drop a list's buffered mark (overflow, or a collector drain). Magic-
 /// checked, so a list that already died and was freed is a no-op.
 pub(crate) unsafe fn cycle_clear_list_buffered(handle: i64) {
-    if let Some(impl_ref) = list_ref_from_handle(handle) {
+    let clear = |impl_ref: &ListImpl| {
         impl_ref
             .cycle_flags
             .fetch_and(!1, std::sync::atomic::Ordering::Relaxed);
-    }
+    };
+    // SAFETY: `with_list_ref_handle` validates `handle` before clearing its buffered bit.
+    unsafe { with_list_ref_handle(handle, clear) };
 }
 
 // --- collector-facing accessors ---------------------------------------------
@@ -1617,16 +1936,18 @@ pub(crate) unsafe fn cycle_clear_list_buffered(handle: i64) {
 /// numbering the collector speaks.
 /// Mark the list shared (see `share.rs`); true when this call set the mark.
 pub(crate) unsafe fn list_mark_shared(handle: i64) -> bool {
-    match list_ref_from_handle(handle) {
-        Some(impl_ref) => {
-            impl_ref
-                .cycle_flags
-                .fetch_or(crate::share::CONTAINER_SHARED_FLAG, std::sync::atomic::Ordering::Release)
-                & crate::share::CONTAINER_SHARED_FLAG
-                == 0
-        }
-        None => false,
-    }
+    let mark = |impl_ref: &ListImpl| {
+        impl_ref
+            .cycle_flags
+            .fetch_or(
+                crate::share::CONTAINER_SHARED_FLAG,
+                std::sync::atomic::Ordering::Release,
+            )
+            & crate::share::CONTAINER_SHARED_FLAG
+            == 0
+    };
+    // SAFETY: `with_list_ref_handle` validates `handle` before setting its shared flag.
+    unsafe { with_list_ref_handle(handle, mark) }.unwrap_or(false)
 }
 
 pub(crate) fn cycle_child_code(tag: ListTypeTag) -> Option<u8> {
@@ -1643,24 +1964,23 @@ pub(crate) fn cycle_child_code(tag: ListTypeTag) -> Option<u8> {
 /// The list's current reference count, or `None` when the handle no longer
 /// validates (the list died into the graveyard).
 pub(crate) unsafe fn cycle_list_strong_count(handle: i64) -> Option<u32> {
-    list_ref_from_handle(handle)
-        .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
+    let read_rc = |impl_ref: &ListImpl| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `with_list_ref_handle` validates `handle` before reading its refcount.
+    unsafe { with_list_ref_handle(handle, read_rc) }
 }
 
 /// Add `delta` to the reference count: the collector's teardown guard.
 pub(crate) unsafe fn cycle_list_guard_strong(handle: i64, delta: u32) {
-    if let Some(impl_ref) = list_ref_from_handle(handle) {
+    let bump = |impl_ref: &ListImpl| {
         impl_ref
             .rc
             .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
-    }
+    };
+    // SAFETY: `with_list_ref_handle` validates `handle` before updating its refcount.
+    unsafe { with_list_ref_handle(handle, bump) };
 }
 
-/// Report every element the list owns a count on, as (value, child code).
-pub(crate) unsafe fn cycle_list_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
-    let Some(impl_ref) = list_ref_from_handle(handle) else {
-        return;
-    };
+fn visit_list_children(impl_ref: &ListImpl, f: &mut dyn FnMut(i64, u8)) {
     let Some(code) = cycle_child_code(impl_ref.type_tag) else {
         return;
     };
@@ -1673,15 +1993,18 @@ pub(crate) unsafe fn cycle_list_children(handle: i64, f: &mut dyn FnMut(i64, u8)
     }
 }
 
+/// Report every element the list owns a count on, as (value, child code).
+pub(crate) unsafe fn cycle_list_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
+    // SAFETY: `with_list_ref_handle` validates `handle` before iterating its elements.
+    unsafe { with_list_ref_handle(handle, |impl_ref| visit_list_children(impl_ref, f)) };
+}
+
 /// The destruction body of a garbage list: drop the count it holds on every
 /// element, then empty the storage so the shell free below can never release
 /// them a second time.
 pub(crate) unsafe fn cycle_list_release_elements(handle: i64) {
-    let Some(impl_ref) = list_mut_from_handle(handle) else {
-        return;
-    };
-    release_all_elements(impl_ref);
-    impl_ref.clear();
+    // SAFETY: Collector holds the world stopped; `with_list_mut_handle` validates `handle`.
+    unsafe { with_list_mut_handle(handle, |impl_ref| list_clear_impl(impl_ref)) };
 }
 
 /// Free a garbage list's shell: the tail of `pith_list_release` minus the
@@ -1689,42 +2012,54 @@ pub(crate) unsafe fn cycle_list_release_elements(handle: i64) {
 /// re-buffered during teardown parks in the graveyard so the fresh suspect
 /// entry never dangles.
 pub(crate) unsafe fn cycle_list_free_dead(handle: i64) {
-    let Some(impl_ref) = list_ref_from_handle(handle) else {
+    let read_buffered = |impl_ref: &ListImpl| {
+        impl_ref
+            .cycle_flags
+            .load(std::sync::atomic::Ordering::Relaxed)
+            & 1
+            != 0
+    };
+    // SAFETY: `with_list_ref_handle` validates `handle` and scopes the borrow before free.
+    let Some(buffered) = (unsafe { with_list_ref_handle(handle, read_buffered) }) else {
         return;
     };
-    let buffered = impl_ref
-        .cycle_flags
-        .load(std::sync::atomic::Ordering::Relaxed)
-        & 1
-        != 0;
-    (*(handle as *mut ListImpl)).magic = 0;
-    retire_identity(handle as *mut ());
+    // SAFETY: Borrow ended above; collector owns this dead list exclusively.
+    unsafe {
+        (*(handle as *mut ListImpl)).magic = 0;
+        retire_identity(handle as *mut ());
+    }
     crate::perf_count(&crate::PERF_LIST_FREES, 1);
     if buffered && crate::cycle::cycle_gc_enabled() {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_LIST);
         return;
     }
-    drop_list_shell(handle as *mut ListImpl);
+    // SAFETY: Magic scrubbed, identity retired, and not deferred to graveyard.
+    unsafe { drop_list_shell(handle as *mut ListImpl) };
 }
 
 /// Drop a list shell the graveyard parked: elements already released, magic
 /// already scrubbed, registry entry already gone; only the box remains.
 pub(crate) unsafe fn cycle_drop_list_shell(ptr: usize) {
-    drop_list_shell(ptr as *mut ListImpl);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { drop_list_shell(ptr as *mut ListImpl) };
 }
 
 /// Free a dead list's box, or quarantine it.
 unsafe fn drop_list_shell(ptr: *mut ListImpl) {
-    let magic = std::ptr::addr_of_mut!((*ptr).magic);
-    crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::List);
+    // SAFETY: Caller passes a valid `Box::into_raw` `ListImpl` pointer to free or quarantine.
+    unsafe {
+        let magic = std::ptr::addr_of_mut!((*ptr).magic);
+        crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::List);
+    }
 }
 
 /// Retain a list handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_retain_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_LIST_RETAIN);
-    if list_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) {
-        (*(handle as *const ListImpl))
+    // SAFETY: Magic check validates handle before atomic retain increment.
+    if unsafe { list_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) } {
+        unsafe { &*(handle as *const ListImpl) }
             .rc
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1734,9 +2069,12 @@ pub unsafe extern "C" fn pith_list_retain_handle(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_release_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_LIST_RELEASE);
-    pith_list_release(PithList {
-        ptr: handle as *mut (),
-    });
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        pith_list_release(PithList {
+            ptr: handle as *mut (),
+        });
+    }
 }
 
 /// Destructor for list elements in collections
@@ -1748,10 +2086,9 @@ pub extern "C" fn pith_list_destructor(ptr: *mut u8) {
         return;
     }
 
-    unsafe {
-        let list = ptr as *const PithList;
-        pith_list_release(*list);
-    }
+    let list = ptr as *const PithList;
+    // SAFETY: Caller guarantees `ptr` points to a valid `PithList`.
+    unsafe { pith_list_release(*list) };
 }
 
 #[cfg(test)]
@@ -2097,11 +2434,15 @@ mod tests {
     /// A string list holding one element the caller has already let go of,
     /// so the list's count is the only one left.
     unsafe fn list_owning_one_element(text: &[u8]) -> (PithList, *mut i8) {
-        let list = pith_list_new(8, 1);
         let s = crate::pith_copy_bytes_to_cstring(text);
-        pith_list_push_value(list, s as i64);
-        crate::pith_cstring_release(s);
-        assert_eq!(crate::cstring_refcount_for_tests(s), Some(1));
+        let (list, rc) = unsafe {
+            let list = pith_list_new(8, 1);
+            pith_list_push_value(list, s as i64);
+            crate::pith_cstring_release(s);
+            let rc = crate::cstring_refcount_for_tests(s);
+            (list, rc)
+        };
+        assert_eq!(rc, Some(1));
         (list, s)
     }
 
@@ -2202,12 +2543,17 @@ mod tests {
             let mut b_list = pith_list_new(1, 0);
             let byte: u8 = 0x5a;
             pith_list_push(&mut b_list, &byte as *const u8, 1);
-            let b_ref = list_ref(b_list).unwrap();
-            assert_eq!(b_ref.get_value(0), Some(0x5a));
-            assert_eq!(b_ref.get_value_unchecked(0), 0x5a);
+            with_list_ref(b_list, |b_ref| {
+                assert_eq!(b_ref.get_value(0), Some(0x5a));
+                assert_eq!(b_ref.get_value_unchecked(0), 0x5a);
+            })
+            .unwrap();
             let updated: u8 = 0xa5;
             assert!(pith_list_set(b_list, 0, &updated as *const u8, 1));
-            assert_eq!(list_ref(b_list).unwrap().get_value(0), Some(0xa5));
+            assert_eq!(
+                with_list_ref(b_list, |b_ref| b_ref.get_value(0)).unwrap(),
+                Some(0xa5)
+            );
             pith_list_release(b_list);
 
             let mut w_list = pith_list_new(4, 0);
@@ -2215,10 +2561,78 @@ mod tests {
             let bytes = word.to_ne_bytes();
             pith_list_push(&mut w_list, bytes.as_ptr(), 4);
             let expected = i64::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3], 0, 0, 0, 0]);
-            let w_ref = list_ref(w_list).unwrap();
-            assert_eq!(w_ref.get_value(0), Some(expected));
-            assert_eq!(w_ref.get_value_unchecked(0), expected);
+            with_list_ref(w_list, |w_ref| {
+                assert_eq!(w_ref.get_value(0), Some(expected));
+                assert_eq!(w_ref.get_value_unchecked(0), expected);
+            })
+            .unwrap();
             pith_list_release(w_list);
+        }
+    }
+
+    #[test]
+    fn with_list_mut_and_ref_handles_self_aliasing_and_distinct_lists() {
+        unsafe {
+            let a = pith_list_new(8, 0);
+            let b = pith_list_new(8, 0);
+            pith_list_push_value(a, 1);
+            pith_list_push_value(a, 2);
+            pith_list_push_value(b, 3);
+
+            // distinct lists extend without aliasing
+            let distinct = with_list_mut_and_ref(
+                a,
+                b,
+                |dst, src| {
+                    for i in 0..src.len() {
+                        if let Some(v) = src.get_value(i) {
+                            dst.push_value(v);
+                        }
+                    }
+                    "distinct"
+                },
+                |_| "same",
+            );
+            assert_eq!(distinct, Some("distinct"));
+            assert_eq!(pith_list_len(a), 3);
+            assert_eq!(pith_list_get_value(a, 2), 3);
+
+            // self-aliasing extends a list with itself via `on_same` (single `&mut`)
+            let same = with_list_mut_and_ref(
+                a,
+                a,
+                |_, _| "distinct",
+                |list| {
+                    let snapshot: Vec<i64> = list.values8.clone();
+                    for v in snapshot {
+                        list.push_value(v);
+                    }
+                    "same"
+                },
+            );
+            assert_eq!(same, Some("same"));
+            assert_eq!(pith_list_len(a), 6);
+            assert_eq!(pith_list_get_value(a, 3), 1);
+            assert_eq!(pith_list_get_value(a, 4), 2);
+            assert_eq!(pith_list_get_value(a, 5), 3);
+
+            // invalid handles return None
+            assert!(with_list_mut_and_ref(bogus_list(), a, |_, _| (), |_| ()).is_none());
+            assert!(with_list_mut_and_ref(a, bogus_list(), |_, _| (), |_| ()).is_none());
+
+            // shared ref2 handles both distinct and aliased lists
+            assert_eq!(
+                with_list_ref2_handle(a.ptr as i64, b.ptr as i64, |x, y| (x.len(), y.len())),
+                Some((6, 1))
+            );
+            assert_eq!(
+                with_list_ref2_handle(a.ptr as i64, a.ptr as i64, |x, y| x.len() + y.len()),
+                Some(12)
+            );
+            assert!(with_list_ref2_handle(a.ptr as i64, 12345, |_, _| ()).is_none());
+
+            pith_list_release(a);
+            pith_list_release(b);
         }
     }
 }

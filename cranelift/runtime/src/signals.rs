@@ -86,34 +86,45 @@ extern "C" fn handle_signal(sig: libc::c_int) {
 }
 
 #[cfg(target_os = "linux")]
-unsafe fn errno_location() -> *mut libc::c_int {
-    libc::__errno_location()
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: `__errno_location` returns the calling thread's errno pointer and is async-signal-safe.
+    unsafe { libc::__errno_location() }
 }
 
 #[cfg(not(target_os = "linux"))]
-unsafe fn errno_location() -> *mut libc::c_int {
-    libc::__error()
+fn errno_location() -> *mut libc::c_int {
+    // SAFETY: `__error` returns the calling thread's errno pointer and is async-signal-safe.
+    unsafe { libc::__error() }
 }
 
 /// a pipe with both ends close-on-exec and non-blocking. linux sets the flags
 /// as it creates the pipe; macos has no `pipe2`, so they are set after, which
 /// is safe here because the pipe is built before any thread can fork.
 #[cfg(target_os = "linux")]
-unsafe fn cloexec_nonblocking_pipe(fds: &mut [libc::c_int; 2]) -> libc::c_int {
-    libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK)
+fn cloexec_nonblocking_pipe(fds: &mut [libc::c_int; 2]) -> libc::c_int {
+    // SAFETY: `fds` is a valid 2-element array owned by the caller.
+    unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) }
 }
 
 #[cfg(not(target_os = "linux"))]
-unsafe fn cloexec_nonblocking_pipe(fds: &mut [libc::c_int; 2]) -> libc::c_int {
-    if libc::pipe(fds.as_mut_ptr()) != 0 {
+fn cloexec_nonblocking_pipe(fds: &mut [libc::c_int; 2]) -> libc::c_int {
+    // SAFETY: `fds` is a valid 2-element array owned by the caller.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return -1;
     }
     for &fd in fds.iter() {
-        if libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != 0
-            || libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK) != 0
-        {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
+        // SAFETY: `fd` is a valid pipe descriptor just opened by `pipe`.
+        let ok = unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) == 0
+                && libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK)
+                    == 0
+        };
+        if !ok {
+            // SAFETY: Both pipe descriptors were opened above and are closed on failure.
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
             return -1;
         }
     }
@@ -128,9 +139,7 @@ fn ensure_pipe() -> bool {
     static PIPE_ONCE: Once = Once::new();
     PIPE_ONCE.call_once(|| {
         let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: fills the two-element array we own with the read and write
-        // ends; the return value is checked before either is published.
-        let rc = unsafe { cloexec_nonblocking_pipe(&mut fds) };
+        let rc = cloexec_nonblocking_pipe(&mut fds);
         if rc != 0 {
             return;
         }
@@ -179,16 +188,16 @@ pub fn ignore_sigpipe() {
 /// kernel rejects it: SIGKILL and SIGSTOP cannot be caught, and a signal
 /// number outside the platform's range is invalid.
 fn install_handler(sig: libc::c_int) -> bool {
-    // SAFETY: `sigaction` is zero-initialized then filled with a valid handler,
-    // an empty block mask, and SA_RESTART. `sigemptyset` and `sigaction` are
-    // plain libc calls on stack-local storage we own.
+    // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = handle_signal as *const () as usize;
+    // SA_RESTART so a signal does not turn the runtime's in-flight reads,
+    // writes, and epoll waits into spurious EINTR failures.
+    action.sa_flags = libc::SA_RESTART;
+    // SAFETY: `sigemptyset` and `sigaction` are plain libc calls on stack-local
+    // storage initialized with a valid signal handler.
     unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = handle_signal as *const () as usize;
         libc::sigemptyset(&mut action.sa_mask);
-        // SA_RESTART so a signal does not turn the runtime's in-flight reads,
-        // writes, and epoll waits into spurious EINTR failures.
-        action.sa_flags = libc::SA_RESTART;
         libc::sigaction(sig, &action, std::ptr::null_mut()) == 0
     }
 }

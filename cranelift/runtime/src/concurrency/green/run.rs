@@ -58,6 +58,7 @@ pub(super) fn finish_task(id: TaskId, result: i64) {
     let (closure, tls_values) =
         unsafe { (std::mem::take(&mut *block.closure.get()), (*block.tls.get()).take_values()) };
     if closure != 0 {
+        // SAFETY: Task owned one reference to `closure` transferred by `spawn`.
         unsafe { crate::pith_closure_release(closure) };
     }
     crate::runtime_core::release_finished_tls(tls_values);

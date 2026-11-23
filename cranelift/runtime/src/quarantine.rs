@@ -109,7 +109,8 @@ pub unsafe fn bury(block: *mut u8, len: usize, magic: *mut u32, kind: Kind) -> b
     if !on() {
         return false;
     }
-    bury_now(block, len, magic, kind);
+    // SAFETY: Caller guarantees `block..block+len` is writable and `magic` lies inside it.
+    unsafe { bury_now(block, len, magic, kind) };
     true
 }
 
@@ -123,11 +124,15 @@ pub unsafe fn bury(block: *mut u8, len: usize, magic: *mut u32, kind: Kind) -> b
 #[inline(always)]
 pub unsafe fn free_box<T>(ptr: *mut T, magic: *mut u32, kind: Kind) {
     if !on() {
-        drop(Box::from_raw(ptr));
+        // SAFETY: Caller guarantees `ptr` came from `Box::into_raw` and is uniquely owned.
+        drop(unsafe { Box::from_raw(ptr) });
         return;
     }
-    std::ptr::drop_in_place(ptr);
-    bury_now(ptr as *mut u8, std::mem::size_of::<T>(), magic, kind);
+    // SAFETY: Caller guarantees `ptr` is uniquely owned and `magic` lies inside the `T` allocation.
+    unsafe {
+        std::ptr::drop_in_place(ptr);
+        bury_now(ptr as *mut u8, std::mem::size_of::<T>(), magic, kind);
+    }
 }
 
 /// `bury` without the switch test, for a caller that has already made it.
@@ -137,8 +142,11 @@ pub unsafe fn free_box<T>(ptr: *mut T, magic: *mut u32, kind: Kind) {
 #[cold]
 #[inline(never)]
 pub(crate) unsafe fn bury_now(block: *mut u8, len: usize, magic: *mut u32, kind: Kind) {
-    std::ptr::write_bytes(block, POISON, len);
-    std::ptr::write_volatile(magic, FREED_MAGIC | kind as u32);
+    // SAFETY: Caller guarantees `block..block+len` is writable and `magic` lies inside it.
+    unsafe {
+        std::ptr::write_bytes(block, POISON, len);
+        std::ptr::write_volatile(magic, FREED_MAGIC | kind as u32);
+    }
     if let Some(sites) = free_sites() {
         let trace = std::backtrace::Backtrace::force_capture();
         lock(sites).insert(magic as usize, trace);
@@ -173,17 +181,22 @@ pub unsafe fn miss(word: u32, at: *const u32, op: Op) {
 /// `at` must be readable.
 #[inline(always)]
 pub unsafe fn magic_is(at: *const u32, want: u32, op: Op) -> bool {
-    if at.read() == want {
+    // SAFETY: Caller guarantees `at` is readable.
+    if unsafe { at.read() } == want {
         return true;
     }
-    miss_out_of_line(at, op);
+    // SAFETY: Caller guarantees `at` is readable.
+    unsafe { miss_out_of_line(at, op) };
     false
 }
 
 #[cold]
 #[inline(never)]
-fn miss_out_of_line(at: *const u32, op: Op) {
-    unsafe { miss(at.read(), at, op) }
+unsafe fn miss_out_of_line(at: *const u32, op: Op) {
+    // SAFETY: Caller guarantees `at` is readable; `miss` only uses `at` as a lookup key.
+    let word = unsafe { at.read() };
+    // SAFETY: `at` is never dereferenced by `miss`.
+    unsafe { miss(word, at, op) };
 }
 
 /// The kind a quarantined block's magic word names, or None for any other
@@ -215,11 +228,20 @@ fn miss_now(word: u32, at: *const u32, op: Op) {
 #[inline(always)]
 pub fn over_release(kind: Kind) {
     if on() {
-        report(
-            &format!("release of a {} whose count is already zero (an over-release)", kind.name()),
-            None,
-        );
+        over_release_now(kind);
     }
+}
+
+#[cold]
+#[inline(never)]
+fn over_release_now(kind: Kind) -> ! {
+    report(
+        &format!(
+            "release of a {} whose count is already zero (an over-release)",
+            kind.name()
+        ),
+        None,
+    )
 }
 
 /// Report a bad use of a struct whose value has died: its last strong count
@@ -259,7 +281,8 @@ fn report(what: &str, at: Option<usize>) -> ! {
 /// `ptr` must be a pointer generated code is about to read a field through.
 #[no_mangle]
 pub unsafe extern "C" fn pith_quarantine_check_struct(ptr: i64) {
-    crate::runtime_core::quarantine_check_struct(ptr);
+    // SAFETY: Caller guarantees `ptr` is a pointer generated code is about to read/write.
+    unsafe { crate::runtime_core::quarantine_check_struct(ptr) };
 }
 
 fn trace_enabled() -> bool {

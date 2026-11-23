@@ -29,21 +29,25 @@ pub struct CountingAllocator;
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         record();
-        System.alloc(layout)
+        // SAFETY: Preconditions forwarded from `GlobalAlloc::alloc`.
+        unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         record();
-        System.alloc_zeroed(layout)
+        // SAFETY: Preconditions forwarded from `GlobalAlloc::alloc_zeroed`.
+        unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         record();
-        System.realloc(ptr, layout, new_size)
+        // SAFETY: Preconditions forwarded from `GlobalAlloc::realloc`.
+        unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout)
+        // SAFETY: Preconditions forwarded from `GlobalAlloc::dealloc`.
+        unsafe { System.dealloc(ptr, layout) }
     }
 }
 

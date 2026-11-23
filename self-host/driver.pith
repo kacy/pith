@@ -7,7 +7,7 @@ from lexer import lex_all
 from parser import parse_with_file, parser_diagnostics, parser_has_errors
 from ast import get_node, node_count, set_node_value
 from checker_modules import module_default_alias
-from errors import Diagnostic
+from errors import Diagnostic, unreadable_source_diagnostic
 from std.collections import copy_list, copy_map
 import std.time as time
 
@@ -666,7 +666,9 @@ pub fn resolve_import_list(imports: List[String], lines: List[Int], cols: List[I
         files_being_checked.insert(file_path, true)
         visited_files.insert(file_path, true)
         read_started := time.mono_nanos()
-        content := dr_read_source(file_path)!
+        content := dr_read_source(file_path) catch:
+            driver_parse_diagnostics = [unreadable_source_diagnostic(file_path)]
+            return roots
         walk_read_files.push(file_path)
         walk_contents.push(content)
         lex_started := time.mono_nanos()

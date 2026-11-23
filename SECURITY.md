@@ -18,7 +18,7 @@ outside that guarantee:
 - a channel send that races a close can lose its value.
 
 the compiler refuses programs that would share mutable state between
-tasks:
+tasks, or reach runtime memory they do not own:
 
 | code | what it refuses |
 |---|---|

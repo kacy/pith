@@ -174,6 +174,9 @@ pub struct ClientRequest:
     # the most a buffered response body may hold, or 0 for the client's limit
     # (MAX_RESPONSE_BODY outside a Client). set with with_max_response_body_bytes.
     pub max_response_body_bytes: Int
+    # optional TLS SNI / certificate verification hostname when dialing a
+    # different address in `host` (e.g. --resolve / --connect-to). empty means `host`.
+    pub server_name: String = ""
 
 # a reusable plain http client connection. it owns its stream: close() gives
 # back the socket and the reader's and writer's registry entries, and a
@@ -327,11 +330,6 @@ fn download_file_response(response: HttpResponse, file_path: String, download_na
 
 fn output_file_writer(file: FileStream) -> BufferedBytesWriter:
     return file.buffered_bytes_writer_chunked(HTTP_FILE_STREAM_CHUNK_SIZE)
-
-fn finish_output_file_writer(file: FileStream, writer: BufferedBytesWriter) -> Int!:
-    writer.flush()!
-    file.close()
-    return 0
 
 fn trim_quotes(value: String) -> String:
     if value.len() >= 2 and value[0] == chr(34) and value[value.len() - 1] == chr(34):
@@ -3874,17 +3872,16 @@ fn http_date_seconds(year: Int, month_name: String, day: Int, clock: String) -> 
     days := datetime.to_timestamp(datetime.date(year, month, day)) / 1000
     return days + hour * 3600 + minute * 60 + second
 
-# parse an http date (rfc 9110 5.6.7) into unix seconds. all three forms a
-# recipient must accept are read: IMF-fixdate ("Sun, 06 Nov 1994 08:49:37
-# GMT"), the obsolete rfc 850 form ("Sunday, 06-Nov-94 08:49:37 GMT", a
-# two-digit year from 69 meaning 19xx) and asctime ("Sun Nov  6 08:49:37
-# 1994").
+# parse an http date (rfc 9110 5.6.7) into unix seconds. accepts IMF-fixdate
+# ("Sun, 06 Nov 1994 08:49:37 GMT"), rfc 850 ("Sunday, 06-Nov-94 08:49:37 GMT",
+# two-digit year >= 69 meaning 19xx), Netscape 4-digit hyphenated cookie dates
+# ("Wed, 21-Oct-2035 07:28:00 GMT"), and asctime ("Sun Nov  6 08:49:37 1994").
 pub fn parse_http_date(text: String) -> Int!:
     value := text.trim()
     comma := value.index_of(",")
     if comma == 3 and value.len() == 29 and value.ends_with(" GMT") and value[4] == " " and value[7] == " " and value[11] == " " and value[16] == " ":
         return http_date_seconds(small_decimal(value.substring(12, 16)), value.substring(8, 11), small_decimal(value.substring(5, 7)), value.substring(17, 25))
-    if comma > 3:
+    if comma >= 3:
         rest := value.substring(comma + 1, value.len())
         if rest.len() == 23 and rest[0] == " " and rest[3] == "-" and rest[7] == "-" and rest[10] == " " and rest.ends_with(" GMT"):
             mut year := small_decimal(rest.substring(8, 10))
@@ -3893,6 +3890,8 @@ pub fn parse_http_date(text: String) -> Int!:
             elif year >= 69:
                 year = year + 1900
             return http_date_seconds(year, rest.substring(4, 7), small_decimal(rest.substring(1, 3)), rest.substring(11, 19))
+        if rest.len() == 25 and rest[0] == " " and rest[3] == "-" and rest[7] == "-" and rest[12] == " " and rest.ends_with(" GMT"):
+            return http_date_seconds(small_decimal(rest.substring(8, 12)), rest.substring(4, 7), small_decimal(rest.substring(1, 3)), rest.substring(13, 21))
     if comma < 0 and value.len() == 24 and value[3] == " " and value[7] == " " and value[10] == " " and value[19] == " ":
         return http_date_seconds(small_decimal(value.substring(20, 24)), value.substring(4, 7), small_decimal(value.substring(8, 10).trim()), value.substring(11, 19))
     fail "invalid http date: " + value
@@ -4319,7 +4318,7 @@ pub fn read_response_tls_into(conn: tls.Conn, writer: BufferedBytesWriter) -> St
 # starts building an outbound request.
 pub fn request(method: String, host: String, port: Int, url_path: String) -> ClientRequest:
     mut headers: Map[String, String] := {}
-    return ClientRequest(method, host, port, normalize_path(url_path), headers, bytes.empty(), false, -1, 0, 0)
+    return ClientRequest(method, host, port, normalize_path(url_path), headers, bytes.empty(), false, -1, 0, 0, "")
 
 # starts a get request builder.
 pub fn get_request(host: String, port: Int, url_path: String) -> ClientRequest:
@@ -4339,11 +4338,11 @@ pub fn delete_request(host: String, port: Int, url_path: String) -> ClientReques
 
 # starts building an outbound https request on port 443.
 pub fn https_request(method: String, host: String, url_path: String) -> ClientRequest:
-    return ClientRequest(method, host, 443, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0)
+    return ClientRequest(method, host, 443, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0, "")
 
 # starts building an outbound https request on an explicit port.
 pub fn https_request_port(method: String, host: String, port: Int, url_path: String) -> ClientRequest:
-    return ClientRequest(method, host, port, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0)
+    return ClientRequest(method, host, port, normalize_path(url_path), {}, bytes.empty(), true, -1, 0, 0, "")
 
 # starts a get https request builder.
 pub fn get_https_request(host: String, url_path: String) -> ClientRequest:
@@ -4619,10 +4618,12 @@ fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
     if resp.status != 307 and resp.status != 308:
         next_body = bytes.empty()
         next_headers = header_without(header_without(next_headers, "Content-Type"), "Transfer-Encoding")
+    mut next_sni := req.server_name
     if request_origin_changed(req, next_use_tls, next_host, next_port):
         next_headers = header_without(next_headers, "Authorization")
         next_headers = header_without(next_headers, "Cookie")
-    return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes)
+        next_sni = ""
+    return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, next_sni)
 
 # one http/1.1 client connection: a plain socket with its buffered reader and
 # writer, or a tls session over the socket. `key` names the origin it was
@@ -4740,7 +4741,7 @@ fn send_request_following_redirects_with_tls_config(req: ClientRequest, tls_conf
 # the tls send path shared by send_tls_with_config and its traced wrapper: force
 # tls on, then dispatch to the plain-host redirect path or a single sni request.
 fn send_tls_request(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
-    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes)
+    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, server_name)
     if server_name != req.host:
         return send_request_wire(current, server_name, config)
     return send_request_following_redirects_with_tls_config(current, config)
@@ -4841,7 +4842,7 @@ pub fn end_server_span(span: trace.Span, status: Int):
 # response handed to redirect_request carries only its status and fields.
 fn streamed_redirect_request(current: ClientRequest, resp: StreamedHttpResponse, redirects_left: Int) -> ClientRequest!:
     next := redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
-    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left, next.max_response_body_bytes)
+    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left, next.max_response_body_bytes, next.server_name)
 
 fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     mut current := req
@@ -4875,9 +4876,16 @@ fn send_request_following_redirects_into_with_tls_config(req: ClientRequest, tls
         redirects_left = redirects_left - 1
         current = streamed_redirect_request(current, resp, redirects_left)!
 
+# the TLS SNI hostname to present and verify for `req`: `req.server_name` when
+# explicitly overridden, otherwise `req.host`.
+fn request_tls_server_name(req: ClientRequest) -> String:
+    if req.server_name != "":
+        return req.server_name
+    return req.host
+
 impl ClientRequest:
     fn header(name: String, value: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn keep_alive() -> ClientRequest:
         return self.header("Connection", "keep-alive")
@@ -4886,13 +4894,13 @@ impl ClientRequest:
         return self.header("Connection", "close")
 
     fn with_timeout(ms: Int) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn follow_redirects(limit: Int) -> ClientRequest:
         mut next_limit := limit
         if next_limit < 0:
             next_limit = 0
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, next_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, next_limit, self.max_response_body_bytes, self.server_name)
 
     fn no_redirects() -> ClientRequest:
         return self.follow_redirects(0)
@@ -4900,10 +4908,14 @@ impl ClientRequest:
     # the most this request's buffered response body may hold, in place of the
     # client's limit or MAX_RESPONSE_BODY.
     fn with_max_response_body_bytes(limit: Int) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, limit)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, limit, self.server_name)
+
+    # override the TLS SNI and certificate hostname while dialing `self.host`.
+    fn with_server_name(name: String) -> ClientRequest:
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, name)
 
     fn query_param(name: String, value: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn query_params(values: Map[String, String]) -> ClientRequest:
         mut next := self
@@ -4912,10 +4924,10 @@ impl ClientRequest:
         return next
 
     fn body_text(text: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text), self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text), self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn body_bytes(data: Bytes) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
 
     fn text_body(text: String) -> ClientRequest:
         return self.body_text(text)
@@ -5006,16 +5018,18 @@ impl ClientRequest:
         return self.send_tls_into_with_config(self.host, config, writer)
 
     fn send_tls_into_with_config(server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes)
+        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, server_name)
         if server_name == self.host:
             return send_request_following_redirects_into_with_tls_config(current, config, writer)
         return send_request_wire_into(current, server_name, config, writer, false)
 
     fn send_to_file(output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_into(writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
     fn send_tls_to_file(output_path: String) -> StreamedHttpResponse!:
@@ -5025,9 +5039,11 @@ impl ClientRequest:
 
     fn send_tls_to_file_with_config(server_name: String, config: tls.Config, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_tls_into_with_config(server_name, config, writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
     fn send_bytes() -> Bytes!:
@@ -5064,9 +5080,11 @@ impl ClientConn:
 
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_into(req, writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
 # the socket only: the reader's and writer's entries live in the registry of
@@ -5091,9 +5109,11 @@ impl TlsClientConn:
 
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_into(req, writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
 # ===============================================================
@@ -5245,7 +5265,7 @@ pub fn new_request(method: String, raw_url: String) -> ClientRequest!:
     query_text := url_mod.query(parsed)
     if query_text != "":
         target = target + "?" + query_text
-    return ClientRequest(method, host, port, normalize_path(target), {}, bytes.empty(), use_tls, -1, 0, 0)
+    return ClientRequest(method, host, port, normalize_path(target), {}, bytes.empty(), use_tls, -1, 0, 0, "")
 
 # the pool key of an origin.
 fn origin_key(use_tls: Bool, host: String, port: Int) -> String:
@@ -5282,10 +5302,25 @@ struct ClientRoute:
     port: Int
     absolute: Bool
     tunnel: Bool
+    proxy_auth: String
 
-# the host and port of a proxy url, "http://host:port" or "host:port". the
-# port defaults to 80. a proxy that is not plain http is refused.
-fn parse_proxy_address(proxy: String) -> (String, Int)!:
+# build a Basic Proxy-Authorization value from URL userinfo ("user:pass" or "user").
+fn proxy_basic_auth_header(userinfo: String) -> String:
+    if userinfo == "":
+        return ""
+    colon := userinfo.index_of(":")
+    mut creds := ""
+    if colon < 0:
+        creds = url_mod.decode_path(userinfo) + ":"
+    else:
+        u := url_mod.decode_path(userinfo.substring(0, colon))
+        p := url_mod.decode_path(userinfo.substring(colon + 1, userinfo.len()))
+        creds = u + ":" + p
+    return "Basic " + encoding.b64_encode(bytes.from_string_utf8(creds))
+
+# the host, port, and optional userinfo of a proxy url, "http://[user:pass@]host:port"
+# or "host:port". the port defaults to 80. a proxy that is not plain http is refused.
+fn parse_proxy_target(proxy: String) -> (String, Int, String)!:
     mut text := proxy.trim()
     if text.index_of("://") < 0:
         text = "http://" + text
@@ -5298,7 +5333,13 @@ fn parse_proxy_address(proxy: String) -> (String, Int)!:
     mut port := url_mod.port(parsed)
     if port < 0:
         port = 80
-    return (host, port)
+    return (host, port, url_mod.userinfo(parsed))
+
+# the host and port of a proxy url, "http://host:port" or "host:port". the
+# port defaults to 80. a proxy that is not plain http is refused.
+fn parse_proxy_address(proxy: String) -> (String, Int)!:
+    target := parse_proxy_target(proxy)!
+    return (target.0, target.1)
 
 # the first of two environment variables that is set and not empty.
 fn env_either(upper: String, lower: String) -> String:
@@ -5361,6 +5402,32 @@ fn proxy_for(proxy: String, no_proxy: String, host: String, port: Int) -> String
             return ""
     return proxy
 
+# return `req` with Proxy-Authorization added for plain proxy requests when the
+# proxy url carried credentials, or removed inside an HTTPS CONNECT tunnel so
+# proxy credentials are never sent to the origin server.
+fn apply_route_proxy_auth(req: ClientRequest, route: ClientRoute) -> ClientRequest:
+    if route.tunnel and header_lookup(req.headers, "Proxy-Authorization") != "":
+        mut next_headers: Map[String, String] := {}
+        for k in req.headers:
+            if k.to_lower() != "proxy-authorization":
+                next_headers.insert(k, req.headers[k])
+        return ClientRequest(req.method, req.host, req.port, req.path, next_headers, req.body, req.use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, req.server_name)
+    if route.absolute and route.proxy_auth != "" and header_lookup(req.headers, "Proxy-Authorization") == "":
+        return req.header("Proxy-Authorization", route.proxy_auth)
+    return req
+
+# format the CONNECT request head for an HTTPS proxy tunnel, including
+# Proxy-Authorization when credentials are supplied.
+fn connect_tunnel_request_bytes(req: ClientRequest, proxy_auth: String) -> Bytes:
+    authority := host_header_value(req.host, 0, false) + ":" + req.port.to_string()
+    safe_authority := strip_header_controls(authority)
+    crlf := chr(13) + chr(10)
+    mut head := "CONNECT " + safe_authority + " HTTP/1.1" + crlf + "Host: " + safe_authority + crlf
+    if proxy_auth != "":
+        head = head + "Proxy-Authorization: " + strip_header_controls(proxy_auth) + crlf
+    head = head + crlf
+    return bytes.from_string_utf8(head)
+
 # ask the proxy on `stream` for a tunnel to the request's origin (rfc 9110
 # 9.3.6) and read its answer. anything but a 2xx fails, with the status.
 # the answer is read a byte at a time, so nothing past its head is taken off
@@ -5368,10 +5435,8 @@ fn proxy_for(proxy: String, no_proxy: String, host: String, port: Int) -> String
 # for as each byte lands, the way io.head_end finds it (LF LF or LF CR LF):
 # appending to a growing value and rescanning it from the start made a
 # proxy's long head cost the square of its length.
-fn open_tunnel(stream: TcpStream, req: ClientRequest) -> Int!:
-    authority := host_header_value(req.host, 0, false) + ":" + req.port.to_string()
-    crlf := chr(13) + chr(10)
-    stream.write_all_bytes(bytes.from_string_utf8("CONNECT " + strip_header_controls(authority) + " HTTP/1.1" + crlf + "Host: " + strip_header_controls(authority) + crlf + crlf))!
+fn open_tunnel(stream: TcpStream, req: ClientRequest, proxy_auth: String) -> Int!:
+    stream.write_all_bytes(connect_tunnel_request_bytes(req, proxy_auth))!
     buf := bytes.buffer()
     defer buf.free()
     mut prev := 0 - 1
@@ -5506,9 +5571,11 @@ impl Client:
     # send `req` and write the body of the final response to a file.
     fn send_to_file(req: ClientRequest, output_path: String) -> StreamedHttpResponse!:
         file := fs.create(output_path)!
+        defer file.close()
         writer := output_file_writer(file)
+        defer writer.free()
         streamed := self.send_into(req, writer)!
-        finish_output_file_writer(file, writer)!
+        writer.flush()!
         return streamed
 
     fn get(raw_url: String) -> HttpResponse!:
@@ -5597,8 +5664,9 @@ impl Client:
         mut target := normalize_path(req.path)
         if route.absolute:
             target = "http://" + host_header_value(req.host, req.port, false) + target
+        wire_req := apply_route_proxy_auth(req, route)
         arm_deadline_at(fd, deadline, false)
-        client_write(c, request_wire_bytes(req, target, connection, false)!, deadline)!
+        client_write(c, request_wire_bytes(wire_req, target, connection, false)!, deadline)!
         src := wire_source(c)
         mut header_due := 0
         if self.response_header_timeout_ms > 0:
@@ -5679,16 +5747,24 @@ impl Client:
         mut proxy := self.proxy_url
         if proxy == "" and self.env_proxy:
             proxy = proxy_from_env(req.use_tls, req.host, req.port)
+        mut base_key := origin_key(req.use_tls, req.host, req.port)
+        if req.use_tls and req.server_name != "" and req.server_name.to_lower() != req.host.to_lower():
+            base_key = base_key + " sni=" + req.server_name.to_lower()
         if proxy == "":
-            return ClientRoute(origin_key(req.use_tls, req.host, req.port), req.host, req.port, false, false)
-        address := parse_proxy_address(proxy)!
-        proxy_host := address.0
-        proxy_port := address.1
-        via := "proxy http://" + proxy_host.to_lower() + ":" + proxy_port.to_string()
+            return ClientRoute(base_key, req.host, req.port, false, false, "")
+        target := parse_proxy_target(proxy)!
+        proxy_host := target.0
+        proxy_port := target.1
+        mut proxy_auth := header_lookup(req.headers, "Proxy-Authorization")
+        if proxy_auth == "" and target.2 != "":
+            proxy_auth = proxy_basic_auth_header(target.2)
+        mut via := "proxy http://" + proxy_host.to_lower() + ":" + proxy_port.to_string()
+        if proxy_auth != "":
+            via = via + " auth=" + proxy_auth
         if req.use_tls:
-            return ClientRoute(origin_key(true, req.host, req.port) + " via " + via, proxy_host, proxy_port, false, true)
+            return ClientRoute(base_key + " via " + via, proxy_host, proxy_port, false, true, proxy_auth)
         # every plain request through one proxy can share its connections
-        return ClientRoute(via, proxy_host, proxy_port, true, false)
+        return ClientRoute(via, proxy_host, proxy_port, true, false, proxy_auth)
 
     # an idle connection for `route` that can carry a request, or a new one.
     fn conn_for(req: ClientRequest, route: ClientRoute, deadline: Int) -> WireConn!:
@@ -5739,7 +5815,7 @@ impl Client:
         arm_deadline_at(stream.fd, deadline, true)
         arm_deadline_at(stream.fd, deadline, false)
         if route.tunnel:
-            opened := open_tunnel(stream, req)
+            opened := open_tunnel(stream, req, route.proxy_auth)
             if opened.is_err:
                 stream.close()
                 fail client_timeout_failure(opened.err, deadline, 0)
@@ -5751,15 +5827,16 @@ impl Client:
     # run the tls handshake over a new connection, with tls_config or the
     # default config. the stream is closed when it fails.
     fn handshake(stream: TcpStream, req: ClientRequest, key: String) -> WireConn!:
+        sni := request_tls_server_name(req)
         if self.tls_config.handle >= 0:
-            return tls_wire(stream, req.host, self.tls_config, key)
+            return tls_wire(stream, sni, self.tls_config, key)
         made := tls.client_config()
         if made.is_err:
             stream.close()
             fail made.err
         config := made!
         defer config.close()
-        return tls_wire(stream, req.host, config, key)
+        return tls_wire(stream, sni, config, key)
 
     # keep `c` for another request, or close it when its origin already has
     # max_idle_conns_per_host idle connections.
@@ -5815,12 +5892,13 @@ impl Client:
         mut target := normalize_path(req.path)
         if route.absolute:
             target = "http://" + host_header_value(req.host, req.port, false) + target
-        expect := self.expect_continue_timeout_ms > 0 and request_expects_continue(req) and not req.body.is_empty()
+        wire_req := apply_route_proxy_auth(req, route)
+        expect := self.expect_continue_timeout_ms > 0 and request_expects_continue(wire_req) and not wire_req.body.is_empty()
         mut wire := bytes.empty()
         if expect:
-            wire = request_head_bytes(req, target, connection, accept_gzip)!
+            wire = request_head_bytes(wire_req, target, connection, accept_gzip)!
         else:
-            wire = request_wire_bytes(req, target, connection, accept_gzip)!
+            wire = request_wire_bytes(wire_req, target, connection, accept_gzip)!
         arm_deadline_at(fd, deadline, false)
         client_write(c, wire, deadline)!
         src := wire_source(c)
@@ -7224,14 +7302,14 @@ test "response headers keep the last of a repeated name, in any case":
     assert(not headers.contains_key("x-a"))
 
 test "a request head reads each field the request names, in any case":
-    plain := ClientRequest("GET", "h.test", 8080, "/", {}, bytes.empty(), false, 0, 0, 0)
+    plain := ClientRequest("GET", "h.test", 8080, "/", {}, bytes.empty(), false, 0, 0, 0, "")
     head := request_head_bytes(plain, "/", "keep-alive", true)!.to_string_utf8() catch ""
     assert(head.contains("Host: h.test:8080"))
     assert(head.contains("Connection: keep-alive"))
     assert(head.contains("Accept-Encoding: gzip"))
     assert(not head.contains("Transfer-Encoding"))
 
-    named := ClientRequest("POST", "h.test", 80, "/", {"hOsT": "other.test", "connection": "close", "accept-encoding": "br", "transfer-encoding": "Chunked", "content-length": "9"}, bytes.from_string_utf8("x"), false, 0, 0, 0)
+    named := ClientRequest("POST", "h.test", 80, "/", {"hOsT": "other.test", "connection": "close", "accept-encoding": "br", "transfer-encoding": "Chunked", "content-length": "9"}, bytes.from_string_utf8("x"), false, 0, 0, 0, "")
     assert(request_sends_chunked(named))
     written := request_head_bytes(named, "/", "keep-alive", true)!.to_string_utf8() catch ""
     assert(written.contains("hOsT: other.test"))
@@ -7243,14 +7321,64 @@ test "a request head reads each field the request names, in any case":
     assert(not written.contains("Content-Length"))
 
     # however a request spells its framing fields, head and body agree.
-    mixed := ClientRequest("POST", "h.test", 80, "/", {"Transfer-Encoding": "gzip", "transfer-encoding": "chunked", "TRANSFER-ENCODING": "identity"}, bytes.from_string_utf8("x"), false, 0, 0, 0)
+    mixed := ClientRequest("POST", "h.test", 80, "/", {"Transfer-Encoding": "gzip", "transfer-encoding": "chunked", "TRANSFER-ENCODING": "identity"}, bytes.from_string_utf8("x"), false, 0, 0, 0, "")
     mixed_head := request_head_bytes(mixed, "/", "", false)!.to_string_utf8() catch ""
     body := request_body_bytes(mixed).to_string_utf8() catch ""
     assert_eq(mixed_head.contains("Transfer-Encoding: chunked"), body != "x")
     assert_eq(mixed_head.contains("Content-Length: 1"), body == "x")
 
     # an empty value counts as not naming the field.
-    blank := ClientRequest("GET", "h.test", 80, "/", {"Host": "", "Connection": ""}, bytes.empty(), false, 0, 0, 0)
+    blank := ClientRequest("GET", "h.test", 80, "/", {"Host": "", "Connection": ""}, bytes.empty(), false, 0, 0, 0, "")
     filled := request_head_bytes(blank, "/", "close", false)!.to_string_utf8() catch ""
     assert(filled.contains("Host: h.test"))
     assert(filled.contains("Connection: close"))
+
+test "proxy target parses userinfo and CONNECT emits Proxy-Authorization":
+    target := parse_proxy_target("http://alice:s3cr3t@proxy.test:3128")!
+    assert_eq(target.0, "proxy.test")
+    assert_eq(target.1, 3128)
+    assert_eq(target.2, "alice:s3cr3t")
+    auth := proxy_basic_auth_header(target.2)
+    assert_eq(auth, "Basic YWxpY2U6czNjcjN0")
+
+    req := https_request_port("GET", "api.example.com", 443, "/v1").header("Proxy-Authorization", auth)
+    connect_wire := connect_tunnel_request_bytes(req, auth).to_string_utf8()!
+    assert_eq(connect_wire, "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\nProxy-Authorization: Basic YWxpY2U6czNjcjN0\r\n\r\n")
+
+    plain_connect := connect_tunnel_request_bytes(req, "").to_string_utf8()!
+    assert_eq(plain_connect, "CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+
+    # inside a TLS tunnel, Proxy-Authorization must not be forwarded to the origin.
+    tunnel_route := ClientRoute("k", "proxy.test", 3128, false, true, auth)
+    stripped := apply_route_proxy_auth(req, tunnel_route)
+    assert_eq(header_lookup(stripped.headers, "Proxy-Authorization"), "")
+
+    # on a plain HTTP proxy request, proxy URL credentials populate Proxy-Authorization.
+    plain_route := ClientRoute("k", "proxy.test", 3128, true, false, auth)
+    plain_req := get_request("example.com", 80, "/")
+    with_auth := apply_route_proxy_auth(plain_req, plain_route)
+    assert_eq(header_lookup(with_auth.headers, "Proxy-Authorization"), auth)
+
+test "with_server_name overrides TLS SNI and isolates pool keys":
+    c := client()
+    r1 := https_request_port("GET", "127.0.0.1", 8443, "/").with_server_name("a.example.test").header("Host", "a.example.test")
+    r2 := https_request_port("GET", "127.0.0.1", 8443, "/").with_server_name("b.example.test").header("Host", "b.example.test")
+    r_def := https_request_port("GET", "127.0.0.1", 8443, "/")
+
+    assert_eq(request_tls_server_name(r1), "a.example.test")
+    assert_eq(request_tls_server_name(r2), "b.example.test")
+    assert_eq(request_tls_server_name(r_def), "127.0.0.1")
+
+    k1 := c.route_for(r1)!.key
+    k2 := c.route_for(r2)!.key
+    k_def := c.route_for(r_def)!.key
+    assert(k1 != k2)
+    assert(k1 != k_def)
+    assert(k1.contains("sni=a.example.test"))
+
+test "parse_http_date accepts 4-digit hyphenated cookie dates":
+    ts1 := parse_http_date("Wed, 21 Oct 2035 07:28:00 GMT")!
+    ts2 := parse_http_date("Wed, 21-Oct-2035 07:28:00 GMT")!
+    ts3 := parse_http_date("Wednesday, 21-Oct-2035 07:28:00 GMT")!
+    assert_eq(ts1, ts2)
+    assert_eq(ts1, ts3)

@@ -1,9 +1,8 @@
 # purl_auth — .netrc credential lookup (-n/--netrc/--netrc-file), HTTP Digest
 # authentication (--digest, RFC 7616 MD5 and SHA-256), and AWS SigV4 request
 # signing (--aws-sigv4) built on std.hash, std.crypto.hmac, std.crypto.random,
-# std.datetime, and std.bits.
+# std.datetime, and std.strings.
 
-import std.bits as bits
 import std.bytes as bytes
 import std.crypto.hmac as hmac
 import std.crypto.random as random
@@ -14,6 +13,7 @@ import std.hash as hash
 import std.net.url as url
 import std.os as os
 import std.os.path as path_mod
+import std.strings as strings
 import std.time as time
 from purl_url import ParsedUrl, authority_header
 
@@ -26,26 +26,12 @@ pub struct NetrcCreds:
     pub login: String
     pub password: String
 
-# Split `text` on '\n' while preserving empty lines (unlike String.split, which skips empty segments).
-fn split_lines_keep_empty(text: String) -> List[String]:
-    mut lines: List[String] := []
-    mut start := 0
-    mut i := 0
-    n := text.len()
-    while i < n:
-        if ord(text[i]) == 10:
-            lines.push(text.substring(start, i))
-            start = i + 1
-        i = i + 1
-    lines.push(text.substring(start, n))
-    return lines
-
 # Tokenize a .netrc file into whitespace-delimited tokens, honoring quoted strings
 # and skipping `macdef` bodies (which run through the next blank line).
 fn tokenize_netrc(text: String) -> List[String]:
     mut tokens: List[String] := []
     mut in_macdef := false
-    for raw_line in split_lines_keep_empty(text):
+    for raw_line in strings.lines_keep_empty(text):
         trimmed := raw_line.trim()
         if in_macdef:
             if trimmed == "":
@@ -162,97 +148,9 @@ pub fn lookup_netrc(host: String, netrc_path: String) -> NetrcCreds?:
         return NetrcCreds(def_login, def_pass)
     return none
 
-# ===============================================================
-# Pure-Pith MD5 (RFC 1321) for legacy HTTP Digest Auth
-# ===============================================================
-
-MD5_SHIFT := [7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21]
-
-MD5_K := [0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501, 0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821, 0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8, 0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a, 0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70, 0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665, 0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1, 0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391]
-
-fn write_u32_le(buf: bytes.ByteBuffer, v: Int):
-    buf.write_byte(bits.mask8(v)) catch 0
-    buf.write_byte(bits.mask8(bits.shr(v, 8))) catch 0
-    buf.write_byte(bits.mask8(bits.shr(v, 16))) catch 0
-    buf.write_byte(bits.mask8(bits.shr(v, 24))) catch 0
-
-fn read_u32_le(data: Bytes, off: Int) -> Int:
-    b0 := data[off]
-    b1 := bits.shl(data[off + 1], 8)
-    b2 := bits.shl(data[off + 2], 16)
-    b3 := bits.shl(data[off + 3], 24)
-    return bits.bor(bits.bor(b0, b1), bits.bor(b2, b3))
-
-# Compute lowercase hex MD5 digest of `text` (RFC 1321).
+# Compute lowercase hex MD5 digest of `text` via std.hash (RFC 1321).
 pub fn md5_hex(text: String) -> String:
-    input := bytes.from_string_utf8(text)
-    orig_len := input.len()
-    padded := bytes.buffer_with_capacity(orig_len + 72)
-    defer padded.free()
-    padded.write(input) catch 0
-    padded.write_byte(0x80) catch 0
-    while padded.len() % 64 != 56:
-        padded.write_byte(0) catch 0
-    bit_len := orig_len * 8
-    write_u32_le(padded, bits.mask32(bit_len))
-    write_u32_le(padded, bits.mask32(bits.shr(bit_len, 32)))
-    msg := padded.bytes()
-
-    mut a0 := 0x67452301
-    mut b0 := 0xefcdab89
-    mut c0 := 0x98badcfe
-    mut d0 := 0x10325476
-
-    mut offset := 0
-    while offset < msg.len():
-        mut m: List[Int] := []
-        mut wi := 0
-        while wi < 16:
-            m.push(read_u32_le(msg, offset + wi * 4))
-            wi = wi + 1
-
-        mut a := a0
-        mut b := b0
-        mut c := c0
-        mut d := d0
-
-        mut i := 0
-        while i < 64:
-            mut f := 0
-            mut g := 0
-            if i < 16:
-                f = bits.bor(bits.band(b, c), bits.band(bits.mask32(bits.invert(b)), d))
-                g = i
-            elif i < 32:
-                f = bits.bor(bits.band(d, b), bits.band(bits.mask32(bits.invert(d)), c))
-                g = (5 * i + 1) % 16
-            elif i < 48:
-                f = bits.xor(bits.xor(b, c), d)
-                g = (3 * i + 5) % 16
-            else:
-                f = bits.xor(c, bits.bor(b, bits.mask32(bits.invert(d))))
-                g = (7 * i) % 16
-
-            f = bits.add32(bits.add32(f, a), bits.add32(MD5_K[i], m[g]))
-            a = d
-            d = c
-            c = b
-            b = bits.add32(b, bits.rotl32(f, MD5_SHIFT[i]))
-            i = i + 1
-
-        a0 = bits.add32(a0, a)
-        b0 = bits.add32(b0, b)
-        c0 = bits.add32(c0, c)
-        d0 = bits.add32(d0, d)
-        offset = offset + 64
-
-    out := bytes.buffer_with_capacity(16)
-    defer out.free()
-    write_u32_le(out, a0)
-    write_u32_le(out, b0)
-    write_u32_le(out, c0)
-    write_u32_le(out, d0)
-    return encoding.to_hex(out.bytes())
+    return hash.md5_string(text)
 
 # ===============================================================
 # HTTP Digest Authentication (--digest, RFC 7616)

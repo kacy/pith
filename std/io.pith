@@ -2752,6 +2752,137 @@ pub fn prompt_with(msg: String) -> String:
     print(msg)
     return input()
 
+# ===============================================================
+# Process Standard Streams (stdin / stdout / stderr)
+# ===============================================================
+
+# Readable byte/text stream bound to the current process's standard input (fd 0).
+pub struct StdIn:
+    pub fd: Int
+
+# Writable byte/text stream bound to the current process's standard output (fd 1).
+pub struct StdOut:
+    pub fd: Int
+
+# Writable byte/text stream bound to the current process's standard error (fd 2).
+pub struct StdErr:
+    pub fd: Int
+
+fn stdio_read_bytes(fd: Int, max_bytes: Int) -> Bytes!:
+    if max_bytes <= 0:
+        return bytes.empty()
+    got := term_read(fd, max_bytes, 0 - 1)
+    if got.is_err:
+        return bytes.empty()
+    return got.ok
+
+fn stdio_write_bytes(fd: Int, data: Bytes) -> Int!:
+    if data.is_empty():
+        return 0
+    n := term_write(fd, data)
+    if n < 0:
+        fail "io: failed writing to fd {fd}"
+    return n
+
+# Return a stream handle for the current process's standard input (fd 0).
+pub fn std_in() -> StdIn:
+    return StdIn(0)
+
+# Return a stream handle for the current process's standard output (fd 1).
+pub fn std_out() -> StdOut:
+    return StdOut(1)
+
+# Return a stream handle for the current process's standard error (fd 2).
+pub fn std_err() -> StdErr:
+    return StdErr(2)
+
+# Read all remaining raw bytes from standard input until EOF.
+pub fn read_stdin_bytes() -> Bytes!:
+    return read_all_bytes_from(std_in(), 65536)
+
+# Read all remaining UTF-8 text from standard input until EOF.
+pub fn read_stdin_all() -> String!:
+    return read_stdin_bytes()!.to_string_utf8()
+
+# Write raw bytes to standard output without appending a newline.
+pub fn write_stdout_bytes(data: Bytes) -> Int!:
+    return stdio_write_bytes(1, data)
+
+# Write UTF-8 text to standard output without appending a newline.
+pub fn write_stdout(text: String) -> Int!:
+    return stdio_write_bytes(1, bytes.from_string_utf8(text))
+
+# Write raw bytes to standard error without appending a newline.
+pub fn write_stderr_bytes(data: Bytes) -> Int!:
+    return stdio_write_bytes(2, data)
+
+# Write UTF-8 text to standard error without appending a newline.
+pub fn write_stderr(text: String) -> Int!:
+    return stdio_write_bytes(2, bytes.from_string_utf8(text))
+
+impl StdIn:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return stdio_read_bytes(self.fd, max_bytes)
+
+    fn read_all_bytes() -> Bytes!:
+        return read_all_bytes_from(self, 65536)
+
+    fn read(max_bytes: Int) -> String!:
+        return stdio_read_bytes(self.fd, max_bytes)!.to_string_utf8()
+
+    fn read_all() -> String!:
+        return self.read_all_bytes()!.to_string_utf8()
+
+impl BytesReader for StdIn:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return stdio_read_bytes(self.fd, max_bytes)
+
+impl Reader for StdIn:
+    fn read(max_bytes: Int) -> String!:
+        return stdio_read_bytes(self.fd, max_bytes)!.to_string_utf8()
+
+impl StdOut:
+    fn write_bytes(data: Bytes) -> Int!:
+        return stdio_write_bytes(self.fd, data)
+
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return stdio_write_bytes(self.fd, data)
+
+    fn write(data: String) -> Int!:
+        return stdio_write_bytes(self.fd, bytes.from_string_utf8(data))
+
+    fn write_all(data: String) -> Int!:
+        return stdio_write_bytes(self.fd, bytes.from_string_utf8(data))
+
+impl BytesWriter for StdOut:
+    fn write_bytes(data: Bytes) -> Int!:
+        return stdio_write_bytes(self.fd, data)
+
+impl Writer for StdOut:
+    fn write(data: String) -> Int!:
+        return stdio_write_bytes(self.fd, bytes.from_string_utf8(data))
+
+impl StdErr:
+    fn write_bytes(data: Bytes) -> Int!:
+        return stdio_write_bytes(self.fd, data)
+
+    fn write_all_bytes(data: Bytes) -> Int!:
+        return stdio_write_bytes(self.fd, data)
+
+    fn write(data: String) -> Int!:
+        return stdio_write_bytes(self.fd, bytes.from_string_utf8(data))
+
+    fn write_all(data: String) -> Int!:
+        return stdio_write_bytes(self.fd, bytes.from_string_utf8(data))
+
+impl BytesWriter for StdErr:
+    fn write_bytes(data: Bytes) -> Int!:
+        return stdio_write_bytes(self.fd, data)
+
+impl Writer for StdErr:
+    fn write(data: String) -> Int!:
+        return stdio_write_bytes(self.fd, bytes.from_string_utf8(data))
+
 test "io string readers and buffers keep offsets":
     reader := string_reader("abcdef")
     out := string_buffer()
@@ -3078,3 +3209,24 @@ test "io a dropped buffered writer does not flush":
     target := string_buffer()
     abandon_writer(target)
     assert_eq(target.string(), "")
+
+test "process stdio stream wrappers satisfy io interfaces":
+    si := std_in()
+    so := std_out()
+    se := std_err()
+    assert_eq(si.fd, 0)
+    assert_eq(so.fd, 1)
+    assert_eq(se.fd, 2)
+    assert_eq(write_stdout_bytes(bytes.empty())!, 0)
+    assert_eq(write_stdout("")!, 0)
+    assert_eq(write_stderr_bytes(bytes.empty())!, 0)
+    assert_eq(write_stderr("")!, 0)
+    assert_eq(so.write_bytes(bytes.empty())!, 0)
+    assert_eq(se.write("")!, 0)
+    assert_eq(si.read_bytes(0)!.len(), 0)
+    # verify interface dispatch works through generic BytesWriter helper
+    assert_eq(write_all_bytes_to(so, bytes.empty())!, 0)
+    assert_eq(write_all_bytes_to(se, bytes.empty())!, 0)
+    # invalid fd reports a clean error instead of crashing
+    bad := StdOut(0 - 1)
+    assert(bad.write_bytes(bytes.from_string_utf8("x")).is_err)

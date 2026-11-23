@@ -32,6 +32,7 @@ SHA1 := 1
 SHA256 := 2
 SHA384 := 3
 SHA512 := 4
+MD5 := 5
 
 # run the concrete hash for `kind`. we dispatch and call directly rather than
 # taking the hash as a function value: a function-value call leaks the value it
@@ -44,6 +45,8 @@ fn hmac_digest(kind: Int, data: Bytes) -> Bytes:
         return hash.sha256_bytes(data)
     if kind == SHA384:
         return hash.sha384_bytes(data)
+    if kind == MD5:
+        return hash.md5_bytes(data)
     return hash.sha512_bytes(data)
 
 # HMAC over any hash function (RFC 2104): hash an oversized key down to size,
@@ -57,6 +60,18 @@ fn hmac(kind: Int, block_size: Int, key: Bytes, message: Bytes) -> Bytes:
     inner_hash := hmac_digest(kind, inner)
     outer := hmac_pad(k, 92, block_size).concat(inner_hash)
     return hmac_digest(kind, outer)
+
+# compute HMAC-MD5 and return raw bytes (legacy protocol interop only).
+pub fn md5(key: Bytes, message: Bytes) -> Bytes:
+    return hmac(MD5, 64, key, message)
+
+# compute HMAC-MD5 and return lowercase hex (legacy protocol interop only).
+pub fn md5_hex(key: Bytes, message: Bytes) -> String:
+    return encoding.to_hex(md5(key, message))
+
+# verify HMAC-MD5 using a no-early-return comparison.
+pub fn verify_md5(key: Bytes, message: Bytes, expected: Bytes) -> Bool:
+    return subtle.equal(md5(key, message), expected)
 
 # compute HMAC-SHA1 and return raw bytes.
 pub fn sha1(key: Bytes, message: Bytes) -> Bytes:
@@ -134,3 +149,15 @@ test "hmac sha512 matches rfc 4231 vector":
     assert_eq(sha512_hex(key, message), expected)
     assert(verify_sha512(key, message, encoding.from_hex(expected)!))
     assert(not verify_sha512(key, bytes.from_string_utf8("hi there"), encoding.from_hex(expected)!))
+
+test "hmac md5 matches rfc 2202 vectors":
+    key1 := list_to_bytes([11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11])
+    msg1 := bytes.from_string_utf8("Hi There")
+    exp1 := "9294727a3638bb1c13f48ef8158bfc9d"
+    assert_eq(md5_hex(key1, msg1), exp1)
+    assert(verify_md5(key1, msg1, encoding.from_hex(exp1)!))
+    assert(not verify_md5(key1, bytes.from_string_utf8("hi there"), encoding.from_hex(exp1)!))
+
+    key2 := bytes.from_string_utf8("Jefe")
+    msg2 := bytes.from_string_utf8("what do ya want for nothing?")
+    assert_eq(md5_hex(key2, msg2), "750c783e6ab0b503eaa86e310a5db738")

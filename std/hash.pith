@@ -1014,6 +1014,132 @@ pub fn sha1_hex(input: Bytes) -> String:
 pub fn sha1_string(input: String) -> String:
     return sha1(bytes.from_string_utf8(input))
 
+# ===============================================================
+# MD5 (RFC 1321) — legacy checksum / protocol interop only
+# ===============================================================
+
+md5_shifts: List[Int] := [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+]
+
+md5_round_constants: List[Int] := [
+    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
+    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
+    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
+    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
+    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
+    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
+    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
+    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
+    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
+    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
+    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
+    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
+    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
+    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
+    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
+    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
+]
+
+fn md5_write_u32_le(buf: bytes.ByteBuffer, v: Int):
+    buf.write_byte(bits.mask8(v)) catch 0
+    buf.write_byte(bits.mask8(bits.shr(v, 8))) catch 0
+    buf.write_byte(bits.mask8(bits.shr(v, 16))) catch 0
+    buf.write_byte(bits.mask8(bits.shr(v, 24))) catch 0
+
+fn md5_read_u32_le(data: Bytes, off: Int) -> Int:
+    b0 := data[off]
+    b1 := bits.shl(data[off + 1], 8)
+    b2 := bits.shl(data[off + 2], 16)
+    b3 := bits.shl(data[off + 3], 24)
+    return bits.bor(bits.bor(b0, b1), bits.bor(b2, b3))
+
+# compute an MD5 digest (RFC 1321) and return raw 16 bytes.
+# MD5 is cryptographically broken; use only for legacy protocol/checksum interop.
+pub fn md5_bytes(input: Bytes) -> Bytes:
+    orig_len := input.len()
+    padded := bytes.buffer_with_capacity(orig_len + 72)
+    defer padded.free()
+    padded.write(input) catch 0
+    padded.write_byte(0x80) catch 0
+    while padded.len() % 64 != 56:
+        padded.write_byte(0) catch 0
+    bit_len := orig_len * 8
+    md5_write_u32_le(padded, bits.mask32(bit_len))
+    md5_write_u32_le(padded, bits.mask32(bits.shr(bit_len, 32)))
+    msg := padded.bytes()
+
+    mut a0 := 0x67452301
+    mut b0 := 0xefcdab89
+    mut c0 := 0x98badcfe
+    mut d0 := 0x10325476
+
+    mut offset := 0
+    while offset < msg.len():
+        mut m: List[Int] := []
+        mut wi := 0
+        while wi < 16:
+            m.push(md5_read_u32_le(msg, offset + wi * 4))
+            wi = wi + 1
+
+        mut a := a0
+        mut b := b0
+        mut c := c0
+        mut d := d0
+
+        mut i := 0
+        while i < 64:
+            mut f := 0
+            mut g := 0
+            if i < 16:
+                f = bits.bor(bits.band(b, c), bits.band(bits.mask32(bits.invert(b)), d))
+                g = i
+            elif i < 32:
+                f = bits.bor(bits.band(d, b), bits.band(bits.mask32(bits.invert(d)), c))
+                g = (5 * i + 1) % 16
+            elif i < 48:
+                f = bits.xor(bits.xor(b, c), d)
+                g = (3 * i + 5) % 16
+            else:
+                f = bits.xor(c, bits.bor(b, bits.mask32(bits.invert(d))))
+                g = (7 * i) % 16
+
+            f = bits.add32(bits.add32(f, a), bits.add32(md5_round_constants[i], m[g]))
+            a = d
+            d = c
+            c = b
+            b = bits.add32(b, bits.rotl32(f, md5_shifts[i]))
+            i = i + 1
+
+        a0 = bits.add32(a0, a)
+        b0 = bits.add32(b0, b)
+        c0 = bits.add32(c0, c)
+        d0 = bits.add32(d0, d)
+        offset = offset + 64
+
+    out := bytes.buffer_with_capacity(16)
+    defer out.free()
+    md5_write_u32_le(out, a0)
+    md5_write_u32_le(out, b0)
+    md5_write_u32_le(out, c0)
+    md5_write_u32_le(out, d0)
+    return out.bytes()
+
+# compute an MD5 digest (RFC 1321) and return lowercase hex.
+pub fn md5(input: Bytes) -> String:
+    return encoding.to_hex(md5_bytes(input))
+
+# compute an MD5 digest and return lowercase hex.
+pub fn md5_hex(input: Bytes) -> String:
+    return md5(input)
+
+## hash a utf-8 string with MD5 (RFC 1321).
+pub fn md5_string(input: String) -> String:
+    return md5(bytes.from_string_utf8(input))
+
 test "sha256 hashes bytes and strings":
     data := bytes.from_string_utf8("hello")
     digest := "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
@@ -1057,6 +1183,16 @@ test "sha1 hashes bytes and strings":
     assert_eq(sha1_hex(data), digest)
     assert_eq(encoding.to_hex(sha1_bytes(data)), digest)
     assert_eq(sha1_string("hello"), digest)
+
+test "md5 matches rfc 1321 vectors":
+    assert_eq(md5_string(""), "d41d8cd98f00b204e9800998ecf8427e")
+    assert_eq(md5_string("a"), "0cc175b9c0f1b6a831c399e269772661")
+    assert_eq(md5_string("abc"), "900150983cd24fb0d6963f7d28e17f72")
+    assert_eq(md5_string("message digest"), "f96b697d7cb7938d525a2f31aaf161d0")
+    assert_eq(md5_string("abcdefghijklmnopqrstuvwxyz"), "c3fcd3d76192e4007dfb496cca67e13b")
+    assert_eq(md5_string("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"), "d174ab98d277d9f5a5611c2c9f419d9f")
+    assert_eq(md5_hex(bytes.from_string_utf8("abc")), "900150983cd24fb0d6963f7d28e17f72")
+    assert_eq(encoding.to_hex(md5_bytes(bytes.from_string_utf8("abc"))), "900150983cd24fb0d6963f7d28e17f72")
 
 test "fnv1a hashes bytes and strings":
     data := bytes.from_string_utf8("hello")

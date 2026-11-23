@@ -78,8 +78,10 @@ a fallback. a function that cannot fail cannot pretend otherwise.
 interpolation takes format specs. there is no null and there are no
 exceptions. an out-of-range index or a missing map key propagates as
 an error inside a `T!` or `T!String` function and stops the process
-elsewhere. integer arithmetic traps on overflow; `wrapping_add`,
-`wrapping_sub` and `wrapping_mul` opt out ([docs/numbers.md](docs/numbers.md)).
+elsewhere. integer arithmetic traps on overflow at every width, and so
+do integer conversions, `abs`, `Float.to_int` and shift counts outside
+0 to 63; the `wrapping_*` methods opt out
+([docs/numbers.md](docs/numbers.md)).
 
 ## why you might want it
 

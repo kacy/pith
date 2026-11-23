@@ -287,10 +287,12 @@ threadlocal mut parser_position: Int := 0
 threadlocal mut parser_error: Bool := false
 threadlocal mut parser_depth: Int := 0
 
-# Maximum container-nesting depth. Deep enough for any real document,
+# Maximum value-nesting depth. Deep enough for any real document,
 # shallow enough that the recursive value parser can't overflow the native
 # stack. A stack overflow is a SIGSEGV, which no error handler can catch, so
-# we have to stop before it happens rather than recover from it.
+# we have to stop before it happens rather than recover from it. every value
+# counts, the innermost scalar too, so 127 nested arrays or objects parse and
+# 128 are refused.
 MAX_PARSE_DEPTH := 128
 
 ## most nodes one parse may allocate. each node costs a few dozen bytes, so
@@ -2831,3 +2833,20 @@ test "json integers cover the full Int range and reject overflow":
     assert_eq(get_int(parse("-9223372036854775808")), 0 - 9223372036854775807 - 1)
     assert_eq(parse("9223372036854775808"), 0 - 1)
     assert_eq(parse("-9223372036854775809"), 0 - 1)
+
+# `n` nested arrays around one scalar
+fn nested_arrays(n: Int) -> String:
+    mut open: List[String] := []
+    mut close: List[String] := []
+    mut i := 0
+    while i < n:
+        open.push("[")
+        close.push("]")
+        i = i + 1
+    return open.join("") + "1" + close.join("")
+
+test "json accepts 127 nested containers and refuses 128":
+    scope := open_scope()
+    assert_eq(type_of(parse(nested_arrays(127))), "array")
+    assert_eq(type_of(parse(nested_arrays(128))), "invalid")
+    close_scope(scope)

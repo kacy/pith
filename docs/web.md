@@ -238,7 +238,8 @@ fn stock(req: web.Request) -> http.HttpResponse:
 a `Map` whose key is not a `String`, and a `List` or a `Map` whose element is
 an optional, are refused at the checker (`docs/limitations.md`); decode such a
 document through `json.parse` and the node accessors instead. a document
-nested deeper than 128 levels is refused, as `json.parse` refuses it.
+whose arrays and objects nest 128 levels deep or more is refused, as
+`json.parse` refuses it; 127 levels is the deepest that decodes.
 
 going the other way, build the response body with the `std.json` constructors and
 send it with `http.json`:

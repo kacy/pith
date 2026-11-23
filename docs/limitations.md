@@ -134,8 +134,8 @@ stale and a fix to it is welcome.
   of those, nested structs, `List`s and `Map[String, _]`s, nested to any depth.
   refused with E219: a map with a non-`String` key, and a list or map whose
   element is an optional (`List[Int?]`). reach those documents through
-  `json.parse` and the node accessors. documents nested deeper than 128 levels
-  are refused.
+  `json.parse` and the node accessors. documents whose arrays and objects nest
+  128 levels deep or more are refused.
 - **toml, yaml and config decode targets are narrower**. `toml.decode`,
   `yaml.decode` and `config.decode` refuse `Float`, `List` and `Map` fields
   (E219). read those through the parsed document instead.

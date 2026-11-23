@@ -25,7 +25,8 @@ both give their registry slot back when the last value naming them goes away,
 and both can be closed earlier by hand — see [who closes a
 config](#who-closes-a-config).
 
-server configs come from a certificate chain and a pkcs#8 private key:
+server configs come from a certificate chain and an unencrypted pem private key
+(pkcs#8 `PRIVATE KEY`, pkcs#1 `RSA PRIVATE KEY`, or sec1 `EC PRIVATE KEY`):
 
 ```pith
 server_cfg := tls.server_config("certs/server.crt", "certs/server.key")!
@@ -103,7 +104,7 @@ worse shutdown than the leak they were fixing. the last line of the example is
 optional now — `cfg` closes itself when the function returns — and is kept
 because it says where the slot goes back.
 
-the std servers do this for you: `App.listen_tls`, `http2.listen_h2_tls` and its
+the std servers do this for you: `App.listen_tls`, `std.net.http2.server.listen_h2_tls` and its
 streaming twin each build a config, serve on it, and close it after their drain,
 so a program that calls one of those has nothing to close.
 `tls.open_server_configs()` counts the server configs still holding a
@@ -118,7 +119,7 @@ listener or a handshake still holds the config, because each of those holds a
 count.
 
 the functions that build a config for you close it for you — `tls.dial`,
-`http.get` and friends, `http2.connect`. the `_with_config` variants never
+`http.get_https` and friends, `std.net.http2.connection.connect`. the `_with_config` variants never
 close, because there the config came from the caller and may well be reused for
 the next connection.
 
@@ -386,8 +387,8 @@ in optional mode, a client may omit its certificate.
 if it does send one, pith verifies it against the configured ca bundle.
 
 a client presents one with `with_client_certificate(cert_path, key_path)`: a
-pem chain, leaf first, and a pkcs#8 pem key, the same pair a server config
-takes.
+pem chain, leaf first, and an unencrypted pem private key (pkcs#8, pkcs#1 rsa,
+or sec1 ec), the same pair a server config takes.
 
 ```pith
 cfg := tls.client_config_with_ca_file("certs/root-ca.pem")!.with_client_certificate("certs/client.crt", "certs/client.key")!

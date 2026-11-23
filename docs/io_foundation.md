@@ -204,7 +204,8 @@ implement `BytesReader`.
 the deadline-aware reads and writes (`read_ctx`, `read_line_ctx`,
 `read_until_ctx`, `write_ctx`, `flush_ctx`) are a second implementation,
 because they return a different error type and the context has to reach the
-source read itself. every buffered reader and writer offers them. a string, a
+source read itself. every text buffered reader and writer (`BufferedReader` and
+`BufferedWriter`, regardless of source or target) offers them. a string, a
 string buffer and a file never block, so their `_ctx` calls check the context
 once and then do the plain call.
 

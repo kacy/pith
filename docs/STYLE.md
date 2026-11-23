@@ -184,16 +184,16 @@ on every exit. see [defer.md](defer.md) for the rules.
 
 ```pith
 # good
-fn open_session(host: String) -> Session!:
-    fd := tcp.connect(host)!
+fn open_session(host: String, port: Int) -> Session!:
+    fd := tcp.connect(host, port)!
     errdefer tcp.close(fd)
     send_greeting(fd)!
     banner := read_reply(fd)!
     return Session(fd: fd, banner: banner)
 
 # bad: each new step needs its own copy of the cleanup
-fn open_session(host: String) -> Session!:
-    fd := tcp.connect(host)!
+fn open_session(host: String, port: Int) -> Session!:
+    fd := tcp.connect(host, port)!
     sent := send_greeting(fd)
     if sent.is_err:
         tcp.close(fd)
@@ -240,16 +240,19 @@ fn join_trimmed(input_lines: List[String]) -> String!:
     return out.string()
 ```
 
-use `+=` and `-=` on numeric variables and fields:
+use `+=`, `-=`, `*=` and `/=` on numeric variables, fields, and list or map
+elements:
 
 ```pith
 mut total_bytes := 0
 for chunk in chunks:
     total_bytes += chunk.len()
+
+counts[key] += 1
 ```
 
-compound assignment does not yet work on list or map elements or on strings,
-so write those out in full: `counts[key] = counts[key] + 1`.
+compound assignment does not work on strings (E217), so write `s = s + ...`
+or use `io.string_buffer()` in a loop.
 
 name the fields when you build a struct whose fields share a type, or one that
 takes booleans. a reader should not have to open the declaration to know which
@@ -341,7 +344,7 @@ when in doubt, spell it out.
 start a file with a short description of what the module is for:
 
 ```pith
-# std.net.http.client - http/1.1 client with connection pooling
+# std.net.http - http/1.1 client with connection pooling
 #
 # keep-alive connections, retries, and custom headers.
 

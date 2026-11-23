@@ -12,7 +12,7 @@ for a browser rather than an api, the session is the better carrier: a token
 in a cookie cannot be revoked before it expires, and a server-side session
 can. `std.web.session`, `std.web.csrf` and `std.web.auth` are that path —
 `docs/web.md` covers them, and `examples/web_login.pith` runs a password
-login through all three. this file stays about the two crypto modules
+login through all three. this file stays about the three crypto modules
 underneath.
 
 ## hashing a password

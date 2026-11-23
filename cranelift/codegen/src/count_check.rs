@@ -1637,6 +1637,11 @@ fn runtime_call_writes(callee: &str) -> bool {
     if callee.contains("release") || callee.contains("retain") {
         return false;
     }
+    // a byte buffer holds raw bytes and no counted value, so nothing done to
+    // one can drop a stored value
+    if callee.starts_with("byte_buffer_") {
+        return false;
+    }
     EVICTING_NAME_PARTS.iter().any(|p| callee.contains(p))
 }
 
@@ -1861,6 +1866,13 @@ ret 13
 mark kind b bytes
 endfunc
 ";
+
+    #[test]
+    fn a_byte_buffer_call_drops_no_stored_value() {
+        assert!(!runtime_call_writes("byte_buffer_take_bytes"));
+        assert!(!runtime_call_writes("byte_buffer_clear"));
+        assert!(runtime_call_writes("list_clear"));
+    }
 
     #[test]
     fn a_catch_over_a_nullable_string_balances() {

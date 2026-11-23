@@ -20,7 +20,7 @@ codes below are the whole set:
 | `E240` | parser | an expected token was missing |
 | `E241` | parser | the file ended in the middle of a construct |
 | `E242` | parser | the tokens do not form a valid construct here |
-| `E243` | lexer | an invalid token: a stray character, an unterminated string, or a bad indentation change |
+| `E243` | lexer | an invalid token (a stray character, an unterminated string, or a bad indentation change), a file over 16 MiB, or a file that is not valid utf-8 |
 
 each is documented in full below. codes in the E0xx and E1xx ranges have never
 been emitted and are not reserved for these phases.
@@ -486,6 +486,11 @@ the parser reached the end of the file before a required token or block terminat
 the parser encountered a token sequence that does not form a valid expression,
 pattern, or declaration.
 
+it also reports input nested past the parser's limits: expressions, types or
+patterns more than 256 levels deep, an expression tree deeper than 25,000
+levels (a chain of 25,000 operators or about 8,000 calls), or blocks nested
+more than 1,000 deep. see the compiler input limits in `SECURITY.md`.
+
 ### E243 — lexer error
 
 the lexer produced an invalid token — an unterminated string literal, a
@@ -493,6 +498,10 @@ stray character that starts no valid token, or a bad indentation change.
 every lexer error is reported, even one that lands between two otherwise
 valid tokens (`1 € + 2`), so an invalid character can never be silently
 dropped.
+
+a source file over 16 MiB, or one that is not valid utf-8, is reported with
+this code too. the utf-8 report gives the byte offset of the first invalid
+byte.
 
 ### E245 — invalid if let / while let pattern
 

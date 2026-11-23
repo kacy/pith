@@ -336,7 +336,12 @@ fn numeric_claim(root: Int, name: String) -> Int!:
     if kind == "int":
         return json.get_int(node)
     if kind == "float":
-        return floor(json.get_float(node)).to_int()
+        seconds := floor(json.get_float(node))
+        # the token is untrusted, and to_int stops the program on a value
+        # outside Int's range
+        if not (seconds >= -9223372036854775808.0 and seconds < 9223372036854775808.0):
+            fail "the " + name + " claim is out of range"
+        return seconds.to_int()
     fail "the " + name + " claim is not a number"
 
 fn audience_matches(root: Int, wanted: String) -> Bool!:

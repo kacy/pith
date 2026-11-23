@@ -156,6 +156,10 @@ fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, default_table: fse
     if mode == MODE_RLE:
         if pos >= data.len():
             fail "zstd: truncated rle symbol"
+        # an offset code is a shift count, so one past the table must not
+        # reach the decode loop
+        if data[pos] > max_symbol:
+            fail "zstd: sequence code out of range"
         return (default_table, 1, data[pos])
     if mode == MODE_FSE:
         desc := fse.read_ncount(data, pos, end, max_symbol, max_log)!

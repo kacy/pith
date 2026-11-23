@@ -740,6 +740,9 @@ pub struct Stream:
     client: Client
     pub id: Int
     inbox: Channel[StreamEvent]
+    # set once close() or finish() has released the stream, so the destructor
+    # of a stream released by hand returns without taking the client's lock.
+    mut released: Bool
 
 impl Stream:
     # send a chunk of the request body, half-closing the stream (END_STREAM on the
@@ -762,13 +765,23 @@ impl Stream:
     # release the stream: reset it (CANCEL) on the wire if its terminal event
     # has not arrived, close its inbox, then drop it from the client's table
     # and free its concurrency slot. call it once per opened stream when done
-    # with it — the reader does not forget a streaming stream on its own, so
-    # one that is never closed retains its channels, its table entries and a
-    # MAX_CONCURRENT_STREAMS slot for the life of the connection. a finished
-    # stream (end-of-stream or reset already delivered) is released without
-    # touching the wire, so closing a completed rpc sends nothing. a second
-    # close finds the stream gone and is a no-op.
+    # with it. the reader does not forget a streaming stream on its own; a
+    # stream dropped without close() is released by its destructor, which
+    # skips the reset when the outbound queue is full. a finished stream
+    # (end-of-stream or reset already delivered) is released without touching
+    # the wire, so closing a completed rpc sends nothing. a second close finds
+    # the stream gone and is a no-op.
     pub fn close():
+        self.release(true)
+
+    # the body of close() and of the destructor. `wait` says whether queueing
+    # the reset frame may block until the outbound queue has room. close()
+    # waits; the destructor must not block, so it queues the reset only when
+    # there is room and otherwise releases the stream without one.
+    fn release(wait: Bool):
+        if self.released:
+            return
+        self.released = true
         mut registered := false
         mut done := false
         locked self.client.mu:
@@ -781,11 +794,27 @@ impl Stream:
             if not rst.is_err:
                 wire := frames.frame_bytes(rst.ok)
                 if not wire.is_err:
-                    self.client.outbound.send(wire.ok)
+                    if wait:
+                        self.client.outbound.send(wire.ok)
+                    else:
+                        self.client.outbound.try_send(wire.ok)
         # a closed inbox still yields its buffered events, so a consumer that
         # is behind drains what already arrived and then sees the close.
         self.inbox.close()
         self.client.forget(self.id)
+
+    # forget a stream whose response the caller has already read to the end:
+    # the unary request paths, which need no reset and no inbox close.
+    fn finish():
+        self.released = true
+        self.client.forget(self.id)
+
+# a stream released by close() or finish() returns at once. stream ids are
+# never reused on a connection, so a stream the client forgot some other way
+# (a GOAWAY, a closed client) finds nothing to release.
+impl Drop for Stream:
+    fn drop():
+        self.release(false)
 
 # a placeholder write task for offline clients, which drive the reader directly
 # and never spawn a real writer over the shared outbound channel.
@@ -1655,7 +1684,7 @@ impl Client:
             # window is fresh, so it is never the shortfall here); send the body
             # under flow control, waiting for a WINDOW_UPDATE if it must.
             send_stream_data(self, stream_id, body, true)
-        return Stream(self, stream_id, target.value())
+        return Stream(self, stream_id, target.value(), false)
 
     # open a stream for a streaming rpc: fills the four pseudo-headers from the
     # method, authority, and path, appends `extra` (e.g. content-type), and sends
@@ -1806,7 +1835,7 @@ impl Client:
             stream := self.open_stream_with_body(fields, false, true, body)!
             stream_id := stream.id
             attempt := assemble_response(stream.inbox)
-            self.forget(stream_id)
+            stream.finish()
             if attempt.is_err:
                 fail attempt.err
             return attempt.ok
@@ -1820,13 +1849,13 @@ impl Client:
             sender := spawn send_stream_data(me, stream_id, body, true)
             attempt := assemble_response(stream.inbox)
             await sender
-            self.forget(stream_id)
+            stream.finish()
             if attempt.is_err:
                 fail attempt.err
             return attempt.ok
         # no body: END_STREAM already rode on the HEADERS frame.
         attempt := assemble_response(stream.inbox)
-        self.forget(stream_id)
+        stream.finish()
         if attempt.is_err:
             fail attempt.err
         return attempt.ok
@@ -1878,7 +1907,7 @@ impl Client:
                 await sender
                 fail attempt.err
             await sender
-            self.forget(stream_id)
+            stream.finish()
             return attempt.ok
         # a single-frame body rides the HEADERS write (see threaded_request), and
         # an empty one half-closes on the HEADERS frame — one call covers both.
@@ -1888,7 +1917,7 @@ impl Client:
         if attempt.is_err:
             stream.close()
             fail attempt.err
-        self.forget(stream_id)
+        stream.finish()
         return attempt.ok
 
     # the most a unary response body may hold, in place of MAX_RESPONSE_BODY.
@@ -2578,7 +2607,7 @@ test "a stream's recv yields its events one at a time":
     inbox.send(headers_event([hpack.header_field(":status", "200")], false))
     inbox.send(data_event(bytes.from_string_utf8("chunk-a"), false))
     inbox.send(data_event(bytes.from_string_utf8("chunk-b"), true))
-    stream := Stream(offline_client(connection_from_frames(bytes.empty())), 1, inbox)
+    stream := Stream(offline_client(connection_from_frames(bytes.empty())), 1, inbox, false)
     h := stream.recv()!
     assert_eq(h.kind, STREAM_HEADERS)
     assert_eq(status_from(h.headers), 200)
@@ -2798,6 +2827,78 @@ test "closing a finished stream skips the wire reset":
 fn post_fields() -> List[hpack.HeaderField]:
     return [hpack.header_field(":method", "POST"), hpack.header_field(":path", "/s"), hpack.header_field(":scheme", "http"), hpack.header_field(":authority", "t")]
 
+# open a streaming stream and return its id; the Stream itself is dropped
+# here without close().
+fn open_and_drop(client: Client) -> Int!:
+    stream := client.open_stream_with_fields(post_fields(), false, false)!
+    return stream.id
+
+fn open_then_close(client: Client) -> Int!:
+    stream := client.open_stream_with_fields(post_fields(), false, false)!
+    stream.close()
+    stream.close()
+    return stream.id
+
+# open a stream, fill the writer queue so a blocking send would wait forever,
+# and return the id; the Stream is dropped here without close().
+fn open_fill_and_drop(client: Client) -> Int!:
+    stream := client.open_stream_with_fields(post_fields(), false, false)!
+    mut filling := true
+    while filling:
+        filling = client.outbound.try_send(bytes.empty())
+    return stream.id
+
+test "a dropped stream leaves the table and frees its concurrency slot":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    sid := open_and_drop(client)!
+    # the HEADERS block, then the destructor's RST_STREAM.
+    assert(client.outbound.try_recv() != none)
+    assert(client.outbound.try_recv() != none)
+    assert(client.outbound.try_recv() == none)
+    locked client.mu:
+        assert(not client.streams.contains_key(sid))
+        assert(not client.credit.contains_key(sid))
+        assert(not client.send_windows.contains_key(sid))
+        assert_eq(client.active.len(), 0)
+    assert(client.slot_free.try_recv() != none)
+
+test "a stream dropped after close() releases nothing twice":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    open_then_close(client)!
+    # HEADERS and close()'s RST_STREAM; the destructor queues nothing more.
+    assert(client.outbound.try_recv() != none)
+    assert(client.outbound.try_recv() != none)
+    assert(client.outbound.try_recv() == none)
+    assert(client.slot_free.try_recv() != none)
+    assert(client.slot_free.try_recv() == none)
+
+test "a dropped stream skips the reset when the outbound queue is full":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    sid := open_fill_and_drop(client)!
+    # released anyway, with no RST_STREAM queued and no wait.
+    mut queued := 0
+    while client.outbound.try_recv() != none:
+        queued = queued + 1
+    assert_eq(queued, OUTBOUND_CAP)
+    locked client.mu:
+        assert(not client.streams.contains_key(sid))
+        assert_eq(client.active.len(), 0)
+
+test "streams dropped without close() do not accumulate":
+    client := offline_client(connection_from_frames(bytes.empty()))
+    for i in 0..10000:
+        open_and_drop(client)!
+        mut draining := true
+        while draining:
+            draining = client.outbound.try_recv() != none
+        client.slot_free.try_recv()
+    locked client.mu:
+        assert_eq(client.streams.len(), 0)
+        assert_eq(client.credit.len(), 0)
+        assert_eq(client.send_windows.len(), 0)
+        assert_eq(client.finished.len(), 0)
+        assert_eq(client.active.len(), 0)
+
 fn open_second_stream(client: Client) -> Int:
     opened := client.open_stream_with_fields(post_fields(), false, false) catch:
         return 0 - 1
@@ -2820,8 +2921,9 @@ test "a stream waits for a concurrency slot and opens once one frees":
     first.close()
     second_id := await waiter
     assert_eq(second_id, first.id + 2)
+    # the waiter returned only the id, so its stream was released on return.
     locked client.mu:
-        assert_eq(client.active.len(), 1)
+        assert_eq(client.active.len(), 0)
 
 test "a refused open releases the lock for the next one":
     client := offline_client(connection_from_frames(bytes.empty()))

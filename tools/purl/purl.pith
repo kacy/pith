@@ -18,7 +18,7 @@ PURL_VERSION := "purl 0.1.0 (pith)"
 fn print_version():
     print(PURL_VERSION)
     print("Protocols: http https file")
-    print("Features: HTTP/1.1 HTTP/2 TLS1.2 TLS1.3 gzip deflate zstd cookies proxy digest aws-sigv4 netrc glob parallel stream")
+    print("Features: HTTP/1.1 HTTP/2 TLS1.2 TLS1.3 gzip deflate zstd cookies proxy socks5 digest aws-sigv4 netrc glob parallel stream")
 
 fn print_help():
     print("Usage: purl [options...] <url> [url...]")
@@ -72,7 +72,9 @@ fn print_help():
     print("     --oauth2-bearer <token>   OAuth 2 Bearer Token")
     print(" -v, --verbose                 Make the operation more talkative")
     print(" -w, --write-out <format>      Output transfer metrics after completion")
-    print(" -x, --proxy <[proto://]h[:p]> Use HTTP proxy")
+    print(" -x, --proxy <[proto://]h[:p]> Use HTTP or SOCKS5 proxy")
+    print("     --socks5 <host[:port]>    Use SOCKS5 proxy (local DNS)")
+    print("     --socks5-hostname <h[:p]> Use SOCKS5 proxy (remote DNS)")
     print("     --noproxy <hosts>         Comma-separated hosts bypassing proxy")
     print(" -X, --request <method>        Specify request method to use")
     print(" -z, --time-cond <file|date>   Transfer based on a time condition")
@@ -83,7 +85,7 @@ fn print_help():
     print("     --compressed              Request and decode gzip/deflate/zstd")
     print("     --cacert <file>           CA certificate to verify peer against")
     print("     --cert <file>             Client certificate file (PEM)")
-    print("     --key <file>              Client private key file (PKCS#8 PEM)")
+    print("     --key <file>              Client private key file (PKCS#8/PKCS#1/SEC1 PEM)")
     print("     --tlsv1.2 / --tlsv1.3     Pin TLS version")
     print("     --http1.1 / --http2       Select HTTP protocol version")
     print("     --http2-prior-knowledge   Use plaintext HTTP/2 (h2c)")
@@ -96,18 +98,18 @@ fn print_help():
     print(" -h, --help                    Show this help message")
     print(" -V, --version                 Show version number and quit")
 
-fn main():
+fn main() -> Int:
     parsed := parse_cli(args())
     if parsed.error_msg != "":
         print_err("purl: {parsed.error_msg}")
         print_err("purl: try 'purl --help' for more information")
-        exit(2)
+        return 2
     if parsed.show_help:
         print_help()
-        return
+        return 0
     if parsed.show_version:
         print_version()
-        return
+        return 0
 
     mut has_any_url := false
     for s in parsed.specs:
@@ -116,8 +118,6 @@ fn main():
     if not has_any_url:
         print_err("purl: no URL specified")
         print_err("purl: try 'purl --help' for more information")
-        exit(2)
+        return 2
 
-    code := execute_cli(parsed)
-    if code != 0:
-        exit(code)
+    return execute_cli(parsed)

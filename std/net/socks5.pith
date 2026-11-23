@@ -1,0 +1,440 @@
+# std.net.socks5 — RFC 1928 SOCKS5 TCP proxy client (with RFC 1929 auth)
+#
+# Supports NO AUTHENTICATION REQUIRED (0x00) and USERNAME/PASSWORD (0x02),
+# IPv4, IPv6, and domain-name (remote DNS resolution / socks5h) targets.
+#
+#   import std.net.socks5 as socks5
+#   stream := socks5.dial_url("socks5h://127.0.0.1:1080", "example.com", 443)!
+
+import std.bits as bits
+import std.bytes as bytes
+import std.io as io
+import std.net.url as url_mod
+from std.io import TcpStream
+
+SOCKS5_VERSION := 5
+AUTH_NONE := 0
+AUTH_USERPASS := 2
+AUTH_NO_ACCEPTABLE := 255
+USERPASS_VERSION := 1
+CMD_CONNECT := 1
+ATYP_IPV4 := 1
+ATYP_DOMAIN := 3
+ATYP_IPV6 := 4
+
+# Configuration for dialing through a SOCKS5 proxy server.
+pub struct Socks5Config:
+    pub proxy_host: String
+    pub proxy_port: Int
+    pub username: String
+    pub password: String
+    pub timeout_ms: Int
+
+# Build a SOCKS5 config for `proxy_host`:`proxy_port` with no authentication.
+pub fn config(proxy_host: String, proxy_port: Int) -> Socks5Config:
+    return Socks5Config(proxy_host, proxy_port, "", "", 0)
+
+impl Socks5Config:
+    # Return a copy configured with RFC 1929 username/password authentication.
+    pub fn with_auth(username: String, password: String) -> Socks5Config:
+        return Socks5Config(self.proxy_host, self.proxy_port, username, password, self.timeout_ms)
+
+    # Return a copy configured with a socket I/O timeout in milliseconds.
+    pub fn with_timeout(ms: Int) -> Socks5Config:
+        return Socks5Config(self.proxy_host, self.proxy_port, self.username, self.password, ms)
+
+# Parse a SOCKS5 proxy URL ("socks5://[user:pass@]host[:port]",
+# "socks5h://[user:pass@]host[:port]", or "host[:port]"). Default port is 1080.
+pub fn parse_proxy_url(raw: String) -> Socks5Config!:
+    mut text := raw.trim()
+    if text == "":
+        fail "socks5: empty proxy url"
+    if text.index_of("://") < 0:
+        text = "socks5h://" + text
+    parsed := url_mod.parse(text)
+    scheme := url_mod.scheme(parsed).to_lower()
+    if scheme != "socks5" and scheme != "socks5h":
+        fail "socks5: unsupported scheme '{scheme}'"
+    host := url_mod.host(parsed)
+    if host == "":
+        fail "socks5: missing proxy host"
+    mut port := url_mod.port(parsed)
+    if port < 0:
+        port = 1080
+    if port <= 0 or port > 65535:
+        fail "socks5: invalid proxy port {port}"
+    ui := url_mod.userinfo(parsed)
+    mut user := ""
+    mut pass := ""
+    if ui != "":
+        colon := ui.index_of(":")
+        if colon < 0:
+            user = url_mod.decode_path(ui)
+        else:
+            user = url_mod.decode_path(ui.substring(0, colon))
+            pass = url_mod.decode_path(ui.substring(colon + 1, ui.len()))
+    return Socks5Config(host, port, user, pass, 0)
+
+# Parse an IPv4 dotted-quad into 4 bytes, or empty if `host` is not IPv4.
+fn parse_ipv4_bytes(host: String) -> List[Int]:
+    parts := host.split_exact(".")
+    if parts.len() != 4:
+        return []
+    mut out: List[Int] := []
+    for p in parts:
+        if p.len() == 0 or p.len() > 3:
+            return []
+        mut val := 0
+        mut i := 0
+        while i < p.len():
+            c := ord(p[i])
+            if c < 48 or c > 57:
+                return []
+            val = val * 10 + (c - 48)
+            i = i + 1
+        if val < 0 or val > 255:
+            return []
+        out.push(val)
+    return out
+
+fn parse_hex_u16(s: String) -> Int:
+    if s.len() == 0 or s.len() > 4:
+        return 0 - 1
+    mut val := 0
+    mut i := 0
+    while i < s.len():
+        c := ord(s[i])
+        mut digit := 0 - 1
+        if c >= 48 and c <= 57:
+            digit = c - 48
+        elif c >= 97 and c <= 102:
+            digit = c - 97 + 10
+        elif c >= 65 and c <= 70:
+            digit = c - 65 + 10
+        else:
+            return 0 - 1
+        val = val * 16 + digit
+        i = i + 1
+    return val
+
+# Parse an IPv6 literal (with or without brackets) into 16 bytes, or empty if invalid.
+fn parse_ipv6_bytes(raw_host: String) -> List[Int]:
+    mut host := raw_host
+    if host.starts_with("[") and host.ends_with("]"):
+        host = host.substring(1, host.len() - 1)
+    if not host.contains(":"):
+        return []
+    dbl := host.index_of("::")
+    mut left_groups: List[Int] := []
+    mut right_groups: List[Int] := []
+    if dbl >= 0:
+        if host.index_of("::") != host.last_index_of("::"):
+            return []
+        left_str := host.substring(0, dbl)
+        right_str := host.substring(dbl + 2, host.len())
+        if left_str != "":
+            for part in left_str.split_exact(":"):
+                v := parse_hex_u16(part)
+                if v < 0:
+                    return []
+                left_groups.push(v)
+        if right_str != "":
+            for part in right_str.split_exact(":"):
+                v := parse_hex_u16(part)
+                if v < 0:
+                    return []
+                right_groups.push(v)
+        if left_groups.len() + right_groups.len() >= 8:
+            return []
+    else:
+        for part in host.split_exact(":"):
+            v := parse_hex_u16(part)
+            if v < 0:
+                return []
+            left_groups.push(v)
+        if left_groups.len() != 8:
+            return []
+
+    mut groups: List[Int] := []
+    for g in left_groups:
+        groups.push(g)
+    missing := 8 - left_groups.len() - right_groups.len()
+    mut z := 0
+    while z < missing:
+        groups.push(0)
+        z = z + 1
+    for g in right_groups:
+        groups.push(g)
+    if groups.len() != 8:
+        return []
+
+    mut out: List[Int] := []
+    for g in groups:
+        out.push(bits.mask8(bits.shr(g, 8)))
+        out.push(bits.mask8(g))
+    return out
+
+# Build the RFC 1928 client greeting packet.
+fn build_greeting(has_auth: Bool) -> Bytes:
+    buf := bytes.buffer_with_capacity(4)
+    defer buf.free()
+    buf.write_byte(SOCKS5_VERSION) catch 0
+    if has_auth:
+        buf.write_byte(2) catch 0
+        buf.write_byte(AUTH_NONE) catch 0
+        buf.write_byte(AUTH_USERPASS) catch 0
+    else:
+        buf.write_byte(1) catch 0
+        buf.write_byte(AUTH_NONE) catch 0
+    return buf.bytes()
+
+# Build the RFC 1929 username/password subnegotiation packet.
+fn build_userpass_auth(username: String, password: String) -> Bytes!:
+    u := bytes.from_string_utf8(username)
+    p := bytes.from_string_utf8(password)
+    if u.len() > 255 or p.len() > 255:
+        fail "socks5: username or password exceeds 255 bytes"
+    buf := bytes.buffer_with_capacity(3 + u.len() + p.len())
+    defer buf.free()
+    buf.write_byte(USERPASS_VERSION) catch 0
+    buf.write_byte(u.len()) catch 0
+    buf.write(u) catch 0
+    buf.write_byte(p.len()) catch 0
+    buf.write(p) catch 0
+    return buf.bytes()
+
+# Build the RFC 1928 CONNECT request packet for `target_host`:`target_port`.
+fn build_connect_request(target_host: String, target_port: Int) -> Bytes!:
+    if target_port < 1 or target_port > 65535:
+        fail "socks5: invalid target port {target_port}"
+    buf := bytes.buffer_with_capacity(64)
+    defer buf.free()
+    buf.write_byte(SOCKS5_VERSION) catch 0
+    buf.write_byte(CMD_CONNECT) catch 0
+    buf.write_byte(0) catch 0
+
+    ipv4 := parse_ipv4_bytes(target_host)
+    if ipv4.len() == 4:
+        buf.write_byte(ATYP_IPV4) catch 0
+        for b in ipv4:
+            buf.write_byte(b) catch 0
+    else:
+        ipv6 := parse_ipv6_bytes(target_host)
+        if ipv6.len() == 16:
+            buf.write_byte(ATYP_IPV6) catch 0
+            for b in ipv6:
+                buf.write_byte(b) catch 0
+        else:
+            host_bytes := bytes.from_string_utf8(target_host)
+            if host_bytes.len() == 0 or host_bytes.len() > 255:
+                fail "socks5: target host length out of range"
+            buf.write_byte(ATYP_DOMAIN) catch 0
+            buf.write_byte(host_bytes.len()) catch 0
+            buf.write(host_bytes) catch 0
+
+    buf.write_byte(bits.mask8(bits.shr(target_port, 8))) catch 0
+    buf.write_byte(bits.mask8(target_port)) catch 0
+    return buf.bytes()
+
+fn reply_error_message(code: Int) -> String:
+    if code == 1:
+        return "general SOCKS server failure"
+    if code == 2:
+        return "connection not allowed by ruleset"
+    if code == 3:
+        return "network unreachable"
+    if code == 4:
+        return "host unreachable"
+    if code == 5:
+        return "connection refused"
+    if code == 6:
+        return "TTL expired"
+    if code == 7:
+        return "command not supported"
+    if code == 8:
+        return "address type not supported"
+    return "unknown reply code {code}"
+
+# Run the RFC 1928 SOCKS5 handshake (and optional RFC 1929 auth) over an open
+# `TcpStream` to open a tunnel to `target_host`:`target_port`.
+pub fn handshake(stream: TcpStream, target_host: String, target_port: Int, username: String, password: String) -> Int!:
+    has_auth := username != "" or password != ""
+    stream.write_all_bytes(build_greeting(has_auth))!
+
+    method_reply := stream.read_exact_bytes(2)!
+    if method_reply.len() != 2 or method_reply[0] != SOCKS5_VERSION:
+        fail "socks5: invalid method selection reply"
+    chosen := method_reply[1]
+    if chosen == AUTH_NO_ACCEPTABLE:
+        fail "socks5: proxy rejected all offered auth methods"
+    if chosen == AUTH_USERPASS:
+        if not has_auth:
+            fail "socks5: proxy requires username/password authentication"
+        stream.write_all_bytes(build_userpass_auth(username, password)!)!
+        auth_reply := stream.read_exact_bytes(2)!
+        if auth_reply.len() != 2 or auth_reply[1] != 0:
+            fail "socks5: authentication failed"
+    elif chosen != AUTH_NONE:
+        fail "socks5: unsupported auth method {chosen}"
+
+    stream.write_all_bytes(build_connect_request(target_host, target_port)!)!
+    head := stream.read_exact_bytes(4)!
+    if head.len() != 4 or head[0] != SOCKS5_VERSION:
+        fail "socks5: invalid connect reply"
+    rep := head[1]
+    if rep != 0:
+        fail "socks5: connect failed: " + reply_error_message(rep)
+
+    atyp := head[3]
+    if atyp == ATYP_IPV4:
+        stream.read_exact_bytes(6)!
+    elif atyp == ATYP_IPV6:
+        stream.read_exact_bytes(18)!
+    elif atyp == ATYP_DOMAIN:
+        len_b := stream.read_exact_bytes(1)!
+        stream.read_exact_bytes(len_b[0] + 2)!
+    else:
+        fail "socks5: unsupported reply address type {atyp}"
+    return 0
+
+# Connect to a SOCKS5 proxy described by `cfg` and establish a tunneled TCP
+# stream to `target_host`:`target_port`.
+pub fn dial(cfg: Socks5Config, target_host: String, target_port: Int) -> TcpStream!:
+    stream := io.connect(cfg.proxy_host, cfg.proxy_port)!
+    if cfg.timeout_ms > 0:
+        stream.set_timeout(cfg.timeout_ms)
+    done := handshake(stream, target_host, target_port, cfg.username, cfg.password)
+    if done.is_err:
+        stream.close()
+        fail done.err
+    return stream
+
+# Parse `proxy_url` and open a SOCKS5-tunneled TCP stream to `target_host`:`target_port`.
+pub fn dial_url(proxy_url: String, target_host: String, target_port: Int) -> TcpStream!:
+    cfg := parse_proxy_url(proxy_url)!
+    return dial(cfg, target_host, target_port)
+
+test "socks5 parses proxy urls and encodes protocol frames":
+    cfg := parse_proxy_url("socks5h://alice:s3cr3t@127.0.0.1:1080")!
+    assert_eq(cfg.proxy_host, "127.0.0.1")
+    assert_eq(cfg.proxy_port, 1080)
+    assert_eq(cfg.username, "alice")
+    assert_eq(cfg.password, "s3cr3t")
+
+    def_cfg := parse_proxy_url("socks5://proxy.local")!
+    assert_eq(def_cfg.proxy_host, "proxy.local")
+    assert_eq(def_cfg.proxy_port, 1080)
+    assert_eq(def_cfg.username, "")
+
+    assert(parse_proxy_url("http://proxy.local:8080").is_err)
+
+    g_noauth := build_greeting(false)
+    assert_eq(g_noauth.len(), 3)
+    assert_eq(g_noauth[0], 5)
+    assert_eq(g_noauth[1], 1)
+    assert_eq(g_noauth[2], 0)
+
+    g_auth := build_greeting(true)
+    assert_eq(g_auth.len(), 4)
+    assert_eq(g_auth[3], 2)
+
+    req_v4 := build_connect_request("127.0.0.1", 8080)!
+    assert_eq(req_v4.len(), 10)
+    assert_eq(req_v4[3], 1)
+    assert_eq(req_v4[4], 127)
+    assert_eq(req_v4[7], 1)
+    assert_eq(req_v4[8], 31)
+    assert_eq(req_v4[9], 144)
+
+    req_dom := build_connect_request("example.com", 443)!
+    assert_eq(req_dom[3], 3)
+    assert_eq(req_dom[4], 11)
+    assert_eq(req_dom[req_dom.len() - 2], 1)
+    assert_eq(req_dom[req_dom.len() - 1], 187)
+
+    req_v6 := build_connect_request("::1", 443)!
+    assert_eq(req_v6.len(), 22)
+    assert_eq(req_v6[3], 4)
+    assert_eq(req_v6[19], 1)
+
+fn mock_socks5_server(listen_fd: Int) -> Int:
+    client_fd := tcp_accept(listen_fd) catch -1
+    if client_fd < 0:
+        return 1
+    stream := TcpStream(client_fd)
+    defer stream.close()
+    stream.set_timeout(3000)
+
+    # 1. Read greeting: [5, nmethods, methods...]
+    g := stream.read_exact_bytes(2) catch bytes.empty()
+    if g.len() != 2 or g[0] != 5:
+        return 1
+    stream.read_exact_bytes(g[1]) catch bytes.empty()
+    # Select username/password auth (0x02)
+    sel := bytes.buffer_with_capacity(2)
+    defer sel.free()
+    sel.write_byte(5) catch 0
+    sel.write_byte(2) catch 0
+    stream.write_all_bytes(sel.bytes()) catch 0
+
+    # 2. Read RFC 1929 auth
+    ver_u := stream.read_exact_bytes(2) catch bytes.empty()
+    if ver_u.len() != 2:
+        return 1
+    u := (stream.read_exact_bytes(ver_u[1]) catch bytes.empty()).to_string_utf8() catch ""
+    plen_b := stream.read_exact_bytes(1) catch bytes.empty()
+    p := (stream.read_exact_bytes(plen_b[0]) catch bytes.empty()).to_string_utf8() catch ""
+    auth_resp := bytes.buffer_with_capacity(2)
+    defer auth_resp.free()
+    auth_resp.write_byte(1) catch 0
+    if u == "bob" and p == "pw":
+        auth_resp.write_byte(0) catch 0
+    else:
+        auth_resp.write_byte(1) catch 0
+    stream.write_all_bytes(auth_resp.bytes()) catch 0
+    if u != "bob" or p != "pw":
+        return 0
+
+    # 3. Read CONNECT request (domain name)
+    hdr := stream.read_exact_bytes(4) catch bytes.empty()
+    if hdr.len() != 4 or hdr[3] != 3:
+        return 1
+    dlen := (stream.read_exact_bytes(1) catch bytes.empty())[0]
+    host := (stream.read_exact_bytes(dlen) catch bytes.empty()).to_string_utf8() catch ""
+    port_b := stream.read_exact_bytes(2) catch bytes.empty()
+    port := port_b[0] * 256 + port_b[1]
+
+    # Reply success with bound 0.0.0.0:0
+    rep := bytes.buffer_with_capacity(10)
+    defer rep.free()
+    rep.write_byte(5) catch 0
+    rep.write_byte(0) catch 0
+    rep.write_byte(0) catch 0
+    rep.write_byte(1) catch 0
+    rep.write_byte(0) catch 0
+    rep.write_byte(0) catch 0
+    rep.write_byte(0) catch 0
+    rep.write_byte(0) catch 0
+    rep.write_byte(0) catch 0
+    rep.write_byte(0) catch 0
+    stream.write_all_bytes(rep.bytes()) catch 0
+
+    # Echo target info over the tunneled stream
+    payload := stream.read_exact_bytes(4) catch bytes.empty()
+    msg := host + ":" + port.to_string() + ":" + (payload.to_string_utf8() catch "")
+    stream.write_all_bytes(bytes.from_string_utf8(msg)) catch 0
+    return 0
+
+test "socks5 dials with username/password auth and tunnels bytes":
+    port := 18941
+    listen_fd := tcp_listen("127.0.0.1", port)!
+    defer tcp_close(listen_fd)
+    server := spawn mock_socks5_server(listen_fd)
+
+    stream := dial_url("socks5h://bob:pw@127.0.0.1:{port}", "api.test", 443)!
+    defer stream.close()
+    stream.set_timeout(3000)
+    stream.write_all_bytes(bytes.from_string_utf8("PING"))!
+    got := stream.read_all_bytes()!.to_string_utf8()!
+    await server
+    assert_eq(got, "api.test:443:PING")

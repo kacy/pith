@@ -63,13 +63,17 @@ MTLS_PORT=18903
 H2C_PORT=18904
 H2_PORT=18905
 PROXY_PORT=18906
+SOCKS_PORT=18907
+SOCKS_AUTH_PORT=18908
 
 start_server http "$HTTP_PORT" 200
-start_server tls "$TLS_PORT" 20 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key"
-start_server tls "$MTLS_PORT" 10 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key" "$FIXTURES/clientcert-ca.crt"
+start_server tls "$TLS_PORT" 30 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key"
+start_server tls "$MTLS_PORT" 20 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key" "$FIXTURES/clientcert-ca.crt"
 start_server h2c "$H2C_PORT" 10
-start_server h2 "$H2_PORT" 10 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key"
+start_server h2 "$H2_PORT" 20 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key"
 start_server proxy "$PROXY_PORT" 10
+start_server socks5 "$SOCKS_PORT" 10
+start_server socks5 "$SOCKS_AUTH_PORT" 10 alice secret
 sleep 0.5
 
 BASE="http://127.0.0.1:$HTTP_PORT"
@@ -419,6 +423,39 @@ assert_contains "-z -file sends If-Unmodified-Since" "$out" '"if_unmodified_sinc
 # 41. -w %{remote_ip} & %{time_namelookup}
 out=$("$PURL" -s -o /dev/null -w '%{remote_ip}|%{time_namelookup}' "$BASE/hello")
 assert_contains "-w remote_ip" "$out" "127.0.0.1|"
+
+# 42. Single-handshake HTTP/2 ALPN fallback (only ONE TLS handshake in -v output)
+out=$("$PURL" -v --http2 --cacert "$FIXTURES/localhost-ca.crt" "https://localhost:$TLS_PORT/hello" 2>"$TMPDIR/h2_fallback.err")
+assert_eq "single-handshake HTTP/2 fallback body" "$out" "hello from purl"
+hs_count=$(grep -c "TLS connection using" "$TMPDIR/h2_fallback.err" || true)
+assert_eq "single-handshake HTTP/2 fallback count=1" "$hs_count" "1"
+
+# 43. HTTP/2 over HTTPS with --connect-to SNI override
+out=$("$PURL" -s --http2 --connect-to "localhost:443:127.0.0.1:$H2_PORT" --cacert "$FIXTURES/localhost-ca.crt" -w ' [v=%{http_version}]' "https://localhost/hello")
+assert_eq "HTTP/2 --connect-to SNI override" "$out" "hello from purl [v=2]"
+
+# 44. SOCKS5 proxy (--socks5, --socks5-hostname remote DNS, -x socks5h:// auth + HTTPS, and HTTP/2 over SOCKS5)
+out=$("$PURL" -s --socks5 "127.0.0.1:$SOCKS_PORT" "$BASE/hello")
+assert_eq "--socks5 HTTP" "$out" "hello from purl"
+
+out=$("$PURL" -s --socks5-hostname "127.0.0.1:$SOCKS_PORT" "http://socks-remote.test:$HTTP_PORT/echo")
+assert_contains "--socks5-hostname remote DNS" "$out" "\"host\":\"socks-remote.test:$HTTP_PORT\""
+
+out=$("$PURL" -s -x "socks5h://alice:secret@127.0.0.1:$SOCKS_AUTH_PORT" --cacert "$FIXTURES/localhost-ca.crt" "https://localhost:$TLS_PORT/hello")
+assert_eq "-x socks5h:// auth + HTTPS" "$out" "hello from purl"
+
+out=$("$PURL" -s --socks5-hostname "127.0.0.1:$SOCKS_AUTH_PORT" -U "alice:secret" --http2 --cacert "$FIXTURES/localhost-ca.crt" -w ' [v=%{http_version}]' "https://localhost:$H2_PORT/hello")
+assert_eq "--socks5-hostname -U auth + HTTP/2" "$out" "hello from purl [v=2]"
+
+# 45. mTLS with PKCS#1 (RSA PRIVATE KEY) and SEC1 (EC PRIVATE KEY) PEM keys
+if command -v openssl >/dev/null 2>&1; then
+    openssl rsa -in "$FIXTURES/clientcert-rsa.key" -traditional -out "$TMPDIR/client-rsa-pkcs1.key" 2>/dev/null
+    openssl ec -in "$FIXTURES/clientcert-ecdsa.key" -out "$TMPDIR/client-ec-sec1.key" 2>/dev/null
+    out=$("$PURL" -s --cacert "$FIXTURES/localhost-ca.crt" --cert "$FIXTURES/clientcert-rsa.crt" --key "$TMPDIR/client-rsa-pkcs1.key" "https://localhost:$MTLS_PORT/hello")
+    assert_eq "mTLS PKCS#1 RSA PRIVATE KEY" "$out" "hello from purl"
+    out=$("$PURL" -s --cacert "$FIXTURES/localhost-ca.crt" --cert "$FIXTURES/clientcert-ecdsa.crt" --key "$TMPDIR/client-ec-sec1.key" "https://localhost:$MTLS_PORT/hello")
+    assert_eq "mTLS SEC1 EC PRIVATE KEY" "$out" "hello from purl"
+fi
 
 printf '\nIntegration summary: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -17,9 +17,11 @@ import std.compress.gzip as gzip
 import std.compress.zlib as zlib
 import std.compress.zstd as zstd
 import std.json as json
+import std.io as io
 import std.net.http as http
 import std.net.tls as tls
 import std.time as time
+from std.io import TcpStream
 from std.net.http import HttpRequestBytes, HttpResponse
 from purl_auth import build_digest_header_with_cnonce, parse_digest_challenge
 
@@ -193,6 +195,133 @@ fn proxy_route(req: HttpRequestBytes) -> HttpResponse:
     json.object_set(obj, "host", json.make_string(req.header_or("Host", "")))
     return http.json(200, json.encode(obj))
 
+fn relay_fd(src_fd: Int, dst_fd: Int) -> Int:
+    while true:
+        chunk := tcp_read_bytes(src_fd, 16384) catch bytes.empty()
+        if chunk.len() == 0:
+            break
+        mut sent := 0
+        while sent < chunk.len():
+            part := chunk.slice(sent, chunk.len())
+            n := tcp_write_bytes(dst_fd, part) catch -1
+            if n <= 0:
+                return 0
+            sent = sent + n
+    return 0
+
+fn serve_socks5_conn(client_fd: Int, req_user: String, req_pass: String, wg: WaitGroup) -> Int:
+    defer wg.done()
+    stream := TcpStream(client_fd)
+    defer stream.close()
+    stream.set_timeout(5000)
+
+    g := stream.read_exact_bytes(2) catch bytes.empty()
+    if g.len() != 2 or g[0] != 5:
+        return 1
+    methods := stream.read_exact_bytes(g[1]) catch bytes.empty()
+    if methods.len() != g[1]:
+        return 1
+
+    need_auth := req_user != ""
+    sel := bytes.buffer_with_capacity(2)
+    defer sel.free()
+    sel.write_byte(5) catch 0
+    if need_auth:
+        sel.write_byte(2) catch 0
+    else:
+        sel.write_byte(0) catch 0
+    stream.write_all_bytes(sel.bytes()) catch 0
+
+    if need_auth:
+        vu := stream.read_exact_bytes(2) catch bytes.empty()
+        if vu.len() != 2:
+            return 1
+        u := (stream.read_exact_bytes(vu[1]) catch bytes.empty()).to_string_utf8() catch ""
+        pl := stream.read_exact_bytes(1) catch bytes.empty()
+        if pl.len() != 1:
+            return 1
+        p := (stream.read_exact_bytes(pl[0]) catch bytes.empty()).to_string_utf8() catch ""
+        aresp := bytes.buffer_with_capacity(2)
+        defer aresp.free()
+        aresp.write_byte(1) catch 0
+        if u == req_user and p == req_pass:
+            aresp.write_byte(0) catch 0
+        else:
+            aresp.write_byte(1) catch 0
+        stream.write_all_bytes(aresp.bytes()) catch 0
+        if u != req_user or p != req_pass:
+            return 0
+
+    hdr := stream.read_exact_bytes(4) catch bytes.empty()
+    if hdr.len() != 4 or hdr[0] != 5 or hdr[1] != 1:
+        return 1
+    atyp := hdr[3]
+    mut target_host := ""
+    if atyp == 1:
+        ip4 := stream.read_exact_bytes(4) catch bytes.empty()
+        if ip4.len() != 4:
+            return 1
+        target_host = "{ip4[0]}.{ip4[1]}.{ip4[2]}.{ip4[3]}"
+    elif atyp == 3:
+        dl := stream.read_exact_bytes(1) catch bytes.empty()
+        if dl.len() != 1:
+            return 1
+        target_host = (stream.read_exact_bytes(dl[0]) catch bytes.empty()).to_string_utf8() catch ""
+    elif atyp == 4:
+        stream.read_exact_bytes(16) catch bytes.empty()
+        target_host = "::1"
+    else:
+        return 1
+
+    pb := stream.read_exact_bytes(2) catch bytes.empty()
+    if pb.len() != 2:
+        return 1
+    target_port := pb[0] * 256 + pb[1]
+
+    # Map synthetic remote-DNS test domain to loopback so tests verify ATYP_DOMAIN.
+    mut dial_host := target_host
+    if target_host == "socks-remote.test":
+        dial_host = "127.0.0.1"
+
+    up_res := io.connect(dial_host, target_port)
+    if up_res.is_err:
+        fail_rep := bytes.buffer_with_capacity(10)
+        defer fail_rep.free()
+        fail_rep.write_byte(5) catch 0
+        fail_rep.write_byte(5) catch 0
+        fail_rep.write_byte(0) catch 0
+        fail_rep.write_byte(1) catch 0
+        mut zi := 0
+        while zi < 6:
+            fail_rep.write_byte(0) catch 0
+            zi = zi + 1
+        stream.write_all_bytes(fail_rep.bytes()) catch 0
+        return 1
+    up := up_res.ok
+    defer up.close()
+    up.set_timeout(5000)
+
+    ok_rep := bytes.buffer_with_capacity(10)
+    defer ok_rep.free()
+    ok_rep.write_byte(5) catch 0
+    ok_rep.write_byte(0) catch 0
+    ok_rep.write_byte(0) catch 0
+    ok_rep.write_byte(1) catch 0
+    mut zj := 0
+    while zj < 6:
+        ok_rep.write_byte(0) catch 0
+        zj = zj + 1
+    stream.write_all_bytes(ok_rep.bytes()) catch 0
+
+    t1 := spawn relay_fd(client_fd, up.fd)
+    t2 := spawn relay_fd(up.fd, client_fd)
+    await t2
+    # Once upstream finishes sending and closes, close both sides so t1 unblocks cleanly.
+    up.close()
+    stream.close()
+    await t1
+    return 0
+
 fn serve_http_conn(fd: Int, wg: WaitGroup) -> Int:
     defer wg.done()
     tcp_set_timeout(fd, 5000)
@@ -202,8 +331,8 @@ fn serve_http_conn(fd: Int, wg: WaitGroup) -> Int:
 fn main() -> Int!:
     argv := args()
     if argv.len() < 4:
-        print_err("usage: fixture_server <http|tls|h2c|h2|proxy> <port> <max_conns> [cert] [key] [client_ca]")
-        exit(2)
+        print_err("usage: fixture_server <http|tls|h2c|h2|proxy|socks5> <port> <max_conns> [cert] [key] [client_ca]")
+        return 2
     mode := argv[1]
     port := parse_int(argv[2]) catch 18900
     max_conns := parse_int(argv[3]) catch 20
@@ -232,6 +361,24 @@ fn main() -> Int!:
         tcp_close(fd)
         return 0
 
+    if mode == "socks5":
+        mut req_user := ""
+        mut req_pass := ""
+        if argv.len() >= 6:
+            req_user = argv[4]
+            req_pass = argv[5]
+        fd := tcp_listen("127.0.0.1", port)!
+        wg := WaitGroup()
+        mut served := 0
+        while served < max_conns:
+            client := tcp_accept(fd)!
+            wg.add(1)
+            spawn serve_socks5_conn(client, req_user, req_pass, wg)
+            served = served + 1
+        wg.wait()
+        tcp_close(fd)
+        return 0
+
     if mode == "h2c":
         fd := tcp_listen("127.0.0.1", port)!
         mut served := 0
@@ -246,7 +393,7 @@ fn main() -> Int!:
     if mode == "tls" or mode == "h2":
         if argv.len() < 6:
             print_err("tls/h2 mode requires <cert> <key> [client_ca]")
-            exit(2)
+            return 2
         cert_path := argv[4]
         key_path := argv[5]
         mut cfg := tls.server_config(cert_path, key_path)!
@@ -270,5 +417,4 @@ fn main() -> Int!:
         return 0
 
     print_err("unknown mode: {mode}")
-    exit(2)
-    return 0
+    return 2

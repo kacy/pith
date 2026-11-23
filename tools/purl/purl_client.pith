@@ -2,9 +2,10 @@
 #
 # Built directly on Pith's standard library: std.net.http (Client, connection
 # pooling, streaming send_to_file, proxies, multipart, timeouts, response body
-# caps), std.net.http2.connection (native h2 and h2c), std.net.tls (TLS 1.2/1.3,
+# caps), std.net.http2.connection (native h2 and h2c with single-handshake ALPN
+# fallback), std.net.socks5 (RFC 1928/1929 SOCKS5), std.net.tls (TLS 1.2/1.3,
 # custom CAs, mTLS, verify hooks), std.net.dns, std.compress.{gzip,zlib,inflate,zstd},
-# std.fs, std.os, std.time, and Pith's green-thread concurrency (spawn/Semaphore).
+# std.io, std.fs, std.os, std.time, and Pith's green-thread concurrency (spawn/Semaphore).
 
 # Import http2 codec modules before std.net.http / std.net.tls so std.binary
 # keeps a single type identity in the self-hosted checker.
@@ -18,8 +19,10 @@ import std.compress.zlib as zlib
 import std.compress.zstd as zstd
 import std.encoding as encoding
 import std.fs as fs
+import std.io as io
 import std.net.dns as dns
 import std.net.http as http
+import std.net.socks5 as socks5
 import std.net.tls as tls
 import std.os as os
 import std.os.path as path_mod
@@ -45,14 +48,14 @@ struct HopResponse:
     streamed_size: Int
     was_streamed: Bool
 
-# Write raw bytes to stdout (fd 1).
+# Write raw bytes to stdout (fd 1) via std.io.
 fn write_stdout_bytes(data: Bytes) -> Int!:
     if data.is_empty():
         return 0
-    n := term_write(1, data)
-    if n < 0:
+    written := io.write_stdout_bytes(data)
+    if written.is_err:
         fail "purl: write error: failed writing to stdout"
-    return n
+    return written.ok
 
 # Write a UTF-8 string to stdout without appending a newline.
 fn write_stdout_str(text: String) -> Int!:
@@ -60,9 +63,9 @@ fn write_stdout_str(text: String) -> Int!:
         return 0
     return write_stdout_bytes(bytes.from_string_utf8(text))!
 
-# Write a line to stderr (fd 2).
+# Write a line to stderr (fd 2) via std.io.
 fn write_stderr_line(text: String):
-    term_write(2, bytes.from_string_utf8(text + "\n"))
+    io.write_stderr(text + "\n") catch 0
 
 # Print an error message to stderr honoring -s / -S rules.
 fn report_error(spec: RequestSpec, code: Int, message: String):
@@ -232,7 +235,7 @@ fn build_tls_config(spec: RequestSpec, want_h2_alpn: Bool) -> tls.Config!:
     elif spec.tls_version == "1.2":
         cfg = cfg.require_tls12()
     if want_h2_alpn:
-        cfg = cfg.with_alpn(["h2"])
+        cfg = cfg.with_alpn(["h2", "http/1.1"])
     if spec.verbose:
         cfg = cfg.with_verify_connection(verbose_tls_hook)
     return cfg
@@ -389,10 +392,8 @@ fn prepare_output_parent(spec: RequestSpec, out_path: String):
         if parent != "" and parent != ".":
             fs.make_dirs(parent)
 
-# Execute one HTTP/1.1 hop using std.net.http.Client (including --resolve /
-# --connect-to SNI override via ClientRequest.with_server_name).
-# When `stream_file` is non-empty, streams the response body directly to disk.
-fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, method: String, target: String, headers: Map[String, String], body: Bytes, stream_file: String) -> HopResponse!:
+# Build a std.net.http.ClientRequest from hop parameters.
+fn build_http1_request(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: Map[String, String], body: Bytes, force_close: Bool) -> http.ClientRequest:
     mut req := http.request(method, dial_host, dial_port, target)
     if u.scheme == "https":
         req = http.https_request_port(method, dial_host, dial_port, target)
@@ -402,10 +403,83 @@ fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_hos
         req = req.header("Host", authority_header(u))
     for k in headers:
         req = req.header(k, headers[k])
+    if force_close and not has_header_ci(headers, "Connection"):
+        req = req.header("Connection", "close")
     if not body.is_empty():
         req = req.body_bytes(body)
     if spec.max_time_ms > 0:
         req = req.with_timeout(spec.max_time_ms)
+    if spec.max_filesize > 0:
+        req = req.with_max_response_body_bytes(spec.max_filesize)
+    return req
+
+# Execute one HTTP/1.1 request over an established http.TlsClientConn (buffered or streamed).
+fn send_http1_over_tls_conn(conn: http.TlsClientConn, req: http.ClientRequest, spec: RequestSpec, stream_file: String) -> HopResponse!:
+    if stream_file != "":
+        prepare_output_parent(spec, stream_file)
+        probe := fs.create(stream_file)
+        if probe.is_err:
+            fail "purl: write error: failed to open '{stream_file}': {probe.err}"
+        probe.ok.close()
+        streamed_res := conn.send_to_file(req, stream_file)
+        if streamed_res.is_err:
+            if fs.is_file(stream_file):
+                fs.remove(stream_file)
+            fail streamed_res.err
+        streamed := streamed_res.ok
+        if spec.max_filesize > 0 and streamed.body_size > spec.max_filesize:
+            if fs.is_file(stream_file):
+                fs.remove(stream_file)
+            fail "purl: maximum file size exceeded ({streamed.body_size} > {spec.max_filesize})"
+        hop := from_streamed_response(streamed)
+        if spec.verbose:
+            log_verbose_response(hop)
+        return hop
+
+    resp := conn.send(req)!
+    if spec.max_filesize > 0 and resp.body.len() > spec.max_filesize:
+        fail "purl: maximum file size exceeded ({resp.body.len()} > {spec.max_filesize})"
+    hop := from_http1_response(resp)
+    if spec.verbose:
+        log_verbose_response(hop)
+    return hop
+
+# Execute one HTTP/1.1 request over an established plain http.ClientConn (buffered or streamed).
+fn send_http1_over_plain_conn(conn: http.ClientConn, req: http.ClientRequest, spec: RequestSpec, stream_file: String) -> HopResponse!:
+    if stream_file != "":
+        prepare_output_parent(spec, stream_file)
+        probe := fs.create(stream_file)
+        if probe.is_err:
+            fail "purl: write error: failed to open '{stream_file}': {probe.err}"
+        probe.ok.close()
+        streamed_res := conn.send_to_file(req, stream_file)
+        if streamed_res.is_err:
+            if fs.is_file(stream_file):
+                fs.remove(stream_file)
+            fail streamed_res.err
+        streamed := streamed_res.ok
+        if spec.max_filesize > 0 and streamed.body_size > spec.max_filesize:
+            if fs.is_file(stream_file):
+                fs.remove(stream_file)
+            fail "purl: maximum file size exceeded ({streamed.body_size} > {spec.max_filesize})"
+        hop := from_streamed_response(streamed)
+        if spec.verbose:
+            log_verbose_response(hop)
+        return hop
+
+    resp := conn.send(req)!
+    if spec.max_filesize > 0 and resp.body.len() > spec.max_filesize:
+        fail "purl: maximum file size exceeded ({resp.body.len()} > {spec.max_filesize})"
+    hop := from_http1_response(resp)
+    if spec.verbose:
+        log_verbose_response(hop)
+    return hop
+
+# Execute one HTTP/1.1 hop using std.net.http.Client (including --resolve /
+# --connect-to SNI override via ClientRequest.with_server_name).
+# When `stream_file` is non-empty, streams the response body directly to disk.
+fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, method: String, target: String, headers: Map[String, String], body: Bytes, stream_file: String) -> HopResponse!:
+    req := build_http1_request(spec, u, dial_host, dial_port, dial_overridden, method, target, headers, body, false)
 
     if spec.verbose:
         if remote_ip != "" and remote_ip != dial_host:
@@ -445,38 +519,24 @@ fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_hos
         log_verbose_response(hop)
     return hop
 
-# Execute one HTTP/2 hop using std.net.http2.connection (h2 over TLS or h2c).
-fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, method: String, target: String, headers: Map[String, String], body: Bytes, prior_knowledge: Bool) -> HopResponse!:
+# Build RFC 9113 HTTP/2 request header fields (omitting connection-specific headers).
+fn build_http2_extra_headers(headers: Map[String, String], body: Bytes) -> List[h2hpack.HeaderField]:
     mut extra: List[h2hpack.HeaderField] := []
     for k in headers:
         lower := k.to_lower()
-        # RFC 9113 forbids connection-specific headers and Host (replaced by :authority).
         if lower == "host" or lower == "connection" or lower == "keep-alive" or lower == "transfer-encoding" or lower == "upgrade":
             continue
         extra.push(h2hpack.header_field(lower, headers[k]))
     if not body.is_empty() and not has_header_ci(headers, "content-length"):
         extra.push(h2hpack.header_field("content-length", body.len().to_string()))
+    return extra
 
+# Send one request on an already-open HTTP/2 client.
+fn send_on_http2_client(h2: h2conn.Client, spec: RequestSpec, u: ParsedUrl, method: String, target: String, headers: Map[String, String], body: Bytes) -> HopResponse!:
+    extra := build_http2_extra_headers(headers, body)
     authority := authority_header(u)
     if spec.verbose:
-        write_stderr_line("* Trying {dial_host}:{dial_port} (HTTP/2)...")
         log_verbose_request(method, target, "HTTP/2", authority, headers, body.len())
-
-    if prior_knowledge and u.scheme == "http":
-        h2c := h2conn.open_h2c(dial_host, dial_port)!
-        defer h2c.close()
-        raw := h2c.request_with_timeout(method, authority, target, extra, body, spec.max_time_ms)!
-        if spec.max_filesize > 0 and raw.body.len() > spec.max_filesize:
-            fail "purl: maximum file size exceeded ({raw.body.len()} > {spec.max_filesize})"
-        hop := from_http2_response(raw)
-        if spec.verbose:
-            log_verbose_response(hop)
-        return hop
-
-    cfg := build_tls_config(spec, true)!
-    defer cfg.close()
-    h2 := h2conn.open_with_config(dial_host, dial_port, cfg)!
-    defer h2.close()
     raw := h2.request_with_timeout(method, authority, target, extra, body, spec.max_time_ms)!
     if spec.max_filesize > 0 and raw.body.len() > spec.max_filesize:
         fail "purl: maximum file size exceeded ({raw.body.len()} > {spec.max_filesize})"
@@ -484,6 +544,90 @@ fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port:
     if spec.verbose:
         log_verbose_response(hop)
     return hop
+
+# Execute one HTTP/2 hop using std.net.http2.connection (h2c, or h2 over TLS with
+# single-handshake ALPN fallback to HTTP/1.1 reusing the established tls.Conn).
+fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: Map[String, String], body: Bytes, prior_knowledge: Bool, stream_file: String) -> HopResponse!:
+    if spec.verbose:
+        write_stderr_line("* Trying {dial_host}:{dial_port} (HTTP/2)...")
+
+    if prior_knowledge and u.scheme == "http":
+        h2c := h2conn.open_h2c(dial_host, dial_port)!
+        defer h2c.close()
+        return send_on_http2_client(h2c, spec, u, method, target, headers, body)!
+
+    cfg := build_tls_config(spec, true)!
+    defer cfg.close()
+    session := tls.dial_with_config(dial_host, dial_port, u.host, cfg)!
+    if session.negotiated_protocol() == "h2":
+        h2 := h2conn.open_tls(session)!
+        defer h2.close()
+        return send_on_http2_client(h2, spec, u, method, target, headers, body)!
+
+    # Single-handshake ALPN fallback: reuse `session` directly for HTTP/1.1.
+    if spec.verbose:
+        write_stderr_line("* ALPN: falling back to HTTP/1.1")
+        log_verbose_request(method, target, "HTTP/1.1", authority_header(u), headers, body.len())
+    tconn := http.TlsClientConn(session)
+    defer tconn.close()
+    req := build_http1_request(spec, u, dial_host, dial_port, dial_overridden, method, target, headers, body, true)
+    return send_http1_over_tls_conn(tconn, req, spec, stream_file)!
+
+# Execute one hop tunneled through a SOCKS5 proxy (supports HTTP/1.1, HTTPS, and HTTP/2).
+fn send_socks5_hop(proxy_url: String, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: Map[String, String], body: Bytes, stream_file: String) -> HopResponse!:
+    mut scfg := socks5.parse_proxy_url(proxy_url)!
+    if scfg.username == "" and scfg.password == "" and spec.proxy_user != "":
+        pair := split_user_pass(spec.proxy_user)
+        scfg = scfg.with_auth(pair.0, pair.1)
+    if spec.connect_timeout_ms > 0:
+        scfg = scfg.with_timeout(spec.connect_timeout_ms)
+    elif spec.max_time_ms > 0:
+        scfg = scfg.with_timeout(spec.max_time_ms)
+
+    mut socks_target := dial_host
+    if proxy_url.trim().to_lower().starts_with("socks5://") and not is_ip_literal(dial_host):
+        socks_target = dns.resolve(dial_host)!
+
+    if spec.verbose:
+        write_stderr_line("* SOCKS5 connect via {scfg.proxy_host}:{scfg.proxy_port} -> {socks_target}:{dial_port}...")
+
+    stream := socks5.dial(scfg, socks_target, dial_port)!
+    if spec.max_time_ms > 0:
+        stream.set_timeout(spec.max_time_ms)
+
+    tun_headers := clone_headers(headers)
+    remove_header_ci(tun_headers, "Proxy-Authorization")
+    if not has_header_ci(tun_headers, "Host"):
+        set_header_ci(tun_headers, "Host", authority_header(u))
+
+    if u.scheme == "https":
+        want_h2 := spec.http_version == "2"
+        cfg := build_tls_config(spec, want_h2)!
+        defer cfg.close()
+        session_res := tls.client(stream, u.host, cfg)
+        if session_res.is_err:
+            stream.close()
+            fail session_res.err
+        session := session_res.ok
+        if want_h2 and session.negotiated_protocol() == "h2":
+            h2 := h2conn.open_tls(session)!
+            defer h2.close()
+            return send_on_http2_client(h2, spec, u, method, target, tun_headers, body)!
+        if spec.verbose:
+            if want_h2:
+                write_stderr_line("* ALPN: falling back to HTTP/1.1")
+            log_verbose_request(method, target, "HTTP/1.1", authority_header(u), tun_headers, body.len())
+        tconn := http.TlsClientConn(session)
+        defer tconn.close()
+        req := build_http1_request(spec, u, dial_host, dial_port, dial_overridden, method, target, tun_headers, body, true)
+        return send_http1_over_tls_conn(tconn, req, spec, stream_file)!
+
+    if spec.verbose:
+        log_verbose_request(method, target, "HTTP/1.1", authority_header(u), tun_headers, body.len())
+    pconn := http.ClientConn(stream, stream.buffered_bytes_reader_chunked(512), stream.buffered_bytes_writer())
+    defer pconn.close()
+    req := build_http1_request(spec, u, dial_host, dial_port, dial_overridden, method, target, tun_headers, body, true)
+    return send_http1_over_plain_conn(pconn, req, spec, stream_file)!
 
 # Decompress response body according to Content-Encoding when --compressed is active.
 fn maybe_decompress(spec: RequestSpec, resp: HopResponse) -> Bytes!:
@@ -586,7 +730,7 @@ fn make_http_client(spec: RequestSpec, has_tls_cfg: Bool, tls_cfg: tls.Config) -
         c = c.with_timeout(spec.max_time_ms)
     if spec.connect_timeout_ms > 0:
         c = c.with_dial_timeout(spec.connect_timeout_ms)
-    if spec.proxy != "":
+    if spec.proxy != "" and not is_socks5_proxy(spec.proxy):
         c = c.with_proxy(spec.proxy)
     if spec.max_filesize > 0:
         c = c.with_max_response_body_bytes(spec.max_filesize)
@@ -787,18 +931,9 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
 
     return PreparedRequest(method, parsed, headers, body, auto_referer, resume_offset, explicit_output, auth_user, auth_pass, has_auth_creds, cache)
 
-# Wrapper to read stdin bytes (kept local so purl_client can satisfy -T -).
+# Read stdin bytes via std.io (for -T - uploads).
 fn purl_args_read_stdin() -> Bytes:
-    buf := bytes.buffer()
-    defer buf.free()
-    while true:
-        chunk := term_read(0, 65536, -1)
-        if chunk.is_err:
-            break
-        if chunk.ok.len() == 0:
-            break
-        buf.write(chunk.ok) catch 0
-    return buf.bytes()
+    return io.read_stdin_bytes() catch bytes.empty()
 
 # Merge inline -b cookies and jar cookies for the current hop into `headers`.
 fn attach_cookies(spec: RequestSpec, jar: CookieJar, u: ParsedUrl, headers: Map[String, String]):
@@ -859,33 +994,50 @@ fn empty_metrics(u: ParsedUrl, code: Int, err: String) -> TransferMetrics:
     empty_hdrs: Map[String, String] := {}
     return TransferMetrics(0, "", 0, 0, 0, 0, 0, 0, 0, effective_url(u), "", 0, "1.1", u.scheme.to_upper(), "", u.port, "", empty_hdrs, code, err)
 
-# True when a proxy is active for `u` (explicit -x or environment proxy, not excluded by --noproxy).
-fn has_active_proxy(spec: RequestSpec, u: ParsedUrl) -> Bool:
-    if spec.noproxy != "" and host_in_noproxy(spec.noproxy, u.host):
-        return false
-    if spec.proxy != "":
-        return true
-    if u.scheme == "https":
-        if os.get_env("HTTPS_PROXY").unwrap_or("") != "" or os.get_env("https_proxy").unwrap_or("") != "":
-            return true
-    else:
-        if os.get_env("HTTP_PROXY").unwrap_or("") != "" or os.get_env("http_proxy").unwrap_or("") != "":
-            return true
-    return false
+# True when `proxy_url` uses the socks5:// or socks5h:// scheme.
+fn is_socks5_proxy(proxy_url: String) -> Bool:
+    lower := proxy_url.trim().to_lower()
+    return lower.starts_with("socks5://") or lower.starts_with("socks5h://")
 
-# Dispatch one hop over HTTP/2 (h2c or h2 with HTTP/1.1 fallback) or HTTP/1.1.
+# Return the active proxy URL for `u` (explicit -x/--socks5* or environment), or "".
+fn effective_proxy_url(spec: RequestSpec, u: ParsedUrl) -> String:
+    if spec.noproxy != "" and host_in_noproxy(spec.noproxy, u.host):
+        return ""
+    if spec.proxy != "":
+        return spec.proxy
+    if u.scheme == "https":
+        p := os.get_env("HTTPS_PROXY").unwrap_or("")
+        if p != "":
+            return p
+        pl := os.get_env("https_proxy").unwrap_or("")
+        if pl != "":
+            return pl
+    else:
+        p := os.get_env("HTTP_PROXY").unwrap_or("")
+        if p != "":
+            return p
+        pl := os.get_env("http_proxy").unwrap_or("")
+        if pl != "":
+            return pl
+    ap := os.get_env("ALL_PROXY").unwrap_or("")
+    if ap != "":
+        return ap
+    return os.get_env("all_proxy").unwrap_or("")
+
+# True when a proxy is active for `u` (explicit -x/--socks5* or env proxy, not excluded by --noproxy).
+fn has_active_proxy(spec: RequestSpec, u: ParsedUrl) -> Bool:
+    return effective_proxy_url(spec, u) != ""
+
+# Dispatch one hop over SOCKS5, HTTP/2 (h2c or h2 with single-handshake ALPN fallback), or HTTP/1.1.
 fn dispatch_hop(client: http.Client, spec: RequestSpec, cur_url: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, cur_method: String, target: String, hop_headers: Map[String, String], cur_body: Bytes, stream_file: String) -> HopResponse!:
-    proxy_on := has_active_proxy(spec, cur_url)
-    if not proxy_on and stream_file == "":
-        if spec.http_version == "2-prior" and cur_url.scheme == "http":
-            return send_http2_hop(spec, cur_url, dial_host, dial_port, cur_method, target, hop_headers, cur_body, true)
-        if spec.http_version == "2" and cur_url.scheme == "https" and not dial_overridden:
-            h2_try := send_http2_hop(spec, cur_url, dial_host, dial_port, cur_method, target, hop_headers, cur_body, false)
-            if h2_try.is_err and h2_try.err.contains("did not negotiate h2"):
-                if spec.verbose:
-                    write_stderr_line("* ALPN: falling back to HTTP/1.1")
-                return send_http1_hop(client, spec, cur_url, dial_host, dial_port, dial_overridden, remote_ip, cur_method, target, hop_headers, cur_body, "")
-            return h2_try
+    proxy_url := effective_proxy_url(spec, cur_url)
+    if is_socks5_proxy(proxy_url):
+        return send_socks5_hop(proxy_url, spec, cur_url, dial_host, dial_port, dial_overridden, cur_method, target, hop_headers, cur_body, stream_file)
+    if proxy_url == "":
+        if spec.http_version == "2-prior" and cur_url.scheme == "http" and stream_file == "":
+            return send_http2_hop(spec, cur_url, dial_host, dial_port, dial_overridden, cur_method, target, hop_headers, cur_body, true, "")
+        if spec.http_version == "2" and cur_url.scheme == "https":
+            return send_http2_hop(spec, cur_url, dial_host, dial_port, dial_overridden, cur_method, target, hop_headers, cur_body, false, stream_file)
     mut hop_client := client
     if spec.noproxy != "" and host_in_noproxy(spec.noproxy, cur_url.host):
         hop_client = client.with_proxy("").with_env_proxy(false)

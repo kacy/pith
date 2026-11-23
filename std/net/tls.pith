@@ -589,16 +589,137 @@ fn native_config_handle(roots_pem: String) -> Config!:
     record.roots_pem = roots_pem
     return config_create(record)
 
+fn der_write_tlv(tag: Int, body: Bytes) -> Bytes!:
+    n := body.len()
+    out := bytes.buffer_with_capacity(n + 6)
+    defer out.free()
+    out.write_byte(tag)!
+    if n < 128:
+        out.write_byte(n)!
+    elif n < 256:
+        out.write_byte(129)!
+        out.write_byte(n)!
+    elif n < 65536:
+        out.write_byte(130)!
+        out.write_byte(n / 256)!
+        out.write_byte(n % 256)!
+    elif n < 16777216:
+        out.write_byte(131)!
+        out.write_byte(n / 65536)!
+        out.write_byte((n / 256) % 256)!
+        out.write_byte(n % 256)!
+    else:
+        fail "tls private key der length exceeds limit"
+    out.write(body)!
+    return out.bytes()
+
+fn der_read_tlv(data: Bytes, offset: Int) -> (Int, Int, Int)!:
+    if offset + 2 > data.len():
+        fail "tls private key der truncated"
+    tag := data[offset]
+    len_byte := data[offset + 1]
+    mut body_start := offset + 2
+    mut length := len_byte
+    if len_byte >= 128:
+        num_octets := len_byte - 128
+        if num_octets < 1 or num_octets > 3 or offset + 2 + num_octets > data.len():
+            fail "tls private key der length invalid"
+        length = 0
+        mut i := 0
+        while i < num_octets:
+            length = length * 256 + data[offset + 2 + i]
+            i = i + 1
+        body_start = offset + 2 + num_octets
+    body_end := body_start + length
+    if body_end > data.len():
+        fail "tls private key der element overflows buffer"
+    return (tag, body_start, body_end)
+
+fn wrap_pkcs1_rsa_as_pkcs8(pkcs1_der: Bytes) -> Bytes!:
+    outer := der_read_tlv(pkcs1_der, 0)!
+    if outer.0 != 48 or outer.2 != pkcs1_der.len():
+        fail "tls rsa private key is not a valid pkcs#1 der sequence"
+    version := encoding.from_hex("020100")!
+    rsa_alg_id := encoding.from_hex("300d06092a864886f70d0101010500")!
+    priv_octet := der_write_tlv(4, pkcs1_der)!
+    return der_write_tlv(48, bytes.concat(bytes.concat(version, rsa_alg_id), priv_octet))!
+
+fn wrap_sec1_ec_as_pkcs8(sec1_der: Bytes) -> Bytes!:
+    outer := der_read_tlv(sec1_der, 0)!
+    if outer.0 != 48 or outer.2 != sec1_der.len():
+        fail "tls ec private key is not a valid sec1 der sequence"
+    mut pos := outer.1
+    end := outer.2
+
+    # 1. version INTEGER (1)
+    ver := der_read_tlv(sec1_der, pos)!
+    if ver.0 != 2 or ver.2 - ver.1 != 1 or sec1_der[ver.1] != 1:
+        fail "tls ec private key has unsupported sec1 version"
+    ver_tlv := sec1_der.slice(pos, ver.2)
+    pos = ver.2
+
+    # 2. privateKey OCTET STRING
+    priv := der_read_tlv(sec1_der, pos)!
+    if priv.0 != 4:
+        fail "tls ec private key missing private key octet string"
+    scalar_len := priv.2 - priv.1
+    priv_tlv := sec1_der.slice(pos, priv.2)
+    pos = priv.2
+
+    # 3. optional [0] parameters (curve OID) and optional [1] publicKey
+    mut curve_oid_tlv := bytes.empty()
+    tail := bytes.buffer()
+    defer tail.free()
+    while pos < end:
+        elem := der_read_tlv(sec1_der, pos)!
+        if elem.0 == 160:
+            inner_oid := der_read_tlv(sec1_der, elem.1)!
+            if inner_oid.0 != 6 or inner_oid.2 != elem.2:
+                fail "tls ec private key curve parameter must be an oid"
+            curve_oid_tlv = sec1_der.slice(elem.1, inner_oid.2)
+        else:
+            tail.write(sec1_der.slice(pos, elem.2))!
+        pos = elem.2
+
+    if curve_oid_tlv.is_empty():
+        if scalar_len == 32:
+            curve_oid_tlv = encoding.from_hex("06082a8648ce3d030107")!
+        elif scalar_len == 48:
+            curve_oid_tlv = encoding.from_hex("06052b81040022")!
+        else:
+            fail "tls ec private key missing curve oid"
+
+    # Re-encode inner ECPrivateKey without [0] parameters (per RFC 5915 / ring PKCS#8).
+    inner_body := bytes.concat(bytes.concat(ver_tlv, priv_tlv), tail.bytes())
+    inner_seq := der_write_tlv(48, inner_body)!
+    ec_pub_oid := encoding.from_hex("06072a8648ce3d0201")!
+    alg_id := der_write_tlv(48, bytes.concat(ec_pub_oid, curve_oid_tlv))!
+    version := encoding.from_hex("020100")!
+    priv_octet := der_write_tlv(4, inner_seq)!
+    return der_write_tlv(48, bytes.concat(bytes.concat(version, alg_id), priv_octet))!
+
+# Decode a PEM private key (PKCS#8 PRIVATE KEY, PKCS#1 RSA PRIVATE KEY, or
+# SEC1 EC PRIVATE KEY) into PKCS#8 PrivateKeyInfo DER bytes.
+fn decode_private_key_pkcs8(key_pem: String) -> Bytes!:
+    key := encoding.pem_decode(key_pem)!
+    if key.kind == "ENCRYPTED PRIVATE KEY" or key.headers.contains_key("Proc-Type") or key.headers.contains_key("DEK-Info"):
+        fail "tls encrypted private keys are not supported"
+    if key.kind == "PRIVATE KEY":
+        return key.body
+    if key.kind == "RSA PRIVATE KEY":
+        return wrap_pkcs1_rsa_as_pkcs8(key.body)!
+    if key.kind == "EC PRIVATE KEY":
+        return wrap_sec1_ec_as_pkcs8(key.body)!
+    fail "tls unsupported private key pem type '{key.kind}' (expected PRIVATE KEY, RSA PRIVATE KEY, or EC PRIVATE KEY)"
+
 fn native_server_config_handle(cert_pem: String, key_pem: String) -> Config!:
     certs := x509.parse_pem_chain(cert_pem)!
     if certs.len() == 0:
         fail "tls certificate chain is empty"
-    key := encoding.pem_decode(key_pem)!
-    if key.kind != "PRIVATE KEY":
-        fail "tls private key must be pkcs#8 pem"
+    key_der := decode_private_key_pkcs8(key_pem)!
     record := empty_config_record()
     record.server_cert_pem = cert_pem
-    record.server_key_der = key.body
+    record.server_key_der = key_der
     return config_create(record)
 
 fn config_alpn_protocols(config: Config) -> List[String]:
@@ -3438,12 +3559,10 @@ impl Config:
         if certs.len() == 0:
             fail "tls client certificate chain is empty"
         key_pem := read_file(key_path)!
-        key := encoding.pem_decode(key_pem)!
-        if key.kind != "PRIVATE KEY":
-            fail "tls client private key must be pkcs#8 pem"
+        key_der := decode_private_key_pkcs8(key_pem)!
         install := fn(r: ConfigRecord):
             r.client_cert_pem = cert_pem
-            r.client_key_der = key.body
+            r.client_key_der = key_der
         config_edit(self.handle, install)
         return self
 
@@ -4171,3 +4290,73 @@ test "setters racing on one config from several tasks keep every change":
         assert(not config_offers_tls12(cfg))
         cfg.close()
         round = round + 1
+
+test "decode_private_key_pkcs8 converts PKCS#1 RSA and SEC1 EC keys to working PKCS#8 DER":
+    # 1. Extract PKCS#1 RSA DER from PKCS#8 fixture and re-wrap as RSA PRIVATE KEY.
+    rsa_orig := encoding.pem_decode(read_file("tests/live/fixtures/clientcert-rsa.key")!)!.body
+    rsa_seq := der_read_tlv(rsa_orig, 0)!
+    rsa_ver := der_read_tlv(rsa_orig, rsa_seq.1)!
+    rsa_alg := der_read_tlv(rsa_orig, rsa_ver.2)!
+    rsa_oct := der_read_tlv(rsa_orig, rsa_alg.2)!
+    pkcs1_der := rsa_orig.slice(rsa_oct.1, rsa_oct.2)
+    rsa_pem := encoding.pem_encode("RSA PRIVATE KEY", pkcs1_der)
+    rsa_converted := decode_private_key_pkcs8(rsa_pem)!
+    assert_eq(encoding.to_hex(rsa_converted), encoding.to_hex(rsa_orig))
+    rsa_sig := signature.sign_rsa_pss_sha256_pkcs8(rsa_converted, bytes.from_string_utf8("hello rsa"))!
+    assert(rsa_sig.len() > 0)
+
+    # Server config accepts PKCS#1 RSA PEM directly.
+    rsa_srv_cfg := native_server_config_handle(read_file("tests/live/fixtures/clientcert-rsa.crt")!, rsa_pem)!
+    rsa_srv_cfg.close()
+
+    # 2. Build OpenSSL-style SEC1 P-256 EC PRIVATE KEY (with [0] prime256v1) and convert back.
+    ec256_orig := encoding.pem_decode(read_file("tests/live/fixtures/clientcert-ecdsa.key")!)!.body
+    e2_seq := der_read_tlv(ec256_orig, 0)!
+    e2_ver := der_read_tlv(ec256_orig, e2_seq.1)!
+    e2_alg := der_read_tlv(ec256_orig, e2_ver.2)!
+    e2_oct := der_read_tlv(ec256_orig, e2_alg.2)!
+    e2_inner := ec256_orig.slice(e2_oct.1, e2_oct.2)
+    e2_in_seq := der_read_tlv(e2_inner, 0)!
+    e2_in_ver := der_read_tlv(e2_inner, e2_in_seq.1)!
+    e2_in_priv := der_read_tlv(e2_inner, e2_in_ver.2)!
+    e2_head := e2_inner.slice(e2_in_seq.1, e2_in_priv.2)
+    e2_tail := e2_inner.slice(e2_in_priv.2, e2_in_seq.2)
+    p256_param := der_write_tlv(160, encoding.from_hex("06082a8648ce3d030107")!)!
+    sec1_256 := der_write_tlv(48, bytes.concat(bytes.concat(e2_head, p256_param), e2_tail))!
+    ec256_pem := encoding.pem_encode("EC PRIVATE KEY", sec1_256)
+    ec256_converted := decode_private_key_pkcs8(ec256_pem)!
+    assert_eq(encoding.to_hex(ec256_converted), encoding.to_hex(ec256_orig))
+    ec256_sig := signature.sign_ecdsa_p256_sha256_asn1_pkcs8(ec256_converted, bytes.from_string_utf8("hello p256"))!
+    assert(ec256_sig.len() > 0)
+
+    # 3. Build SEC1 P-384 EC PRIVATE KEY (with [0] secp384r1) and convert back.
+    ec384_orig := encoding.pem_decode(read_file("tests/live/fixtures/sig-p384-pkcs8.pem")!)!.body
+    e3_seq := der_read_tlv(ec384_orig, 0)!
+    e3_ver := der_read_tlv(ec384_orig, e3_seq.1)!
+    e3_alg := der_read_tlv(ec384_orig, e3_ver.2)!
+    e3_oct := der_read_tlv(ec384_orig, e3_alg.2)!
+    e3_inner := ec384_orig.slice(e3_oct.1, e3_oct.2)
+    e3_in_seq := der_read_tlv(e3_inner, 0)!
+    e3_in_ver := der_read_tlv(e3_inner, e3_in_seq.1)!
+    e3_in_priv := der_read_tlv(e3_inner, e3_in_ver.2)!
+    e3_head := e3_inner.slice(e3_in_seq.1, e3_in_priv.2)
+    e3_tail := e3_inner.slice(e3_in_priv.2, e3_in_seq.2)
+    p384_param := der_write_tlv(160, encoding.from_hex("06052b81040022")!)!
+    sec1_384 := der_write_tlv(48, bytes.concat(bytes.concat(e3_head, p384_param), e3_tail))!
+    ec384_pem := encoding.pem_encode("EC PRIVATE KEY", sec1_384)
+    ec384_converted := decode_private_key_pkcs8(ec384_pem)!
+    assert_eq(encoding.to_hex(ec384_converted), encoding.to_hex(ec384_orig))
+    ec384_sig := signature.sign_ecdsa_p384_sha384_asn1_pkcs8(ec384_converted, bytes.from_string_utf8("hello p384"))!
+    assert(ec384_sig.len() > 0)
+
+    # 4. Encrypted PEM keys are rejected cleanly.
+    enc_pem := encoding.pem_encode("ENCRYPTED PRIVATE KEY", bytes.from_string_utf8("0000"))
+    enc_res := decode_private_key_pkcs8(enc_pem)
+    assert(enc_res.is_err)
+    assert(enc_res.err.contains("encrypted"))
+    mut enc_hdrs: Map[String, String] := {}
+    enc_hdrs.insert("Proc-Type", "4,ENCRYPTED")
+    legacy_enc := encoding.pem_encode_block(encoding.PemBlock("RSA PRIVATE KEY", enc_hdrs, pkcs1_der))
+    legacy_res := decode_private_key_pkcs8(legacy_enc)
+    assert(legacy_res.is_err)
+    assert(legacy_res.err.contains("encrypted"))

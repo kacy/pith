@@ -1,12 +1,11 @@
 # html templates that escape by default
 #
-# std.template renders a page from a context. every `<%= %>` value goes
-# through html.escape on the way out, so the hostile note in this example is
-# displayed rather than executed. the only unescaped path is `<%raw %>`, which
+# std.template renders a page from a context. every `<%= %>` value is escaped
+# for where it lands, so the hostile note in this example is displayed rather
+# than executed, and its `javascript:` link is replaced. the only unescaped path is `<%raw %>`, which
 # a human has to type, and which is greppable precisely so it can be audited.
 #
 # Run: pith run examples/templating.pith
-import std.html as html
 import std.template as template
 
 # the page. `<% %>` rather than `{{ }}` because pith already owns braces
@@ -17,7 +16,7 @@ fn page_source() -> String:
         "<% if notes %>",
         "<ul>",
         "<% for note in notes %>",
-        "<li><a href=\"<%raw note.link %>\"><%= note.title %></a>: <%= note.body %></li>",
+        "<li><a href=\"<%= note.link %>\"><%= note.title %></a>: <%= note.body %></li>",
         "<% end %>",
         "</ul>",
         "<% else %>",
@@ -26,12 +25,10 @@ fn page_source() -> String:
         "<footer><%raw footer %></footer>",
     ].join("")
 
-# one note. `link` is built in pith with html.escape_url, because a url in an
-# href needs its scheme filtered and escaping alone would leave
-# "javascript:alert(1)" clickable. it is emitted with `<%raw %>` since it has
-# already been escaped once and escaping it twice would break the url.
+# one note. the template sees that `link` lands in an href, so it filters the
+# url's scheme with html.safe_url before it escapes it.
 fn note(title: String, body: String, link: String) -> template.Ctx:
-    return template.context().set("title", title).set("body", body).set("link", html.escape_url(link))
+    return template.context().set("title", title).set("body", body).set("link", link)
 
 fn render_notes() -> Int!template.TemplateError:
     page := template.compile(page_source())!

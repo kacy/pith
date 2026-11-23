@@ -54,15 +54,34 @@
 # not take the response down. if a missing field is a bug for you, check the
 # context before you render it.
 #
-# ## what this does not make safe
+# ## where a value lands
 #
-# escaping is correct for element text and quoted attribute values. it is not
-# correct inside `<script>` or `<style>`, in a url attribute, or in an unquoted
-# attribute — the module header of `std.html` explains why, and the same limits
-# apply here, because this module escapes with `html.escape`. for a link built
-# from untrusted input, put the value through `html.escape_url` in pith and
-# emit it with `<%raw %>`, or accept that `<%= %>` will escape the quotes but
-# will not stop `javascript:`.
+# compile reads the template's literal html and records where each `<%= %>`
+# sits, and render escapes the value for that place:
+#
+#   - element text, a comment, `<title>` or `<textarea>`, and a quoted
+#     attribute value: `html.escape`.
+#   - an unquoted attribute value (`<p title=<%= x %>>`): every ascii byte
+#     other than a letter, a digit, `-`, `_` and `.` becomes a numeric entity,
+#     so a space or a `>` cannot end the attribute.
+#   - a url attribute (`href`, `src`, `action`, `formaction`, `xlink:href`,
+#     `poster`, `cite`, `background`, `data`, `codebase`, `longdesc`,
+#     `manifest`, `icon`): the url is checked with `html.safe_url` first, and a
+#     value it refuses is written as `about:blank`. the check covers the literal
+#     text in front of the value too, so `href="/<%= p %>"` with `p` set to
+#     `/evil.example` is refused as the `//evil.example` the browser would see.
+#     a second value in the same url is checked on its own.
+#
+# compile refuses `<%= %>` where no escaping makes a value safe: inside
+# `<script>` or `<style>`, in an event handler (`on...`), `style` or `srcdoc`
+# attribute, and in a tag or attribute name. pass data to a script as json in a
+# data attribute, and choose between fixed class names or attributes with
+# `<% if %>`. `<%raw %>` is still allowed in all of these places, and what it
+# writes is assumed not to change where the template is.
+#
+# the paths through an `if` must leave the html in the same place, and so must
+# a `for` body, so a value after the block has one context. a template that
+# opens an attribute in one branch and not the other fails to compile.
 
 import std.fs as fs
 import std.html as html
@@ -88,6 +107,12 @@ NODE_ELSE := 4
 NODE_FOR := 5
 NODE_END := 6
 
+# how a `<%= %>` value is written out
+MODE_TEXT := 0
+MODE_URL := 1
+MODE_UNQUOTED := 2
+MODE_UNQUOTED_URL := 3
+
 # ---------------------------------------------------------------
 # types
 # ---------------------------------------------------------------
@@ -111,6 +136,10 @@ struct Node:
     alt: Int
     close: Int
     offset: Int
+    # how a `<%= %>` value is escaped, from where it sits in the html (one of
+    # the MODE_ constants). for a url mode, `text` holds the literal start of
+    # the attribute value the value is appended to.
+    mode: Int
 
 # a parsed template. compile once, render many times; a `Template` holds no
 # per-render state and is safe to share.
@@ -231,10 +260,10 @@ fn is_path(path: String) -> Bool:
     return segment_length > 0
 
 fn node_text(text: String, offset: Int) -> Node:
-    return Node(NODE_TEXT, text, "", "", false, 0 - 1, 0 - 1, offset)
+    return Node(NODE_TEXT, text, "", "", false, 0 - 1, 0 - 1, offset, MODE_TEXT)
 
 fn node_output(kind: Int, path: String, offset: Int) -> Node:
-    return Node(kind, "", path, "", false, 0 - 1, 0 - 1, offset)
+    return Node(kind, "", path, "", false, 0 - 1, 0 - 1, offset, MODE_TEXT)
 
 fn fail_at(message: String, offset: Int) -> Node!TemplateError:
     fail TemplateError(message, offset)
@@ -257,9 +286,9 @@ fn parse_tag(body: String, offset: Int) -> Node!TemplateError:
             return fail_at("expected a name or dotted path after 'raw', got '{path}'", offset)!
         return node_output(NODE_RAW, path, offset)
     if trimmed == "end":
-        return Node(NODE_END, "", "", "", false, 0 - 1, 0 - 1, offset)
+        return Node(NODE_END, "", "", "", false, 0 - 1, 0 - 1, offset, MODE_TEXT)
     if trimmed == "else":
-        return Node(NODE_ELSE, "", "", "", false, 0 - 1, 0 - 1, offset)
+        return Node(NODE_ELSE, "", "", "", false, 0 - 1, 0 - 1, offset, MODE_TEXT)
     if trimmed.starts_with("if "):
         mut condition := trimmed.substring(3, trimmed.len()).trim()
         mut negate := false
@@ -268,7 +297,7 @@ fn parse_tag(body: String, offset: Int) -> Node!TemplateError:
             negate = true
         if not is_path(condition):
             return fail_at("expected a name or dotted path after 'if', got '{condition}'", offset)!
-        return Node(NODE_IF, "", condition, "", negate, 0 - 1, 0 - 1, offset)
+        return Node(NODE_IF, "", condition, "", negate, 0 - 1, 0 - 1, offset, MODE_TEXT)
     if trimmed.starts_with("for "):
         rest := trimmed.substring(4, trimmed.len())
         parts := rest.split(" in ")
@@ -280,8 +309,310 @@ fn parse_tag(body: String, offset: Int) -> Node!TemplateError:
             return fail_at("'{name}' is not a usable loop variable name", offset)!
         if not is_path(source):
             return fail_at("expected a name or dotted path to loop over, got '{source}'", offset)!
-        return Node(NODE_FOR, "", source, name, false, 0 - 1, 0 - 1, offset)
+        return Node(NODE_FOR, "", source, name, false, 0 - 1, 0 - 1, offset, MODE_TEXT)
     return fail_at("unknown tag '{trimmed}'", offset)!
+
+# ---------------------------------------------------------------
+# html context
+# ---------------------------------------------------------------
+#
+# compile reads the template's literal text with a small html tokenizer, so
+# each `<%= %>` knows where in the page it lands and is escaped for that
+# place. the tokenizer follows the states of the html spec that decide what a
+# value means: element text, a tag, an attribute name, a quoted or unquoted
+# attribute value, a comment, and the raw text inside `<script>` and
+# `<style>`. it only reads the template, never a value, so a value cannot
+# change the state.
+
+# where the tokenizer is
+H_TEXT := 0
+H_LT := 1
+H_LT_SLASH := 2
+H_TAG_NAME := 3
+H_IN_TAG := 4
+H_ATTR_NAME := 5
+H_AFTER_ATTR := 6
+H_BEFORE_VALUE := 7
+H_DOUBLE := 8
+H_SINGLE := 9
+H_UNQUOTED := 10
+H_COMMENT := 11
+H_BOGUS := 12
+H_SCRIPT := 13
+H_RCDATA := 14
+
+# the tokenizer's state. `tag` is the element being opened or closed, or the
+# element whose raw text this is in H_SCRIPT and H_RCDATA. `attr` is the
+# attribute being read. `prefix` is the literal text of the attribute value so
+# far. `known` turns false once a value is interpolated into it, since the
+# literal text alone then no longer says how the url starts.
+struct HtmlState:
+    kind: Int
+    tag: String
+    attr: String
+    closing: Bool
+    prefix: String
+    known: Bool
+
+fn html_state(kind: Int, tag: String, attr: String, closing: Bool) -> HtmlState:
+    return HtmlState(kind, tag, attr, closing, "", true)
+
+fn is_space(byte: Int) -> Bool:
+    return byte == 32 or byte == 9 or byte == 10 or byte == 12 or byte == 13
+
+fn is_letter(byte: Int) -> Bool:
+    return (byte >= 97 and byte <= 122) or (byte >= 65 and byte <= 90)
+
+# an attribute whose value a browser follows as a url.
+fn is_url_attr(name: String) -> Bool:
+    if name == "href" or name == "src" or name == "action" or name == "formaction":
+        return true
+    if name == "xlink:href" or name == "poster" or name == "cite" or name == "background":
+        return true
+    return name == "data" or name == "codebase" or name == "longdesc" or name == "manifest" or name == "icon"
+
+# an attribute whose value is code or markup rather than text: an event
+# handler, inline css, or an iframe's srcdoc. escaping does not make a value
+# safe there, so compile refuses `<%= %>` in one.
+fn is_code_attr(name: String) -> Bool:
+    return name.starts_with("on") or name == "style" or name == "srcdoc"
+
+# the state after the `>` that ends a tag. `<script>` and `<style>` hold raw
+# text in which an escaped value is still live code. in the other raw text and
+# rcdata elements a value is shown as text, and with `<` escaped it cannot end
+# the element.
+fn after_tag(tag: String, closing: Bool) -> HtmlState:
+    if closing:
+        return html_state(H_TEXT, "", "", false)
+    if tag == "script" or tag == "style":
+        return html_state(H_SCRIPT, tag, "", false)
+    if tag == "textarea" or tag == "title" or tag == "xmp" or tag == "iframe":
+        return html_state(H_RCDATA, tag, "", false)
+    if tag == "noembed" or tag == "noframes" or tag == "noscript":
+        return html_state(H_RCDATA, tag, "", false)
+    return html_state(H_TEXT, "", "", false)
+
+# whether `text` at `at` holds `</` and then `tag` in any case, followed by
+# something that ends a tag name. that is what ends a raw text element.
+fn closes_raw(text: String, at: Int, tag: String) -> Bool:
+    end := at + 2 + tag.len()
+    if end > text.len() or ord(text[at + 1]) != 47:
+        return false
+    if text.substring(at + 2, end).to_lower() != tag:
+        return false
+    if end == text.len():
+        return true
+    next := ord(text[end])
+    return is_space(next) or next == 47 or next == 62
+
+# the state after the literal `text`.
+fn advance(start: HtmlState, text: String) -> HtmlState:
+    mut kind := start.kind
+    mut tag := start.tag
+    mut attr := start.attr
+    mut closing := start.closing
+    mut prefix := start.prefix
+    mut known := start.known
+    # where the current attribute value began in `text`, so its literal part
+    # is copied once rather than a byte at a time
+    mut value_from := 0
+    mut ended := false
+    mut i := 0
+    while i < text.len():
+        byte := ord(text[i])
+        if kind == H_TEXT:
+            if byte == 60:
+                kind = H_LT
+        elif kind == H_LT:
+            if is_letter(byte):
+                kind = H_TAG_NAME
+                tag = text[i].to_lower()
+                closing = false
+            elif byte == 47:
+                kind = H_LT_SLASH
+            elif byte == 33:
+                kind = H_BOGUS
+                if i + 2 < text.len() and text.substring(i + 1, i + 3) == "--":
+                    kind = H_COMMENT
+                    i = i + 2
+            elif byte == 63:
+                kind = H_BOGUS
+            elif byte != 60:
+                kind = H_TEXT
+        elif kind == H_LT_SLASH:
+            if is_letter(byte):
+                kind = H_TAG_NAME
+                tag = text[i].to_lower()
+                closing = true
+            elif byte == 62:
+                kind = H_TEXT
+            else:
+                kind = H_BOGUS
+        elif kind == H_TAG_NAME:
+            if is_space(byte) or byte == 47:
+                kind = H_IN_TAG
+            elif byte == 62:
+                ended = true
+            else:
+                tag = tag + text[i].to_lower()
+        elif kind == H_IN_TAG or kind == H_AFTER_ATTR:
+            if byte == 62:
+                ended = true
+            elif byte == 47:
+                kind = H_IN_TAG
+            elif byte == 61 and kind == H_AFTER_ATTR:
+                kind = H_BEFORE_VALUE
+            elif not is_space(byte):
+                kind = H_ATTR_NAME
+                attr = text[i].to_lower()
+        elif kind == H_ATTR_NAME:
+            if is_space(byte):
+                kind = H_AFTER_ATTR
+            elif byte == 47:
+                kind = H_IN_TAG
+            elif byte == 61:
+                kind = H_BEFORE_VALUE
+            elif byte == 62:
+                ended = true
+            else:
+                attr = attr + text[i].to_lower()
+        elif kind == H_BEFORE_VALUE:
+            if byte == 34 or byte == 39:
+                kind = H_DOUBLE
+                if byte == 39:
+                    kind = H_SINGLE
+                prefix = ""
+                known = true
+                value_from = i + 1
+            elif byte == 62:
+                ended = true
+            elif not is_space(byte):
+                kind = H_UNQUOTED
+                prefix = ""
+                known = true
+                value_from = i
+        elif kind == H_DOUBLE or kind == H_SINGLE:
+            if (byte == 34 and kind == H_DOUBLE) or (byte == 39 and kind == H_SINGLE):
+                kind = H_IN_TAG
+                prefix = ""
+        elif kind == H_UNQUOTED:
+            if is_space(byte):
+                kind = H_IN_TAG
+                prefix = ""
+            elif byte == 62:
+                ended = true
+        elif kind == H_COMMENT:
+            if byte == 62 and i >= 2 and text.substring(i - 2, i) == "--":
+                kind = H_TEXT
+        elif kind == H_BOGUS:
+            if byte == 62:
+                kind = H_TEXT
+        elif kind == H_SCRIPT or kind == H_RCDATA:
+            if byte == 60 and closes_raw(text, i, tag):
+                kind = H_TAG_NAME
+                closing = true
+                i = i + 1 + tag.len()
+        if ended:
+            next := after_tag(tag, closing)
+            kind = next.kind
+            tag = next.tag
+            attr = ""
+            closing = false
+            prefix = ""
+            known = true
+            ended = false
+        i = i + 1
+    if kind == H_DOUBLE or kind == H_SINGLE or kind == H_UNQUOTED:
+        prefix = prefix + text.substring(value_from, text.len())
+    return HtmlState(kind, tag, attr, closing, prefix, known)
+
+# the state after a value is written at `st`: an attribute value has begun,
+# and its literal text no longer says how it starts.
+fn after_value(st: HtmlState) -> HtmlState:
+    mut kind := st.kind
+    if kind == H_BEFORE_VALUE:
+        kind = H_UNQUOTED
+    return HtmlState(kind, st.tag, st.attr, st.closing, "", false)
+
+# how a `<%= %>` at `st` is escaped, or a failure for a place where escaping
+# cannot make a value safe.
+fn escape_mode(st: HtmlState, offset: Int) -> Int!TemplateError:
+    kind := st.kind
+    if kind == H_TEXT or kind == H_RCDATA or kind == H_COMMENT or kind == H_BOGUS:
+        return MODE_TEXT
+    if kind == H_SCRIPT:
+        fail TemplateError("'<%=' cannot make a value safe inside <{st.tag}>; pass it as json in a data attribute or a <script type=\"application/json\"> block", offset)
+    quoted := kind == H_DOUBLE or kind == H_SINGLE
+    if quoted or kind == H_UNQUOTED or kind == H_BEFORE_VALUE:
+        if is_code_attr(st.attr):
+            fail TemplateError("'<%=' cannot make a value safe in the '{st.attr}' attribute; put it in a data attribute or choose a class instead", offset)
+        if is_url_attr(st.attr):
+            if quoted:
+                return MODE_URL
+            return MODE_UNQUOTED_URL
+        if quoted:
+            return MODE_TEXT
+        return MODE_UNQUOTED
+    fail TemplateError("a value cannot be part of a tag or attribute name; use '<% if %>' to choose between fixed ones", offset)
+
+# one state for the two that the paths through a block leave the html in, or
+# a failure when they differ in a way that leaves a later value unsure of
+# where it lands. a tag that ends on a different attribute in each branch is
+# fine, since only the name of the next attribute matters.
+fn merge_states(a: HtmlState, b: HtmlState, offset: Int) -> HtmlState!TemplateError:
+    if a.kind == b.kind and a.tag == b.tag and a.attr == b.attr and a.closing == b.closing:
+        if a.known and b.known and a.prefix == b.prefix:
+            return a
+        return HtmlState(a.kind, a.tag, a.attr, a.closing, "", false)
+    tag_a := a.kind == H_IN_TAG or a.kind == H_ATTR_NAME or a.kind == H_AFTER_ATTR
+    tag_b := b.kind == H_IN_TAG or b.kind == H_ATTR_NAME or b.kind == H_AFTER_ATTR
+    if tag_a and tag_b and a.tag == b.tag and a.closing == b.closing:
+        return html_state(H_IN_TAG, a.tag, "", a.closing)
+    fail TemplateError("the paths through this block leave the html in different places, so a value after it has no single context to be escaped for", offset)
+
+# a value for an unquoted attribute. every ascii byte other than a letter, a
+# digit, `-`, `_` and `.` becomes a numeric entity, so a space or a `>` in the
+# value cannot end the attribute. the bytes of a multi-byte character pass
+# through whole.
+fn escape_unquoted(input: String) -> String:
+    mut parts: List[String] := []
+    mut copied := 0
+    mut position := 0
+    while position < input.len():
+        byte := ord(input[position])
+        plain := byte >= 128 or is_letter(byte) or (byte >= 48 and byte <= 57) or byte == 45 or byte == 95 or byte == 46
+        if not plain:
+            if position > copied:
+                parts.push(input.substring(copied, position))
+            parts.push("&#{byte};")
+            copied = position + 1
+        position = position + 1
+    if copied == 0:
+        return input
+    if copied < input.len():
+        parts.push(input.substring(copied, input.len()))
+    return parts.join("")
+
+# a value for a url attribute, appended to the literal `prefix`. the url the
+# browser will follow is checked whole with `html.safe_url`, and the value
+# becomes `about:blank` when that refuses it.
+fn url_value(prefix: String, value: String) -> String:
+    if value == "":
+        return value
+    whole := prefix + value
+    if html.safe_url(whole) != whole:
+        return "about:blank"
+    return value
+
+# a `<%= %>` value, escaped for where it sits.
+fn escape_for(mode: Int, prefix: String, value: String) -> String:
+    if mode == MODE_URL:
+        return html.escape(url_value(prefix, value))
+    if mode == MODE_UNQUOTED_URL:
+        return escape_unquoted(url_value(prefix, value))
+    if mode == MODE_UNQUOTED:
+        return escape_unquoted(value)
+    return html.escape(value)
 
 # Compiles template source into a `Template`.
 #
@@ -295,15 +626,24 @@ pub fn compile(source: String) -> Template!TemplateError:
         fail TemplateError("template source is larger than {MAX_SOURCE_BYTES} bytes", 0)
     mut nodes: List[Node] := []
     mut open_blocks: List[Int] := []
+    # the html state where each open block began, and where its `if` branch
+    # ended once an `else` is seen
+    mut entry_states: List[HtmlState] := []
+    mut then_states: List[HtmlState] := []
+    mut state := html_state(H_TEXT, "", "", false)
     mut position := 0
     while position < source.len():
         open := find_pair(source, position, 60, 37)
         if open < 0:
-            nodes.push(node_text(source.substring(position, source.len()), position))
+            text := source.substring(position, source.len())
+            nodes.push(node_text(text, position))
+            state = advance(state, text)
             position = source.len()
         else:
             if open > position:
-                nodes.push(node_text(source.substring(position, open), position))
+                text := source.substring(position, open)
+                nodes.push(node_text(text, position))
+                state = advance(state, text)
             close := find_pair(source, open + 2, 37, 62)
             if close < 0:
                 fail TemplateError("unclosed '<%' tag", open)
@@ -311,18 +651,30 @@ pub fn compile(source: String) -> Template!TemplateError:
             if node.kind == NODE_END:
                 if open_blocks.len() == 0:
                     fail TemplateError("'end' with no open 'if' or 'for'", open)
-                opener := open_blocks[open_blocks.len() - 1]
-                open_blocks = open_blocks.slice(0, open_blocks.len() - 1)
+                last := open_blocks.len() - 1
+                opener := open_blocks[last]
+                # a loop body can run again or not at all, so it must end
+                # where it began; an `if` must end where its other path does
+                mut other := entry_states[last]
+                if nodes[opener].alt >= 0:
+                    other = then_states[last]
+                state = merge_states(state, other, open)!
+                open_blocks = open_blocks.slice(0, last)
+                entry_states = entry_states.slice(0, last)
+                then_states = then_states.slice(0, last)
                 nodes.push(node)
                 nodes = close_block(nodes, opener, nodes.len() - 1)
             elif node.kind == NODE_ELSE:
                 if open_blocks.len() == 0:
                     fail TemplateError("'else' with no open 'if'", open)
-                opener := open_blocks[open_blocks.len() - 1]
+                last := open_blocks.len() - 1
+                opener := open_blocks[last]
                 if nodes[opener].kind != NODE_IF:
                     fail TemplateError("'else' is only allowed inside an 'if'", open)
                 if nodes[opener].alt >= 0:
                     fail TemplateError("an 'if' may have only one 'else'", open)
+                then_states[last] = state
+                state = entry_states[last]
                 nodes.push(node)
                 nodes = set_alt(nodes, opener, nodes.len() - 1)
             elif node.kind == NODE_IF or node.kind == NODE_FOR:
@@ -330,6 +682,18 @@ pub fn compile(source: String) -> Template!TemplateError:
                     fail TemplateError("blocks nested deeper than {MAX_NESTING}", open)
                 nodes.push(node)
                 open_blocks.push(nodes.len() - 1)
+                entry_states.push(state)
+                then_states.push(state)
+            elif node.kind == NODE_ESCAPED:
+                mode := escape_mode(state, open)!
+                mut prefix := ""
+                if state.known:
+                    prefix = state.prefix
+                nodes.push(Node(NODE_ESCAPED, prefix, node.path, "", false, 0 - 1, 0 - 1, open, mode))
+                state = after_value(state)
+            elif node.kind == NODE_RAW:
+                nodes.push(node)
+                state = after_value(state)
             else:
                 nodes.push(node)
             position = close + 2
@@ -341,14 +705,14 @@ pub fn compile(source: String) -> Template!TemplateError:
 fn close_block(nodes: List[Node], opener: Int, closer: Int) -> List[Node]:
     old := nodes[opener]
     mut out := nodes
-    out[opener] = Node(old.kind, old.text, old.path, old.name, old.negate, old.alt, closer, old.offset)
+    out[opener] = Node(old.kind, old.text, old.path, old.name, old.negate, old.alt, closer, old.offset, old.mode)
     return out
 
 # record the matching `else` on the node that opened the block.
 fn set_alt(nodes: List[Node], opener: Int, alt: Int) -> List[Node]:
     old := nodes[opener]
     mut out := nodes
-    out[opener] = Node(old.kind, old.text, old.path, old.name, old.negate, alt, old.close, old.offset)
+    out[opener] = Node(old.kind, old.text, old.path, old.name, old.negate, alt, old.close, old.offset, old.mode)
     return out
 
 # ---------------------------------------------------------------
@@ -490,7 +854,7 @@ fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[Strin
             out_len = out_len + node.text.len()
             index = index + 1
         elif node.kind == NODE_ESCAPED:
-            piece := html.escape(stringify(resolve(root, names, values, node.path)))
+            piece := escape_for(node.mode, node.text, stringify(resolve(root, names, values, node.path)))
             parts.push(piece)
             out_len = out_len + piece.len()
             index = index + 1
@@ -535,9 +899,10 @@ fn render_range(t: Template, start: Int, stop: Int, root: Int, names: List[Strin
 
 # Renders `t` with `data`, escaping every `<%= %>` value.
 #
-# a value interpolated with `<%= %>` goes through `html.escape` on the way out,
-# always, with no way to turn that off for the template as a whole. the only
-# unescaped path is a `<%raw %>` tag that somebody wrote on purpose.
+# a value interpolated with `<%= %>` is escaped for where it lands (see the
+# module header), always, with no way to turn that off for the template as a
+# whole. the only unescaped path is a `<%raw %>` tag that somebody wrote on
+# purpose.
 pub fn render(t: Template, data: Ctx) -> String!TemplateError:
     mut names: List[String] := []
     mut values: List[Int] := []
@@ -763,3 +1128,92 @@ test "load reads a template off disk and load_in joins a safe name":
     assert_eq(from_path, "<h1>&lt;b&gt;</h1>")
     assert_eq(from_name, "<h1>&lt;b&gt;</h1>")
     assert_eq(missing, true)
+
+fn link(url: String) -> String:
+    ctx := context().set("u", url)
+    return render_string("<a href=\"<%= u %>\">", ctx) catch "ERR"
+
+test "a value in a url attribute cannot run script":
+    assert_eq(link("javascript:alert(1)"), "<a href=\"about:blank\">")
+    assert_eq(link("JaVaScRiPt:alert(1)"), "<a href=\"about:blank\">")
+    assert_eq(link("data:text/html,<script>alert(1)</script>"), "<a href=\"about:blank\">")
+    assert_eq(link("vbscript:msgbox(1)"), "<a href=\"about:blank\">")
+    assert_eq(link(" javascript:alert(1)"), "<a href=\"about:blank\">")
+    assert_eq(link("\x01java\tscript:alert(1)"), "<a href=\"about:blank\">")
+    assert_eq(link("java\nscript:alert(1)"), "<a href=\"about:blank\">")
+    assert_eq(link("//evil.example"), "<a href=\"about:blank\">")
+    # an entity is not decoded in the value, and its `&` is escaped, so the
+    # browser sees the text `javascript&#58;alert(1)`: a relative path
+    assert_eq(link("javascript&#58;alert(1)"), "<a href=\"javascript&amp;#58;alert(1)\">")
+
+test "a value in a url attribute keeps the urls a page needs":
+    assert_eq(link("https://example.com/a?b=c&d=e"), "<a href=\"https://example.com/a?b=c&amp;d=e\">")
+    assert_eq(link("http://example.com"), "<a href=\"http://example.com\">")
+    assert_eq(link("/relative/path"), "<a href=\"/relative/path\">")
+    assert_eq(link("relative"), "<a href=\"relative\">")
+    assert_eq(link("mailto:someone@example.com"), "<a href=\"mailto:someone@example.com\">")
+    assert_eq(link("#top"), "<a href=\"#top\">")
+    assert_eq(link(""), "<a href=\"\">")
+
+test "every url attribute is checked, in every quoting":
+    ctx := context().set("u", "javascript:alert(1)")
+
+    assert_eq(render_string("<img SRC='<%= u %>'>", ctx)!, "<img SRC='about:blank'>")
+    assert_eq(render_string("<form action=<%= u %>>", ctx)!, "<form action=about&#58;blank>")
+    assert_eq(render_string("<button formaction = \"<%= u %>\">", ctx)!, "<button formaction = \"about:blank\">")
+    assert_eq(render_string("<svg><a xlink:href=\"<%= u %>\"></a></svg>", ctx)!, "<svg><a xlink:href=\"about:blank\"></a></svg>")
+    assert_eq(render_string("<a title=\"<%= u %>\">", ctx)!, "<a title=\"javascript:alert(1)\">")
+
+test "a url is checked with the literal text in front of it":
+    ctx := context().set("p", "/evil.example").set("id", "javascript:alert(1)").set("q", "a b")
+
+    # "/" and "/evil.example" make "//evil.example", which leaves the site
+    assert_eq(render_string("<a href=\"/<%= p %>\">", ctx)!, "<a href=\"/about:blank\">")
+    assert_eq(render_string("<a href=\"/users/<%= id %>\">", ctx)!, "<a href=\"/users/javascript:alert(1)\">")
+    assert_eq(render_string("<a href=\"https://example.com/?q=<%= q %>\">", ctx)!, "<a href=\"https://example.com/?q=a b\">")
+    assert_eq(render_string("<a href=\"java<%= id %>\">", context().set("id", "script:alert(1)"))!, "<a href=\"javaabout:blank\">")
+
+test "an unquoted attribute value cannot end the attribute":
+    ctx := context().set("v", "x onmouseover=alert(1)")
+
+    assert_eq(render_string("<p title=<%= v %>>", ctx)!, "<p title=x&#32;onmouseover&#61;alert&#40;1&#41;>")
+    assert_eq(render_string("<p title=<%= v %> class=a>", context().set("v", "café-1.2_x"))!, "<p title=café-1.2_x class=a>")
+
+test "compile refuses a value where escaping cannot make it safe":
+    assert_eq(compile_rejects("<a onclick=\"go('<%= x %>')\">"), true)
+    assert_eq(compile_rejects("<a ONMOUSEOVER=<%= x %>>"), true)
+    assert_eq(compile_rejects("<p style=\"color: <%= x %>\">"), true)
+    assert_eq(compile_rejects("<iframe srcdoc=\"<%= x %>\">"), true)
+    assert_eq(compile_rejects("<script>var a = <%= x %>;</script>"), true)
+    assert_eq(compile_rejects("<STYLE>p {{ color: <%= x %> }}</style>"), true)
+    assert_eq(compile_rejects("<<%= x %>>"), true)
+    assert_eq(compile_rejects("<div <%= x %>>"), true)
+    assert_eq(compile_rejects("<div data-<%= x %>=1>"), true)
+    assert_eq(compile_rejects("</<%= x %>>"), true)
+
+test "raw is still allowed everywhere":
+    ctx := context().set("u", "javascript:void(0)").set("js", "1 + 1")
+
+    assert_eq(render_string("<a href=\"<%raw u %>\">", ctx)!, "<a href=\"javascript:void(0)\">")
+    assert_eq(render_string("<script>var a = <%raw js %>;</script>", ctx)!, "<script>var a = 1 + 1;</script>")
+
+test "the context follows the page past scripts, comments and raw text":
+    ctx := context().set("x", "<b>")
+
+    assert_eq(render_string("<script>if (a < b) {{}}</script><p><%= x %></p>", ctx)!, "<script>if (a < b) {{}}</script><p>&lt;b&gt;</p>")
+    assert_eq(render_string("<!-- <a href=\" --><%= x %>", ctx)!, "<!-- <a href=\" -->&lt;b&gt;")
+    assert_eq(render_string("<!-- <%= x %> -->", ctx)!, "<!-- &lt;b&gt; -->")
+    assert_eq(render_string("<textarea><a href=\"</textarea><%= x %>", ctx)!, "<textarea><a href=\"</textarea>&lt;b&gt;")
+    assert_eq(render_string("<title><%= x %></title>", ctx)!, "<title>&lt;b&gt;</title>")
+    assert_eq(render_string("<p title=\"a>b\"><%= x %>", ctx)!, "<p title=\"a>b\">&lt;b&gt;")
+
+test "blocks must leave the html where a later value can be placed":
+    ctx := context().set_bool("c", true).set("v", "\"")
+
+    assert_eq(render_string("<input <% if c %>checked<% else %>disabled<% end %> value=\"<%= v %>\">", ctx)!, "<input checked value=\"&quot;\">")
+    assert_eq(render_string("<a class=\"<% for i in c %>x <% end %>\" href=\"<%= v %>\">", ctx)!, "<a class=\"\" href=\"&quot;\">")
+    rows := list().push_text("/a").push_text("javascript:b")
+    assert_eq(render_string("<% for r in rows %><a href=\"<%= r %>\">x</a><% end %>", context().set_child("rows", rows))!, "<a href=\"/a\">x</a><a href=\"about:blank\">x</a>")
+    assert_eq(compile_rejects("<% if c %><a href=\"<% end %><%= v %>"), true)
+    assert_eq(compile_rejects("<% for i in c %><p title=\"<% end %>"), true)
+    assert_eq(compile_rejects("<% if c %><a href=\"<% else %><p><% end %>"), true)

@@ -414,13 +414,15 @@ alive), `ByteArray` and `X25519KeyPair`; websocket sessions (no close frame on
 drop); `tls.Conn` and `tls.Listener` (`conn_from_handle` and
 `listener_from_handle` were removed, and a dropped conn sends no close_notify);
 `http.ClientConn`, `http2.Connection`, the h2 server connection and the http
-client's idle pool; `postgres.Conn`, `mysql.Conn`, `redis.Client`, and
+client's idle pool; `http2.Stream`, and with it the three grpc stream types
+(stream ids are never reused on a connection, so a drop of a stream the
+client already forgot finds nothing, and a dropped open stream queues its
+reset only when the send queue has room); `postgres.Conn`, `mysql.Conn`, `redis.Client`, and
 `std.db`'s `Tx` and `Stmt`, which own their pin, and `Db`, which holds its
 pool (the module-global pool and pin registries are gone). io registry handles
 come from one process-wide counter, so a drop on another task finds nothing.
 still by hand: `ByteBuffer`, whose destructor waits on the count checker
-telling an `Int` field store from a counted one; grpc streams, which need a
-release on `http2.Stream` that sends no reset frame; `http2.Client`, which its
+telling an `Int` field store from a counted one; `http2.Client`, which its
 reader and writer tasks hold; `term.session.Terminal`, whose tasks hold it and
 whose close writes to the tty; and `TcpStream`, which is a view of a socket
 another value owns. the text below is the plan as it was written.

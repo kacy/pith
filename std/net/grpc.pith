@@ -804,8 +804,8 @@ impl ServerStream:
         return recv_stream_message(self.stream, self.reader)!
 
     # release the underlying http/2 stream: its event channels, table entries
-    # and MAX_CONCURRENT_STREAMS slot. call it once per stream when done — an
-    # unclosed stream retains all of that for the connection's whole life. a
+    # and MAX_CONCURRENT_STREAMS slot. call it once per stream when done; a
+    # stream dropped without close() is released when its last value goes. a
     # completed rpc is released without touching the wire; an abandoned one is
     # reset (CANCEL) so the server stops sending. a second close is a no-op.
     pub fn close():
@@ -873,9 +873,8 @@ impl ClientStream:
     # release the underlying http/2 stream and its concurrency slot. distinct
     # from close_send(), which half-closes the rpc's request sequence on the
     # wire: close() is the local teardown, called once when done with the
-    # stream — normally after recv_response(). an unclosed stream retains its
-    # channels and a MAX_CONCURRENT_STREAMS slot for the connection's whole
-    # life. a second close is a no-op.
+    # stream, normally after recv_response(). a stream dropped without close()
+    # is released when its last value goes. a second close is a no-op.
     pub fn close():
         self.stream.close()
 
@@ -905,9 +904,9 @@ impl BidiStream:
 
     # release the underlying http/2 stream and its concurrency slot. distinct
     # from close_send(): that half-closes the request stream on the wire,
-    # while close() is the local teardown once both directions are done. an
-    # unclosed stream retains its channels and a MAX_CONCURRENT_STREAMS slot
-    # for the connection's whole life. a second close is a no-op.
+    # while close() is the local teardown once both directions are done. a
+    # stream dropped without close() is released when its last value goes. a
+    # second close is a no-op.
     pub fn close():
         self.stream.close()
 

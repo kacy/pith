@@ -79,3 +79,47 @@ pub unsafe extern "C" fn pith_atomic_int_compare_set(handle: i64, expected: i64,
         None => 0,
     }
 }
+
+/// Atomically add `delta` to the cell and return its previous value.
+///
+/// # Safety
+/// handle must be a valid atomic-cell handle or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_atomic_int_fetch_add(handle: i64, delta: i64) -> i64 {
+    match cell_ref(handle) {
+        Some(cell) => cell.fetch_add(delta, Ordering::AcqRel),
+        None => 0,
+    }
+}
+
+/// Atomically subtract `delta` from the cell and return its previous value.
+///
+/// # Safety
+/// handle must be a valid atomic-cell handle or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_atomic_int_fetch_sub(handle: i64, delta: i64) -> i64 {
+    match cell_ref(handle) {
+        Some(cell) => cell.fetch_sub(delta, Ordering::AcqRel),
+        None => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::concurrency::sync_handle::pith_sync_release;
+
+    #[test]
+    fn fetch_add_and_fetch_sub_return_previous_values() {
+        let h = pith_atomic_int_new(10);
+        unsafe {
+            assert_eq!(pith_atomic_int_fetch_add(h, 5), 10);
+            assert_eq!(pith_atomic_int_get(h), 15);
+            assert_eq!(pith_atomic_int_fetch_sub(h, 3), 15);
+            assert_eq!(pith_atomic_int_get(h), 12);
+            assert_eq!(pith_atomic_int_fetch_add(h, -2), 12);
+            assert_eq!(pith_atomic_int_get(h), 10);
+            pith_sync_release(h);
+        }
+    }
+}

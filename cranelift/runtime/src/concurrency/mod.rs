@@ -12,7 +12,8 @@ pub mod waitgroup;
 
 // Re-export FFI functions for use by the codegen
 pub use atomic_int::{
-    pith_atomic_int_compare_set, pith_atomic_int_get, pith_atomic_int_new, pith_atomic_int_set,
+    pith_atomic_int_compare_set, pith_atomic_int_fetch_add, pith_atomic_int_fetch_sub,
+    pith_atomic_int_get, pith_atomic_int_new, pith_atomic_int_set,
 };
 pub use channel::{
     pith_channel_cap, pith_channel_close, pith_channel_is_closed, pith_channel_len,

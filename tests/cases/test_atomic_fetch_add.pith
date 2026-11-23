@@ -1,0 +1,26 @@
+# AtomicInt.fetch_add and fetch_sub return the previous value and stay exact
+# under concurrent increments and decrements across green tasks.
+
+fn worker(counter: AtomicInt, rounds: Int) -> Int:
+    mut i := 0
+    while i < rounds:
+        counter.fetch_add(2)
+        counter.fetch_sub(1)
+        i = i + 1
+    return rounds
+
+fn main() -> Int:
+    c := AtomicInt(10)
+    prev1 := c.fetch_add(5)
+    prev2 := c.fetch_sub(3)
+    print("{prev1} {prev2} {c.load()}")
+
+    mut tasks: List[Task[Int]] := []
+    mut w := 0
+    while w < 8:
+        tasks.push(spawn worker(c, 500))
+        w = w + 1
+    for t in tasks:
+        await t
+    print("{c.load()}")
+    return 0

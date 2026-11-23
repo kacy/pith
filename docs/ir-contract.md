@@ -410,10 +410,13 @@ count on the live payload, gives the shared box the payload destructor, and
 drops the count on it. the register return clears the destructor the same
 way when a local's box is its own and the payload leaves with its count.
 
-**main's result.** the entry glue exits 0 and ignores what `main` returns,
-so a `fn main() -> T!` settles its result before the `ret`: it releases an
-ok value, and a returned result that holds an error is reported through
-`pith_main_error_exit`, which exits with status 1. a `fail` or a `!` in main
+**main's result.** `fn main() -> Int` returns its `Int` value as the process
+exit status; any non-`Int` `main` (void, `String`, etc.) pins its normal exit
+status to `0` so heap pointers are never truncated into exit codes. a
+`fn main() -> T!` settles its result before the `ret`: a returned result that
+holds an error is reported through `pith_main_error_exit` (exit status 1), an
+ok `Int` in `fn main() -> Int!` is returned as the process exit status, and any
+other ok payload is released before exiting `0`. a `fail` or a `!` in main
 reports the same way, before any box is built.
 
 **optional encoding.** a `T?` is the null pointer when it is none. a Some is

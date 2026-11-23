@@ -256,6 +256,8 @@ pub fn ir_runtime_call_name(name: String) -> String:
         return "pith_cstring_trim"
     if name == "split":
         return "pith_string_split_to_list"
+    if name == "split_exact":
+        return "pith_string_split_exact_to_list"
     if name == "to_upper":
         return "pith_cstring_to_upper"
     if name == "to_lower":
@@ -568,6 +570,10 @@ pub fn ir_method_emit_name(mname: String, obj_type: String) -> String:
             emit_name = "pith_atomic_int_set"
         elif mname == "compare_set":
             emit_name = "pith_atomic_int_compare_set"
+        elif mname == "fetch_add":
+            emit_name = "pith_atomic_int_fetch_add"
+        elif mname == "fetch_sub":
+            emit_name = "pith_atomic_int_fetch_sub"
     # the remaining sync primitives emit their full runtime symbols for the
     # same reason atomics and channels do: a bare name like `done` is also a
     # legal variable name, and the consumer resolves a call through a local

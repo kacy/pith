@@ -85,6 +85,26 @@ buf.reset()
 
 `reset()` is just a clearer alias for `clear()`.
 
+a buffer frees its storage when the last value naming it dies. `free()`
+releases the contents early and `take_bytes()` moves them out as `Bytes`; both
+leave an empty buffer that still works. the buffer's handle is private to
+`std.bytes`, and the `byte_buffer_*` builtins behind it are callable only
+there, so a program never holds a handle to freed memory.
+
+a buffer counts as a collection for the task rules: hand it to a `spawn` or a
+channel whole, as a list would be (E248). it cannot become an interface value
+such as `io.BytesWriter`, since the checks could not follow it from there; a
+generic function bounded by the interface still takes it. to give a writer to
+code that takes a `BytesWriter`, use `io.memory_writer()`, whose bytes sit
+behind a lock:
+
+```pith
+out := io.memory_writer()
+writer := out.buffered_chunked(64)
+http.send_buffered(writer, http.text(200, "hi"))!
+print(out.string())
+```
+
 `write` and `write_string_utf8` return the number of bytes appended, so
 appending an empty value succeeds and returns 0. text built piece by piece, such
 as a blank header value or an empty field, needs no guard around the write.

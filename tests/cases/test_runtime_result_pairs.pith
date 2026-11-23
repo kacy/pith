@@ -134,31 +134,27 @@ fn floats():
     print("inline err: " + parse_float("infinity").err)
     parse_float("discarded")
 
-fn buffer_through(buf: Int, data: Bytes) -> Int!:
-    return byte_buffer_write(buf, data)! + byte_buffer_write_string_utf8(buf, "cd")!
+fn buffer_through(buf: ByteBuffer, data: Bytes) -> Int!:
+    return buf.write(data)! + buf.write_string_utf8("cd")!
 
-fn buffer_through_twice(buf: Int, data: Bytes) -> Int!:
+fn buffer_through_twice(buf: ByteBuffer, data: Bytes) -> Int!:
     return buffer_through(buf, data)! + 100
 
+# std.bytes keeps a buffer's handle private, so pith code only ever holds a
+# live one and only the success half of these pairs is reachable from here.
+# the runtime's own tests cover a bad handle.
 fn buffers():
     print("-- byte buffer writes")
-    buf := byte_buffer_new()
+    buf := bytes.buffer()
     data := bytes.from_string_utf8("ab")
-    print("catch ok: " + (byte_buffer_write(buf, data) catch -1).to_string())
-    print("catch err: " + (byte_buffer_write(0, data) catch -1).to_string())
-    print("string catch ok: " + (byte_buffer_write_string_utf8(buf, "héllo") catch -1).to_string())
-    print("string catch err: " + (byte_buffer_write_string_utf8(0, "x") catch -1).to_string())
+    print("catch ok: " + (buf.write(data) catch -1).to_string())
+    print("string catch ok: " + (buf.write_string_utf8("héllo") catch -1).to_string())
     show("two frames ok", buffer_through_twice(buf, data))
-    show("two frames err", buffer_through_twice(0, data))
-    print("unwrap_or ok: " + byte_buffer_write_string_utf8(buf, "").unwrap_or(-1).to_string())
-    print("unwrap_or err: " + byte_buffer_write(0, bytes.empty()).unwrap_or(-1).to_string())
-    local_ok := byte_buffer_write(buf, bytes.empty())
-    local_err := byte_buffer_write_string_utf8(0, "")
-    print("local: " + local_ok.ok.to_string() + " [" + local_err.err + "]")
-    show("argument err", byte_buffer_write(0, data))
-    byte_buffer_write_string_utf8(buf, "!")
-    print("len: " + byte_buffer_len(buf).to_string())
-    byte_buffer_free(buf)
+    print("unwrap_or ok: " + buf.write_string_utf8("").unwrap_or(-1).to_string())
+    local_ok := buf.write(bytes.empty())
+    print("local: " + local_ok.ok.to_string())
+    buf.write_string_utf8("!")
+    print("len: " + buf.len().to_string())
 
 fn file_through(h: Int, text: String, data: Bytes) -> Int!:
     return file_write(h, text)! + file_write_bytes(h, data)!

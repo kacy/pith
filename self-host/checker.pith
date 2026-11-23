@@ -104,6 +104,9 @@ generic_body_spec_limit := 64
 # is walked in that module's context.
 mut struct_instance_decl_idx: Map[Int, Int] := {}
 mut impl_method_modules: Map[Int, String] := {}
+# the module each non-generic struct was declared in; a generic instance
+# answers through its declaration instead
+mut struct_decl_modules: Map[Int, String] := {}
 mut signature_alias_tables: Map[String, Map[String, String]] := {}
 # per-module snapshots taken as each module is checked, so a generic body
 # one module declares can be walked during a later module's turn with the
@@ -343,6 +346,7 @@ pub fn initialize_checker(file_path: String):
     generic_drop_walked = {}
     struct_instance_decl_idx = {}
     impl_method_modules = {}
+    struct_decl_modules = {}
     signature_alias_tables = {}
     checker_module_roots = {}
     checker_module_files = {}
@@ -1125,6 +1129,7 @@ fn register_struct_declaration(node_idx: Int, node: Node):
     mut empty_bools: List[Bool] := []
     tid := declared_type_id(node_idx, ti_struct(base_name, empty_names, empty_ints, empty_bools, empty_bools))
     register_module_type_name(base_name, tid)
+    struct_decl_modules.insert(tid, current_checker_module_path)
     note_plain_type_declaration(base_name)
     define_binding_at(current_scope, base_name, tid, false, node_idx)
     # non-generic: resolve field types immediately
@@ -2041,6 +2046,13 @@ fn interface_value_accepts(value_idx: Int, actual_tid: Int, expected_tid: Int) -
         return false
     if not type_implements_interface_value(get_type_name(actual_tid), get_type_info(expected_tid).name):
         return false
+    # an interface value hides the type behind it, so the sharing checks judge
+    # it by every type that implements the interface. a ByteBuffer among them
+    # would make every writer value a buffer no task could hand on, so a
+    # buffer never becomes one. a generic function bounded by the interface
+    # still takes it, since there the type stays known.
+    if is_runtime_buffer_type(actual_tid):
+        report_error_with_fix_at(value_idx, "E248", "a " + get_type_name(actual_tid) + " cannot become a " + get_type_info(expected_tid).name + " value: the sharing checks could not follow its buffer to another task", "pass it to a generic function bounded by the interface, or write into io.memory_writer()")
     interface_coercions.insert(value_idx, expected_tid)
     return true
 
@@ -4313,7 +4325,27 @@ fn bare_name_import_sources(name: String) -> List[String]:
             sources.push(w.substring(wildcard_needle.len(), w.len()))
     return sources
 
+# the builtins that take a raw pointer as an Int. the runtime checks the
+# pointer's alignment and a magic word, which cannot tell a live buffer from
+# freed memory or a made-up number, so only std.bytes may call them: it keeps
+# each handle in a private field and frees it in the owner's destructor.
+fn is_raw_handle_builtin(name: String) -> Bool:
+    return name.starts_with("byte_buffer_")
+
+# E251 for a raw-handle builtin named outside std.bytes. a function the
+# program declares under the same name is its own and stays callable.
+fn builtin_reachable_here(node_idx: Int, name: String, scope_id: Int) -> Bool:
+    if not is_raw_handle_builtin(name) or in_std_bytes():
+        return true
+    owned_idx := lookup_binding_index_preferring(scope_id, name, current_checker_module_path, bare_name_import_sources(name))
+    if owned_idx >= 0 and binding_decl_node_at(owned_idx) >= 0:
+        return true
+    report_error_with_fix_at(node_idx, "E251", "'" + name + "' is internal to std.bytes", "use bytes.buffer() or bytes.array() and their methods")
+    return false
+
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
+    if not builtin_reachable_here(node_idx, name, scope_id):
+        return TID_ERR
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
         # the shared global scope holds every module's top-level names at
@@ -5135,6 +5167,8 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
 
     if callee_node.kind == "ident":
         name := callee_node.value
+        if not builtin_reachable_here(callee_idx, name, scope_id):
+            return TID_ERR
         # assert_eq / assert_ne take two values of any one type, which no fixed
         # builtin signature describes, so they are resolved by name here rather
         # than registered in checker_builtins.
@@ -5295,6 +5329,27 @@ fn struct_has_field(info: TypeInfo, field_name: String) -> Bool:
 # given at most once, every name must exist, and any omitted field must have a
 # default. Fields can arrive in any order; the emitter reorders to declaration
 # order independently.
+# the module that declared a struct, or "" for the root file or when unknown
+fn struct_declared_module(tid: Int) -> String:
+    if struct_decl_modules.contains_key(tid):
+        return struct_decl_modules[tid]
+    if struct_instance_decl_idx.contains_key(tid):
+        return declaration_module(struct_instance_decl_idx[tid])
+    return ""
+
+# a field declared without `pub` belongs to its module: code elsewhere may
+# not read it, write it or set it in a constructor (E251). a struct whose
+# handle names runtime memory relies on this, since a copied or made-up
+# handle would reach memory the struct no longer owns.
+fn check_field_visible(at: Int, tid: Int, info: TypeInfo, fidx: Int) -> Bool:
+    if fidx < 0 or fidx >= info.field_pub.len() or info.field_pub[fidx]:
+        return true
+    owner := struct_declared_module(tid)
+    if owner.len() == 0 or owner == current_checker_module_path:
+        return true
+    report_error_at(at, "E251", "field '" + info.fields[fidx] + "' of " + get_type_name(tid) + " is not public outside module '" + owner + "'")
+    return false
+
 fn check_named_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_indices: List[Int], scope_id: Int) -> Int:
     mut provided: Map[String, Int] := {}
     mut ok := true
@@ -5314,6 +5369,9 @@ fn check_named_struct_constructor(name: String, struct_tid: Int, info: TypeInfo,
             if an.children.len() > 0:
                 expr = an.children[0]
             provided.insert(an.value, expr)
+            for fname, fi in info.fields:
+                if strings_equal(fname, an.value) and not check_field_visible(ai, struct_tid, info, fi):
+                    ok = false
     # every field without a default must be supplied.
     for fld in info.fields:
         if provided.contains_key(fld) == false:
@@ -5354,6 +5412,7 @@ fn check_struct_constructor(name: String, struct_tid: Int, info: TypeInfo, arg_i
     # check provided field types
     mut idx := 0
     for ai in arg_indices:
+        check_field_visible(ai, struct_tid, info, idx)
         arg_node := get_node(ai)
         mut arg_expr_idx := ai
         if arg_node.kind == "arg":
@@ -7528,6 +7587,7 @@ fn check_field_access_expression(node_idx: Int, node: Node, scope_id: Int) -> In
         mut fidx := 0
         while fidx < obj_info.fields.len():
             if strings_equal(obj_info.fields[fidx], field_name):
+                check_field_visible(node_idx, obj_type, obj_info, fidx)
                 guard_key := obj_type.to_string() + "." + field_name
                 if struct_field_guards.contains_key(guard_key):
                     check_guarded_field(node_idx, obj_node_idx, field_name, struct_field_guards[guard_key], scope_id)
@@ -8754,6 +8814,7 @@ fn check_struct_initialization(node: Node, scope_id: Int) -> Int:
     # check each field type
     mut idx := 0
     for child in node.children:
+        check_field_visible(child, struct_tid, info, idx)
         arg_type := c_check_expr(child, scope_id)
         if is_error_type(arg_type) == false:
             if idx < info.field_types.len():
@@ -8882,6 +8943,8 @@ fn buffer_path(tid: Int, seen: Map[Int, Bool]) -> String:
             if inner != "":
                 return join_buffer_path(i.to_string(), inner)
         return ""
+    if info.kind == "struct" and is_runtime_buffer_type(tid):
+        return "."
     if (info.kind != "struct" and info.kind != "enum") or seen.contains_key(tid):
         return ""
     seen.insert(tid, true)
@@ -8896,6 +8959,10 @@ fn buffer_path(tid: Int, seen: Map[Int, Bool]) -> String:
     # buffer when any of them does
     if is_interface_value_type(tid):
         for impl_tid in interface_implementer_tids(info.name):
+            # a runtime buffer is refused as an interface value, so no value of
+            # the interface holds one
+            if is_runtime_buffer_type(impl_tid):
+                continue
             inner := buffer_path(impl_tid, seen)
             if inner != "":
                 return join_buffer_path(get_type_name(impl_tid), inner)
@@ -8907,6 +8974,19 @@ fn buffer_path(tid: Int, seen: Map[Int, Bool]) -> String:
         if inner != "":
             return join_buffer_path(fname, inner)
     return ""
+
+# whether the code being checked is std.bytes, imported or checked as the root
+# file (its own tests run that way)
+fn in_std_bytes() -> Bool:
+    if current_checker_module_path == "std.bytes":
+        return true
+    return current_checker_module_path == "" and checker_current_file_path().ends_with("std/bytes.pith")
+
+# std.bytes's buffers keep runtime memory behind a private Int handle. the
+# handle reads as a plain number, so the two types count as a buffer by name.
+fn is_runtime_buffer_type(tid: Int) -> Bool:
+    name := get_type_info(tid).name
+    return (name == "ByteBuffer" or name == "ByteArray") and struct_declared_module(tid) == "std.bytes"
 
 fn join_buffer_path(head: String, rest: String) -> String:
     if rest == ".":

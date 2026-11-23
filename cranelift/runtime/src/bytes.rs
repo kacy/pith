@@ -875,23 +875,12 @@ pub unsafe extern "C" fn pith_byte_buffer_write_word(handle: i64, word: i64, cou
 /// handle must be a valid PithByteBuffer or garbage.
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_take_bytes(handle: i64) -> i64 {
-    // SAFETY: Validates handle and scrubs magic before reclaiming the box; borrow ends first.
-    let valid = unsafe {
-        with_byte_buffer_mut(handle, |buf| {
-            // reclaim the whole box: the vec moves into the bytes object, the
-            // buffer allocation dies here, and the scrubbed magic makes any stale
-            // handle fail the validity check
-            buf.magic = 0;
-        })
-    }
-    .is_some();
-    if !valid {
-        return 0;
-    }
-    // SAFETY: Handle was validated, its magic is scrubbed, and no borrow remains live.
-    let boxed = unsafe { Box::from_raw(handle as *mut PithByteBuffer) };
-    crate::perf_count(&crate::PERF_BYTE_BUFFER_FREES, 1);
-    pith_bytes_from_vec(boxed.data)
+    // the vec moves into the bytes object and the buffer stays alive and empty.
+    // only the destructor of the value that owns the handle frees the buffer, so
+    // no handle a program can still name ever points at freed memory.
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before borrowing.
+    unsafe { with_byte_buffer_mut(handle, |buf| pith_bytes_from_vec(std::mem::take(&mut buf.data))) }
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -1028,6 +1017,11 @@ mod tests {
             let data = pith_byte_buffer_take_bytes(buf);
             assert_eq!(with_bytes(data, <[u8]>::to_vec).unwrap(), b"abcabcdefgha");
             pith_bytes_release(data);
+            // taking the contents leaves an empty buffer that still works
+            assert_eq!(pith_byte_buffer_len(buf), 0);
+            assert_eq!(pith_byte_buffer_write_word(buf, word, 2), 1);
+            assert_eq!(pith_byte_buffer_len(buf), 2);
+            pith_byte_buffer_free(buf);
         }
     }
 

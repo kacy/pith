@@ -8,7 +8,7 @@ fn main() -> String!:
     print(reader.read_bytes(2)!.to_string_utf8()!)
     print("[" + reader.read_bytes(2)!.to_string_utf8()! + "]")
 
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered_chunked(3)
     print(writer.write_bytes(bytes.from_string_utf8("ab"))!.to_string())
     print(writer.write_bytes(bytes.from_string_utf8("cdef"))!.to_string())
@@ -17,7 +17,7 @@ fn main() -> String!:
 
     # write_all_and_flush sends straight through with nothing buffered, and
     # keeps the order with something buffered ahead of it.
-    through_sink := bytes.buffer()
+    through_sink := io.memory_writer()
     through := through_sink.buffered_chunked(64)
     print(through.write_all_and_flush(bytes.from_string_utf8("head"))!.to_string())
     print(through.write_bytes(bytes.from_string_utf8("+"))!.to_string())

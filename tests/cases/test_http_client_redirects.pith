@@ -4,6 +4,7 @@
 # redirect leaves the host.
 
 import std.net.http as http
+import std.io as io
 import std.bytes as bytes
 
 fn choose_port(start: Int) -> Int!:
@@ -95,10 +96,9 @@ fn main() -> String!:
     elsewhere := http.new_request("GET", base + "/elsewhere")!.basic_auth("user", "secret").cookie("session", "s1")
     print("another host, credentials dropped: " + show(c.send(elsewhere)))
 
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered_chunked(64)
     streamed := c.send_into(http.new_request("GET", base + "/status/302")!, writer)!
     print("send_into through a redirect: {streamed.status} {sink.bytes().to_string_utf8()!}")
     writer.free()
-    sink.free()
     return ""

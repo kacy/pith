@@ -83,6 +83,11 @@ struct HttpRequest:
 type UserId = Int
 ```
 
+a field without `pub` belongs to its module: code in another module can't
+read it, assign it, or set it in a constructor (E251). leave a field private
+when its value has to stay consistent with the rest of the struct, such as a
+handle the struct owns.
+
 ## organization
 
 group related declarations and separate the groups with a blank line.

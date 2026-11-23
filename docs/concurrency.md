@@ -212,6 +212,12 @@ module global collection passed to `spawn` or sent is refused as well, since
 the program still holds it: a task reads the global directly. writing a
 global from several tasks is covered by the sharing rule (E309).
 
+`std.bytes.ByteBuffer` and `ByteArray` count as collections here, although
+their handle is an `Int`. neither can become an interface value, which would
+hide the buffer from these checks (E248); `io.memory_writer()` is the
+in-memory `BytesWriter` that several tasks may share, since its bytes sit
+behind a lock.
+
 a spawn evaluates its arguments on the new task. so `spawn total(copy_list(xs))`
 copies `xs` there, while this task may still be pushing to it, and it is
 refused unless the scope does not use `xs` again. make the copy first and
@@ -321,7 +327,16 @@ only read needs no lock.
 a value read inside `locked` stays there: storing a guarded collection in
 a variable declared outside the block, returning it, or capturing it in a
 closure is refused (E276), since the handle would reach the buffer after the
-unlock. so is a guarded struct with a counted field that some code reassigns.
+unlock. so is storing it into a container that outlives the block: a push,
+an insert or a field store into a list, map or struct declared outside the
+block, a parameter or a global, whether the value is stored whole or inside
+a tuple, a struct or an optional. a call is judged by what its callee does,
+followed through generic functions and interface methods: passing the value
+to a function that stores it into another argument outliving the block, or
+lets it escape, is refused, and so is passing it to a function value, which
+may keep it. a call that only reads its argument (`len`, a loop over it,
+indexing, a function that keeps nothing) stays allowed. so is a guarded
+struct with a counted field that some code reassigns.
 a name bound inside the block to a guarded value counts as the guarded value
 for the rest of the block: a local (`list := self.idle[key]`), a loop
 variable over it, an `if let` binding of it, the result of `get` or `unwrap`

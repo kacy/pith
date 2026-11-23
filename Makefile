@@ -1417,6 +1417,7 @@ MEMCHECK_OSTHREAD_CASES := \
 
 MEMCHECK_CASES := \
 	tests/cases/test_drop_hook \
+	tests/cases/test_byte_buffer_ownership \
 	tests/cases/test_drop_lend \
 	tests/cases/test_drop_generic \
 	tests/cases/test_result_box_shared_release \

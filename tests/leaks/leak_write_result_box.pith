@@ -8,22 +8,23 @@
 # result handed to a function.
 import leakprobe as probe
 import std.bytes as bytes
+from std.bytes import ByteBuffer
 
 fn counted(r: Int!) -> Int:
     if r.is_ok:
         return r.ok
     return r.err.len()
 
-fn through_try(buf: Int, h: Int, data: Bytes) -> Int!:
-    return byte_buffer_write(buf, data)! + file_write(h, "ab")! + file_write_bytes(h, data)!
+fn through_try(buf: ByteBuffer, h: Int, data: Bytes) -> Int!:
+    return buf.write(data)! + file_write(h, "ab")! + file_write_bytes(h, data)!
 
-fn churn_round(buf: Int, sink: Int, closed: Int, data: Bytes, empty: Bytes) -> Int:
+fn churn_round(buf: ByteBuffer, sink: Int, closed: Int, data: Bytes, empty: Bytes) -> Int:
     mut acc := 0
     # success, a bound result read by field
-    r := byte_buffer_write(buf, data)
+    r := buf.write(data)
     if r.is_ok:
         acc = acc + r.ok
-    s := byte_buffer_write_string_utf8(buf, "")
+    s := buf.write_string_utf8("")
     acc = acc + s.ok
     # success and failure through `!`
     acc = acc + (through_try(buf, sink, empty) catch 0)
@@ -31,19 +32,19 @@ fn churn_round(buf: Int, sink: Int, closed: Int, data: Bytes, empty: Bytes) -> I
     # catch on either path
     acc = acc + (file_write(sink, "xyz") catch 0)
     acc = acc + (file_write(closed, "xyz") catch 0)
-    acc = acc + (byte_buffer_write(0, data) catch 0)
+    acc = acc + (file_write_bytes(closed, data) catch 0)
     # a discarded statement
     file_write_bytes(sink, data)
-    byte_buffer_write_string_utf8(0, "x")
+    file_write(closed, "x")
     # handed to a function, the failure's message read there
     acc = acc + counted(file_write(closed, ""))
-    acc = acc + counted(byte_buffer_write_string_utf8(buf, "pq"))
-    byte_buffer_clear(buf)
+    acc = acc + counted(buf.write_string_utf8("pq"))
+    buf.clear()
     return acc
 
 fn main():
     n := probe.rounds()
-    buf := byte_buffer_new()
+    buf := bytes.buffer()
     sink := file_open_write("/dev/null") catch -1
     closed := file_open_write("/dev/null") catch -1
     file_close(closed)
@@ -57,6 +58,5 @@ fn main():
     if acc < 0:
         print("unreachable")
     file_close(sink)
-    byte_buffer_free(buf)
     kb := probe.peak_kb()
     print("{kb}")

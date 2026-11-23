@@ -124,7 +124,7 @@ per-value destructor could never have helped here, because there is no value.
 | `concurrent.Ticker` | `stop()` | the ticker worker task runs for the life of the process | safe |
 | `concurrent.Group` | `wait()` or `cancel()` | the tasks and the semaphore stay outstanding | not re-entrant |
 | `concurrent.CancelToken` | `cancel()` | the parent and deadline watcher tasks and the done channel stay live | safe |
-| `bytes.ByteBuffer` | `free()`, or `take_bytes()` which consumes it | a heap allocation with no refcount behind it | safe |
+| `bytes.ByteBuffer` | its destructor; `free()` and `take_bytes()` empty it early | nothing: the destructor frees it | safe |
 | `protobuf.Writer` | `free()` | the wrapped byte buffer | safe |
 | `crypto.ecdh.X25519KeyPair` | `close()` | the boxed private key and its registry entry | safe |
 | `json` / `toml` / `yaml` scopes | `close_scope(scope)` | every node parsed in the scope stays in the threadlocal node pool for the life of the task | safe |
@@ -421,8 +421,9 @@ reset only when the send queue has room); `postgres.Conn`, `mysql.Conn`, `redis.
 `std.db`'s `Tx` and `Stmt`, which own their pin, and `Db`, which holds its
 pool (the module-global pool and pin registries are gone). io registry handles
 come from one process-wide counter, so a drop on another task finds nothing.
-still by hand: `ByteBuffer`, whose destructor waits on the count checker
-telling an `Int` field store from a counted one; `http2.Client`, which its
+`ByteBuffer` frees its storage on drop: `take_bytes()` leaves an empty buffer
+behind instead of freeing it, so the destructor has nothing to record. still by
+hand: `http2.Client`, which its
 reader and writer tasks hold; `term.session.Terminal`, whose tasks hold it and
 whose close writes to the tty; and `TcpStream`, which is a view of a socket
 another value owns. the text below is the plan as it was written.
@@ -491,6 +492,6 @@ a generic struct is on the hook: each instance gets its own destructor,
 keyed by its field kinds and its specialized drop symbol, which calls the drop
 checked against that instance's type arguments. the checker walks a generic
 drop against every instance built and applies E318 after the first. what is
-left on the compiler side: the bounded leaks above, and refusing a struct
-literal with private fields outside its module, so a second value cannot be
-built over a live handle.
+left on the compiler side: the bounded leaks above. a struct literal that sets
+a private field outside its module is refused (E251), so a second value cannot
+be built over a live handle.

@@ -53,7 +53,7 @@ fn echo_trace(next: fn(HttpRequestBytes) -> HttpResponse, req: HttpRequestBytes)
 # serve one request through `handler` entirely in memory.
 fn exchange(handler: fn(HttpRequestBytes) -> HttpResponse, req: ClientRequest) -> HttpResponse!:
     request_reader := io.bytes_reader(req.to_bytes()!).buffered_chunked(64)
-    response_buffer := bytes.buffer()
+    response_buffer := io.memory_writer()
     http.serve_one(request_reader, response_buffer.buffered_chunked(64), handler)!
     return http.parse_response_bytes(response_buffer.bytes())!
 

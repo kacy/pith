@@ -1,0 +1,19 @@
+# a guarded collection inserted into a map declared outside the `locked`
+# block (E276)
+guard mu:
+    mut items: List[Int] := []
+
+fn pusher(n: Int) -> Int:
+    for i in 0..n:
+        locked mu:
+            items.push(i)
+    return n
+
+fn main() -> Int!:
+    a := spawn pusher(100)
+    mut saved: Map[String, List[Int]] := {}
+    locked mu:
+        saved.insert("items", items)
+    r := await a
+    print("{r} {saved["items"].len()}")
+    return 0

@@ -1138,9 +1138,8 @@ builder methods back to the constructor, so
 
 the constructor list is short on purpose. an entry has to be a call whose result
 the caller owns, on a type with no method that consumes the receiver instead of
-closing it — `bytes.ByteBuffer` is excluded for exactly that reason, since
-`take_bytes()` frees the buffer as it takes its contents. the survey behind the
-list is in [destructors_roadmap.md](destructors_roadmap.md).
+closing it, and a type with a destructor needs no entry at all. the survey
+behind the list is in [destructors_roadmap.md](destructors_roadmap.md).
 
 the message names the constructor and the closer to defer:
 
@@ -1459,6 +1458,28 @@ outside a guard block, is reached safely only while its mutex is held. inside
 `locked`, its value may not be stored in a variable declared outside the
 block, returned from the block, or captured by a closure made in the block:
 each keeps a handle to the buffer after the lock is released.
+
+it also may not be stored into a container that outlives the block. that is
+a list, map, set or struct reached through a local declared outside the
+block, a parameter, `self` or a global: `out.push(items)`, `m.insert(k,
+items)`, `box.f = items`, and the same with the value wrapped in a tuple, a
+struct or an optional. a call is judged by the callee's summary, which the
+sharing pass computes for each function over the whole program, so generic
+functions and interface methods are followed. passing a guarded
+value to a function that stores the parameter into another argument that
+outlives the block, or lets the parameter escape (into a global or code the
+checker cannot follow), is refused. so is passing it to a
+function value or a method on a type the checker cannot name, which may keep
+it. a call that only reads its argument keeps nothing and stays allowed:
+`len`, iteration, indexing, and a function that reads the list and returns a
+count.
+
+```
+error[E276]: this value holds the guarded global 'items', and 'keep' stores it in an argument that outlives the block, so the buffer is reached after the lock is released
+  22 |         keep(out, ident(items))
+                         ^
+  fix: copy what is needed inside the block
+```
 
 a name bound inside the block to a guarded value is guarded too, for the rest
 of the block: a local bound to it (`list := self.idle[key]`), a loop variable

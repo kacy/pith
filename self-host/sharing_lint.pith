@@ -2081,7 +2081,9 @@ fn source_of_guard(src: String, guard: String) -> Bool:
     return src.starts_with("t") and source_global_name(src) == guard
 
 fn describe_source(af: AliasFlow, src: String) -> String:
-    if src.starts_with("g") or src.starts_with("t") or src.starts_with("h"):
+    if src.starts_with("t"):
+        return "the guarded global '" + source_global_name(src) + "'"
+    if src.starts_with("g") or src.starts_with("h"):
         return "the module global '" + source_global_name(src) + "'"
     if src.starts_with("z"):
         return "the frozen field '" + slot_field_name(src) + "'"
@@ -2336,19 +2338,93 @@ fn judge_sinks(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, r
 # outside it, that holds a guarded buffer reaches it after the lock is
 # released (E276). the checker judges a path or a call that returns its
 # argument; this covers a value that holds the buffer some other way, such as
-# a struct a call builds around it or a local that took one.
+# a struct a call builds around it or a local that took one. it also covers a
+# value stored into a container that outlives the block (`out.push(v)`,
+# `m.insert(k, v)`, `box.f = v`), handed where the pass cannot follow it (a
+# call through a function value, or a method its type does not name), or
+# passed to a function whose summary keeps it: one that lets the parameter
+# escape, or stores it into another argument that outlives the block. a call
+# that only reads its argument keeps nothing, so it stays allowed.
 fn report_lock_leaks(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups):
     for ev in body.events:
-        mut how := ""
-        if ev.block >= 0 and ev.kind == "return":
-            how = "this returns it out of the block"
-        elif ev.block >= 0 and (ev.kind == "alias" or ev.kind == "part") and not inside_block(af, ev.block, ev.a):
-            how = "this stores it where it outlives the block"
-        if how != "" and guarded_segment(ev.b) == "" and node_may_share(af, ev.b):
-            guarded := guarded_source(af, st, g, alias_roots(af, st, ev.b))
-            if guarded != "":
-                node := get_node(ev.b)
-                af.out.push(Diagnostic("error", "E276", "this value holds " + describe_source(af, guarded) + ", and " + how + ", so the buffer is reached after the lock is released", af.files[body.module], node.line, node.col, "copy what is needed inside the block"))
+        if ev.block < 0:
+            continue
+        if ev.kind == "return":
+            report_lock_leak(af, body, st, g, ev.b, ev.block, "this returns it out of the block", true)
+        elif (ev.kind == "alias" or ev.kind == "part") and not inside_block(af, ev.block, ev.a):
+            report_lock_leak(af, body, st, g, ev.b, ev.block, "this stores it where it outlives the block", true)
+        elif ev.kind == "store" and outlives_block(af, st, g, alias_roots(af, st, ev.a), ev.block):
+            report_lock_leak(af, body, st, g, ev.b, ev.block, "this stores it in a container that outlives the block", false)
+        elif ev.kind == "escape":
+            report_lock_leak(af, body, st, g, ev.b, ev.block, "this hands it where the checker cannot follow it", false)
+        elif ev.kind == "call":
+            report_call_lock_leaks(af, body, st, g, ev)
+
+# a guarded value passed to a callee that keeps it past the call
+fn report_call_lock_leaks(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, ev: AliasEvent):
+    for t in af.targets[ev.a]:
+        if not af.summaries.contains_key(t):
+            continue
+        s := af.summaries[t]
+        name := get_node(t).value
+        for key in s.escaped:
+            arg := call_arg(af, ev.a, t, key)
+            if arg >= 0:
+                report_lock_leak(af, body, st, g, arg, ev.block, "'" + name + "' lets it escape", false)
+        for key in s.stores.keys():
+            container := call_arg(af, ev.a, t, key)
+            if container < 0 or is_guarded_arg(container, ev.block) or content_safe(af, container):
+                continue
+            if not outlives_block(af, st, g, alias_roots(af, st, container), ev.block):
+                continue
+            for src in s.stores[key]:
+                if is_param_source(src):
+                    value := call_arg(af, ev.a, t, src)
+                    if value >= 0:
+                        report_lock_leak(af, body, st, g, value, ev.block, "'" + name + "' stores it in an argument that outlives the block", false)
+
+# report a value that holds a guarded buffer and leaves the `locked` block
+# `block` as `how` says. the checker already judges a guarded path stored in
+# a variable or returned (`paths_judged`). a guarded path the block then
+# empties is a take, not an escape.
+fn report_lock_leak(af: AliasFlow, body: AliasBody, st: AliasSolve, g: AliasGroups, value: Int, block: Int, how: String, paths_judged: Bool):
+    path := guarded_segment(value) != ""
+    if (path and (paths_judged or block_replaces(block, value))) or not node_may_share(af, value):
+        return
+    guarded := guarded_source(af, st, g, alias_roots(af, st, value))
+    if guarded == "":
+        return
+    key := "E276:" + value.to_string()
+    if af.reported.contains_key(key):
+        return
+    af.reported.insert(key, true)
+    node := get_node(value)
+    af.out.push(Diagnostic("error", "E276", "this value holds " + describe_source(af, guarded) + ", and " + how + ", so the buffer is reached after the lock is released", af.files[body.module], node.line, node.col, "copy what is needed inside the block"))
+
+# whether a container reaches storage that outlives the `locked` block
+# `block`: a global, a guarded field, a value the pass cannot follow, or a
+# local whose group, or a group holding it, has a member declared outside
+# the block (a parameter and self count as declared outside)
+fn outlives_block(af: AliasFlow, st: AliasSolve, g: AliasGroups, r: Roots, block: Int) -> Bool:
+    if r.sources.len() > 0 or r.held_sources.len() > 0:
+        return true
+    mut groups: List[Int] := []
+    for l in r.locals:
+        push_local(groups, uf_find(st, l))
+    for l in r.held_locals:
+        push_local(groups, uf_find(st, l))
+    mut at := 0
+    while at < groups.len():
+        root := groups[at]
+        at = at + 1
+        if g.members.contains_key(root):
+            for m in g.members[root]:
+                if not inside_block(af, block, m):
+                    return true
+        for h, i in st.holders:
+            if uf_find(st, st.held[i]) == root:
+                push_local(groups, uf_find(st, h))
+    return false
 
 # the first guarded buffer a value holds, as a source, or ""
 fn guarded_source(af: AliasFlow, st: AliasSolve, g: AliasGroups, r: Roots) -> String:

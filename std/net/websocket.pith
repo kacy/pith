@@ -886,7 +886,7 @@ test "websocket receive rejects a message past the size cap":
     while total <= MAX_MESSAGE_BYTES:
         frames_buf.write(frame_bytes_with_fin(OP_CONTINUATION, chunk, false)!)!
         total = total + chunk.len()
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     # a client-side socket accepts unmasked server frames, so the test frames need no
     # masking.
     ws := from_buffered(io.bytes_reader(frames_buf.bytes()).buffered_chunked(4096), sink.buffered(), true)
@@ -899,7 +899,7 @@ test "websocket close_now closes the session":
     frame_data := text_frame_bytes("ping")!
     cursor := io.bytes_reader(frame_data)
     reader := cursor.buffered_chunked(64)
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered()
     ws := from_buffered(reader, writer, true)
     assert(not ws.is_closed())
@@ -913,12 +913,11 @@ test "websocket close_now closes the session":
     reader.free()
     writer.free()
     cursor.close()
-    sink.free()
 
 test "websocket close sends a close frame and closes":
     cursor := io.bytes_reader(bytes.empty())
     reader := cursor.buffered_chunked(64)
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered()
     ws := from_buffered(reader, writer, true)
     wrote := ws.close(1000, "bye")!
@@ -932,4 +931,3 @@ test "websocket close sends a close frame and closes":
     reader.free()
     writer.free()
     cursor.close()
-    sink.free()

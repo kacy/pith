@@ -1,0 +1,27 @@
+# a guarded collection wrapped in a tuple, a struct and an optional, each
+# stored into a list declared outside the `locked` block (E276)
+struct Holder:
+    xs: List[Int]
+
+guard mu:
+    mut items: List[Int] := []
+
+fn pusher(n: Int) -> Int:
+    for i in 0..n:
+        locked mu:
+            items.push(i)
+    return n
+
+fn main() -> Int!:
+    a := spawn pusher(100)
+    mut pairs: List[(Int, List[Int])] := []
+    mut holders: List[Holder] := []
+    mut maybe: List[List[Int]?] := []
+    locked mu:
+        pairs.push((1, items))
+        holders.push(Holder(xs: items))
+        found: List[Int]? := items
+        maybe.push(found)
+    r := await a
+    print("{r} {pairs.len()} {holders.len()} {maybe.len()}")
+    return 0

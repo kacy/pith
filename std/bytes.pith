@@ -14,16 +14,20 @@ fn byte_buffer_handle(capacity: Int) -> Int:
 pub struct Utf8DecodeError:
     pub message: String
 
-# growable byte buffer for incremental writes. free it with free(), or hand
-# its storage over with take_bytes(); it has no destructor (see
-# docs/ownership.md, "destructors").
+# growable byte buffer for incremental writes. the storage is freed when the
+# last value naming the buffer dies. free() and take_bytes() hand the contents
+# back early and leave an empty buffer that still works.
+#
+# the handle names runtime memory, so it stays private to this module: code
+# elsewhere can neither copy it into a second buffer nor make one up, and the
+# sharing checks treat both types as a buffer two tasks may not both reach.
 pub struct ByteBuffer:
-    pub handle: Int
+    handle: Int
 
 # packed mutable byte storage for algorithms that need in-place state. the
 # storage is freed when the last value naming the array dies.
 pub struct ByteArray:
-    pub handle: Int
+    handle: Int
 
 EMPTY_BYTES := bytes_from_string_utf8("")
 
@@ -158,9 +162,12 @@ impl ByteBuffer:
     fn write(data: Bytes) -> Int!:
         return byte_buffer_write(self.handle, data)
 
+    # release the contents now instead of when the buffer dies. the buffer
+    # stays usable and starts out empty again.
     fn free():
-        byte_buffer_free(self.handle)
+        byte_buffer_take_bytes(self.handle)
 
+    # move the contents out as bytes, leaving the buffer empty.
     fn take_bytes() -> Bytes:
         return byte_buffer_take_bytes(self.handle)
 
@@ -176,6 +183,11 @@ impl ByteBuffer:
 
     fn bytes() -> Bytes:
         return byte_buffer_bytes(self.handle)
+
+    # the contents as a string, copied verbatim: nothing is decoded, so bytes
+    # that are not valid utf-8 come through as written.
+    fn string() -> String:
+        return byte_buffer_string(self.handle)
 
     fn len() -> Int:
         return byte_buffer_len(self.handle)
@@ -231,6 +243,10 @@ impl ByteArray:
 
     fn clear():
         byte_buffer_clear(self.handle)
+
+impl Drop for ByteBuffer:
+    fn drop():
+        byte_buffer_free(self.handle)
 
 # an array has no free() of its own: its storage goes when its last value dies.
 impl Drop for ByteArray:

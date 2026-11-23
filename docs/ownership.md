@@ -801,15 +801,11 @@ address, so the runtime cannot tell a second close from a close of the new
 key. the pair records the close in the value itself (its handle goes to -1),
 so the destructor after a close finds nothing to free.
 
-`std.bytes.ByteBuffer` would need the same record and has no destructor
-yet. `take_bytes()` hands its storage over and frees the box, so the buffer
-has to remember that it is spent, and writing that down is a field store in
-`free()`. the count checker (`count-marks-check-only`) cannot tell a store
-to an `Int` field from one that drops a counted value, so every list loop
-that can reach `free()` would fail its borrow check. the buffer can take a
-destructor once the checker can tell the two apart, or once `take_bytes()`
-leaves an empty box behind for the destructor to free. a `ByteArray` has
-no `take_bytes()` and does free its storage on drop.
+`std.bytes.ByteBuffer` needs no such record. `free()` and `take_bytes()`
+empty the buffer and leave it usable, and only its destructor frees the
+storage. a `ByteArray` frees its storage on drop as well. both keep their
+handle in a private field, and the `byte_buffer_*` builtins are callable only
+from `std.bytes`, so no copy or made-up number can reach the memory (E251).
 
 the io readers, writers and buffers, files, processes, byte arrays, ecdh
 key pairs and websocket sessions implement `Drop`; docs/io_foundation.md

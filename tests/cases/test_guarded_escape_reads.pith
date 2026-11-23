@@ -1,0 +1,59 @@
+# inside `locked`, a guarded collection may not reach a container that
+# outlives the block (E276). these are the uses that stay allowed: reading it,
+# passing it to a function or an interface method that only reads it, storing
+# it into a container made inside the block, storing a copy or a plain
+# element outside, and taking it out of the guard.
+interface Measure:
+    fn size(xs: List[Int]) -> Int
+
+struct Counter:
+    seen: Int
+
+impl Measure for Counter:
+    fn size(xs: List[Int]) -> Int:
+        self.seen = self.seen + 1
+        return xs.len()
+
+guard mu:
+    mut items: List[Int] := []
+    mut batches: List[List[Int]] := []
+
+fn total(xs: List[Int]) -> Int:
+    mut t := 0
+    for x in xs:
+        t = t + x
+    return t
+
+fn ident[T](x: T) -> T:
+    return x
+
+fn pusher(n: Int) -> Int:
+    for i in 0..n:
+        locked mu:
+            items.push(i)
+    return n
+
+fn main() -> Int!:
+    a := spawn pusher(100)
+    r := await a
+    m: Measure := Counter(seen: 0)
+    mut copies: List[List[Int]] := []
+    mut firsts: List[Int] := []
+    mut sums: Map[String, Int] := {}
+    mut taken: List[List[List[Int]]] := []
+    mut n := 0
+    locked mu:
+        n = items.len() + total(items) + m.size(items)
+        for x in items:
+            n = n + x
+        firsts.push(items[0])
+        sums.insert("total", total(ident(items)))
+        local: List[List[Int]] := []
+        local.push(items)
+        n = n + local.len()
+        copies.push(items.slice(0, items.len()))
+        batches.push([1, 2])
+        taken.push(batches)
+        batches = []
+    print("{r} {n} {firsts[0]} {sums["total"]} {copies[0].len()} {taken[0].len()}")
+    return 0

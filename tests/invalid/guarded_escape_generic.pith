@@ -1,0 +1,25 @@
+# a guarded collection passed through a generic function that returns it, and
+# then to a generic function that stores it in its other argument (E276)
+guard mu:
+    mut items: List[Int] := []
+
+fn ident[T](x: T) -> T:
+    return x
+
+fn keep[T](out: List[T], x: T):
+    out.push(x)
+
+fn pusher(n: Int) -> Int:
+    for i in 0..n:
+        locked mu:
+            items.push(i)
+    return n
+
+fn main() -> Int!:
+    a := spawn pusher(100)
+    out: List[List[Int]] := []
+    locked mu:
+        keep(out, ident(items))
+    r := await a
+    print("{r} {out[0].len()}")
+    return 0

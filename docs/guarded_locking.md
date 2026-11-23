@@ -551,6 +551,17 @@ build settled a question this page left open, or departed from it:
   nested. a module global is followed through the whole call chain; a
   struct's mutex is matched when a method on the same receiver locks that
   field on `self`.
+- **escape through a container or a call.** E276 saw a guarded collection
+  assigned, returned or captured, but not one pushed into a list declared
+  outside the block, inserted into a map, or handed to a function that
+  stores it. a reader of that list then raced the writers under the lock.
+  the sharing pass now refuses a guarded value stored into a container that
+  outlives the block, a value handed where it cannot be followed, and an
+  argument whose callee's summary lets it escape or stores it into another
+  argument that outlives the block. the summaries are the ones E248 already
+  computes over the whole program, so generic functions and interface methods
+  are followed, and a call that only reads its argument stays allowed. std,
+  the examples and the compiler check clean.
 
 ## open questions
 

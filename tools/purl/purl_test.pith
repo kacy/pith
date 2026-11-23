@@ -278,3 +278,10 @@ test "purl_auth computes MD5, HTTP Digest, AWS SigV4, and parses netrc + cookie 
     assert(p.specs[0].netrc)
     assert(p.specs[0].use_digest)
     assert_eq(p.specs[0].max_filesize, 4096)
+
+    ps1 := parse_tokens_standalone(["--socks5", "127.0.0.1:1080", "http://a/"])
+    assert_eq(ps1.error_msg, "")
+    assert_eq(ps1.specs[0].proxy, "socks5://127.0.0.1:1080")
+    ps2 := parse_tokens_standalone(["--socks5-hostname", "127.0.0.1:1080", "http://a/"])
+    assert_eq(ps2.error_msg, "")
+    assert_eq(ps2.specs[0].proxy, "socks5h://127.0.0.1:1080")

@@ -33,7 +33,7 @@ Then add an alias to your shell rc file:
   alias curl purl
   ```
 
-Whenever you hit a protocol or flag `purl` doesn't support yet (e.g. SFTP, SOCKS5, HTTP/3, `--unix-socket`), bypass the alias for one command with `\curl ...` or `command curl ...`.
+Whenever you hit a protocol or flag `purl` doesn't support yet (e.g. SFTP, HTTP/3, `--unix-socket`), bypass the alias for one command with `\curl ...` or `command curl ...`.
 
 Default flags can live in `~/.purlrc` (using standard curl config syntax); pass `-q` / `--disable` as the first argument to skip it.
 
@@ -97,7 +97,7 @@ purl -o a.json https://api.example.com/a --next -X POST -d "k=v" https://api.exa
 | Area | Options |
 |---|---|
 | **Protocols** | `http://`, `https://`, `file://`, schemeless URLs (`--proto-default`, default `http`), embedded `user:pass@host`, bracketed IPv6 (`[::1]:8080`) |
-| **HTTP versions** | `--http1.1` (default), `--http2` (ALPN `h2` over TLS with HTTP/1.1 fallback), `--http2-prior-knowledge` (`h2c`) |
+| **HTTP versions** | `--http1.1` (default), `--http2` (single-handshake ALPN `h2` over TLS with HTTP/1.1 fallback), `--http2-prior-knowledge` (`h2c`) |
 | **Methods & bodies** | `-X`/`--request`, `-I`/`--head`, `-G`/`--get`, `-d`/`--data`/`--data-ascii` (`@file`, `@-`), `--data-raw`, `--data-binary`, `--data-urlencode` (all 5 forms), `--json`, `-F`/`--form` (`@file`, `<file`, `;filename=`, `;type=`), `--form-string`, `-T`/`--upload-file` (`-` for stdin, trailing-slash basename append) |
 | **Headers & auth** | `-H`/`--header` (`Name: Value`, `Name:` removal, `Name;` empty value, `@file`), `-A`/`--user-agent`, `-e`/`--referer` (`;auto`), `-u`/`--user`, `--oauth2-bearer`, `-n`/`--netrc`, `--netrc-optional`, `--netrc-file`, `--digest` (RFC 7616 MD5 & SHA-256), `--aws-sigv4` (HMAC-SHA256 request signing), `-U`/`--proxy-user` (plain HTTP proxy) |
 | **Cookies** | `-b`/`--cookie` (inline `k=v` or Netscape jar file), `-c`/`--cookie-jar` (including `-` for stdout), in-memory `Set-Cookie` handling (`Domain`, `Path`, `Max-Age`, RFC 1123 / RFC 850 `Expires`, `Secure`, `HttpOnly`) across redirects |
@@ -107,9 +107,9 @@ purl -o a.json https://api.example.com/a --next -X POST -d "k=v" https://api.exa
 | **URL globbing & parallel** | `{a,b,c}` sets, `[1-10]` / `[01-05]` / `[a-z]` / `[1-10:2]` ranges, `#1`/`#2` output substitutions, IPv6 `[::1]` preservation, `-g`/`--globoff`, `-Z`/`--parallel`, `--parallel-max` (default 50), `--parallel-immediate` (using Pith `spawn` + `Semaphore`) |
 | **DNS & routing overrides** | `--resolve <host:port:addr>` and `--connect-to <h1:p1:h2:p2>` (preserving `Host` header and TLS SNI), DNS lookup resolution via `std.net.dns` |
 | **Compression** | `--compressed` (`gzip`, `deflate` zlib + raw RFC 1951, `zstd`), `--raw` |
-| **TLS** | TLS 1.3 and TLS 1.2 via `std.net.tls`: `-k`/`--insecure`, `--cacert`, `--cert` + `--key` (mTLS, PKCS#8 PEM), `--tlsv1.2`, `--tlsv1.3`, `--tls-max` |
+| **TLS** | TLS 1.3 and TLS 1.2 via `std.net.tls`: `-k`/`--insecure`, `--cacert`, `--cert` + `--key` (mTLS, PKCS#8 / PKCS#1 RSA / SEC1 EC PEM), `--tlsv1.2`, `--tlsv1.3`, `--tls-max` |
 | **Timeouts & retries** | `-m`/`--max-time`, `--connect-timeout`, `--expect100-timeout`, `--retry`, `--retry-delay`, `--retry-max-time`, `--retry-all-errors`, `--retry-connrefused`, numeric `Retry-After` support |
-| **Proxies** | `-x`/`--proxy`, `--noproxy`, `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` (and lowercase variants), HTTPS `CONNECT` tunnels via `std.net.http.Client` |
+| **Proxies** | `-x`/`--proxy` (`http://`, `socks5://`, `socks5h://`), `--socks5`, `--socks5-hostname`, `-U`/`--proxy-user`, `--noproxy`, `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` / `NO_PROXY`, HTTPS `CONNECT` tunnels via `std.net.http.Client`, SOCKS5 (RFC 1928/1929) via `std.net.socks5` |
 | **Diagnostics & scripting** | `-v`/`--verbose` (including resolved IP, TLS version, cipher, ALPN, and peer cert info), `-s`/`--silent`, `-S`/`--show-error`, `-f`/`--fail`, `--fail-with-body`, `-w`/`--write-out` (`@file`, `\n`, `\r`, `\t`, `%%`, `%{http_code}`, `%{response_code}`, `%{content_type}`, `%{size_download}`, `%{size_upload}`, `%{size_header}`, `%{size_request}`, `%{time_namelookup}`, `%{time_total}`, `%{time_starttransfer}`, `%{speed_download}`, `%{url_effective}`, `%{redirect_url}`, `%{num_redirects}`, `%{http_version}`, `%{scheme}`, `%{remote_ip}`, `%{remote_port}`, `%{filename_effective}`, `%{exitcode}`, `%{errormsg}`, `%{onerror}`, `%{json}`, `%header{name}`) |
 | **CLI ergonomics** | Combined short flags (`-fsSL`, `-iL`, `-svk`), attached short values (`-XPOST`, `-oout`), `--opt=val`, `--no-<flag>` negations, `--` separator, `-K`/`--config` (and `-K -`), `~/.purlrc` + `-q`/`--disable`, `--next`/`-:`, `--url`, `--request-target`, `--no-keepalive`, `-h`/`--help`, `-V`/`--version` |
 
@@ -118,8 +118,7 @@ purl -o a.json https://api.example.com/a --next -X POST -d "k=v" https://api.exa
 - **HTTP/2 default & proxies:** Unlike modern `curl`, `purl` defaults to HTTP/1.1 unless `--http2` or `--http2-prior-knowledge` is passed. When an HTTP proxy (`-x` or env proxy) is active, `--http2` routes over HTTP/1.1 so `std.net.http.Client`'s proxy / `CONNECT` path is used.
 - **Direct disk streaming:** `-o` / `-O` streams response bodies directly to disk without buffering in RAM for direct HTTP/1.1 and HTTPS transfers. Transfers combining `--compressed`, `-L`, `-i`, `-J`, `--digest`, `-C`, or HTTP/2 still buffer in memory before writing.
 - **Duplicate headers (HTTP/1.1):** `std.net.http` stores request and response headers (other than `Set-Cookie`) in a `Map[String, String]`, so sending or receiving multiple headers with the same name collapses to one value on HTTP/1.1.
-- **Client certificates (`--cert` / `--key`):** `std.net.tls` accepts PKCS#8 PEM private keys (`-----BEGIN PRIVATE KEY-----`) without passphrases. PKCS#1 (`RSA PRIVATE KEY`), encrypted keys, and PKCS#12/DER bundles are not supported.
-- **Proxy authentication (`-U` / `--proxy-user`):** Sends `Proxy-Authorization` on plain HTTP proxy requests; HTTPS `CONNECT` tunnel authentication is not yet supported by `std.net.http`.
+- **Client certificates (`--cert` / `--key`):** `std.net.tls` accepts unencrypted PKCS#8 (`PRIVATE KEY`), PKCS#1 (`RSA PRIVATE KEY`), and SEC1 (`EC PRIVATE KEY`) PEM private keys. Encrypted keys and PKCS#12/DER bundles are not supported.
 - **Progress meter:** Interactive progress bars are omitted (`-#` / `--progress-bar` and `--no-progress-meter` are accepted as no-ops so scripts work unchanged).
 - **Script-compat no-op flags:** `-N`/`--no-buffer`, `-4`/`--ipv4`, `--tcp-nodelay`, `-0`/`--http1.0`, `--anyauth`, `--basic` are accepted without failing.
 
@@ -127,7 +126,7 @@ purl -o a.json https://api.example.com/a --next -X POST -d "k=v" https://api.exa
 
 - **Other protocols:** FTP, FTPS, SFTP, SCP, SMTP, IMAP, POP3, LDAP, TFTP, Telnet, Gopher, Dict, SMB, MQTT. (Passing an unsupported scheme exits with curl code `1`.)
 - **HTTP/3 (QUIC):** `--http3` / `--http3-only`.
-- **SOCKS proxies:** `--socks4`, `--socks5`, `--socks5-hostname`, and `socks5://` proxy URLs.
+- **SOCKS4 proxies:** `--socks4` (`--socks5`, `--socks5-hostname`, `socks5://`, and `socks5h://` are supported).
 - **Enterprise HTTP auth:** `--ntlm`, `--negotiate` (Kerberos / SPNEGO).
 - **Low-level socket / DNS controls:** `--unix-socket` (Pith runtime has no `AF_UNIX` socket primitives yet), `--interface`, `--dns-servers`, `--doh-url`, `-6`/`--ipv6` forcing.
 - **Brotli (`br`) compression:** `--compressed` supports `gzip`, `deflate`, and `zstd`; `Content-Encoding: br` fails with exit code `61`.

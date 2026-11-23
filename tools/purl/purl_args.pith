@@ -625,8 +625,20 @@ fn apply_option(st: ParseState, name: String, value: String, has_value: Bool) ->
         fail "option --{name}: TLS versions older than 1.2 are not supported (use --tlsv1.2 or --tlsv1.3)"
     if name == "http3" or name == "http3-only":
         fail "option --{name}: HTTP/3 (QUIC) is not supported yet"
-    if name == "socks4" or name == "socks5" or name == "socks5-hostname":
-        fail "option --{name}: SOCKS proxies are not supported yet (use an HTTP proxy with -x)"
+    if name == "socks4":
+        fail "option --socks4: SOCKS4 proxies are not supported yet (use --socks5 or --socks5-hostname)"
+    if name == "socks5":
+        if value.contains("://"):
+            cur.proxy = value
+        else:
+            cur.proxy = "socks5://" + value
+        return 0
+    if name == "socks5-hostname":
+        if value.contains("://"):
+            cur.proxy = value
+        else:
+            cur.proxy = "socks5h://" + value
+        return 0
     if name == "retry":
         n := parse_int(value) catch -1
         if n < 0:

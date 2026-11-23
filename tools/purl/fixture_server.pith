@@ -7,19 +7,19 @@
 #   fixture_server h2c <port> <max_conns>
 #   fixture_server h2 <port> <max_conns> <cert> <key>
 #   fixture_server proxy <port> <max_conns>
+#   fixture_server socks5 <port> <max_conns> [user] [pass]
+#   fixture_server unix <socket_path> <max_conns>
 
-import std.net.http2.frames as h2frames
-import std.net.http2.hpack as h2hpack
-import std.net.http2.connection as h2conn
-import std.net.http2.server as h2server
 import std.bytes as bytes
 import std.compress.gzip as gzip
 import std.compress.zlib as zlib
 import std.compress.zstd as zstd
-import std.json as json
 import std.io as io
+import std.json as json
 import std.net.http as http
+import std.net.http2.server as h2server
 import std.net.tls as tls
+import std.net.unix as unix
 import std.time as time
 from std.io import TcpStream
 from std.net.http import HttpRequestBytes, HttpResponse
@@ -185,6 +185,13 @@ fn route(req: HttpRequestBytes) -> HttpResponse:
     if path == "/cookie-set":
         return http.text(200, "cookies-set").set_cookie(http.cookie("session", "xyz99").path("/").http_only()).set_cookie(http.cookie("prefs", "compact").path("/"))
 
+    if path == "/multi-headers":
+        vals := req.header_values("X-Multi").join("|")
+        mut resp := http.text(200, vals)
+        resp = resp.add_header("X-Resp-Multi", "one").add_header("X-Resp-Multi", "two")
+        resp = resp.add_header("Link", "</a.css>; rel=preload").add_header("Link", "</b.js>; rel=preload")
+        return resp
+
     return http.not_found_response()
 
 fn proxy_route(req: HttpRequestBytes) -> HttpResponse:
@@ -331,11 +338,25 @@ fn serve_http_conn(fd: Int, wg: WaitGroup) -> Int:
 fn main() -> Int!:
     argv := args()
     if argv.len() < 4:
-        print_err("usage: fixture_server <http|tls|h2c|h2|proxy|socks5> <port> <max_conns> [cert] [key] [client_ca]")
+        print_err("usage: fixture_server <http|tls|h2c|h2|proxy|socks5|unix> <port|sock> <max_conns> [cert] [key] [client_ca]")
         return 2
     mode := argv[1]
     port := parse_int(argv[2]) catch 18900
     max_conns := parse_int(argv[3]) catch 20
+
+    if mode == "unix":
+        sock_path := argv[2]
+        listener := unix.listen(sock_path)!
+        defer listener.close()
+        wg := WaitGroup()
+        mut served := 0
+        while served < max_conns:
+            client := listener.accept_fd()!
+            wg.add(1)
+            spawn serve_http_conn(client, wg)
+            served = served + 1
+        wg.wait()
+        return 0
 
     if mode == "http":
         fd := tcp_listen("127.0.0.1", port)!

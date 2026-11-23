@@ -95,6 +95,7 @@ pub struct RequestSpec:
     pub mut etag_compare: String
     pub mut time_cond: String
     pub mut max_filesize: Int
+    pub mut unix_socket: String
     pub mut opt_tokens: List[String]
 
 # Top-level result of parsing argv (plus any -K config files).
@@ -119,7 +120,7 @@ pub fn default_spec() -> RequestSpec:
     resolves: List[String] := []
     connect_tos: List[String] := []
     opt_tokens: List[String] := []
-    return RequestSpec(urls, "", false, false, headers, data_parts, false, forms, "", "", "", "", false, "", cookies_inline, cookie_files, "", "", "", false, false, 50, false, false, false, outputs, false, false, false, "", false, false, "", false, false, false, false, false, "", false, false, "", "", "", "", "1.1", 0, 0, "", "", "", 0, 0, 0, false, false, "http", "", false, false, 1000, false, false, false, "", false, "", resolves, connect_tos, "", "", "", 0, opt_tokens)
+    return RequestSpec(urls, "", false, false, headers, data_parts, false, forms, "", "", "", "", false, "", cookies_inline, cookie_files, "", "", "", false, false, 50, false, false, false, outputs, false, false, false, "", false, false, "", false, false, false, false, false, "", false, false, "", "", "", "", "1.1", 0, 0, "", "", "", 0, 0, 0, false, false, "http", "", false, false, 1000, false, false, false, "", false, "", resolves, connect_tos, "", "", "", 0, "", opt_tokens)
 
 # Parse a byte size string with optional k/m/g suffix (e.g. "1024", "10k", "5M") into bytes.
 pub fn parse_byte_size(raw: String) -> Int!:
@@ -266,7 +267,7 @@ fn long_takes_value(name: String) -> Bool:
         return true
     if name == "url" or name == "config" or name == "expect100-timeout" or name == "socks4" or name == "socks5" or name == "socks5-hostname":
         return true
-    if name == "parallel-max" or name == "netrc-file" or name == "aws-sigv4" or name == "resolve" or name == "connect-to" or name == "etag-save" or name == "etag-compare" or name == "time-cond" or name == "max-filesize":
+    if name == "parallel-max" or name == "netrc-file" or name == "aws-sigv4" or name == "resolve" or name == "connect-to" or name == "etag-save" or name == "etag-compare" or name == "time-cond" or name == "max-filesize" or name == "unix-socket":
         return true
     return false
 
@@ -638,6 +639,9 @@ fn apply_option(st: ParseState, name: String, value: String, has_value: Bool) ->
             cur.proxy = value
         else:
             cur.proxy = "socks5h://" + value
+        return 0
+    if name == "unix-socket":
+        cur.unix_socket = value
         return 0
     if name == "retry":
         n := parse_int(value) catch -1

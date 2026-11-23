@@ -1,17 +1,13 @@
 # purl_client — HTTP/1.1, HTTPS, HTTP/2, and file:// transfer engine for purl.
 #
 # Built directly on Pith's standard library: std.net.http (Client, connection
-# pooling, streaming send_to_file, proxies, multipart, timeouts, response body
-# caps), std.net.http2.connection (native h2 and h2c with single-handshake ALPN
-# fallback), std.net.socks5 (RFC 1928/1929 SOCKS5), std.net.tls (TLS 1.2/1.3,
-# custom CAs, mTLS, verify hooks), std.net.dns, std.compress.{gzip,zlib,inflate,zstd},
+# pooling, multi-value headers, streaming send_to_file, proxies, multipart,
+# timeouts, response body caps), std.net.http2.connection (native h2 and h2c
+# with single-handshake ALPN fallback), std.net.socks5 (RFC 1928/1929 SOCKS5),
+# std.net.unix (AF_UNIX domain sockets), std.net.tls (TLS 1.2/1.3, custom CAs,
+# mTLS, verify hooks), std.net.dns, std.compress.{gzip,zlib,inflate,zstd},
 # std.io, std.fs, std.os, std.time, and Pith's green-thread concurrency (spawn/Semaphore).
 
-# Import http2 codec modules before std.net.http / std.net.tls so std.binary
-# keeps a single type identity in the self-hosted checker.
-import std.net.http2.frames as h2frames
-import std.net.http2.hpack as h2hpack
-import std.net.http2.connection as h2conn
 import std.bytes as bytes
 import std.compress.gzip as gzip
 import std.compress.inflate as inflate
@@ -22,8 +18,11 @@ import std.fs as fs
 import std.io as io
 import std.net.dns as dns
 import std.net.http as http
+import std.net.http2.connection as h2conn
+import std.net.http2.hpack as h2hpack
 import std.net.socks5 as socks5
 import std.net.tls as tls
+import std.net.unix as unix
 import std.os as os
 import std.os.path as path_mod
 import std.time as time
@@ -136,67 +135,108 @@ fn log_verbose_response(resp: HopResponse):
     write_stderr_line("< ")
 
 # Emit verbose request line and headers ("> ...") to stderr.
-fn log_verbose_request(method: String, target: String, proto: String, host_hdr: String, headers: Map[String, String], body_len: Int):
+fn log_verbose_request(method: String, target: String, proto: String, host_hdr: String, headers: List[http.HeaderField], body_len: Int):
     write_stderr_line("> {method} {target} {proto}")
     if not has_header_ci(headers, "Host"):
         write_stderr_line("> Host: {host_hdr}")
-    for k in headers:
-        write_stderr_line("> {k}: {headers[k]}")
+    for h in headers:
+        write_stderr_line("> {h.name}: {h.value}")
     if body_len > 0 and not has_header_ci(headers, "Content-Length") and not has_header_ci(headers, "Transfer-Encoding"):
         write_stderr_line("> Content-Length: {body_len}")
     write_stderr_line("> ")
 
-# Case-insensitive key check on a header map.
-fn has_header_ci(headers: Map[String, String], name: String) -> Bool:
+# Case-insensitive key check on an ordered header list.
+fn has_header_ci(headers: List[http.HeaderField], name: String) -> Bool:
     want := name.to_lower()
-    for k in headers:
-        if k.to_lower() == want:
+    for h in headers:
+        if h.name.to_lower() == want:
             return true
     return false
 
-# Case-insensitive lookup on a header map.
-fn get_header_ci(headers: Map[String, String], name: String) -> String:
+# Case-insensitive lookup on an ordered header list (returns last matching value).
+fn get_header_ci(headers: List[http.HeaderField], name: String) -> String:
+    want := name.to_lower()
+    mut found := ""
+    for h in headers:
+        if h.name.to_lower() == want:
+            found = h.value
+    return found
+
+# Case-insensitive lookup on a header map (used for stdlib multipart Content-Type).
+fn get_header_map_ci(headers: Map[String, String], name: String) -> String:
     want := name.to_lower()
     for k in headers:
         if k.to_lower() == want:
             return headers[k]
     return ""
 
-# Case-insensitive remove on a header map.
-fn remove_header_ci(headers: Map[String, String], name: String):
+# Return `headers` without any entries matching `name` (case-insensitive).
+fn remove_header_ci(headers: List[http.HeaderField], name: String) -> List[http.HeaderField]:
     want := name.to_lower()
-    mut to_drop: List[String] := []
-    for k in headers:
-        if k.to_lower() == want:
-            to_drop.push(k)
-    for k in to_drop:
-        headers.remove(k)
+    mut out: List[http.HeaderField] := []
+    for h in headers:
+        if h.name.to_lower() != want:
+            out.push(h)
+    return out
 
-# Set a header, replacing any existing entry that differs only in casing.
-fn set_header_ci(headers: Map[String, String], name: String, value: String):
-    remove_header_ci(headers, name)
-    headers.insert(name, value)
+# Set a header, replacing any existing entries that differ only in casing.
+fn set_header_ci(headers: List[http.HeaderField], name: String, value: String) -> List[http.HeaderField]:
+    mut out := remove_header_ci(headers, name)
+    out.push(http.HeaderField(name, value))
+    return out
+
+fn string_list_contains(items: List[String], target: String) -> Bool:
+    for item in items:
+        if item == target:
+            return true
+    return false
+
+fn string_list_remove(items: List[String], target: String) -> List[String]:
+    mut out: List[String] := []
+    for item in items:
+        if item != target:
+            out.push(item)
+    return out
 
 # Apply one curl -H specification ("Name: Val", "Name:", "Name;").
-fn apply_header_spec(headers: Map[String, String], raw: String):
+# The first -H for a header name replaces any default header (e.g. User-Agent or
+# Content-Type); subsequent -H flags with the same name append repeated values.
+fn apply_header_spec(headers: List[http.HeaderField], seen_user: List[String], raw: String) -> (List[http.HeaderField], List[String]):
     colon := raw.index_of(":")
     if colon > 0:
         name := raw.substring(0, colon).trim()
         val := raw.substring(colon + 1, raw.len()).trim()
         if name == "":
-            return
+            return (headers, seen_user)
+        lower := name.to_lower()
         if val == "":
             # curl convention: "Name:" deletes a header.
-            remove_header_ci(headers, name)
-        else:
-            set_header_ci(headers, name, val)
-        return
+            return (remove_header_ci(headers, name), string_list_remove(seen_user, lower))
+        if string_list_contains(seen_user, lower):
+            mut appended := clone_headers(headers)
+            appended.push(http.HeaderField(name, val))
+            return (appended, seen_user)
+        mut next_seen: List[String] := []
+        for s in seen_user:
+            next_seen.push(s)
+        next_seen.push(lower)
+        return (set_header_ci(headers, name, val), next_seen)
     semi := raw.index_of(";")
     if semi > 0:
         name := raw.substring(0, semi).trim()
         if name != "":
+            lower := name.to_lower()
             # curl convention: "Name;" sends an empty-value header.
-            set_header_ci(headers, name, "")
+            if string_list_contains(seen_user, lower):
+                mut appended := clone_headers(headers)
+                appended.push(http.HeaderField(name, ""))
+                return (appended, seen_user)
+            mut next_seen: List[String] := []
+            for s in seen_user:
+                next_seen.push(s)
+            next_seen.push(lower)
+            return (set_header_ci(headers, name, ""), next_seen)
+    return (headers, seen_user)
 
 # TLS verify hook that prints negotiated TLS info to stderr when -v is active.
 fn verbose_tls_hook(state: tls.ConnectionState) -> String:
@@ -240,22 +280,36 @@ fn build_tls_config(spec: RequestSpec, want_h2_alpn: Bool) -> tls.Config!:
         cfg = cfg.with_verify_connection(verbose_tls_hook)
     return cfg
 
-# Convert an HTTP/1.1 HttpResponse into a uniform HopResponse.
+# Convert an HTTP/1.1 HttpResponse into a uniform HopResponse, preserving repeated wire headers.
 fn from_http1_response(resp: http.HttpResponse) -> HopResponse:
     mut names: List[String] := []
     mut values: List[String] := []
-    for k in resp.headers:
-        names.push(k)
-        values.push(resp.headers[k])
+    if resp.raw_headers.len() > 0:
+        for f in resp.raw_headers:
+            if f.name.to_lower() == "set-cookie":
+                continue
+            names.push(f.name)
+            values.push(f.value)
+    else:
+        for k in resp.headers:
+            names.push(k)
+            values.push(resp.headers[k])
     return HopResponse("1.1", resp.status, resp.content_type, names, values, resp.set_cookie_headers, resp.body, resp.body.len(), false)
 
-# Convert a streamed HTTP/1.1 StreamedHttpResponse into a uniform HopResponse.
+# Convert a streamed HTTP/1.1 StreamedHttpResponse into a uniform HopResponse, preserving repeated wire headers.
 fn from_streamed_response(resp: http.StreamedHttpResponse) -> HopResponse:
     mut names: List[String] := []
     mut values: List[String] := []
-    for k in resp.headers:
-        names.push(k)
-        values.push(resp.headers[k])
+    if resp.raw_headers.len() > 0:
+        for f in resp.raw_headers:
+            if f.name.to_lower() == "set-cookie":
+                continue
+            names.push(f.name)
+            values.push(f.value)
+    else:
+        for k in resp.headers:
+            names.push(k)
+            values.push(resp.headers[k])
     return HopResponse("1.1", resp.status, resp.content_type, names, values, resp.set_cookie_headers, bytes.empty(), resp.body_size, true)
 
 # Convert an HTTP/2 connection.Response into a uniform HopResponse.
@@ -392,8 +446,8 @@ fn prepare_output_parent(spec: RequestSpec, out_path: String):
         if parent != "" and parent != ".":
             fs.make_dirs(parent)
 
-# Build a std.net.http.ClientRequest from hop parameters.
-fn build_http1_request(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: Map[String, String], body: Bytes, force_close: Bool) -> http.ClientRequest:
+# Build a std.net.http.ClientRequest from hop parameters (preserving repeated headers).
+fn build_http1_request(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: List[http.HeaderField], body: Bytes, force_close: Bool) -> http.ClientRequest:
     mut req := http.request(method, dial_host, dial_port, target)
     if u.scheme == "https":
         req = http.https_request_port(method, dial_host, dial_port, target)
@@ -401,8 +455,8 @@ fn build_http1_request(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_
             req = req.with_server_name(u.host)
     if dial_overridden and not has_header_ci(headers, "Host"):
         req = req.header("Host", authority_header(u))
-    for k in headers:
-        req = req.header(k, headers[k])
+    for h in headers:
+        req = req.add_header(h.name, h.value)
     if force_close and not has_header_ci(headers, "Connection"):
         req = req.header("Connection", "close")
     if not body.is_empty():
@@ -478,7 +532,7 @@ fn send_http1_over_plain_conn(conn: http.ClientConn, req: http.ClientRequest, sp
 # Execute one HTTP/1.1 hop using std.net.http.Client (including --resolve /
 # --connect-to SNI override via ClientRequest.with_server_name).
 # When `stream_file` is non-empty, streams the response body directly to disk.
-fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, method: String, target: String, headers: Map[String, String], body: Bytes, stream_file: String) -> HopResponse!:
+fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, method: String, target: String, headers: List[http.HeaderField], body: Bytes, stream_file: String) -> HopResponse!:
     req := build_http1_request(spec, u, dial_host, dial_port, dial_overridden, method, target, headers, body, false)
 
     if spec.verbose:
@@ -520,19 +574,19 @@ fn send_http1_hop(client: http.Client, spec: RequestSpec, u: ParsedUrl, dial_hos
     return hop
 
 # Build RFC 9113 HTTP/2 request header fields (omitting connection-specific headers).
-fn build_http2_extra_headers(headers: Map[String, String], body: Bytes) -> List[h2hpack.HeaderField]:
+fn build_http2_extra_headers(headers: List[http.HeaderField], body: Bytes) -> List[h2hpack.HeaderField]:
     mut extra: List[h2hpack.HeaderField] := []
-    for k in headers:
-        lower := k.to_lower()
+    for h in headers:
+        lower := h.name.to_lower()
         if lower == "host" or lower == "connection" or lower == "keep-alive" or lower == "transfer-encoding" or lower == "upgrade":
             continue
-        extra.push(h2hpack.header_field(lower, headers[k]))
+        extra.push(h2hpack.header_field(lower, h.value))
     if not body.is_empty() and not has_header_ci(headers, "content-length"):
         extra.push(h2hpack.header_field("content-length", body.len().to_string()))
     return extra
 
 # Send one request on an already-open HTTP/2 client.
-fn send_on_http2_client(h2: h2conn.Client, spec: RequestSpec, u: ParsedUrl, method: String, target: String, headers: Map[String, String], body: Bytes) -> HopResponse!:
+fn send_on_http2_client(h2: h2conn.Client, spec: RequestSpec, u: ParsedUrl, method: String, target: String, headers: List[http.HeaderField], body: Bytes) -> HopResponse!:
     extra := build_http2_extra_headers(headers, body)
     authority := authority_header(u)
     if spec.verbose:
@@ -547,7 +601,7 @@ fn send_on_http2_client(h2: h2conn.Client, spec: RequestSpec, u: ParsedUrl, meth
 
 # Execute one HTTP/2 hop using std.net.http2.connection (h2c, or h2 over TLS with
 # single-handshake ALPN fallback to HTTP/1.1 reusing the established tls.Conn).
-fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: Map[String, String], body: Bytes, prior_knowledge: Bool, stream_file: String) -> HopResponse!:
+fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: List[http.HeaderField], body: Bytes, prior_knowledge: Bool, stream_file: String) -> HopResponse!:
     if spec.verbose:
         write_stderr_line("* Trying {dial_host}:{dial_port} (HTTP/2)...")
 
@@ -573,8 +627,53 @@ fn send_http2_hop(spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port:
     req := build_http1_request(spec, u, dial_host, dial_port, dial_overridden, method, target, headers, body, true)
     return send_http1_over_tls_conn(tconn, req, spec, stream_file)!
 
+# Execute one hop over an AF_UNIX Unix domain socket (--unix-socket).
+# Supports HTTP/1.1 (buffered or streamed -o), HTTPS, and TLS ALPN HTTP/2.
+fn send_unix_socket_hop(spec: RequestSpec, u: ParsedUrl, method: String, target: String, headers: List[http.HeaderField], body: Bytes, stream_file: String) -> HopResponse!:
+    if spec.verbose:
+        write_stderr_line("* Trying {spec.unix_socket}...")
+
+    stream := unix.connect_stream(spec.unix_socket)!
+    if spec.max_time_ms > 0:
+        stream.set_timeout(spec.max_time_ms)
+    elif spec.connect_timeout_ms > 0:
+        stream.set_timeout(spec.connect_timeout_ms)
+
+    mut unix_headers := clone_headers(headers)
+    if not has_header_ci(unix_headers, "Host"):
+        unix_headers = set_header_ci(unix_headers, "Host", authority_header(u))
+
+    if u.scheme == "https":
+        want_h2 := spec.http_version == "2"
+        cfg := build_tls_config(spec, want_h2)!
+        defer cfg.close()
+        session_res := tls.client(stream, u.host, cfg)
+        if session_res.is_err:
+            stream.close()
+            fail session_res.err
+        session := session_res.ok
+        if want_h2 and session.negotiated_protocol() == "h2":
+            h2 := h2conn.open_tls(session)!
+            defer h2.close()
+            return send_on_http2_client(h2, spec, u, method, target, unix_headers, body)!
+        if spec.verbose:
+            if want_h2:
+                write_stderr_line("* ALPN: falling back to HTTP/1.1")
+            log_verbose_request(method, target, "HTTP/1.1", authority_header(u), unix_headers, body.len())
+        tconn := http.TlsClientConn(session)
+        defer tconn.close()
+        req := build_http1_request(spec, u, u.host, u.port, false, method, target, unix_headers, body, true)
+        return send_http1_over_tls_conn(tconn, req, spec, stream_file)!
+
+    if spec.verbose:
+        log_verbose_request(method, target, "HTTP/1.1", authority_header(u), unix_headers, body.len())
+    pconn := http.ClientConn(stream, stream.buffered_bytes_reader_chunked(512), stream.buffered_bytes_writer())
+    defer pconn.close()
+    req := build_http1_request(spec, u, u.host, u.port, false, method, target, unix_headers, body, true)
+    return send_http1_over_plain_conn(pconn, req, spec, stream_file)!
+
 # Execute one hop tunneled through a SOCKS5 proxy (supports HTTP/1.1, HTTPS, and HTTP/2).
-fn send_socks5_hop(proxy_url: String, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: Map[String, String], body: Bytes, stream_file: String) -> HopResponse!:
+fn send_socks5_hop(proxy_url: String, spec: RequestSpec, u: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, method: String, target: String, headers: List[http.HeaderField], body: Bytes, stream_file: String) -> HopResponse!:
     mut scfg := socks5.parse_proxy_url(proxy_url)!
     if scfg.username == "" and scfg.password == "" and spec.proxy_user != "":
         pair := split_user_pass(spec.proxy_user)
@@ -595,10 +694,9 @@ fn send_socks5_hop(proxy_url: String, spec: RequestSpec, u: ParsedUrl, dial_host
     if spec.max_time_ms > 0:
         stream.set_timeout(spec.max_time_ms)
 
-    tun_headers := clone_headers(headers)
-    remove_header_ci(tun_headers, "Proxy-Authorization")
+    mut tun_headers := remove_header_ci(clone_headers(headers), "Proxy-Authorization")
     if not has_header_ci(tun_headers, "Host"):
-        set_header_ci(tun_headers, "Host", authority_header(u))
+        tun_headers = set_header_ci(tun_headers, "Host", authority_header(u))
 
     if u.scheme == "https":
         want_h2 := spec.http_version == "2"
@@ -742,7 +840,7 @@ fn make_http_client(spec: RequestSpec, has_tls_cfg: Bool, tls_cfg: tls.Config) -
 struct PreparedRequest:
     method: String
     url: ParsedUrl
-    headers: Map[String, String]
+    headers: List[http.HeaderField]
     body: Bytes
     auto_referer: Bool
     resume_offset: Int
@@ -762,7 +860,7 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
     mut parsed := parse_target_url(raw_url, spec.proto_default)!
     mut cache := stdin_cache
     mut body := bytes.empty()
-    mut headers: Map[String, String] := {}
+    mut headers: List[http.HeaderField] := []
     mut method := spec.method
     mut multipart_ct := ""
 
@@ -792,7 +890,7 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
         cache = built.1
         tmp_req := http.request(method, parsed.host, parsed.port, "/").multipart_body(built.0)!
         body = tmp_req.body
-        multipart_ct = get_header_ci(tmp_req.headers, "Content-Type")
+        multipart_ct = get_header_map_ci(tmp_req.headers, "Content-Type")
     elif spec.data_parts.len() > 0:
         built := build_data_body(spec.data_parts, spec.is_json, cache)!
         cache = built.1
@@ -814,23 +912,23 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
     # Default headers.
     if spec.user_agent_set:
         if spec.user_agent != "":
-            set_header_ci(headers, "User-Agent", spec.user_agent)
+            headers = set_header_ci(headers, "User-Agent", spec.user_agent)
     else:
-        set_header_ci(headers, "User-Agent", PURL_USER_AGENT)
+        headers = set_header_ci(headers, "User-Agent", PURL_USER_AGENT)
 
     if spec.is_json:
-        set_header_ci(headers, "Accept", "application/json")
+        headers = set_header_ci(headers, "Accept", "application/json")
         if not spec.use_get:
-            set_header_ci(headers, "Content-Type", "application/json")
+            headers = set_header_ci(headers, "Content-Type", "application/json")
     else:
-        set_header_ci(headers, "Accept", "*/*")
+        headers = set_header_ci(headers, "Accept", "*/*")
         if multipart_ct != "":
-            set_header_ci(headers, "Content-Type", multipart_ct)
+            headers = set_header_ci(headers, "Content-Type", multipart_ct)
         elif spec.data_parts.len() > 0 and not spec.use_get:
-            set_header_ci(headers, "Content-Type", "application/x-www-form-urlencoded")
+            headers = set_header_ci(headers, "Content-Type", "application/x-www-form-urlencoded")
 
     if spec.compressed:
-        set_header_ci(headers, "Accept-Encoding", "gzip, deflate, zstd")
+        headers = set_header_ci(headers, "Accept-Encoding", "gzip, deflate, zstd")
 
     # Referer (-e) and ";auto" handling.
     mut auto_referer := false
@@ -841,15 +939,15 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
             auto_referer = true
             ref_val := spec.referer.substring(0, spec.referer.len() - 5)
             if ref_val != "":
-                set_header_ci(headers, "Referer", ref_val)
+                headers = set_header_ci(headers, "Referer", ref_val)
         else:
-            set_header_ci(headers, "Referer", spec.referer)
+            headers = set_header_ci(headers, "Referer", spec.referer)
 
     # Conditional ETag (--etag-compare) and time condition (-z / --time-cond).
     if spec.etag_compare != "" and fs.is_file(spec.etag_compare):
         etag_val := (fs.read(spec.etag_compare) catch "").trim()
         if etag_val != "":
-            set_header_ci(headers, "If-None-Match", etag_val)
+            headers = set_header_ci(headers, "If-None-Match", etag_val)
 
     if spec.time_cond != "":
         mut tc := spec.time_cond.trim()
@@ -861,14 +959,14 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
             if fs.is_file(tc):
                 mtime := fs.modified(tc) catch -1
                 if mtime >= 0:
-                    set_header_ci(headers, hdr_name, http.http_date(mtime))
+                    headers = set_header_ci(headers, hdr_name, http.http_date(mtime))
             else:
-                set_header_ci(headers, hdr_name, tc)
+                headers = set_header_ci(headers, hdr_name, tc)
 
     # Range (-r) and Resume (-C).
     mut resume_offset := 0
     if spec.range != "":
-        set_header_ci(headers, "Range", "bytes=" + spec.range)
+        headers = set_header_ci(headers, "Range", "bytes=" + spec.range)
     elif spec.continue_at != "":
         if spec.continue_at == "-":
             mut target_file := ""
@@ -882,12 +980,12 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
                 sz := fs.size(target_file) catch 0
                 if sz > 0:
                     resume_offset = sz
-                    set_header_ci(headers, "Range", "bytes={sz}-")
+                    headers = set_header_ci(headers, "Range", "bytes={sz}-")
         else:
             off := parse_int(spec.continue_at) catch 0
             if off > 0:
                 resume_offset = off
-                set_header_ci(headers, "Range", "bytes={off}-")
+                headers = set_header_ci(headers, "Range", "bytes={off}-")
 
     # Resolve credentials: -u, URL userinfo, or .netrc (-n / --netrc-optional / --netrc-file).
     mut auth_user := ""
@@ -912,10 +1010,10 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
 
     # Attach immediate auth unless --digest or --aws-sigv4 handles auth per hop.
     if spec.bearer != "":
-        set_header_ci(headers, "Authorization", "Bearer " + spec.bearer)
+        headers = set_header_ci(headers, "Authorization", "Bearer " + spec.bearer)
     elif has_auth_creds and not spec.use_digest and spec.aws_sigv4 == "":
         auth_raw := auth_user + ":" + auth_pass
-        set_header_ci(headers, "Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(auth_raw)))
+        headers = set_header_ci(headers, "Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(auth_raw)))
 
     # Proxy-Authorization for HTTP proxies and HTTPS CONNECT tunnels (-U / --proxy-user).
     if spec.proxy_user != "":
@@ -923,11 +1021,15 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
         mut pauth := spec.proxy_user
         if pcolon < 0:
             pauth = spec.proxy_user + ":"
-        set_header_ci(headers, "Proxy-Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(pauth)))
+        headers = set_header_ci(headers, "Proxy-Authorization", "Basic " + encoding.b64_encode(bytes.from_string_utf8(pauth)))
 
-    # Apply explicit -H headers last so user overrides and "Name:" removals win.
+    # Apply explicit -H headers last so user overrides and "Name:" removals win,
+    # while repeated -H flags for the same name preserve all values in order.
+    mut seen_user: List[String] := []
     for hspec in spec.headers:
-        apply_header_spec(headers, hspec)
+        applied := apply_header_spec(headers, seen_user, hspec)
+        headers = applied.0
+        seen_user = applied.1
 
     return PreparedRequest(method, parsed, headers, body, auto_referer, resume_offset, explicit_output, auth_user, auth_pass, has_auth_creds, cache)
 
@@ -936,7 +1038,7 @@ fn purl_args_read_stdin() -> Bytes:
     return io.read_stdin_bytes() catch bytes.empty()
 
 # Merge inline -b cookies and jar cookies for the current hop into `headers`.
-fn attach_cookies(spec: RequestSpec, jar: CookieJar, u: ParsedUrl, headers: Map[String, String]):
+fn attach_cookies(spec: RequestSpec, jar: CookieJar, u: ParsedUrl, headers: List[http.HeaderField]) -> List[http.HeaderField]:
     mut parts: List[String] := []
     existing := get_header_ci(headers, "Cookie")
     if existing != "":
@@ -948,20 +1050,32 @@ fn attach_cookies(spec: RequestSpec, jar: CookieJar, u: ParsedUrl, headers: Map[
     if jar_str != "":
         parts.push(jar_str)
     if parts.len() > 0:
-        set_header_ci(headers, "Cookie", parts.join("; "))
+        return set_header_ci(headers, "Cookie", parts.join("; "))
+    return headers
 
-# Copy a header map cleanly.
-fn clone_headers(src: Map[String, String]) -> Map[String, String]:
+# Copy an ordered header list cleanly.
+fn clone_headers(src: List[http.HeaderField]) -> List[http.HeaderField]:
+    mut dst: List[http.HeaderField] := []
+    for h in src:
+        dst.push(h)
+    return dst
+
+# Collapse ordered headers into a Map for AWS SigV4 signing (comma-joining duplicates).
+fn headers_to_sigv4_map(headers: List[http.HeaderField]) -> Map[String, String]:
     mut dst: Map[String, String] := {}
-    for k in src:
-        dst.insert(k, src[k])
+    for h in headers:
+        lk := h.name.to_lower()
+        if dst.contains_key(lk):
+            dst.insert(lk, dst[lk] + "," + h.value.trim())
+        else:
+            dst.insert(lk, h.value.trim())
     return dst
 
 # Estimate the request head + body size for -w %{size_request}.
-fn estimate_request_size(method: String, target: String, headers: Map[String, String], body_len: Int) -> Int:
+fn estimate_request_size(method: String, target: String, headers: List[http.HeaderField], body_len: Int) -> Int:
     mut total := method.len() + 1 + target.len() + 11
-    for k in headers:
-        total = total + k.len() + 2 + headers[k].len() + 2
+    for h in headers:
+        total = total + h.name.len() + 2 + h.value.len() + 2
     return total + 2 + body_len
 
 # Execute one transfer (all redirect hops, no outer retry).
@@ -1028,8 +1142,10 @@ fn effective_proxy_url(spec: RequestSpec, u: ParsedUrl) -> String:
 fn has_active_proxy(spec: RequestSpec, u: ParsedUrl) -> Bool:
     return effective_proxy_url(spec, u) != ""
 
-# Dispatch one hop over SOCKS5, HTTP/2 (h2c or h2 with single-handshake ALPN fallback), or HTTP/1.1.
-fn dispatch_hop(client: http.Client, spec: RequestSpec, cur_url: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, cur_method: String, target: String, hop_headers: Map[String, String], cur_body: Bytes, stream_file: String) -> HopResponse!:
+# Dispatch one hop over Unix socket, SOCKS5, HTTP/2 (h2c or h2 with single-handshake ALPN fallback), or HTTP/1.1.
+fn dispatch_hop(client: http.Client, spec: RequestSpec, cur_url: ParsedUrl, dial_host: String, dial_port: Int, dial_overridden: Bool, remote_ip: String, cur_method: String, target: String, hop_headers: List[http.HeaderField], cur_body: Bytes, stream_file: String) -> HopResponse!:
+    if spec.unix_socket != "":
+        return send_unix_socket_hop(spec, cur_url, cur_method, target, hop_headers, cur_body, stream_file)
     proxy_url := effective_proxy_url(spec, cur_url)
     if is_socks5_proxy(proxy_url):
         return send_socks5_hop(proxy_url, spec, cur_url, dial_host, dial_port, dial_overridden, cur_method, target, hop_headers, cur_body, stream_file)
@@ -1082,22 +1198,25 @@ fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, pr
         dial_port := dial_info.1
         dial_overridden := dial_info.2
 
-        dns_res := measure_dns_lookup(dial_host, has_active_proxy(spec, cur_url))
+        dns_res := measure_dns_lookup(dial_host, has_active_proxy(spec, cur_url) or spec.unix_socket != "")
         last_ip = dns_res.0
         if hops == 0:
             dns_ms = dns_res.1
 
-        hop_headers := clone_headers(cur_headers)
-        attach_cookies(spec, jar, cur_url, hop_headers)
+        mut hop_headers := attach_cookies(spec, jar, cur_url, clone_headers(cur_headers))
 
         # Sign with AWS SigV4 per hop if requested.
         if spec.aws_sigv4 != "":
-            sig_res := sign_aws_sigv4(spec.aws_sigv4, prep.auth_user, prep.auth_pass, cur_method, cur_url, hop_headers, cur_body)
+            sig_map := headers_to_sigv4_map(hop_headers)
+            sig_res := sign_aws_sigv4(spec.aws_sigv4, prep.auth_user, prep.auth_pass, cur_method, cur_url, sig_map, cur_body)
             if sig_res.is_err:
                 elapsed := time.mono_millis() - started_ms
                 empty_hdrs: Map[String, String] := {}
                 m := TransferMetrics(0, "", 0, cur_body.len(), all_headers_text.len(), last_req_size, elapsed, elapsed, dns_ms, effective_url(cur_url), "", hops, spec.http_version, cur_url.scheme.to_upper(), last_ip, dial_port, "", empty_hdrs, 2, sig_res.err)
                 return AttemptOutcome(2, sig_res.err, 0, m, empty_hop(), cur_url, bytes.empty(), all_headers_text, false, "")
+            for sk in sig_map:
+                if sk == "Authorization" or sk.ends_with("-Date") or sk.ends_with("-Content-Sha256"):
+                    hop_headers = set_header_ci(hop_headers, sk, sig_map[sk])
 
         last_req_size = estimate_request_size(cur_method, target, hop_headers, cur_body.len())
 
@@ -1125,7 +1244,7 @@ fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, pr
                 digest_tried = true
                 auth_res := build_digest_header(www_auth, prep.auth_user, prep.auth_pass, cur_method, target)
                 if auth_res.is_ok:
-                    set_header_ci(cur_headers, "Authorization", auth_res.ok)
+                    cur_headers = set_header_ci(cur_headers, "Authorization", auth_res.ok)
                     continue
 
         mut resolved_redir := ""
@@ -1167,17 +1286,17 @@ fn run_single_attempt(spec: RequestSpec, client: http.Client, jar: CookieJar, pr
             if not keep_post and cur_method != "GET" and cur_method != "HEAD":
                 cur_method = "GET"
                 cur_body = bytes.empty()
-                remove_header_ci(cur_headers, "Content-Type")
-                remove_header_ci(cur_headers, "Content-Length")
-                remove_header_ci(cur_headers, "Transfer-Encoding")
+                cur_headers = remove_header_ci(cur_headers, "Content-Type")
+                cur_headers = remove_header_ci(cur_headers, "Content-Length")
+                cur_headers = remove_header_ci(cur_headers, "Transfer-Encoding")
 
             if origin_changed(cur_url, next_url) and not spec.location_trusted:
-                remove_header_ci(cur_headers, "Authorization")
+                cur_headers = remove_header_ci(cur_headers, "Authorization")
             if origin_changed(cur_url, next_url):
-                remove_header_ci(cur_headers, "Host")
+                cur_headers = remove_header_ci(cur_headers, "Host")
 
             if prep.auto_referer:
-                set_header_ci(cur_headers, "Referer", effective_url(cur_url))
+                cur_headers = set_header_ci(cur_headers, "Referer", effective_url(cur_url))
 
             cur_url = next_url
             hops = hops + 1

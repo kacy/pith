@@ -8,6 +8,7 @@ pub struct Option:
     pub default_value: String
     pub takes_value: Bool
     pub required: Bool
+    pub repeatable: Bool = false
 
 # one subcommand and its local arguments.
 pub struct Command:
@@ -30,6 +31,7 @@ pub struct Parsed:
     pub flags: Set[String]
     pub values: Map[String, String]
     pub positionals: List[String]
+    pub multi_values: Map[String, List[String]]
 
 # cli parsing error.
 pub struct CliError:
@@ -40,15 +42,19 @@ fn cli_error(message: String) -> CliError:
 
 # create a boolean flag.
 pub fn flag(name: String, short: String, description: String) -> Option:
-    return Option(name, short, description, "", false, false)
+    return Option(name, short, description, "", false, false, false)
 
 # create a string option with a default value.
 pub fn option(name: String, short: String, description: String, default_value: String) -> Option:
-    return Option(name, short, description, default_value, true, false)
+    return Option(name, short, description, default_value, true, false, false)
 
 # create a required string option.
 pub fn required_option(name: String, short: String, description: String) -> Option:
-    return Option(name, short, description, "", true, true)
+    return Option(name, short, description, "", true, true, false)
+
+# create a repeatable string option whose values accumulate in order (e.g. -H).
+pub fn multi_option(name: String, short: String, description: String) -> Option:
+    return Option(name, short, description, "", true, false, true)
 
 # create a subcommand.
 pub fn command(name: String, description: String, options: List[Option], positionals: List[String]) -> Command:
@@ -63,6 +69,34 @@ fn cli_find_option(options: List[Option], name: String) -> Option!CliError:
         if opt.name == name or (opt.short != "" and opt.short == name):
             return opt
     fail cli_error("unknown option: " + name)
+
+fn cli_find_short_exact(options: List[Option], short_name: String) -> Option?:
+    for opt in options:
+        if opt.short != "" and opt.short == short_name:
+            return opt
+    return none
+
+fn cli_find_short_char(options: List[Option], ch: String) -> Option!CliError:
+    for opt in options:
+        if opt.short == ch or (opt.short == "" and opt.name == ch):
+            return opt
+    fail cli_error("unknown option: -" + ch)
+
+fn cli_find_flag_by_name(options: List[Option], name: String) -> Option?:
+    for opt in options:
+        if opt.name == name and not opt.takes_value:
+            return opt
+    return none
+
+fn cli_record_value(values: Map[String, String], multi_values: Map[String, List[String]], given: Set[String], name: String, repeatable: Bool, val: String):
+    values.insert(name, val)
+    given.add(name)
+    if repeatable:
+        mut bucket: List[String] := []
+        if multi_values.contains_key(name):
+            bucket = multi_values[name]
+        bucket.push(val)
+        multi_values.insert(name, bucket)
 
 fn cli_find_command(commands: List[Command], name: String) -> Command!CliError:
     for cmd in commands:
@@ -114,22 +148,32 @@ fn cli_check_required(values: Map[String, String], options: List[Option]) -> Boo
 # option or an option's value names the command, when the spec has commands.
 # app options are accepted anywhere on the line, before or after the command;
 # after it, an option the command defines with the same name takes precedence.
+# supports POSIX short-flag clustering (-fsSL), attached short option values
+# (-XPOST, -fsSoout.txt), repeatable multi_option (-H), --no-<flag> negations,
+# and the `--` end-of-options separator.
 pub fn parse(spec: Cli, argv: List[String]) -> Parsed!CliError:
     mut command_name := ""
     mut options := spec.options
     mut positional_names := spec.positionals
     mut flags: Set[String] := {}
     mut values: Map[String, String] := {}
+    mut multi_values: Map[String, List[String]] := {}
     mut given: Set[String] := {}
     cli_set_defaults(values, options, given)
     mut positionals: List[String] := []
     mut pending := ""
+    mut pending_repeatable := false
+    mut positional_only := false
 
     for arg in argv:
         if pending != "":
-            values.insert(pending, arg)
-            given.add(pending)
+            cli_record_value(values, multi_values, given, pending, pending_repeatable, arg)
             pending = ""
+            pending_repeatable = false
+        elif positional_only:
+            positionals.push(arg)
+        elif arg == "--":
+            positional_only = true
         elif arg.starts_with("--"):
             body := arg.substring(2, arg.len())
             eq := cli_eq_index(body)
@@ -138,24 +182,56 @@ pub fn parse(spec: Cli, argv: List[String]) -> Parsed!CliError:
             if eq >= 0:
                 name = body.substring(0, eq)
                 inline_value = body.substring(eq + 1, body.len())
-            opt := cli_find_option(options, name)!
-            if opt.takes_value:
-                if eq >= 0:
-                    values.insert(opt.name, inline_value)
-                    given.add(opt.name)
+            found := cli_find_option(options, name)
+            if found.is_ok:
+                opt := found.ok
+                if opt.takes_value:
+                    if eq >= 0:
+                        cli_record_value(values, multi_values, given, opt.name, opt.repeatable, inline_value)
+                    else:
+                        pending = opt.name
+                        pending_repeatable = opt.repeatable
                 else:
-                    pending = opt.name
+                    if eq >= 0:
+                        fail cli_error("flag does not take a value: --" + opt.name)
+                    flags.add(opt.name)
+            elif name.starts_with("no-") and name.len() > 3:
+                base := name.substring(3, name.len())
+                neg := cli_find_flag_by_name(options, base)
+                if let nopt = neg:
+                    if eq >= 0:
+                        fail cli_error("flag does not take a value: --no-" + nopt.name)
+                    flags.remove(nopt.name)
+                else:
+                    fail found.err
             else:
-                if eq >= 0:
-                    fail cli_error("flag does not take a value: --" + opt.name)
-                flags.add(opt.name)
+                fail found.err
         elif arg.starts_with("-") and arg != "-":
-            name := arg.substring(1, arg.len())
-            opt := cli_find_option(options, name)!
-            if opt.takes_value:
-                pending = opt.name
+            body := arg.substring(1, arg.len())
+            exact := cli_find_short_exact(options, body)
+            if let eopt = exact:
+                if eopt.takes_value:
+                    pending = eopt.name
+                    pending_repeatable = eopt.repeatable
+                else:
+                    flags.add(eopt.name)
             else:
-                flags.add(opt.name)
+                mut j := 0
+                while j < body.len():
+                    ch := body[j]
+                    opt := cli_find_short_char(options, ch)!
+                    if opt.takes_value:
+                        if j + 1 < body.len():
+                            attached := body.substring(j + 1, body.len())
+                            cli_record_value(values, multi_values, given, opt.name, opt.repeatable, attached)
+                            j = body.len()
+                        else:
+                            pending = opt.name
+                            pending_repeatable = opt.repeatable
+                            j = body.len()
+                    else:
+                        flags.add(opt.name)
+                        j = j + 1
         elif command_name == "" and spec.commands.len() > 0 and not arg.starts_with("-"):
             cmd := cli_find_command(spec.commands, arg)!
             command_name = cmd.name
@@ -170,7 +246,7 @@ pub fn parse(spec: Cli, argv: List[String]) -> Parsed!CliError:
     if positionals.len() < positional_names.len():
         fail cli_error("missing positional argument: " + positional_names[positionals.len()])
     cli_check_required(values, options)!
-    return Parsed(command_name, flags, values, positionals)
+    return Parsed(command_name, flags, values, positionals, multi_values)
 
 # return true when a parsed flag was set.
 pub fn flag_value(parsed: Parsed, name: String) -> Bool:
@@ -181,6 +257,15 @@ pub fn string(parsed: Parsed, name: String) -> String:
     if parsed.values.contains_key(name):
         return parsed.values[name]
     return ""
+
+# return all values given for an option in order (for multi_option, or a
+# single-element list when a regular option has a value).
+pub fn strings(parsed: Parsed, name: String) -> List[String]:
+    if parsed.multi_values.contains_key(name):
+        return parsed.multi_values[name]
+    if parsed.values.contains_key(name):
+        return [parsed.values[name]]
+    return []
 
 # return an option value parsed as an int, or fallback.
 pub fn int_or(parsed: Parsed, name: String, fallback: Int) -> Int:
@@ -206,6 +291,8 @@ fn cli_options_help(options: List[Option]) -> List[String]:
         if opt.takes_value:
             label = label + " <value>"
         mut line := "  " + label + " - " + opt.description
+        if opt.repeatable:
+            line = line + " (repeatable)"
         if opt.default_value != "":
             line = line + " (default: " + opt.default_value + ")"
         lines.push(line)
@@ -299,3 +386,59 @@ test "cli lets a command's option shadow an app option of the same name":
 
     given := parse(spec, ["run", "--file", "late.txt"])!
     assert_eq(string(given, "file"), "late.txt")
+
+test "cli supports POSIX short-flag clustering and attached short values":
+    spec := app("fetch", "http client", [flag("fail", "f", "fail on http error"), flag("silent", "s", "silent mode"), flag("show-error", "S", "show errors"), flag("location", "L", "follow redirects"), option("request", "X", "method", "GET"), option("output", "o", "output file", "")], ["url"], [])
+
+    p := parse(spec, ["-fsSL", "-XPOST", "-oout.txt", "https://example.com"])!
+    assert(flag_value(p, "fail"))
+    assert(flag_value(p, "silent"))
+    assert(flag_value(p, "show-error"))
+    assert(flag_value(p, "location"))
+    assert_eq(string(p, "request"), "POST")
+    assert_eq(string(p, "output"), "out.txt")
+    assert_eq(positional(p, 0), "https://example.com")
+
+    # value-taking short option at end of a cluster takes the next token, or inline remainder.
+    p2 := parse(spec, ["-fsSo", "next.txt", "https://example.com"])!
+    assert(flag_value(p2, "fail"))
+    assert(flag_value(p2, "silent"))
+    assert(flag_value(p2, "show-error"))
+    assert_eq(string(p2, "output"), "next.txt")
+
+    p3 := parse(spec, ["-fsSojoined.txt", "https://example.com"])!
+    assert(flag_value(p3, "fail"))
+    assert_eq(string(p3, "output"), "joined.txt")
+
+    bad := parse(spec, ["-fsZ", "https://example.com"])
+    assert(bad.is_err)
+    assert_eq(bad.err.message, "unknown option: -Z")
+
+test "cli supports repeatable multi_option, --no-* negations, and -- separator":
+    spec := app("fetch", "http client", [flag("location", "L", "follow redirects"), flag("no-color", "", "explicit no-color flag"), multi_option("header", "H", "request header")], [], [])
+
+    p := parse(spec, ["-L", "--no-location", "--no-color", "-H", "Accept: */*", "-HX-One: 1", "--header=X-Two: 2", "--", "--not-a-flag", "-fsSL"])!
+    assert(not flag_value(p, "location"))
+    assert(flag_value(p, "no-color"))
+    hdrs := strings(p, "header")
+    assert_eq(hdrs.len(), 3)
+    assert_eq(hdrs[0], "Accept: */*")
+    assert_eq(hdrs[1], "X-One: 1")
+    assert_eq(hdrs[2], "X-Two: 2")
+    # string() returns the last value for a repeatable option as well.
+    assert_eq(string(p, "header"), "X-Two: 2")
+    assert_eq(p.positionals.len(), 2)
+    assert_eq(positional(p, 0), "--not-a-flag")
+    assert_eq(positional(p, 1), "-fsSL")
+
+    # --no-location=1 is rejected because it's a boolean flag.
+    bad_neg := parse(spec, ["--no-location=1"])
+    assert(bad_neg.is_err)
+    # --no-header fails because header takes a value, not a flag.
+    bad_val_neg := parse(spec, ["--no-header"])
+    assert(bad_val_neg.is_err)
+    # --no-unknown fails with unknown option.
+    bad_unk := parse(spec, ["--no-unknown"])
+    assert(bad_unk.is_err)
+
+    assert(help(spec).contains("(repeatable)"))

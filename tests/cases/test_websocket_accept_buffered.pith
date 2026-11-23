@@ -9,7 +9,7 @@ fn main() -> Int!:
     req := http.read_request_buffered_bytes(io.bytes_reader(request_bytes).buffered_chunked(5))!
 
     inbound := websocket.client_text_frame_bytes("hi", bytes.from_string_utf8("abcd"))!
-    outbound := bytes.buffer()
+    outbound := io.memory_writer()
     ws := websocket.accept_buffered(req, io.bytes_reader(inbound).buffered_chunked(3), outbound.buffered_chunked(4))!
 
     response := websocket.upgrade_response(req)!

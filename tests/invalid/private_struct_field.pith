@@ -1,0 +1,15 @@
+# a field declared without `pub` belongs to its module. std.bytes keeps a
+# buffer's handle private because it names runtime memory: reading it would let
+# a second buffer share the memory, and setting it would point a buffer at
+# memory it does not own.
+
+import std.bytes as bytes
+from std.bytes import ByteBuffer, ByteArray
+
+fn main() -> Int!:
+    a := bytes.array()
+    print(a.handle.to_string())
+    forged := ByteArray(handle: 7)
+    b := ByteBuffer(3)
+    print("{forged.len()} {b.len()}")
+    return 0

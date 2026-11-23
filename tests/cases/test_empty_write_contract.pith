@@ -54,16 +54,15 @@ fn files():
     show("file_write_bytes to /dev/full", file_write_bytes(full, bytes.from_string_utf8("x")))
     file_close(full)
 
+# the buffer writes go through bytes.buffer(): std.bytes keeps the handle
+# private, so a buffer that is not open cannot be named from pith.
 fn buffers():
-    buf := byte_buffer_new()
-    show("byte_buffer_write empty", byte_buffer_write(buf, bytes.empty()))
-    show("byte_buffer_write ab", byte_buffer_write(buf, bytes.from_string_utf8("ab")))
-    show("byte_buffer_write_string_utf8 empty", byte_buffer_write_string_utf8(buf, ""))
-    show("byte_buffer_write_string_utf8 héllo", byte_buffer_write_string_utf8(buf, "héllo"))
-    print("byte_buffer_len: " + byte_buffer_len(buf).to_string())
-    byte_buffer_free(buf)
-    show("byte_buffer_write on handle 0", byte_buffer_write(0, bytes.empty()))
-    show("byte_buffer_write_string_utf8 on handle 0", byte_buffer_write_string_utf8(0, ""))
+    buf := bytes.buffer()
+    show("byte_buffer_write empty", buf.write(bytes.empty()))
+    show("byte_buffer_write ab", buf.write(bytes.from_string_utf8("ab")))
+    show("byte_buffer_write_string_utf8 empty", buf.write_string_utf8(""))
+    show("byte_buffer_write_string_utf8 héllo", buf.write_string_utf8("héllo"))
+    print("byte_buffer_len: " + buf.len().to_string())
 
 fn accept_and_read(listener: Int) -> String!:
     conn := tcp_accept(listener)!

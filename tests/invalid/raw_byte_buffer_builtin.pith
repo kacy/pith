@@ -1,0 +1,8 @@
+# the byte_buffer_* builtins take a raw pointer as an Int, and the runtime
+# cannot tell a live buffer from freed memory or a made-up number. only
+# std.bytes may call them; other code uses bytes.buffer() and its methods.
+
+fn main():
+    h := byte_buffer_new()
+    byte_buffer_free(h)
+    byte_buffer_free(4096)

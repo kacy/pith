@@ -213,7 +213,7 @@ fn tls_case() -> Int!:
 # response's status line and Connection field.
 fn exchange(label: String, wire: String, config: http.ServerConfig) -> Int!:
     reader := io.bytes_reader(bytes.from_string_utf8(wire)).buffered_chunked(7)
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered()
     http.serve_connection_with(reader, writer, route, config) catch 0
     writer.flush()!
@@ -233,7 +233,6 @@ fn exchange(label: String, wire: String, config: http.ServerConfig) -> Int!:
     print(label + ": " + seen.join(" | "))
     reader.free()
     writer.free()
-    sink.free()
     return 0
 
 fn limits_case() -> Int!:

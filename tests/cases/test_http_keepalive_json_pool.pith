@@ -40,7 +40,7 @@ fn main() -> String!:
         i = i + 1
 
     reader := io.bytes_reader(bytes.from_string_utf8(wire)).buffered_chunked(64)
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered()
     http.serve_connection(reader, writer, handler)!
     writer.flush()!
@@ -55,5 +55,4 @@ fn main() -> String!:
 
     reader.free()
     writer.free()
-    sink.free()
     return "ok"

@@ -1,0 +1,15 @@
+# a ByteBuffer cannot become an interface value. behind one its type is
+# hidden, and the sharing checks could not follow the buffer to another task.
+# io.memory_writer() is the in-memory writer to hand on instead.
+
+import std.bytes as bytes
+import std.io as io
+
+fn send(w: io.BytesWriter) -> Int!:
+    return w.write_bytes(bytes.from_string_utf8("hi"))
+
+fn main() -> Int!:
+    b := bytes.buffer()
+    w: io.BytesWriter := b
+    print("{send(w)!} {b.len()}")
+    return 0

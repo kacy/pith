@@ -38,7 +38,7 @@ fn temp_file_path(prefix: String, ext: String) -> String:
 
 fn save_demo_download(output_path: String) -> String!:
     response_reader := io.bytes_reader(http.text(200, "saved").to_bytes()!).buffered_chunked(4)
-    request_writer := bytes.buffer().buffered_chunked(4)
+    request_writer := io.memory_writer().buffered_chunked(4)
     conn := ClientConn(io.from_fd(-1), response_reader, request_writer)
     conn.send_to_file(http.get_request("example.test", 80, "/download"), output_path)!
     return ""
@@ -80,7 +80,7 @@ fn main() -> String!:
     print("is-put:" + (req.is_put("/items/42") catch false).to_string())
     print("is-patch:" + (req.is_patch("/items/42") catch false).to_string())
 
-    out := bytes.buffer()
+    out := io.memory_writer()
     handled := app(req).header("X-Trace", req.header_or("X-Trace", "trace-generated"))
     http.send_buffered(out.buffered_chunked(4), handled)!
     served := http.parse_response_bytes(out.bytes())!
@@ -158,13 +158,13 @@ fn main() -> String!:
 
     asset_path := temp_file_path("pith-http-helper-asset-", ".html")
     fs.write(asset_path, "<h1>asset</h1>")!
-    static_out := bytes.buffer()
+    static_out := io.memory_writer()
     http.send_static_path(static_out.buffered_chunked(5), http.response(200).keep_alive(), asset_path)!
     static_resp := http.parse_response_bytes(static_out.bytes())!
     print("static-type:" + static_resp.header_value("Content-Type"))
     print("static-body:" + static_resp.body_text()!)
 
-    download_out := bytes.buffer()
+    download_out := io.memory_writer()
     http.send_download_path(download_out.buffered_chunked(5), http.response(200), asset_path, "asset.html")!
     download_resp := http.parse_response_bytes(download_out.bytes())!
     print("download-disposition:" + download_resp.header_value("Content-Disposition"))

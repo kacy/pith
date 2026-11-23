@@ -72,13 +72,13 @@ fn unmasked_client_text() -> Bytes!:
     return websocket.text_frame_bytes("nope")
 
 fn main() -> Int!:
-    invalid_continuation := websocket.from_buffered(io.bytes_reader(invalid_continuation_wire()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), false)
+    invalid_continuation := websocket.from_buffered(io.bytes_reader(invalid_continuation_wire()!).buffered_chunked(3), io.memory_writer().buffered_chunked(3), false)
     print(invalid_continuation.recv().is_err.to_string())
 
-    fragmented_ping := websocket.from_buffered(io.bytes_reader(fragmented_ping_wire()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), false)
+    fragmented_ping := websocket.from_buffered(io.bytes_reader(fragmented_ping_wire()!).buffered_chunked(3), io.memory_writer().buffered_chunked(3), false)
     print(fragmented_ping.recv().is_err.to_string())
 
-    invalid_text := websocket.from_buffered(io.bytes_reader(invalid_text_wire()!).buffered_chunked(2), bytes.buffer().buffered_chunked(2), false)
+    invalid_text := websocket.from_buffered(io.bytes_reader(invalid_text_wire()!).buffered_chunked(2), io.memory_writer().buffered_chunked(2), false)
     print(invalid_text.recv_text().is_err.to_string())
 
     reserved_bits := websocket.parse_frame(reserved_bits_wire()!)
@@ -96,9 +96,9 @@ fn main() -> Int!:
     invalid_close_reason := websocket.parse_frame(invalid_close_reason_wire()!)
     print(invalid_close_reason.is_err.to_string())
 
-    masked_server := websocket.from_buffered(io.bytes_reader(masked_server_text()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), true)
+    masked_server := websocket.from_buffered(io.bytes_reader(masked_server_text()!).buffered_chunked(3), io.memory_writer().buffered_chunked(3), true)
     print(masked_server.recv_text().is_err.to_string())
 
-    unmasked_client := websocket.from_buffered(io.bytes_reader(unmasked_client_text()!).buffered_chunked(3), bytes.buffer().buffered_chunked(3), false)
+    unmasked_client := websocket.from_buffered(io.bytes_reader(unmasked_client_text()!).buffered_chunked(3), io.memory_writer().buffered_chunked(3), false)
     print(unmasked_client.recv_text().is_err.to_string())
     return 0

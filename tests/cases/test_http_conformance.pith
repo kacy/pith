@@ -69,14 +69,13 @@ fn summarize(response_text: String) -> String:
 
 fn run_once(raw: Bytes, chunk: Int) -> String:
     reader := io.bytes_reader(raw.concat(bytes.from_string_utf8(AFTER))).buffered_chunked(chunk)
-    sink := bytes.buffer()
+    sink := io.memory_writer()
     writer := sink.buffered()
     http.serve_connection(reader, writer, echo) catch 0
     writer.flush() catch 0
     out := bytes.decode_utf8(sink.bytes())
     reader.free()
     writer.free()
-    sink.free()
     if out.is_err:
         return "non-utf8 response"
     return summarize(out.ok)

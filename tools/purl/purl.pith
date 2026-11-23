@@ -98,18 +98,18 @@ fn print_help():
     print(" -h, --help                    Show this help message")
     print(" -V, --version                 Show version number and quit")
 
-fn main():
+fn main() -> Int:
     parsed := parse_cli(args())
     if parsed.error_msg != "":
         print_err("purl: {parsed.error_msg}")
         print_err("purl: try 'purl --help' for more information")
-        exit(2)
+        return 2
     if parsed.show_help:
         print_help()
-        return
+        return 0
     if parsed.show_version:
         print_version()
-        return
+        return 0
 
     mut has_any_url := false
     for s in parsed.specs:
@@ -118,8 +118,6 @@ fn main():
     if not has_any_url:
         print_err("purl: no URL specified")
         print_err("purl: try 'purl --help' for more information")
-        exit(2)
+        return 2
 
-    code := execute_cli(parsed)
-    if code != 0:
-        exit(code)
+    return execute_cli(parsed)

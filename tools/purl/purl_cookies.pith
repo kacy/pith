@@ -6,6 +6,7 @@
 
 import std.bytes as bytes
 import std.fs as fs
+import std.io as io
 import std.net.http as http
 import std.time as time
 
@@ -220,10 +221,10 @@ pub fn format_cookie_jar(jar: CookieJar) -> String:
 pub fn save_cookie_file(jar: CookieJar, file_path: String) -> Int!:
     text := format_cookie_jar(jar)
     if file_path == "-":
-        n := term_write(1, bytes.from_string_utf8(text))
-        if n < 0:
+        written := io.write_stdout(text)
+        if written.is_err:
             fail "failed writing cookie jar to stdout"
-        return n
+        return written.ok
     fs.write(file_path, text)!
     return text.len()
 

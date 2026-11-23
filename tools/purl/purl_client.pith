@@ -2,9 +2,10 @@
 #
 # Built directly on Pith's standard library: std.net.http (Client, connection
 # pooling, streaming send_to_file, proxies, multipart, timeouts, response body
-# caps), std.net.http2.connection (native h2 and h2c), std.net.tls (TLS 1.2/1.3,
+# caps), std.net.http2.connection (native h2 and h2c with single-handshake ALPN
+# fallback), std.net.socks5 (RFC 1928/1929 SOCKS5), std.net.tls (TLS 1.2/1.3,
 # custom CAs, mTLS, verify hooks), std.net.dns, std.compress.{gzip,zlib,inflate,zstd},
-# std.fs, std.os, std.time, and Pith's green-thread concurrency (spawn/Semaphore).
+# std.io, std.fs, std.os, std.time, and Pith's green-thread concurrency (spawn/Semaphore).
 
 # Import http2 codec modules before std.net.http / std.net.tls so std.binary
 # keeps a single type identity in the self-hosted checker.
@@ -18,6 +19,7 @@ import std.compress.zlib as zlib
 import std.compress.zstd as zstd
 import std.encoding as encoding
 import std.fs as fs
+import std.io as io
 import std.net.dns as dns
 import std.net.http as http
 import std.net.socks5 as socks5
@@ -46,14 +48,14 @@ struct HopResponse:
     streamed_size: Int
     was_streamed: Bool
 
-# Write raw bytes to stdout (fd 1).
+# Write raw bytes to stdout (fd 1) via std.io.
 fn write_stdout_bytes(data: Bytes) -> Int!:
     if data.is_empty():
         return 0
-    n := term_write(1, data)
-    if n < 0:
+    written := io.write_stdout_bytes(data)
+    if written.is_err:
         fail "purl: write error: failed writing to stdout"
-    return n
+    return written.ok
 
 # Write a UTF-8 string to stdout without appending a newline.
 fn write_stdout_str(text: String) -> Int!:
@@ -61,9 +63,9 @@ fn write_stdout_str(text: String) -> Int!:
         return 0
     return write_stdout_bytes(bytes.from_string_utf8(text))!
 
-# Write a line to stderr (fd 2).
+# Write a line to stderr (fd 2) via std.io.
 fn write_stderr_line(text: String):
-    term_write(2, bytes.from_string_utf8(text + "\n"))
+    io.write_stderr(text + "\n") catch 0
 
 # Print an error message to stderr honoring -s / -S rules.
 fn report_error(spec: RequestSpec, code: Int, message: String):
@@ -929,18 +931,9 @@ fn prepare_request(spec: RequestSpec, raw_url: String, explicit_output: String, 
 
     return PreparedRequest(method, parsed, headers, body, auto_referer, resume_offset, explicit_output, auth_user, auth_pass, has_auth_creds, cache)
 
-# Wrapper to read stdin bytes (kept local so purl_client can satisfy -T -).
+# Read stdin bytes via std.io (for -T - uploads).
 fn purl_args_read_stdin() -> Bytes:
-    buf := bytes.buffer()
-    defer buf.free()
-    while true:
-        chunk := term_read(0, 65536, -1)
-        if chunk.is_err:
-            break
-        if chunk.ok.len() == 0:
-            break
-        buf.write(chunk.ok) catch 0
-    return buf.bytes()
+    return io.read_stdin_bytes() catch bytes.empty()
 
 # Merge inline -b cookies and jar cookies for the current hop into `headers`.
 fn attach_cookies(spec: RequestSpec, jar: CookieJar, u: ParsedUrl, headers: Map[String, String]):

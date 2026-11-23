@@ -1,0 +1,226 @@
+# std.net.unix — AF_UNIX Unix domain stream sockets
+#
+# Provides Unix domain socket listeners and streams backed by the same socket
+# handle table and reactor as TCP sockets, so streams integrate cleanly with
+# std.io, std.net.http, and std.net.tls.
+#
+#   import std.net.unix as unix
+#   listener := unix.listen("/tmp/app.sock")!
+#   defer listener.close()
+#   conn := listener.accept()!
+
+import std.bytes as bytes
+import std.fs as fs
+import std.io as io
+import std.net.http as http
+import std.net.tcp as tcp
+import std.os.path as path_mod
+from std.io import TcpStream
+
+# A listening AF_UNIX stream socket bound to a filesystem path.
+pub struct UnixListener:
+    pub fd: Int
+    pub path: String
+
+# A connected AF_UNIX stream socket.
+pub struct UnixStream:
+    pub fd: Int
+
+# Bind and listen on a Unix domain socket at `path`.
+pub fn listen(path: String) -> UnixListener!:
+    fd := unix_listen(path)!
+    return UnixListener(fd, path)
+
+# Bind and listen on a Unix domain socket at `path`, returning the raw socket handle.
+pub fn listen_fd(path: String) -> Int!:
+    return unix_listen(path)
+
+# Accept an incoming connection on a Unix listener socket handle.
+pub fn accept_fd(server_fd: Int) -> Int!:
+    return unix_accept(server_fd)
+
+# Connect to a Unix domain stream socket at `path`.
+pub fn connect(path: String) -> UnixStream!:
+    fd := unix_connect(path)!
+    return UnixStream(fd)
+
+# Connect to a Unix domain stream socket at `path`, returning the raw socket handle.
+pub fn connect_fd(path: String) -> Int!:
+    return unix_connect(path)
+
+# Connect to a Unix domain stream socket at `path` and return a `TcpStream` handle
+# for direct use with `std.net.http.ClientConn` or `std.net.tls.client`.
+pub fn connect_stream(path: String) -> TcpStream!:
+    fd := unix_connect(path)!
+    return TcpStream(fd)
+
+impl UnixListener:
+    # Accept one incoming client connection.
+    pub fn accept() -> UnixStream!:
+        client_fd := unix_accept(self.fd)!
+        return UnixStream(client_fd)
+
+    # Accept one incoming client connection and return its raw socket handle.
+    pub fn accept_fd() -> Int!:
+        return unix_accept(self.fd)
+
+    # Shut down the listener without closing its handle so blocked accept calls wake.
+    pub fn shutdown() -> Bool:
+        return tcp_shutdown(self.fd) == 1
+
+    # Close the listening socket handle.
+    pub fn close():
+        tcp_close(self.fd)
+
+impl Drop for UnixListener:
+    fn drop():
+        tcp_close(self.fd)
+
+impl UnixStream:
+    # Read up to `max_bytes` as a UTF-8 string.
+    pub fn read(max_bytes: Int) -> String!:
+        return tcp_read(self.fd, max_bytes)
+
+    # Read up to `max_bytes` raw bytes (empty Bytes signals EOF).
+    pub fn read_bytes(max_bytes: Int) -> Bytes!:
+        return tcp_read_bytes(self.fd, max_bytes)
+
+    # Read exactly `count` bytes, failing if EOF arrives early.
+    pub fn read_exact_bytes(count: Int) -> Bytes!:
+        if count <= 0:
+            return bytes.empty()
+        buf := bytes.buffer_with_capacity(count)
+        defer buf.free()
+        while buf.len() < count:
+            chunk := tcp_read_bytes(self.fd, count - buf.len())!
+            if chunk.len() == 0:
+                fail "unix: unexpected eof"
+            buf.write(chunk)!
+        return buf.bytes()
+
+    # Read all bytes until EOF.
+    pub fn read_all_bytes() -> Bytes!:
+        buf := bytes.buffer()
+        defer buf.free()
+        while true:
+            chunk := tcp_read_bytes(self.fd, 16384)!
+            if chunk.len() == 0:
+                break
+            buf.write(chunk)!
+        return buf.bytes()
+
+    # Write a UTF-8 string in a single syscall, returning bytes written.
+    pub fn write(data: String) -> Int!:
+        return tcp_write(self.fd, data)
+
+    # Write an entire UTF-8 string, looping until all bytes are sent.
+    pub fn write_all(data: String) -> Int!:
+        return tcp.write_all(self.fd, data)
+
+    # Write raw bytes in a single syscall, returning bytes written.
+    pub fn write_bytes(data: Bytes) -> Int!:
+        return tcp_write_bytes(self.fd, data)
+
+    # Write all bytes in `data`, looping until every byte is sent.
+    pub fn write_all_bytes(data: Bytes) -> Int!:
+        return tcp.write_all_bytes(self.fd, data)
+
+    # Set the per-read timeout in milliseconds (0 clears it).
+    pub fn set_timeout(ms: Int):
+        tcp_set_timeout(self.fd, ms)
+
+    # Set a read deadline `ms` milliseconds from now (0 clears it).
+    pub fn set_read_deadline(ms: Int):
+        tcp_set_read_deadline(self.fd, ms)
+
+    # Set a write deadline `ms` milliseconds from now (0 clears it).
+    pub fn set_write_deadline(ms: Int):
+        tcp_set_write_deadline(self.fd, ms)
+
+    # Shut down both directions of the socket without closing the handle.
+    pub fn shutdown() -> Bool:
+        return tcp_shutdown(self.fd) == 1
+
+    # Close the socket handle.
+    pub fn close():
+        tcp_close(self.fd)
+
+impl io.Reader for UnixStream:
+    fn read(max_bytes: Int) -> String!:
+        return tcp_read(self.fd, max_bytes)
+
+impl io.BytesReader for UnixStream:
+    fn read_bytes(max_bytes: Int) -> Bytes!:
+        return tcp_read_bytes(self.fd, max_bytes)
+
+impl io.Writer for UnixStream:
+    fn write(data: String) -> Int!:
+        return tcp_write(self.fd, data)
+
+impl io.BytesWriter for UnixStream:
+    fn write_bytes(data: Bytes) -> Int!:
+        return tcp_write_bytes(self.fd, data)
+
+impl io.Closer for UnixStream:
+    fn close():
+        tcp_close(self.fd)
+
+impl Drop for UnixStream:
+    fn drop():
+        tcp_close(self.fd)
+
+fn serve_unix_echo(listener: UnixListener) -> Int:
+    conn := listener.accept() catch:
+        return 1
+    defer conn.close()
+    conn.set_timeout(3000)
+    data := conn.read_exact_bytes(5) catch bytes.empty()
+    if data.len() != 5:
+        return 1
+    conn.write_all_bytes(bytes.concat(bytes.from_string_utf8("echo:"), data)) catch 0
+    return 0
+
+fn unix_http_handler(req: http.HttpRequestBytes) -> http.HttpResponse:
+    path := req.path() catch "/"
+    return http.text(200, "unix-http:" + path)
+
+fn serve_unix_http(listener: UnixListener) -> Int:
+    cfd := listener.accept_fd() catch -1
+    if cfd < 0:
+        return 1
+    tcp_set_timeout(cfd, 3000)
+    http.serve_connection_fd(cfd, unix_http_handler) catch 0
+    return 0
+
+test "unix sockets echo bytes and serve HTTP/1.1 over AF_UNIX":
+    tmp := fs.make_temp_dir("pith-unix-test-")!
+    defer fs.remove_tree(tmp)
+
+    sock1 := path_mod.join(tmp, "echo.sock")
+    l1 := listen(sock1)!
+    defer l1.close()
+    srv1 := spawn serve_unix_echo(l1)
+
+    c1 := connect(sock1)!
+    defer c1.close()
+    c1.set_timeout(3000)
+    c1.write_all_bytes(bytes.from_string_utf8("hello"))!
+    got := c1.read_all_bytes()!.to_string_utf8()!
+    assert_eq(await srv1, 0)
+    assert_eq(got, "echo:hello")
+
+    # Serve HTTP/1.1 over an AF_UNIX socket using std.net.http.
+    sock2 := path_mod.join(tmp, "http.sock")
+    l2 := listen(sock2)!
+    defer l2.close()
+    srv2 := spawn serve_unix_http(l2)
+
+    stream := connect_stream(sock2)!
+    stream.set_timeout(3000)
+    hconn := http.ClientConn(stream, stream.buffered_bytes_reader_chunked(512), stream.buffered_bytes_writer())
+    defer hconn.close()
+    req := http.request("GET", "localhost", 80, "/ping").header("Connection", "close")
+    resp := hconn.send(req)!
+    assert_eq(await srv2, 0)
+    assert_eq(resp.status, 200)
+    assert_eq(resp.body.to_string_utf8()!, "unix-http:/ping")

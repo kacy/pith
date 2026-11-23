@@ -1,4 +1,4 @@
-.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-fresh-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean fuzz-surfaces-check fuzz-surfaces loom-check pithgen-leak count-marks-check-only purl-check
+.PHONY: sanitize-asan sanitize-asan-only sanitize-tsan sanitize-tsan-only pithgen-sanitize check-tls-barriers tls-live-interop tls-go-interop tls-rustls-interop tls-bogo tls-bogo-gate pithgen-check build self-host self-host-ir-driver bootstrap bootstrap-verify bootstrap-ir-checks bootstrap-ir-checks-only bootstrap-ir-fixed-point bootstrap-ir-fixed-point-only bootstrap-ir-invariants bootstrap-ir-invariants-only run-examples run-examples-self run-examples-self-only run-regressions run-regressions-only run-regressions-self run-regressions-self-only run-live-websocket-tests run-live-websocket-tests-self-only db-live-tests parity-examples parity-examples-only check-parse-invalid check-parse-invalid-only check-parse-invalid-self-host check-parse-invalid-self-host-only check-invalid check-invalid-only check-invalid-self-host check-invalid-self-host-only cli-regressions cli-regressions-only cli-regressions-self cli-regressions-self-only test-runner-goldens test-runner-goldens-only abort-goldens abort-goldens-only ir-contract-regressions ir-contract-regressions-only test-std-self test-std-self-only test-self-host-only test-fast-self status-audit check-no-panics check-test-ports safety-check fuzz-check fuzz green-smoke green-threadlocal green-pingpong green-producer-consumer green-waitgroup green-mutex green-semaphore green-barrier green-await-fanin green-echo green-starvation green-pool-wake green-pinned-fairness green-preempted-fairness green-fresh-fairness green-edge-waits green-tests verify-green-corpus verify-green-corpus-only build-corpus-bins-only verify-osthread-corpus verify-osthread-corpus-only docsite docsite-check lsp-check lsp-check-only diag-check diag-check-only zstd-pure-bench zstd-encode-check memcheck memcheck-only leak-check leak-check-only run-regressions-result-box-only memcheck-result-box memcheck-result-box-only leak-check-result-box-only check-bootstrap-seed smoke-bootstrap-seed test clean fuzz-surfaces-check fuzz-surfaces loom-check pithgen-leak count-marks-check-only purl-check
 
 
 # prints a bounded account of a failed regression case: exit status, the
@@ -1309,27 +1309,47 @@ verify-green-corpus: build verify-green-corpus-only
 rc-check-only:
 	@PITH_RC_CHECK=1 $(MAKE) --no-print-directory verify-green-corpus-only green-tests
 
+build-corpus-bins-only:
+	@if [ -z "$$PITH_CORPUS_BIN_DIR" ]; then echo "PITH_CORPUS_BIN_DIR must be set" >&2; exit 1; fi
+	@bash tooling/corpus_build_once.sh "$$PITH_CORPUS_BIN_DIR" $(GREEN_CORPUS_EXPECTED)
+
 verify-green-corpus-only:
 	@echo "--- regression corpus under the green backend (default + 1 worker) ---"
 	@pass=0; fail=0; skip=0; \
-	out=$$(mktemp); err=$$(mktemp); trap 'rm -f "$$out" "$$err"' EXIT; \
+	tmpdir=$$(mktemp -d); out="$$tmpdir/out"; err="$$tmpdir/err"; trap 'rm -rf "$$tmpdir"' EXIT; \
 	for f in $(GREEN_CORPUS_EXPECTED); do \
 		name=$$(basename "$$f" .txt); \
 		src="tests/cases/$$name.pith"; \
 		[ -f "$$src" ] || { skip=$$((skip+1)); continue; }; \
 		expected=$$(cat "$$f"); \
-		timeout 60 env PITH_GREEN=1 ./target/release/pith run "$$src" >"$$out" 2>"$$err"; rc=$$?; \
+		if [ -n "$$PITH_CORPUS_BIN_DIR" ] && [ -x "$$PITH_CORPUS_BIN_DIR/$$name" ]; then \
+			bin="$$PITH_CORPUS_BIN_DIR/$$name"; \
+		else \
+			bin="$$tmpdir/$$name"; \
+			if ! timeout 120 ./target/release/pith build "$$src" -o "$$bin" >"$$out" 2>"$$err"; then \
+				rc=$$?; \
+				echo "FAIL $$name (green build)"; fail=$$((fail+1)); \
+				$(EXPLAIN_CASE_FAILURE) "$$f" "$$out" "$$err" "$$rc"; \
+				rm -f "$$bin" "$$bin.o"; \
+				continue; \
+			fi; \
+			rm -f "$$bin.o"; \
+		fi; \
+		timeout 60 env PITH_GREEN=1 "$$bin" >"$$out" 2>"$$err"; rc=$$?; \
 		if [ "$$(cat "$$out")" != "$$expected" ]; then \
 			echo "FAIL $$name (green default workers)"; fail=$$((fail+1)); \
 			$(EXPLAIN_CASE_FAILURE) "$$f" "$$out" "$$err" "$$rc"; \
+			[ -n "$$PITH_CORPUS_BIN_DIR" ] || rm -f "$$bin"; \
 			continue; \
 		fi; \
-		timeout 60 env PITH_GREEN=1 PITH_GREEN_WORKERS=1 ./target/release/pith run "$$src" >"$$out" 2>"$$err"; rc=$$?; \
+		timeout 60 env PITH_GREEN=1 PITH_GREEN_WORKERS=1 "$$bin" >"$$out" 2>"$$err"; rc=$$?; \
 		if [ "$$(cat "$$out")" != "$$expected" ]; then \
 			echo "FAIL $$name (green 1 worker)"; fail=$$((fail+1)); \
 			$(EXPLAIN_CASE_FAILURE) "$$f" "$$out" "$$err" "$$rc"; \
+			[ -n "$$PITH_CORPUS_BIN_DIR" ] || rm -f "$$bin"; \
 			continue; \
 		fi; \
+		[ -n "$$PITH_CORPUS_BIN_DIR" ] || rm -f "$$bin"; \
 		pass=$$((pass+1)); \
 	done; \
 	echo "$$pass passed, $$fail failed, $$skip without a source"; \
@@ -1347,7 +1367,11 @@ verify-osthread-corpus-only:
 		src="tests/cases/$$name.pith"; \
 		[ -f "$$src" ] || { skip=$$((skip+1)); continue; }; \
 		expected=$$(cat "$$f"); \
-		timeout 60 env PITH_GREEN=0 ./target/release/pith run "$$src" >"$$out" 2>"$$err"; rc=$$?; \
+		if [ -n "$$PITH_CORPUS_BIN_DIR" ] && [ -x "$$PITH_CORPUS_BIN_DIR/$$name" ]; then \
+			timeout 60 env PITH_GREEN=0 "$$PITH_CORPUS_BIN_DIR/$$name" >"$$out" 2>"$$err"; rc=$$?; \
+		else \
+			timeout 60 env PITH_GREEN=0 ./target/release/pith run "$$src" >"$$out" 2>"$$err"; rc=$$?; \
+		fi; \
 		if [ "$$(cat "$$out")" = "$$expected" ]; then \
 			pass=$$((pass+1)); \
 		else \
@@ -1619,19 +1643,7 @@ leak-check-result-box-only:
 # whose return kind is spelled bare, a repeated function name and the other
 # contract rules the driver checks. the generator files (no main) are skipped.
 validate-ir-contract-only:
-	@echo "--- IR contract (ir_driver --combined --validate) over the corpus ---"
-	@[ -x self-host/ir_driver ] || $(MAKE) --no-print-directory self-host-ir-driver
-	@mkdir -p .pith-build
-	@bad=0; n=0; \
-	for f in tests/cases/test_*.pith examples/*.pith; do \
-		grep -q "^fn main" "$$f" || continue; \
-		n=$$((n+1)); \
-		if ! ./self-host/ir_driver --combined --validate "$$f" > /dev/null 2> .pith-build/validate.err; then \
-			bad=$$((bad+1)); echo "VALIDATE FAIL $$f: $$(head -1 .pith-build/validate.err | cut -c1-160)"; \
-		fi; \
-	done; \
-	echo "validated $$n programs, $$bad failed"; \
-	[ $$bad -eq 0 ]
+	@bash tooling/ir_corpus_check.sh validate
 
 # --- count marks ---
 # the `mark` lines PITH_CHECK_COUNTS=1 adds for the count checker (see
@@ -1641,32 +1653,7 @@ validate-ir-contract-only:
 # the same marked ir then goes through the checker, and a function it finds
 # unbalanced, or a borrow a write can drop, fails the target.
 count-marks-check-only:
-	@echo "--- count marks ---"
-	@[ -x self-host/ir_driver ] || $(MAKE) --no-print-directory self-host-ir-driver
-	@mkdir -p .pith-build
-	@PITH_CHECK_COUNTS=1 ./self-host/ir_driver --combined tests/count_marks/marks.pith \
-		| awk '$$1=="func"{f=$$0; next} $$1=="mark"{if(f!=""){print f; f=""} print}' > .pith-build/marks.out
-	@diff -u tests/count_marks/marks.expected .pith-build/marks.out || \
-		{ echo "marks differ from tests/count_marks/marks.expected"; exit 1; }
-	@bad=0; unbalanced=0; n=0; \
-	for f in tests/cases/test_*.pith examples/*.pith; do \
-		grep -q "^fn main" "$$f" || continue; \
-		n=$$((n+1)); \
-		./self-host/ir_driver --combined "$$f" > .pith-build/plain.ir 2>&1; \
-		PITH_CHECK_COUNTS=1 ./self-host/ir_driver --combined "$$f" > .pith-build/withmarks.ir 2>&1; \
-		grep -v '^mark ' .pith-build/withmarks.ir > .pith-build/marked.ir; \
-		if ! cmp -s .pith-build/plain.ir .pith-build/marked.ir; then \
-			bad=$$((bad+1)); echo "MARKS CHANGE THE IR: $$f"; \
-		fi; \
-		PITH_CHECK_COUNTS=only ./target/release/pith build-ir .pith-build/withmarks.ir .pith-build/counts.bin 2>&1 \
-			| grep -E '^  (unbalanced|borrow): ' > .pith-build/counts.out; \
-		if [ -s .pith-build/counts.out ]; then \
-			unbalanced=$$((unbalanced+1)); echo "COUNT CHECK: $$f"; cat .pith-build/counts.out; \
-		fi; \
-	done; \
-	echo "compared $$n programs with and without marks, $$bad differ"; \
-	echo "count-checked $$n programs, $$unbalanced with findings"; \
-	[ $$bad -eq 0 ] && [ $$unbalanced -eq 0 ]
+	@bash tooling/ir_corpus_check.sh count-marks
 
 # --- gzip interop check ---
 # both directions against the system tool: pith reads gzip's output

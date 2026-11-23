@@ -1,21 +1,27 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# cancel an older in-flight run on the same PR when new commits land, while
+# letting every push to main run to completion.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # nothing in ci writes to the repository, so its token is read-only.
 permissions:
   contents: read
 
+# the suite used to run sequentially in one 48-step `build` job that took
+# 80 minutes on a fast runner and crossed the 120-minute timeout on slower
+# runners. splitting it into parallel jobs keeps every job under ~25 minutes
+# even on slow runners without dropping a single check.
 jobs:
-  build:
+  core-and-interop:
     runs-on: ubuntu-latest
-    # the default job timeout is six hours. twice in one day a run wedged
-    # with zero output inside the memcheck step's apt-get preamble (a
-    # mirror stall), and each time it sat until someone noticed — the run
-    # for #811 burned four hours. a wedged run should fail in minutes.
-    # the job takes about 83 minutes on a typical runner and was cancelled
-    # at 90 on a slow one, with every step about a fifth slower, so the bound
-    # sits well above the normal run while still catching a wedge.
-    timeout-minutes: 120
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -62,36 +68,8 @@ jobs:
       - name: green-thread runtime tests
         run: make green-tests
 
-      - name: regression corpus under green
-        run: make verify-green-corpus-only
-
-      # a struct keeps plain counts until it can reach another task; this
-      # aborts any case where a task touched a struct it did not build without
-      # the struct having been marked shared
-      - name: shared-count check over the green corpus
-        run: make rc-check-only
-
-      # the runner is linux, so every other step above already runs green by
-      # default. this is the only step that exercises the PITH_GREEN=0 opt-out
-      # across the corpus.
-      - name: regression corpus under os threads
-        run: make verify-osthread-corpus-only
-
-      # the memcheck step below runs with valgrind's leak check off, because
-      # the runtime's freelists and pools are still reachable at exit and
-      # would bury a real signal. this covers leaks instead, by measuring
-      # growth across two round counts.
-      - name: leak growth
-        run: make leak-check-only
-
-      - name: build self-hosted compiler
-        run: make self-host
-
-      - name: IR contract over the corpus
-        run: make validate-ir-contract-only
-
-      - name: count marks leave the IR unchanged and every count balances
-        run: make count-marks-check-only
+      - name: build self-hosted compiler and ir driver
+        run: make self-host self-host-ir-driver
 
       - name: run examples (self-hosted)
         run: make run-examples-self
@@ -149,26 +127,6 @@ jobs:
 
       - name: pithgen check
         run: make pithgen-check
-
-      - name: memcheck
-        # generous triple of the step's normal time (apt ~1min + the
-        # curated suite ~8min): the observed wedges were apt-mirror stalls
-        # that produced no output at all, so a hard cap converts hours of
-        # silence into a fast, visible failure.
-        timeout-minutes: 30
-        run: |
-          # the install is bounded and retried; see the script for why.
-          tooling/ci_install_valgrind.sh
-          make memcheck
-
-      - name: verify a fresh clone can bootstrap from the seed
-        run: make smoke-bootstrap-seed
-
-      - name: verify the tracked seed matches the emitter source
-        run: make check-bootstrap-seed
-
-      - name: verify bootstrap fixed point
-        run: make bootstrap-verify
 
       - name: lint
         run: |
@@ -242,10 +200,98 @@ jobs:
             fi
           done
 
+  # build the regression corpus executables once in parallel, then execute them
+  # sequentially under green (default + 1 worker), shared-count checks
+  # (PITH_RC_CHECK=1), and os threads (PITH_GREEN=0). all three switches are
+  # pure runtime flags, so compiling once instead of five times tests the exact
+  # same machine code and runtime paths while cutting corpus time ~7x.
+  corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      PITH_CORPUS_BIN_DIR: /tmp/pith-corpus-bins
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: cargo build --release
+
+      - name: compile regression corpus once
+        run: make build-corpus-bins-only
+
+      - name: regression corpus under green
+        run: make verify-green-corpus-only
+
+      # a struct keeps plain counts until it can reach another task; this
+      # aborts any case where a task touched a struct it did not build without
+      # the struct having been marked shared
+      - name: shared-count check over the green corpus
+        run: make rc-check-only
+
+      # the runner is linux, so every other step above already runs green by
+      # default. this is the only step that exercises the PITH_GREEN=0 opt-out
+      # across the corpus.
+      - name: regression corpus under os threads
+        run: make verify-osthread-corpus-only
+
+  # the memcheck step below runs with valgrind's leak check off, because
+  # the runtime's freelists and pools are still reachable at exit and
+  # would bury a real signal. leak growth covers leaks instead, by measuring
+  # growth across two round counts.
+  leak-and-memcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: cargo build --release
+
+      - name: leak growth
+        run: make leak-check-only
+
+      - name: memcheck
+        # generous triple of the step's normal time (apt ~1min + the
+        # curated suite ~8min): the observed wedges were apt-mirror stalls
+        # that produced no output at all, so a hard cap converts hours of
+        # silence into a fast, visible failure.
+        timeout-minutes: 30
+        run: |
+          # the install is bounded and retried; see the script for why.
+          tooling/ci_install_valgrind.sh
+          make memcheck
+
+  ir-and-bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        run: cargo build --release
+
+      - name: build self-hosted compiler
+        run: make self-host
+
+      - name: IR contract over the corpus
+        run: make validate-ir-contract-only
+
+      - name: count marks leave the IR unchanged and every count balances
+        run: make count-marks-check-only
+
+      - name: verify a fresh clone can bootstrap from the seed
+        run: make smoke-bootstrap-seed
+
+      - name: verify the tracked seed matches the emitter source
+        run: make check-bootstrap-seed
+
+      - name: verify bootstrap fixed point
+        run: make bootstrap-verify
+
   # the two-register result abi is the default, so every job above runs it.
   # this one runs the regression corpus, the leak cases and the memcheck set
   # with it off (PITH_RESULT_REG=0), the box abi every `-> T!` function used
-  # before. it runs beside the build job, so it adds no wall time.
+  # before. it runs beside the jobs above, so it adds no wall time.
   result-box:
     runs-on: ubuntu-latest
     timeout-minutes: 60

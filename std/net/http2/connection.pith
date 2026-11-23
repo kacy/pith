@@ -442,11 +442,23 @@ impl Drop for Connection:
         if self.live and self.plaintext:
             tcp_close(self.fd)
 
-# open a connection to `host`:`port` using the caller's tls `config` and run the
-# handshake. the config must offer alpn "h2"; use this to trust a private ca or
-# otherwise customize tls. fails if the peer does not negotiate http/2.
-pub fn connect_with_config(host: String, port: Int, config: tls.Config) -> Connection!:
-    session := tls.dial_with_config(host, port, host, config)!
+# run the http/2 client handshake over an already-handshaked tls session.
+# fails without closing `session` if the peer did not negotiate alpn "h2",
+# so a caller offering ["h2", "http/1.1"] can reuse `session` for http/1.1
+# instead of performing a second tls handshake.
+pub fn connect_tls(session: tls.Conn) -> Connection!:
+    negotiated := session.negotiated_protocol()
+    if negotiated != "h2":
+        fail "http2: server did not negotiate h2 (alpn '{negotiated}')"
+    conn := new_live_connection(session)
+    conn.handshake()!
+    return conn
+
+# open a connection to `host`:`port` with explicit TLS SNI `server_name` using
+# the caller's tls `config` and run the http/2 handshake. fails if the peer
+# does not negotiate http/2.
+pub fn connect_with_config_sni(host: String, port: Int, server_name: String, config: tls.Config) -> Connection!:
+    session := tls.dial_with_config(host, port, server_name, config)!
     negotiated := session.negotiated_protocol()
     if negotiated != "h2":
         session.close()
@@ -454,6 +466,12 @@ pub fn connect_with_config(host: String, port: Int, config: tls.Config) -> Conne
     conn := new_live_connection(session)
     conn.handshake()!
     return conn
+
+# open a connection to `host`:`port` using the caller's tls `config` and run the
+# handshake. the config must offer alpn "h2"; use this to trust a private ca or
+# otherwise customize tls. fails if the peer does not negotiate http/2.
+pub fn connect_with_config(host: String, port: Int, config: tls.Config) -> Connection!:
+    return connect_with_config_sni(host, port, host, config)!
 
 # open a connection to `host`:`port` over tls with alpn "h2", trusting the system
 # roots, and run the handshake. fails if the peer does not negotiate http/2.
@@ -832,6 +850,19 @@ pub fn open(host: String, port: Int) -> Client!:
 # when done.
 pub fn open_h2c(host: String, port: Int) -> Client!:
     conn := connect_h2c(host, port)!
+    return client_from_connection(conn)
+
+# open a multiplexed client over an already-handshaked tls session whose
+# negotiated alpn is "h2". if alpn is not "h2", fails without closing
+# `session` so the caller can reuse it for http/1.1 without a second handshake.
+pub fn open_tls(session: tls.Conn) -> Client!:
+    conn := connect_tls(session)!
+    return client_from_connection(conn)
+
+# open a multiplexed client to `host`:`port` with explicit TLS SNI `server_name`
+# using the caller's tls `config` (which must offer alpn "h2").
+pub fn open_with_config_sni(host: String, port: Int, server_name: String, config: tls.Config) -> Client!:
+    conn := connect_with_config_sni(host, port, server_name, config)!
     return client_from_connection(conn)
 
 # open a multiplexed client using the caller's tls `config` (which must offer
@@ -2845,3 +2876,62 @@ test "a closed or going-away client refuses new streams":
     other := offline_client(connection_from_frames(bytes.empty()))
     other.closed.store(1)
     assert(other.open_stream_with_fields(post_fields(), false, false).is_err)
+
+fn serve_tls_echo_once(listener: tls.Listener) -> Int:
+    conn := tls.accept(listener) catch:
+        return 1
+    defer conn.close()
+    got := conn.read_bytes(4) catch bytes.empty()
+    if got.len() == 4:
+        conn.write_all_bytes(bytes.from_string_utf8("PONG")) catch 0
+    return 0
+
+fn serve_tls_read_preface(listener: tls.Listener) -> Bytes:
+    conn := tls.accept(listener) catch:
+        return bytes.empty()
+    defer conn.close()
+    mut acc := bytes.empty()
+    while acc.len() < 24:
+        chunk := conn.read_bytes(24 - acc.len()) catch bytes.empty()
+        if chunk.len() == 0:
+            break
+        acc = bytes.concat(acc, chunk)
+    return acc
+
+test "connect_tls leaves non-h2 session open for fallback and accepts h2":
+    # 1. Server negotiates http/1.1 -> open_tls fails without closing session,
+    #    allowing immediate application I/O on the same TLS handshake.
+    srv_h1_cfg := tls.server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.with_alpn(["http/1.1"])
+    defer srv_h1_cfg.close()
+    h1_listener := tls.listen("127.0.0.1", 18942, srv_h1_cfg)!
+    defer h1_listener.close()
+    h1_srv := spawn serve_tls_echo_once(h1_listener)
+
+    cli_cfg := tls.client_config_with_ca_file("tests/live/fixtures/localhost-ca.crt")!.with_alpn(["h2", "http/1.1"])
+    defer cli_cfg.close()
+    session := tls.dial_with_config("127.0.0.1", 18942, "localhost", cli_cfg)!
+    defer session.close()
+    assert_eq(session.negotiated_protocol(), "http/1.1")
+    h2_attempt := open_tls(session)
+    assert(h2_attempt.is_err)
+    assert(h2_attempt.err.contains("did not negotiate h2"))
+    # Same TLS session is still live for HTTP/1.1 fallback.
+    session.write_all_bytes(bytes.from_string_utf8("PING"))!
+    reply := session.read_bytes(4)!
+    assert_eq(reply.to_string_utf8()!, "PONG")
+    assert_eq(await h1_srv, 0)
+
+    # 2. Server negotiates h2 -> connect_tls succeeds and sends the client preface.
+    srv_h2_cfg := tls.server_config("tests/live/fixtures/localhost.crt", "tests/live/fixtures/localhost.key")!.with_alpn(["h2", "http/1.1"])
+    defer srv_h2_cfg.close()
+    h2_listener := tls.listen("127.0.0.1", 18943, srv_h2_cfg)!
+    defer h2_listener.close()
+    h2_srv := spawn serve_tls_read_preface(h2_listener)
+
+    h2_session := tls.dial_with_config("127.0.0.1", 18943, "localhost", cli_cfg)!
+    assert_eq(h2_session.negotiated_protocol(), "h2")
+    conn := connect_tls(h2_session)!
+    preface := await h2_srv
+    conn.close()
+    assert_eq(preface.len(), 24)
+    assert_eq(encoding.to_hex(preface), PREFACE_HEX)

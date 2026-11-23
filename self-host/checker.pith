@@ -2046,6 +2046,13 @@ fn interface_value_accepts(value_idx: Int, actual_tid: Int, expected_tid: Int) -
         return false
     if not type_implements_interface_value(get_type_name(actual_tid), get_type_info(expected_tid).name):
         return false
+    # an interface value hides the type behind it, so the sharing checks judge
+    # it by every type that implements the interface. a ByteBuffer among them
+    # would make every writer value a buffer no task could hand on, so a
+    # buffer never becomes one. a generic function bounded by the interface
+    # still takes it, since there the type stays known.
+    if is_runtime_buffer_type(actual_tid):
+        report_error_with_fix_at(value_idx, "E248", "a " + get_type_name(actual_tid) + " cannot become a " + get_type_info(expected_tid).name + " value: the sharing checks could not follow its buffer to another task", "pass it to a generic function bounded by the interface, or write into io.memory_writer()")
     interface_coercions.insert(value_idx, expected_tid)
     return true
 
@@ -4318,7 +4325,27 @@ fn bare_name_import_sources(name: String) -> List[String]:
             sources.push(w.substring(wildcard_needle.len(), w.len()))
     return sources
 
+# the builtins that take a raw pointer as an Int. the runtime checks the
+# pointer's alignment and a magic word, which cannot tell a live buffer from
+# freed memory or a made-up number, so only std.bytes may call them: it keeps
+# each handle in a private field and frees it in the owner's destructor.
+fn is_raw_handle_builtin(name: String) -> Bool:
+    return name.starts_with("byte_buffer_")
+
+# E251 for a raw-handle builtin named outside std.bytes. a function the
+# program declares under the same name is its own and stays callable.
+fn builtin_reachable_here(node_idx: Int, name: String, scope_id: Int) -> Bool:
+    if not is_raw_handle_builtin(name) or in_std_bytes():
+        return true
+    owned_idx := lookup_binding_index_preferring(scope_id, name, current_checker_module_path, bare_name_import_sources(name))
+    if owned_idx >= 0 and binding_decl_node_at(owned_idx) >= 0:
+        return true
+    report_error_with_fix_at(node_idx, "E251", "'" + name + "' is internal to std.bytes", "use bytes.buffer() or bytes.array() and their methods")
+    return false
+
 fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
+    if not builtin_reachable_here(node_idx, name, scope_id):
+        return TID_ERR
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
         # the shared global scope holds every module's top-level names at
@@ -5140,6 +5167,8 @@ fn check_function_call(node: Node, scope_id: Int) -> Int:
 
     if callee_node.kind == "ident":
         name := callee_node.value
+        if not builtin_reachable_here(callee_idx, name, scope_id):
+            return TID_ERR
         # assert_eq / assert_ne take two values of any one type, which no fixed
         # builtin signature describes, so they are resolved by name here rather
         # than registered in checker_builtins.
@@ -8914,6 +8943,8 @@ fn buffer_path(tid: Int, seen: Map[Int, Bool]) -> String:
             if inner != "":
                 return join_buffer_path(i.to_string(), inner)
         return ""
+    if info.kind == "struct" and is_runtime_buffer_type(tid):
+        return "."
     if (info.kind != "struct" and info.kind != "enum") or seen.contains_key(tid):
         return ""
     seen.insert(tid, true)
@@ -8928,6 +8959,10 @@ fn buffer_path(tid: Int, seen: Map[Int, Bool]) -> String:
     # buffer when any of them does
     if is_interface_value_type(tid):
         for impl_tid in interface_implementer_tids(info.name):
+            # a runtime buffer is refused as an interface value, so no value of
+            # the interface holds one
+            if is_runtime_buffer_type(impl_tid):
+                continue
             inner := buffer_path(impl_tid, seen)
             if inner != "":
                 return join_buffer_path(get_type_name(impl_tid), inner)
@@ -8939,6 +8974,19 @@ fn buffer_path(tid: Int, seen: Map[Int, Bool]) -> String:
         if inner != "":
             return join_buffer_path(fname, inner)
     return ""
+
+# whether the code being checked is std.bytes, imported or checked as the root
+# file (its own tests run that way)
+fn in_std_bytes() -> Bool:
+    if current_checker_module_path == "std.bytes":
+        return true
+    return current_checker_module_path == "" and checker_current_file_path().ends_with("std/bytes.pith")
+
+# std.bytes's buffers keep runtime memory behind a private Int handle. the
+# handle reads as a plain number, so the two types count as a buffer by name.
+fn is_runtime_buffer_type(tid: Int) -> Bool:
+    name := get_type_info(tid).name
+    return (name == "ByteBuffer" or name == "ByteArray") and struct_declared_module(tid) == "std.bytes"
 
 fn join_buffer_path(head: String, rest: String) -> String:
     if rest == ".":

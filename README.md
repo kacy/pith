@@ -207,9 +207,9 @@ open defects. the ones to know before you start:
   trace.
 - `.value()` on a `none` stops the program with a runtime error; use
   `if let`, `match` or `unwrap_or` when the optional can be empty.
-- gzip compresses with fixed huffman only, and the regex engine skips
-  counted repeats, backreferences, lazy quantifiers and lookaround on
-  purpose.
+- gzip compresses with fixed huffman only, and the regex engine leaves
+  out backreferences, lazy quantifiers and lookaround on purpose. compile
+  refuses them with an error that names the feature.
 
 ## install
 

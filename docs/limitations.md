@@ -143,12 +143,18 @@ stale and a fix to it is welcome.
   or http/1.1 over alpn. without tls there is no negotiation, so plaintext
   http/2 means calling `listen_h2c`. `std.net.http` itself is http/1.1.
 - **regex is deliberately small**. `std.regex` covers literals, `.`, classes,
-  `\d \w \s`, greedy `* + ?`, alternation, capturing groups and `^ $`. matching
-  is a pike vm, linear in the input. lazy quantifiers and lookaround are
-  compile errors, but counted repeats and backreferences are not: `a{2}`
-  matches the literal text `a{2}` and `(a)\1` matches `a1`. matching works on
-  bytes, so `.` consumes one byte, not one character; a match never ends
-  inside a multi-byte character.
+  `\d \w \s` and their negations, greedy `* + ?`, counted repeats `{n}`,
+  `{n,}` and `{n,m}` up to 1000, alternation, capturing groups, `(?:...)`
+  groups and `^ $`. matching is a pike vm, linear in the input, and
+  `find_all` and `replace_all` are linear in the input too. compile refuses
+  lazy and possessive quantifiers, backreferences, lookaround, atomic and
+  named groups, inline flags, `\b`, posix classes and other escaped letters,
+  with an error that names the feature. a `{` that does not start a counted
+  repeat is a literal, as in go: `a{,2}` matches the text `a{,2}`. iteration
+  skips an empty match right after a match, as go does. matching works on
+  bytes, so `.` consumes one byte, not one character. a match never ends
+  inside a multi-byte character; a pattern whose matches keep doing so is
+  rejected at each start and can make iteration quadratic.
 - **gzip compresses with fixed huffman codes only**. it reads any deflate
   stream and writes valid gzip and zlib, but without dynamic huffman trees the
   output is a few percent larger than it could be.

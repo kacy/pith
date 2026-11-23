@@ -330,6 +330,7 @@ http.serve_connection_with(reader, writer, handler, config)!
 | --- | --- | --- |
 | `read_header_timeout_ms` | 0 | how long the request head may take; 0 falls back to `read_timeout_ms` |
 | `read_timeout_ms` | 0 | how long the head and the body together may take |
+| `read_body_timeout_ms` | 0 | how long the body may take, from the end of the head, sized, chunked or streamed |
 | `write_timeout_ms` | 0 | how long the response may take, from the end of the request head, so the handler counts |
 | `idle_timeout_ms` | 0 | how long a keep-alive connection may wait for its next request; 0 falls back to `read_timeout_ms` |
 | `max_header_bytes` | `MAX_HEADER_BYTES` | the request head, answered with `431` past it |
@@ -356,6 +357,10 @@ read. the clocks start here:
   `read_header_timeout_ms` from that byte.
 - `read_timeout_ms` counts from the same point as the head's time, and covers the
   body too.
+- `read_body_timeout_ms` counts from the end of the head. when `read_timeout_ms`
+  is set as well, the earlier deadline applies. a handler reading a streamed body
+  sees it run out as a `read_body_part` failure equal to
+  `http.BODY_TIMEOUT_MESSAGE`.
 
 a request that runs out of read time once its first byte has arrived is answered
 with `408 Request Timeout` and the connection closes. a connection that runs out

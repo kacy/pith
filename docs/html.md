@@ -78,6 +78,9 @@ still clickable. use `escape_url`.
 the attribute and starts a new one, and none of those are escaped. quote your
 attributes; this module assumes you did.
 
+`std.template` handles both of these for a `<%= %>` value; see
+[where a value lands](#where-a-value-lands).
+
 **an html comment, a tag name, or an attribute name.** none of those are text.
 if untrusted data is deciding what your tags are called, escaping is not the
 problem you have.
@@ -97,10 +100,16 @@ html.safe_url("javascript:alert(1)")     # "about:blank"
 
 accepted: `http`, `https`, `mailto`, `tel`, and a relative url with no scheme.
 refused: every other scheme, and a protocol-relative url (`//evil.example`,
-along with the backslash spellings browsers also accept). the last one is not
-script execution, but an attacker-supplied `href` that silently navigates
-off-site is an open redirect, and an open redirect is exactly what an
-attacker-supplied `href` is for.
+along with the backslash spellings browsers also accept).
+
+`safe_url` stops a link from running script. it does not keep a link on your
+site: `https://evil.example` is an `https` url and passes unchanged. refusing
+`//evil.example` only stops a relative-looking value from leaving the site
+under the page's own scheme. for a redirect to a destination the request
+chose, which is where an open redirect comes from, use
+`web.local_redirect(target, fallback)` from `std.web`. it accepts only a path
+on this site: one leading `/`, not followed by `/` or `\`, with no control
+characters.
 
 the check runs on a copy of the url with control characters, spaces, and
 delete removed, because that is what a browser does before it decides what the
@@ -147,8 +156,8 @@ return http.json_response(200, json.encode(body))
 ## templates
 
 `std.html` is the call you have to remember. `std.template` is the one you do
-not: it renders a page from a context and escapes every interpolated value on
-the way out, unless a human wrote the opt-out.
+not: it renders a page from a context and escapes every interpolated value for
+where it lands, unless a human wrote the opt-out.
 
 ```pith
 import std.template as template
@@ -200,17 +209,17 @@ every place your templates trust a value, which is a property `<%== %>` and
 `{{{ }}}` do not give you.
 
 use it for markup your own program produced, and for a value you have already
-escaped by hand — a url that went through `html.escape_url`, for instance,
-where a second pass of `escape` would corrupt the `&amp;` it just wrote:
-
-```pith
-fn note(title: String, link: String) -> template.Ctx:
-    return template.context().set("title", title).set("link", html.escape_url(link))
-```
+escaped by hand, where a second pass of `escape` would corrupt the `&amp;` it
+wrote. a url from outside does not need it: `<%= %>` in an `href` already
+filters the scheme and escapes.
 
 ```
-<a href="<%raw note.link %>"><%= note.title %></a>
+<a href="<%= note.link %>"><%= note.title %></a>
 ```
+
+`<%raw %>` is allowed in every position, including the ones where `<%= %>` is
+refused below. compile assumes that what it writes does not move the page into
+a different context, such as opening a tag or an attribute it does not close.
 
 ### the context
 
@@ -253,12 +262,44 @@ is checked on the name as written rather than on a resolved path, so there is no
 window between the check and the read and no symlink to race — a name that
 cannot express a traversal cannot become one.
 
-### what the escaping does not cover
+### where a value lands
 
-the renderer escapes with `html.escape`, so it inherits exactly the limits
-above. a `<%= %>` inside a `<script>` block is not safe, and a `<%= %>` in an
-`href` escapes the quotes but does not stop `javascript:`. put the url through
-`html.escape_url` in pith and emit it with `<%raw %>`.
+`compile` reads the literal html of the template with a small tokenizer that
+follows the html spec's states for text, tags, attribute names and values,
+comments, and the raw text of `<script>` and `<style>`. each `<%= %>` is
+escaped for the place it sits:
+
+| where | how |
+| --- | --- |
+| element text, a comment, `<title>`, `<textarea>` | `html.escape` |
+| a quoted attribute value | `html.escape` |
+| an unquoted attribute value | every ascii byte other than a letter, a digit, `-`, `_` or `.` becomes a numeric entity |
+| a url attribute, quoted or not | `html.safe_url`, then the escaping for its quoting |
+
+the url attributes are `href`, `src`, `action`, `formaction`, `xlink:href`,
+`poster`, `cite`, `background`, `data`, `codebase`, `longdesc`, `manifest`
+and `icon`. a value that `safe_url` refuses is written as `about:blank`. the
+check runs on the literal text in front of the value plus the value, so
+`href="/<%= path %>"` with `path` set to `/evil.example` is refused as the
+`//evil.example` a browser would follow, and `href="/users/<%= id %>"` passes
+any id. a second value in the same url is checked by itself, without the
+first.
+
+`compile` refuses a `<%= %>` in these places, where no escaping makes a value
+safe:
+
+- inside `<script>` or `<style>`. pass data to a script as json in a data
+  attribute or a `<script type="application/json">` block.
+- in an event handler attribute (any name starting with `on`), in `style`,
+  and in an iframe's `srcdoc`. put the value in a data attribute and read it
+  from script, or choose a class with `<% if %>`.
+- in a tag name or an attribute name. choose between fixed names with
+  `<% if %>`.
+
+the paths through an `if`, with or without an `else`, must leave the html in
+the same place, and so must a `for` body, so that a value after the block has
+one context. a template that opens a tag or an attribute value in one branch
+and not the other fails to compile.
 
 rendered output is capped at 8 MiB; a page that exceeds it fails rather than
 growing until the process does.

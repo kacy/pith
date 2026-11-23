@@ -66,6 +66,8 @@ PROXY_PORT=18906
 SOCKS_PORT=18907
 SOCKS_AUTH_PORT=18908
 
+UNIX_SOCK="$TMPDIR/fixture.sock"
+
 start_server http "$HTTP_PORT" 200
 start_server tls "$TLS_PORT" 30 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key"
 start_server tls "$MTLS_PORT" 20 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key" "$FIXTURES/clientcert-ca.crt"
@@ -74,6 +76,7 @@ start_server h2 "$H2_PORT" 20 "$FIXTURES/localhost.crt" "$FIXTURES/localhost.key
 start_server proxy "$PROXY_PORT" 10
 start_server socks5 "$SOCKS_PORT" 10
 start_server socks5 "$SOCKS_AUTH_PORT" 10 alice secret
+start_server unix "$UNIX_SOCK" 10
 sleep 0.5
 
 BASE="http://127.0.0.1:$HTTP_PORT"
@@ -456,6 +459,37 @@ if command -v openssl >/dev/null 2>&1; then
     out=$("$PURL" -s --cacert "$FIXTURES/localhost-ca.crt" --cert "$FIXTURES/clientcert-ecdsa.crt" --key "$TMPDIR/client-ec-sec1.key" "https://localhost:$MTLS_PORT/hello")
     assert_eq "mTLS SEC1 EC PRIVATE KEY" "$out" "hello from purl"
 fi
+
+# 46. Multi-value HTTP/1.1 & HTTP/2 request and response headers
+out=$("$PURL" -s -i -H "X-Multi: first" -H "X-Multi: second" -H "x-multi: third" "$BASE/multi-headers")
+assert_contains "HTTP/1.1 multi-value request headers" "$out" "first|second|third"
+assert_contains "HTTP/1.1 multi-value response X-Resp-Multi 1" "$out" "X-Resp-Multi: one"
+assert_contains "HTTP/1.1 multi-value response X-Resp-Multi 2" "$out" "X-Resp-Multi: two"
+assert_contains "HTTP/1.1 multi-value response Link 1" "$out" "Link: </a.css>; rel=preload"
+assert_contains "HTTP/1.1 multi-value response Link 2" "$out" "Link: </b.js>; rel=preload"
+
+out=$("$PURL" -s -i --http2-prior-knowledge -H "X-Multi: h2a" -H "X-Multi: h2b" "http://127.0.0.1:$H2C_PORT/multi-headers")
+assert_contains "HTTP/2 multi-value request headers" "$out" "h2a|h2b"
+assert_contains "HTTP/2 multi-value response X-Resp-Multi 1" "$out" "x-resp-multi: one"
+assert_contains "HTTP/2 multi-value response X-Resp-Multi 2" "$out" "x-resp-multi: two"
+
+# Replacing a default header via -H still replaces rather than duplicating.
+out=$("$PURL" -s -H "User-Agent: custom-override/1" "$BASE/echo")
+assert_contains "-H replaces default User-Agent cleanly" "$out" '"user_agent":"custom-override/1"'
+
+# 47. --unix-socket over AF_UNIX (skips DNS, preserves Host & multi-value headers, streams -o)
+out=$("$PURL" -s --unix-socket "$UNIX_SOCK" "http://unresolvable.unix.local/hello")
+assert_eq "--unix-socket basic GET (skips DNS)" "$out" "hello from purl"
+
+out=$("$PURL" -s --unix-socket "$UNIX_SOCK" -H "X-Multi: u1" -H "X-Multi: u2" "http://docker.local/multi-headers")
+assert_eq "--unix-socket multi-value headers" "$out" "u1|u2"
+
+out=$("$PURL" -s --unix-socket "$UNIX_SOCK" "http://docker.local/echo")
+assert_contains "--unix-socket preserves Host" "$out" '"host":"docker.local"'
+
+"$PURL" -s --unix-socket "$UNIX_SOCK" -o "$TMPDIR/unix_big.bin" "http://localhost/big"
+unix_sz=$(wc -c < "$TMPDIR/unix_big.bin" | tr -d ' ')
+assert_eq "--unix-socket streaming -o 64KiB" "$unix_sz" "65536"
 
 printf '\nIntegration summary: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

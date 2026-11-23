@@ -141,6 +141,12 @@ pub struct StreamedHttpRequest:
     pub req: HttpRequestBytes
     pub body_size: Int
 
+# a single ordered HTTP header field (name and value), preserving case and
+# repeated occurrences on the wire.
+pub struct HeaderField:
+    pub name: String
+    pub value: String
+
 # structured response data used by the bytes-first server helpers.
 pub struct HttpResponse:
     pub status: Int
@@ -151,6 +157,9 @@ pub struct HttpResponse:
     # http/2 response trailers (a header block sent after the body). empty for
     # ordinary responses; grpc carries its grpc-status/grpc-message here.
     pub trailers: Map[String, String]
+    # ordered wire header fields, preserving repeated names. populated when
+    # parsed from the wire or built with add_header().
+    pub raw_headers: List[HeaderField] = []
 
 # response metadata returned when a body is streamed into a writer.
 pub struct StreamedHttpResponse:
@@ -159,6 +168,8 @@ pub struct StreamedHttpResponse:
     pub headers: Map[String, String]
     pub set_cookie_headers: List[String]
     pub body_size: Int
+    # ordered wire header fields, preserving repeated names.
+    pub raw_headers: List[HeaderField] = []
 
 # a small builder for outbound http client requests.
 pub struct ClientRequest:
@@ -177,6 +188,8 @@ pub struct ClientRequest:
     # optional TLS SNI / certificate verification hostname when dialing a
     # different address in `host` (e.g. --resolve / --connect-to). empty means `host`.
     pub server_name: String = ""
+    # additional header fields appended by add_header() when a name repeats.
+    pub extra_headers: List[HeaderField] = []
 
 # a reusable plain http client connection. it owns its stream: close() gives
 # back the socket and the reader's and writer's registry entries, and a
@@ -271,6 +284,38 @@ fn copy_string_list(items: List[String]) -> List[String]:
     for item in items:
         copied.push(item)
     return copied
+
+fn copy_header_fields(items: List[HeaderField]) -> List[HeaderField]:
+    mut copied: List[HeaderField] := []
+    for item in items:
+        copied.push(item)
+    return copied
+
+fn header_fields_without(items: List[HeaderField], name: String) -> List[HeaderField]:
+    mut copied: List[HeaderField] := []
+    for item in items:
+        if not header_key_matches(item.name, name):
+            copied.push(item)
+    return copied
+
+fn header_fields_lookup_all(items: List[HeaderField], name: String) -> List[String]:
+    mut values: List[String] := []
+    for item in items:
+        if header_key_matches(item.name, name):
+            values.push(item.value)
+    return values
+
+fn header_fields_has(items: List[HeaderField], name: String) -> Bool:
+    for item in items:
+        if header_key_matches(item.name, name):
+            return true
+    return false
+
+fn header_has_key(headers: Map[String, String], name: String) -> Bool:
+    for key in headers:
+        if header_key_matches(key, name):
+            return true
+    return false
 
 fn parse_cookie_map(header_value: String) -> Map[String, String]:
     mut cookies: Map[String, String] := {}
@@ -1607,6 +1652,22 @@ impl HttpRequestBytes:
             if value != "":
                 return value
         return head_header_value(self.head, name)
+    # every value for `name` in wire order (case-insensitive). if header_map
+    # holds an override (e.g. an absolute-form Host), that single value wins.
+    fn header_values(name: String) -> List[String]:
+        if self.header_map.len() > 0:
+            value := header_lookup(self.header_map, name)
+            if value != "":
+                return [value]
+        return header_fields_lookup_all(head_raw_headers(self.head), name)
+    # every header field in wire order, preserving spelling and repeated names.
+    fn raw_headers() -> List[HeaderField]:
+        mut items := head_raw_headers(self.head)
+        if self.header_map.len() > 0:
+            for key in self.header_map:
+                items = header_fields_without(items, key)
+                items.push(HeaderField(key, self.header_map[key]))
+        return items
     # every header field as a map with lowercase names, repeated fields
     # combined as header() combines them.
     fn header_fields() -> Map[String, String]:
@@ -2309,12 +2370,12 @@ fn stream_response_body_raw(src: ByteSource, parsed: ResponseHead, writer: Buffe
 fn response_from_parsed(parsed: ResponseHead, body: Bytes, trailers: Map[String, String]) -> HttpResponse:
     headers := response_headers_map(parsed.head)
     content_type := header_lookup(headers, "Content-Type")
-    return HttpResponse(parsed.status, content_type, header_without(headers, "Content-Type"), body, response_set_cookie_headers(parsed.head), trailers)
+    return HttpResponse(parsed.status, content_type, header_without(headers, "Content-Type"), body, response_set_cookie_headers(parsed.head), trailers, head_raw_headers(parsed.head))
 
 fn streamed_response_from_parsed(parsed: ResponseHead, body_size: Int) -> StreamedHttpResponse:
     headers := response_headers_map(parsed.head)
     content_type := header_lookup(headers, "Content-Type")
-    return StreamedHttpResponse(parsed.status, content_type, header_without(headers, "Content-Type"), response_set_cookie_headers(parsed.head), body_size)
+    return StreamedHttpResponse(parsed.status, content_type, header_without(headers, "Content-Type"), response_set_cookie_headers(parsed.head), body_size, head_raw_headers(parsed.head))
 
 # read one whole response from `src`: the head and the body it frames, the body
 # at most `limit` bytes.
@@ -2644,20 +2705,48 @@ impl Cookie:
 impl HttpResponse:
     fn header(name: String, value: String) -> HttpResponse:
         if header_key_matches(name, "Content-Type"):
-            return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
+            mut next_raw: List[HeaderField] := []
+            if self.raw_headers.len() > 0:
+                next_raw = header_fields_without(self.raw_headers, "Content-Type")
+                next_raw.push(HeaderField("Content-Type", value))
+            return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers), next_raw)
         # Set-Cookie repeats rather than replaces (rfc 9110 5.3), so it lives in
         # the list both the http/1.1 and the http/2 writers send from
         if header_key_matches(name, "Set-Cookie"):
             mut cookies := copy_string_list(self.set_cookie_headers)
             cookies.push(value)
-            return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, cookies, copy_headers_map(self.trailers))
-        return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
+            mut next_raw := copy_header_fields(self.raw_headers)
+            if next_raw.len() > 0:
+                next_raw.push(HeaderField(name, value))
+            return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, cookies, copy_headers_map(self.trailers), next_raw)
+        mut next_raw: List[HeaderField] := []
+        if self.raw_headers.len() > 0:
+            next_raw = header_fields_without(self.raw_headers, name)
+            next_raw.push(HeaderField(name, value))
+        return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers), next_raw)
+
+    # append a header field without replacing earlier values of the same name.
+    fn add_header(name: String, value: String) -> HttpResponse:
+        if header_key_matches(name, "Set-Cookie"):
+            return self.header(name, value)
+        mut next_raw := copy_header_fields(self.raw_headers)
+        if next_raw.len() == 0:
+            if self.content_type != "":
+                next_raw.push(HeaderField("Content-Type", self.content_type))
+            for key in self.headers:
+                next_raw.push(HeaderField(key, self.headers[key]))
+            for cookie in self.set_cookie_headers:
+                next_raw.push(HeaderField("Set-Cookie", cookie))
+        next_raw.push(HeaderField(name, value))
+        if header_key_matches(name, "Content-Type"):
+            return HttpResponse(self.status, value, header_without(self.headers, "Content-Type"), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers), next_raw)
+        return HttpResponse(self.status, self.content_type, header_with(self.headers, name, value), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers), next_raw)
 
     fn with_body_text(text: String) -> HttpResponse:
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), bytes.from_string_utf8(text), copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), bytes.from_string_utf8(text), copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers), copy_header_fields(self.raw_headers))
 
     fn with_body_bytes(data: Bytes) -> HttpResponse:
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), data, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers))
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), data, copy_string_list(self.set_cookie_headers), copy_headers_map(self.trailers), copy_header_fields(self.raw_headers))
 
     fn with_json(handle: Int) -> HttpResponse:
         body_bytes := json_mod.encode_bytes(handle)
@@ -2684,14 +2773,18 @@ impl HttpResponse:
         return self.header("Connection", "close")
 
     fn set_cookie(item: Cookie) -> HttpResponse:
+        serialized := serialize_cookie(item)
         mut next := copy_string_list(self.set_cookie_headers)
-        next.push(serialize_cookie(item))
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, next, copy_headers_map(self.trailers))
+        next.push(serialized)
+        mut next_raw := copy_header_fields(self.raw_headers)
+        if next_raw.len() > 0:
+            next_raw.push(HeaderField("Set-Cookie", serialized))
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, next, copy_headers_map(self.trailers), next_raw)
 
     # sets the http/2 response trailers (replacing any existing). grpc uses this
     # to carry grpc-status/grpc-message after the body.
     fn with_trailers(t: Map[String, String]) -> HttpResponse:
-        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(t))
+        return HttpResponse(self.status, self.content_type, copy_headers_map(self.headers), self.body, copy_string_list(self.set_cookie_headers), copy_headers_map(t), copy_header_fields(self.raw_headers))
 
     fn clear_cookie(name: String) -> HttpResponse:
         return self.set_cookie(expired_cookie(name))
@@ -2719,6 +2812,24 @@ impl HttpResponse:
             if self.content_type != "":
                 return self.content_type
         return header_lookup(self.headers, name)
+
+    # every value for `name` in wire order (case-insensitive).
+    fn header_values(name: String) -> List[String]:
+        if header_key_matches(name, "Set-Cookie"):
+            return copy_string_list(self.set_cookie_headers)
+        if self.raw_headers.len() > 0:
+            found := header_fields_lookup_all(self.raw_headers, name)
+            if found.len() > 0:
+                return found
+            if header_key_matches(name, "Content-Type") and self.content_type != "":
+                return [self.content_type]
+            return []
+        if header_key_matches(name, "Content-Type") and self.content_type != "":
+            return [self.content_type]
+        for key in self.headers:
+            if header_key_matches(key, name):
+                return [self.headers[key]]
+        return []
 
     fn body_bytes() -> Bytes:
         return self.body
@@ -2838,19 +2949,32 @@ fn write_response_head(out: ByteBuffer, response: HttpResponse, body_length: Int
         write_field(out, "Content-Type", strip_header_controls(response.content_type))!
     mut explicit_length := ""
     mut has_date := false
-    for key in response.headers:
-        # as in net/http, a server drops a bad name: the handler has already
-        # returned, so there is nobody to give an error to.
-        if not is_field_name(key):
-            continue
-        if header_key_matches(key, "Content-Length"):
-            explicit_length = response.headers[key].trim()
-            continue
-        if header_key_matches(key, "Content-Type") or header_key_matches(key, "Set-Cookie") or header_key_matches(key, "Transfer-Encoding") or header_key_matches(key, "Connection"):
-            continue
-        if header_key_matches(key, "Date"):
-            has_date = true
-        write_field(out, strip_header_controls(key), strip_header_controls(response.headers[key]))!
+    if response.raw_headers.len() > 0:
+        for item in response.raw_headers:
+            if not is_field_name(item.name):
+                continue
+            if header_key_matches(item.name, "Content-Length"):
+                explicit_length = item.value.trim()
+                continue
+            if header_key_matches(item.name, "Content-Type") or header_key_matches(item.name, "Set-Cookie") or header_key_matches(item.name, "Transfer-Encoding") or header_key_matches(item.name, "Connection"):
+                continue
+            if header_key_matches(item.name, "Date"):
+                has_date = true
+            write_field(out, strip_header_controls(item.name), strip_header_controls(item.value))!
+    else:
+        for key in response.headers:
+            # as in net/http, a server drops a bad name: the handler has already
+            # returned, so there is nobody to give an error to.
+            if not is_field_name(key):
+                continue
+            if header_key_matches(key, "Content-Length"):
+                explicit_length = response.headers[key].trim()
+                continue
+            if header_key_matches(key, "Content-Type") or header_key_matches(key, "Set-Cookie") or header_key_matches(key, "Transfer-Encoding") or header_key_matches(key, "Connection"):
+                continue
+            if header_key_matches(key, "Date"):
+                has_date = true
+            write_field(out, strip_header_controls(key), strip_header_controls(response.headers[key]))!
     for line in response.set_cookie_headers:
         write_field(out, "Set-Cookie", strip_header_controls(line))!
     write_framing_field(out, response.status, body_length, use_chunked, explicit_length, head_request)!
@@ -2881,6 +3005,24 @@ impl StreamedHttpResponse:
             if self.content_type != "":
                 return self.content_type
         return header_lookup(self.headers, name)
+
+    # every value for `name` in wire order (case-insensitive).
+    fn header_values(name: String) -> List[String]:
+        if header_key_matches(name, "Set-Cookie"):
+            return copy_string_list(self.set_cookie_headers)
+        if self.raw_headers.len() > 0:
+            found := header_fields_lookup_all(self.raw_headers, name)
+            if found.len() > 0:
+                return found
+            if header_key_matches(name, "Content-Type") and self.content_type != "":
+                return [self.content_type]
+            return []
+        if header_key_matches(name, "Content-Type") and self.content_type != "":
+            return [self.content_type]
+        for key in self.headers:
+            if header_key_matches(key, name):
+                return [self.headers[key]]
+        return []
 
     fn cookies() -> List[String]:
         return copy_string_list(self.set_cookie_headers)
@@ -4063,7 +4205,7 @@ fn content_etag(modified: Int, size: Int) -> String:
 
 # `resp` with its status replaced.
 fn with_status(resp: HttpResponse, status: Int) -> HttpResponse:
-    return HttpResponse(status, resp.content_type, resp.headers, resp.body, resp.set_cookie_headers, resp.trailers)
+    return HttpResponse(status, resp.content_type, resp.headers, resp.body, resp.set_cookie_headers, resp.trailers, copy_header_fields(resp.raw_headers))
 
 # the answer to `req` for a representation: the validators, the
 # preconditions, then a single range, several ranges or the whole content.
@@ -4262,6 +4404,32 @@ fn response_set_cookie_headers(raw_head: Bytes) -> List[String]:
         pos = pos + 1
     return result
 
+# every header field in a response or request head, in wire order, preserving
+# spelling and repeated names.
+fn head_raw_headers(raw_head: Bytes) -> List[HeaderField]:
+    mut result: List[HeaderField] := []
+    hdrs := headers_bytes(raw_head)
+    mut line_start := 0
+    mut pos := 0
+    while pos <= hdrs.len():
+        at_end := pos == hdrs.len()
+        mut at_nl := false
+        if not at_end:
+            at_nl = hdrs[pos] == 10
+        if at_end or at_nl:
+            line_end := trim_trailing_cr(hdrs, line_start, pos)
+            if line_end > line_start:
+                colon := find_byte(hdrs, line_start, 58)
+                if colon > line_start and colon < line_end:
+                    name := (decode_utf8(hdrs.slice(line_start, colon)) catch "").trim()
+                    if name != "":
+                        value_start := trim_ascii_start(hdrs, colon + 1, line_end)
+                        value_end := trim_ascii_end(hdrs, value_start, line_end)
+                        result.push(HeaderField(name, decode_utf8(hdrs.slice(value_start, value_end)) catch ""))
+            line_start = pos + 1
+        pos = pos + 1
+    return result
+
 # parses a raw http response payload into a structured response. the head is
 # checked as read_response_buffered_bytes checks it, and the body is framed by
 # it, so bytes past a declared length are ignored.
@@ -4433,7 +4601,11 @@ fn host_header_value(host: String, port: Int, use_tls: Bool) -> String:
 # chunked. any other Transfer-Encoding a request names is dropped, and the
 # body is sent with a Content-Length.
 fn request_sends_chunked(req: ClientRequest) -> Bool:
-    return header_lookup(req.headers, "Transfer-Encoding").trim().to_lower() == "chunked"
+    mut te := header_lookup(req.headers, "Transfer-Encoding")
+    for item in req.extra_headers:
+        if header_key_matches(item.name, "Transfer-Encoding"):
+            te = item.value
+    return te.trim().to_lower() == "chunked"
 
 # whether a request with an empty body still says Content-Length: 0. as in
 # net/http, only the methods that expect a body do.
@@ -4471,6 +4643,15 @@ fn request_head_bytes(req: ClientRequest, target: String, connection: String, ac
             has_connection = has_connection or req.headers[key] != ""
         elif header_key_matches(key, "Accept-Encoding"):
             has_accept_encoding = true
+    for item in req.extra_headers:
+        if not is_field_name(item.name):
+            fail "invalid header field name: " + strip_header_controls(item.name)
+        if header_key_matches(item.name, "Host"):
+            has_host = has_host or item.value != ""
+        elif header_key_matches(item.name, "Connection"):
+            has_connection = has_connection or item.value != ""
+        elif header_key_matches(item.name, "Accept-Encoding"):
+            has_accept_encoding = true
     mut line := strip_header_controls(req.method) + " " + strip_header_controls(target) + " HTTP/1.1" + crlf
     if not has_host:
         line = line + "Host: " + strip_header_controls(host_header_value(req.host, req.port, req.use_tls)) + crlf
@@ -4485,6 +4666,12 @@ fn request_head_bytes(req: ClientRequest, target: String, connection: String, ac
         # second header or splice a whole request into the outbound
         # stream. the response path applies the same guard.
         out.write(bytes.from_string_utf8(strip_header_controls(key) + ": " + strip_header_controls(req.headers[key]) + crlf)) catch 0
+    for item in req.extra_headers:
+        if header_key_matches(item.name, "Content-Length") or header_key_matches(item.name, "Transfer-Encoding"):
+            continue
+        if item.value == "" and (header_key_matches(item.name, "Host") or header_key_matches(item.name, "Connection")):
+            continue
+        out.write(bytes.from_string_utf8(strip_header_controls(item.name) + ": " + strip_header_controls(item.value) + crlf)) catch 0
     mut tail := ""
     if connection != "" and not has_connection:
         tail = tail + "Connection: " + connection + crlf
@@ -4612,18 +4799,22 @@ fn redirect_request(req: ClientRequest, resp: HttpResponse) -> ClientRequest!:
     mut next_method := req.method
     mut next_body := req.body
     mut next_headers := copy_headers_map(req.headers)
+    mut next_extra := copy_header_fields(req.extra_headers)
     if not redirect_preserves_method(resp.status, req.method):
         next_method = "GET"
     # only 307 and 308 send the body again
     if resp.status != 307 and resp.status != 308:
         next_body = bytes.empty()
         next_headers = header_without(header_without(next_headers, "Content-Type"), "Transfer-Encoding")
+        next_extra = header_fields_without(header_fields_without(next_extra, "Content-Type"), "Transfer-Encoding")
     mut next_sni := req.server_name
     if request_origin_changed(req, next_use_tls, next_host, next_port):
         next_headers = header_without(next_headers, "Authorization")
         next_headers = header_without(next_headers, "Cookie")
+        next_extra = header_fields_without(next_extra, "Authorization")
+        next_extra = header_fields_without(next_extra, "Cookie")
         next_sni = ""
-    return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, next_sni)
+    return ClientRequest(next_method, next_host, next_port, normalize_path(next_path), next_headers, next_body, next_use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, next_sni, next_extra)
 
 # one http/1.1 client connection: a plain socket with its buffered reader and
 # writer, or a tls session over the socket. `key` names the origin it was
@@ -4741,7 +4932,7 @@ fn send_request_following_redirects_with_tls_config(req: ClientRequest, tls_conf
 # the tls send path shared by send_tls_with_config and its traced wrapper: force
 # tls on, then dispatch to the plain-host redirect path or a single sni request.
 fn send_tls_request(req: ClientRequest, server_name: String, config: tls.Config) -> HttpResponse!:
-    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, server_name)
+    current := ClientRequest(req.method, req.host, req.port, req.path, copy_headers_map(req.headers), req.body, true, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, server_name, copy_header_fields(req.extra_headers))
     if server_name != req.host:
         return send_request_wire(current, server_name, config)
     return send_request_following_redirects_with_tls_config(current, config)
@@ -4841,8 +5032,8 @@ pub fn end_server_span(span: trace.Span, status: Int):
 # redirect limit. the redirect's body was already read and dropped, so the
 # response handed to redirect_request carries only its status and fields.
 fn streamed_redirect_request(current: ClientRequest, resp: StreamedHttpResponse, redirects_left: Int) -> ClientRequest!:
-    next := redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}))!
-    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left, next.max_response_body_bytes, next.server_name)
+    next := redirect_request(current, HttpResponse(resp.status, resp.content_type, copy_headers_map(resp.headers), bytes.empty(), copy_string_list(resp.set_cookie_headers), {}, copy_header_fields(resp.raw_headers)))!
+    return ClientRequest(next.method, next.host, next.port, next.path, copy_headers_map(next.headers), next.body, next.use_tls, next.timeout_ms, redirects_left, next.max_response_body_bytes, next.server_name, copy_header_fields(next.extra_headers))
 
 fn send_request_following_redirects_into(req: ClientRequest, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
     mut current := req
@@ -4885,7 +5076,28 @@ fn request_tls_server_name(req: ClientRequest) -> String:
 
 impl ClientRequest:
     fn header(name: String, value: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
+        return ClientRequest(self.method, self.host, self.port, self.path, header_with(self.headers, name, value), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name, header_fields_without(self.extra_headers, name))
+
+    # append a header field without replacing earlier values of the same name.
+    fn add_header(name: String, value: String) -> ClientRequest:
+        if not header_has_key(self.headers, name):
+            mut next_headers := copy_headers_map(self.headers)
+            next_headers.insert(name, value)
+            return ClientRequest(self.method, self.host, self.port, self.path, next_headers, self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name, copy_header_fields(self.extra_headers))
+        mut next_extra := copy_header_fields(self.extra_headers)
+        next_extra.push(HeaderField(name, value))
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name, next_extra)
+
+    # every value set for `name` in insertion order (case-insensitive).
+    fn header_values(name: String) -> List[String]:
+        mut values: List[String] := []
+        for key in self.headers:
+            if header_key_matches(key, name):
+                values.push(self.headers[key])
+        for item in self.extra_headers:
+            if header_key_matches(item.name, name):
+                values.push(item.value)
+        return values
 
     fn keep_alive() -> ClientRequest:
         return self.header("Connection", "keep-alive")
@@ -4894,13 +5106,13 @@ impl ClientRequest:
         return self.header("Connection", "close")
 
     fn with_timeout(ms: Int) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, ms, self.redirect_limit, self.max_response_body_bytes, self.server_name, copy_header_fields(self.extra_headers))
 
     fn follow_redirects(limit: Int) -> ClientRequest:
         mut next_limit := limit
         if next_limit < 0:
             next_limit = 0
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, next_limit, self.max_response_body_bytes, self.server_name)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, next_limit, self.max_response_body_bytes, self.server_name, copy_header_fields(self.extra_headers))
 
     fn no_redirects() -> ClientRequest:
         return self.follow_redirects(0)
@@ -4908,14 +5120,14 @@ impl ClientRequest:
     # the most this request's buffered response body may hold, in place of the
     # client's limit or MAX_RESPONSE_BODY.
     fn with_max_response_body_bytes(limit: Int) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, limit, self.server_name)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, limit, self.server_name, copy_header_fields(self.extra_headers))
 
     # override the TLS SNI and certificate hostname while dialing `self.host`.
     fn with_server_name(name: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, name)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, name, copy_header_fields(self.extra_headers))
 
     fn query_param(name: String, value: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
+        return ClientRequest(self.method, self.host, self.port, append_query_param_to_path(self.path, name, value), copy_headers_map(self.headers), self.body, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name, copy_header_fields(self.extra_headers))
 
     fn query_params(values: Map[String, String]) -> ClientRequest:
         mut next := self
@@ -4924,10 +5136,10 @@ impl ClientRequest:
         return next
 
     fn body_text(text: String) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text), self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), bytes.from_string_utf8(text), self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name, copy_header_fields(self.extra_headers))
 
     fn body_bytes(data: Bytes) -> ClientRequest:
-        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name)
+        return ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), data, self.use_tls, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, self.server_name, copy_header_fields(self.extra_headers))
 
     fn text_body(text: String) -> ClientRequest:
         return self.body_text(text)
@@ -5018,7 +5230,7 @@ impl ClientRequest:
         return self.send_tls_into_with_config(self.host, config, writer)
 
     fn send_tls_into_with_config(server_name: String, config: tls.Config, writer: BufferedBytesWriter) -> StreamedHttpResponse!:
-        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, server_name)
+        current := ClientRequest(self.method, self.host, self.port, self.path, copy_headers_map(self.headers), self.body, true, self.timeout_ms, self.redirect_limit, self.max_response_body_bytes, server_name, copy_header_fields(self.extra_headers))
         if server_name == self.host:
             return send_request_following_redirects_into_with_tls_config(current, config, writer)
         return send_request_wire_into(current, server_name, config, writer, false)
@@ -5229,6 +5441,8 @@ pub struct OpenResponse:
     mut in_chunk: Bool
     mut finished: Bool
     mut closed: Bool
+    # ordered wire header fields, preserving repeated names.
+    pub raw_headers: List[HeaderField] = []
 
 # net/http's DefaultMaxIdleConnsPerHost and the idle timeout of its
 # DefaultTransport.
@@ -5406,12 +5620,12 @@ fn proxy_for(proxy: String, no_proxy: String, host: String, port: Int) -> String
 # proxy url carried credentials, or removed inside an HTTPS CONNECT tunnel so
 # proxy credentials are never sent to the origin server.
 fn apply_route_proxy_auth(req: ClientRequest, route: ClientRoute) -> ClientRequest:
-    if route.tunnel and header_lookup(req.headers, "Proxy-Authorization") != "":
+    if route.tunnel and (header_lookup(req.headers, "Proxy-Authorization") != "" or header_fields_has(req.extra_headers, "Proxy-Authorization")):
         mut next_headers: Map[String, String] := {}
         for k in req.headers:
             if k.to_lower() != "proxy-authorization":
                 next_headers.insert(k, req.headers[k])
-        return ClientRequest(req.method, req.host, req.port, req.path, next_headers, req.body, req.use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, req.server_name)
+        return ClientRequest(req.method, req.host, req.port, req.path, next_headers, req.body, req.use_tls, req.timeout_ms, req.redirect_limit, req.max_response_body_bytes, req.server_name, header_fields_without(req.extra_headers, "Proxy-Authorization"))
     if route.absolute and route.proxy_auth != "" and header_lookup(req.headers, "Proxy-Authorization") == "":
         return req.header("Proxy-Authorization", route.proxy_auth)
     return req
@@ -5647,7 +5861,7 @@ impl Client:
                 if parsed.kind == BodyFraming.Exact:
                     length = parsed.content_length
                 reusable := self.keep_alives and not parsed.wants_close and parsed.status != 101 and not request_prefers_close_header(req)
-                return OpenResponse(status: resp.status, content_type: resp.content_type, headers: resp.headers, set_cookie_headers: resp.set_cookie_headers, content_length: length, client: self, conn: c, src: wire_source(c), head: parsed, reusable: reusable, left: parsed.content_length, in_chunk: false, finished: false, closed: false)
+                return OpenResponse(status: resp.status, content_type: resp.content_type, headers: resp.headers, set_cookie_headers: resp.set_cookie_headers, content_length: length, client: self, conn: c, src: wire_source(c), head: parsed, reusable: reusable, left: parsed.content_length, in_chunk: false, finished: false, closed: false, raw_headers: resp.raw_headers)
             wire_close(c)
             if retried or not c.reused or head.err != NO_RESPONSE_MESSAGE or not request_replayable(req):
                 fail head.err
@@ -5685,7 +5899,7 @@ impl Client:
         resp := response_from_parsed(result.parsed, result.body, result.trailers)
         if not result.decoded:
             return resp
-        return HttpResponse(resp.status, resp.content_type, header_without(header_without(resp.headers, "Content-Encoding"), "Content-Length"), resp.body, resp.set_cookie_headers, resp.trailers)
+        return HttpResponse(resp.status, resp.content_type, header_without(header_without(resp.headers, "Content-Encoding"), "Content-Length"), resp.body, resp.set_cookie_headers, resp.trailers, header_fields_without(header_fields_without(resp.raw_headers, "Content-Encoding"), "Content-Length"))
 
     # send `req`, then each redirect it is answered with, up to max_redirects.
     # a redirect without a Location is the final response.
@@ -6164,6 +6378,24 @@ impl OpenResponse:
         else:
             wire_close(self.conn)
 
+    # every value for `name` in wire order (case-insensitive).
+    fn header_values(name: String) -> List[String]:
+        if header_key_matches(name, "Set-Cookie"):
+            return copy_string_list(self.set_cookie_headers)
+        if self.raw_headers.len() > 0:
+            found := header_fields_lookup_all(self.raw_headers, name)
+            if found.len() > 0:
+                return found
+            if header_key_matches(name, "Content-Type") and self.content_type != "":
+                return [self.content_type]
+            return []
+        if header_key_matches(name, "Content-Type") and self.content_type != "":
+            return [self.content_type]
+        for key in self.headers:
+            if header_key_matches(key, name):
+                return [self.headers[key]]
+        return []
+
 # whether a client request names Expect: 100-continue.
 fn request_expects_continue(req: ClientRequest) -> Bool:
     return header_lookup(req.headers, "Expect").trim().to_lower() == "100-continue"
@@ -6175,7 +6407,14 @@ fn response_content_encoding(head: Bytes) -> String:
 # whether a client request's own Connection field asks to close.
 fn request_prefers_close_header(req: ClientRequest) -> Bool:
     value := bytes.from_string_utf8(header_lookup(req.headers, "Connection"))
-    return list_has_token(value, 0, value.len(), "close")
+    if list_has_token(value, 0, value.len(), "close"):
+        return true
+    for item in req.extra_headers:
+        if header_key_matches(item.name, "Connection"):
+            extra := bytes.from_string_utf8(item.value)
+            if list_has_token(extra, 0, extra.len(), "close"):
+                return true
+    return false
 
 # extracts one route parameter from a matched path pattern.
 pub fn route_param(req: HttpRequestBytes, pattern: String, name: String) -> String!:
@@ -7382,3 +7621,172 @@ test "parse_http_date accepts 4-digit hyphenated cookie dates":
     ts3 := parse_http_date("Wednesday, 21-Oct-2035 07:28:00 GMT")!
     assert_eq(ts1, ts2)
     assert_eq(ts1, ts3)
+
+test "ClientRequest add_header emits repeated headers in order and header replaces all":
+    mut req := get_request("example.test", 80, "/items")
+    req = req.add_header("X-Tag", "one").add_header("X-Tag", "two").add_header("x-tag", "three")
+    req = req.add_header("Accept", "application/json").with_timeout(1500).query_param("a", "1")
+    vals := req.header_values("x-tag")
+    assert_eq(vals.len(), 3)
+    assert_eq(vals[0], "one")
+    assert_eq(vals[1], "two")
+    assert_eq(vals[2], "three")
+
+    wire := request_head_bytes(req, req.path, "close", false)!.to_string_utf8()!
+    i1 := wire.index_of("X-Tag: one\r\n")
+    i2 := wire.index_of("X-Tag: two\r\n")
+    i3 := wire.index_of("x-tag: three\r\n")
+    assert(i1 >= 0)
+    assert(i2 > i1)
+    assert(i3 > i2)
+    assert(wire.contains("Accept: application/json\r\n"))
+
+    # header() replaces all earlier values of the same name across headers and extra_headers.
+    replaced := req.header("X-Tag", "only")
+    rep_vals := replaced.header_values("X-Tag")
+    assert_eq(rep_vals.len(), 1)
+    assert_eq(rep_vals[0], "only")
+    rep_wire := request_head_bytes(replaced, replaced.path, "close", false)!.to_string_utf8()!
+    assert(rep_wire.contains("X-Tag: only\r\n"))
+    assert(not rep_wire.contains("X-Tag: one"))
+    assert(not rep_wire.contains("X-Tag: two"))
+    assert(not rep_wire.contains("x-tag: three"))
+
+    # invalid header name in extra_headers is still rejected.
+    bad := req.add_header("Bad Name", "val")
+    assert(request_head_bytes(bad, "/", "close", false).is_err)
+
+test "ClientRequest redirect and tunnel proxy strip sensitive extra_headers":
+    mut req := post_request("origin.test", 80, "/upload").body_bytes(bytes.from_string_utf8("body"))
+    req = req.add_header("Authorization", "Bearer first").add_header("Authorization", "Bearer second")
+    req = req.add_header("Cookie", "a=1").add_header("Cookie", "b=2")
+    req = req.add_header("Content-Type", "text/plain").add_header("Content-Type", "text/html")
+    req = req.add_header("X-Keep", "k1").add_header("X-Keep", "k2")
+    cross := redirect_request(req, response(302).header("Location", "http://other.test/next"))!
+    assert_eq(cross.header_values("Authorization").len(), 0)
+    assert_eq(cross.header_values("Cookie").len(), 0)
+    assert_eq(cross.header_values("Content-Type").len(), 0)
+    kept := cross.header_values("X-Keep")
+    assert_eq(kept.len(), 2)
+    assert_eq(kept[0], "k1")
+    assert_eq(kept[1], "k2")
+
+    # CONNECT tunnel strips repeated Proxy-Authorization from headers and extra_headers.
+    mut tunnel_req := https_request_port("GET", "api.example.com", 443, "/v1")
+    tunnel_req = tunnel_req.add_header("Proxy-Authorization", "Basic aaa").add_header("Proxy-Authorization", "Basic bbb")
+    tunnel_req = tunnel_req.add_header("X-Trace", "t1").add_header("X-Trace", "t2")
+    tunnel_route := ClientRoute("k", "proxy.test", 3128, false, true, "Basic aaa")
+    stripped := apply_route_proxy_auth(tunnel_req, tunnel_route)
+    assert_eq(stripped.header_values("Proxy-Authorization").len(), 0)
+    assert_eq(stripped.header_values("X-Trace").len(), 2)
+
+test "HttpResponse add_header, serialization, and parsing preserve repeated headers":
+    mut built := text(200, "hello").header("X-Single", "s")
+    built = built.add_header("X-Multi", "first").add_header("X-Multi", "second")
+    built = built.add_header("Link", "</a.css>; rel=preload").add_header("Link", "</b.js>; rel=preload")
+    built = built.add_header("Set-Cookie", "c1=v1").add_header("Set-Cookie", "c2=v2")
+    assert_eq(built.header_value("X-Multi"), "second")
+    mvals := built.header_values("x-multi")
+    assert_eq(mvals.len(), 2)
+    assert_eq(mvals[0], "first")
+    assert_eq(mvals[1], "second")
+    assert_eq(built.header_values("Content-Type").len(), 1)
+    assert_eq(built.header_values("Set-Cookie").len(), 2)
+
+    wire := built.to_bytes()!
+    wire_text := wire.to_string_utf8()!
+    i1 := wire_text.index_of("X-Multi: first\r\n")
+    i2 := wire_text.index_of("X-Multi: second\r\n")
+    assert(i1 >= 0)
+    assert(i2 > i1)
+    assert(wire_text.contains("Link: </a.css>; rel=preload\r\n"))
+    assert(wire_text.contains("Link: </b.js>; rel=preload\r\n"))
+
+    # round-trip through parse_response_bytes preserves raw_headers and header_values.
+    parsed := parse_response_bytes(wire)!
+    assert_eq(parsed.header_value("X-Multi"), "second")
+    pm := parsed.header_values("X-Multi")
+    assert_eq(pm.len(), 2)
+    assert_eq(pm[0], "first")
+    assert_eq(pm[1], "second")
+    pl := parsed.header_values("link")
+    assert_eq(pl.len(), 2)
+    assert_eq(pl[0], "</a.css>; rel=preload")
+    assert_eq(pl[1], "</b.js>; rel=preload")
+    assert_eq(parsed.header_values("Set-Cookie").len(), 2)
+    assert(parsed.raw_headers.len() >= 6)
+
+    # calling header() after add_header() replaces all values for that name.
+    replaced := built.header("X-Multi", "sole")
+    rm := replaced.header_values("X-Multi")
+    assert_eq(rm.len(), 1)
+    assert_eq(rm[0], "sole")
+    rep_wire := replaced.to_bytes()!.to_string_utf8()!
+    assert(rep_wire.contains("X-Multi: sole\r\n"))
+    assert(not rep_wire.contains("X-Multi: first"))
+    assert(not rep_wire.contains("X-Multi: second"))
+
+test "HttpRequestBytes header_values and raw_headers preserve repeated request headers":
+    raw := "GET /multi HTTP/1.1\r\nHost: example.test\r\nX-Dup: alpha\r\nX-Single: one\r\nx-dup: beta\r\nX-Dup: gamma\r\n\r\n"
+    req := build_http_request(bytes.from_string_utf8(raw), bytes.empty())!
+    assert_eq(req.header("X-Dup")!, "alpha, beta, gamma")
+    vals := req.header_values("X-Dup")
+    assert_eq(vals.len(), 3)
+    assert_eq(vals[0], "alpha")
+    assert_eq(vals[1], "beta")
+    assert_eq(vals[2], "gamma")
+    raw_fields := req.raw_headers()
+    assert_eq(raw_fields.len(), 5)
+    assert_eq(raw_fields[1].name, "X-Dup")
+    assert_eq(raw_fields[1].value, "alpha")
+    assert_eq(raw_fields[3].name, "x-dup")
+    assert_eq(raw_fields[3].value, "beta")
+
+fn serve_multi_header_test(listener: Int):
+    mut served := 0
+    while served < 2:
+        conn_fd := tcp_accept(listener) catch -1
+        if conn_fd >= 0:
+            req := read_request_bytes(conn_fd)
+            if req.is_ok:
+                echoed := req.ok.header_values("X-Client-Multi").join("|")
+                mut resp := text(200, echoed)
+                resp = resp.add_header("X-Server-Multi", "s1").add_header("X-Server-Multi", "s2")
+                resp = resp.add_header("Link", "<one>").add_header("Link", "<two>")
+                wire := resp.to_bytes()
+                if wire.is_ok:
+                    send_response_bytes(conn_fd, wire.ok) catch 0
+            tcp_close(conn_fd)
+            served = served + 1
+
+test "loopback HTTP/1.1 multi-value headers survive Client send and send_to_file":
+    port := 18944
+    listener := tcp_listen("127.0.0.1", port)!
+    assert(listener >= 0)
+    defer tcp_close(listener)
+    spawn serve_multi_header_test(listener)
+
+    c := client().with_keep_alives(false)
+    mut req := get_request("127.0.0.1", port, "/echo")
+    req = req.add_header("X-Client-Multi", "c1").add_header("X-Client-Multi", "c2").add_header("X-Client-Multi", "c3")
+    resp := c.send(req)!
+    assert_eq(resp.status, 200)
+    assert_eq(resp.body_text()!, "c1|c2|c3")
+    sv := resp.header_values("X-Server-Multi")
+    assert_eq(sv.len(), 2)
+    assert_eq(sv[0], "s1")
+    assert_eq(sv[1], "s2")
+    lv := resp.header_values("Link")
+    assert_eq(lv.len(), 2)
+    assert_eq(lv[0], "<one>")
+    assert_eq(lv[1], "<two>")
+
+    tmp_path := "/tmp/pith_http_multi_header_streamed.txt"
+    defer fs.remove(tmp_path)
+    streamed := c.send_to_file(req, tmp_path)!
+    assert_eq(streamed.status, 200)
+    ssv := streamed.header_values("X-Server-Multi")
+    assert_eq(ssv.len(), 2)
+    assert_eq(ssv[0], "s1")
+    assert_eq(ssv[1], "s2")
+    assert_eq(fs.read(tmp_path)!, "c1|c2|c3")

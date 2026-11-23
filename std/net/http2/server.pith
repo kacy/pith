@@ -729,13 +729,20 @@ fn response_fields(response: http.HttpResponse) -> List[hpack.HeaderField]:
     mut fields: List[hpack.HeaderField] := [hpack.header_field(":status", response.status.to_string())]
     if response.content_type != "":
         fields.push(hpack.header_field("content-type", response.content_type))
-    for key in response.headers:
-        name := key.to_lower()
-        # as on http/1.1, cookies come from the list alone: a response read by
-        # the http client also has its last one in this map
-        if is_hop_by_hop(name) or name == "content-type" or name == "content-length" or name == "set-cookie":
-            continue
-        fields.push(hpack.header_field(name, response.headers[key]))
+    if response.raw_headers.len() > 0:
+        for item in response.raw_headers:
+            name := item.name.to_lower()
+            if is_hop_by_hop(name) or name == "content-type" or name == "content-length" or name == "set-cookie":
+                continue
+            fields.push(hpack.header_field(name, item.value))
+    else:
+        for key in response.headers:
+            name := key.to_lower()
+            # as on http/1.1, cookies come from the list alone: a response read by
+            # the http client also has its last one in this map
+            if is_hop_by_hop(name) or name == "content-type" or name == "content-length" or name == "set-cookie":
+                continue
+            fields.push(hpack.header_field(name, response.headers[key]))
     for cookie in response.set_cookie_headers:
         fields.push(hpack.header_field("set-cookie", cookie))
     return fields
@@ -2137,3 +2144,33 @@ test "an accepted tls connection is in the drain count before its handshake star
     release_tls_listener(listener)
     config.close()
     shutdown.reset()
+
+test "response_fields emits repeated headers from HttpResponse.add_header":
+    mut resp := http.text(200, "ok")
+    resp = resp.add_header("X-Multi", "alpha").add_header("X-Multi", "beta")
+    resp = resp.add_header("Link", "<a>").add_header("Link", "<b>")
+    resp = resp.add_header("Set-Cookie", "s=1").add_header("Set-Cookie", "s=2")
+    fields := response_fields(resp)
+    mut multi: List[String] := []
+    mut links: List[String] := []
+    mut cookies: List[String] := []
+    mut ct_count := 0
+    for f in fields:
+        if f.name == "x-multi":
+            multi.push(f.value)
+        elif f.name == "link":
+            links.push(f.value)
+        elif f.name == "set-cookie":
+            cookies.push(f.value)
+        elif f.name == "content-type":
+            ct_count = ct_count + 1
+    assert_eq(ct_count, 1)
+    assert_eq(multi.len(), 2)
+    assert_eq(multi[0], "alpha")
+    assert_eq(multi[1], "beta")
+    assert_eq(links.len(), 2)
+    assert_eq(links[0], "<a>")
+    assert_eq(links[1], "<b>")
+    assert_eq(cookies.len(), 2)
+    assert_eq(cookies[0], "s=1")
+    assert_eq(cookies[1], "s=2")

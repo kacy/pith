@@ -1,0 +1,22 @@
+# a scalar field may be written from any task with no lock. two tasks bump
+# the same counter, which is a logic race (the final count can come out low)
+# but not a memory one: a race on a number frees nothing. the sanitizer gate
+# skips this case under tsan, which reports the race it is built to show.
+struct Counter:
+    name: String
+    hits: Int
+
+fn bump(c: Counter, n: Int) -> Int:
+    mut total := 0
+    for i in 0..n:
+        c.hits = c.hits + 1
+        total = total + c.name.len()
+    return total
+
+fn main() -> Int!:
+    c := Counter(name: "service", hits: 0)
+    a := spawn bump(c, 1000)
+    b := spawn bump(c, 1000)
+    print("read {await a} {await b}")
+    print("counted at most 2000: {c.hits <= 2000}")
+    return 0

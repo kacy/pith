@@ -1,14 +1,12 @@
 # the shapes the shared-field rule (E248, E276, E309) still accepts. a
 # counted field no code reassigns after its struct is built is settled, and
-# every task may read it; a scalar field may be written from any task, since a
-# race on a number frees nothing; a field in a guard block is written under its
-# lock; a reassigned field of another struct with the same name does not count;
-# and a global that tasks write sits in a guard block or is threadlocal.
+# every task may read it; a field in a guard block is written under its lock;
+# a reassigned field of another struct with the same name does not count; and
+# a global that tasks write sits in a guard block or is threadlocal.
+# test_scalar_field_race covers a scalar field written from several tasks.
 struct Config:
     name: String
     tags: Inner?
-    # a counter tasks bump with no lock: a logic race, not a memory one
-    hits: Int
 
 struct Inner:
     label: String
@@ -37,7 +35,6 @@ fn rename(o: Other):
 fn read_config(c: Config, n: Int) -> Int:
     mut total := 0
     for i in 0..n:
-        c.hits = c.hits + 1
         total = total + c.name.len()
         if c.tags != none:
             total = total + c.tags.value().label.len()
@@ -75,7 +72,7 @@ fn consume(ch: Channel[Config]) -> Int:
 fn main() -> Int!:
     other := Other(name: "x")
     rename(other)
-    c := Config(name: "service", tags: Inner(label: "blue"), hits: 0)
+    c := Config(name: "service", tags: Inner(label: "blue"))
     a := spawn read_config(c, 1000)
     b := spawn read_config(c, 1000)
     print("config {await a} {await b}")

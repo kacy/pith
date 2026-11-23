@@ -65,6 +65,20 @@ measures_memory=(
   test_struct_store_ownership
 )
 
+# a case whose expected output includes a time bound. the sanitizers slow a
+# program several times over, so these can miss the bound; they still run,
+# and still fail on a report, but their output is not compared.
+measures_time=(
+  test_regex_linear
+)
+
+# a case that races on a scalar field on purpose, to show the compiler
+# accepts it. tsan reports exactly that race, so tsan skips these; asan
+# still runs them.
+races_on_purpose=(
+  test_scalar_field_race
+)
+
 export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:detect_stack_use_after_return=0:allocator_may_return_null=1}"
 # tsan's thread leak report is off: on the os-thread backend a task whose
 # handle was stored or passed on and never awaited (a deadline that gave up on
@@ -119,7 +133,7 @@ run_case() {
   fi
   if grep -q -E '^==[0-9]+==ERROR: (Address|Thread)Sanitizer|^WARNING: ThreadSanitizer' "$log"; then
     echo "REPORT $name $backend"
-  elif [[ " ${measures_memory[*]} " == *" $(basename "$name") "* ]]; then
+  elif [[ " ${measures_memory[*]} ${measures_time[*]} " == *" $(basename "$name") "* ]]; then
     echo "ok $name $backend"
   elif [ "$(cat "$out")" != "$(cat "$expected")" ]; then
     echo "FAIL $name $backend"
@@ -198,6 +212,7 @@ if [ "$scope" = all ] || [ "$scope" = corpus ]; then
   git ls-files -z tests/cases | xargs -0 cp --parents -t "$work"
   for expected in tests/expected/*.txt; do
     name="$(basename "$expected" .txt)"
+    [ "$kind" = tsan ] && [[ " ${races_on_purpose[*]} " == *" $name "* ]] && continue
     [ -f "tests/cases/$name.pith" ] && echo "tests/cases/$name"
   done | xargs -P "$jobs" -I{} "$0" "$kind" --case "$work" {} "$backends" >>"$results"
 fi

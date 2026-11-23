@@ -23,6 +23,7 @@ tasks:
 | code | what it refuses |
 |---|---|
 | E248 | handing a task (by spawn, closure capture or channel send) a value whose buffer the sender still holds |
+| E251 | naming a private field outside its module, or a raw-handle `byte_buffer_*` builtin outside `std.bytes` |
 | E271 | touching a guarded field without holding its lock |
 | E276 | a guarded buffer that is still reachable after the lock is released |
 | E309 | a module global that every task can reach and that is changed after init |

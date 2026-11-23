@@ -546,6 +546,40 @@ pub fn circuit(breaker: resilience.Breaker) -> fn(fn(Request) -> http.HttpRespon
             breaker.success()
         return resp
 
+# Whether `target` is a path on this site, safe to redirect to when it came
+# from the request (a `next` parameter after login, say).
+#
+# it must start with exactly one `/`. a second `/` or a `\` after it makes a
+# protocol-relative url, which a browser follows to another host, and any other
+# start is a scheme or a relative path. a control byte anywhere refuses it,
+# since a browser drops tab and newline from a url before it parses it, which
+# turns `/<TAB>/evil.example` into `//evil.example`.
+pub fn is_local_path(target: String) -> Bool:
+    if target.len() == 0 or ord(target[0]) != 47:
+        return false
+    if target.len() > 1:
+        second := ord(target[1])
+        if second == 47 or second == 92:
+            return false
+    mut i := 0
+    while i < target.len():
+        byte := ord(target[i])
+        if byte < 32 or byte == 127:
+            return false
+        i = i + 1
+    return true
+
+# A 303 to `target` when `is_local_path` accepts it, and to `fallback`
+# otherwise. this is the redirect for a destination the request chose: an
+# absolute url, or a `//host` one, never leaves the site.
+#
+#   return web.local_redirect(req.query("next"), "/")
+pub fn local_redirect(target: String, fallback: String) -> http.HttpResponse:
+    mut location := fallback
+    if is_local_path(target):
+        location = target
+    return http.response(303).header("Location", location)
+
 # a middleware that answers 413 to a request whose body is longer than
 # `limit` bytes, the per-route counterpart of http.MaxBytesReader. the server
 # has already read the body by the time a middleware runs, bounded by the
@@ -1077,6 +1111,27 @@ fn bracket_b(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpR
 # middleware can short-circuit the chain.
 fn short_circuit(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpResponse:
     return http.text(200, "blocked")
+
+test "is_local_path accepts only a path on this site":
+    assert_eq(is_local_path("/"), true)
+    assert_eq(is_local_path("/account?tab=keys#top"), true)
+    assert_eq(is_local_path("/a//b"), true)
+    assert_eq(is_local_path(""), false)
+    assert_eq(is_local_path("account"), false)
+    assert_eq(is_local_path("https://evil.example"), false)
+    assert_eq(is_local_path("javascript:alert(1)"), false)
+    assert_eq(is_local_path("//evil.example"), false)
+    assert_eq(is_local_path("/\\evil.example"), false)
+    assert_eq(is_local_path("/\t/evil.example"), false)
+    assert_eq(is_local_path("/\n/evil.example"), false)
+    assert_eq(is_local_path("\\\\evil.example"), false)
+
+test "local_redirect falls back for a target off the site":
+    home := local_redirect("https://evil.example/", "/")
+    assert_eq(home.status, 303)
+    assert_eq(home.header_value("Location"), "/")
+    there := local_redirect("/account", "/")
+    assert_eq(there.header_value("Location"), "/account")
 
 test "middleware composes as an onion, first registered outermost":
     handler := fn(req: Request) => http.text(200, "core")

@@ -114,7 +114,11 @@ struct Ring {
     dequeue_pos: PaddedPos,
 }
 
+// SAFETY: `Slot::cell` is only accessed after exclusively claiming the slot via
+// atomic sequence/position CASes (Acquire/Release).
 unsafe impl Send for Ring {}
+// SAFETY: Concurrent senders and receivers synchronize every cell read/write
+// through the Vyukov sequence protocol on `Slot::sequence`.
 unsafe impl Sync for Ring {}
 
 impl Ring {
@@ -161,6 +165,7 @@ impl Ring {
     }
 
     /// lock-free enqueue: false when the channel is at capacity.
+    #[inline(always)]
     fn try_enqueue(&self, value: i64, capacity: usize) -> bool {
         let mut pos = self.enqueue_pos.0.load(Ordering::Relaxed);
         loop {
@@ -184,6 +189,8 @@ impl Ring {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
+                        // SAFETY: Slot was claimed exclusively via `enqueue_pos` CAS and its
+                        // sequence matched `pos`; the Release store below publishes the write.
                         unsafe { *slot.cell.get() = value };
                         // release-publish the value to the dequeuer at this pos.
                         slot.sequence.store(pos + 1, Ordering::Release);
@@ -202,6 +209,7 @@ impl Ring {
     }
 
     /// lock-free dequeue: None when the channel is empty.
+    #[inline(always)]
     fn try_dequeue(&self) -> Option<i64> {
         let mut pos = self.dequeue_pos.0.load(Ordering::Relaxed);
         loop {
@@ -216,6 +224,8 @@ impl Ring {
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
+                        // SAFETY: Slot was claimed exclusively via `dequeue_pos` CAS and
+                        // `seq == pos + 1` Acquire-synchronized with the enqueuer's Release store.
                         let value = unsafe { *slot.cell.get() };
                         // hand the slot to the enqueuer one lap later.
                         slot.sequence.store(pos + self.mask + 1, Ordering::Release);
@@ -368,30 +378,45 @@ struct TaggedChannel {
     inner: ChannelInner,
 }
 
-/// the channel behind a handle, or None for anything that is not one. an
-/// aligned pointer whose first word is the tag is accepted; a freed channel had
-/// its tag scrubbed, so a stale handle is rejected here like a garbage one.
-#[inline]
-unsafe fn channel_ref<'a>(handle: i64) -> Option<&'a TaggedChannel> {
-    channel_ref_for(handle, crate::quarantine::Op::Use)
-}
-
-/// `channel_ref`, naming what the caller does with the channel in a
-/// quarantine report.
+/// Validate `handle` as a `TaggedChannel` for `op` and borrow it for the
+/// duration of `f`. An aligned pointer whose first word is `CHANNEL_MAGIC` is
+/// accepted; a freed channel had its magic scrubbed, so a stale handle is
+/// rejected here like a garbage one.
+///
+/// # Safety
+/// `handle` must be a live channel handle kept alive for `f`, or garbage
+/// rejected by alignment/magic.
 #[inline(always)]
-unsafe fn channel_ref_for<'a>(handle: i64, op: crate::quarantine::Op) -> Option<&'a TaggedChannel> {
+unsafe fn with_channel_for<R>(
+    handle: i64,
+    op: crate::quarantine::Op,
+    f: impl FnOnce(&TaggedChannel) -> R,
+) -> Option<R> {
     let ptr = handle as *const TaggedChannel;
     if !handle_registry::plausibly_aligned::<TaggedChannel>(ptr as *const ()) {
         return None;
     }
-    if !crate::quarantine::magic_is(
-        std::ptr::addr_of!((*ptr).magic),
-        CHANNEL_MAGIC,
-        op,
-    ) {
+    // SAFETY: Alignment verified; `magic_is` validates the magic word before dereferencing.
+    let valid = unsafe {
+        crate::quarantine::magic_is(std::ptr::addr_of!((*ptr).magic), CHANNEL_MAGIC, op)
+    };
+    if !valid {
         return None;
     }
-    Some(&*ptr)
+    // SAFETY: Magic word matched `CHANNEL_MAGIC`; handle stays live for `f`.
+    let channel = unsafe { &*ptr };
+    Some(f(channel))
+}
+
+/// Validate `handle` as a `TaggedChannel` for ordinary use and borrow it for
+/// the duration of `f`.
+///
+/// # Safety
+/// Same requirements as [`with_channel_for`].
+#[inline(always)]
+unsafe fn with_channel<R>(handle: i64, f: impl FnOnce(&TaggedChannel) -> R) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_channel_for(handle, crate::quarantine::Op::Use, f) }
 }
 
 #[cfg(test)]
@@ -422,7 +447,8 @@ impl ParkCount {
     #[inline]
     fn take(&self) {
         if !self.taken.get() {
-            unsafe { (*self.t).refs.fetch_add(1, Ordering::Relaxed) };
+            // SAFETY: Caller's handle keeps `self.t` live when `take` is called.
+            unsafe { &*self.t }.refs.fetch_add(1, Ordering::Relaxed);
             self.taken.set(true);
         }
     }
@@ -431,27 +457,54 @@ impl ParkCount {
 impl Drop for ParkCount {
     fn drop(&mut self) {
         if self.taken.get() {
-            unsafe { release_count(&*self.t) };
+            let should_free = {
+                // SAFETY: `ParkCount` holds a refcount keeping `self.t` live through `dec_count`.
+                let t = unsafe { &*self.t };
+                dec_count(t)
+            };
+            if should_free {
+                // SAFETY: `dec_count` released the last count and no reference to `self.t` remains.
+                unsafe { free_channel(self.t as *mut TaggedChannel) };
+            }
         }
     }
 }
 
-/// one owner fewer; the last one frees. shared by the language's release and
-/// by a parked operation's completion.
-unsafe fn release_count(t: &TaggedChannel) {
+/// Decrement one owner count. Returns `true` if the last owner was just
+/// released and the caller must free the channel.
+#[inline(always)]
+fn dec_count(t: &TaggedChannel) -> bool {
     let prev = t.refs.fetch_sub(1, Ordering::Release);
     if prev > 1 {
-        return;
+        return false;
     }
     if prev == 0 {
         crate::quarantine::over_release(crate::quarantine::Kind::Channel);
         // an over-release: put the count back rather than wrap. the same guard
         // every other kind's release has.
         t.refs.fetch_add(1, Ordering::Relaxed);
-        return;
+        return false;
     }
     acquire_last_count!(t.refs);
-    free_channel(t as *const TaggedChannel as *mut TaggedChannel);
+    true
+}
+
+/// Release any queued non-primitive payloads on a quiescent channel being freed.
+fn drain_channel_elements(t: &TaggedChannel) {
+    let tag = crate::collections::list::element_tag_from_code(t.payload_tag as i32);
+    if matches!(tag, crate::collections::list::ListTypeTag::Primitive) {
+        return;
+    }
+    if let Some(ring) = &t.inner.ring {
+        while let Some(v) = ring.try_dequeue() {
+            // SAFETY: Channel owned one refcount on each queued payload matching `tag`.
+            unsafe { crate::collections::list::release_element(tag, v) };
+        }
+    }
+    if let Some(v) = lock_state(&t.inner.state).pending_value.take() {
+        // SAFETY: Channel owned one refcount on the pending payload matching `tag`.
+        unsafe { crate::collections::list::release_element(tag, v) };
+    }
 }
 
 /// nothing names the body any more (no owner, no parked call), so the ring is
@@ -459,22 +512,19 @@ unsafe fn release_count(t: &TaggedChannel) {
 /// released by the payload tag; a payload that is itself a channel releases
 /// through this same path, which holds no lock, so that is fine.
 unsafe fn free_channel(p: *mut TaggedChannel) {
-    let tag = crate::collections::list::element_tag_from_code((*p).payload_tag as i32);
-    if !matches!(tag, crate::collections::list::ListTypeTag::Primitive) {
-        if let Some(ring) = &(*p).inner.ring {
-            while let Some(v) = ring.try_dequeue() {
-                crate::collections::list::release_element(tag, v);
-            }
-        }
-        if let Some(v) = lock_state(&(*p).inner.state).pending_value.take() {
-            crate::collections::list::release_element(tag, v);
-        }
-    }
-    let bytes = channel_bytes((*p).capacity as usize);
+    let bytes = {
+        // SAFETY: Caller guarantees `p` is quiescent with no remaining owners.
+        let t = unsafe { &*p };
+        drain_channel_elements(t);
+        channel_bytes(t.capacity as usize)
+    };
     // a stale handle must fail validation from here on
-    (*p).magic = 0;
-    let magic = std::ptr::addr_of_mut!((*p).magic);
-    crate::quarantine::free_box(p, magic, crate::quarantine::Kind::Channel);
+    // SAFETY: No references to `*p` remain; `p` came from `Box::into_raw`.
+    unsafe {
+        (*p).magic = 0;
+        let magic = std::ptr::addr_of_mut!((*p).magic);
+        crate::quarantine::free_box(p, magic, crate::quarantine::Kind::Channel);
+    }
     crate::perf_count(&crate::PERF_CHANNEL_FREES, 1);
     crate::perf_count(&crate::PERF_CHANNEL_FREED_BYTES, bytes);
     #[cfg(test)]
@@ -668,21 +718,28 @@ pub extern "C" fn pith_channel_new(capacity: i64, payload_tag: i64) -> i64 {
     ptr as i64
 }
 
+#[inline(always)]
+fn retain_channel(t: &TaggedChannel) {
+    t.refs.fetch_add(1, Ordering::Relaxed);
+}
+
 /// One more owner of this handle: a binding, a field, an element, or a
 /// capture took a copy. Garbage handles are ignored, like every other kind.
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_retain(handle: i64) {
-    if let Some(t) = channel_ref_for(handle, crate::quarantine::Op::Retain) {
-        t.refs.fetch_add(1, Ordering::Relaxed);
-    }
+    // SAFETY: `handle` is validated by `with_channel_for` before borrowing its refcount.
+    unsafe { with_channel_for(handle, crate::quarantine::Op::Retain, retain_channel) };
 }
 
 /// One owner fewer; the last owner frees the channel, releasing any values
 /// still queued by the payload tag.
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_release(handle: i64) {
-    if let Some(t) = channel_ref_for(handle, crate::quarantine::Op::Release) {
-        release_count(t);
+    // SAFETY: `handle` is validated by `with_channel_for` before borrowing its refcount.
+    if unsafe { with_channel_for(handle, crate::quarantine::Op::Release, dec_count) } == Some(true)
+    {
+        // SAFETY: `dec_count` released the last count and the borrow of `TaggedChannel` has ended.
+        unsafe { free_channel(handle as *mut TaggedChannel) };
     }
 }
 
@@ -767,7 +824,8 @@ const SPIN_TRIES: usize = 64;
 /// whichever fence comes second sees the other side's write: the waker sees the
 /// incremented gate (and notifies under the mutex, which the parker holds until
 /// it actually waits), or the parker's re-try sees the freed slot.
-unsafe fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, value: i64) -> i64 {
+#[inline]
+fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, value: i64) -> i64 {
     let capacity = inner.capacity;
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
@@ -807,7 +865,8 @@ unsafe fn buffered_send(park: &ParkCount, inner: &ChannelInner, ring: &Ring, val
 /// the buffered recv, mirror of `buffered_send`: lock-free dequeue on the fast
 /// path; park under the mutex only when the ring is empty. a closed channel
 /// still drains: the dequeue try comes before the closed check.
-unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> Option<i64> {
+#[inline]
+fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> Option<i64> {
     let green_task = green::current_task();
     let mut spins = if green_task.is_none() { SPIN_TRIES } else { 0 };
     loop {
@@ -856,13 +915,9 @@ unsafe fn buffered_recv(park: &ParkCount, inner: &ChannelInner, ring: &Ring) -> 
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
-    // an unknown or freed handle gets the closed channel's answer: the send is
-    // refused.
-    let Some(t) = channel_ref(handle) else {
-        return 0;
-    };
+#[inline(always)]
+fn channel_send_impl(t: &TaggedChannel, value: i64) -> i64 {
+    // declared first so it drops last (see `ParkCount`).
     let park = ParkCount::new(t);
     let inner = &t.inner;
     // a buffered channel's values live in the lock-free ring; the mutex is only
@@ -913,10 +968,15 @@ pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
-    let Some(t) = channel_ref(handle) else {
-        return 0;
-    };
+pub unsafe extern "C" fn pith_channel_send(handle: i64, value: i64) -> i64 {
+    // an unknown or freed handle gets the closed channel's answer: the send is
+    // refused.
+    // SAFETY: `handle` is validated by `with_channel` before borrowing the channel.
+    unsafe { with_channel(handle, |t| channel_send_impl(t, value)) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn channel_try_send_impl(t: &TaggedChannel, value: i64) -> i64 {
     let inner = &t.inner;
     if let Some(ring) = &inner.ring {
         if inner.closed_flag.load(Ordering::SeqCst) {
@@ -942,12 +1002,15 @@ pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
     1
 }
 
-unsafe fn channel_recv(handle: i64) -> Option<i64> {
-    // an unknown or freed handle yields the empty optional, exactly what a
-    // closed and drained channel yields.
-    let Some(t) = channel_ref(handle) else {
-        return None;
-    };
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_try_send(handle: i64, value: i64) -> i64 {
+    // SAFETY: `handle` is validated by `with_channel` before borrowing the channel.
+    unsafe { with_channel(handle, |t| channel_try_send_impl(t, value)) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn channel_recv_impl(t: &TaggedChannel) -> Option<i64> {
+    // declared first so it drops last (see `ParkCount`).
     let park = ParkCount::new(t);
     let inner = &t.inner;
     if let Some(ring) = &inner.ring {
@@ -979,10 +1042,16 @@ unsafe fn channel_recv(handle: i64) -> Option<i64> {
     }
 }
 
-unsafe fn channel_try_recv(handle: i64) -> Option<i64> {
-    let Some(t) = channel_ref(handle) else {
-        return None;
-    };
+#[inline(always)]
+unsafe fn channel_recv(handle: i64) -> Option<i64> {
+    // an unknown or freed handle yields the empty optional, exactly what a
+    // closed and drained channel yields.
+    // SAFETY: `handle` is validated by `with_channel` before borrowing the channel.
+    unsafe { with_channel(handle, channel_recv_impl) }.flatten()
+}
+
+#[inline(always)]
+fn channel_try_recv_impl(t: &TaggedChannel) -> Option<i64> {
     let inner = &t.inner;
     if let Some(ring) = &inner.ring {
         if let Some(value) = ring.try_dequeue() {
@@ -1001,34 +1070,40 @@ unsafe fn channel_try_recv(handle: i64) -> Option<i64> {
     None
 }
 
+#[inline(always)]
+unsafe fn channel_try_recv(handle: i64) -> Option<i64> {
+    // SAFETY: `handle` is validated by `with_channel` before borrowing the channel.
+    unsafe { with_channel(handle, channel_try_recv_impl) }.flatten()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_recv(handle: i64) -> i64 {
-    optional_from(channel_recv(handle))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_from(unsafe { channel_recv(handle) })
 }
 
 /// `pith_channel_recv` as a register pair; see `optional_pair`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_recv_pair(handle: i64) -> ResultPair {
-    optional_pair(channel_recv(handle))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_pair(unsafe { channel_recv(handle) })
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_try_recv(handle: i64) -> i64 {
-    optional_from(channel_try_recv(handle))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_from(unsafe { channel_try_recv(handle) })
 }
 
 /// `pith_channel_try_recv` as a register pair; see `optional_pair`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_channel_try_recv_pair(handle: i64) -> ResultPair {
-    optional_pair(channel_try_recv(handle))
+    // SAFETY: Preconditions forwarded from caller.
+    optional_pair(unsafe { channel_try_recv(handle) })
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
-    // an unknown or freed handle reports false, the same as a second close.
-    let Some(t) = channel_ref(handle) else {
-        return 0;
-    };
+#[inline(always)]
+fn channel_close_impl(t: &TaggedChannel) -> i64 {
     let inner = &t.inner;
     let mut state = lock_state(&inner.state);
     if state.closed {
@@ -1051,11 +1126,14 @@ pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
-    // an unknown or freed handle has length 0.
-    let Some(t) = channel_ref(handle) else {
-        return 0;
-    };
+pub unsafe extern "C" fn pith_channel_close(handle: i64) -> i64 {
+    // an unknown or freed handle reports false, the same as a second close.
+    // SAFETY: `handle` is validated by `with_channel` before borrowing the channel.
+    unsafe { with_channel(handle, channel_close_impl) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn channel_len_impl(t: &TaggedChannel) -> i64 {
     let channel = &t.inner;
     if let Some(ring) = &channel.ring {
         return ring.len() as i64;
@@ -1071,26 +1149,38 @@ pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_channel_cap(handle: i64) -> i64 {
-    let Some(t) = channel_ref(handle) else {
-        return 0;
-    };
+pub unsafe extern "C" fn pith_channel_len(handle: i64) -> i64 {
+    // an unknown or freed handle has length 0.
+    // SAFETY: `handle` is validated by `with_channel` before borrowing the channel.
+    unsafe { with_channel(handle, channel_len_impl) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn channel_cap_impl(t: &TaggedChannel) -> i64 {
     t.capacity as i64
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_channel_is_closed(handle: i64) -> i64 {
-    // an unknown or freed handle reports closed, by convention.
-    let Some(t) = channel_ref(handle) else {
-        return 1;
-    };
-    let channel = &t.inner;
-    let state = lock_state(&channel.state);
+pub unsafe extern "C" fn pith_channel_cap(handle: i64) -> i64 {
+    // SAFETY: `handle` is validated by `with_channel` before borrowing the channel.
+    unsafe { with_channel(handle, channel_cap_impl) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn channel_is_closed_impl(t: &TaggedChannel) -> i64 {
+    let state = lock_state(&t.inner.state);
     if state.closed {
         1
     } else {
         0
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_channel_is_closed(handle: i64) -> i64 {
+    // an unknown or freed handle reports closed, by convention.
+    // SAFETY: `handle` is validated by `with_channel` before borrowing the channel.
+    unsafe { with_channel(handle, channel_is_closed_impl) }.unwrap_or(1)
 }
 
 #[no_mangle]

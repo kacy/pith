@@ -5,11 +5,13 @@
 //! non-blocking and a would-block parks the task on the reactor (`netpoll`)
 //! through `fdio`; under os threads, sockets block in the kernel.
 
-use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::bytes::{pith_bytes_from_vec, with_bytes};
 use crate::concurrency::scheduler::{backend, Backend};
 use crate::fd_handle::{self, FdKind, Guard};
 use crate::fdio;
-use crate::ffi_util::{cstr_bytes, cstr_str, cstr_str_or_empty, write_result, ResultPair};
+use crate::ffi_util::{
+    with_cstr_bytes, with_cstr_str, with_cstr_str_or_empty, write_result, ResultPair,
+};
 use crate::netpoll;
 use std::os::unix::io::RawFd;
 
@@ -295,45 +297,42 @@ fn widen_backlog(fd: RawFd) {
     }
 }
 
-/// TCP listen: bind and listen on addr:port, return the listener's handle
-#[no_mangle]
-pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
+fn tcp_listen_impl(host: &str, port: i64) -> i64 {
     use std::net::TcpListener;
+    use std::os::unix::io::IntoRawFd;
 
-    // the first socket of the process is where SIGPIPE stops being fatal: a peer
-    // that hangs up mid-response must give this server an EPIPE to handle, not a
-    // signal that kills it. see signals::ignore_sigpipe.
-    crate::signals::ignore_sigpipe();
-
-    let host = cstr_str_or_empty(addr);
     let host = if host.is_empty() { "0.0.0.0" } else { host };
     let bind_addr = format!("{}:{}", host, port);
     match TcpListener::bind(&bind_addr) {
         Ok(listener) => {
-            use std::os::unix::io::IntoRawFd;
-            let fd = listener.into_raw_fd() as i64;
-            widen_backlog(fd as RawFd);
+            let fd = listener.into_raw_fd();
+            widen_backlog(fd);
             // green mode: a non-blocking listener lets accept yield instead of
             // parking the worker.
             if is_green() {
-                fdio::set_nonblocking(fd as RawFd);
+                fdio::set_nonblocking(fd);
             }
-            open_socket(fd as RawFd)
+            open_socket(fd)
         }
         Err(_) => 0,
     }
 }
 
-/// TCP connect: connect to addr:port, return the connection's handle
+/// TCP listen: bind and listen on addr:port, return the listener's handle
 #[no_mangle]
-pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
-    use std::net::TcpStream;
-
-    // as in pith_tcp_listen: a client writing to a server that closed first must
-    // see EPIPE rather than be killed.
+pub unsafe extern "C" fn pith_tcp_listen(addr: *const i8, port: i64) -> i64 {
+    // the first socket of the process is where SIGPIPE stops being fatal: a peer
+    // that hangs up mid-response must give this server an EPIPE to handle, not a
+    // signal that kills it. see signals::ignore_sigpipe.
     crate::signals::ignore_sigpipe();
+    // SAFETY: Caller guarantees `addr` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str_or_empty(addr, |host| tcp_listen_impl(host, port)) }
+}
 
-    let host = cstr_str_or_empty(addr);
+fn tcp_connect_impl(host: &str, port: i64) -> i64 {
+    use std::net::TcpStream;
+    use std::os::unix::io::IntoRawFd;
+
     let host = if host.is_empty() { "127.0.0.1" } else { host };
 
     // green mode: a non-blocking connect that yields the task on EINPROGRESS.
@@ -352,11 +351,20 @@ pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
             // otherwise collides with the peer's delayed acks for a ~40ms stall
             // per round-trip.
             let _ = stream.set_nodelay(true);
-            use std::os::unix::io::IntoRawFd;
             open_socket(stream.into_raw_fd())
         }
         Err(_) => 0,
     }
+}
+
+/// TCP connect: connect to addr:port, return the connection's handle
+#[no_mangle]
+pub unsafe extern "C" fn pith_tcp_connect(addr: *const i8, port: i64) -> i64 {
+    // as in pith_tcp_listen: a client writing to a server that closed first must
+    // see EPIPE rather than be killed.
+    crate::signals::ignore_sigpipe();
+    // SAFETY: Caller guarantees `addr` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str_or_empty(addr, |host| tcp_connect_impl(host, port)) }
 }
 
 /// TCP accept: accept a connection on a listener handle, return the client's
@@ -392,17 +400,14 @@ pub extern "C" fn pith_tcp_accept(server: i64) -> i64 {
     }
 
     use std::net::TcpListener;
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
 
+    // SAFETY: `listener` guard keeps `server_fd` open; `into_raw_fd` below prevents closing it.
     let listener_ref = unsafe { TcpListener::from_raw_fd(server_fd) };
     let result = match listener_ref.accept() {
-        Ok((stream, _addr)) => {
-            use std::os::unix::io::IntoRawFd;
-            open_socket(stream.into_raw_fd())
-        }
+        Ok((stream, _addr)) => open_socket(stream.into_raw_fd()),
         Err(_) => 0,
     };
-    use std::os::unix::io::IntoRawFd;
     let _ = listener_ref.into_raw_fd();
     result
 }
@@ -458,38 +463,58 @@ fn green_unix_connect(path: &str) -> i64 {
     open_socket(fd)
 }
 
+#[cfg(unix)]
+fn unix_listen_impl(path_str: &str) -> i64 {
+    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::net::UnixListener;
+
+    if path_str.is_empty() {
+        return 0;
+    }
+    match UnixListener::bind(path_str) {
+        Ok(listener) => {
+            let fd = listener.into_raw_fd();
+            widen_backlog(fd);
+            if is_green() {
+                fdio::set_nonblocking(fd);
+            }
+            open_socket(fd)
+        }
+        Err(_) => 0,
+    }
+}
+
 /// Unix domain socket listen: bind and listen on `path`, returning a socket
 /// handle compatible with `tcp_read*`, `tcp_write*`, `tcp_close`, and deadlines.
 #[no_mangle]
 pub unsafe extern "C" fn pith_unix_listen(path: *const i8) -> i64 {
     #[cfg(unix)]
     {
-        use std::os::unix::io::IntoRawFd;
-        use std::os::unix::net::UnixListener;
-
         crate::signals::ignore_sigpipe();
-        let Some(path_str) = cstr_str(path) else {
-            return 0;
-        };
-        if path_str.is_empty() {
-            return 0;
-        }
-        match UnixListener::bind(path_str) {
-            Ok(listener) => {
-                let fd = listener.into_raw_fd();
-                widen_backlog(fd);
-                if is_green() {
-                    fdio::set_nonblocking(fd);
-                }
-                open_socket(fd)
-            }
-            Err(_) => 0,
-        }
+        // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+        unsafe { with_cstr_str(path, unix_listen_impl) }.unwrap_or(0)
     }
     #[cfg(not(unix))]
     {
         let _ = path;
         0
+    }
+}
+
+#[cfg(unix)]
+fn unix_connect_impl(path_str: &str) -> i64 {
+    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+
+    if path_str.is_empty() {
+        return 0;
+    }
+    if is_green() {
+        return green_unix_connect(path_str);
+    }
+    match UnixStream::connect(path_str) {
+        Ok(stream) => open_socket(stream.into_raw_fd()),
+        Err(_) => 0,
     }
 }
 
@@ -499,23 +524,9 @@ pub unsafe extern "C" fn pith_unix_listen(path: *const i8) -> i64 {
 pub unsafe extern "C" fn pith_unix_connect(path: *const i8) -> i64 {
     #[cfg(unix)]
     {
-        use std::os::unix::io::IntoRawFd;
-        use std::os::unix::net::UnixStream;
-
         crate::signals::ignore_sigpipe();
-        let Some(path_str) = cstr_str(path) else {
-            return 0;
-        };
-        if path_str.is_empty() {
-            return 0;
-        }
-        if is_green() {
-            return green_unix_connect(path_str);
-        }
-        match UnixStream::connect(path_str) {
-            Ok(stream) => open_socket(stream.into_raw_fd()),
-            Err(_) => 0,
-        }
+        // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+        unsafe { with_cstr_str(path, unix_connect_impl) }.unwrap_or(0)
     }
     #[cfg(not(unix))]
     {
@@ -556,6 +567,7 @@ pub extern "C" fn pith_unix_accept(server: i64) -> i64 {
         use std::os::unix::io::{FromRawFd, IntoRawFd};
         use std::os::unix::net::UnixListener;
 
+        // SAFETY: `listener` guard keeps `server_fd` open; `into_raw_fd` below prevents closing it.
         let listener_ref = unsafe { UnixListener::from_raw_fd(server_fd) };
         let result = match listener_ref.accept() {
             Ok((stream, _addr)) => open_socket(stream.into_raw_fd()),
@@ -674,20 +686,18 @@ pub extern "C" fn pith_tcp_wait_writable(conn: i64, timeout_ms: i64) -> i64 {
 /// still the bytes the caller asked to send.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_write(conn_fd: i64, data: *const i8) -> ResultPair {
-    let outcome = match cstr_bytes(data) {
-        Some(text) => socket_write(conn_fd, text),
-        None => Err("invalid string".to_string()),
-    };
+    // SAFETY: Caller guarantees `data` is null or a valid null-terminated C string.
+    let outcome = unsafe { with_cstr_bytes(data, |text| socket_write(conn_fd, text)) }
+        .unwrap_or_else(|| Err("invalid string".to_string()));
     write_result("tcp_write", outcome)
 }
 
 /// the `Bytes` form of `pith_tcp_write`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tcp_write_bytes(conn_fd: i64, data: i64) -> ResultPair {
-    let outcome = match pith_bytes_ref(data) {
-        Some(bytes) => socket_write(conn_fd, &bytes.data),
-        None => Err("invalid bytes value".to_string()),
-    };
+    // SAFETY: `with_bytes` validates `data` before borrowing its slice.
+    let outcome = unsafe { with_bytes(data, |bytes| socket_write(conn_fd, bytes)) }
+        .unwrap_or_else(|| Err("invalid bytes value".to_string()));
     write_result("tcp_write_bytes", outcome)
 }
 
@@ -700,15 +710,15 @@ pub extern "C" fn pith_tcp_set_timeout(conn: i64, ms: i64) {
     };
 
     use std::net::TcpStream;
-    use std::os::unix::io::FromRawFd;
+    use std::os::unix::io::{FromRawFd, IntoRawFd};
 
+    // SAFETY: `guard` keeps `guard.fd()` open; `into_raw_fd` below prevents closing it.
     let stream = unsafe { TcpStream::from_raw_fd(guard.fd()) };
     if ms <= 0 {
         let _ = stream.set_read_timeout(None);
     } else {
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(ms as u64)));
     }
-    use std::os::unix::io::IntoRawFd;
     let _ = stream.into_raw_fd();
     // the next wait reads the value back, as the kernel rounded it.
     fd_handle::cache_timeout(&guard, false, None);
@@ -781,6 +791,13 @@ pub extern "C" fn pith_tcp_shutdown(conn: i64) -> i64 {
     }
 }
 
+fn dns_resolve_impl(host: &str) -> *mut i8 {
+    match crate::dns::resolve(host, 0).first() {
+        Some(addr) => crate::pith_strdup_string(&addr.ip().to_string()),
+        None => std::ptr::null_mut(),
+    }
+}
+
 /// DNS resolve: resolve hostname to IP address string
 ///
 /// under the green backend the lookup runs on the resolver pool and this task
@@ -789,13 +806,8 @@ pub extern "C" fn pith_tcp_shutdown(conn: i64) -> i64 {
 /// null, which is what the caller already treats as an error.
 #[no_mangle]
 pub unsafe extern "C" fn pith_dns_resolve(hostname: *const i8) -> *mut i8 {
-    let Some(host) = cstr_str(hostname) else {
-        return std::ptr::null_mut();
-    };
-    match crate::dns::resolve(host, 0).first() {
-        Some(addr) => crate::pith_strdup_string(&addr.ip().to_string()),
-        None => std::ptr::null_mut(),
-    }
+    // SAFETY: Caller guarantees `hostname` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(hostname, dns_resolve_impl) }.unwrap_or(std::ptr::null_mut())
 }
 
 #[cfg(test)]

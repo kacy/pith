@@ -1,6 +1,19 @@
-use crate::collections::list::{list_mut_from_handle, list_ref_from_handle, PithList};
-use crate::ffi_util::{cstr_bytes, cstr_str};
+use crate::collections::list::{with_list_mut_handle, with_list_ref_handle, ListImpl, PithList};
+use crate::ffi_util::{with_cstr_bytes, with_cstr_bytes2, with_cstr_str2};
 use crate::runtime_core::optional_tuple;
+use std::mem::MaybeUninit;
+
+/// Borrow bytes from a C string pointer for the duration of `f`, passing `&[]` if null.
+#[inline(always)]
+unsafe fn with_cstr_bytes_or_empty<R>(ptr: *const i8, f: impl FnOnce(&[u8]) -> R) -> R {
+    if ptr.is_null() {
+        return f(&[]);
+    }
+    let len = crate::string::pith_cstring_len(ptr) as usize;
+    // SAFETY: Caller guarantees `ptr` points to a readable, null-terminated C string.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+    f(bytes)
+}
 
 /// Get command line arguments as a Pith list of C string pointers.
 #[no_mangle]
@@ -8,12 +21,16 @@ pub unsafe extern "C" fn pith_args() -> PithList {
     use crate::collections::list::{pith_list_new, pith_list_push_value};
     use std::env;
 
-    let list = pith_list_new(8, 1);
+    // SAFETY: Allocates a fresh string-tagged list.
+    let list = unsafe { pith_list_new(8, 1) };
 
     for arg in env::args() {
         let arg_ptr = crate::pith_copy_bytes_to_cstring(arg.as_bytes());
-        pith_list_push_value(list, arg_ptr as i64);
-        crate::pith_cstring_release(arg_ptr as *const i8);
+        // SAFETY: `list` is freshly allocated and `arg_ptr` is a valid heap cstring.
+        unsafe {
+            pith_list_push_value(list, arg_ptr as i64);
+            crate::pith_cstring_release(arg_ptr as *const i8);
+        }
     }
 
     list
@@ -97,22 +114,8 @@ fn report_split(bytes: &[u8], index: usize, start: i64, end: i64) -> ! {
     crate::failure::fail(message)
 }
 
-/// Extract substring from C string (start inclusive, end exclusive)
-/// Returns newly allocated C string
-///
-/// Aborts when either bound would cut a well-formed utf-8 character in half.
-/// That cut used to succeed and hand back a string that no longer round-trips
-/// through utf-8, which is silent corruption of user text; failing loudly
-/// matches `pith_cstring_char_at_strict` and the other strict accessors.
-///
-/// # Safety
-/// s must be a valid null-terminated C string
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i64) -> *mut i8 {
-    let Some(bytes) = cstr_bytes(s) else {
-        return std::ptr::null_mut();
-    };
-
+#[inline(always)]
+fn cstring_substring_impl(bytes: &[u8], start: i64, end: i64) -> *mut i8 {
     let len = bytes.len() as i64;
     let lo = start.max(0).min(len) as usize;
     let hi = end.max(lo as i64).min(len) as usize;
@@ -131,30 +134,46 @@ pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i
     crate::pith_copy_bytes_to_cstring(&bytes[lo..hi])
 }
 
-/// Split a string by delimiter and return as a PithList of strings
-unsafe fn split_to_list_inner(s: *const i8, delim: *const i8, keep_empty: bool) -> PithList {
-    use crate::collections::list::pith_list_new;
+/// Extract substring from C string (start inclusive, end exclusive)
+/// Returns newly allocated C string
+///
+/// Aborts when either bound would cut a well-formed utf-8 character in half.
+/// That cut used to succeed and hand back a string that no longer round-trips
+/// through utf-8, which is silent corruption of user text; failing loudly
+/// matches `pith_cstring_char_at_strict` and the other strict accessors.
+///
+/// # Safety
+/// s must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_substring(s: *const i8, start: i64, end: i64) -> *mut i8 {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, |bytes| cstring_substring_impl(bytes, start, end)) }
+        .unwrap_or(std::ptr::null_mut())
+}
 
-    let (Some(s_slice), Some(delim_slice)) = (cstr_bytes(s), cstr_bytes(delim)) else {
-        return pith_list_new(8, 1);
-    };
+fn split_impl(s_slice: &[u8], delim_slice: &[u8], keep_empty: bool) -> PithList {
+    use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
+
     let s_len = s_slice.len();
     let delim_len = delim_slice.len();
 
     if s_len == 0 && !keep_empty {
-        return pith_list_new(8, 1);
+        // SAFETY: Allocates a fresh string-tagged list.
+        return unsafe { pith_list_new(8, 1) };
     }
 
     // string-tagged: the pushes retain and the free path cascades, so the
     // list is the sole owner of its parts
-    let list = pith_list_new(8, 1);
+    // SAFETY: Allocates a fresh string-tagged list.
+    let list = unsafe { pith_list_new(8, 1) };
     let push_part = |part: &[u8]| {
         if !keep_empty && part.is_empty() {
             return;
         }
         // the fresh part's one count moves into the list
         let part_ptr = crate::pith_copy_bytes_to_cstring(part);
-        crate::collections::list::pith_list_push_value_owned(list, part_ptr as i64);
+        // SAFETY: `list` is freshly allocated and `part_ptr` transfers its single count.
+        unsafe { pith_list_push_value_owned(list, part_ptr as i64) };
     };
     // an empty delimiter never matches, so the whole string is one part.
     // each delimiter is found from the end of the previous one, so a
@@ -172,13 +191,22 @@ unsafe fn split_to_list_inner(s: *const i8, delim: *const i8, keep_empty: bool) 
     list
 }
 
+/// Split a string by delimiter and return as a PithList of strings
+unsafe fn split_to_list_inner(s: *const i8, delim: *const i8, keep_empty: bool) -> PithList {
+    // SAFETY: Caller guarantees `s` and `delim` are null or valid C strings.
+    unsafe { with_cstr_bytes2(s, delim, |sb, db| split_impl(sb, db, keep_empty)) }
+        // SAFETY: Allocates a fresh empty string-tagged list on null input.
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 1) })
+}
+
 /// Split string into a list of strings by delimiter, dropping empty parts.
 ///
 /// # Safety
 /// Both s and delim must be valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i8) -> PithList {
-    split_to_list_inner(s, delim, false)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { split_to_list_inner(s, delim, false) }
 }
 
 /// Split string into a list of strings by delimiter, preserving empty parts on
@@ -188,16 +216,11 @@ pub unsafe extern "C" fn pith_string_split_to_list(s: *const i8, delim: *const i
 /// Both s and delim must be valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_string_split_exact_to_list(s: *const i8, delim: *const i8) -> PithList {
-    split_to_list_inner(s, delim, true)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { split_to_list_inner(s, delim, true) }
 }
 
-/// Trim ASCII whitespace from both ends of a C string.
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_trim(s: *const i8) -> *mut i8 {
-    let Some(slice) = cstr_bytes(s) else {
-        return std::ptr::null_mut();
-    };
-
+fn trim_impl(slice: &[u8]) -> *mut i8 {
     let mut start = 0usize;
     let mut end = slice.len();
 
@@ -211,33 +234,32 @@ pub unsafe extern "C" fn pith_cstring_trim(s: *const i8) -> *mut i8 {
     crate::pith_copy_bytes_to_cstring(&slice[start..end])
 }
 
+/// Trim ASCII whitespace from both ends of a C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_trim(s: *const i8) -> *mut i8 {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, trim_impl) }.unwrap_or(std::ptr::null_mut())
+}
+
+#[inline(always)]
+fn char_at_impl(bytes: &[u8], index: i64) -> *mut i8 {
+    if index < 0 || index as usize >= bytes.len() {
+        return crate::pith_cstring_empty();
+    }
+    crate::pith_copy_bytes_to_cstring(&[bytes[index as usize]])
+}
+
 /// Get a single character from a C string at index as a new C string.
 /// Returns a newly allocated 1-character string (or empty string if out of bounds)
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_char_at(s: *const i8, index: i64) -> *mut i8 {
-    let Some(bytes) = cstr_bytes(s) else {
-        return crate::pith_cstring_empty();
-    };
-
-    if index < 0 || index as usize >= bytes.len() {
-        return crate::pith_cstring_empty();
-    }
-
-    let ptr = crate::pith_alloc_cstring(1);
-    *ptr = bytes[index as usize] as i8;
-    ptr
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, |bytes| char_at_impl(bytes, index)) }
+        .unwrap_or_else(crate::pith_cstring_empty)
 }
 
-/// Strict indexed character access for `s[i]` on a String. Aborts with a
-/// structured diagnostic on out-of-bounds instead of returning silent "".
-/// Callers who want the checked shape have `.get(i)` (returns String?).
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -> *mut i8 {
-    let Some(bytes) = cstr_bytes(s) else {
-        eprintln!("pith runtime error: string indexing on invalid string handle");
-        // panic-guard: strict string indexing on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
-    };
+#[inline(always)]
+fn char_at_strict_impl(bytes: &[u8], index: i64) -> *mut i8 {
     let len = bytes.len() as i64;
     if index < 0 || index >= len {
         crate::failure::fail(format!(
@@ -245,9 +267,30 @@ pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -
             index, len
         ));
     }
-    let ptr = crate::pith_alloc_cstring(1);
-    *ptr = bytes[index as usize] as i8;
+    crate::pith_copy_bytes_to_cstring(&[bytes[index as usize]])
+}
+
+/// Strict indexed character access for `s[i]` on a String. Aborts with a
+/// structured diagnostic on out-of-bounds instead of returning silent "".
+/// Callers who want the checked shape have `.get(i)` (returns String?).
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -> *mut i8 {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    let Some(ptr) = (unsafe { with_cstr_bytes(s, |bytes| char_at_strict_impl(bytes, index)) }) else {
+        eprintln!("pith runtime error: string indexing on invalid string handle");
+        // panic-guard: strict string indexing on an invalid handle is a program bug with no value to return.
+        std::process::exit(1);
+    };
     ptr
+}
+
+#[inline(always)]
+fn char_at_opt_impl(bytes: &[u8], index: i64) -> i64 {
+    if index < 0 || index as usize >= bytes.len() {
+        return optional_tuple(false, 0);
+    }
+    let ptr = crate::pith_copy_bytes_to_cstring(&[bytes[index as usize]]);
+    optional_tuple(true, ptr as i64)
 }
 
 /// Get a single character at index wrapped in an Optional tuple. Returns
@@ -256,15 +299,9 @@ pub unsafe extern "C" fn pith_cstring_char_at_strict(s: *const i8, index: i64) -
 /// intentional empty result.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_char_at_opt(s: *const i8, index: i64) -> i64 {
-    let Some(bytes) = cstr_bytes(s) else {
-        return optional_tuple(false, 0);
-    };
-    if index < 0 || index as usize >= bytes.len() {
-        return optional_tuple(false, 0);
-    }
-    let ptr = crate::pith_alloc_cstring(1);
-    *ptr = bytes[index as usize] as i8;
-    optional_tuple(true, ptr as i64)
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, |bytes| char_at_opt_impl(bytes, index)) }
+        .unwrap_or_else(|| optional_tuple(false, 0))
 }
 
 /// Format a float with a fixed number of decimal places.
@@ -278,6 +315,39 @@ pub unsafe extern "C" fn pith_float_format(value: f64, precision: i64) -> i64 {
     crate::runtime_core::pith_copy_bytes_to_cstring(text.as_bytes()) as i64
 }
 
+fn format_pad_impl(bytes: &[u8], width: i64, align: i64, fill: i64) -> i64 {
+    let text = String::from_utf8_lossy(bytes);
+    let width = width.max(0) as usize;
+    let fill_ch = (fill as u8) as char;
+    let char_count = text.chars().count();
+    if char_count >= width {
+        return crate::runtime_core::pith_copy_bytes_to_cstring(text.as_bytes()) as i64;
+    }
+    let pad = width - char_count;
+    let out = match align as u8 {
+        b'<' => format!("{}{}", text, fill_ch.to_string().repeat(pad)),
+        b'^' => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!(
+                "{}{}{}",
+                fill_ch.to_string().repeat(left),
+                text,
+                fill_ch.to_string().repeat(right)
+            )
+        }
+        _ => {
+            // right alignment; zero-fill tucks behind a leading sign
+            if fill_ch == '0' && (text.starts_with('-') || text.starts_with('+')) {
+                format!("{}{}{}", &text[..1], "0".repeat(pad), &text[1..])
+            } else {
+                format!("{}{}", fill_ch.to_string().repeat(pad), text)
+            }
+        }
+    };
+    crate::runtime_core::pith_copy_bytes_to_cstring(out.as_bytes()) as i64
+}
+
 /// Pad a string to a width: align is '<', '>', or '^' as a byte, fill
 /// is the pad byte (space or '0'). Strings already at or over the
 /// width pass through as a fresh copy.
@@ -286,42 +356,20 @@ pub unsafe extern "C" fn pith_float_format(value: f64, precision: i64) -> i64 {
 /// handle must be a valid cstring pointer or 0.
 #[no_mangle]
 pub unsafe extern "C" fn pith_format_pad(handle: i64, width: i64, align: i64, fill: i64) -> i64 {
-    let text = if handle == 0 {
-        String::new()
-    } else {
-        std::ffi::CStr::from_ptr(handle as *const libc::c_char)
-            .to_string_lossy()
-            .into_owned()
-    };
-    let width = width.max(0) as usize;
-    let fill_ch = (fill as u8) as char;
-    let out = if text.chars().count() >= width {
-        text
-    } else {
-        let pad = width - text.chars().count();
-        match align as u8 {
-            b'<' => format!("{}{}", text, fill_ch.to_string().repeat(pad)),
-            b'^' => {
-                let left = pad / 2;
-                let right = pad - left;
-                format!(
-                    "{}{}{}",
-                    fill_ch.to_string().repeat(left),
-                    text,
-                    fill_ch.to_string().repeat(right)
-                )
-            }
-            _ => {
-                // right alignment; zero-fill tucks behind a leading sign
-                if fill_ch == '0' && (text.starts_with('-') || text.starts_with('+')) {
-                    format!("{}{}{}", &text[..1], "0".repeat(pad), &text[1..])
-                } else {
-                    format!("{}{}", fill_ch.to_string().repeat(pad), text)
-                }
-            }
-        }
-    };
-    crate::runtime_core::pith_copy_bytes_to_cstring(out.as_bytes()) as i64
+    // SAFETY: `handle` is 0 or a valid null-terminated C string for this call.
+    unsafe {
+        with_cstr_bytes_or_empty(handle as *const i8, |bytes| {
+            format_pad_impl(bytes, width, align, fill)
+        })
+    }
+}
+
+#[inline(always)]
+fn byte_at_impl(bytes: &[u8], index: i64) -> i64 {
+    if index < 0 || index as usize >= bytes.len() {
+        return -1;
+    }
+    bytes[index as usize] as i64
 }
 
 /// Read one byte of a string as an integer: the allocation-free form of
@@ -329,32 +377,39 @@ pub unsafe extern "C" fn pith_format_pad(handle: i64, width: i64, align: i64, fi
 /// mirroring char_at's empty-string-on-out-of-range semantics under ==.
 ///
 /// # Safety
-
 /// s must be a valid null-terminated C string or garbage (checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_byte_at(s: *const i8, index: i64) -> i64 {
-    let Some(bytes) = cstr_bytes(s) else {
-        return -1;
-    };
-    if index < 0 || index as usize >= bytes.len() {
-        return -1;
-    }
-    bytes[index as usize] as i64
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, |bytes| byte_at_impl(bytes, index)) }.unwrap_or(-1)
 }
 
-/// Trim ASCII whitespace from the left side of a C string.
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_trim_left(s: *const i8) -> *mut i8 {
-    let Some(slice) = cstr_bytes(s) else {
-        return std::ptr::null_mut();
-    };
-
+fn trim_left_impl(slice: &[u8]) -> *mut i8 {
     let mut start = 0usize;
     while start < slice.len() && matches!(slice[start], b' ' | b'\t' | b'\n' | b'\r') {
         start += 1;
     }
 
     crate::pith_copy_bytes_to_cstring(&slice[start..])
+}
+
+/// Trim ASCII whitespace from the left side of a C string.
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_trim_left(s: *const i8) -> *mut i8 {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, trim_left_impl) }.unwrap_or(std::ptr::null_mut())
+}
+
+fn to_upper_impl(slice: &[u8]) -> *mut i8 {
+    let len = slice.len();
+    // SAFETY: `pith_alloc_cstring(len)` returns a fresh writable buffer of `len` bytes plus NUL.
+    let ptr = unsafe { crate::pith_alloc_cstring(len) };
+    // SAFETY: `ptr` points to `len` writable (uninitialized) bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, len) };
+    for (dst, &b) in out.iter_mut().zip(slice) {
+        dst.write(b.to_ascii_uppercase());
+    }
+    ptr
 }
 
 /// Convert C string to uppercase
@@ -364,16 +419,18 @@ pub unsafe extern "C" fn pith_cstring_trim_left(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_to_upper(s: *const i8) -> *mut i8 {
-    let Some(slice) = cstr_bytes(s) else {
-        return std::ptr::null_mut();
-    };
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, to_upper_impl) }.unwrap_or(std::ptr::null_mut())
+}
+
+fn to_lower_impl(slice: &[u8]) -> *mut i8 {
     let len = slice.len();
-
-    let ptr = crate::pith_alloc_cstring(len);
-
-    for i in 0..len {
-        let c = slice[i];
-        *ptr.add(i) = (c as char).to_ascii_uppercase() as u8 as i8;
+    // SAFETY: `pith_alloc_cstring(len)` returns a fresh writable buffer of `len` bytes plus NUL.
+    let ptr = unsafe { crate::pith_alloc_cstring(len) };
+    // SAFETY: `ptr` points to `len` writable (uninitialized) bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, len) };
+    for (dst, &b) in out.iter_mut().zip(slice) {
+        dst.write(b.to_ascii_lowercase());
     }
     ptr
 }
@@ -385,16 +442,18 @@ pub unsafe extern "C" fn pith_cstring_to_upper(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_to_lower(s: *const i8) -> *mut i8 {
-    let Some(slice) = cstr_bytes(s) else {
-        return std::ptr::null_mut();
-    };
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, to_lower_impl) }.unwrap_or(std::ptr::null_mut())
+}
+
+fn reverse_impl(slice: &[u8]) -> *mut i8 {
     let len = slice.len();
-
-    let ptr = crate::pith_alloc_cstring(len);
-
-    for i in 0..len {
-        let c = slice[i];
-        *ptr.add(i) = (c as char).to_ascii_lowercase() as u8 as i8;
+    // SAFETY: `pith_alloc_cstring(len)` returns a fresh writable buffer of `len` bytes plus NUL.
+    let ptr = unsafe { crate::pith_alloc_cstring(len) };
+    // SAFETY: `ptr` points to `len` writable (uninitialized) bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(ptr as *mut MaybeUninit<u8>, len) };
+    for (dst, &b) in out.iter_mut().zip(slice.iter().rev()) {
+        dst.write(b);
     }
     ptr
 }
@@ -406,17 +465,21 @@ pub unsafe extern "C" fn pith_cstring_to_lower(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_reverse(s: *const i8) -> *mut i8 {
-    let Some(slice) = cstr_bytes(s) else {
-        return std::ptr::null_mut();
-    };
-    let len = slice.len();
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, reverse_impl) }.unwrap_or(std::ptr::null_mut())
+}
 
-    let ptr = crate::pith_alloc_cstring(len);
+fn chars_impl(list: PithList, bytes: &[u8]) {
+    use crate::collections::list::pith_list_push_value;
 
-    for i in 0..len {
-        *ptr.add(i) = slice[len - 1 - i] as i8;
+    for &b in bytes {
+        // SAFETY: `b` is a valid byte; `list` is a freshly allocated string-tagged list.
+        unsafe {
+            let ch_ptr = crate::pith_chr_cstr(b as i64);
+            pith_list_push_value(list, ch_ptr as i64);
+            crate::pith_cstring_release(ch_ptr as *const i8);
+        }
     }
-    ptr
 }
 
 /// Split string into a list of single-character strings (chars)
@@ -425,17 +488,44 @@ pub unsafe extern "C" fn pith_cstring_reverse(s: *const i8) -> *mut i8 {
 /// s must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_chars(s: *const i8) -> i64 {
-    use crate::collections::list::{pith_list_new, pith_list_push_value};
-
-    let list = pith_list_new(8, 1);
-    if let Some(bytes) = cstr_bytes(s) {
-        for &b in bytes {
-            let ch_ptr = crate::pith_chr_cstr(b as i64);
-            pith_list_push_value(list, ch_ptr as i64);
-            crate::pith_cstring_release(ch_ptr as *const i8);
-        }
-    }
+    // SAFETY: Allocates a fresh string-tagged list.
+    let list = unsafe { crate::collections::list::pith_list_new(8, 1) };
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, |bytes| chars_impl(list, bytes)) };
     list.ptr as i64
+}
+
+/// Compare two nullable C-string pointers lexicographically by raw bytes.
+///
+/// # Safety
+/// Both `a` and `b` must be 0 or valid pointers to null-terminated C strings.
+#[inline(always)]
+unsafe fn compare_cstr_handles(a: i64, b: i64) -> std::cmp::Ordering {
+    let ap = a as *const i8;
+    let bp = b as *const i8;
+    if ap.is_null() {
+        return if bp.is_null() {
+            std::cmp::Ordering::Equal
+        } else {
+            std::cmp::Ordering::Less
+        };
+    }
+    if bp.is_null() {
+        return std::cmp::Ordering::Greater;
+    }
+    // SAFETY: Caller guarantees both non-null pointers are valid C strings.
+    unsafe { with_cstr_bytes2(ap, bp, |ab, bb| ab.cmp(bb)) }.unwrap_or(std::cmp::Ordering::Equal)
+}
+
+unsafe fn sort_strings_impl(impl_ref: &mut ListImpl) {
+    if impl_ref.elem_size != 8 {
+        return;
+    }
+    impl_ref.values8.sort_by(|&a, &b| {
+        // SAFETY: Caller guarantees every 8-byte element is null or a valid C string.
+        unsafe { compare_cstr_handles(a, b) }
+    });
+    impl_ref.sync_value_view();
 }
 
 /// Sort a list of C-string pointers in-place (lexicographic order)
@@ -445,22 +535,16 @@ pub unsafe extern "C" fn pith_cstring_chars(s: *const i8) -> i64 {
 /// each 8-byte element is a *const i8 pointer to a null-terminated C string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_sort_strings(list_ptr: i64) {
-    let Some(impl_ref) = list_mut_from_handle(list_ptr) else {
-        return;
-    };
+    // SAFETY: `list_ptr` is validated by `with_list_mut_handle` and caller guarantees
+    // every element is null or a valid C string.
+    unsafe { with_list_mut_handle(list_ptr, |list| sort_strings_impl(list)) };
+}
+
+fn sort_i64_impl(impl_ref: &mut ListImpl) {
     if impl_ref.elem_size != 8 {
         return;
     }
-    impl_ref.values8.sort_by(|a, b| {
-        let ap = *a as *const i8;
-        let bp = *b as *const i8;
-        match (cstr_bytes(ap), cstr_bytes(bp)) {
-            (None, None) => std::cmp::Ordering::Equal,
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (Some(a_bytes), Some(b_bytes)) => a_bytes.cmp(b_bytes),
-        }
-    });
+    impl_ref.values8.sort();
     impl_ref.sync_value_view();
 }
 
@@ -470,14 +554,39 @@ pub unsafe extern "C" fn pith_list_sort_strings(list_ptr: i64) {
 /// list_ptr is i64 carrying the PithList's internal ptr value
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_sort(list_ptr: i64) {
-    let Some(impl_ref) = list_mut_from_handle(list_ptr) else {
-        return;
-    };
-    if impl_ref.elem_size != 8 {
-        return;
+    // SAFETY: `list_ptr` is validated by `with_list_mut_handle` before mutating.
+    unsafe { with_list_mut_handle(list_ptr, sort_i64_impl) };
+}
+
+fn list_slice_impl(impl_ref: &ListImpl, start: i64, end: i64) -> PithList {
+    use crate::collections::list::{pith_list_new, pith_list_push_value};
+
+    // SAFETY: Allocates a fresh list with the source list's element tag.
+    let new_list = unsafe { pith_list_new(8, impl_ref.type_tag as i32) };
+    let len = impl_ref.len() as i64;
+    let s = start.max(0).min(len) as usize;
+    let e = end.max(0).min(len) as usize;
+    for i in s..e {
+        if let Some(val) = impl_ref.get_value(i) {
+            // SAFETY: `new_list` is freshly allocated and `val` matches its element tag.
+            unsafe { pith_list_push_value(new_list, val) };
+        }
     }
-    impl_ref.values8.sort();
-    impl_ref.sync_value_view();
+    new_list
+}
+
+fn clone_list_elements(impl_ref: &ListImpl) -> PithList {
+    use crate::collections::list::{pith_list_new, pith_list_push_value};
+
+    // SAFETY: Allocates a fresh list with the source list's element tag.
+    let new_list = unsafe { pith_list_new(8, impl_ref.type_tag as i32) };
+    for i in 0..impl_ref.len() {
+        if let Some(val) = impl_ref.get_value(i) {
+            // SAFETY: `new_list` is freshly allocated and `val` matches its element tag.
+            unsafe { pith_list_push_value(new_list, val) };
+        }
+    }
+    new_list
 }
 
 /// Get a sub-slice of a list
@@ -486,86 +595,43 @@ pub unsafe extern "C" fn pith_list_sort(list_ptr: i64) {
 /// list_ptr is i64 carrying the PithList's internal ptr value
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_slice(list_ptr: i64, start: i64, end: i64) -> i64 {
-    use crate::collections::list::{pith_list_new, pith_list_push_value};
-
-    let src_tag = list_ref_from_handle(list_ptr).map(|r| r.type_tag as i32).unwrap_or(0);
-    let new_list = pith_list_new(8, src_tag);
-    if let Some(impl_ref) = list_ref_from_handle(list_ptr) {
-        let len = impl_ref.len() as i64;
-        let s = start.max(0).min(len) as usize;
-        let e = end.max(0).min(len) as usize;
-        for i in s..e {
-            if let Some(val) = impl_ref.get_value(i) {
-                pith_list_push_value(new_list, val);
-            }
-        }
-    }
+    // SAFETY: `list_ptr` is validated by `with_list_ref_handle` before reading.
+    let new_list =
+        unsafe { with_list_ref_handle(list_ptr, |impl_ref| list_slice_impl(impl_ref, start, end)) }
+            // SAFETY: Allocates an empty primitive list when `list_ptr` is invalid.
+            .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) });
     new_list.ptr as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_sort_copy(list_ptr: i64) -> i64 {
-    use crate::collections::list::{pith_list_new, pith_list_push_value};
-
-    let src_tag = list_ref_from_handle(list_ptr).map(|r| r.type_tag as i32).unwrap_or(0);
-    let new_list = pith_list_new(8, src_tag);
-    let Some(impl_ref) = list_ref_from_handle(list_ptr) else {
-        return new_list.ptr as i64;
-    };
-    let mut i = 0usize;
-    while i < impl_ref.len() {
-        if let Some(val) = impl_ref.get_value(i) {
-            pith_list_push_value(new_list, val);
-        }
-        i += 1;
-    }
-
-    pith_list_sort(new_list.ptr as i64);
+    // SAFETY: `list_ptr` is validated by `with_list_ref_handle` before reading.
+    let new_list = unsafe { with_list_ref_handle(list_ptr, clone_list_elements) }
+        // SAFETY: Allocates an empty primitive list when `list_ptr` is invalid.
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) });
+    // SAFETY: `new_list` is a freshly allocated valid list.
+    unsafe { pith_list_sort(new_list.ptr as i64) };
     new_list.ptr as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_sort_strings_copy(list_ptr: i64) -> i64 {
-    use crate::collections::list::{pith_list_new, pith_list_push_value};
-
-    let src_tag = list_ref_from_handle(list_ptr).map(|r| r.type_tag as i32).unwrap_or(0);
-    let new_list = pith_list_new(8, src_tag);
-    let Some(impl_ref) = list_ref_from_handle(list_ptr) else {
-        return new_list.ptr as i64;
-    };
-    let mut i = 0usize;
-    while i < impl_ref.len() {
-        if let Some(val) = impl_ref.get_value(i) {
-            pith_list_push_value(new_list, val);
-        }
-        i += 1;
-    }
-
-    pith_list_sort_strings(new_list.ptr as i64);
+    // SAFETY: `list_ptr` is validated by `with_list_ref_handle` before reading.
+    let new_list = unsafe { with_list_ref_handle(list_ptr, clone_list_elements) }
+        // SAFETY: Allocates an empty primitive list when `list_ptr` is invalid.
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) });
+    // SAFETY: `new_list` is a freshly allocated valid string list.
+    unsafe { pith_list_sort_strings(new_list.ptr as i64) };
     new_list.ptr as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_slice_copy(list_ptr: i64, start: i64, end: i64) -> i64 {
-    pith_list_slice(list_ptr, start, end)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { pith_list_slice(list_ptr, start, end) }
 }
 
-/// Replace all occurrences of `from` with `to` in `s`
-/// Returns newly allocated C string
-///
-/// # Safety
-/// All pointers must be valid null-terminated C strings
-#[no_mangle]
-pub unsafe extern "C" fn pith_cstring_replace(
-    s: *const i8,
-    from: *const i8,
-    to: *const i8,
-) -> *mut i8 {
-    let Some(s_bytes) = cstr_bytes(s) else {
-        return std::ptr::null_mut();
-    };
-    let from_bytes = cstr_bytes(from).unwrap_or(&[]);
-    let to_bytes = cstr_bytes(to).unwrap_or(&[]);
+fn replace_impl(s_bytes: &[u8], from_bytes: &[u8], to_bytes: &[u8]) -> *mut i8 {
     let s_len = s_bytes.len();
     let from_len = from_bytes.len();
 
@@ -587,16 +653,44 @@ pub unsafe extern "C" fn pith_cstring_replace(
     crate::pith_copy_bytes_to_cstring(&result)
 }
 
+/// Replace all occurrences of `from` with `to` in `s`
+/// Returns newly allocated C string
+///
+/// # Safety
+/// All pointers must be valid null-terminated C strings
+#[no_mangle]
+pub unsafe extern "C" fn pith_cstring_replace(
+    s: *const i8,
+    from: *const i8,
+    to: *const i8,
+) -> *mut i8 {
+    // SAFETY: All non-null pointers are valid null-terminated C strings for this call.
+    unsafe {
+        with_cstr_bytes(s, |s_bytes| {
+            with_cstr_bytes_or_empty(from, |from_bytes| {
+                with_cstr_bytes_or_empty(to, |to_bytes| replace_impl(s_bytes, from_bytes, to_bytes))
+            })
+        })
+    }
+    .unwrap_or(std::ptr::null_mut())
+}
+
 /// Check if a C string is empty (null or zero-length)
 ///
 /// # Safety
 /// s must be null or a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_is_empty(s: *const i8) -> i64 {
-    if matches!(cstr_bytes(s), None | Some([])) {
-        1
-    } else {
-        0
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    let is_empty = unsafe { with_cstr_bytes(s, <[u8]>::is_empty) }.unwrap_or(true);
+    i64::from(is_empty)
+}
+
+#[inline(always)]
+fn last_index_of_impl(h: &str, n: &str) -> i64 {
+    match h.rfind(n) {
+        Some(idx) => idx as i64,
+        None => -1,
     }
 }
 
@@ -606,13 +700,8 @@ pub unsafe extern "C" fn pith_cstring_is_empty(s: *const i8) -> i64 {
 /// Both arguments must be valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_last_index_of(haystack: *const i8, needle: *const i8) -> i64 {
-    let (Some(h), Some(n)) = (cstr_str(haystack), cstr_str(needle)) else {
-        return -1;
-    };
-    match h.rfind(n) {
-        Some(idx) => idx as i64,
-        None => -1,
-    }
+    // SAFETY: Both arguments are null or valid null-terminated C strings.
+    unsafe { with_cstr_str2(haystack, needle, last_index_of_impl) }.unwrap_or(-1)
 }
 
 #[cfg(test)]
@@ -627,7 +716,7 @@ mod tests {
         unsafe {
             assert!(pith_cstring_substring(std::ptr::null(), 0, 1).is_null());
             let ch = pith_cstring_char_at(std::ptr::null(), 0);
-            assert_eq!(crate::ffi_util::cstr_bytes(ch), Some(&[][..]));
+            assert_eq!(with_cstr_bytes(ch, <[u8]>::to_vec), Some(Vec::new()));
             assert_eq!(pith_cstring_is_empty(std::ptr::null()), 1);
             assert_eq!(pith_cstring_is_empty(ptr), 0);
             assert_eq!(
@@ -643,7 +732,7 @@ mod tests {
         let o = std::ffi::CString::new(to).unwrap();
         unsafe {
             let out = pith_cstring_replace(t.as_ptr(), f.as_ptr(), o.as_ptr());
-            let text = String::from_utf8(cstr_bytes(out).unwrap().to_vec()).unwrap();
+            let text = String::from_utf8(with_cstr_bytes(out, <[u8]>::to_vec).unwrap()).unwrap();
             crate::pith_cstring_release(out);
             text
         }
@@ -658,7 +747,9 @@ mod tests {
             let mut parts = Vec::new();
             for i in 0..pith_list_len(list) {
                 let part = pith_list_get_value(list, i) as *const i8;
-                parts.push(String::from_utf8(cstr_bytes(part).unwrap().to_vec()).unwrap());
+                parts.push(
+                    String::from_utf8(with_cstr_bytes(part, <[u8]>::to_vec).unwrap()).unwrap(),
+                );
             }
             pith_list_release(list);
             parts
@@ -735,7 +826,9 @@ mod tests {
             let mut parts = Vec::new();
             for i in 0..pith_list_len(list) {
                 let part = pith_list_get_value(list, i) as *const i8;
-                parts.push(String::from_utf8(cstr_bytes(part).unwrap().to_vec()).unwrap());
+                parts.push(
+                    String::from_utf8(with_cstr_bytes(part, <[u8]>::to_vec).unwrap()).unwrap(),
+                );
             }
             pith_list_release(list);
             parts

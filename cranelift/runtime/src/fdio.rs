@@ -51,11 +51,10 @@ pub(crate) fn is_would_block(err: i32) -> bool {
 /// still safe: the caller then blocks in the syscall rather than yielding.
 pub(crate) fn set_nonblocking(fd: RawFd) {
     // SAFETY: plain fcntl on a valid fd we just created or accepted.
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags >= 0 {
+        // SAFETY: setting O_NONBLOCK on the same valid fd.
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
     }
 }
 
@@ -306,28 +305,34 @@ impl Channel {
     /// one read into `buf`, returning the raw syscall result.
     ///
     /// # Safety
-    /// `buf` must be writable for `size` bytes and `fd` owned by pith for the
-    /// length of the call.
-    unsafe fn read(self, fd: i32, buf: *mut u8, size: usize) -> isize {
-        let buf = buf as *mut libc::c_void;
+    /// `fd` must be owned by pith for the length of the call.
+    unsafe fn read(self, fd: i32, buf: &mut [u8]) -> isize {
+        let ptr = buf.as_mut_ptr() as *mut libc::c_void;
+        let size = buf.len();
         match self {
-            Channel::Pipe => libc::read(fd, buf, size),
-            Channel::Socket => libc::recv(fd, buf, size, Self::NO_FLAGS),
-            Channel::PolledSocket => libc::recv(fd, buf, size, libc::MSG_DONTWAIT),
+            // SAFETY: `buf` is writable for `size` bytes; caller guarantees `fd` is owned.
+            Channel::Pipe => unsafe { libc::read(fd, ptr, size) },
+            // SAFETY: `buf` is writable for `size` bytes; caller guarantees `fd` is owned.
+            Channel::Socket => unsafe { libc::recv(fd, ptr, size, Self::NO_FLAGS) },
+            // SAFETY: `buf` is writable for `size` bytes; caller guarantees `fd` is owned.
+            Channel::PolledSocket => unsafe { libc::recv(fd, ptr, size, libc::MSG_DONTWAIT) },
         }
     }
 
     /// one write from `data`, returning the raw syscall result.
     ///
     /// # Safety
-    /// `data` must be readable for `size` bytes and `fd` owned by pith for the
-    /// length of the call.
-    unsafe fn write(self, fd: i32, data: *const u8, size: usize) -> isize {
-        let data = data as *const libc::c_void;
+    /// `fd` must be owned by pith for the length of the call.
+    unsafe fn write(self, fd: i32, data: &[u8]) -> isize {
+        let ptr = data.as_ptr() as *const libc::c_void;
+        let size = data.len();
         match self {
-            Channel::Pipe => libc::write(fd, data, size),
-            Channel::Socket => libc::send(fd, data, size, Self::NO_FLAGS),
-            Channel::PolledSocket => libc::send(fd, data, size, libc::MSG_DONTWAIT),
+            // SAFETY: `data` is readable for `size` bytes; caller guarantees `fd` is owned.
+            Channel::Pipe => unsafe { libc::write(fd, ptr, size) },
+            // SAFETY: `data` is readable for `size` bytes; caller guarantees `fd` is owned.
+            Channel::Socket => unsafe { libc::send(fd, ptr, size, Self::NO_FLAGS) },
+            // SAFETY: `data` is readable for `size` bytes; caller guarantees `fd` is owned.
+            Channel::PolledSocket => unsafe { libc::send(fd, ptr, size, libc::MSG_DONTWAIT) },
         }
     }
 
@@ -506,9 +511,9 @@ fn read_channel(guard: &Guard, size: usize, channel: Channel) -> Option<Vec<u8>>
     let mut buf = vec![0u8; size];
     let mut budget = WaitBudget::Unasked;
     loop {
-        // SAFETY: reading up to `size` bytes into a buffer we own; `fd` is held
+        // SAFETY: reading into a buffer we own; `fd` is held
         // open by `guard` for the duration of this call.
-        let n = unsafe { channel.read(fd as i32, buf.as_mut_ptr(), size) };
+        let n = unsafe { channel.read(fd as i32, &mut buf) };
         if n >= 0 {
             if n == 0 && !guard.is_live() {
                 return None;
@@ -586,9 +591,9 @@ fn write_channel(guard: &Guard, data: &[u8], channel: Channel) -> Result<usize, 
     let fd = guard.fd() as i64;
     let mut budget = WaitBudget::Unasked;
     loop {
-        // SAFETY: writing `data.len()` bytes from a buffer we borrow; `fd` is
+        // SAFETY: writing from a buffer we borrow; `fd` is
         // held open by `guard` for the duration of this call.
-        let n = unsafe { channel.write(fd as i32, data.as_ptr(), data.len()) };
+        let n = unsafe { channel.write(fd as i32, data) };
         if n > 0 {
             if channel.is_socket() {
                 crate::perf_stats!(PERF_SOCK_WRITES += 1, PERF_SOCK_WRITE_BYTES += n as usize);
@@ -640,9 +645,9 @@ pub(crate) fn socket_read_blocking(guard: &Guard, size: usize) -> Option<Vec<u8>
     // for the cycle collector. the bracket is kept to the syscall itself.
     let n = {
         let _native = crate::cycle::native_bracket();
-        // SAFETY: reading up to `size` bytes into a buffer we own; `fd` is
+        // SAFETY: reading into a buffer we own; `fd` is
         // held open by `guard` for the duration of this call.
-        unsafe { Channel::Socket.read(fd as i32, buf.as_mut_ptr(), size) }
+        unsafe { Channel::Socket.read(fd as i32, &mut buf) }
     };
     if n >= 0 {
         if n == 0 && !guard.is_live() {
@@ -670,9 +675,9 @@ pub(crate) fn socket_write_blocking(guard: &Guard, data: &[u8]) -> Result<usize,
     // window for the cycle collector, kept to the syscall itself.
     let n = {
         let _native = crate::cycle::native_bracket();
-        // SAFETY: writing `data.len()` bytes from a buffer we borrow; `fd` is
+        // SAFETY: writing from a buffer we borrow; `fd` is
         // held open by `guard` for the duration of this call.
-        unsafe { Channel::Socket.write(fd as i32, data.as_ptr(), data.len()) }
+        unsafe { Channel::Socket.write(fd as i32, data) }
     };
     if n >= 0 {
         return Ok(n as usize);
@@ -741,8 +746,8 @@ mod tests {
     /// the raw errno from one socket read of `fd`, which must fail.
     fn socket_read_errno(fd: RawFd) -> i32 {
         let mut buf = [0u8; 16];
-        // SAFETY: reading into a stack buffer of the length we pass.
-        let n = unsafe { Channel::Socket.read(fd, buf.as_mut_ptr(), buf.len()) };
+        // SAFETY: reading into a stack buffer; test expects failure on `fd`.
+        let n = unsafe { Channel::Socket.read(fd, &mut buf) };
         assert_eq!(n, -1);
         errno()
     }
@@ -750,8 +755,8 @@ mod tests {
     /// the raw errno from one socket write to `fd`, which must fail.
     fn socket_write_errno(fd: RawFd) -> i32 {
         let data = b"x";
-        // SAFETY: writing one byte from a buffer that outlives the call.
-        let n = unsafe { Channel::Socket.write(fd, data.as_ptr(), data.len()) };
+        // SAFETY: writing one byte from a static buffer; test expects failure on `fd`.
+        let n = unsafe { Channel::Socket.write(fd, data) };
         assert_eq!(n, -1);
         errno()
     }

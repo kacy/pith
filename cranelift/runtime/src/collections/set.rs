@@ -220,7 +220,8 @@ const SET_MAGIC: u32 = 0x50534554;
 /// per access. Freed sets get their magic scrubbed in pith_set_free.
 #[inline]
 unsafe fn set_magic_ok(ptr: *const ()) -> bool {
-    set_magic_ok_for(ptr, crate::quarantine::Op::Use)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { set_magic_ok_for(ptr, crate::quarantine::Op::Use) }
 }
 
 /// `set_magic_ok`, naming what the caller does with the set in a quarantine
@@ -228,35 +229,138 @@ unsafe fn set_magic_ok(ptr: *const ()) -> bool {
 #[inline(always)]
 unsafe fn set_magic_ok_for(ptr: *const (), op: crate::quarantine::Op) -> bool {
     handle_registry::plausibly_aligned::<SetImpl>(ptr)
-        && crate::quarantine::magic_is(std::ptr::addr_of!((*(ptr as *const SetImpl)).magic), SET_MAGIC, op)
+        && unsafe {
+            // SAFETY: Alignment verified above; `magic_is` reads the magic field to validate.
+            crate::quarantine::magic_is(
+                std::ptr::addr_of!((*(ptr as *const SetImpl)).magic),
+                SET_MAGIC,
+                op,
+            )
+        }
 }
 
-unsafe fn set_ref<'a>(set: PithSet) -> Option<&'a SetImpl> {
-    if !set_magic_ok(set.ptr as *const ()) {
+/// Validate `set` and borrow its `SetImpl` immutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_set_ref<R>(set: PithSet, f: impl FnOnce(&SetImpl) -> R) -> Option<R> {
+    if !unsafe { set_magic_ok(set.ptr as *const ()) } {
         return None;
     }
-    Some(&*(set.ptr as *const SetImpl))
+    // SAFETY: Magic check validated pointer; borrow is scoped to `f`.
+    let impl_ref = unsafe { &*(set.ptr as *const SetImpl) };
+    Some(f(impl_ref))
 }
 
-unsafe fn set_mut<'a>(set: PithSet) -> Option<&'a mut SetImpl> {
-    if !set_magic_ok(set.ptr as *const ()) {
+/// Validate `set` and borrow its `SetImpl` mutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_set_mut<R>(set: PithSet, f: impl FnOnce(&mut SetImpl) -> R) -> Option<R> {
+    if !unsafe { set_magic_ok(set.ptr as *const ()) } {
         return None;
     }
-    Some(&mut *(set.ptr as *mut SetImpl))
+    // SAFETY: Magic check validated pointer; caller ensures exclusive access for `f`.
+    let impl_mut = unsafe { &mut *(set.ptr as *mut SetImpl) };
+    Some(f(impl_mut))
 }
 
-unsafe fn set_ref_from_handle<'a>(handle: i64) -> Option<&'a SetImpl> {
-    if !set_magic_ok(handle as *const ()) {
-        return None;
-    }
-    Some(&*(handle as *const SetImpl))
+/// Validate `handle` and borrow its `SetImpl` immutably for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_set_ref_handle<R>(
+    handle: i64,
+    f: impl FnOnce(&SetImpl) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_set_ref(PithSet { ptr: handle as *mut () }, f) }
 }
 
-unsafe fn set_mut_from_handle<'a>(handle: i64) -> Option<&'a mut SetImpl> {
-    if !set_magic_ok(handle as *const ()) {
+/// Validate `handle` and borrow its `SetImpl` mutably for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_set_mut_handle<R>(
+    handle: i64,
+    f: impl FnOnce(&mut SetImpl) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_set_mut(PithSet { ptr: handle as *mut () }, f) }
+}
+
+/// Validate two sets and borrow both immutably for the duration of `f`.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn with_set_ref2<R>(
+    a: PithSet,
+    b: PithSet,
+    f: impl FnOnce(&SetImpl, &SetImpl) -> R,
+) -> Option<R> {
+    if !unsafe { set_magic_ok(a.ptr as *const ()) }
+        || !unsafe { set_magic_ok(b.ptr as *const ()) }
+    {
         return None;
     }
-    Some(&mut *(handle as *mut SetImpl))
+    // SAFETY: Both pointers passed magic validation and both borrows are shared (`&SetImpl`),
+    // so aliasing `a.ptr == b.ptr` is sound.
+    let a_ref = unsafe { &*(a.ptr as *const SetImpl) };
+    let b_ref = unsafe { &*(b.ptr as *const SetImpl) };
+    Some(f(a_ref, b_ref))
+}
+
+/// Validate two set handles and borrow both immutably for the duration of `f`.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn with_set_ref2_handle<R>(
+    a: i64,
+    b: i64,
+    f: impl FnOnce(&SetImpl, &SetImpl) -> R,
+) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        with_set_ref2(
+            PithSet { ptr: a as *mut () },
+            PithSet { ptr: b as *mut () },
+            f,
+        )
+    }
+}
+
+/// Validate `dst` (mutable) and `src` (shared) without aliasing UB.
+#[allow(dead_code)]
+#[inline(always)]
+unsafe fn with_set_mut_and_ref<R>(
+    dst: PithSet,
+    src: PithSet,
+    on_distinct: impl FnOnce(&mut SetImpl, &SetImpl) -> R,
+    on_same: impl FnOnce(&mut SetImpl) -> R,
+) -> Option<R> {
+    if !unsafe { set_magic_ok(dst.ptr as *const ()) } {
+        return None;
+    }
+    if dst.ptr == src.ptr {
+        // SAFETY: `dst` validated; only one `&mut` reference is minted.
+        let same = unsafe { &mut *(dst.ptr as *mut SetImpl) };
+        return Some(on_same(same));
+    }
+    if !unsafe { set_magic_ok(src.ptr as *const ()) } {
+        return None;
+    }
+    // SAFETY: `dst` and `src` are both valid and distinct pointers.
+    let dst_mut = unsafe { &mut *(dst.ptr as *mut SetImpl) };
+    let src_ref = unsafe { &*(src.ptr as *const SetImpl) };
+    Some(on_distinct(dst_mut, src_ref))
+}
+
+/// Borrow a non-null C-string element as `ElemRef::Str` for the duration of `f`.
+#[inline(always)]
+unsafe fn with_cstr_elem<R>(s: *const i8, f: impl FnOnce(&ElemRef<'_>) -> R) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller; borrow is scoped to `f`.
+    unsafe { crate::ffi_util::with_cstr_bytes(s, |bytes| f(&ElemRef::Str(bytes))) }
+}
+
+/// Borrow a bytes handle's content as `ElemRef::Bytes` for the duration of `f`.
+/// A null handle is the empty value, matching `pith_bytes_eq`.
+#[inline(always)]
+unsafe fn with_bytes_elem<R>(handle: i64, f: impl FnOnce(&ElemRef<'_>) -> R) -> Option<R> {
+    if handle == 0 {
+        return Some(f(&ElemRef::Bytes(&[])));
+    }
+    // SAFETY: `with_bytes` validates `handle` and scopes the borrowed slice to `f`.
+    unsafe { crate::bytes::with_bytes(handle, |bytes| f(&ElemRef::Bytes(bytes))) }
 }
 
 /// Create a new empty set
@@ -279,27 +383,25 @@ pub unsafe extern "C" fn pith_set_new(elem_type: i32, elem_size: i64) -> PithSet
 /// Get set length
 #[no_mangle]
 pub extern "C" fn pith_set_len(set: PithSet) -> i64 {
-    unsafe {
-        set_ref(set)
-            .map(|impl_ref| impl_ref.len() as i64)
-            .unwrap_or(0)
-    }
+    // SAFETY: `with_set_ref` validates `set` before reading its length.
+    unsafe { with_set_ref(set, |impl_ref| impl_ref.len() as i64) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn set_contains_int_impl(impl_ref: &SetImpl, elem: i64) -> bool {
+    matches!(impl_ref.elem_type, ElemType::Int) && impl_ref.contains(&ElemRef::Int(elem))
 }
 
 /// Check if set contains integer element
 #[no_mangle]
 pub extern "C" fn pith_set_contains_int(set: PithSet, elem: i64) -> bool {
-    unsafe {
-        let Some(impl_ref) = set_ref(set) else {
-            return false;
-        };
+    // SAFETY: `with_set_ref` validates `set` before probing it.
+    unsafe { with_set_ref(set, |impl_ref| set_contains_int_impl(impl_ref, elem)) }.unwrap_or(false)
+}
 
-        if !matches!(impl_ref.elem_type, ElemType::Int) {
-            return false;
-        }
-
-        impl_ref.contains(&ElemRef::Int(elem))
-    }
+#[inline(always)]
+fn set_remove_int_impl(impl_ref: &mut SetImpl, elem: i64) -> bool {
+    matches!(impl_ref.elem_type, ElemType::Int) && impl_ref.remove(&ElemRef::Int(elem))
 }
 
 /// Remove integer element from set
@@ -310,16 +412,11 @@ pub unsafe extern "C" fn pith_set_remove_int(set: *mut PithSet, elem: i64) -> bo
     if set.is_null() {
         return false;
     }
-
-    let Some(impl_ref) = set_mut(*set) else {
-        return false;
-    };
-
-    if !matches!(impl_ref.elem_type, ElemType::Int) {
-        return false;
-    }
-
-    impl_ref.remove(&ElemRef::Int(elem))
+    // SAFETY: `set` is non-null per caller contract.
+    let set_val = unsafe { *set };
+    // SAFETY: `with_set_mut` validates `set_val` before mutating it.
+    unsafe { with_set_mut(set_val, |impl_ref| set_remove_int_impl(impl_ref, elem)) }
+        .unwrap_or(false)
 }
 
 /// Clear all elements from set
@@ -328,21 +425,21 @@ pub unsafe extern "C" fn pith_set_clear(set: *mut PithSet) {
     if set.is_null() {
         return;
     }
-
-    let Some(impl_ref) = set_mut(*set) else {
-        return;
-    };
-
-    impl_ref.clear();
+    // SAFETY: `set` is non-null per caller contract.
+    let set_val = unsafe { *set };
+    // SAFETY: `with_set_mut` validates `set_val` before clearing it.
+    unsafe { with_set_mut(set_val, SetImpl::clear) };
 }
 
 /// Release set and free memory
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_release(set: PithSet) {
-    if !set_magic_ok_for(set.ptr as *const (), crate::quarantine::Op::Release) {
+    // SAFETY: `set_magic_ok_for` validates alignment and magic word.
+    if !unsafe { set_magic_ok_for(set.ptr as *const (), crate::quarantine::Op::Release) } {
         return;
     }
-    let impl_ref = &mut *(set.ptr as *mut SetImpl);
+    // SAFETY: Magic validated; only the atomic refcount is accessed while shared.
+    let impl_ref = unsafe { &*(set.ptr as *const SetImpl) };
     let prev = impl_ref
         .rc
         .fetch_sub(1, std::sync::atomic::Ordering::Release);
@@ -358,16 +455,20 @@ pub unsafe extern "C" fn pith_set_release(set: PithSet) {
 
     // Free the set implementation. Scrub the magic first so any handle
     // that outlives the set fails the fast validity check.
-    (*(set.ptr as *mut SetImpl)).magic = 0;
-    drop_set_shell(set.ptr as *mut SetImpl);
+    // SAFETY: Last strong count observed with acquire; `impl_ref` borrow ended above.
+    unsafe {
+        (*(set.ptr as *mut SetImpl)).magic = 0;
+        drop_set_shell(set.ptr as *mut SetImpl);
+    }
 }
 
 /// Retain a set handle: one more owner of this shared handle.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_retain_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_SET_RETAIN);
-    if set_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) {
-        (*(handle as *const SetImpl))
+    // SAFETY: Magic check validates handle before atomic retain increment.
+    if unsafe { set_magic_ok_for(handle as *const (), crate::quarantine::Op::Retain) } {
+        unsafe { &*(handle as *const SetImpl) }
             .rc
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -377,9 +478,12 @@ pub unsafe extern "C" fn pith_set_retain_handle(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_release_handle(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_SET_RELEASE);
-    pith_set_release(PithSet {
-        ptr: handle as *mut (),
-    });
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe {
+        pith_set_release(PithSet {
+            ptr: handle as *mut (),
+        });
+    }
 }
 
 // --- collector-facing accessors ---------------------------------------------
@@ -393,26 +497,27 @@ pub unsafe extern "C" fn pith_set_release_handle(handle: i64) {
 
 /// The set's current reference count, or `None` for an invalid handle.
 pub(crate) unsafe fn cycle_set_strong_count(handle: i64) -> Option<u32> {
-    set_ref_from_handle(handle)
-        .map(|impl_ref| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed))
+    let read_rc = |impl_ref: &SetImpl| impl_ref.rc.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `with_set_ref_handle` validates `handle` before reading its refcount.
+    unsafe { with_set_ref_handle(handle, read_rc) }
 }
 
 /// Add `delta` to the reference count: the collector's teardown guard.
 pub(crate) unsafe fn cycle_set_guard_strong(handle: i64, delta: u32) {
-    if let Some(impl_ref) = set_ref_from_handle(handle) {
+    let bump = |impl_ref: &SetImpl| {
         impl_ref
             .rc
             .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
-    }
+    };
+    // SAFETY: `with_set_ref_handle` validates `handle` before updating its refcount.
+    unsafe { with_set_ref_handle(handle, bump) };
 }
 
 /// The destruction body of a garbage set: drop the owned elements by
 /// clearing, leaving an empty set so the shell free cannot repeat it.
 pub(crate) unsafe fn cycle_set_release_elements(handle: i64) {
-    let Some(impl_ref) = set_mut_from_handle(handle) else {
-        return;
-    };
-    impl_ref.clear();
+    // SAFETY: Collector holds the world stopped; `with_set_mut_handle` validates `handle`.
+    unsafe { with_set_mut_handle(handle, SetImpl::clear) };
 }
 
 /// Free a garbage set's shell: the tail of `pith_set_release` minus the
@@ -420,17 +525,47 @@ pub(crate) unsafe fn cycle_set_release_elements(handle: i64) {
 /// no buffered bit and never enter the suspect buffer, so a plain drop is
 /// always safe here.
 pub(crate) unsafe fn cycle_set_free_dead(handle: i64) {
-    if set_ref_from_handle(handle).is_none() {
+    // SAFETY: Magic check validates `handle` before scrubbing and freeing.
+    if !unsafe { set_magic_ok(handle as *const ()) } {
         return;
     }
-    (*(handle as *mut SetImpl)).magic = 0;
-    drop_set_shell(handle as *mut SetImpl);
+    // SAFETY: Collector owns this dead set exclusively.
+    unsafe {
+        (*(handle as *mut SetImpl)).magic = 0;
+        drop_set_shell(handle as *mut SetImpl);
+    }
 }
 
 /// Free a dead set's box, or quarantine it.
 unsafe fn drop_set_shell(ptr: *mut SetImpl) {
-    let magic = std::ptr::addr_of_mut!((*ptr).magic);
-    crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::Set);
+    // SAFETY: Caller passes a valid `Box::into_raw` `SetImpl` pointer to free or quarantine.
+    unsafe {
+        let magic = std::ptr::addr_of_mut!((*ptr).magic);
+        crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::Set);
+    }
+}
+
+fn set_to_list_int_impl(impl_ref: &SetImpl) -> crate::collections::list::PithList {
+    use crate::collections::list::{pith_list_new, pith_list_push, PithList};
+
+    if !matches!(impl_ref.elem_type, ElemType::Int) {
+        return PithList {
+            ptr: std::ptr::null_mut(),
+        };
+    }
+
+    // SAFETY: Allocates a fresh primitive int list.
+    let mut list = unsafe { pith_list_new(std::mem::size_of::<i64>() as i64, 0) };
+
+    for elem in impl_ref.iter() {
+        if let SetElement::Int(n) = elem {
+            let n_ptr = n as *const i64 as *const u8;
+            // SAFETY: `list` is valid and `n_ptr` points to a readable `i64`.
+            unsafe { pith_list_push(&mut list, n_ptr, std::mem::size_of::<i64>() as i64) };
+        }
+    }
+
+    list
 }
 
 /// Convert set to list (for int elements)
@@ -439,26 +574,35 @@ unsafe fn drop_set_shell(ptr: *mut SetImpl) {
 /// Returns a new list that must be released
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_int(set: PithSet) -> crate::collections::list::PithList {
-    use crate::collections::list::{pith_list_new, pith_list_push, PithList};
-
-    let Some(impl_ref) = set_ref(set) else {
-        return PithList {
+    // SAFETY: `with_set_ref` validates `set` before iterating its elements.
+    unsafe { with_set_ref(set, set_to_list_int_impl) }.unwrap_or(
+        crate::collections::list::PithList {
             ptr: std::ptr::null_mut(),
-        };
-    };
+        },
+    )
+}
 
-    if !matches!(impl_ref.elem_type, ElemType::Int) {
+fn set_to_list_string_impl(impl_ref: &SetImpl) -> crate::collections::list::PithList {
+    use crate::collections::list::{pith_list_new, pith_list_push_value, PithList};
+
+    if !matches!(impl_ref.elem_type, ElemType::String) {
         return PithList {
             ptr: std::ptr::null_mut(),
         };
     }
 
-    let mut list = pith_list_new(std::mem::size_of::<i64>() as i64, 0);
+    // string-tagged: the list owns the freshly copied element strings
+    // SAFETY: Allocates a fresh string-tagged list.
+    let list = unsafe { pith_list_new(8, 1) };
 
     for elem in impl_ref.iter() {
-        if let SetElement::Int(n) = elem {
-            let n_ptr = n as *const i64 as *const u8;
-            pith_list_push(&mut list, n_ptr, std::mem::size_of::<i64>() as i64);
+        if let SetElement::String(bytes) = elem {
+            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
+            // SAFETY: `list` and `ptr` are freshly allocated handles.
+            unsafe {
+                pith_list_push_value(list, ptr as i64);
+                crate::pith_cstring_release(ptr as *const i8);
+            }
         }
     }
 
@@ -473,32 +617,17 @@ pub unsafe extern "C" fn pith_set_to_list_int(set: PithSet) -> crate::collection
 pub unsafe extern "C" fn pith_set_to_list_string(
     set: PithSet,
 ) -> crate::collections::list::PithList {
-    use crate::collections::list::{pith_list_new, pith_list_push_value, PithList};
-
-    let Some(impl_ref) = set_ref(set) else {
-        return PithList {
+    // SAFETY: `with_set_ref` validates `set` before iterating its elements.
+    unsafe { with_set_ref(set, set_to_list_string_impl) }.unwrap_or(
+        crate::collections::list::PithList {
             ptr: std::ptr::null_mut(),
-        };
-    };
+        },
+    )
+}
 
-    if !matches!(impl_ref.elem_type, ElemType::String) {
-        return PithList {
-            ptr: std::ptr::null_mut(),
-        };
-    }
-
-    // string-tagged: the list owns the freshly copied element strings
-    let list = pith_list_new(8, 1);
-
-    for elem in impl_ref.iter() {
-        if let SetElement::String(bytes) = elem {
-            let ptr = crate::pith_copy_bytes_to_cstring(bytes);
-            pith_list_push_value(list, ptr as i64);
-            crate::pith_cstring_release(ptr as *const i8);
-        }
-    }
-
-    list
+fn set_to_list_cstr_impl(impl_ref: &SetImpl) -> i64 {
+    require_flavor(impl_ref.elem_type, ElemType::String, "set_to_list");
+    set_to_list_string_impl(impl_ref).ptr as i64
 }
 
 /// Convert a string set handle to a list handle of C-string pointers.
@@ -506,16 +635,9 @@ pub unsafe extern "C" fn pith_set_to_list_string(
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_cstr(set_handle: i64) -> i64 {
-    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
-        let empty = crate::collections::list::pith_list_new(8, 0);
-        return empty.ptr as i64;
-    };
-    require_flavor(impl_ref.elem_type, ElemType::String, "set_to_list");
-
-    let list = pith_set_to_list_string(PithSet {
-        ptr: set_handle as *mut (),
-    });
-    list.ptr as i64
+    // SAFETY: `with_set_ref_handle` validates `set_handle` before converting it.
+    unsafe { with_set_ref_handle(set_handle, set_to_list_cstr_impl) }
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) }.ptr as i64)
 }
 
 /// Convert an int set handle to a list handle of i64 elements.
@@ -523,62 +645,51 @@ pub unsafe extern "C" fn pith_set_to_list_cstr(set_handle: i64) -> i64 {
 /// Returns the raw `ListImpl` pointer as i64 to match the Cranelift collection ABI.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_int_handle(set_handle: i64) -> i64 {
-    if !set_magic_ok(set_handle as *const ()) {
-        let empty = crate::collections::list::pith_list_new(8, 0);
-        return empty.ptr as i64;
-    }
-
-    let list = pith_set_to_list_int(PithSet {
-        ptr: set_handle as *mut (),
-    });
-    list.ptr as i64
+    // SAFETY: `with_set_ref_handle` validates `set_handle` before converting it.
+    unsafe { with_set_ref_handle(set_handle, |impl_ref| set_to_list_int_impl(impl_ref).ptr as i64) }
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) }.ptr as i64)
 }
 
 // ---------------------------------------------------------------------------
 // Handle-based C-string variants for Cranelift codegen
 // ---------------------------------------------------------------------------
 
-/// Borrow a c-string element: take its length (one header read for a heap
-/// string, a scan for a literal) and hand back the caller's own bytes.
-/// Nothing is copied, so the borrow is only good for the length of the call
-/// that took it.
-unsafe fn cstr_elem_ref<'a>(s: *const i8) -> ElemRef<'a> {
-    let len = crate::string::pith_cstring_len(s) as usize;
-    ElemRef::Str(std::slice::from_raw_parts(s as *const u8, len))
-}
-
-/// Create a new string set (handle-based). Returns SetImpl pointer as i64.
-/// Create a new string set with default settings
-#[no_mangle]
-pub unsafe extern "C" fn pith_set_new_default() -> i64 {
-    pith_set_new_handle(1)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_set_new_int() -> i64 {
-    pith_set_new_handle(0)
-}
-
-/// Create a set of `Bytes` elements, compared and hashed by content.
-#[no_mangle]
-pub unsafe extern "C" fn pith_set_new_bytes() -> i64 {
-    pith_set_new_handle(2)
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn pith_set_new_handle(elem_type: i32) -> i64 {
+#[inline(always)]
+fn set_new_handle_impl(elem_type: i32) -> i64 {
     let set_impl = SetImpl::new(ElemType::from_code(elem_type), 8);
     let boxed = Box::new(set_impl);
     let ptr = Box::into_raw(boxed);
     ptr as i64
 }
 
+/// Create a new string set (handle-based). Returns SetImpl pointer as i64.
+/// Create a new string set with default settings
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_new_default() -> i64 {
+    set_new_handle_impl(1)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_new_int() -> i64 {
+    set_new_handle_impl(0)
+}
+
+/// Create a set of `Bytes` elements, compared and hashed by content.
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_new_bytes() -> i64 {
+    set_new_handle_impl(2)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_set_new_handle(elem_type: i32) -> i64 {
+    set_new_handle_impl(elem_type)
+}
+
 /// Get set length (handle-based).
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_len_handle(set_handle: i64) -> i64 {
-    set_ref_from_handle(set_handle)
-        .map(|impl_ref| impl_ref.len() as i64)
-        .unwrap_or(0)
+    // SAFETY: `with_set_ref_handle` validates `set_handle` before reading its length.
+    unsafe { with_set_ref_handle(set_handle, |impl_ref| impl_ref.len() as i64) }.unwrap_or(0)
 }
 
 /// Insert a C-string element into the set. Returns 1 if newly inserted, 0 if already present.
@@ -587,32 +698,31 @@ pub unsafe extern "C" fn pith_set_add_cstr(set_handle: i64, elem: *const i8) -> 
     if elem.is_null() {
         return 0;
     }
-    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
-        return 0;
+    let run = |impl_ref: &mut SetImpl| {
+        require_flavor(impl_ref.elem_type, ElemType::String, "set_add");
+        // SAFETY: `elem` is non-null and a valid C string per caller contract.
+        let added = unsafe { with_cstr_elem(elem, |set_elem| impl_ref.insert(set_elem)) }
+            .unwrap_or(false);
+        i64::from(added)
     };
-    require_flavor(impl_ref.elem_type, ElemType::String, "set_add");
-    let set_elem = cstr_elem_ref(elem);
-    if impl_ref.insert(&set_elem) {
-        1
-    } else {
-        0
+    // SAFETY: `with_set_mut_handle` validates `set_handle` before mutating it.
+    unsafe { with_set_mut_handle(set_handle, run) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn set_add_int_impl(impl_ref: &mut SetImpl, elem: i64) -> i64 {
+    if !matches!(impl_ref.elem_type, ElemType::Int) {
+        return 0;
     }
+    i64::from(impl_ref.insert(&ElemRef::Int(elem)))
 }
 
 /// Insert an integer element into the set. Returns 1 if newly inserted, 0 if already present.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_add_int_handle(set_handle: i64, elem: i64) -> i64 {
-    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
-        return 0;
-    };
-    if !matches!(impl_ref.elem_type, ElemType::Int) {
-        return 0;
-    }
-    if impl_ref.insert(&ElemRef::Int(elem)) {
-        1
-    } else {
-        0
-    }
+    // SAFETY: `with_set_mut_handle` validates `set_handle` before mutating it.
+    unsafe { with_set_mut_handle(set_handle, |impl_ref| set_add_int_impl(impl_ref, elem)) }
+        .unwrap_or(0)
 }
 
 /// Check if a C-string element exists in the set. Returns 1 if present, 0 otherwise.
@@ -621,32 +731,24 @@ pub unsafe extern "C" fn pith_set_contains_cstr(set_handle: i64, elem: *const i8
     if elem.is_null() {
         return 0;
     }
-    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
-        return 0;
+    let run = |impl_ref: &SetImpl| {
+        require_flavor(impl_ref.elem_type, ElemType::String, "set_contains");
+        // SAFETY: `elem` is non-null and a valid C string per caller contract.
+        let found = unsafe { with_cstr_elem(elem, |set_elem| impl_ref.contains(set_elem)) }
+            .unwrap_or(false);
+        i64::from(found)
     };
-    require_flavor(impl_ref.elem_type, ElemType::String, "set_contains");
-    let set_elem = cstr_elem_ref(elem);
-    if impl_ref.contains(&set_elem) {
-        1
-    } else {
-        0
-    }
+    // SAFETY: `with_set_ref_handle` validates `set_handle` before probing it.
+    unsafe { with_set_ref_handle(set_handle, run) }.unwrap_or(0)
 }
 
 /// Check if an integer element exists in the set. Returns 1 if present, 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_contains_int_handle(set_handle: i64, elem: i64) -> i64 {
-    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
-        return 0;
-    };
-    if !matches!(impl_ref.elem_type, ElemType::Int) {
-        return 0;
-    }
-    if impl_ref.contains(&ElemRef::Int(elem)) {
-        1
-    } else {
-        0
-    }
+    // SAFETY: `with_set_ref_handle` validates `set_handle` before probing it.
+    let found = unsafe { with_set_ref_handle(set_handle, |impl_ref| set_contains_int_impl(impl_ref, elem)) }
+        .unwrap_or(false);
+    i64::from(found)
 }
 
 /// Remove a C-string element from the set.
@@ -655,12 +757,13 @@ pub unsafe extern "C" fn pith_set_remove_cstr(set_handle: i64, elem: *const i8) 
     if elem.is_null() {
         return;
     }
-    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
-        return;
+    let run = |impl_ref: &mut SetImpl| {
+        require_flavor(impl_ref.elem_type, ElemType::String, "set_remove");
+        // SAFETY: `elem` is non-null and a valid C string per caller contract.
+        unsafe { with_cstr_elem(elem, |set_elem| impl_ref.remove(set_elem)) };
     };
-    require_flavor(impl_ref.elem_type, ElemType::String, "set_remove");
-    let set_elem = cstr_elem_ref(elem);
-    impl_ref.remove(&set_elem);
+    // SAFETY: `with_set_mut_handle` validates `set_handle` before mutating it.
+    unsafe { with_set_mut_handle(set_handle, run) };
 }
 
 // ---------------------------------------------------------------------------
@@ -674,64 +777,61 @@ pub unsafe extern "C" fn pith_set_remove_cstr(set_handle: i64, elem: *const i8) 
 // bytes objects the way string iteration hands out fresh strings, owned by
 // the list `pith_set_to_list_bytes` builds.
 
-/// The set element for a bytes handle, or `None` for a handle that is not a
-/// live bytes object. A null handle is the empty value, which `pith_bytes_eq`
-/// already treats as equal to an empty bytes object.
-/// The caller's bytes object is alive for the whole of the entry point that
-/// borrowed it, so the borrow must not outlive that call.
-unsafe fn bytes_elem_ref<'a>(handle: i64) -> Option<ElemRef<'a>> {
-    if handle == 0 {
-        return Some(ElemRef::Bytes(&[]));
-    }
-    crate::bytes::pith_bytes_ref(handle).map(|b| ElemRef::Bytes(b.data.as_slice()))
-}
-
 /// Insert a bytes element by content. Returns 1 if newly inserted, 0 if it
 /// was already present or the handle is not a bytes object.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_add_bytes(set_handle: i64, elem: i64) -> i64 {
-    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
-        return 0;
+    let run = |impl_ref: &mut SetImpl| {
+        require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_add_bytes");
+        // SAFETY: `with_bytes_elem` validates `elem` before borrowing its bytes.
+        let added = unsafe { with_bytes_elem(elem, |set_elem| impl_ref.insert(set_elem)) }
+            .unwrap_or(false);
+        i64::from(added)
     };
-    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_add_bytes");
-    let Some(set_elem) = bytes_elem_ref(elem) else {
-        return 0;
-    };
-    if impl_ref.insert(&set_elem) {
-        1
-    } else {
-        0
-    }
+    // SAFETY: `with_set_mut_handle` validates `set_handle` before mutating it.
+    unsafe { with_set_mut_handle(set_handle, run) }.unwrap_or(0)
 }
 
 /// Check membership of a bytes element by content. Returns 1 if present.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_contains_bytes(set_handle: i64, elem: i64) -> i64 {
-    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
-        return 0;
+    let run = |impl_ref: &SetImpl| {
+        require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_contains_bytes");
+        // SAFETY: `with_bytes_elem` validates `elem` before borrowing its bytes.
+        let found = unsafe { with_bytes_elem(elem, |set_elem| impl_ref.contains(set_elem)) }
+            .unwrap_or(false);
+        i64::from(found)
     };
-    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_contains_bytes");
-    let Some(set_elem) = bytes_elem_ref(elem) else {
-        return 0;
-    };
-    if impl_ref.contains(&set_elem) {
-        1
-    } else {
-        0
-    }
+    // SAFETY: `with_set_ref_handle` validates `set_handle` before probing it.
+    unsafe { with_set_ref_handle(set_handle, run) }.unwrap_or(0)
 }
 
 /// Remove a bytes element by content.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_remove_bytes(set_handle: i64, elem: i64) {
-    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
-        return;
+    let run = |impl_ref: &mut SetImpl| {
+        require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_remove_bytes");
+        // SAFETY: `with_bytes_elem` validates `elem` before borrowing its bytes.
+        unsafe { with_bytes_elem(elem, |set_elem| impl_ref.remove(set_elem)) };
     };
-    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_remove_bytes");
-    let Some(set_elem) = bytes_elem_ref(elem) else {
-        return;
-    };
-    impl_ref.remove(&set_elem);
+    // SAFETY: `with_set_mut_handle` validates `set_handle` before mutating it.
+    unsafe { with_set_mut_handle(set_handle, run) };
+}
+
+fn set_to_list_bytes_impl(impl_ref: &SetImpl) -> i64 {
+    use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
+
+    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_to_list_bytes");
+    // SAFETY: Allocates a fresh bytes-tagged list.
+    let list = unsafe { pith_list_new(8, 5) };
+    for elem in impl_ref.iter() {
+        if let SetElement::Bytes(bytes) = elem {
+            let handle = crate::bytes::pith_bytes_from_vec(bytes.clone());
+            // SAFETY: `list` is freshly allocated and `handle` is an owned bytes handle.
+            unsafe { pith_list_push_value_owned(list, handle) };
+        }
+    }
+    list.ptr as i64
 }
 
 /// Convert a bytes set handle to a list handle of fresh bytes objects. The
@@ -739,54 +839,32 @@ pub unsafe extern "C" fn pith_set_remove_bytes(set_handle: i64, elem: i64) {
 /// releases them; the set's own storage is untouched.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_to_list_bytes(set_handle: i64) -> i64 {
-    use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
-    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
-        let empty = pith_list_new(8, 0);
-        return empty.ptr as i64;
-    };
-    require_flavor(impl_ref.elem_type, ElemType::Bytes, "set_to_list_bytes");
-    let list = pith_list_new(8, 5);
-    for elem in impl_ref.iter() {
-        if let SetElement::Bytes(bytes) = elem {
-            let handle = crate::bytes::pith_bytes_from_vec(bytes.clone());
-            pith_list_push_value_owned(list, handle);
-        }
-    }
-    list.ptr as i64
+    // SAFETY: `with_set_ref_handle` validates `set_handle` before iterating its elements.
+    unsafe { with_set_ref_handle(set_handle, set_to_list_bytes_impl) }
+        .unwrap_or_else(|| unsafe { crate::collections::list::pith_list_new(8, 0) }.ptr as i64)
 }
 
 /// Remove an integer element from the set.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_remove_int_handle(set_handle: i64, elem: i64) {
-    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
-        return;
-    };
-    if !matches!(impl_ref.elem_type, ElemType::Int) {
-        return;
-    }
-    impl_ref.remove(&ElemRef::Int(elem));
+    // SAFETY: `with_set_mut_handle` validates `set_handle` before mutating it.
+    unsafe { with_set_mut_handle(set_handle, |impl_ref| set_remove_int_impl(impl_ref, elem)) };
 }
 
 /// Clear all elements from set (handle-based).
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_clear_handle(set_handle: i64) {
-    let Some(impl_ref) = set_mut_from_handle(set_handle) else {
-        return;
-    };
-    impl_ref.clear();
+    // SAFETY: `with_set_mut_handle` validates `set_handle` before clearing it.
+    unsafe { with_set_mut_handle(set_handle, SetImpl::clear) };
 }
 
 /// Check if set is empty (handle-based). Returns 1 if empty, 0 otherwise.
 #[no_mangle]
 pub unsafe extern "C" fn pith_set_is_empty_handle(set_handle: i64) -> i64 {
-    let Some(impl_ref) = set_ref_from_handle(set_handle) else {
-        return 1;
-    };
-    if impl_ref.len() == 0 {
-        1
-    } else {
-        0
-    }
+    // SAFETY: `with_set_ref_handle` validates `set_handle` before checking its length.
+    let empty = unsafe { with_set_ref_handle(set_handle, |impl_ref| impl_ref.len() == 0) }
+        .unwrap_or(true);
+    i64::from(empty)
 }
 
 /// Destructor for set elements in collections
@@ -798,10 +876,9 @@ pub extern "C" fn pith_set_destructor(ptr: *mut u8) {
         return;
     }
 
-    unsafe {
-        let set = ptr as *const PithSet;
-        pith_set_release(*set);
-    }
+    let set = ptr as *const PithSet;
+    // SAFETY: Caller guarantees `ptr` points to a valid `PithSet`.
+    unsafe { pith_set_release(*set) };
 }
 
 #[cfg(test)]
@@ -904,12 +981,15 @@ mod tests {
             let first = crate::collections::list::pith_list_get_value(list_handle, 0);
             assert_ne!(first, sibling);
             assert_ne!(first, empty);
-            assert!(crate::bytes::pith_bytes_ref(first).is_some());
+            assert!(crate::bytes::with_bytes(first, |_| ()).is_some());
             crate::collections::list::pith_list_release_handle(list);
 
             for h in [from_vec, from_str, sibling, empty, absent] {
-                let b = crate::bytes::pith_bytes_ref(h).expect("the set never took a count");
-                assert_eq!(b.rc.load(std::sync::atomic::Ordering::Relaxed), 1);
+                let rc = crate::bytes::with_bytes_obj(h, |b| {
+                    b.rc.load(std::sync::atomic::Ordering::Relaxed)
+                })
+                .expect("the set never took a count");
+                assert_eq!(rc, 1);
                 crate::bytes::pith_bytes_release(h);
             }
             pith_set_release_handle(set);
@@ -1101,6 +1181,66 @@ mod tests {
             );
             assert_eq!(pith_set_contains_cstr(set, fresh), 1);
             pith_set_release_handle(set);
+        }
+    }
+
+    #[test]
+    fn with_set_mut_and_ref_handles_self_aliasing_and_distinct_sets() {
+        unsafe {
+            let a = pith_set_new(0, 8);
+            let b = pith_set_new(0, 8);
+            pith_set_add_int_handle(a.ptr as i64, 1);
+            pith_set_add_int_handle(b.ptr as i64, 2);
+
+            // distinct sets take `on_distinct`
+            let distinct = with_set_mut_and_ref(
+                a,
+                b,
+                |dst, src| {
+                    for elem in src.iter() {
+                        if let SetElement::Int(n) = elem {
+                            dst.insert(&ElemRef::Int(*n));
+                        }
+                    }
+                    "distinct"
+                },
+                |_| "same",
+            );
+            assert_eq!(distinct, Some("distinct"));
+            assert_eq!(pith_set_len(a), 2);
+            assert!(pith_set_contains_int(a, 1));
+            assert!(pith_set_contains_int(a, 2));
+
+            // self-aliasing takes `on_same` with a single `&mut SetImpl`
+            let same = with_set_mut_and_ref(
+                a,
+                a,
+                |_, _| "distinct",
+                |set| {
+                    set.insert(&ElemRef::Int(3));
+                    "same"
+                },
+            );
+            assert_eq!(same, Some("same"));
+            assert!(pith_set_contains_int(a, 3));
+
+            // invalid handles return None
+            assert!(with_set_mut_and_ref(bogus_set(), a, |_, _| (), |_| ()).is_none());
+            assert!(with_set_mut_and_ref(a, bogus_set(), |_, _| (), |_| ()).is_none());
+
+            // shared ref2 supports both distinct and aliased handles
+            assert_eq!(
+                with_set_ref2_handle(a.ptr as i64, b.ptr as i64, |x, y| (x.len(), y.len())),
+                Some((3, 1))
+            );
+            assert_eq!(
+                with_set_ref2_handle(a.ptr as i64, a.ptr as i64, |x, y| x.len() + y.len()),
+                Some(6)
+            );
+            assert!(with_set_ref2_handle(a.ptr as i64, 12345, |_, _| ()).is_none());
+
+            pith_set_release(a);
+            pith_set_release(b);
         }
     }
 }

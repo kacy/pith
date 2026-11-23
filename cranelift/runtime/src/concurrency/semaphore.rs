@@ -53,15 +53,11 @@ pub struct PithSemaphore {
 /// Opaque handle to a Pith Semaphore
 pub type PithSemaphoreHandle = PithSemaphore;
 
-unsafe fn semaphore_ref<'a>(handle: *mut PithSemaphoreHandle) -> Option<&'a PithSemaphoreHandle> {
-    sync_handle::header_of(handle as *const (), SEMAPHORE_MAGIC, crate::quarantine::Op::Use)?;
-    Some(&*handle)
-}
-
 /// the last count is gone, so no task waits: a waiter holds a count of its
 /// own.
 pub(crate) unsafe fn free_semaphore(p: *mut PithSemaphore) {
-    sync_handle::free_box(p);
+    // SAFETY: Caller guarantees `p` is an unowned `PithSemaphore` from `Box::into_raw`.
+    unsafe { sync_handle::free_box(p) };
 }
 
 fn lock_state(lock: &Mutex<SemaphoreState>) -> MutexGuard<'_, SemaphoreState> {
@@ -143,17 +139,8 @@ pub extern "C" fn pith_semaphore_new(initial: i64) -> *mut PithSemaphoreHandle {
     ptr
 }
 
-/// Acquire a permit from the semaphore (decrement counter)
-///
-/// Blocks until a permit is available.
-///
-/// # Safety
-/// handle must be a valid semaphore handle
-#[no_mangle]
-pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle) {
-    let Some(sem) = semaphore_ref(handle) else {
-        return;
-    };
+#[inline(always)]
+fn acquire_semaphore(sem: &PithSemaphore) {
     // declared before the guard so its count is given back after the guard
     // is dropped.
     let block = BlockCount::new(&sem.header);
@@ -168,15 +155,8 @@ pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle
     guard.count -= 1;
 }
 
-/// Release a permit to the semaphore (increment counter)
-///
-/// # Safety
-/// handle must be a valid semaphore handle
-#[no_mangle]
-pub unsafe extern "C" fn pith_semaphore_release(handle: *mut PithSemaphoreHandle) {
-    let Some(sem) = semaphore_ref(handle) else {
-        return;
-    };
+#[inline(always)]
+fn release_semaphore(sem: &PithSemaphore) {
     let mut state = lock_state(&sem.lock);
     if state.count < state.max {
         state.count += 1;
@@ -185,6 +165,42 @@ pub unsafe extern "C" fn pith_semaphore_release(handle: *mut PithSemaphoreHandle
     // a single parked green task. see the module note on one-waiter-per-permit.
     sem.cvar.notify_one();
     wake_one_green_waiter(&mut state);
+}
+
+/// Acquire a permit from the semaphore (decrement counter)
+///
+/// Blocks until a permit is available.
+///
+/// # Safety
+/// handle must be a valid semaphore handle
+#[no_mangle]
+pub unsafe extern "C" fn pith_semaphore_acquire(handle: *mut PithSemaphoreHandle) {
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithSemaphore`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            SEMAPHORE_MAGIC,
+            crate::quarantine::Op::Use,
+            acquire_semaphore,
+        )
+    };
+}
+
+/// Release a permit to the semaphore (increment counter)
+///
+/// # Safety
+/// handle must be a valid semaphore handle
+#[no_mangle]
+pub unsafe extern "C" fn pith_semaphore_release(handle: *mut PithSemaphoreHandle) {
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithSemaphore`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            SEMAPHORE_MAGIC,
+            crate::quarantine::Op::Use,
+            release_semaphore,
+        )
+    };
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use crate::ffi_util::{cstr_bytes, write_result, ResultPair};
+use crate::ffi_util::{with_cstr_bytes, write_result, ResultPair};
 
 #[repr(C)]
 pub(crate) struct PithBytes {
@@ -32,39 +32,116 @@ pub(crate) struct PithByteBuffer {
     magic: u32,
 }
 
-/// Fast validity checks: one memory read against a magic word instead of a
-/// global registry lock per access. The free paths scrub the magic, so a
-/// stale or wild handle fails the compare instead of being dereferenced
-/// blindly.
-pub(crate) unsafe fn pith_bytes_ref<'a>(handle: i64) -> Option<&'a PithBytes> {
-    bytes_ref_for(handle, crate::quarantine::Op::Use)
-}
-
-/// `pith_bytes_ref`, naming what the caller does with the bytes in a
-/// quarantine report.
+/// Validate `handle` as a `PithBytes` for `op` and borrow it for the duration of `f`.
+///
+/// The borrow cannot escape the closure.
 #[inline(always)]
-unsafe fn bytes_ref_for<'a>(handle: i64, op: crate::quarantine::Op) -> Option<&'a PithBytes> {
+pub(crate) unsafe fn with_bytes_obj_for<R>(
+    handle: i64,
+    op: crate::quarantine::Op,
+    f: impl FnOnce(&PithBytes) -> R,
+) -> Option<R> {
     let ptr = handle as *const PithBytes;
-    if !crate::handle_registry::plausibly_aligned::<PithBytes>(ptr as *const ())
-        || !crate::quarantine::magic_is(std::ptr::addr_of!((*ptr).magic), BYTES_MAGIC, op)
-    {
+    if !crate::handle_registry::plausibly_aligned::<PithBytes>(ptr as *const ()) {
         return None;
     }
-    Some(&*ptr)
+    // SAFETY: `ptr` passed alignment validation; `magic_is` validates the magic word before dereferencing.
+    let valid = unsafe { crate::quarantine::magic_is(std::ptr::addr_of!((*ptr).magic), BYTES_MAGIC, op) };
+    if !valid {
+        return None;
+    }
+    // SAFETY: Magic word matched `BYTES_MAGIC`; caller holds the handle live for the duration of `f`.
+    let bytes = unsafe { &*ptr };
+    Some(f(bytes))
 }
 
-unsafe fn pith_byte_buffer_mut<'a>(handle: i64) -> Option<&'a mut PithByteBuffer> {
+/// Validate `handle` as a `PithBytes` and borrow the object for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_bytes_obj<R>(handle: i64, f: impl FnOnce(&PithBytes) -> R) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_bytes_obj_for(handle, crate::quarantine::Op::Use, f) }
+}
+
+/// Validate `handle` as a `PithBytes` and borrow its byte slice for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_bytes<R>(handle: i64, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_bytes_obj(handle, |b| f(b.data.as_slice())) }
+}
+
+/// Validate two `PithBytes` handles and borrow both slices for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_bytes2<R>(
+    a: i64,
+    b: i64,
+    f: impl FnOnce(&[u8], &[u8]) -> R,
+) -> Option<R> {
+    // SAFETY: Both borrows are shared (`&[u8]`), so aliasing `a == b` is sound.
+    unsafe { with_bytes(a, |a_slice| with_bytes(b, |b_slice| f(a_slice, b_slice))) }.flatten()
+}
+
+/// Validate three `PithBytes` handles and borrow all three slices for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_bytes3<R>(
+    a: i64,
+    b: i64,
+    c: i64,
+    f: impl FnOnce(&[u8], &[u8], &[u8]) -> R,
+) -> Option<R> {
+    // SAFETY: All borrows are shared (`&[u8]`), so any handle aliasing is sound.
+    unsafe {
+        with_bytes(a, |a_s| {
+            with_bytes(b, |b_s| with_bytes(c, |c_s| f(a_s, b_s, c_s))).flatten()
+        })
+    }
+    .flatten()
+}
+
+/// Validate four `PithBytes` handles and borrow all four slices for the duration of `f`.
+#[inline(always)]
+pub(crate) unsafe fn with_bytes4<R>(
+    a: i64,
+    b: i64,
+    c: i64,
+    d: i64,
+    f: impl FnOnce(&[u8], &[u8], &[u8], &[u8]) -> R,
+) -> Option<R> {
+    // SAFETY: All borrows are shared (`&[u8]`), so any handle aliasing is sound.
+    unsafe {
+        with_bytes(a, |a_s| {
+            with_bytes(b, |b_s| {
+                with_bytes(c, |c_s| with_bytes(d, |d_s| f(a_s, b_s, c_s, d_s))).flatten()
+            })
+            .flatten()
+        })
+    }
+    .flatten()
+}
+
+/// Validate `handle` as a `PithByteBuffer` and borrow it mutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_byte_buffer_mut<R>(
+    handle: i64,
+    f: impl FnOnce(&mut PithByteBuffer) -> R,
+) -> Option<R> {
     let ptr = handle as *mut PithByteBuffer;
-    if !crate::handle_registry::plausibly_aligned::<PithByteBuffer>(ptr as *const ())
-        || !crate::quarantine::magic_is(
+    if !crate::handle_registry::plausibly_aligned::<PithByteBuffer>(ptr as *const ()) {
+        return None;
+    }
+    // SAFETY: Alignment validated; check magic word before mutably dereferencing.
+    let valid = unsafe {
+        crate::quarantine::magic_is(
             std::ptr::addr_of!((*ptr).magic),
             BYTE_BUFFER_MAGIC,
             crate::quarantine::Op::Use,
         )
-    {
+    };
+    if !valid {
         return None;
     }
-    Some(&mut *ptr)
+    // SAFETY: Magic word matched `BYTE_BUFFER_MAGIC`; caller guarantees exclusive access for `f`.
+    let buf = unsafe { &mut *ptr };
+    Some(f(buf))
 }
 
 pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
@@ -82,6 +159,23 @@ pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
     ptr as i64
 }
 
+#[inline(always)]
+fn release_bytes_rc(b: &PithBytes) -> bool {
+    let prev = crate::runtime_core::count_release(&b.rc);
+    if prev > 1 {
+        return false;
+    }
+    if prev == 0 {
+        crate::quarantine::over_release(crate::quarantine::Kind::Bytes);
+        // over-release: put the count back and leave the object alone
+        // rather than double-freeing
+        b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return false;
+    }
+    acquire_last_count!(b.rc);
+    true
+}
+
 /// One more owner of this bytes object.
 ///
 /// # Safety
@@ -90,8 +184,11 @@ pub(crate) fn pith_bytes_from_vec(data: Vec<u8>) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_retain(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_BYTES_RETAIN);
-    if let Some(b) = bytes_ref_for(handle, crate::quarantine::Op::Retain) {
-        b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `handle` is validated by `with_bytes_obj_for` before bumping its refcount.
+    unsafe {
+        with_bytes_obj_for(handle, crate::quarantine::Op::Retain, |b| {
+            b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
     }
 }
 
@@ -102,47 +199,68 @@ pub unsafe extern "C" fn pith_bytes_retain(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_release(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_BYTES_RELEASE);
-    let Some(b) = bytes_ref_for(handle, crate::quarantine::Op::Release) else {
-        return;
-    };
-    let prev = crate::runtime_core::count_release(&b.rc);
-    if prev > 1 {
-        return;
-    }
-    if prev == 0 {
-        crate::quarantine::over_release(crate::quarantine::Kind::Bytes);
-        // over-release: put the count back and leave the object alone
-        // rather than double-freeing
-        b.rc.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: `handle` is validated by `with_bytes_obj_for`; the shared borrow
+    // ends before any mutation or deallocation below.
+    let should_free =
+        unsafe { with_bytes_obj_for(handle, crate::quarantine::Op::Release, release_bytes_rc) }
+            .unwrap_or(false);
+    if !should_free {
         return;
     }
-    acquire_last_count!(b.rc);
     crate::perf_count(&crate::PERF_BYTES_FREES, 1);
-    // scrub the magic so stale handles fail the validity check
-    (*(handle as *mut PithBytes)).magic = 0;
     let ptr = handle as *mut PithBytes;
-    crate::quarantine::free_box(ptr, std::ptr::addr_of_mut!((*ptr).magic), crate::quarantine::Kind::Bytes);
+    // SAFETY: Last reference was released and no borrow of `ptr` remains live.
+    unsafe {
+        // scrub the magic so stale handles fail the validity check
+        (*ptr).magic = 0;
+        crate::quarantine::free_box(
+            ptr,
+            std::ptr::addr_of_mut!((*ptr).magic),
+            crate::quarantine::Kind::Bytes,
+        );
+    }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_bytes_from_string_utf8(s: *const i8) -> i64 {
-    if s.is_null() {
-        return pith_bytes_from_vec(Vec::new());
-    }
-    let len = crate::string::pith_cstring_len(s) as usize;
-    let bytes = std::slice::from_raw_parts(s as *const u8, len);
+#[inline(always)]
+fn bytes_from_slice(bytes: &[u8]) -> i64 {
     pith_bytes_from_vec(bytes.to_vec())
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_bytes_to_string_utf8(handle: i64) -> *mut i8 {
-    let Some(bytes) = pith_bytes_ref(handle) else {
-        return std::ptr::null_mut();
-    };
-    if std::str::from_utf8(&bytes.data).is_err() {
+pub unsafe extern "C" fn pith_bytes_from_string_utf8(s: *const i8) -> i64 {
+    // SAFETY: `s` is null or a valid null-terminated C string for this call.
+    unsafe { with_cstr_bytes(s, bytes_from_slice) }
+        .unwrap_or_else(|| pith_bytes_from_vec(Vec::new()))
+}
+
+#[inline(always)]
+fn bytes_to_string_utf8_impl(data: &[u8]) -> *mut i8 {
+    if std::str::from_utf8(data).is_err() {
         return std::ptr::null_mut();
     }
-    crate::pith_copy_bytes_to_cstring(&bytes.data)
+    crate::pith_copy_bytes_to_cstring(data)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_bytes_to_string_utf8(handle: i64) -> *mut i8 {
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(handle, bytes_to_string_utf8_impl) }.unwrap_or(std::ptr::null_mut())
+}
+
+#[inline(always)]
+fn bytes_substring_utf8_impl(data: &[u8], start: i64, end: i64) -> *mut i8 {
+    let len = data.len() as i64;
+    // an inverted range is empty, not reversed: clamping `end` up to `start`
+    // matches pith_cstring_substring and pith_list_slice. swapping the two
+    // instead would hand back bytes the caller never asked for, which for a
+    // parser walking a buffer is wrong data rather than no data.
+    let start_idx = start.max(0).min(len);
+    let end_idx = end.max(start_idx).min(len);
+    let slice = &data[start_idx as usize..end_idx as usize];
+    if std::str::from_utf8(slice).is_err() {
+        return std::ptr::null_mut();
+    }
+    crate::pith_copy_bytes_to_cstring(slice)
 }
 
 /// Slice a byte range and decode it as UTF-8 in one step, returning a
@@ -151,29 +269,15 @@ pub unsafe extern "C" fn pith_bytes_to_string_utf8(handle: i64) -> *mut i8 {
 /// register, a real cost in tight scanning loops (json, csv).
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_substring_utf8(handle: i64, start: i64, end: i64) -> *mut i8 {
-    let Some(bytes) = pith_bytes_ref(handle) else {
-        return std::ptr::null_mut();
-    };
-    let len = bytes.data.len() as i64;
-    // an inverted range is empty, not reversed: clamping `end` up to `start`
-    // matches pith_cstring_substring and pith_list_slice. swapping the two
-    // instead would hand back bytes the caller never asked for, which for a
-    // parser walking a buffer is wrong data rather than no data.
-    let start_idx = start.max(0).min(len);
-    let end_idx = end.max(start_idx).min(len);
-    let slice = &bytes.data[start_idx as usize..end_idx as usize];
-    if std::str::from_utf8(slice).is_err() {
-        return std::ptr::null_mut();
-    }
-    crate::pith_copy_bytes_to_cstring(slice)
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(handle, |data| bytes_substring_utf8_impl(data, start, end)) }
+        .unwrap_or(std::ptr::null_mut())
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_len(handle: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(handle) else {
-        return 0;
-    };
-    bytes.data.len() as i64
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(handle, |data| data.len() as i64) }.unwrap_or(0)
 }
 
 /// The data pointer of a bytes handle, or 0 for a handle `pith_bytes_ref`
@@ -187,10 +291,8 @@ pub unsafe extern "C" fn pith_bytes_len(handle: i64) -> i64 {
 /// handle must be a valid PithBytes or garbage.
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_data_ptr(handle: i64) -> i64 {
-    match pith_bytes_ref(handle) {
-        Some(bytes) => bytes.data.as_ptr() as i64,
-        None => 0,
-    }
+    // SAFETY: `handle` is validated by `with_bytes` before reading its data pointer.
+    unsafe { with_bytes(handle, |data| data.as_ptr() as i64) }.unwrap_or(0)
 }
 
 /// The byte at `ptr + idx`, unchecked: the caller holds the bytes alive
@@ -202,28 +304,35 @@ pub unsafe extern "C" fn pith_bytes_data_ptr(handle: i64) -> i64 {
 /// The bytes `ptr + idx` up to the width must be readable.
 #[no_mangle]
 pub unsafe extern "C" fn pith_load_u8(ptr: i64, idx: i64) -> i64 {
-    *(ptr as *const u8).offset(idx as isize) as i64
+    // SAFETY: Caller guarantees the byte at `ptr + idx` is readable.
+    unsafe { *(ptr as *const u8).offset(idx as isize) as i64 }
 }
 
 /// # Safety
 /// As `pith_load_u8`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_load_u16(ptr: i64, idx: i64) -> i64 {
-    u16::from_le(std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u16)) as i64
+    // SAFETY: Caller guarantees 2 bytes at `ptr + idx` are readable.
+    let raw = unsafe { std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u16) };
+    u16::from_le(raw) as i64
 }
 
 /// # Safety
 /// As `pith_load_u8`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_load_u32(ptr: i64, idx: i64) -> i64 {
-    u32::from_le(std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u32)) as i64
+    // SAFETY: Caller guarantees 4 bytes at `ptr + idx` are readable.
+    let raw = unsafe { std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u32) };
+    u32::from_le(raw) as i64
 }
 
 /// # Safety
 /// As `pith_load_u8`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_load_u64(ptr: i64, idx: i64) -> i64 {
-    u64::from_le(std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u64)) as i64
+    // SAFETY: Caller guarantees 8 bytes at `ptr + idx` are readable.
+    let raw = unsafe { std::ptr::read_unaligned((ptr as *const u8).offset(idx as isize) as *const u64) };
+    u64::from_le(raw) as i64
 }
 
 /// Store `value` as the 8 bytes at `ptr + off`, the mirror of
@@ -234,7 +343,8 @@ pub unsafe extern "C" fn pith_load_u64(ptr: i64, idx: i64) -> i64 {
 /// The 8 bytes at `ptr + off` must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn pith_store_u64(ptr: i64, off: i64, value: i64) {
-    std::ptr::write_unaligned((ptr as *mut u8).offset(off as isize) as *mut i64, value)
+    // SAFETY: Caller guarantees 8 bytes at `ptr + off` are writable.
+    unsafe { std::ptr::write_unaligned((ptr as *mut u8).offset(off as isize) as *mut i64, value) };
 }
 
 /// A fresh counted string holding the `len` bytes at `ptr`, copied as
@@ -248,91 +358,131 @@ pub unsafe extern "C" fn pith_cstring_from_raw(ptr: i64, len: i64) -> i64 {
     if len <= 0 {
         return crate::pith_copy_bytes_to_cstring(&[]) as i64;
     }
-    crate::pith_copy_bytes_to_cstring(std::slice::from_raw_parts(ptr as *const u8, len as usize)) as i64
+    // SAFETY: Caller guarantees `len` bytes at `ptr` are readable.
+    let slice = unsafe { std::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    crate::pith_copy_bytes_to_cstring(slice) as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_is_empty(handle: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(handle) else {
-        return 1;
-    };
-    if bytes.data.is_empty() {
-        1
-    } else {
-        0
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    let is_empty = unsafe { with_bytes(handle, <[u8]>::is_empty) }.unwrap_or(true);
+    i64::from(is_empty)
+}
+
+#[inline(always)]
+fn bytes_get_impl(data: &[u8], idx: i64) -> i64 {
+    if idx < 0 {
+        return 0;
     }
+    data.get(idx as usize).copied().unwrap_or(0) as i64
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_get(handle: i64, idx: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(handle) else {
-        return 0;
-    };
-    if idx < 0 {
-        return 0;
-    }
-    bytes.data.get(idx as usize).copied().unwrap_or(0) as i64
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(handle, |data| bytes_get_impl(data, idx)) }.unwrap_or(0)
 }
 
-/// Strict indexed byte access for `bytes[i]`. Aborts with a structured
-/// diagnostic on out-of-bounds instead of returning silent 0.
-#[no_mangle]
-pub unsafe extern "C" fn pith_bytes_get_strict(handle: i64, idx: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(handle) else {
-        eprintln!("pith runtime error: bytes indexing on invalid bytes handle");
-        // panic-guard: strict bytes indexing on an invalid handle is a program bug with no value to return.
-        std::process::exit(1);
-    };
-    let len = bytes.data.len() as i64;
+#[inline(always)]
+fn bytes_get_strict_impl(data: &[u8], idx: i64) -> i64 {
+    let len = data.len() as i64;
     if idx < 0 || idx >= len {
         crate::failure::fail(format!(
             "bytes index out of bounds: {} for bytes of length {}",
             idx, len
         ));
     }
-    bytes.data[idx as usize] as i64
+    data[idx as usize] as i64
 }
 
+/// Strict indexed byte access for `bytes[i]`. Aborts with a structured
+/// diagnostic on out-of-bounds instead of returning silent 0.
 #[no_mangle]
-pub unsafe extern "C" fn pith_bytes_slice(handle: i64, start: i64, end: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(handle) else {
-        return 0;
+pub unsafe extern "C" fn pith_bytes_get_strict(handle: i64, idx: i64) -> i64 {
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    let Some(byte) = (unsafe { with_bytes(handle, |data| bytes_get_strict_impl(data, idx)) }) else {
+        eprintln!("pith runtime error: bytes indexing on invalid bytes handle");
+        // panic-guard: strict bytes indexing on an invalid handle is a program bug with no value to return.
+        std::process::exit(1);
     };
-    let len = bytes.data.len() as i64;
+    byte
+}
+
+enum SliceOutcome {
+    ShareWhole,
+    Owned(i64),
+}
+
+#[inline(always)]
+fn bytes_slice_impl(data: &[u8], start: i64, end: i64) -> SliceOutcome {
+    let len = data.len() as i64;
     // see the note in pith_bytes_substring_utf8: an inverted range is empty.
     let start_idx = start.max(0).min(len);
     let end_idx = end.max(start_idx).min(len);
     // bytes values are immutable, so the whole range can share the value
     if start_idx == 0 && end_idx == len {
-        pith_bytes_retain(handle);
-        return handle;
+        return SliceOutcome::ShareWhole;
     }
-    pith_bytes_from_vec(bytes.data[start_idx as usize..end_idx as usize].to_vec())
+    SliceOutcome::Owned(pith_bytes_from_vec(
+        data[start_idx as usize..end_idx as usize].to_vec(),
+    ))
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_bytes_slice(handle: i64, start: i64, end: i64) -> i64 {
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    match unsafe { with_bytes(handle, |data| bytes_slice_impl(data, start, end)) } {
+        None => 0,
+        Some(SliceOutcome::ShareWhole) => {
+            // SAFETY: `handle` was just validated as a live `PithBytes`.
+            unsafe { pith_bytes_retain(handle) };
+            handle
+        }
+        Some(SliceOutcome::Owned(new_handle)) => new_handle,
+    }
+}
+
+enum ConcatOutcome {
+    ShareLeft,
+    ShareRight,
+    Owned(i64),
+}
+
+#[inline(always)]
+fn bytes_concat_impl(a_data: &[u8], b_data: &[u8]) -> ConcatOutcome {
+    // bytes values are immutable, so a concat with an empty side can share
+    // the other one. a buffered reader concatenates each read onto what it
+    // has cached, which is usually nothing.
+    if a_data.is_empty() {
+        return ConcatOutcome::ShareRight;
+    }
+    if b_data.is_empty() {
+        return ConcatOutcome::ShareLeft;
+    }
+    let mut out = Vec::with_capacity(a_data.len() + b_data.len());
+    out.extend_from_slice(a_data);
+    out.extend_from_slice(b_data);
+    ConcatOutcome::Owned(pith_bytes_from_vec(out))
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_concat(a: i64, b: i64) -> i64 {
-    let Some(a_bytes) = pith_bytes_ref(a) else {
-        return 0;
-    };
-    let Some(b_bytes) = pith_bytes_ref(b) else {
-        return 0;
-    };
-    // bytes values are immutable, so a concat with an empty side can share
-    // the other one. a buffered reader concatenates each read onto what it
-    // has cached, which is usually nothing.
-    if a_bytes.data.is_empty() {
-        pith_bytes_retain(b);
-        return b;
+    // SAFETY: Both handles are validated by `with_bytes2` before borrowing their slices.
+    match unsafe { with_bytes2(a, b, bytes_concat_impl) } {
+        None => 0,
+        Some(ConcatOutcome::ShareLeft) => {
+            // SAFETY: `a` was just validated as a live `PithBytes`.
+            unsafe { pith_bytes_retain(a) };
+            a
+        }
+        Some(ConcatOutcome::ShareRight) => {
+            // SAFETY: `b` was just validated as a live `PithBytes`.
+            unsafe { pith_bytes_retain(b) };
+            b
+        }
+        Some(ConcatOutcome::Owned(new_handle)) => new_handle,
     }
-    if b_bytes.data.is_empty() {
-        pith_bytes_retain(a);
-        return a;
-    }
-    let mut out = Vec::with_capacity(a_bytes.data.len() + b_bytes.data.len());
-    out.extend_from_slice(&a_bytes.data);
-    out.extend_from_slice(&b_bytes.data);
-    pith_bytes_from_vec(out)
 }
 
 #[no_mangle]
@@ -340,37 +490,13 @@ pub unsafe extern "C" fn pith_bytes_eq(a: i64, b: i64) -> i64 {
     if a == 0 && b == 0 {
         return 1;
     }
-    let Some(a_bytes) = pith_bytes_ref(a) else {
-        return 0;
-    };
-    let Some(b_bytes) = pith_bytes_ref(b) else {
-        return 0;
-    };
-    if a_bytes.data == b_bytes.data {
-        1
-    } else {
-        0
-    }
+    // SAFETY: Both handles are validated by `with_bytes2` before comparing slices.
+    let eq = unsafe { with_bytes2(a, b, |left, right| left == right) }.unwrap_or(false);
+    i64::from(eq)
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
-    // an invalid handle (null, or a freed/fabricated id) must never read as a
-    // match: this is the primitive that gates every MAC, tag, and password
-    // comparison. degrading a bad handle to an empty slice made two invalid
-    // handles compare EQUAL (both len 0). fail closed instead. this branch is
-    // on handle validity, not on secret content, so it leaks no timing about
-    // the compared values.
-    let a_ref = match pith_bytes_ref(a) {
-        Some(r) => r,
-        None => return 0,
-    };
-    let b_ref = match pith_bytes_ref(b) {
-        Some(r) => r,
-        None => return 0,
-    };
-    let a_bytes = a_ref.data.as_slice();
-    let b_bytes = b_ref.data.as_slice();
+#[inline(always)]
+fn constant_time_eq_impl(a_bytes: &[u8], b_bytes: &[u8]) -> i64 {
     let max_len = a_bytes.len().max(b_bytes.len());
     // fold the length difference in without narrowing it: casting the xor to
     // u8 dropped the high bits, so two inputs whose lengths differ by an exact
@@ -384,11 +510,19 @@ pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
         diff |= left ^ right;
     }
 
-    if diff == 0 {
-        1
-    } else {
-        0
-    }
+    i64::from(diff == 0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_crypto_constant_time_eq(a: i64, b: i64) -> i64 {
+    // an invalid handle (null, or a freed/fabricated id) must never read as a
+    // match: this is the primitive that gates every MAC, tag, and password
+    // comparison. degrading a bad handle to an empty slice made two invalid
+    // handles compare EQUAL (both len 0). fail closed instead. this branch is
+    // on handle validity, not on secret content, so it leaks no timing about
+    // the compared values.
+    // SAFETY: Both handles are validated by `with_bytes2` before borrowing their slices.
+    unsafe { with_bytes2(a, b, constant_time_eq_impl) }.unwrap_or(0)
 }
 
 #[no_mangle]
@@ -448,16 +582,25 @@ fn fill_secure_random(out: &mut [u8]) -> bool {
 /// handle must be a valid PithByteBuffer or garbage.
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_free(handle: i64) {
-    if pith_byte_buffer_mut(handle).is_none() {
+    // SAFETY: Validates handle and scrubs magic before freeing; borrow ends before `free_box`.
+    let valid = unsafe {
+        with_byte_buffer_mut(handle, |buf| {
+            // scrub the magic so a stale handle fails the validity check instead
+            // of touching freed memory
+            buf.magic = 0;
+        })
+    }
+    .is_some();
+    if !valid {
         return;
     }
     crate::perf_count(&crate::PERF_BYTE_BUFFER_FREES, 1);
-    // scrub the magic so a stale handle fails the validity check instead
-    // of touching freed memory
-    (*(handle as *mut PithByteBuffer)).magic = 0;
     let ptr = handle as *mut PithByteBuffer;
-    let magic = std::ptr::addr_of_mut!((*ptr).magic);
-    crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::ByteBuffer);
+    // SAFETY: Handle was validated, its magic is scrubbed, and no borrow remains live.
+    unsafe {
+        let magic = std::ptr::addr_of_mut!((*ptr).magic);
+        crate::quarantine::free_box(ptr, magic, crate::quarantine::Kind::ByteBuffer);
+    }
 }
 
 /// Allocate a fresh byte buffer.
@@ -482,56 +625,74 @@ pub extern "C" fn pith_byte_buffer_with_capacity(capacity: i64) -> i64 {
     ptr as i64
 }
 
-/// append `bytes` to the buffer behind `handle`, returning the count appended
-/// (`0` for an empty slice, which is a success). the buffer handle is checked
-/// first, so an invalid one is what a call with two bad arguments reports.
+/// append `bytes` to `buffer`, returning the count appended (`0` for an empty
+/// slice, which is a success).
 ///
 /// inlined into each entry point, with the failure text built out of line:
 /// the append is a few instructions, and as a call that hands back a
 /// `Result<usize, String>` it cost more than the copy it wraps.
 #[inline(always)]
-unsafe fn append_to_buffer(builtin: &str, handle: i64, bytes: Option<&[u8]>, what: &str) -> ResultPair {
-    let (Some(buffer), Some(bytes)) = (pith_byte_buffer_mut(handle), bytes) else {
-        return append_failure(builtin, handle, what);
-    };
-    crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += bytes.len());
+fn append_bytes_to_buf(buffer: &mut PithByteBuffer, bytes: &[u8]) -> ResultPair {
+    crate::perf_stats!(
+        PERF_BYTE_BUFFER_WRITES += 1,
+        PERF_BYTE_BUFFER_WRITE_BYTES += bytes.len(),
+    );
     buffer.data.extend_from_slice(bytes);
     crate::ffi_util::result_ok(bytes.len() as i64)
 }
 
-/// the failed result of an append: an invalid buffer handle is reported
-/// before an invalid value.
 #[cold]
 #[inline(never)]
-unsafe fn append_failure(builtin: &str, handle: i64, what: &str) -> ResultPair {
-    let outcome = if pith_byte_buffer_mut(handle).is_none() {
-        Err("invalid buffer handle".to_string())
-    } else {
-        Err(format!("invalid {what}"))
-    };
-    write_result(builtin, outcome)
+fn invalid_buffer_result(builtin: &str) -> ResultPair {
+    write_result(builtin, Err("invalid buffer handle".to_string()))
+}
+
+#[cold]
+#[inline(never)]
+fn invalid_value_result(builtin: &str, what: &str) -> ResultPair {
+    write_result(builtin, Err(format!("invalid {what}")))
 }
 
 /// append a `Bytes` value to a buffer, as a result pair holding the count or
 /// the failure's reason: an invalid buffer handle or an invalid bytes value.
+/// the buffer handle is checked first, so an invalid one is what a call with
+/// two bad arguments reports.
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_write(handle: i64, data: i64) -> ResultPair {
-    let bytes = pith_bytes_ref(data).map(|bytes| bytes.data.as_slice());
-    append_to_buffer("byte_buffer_write", handle, bytes, "bytes value")
+    // SAFETY: `handle` (`PithByteBuffer`) and `data` (`PithBytes`) are distinct handle
+    // types validated before borrowing.
+    let result = unsafe {
+        with_byte_buffer_mut(handle, |buffer| {
+            with_bytes(data, |bytes| append_bytes_to_buf(buffer, bytes))
+        })
+    };
+    match result {
+        None => invalid_buffer_result("byte_buffer_write"),
+        Some(None) => invalid_value_result("byte_buffer_write", "bytes value"),
+        Some(Some(pair)) => pair,
+    }
 }
 
 /// append a string's bytes to a buffer, as a result pair holding the count or
 /// the failure's reason: an invalid buffer handle or an invalid string.
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_write_string_utf8(handle: i64, s: *const i8) -> ResultPair {
-    append_to_buffer("byte_buffer_write_string_utf8", handle, cstr_bytes(s), "string")
+    // SAFETY: `handle` (`PithByteBuffer`) and `s` (C string) are distinct and validated
+    // before borrowing.
+    let result = unsafe {
+        with_byte_buffer_mut(handle, |buffer| {
+            with_cstr_bytes(s, |bytes| append_bytes_to_buf(buffer, bytes))
+        })
+    };
+    match result {
+        None => invalid_buffer_result("byte_buffer_write_string_utf8"),
+        Some(None) => invalid_value_result("byte_buffer_write_string_utf8", "string"),
+        Some(Some(pair)) => pair,
+    }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_byte_buffer_write_byte(handle: i64, value: i64) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
+#[inline(always)]
+fn byte_buffer_write_byte_impl(buffer: &mut PithByteBuffer, value: i64) -> i64 {
     if !(0..=255).contains(&value) {
         return 0;
     }
@@ -540,17 +701,15 @@ pub unsafe extern "C" fn pith_byte_buffer_write_byte(handle: i64, value: i64) ->
     1
 }
 
-/// Append `len` bytes copied from `src` within this same buffer: the
-/// back-reference every LZ-family decoder needs. The copy runs forward one
-/// byte at a time on purpose: when the source range overlaps the
-/// destination (offset < len), that repetition IS the encoding, which is
-/// how a run of bytes costs one short match. Returns 1, or 0 on a bad
-/// handle or a range that starts outside the buffer.
 #[no_mangle]
-pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len: i64) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
+pub unsafe extern "C" fn pith_byte_buffer_write_byte(handle: i64, value: i64) -> i64 {
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before mutating.
+    unsafe { with_byte_buffer_mut(handle, |buf| byte_buffer_write_byte_impl(buf, value)) }
+        .unwrap_or(0)
+}
+
+#[inline(always)]
+fn byte_buffer_copy_within_impl(buffer: &mut PithByteBuffer, src: i64, len: i64) -> i64 {
     if src < 0 || len < 0 || (src as usize) >= buffer.data.len() {
         return 0;
     }
@@ -577,6 +736,37 @@ pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len
     1
 }
 
+/// Append `len` bytes copied from `src` within this same buffer: the
+/// back-reference every LZ-family decoder needs. The copy runs forward one
+/// byte at a time on purpose: when the source range overlaps the
+/// destination (offset < len), that repetition IS the encoding, which is
+/// how a run of bytes costs one short match. Returns 1, or 0 on a bad
+/// handle or a range that starts outside the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len: i64) -> i64 {
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before mutating.
+    unsafe { with_byte_buffer_mut(handle, |buf| byte_buffer_copy_within_impl(buf, src, len)) }
+        .unwrap_or(0)
+}
+
+#[inline(always)]
+fn bytes_read_word_impl(data: &[u8], off: i64, count: i64) -> i64 {
+    if off < 0 || !(1..=8).contains(&count) {
+        return 0;
+    }
+    let off = off as usize;
+    let count = count as usize;
+    let Some(end) = off.checked_add(count) else {
+        return 0;
+    };
+    if end > data.len() {
+        return 0;
+    }
+    let mut le = [0u8; 8];
+    le[..count].copy_from_slice(&data[off..end]);
+    u64::from_le_bytes(le) as i64
+}
+
 /// Read `count` bytes at `off` as one little-endian integer, the mirror
 /// of `write_word`. A word-at-a-time consumer (the xxhash kernel, the
 /// bitstream refill) pays one call here instead of a byte loop. Returns 0
@@ -587,23 +777,31 @@ pub unsafe extern "C" fn pith_byte_buffer_copy_within(handle: i64, src: i64, len
 /// handle must be a valid PithBytes or garbage.
 #[no_mangle]
 pub unsafe extern "C" fn pith_bytes_read_word(handle: i64, off: i64, count: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(handle) else {
-        return 0;
-    };
-    if off < 0 || !(1..=8).contains(&count) {
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(handle, |data| bytes_read_word_impl(data, off, count)) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn byte_buffer_write_range_impl(
+    buffer: &mut PithByteBuffer,
+    data: &[u8],
+    start: i64,
+    len: i64,
+) -> i64 {
+    if start < 0 || len < 0 {
         return 0;
     }
-    let off = off as usize;
-    let count = count as usize;
-    let Some(end) = off.checked_add(count) else {
+    let start = start as usize;
+    let len = len as usize;
+    let Some(end) = start.checked_add(len) else {
         return 0;
     };
-    if end > bytes.data.len() {
+    if end > data.len() {
         return 0;
     }
-    let mut le = [0u8; 8];
-    le[..count].copy_from_slice(&bytes.data[off..end]);
-    u64::from_le_bytes(le) as i64
+    crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += len);
+    buffer.data.extend_from_slice(&data[start..end]);
+    1
 }
 
 /// Append `len` bytes of `src` starting at `start`: a slice-then-write
@@ -617,25 +815,40 @@ pub unsafe extern "C" fn pith_bytes_read_word(handle: i64, off: i64, count: i64)
 /// garbage (the magic checks reject garbage).
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_write_range(handle: i64, src: i64, start: i64, len: i64) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
-    let Some(bytes) = pith_bytes_ref(src) else {
-        return 0;
-    };
-    if start < 0 || len < 0 {
+    // SAFETY: `handle` (`PithByteBuffer`) and `src` (`PithBytes`) are distinct handle
+    // types validated before borrowing.
+    unsafe {
+        with_byte_buffer_mut(handle, |buffer| {
+            with_bytes(src, |data| byte_buffer_write_range_impl(buffer, data, start, len))
+        })
+    }
+    .flatten()
+    .unwrap_or(0)
+}
+
+#[inline(always)]
+fn byte_buffer_write_word_impl(buffer: &mut PithByteBuffer, word: i64, count: i64) -> i64 {
+    if !(1..=8).contains(&count) {
         return 0;
     }
-    let start = start as usize;
-    let len = len as usize;
-    let Some(end) = start.checked_add(len) else {
-        return 0;
-    };
-    if end > bytes.data.len() {
-        return 0;
+    crate::perf_stats!(
+        PERF_BYTE_BUFFER_WRITES += 1,
+        PERF_BYTE_BUFFER_WRITE_BYTES += count as usize,
+    );
+    // store all eight bytes in one unaligned write and count only the low
+    // `count`; extend_from_slice with a run-time length is a memcpy call.
+    let data = &mut buffer.data;
+    data.reserve(8);
+    let len = data.len();
+    // SAFETY: `reserve(8)` ensures 8 bytes of spare capacity at `len`, and
+    // `1 <= count <= 8`, so `len + count` bytes are initialized.
+    unsafe {
+        std::ptr::write_unaligned(
+            data.as_mut_ptr().add(len).cast::<[u8; 8]>(),
+            (word as u64).to_le_bytes(),
+        );
+        data.set_len(len + count as usize);
     }
-    crate::perf_stats!(PERF_BYTE_BUFFER_WRITES += 1, PERF_BYTE_BUFFER_WRITE_BYTES += len);
-    buffer.data.extend_from_slice(&bytes.data[start..end]);
     1
 }
 
@@ -649,24 +862,9 @@ pub unsafe extern "C" fn pith_byte_buffer_write_range(handle: i64, src: i64, sta
 /// handle must be a valid PithByteBuffer or garbage.
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_write_word(handle: i64, word: i64, count: i64) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
-    if !(1..=8).contains(&count) {
-        return 0;
-    }
-    crate::perf_stats!(
-        PERF_BYTE_BUFFER_WRITES += 1,
-        PERF_BYTE_BUFFER_WRITE_BYTES += count as usize,
-    );
-    // store all eight bytes in one unaligned write and count only the low
-    // `count`; extend_from_slice with a run-time length is a memcpy call.
-    let data = &mut buffer.data;
-    data.reserve(8);
-    let len = data.len();
-    std::ptr::write_unaligned(data.as_mut_ptr().add(len).cast::<[u8; 8]>(), (word as u64).to_le_bytes());
-    data.set_len(len + count as usize);
-    1
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before mutating.
+    unsafe { with_byte_buffer_mut(handle, |buf| byte_buffer_write_word_impl(buf, word, count)) }
+        .unwrap_or(0)
 }
 
 /// Extract the accumulated bytes (moving the storage, no copy) and free
@@ -677,24 +875,38 @@ pub unsafe extern "C" fn pith_byte_buffer_write_word(handle: i64, word: i64, cou
 /// handle must be a valid PithByteBuffer or garbage.
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_take_bytes(handle: i64) -> i64 {
-    if pith_byte_buffer_mut(handle).is_none() {
+    // SAFETY: Validates handle and scrubs magic before reclaiming the box; borrow ends first.
+    let valid = unsafe {
+        with_byte_buffer_mut(handle, |buf| {
+            // reclaim the whole box: the vec moves into the bytes object, the
+            // buffer allocation dies here, and the scrubbed magic makes any stale
+            // handle fail the validity check
+            buf.magic = 0;
+        })
+    }
+    .is_some();
+    if !valid {
         return 0;
     }
-    // reclaim the whole box: the vec moves into the bytes object, the
-    // buffer allocation dies here, and the scrubbed magic makes any stale
-    // handle fail the validity check
-    (*(handle as *mut PithByteBuffer)).magic = 0;
-    let boxed = Box::from_raw(handle as *mut PithByteBuffer);
+    // SAFETY: Handle was validated, its magic is scrubbed, and no borrow remains live.
+    let boxed = unsafe { Box::from_raw(handle as *mut PithByteBuffer) };
     crate::perf_count(&crate::PERF_BYTE_BUFFER_FREES, 1);
     pith_bytes_from_vec(boxed.data)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_bytes(handle: i64) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
-    pith_bytes_from_vec(buffer.data.clone())
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before cloning its bytes.
+    unsafe { with_byte_buffer_mut(handle, |buf| pith_bytes_from_vec(buf.data.clone())) }
+        .unwrap_or(0)
+}
+
+#[inline(always)]
+fn byte_buffer_string_impl(buffer: &mut PithByteBuffer) -> *mut i8 {
+    if buffer.data.is_empty() {
+        return crate::pith_cstring_empty();
+    }
+    crate::pith_copy_bytes_to_cstring(&buffer.data)
 }
 
 /// Copy the accumulated bytes into a fresh pith string, verbatim.
@@ -714,28 +926,19 @@ pub unsafe extern "C" fn pith_byte_buffer_bytes(handle: i64) -> i64 {
 /// string for garbage).
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_string(handle: i64) -> *mut i8 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return crate::pith_cstring_empty();
-    };
-    if buffer.data.is_empty() {
-        return crate::pith_cstring_empty();
-    }
-    crate::pith_copy_bytes_to_cstring(&buffer.data)
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before reading.
+    unsafe { with_byte_buffer_mut(handle, byte_buffer_string_impl) }
+        .unwrap_or_else(crate::pith_cstring_empty)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_len(handle: i64) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
-    buffer.data.len() as i64
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before reading its length.
+    unsafe { with_byte_buffer_mut(handle, |buf| buf.data.len() as i64) }.unwrap_or(0)
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_byte_buffer_get(handle: i64, index: i64) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
+#[inline(always)]
+fn byte_buffer_get_impl(buffer: &mut PithByteBuffer, index: i64) -> i64 {
     if index < 0 {
         return 0;
     }
@@ -743,10 +946,13 @@ pub unsafe extern "C" fn pith_byte_buffer_get(handle: i64, index: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_byte_buffer_set(handle: i64, index: i64, value: i64) -> i64 {
-    let Some(buffer) = pith_byte_buffer_mut(handle) else {
-        return 0;
-    };
+pub unsafe extern "C" fn pith_byte_buffer_get(handle: i64, index: i64) -> i64 {
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before reading.
+    unsafe { with_byte_buffer_mut(handle, |buf| byte_buffer_get_impl(buf, index)) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn byte_buffer_set_impl(buffer: &mut PithByteBuffer, index: i64, value: i64) -> i64 {
     if index < 0 || !(0..=255).contains(&value) {
         return 0;
     }
@@ -759,10 +965,16 @@ pub unsafe extern "C" fn pith_byte_buffer_set(handle: i64, index: i64, value: i6
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pith_byte_buffer_set(handle: i64, index: i64, value: i64) -> i64 {
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before mutating.
+    unsafe { with_byte_buffer_mut(handle, |buf| byte_buffer_set_impl(buf, index, value)) }
+        .unwrap_or(0)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pith_byte_buffer_clear(handle: i64) {
-    if let Some(buffer) = pith_byte_buffer_mut(handle) {
-        buffer.data.clear();
-    }
+    // SAFETY: `handle` is validated by `with_byte_buffer_mut` before clearing.
+    unsafe { with_byte_buffer_mut(handle, |buf| buf.data.clear()) };
 }
 
 #[cfg(test)]
@@ -784,13 +996,16 @@ mod tests {
             assert_eq!(pith_load_u32(ptr, 1), i64::from(u32::from_le_bytes(*b"name")));
             assert_eq!(pith_load_u64(ptr, 1), u64::from_le_bytes(*b"name\":\x80\xff") as i64);
             let s = pith_cstring_from_raw(ptr + 1, 4);
-            assert_eq!(crate::ffi_util::cstr_bytes(s as *const i8), Some(&b"name"[..]));
+            assert_eq!(with_cstr_bytes(s as *const i8, <[u8]>::to_vec), Some(b"name".to_vec()));
             crate::pith_cstring_release(s as *const i8);
             let invalid = pith_cstring_from_raw(ptr + 7, 2);
-            assert_eq!(crate::ffi_util::cstr_bytes(invalid as *const i8), Some(&b"\x80\xff"[..]));
+            assert_eq!(
+                with_cstr_bytes(invalid as *const i8, <[u8]>::to_vec),
+                Some(b"\x80\xff".to_vec())
+            );
             crate::pith_cstring_release(invalid as *const i8);
             let empty = pith_cstring_from_raw(ptr, 0);
-            assert_eq!(crate::ffi_util::cstr_bytes(empty as *const i8), Some(&b""[..]));
+            assert_eq!(with_cstr_bytes(empty as *const i8, <[u8]>::to_vec), Some(Vec::new()));
             crate::pith_cstring_release(empty as *const i8);
             let mut slots = [0i64; 3];
             pith_store_u64(slots.as_mut_ptr() as i64, 8, -5);
@@ -811,7 +1026,7 @@ mod tests {
             assert_eq!(pith_byte_buffer_write_word(buf, word, 9), 0);
             assert_eq!(pith_byte_buffer_write_word(0, word, 8), 0);
             let data = pith_byte_buffer_take_bytes(buf);
-            assert_eq!(pith_bytes_ref(data).unwrap().data, b"abcabcdefgha");
+            assert_eq!(with_bytes(data, <[u8]>::to_vec).unwrap(), b"abcabcdefgha");
             pith_bytes_release(data);
         }
     }
@@ -845,7 +1060,9 @@ mod tests {
     }
 
     fn rc_of(handle: i64) -> u32 {
-        unsafe { pith_bytes_ref(handle).map(|b| b.rc.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0) }
+        unsafe {
+            with_bytes_obj(handle, |b| b.rc.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0)
+        }
     }
 
     #[test]
@@ -862,7 +1079,7 @@ mod tests {
             assert_eq!(rc_of(data), 1);
             let both = pith_bytes_concat(data, data);
             assert_ne!(both, data);
-            assert_eq!(pith_bytes_ref(both).map(|b| b.data.clone()), Some(b"abcabc".to_vec()));
+            assert_eq!(with_bytes(both, <[u8]>::to_vec), Some(b"abcabc".to_vec()));
             pith_bytes_release(both);
             pith_bytes_release(data);
             pith_bytes_release(empty);
@@ -882,7 +1099,7 @@ mod tests {
             pith_bytes_release(clamped);
             let part = pith_bytes_slice(data, 1, 3);
             assert_ne!(part, data);
-            assert_eq!(pith_bytes_ref(part).map(|b| b.data.clone()), Some(b"bc".to_vec()));
+            assert_eq!(with_bytes(part, <[u8]>::to_vec), Some(b"bc".to_vec()));
             pith_bytes_release(part);
             assert_eq!(rc_of(data), 1);
             pith_bytes_release(data);

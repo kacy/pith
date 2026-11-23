@@ -44,15 +44,11 @@ pub struct PithWaitGroup {
 /// Opaque handle to a Pith WaitGroup
 pub type PithWaitGroupHandle = PithWaitGroup;
 
-unsafe fn waitgroup_ref<'a>(handle: *mut PithWaitGroupHandle) -> Option<&'a PithWaitGroupHandle> {
-    sync_handle::header_of(handle as *const (), WAITGROUP_MAGIC, crate::quarantine::Op::Use)?;
-    Some(&*handle)
-}
-
 /// the last count is gone, so no task waits: a waiter holds a count of its
 /// own.
 pub(crate) unsafe fn free_waitgroup(p: *mut PithWaitGroup) {
-    sync_handle::free_box(p);
+    // SAFETY: Caller guarantees `p` is an unowned `PithWaitGroup` from `Box::into_raw`.
+    unsafe { sync_handle::free_box(p) };
 }
 
 fn lock_state(lock: &Mutex<WaitGroupState>) -> MutexGuard<'_, WaitGroupState> {
@@ -129,28 +125,14 @@ pub extern "C" fn pith_waitgroup_new() -> *mut PithWaitGroupHandle {
     ptr
 }
 
-/// Add delta to the WaitGroup counter
-///
-/// # Safety
-/// handle must be a valid waitgroup handle
-#[no_mangle]
-pub unsafe extern "C" fn pith_waitgroup_add(handle: *mut PithWaitGroupHandle, delta: i64) {
-    let Some(wg) = waitgroup_ref(handle) else {
-        return;
-    };
+#[inline(always)]
+fn add_waitgroup(wg: &PithWaitGroup, delta: i64) {
     let mut state = lock_state(&wg.lock);
     state.count = (state.count as i64 + delta).max(0) as usize;
 }
 
-/// Decrement the WaitGroup counter (Done)
-///
-/// # Safety
-/// handle must be a valid waitgroup handle
-#[no_mangle]
-pub unsafe extern "C" fn pith_waitgroup_done(handle: *mut PithWaitGroupHandle) {
-    let Some(wg) = waitgroup_ref(handle) else {
-        return;
-    };
+#[inline(always)]
+fn done_waitgroup(wg: &PithWaitGroup) {
     let mut state = lock_state(&wg.lock);
     if state.count > 0 {
         state.count -= 1;
@@ -161,15 +143,8 @@ pub unsafe extern "C" fn pith_waitgroup_done(handle: *mut PithWaitGroupHandle) {
     }
 }
 
-/// Wait for the WaitGroup counter to reach zero
-///
-/// # Safety
-/// handle must be a valid waitgroup handle
-#[no_mangle]
-pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
-    let Some(wg) = waitgroup_ref(handle) else {
-        return;
-    };
+#[inline(always)]
+fn wait_waitgroup(wg: &PithWaitGroup) {
     // declared before the guard so its count is given back after the guard
     // is dropped.
     let block = BlockCount::new(&wg.header);
@@ -183,10 +158,75 @@ pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
     }
 }
 
+/// Add delta to the WaitGroup counter
+///
+/// # Safety
+/// handle must be a valid waitgroup handle
+#[no_mangle]
+pub unsafe extern "C" fn pith_waitgroup_add(handle: *mut PithWaitGroupHandle, delta: i64) {
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithWaitGroup`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            WAITGROUP_MAGIC,
+            crate::quarantine::Op::Use,
+            |wg| add_waitgroup(wg, delta),
+        )
+    };
+}
+
+/// Decrement the WaitGroup counter (Done)
+///
+/// # Safety
+/// handle must be a valid waitgroup handle
+#[no_mangle]
+pub unsafe extern "C" fn pith_waitgroup_done(handle: *mut PithWaitGroupHandle) {
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithWaitGroup`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            WAITGROUP_MAGIC,
+            crate::quarantine::Op::Use,
+            done_waitgroup,
+        )
+    };
+}
+
+/// Wait for the WaitGroup counter to reach zero
+///
+/// # Safety
+/// handle must be a valid waitgroup handle
+#[no_mangle]
+pub unsafe extern "C" fn pith_waitgroup_wait(handle: *mut PithWaitGroupHandle) {
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithWaitGroup`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            WAITGROUP_MAGIC,
+            crate::quarantine::Op::Use,
+            wait_waitgroup,
+        )
+    };
+}
+
+#[cfg(test)]
+fn waitgroup_green_waiters_len(wg: &PithWaitGroup) -> usize {
+    lock_state(&wg.lock).green_waiters.len()
+}
+
 /// how many green waiter entries the waitgroup lists.
 #[cfg(test)]
 pub(crate) unsafe fn green_waiters_for_tests(handle: *mut PithWaitGroupHandle) -> usize {
-    waitgroup_ref(handle).map_or(0, |wg| lock_state(&wg.lock).green_waiters.len())
+    // SAFETY: `handle` is validated by `with_sync_ref` before borrowing `PithWaitGroup`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            WAITGROUP_MAGIC,
+            crate::quarantine::Op::Use,
+            waitgroup_green_waiters_len,
+        )
+    }
+    .unwrap_or(0)
 }
 
 #[cfg(test)]

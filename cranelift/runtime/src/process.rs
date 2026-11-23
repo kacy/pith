@@ -25,7 +25,7 @@ use crate::collections::list::PithList;
 use crate::concurrency::scheduler::{backend, Backend};
 use crate::fd_handle::{self, FdKind};
 use crate::fdio;
-use crate::ffi_util::{cstr_str, cstr_str_or_empty};
+use crate::ffi_util::{with_cstr_str, with_cstr_str_or_empty};
 use crate::handle_registry::{self, HandleKind};
 use crate::netpoll;
 use parking_lot::Mutex;
@@ -153,24 +153,24 @@ fn process_output_handles() -> &'static Mutex<HashMap<i64, ProcessOutputHandle>>
 }
 
 unsafe fn pith_optional_cstring(ptr: *const i8) -> String {
-    cstr_str_or_empty(ptr).to_string()
+    // SAFETY: Caller guarantees `ptr` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str_or_empty(ptr, str::to_owned) }
 }
 
 unsafe fn pith_required_cstring(ptr: *const i8) -> Option<String> {
-    let text = cstr_str(ptr)?;
-    if text.is_empty() {
-        return None;
-    }
-    Some(text.to_string())
+    // SAFETY: Caller guarantees `ptr` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(ptr, |text| (!text.is_empty()).then(|| text.to_owned())) }.flatten()
 }
 
 unsafe fn pith_string_list_to_vec(list: PithList) -> Vec<String> {
     let len = crate::collections::list::pith_list_len(list);
-    let mut values = Vec::with_capacity(len as usize);
+    let mut values = Vec::with_capacity(len.max(0) as usize);
     let mut i = 0;
     while i < len {
-        let ptr = crate::collections::list::pith_list_get_value(list, i) as *const i8;
-        values.push(pith_optional_cstring(ptr));
+        // SAFETY: `i` is in `0..len` for `list`; caller guarantees elements are valid C strings or null.
+        let ptr = unsafe { crate::collections::list::pith_list_get_value(list, i) } as *const i8;
+        // SAFETY: Preconditions forwarded from caller.
+        values.push(unsafe { pith_optional_cstring(ptr) });
         i += 1;
     }
     values
@@ -217,6 +217,33 @@ fn pith_strdup_string(text: &str) -> *mut i8 {
     crate::runtime_core::pith_strdup_string(text)
 }
 
+fn build_command_from_parts(
+    program_text: String,
+    args: Vec<String>,
+    cwd_text: String,
+    keys: Vec<String>,
+    values: Vec<String>,
+) -> Command {
+    let mut command = Command::new(program_text);
+    // before the per-command overrides below, so an override the caller named
+    // wins over what the program set process-wide.
+    crate::env_overlay::apply(&mut command);
+
+    for arg in args {
+        command.arg(arg);
+    }
+
+    if !cwd_text.is_empty() {
+        command.current_dir(cwd_text);
+    }
+
+    for (key, value) in keys.into_iter().zip(values.into_iter()) {
+        command.env(key, value);
+    }
+
+    command
+}
+
 unsafe fn pith_build_command(
     program: *const i8,
     argv: PithList,
@@ -224,39 +251,20 @@ unsafe fn pith_build_command(
     env_keys: PithList,
     env_values: PithList,
 ) -> Option<Command> {
-    let program_text = pith_required_cstring(program)?;
-    let mut command = Command::new(program_text);
-    // before the per-command overrides below, so an override the caller named
-    // wins over what the program set process-wide.
-    crate::env_overlay::apply(&mut command);
-
-    for arg in pith_string_list_to_vec(argv) {
-        command.arg(arg);
-    }
-
-    let cwd_text = pith_optional_cstring(cwd);
-    if !cwd_text.is_empty() {
-        command.current_dir(cwd_text);
-    }
-
-    let keys = pith_string_list_to_vec(env_keys);
-    let values = pith_string_list_to_vec(env_values);
-    for (key, value) in keys.into_iter().zip(values.into_iter()) {
-        command.env(key, value);
-    }
-
-    Some(command)
+    // SAFETY: Caller guarantees `program`, `cwd`, and all list elements are valid C strings or null.
+    let program_text = unsafe { pith_required_cstring(program) }?;
+    // SAFETY: Preconditions forwarded from caller.
+    let args = unsafe { pith_string_list_to_vec(argv) };
+    // SAFETY: Preconditions forwarded from caller.
+    let cwd_text = unsafe { pith_optional_cstring(cwd) };
+    // SAFETY: Preconditions forwarded from caller.
+    let keys = unsafe { pith_string_list_to_vec(env_keys) };
+    // SAFETY: Preconditions forwarded from caller.
+    let values = unsafe { pith_string_list_to_vec(env_values) };
+    Some(build_command_from_parts(program_text, args, cwd_text, keys, values))
 }
 
-/// Spawn a child process and return a process handle
-///
-/// # Safety
-/// cmd must be a valid null-terminated C string
-#[no_mangle]
-pub unsafe extern "C" fn pith_process_spawn(cmd: *const i8) -> i64 {
-    let Some(cmd_str) = cstr_str(cmd) else {
-        return 0;
-    };
+fn process_spawn_shell(cmd_str: &str) -> i64 {
     let mut command = Command::new("/bin/sh");
     crate::env_overlay::apply(&mut command);
     match command
@@ -272,18 +280,7 @@ pub unsafe extern "C" fn pith_process_spawn(cmd: *const i8) -> i64 {
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_process_spawn_argv(
-    program: *const i8,
-    argv: PithList,
-    cwd: *const i8,
-    env_keys: PithList,
-    env_values: PithList,
-) -> i64 {
-    let Some(mut command) = pith_build_command(program, argv, cwd, env_keys, env_values) else {
-        return 0;
-    };
-
+fn spawn_piped_command(mut command: Command) -> i64 {
     match command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -295,18 +292,7 @@ pub unsafe extern "C" fn pith_process_spawn_argv(
     }
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_process_output_argv(
-    program: *const i8,
-    argv: PithList,
-    cwd: *const i8,
-    env_keys: PithList,
-    env_values: PithList,
-) -> i64 {
-    let Some(command) = pith_build_command(program, argv, cwd, env_keys, env_values) else {
-        return 0;
-    };
-
+fn run_output_command(command: Command) -> i64 {
     // the child runs to completion on a pool thread (or inline, off green); the
     // pith-visible handle is built here either way.
     match command_output(command) {
@@ -318,6 +304,46 @@ pub unsafe extern "C" fn pith_process_output_argv(
         }
         None => 0,
     }
+}
+
+/// Spawn a child process and return a process handle
+///
+/// # Safety
+/// cmd must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn pith_process_spawn(cmd: *const i8) -> i64 {
+    // SAFETY: Caller guarantees `cmd` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(cmd, process_spawn_shell) }.unwrap_or(0)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_process_spawn_argv(
+    program: *const i8,
+    argv: PithList,
+    cwd: *const i8,
+    env_keys: PithList,
+    env_values: PithList,
+) -> i64 {
+    // SAFETY: Caller guarantees `program`, `cwd`, and all list elements are valid C strings or null.
+    let Some(command) = (unsafe { pith_build_command(program, argv, cwd, env_keys, env_values) }) else {
+        return 0;
+    };
+    spawn_piped_command(command)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_process_output_argv(
+    program: *const i8,
+    argv: PithList,
+    cwd: *const i8,
+    env_keys: PithList,
+    env_values: PithList,
+) -> i64 {
+    // SAFETY: Caller guarantees `program`, `cwd`, and all list elements are valid C strings or null.
+    let Some(command) = (unsafe { pith_build_command(program, argv, cwd, env_keys, env_values) }) else {
+        return 0;
+    };
+    run_output_command(command)
 }
 
 #[no_mangle]

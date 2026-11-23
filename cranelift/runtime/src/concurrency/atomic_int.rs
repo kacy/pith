@@ -19,14 +19,51 @@ pub struct Cell {
     value: AtomicI64,
 }
 
-unsafe fn cell_ref<'a>(handle: i64) -> Option<&'a AtomicI64> {
-    sync_handle::header_of(handle as *const (), ATOMIC_INT_MAGIC, crate::quarantine::Op::Use)?;
-    Some(&(*(handle as *const Cell)).value)
+#[inline(always)]
+unsafe fn with_cell<R>(handle: i64, f: impl FnOnce(&AtomicI64) -> R) -> Option<R> {
+    // SAFETY: `Cell` is `#[repr(C)]` starting with `SyncHeader` tagged `ATOMIC_INT_MAGIC`.
+    unsafe {
+        sync_handle::with_sync_ref(
+            handle as *const (),
+            ATOMIC_INT_MAGIC,
+            crate::quarantine::Op::Use,
+            |c: &Cell| f(&c.value),
+        )
+    }
 }
 
 /// the last count is gone.
 pub(crate) unsafe fn free_cell(p: *mut Cell) {
-    sync_handle::free_box(p);
+    // SAFETY: Caller guarantees `p` is an unowned `Cell` from `Box::into_raw`.
+    unsafe { sync_handle::free_box(p) };
+}
+
+#[inline(always)]
+fn cell_get(cell: &AtomicI64) -> i64 {
+    cell.load(Ordering::Acquire)
+}
+
+#[inline(always)]
+fn cell_set(cell: &AtomicI64, value: i64) {
+    cell.store(value, Ordering::Release);
+}
+
+#[inline(always)]
+fn cell_compare_set(cell: &AtomicI64, expected: i64, new: i64) -> i64 {
+    match cell.compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => 1,
+        Err(_) => 0,
+    }
+}
+
+#[inline(always)]
+fn cell_fetch_add(cell: &AtomicI64, delta: i64) -> i64 {
+    cell.fetch_add(delta, Ordering::AcqRel)
+}
+
+#[inline(always)]
+fn cell_fetch_sub(cell: &AtomicI64, delta: i64) -> i64 {
+    cell.fetch_sub(delta, Ordering::AcqRel)
 }
 
 /// Create an atomic cell holding `initial`.
@@ -45,10 +82,8 @@ pub extern "C" fn pith_atomic_int_new(initial: i64) -> i64 {
 /// handle must be a valid atomic-cell handle or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_atomic_int_get(handle: i64) -> i64 {
-    match cell_ref(handle) {
-        Some(cell) => cell.load(Ordering::Acquire),
-        None => 0,
-    }
+    // SAFETY: `handle` is validated by `with_cell` before borrowing its atomic value.
+    unsafe { with_cell(handle, cell_get) }.unwrap_or(0)
 }
 
 /// Store a new value.
@@ -57,9 +92,8 @@ pub unsafe extern "C" fn pith_atomic_int_get(handle: i64) -> i64 {
 /// handle must be a valid atomic-cell handle or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_atomic_int_set(handle: i64, value: i64) {
-    if let Some(cell) = cell_ref(handle) {
-        cell.store(value, Ordering::Release);
-    }
+    // SAFETY: `handle` is validated by `with_cell` before borrowing its atomic value.
+    unsafe { with_cell(handle, |cell| cell_set(cell, value)) };
 }
 
 /// Store `new` only if the cell currently holds `expected`; returns 1 on
@@ -70,14 +104,8 @@ pub unsafe extern "C" fn pith_atomic_int_set(handle: i64, value: i64) {
 /// handle must be a valid atomic-cell handle or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_atomic_int_compare_set(handle: i64, expected: i64, new: i64) -> i64 {
-    match cell_ref(handle) {
-        Some(cell) => match cell.compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire)
-        {
-            Ok(_) => 1,
-            Err(_) => 0,
-        },
-        None => 0,
-    }
+    // SAFETY: `handle` is validated by `with_cell` before borrowing its atomic value.
+    unsafe { with_cell(handle, |cell| cell_compare_set(cell, expected, new)) }.unwrap_or(0)
 }
 
 /// Atomically add `delta` to the cell and return its previous value.
@@ -86,10 +114,8 @@ pub unsafe extern "C" fn pith_atomic_int_compare_set(handle: i64, expected: i64,
 /// handle must be a valid atomic-cell handle or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_atomic_int_fetch_add(handle: i64, delta: i64) -> i64 {
-    match cell_ref(handle) {
-        Some(cell) => cell.fetch_add(delta, Ordering::AcqRel),
-        None => 0,
-    }
+    // SAFETY: `handle` is validated by `with_cell` before borrowing its atomic value.
+    unsafe { with_cell(handle, |cell| cell_fetch_add(cell, delta)) }.unwrap_or(0)
 }
 
 /// Atomically subtract `delta` from the cell and return its previous value.
@@ -98,10 +124,8 @@ pub unsafe extern "C" fn pith_atomic_int_fetch_add(handle: i64, delta: i64) -> i
 /// handle must be a valid atomic-cell handle or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_atomic_int_fetch_sub(handle: i64, delta: i64) -> i64 {
-    match cell_ref(handle) {
-        Some(cell) => cell.fetch_sub(delta, Ordering::AcqRel),
-        None => 0,
-    }
+    // SAFETY: `handle` is validated by `with_cell` before borrowing its atomic value.
+    unsafe { with_cell(handle, |cell| cell_fetch_sub(cell, delta)) }.unwrap_or(0)
 }
 
 #[cfg(test)]

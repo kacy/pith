@@ -390,15 +390,27 @@ fn ensure_workers_started() {
     });
 }
 
-/// start a task running the pith closure and return its handle (see
-/// `make_handle`). the handle is never 0, matching `os_thread_spawn`.
+/// Invoke a compiler-emitted Pith closure body on a green task stack.
 ///
 /// # Safety
-/// `closure_handle` must be a valid pith closure handle or 0.
-pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
-    if closure_handle == 0 {
+/// `closure_handle` must be a valid Pith closure handle kept alive for the task's lifetime.
+unsafe fn invoke_closure(closure_handle: i64) -> i64 {
+    // SAFETY: `closure_handle` was non-zero at spawn and pith owns the
+    // closure's lifetime for the duration of the task; `get_fn` validates
+    // the handle and returns 0 for anything bogus.
+    let func_ptr = unsafe { crate::pith_closure_get_fn(closure_handle) };
+    if func_ptr == 0 {
         return 0;
     }
+    // SAFETY: the transmute matches the pith closure calling convention
+    // `extern "C" fn(i64) -> i64`, the same transmute the os-thread backend performs.
+    let func: extern "C" fn(i64) -> i64 =
+        // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
+        unsafe { std::mem::transmute(func_ptr as *const ()) };
+    func(closure_handle)
+}
+
+fn green_spawn_with(closure_handle: i64, body: impl FnOnce() -> i64 + 'static) -> i64 {
     ensure_workers_started();
 
     // the coroutine body runs the pith closure exactly as the os-thread backend
@@ -417,21 +429,7 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
             // top does not run again after a suspend), and the pointer stays
             // valid for the whole life of the body, so once is enough.
             let _finish = publish_yielder(yielder as *const TaskYielder);
-            // SAFETY: closure_handle was non-zero at spawn and pith owns the
-            // closure's lifetime for the duration of the task; get_fn validates
-            // the handle and returns 0 for anything bogus. the transmute matches
-            // the pith closure calling convention `extern "C" fn(i64) -> i64`,
-            // the same transmute the os-thread backend performs.
-            unsafe {
-                let func_ptr = crate::pith_closure_get_fn(closure_handle);
-                if func_ptr == 0 {
-                    return 0;
-                }
-                let func: extern "C" fn(i64) -> i64 =
-                    // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
-                    std::mem::transmute(func_ptr as *const ());
-                func(closure_handle)
-            }
+            body()
         },
     );
 
@@ -439,6 +437,20 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
     let generation = scheduler().sync.ensure(id).arm(SendCoroutine(coro), bounds, closure_handle);
     enqueue_fresh(id);
     make_handle(id, generation)
+}
+
+/// start a task running the pith closure and return its handle (see
+/// `make_handle`). the handle is never 0, matching `os_thread_spawn`.
+///
+/// # Safety
+/// `closure_handle` must be a valid pith closure handle or 0.
+pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
+    if closure_handle == 0 {
+        return 0;
+    }
+    // SAFETY: Caller guarantees `closure_handle` is a valid pith closure handle
+    // whose lifetime is owned by the task until `finish_task` releases it.
+    green_spawn_with(closure_handle, move || unsafe { invoke_closure(closure_handle) })
 }
 
 /// green await: return the target task's result, blocking until it completes.
@@ -456,11 +468,9 @@ pub(crate) unsafe fn green_spawn(closure_handle: i64) -> i64 {
 /// `Running` sets the pending flag and is not lost.
 ///
 /// await consumes the handle: the first awaiter to see the result retires the
-/// task, and any later await of the same handle returns 0.
-///
-/// # Safety
-/// `task_handle` came from spawn or is garbage; garbage resolves to no task.
-pub(crate) unsafe fn green_await(task_handle: i64) -> i64 {
+/// task, and any later await of the same handle returns 0. garbage handles
+/// resolve to no task and return 0.
+pub(crate) fn green_await(task_handle: i64) -> i64 {
     let Some((id, generation)) = split_handle(task_handle) else {
         return 0;
     };

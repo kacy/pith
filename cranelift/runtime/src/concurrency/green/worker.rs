@@ -40,7 +40,8 @@ pub(super) fn with_own_cache<R>(f: impl FnOnce(&mut WorkerCache) -> R) -> Option
     // SAFETY: worker `w`'s cache is reached only from worker `w`'s own thread
     // (the one that set `CACHE_OWNER`), and `f` does not re-enter, so this is
     // the only reference.
-    Some(f(unsafe { &mut *scheduler().workers[w].cache.0.get() }))
+    let cache = unsafe { &mut *scheduler().workers[w].cache.0.get() };
+    Some(f(cache))
 }
 
 /// one worker's run queues, its park spot, and what the monitor reads about

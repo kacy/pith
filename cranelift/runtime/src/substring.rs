@@ -54,7 +54,7 @@ pub fn find_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> 
     }
     let rest = &haystack[start..];
     if n_len == 1 {
-        // memchr reads only within the length it is given
+        // SAFETY: `memchr` reads only within `rest`'s valid length `rest.len()`.
         let found =
             unsafe { libc::memchr(rest.as_ptr() as *const c_void, needle[0] as i32, rest.len()) };
         return if found.is_null() {
@@ -72,8 +72,7 @@ pub fn find_from(haystack: &[u8], needle: &[u8], start: usize) -> Option<usize> 
 
 /// libc's `memmem` over two non-empty slices, as an offset into `haystack`.
 fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    // memmem reads only within the lengths it is given, which are exactly
-    // the two slices.
+    // SAFETY: `memmem` reads only within the lengths of the two valid slices.
     let found = unsafe {
         libc::memmem(
             haystack.as_ptr() as *const c_void,
@@ -98,6 +97,13 @@ const PAIR_MIN_HAYSTACK: usize = 32;
 /// first match as an offset into `haystack`.
 #[cfg(target_arch = "x86_64")]
 fn packed_pair(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    // SAFETY: SSE2 is part of the x86_64 baseline.
+    unsafe { packed_pair_sse2(haystack, needle) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+fn packed_pair_sse2(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     use std::arch::x86_64::{
         __m128i, _mm_and_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
         _mm_set1_epi8,
@@ -113,29 +119,30 @@ fn packed_pair(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     // kind memmem handles better, and it takes over from where we are.
     let mut misses = 0usize;
     let mut at = 0usize;
-    // SAFETY: SSE2 is part of the x86_64 baseline. each load reads sixteen
-    // bytes at `at` or `at + last`, and `at <= end` keeps both windows
-    // within `haystack`.
-    unsafe {
-        let first_v = _mm_set1_epi8(needle[0] as i8);
-        let last_v = _mm_set1_epi8(needle[last] as i8);
-        while at <= end {
-            let a = _mm_loadu_si128(haystack.as_ptr().add(at) as *const __m128i);
-            let b = _mm_loadu_si128(haystack.as_ptr().add(at + last) as *const __m128i);
-            let both = _mm_and_si128(_mm_cmpeq_epi8(a, first_v), _mm_cmpeq_epi8(b, last_v));
-            let mut mask = _mm_movemask_epi8(both) as u32;
-            while mask != 0 {
-                let pos = at + mask.trailing_zeros() as usize;
-                if haystack[pos..pos + needle.len()] == *needle {
-                    return Some(pos);
-                }
-                misses += 1;
-                mask &= mask - 1;
+    let first_v = _mm_set1_epi8(needle[0] as i8);
+    let last_v = _mm_set1_epi8(needle[last] as i8);
+    while at <= end {
+        // SAFETY: `at <= end` keeps both 16-byte windows (`at..at+16` and
+        // `at+last..at+last+16`) within `haystack`.
+        let (a, b) = unsafe {
+            (
+                _mm_loadu_si128(haystack.as_ptr().add(at) as *const __m128i),
+                _mm_loadu_si128(haystack.as_ptr().add(at + last) as *const __m128i),
+            )
+        };
+        let both = _mm_and_si128(_mm_cmpeq_epi8(a, first_v), _mm_cmpeq_epi8(b, last_v));
+        let mut mask = _mm_movemask_epi8(both) as u32;
+        while mask != 0 {
+            let pos = at + mask.trailing_zeros() as usize;
+            if haystack[pos..pos + needle.len()] == *needle {
+                return Some(pos);
             }
-            at += 16;
-            if misses > 64 + at / 8 {
-                return memmem(&haystack[at..], needle).map(|found| at + found);
-            }
+            misses += 1;
+            mask &= mask - 1;
+        }
+        at += 16;
+        if misses > 64 + at / 8 {
+            return memmem(&haystack[at..], needle).map(|found| at + found);
         }
     }
     // the last positions, fewer than sixteen, go through memmem

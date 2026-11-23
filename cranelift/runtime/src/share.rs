@@ -50,7 +50,9 @@ pub unsafe extern "C" fn pith_share(value: i64, tag: i64) {
     if value == 0 {
         return;
     }
-    share_value(value, crate::collections::list::element_tag_from_code(tag as i32));
+    let kind = crate::collections::list::element_tag_from_code(tag as i32);
+    // SAFETY: Caller guarantees `value` is a live heap value matching `tag`.
+    unsafe { share_value(value, kind) };
 }
 
 /// Mark `value` shared when `holder`, a struct it is being stored into, is
@@ -60,28 +62,39 @@ pub unsafe extern "C" fn pith_share(value: i64, tag: i64) {
 /// `holder` must be a live struct; `value` a live value of the kind `tag`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_share_into(holder: i64, value: i64, tag: i64) {
-    if value != 0 && crate::runtime_core::struct_is_shared(holder) {
-        pith_share(value, tag);
+    // SAFETY: Caller guarantees `holder` is a live struct pointer.
+    if value != 0 && unsafe { crate::runtime_core::struct_is_shared(holder) } {
+        // SAFETY: Caller guarantees `value` is a live heap value matching `tag`.
+        unsafe { pith_share(value, tag) };
+    }
+}
+
+#[inline(always)]
+fn tag_to_child_kind(tag: ListTypeTag) -> Option<u8> {
+    match tag {
+        ListTypeTag::Struct => Some(CHILD_STRUCT),
+        ListTypeTag::Closure => Some(CHILD_CLOSURE),
+        ListTypeTag::List => Some(CHILD_LIST),
+        ListTypeTag::Map => Some(CHILD_MAP),
+        // strings, bytes, sets and channels hold no struct, and their own
+        // counts are atomic
+        _ => None,
     }
 }
 
 pub(crate) unsafe fn share_value(value: i64, tag: ListTypeTag) {
-    let child = match tag {
-        ListTypeTag::Struct => CHILD_STRUCT,
-        ListTypeTag::Closure => CHILD_CLOSURE,
-        ListTypeTag::List => CHILD_LIST,
-        ListTypeTag::Map => CHILD_MAP,
-        // strings, bytes, sets and channels hold no struct, and their own
-        // counts are atomic
-        _ => return,
+    let Some(child) = tag_to_child_kind(tag) else {
+        return;
     };
     // the common case is a value with nothing to walk: one already shared, or
     // a spawn's closure over plain values. the work list stays empty, and so
     // unallocated, until a child turns up.
     let mut work: Vec<(i64, u8)> = Vec::new();
-    mark_one(value, child, &mut work);
+    // SAFETY: Caller guarantees `value` is a live heap value matching `tag`.
+    unsafe { mark_one(value, child, &mut work) };
     while let Some((v, kind)) = work.pop() {
-        mark_one(v, kind, &mut work);
+        // SAFETY: `v` and `kind` were reported as live child edges of a marked parent.
+        unsafe { mark_one(v, kind, &mut work) };
     }
 }
 
@@ -98,24 +111,32 @@ unsafe fn mark_one(v: i64, kind: u8, work: &mut Vec<(i64, u8)>) {
     };
     match kind {
         CHILD_STRUCT => {
-            if crate::runtime_core::struct_mark_shared(v) {
+            // SAFETY: Caller guarantees `v` is a live struct handle.
+            if unsafe { crate::runtime_core::struct_mark_shared(v) } {
                 forget_owner(v);
-                crate::cycle::struct_children(v, &mut push);
+                // SAFETY: `v` is a live struct whose tracer reports its child edges.
+                unsafe { crate::cycle::struct_children(v, &mut push) };
             }
         }
         CHILD_CLOSURE => {
-            if crate::runtime_core::closure_mark_shared(v) {
-                crate::runtime_core::cycle_closure_children(v, &mut push);
+            // SAFETY: Caller guarantees `v` is a live closure handle.
+            if unsafe { crate::runtime_core::closure_mark_shared(v) } {
+                // SAFETY: `v` is a live closure whose env slots can be enumerated.
+                unsafe { crate::runtime_core::cycle_closure_children(v, &mut push) };
             }
         }
         CHILD_LIST => {
-            if crate::collections::list::list_mark_shared(v) {
-                crate::collections::list::cycle_list_children(v, &mut push);
+            // SAFETY: Caller guarantees `v` is a live list handle.
+            if unsafe { crate::collections::list::list_mark_shared(v) } {
+                // SAFETY: `v` is a live list whose owned elements can be enumerated.
+                unsafe { crate::collections::list::cycle_list_children(v, &mut push) };
             }
         }
         CHILD_MAP => {
-            if crate::collections::map::map_mark_shared(v) {
-                crate::collections::map::cycle_map_children(v, &mut push);
+            // SAFETY: Caller guarantees `v` is a live map handle.
+            if unsafe { crate::collections::map::map_mark_shared(v) } {
+                // SAFETY: `v` is a live map whose owned values can be enumerated.
+                unsafe { crate::collections::map::cycle_map_children(v, &mut push) };
             }
         }
         _ => {}

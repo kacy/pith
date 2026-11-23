@@ -237,9 +237,9 @@ fn await_retires_the_task_and_its_handle() {
     let (id, handle) = spawn_unqueued(returning(5));
     run_task(id);
     assert_eq!(green_is_done(handle), 1);
-    assert_eq!(unsafe { green_await(handle) }, 5);
+    assert_eq!(green_await(handle), 5);
     assert_eq!(green_is_done(handle), 0, "a retired handle names no task");
-    assert_eq!(unsafe { green_await(handle) }, 0, "await consumes the handle");
+    assert_eq!(green_await(handle), 0, "await consumes the handle");
 
     let join = lock_join(&sync_block(id).unwrap().join);
     assert!(!join.live);
@@ -253,10 +253,10 @@ fn a_stale_generation_resolves_to_no_task() {
     let (_, generation) = split_handle(handle).unwrap();
     let stale = make_handle(id, generation.wrapping_add(1) & GEN_MASK);
     assert_eq!(green_is_done(stale), 0);
-    assert_eq!(unsafe { green_await(stale) }, 0);
+    assert_eq!(green_await(stale), 0);
     green_detach(stale);
     run_task(id);
-    assert_eq!(unsafe { green_await(handle) }, 1, "the real handle still works");
+    assert_eq!(green_await(handle), 1, "the real handle still works");
 }
 
 // detaching a running task retires it when it finishes.
@@ -267,7 +267,7 @@ fn a_detached_task_retires_when_it_finishes() {
     assert!(lock_join(&sync_block(id).unwrap().join).live, "still running");
     run_task(id);
     assert!(!lock_join(&sync_block(id).unwrap().join).live);
-    assert_eq!(unsafe { green_await(handle) }, 0);
+    assert_eq!(green_await(handle), 0);
 }
 
 // detaching a finished task retires it at once.

@@ -24,9 +24,11 @@
 //! grows with the tree), so those are offloaded.
 
 use crate::blocking::{self, Pool};
-use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::bytes::{pith_bytes_from_vec, with_bytes};
 use crate::collections::list::{pith_list_new, pith_list_push_value_owned};
-use crate::ffi_util::{cstr_bytes, cstr_str, write_result, ResultPair};
+use crate::ffi_util::{
+    with_cstr_bytes, with_cstr_str, with_cstr_str2, write_result, ResultPair,
+};
 use crate::runtime_core::optional_tuple;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -121,12 +123,8 @@ impl Default for FileWrite {
 /// opened, or closed since.
 const UNKNOWN_FILE_HANDLE: &str = "invalid or closed file handle";
 
-/// open the file at `path` (a C string) and register it, returning its handle
-/// or 0 on failure. the shared body of the three `pith_file_open_*` exports.
-unsafe fn open_file_handle(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
-    let Some(path_str) = cstr_str(path) else {
-        return 0;
-    };
+/// open the file at `path` and register it, returning its handle or 0 on failure.
+fn open_file_handle_str(path_str: &str, create: bool, write: bool, append: bool) -> i64 {
     // the path is the only thing to hand over and it is short, so this one does
     // not bother with a separate direct arm: `blocking::run` runs the open
     // right here when there is no worker to protect.
@@ -137,18 +135,40 @@ unsafe fn open_file_handle(path: *const i8, create: bool, write: bool, append: b
     }
 }
 
+/// open the file at `path` (a C string) and register it, returning its handle
+/// or 0 on failure. the shared body of the three `pith_file_open_*` exports.
+unsafe fn open_file_handle(path: *const i8, create: bool, write: bool, append: bool) -> i64 {
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(path, |s| open_file_handle_str(s, create, write, append)) }.unwrap_or(0)
+}
+
+fn dir_exists_at(path_str: &str) -> bool {
+    let path = std::path::Path::new(path_str);
+    path.exists() && path.is_dir()
+}
+
+fn file_size_at(path_str: &str) -> i64 {
+    std::fs::metadata(path_str).map_or(-1, |meta| meta.len() as i64)
+}
+
+fn file_mtime_at(path_str: &str) -> i64 {
+    let Ok(modified) = std::fs::metadata(path_str).and_then(|meta| meta.modified()) else {
+        return -1;
+    };
+    match modified.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since) => since.as_secs() as i64,
+        Err(_) => -1,
+    }
+}
+
 /// Check if a file exists
 ///
 /// # Safety
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_exists(path: *const i8) -> i64 {
-    if let Some(path_str) = cstr_str(path) {
-        if std::path::Path::new(path_str).exists() {
-            return 1;
-        }
-    }
-    0
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    i64::from(unsafe { with_cstr_str(path, |s| std::path::Path::new(s).exists()) }.unwrap_or(false))
 }
 
 /// Check if a directory exists
@@ -157,13 +177,8 @@ pub unsafe extern "C" fn pith_file_exists(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_dir_exists(path: *const i8) -> i64 {
-    if let Some(path_str) = cstr_str(path) {
-        let path = std::path::Path::new(path_str);
-        if path.exists() && path.is_dir() {
-            return 1;
-        }
-    }
-    0
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    i64::from(unsafe { with_cstr_str(path, dir_exists_at) }.unwrap_or(false))
 }
 
 /// Create a directory
@@ -172,14 +187,10 @@ pub unsafe extern "C" fn pith_dir_exists(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_mkdir(path: *const i8) -> i64 {
-    use std::fs;
-
-    if let Some(path_str) = cstr_str(path) {
-        if fs::create_dir_all(path_str).is_ok() {
-            return 1;
-        }
-    }
-    0
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    i64::from(
+        unsafe { with_cstr_str(path, |s| std::fs::create_dir_all(s).is_ok()) }.unwrap_or(false),
+    )
 }
 
 /// Remove an empty directory
@@ -188,14 +199,8 @@ pub unsafe extern "C" fn pith_mkdir(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_remove_dir(path: *const i8) -> i64 {
-    use std::fs;
-
-    if let Some(path_str) = cstr_str(path) {
-        if fs::remove_dir(path_str).is_ok() {
-            return 1;
-        }
-    }
-    0
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    i64::from(unsafe { with_cstr_str(path, |s| std::fs::remove_dir(s).is_ok()) }.unwrap_or(false))
 }
 
 /// Remove a directory tree recursively
@@ -207,10 +212,10 @@ pub unsafe extern "C" fn pith_remove_dir(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_remove_tree(path: *const i8) -> i64 {
-    let Some(path_str) = cstr_str(path) else {
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    let Some(path) = (unsafe { with_cstr_str(path, str::to_owned) }) else {
         return 0;
     };
-    let path = path_str.to_string();
     blocking::run(&POOL, move || std::fs::remove_dir_all(path).is_ok()) as i64
 }
 
@@ -221,12 +226,8 @@ pub unsafe extern "C" fn pith_remove_tree(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_size(path: *const i8) -> i64 {
-    if let Some(path_str) = cstr_str(path) {
-        if let Ok(meta) = std::fs::metadata(path_str) {
-            return meta.len() as i64;
-        }
-    }
-    -1
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(path, file_size_at) }.unwrap_or(-1)
 }
 
 /// Read a file's modification time, in whole seconds since the unix epoch.
@@ -236,16 +237,8 @@ pub unsafe extern "C" fn pith_file_size(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_mtime(path: *const i8) -> i64 {
-    let Some(path_str) = cstr_str(path) else {
-        return -1;
-    };
-    let Ok(modified) = std::fs::metadata(path_str).and_then(|meta| meta.modified()) else {
-        return -1;
-    };
-    match modified.duration_since(std::time::UNIX_EPOCH) {
-        Ok(since) => since.as_secs() as i64,
-        Err(_) => -1,
-    }
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(path, file_mtime_at) }.unwrap_or(-1)
 }
 
 /// Remove a file
@@ -254,14 +247,8 @@ pub unsafe extern "C" fn pith_file_mtime(path: *const i8) -> i64 {
 /// path must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_remove_file(path: *const i8) -> i64 {
-    use std::fs;
-
-    if let Some(path_str) = cstr_str(path) {
-        if fs::remove_file(path_str).is_ok() {
-            return 1;
-        }
-    }
-    0
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    i64::from(unsafe { with_cstr_str(path, |s| std::fs::remove_file(s).is_ok()) }.unwrap_or(false))
 }
 
 /// Rename a file
@@ -270,14 +257,10 @@ pub unsafe extern "C" fn pith_remove_file(path: *const i8) -> i64 {
 /// Both paths must be valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_rename_file(from: *const i8, to: *const i8) -> i64 {
-    use std::fs;
-
-    if let (Some(from_str), Some(to_str)) = (cstr_str(from), cstr_str(to)) {
-        if fs::rename(from_str, to_str).is_ok() {
-            return 1;
-        }
-    }
-    0
+    // SAFETY: Caller guarantees `from` and `to` are null or valid null-terminated C strings.
+    i64::from(
+        unsafe { with_cstr_str2(from, to, |f, t| std::fs::rename(f, t).is_ok()) }.unwrap_or(false),
+    )
 }
 
 /// Read entire file contents as a C string
@@ -340,37 +323,20 @@ fn create_new_file_at(path: &str, content: &[u8], mode: u32) -> i64 {
     }
 }
 
-/// `create_new_file_at` for pith: `content` is a `Bytes` handle and `mode` the
-/// permission bits. the bytes are copied before the job crosses to a pool
-/// thread, as in `pith_write_file_bytes`.
-#[no_mangle]
-pub unsafe extern "C" fn pith_fs_create_new(path: *const i8, content: i64, mode: i64) -> i64 {
-    let (Some(path_str), Some(bytes)) = (cstr_str(path), pith_bytes_ref(content)) else {
-        return libc::EINVAL as i64;
-    };
+fn fs_create_new_impl(path_str: &str, data: &[u8], mode: i64) -> i64 {
     let mode = (mode & 0o7777) as u32;
     if !blocking::offloads() {
-        return create_new_file_at(path_str, &bytes.data, mode);
+        return create_new_file_at(path_str, data, mode);
     }
-    let (path, content) = (path_str.to_string(), bytes.data.clone());
+    let (path, content) = (path_str.to_string(), data.to_vec());
     // `blocking::run` reports a job that panicked as the default, and a
     // default 0 would read as success, so the job answers in an option.
-    blocking::run(&POOL, move || {
-        Some(create_new_file_at(&path, &content, mode))
-    })
-    .unwrap_or(-1)
+    blocking::run(&POOL, move || Some(create_new_file_at(&path, &content, mode))).unwrap_or(-1)
 }
 
-/// create one directory with `mode` (less the umask). `mkdir(2)` fails with
-/// `EEXIST` on any existing path, a symlink included, so a planted name is
-/// never reused. returns 0 or the errno.
-#[no_mangle]
-pub unsafe extern "C" fn pith_fs_mkdir_new(path: *const i8, mode: i64) -> i64 {
+fn fs_mkdir_new_at(path_str: &str, mode: i64) -> i64 {
     use std::os::unix::fs::DirBuilderExt;
 
-    let Some(path_str) = cstr_str(path) else {
-        return libc::EINVAL as i64;
-    };
     let mode = (mode & 0o7777) as u32;
     match std::fs::DirBuilder::new().mode(mode).create(path_str) {
         Ok(()) => 0,
@@ -378,12 +344,59 @@ pub unsafe extern "C" fn pith_fs_mkdir_new(path: *const i8, mode: i64) -> i64 {
     }
 }
 
+fn write_file_impl(path_str: &str, data: &[u8]) -> i64 {
+    // handing the content to another thread means owning it, which for a write
+    // means copying it. that copy is worth a syscall the worker would otherwise
+    // sit through, but only when there is a worker to protect, so ask first
+    // and write straight out of the caller's buffer when there is not.
+    if !blocking::offloads() {
+        return write_file_at(path_str, data) as i64;
+    }
+    // the copy is of the bytes, not of the handle: a `Bytes` object belongs to
+    // the thread-local machinery of the task that made it and must not be
+    // touched from a pool thread.
+    let (path, content) = (path_str.to_string(), data.to_vec());
+    blocking::run(&POOL, move || write_file_at(&path, &content)) as i64
+}
+
+fn append_file_impl(path_str: &str, data: &[u8]) -> i64 {
+    if !blocking::offloads() {
+        return append_file_at(path_str, data) as i64;
+    }
+    let (path, content) = (path_str.to_string(), data.to_vec());
+    blocking::run(&POOL, move || append_file_at(&path, &content)) as i64
+}
+
+/// `create_new_file_at` for pith: `content` is a `Bytes` handle and `mode` the
+/// permission bits. the bytes are copied before the job crosses to a pool
+/// thread, as in `pith_write_file_bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn pith_fs_create_new(path: *const i8, content: i64, mode: i64) -> i64 {
+    // SAFETY: Caller guarantees `path` is null or a valid C string; `with_bytes` validates `content`.
+    unsafe {
+        with_cstr_str(path, |path_str| {
+            with_bytes(content, |data| fs_create_new_impl(path_str, data, mode))
+        })
+    }
+    .flatten()
+    .unwrap_or(libc::EINVAL as i64)
+}
+
+/// create one directory with `mode` (less the umask). `mkdir(2)` fails with
+/// `EEXIST` on any existing path, a symlink included, so a planted name is
+/// never reused. returns 0 or the errno.
+#[no_mangle]
+pub unsafe extern "C" fn pith_fs_mkdir_new(path: *const i8, mode: i64) -> i64 {
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(path, |p| fs_mkdir_new_at(p, mode)) }.unwrap_or(libc::EINVAL as i64)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
-    let Some(path_str) = cstr_str(path) else {
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    let Some(path) = (unsafe { with_cstr_str(path, str::to_owned) }) else {
         return std::ptr::null_mut();
     };
-    let path = path_str.to_string();
     // the contents come back as a plain `String` and become a pith C string
     // here, on the calling task's thread.
     match blocking::run(&POOL, move || read_file_text_at(&path)) {
@@ -394,10 +407,10 @@ pub unsafe extern "C" fn pith_read_file(path: *const i8) -> *mut i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_read_file_bytes(path: *const i8) -> i64 {
-    let Some(path_str) = cstr_str(path) else {
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    let Some(path) = (unsafe { with_cstr_str(path, str::to_owned) }) else {
         return 0;
     };
-    let path = path_str.to_string();
     match blocking::run(&POOL, move || std::fs::read(&path).ok()) {
         Some(contents) => pith_bytes_from_vec(contents),
         None => 0,
@@ -409,80 +422,50 @@ pub unsafe extern "C" fn pith_write_file(path: *const i8, content: *const i8) ->
     // the content is read as a `str` rather than as raw bytes because that is
     // what this entry point has always done: a non-utf-8 payload fails the
     // write instead of landing on disk.
-    let (Some(path_str), Some(content)) = (cstr_str(path), cstr_str(content)) else {
-        return 0;
-    };
-    // handing the content to another thread means owning it, which for a write
-    // means copying it. that copy is worth a syscall the worker would otherwise
-    // sit through, but only when there is a worker to protect, so ask first
-    // and write straight out of the caller's buffer when there is not.
-    if !blocking::offloads() {
-        return write_file_at(path_str, content.as_bytes()) as i64;
-    }
-    let (path, content) = (path_str.to_string(), content.as_bytes().to_vec());
-    blocking::run(&POOL, move || write_file_at(&path, &content)) as i64
+    // SAFETY: Caller guarantees `path` and `content` are null or valid null-terminated C strings.
+    unsafe { with_cstr_str2(path, content, |p, c| write_file_impl(p, c.as_bytes())) }.unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_write_file_bytes(path: *const i8, content: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(content) else {
-        return 0;
-    };
-    let Some(path_str) = cstr_str(path) else {
-        return 0;
-    };
-    if !blocking::offloads() {
-        return write_file_at(path_str, &bytes.data) as i64;
-    }
-    // the copy is of the bytes, not of the handle: a `Bytes` object belongs to
-    // the thread-local machinery of the task that made it and must not be
-    // touched from a pool thread.
-    let (path, content) = (path_str.to_string(), bytes.data.clone());
-    blocking::run(&POOL, move || write_file_at(&path, &content)) as i64
+    // SAFETY: `with_bytes` validates `content`; caller guarantees `path` is null or a valid C string.
+    unsafe { with_bytes(content, |data| with_cstr_str(path, |p| write_file_impl(p, data))) }
+        .flatten()
+        .unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_append_file(path: *const i8, content: *const i8) -> i64 {
     // as in `pith_write_file`, non-utf-8 content fails rather than being
     // appended, which is what this entry point has always done.
-    let (Some(path_str), Some(content)) = (cstr_str(path), cstr_str(content)) else {
-        return 0;
-    };
-    if !blocking::offloads() {
-        return append_file_at(path_str, content.as_bytes()) as i64;
-    }
-    let (path, content) = (path_str.to_string(), content.as_bytes().to_vec());
-    blocking::run(&POOL, move || append_file_at(&path, &content)) as i64
+    // SAFETY: Caller guarantees `path` and `content` are null or valid null-terminated C strings.
+    unsafe { with_cstr_str2(path, content, |p, c| append_file_impl(p, c.as_bytes())) }.unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_append_file_bytes(path: *const i8, content: i64) -> i64 {
-    let Some(bytes) = pith_bytes_ref(content) else {
-        return 0;
-    };
-    let Some(path_str) = cstr_str(path) else {
-        return 0;
-    };
-    if !blocking::offloads() {
-        return append_file_at(path_str, &bytes.data) as i64;
-    }
-    let (path, content) = (path_str.to_string(), bytes.data.clone());
-    blocking::run(&POOL, move || append_file_at(&path, &content)) as i64
+    // SAFETY: `with_bytes` validates `content`; caller guarantees `path` is null or a valid C string.
+    unsafe { with_bytes(content, |data| with_cstr_str(path, |p| append_file_impl(p, data))) }
+        .flatten()
+        .unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_read(path: *const i8) -> i64 {
-    open_file_handle(path, false, false, false)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { open_file_handle(path, false, false, false) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_write(path: *const i8) -> i64 {
-    open_file_handle(path, true, true, false)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { open_file_handle(path, true, true, false) }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_open_append(path: *const i8) -> i64 {
-    open_file_handle(path, true, false, true)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { open_file_handle(path, true, false, true) }
 }
 
 /// read one chunk from an open handle, on a pool thread when there is a worker
@@ -549,20 +532,18 @@ pub unsafe extern "C" fn pith_file_read_bytes(handle: i64, max_bytes: i64) -> i6
 /// reason.
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_write(handle: i64, data: *const i8) -> ResultPair {
-    let outcome = match cstr_bytes(data) {
-        Some(bytes) => write_handle_chunk(handle, bytes),
-        None => Err("invalid string".to_string()),
-    };
+    // SAFETY: Caller guarantees `data` is null or a valid null-terminated C string.
+    let outcome = unsafe { with_cstr_bytes(data, |bytes| write_handle_chunk(handle, bytes)) }
+        .unwrap_or_else(|| Err("invalid string".to_string()));
     write_result("file_write", outcome)
 }
 
 /// the `Bytes` form of `pith_file_write`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_file_write_bytes(handle: i64, data: i64) -> ResultPair {
-    let outcome = match pith_bytes_ref(data) {
-        Some(bytes) => write_handle_chunk(handle, &bytes.data),
-        None => Err("invalid bytes value".to_string()),
-    };
+    // SAFETY: `with_bytes` validates `data` before borrowing its slice.
+    let outcome = unsafe { with_bytes(data, |bytes| write_handle_chunk(handle, bytes)) }
+        .unwrap_or_else(|| Err("invalid bytes value".to_string()));
     write_result("file_write_bytes", outcome)
 }
 
@@ -571,18 +552,21 @@ pub extern "C" fn pith_file_close(handle: i64) {
     file_handles().lock().remove(&handle);
 }
 
+fn env_cstring(name_str: &str) -> Option<*mut i8> {
+    let var = crate::env_overlay::get(name_str)?;
+    Some(crate::pith_copy_bytes_to_cstring(var.as_bytes()))
+}
+
 /// Get environment variable value
 ///
 /// # Safety
 /// name must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
-    if let Some(name_str) = cstr_str(name) {
-        if let Some(var) = crate::env_overlay::get(name_str) {
-            return crate::pith_copy_bytes_to_cstring(var.as_bytes());
-        }
-    }
-    crate::pith_strdup_string("")
+    // SAFETY: Caller guarantees `name` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(name, env_cstring) }
+        .flatten()
+        .unwrap_or_else(|| crate::pith_strdup_string("")) as *const i8
 }
 
 /// Get environment variable value wrapped in an Optional tuple. Returns
@@ -594,13 +578,11 @@ pub unsafe extern "C" fn pith_env(name: *const i8) -> *const i8 {
 /// name must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_env_opt(name: *const i8) -> i64 {
-    if let Some(name_str) = cstr_str(name) {
-        if let Some(var) = crate::env_overlay::get(name_str) {
-            let cstr = crate::pith_copy_bytes_to_cstring(var.as_bytes());
-            return optional_tuple(true, cstr as i64);
-        }
+    // SAFETY: Caller guarantees `name` is null or a valid null-terminated C string.
+    match unsafe { with_cstr_str(name, env_cstring) }.flatten() {
+        Some(cstr) => optional_tuple(true, cstr as i64),
+        None => optional_tuple(false, 0),
     }
-    optional_tuple(false, 0)
 }
 
 #[no_mangle]
@@ -615,12 +597,10 @@ pub unsafe extern "C" fn pith_os_getcwd() -> *const i8 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_chdir(path: *const i8) -> i64 {
-    if let Some(path_str) = cstr_str(path) {
-        if std::env::set_current_dir(path_str).is_ok() {
-            return 1;
-        }
-    }
-    0
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    i64::from(
+        unsafe { with_cstr_str(path, |p| std::env::set_current_dir(p).is_ok()) }.unwrap_or(false),
+    )
 }
 
 #[no_mangle]
@@ -655,11 +635,8 @@ pub unsafe extern "C" fn pith_os_home_dir() -> *const i8 {
 /// name and value must be valid null-terminated C strings
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_set_env(name: *const i8, value: *const i8) -> i64 {
-    if let (Some(name_str), Some(value_str)) = (cstr_str(name), cstr_str(value)) {
-        crate::env_overlay::set(name_str, value_str);
-        return 1;
-    }
-    0
+    // SAFETY: Caller guarantees `name` and `value` are null or valid null-terminated C strings.
+    i64::from(unsafe { with_cstr_str2(name, value, crate::env_overlay::set) }.is_some())
 }
 
 /// Remove an environment variable as the program sees it.
@@ -672,11 +649,8 @@ pub unsafe extern "C" fn pith_os_set_env(name: *const i8, value: *const i8) -> i
 /// name must be a valid null-terminated C string
 #[no_mangle]
 pub unsafe extern "C" fn pith_os_unset_env(name: *const i8) -> i64 {
-    if let Some(name_str) = cstr_str(name) {
-        crate::env_overlay::unset(name_str);
-        return 1;
-    }
-    0
+    // SAFETY: Caller guarantees `name` is null or a valid null-terminated C string.
+    i64::from(unsafe { with_cstr_str(name, crate::env_overlay::unset) }.is_some())
 }
 
 /// the entry names of a directory, in whatever order the filesystem gives them,
@@ -696,22 +670,21 @@ fn list_dir_at(path: &str) -> Option<Vec<String>> {
 /// this one is not the single cheap lookup the other metadata calls are.
 #[no_mangle]
 pub unsafe extern "C" fn pith_list_dir(path: *const i8) -> i64 {
-    let names = match cstr_str(path) {
-        Some(path_str) => {
-            let path = path_str.to_string();
-            blocking::run(&POOL, move || list_dir_at(&path))
-        }
-        None => None,
-    };
+    // SAFETY: Caller guarantees `path` is null or a valid null-terminated C string.
+    let names = unsafe { with_cstr_str(path, str::to_owned) }
+        .and_then(|path| blocking::run(&POOL, move || list_dir_at(&path)));
 
     // an unreadable directory is an empty list, not an error. the
     // list and its strings are pith objects, so they are built here rather than
     // on the pool thread.
     // each name is born with one count, which the String-tagged list takes
     // over; a plain push would add a second one nobody gives back.
-    let list = pith_list_new(8, 1);
+    // SAFETY: Allocates a fresh String-tagged list.
+    let list = unsafe { pith_list_new(8, 1) };
     for name in names.unwrap_or_default() {
-        pith_list_push_value_owned(list, crate::pith_strdup_string(&name) as i64);
+        let cstr = crate::pith_strdup_string(&name) as i64;
+        // SAFETY: `list` is a live String-tagged list and `cstr` transfers one owned count.
+        unsafe { pith_list_push_value_owned(list, cstr) };
     }
     list.ptr as i64
 }

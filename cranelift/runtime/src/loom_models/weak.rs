@@ -45,17 +45,21 @@ impl Header {
         fence(Ordering::Acquire);
         self.strong.store(guard, Ordering::Release);
         // the destructor: it drops the fields, exactly once.
-        self.field.with_mut(|field| unsafe {
-            assert_eq!(*field, 1, "the destructor ran twice");
-            *field = 0;
+        self.field.with_mut(|field| {
+            // SAFETY: Last strong release synchronized via `fence(Ordering::Acquire)`.
+            let val = unsafe { &mut *field };
+            assert_eq!(*val, 1, "the destructor ran twice");
+            *val = 0;
         });
         self.flags.fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
     }
 
     /// a reader using the value it upgraded to.
     fn read(&self) {
-        self.field.with(|field| unsafe {
-            assert_eq!(*field, 1, "read a destroyed value");
+        self.field.with(|field| {
+            // SAFETY: Reader holds an upgraded strong count keeping `field` live.
+            let val = unsafe { *field };
+            assert_eq!(val, 1, "read a destroyed value");
         });
     }
 }
@@ -70,8 +74,10 @@ fn race(upgrade: fn(&Header) -> bool, guard: u32) {
             header.release(guard);
         }
         drop_last.join().unwrap();
-        header.field.with(|field| unsafe {
-            assert_eq!(*field, 0, "the value was never destroyed");
+        header.field.with(|field| {
+            // SAFETY: All threads have joined; reading `field` is exclusive.
+            let val = unsafe { *field };
+            assert_eq!(val, 0, "the value was never destroyed");
         });
     });
 }

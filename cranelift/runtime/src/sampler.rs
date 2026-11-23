@@ -33,20 +33,24 @@ extern "C" fn start() {
     let buffer = vec![0u64; MAX_SAMPLES].into_boxed_slice();
     SAMPLES.store(Box::leak(buffer).as_mut_ptr(), Ordering::Release);
     let _ = OUT_PATH.set(path);
-    unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = on_sample as *const () as usize;
-        action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+    // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = on_sample as *const () as usize;
+    action.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+    // SAFETY: `action` is stack-local and initialized with a valid SA_SIGINFO handler.
+    let installed = unsafe {
         libc::sigemptyset(&mut action.sa_mask);
-        if libc::sigaction(libc::SIGPROF, &action, std::ptr::null_mut()) != 0 {
-            return;
-        }
-        libc::atexit(write_samples);
-        set_timer(INTERVAL_US);
+        libc::sigaction(libc::SIGPROF, &action, std::ptr::null_mut()) == 0
+    };
+    if !installed {
+        return;
     }
+    // SAFETY: `write_samples` is a valid `extern "C" fn()` registered once at startup.
+    unsafe { libc::atexit(write_samples) };
+    set_timer(INTERVAL_US);
 }
 
-unsafe fn set_timer(interval_us: libc::suseconds_t) {
+fn set_timer(interval_us: libc::suseconds_t) {
     let tick = libc::timeval {
         tv_sec: 0,
         tv_usec: interval_us,
@@ -55,7 +59,8 @@ unsafe fn set_timer(interval_us: libc::suseconds_t) {
         it_interval: tick,
         it_value: tick,
     };
-    libc::setitimer(libc::ITIMER_PROF, &timer, std::ptr::null_mut());
+    // SAFETY: `timer` is a valid stack-local `itimerval` for `ITIMER_PROF`.
+    unsafe { libc::setitimer(libc::ITIMER_PROF, &timer, std::ptr::null_mut()) };
 }
 
 extern "C" fn on_sample(_sig: libc::c_int, _info: *mut libc::siginfo_t, context: *mut libc::c_void) {
@@ -63,32 +68,38 @@ extern "C" fn on_sample(_sig: libc::c_int, _info: *mut libc::siginfo_t, context:
     if samples.is_null() || context.is_null() {
         return;
     }
+    // SAFETY: Kernel passes a valid non-null `ucontext_t` to an `SA_SIGINFO` handler.
     let pc = unsafe { interrupted_pc(context as *const libc::ucontext_t) };
     let slot = NEXT.fetch_add(1, Ordering::Relaxed);
     if slot < MAX_SAMPLES {
+        // SAFETY: `samples` is a leaked `MAX_SAMPLES` buffer and `slot` is uniquely claimed.
         unsafe { samples.add(slot).write(pc) };
     }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 unsafe fn interrupted_pc(context: *const libc::ucontext_t) -> u64 {
-    (*context).uc_mcontext.gregs[libc::REG_RIP as usize] as u64
+    // SAFETY: Caller guarantees `context` is a valid `ucontext_t` pointer from SIGPROF.
+    unsafe { (*context).uc_mcontext.gregs[libc::REG_RIP as usize] as u64 }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 unsafe fn interrupted_pc(context: *const libc::ucontext_t) -> u64 {
-    (*context).uc_mcontext.pc
+    // SAFETY: Caller guarantees `context` is a valid `ucontext_t` pointer from SIGPROF.
+    unsafe { (*context).uc_mcontext.pc }
 }
 
 // on macos uc_mcontext is a pointer to the saved thread state
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 unsafe fn interrupted_pc(context: *const libc::ucontext_t) -> u64 {
-    (*(*context).uc_mcontext).__ss.__rip
+    // SAFETY: Caller guarantees `context` and its `uc_mcontext` are valid from SIGPROF.
+    unsafe { (*(*context).uc_mcontext).__ss.__rip }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe fn interrupted_pc(context: *const libc::ucontext_t) -> u64 {
-    (*(*context).uc_mcontext).__ss.__pc
+    // SAFETY: Caller guarantees `context` and its `uc_mcontext` are valid from SIGPROF.
+    unsafe { (*(*context).uc_mcontext).__ss.__pc }
 }
 
 #[cfg(not(any(
@@ -100,7 +111,7 @@ unsafe fn interrupted_pc(_context: *const libc::ucontext_t) -> u64 {
 }
 
 extern "C" fn write_samples() {
-    unsafe { set_timer(0) };
+    set_timer(0);
     let Some(path) = OUT_PATH.get() else {
         return;
     };
@@ -128,6 +139,7 @@ extern "C" fn write_samples() {
         text.push('\n');
     }
     for i in 0..count {
+        // SAFETY: `samples` is a leaked `MAX_SAMPLES` buffer and `i < count <= MAX_SAMPLES`.
         let pc = unsafe { samples.add(i).read() };
         text.push_str(&format!("{pc:x}\n"));
     }

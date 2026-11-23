@@ -1,6 +1,6 @@
 use crate::string;
 use std::alloc::{alloc, Layout};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     // the length is already known, so allocate the headered cstring directly.
@@ -8,11 +8,7 @@ pub(crate) fn pith_strdup_string(text: &str) -> *mut i8 {
     // string's buffer looking for a header no rust allocation has: a read of
     // memory this process does not own whenever the buffer starts its heap
     // block. pith_alloc_cstring writes the nul terminator itself.
-    unsafe {
-        let result = pith_alloc_cstring(text.len());
-        std::ptr::copy_nonoverlapping(text.as_ptr() as *const i8, result, text.len());
-        result
-    }
+    pith_copy_bytes_to_cstring(text.as_bytes())
 }
 
 #[no_mangle]
@@ -50,7 +46,8 @@ pub(crate) fn pith_layout(size: usize, align: usize) -> Layout {
 }
 
 pub(crate) unsafe fn pith_alloc(layout: Layout) -> *mut u8 {
-    let ptr = alloc(layout);
+    // SAFETY: Caller guarantees `layout` has non-zero size.
+    let ptr = unsafe { alloc(layout) };
     if ptr.is_null() {
         eprintln!("pith runtime error: allocation failed");
         // panic-guard: out of memory.
@@ -120,7 +117,48 @@ fn cstring_layout(data_len: usize) -> Layout {
 /// The length a heap cstring's header records.
 #[inline(always)]
 unsafe fn cstring_data_len(base: *const u8) -> usize {
-    (base.add(8) as *const u64).read() as usize
+    // SAFETY: Caller guarantees `base` points to a valid 16-byte cstring header.
+    unsafe { (base.add(8) as *const u64).read() as usize }
+}
+
+/// Borrow a heap cstring's atomic refcount for the duration of `f`.
+///
+/// # Safety
+/// `base` must point to a live 16-byte heap cstring header that outlives `f`.
+#[inline(always)]
+unsafe fn with_cstring_refcount<R>(base: *mut u8, f: impl FnOnce(&AtomicU32) -> R) -> R {
+    // SAFETY: Caller guarantees `base` is an 8-aligned valid cstring header,
+    // so `base + 4` is a 4-aligned `AtomicU32` refcount slot.
+    let rc = unsafe { &*(base.add(4) as *const AtomicU32) };
+    f(rc)
+}
+
+/// Borrow a bounded prefix of a heap cstring's bytes for diagnostic logging.
+///
+/// # Safety
+/// `base` must be the live header corresponding to `s`.
+#[inline(always)]
+unsafe fn with_cstring_preview<R>(
+    base: *const u8,
+    s: *const i8,
+    max_len: usize,
+    f: impl FnOnce(&[u8]) -> R,
+) -> R {
+    // SAFETY: Caller guarantees `base` is the valid header for `s`.
+    let data_len = unsafe { cstring_data_len(base) };
+    // SAFETY: `s` has `data_len` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, data_len.min(max_len)) };
+    f(bytes)
+}
+
+fn preview_lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[inline(always)]
+fn acquire_last_u32(rc: &AtomicU32) {
+    let _ = rc;
+    acquire_last_count!(rc);
 }
 
 /// Debug: under PITH_CSTRING_NOFREE + PITH_LEAK_SCAN, every allocation is
@@ -145,20 +183,19 @@ pub fn report_leaked_cstrings() {
     let ptrs = crate::sync::lock(&reg);
     let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for &p in ptrs.iter() {
-        unsafe {
-            let s = p as *const i8;
-            let Some(base) = cstring_base(s) else {
-                continue;
-            };
-            let rc = cstring_refcount(base).load(Ordering::Relaxed);
-            if rc == 0 {
-                continue;
-            }
-            let data_len = cstring_data_len(base);
-            let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
-            let content = String::from_utf8_lossy(bytes).into_owned();
-            *counts.entry(format!("rc={} {:?}", rc, content)).or_insert(0) += 1;
+        let s = p as *const i8;
+        // SAFETY: `p` came from `alloc_cstring` under `PITH_CSTRING_NOFREE` + `PITH_LEAK_SCAN`.
+        let Some(base) = (unsafe { cstring_base(s) }) else {
+            continue;
+        };
+        // SAFETY: `base` was just validated and is never freed under leak scan.
+        let rc = unsafe { with_cstring_refcount(base, |r| r.load(Ordering::Relaxed)) };
+        if rc == 0 {
+            continue;
         }
+        // SAFETY: `base` is the validated header for `s`.
+        let content = unsafe { with_cstring_preview(base, s, 40, preview_lossy) };
+        *counts.entry(format!("rc={} {:?}", rc, content)).or_insert(0) += 1;
     }
     let mut rows: Vec<(usize, String)> = counts.into_iter().map(|(k, v)| (v, k)).collect();
     rows.sort_by(|a, b| b.0.cmp(&a.0));
@@ -179,6 +216,11 @@ const CSTRING_HOOKS: u8 = crate::switches::PERF_STATS
 /// Allocate a heap cstring with `data_len` data bytes, refcount 1, and the
 /// trailing NUL already written. The caller fills bytes 0..data_len.
 pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
+    alloc_cstring_raw(data_len)
+}
+
+#[inline(always)]
+fn alloc_cstring_raw(data_len: usize) -> *mut i8 {
     if crate::switches::any(CSTRING_HOOKS) {
         return alloc_cstring_hooked(data_len);
     }
@@ -187,22 +229,28 @@ pub(crate) unsafe fn pith_alloc_cstring(data_len: usize) -> *mut i8 {
 
 #[cold]
 #[inline(never)]
-unsafe fn alloc_cstring_hooked(data_len: usize) -> *mut i8 {
+fn alloc_cstring_hooked(data_len: usize) -> *mut i8 {
     alloc_cstring::<true>(data_len)
 }
 
 #[inline(always)]
-unsafe fn alloc_cstring<const HOOKED: bool>(data_len: usize) -> *mut i8 {
+fn alloc_cstring<const HOOKED: bool>(data_len: usize) -> *mut i8 {
     if HOOKED {
         crate::alloc_sites::record("string");
         crate::perf_count(&crate::PERF_CSTRING_ALLOCS, 1);
     }
-    let base = pith_alloc(cstring_layout(data_len));
-    (base as *mut u32).write(CSTRING_MAGIC);
-    (base.add(4) as *mut u32).write(1);
-    (base.add(8) as *mut u64).write(data_len as u64);
-    let data = base.add(CSTRING_HEADER_SIZE) as *mut i8;
-    *data.add(data_len) = 0;
+    let layout = cstring_layout(data_len);
+    // SAFETY: `layout` has non-zero size `>= CSTRING_HEADER_SIZE + data_len + 1` and
+    // alignment `CSTRING_ALIGN` (8); initialize header fields and trailing NUL.
+    let data = unsafe {
+        let base = pith_alloc(layout);
+        (base as *mut u32).write(CSTRING_MAGIC);
+        (base.add(4) as *mut u32).write(1);
+        (base.add(8) as *mut u64).write(data_len as u64);
+        let data = base.add(CSTRING_HEADER_SIZE) as *mut i8;
+        *data.add(data_len) = 0;
+        data
+    };
     if !HOOKED {
         return data;
     }
@@ -220,7 +268,8 @@ unsafe fn alloc_cstring<const HOOKED: bool>(data_len: usize) -> *mut i8 {
 /// of the 16 bytes in front of it (mapped binary data) and fails the magic
 /// compare. Same practical-guard contract as the collection magic words.
 pub(crate) unsafe fn cstring_base(s: *const i8) -> Option<*mut u8> {
-    cstring_base_for::<true>(s, crate::quarantine::Op::Use)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { cstring_base_for::<true>(s, crate::quarantine::Op::Use) }
 }
 
 /// `cstring_base`, naming what the caller does with the string in a
@@ -232,55 +281,54 @@ unsafe fn cstring_base_for<const REPORT: bool>(s: *const i8, op: crate::quaranti
     if addr < CSTRING_HEADER_SIZE || addr % CSTRING_ALIGN != 0 {
         return None;
     }
-    let base = (s as *const u8).sub(CSTRING_HEADER_SIZE) as *mut u8;
     // volatile, because for a literal this reads memory outside the literal.
     // once the compiler can see the pointer (a runtime literal, inlined into
     // a caller), a plain read lets it assume the magic matched and write a
     // count into read-only data.
-    let magic = std::ptr::read_volatile(base as *const u32);
+    // SAFETY: `addr >= CSTRING_HEADER_SIZE` and 8-aligned; probe the header magic.
+    let (base, magic) = unsafe {
+        let base = (s as *const u8).sub(CSTRING_HEADER_SIZE) as *mut u8;
+        let magic = std::ptr::read_volatile(base as *const u32);
+        (base, magic)
+    };
     if magic != CSTRING_MAGIC {
         if REPORT {
-            crate::quarantine::miss(magic, base as *const u32, op);
+            // SAFETY: `base` is only used as a lookup key in quarantine reporting.
+            unsafe { crate::quarantine::miss(magic, base as *const u32, op) };
         }
         return None;
     }
     Some(base)
 }
 
-unsafe fn cstring_refcount(base: *mut u8) -> &'static AtomicU32 {
-    &*(base.add(4) as *const AtomicU32)
-}
-
 /// Bump the refcount of a heap cstring. No-op for literals and null.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_retain(s: *const i8) {
     if crate::switches::any(CSTRING_HOOKS) {
-        return cstring_retain_hooked(s);
+        // SAFETY: Preconditions forwarded from caller.
+        return unsafe { cstring_retain_hooked(s) };
     }
-    if let Some(base) = cstring_base_for::<false>(s, crate::quarantine::Op::Retain) {
-        cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
+    // SAFETY: `s` is validated by `cstring_base_for` before bumping its refcount.
+    if let Some(base) = unsafe { cstring_base_for::<false>(s, crate::quarantine::Op::Retain) } {
+        // SAFETY: `base` was just validated as a live heap cstring header.
+        unsafe { with_cstring_refcount(base, |rc| rc.fetch_add(1, Ordering::Relaxed)) };
     }
 }
 
 #[cold]
 #[inline(never)]
 unsafe fn cstring_retain_hooked(s: *const i8) {
-    if let Some(base) = cstring_base_for::<true>(s, crate::quarantine::Op::Retain) {
+    // SAFETY: Preconditions forwarded from caller.
+    if let Some(base) = unsafe { cstring_base_for::<true>(s, crate::quarantine::Op::Retain) } {
         crate::perf_count(&crate::PERF_CSTRING_RETAINS, 1);
-        let prev = cstring_refcount(base).fetch_add(1, Ordering::Relaxed);
-        cstring_watch(base, s, "retain", prev as i64, 1);
+        // SAFETY: `base` was just validated as a live heap cstring header.
+        let prev = unsafe { with_cstring_refcount(base, |rc| rc.fetch_add(1, Ordering::Relaxed)) };
+        // SAFETY: `base` is the validated header for `s` and remains live.
+        unsafe { cstring_watch(base, s, "retain", prev as i64, 1) };
     }
 }
 
-/// Debug: PITH_CSTRING_WATCH=<content> logs every rc operation on strings
-/// with that exact content, with the count before the op.
-#[inline(always)]
-unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delta: i64) {
-    let Some(needle) = debug_watch_needle() else {
-        return;
-    };
-    let data_len = cstring_data_len(base);
-    let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(64));
+fn cstring_watch_log(bytes: &[u8], needle: &str, s: *const i8, op: &str, prev: i64, delta: i64) {
     let content = String::from_utf8_lossy(bytes);
     // a trailing '*' makes the needle a prefix match
     let hit = match needle.strip_suffix('*') {
@@ -292,83 +340,106 @@ unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delt
     }
 }
 
+/// Debug: PITH_CSTRING_WATCH=<content> logs every rc operation on strings
+/// with that exact content, with the count before the op.
+#[inline(always)]
+unsafe fn cstring_watch(base: *const u8, s: *const i8, op: &str, prev: i64, delta: i64) {
+    let Some(needle) = debug_watch_needle() else {
+        return;
+    };
+    // SAFETY: Caller guarantees `base` is the live header for `s`.
+    unsafe { with_cstring_preview(base, s, 64, |b| cstring_watch_log(b, needle, s, op, prev, delta)) };
+}
+
 /// Drop one count; free the allocation when the last count dies. The magic
 /// is scrubbed before the free so a stale pointer fails the header check
 /// instead of double-freeing. No-op for literals and null.
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_release(s: *const i8) {
     if crate::switches::any(CSTRING_HOOKS) {
-        return cstring_release_hooked(s);
+        // SAFETY: Preconditions forwarded from caller.
+        return unsafe { cstring_release_hooked(s) };
     }
-    cstring_release::<false>(s);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { cstring_release::<false>(s) };
 }
 
 #[cold]
 #[inline(never)]
 unsafe fn cstring_release_hooked(s: *const i8) {
-    cstring_release::<true>(s);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { cstring_release::<true>(s) };
 }
 
 #[inline(always)]
 unsafe fn cstring_release<const HOOKED: bool>(s: *const i8) {
-    if let Some(base) = cstring_base_for::<HOOKED>(s, crate::quarantine::Op::Release) {
+    // SAFETY: `s` is validated by `cstring_base_for` before decrementing its refcount.
+    let Some(base) = (unsafe { cstring_base_for::<HOOKED>(s, crate::quarantine::Op::Release) }) else {
+        return;
+    };
+    if HOOKED {
+        crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
+    }
+    // SAFETY: `base` was just validated and the caller holds a count on it.
+    let prev = unsafe { with_cstring_refcount(base, count_release) };
+    if HOOKED {
+        // SAFETY: `base` is still valid until deallocated below.
+        unsafe { cstring_watch(base, s, "release", prev as i64, -1) };
+    }
+    if prev == 0 {
+        // an over-release means the emitter's ownership accounting is
+        // wrong somewhere; report it loudly in debug runs instead of
+        // corrupting the heap.
         if HOOKED {
-            crate::perf_count(&crate::PERF_CSTRING_RELEASES, 1);
+            crate::quarantine::over_release(crate::quarantine::Kind::String);
         }
-        let prev = count_release(cstring_refcount(base));
-        if HOOKED {
-            cstring_watch(base, s, "release", prev as i64, -1);
+        if HOOKED && cstring_debug_no_free() {
+            // SAFETY: `base` is the validated header for `s` and is kept alive under no-free.
+            let content = unsafe { with_cstring_preview(base, s, 60, preview_lossy) };
+            eprintln!("pith debug: cstring over-release: {:?}", content);
         }
-        if prev == 0 {
-            // an over-release means the emitter's ownership accounting is
-            // wrong somewhere; report it loudly in debug runs instead of
-            // corrupting the heap.
-            if HOOKED {
-                crate::quarantine::over_release(crate::quarantine::Kind::String);
+        // SAFETY: Restore zero refcount on over-release without freeing.
+        unsafe { with_cstring_refcount(base, |rc| rc.store(0, Ordering::Relaxed)) };
+        return;
+    }
+    if prev == 1 {
+        // SAFETY: Last release; synchronize prior releases before freeing.
+        unsafe { with_cstring_refcount(base, acquire_last_u32) };
+        let needle = if HOOKED { debug_trace_needle() } else { None };
+        if let Some(needle) = needle {
+            // SAFETY: Sole owner; `base` is still live before free.
+            let content = unsafe { with_cstring_preview(base, s, 40, preview_lossy) };
+            if content == needle {
+                eprintln!("pith trace: final release of {:?} at {:p}", content, s);
             }
-            if HOOKED && cstring_debug_no_free() {
-                let data_len = cstring_data_len(base);
-                let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(60));
-                eprintln!(
-                    "pith debug: cstring over-release: {:?}",
-                    String::from_utf8_lossy(bytes)
-                );
+        }
+        // SAFETY: Sole owner; read recorded byte length from header.
+        let data_len = unsafe { cstring_data_len(base) };
+        if HOOKED && cstring_debug_no_free() {
+            // scrub instead of freeing: a read-after-release shows up
+            // as '!' runs in program output instead of silent reuse
+            if debug_scrub_log() {
+                // SAFETY: Sole owner; preview bytes before scrubbing.
+                let content = unsafe { with_cstring_preview(base, s, 24, preview_lossy) };
+                eprintln!("scrub {:p} len={} {:?}", s, data_len, content);
             }
-            cstring_refcount(base).store(0, Ordering::Relaxed);
+            // SAFETY: Sole owner; `s` has `data_len` writable bytes.
+            unsafe { std::ptr::write_bytes(s as *mut u8, b'!', data_len) };
             return;
         }
-        if prev == 1 {
-            acquire_last_count!(cstring_refcount(base));
-            let needle = if HOOKED { debug_trace_needle() } else { None };
-            if let Some(needle) = needle {
-                let data_len = cstring_data_len(base);
-                let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(40));
-                let content = String::from_utf8_lossy(bytes);
-                if content == needle {
-                    eprintln!("pith trace: final release of {:?} at {:p}", content, s);
-                }
-            }
-            if HOOKED && cstring_debug_no_free() {
-                // scrub instead of freeing: a read-after-release shows up
-                // as '!' runs in program output instead of silent reuse
-                let data_len = cstring_data_len(base);
-                if debug_scrub_log() {
-                    let bytes = std::slice::from_raw_parts(s as *const u8, data_len.min(24));
-                    eprintln!("scrub {:p} len={} {:?}", s, data_len, String::from_utf8_lossy(bytes));
-                }
-                std::ptr::write_bytes(s as *mut u8, b'!', data_len);
+        if HOOKED {
+            crate::perf_count(&crate::PERF_CSTRING_FREES, 1);
+            let size = cstring_alloc_size(data_len);
+            // SAFETY: Sole owner; `base..base+size` is writable and magic is at `base`.
+            if unsafe { crate::quarantine::bury(base, size, base as *mut u32, crate::quarantine::Kind::String) } {
                 return;
             }
-            let data_len = cstring_data_len(base);
-            if HOOKED {
-                crate::perf_count(&crate::PERF_CSTRING_FREES, 1);
-                let size = cstring_alloc_size(data_len);
-                if crate::quarantine::bury(base, size, base as *mut u32, crate::quarantine::Kind::String) {
-                    return;
-                }
-            }
+        }
+        let layout = cstring_layout(data_len);
+        // SAFETY: Sole owner; scrub magic and deallocate with the layout used to allocate `base`.
+        unsafe {
             (base as *mut u32).write(0);
-            std::alloc::dealloc(base, cstring_layout(data_len));
+            std::alloc::dealloc(base, layout);
         }
     }
 }
@@ -422,7 +493,10 @@ fn cstring_debug_no_free() -> bool {
 /// Test-only view of a heap cstring's refcount (None for literals/null).
 #[cfg(test)]
 pub(crate) unsafe fn cstring_refcount_for_tests(s: *const i8) -> Option<u32> {
-    cstring_base(s).map(|base| cstring_refcount(base).load(Ordering::Relaxed))
+    // SAFETY: Preconditions forwarded from test caller.
+    let base = unsafe { cstring_base(s) }?;
+    // SAFETY: `base` was just validated as a live cstring header.
+    Some(unsafe { with_cstring_refcount(base, |rc| rc.load(Ordering::Relaxed)) })
 }
 
 /// O(1) length from the header of a heap cstring or a compiled literal; None
@@ -432,12 +506,17 @@ pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
     if addr < CSTRING_HEADER_SIZE || addr % CSTRING_ALIGN != 0 {
         return None;
     }
-    let base = (s as *const u8).sub(CSTRING_HEADER_SIZE);
-    let magic = (base as *const u32).read();
+    // SAFETY: `addr >= CSTRING_HEADER_SIZE` and 8-aligned; probe the header magic.
+    let (base, magic) = unsafe {
+        let base = (s as *const u8).sub(CSTRING_HEADER_SIZE);
+        let magic = (base as *const u32).read();
+        (base, magic)
+    };
     if magic != CSTRING_MAGIC && magic != CSTRING_STATIC_MAGIC {
         return None;
     }
-    Some(cstring_data_len(base) as i64)
+    // SAFETY: Magic matched a valid heap or static cstring header.
+    Some(unsafe { cstring_data_len(base) } as i64)
 }
 
 /// Under quarantine, report `s` if it is a freed heap string. A reader whose
@@ -447,17 +526,20 @@ pub(crate) unsafe fn cstring_header_len(s: *const i8) -> Option<i64> {
 #[inline(never)]
 pub(crate) unsafe fn cstring_check_freed(s: *const i8) {
     if crate::quarantine::on() {
-        cstring_base(s);
+        // SAFETY: Preconditions forwarded from caller; reports freed heap strings under quarantine.
+        unsafe { cstring_base(s) };
     }
 }
 
-pub(crate) unsafe fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
-    let ptr = pith_alloc_cstring(bytes.len());
-    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len());
+pub(crate) fn pith_copy_bytes_to_cstring(bytes: &[u8]) -> *mut i8 {
+    let ptr = alloc_cstring_raw(bytes.len());
+    // SAFETY: `alloc_cstring_raw` returns a fresh writable buffer of at least `bytes.len() + 1` bytes
+    // that does not alias `bytes`, with the trailing NUL already written.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr as *mut u8, bytes.len()) };
     ptr
 }
 
-pub(crate) unsafe fn pith_cstring_empty() -> *mut i8 {
+pub(crate) fn pith_cstring_empty() -> *mut i8 {
     CSTRING_EMPTY.bytes.as_ptr() as *mut i8
 }
 
@@ -667,64 +749,106 @@ impl PithClosure {
         }
     }
 
-    /// `captures`, but with the slots writable: the cycle env release
-    /// blanks each slot after dropping its count so the later shell free
-    /// can never release it a second time. Same walk order.
-    fn captures_mut(&mut self) -> impl Iterator<Item = (&mut i64, &mut u8)> {
-        self.env
+    /// Copy every capture out in walk order and blank the slots so a later
+    /// shell free (or cyclic back-edge release) can never release them a
+    /// second time.
+    fn take_captures(&mut self) -> ([Capture; PITH_CLOSURE_ENV_SLOTS], Vec<Capture>) {
+        let mut inline = [Capture { value: 0, tag: 0 }; PITH_CLOSURE_ENV_SLOTS];
+        for ((dst, value), tag) in inline
             .iter_mut()
+            .zip(self.env.iter_mut())
             .zip(self.env_tags.iter_mut())
-            .chain(self.overflow.iter_mut().flat_map(|overflow| {
-                overflow.captures.iter_mut().map(|c| (&mut c.value, &mut c.tag))
-            }))
+        {
+            *dst = Capture {
+                value: *value,
+                tag: *tag,
+            };
+            *value = 0;
+            *tag = 0;
+        }
+        let spill = match &mut self.overflow {
+            Some(overflow) => {
+                let mut out = Vec::with_capacity(overflow.captures.len());
+                for c in &mut overflow.captures {
+                    out.push(*c);
+                    c.value = 0;
+                    c.tag = 0;
+                }
+                out
+            }
+            None => Vec::new(),
+        };
+        (inline, spill)
     }
 }
 
-/// Validate a closure handle by its magic word. Returns the typed
-/// pointer only when the handle is non-null, aligned, and still carries
-/// the magic. This is the lock-free equivalent of the old registry lookup.
-/// Same practical-guard contract as the string and struct magic words:
-/// a stale pointer whose magic was scrubbed on free reads as invalid.
-unsafe fn closure_base<'a>(handle: i64) -> Option<&'a PithClosure> {
-    closure_base_for(handle, crate::quarantine::Op::Use)
-}
-
-/// `closure_base`, naming what the caller does with the closure in a
-/// quarantine report.
+/// Validate a closure handle by its magic word for `op` and borrow it for the
+/// duration of `f`. This is the lock-free equivalent of the old registry lookup:
+/// a stale pointer whose magic was scrubbed on free reads as invalid, and the
+/// borrow cannot escape `f`.
 #[inline(always)]
-unsafe fn closure_base_for<'a>(handle: i64, op: crate::quarantine::Op) -> Option<&'a PithClosure> {
+unsafe fn with_closure_for<R>(
+    handle: i64,
+    op: crate::quarantine::Op,
+    f: impl FnOnce(&PithClosure) -> R,
+) -> Option<R> {
     if handle == 0 || (handle as u64) % 8 != 0 {
         return None;
     }
     let ptr = handle as *const PithClosure;
-    let magic = (ptr as *const u32).read();
+    // SAFETY: Non-null 8-aligned pointer; magic word sits at offset 0 of `PithClosure`.
+    let magic = unsafe { std::ptr::addr_of!((*ptr).magic).read() };
     if magic != CLOSURE_MAGIC {
-        crate::quarantine::miss(magic, ptr as *const u32, op);
+        // SAFETY: `ptr` is only used as a lookup key in quarantine reporting.
+        unsafe { crate::quarantine::miss(magic, std::ptr::addr_of!((*ptr).magic), op) };
         return None;
     }
-    Some(&*ptr)
+    // SAFETY: Magic word matched `CLOSURE_MAGIC`; caller guarantees handle stays live for `f`.
+    let closure = unsafe { &*ptr };
+    Some(f(closure))
+}
+
+/// Validate a closure handle and borrow it immutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_closure<R>(handle: i64, f: impl FnOnce(&PithClosure) -> R) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_closure_for(handle, crate::quarantine::Op::Use, f) }
+}
+
+/// Validate a closure handle and borrow it mutably for the duration of `f`.
+#[inline(always)]
+unsafe fn with_closure_mut<R>(handle: i64, f: impl FnOnce(&mut PithClosure) -> R) -> Option<R> {
+    if handle == 0 || (handle as u64) % 8 != 0 {
+        return None;
+    }
+    let ptr = handle as *mut PithClosure;
+    // SAFETY: Non-null 8-aligned pointer; magic word sits at offset 0 of `PithClosure`.
+    let magic = unsafe { std::ptr::addr_of!((*ptr).magic).read() };
+    if magic != CLOSURE_MAGIC {
+        // SAFETY: `ptr` is only used as a lookup key in quarantine reporting.
+        unsafe { crate::quarantine::miss(magic, std::ptr::addr_of!((*ptr).magic), crate::quarantine::Op::Use) };
+        return None;
+    }
+    // SAFETY: Magic word matched `CLOSURE_MAGIC`; caller guarantees exclusive access for `f`.
+    let closure = unsafe { &mut *ptr };
+    Some(f(closure))
 }
 
 unsafe fn release_captured_value(value: i64, tag: u8) {
+    // SAFETY: Caller guarantees `value` holds one refcount of the kind named by `tag`.
     match tag {
-        CLOSURE_TAG_STRING => pith_cstring_release(value as *const i8),
-        CLOSURE_TAG_LIST => crate::collections::list::pith_list_release_handle(value),
-        CLOSURE_TAG_MAP => crate::collections::map::pith_map_release_handle(value),
-        CLOSURE_TAG_SET => crate::collections::set::pith_set_release_handle(value),
-        CLOSURE_TAG_BYTES => crate::bytes::pith_bytes_release(value),
-        CLOSURE_TAG_STRUCT => pith_struct_release(value),
-        CLOSURE_TAG_CLOSURE => pith_closure_release(value),
-        CLOSURE_TAG_WEAK => pith_struct_weak_release(value),
-        CLOSURE_TAG_CHANNEL => crate::concurrency::channel::pith_channel_release(value),
-        CLOSURE_TAG_SYNC => crate::concurrency::sync_handle::pith_sync_release(value),
+        CLOSURE_TAG_STRING => unsafe { pith_cstring_release(value as *const i8) },
+        CLOSURE_TAG_LIST => unsafe { crate::collections::list::pith_list_release_handle(value) },
+        CLOSURE_TAG_MAP => unsafe { crate::collections::map::pith_map_release_handle(value) },
+        CLOSURE_TAG_SET => unsafe { crate::collections::set::pith_set_release_handle(value) },
+        CLOSURE_TAG_BYTES => unsafe { crate::bytes::pith_bytes_release(value) },
+        CLOSURE_TAG_STRUCT => unsafe { pith_struct_release(value) },
+        CLOSURE_TAG_CLOSURE => unsafe { pith_closure_release(value) },
+        CLOSURE_TAG_WEAK => unsafe { pith_struct_weak_release(value) },
+        CLOSURE_TAG_CHANNEL => unsafe { crate::concurrency::channel::pith_channel_release(value) },
+        CLOSURE_TAG_SYNC => unsafe { crate::concurrency::sync_handle::pith_sync_release(value) },
         _ => {}
     }
-}
-
-/// `closure_base`, with the closure writable.
-unsafe fn closure_base_mut<'a>(handle: i64) -> Option<&'a mut PithClosure> {
-    closure_base(handle)?;
-    Some(&mut *(handle as *mut PithClosure))
 }
 
 #[no_mangle]
@@ -739,6 +863,7 @@ pub extern "C" fn pith_closure_new(func_ptr: i64) -> i64 {
     let pooled = closure_pool_take();
     if !pooled.is_null() {
         let ptr = pooled as *mut PithClosure;
+        // SAFETY: `pooled` is an unowned recycled `PithClosure` allocation.
         unsafe { ptr.write(fresh_closure(func_ptr)) };
         return ptr as i64;
     }
@@ -773,7 +898,8 @@ fn closure_pool_take() -> *mut u8 {
     if slot.is_null() {
         return std::ptr::null_mut();
     }
-    unsafe { (*slot).closures.pop().unwrap_or(std::ptr::null_mut()) }
+    // SAFETY: `slot` is non-null and exclusively owned by this thread while active.
+    unsafe { (*slot).closures.pop() }.unwrap_or(std::ptr::null_mut())
 }
 
 /// Recycle a dead closure shell, or hand it back to the allocator. The
@@ -781,19 +907,22 @@ fn closure_pool_take() -> *mut u8 {
 /// everything else is plain data the next construction overwrites.
 unsafe fn closure_free_shell(handle: i64) {
     let ptr = handle as *mut PithClosure;
-    std::ptr::drop_in_place(&mut (*ptr).overflow);
+    // SAFETY: Sole owner after magic scrub; drop only the `overflow` spill storage.
+    unsafe { std::ptr::drop_in_place(std::ptr::addr_of_mut!((*ptr).overflow)) };
     let size = std::mem::size_of::<PithClosure>();
-    if crate::quarantine::bury(ptr as *mut u8, size, ptr as *mut u32, crate::quarantine::Kind::Closure) {
+    // SAFETY: `ptr..ptr+size` is writable and magic sits at offset 0.
+    if unsafe { crate::quarantine::bury(ptr as *mut u8, size, ptr as *mut u32, crate::quarantine::Kind::Closure) } {
         return;
     }
     if struct_pool_enabled() {
         let slot = pool_slot();
-        if !slot.is_null() && (*slot).closures.len() < CLOSURE_POOL_CAP {
-            (*slot).closures.push(ptr as *mut u8);
+        // SAFETY: `slot` is non-null and exclusively owned by this thread while active.
+        if !slot.is_null() && unsafe { (*slot).try_push_closure(ptr as *mut u8) } {
             return;
         }
     }
-    std::alloc::dealloc(ptr as *mut u8, std::alloc::Layout::new::<PithClosure>());
+    // SAFETY: `ptr` was originally allocated via `Box::new(PithClosure { .. })`.
+    unsafe { std::alloc::dealloc(ptr as *mut u8, std::alloc::Layout::new::<PithClosure>()) };
 }
 
 /// One more owner of this closure.
@@ -803,32 +932,24 @@ unsafe fn closure_free_shell(handle: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_retain(handle: i64) {
     crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RETAIN);
-    if let Some(closure) = closure_base_for(handle, crate::quarantine::Op::Retain) {
-        closure
-            .ref_count
-            .fetch_add(1, Ordering::Relaxed);
-    }
+    // SAFETY: `handle` is validated by `with_closure_for` before bumping its refcount.
+    unsafe { with_closure_for(handle, crate::quarantine::Op::Retain, |c| c.ref_count.fetch_add(1, Ordering::Relaxed)) };
 }
 
-/// Drop one owner; the last release drops the counts the closure took
-/// on its captured values, then frees the closure. Closures once
-/// allocated with no release path at all, and leaked their environments.
-///
-/// # Safety
-/// handle must be a valid closure handle or garbage (magic-checked).
-#[no_mangle]
-pub unsafe extern "C" fn pith_closure_release(handle: i64) {
-    crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RELEASE);
-    let Some(closure) = closure_base_for(handle, crate::quarantine::Op::Release) else {
-        return;
-    };
+enum ClosureReleaseAction {
+    Keep,
+    Retire { buffered: bool },
+}
+
+#[inline(always)]
+fn closure_release_step(closure: &PithClosure) -> ClosureReleaseAction {
     // cycle-gc suspect hook, before our count is given up: while we still
     // hold it the closure cannot die under the hook, which is what makes
     // marking it safe against a concurrent final release (see
     // `maybe_suspect_struct` for the full argument).
     let gc = crate::cycle::cycle_gc_enabled();
     if gc && closure.ref_count.load(Ordering::Relaxed) > 1 {
-        maybe_suspect_closure(closure, handle);
+        maybe_suspect_closure(closure);
     }
     // a count of one is ours alone: no other owner is left to retain or
     // release concurrently. so the last release of a closure that never
@@ -842,45 +963,56 @@ pub unsafe extern "C" fn pith_closure_release(handle: i64) {
         closure.ref_count.store(0, Ordering::Relaxed);
         1
     } else {
-        closure
-            .ref_count
-            .fetch_sub(1, Ordering::Release)
+        closure.ref_count.fetch_sub(1, Ordering::Release)
     };
     if prev > 1 {
-        return;
+        return ClosureReleaseAction::Keep;
     }
     if prev <= 0 {
         crate::quarantine::over_release(crate::quarantine::Kind::Closure);
         // over-release: restore and leave it alone
-        closure
-            .ref_count
-            .fetch_add(1, Ordering::Relaxed);
-        return;
+        closure.ref_count.fetch_add(1, Ordering::Relaxed);
+        return ClosureReleaseAction::Keep;
     }
     acquire_last_count!(closure.ref_count);
     closure.release_captures();
-    retire_closure_shell(closure, handle);
+    let buffered = closure.cycle_flags.load(Ordering::Relaxed) & CLOSURE_BUFFERED_FLAG != 0;
+    ClosureReleaseAction::Retire { buffered }
+}
+
+/// Drop one owner; the last release drops the counts the closure took
+/// on its captured values, then frees the closure. Closures once
+/// allocated with no release path at all, and leaked their environments.
+///
+/// # Safety
+/// handle must be a valid closure handle or garbage (magic-checked).
+#[no_mangle]
+pub unsafe extern "C" fn pith_closure_release(handle: i64) {
+    crate::perf::perf_rc_op(crate::perf::RC_CLOSURE_RELEASE);
+    // SAFETY: `handle` is validated by `with_closure_for` before decrementing its refcount.
+    let action = unsafe { with_closure_for(handle, crate::quarantine::Op::Release, closure_release_step) };
+    if let Some(ClosureReleaseAction::Retire { buffered }) = action {
+        // SAFETY: Last release; `&PithClosure` borrow has ended so scrubbing and freeing cannot alias.
+        unsafe { retire_closure_shell(handle, buffered) };
+    }
 }
 
 /// The end of a closure whose captures are already released: scrub the
-/// magic so a stale handle fails closure_base, then free the shell. A
+/// magic so a stale handle fails `with_closure_for`, then free the shell. A
 /// closure that dies while the suspect buffer points at it parks its shell
 /// in the graveyard instead, so the buffered entry never dangles; the
 /// scrubbed magic keeps that handle from validating, and the next collection
 /// frees the shell.
 #[inline(always)]
-unsafe fn retire_closure_shell(closure: &PithClosure, handle: i64) {
-    let buffered = closure
-        .cycle_flags
-        .load(Ordering::Relaxed)
-        & CLOSURE_BUFFERED_FLAG
-        != 0;
-    (handle as *mut u32).write(0);
+unsafe fn retire_closure_shell(handle: i64, buffered: bool) {
+    // SAFETY: Sole owner after last release; no `&PithClosure` borrow is live.
+    unsafe { (handle as *mut u32).write(0) };
     if buffered && crate::cycle::cycle_gc_enabled() {
         crate::cycle::graveyard_defer(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
         return;
     }
-    closure_free_shell(handle);
+    // SAFETY: Sole owner and not deferred to graveyard; recycle or deallocate shell.
+    unsafe { closure_free_shell(handle) };
 }
 
 /// Mark a closure as a cycle suspect and hand it to the buffer. Outlined and
@@ -888,7 +1020,7 @@ unsafe fn retire_closure_shell(closure: &PithClosure, handle: i64) {
 /// must stay frameless when the flag is off.
 #[cold]
 #[inline(never)]
-unsafe fn maybe_suspect_closure(closure: &PithClosure, handle: i64) {
+fn maybe_suspect_closure(closure: &PithClosure) {
     if closure
         .cycle_flags
         .fetch_or(CLOSURE_BUFFERED_FLAG, Ordering::Relaxed)
@@ -897,17 +1029,17 @@ unsafe fn maybe_suspect_closure(closure: &PithClosure, handle: i64) {
     {
         return; // already buffered
     }
-    crate::cycle::cycle_suspect(handle as usize, crate::cycle::CYCLE_KIND_CLOSURE);
+    // SAFETY: Caller holds a strong count on this live `PithClosure` and just set its
+    // buffered bit; its address is the closure handle.
+    let handle = closure as *const PithClosure as usize;
+    unsafe { crate::cycle::cycle_suspect(handle, crate::cycle::CYCLE_KIND_CLOSURE) };
 }
 
 /// Drop a closure's buffered mark (overflow, or a collector drain). Magic-
 /// checked, so a closure that already died and was freed is a no-op.
 pub(crate) unsafe fn cycle_clear_closure_buffered(handle: i64) {
-    if let Some(closure) = closure_base(handle) {
-        closure
-            .cycle_flags
-            .fetch_and(!CLOSURE_BUFFERED_FLAG, Ordering::Relaxed);
-    }
+    // SAFETY: Preconditions forwarded from cycle collector.
+    unsafe { with_closure(handle, |c| c.cycle_flags.fetch_and(!CLOSURE_BUFFERED_FLAG, Ordering::Relaxed)) };
 }
 
 // --- collector-facing closure accessors -------------------------------------
@@ -920,45 +1052,33 @@ pub(crate) unsafe fn cycle_clear_closure_buffered(handle: i64) {
 /// The closure's current reference count, or `None` when the handle no longer
 /// validates (the closure died and its magic was scrubbed).
 pub(crate) unsafe fn cycle_closure_strong_count(handle: i64) -> Option<i64> {
-    closure_base(handle).map(|closure| {
-        closure
-            .ref_count
-            .load(Ordering::Relaxed)
-    })
+    // SAFETY: Preconditions forwarded from cycle collector.
+    unsafe { with_closure(handle, |c| c.ref_count.load(Ordering::Relaxed)) }
 }
 
 /// Add `delta` to the closure's reference count. The collector's teardown
 /// guard: a huge bias keeps releases from other dying objects from ever
 /// reaching this closure's death path while the collector owns it.
 pub(crate) unsafe fn cycle_closure_guard_strong(handle: i64, delta: i64) {
-    if let Some(closure) = closure_base(handle) {
-        closure
-            .ref_count
-            .fetch_add(delta, Ordering::Relaxed);
-    }
+    // SAFETY: Preconditions forwarded from cycle collector.
+    unsafe { with_closure(handle, |c| c.ref_count.fetch_add(delta, Ordering::Relaxed)) };
+}
+
+fn mark_closure_shared_impl(closure: &PithClosure) -> bool {
+    closure
+        .cycle_flags
+        .fetch_or(crate::share::CONTAINER_SHARED_FLAG, Ordering::Release)
+        & crate::share::CONTAINER_SHARED_FLAG
+        == 0
 }
 
 /// Mark the closure shared (see `share.rs`); true when this call set the mark.
 pub(crate) unsafe fn closure_mark_shared(handle: i64) -> bool {
-    match closure_base(handle) {
-        Some(closure) => {
-            closure
-                .cycle_flags
-                .fetch_or(crate::share::CONTAINER_SHARED_FLAG, Ordering::Release)
-                & crate::share::CONTAINER_SHARED_FLAG
-                == 0
-        }
-        None => false,
-    }
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_closure(handle, mark_closure_shared_impl) }.unwrap_or(false)
 }
 
-/// Report every captured value that carries a count, as (value, env tag).
-/// Weak captures (tag 8) are reported too, and the caller filters them: they
-/// hold no strong count and are not edges of the ownership graph.
-pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
-    let Some(closure) = closure_base(handle) else {
-        return;
-    };
+fn walk_closure_children(closure: &PithClosure, f: &mut dyn FnMut(i64, u8)) {
     // a closure over plain values only (every spawn of `f(i, n)`, say) has no
     // tagged slot: two word reads answer that without walking all sixteen
     if closure.overflow.is_none() && closure.env_tags.iter().all(|&tag| tag == 0) {
@@ -971,17 +1091,28 @@ pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, 
     }
 }
 
+/// Report every captured value that carries a count, as (value, env tag).
+/// Weak captures (tag 8) are reported too, and the caller filters them: they
+/// hold no strong count and are not edges of the ownership graph.
+pub(crate) unsafe fn cycle_closure_children(handle: i64, f: &mut dyn FnMut(i64, u8)) {
+    // SAFETY: Preconditions forwarded from cycle collector / share walk.
+    unsafe { with_closure(handle, |c| walk_closure_children(c, f)) };
+}
+
 /// The destruction body of a garbage closure: drop the counts it took on its
 /// captures, exactly as the last release would, then blank the slots so the
 /// shell free below can never release them a second time.
 pub(crate) unsafe fn cycle_closure_release_env(handle: i64) {
-    let Some(closure) = closure_base_mut(handle) else {
+    // SAFETY: Collector runs with mutators stopped; blank slots while holding `&mut`,
+    // then drop the borrow before releasing captures so cyclic back-edges cannot alias it.
+    let Some((inline, spill)) = (unsafe { with_closure_mut(handle, PithClosure::take_captures) }) else {
         return;
     };
-    for (value, tag) in closure.captures_mut() {
-        release_captured_value(*value, *tag);
-        *value = 0;
-        *tag = 0;
+    for capture in inline.into_iter().chain(spill) {
+        if capture.tag != 0 {
+            // SAFETY: Non-zero tag marks a captured value holding one refcount.
+            unsafe { release_captured_value(capture.value, capture.tag) };
+        }
     }
 }
 
@@ -990,36 +1121,42 @@ pub(crate) unsafe fn cycle_closure_release_env(handle: i64) {
 /// A shell whose buffered bit was set during teardown (a release hook fired
 /// on the collector thread) parks in the graveyard.
 pub(crate) unsafe fn cycle_closure_free_dead(handle: i64) {
-    let Some(closure) = closure_base(handle) else {
+    // SAFETY: Preconditions forwarded from cycle collector.
+    let Some(buffered) = (unsafe {
+        with_closure(handle, |c| c.cycle_flags.load(Ordering::Relaxed) & CLOSURE_BUFFERED_FLAG != 0)
+    }) else {
         return;
     };
-    retire_closure_shell(closure, handle);
+    // SAFETY: Collector owns this dead shell and the shared borrow above has ended.
+    unsafe { retire_closure_shell(handle, buffered) };
 }
 
 /// Drop a closure shell the graveyard parked. The magic is already scrubbed
 /// and the captures already released, so only the box itself remains.
 pub(crate) unsafe fn cycle_drop_closure_shell(ptr: usize) {
     let closure = ptr as *mut PithClosure;
-    crate::quarantine::free_box(closure, closure as *mut u32, crate::quarantine::Kind::Closure);
+    // SAFETY: Graveyard owns this boxed shell; magic sits at offset 0.
+    unsafe { crate::quarantine::free_box(closure, closure as *mut u32, crate::quarantine::Kind::Closure) };
 }
 
 #[cfg(test)]
 pub(crate) unsafe fn closure_buffered_for_tests(handle: i64) -> bool {
-    closure_base(handle).is_some_and(|closure| {
-        closure
-            .cycle_flags
-            .load(Ordering::Relaxed)
-            & CLOSURE_BUFFERED_FLAG
-            != 0
-    })
+    // SAFETY: Preconditions forwarded from test caller.
+    unsafe { with_closure(handle, |c| c.cycle_flags.load(Ordering::Relaxed) & CLOSURE_BUFFERED_FLAG != 0) }
+        .unwrap_or(false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_closure_get_fn(handle: i64) -> i64 {
-    if let Some(closure) = closure_base(handle) {
-        closure.func_ptr
-    } else {
-        0
+    // SAFETY: `handle` is validated by `with_closure` before reading `func_ptr`.
+    unsafe { with_closure(handle, |c| c.func_ptr) }.unwrap_or(0)
+}
+
+#[inline(always)]
+fn closure_set_env_impl(closure: &mut PithClosure, slot: EnvSlot, value: i64) {
+    match slot {
+        EnvSlot::Inline(idx) => closure.env[idx] = value,
+        EnvSlot::Spill(idx) => closure.spill_capture(idx).value = value,
     }
 }
 
@@ -1028,10 +1165,21 @@ pub unsafe extern "C" fn pith_closure_set_env(handle: i64, slot: i64, value: i64
     let Some(slot) = EnvSlot::classify(slot) else {
         return;
     };
-    if let Some(closure) = closure_base_mut(handle) {
-        match slot {
-            EnvSlot::Inline(idx) => closure.env[idx] = value,
-            EnvSlot::Spill(idx) => closure.spill_capture(idx).value = value,
+    // SAFETY: `handle` is validated by `with_closure_mut`; construction-time exclusive access.
+    unsafe { with_closure_mut(handle, |c| closure_set_env_impl(c, slot, value)) };
+}
+
+#[inline(always)]
+fn closure_set_env_rc_impl(closure: &mut PithClosure, slot: EnvSlot, value: i64, tag: u8) {
+    match slot {
+        EnvSlot::Inline(idx) => {
+            closure.env[idx] = value;
+            closure.env_tags[idx] = tag;
+        }
+        EnvSlot::Spill(idx) => {
+            let capture = closure.spill_capture(idx);
+            capture.value = value;
+            capture.tag = tag;
         }
     }
 }
@@ -1047,29 +1195,12 @@ pub unsafe extern "C" fn pith_closure_set_env_rc(handle: i64, slot: i64, value: 
     let Some(slot) = EnvSlot::classify(slot) else {
         return;
     };
-    if let Some(closure) = closure_base_mut(handle) {
-        match slot {
-            EnvSlot::Inline(idx) => {
-                closure.env[idx] = value;
-                closure.env_tags[idx] = tag as u8;
-            }
-            EnvSlot::Spill(idx) => {
-                let capture = closure.spill_capture(idx);
-                capture.value = value;
-                capture.tag = tag as u8;
-            }
-        }
-    }
+    // SAFETY: `handle` is validated by `with_closure_mut`; construction-time exclusive access.
+    unsafe { with_closure_mut(handle, |c| closure_set_env_rc_impl(c, slot, value, tag as u8)) };
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_closure_get_env(handle: i64, slot: i64) -> i64 {
-    let Some(slot) = EnvSlot::classify(slot) else {
-        return 0;
-    };
-    let Some(closure) = closure_base(handle) else {
-        return 0;
-    };
+#[inline(always)]
+fn closure_get_env_impl(closure: &PithClosure, slot: EnvSlot) -> i64 {
     match slot {
         EnvSlot::Inline(idx) => closure.env[idx],
         // an unwritten (or never-spilled) slot answers 0, like an
@@ -1083,13 +1214,23 @@ pub unsafe extern "C" fn pith_closure_get_env(handle: i64, slot: i64) -> i64 {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn pith_closure_get_env(handle: i64, slot: i64) -> i64 {
+    let Some(slot) = EnvSlot::classify(slot) else {
+        return 0;
+    };
+    // SAFETY: `handle` is validated by `with_closure` before reading its env.
+    unsafe { with_closure(handle, |c| closure_get_env_impl(c, slot)) }.unwrap_or(0)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn pith_print(s: string::PithString) {
-    if s.ptr.is_null() || s.len == 0 {
+    if s.ptr.is_null() || s.len <= 0 {
         println!();
         return;
     }
 
-    let slice = std::slice::from_raw_parts(s.ptr, s.len as usize);
+    // SAFETY: Caller guarantees `s.ptr` is valid for `s.len` readable bytes.
+    let slice = unsafe { std::slice::from_raw_parts(s.ptr, s.len as usize) };
     if let Ok(str_ref) = std::str::from_utf8(slice) {
         println!("{}", str_ref);
     } else {
@@ -1102,19 +1243,24 @@ mod tests {
     use super::*;
 
     unsafe fn heap_refcount(s: *const i8) -> u32 {
-        let base = (s as *const u8).sub(CSTRING_HEADER_SIZE);
-        (base.add(4) as *const u32).read()
+        unsafe {
+            let base = (s as *const u8).sub(CSTRING_HEADER_SIZE);
+            (base.add(4) as *const u32).read()
+        }
     }
 
     unsafe fn text(s: *const i8) -> String {
         let len = string::pith_cstring_len(s) as usize;
-        String::from_utf8_lossy(std::slice::from_raw_parts(s as *const u8, len)).into_owned()
+        let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
+        String::from_utf8_lossy(bytes).into_owned()
     }
 
     unsafe fn append(base: *const i8, parts: &[*const i8]) -> *mut i8 {
         let mut p = [std::ptr::null(); APPEND_MANY_MAX];
         p[..parts.len()].copy_from_slice(parts);
-        pith_cstring_append_many(parts.len() as i64, base, p[0], p[1], p[2], p[3], p[4], p[5], p[6])
+        unsafe {
+            pith_cstring_append_many(parts.len() as i64, base, p[0], p[1], p[2], p[3], p[4], p[5], p[6])
+        }
     }
 
     #[test]
@@ -1277,10 +1423,12 @@ mod tests {
 
     unsafe fn struct_counts(ptr: i64) -> (u32, u32) {
         let base = (ptr as usize - STRUCT_HEADER) as *const u8;
-        (
-            (base.add(STRUCT_OFF_STRONG) as *const u32).read(),
-            (base.add(STRUCT_OFF_WEAK) as *const u32).read(),
-        )
+        unsafe {
+            (
+                (base.add(STRUCT_OFF_STRONG) as *const u32).read(),
+                (base.add(STRUCT_OFF_WEAK) as *const u32).read(),
+            )
+        }
     }
 
     #[test]
@@ -1457,7 +1605,7 @@ mod tests {
 
     /// a destructor that keeps a weak reference to the value it tears down.
     unsafe extern "C" fn weak_taking_dtor(ptr: i64) {
-        pith_struct_weak_retain(ptr);
+        unsafe { pith_struct_weak_retain(ptr) };
         WEAK_TAKEN.store(ptr, Ordering::SeqCst);
     }
 
@@ -1465,7 +1613,7 @@ mod tests {
 
     /// a destructor that tries to upgrade a weak reference to its own value.
     unsafe extern "C" fn self_upgrading_dtor(ptr: i64) {
-        SELF_UPGRADE.store(pith_struct_weak_upgrade(ptr), Ordering::SeqCst);
+        SELF_UPGRADE.store(unsafe { pith_struct_weak_upgrade(ptr) }, Ordering::SeqCst);
     }
 
     static SELF_UPGRADE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
@@ -1646,19 +1794,24 @@ pub unsafe extern "C" fn pith_concat_cstr(a: *const i8, b: *const i8) -> *mut i8
         return if b.is_null() {
             std::ptr::null_mut()
         } else {
-            pith_strdup(b)
+            // SAFETY: Preconditions forwarded from caller.
+            unsafe { pith_strdup(b) }
         };
     }
     if b.is_null() {
-        return pith_strdup(a);
+        // SAFETY: Preconditions forwarded from caller.
+        return unsafe { pith_strdup(a) };
     }
 
     let len_a = string::pith_cstring_len(a) as usize;
     let len_b = string::pith_cstring_len(b) as usize;
-    let result = pith_alloc_cstring(len_a + len_b);
-
-    std::ptr::copy_nonoverlapping(a, result, len_a);
-    std::ptr::copy_nonoverlapping(b, result.add(len_a), len_b);
+    let result = alloc_cstring_raw(len_a + len_b);
+    // SAFETY: `a` and `b` are valid for `len_a` and `len_b` readable bytes, and
+    // `result` is a fresh non-overlapping buffer of at least `len_a + len_b + 1` bytes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(a, result, len_a);
+        std::ptr::copy_nonoverlapping(b, result.add(len_a), len_b);
+    }
     result
 }
 
@@ -1683,7 +1836,7 @@ fn join_part_is_int(ints: u64, i: usize) -> bool {
 /// the caller's array: handing them over in a struct made the copy read back
 /// words that were still being stored.
 #[inline(always)]
-unsafe fn measure_join_parts(parts: &[*const i8], ints: u64, lens: &mut [usize; CONCAT_MANY_MAX]) -> usize {
+fn measure_join_parts(parts: &[*const i8], ints: u64, lens: &mut [usize; CONCAT_MANY_MAX]) -> usize {
     let mut total = 0usize;
     for (i, &part) in parts.iter().enumerate() {
         lens[i] = if join_part_is_int(ints, i) {
@@ -1698,17 +1851,28 @@ unsafe fn measure_join_parts(parts: &[*const i8], ints: u64, lens: &mut [usize; 
     total
 }
 
-/// Write every part, in order, starting at `dst`.
+/// Write every part, in order, into `dst`, whose length equals `sum(lens[..parts.len()])`.
 #[inline(always)]
-unsafe fn write_join_parts(parts: &[*const i8], ints: u64, lens: &[usize; CONCAT_MANY_MAX], dst: *mut i8) {
-    let mut at = dst as *mut u8;
+unsafe fn write_join_parts(
+    parts: &[*const i8],
+    ints: u64,
+    lens: &[usize; CONCAT_MANY_MAX],
+    mut dst: &mut [std::mem::MaybeUninit<u8>],
+) {
     for (i, &part) in parts.iter().enumerate() {
+        let len = lens[i];
+        let Some((slice, rest)) = dst.split_at_mut_checked(len) else {
+            break;
+        };
         if join_part_is_int(ints, i) {
-            write_int_text(part as i64, at, lens[i]);
-        } else if lens[i] > 0 {
-            std::ptr::copy_nonoverlapping(part as *const u8, at, lens[i]);
+            write_int_text(part as i64, slice);
+        } else if len > 0 {
+            // SAFETY: Caller guarantees `part` has `len` readable bytes non-overlapping with `slice`.
+            unsafe {
+                std::ptr::copy_nonoverlapping(part as *const u8, slice.as_mut_ptr() as *mut u8, len)
+            };
         }
-        at = at.add(lens[i]);
+        dst = rest;
     }
 }
 
@@ -1747,8 +1911,13 @@ pub unsafe extern "C" fn pith_concat_cstr_many(
     }
     let mut lens = [0usize; CONCAT_MANY_MAX];
     let total = measure_join_parts(parts, ints, &mut lens);
-    let result = pith_alloc_cstring(total);
-    write_join_parts(parts, ints, &lens, result);
+    let result = alloc_cstring_raw(total);
+    // SAFETY: `result` points to `total` freshly allocated writable bytes.
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(result as *mut std::mem::MaybeUninit<u8>, total)
+    };
+    // SAFETY: Caller guarantees non-int, non-null parts are valid non-overlapping C strings.
+    unsafe { write_join_parts(parts, ints, &lens, dst) };
     result
 }
 
@@ -1785,58 +1954,62 @@ pub unsafe extern "C" fn pith_cstring_append_many(
     let added = measure_join_parts(parts, ints, &mut lens);
     // a string part that is the base itself would be read while it grows
     let reads_base = parts.iter().enumerate().any(|(i, &part)| part == base && !join_part_is_int(ints, i));
-    let header = cstring_base(base).filter(|&h| {
-        cstring_refcount(h).load(Ordering::Acquire) == 1
-            && !reads_base
-            && !cstring_debug_no_free()
-            && leak_scan_registry().is_none()
+    // SAFETY: `base` is validated by `cstring_base` before checking sole ownership.
+    let header = unsafe { cstring_base(base) }.filter(|&h| {
+        // SAFETY: `h` was just validated as a live heap cstring header.
+        let sole = unsafe { with_cstring_refcount(h, |rc| rc.load(Ordering::Acquire) == 1) };
+        sole && !reads_base && !cstring_debug_no_free() && leak_scan_registry().is_none()
     });
     let Some(mut header) = header else {
         let packed = (count + 1) as i64 | (ints << (JOIN_INT_SHIFT + 1)) as i64;
-        let fresh = pith_concat_cstr_many(packed, base, s0, s1, s2, s3, s4, s5, s6);
-        pith_cstring_release(base);
+        // SAFETY: Preconditions forwarded from caller.
+        let fresh = unsafe { pith_concat_cstr_many(packed, base, s0, s1, s2, s3, s4, s5, s6) };
+        // SAFETY: Caller transferred one refcount on `base` to this call.
+        unsafe { pith_cstring_release(base) };
         return fresh;
     };
-    let len = cstring_data_len(header);
+    // SAFETY: `header` is a validated sole-owned heap cstring header.
+    let len = unsafe { cstring_data_len(header) };
     let new_len = len + added;
-    if cstring_alloc_size(new_len) != cstring_alloc_size(len) {
-        header = std::alloc::realloc(header, cstring_layout(len), cstring_alloc_size(new_len));
+    let new_size = cstring_alloc_size(new_len);
+    if new_size != cstring_alloc_size(len) {
+        let old_layout = cstring_layout(len);
+        // SAFETY: `header` is sole-owned and was allocated with `old_layout`.
+        header = unsafe { std::alloc::realloc(header, old_layout, new_size) };
         if header.is_null() {
             eprintln!("pith runtime error: allocation failed");
             // panic-guard: out of memory.
             std::process::exit(1);
         }
     }
-    let data = header.add(CSTRING_HEADER_SIZE) as *mut i8;
-    write_join_parts(parts, ints, &lens, data.add(len));
-    *data.add(new_len) = 0;
-    (header.add(8) as *mut u64).write(new_len as u64);
+    // SAFETY: `header` is sole-owned with capacity for `CSTRING_HEADER_SIZE + new_len + 1` bytes.
+    let (data, tail) = unsafe {
+        let data = header.add(CSTRING_HEADER_SIZE) as *mut i8;
+        let tail = std::slice::from_raw_parts_mut(
+            (data as *mut std::mem::MaybeUninit<u8>).add(len),
+            added,
+        );
+        (data, tail)
+    };
+    // SAFETY: `reads_base` is false, so no part aliases `tail`, and lengths match `added`.
+    unsafe { write_join_parts(parts, ints, &lens, tail) };
+    // SAFETY: `header` is sole-owned; write trailing NUL and updated byte length.
+    unsafe {
+        *data.add(new_len) = 0;
+        (header.add(8) as *mut u64).write(new_len as u64);
+    }
     data
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_strdup(ptr: *const i8) -> *mut i8 {
-    if ptr.is_null() {
-        return std::ptr::null_mut();
-    }
-
-    let len = string::pith_cstring_len(ptr) as usize;
-    let result = pith_alloc_cstring(len);
-    std::ptr::copy_nonoverlapping(ptr, result, len);
-
-    result
+    // SAFETY: Caller guarantees `ptr` is null or a valid NUL-terminated C string.
+    unsafe { crate::ffi_util::with_cstr_bytes(ptr, pith_copy_bytes_to_cstring) }
+        .unwrap_or(std::ptr::null_mut())
 }
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_print_cstr(ptr: *const i8) {
-    if ptr.is_null() {
-        println!();
-        return;
-    }
-
-    let len = string::pith_cstring_len(ptr) as usize;
-    let slice = std::slice::from_raw_parts(ptr as *const u8, len);
-    if let Ok(str_ref) = std::str::from_utf8(slice) {
+fn print_utf8_bytes(bytes: &[u8]) {
+    if let Ok(str_ref) = std::str::from_utf8(bytes) {
         println!("{}", str_ref);
     } else {
         println!();
@@ -1844,19 +2017,31 @@ pub unsafe extern "C" fn pith_print_cstr(ptr: *const i8) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_print_err(ptr: *const i8) {
-    if ptr.is_null() {
-        eprintln!();
-        return;
+pub unsafe extern "C" fn pith_print_cstr(ptr: *const i8) {
+    // SAFETY: Caller guarantees `ptr` is null or a valid NUL-terminated C string.
+    if unsafe { crate::ffi_util::with_cstr_bytes(ptr, print_utf8_bytes) }.is_none() {
+        println!();
     }
+}
 
-    let len = string::pith_cstring_len(ptr) as usize;
-    let slice = std::slice::from_raw_parts(ptr as *const u8, len);
-    if let Ok(str_ref) = std::str::from_utf8(slice) {
+fn eprint_utf8_bytes(bytes: &[u8]) {
+    if let Ok(str_ref) = std::str::from_utf8(bytes) {
         eprintln!("{}", str_ref);
     } else {
         eprintln!();
     }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn pith_print_err(ptr: *const i8) {
+    // SAFETY: Caller guarantees `ptr` is null or a valid NUL-terminated C string.
+    if unsafe { crate::ffi_util::with_cstr_bytes(ptr, eprint_utf8_bytes) }.is_none() {
+        eprintln!();
+    }
+}
+
+fn report_main_error_msg(msg: &str) {
+    eprintln!("error: {}", msg);
 }
 
 /// Report an error escaping `main` and exit nonzero. The emitter calls this on
@@ -1866,16 +2051,13 @@ pub unsafe extern "C" fn pith_print_err(ptr: *const i8) {
 /// gets a generic line rather than a read through a non-string pointer.
 #[no_mangle]
 pub unsafe extern "C" fn pith_main_error_exit(err: i64, is_string: i64) -> i64 {
-    if is_string != 0 && err != 0 {
-        let ptr = err as *const i8;
-        let len = string::pith_cstring_len(ptr) as usize;
-        let slice = std::slice::from_raw_parts(ptr as *const u8, len);
-        if let Ok(msg) = std::str::from_utf8(slice) {
-            eprintln!("error: {}", msg);
-        } else {
-            eprintln!("error: main returned an error");
-        }
+    let printed = if is_string != 0 && err != 0 {
+        // SAFETY: When `is_string != 0` and `err != 0`, emitter passes a valid C string handle.
+        unsafe { crate::ffi_util::with_cstr_str(err as *const i8, report_main_error_msg) }.is_some()
     } else {
+        false
+    };
+    if !printed {
         eprintln!("error: main returned an error");
     }
     // panic-guard: main returned an error; this is the process exit status for it.
@@ -1896,28 +2078,28 @@ pub unsafe extern "C" fn pith_cstring_eq(a: *const i8, b: *const i8) -> i64 {
     // most unequal pairs differ in the first byte, which settles it before
     // either length is taken. an empty string's first byte is its zero
     // terminator, so this holds for empty strings too.
-    if *a != *b {
+    // SAFETY: Both pointers are non-null valid NUL-terminated C strings, so byte 0 is readable.
+    if unsafe { *a != *b } {
         return 0;
     }
     // compare by length, then bytes. a heap string's length is one header
     // read, and a string holding a zero byte compares in full rather than
     // stopping at the zero.
-    let la = crate::string::pith_cstring_len(a) as usize;
-    let lb = crate::string::pith_cstring_len(b) as usize;
-    if la != lb {
-        return 0;
-    }
-    let sa = std::slice::from_raw_parts(a as *const u8, la);
-    let sb = std::slice::from_raw_parts(b as *const u8, lb);
-    (sa == sb) as i64
+    // SAFETY: Both pointers are non-null valid NUL-terminated C strings.
+    unsafe { crate::ffi_util::with_cstr_bytes2(a, b, |sa, sb| (sa == sb) as i64) }.unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_ord_cstr(s: *const i8) -> i64 {
-    if s.is_null() || *s == 0 {
+    if s.is_null() {
         return 0;
     }
-    *s as i64
+    // SAFETY: Caller guarantees non-null `s` points to a readable NUL-terminated C string.
+    let first = unsafe { *s };
+    if first == 0 {
+        return 0;
+    }
+    first as i64
 }
 
 #[no_mangle]
@@ -1987,14 +2169,10 @@ pub extern "C" fn pith_test_set_failed(failed: i64) {
 // walk the contents instead. a handle that does not resolve falls back to
 // identity so a malformed value still gives a definite answer.
 
-#[no_mangle]
-pub unsafe extern "C" fn pith_list_eq_scalar(a: i64, b: i64) -> i64 {
-    let (Some(x), Some(y)) = (
-        crate::collections::list::list_ref_from_handle(a),
-        crate::collections::list::list_ref_from_handle(b),
-    ) else {
-        return (a == b) as i64;
-    };
+fn list_eq_scalar_impl(
+    x: &crate::collections::list::ListImpl,
+    y: &crate::collections::list::ListImpl,
+) -> i64 {
     if x.len() != y.len() {
         return 0;
     }
@@ -2007,50 +2185,69 @@ pub unsafe extern "C" fn pith_list_eq_scalar(a: i64, b: i64) -> i64 {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn pith_list_eq_string(a: i64, b: i64) -> i64 {
-    let (Some(x), Some(y)) = (
-        crate::collections::list::list_ref_from_handle(a),
-        crate::collections::list::list_ref_from_handle(b),
-    ) else {
-        return (a == b) as i64;
-    };
+pub unsafe extern "C" fn pith_list_eq_scalar(a: i64, b: i64) -> i64 {
+    // SAFETY: `a` and `b` are validated by `with_list_ref2_handle`; shared borrows permit `a == b`.
+    unsafe { crate::collections::list::with_list_ref2_handle(a, b, list_eq_scalar_impl) }
+        .unwrap_or((a == b) as i64)
+}
+
+unsafe fn list_eq_string_impl(
+    x: &crate::collections::list::ListImpl,
+    y: &crate::collections::list::ListImpl,
+) -> i64 {
     if x.len() != y.len() {
         return 0;
     }
     for i in 0..x.len() {
         let pa = x.get_value(i).unwrap_or(0) as *const i8;
         let pb = y.get_value(i).unwrap_or(0) as *const i8;
-        if pith_cstring_eq(pa, pb) == 0 {
+        // SAFETY: Caller guarantees both lists hold valid C string handles (or null).
+        if unsafe { pith_cstring_eq(pa, pb) } == 0 {
             return 0;
         }
     }
     1
 }
 
-unsafe fn bytes_hex(handle: i64) -> String {
-    if let Some(b) = crate::bytes::pith_bytes_ref(handle) {
-        let mut s = String::from("0x");
-        for byte in &b.data {
-            s.push_str(&format!("{:02x}", byte));
-        }
-        s
-    } else {
-        format!("<bytes {}>", handle)
+#[no_mangle]
+pub unsafe extern "C" fn pith_list_eq_string(a: i64, b: i64) -> i64 {
+    // SAFETY: `a` and `b` are validated by `with_list_ref2_handle`; elements are string handles.
+    unsafe { crate::collections::list::with_list_ref2_handle(a, b, |x, y| list_eq_string_impl(x, y)) }
+        .unwrap_or((a == b) as i64)
+}
+
+fn format_bytes_hex(data: &[u8]) -> String {
+    let mut s = String::from("0x");
+    for byte in data {
+        s.push_str(&format!("{:02x}", byte));
     }
+    s
+}
+
+unsafe fn bytes_hex(handle: i64) -> String {
+    // SAFETY: `handle` is validated by `with_bytes` before borrowing its slice.
+    unsafe { crate::bytes::with_bytes(handle, format_bytes_hex) }
+        .unwrap_or_else(|| format!("<bytes {}>", handle))
+}
+
+fn list_values_copy(list: &crate::collections::list::ListImpl) -> Vec<i64> {
+    (0..list.len()).map(|i| list.get_value(i).unwrap_or(0)).collect()
 }
 
 unsafe fn list_display(handle: i64, string_elems: bool) -> String {
-    let Some(list) = crate::collections::list::list_ref_from_handle(handle) else {
+    // SAFETY: `handle` is validated by `with_list_ref_handle` before reading elements.
+    let Some(values) = (unsafe { crate::collections::list::with_list_ref_handle(handle, list_values_copy) }) else {
         return format!("<list {}>", handle);
     };
     let mut s = String::from("[");
-    for i in 0..list.len() {
+    for (i, v) in values.into_iter().enumerate() {
         if i > 0 {
             s.push_str(", ");
         }
-        let v = list.get_value(i).unwrap_or(0);
         if string_elems {
-            s.push_str(&format!("\"{}\"", cstr_to_display(v as *const i8)));
+            // SAFETY: Caller guarantees elements are valid C string handles when `string_elems`.
+            let text = unsafe { cstr_to_display(v as *const i8) };
+            s.push_str(&format!("\"{}\"", text));
         } else {
             s.push_str(&v.to_string());
         }
@@ -2062,13 +2259,14 @@ unsafe fn list_display(handle: i64, string_elems: bool) -> String {
 /// One side of an assertion failure, decoded per `kind`
 /// (0 int, 1 float, 2 string, 3 bytes, 4 bool, 5 int-list, 6 string-list).
 unsafe fn assert_operand(v: i64, kind: i64) -> String {
+    // SAFETY: Caller guarantees `v` is a valid value of the given `kind`.
     match kind {
         1 => f64::from_bits(v as u64).to_string(),
-        2 => format!("\"{}\"", cstr_to_display(v as *const i8)),
-        3 => bytes_hex(v),
+        2 => format!("\"{}\"", unsafe { cstr_to_display(v as *const i8) }),
+        3 => unsafe { bytes_hex(v) },
         4 => if v != 0 { "true".to_string() } else { "false".to_string() },
-        5 => list_display(v, false),
-        6 => list_display(v, true),
+        5 => unsafe { list_display(v, false) },
+        6 => unsafe { list_display(v, true) },
         _ => v.to_string(),
     }
 }
@@ -2080,11 +2278,9 @@ unsafe fn assert_operand(v: i64, kind: i64) -> String {
 #[no_mangle]
 pub unsafe extern "C" fn pith_assert_eq_fail(a: i64, b: i64, kind: i64) {
     TEST_FAILED.store(true, Ordering::Relaxed);
-    let message = format!(
-        "assertion failed: {} != {}",
-        assert_operand(a, kind),
-        assert_operand(b, kind)
-    );
+    // SAFETY: Preconditions forwarded from caller.
+    let (lhs, rhs) = unsafe { (assert_operand(a, kind), assert_operand(b, kind)) };
+    let message = format!("assertion failed: {} != {}", lhs, rhs);
     record_failure_detail(&message);
     eprintln!("{}", message);
 }
@@ -2098,11 +2294,9 @@ pub unsafe extern "C" fn pith_assert_eq_fail(a: i64, b: i64, kind: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn pith_assert_ne_fail(a: i64, b: i64, kind: i64) {
     TEST_FAILED.store(true, Ordering::Relaxed);
-    let message = format!(
-        "assertion failed: {} == {}",
-        assert_operand(a, kind),
-        assert_operand(b, kind)
-    );
+    // SAFETY: Preconditions forwarded from caller.
+    let (lhs, rhs) = unsafe { (assert_operand(a, kind), assert_operand(b, kind)) };
+    let message = format!("assertion failed: {} == {}", lhs, rhs);
     record_failure_detail(&message);
     eprintln!("{}", message);
 }
@@ -2398,8 +2592,10 @@ fn read_failure_detail() -> Option<(String, Option<(String, i64, i64)>)> {
 /// `name` must point to a valid NUL-terminated string for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_test_enter(name: *const i8) -> i64 {
+    // SAFETY: Caller guarantees `name` is a valid NUL-terminated string.
+    let name = unsafe { cstr_to_display(name) };
     if let Ok(mut current) = CURRENT_TEST.lock() {
-        *current = cstr_to_display(name);
+        *current = name;
     }
     0
 }
@@ -2412,8 +2608,10 @@ pub unsafe extern "C" fn pith_test_enter(name: *const i8) -> i64 {
 /// `file` must point to a valid NUL-terminated string for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_test_set_file(file: *const i8) -> i64 {
+    // SAFETY: Caller guarantees `file` is a valid NUL-terminated string.
+    let file = unsafe { cstr_to_display(file) };
     if let Ok(mut current) = TEST_FILE.lock() {
-        *current = cstr_to_display(file);
+        *current = file;
     }
     0
 }
@@ -2425,8 +2623,10 @@ pub unsafe extern "C" fn pith_test_set_file(file: *const i8) -> i64 {
 /// `file` must point to a valid NUL-terminated string for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_test_fail_site(file: *const i8, line: i64, col: i64) {
+    // SAFETY: Caller guarantees `file` is a valid NUL-terminated string.
+    let file = unsafe { cstr_to_display(file) };
     if let Ok(mut site) = FAIL_SITE.lock() {
-        *site = Some((cstr_to_display(file), line, col));
+        *site = Some((file, line, col));
     }
 }
 
@@ -2438,8 +2638,8 @@ pub unsafe extern "C" fn pith_test_fail_site(file: *const i8, line: i64, col: i6
 /// `name` and `detail` must point to valid NUL-terminated strings for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_test_report_case(name: *const i8, ok: i64, detail: *const i8) {
-    let name = cstr_to_display(name);
-    let detail = cstr_to_display(detail);
+    // SAFETY: Caller guarantees `name` and `detail` are valid NUL-terminated strings.
+    let (name, detail) = unsafe { (cstr_to_display(name), cstr_to_display(detail)) };
     if ok == 0 {
         record_failure_detail(&format!("{} -- {}", name, detail));
     }
@@ -2463,7 +2663,8 @@ pub unsafe extern "C" fn pith_test_report_case(name: *const i8, ok: i64, detail:
 pub unsafe extern "C" fn pith_test_skip(reason: *const i8) -> i64 {
     use std::io::Write;
     let name = locked_string(&CURRENT_TEST);
-    let reason = cstr_to_display(reason);
+    // SAFETY: Caller guarantees `reason` is a valid NUL-terminated string.
+    let reason = unsafe { cstr_to_display(reason) };
     if test_json_mode() {
         print_test_record(&name, "skipped", elapsed_ms(), Some(&reason), &None);
     } else {
@@ -2516,8 +2717,8 @@ fn filtered_out(name: &str) -> i64 {
 /// `name` and `tags` must point to valid NUL-terminated strings for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_test_should_run(name: *const i8, tags: *const i8) -> i64 {
-    let name = cstr_to_display(name);
-    let tags = cstr_to_display(tags);
+    // SAFETY: Caller guarantees `name` and `tags` are valid NUL-terminated strings.
+    let (name, tags) = unsafe { (cstr_to_display(name), cstr_to_display(tags)) };
     if let Ok(mut current) = CURRENT_TAGS.lock() {
         *current = tags.clone();
     }
@@ -2609,8 +2810,10 @@ pub extern "C" fn pith_test_child_ok() -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_test_record(name: *const i8, pid: i64) -> i64 {
     let mut status: i32 = 0;
-    libc::waitpid(pid as i32, &mut status, 0);
-    let name_str = cstr_to_display(name);
+    // SAFETY: `status` is a valid out-pointer for `waitpid`.
+    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+    // SAFETY: Caller guarantees `name` is a valid NUL-terminated string.
+    let name_str = unsafe { cstr_to_display(name) };
     let duration = elapsed_ms();
     // read unconditionally: this is also what closes the read end of the pipe
     let detail = read_failure_detail();
@@ -2889,6 +3092,14 @@ pub extern "C" fn pith_atan2(y: f64, x: f64) -> f64 {
     y.atan2(x)
 }
 
+fn compare_bytes(sa: &[u8], sb: &[u8]) -> i64 {
+    match sa.cmp(sb) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_compare(a: *const i8, b: *const i8) -> i64 {
     if a.is_null() && b.is_null() {
@@ -2902,18 +3113,14 @@ pub unsafe extern "C" fn pith_cstring_compare(a: *const i8, b: *const i8) -> i64
     }
     // compare the full bytes so a zero byte inside a string does not end
     // the compare; a string that is a prefix of the other sorts first
-    let sa = std::slice::from_raw_parts(a as *const u8, crate::string::pith_cstring_len(a) as usize);
-    let sb = std::slice::from_raw_parts(b as *const u8, crate::string::pith_cstring_len(b) as usize);
-    match sa.cmp(sb) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
-    }
+    // SAFETY: Both pointers are non-null valid NUL-terminated C strings.
+    unsafe { crate::ffi_util::with_cstr_bytes2(a, b, compare_bytes) }.unwrap_or(0)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_lt(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) < 0 {
+    // SAFETY: Preconditions forwarded from caller.
+    if unsafe { pith_cstring_compare(a, b) } < 0 {
         1
     } else {
         0
@@ -2922,7 +3129,8 @@ pub unsafe extern "C" fn pith_cstring_lt(a: *const i8, b: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_gt(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) > 0 {
+    // SAFETY: Preconditions forwarded from caller.
+    if unsafe { pith_cstring_compare(a, b) } > 0 {
         1
     } else {
         0
@@ -2931,7 +3139,8 @@ pub unsafe extern "C" fn pith_cstring_gt(a: *const i8, b: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_lte(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) <= 0 {
+    // SAFETY: Preconditions forwarded from caller.
+    if unsafe { pith_cstring_compare(a, b) } <= 0 {
         1
     } else {
         0
@@ -2940,7 +3149,8 @@ pub unsafe extern "C" fn pith_cstring_lte(a: *const i8, b: *const i8) -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
-    if pith_cstring_compare(a, b) >= 0 {
+    // SAFETY: Preconditions forwarded from caller.
+    if unsafe { pith_cstring_compare(a, b) } >= 0 {
         1
     } else {
         0
@@ -2950,16 +3160,24 @@ pub unsafe extern "C" fn pith_cstring_gte(a: *const i8, b: *const i8) -> i64 {
 #[no_mangle]
 pub unsafe extern "C" fn pith_int_to_cstr(n: i64) -> *mut i8 {
     let len = int_text_len(n);
-    let ptr = pith_alloc_cstring(len);
-    write_int_text(n, ptr as *mut u8, len);
+    let ptr = alloc_cstring_raw(len);
+    // SAFETY: `ptr` points to `len` freshly allocated writable bytes.
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(ptr as *mut std::mem::MaybeUninit<u8>, len)
+    };
+    write_int_text(n, dst);
     ptr
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_uint_to_cstr(n: i64) -> *mut i8 {
     let len = uint_text_len(n as u64);
-    let ptr = pith_alloc_cstring(len);
-    write_decimal_before(n as u64, (ptr as *mut u8).add(len));
+    let ptr = alloc_cstring_raw(len);
+    // SAFETY: `ptr` points to `len` freshly allocated writable bytes.
+    let dst = unsafe {
+        std::slice::from_raw_parts_mut(ptr as *mut std::mem::MaybeUninit<u8>, len)
+    };
+    write_decimal_into(n as u64, dst);
     ptr
 }
 
@@ -2975,52 +3193,57 @@ fn int_text_len(n: i64) -> usize {
     uint_text_len(n.unsigned_abs()) + usize::from(n < 0)
 }
 
-/// Write `n` in decimal into the `len` bytes at `dst`, where `len` is
-/// `int_text_len(n)`.
-#[inline]
-unsafe fn write_int_text(n: i64, dst: *mut u8, len: usize) {
-    write_decimal_before(n.unsigned_abs(), dst.add(len));
+/// Write `n` in decimal into `dst`, whose length is `int_text_len(n)`.
+#[inline(always)]
+fn write_int_text(n: i64, dst: &mut [std::mem::MaybeUninit<u8>]) {
+    write_decimal_into(n.unsigned_abs(), dst);
     if n < 0 {
-        *dst = b'-';
+        if let Some(first) = dst.first_mut() {
+            first.write(b'-');
+        }
     }
 }
 
 /// "00", "01" ... "99", end to end.
-const DIGIT_PAIRS: [u8; 200] = {
-    let mut pairs = [0u8; 200];
+const DIGIT_PAIRS: [[u8; 2]; 100] = {
+    let mut pairs = [[0u8; 2]; 100];
     let mut i = 0;
     while i < 100 {
-        pairs[2 * i] = b'0' + (i / 10) as u8;
-        pairs[2 * i + 1] = b'0' + (i % 10) as u8;
+        pairs[i] = [b'0' + (i / 10) as u8, b'0' + (i % 10) as u8];
         i += 1;
     }
     pairs
 };
 
-/// Write the digits of `n` so that the last one sits just before `end`. The
-/// caller measured the number, so the digits go straight to their place: a
-/// number's text costs one allocation and no copy. Two digits per step
-/// halve the chain of divisions each digit waits on, which is what a
-/// conversion spends most of its time in.
-#[inline]
-unsafe fn write_decimal_before(mut n: u64, end: *mut u8) {
-    let mut at = end;
+/// Write the digits of `n` right-aligned into `dst`. The caller measured the
+/// number, so the digits go straight to their place: a number's text costs one
+/// allocation and no copy. Two digits per step halve the chain of divisions
+/// each digit waits on, which is what a conversion spends most of its time in.
+#[inline(always)]
+fn write_decimal_into(mut n: u64, mut dst: &mut [std::mem::MaybeUninit<u8>]) {
     while n >= 100 {
-        let pair = (n % 100) as usize * 2;
+        let Some((rest, tail)) = dst.split_last_chunk_mut::<2>() else {
+            return;
+        };
+        let pair = DIGIT_PAIRS[(n % 100) as usize];
         n /= 100;
-        at = at.sub(2);
-        std::ptr::copy_nonoverlapping(DIGIT_PAIRS.as_ptr().add(pair), at, 2);
+        tail[0].write(pair[0]);
+        tail[1].write(pair[1]);
+        dst = rest;
     }
     if n >= 10 {
-        std::ptr::copy_nonoverlapping(DIGIT_PAIRS.as_ptr().add(n as usize * 2), at.sub(2), 2);
-    } else {
-        *at.sub(1) = b'0' + n as u8;
+        if let Some((_, tail)) = dst.split_last_chunk_mut::<2>() {
+            let pair = DIGIT_PAIRS[n as usize];
+            tail[0].write(pair[0]);
+            tail[1].write(pair[1]);
+        }
+    } else if let Some(last) = dst.last_mut() {
+        last.write(b'0' + n as u8);
     }
 }
 
-#[no_mangle]
-pub extern "C" fn pith_float_to_cstr(n: f64) -> *mut i8 {
-    let s = if n == n.floor() && n.abs() < 1e15 {
+fn format_float(n: f64) -> String {
+    if n == n.floor() && n.abs() < 1e15 {
         format!("{}", n as i64)
     } else {
         let formatted = format!("{:.6}", n);
@@ -3028,16 +3251,18 @@ pub extern "C" fn pith_float_to_cstr(n: f64) -> *mut i8 {
             .trim_end_matches('0')
             .trim_end_matches('.')
             .to_string()
-    };
-    let len = s.len();
-    unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn pith_float_to_cstr(n: f64) -> *mut i8 {
+    pith_copy_bytes_to_cstring(format_float(n).as_bytes())
 }
 
 #[no_mangle]
 pub extern "C" fn pith_bool_to_cstr(b: i64) -> *mut i8 {
     let s = if b != 0 { "true" } else { "false" };
-    let len = s.len();
-    unsafe { pith_copy_bytes_to_cstring(&s.as_bytes()[..len]) }
+    pith_copy_bytes_to_cstring(s.as_bytes())
 }
 
 // --- container display -------------------------------------------------
@@ -3047,29 +3272,33 @@ pub extern "C" fn pith_bool_to_cstr(b: i64) -> *mut i8 {
 // float list (both store 8-byte values): 0=int, 1=float, 2=bool, 3=string.
 
 pub(crate) unsafe fn display_value_for_map(out: &mut String, raw: i64, kind: i64) {
-    display_value(out, raw, kind)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { display_value(out, raw, kind) }
 }
 
 unsafe fn display_value(out: &mut String, raw: i64, kind: i64) {
     match kind {
-        1 => {
-            let f = f64::from_bits(raw as u64);
-            let ptr = pith_float_to_cstr(f);
-            out.push_str(&cstr_to_display(ptr));
-        }
+        1 => out.push_str(&format_float(f64::from_bits(raw as u64))),
         2 => out.push_str(if raw != 0 { "true" } else { "false" }),
-        3 => out.push_str(&cstr_to_display(raw as *const i8)),
+        // SAFETY: Caller guarantees `raw` is a valid C string handle when `kind == 3`.
+        3 => out.push_str(&unsafe { cstr_to_display(raw as *const i8) }),
         _ => out.push_str(&raw.to_string()),
     }
 }
 
 unsafe fn cstr_to_display(ptr: *const i8) -> String {
-    if ptr.is_null() {
-        return String::new();
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { crate::ffi_util::with_cstr_bytes(ptr, preview_lossy) }.unwrap_or_default()
+}
+
+fn collect_list_values(list: &crate::collections::list::ListImpl) -> Vec<i64> {
+    let mut values = Vec::with_capacity(list.len());
+    for i in 0..list.len() {
+        if let Some(raw) = list.get_value(i) {
+            values.push(raw);
+        }
     }
-    let len = crate::string::pith_cstring_len(ptr) as usize;
-    let bytes = std::slice::from_raw_parts(ptr as *const u8, len);
-    String::from_utf8_lossy(bytes).into_owned()
+    values
 }
 
 /// Render a list as "[a, b, c]" for interpolation. `sorted` is set when the
@@ -3077,14 +3306,9 @@ unsafe fn cstr_to_display(ptr: *const i8) -> String {
 /// displayed set sorts its elements.
 #[no_mangle]
 pub unsafe extern "C" fn pith_display_list(handle: i64, elem_kind: i64, sorted: i64) -> *mut i8 {
-    let mut values: Vec<i64> = Vec::new();
-    if let Some(list) = crate::collections::list::list_ref_from_handle(handle) {
-        for i in 0..list.len() {
-            if let Some(raw) = list.get_value(i) {
-                values.push(raw);
-            }
-        }
-    }
+    // SAFETY: `handle` is validated by `with_list_ref_handle` before reading elements.
+    let mut values = unsafe { crate::collections::list::with_list_ref_handle(handle, collect_list_values) }
+        .unwrap_or_default();
     if sorted != 0 {
         match elem_kind {
             1 => values.sort_by(|a, b| {
@@ -3092,7 +3316,10 @@ pub unsafe extern "C" fn pith_display_list(handle: i64, elem_kind: i64, sorted: 
                     .partial_cmp(&f64::from_bits(*b as u64))
                     .unwrap_or(std::cmp::Ordering::Equal)
             }),
-            3 => values.sort_by_key(|v| cstr_to_display(*v as *const i8)),
+            3 => values.sort_by_key(|v| {
+                // SAFETY: Caller guarantees elements are valid C strings when `elem_kind == 3`.
+                unsafe { cstr_to_display(*v as *const i8) }
+            }),
             _ => values.sort(),
         }
     }
@@ -3101,7 +3328,8 @@ pub unsafe extern "C" fn pith_display_list(handle: i64, elem_kind: i64, sorted: 
         if i > 0 {
             out.push_str(", ");
         }
-        display_value(&mut out, *raw, elem_kind);
+        // SAFETY: Caller guarantees elements match `elem_kind`.
+        unsafe { display_value(&mut out, *raw, elem_kind) };
     }
     out.push(']');
     pith_copy_bytes_to_cstring(out.as_bytes())
@@ -3118,7 +3346,8 @@ pub unsafe extern "C" fn pith_free(ptr: *mut i8) {
     use std::alloc::Layout;
 
     if !ptr.is_null() {
-        std::alloc::dealloc(ptr as *mut u8, Layout::new::<u8>());
+        // SAFETY: Caller guarantees `ptr` was allocated with `Layout::new::<u8>()`.
+        unsafe { std::alloc::dealloc(ptr as *mut u8, Layout::new::<u8>()) };
     }
 }
 
@@ -3290,7 +3519,8 @@ fn green_task_tls() -> Option<*mut TlsMap> {
 /// `init_thunk` must be the address of a compiled `extern "C" fn() -> i64`.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_get_or_init(slot: i64, init_thunk: i64) -> i64 {
-    pith_tls_get_or_init_tagged(slot, init_thunk, 0)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { pith_tls_get_or_init_tagged(slot, init_thunk, 0) }
 }
 
 /// `pith_tls_get_or_init` for a slot whose values carry counts: `tag` is the
@@ -3309,11 +3539,12 @@ pub unsafe extern "C" fn pith_tls_get_or_init_tagged(slot: i64, init_thunk: i64,
         // SAFETY: a task's map is owned by the running task and the thread's
         // map by this thread; nothing else holds a borrow of either while
         // pith code runs.
-        if let Some(v) = (*map).get(&slot) {
+        if let Some(v) = unsafe { (*map).get(&slot) } {
             return v;
         }
     }
-    tls_get_or_init_slow(slot, init_thunk, tag)
+    // SAFETY: Preconditions on `init_thunk` forwarded from caller.
+    unsafe { tls_get_or_init_slow(slot, init_thunk, tag) }
 }
 
 /// The first read of a slot, which runs its initializer, and any read made
@@ -3330,13 +3561,14 @@ unsafe fn tls_get_or_init_slow(slot: i64, init_thunk: i64, tag: i64) -> i64 {
         // thunk, and the write borrow is created fresh afterward. that mirrors
         // the `TLS_GLOBALS` path: the thunk may itself touch other threadlocal
         // slots on the same map without a live borrow being held across it.
-        if let Some(v) = (*map).get(&slot) {
+        if let Some(v) = unsafe { (*map).get(&slot) } {
             return v;
         }
         // panic-guard: calling a compiler-emitted threadlocal initializer thunk.
-        let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
+        let thunk: extern "C" fn() -> i64 = unsafe { std::mem::transmute(init_thunk as usize) };
         let value = thunk();
-        (*map).insert(slot, value, tag);
+        // SAFETY: Short-lived write borrow after the thunk returns.
+        unsafe { (*map).insert(slot, value, tag) };
         return value;
     }
 
@@ -3344,7 +3576,7 @@ unsafe fn tls_get_or_init_slow(slot: i64, init_thunk: i64, tag: i64) -> i64 {
         return v;
     }
     // panic-guard: calling a compiler-emitted threadlocal initializer thunk.
-    let thunk: extern "C" fn() -> i64 = std::mem::transmute(init_thunk as usize);
+    let thunk: extern "C" fn() -> i64 = unsafe { std::mem::transmute(init_thunk as usize) };
     let value = thunk();
     // another access on this thread during the thunk can't have run (single
     // thread), so a plain insert is correct.
@@ -3378,7 +3610,8 @@ fn tls_globals_set(slot: i64, value: i64, tag: i64) {
 /// the same as a plain global assignment.
 #[no_mangle]
 pub unsafe extern "C" fn pith_tls_set(slot: i64, value: i64) {
-    pith_tls_set_tagged(slot, value, 0)
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { pith_tls_set_tagged(slot, value, 0) }
 }
 
 /// `pith_tls_set` with the value's element tag (see
@@ -3392,7 +3625,7 @@ pub unsafe extern "C" fn pith_tls_set_tagged(slot: i64, value: i64, tag: i64) {
     if !map.is_null() {
         // SAFETY: as in `pith_tls_get_or_init_tagged`: the running task's own
         // map, or this thread's, with no other borrow live.
-        (*map).insert(slot, value, tag);
+        unsafe { (*map).insert(slot, value, tag) };
         return;
     }
     tls_globals_set(slot, value, tag);
@@ -3477,6 +3710,42 @@ struct PoolSlot {
     struct_bytes: usize,
     closures: Vec<*mut u8>,
     owned: std::sync::atomic::AtomicBool,
+}
+
+impl PoolSlot {
+    #[inline(always)]
+    fn try_push_closure(&mut self, ptr: *mut u8) -> bool {
+        if self.closures.len() < CLOSURE_POOL_CAP {
+            self.closures.push(ptr);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline(always)]
+    fn pop_struct(&mut self, bucket: usize, total: usize) -> Option<*mut u8> {
+        let ptr = self.struct_buckets.get_mut(bucket)?.pop()?;
+        self.struct_bytes -= total;
+        Some(ptr)
+    }
+
+    #[inline(always)]
+    fn push_struct(&mut self, bucket: usize, base: *mut u8, total: usize) -> bool {
+        if self.struct_bytes + total > STRUCT_POOL_MAX_BYTES {
+            return false;
+        }
+        if self.struct_buckets.len() <= bucket {
+            self.struct_buckets.resize(bucket + 1, Vec::new());
+        }
+        let stack = &mut self.struct_buckets[bucket];
+        if stack.len() >= STRUCT_POOL_CAP {
+            return false;
+        }
+        stack.push(base);
+        self.struct_bytes += total;
+        true
+    }
 }
 
 struct PoolRegistry {
@@ -3609,7 +3878,7 @@ fn struct_pool_bucket(total: usize) -> Option<usize> {
 
 /// Reuse a recycled block of exactly `total` bytes, re-zeroed like alloc_zeroed.
 /// Returns null on a pool miss (the caller then allocates fresh).
-unsafe fn struct_pool_take(total: usize) -> *mut u8 {
+fn struct_pool_take(total: usize) -> *mut u8 {
     if !struct_pool_enabled() {
         return std::ptr::null_mut();
     }
@@ -3620,16 +3889,12 @@ unsafe fn struct_pool_take(total: usize) -> *mut u8 {
     if slot.is_null() {
         return std::ptr::null_mut();
     }
-    let slot = &mut *slot;
-    let Some(ptr) = slot
-        .struct_buckets
-        .get_mut(bucket)
-        .and_then(|stack| stack.pop())
-    else {
+    // SAFETY: `slot` is non-null and exclusively owned by this thread while active.
+    let Some(ptr) = (unsafe { (*slot).pop_struct(bucket, total) }) else {
         return std::ptr::null_mut();
     };
-    slot.struct_bytes -= total;
-    std::ptr::write_bytes(ptr, 0, total);
+    // SAFETY: `ptr` is an unowned recycled struct allocation of exactly `total` bytes.
+    unsafe { std::ptr::write_bytes(ptr, 0, total) };
     ptr
 }
 
@@ -3647,20 +3912,8 @@ unsafe fn struct_pool_return(base: *mut u8, total: usize) -> bool {
     if slot.is_null() {
         return false;
     }
-    let slot = &mut *slot;
-    if slot.struct_bytes + total > STRUCT_POOL_MAX_BYTES {
-        return false;
-    }
-    if slot.struct_buckets.len() <= bucket {
-        slot.struct_buckets.resize(bucket + 1, Vec::new());
-    }
-    let stack = &mut slot.struct_buckets[bucket];
-    if stack.len() >= STRUCT_POOL_CAP {
-        return false;
-    }
-    stack.push(base);
-    slot.struct_bytes += total;
-    true
+    // SAFETY: `slot` is non-null and exclusively owned by this thread while active.
+    unsafe { (*slot).push_struct(bucket, base, total) }
 }
 
 #[no_mangle]
@@ -3689,7 +3942,9 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     let total = size + STRUCT_HEADER;
     let base = struct_pool_take(total);
     let base = if base.is_null() {
-        let allocated = alloc_zeroed(pith_layout(total, 8));
+        let layout = pith_layout(total, 8);
+        // SAFETY: `total >= STRUCT_HEADER + 8 > 0`, so `layout` has non-zero size.
+        let allocated = unsafe { alloc_zeroed(layout) };
         if allocated.is_null() {
             eprintln!("pith runtime error: allocation failed");
             // panic-guard: out of memory.
@@ -3699,12 +3954,15 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     } else {
         base
     };
-    (base as *mut u32).write(STRUCT_MAGIC);
-    (base.add(STRUCT_OFF_STRONG) as *mut u32).write(1);
-    // the implicit weak unit the strong refs hold together
-    (base.add(STRUCT_OFF_WEAK) as *mut u32).write(1);
-    (base.add(STRUCT_OFF_SIZE) as *mut u64).write(size as u64);
-    let ptr = base.add(STRUCT_HEADER) as i64;
+    // SAFETY: `base` is a freshly zeroed 8-aligned allocation of `total >= STRUCT_HEADER` bytes.
+    let ptr = unsafe {
+        (base as *mut u32).write(STRUCT_MAGIC);
+        (base.add(STRUCT_OFF_STRONG) as *mut u32).write(1);
+        // the implicit weak unit the strong refs hold together
+        (base.add(STRUCT_OFF_WEAK) as *mut u32).write(1);
+        (base.add(STRUCT_OFF_SIZE) as *mut u64).write(size as u64);
+        base.add(STRUCT_HEADER) as i64
+    };
     crate::share::note_owner(ptr);
     ptr
 }
@@ -3740,13 +3998,29 @@ const STRUCT_OFF_DEAD: usize = 12;
 const STRUCT_OFF_SIZE: usize = 16;
 const STRUCT_OFF_DTOR: usize = 24;
 
-unsafe fn struct_strong(base: *mut u8) -> &'static AtomicU32 {
-    &*(base.add(STRUCT_OFF_STRONG) as *const AtomicU32)
+/// Typed view of the 32-byte header sitting immediately before a struct's fields.
+/// Atomic fields allow concurrent access through shared `&StructHeader` borrows
+/// scoped tightly to [`with_struct_header_for`].
+#[repr(C)]
+struct StructHeader {
+    magic: u32,
+    strong: AtomicU32,
+    weak: AtomicU32,
+    flags: AtomicU32,
+    size: u64,
+    dtor: AtomicU64,
 }
 
-unsafe fn struct_weak(base: *mut u8) -> &'static AtomicU32 {
-    &*(base.add(STRUCT_OFF_WEAK) as *const AtomicU32)
-}
+const _: () = {
+    assert!(std::mem::size_of::<StructHeader>() == STRUCT_HEADER);
+    assert!(std::mem::align_of::<StructHeader>() == 8);
+    assert!(std::mem::offset_of!(StructHeader, magic) == 0);
+    assert!(std::mem::offset_of!(StructHeader, strong) == STRUCT_OFF_STRONG);
+    assert!(std::mem::offset_of!(StructHeader, weak) == STRUCT_OFF_WEAK);
+    assert!(std::mem::offset_of!(StructHeader, flags) == STRUCT_OFF_DEAD);
+    assert!(std::mem::offset_of!(StructHeader, size) == STRUCT_OFF_SIZE);
+    assert!(std::mem::offset_of!(StructHeader, dtor) == STRUCT_OFF_DTOR);
+};
 
 // the dead flag must be an atomic like its neighbors: structs cross task (and
 // therefore worker-thread) boundaries, so the last strong owner can set it on
@@ -3802,99 +4076,151 @@ fn count_down(count: &AtomicU32, local: bool) -> u32 {
     }
 }
 
-/// Whether this struct's counts are plain: local counts are on and nothing
-/// has marked the struct shared. `switches` is the caller's copy of
-/// `switches::get()`, so a count path reads the switch byte once.
+impl StructHeader {
+    /// Whether this struct's counts are plain: local counts are on and nothing
+    /// has marked the struct shared. `switches` is the caller's copy of
+    /// `switches::get()`, so a count path reads the switch byte once.
+    #[inline(always)]
+    fn is_local(&self, switches: u8) -> bool {
+        switches & crate::switches::LOCAL_COUNTS != 0
+            && self.flags.load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
+    }
+
+    /// Under quarantine, a count operation on a struct whose value already died
+    /// is reported, the same as one on a freed struct.
+    #[inline(always)]
+    fn quarantine_check_alive(&self, op: crate::quarantine::Op) {
+        if crate::quarantine::on() && self.flags.load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+            crate::quarantine::dead_struct(op);
+        }
+    }
+
+    /// Drop one unit of weak and answer whether this dropped the last hold on
+    /// the header. The caller frees the header after the `&StructHeader` borrow
+    /// ends so magic scrubbing and deallocation never alias a live reference.
+    #[inline(always)]
+    fn drop_weak_count(&self, ptr: i64, switches: u8) -> bool {
+        if self.is_local(switches) {
+            crate::share::check_local(switches, ptr, "weak release");
+            return count_down(&self.weak, true) == 1;
+        }
+        // a count of one is ours alone: a new weak reference is made only from a
+        // strong or a weak one, and there is neither, so the drop needs no
+        // read-modify-write. the acquire load pairs with the release decrements
+        // of the holders that went before.
+        if self.weak.load(Ordering::Acquire) != 1 {
+            if self.weak.fetch_sub(1, Ordering::Release) != 1 {
+                return false;
+            }
+            acquire_last_count!(self.weak);
+        }
+        true
+    }
+}
+
+/// Validate `ptr` as a struct handle for `op` and borrow its header for the
+/// duration of `f`. A count path that already knows quarantine is off passes
+/// `REPORT = false` and skips the freed-magic test.
 #[inline(always)]
-unsafe fn struct_local(base: *mut u8, switches: u8) -> bool {
-    switches & crate::switches::LOCAL_COUNTS != 0
-        && struct_flags(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT == 0
+unsafe fn with_struct_header_for<const REPORT: bool, R>(
+    ptr: i64,
+    op: crate::quarantine::Op,
+    f: impl FnOnce(&StructHeader) -> R,
+) -> Option<R> {
+    if ptr == 0 || (ptr as u64) % 8 != 0 {
+        return None;
+    }
+    let base = (ptr as usize).checked_sub(STRUCT_HEADER)? as *const StructHeader;
+    // SAFETY: `ptr` is non-null, 8-aligned, and `>= STRUCT_HEADER`; read magic at offset 0.
+    let magic = unsafe { std::ptr::addr_of!((*base).magic).read() };
+    if magic != STRUCT_MAGIC {
+        if REPORT {
+            // SAFETY: `base` is only used as a lookup key in quarantine reporting.
+            unsafe { crate::quarantine::miss(magic, std::ptr::addr_of!((*base).magic), op) };
+        }
+        return None;
+    }
+    // SAFETY: Magic matched `STRUCT_MAGIC`; caller keeps the header live for `f`.
+    let header = unsafe { &*base };
+    Some(f(header))
+}
+
+#[inline(always)]
+unsafe fn with_struct_header<R>(ptr: i64, f: impl FnOnce(&StructHeader) -> R) -> Option<R> {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_struct_header_for::<true, R>(ptr, crate::quarantine::Op::Use, f) }
 }
 
 /// Whether the struct at `ptr` is marked shared. False for anything that is
 /// not a live struct.
 pub(crate) unsafe fn struct_is_shared(ptr: i64) -> bool {
-    match struct_base(ptr) {
-        Some(base) => struct_flags(base).load(Ordering::Relaxed) & STRUCT_SHARED_BIT != 0,
-        None => false,
-    }
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_struct_header(ptr, |h| h.flags.load(Ordering::Relaxed) & STRUCT_SHARED_BIT != 0) }
+        .unwrap_or(false)
+}
+
+fn mark_struct_shared_impl(h: &StructHeader) -> bool {
+    h.flags.fetch_or(STRUCT_SHARED_BIT, Ordering::Release) & STRUCT_SHARED_BIT == 0
 }
 
 /// Mark the struct at `ptr` shared; true when this call set the mark.
 pub(crate) unsafe fn struct_mark_shared(ptr: i64) -> bool {
-    match struct_base(ptr) {
-        Some(base) => {
-            struct_flags(base).fetch_or(STRUCT_SHARED_BIT, Ordering::Release) & STRUCT_SHARED_BIT == 0
-        }
-        None => false,
-    }
-}
-
-/// The header's flag word at STRUCT_OFF_DEAD: the dead, buffered and shared
-/// bits above.
-unsafe fn struct_flags(base: *mut u8) -> &'static AtomicU32 {
-    &*(base.add(STRUCT_OFF_DEAD) as *const AtomicU32)
-}
-
-// drop one unit of weak; free the allocation when it reaches zero. this is the
-// single place a struct header is deallocated, so the strong path and every
-// weak reference funnel their final drop through here.
-#[inline]
-unsafe fn struct_weak_drop(base: *mut u8, switches: u8) {
-    let weak = struct_weak(base);
-    if struct_local(base, switches) {
-        crate::share::check_local(switches, base.add(STRUCT_HEADER) as i64, "weak release");
-        if count_down(weak, true) == 1 {
-            struct_free_header_for(base, switches);
-        }
-        return;
-    }
-    // a count of one is ours alone: a new weak reference is made only from a
-    // strong or a weak one, and there is neither, so the drop needs no
-    // read-modify-write. the acquire load pairs with the release decrements
-    // of the holders that went before.
-    if weak.load(Ordering::Acquire) != 1 {
-        if weak.fetch_sub(1, Ordering::Release) != 1 {
-            return;
-        }
-        acquire_last_count!(weak);
-    }
-    struct_free_header_for(base, switches);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { with_struct_header(ptr, mark_struct_shared_impl) }.unwrap_or(false)
 }
 
 /// `struct_free_header` with quarantine read from `switches`. The quarantine
-/// copy stays out of line, so the free path keeps `struct_weak_drop` small
-/// enough to inline into its callers.
-unsafe fn struct_free_header_for(base: *mut u8, switches: u8) {
+/// copy stays out of line, so the free path stays small enough to inline.
+unsafe fn struct_free_header_for(ptr: i64, switches: u8) {
     if switches & crate::switches::QUARANTINE != 0 {
-        struct_free_header_quarantined(base);
+        // SAFETY: Preconditions forwarded from caller.
+        unsafe { struct_free_header_quarantined(ptr) };
     } else {
-        struct_free_header::<false>(base);
+        // SAFETY: Preconditions forwarded from caller.
+        unsafe { struct_free_header::<false>(ptr) };
     }
 }
 
 #[cold]
 #[inline(never)]
-unsafe fn struct_free_header_quarantined(base: *mut u8) {
-    struct_free_header::<true>(base);
+unsafe fn struct_free_header_quarantined(ptr: i64) {
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { struct_free_header::<true>(ptr) };
+}
+
+#[inline(always)]
+unsafe fn free_struct_header_if<const HOOKED: bool>(ptr: i64, switches: u8) {
+    if HOOKED {
+        // SAFETY: Preconditions forwarded from caller.
+        unsafe { struct_free_header_for(ptr, switches) };
+    } else {
+        // SAFETY: Preconditions forwarded from caller.
+        unsafe { struct_free_header::<false>(ptr) };
+    }
 }
 
 /// Scrub and free (or pool) a struct header nothing references any more, or
 /// keep it poisoned under quarantine. A release that knows quarantine is off
 /// takes the `false` copy and pays nothing for it.
-unsafe fn struct_free_header<const QUARANTINE: bool>(base: *mut u8) {
-    crate::share::forget_owner(base.add(STRUCT_HEADER) as i64);
-    let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
+unsafe fn struct_free_header<const QUARANTINE: bool>(ptr: i64) {
+    crate::share::forget_owner(ptr);
+    let base = (ptr as usize - STRUCT_HEADER) as *mut u8;
+    // SAFETY: Sole owner of `base`; read the recorded field byte size.
+    let size = unsafe { (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize };
     let total = size + STRUCT_HEADER;
     if QUARANTINE {
-        crate::quarantine::bury_now(base, total, base as *mut u32, crate::quarantine::Kind::Struct);
+        // SAFETY: Sole owner; poison and mark the full `total`-byte block.
+        unsafe { crate::quarantine::bury_now(base, total, base as *mut u32, crate::quarantine::Kind::Struct) };
         return;
     }
     // scrub the magic so any stale pointer fails the check
-    (base as *mut u32).write(0);
+    // SAFETY: Sole owner and no `&StructHeader` borrow is live.
+    unsafe { (base as *mut u32).write(0) };
     // keep the block on the per-thread freelist when it fits; otherwise free it.
-    if !struct_pool_return(base, total) {
-        std::alloc::dealloc(base, pith_layout(total, 8));
+    // SAFETY: Sole owner; `base` was allocated with `pith_layout(total, 8)`.
+    if !unsafe { struct_pool_return(base, total) } {
+        // SAFETY: Matches the allocation layout from `pith_struct_alloc`.
+        unsafe { std::alloc::dealloc(base, pith_layout(total, 8)) };
     }
 }
 
@@ -3906,16 +4232,18 @@ pub(crate) fn optional_tuple(is_some: bool, value: i64) -> i64 {
     if !is_some {
         return 0;
     }
+    // SAFETY: `pith_struct_alloc(2)` allocates a fresh 2-field struct.
+    let tuple = unsafe { pith_struct_alloc(2) };
+    if tuple == 0 {
+        return 0;
+    }
+    // SAFETY: `tuple` points to 2 newly allocated writable `i64` field slots.
     unsafe {
-        let tuple = pith_struct_alloc(2);
-        if tuple == 0 {
-            return 0;
-        }
         let ptr = tuple as *mut i64;
         *ptr = 1;
         *ptr.add(1) = value;
-        tuple
     }
+    tuple
 }
 
 /// An optional getter's answer as a `T?`: see `optional_tuple`.
@@ -3942,46 +4270,13 @@ pub(crate) fn optional_pair(found: Option<i64>) -> crate::ffi_util::ResultPair {
     }
 }
 
-unsafe fn struct_base(ptr: i64) -> Option<*mut u8> {
-    struct_base_for::<true>(ptr, crate::quarantine::Op::Use)
-}
-
-/// `struct_base`, naming what the caller does with the struct in a
-/// quarantine report. A count path that knows quarantine is off passes
-/// `REPORT = false` and skips the freed-magic test.
-#[inline(always)]
-unsafe fn struct_base_for<const REPORT: bool>(ptr: i64, op: crate::quarantine::Op) -> Option<*mut u8> {
-    if ptr == 0 || (ptr as u64) % 8 != 0 {
-        return None;
-    }
-    let base = (ptr as usize).checked_sub(STRUCT_HEADER)? as *mut u8;
-    let magic = (base as *const u32).read();
-    if magic != STRUCT_MAGIC {
-        if REPORT {
-            crate::quarantine::miss(magic, base as *const u32, op);
-        }
-        return None;
-    }
-    Some(base)
-}
-
 /// The struct check generated code makes under quarantine before it touches
 /// a field (see `quarantine::pith_quarantine_check_struct`).
 pub(crate) unsafe fn quarantine_check_struct(ptr: i64) {
-    let Some(base) = struct_base(ptr) else {
-        return;
-    };
-    if struct_flags(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
+    // SAFETY: Preconditions forwarded from generated code under quarantine.
+    let dead = unsafe { with_struct_header(ptr, |h| h.flags.load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0) };
+    if dead == Some(true) {
         crate::quarantine::dead_struct(crate::quarantine::Op::Use);
-    }
-}
-
-/// Under quarantine, a count operation on a struct whose value already died
-/// is reported, the same as one on a freed struct.
-#[inline(always)]
-unsafe fn quarantine_check_alive(base: *mut u8, op: crate::quarantine::Op) {
-    if crate::quarantine::on() && struct_flags(base).load(Ordering::Acquire) & STRUCT_DEAD_BIT != 0 {
-        crate::quarantine::dead_struct(op);
     }
 }
 
@@ -3996,9 +4291,8 @@ pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
     // or on an optional shell a runtime call has just returned, so the struct
     // cannot have been freed yet. skipping the quarantine report keeps this
     // path free of a stack frame.
-    if let Some(base) = struct_base_for::<false>(ptr, crate::quarantine::Op::Use) {
-        (base.add(STRUCT_OFF_DTOR) as *mut u64).write(dtor as u64);
-    }
+    // SAFETY: `ptr` is validated by `with_struct_header_for` before storing `dtor`.
+    unsafe { with_struct_header_for::<false, _>(ptr, crate::quarantine::Op::Use, |h| h.dtor.store(dtor as u64, Ordering::Relaxed)) };
 }
 
 /// One more owner of this struct.
@@ -4009,9 +4303,11 @@ pub unsafe extern "C" fn pith_struct_set_dtor(ptr: i64, dtor: i64) {
 pub unsafe extern "C" fn pith_struct_retain(ptr: i64) {
     let switches = crate::switches::get();
     if switches & STRUCT_RETAIN_HOOKS != 0 {
-        return struct_retain_hooked(ptr, switches);
+        // SAFETY: Preconditions forwarded from caller.
+        return unsafe { struct_retain_hooked(ptr, switches) };
     }
-    struct_retain::<false>(ptr, switches);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { struct_retain::<false>(ptr, switches) };
 }
 
 // the switches that add work to a struct retain. with none of them on, the
@@ -4023,7 +4319,28 @@ const STRUCT_RETAIN_HOOKS: u8 =
 #[cold]
 #[inline(never)]
 unsafe fn struct_retain_hooked(ptr: i64, switches: u8) {
-    struct_retain::<true>(ptr, switches);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { struct_retain::<true>(ptr, switches) };
+}
+
+#[inline(always)]
+fn struct_retain_impl<const HOOKED: bool>(h: &StructHeader, ptr: i64, switches: u8) {
+    if HOOKED {
+        h.quarantine_check_alive(crate::quarantine::Op::Retain);
+    }
+    let flags = h.flags.load(Ordering::Relaxed);
+    // a backstop: a value already destroyed is never revived. every weak
+    // read takes its count through `weak_upgrade`, so nothing should
+    // retain a dead struct; one that does gets no count, and its matching
+    // release lands on the over-release guard in `struct_release`.
+    if flags & STRUCT_DEAD_BIT != 0 {
+        return;
+    }
+    let local = switches & crate::switches::LOCAL_COUNTS != 0 && flags & STRUCT_SHARED_BIT == 0;
+    if HOOKED && local {
+        crate::share::check_local(switches, ptr, "retain");
+    }
+    count_up(&h.strong, local);
 }
 
 #[inline(always)]
@@ -4031,24 +4348,8 @@ unsafe fn struct_retain<const HOOKED: bool>(ptr: i64, switches: u8) {
     if HOOKED {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RETAIN);
     }
-    if let Some(base) = struct_base_for::<HOOKED>(ptr, crate::quarantine::Op::Retain) {
-        if HOOKED {
-            quarantine_check_alive(base, crate::quarantine::Op::Retain);
-        }
-        let flags = struct_flags(base).load(Ordering::Relaxed);
-        // a backstop: a value already destroyed is never revived. every weak
-        // read takes its count through `weak_upgrade`, so nothing should
-        // retain a dead struct; one that does gets no count, and its matching
-        // release lands on the over-release guard in `struct_release`.
-        if flags & STRUCT_DEAD_BIT != 0 {
-            return;
-        }
-        let local = switches & crate::switches::LOCAL_COUNTS != 0 && flags & STRUCT_SHARED_BIT == 0;
-        if HOOKED && local {
-            crate::share::check_local(switches, ptr, "retain");
-        }
-        count_up(struct_strong(base), local);
-    }
+    // SAFETY: `ptr` is validated by `with_struct_header_for` before bumping its count.
+    unsafe { with_struct_header_for::<HOOKED, _>(ptr, crate::quarantine::Op::Retain, |h| struct_retain_impl::<HOOKED>(h, ptr, switches)) };
 }
 
 /// The number of strong owners this struct has right now; 0 for a pointer
@@ -4064,10 +4365,8 @@ unsafe fn struct_retain<const HOOKED: bool>(ptr: i64, switches: u8) {
 /// ptr must be a pith_struct_alloc result, 0, or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_strong_count(ptr: i64) -> i64 {
-    match struct_base(ptr) {
-        Some(base) => struct_strong(base).load(Ordering::Acquire) as i64,
-        None => 0,
-    }
+    // SAFETY: `ptr` is validated by `with_struct_header` before loading its strong count.
+    unsafe { with_struct_header(ptr, |h| h.strong.load(Ordering::Acquire) as i64) }.unwrap_or(0)
 }
 
 /// Drop one owner; the last strong release runs the destructor (releasing the
@@ -4080,9 +4379,11 @@ pub unsafe extern "C" fn pith_struct_strong_count(ptr: i64) -> i64 {
 pub unsafe extern "C" fn pith_struct_release(ptr: i64) {
     let switches = crate::switches::get();
     if switches & STRUCT_RELEASE_HOOKS != 0 {
-        return struct_release_hooked(ptr, switches);
+        // SAFETY: Preconditions forwarded from caller.
+        return unsafe { struct_release_hooked(ptr, switches) };
     }
-    struct_release::<false>(ptr, switches);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { struct_release::<false>(ptr, switches) };
 }
 
 // the switches that add work to a struct release, kept out of line for the
@@ -4095,28 +4396,59 @@ const STRUCT_RELEASE_HOOKS: u8 = crate::switches::PERF_STATS
 #[cold]
 #[inline(never)]
 unsafe fn struct_release_hooked(ptr: i64, switches: u8) {
-    struct_release::<true>(ptr, switches);
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { struct_release::<true>(ptr, switches) };
+}
+
+enum StructReleaseStep {
+    Keep,
+    FreeNow,
+    RunDtor(u64),
+}
+
+/// Tail of the last strong release after any destructor has run. Returns `true`
+/// when the caller must free the header once the `&StructHeader` borrow ends.
+#[inline(always)]
+unsafe fn struct_release_finish<const HOOKED: bool>(h: &StructHeader, ptr: i64, switches: u8) -> bool {
+    if HOOKED {
+        crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+    }
+    // with only the implicit weak unit left, nothing can read the dead flag,
+    // so the header is freed without setting it. a destructor that made a
+    // weak reference, or a suspect buffer holding one, keeps the full path.
+    if h.weak.load(Ordering::Acquire) == 1 {
+        return true;
+    }
+    // the value is now dead; a weak read after this returns none. the release
+    // ordering publishes the destructor's writes to any thread whose weak load
+    // sees the flag. fetch_or rather than a store so a concurrently-set
+    // buffered bit survives. then drop the implicit weak unit, which frees the
+    // header if no weak refs remain. for a buffered struct the suspect
+    // buffer's weak count keeps the header alive past this point.
+    if HOOKED && crate::quarantine::on() {
+        // a weak reference keeps the header, but the fields were released:
+        // poison them so a read through a stale pointer cannot pass for data
+        // SAFETY: Fields at `ptr..ptr+h.size` sit after `StructHeader` and have no strong owners left.
+        unsafe { std::ptr::write_bytes(ptr as *mut u8, crate::quarantine::POISON, h.size as usize) };
+    }
+    h.flags.fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
+    h.drop_weak_count(ptr, switches)
 }
 
 #[inline(always)]
-unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
+unsafe fn struct_release_step<const HOOKED: bool>(
+    h: &StructHeader,
+    ptr: i64,
+    switches: u8,
+) -> StructReleaseStep {
     if HOOKED {
-        crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RELEASE);
+        h.quarantine_check_alive(crate::quarantine::Op::Release);
     }
-    let Some(base) = struct_base_for::<HOOKED>(ptr, crate::quarantine::Op::Release) else {
-        return;
-    };
-    if HOOKED {
-        quarantine_check_alive(base, crate::quarantine::Op::Release);
-    }
-    let strong = struct_strong(base);
     // the sole owner of a struct that no weak reference holds is the only
     // party that can reach it: no other thread can retain, release or
     // upgrade it, so the last release skips the decrement. the acquire
     // loads pair with the release decrements of the owners that went before.
-    let weak = struct_weak(base);
-    let sole = strong.load(Ordering::Acquire) == 1
-        && weak.load(Ordering::Acquire) == 1;
+    let sole = h.strong.load(Ordering::Acquire) == 1 && h.weak.load(Ordering::Acquire) == 1;
     if HOOKED && sole {
         crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_SOLE_RELEASE);
     }
@@ -4130,28 +4462,29 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
         // hook's feet. if other owners release between this load and our
         // decrement, the struct simply dies buffered, which the death path
         // below already supports.
-        if HOOKED && switches & crate::switches::CYCLE_GC != 0 && strong.load(Ordering::Relaxed) > 1 {
-            maybe_suspect_struct(ptr, base);
+        if HOOKED && switches & crate::switches::CYCLE_GC != 0 && h.strong.load(Ordering::Relaxed) > 1 {
+            // SAFETY: Caller still holds a strong count on `ptr`, matching `h`.
+            unsafe { maybe_suspect_struct(ptr, h) };
         }
-        let local = struct_local(base, switches);
+        let local = h.is_local(switches);
         if HOOKED && local {
             crate::share::check_local(switches, ptr, "release");
         }
-        let prev = count_down(strong, local);
+        let prev = count_down(&h.strong, local);
         if prev > 1 {
-            return;
+            return StructReleaseStep::Keep;
         }
         if prev == 0 {
             if HOOKED {
                 crate::quarantine::over_release(crate::quarantine::Kind::Struct);
             }
             // over-release: restore and leave the object alone
-            strong.fetch_add(1, Ordering::Relaxed);
-            return;
+            h.strong.fetch_add(1, Ordering::Relaxed);
+            return StructReleaseStep::Keep;
         }
-        acquire_last_count!(strong);
+        acquire_last_count!(h.strong);
     }
-    let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
+    let dtor = h.dtor.load(Ordering::Relaxed);
     if dtor != 0 {
         // a destructor may run user code: a `Drop` method that binds `self`
         // or passes it along, which retains and releases the value. with the
@@ -4166,39 +4499,46 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
         // the guard is `STRUCT_DTOR_GUARD` rather than one, so a weak upgrade
         // racing the destructor can tell it from a live count and refuse it.
         // the release store pairs with the acquire loads in `weak_upgrade`.
-        strong.store(STRUCT_DTOR_GUARD, Ordering::Release);
-        // panic-guard: calling a compiler-emitted struct destructor from its header slot.
-        let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
-        f(ptr);
+        h.strong.store(STRUCT_DTOR_GUARD, Ordering::Release);
+        return StructReleaseStep::RunDtor(dtor);
     }
+    // SAFETY: Last strong release on `ptr`, matching `h`, with no destructor.
+    if unsafe { struct_release_finish::<HOOKED>(h, ptr, switches) } {
+        StructReleaseStep::FreeNow
+    } else {
+        StructReleaseStep::Keep
+    }
+}
+
+#[inline(always)]
+unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
     if HOOKED {
-        crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+        crate::perf::count_rc_op(switches, crate::perf::RC_STRUCT_RELEASE);
     }
-    // with only the implicit weak unit left, nothing can read the dead flag,
-    // so the header is freed without setting it. a destructor that made a
-    // weak reference, or a suspect buffer holding one, keeps the full path.
-    if weak.load(Ordering::Acquire) == 1 {
-        if HOOKED {
-            struct_free_header_for(base, switches);
-        } else {
-            struct_free_header::<false>(base);
-        }
+    // SAFETY: `ptr` is validated by `with_struct_header_for` before decrementing its count.
+    let Some(step) = (unsafe { with_struct_header_for::<HOOKED, _>(ptr, crate::quarantine::Op::Release, |h| struct_release_step::<HOOKED>(h, ptr, switches)) }) else {
         return;
+    };
+    match step {
+        StructReleaseStep::Keep => {}
+        StructReleaseStep::FreeNow => {
+            // SAFETY: Last weak unit was dropped and `&StructHeader` borrow has ended.
+            unsafe { free_struct_header_if::<HOOKED>(ptr, switches) };
+        }
+        StructReleaseStep::RunDtor(dtor) => {
+            // panic-guard: calling a compiler-emitted struct destructor from its header slot.
+            let f: unsafe extern "C" fn(i64) = unsafe { std::mem::transmute(dtor as usize) };
+            // SAFETY: `dtor` is the compiled destructor for `ptr`, running under `STRUCT_DTOR_GUARD`.
+            unsafe { f(ptr) };
+            let base = (ptr as usize - STRUCT_HEADER) as *const StructHeader;
+            // SAFETY: The implicit weak unit keeps the header alive across `f(ptr)`.
+            let should_free = unsafe { struct_release_finish::<HOOKED>(&*base, ptr, switches) };
+            if should_free {
+                // SAFETY: Last weak unit was dropped and `&StructHeader` borrow has ended.
+                unsafe { free_struct_header_if::<HOOKED>(ptr, switches) };
+            }
+        }
     }
-    // the value is now dead; a weak read after this returns none. the release
-    // ordering publishes the destructor's writes to any thread whose weak load
-    // sees the flag. fetch_or rather than a store so a concurrently-set
-    // buffered bit survives. then drop the implicit weak unit, which frees the
-    // header if no weak refs remain. for a buffered struct the suspect
-    // buffer's weak count keeps the header alive past this point.
-    if HOOKED && crate::quarantine::on() {
-        // a weak reference keeps the header, but the fields were released:
-        // poison them so a read through a stale pointer cannot pass for data
-        let size = (base.add(STRUCT_OFF_SIZE) as *const u64).read() as usize;
-        std::ptr::write_bytes(base.add(STRUCT_HEADER), crate::quarantine::POISON, size);
-    }
-    struct_flags(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
-    struct_weak_drop(base, switches);
 }
 
 /// Mark a struct as a cycle suspect: set the buffered bit, take the weak
@@ -4207,24 +4547,21 @@ unsafe fn struct_release<const HOOKED: bool>(ptr: i64, switches: u8) {
 /// The caller still holds a strong count, so the header is alive throughout.
 #[cold]
 #[inline(never)]
-unsafe fn maybe_suspect_struct(ptr: i64, base: *mut u8) {
-    if struct_flags(base).fetch_or(STRUCT_BUFFERED_BIT, Ordering::Relaxed)
-        & STRUCT_BUFFERED_BIT
-        != 0
-    {
+unsafe fn maybe_suspect_struct(ptr: i64, h: &StructHeader) {
+    if h.flags.fetch_or(STRUCT_BUFFERED_BIT, Ordering::Relaxed) & STRUCT_BUFFERED_BIT != 0 {
         return; // already buffered
     }
-    struct_weak(base).fetch_add(1, Ordering::Relaxed);
-    crate::cycle::cycle_suspect(ptr as usize, crate::cycle::CYCLE_KIND_STRUCT);
+    h.weak.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: Caller holds a strong count on `ptr`, buffered bit is set, and buffer owns a weak count.
+    unsafe { crate::cycle::cycle_suspect(ptr as usize, crate::cycle::CYCLE_KIND_STRUCT) };
 }
 
 /// Drop a struct's buffered mark (overflow, or a collector drain). The
 /// caller drops the buffer's weak count separately; magic-checked so a
 /// header that is already gone is a no-op.
 pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
-    if let Some(base) = struct_base(ptr) {
-        struct_flags(base).fetch_and(!STRUCT_BUFFERED_BIT, Ordering::Relaxed);
-    }
+    // SAFETY: Preconditions forwarded from cycle collector.
+    unsafe { with_struct_header(ptr, |h| h.flags.fetch_and(!STRUCT_BUFFERED_BIT, Ordering::Relaxed)) };
 }
 
 // --- collector-facing struct accessors --------------------------------------
@@ -4238,49 +4575,57 @@ pub(crate) unsafe fn cycle_clear_struct_buffered(ptr: i64) {
 /// buffer's for a drained entry), `None` when the pointer is not a struct
 /// header at all.
 pub(crate) unsafe fn cycle_struct_alive(ptr: i64) -> Option<bool> {
-    let base = struct_base(ptr)?;
-    Some(struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0)
+    // SAFETY: Preconditions forwarded from cycle collector.
+    unsafe { with_struct_header(ptr, |h| h.flags.load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0) }
+}
+
+fn live_struct_strong_count(h: &StructHeader) -> Option<u32> {
+    if h.flags.load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
+        return None;
+    }
+    Some(h.strong.load(Ordering::Relaxed))
 }
 
 /// The struct's current strong count, or `None` for a dead value or a
 /// non-struct pointer. The collector must never seed a graph node from a
 /// dead value.
 pub(crate) unsafe fn cycle_struct_strong_count(ptr: i64) -> Option<u32> {
-    let base = struct_base(ptr)?;
-    if struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT != 0 {
-        return None;
-    }
-    Some(struct_strong(base).load(Ordering::Relaxed))
+    // SAFETY: Preconditions forwarded from cycle collector.
+    unsafe { with_struct_header(ptr, live_struct_strong_count) }.flatten()
 }
 
 /// The compiled destructor in the header's dtor slot, or 0 for none (a
 /// dtor-less box is a leaf to the collector: no rc children to walk).
 pub(crate) unsafe fn cycle_struct_dtor_slot(ptr: i64) -> u64 {
-    match struct_base(ptr) {
-        Some(base) => (base.add(STRUCT_OFF_DTOR) as *const u64).read(),
-        None => 0,
-    }
+    // SAFETY: Preconditions forwarded from cycle collector / share walk.
+    unsafe { with_struct_header(ptr, |h| h.dtor.load(Ordering::Relaxed)) }.unwrap_or(0)
 }
 
 /// Add `delta` to the strong count: the collector's teardown guard.
 pub(crate) unsafe fn cycle_struct_guard_strong(ptr: i64, delta: u32) {
-    if let Some(base) = struct_base(ptr) {
-        struct_strong(base).fetch_add(delta, Ordering::Relaxed);
-    }
+    // SAFETY: Preconditions forwarded from cycle collector.
+    unsafe { with_struct_header(ptr, |h| h.strong.fetch_add(delta, Ordering::Relaxed)) };
 }
 
 /// Run a garbage struct's destructor: the same body the last strong release
 /// would have run, releasing every field the struct owns.
 pub(crate) unsafe fn cycle_struct_run_dtor(ptr: i64) {
-    let Some(base) = struct_base(ptr) else {
+    // SAFETY: Preconditions forwarded from cycle collector.
+    let Some(dtor) = (unsafe { with_struct_header(ptr, |h| h.dtor.load(Ordering::Relaxed)) }) else {
         return;
     };
-    let dtor = (base.add(STRUCT_OFF_DTOR) as *const u64).read();
     if dtor != 0 {
         // panic-guard: calling a compiler-emitted struct destructor from its header slot.
-        let f: unsafe extern "C" fn(i64) = std::mem::transmute(dtor as usize);
-        f(ptr);
+        let f: unsafe extern "C" fn(i64) = unsafe { std::mem::transmute(dtor as usize) };
+        // SAFETY: `dtor` is the compiled destructor for `ptr`, invoked under collector guard.
+        unsafe { f(ptr) };
     }
+}
+
+fn mark_dead_and_drop_weak(h: &StructHeader, ptr: i64, switches: u8) -> bool {
+    crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
+    h.flags.fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
+    h.drop_weak_count(ptr, switches)
 }
 
 /// Free a garbage struct's shell: the tail of `pith_struct_release` minus
@@ -4289,26 +4634,34 @@ pub(crate) unsafe fn cycle_struct_run_dtor(ptr: i64) {
 /// weak unit, so outstanding weak references keep holding the header exactly
 /// as they would after a normal death.
 pub(crate) unsafe fn cycle_struct_free_dead(ptr: i64) {
-    let Some(base) = struct_base(ptr) else {
-        return;
-    };
-    crate::perf_count(&crate::PERF_STRUCT_FREES, 1);
-    struct_flags(base).fetch_or(STRUCT_DEAD_BIT, Ordering::Release);
-    struct_weak_drop(base, crate::switches::get());
+    let switches = crate::switches::get();
+    // SAFETY: Preconditions forwarded from cycle collector.
+    let should_free = unsafe { with_struct_header(ptr, |h| mark_dead_and_drop_weak(h, ptr, switches)) };
+    if should_free == Some(true) {
+        // SAFETY: Last weak unit was dropped and `&StructHeader` borrow has ended.
+        unsafe { struct_free_header_for(ptr, switches) };
+    }
 }
 
 #[cfg(test)]
 pub(crate) unsafe fn struct_dead_word_for_tests(ptr: i64) -> u32 {
-    struct_base(ptr)
-        .map(|base| struct_flags(base).load(Ordering::Relaxed))
-        .unwrap_or(u32::MAX)
+    // SAFETY: Preconditions forwarded from test caller.
+    unsafe { with_struct_header(ptr, |h| h.flags.load(Ordering::Relaxed)) }.unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
 pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
-    struct_base(ptr)
-        .map(|base| struct_weak(base).load(Ordering::Relaxed))
-        .unwrap_or(u32::MAX)
+    // SAFETY: Preconditions forwarded from test caller.
+    unsafe { with_struct_header(ptr, |h| h.weak.load(Ordering::Relaxed)) }.unwrap_or(u32::MAX)
+}
+
+#[inline(always)]
+fn struct_weak_retain_impl(h: &StructHeader, ptr: i64, switches: u8) {
+    let local = h.is_local(switches);
+    if local {
+        crate::share::check_local(switches, ptr, "weak retain");
+    }
+    count_up(&h.weak, local);
 }
 
 /// One more weak (non-owning) reference to this struct. Does not affect the
@@ -4320,13 +4673,8 @@ pub(crate) unsafe fn struct_weak_count_for_tests(ptr: i64) -> u32 {
 pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
     let switches = crate::switches::get();
     crate::perf::count_rc_op(switches, crate::perf::RC_WEAK_RETAIN);
-    if let Some(base) = struct_base(ptr) {
-        let local = struct_local(base, switches);
-        if local {
-            crate::share::check_local(switches, ptr, "weak retain");
-        }
-        count_up(struct_weak(base), local);
-    }
+    // SAFETY: `ptr` is validated by `with_struct_header` before bumping its weak count.
+    unsafe { with_struct_header(ptr, |h| struct_weak_retain_impl(h, ptr, switches)) };
 }
 
 /// Drop one weak reference; frees the header if this was the last hold on it.
@@ -4337,8 +4685,30 @@ pub unsafe extern "C" fn pith_struct_weak_retain(ptr: i64) {
 pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
     let switches = crate::switches::get();
     crate::perf::count_rc_op(switches, crate::perf::RC_WEAK_RELEASE);
-    if let Some(base) = struct_base(ptr) {
-        struct_weak_drop(base, switches);
+    // SAFETY: `ptr` is validated by `with_struct_header` before dropping its weak count.
+    let should_free = unsafe { with_struct_header(ptr, |h| h.drop_weak_count(ptr, switches)) };
+    if should_free == Some(true) {
+        // SAFETY: Last weak unit was dropped and `&StructHeader` borrow has ended.
+        unsafe { struct_free_header_for(ptr, switches) };
+    }
+}
+
+#[inline(always)]
+fn struct_weak_upgrade_impl(h: &StructHeader) -> bool {
+    let switches = crate::switches::get();
+    if h.is_local(switches) {
+        // only the task that built it can reach a local struct, so nothing
+        // can release it between this check and the increment.
+        let count = h.strong.load(Ordering::Relaxed);
+        let live = h.flags.load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0
+            && count != 0
+            && count < STRUCT_DTOR_GUARD;
+        if live {
+            h.strong.store(count + 1, Ordering::Relaxed);
+        }
+        live
+    } else {
+        weak_upgrade(&h.strong, &h.flags)
     }
 }
 
@@ -4356,25 +4726,8 @@ pub unsafe extern "C" fn pith_struct_weak_release(ptr: i64) {
 /// ptr must be a pith_struct_alloc result, 0, or garbage (magic-checked).
 #[no_mangle]
 pub unsafe extern "C" fn pith_struct_weak_upgrade(ptr: i64) -> i64 {
-    let Some(base) = struct_base(ptr) else {
-        return 0;
-    };
-    let switches = crate::switches::get();
-    let upgraded = if struct_local(base, switches) {
-        // only the task that built it can reach a local struct, so nothing
-        // can release it between this check and the increment.
-        let strong = struct_strong(base);
-        let count = strong.load(Ordering::Relaxed);
-        let live = struct_flags(base).load(Ordering::Relaxed) & STRUCT_DEAD_BIT == 0
-            && count != 0
-            && count < STRUCT_DTOR_GUARD;
-        if live {
-            strong.store(count + 1, Ordering::Relaxed);
-        }
-        live
-    } else {
-        weak_upgrade(struct_strong(base), struct_flags(base))
-    };
+    // SAFETY: `ptr` is validated by `with_struct_header` before upgrading.
+    let upgraded = unsafe { with_struct_header(ptr, struct_weak_upgrade_impl) }.unwrap_or(false);
     if upgraded {
         ptr
     } else {
@@ -4427,8 +4780,10 @@ impl Drop for WeakFieldGuard {
 pub unsafe extern "C" fn pith_struct_weak_load_field(holder: i64, offset: i64) -> i64 {
     let slot = holder + offset;
     let _guard = WeakFieldGuard::lock(slot);
-    let target = (*(slot as *const AtomicI64)).load(Ordering::Acquire);
-    pith_struct_weak_upgrade(target)
+    // SAFETY: Caller guarantees `holder + offset` points to an aligned `AtomicI64` weak field.
+    let target = unsafe { (*(slot as *const AtomicI64)).load(Ordering::Acquire) };
+    // SAFETY: Guard keeps the field's weak count alive while upgrading `target`.
+    unsafe { pith_struct_weak_upgrade(target) }
 }
 
 /// Store `target`, on which the caller took a weak count, into the weak field
@@ -4443,9 +4798,11 @@ pub unsafe extern "C" fn pith_struct_weak_store_field(holder: i64, offset: i64, 
     let slot = holder + offset;
     let old = {
         let _guard = WeakFieldGuard::lock(slot);
-        (*(slot as *const AtomicI64)).swap(target, Ordering::AcqRel)
+        // SAFETY: Caller guarantees `holder + offset` points to an aligned `AtomicI64` weak field.
+        unsafe { (*(slot as *const AtomicI64)).swap(target, Ordering::AcqRel) }
     };
-    pith_struct_weak_release(old);
+    // SAFETY: The field previously owned one weak count on `old`.
+    unsafe { pith_struct_weak_release(old) };
 }
 
 /// The upgrade itself, on a struct's strong count and flag word: add one to

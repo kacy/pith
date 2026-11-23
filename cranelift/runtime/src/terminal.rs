@@ -19,7 +19,7 @@
 //!   string, so a trap mid-frame still hands back a working shell. SIGKILL and
 //!   a segfault bypass `exit` and are not covered.
 
-use crate::bytes::{pith_bytes_from_vec, pith_bytes_ref};
+use crate::bytes::{pith_bytes_from_vec, with_bytes};
 use crate::fdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -75,7 +75,7 @@ pub extern "C" fn pith_term_is_tty(fd: i64) -> i64 {
         return 0;
     }
     // SAFETY: isatty on any fd is a read-only query.
-    unsafe { i64::from(libc::isatty(fd as i32) == 1) }
+    i64::from(unsafe { libc::isatty(fd as i32) } == 1)
 }
 
 /// save `fd`'s termios and enter raw mode (`cfmakeraw`, `VMIN=1`/`VTIME=0`).
@@ -87,23 +87,26 @@ pub extern "C" fn pith_term_raw_enter(fd: i64) -> i64 {
         return 0;
     }
     let fd = fd as i32;
-    // SAFETY: zeroed termios filled by tcgetattr before any read of it.
-    unsafe {
-        let mut termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(fd, &mut termios) != 0 {
-            return 0;
-        }
-        let saved_state = termios;
-        let mut raw = termios;
-        libc::cfmakeraw(&mut raw);
-        // one byte at a time, no read timeout: the poll in `pith_term_read`
-        // owns all waiting, so a read issued after a successful poll returns
-        // immediately with at least one byte.
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        if libc::tcsetattr(fd, libc::TCSANOW, &raw) != 0 {
-            return 0;
-        }
+    // SAFETY: `termios` is POD; filled by `tcgetattr` below before any read.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    // SAFETY: `tcgetattr` initializes `termios` on this stack.
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return 0;
+    }
+    let saved_state = termios;
+    let mut raw = termios;
+    // SAFETY: `cfmakeraw` modifies our local `termios` in place.
+    unsafe { libc::cfmakeraw(&mut raw) };
+    // one byte at a time, no read timeout: the poll in `pith_term_read`
+    // owns all waiting, so a read issued after a successful poll returns
+    // immediately with at least one byte.
+    raw.c_cc[libc::VMIN] = 1;
+    raw.c_cc[libc::VTIME] = 0;
+    // SAFETY: `tcsetattr` applies our initialized raw `termios` to `fd`.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+        return 0;
+    }
+    {
         let mut saved = crate::sync::lock(&SAVED);
         if saved.is_none() {
             *saved = Some((fd, saved_state));
@@ -112,9 +115,7 @@ pub extern "C" fn pith_term_raw_enter(fd: i64) -> i64 {
     if !ATEXIT_ARMED.swap(true, Ordering::SeqCst) {
         // SAFETY: registering a plain extern "C" hook; atexit accepts exactly
         // this (see green.rs and perf.rs for the precedent).
-        unsafe {
-            libc::atexit(restore_at_exit);
-        }
+        unsafe { libc::atexit(restore_at_exit) };
     }
     1
 }
@@ -135,17 +136,16 @@ pub extern "C" fn pith_term_size(fd: i64) -> i64 {
     if fd < 0 {
         return -1;
     }
+    // SAFETY: `winsize` is POD; filled by `TIOCGWINSZ` ioctl before any read.
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     // SAFETY: ioctl writing a winsize of exactly the size we declare.
-    unsafe {
-        let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(fd as i32, libc::TIOCGWINSZ, &mut ws) != 0 {
-            return -1;
-        }
-        if ws.ws_col == 0 && ws.ws_row == 0 {
-            return -1;
-        }
-        ((ws.ws_row as i64) << 16) | (ws.ws_col as i64)
+    if unsafe { libc::ioctl(fd as i32, libc::TIOCGWINSZ, &mut ws) } != 0 {
+        return -1;
     }
+    if ws.ws_col == 0 && ws.ws_row == 0 {
+        return -1;
+    }
+    ((ws.ws_row as i64) << 16) | (ws.ws_col as i64)
 }
 
 /// read up to `max` bytes from `fd`, waiting at most `timeout_ms` (-1 waits
@@ -189,21 +189,7 @@ pub extern "C" fn pith_term_read(fd: i64, max: i64, timeout_ms: i64) -> i64 {
     }
 }
 
-/// write all of a `Bytes` value to `fd`, looping over partial writes. returns
-/// the byte count on success, -1 on a bad handle or an error mid-write. no
-/// newline is appended: that is the point.
-#[no_mangle]
-pub extern "C" fn pith_term_write(fd: i64, data: i64) -> i64 {
-    if fd < 0 {
-        return -1;
-    }
-    // SAFETY: the magic check inside rejects anything that is not a live
-    // Bytes handle.
-    let bytes = match unsafe { pith_bytes_ref(data) } {
-        Some(b) => b,
-        None => return -1,
-    };
-    let buf = &bytes.data;
+fn write_all_fd(fd: i64, buf: &[u8]) -> i64 {
     let mut written = 0usize;
     while written < buf.len() {
         let rest = &buf[written..];
@@ -230,6 +216,18 @@ pub extern "C" fn pith_term_write(fd: i64, data: i64) -> i64 {
     written as i64
 }
 
+/// write all of a `Bytes` value to `fd`, looping over partial writes. returns
+/// the byte count on success, -1 on a bad handle or an error mid-write. no
+/// newline is appended: that is the point.
+#[no_mangle]
+pub extern "C" fn pith_term_write(fd: i64, data: i64) -> i64 {
+    if fd < 0 {
+        return -1;
+    }
+    // SAFETY: `with_bytes` validates `data` before borrowing its slice.
+    unsafe { with_bytes(data, |buf| write_all_fd(fd, buf)) }.unwrap_or(-1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,16 +240,14 @@ mod tests {
     /// a pty pair: master fd for the "terminal side", slave fd for the
     /// process side. built from posix_openpt so the tests need no real tty.
     fn open_pty() -> (i32, i32) {
-        unsafe {
-            let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
-            assert!(master >= 0, "posix_openpt failed");
-            assert_eq!(libc::grantpt(master), 0);
-            assert_eq!(libc::unlockpt(master), 0);
-            let name = pty_name(master);
-            let slave = libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY);
-            assert!(slave >= 0, "open slave failed");
-            (master, slave)
-        }
+        let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(master >= 0, "posix_openpt failed");
+        assert_eq!(unsafe { libc::grantpt(master) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+        let name = pty_name(master);
+        let slave = unsafe { libc::open(name.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
+        assert!(slave >= 0, "open slave failed");
+        (master, slave)
     }
 
     /// the slave device path for a pty master. uses ptsname_r because
@@ -271,7 +267,7 @@ mod tests {
     }
 
     fn bytes_slice(handle: i64) -> Vec<u8> {
-        unsafe { pith_bytes_ref(handle).expect("valid bytes handle").data.clone() }
+        unsafe { with_bytes(handle, <[u8]>::to_vec) }.expect("valid bytes handle")
     }
 
     #[test]

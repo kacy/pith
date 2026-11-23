@@ -84,7 +84,8 @@ fn set_thread_frame(frame: usize) {
 /// call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_isolate_call(closure: i64) -> *mut i8 {
-    let func = crate::pith_closure_get_fn(closure);
+    // SAFETY: Caller guarantees `closure` is a live pith closure handle.
+    let func = unsafe { crate::pith_closure_get_fn(closure) };
     if func == 0 {
         return crate::runtime_core::pith_cstring_empty();
     }
@@ -98,24 +99,29 @@ pub unsafe extern "C" fn pith_isolate_call(closure: i64) -> *mut i8 {
     // after the call: a failure writes it from another function.
     let fp: *mut Frame = &mut frame;
     set_head(fp);
-    run(fp, func, closure);
+    // SAFETY: `fp` points to our live stack frame and `func`/`closure` form a valid pith closure.
+    unsafe { run(fp, func, closure) };
     // read the head's slot afresh: the task may be on another thread by now.
-    set_head((*fp).prev);
-    let locks = std::mem::take(&mut (*fp).locks);
-    match (*fp).message.take() {
+    // SAFETY: `fp` points to our stack-local `frame`.
+    let prev = unsafe { (*fp).prev };
+    set_head(prev);
+    // SAFETY: `fp` is unlinked from the catch chain and uniquely owned by this stack frame.
+    let (locks, message) = unsafe { (std::mem::take(&mut (*fp).locks), (*fp).message.take()) };
+    match message {
         None => {
             // a call that returned holding a lock leaves it held, as any
             // function may. an enclosing frame takes the entries over, so a
             // failure further out still finds them.
-            let prev = (*fp).prev;
             if !prev.is_null() && !locks.is_empty() {
-                (*prev).locks.extend(locks);
+                // SAFETY: `prev` is an enclosing catch frame still live on this same stack.
+                unsafe { (*prev).locks.extend(locks) };
             }
             crate::runtime_core::pith_cstring_empty()
         }
         Some(message) => {
             for handle in locks.into_iter().rev() {
-                crate::concurrency::mutex::pith_mutex_unlock(handle as *mut _);
+                // SAFETY: Each recorded handle came from `note_lock` for a mutex locked by this call.
+                unsafe { crate::concurrency::mutex::pith_mutex_unlock(handle as *mut _) };
             }
             crate::runtime_core::pith_strdup_string(&message)
         }
@@ -125,7 +131,8 @@ pub unsafe extern "C" fn pith_isolate_call(closure: i64) -> *mut i8 {
 /// call `func(closure)` behind the frame `fp`.
 #[inline(always)]
 unsafe fn run(fp: *mut Frame, func: i64, closure: i64) {
-    isolate_enter(std::ptr::addr_of_mut!((*fp).sp), func, closure);
+    // SAFETY: Caller guarantees `fp` is a live catch frame and `func`/`closure` are callable.
+    unsafe { isolate_enter(std::ptr::addr_of_mut!((*fp).sp), func, closure) };
 }
 
 /// whether this target has a catch frame. without one, `isolate_enter` is a
@@ -160,32 +167,47 @@ extern "C" {
     fn __asan_handle_no_return();
 }
 
+#[cold]
+#[inline(never)]
+unsafe fn note_lock_slow(frame: *mut Frame, handle: usize) {
+    // SAFETY: Caller guarantees `frame` is the running task's live catch frame.
+    unsafe { (*frame).locks.push(handle) };
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn note_unlock_slow(mut frame: *mut Frame, handle: usize) {
+    while !frame.is_null() {
+        // SAFETY: frames on the chain are live, as in `fail`.
+        let locks = unsafe { &mut (*frame).locks };
+        if let Some(i) = locks.iter().rposition(|&h| h == handle) {
+            locks.remove(i);
+            return;
+        }
+        // SAFETY: frames on the chain are live, as in `fail`.
+        frame = unsafe { (*frame).prev };
+    }
+}
+
 /// A mutex the running task just locked. Inside an isolated call it is
 /// recorded, so a failure can unlock it.
-#[inline]
+#[inline(always)]
 pub(crate) fn note_lock(handle: usize) {
     let frame = head();
     if !frame.is_null() {
         // SAFETY: the running task's own frame.
-        unsafe { (*frame).locks.push(handle) };
+        unsafe { note_lock_slow(frame, handle) };
     }
 }
 
 /// A mutex the running task just unlocked: forget the newest record of it on
 /// the chain, if any.
-#[inline]
+#[inline(always)]
 pub(crate) fn note_unlock(handle: usize) {
-    let mut frame = head();
-    while !frame.is_null() {
+    let frame = head();
+    if !frame.is_null() {
         // SAFETY: frames on the chain are live, as in `fail`.
-        unsafe {
-            let locks = &mut (*frame).locks;
-            if let Some(i) = locks.iter().rposition(|&h| h == handle) {
-                locks.remove(i);
-                return;
-            }
-            frame = (*frame).prev;
-        }
+        unsafe { note_unlock_slow(frame, handle) };
     }
 }
 
@@ -293,8 +315,9 @@ unsafe extern "C" fn isolate_resume(sp: usize) -> ! {
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 unsafe extern "C" fn isolate_enter(_sp_slot: *mut usize, func: i64, closure: i64) {
+    // SAFETY: Caller guarantees `func` is a valid closure entry point for the pith closure ABI.
     // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
-    let f: extern "C" fn(i64) -> i64 = std::mem::transmute(func as usize);
+    let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(func as usize) };
     f(closure);
 }
 
@@ -343,10 +366,9 @@ mod tests {
         let fp: *mut Frame = &mut frame;
         set_head(fp);
         unsafe { run(fp, func as usize as i64, 0) };
-        unsafe {
-            set_head((*fp).prev);
-            (*fp).message.take()
-        }
+        let prev = unsafe { (*fp).prev };
+        set_head(prev);
+        unsafe { (*fp).message.take() }
     }
 
     #[test]

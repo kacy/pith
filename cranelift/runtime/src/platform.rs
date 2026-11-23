@@ -1,7 +1,7 @@
 //! process-level builtins: exit, sleep, clocks, reading a stdin line, `exec`,
 //! the shared random number generator, and float formatting.
 
-use crate::ffi_util::cstr_str;
+use crate::ffi_util::with_cstr_str;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -93,20 +93,9 @@ pub unsafe extern "C" fn pith_input() -> *mut i8 {
     std::ptr::null_mut()
 }
 
-/// Execute a command and return exit code
-///
-/// the child runs to completion via the process pool (see `process`), so a
-/// green worker is not held for however long the command takes.
-///
-/// # Safety
-/// command must be a valid null-terminated C string
-#[no_mangle]
-pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
+fn exec_command_str(cmd_str: &str) -> i64 {
     use std::process::Command;
 
-    let Some(cmd_str) = cstr_str(command) else {
-        return -1;
-    };
     let parts: Vec<&str> = cmd_str.split_whitespace().collect();
     if parts.is_empty() {
         return -1;
@@ -122,6 +111,19 @@ pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
         Some(status) => crate::process::exit_code(status),
         None => -1,
     }
+}
+
+/// Execute a command and return exit code
+///
+/// the child runs to completion via the process pool (see `process`), so a
+/// green worker is not held for however long the command takes.
+///
+/// # Safety
+/// command must be a valid null-terminated C string
+#[no_mangle]
+pub unsafe extern "C" fn pith_exec(command: *const i8) -> i64 {
+    // SAFETY: Caller guarantees `command` is null or a valid null-terminated C string.
+    unsafe { with_cstr_str(command, exec_command_str) }.unwrap_or(-1)
 }
 
 /// the multiplier/increment of the LCG behind `pith_random_float` (knuth's
@@ -181,10 +183,13 @@ pub unsafe extern "C" fn pith_random_string(len: i64) -> *mut i8 {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     let n = len.max(0) as usize;
 
-    let ptr = crate::pith_alloc_cstring(n);
-    for i in 0..n {
+    // SAFETY: Allocates a non-null cstring buffer of `n` writable bytes plus trailing NUL.
+    let ptr = unsafe { crate::pith_alloc_cstring(n) };
+    // SAFETY: `ptr` is non-null and uniquely owned for `n` uninitialized bytes.
+    let buf = unsafe { std::slice::from_raw_parts_mut(ptr.cast::<std::mem::MaybeUninit<u8>>(), n) };
+    for byte in buf {
         let idx = (pith_random_float() * CHARSET.len() as f64) as usize % CHARSET.len();
-        *ptr.add(i) = CHARSET[idx] as i8;
+        byte.write(CHARSET[idx]);
     }
     ptr
 }

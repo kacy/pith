@@ -234,16 +234,40 @@ impl Slab {
 #[no_mangle]
 pub unsafe extern "C" fn pith_spawn(closure_handle: i64) -> i64 {
     // what the new task captured is reachable from two tasks from here on
-    crate::share::share_value(closure_handle, crate::collections::list::ListTypeTag::Closure);
-    crate::concurrency::scheduler::spawn(closure_handle)
+    // SAFETY: `closure_handle` is a live closure handle or 0 (validated downstream).
+    unsafe {
+        crate::share::share_value(closure_handle, crate::collections::list::ListTypeTag::Closure);
+        crate::concurrency::scheduler::spawn(closure_handle)
+    }
 }
 
-/// Spawn for the os-thread backend: one OS thread per task.
-pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
-    if closure_handle == 0 {
-        return 0;
-    }
+/// Run a compiler-emitted Pith closure body and release the task's owned
+/// closure reference.
+///
+/// # Safety
+/// `closure_handle` must be a valid Pith closure handle whose ownership was
+/// transferred to the task.
+unsafe fn run_task_closure(closure_handle: i64) -> i64 {
+    // SAFETY: `closure_handle` is a valid closure handle; `pith_closure_get_fn` validates it.
+    let func_ptr = unsafe { crate::pith_closure_get_fn(closure_handle) };
+    let result = if func_ptr == 0 {
+        0
+    } else {
+        // SAFETY: `func_ptr` came from a valid Pith closure header matching `extern "C" fn(i64) -> i64`.
+        // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
+        let func: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(func_ptr as *const ()) };
+        func(closure_handle)
+    };
+    // the body has run, so release the one closure reference the task owned.
+    // otherwise every spawned task leaks its closure environment (the emitter
+    // moves the closure into `spawn` and never releases it). mirrors the green
+    // backend's release in `finish_task`.
+    // SAFETY: Task owned one reference to `closure_handle` transferred by `spawn`.
+    unsafe { crate::pith_closure_release(closure_handle) };
+    result
+}
 
+fn os_thread_spawn_with(run: impl FnOnce() -> i64 + Send + 'static) -> i64 {
     let shared = Arc::new((
         Mutex::new(TaskShared {
             done: false,
@@ -278,19 +302,7 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
     let join_handle = std::thread::spawn(move || {
         crate::cycle::adopt_mutator_slot(cycle_slot);
         crate::stack_guard::enter_thread();
-        let func_ptr = crate::pith_closure_get_fn(closure_handle);
-        let result = if func_ptr == 0 {
-            0
-        } else {
-            // panic-guard: calling a compiler-emitted closure body through the pith closure abi.
-            let func: extern "C" fn(i64) -> i64 = std::mem::transmute(func_ptr as *const ());
-            func(closure_handle)
-        };
-        // the body has run, so release the one closure reference the task owned.
-        // otherwise every spawned task leaks its closure environment (the emitter
-        // moves the closure into `spawn` and never releases it). mirrors the green
-        // backend's release in `finish_task`.
-        crate::pith_closure_release(closure_handle);
+        let result = run();
         crate::runtime_core::release_thread_tls();
         // publish completion to awaiters (condvar).
         {
@@ -325,6 +337,15 @@ pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
     task_handle
 }
 
+/// Spawn for the os-thread backend: one OS thread per task.
+pub(crate) unsafe fn os_thread_spawn(closure_handle: i64) -> i64 {
+    if closure_handle == 0 {
+        return 0;
+    }
+    // SAFETY: Caller guarantees `closure_handle` is a valid closure handle transferred to this task.
+    os_thread_spawn_with(move || unsafe { run_task_closure(closure_handle) })
+}
+
 /// Codegen-facing await entrypoint. Routes through the scheduler seam, the
 /// mirror of `pith_spawn`.
 #[no_mangle]
@@ -337,7 +358,7 @@ pub unsafe extern "C" fn pith_await(task_handle: i64) -> i64 {
 /// handle unregistered; a second await of the same handle, whether it runs
 /// after the first or alongside it, and an await of a stale/garbage one,
 /// safely return 0.
-pub(crate) unsafe fn os_thread_await(task_handle: i64) -> i64 {
+pub(crate) fn os_thread_await(task_handle: i64) -> i64 {
     if !handle_registry::is_valid_id(task_handle, HandleKind::Task) {
         return 0;
     }
@@ -590,9 +611,7 @@ mod tests {
     #[test]
     fn ffi_entrypoints_reject_garbage_handles() {
         for &bogus in &[0_i64, -1, i64::MAX, i64::MIN, 999_999_999] {
-            // SAFETY: os_thread_await is unsafe only because a valid handle would
-            // join a thread; a bogus handle is rejected before any of that.
-            assert_eq!(unsafe { os_thread_await(bogus) }, 0);
+            assert_eq!(os_thread_await(bogus), 0);
             assert_eq!(os_thread_is_done(bogus), 0);
             os_thread_detach(bogus); // must not panic
         }

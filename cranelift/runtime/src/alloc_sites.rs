@@ -32,6 +32,7 @@ pub(crate) fn start() -> bool {
         return false;
     }
     PERIOD.store(period, Ordering::Relaxed);
+    // SAFETY: `report` is a valid `extern "C" fn()` registered once at startup.
     unsafe {
         libc::atexit(report);
     }

@@ -20,14 +20,15 @@ static INSTALL: Once = Once::new();
 /// install the SIGILL handler once per process.
 pub(crate) fn install() {
     INSTALL.call_once(|| {
-        // SAFETY: plain libc calls on locals.
+        // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = on_sigill as *const () as usize;
+        // SA_NODEFER: the error path may leave the handler without
+        // returning, and SIGILL must not stay blocked when it does.
+        action.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
+        // SAFETY: `sigemptyset` and `sigaction` are plain libc calls on stack-local storage.
         unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_sigill as *const () as usize;
             libc::sigemptyset(&mut action.sa_mask);
-            // SA_NODEFER: the error path may leave the handler without
-            // returning, and SIGILL must not stay blocked when it does.
-            action.sa_flags = libc::SA_SIGINFO | libc::SA_NODEFER;
             libc::sigaction(libc::SIGILL, &action, std::ptr::null_mut());
         }
     });
@@ -35,8 +36,9 @@ pub(crate) fn install() {
 
 /// whether the instruction at `pc` is the trap the code generator emits.
 ///
-/// SAFETY: `pc` is the faulting address the kernel reported for SIGILL, so
-/// the instruction there is mapped and readable.
+/// # Safety
+/// `pc` must be null or the faulting address the kernel reported for SIGILL,
+/// where the instruction bytes are mapped and readable.
 unsafe fn is_trap_instruction(pc: *const u8) -> bool {
     if pc.is_null() {
         return false;
@@ -44,12 +46,14 @@ unsafe fn is_trap_instruction(pc: *const u8) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
         // ud2
-        *pc == 0x0f && *pc.add(1) == 0x0b
+        // SAFETY: Caller guarantees `pc` points to a mapped faulting instruction.
+        unsafe { *pc == 0x0f && *pc.add(1) == 0x0b }
     }
     #[cfg(target_arch = "aarch64")]
     {
         // udf #imm16: the top sixteen bits of the word are zero
-        (pc as *const u32).read_unaligned() >> 16 == 0
+        // SAFETY: Caller guarantees `pc` points to a mapped 4-byte faulting instruction.
+        unsafe { (pc as *const u32).read_unaligned() >> 16 == 0 }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
@@ -72,11 +76,11 @@ extern "C" fn on_sigill(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
         // the same thread (a green worker running another task) was then
         // a blocked SIGILL, which the kernel turns into a kill. put back the
         // mask the faulting code ran with, as sigreturn would.
-        // SAFETY: an SA_SIGINFO handler's third argument is the ucontext of
-        // the interrupted code.
-        unsafe {
-            let uc = ctx as *const libc::ucontext_t;
-            if !uc.is_null() {
+        let uc = ctx as *const libc::ucontext_t;
+        if !uc.is_null() {
+            // SAFETY: an SA_SIGINFO handler's third argument is the ucontext of
+            // the interrupted code, and `pthread_sigmask` is async-signal-safe.
+            unsafe {
                 libc::pthread_sigmask(libc::SIG_SETMASK, &(*uc).uc_sigmask, std::ptr::null_mut());
             }
         }
@@ -89,14 +93,16 @@ extern "C" fn on_sigill(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut 
     // not ours: restore the default action and let the process die of SIGILL
     // as it would have. a fault re-raises itself when the instruction runs
     // again; a signal someone sent (code <= 0) does not, so send it again.
-    // SAFETY: plain libc calls on locals.
+    // SAFETY: `libc::sigaction` is a C POD struct valid to zero-initialize.
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = libc::SIG_DFL;
+    // SAFETY: `sigemptyset` and `sigaction` are async-signal-safe on stack-local storage.
     unsafe {
-        let mut action: libc::sigaction = std::mem::zeroed();
-        action.sa_sigaction = libc::SIG_DFL;
         libc::sigemptyset(&mut action.sa_mask);
         libc::sigaction(sig, &action, std::ptr::null_mut());
-        if code <= 0 {
-            libc::raise(sig);
-        }
+    }
+    if code <= 0 {
+        // SAFETY: `raise` is async-signal-safe.
+        unsafe { libc::raise(sig) };
     }
 }

@@ -1,4 +1,5 @@
-use crate::bytes::pith_bytes_ref;
+use crate::bytes::with_bytes;
+use crate::ffi_util::with_cstr_bytes;
 
 fn skip_ws(input: &[u8], mut pos: usize) -> usize {
     while pos < input.len() && matches!(input[pos], b' ' | b'\t' | b'\n' | b'\r') {
@@ -55,21 +56,28 @@ pub unsafe extern "C" fn pith_json_float_bits(ptr: i64, start: i64, end: i64) ->
     if ptr == 0 || start < 0 || end < start {
         return JSON_FLOAT_REFUSED;
     }
-    let span = std::slice::from_raw_parts((ptr as *const u8).add(start as usize), (end - start) as usize);
+    // SAFETY: Caller guarantees the bytes `ptr[start..end]` are readable.
+    let span = unsafe {
+        std::slice::from_raw_parts((ptr as *const u8).add(start as usize), (end - start) as usize)
+    };
     match float_of_span(span) {
         Some(value) => value.to_bits() as i64,
         None => JSON_FLOAT_REFUSED,
     }
 }
 
-unsafe fn alloc_result(is_ok: i64, ok: i64, err: i64) -> i64 {
-    let tuple = crate::pith_struct_alloc(3) as *mut i64;
+fn alloc_result(is_ok: i64, ok: i64, err: i64) -> i64 {
+    // SAFETY: Allocates a fresh 3-slot struct; null is checked before writing slots 0..3.
+    let tuple = unsafe { crate::pith_struct_alloc(3) } as *mut i64;
     if tuple.is_null() {
         return 0;
     }
-    *tuple = is_ok;
-    *tuple.add(1) = ok;
-    *tuple.add(2) = err;
+    // SAFETY: `tuple` is a freshly allocated, non-null 3-slot struct.
+    unsafe {
+        *tuple = is_ok;
+        *tuple.add(1) = ok;
+        *tuple.add(2) = err;
+    }
     tuple as i64
 }
 
@@ -78,19 +86,26 @@ unsafe fn alloc_result(is_ok: i64, ok: i64, err: i64) -> i64 {
 /// compiler's `JsonDecodeError`, whose own destructor does the same, but
 /// this one is allocated here and the compiler never attaches one to it.
 unsafe extern "C" fn decode_error_dtor(ptr: i64) {
-    let message = *(ptr as *const i64);
+    // SAFETY: `ptr` is the 1-slot error struct allocated by `err_result`.
+    let message = unsafe { *(ptr as *const i64) };
     if message != 0 {
-        crate::pith_cstring_release(message as *const i8);
+        // SAFETY: Slot 0 holds an owned pith C string written by `err_result`.
+        unsafe { crate::pith_cstring_release(message as *const i8) };
     }
 }
 
-unsafe fn err_result(message: &[u8]) -> i64 {
-    let error = crate::pith_struct_alloc(1) as *mut i64;
+fn err_result(message: &[u8]) -> i64 {
+    // SAFETY: Allocates a fresh 1-slot error struct; null is checked before writing slot 0.
+    let error = unsafe { crate::pith_struct_alloc(1) } as *mut i64;
     if error.is_null() {
         return 0;
     }
-    *error = crate::pith_copy_bytes_to_cstring(message) as i64;
-    crate::pith_struct_set_dtor(error as i64, decode_error_dtor as *const () as usize as i64);
+    let msg = crate::pith_copy_bytes_to_cstring(message) as i64;
+    // SAFETY: `error` is a freshly allocated, non-null 1-slot struct; `decode_error_dtor` matches its layout.
+    unsafe {
+        *error = msg;
+        crate::pith_struct_set_dtor(error as i64, decode_error_dtor as *const () as usize as i64);
+    }
     alloc_result(0, 0, error as i64)
 }
 
@@ -653,45 +668,154 @@ fn nested_skip_object(input: &[u8], pos: usize, depth: usize) -> Result<usize, N
 /// parent outranks it too.
 type NestedFill = Result<(usize, Option<Vec<u8>>), NestedAbort>;
 
-/// The destructor address at index `k` of the table the lowering passed,
-/// or None when the table has no such entry (a spec naming an index the
-/// table lacks is a lowering defect, and the fill fails rather than
-/// attaching a wrong address). `k` is -1 for a pre-allocated struct, which
-/// never asks.
-unsafe fn nested_dtor_at(dtors: *const i64, k: i64, count: usize) -> Option<i64> {
-    if k < 0 || k as usize >= count || dtors.is_null() {
-        return None;
+/// A validated destructor address taken from the lowering's destructor table
+/// (0 means no destructor is needed for the struct).
+#[derive(Clone, Copy)]
+struct ValidDtor(i64);
+
+impl ValidDtor {
+    /// Allocate the struct a list element or a struct field under one needs:
+    /// `field_count` zeroed slots, with this destructor attached when non-zero.
+    /// Returns `None` when the allocation failed, which the caller treats as a
+    /// malformed fill.
+    #[inline(always)]
+    fn alloc_object(self, spec: &[u8]) -> Option<ObjectTarget<'_>> {
+        let field_count = nested_spec_field_count(spec);
+        // SAFETY: Allocates a fresh zeroed struct with `field_count` slots.
+        let ptr = unsafe { crate::pith_struct_alloc(field_count as i64) };
+        if ptr == 0 {
+            return None;
+        }
+        if self.0 != 0 {
+            // SAFETY: `ptr` is a freshly allocated struct and `self.0` came from `DtorTable`.
+            unsafe { crate::pith_struct_set_dtor(ptr, self.0) };
+        }
+        // SAFETY: `ptr` has `nested_spec_field_count(spec)` zeroed slots matching `spec`.
+        Some(unsafe { ObjectTarget::from_raw(spec, ptr) })
     }
-    Some(*dtors.add(k as usize))
 }
 
-/// Allocate the struct a list element or a struct field under one needs:
-/// `field_count` zeroed slots, the destructor `dtor` names attached when it
-/// is not 0. Returns 0 when the allocation failed, which the caller treats
-/// as a malformed fill.
-unsafe fn nested_alloc_struct(field_count: usize, dtor: i64) -> i64 {
-    let ptr = crate::pith_struct_alloc(field_count as i64);
-    if ptr != 0 && dtor != 0 {
-        crate::pith_struct_set_dtor(ptr, dtor);
+/// The table the entry points thread through the fill: the destructor
+/// addresses a list element struct may name.
+struct DtorTable<'a>(&'a [i64]);
+
+impl<'a> DtorTable<'a> {
+    const EMPTY: DtorTable<'static> = DtorTable(&[]);
+
+    /// # Safety
+    /// When `ptr != 0` and `count > 0`, `ptr` must point to at least `count` readable
+    /// destructor function addresses (or 0 for no destructor) valid for `'a`.
+    #[inline(always)]
+    unsafe fn from_raw(ptr: i64, count: i64) -> Self {
+        if ptr == 0 || count <= 0 {
+            return DtorTable(&[]);
+        }
+        // SAFETY: Preconditions forwarded from caller.
+        DtorTable(unsafe { std::slice::from_raw_parts(ptr as *const i64, count as usize) })
     }
-    ptr
+
+    /// The destructor address at index `k` of the table the lowering passed,
+    /// or None when the table has no such entry (a spec naming an index the
+    /// table lacks is a lowering defect, and the fill fails rather than
+    /// attaching a wrong address). `k` is -1 for a pre-allocated struct, which
+    /// never asks.
+    #[inline(always)]
+    fn get(&self, k: i64) -> Option<ValidDtor> {
+        let idx = usize::try_from(k).ok()?;
+        self.0.get(idx).copied().map(ValidDtor)
+    }
 }
 
-/// The list a field of element spec `elem` holds: the constructor is the
-/// element kind's, the same one the emitter picks for a list literal of
-/// that type (`ir_list_ctor_for_elem_kind`), so a list of strings, structs
-/// or lists owns its elements and its release cascades, and a list of
-/// ints, bools or floats holds them by value.
-unsafe fn nested_new_list(elem: &[u8]) -> i64 {
-    use crate::collections::list;
-    let handle = match elem.first() {
-        Some(b's') => list::pith_list_new_cstr(),
-        Some(b'o') => list::pith_list_new_struct(),
-        Some(b'l') => list::pith_list_new_nested_list(),
-        Some(b'm') => list::pith_list_new_nested_map(),
-        _ => list::pith_list_new_default(),
-    };
-    handle.ptr as i64
+/// A live Pith struct allocation paired with the spec describing its slots.
+///
+/// Invariant: `obj` has one `i64` slot per field in `spec`, and each pre-allocated
+/// `o` field (without `#<k>`) holds either 0 or a sub-struct laid out by its sub-spec.
+#[derive(Clone, Copy)]
+struct ObjectTarget<'a> {
+    spec: &'a [u8],
+    obj: *mut i64,
+}
+
+impl<'a> ObjectTarget<'a> {
+    /// # Safety
+    /// `struct_ptr` must be a `pith_struct_alloc` result laid out by `spec`, with
+    /// each pre-allocated `o` slot holding a struct laid out by its sub-spec.
+    #[inline(always)]
+    unsafe fn from_raw(spec: &'a [u8], struct_ptr: i64) -> Self {
+        Self {
+            spec,
+            obj: struct_ptr as *mut i64,
+        }
+    }
+
+    #[inline(always)]
+    fn as_handle(self) -> i64 {
+        self.obj as i64
+    }
+
+    #[inline(always)]
+    fn read_slot(self, idx: usize) -> i64 {
+        // SAFETY: `idx` came from `nested_lookup(self.spec, ...)`, so it is in bounds of `self.obj`.
+        unsafe { *self.obj.add(idx) }
+    }
+
+    #[inline(always)]
+    fn write_slot(self, idx: usize, value: i64) {
+        // SAFETY: `idx` came from `nested_lookup(self.spec, ...)`, so it is in bounds of `self.obj`.
+        unsafe { *self.obj.add(idx) = value };
+    }
+
+    #[inline(always)]
+    fn replace_string(self, idx: usize, bytes: &[u8]) {
+        let prev = self.read_slot(idx);
+        if prev != 0 {
+            // SAFETY: Slot holds an owned pith C string written by an earlier occurrence of this key.
+            unsafe { crate::pith_cstring_release(prev as *const i8) };
+        }
+        self.write_slot(idx, crate::pith_copy_bytes_to_cstring(bytes) as i64);
+    }
+
+    #[inline(always)]
+    fn has_object_slot(self, idx: usize, dtor: i64) -> bool {
+        dtor >= 0 || self.read_slot(idx) != 0
+    }
+
+    #[inline(always)]
+    fn child_object(self, idx: usize, sub_spec: &'a [u8]) -> ObjectTarget<'a> {
+        let child = self.read_slot(idx);
+        // SAFETY: By `ObjectTarget`'s invariant, slot `idx` holds a struct laid out by `sub_spec`.
+        unsafe { ObjectTarget::from_raw(sub_spec, child) }
+    }
+
+    #[inline(always)]
+    fn clear_struct(self, idx: usize) {
+        let prev = self.read_slot(idx);
+        if prev != 0 {
+            // SAFETY: Slot holds an owned struct allocated by an earlier occurrence of this key.
+            unsafe { crate::pith_struct_release(prev) };
+            self.write_slot(idx, 0);
+        }
+    }
+
+    #[inline(always)]
+    fn clear_list(self, idx: usize) {
+        let prev = self.read_slot(idx);
+        if prev != 0 {
+            // SAFETY: Slot holds an owned list allocated by an earlier occurrence of this key.
+            unsafe { crate::collections::list::pith_list_release_handle(prev) };
+            self.write_slot(idx, 0);
+        }
+    }
+
+    #[inline(always)]
+    fn clear_map(self, idx: usize) {
+        let prev = self.read_slot(idx);
+        if prev != 0 {
+            // SAFETY: Slot holds an owned map allocated by an earlier occurrence of this key.
+            unsafe { crate::collections::map::pith_map_release_handle(prev) };
+            self.write_slot(idx, 0);
+        }
+    }
 }
 
 /// The kind of value an element spec builds, as the tag a container owns
@@ -708,45 +832,97 @@ fn nested_elem_tag(elem: &[u8]) -> crate::collections::list::ListTypeTag {
     }
 }
 
-/// The map a `Map[String, T]` field holds: string-keyed, owning its values
-/// by the element kind's tag, as the map a literal of that type builds
-/// does, so a map of strings, structs, lists or maps releases its values
-/// with itself and a map of ints, bools or floats holds them by value.
-unsafe fn nested_new_map(elem: &[u8]) -> i64 {
-    crate::collections::map::new_string_keyed_handle(nested_elem_tag(elem))
+/// A live list handle allocated for a decoded list field or element.
+#[derive(Clone, Copy)]
+struct NestedList(crate::collections::list::PithList);
+
+impl NestedList {
+    /// The list a field of element spec `elem` holds: the constructor is the
+    /// element kind's, the same one the emitter picks for a list literal of
+    /// that type (`ir_list_ctor_for_elem_kind`), so a list of strings, structs
+    /// or lists owns its elements and its release cascades, and a list of
+    /// ints, bools or floats holds them by value.
+    #[inline(always)]
+    fn new(elem: &[u8]) -> Option<Self> {
+        use crate::collections::list;
+        // SAFETY: All `pith_list_new_*` constructors allocate a fresh list with no pointer inputs.
+        let handle = match elem.first() {
+            Some(b's') => unsafe { list::pith_list_new_cstr() },
+            Some(b'o') => unsafe { list::pith_list_new_struct() },
+            Some(b'l') => unsafe { list::pith_list_new_nested_list() },
+            Some(b'm') => unsafe { list::pith_list_new_nested_map() },
+            _ => unsafe { list::pith_list_new_default() },
+        };
+        (!handle.ptr.is_null()).then_some(NestedList(handle))
+    }
+
+    #[inline(always)]
+    fn as_handle(self) -> i64 {
+        self.0.ptr as i64
+    }
+
+    #[inline(always)]
+    fn push_value(self, value: i64) {
+        // SAFETY: `self.0` is a live list built by `NestedList::new` for primitive elements.
+        unsafe { crate::collections::list::pith_list_push_value(self.0, value) };
+    }
+
+    #[inline(always)]
+    fn push_owned(self, value: i64) {
+        // SAFETY: `self.0` is a live list built by `NestedList::new` and `value` transfers one count.
+        unsafe { crate::collections::list::pith_list_push_value_owned(self.0, value) };
+    }
 }
 
-/// Store a member into a decode-built map: a heap value hands the map its
-/// one count (the allocation's, or the fresh string's), a scalar is copied.
-/// A key already present has its earlier value released by the map, so a
-/// repeated key leaves one value, the last, and nothing stranded.
-unsafe fn nested_map_insert(map: i64, elem: &[u8], key: &[u8], value: i64) {
-    use crate::collections::list::ListTypeTag;
-    let owned = nested_elem_tag(elem) != ListTypeTag::Primitive;
-    crate::collections::map::insert_bytes_key(map, key, value, owned);
+/// A live string-keyed map handle allocated for a decoded map field or element.
+#[derive(Clone, Copy)]
+struct NestedMap(i64);
+
+impl NestedMap {
+    /// The map a `Map[String, T]` field holds: string-keyed, owning its values
+    /// by the element kind's tag, as the map a literal of that type builds
+    /// does, so a map of strings, structs, lists or maps releases its values
+    /// with itself and a map of ints, bools or floats holds them by value.
+    #[inline(always)]
+    fn new(elem: &[u8]) -> Option<Self> {
+        // SAFETY: Allocates a fresh string-keyed map with value tag `nested_elem_tag(elem)`.
+        let handle = unsafe { crate::collections::map::new_string_keyed_handle(nested_elem_tag(elem)) };
+        (handle != 0).then_some(NestedMap(handle))
+    }
+
+    #[inline(always)]
+    fn as_handle(self) -> i64 {
+        self.0
+    }
+
+    /// Store a member into a decode-built map: a heap value hands the map its
+    /// one count (the allocation's, or the fresh string's), a scalar is copied.
+    /// A key already present has its earlier value released by the map, so a
+    /// repeated key leaves one value, the last, and nothing stranded.
+    #[inline(always)]
+    fn insert(self, elem: &[u8], key: &[u8], value: i64) {
+        use crate::collections::list::ListTypeTag;
+        let owned = nested_elem_tag(elem) != ListTypeTag::Primitive;
+        // SAFETY: `self.0` is a live string-keyed map built for `elem`; `value` matches `elem`.
+        unsafe { crate::collections::map::insert_bytes_key(self.0, key, value, owned) };
+    }
 }
 
-/// The table the entry points thread through the fill: the destructor
-/// addresses a list element struct may name, and how many there are.
-struct NestedDtors {
-    table: *const i64,
-    count: usize,
-}
-
-/// Fill the struct at `obj`, laid out by `spec`, from the object opening at
-/// `pos` (the byte is `{`). A key the spec knows writes its slot; one it
-/// does not is consumed with the parser's grammar. A key that repeats has
-/// its last value win, as the node accessors read the last entry: a string
-/// slot already holding a value is released before it is overwritten, a
-/// pre-allocated struct slot is filled again in place with a fresh mask,
-/// and a list slot or a filler-allocated struct slot has its first value
-/// released before the second is built.
-///
-/// # Safety
-/// `obj` must have a slot per spec field; each `o` field's slot without a
-/// `#<k>` must hold a struct laid out by that field's sub-spec; `dtors`
-/// must hold `count` addresses or be null when no field names one.
-unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i64, dtors: &NestedDtors, depth: usize) -> NestedFill {
+/// Fill the struct behind `target` from the object opening at `pos` (the byte
+/// is `{`). A key the spec knows writes its slot; one it does not is consumed
+/// with the parser's grammar. A key that repeats has its last value win, as the
+/// node accessors read the last entry: a string slot already holding a value is
+/// released before it is overwritten, a pre-allocated struct slot is filled
+/// again in place with a fresh mask, and a list slot or a filler-allocated
+/// struct slot has its first value released before the second is built.
+fn nested_fill_object<'a>(
+    input: &[u8],
+    pos: usize,
+    target: ObjectTarget<'a>,
+    dtors: &DtorTable<'_>,
+    depth: usize,
+) -> NestedFill {
+    let spec = target.spec;
     let mut filled: u64 = 0;
     let mut wrong: u64 = 0;
     let mut deferred: Vec<(usize, Vec<u8>)> = Vec::new();
@@ -778,22 +954,18 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
             }
             Some((idx, field)) => {
                 let bit = 1u64 << idx;
-                let slot = obj.add(idx);
                 let mut ok = false;
                 match field.kind {
                     b's' if b == b'"' => {
                         let (value, end) = nested_read_string(input, pos)?;
-                        if *slot != 0 {
-                            crate::pith_cstring_release(*slot as *const i8);
-                        }
-                        *slot = crate::pith_copy_bytes_to_cstring(&value) as i64;
+                        target.replace_string(idx, &value);
                         pos = end;
                         ok = true;
                     }
                     b'i' if nested_is_number_start(b) => {
                         let (value, end) = nested_read_number(input, pos)?;
                         if let Some(value) = value {
-                            *slot = value;
+                            target.write_slot(idx, value);
                             ok = true;
                         }
                         pos = end;
@@ -807,41 +979,40 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
                         let Some(value) = float_of_span(&input[pos..end]) else {
                             return Err(NestedAbort::Malformed);
                         };
-                        *slot = value.to_bits() as i64;
+                        target.write_slot(idx, value.to_bits() as i64);
                         pos = end;
                         ok = true;
                     }
                     b'b' if input[pos..].starts_with(b"true") => {
-                        *slot = 1;
+                        target.write_slot(idx, 1);
                         pos += 4;
                         ok = true;
                     }
                     b'b' if input[pos..].starts_with(b"false") => {
-                        *slot = 0;
+                        target.write_slot(idx, 0);
                         pos += 5;
                         ok = true;
                     }
-                    b'o' if b == b'{' && (*slot != 0 || field.dtor >= 0) => {
+                    b'o' if b == b'{' && target.has_object_slot(idx, field.dtor) => {
                         let sub_spec = &spec[field.sub_start..field.sub_end];
-                        if field.dtor >= 0 {
+                        let child = if field.dtor >= 0 {
                             // a struct field under a list element: no
                             // pre-allocated slot, so allocate it here and
                             // store it before it is filled, and drop what a
                             // repeated key built before.
-                            let Some(dtor) = nested_dtor_at(dtors.table, field.dtor, dtors.count) else {
+                            let Some(dtor) = dtors.get(field.dtor) else {
                                 return Err(NestedAbort::Malformed);
                             };
-                            if *slot != 0 {
-                                crate::pith_struct_release(*slot);
-                                *slot = 0;
-                            }
-                            let sub = nested_alloc_struct(nested_spec_field_count(sub_spec), dtor);
-                            if sub == 0 {
+                            target.clear_struct(idx);
+                            let Some(sub) = dtor.alloc_object(sub_spec) else {
                                 return Err(NestedAbort::Malformed);
-                            }
-                            *slot = sub;
-                        }
-                        let (end, sub_err) = nested_fill_object(input, pos, sub_spec, *slot as *mut i64, dtors, inner_depth)?;
+                            };
+                            target.write_slot(idx, sub.as_handle());
+                            sub
+                        } else {
+                            target.child_object(idx, sub_spec)
+                        };
+                        let (end, sub_err) = nested_fill_object(input, pos, child, dtors, inner_depth)?;
                         deferred.retain(|(slot_idx, _)| *slot_idx != idx);
                         if let Some(msg) = sub_err {
                             deferred.push((idx, msg));
@@ -852,18 +1023,14 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
                     b'l' if b == b'[' => {
                         // a repeated list key: the first list and everything
                         // in it go before the second is built.
-                        if *slot != 0 {
-                            crate::collections::list::pith_list_release_handle(*slot);
-                            *slot = 0;
-                        }
+                        target.clear_list(idx);
                         let elem = &spec[field.sub_start..field.sub_end];
-                        let list = nested_new_list(elem);
-                        if list == 0 {
+                        let Some(list) = NestedList::new(elem) else {
                             return Err(NestedAbort::Malformed);
-                        }
+                        };
                         // owned by the struct from here: a failure anywhere
                         // below releases the root and the list with it.
-                        *slot = list;
+                        target.write_slot(idx, list.as_handle());
                         let name = &spec[field.name_start..field.name_end];
                         let (end, elem_err) = nested_fill_list(input, pos, elem, name, list, dtors, inner_depth)?;
                         deferred.retain(|(slot_idx, _)| *slot_idx != idx);
@@ -876,18 +1043,14 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
                     b'm' if b == b'{' => {
                         // a repeated map key: the first map and its values
                         // go before the second is built, as for a list.
-                        if *slot != 0 {
-                            crate::collections::map::pith_map_release_handle(*slot);
-                            *slot = 0;
-                        }
+                        target.clear_map(idx);
                         let elem = &spec[field.sub_start..field.sub_end];
-                        let map = nested_new_map(elem);
-                        if map == 0 {
+                        let Some(map) = NestedMap::new(elem) else {
                             return Err(NestedAbort::Malformed);
-                        }
+                        };
                         // owned by the struct before the first member is
                         // read, so a failure below cascades from the root.
-                        *slot = map;
+                        target.write_slot(idx, map.as_handle());
                         let name = &spec[field.name_start..field.name_end];
                         let (end, member_err) = nested_fill_map(input, pos, elem, name, map, dtors, inner_depth)?;
                         deferred.retain(|(slot_idx, _)| *slot_idx != idx);
@@ -955,10 +1118,15 @@ unsafe fn nested_fill_object(input: &[u8], pos: usize, spec: &[u8], obj: *mut i6
 /// any; like a field error it waits with the caller, because a malformed
 /// byte anywhere in the document outranks it. Elements after a failed one
 /// are still read, so the grammar check covers the whole array.
-///
-/// # Safety
-/// `list` must be a list handle built by `nested_new_list(elem)`.
-unsafe fn nested_fill_list(input: &[u8], pos: usize, elem: &[u8], path: &[u8], list: i64, dtors: &NestedDtors, depth: usize) -> NestedFill {
+fn nested_fill_list(
+    input: &[u8],
+    pos: usize,
+    elem: &[u8],
+    path: &[u8],
+    list: NestedList,
+    dtors: &DtorTable<'_>,
+    depth: usize,
+) -> NestedFill {
     let mut first_err: Option<Vec<u8>> = None;
     let elem_depth = depth + 1;
     let mut pos = skip_ws(input, pos + 1);
@@ -995,23 +1163,30 @@ unsafe fn nested_fill_list(input: &[u8], pos: usize, elem: &[u8], path: &[u8], l
 /// `expected <kind> element: <path>[<index>]`; a struct element's own
 /// field error comes back as `<path>[<index>]: <its message>`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn nested_fill_element(input: &[u8], pos: usize, elem: &[u8], path: &[u8], index: usize, list: i64, dtors: &NestedDtors, depth: usize) -> NestedFill {
-    use crate::collections::list::{pith_list_push_value, pith_list_push_value_owned, PithList};
-    let handle = PithList { ptr: list as *mut () };
+fn nested_fill_element(
+    input: &[u8],
+    pos: usize,
+    elem: &[u8],
+    path: &[u8],
+    index: usize,
+    list: NestedList,
+    dtors: &DtorTable<'_>,
+    depth: usize,
+) -> NestedFill {
     let b = input[pos];
     let field = nested_field_at(elem, 0);
     match field.kind {
         b's' if b == b'"' => {
             let (value, end) = nested_read_string(input, pos)?;
             let s = crate::pith_copy_bytes_to_cstring(&value) as i64;
-            pith_list_push_value_owned(handle, s);
+            list.push_owned(s);
             Ok((end, None))
         }
         b'i' if nested_is_number_start(b) => {
             let (value, end) = nested_read_number(input, pos)?;
             match value {
                 Some(value) => {
-                    pith_list_push_value(handle, value);
+                    list.push_value(value);
                     Ok((end, None))
                 }
                 None => Ok((end, Some(nested_element_error(b'i', path, index)))),
@@ -1022,50 +1197,47 @@ unsafe fn nested_fill_element(input: &[u8], pos: usize, elem: &[u8], path: &[u8]
             let Some(value) = float_of_span(&input[pos..end]) else {
                 return Err(NestedAbort::Malformed);
             };
-            pith_list_push_value(handle, value.to_bits() as i64);
+            list.push_value(value.to_bits() as i64);
             Ok((end, None))
         }
         b'b' if input[pos..].starts_with(b"true") => {
-            pith_list_push_value(handle, 1);
+            list.push_value(1);
             Ok((pos + 4, None))
         }
         b'b' if input[pos..].starts_with(b"false") => {
-            pith_list_push_value(handle, 0);
+            list.push_value(0);
             Ok((pos + 5, None))
         }
         b'o' if b == b'{' => {
             let sub_spec = &elem[field.sub_start..field.sub_end];
-            let Some(dtor) = nested_dtor_at(dtors.table, field.dtor, dtors.count) else {
+            let Some(dtor) = dtors.get(field.dtor) else {
                 return Err(NestedAbort::Malformed);
             };
-            let sub = nested_alloc_struct(nested_spec_field_count(sub_spec), dtor);
-            if sub == 0 {
+            let Some(sub) = dtor.alloc_object(sub_spec) else {
                 return Err(NestedAbort::Malformed);
-            }
+            };
             // the list takes the one count the allocation minted, before
             // any field of the element is read
-            pith_list_push_value_owned(handle, sub);
-            let (end, sub_err) = nested_fill_object(input, pos, sub_spec, sub as *mut i64, dtors, depth)?;
+            list.push_owned(sub.as_handle());
+            let (end, sub_err) = nested_fill_object(input, pos, sub, dtors, depth)?;
             Ok((end, sub_err.map(|msg| nested_element_prefixed(path, index, &msg))))
         }
         b'l' if b == b'[' => {
             let inner_elem = &elem[field.sub_start..field.sub_end];
-            let inner = nested_new_list(inner_elem);
-            if inner == 0 {
+            let Some(inner) = NestedList::new(inner_elem) else {
                 return Err(NestedAbort::Malformed);
-            }
-            pith_list_push_value_owned(handle, inner);
+            };
+            list.push_owned(inner.as_handle());
             let mut inner_path = path.to_vec();
             nested_push_index(&mut inner_path, index);
             nested_fill_list(input, pos, inner_elem, &inner_path, inner, dtors, depth)
         }
         b'm' if b == b'{' => {
             let inner_elem = &elem[field.sub_start..field.sub_end];
-            let inner = nested_new_map(inner_elem);
-            if inner == 0 {
+            let Some(inner) = NestedMap::new(inner_elem) else {
                 return Err(NestedAbort::Malformed);
-            }
-            pith_list_push_value_owned(handle, inner);
+            };
+            list.push_owned(inner.as_handle());
             let mut inner_path = path.to_vec();
             nested_push_index(&mut inner_path, index);
             nested_fill_map(input, pos, inner_elem, &inner_path, inner, dtors, depth)
@@ -1086,10 +1258,15 @@ unsafe fn nested_fill_element(input: &[u8], pos: usize, elem: &[u8], path: &[u8]
 /// Returns the position after the object and the first member error in
 /// document order, if any, for a key whose last value carried it; like an
 /// element error it waits with the caller.
-///
-/// # Safety
-/// `map` must be a map handle built by `nested_new_map(elem)`.
-unsafe fn nested_fill_map(input: &[u8], pos: usize, elem: &[u8], path: &[u8], map: i64, dtors: &NestedDtors, depth: usize) -> NestedFill {
+fn nested_fill_map(
+    input: &[u8],
+    pos: usize,
+    elem: &[u8],
+    path: &[u8],
+    map: NestedMap,
+    dtors: &DtorTable<'_>,
+    depth: usize,
+) -> NestedFill {
     let mut deferred: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let member_depth = depth + 1;
     let mut pos = skip_ws(input, pos + 1);
@@ -1140,21 +1317,30 @@ unsafe fn nested_fill_map(input: &[u8], pos: usize, elem: &[u8], path: &[u8], ma
 /// `expected <kind> element: <path>.<key>`; a struct's own field error
 /// comes back as `<path>.<key>: <its message>`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn nested_fill_member(input: &[u8], pos: usize, elem: &[u8], path: &[u8], key: &[u8], map: i64, dtors: &NestedDtors, depth: usize) -> NestedFill {
+fn nested_fill_member(
+    input: &[u8],
+    pos: usize,
+    elem: &[u8],
+    path: &[u8],
+    key: &[u8],
+    map: NestedMap,
+    dtors: &DtorTable<'_>,
+    depth: usize,
+) -> NestedFill {
     let b = input[pos];
     let field = nested_field_at(elem, 0);
     match field.kind {
         b's' if b == b'"' => {
             let (value, end) = nested_read_string(input, pos)?;
             let s = crate::pith_copy_bytes_to_cstring(&value) as i64;
-            nested_map_insert(map, elem, key, s);
+            map.insert(elem, key, s);
             Ok((end, None))
         }
         b'i' if nested_is_number_start(b) => {
             let (value, end) = nested_read_number(input, pos)?;
             match value {
                 Some(value) => {
-                    nested_map_insert(map, elem, key, value);
+                    map.insert(elem, key, value);
                     Ok((end, None))
                 }
                 None => Ok((end, Some(nested_kind_error_at(b'i', &nested_member_path(path, key))))),
@@ -1165,48 +1351,45 @@ unsafe fn nested_fill_member(input: &[u8], pos: usize, elem: &[u8], path: &[u8],
             let Some(value) = float_of_span(&input[pos..end]) else {
                 return Err(NestedAbort::Malformed);
             };
-            nested_map_insert(map, elem, key, value.to_bits() as i64);
+            map.insert(elem, key, value.to_bits() as i64);
             Ok((end, None))
         }
         b'b' if input[pos..].starts_with(b"true") => {
-            nested_map_insert(map, elem, key, 1);
+            map.insert(elem, key, 1);
             Ok((pos + 4, None))
         }
         b'b' if input[pos..].starts_with(b"false") => {
-            nested_map_insert(map, elem, key, 0);
+            map.insert(elem, key, 0);
             Ok((pos + 5, None))
         }
         b'o' if b == b'{' => {
             let sub_spec = &elem[field.sub_start..field.sub_end];
-            let Some(dtor) = nested_dtor_at(dtors.table, field.dtor, dtors.count) else {
+            let Some(dtor) = dtors.get(field.dtor) else {
                 return Err(NestedAbort::Malformed);
             };
-            let sub = nested_alloc_struct(nested_spec_field_count(sub_spec), dtor);
-            if sub == 0 {
+            let Some(sub) = dtor.alloc_object(sub_spec) else {
                 return Err(NestedAbort::Malformed);
-            }
+            };
             // the map takes the one count the allocation minted, before
             // any field of the member is read
-            nested_map_insert(map, elem, key, sub);
-            let (end, sub_err) = nested_fill_object(input, pos, sub_spec, sub as *mut i64, dtors, depth)?;
+            map.insert(elem, key, sub.as_handle());
+            let (end, sub_err) = nested_fill_object(input, pos, sub, dtors, depth)?;
             Ok((end, sub_err.map(|msg| nested_prefixed_at(&nested_member_path(path, key), &msg))))
         }
         b'l' if b == b'[' => {
             let inner_elem = &elem[field.sub_start..field.sub_end];
-            let inner = nested_new_list(inner_elem);
-            if inner == 0 {
+            let Some(inner) = NestedList::new(inner_elem) else {
                 return Err(NestedAbort::Malformed);
-            }
-            nested_map_insert(map, elem, key, inner);
+            };
+            map.insert(elem, key, inner.as_handle());
             nested_fill_list(input, pos, inner_elem, &nested_member_path(path, key), inner, dtors, depth)
         }
         b'm' if b == b'{' => {
             let inner_elem = &elem[field.sub_start..field.sub_end];
-            let inner = nested_new_map(inner_elem);
-            if inner == 0 {
+            let Some(inner) = NestedMap::new(inner_elem) else {
                 return Err(NestedAbort::Malformed);
-            }
-            nested_map_insert(map, elem, key, inner);
+            };
+            map.insert(elem, key, inner.as_handle());
             nested_fill_map(input, pos, inner_elem, &nested_member_path(path, key), inner, dtors, depth)
         }
         kind => {
@@ -1234,8 +1417,8 @@ pub unsafe extern "C" fn pith_json_fill_struct_nested(
     struct_ptr: i64,
     check_utf8: i64,
 ) -> i64 {
-    let dtors = NestedDtors { table: std::ptr::null(), count: 0 };
-    nested_fill_root(bytes_handle, spec_ptr, struct_ptr, check_utf8, &dtors)
+    // SAFETY: Preconditions forwarded from caller; no destructor table is used.
+    unsafe { nested_fill_root(bytes_handle, spec_ptr, struct_ptr, check_utf8, &DtorTable::EMPTY) }
 }
 
 /// `pith_json_fill_struct_nested` for a spec with a list field: `dtors_ptr`
@@ -1258,44 +1441,79 @@ pub unsafe extern "C" fn pith_json_fill_struct_lists(
     dtors_ptr: i64,
     dtor_count: i64,
 ) -> i64 {
-    let dtors = if dtors_ptr == 0 || dtor_count <= 0 {
-        NestedDtors { table: std::ptr::null(), count: 0 }
-    } else {
-        NestedDtors { table: dtors_ptr as *const i64, count: dtor_count as usize }
-    };
-    nested_fill_root(bytes_handle, spec_ptr, struct_ptr, check_utf8, &dtors)
+    // SAFETY: Caller guarantees `dtors_ptr` is 0 or holds at least `dtor_count` destructor addresses.
+    let dtors = unsafe { DtorTable::from_raw(dtors_ptr, dtor_count) };
+    // SAFETY: Preconditions forwarded from caller.
+    unsafe { nested_fill_root(bytes_handle, spec_ptr, struct_ptr, check_utf8, &dtors) }
 }
 
-unsafe fn nested_fill_root(bytes_handle: i64, spec_ptr: i64, struct_ptr: i64, check_utf8: i64, dtors: &NestedDtors) -> i64 {
-    let spec = crate::ffi_util::cstr_bytes(spec_ptr as *const i8).unwrap_or(&[]);
-    let outcome: Result<(), Vec<u8>> = (|| {
-        let Some(bytes) = pith_bytes_ref(bytes_handle) else {
-            return Err(b"invalid json object".to_vec());
-        };
-        let input = bytes.data.as_slice();
-        if check_utf8 != 0 && std::str::from_utf8(input).is_err() {
-            return Err(b"bytes_to_string_utf8 failed".to_vec());
-        }
-        let pos = skip_ws(input, 0);
-        if pos >= input.len() || input[pos] != b'{' {
-            return Err(b"invalid json object".to_vec());
-        }
-        let (end, field_error) = match nested_fill_object(input, pos, spec, struct_ptr as *mut i64, dtors, 1) {
-            Ok(filled) => filled,
-            Err(abort) => return Err(abort.message().to_vec()),
-        };
-        if skip_ws(input, end) < input.len() {
-            return Err(b"invalid json object".to_vec());
-        }
-        match field_error {
-            Some(msg) => Err(msg),
-            None => Ok(()),
-        }
-    })();
+fn nested_fill_from_input(
+    input: &[u8],
+    target: ObjectTarget<'_>,
+    check_utf8: bool,
+    dtors: &DtorTable<'_>,
+) -> Result<(), Vec<u8>> {
+    if check_utf8 && std::str::from_utf8(input).is_err() {
+        return Err(b"bytes_to_string_utf8 failed".to_vec());
+    }
+    let pos = skip_ws(input, 0);
+    if pos >= input.len() || input[pos] != b'{' {
+        return Err(b"invalid json object".to_vec());
+    }
+    let (end, field_error) = match nested_fill_object(input, pos, target, dtors, 1) {
+        Ok(filled) => filled,
+        Err(abort) => return Err(abort.message().to_vec()),
+    };
+    if skip_ws(input, end) < input.len() {
+        return Err(b"invalid json object".to_vec());
+    }
+    match field_error {
+        Some(msg) => Err(msg),
+        None => Ok(()),
+    }
+}
+
+unsafe fn nested_fill_with_spec(
+    bytes_handle: i64,
+    spec: &[u8],
+    struct_ptr: i64,
+    check_utf8: bool,
+    dtors: &DtorTable<'_>,
+) -> Result<(), Vec<u8>> {
+    // SAFETY: Caller guarantees `struct_ptr` is laid out by `spec`.
+    let target = unsafe { ObjectTarget::from_raw(spec, struct_ptr) };
+    // SAFETY: `with_bytes` validates `bytes_handle` before borrowing its slice.
+    unsafe {
+        with_bytes(bytes_handle, |input| {
+            nested_fill_from_input(input, target, check_utf8, dtors)
+        })
+    }
+    .unwrap_or_else(|| Err(b"invalid json object".to_vec()))
+}
+
+unsafe fn nested_fill_root(
+    bytes_handle: i64,
+    spec_ptr: i64,
+    struct_ptr: i64,
+    check_utf8: i64,
+    dtors: &DtorTable<'_>,
+) -> i64 {
+    let check_utf8 = check_utf8 != 0;
+    // SAFETY: Caller guarantees `spec_ptr` is null or a valid null-terminated C string.
+    let outcome = unsafe {
+        with_cstr_bytes(spec_ptr as *const i8, |spec| {
+            nested_fill_with_spec(bytes_handle, spec, struct_ptr, check_utf8, dtors)
+        })
+    }
+    .unwrap_or_else(|| {
+        // SAFETY: Preconditions forwarded from caller for an empty spec when `spec_ptr` is null.
+        unsafe { nested_fill_with_spec(bytes_handle, &[], struct_ptr, check_utf8, dtors) }
+    });
     match outcome {
         Ok(()) => alloc_result(1, struct_ptr, 0),
         Err(msg) => {
-            crate::pith_struct_release(struct_ptr);
+            // SAFETY: Caller transferred ownership of `struct_ptr`; release it on decode failure.
+            unsafe { crate::pith_struct_release(struct_ptr) };
             err_result(&msg)
         }
     }

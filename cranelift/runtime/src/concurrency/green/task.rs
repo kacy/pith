@@ -257,12 +257,10 @@ impl SyncArena {
                 Err(existing) => {
                     // SAFETY: `fresh` came from Box::into_raw above and was
                     // never shared.
-                    unsafe {
-                        drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
-                            fresh,
-                            ARENA_CHUNK,
-                        )));
-                    }
+                    let unused = unsafe {
+                        Box::from_raw(std::ptr::slice_from_raw_parts_mut(fresh, ARENA_CHUNK))
+                    };
+                    drop(unused);
                     chunk = existing;
                 }
             }

@@ -4119,9 +4119,24 @@ fn check_for_statement(node: Node, scope_id: Int):
 # the result with is_error_type instead of assuming success. the cache
 # is written, never consulted, on this path: calling twice on one node
 # re-checks it and can re-report.
+#
+# binary operators and method calls are dispatched here rather than in
+# check_expression_implementation. a long chain such as `a + b + ...` or
+# `x.f().g()...` recurses once per link down its left side, and skipping
+# that function's large frame on each link roughly halves the stack the
+# chain needs.
 pub fn c_check_expr(node_idx: Int, scope_id: Int) -> Int:
     prev := checker_set_current_node(node_idx)
-    result := check_expression_implementation(node_idx, scope_id)
+    node := get_node(node_idx)
+    mut result := TID_ERR
+    if node.kind == "binary":
+        result = check_binary_expression(node, scope_id)
+    elif node.kind == "method_call":
+        result = check_method_call(node, scope_id)
+        check_holding_call(node_idx, node, scope_id)
+        check_argument_labels(node_idx, node)
+    else:
+        result = check_expression_implementation(node_idx, scope_id)
     checker_restore_current_node(prev)
     expression_type_cache.insert(node_idx, result)
     return result
@@ -4173,8 +4188,6 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         return check_identifier(node_idx, node.value, scope_id)
     if node.kind == "self":
         return check_identifier(node_idx, "self", scope_id)
-    if node.kind == "binary":
-        return check_binary_expression(node, scope_id)
     if node.kind == "unary":
         return check_unary_expression(node, scope_id)
     if node.kind == "grouped":
@@ -4204,11 +4217,6 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         check_holding_call(node_idx, node, scope_id)
         check_argument_labels(node_idx, node)
         return call_tid
-    if node.kind == "method_call":
-        method_tid := check_method_call(node, scope_id)
-        check_holding_call(node_idx, node, scope_id)
-        check_argument_labels(node_idx, node)
-        return method_tid
     if node.kind == "field_access":
         return check_field_access_expression(node_idx, node, scope_id)
     if node.kind == "index":

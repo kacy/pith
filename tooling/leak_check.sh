@@ -371,11 +371,62 @@ measure() {
   echo $((high - low))
 }
 
+# Build each unique leak case once in parallel before measuring RSS
+# sequentially. Many entries share one `.pith` source with different `SHAPE=`
+# or `PITH_GREEN=` env flags, so deduplicating avoids ~85 redundant compiles,
+# while keeping measurements strictly serial so concurrent processes cannot
+# perturb peak RSS.
+jobs="${PITH_JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+case "$jobs" in
+  ''|*[!0-9]*|0) jobs=4 ;;
+esac
+
+"$pith" run examples/hello.pith > /dev/null 2>&1
+
+declare -A seen_base=()
+unique_bases=()
+for entry in "${cases[@]}"; do
+  read -r base _ <<<"$entry"
+  if [ -z "${seen_base[$base]:-}" ]; then
+    seen_base["$base"]=1
+    unique_bases+=("$base")
+  fi
+done
+
+build_status_dir="$(mktemp -d "${TMPDIR:-/tmp}/pith-leak-build-XXXXXX")"
+trap 'rm -rf "$build_status_dir"' EXIT
+
+build_one() {
+  local idx="$1"
+  local base="$2"
+  if ! "$pith" build "$base.pith" > /dev/null 2>&1; then
+    printf '%s\n' "$base" > "$build_status_dir/$idx.fail"
+  fi
+}
+
+active=0
+for idx in "${!unique_bases[@]}"; do
+  build_one "$idx" "${unique_bases[$idx]}" &
+  active=$((active + 1))
+  if [ "$active" -ge "$jobs" ]; then
+    wait -n || true
+    active=$((active - 1))
+  fi
+done
+wait || true
+
+declare -A build_failed=()
+for idx in "${!unique_bases[@]}"; do
+  if [ -f "$build_status_dir/$idx.fail" ]; then
+    build_failed["${unique_bases[$idx]}"]=1
+  fi
+done
+
 failed=0
 for entry in "${cases[@]}"; do
   # split "path KEY=VALUE..." into the case path and its extra environment
   read -r base extra_env <<<"$entry"
-  if ! "$pith" build "$base.pith" > /dev/null 2>&1; then
+  if [ -n "${build_failed[$base]:-}" ]; then
     echo "FAIL $base (build)"
     failed=1
     continue

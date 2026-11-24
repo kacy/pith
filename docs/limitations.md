@@ -13,6 +13,10 @@ stale and a fix to it is welcome.
   with payloads compares tags and then payloads, strings by content and nested
   enums recursively, but a struct payload compares by identity:
   `Box.Holds(P(1)) == Box.Holds(P(1))` is false.
+- **`==` is refused on lists, maps and sets**. it would compare the
+  handles, so the checker reports E217 instead. use `lists_equal` or
+  `sets_equal` from `std.collections`, or compare a map's length and look up
+  each key. `==` on structs still compares identity.
 - **range patterns take non-negative integer literals**. `0..=9 => ...` and
   `0..10 => ...` work on integer subjects, with or-patterns and guards. a
   negative bound (`-5..=-1`) and a named constant (`LO..=9`) do not parse, and a

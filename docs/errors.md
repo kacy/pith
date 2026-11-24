@@ -234,6 +234,16 @@ error[E217]: operator '+' not supported for types Bool and Bool
       ^^^^^^^^^^
 ```
 
+`==` and `!=` on a list, map or set report here too. on a collection they
+would compare the handles rather than the contents:
+
+```
+error[E217]: operator == is not defined on a list: it would compare identity, not contents
+  4 |     print("{a == b}")
+               ^
+  fix: compare the contents with `lists_equal(a, b)` from std.collections, or `assert_eq(a, b)` in a test
+```
+
 ### E218 — match guard must be Bool
 
 the `if` guard on a match arm doesn't evaluate to Bool.

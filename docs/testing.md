@@ -48,9 +48,10 @@ the built-in assertions are `assert`, `assert_eq` and `assert_ne`:
   assertion failed: "hello" != "world"
   ```
 
-maps, sets, and structs still compare by identity — `assert_eq` on those checks
+maps, sets, and structs still compare by identity: `assert_eq` on those checks
 whether they are the same value, not whether their contents match. compare their
-fields or elements directly when you need a deep check.
+fields or elements directly when you need a deep check; `sets_equal` in
+`std.collections` compares two sets.
 
 a failed assertion ends the process on the spot. under `pith test` that process
 is the forked child running one test, so the runner records one failure and

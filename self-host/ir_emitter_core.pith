@@ -428,6 +428,15 @@ fn ir_loop_var_pop(name: String, previous: String):
     if name.len() > 0:
         ir_loop_var_slots.insert(name, previous)
 
+# the local a returned or failed expression hands its count over from, or ""
+# when the expression is not a plain name. a name a `for` variable shadows
+# reads the loop's own slot, so it hands over nothing, and the exit cleanup
+# still has to release the function's local of that name.
+fn ir_returned_local_name(node: Node) -> String:
+    if node.kind != "ident" or ir_loop_var_slot(node.value).len() > 0:
+        return ""
+    return node.value
+
 # the storage a loop variable gets. the loop id keeps two loops in one function
 # apart, including an inner loop that reuses an outer loop's variable name.
 fn ir_loop_var_slot_name(fid: Int, name: String) -> String:
@@ -10726,7 +10735,7 @@ fn ir_emit_fail_expr(node: Node) -> Int:
         expr_node := get_node(node.children[0])
         err_kind := ir_rc_kind(ir_infer_type(node.children[0]))
         if err_kind.len() > 0:
-            if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == err_kind:
+            if ir_rc_local_kind(ir_returned_local_name(expr_node)) == err_kind:
                 exclude = expr_node.value
             elif ir_expr_is_borrowed(node.children[0]):
                 ir_rc_retain_reg(err_r, err_kind)
@@ -11899,7 +11908,7 @@ pub fn ir_emit_return_value(expr_child: Int):
     # in a generic body the inferred type can miss (a tuple-lowered
     # optional reads back as the optional type, whose rc_kind is empty),
     # yet the local is still tracked and returning it must not release it.
-    if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
+    if ir_rc_local_kind(ir_returned_local_name(expr_node)).len() > 0:
         exclude = expr_node.value
         pair_source = "local"
         box_may_share = true
@@ -11937,7 +11946,7 @@ pub fn ir_emit_return_value(expr_child: Int):
         # forwarding it (rather than wrapping in Some again) is the same
         # signal as a tuple retkind; the guard against an Optional[Tuple]
         # inner still applies.
-        ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
+        ident_tuple_local := ir_rc_local_kind(ir_returned_local_name(expr_node)) == "tuple"
         # the checker records a return of the payload type into an optional
         # return as a widening (check_return_statement). that record answers
         # what the shape tests below cannot when the payload is itself an

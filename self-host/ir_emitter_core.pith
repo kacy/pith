@@ -468,8 +468,13 @@ mut ir_interface_coercion_bypass: Map[Int, Bool] := {}
 # a small integer per concrete type converted to an interface, in first-use
 # order
 mut ir_interface_type_ids: Map[String, Int] := {}
-# methods of an interface impl, by symbol: they keep the boxed result abi
+# method symbols that keep the boxed result abi because one of the bodies
+# compiled under the symbol does not fit the register pair
 mut ir_result_reg_blocked: Map[String, Bool] := {}
+# the register-pair methods an interface value's slot points at, by symbol,
+# with their parameter counts: each gets a boxing adapter
+# (ir_emit_interface_adapters)
+mut ir_interface_adapters: Map[String, Int] := {}
 mut ir_current_func_returns_result := false
 # whether a miss (index, key, `.value()`) fails the current function. only a
 # String error can carry the miss message; a `T!E` function with any other E
@@ -699,6 +704,7 @@ fn ir_reset_type_state():
     ir_func_result_ok_kinds.clear()
     ir_result_reg_funcs.clear()
     ir_result_reg_blocked = {}
+    ir_interface_adapters = {}
     ir_rcall_defer_idx = 0 - 1
     ir_rcall_current_idx = 0 - 1
     ir_rcall_pair_ready = false
@@ -3079,8 +3085,8 @@ fn ir_emit_result_arg_release_helpers():
         ir_emit_zero_ret_endfunc()
 
 # a result box handed back whole by a function that returns the box (the box
-# abi, which generic functions and interface impls always use) has to be one
-# the caller owns alone. every caller that opens a call's box takes the
+# abi, which generic functions and most interface impl methods use) has to be
+# one the caller owns alone. every caller that opens a call's box takes the
 # payload's count over and frees the shell, which is right only when nothing
 # else holds the box. a box that also sits in a holder carries the payload
 # destructor (ir_attach_result_box_dtor), and the holder would release that
@@ -8165,46 +8171,52 @@ fn ir_method_result_ok_kind(impl_type: String, method_idx: Int) -> String:
     return ""
 
 # register a plain-impl method for the register ABI when its result shape
-# fits. interface impls (`impl Iface for T`) are excluded wholesale: their
-# defaults are shared fn_decl nodes emitted once per conforming type, and
-# their methods back generic bounds whose bodies re-emit under specialized
-# names. a generic impl target is excluded the same way a generic function
-# is: its methods re-emit per specialization while this registry keys the
-# base name. beyond that the gate matches the free-function one exactly,
-# including the lambda/spawn body exclusion (see ir_maybe_register_result_reg
-# for the rationale).
+# fits. a generic impl target is excluded the same way a generic function is:
+# its methods re-emit per specialization while this registry keys the base
+# name. beyond that the gate matches the free-function one exactly, including
+# the lambda/spawn body exclusion (see ir_maybe_register_result_reg for the
+# rationale).
+#
+# a method of an interface impl (`impl Iface for T`) does not take the pair
+# on its own: its defaults are shared fn_decl nodes emitted once per
+# conforming type, and its methods back generic bounds whose bodies re-emit
+# under specialized names. a same-named method in the type's own impl
+# compiles to the same symbol, and that one does take the pair when every
+# body under the symbol fits, whichever impl is registered first. direct
+# calls then use the pair, and an interface value's slot points at an
+# adapter that boxes the result (ir_interface_slot_target).
 fn ir_maybe_register_result_reg_method(impl_node: Node, impl_type: String, method_idx: Int, method_node: Node, module_path: String):
     if not ir_result_reg_enabled():
         return
     mut full_name := impl_type + "_" + method_node.value
     if module_path.len() > 0:
         full_name = ir_import_impl_method_name(module_path, impl_type, method_node.value)
-    # an interface impl's method keeps the boxed result: a call through an
-    # interface value (calli) expects it. a same-named method in the type's
-    # own impl compiles to the same symbol, so it must not take the register
-    # pair either, whichever of the two impls is registered first.
-    if ir_impl_interface_base(impl_node).len() > 0:
+    ok_kind := ir_result_reg_method_ok_kind(impl_type, method_idx, method_node)
+    if ok_kind.len() == 0:
         ir_result_reg_blocked.insert(full_name, true)
         if ir_result_reg_funcs.contains_key(full_name):
             ir_result_reg_funcs.remove(full_name)
             ir_func_result_ok_kinds.remove(full_name)
         return
-    if ir_result_reg_blocked.contains_key(full_name):
+    if ir_impl_interface_base(impl_node).len() > 0 or ir_result_reg_blocked.contains_key(full_name):
         return
-    if impl_type.contains("["):
-        return
-    if ir_has_generic_params(method_node):
-        return
-    if ir_resolve_assoc_type(impl_type, ir_extract_return_type(method_idx)) != "tuple":
-        return
-    ok_kind := ir_method_result_ok_kind(impl_type, method_idx)
-    if not ir_result_reg_ok_kind_fits(ok_kind):
-        return
-    for child_idx in method_node.children:
-        if ir_node_contains_lambda_or_spawn(child_idx):
-            return
     ir_result_reg_funcs.insert(full_name, true)
     ir_func_result_ok_kinds.insert(full_name, ok_kind)
+
+# the ok payload kind a method returns in the register pair, or "" when the
+# method does not fit it.
+fn ir_result_reg_method_ok_kind(impl_type: String, method_idx: Int, method_node: Node) -> String:
+    if impl_type.contains("[") or ir_has_generic_params(method_node):
+        return ""
+    if ir_resolve_assoc_type(impl_type, ir_extract_return_type(method_idx)) != "tuple":
+        return ""
+    ok_kind := ir_method_result_ok_kind(impl_type, method_idx)
+    if not ir_result_reg_ok_kind_fits(ok_kind):
+        return ""
+    for child_idx in method_node.children:
+        if ir_node_contains_lambda_or_spawn(child_idx):
+            return ""
+    return ok_kind
 
 fn ir_node_contains_lambda_or_spawn(idx: Int) -> Bool:
     node := get_node(idx)
@@ -9096,16 +9108,23 @@ fn ir_interface_coercion(idx: Int) -> Int:
         return 0 - 1
     return iface
 
-# the methods of an interface, in declaration order: the slot layout.
-fn ir_interface_method_names(iface_name: String) -> List[String]:
-    mut names: List[String] := []
+# the method declarations of an interface, in declaration order: the slot
+# layout.
+fn ir_interface_methods(iface_name: String) -> List[Int]:
+    mut methods: List[Int] := []
     base := ir_strip_type_args(iface_name)
     if not ir_interface_decl_index.contains_key(base):
-        return names
+        return methods
     for child in get_node(ir_interface_decl_index[base]).children:
-        cn := get_node(child)
-        if cn.kind == "fn_sig" or cn.kind == "fn_decl":
-            names.push(cn.value)
+        kind := get_node(child).kind
+        if kind == "fn_sig" or kind == "fn_decl":
+            methods.push(child)
+    return methods
+
+fn ir_interface_method_names(iface_name: String) -> List[String]:
+    mut names: List[String] := []
+    for method_idx in ir_interface_methods(iface_name):
+        names.push(get_node(method_idx).value)
     return names
 
 fn ir_interface_type_id(concrete: String) -> Int:
@@ -9126,7 +9145,7 @@ fn ir_emit_interface_value(idx: Int) -> Int:
     ir_interface_coercion_bypass.remove(idx)
     if inner_kind.len() > 0 and borrowed:
         ir_rc_retain_reg(inner_r, inner_kind)
-    methods := ir_interface_method_names(iface_name)
+    methods := ir_interface_methods(iface_name)
     count_r := ir_reg()
     ir_emit("iconst " + count_r.to_string() + " " + (methods.len() + 2).to_string())
     r := ir_reg()
@@ -9136,9 +9155,9 @@ fn ir_emit_interface_value(idx: Int) -> Int:
     ir_emit("sstore " + r.to_string() + " 0 " + id_r.to_string())
     ir_emit("sstore " + r.to_string() + " 1 " + inner_r.to_string())
     mut sig := "0" + ir_tuple_elem_code(inner_kind)
-    for m, i in methods:
+    for method_idx, i in methods:
         fr := ir_reg()
-        ir_emit("funcref " + fr.to_string() + " " + ir_lookup_impl_method_name(concrete, m))
+        ir_emit("funcref " + fr.to_string() + " " + ir_interface_slot_target(concrete, method_idx))
         ir_emit("sstore " + r.to_string() + " " + (i + 2).to_string() + " " + fr.to_string())
         sig = sig + "0"
     if ir_tuple_sig_has_rc(sig):
@@ -9148,6 +9167,47 @@ fn ir_emit_interface_value(idx: Int) -> Int:
         ir_emit("funcref " + dtor_r.to_string() + " " + ir_tuple_dtor_name(sig))
         ir_emit_call_text(ir_reg(), "pith_struct_set_dtor", "void", 2, " " + r.to_string() + " " + dtor_r.to_string())
     return r
+
+# the function an interface value's slot for the method declared at
+# method_idx points at. a slot is called with calli, which expects the boxed
+# result, so a method on the register pair is reached through an adapter
+# that boxes its result (ir_emit_interface_adapters).
+fn ir_interface_slot_target(concrete: String, method_idx: Int) -> String:
+    symbol := ir_lookup_impl_method_name(concrete, get_node(method_idx).value)
+    if not ir_result_reg_funcs.contains_key(symbol):
+        return symbol
+    ir_interface_adapters.insert(symbol, ir_param_count(method_idx) + 1)
+    return ir_interface_adapter_name(symbol)
+
+# a `.` cannot appear in a name written in source, so the adapter's symbol
+# cannot collide with one.
+fn ir_interface_adapter_name(symbol: String) -> String:
+    return symbol + ".iface"
+
+# one adapter per register-pair method an interface value of this module
+# points at: it takes the method's parameters, calls it, and returns the
+# pair folded into the result box a calli caller owns, exactly as the method
+# would under the box abi. the parameters are borrowed, as a method's are.
+fn ir_emit_interface_adapters():
+    for symbol in ir_interface_adapters.keys().sort():
+        param_count := ir_interface_adapters[symbol]
+        ir_prepare_func_emission("tuple")
+        ir_emit_func_header(ir_interface_adapter_name(symbol), param_count, "tuple")
+        mut arg_regs: List[Int] := []
+        mut i := 0
+        while i < param_count:
+            ir_emit_named_param("__arg_" + i.to_string(), "")
+            i = i + 1
+        i = 0
+        while i < param_count:
+            arg_r := ir_reg()
+            ir_emit("load " + arg_r.to_string() + " __arg_" + i.to_string())
+            arg_regs.push(arg_r)
+            i = i + 1
+        box_r := ir_emit_result_reg_call(ir_reg(), symbol, param_count, ir_join_arg_regs(arg_regs))
+        ir_emit("ret " + box_r.to_string())
+        ir_emit_count_marks()
+        ir_emit("endfunc")
 
 # a method call on an interface value: load the method's pointer from its
 # slot and call it with the concrete value as the receiver. -1 when the
@@ -14363,9 +14423,12 @@ fn ir_collect_impl_method_signatures(node: Node, module_path: String):
         if ir_is_fn_decl_kind(method_node.kind):
             ir_record_impl_method_signature(impl_type, method_idx, method_node, module_path)
             ir_maybe_register_result_reg_method(node, impl_type, method_idx, method_node, module_path)
-    # inherited interface defaults get a signature under this concrete type too
+    # inherited interface defaults get a signature under this concrete type
+    # too. a default compiles under the same symbol as a same-named method of
+    # the type's own impl, so it has to fit the register pair as well.
     for default_idx in ir_inherited_default_indices(node):
         ir_record_impl_method_signature(impl_type, default_idx, get_node(default_idx), module_path)
+        ir_maybe_register_result_reg_method(node, impl_type, default_idx, get_node(default_idx), module_path)
 
 # the declaration an impl target names, resolved in the impl's own module
 # (falling back to the module currently being emitted, then the global
@@ -15855,6 +15918,8 @@ fn ir_emit_root_module(root_idx: Int, root: Node):
     ir_emit_generic_enum_instance_dtors()
     ir_emit_generic_enum_instance_tracers()
     ir_append_lambda_bodies()
+    # after every body that can build an interface value
+    ir_emit_interface_adapters()
     # per-instance destructors for generic structs built through the struct
     # literal path, after every body: a construction inside a specialization or
     # a lambda registers its instance only as that body is emitted, and a

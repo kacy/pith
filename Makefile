@@ -1637,8 +1637,8 @@ leak-check-only:
 # --- the box result abi (PITH_RESULT_REG=0) ---
 # the two-register result abi is the default. PITH_RESULT_REG=0 turns it off
 # and every `-> T!` function returns its three-slot box again, which is also
-# what generic functions, interface impls, `Float!` and multi-word payloads
-# always do. these run the regression corpus, the memcheck set and the leak
+# what generic functions, most interface impl methods, `Float!` and multi-word
+# payloads do. these run the regression corpus, the memcheck set and the leak
 # cases with it off, so the box path keeps its own coverage. the emitter
 # reads the variable, and `pith run` and `pith build` pass it on.
 run-regressions-result-box-only:

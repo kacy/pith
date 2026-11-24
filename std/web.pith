@@ -690,13 +690,19 @@ fn run_route(router: Router, route: Route, req: http.HttpRequestBytes, parts: Li
     return handler(Request(req, params_for(route, parts), route.pattern, empty_values))
 
 # the 301 a path that is not in canonical form gets (see http.clean_path),
-# with the query kept. cleaning collapses repeated slashes, so the Location
-# never starts with "//", which a browser would read as another host.
+# with the query kept. cleaning collapses repeated slashes, and checking
+# is_local_path refuses leading `/\` (which browsers treat like `//host`) and
+# control bytes so canonicalization can never produce an open redirect.
 fn clean_path_redirect(req: http.HttpRequestBytes, path: String) -> http.HttpResponse:
     mut location := http.clean_path(path)
+    if not is_local_path(location):
+        return http.text(400, http.reason_phrase(400))
     query := req.query() catch ""
     if query.len() > 0:
-        location = location + "?" + query
+        candidate := location + "?" + query
+        if not is_local_path(candidate):
+            return http.text(400, http.reason_phrase(400))
+        location = candidate
     return http.redirect_response(location)
 
 # find the first route whose method and path match, wrap its handler in the
@@ -1771,3 +1777,9 @@ test "an app serves with the config it carries":
     tcp.close(kept)
     assert(answered.starts_with("HTTP/1.1 200 "))
     assert(answered.contains("Connection: close"))
+
+test "canonical path cleanup refuses backslash open redirects":
+    app := bare().get("/", fn(req: Request) => http.text(200, "ok"))
+    req := http.build_http_request(bytes.from_string_utf8("GET /\\evil.example// HTTP/1.1\r\nHost: localhost\r\n\r\n"), bytes.empty())!
+    resp := dispatch(app.router, req)
+    assert_eq(resp.status, 400)

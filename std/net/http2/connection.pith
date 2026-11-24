@@ -46,6 +46,15 @@ pub SETTINGS_MAX_FRAME_SIZE := 5
 # SETTINGS_MAX_HEADER_LIST_SIZE — the largest header list the peer will accept.
 pub SETTINGS_MAX_HEADER_LIST_SIZE := 6
 
+# RFC 9113 §6.5.2 and §6.9.1 bounds for peer SETTINGS and flow-control windows,
+# plus a local ceiling on our HPACK encoder table so a peer advertising 4 GiB
+# cannot commit our encoder to unbounded dynamic-table memory.
+MIN_MAX_FRAME_SIZE := 16384
+MAX_MAX_FRAME_SIZE := 16777215
+MAX_FLOW_CONTROL_WINDOW := 2147483647
+MAX_LOCAL_ENCODER_TABLE_SIZE := 65536
+FLOW_CONTROL_OVERFLOW := "http2: flow-control window overflow"
+
 # the default connection and stream flow-control window (RFC 9113 §6.9.2).
 pub DEFAULT_INITIAL_WINDOW := 65535
 
@@ -1004,9 +1013,12 @@ fn reader_loop(client: Client):
             return
         outcome := handle_frame(client, attempt.ok, accums)
         if outcome.is_err:
-            # a frame we could not process is a connection-level protocol error:
+            # a frame we could not process is a connection-level error:
             # tell the peer why, then drop every stream.
-            send_goaway(client, frames.ERROR_PROTOCOL_ERROR)
+            if outcome.err == FLOW_CONTROL_OVERFLOW:
+                send_goaway(client, frames.ERROR_FLOW_CONTROL_ERROR)
+            else:
+                send_goaway(client, frames.ERROR_PROTOCOL_ERROR)
             fail_all(client)
             return
         if not outcome.ok:
@@ -1133,7 +1145,7 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
     if t == frames.FRAME_SETTINGS:
         sf := frames.parse_settings(frame)!
         if not sf.ack:
-            apply_settings(client, sf.settings)
+            apply_settings(client, sf.settings)!
             client.enqueue(frames.settings_ack_frame())!
         return true
     if t == frames.FRAME_PING:
@@ -1147,7 +1159,7 @@ fn handle_frame(client: Client, frame: frames.Frame, accums: Map[Int, UnaryAccum
         # credit grows a send window; apply it and wake any blocked body sender.
         if wu.increment == 0:
             fail "http2: WINDOW_UPDATE with a zero increment"
-        grant_send_credit(client, wu.stream_id, wu.increment)
+        grant_send_credit(client, wu.stream_id, wu.increment)!
         return true
     if t == frames.FRAME_GOAWAY:
         ga := frames.parse_goaway(frame)!
@@ -1372,36 +1384,60 @@ fn assemble_response_until(inbox: Channel[StreamEvent], deadline_ms: Int) -> Res
         if event.end:
             return Response(status, headers, trailers, body.bytes())
 
-# apply the peer's SETTINGS (RFC 9113 §6.5.2). the header-table-size bounds our
-# hpack encoder so the indices we emit stay valid for the peer's decoder; the
-# frame size and header-list size shape and gate what we send; the initial
-# window size sets new streams' send credit and retroactively resizes open ones;
-# max-concurrent-streams caps how many streams we open at once. push-related and
-# unknown identifiers are ignored.
-fn apply_settings(client: Client, settings: List[frames.Setting]):
+# apply the peer's SETTINGS (RFC 9113 §6.5.2), rejecting out-of-range values
+# before mutating connection state so a hostile peer cannot cause a 0-byte
+# CONTINUATION infinite loop, window overflow, or unbounded HPACK table growth.
+fn apply_settings(client: Client, settings: List[frames.Setting]) -> Bool!:
+    # validate all settings up front before applying any of them.
+    for s in settings:
+        if s.id == SETTINGS_ENABLE_PUSH:
+            if s.value != 0 and s.value != 1:
+                fail "http2: invalid SETTINGS_ENABLE_PUSH"
+        elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
+            if s.value < 0 or s.value > MAX_FLOW_CONTROL_WINDOW:
+                fail FLOW_CONTROL_OVERFLOW
+        elif s.id == SETTINGS_MAX_FRAME_SIZE:
+            if s.value < MIN_MAX_FRAME_SIZE or s.value > MAX_MAX_FRAME_SIZE:
+                fail "http2: invalid SETTINGS_MAX_FRAME_SIZE"
+        elif s.id == SETTINGS_HEADER_TABLE_SIZE:
+            if s.value < 0:
+                fail "http2: invalid SETTINGS_HEADER_TABLE_SIZE"
     mut admit_more := false
+    mut overflow := false
     locked client.mu:
         for s in settings:
             if s.id == SETTINGS_HEADER_TABLE_SIZE:
-                client.conn.set_encoder_table_size(s.value)
+                mut capped := s.value
+                if capped > MAX_LOCAL_ENCODER_TABLE_SIZE:
+                    capped = MAX_LOCAL_ENCODER_TABLE_SIZE
+                client.conn.set_encoder_table_size(capped)
             elif s.id == SETTINGS_MAX_FRAME_SIZE:
                 client.peer_max_frame_size.store(s.value)
             elif s.id == SETTINGS_MAX_HEADER_LIST_SIZE:
                 client.peer_max_header_list = s.value
             elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
                 # RFC 9113 §6.9.2: a change adjusts every open stream's send window
-                # by the delta from the previous initial value.
+                # by the delta from the previous initial value; overflowing 2^31-1
+                # is a connection FLOW_CONTROL_ERROR.
                 delta := s.value - client.peer_initial_window
-                client.peer_initial_window = s.value
                 for sid in client.active:
                     if client.send_windows.contains_key(sid):
-                        client.send_windows.insert(sid, client.send_windows[sid] + delta)
+                        if client.send_windows[sid] + delta > MAX_FLOW_CONTROL_WINDOW:
+                            overflow = true
+                if not overflow:
+                    client.peer_initial_window = s.value
+                    for sid in client.active:
+                        if client.send_windows.contains_key(sid):
+                            client.send_windows.insert(sid, client.send_windows[sid] + delta)
             elif s.id == SETTINGS_MAX_CONCURRENT_STREAMS:
                 client.max_concurrent = s.value
                 admit_more = true
+    if overflow:
+        fail FLOW_CONTROL_OVERFLOW
     # a raised (or first-seen) limit may let a queued request() proceed.
     if admit_more:
         client.slot_free.try_send(1)
+    return true
 
 # the uncompressed size an hpack header list counts against
 # SETTINGS_MAX_HEADER_LIST_SIZE: each field is its name and value octets plus a
@@ -1418,6 +1454,8 @@ fn header_list_size(fields: List[hpack.HeaderField]) -> Int:
 # the wire — a header block must not be split by another stream's frames (RFC
 # 9113 §6.10).
 fn header_block_wire(stream_id: Int, block: Bytes, end_stream: Bool, max_frame_size: Int) -> Bytes!:
+    if max_frame_size <= 0:
+        fail "http2: invalid max frame size"
     out := bytes.buffer()
     defer out.free()
     total := block.len()
@@ -1437,25 +1475,35 @@ fn header_block_wire(stream_id: Int, block: Bytes, end_stream: Bool, max_frame_s
     return out.bytes()
 
 # apply an inbound WINDOW_UPDATE to our send windows and wake any body sender
-# waiting on the affected stream. a stream-0 update grows the connection window,
-# which may unblock any stream, so it pokes them all; a stream id grows just
-# that one stream. pokes are sent outside the mutex so a full poke channel (one
-# already pending) never blocks the reader.
-fn grant_send_credit(client: Client, stream_id: Int, increment: Int):
+# waiting on the affected stream. fails with FLOW_CONTROL_OVERFLOW when an
+# increment would push a window past RFC 9113's 2^31 - 1 ceiling.
+fn grant_send_credit(client: Client, stream_id: Int, increment: Int) -> Bool!:
+    if increment <= 0 or increment > MAX_FLOW_CONTROL_WINDOW:
+        fail FLOW_CONTROL_OVERFLOW
     mut waiters: List[Channel[Int]] := []
+    mut overflow := false
     locked client.mu:
         if stream_id == 0:
-            client.conn_send_window = client.conn_send_window + increment
-            for sid in client.active:
-                if client.credit.contains_key(sid):
-                    waiters.push(client.credit[sid])
+            if client.conn_send_window + increment > MAX_FLOW_CONTROL_WINDOW:
+                overflow = true
+            else:
+                client.conn_send_window = client.conn_send_window + increment
+                for sid in client.active:
+                    if client.credit.contains_key(sid):
+                        waiters.push(client.credit[sid])
         else:
             if client.send_windows.contains_key(stream_id):
-                client.send_windows.insert(stream_id, client.send_windows[stream_id] + increment)
-            if client.credit.contains_key(stream_id):
+                if client.send_windows[stream_id] + increment > MAX_FLOW_CONTROL_WINDOW:
+                    overflow = true
+                else:
+                    client.send_windows.insert(stream_id, client.send_windows[stream_id] + increment)
+            if not overflow and client.credit.contains_key(stream_id):
                 waiters.push(client.credit[stream_id])
+    if overflow:
+        fail FLOW_CONTROL_OVERFLOW
     for ch in waiters:
         ch.try_send(1)
+    return true
 
 # stream `data` as DATA frames over the client, honoring the peer's send windows
 # (RFC 9113 §6.9): reserve credit bounded by the stream window, the connection
@@ -2399,10 +2447,16 @@ test "header_list_size sums names, values, and per-field overhead":
 
 test "apply_settings records the peer's frame and header-list limits":
     client := offline_client(connection_from_frames(bytes.empty()))
-    apply_settings(client, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 32768), frames.setting(SETTINGS_MAX_HEADER_LIST_SIZE, 8192), frames.setting(SETTINGS_HEADER_TABLE_SIZE, 0)])
+    apply_settings(client, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 32768), frames.setting(SETTINGS_MAX_HEADER_LIST_SIZE, 8192), frames.setting(SETTINGS_HEADER_TABLE_SIZE, 0)])!
     assert_eq(client.peer_max_frame_size.load(), 32768)
     locked client.mu:
         assert_eq(client.peer_max_header_list, 8192)
+    # RFC 9113 §6.5.2 bounds: max frame size 0 or > 2^24-1 and initial window > 2^31-1 are refused
+    assert(apply_settings(client, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 0)]).is_err)
+    assert(apply_settings(client, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 16383)]).is_err)
+    assert(apply_settings(client, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 16777216)]).is_err)
+    assert(apply_settings(client, [frames.setting(SETTINGS_INITIAL_WINDOW_SIZE, 2147483648)]).is_err)
+    assert(header_block_wire(1, bytes.from_string_utf8("abc"), true, 0).is_err)
 
 test "header_block_wire emits a single HEADERS when the block fits":
     block := bytes.from_string_utf8("small")
@@ -2578,7 +2632,7 @@ test "a body waits for credit when the connection window is exhausted":
     head := frames.parse_headers(frames.read_frame(reader, frames.MAX_ALLOWED_FRAME_SIZE)!)!
     assert(not head.end_stream)
     assert_eq(binary.remaining(reader), 0)
-    grant_send_credit(client, 0, 100)
+    grant_send_credit(client, 0, 100)!
     late := next_data_frame(client.outbound)!
     assert_eq(late.data.to_string_utf8()!, "late")
     assert(late.end_stream)
@@ -2587,12 +2641,14 @@ test "a body waits for credit when the connection window is exhausted":
 test "grant_send_credit grows the stream and connection windows":
     client := offline_client(connection_from_frames(bytes.empty()))
     arm_send_stream(client, 1, 0, 0, 100)
-    grant_send_credit(client, 1, 50)
+    grant_send_credit(client, 1, 50)!
     locked client.mu:
         assert_eq(client.send_windows[1], 50)
-    grant_send_credit(client, 0, 30)
+    grant_send_credit(client, 0, 30)!
     locked client.mu:
         assert_eq(client.conn_send_window, 30)
+    assert(grant_send_credit(client, 0, 2147483647).is_err)
+    assert(grant_send_credit(client, 1, 2147483647).is_err)
 
 test "a new SETTINGS_INITIAL_WINDOW_SIZE resizes open stream windows by the delta":
     client := offline_client(connection_from_frames(bytes.empty()))
@@ -2601,14 +2657,14 @@ test "a new SETTINGS_INITIAL_WINDOW_SIZE resizes open stream windows by the delt
         client.active.push(1)
         client.send_windows.insert(1, DEFAULT_INITIAL_WINDOW)
     # the peer shrinks the initial window; the open stream shrinks by the delta.
-    apply_settings(client, [frames.setting(SETTINGS_INITIAL_WINDOW_SIZE, 1000)])
+    apply_settings(client, [frames.setting(SETTINGS_INITIAL_WINDOW_SIZE, 1000)])!
     locked client.mu:
         assert_eq(client.peer_initial_window, 1000)
         assert_eq(client.send_windows[1], 1000)
 
 test "apply_settings records the peer's max concurrent streams":
     client := offline_client(connection_from_frames(bytes.empty()))
-    apply_settings(client, [frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 3)])
+    apply_settings(client, [frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 3)])!
     locked client.mu:
         assert_eq(client.max_concurrent, 3)
 
@@ -2625,8 +2681,8 @@ test "send_stream_data splits a body across the window and finishes after a WIND
     assert_eq(first.data.to_string_utf8()!, "abcd")
     assert(not first.end_stream)
     # grant the remaining six bytes on both windows; the sender wakes and sends.
-    grant_send_credit(client, 1, 6)
-    grant_send_credit(client, 0, 6)
+    grant_send_credit(client, 1, 6)!
+    grant_send_credit(client, 0, 6)!
     total := await sender
     assert_eq(total, 10)
     second := next_data_frame(client.outbound)!
@@ -2937,7 +2993,7 @@ fn open_second_stream(client: Client) -> Int:
 
 test "a stream waits for a concurrency slot and opens once one frees":
     client := offline_client(connection_from_frames(bytes.empty()))
-    apply_settings(client, [frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 1)])
+    apply_settings(client, [frames.setting(SETTINGS_MAX_CONCURRENT_STREAMS, 1)])!
     # the settings poke would admit a waiter at once; drain it so the second
     # open has to wait for the first stream's slot.
     client.slot_free.try_recv()
@@ -2958,7 +3014,7 @@ test "a stream waits for a concurrency slot and opens once one frees":
 
 test "a refused open releases the lock for the next one":
     client := offline_client(connection_from_frames(bytes.empty()))
-    apply_settings(client, [frames.setting(SETTINGS_MAX_HEADER_LIST_SIZE, 8)])
+    apply_settings(client, [frames.setting(SETTINGS_MAX_HEADER_LIST_SIZE, 8)])!
     refused := client.open_stream_with_fields(post_fields(), false, false)
     assert(refused.is_err)
     # the refusal failed from inside the locked block; if it had kept `mu`,

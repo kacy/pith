@@ -147,6 +147,16 @@ pub fn checker_reported_at_current() -> Bool:
             return true
     return false
 
+## true when an error with `code` is already recorded at the node's position.
+## a parameter default is checked again at every call that leaves it out, so
+## a fault in one is reported once rather than once per call.
+pub fn checker_reported_at(node_idx: Int, code: String) -> Bool:
+    pos := checker_node_position(node_idx)
+    for d in checker_diagnostics:
+        if d.code == code and d.line == pos.0 and d.col == pos.1 and d.file == checker_file_path:
+            return true
+    return false
+
 # `from m import f as g` reaches f through a module alias only the parser
 # writes (see from_import_alias_receiver), so a message built from the
 # rewritten tree would show `__as_g.f` where the source says `g`, or

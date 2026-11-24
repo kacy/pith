@@ -520,6 +520,81 @@ fn strip_digit_separators(text: String) -> String:
         i = i + 1
     return out
 
+# a `0x`, `0b` or `0o` literal's token. a prefix with no digits after it is an
+# error here, since it names no value and the backend would refuse it later.
+fn emit_radix_literal(start: Int):
+    text := strip_digit_separators(source.substring(start, current_position))
+    if text.len() == 2:
+        emit("err", "the integer literal '" + text + "' has no digits after its prefix")
+        return
+    emit("int_lit", text)
+
+# the value of one digit in `base`, or -1 when the character is not one
+fn literal_digit_value(c: String, base: Int) -> Int:
+    code := ord(c)
+    mut value := 0 - 1
+    if code >= 48 and code <= 57:
+        value = code - 48
+    elif code >= 97 and code <= 102:
+        value = code - 87
+    elif code >= 65 and code <= 70:
+        value = code - 55
+    if value >= base:
+        return 0 - 1
+    return value
+
+## the magnitude an integer literal's token text spells: decimal digits, or
+## `0x`, `0b` or `0o` and digits, with the `_` separators already removed.
+## the first value is the magnitude's low 64 bits read as an Int, so one at or
+## above 2^63 comes back negative. the second is true when the magnitude is
+## past 2^64 - 1 or the text is not a literal, and then the first means
+## nothing. it never overflows, whatever the text.
+pub fn int_literal_magnitude(text: String) -> (Int, Bool):
+    mut base := 10
+    mut i := 0
+    if text.len() > 2 and text[0] == "0":
+        prefix := text[1]
+        if prefix == "x" or prefix == "X":
+            base = 16
+        elif prefix == "b" or prefix == "B":
+            base = 2
+        elif prefix == "o" or prefix == "O":
+            base = 8
+        if base != 10:
+            i = 2
+    if i >= text.len():
+        return (0, true)
+    # (2^64 - 1) / base and its remainder: a magnitude past `limit`, or at it
+    # with a next digit past `rest`, would not fit in 64 bits
+    mut limit := 1844674407370955161
+    mut rest := 5
+    if base == 16:
+        limit = 1152921504606846975
+        rest = 15
+    elif base == 8:
+        limit = 2305843009213693951
+        rest = 7
+    elif base == 2:
+        limit = 9223372036854775807
+        rest = 1
+    mut magnitude := 0
+    while i < text.len():
+        digit := literal_digit_value(text[i], base)
+        if digit < 0 or magnitude < 0 or magnitude > limit or (magnitude == limit and digit > rest):
+            return (0, true)
+        magnitude = magnitude.wrapping_mul(base).wrapping_add(digit)
+        i = i + 1
+    return (magnitude, false)
+
+## the value of an integer literal's text, which may start with `-`, as the
+## two's complement bits an iconst takes. the checker has already refused a
+## literal outside its type's range, so the bits read back as that value.
+pub fn int_literal_value(text: String) -> Int:
+    if text.starts_with("-"):
+        zero := 0
+        return zero.wrapping_sub(int_literal_magnitude(text.substring(1, text.len())).0)
+    return int_literal_magnitude(text).0
+
 fn scan_number():
     start := current_position
 
@@ -549,7 +624,7 @@ fn scan_number():
                         current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
+                emit_radix_literal(start)
                 return
             if next_char == "X":
                 current_position = current_position + 2
@@ -564,7 +639,7 @@ fn scan_number():
                         current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
+                emit_radix_literal(start)
                 return
             if next_char == "b":
                 current_position = current_position + 2
@@ -582,7 +657,7 @@ fn scan_number():
                         current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
+                emit_radix_literal(start)
                 return
             if next_char == "B":
                 current_position = current_position + 2
@@ -600,7 +675,7 @@ fn scan_number():
                         current_column = current_column + 1
                     else:
                         break
-                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
+                emit_radix_literal(start)
                 return
             if next_char == "o":
                 current_position = current_position + 2
@@ -610,7 +685,7 @@ fn scan_number():
                         break
                     current_position = current_position + 1
                     current_column = current_column + 1
-                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
+                emit_radix_literal(start)
                 return
             if next_char == "O":
                 current_position = current_position + 2
@@ -620,7 +695,7 @@ fn scan_number():
                         break
                     current_position = current_position + 1
                     current_column = current_column + 1
-                emit("int_lit", strip_digit_separators(source.substring(start, current_position)))
+                emit_radix_literal(start)
                 return
 
     # decimal digits

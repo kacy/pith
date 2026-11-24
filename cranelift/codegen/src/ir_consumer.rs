@@ -3325,7 +3325,9 @@ fn scan_float_vars(
 
 /// A block for each label of a function body, created in stream order, and
 /// the labels where a loop exits: the label right after a jmp back to an
-/// earlier label.
+/// earlier label. A `label NAME cold` block is marked cold, so it and the
+/// edge blocks that carry values into it are laid out after the function's
+/// other blocks.
 fn create_label_blocks<'a>(
     builder: &mut FunctionBuilder<'_>,
     body_lines: &[&'a str],
@@ -3338,6 +3340,9 @@ fn create_label_blocks<'a>(
         if !parts.is_empty() && parts[0] == "label" && parts.len() >= 2 {
             let block = builder.create_block();
             labels.insert(parts[1].to_string(), block);
+            if parts.get(2) == Some(&"cold") {
+                builder.set_cold_block(block);
+            }
             if after_back_edge {
                 loop_exits.insert(parts[1]);
             }
@@ -3500,6 +3505,12 @@ fn compile_ir_function(
         // both the terminated and live paths below. A later jmp/brif to a label
         // already in this set is a back-edge (see `defined_labels`).
         if parts[0] == "label" && parts.len() >= 2 {
+            if parts.len() > 3 || parts.get(2).is_some_and(|flag| *flag != "cold") {
+                return Err(CompileError::ModuleError(format!(
+                    "ir consumer: a label takes only its name and `cold` in {}: {}",
+                    func_name, line
+                )));
+            }
             defined_labels.insert(parts[1].to_string());
             // a label starts a block other paths jump to, which no earlier
             // handle test dominates; this covers the label a terminated
@@ -5711,6 +5722,29 @@ mod tests {
                   ret 3\n\
                   endfunc\n";
         compile_ok_for_ir(ir);
+    }
+
+    #[test]
+    fn a_cold_label_marks_its_block_cold() {
+        use cranelift::codegen::ir::{Function, UserFuncName};
+        let sig = Signature::new(cranelift::codegen::isa::CallConv::SystemV);
+        let mut func = Function::with_name_signature(UserFuncName::default(), sig);
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut builder = FunctionBuilder::new(&mut func, &mut fb_ctx);
+        let body = ["brif 1 L1 L2", "label L1", "ret 0", "label L2 cold", "ret 0"];
+        let (labels, _) = create_label_blocks(&mut builder, &body);
+        assert!(!builder.func.layout.is_cold(labels["L1"]));
+        assert!(builder.func.layout.is_cold(labels["L2"]));
+    }
+
+    #[test]
+    fn a_label_takes_cold_and_nothing_else() {
+        let ir = |flag: &str| {
+            format!("func main 0 int\niconst 1 1\nbrif 1 L1 L2\nlabel L1\nret 1\nlabel L2{flag}\niconst 2 0\nret 2\nendfunc\n")
+        };
+        compile_ok_for_ir(&ir(" cold"));
+        let err = compile_err_for_ir(&ir(" hot"));
+        assert!(err.contains("a label takes only its name"), "{err}");
     }
 
     #[test]

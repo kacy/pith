@@ -2044,6 +2044,23 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "cannot read $$tmpdir/missing.pith"; then pass=$$((pass+1)); echo "ok   lint names a missing file"; else echo "FAIL lint missing file"; echo "$$out"; fail=$$((fail+1)); fi; \
+	mkdir -p "$$tmpdir/elsewhere"; \
+	printf 'import std.json as json\n\nfn main():\n    print("away " + json.encode(json.make_int(1)))\n' > "$$tmpdir/elsewhere/away.pith"; \
+	set +e; \
+	out=$$(cd "$$tmpdir/elsewhere" && env -u PITH_HOME -u PITH_IR_DRIVER -u PITH_SELF_HOST $(CURDIR)/target/release/pith build away.pith -o away 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/elsewhere/away")" = "away 1" ]; then pass=$$((pass+1)); echo "ok   build outside the checkout"; else echo "FAIL build outside the checkout"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(cd "$$tmpdir/elsewhere" && env -u PITH_HOME -u PITH_SELF_HOST $(CURDIR)/target/release/pith check away.pith 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ]; then pass=$$((pass+1)); echo "ok   check outside the checkout"; else echo "FAIL check outside the checkout"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(cd "$$tmpdir/elsewhere" && PITH_IR_DRIVER="$$tmpdir/no_driver" $(CURDIR)/target/release/pith build away.pith 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -ne 0 ] && echo "$$out" | grep -q "PITH_IR_DRIVER is set to $$tmpdir/no_driver, which does not exist"; then pass=$$((pass+1)); echo "ok   a missing PITH_IR_DRIVER is named"; else echo "FAIL a missing PITH_IR_DRIVER is named"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"
@@ -2090,6 +2107,29 @@ cli-regressions-self-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/wrapped_out")" = "wrapped" ]; then pass=$$((pass+1)); echo "ok   build forwards -o"; else echo "FAIL build forwards -o"; echo "$$out"; fail=$$((fail+1)); fi; \
+	mkdir -p "$$tmpdir/elsewhere/lone"; \
+	printf 'import std.json as json\n\nfn main():\n    print("away " + json.encode(json.make_int(1)))\n' > "$$tmpdir/elsewhere/away.pith"; \
+	set +e; \
+	out=$$(cd "$$tmpdir/elsewhere" && env -u PITH_HOME -u PITH_NATIVE $(CURDIR)/self-host/pith_main build away.pith -o away 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ] && [ "$$("$$tmpdir/elsewhere/away")" = "away 1" ]; then pass=$$((pass+1)); echo "ok   build outside the checkout"; else echo "FAIL build outside the checkout"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(cd "$$tmpdir/elsewhere" && env -u PITH_HOME $(CURDIR)/self-host/pith_main check away.pith 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 0 ]; then pass=$$((pass+1)); echo "ok   check outside the checkout"; else echo "FAIL check outside the checkout"; echo "$$out"; fail=$$((fail+1)); fi; \
+	cp self-host/pith_main "$$tmpdir/elsewhere/lone/pith_main"; \
+	set +e; \
+	out=$$(cd "$$tmpdir/elsewhere" && env -u PITH_HOME -u PITH_NATIVE lone/pith_main run away.pith 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 1 ] && echo "$$out" | grep -q "cannot find the native pith backend; tried ./target/release/pith, ../target/release/pith, lone/../target/release/pith"; then pass=$$((pass+1)); echo "ok   a missing backend names the paths tried"; else echo "FAIL a missing backend names the paths tried"; echo "$$out"; fail=$$((fail+1)); fi; \
+	set +e; \
+	out=$$(PITH_NATIVE="$$tmpdir/no_backend" ./self-host/pith_main run "$$tmpdir/elsewhere/away.pith" 2>&1); \
+	status=$$?; \
+	set -e; \
+	if [ $$status -eq 1 ] && echo "$$out" | grep -q "PITH_NATIVE is set to $$tmpdir/no_backend, which does not exist"; then pass=$$((pass+1)); echo "ok   a missing PITH_NATIVE is named"; else echo "FAIL a missing PITH_NATIVE is named"; echo "$$out"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all self-host cli regressions passed"

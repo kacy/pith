@@ -2042,6 +2042,7 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
 
     mut server_hs_seq := 0
     mut certs: List[x509.Certificate] := []
+    mut ee_seen := false
     mut cert_verified := false
     mut cert_verify_seen := false
     mut client_cert_requested := false
@@ -2092,6 +2093,8 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
             if server_finished:
                 fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "excess data after tls server finished")
             if message.message_type == TLS_HANDSHAKE_ENCRYPTED_EXTENSIONS:
+                if ee_seen or client_cert_requested or cert_verified or cert_verify_seen:
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected tls encrypted extensions")
                 mut ee_unsupported := false
                 mut ee_duplicated := false
                 mut seen_ee_extensions: List[Int] := []
@@ -2112,13 +2115,14 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                     if not alpn_protocols.contains(encrypted_extensions.alpn_protocol):
                         fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_ILLEGAL_PARAMETER, "server negotiated an unexpected alpn protocol")
                 negotiated_alpn = encrypted_extensions.alpn_protocol
+                ee_seen = true
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE_REQUEST:
-                if did_resume:
+                if did_resume or not ee_seen or client_cert_requested or cert_verified or cert_verify_seen:
                     # rfc 8446 §4.3.2: certificate requests belong to full
-                    # handshakes; a resumed session's authentication is the
-                    # original one.
-                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "tls certificate request in a resumed handshake")
+                    # handshakes, arrive once after EncryptedExtensions and
+                    # before Certificate.
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected tls certificate request")
                 client_cert_requested = true
                 request := tls13.parse_certificate_request(message.body) catch:
                     fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls certificate request")
@@ -2135,8 +2139,8 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                     client_cert_usable = select_server_signature_scheme(client_key_is_ecdsa(config) catch false, true, request.signature_schemes) != 0
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE:
-                if did_resume:
-                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected certificate during resumed tls handshake")
+                if did_resume or not ee_seen or cert_verified or cert_verify_seen:
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected tls server certificate")
                 server_cert_msg := tls13.parse_certificate_message(message.body) catch:
                     fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls server certificate message")
                 certs = certificates_from_message(server_cert_msg) catch:
@@ -2160,10 +2164,8 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 cert_verified = true
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE_VERIFY:
-                if did_resume:
-                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected certificate verify during resumed tls handshake")
-                if certs.len() == 0:
-                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "certificate verify arrived before certificate")
+                if did_resume or not cert_verified or cert_verify_seen or certs.len() == 0:
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected tls server certificate verify")
                 cv := tls13.parse_certificate_verify(message.body) catch:
                     fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_DECODE_ERROR, "malformed tls certificate verify")
                 if not scheme_matches_certificate_key(cv.signature_scheme, certs[0].public_key_algorithm):
@@ -2175,6 +2177,8 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
                 cert_verify_seen = true
                 transcript_append(transcript_buf, message)!
             elif message.message_type == TLS_HANDSHAKE_FINISHED:
+                if not ee_seen:
+                    fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "server finished before encrypted extensions")
                 if not did_resume and (not cert_verified or not cert_verify_seen):
                     fail refuse_sealed_with(stream, server_hello.cipher_suite, client_hs_keys.key, client_hs_keys.iv, ALERT_UNEXPECTED_MESSAGE, "server finished before certificate verification")
                 verify_data := tls13.parse_finished(message.body) catch:
@@ -2934,6 +2938,12 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
             if client_finished_seen:
                 fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "excess data after tls client finished")
             if message.message_type == TLS_HANDSHAKE_CERTIFICATE:
+                # rfc 8446 §4.4.2: a client Certificate is valid only when
+                # requested on a full handshake, at most once, and never after
+                # CertificateVerify (or a second Certificate would overwrite
+                # `peer` without proving possession of the second key).
+                if not client_cert_requested or did_resume or client_cert_seen or client_cert_verify_seen:
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected tls client certificate")
                 client_cert_msg := tls13.parse_certificate_message(message.body) catch:
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client certificate message")
                 client_certs = certificates_from_message(client_cert_msg) catch:
@@ -2947,8 +2957,8 @@ fn native_server_handshake(stream: TcpStream, config: Config) -> Conn!:
                 client_cert_seen = true
                 transcript_append(transcript, message)!
             elif message.message_type == TLS_HANDSHAKE_CERTIFICATE_VERIFY:
-                if client_certs.len() == 0:
-                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "client certificate verify arrived before certificate")
+                if not client_cert_requested or did_resume or not client_cert_seen or client_cert_verify_seen or client_certs.len() == 0:
+                    fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_UNEXPECTED_MESSAGE, "unexpected tls client certificate verify")
                 cv := tls13.parse_certificate_verify(message.body) catch:
                     fail refuse_sealed_with(stream, cipher, server_app_keys.key, server_app_keys.iv, ALERT_DECODE_ERROR, "malformed tls client certificate verify")
                 if not scheme_matches_certificate_key(cv.signature_scheme, client_certs[0].public_key_algorithm):

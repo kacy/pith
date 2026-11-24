@@ -1430,15 +1430,25 @@ fn read_all_bytes_from[R: BytesReader](reader: R, chunk_size: Int) -> Bytes!:
         chunk = reader.read_bytes(size)!
     return buf.take_bytes()
 
+# cap initial buffer reservation and single-read sizes for read_exact_* so an
+# untrusted caller-declared length (such as an HTTP Content-Length header)
+# cannot force a multi-megabyte allocation before bytes actually arrive.
+MAX_READ_EXACT_CHUNK := 65536
+
+fn capped_read_size(want: Int) -> Int:
+    if want > MAX_READ_EXACT_CHUNK:
+        return MAX_READ_EXACT_CHUNK
+    return want
+
 # exactly `count` bytes from a source, failing with unexpected eof when it
 # ends first.
 fn read_exact_bytes_from[R: BytesReader](reader: R, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
-    buf := bytes.buffer_with_capacity(count)
+    buf := bytes.buffer_with_capacity(capped_read_size(count))
     errdefer buf.free()
     while buf.len() < count:
-        chunk := reader.read_bytes(count - buf.len())!
+        chunk := reader.read_bytes(capped_read_size(count - buf.len()))!
         if chunk.is_empty():
             fail "unexpected eof"
         buf.write(chunk)!
@@ -1576,10 +1586,10 @@ fn read_all_process_stderr_bytes_chunked_ctx(reader: ProcessStderr, ctx: Context
 fn read_exact_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context, count: Int) -> Bytes!BlockingError:
     if count <= 0:
         return bytes.empty()
-    buf := bytes.buffer_with_capacity(count)
+    buf := bytes.buffer_with_capacity(capped_read_size(count))
     errdefer buf.free()
     while buf.len() < count:
-        chunk := tcp_stream_read_bytes_ctx(stream, ctx, count - buf.len())!
+        chunk := tcp_stream_read_bytes_ctx(stream, ctx, capped_read_size(count - buf.len()))!
         if chunk.is_empty():
             fail blocking_failed("unexpected eof")
         wrote := buf.write(chunk)
@@ -1590,10 +1600,10 @@ fn read_exact_tcp_stream_bytes_ctx(stream: TcpStream, ctx: Context, count: Int) 
 fn read_exact_process_stdout_bytes_ctx(reader: ProcessStdout, ctx: Context, count: Int) -> Bytes!BlockingError:
     if count <= 0:
         return bytes.empty()
-    buf := bytes.buffer_with_capacity(count)
+    buf := bytes.buffer_with_capacity(capped_read_size(count))
     errdefer buf.free()
     while buf.len() < count:
-        chunk := process_stdout_read_bytes_ctx(reader, ctx, count - buf.len())!
+        chunk := process_stdout_read_bytes_ctx(reader, ctx, capped_read_size(count - buf.len()))!
         if chunk.is_empty():
             fail blocking_failed("unexpected eof")
         wrote := buf.write(chunk)
@@ -1604,10 +1614,10 @@ fn read_exact_process_stdout_bytes_ctx(reader: ProcessStdout, ctx: Context, coun
 fn read_exact_process_stderr_bytes_ctx(reader: ProcessStderr, ctx: Context, count: Int) -> Bytes!BlockingError:
     if count <= 0:
         return bytes.empty()
-    buf := bytes.buffer_with_capacity(count)
+    buf := bytes.buffer_with_capacity(capped_read_size(count))
     errdefer buf.free()
     while buf.len() < count:
-        chunk := process_stderr_read_bytes_ctx(reader, ctx, count - buf.len())!
+        chunk := process_stderr_read_bytes_ctx(reader, ctx, capped_read_size(count - buf.len()))!
         if chunk.is_empty():
             fail blocking_failed("unexpected eof")
         wrote := buf.write(chunk)
@@ -1622,7 +1632,7 @@ fn buffered_bytes_reader_read_internal(reader: BufferedBytesReader, max_bytes: I
         return bytes.empty()
     state := buffered_bytes_readers[reader.handle]
 
-    buf := bytes.buffer_with_capacity(max_bytes)
+    buf := bytes.buffer_with_capacity(capped_read_size(max_bytes))
     errdefer buf.free()
     while buf.len() < max_bytes:
         if state.cache.is_empty():

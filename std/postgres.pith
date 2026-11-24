@@ -30,6 +30,7 @@ import std.hash as hash
 import std.crypto.hmac as hmac
 import std.crypto.kdf as kdf
 import std.crypto.random as random
+import std.crypto.subtle as subtle
 import std.net.tcp as tcp
 import std.net.tls as tls
 from std.io import TcpStream
@@ -196,14 +197,21 @@ impl Drop for Conn:
     fn drop():
         self.abandon()
 
-# a string followed by a null terminator, the wire's cstring form.
-fn cstring(text: String) -> Bytes:
-    out := bytes.buffer()
-    out.write_string_utf8(text) catch 0
-    out.write_byte(0) catch 0
-    result := out.bytes()
-    out.free()
-    return result
+# a string followed by a null terminator, the wire's cstring form. refuses
+# embedded NUL bytes so an untrusted username/database/statement cannot inject
+# extra startup parameters or truncate wire fields.
+fn cstring(text: String) -> Bytes!:
+    raw := bytes.from_string_utf8(text)
+    mut i := 0
+    while i < raw.len():
+        if raw[i] == 0:
+            fail "postgres: string contains embedded null byte"
+        i = i + 1
+    out := bytes.buffer_with_capacity(raw.len() + 1)
+    errdefer out.free()
+    out.write(raw)!
+    out.write_byte(0)!
+    return out.take_bytes()
 
 # pull the human-readable message out of an ErrorResponse payload: a series of
 # type-tagged cstrings, where 'M' holds the message.
@@ -274,12 +282,13 @@ impl Conn:
     fn handshake(user: String, password: String, database: String) -> Bool!:
         # StartupMessage: protocol 3.0, then null-terminated key/value pairs.
         params := bytes.buffer()
-        params.write(be32(196608)) catch 0
-        params.write(cstring("user")) catch 0
-        params.write(cstring(user)) catch 0
-        params.write(cstring("database")) catch 0
-        params.write(cstring(database)) catch 0
-        params.write_byte(0) catch 0
+        errdefer params.free()
+        params.write(be32(196608))!
+        params.write(cstring("user")!)!
+        params.write(cstring(user)!)!
+        params.write(cstring("database")!)!
+        params.write(cstring(database)!)!
+        params.write_byte(0)!
         self.send(0, params.take_bytes())!
 
         # SCRAM state carried across the two AuthenticationSASL rounds.
@@ -287,6 +296,7 @@ impl Conn:
         mut client_first_bare := ""
         mut server_signature := ""
         mut scram_verified := false
+        mut auth_ok := false
         while true:
             msg := self.read_message()!
             if msg.mtype == 69:
@@ -305,6 +315,7 @@ impl Conn:
                     # can send a bare AuthenticationOk.
                     if client_first_bare != "" and not scram_verified:
                         fail "postgres: server skipped SCRAM signature verification"
+                    auth_ok = true
                     continue
                 elif auth == 3:
                     # cleartext password — only over an encrypted channel. on a
@@ -314,16 +325,17 @@ impl Conn:
                     # refuse), so require tls.
                     if self.session == none:
                         fail "postgres: server asked for a cleartext password on an unencrypted connection"
-                    self.send(112, cstring(password))!
+                    self.send(112, cstring(password)!)!
                 elif auth == 10:
                     # AuthenticationSASL: begin SCRAM-SHA-256.
                     client_nonce = encoding.b64_encode(random.bytes(18)!)
                     client_first_bare = "n=,r=" + client_nonce
                     client_first := "n,," + client_first_bare
                     initial := bytes.buffer()
-                    initial.write(cstring("SCRAM-SHA-256")) catch 0
-                    initial.write(be32(client_first.len())) catch 0
-                    initial.write_string_utf8(client_first) catch 0
+                    errdefer initial.free()
+                    initial.write(cstring("SCRAM-SHA-256")!)!
+                    initial.write(be32(client_first.len()))!
+                    initial.write_string_utf8(client_first)!
                     self.send(112, initial.take_bytes())!
                 elif auth == 11:
                     # AuthenticationSASLContinue: server-first-message.
@@ -343,7 +355,13 @@ impl Conn:
                 else:
                     fail "postgres: unsupported auth method {auth}"
             elif msg.mtype == 90:
-                # ReadyForQuery
+                # ReadyForQuery: must only follow AuthenticationOk (and a
+                # verified SCRAM ServerSignature when SASL ran), so a MITM
+                # cannot jump straight to ReadyForQuery to skip mutual auth.
+                if not auth_ok:
+                    fail "postgres: server sent ReadyForQuery before AuthenticationOk"
+                if client_first_bare != "" and not scram_verified:
+                    fail "postgres: server skipped SCRAM signature verification"
                 return true
             else:
                 # ParameterStatus (83), BackendKeyData (75), NoticeResponse (78) — ignore.
@@ -410,9 +428,11 @@ fn scram_client_final(server_first: String, client_first_bare: String, password:
 fn scram_server_verified(server_final: String, expected: String) -> Bool:
     if expected == "":
         return false
+    expected_bytes := bytes.from_string_utf8(expected)
     for part in server_final.split(","):
         if part.starts_with("v="):
-            return part.substring(2, part.len()) == expected
+            got := bytes.from_string_utf8(part.substring(2, part.len()))
+            return subtle.equal(got, expected_bytes)
     return false
 
 # --- queries ---
@@ -517,74 +537,79 @@ impl Conn:
     # Parse a statement under `name` (empty for the unnamed statement). the query
     # text carries `$1`, `$2`, ... placeholders; no parameter types are declared,
     # so the server infers them.
-    fn send_parse(name: String, text: String):
+    fn send_parse(name: String, text: String) -> Bool!:
         parse := bytes.buffer()
-        parse.write(cstring(name)) catch 0
-        parse.write(cstring(text)) catch 0
-        parse.write(be16(0)) catch 0
-        self.send(80, parse.bytes()) catch 0
-        parse.free()
+        errdefer parse.free()
+        parse.write(cstring(name)!)!
+        parse.write(cstring(text)!)!
+        parse.write(be16(0))!
+        self.send(80, parse.take_bytes())!
+        return true
 
     # Bind `params` (in text form) to the statement `stmt_name` through the
     # unnamed portal, then Describe/Execute/Sync it. shared by the one-shot and
     # prepared paths.
-    fn send_bind_execute(stmt_name: String, params: List[String]):
+    fn send_bind_execute(stmt_name: String, params: List[String]) -> Bool!:
+        if params.len() > 65535:
+            fail "postgres: too many query parameters (maximum is 65535)"
         bind := bytes.buffer()
-        bind.write(cstring("")) catch 0
-        bind.write(cstring(stmt_name)) catch 0
-        bind.write(be16(0)) catch 0
-        bind.write(be16(params.len())) catch 0
+        errdefer bind.free()
+        bind.write(cstring("")!)!
+        bind.write(cstring(stmt_name)!)!
+        bind.write(be16(0))!
+        bind.write(be16(params.len()))!
         for param in params:
             value := bytes.from_string_utf8(param)
-            bind.write(be32(bytes.len(value))) catch 0
-            bind.write(value) catch 0
-        bind.write(be16(0)) catch 0
-        self.send(66, bind.bytes()) catch 0
-        bind.free()
+            bind.write(be32(bytes.len(value)))!
+            bind.write(value)!
+        bind.write(be16(0))!
+        self.send(66, bind.take_bytes())!
 
         describe := bytes.buffer()
-        describe.write_byte(80) catch 0
-        describe.write(cstring("")) catch 0
-        self.send(68, describe.bytes()) catch 0
-        describe.free()
+        errdefer describe.free()
+        describe.write_byte(80)!
+        describe.write(cstring("")!)!
+        self.send(68, describe.take_bytes())!
 
         execute := bytes.buffer()
-        execute.write(cstring("")) catch 0
-        execute.write(be32(0)) catch 0
-        self.send(69, execute.bytes()) catch 0
-        execute.free()
+        errdefer execute.free()
+        execute.write(cstring("")!)!
+        execute.write(be32(0))!
+        self.send(69, execute.take_bytes())!
 
-        self.send(83, bytes.empty()) catch 0
+        self.send(83, bytes.empty())!
+        return true
 
     # Parse/Bind/Describe/Execute/Sync for one parameterized statement using the
     # unnamed statement and portal, so nothing is left prepared on the server.
-    fn send_extended(text: String, params: List[String]):
-        self.send_parse("", text)
-        self.send_bind_execute("", params)
+    fn send_extended(text: String, params: List[String]) -> Bool!:
+        self.send_parse("", text)!
+        self.send_bind_execute("", params)!
+        return true
 
 # run a query through the simple query protocol and collect its rows.
 pub fn query(conn: Conn, text: String) -> Rows!:
-    conn.send(81, cstring(text))!
+    conn.send(81, cstring(text)!)!
     result := read_response(conn)!
     return Rows(rows: result.rows, pos: 0)
 
 # run a parameterized query. `$1`, `$2`, ... bind to `params` (in text form),
 # which keeps values off the sql string.
 pub fn query_params(conn: Conn, text: String, params: List[String]) -> Rows!:
-    conn.send_extended(text, params)
+    conn.send_extended(text, params)!
     result := read_response(conn)!
     return Rows(rows: result.rows, pos: 0)
 
 # run a statement for its effect (insert/update/delete/ddl), returning the
 # number of rows it affected.
 pub fn exec(conn: Conn, text: String) -> Int!:
-    conn.send(81, cstring(text))!
+    conn.send(81, cstring(text)!)!
     result := read_response(conn)!
     return result.affected
 
 # like exec, but with `$1`, `$2`, ... bound to `params`.
 pub fn exec_params(conn: Conn, text: String, params: List[String]) -> Int!:
-    conn.send_extended(text, params)
+    conn.send_extended(text, params)!
     result := read_response(conn)!
     return result.affected
 
@@ -595,21 +620,21 @@ pub fn exec_params(conn: Conn, text: String, params: List[String]) -> Int!:
 # names live for the session; re-preparing an existing name is an error on the
 # server, so pick a fresh one per distinct query.
 pub fn prepare(conn: Conn, name: String, text: String) -> Int!:
-    conn.send_parse(name, text)
+    conn.send_parse(name, text)!
     conn.send(83, bytes.empty())!
     read_response(conn)!
     return 0
 
 # run a prepared statement, binding `params`, and collect its rows.
 pub fn query_prepared(conn: Conn, name: String, params: List[String]) -> Rows!:
-    conn.send_bind_execute(name, params)
+    conn.send_bind_execute(name, params)!
     result := read_response(conn)!
     return Rows(rows: result.rows, pos: 0)
 
 # run a prepared statement for its effect, returning the number of rows it
 # affected.
 pub fn exec_prepared(conn: Conn, name: String, params: List[String]) -> Int!:
-    conn.send_bind_execute(name, params)
+    conn.send_bind_execute(name, params)!
     result := read_response(conn)!
     return result.affected
 
@@ -861,3 +886,7 @@ test "close records that it ran, so a second close and the drop do nothing":
     conn.close()
     conn.abandon()
     assert(conn.closed)
+
+test "cstring rejects embedded null bytes":
+    assert(cstring("ok").is_ok)
+    assert(cstring("bad" + chr(0) + "user").is_err)

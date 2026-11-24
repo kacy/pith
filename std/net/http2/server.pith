@@ -69,6 +69,15 @@ from std.net.http2.connection import StreamEvent, headers_event, data_event, res
 # exchange.
 PREFACE := "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
+# RFC 9113 §6.5.2 and §6.9.1 bounds for peer SETTINGS and flow-control windows,
+# plus a local ceiling on our HPACK encoder table so a hostile peer advertising
+# 4 GiB cannot commit our encoder to unbounded dynamic-table memory.
+MIN_MAX_FRAME_SIZE := 16384
+MAX_MAX_FRAME_SIZE := 16777215
+MAX_FLOW_CONTROL_WINDOW := 2147483647
+MAX_LOCAL_ENCODER_TABLE_SIZE := 65536
+FLOW_CONTROL_OVERFLOW := "http2: flow-control window overflow"
+
 # the most streams the server will serve at once on one connection. advertised in
 # the server's SETTINGS and enforced by the reader: a new stream past the cap is
 # refused with RST_STREAM rather than spawned.
@@ -725,16 +734,19 @@ fn is_hop_by_hop(name: String) -> Bool:
 # pseudo-header first, then the content type, the regular headers (lowercased,
 # with hop-by-hop and length/type headers dropped), and any set-cookie lines.
 # content-length is omitted — http/2 conveys the body length through DATA framing.
+# drops any malformed header name or value containing CR/LF/NUL so outbound
+# responses stay RFC 9113 §8.2.1 compliant.
 fn response_fields(response: http.HttpResponse) -> List[hpack.HeaderField]:
     mut fields: List[hpack.HeaderField] := [hpack.header_field(":status", response.status.to_string())]
-    if response.content_type != "":
+    if response.content_type != "" and field_value_is_clean(response.content_type):
         fields.push(hpack.header_field("content-type", response.content_type))
     if response.raw_headers.len() > 0:
         for item in response.raw_headers:
             name := item.name.to_lower()
             if is_hop_by_hop(name) or name == "content-type" or name == "content-length" or name == "set-cookie":
                 continue
-            fields.push(hpack.header_field(name, item.value))
+            if is_h2_header_name(name) and field_value_is_clean(item.value):
+                fields.push(hpack.header_field(name, item.value))
     else:
         for key in response.headers:
             name := key.to_lower()
@@ -742,9 +754,12 @@ fn response_fields(response: http.HttpResponse) -> List[hpack.HeaderField]:
             # the http client also has its last one in this map
             if is_hop_by_hop(name) or name == "content-type" or name == "content-length" or name == "set-cookie":
                 continue
-            fields.push(hpack.header_field(name, response.headers[key]))
+            val := response.headers[key]
+            if is_h2_header_name(name) and field_value_is_clean(val):
+                fields.push(hpack.header_field(name, val))
     for cookie in response.set_cookie_headers:
-        fields.push(hpack.header_field("set-cookie", cookie))
+        if field_value_is_clean(cookie):
+            fields.push(hpack.header_field("set-cookie", cookie))
     return fields
 
 # flatten a response's trailers into hpack header fields for the trailing HEADERS
@@ -752,7 +767,10 @@ fn response_fields(response: http.HttpResponse) -> List[hpack.HeaderField]:
 fn response_trailer_fields(response: http.HttpResponse) -> List[hpack.HeaderField]:
     mut fields: List[hpack.HeaderField] := []
     for key in response.trailers:
-        fields.push(hpack.header_field(key.to_lower(), response.trailers[key]))
+        name := key.to_lower()
+        val := response.trailers[key]
+        if is_h2_header_name(name) and field_value_is_clean(val):
+            fields.push(hpack.header_field(name, val))
     return fields
 
 # encode and send a response's HEADERS on `stream_id`: one HEADERS frame carrying
@@ -818,28 +836,42 @@ impl Server:
         return false
 
 # apply an inbound WINDOW_UPDATE to our send windows and wake any body sender
-# waiting on the affected stream. a stream-0 update grows the connection window,
-# which may unblock any stream, so it pokes them all; a stream id grows just that
-# one stream. pokes are sent outside the mutex so a full poke channel (one already
-# pending) never blocks the reader. mirrors the client's grant_send_credit.
-fn grant_send_credit(server: Server, stream_id: Int, increment: Int):
+# waiting on the affected stream. fails with FLOW_CONTROL_OVERFLOW if the new
+# window would exceed RFC 9113's 2^31 - 1 ceiling.
+fn grant_send_credit(server: Server, stream_id: Int, increment: Int) -> Bool!:
+    if increment <= 0 or increment > MAX_FLOW_CONTROL_WINDOW:
+        fail FLOW_CONTROL_OVERFLOW
     if stream_id == 0:
         mut waiters: List[Channel[Int]] := []
+        mut overflow := false
         locked server.mu:
-            server.conn_send_window = server.conn_send_window + increment
-            for sid in server.active:
-                if server.credit.contains_key(sid):
-                    waiters.push(server.credit[sid])
+            if server.conn_send_window + increment > MAX_FLOW_CONTROL_WINDOW:
+                overflow = true
+            else:
+                server.conn_send_window = server.conn_send_window + increment
+                for sid in server.active:
+                    if server.credit.contains_key(sid):
+                        waiters.push(server.credit[sid])
+        if overflow:
+            fail FLOW_CONTROL_OVERFLOW
         for ch in waiters:
             ch.try_send(1)
-        return
+        return true
     mut poke: Channel[Int]? := none
+    mut overflow := false
     locked server.mu:
         if server.send_windows.contains_key(stream_id):
-            server.send_windows.insert(stream_id, server.send_windows[stream_id] + increment)
-        poke = server.credit.get(stream_id)
+            if server.send_windows[stream_id] + increment > MAX_FLOW_CONTROL_WINDOW:
+                overflow = true
+            else:
+                server.send_windows.insert(stream_id, server.send_windows[stream_id] + increment)
+        if not overflow:
+            poke = server.credit.get(stream_id)
+    if overflow:
+        fail FLOW_CONTROL_OVERFLOW
     if let ch = poke:
         ch.try_send(1)
+    return true
 
 # stream `data` as flow-controlled DATA frames on `stream_id`, honoring the
 # client's send windows: reserve credit bounded by the stream window, the
@@ -1095,15 +1127,14 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
             # apply the client's limits (initial window, max frame size, header
             # table size) to our send side before acking them, so a response is
             # framed and gated to what the client accepts.
-            apply_peer_settings(server, sf.settings)
+            apply_peer_settings(server, sf.settings)!
             server.enqueue_frame(frames.settings_ack_frame())
         return true
     if t == frames.FRAME_WINDOW_UPDATE:
         wu := frames.parse_window_update(frame)!
-        # a zero increment is a protocol error (RFC 9113 §6.9.1); ignore the frame
-        # rather than tear the connection down over it.
-        if wu.increment != 0:
-            grant_send_credit(server, wu.stream_id, wu.increment)
+        if wu.increment == 0:
+            fail "http2: WINDOW_UPDATE with a zero increment"
+        grant_send_credit(server, wu.stream_id, wu.increment)!
         return true
     if t == frames.FRAME_PING:
         pf := frames.parse_ping(frame)!
@@ -1122,25 +1153,104 @@ fn handle_frame(server: Server, frame: frames.Frame) -> Bool!:
     # so they are ignored.
     return true
 
-# apply the client's SETTINGS (RFC 9113 §6.5.2) to our send side. the header
-# table size bounds our hpack encoder so the indices we emit stay valid for the
-# client's decoder; the max frame size caps how large a DATA frame we send; the
-# initial window size seeds new streams' send credit and, per §6.9.2, adjusts
-# every open stream's window by the delta from the previous value. other
-# identifiers do not shape what the server sends, so they are ignored.
-fn apply_peer_settings(server: Server, settings: List[frames.Setting]):
+# apply the client's SETTINGS (RFC 9113 §6.5.2) to our send side, rejecting
+# out-of-range values before mutating server state.
+fn apply_peer_settings(server: Server, settings: List[frames.Setting]) -> Bool!:
+    for s in settings:
+        if s.id == SETTINGS_INITIAL_WINDOW_SIZE:
+            if s.value < 0 or s.value > MAX_FLOW_CONTROL_WINDOW:
+                fail FLOW_CONTROL_OVERFLOW
+        elif s.id == SETTINGS_MAX_FRAME_SIZE:
+            if s.value < MIN_MAX_FRAME_SIZE or s.value > MAX_MAX_FRAME_SIZE:
+                fail "http2: invalid SETTINGS_MAX_FRAME_SIZE"
+        elif s.id == SETTINGS_HEADER_TABLE_SIZE:
+            if s.value < 0:
+                fail "http2: invalid SETTINGS_HEADER_TABLE_SIZE"
+    mut overflow := false
     locked server.mu:
         for s in settings:
             if s.id == SETTINGS_HEADER_TABLE_SIZE:
-                server.conn.set_encoder_table_size(s.value)
+                mut capped := s.value
+                if capped > MAX_LOCAL_ENCODER_TABLE_SIZE:
+                    capped = MAX_LOCAL_ENCODER_TABLE_SIZE
+                server.conn.set_encoder_table_size(capped)
             elif s.id == SETTINGS_MAX_FRAME_SIZE:
                 server.peer_max_frame_size = s.value
             elif s.id == SETTINGS_INITIAL_WINDOW_SIZE:
                 delta := s.value - server.peer_initial_window
-                server.peer_initial_window = s.value
                 for sid in server.active:
                     if server.send_windows.contains_key(sid):
-                        server.send_windows.insert(sid, server.send_windows[sid] + delta)
+                        if server.send_windows[sid] + delta > MAX_FLOW_CONTROL_WINDOW:
+                            overflow = true
+                if not overflow:
+                    server.peer_initial_window = s.value
+                    for sid in server.active:
+                        if server.send_windows.contains_key(sid):
+                            server.send_windows.insert(sid, server.send_windows[sid] + delta)
+    if overflow:
+        fail FLOW_CONTROL_OVERFLOW
+    return true
+
+# whether `b` is an RFC 9110 token character (tchar):
+# ! # $ % & ' * + - . ^ _ ` | ~ or DIGIT / ALPHA.
+fn is_tchar(b: Int) -> Bool:
+    if (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122):
+        return true
+    return b == 33 or b == 35 or b == 36 or b == 37 or b == 38 or b == 39 or b == 42 or b == 43 or b == 45 or b == 46 or b == 94 or b == 95 or b == 96 or b == 124 or b == 126
+
+# RFC 9113 §8.2.1: regular HTTP/2 header names must be non-empty lowercase
+# tokens (no uppercase A-Z, no ':', no spaces, no CTLs).
+fn is_h2_header_name(name: String) -> Bool:
+    data := bytes.from_string_utf8(name)
+    if data.len() == 0:
+        return false
+    mut i := 0
+    while i < data.len():
+        b := data[i]
+        if b >= 65 and b <= 90:
+            return false
+        if not is_tchar(b):
+            return false
+        i = i + 1
+    return true
+
+# RFC 9110 §9.1: :method must be a non-empty token (no spaces or CTLs so it
+# cannot split into method + path when bridged to HTTP/1.1).
+fn is_http_token(text: String) -> Bool:
+    data := bytes.from_string_utf8(text)
+    if data.len() == 0:
+        return false
+    mut i := 0
+    while i < data.len():
+        if not is_tchar(data[i]):
+            return false
+        i = i + 1
+    return true
+
+# RFC 9113 §8.2.1: a field value must not contain NUL, CR, LF, or other CTLs
+# (HTAB is permitted).
+fn field_value_is_clean(text: String) -> Bool:
+    data := bytes.from_string_utf8(text)
+    mut i := 0
+    while i < data.len():
+        b := data[i]
+        if (b < 32 and b != 9) or b == 127:
+            return false
+        i = i + 1
+    return true
+
+# pseudo-header values like :path and :authority must carry no whitespace or
+# CTLs so bridging `method + " " + path + " HTTP/1.1"` can never spoof the
+# request target or inject headers.
+fn pseudo_value_no_space_or_ctl(text: String) -> Bool:
+    data := bytes.from_string_utf8(text)
+    mut i := 0
+    while i < data.len():
+        b := data[i]
+        if b <= 32 or b == 127:
+            return false
+        i = i + 1
+    return true
 
 # whether a decoded header name or value is free of the octets that MUST NOT
 # appear in an http/2 field: NUL, CR, and LF. bridging such a field into an
@@ -1157,10 +1267,44 @@ fn field_text_is_clean(text: String) -> Bool:
         i = i + 1
     return true
 
+# validate a decoded HTTP/2 request header or trailer block against RFC 9113
+# §8.2/§8.3 so bridging to HTTP/1.1 cannot spoof `:method`, `:path`, or header
+# names/values. trailers (`is_trailer == true`) must contain no pseudo-headers.
 fn header_fields_are_clean(fields: List[hpack.HeaderField]) -> Bool:
+    return validate_header_block(fields, false)
+
+fn validate_header_block(fields: List[hpack.HeaderField], is_trailer: Bool) -> Bool:
+    mut seen_regular := false
+    mut seen_method := false
+    mut seen_path := false
+    mut seen_scheme := false
+    mut seen_authority := false
     for field in fields:
-        if not field_text_is_clean(field.name) or not field_text_is_clean(field.value):
-            return false
+        if field.name.starts_with(":"):
+            if is_trailer or seen_regular:
+                return false
+            if field.name == ":method":
+                if seen_method or not is_http_token(field.value):
+                    return false
+                seen_method = true
+            elif field.name == ":path":
+                if seen_path or field.value == "" or not pseudo_value_no_space_or_ctl(field.value):
+                    return false
+                seen_path = true
+            elif field.name == ":scheme":
+                if seen_scheme or field.value == "" or not pseudo_value_no_space_or_ctl(field.value):
+                    return false
+                seen_scheme = true
+            elif field.name == ":authority":
+                if seen_authority or not pseudo_value_no_space_or_ctl(field.value):
+                    return false
+                seen_authority = true
+            else:
+                return false
+        else:
+            seen_regular = true
+            if not is_h2_header_name(field.name) or not field_value_is_clean(field.value):
+                return false
     return true
 
 # whether a decoded header list stays within the server's size limits, so a giant
@@ -1179,20 +1323,21 @@ fn header_list_within_limits(fields: List[hpack.HeaderField]) -> Bool:
 # refused with RST_STREAM.
 fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.HeaderField]):
     stream_id := hf.stream_id
-    # refuse a request whose headers would splice extra lines when bridged to
-    # http/1.1, or whose header list is over-large, before opening or feeding any
-    # stream. the block was already decoded by the caller, so the shared hpack
-    # decoder stays in step even though we drop the request.
-    if not header_fields_are_clean(fields):
+    # a header block for a stream we already know is the request trailers.
+    mut known := false
+    locked server.mu:
+        known = server.streams.contains_key(stream_id)
+    # refuse a request or trailer block whose headers would splice extra lines
+    # or spoof pseudo-headers when bridged to http/1.1, or whose header list is
+    # over-large, before opening or feeding any stream. the block was already
+    # decoded by the caller, so the shared hpack decoder stays in step even
+    # though we drop the request.
+    if not validate_header_block(fields, known):
         server.reset(stream_id, frames.ERROR_PROTOCOL_ERROR)
         return
     if not header_list_within_limits(fields):
         server.reset(stream_id, frames.ERROR_ENHANCE_YOUR_CALM)
         return
-    # a header block for a stream we already know is the request trailers.
-    mut known := false
-    locked server.mu:
-        known = server.streams.contains_key(stream_id)
     if known:
         if let inbox = server.inbox_for(stream_id):
             inbox.send(headers_event(fields, hf.end_stream))
@@ -1245,7 +1390,10 @@ fn run_reader(server: Server):
             break
         outcome := handle_frame(server, attempt.ok)
         if outcome.is_err:
-            send_goaway(server, frames.ERROR_PROTOCOL_ERROR)
+            if outcome.err == FLOW_CONTROL_OVERFLOW:
+                send_goaway(server, frames.ERROR_FLOW_CONTROL_ERROR)
+            else:
+                send_goaway(server, frames.ERROR_PROTOCOL_ERROR)
             break
         if not outcome.ok:
             break
@@ -1878,12 +2026,30 @@ test "reserve_send is bounded by the stream and connection windows and the frame
 test "grant_send_credit grows the stream and connection send windows":
     server := test_server(server_conn_from_bytes(bytes.empty()))
     arm_send_stream(server, 1, 0, 0, 100)
-    grant_send_credit(server, 1, 50)
+    grant_send_credit(server, 1, 50)!
     locked server.mu:
         assert_eq(server.send_windows[1], 50)
-    grant_send_credit(server, 0, 30)
+    grant_send_credit(server, 0, 30)!
     locked server.mu:
         assert_eq(server.conn_send_window, 30)
+    assert(grant_send_credit(server, 0, 2147483647).is_err)
+    assert(grant_send_credit(server, 1, 2147483647).is_err)
+
+test "apply_peer_settings refuses RFC 9113 out-of-range settings":
+    server := test_server(server_conn_from_bytes(bytes.empty()))
+    assert(apply_peer_settings(server, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 0)]).is_err)
+    assert(apply_peer_settings(server, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 16383)]).is_err)
+    assert(apply_peer_settings(server, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 16777216)]).is_err)
+    assert(apply_peer_settings(server, [frames.setting(SETTINGS_INITIAL_WINDOW_SIZE, 2147483648)]).is_err)
+    assert(apply_peer_settings(server, [frames.setting(SETTINGS_MAX_FRAME_SIZE, 32768)]).is_ok)
+
+test "header validation rejects spoofed :method, :path, and malformed header names":
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET /admin HTTP/1.1"), hpack.header_field(":path", "/public")]))
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/a b")]))
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field("x-role: admin", "")]))
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":path", "/"), hpack.header_field("X-Upper", "1")]))
+    assert(not header_fields_are_clean([hpack.header_field(":method", "GET"), hpack.header_field(":method", "POST"), hpack.header_field(":path", "/")]))
+    assert(not header_fields_are_clean([hpack.header_field("x-a", "1"), hpack.header_field(":method", "GET"), hpack.header_field(":path", "/")]))
 
 test "send_stream_data splits a large body across the window and finishes after a WINDOW_UPDATE":
     server := test_server(server_conn_from_bytes(bytes.empty()))
@@ -1897,8 +2063,8 @@ test "send_stream_data splits a large body across the window and finishes after 
     assert_eq(first.data.to_string_utf8()!, "abcd")
     assert(not first.end_stream)
     # grant the remaining six bytes on both windows; the sender wakes and finishes.
-    grant_send_credit(server, 1, 6)
-    grant_send_credit(server, 0, 6)
+    grant_send_credit(server, 1, 6)!
+    grant_send_credit(server, 0, 6)!
     total := await sender
     assert_eq(total, 10)
     second := next_data_frame(server.outbound)!

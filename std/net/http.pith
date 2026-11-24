@@ -426,18 +426,24 @@ fn find_bytes(data: Bytes, start: Int, needle: Bytes) -> Int:
         pos = pos + 1
     return -1
 
+# cap how many parts a single multipart/form-data body may contain, so a crafted
+# upload packed with tiny boundaries cannot force unbounded allocations or CPU.
+MAX_MULTIPART_PARTS := 4096
+
 # where a part's header block ends: the first blank line from `start`, CRLF or
 # bare LF. answers [where the blank line starts, its length], or [] when the
-# headers never end.
+# headers never end. scanned in a single forward pass so a CRLF body never scans
+# to EOF looking for bare LF on every part.
 fn multipart_header_bounds(data: Bytes, start: Int) -> List[Int]:
-    crlf_blank := bytes.from_string_utf8(chr(13) + chr(10) + chr(13) + chr(10))
-    lf_blank := bytes.from_string_utf8(chr(10) + chr(10))
-    crlf_pos := find_bytes(data, start, crlf_blank)
-    lf_pos := find_bytes(data, start, lf_blank)
-    if crlf_pos >= 0 and (lf_pos < 0 or crlf_pos <= lf_pos):
-        return [crlf_pos, 4]
-    if lf_pos >= 0:
-        return [lf_pos, 2]
+    n := data.len()
+    mut i := start
+    while i < n:
+        b := data[i]
+        if b == 13 and i + 3 < n and data[i + 1] == 10 and data[i + 2] == 13 and data[i + 3] == 10:
+            return [i, 4]
+        if b == 10 and i + 1 < n and data[i + 1] == 10:
+            return [i, 2]
+        i = i + 1
     return []
 
 fn parse_header_text_map(text: String) -> Map[String, String]:
@@ -460,17 +466,19 @@ fn parse_header_text_map(text: String) -> Map[String, String]:
 # the next boundary delimiter from `start`, with the line ending before it,
 # which belongs to the delimiter rather than the part body (rfc 2046 5.1.1).
 # answers [where that line ending starts, its length], or [] when there is
-# none.
-fn multipart_find_next_boundary(data: Bytes, start: Int, boundary: String) -> List[Int]:
-
-    crlf_marker := bytes.from_string_utf8(chr(13) + chr(10) + "--" + boundary)
-    lf_marker := bytes.from_string_utf8(chr(10) + "--" + boundary)
-    crlf_pos := find_bytes(data, start, crlf_marker)
-    lf_pos := find_bytes(data, start, lf_marker)
-    if crlf_pos >= 0 and (lf_pos < 0 or crlf_pos <= lf_pos):
-        return [crlf_pos, 2]
-    if lf_pos >= 0:
-        return [lf_pos, 1]
+# none. searches for `--boundary` once and checks the preceding line ending so
+# CRLF and bare-LF bodies both run in O(N) total time.
+fn multipart_find_next_boundary(data: Bytes, start: Int, marker: Bytes) -> List[Int]:
+    mut search := start + 1
+    while search < data.len():
+        at := find_bytes(data, search, marker)
+        if at < 0:
+            return []
+        if at >= start + 2 and data[at - 2] == 13 and data[at - 1] == 10:
+            return [at - 2, 2]
+        if at >= start + 1 and data[at - 1] == 10:
+            return [at - 1, 1]
+        search = at + 1
     return []
 
 fn multipart_consume_newline(data: Bytes, start: Int) -> Int:
@@ -493,6 +501,8 @@ fn parse_multipart_parts(body: Bytes, boundary: String) -> List[MultipartPart]!:
     pos = multipart_consume_newline(body, pos)
     mut parts: List[MultipartPart] := []
     while pos <= body.len():
+        if parts.len() >= MAX_MULTIPART_PARTS:
+            fail "multipart body has too many parts"
         header_bounds := multipart_header_bounds(body, pos)
         if header_bounds.len() != 2:
             fail "multipart headers are incomplete"
@@ -508,7 +518,7 @@ fn parse_multipart_parts(body: Bytes, boundary: String) -> List[MultipartPart]!:
         filename := header_param_value(disposition, "filename")
         content_type := header_lookup(headers, "Content-Type")
         body_start := header_bounds[0] + header_bounds[1]
-        next_boundary := multipart_find_next_boundary(body, body_start, boundary)
+        next_boundary := multipart_find_next_boundary(body, body_start, marker)
         if next_boundary.len() != 2:
             fail "multipart closing boundary not found"
         part_body := body.slice(body_start, next_boundary[0])
@@ -2070,10 +2080,18 @@ fn stream_chunked_from(src: ByteSource, writer: BufferedBytesWriter) -> Int!:
 fn read_exact_from_tls(conn: tls.Conn, count: Int) -> Bytes!:
     if count <= 0:
         return bytes.empty()
-    out := bytes.buffer_with_capacity(count)
+    # cap initial reservation and per-read chunk so a declared-large
+    # Content-Length cannot allocate megabytes before bytes arrive.
+    mut initial := count
+    if initial > 65536:
+        initial = 65536
+    out := bytes.buffer_with_capacity(initial)
     errdefer out.free()
     while out.len() < count:
-        chunk := conn.read_bytes(count - out.len())!
+        mut want := count - out.len()
+        if want > 65536:
+            want = 65536
+        chunk := conn.read_bytes(want)!
         if chunk.is_empty():
             fail "unexpected eof"
         out.write(chunk)!
@@ -7818,3 +7836,12 @@ test "loopback HTTP/1.1 multi-value headers survive Client send and send_to_file
     assert_eq(ssv[0], "s1")
     assert_eq(ssv[1], "s2")
     assert_eq(fs.read(tmp_path)!, "c1|c2|c3")
+
+test "multipart parser handles CRLF/LF linearly and enforces MAX_MULTIPART_PARTS":
+    crlf := chr(13) + chr(10)
+    part := "--b" + crlf + "Content-Disposition: form-data; name=\"k\"" + crlf + crlf + "v" + crlf
+    ok_body := bytes.from_string_utf8(part.repeat(50) + "--b--" + crlf)
+    parsed := parse_multipart_parts(ok_body, "b")!
+    assert_eq(parsed.len(), 50)
+    too_many := bytes.from_string_utf8(part.repeat(MAX_MULTIPART_PARTS + 1) + "--b--" + crlf)
+    assert(parse_multipart_parts(too_many, "b").is_err)

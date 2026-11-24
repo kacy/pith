@@ -63,14 +63,26 @@ pub fn parse(input: String) -> URL:
     mut r_fragment := ""
     mut pos := 0
 
-    # scheme: find "://"
+    # scheme: RFC 3986 §3.1 — ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+    # followed immediately by "://". stop at the first non-scheme byte so a
+    # relative path or query carrying "https://..." is never misparsed as a
+    # scheme + host.
     mut scheme_end := 0 - 1
     mut i := 0
-    while i + 2 < input.len():
-        if input[i] == ":" and input[i + 1] == "/" and input[i + 2] == "/":
-            scheme_end = i
-            break
-        i = i + 1
+    if input.len() > 0:
+        first_b := ord(input[0])
+        is_alpha := (first_b >= 65 and first_b <= 90) or (first_b >= 97 and first_b <= 122)
+        if is_alpha:
+            while i < input.len():
+                b := ord(input[i])
+                if b == 58:
+                    if i + 2 < input.len() and input[i + 1] == "/" and input[i + 2] == "/":
+                        scheme_end = i
+                    break
+                ok := (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 43 or b == 45 or b == 46
+                if not ok:
+                    break
+                i = i + 1
     if scheme_end > 0:
         r_scheme = input.substring(0, scheme_end)
         pos = scheme_end + 3
@@ -432,6 +444,12 @@ test "url parse handles userinfo, bracketed ipv6, and invalid ports":
     empty_port := parse("http://example.com:/path")
     assert_eq(host(empty_port), "example.com")
     assert_eq(port(empty_port), 0 - 1)
+
+    rel_with_nested_url := parse("/redirect?next=https://evil.example/a")
+    assert_eq(scheme(rel_with_nested_url), "")
+    assert_eq(host(rel_with_nested_url), "")
+    assert_eq(path(rel_with_nested_url), "/redirect")
+    assert_eq(query(rel_with_nested_url), "next=https://evil.example/a")
 
 test "url parsing is safe from concurrent threads":
     mut tasks := []

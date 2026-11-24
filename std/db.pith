@@ -71,11 +71,13 @@ pub fn parse_url(url: String) -> Dsn!:
     driver := normalize_driver(url.substring(0, scheme_at))!
     mut rest := url.substring(scheme_at + 3, url.len())
 
-    # peel the query string (only `pool` is honored today) off the tail.
+    # peel the query string (`pool` is honored; TLS/SSL options fail closed so a
+    # caller asking for `?sslmode=require` or `?tls=true` never silently gets a
+    # plaintext TCP connection).
     mut pool_size := DEFAULT_POOL_SIZE
     query_at := rest.index_of("?")
     if query_at >= 0:
-        pool_size = pool_from_query(rest.substring(query_at + 1, rest.len()), pool_size)
+        pool_size = pool_from_query(rest.substring(query_at + 1, rest.len()), pool_size)!
         rest = rest.substring(0, query_at)
 
     # split the authority (credentials + host) from the database path.
@@ -128,15 +130,28 @@ fn default_port(driver: String) -> Int:
     return 5432
 
 # read `pool=N` out of a query string, keeping `fallback` when it is absent or
-# not a positive integer.
-fn pool_from_query(query: String, fallback: Int) -> Int:
+# not a positive integer. refuses TLS/SSL query options that request encryption
+# so `std.db.open` never silently downgrades to plaintext TCP.
+fn pool_from_query(query: String, fallback: Int) -> Int!:
+    mut result := fallback
     for pair in query.split("&"):
         eq_at := pair.index_of("=")
-        if eq_at >= 0 and pair.substring(0, eq_at) == "pool":
-            n := parse_int(pair.substring(eq_at + 1, pair.len())) catch fallback
-            if n > 0:
-                return n
-    return fallback
+        if eq_at >= 0:
+            key := pair.substring(0, eq_at).to_lower()
+            val := pair.substring(eq_at + 1, pair.len()).to_lower()
+            if key == "pool":
+                n := parse_int(val) catch fallback
+                if n > 0:
+                    result = n
+            elif key == "sslmode":
+                if val != "disable":
+                    fail "db: url requests TLS via sslmode={val}, which std.db.open does not support; use connect_tls instead"
+            elif key == "tls" or key == "ssl":
+                if val != "false" and val != "0" and val != "disable" and val != "off":
+                    fail "db: url requests TLS via {key}={val}, which std.db.open does not support; use connect_tls instead"
+            elif key == "sslrootcert" or key == "sslcert" or key == "sslkey":
+                fail "db: url specifies TLS option '{key}', which std.db.open does not support; use connect_tls instead"
+    return result
 
 # --- rows helpers ---
 
@@ -202,6 +217,15 @@ test "parse_url rejects an unknown scheme":
 test "parse_url rejects a url with no scheme":
     result := parse_url("localhost:5432/app")
     assert(result.is_err)
+
+test "parse_url refuses tls query options instead of silently downgrading":
+    assert(parse_url("postgres://localhost/app?sslmode=require").is_err)
+    assert(parse_url("postgres://localhost/app?sslmode=verify-full").is_err)
+    assert(parse_url("mysql://localhost/app?tls=true").is_err)
+    assert(parse_url("postgres://localhost/app?sslrootcert=/etc/ca.pem").is_err)
+    # explicit opt-out remains allowed
+    dsn := parse_url("postgres://localhost/app?sslmode=disable&pool=4")!
+    assert_eq(dsn.pool_size, 4)
 
 test "first returns the leading row or none":
     rows := [sql.row([sql.integer(1)], ["id"]), sql.row([sql.integer(2)], ["id"])]

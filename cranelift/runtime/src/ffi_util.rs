@@ -178,6 +178,32 @@ pub(crate) unsafe fn unbox_result(pair: ResultPair) -> Result<i64, String> {
 mod tests {
     use super::*;
 
+    /// A string with no runtime header, 16 zero bytes into its own buffer.
+    /// `pith_cstring_len` probes the 16 bytes in front of a pointer for a
+    /// header, and every string the runtime hands out has one. A bare literal
+    /// has whatever static the linker put in front of it instead, and when
+    /// those bytes spelled a header the probe read its length and the tests
+    /// failed on one build and passed on another. Zeros there make the probe
+    /// miss, so these tests always reach the byte-counting fallback.
+    struct Bare(Vec<u64>);
+
+    impl Bare {
+        fn new(text: &[u8]) -> Self {
+            let mut words = vec![0u64; 2 + text.len().div_ceil(8) + 1];
+            // SAFETY: the buffer holds the 16 leading bytes, the text and at
+            // least one more zero byte.
+            unsafe {
+                std::ptr::copy_nonoverlapping(text.as_ptr(), (words.as_mut_ptr() as *mut u8).add(16), text.len())
+            };
+            Bare(words)
+        }
+
+        fn ptr(&self) -> *const i8 {
+            // SAFETY: the buffer is at least 16 bytes long.
+            unsafe { (self.0.as_ptr() as *const u8).add(16) as *const i8 }
+        }
+    }
+
     #[test]
     fn null_cstring_returns_safe_defaults() {
         let null = std::ptr::null();
@@ -190,7 +216,8 @@ mod tests {
     #[test]
     fn invalid_utf8_returns_safe_defaults() {
         let invalid = [0xffu8, 0x00];
-        let ptr = invalid.as_ptr() as *const i8;
+        let bare_invalid = Bare::new(&invalid[..]);
+        let ptr = bare_invalid.ptr();
 
         assert_eq!(unsafe { with_cstr_bytes(ptr, |b| b.to_vec()) }, Some(invalid[..1].to_vec()));
         assert!(unsafe { with_cstr_str(ptr, str::to_owned) }.is_none());
@@ -201,7 +228,8 @@ mod tests {
     #[test]
     fn valid_cstring_round_trips() {
         let valid = b"pith\0";
-        let ptr = valid.as_ptr() as *const i8;
+        let bare_valid = Bare::new(&valid[..]);
+        let ptr = bare_valid.ptr();
 
         assert_eq!(unsafe { with_cstr_bytes(ptr, |b| b.to_vec()) }, Some(valid[..4].to_vec()));
         assert_eq!(unsafe { with_cstr_str(ptr, str::to_owned) }, Some("pith".to_string()));
@@ -213,8 +241,11 @@ mod tests {
     fn with_cstr_bytes_handles_null_invalid_and_valid() {
         let null = std::ptr::null();
         let invalid = [0xffu8, 0xfe, 0x00];
+        let bare_invalid = Bare::new(&invalid[..]);
         let empty = b"\0";
+        let bare_empty = Bare::new(&empty[..]);
         let valid = b"pith\0";
+        let bare_valid = Bare::new(&valid[..]);
 
         let mut called = false;
         assert_eq!(
@@ -228,16 +259,16 @@ mod tests {
         );
         assert!(!called);
 
-        let inv_ptr = invalid.as_ptr() as *const i8;
+        let inv_ptr = bare_invalid.ptr();
         assert_eq!(
             unsafe { with_cstr_bytes(inv_ptr, |b| b.to_vec()) },
             Some(vec![0xff, 0xfe])
         );
 
-        let empty_ptr = empty.as_ptr() as *const i8;
+        let empty_ptr = bare_empty.ptr();
         assert_eq!(unsafe { with_cstr_bytes(empty_ptr, <[u8]>::len) }, Some(0));
 
-        let valid_ptr = valid.as_ptr() as *const i8;
+        let valid_ptr = bare_valid.ptr();
         assert_eq!(
             unsafe { with_cstr_bytes(valid_ptr, |b| b.to_vec()) },
             Some(b"pith".to_vec())
@@ -248,11 +279,14 @@ mod tests {
     fn with_cstr_bytes2_handles_null_invalid_and_valid() {
         let null = std::ptr::null();
         let a = b"hello\0";
+        let bare_a = Bare::new(&a[..]);
         let b = b"world\0";
+        let bare_b = Bare::new(&b[..]);
         let invalid = [0x80u8, 0x00];
-        let a_ptr = a.as_ptr() as *const i8;
-        let b_ptr = b.as_ptr() as *const i8;
-        let inv_ptr = invalid.as_ptr() as *const i8;
+        let bare_invalid = Bare::new(&invalid[..]);
+        let a_ptr = bare_a.ptr();
+        let b_ptr = bare_b.ptr();
+        let inv_ptr = bare_invalid.ptr();
 
         let mut called = false;
         assert_eq!(
@@ -298,11 +332,14 @@ mod tests {
     fn with_cstr_str_handles_null_invalid_and_valid() {
         let null = std::ptr::null();
         let invalid = [0xffu8, 0x00];
+        let bare_invalid = Bare::new(&invalid[..]);
         let empty = b"\0";
+        let bare_empty = Bare::new(&empty[..]);
         let valid = b"pith\0";
-        let inv_ptr = invalid.as_ptr() as *const i8;
-        let empty_ptr = empty.as_ptr() as *const i8;
-        let valid_ptr = valid.as_ptr() as *const i8;
+        let bare_valid = Bare::new(&valid[..]);
+        let inv_ptr = bare_invalid.ptr();
+        let empty_ptr = bare_empty.ptr();
+        let valid_ptr = bare_valid.ptr();
 
         let mut called = false;
         assert_eq!(
@@ -339,11 +376,14 @@ mod tests {
     fn with_cstr_str2_handles_null_invalid_and_valid() {
         let null = std::ptr::null();
         let invalid = [0xffu8, 0x00];
+        let bare_invalid = Bare::new(&invalid[..]);
         let a = b"foo\0";
+        let bare_a = Bare::new(&a[..]);
         let b = b"bar\0";
-        let inv_ptr = invalid.as_ptr() as *const i8;
-        let a_ptr = a.as_ptr() as *const i8;
-        let b_ptr = b.as_ptr() as *const i8;
+        let bare_b = Bare::new(&b[..]);
+        let inv_ptr = bare_invalid.ptr();
+        let a_ptr = bare_a.ptr();
+        let b_ptr = bare_b.ptr();
 
         let mut called = false;
         for (lhs, rhs) in [
@@ -375,20 +415,23 @@ mod tests {
     fn with_cstr_str_or_empty_handles_null_invalid_and_valid() {
         let null = std::ptr::null();
         let invalid = [0xffu8, 0x00];
+        let bare_invalid = Bare::new(&invalid[..]);
         let empty = b"\0";
+        let bare_empty = Bare::new(&empty[..]);
         let valid = b"pith\0";
+        let bare_valid = Bare::new(&valid[..]);
 
         assert_eq!(unsafe { with_cstr_str_or_empty(null, str::to_owned) }, "");
         assert_eq!(
-            unsafe { with_cstr_str_or_empty(invalid.as_ptr() as *const i8, str::to_owned) },
+            unsafe { with_cstr_str_or_empty(bare_invalid.ptr(), str::to_owned) },
             ""
         );
         assert_eq!(
-            unsafe { with_cstr_str_or_empty(empty.as_ptr() as *const i8, str::to_owned) },
+            unsafe { with_cstr_str_or_empty(bare_empty.ptr(), str::to_owned) },
             ""
         );
         assert_eq!(
-            unsafe { with_cstr_str_or_empty(valid.as_ptr() as *const i8, str::to_owned) },
+            unsafe { with_cstr_str_or_empty(bare_valid.ptr(), str::to_owned) },
             "pith"
         );
     }

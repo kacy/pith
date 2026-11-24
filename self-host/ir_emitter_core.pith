@@ -13653,18 +13653,34 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
-    # an exclusive range's head found the value below hi, and only this step
-    # writes it, so the step is exact. an inclusive range's last value can be
-    # the largest Int, so its step stays a plain add.
+    # an inclusive range can end at the largest Int, which has no next value,
+    # so the loop leaves here once the value has reached hi, and otherwise
+    # steps and goes straight back to the body. its head tests the value only
+    # on the way in, so each value still costs one compare. an exclusive
+    # range's head found the value below hi. only this step writes the value,
+    # so in both cases the step is exact.
     v3 := ir_reg()
     ir_emit("load " + v3.to_string() + " " + fv)
+    mut back_l := head_l
+    mut last_l := end_l
+    if inclusive:
+        # the exit gets a label of its own just before end_l. a branch straight
+        # to end_l, which the head branches to as well, is an edge the backend
+        # splits, and the split block lands between the compare and the step,
+        # so every value would take a jump over it.
+        last_l = ir_label()
+        h3 := ir_reg()
+        ir_emit("load " + h3.to_string() + " " + fh)
+        more_r := ir_reg()
+        ir_emit("lt " + more_r.to_string() + " " + v3.to_string() + " " + h3.to_string())
+        next_l := ir_label()
+        ir_emit("brif " + more_r.to_string() + " " + next_l + " " + last_l)
+        ir_emit_label(next_l)
+        back_l = body_l
     one_r := ir_reg()
     ir_emit("iconst " + one_r.to_string() + " 1")
     inc_r := ir_reg()
-    mut step_op := "addnsw"
-    if inclusive:
-        step_op = "add"
-    ir_emit(step_op + " " + inc_r.to_string() + " " + v3.to_string() + " " + one_r.to_string())
+    ir_emit("addnsw " + inc_r.to_string() + " " + v3.to_string() + " " + one_r.to_string())
     ir_emit("store " + fv + " " + inc_r.to_string())
     if has_index:
         p3 := ir_reg()
@@ -13674,7 +13690,9 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
         pinc_r := ir_reg()
         ir_emit("add " + pinc_r.to_string() + " " + p3.to_string() + " " + pone_r.to_string())
         ir_emit("store " + fp + " " + pinc_r.to_string())
-    ir_emit("jmp " + head_l)
+    ir_emit("jmp " + back_l)
+    if inclusive:
+        ir_emit_label(last_l)
     ir_emit_label(end_l)
 
 # `for x in it` where `it` is an iterator (a struct with `next() -> T?`).

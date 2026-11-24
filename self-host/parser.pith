@@ -4,7 +4,7 @@
 # the entry points are parse_with_file() and parse(); parse_main.pith is
 # a small command-line wrapper around them.
 
-from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr, interp_escape_kind, INTERP_ESCAPE_COLLAPSED, INTERP_ESCAPE_KEPT
+from lexer import Token, int_literal_magnitude, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr, interp_escape_kind, INTERP_ESCAPE_COLLAPSED, INTERP_ESCAPE_KEPT
 from ast import add_node, add_node_with_type_args, add_leaf, get_node, node_count, set_node_value, set_node_name_position, node_kind, from_import_alias_receiver
 from errors import Diagnostic
 
@@ -2216,7 +2216,11 @@ fn parse_module_guard_block(decls: List[Int]):
     mut count := 0 - 1
     if match_tok("lbracket"):
         count_tok := expect("int_lit")
-        count = parse_guard_count(count_tok.value)
+        value := int_literal_magnitude(count_tok.value)
+        count = value.0
+        if count_tok.value.len() > 0 and (value.1 or count < 0):
+            parser_report_error_at(count_tok.current_line, count_tok.current_column, "E319", "the guard count " + count_tok.value + " does not fit in an Int", "")
+            count = 1
         if count < 1:
             parser_report_error_at(count_tok.current_line, count_tok.current_column, "E274", "a sharded guard needs a count of at least 1", "write the number of mutexes: `guard " + name_tok.value + "[8]:`")
             count = 1
@@ -2252,17 +2256,6 @@ fn parse_module_guard_block(decls: List[Int]):
             advance_token()
         skip_newlines()
     expect("dedent")
-
-fn parse_guard_count(text: String) -> Int:
-    mut n := 0
-    mut i := 0
-    while i < text.len():
-        c := ord(text[i])
-        if c < 48 or c > 57:
-            return 0 - 1
-        n = n * 10 + c - 48
-        i = i + 1
-    return n
 
 # an E274 at the token about to be read, which is the one at fault
 fn guard_error_here(message: String, fix: String):

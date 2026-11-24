@@ -2,14 +2,20 @@
 
 from ast import Node
 from ir_builder import ir_emit, ir_reg, ir_str
+from lexer import int_literal_value
 
-## materialize an int literal in a fresh register. node.value is passed
-## through to the iconst verbatim, so the ir carries exactly the text the
-## parser recorded. the match compiler calls this too, to build the constant
-## a pattern is compared against.
+## materialize an int literal in a fresh register. the iconst carries the
+## literal's value in decimal whatever its spelling, so a hex literal, a
+## pattern's `-0x8000000000000000` or a UInt pattern past the largest Int
+## reaches the backend as the 64 bits it names. the match compiler calls this
+## too, to build the constant a pattern is compared against.
 pub fn ir_emit_int_literal(node: Node) -> Int:
+    return ir_emit_int_literal_text(node.value)
+
+## the same for a literal's text, which may start with `-`
+pub fn ir_emit_int_literal_text(text: String) -> Int:
     r := ir_reg()
-    ir_emit("iconst " + r.to_string() + " " + node.value)
+    ir_emit("iconst " + r.to_string() + " " + int_literal_value(text).to_string())
     return r
 
 ## materialize a string literal in a fresh register. the text is interned

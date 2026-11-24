@@ -1,0 +1,107 @@
+# a type whose own impl and interface impl both declare a fallible method of
+# the same name compiles both to one symbol, which returns its result in the
+# register pair. a direct call reads the pair, and a call through an
+# interface value goes through an adapter that folds the pair into the box
+# the dispatched call expects. each method here is called both ways, on its
+# ok path and on its error path, with a counted payload on each side: a
+# fresh String ok value, a fresh String message, and a struct error.
+interface Store:
+    fn take(n: Int) -> String!
+    fn pick(n: Int) -> Int!Bad
+    fn size() -> Int!
+
+struct Bad:
+    reason: String
+    code: Int
+
+struct Shelf:
+    prefix: String
+
+impl Shelf:
+    fn take(n: Int) -> String!:
+        if n < 0:
+            fail "no item {n} on {self.prefix}"
+        return self.prefix + "-" + n.to_string()
+
+    fn pick(n: Int) -> Int!Bad:
+        if n > 9:
+            fail Bad{"too far on " + self.prefix, n}
+        return n * 3
+
+impl Store for Shelf:
+    fn take(n: Int) -> String!:
+        if n < 0:
+            fail "no item {n} on {self.prefix}"
+        return self.prefix + "-" + n.to_string()
+
+    fn pick(n: Int) -> Int!Bad:
+        if n > 9:
+            fail Bad{"too far on " + self.prefix, n}
+        return n * 3
+
+    # no twin in the type's own impl: this one keeps the boxed result
+    fn size() -> Int!:
+        if self.prefix.len() == 0:
+            fail "empty shelf"
+        return self.prefix.len()
+
+fn describe(r: String!) -> String:
+    if r.is_ok:
+        return "ok " + r.ok
+    return "err " + r.err
+
+fn describe_pick(r: Int!Bad) -> String:
+    if r.is_ok:
+        return "ok {r.ok}"
+    return "err {r.err.reason} {r.err.code}"
+
+# `!` through an interface value: the adapter's error box propagates
+fn take_both(st: Store, a: Int, b: Int) -> String!:
+    first := st.take(a)!
+    second := st.take(b)!
+    return first + " " + second
+
+# the same through a direct call on the concrete type
+fn take_both_direct(s: Shelf, a: Int, b: Int) -> String!:
+    first := s.take(a)!
+    second := s.take(b)!
+    return first + " " + second
+
+fn bounded[T: Store](x: T, n: Int) -> String!:
+    return x.take(n)
+
+fn main():
+    s := Shelf(prefix: "top")
+    st: Store := s
+
+    print(describe(s.take(1)))
+    print(describe(s.take(0 - 1)))
+    print(describe(st.take(2)))
+    print(describe(st.take(0 - 2)))
+
+    print(describe_pick(s.pick(3)))
+    print(describe_pick(s.pick(12)))
+    print(describe_pick(st.pick(4)))
+    print(describe_pick(st.pick(13)))
+
+    print(st.take(5) catch "caught")
+    print(st.take(0 - 5) catch "caught")
+    print((st.pick(20) catch 0 - 1).to_string())
+    print((st.size() catch 0).to_string())
+    empty: Store := Shelf(prefix: "")
+    print((empty.size() catch 0 - 1).to_string())
+
+    print(take_both(st, 1, 2) catch "both failed")
+    print(take_both(st, 1, 0 - 2) catch "both failed")
+    print(take_both_direct(s, 3, 4) catch "both failed")
+    print(take_both_direct(s, 0 - 3, 4) catch "both failed")
+
+    print(describe(bounded(s, 6)))
+    print(describe(bounded(st, 0 - 6)))
+
+    stores: List[Store] := [Shelf(prefix: "a"), s, Shelf(prefix: "b")]
+    mut total := 0
+    for one in stores:
+        total = total + (one.take(total) catch "x").len()
+        total = total + (one.pick(total) catch 0)
+    print(total.to_string())

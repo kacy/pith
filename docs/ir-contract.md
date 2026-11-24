@@ -429,11 +429,11 @@ count, and whichever was released first freed what the other still read
 **a returned box belongs to the caller alone.** every caller that opens a
 call's box takes over the payload's count, which is correct only when
 nothing else holds the box. so a function that returns the box itself (the
-box abi, which generic functions and interface impls always use) and returns
-a box it does not fully own (a parameter, a field, an element, or a local
-whose count is shared) passes it through `__result_unshare_<ok><err>`. that
-helper returns the same box when the caller's count is the only one, with
-its destructor cleared. otherwise it returns a fresh box holding its own
+box abi, which generic functions and most interface impl methods use) and
+returns a box it does not fully own (a parameter, a field, an element, or a
+local whose count is shared) passes it through `__result_unshare_<ok><err>`.
+that helper returns the same box when the caller's count is the only one,
+with its destructor cleared. otherwise it returns a fresh box holding its own
 count on the live payload, gives the shared box the payload destructor, and
 drops the count on it. the register return clears the destructor the same
 way when a local's box is its own and the payload leaves with its count.

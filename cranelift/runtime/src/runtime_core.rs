@@ -31,7 +31,7 @@ pub unsafe extern "C" fn pith_runtime_error(code: i64) -> i64 {
         // panic-guard: the compiler's runtime-error trap for conditions no caller can recover from.
         std::process::exit(1);
     }
-    crate::failure::fail(message.to_string())
+    crate::failure::fail_static(message)
 }
 
 pub(crate) fn pith_layout(size: usize, align: usize) -> Layout {
@@ -2797,6 +2797,14 @@ pub extern "C" fn pith_test_fork() -> i64 {
     if !piped {
         return pid;
     }
+    if pid < 0 {
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        DETAIL_READ_FD.store(-1, Ordering::Relaxed);
+        return -1;
+    }
     if pid == 0 {
         unsafe {
             libc::close(fds[0]);
@@ -2838,15 +2846,40 @@ pub extern "C" fn pith_test_child_ok() -> i64 {
 /// `name` must point to a valid NUL-terminated string for this call.
 #[no_mangle]
 pub unsafe extern "C" fn pith_test_record(name: *const i8, pid: i64) -> i64 {
-    let mut status: i32 = 0;
-    // SAFETY: `status` is a valid out-pointer for `waitpid`.
-    unsafe { libc::waitpid(pid as i32, &mut status, 0) };
     // SAFETY: Caller guarantees `name` is a valid NUL-terminated string.
     let name_str = unsafe { cstr_to_display(name) };
     let duration = elapsed_ms();
+    let json = test_json_mode();
+    if pid <= 0 {
+        let _ = read_failure_detail();
+        TEST_FAIL.fetch_add(1, Ordering::Relaxed);
+        if json {
+            print_test_record(&name_str, "failed", duration, Some("fork failed"), &None);
+        } else {
+            println!("  {} ... FAILED (fork failed)", name_str);
+        }
+        return 1;
+    }
+    let mut status: i32 = 0;
+    // SAFETY: `status` is a valid out-pointer for `waitpid`.
+    let waited = loop {
+        let rc = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+        if rc < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break rc;
+    };
     // read unconditionally: this is also what closes the read end of the pipe
     let detail = read_failure_detail();
-    let json = test_json_mode();
+    if waited < 0 {
+        TEST_FAIL.fetch_add(1, Ordering::Relaxed);
+        if json {
+            print_test_record(&name_str, "failed", duration, Some("waitpid failed"), &None);
+        } else {
+            println!("  {} ... FAILED (waitpid failed)", name_str);
+        }
+        return 1;
+    }
     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == TEST_SKIP_CODE {
         // the child already reported its own skip, in whichever shape this run
         // is printing

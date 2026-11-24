@@ -71,7 +71,9 @@ fn open_impl(
     let Ok(plain) = key.open_in_place(nonce, aead::Aad::from(aad), &mut in_out) else {
         return 0;
     };
-    pith_bytes_from_vec(plain.to_vec())
+    let plain_len = plain.len();
+    in_out.truncate(plain_len);
+    pith_bytes_from_vec(in_out)
 }
 
 fn verify_impl(

@@ -305,6 +305,22 @@ impl Inner {
         self.waiters.entry((fd, interest)).or_default().push(waiter);
         self.waiting += 1;
     }
+
+    /// remove a specific waiter by `(fd, interest, seq)` if still present
+    /// (for cleaning up after a spurious wake so no stale waiter remains).
+    fn remove_waiter(&mut self, fd: RawFd, interest: Interest, seq: u64) {
+        let mut empty = false;
+        if let Some(list) = self.waiters.get_mut(&(fd, interest)) {
+            if let Some(idx) = list.iter().position(|w| w.seq == seq) {
+                list.swap_remove(idx);
+                self.waiting -= 1;
+            }
+            empty = list.is_empty();
+        }
+        if empty {
+            self.waiters.remove(&(fd, interest));
+        }
+    }
 }
 
 /// one worker's poller: its epoll fd, the eventfd that wakes it, and its
@@ -404,6 +420,16 @@ impl Poller {
 /// of, so it is rewritten with a `MOD`. any other failure leaves the fd out of
 /// `fds`, so the next wait tries again; this one then ends only by its
 /// deadline or a close.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RegisterOutcome {
+    /// A buffered edge already satisfied this wait; caller retries immediately.
+    Ready,
+    /// Waiter registered with sequence number `seq`; caller must park.
+    Parked(u64),
+    /// `epoll_ctl` rejected the fd (e.g. EBADF/EPERM/ENOMEM); caller must NOT park.
+    Failed,
+}
+
 fn register_io(
     poller: &Poller,
     inner: &mut Inner,
@@ -412,13 +438,13 @@ fn register_io(
     deadline: Option<Instant>,
     task: usize,
     outcome: &Arc<AtomicI32>,
-) -> bool {
+) -> RegisterOutcome {
     match inner.fds.get_mut(&fd) {
         Some(reg) => {
             let bit = interest.epoll_bit();
             if reg.ready & bit != 0 {
                 reg.ready &= !bit;
-                return false;
+                return RegisterOutcome::Ready;
             }
         }
         None => {
@@ -426,9 +452,10 @@ fn register_io(
             if err == libc::EEXIST {
                 err = epoll_apply(poller.epfd, libc::EPOLL_CTL_MOD, fd);
             }
-            if err == 0 {
-                inner.fds.insert(fd, FdReg { ready: 0 });
+            if err != 0 {
+                return RegisterOutcome::Failed;
             }
+            inner.fds.insert(fd, FdReg { ready: 0 });
         }
     }
     let seq = inner.take_seq();
@@ -448,7 +475,7 @@ fn register_io(
             target: DeadlineTarget::Io { fd, interest },
         });
     }
-    true
+    RegisterOutcome::Parked(seq)
 }
 
 /// run one `epoll_ctl` op and return its errno, or 0 on success. an `ADD` or
@@ -544,23 +571,32 @@ pub(crate) fn wait_io(
 
     let deadline = if timeout_ms < 0 {
         None
+    } else if timeout_ms == 0 {
+        Some(Instant::now())
     } else {
-        Some(Instant::now() + Duration::from_millis(timeout_ms as u64))
+        crate::fdio::deadline_after_ms(timeout_ms)
     };
 
     // register under the lock. no notify is needed for the deadline: this
     // worker is the one that polls this registry, and it reads the nearest
     // deadline when it next parks.
-    let parks = {
+    let reg = {
         let mut inner = lock_inner(poller);
-        let parks = register_io(poller, &mut inner, fd, interest, deadline, task, &outcome);
+        let reg = register_io(poller, &mut inner, fd, interest, deadline, task, &outcome);
         inner.publish(&poller.busy);
-        parks
+        reg
     };
-    if !parks {
-        // an edge came while nobody waited; the caller's retry will see it.
-        return if live() { 1 } else { -1 };
-    }
+    let seq = match reg {
+        RegisterOutcome::Ready => {
+            // an edge came while nobody waited; the caller's retry will see it.
+            return if live() { 1 } else { -1 };
+        }
+        RegisterOutcome::Failed => {
+            // epoll_ctl refused this fd; parking would wait forever.
+            return -1;
+        }
+        RegisterOutcome::Parked(seq) => seq,
+    };
     if !live() {
         // every waiter on this fd waits on the same dead handle (the number
         // cannot have moved on while this call holds it), so the ordinary close
@@ -575,7 +611,15 @@ pub(crate) fn wait_io(
     // never lost. thus when `park_current` returns, `outcome` has been set.
     green::park_current(task);
 
-    match outcome.load(AtomicOrdering::Acquire) {
+    let res = outcome.load(AtomicOrdering::Acquire);
+    if res == PENDING {
+        // spurious wake before a terminal outcome: remove our waiter so a stale
+        // entry cannot later wake this task out of an unrelated park.
+        let mut inner = lock_inner(poller);
+        inner.remove_waiter(fd, interest, seq);
+        inner.publish(&poller.busy);
+    }
+    match res {
         READY => 1,
         TIMED_OUT => 0,
         // the fd was closed under us while we were parked: report an error so the
@@ -602,11 +646,14 @@ pub(crate) fn sleep_task(ms: i64, task: usize) {
         return;
     }
     let Some(index) = green::current_worker() else {
-        std::thread::sleep(Duration::from_millis(ms as u64));
+        let clamped = ms.min(crate::fdio::MAX_WAIT_MS) as u64;
+        std::thread::sleep(Duration::from_millis(clamped));
         return;
     };
     let outcome = Arc::new(AtomicI32::new(PENDING));
-    let at = Instant::now() + Duration::from_millis(ms as u64);
+    let Some(at) = crate::fdio::deadline_after_ms(ms) else {
+        return;
+    };
     register_timer(poller(index), at, task, &outcome);
 
     // park until the sweep marks us done. unlike `wait_io`, where a spurious
@@ -1125,7 +1172,10 @@ mod tests {
     /// register a wait by task id; returns whether the task would park.
     fn wait(poller: &Poller, inner: &mut Inner, fd: RawFd, interest: Interest, task: usize) -> bool {
         let outcome = Arc::new(AtomicI32::new(PENDING));
-        register_io(poller, inner, fd, interest, None, task, &outcome)
+        matches!(
+            register_io(poller, inner, fd, interest, None, task, &outcome),
+            RegisterOutcome::Parked(_)
+        )
     }
 
     fn send_byte(fd: RawFd) {
@@ -1202,7 +1252,10 @@ mod tests {
         let (a, b) = socket_pair();
         let outcome = Arc::new(AtomicI32::new(PENDING));
         let mut inner = lock_inner(&poller);
-        assert!(register_io(&poller, &mut inner, a, Interest::Read, None, 1, &outcome));
+        assert!(matches!(
+            register_io(&poller, &mut inner, a, Interest::Read, None, 1, &outcome),
+            RegisterOutcome::Parked(_)
+        ));
         // the add reports the socket writable: a write bit with no writer.
         assert!(harvest(&poller, &mut inner).is_empty());
         drop(inner);
@@ -1224,5 +1277,16 @@ mod tests {
         assert_eq!(harvest(&poller, &mut inner), vec![4]);
         drop(inner);
         close_fds(&[c, d]);
+    }
+
+    #[test]
+    fn failed_epoll_add_returns_failed_without_parking_waiter() {
+        let poller = Poller::new();
+        let outcome = Arc::new(AtomicI32::new(PENDING));
+        let mut inner = lock_inner(&poller);
+        let reg = register_io(&poller, &mut inner, -1, Interest::Read, None, 99, &outcome);
+        assert_eq!(reg, RegisterOutcome::Failed);
+        assert_eq!(inner.waiting, 0);
+        assert!(!inner.fds.contains_key(&-1));
     }
 }

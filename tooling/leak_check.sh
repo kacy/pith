@@ -283,6 +283,7 @@ cases=(
   tests/leaks/leak_http_response_paths
   tests/leaks/leak_http_client_pool
   tests/leaks/leak_csv_encode
+  tests/leaks/leak_markdown_render
   tests/leaks/leak_path_clean_count
   tests/leaks/leak_metrics_scrape
   "tests/leaks/leak_owned_receiver_getter SHAPE=1"

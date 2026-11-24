@@ -1,0 +1,51 @@
+# rendering markdown over and over. a round renders one document that uses
+# every block and inline construct std.markdown has, three ways: to html with
+# the safe defaults, to html with raw html allowed, and through the event
+# iterator into a renderer of its own. the parser builds a block tree, an
+# inline tree per paragraph, delimiter and bracket stacks and a queue of
+# events, all as lists of structs and enums, so a node or an event that is not
+# released moves the peak between the two round counts.
+import leakprobe as probe
+import std.markdown as markdown
+
+struct Tally:
+    count: Int
+
+impl markdown.Renderer for Tally:
+    fn event(event: markdown.Event):
+        self.count += 1
+
+    fn finish() -> String:
+        return "{self.count}"
+
+fn document(i: Int) -> String:
+    nl := chr(10)
+    parts := [
+        "# heading {i} *emphasis*", "", "setext **strong**", "===", "",
+        "a paragraph with `code`, a [link](/u \"title\"), a [reference][r], an",
+        "![image *alt*](/i.png), <https://example.com>, <a@b.co>, &amp; &copy; &#65;",
+        "and <b>inline html</b> and [unsafe](javascript&colon;x) and a hard  ", "break.", "",
+        "> quoted *text*", "> - nested", "", "- tight", "- list", "", "1. loose", "", "2. list",
+        "", "```go", "fenced := code", "```", "", "    indented code", "", "<div>", "html block",
+        "</div>", "", "***", "", "[r]: /ref 'reference title'", "",
+    ]
+    return parts.join(nl)
+
+fn round(i: Int) -> Int:
+    source := document(i)
+    safe := markdown.to_html(source)
+    raw := markdown.render(source, markdown.options().allow_html(true))
+    mut events := 0
+    for event in markdown.events(source, markdown.options()):
+        events += 1
+    tally := Tally(count: 0)
+    counted := markdown.render_with(source, markdown.options(), tally)
+    return safe.len() + raw.len() + events + counted.len()
+
+fn main():
+    n := probe.rounds() / 10
+    mut total := 0
+    for i in 0..n:
+        total += round(i)
+    kb := probe.peak_kb()
+    print("{kb}")

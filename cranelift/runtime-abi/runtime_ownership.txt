@@ -173,8 +173,8 @@ pith_struct_set_dtor|b,-|-|-|writes the destructor address into the header
 pith_struct_weak_retain|b|-|runtime_core.rs:4162|adds one weak count; strong count untouched
 pith_struct_weak_release|b|-|runtime_core.rs:4180|drops one weak count (consumes a weak reference); strong count untouched
 pith_struct_weak_upgrade|b|own|runtime_core.rs:4195|returns ptr with one new strong count taken by CAS, or 0 when dead; the caller releases it
-pith_struct_weak_load_field|b,-|own|runtime_core.rs:4424|reads the weak field at the offset and upgrades it under the field lock: one new strong count, or 0 when the target is gone
-pith_struct_weak_store_field|b,-,-|-|runtime_core.rs:4439|swaps in a target the caller took a weak count on, under the field lock, and drops the old target's weak count; strong counts untouched
+pith_struct_weak_load_field|b,-|own|runtime_core.rs:4987|reads the weak field at the offset and upgrades it, under the field lock when the holder is shared: one new strong count, or 0 when the target is gone
+pith_struct_weak_store_field|b,-,-|-|runtime_core.rs:5012|swaps in a target the caller took a weak count on, under the field lock when the holder is shared, and drops the old target's weak count; strong counts untouched
 pith_cc_register_tracer|-,-|-|-|dtor and tracer are function addresses
 pith_cc_register_user_drop|-|-|-|dtor is a function address
 pith_cc_visit|b,-|-|cycle.rs:216|reports a child to the installed collector hook or the per-thread buffer; never retains or releases

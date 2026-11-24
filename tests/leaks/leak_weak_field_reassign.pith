@@ -1,0 +1,39 @@
+# weak field stores and reads on a local holder, which skip the runtime's
+# field lock, and on a shared one, which take it. each store drops the
+# field's weak count on the child before: on entry that is the last call's
+# child, whose strong owner is gone, so the count is all that keeps its
+# header. each read takes a strong count and gives it back. a count either
+# path skipped would keep one header per round.
+import leakprobe as probe
+
+struct Child:
+    n: Int
+
+struct Holder:
+    weak w: Child?
+
+fn churn(h: Holder, i: Int) -> Int:
+    first := Child(n: i)
+    h.w = first
+    keep := Child(n: i + 1)
+    h.w = keep
+    mut got := 0
+    if let c = h.w:
+        got = c.n
+    return got
+
+fn main():
+    n := probe.rounds()
+    local := Holder(w: none)
+    shared := Holder(w: none)
+    # a spawn argument is marked shared, and stays so
+    t := spawn churn(shared, 0)
+    mut sum := await t
+    mut i := 0
+    while i < n:
+        sum = sum + churn(local, i) + churn(shared, i)
+        i = i + 1
+    local.w = none
+    shared.w = none
+    kb := probe.peak_kb()
+    print("{kb}")

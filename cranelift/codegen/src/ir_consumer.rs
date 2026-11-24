@@ -97,6 +97,13 @@ fn exit_unless<const N: usize>(
     builder.switch_to_block(next);
 }
 
+/// The shared mark of the struct `obj` points into: nonzero once another
+/// task can reach it. `obj` must be a live struct, never null.
+fn struct_shared_mark(builder: &mut FunctionBuilder<'_>, obj: Value) -> Value {
+    let word = builder.ins().load(types::I32, MemFlags::new(), obj, STRUCT_FLAGS_FROM_DATA);
+    builder.ins().band_imm(word, STRUCT_SHARED_MASK as i64)
+}
+
 /// The slow side of a fast path: fill `slow` with a call to `fallback` on
 /// `args` that joins `done` with its result, and leave the builder in
 /// `done` on the merged value.
@@ -1392,14 +1399,56 @@ fn inline_runtime_call(
         // struct the emitter is storing into, never null.
         ("pith_share_into", 3) => {
             let fallback = runtime_ref(builder, "pith_share_into")?;
-            let word = builder.ins().load(types::I32, MemFlags::new(), args[0], STRUCT_FLAGS_FROM_DATA);
-            let shared = builder.ins().band_imm(word, STRUCT_SHARED_MASK as i64);
+            let shared = struct_shared_mark(builder, args[0]);
             let call_block = builder.create_block();
             let done = builder.create_block();
             builder.set_cold_block(call_block);
             builder.ins().brif(shared, call_block, &[], done, &[]);
             builder.switch_to_block(call_block);
             builder.ins().call(fallback, &[args[0], args[1], args[2]]);
+            builder.ins().jump(done, &[]);
+            builder.switch_to_block(done);
+            builder.ins().iconst(types::I64, 0)
+        }
+        // a weak field read or store takes the runtime's weak field lock
+        // only when its holder is shared, since only a shared holder is
+        // reachable from another task (see `weak_holder_is_local` in the
+        // runtime). for a local holder, the read loads and upgrades the field
+        // here, and the store swaps it and drops the old target's weak count.
+        ("pith_struct_weak_load_field", 2) => {
+            let locked = runtime_ref(builder, fname)?;
+            let upgrade = runtime_ref(builder, "pith_struct_weak_upgrade")?;
+            let shared = struct_shared_mark(builder, args[0]);
+            let local = builder.create_block();
+            let slow = builder.create_block();
+            let done = builder.create_block();
+            builder.append_block_param(done, types::I64);
+            builder.ins().brif(shared, slow, &[], local, &[]);
+            builder.switch_to_block(local);
+            let slot = builder.ins().iadd(args[0], args[1]);
+            let target = builder.ins().load(types::I64, MemFlags::new(), slot, 0);
+            let call = builder.ins().call(upgrade, &[target]);
+            let upgraded = builder.func.dfg.first_result(call);
+            jump_with_i64_arg(builder, done, upgraded);
+            join_with_fallback_call(builder, slow, done, locked, &[args[0], args[1]])
+        }
+        ("pith_struct_weak_store_field", 3) => {
+            let locked = runtime_ref(builder, fname)?;
+            let release = runtime_ref(builder, "pith_struct_weak_release")?;
+            let shared = struct_shared_mark(builder, args[0]);
+            let local = builder.create_block();
+            let slow = builder.create_block();
+            let done = builder.create_block();
+            builder.set_cold_block(slow);
+            builder.ins().brif(shared, slow, &[], local, &[]);
+            builder.switch_to_block(local);
+            let slot = builder.ins().iadd(args[0], args[1]);
+            let old = builder.ins().load(types::I64, MemFlags::new(), slot, 0);
+            builder.ins().store(MemFlags::new(), args[2], slot, 0);
+            builder.ins().call(release, &[old]);
+            builder.ins().jump(done, &[]);
+            builder.switch_to_block(slow);
+            builder.ins().call(locked, &[args[0], args[1], args[2]]);
             builder.ins().jump(done, &[]);
             builder.switch_to_block(done);
             builder.ins().iconst(types::I64, 0)
@@ -1776,12 +1825,13 @@ fn emit_runtime_error_value(
 /// since the runtime reads the faulting instruction rather than the code.
 const OVERFLOW_TRAP_CODE: u8 = 7;
 
-/// The plain opcode behind a checked one (`addc` -> `add`, `uaddc` -> `add`),
-/// or the opcode itself. A checked op on a string or float operand lowers as
-/// its plain form, which concatenates or promotes the way `add` always has.
+/// The plain opcode behind a checked or exact one (`addc` -> `add`, `uaddc`
+/// -> `add`, `addnsw` -> `add`), or the opcode itself. A checked op on a
+/// string or float operand lowers as its plain form, which concatenates or
+/// promotes the way `add` always has.
 fn plain_arith_op(op: &str) -> &str {
     match op {
-        "addc" | "uaddc" => "add",
+        "addc" | "uaddc" | "addnsw" => "add",
         "subc" | "usubc" => "sub",
         "mulc" | "umulc" => "mul",
         _ => op,
@@ -1849,18 +1899,37 @@ fn checked_operand_range(op: &str, c: i64, const_on_left: bool) -> Option<(i128,
 /// plain add or multiply. The overflow forms make x64 materialize the flag and
 /// test it, and a constant multiply in that form takes the slow one-operand
 /// `imul`; the compare fuses with its branch and leaves the arithmetic alone.
+///
+/// `a_nonneg` and `b_nonneg` say an operand is never negative (see
+/// nonneg.rs). For the signed ops such an operand leaves one way out of the
+/// range, or none, and the check covers only that:
+///
+/// - `x op c`: the range check drops the end below zero, so `i * 3` on a
+///   counter compares against the top alone.
+/// - `a + b` with `b >= 0` can only overflow upward, and then the wrapped sum
+///   comes out below `a`, so the check is `sum < a`; with both operands at
+///   least zero it is `sum < 0`. Either compare fuses with its branch.
+/// - `a - b` with both operands at least zero lies within -MAX..MAX and
+///   needs no check. With `b >= 0` alone it can only overflow downward, and
+///   then the wrapped difference comes out above `a`.
+///
+/// Two unsigned words need no flag either: `a + b` is an add whose carry
+/// traps directly, and `a - b` leaves the range exactly when `a < b`.
 fn emit_checked_int_arith(
     builder: &mut FunctionBuilder<'_>,
     op: &str,
     a: Value,
     b: Value,
+    a_nonneg: bool,
+    b_nonneg: bool,
 ) -> Result<Value, CompileError> {
     let unsigned = op.starts_with('u');
+    let (a_nonneg, b_nonneg) = (a_nonneg && !unsigned, b_nonneg && !unsigned);
     let commutes = !matches!(op, "subc" | "usubc");
     let constant = match (iconst_of(builder.func, a), iconst_of(builder.func, b)) {
-        (_, Some(c)) => Some((b, c, a, false)),
-        (Some(c), None) if commutes => Some((a, c, b, false)),
-        (Some(c), None) => Some((a, c, b, true)),
+        (_, Some(c)) => Some((c, a, a_nonneg, false)),
+        (Some(c), None) if commutes => Some((c, b, b_nonneg, false)),
+        (Some(c), None) => Some((c, b, b_nonneg, true)),
         _ => None,
     };
     let plain = |builder: &mut FunctionBuilder<'_>| match plain_arith_op(op) {
@@ -1868,53 +1937,67 @@ fn emit_checked_int_arith(
         "sub" => builder.ins().isub(a, b),
         _ => builder.ins().imul(a, b),
     };
-    let mut computed = None;
-    let overflowed = if let Some((_, c, x, const_on_left)) = constant {
-        let Some((lo, hi)) = checked_operand_range(op, c, const_on_left) else {
-            return Ok(plain(builder));
-        };
-        let (min, max) = if unsigned { (0i128, u64::MAX as i128) } else { (i64::MIN as i128, i64::MAX as i128) };
-        let (below, above) = if unsigned {
-            (IntCC::UnsignedLessThan, IntCC::UnsignedGreaterThan)
-        } else {
-            (IntCC::SignedLessThan, IntCC::SignedGreaterThan)
-        };
-        if lo == min {
-            builder.ins().icmp_imm(above, x, hi as i64)
-        } else if hi == max {
-            builder.ins().icmp_imm(below, x, lo as i64)
-        } else {
-            // both ends: one unsigned compare of the distance from lo
-            let shifted = builder.ins().iadd_imm(x, (lo as i64).wrapping_neg());
-            builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, shifted, (hi - lo) as i64)
-        }
-    } else {
-        let (value, overflowed) = match op {
-            "addc" => builder.ins().sadd_overflow(a, b),
-            "subc" => builder.ins().ssub_overflow(a, b),
-            "mulc" => builder.ins().smul_overflow(a, b),
-            "uaddc" => builder.ins().uadd_overflow(a, b),
-            "usubc" => builder.ins().usub_overflow(a, b),
-            "umulc" => builder.ins().umul_overflow(a, b),
-            _ => {
-                return Err(CompileError::ModuleError(format!(
-                    "IR consumer: unsupported checked integer op '{op}'"
-                )))
-            }
-        };
-        computed = Some(value);
-        overflowed
-    };
     // a trap, not a call to the runtime error: a call on the cold path makes
     // every value live across the check survive a call, which costs spills
     // in the hot loop around it (twice the instructions in a merge loop).
     // the runtime turns the trap into the integer-overflow error
     // (overflow_trap.rs).
-    builder.ins().trapnz(overflowed, cranelift::codegen::ir::TrapCode::unwrap_user(OVERFLOW_TRAP_CODE));
-    Ok(match computed {
-        Some(value) => value,
-        None => plain(builder),
-    })
+    let code = cranelift::codegen::ir::TrapCode::unwrap_user(OVERFLOW_TRAP_CODE);
+    if let Some((c, x, x_nonneg, const_on_left)) = constant {
+        let Some((lo, hi)) = checked_operand_range(op, c, const_on_left) else {
+            return Ok(plain(builder));
+        };
+        let (min, max) = if unsigned { (0i128, u64::MAX as i128) } else { (i64::MIN as i128, i64::MAX as i128) };
+        let least = if x_nonneg { 0 } else { min };
+        let (below, above) = if unsigned {
+            (IntCC::UnsignedLessThan, IntCC::UnsignedGreaterThan)
+        } else {
+            (IntCC::SignedLessThan, IntCC::SignedGreaterThan)
+        };
+        let overflowed = match (lo > least, hi < max) {
+            (false, false) => return Ok(plain(builder)),
+            (false, true) => builder.ins().icmp_imm(above, x, hi as i64),
+            (true, false) => builder.ins().icmp_imm(below, x, lo as i64),
+            (true, true) => {
+                // both ends: one unsigned compare of the distance from lo
+                let shifted = builder.ins().iadd_imm(x, (lo as i64).wrapping_neg());
+                builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, shifted, (hi - lo) as i64)
+            }
+        };
+        builder.ins().trapnz(overflowed, code);
+        return Ok(plain(builder));
+    }
+    let (value, overflowed) = match op {
+        "addc" if a_nonneg || b_nonneg => {
+            let sum = builder.ins().iadd(a, b);
+            let overflowed = if a_nonneg && b_nonneg {
+                builder.ins().icmp_imm(IntCC::SignedLessThan, sum, 0)
+            } else if b_nonneg {
+                builder.ins().icmp(IntCC::SignedLessThan, sum, a)
+            } else {
+                builder.ins().icmp(IntCC::SignedLessThan, sum, b)
+            };
+            (sum, overflowed)
+        }
+        "subc" if a_nonneg && b_nonneg => return Ok(plain(builder)),
+        "subc" if b_nonneg => {
+            let diff = builder.ins().isub(a, b);
+            (diff, builder.ins().icmp(IntCC::SignedGreaterThan, diff, a))
+        }
+        "uaddc" => return Ok(builder.ins().uadd_overflow_trap(a, b, code)),
+        "usubc" => (builder.ins().isub(a, b), builder.ins().icmp(IntCC::UnsignedLessThan, a, b)),
+        "addc" => builder.ins().sadd_overflow(a, b),
+        "subc" => builder.ins().ssub_overflow(a, b),
+        "mulc" => builder.ins().smul_overflow(a, b),
+        "umulc" => builder.ins().umul_overflow(a, b),
+        _ => {
+            return Err(CompileError::ModuleError(format!(
+                "IR consumer: unsupported checked integer op '{op}'"
+            )))
+        }
+    };
+    builder.ins().trapnz(overflowed, code);
+    Ok(value)
 }
 
 fn emit_checked_int_div_or_mod(
@@ -3361,12 +3444,61 @@ fn compile_ir_function(
     let inline_opt_regs = if fast_paths { scan_unpackable_opt_regs(body_lines) } else { HashSet::new() };
     let mut virtual_opts: HashMap<usize, (Value, Value)> = HashMap::new();
 
+    // the values known never to be negative, which make a checked op's test
+    // cheaper (emit_checked_int_arith). a load of a variable that never holds
+    // a negative value is one (nonneg.rs), and so is a length, a constant of
+    // at least zero, and a checked or exact sum or product of two of them. a
+    // line whose result is one names its register in `pending_nonneg`, with
+    // the value the register held before, and the new value is recorded at
+    // the top of the next line, where no `continue` in the arms below can
+    // skip it. a line that left the register alone records nothing.
+    let nonneg_names = crate::nonneg::nonneg_vars(
+        body_lines,
+        param_names,
+        |name| global_data.contains_key(name),
+        |name| declared_funcs.contains_key(name),
+    );
+    let mut nonneg_values: HashSet<Value> = HashSet::new();
+    let mut pending_nonneg: Option<(usize, Option<Value>)> = None;
+
     // Compile instructions
     let mut terminated = false;
     for (line_idx, line) in body_lines.iter().enumerate() {
+        if let Some((reg, before)) = pending_nonneg.take() {
+            if let Some(&v) = regs.get(&reg) {
+                if Some(v) != before && !kinds.floats.contains(&reg) && !kinds.strings.contains(&reg) {
+                    nonneg_values.insert(v);
+                }
+            }
+        }
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() || parts[0].starts_with(';') {
             continue;
+        }
+        let value_nonneg = |token: &str| {
+            token.parse::<usize>().ok().and_then(|r| regs.get(&r)).is_some_and(|&v| {
+                nonneg_values.contains(&v) || iconst_of(builder.func, v).is_some_and(|c| c >= 0)
+            })
+        };
+        let result_nonneg = match parts[0] {
+            "iconst" => parts.get(2).and_then(|v| v.parse::<i64>().ok()).is_some_and(|v| v >= 0),
+            "load" => parts.get(2).is_some_and(|name| {
+                nonneg_names.contains(*name) && !float_vars.contains(*name) && !string_vars.contains(*name)
+            }),
+            "call" => parts
+                .get(2)
+                .is_some_and(|f| crate::nonneg::LENGTH_CALLS.contains(f) && !declared_funcs.contains_key(*f)),
+            op if crate::nonneg::keeps_nonneg(op) && parts.len() >= 4 => {
+                value_nonneg(parts[2]) && value_nonneg(parts[3])
+            }
+            _ => false,
+        };
+        let operands_nonneg = (
+            parts.get(2).is_some_and(|t| value_nonneg(t)),
+            parts.get(3).is_some_and(|t| value_nonneg(t)),
+        );
+        if result_nonneg {
+            pending_nonneg = parts[1].parse::<usize>().ok().map(|r| (r, regs.get(&r).copied()));
         }
 
         // Record a label as "defined" the moment we reach it in the stream, in
@@ -3507,6 +3639,7 @@ fn compile_ir_function(
             }
 
             "add" | "sub" | "mul" | "div" | "mod" | "addc" | "subc" | "mulc" | "uaddc" | "usubc" | "umulc"
+            | "addnsw"
                 if parts.len() >= 4 =>
             {
                 let reg = parse_reg(parts[1], line, func_name)?;
@@ -3561,8 +3694,10 @@ fn compile_ir_function(
                             checked,
                             a,
                             b,
+                            operands_nonneg.0,
+                            operands_nonneg.1,
                         )?,
-                        "add" => builder.ins().iadd(a, b),
+                        "add" | "addnsw" => builder.ins().iadd(a, b),
                         "sub" => builder.ins().isub(a, b),
                         "mul" => builder.ins().imul(a, b),
                         "div" | "mod" => emit_checked_int_div_or_mod(
@@ -5262,50 +5397,54 @@ mod tests {
         assert!(sanitize_hook_names(Some("tsan")).is_err());
     }
 
+    /// Compile the one function in `ir`, `main`, and display its CLIF, with
+    /// the thread sanitizer's hooks when `sanitize`. Also answers the runtime
+    /// functions it was compiled against, by name.
+    fn compile_main(ir: &str, sanitize: bool) -> (String, HashMap<String, FuncId>) {
+        let mut codegen = crate::create_codegen().expect("create codegen");
+        let runtime_funcs = crate::runtime_imports::declare_runtime_functions(&mut codegen.module)
+            .expect("declare runtime functions");
+        let hooks = if sanitize {
+            let mut sig = codegen.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            let mut declare = |name: &str| {
+                codegen.module.declare_function(name, Linkage::Import, &sig).expect("declare")
+            };
+            Some(SanitizeHooks { read: declare("__tsan_read8"), write: declare("__tsan_write8") })
+        } else {
+            None
+        };
+        let lines: Vec<&str> = ir.lines().skip(1).take_while(|l| *l != "endfunc").collect();
+        let func = compile_ir_function(
+            &mut codegen,
+            "main",
+            "int",
+            &[],
+            &[],
+            &lines,
+            &runtime_funcs,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &[],
+            &HashSet::new(),
+            None,
+            hooks,
+            &HashMap::new(),
+        )
+        .expect("compile");
+        (func.display().to_string(), runtime_funcs)
+    }
+
     // with a sanitizer named, field reads and writes report to its checks
     // and the inline fast paths give way to their runtime calls.
     #[test]
     fn sanitized_build_checks_fields_and_calls_the_runtime() {
         let ir = "func main 0 int\niconst 1 0\ncall 2 pith_struct_alloc int 1 1\n\
                   sstore 2 0 1\nfield 3 2 0\ncall 4 pith_list_len int 1 1\nret 3\nendfunc\n";
-        let compiled = |sanitize: bool| {
-            let mut codegen = crate::create_codegen().expect("create codegen");
-            let runtime_funcs = crate::runtime_imports::declare_runtime_functions(&mut codegen.module)
-                .expect("declare runtime functions");
-            let hooks = if sanitize {
-                let mut sig = codegen.module.make_signature();
-                sig.params.push(AbiParam::new(types::I64));
-                let mut declare = |name: &str| {
-                    codegen.module.declare_function(name, Linkage::Import, &sig).expect("declare")
-                };
-                Some(SanitizeHooks { read: declare("__tsan_read8"), write: declare("__tsan_write8") })
-            } else {
-                None
-            };
-            let lines: Vec<&str> = ir.lines().skip(1).take_while(|l| *l != "endfunc").collect();
-            let func = compile_ir_function(
-                &mut codegen,
-                "main",
-                "int",
-                &[],
-                &[],
-                &lines,
-                &runtime_funcs,
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashSet::new(),
-                &HashMap::new(),
-                &[],
-                &HashSet::new(),
-                None,
-                hooks,
-                &HashMap::new(),
-            )
-            .expect("compile");
-            func.display().to_string()
-        };
-        let plain = compiled(false);
-        let sanitized = compiled(true);
+        let plain = compile_main(ir, false).0;
+        let sanitized = compile_main(ir, true).0;
         let calls = |text: &str| text.matches(" call ").count();
         // after main's pith_runtime_start: the alloc and the fast path's
         // cold fallback, against the alloc, the two checks and a plain
@@ -5313,6 +5452,82 @@ mod tests {
         assert_eq!(calls(&plain), 3, "{plain}");
         assert_eq!(calls(&sanitized), 5, "{sanitized}");
         assert!(!sanitized.contains("can_move"), "{sanitized}");
+    }
+
+    /// Each branch `clif` takes on a struct's shared mark, in order: the body
+    /// of the block it goes to when the mark is set, and of the one it goes
+    /// to when it is clear.
+    fn shared_mark_branches(clif: &str) -> Vec<(String, String)> {
+        let mut blocks: HashMap<String, String> = HashMap::new();
+        let mut current = String::new();
+        let mut marks = HashSet::new();
+        let mut branches = Vec::new();
+        let mask = format!(", {STRUCT_SHARED_MASK}");
+        for line in clif.lines().map(str::trim) {
+            if line.starts_with("block") && line.ends_with(':') {
+                current = line.split(['(', ' ', ':']).next().unwrap_or_default().to_string();
+                continue;
+            }
+            blocks.entry(current.clone()).or_default().push_str(&format!("{line}\n"));
+            if let Some((value, op)) = line.split_once(" = ") {
+                if op.starts_with("band_imm") && op.ends_with(&mask) {
+                    marks.insert(value.to_string());
+                }
+            }
+            let parts: Vec<&str> = line.split([' ', ',']).filter(|p| !p.is_empty()).collect();
+            if let ["brif", cond, set, clear] = parts[..] {
+                if marks.contains(cond) {
+                    branches.push((set.to_string(), clear.to_string()));
+                }
+            }
+        }
+        branches
+            .into_iter()
+            .map(|(set, clear)| (blocks[&set].clone(), blocks[&clear].clone()))
+            .collect()
+    }
+
+    /// The `call` of the runtime function `name` as `clif` writes it, up to
+    /// its arguments: `call fn2(`.
+    fn clif_call(clif: &str, funcs: &HashMap<String, FuncId>, name: &str) -> String {
+        let declared = format!(" = u0:{} ", funcs[name].as_u32());
+        let fn_ref = clif
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.contains(&declared).then(|| line.split(' ').next().unwrap_or_default()))
+            .unwrap_or_else(|| panic!("{name} is never declared in\n{clif}"));
+        format!("call {fn_ref}(")
+    }
+
+    // a weak field read or store takes the runtime's locked call when its
+    // holder is marked shared, and only then: the lock is what keeps a store
+    // in another task from freeing the old target's header between a read's
+    // load and its upgrade. a local holder's field is read and upgraded, or
+    // swapped and its old target's weak count dropped, without the call.
+    #[test]
+    fn weak_field_calls_take_the_lock_on_a_shared_holder() {
+        let ir = "func main 0 int\niconst 1 2\ncall 2 pith_struct_alloc int 1 1\n\
+                  iconst 3 8\ncall 4 pith_struct_weak_store_field void 3 2 3 2\n\
+                  call 5 pith_struct_weak_load_field int 2 2 3\nret 5\nendfunc\n";
+        let (clif, funcs) = compile_main(ir, false);
+        let call = |name: &str| clif_call(&clif, &funcs, name);
+        let branches = shared_mark_branches(&clif);
+        assert_eq!(branches.len(), 2, "{clif}");
+        let (shared_store, local_store) = &branches[0];
+        assert!(shared_store.contains(&call("pith_struct_weak_store_field")), "{clif}");
+        assert!(!local_store.contains(&call("pith_struct_weak_store_field")), "{clif}");
+        assert!(local_store.contains(&call("pith_struct_weak_release")), "{clif}");
+        let (shared_load, local_load) = &branches[1];
+        assert!(shared_load.contains(&call("pith_struct_weak_load_field")), "{clif}");
+        assert!(!local_load.contains(&call("pith_struct_weak_load_field")), "{clif}");
+        assert!(local_load.contains(&call("pith_struct_weak_upgrade")), "{clif}");
+
+        // a build without the fast paths makes the runtime calls, which
+        // test the mark themselves
+        let (sanitized, funcs) = compile_main(ir, true);
+        assert!(shared_mark_branches(&sanitized).is_empty(), "{sanitized}");
+        assert!(sanitized.contains(&clif_call(&sanitized, &funcs, "pith_struct_weak_store_field")), "{sanitized}");
+        assert!(sanitized.contains(&clif_call(&sanitized, &funcs, "pith_struct_weak_load_field")), "{sanitized}");
     }
 
     #[test]

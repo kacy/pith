@@ -40,7 +40,7 @@ fn run_cli() {
     // the compiler and ir driver this spawns find std through PITH_HOME when
     // the source file is outside a checkout
     if env::var_os("PITH_HOME").is_none() {
-        if let Some(home) = install_home() {
+        if let Some(home) = install_home().or_else(checkout_root) {
             env::set_var("PITH_HOME", home);
         }
     }
@@ -235,7 +235,8 @@ fn print_usage() {
     println!();
     println!("Environment:");
     println!("  PITH_HOME         Installed toolchain root (default: the directory above bin/pith)");
-    println!("  PITH_SELF_HOST    Path to self-hosted compiler (default: ./self-host/pith_main)");
+    println!("  PITH_SELF_HOST    Path to self-hosted compiler (default: self-host/pith_main in this checkout)");
+    println!("  PITH_IR_DRIVER    Path to the IR driver (default: self-host/ir_driver in this checkout)");
     println!("  PITH_DUMP_IR      Path to dump combined IR text (for debugging)");
 }
 
@@ -273,6 +274,27 @@ fn install_home() -> Option<PathBuf> {
         .then(|| home.to_path_buf())
 }
 
+/// The checkout a cargo build of this binary sits in: `<root>/target/release/pith`
+/// with `<root>/self-host` beside `target`. None for an install.
+fn checkout_root() -> Option<PathBuf> {
+    let exe = fs::canonicalize(env::current_exe().ok()?).ok()?;
+    let root = exe.parent()?.parent()?.parent()?;
+    root.join("self-host").is_dir().then(|| root.to_path_buf())
+}
+
+/// The self-host directories that may hold the ir driver, the self-hosted
+/// compiler and the seed: the working directory's checkout first, so the
+/// in-repo workflow and a directory with its own seed behave as before, then
+/// the checkout this binary was built in, so a source build works from any
+/// directory.
+fn self_host_dirs() -> Vec<String> {
+    let mut dirs = vec!["./self-host".to_string(), "../self-host".to_string()];
+    if let Some(root) = checkout_root() {
+        dirs.push(root.join("self-host").to_string_lossy().into_owned());
+    }
+    dirs
+}
+
 /// A file under the install's `lib/`, if there is an install and it has one.
 fn installed_lib(name: &str) -> Option<String> {
     let path = install_home()?.join("lib").join(name);
@@ -280,36 +302,31 @@ fn installed_lib(name: &str) -> Option<String> {
 }
 
 /// Find the self-hosted compiler executable
-fn find_self_hosted_compiler() -> Option<String> {
+fn find_self_hosted_compiler() -> Result<String, String> {
     if let Ok(path) = env::var("PITH_SELF_HOST") {
         if Path::new(&path).exists() {
-            return Some(path);
+            return Ok(path);
         }
+        return Err(format!("PITH_SELF_HOST is set to {}, which does not exist", path));
     }
     if let Some(path) = installed_lib("pith_main") {
-        return Some(path);
+        return Ok(path);
     }
 
-    let candidates = [
-        "./self-host/pith_main",
-        "../self-host/pith_main",
-        "./pith_main",
-    ];
-
-    for candidate in &candidates {
-        if Path::new(candidate).exists() {
-            return Some(candidate.to_string());
-        }
+    let mut candidates: Vec<String> = self_host_dirs().iter().map(|dir| format!("{}/pith_main", dir)).collect();
+    candidates.push("./pith_main".to_string());
+    if let Some(found) = candidates.iter().find(|c| Path::new(c).exists()) {
+        return Ok(found.clone());
     }
-
-    None
+    Err(format!(
+        "self-hosted compiler not found; tried {}. Build it with `make self-host`, or set PITH_SELF_HOST to its path",
+        candidates.join(", ")
+    ))
 }
 
 /// Get AST from self-hosted compiler by running 'pith parse'
 fn get_ast_from_compiler(path: &str) -> Result<String, String> {
-    let compiler = find_self_hosted_compiler().ok_or(
-        "Self-hosted compiler not found. Set PITH_SELF_HOST or ensure ./self-host/pith_main exists",
-    )?;
+    let compiler = find_self_hosted_compiler()?;
 
     let output = Command::new(&compiler)
         .args(["parse", path])
@@ -329,7 +346,7 @@ fn get_ast_from_compiler(path: &str) -> Result<String, String> {
 
 /// Get tokens from self-hosted compiler by running 'pith lex'
 fn get_tokens_from_compiler(path: &str) -> Result<String, String> {
-    let compiler = find_self_hosted_compiler().ok_or("Self-hosted compiler not found")?;
+    let compiler = find_self_hosted_compiler()?;
 
     let output = Command::new(&compiler)
         .args(["lex", path])
@@ -426,14 +443,22 @@ fn find_ir_driver(source: &str) -> Result<Option<String>, String> {
         if Path::new(&path).exists() {
             return Ok(Some(path));
         }
+        return Err(format!("PITH_IR_DRIVER is set to {}, which does not exist", path));
     }
     if let Some(path) = installed_lib("ir_driver") {
         return Ok(Some(path));
     }
 
-    for dir in &["./self-host", "../self-host"] {
+    for dir in &self_host_dirs() {
+        let dir = dir.as_str();
         let candidate = format!("{}/ir_driver", dir);
         if !Path::new(&candidate).exists() {
+            // the working directory's checkout builds its driver from its
+            // own seed rather than borrowing the one this binary was built
+            // beside
+            if Path::new(&format!("{}/bootstrap/ir_driver.ir", dir)).exists() {
+                return Ok(None);
+            }
             continue;
         }
         let Some(reason) = ir_driver_staleness(dir, &candidate) else {
@@ -480,7 +505,9 @@ fn ir_driver_older_than_seed(dir: &str, driver: &str) -> bool {
 fn bootstrap_ir_driver_from_seed() -> Result<String, String> {
     use pith_codegen::linker::build_executable;
 
-    for dir in &["./self-host", "../self-host"] {
+    let dirs = self_host_dirs();
+    for dir in &dirs {
+        let dir = dir.as_str();
         let seed = format!("{}/bootstrap/ir_driver.ir", dir);
         if !Path::new(&seed).exists() {
             continue;
@@ -505,7 +532,10 @@ fn bootstrap_ir_driver_from_seed() -> Result<String, String> {
         stamp_if_ir_driver(&exe_path);
         return Ok(exe_path);
     }
-    Err("No IR driver found. Ensure ./self-host/ir_driver exists.".to_string())
+    Err(format!(
+        "No IR driver found: none of {} holds ir_driver or bootstrap/ir_driver.ir. Build one with `make self-host-ir-driver`, or set PITH_IR_DRIVER to its path",
+        dirs.join(", ")
+    ))
 }
 
 fn describe_exit(status: &std::process::ExitStatus) -> String {
@@ -852,9 +882,9 @@ fn lex_file(path: &str) {
 
 fn delegate_to_frontend(args: &[String]) {
     let compiler = match find_self_hosted_compiler() {
-        Some(c) => c,
-        None => {
-            eprintln!("Self-hosted compiler not found");
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
@@ -863,11 +893,7 @@ fn delegate_to_frontend(args: &[String]) {
     command.args(args);
     if let Ok(current_exe) = env::current_exe() {
         if env::var("PITH_IR_DRIVER").is_err() {
-            if let Some(root) = current_exe
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|p| p.parent())
-            {
+            if let Some(root) = checkout_root() {
                 let ir_driver = root.join("self-host").join("ir_driver");
                 if ir_driver.exists() {
                     command.env("PITH_IR_DRIVER", ir_driver);

@@ -1,8 +1,10 @@
 //! integer overflow reported from a trap.
 //!
-//! the code generator checks Int and UInt `+`, `-` and `*` with a trap
-//! instruction on the overflow path (`ud2` on x86-64, `udf` on aarch64)
-//! rather than a call into the runtime: a call there, even one never taken,
+//! the code generator checks Int and UInt `+`, `-` and `*`, the conversions
+//! to the narrow and unsigned types (which also check narrow arithmetic) and
+//! shift counts with a trap instruction on the overflow path (`ud2` on
+//! x86-64, `udf` on aarch64) rather than a call into the runtime: a call
+//! there, even one never taken,
 //! makes the values live across the check survive it, which costs spills in
 //! the loops the checks sit in. the trap raises SIGILL, and the handler here
 //! turns it into the same `pith runtime error: integer overflow` a call

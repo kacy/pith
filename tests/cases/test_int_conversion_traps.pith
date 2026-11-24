@@ -1,0 +1,65 @@
+# integer conversions, abs, Float.to_int and the shifts stop the program when
+# the result does not fit, like Int arithmetic does. each one below runs
+# under isolate_call, the way an http or grpc handler does, so the error
+# fails that call only and the program goes on to the next.
+fn big() -> Int:
+    return 9223372036854775807
+
+fn small() -> Int:
+    return 0 - big() - 1
+
+fn n(x: Int) -> Int:
+    return x
+
+fn f(x: Float) -> Float:
+    return x
+
+fn show_trap(label: String, failure: String):
+    print("{label}: {failure}")
+
+fn main():
+    show_trap("abs MIN", isolate_call(fn() -> Int => abs(small())))
+    show_trap("Int8 128", isolate_call(fn() -> Int => Int8(n(128)).to_string().len()))
+    show_trap("Int8 -129", isolate_call(fn() -> Int => Int8(n(-129)).to_string().len()))
+    show_trap("Int16 32768", isolate_call(fn() -> Int => Int16(n(32768)).to_string().len()))
+    show_trap("Int32 max+1", isolate_call(fn() -> Int => Int32(n(2147483648)).to_string().len()))
+    show_trap("Int32 Int max", isolate_call(fn() -> Int => Int32(big()).to_string().len()))
+    show_trap("UInt8 256", isolate_call(fn() -> Int => UInt8(n(256)).to_string().len()))
+    show_trap("UInt8 -1", isolate_call(fn() -> Int => UInt8(n(-1)).to_string().len()))
+    show_trap("UInt16 65536", isolate_call(fn() -> Int => UInt16(n(65536)).to_string().len()))
+    show_trap("UInt32 -1", isolate_call(fn() -> Int => UInt32(n(-1)).to_string().len()))
+    show_trap("UInt MIN", isolate_call(fn() -> Int => UInt(small()).to_string().len()))
+    show_trap("UInt64 -1", isolate_call(fn() -> Int => UInt64(n(-1)).to_string().len()))
+    show_trap("to_int NaN", isolate_call(fn() -> Int => (f(0.0) / f(0.0)).to_int()))
+    show_trap("to_int inf", isolate_call(fn() -> Int => (f(1.0) / f(0.0)).to_int()))
+    show_trap("to_int -inf", isolate_call(fn() -> Int => (f(-1.0) / f(0.0)).to_int()))
+    show_trap("to_int 2^63", isolate_call(fn() -> Int => f(9223372036854775808.0).to_int()))
+    show_trap("to_int 1e300", isolate_call(fn() -> Int => f(1.0e300).to_int()))
+    show_trap("shl 64", isolate_call(fn() -> Int => bit_shl(1, n(64))))
+    show_trap("shl -1", isolate_call(fn() -> Int => bit_shl(1, n(-1))))
+    show_trap("shr 64", isolate_call(fn() -> Int => bit_shr(1, n(64))))
+    show_trap("shr -1", isolate_call(fn() -> Int => bit_shr(1, n(-1))))
+    show_trap("Int8 127 + 1", isolate_call(fn() -> Int => (Int8(n(127)) + Int8(n(1))).to_string().len()))
+    show_trap("UInt8 3 - 5", isolate_call(fn() -> Int => (UInt8(n(3)) - UInt8(n(5))).to_string().len()))
+    show_trap("Int32 max * 2", isolate_call(fn() -> Int => (Int32(n(2147483647)) * Int32(n(2))).to_string().len()))
+    show_trap("Int8 -128 / -1", isolate_call(fn() -> Int => (Int8(n(-128)) / Int8(n(-1))).to_string().len()))
+    show_trap("negate Int8 -128", isolate_call(fn() -> Int => (-Int8(n(-128))).to_string().len()))
+
+    # values that fit are unchanged
+    print("abs {abs(small() + 1)} {abs(n(-5))} {abs(n(7))}")
+    print("Int8 {Int8(n(-128))} {Int8(n(127))}, Int16 {Int16(n(-32768))} {Int16(n(32767))}")
+    print("Int32 {Int32(n(-2147483648))} {Int32(n(2147483647))}, Int64 {Int64(small())} {Int64(big())}")
+    print("UInt8 {UInt8(n(0))} {UInt8(n(255))}, UInt16 {UInt16(n(65535))}, UInt32 {UInt32(n(4294967295))}")
+    print("UInt {UInt(n(0))} {UInt(big())}, UInt64 {UInt64(big())}")
+    print("to_int {f(2.9).to_int()} {f(-2.9).to_int()} {f(-9223372036854775808.0).to_int()} {f(9223372036854774784.0).to_int()}")
+    print("shl {bit_shl(1, n(63))} {bit_shl(n(-1), n(0))} {bit_shl(big(), n(1))}, shr {bit_shr(n(-1), n(63))} {bit_shr(n(-1), n(0))}")
+    print("Int8 {Int8(n(100)) + Int8(n(27))} {Int8(n(-100)) - Int8(n(28))}, UInt8 {UInt8(n(200)) + UInt8(n(55))}")
+
+    # the explicit forms keep the low bits
+    print("wrapping_int8 {n(255).wrapping_int8()} {n(128).wrapping_int8()}")
+    print("wrapping_int16 {n(65535).wrapping_int16()}, wrapping_int32 {n(4294967295).wrapping_int32()}")
+    print("wrapping_uint8 {n(-1).wrapping_uint8()} {n(257).wrapping_uint8()}")
+    print("wrapping_uint16 {n(-1).wrapping_uint16()}, wrapping_uint32 {n(-1).wrapping_uint32()}")
+    print("wrapping_uint {small().wrapping_uint()}, wrapping_uint64 {n(-1).wrapping_uint64()}")
+    print("narrow wrapping_add {Int8(n(127)).wrapping_add(Int8(n(1)))} {UInt8(n(3)).wrapping_sub(UInt8(n(5)))}")
+    print("mask {UInt8(bit_and(n(511), 255))}")

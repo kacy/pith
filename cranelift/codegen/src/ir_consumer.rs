@@ -419,7 +419,8 @@ fn list_index_in_bounds(
 
 // the native instruction behind a bit builtin, or None for anything else.
 // these mirror the runtime externs exactly: pith_bit_shr is a logical shift
-// (ushr) and shift amounts mask mod 64 on both paths.
+// (ushr), a shift count outside 0..63 stops the program on both paths, and
+// a rotate takes its amount mod the width.
 fn bits_builtin_op(builtin: &str) -> Option<&'static str> {
     match builtin {
         "bit_and" => Some("band"),
@@ -537,7 +538,10 @@ fn emit_bits_op(builder: &mut FunctionBuilder<'_>, op: &str, a: Value, b: Value)
         "band" => builder.ins().band(a, b),
         "bor" => builder.ins().bor(a, b),
         "bxor" => builder.ins().bxor(a, b),
-        "shl" => builder.ins().ishl(a, b),
+        "shl" => {
+            emit_int_fit(builder, b, 0, 63);
+            builder.ins().ishl(a, b)
+        }
         // a 32-bit rotate turns the low half of the value and zero-extends
         // the result, as pith_bit_rotr32 does
         "rotl32" | "rotr32" => {
@@ -551,8 +555,31 @@ fn emit_bits_op(builder: &mut FunctionBuilder<'_>, op: &str, a: Value, b: Value)
         }
         "rotl64" => builder.ins().rotl(a, b),
         "rotr64" => builder.ins().rotr(a, b),
-        _ => builder.ins().ushr(a, b),
+        _ => {
+            emit_int_fit(builder, b, 0, 63);
+            builder.ins().ushr(a, b)
+        }
     }
+}
+
+/// `x` when `lo <= x <= hi`, and the integer-overflow trap otherwise: one
+/// unsigned compare of the distance from `lo`, or no check at all for a
+/// constant in range. the conversions to the narrow and unsigned types and
+/// the shift counts go through it.
+fn emit_int_fit(builder: &mut FunctionBuilder<'_>, x: Value, lo: i64, hi: i64) -> Value {
+    if let Some(c) = iconst_of(builder.func, x) {
+        if (lo..=hi).contains(&c) {
+            return x;
+        }
+    }
+    let out = if lo == 0 {
+        builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, x, hi)
+    } else {
+        let shifted = builder.ins().iadd_imm(x, lo.wrapping_neg());
+        builder.ins().icmp_imm(IntCC::UnsignedGreaterThan, shifted, hi.wrapping_sub(lo))
+    };
+    builder.ins().trapnz(out, cranelift::codegen::ir::TrapCode::unwrap_user(OVERFLOW_TRAP_CODE));
+    x
 }
 
 // the runtime getters that also come as a register pair returning
@@ -1458,30 +1485,41 @@ fn inline_runtime_call(
             let fallback = runtime_ref(builder, fname)?;
             inline_list_len(builder, args[0], fallback)
         }
-        // the narrow integer conversions are a truncate and a sign or zero
-        // extend, cheap enough to emit after every arithmetic op on a narrow
-        // type, which is where the emitter puts them
-        ("Int8" | "pith_int8", 1) => {
+        // the conversions from Int: one compare and a trap when the value
+        // does not fit the target type, the value itself otherwise. the
+        // emitter also puts the narrow ones after every arithmetic op on a
+        // narrow type, which is how `Int8(127) + 1` stops.
+        ("Int8", 1) => emit_int_fit(builder, args[0], i8::MIN as i64, i8::MAX as i64),
+        ("Int16", 1) => emit_int_fit(builder, args[0], i16::MIN as i64, i16::MAX as i64),
+        ("Int32", 1) => emit_int_fit(builder, args[0], i32::MIN as i64, i32::MAX as i64),
+        ("UInt8", 1) => emit_int_fit(builder, args[0], 0, u8::MAX as i64),
+        ("UInt16", 1) => emit_int_fit(builder, args[0], 0, u16::MAX as i64),
+        ("UInt32", 1) => emit_int_fit(builder, args[0], 0, u32::MAX as i64),
+        ("UInt" | "UInt64", 1) => emit_int_fit(builder, args[0], 0, i64::MAX),
+        ("Int64" | "pith_wrapping_uint64", 1) => args[0],
+        // the wrapping conversions keep the low bits: a truncate and a sign
+        // or zero extend.
+        ("pith_wrapping_int8", 1) => {
             let low = builder.ins().ireduce(types::I8, args[0]);
             builder.ins().sextend(types::I64, low)
         }
-        ("Int16" | "pith_int16", 1) => {
+        ("pith_wrapping_int16", 1) => {
             let low = builder.ins().ireduce(types::I16, args[0]);
             builder.ins().sextend(types::I64, low)
         }
-        ("Int32" | "pith_int32", 1) => {
+        ("pith_wrapping_int32", 1) => {
             let low = builder.ins().ireduce(types::I32, args[0]);
             builder.ins().sextend(types::I64, low)
         }
-        ("UInt8" | "pith_uint8", 1) => {
+        ("pith_wrapping_uint8", 1) => {
             let low = builder.ins().ireduce(types::I8, args[0]);
             builder.ins().uextend(types::I64, low)
         }
-        ("UInt16" | "pith_uint16", 1) => {
+        ("pith_wrapping_uint16", 1) => {
             let low = builder.ins().ireduce(types::I16, args[0]);
             builder.ins().uextend(types::I64, low)
         }
-        ("UInt32" | "pith_uint32", 1) => {
+        ("pith_wrapping_uint32", 1) => {
             let low = builder.ins().ireduce(types::I32, args[0]);
             builder.ins().uextend(types::I64, low)
         }
@@ -3394,8 +3432,7 @@ fn compile_ir_function(
                     "band" => builder.ins().band(a, b),
                     "bor" => builder.ins().bor(a, b),
                     "bxor" => builder.ins().bxor(a, b),
-                    "shl" => builder.ins().ishl(a, b),
-                    "shr" => builder.ins().ushr(a, b),
+                    "shl" | "shr" => emit_bits_op(&mut builder, parts[0], a, b),
                     _ => {
                         return Err(CompileError::ModuleError(format!(
                             "IR consumer: unsupported bitwise instruction in {}: {}",

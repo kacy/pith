@@ -70,6 +70,18 @@ pub fn blob(b: Bytes) -> Value:
 pub fn null_value() -> Value:
     return Value.Null
 
+# a Real column read as an Int: truncated toward zero, with NaN read as 0 and
+# a value past either end of Int's range read as that end. a database can hold
+# all three, and `to_int` stops the program on them.
+fn real_to_int(f: Float) -> Int:
+    if f >= 9223372036854775808.0:
+        return 9223372036854775807
+    if f < -9223372036854775808.0:
+        return -9223372036854775807 - 1
+    if f != f:
+        return 0
+    return f.to_int()
+
 # a materialized result row: the column values in order, alongside their names.
 pub struct Row:
     pub values: List[Value]
@@ -110,7 +122,7 @@ impl Row:
             return 0
         return match self.values[col]:
             Value.Integer(n) => n
-            Value.Real(f) => f.to_int()
+            Value.Real(f) => real_to_int(f)
             Value.Numeric(d) => decimal.to_int(d).unwrap_or(0)
             _ => 0
 

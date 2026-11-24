@@ -96,7 +96,9 @@ lowers to `pith_concat_cstr`.
 **bitwise and logical**
 
 ```
-band|bor|bxor|shl|shr REG A B    bitwise ops.
+band|bor|bxor|shl|shr REG A B    bitwise ops. a shl or shr count outside 0
+                                 to 63 stops the program with the
+                                 integer-overflow runtime error.
 bnot REG A                       bitwise complement.
 and|or REG A B                   lowered as bitwise band/bor (operands are 0/1).
 ```

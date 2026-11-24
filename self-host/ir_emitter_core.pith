@@ -39,7 +39,7 @@
 
 # the front half of the compiler: ast, checker verdicts, type table
 from ast import get_node, node_kind, node_value, node_child, node_child_count, node_count, Node
-from checker import c_interface_coercion, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_argument_widens_to_result, c_result_widening_target, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
+from checker import c_interface_coercion, wrapping_conversion_target, c_is_interface_value_type, generic_base_identity, module_declares_generic, get_definition_of, c_get_expr_type, c_argument_widens_to_optional, c_argument_widens_to_result, c_result_widening_target, c_generic_call_subst, c_check_specialization, c_check_method_specialization, c_check_method_body_for, struct_instance_base_name, struct_instance_type_args, struct_instance_tids, decode_tid_list, has_generic_declaration, get_generic_declaration_index, collect_generic_parameter_names
 from types import TypeInfo, get_type_info, get_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, TID_ERR, TID_NONE
 # satellite registries: names, methods, generics, structs, aliases
 from ir_metadata import ir_is_bool_returning_method, ir_is_string_returning_method, ir_is_void_method, ir_method_emit_name, ir_builtin_result_retkind, ir_builtin_result_ok_kind, ir_is_pair_builtin_name, ir_sentinel_result_builtin_names, ir_obj_type_is_primitive, ir_primitive_method_call_name
@@ -5617,11 +5617,10 @@ fn ir_append_deferred_lambda_body():
         bodies.push(line)
     ir_lambda_bodies = bodies
 
-# the conversion that brings a value back into a narrow integer type's range,
+# the conversion that checks a value against a narrow integer type's range,
 # or "" for a type whose arithmetic needs none. the ir computes in 64 bits, so
-# without it `Int8(127) + Int8(1)` held 128 and `UInt8(3) - UInt8(5)` held -2,
-# values their type cannot hold, which then failed to compare equal to the
-# wrapped value they stand for. the 64-bit types wrap on their own.
+# `Int8(127) + Int8(1)` holds 128 until the conversion stops the program. the
+# 64-bit types check their own arithmetic.
 fn ir_sized_int_narrow_fn(tid: Int) -> String:
     if tid < 0:
         return ""
@@ -5630,7 +5629,7 @@ fn ir_sized_int_narrow_fn(tid: Int) -> String:
         return name
     return ""
 
-# wrap `r`, the result of arithmetic typed `tid`, into that type's range.
+# check `r`, the result of arithmetic typed `tid`, against that type's range.
 fn ir_narrow_to_tid(tid: Int, r: Int) -> Int:
     narrow := ir_sized_int_narrow_fn(tid)
     if narrow.len() == 0:
@@ -5639,9 +5638,19 @@ fn ir_narrow_to_tid(tid: Int, r: Int) -> Int:
     ir_emit_call1(out, narrow, "int", r)
     return out
 
+# wrap `r` into the range of `tid` by keeping its low bits, for the wrapping
+# methods. the 64-bit types need nothing, since the ir already wraps there.
+fn ir_wrap_to_tid(tid: Int, r: Int) -> Int:
+    narrow := ir_sized_int_narrow_fn(tid)
+    if narrow.len() == 0:
+        return r
+    out := ir_reg()
+    ir_emit_call1(out, "pith_wrapping_" + narrow.to_lower(), "int", r)
+    return out
+
 # whether the fused map update, which adds in the runtime with Int's
 # overflow check, must leave `m[k] + d` on a value of this type to the
-# general path: a narrow type wraps into its range there, and an unsigned
+# general path: a narrow type checks its own range there, and an unsigned
 # word checks the unsigned range.
 fn ir_fused_add_declines(tid: Int) -> Bool:
     return ir_sized_int_narrow_fn(tid).len() > 0 or ir_is_unsigned_word(tid)
@@ -6304,8 +6313,9 @@ fn ir_is_unsigned_word(tid: Int) -> Bool:
     name := get_type_name(tid)
     return name == "UInt" or name == "UInt64"
 
-# whether arithmetic on a value of type `tid` stops on overflow: Int, and the
-# unsigned words. the narrow types wrap into their range instead (see
+# whether the arithmetic op on a value of type `tid` checks for overflow
+# itself: Int, and the unsigned words. the narrow types compute in 64 bits
+# and check the result against their range afterwards (see
 # ir_sized_int_narrow_fn), and Float has no overflow to check.
 fn ir_int_checks_overflow(tid: Int) -> Bool:
     if tid < 0:
@@ -9257,13 +9267,17 @@ fn ir_emit_typed_receiver_method(idx: Int) -> Int:
         if recv_tid >= 0:
             recv_info := get_type_info(recv_tid)
             if recv_info.kind == "primitive" and (mname == "wrapping_add" or mname == "wrapping_sub" or mname == "wrapping_mul"):
-                # the plain op wraps at 64 bits; a narrow type then wraps
-                # into its own range the way its arithmetic always has
+                # the plain op wraps at 64 bits, and a narrow type then
+                # wraps into its own range
                 obj_r := ir_expr(node.children[0])
                 arg_r := ir_expr(ir_method_call_arg_expr(node, 0))
                 out_r := ir_reg()
                 ir_emit_simple_binary(out_r, mname.replace("wrapping_", ""), obj_r, arg_r)
-                return ir_narrow_to_tid(recv_tid, out_r)
+                return ir_wrap_to_tid(recv_tid, out_r)
+            wrap_target := wrapping_conversion_target(mname)
+            if recv_info.kind == "primitive" and wrap_target.len() > 0:
+                obj_r := ir_expr(node.children[0])
+                return ir_wrap_to_tid(lookup_type_id(wrap_target), obj_r)
             if recv_info.kind == "primitive" and mname == "to_string":
                 if recv_info.name == "UInt" or recv_info.name == "UInt8" or recv_info.name == "UInt16" or recv_info.name == "UInt32" or recv_info.name == "UInt64":
                     obj_r := ir_expr(node.children[0])

@@ -25,9 +25,26 @@ pith runtime error: integer overflow
 ```
 
 `UInt` and `UInt64` stop the same way when a result leaves 0 to 2^64 - 1, so
-`UInt(3) - UInt(5)` is an error rather than a very large number. the narrower
-types (`Int8` through `UInt32`) keep wrapping into their range, which is what
-their arithmetic has always done.
+`UInt(3) - UInt(5)` is an error rather than a very large number. the narrow
+types (`Int8`, `Int16`, `Int32`, `UInt8`, `UInt16` and `UInt32`) stop when a
+result of `+`, `-`, `*`, `/` or `-x` leaves the type's range, so
+`Int8(127) + Int8(1)` and `Int8(-128) / Int8(-1)` are errors too.
+
+the rest of the integer operations follow the same rule:
+
+| operation | stops the program when |
+| --- | --- |
+| `Int8(x)`, `Int16(x)`, `Int32(x)`, `UInt8(x)`, `UInt16(x)`, `UInt32(x)` | `x` is outside the target type's range |
+| `UInt(x)`, `UInt64(x)` | `x` is negative |
+| `Int64(x)` | never; every `Int` fits |
+| `abs(x)` | `x` is the most negative `Int` |
+| `f.to_int()` | `f` is NaN, or outside the `Int` range once truncated toward zero |
+| `bit_shl(x, n)`, `bit_shr(x, n)` | `n` is outside 0 to 63 |
+
+the error is `integer overflow` in every case except NaN, which reports
+`NaN converted to an integer`. a shift drops any bits it moves past either
+end without an error, so `bit_shl(x, 1)` on a large `x` loses its top bit.
+the rotates in `std.bits` take their amount modulo the width.
 
 hashing, checksums and random number generators want the wrapping result. they
 ask for it by name:
@@ -41,6 +58,20 @@ seed = seed.wrapping_add(1)
 receiver's type and return one, wrapping at 64 bits for `Int`, `UInt` and
 `UInt64`, and into the type's range for the narrow ones. when the number is
 meant to grow without bound, use `std.bigint`.
+
+a conversion that should keep the low bits asks for it by name too.
+`wrapping_int8()`, `wrapping_int16()`, `wrapping_int32()`, `wrapping_uint8()`,
+`wrapping_uint16()`, `wrapping_uint32()`, `wrapping_uint()` and
+`wrapping_uint64()` work on any integer and keep the bits of its two's
+complement value that fit the target type:
+
+```pith
+print("{h.wrapping_uint64()}")      # a 64-bit hash, printed unsigned
+low := (300).wrapping_uint8()       # 44
+```
+
+masking first works as well when the target is unsigned:
+`UInt8(bit_and(x, 255))`.
 
 `examples/overflow_wrapping.pith` uses them for a hash, a random number
 generator and a sequence number, and checks a sum before it can overflow.

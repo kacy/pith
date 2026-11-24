@@ -1,0 +1,18 @@
+# Regression test for #1130: fused map-count-if optimization must also apply
+# inside result-returning functions (`-> T!`).
+
+fn tally(words: List[String]) -> Int!:
+    mut counts: Map[String, Int] := {}
+    for w in words:
+        if counts.contains_key(w):
+            counts[w] += 1
+        else:
+            counts[w] = 1
+    if not counts.contains_key("a"):
+        fail "missing key"
+    return counts["a"] + counts["b"] * 10
+
+fn main() -> Int!:
+    total := tally(["a", "b", "a", "b", "a"])!
+    print("{total}")
+    return 0

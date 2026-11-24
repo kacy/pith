@@ -384,81 +384,15 @@ pub fn get_type_name(tid: Int) -> String:
 # true for Int, UInt, Float and the eight sized integer types; false
 # for everything else, including Bool, String, Void and every user
 # type. the checker gates the arithmetic and ordering operators on
-# this. it re-resolves each builtin by name through the type table on
-# every call instead of comparing against the TID_* constants, so it
-# only answers correctly once initialize_type_table has run.
+# this. compares directly against the fixed TID_* primitive constants.
 pub fn is_numeric_type(tid: Int) -> Bool:
-    tid_int := lookup_type_id("Int")
-    tid_uint := lookup_type_id("UInt")
-    tid_float := lookup_type_id("Float")
-    tid_int8 := lookup_type_id("Int8")
-    tid_int16 := lookup_type_id("Int16")
-    tid_int32 := lookup_type_id("Int32")
-    tid_int64 := lookup_type_id("Int64")
-    tid_uint8 := lookup_type_id("UInt8")
-    tid_uint16 := lookup_type_id("UInt16")
-    tid_uint32 := lookup_type_id("UInt32")
-    tid_uint64 := lookup_type_id("UInt64")
-    if tid == tid_int:
-        return true
-    if tid == tid_uint:
-        return true
-    if tid == tid_float:
-        return true
-    if tid == tid_int8:
-        return true
-    if tid == tid_int16:
-        return true
-    if tid == tid_int32:
-        return true
-    if tid == tid_int64:
-        return true
-    if tid == tid_uint8:
-        return true
-    if tid == tid_uint16:
-        return true
-    if tid == tid_uint32:
-        return true
-    if tid == tid_uint64:
-        return true
-    return false
+    return (tid >= TID_INT and tid <= TID_FLOAT) or (tid >= TID_INT8 and tid <= TID_UINT64)
 
 # is_numeric_type minus Float — Int, UInt and the eight sized integer
 # types. use it where a whole number is required and a Float is not
-# good enough, such as a string, bytes, or list index. same name-based
-# lookup, so the same dependency on initialize_type_table.
+# good enough, such as a string, bytes, or list index.
 pub fn is_integer_type(tid: Int) -> Bool:
-    tid_int := lookup_type_id("Int")
-    tid_uint := lookup_type_id("UInt")
-    tid_int8 := lookup_type_id("Int8")
-    tid_int16 := lookup_type_id("Int16")
-    tid_int32 := lookup_type_id("Int32")
-    tid_int64 := lookup_type_id("Int64")
-    tid_uint8 := lookup_type_id("UInt8")
-    tid_uint16 := lookup_type_id("UInt16")
-    tid_uint32 := lookup_type_id("UInt32")
-    tid_uint64 := lookup_type_id("UInt64")
-    if tid == tid_int:
-        return true
-    if tid == tid_uint:
-        return true
-    if tid == tid_int8:
-        return true
-    if tid == tid_int16:
-        return true
-    if tid == tid_int32:
-        return true
-    if tid == tid_int64:
-        return true
-    if tid == tid_uint8:
-        return true
-    if tid == tid_uint16:
-        return true
-    if tid == tid_uint32:
-        return true
-    if tid == tid_uint64:
-        return true
-    return false
+    return tid == TID_INT or tid == TID_UINT or (tid >= TID_INT8 and tid <= TID_UINT64)
 
 # true only for the sentinel the checker returns from an expression it
 # could not type. that sentinel is TID_ERR == 15, an ordinary positive
@@ -467,7 +401,7 @@ pub fn is_integer_type(tid: Int) -> Bool:
 # error type, which is what stops one bad expression from producing a
 # cascade of follow-on messages.
 pub fn is_error_type(tid: Int) -> Bool:
-    return tid == lookup_type_id("<error>")
+    return tid == TID_ERR
 
 # true for the bare-`none` sentinel. `none` carries no type of its own, so it
 # only satisfies a target that is already an optional.

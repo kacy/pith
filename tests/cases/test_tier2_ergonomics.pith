@@ -1,0 +1,93 @@
+# Regression test for Tier 2 ergonomics:
+# - top-level typed binding with qualified type (`X: mod.Type := ...`)
+# - generic function type inference from user generic structs and enums
+# - arrow-lambda widening into optional, result, optional-result, and interface
+# - negative integer, negative hex, negative float, and negative range patterns
+
+import std.collections as collections
+
+TOP_ERR: collections.CollectionError := collections.CollectionError(message: "ok")
+
+struct Box[T]:
+    value: T
+
+enum Either[L, R]:
+    Left(L)
+    Right(R)
+
+interface Describer:
+    fn describe() -> String
+
+struct Badge:
+    label: String
+
+impl Describer for Badge:
+    fn describe() -> String:
+        return "badge:" + self.label
+
+fn unwrap_box[T](b: Box[T]) -> T:
+    return b.value
+
+fn either_tag[L, R](e: Either[L, R]) -> String:
+    match e:
+        Either.Left(_) => return "left"
+        Either.Right(_) => return "right"
+
+fn classify_int(n: Int) -> String:
+    match n:
+        -0x10 => return "neg16"
+        -10..=-2 => return "neg_range_incl"
+        -1 => return "neg_one"
+        -20..-10 => return "neg_range_excl"
+        0 => return "zero"
+        _ => return "other"
+
+fn classify_float(x: Float) -> String:
+    match x:
+        -1.5 => return "neg_one_half"
+        0.0 => return "zero"
+        _ => return "other"
+
+fn main() -> Int!:
+    print("top:{TOP_ERR.message}")
+
+    b_int := Box(value: 99)
+    b_str := Box(value: "hello")
+    print("box:{unwrap_box(b_int)}:{unwrap_box(b_str)}")
+
+    e1: Either[Int, String] := Either.Left(1)
+    e2: Either[Int, String] := Either.Right("ok")
+    print("either:{either_tag(e1)}:{either_tag(e2)}")
+
+    to_opt := fn(x: Int) -> Int? => x
+    to_none := fn(x: Int) -> Int? => none
+    to_res := fn(x: Int) -> Int! => x + 1
+    to_opt_res := fn(x: Int) -> Int?! => x + 2
+    to_pair := fn(p: (Int, Int)) -> (Int, Int) => p
+    to_iface := fn(b: Badge) -> Describer => b
+    to_opt_iface := fn(b: Badge) -> Describer? => b
+    to_res_iface := fn(b: Badge) -> Describer! => b
+
+    mut opt_val := 0
+    if let v = to_opt(5):
+        opt_val = v
+    mut none_seen := false
+    if let v = to_none(5):
+        none_seen = v < 0
+    else:
+        none_seen = true
+    res_val := to_res(5)!
+    mut opt_res_val := 0
+    if let v = to_opt_res(5)!:
+        opt_res_val = v
+    pair_val := to_pair((3, 4))
+    d1 := to_iface(Badge(label: "a"))
+    mut d2_str := ""
+    if let d2 = to_opt_iface(Badge(label: "b")):
+        d2_str = d2.describe()
+    d3 := to_res_iface(Badge(label: "c"))!
+    print("lambda:{opt_val}:{none_seen}:{res_val}:{opt_res_val}:{pair_val.0},{pair_val.1}:{d1.describe()}:{d2_str}:{d3.describe()}")
+
+    print("int:{classify_int(-16)}:{classify_int(-5)}:{classify_int(-1)}:{classify_int(-15)}:{classify_int(0)}:{classify_int(7)}")
+    print("flt:{classify_float(-1.5)}:{classify_float(0.0)}:{classify_float(2.5)}")
+    return 0

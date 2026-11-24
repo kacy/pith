@@ -47,6 +47,8 @@ mut generic_wildcard_import_entries: List[String] := []
 # a self-compile.
 mut generic_named_import_sources: Map[String, List[String]] := {}
 mut generic_wildcard_import_sources: Map[String, List[String]] := {}
+mut all_named_import_first_source: Map[String, String] := {}
+mut all_wildcard_import_sources: Map[String, List[String]] := {}
 mut current_checker_module_path: String := ""
 mut checked_module_paths: Map[String, Bool] := {}
 mut generic_inference_subst: Map[String, Int] := {}
@@ -191,6 +193,8 @@ pub mut impl_interface_args: Map[String, String] := {}
 # (un-instantiated) struct name from which the instance was built.
 pub mut struct_instance_type_args: Map[Int, String] := {}
 pub mut struct_instance_base_name: Map[Int, String] := {}
+mut enum_instance_type_args: Map[Int, String] := {}
+mut enum_instance_base_name: Map[Int, String] := {}
 # Pith's cross-module Map read is unreliable for iterating, so we also
 # maintain a parallel list of instance tids that callers can use to walk
 # every generic struct instantiation the program has registered.
@@ -307,6 +311,8 @@ pub fn initialize_checker(file_path: String):
     impl_interface_args = {}
     struct_instance_type_args = {}
     struct_instance_base_name = {}
+    enum_instance_type_args = {}
+    enum_instance_base_name = {}
     struct_instance_tids = []
     suppress_unknown_type_for = {}
     expression_type_cache = {}
@@ -332,6 +338,8 @@ pub fn initialize_checker(file_path: String):
     generic_wildcard_import_entries = []
     generic_named_import_sources = {}
     generic_wildcard_import_sources = {}
+    all_named_import_first_source = {}
+    all_wildcard_import_sources = {}
     current_checker_module_path = ""
     checked_module_paths = {}
     generic_inference_subst = {}
@@ -438,6 +446,7 @@ pub fn process_import_aliases(root_idx: Int):
                 if parts.len() > 1:
                     if parts[1] == "*":
                         generic_wildcard_import_entries.push(current_checker_module_path + chr(9) + mod_path)
+                        index_all_wildcard_import_source(current_checker_module_path, mod_path)
                         if current_checker_module_path.len() > 0:
                             index_wildcard_import_source(current_checker_module_path, mod_path)
                     else:
@@ -473,6 +482,7 @@ pub fn process_import_aliases(root_idx: Int):
                                     checker_note_alias_module(receiver, mod_path)
                                     continue
                                 generic_named_import_entries.push(current_checker_module_path + chr(9) + imported_name + chr(9) + mod_path)
+                                index_all_named_import_source(current_checker_module_path + chr(9) + imported_name, mod_path)
                                 if current_checker_module_path.len() > 0:
                                     index_named_import_source(current_checker_module_path + chr(9) + imported_name, mod_path)
 
@@ -1692,23 +1702,52 @@ fn index_wildcard_import_source(key: String, source: String):
     else:
         generic_wildcard_import_sources.insert(key, [source])
 
-# rebuild both index maps from the entry lists, for the path that replaces
-# the lists wholesale (a snapshot restore). an entry with an empty field is
-# not indexed, which is what the split-based walk this replaced did with
-# it: split drops empty parts, so such an entry never had enough parts to
-# match. the only field that can be empty is the importing module's path,
-# for the main file.
+# file one named-import source under "module<TAB>name" for all modules
+# (including the main file, whose module path is ""). first entry wins.
+fn index_all_named_import_source(key: String, source: String):
+    if not all_named_import_first_source.contains_key(key):
+        all_named_import_first_source.insert(key, source)
+
+# file one wildcard-import source under the importing module's path for all
+# modules (including the main file, whose module path is "").
+fn index_all_wildcard_import_source(key: String, source: String):
+    if all_wildcard_import_sources.contains_key(key):
+        mut sources := all_wildcard_import_sources[key]
+        sources.push(source)
+        all_wildcard_import_sources.insert(key, sources)
+    else:
+        all_wildcard_import_sources.insert(key, [source])
+
+# rebuild all import index maps from the entry lists, for the path that
+# replaces the lists wholesale (a snapshot restore). generic_*_import_sources
+# skips empty-module entries to match resolve_generic_declaration_key's
+# main-file rule; all_*_import_sources indexes every module including "".
 fn rebuild_generic_import_index():
     generic_named_import_sources = {}
     generic_wildcard_import_sources = {}
+    all_named_import_first_source = {}
+    all_wildcard_import_sources = {}
+    tab := chr(9)
     for entry in generic_named_import_entries:
-        parts := entry.split(chr(9))
-        if parts.len() >= 3:
-            index_named_import_source(parts[0] + chr(9) + parts[1], parts[2])
+        t1 := entry.index_of(tab)
+        if t1 >= 0:
+            rest := entry.substring(t1 + 1, entry.len())
+            t2 := rest.index_of(tab)
+            if t2 >= 0:
+                mod_key := entry.substring(0, t1)
+                imp_name := rest.substring(0, t2)
+                src := rest.substring(t2 + 1, rest.len())
+                index_all_named_import_source(mod_key + tab + imp_name, src)
+                if mod_key.len() > 0 and imp_name.len() > 0 and src.len() > 0:
+                    index_named_import_source(mod_key + tab + imp_name, src)
     for entry in generic_wildcard_import_entries:
-        parts := entry.split(chr(9))
-        if parts.len() >= 2:
-            index_wildcard_import_source(parts[0], parts[1])
+        t1 := entry.index_of(tab)
+        if t1 >= 0:
+            mod_key := entry.substring(0, t1)
+            src := entry.substring(t1 + 1, entry.len())
+            index_all_wildcard_import_source(mod_key, src)
+            if mod_key.len() > 0 and src.len() > 0:
+                index_wildcard_import_source(mod_key, src)
 
 # the key generic_declaration_map holds `name` under as seen from the module
 # being checked, or "" when no declaration is visible. the current module's
@@ -4297,24 +4336,17 @@ fn type_supports_stringify(tid: Int) -> Bool:
 # module) or wildcard-imports anything. name-level, deliberately loose:
 # it never rejects a genuine import, only names no import mentions.
 fn current_module_imports_name(name: String) -> Bool:
-    wildcard_needle := current_checker_module_path + chr(9)
-    for w in generic_wildcard_import_entries:
-        if w.starts_with(wildcard_needle):
-            return true
-    needle := current_checker_module_path + chr(9) + name + chr(9)
-    for entry in generic_named_import_entries:
-        if entry.starts_with(needle):
-            return true
-    return false
+    if all_wildcard_import_sources.contains_key(current_checker_module_path):
+        return true
+    return all_named_import_first_source.contains_key(current_checker_module_path + chr(9) + name)
 
 # the module a from-import in the current module names as the source of
 # `name`, or "". first matching entry wins; an aliased or wildcard import
 # leaves the name unresolved here and the caller keeps the global answer.
 fn from_import_source_module(name: String) -> String:
-    needle := current_checker_module_path + chr(9) + name + chr(9)
-    for entry in generic_named_import_entries:
-        if entry.starts_with(needle):
-            return entry.substring(needle.len(), entry.len())
+    key := current_checker_module_path + chr(9) + name
+    if all_named_import_first_source.contains_key(key):
+        return all_named_import_first_source[key]
     return ""
 
 # the modules a bare `name` in the current module may come from by import:
@@ -4327,10 +4359,9 @@ fn bare_name_import_sources(name: String) -> List[String]:
     if named.len() > 0:
         sources.push(named)
         return sources
-    wildcard_needle := current_checker_module_path + chr(9)
-    for w in generic_wildcard_import_entries:
-        if w.starts_with(wildcard_needle):
-            sources.push(w.substring(wildcard_needle.len(), w.len()))
+    if all_wildcard_import_sources.contains_key(current_checker_module_path):
+        for w in all_wildcard_import_sources[current_checker_module_path]:
+            sources.push(w)
     return sources
 
 # the builtins that take a raw pointer as an Int. the runtime checks the
@@ -5522,11 +5553,17 @@ fn unify_field_type_against_arg(field_node_idx: Int, arg_tid: Int, generic_param
                 if fnode.children.len() == 1:
                     unify_field_type_against_arg(fnode.children[0], arg_info.inner, generic_params, subst_map)
             return
-        # a field typed by another generic struct (`inner: Guard[T]`) given
-        # an instance of it: each written argument matches the instance's own
+        # a field typed by another generic struct or enum (`inner: Guard[T]`)
+        # given an instance of it: each written argument matches the instance's own
         if struct_instance_base_name.contains_key(arg_tid) and struct_instance_type_args.contains_key(arg_tid):
-            if extract_base_type_name(struct_instance_base_name[arg_tid]) == fnode.value:
+            if extract_base_type_name(struct_instance_base_name[arg_tid]) == extract_base_type_name(fnode.value):
                 inst_args := decode_tid_list(struct_instance_type_args[arg_tid])
+                for c, ci in fnode.children:
+                    if ci < inst_args.len():
+                        unify_field_type_against_arg(c, inst_args[ci], generic_params, subst_map)
+        elif enum_instance_base_name.contains_key(arg_tid) and enum_instance_type_args.contains_key(arg_tid):
+            if extract_base_type_name(enum_instance_base_name[arg_tid]) == extract_base_type_name(fnode.value):
+                inst_args := decode_tid_list(enum_instance_type_args[arg_tid])
                 for c, ci in fnode.children:
                     if ci < inst_args.len():
                         unify_field_type_against_arg(c, inst_args[ci], generic_params, subst_map)
@@ -6111,6 +6148,27 @@ fn infer_generic_subst_from_type_text(type_name: String, actual_tid: Int, generi
             return infer_generic_subst_from_type_text(args[1], actual_info.value_type, generic_params)
         return true
 
+    bracket := trimmed.index_of("[")
+    if bracket > 0 and trimmed.ends_with("]"):
+        expected_base := extract_base_type_name(trimmed.substring(0, bracket))
+        args := split_top_level_type_args(trimmed.substring(bracket + 1, trimmed.len() - 1))
+        if struct_instance_base_name.contains_key(actual_tid) and struct_instance_type_args.contains_key(actual_tid):
+            if extract_base_type_name(struct_instance_base_name[actual_tid]) == expected_base:
+                inst_args := decode_tid_list(struct_instance_type_args[actual_tid])
+                for arg_text, ai in args:
+                    if ai < inst_args.len():
+                        if infer_generic_subst_from_type_text(arg_text, inst_args[ai], generic_params) == false:
+                            return false
+                return true
+        if enum_instance_base_name.contains_key(actual_tid) and enum_instance_type_args.contains_key(actual_tid):
+            if extract_base_type_name(enum_instance_base_name[actual_tid]) == expected_base:
+                inst_args := decode_tid_list(enum_instance_type_args[actual_tid])
+                for arg_text, ai in args:
+                    if ai < inst_args.len():
+                        if infer_generic_subst_from_type_text(arg_text, inst_args[ai], generic_params) == false:
+                            return false
+                return true
+
     return true
 
 fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_params: List[String]) -> Bool:
@@ -6149,6 +6207,23 @@ fn infer_generic_subst_from_type_node(type_idx: Int, actual_tid: Int, generic_pa
                     return false
                 return infer_generic_subst_from_type_node(node.children[1], actual_info.value_type, generic_params)
             return true
+        expected_base := extract_base_type_name(node.value)
+        if struct_instance_base_name.contains_key(actual_tid) and struct_instance_type_args.contains_key(actual_tid):
+            if extract_base_type_name(struct_instance_base_name[actual_tid]) == expected_base:
+                inst_args := decode_tid_list(struct_instance_type_args[actual_tid])
+                for child, ci in node.children:
+                    if ci < inst_args.len():
+                        if infer_generic_subst_from_type_node(child, inst_args[ci], generic_params) == false:
+                            return false
+                return true
+        if enum_instance_base_name.contains_key(actual_tid) and enum_instance_type_args.contains_key(actual_tid):
+            if extract_base_type_name(enum_instance_base_name[actual_tid]) == expected_base:
+                inst_args := decode_tid_list(enum_instance_type_args[actual_tid])
+                for child, ci in node.children:
+                    if ci < inst_args.len():
+                        if infer_generic_subst_from_type_node(child, inst_args[ci], generic_params) == false:
+                            return false
+                return true
         return true
 
     if node.kind == "optional_type":
@@ -8559,13 +8634,49 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
                 value_idx := body_node.children[0]
                 note_literal_target(value_idx, declared_return)
                 ret_type = c_check_expr(value_idx, lambda_scope)
-                # a literal body takes the declared return type, as a return
-                # statement's literal does
-                if declared_return >= 0 and (node_kind(value_idx) == "list" or node_kind(value_idx) == "map" or node_kind(value_idx) == "set"):
-                    if collection_literal_matches_target(value_idx, declared_return, lambda_scope):
-                        ret_type = declared_return
                 if declared_return >= 0:
-                    if is_error_type(ret_type) == false and types_structurally_equal(ret_type, declared_return) == false:
+                    exp_info := get_type_info(declared_return)
+                    mut matched := false
+                    val_node := get_node(value_idx)
+                    # a literal body takes the declared return type, as a return
+                    # statement's literal does
+                    if val_node.kind == "list" or val_node.kind == "map" or val_node.kind == "set":
+                        if val_node.children.len() == 0 and is_error_type(ret_type):
+                            if exp_info.kind == "list" or exp_info.kind == "map" or exp_info.kind == "set":
+                                expression_type_cache.insert(value_idx, declared_return)
+                                matched = true
+                            elif exp_info.kind == "optional" and exp_info.inner >= 0:
+                                propagate_expected_collection_type(value_idx, declared_return)
+                                literal_tid := c_get_expr_type(value_idx)
+                                if is_error_type(literal_tid) == false:
+                                    argument_widens_to_optional(value_idx, literal_tid, declared_return)
+                                matched = true
+                        if not matched:
+                            mut literal_target := declared_return
+                            if exp_info.kind == "result":
+                                literal_target = exp_info.inner
+                            if collection_literal_matches_target(value_idx, literal_target, lambda_scope):
+                                matched = true
+                    if not matched and val_node.kind == "none_lit" and exp_info.kind == "optional":
+                        matched = true
+                    if not matched and (is_error_type(ret_type) or ret_type == declared_return or types_structurally_equal(ret_type, declared_return)):
+                        matched = true
+                    if not matched and exp_info.kind == "result":
+                        if ret_type == exp_info.inner or types_structurally_equal(ret_type, exp_info.inner):
+                            matched = true
+                        elif get_type_info(exp_info.inner).kind == "optional" and argument_widens_to_optional(value_idx, ret_type, exp_info.inner):
+                            matched = true
+                        elif interface_value_accepts(value_idx, ret_type, exp_info.inner):
+                            matched = true
+                    if not matched and exp_info.kind == "optional":
+                        if ret_type == exp_info.inner or types_structurally_equal(ret_type, exp_info.inner):
+                            argument_widens_to_optional(value_idx, ret_type, declared_return)
+                            matched = true
+                        elif argument_widens_to_optional(value_idx, ret_type, declared_return):
+                            matched = true
+                    if not matched and interface_value_accepts(value_idx, ret_type, declared_return):
+                        matched = true
+                    if not matched:
                         report_error("E200", "lambda return type mismatch: expected " + get_type_name(declared_return) + ", got " + get_type_name(ret_type))
                     ret_type = declared_return
         elif body_node.kind == "block":
@@ -9339,6 +9450,8 @@ fn instantiate_generic_enum_type(decl_idx: Int, type_args: List[Int]) -> Int:
     mut shell_variant_types: List[List[Int]] := []
     tid := add_type_info(ti_enum(inst_name, shell_variants, shell_variant_types))
     register_type_name(inst_name, tid)
+    enum_instance_type_args.insert(tid, encode_tid_list(type_args))
+    enum_instance_base_name.insert(tid, base_name)
     mut variant_names: List[String] := []
     mut variant_types: List[List[Int]] := []
     for child in decl.children:
@@ -9973,6 +10086,8 @@ pub struct CheckerSnapshot:
     pub impl_interface_args: Map[String, String]
     pub struct_instance_type_args: Map[Int, String]
     pub struct_instance_base_name: Map[Int, String]
+    pub enum_instance_type_args: Map[Int, String]
+    pub enum_instance_base_name: Map[Int, String]
     pub struct_instance_tids: List[Int]
     pub suppress_unknown_type_for: Map[String, Int]
     pub expression_type_cache: Map[Int, Int]
@@ -10065,6 +10180,8 @@ pub fn take_checker_snapshot() -> CheckerSnapshot:
         impl_interface_args: copy_map(impl_interface_args),
         struct_instance_type_args: copy_map(struct_instance_type_args),
         struct_instance_base_name: copy_map(struct_instance_base_name),
+        enum_instance_type_args: copy_map(enum_instance_type_args),
+        enum_instance_base_name: copy_map(enum_instance_base_name),
         struct_instance_tids: copy_list(struct_instance_tids),
         suppress_unknown_type_for: copy_map(suppress_unknown_type_for),
         expression_type_cache: copy_map(expression_type_cache),
@@ -10157,6 +10274,8 @@ pub fn restore_checker_snapshot(s: CheckerSnapshot):
     impl_interface_args = copy_map(s.impl_interface_args)
     struct_instance_type_args = copy_map(s.struct_instance_type_args)
     struct_instance_base_name = copy_map(s.struct_instance_base_name)
+    enum_instance_type_args = copy_map(s.enum_instance_type_args)
+    enum_instance_base_name = copy_map(s.enum_instance_base_name)
     struct_instance_tids = copy_list(s.struct_instance_tids)
     suppress_unknown_type_for = copy_map(s.suppress_unknown_type_for)
     expression_type_cache = copy_map(s.expression_type_cache)

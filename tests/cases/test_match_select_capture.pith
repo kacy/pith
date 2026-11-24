@@ -1,0 +1,62 @@
+# Regression test for closure/spawn capture analysis of match arm bindings and
+# select recv arm bindings (ir_capture.pith): names bound by `match` arms or
+# `select` receive arms must not be treated as free variables of an enclosing
+# lambda or spawn, while genuine outer locals referenced alongside them are
+# still captured cleanly.
+
+enum Packet:
+    Number(Int)
+    Pair(Int, String)
+    Empty
+
+fn test_match_in_closure(tag: String, pkt: Packet) -> String:
+    f := fn() -> String:
+        match pkt:
+            Packet.Number(n) if n > 0 =>
+                return "{tag}:pos:{n}"
+            Packet.Number(n) =>
+                return "{tag}:nonpos:{n}"
+            Packet.Pair(code, msg) =>
+                return "{tag}:{code}:{msg}"
+            Packet.Empty =>
+                return "{tag}:empty"
+    return f()
+
+fn run_thunk(f: fn() -> String) -> String:
+    return f()
+
+fn test_match_in_spawn(prefix: String, pkt: Packet) -> String:
+    worker := fn() -> String:
+        match pkt:
+            Packet.Pair(n, label) => return "{prefix}/{n}/{label}"
+            _ => return "{prefix}/other"
+    t := spawn run_thunk(worker)
+    return await t
+
+fn test_select_in_closure_and_spawn(prefix: String) -> String:
+    ch := Channel[String](2)
+    ch.send("alpha")
+    ch.send("beta")
+
+    recv_fn := fn() -> String:
+        return select:
+            msg := ch.recv() => "{prefix}:{msg}"
+            default => "none"
+    first := recv_fn()
+
+    worker := fn() -> String:
+        return select:
+            item := ch.recv() => "{prefix}:{item}"
+            default => "empty"
+    t := spawn run_thunk(worker)
+    second := await t
+    ch.close()
+    return first + "|" + second
+
+fn main():
+    print(test_match_in_closure("a", Packet.Number(7)))
+    print(test_match_in_closure("b", Packet.Number(-2)))
+    print(test_match_in_closure("c", Packet.Pair(42, "hi")))
+    print(test_match_in_closure("d", Packet.Empty))
+    print(test_match_in_spawn("sp", Packet.Pair(9, "ok")))
+    print(test_select_in_closure_and_spawn("sel"))

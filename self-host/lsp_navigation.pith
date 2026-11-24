@@ -18,7 +18,7 @@
 from checker import get_definition_of, c_get_expr_type, extract_binding_name
 from checker_methods import all_method_keys
 from scope import all_binding_names, all_binding_types, all_binding_decl_nodes
-from driver import file_for_node, dr_read_source
+from driver import file_for_node, node_range_for_file, dr_read_source
 from types import get_type_name, get_type_info, TID_ERR
 from ast import Node, get_node, node_count
 from lsp_state import PithPos, uri_to_path, path_to_uri, document_text, get_position_encoding, line_col_to_lsp_pos, lsp_pos_to_line_col, text_line
@@ -553,11 +553,11 @@ fn member_entries(path: String, line1: Int, line_text: String, dot_off: Int) -> 
     mut best := 0 - 1
     mut best_col := 0 - 1
     if recv_start < dot_off:
-        total := node_count()
-        mut i := 0
-        while i < total:
+        file_range := node_range_for_file(path)
+        mut i := file_range.0
+        while i < file_range.1:
             node := get_node(i)
-            if node.line == line1 and node.col > recv_start and node.col <= dot_off and file_for_node(i) == path:
+            if node.line == line1 and node.col > recv_start and node.col <= dot_off:
                 tid := c_get_expr_type(i)
                 if tid >= 0 and tid != TID_ERR:
                     # the node starting latest inside the receiver span

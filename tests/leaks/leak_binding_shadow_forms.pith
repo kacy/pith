@@ -1,6 +1,7 @@
 # the inner-scope bindings that may reuse an enclosing name, churned with heap
 # values: a `for` variable over a local of another type, a defer written
-# outside the loop that an early return runs inside it, a closure parameter
+# outside the loop that an early return runs inside it, a return or fail of
+# the loop variable while a local of its name is live, a closure parameter
 # and a closure payload over locals of the same name, and sibling payloads of
 # different types followed by a binding at the function's level. each of those
 # has storage of its own (tests/cases/test_binding_shadow_forms.pith), so a
@@ -41,6 +42,28 @@ fn defer_outside_loop(i: Int) -> Int:
             return word.len()
     return 0
 
+fn first_long(names: List[String]) -> String:
+    name := "outer-{names.len()}"
+    for name in names:
+        if name.len() > 3:
+            return name
+    return name
+
+fn first_bad(names: List[String]) -> String!:
+    reason := "outer-{names.len()}"
+    for reason in names:
+        if reason.starts_with("bad"):
+            fail reason
+    return reason
+
+fn returned_loop_variable(i: Int) -> Int:
+    words := ["ab", "long-{i}", "bad-{i}"]
+    failed := first_bad(words)
+    mut used := first_long(words).len()
+    if failed.is_err:
+        used = used + failed.err.len()
+    return used
+
 fn closure_shadows(i: Int) -> Int:
     name := "outer-{i}"
     shout := fn(name: String) -> String => name + "!"
@@ -70,7 +93,8 @@ fn main():
     mut i := 0
     mut used := 0
     while i < n:
-        used = used + for_over_other_type(i) + defer_outside_loop(i) + closure_shadows(i) + sibling_payloads(i)
+        used = used + for_over_other_type(i) + defer_outside_loop(i) + returned_loop_variable(i)
+        used = used + closure_shadows(i) + sibling_payloads(i)
         i = i + 1
     if used < 0:
         print("unreachable")

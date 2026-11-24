@@ -109,6 +109,22 @@ fn deferred_outside(stop: Int) -> Int:
             return word
     return 0
 
+# returning or failing with the loop variable hands out the loop's element,
+# which takes a count of its own, and the local it shadows is still released
+fn first_long(names: List[String]) -> String:
+    name := "outer-{names.len()}"
+    for name in names:
+        if name.len() > 3:
+            return name
+    return name
+
+fn first_bad(names: List[String]) -> String!:
+    reason := "outer-{names.len()}"
+    for reason in names:
+        if reason.starts_with("bad"):
+            fail reason
+    return reason
+
 fn deferred_inside(n: Int) -> Int:
     word := ["kept-{n}"]
     mut total := 0
@@ -165,6 +181,12 @@ fn main():
         checksum = checksum + for_index_over_counter(round).len() + for_nested(round).len()
         checksum = checksum + closures_around_loop(round).len() + closure_params(round).len()
         checksum = checksum + closure_own_payload(round).len() + siblings(round).len()
+        words := ["ab", "long-{round}", "bad-{round}"]
+        checksum = checksum + first_long(words).len()
+        failed := first_bad(words)
+        if failed.is_err:
+            checksum = checksum + failed.err.len()
+        checksum = checksum + words[1].len() + words[2].len()
         round = round + 1
     print("checksum {checksum}")
     print(for_same_type(1))
@@ -176,6 +198,14 @@ fn main():
     print("returned {deferred_outside(2)}")
     print("returned {deferred_outside(9)}")
     print("returned {deferred_inside(7)}")
+    words := ["ab", "long-1", "bad-2"]
+    print(first_long(words))
+    print(first_long(["a"]))
+    failed := first_bad(words)
+    if failed.is_err:
+        print("failed {failed.err}")
+    print(first_bad(["ok"]) catch "none")
+    print("{words[1]} {words[2]}")
     print(closure_params(8))
     print(closure_own_payload(10))
     print(closure_own_payload(11))

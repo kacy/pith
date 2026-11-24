@@ -1,0 +1,69 @@
+# a value built straight into a weak slot has no strong owner, so it is
+# dropped at the store and the slot reads back none. the store used to keep
+# the constructor's strong count: the value leaked, its drop never ran, and
+# the slot read it back alive. covers each way a weak slot is written: a
+# field assignment, a named and a positional constructor field, and a weak
+# local, plus a value some other binding still owns, which stays alive.
+struct Child:
+    pub n: Int
+
+impl Drop for Child:
+    fn drop():
+        print("dropped {self.n}")
+
+struct Holder:
+    weak w: Child?
+
+struct Pair:
+    pub id: Int
+    weak w: Child?
+
+fn make(n: Int) -> Child:
+    return Child(n: n)
+
+fn state(c: Child?) -> String:
+    return match c:
+        got => "alive {got.n}"
+        none => "none"
+
+fn field_assignment():
+    mut h := Holder(w: none)
+    h.w = Child(n: 1)
+    print("assigned: " + state(h.w))
+    h.w = make(2)
+    print("from a call: " + state(h.w))
+
+fn named_field():
+    h := Holder(w: Child(n: 3))
+    print("named: " + state(h.w))
+
+fn positional_field():
+    p := Pair(7, Child(n: 4))
+    print("positional: " + state(p.w) + " id {p.id}")
+
+fn weak_local():
+    weak w := Child(n: 5)
+    print("local: " + state(w))
+
+fn owned_elsewhere():
+    keep := Child(n: 6)
+    mut h := Holder(w: none)
+    h.w = keep
+    print("owned elsewhere: " + state(h.w))
+
+fn in_a_loop():
+    mut h := Holder(w: none)
+    mut i := 0
+    while i < 3:
+        h.w = Child(n: 10 + i)
+        i = i + 1
+    print("loop: " + state(h.w))
+
+fn main():
+    field_assignment()
+    named_field()
+    positional_field()
+    weak_local()
+    owned_elsewhere()
+    print("after owned_elsewhere")
+    in_a_loop()

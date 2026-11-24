@@ -1013,7 +1013,14 @@ fn ir_emit_weak_payload(val_idx: Int) -> Int:
     ir_emit("call " + retain_r.to_string() + " pith_struct_weak_retain void 1 " + payload_r.to_string())
     # a fresh optional (a call result, another weak read) has no other owner.
     # the weak count above keeps the header readable after its release.
-    if ir_rc_kind(ir_infer_type(val_idx)) == "tuple" and ir_optional_subject_is_owned(val_idx):
+    value_kind := ir_rc_kind(ir_infer_type(val_idx))
+    if value_kind == "tuple" and ir_optional_subject_is_owned(val_idx):
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
+    # so does a fresh struct (`h.w = Child(n: 1)`): nothing holds its strong
+    # count, so it is dropped here and the field reads back none, as for any
+    # target whose last strong reference is gone. kept, the count leaked the
+    # struct and the field read it back alive.
+    elif value_kind == "struct" and not ir_expr_is_borrowed(val_idx):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
     return payload_r
 

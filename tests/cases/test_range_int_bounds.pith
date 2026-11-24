@@ -1,0 +1,98 @@
+# a range-for that ends at the largest Int, or starts at the smallest, runs
+# each value once and stops. an inclusive range used to step past its last
+# value, wrap around to the smallest Int and keep looping. `continue` goes
+# through the same step, and `break` and the index binding work at the edges.
+from std.collections import range
+from std.iter import Range, to_list
+
+MAX := 9223372036854775807
+MIN := 0 - 9223372036854775807 - 1
+
+fn main():
+    mut count := 0
+    mut last := 0
+    for i in MAX - 5..=MAX:
+        count += 1
+        last = i
+    print("inclusive to max: count={count} last={last}")
+
+    count = 0
+    for i in MAX..=MAX:
+        count += 1
+        last = i
+    print("max alone: count={count} last={last}")
+
+    mut seen := ""
+    for i, k in MAX - 2..=MAX:
+        seen = seen + " {k}:{MAX - i}"
+    print("with index:{seen}")
+
+    count = 0
+    mut skipped := 0
+    for i in MAX - 4..=MAX:
+        if i == MAX or i == MAX - 2:
+            skipped += 1
+            continue
+        count += 1
+    print("continue at max: count={count} skipped={skipped}")
+
+    count = 0
+    for i in MAX - 3..=MAX:
+        count += 1
+        continue
+    print("continue every time: count={count}")
+
+    count = 0
+    for i in MAX - 10..=MAX:
+        if i == MAX - 2:
+            break
+        count += 1
+    print("break before max: count={count}")
+
+    count = 0
+    for i in MAX - 3..MAX:
+        count += 1
+        last = i
+    print("exclusive to max: count={count} last={MAX - last}")
+
+    count = 0
+    for i in MIN..=MIN + 3:
+        count += 1
+        last = i
+    print("inclusive from min: count={count} last={last - MIN}")
+
+    count = 0
+    for i in MIN..MIN + 3:
+        count += 1
+    print("exclusive from min: count={count}")
+
+    count = 0
+    for i in MIN..=MIN:
+        count += 1
+    print("min alone: count={count}")
+
+    count = 0
+    for i in MAX..=MAX - 1:
+        count += 1
+    for i in MAX..MAX:
+        count += 1
+    for i in 5..=4:
+        count += 1
+    print("empty: count={count}")
+
+    count = 0
+    for i in MAX - 2..=MAX:
+        for j in MAX - 1..=MAX:
+            count += 1
+    print("nested to max: count={count}")
+
+    count = 0
+    for i in MIN..=MIN + 2:
+        for j in MAX - 2..=MAX:
+            if j == MAX:
+                continue
+            count += 1
+    print("nested min and max: count={count}")
+
+    print("Range near max: {to_list(Range(cur: MAX - 3, hi: MAX)).len()}, near min: {to_list(Range(cur: MIN, hi: MIN + 3)).len()}")
+    print("range near max: {range(MAX - 3, MAX).len()}, near min: {range(MIN, MIN + 3).len()}")

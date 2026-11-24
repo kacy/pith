@@ -156,6 +156,10 @@ fn build_for_mode(mode: Int, data: Bytes, pos: Int, end: Int, default_table: fse
     if mode == MODE_RLE:
         if pos >= data.len():
             fail "zstd: truncated rle symbol"
+        # an offset code is a shift count, so one past the table must not
+        # reach the decode loop
+        if data[pos] > max_symbol:
+            fail "zstd: sequence code out of range"
         return (default_table, 1, data[pos])
     if mode == MODE_FSE:
         desc := fse.read_ncount(data, pos, end, max_symbol, max_log)!
@@ -824,6 +828,19 @@ test "sequence counts read at all three widths":
     c3 := read_sequence_count(three.take_bytes(), 0)!
     assert_eq(c3.count, 0x10 + 256 + 0x7F00)
     assert_eq(c3.bytes_used, 3)
+
+test "an rle code past its table is refused before it becomes a shift":
+    # offset mode rle (bits 4-5 = 1), then the symbol. 31 is the last offset
+    # code; 200 would be a shift count past 63.
+    mut ok := bytes.buffer()
+    ok.write_byte(16)
+    ok.write_byte(31)
+    got := read_tables(ok.take_bytes(), 0, 2, [])!
+    assert_eq(got.0.of_rle, 31)
+    mut bad := bytes.buffer()
+    bad.write_byte(16)
+    bad.write_byte(200)
+    assert(read_tables(bad.take_bytes(), 0, 2, []).is_err)
 
 test "offset resolution walks the repeat history":
     # a literal offset pushes the history down

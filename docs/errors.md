@@ -11,9 +11,10 @@ and fix suggestion (if available).
 
 ## lexing and parsing errors (E24x)
 
-the lexer and parser do not have their own numeric ranges. every diagnostic
-they produce lands in the E24x block alongside the checker's, and the four
-codes below are the whole set:
+the lexer and parser do not have their own numeric ranges. general lex and
+parse diagnostics land in the E24x block alongside the checker's, covered by
+the four codes below (the parser also emits `E264` for malformed `where`
+clauses and `E274` for malformed `guard` blocks):
 
 | code | phase | what it covers |
 |------|-------|----------------|
@@ -426,10 +427,14 @@ error[E233]: type nesting too deep
 
 the `fail` statement was used in a function that does not return a result type.
 
-### E235 — import cycle detected
+### E235 — import cycle or missing interface method
 
 two or more modules import each other, forming a cycle. break the cycle
 by restructuring the code or extracting shared types into a third module.
+
+the checker also emits `E235` when an `impl Interface for Type` block omits a
+required method declared by the interface (`impl of <Iface> for <Type> is
+missing method: <name>`).
 
 ### E236 — imported name not found
 
@@ -453,7 +458,7 @@ error[E237]: 'secret' is not public in the imported module
                        ^^^^^^
 ```
 
-**not currently emitted**, and there is no check behind it: `from mod import name` currently succeeds whether or not `name` is `pub`. only the `mod.name(...)` call form is gated, by `E251`.
+**not currently emitted**, and there is no check behind it: `from mod import name` currently succeeds whether or not `name` is `pub`. module-qualified access (`mod.name` / `mod.name(...)`), private struct fields outside their declaring module, and internal `byte_buffer_*` builtins are gated by `E251`.
 
 ### E238 — invalid unwrap context
 
@@ -582,6 +587,13 @@ one is refused when any implementing type reaches a collection outside a
 `guard` block, even if the value at hand holds a type that does not. the
 message names the type and field (`Bag.items`). a conversion written in the
 call (`spawn work(Sq(s: 2))`) is fresh and allowed.
+
+`std.bytes.ByteBuffer` and `ByteArray` count as collections under this rule,
+even though their handle is an `Int`. neither can be converted to an interface
+value (such as `io.BytesWriter`), because that would hide the buffer from these
+checks (`E248`). use `io.memory_writer()` when an in-memory `BytesWriter` needs
+to cross tasks or become an interface value, since its buffer sits behind a
+lock.
 
 these rules apply in a program that spawns, as E309 defines it. that includes
 a program whose only spawn is in a function it reaches through a function
@@ -723,15 +735,24 @@ error[E250]: 'Channel' is a builtin type name and cannot be used as a struct nam
                 ^
 ```
 
-### E251 — function is not public in that module
+### E251 — private item or internal builtin
 
 a module function declared with a bare `fn` belongs to the module that declared
-it; only a `pub fn` can be called through an import. the two live in one shared
-name table, so before this check the lookup for `mod.helper` would fall through
-to a bare-name match and return something the caller had no business holding.
+it; only a `pub fn` can be reached through an import (`mod.name` or
+`mod.name(...)`). the two live in one shared name table, so before this check
+the lookup for `mod.helper` would fall through to a bare-name match and return
+something the caller had no business holding.
 
-mark the function `pub` if it is meant to be part of the module's surface, or
-call the public entry point that wraps it.
+the same code refuses two other encapsulation violations:
+
+- reading, assigning, or constructing a struct field declared without `pub`
+  outside the module that declared the struct (`ByteArray(handle: 7)` or
+  `a.handle`), so code cannot copy or forge a private resource handle;
+- calling the raw-handle `byte_buffer_*` runtime builtins outside `std.bytes`,
+  which owns `ByteBuffer` and `ByteArray`.
+
+mark the function or field `pub` if it is meant to be part of the module's
+surface, or call the public entry point that wraps it.
 
 ```
 error[E251]: 'frame_message' is not public in module 'grpc'
@@ -1036,28 +1057,148 @@ error[E273]: 'm' is already held by an enclosing locked block, and locking it ag
 a module guard block holds only `mut` globals, and none of them may be `pub`,
 since another module could not take the mutex. a sharded guard,
 `guard m[n]:`, needs a count of at least 1 and is only allowed on module
-globals. a guard block is not allowed in a generic struct.
+globals. a guard block is not allowed in a generic struct, and a field inside a
+guard block cannot be `frozen` (a frozen field is immutable and needs no lock).
 
 ```
 error[E274]: a guarded global cannot be pub, since another module could not take its mutex
 error[E274]: a guard block holds only `mut` globals
 error[E274]: a sharded guard is only allowed on module globals
 error[E274]: a guard block is not allowed in a generic struct
+error[E274]: field 'x' cannot be both frozen and inside a guard block
+```
+
+### E275 — a frozen field is changed
+
+a field declared `frozen` is set when its struct is built and never changed
+after (see docs/ownership.md, "frozen fields"). reassigning it, assigning to
+one of its elements, or calling a method that changes it in place (`push`,
+`insert`, `remove` and the like) through a path that runs through it is
+refused. build a new struct with the changed value, or drop `frozen` and keep
+the field in a `guard` block.
+
+in a program that spawns tasks, a frozen field's value may not be changed
+through another name either: a local the value was copied into, a parameter
+it was passed as, or a value that holds it. nor may it be stored into a value
+a caller handed in, or go where the checker cannot follow it, such as a
+closure's argument.
+
+```
+error[E275]: 'rows' is frozen, and its value is changed in place through another name, while another task may be reading it
+  13 |     xs.push("main")
+           ^
+  fix: change a copy, or move the field into a `guard` block
+```
+
+```
+error[E275]: 'routes' is frozen, so it cannot be changed in place
+  8 |     r.routes.push("/admin")
+          ^
+  fix: build a new value with the change, or drop `frozen` and keep the field in a guard block
+```
+
+### E276 — a guarded value leaves its lock
+
+a guarded field or global holding a collection, or a struct that reaches one
+outside a guard block, is reached safely only while its mutex is held. inside
+`locked`, its value may not be stored in a variable declared outside the
+block, returned from the block, or captured by a closure made in the block:
+each keeps a handle to the buffer after the lock is released.
+
+it also may not be stored into a container that outlives the block. that is
+a list, map, set or struct reached through a local declared outside the
+block, a parameter, `self` or a global: `out.push(items)`, `m.insert(k,
+items)`, `box.f = items`, and the same with the value wrapped in a tuple, a
+struct or an optional. a call is judged by the callee's summary, which the
+sharing pass computes for each function over the whole program, so generic
+functions and interface methods are followed. passing a guarded
+value to a function that stores the parameter into another argument that
+outlives the block, or lets the parameter escape (into a global or code the
+checker cannot follow), is refused. so is passing it to a
+function value or a method on a type the checker cannot name, which may keep
+it. a call that only reads its argument keeps nothing and stays allowed:
+`len`, iteration, indexing, and a function that reads the list and returns a
+count.
+
+```
+error[E276]: this value holds the guarded global 'items', and 'keep' stores it in an argument that outlives the block, so the buffer is reached after the lock is released
+  22 |         keep(out, ident(items))
+                         ^
+  fix: copy what is needed inside the block
+```
+
+a name bound inside the block to a guarded value is guarded too, for the rest
+of the block: a local bound to it (`list := self.idle[key]`), a loop variable
+over it, an `if let` or `while let` binding of it, the result of a builtin
+accessor on it (`get`, `first`, `last`, `unwrap`, `unwrap_or`, `expect`,
+`value`, `values`), and the result of a function that returns one of its
+parameters when a guarded value is passed in. a value that holds a guarded
+buffer some other way, such as a struct a call builds around it, may not
+leave the block either. storing such a value back under the same guard
+(`rooms[name] = room`) is not an escape. a copy (`list.slice(0,
+list.len())`, or `copy_list` of a list whose elements hold no buffer) is a
+new buffer and may leave.
+
+a block that moves the value out and gives the field a new one, `out =
+self.items` then `self.items = []`, is a take and is allowed, since the guard
+no longer reaches the old buffer. so is reading an element and removing it
+in the same block (`v = xs[k]` then `xs.remove(k)`), and `take` on a guarded
+map. a value that never changes after it is built belongs in a `frozen`
+field instead of a guard.
+
+a value stored into a guarded collection is reached under the lock from then
+on, so nothing outside the lock may still hold it. it must be fresh or a
+moved local, as for a value handed to another task (see E248): built in the
+call, or a local the scope does not use again after the store. a parameter
+stored this way makes each call judge its argument the same way, so a pool's
+`release(conn)` refuses a caller that keeps using `conn`. a guarded field set
+when its struct is built, and a guarded global's initializer, are judged as
+stores. a value read under the same guard may be stored back; a guard that
+holds such a value may then hold one buffer twice, so a value taken out of it
+is not counted as fresh.
+
+```
+error[E276]: 'cache' is guarded, and this stores a value that shares a buffer with 'v', which this scope uses again, so the buffer is reached outside the lock
+  16 |         cache.push(v)
+                          ^
+  fix: store a copy, or build the value inside the block
+```
+
+the same applies to a guarded struct, optional, tuple or enum whose fields
+reach a counted field that some code reassigns (see E248). a task that writes
+that field under the lock frees the value the copy outside the block still
+reads.
+
+```
+error[E276]: 'item' is guarded, and this stores its value where it outlives the block, and its field 'name' is reassigned at app.pith:13, so a write under the lock frees the value read after the block
+  19 |         out = b.item
+                       ^
+  fix: copy what is needed inside the block, move 'name' into a `guard` block, or stop reassigning it once the value is built
+```
+
+```
+error[E276]: 'messages' is guarded, and this returns its value out of the block, so the buffer is reached after the lock is released
+  11 |         return inbox.messages
+                      ^
+  fix: copy what is needed inside the block, or declare the field `frozen` outside the guard block if it is never changed
 ```
 
 ---
 
-## lint errors (E3xx)
+## lint warnings and later checker errors (E3xx)
 
-reported by `pith lint`. all of them are warnings: `pith lint` reports them
-without failing a build.
+`E300`–`E308` and `E310`–`E312` are lint warnings reported by `pith lint`.
+`pith lint` exits non-zero when any warning is reported, though warnings do not
+block `pith build` or `pith run`. `E309` and `E313`–`E318` are hard checker
+errors emitted during `pith check` / `build` / `run` / `test` (`E309` is also
+reported by `pith lint`).
 
 ### E300 — snake_case required (warning)
 
 function names, variable names, and method names must use `snake_case`.
 
 ```
-error[E300]: function name 'GetUser' should be snake_case
+warning[E300]: function name 'GetUser' should be snake_case
   1 | fn GetUser():
        ^^^^^^^
 ```
@@ -1067,7 +1208,7 @@ error[E300]: function name 'GetUser' should be snake_case
 type names (structs, enums, interfaces, type aliases) must use `PascalCase`.
 
 ```
-error[E301]: struct name 'my_point' should be PascalCase
+warning[E301]: struct name 'my_point' should be PascalCase
   1 | struct my_point:
             ^^^^^^^^
 ```
@@ -1429,119 +1570,4 @@ error[E318]: `self` escapes drop: it is passed to 'remember', where it is passed
   26 |         self.remember()
                ^
   fix: use self only to read and write its fields and to call methods that do the same; copy out the field values that must outlive it
-```
-
-### E275 — a frozen field is changed
-
-a field declared `frozen` is set when its struct is built and never changed
-after (see docs/ownership.md, "frozen fields"). reassigning it, assigning to
-one of its elements, or calling a method that changes it in place (`push`,
-`insert`, `remove` and the like) through a path that runs through it is
-refused. build a new struct with the changed value, or drop `frozen` and keep
-the field in a `guard` block.
-
-in a program that spawns tasks, a frozen field's value may not be changed
-through another name either: a local the value was copied into, a parameter
-it was passed as, or a value that holds it. nor may it be stored into a value
-a caller handed in, or go where the checker cannot follow it, such as a
-closure's argument.
-
-```
-error[E275]: 'rows' is frozen, and its value is changed in place through another name, while another task may be reading it
-  13 |     xs.push("main")
-           ^
-  fix: change a copy, or move the field into a `guard` block
-```
-
-```
-error[E275]: 'routes' is frozen, so it cannot be changed in place
-  8 |     r.routes.push("/admin")
-          ^
-  fix: build a new value with the change, or drop `frozen` and keep the field in a guard block
-```
-
-### E276 — a guarded value leaves its lock
-
-a guarded field or global holding a collection, or a struct that reaches one
-outside a guard block, is reached safely only while its mutex is held. inside
-`locked`, its value may not be stored in a variable declared outside the
-block, returned from the block, or captured by a closure made in the block:
-each keeps a handle to the buffer after the lock is released.
-
-it also may not be stored into a container that outlives the block. that is
-a list, map, set or struct reached through a local declared outside the
-block, a parameter, `self` or a global: `out.push(items)`, `m.insert(k,
-items)`, `box.f = items`, and the same with the value wrapped in a tuple, a
-struct or an optional. a call is judged by the callee's summary, which the
-sharing pass computes for each function over the whole program, so generic
-functions and interface methods are followed. passing a guarded
-value to a function that stores the parameter into another argument that
-outlives the block, or lets the parameter escape (into a global or code the
-checker cannot follow), is refused. so is passing it to a
-function value or a method on a type the checker cannot name, which may keep
-it. a call that only reads its argument keeps nothing and stays allowed:
-`len`, iteration, indexing, and a function that reads the list and returns a
-count.
-
-```
-error[E276]: this value holds the guarded global 'items', and 'keep' stores it in an argument that outlives the block, so the buffer is reached after the lock is released
-  22 |         keep(out, ident(items))
-                         ^
-  fix: copy what is needed inside the block
-```
-
-a name bound inside the block to a guarded value is guarded too, for the rest
-of the block: a local bound to it (`list := self.idle[key]`), a loop variable
-over it, an `if let` or `while let` binding of it, the result of a builtin
-accessor on it (`get`, `first`, `last`, `unwrap`, `unwrap_or`, `expect`,
-`value`, `values`), and the result of a function that returns one of its
-parameters when a guarded value is passed in. a value that holds a guarded
-buffer some other way, such as a struct a call builds around it, may not
-leave the block either. storing such a value back under the same guard
-(`rooms[name] = room`) is not an escape. a copy (`list.slice(0,
-list.len())`, or `copy_list` of a list whose elements hold no buffer) is a
-new buffer and may leave.
-
-a block that moves the value out and gives the field a new one, `out =
-self.items` then `self.items = []`, is a take and is allowed, since the guard
-no longer reaches the old buffer. so is reading an element and removing it
-in the same block (`v = xs[k]` then `xs.remove(k)`), and `take` on a guarded
-map. a value that never changes after it is built belongs in a `frozen`
-field instead of a guard.
-
-a value stored into a guarded collection is reached under the lock from then
-on, so nothing outside the lock may still hold it. it must be fresh or a
-moved local, as for a value handed to another task (see E248): built in the
-call, or a local the scope does not use again after the store. a parameter
-stored this way makes each call judge its argument the same way, so a pool's
-`release(conn)` refuses a caller that keeps using `conn`. a guarded field set
-when its struct is built, and a guarded global's initializer, are judged as
-stores. a value read under the same guard may be stored back; a guard that
-holds such a value may then hold one buffer twice, so a value taken out of it
-is not counted as fresh.
-
-```
-error[E276]: 'cache' is guarded, and this stores a value that shares a buffer with 'v', which this scope uses again, so the buffer is reached outside the lock
-  16 |         cache.push(v)
-                          ^
-  fix: store a copy, or build the value inside the block
-```
-
-the same applies to a guarded struct, optional, tuple or enum whose fields
-reach a counted field that some code reassigns (see E248). a task that writes
-that field under the lock frees the value the copy outside the block still
-reads.
-
-```
-error[E276]: 'item' is guarded, and this stores its value where it outlives the block, and its field 'name' is reassigned at app.pith:13, so a write under the lock frees the value read after the block
-  19 |         out = b.item
-                       ^
-  fix: copy what is needed inside the block, move 'name' into a `guard` block, or stop reassigning it once the value is built
-```
-
-```
-error[E276]: 'messages' is guarded, and this returns its value out of the block, so the buffer is reached after the lock is released
-  11 |         return inbox.messages
-                      ^
-  fix: copy what is needed inside the block, or declare the field `frozen` outside the guard block if it is never changed
 ```

@@ -72,7 +72,10 @@ the command, an option the command defines with the same name or short name
 takes precedence over the app's.
 
 this layer is for small pith tools that want options, flags, subcommands, and
-help text without each tool reimplementing the same argument loop.
+help text without each tool reimplementing the same argument loop. it also
+supports posix short-flag clustering (`-fsSL`), attached short option values
+(`-XPOST`), repeatable `multi_option` flags (read with `cli.strings(parsed, name)`),
+`--no-<flag>` negations, and the `--` end-of-options separator.
 
 ## diagnostics
 
@@ -90,8 +93,8 @@ print(diagnostic.render(diag))
 print(diagnostic.render_json(diag))
 ```
 
-the structs stay simple on purpose: severity, message, optional span, and an
-optional fix string. that makes it useful for compiler-adjacent tools without
+the structs stay simple on purpose: severity, message, a `Span` (empty when
+absent), and a `Fix` (empty when absent). that makes it useful for compiler-adjacent tools without
 coupling every caller to compiler internals.
 
 ## editor wire protocol
@@ -102,6 +105,7 @@ over `std.json` handles. both are pure data-plane layers — no sockets, no
 tasks — so a server loop can be tested entirely with in-memory bytes.
 
 ```pith
+import std.bytes as bytes
 import std.lsp.transport as transport
 import std.lsp.protocol as protocol
 

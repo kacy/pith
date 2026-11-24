@@ -1,0 +1,86 @@
+# arithmetic on a narrow integer type stops the program when the result
+# leaves that type's range, like Int arithmetic does. the ir computes in 64
+# bits and checks the result against the range after each op, at every place
+# the result can land: an expression, a compound assignment to a local, a
+# field or a list element, and a loop accumulator. the wrapping methods keep
+# the old wrapped result on request.
+struct Pixel:
+    level: UInt8
+
+fn checksum(data: List[UInt8]) -> UInt8:
+    mut sum := UInt8(0)
+    for b in data:
+        sum = sum + b
+    return sum
+
+fn wrapping_checksum(data: List[UInt8]) -> UInt8:
+    mut sum := UInt8(0)
+    for b in data:
+        sum = sum.wrapping_add(b)
+    return sum
+
+fn neg(x: Int8) -> Int8:
+    return -x
+
+fn bump_local() -> Int:
+    mut n := UInt8(250)
+    n += UInt8(10)
+    return 0
+
+fn drop_local() -> Int:
+    mut m := Int8(-100)
+    m -= Int8(100)
+    return 0
+
+fn bump_field() -> Int:
+    mut p := Pixel(UInt8(250))
+    p.level += UInt8(9)
+    return 0
+
+fn bump_index() -> Int:
+    levels := [UInt8(255), UInt8(1)]
+    levels[0] += UInt8(2)
+    return 0
+
+fn report(label: String, failure: String):
+    print("{label}: {failure}")
+
+fn main() -> Int:
+    report("Int8 127 + 1", isolate_call(fn() -> Int => (Int8(127) + Int8(1)).to_string().len()))
+    report("UInt8 255 + 1", isolate_call(fn() -> Int => (UInt8(255) + UInt8(1)).to_string().len()))
+    report("UInt8 3 - 5", isolate_call(fn() -> Int => (UInt8(3) - UInt8(5)).to_string().len()))
+    report("Int16 32767 + 1", isolate_call(fn() -> Int => (Int16(32767) + Int16(1)).to_string().len()))
+    report("UInt16 0 - 1", isolate_call(fn() -> Int => (UInt16(0) - UInt16(1)).to_string().len()))
+    report("Int32 max * 2", isolate_call(fn() -> Int => (Int32(2147483647) * Int32(2)).to_string().len()))
+    report("UInt32 max + 1", isolate_call(fn() -> Int => (UInt32(4294967295) + UInt32(1)).to_string().len()))
+    report("Int8 -128 / -1", isolate_call(fn() -> Int => (Int8(-128) / Int8(-1)).to_string().len()))
+    report("negate Int8 -128", isolate_call(fn() -> Int => neg(Int8(-128)).to_string().len()))
+    report("compound +=", isolate_call(fn() -> Int => bump_local()))
+    report("compound -=", isolate_call(fn() -> Int => drop_local()))
+    report("field +=", isolate_call(fn() -> Int => bump_field()))
+    report("index +=", isolate_call(fn() -> Int => bump_index()))
+    report("checksum", isolate_call(fn() -> Int => checksum([UInt8(200), UInt8(100), UInt8(7)]).to_string().len()))
+
+    # results that stay in range are unchanged at every site
+    a := Int8(126) + Int8(1)
+    print("Int8 126 + 1 = {a}, equals 127: {a == Int8(127)}")
+    print("UInt8 3 - 3 = {UInt8(3) - UInt8(3)}, Int16 -32767 - 1 = {Int16(-32767) - Int16(1)}")
+    print("Int8 -127 / -1 = {Int8(-127) / Int8(-1)}, negate Int8 -127 = {neg(Int8(-127))}")
+    mut n := UInt8(250)
+    n += UInt8(5)
+    mut p := Pixel(UInt8(250))
+    p.level += UInt8(5)
+    levels := [UInt8(250), UInt8(1)]
+    levels[0] += UInt8(5)
+    print("compound {n}, field {p.level}, index {levels[0]}")
+    print("checksum {checksum([UInt8(200), UInt8(50), UInt8(5)])}")
+
+    # the wrapping methods give the wrapped result
+    print("Int8 127 wrapping_add 1 = {Int8(127).wrapping_add(Int8(1))}")
+    print("UInt8 3 wrapping_sub 5 = {UInt8(3).wrapping_sub(UInt8(5))}")
+    print("Int32 max wrapping_mul 2 = {Int32(2147483647).wrapping_mul(Int32(2))}")
+    print("wrapping checksum {wrapping_checksum([UInt8(200), UInt8(100), UInt8(7)])}")
+
+    # the 64-bit types are unchanged
+    print("Int {9223372036854775807 + 0}")
+    return 0

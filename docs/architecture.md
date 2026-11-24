@@ -14,7 +14,7 @@ the active pipeline is:
 3. type-check and resolve imports
 4. emit Pith text IR
 5. lower text IR to Cranelift IR
-6. emit an object file and link it with the Rust runtime using `gcc`
+6. emit an object file and link it with the Rust runtime using the system C compiler (`$CC`, defaulting to `cc`)
 
 end to end, that is:
 
@@ -25,7 +25,7 @@ pith source (.pith)
   -> ir_consumer.rs (text ir -> cranelift ir)
   -> cranelift native code generation
   -> object file (.o)
-  -> system linker (gcc)
+  -> system linker ($CC / cc)
   -> native executable
 ```
 
@@ -93,7 +93,7 @@ if a change only affects object output or linking, it belongs in `cranelift/`.
 
 ### add or change tls or protocol behavior
 
-- Pith stdlib protocol logic: `std/net/tls.pith`, `std/net/tls13.pith`, `std/net/http.pith`, `std/net/websocket.pith`
+- Pith stdlib protocol logic: `std/net/tls.pith`, `std/net/tls13.pith`, `std/net/tls12.pith`, `std/net/http.pith`, `std/net/http2/*.pith`, `std/net/grpc.pith`, `std/net/websocket.pith`
 - crypto helpers used by tls: `std/crypto/*.pith`
 - only add Rust runtime support when the stdlib truly needs a new low-level primitive
 
@@ -106,7 +106,9 @@ if a change only affects object output or linking, it belongs in `cranelift/`.
 
 - server loop and routing: `self-host/lsp_server.pith`
 - documents and position conversion: `self-host/lsp_state.pith`
-- diagnostics/hover/symbols/formatting: `self-host/lsp_features.pith`
+- diagnostics, hover, symbols, formatting, code actions: `self-host/lsp_features.pith`
+- definition, references, completion, rename: `self-host/lsp_navigation.pith`
+- semantic tokens, signature help, inlay hints: `self-host/lsp_tokens.pith`
 - framing and json-rpc envelope: `std/lsp/transport.pith`, `std/lsp/protocol.pith`
 
 ## mental model for new contributors

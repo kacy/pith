@@ -23,6 +23,8 @@ never stops the process on its own.
 | error | raised by |
 |---|---|
 | division by zero, integer division overflow, `.value()` on none (and integer overflow, code 7) | `pith_runtime_error(code)` in `runtime_core.rs`, called from the slow block the codegen emits beside a checked `div`/`mod` (`emit_checked_int_div_or_mod` in `ir_consumer.rs`) and from the none check |
+| integer overflow in `+`, `-`, `*`, a narrow-type op, an integer conversion or a shift count | the trap instruction the codegen emits on the overflow path, which the SIGILL handler in `overflow_trap.rs` turns into `pith_runtime_error(7)` |
+| integer overflow in `abs` and `Float.to_int`, and `to_int` on NaN | `pith_abs` and `pith_float_to_int` in `runtime_core.rs` |
 | `xs[i]` and `xs[i] = v` out of range | `strict_index_out_of_bounds` and `strict_store_out_of_bounds` in `collections/list.rs`. the codegen inlines the in-bounds case (`inline_list_get_value_strict`) and calls `pith_list_get_value_strict` and the strict stores only on the slow path |
 | `m[k]` on a missing key, and the fused `m[k] += n` | `strict_miss` in `collections/map.rs` |
 | `s[i]` and `b[i]` out of range | `pith_cstring_char_at_strict` in `string_list.rs`, `pith_bytes_get_strict` in `bytes.rs` (the latter also inlined, `inline_bytes_get_strict`) |

@@ -10,9 +10,9 @@ parsers that read untrusted bytes:
 | `hpack` | one `hpack.Decoder` across several header blocks |
 | `h2server` | `server.serve_h2c_connection` over loopback tcp |
 | `websocket` | `WebSocket.recv` over an in-memory reader (server side) |
-| `yaml`, `toml`, `json` | `parse` / `parse_all` and `decode_scalars` |
+| `yaml`, `toml`, `json` | `parse` / `parse_all` and `decode_scalars` / `decode_scalars_bytes` |
 | `protobuf` | a generic walk: every field by wire type, nested messages, packed varints |
-| `inflate`, `gzip`, `zstd` | the bounded decoders (`zstd` runs both the binding and `zstd_pure`) |
+| `inflate` (plus `zlib`), `gzip`, `zstd` | the bounded decoders (`zstd` runs both the binding and `zstd_pure`) |
 | `tar`, `zip` | `list` |
 | `regex`, `glob` | pattern and subject split at the first 0x01 byte |
 
@@ -44,7 +44,7 @@ hit does not bury the rest.
 ## running it
 
 ```
-make fuzz-surfaces-check                  # every target, 400 small inputs, fixed seed
+make fuzz-surfaces-check                  # every target, 300 small inputs, fixed seed
 make fuzz-surfaces FUZZ_MINUTES=30        # every target for 30 minutes, 4 at a time
 tools/fuzz-surfaces/run.sh --minutes 10 --jobs 2 yaml toml
 tools/fuzz-surfaces/run.sh --known DIR    # which oracle flags each DIR/<target>-*.bin
@@ -58,7 +58,7 @@ and `PITH_ASAN_CC` to a linker wrapper that adds rustc's asan runtime, then
 pass `--asan`:
 
 ```
-RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zsanitizer=address -Cforce-frame-pointers=yes" \
+RUSTC_BOOTSTRAP=1 RUSTFLAGS="-C relocation-model=pie -Zsanitizer=address -Cforce-frame-pointers=yes" \
   cargo build --release -p pith-runtime --target x86_64-unknown-linux-gnu --target-dir DIR
 PITH_ASAN_RUNTIME=DIR/x86_64-unknown-linux-gnu/release/libpith_runtime.a \
   PITH_ASAN_CC=cc-asan tools/fuzz-surfaces/run.sh --asan --minutes 10

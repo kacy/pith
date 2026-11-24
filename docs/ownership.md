@@ -666,9 +666,10 @@ gaps, all bounded leaks rather than dangling pointers:
   struct built over an unresolved type parameter (`Bag[<error>]`), whose
   defaults are stored into elsewhere (`check_untagged_stores` in
   `cranelift/codegen/src/count_check/`).
-- **a result or optional bound to a name can leak its payload.** `T!` and
-  `T?` lower to a three-slot value, and releasing one frees those slots
-  without dropping the payload they own. a local whose every use is a
+- **a result or optional bound to a name can leak its payload.** a boxed `T!`
+  lowers to a three-slot shell and `Some(v)` of `T?` lowers to a two-slot shell
+  (`none` is null); releasing a shell without a payload destructor frees those
+  slots without dropping the payload they own. a local whose every use is a
   probe (`.is_ok`, `.is_err`, `== none`), a payload read (`.ok`, `.err`),
   a `match` on an optional local, an argument of a call whose callee
   provably only reads the parameter, or — for a result — an
@@ -807,9 +808,11 @@ storage. a `ByteArray` frees its storage on drop as well. both keep their
 handle in a private field, and the `byte_buffer_*` builtins are callable only
 from `std.bytes`, so no copy or made-up number can reach the memory (E251).
 
-the io readers, writers and buffers, files, processes, byte arrays, ecdh
-key pairs and websocket sessions implement `Drop`; docs/io_foundation.md
-lists what each io type releases.
+the io readers, writers and buffers, files, processes, byte buffers and byte
+arrays, ecdh key pairs, tls configs/connections/listeners, http/http2/unix
+connections and streams, websocket sessions, and database handles implement
+`Drop`; docs/io_foundation.md lists what each io type releases, and
+docs/destructors_roadmap.md ("stage 2") lists the full set across std.
 
 `tests/cases/test_drop_hook` pins where the hook fires (scope exit, a
 rebind, a list or a struct field dying, a value returned to a caller),

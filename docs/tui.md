@@ -165,7 +165,7 @@ picked := items.selected()    # String? — none when empty
   offset + rows`, so the selection is always visible.
 - `table(headers, rows_data, body_rows)` sizes columns by display width —
   cjk cells pad to equal columns — fills ragged rows with empty cells,
-  and scrolls its body with the same keys.
+  and scrolls its body with `j`/`k`, arrows, and `home`/`end`.
 - `focus_ring(count)` tracks which pane is active: `next()`/`prev()`, and
   the application routes keys to the widget at `ring.active`.
 
@@ -182,9 +182,12 @@ picked := items.selected()    # String? — none when empty
   both scroll axes follow the cursor. deliberately not in v1: undo,
   selection, clipboard, soft-wrap, word motions, and mouse support.
 
-focus is a convention shared by the interactive widgets: `focus()` /
-`blur()` toggle whether `key()` responds and whether the cursor draws.
-a form is a `FocusRing` plus widgets, with tab cycling in `update`:
+focus is a convention shared by `ListView`, `Input`, and `TextArea`: `focus()` /
+`blur()` toggle `focused` to control whether the cursor or active highlight
+draws in `view()` (`TableView` exposes the `focused` field directly). `key()`
+does not ignore calls while blurred — the application routes keys only to the
+widget at `ring.active`. a form is a `FocusRing` plus widgets, with tab cycling
+in `update`:
 
 ```pith
 DemoMsg.Cycle =>

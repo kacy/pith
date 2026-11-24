@@ -181,7 +181,8 @@ impl Progress:
     # the bar at `ratio` full, clamped to 0..1.
     fn view(ratio: Float) -> String:
         mut r := ratio
-        if r < 0.0:
+        # a NaN ratio draws an empty bar
+        if not (r >= 0.0):
             r = 0.0
         if r > 1.0:
             r = 1.0

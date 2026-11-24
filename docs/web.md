@@ -238,7 +238,8 @@ fn stock(req: web.Request) -> http.HttpResponse:
 a `Map` whose key is not a `String`, and a `List` or a `Map` whose element is
 an optional, are refused at the checker (`docs/limitations.md`); decode such a
 document through `json.parse` and the node accessors instead. a document
-nested deeper than 128 levels is refused, as `json.parse` refuses it.
+whose arrays and objects nest 128 levels deep or more is refused, as
+`json.parse` refuses it; 127 levels is the deepest that decodes.
 
 going the other way, build the response body with the `std.json` constructors and
 send it with `http.json`:
@@ -647,6 +648,13 @@ attempt expensive; the limiter is what bounds how many are made:
 app = app.group("/login", web.rate_limit(resilience.rate_limiter(5, 10)))
 ```
 
+this limiter is one bucket for every caller. it bounds the total cost of
+login attempts, but one client sending as fast as it can spends the whole
+budget, and everyone else's sign-in gets a 429 until the bucket refills.
+`web.rate_limit` has no per-client mode. to limit each client separately,
+keep a limiter per `req.peer_ip()` in your own middleware and bound how many
+it holds, or put a proxy that limits by address in front of the app.
+
 `examples/web_login.pith` runs the whole stack end to end: the login page
 with its csrf token, a wrong password, a right one, the rotation, the
 protected page, three ways of faking the cookie, and a sign-out.
@@ -703,10 +711,23 @@ convenience and the session is the authority: the comparison is always
 against what the store holds, so a cookie the attacker planted alongside a
 matching header matches nothing.
 
-`SameSite=Lax` on the session cookie — the default in `std.web.session` —
-turns away most of this on its own. the token is the layer underneath, for
-what it does not cover: a top-level POST from another site, a browser that
-ignores `SameSite`, and a session deliberately set to `SameSite=None`.
+`SameSite=Lax` on the session cookie, the default in `std.web.session`,
+turns away most of this on its own: a browser that honors it leaves the
+cookie off a POST, a fetch, or a form that another site starts. the token
+covers what `Lax` does not:
+
+- a sibling subdomain. `SameSite` compares sites, and `evil.example.com` is
+  the same site as `app.example.com`, so a page on any subdomain you do not
+  control gets the cookie attached.
+- a `GET` that changes state. `Lax` sends the cookie on a top-level
+  navigation from another site, and the middleware lets `GET` through, so
+  keep every change behind `POST`, `PUT`, `PATCH` or `DELETE`.
+- a browser that ignores `SameSite`, and a session deliberately set to
+  `SameSite=None`.
+- chrome's grace period for a cookie set with no `SameSite` attribute: for
+  its first two minutes, a cross-site top-level POST still carries it.
+  `std.web.session` always sets the attribute, so this applies only to a
+  cookie written some other way.
 
 a urlencoded body larger than 64 KiB is not scanned for the token, because
 splitting a ten megabyte body on `&` to find one field is work an attacker
@@ -989,10 +1010,10 @@ the 503 is best-effort. closing a socket that still holds unread data resets it
 rather than finishing it cleanly, and a client that gets a reset drops what it had
 buffered — so a peer that had already sent its request, which is most of them when
 a cap is firing, sees a connection error instead of the status line. draining the
-request first is what would fix that, and it cannot be done without a read that
-has no deadline under the green runtime, which would park the accept loop for
-good. so treat the refusal metric as the signal and the 503 as a courtesy to the
-clients that happen to be waiting.
+request first is what would fix that, and even a bounded read would hold the
+accept loop for up to its deadline against every silent peer, breaking the
+property that the accept loop never waits. so treat the refusal metric as the
+signal and the 503 as a courtesy to the clients that happen to be waiting.
 
 this is deliberately not what the http/2 server does, which waits for a
 connection to end before accepting another. the difference is the protocol. an
@@ -1034,6 +1055,7 @@ and `listen_tls` serve. `web.server_config()` is the default:
 | `read_header_timeout_ms` | 5000 | the whole request head, from its first byte |
 | `idle_timeout_ms` | 5000 | a keep-alive connection's wait for its next request |
 | `read_timeout_ms` | off | the head and the body together |
+| `read_body_timeout_ms` | 60000 | the body, from the end of the request head |
 | `write_timeout_ms` | off | the response, from the end of the request head |
 | `max_header_bytes` | `http.MAX_HEADER_BYTES` (64 kb) | the request head |
 | `max_body_bytes` | `http.MAX_REQUEST_BODY` (10 mb) | the request body |
@@ -1046,11 +1068,16 @@ past `max_connections`, a new connection is refused with a 503.
 net/http turns every timeout off by default, and a server built that way can be
 held open by a client that sends one byte of its head every few seconds. the
 read-header timeout here is a deadline on the socket, so the head has 5 s in
-total however the bytes are spaced. the body has no total limit by
-default, so a large upload over a slow link still finishes, but every read must
-make progress within 5 s, or within the longest read timeout the config sets
-when that is longer. a config with no read timeouts at all turns that bound off
-too.
+total however the bytes are spaced. the body has 60 s in total from the end of
+the head, whether it is sized, chunked, or streamed to the handler through
+`http.read_body_part`. without that total, a client that sends one body byte
+every few seconds would hold its connection slot indefinitely, and 512 such
+clients would fill `max_connections`. 60 s carries the default 10 mb body at about 170 kb/s; an
+app that takes larger or slower uploads raises it with
+`with_read_body_timeout(ms)`, and 0 turns it off. every read must also make
+progress within 5 s, or within the longest of `read_timeout_ms`,
+`read_header_timeout_ms` and `idle_timeout_ms` when that is longer. a config
+with no read timeouts at all turns that bound off too.
 
 change any of it with `with_config`:
 
@@ -1063,7 +1090,9 @@ app := web.new().with_config(config).get("/", home)
 ```
 
 a request that runs out of time after its first byte gets `408 Request Timeout`
-and the connection closes. a connection that times out before sending anything,
+and the connection closes. a handler reading a streamed body sees the body
+deadline as a `read_body_part` failure equal to `http.BODY_TIMEOUT_MESSAGE`,
+and should answer 408 itself. a connection that times out before sending anything,
 or that sits idle between requests, is closed with no response, as net/http
 does. a response that runs out of write time is cut off and the connection
 closes. the config does not apply to http/2 (`listen_h2c`, or a `listen_tls`
@@ -1096,6 +1125,28 @@ app.listen_tls("0.0.0.0", 8443, "cert.pem", "key.pem")!
 key. h2c needs neither, which makes it the easy choice behind a load balancer
 that terminates tls. reach for `listen_tls` when the pith server terminates tls
 itself.
+
+### http/2 limits
+
+an http/2 connection is served by `std.net.http2.server`, with fixed limits of
+its own in place of the `ServerConfig` above:
+
+| limit | value | past it |
+| --- | --- | --- |
+| concurrent streams per connection | 128, advertised in `SETTINGS` | a new stream is refused with `RST_STREAM` `REFUSED_STREAM` |
+| header fields per request | 100 | the stream is reset with `ENHANCE_YOUR_CALM` |
+| decoded header list per request | 64 kb, names plus values | the stream is reset with `ENHANCE_YOUR_CALM` |
+| compressed header block | 80 kb, `HEADERS` plus `CONTINUATION` | the connection ends with `GOAWAY` |
+| `CONTINUATION` frames per header block | 64 | the connection ends with `GOAWAY` |
+| request body | `http.MAX_REQUEST_BODY` (10 mb) | the stream is reset with `ENHANCE_YOUR_CALM` |
+| outbound frame queue per connection | 256 | handlers and the reader wait for the writer |
+| connections, across every http/2 listener in the process | 512 | the accept loop waits for one to finish |
+| socket inactivity | 120 s | the connection is dropped |
+
+a stream counts against the 128 until its handler returns, including after
+the client resets it. a client that opens and immediately resets streams (the
+rapid reset attack) cannot keep more than 128 handlers running on one
+connection, and every stream past that is refused with `REFUSED_STREAM`.
 
 ## graceful shutdown
 
@@ -1153,8 +1204,8 @@ fn greet(req: web.Request) -> http.HttpResponse:
 ```
 
 for a whole page rather than a fragment, `std.template` renders from a context
-and escapes every interpolated value on the way out, so the safe thing is what
-happens when you do not think about it:
+and escapes every interpolated value for where it lands in the page, so the
+safe thing is what happens when you do not think about it:
 
 ```pith
 import std.template as template
@@ -1167,8 +1218,21 @@ fn greet(req: web.Request) -> http.HttpResponse:
 a page served per request should be `compile`d once at startup rather than on
 every call, so that a syntax error is a failure to boot instead of a 500.
 
+a `<%= %>` in element text or a quoted attribute is html-escaped. one in an
+unquoted attribute has every character that could end the attribute turned
+into an entity. one in a url attribute such as `href` or `src` is checked with
+`html.safe_url` first, so `javascript:`, `data:` and `//other.host` become
+`about:blank`. compile refuses a `<%= %>` where escaping cannot help: inside
+`<script>` or `<style>`, in an `on...` event handler, `style` or `srcdoc`
+attribute, or in a tag or attribute name.
+
 [docs/html.md](html.md) is the full account of both: the five characters, why
 there is no separate attribute escaper, why a url in an `href` needs
-`html.escape_url` rather than `html.escape`, the contexts — inside `<script>`,
-inside `<style>`, an unquoted attribute — where escaping is not the fix, and
-the template syntax with its one greppable opt-out.
+`html.escape_url` when you build the page by hand, the contexts where escaping
+is not the fix, and the template syntax with its one greppable opt-out.
+
+to send a browser to a destination the request named, such as a `next`
+parameter after login, use `web.local_redirect(target, fallback)`. it answers
+303 to `target` only when `web.is_local_path` accepts it as a path on this
+site (one leading `/`, not `//` or `/\`, no control characters), and to
+`fallback` otherwise.

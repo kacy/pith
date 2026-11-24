@@ -22,11 +22,12 @@ pub fn xor(left: Int, right: Int) -> Int:
 pub fn invert(value: Int) -> Int:
     return bit_not(value)
 
-# shift left.
+# shift left. bits shifted past the top are lost, and an amount outside 0 to
+# 63 stops the program.
 pub fn shl(value: Int, amount: Int) -> Int:
     return bit_shl(value, amount)
 
-# shift right with zero fill.
+# shift right with zero fill. an amount outside 0 to 63 stops the program.
 pub fn shr(value: Int, amount: Int) -> Int:
     return bit_shr(value, amount)
 
@@ -86,8 +87,8 @@ test "bit masks keep the low bits":
 
 test "addition helpers wrap unsigned widths":
     assert_eq(add32(4294967295, 1), 0)
-    assert_eq(UInt64(add64(-1, 1)).to_string(), "0")
-    assert_eq(UInt64(add64(9223372036854775807, 1)).to_string(), "9223372036854775808")
+    assert_eq(add64(-1, 1).wrapping_uint64().to_string(), "0")
+    assert_eq(add64(9223372036854775807, 1).wrapping_uint64().to_string(), "9223372036854775808")
 
 test "rotations stay inside 32 bits":
     assert_eq(rotl32(1, 4), 16)
@@ -104,17 +105,27 @@ test "rotations stay inside 32 bits":
 test "rotations stay inside 64 bits":
     assert_eq(rotl64(1, 8), 256)
     assert_eq(rotr64(256, 8), 1)
-    assert_eq(UInt64(rotl64(1, 63)).to_string(), "9223372036854775808")
-    assert_eq(UInt64(rotr64(1, 1)).to_string(), "9223372036854775808")
-    assert_eq(UInt64(rotl64(-1, 17)).to_string(), "18446744073709551615")
+    assert_eq(rotl64(1, 63).wrapping_uint64().to_string(), "9223372036854775808")
+    assert_eq(rotr64(1, 1).wrapping_uint64().to_string(), "9223372036854775808")
+    assert_eq(rotl64(-1, 17).wrapping_uint64().to_string(), "18446744073709551615")
     assert_eq(rotl64(1, 64), 1)
     assert_eq(rotr64(2, 65), 1)
 
-test "fixed width integer constructors wrap values":
-    assert_eq(UInt8(257).to_string(), "1")
-    assert_eq(UInt16(65537).to_string(), "1")
+test "fixed width integer constructors keep values that fit":
+    assert_eq(UInt8(255).to_string(), "255")
+    assert_eq(UInt16(65535).to_string(), "65535")
     assert_eq(UInt32(4294967295).to_string(), "4294967295")
-    assert_eq(UInt64(-1).to_string(), "18446744073709551615")
-    assert_eq(Int8(255).to_string(), "-1")
-    assert_eq(Int16(65535).to_string(), "-1")
-    assert_eq(Int32(4294967295).to_string(), "-1")
+    assert_eq(UInt64(9223372036854775807).to_string(), "9223372036854775807")
+    assert_eq(Int8(-128).to_string(), "-128")
+    assert_eq(Int16(32767).to_string(), "32767")
+    assert_eq(Int32(-2147483648).to_string(), "-2147483648")
+
+test "wrapping conversions keep the low bits":
+    assert_eq((257).wrapping_uint8().to_string(), "1")
+    assert_eq((65537).wrapping_uint16().to_string(), "1")
+    assert_eq((-1).wrapping_uint32().to_string(), "4294967295")
+    assert_eq((-1).wrapping_uint64().to_string(), "18446744073709551615")
+    assert_eq((-1).wrapping_uint().to_string(), "18446744073709551615")
+    assert_eq((255).wrapping_int8().to_string(), "-1")
+    assert_eq((65535).wrapping_int16().to_string(), "-1")
+    assert_eq((4294967295).wrapping_int32().to_string(), "-1")

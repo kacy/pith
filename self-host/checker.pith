@@ -7131,6 +7131,14 @@ fn check_result_method_call(method: String, info: TypeInfo, args: List[Int], sco
 # primitive methods
 # ---------------------------------------------------------------
 
+# the type a wrapping conversion method converts to (`wrapping_uint8` gives
+# "UInt8"), or "" for any other name.
+pub fn wrapping_conversion_target(method: String) -> String:
+    for name in ["Int8", "Int16", "Int32", "UInt8", "UInt16", "UInt32", "UInt", "UInt64"]:
+        if method == "wrapping_" + name.to_lower():
+            return name
+    return ""
+
 fn check_int_method_call(method: String, recv_tid: Int, args: List[Int], scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     tid_float := lookup_type_id("Float")
@@ -7146,6 +7154,12 @@ fn check_int_method_call(method: String, recv_tid: Int, args: List[Int], scope_i
     if method == "wrapping_add" or method == "wrapping_sub" or method == "wrapping_mul":
         expect_one_typed_argument(method, args, recv_tid, scope_id)
         return recv_tid
+    # `UInt8(x)` and the other conversions stop the program when x does not
+    # fit. these keep the low bits of the two's complement value instead.
+    target := wrapping_conversion_target(method)
+    if target.len() > 0:
+        expect_no_arguments(method, args)
+        return lookup_type_id(target)
     report_error("E209", "Int has no method '" + method + "'")
     return TID_ERR
 

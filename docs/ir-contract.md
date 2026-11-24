@@ -18,9 +18,12 @@ dispatches on the first token. blank lines are ignored.
 
 there are two kinds of line: **declarations** that set up the module (strings,
 functions, structs, globals) and **instructions** that make up a function body.
-the consumer reads the whole file twice — once to declare every function and
-piece of data so calls can resolve regardless of order, then again to compile
-each function body.
+the consumer reads the whole file in two passes — once to declare every
+function and piece of data so calls can resolve regardless of order, then again
+to compile each function body. when a `main` function is present, a reachability
+pass runs before pass 1 so only live functions, live globals, live cycle-collector
+tracer registrations, and deduplicated live string literals are declared and
+compiled.
 
 values inside a body live in **registers**, written as bare integers (`1`, `2`,
 `8`). a register is assigned once by the instruction that produces it and read by
@@ -85,14 +88,17 @@ uaddc|usubc|umulc REG A B     the same for UInt and UInt64, against the unsigned
 fadd|fsub|fmul|fdiv REG A B   float op on two float registers.
 ```
 
-`add|sub|mul|div` (and the checked forms) also lower as float ops when both operands are float registers —
-the consumer tracks which registers hold floats and picks the instruction class
-accordingly.
+`add|sub|mul|div` (and the checked forms) also lower as float ops when either
+operand is a float register — the consumer tracks which registers hold floats
+and picks the instruction class accordingly. `add` on two string registers
+lowers to `pith_concat_cstr`.
 
 **bitwise and logical**
 
 ```
-band|bor|bxor|shl|shr REG A B    bitwise ops.
+band|bor|bxor|shl|shr REG A B    bitwise ops. a shl or shr count outside 0
+                                 to 63 stops the program with the
+                                 integer-overflow runtime error.
 bnot REG A                       bitwise complement.
 and|or REG A B                   lowered as bitwise band/bor (operands are 0/1).
 ```
@@ -101,8 +107,11 @@ and|or REG A B                   lowered as bitwise band/bor (operands are 0/1).
 
 ```
 eq|neq|lt|gt|lte|gte REG A B     result is 0 or 1. dispatches on operand kind:
-                                 integers compare directly, floats via FloatCC,
-                                 strings via the pith_cstring_* runtime helpers.
+                                 integers compare directly, floats via FloatCC;
+                                 ordered comparisons (`lt|gt|lte|gte`) dispatch
+                                 strings via the pith_cstring_* runtime helpers
+                                 (`eq`/`neq` compare raw words; string equality
+                                 is emitted as an explicit `__str_eq` call).
 ```
 
 ```
@@ -125,8 +134,9 @@ appendn REG COUNT BASE PART...   REG = BASE with the COUNT parts appended; the
 ```
 
 the emitter writes only `concat`. `concatn` and `appendn` are made inside the
-consumer, by `fuse_concat_chains` and `fuse_self_appends`, from a chain of
-`concat`s whose intermediate results nothing else reads.
+consumer, by `fuse_concat_chains`, `fuse_self_appends`, and `fuse_int_parts`,
+from a chain of `concat`s (and adjacent `int_to_string` calls) whose
+intermediate results nothing else reads.
 
 **optionals**
 
@@ -264,7 +274,7 @@ refuses a runtime function without a row there.
 (`cranelift/codegen/src/count_check.rs`) on the marked ir before the
 backend drops the marks. it prints, on stderr, how many functions balance,
 how many don't, and how many it couldn't settle, with each unbalanced
-function and the instruction that made the count in question. it checks two
+function and the instruction that made the count in question. it checks three
 rules:
 
 - balance: on every path, each count a function takes is given up exactly
@@ -274,6 +284,9 @@ rules:
   as `clear` or `pop`, a store into the same storage, or a call into a
   function that writes it. a call the checker knows nothing about counts as
   a write.
+- untagged stores: a counted value is not stored into an untagged container
+  (which cannot release it on teardown), and no struct is instantiated over an
+  `<error>` placeholder type.
 
 `PITH_CHECK_COUNTS=2` adds the join details and the names of the balanced
 functions. `PITH_CHECK_COUNTS=only` reports and stops before code
@@ -344,7 +357,9 @@ global's init kind:
 | `float` | a float, bitcast through an i64 register |
 | `string` | a heap or literal c-string pointer |
 | `bytes` | a byte buffer pointer |
-| `list`, `map`, `set` | a collection handle |
+| `list`, `list_string`, `map`, `map_int`, `set`, `set_int` | a collection handle (with specialized element/key flavors) |
+| `channel`, `task` | a concurrency channel or task handle |
+| `opaque:NAME` | a runtime opaque handle (such as `opaque:Mutex`, `opaque:WaitGroup`, `opaque:Semaphore`) |
 | `struct` | a struct pointer of unspecified type |
 | `struct:NAME` | a struct pointer known to be of type NAME |
 | `tuple` | a tuple (a struct-shaped allocation) |
@@ -517,8 +532,10 @@ names the function and the offending line. these are covered by tests in
 - a `brif` or `jmp` to a label that does not exist
 - a malformed `store`, `call`, or `field`
 - a register reference that was never assigned, or a non-numeric register token
+- a `func` whose name collides with a runtime declaration
 - a `call` whose retkind promises a value when the callee returns nothing. every
-  ir-declared function returns an i64, so this can only mean the emitter's idea
+  ir-declared function returns a value (one i64, or a two-value register pair),
+  so this can only mean the emitter's idea
   of a runtime call disagrees with `runtime_functions.txt`. before the check,
   the destination register got a zero nobody wrote
 
@@ -546,7 +563,6 @@ tightening targets, not settled behavior:
 
 - an **unknown declaration** in the first pass is silently ignored rather than
   rejected.
-- a `func` whose name collides with a runtime declaration is silently skipped.
 - if `pith_struct_alloc` is somehow absent, a struct construction falls back to a
   zero register instead of failing.
 - a `strref` naming no string reads as a null string instead of failing,

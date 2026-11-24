@@ -25,9 +25,9 @@ call counts.
 ## what it measures
 
 throughput (calls/sec over a batch) is the common metric — all three compute it
-the same way, total calls over wall time. pith has only millisecond wall-clock
-resolution, so it reports throughput and an average latency; the go and rust
-clients also print per-call median and p99 as extra detail.
+the same way, total calls over wall time. all three clients also time each call
+with a monotonic clock (`time.mono_nanos()` in pith) and print per-call median
+and p99 alongside throughput.
 
 ## the proto
 

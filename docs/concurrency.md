@@ -357,8 +357,8 @@ shards. holding any element of the list reaches the data under it, since the
 checker does not track which index is which.
 
 `rooms_mu.lock()` and `rooms_mu.unlock()` are still there for a lock that
-has to be released partway through and taken again, as `std.crypto.jwks`
-does around a key fetch. `locked` is a keyword only at the head of a block,
+has to be released partway through or held across a call boundary. `locked` is
+a keyword only at the head of a block,
 so a variable named `locked` still works.
 
 `examples/room_registry.pith` is this worked through: a registry several
@@ -477,8 +477,9 @@ things that are still intentionally explicit or still growing:
 
 - task cancellation is cooperative, not forceful
 - plain file io still does not have `_ctx` variants
-- sharing a mutable collection across tasks is a data race (above);
-  use channels
+- mutable collections are not thread-safe and the compiler refuses sharing
+  them across tasks (`E248`, `E276`, `E309`); use channels, `frozen` fields,
+  or `guard` blocks
 
 ## the green backend
 
@@ -537,8 +538,8 @@ from a median of 97 ms, landing anywhere between 70 and 130 ms, to a flat
 400 ms, and `cpu_parallel_sync` went from 921 to 658 ms. `PITH_GREEN_MIGRATE=0` turns the
 first rule off, so a task stays on the first worker that runs it. moving a
 task is safe because the runtime is built so that a suspended task carries
-nothing tied to the thread it parked on (see the placement note in
-`docs/limitations.md`).
+nothing tied to the thread it parked on (`make check-tls-barriers` checks this
+on every build).
 
 a read deadline survives that translation. `tcp.set_timeout` stores the deadline
 on the socket itself, and the reactor wait is bounded by it: a read that reaches
@@ -590,7 +591,7 @@ nothing in your program changes. the same `spawn`, `Channel`, `Mutex`, and
 both ways. `PITH_GREEN` picks one explicitly: `1`, `on`, or `true` forces
 green, `0`, `off`, or `false` forces os threads, and anything else — including
 leaving it unset — takes the platform default, which is green on linux and os
-threads everywhere else. the two green examples in this repo run identically
+threads everywhere else. examples like `worker_pool.pith` run identically
 whichever way you set it:
 
 ```
@@ -637,9 +638,9 @@ fire-and-forget `spawn f()` whose handle you never keep: a discarded spawn is
 detached at the spawn site, and a handle a function leaves unawaited in a
 local is detached when the function returns, so its slot is reclaimed when the body finishes
 rather than pinned until the process exits. a fan-out of 500k short tasks
-holds around 3 mb, flat no matter how many run in total — see the green fan-out row in `docs/performance.md`. (an awaited task on
-the os-thread backend still keeps its record until you read the result;
-teaching that path the same reclamation is the next step.)
+holds around 3 mb, flat no matter how many run in total — see the green
+fan-out row in `docs/performance.md`. (the os-thread backend reclaims finished
+tasks on `await` or `detach` under the same policy.)
 
 ### which backend to use
 

@@ -528,7 +528,14 @@ fn fetch(jwks_url: String, wait_ms: Int, limit: Int) -> String!:
     if target.query.len() > 0:
         request_path = request_path + "?" + target.query
 
-    resp := send_jwks_request(target, request_path, wait_ms, limit)!
+    # the client stops reading at limit + 1 bytes, so its size error means the
+    # body is over the cap. report it in the same words as the check below.
+    sent := send_jwks_request(target, request_path, wait_ms, limit)
+    if sent.is_err:
+        if sent.err.contains("exceeds"):
+            fail "the jwks endpoint answered with a body over the " + limit.to_string() + " byte cap"
+        fail sent.err
+    resp := sent.ok
     if resp.status != 200:
         fail "the jwks endpoint answered " + resp.status.to_string()
     body := resp.body_bytes()

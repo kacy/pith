@@ -130,18 +130,18 @@ pub fn semantic_tokens_full(uri: String) -> Int:
     mut e_types: List[Int] := []
     mut lexed_lines: Map[Int, Bool] := {}
     for tok in lex_all(text):
-        line0 := tok.current_line - 1
+        line0 := tok.line - 1
         if line0 < 0 or line0 >= lines.len():
             continue
         if tok.kind != "eof":
             lexed_lines.insert(line0, true)
         if tok.len <= 0 or tok.value.len() == 0:
             continue
-        type_idx := classify_token(tok.kind, tok.value, lines[line0], tok.current_column, tok.len)
+        type_idx := classify_token(tok.kind, tok.value, lines[line0], tok.column, tok.len)
         if type_idx < 0:
             continue
-        e_lines.push(tok.current_line)
-        e_cols.push(tok.current_column)
+        e_lines.push(tok.line)
+        e_cols.push(tok.column)
         e_lens.push(tok.len)
         e_types.push(type_idx)
 

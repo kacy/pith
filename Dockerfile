@@ -6,9 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc make && \
 WORKDIR /src
 COPY . .
 
-RUN cargo build --release && \
-    ./target/release/pith build self-host/pith_main.pith && \
-    ./target/release/pith build self-host/ir_driver.pith
+RUN cargo build --release --locked && \
+    ./target/release/pith build self-host/ir_driver.pith && \
+    ./target/release/pith build self-host/pith_main.pith
 
 # ---
 
@@ -25,6 +25,7 @@ COPY --from=builder /src/self-host/pith_main /opt/pith/self-host/pith_main
 COPY --from=builder /src/self-host/ir_driver /opt/pith/self-host/ir_driver
 COPY --from=builder /src/std /opt/pith/std
 
+ENV PITH_HOME=/opt/pith
 ENV PITH_RUNTIME_LIB=/usr/local/lib/pith/libpith_runtime.a
 ENV PITH_SELF_HOST=/opt/pith/self-host/pith_main
 ENV PITH_IR_DRIVER=/opt/pith/self-host/ir_driver

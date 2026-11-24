@@ -1,0 +1,2884 @@
+# std.markdown - commonmark to html, safe by default
+#
+# a commonmark 0.31.2 parser with an html renderer. the defaults are chosen for
+# the case that matters most, rendering text someone else wrote:
+#
+#   import std.markdown as markdown
+#
+#   markdown.to_html("# hello\n\n*world* <script>x</script>")
+#   # "<h1>hello</h1>\n<p><em>world</em> &lt;script&gt;x&lt;/script&gt;</p>\n"
+#
+# ## what is safe by default
+#
+#   - raw html, in a block or inline, is escaped and shown as text. pass
+#     `options().allow_html(true)` only for text you would paste into the page
+#     yourself.
+#   - every link and image destination is checked with `html.safe_url` after
+#     its entities and backslash escapes are decoded, so `javascript&colon;`
+#     and `java&#x09;script:` are refused the same as `javascript:`. a refused
+#     destination becomes the empty string, so the link renders as `href=""`.
+#     `data:` urls are refused for images as well as links. the check runs
+#     when the events are produced, so a renderer written against `events`
+#     never sees a refused url either.
+#   - all text and attribute values are escaped with `html.escape` semantics.
+#
+# ## the api
+#
+#   markdown.to_html(text)                     safe defaults
+#   markdown.render(text, opts)                html with chosen options
+#   markdown.events(text, opts)                an iterator of `Event` values
+#   markdown.render_with(text, opts, r)        drive any `Renderer`
+#
+# `events` yields `Start(tag)` and `End(tag)` around containers, and `Text`,
+# `Code`, `Html`, `InlineHtml`, `SoftBreak`, `HardBreak` and `Rule` for the
+# rest. adjacent text arrives as one `Text`. paragraphs directly inside the
+# items of a tight list produce no `Start(Paragraph)`/`End(Paragraph)`, the
+# same choice the html renderer needs.
+#
+# ## limits
+#
+# parsing is linear in the input on every input. the emphasis, link and code
+# span algorithms are the bounded ones from the commonmark spec's appendix and
+# from cmark, and the cases that are quadratic in a naive parser have tests in
+# tests/cases/test_markdown_linear.pith. block quotes and list items nest at
+# most MAX_NESTING deep; a marker past that depth is ordinary text. the walk
+# that produces events uses no recursion, so deep emphasis or link nesting
+# cannot exhaust the stack.
+#
+# the output is linear in the input too: every construct writes a bounded
+# amount of markup per input byte, except a reference link, which repeats its
+# definition's destination and title. those copies are budgeted, as cmark does:
+# once they add up to the input size (or 100 KB, whichever is larger), further
+# references render as the text they were written as.
+
+import std.html as html
+import std.text as text
+import std.text.tables as packed
+import std.markdown.tables as tables
+from std.iter import Iterator
+
+# how deeply block quotes and list items may nest. a `>` or list marker that
+# would open a container past this depth is read as text instead. every line
+# walks the open containers, so this is also what keeps a document of blank
+# lines under a deep list linear.
+pub MAX_NESTING := 32
+
+# how deeply parentheses may nest inside an inline link destination, as in
+# cmark. this bounds how far a failed destination scan can reach, which keeps
+# `[a](b` repeated linear.
+MAX_LINK_PARENS := 32
+
+# the most characters a link label may hold between its brackets.
+MAX_LABEL_BYTES := 999
+
+# the reference expansion budget is the input size, but never less than this.
+MIN_REFERENCE_BUDGET := 100000
+
+# byte classes, indexed by byte value. a '1' marks a member.
+#
+# INLINE_SPECIAL: the bytes the inline parser stops a text run at.
+INLINE_SPECIAL := "0000000000100000000000000000000001000010001000000000000000001000000000000000000000000000000111011000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# HTML_SPECIAL: the bytes html.escape rewrites.
+HTML_SPECIAL := "0000000000000000000000000000000000100011000000000000000000001010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# HREF_SAFE: the bytes a destination keeps as they are in an href; every other
+# byte is percent-encoded, except `&` and `'`, which become entities. this is
+# cmark's table, so the output matches the spec's.
+HREF_SAFE := "0000000000000000000000000000000001011100111111111111111111110101111111111111111111111111111000010111111111111111111111111110001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+# ---------------------------------------------------------------
+# options
+# ---------------------------------------------------------------
+
+# How a document is parsed and rendered. Build one with `options()` and the
+# builder methods; each method returns a changed copy and leaves the receiver
+# alone, so a shared base can be specialized safely.
+pub struct Options:
+    raw_html: Bool = false
+    unsafe_urls: Bool = false
+    gfm_extensions: Bool = true
+    heading_anchor_ids: Bool = false
+
+# The safe defaults: raw html escaped, unsafe urls refused, gfm on.
+pub fn options() -> Options:
+    return Options()
+
+impl Options:
+    # A copy that passes raw html through when `allow` is true. only for text
+    # you trust as much as your own templates.
+    fn allow_html(allow: Bool) -> Options:
+        copy := self.copy()
+        copy.raw_html = allow
+        return copy
+
+    # A copy that skips the `html.safe_url` check on destinations when `allow`
+    # is true. the conformance tests need it for schemes such as `irc:`; a page
+    # that renders untrusted text should never set it.
+    fn allow_unsafe_urls(allow: Bool) -> Options:
+        copy := self.copy()
+        copy.unsafe_urls = allow
+        return copy
+
+    # A copy with the github flavored markdown extensions on or off. stored for
+    # the extensions to come; commonmark parsing is the same either way today.
+    fn gfm(enabled: Bool) -> Options:
+        copy := self.copy()
+        copy.gfm_extensions = enabled
+        return copy
+
+    # A copy that asks for `id` attributes on headings. reserved: headings are
+    # rendered without ids for now.
+    fn heading_ids(enabled: Bool) -> Options:
+        copy := self.copy()
+        copy.heading_anchor_ids = enabled
+        return copy
+
+    fn copy() -> Options:
+        return Options(raw_html: self.raw_html, unsafe_urls: self.unsafe_urls, gfm_extensions: self.gfm_extensions, heading_anchor_ids: self.heading_anchor_ids)
+
+# ---------------------------------------------------------------
+# events
+# ---------------------------------------------------------------
+
+# A container that `Start` opens and `End` closes.
+pub enum Tag:
+    Paragraph
+    # a heading and its level, 1 to 6.
+    Heading(Int)
+    BlockQuote
+    # a fenced or indented code block and its info string ("" when there is
+    # none). the code itself arrives as one `Text` event.
+    CodeBlock(String)
+    # a list: the start number of an ordered list (none for a bullet list),
+    # and whether the list is tight.
+    List(Int?, Bool)
+    Item
+    Emphasis
+    Strong
+    # a link: its destination and title. the destination has passed the url
+    # check unless the options allow unsafe urls.
+    Link(String, String)
+    # an image: its source and title. the alt text is the events between
+    # `Start` and `End`.
+    Image(String, String)
+
+# One step of a document, in reading order.
+pub enum Event:
+    Start(Tag)
+    End(Tag)
+    # text, with entities and escapes decoded. never empty.
+    Text(String)
+    # the contents of a code span.
+    Code(String)
+    # a raw html block. only produced when the options allow html; otherwise
+    # the block arrives as a paragraph of text.
+    Html(String)
+    # raw inline html. only produced when the options allow html; otherwise it
+    # arrives as text.
+    InlineHtml(String)
+    SoftBreak
+    HardBreak
+    # a thematic break.
+    Rule
+
+# Something that consumes a document's events and builds output from them.
+# `render_with` feeds a renderer every event in order and then calls `finish`.
+pub interface Renderer:
+    # handle the next event.
+    fn event(event: Event)
+
+    # the output, once every event has been handled.
+    fn finish() -> String
+
+# Renders markdown to html with the safe defaults.
+pub fn to_html(source: String) -> String:
+    return render(source, options())
+
+# Renders markdown to html with the given options.
+pub fn render(source: String, opts: Options) -> String:
+    return drive(events(source, opts), html_renderer())
+
+# Feeds the events of `source` to `renderer` and returns what it produces.
+pub fn render_with(source: String, opts: Options, renderer: Renderer) -> String:
+    return drive(events(source, opts), renderer)
+
+fn drive[R: Renderer](stream: Events, renderer: R) -> String:
+    for event in stream:
+        renderer.event(event)
+    return renderer.finish()
+
+# Parses `source` and returns an iterator over its events.
+#
+# the block structure is parsed up front, since a link reference may be
+# defined after its use; inline content is parsed one paragraph or heading at
+# a time as the iterator reaches it.
+pub fn events(source: String, opts: Options) -> Events:
+    document := parse_blocks(source)
+    return Events(document: document, opts: opts, queue: [], queue_at: 0, node: 0, entering: true, finished: false)
+
+# ---------------------------------------------------------------
+# character classes
+# ---------------------------------------------------------------
+
+fn is_space_or_tab(c: Int) -> Bool:
+    return c == 32 or c == 9
+
+# cmark's isspace: space, tab, and the four line-ish controls.
+fn is_ascii_whitespace(c: Int) -> Bool:
+    return c == 32 or (c >= 9 and c <= 13)
+
+fn is_ascii_punctuation(c: Int) -> Bool:
+    if c >= 33 and c <= 47:
+        return true
+    if c >= 58 and c <= 64:
+        return true
+    if c >= 91 and c <= 96:
+        return true
+    return c >= 123 and c <= 126
+
+fn is_ascii_letter(c: Int) -> Bool:
+    return (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+
+fn is_ascii_digit(c: Int) -> Bool:
+    return c >= 48 and c <= 57
+
+fn is_ascii_alphanumeric(c: Int) -> Bool:
+    return is_ascii_letter(c) or is_ascii_digit(c)
+
+fn is_hex_digit(c: Int) -> Bool:
+    return is_ascii_digit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
+
+fn hex_value(c: Int) -> Int:
+    if c <= 57:
+        return c - 48
+    if c <= 70:
+        return c - 55
+    return c - 87
+
+# a byte that cannot appear in a plain link destination: space or a control.
+fn is_space_or_control(c: Int) -> Bool:
+    return c <= 32 or c == 127
+
+fn ascii_lower(c: Int) -> Int:
+    if c >= 65 and c <= 90:
+        return c + 32
+    return c
+
+# commonmark's unicode whitespace: the Zs category plus tab, line feed, form
+# feed and carriage return.
+fn is_unicode_whitespace(code_point: Int) -> Bool:
+    if code_point < 128:
+        return code_point == 32 or code_point == 9 or code_point == 10 or code_point == 12 or code_point == 13
+    if code_point == 160 or code_point == 5760:
+        return true
+    if code_point >= 8192 and code_point <= 8202:
+        return true
+    return code_point == 8239 or code_point == 8287 or code_point == 12288
+
+# commonmark's unicode punctuation: the P and S categories.
+fn is_unicode_punctuation(code_point: Int) -> Bool:
+    if code_point < 128:
+        return is_ascii_punctuation(code_point)
+    record := packed.find_containing(tables.PUNCTUATION_RANGES, 2, tables.punctuation_count(), code_point)
+    if record < 0:
+        return false
+    return code_point <= packed.field(tables.PUNCTUATION_RANGES, record, 1, 2)
+
+# ---------------------------------------------------------------
+# utf-8
+# ---------------------------------------------------------------
+
+fn encode_utf8(code_point: Int) -> String:
+    if code_point < 128:
+        return chr(code_point)
+    if code_point < 2048:
+        return chr(192 + bit_shr(code_point, 6)) + chr(128 + bit_and(code_point, 63))
+    if code_point < 65536:
+        return chr(224 + bit_shr(code_point, 12)) + chr(128 + bit_and(bit_shr(code_point, 6), 63)) + chr(128 + bit_and(code_point, 63))
+    return chr(240 + bit_shr(code_point, 18)) + chr(128 + bit_and(bit_shr(code_point, 12), 63)) + chr(128 + bit_and(bit_shr(code_point, 6), 63)) + chr(128 + bit_and(code_point, 63))
+
+# how many bytes the utf-8 sequence led by `lead` takes, or 1 for a byte that
+# cannot lead one.
+fn utf8_length(lead: Int) -> Int:
+    if lead < 192:
+        return 1
+    if lead < 224:
+        return 2
+    if lead < 240:
+        return 3
+    if lead < 248:
+        return 4
+    return 1
+
+# the code point starting at `position`, U+FFFD for a malformed sequence, and
+# a newline at the end of the string (the spec counts the edges as whitespace).
+fn code_point_at(source: String, position: Int) -> Int:
+    if position >= source.len():
+        return 10
+    lead := ord(source[position])
+    if lead < 128:
+        return lead
+    length := utf8_length(lead)
+    if length == 1 or position + length > source.len():
+        return 65533
+    mut value := bit_and(lead, bit_shr(127, length))
+    for k in 1..length:
+        byte := ord(source[position + k])
+        if bit_and(byte, 192) != 128:
+            return 65533
+        value = value * 64 + bit_and(byte, 63)
+    return value
+
+# the code point that ends just before `position`, or a newline at the start.
+fn code_point_before(source: String, position: Int) -> Int:
+    if position <= 0:
+        return 10
+    last := ord(source[position - 1])
+    if last < 128:
+        return last
+    mut start := position - 1
+    while start > 0 and position - start < 4 and bit_and(ord(source[start]), 192) == 128:
+        start -= 1
+    if start + utf8_length(ord(source[start])) != position:
+        return 65533
+    return code_point_at(source, start)
+
+# ---------------------------------------------------------------
+# entities, escapes and labels
+# ---------------------------------------------------------------
+
+# a character reference recognized at some position: how many bytes it spans
+# (0 when there is none) and the text it stands for.
+struct EntityMatch:
+    length: Int
+    value: String
+
+fn no_entity() -> EntityMatch:
+    return EntityMatch(length: 0, value: "")
+
+# the character reference starting at `position`, which holds an `&`. `limit`
+# is where the reference must end by.
+fn entity_at(source: String, position: Int, limit: Int) -> EntityMatch:
+    mut i := position + 1
+    if i < limit and ord(source[i]) == 35:
+        i += 1
+        mut hex := false
+        if i < limit and (ord(source[i]) == 120 or ord(source[i]) == 88):
+            hex = true
+            i += 1
+        digits_start := i
+        mut value := 0
+        while i < limit:
+            c := ord(source[i])
+            if hex and is_hex_digit(c) and i - digits_start < 6:
+                value = value * 16 + hex_value(c)
+            elif not hex and is_ascii_digit(c) and i - digits_start < 7:
+                value = value * 10 + (c - 48)
+            else:
+                break
+            i += 1
+        if i == digits_start or i >= limit or ord(source[i]) != 59:
+            return no_entity()
+        if value == 0 or value > 1114111 or (value >= 55296 and value <= 57343):
+            value = 65533
+        return EntityMatch(length: i + 1 - position, value: encode_utf8(value))
+    name_start := i
+    if i >= limit or not is_ascii_letter(ord(source[i])):
+        return no_entity()
+    while i < limit and is_ascii_alphanumeric(ord(source[i])) and i - name_start < 32:
+        i += 1
+    if i - name_start < 2 or i >= limit or ord(source[i]) != 59:
+        return no_entity()
+    value := lookup_entity(source, name_start, i)
+    if value == "":
+        return no_entity()
+    return EntityMatch(length: i + 1 - position, value: value)
+
+# compares source[start..end] with table[at..stop] bytewise: negative, zero or
+# positive as the source sorts before, equal to or after the table entry.
+fn compare_span(source: String, start: Int, end: Int, table: String, at: Int, stop: Int) -> Int:
+    mut i := 0
+    while start + i < end and at + i < stop:
+        left := ord(source[start + i])
+        right := ord(table[at + i])
+        if left != right:
+            return left - right
+        i += 1
+    return (end - start) - (stop - at)
+
+# the text of the named entity source[start..end] (without `&` and `;`), or
+# "" when html5 has no entity by that name. a binary search over the generated
+# table's lines.
+fn lookup_entity(source: String, start: Int, end: Int) -> String:
+    table := tables.ENTITIES
+    mut low := 0
+    mut high := table.len()
+    while low < high:
+        mut record := (low + high) / 2
+        while record > low and ord(table[record - 1]) != 10:
+            record -= 1
+        mut name_end := record
+        while ord(table[name_end]) != 32:
+            name_end += 1
+        mut line_end := name_end + 1
+        while ord(table[line_end]) != 10:
+            line_end += 1
+        order := compare_span(source, start, end, table, record, name_end)
+        if order == 0:
+            mut value := encode_utf8(packed.field_at(table, name_end + 1))
+            if line_end - name_end > 5:
+                value = value + encode_utf8(packed.field_at(table, name_end + 5))
+            return value
+        if order < 0:
+            high = record
+        else:
+            low = line_end + 1
+    return ""
+
+# source[start..end] with backslash escapes and character references decoded,
+# as link destinations, titles and info strings need.
+fn unescape(source: String, start: Int, end: Int) -> String:
+    mut i := start
+    while i < end:
+        c := ord(source[i])
+        if c == 92 or c == 38:
+            break
+        i += 1
+    if i == end:
+        if start == 0 and end == source.len():
+            return source
+        return source.substring(start, end)
+    mut parts: List[String] := []
+    mut copied := start
+    while i < end:
+        c := ord(source[i])
+        if c == 92 and i + 1 < end and is_ascii_punctuation(ord(source[i + 1])):
+            if i > copied:
+                parts.push(source.substring(copied, i))
+            parts.push(source[i + 1])
+            i += 2
+            copied = i
+        elif c == 38:
+            entity := entity_at(source, i, end)
+            if entity.length == 0:
+                i += 1
+                continue
+            if i > copied:
+                parts.push(source.substring(copied, i))
+            parts.push(entity.value)
+            i += entity.length
+            copied = i
+        else:
+            i += 1
+    if copied < end:
+        parts.push(source.substring(copied, end))
+    return parts.join("")
+
+# the key a link label is matched by: whitespace runs collapsed to one space,
+# the ends trimmed, and the text case-folded with unicode full folding, so
+# `[ẞ]` matches `[SS]`.
+fn normalize_label(source: String, start: Int, end: Int) -> String:
+    mut words: List[String] := []
+    mut i := start
+    while i < end:
+        while i < end and is_ascii_whitespace(ord(source[i])):
+            i += 1
+        if i >= end:
+            break
+        word_start := i
+        mut ascii := true
+        while i < end and not is_ascii_whitespace(ord(source[i])):
+            if ord(source[i]) >= 128:
+                ascii = false
+            i += 1
+        word := source.substring(word_start, i)
+        if ascii:
+            words.push(word.to_lower())
+        else:
+            words.push(fold_full(word))
+    return words.join(" ")
+
+# full unicode case folding of `word`.
+fn fold_full(word: String) -> String:
+    mut parts: List[String] := []
+    mut i := 0
+    while i < word.len():
+        lead := ord(word[i])
+        length := utf8_length(lead)
+        code_point := code_point_at(word, i)
+        if code_point == 65533 and (length == 1 or i + length > word.len()):
+            parts.push(word[i])
+            i += 1
+            continue
+        record := packed.find(tables.FULL_FOLDS, 4, tables.full_fold_count(), code_point)
+        if record >= 0:
+            for slot in 1..4:
+                folded := packed.field(tables.FULL_FOLDS, record, slot, 4)
+                if folded != 0:
+                    parts.push(encode_utf8(folded))
+        else:
+            parts.push(encode_utf8(text.fold_code_point(code_point)))
+        i += length
+    return parts.join("")
+
+# ---------------------------------------------------------------
+# link syntax shared by references and inline links
+# ---------------------------------------------------------------
+
+# past spaces and tabs, at most one newline, and spaces and tabs again.
+fn skip_spnl(source: String, position: Int) -> Int:
+    mut i := skip_spaces(source, position)
+    if i < source.len() and ord(source[i]) == 10:
+        i = skip_spaces(source, i + 1)
+    return i
+
+fn skip_spaces(source: String, position: Int) -> Int:
+    mut i := position
+    while i < source.len() and is_space_or_tab(ord(source[i])):
+        i += 1
+    return i
+
+# the end of a link label that starts at `position` (just past its `]`), or
+# -1. a label holds no unescaped bracket and at most MAX_LABEL_BYTES bytes.
+fn scan_link_label(source: String, position: Int) -> Int:
+    if position >= source.len() or ord(source[position]) != 91:
+        return -1
+    mut i := position + 1
+    while i < source.len():
+        if i - position - 1 > MAX_LABEL_BYTES:
+            return -1
+        c := ord(source[i])
+        if c == 92 and i + 1 < source.len():
+            i += 2
+            continue
+        if c == 91:
+            return -1
+        if c == 93:
+            if i - position - 1 > MAX_LABEL_BYTES:
+                return -1
+            return i + 1
+        i += 1
+    return -1
+
+# where a link destination was found: the span of its text (inside the angle
+# brackets for the `<...>` form) and the position after it.
+struct DestinationSpan:
+    found: Bool
+    start: Int
+    end: Int
+    next: Int
+
+fn no_destination() -> DestinationSpan:
+    return DestinationSpan(found: false, start: 0, end: 0, next: 0)
+
+fn scan_link_destination(source: String, position: Int) -> DestinationSpan:
+    length := source.len()
+    if position < length and ord(source[position]) == 60:
+        mut i := position + 1
+        while i < length:
+            c := ord(source[i])
+            if c == 62:
+                return DestinationSpan(found: true, start: position + 1, end: i, next: i + 1)
+            if c == 60 or c == 10:
+                return no_destination()
+            if c == 92:
+                if i + 1 >= length or ord(source[i + 1]) == 10:
+                    return no_destination()
+                i += 2
+                continue
+            i += 1
+        return no_destination()
+    mut i := position
+    mut depth := 0
+    while i < length:
+        c := ord(source[i])
+        if c == 92 and i + 1 < length and is_ascii_punctuation(ord(source[i + 1])):
+            i += 2
+            continue
+        if c == 40:
+            depth += 1
+            if depth > MAX_LINK_PARENS:
+                return no_destination()
+        elif c == 41:
+            if depth == 0:
+                break
+            depth -= 1
+        elif is_space_or_control(c):
+            break
+        i += 1
+    if depth != 0:
+        return no_destination()
+    if i == position and (i >= length or ord(source[i]) != 41):
+        return no_destination()
+    return DestinationSpan(found: true, start: position, end: i, next: i)
+
+# the end of a link title starting at `position` (just past its closing
+# quote), or -1.
+fn scan_link_title(source: String, position: Int) -> Int:
+    if position >= source.len():
+        return -1
+    opener := ord(source[position])
+    mut closer := opener
+    if opener == 40:
+        closer = 41
+    elif opener != 34 and opener != 39:
+        return -1
+    mut i := position + 1
+    while i < source.len():
+        c := ord(source[i])
+        if c == 92 and i + 1 < source.len():
+            i += 2
+            continue
+        if c == closer:
+            return i + 1
+        if opener == 40 and c == 40:
+            return -1
+        i += 1
+    return -1
+
+# ---------------------------------------------------------------
+# raw html syntax
+# ---------------------------------------------------------------
+
+fn skip_html_whitespace(source: String, position: Int, limit: Int) -> Int:
+    mut i := position
+    while i < limit:
+        c := ord(source[i])
+        if c != 32 and c != 9 and c != 10 and c != 13 and c != 12:
+            break
+        i += 1
+    return i
+
+fn skip_tag_name(source: String, position: Int, limit: Int) -> Int:
+    mut i := position
+    while i < limit:
+        c := ord(source[i])
+        if not is_ascii_alphanumeric(c) and c != 45:
+            break
+        i += 1
+    return i
+
+# the end of an open tag starting at `position` (the `<`), or -1.
+fn scan_open_tag(source: String, position: Int, limit: Int) -> Int:
+    mut i := position + 1
+    if i >= limit or not is_ascii_letter(ord(source[i])):
+        return -1
+    i = skip_tag_name(source, i, limit)
+    while true:
+        before_space := i
+        i = skip_html_whitespace(source, i, limit)
+        if i >= limit:
+            return -1
+        c := ord(source[i])
+        if c == 62:
+            return i + 1
+        if c == 47:
+            if i + 1 < limit and ord(source[i + 1]) == 62:
+                return i + 2
+            return -1
+        if i == before_space:
+            return -1
+        if not is_ascii_letter(c) and c != 95 and c != 58:
+            return -1
+        i += 1
+        while i < limit:
+            d := ord(source[i])
+            if not is_ascii_alphanumeric(d) and d != 95 and d != 46 and d != 58 and d != 45:
+                break
+            i += 1
+        after_name := i
+        mut j := skip_html_whitespace(source, i, limit)
+        if j >= limit or ord(source[j]) != 61:
+            i = after_name
+            continue
+        j = skip_html_whitespace(source, j + 1, limit)
+        if j >= limit:
+            return -1
+        quote := ord(source[j])
+        if quote == 34 or quote == 39:
+            mut k := j + 1
+            while k < limit and ord(source[k]) != quote:
+                k += 1
+            if k >= limit:
+                return -1
+            i = k + 1
+        else:
+            mut k := j
+            while k < limit:
+                d := ord(source[k])
+                if d <= 32 or d == 34 or d == 39 or d == 61 or d == 60 or d == 62 or d == 96:
+                    break
+                k += 1
+            if k == j:
+                return -1
+            i = k
+    return -1
+
+# the end of a closing tag starting at `position` (the `<`), or -1.
+fn scan_closing_tag(source: String, position: Int, limit: Int) -> Int:
+    mut i := position + 2
+    if i >= limit or ord(source[position + 1]) != 47 or not is_ascii_letter(ord(source[i])):
+        return -1
+    i = skip_tag_name(source, i, limit)
+    i = skip_html_whitespace(source, i, limit)
+    if i < limit and ord(source[i]) == 62:
+        return i + 1
+    return -1
+
+# whether source[position..] starts with `word`, ignoring ascii case.
+fn starts_with_ignore_case(source: String, position: Int, limit: Int, word: String) -> Bool:
+    if position + word.len() > limit:
+        return false
+    for k in 0..word.len():
+        if ascii_lower(ord(source[position + k])) != ord(word[k]):
+            return false
+    return true
+
+# whether source[position..] starts with `word`, byte for byte.
+fn starts_with_exactly(source: String, position: Int, limit: Int, word: String) -> Bool:
+    if position + word.len() > limit:
+        return false
+    for k in 0..word.len():
+        if ord(source[position + k]) != ord(word[k]):
+            return false
+    return true
+
+# the position of `needle` in source[position..limit], or -1.
+fn find_text(source: String, position: Int, limit: Int, needle: String) -> Int:
+    first := ord(needle[0])
+    mut i := position
+    while i + needle.len() <= limit:
+        if ord(source[i]) == first:
+            mut k := 1
+            while k < needle.len() and ord(source[i + k]) == ord(needle[k]):
+                k += 1
+            if k == needle.len():
+                return i
+        i += 1
+    return -1
+
+# ---------------------------------------------------------------
+# block structure
+# ---------------------------------------------------------------
+
+enum BlockKind:
+    Document
+    Quote
+    List
+    Item
+    Paragraph
+    Heading
+    Rule
+    Code
+    Html
+
+# one block of the document tree. blocks live in one list and refer to each
+# other by index, so the tree holds no reference cycles.
+struct Block:
+    kind: BlockKind
+    parent: Int
+    first_child: Int = -1
+    last_child: Int = -1
+    prev: Int = -1
+    next: Int = -1
+    open: Bool = true
+    start_line: Int
+    end_line: Int = 0
+    # block quotes and list items between this block and the document.
+    depth: Int = 0
+    # a leaf's text once it is closed: inline source for a paragraph or
+    # heading, the literal for code and html.
+    content: String = ""
+    info: String = ""
+    level: Int = 0
+    fenced: Bool = false
+    fence_char: Int = 0
+    fence_length: Int = 0
+    fence_offset: Int = 0
+    html_type: Int = 0
+    ordered: Bool = false
+    bullet_char: Int = 0
+    delimiter: Int = 0
+    list_start: Int = 0
+    marker_offset: Int = 0
+    padding: Int = 0
+    tight: Bool = true
+
+# a link reference definition.
+struct Reference:
+    destination: String
+    title: String
+
+# a parsed document: the block tree, the reference definitions and what is
+# left of the budget for copying them into the output.
+struct Document:
+    source: String
+    blocks: List[Block]
+    references: Map[String, Reference]
+    reference_budget: Int
+    # a heap copy of INLINE_SPECIAL. indexing a string with a length header
+    # is inlined, and a copy made at run time has one, so the per-byte lookup
+    # in a text run reads it directly.
+    inline_special: String
+
+# the list marker a line starts with.
+struct ListMarker:
+    ordered: Bool
+    bullet_char: Int
+    start: Int
+    delimiter: Int
+    padding: Int
+    marker_offset: Int
+
+fn accepts_lines(kind: BlockKind) -> Bool:
+    return kind == BlockKind.Paragraph or kind == BlockKind.Code or kind == BlockKind.Html
+
+fn can_contain(parent: BlockKind, child: BlockKind) -> Bool:
+    if parent == BlockKind.Document or parent == BlockKind.Quote or parent == BlockKind.Item:
+        return child != BlockKind.Item
+    if parent == BlockKind.List:
+        return child == BlockKind.Item
+    return false
+
+# the first characters that can start a block other than a paragraph.
+fn may_start_block(c: Int) -> Bool:
+    if is_ascii_digit(c):
+        return true
+    return c == 35 or c == 96 or c == 126 or c == 42 or c == 43 or c == 95 or c == 61 or c == 60 or c == 62 or c == 45
+
+# the line-by-line block parser. it follows the commonmark reference parser:
+# each line first continues the open containers it can, then tries to open
+# new blocks, and what is left is added to the innermost open leaf.
+#
+# positions within the current line (`offset`, `next_nonspace`) are relative
+# to `line_start`, and columns count tabs to the next multiple of four.
+struct BlockParser:
+    source: String
+    blocks: List[Block]
+    references: Map[String, Reference]
+    tip: Int
+    old_tip: Int
+    last_matched: Int
+    all_closed: Bool
+    line_start: Int
+    line_end: Int
+    line_number: Int
+    offset: Int
+    column: Int
+    next_nonspace: Int
+    next_nonspace_column: Int
+    indent: Int
+    indented: Bool
+    blank: Bool
+    partially_consumed_tab: Bool
+    # the lines of the open leaf. only the innermost open block takes lines,
+    # and it is closed before any other block opens, so one buffer serves.
+    lines: List[String]
+
+fn parse_blocks(input: String) -> Document:
+    mut source := input
+    if source.contains(chr(0)):
+        source = source.replace(chr(0), encode_utf8(65533))
+    mut blocks: List[Block] := []
+    blocks.push(Block(kind: BlockKind.Document, parent: -1, start_line: 1))
+    parser := BlockParser(source: source, blocks: blocks, references: {}, tip: 0, old_tip: 0, last_matched: 0, all_closed: true, line_start: 0, line_end: 0, line_number: 0, offset: 0, column: 0, next_nonspace: 0, next_nonspace_column: 0, indent: 0, indented: false, blank: false, partially_consumed_tab: false, lines: [])
+    length := source.len()
+    mut position := 0
+    while position < length:
+        mut line_end := position
+        while line_end < length:
+            c := ord(source[line_end])
+            if c == 10 or c == 13:
+                break
+            line_end += 1
+        parser.incorporate_line(position, line_end)
+        if line_end >= length:
+            position = length
+        elif ord(source[line_end]) == 13 and line_end + 1 < length and ord(source[line_end + 1]) == 10:
+            position = line_end + 2
+        else:
+            position = line_end + 1
+    while parser.tip >= 0:
+        parser.finalize(parser.tip, parser.line_number)
+    budget := max(length, MIN_REFERENCE_BUDGET)
+    return Document(source: source, blocks: parser.blocks, references: parser.references, reference_budget: budget, inline_special: INLINE_SPECIAL.substring(0, 256))
+
+impl BlockParser:
+    fn line_length() -> Int:
+        return self.line_end - self.line_start
+
+    fn peek_at(position: Int) -> Int:
+        if position < self.line_end - self.line_start:
+            return ord(self.source[self.line_start + position])
+        return -1
+
+    fn kind_of(index: Int) -> BlockKind:
+        return self.blocks[index].kind
+
+    # find the first character after the spaces and tabs at the offset. the
+    # result stays valid while the offset moves within those spaces, as cmark
+    # does, so a line under many containers is scanned once, not once per
+    # container.
+    fn find_next_nonspace():
+        if self.next_nonspace <= self.offset:
+            mut i := self.offset
+            mut columns := self.column
+            mut c := self.peek_at(i)
+            while c == 32 or c == 9:
+                if c == 32:
+                    columns += 1
+                else:
+                    columns += 4 - (columns % 4)
+                i += 1
+                c = self.peek_at(i)
+            self.next_nonspace = i
+            self.next_nonspace_column = columns
+        self.blank = self.peek_at(self.next_nonspace) == -1
+        self.indent = self.next_nonspace_column - self.column
+        self.indented = self.indent >= 4
+
+    fn advance_next_nonspace():
+        self.offset = self.next_nonspace
+        self.column = self.next_nonspace_column
+        self.partially_consumed_tab = false
+
+    # move `count` characters forward, or `count` columns when `columns` is
+    # true, in which case a tab can be left partly consumed.
+    fn advance_offset(count: Int, columns: Bool):
+        mut remaining := count
+        while remaining > 0:
+            c := self.peek_at(self.offset)
+            if c == -1:
+                break
+            if c == 9:
+                to_tab := 4 - (self.column % 4)
+                if columns:
+                    self.partially_consumed_tab = to_tab > remaining
+                    step := min(to_tab, remaining)
+                    self.column += step
+                    if not self.partially_consumed_tab:
+                        self.offset += 1
+                    remaining -= step
+                else:
+                    self.partially_consumed_tab = false
+                    self.column += to_tab
+                    self.offset += 1
+                    remaining -= 1
+            else:
+                self.partially_consumed_tab = false
+                self.offset += 1
+                self.column += 1
+                remaining -= 1
+
+    fn rest_of_line() -> String:
+        return self.source.substring(self.line_start + min(self.offset, self.line_length()), self.line_end)
+
+    fn add_line():
+        if self.partially_consumed_tab:
+            self.offset += 1
+            to_tab := 4 - (self.column % 4)
+            self.lines.push(" ".repeat(to_tab) + self.rest_of_line())
+        else:
+            self.lines.push(self.rest_of_line())
+
+    fn add_child(kind: BlockKind, offset: Int) -> Int:
+        while not can_contain(self.kind_of(self.tip), kind):
+            self.finalize(self.tip, self.line_number - 1)
+        parent := self.tip
+        mut depth := self.blocks[parent].depth
+        if kind == BlockKind.Quote or kind == BlockKind.Item:
+            depth += 1
+        index := self.blocks.len()
+        self.blocks.push(Block(kind: kind, parent: parent, start_line: self.line_number, depth: depth))
+        previous := self.blocks[parent].last_child
+        if previous >= 0:
+            self.blocks[previous].next = index
+            self.blocks[index].prev = previous
+        else:
+            self.blocks[parent].first_child = index
+        self.blocks[parent].last_child = index
+        self.tip = index
+        return index
+
+    fn close_unmatched():
+        if self.all_closed:
+            return
+        while self.old_tip != self.last_matched:
+            parent := self.blocks[self.old_tip].parent
+            self.finalize(self.old_tip, self.line_number - 1)
+            self.old_tip = parent
+        self.all_closed = true
+
+    # close a block, as the reference parser does: settle its content and
+    # move the tip to its parent.
+    fn finalize(index: Int, line_number: Int):
+        block := self.blocks[index]
+        above := block.parent
+        block.open = false
+        block.end_line = line_number
+        kind := block.kind
+        if kind == BlockKind.Paragraph:
+            self.finalize_paragraph(index)
+        elif kind == BlockKind.Code:
+            self.finalize_code(block)
+        elif kind == BlockKind.Html:
+            block.content = self.lines.join("\n")
+            self.lines.clear()
+        elif kind == BlockKind.Item:
+            if block.last_child >= 0:
+                block.end_line = self.blocks[block.last_child].end_line
+            else:
+                block.end_line = block.start_line
+        elif kind == BlockKind.List:
+            self.finalize_list(block)
+        self.tip = above
+
+    fn finalize_paragraph(index: Int):
+        block := self.blocks[index]
+        content := self.lines.join("\n")
+        self.lines.clear()
+        consumed := parse_references(content, 0, self.references)
+        mut rest := content
+        if consumed > 0:
+            rest = content.substring(consumed, content.len())
+        if is_blank(rest):
+            self.unlink_last(index)
+            return
+        block.content = rest
+
+    # remove a block that was just closed. an open block is always the last
+    # child of its parent, so this is the only unlink the parser needs.
+    fn unlink_last(index: Int):
+        block := self.blocks[index]
+        parent := self.blocks[block.parent]
+        if block.prev >= 0:
+            self.blocks[block.prev].next = -1
+            parent.last_child = block.prev
+        else:
+            parent.first_child = -1
+            parent.last_child = -1
+
+    fn finalize_code(block: Block):
+        if block.fenced:
+            info_line := self.lines[0]
+            block.info = unescape(info_line.trim(), 0, info_line.trim().len())
+            mut code_lines: List[String] := []
+            for line_index in 1..self.lines.len():
+                code_lines.push(self.lines[line_index])
+            if code_lines.len() > 0:
+                block.content = code_lines.join("\n") + "\n"
+        else:
+            mut count := self.lines.len()
+            while count > 0 and is_blank(self.lines[count - 1]):
+                count -= 1
+            mut code_lines: List[String] := []
+            for line_index in 0..count:
+                code_lines.push(self.lines[line_index])
+            block.content = code_lines.join("\n") + "\n"
+        self.lines.clear()
+
+    # a list is loose when a blank line separates two of its items, or two
+    # blocks directly inside one of its items.
+    fn finalize_list(block: Block):
+        mut item := block.first_child
+        while item >= 0 and block.tight:
+            if self.ends_with_blank_line(item):
+                block.tight = false
+            mut child := self.blocks[item].first_child
+            while child >= 0 and block.tight:
+                if self.ends_with_blank_line(child):
+                    block.tight = false
+                child = self.blocks[child].next
+            item = self.blocks[item].next
+        if block.last_child >= 0:
+            block.end_line = self.blocks[block.last_child].end_line
+
+    fn ends_with_blank_line(index: Int) -> Bool:
+        next := self.blocks[index].next
+        if next < 0:
+            return false
+        return self.blocks[index].end_line != self.blocks[next].start_line - 1
+
+    # try to continue an open block with the current line: 0 when it
+    # continues, 1 when it does not, 2 when the line closed a fenced code
+    # block and is used up.
+    fn continue_block(index: Int) -> Int:
+        block := self.blocks[index]
+        match block.kind:
+            BlockKind.Quote =>
+                if self.indented or self.peek_at(self.next_nonspace) != 62:
+                    return 1
+                self.advance_next_nonspace()
+                self.advance_offset(1, false)
+                if is_space_or_tab(self.peek_at(self.offset)):
+                    self.advance_offset(1, true)
+                return 0
+            BlockKind.Item =>
+                if self.blank:
+                    if block.first_child < 0:
+                        return 1
+                    self.advance_next_nonspace()
+                    return 0
+                if self.indent >= block.marker_offset + block.padding:
+                    self.advance_offset(block.marker_offset + block.padding, true)
+                    return 0
+                return 1
+            BlockKind.Heading | BlockKind.Rule =>
+                return 1
+            BlockKind.Code =>
+                return self.continue_code(index)
+            BlockKind.Html =>
+                if self.blank and (block.html_type == 6 or block.html_type == 7):
+                    return 1
+                return 0
+            BlockKind.Paragraph =>
+                if self.blank:
+                    return 1
+                return 0
+            _ =>
+                return 0
+
+    fn continue_code(index: Int) -> Int:
+        block := self.blocks[index]
+        if block.fenced:
+            if self.indent <= 3 and self.peek_at(self.next_nonspace) == block.fence_char:
+                mut i := self.next_nonspace
+                while self.peek_at(i) == block.fence_char:
+                    i += 1
+                run := i - self.next_nonspace
+                while is_space_or_tab(self.peek_at(i)):
+                    i += 1
+                if run >= block.fence_length and i >= self.line_length():
+                    self.finalize(index, self.line_number)
+                    return 2
+            mut skip := block.fence_offset
+            while skip > 0 and is_space_or_tab(self.peek_at(self.offset)):
+                self.advance_offset(1, true)
+                skip -= 1
+            return 0
+        if self.indent >= 4:
+            self.advance_offset(4, true)
+            return 0
+        if self.blank:
+            self.advance_next_nonspace()
+            return 0
+        return 1
+
+    fn incorporate_line(start: Int, end: Int):
+        self.line_start = start
+        self.line_end = end
+        self.old_tip = self.tip
+        self.offset = 0
+        self.column = 0
+        self.next_nonspace = 0
+        self.blank = false
+        self.partially_consumed_tab = false
+        self.line_number += 1
+
+        mut container := 0
+        while true:
+            last := self.blocks[container].last_child
+            if last < 0 or not self.blocks[last].open:
+                break
+            container = last
+            self.find_next_nonspace()
+            outcome := self.continue_block(container)
+            if outcome == 2:
+                return
+            if outcome == 1:
+                container = self.blocks[container].parent
+                break
+
+        self.all_closed = container == self.old_tip
+        self.last_matched = container
+
+        container_kind := self.kind_of(container)
+        mut matched_leaf := container_kind != BlockKind.Paragraph and accepts_lines(container_kind)
+        while not matched_leaf:
+            self.find_next_nonspace()
+            if not self.indented and not may_start_block(self.peek_at(self.next_nonspace)):
+                self.advance_next_nonspace()
+                break
+            started := self.start_block(container)
+            if started == 0:
+                self.advance_next_nonspace()
+                break
+            container = self.tip
+            if started == 2:
+                matched_leaf = true
+
+        if not self.all_closed and not self.blank and self.kind_of(self.tip) == BlockKind.Paragraph:
+            # a lazy continuation line
+            self.add_line()
+            return
+        self.close_unmatched()
+        kind := self.kind_of(container)
+        if accepts_lines(kind):
+            self.add_line()
+            if kind == BlockKind.Html and self.html_block_ends(self.blocks[container].html_type):
+                self.finalize(container, self.line_number)
+        elif self.offset < self.line_length() and not self.blank:
+            self.add_child(BlockKind.Paragraph, self.offset)
+            self.advance_next_nonspace()
+            self.add_line()
+
+    # whether the rest of the line meets the end condition of an html block
+    # of the first five kinds.
+    fn html_block_ends(html_type: Int) -> Bool:
+        start := self.line_start + min(self.offset, self.line_length())
+        end := self.line_end
+        if html_type == 1:
+            for tag in ["</script>", "</pre>", "</style>", "</textarea>"]:
+                if find_text_ignore_case(self.source, start, end, tag) >= 0:
+                    return true
+            return false
+        if html_type == 2:
+            return find_text(self.source, start, end, "-->") >= 0
+        if html_type == 3:
+            return find_text(self.source, start, end, "?>") >= 0
+        if html_type == 4:
+            return find_text(self.source, start, end, ">") >= 0
+        if html_type == 5:
+            return find_text(self.source, start, end, "]]>") >= 0
+        return false
+
+    # try each kind of block start in the spec's order: 0 when none matches,
+    # 1 for a new container, 2 for a new leaf.
+    fn start_block(container: Int) -> Int:
+        mut started := self.start_block_quote(container)
+        if started == 0:
+            started = self.start_atx_heading()
+        if started == 0:
+            started = self.start_fenced_code()
+        if started == 0:
+            started = self.start_html_block(container)
+        if started == 0:
+            started = self.start_setext_heading(container)
+        if started == 0:
+            started = self.start_thematic_break()
+        if started == 0:
+            started = self.start_list_item(container)
+        if started == 0:
+            started = self.start_indented_code()
+        return started
+
+    fn start_block_quote(container: Int) -> Int:
+        if self.indented or self.peek_at(self.next_nonspace) != 62:
+            return 0
+        if self.blocks[container].depth >= MAX_NESTING:
+            return 0
+        self.advance_next_nonspace()
+        self.advance_offset(1, false)
+        if is_space_or_tab(self.peek_at(self.offset)):
+            self.advance_offset(1, true)
+        self.close_unmatched()
+        self.add_child(BlockKind.Quote, self.next_nonspace)
+        return 1
+
+    fn start_atx_heading() -> Int:
+        if self.indented:
+            return 0
+        mut i := self.next_nonspace
+        while self.peek_at(i) == 35 and i - self.next_nonspace < 7:
+            i += 1
+        level := i - self.next_nonspace
+        if level == 0 or level > 6:
+            return 0
+        after := self.peek_at(i)
+        if after != -1 and not is_space_or_tab(after):
+            return 0
+        while is_space_or_tab(self.peek_at(i)):
+            i += 1
+        self.advance_next_nonspace()
+        self.advance_offset(i - self.offset, false)
+        self.close_unmatched()
+        heading := self.add_child(BlockKind.Heading, self.next_nonspace)
+        self.blocks[heading].level = level
+        self.blocks[heading].content = strip_closing_hashes(self.rest_of_line())
+        self.advance_offset(self.line_length() - self.offset, false)
+        return 2
+
+    fn start_fenced_code() -> Int:
+        if self.indented:
+            return 0
+        fence := self.peek_at(self.next_nonspace)
+        if fence != 96 and fence != 126:
+            return 0
+        mut i := self.next_nonspace
+        while self.peek_at(i) == fence:
+            i += 1
+        length := i - self.next_nonspace
+        if length < 3:
+            return 0
+        if fence == 96:
+            while i < self.line_length():
+                if self.peek_at(i) == 96:
+                    return 0
+                i += 1
+        self.close_unmatched()
+        code := self.add_child(BlockKind.Code, self.next_nonspace)
+        block := self.blocks[code]
+        block.fenced = true
+        block.fence_char = fence
+        block.fence_length = length
+        block.fence_offset = self.indent
+        self.advance_next_nonspace()
+        self.advance_offset(length, false)
+        return 2
+
+    fn start_html_block(container: Int) -> Int:
+        if self.indented or self.peek_at(self.next_nonspace) != 60:
+            return 0
+        lazy := not self.all_closed and not self.blank and self.kind_of(self.tip) == BlockKind.Paragraph
+        may_be_tag := self.kind_of(container) != BlockKind.Paragraph and not lazy
+        html_type := html_block_type(self.source, self.line_start + self.next_nonspace, self.line_end, may_be_tag)
+        if html_type == 0:
+            return 0
+        self.close_unmatched()
+        block := self.add_child(BlockKind.Html, self.offset)
+        self.blocks[block].html_type = html_type
+        return 2
+
+    fn start_setext_heading(container: Int) -> Int:
+        if self.indented or self.kind_of(container) != BlockKind.Paragraph:
+            return 0
+        marker := self.peek_at(self.next_nonspace)
+        if marker != 61 and marker != 45:
+            return 0
+        mut i := self.next_nonspace
+        while self.peek_at(i) == marker:
+            i += 1
+        while is_space_or_tab(self.peek_at(i)):
+            i += 1
+        if i < self.line_length():
+            return 0
+        self.close_unmatched()
+        content := self.lines.join("\n")
+        consumed := parse_references(content, 0, self.references)
+        mut rest := content
+        if consumed > 0:
+            rest = content.substring(consumed, content.len())
+        self.lines.clear()
+        if rest.len() == 0:
+            return 0
+        block := self.blocks[container]
+        block.kind = BlockKind.Heading
+        block.content = rest
+        if marker == 61:
+            block.level = 1
+        else:
+            block.level = 2
+        self.advance_offset(self.line_length() - self.offset, false)
+        return 2
+
+    fn start_thematic_break() -> Int:
+        if self.indented:
+            return 0
+        marker := self.peek_at(self.next_nonspace)
+        if marker != 42 and marker != 45 and marker != 95:
+            return 0
+        mut count := 0
+        mut i := self.next_nonspace
+        while i < self.line_length():
+            c := self.peek_at(i)
+            if c == marker:
+                count += 1
+            elif not is_space_or_tab(c):
+                return 0
+            i += 1
+        if count < 3:
+            return 0
+        self.close_unmatched()
+        self.add_child(BlockKind.Rule, self.next_nonspace)
+        self.advance_offset(self.line_length() - self.offset, false)
+        return 2
+
+    fn start_list_item(container: Int) -> Int:
+        if self.indented and self.kind_of(container) != BlockKind.List:
+            return 0
+        if self.blocks[container].depth >= MAX_NESTING:
+            return 0
+        found := self.parse_list_marker(container)
+        if found == none:
+            return 0
+        marker := found.value()
+        self.close_unmatched()
+        tip := self.blocks[self.tip]
+        if tip.kind != BlockKind.List or not lists_match(tip, marker):
+            list := self.add_child(BlockKind.List, self.next_nonspace)
+            set_list_marker(self.blocks[list], marker)
+        item := self.add_child(BlockKind.Item, self.next_nonspace)
+        set_list_marker(self.blocks[item], marker)
+        return 1
+
+    fn parse_list_marker(container: Int) -> ListMarker?:
+        if self.indent >= 4:
+            return none
+        marker_offset := self.indent
+        start := self.next_nonspace
+        c := self.peek_at(start)
+        mut ordered := false
+        mut bullet := 0
+        mut number := 0
+        mut delimiter := 0
+        mut marker_length := 0
+        if c == 42 or c == 43 or c == 45:
+            bullet = c
+            marker_length = 1
+        elif is_ascii_digit(c):
+            mut i := start
+            while i - start < 9 and is_ascii_digit(self.peek_at(i)):
+                number = number * 10 + (self.peek_at(i) - 48)
+                i += 1
+            closer := self.peek_at(i)
+            if closer != 46 and closer != 41:
+                return none
+            if self.kind_of(container) == BlockKind.Paragraph and number != 1:
+                return none
+            ordered = true
+            delimiter = closer
+            marker_length = i - start + 1
+        else:
+            return none
+        after := self.peek_at(start + marker_length)
+        if after != -1 and not is_space_or_tab(after):
+            return none
+        if self.kind_of(container) == BlockKind.Paragraph:
+            mut j := start + marker_length
+            while is_space_or_tab(self.peek_at(j)):
+                j += 1
+            if j >= self.line_length():
+                return none
+        self.advance_next_nonspace()
+        self.advance_offset(marker_length, true)
+        spaces_start_column := self.column
+        spaces_start_offset := self.offset
+        while true:
+            self.advance_offset(1, true)
+            if self.column - spaces_start_column >= 5 or not is_space_or_tab(self.peek_at(self.offset)):
+                break
+        blank_item := self.peek_at(self.offset) == -1
+        spaces_after := self.column - spaces_start_column
+        mut padding := marker_length + spaces_after
+        if spaces_after >= 5 or spaces_after < 1 or blank_item:
+            padding = marker_length + 1
+            self.column = spaces_start_column
+            self.offset = spaces_start_offset
+            if is_space_or_tab(self.peek_at(self.offset)):
+                self.advance_offset(1, true)
+        return ListMarker(ordered: ordered, bullet_char: bullet, start: number, delimiter: delimiter, padding: padding, marker_offset: marker_offset)
+
+    fn start_indented_code() -> Int:
+        if not self.indented or self.blank or self.kind_of(self.tip) == BlockKind.Paragraph:
+            return 0
+        self.advance_offset(4, true)
+        self.close_unmatched()
+        self.add_child(BlockKind.Code, self.offset)
+        return 2
+
+fn lists_match(list: Block, marker: ListMarker) -> Bool:
+    return list.ordered == marker.ordered and list.delimiter == marker.delimiter and list.bullet_char == marker.bullet_char
+
+fn set_list_marker(block: Block, marker: ListMarker):
+    block.ordered = marker.ordered
+    block.bullet_char = marker.bullet_char
+    block.list_start = marker.start
+    block.delimiter = marker.delimiter
+    block.padding = marker.padding
+    block.marker_offset = marker.marker_offset
+
+fn is_blank(line: String) -> Bool:
+    for i in 0..line.len():
+        if not is_ascii_whitespace(ord(line[i])):
+            return false
+    return true
+
+# an atx heading's text without its optional closing run of `#`.
+fn strip_closing_hashes(line: String) -> String:
+    mut end := line.len()
+    while end > 0 and is_space_or_tab(ord(line[end - 1])):
+        end -= 1
+    mut hashes := end
+    while hashes > 0 and ord(line[hashes - 1]) == 35:
+        hashes -= 1
+    if hashes == end:
+        return line
+    if hashes == 0 or is_space_or_tab(ord(line[hashes - 1])):
+        return line.substring(0, hashes)
+    return line
+
+# which kind of html block (1 to 7) a line starting at `position` opens, or 0.
+# `may_be_tag` is false where a kind 7 block may not start: it cannot
+# interrupt a paragraph.
+fn html_block_type(source: String, position: Int, limit: Int, may_be_tag: Bool) -> Int:
+    after := position + 1
+    for name in ["script", "pre", "style", "textarea"]:
+        if starts_with_ignore_case(source, after, limit, name):
+            end := after + name.len()
+            if end >= limit or is_space_or_tab(ord(source[end])) or ord(source[end]) == 62:
+                return 1
+    if starts_with_ignore_case(source, after, limit, "!--"):
+        return 2
+    if after < limit and ord(source[after]) == 63:
+        return 3
+    if after + 1 < limit and ord(source[after]) == 33 and is_ascii_letter(ord(source[after + 1])):
+        return 4
+    if starts_with_exactly(source, after, limit, "![CDATA["):
+        return 5
+    mut name_start := after
+    if name_start < limit and ord(source[name_start]) == 47:
+        name_start += 1
+    name_end := skip_tag_name(source, name_start, limit)
+    if name_end > name_start and is_block_tag_name(source, name_start, name_end):
+        if name_end >= limit or is_space_or_tab(ord(source[name_end])) or ord(source[name_end]) == 62:
+            return 6
+        if ord(source[name_end]) == 47 and name_end + 1 < limit and ord(source[name_end + 1]) == 62:
+            return 6
+    if not may_be_tag:
+        return 0
+    mut tag_end := scan_open_tag(source, position, limit)
+    if tag_end < 0:
+        tag_end = scan_closing_tag(source, position, limit)
+    if tag_end < 0:
+        return 0
+    for name in ["script", "pre", "style", "textarea"]:
+        if name_end - name_start == name.len() and starts_with_ignore_case(source, name_start, name_end, name):
+            return 0
+    while tag_end < limit and is_space_or_tab(ord(source[tag_end])):
+        tag_end += 1
+    if tag_end < limit:
+        return 0
+    return 7
+
+# the tag names that open a kind 6 html block, each between spaces.
+BLOCK_TAG_NAMES := " address article aside base basefont blockquote body caption center col colgroup dd details dialog dir div dl dt fieldset figcaption figure footer form frame frameset h1 h2 h3 h4 h5 h6 head header hr html iframe legend li link main menu menuitem nav noframes ol optgroup option p param search section summary table tbody td tfoot th thead title tr track ul "
+
+fn is_block_tag_name(source: String, start: Int, end: Int) -> Bool:
+    if end - start > 10:
+        return false
+    return BLOCK_TAG_NAMES.contains(" " + source.substring(start, end).to_lower() + " ")
+
+fn find_text_ignore_case(source: String, position: Int, limit: Int, needle: String) -> Int:
+    mut i := position
+    while i + needle.len() <= limit:
+        if starts_with_ignore_case(source, i, limit, needle):
+            return i
+        i += 1
+    return -1
+
+# parse the link reference definitions at the start of `content`, adding each
+# to `references` (the first definition of a label wins). returns how many
+# bytes they took.
+fn parse_references(content: String, position: Int, references: Map[String, Reference]) -> Int:
+    mut at := position
+    while at < content.len() and ord(content[at]) == 91:
+        taken := parse_reference(content, at, references)
+        if taken == 0:
+            break
+        at += taken
+    return at - position
+
+fn parse_reference(content: String, position: Int, references: Map[String, Reference]) -> Int:
+    label_end := scan_link_label(content, position)
+    if label_end < 0 or label_end >= content.len() or ord(content[label_end]) != 58:
+        return 0
+    destination := scan_link_destination(content, skip_spnl(content, label_end + 1))
+    if not destination.found:
+        return 0
+    before_title := destination.next
+    mut at := skip_spnl(content, before_title)
+    mut title_start := -1
+    mut title_end := -1
+    if at != before_title:
+        after_title := scan_link_title(content, at)
+        if after_title >= 0:
+            title_start = at + 1
+            title_end = after_title - 1
+            at = after_title
+    if title_start < 0:
+        at = before_title
+    mut line_end := skip_spaces(content, at)
+    if line_end < content.len() and ord(content[line_end]) != 10:
+        if title_start < 0:
+            return 0
+        title_start = -1
+        line_end = skip_spaces(content, before_title)
+        if line_end < content.len() and ord(content[line_end]) != 10:
+            return 0
+    key := normalize_label(content, position + 1, label_end - 1)
+    if key == "":
+        return 0
+    if not references.contains_key(key):
+        mut title := ""
+        if title_start >= 0:
+            title = unescape(content, title_start, title_end)
+        references[key] = Reference(destination: unescape(content, destination.start, destination.end), title: title)
+    if line_end < content.len():
+        return line_end + 1 - position
+    return line_end - position
+
+# ---------------------------------------------------------------
+# inline structure
+# ---------------------------------------------------------------
+
+enum InlineKind:
+    Root
+    Text
+    SoftBreak
+    HardBreak
+    Code
+    Html
+    Emphasis
+    Strong
+    Link
+    Image
+
+# one inline node. text is either a span of the subject (`start` >= 0) or a
+# literal in `literal`, so plain runs are not copied until they are emitted.
+struct Inline:
+    kind: InlineKind
+    start: Int = -1
+    end: Int = -1
+    literal: String = ""
+    destination: String = ""
+    title: String = ""
+    parent: Int = -1
+    first_child: Int = -1
+    last_child: Int = -1
+    prev: Int = -1
+    next: Int = -1
+
+# an emphasis delimiter run on the delimiter stack.
+struct Delimiter:
+    marker: Int
+    count: Int
+    original: Int
+    node: Int
+    prev: Int
+    next: Int
+    can_open: Bool
+    can_close: Bool
+
+# an open `[` or `![` waiting for its `]`.
+struct Bracket:
+    node: Int
+    position: Int
+    image: Bool
+    previous_delimiter: Int
+    bracket_after: Bool
+
+# parses one paragraph or heading into a tree of inline nodes, following the
+# reference parser and the delimiter algorithm of the spec's appendix.
+struct InlineParser:
+    subject: String
+    position: Int
+    nodes: List[Inline]
+    delimiters: List[Delimiter]
+    top_delimiter: Int
+    brackets: List[Bracket]
+    # link openers below this index on the bracket stack are inactive: a link
+    # may not contain another link. one bound instead of a flag per opener
+    # keeps closing a link constant time.
+    link_floor: Int
+    document: Document
+    # the last position of a backtick run of each length, once a search for
+    # a closing run has reached the end of the subject.
+    backtick_runs: Map[Int, Int]
+    backticks_scanned: Bool
+    # set once a construct is known to have no terminator in the rest of the
+    # subject, so later openers of the same kind are not rescanned.
+    no_comment_end: Bool
+    no_instruction_end: Bool
+    no_declaration_end: Bool
+    no_cdata_end: Bool
+
+fn parse_inlines(subject: String, document: Document) -> InlineParser:
+    mut nodes: List[Inline] := []
+    nodes.push(Inline(kind: InlineKind.Root))
+    parser := InlineParser(subject: subject, position: 0, nodes: nodes, delimiters: [], top_delimiter: -1, brackets: [], link_floor: 0, document: document, backtick_runs: {}, backticks_scanned: false, no_comment_end: false, no_instruction_end: false, no_declaration_end: false, no_cdata_end: false)
+    parser.parse()
+    return parser
+
+impl InlineParser:
+    fn parse():
+        subject := self.subject
+        special := self.document.inline_special
+        length := subject.len()
+        while self.position < length:
+            c := ord(subject[self.position])
+            if ord(special[c]) == 48:
+                self.parse_text_run()
+            elif c == 10:
+                self.parse_newline()
+            elif c == 92:
+                self.parse_backslash()
+            elif c == 96:
+                self.parse_backticks()
+            elif c == 42 or c == 95:
+                self.parse_delimiter_run(c)
+            elif c == 91:
+                node := self.append_span(self.position, self.position + 1)
+                self.push_bracket(node, self.position, false)
+                self.position += 1
+            elif c == 33:
+                self.parse_bang()
+            elif c == 93:
+                self.parse_close_bracket()
+            elif c == 60:
+                self.parse_angle()
+            else:
+                self.parse_entity()
+        self.process_emphasis(-1)
+
+    fn new_node(kind: InlineKind) -> Int:
+        index := self.nodes.len()
+        self.nodes.push(Inline(kind: kind))
+        return index
+
+    fn append_child(parent: Int, child: Int):
+        node := self.nodes[child]
+        node.parent = parent
+        node.next = -1
+        last := self.nodes[parent].last_child
+        node.prev = last
+        if last >= 0:
+            self.nodes[last].next = child
+        else:
+            self.nodes[parent].first_child = child
+        self.nodes[parent].last_child = child
+
+    fn unlink(index: Int):
+        node := self.nodes[index]
+        if node.prev >= 0:
+            self.nodes[node.prev].next = node.next
+        elif node.parent >= 0:
+            self.nodes[node.parent].first_child = node.next
+        if node.next >= 0:
+            self.nodes[node.next].prev = node.prev
+        elif node.parent >= 0:
+            self.nodes[node.parent].last_child = node.prev
+        node.parent = -1
+        node.prev = -1
+        node.next = -1
+
+    fn insert_after(index: Int, sibling: Int):
+        node := self.nodes[index]
+        added := self.nodes[sibling]
+        added.parent = node.parent
+        added.prev = index
+        added.next = node.next
+        if node.next >= 0:
+            self.nodes[node.next].prev = sibling
+        elif node.parent >= 0:
+            self.nodes[node.parent].last_child = sibling
+        node.next = sibling
+
+    fn append_span(start: Int, end: Int) -> Int:
+        index := self.nodes.len()
+        self.nodes.push(Inline(kind: InlineKind.Text, start: start, end: end))
+        self.append_child(0, index)
+        return index
+
+    fn append_literal(kind: InlineKind, literal: String) -> Int:
+        index := self.nodes.len()
+        self.nodes.push(Inline(kind: kind, literal: literal))
+        self.append_child(0, index)
+        return index
+
+    fn parse_text_run():
+        subject := self.subject
+        special := self.document.inline_special
+        length := subject.len()
+        start := self.position
+        mut end := start + 1
+        while end < length and ord(special[ord(subject[end])]) == 48:
+            end += 1
+        self.position = end
+        mut kept := end
+        if end < length and ord(subject[end]) == 10:
+            while kept > start and is_ascii_whitespace(ord(subject[kept - 1])):
+                kept -= 1
+        if kept > start:
+            self.append_span(start, kept)
+
+    fn parse_newline():
+        subject := self.subject
+        newline_at := self.position
+        self.position += 1
+        while self.position < subject.len() and is_space_or_tab(ord(subject[self.position])):
+            self.position += 1
+        if newline_at > 1 and ord(subject[newline_at - 1]) == 32 and ord(subject[newline_at - 2]) == 32:
+            self.append_literal(InlineKind.HardBreak, "")
+        else:
+            self.append_literal(InlineKind.SoftBreak, "")
+
+    fn parse_backslash():
+        subject := self.subject
+        self.position += 1
+        if self.position < subject.len():
+            c := ord(subject[self.position])
+            if c == 10:
+                self.position += 1
+                self.append_literal(InlineKind.HardBreak, "")
+                return
+            if is_ascii_punctuation(c):
+                self.append_span(self.position, self.position + 1)
+                self.position += 1
+                return
+        self.append_span(self.position - 1, self.position)
+
+    fn parse_backticks():
+        subject := self.subject
+        length := subject.len()
+        start := self.position
+        mut after_open := start
+        while after_open < length and ord(subject[after_open]) == 96:
+            after_open += 1
+        ticks := after_open - start
+        self.position = after_open
+        if self.backticks_scanned and self.backtick_runs.get(ticks).unwrap_or(-1) < after_open:
+            self.append_span(start, after_open)
+            return
+        mut i := after_open
+        while i < length:
+            if ord(subject[i]) != 96:
+                i += 1
+                continue
+            run_start := i
+            while i < length and ord(subject[i]) == 96:
+                i += 1
+            run := i - run_start
+            self.backtick_runs[run] = run_start
+            if run == ticks:
+                self.append_literal(InlineKind.Code, code_span_text(subject, after_open, run_start))
+                self.position = i
+                return
+        self.backticks_scanned = true
+        self.append_span(start, after_open)
+
+    fn parse_delimiter_run(marker: Int):
+        subject := self.subject
+        start := self.position
+        mut end := start
+        while end < subject.len() and ord(subject[end]) == marker:
+            end += 1
+        before := code_point_before(subject, start)
+        after := code_point_at(subject, end)
+        before_space := is_unicode_whitespace(before)
+        before_punct := is_unicode_punctuation(before)
+        after_space := is_unicode_whitespace(after)
+        after_punct := is_unicode_punctuation(after)
+        left := not after_space and (not after_punct or before_space or before_punct)
+        right := not before_space and (not before_punct or after_space or after_punct)
+        mut can_open := left
+        mut can_close := right
+        if marker == 95:
+            can_open = left and (not right or before_punct)
+            can_close = right and (not left or after_punct)
+        node := self.append_span(start, end)
+        self.position = end
+        if not can_open and not can_close:
+            return
+        count := end - start
+        index := self.delimiters.len()
+        self.delimiters.push(Delimiter(marker: marker, count: count, original: count, node: node, prev: self.top_delimiter, next: -1, can_open: can_open, can_close: can_close))
+        if self.top_delimiter >= 0:
+            self.delimiters[self.top_delimiter].next = index
+        self.top_delimiter = index
+
+    fn push_bracket(node: Int, position: Int, image: Bool):
+        if self.brackets.len() > 0:
+            self.brackets[self.brackets.len() - 1].bracket_after = true
+        self.brackets.push(Bracket(node: node, position: position, image: image, previous_delimiter: self.top_delimiter, bracket_after: false))
+
+    fn pop_bracket():
+        self.brackets.remove(self.brackets.len() - 1)
+        self.link_floor = min(self.link_floor, self.brackets.len())
+
+    fn parse_bang():
+        subject := self.subject
+        start := self.position
+        if start + 1 < subject.len() and ord(subject[start + 1]) == 91:
+            node := self.append_span(start, start + 2)
+            self.push_bracket(node, start + 1, true)
+            self.position = start + 2
+            return
+        self.append_span(start, start + 1)
+        self.position = start + 1
+
+    fn parse_close_bracket():
+        subject := self.subject
+        self.position += 1
+        after_bracket := self.position
+        if self.brackets.len() == 0:
+            self.append_span(after_bracket - 1, after_bracket)
+            return
+        top := self.brackets.len() - 1
+        opener := self.brackets[top]
+        if not opener.image and top < self.link_floor:
+            self.append_span(after_bracket - 1, after_bracket)
+            self.pop_bracket()
+            return
+
+        mut matched := false
+        mut destination := ""
+        mut title := ""
+        if after_bracket < subject.len() and ord(subject[after_bracket]) == 40:
+            found := scan_link_destination(subject, skip_spnl(subject, after_bracket + 1))
+            if found.found:
+                mut at := skip_spnl(subject, found.next)
+                mut title_start := -1
+                mut title_end := -1
+                if at > found.next and is_ascii_whitespace(ord(subject[at - 1])):
+                    after_title := scan_link_title(subject, at)
+                    if after_title >= 0:
+                        title_start = at + 1
+                        title_end = after_title - 1
+                        at = skip_spnl(subject, after_title)
+                if at < subject.len() and ord(subject[at]) == 41:
+                    self.position = at + 1
+                    matched = true
+                    destination = unescape(subject, found.start, found.end)
+                    if title_start >= 0:
+                        title = unescape(subject, title_start, title_end)
+
+        if not matched:
+            label_end := scan_link_label(subject, after_bracket)
+            mut label_start := -1
+            mut label_stop := -1
+            if label_end > after_bracket + 2:
+                label_start = after_bracket
+                label_stop = label_end
+            elif not opener.bracket_after:
+                label_start = opener.position
+                label_stop = after_bracket
+            if label_start >= 0:
+                if let reference = self.lookup_reference(label_start + 1, label_stop - 1):
+                    matched = true
+                    destination = reference.destination
+                    title = reference.title
+                    if label_end > after_bracket:
+                        self.position = label_end
+
+        if not matched:
+            self.pop_bracket()
+            self.position = after_bracket
+            self.append_span(after_bracket - 1, after_bracket)
+            return
+
+        mut kind := InlineKind.Link
+        if opener.image:
+            kind = InlineKind.Image
+        link := self.new_node(kind)
+        self.nodes[link].destination = destination
+        self.nodes[link].title = title
+        mut child := self.nodes[opener.node].next
+        while child >= 0:
+            following := self.nodes[child].next
+            self.unlink(child)
+            self.append_child(link, child)
+            child = following
+        self.append_child(0, link)
+        self.process_emphasis(opener.previous_delimiter)
+        self.pop_bracket()
+        self.unlink(opener.node)
+        if not opener.image:
+            self.link_floor = self.brackets.len()
+
+    # the definition a label refers to, charged against the document's
+    # reference budget, or none.
+    fn lookup_reference(start: Int, end: Int) -> Reference?:
+        if self.document.references.len() == 0 or end - start > MAX_LABEL_BYTES:
+            return none
+        key := normalize_label(self.subject, start, end)
+        if key == "":
+            return none
+        found := self.document.references.get(key)
+        if found == none:
+            return none
+        reference := found.value()
+        cost := reference.destination.len() + reference.title.len()
+        if cost > self.document.reference_budget:
+            return none
+        self.document.reference_budget -= cost
+        return reference
+
+    fn parse_angle():
+        start := self.position
+        autolink_end := self.parse_autolink()
+        if autolink_end > 0:
+            self.position = autolink_end
+            return
+        tag_end := self.scan_raw_html(start)
+        if tag_end > 0:
+            self.append_literal(InlineKind.Html, self.subject.substring(start, tag_end))
+            self.position = tag_end
+            return
+        self.append_span(start, start + 1)
+        self.position = start + 1
+
+    # an autolink at the current `<`: appends the link and returns the
+    # position after it, or returns 0.
+    fn parse_autolink() -> Int:
+        subject := self.subject
+        length := subject.len()
+        start := self.position + 1
+        mut i := start
+        if i < length and is_ascii_letter(ord(subject[i])):
+            i += 1
+            while i < length and i - start < 32:
+                c := ord(subject[i])
+                if not is_ascii_alphanumeric(c) and c != 43 and c != 46 and c != 45:
+                    break
+                i += 1
+            if i - start >= 2 and i < length and ord(subject[i]) == 58:
+                i += 1
+                while i < length:
+                    c := ord(subject[i])
+                    if c == 62:
+                        address := unescape_entities(subject, start, i)
+                        self.append_autolink(address, address)
+                        return i + 1
+                    if c <= 32 or c == 60 or c == 127:
+                        break
+                    i += 1
+        i = start
+        while i < length and is_email_local_char(ord(subject[i])):
+            i += 1
+        if i == start or i >= length or ord(subject[i]) != 64:
+            return 0
+        i += 1
+        while true:
+            label_start := i
+            while i < length and (is_ascii_alphanumeric(ord(subject[i])) or ord(subject[i]) == 45):
+                i += 1
+            label_length := i - label_start
+            if label_length == 0 or label_length > 63:
+                return 0
+            if ord(subject[label_start]) == 45 or ord(subject[i - 1]) == 45:
+                return 0
+            if i < length and ord(subject[i]) == 46:
+                i += 1
+                continue
+            break
+        if i >= length or ord(subject[i]) != 62:
+            return 0
+        address := unescape_entities(subject, start, i)
+        self.append_autolink("mailto:" + address, address)
+        return i + 1
+
+    fn append_autolink(destination: String, label: String):
+        link := self.new_node(InlineKind.Link)
+        self.nodes[link].destination = destination
+        text_node := self.new_node(InlineKind.Text)
+        self.nodes[text_node].literal = label
+        self.append_child(link, text_node)
+        self.append_child(0, link)
+
+    # the end of the raw html construct starting at `start`, or 0.
+    fn scan_raw_html(start: Int) -> Int:
+        subject := self.subject
+        length := subject.len()
+        if start + 1 >= length:
+            return 0
+        c := ord(subject[start + 1])
+        if c == 47:
+            return max(scan_closing_tag(subject, start, length), 0)
+        if c == 63:
+            if self.no_instruction_end:
+                return 0
+            end := find_text(subject, start + 2, length, "?>")
+            if end < 0:
+                self.no_instruction_end = true
+                return 0
+            return end + 2
+        if c == 33:
+            return self.scan_bang_html(start)
+        return max(scan_open_tag(subject, start, length), 0)
+
+    fn scan_bang_html(start: Int) -> Int:
+        subject := self.subject
+        length := subject.len()
+        if starts_with_ignore_case(subject, start, length, "<!--"):
+            if starts_with_ignore_case(subject, start, length, "<!-->"):
+                return start + 5
+            if starts_with_ignore_case(subject, start, length, "<!--->"):
+                return start + 6
+            if self.no_comment_end:
+                return 0
+            end := find_text(subject, start + 4, length, "-->")
+            if end < 0:
+                self.no_comment_end = true
+                return 0
+            return end + 3
+        if starts_with_exactly(subject, start, length, "<![CDATA["):
+            if self.no_cdata_end:
+                return 0
+            end := find_text(subject, start + 9, length, "]]>")
+            if end < 0:
+                self.no_cdata_end = true
+                return 0
+            return end + 3
+        if start + 2 < length and is_ascii_letter(ord(subject[start + 2])):
+            if self.no_declaration_end:
+                return 0
+            end := find_text(subject, start + 3, length, ">")
+            if end < 0:
+                self.no_declaration_end = true
+                return 0
+            return end + 1
+        return 0
+
+    fn parse_entity():
+        start := self.position
+        entity := entity_at(self.subject, start, self.subject.len())
+        if entity.length == 0:
+            self.append_span(start, start + 1)
+            self.position = start + 1
+            return
+        self.append_literal(InlineKind.Text, entity.value)
+        self.position = start + entity.length
+
+    fn remove_delimiter(index: Int):
+        delimiter := self.delimiters[index]
+        if delimiter.prev >= 0:
+            self.delimiters[delimiter.prev].next = delimiter.next
+        if delimiter.next >= 0:
+            self.delimiters[delimiter.next].prev = delimiter.prev
+        else:
+            self.top_delimiter = delimiter.prev
+
+    # match emphasis openers and closers above `bottom` on the delimiter
+    # stack, per the spec's appendix. `openers_bottom` remembers, for each
+    # kind of closer, below which point no opener can match it, which keeps
+    # the search linear.
+    fn process_emphasis(bottom: Int):
+        mut openers_bottom: List[Int] := []
+        for slot in 0..12:
+            openers_bottom.push(bottom)
+        mut closer := self.top_delimiter
+        while closer >= 0 and self.delimiters[closer].prev != bottom:
+            closer = self.delimiters[closer].prev
+        while closer >= 0:
+            closing := self.delimiters[closer]
+            if not closing.can_close:
+                closer = closing.next
+                continue
+            mut slot := closing.original % 3
+            if closing.marker == 42:
+                slot += 6
+            if closing.can_open:
+                slot += 3
+            mut opener := closing.prev
+            mut found := false
+            while opener >= 0 and opener != bottom and opener != openers_bottom[slot]:
+                opening := self.delimiters[opener]
+                odd_match := (closing.can_open or opening.can_close) and closing.original % 3 != 0 and (opening.original + closing.original) % 3 == 0
+                if opening.marker == closing.marker and opening.can_open and not odd_match:
+                    found = true
+                    break
+                opener = opening.prev
+            if not found:
+                openers_bottom[slot] = closing.prev
+                next_closer := closing.next
+                if not closing.can_open:
+                    self.remove_delimiter(closer)
+                closer = next_closer
+                continue
+            opening := self.delimiters[opener]
+            mut used := 1
+            if closing.count >= 2 and opening.count >= 2:
+                used = 2
+            opening.count -= used
+            closing.count -= used
+            self.nodes[opening.node].end -= used
+            self.nodes[closing.node].end -= used
+            mut kind := InlineKind.Emphasis
+            if used == 2:
+                kind = InlineKind.Strong
+            emphasis := self.new_node(kind)
+            mut child := self.nodes[opening.node].next
+            while child >= 0 and child != closing.node:
+                following := self.nodes[child].next
+                self.unlink(child)
+                self.append_child(emphasis, child)
+                child = following
+            self.insert_after(opening.node, emphasis)
+            # drop the delimiters between the opener and the closer
+            opening.next = closer
+            closing.prev = opener
+            if opening.count == 0:
+                self.unlink(opening.node)
+                self.remove_delimiter(opener)
+            if closing.count == 0:
+                self.unlink(closing.node)
+                next_closer := closing.next
+                self.remove_delimiter(closer)
+                closer = next_closer
+        while self.top_delimiter >= 0 and self.top_delimiter != bottom:
+            self.remove_delimiter(self.top_delimiter)
+
+fn is_email_local_char(c: Int) -> Bool:
+    if is_ascii_alphanumeric(c):
+        return true
+    return c == 46 or c == 33 or c == 35 or c == 36 or c == 37 or c == 38 or c == 39 or c == 42 or c == 43 or c == 47 or c == 61 or c == 63 or c == 94 or c == 95 or c == 96 or c == 123 or c == 124 or c == 125 or c == 126 or c == 45
+
+# source[start..end] with character references decoded but backslashes kept,
+# as autolinks are read.
+fn unescape_entities(source: String, start: Int, end: Int) -> String:
+    mut parts: List[String] := []
+    mut copied := start
+    mut i := start
+    while i < end:
+        if ord(source[i]) != 38:
+            i += 1
+            continue
+        entity := entity_at(source, i, end)
+        if entity.length == 0:
+            i += 1
+            continue
+        if i > copied:
+            parts.push(source.substring(copied, i))
+        parts.push(entity.value)
+        i += entity.length
+        copied = i
+    if copied == start:
+        return source.substring(start, end)
+    if copied < end:
+        parts.push(source.substring(copied, end))
+    return parts.join("")
+
+# a code span's content: line endings become spaces, and one space is
+# stripped from each end when both ends have one and the span is not all
+# spaces.
+fn code_span_text(source: String, start: Int, end: Int) -> String:
+    mut content := source.substring(start, end)
+    if content.contains("\n"):
+        content = content.replace("\n", " ")
+    length := content.len()
+    if length >= 2 and ord(content[0]) == 32 and ord(content[length - 1]) == 32:
+        for i in 0..length:
+            if ord(content[i]) != 32:
+                return content.substring(1, length - 1)
+    return content
+
+# ---------------------------------------------------------------
+# the event stream
+# ---------------------------------------------------------------
+
+# An iterator over the events of a parsed document. Get one from `events`.
+pub struct Events:
+    document: Document
+    opts: Options
+    queue: List[Event]
+    queue_at: Int
+    node: Int
+    entering: Bool
+    finished: Bool
+
+impl Iterator for Events:
+    type Item = Event
+
+    # The next event, or none after the end of the document.
+    fn next() -> Item?:
+        while self.queue_at >= self.queue.len():
+            if self.finished:
+                return none
+            self.queue.clear()
+            self.queue_at = 0
+            self.step()
+        event := self.queue[self.queue_at]
+        self.queue_at += 1
+        return event
+
+impl Events:
+    # walk one step through the block tree, queueing its events. the walk
+    # follows parent and sibling links, so it uses no stack however deep the
+    # tree is.
+    fn step():
+        blocks := self.document.blocks
+        index := self.node
+        block := blocks[index]
+        if not self.entering:
+            if block.kind == BlockKind.Document:
+                self.finished = true
+                return
+            self.queue.push(Event.End(container_tag(block)))
+            self.move_past(block)
+            return
+        match block.kind:
+            BlockKind.Document | BlockKind.Quote | BlockKind.List | BlockKind.Item =>
+                if block.kind != BlockKind.Document:
+                    self.queue.push(Event.Start(container_tag(block)))
+                if block.first_child >= 0:
+                    self.node = block.first_child
+                else:
+                    self.entering = false
+                return
+            BlockKind.Paragraph =>
+                tight := self.in_tight_item(block)
+                if not tight:
+                    self.queue.push(Event.Start(Tag.Paragraph))
+                self.queue_inlines(block.content)
+                if not tight:
+                    self.queue.push(Event.End(Tag.Paragraph))
+            BlockKind.Heading =>
+                self.queue.push(Event.Start(Tag.Heading(block.level)))
+                self.queue_inlines(block.content)
+                self.queue.push(Event.End(Tag.Heading(block.level)))
+            BlockKind.Rule =>
+                self.queue.push(Event.Rule)
+            BlockKind.Code =>
+                self.queue.push(Event.Start(Tag.CodeBlock(block.info)))
+                if block.content.len() > 0:
+                    self.queue.push(Event.Text(block.content))
+                self.queue.push(Event.End(Tag.CodeBlock(block.info)))
+            BlockKind.Html =>
+                if self.opts.raw_html:
+                    self.queue.push(Event.Html(block.content))
+                else:
+                    tight := self.in_tight_item(block)
+                    if not tight:
+                        self.queue.push(Event.Start(Tag.Paragraph))
+                    if block.content.len() > 0:
+                        self.queue.push(Event.Text(block.content))
+                    if not tight:
+                        self.queue.push(Event.End(Tag.Paragraph))
+        self.move_past(block)
+
+    fn move_past(block: Block):
+        if block.next >= 0:
+            self.node = block.next
+            self.entering = true
+        else:
+            self.node = block.parent
+            self.entering = false
+
+    fn in_tight_item(block: Block) -> Bool:
+        blocks := self.document.blocks
+        if block.parent < 0 or blocks[block.parent].kind != BlockKind.Item:
+            return false
+        return blocks[blocks[block.parent].parent].tight
+
+    # parse a leaf's inline content and queue its events, merging adjacent
+    # text into one event.
+    fn queue_inlines(content: String):
+        subject := trim_end(content)
+        if subject.len() == 0:
+            return
+        parser := parse_inlines(subject, self.document)
+        nodes := parser.nodes
+        mut current := nodes[0].first_child
+        mut entering := true
+        while current > 0:
+            node := nodes[current]
+            if entering:
+                if node.kind == InlineKind.Text or (node.kind == InlineKind.Html and not self.opts.raw_html):
+                    current = self.queue_text_run(parser, current)
+                    entering = false
+                    continue
+                match node.kind:
+                    InlineKind.SoftBreak =>
+                        self.queue.push(Event.SoftBreak)
+                    InlineKind.HardBreak =>
+                        self.queue.push(Event.HardBreak)
+                    InlineKind.Code =>
+                        self.queue.push(Event.Code(node.literal))
+                    InlineKind.Html =>
+                        self.queue.push(Event.InlineHtml(node.literal))
+                    _ =>
+                        self.queue.push(Event.Start(self.inline_tag(node)))
+                        if node.first_child >= 0:
+                            current = node.first_child
+                            continue
+                        self.queue.push(Event.End(self.inline_tag(node)))
+            else:
+                if node.kind != InlineKind.Text and node.kind != InlineKind.Html and node.first_child >= 0:
+                    self.queue.push(Event.End(self.inline_tag(node)))
+            if node.next >= 0:
+                current = node.next
+                entering = true
+            else:
+                current = node.parent
+                entering = false
+
+    # queue one Text event for the run of text siblings starting at `first`
+    # and return the last node of the run.
+    fn queue_text_run(parser: InlineParser, first: Int) -> Int:
+        nodes := parser.nodes
+        mut pieces: List[String] := []
+        mut current := first
+        mut last := first
+        while current >= 0:
+            node := nodes[current]
+            if node.kind == InlineKind.Text:
+                if node.start >= 0:
+                    if node.end > node.start:
+                        pieces.push(parser.subject.substring(node.start, node.end))
+                elif node.literal.len() > 0:
+                    pieces.push(node.literal)
+            elif node.kind == InlineKind.Html and not self.opts.raw_html:
+                pieces.push(node.literal)
+            else:
+                break
+            last = current
+            current = node.next
+        if pieces.len() == 1:
+            self.queue.push(Event.Text(pieces[0]))
+        elif pieces.len() > 1:
+            self.queue.push(Event.Text(pieces.join("")))
+        return last
+
+    fn inline_tag(node: Inline) -> Tag:
+        return match node.kind:
+            InlineKind.Emphasis => Tag.Emphasis
+            InlineKind.Strong => Tag.Strong
+            InlineKind.Image => Tag.Image(self.checked_url(node.destination), node.title)
+            _ => Tag.Link(self.checked_url(node.destination), node.title)
+
+    # the destination as the events carry it: refused urls become "".
+    fn checked_url(destination: String) -> String:
+        if self.opts.unsafe_urls:
+            return destination
+        if html.safe_url(destination) == "about:blank":
+            return ""
+        return destination
+
+fn container_tag(block: Block) -> Tag:
+    return match block.kind:
+        BlockKind.Quote => Tag.BlockQuote
+        BlockKind.Item => Tag.Item
+        _ => list_tag(block)
+
+fn list_tag(block: Block) -> Tag:
+    if block.ordered:
+        return Tag.List(block.list_start, block.tight)
+    return Tag.List(none, block.tight)
+
+fn trim_end(content: String) -> String:
+    mut end := content.len()
+    while end > 0 and is_ascii_whitespace(ord(content[end - 1])):
+        end -= 1
+    if end == content.len():
+        return content
+    return content.substring(0, end)
+
+# ---------------------------------------------------------------
+# the html renderer
+# ---------------------------------------------------------------
+
+# Renders events as html, the way cmark does. Get one from `html_renderer`.
+pub struct HtmlRenderer:
+    parts: List[String]
+    at_line_start: Bool
+    # how many images deep the renderer is: inside an image, only the text of
+    # the events is written, as the alt attribute.
+    image_depth: Int
+    # heap copies of HTML_SPECIAL and HREF_SAFE, which index faster than the
+    # constants (see Document.inline_special).
+    html_special: String
+    href_safe: String
+
+# A renderer that writes html.
+pub fn html_renderer() -> HtmlRenderer:
+    return HtmlRenderer(parts: [], at_line_start: true, image_depth: 0, html_special: HTML_SPECIAL.substring(0, 256), href_safe: HREF_SAFE.substring(0, 256))
+
+impl Renderer for HtmlRenderer:
+    # Writes the html for one event.
+    fn event(event: Event):
+        if self.image_depth > 0:
+            self.alt_text_event(event)
+            return
+        match event:
+            Event.Start(tag) =>
+                self.open_tag(tag)
+            Event.End(tag) =>
+                self.close_tag(tag)
+            Event.Text(content) =>
+                self.write_escaped(content)
+            Event.Code(content) =>
+                self.write("<code>")
+                self.write_escaped(content)
+                self.write("</code>")
+            Event.Html(content) =>
+                self.newline()
+                self.write(content)
+                self.newline()
+            Event.InlineHtml(content) =>
+                self.write(content)
+            Event.SoftBreak =>
+                self.write("\n")
+            Event.HardBreak =>
+                self.write("<br />\n")
+            Event.Rule =>
+                self.newline()
+                self.write("<hr />\n")
+
+    # The html written so far.
+    fn finish() -> String:
+        return self.parts.join("")
+
+impl HtmlRenderer:
+    fn write(piece: String):
+        if piece.len() == 0:
+            return
+        self.parts.push(piece)
+        self.at_line_start = ord(piece[piece.len() - 1]) == 10
+
+    # start a new line unless the output is empty or already at one.
+    fn newline():
+        if not self.at_line_start:
+            self.write("\n")
+
+    fn write_escaped(content: String):
+        special := self.html_special
+        mut copied := 0
+        for i in 0..content.len():
+            c := ord(content[i])
+            if ord(special[c]) == 48:
+                continue
+            if i > copied:
+                self.parts.push(content.substring(copied, i))
+            self.parts.push(html_entity(c))
+            copied = i + 1
+        if copied == 0:
+            self.write(content)
+            return
+        if copied < content.len():
+            self.parts.push(content.substring(copied, content.len()))
+        self.at_line_start = ord(content[content.len() - 1]) == 10
+
+    fn write_url(url: String):
+        safe := self.href_safe
+        mut copied := 0
+        for i in 0..url.len():
+            c := ord(url[i])
+            if ord(safe[c]) == 49:
+                continue
+            if i > copied:
+                self.parts.push(url.substring(copied, i))
+            if c == 38:
+                self.parts.push("&amp;")
+            elif c == 39:
+                self.parts.push("&#39;")
+            else:
+                self.parts.push(percent_encoded(c))
+            copied = i + 1
+        if copied < url.len():
+            self.parts.push(url.substring(copied, url.len()))
+        self.at_line_start = false
+
+    fn open_tag(tag: Tag):
+        match tag:
+            Tag.Paragraph =>
+                self.newline()
+                self.write("<p>")
+            Tag.Heading(level) =>
+                self.newline()
+                self.write("<h{level}>")
+            Tag.BlockQuote =>
+                self.newline()
+                self.write("<blockquote>\n")
+            Tag.CodeBlock(info) =>
+                self.newline()
+                language := first_word(info)
+                if language.len() == 0:
+                    self.write("<pre><code>")
+                else:
+                    self.write("<pre><code class=\"language-")
+                    self.write_escaped(language)
+                    self.write("\">")
+            Tag.List(start, tight) =>
+                self.newline()
+                if start == none:
+                    self.write("<ul>\n")
+                elif start == 1:
+                    self.write("<ol>\n")
+                else:
+                    self.write("<ol start=\"{start.value()}\">\n")
+            Tag.Item =>
+                self.newline()
+                self.write("<li>")
+            Tag.Emphasis =>
+                self.write("<em>")
+            Tag.Strong =>
+                self.write("<strong>")
+            Tag.Link(url, title) =>
+                self.write("<a href=\"")
+                self.write_url(url)
+                if title.len() > 0:
+                    self.write("\" title=\"")
+                    self.write_escaped(title)
+                self.write("\">")
+            Tag.Image(url, title) =>
+                self.write("<img src=\"")
+                self.write_url(url)
+                self.write("\" alt=\"")
+                self.image_depth = 1
+
+    fn close_tag(tag: Tag):
+        match tag:
+            Tag.Paragraph =>
+                self.write("</p>\n")
+            Tag.Heading(level) =>
+                self.write("</h{level}>\n")
+            Tag.BlockQuote =>
+                self.newline()
+                self.write("</blockquote>\n")
+            Tag.CodeBlock(info) =>
+                self.write("</code></pre>\n")
+            Tag.List(start, tight) =>
+                if start == none:
+                    self.write("</ul>\n")
+                else:
+                    self.write("</ol>\n")
+            Tag.Item =>
+                self.write("</li>\n")
+            Tag.Emphasis =>
+                self.write("</em>")
+            Tag.Strong =>
+                self.write("</strong>")
+            Tag.Link(url, title) =>
+                self.write("</a>")
+            Tag.Image(url, title) =>
+                self.write("\" />")
+
+    # inside an image, text becomes the alt attribute and tags are dropped.
+    fn alt_text_event(event: Event):
+        match event:
+            Event.Start(tag) =>
+                if let Tag.Image(url, title) = tag:
+                    self.image_depth += 1
+            Event.End(tag) =>
+                if let Tag.Image(url, title) = tag:
+                    self.image_depth -= 1
+                    if self.image_depth == 0:
+                        if title.len() > 0:
+                            self.write("\" title=\"")
+                            self.write_escaped(title)
+                        self.write("\" />")
+            Event.Text(content) =>
+                self.write_escaped(content)
+            Event.Code(content) =>
+                self.write_escaped(content)
+            Event.InlineHtml(content) =>
+                self.write_escaped(content)
+            Event.Html(content) =>
+                self.write_escaped(content)
+            Event.SoftBreak | Event.HardBreak =>
+                self.write(" ")
+            Event.Rule =>
+                self.write(" ")
+
+fn html_entity(c: Int) -> String:
+    if c == 38:
+        return "&amp;"
+    if c == 60:
+        return "&lt;"
+    if c == 62:
+        return "&gt;"
+    if c == 34:
+        return "&quot;"
+    return "&#39;"
+
+fn percent_encoded(c: Int) -> String:
+    digits := "0123456789ABCDEF"
+    return "%" + digits[bit_shr(c, 4)] + digits[bit_and(c, 15)]
+
+# the first word of a code block's info string, which names its language.
+fn first_word(info: String) -> String:
+    for i in 0..info.len():
+        if is_ascii_whitespace(ord(info[i])):
+            return info.substring(0, i)
+    return info
+
+# ---------------------------------------------------------------
+# tests
+# ---------------------------------------------------------------
+
+# a compact spelling of an event, for comparing event streams in tests.
+fn describe(event: Event) -> String:
+    return match event:
+        Event.Start(tag) => "+" + describe_tag(tag)
+        Event.End(tag) => "-" + describe_tag(tag)
+        Event.Text(content) => "text(" + content + ")"
+        Event.Code(content) => "code(" + content + ")"
+        Event.Html(content) => "html(" + content + ")"
+        Event.InlineHtml(content) => "inline_html(" + content + ")"
+        Event.SoftBreak => "soft"
+        Event.HardBreak => "hard"
+        Event.Rule => "rule"
+
+fn describe_tag(tag: Tag) -> String:
+    return match tag:
+        Tag.Paragraph => "p"
+        Tag.Heading(level) => "h{level}"
+        Tag.BlockQuote => "quote"
+        Tag.CodeBlock(info) => "code[" + info + "]"
+        Tag.List(start, tight) => "list[{start} {tight}]"
+        Tag.Item => "item"
+        Tag.Emphasis => "em"
+        Tag.Strong => "strong"
+        Tag.Link(url, title) => "link[" + url + "|" + title + "]"
+        Tag.Image(url, title) => "image[" + url + "|" + title + "]"
+
+fn describe_all(source: String, opts: Options) -> String:
+    mut parts: List[String] := []
+    for event in events(source, opts):
+        parts.push(describe(event))
+    return parts.join(" ")
+
+fn count_of(page: String, needle: String) -> Int:
+    mut total := 0
+    mut at := find_text(page, 0, page.len(), needle)
+    while at >= 0:
+        total += 1
+        at = find_text(page, at + needle.len(), page.len(), needle)
+    return total
+
+# counts events and keeps the text, to show render_with drives any renderer.
+struct CountingRenderer:
+    counted: Int
+    texts: List[String]
+
+impl Renderer for CountingRenderer:
+    fn event(event: Event):
+        self.counted += 1
+        if let Event.Text(content) = event:
+            self.texts.push(content)
+
+    fn finish() -> String:
+        return "{self.counted} events: " + self.texts.join("|")
+
+test "renders the common blocks and inlines":
+    assert_eq(to_html("# title"), "<h1>title</h1>\n")
+    assert_eq(to_html("a *b* **c** `d`"), "<p>a <em>b</em> <strong>c</strong> <code>d</code></p>\n")
+    assert_eq(to_html("- one\n- two"), "<ul>\n<li>one</li>\n<li>two</li>\n</ul>\n")
+    assert_eq(to_html("3. three\n4. four"), "<ol start=\"3\">\n<li>three</li>\n<li>four</li>\n</ol>\n")
+    assert_eq(to_html("> quoted"), "<blockquote>\n<p>quoted</p>\n</blockquote>\n")
+    assert_eq(to_html("```go\nx := 1\n```"), "<pre><code class=\"language-go\">x := 1\n</code></pre>\n")
+    assert_eq(to_html("    indented"), "<pre><code>indented\n</code></pre>\n")
+    assert_eq(to_html("***"), "<hr />\n")
+    assert_eq(to_html("line  \nbreak"), "<p>line<br />\nbreak</p>\n")
+    assert_eq(to_html("[a](/b \"c\")"), "<p><a href=\"/b\" title=\"c\">a</a></p>\n")
+    assert_eq(to_html("![alt *text*](/i.png)"), "<p><img src=\"/i.png\" alt=\"alt text\" /></p>\n")
+    assert_eq(to_html("[ref]\n\n[ref]: /target"), "<p><a href=\"/target\">ref</a></p>\n")
+    assert_eq(to_html(""), "")
+
+test "raw html is escaped unless allowed":
+    assert_eq(to_html("<script>alert(1)</script>"), "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n")
+    assert_eq(to_html("<div>\n*hi*\n</div>"), "<p>&lt;div&gt;\n*hi*\n&lt;/div&gt;</p>\n")
+    assert_eq(to_html("a <b onclick=\"x()\">b</b>"), "<p>a &lt;b onclick=&quot;x()&quot;&gt;b&lt;/b&gt;</p>\n")
+    assert_eq(to_html("<!-- note -->"), "<p>&lt;!-- note --&gt;</p>\n")
+    allowed := options().allow_html(true)
+    assert_eq(render("<div>\n*hi*\n</div>", allowed), "<div>\n*hi*\n</div>\n")
+    assert_eq(render("a <b>b</b>", allowed), "<p>a <b>b</b></p>\n")
+
+test "unsafe link schemes are refused after decoding":
+    assert_eq(to_html("[x](javascript:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](JaVaScRiPt:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](javascript&colon;alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](&#106;avascript:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](&#x6A;avascript:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](&#X6a;avascript&#58;alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](java&#x09;script:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](java&#9;script:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](java&Tab;script:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](jav&NewLine;ascript:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](&#32;javascript:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](&#x01;javascript:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](<\tjavascript:alert(1)>)"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](javascript\\:alert(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](vbscript:msgbox(1))"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](file:///etc/passwd)"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](<data:text/html,<script>alert(1)</script>>)"), "<p>[x](&lt;data:text/html,&lt;script&gt;alert(1)&lt;/script&gt;&gt;)</p>\n")
+    assert_eq(to_html("[x](data:text/html;base64,PHNjcmlwdD4=)"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("[x](//evil.example/)"), "<p><a href=\"\">x</a></p>\n")
+
+test "unsafe image sources, autolinks and references are refused too":
+    assert_eq(to_html("![x](javascript:alert(1))"), "<p><img src=\"\" alt=\"x\" /></p>\n")
+    assert_eq(to_html("![x](data:image/png;base64,AAAA)"), "<p><img src=\"\" alt=\"x\" /></p>\n")
+    assert_eq(to_html("![x](data:image/svg+xml,%3Csvg%20onload=alert(1)%3E)"), "<p><img src=\"\" alt=\"x\" /></p>\n")
+    assert_eq(to_html("<javascript:alert(1)>"), "<p><a href=\"\">javascript:alert(1)</a></p>\n")
+    assert_eq(to_html("[x]\n\n[x]: javascript&colon;alert(1)"), "<p><a href=\"\">x</a></p>\n")
+    assert_eq(to_html("![x]\n\n[x]: &#106;avascript:alert(1)"), "<p><img src=\"\" alt=\"x\" /></p>\n")
+
+test "safe destinations pass through, encoded for the attribute":
+    assert_eq(to_html("[x](https://example.com/a?b=1&c=2#d)"), "<p><a href=\"https://example.com/a?b=1&amp;c=2#d\">x</a></p>\n")
+    assert_eq(to_html("[x](mailto:a@example.com)"), "<p><a href=\"mailto:a@example.com\">x</a></p>\n")
+    assert_eq(to_html("[x](/path/to/page)"), "<p><a href=\"/path/to/page\">x</a></p>\n")
+    assert_eq(to_html("[x](#section)"), "<p><a href=\"#section\">x</a></p>\n")
+    assert_eq(to_html("<https://example.com>"), "<p><a href=\"https://example.com\">https://example.com</a></p>\n")
+    assert_eq(to_html("<me@example.com>"), "<p><a href=\"mailto:me@example.com\">me@example.com</a></p>\n")
+    assert_eq(to_html("[x](</a b\"c'>)"), "<p><a href=\"/a%20b%22c&#39;\">x</a></p>\n")
+
+test "the url check can be switched off":
+    unsafe := options().allow_unsafe_urls(true)
+    assert_eq(render("[x](javascript:alert(1))", unsafe), "<p><a href=\"javascript:alert(1)\">x</a></p>\n")
+
+test "attributes and text cannot break out":
+    assert_eq(to_html("[x](/u \"a\\\"onmouseover=\\\"b\")"), "<p><a href=\"/u\" title=\"a&quot;onmouseover=&quot;b\">x</a></p>\n")
+    assert_eq(to_html("![\"><script>](/i.png)"), "<p><img src=\"/i.png\" alt=\"&quot;&gt;&lt;script&gt;\" /></p>\n")
+    assert_eq(to_html("```\"><script>\ncode\n```"), "<pre><code class=\"language-&quot;&gt;&lt;script&gt;\">code\n</code></pre>\n")
+    assert_eq(to_html("a & b < c > d \" e ' f"), "<p>a &amp; b &lt; c &gt; d &quot; e &#39; f</p>\n")
+    assert_eq(to_html("`<script>`"), "<p><code>&lt;script&gt;</code></p>\n")
+
+test "the event stream carries checked urls and no raw html by default":
+    assert_eq(describe_all("[x](javascript:alert(1)) <b>", options()), "+p +link[|] text(x) -link[|] text( <b>) -p")
+    assert_eq(describe_all("a <b>", options().allow_html(true)), "+p text(a ) inline_html(<b>) -p")
+    assert_eq(describe_all("<div>\nx\n</div>", options()), "+p text(<div>\nx\n</div>) -p")
+    assert_eq(describe_all("<div>\nx\n</div>", options().allow_html(true)), "html(<div>\nx\n</div>)")
+
+test "events arrive in reading order with text merged":
+    assert_eq(describe_all("# Hi *there*", options()), "+h1 text(Hi ) +em text(there) -em -h1")
+    assert_eq(describe_all("a [b] &amp; *c", options()), "+p text(a [b] & *c) -p")
+    assert_eq(describe_all("a\nb  \nc", options()), "+p text(a) soft text(b) hard text(c) -p")
+    assert_eq(describe_all("```rust ignore\nfn x\n```", options()), "+code[rust ignore] text(fn x\n) -code[rust ignore]")
+    assert_eq(describe_all("---", options()), "rule")
+    assert_eq(describe_all("> a", options()), "+quote +p text(a) -p -quote")
+    assert_eq(describe_all("![a *b*](/c \"d\")", options()), "+p +image[/c|d] text(a ) +em text(b) -em -image[/c|d] -p")
+
+test "tight list items carry no paragraph events":
+    assert_eq(describe_all("- a\n- b", options()), "+list[none true] +item text(a) -item +item text(b) -item -list[none true]")
+    assert_eq(describe_all("- a\n\n- b", options()), "+list[none false] +item +p text(a) -p -item +item +p text(b) -p -item -list[none false]")
+    assert_eq(describe_all("7) a", options()), "+list[7 true] +item text(a) -item -list[7 true]")
+
+test "render_with drives any renderer":
+    counter := CountingRenderer(counted: 0, texts: [])
+    assert_eq(render_with("# a\n\nb *c*", options(), counter), "9 events: a|b |c")
+
+test "options builders return copies":
+    base := options()
+    allowed := base.allow_html(true)
+    assert_eq(render("a <b>", base), "<p>a &lt;b&gt;</p>\n")
+    assert_eq(render("a <b>", allowed), "<p>a <b></p>\n")
+    assert_eq(render("# h", base.heading_ids(true).gfm(false)), "<h1>h</h1>\n")
+
+test "entities use the full html5 table":
+    assert_eq(to_html("&CounterClockwiseContourIntegral; &ngE; &copy; &amp;"), "<p>∳ ≧̸ © &amp;</p>\n")
+    assert_eq(to_html("&nbsp &bogus; &#0; &#x110000; &#1234567;"), "<p>&amp;nbsp &amp;bogus; � � �</p>\n")
+    assert_eq(to_html("&#X41;&#66;&#x00043;"), "<p>ABC</p>\n")
+
+test "link labels match under full case folding":
+    assert_eq(to_html("[ẞ]\n\n[SS]: /ss"), "<p><a href=\"/ss\">ẞ</a></p>\n")
+    assert_eq(to_html("[ΑΓΩ]\n\n[αγω]: /greek"), "<p><a href=\"/greek\">ΑΓΩ</a></p>\n")
+    assert_eq(to_html("[Foo \n bar]\n\n[foo bar]: /x"), "<p><a href=\"/x\">Foo\nbar</a></p>\n")
+
+test "containers nest at most MAX_NESTING deep":
+    deep := to_html("> ".repeat(MAX_NESTING + 8) + "a")
+    assert_eq(count_of(deep, "<blockquote>"), MAX_NESTING)
+    assert(deep.contains("&gt; a"))
+    items := to_html("- ".repeat(MAX_NESTING + 8) + "a")
+    assert_eq(count_of(items, "<li>"), MAX_NESTING)
+
+test "reference copies are budgeted":
+    definition := "[x]: /" + "u".repeat(60000) + "\n\n"
+    page := to_html(definition + "[x] [x] [x]")
+    assert_eq(count_of(page, "<a href"), 1)
+    assert(page.contains("[x] [x]"))
+
+test "any input renders without failing":
+    for source in [chr(0), "*", "[", "]", "<", "&", "`", "\\", "\r", "\r\n\r\n", "\t", "> - 1. ```", "ÿþ", "é*é*"]:
+        to_html(source)
+    garbage := chr(255) + chr(128) + "*" + chr(192) + "_" + chr(237) + "[" + chr(160) + "]"
+    to_html(garbage)
+    assert_eq(to_html("a" + chr(0) + "b"), "<p>a�b</p>\n")

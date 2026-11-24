@@ -1,0 +1,25 @@
+# an `if let`, `while let` or `match` payload is a binding in a nested block
+# like a `:=` one (nested_binding_shadow.pith). a function has one slot per
+# name, so a payload reusing an outer local's name overwrote the local, and the
+# read after the block printed the payload, or a heap address when the types
+# differed. it is rejected now, as the `:=` form is.
+enum Packet:
+    Number(Int)
+    Text(String)
+
+fn maybe(n: Int) -> Int?:
+    if n > 0:
+        return n * 10
+    return none
+
+fn main() -> Int:
+    x := 5
+    if let x = maybe(3):
+        print("inner {x}")
+    print("outer {x}")
+    y := 6
+    match Packet.Text("hello"):
+        Packet.Number(n) => print("{n}")
+        Packet.Text(y) => print("inner {y}")
+    print("outer {y}")
+    return 0

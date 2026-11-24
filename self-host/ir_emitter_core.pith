@@ -13267,8 +13267,9 @@ fn ir_mark_guarded_steps(cond_idx: Int, body_idx: Int):
 # one, one inside a nested loop or a closure (which may run it more than
 # once between two tests of the condition), or a new binding of the name.
 # a name is one slot for the whole function, so an `if let`, `while let` or
-# `match` payload of the same name writes the counter too, and so does a
-# parameter of that name.
+# `match` payload of the same name would write the counter too, and so would a
+# parameter of that name. the checker rejects such a payload (E262), and the
+# rule stays so the proof does not lean on that.
 fn ir_counter_assignments(idx: Int, name: String, dir: String, nested: Bool, out: List[Int]):
     n := get_node(idx)
     if ir_is_binding_kind(n.kind) and ir_binding_name(n) == name:

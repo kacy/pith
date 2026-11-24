@@ -13,16 +13,6 @@ fn small() -> Int:
 fn n(x: Int) -> Int:
     return x
 
-fn some_big() -> Int?:
-    return big()
-
-enum Held:
-    Full(Int)
-    Empty
-
-fn held_big() -> Held:
-    return Held.Full(big())
-
 fn note(x: Int):
     if x == 0:
         print("note zero")
@@ -30,23 +20,6 @@ fn note(x: Int):
 fn show(label: String, failure: String):
     if failure == "":
         print("{label}: no trap")
-    else:
-        print("{label}: {failure}")
-
-# a payload binding of a counter's name writes the counter's slot, so the
-# step after it must stop the program. were the payload given a slot of its
-# own, the loop would finish instead, which is right too. what must never
-# happen is a counter that wrapped: it would come back negative, and reading
-# an empty list then fails the call with an index error.
-fn not_wrapped(x: Int) -> Int:
-    empty: List[Int] := []
-    if x < 0:
-        return empty[0]
-    return x
-
-fn show_no_wrap(label: String, failure: String):
-    if failure == "" or failure == "integer overflow":
-        print("{label}: no wrap")
     else:
         print("{label}: {failure}")
 
@@ -86,25 +59,6 @@ fn count_down_through(start: Int, last: Int) -> Int:
     mut i := start
     while i >= last:
         i = i - 1
-    return i
-
-# an `if let` payload with the counter's name writes the counter
-fn rebound_by_if_let(bound: Int) -> Int:
-    mut i := 0
-    while i < bound:
-        if let i = some_big():
-            note(i)
-        i = i + 1
-    return i
-
-# so does a match payload
-fn rebound_by_match(bound: Int) -> Int:
-    mut i := 0
-    while i < bound:
-        match held_big():
-            Held.Full(i) => note(i)
-            Held.Empty => note(1)
-        i = i + 1
     return i
 
 # a deferred sum runs after the step, when the counter can be at the bound
@@ -322,8 +276,6 @@ fn main():
     show("two steps per test", isolate_call(fn() -> Int => step_twice(top - 1, top)))
     show("counter written in body", isolate_call(fn() -> Int => reset_then_step(n(0), n(3), n(1))))
     show("count down through min", isolate_call(fn() -> Int => count_down_through(bottom + 2, bottom)))
-    show_no_wrap("counter rebound by if let", isolate_call(fn() -> Int => not_wrapped(rebound_by_if_let(n(3)))))
-    show_no_wrap("counter rebound by match", isolate_call(fn() -> Int => not_wrapped(rebound_by_match(n(3)))))
     show("deferred use at max", isolate_call(fn() -> Int => deferred_use(top - 2, top)))
     show("use after step at max", isolate_call(fn() -> Int => use_after_step(top - 2, top)))
     show("two steps down past min", isolate_call(fn() -> Int => lower_twice(bottom, bottom + 1)))

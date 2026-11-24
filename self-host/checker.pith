@@ -18,7 +18,7 @@
 # code does not follow it.
 
 from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_result, ti_tuple, ti_task, add_type_info, set_type_info, register_type_name, register_qualified_type_name, lookup_type_id, lookup_qualified_type_id, lookup_entry_type_id, get_type_info, get_type_name, is_numeric_type, is_integer_type, is_error_type, is_none_type, initialize_type_table, TypeTableSnapshot, take_type_table_snapshot, restore_type_table_snapshot, TID_INT, TID_FLOAT, TID_BOOL, TID_STRING, TID_BYTES, TID_VOID, TID_ERR, TID_NONE
-from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, binding_is_module_level, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
+from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_rebinds_capture, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, binding_is_module_level, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
 from ast import Node, get_node, node_kind, node_value, node_child_count, node_child, append_node_child, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, render_diagnostics_json
 from lexer import int_literal_magnitude
@@ -3551,6 +3551,64 @@ fn note_fn_binding_name(name: String, node_idx: Int):
         report_error_at(node_idx, "E261", "the name '" + name + "' is bound weak elsewhere in this function; use a different name")
     fn_bound_names.push(name)
 
+# what the closure being checked captures, and the nested bindings in its body
+# that reuse the name of a local it could capture. such a binding overwrites a
+# slot only when the closure captures the name, and the read that captures it
+# can come after the binding, so the two are matched once the body is done
+# (finish_closure_captures). each capture keeps the scope it was read from, so
+# an enclosing closure can tell whether it captures the name too.
+mut closure_capture_names: List[String] := []
+mut closure_capture_scopes: List[Int] := []
+mut closure_rebind_names: List[String] := []
+mut closure_rebind_nodes: List[Int] := []
+
+fn note_closure_capture(name: String, scope_id: Int):
+    if checker_lambda_scope >= 0 and binding_is_captured_past(scope_id, name, checker_lambda_scope):
+        closure_capture_names.push(name)
+        closure_capture_scopes.push(scope_id)
+
+# record a binding made by `:=`, by an `if let`, `while let` or `match`
+# payload, or by a select arm's received value. one in a nested block does not
+# shadow an enclosing binding of the same name, it overwrites it: the emitter
+# gives a function one slot per name, so the inner binding writes the outer
+# one's storage and the outer read after the block answers with the inner
+# value, or with garbage when the two have different types. that is a wrong
+# answer with no diagnostic, so the name is rejected rather than allowed to
+# shadow, the same choice E250 makes for a struct that reuses a builtin type
+# name. inside a closure the same goes for its parameters and the names it
+# captures, which share its slots.
+#
+# sibling blocks reusing a name are untouched: neither encloses the other, so
+# the earlier one is not visible here and they share a slot harmlessly. a `for`
+# variable does not come through here, since it gets a slot of its own for the
+# length of the loop.
+fn note_nested_binding_name(name: String, node_idx: Int, scope_id: Int):
+    if binding_shadows_enclosing_local(scope_id, name, checker_lambda_scope):
+        report_error_at(node_idx, "E262", "'" + name + "' is already bound in this function; a nested binding overwrites it rather than shadowing it")
+    elif binding_rebinds_capture(scope_id, name, checker_lambda_scope):
+        closure_rebind_names.push(name)
+        closure_rebind_nodes.push(node_idx)
+    note_fn_binding_name(name, node_idx)
+
+# report the nested bindings of a closure body that overwrite a capture. the
+# captures that also cross `outer_closure` are handed to the enclosing closure,
+# which has to carry them into this one, and its lists are put back.
+fn finish_closure_captures(outer_closure: Int, outer_names: List[String], outer_scopes: List[Int], outer_rebind_names: List[String], outer_rebind_nodes: List[Int]):
+    for name, i in closure_rebind_names:
+        if closure_capture_names.contains(name):
+            report_error_at(closure_rebind_nodes[i], "E262", "'" + name + "' is captured from the enclosing function; a nested binding in the closure overwrites the capture rather than shadowing it")
+    mut names := outer_names
+    mut scopes := outer_scopes
+    if outer_closure >= 0:
+        for name, i in closure_capture_names:
+            if binding_is_captured_past(closure_capture_scopes[i], name, outer_closure):
+                names.push(name)
+                scopes.push(closure_capture_scopes[i])
+    closure_capture_names = names
+    closure_capture_scopes = scopes
+    closure_rebind_names = outer_rebind_names
+    closure_rebind_nodes = outer_rebind_nodes
+
 fn check_binding_statement(node_idx: Int, scope_id: Int):
     node := get_node(node_idx)
     name := extract_binding_name(node.value)
@@ -3568,19 +3626,7 @@ fn check_binding_statement(node_idx: Int, scope_id: Int):
         fn_weak_names.push(name)
         check_weak_binding(node_idx, scope_id, name)
         return
-    # a binding in a nested block does not shadow an enclosing one, it
-    # overwrites it: the emitter gives a function one slot per name, so the
-    # inner binding writes the outer one's storage and the outer read after the
-    # block answers with the inner value — or with garbage, when the two have
-    # different types. that is a wrong answer with no diagnostic, so the name is
-    # rejected rather than allowed to shadow, the same choice E250 makes for a
-    # struct that reuses a builtin type name.
-    #
-    # sibling blocks reusing a name are untouched: neither encloses the other,
-    # so the earlier one is not visible here and they share a slot harmlessly.
-    if binding_shadows_enclosing_local(scope_id, name):
-        report_error_at(node_idx, "E262", "'" + name + "' is already bound in this function; a nested binding overwrites it rather than shadowing it")
-    note_fn_binding_name(name, node_idx)
+    note_nested_binding_name(name, node_idx, scope_id)
     # children: [type_expr?, value_expr]
     # if 2 children -> first is type annotation, second is value
     # if 1 child -> no annotation, child is value
@@ -3986,7 +4032,7 @@ fn check_let_pattern(pat_idx: Int, subj_idx: Int, branch_scope: Int, outer_scope
         check_pattern_match(pat_idx, subj_type, branch_scope)
         return
     if pat.kind == "pat_binding":
-        note_fn_binding_name(pat.value, pat_idx)
+        note_nested_binding_name(pat.value, pat_idx, branch_scope)
         reject_variant_named_binding(pat_idx, pat.value, subj_type)
         info := get_type_info(subj_type)
         if info.kind == "optional":
@@ -4390,6 +4436,7 @@ fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
         return TID_ERR
     tid := lookup_binding(scope_id, name)
     if tid >= 0:
+        note_closure_capture(name, scope_id)
         # the shared global scope holds every module's top-level names at
         # once and answers with whichever module registered the name
         # last. that is the wrong binding whenever another module
@@ -8081,7 +8128,7 @@ fn check_select_expression(node: Node, scope_id: Int) -> Int:
     for child in node.children:
         arm_node := get_node(child)
         last_branch_value_expr = 0 - 1
-        arm_type := check_select_arm(arm_node, scope_id)
+        arm_type := check_select_arm(child, arm_node, scope_id)
         branch_exprs.push(last_branch_value_expr)
         branch_types.push(arm_type)
         if arm_node.kind == "select_default_arm":
@@ -8156,9 +8203,9 @@ fn mark_widened_branches(exprs: List[Int], types: List[Int], result_type: Int):
             if get_type_info(t).kind != "optional":
                 optional_widened_arguments.insert(e, true)
 
-fn check_select_arm(arm: Node, scope_id: Int) -> Int:
+fn check_select_arm(arm_idx: Int, arm: Node, scope_id: Int) -> Int:
     if arm.kind == "select_recv_arm":
-        return check_select_recv_arm(arm, scope_id)
+        return check_select_recv_arm(arm_idx, arm, scope_id)
     if arm.kind == "select_send_arm":
         return check_select_send_arm(arm, scope_id)
     if arm.kind == "select_timeout_arm":
@@ -8168,7 +8215,7 @@ fn check_select_arm(arm: Node, scope_id: Int) -> Int:
     report_error("E232", "invalid select arm")
     return TID_ERR
 
-fn check_select_recv_arm(arm: Node, scope_id: Int) -> Int:
+fn check_select_recv_arm(arm_idx: Int, arm: Node, scope_id: Int) -> Int:
     if arm.children.len() < 2:
         report_error("E232", "select recv arm requires a recv expression and body")
         return TID_ERR
@@ -8180,6 +8227,7 @@ fn check_select_recv_arm(arm: Node, scope_id: Int) -> Int:
     if is_error_type(recv_type):
         return TID_ERR
     arm_scope := create_scope(scope_id)
+    note_nested_binding_name(arm.value, arm_idx, arm_scope)
     define_binding(arm_scope, arm.value, recv_type, false)
     return check_select_arm_body(arm, 1, arm_scope)
 
@@ -8406,7 +8454,7 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     if pat.kind == "pat_wildcard":
         return
     if pat.kind == "pat_binding":
-        note_fn_binding_name(pat.value, pat_idx)
+        note_nested_binding_name(pat.value, pat_idx, scope_id)
         reject_variant_named_binding(pat_idx, pat.value, expected_type)
         # a binding on an optional subject unwraps, mirroring if let
         info := get_type_info(expected_type)
@@ -8553,7 +8601,7 @@ fn check_variant_pattern_match(pat_idx: Int, pat: Node, expected_type: Int, scop
                             # match itself unwraps — applying it to a payload
                             # typed the box as its inner and interpolating
                             # the binding printed a heap address.
-                            note_fn_binding_name(sub.value, sub_pat)
+                            note_nested_binding_name(sub.value, sub_pat, scope_id)
                             reject_variant_named_binding(sub_pat, sub.value, variant_fields[fidx])
                             define_binding_at(scope_id, sub.value, variant_fields[fidx], false, sub_pat)
                         else:
@@ -8700,6 +8748,14 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
     checker_lambda_depth = checker_lambda_depth + 1
     saved_lambda_scope := checker_lambda_scope
     checker_lambda_scope = lambda_scope
+    saved_capture_names := closure_capture_names
+    saved_capture_scopes := closure_capture_scopes
+    saved_rebind_names := closure_rebind_names
+    saved_rebind_nodes := closure_rebind_nodes
+    closure_capture_names = []
+    closure_capture_scopes = []
+    closure_rebind_names = []
+    closure_rebind_nodes = []
     mut ret_type := TID_VOID
     if body_idx >= 0:
         body_node := get_node(body_idx)
@@ -8772,6 +8828,7 @@ fn check_lambda_expression(node: Node, scope_id: Int) -> Int:
             lambda_inferred_return = saved_infer
         else:
             ret_type = c_check_expr(body_idx, lambda_scope)
+    finish_closure_captures(saved_lambda_scope, saved_capture_names, saved_capture_scopes, saved_rebind_names, saved_rebind_nodes)
     checker_lambda_depth = checker_lambda_depth - 1
     checker_lambda_scope = saved_lambda_scope
     return add_type_info(ti_function(params, ret_type))

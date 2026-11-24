@@ -62,6 +62,12 @@ stale and a fix to it is welcome.
   unlocked. an error in main or in any other task, a stack overflow and a
   failed allocation still stop the process. docs/failure_isolation.md has the
   details.
+- **a nested binding cannot shadow a local of the same function**. a function
+  has one slot per name, so a `:=`, a `match`, `if let` or `while let` payload,
+  a select arm or a `catch` name in a nested block that reuses an enclosing
+  local's name is E262. rename the inner one. a `for` variable may shadow a
+  local, since it gets a slot of its own. a closure parameter may too, and so
+  may a binding in a closure body when the closure does not capture that name.
 - **a local that shadows a module global takes the name for the whole
   function**. the global is unreachable from that function, except on either
   side of a `for` loop whose variable shadows it. reading the global and then

@@ -867,12 +867,21 @@ error[E262]: cannot infer the type arguments of generic enum 'Opt' from this con
 ```
 
 the same code reports a binding in a nested block that reuses a name an
-enclosing block of the same function already bound. a function has one slot
-per name, so the inner binding would overwrite the outer value instead of
-shadowing it. sibling blocks may reuse a name.
+enclosing block of the same function already bound: a `:=`, an `if let`,
+`while let` or `match` payload, a select arm's received value, or the name of a
+`catch err:` block. a function has one slot per name, so the inner binding
+would overwrite the outer value instead of shadowing it. sibling blocks may
+reuse a name, and a `for` variable may reuse a local's name, since it gets a
+slot of its own for the length of the loop.
+
+a closure is a function of its own, so its body may bind a name the enclosing
+function uses. its parameters and the names it captures share its slots,
+though, so a binding in a nested block of the body that reuses one of those
+is reported too.
 
 ```
 error[E262]: 'x' is already bound in this function; a nested binding overwrites it rather than shadowing it
+error[E262]: 'x' is captured from the enclosing function; a nested binding in the closure overwrites the capture rather than shadowing it
 ```
 
 ### E263 — duplicate method across impl blocks

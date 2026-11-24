@@ -1359,8 +1359,8 @@ fn open_stream(server: Server, hf: frames.HeadersFrame, fields: List[hpack.Heade
     # spawn the handler before delivering the first event: the inbox is buffered,
     # so the send never blocks the reader waiting for the handler to start.
     spawn handle_stream(server, stream_id, inbox)
-    if let inbox = server.inbox_for(stream_id):
-        inbox.send(headers_event(fields, hf.end_stream))
+    if let registered = server.inbox_for(stream_id):
+        registered.send(headers_event(fields, hf.end_stream))
 
 # grant flow-control credit for consumed body bytes: at the connection level
 # always, and at the stream level while the stream stays open. mirrors the

@@ -428,6 +428,15 @@ fn ir_loop_var_pop(name: String, previous: String):
     if name.len() > 0:
         ir_loop_var_slots.insert(name, previous)
 
+# the local a returned or failed expression hands its count over from, or ""
+# when the expression is not a plain name. a name a `for` variable shadows
+# reads the loop's own slot, so it hands over nothing, and the exit cleanup
+# still has to release the function's local of that name.
+fn ir_returned_local_name(node: Node) -> String:
+    if node.kind != "ident" or ir_loop_var_slot(node.value).len() > 0:
+        return ""
+    return node.value
+
 # the storage a loop variable gets. the loop id keeps two loops in one function
 # apart, including an inner loop that reuses an outer loop's variable name.
 fn ir_loop_var_slot_name(fid: Int, name: String) -> String:
@@ -441,9 +450,14 @@ fn ir_loop_var_slot_name(fid: Int, name: String) -> String:
 # success exits and emitted only at error exits. ir_defer_scope_starts marks
 # where each open block scope begins in the flat stack; ir_defer_loop_base_stack
 # records the flat-stack length at each loop entry so break/continue emit only
-# the defers registered inside the loop. all four reset per function.
+# the defers registered inside the loop. all of them reset per function.
 mut ir_defer_nodes: List[Int] := []
 mut ir_defer_is_err: List[Int] := []
+# the loop variable slots in force where each entry was deferred, parallel to
+# ir_defer_nodes. an exit edge inside a `for` body re-emits a defer registered
+# outside the loop, and a name the loop variable shadows must still read the
+# function's own slot there, as it does where the defer was written.
+mut ir_defer_loop_slots: List[Map[String, String]] := []
 mut ir_defer_scope_starts: List[Int] := []
 mut ir_defer_loop_base_stack: List[Int] := []
 # open owned loop iterables (a split result, a keys() list). a `for` loop
@@ -1704,6 +1718,15 @@ fn ir_defer_push_scope():
 fn ir_defer_register(inner_idx: Int, is_err: Int):
     ir_defer_nodes.push(inner_idx)
     ir_defer_is_err.push(is_err)
+    ir_defer_loop_slots.push(ir_copy_var_types(ir_loop_var_slots))
+
+# emit one deferred entry with the loop variable slots of the place it was
+# deferred, then put the current ones back.
+fn ir_defer_emit_entry(i: Int):
+    current := ir_loop_var_slots
+    ir_loop_var_slots = ir_defer_loop_slots[i]
+    ir_stmt(ir_defer_nodes[i])
+    ir_loop_var_slots = current
 
 # emit deferred nodes from the top of the flat stack down to `stop` (inclusive
 # of `stop`), in LIFO order, WITHOUT truncating the stack. used at early exits
@@ -1714,7 +1737,7 @@ fn ir_defer_emit_through(stop: Int, is_error_exit: Bool):
     mut i := ir_defer_nodes.len() - 1
     while i >= stop:
         if is_error_exit or ir_defer_is_err[i] == 0:
-            ir_stmt(ir_defer_nodes[i])
+            ir_defer_emit_entry(i)
         i = i - 1
 
 # release every still-open loop's owned iterable at a function exit edge. the
@@ -1752,11 +1775,12 @@ fn ir_defer_pop_scope_emit():
         mut i := ir_defer_nodes.len() - 1
         while i >= start:
             if ir_defer_is_err[i] == 0:
-                ir_stmt(ir_defer_nodes[i])
+                ir_defer_emit_entry(i)
             i = i - 1
     while ir_defer_nodes.len() > start:
         ir_defer_nodes.remove(ir_defer_nodes.len() - 1)
         ir_defer_is_err.remove(ir_defer_is_err.len() - 1)
+        ir_defer_loop_slots.remove(ir_defer_loop_slots.len() - 1)
 
 # a loop records the flat-stack length at entry so break/continue emit only the
 # defers registered inside the loop body, not the enclosing function's.
@@ -10067,13 +10091,15 @@ fn ir_captures_uncounted(captures: List[String]) -> Bool:
 struct SavedDefers:
     nodes: List[Int]
     is_err: List[Int]
+    loop_slots: List[Map[String, String]]
     scope_starts: List[Int]
     loop_bases: List[Int]
 
 fn ir_defers_enter_function() -> SavedDefers:
-    saved := SavedDefers(ir_defer_nodes, ir_defer_is_err, ir_defer_scope_starts, ir_defer_loop_base_stack)
+    saved := SavedDefers(ir_defer_nodes, ir_defer_is_err, ir_defer_loop_slots, ir_defer_scope_starts, ir_defer_loop_base_stack)
     ir_defer_nodes = []
     ir_defer_is_err = []
+    ir_defer_loop_slots = []
     ir_defer_scope_starts = []
     ir_defer_loop_base_stack = []
     return saved
@@ -10081,6 +10107,7 @@ fn ir_defers_enter_function() -> SavedDefers:
 fn ir_defers_leave_function(saved: SavedDefers):
     ir_defer_nodes = saved.nodes
     ir_defer_is_err = saved.is_err
+    ir_defer_loop_slots = saved.loop_slots
     ir_defer_scope_starts = saved.scope_starts
     ir_defer_loop_base_stack = saved.loop_bases
 
@@ -10719,7 +10746,7 @@ fn ir_emit_fail_expr(node: Node) -> Int:
         expr_node := get_node(node.children[0])
         err_kind := ir_rc_kind(ir_infer_type(node.children[0]))
         if err_kind.len() > 0:
-            if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == err_kind:
+            if ir_rc_local_kind(ir_returned_local_name(expr_node)) == err_kind:
                 exclude = expr_node.value
             elif ir_expr_is_borrowed(node.children[0]):
                 ir_rc_retain_reg(err_r, err_kind)
@@ -11892,7 +11919,7 @@ pub fn ir_emit_return_value(expr_child: Int):
     # in a generic body the inferred type can miss (a tuple-lowered
     # optional reads back as the optional type, whose rc_kind is empty),
     # yet the local is still tracked and returning it must not release it.
-    if expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value).len() > 0:
+    if ir_rc_local_kind(ir_returned_local_name(expr_node)).len() > 0:
         exclude = expr_node.value
         pair_source = "local"
         box_may_share = true
@@ -11930,7 +11957,7 @@ pub fn ir_emit_return_value(expr_child: Int):
         # forwarding it (rather than wrapping in Some again) is the same
         # signal as a tuple retkind; the guard against an Optional[Tuple]
         # inner still applies.
-        ident_tuple_local := expr_node.kind == "ident" and ir_rc_local_kind(expr_node.value) == "tuple"
+        ident_tuple_local := ir_rc_local_kind(ir_returned_local_name(expr_node)) == "tuple"
         # the checker records a return of the payload type into an optional
         # return as a widening (check_return_statement). that record answers
         # what the shape tests below cannot when the payload is itself an
@@ -13278,8 +13305,9 @@ fn ir_mark_guarded_steps(cond_idx: Int, body_idx: Int):
 # one, one inside a nested loop or a closure (which may run it more than
 # once between two tests of the condition), or a new binding of the name.
 # a name is one slot for the whole function, so an `if let`, `while let` or
-# `match` payload of the same name writes the counter too, and so does a
-# parameter of that name.
+# `match` payload of the same name would write the counter too, and so would a
+# parameter of that name. the checker rejects such a payload (E262), and the
+# rule stays so the proof does not lean on that.
 fn ir_counter_assignments(idx: Int, name: String, dir: String, nested: Bool, out: List[Int]):
     n := get_node(idx)
     if ir_is_binding_kind(n.kind) and ir_binding_name(n) == name:
@@ -14656,6 +14684,7 @@ fn ir_prepare_func_emission(ret_type: String):
     # defers are function-scoped: start each function with empty scope stacks
     ir_defer_nodes = []
     ir_defer_is_err = []
+    ir_defer_loop_slots = []
     ir_defer_scope_starts = []
     ir_defer_loop_base_stack = []
     ir_loop_iter_vars = []

@@ -232,6 +232,10 @@ ret2 FLAG_REG VAL_REG       return both registers, under the register-result abi
 brif COND THEN ELSE         branch to label THEN if COND is nonzero, else ELSE.
 jmp LABEL                   unconditional branch.
 label NAME                  a branch target.
+label NAME cold             a branch target on a rare path, such as an error
+                            exit. the back end lays the block out after the
+                            function's other blocks, together with the moves
+                            on the branches into it.
 ```
 
 ## count marks
@@ -530,6 +534,7 @@ names the function and the offending line. these are covered by tests in
 - an unknown instruction opcode
 - a call to a function that was never declared
 - a `brif` or `jmp` to a label that does not exist
+- a `label` line with anything after its name other than `cold`
 - a malformed `store`, `call`, or `field`
 - a register reference that was never assigned, or a non-numeric register token
 - a `func` whose name collides with a runtime declaration

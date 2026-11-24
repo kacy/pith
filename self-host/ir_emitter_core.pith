@@ -61,7 +61,7 @@ from ir_capture import ir_capture_find_free_vars
 from return_paths import statement_always_leaves
 from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_decode_result_value, ir_emit_result_flag_field, ir_emit_result_error_message, ir_emit_result_value_field, ir_result_field_kind
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_optional_value_as, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read, ir_emit_weak_field_read
-from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
+from ir_literals import ir_emit_int_literal, ir_emit_int_literal_text, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 from ir_type_helpers import ir_type_alias_nodes, ir_alias_target_node, ir_type_from_tid, ir_bytes_keyed_type, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_list_element_tid, ir_function_return_kind
@@ -1027,7 +1027,14 @@ fn ir_emit_weak_payload(val_idx: Int) -> Int:
     ir_emit("call " + retain_r.to_string() + " pith_struct_weak_retain void 1 " + payload_r.to_string())
     # a fresh optional (a call result, another weak read) has no other owner.
     # the weak count above keeps the header readable after its release.
-    if ir_rc_kind(ir_infer_type(val_idx)) == "tuple" and ir_optional_subject_is_owned(val_idx):
+    value_kind := ir_rc_kind(ir_infer_type(val_idx))
+    if value_kind == "tuple" and ir_optional_subject_is_owned(val_idx):
+        ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
+    # so does a fresh struct (`h.w = Child(n: 1)`): nothing holds its strong
+    # count, so it is dropped here and the field reads back none, as for any
+    # target whose last strong reference is gone. kept, the count leaked the
+    # struct and the field read it back alive.
+    elif value_kind == "struct" and not ir_expr_is_borrowed(val_idx):
         ir_emit_call1(ir_reg(), "pith_struct_release", "void", val_r)
     return payload_r
 
@@ -5700,6 +5707,10 @@ fn ir_narrow_sized_result(idx: Int, op: String, r: Int) -> Int:
     return ir_narrow_to_tid(c_get_expr_type(idx), r)
 
 fn ir_emit_unary_expr(node: Node) -> Int:
+    # a negated literal is one constant, which is how `-9223372036854775808`
+    # names the smallest Int though its digits alone do not fit one
+    if node.value == "negate" and node_kind(node.children[0]) == "int_lit":
+        return ir_emit_int_literal_text("-" + node_value(node.children[0]))
     operand_r := ir_expr(node.children[0])
     # `-x` on an Int is `0 - x`, which overflows for the most negative Int
     if node.value == "negate" and ir_int_checks_overflow(c_get_expr_type(node.children[0])) and not ir_is_unsigned_word(c_get_expr_type(node.children[0])):
@@ -13677,18 +13688,34 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
     ir_break_stack.remove(ir_break_stack.len() - 1)
     ir_continue_stack.remove(ir_continue_stack.len() - 1)
     ir_emit_label(step_l)
-    # an exclusive range's head found the value below hi, and only this step
-    # writes it, so the step is exact. an inclusive range's last value can be
-    # the largest Int, so its step stays a plain add.
+    # an inclusive range can end at the largest Int, which has no next value,
+    # so the loop leaves here once the value has reached hi, and otherwise
+    # steps and goes straight back to the body. its head tests the value only
+    # on the way in, so each value still costs one compare. an exclusive
+    # range's head found the value below hi. only this step writes the value,
+    # so in both cases the step is exact.
     v3 := ir_reg()
     ir_emit("load " + v3.to_string() + " " + fv)
+    mut back_l := head_l
+    mut last_l := end_l
+    if inclusive:
+        # the exit gets a label of its own just before end_l. a branch straight
+        # to end_l, which the head branches to as well, is an edge the backend
+        # splits, and the split block lands between the compare and the step,
+        # so every value would take a jump over it.
+        last_l = ir_label()
+        h3 := ir_reg()
+        ir_emit("load " + h3.to_string() + " " + fh)
+        more_r := ir_reg()
+        ir_emit("lt " + more_r.to_string() + " " + v3.to_string() + " " + h3.to_string())
+        next_l := ir_label()
+        ir_emit("brif " + more_r.to_string() + " " + next_l + " " + last_l)
+        ir_emit_label(next_l)
+        back_l = body_l
     one_r := ir_reg()
     ir_emit("iconst " + one_r.to_string() + " 1")
     inc_r := ir_reg()
-    mut step_op := "addnsw"
-    if inclusive:
-        step_op = "add"
-    ir_emit(step_op + " " + inc_r.to_string() + " " + v3.to_string() + " " + one_r.to_string())
+    ir_emit("addnsw " + inc_r.to_string() + " " + v3.to_string() + " " + one_r.to_string())
     ir_emit("store " + fv + " " + inc_r.to_string())
     if has_index:
         p3 := ir_reg()
@@ -13698,7 +13725,9 @@ fn ir_emit_for_range_stmt(node: Node, names: IrForBindingNames):
         pinc_r := ir_reg()
         ir_emit("add " + pinc_r.to_string() + " " + p3.to_string() + " " + pone_r.to_string())
         ir_emit("store " + fp + " " + pinc_r.to_string())
-    ir_emit("jmp " + head_l)
+    ir_emit("jmp " + back_l)
+    if inclusive:
+        ir_emit_label(last_l)
     ir_emit_label(end_l)
 
 # `for x in it` where `it` is an iterator (a struct with `next() -> T?`).

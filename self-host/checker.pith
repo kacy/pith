@@ -21,10 +21,11 @@ from types import TypeInfo, ti_struct, ti_enum, ti_function, ti_optional, ti_res
 from scope import reset_scope_arena, create_scope, binding_shadows_enclosing_local, binding_rebinds_capture, binding_is_captured_past, define_binding, define_binding_at, lookup_binding, lookup_binding_index, lookup_binding_decl_node, binding_is_module_level, set_binding_type_at, lookup_binding_owned_by, lookup_binding_index_preferring, binding_type_at, binding_decl_node_at, module_declared_top_level, set_defining_module, is_binding_mutable, get_scope_return_type, is_in_loop_scope, create_function_scope, create_loop_scope, ScopeSnapshot, take_scope_snapshot, restore_scope_snapshot
 from ast import Node, get_node, node_kind, node_value, node_child_count, node_child, append_node_child, from_import_names, from_import_name_aliases, from_import_alias_receiver
 from errors import Diagnostic, render_diagnostics_json
+from lexer import int_literal_magnitude
 from checker_modules import module_generic_target_name, clean_import_part, module_default_alias, module_import_target_name, split_qualified_name
 from checker_type_intern import intern_list_type, intern_set_type, intern_map_type, intern_task_type, intern_channel_type
 from checker_builtins import register_builtin_types, builtin_scope_id, set_builtin_scope_id
-from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, report_error_at, report_error_at_name, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_is_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot, checker_note_alias_module
+from checker_diagnostics import checker_reset_diagnostics, checker_set_file_path, checker_get_diagnostics, checker_set_current_node, checker_restore_current_node, checker_current_node_index, checker_reported_at_current, checker_reported_at, report_error_at, report_error_at_name, report_error, report_error_with_fix_at, report_error_with_fix, checker_current_file_path, checker_set_reporting, checker_is_reporting, checker_set_message_suffix, checker_set_severity_override, checker_begin_dedup, checker_end_dedup, DiagnosticsSnapshot, take_diagnostics_snapshot, restore_diagnostics_snapshot, checker_note_alias_module
 from checker_interfaces import checker_interfaces_reset, register_interface_declaration_name, has_interface_declaration, take_interfaces_snapshot, restore_interfaces_snapshot
 from checker_methods import checker_methods_reset, register_method_signature, has_method_declaration, get_method_declaration_index, method_tid_key, register_method_owner, clear_method_owner, method_declaration_owner, MethodsSnapshot, take_methods_snapshot, restore_methods_snapshot
 from return_paths import missing_return_sites
@@ -4260,6 +4261,7 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
     tid_string := lookup_type_id("String")
     tid_bool := lookup_type_id("Bool")
     if node.kind == "int_lit":
+        check_int_literal_range(node_idx, node.value, tid_int)
         return tid_int
     if node.kind == "float_lit":
         return tid_float
@@ -4285,6 +4287,7 @@ fn check_expression_implementation(node_idx: Int, scope_id: Int) -> Int:
         for child in node.children:
             cn := get_node(child)
             if cn.kind == "interp_spec":
+                check_format_spec_numbers(child, cn.value)
                 spec_tid := c_check_expr(cn.children[0], scope_id)
                 if is_error_type(spec_tid) == false:
                     if type_supports_stringify(spec_tid) == false:
@@ -4677,6 +4680,80 @@ fn check_pipe_expression(node: Node, scope_id: Int) -> Int:
     return TID_ERR
 
 # ---------------------------------------------------------------
+# integer literals
+# ---------------------------------------------------------------
+
+# the smallest and largest values of an integer type, written as literals,
+# or two empty strings for any other type
+fn integer_type_bounds(tid: Int) -> (String, String):
+    name := get_type_name(tid)
+    if name == "Int" or name == "Int64":
+        return ("-9223372036854775808", "9223372036854775807")
+    if name == "UInt" or name == "UInt64":
+        return ("0", "18446744073709551615")
+    if name == "Int32":
+        return ("-2147483648", "2147483647")
+    if name == "Int16":
+        return ("-32768", "32767")
+    if name == "Int8":
+        return ("-128", "127")
+    if name == "UInt32":
+        return ("0", "4294967295")
+    if name == "UInt16":
+        return ("0", "65535")
+    if name == "UInt8":
+        return ("0", "255")
+    return ("", "")
+
+# a <= b, reading both as unsigned 64-bit magnitudes
+fn unsigned_at_most(a: Int, b: Int) -> Bool:
+    if (a < 0) == (b < 0):
+        return a <= b
+    return b < 0
+
+# report an integer literal that names no value of the integer type `tid`.
+# `text` is the token's text, with a leading `-` when the literal is negated.
+# the digits are read without overflowing, so no literal can stop the
+# checker itself, and a literal that passes here is one the backend takes.
+fn check_int_literal_range(at_idx: Int, text: String, tid: Int):
+    bounds := integer_type_bounds(tid)
+    if bounds.1.len() == 0:
+        return
+    mut digits := text
+    mut limit := bounds.1
+    if text.starts_with("-"):
+        digits = text.substring(1, text.len())
+        limit = bounds.0.replace("-", "")
+    value := int_literal_magnitude(digits)
+    if not value.1 and unsigned_at_most(value.0, int_literal_magnitude(limit).0):
+        return
+    if checker_reported_at(at_idx, "E319"):
+        return
+    message := "the integer literal " + text + " is outside the range of " + get_type_name(tid) + ", " + bounds.0 + " to " + bounds.1
+    if bounds.1 == "9223372036854775807":
+        report_error_with_fix_at(at_idx, "E319", message, "a whole number past 64 bits needs std.bigint")
+    else:
+        report_error_at(at_idx, "E319", message)
+
+# the width and precision of a format spec (`{x:8.2}`) are numbers in the
+# source too, and one that does not fit in an Int is refused here. a spec
+# like that is more often a brace meant to be printed, as in `{"qty":5}`.
+fn check_format_spec_numbers(spec_idx: Int, spec: String):
+    mut start := 0
+    if spec.starts_with("<") or spec.starts_with(">") or spec.starts_with("^"):
+        start = 1
+    mut width := spec.substring(start, spec.len())
+    mut precision := ""
+    dot := width.index_of(".")
+    if dot >= 0:
+        precision = width.substring(dot + 1, width.len())
+        width = width.substring(0, dot)
+    for part in [("width", width), ("precision", precision)]:
+        value := int_literal_magnitude(part.1)
+        if part.1.len() > 0 and (value.1 or value.0 < 0):
+            report_error_with_fix_at(spec_idx, "E319", "the format " + part.0 + " " + part.1 + " does not fit in an Int", "to print a brace, double it: `{{{{` or `}}}}`")
+
+# ---------------------------------------------------------------
 # unary expression
 # ---------------------------------------------------------------
 
@@ -4684,6 +4761,13 @@ fn check_unary_expression(node: Node, scope_id: Int) -> Int:
     tid_bool := lookup_type_id("Bool")
     if node.children.len() < 1:
         return TID_ERR
+    # a negated literal is checked whole, so `-9223372036854775808`, the
+    # smallest Int, is allowed though its digits alone do not fit
+    if node.value == "negate" and node_kind(node.children[0]) == "int_lit":
+        tid_int := lookup_type_id("Int")
+        check_int_literal_range(checker_current_node_index(), "-" + node_value(node.children[0]), tid_int)
+        expression_type_cache.insert(node.children[0], tid_int)
+        return tid_int
     operand := c_check_expr(node.children[0], scope_id)
     if is_error_type(operand):
         return TID_ERR
@@ -7802,37 +7886,21 @@ fn check_field_access_expression(node_idx: Int, node: Node, scope_id: Int) -> In
     report_error("E209", get_type_name(obj_type) + " has no field '" + field_name + "'")
     return TID_ERR
 
-## the non-negative decimal integer a string spells, or -1 when it is empty.
+## the non-negative decimal integer a string spells, or -1 when it is empty
+## or holds anything but digits. a number past the largest Int reads as the
+## largest Int, so a tuple index that long is out of bounds.
 pub fn parse_integer_string(s: String) -> Int:
-    # simple integer parser for tuple field indices
     if s.len() == 0:
         return -1
     mut result := 0
     mut i := 0
     while i < s.len():
-        ch := s[i]
-        if ch == "0":
-            result = result * 10
-        elif ch == "1":
-            result = result * 10 + 1
-        elif ch == "2":
-            result = result * 10 + 2
-        elif ch == "3":
-            result = result * 10 + 3
-        elif ch == "4":
-            result = result * 10 + 4
-        elif ch == "5":
-            result = result * 10 + 5
-        elif ch == "6":
-            result = result * 10 + 6
-        elif ch == "7":
-            result = result * 10 + 7
-        elif ch == "8":
-            result = result * 10 + 8
-        elif ch == "9":
-            result = result * 10 + 9
-        else:
+        digit := ord(s[i]) - 48
+        if digit < 0 or digit > 9:
             return -1
+        if result > (9223372036854775807 - digit) / 10:
+            return 9223372036854775807
+        result = result * 10 + digit
         i = i + 1
     return result
 
@@ -8398,10 +8466,17 @@ fn check_pattern_match(pat_idx: Int, expected_type: Int, scope_id: Int):
     if pat.kind == "pat_int":
         if is_integer_type(expected_type) == false:
             report_error("E228", "integer pattern cannot match " + get_type_name(expected_type))
+            return
+        check_int_literal_range(pat_idx, pat.value, expected_type)
         return
     if pat.kind == "pat_range":
         if is_integer_type(expected_type) == false:
             report_error("E228", "range pattern cannot match " + get_type_name(expected_type))
+            return
+        for bound in pat.children:
+            check_int_literal_range(bound, node_value(bound), expected_type)
+        # the emitter compares an unsigned subject with the unsigned forms
+        expression_type_cache.insert(pat_idx, expected_type)
         return
     if pat.kind == "pat_float":
         if expected_type != TID_FLOAT:

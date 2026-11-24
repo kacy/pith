@@ -1,0 +1,60 @@
+# the integer literals at the edge of each type's range compile to the value
+# they spell, in every base. `-9223372036854775808` is one constant, the
+# smallest Int, though its digits alone do not fit an Int. a pattern takes the
+# range of its subject's type, so a UInt pattern reaches 2^64 - 1, and a range
+# pattern on a UInt compares unsigned.
+
+MIN_INT := -9223372036854775808
+MAX_INT := 9223372036854775807
+
+fn lowest(x: Int = -9223372036854775808) -> Int:
+    return x
+
+fn name_int(n: Int) -> String:
+    match n:
+        -9223372036854775808 => return "min"
+        9223372036854775807 => return "max"
+        -0x10 => return "-16"
+        -9223372036854775807..=-0x7FFF_FFFF_FFFF_FF00 => return "near min"
+        0x7FFF_FFFF_FFFF_FF00..9223372036854775807 => return "near max"
+        _ => return "other"
+
+fn name_word(n: UInt) -> String:
+    match n:
+        18446744073709551615 => return "max"
+        0xFFFF_FFFF_FFFF_FFFE => return "max - 1"
+        0..=10 => return "small"
+        100..=9223372036854775900 => return "across the sign bit"
+        9223372036854775901..=18446744073709551613 => return "upper"
+        _ => return "other"
+
+fn name_byte(n: UInt8) -> String:
+    match n:
+        255 => return "max"
+        0..=0x7F => return "low"
+        _ => return "high"
+
+fn name_small(n: Int8) -> String:
+    match n:
+        -128 => return "min"
+        127 => return "max"
+        _ => return "other"
+
+fn name_int32(n: Int32) -> String:
+    match n:
+        -2147483648 => return "min"
+        2147483647 => return "max"
+        _ => return "other"
+
+fn main():
+    print("{MIN_INT} {MAX_INT} {lowest()}")
+    print("{-9223372036854775808} {- 9223372036854775808} {-0x8000000000000000} {-0b1000000000000000000000000000000000000000000000000000000000000000} {-0o1000000000000000000000}")
+    print("{0x7FFF_FFFF_FFFF_FFFF} {0b111111111111111111111111111111111111111111111111111111111111111} {0o777777777777777777777} {9_223_372_036_854_775_807}")
+    print("{MIN_INT == 0 - 9223372036854775807 - 1} {-9223372036854775808 + 1}")
+    print("{name_int(MIN_INT)} {name_int(MAX_INT)} {name_int(-16)} {name_int(MIN_INT + 5)} {name_int(MAX_INT - 5)} {name_int(0)}")
+    top := UInt(MAX_INT) + UInt(MAX_INT) + UInt(1)
+    half := UInt(MAX_INT) + UInt(1)
+    print("{name_word(top)}, {name_word(top - UInt(1))}, {name_word(UInt(3))}, {name_word(UInt(11))}, {name_word(UInt(200))}, {name_word(half)}, {name_word(half + UInt(1000))}")
+    print("{name_byte(UInt8(255))} {name_byte(UInt8(127))} {name_byte(UInt8(128))}")
+    print("{name_small(Int8(-128))} {name_small(Int8(127))} {name_small(Int8(0))}")
+    print("{name_int32(Int32(-2147483648))} {name_int32(Int32(2147483647))} {name_int32(Int32(5))}")

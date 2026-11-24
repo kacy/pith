@@ -8,7 +8,7 @@
 
 from ast import Node, get_node
 from checker import c_get_expr_type
-from types import get_type_info
+from types import get_type_info, get_type_name
 from ir_builder import ir_emit, ir_label, ir_new_temp_name, ir_reg, ir_var_regs, ir_var_types, ir_current_func_return_kind, ir_untracked_rc_binds, ir_kinded_rc_binds
 from ir_call_emit import ir_emit_call2, ir_emit_label, ir_last_was_ret
 from ir_literals import ir_emit_bool_literal, ir_emit_float_literal, ir_emit_int_literal, ir_emit_string_literal
@@ -273,16 +273,21 @@ pub fn ir_emit_match_cond(pat_idx: Int, subj_r: Int) -> Int:
         ir_emit("iconst " + r.to_string() + " 0")
         return r
     if pat.kind == "pat_range":
-        # lo <= subject and subject <= hi ("incl") or < hi ("excl")
+        # lo <= subject and subject <= hi ("incl") or < hi ("excl"), compared
+        # unsigned on a UInt subject, whose bounds may pass the largest Int
         lo_r := ir_emit_int_literal(get_node(pat.children[0]))
         hi_r := ir_emit_int_literal(get_node(pat.children[1]))
+        subject_name := get_type_name(c_get_expr_type(pat_idx))
+        mut cmp := ""
+        if subject_name == "UInt" or subject_name == "UInt64":
+            cmp = "u"
         lo_ok := ir_reg()
-        ir_emit("gte " + lo_ok.to_string() + " " + subj_r.to_string() + " " + lo_r.to_string())
+        ir_emit(cmp + "gte " + lo_ok.to_string() + " " + subj_r.to_string() + " " + lo_r.to_string())
         hi_ok := ir_reg()
         if pat.value == "incl":
-            ir_emit("lte " + hi_ok.to_string() + " " + subj_r.to_string() + " " + hi_r.to_string())
+            ir_emit(cmp + "lte " + hi_ok.to_string() + " " + subj_r.to_string() + " " + hi_r.to_string())
         else:
-            ir_emit("lt " + hi_ok.to_string() + " " + subj_r.to_string() + " " + hi_r.to_string())
+            ir_emit(cmp + "lt " + hi_ok.to_string() + " " + subj_r.to_string() + " " + hi_r.to_string())
         r := ir_reg()
         ir_emit("and " + r.to_string() + " " + lo_ok.to_string() + " " + hi_ok.to_string())
         return r

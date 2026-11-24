@@ -17,10 +17,10 @@ stale and a fix to it is welcome.
   handles, so the checker reports E217 instead. use `lists_equal` or
   `sets_equal` from `std.collections`, or compare a map's length and look up
   each key. `==` on structs still compares identity.
-- **range patterns take non-negative integer literals**. `0..=9 => ...` and
-  `0..10 => ...` work on integer subjects, with or-patterns and guards. a
-  negative bound (`-5..=-1`) and a named constant (`LO..=9`) do not parse, and a
-  `Float` subject is E228. use a guard instead: `n if n < 0 => ...`.
+- **range patterns take integer literals**. `0..=9 => ...`, `0..10 => ...`
+  and `-5..=-1 => ...` work on integer subjects, with or-patterns and guards.
+  a named constant (`LO..=9`) does not parse, and a `Float` subject is E228.
+  use a guard instead: `n if n < LO => ...`.
 - **`if let` and `while let` are statements**. neither works as an expression,
   and the let position takes a variant pattern or an optional binding only. a
   literal (`if let 3 = f():`) is E245. a variant pattern on an optional enum

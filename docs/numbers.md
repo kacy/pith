@@ -15,6 +15,15 @@ measurements, ratios, and anything headed for a chart. `Decimal` for money, tax,
 invoice lines, and anything a person will later reconcile against a statement.
 `BigInt` when a whole number outgrows 64 bits.
 
+## literals
+
+an integer literal is an `Int`, written in decimal, hex (`0xff`), binary
+(`0b1010`) or octal (`0o17`), with `_` allowed between digits (`1_000_000`).
+it has to fit: `9223372036854775807` is the largest and
+`-9223372036854775808` the smallest, and a literal past either is a compile
+error (E319). a literal in a `match` arm takes the type of the value it is
+compared against, so a `UInt` arm can name `18446744073709551615`.
+
 ## overflow
 
 `+`, `-` and `*` on an `Int` stop the program when the result does not fit in

@@ -294,8 +294,8 @@ described.
 
 every run rebuilds the node arena and the checker's tables. assigning
 over a global releases the value it replaces (see
-[ownership.md](ownership.md)), so the thirty tables `initialize_checker`
-rebinds and the twenty-one the driver rebinds are reclaimed each run, and
+[ownership.md](ownership.md)), so the tables `initialize_checker`
+and the driver rebind are reclaimed each run, and
 `reset_arena` empties the node list in place. a `for` loop over a string
 releases the one-byte string it binds each iteration, which the checker's
 name helpers and the driver's path helpers do on every lookup;

@@ -153,9 +153,9 @@ fn fuzz_tls13(input: Bytes) -> Int:
 
 fn finish_tls13(input: Bytes, base: Int) -> Int:
     mut total := base
-    lenient := tls13.parse_client_hello_lenient(input) catch:
-        return total
-    total = total + lenient.supported_groups.len() + lenient.signature_schemes.len()
+    lenient_res := tls13.parse_client_hello_lenient(input)
+    if lenient_res.is_ok:
+        total = total + lenient_res.ok.supported_groups.len() + lenient_res.ok.signature_schemes.len()
     # each parser is called for its crash-resistance, not its result: is_err
     # forces evaluation and swallows the error either way.
     if tls13.parse_server_hello(input).is_err:

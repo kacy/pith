@@ -32,18 +32,14 @@ skipped, and whether a second call is safe.
 | type | closer | lost when skipped | double close |
 |---|---|---|---|
 | `Config` | `close()`, or its destructor | nothing any more: `Config` implements `Drop`, so a config nobody closes gives its slots back when the last value naming it dies | safe |
-| `Conn` | `close()` | the `native_conn_shards` entry (keys, ivs, transcript, sequence numbers), the handshake-pending flag, the socket fd, and the `close_notify` alert | safe |
-| `Listener` | `close()` | the listener-config entry and the listening socket | safe |
+| `Conn` | `close()`, or its destructor | the `close_notify` alert only: `Conn` implements `Drop`, which closes the socket and frees the session state without network i/o | safe |
+| `Listener` | `close()`, or its destructor | nothing any more: `Listener` implements `Drop`, releasing its listener-config binding and closing its socket | safe |
 
-handles are never reissued, so the maps only grow for the two types that
-still close by hand. a `Conn` and a `Listener` cannot carry the destructor yet
-because std rebuilds both from a bare handle — `conn_from_handle` and
-`listener_from_handle` are public, and the accept wrappers build a `Listener`
-over the caller's handle — so a destructor on either would close a live
-resource under the other box. `Config` had the same shape in two places (the
-listener's handshake rebuilt a `Config` over the registered handle, and the
-verify hook's result named handle 0) and lost both when it moved: the listener
-registry holds the config itself now, and the hook result carries an optional.
+all three tls types now implement `Drop` (see stage 2 below). originally,
+`Conn` and `Listener` could not carry destructors because std rebuilt both from
+bare handles via `conn_from_handle` and `listener_from_handle`; removing those
+helpers and holding the structs directly let both move onto `Drop` alongside
+`Config`.
 
 ### io and files — `std/io.pith`
 
@@ -125,18 +121,19 @@ per-value destructor could never have helped here, because there is no value.
 | `concurrent.Group` | `wait()` or `cancel()` | the tasks and the semaphore stay outstanding | not re-entrant |
 | `concurrent.CancelToken` | `cancel()` | the parent and deadline watcher tasks and the done channel stay live | safe |
 | `bytes.ByteBuffer` | its destructor; `free()` and `take_bytes()` empty it early | nothing: the destructor frees it | safe |
-| `protobuf.Writer` | `free()` | the wrapped byte buffer | safe |
+| `protobuf.Writer` | its destructor (via `ByteBuffer`); `free()` empties it early | nothing: the wrapped `ByteBuffer`'s destructor frees it | safe |
 | `crypto.ecdh.X25519KeyPair` | `close()` | the boxed private key and its registry entry | safe |
 | `json` / `toml` / `yaml` scopes | `close_scope(scope)` | every node parsed in the scope stays in the threadlocal node pool for the life of the task | safe |
 
 ### registries with no closer at all
 
-`resilience.Limiter`, `resilience.Breaker` and `crypto.jwks.Cache` each allocate
-four to six module-map entries on construction, and no function anywhere removes
-them. `web.session.Store` reclaims the sessions under it — `destroy` drops one,
-and a sweep expires the rest — but never the store's own handle. all four are
-meant to be built once at startup, which is why nobody has hit it; a per-request
-`rate_limiter()` grows four maps forever.
+`crypto.jwks.Cache` allocates module-map entries on construction, and no
+function anywhere removes them. `web.session.Store` reclaims the sessions under
+it — `destroy` drops one, and a sweep expires the rest — but never the store's
+own handle. both are meant to be built once at startup, which is why nobody has
+hit it. (`resilience.Limiter` and `resilience.Breaker` used to be in this group
+too, but both moved their state into `guard mu:` struct fields and are now
+reclaimed automatically on drop.)
 
 ### does `defer` already cover the common path
 
@@ -220,11 +217,9 @@ tag zero regardless of its signature (issue #918), and a generic function
 body's specialization emitted no scope-exit release. all three are closed: a
 generic body is typed against each set of concrete types before it is emitted
 (docs/generics.md), and a struct built inside one gets its destructor like the
-same line outside. what remains is narrower and is refused rather than
-silent: a generic struct cannot implement `Drop` (E268), because its destructor
-is generated per instance from the resolved field kinds and that body has no
-place for the method call yet. a `Guard[T]` wants a concrete wrapper around it
-until that lands.
+same line outside. generic structs can also implement `Drop`: each
+instantiation gets its own destructor calling the specialized `drop` checked
+against that instance's type arguments (see stage 4 below).
 
 **the emitter's documented bounded leaks change meaning.** a `T!` or `T?`
 local passed as an argument, a tuple-typed register the emitter cannot tie back
@@ -236,8 +231,8 @@ the shapes are rare, each is being closed on its own, and the alternative was
 to leave every forgotten close leaking so that the rare shape would not.
 
 **there is no type identity at a release site.** the header carries a
-destructor pointer and nothing else identifying. interfaces are fully
-monomorphized — there is no vtable anywhere in the tree, and the collector
+destructor pointer and nothing else identifying. plain struct values carry no
+vtable or type tag (only interface values box a method table), and the collector
 already uses the destructor pointer itself as a stand-in type key. so `Drop`
 is not dispatched from a release site; it is resolved at construction and
 baked into the per-declaration destructor body, which is what the existing
@@ -392,9 +387,8 @@ consumes its receiver, so a rule that only looked for `close()` would report a
 correct program. every addition to the constructor list has to be audited the
 same way.
 
-extending it is cheap and is where the next increment of value is. the obvious
-next entries are the parser scopes, whose `open_scope` / `close_scope` pairing
-is unambiguous and whose types have no consuming method.
+extending it is cheap when a new non-`Drop` resource needs tracking (the parser
+scopes' `open_scope` / `close_scope` pairing is already included above).
 
 effort: small — one lint pass, one error code, three smoke cases in the makefile.
 
@@ -422,7 +416,8 @@ reset only when the send queue has room); `postgres.Conn`, `mysql.Conn`, `redis.
 pool (the module-global pool and pin registries are gone). io registry handles
 come from one process-wide counter, so a drop on another task finds nothing.
 `ByteBuffer` frees its storage on drop: `take_bytes()` leaves an empty buffer
-behind instead of freeing it, so the destructor has nothing to record. still by
+behind instead of freeing it, so the destructor has nothing to record.
+`unix.UnixListener` and `unix.UnixStream` close their sockets on drop too. still by
 hand: `http2.Client`, which its
 reader and writer tasks hold; `term.session.Terminal`, whose tasks hold it and
 whose close writes to the tty; and `TcpStream`, which is a view of a socket
@@ -482,11 +477,13 @@ unchanged because the method adds no edges. the checker refuses the shapes the
 destructor cannot call (E268): an enum, an impl outside the declaring
 module, or a `drop` with parameters or a return value.
 
-the collector question was decided the plain way: a `drop` runs wherever the
-release runs, the collector's sweep included. a `Drop` struct with no counted
-fields is a leaf, so the sweep only reaches it through a member's field
-release, which is an ordinary release on the collector's thread. refusing to
-run it there would trade a cleanup on an unchosen thread for no cleanup.
+the collector question was settled conservatively: a garbage cycle that runs
+through a `Drop` struct is left alone and leaks, because running a `drop` inside
+the sweep pass could reach another cycle member through a strong field and keep
+it past the free (`keep_user_drops` in `cycle.rs`). a `Drop` struct outside any
+cycle — reached only through a cycle member's field — dies by an ordinary
+release when that member is freed, and its `drop` runs then (see
+docs/ownership.md, "destructors").
 
 a generic struct is on the hook: each instance gets its own destructor,
 keyed by its field kinds and its specialized drop symbol, which calls the drop

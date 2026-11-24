@@ -72,9 +72,10 @@ stale and a fix to it is welcome.
   interface type cannot be tested for or converted back to its concrete type,
   and `==` on two of them compares identity. an interface with type
   parameters or associated types, or with a method that has type parameters,
-  cannot be a value type (E316). a generic struct cannot implement an
-  interface yet, as a bound or as a value (`impl Shape for Box[T]` is not
-  matched). see docs/interface_values.md.
+  cannot be a value type (E316). a generic struct can implement an interface
+  for bounds using its bare name (`impl Iterator for FilterIter:`, not
+  `impl Shape for Box[T]`), but cannot yet convert to an interface value. see
+  docs/interface_values.md.
 - **method syntax never reaches a free function**. there is no ufcs. a
   primitive receiver resolves builtins only, so `(1.5).to_int()` is the
   `Float` builtin even when a free `fn to_int` exists.
@@ -95,15 +96,8 @@ stale and a fix to it is welcome.
   specialization is type checked against its concrete types, so a body that is
   wrong for some type its bound admits is reported only when a caller reaches
   that type. `pith check` names the specialization (`... in bad[String]`).
-- **`spawn` with a builtin call in an argument fails to compile** (#1082).
-  `spawn f(bit_and(x, y))` fails with `unknown load source`. bind the argument
-  to a local first.
 - **destructor limits**. a garbage cycle that runs through a `Drop` struct is
-  not collected by the cycle collector: it leaks. a struct literal is not
-  refused outside its module even when its fields are private, so code can
-  still build a second value over a live handle (`redis.Client(fd: 5, ...)`)
-  whose destructor then closes the first one's resource. see
-  docs/ownership.md.
+  not collected by the cycle collector: it leaks. see docs/ownership.md.
 
 ## standard library
 
@@ -121,10 +115,12 @@ stale and a fix to it is welcome.
   and a dropped `std.db` transaction is rolled back by closing its connection.
   a dropped stream that is still open queues its reset only when the
   connection's send queue has room. call `close()` where the peer must see a
-  clean end. one type still closes by hand only: an `http2.Client`, which its
-  own reader and writer tasks keep alive. `pith lint` flags a local of a type without a
-  destructor that is never closed (E307). docs/destructors_roadmap.md tracks
-  the rest.
+  clean end. a few types still close by hand: `http2.Client` and
+  `term.session.Terminal` (whose own tasks keep them alive), `TcpStream` (a
+  view over a socket another value owns), parser scopes
+  (`open_scope`/`close_scope`), and `concurrent.Ticker`/`Group`/`CancelToken`.
+  `pith lint` flags a local of a type without a destructor that is never closed
+  (E307). docs/destructors_roadmap.md tracks the rest.
 - **testing has no benchmarks**. `pith test` runs `test` blocks with
   `--filter`, `--tag`, `--exclude-tag` and `--json`, and `std/testing` adds
   assertions, fixtures and parameterized cases, but there is no benchmark
@@ -134,8 +130,8 @@ stale and a fix to it is welcome.
   of those, nested structs, `List`s and `Map[String, _]`s, nested to any depth.
   refused with E219: a map with a non-`String` key, and a list or map whose
   element is an optional (`List[Int?]`). reach those documents through
-  `json.parse` and the node accessors. documents nested deeper than 128 levels
-  are refused.
+  `json.parse` and the node accessors. documents whose arrays and objects nest
+  128 levels deep or more are refused.
 - **toml, yaml and config decode targets are narrower**. `toml.decode`,
   `yaml.decode` and `config.decode` refuse `Float`, `List` and `Map` fields
   (E219). read those through the parsed document instead.
@@ -198,7 +194,7 @@ stale and a fix to it is welcome.
   a pass.
 - **closing a channel can race a send**. a send that passes its closed check
   as another task closes the channel can enqueue a value nobody reads, and the
-  send reports success. a channel costs about 416 bytes plus 16 bytes per
+  send reports success. a channel costs about 448 bytes plus 16 bytes per
   buffered slot (rounded up to a power of two) for as long as it lives.
 
 ## concurrency

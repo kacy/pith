@@ -36,14 +36,14 @@ and [docs/concurrency.md](docs/concurrency.md) lists the sharing rules.
 
 every pull request and every push to main runs:
 
-- the count checker (`make count-marks-check`). it fails the build if
+- the count checker (`make count-marks-check-only`). it fails the build if
   the retains and releases the compiler placed do not balance.
 - valgrind memcheck over a curated set of programs, and leak-growth
   checks that fail if memory use grows over repeated runs.
-- `make check-no-panics`, which scans the rust runtime for `panic!`,
-  `.unwrap()`, `expect(`, `process::exit`, `transmute` and similar
-  calls. each one must carry a comment that explains why it cannot be
-  reached or why stopping is correct.
+- `make check-no-panics`, which scans the rust runtime and backend for `panic!`,
+  `.unwrap()`, `expect(`, `transmute` and similar calls (plus `process::exit`
+  in the runtime and codegen crates). each one must carry a comment that
+  explains why it cannot be reached or why stopping is correct.
 - the bootstrap fixed point: the compiler builds itself and the output
   must match.
 
@@ -67,7 +67,8 @@ there is no cap on indentation depth, string interpolation or source
 file size. some pathological inputs still crash the compiler by
 overflowing its stack: about 100,000 nested unary minus signs, a binary
 expression with about 50,000 terms, or a source file of about 20 MB.
-a file that is not valid utf-8 fails with only `read_file failed`.
+a file that is not valid utf-8 fails with only `read_file failed`
+(or `error: cannot read <path>` in `check`/`fmt`/`lint`/`doc`).
 these are bugs, and reports are welcome.
 
 ## runtime failures in servers
@@ -98,11 +99,19 @@ task the handler spawned. see
   `SameSite=Lax`. the csrf middleware requires a token on unsafe
   methods.
 - http/1.1: a request with both `Content-Length` and
-  `Transfer-Encoding`, duplicate or conflicting `Content-Length`, or
+  `Transfer-Encoding`, conflicting `Content-Length`, or
   obsolete header folding is refused. oversized bodies, oversized
-  headers and slow headers get 413, 431 and 408.
+  headers and slow headers get 413, 431 and 408. in `std.web`, a
+  request body has 60 s in total after its head, and a slower one gets
+  408.
 - http/2: at most 128 concurrent streams per connection, capped
-  header lists, and rapid stream resets are refused.
+  header lists, and a stream past the cap is refused, so rapid stream
+  resets cannot pile up handlers. see [docs/web.md](docs/web.md).
+- templates: a `<%= %>` value is escaped for where it lands. a url
+  attribute value goes through `html.safe_url`, an unquoted attribute
+  value has every delimiter encoded, and compile refuses a value inside
+  `<script>`, `<style>`, an event handler, `style` or `srcdoc`.
+  see [docs/html.md](docs/html.md).
 - yaml: no anchors, aliases or tags, with caps on depth and input
   size.
 - databases: the postgres and mysql drivers send parameters
@@ -111,14 +120,15 @@ task the handler spawned. see
 
 two defaults need care:
 
-- template escaping covers html text and attributes. it does not know
-  about urls, so a url in an `href` or `src` needs `html.escape_url`,
-  and a url from user input should also go through `html.safe_url`.
-  see [docs/html.md](docs/html.md).
-- the default http server timeouts bound the request head, but not the
-  total time to read a body. a slow client can hold a connection while
-  sending a body a little at a time. set `with_read_timeout` on the
-  server config. see [docs/web.md](docs/web.md).
+- `html.safe_url` stops script urls, not off-site ones:
+  `https://evil.example` passes. a redirect to a destination the
+  request chose should use `web.local_redirect`, which accepts only a
+  path on this site. `<%raw %>` in a template writes a value
+  unchecked, wherever it sits. see [docs/html.md](docs/html.md).
+- the plain `std.net.http` entry points (`http.server_config()`) have
+  every timeout off, as net/http does. `std.web` turns on the head,
+  idle and body deadlines. a server built on `std.net.http` directly
+  should set them. see [docs/http_apps.md](docs/http_apps.md).
 
 ## container
 

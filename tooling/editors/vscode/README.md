@@ -1,7 +1,9 @@
 # pith for vs code
 
 syntax highlighting for `.pith` files plus a client for the pith
-language server: diagnostics, hover, document symbols, and formatting.
+language server: diagnostics, hover, document and workspace symbols,
+formatting, go-to-definition, references, completion, semantic tokens,
+signature help, inlay hints, rename, and code actions.
 
 ## running from source
 
@@ -24,7 +26,7 @@ lives somewhere else, point the `pith.serverPath` setting at it:
 
 ```json
 {
-  "pith.serverPath": "/home/you/code/forge/self-host/pith_main"
+  "pith.serverPath": "/home/you/code/pith/target/release/pith"
 }
 ```
 

@@ -26,7 +26,8 @@ a deferred statement runs on every exit from its block:
 - falling off the end of the block
 - a `return`
 - a `fail`
-- a `!` that propagates an error
+- a `!` or `?` that propagates an error (or an index, map, or `.value()` miss
+  propagated inside a `T!` function)
 
 it does not run if control never reaches the `defer` — a `defer` in an
 `if` branch that is not taken never fires. that falls out of the model:
@@ -79,7 +80,7 @@ scope, because that would re-enter the very cleanup in progress:
 
 - no `return`, `fail`, `break`, or `continue`
 - no `!` or `?` propagation
-- no nested `defer`
+- no nested `defer` or `locked` block
 - no binding (its name would never be in scope anyway)
 
 if you need any of those, move the logic into a helper and defer a call
@@ -88,7 +89,8 @@ to it.
 ## errdefer
 
 `errdefer` is the error-only sibling of `defer`. it runs only when the
-scope exits through an error — a `fail` or an `!` that propagates — and
+scope exits through an error — a `fail`, a `!` or `?` that propagates, or an
+index/map/`.value()` miss propagated inside a `T!` function — and
 stays silent on a normal `return`, on falling off the end, and on `break`
 or `continue`. use it for cleanup that should happen only when something
 went wrong: undo a half-finished change, roll back a transaction, delete a
@@ -141,5 +143,5 @@ cleanups to walk. this is the same approach zig takes.
 
 `errdefer` rides the same machinery: each entry is tagged as always-run
 or error-only, and the success exits (return, fall-through, break,
-continue) skip the error-only ones while the error exits (fail, `!`) emit
-them all.
+continue) skip the error-only ones while the error exits (`fail`, `!`, `?`,
+and propagated `T!` misses) emit them all.

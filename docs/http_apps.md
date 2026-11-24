@@ -70,7 +70,7 @@ if an upload should go straight to a writer instead of into memory, stream the
 body and keep the request metadata:
 
 ```pith
-out := bytes.buffer()
+out := io.memory_writer()
 streamed := http.read_request_buffered_bytes_into(reader, out.buffered_chunked(4096))!
 
 if streamed.matches_path("/upload")!:
@@ -330,6 +330,7 @@ http.serve_connection_with(reader, writer, handler, config)!
 | --- | --- | --- |
 | `read_header_timeout_ms` | 0 | how long the request head may take; 0 falls back to `read_timeout_ms` |
 | `read_timeout_ms` | 0 | how long the head and the body together may take |
+| `read_body_timeout_ms` | 0 | how long the body may take, from the end of the head, sized, chunked or streamed |
 | `write_timeout_ms` | 0 | how long the response may take, from the end of the request head, so the handler counts |
 | `idle_timeout_ms` | 0 | how long a keep-alive connection may wait for its next request; 0 falls back to `read_timeout_ms` |
 | `max_header_bytes` | `MAX_HEADER_BYTES` | the request head, answered with `431` past it |
@@ -356,6 +357,10 @@ read. the clocks start here:
   `read_header_timeout_ms` from that byte.
 - `read_timeout_ms` counts from the same point as the head's time, and covers the
   body too.
+- `read_body_timeout_ms` counts from the end of the head. when `read_timeout_ms`
+  is set as well, the earlier deadline applies. a handler reading a streamed body
+  sees it run out as a `read_body_part` failure equal to
+  `http.BODY_TIMEOUT_MESSAGE`.
 
 a request that runs out of read time once its first byte has arrived is answered
 with `408 Request Timeout` and the connection closes. a connection that runs out
@@ -493,7 +498,7 @@ on the client side, you can also stream the decoded response body into a
 writer:
 
 ```pith
-out := bytes.buffer()
+out := io.memory_writer()
 meta := http.get_request("example.com", 80, "/dump").no_redirects().send_into(out.buffered_chunked(4096))!
 
 print(meta.status.to_string())
@@ -727,7 +732,7 @@ created := c.send(http.new_request("POST", "http://127.0.0.1:8080/items")!.json_
 
 `http.new_request(method, url)` builds a `ClientRequest` from an absolute
 `http://` or `https://` url. every builder method on `ClientRequest` works on
-it. `Client` has `send`, `send_into`, `send_to_file`, `get`, `head` and
+it. `Client` has `send`, `send_into`, `send_to_file`, `open`, `get`, `head` and
 `post`.
 
 ### settings
@@ -748,7 +753,7 @@ of the one it came from.
 | `with_expect_continue_timeout(ms)` | 1000 | wait for `100 Continue` before sending the body |
 | `with_proxy(url)` | none | send every request through this http proxy |
 | `with_env_proxy(on)` | false | take the proxy from `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` |
-| `with_tls_config(config)` | default roots | tls config for https origins; the caller closes it |
+| `with_tls_config(config)` | default roots | tls config for https origins (released on drop when the last holder, including the client, goes away; only call `close()` once no client uses it) |
 | `with_max_response_header_bytes(n)` | `http.MAX_RESPONSE_HEADER_BYTES` (1 MiB) | the most a response head may hold |
 | `with_max_response_body_bytes(n)` | `http.MAX_RESPONSE_BODY` (64 MiB) | the most a buffered response body may hold, after gzip decoding |
 
@@ -840,8 +845,12 @@ answer is returned, the body is never sent, and the connection is closed.
 `with_proxy("http://proxy:3128")` sends every request through that proxy.
 a plain http request goes to the proxy with the full url as its target. an
 https request opens a `CONNECT` tunnel through the proxy, and tls to the
-origin runs inside the tunnel. only plain http proxies are supported, and
-the client does not send `Proxy-Authorization`.
+origin runs inside the tunnel. only plain http proxies are supported here
+(standalone socks5 dialing lives in `std.net.socks5`). credentials in the
+proxy url (`http://user:pass@proxy:3128`) or an explicit `Proxy-Authorization`
+header on the request are sent to the proxy on plain requests and `CONNECT`
+tunnels, and stripped from the tunneled origin request so they never leak to
+the target server.
 
 `with_env_proxy(true)` reads `HTTP_PROXY` for http urls and `HTTPS_PROXY`
 for https urls (or their lowercase forms) on each request, with net/http's
@@ -859,7 +868,8 @@ cidr ranges in `NO_PROXY` are not supported.
 
 compared with net/http, the client has no cookie jar, no http/2, no
 `CheckRedirect` hook, no limit on connections per host beyond the idle limit,
-no `Proxy-Authorization`, no socks or https proxies, and no streaming of a
-gzip body. a response body is read in full (up to the body limit) before `send` returns, or written
-in full to the writer for `send_into`, so the client has no body stream that
-the caller closes.
+no socks or https proxies (see `std.net.socks5` for standalone socks5), and no
+streaming of a gzip body. `client.open(req)` streams a response body
+incrementally via `OpenResponse` (without following redirects or decoding
+gzip); `send` reads the body in full up to the body limit, and `send_into` /
+`send_to_file` stream it straight into a writer or file.

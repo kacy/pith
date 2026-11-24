@@ -69,7 +69,7 @@ check run.
 |---|---|
 | `off` | the pass does not run; generic bodies are left as pass 2 leaves them |
 | `silent` | the pass runs and records nothing; the emitter's type reads still benefit |
-| `count` | faults are recorded as warnings, so `pith check` prints them and exits 0 |
+| `count` | faults are recorded as warnings, so `pith check --json` prints them and exits 0 (plain `pith check` prints `ok`) |
 | `on` | faults are recorded as errors |
 
 The default is `on`: a fault inside a generic body is an error. The pass ran

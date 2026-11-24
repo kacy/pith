@@ -306,9 +306,11 @@ fn register_buckets(bare: String, bounds: List[Float]) -> List[Float]:
 # print without a trailing ".0" (so a bucket reads le="5", a count reads "3"),
 # fractions print in full. used for prometheus text and bucket keys alike.
 fn render_value(v: Float) -> String:
-    whole := v.to_int()
-    if whole.to_float() == v:
-        return whole.to_string()
+    # NaN, the infinities and anything outside Int's range print as floats.
+    if v >= -9223372036854775808.0 and v < 9223372036854775808.0:
+        whole := v.to_int()
+        if whole.to_float() == v:
+            return whole.to_string()
     return v.to_string()
 
 fn metric_name_char(c: String) -> String:

@@ -78,12 +78,14 @@ a fallback. a function that cannot fail cannot pretend otherwise.
 interpolation takes format specs. there is no null and there are no
 exceptions. an out-of-range index or a missing map key propagates as
 an error inside a `T!` or `T!String` function and stops the process
-elsewhere. integer arithmetic traps on overflow; `wrapping_add`,
-`wrapping_sub` and `wrapping_mul` opt out ([docs/numbers.md](docs/numbers.md)).
+elsewhere. integer arithmetic traps on overflow at every width, and so
+do integer conversions, `abs`, `Float.to_int` and shift counts outside
+0 to 63; the `wrapping_*` methods opt out
+([docs/numbers.md](docs/numbers.md)).
 
 ## why you might want it
 
-**the whole stack is readable.** 126 standard library modules, 42,000
+**the whole stack is readable.** 128 standard library modules, 44,000
 lines of pith: the tls implementation, http/1.1 and http/2,
 websockets, grpc, the database wire protocols, json, toml, yaml,
 compression, hashing, a linear-time regex engine. when the language
@@ -107,7 +109,9 @@ exit or only the failing one. see [docs/errors.md](docs/errors.md) and
 **one bad request does not take down the server.** a runtime error
 inside an http or grpc handler, such as an out-of-range index, a
 missing map key, a division by zero or an integer overflow, fails that
-request with a 500 (`INTERNAL` for grpc) and the server keeps serving
+request with a 500 (`INTERNAL` for grpc) and the server keeps serving.
+a stack overflow still ends the process, and so does a runtime error
+in a task the handler spawned
 ([docs/failure_isolation.md](docs/failure_isolation.md)).
 
 **memory is managed at compile time.** the compiler emits retain and
@@ -116,9 +120,9 @@ release pairs under a borrowed-by-default discipline
 no runtime to tune. a struct graph breaks its own cycles with a `weak`
 field. a checker in ci follows every retain and release the compiler
 emits and fails the build when a function's counts do not balance on
-every path. over the test corpus it proves 97% of functions balanced and
+every path. over the test corpus it proves over 99% of functions balanced and
 leaves the rest undecided ([docs/ir-contract.md](docs/ir-contract.md)).
-valgrind and leak-growth gates also run on every merge, and asan runs
+valgrind and leak-growth gates also run on every merge, and asan and tsan run
 nightly ([docs/testing.md](docs/testing.md)).
 
 **concurrency is structured, and green by default.** `spawn` and
@@ -205,8 +209,9 @@ open defects. the ones to know before you start:
   with `lock` and `install` but nothing that fetches.
 - no debugger, and a runtime error prints its message without a stack
   trace.
-- `.value()` on a `none` stops the program with a runtime error; use
-  `if let`, `match` or `unwrap_or` when the optional can be empty.
+- `.value()` on a `none` propagates as an error inside a `T!` or `T!String`
+  function and stops the program elsewhere; use `if let`, `match` or `unwrap_or`
+  when the optional can be empty.
 - gzip compresses with fixed huffman only, and the regex engine leaves
   out backreferences, lazy quantifiers and lookaround on purpose. compile
   refuses them with an error that names the feature.
@@ -254,11 +259,11 @@ everything rebuilds from source.
 
 ## the standard library
 
-126 modules, all pith. the areas, with the doc that goes deepest:
+128 modules, all pith. the areas, with the doc that goes deepest:
 
 | area | modules | read |
 |---|---|---|
-| networking | tcp, dns, url, http, http2, websocket, tls, sse, grpc | [tls](docs/tls.md), [grpc](docs/grpc.md), [web](docs/web.md) |
+| networking | tcp, unix, dns, url, http, http2, websocket, tls, sse, grpc, socks5 | [tls](docs/tls.md), [grpc](docs/grpc.md), [web](docs/web.md) |
 | databases | sql, postgres, mysql, redis, and `db` on top | [db](docs/db.md) |
 | web apps | web: routing, middleware, sessions, csrf, cors | [http apps](docs/http_apps.md) |
 | data | json, toml, yaml, csv, config, table | [yaml](docs/yaml.md) |
@@ -278,7 +283,8 @@ what you read there is what the compiler read.
 
 ## proof it is usable
 
-real programs live in `tools/` and run against golden output in ci: a
+real programs live in `tools/` and run against golden output or integration
+suites in ci: `purl` (a `curl`-compatible http/1.1 and http/2 client), a
 static site generator, a web log analyzer, a json api client talking
 to a pith http server, a worker pool over spawn and channels, the
 protobuf code generator, and the documentation site generator that
@@ -317,7 +323,7 @@ from greeter import greet
 make build            # native backend
 make self-host        # the compiler, compiled by itself
 make test             # the full suite
-make run-examples     # 131 example programs against snapshots
+make run-examples     # 126 deterministic example programs against snapshots
 make status-audit     # current corpus and size numbers
 ```
 
@@ -329,10 +335,10 @@ self-host/     the compiler, in pith: lexer, parser, checker,
 cranelift/     the native backend, in rust: ir consumer, codegen,
                runtime (arc, collections, net)
 std/           the standard library
-examples/      141 runnable programs, 134 with expected output
+examples/      131 runnable programs (plus examples/gateway), 128 with expected output
 tests/         regression, invalid-program, leak, and golden fixtures
-tools/         real programs in pith: codegen, generators, fuzzers,
-               a log analyzer, a worker pool
+tools/         real programs in pith: purl (http client), codegen, generators,
+               fuzzers, a log analyzer, a worker pool
 docs/          architecture, ownership, errors, grammar, limitations
 ```
 

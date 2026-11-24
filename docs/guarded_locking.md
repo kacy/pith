@@ -1,10 +1,11 @@
 # guarded data and locked blocks
 
 a design for checking, at compile time, that data shared between tasks is only
-touched with its lock held. nothing here is implemented. this page says why the
-check is needed, what the syntax would be, what the checker would enforce, what
-it would cost, in what order it could land, and how the work is branched and
-tested.
+touched with its lock held. status: implemented (see [as built](#as-built)
+below; the sections before it are the original design proposal as written).
+this page says why the check was needed, what the syntax would be, what the
+checker would enforce, what it would cost, in what order it could land, and how
+the work was branched and tested.
 
 ## why
 
@@ -490,8 +491,9 @@ build settled a question this page left open, or departed from it:
   spawns, because std.net.http has a function with the same name as one of
   its own.
 - **what counts as a write.** an assignment rooted at the global, or a mutating
-  method called on it. a write through a function that takes the collection as
-  an argument is not seen.
+  method called on it. `sharing_lint.pith` now follows global buffers through
+  aliases, locals, function arguments, and return values as well (see E309 in
+  `docs/errors.md`).
 - **the TLS config registry.** it was fourteen handle-keyed maps behind
   generic accessors that took the lock themselves, which the checker could not
   follow. it is now one guarded map from handle to a `ConfigRecord`. a reader
@@ -533,8 +535,9 @@ build settled a question this page left open, or departed from it:
   pool's client list, the terminal's options, metrics series labels, the tls
   parsed-roots cache entries and the gateway's grpc targets moved from guards
   to frozen fields, which drops the per-request mutex E248 had added to
-  requests. zstd's predefined tables are built at module init. a write through
-  a copy of a frozen value, under another name, is not seen.
+  requests. zstd's predefined tables are built at module init. in a program
+  that spawns, `sharing_lint.pith` now follows frozen field buffers through
+  aliases, locals, parameters, and calls too (E275).
 - **E248 at channel sends.** `send` and `try_send` are checked like a spawn's
   arguments, since the receiver gets the handle. the http/2 client and server
   handed stream events to a helper that sent its parameter; the helper now

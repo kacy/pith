@@ -378,13 +378,13 @@ fn log_calls(next: fn(String, Bytes) -> Bytes!grpc.GrpcError, path: String, requ
     print(path)
     return next(path, request)
 
-guarded := grpc.intercept(serve_Chat, [grpc.authorize(check_token), log_calls])
+guarded := grpc.intercept(chat_dispatch, [grpc.authorize(check_token), log_calls])
 grpc.serve("0.0.0.0", 50051, guarded)!
 ```
 
-`intercept` returns a dispatch, so it drops into `serve`, `serve_tls`, or any
-other serve form without changing a signature — a generated `serve_<Svc>` router
-and a hand-written dispatch both compose the same way. the first interceptor in
+`intercept` wraps any `fn(String, Bytes) -> Bytes!grpc.GrpcError` dispatch and
+returns a dispatch of the same type, so it drops into `serve`, `serve_tls`,
+`serve_body`, or `serve_body_tls` without changing a signature. the first interceptor in
 the list runs outermost, seeing the call first and the reply last.
 
 three come ready made:

@@ -24,7 +24,9 @@ import std.bigint as bigint
 # of the product, so `h * FNV_PRIME` would stop on the second byte.
 # the offset basis 14695981039346656037 is above the largest Int, so it is
 # written as the Int with the same 64 bits, and main prints the result as a
-# UInt to match the published test vectors.
+# UInt to match the published test vectors. `UInt(h)` would stop on a hash
+# with the top bit set, since a negative Int does not fit a UInt;
+# `h.wrapping_uint()` keeps the 64 bits as they are.
 FNV_OFFSET := -3750763034362895579
 FNV_PRIME := 1099511628211
 
@@ -46,8 +48,8 @@ fn next_roll(mut g: Lcg) -> Int:
     # positive value in 1..6.
     return bit_and(bit_shr(g.state, 33), 2147483647) % 6 + 1
 
-# a 32-bit sequence number that wraps back to 0, as tcp's does. a UInt32 is a
-# narrow type, so plain `+` wraps too; wrapping_add says it on purpose.
+# a 32-bit sequence number that wraps back to 0, as tcp's does. plain `+`
+# would stop at the top of UInt32's range.
 fn next_seq(seq: UInt32) -> UInt32:
     return seq.wrapping_add(UInt32(1))
 
@@ -68,9 +70,9 @@ fn add_checked(a: Int, b: Int) -> Int?:
     return a + b
 
 fn main():
-    print("fnv1a64(\"\") = {UInt(fnv1a64(""))}")
-    print("fnv1a64(\"a\") = {UInt(fnv1a64("a"))}")
-    print("fnv1a64(\"pith\") = {UInt(fnv1a64("pith"))}")
+    print("fnv1a64(\"\") = {fnv1a64("").wrapping_uint()}")
+    print("fnv1a64(\"a\") = {fnv1a64("a").wrapping_uint()}")
+    print("fnv1a64(\"pith\") = {fnv1a64("pith").wrapping_uint()}")
 
     mut g := Lcg(state: 42)
     mut rolls: List[Int] := []

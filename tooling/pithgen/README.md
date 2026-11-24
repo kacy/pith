@@ -86,10 +86,10 @@ that is then cleared or rebound; early return, `continue` and nested loops
 over mutated lists. every value they print is a fresh heap string the
 generator computes, so a stale read shows up as filler.
 
-`--pending-shapes` adds 33 more, for the classes #1277 fixes. main's
-toolchain still gets them wrong, so they stay out of the default programs,
-the `pithgen-check` gate and the nightly hunt until those fixes land; then
-`OWN_SHAPES_SETTLED` moves up to cover them. without the flag a seed gives
+`--pending-shapes` adds 33 more, originally written for the classes #1277
+fixed. those fixes have landed on main, while the shapes still sit behind
+`--pending-shapes` (and out of the default programs, `pithgen-check` and the
+nightly hunt) until `OWN_SHAPES_SETTLED` is bumped to cover them. without the flag a seed gives
 the program it gave before they were added. they are: a closure in a field
 or a list element called with an argument read from the same holder, that
 overwrites the field, replaces itself or empties its list (`fnfield`,
@@ -129,7 +129,7 @@ make pithgen-sanitize PITHGEN_CC=/path/to/cc-asan \
     PITHGEN_RUNTIME_LIB=/path/to/asan/libpith_runtime.a PITHGEN_SEEDS=0..2000
 ```
 
-build the asan runtime with `RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Zsanitizer=address
+build the asan runtime with `RUSTC_BOOTSTRAP=1 RUSTFLAGS="-C relocation-model=pie -Zsanitizer=address
 -Zsanitizer-recover=address -Cforce-frame-pointers=yes" cargo build --release
 -p pith-runtime --target x86_64-unknown-linux-gnu`. the make target hands
 `PITHGEN_CC` and `PITHGEN_RUNTIME_LIB` to the run as `CC` and

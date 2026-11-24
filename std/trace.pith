@@ -266,7 +266,8 @@ fn trace_id_sample_value(decoded: Bytes) -> Int:
 fn ratio_sampled(trace_id: String, ratio: Float) -> Bool:
     if ratio >= 1.0:
         return true
-    if ratio <= 0.0:
+    # a NaN ratio samples nothing, and must not reach to_int below
+    if not (ratio > 0.0):
         return false
     decoded := encoding.from_hex(trace_id) catch bytes.empty()
     if decoded.len() < 16:

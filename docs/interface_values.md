@@ -56,8 +56,9 @@ fn main():
 The rules:
 
 - An interface name is a type wherever a type is accepted: a parameter, a
-  local, a struct field, a return type, a list, map value, set element,
-  optional or result payload. There is no `dyn` keyword. A bound
+  local, a struct field, a return type, a list, map value,
+  optional or result payload (not a set element or map key, which require
+  `Int`, `String`, or `Bytes`, E254). There is no `dyn` keyword. A bound
   (`T: Shape`) keeps its current meaning and is still specialized.
 - A concrete value becomes an interface value where the expected type is the
   interface: an assignment, an argument, a return, a field initializer, or an
@@ -167,6 +168,10 @@ unifying its elements, which would refuse `[Sq(..), Label(..)]`.
   type that implements the interface (E248): the checker cannot know which one
   the value holds, so it refuses the value when any of them reaches an
   unguarded collection.
+- `std.bytes.ByteBuffer` and `ByteArray` cannot be converted to an interface
+  value (`E248`), because boxing them would hide their mutable buffer from the
+  task-sharing checks (use `io.memory_writer()` when an in-memory `BytesWriter`
+  interface value is needed).
 - An interface value satisfies its own bound: `f[T: Shape](x)` with `x: Shape`
   specializes at `Shape`, and the calls in the body dispatch.
 
@@ -177,7 +182,7 @@ unifying its elements, which would refuse `[Sq(..), Label(..)]`.
 - Calling a method the interface does not declare on an interface value is
   E209, naming the interface.
 - A conversion where the concrete type does not implement the interface is a
-  type mismatch (E219) at the value.
+  type mismatch (E200/E219) at the value.
 - The generic body pass needs no change: a bound is still a bound.
 
 ## what is out of scope for the first version
@@ -212,8 +217,9 @@ Left:
   does not check, because a method call on a primitive receiver resolves
   builtins only (docs/limitations.md). Through an interface value the
   primitive's own methods dispatch correctly.
-- A generic struct cannot implement an interface (`impl Shape for Box[T]` is
-  not matched by a bound either), so it cannot be converted.
+- A generic struct can implement an interface for bounds using its bare name
+  (`impl Iterator for FilterIter:`), but `impl Shape for Box[T]` is not matched
+  and generic structs cannot yet convert to interface values.
 - A bench case for a dispatched call against a specialized one, as a baseline
   for a shared table or devirtualization.
 - Downcasts, embedding and value equality, as above.

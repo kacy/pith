@@ -2061,6 +2061,38 @@ cli-regressions-only:
 	status=$$?; \
 	set -e; \
 	if [ $$status -ne 0 ] && echo "$$out" | grep -q "PITH_IR_DRIVER is set to $$tmpdir/no_driver, which does not exist"; then pass=$$((pass+1)); echo "ok   a missing PITH_IR_DRIVER is named"; else echo "FAIL a missing PITH_IR_DRIVER is named"; echo "$$out"; fail=$$((fail+1)); fi; \
+	printf 'import cyc_b\n\nfn main():\n    return\n' > "$$tmpdir/cyc_a.pith"; \
+	printf 'import cyc_a\n\npub fn ping() -> Int:\n    return 1\n' > "$$tmpdir/cyc_b.pith"; \
+	set +e; \
+	cyc_imp_out=$$(./target/release/pith check --json "$$tmpdir/cyc_a.pith" 2>&1); \
+	cyc_imp_status=$$?; \
+	set -e; \
+	if [ $$cyc_imp_status -ne 0 ] && echo "$$cyc_imp_out" | grep -q '"code":"E235"'; then pass=$$((pass+1)); echo "ok   import cycle reports E235"; else echo "FAIL import cycle reports E235"; echo "$$cyc_imp_out"; fail=$$((fail+1)); fi; \
+	printf 'pub fn leaf() -> Int:\n    return 1\n' > "$$tmpdir/dia_leaf.pith"; \
+	printf 'import dia_leaf\n\npub fn left() -> Int:\n    return dia_leaf.leaf()\n' > "$$tmpdir/dia_l.pith"; \
+	printf 'import dia_leaf\n\npub fn right() -> Int:\n    return dia_leaf.leaf()\n' > "$$tmpdir/dia_r.pith"; \
+	printf 'import dia_l\nimport dia_r\n\nfn main():\n    n := dia_l.left() + dia_r.right()\n    print("{n}")\n' > "$$tmpdir/dia_top.pith"; \
+	set +e; \
+	dia_out=$$(./target/release/pith check "$$tmpdir/dia_top.pith" 2>&1); \
+	dia_status=$$?; \
+	set -e; \
+	if [ $$dia_status -eq 0 ]; then pass=$$((pass+1)); echo "ok   diamond import is not a cycle"; else echo "FAIL diamond import"; echo "$$dia_out"; fail=$$((fail+1)); fi; \
+	pith_abs=$$(pwd)/target/release/pith; \
+	mkdir -p "$$tmpdir/pkgwork"; \
+	set +e; \
+	(cd "$$tmpdir/pkgwork" && env -u PITH_SELF_HOST -u PITH_IR_DRIVER -u PITH_HOME "$$pith_abs" new "../escape") >/dev/null 2>&1; \
+	bad_new1=$$?; \
+	(cd "$$tmpdir/pkgwork" && env -u PITH_SELF_HOST -u PITH_IR_DRIVER -u PITH_HOME "$$pith_abs" new "-bad") >/dev/null 2>&1; \
+	bad_new2=$$?; \
+	(cd "$$tmpdir/pkgwork" && env -u PITH_SELF_HOST -u PITH_IR_DRIVER -u PITH_HOME "$$pith_abs" new sample_pkg) >/dev/null 2>&1; \
+	good_new=$$?; \
+	insp_api=$$(cd "$$tmpdir/pkgwork/sample_pkg" && env -u PITH_SELF_HOST -u PITH_IR_DRIVER -u PITH_HOME "$$pith_abs" package inspect --api 2>&1); \
+	insp_api_st=$$?; \
+	insp_files=$$(cd "$$tmpdir/pkgwork/sample_pkg" && env -u PITH_SELF_HOST -u PITH_IR_DRIVER -u PITH_HOME "$$pith_abs" package inspect --files 2>&1); \
+	insp_files_st=$$?; \
+	set -e; \
+	if [ $$bad_new1 -ne 0 ] && [ $$bad_new2 -ne 0 ] && [ $$good_new -eq 0 ]; then pass=$$((pass+1)); echo "ok   pith new validates package name"; else echo "FAIL pith new validates package name ($$bad_new1 $$bad_new2 $$good_new)"; fail=$$((fail+1)); fi; \
+	if [ $$insp_api_st -eq 0 ] && echo "$$insp_api" | grep -q "pub fn hello" && [ $$insp_files_st -eq 0 ] && echo "$$insp_files" | grep -q "lib.pith"; then pass=$$((pass+1)); echo "ok   package inspect --api/--files without pkg name"; else echo "FAIL package inspect flags ($$insp_api_st $$insp_files_st)"; echo "$$insp_api"; echo "$$insp_files"; fail=$$((fail+1)); fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \
 	echo "all native cli regressions passed"
@@ -2172,6 +2204,11 @@ ir-contract-regressions-only:
 		pass=$$((pass+1)); echo "ok   list query methods self-host"; \
 	else \
 		echo "FAIL list query methods self-host"; fail=$$((fail+1)); \
+	fi; \
+	if timeout 15 ./self-host/ir_driver --combined tests/cases/test_map_count_result_fn.pith | grep -q 'map_add_or_insert'; then \
+		pass=$$((pass+1)); echo "ok   map count-if fuses in result-returning fn (#1130)"; \
+	else \
+		echo "FAIL map count-if fuses in result-returning fn (#1130)"; fail=$$((fail+1)); \
 	fi; \
 	echo "$$pass passed, $$fail failed"; \
 	if [ $$fail -gt 0 ]; then exit 1; fi; \

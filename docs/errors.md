@@ -1246,17 +1246,6 @@ warning[E304]: public function 'serve' is missing a doc comment
             ^^^^^
 ```
 
-### E305 — deep nesting (warning)
-
-code is indented more than 4 levels deep. consider extracting a helper
-function to reduce complexity.
-
-```
-warning[E305]: indentation depth 5 exceeds maximum of 4
-  12 |                     if x > 0:
-                            ^^
-```
-
 ### E306 — strong reference cycle (warning)
 
 a struct holds a strong reference back to itself, directly (`next: Node?`) or

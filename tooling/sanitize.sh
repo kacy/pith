@@ -128,13 +128,16 @@ run_case() {
   expected="${dir%/cases}/expected/$(basename "$name").txt"
   out="$work/$tag.$backend.out"
   log="$work/$tag.$backend.log"
-  if ! PITH_GREEN="$green" timeout 600 "$work/$name" >"$out" 2>"$log"; then
-    :  # the exit code is judged by the expected output below
-  fi
+  local rc=0
+  PITH_GREEN="$green" timeout 600 "$work/$name" >"$out" 2>"$log" || rc=$?
   if grep -q -E '^==[0-9]+==ERROR: (Address|Thread)Sanitizer|^WARNING: ThreadSanitizer' "$log"; then
     echo "REPORT $name $backend"
   elif [[ " ${measures_memory[*]} ${measures_time[*]} " == *" $(basename "$name") "* ]]; then
-    echo "ok $name $backend"
+    if [ "$rc" -ne 0 ]; then
+      echo "FAIL $name $backend (exit $rc)"
+    else
+      echo "ok $name $backend"
+    fi
   elif [ "$(cat "$out")" != "$(cat "$expected")" ]; then
     echo "FAIL $name $backend"
   else

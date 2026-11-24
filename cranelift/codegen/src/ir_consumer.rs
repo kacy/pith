@@ -4789,7 +4789,17 @@ fn parse_i64_operand(
     instruction: &str,
     func_name: &str,
 ) -> Result<i64, CompileError> {
-    let parsed = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+    let parsed = if let Some(rest) = s.strip_prefix('-') {
+        if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).map(|v| v.wrapping_neg())
+        } else if let Some(bin) = rest.strip_prefix("0b").or_else(|| rest.strip_prefix("0B")) {
+            i64::from_str_radix(bin, 2).map(|v| v.wrapping_neg())
+        } else if let Some(oct) = rest.strip_prefix("0o").or_else(|| rest.strip_prefix("0O")) {
+            i64::from_str_radix(oct, 8).map(|v| v.wrapping_neg())
+        } else {
+            s.parse::<i64>()
+        }
+    } else if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         i64::from_str_radix(hex, 16)
     } else if let Some(bin) = s.strip_prefix("0b").or_else(|| s.strip_prefix("0B")) {
         i64::from_str_radix(bin, 2)

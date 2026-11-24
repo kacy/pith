@@ -447,6 +447,9 @@ pub fn cmd_package_context(name: String) -> String!:
 pub fn cmd_new(name: String) -> String!:
     nl := chr(10)
     tab := chr(9)
+    if not package_safe_segment(name) or name.starts_with("-") or name.starts_with("."):
+        print("error: invalid package name '" + name + "' (use letters, digits, '_', '-', or '.', not starting with '-' or '.')")
+        exit(1)
     if dir_exists(name):
         print("error: directory '" + name + "' already exists")
         exit(1)

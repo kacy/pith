@@ -356,15 +356,26 @@ fn cmd_package(action: String, args_list: List[String]) -> String!:
         return cmd_package_install(refresh)
     if action == "inspect":
         mut name := "."
+        mut have_name := false
         mut api_only := false
         mut files_only := false
-        if args_list.len() >= 4:
-            name = args_list[3]
-        if args_list.len() >= 5:
-            if args_list[4] == "--api":
+        mut ai := 3
+        while ai < args_list.len():
+            arg := args_list[ai]
+            if arg == "--api":
                 api_only = true
-            elif args_list[4] == "--files":
+            elif arg == "--files":
                 files_only = true
+            elif arg.starts_with("-"):
+                print("usage: pith package inspect [package] [--api|--files]")
+                exit(1)
+            elif not have_name:
+                name = arg
+                have_name = true
+            else:
+                print("usage: pith package inspect [package] [--api|--files]")
+                exit(1)
+            ai = ai + 1
         return cmd_package_inspect(name, api_only, files_only)
     if action == "context":
         mut name := "."

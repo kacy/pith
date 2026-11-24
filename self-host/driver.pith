@@ -314,6 +314,11 @@ pub fn walk_is_unchanged(s: DriverSnapshot) -> Bool:
 fn record_module_node_range(start: Int, end: Int, file: String):
     if end <= start:
         return
+    if module_range_starts.len() > 0:
+        last := module_range_starts.len() - 1
+        if module_range_starts[last] == start and module_range_files[last] == file:
+            module_range_ends[last] = end
+            return
     module_range_starts.push(start)
     module_range_ends.push(end)
     module_range_files.push(file)
@@ -337,6 +342,24 @@ pub fn file_for_node(idx: Int) -> String:
     if idx < module_range_ends[found]:
         return module_range_files[found]
     return ""
+
+## the half-open arena node index range [start, end) parsed from `file`,
+## or (0, 0) when `file` has no recorded range. callers that walk one
+## file's nodes use this to avoid scanning every imported module's arena.
+pub fn node_range_for_file(file: String) -> (Int, Int):
+    total := node_count()
+    mut i := module_range_files.len() - 1
+    while i >= 0:
+        if module_range_files[i] == file:
+            start := module_range_starts[i]
+            mut end := module_range_ends[i]
+            if end > total:
+                end = total
+            if start < end:
+                return (start, end)
+            return (0, 0)
+        i = i - 1
+    return (0, 0)
 
 fn dr_join_path(base: String, child: String) -> String:
     if child.len() == 0:
@@ -569,14 +592,12 @@ fn dots_to_slashes(mod_path: String) -> String:
     return result
 
 # find the stdlib root by walking up from source file directory.
-# uses exec to test for std/ directory existence.
 fn dr_find_stdlib_root(source_path: String) -> String:
     mut dir := get_directory(source_path)
     mut depth := 0
     while depth < 20:
         test_path := dir + "/std"
-        result := exec("test -d " + test_path)
-        if result == 0:
+        if dir_exists(test_path):
             return dir
         # go up one level
         parent := get_directory(dir)
@@ -648,21 +669,17 @@ pub fn resolve_import_list(imports: List[String], lines: List[Int], cols: List[I
                 import_respellings.insert(import_respelling_key(source_path, mod_path), first_import_spellings[file_path])
         else:
             first_import_spellings.insert(file_path, mod_path)
-        if visited_files.contains_key(file_path):
-            continue
-        # Check for import cycles (must check this AFTER checking visited)
-        # A file in files_being_checked means we're currently processing it upstream,
-        # which indicates a circular dependency
+        # check for import cycles before skipping already-visited files:
+        # a file still in files_being_checked is currently on the active DFS
+        # stack, so reaching it again means a circular dependency.
         if files_being_checked.contains_key(file_path):
-            # Import cycle detected - report E235 error
             mut cycle_msg := "import cycle detected: " + file_path
-            # Build cycle path from checking map
             for checking_path in files_being_checked.keys():
                 cycle_msg = cycle_msg + " -> " + checking_path
-            print_err("error[E235]: " + cycle_msg)
-            # Return error by attempting to read non-existent file
-            # This triggers error propagation
-            read_file("__import_cycle_error__")!
+            driver_parse_diagnostics = [Diagnostic("error", "E235", cycle_msg, source_path, lines[position], cols[position], "break the circular import by extracting shared declarations into a separate module")]
+            return roots
+        if visited_files.contains_key(file_path):
+            continue
         files_being_checked.insert(file_path, true)
         visited_files.insert(file_path, true)
         read_started := time.mono_nanos()
@@ -735,6 +752,7 @@ pub fn begin_driver(source_path: String):
     walk_edge_files = []
     walk_read_files = []
     walk_contents = []
+    files_being_checked.insert(source_path, true)
     mark_visited(source_path)
 
 # attribute the arena slice [start, end) to the entry file. the slice

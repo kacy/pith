@@ -9776,11 +9776,7 @@ fn ir_emit_lambda_params(params: List[String]):
 # the next call of the closure read freed memory (a released optional
 # argument, `show(c())` twice, was the first shape to reach valgrind).
 fn ir_emit_lambda_expr_return(expr_idx: Int):
-    br := ir_expr(expr_idx)
-    ret_kind := ir_rc_kind(ir_substitute_type_name(ir_infer_type(expr_idx)))
-    if ret_kind.len() > 0 and ir_expr_is_borrowed(expr_idx):
-        ir_rc_retain_reg(br, ret_kind)
-    ir_emit("ret " + br.to_string())
+    ir_emit_return_value(expr_idx)
 
 fn ir_emit_lambda_body_value(body_idx: Int):
     if body_idx < 0:
@@ -9920,11 +9916,14 @@ fn ir_emit_lambda(idx: Int) -> Int:
     # stay empty and nothing about the body's emission changes.
     saved_ret_kind := ir_current_func_return_kind
     saved_ret_inner := ir_current_func_optional_inner_kind
+    saved_last_was_ret := ir_last_was_ret
     ir_current_func_return_kind = parts.ret_kind
     ir_current_func_optional_inner_kind = parts.ret_inner
+    ir_last_was_ret = false
     ir_emit_lambda_body_value(parts.body_idx)
     ir_current_func_return_kind = saved_ret_kind
     ir_current_func_optional_inner_kind = saved_ret_inner
+    ir_last_was_ret = saved_last_was_ret
     ir_emit_lambda_default_return()
     ir_finish_lambda_emit(saved_builder, saved_vars, saved_types)
     ir_emitting_main_body = saved_in_main
@@ -11169,10 +11168,10 @@ fn ir_count_insert_value(stmt_idx: Int, map_idx: Int, key_idx: Int) -> Int:
     return value_idx
 
 # emit the counting branch as one call, or return false to leave the if
-# statement to the general path.
+# statement to the general path. safe even inside a result-returning function:
+# every operand is verified pure-read, the update arm runs only when the key
+# exists, and the fused runtime helper returns void.
 fn ir_try_emit_map_count_if(node: Node) -> Bool:
-    if ir_current_func_returns_result:
-        return false
     mut cond_idx := 0 - 1
     mut then_idx := 0 - 1
     mut else_idx := 0 - 1
@@ -11893,7 +11892,7 @@ pub fn ir_emit_return_value(expr_child: Int):
     elif ir_current_func_return_kind == "tuple" and ir_emitting_main_body and ir_current_func_returns_result:
         ir_emit_main_result_return(r, expr_node.kind == "none_lit", ir_return_forwards_result(expr_kind, result_kind), expr_tid, exclude)
         return
-    elif ir_current_func_return_kind == "tuple":
+    elif ir_current_func_return_kind == "tuple" and ir_current_func_returns_result:
         # a result return: forward a whole result, wrap anything else as the
         # ok payload. the checker can only have accepted `return none` here
         # when the ok type is an optional, so its payload is the empty shell;
@@ -12911,9 +12910,14 @@ fn ir_optional_subject_is_owned(idx: Int) -> Bool:
     kind := node.kind
     # a weak read's shell owns the count its upgrade took (ir_emit_weak_read),
     # and a catch hands out an owned value on both arms (ir_emit_catch_expr):
-    # `(f() catch none).unwrap_or(d)` left that shell behind
+    # `(f() catch none).unwrap_or(d)` left that shell behind.
     if kind == "await" or kind == "catch_expr" or kind == "catch_block" or ir_node_is_weak_field_read(idx):
         return true
+    # a `!` over a fresh result box (call, method_call, await) releases the
+    # result box and hands out its optional payload owned; a `!` over a
+    # borrowed local/field keeps the box and payload with its owner.
+    if (kind == "try" or kind == "try_expr") and node.children.len() > 0:
+        return ir_extraction_operand_class(node.children[0]) != "borrowed"
     if kind != "call" and kind != "method_call":
         return false
     # an uncounted `.value()` spells like a method call and is a field read:

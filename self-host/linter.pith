@@ -7,7 +7,6 @@
 #   E300 — snake_case for functions and variables
 #   E301 — PascalCase for types (structs, enums, interfaces, aliases)
 #   E304 — public function missing doc comment
-#   E305 — indentation depth exceeds 4 levels
 #   E306 — a strong reference cycle between structs
 #   E307 — a resource built locally and never closed
 #   E308 — a binding shadows a module global
@@ -149,7 +148,6 @@ fn lint_top_level(node_idx: Int, source: String):
         if not is_screaming_snake_case(name):
             check_snake_case(name, "constant", inner.line, inner.col)
     elif inner.kind == "test_decl":
-        lint_block_depth(inner, 1)
         lint_shadowed_globals(inner_idx)
         lint_parking_in_locked(inner_idx, 0)
     for site in missing_return_sites(inner_idx):
@@ -170,11 +168,9 @@ fn lint_fn_decl(node: Node, node_idx: Int, is_pub: Bool, source: String):
     if is_pub:
         check_doc_comment(name, node_idx, source, false)
 
-    # check body for nesting depth
     for child in node.children:
         cn := get_node(child)
         if cn.kind == "body":
-            lint_block_depth(cn, 1)
             lint_unclosed_resources(child)
             lint_parking_in_locked(child, l_holding_count(node))
     lint_shadowed_globals(node_idx)
@@ -201,11 +197,9 @@ fn lint_impl_decl(node: Node, source: String):
             # E304: public method missing doc comment
             if is_pub:
                 check_doc_comment(name, actual_idx, source, true)
-            # check body nesting depth
             for child in actual.children:
                 cn := get_node(child)
                 if cn.kind == "body":
-                    lint_block_depth(cn, 1)
                     lint_unclosed_resources(child)
                     lint_parking_in_locked(child, l_holding_count(actual))
             lint_shadowed_globals(actual_idx)
@@ -339,35 +333,6 @@ fn check_doc_comment(name: String, node_idx: Int, source: String, is_method: Boo
         documented = prev.len() > 0 and prev[0] == "#"
     if not documented:
         report_linter_warning("E304", "public function '" + name + "' is missing a doc comment", found_line + 1, 0)
-
-# ---------------------------------------------------------------
-# E305: indentation depth exceeds 4 levels
-# ---------------------------------------------------------------
-
-fn lint_block_depth(node: Node, depth: Int):
-    for child in node.children:
-        cn := get_node(child)
-        if cn.kind == "block":
-            for stmt in cn.children:
-                lint_stmt_depth(stmt, depth)
-        elif cn.kind == "if" or cn.kind == "while" or cn.kind == "for" or cn.kind == "match":
-            if depth >= 5:
-                report_linter_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring", cn.line, cn.col)
-            lint_block_depth(cn, depth + 1)
-        else:
-            lint_stmt_depth(child, depth)
-
-fn lint_stmt_depth(node_idx: Int, depth: Int):
-    node := get_node(node_idx)
-    if node.kind == "if" or node.kind == "while" or node.kind == "for_in" or node.kind == "match":
-        if depth >= 5:
-            report_linter_warning("E305", "nesting depth " + depth.to_string() + " exceeds 4 levels -- consider refactoring", node.line, node.col)
-        for child in node.children:
-            cn := get_node(child)
-            if cn.kind == "body" or cn.kind == "block" or cn.kind == "else" or cn.kind == "elif":
-                lint_block_depth(cn, depth + 1)
-            else:
-                lint_stmt_depth(child, depth)
 
 # ---------------------------------------------------------------
 # helpers

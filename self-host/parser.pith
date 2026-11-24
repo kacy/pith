@@ -1563,26 +1563,42 @@ fn parse_pattern_nested() -> Int:
         advance_token()
         return add_leaf_with_position("pat_wildcard", "_")
 
-    if _cur_tok_kind() == "int_lit":
-        _tv := _cur_tok_value()
+    if _cur_tok_kind() == "int_lit" or (_cur_tok_kind() == "minus" and _peek_ahead_kind(1) == "int_lit"):
+        mut _tv := ""
+        if _cur_tok_kind() == "minus":
+            advance_token()
+            _tv = "-" + _cur_tok_value()
+        else:
+            _tv = _cur_tok_value()
         advance_token()
         if check("dotdot") or check("dotdoteq"):
             mut range_kind := "excl"
             if check("dotdoteq"):
                 range_kind = "incl"
             advance_token()
-            hi_val := _cur_tok_value()
-            expect("int_lit")
+            mut hi_val := ""
+            if check("minus"):
+                advance_token()
+                hi_val = "-" + _cur_tok_value()
+                expect("int_lit")
+            else:
+                hi_val = _cur_tok_value()
+                expect("int_lit")
             lo_leaf := add_leaf_from_mark("pat_int", _tv, mark)
             hi_leaf := add_leaf_with_position("pat_int", hi_val)
             mut range_children: List[Int] := [lo_leaf, hi_leaf]
             return add_node_from_mark("pat_range", range_kind, range_children, mark)
-        return add_leaf_with_position("pat_int", _tv)
+        return add_leaf_from_mark("pat_int", _tv, mark)
 
-    if _cur_tok_kind() == "float_lit":
-        _tv := _cur_tok_value()
+    if _cur_tok_kind() == "float_lit" or (_cur_tok_kind() == "minus" and _peek_ahead_kind(1) == "float_lit"):
+        mut _tv := ""
+        if _cur_tok_kind() == "minus":
+            advance_token()
+            _tv = "-" + _cur_tok_value()
+        else:
+            _tv = _cur_tok_value()
         advance_token()
-        return add_leaf_with_position("pat_float", _tv)
+        return add_leaf_from_mark("pat_float", _tv, mark)
 
     if _cur_tok_kind() == "string_lit":
         _tv := _cur_tok_value()
@@ -1837,7 +1853,7 @@ fn looks_like_binding() -> Bool:
             return true
         if ak == "eof" or ak == "newline" or ak == "dedent":
             return false
-        if ak == "identifier" or ak == "lbracket" or ak == "rbracket" or ak == "lparen" or ak == "rparen" or ak == "comma" or ak == "question" or ak == "bang" or ak == "arrow" or ak == "kw_fn" or ak == "plus":
+        if ak == "identifier" or ak == "dot" or ak == "lbracket" or ak == "rbracket" or ak == "lparen" or ak == "rparen" or ak == "comma" or ak == "question" or ak == "bang" or ak == "arrow" or ak == "kw_fn" or ak == "plus":
             i = i + 1
             continue
         return false

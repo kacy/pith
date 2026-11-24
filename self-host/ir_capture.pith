@@ -86,6 +86,28 @@ fn ir_find_free_vars_walk(idx: Int, bound: List[String], free: List[String], blo
                 loop_bound.push(cn.value)
         mut for_free := ir_find_free_vars_walk(node.children[0], bound, free, blocked_names, locals)
         return ir_find_free_vars_walk(node.children[1], loop_bound, for_free, blocked_names, locals)
+    # a match arm's pattern binds names for its guard and body only.
+    if node.kind == "arm" and node.children.len() >= 2:
+        arm_bound := ir_copy_names(bound)
+        ir_collect_pattern_names(node.children[0], arm_bound)
+        mut arm_free := ir_copy_names(free)
+        mut k := 1
+        while k < node.children.len():
+            arm_free = ir_find_free_vars_walk(node.children[k], arm_bound, arm_free, blocked_names, locals)
+            k = k + 1
+        return arm_free
+    # a select recv arm evaluates its receive expression under the outer scope,
+    # then binds its name for the arm body only.
+    if node.kind == "select_recv_arm" and node.children.len() >= 1:
+        mut recv_free := ir_find_free_vars_walk(node.children[0], bound, free, blocked_names, locals)
+        recv_bound := ir_copy_names(bound)
+        if node.value.len() > 0 and node.value != "_" and not ir_list_contains(recv_bound, node.value):
+            recv_bound.push(node.value)
+        mut k := 1
+        while k < node.children.len():
+            recv_free = ir_find_free_vars_walk(node.children[k], recv_bound, recv_free, blocked_names, locals)
+            k = k + 1
+        return recv_free
     if node.kind == "body" or node.kind == "block":
         mut scoped_bound := ir_copy_names(bound)
         mut updated_free := ir_copy_names(free)

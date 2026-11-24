@@ -77,10 +77,14 @@ int -0 ok: 0
 int 007 ok: 7
 int -12 ok: -12
 int 9223372036854775807 ok: 9223372036854775807
-int 9223372036854775808 ok: 9223372036854775807
-int 99999999999999999999999 ok: 9223372036854775807
-int -9223372036854775808 ok: -9223372036854775807
-int -99999999999999999999 ok: -9223372036854775807
+int 9223372036854775808 err: invalid json at byte 24
+int 99999999999999999999999 err: invalid json at byte 28
+int -9223372036854775808 ok: -9223372036854775808
+int -9223372036854775809 err: invalid json at byte 25
+int -99999999999999999999 err: invalid json at byte 26
+int 92233720368547758070 err: invalid json at byte 25
+int -922337203685477580 ok: -922337203685477580
+int -9223372036854775800 ok: -9223372036854775800
 int 1e3 err: invalid json object at byte 6
 int 1.0 err: invalid json object at byte 6
 int +5 err: invalid json object at byte 5
@@ -118,6 +122,7 @@ skip_strict err: invalid json at byte 8
 skip_bad_escape err: invalid json at byte 11
 skip_lone_surrogate err: invalid json at byte 14
 skip_pair ok: 6
+skip_max_int ok: 7
 skip_big_int err: invalid json at byte 27
 skip_big_float ok: 8
 skip_plus ok: 9

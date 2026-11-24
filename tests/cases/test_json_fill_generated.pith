@@ -10,7 +10,8 @@
 # backslash, so quotes and backslashes sit at each offset across two
 # words; keys that miss the guess (out of order, escaped, unknown) take
 # the general path, and the values under unknown keys are stepped over
-# with the node parser's grammar and depth bound. the integer edges, a
+# with the node parser's grammar and depth bound. the integer edges (an
+# integer outside Int's range fails, where the runtime fill saturated), a
 # Float field's span, Bool prefixes, whitespace of every kind, bytes after
 # the closing brace and bytes that are not utf-8 complete it.
 
@@ -155,7 +156,7 @@ fn main() -> Int:
     show_text("repeated", json.decode_text[Text](obj(q("s") + ":" + q("first value, long") + "," + q("s") + ":" + q("second"))))
 
     # integers
-    for text in ["0", "-0", "007", "-12", "9223372036854775807", "9223372036854775808", "99999999999999999999999", "-9223372036854775808", "-99999999999999999999", "1e3", "1.0", "+5", "-", "--1", "12x", "0x10"]:
+    for text in ["0", "-0", "007", "-12", "9223372036854775807", "9223372036854775808", "99999999999999999999999", "-9223372036854775808", "-9223372036854775809", "-99999999999999999999", "92233720368547758070", "-922337203685477580", "-9223372036854775800", "1e3", "1.0", "+5", "-", "--1", "12x", "0x10"]:
         show_num("int " + text, json.decode_text[Num](obj(q("n") + ":" + text)))
     show_num("int_at_end", json.decode_text[Num](chr(123) + q("n") + ":42"))
 
@@ -179,6 +180,7 @@ fn main() -> Int:
     show_num("skip_bad_escape", json.decode_text[Num](obj(q("a") + ":[" + q("x" + bs + "q") + "]," + q("n") + ":4")))
     show_num("skip_lone_surrogate", json.decode_text[Num](obj(q("a") + ":[" + q(bs + "ud800") + "]," + q("n") + ":5")))
     show_num("skip_pair", json.decode_text[Num](obj(q("a") + ":[" + q(bs + "ud83d" + bs + "ude00") + "]," + q("n") + ":6")))
+    show_num("skip_max_int", json.decode_text[Num](obj(q("a") + ":[9223372036854775807,-9223372036854775808]," + q("n") + ":7")))
     show_num("skip_big_int", json.decode_text[Num](obj(q("a") + ":[123456789012345678901]," + q("n") + ":7")))
     show_num("skip_big_float", json.decode_text[Num](obj(q("a") + ":[1234567890123456789012.5]," + q("n") + ":8")))
     show_num("skip_plus", json.decode_text[Num](obj(q("a") + ":[+1]," + q("n") + ":9")))

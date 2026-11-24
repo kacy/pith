@@ -613,18 +613,22 @@ fn json_byte_read_int(input: Bytes, pos: Int) -> JsonByteInt:
         neg = true
         i = i + 1
     digits_start := i
+    # the digits are accumulated as a negative number, since Int's minimum
+    # has no positive counterpart. the overflow guard runs before each step
+    # so a huge integer never wraps into a small one and slips past a
+    # downstream size or count check.
     mut value := 0
     while i < input.len() and json_byte_is_digit(input[i]):
-        # guard against overflow before it silently wraps a huge integer
-        # into a small one and bypasses a downstream size/count check
         digit := input[i] - 48
-        if value > (9223372036854775807 - digit) / 10:
+        if value < (0 - 9223372036854775807 - 1 + digit) / 10:
             return JsonByteInt(false, 0, pos)
-        value = (value * 10) + digit
+        value = (value * 10) - digit
         i = i + 1
     if i == digits_start:
         return JsonByteInt(false, 0, pos)
-    if neg:
+    if not neg:
+        if value < 0 - 9223372036854775807:
+            return JsonByteInt(false, 0, pos)
         value = 0 - value
     return JsonByteInt(true, value, i)
 
@@ -1322,8 +1326,9 @@ fn json_fill_skip_string(input: Bytes, pos: Int) -> Int:
     return end + 1
 
 # the parser's number branch: the span of number bytes at `pos`, -1 when
-# an integer's digits pass parse_integer_manual's overflow bound. a span
-# with a `.`, `e` or `E` after its first byte is a float and has none.
+# an integer is outside Int's range. a span with a `.`, `e` or `E` after
+# its first byte is a float and has no bound. the digits are accumulated
+# as a negative number, as in json_byte_read_int.
 fn json_fill_skip_number(input: Bytes, pos: Int) -> Int:
     end := json_byte_number_span_end(input, pos + 1)
     mut i := pos + 1
@@ -1337,10 +1342,13 @@ fn json_fill_skip_number(input: Bytes, pos: Int) -> Int:
     while i < end:
         b := input[i]
         if json_byte_is_digit(b):
-            if value > 922337203685477580 / 10:
+            digit := b - 48
+            if value < (0 - 9223372036854775807 - 1 + digit) / 10:
                 return -1
-            value = value * 10 + (b - 48)
+            value = value * 10 - digit
         i = i + 1
+    if input[pos] != 45 and value < 0 - 9223372036854775807:
+        return -1
     return end
 
 # the parser's value grammar for a value nobody keeps, at nesting level
@@ -2839,6 +2847,11 @@ test "json integers cover the full Int range and reject overflow":
     assert(scanned.ok)
     assert_eq(scanned.value, 9223372036854775807)
     assert(not json_byte_read_int(bytes.from_string_utf8("9223372036854775808"), 0).ok)
+    low := json_byte_read_int(bytes.from_string_utf8("-9223372036854775808"), 0)
+    assert(low.ok)
+    assert_eq(low.value, 0 - 9223372036854775807 - 1)
+    assert(not json_byte_read_int(bytes.from_string_utf8("-9223372036854775809"), 0).ok)
+    assert(not json_byte_read_int(bytes.from_string_utf8("99999999999999999999999"), 0).ok)
 
 # `n` nested arrays around one scalar
 fn nested_arrays(n: Int) -> String:

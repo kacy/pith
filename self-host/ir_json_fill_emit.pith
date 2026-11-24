@@ -32,9 +32,10 @@
 # fields and ran 38% slower than the runtime fill on fewer instructions.
 #
 # the grammar and the outcomes are those of the runtime fill this
-# replaced (pith_json_fill_struct, #1104): keys and string values are
+# replaced (pith_json_fill_struct, #1104), except that an Int out of
+# range fails where the runtime fill saturated: keys and string values are
 # taken raw (no escape decoding, no utf-8 check), an Int field takes an
-# optional `-` and digits, saturating at the type's bounds, a Float field
+# optional `-` and digits and fails outside Int's range, a Float field
 # any number span (`3` widens to 3.0), a Bool field `true` or `false` by
 # prefix, a repeated key's last value wins (a string slot releases the
 # earlier string), and any bytes after the closing brace are not looked
@@ -263,9 +264,10 @@ fn ir_jf_store_slot(v: JsonFillVars, value: Int):
     off := ir_jf_op_const("mul", ir_jf_load(v.slot), 8)
     ir_emit_call_text(ir_reg(), "pith_store_u64", "void", 3, " " + ir_jf_load(v.obj).to_string() + " " + off.to_string() + " " + value.to_string())
 
-# an Int value: an optional `-` and at least one digit, accumulated with
-# saturation at the type's bounds (so `-` of the saturated value is the
-# negative bound plus one, as the runtime fill had it).
+# an Int value: an optional `-` and at least one digit. the digits are
+# accumulated as a negative number, since Int's minimum has no positive
+# counterpart, and a value outside Int's range fails the decode, as
+# json.parse refuses it.
 fn ir_jf_emit_int(v: JsonFillVars, fail_l: String, done_l: String):
     neg_l := ir_label()
     pos_l := ir_label()
@@ -273,14 +275,13 @@ fn ir_jf_emit_int(v: JsonFillVars, fail_l: String, done_l: String):
     top_l := ir_label()
     chk_l := ir_label()
     mul_l := ir_label()
-    add_l := ir_label()
     sum_l := ir_label()
-    sat_l := ir_label()
     step_l := ir_label()
     end_l := ir_label()
     some_l := ir_label()
     flip_l := ir_label()
     keep_l := ir_label()
+    fits_l := ir_label()
     ir_jf_brif(ir_jf_op_const("eq", ir_jf_byte_at(v, ir_jf_load(v.pos)), 45), neg_l, pos_l)
     ir_emit_label(neg_l)
     ir_jf_store_const(v.neg, 1)
@@ -299,29 +300,27 @@ fn ir_jf_emit_int(v: JsonFillVars, fail_l: String, done_l: String):
     d := ir_jf_op_const("sub", ir_jf_byte_at(v, ir_jf_load(v.scan)), 48)
     not_digit := ir_jf_op("or", ir_jf_op_const("lt", d, 0), ir_jf_op_const("gt", d, 9))
     ir_jf_brif(not_digit, end_l, mul_l)
+    # aux * 10 - digit must stay at or above Int's minimum
     ir_emit_label(mul_l)
-    ir_jf_brif(ir_jf_op_const("gt", ir_jf_load(v.aux), 922337203685477580), sat_l, add_l)
-    ir_emit_label(add_l)
+    ir_jf_brif(ir_jf_op_const("lt", ir_jf_load(v.aux), 0 - 922337203685477580), fail_l, sum_l)
+    ir_emit_label(sum_l)
     d2 := ir_jf_op_const("sub", ir_jf_byte_at(v, ir_jf_load(v.scan)), 48)
     tens := ir_jf_op_const("mul", ir_jf_load(v.aux), 10)
-    room := ir_jf_op("sub", ir_jf_const(9223372036854775807), d2)
-    ir_jf_brif(ir_jf_op("gt", tens, room), sat_l, sum_l)
-    ir_emit_label(sum_l)
-    d3 := ir_jf_op_const("sub", ir_jf_byte_at(v, ir_jf_load(v.scan)), 48)
-    ir_emit("store " + v.aux + " " + ir_jf_op("add", ir_jf_op_const("mul", ir_jf_load(v.aux), 10), d3).to_string())
-    ir_jf_jmp(step_l)
-    ir_emit_label(sat_l)
-    ir_jf_store_const(v.aux, 9223372036854775807)
-    ir_jf_jmp(step_l)
+    low := ir_jf_op_const("sub", ir_jf_op_const("sub", d2, 9223372036854775807), 1)
+    ir_jf_brif(ir_jf_op("lt", tens, low), fail_l, step_l)
     ir_emit_label(step_l)
+    ir_emit("store " + v.aux + " " + ir_jf_op("sub", tens, d2).to_string())
     ir_emit("store " + v.scan + " " + ir_jf_op_const("add", ir_jf_load(v.scan), 1).to_string())
     ir_jf_jmp(top_l)
     ir_emit_label(end_l)
     ir_jf_brif(ir_jf_op("eq", ir_jf_load(v.scan), ir_jf_load(v.pos)), fail_l, some_l)
     ir_emit_label(some_l)
     ir_emit("store " + v.pos + " " + ir_jf_load(v.scan).to_string())
-    ir_jf_brif(ir_jf_load(v.neg), flip_l, keep_l)
+    ir_jf_brif(ir_jf_load(v.neg), keep_l, flip_l)
+    # a positive value is the negation, which Int's minimum does not have
     ir_emit_label(flip_l)
+    ir_jf_brif(ir_jf_op_const("lt", ir_jf_load(v.aux), 0 - 9223372036854775807), fail_l, fits_l)
+    ir_emit_label(fits_l)
     ir_jf_store_slot(v, ir_jf_op("sub", ir_jf_const(0), ir_jf_load(v.aux)))
     ir_jf_jmp(done_l)
     ir_emit_label(keep_l)

@@ -697,7 +697,7 @@ YAML_MAX_EXPONENT := 1000
 
 fn parse_float_manual(text: String) -> Float:
     sign := split_sign(text)
-    mut int_part := 0
+    mut int_part := 0.0
     mut frac := 0.0
     mut frac_div := 1.0
     mut in_frac := false
@@ -725,9 +725,9 @@ fn parse_float_manual(text: String) -> Float:
             frac_div = frac_div * 10.0
             frac = frac + (ord(c) - 48).to_float() / frac_div
         else:
-            int_part = int_part * 10 + (ord(c) - 48)
+            int_part = int_part * 10.0 + (ord(c) - 48).to_float()
         i = i + 1
-    mut value := int_part.to_float() + frac
+    mut value := int_part + frac
     if exponent > YAML_MAX_EXPONENT:
         exponent = YAML_MAX_EXPONENT
     mut e := 0
@@ -1403,6 +1403,7 @@ fn is_plain_key_byte(b: Int) -> Bool:
 
 struct YamlScannedInt:
     ok: Bool
+    overflow: Bool
     value: Int
 
 fn scan_int(data: Bytes, pos: Int, stop: Int) -> YamlScannedInt:
@@ -1414,14 +1415,17 @@ fn scan_int(data: Bytes, pos: Int, stop: Int) -> YamlScannedInt:
     mut digits := 0
     mut value := 0
     while i < stop and data[i] >= 48 and data[i] <= 57:
-        value = value * 10 + (data[i] - 48)
+        digit := data[i] - 48
+        if value > (9223372036854775807 - digit) / 10:
+            return YamlScannedInt(false, true, 0)
+        value = value * 10 + digit
         digits = digits + 1
         i = i + 1
     if digits == 0 or not scan_value_ends(data, i, stop):
-        return YamlScannedInt(false, 0)
+        return YamlScannedInt(false, false, 0)
     if negative:
         value = 0 - value
-    return YamlScannedInt(true, value)
+    return YamlScannedInt(true, false, value)
 
 # whether `word` fills the value slot at `pos` exactly.
 fn scan_word(data: Bytes, pos: Int, word: String, stop: Int) -> Bool:
@@ -1501,6 +1505,8 @@ pub fn scan_scalars(input: String) -> YamlScalars:
             out.bools.insert(key, false)
         else:
             n := scan_int(data, pos, stop)
+            if n.overflow:
+                return empty_yaml_scalars(false)
             if n.ok:
                 out.ints.insert(key, n.value)
             else:
@@ -1959,3 +1965,10 @@ test "yaml folds literal and folded block scalars correctly":
     assert_eq(get_string(folded, "text"), "line one line two" + nl)
     stripped := parse("text: |-" + nl + "  only" + nl)
     assert_eq(get_string(stripped, "text"), "only")
+
+test "yaml handles huge integer and float literals without overflowing":
+    big := "10000000000000000000000000000000000000000"
+    assert(not scan_scalars("port: " + big + "\n").ok)
+    assert(parse("port: " + big + "\n") < 0)
+    root := parse("ratio: " + big + ".5\n")
+    assert(root >= 0)

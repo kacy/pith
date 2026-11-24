@@ -240,15 +240,16 @@ you need [rust and cargo](https://rustup.rs/) for the native backend.
 
 ```
 cargo build --release
+make self-host
 ./target/release/pith run examples/hello.pith
 ./target/release/pith new myapp
 ```
 
 `pith new` scaffolds a library package with a `pith.toml`, a `Makefile`,
-a test and an `AGENTS.md`. to build the compiler with itself:
+a test and an `AGENTS.md`. `make self-host` builds the self-hosted
+compiler (`check`, `fmt`, `lint`, `doc`, `lsp`, `new`, `package`):
 
 ```
-make self-host
 ./self-host/pith_main check examples/hello.pith
 ```
 
@@ -323,7 +324,7 @@ from greeter import greet
 make build            # native backend
 make self-host        # the compiler, compiled by itself
 make test             # the full suite
-make run-examples     # 126 deterministic example programs against snapshots
+make run-examples     # 128 deterministic example programs against snapshots
 make status-audit     # current corpus and size numbers
 ```
 

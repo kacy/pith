@@ -4399,6 +4399,26 @@ fn check_identifier(node_idx: Int, name: String, scope_id: Int) -> Int:
     report_error_at(node_idx, "E201", "undefined variable: " + name)
     return TID_ERR
 
+# "list", "map" or "set" when == on a value of this type would compare
+# collection handles, including through an optional, and "" otherwise. a
+# comparison with `none` never gets here.
+fn equality_collection_kind(tid: Int) -> String:
+    if tid < 0:
+        return ""
+    mut info := get_type_info(tid)
+    if info.kind == "optional" and info.inner >= 0:
+        info = get_type_info(info.inner)
+    if info.kind == "list" or info.kind == "map" or info.kind == "set":
+        return info.kind
+    return ""
+
+fn equality_collection_fix(kind: String) -> String:
+    if kind == "list":
+        return "compare the contents with `lists_equal(a, b)` from std.collections, or `assert_eq(a, b)` in a test"
+    if kind == "set":
+        return "compare the contents with `sets_equal(a, b)` from std.collections"
+    return "compare the lengths, then look up each key of one map in the other"
+
 # ---------------------------------------------------------------
 # binary expression checking
 # ---------------------------------------------------------------
@@ -4488,6 +4508,16 @@ fn check_binary_expression(node: Node, scope_id: Int) -> Int:
         return left
 
     # comparison operators: eq, neq
+    if op == "eq" or op == "neq":
+        mut coll := equality_collection_kind(left)
+        if coll == "":
+            coll = equality_collection_kind(right)
+        if coll != "":
+            mut symbol := "=="
+            if op == "neq":
+                symbol = "!="
+            report_error_with_fix("E217", "operator " + symbol + " is not defined on a " + coll + ": it would compare identity, not contents", equality_collection_fix(coll))
+            return TID_ERR
     if op == "eq":
         if left != right and optional_types_match(left, right) == false and optional_plain_comparison(left, right) == false:
             report_error("E217", "operator == type mismatch: " + get_type_name(left) + " vs " + get_type_name(right))

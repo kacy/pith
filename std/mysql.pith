@@ -54,12 +54,22 @@ struct Reader:
     mut pos: Int
 
 impl Reader:
+    fn remaining() -> Int:
+        if self.pos < 0 or self.pos >= self.data.len():
+            return 0
+        return self.data.len() - self.pos
+
     fn u8() -> Int:
+        if self.remaining() < 1:
+            return 0
         v := bytes.get(self.data, self.pos)
         self.pos = self.pos + 1
         return v
 
     fn le(width: Int) -> Int:
+        if width < 0 or width > self.remaining():
+            self.pos = self.data.len()
+            return 0
         mut value := 0
         mut i := 0
         while i < width:
@@ -69,10 +79,17 @@ impl Reader:
         return value
 
     fn skip(n: Int):
+        if n <= 0:
+            return
+        if n > self.remaining():
+            self.pos = self.data.len()
+            return
         self.pos = self.pos + n
 
     # a length-encoded integer.
     fn lenenc() -> Int:
+        if self.remaining() < 1:
+            return 0
         first := self.u8()
         if first < 251:
             return first
@@ -81,12 +98,17 @@ impl Reader:
         if first == 253:
             return self.le(3)
         if first == 254:
+            if self.remaining() < 8:
+                self.pos = self.data.len()
+                return 0 - 1
             return self.le(8)
         return 0
 
     # a length-encoded string.
     fn lenenc_str() -> String!:
         n := self.lenenc()
+        if n < 0 or n > self.remaining():
+            fail "mysql: truncated length-encoded string"
         s := bytes.to_string_utf8(bytes.slice(self.data, self.pos, self.pos + n))!
         self.pos = self.pos + n
         return s
@@ -94,8 +116,10 @@ impl Reader:
     # a null-terminated string.
     fn cstring() -> String!:
         start := self.pos
-        while bytes.get(self.data, self.pos) != 0:
+        while self.pos < self.data.len() and bytes.get(self.data, self.pos) != 0:
             self.pos = self.pos + 1
+        if self.pos >= self.data.len():
+            fail "mysql: unterminated cstring"
         s := bytes.to_string_utf8(bytes.slice(self.data, start, self.pos))!
         self.pos = self.pos + 1
         return s
@@ -952,3 +976,16 @@ test "close records that it ran, so a second close and the drop do nothing":
     conn.close()
     conn.abandon()
     assert(conn.closed)
+
+test "reader rejects truncated or overflowing length-encoded strings and unterminated cstrings":
+    # 0xfe followed by 0xffffffffffffffff (negative as signed i64) must fail cleanly
+    evil := encoding.from_hex("feffffffffffffffff")!
+    r1 := Reader(data: evil, pos: 0)
+    assert(r1.lenenc_str().is_err)
+    # length larger than remaining bytes must fail cleanly
+    trunc := encoding.from_hex("0a6162")!
+    r2 := Reader(data: trunc, pos: 0)
+    assert(r2.lenenc_str().is_err)
+    # unterminated cstring must fail cleanly instead of reading past EOF
+    r3 := Reader(data: bytes.from_string_utf8("no-nul"), pos: 0)
+    assert(r3.cstring().is_err)

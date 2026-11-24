@@ -77,21 +77,23 @@ fn huffman_decode(r: BitReader, h: Huffman) -> Int!:
     fail "inflate: invalid huffman code"
 
 # length and distance tables (rfc 1951 section 3.2.5)
+LENGTH_BASE := [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+LENGTH_EXTRA := [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+DIST_BASE := [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+DIST_EXTRA := [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+CLEN_ORDER := [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
+
 fn length_base(sym: Int) -> Int:
-    table := [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
-    return table[sym - 257]
+    return LENGTH_BASE[sym - 257]
 
 fn length_extra(sym: Int) -> Int:
-    table := [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
-    return table[sym - 257]
+    return LENGTH_EXTRA[sym - 257]
 
 fn dist_base(sym: Int) -> Int:
-    table := [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
-    return table[sym]
+    return DIST_BASE[sym]
 
 fn dist_extra(sym: Int) -> Int:
-    table := [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
-    return table[sym]
+    return DIST_EXTRA[sym]
 
 fn fixed_literal_huffman() -> Huffman:
     mut lengths: List[Int] := []
@@ -118,8 +120,7 @@ fn fixed_distance_huffman() -> Huffman:
 
 # the code-length alphabet arrives in this fixed order
 fn clen_order(i: Int) -> Int:
-    order := [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15]
-    return order[i]
+    return CLEN_ORDER[i]
 
 struct HuffmanPair:
     lit: Huffman
@@ -190,13 +191,10 @@ fn inflate_block(r: BitReader, out: ByteBuffer, lit: Huffman, dist: Huffman, max
             distance := dist_base(dsym) + br_read_bits(r, dist_extra(dsym))!
             if distance > out.len():
                 fail "inflate: distance beyond output"
-            mut src := out.len() - distance
-            while length > 0:
-                if out.len() >= max_output:
-                    fail "inflate: output exceeds maximum size"
-                out.write_byte(out.get(src))!
-                src = src + 1
-                length = length - 1
+            if length > max_output - out.len():
+                fail "inflate: output exceeds maximum size"
+            if not out.copy_within(out.len() - distance, length):
+                fail "inflate: back-reference copy failed"
     return true
 
 ## an inflate result that also reports where the stream ended, so a

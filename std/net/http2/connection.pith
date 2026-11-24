@@ -2016,11 +2016,12 @@ impl Client:
     # client lifetime) is awaited so it flushes before the transport drops; a
     # promoted client's reader then unblocks on the closed transport.
     pub fn close():
+        # guard against double close (e.g. explicit close() followed by defer):
+        # awaiting the writer or waiting on reader_done a second time would hang.
+        if not self.closed.compare_set(0, 1):
+            return
         locked self.mu:
             self.going_away = true
-        # mark closed first, so a concurrent promoter sees it and does not release
-        # the reader onto a transport we are about to drop.
-        self.closed.store(1)
         # release the reader if it is still parked (client never promoted), so it
         # observes closed and exits instead of parking forever.
         self.promote_gate.close()

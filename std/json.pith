@@ -617,9 +617,10 @@ fn json_byte_read_int(input: Bytes, pos: Int) -> JsonByteInt:
     while i < input.len() and json_byte_is_digit(input[i]):
         # guard against overflow before it silently wraps a huge integer
         # into a small one and bypasses a downstream size/count check
-        if value > 922337203685477580 / 10:
+        digit := input[i] - 48
+        if value > (9223372036854775807 - digit) / 10:
             return JsonByteInt(false, 0, pos)
-        value = (value * 10) + (input[i] - 48)
+        value = (value * 10) + digit
         i = i + 1
     if i == digits_start:
         return JsonByteInt(false, 0, pos)
@@ -2833,6 +2834,11 @@ test "json integers cover the full Int range and reject overflow":
     assert_eq(get_int(parse("-9223372036854775808")), 0 - 9223372036854775807 - 1)
     assert_eq(parse("9223372036854775808"), 0 - 1)
     assert_eq(parse("-9223372036854775809"), 0 - 1)
+    # byte-level scalar scanner also accepts 18-digit and max i64 integers
+    scanned := json_byte_read_int(bytes.from_string_utf8("9223372036854775807"), 0)
+    assert(scanned.ok)
+    assert_eq(scanned.value, 9223372036854775807)
+    assert(not json_byte_read_int(bytes.from_string_utf8("9223372036854775808"), 0).ok)
 
 # `n` nested arrays around one scalar
 fn nested_arrays(n: Int) -> String:

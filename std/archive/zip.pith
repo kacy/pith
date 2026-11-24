@@ -85,13 +85,16 @@ fn zip_archive_name(root_path: String, entry_path: String) -> String!:
         name = path.join(base, rel)
     return zip_safe_name(name)!
 
-fn zip_decode_name(data: Bytes, offset: Int, length: Int) -> String!:
+fn zip_decode_raw_name(data: Bytes, offset: Int, length: Int) -> String!:
     if length < 0 or offset < 0 or offset + length > data.len():
         fail "zip filename truncated"
     name := data.slice(offset, offset + length).to_string_utf8()
     if name.is_err:
         fail "zip filename is not utf-8"
-    return zip_safe_name(name.ok)!
+    return name.ok
+
+fn zip_decode_name(data: Bytes, offset: Int, length: Int) -> String!:
+    return zip_safe_name(zip_decode_raw_name(data, offset, length)!)!
 
 fn zip_entry_from_record(record: ZipRecord) -> ZipEntry:
     return ZipEntry(record.name, record.size, record.compressed_size, record.crc32, record.method, record.is_dir)
@@ -139,12 +142,49 @@ fn zip_records(data: Bytes) -> List[ZipRecord]!:
         extra_len := zip_read_u16(data, pos + 30)!
         comment_len := zip_read_u16(data, pos + 32)!
         local_offset := zip_read_u32(data, pos + 42)!
-        name := zip_decode_name(data, pos + 46, name_len)!
-        is_dir := name.ends_with("/")
+        raw_name := zip_decode_raw_name(data, pos + 46, name_len)!
+        is_dir := raw_name.ends_with("/")
+        name := zip_safe_name(raw_name)!
+        if is_dir and (size != 0 or compressed_size != 0):
+            fail "zip directory entry must be empty"
         records.push(ZipRecord(name, size, compressed_size, crc, method, local_offset, is_dir))
         pos = pos + 46 + name_len + extra_len + comment_len
         i = i + 1
+    zip_check_no_overlaps(data, records, central_offset)!
     return records
+
+struct ZipSpan:
+    start: Int
+    end: Int
+
+fn zip_check_no_overlaps(data: Bytes, records: List[ZipRecord], central_offset: Int) -> Bool!:
+    mut seen_names: Map[String, Bool] := {}
+    mut spans: List[ZipSpan] := []
+    for record in records:
+        if seen_names.contains_key(record.name):
+            fail "duplicate zip entry: " + record.name
+        seen_names.insert(record.name, true)
+        data_start := zip_local_data_start(data, record)!
+        span_end := data_start + record.compressed_size
+        if span_end > central_offset:
+            fail "zip entry overlaps central directory"
+        spans.push(ZipSpan(record.local_offset, span_end))
+    # sort spans by start offset (insertion sort: O(N) on normal archives)
+    mut i := 1
+    while i < spans.len():
+        cur := spans[i]
+        mut j := i - 1
+        while j >= 0 and spans[j].start > cur.start:
+            spans[j + 1] = spans[j]
+            j = j - 1
+        spans[j + 1] = cur
+        i = i + 1
+    mut k := 1
+    while k < spans.len():
+        if spans[k - 1].end > spans[k].start:
+            fail "overlapping zip entries"
+        k = k + 1
+    return true
 
 fn zip_local_data_start(data: Bytes, record: ZipRecord) -> Int!:
     pos := record.local_offset
@@ -377,3 +417,46 @@ test "zip creates extracts and rejects invalid archives":
     assert(list(zip_test_manual_archive("compressed.txt", content, 8, checksum.crc32(content))!).is_err)
     assert(extract(zip_test_manual_archive("../evil.txt", bytes.empty(), METHOD_STORED, checksum.crc32(bytes.empty()))!, path.join(root, "unsafe")).is_err)
     assert(fs.remove_tree(root))
+
+test "zip extracts directory entries and rejects overlapping entry bombs":
+    root := fs.make_temp_dir("pith-zip-dir-")!
+    defer fs.remove_tree(root)
+    # build an archive with an explicit directory entry "sub/" and file "sub/a.txt"
+    out := bytes.buffer()
+    defer out.free()
+    mut recs: List[ZipRecord] := []
+    dir_off := out.len()
+    empty_crc := checksum.crc32(bytes.empty())
+    zip_write_local_header(out, "sub/", bytes.empty(), empty_crc)!
+    recs.push(ZipRecord("sub/", 0, 0, empty_crc, METHOD_STORED, dir_off, true))
+    file_off := out.len()
+    payload := bytes.from_string_utf8("ok")
+    payload_crc := checksum.crc32(payload)
+    zip_write_local_header(out, "sub/a.txt", payload, payload_crc)!
+    zip_write_bytes(out, payload)!
+    recs.push(ZipRecord("sub/a.txt", payload.len(), payload.len(), payload_crc, METHOD_STORED, file_off, false))
+    c_off := out.len()
+    for r in recs:
+        zip_write_central_header(out, r)!
+    c_size := out.len() - c_off
+    zip_write_eocd(out, recs.len(), c_size, c_off)!
+    dir_archive := out.bytes()
+    listed := list(dir_archive)!
+    assert_eq(listed.len(), 2)
+    assert(listed[0].is_dir)
+    assert(not listed[1].is_dir)
+    out_dir := path.join(root, "extracted")
+    assert(extract(dir_archive, out_dir)!)
+    assert_eq(fs.read(path.join(path.join(out_dir, "sub"), "a.txt"))!, "ok")
+
+    # build an overlapping bomb: two distinct central entries pointing at offset 0
+    bomb := bytes.buffer()
+    defer bomb.free()
+    zip_write_local_header(bomb, "a.txt", payload, payload_crc)!
+    zip_write_bytes(bomb, payload)!
+    bc_off := bomb.len()
+    zip_write_central_header(bomb, ZipRecord("a.txt", payload.len(), payload.len(), payload_crc, METHOD_STORED, 0, false))!
+    zip_write_central_header(bomb, ZipRecord("b.txt", payload.len(), payload.len(), payload_crc, METHOD_STORED, 0, false))!
+    bc_size := bomb.len() - bc_off
+    zip_write_eocd(bomb, 2, bc_size, bc_off)!
+    assert(list(bomb.bytes()).is_err)

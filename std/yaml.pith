@@ -622,7 +622,7 @@ fn parse_digits_in_base(text: String, start: Int, base: Int) -> Int:
     mut i := start
     while i < text.len():
         digit := hex_digit_value(text[i])
-        if value > 922337203685477580 / base:
+        if value > (9223372036854775807 - digit) / base:
             yaml_fail("integer literal out of range: " + text)
             return 0
         value = value * base + digit
@@ -1972,3 +1972,6 @@ test "yaml handles huge integer and float literals without overflowing":
     assert(parse("port: " + big + "\n") < 0)
     root := parse("ratio: " + big + ".5\n")
     assert(root >= 0)
+    # 18-digit decimal integers up to i64::MAX must parse cleanly
+    max_root := parse("max: 9223372036854775807\n")
+    assert_eq(get_int(max_root, "max"), 9223372036854775807)

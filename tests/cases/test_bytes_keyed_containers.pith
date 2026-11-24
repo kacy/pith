@@ -3,9 +3,10 @@
 # value built from a string and the same value assembled byte by byte in a
 # buffer are one entry, and the empty value is a key like any other. every
 # operation the string flavor has works the same way here, iteration hands
-# out fresh bytes objects, and `==` on the container is identity, as it is
-# for every container.
+# out fresh bytes objects, and `sets_equal` compares two sets by content
+# (`==` on a container is refused).
 import std.bytes as bytes
+from std.collections import sets_equal
 
 struct Seen:
     pub keys: Set[Bytes]
@@ -75,9 +76,10 @@ fn set_section():
     print("literal: {lit.len()}")
     built := build_members()
     print("built: {built.len()} {holds(built, assembled("yy"))} {holds(built, abc)}")
-    # container equality is identity for every container
+    # sets_equal compares the members by content
     same := s
-    print("identity: {s == same} {s == lit}")
+    rebuilt: Set[Bytes] := {assembled("abd"), assembled("abc")}
+    print("contents: {sets_equal(s, same)} {sets_equal(s, lit)} {sets_equal(lit, rebuilt)}")
     s.clear()
     print("cleared: {s.len()} {s.is_empty()}")
 

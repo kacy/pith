@@ -480,7 +480,10 @@ fn repeat_impl(bytes: &[u8], n: i64) -> *mut i8 {
     if n <= 0 || len == 0 {
         return crate::pith_cstring_empty();
     }
-    let Some(total_len) = len.checked_mul(n as usize) else {
+    let Some(total_len) = len
+        .checked_mul(n as usize)
+        .filter(|&t| crate::runtime_core::cstring_len_valid(t))
+    else {
         return crate::pith_cstring_empty();
     };
     // SAFETY: `pith_alloc_cstring(total_len)` returns a fresh writable buffer of
@@ -684,7 +687,9 @@ mod tests {
         assert_eq!(repeat("ab", 3), b"ababab");
         assert_eq!(repeat("ab", 0), b"");
         assert_eq!(repeat("ab", -1), b"");
-        // a total past the address space is refused, not wrapped
+        // a total past the address space (or valid layout limit) is refused, not wrapped
         assert_eq!(repeat("abc", i64::MAX), b"");
+        assert_eq!(repeat("ab", i64::MAX), b"");
+        assert_eq!(repeat("a", i64::MAX), b"");
     }
 }

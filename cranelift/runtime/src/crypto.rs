@@ -1,36 +1,25 @@
 use crate::bytes::{pith_bytes_from_vec, with_bytes, with_bytes2, with_bytes3, with_bytes4};
-use crate::handle_registry::{self, HandleKind};
+use crate::int_hash::IntMap;
 use ring::{aead, agreement, rand, signature};
 use std::fs;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
-struct PithX25519Key {
-    key: Option<agreement::EphemeralPrivateKey>,
+struct EcdhKeyEntry {
     public_key: Vec<u8>,
+    private_key: Mutex<Option<agreement::EphemeralPrivateKey>>,
 }
 
-/// Validate `handle` as a `PithX25519Key` and borrow it immutably for the duration of `f`.
-#[inline(always)]
-unsafe fn with_x25519_key_ref<R>(handle: i64, f: impl FnOnce(&PithX25519Key) -> R) -> Option<R> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::X25519Key) {
-        return None;
-    }
-    // SAFETY: Handle validated in registry; caller keeps handle live for the duration of `f`.
-    let key = unsafe { &*(handle as *const PithX25519Key) };
-    Some(f(key))
-}
+static NEXT_ECDH_KEY_ID: AtomicI64 = AtomicI64::new(1);
+static ECDH_KEYS: LazyLock<Mutex<IntMap<i64, Arc<EcdhKeyEntry>>>> =
+    LazyLock::new(|| Mutex::new(IntMap::default()));
 
-/// Validate `handle` as a `PithX25519Key` and borrow it mutably for the duration of `f`.
-#[inline(always)]
-unsafe fn with_x25519_key_mut<R>(
-    handle: i64,
-    f: impl FnOnce(&mut PithX25519Key) -> R,
-) -> Option<R> {
-    if !handle_registry::is_valid(handle as *const (), HandleKind::X25519Key) {
+fn lookup_ecdh_key(handle: i64) -> Option<Arc<EcdhKeyEntry>> {
+    if handle <= 0 {
         return None;
     }
-    // SAFETY: Handle validated in registry; caller ensures exclusive access for `f`.
-    let key = unsafe { &mut *(handle as *mut PithX25519Key) };
-    Some(f(key))
+    let table = crate::sync::lock(&ECDH_KEYS);
+    table.get(&handle).map(Arc::clone)
 }
 
 /// an AEAD key and nonce from raw bytes, or `None` for a key of the wrong
@@ -129,12 +118,16 @@ fn sign_ed25519_impl(pkcs8: &[u8], message: &[u8]) -> i64 {
     pith_bytes_from_vec(key_pair.sign(message).as_ref().to_vec())
 }
 
-fn x25519_public_key_impl(key: &PithX25519Key) -> i64 {
-    pith_bytes_from_vec(key.public_key.clone())
+fn x25519_public_key_impl(entry: &EcdhKeyEntry) -> i64 {
+    pith_bytes_from_vec(entry.public_key.clone())
 }
 
-fn x25519_shared_secret_impl(key: &mut PithX25519Key, peer: &[u8]) -> i64 {
-    let Some(private_key) = key.key.take() else {
+fn x25519_shared_secret_impl(entry: &EcdhKeyEntry, peer: &[u8]) -> i64 {
+    let private_key = {
+        let mut guard = crate::sync::lock(&entry.private_key);
+        guard.take()
+    };
+    let Some(private_key) = private_key else {
         return 0;
     };
     let peer_key = agreement::UnparsedPublicKey::new(private_key.algorithm(), peer);
@@ -244,12 +237,17 @@ fn ecdh_keygen(alg: &'static agreement::Algorithm) -> i64 {
     let Ok(public_key) = key.compute_public_key() else {
         return 0;
     };
-    let ptr = Box::into_raw(Box::new(PithX25519Key {
-        key: Some(key),
+    let entry = Arc::new(EcdhKeyEntry {
         public_key: public_key.as_ref().to_vec(),
-    }));
-    handle_registry::register(ptr as *const (), HandleKind::X25519Key);
-    ptr as i64
+        private_key: Mutex::new(Some(key)),
+    });
+    let id = NEXT_ECDH_KEY_ID.fetch_add(1, Ordering::Relaxed);
+    if id <= 0 {
+        return 0;
+    }
+    let mut table = crate::sync::lock(&ECDH_KEYS);
+    table.insert(id, entry);
+    id
 }
 
 #[no_mangle]
@@ -272,8 +270,9 @@ pub extern "C" fn pith_crypto_p384_keygen() -> i64 {
 
 #[no_mangle]
 pub unsafe extern "C" fn pith_crypto_x25519_public_key(handle: i64) -> i64 {
-    // SAFETY: `handle` is validated by `with_x25519_key_ref` before borrowing.
-    unsafe { with_x25519_key_ref(handle, x25519_public_key_impl) }.unwrap_or(0)
+    lookup_ecdh_key(handle)
+        .map(|entry| x25519_public_key_impl(&entry))
+        .unwrap_or(0)
 }
 
 #[no_mangle]
@@ -281,24 +280,24 @@ pub unsafe extern "C" fn pith_crypto_x25519_shared_secret(
     handle: i64,
     peer_public_key: i64,
 ) -> i64 {
-    // SAFETY: `peer_public_key` (`PithBytes`) and `handle` (`PithX25519Key`) are
-    // distinct handle types validated before borrowing.
-    unsafe {
-        with_bytes(peer_public_key, |peer| {
-            with_x25519_key_mut(handle, |key| x25519_shared_secret_impl(key, peer))
-        })
-    }
-    .flatten()
-    .unwrap_or(0)
+    let Some(entry) = lookup_ecdh_key(handle) else {
+        return 0;
+    };
+    // SAFETY: `peer_public_key` is validated by `with_bytes` before borrowing its slice.
+    unsafe { with_bytes(peer_public_key, |peer| x25519_shared_secret_impl(&entry, peer)) }
+        .unwrap_or(0)
 }
 
 #[no_mangle]
 pub extern "C" fn pith_crypto_x25519_close(handle: i64) {
-    if !handle_registry::unregister(handle as *const (), HandleKind::X25519Key) {
+    if handle <= 0 {
         return;
     }
-    // SAFETY: `unregister` succeeded once for a Box allocated by `ecdh_keygen`.
-    let _ = unsafe { Box::from_raw(handle as *mut PithX25519Key) };
+    let removed = {
+        let mut table = crate::sync::lock(&ECDH_KEYS);
+        table.remove(&handle)
+    };
+    drop(removed);
 }
 
 #[no_mangle]
@@ -642,6 +641,49 @@ mod tests {
             for t in threads {
                 t.join().unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn concurrent_x25519_shared_secret_succeeds_at_most_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        for _ in 0..64 {
+            let handle = pith_crypto_x25519_keygen();
+            let peer_handle = pith_crypto_x25519_keygen();
+            let peer_pub = unsafe { pith_crypto_x25519_public_key(peer_handle) };
+            assert!(handle > 0 && peer_pub > 0);
+            let barrier = Arc::new(Barrier::new(4));
+            let successes = Arc::new(AtomicUsize::new(0));
+            let mut threads = Vec::new();
+            for i in 0..4 {
+                let b = Arc::clone(&barrier);
+                let s = Arc::clone(&successes);
+                threads.push(std::thread::spawn(move || {
+                    b.wait();
+                    if i == 3 {
+                        pith_crypto_x25519_close(handle);
+                    } else if i == 2 {
+                        let pk = unsafe { pith_crypto_x25519_public_key(handle) };
+                        if pk != 0 {
+                            unsafe { crate::bytes::pith_bytes_release(pk) };
+                        }
+                    } else {
+                        let sec = unsafe { pith_crypto_x25519_shared_secret(handle, peer_pub) };
+                        if sec != 0 {
+                            s.fetch_add(1, Ordering::Relaxed);
+                            unsafe { crate::bytes::pith_bytes_release(sec) };
+                        }
+                    }
+                }));
+            }
+            for t in threads {
+                t.join().unwrap();
+            }
+            assert!(successes.load(Ordering::Relaxed) <= 1);
+            pith_crypto_x25519_close(handle);
+            pith_crypto_x25519_close(peer_handle);
+            unsafe { crate::bytes::pith_bytes_release(peer_pub) };
         }
     }
 }

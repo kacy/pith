@@ -100,14 +100,34 @@ static CSTRING_EMPTY: StaticChar = StaticChar {
 /// smallest chunks, so a short string wastes nothing the allocator would not
 /// already round away. Past that there are four classes per power of two,
 /// which wastes at most a quarter and keeps repeated appends amortized.
-fn cstring_alloc_size(data_len: usize) -> usize {
-    let total = CSTRING_HEADER_SIZE + data_len + 1;
-    if total <= 136 {
-        return (total + 7) / 16 * 16 + 8;
+fn cstring_alloc_size_checked(data_len: usize) -> Option<usize> {
+    let total = CSTRING_HEADER_SIZE.checked_add(data_len)?.checked_add(1)?;
+    let size = if total <= 136 {
+        (total + 7) / 16 * 16 + 8
+    } else {
+        let top = usize::BITS - 1 - (total - 1).leading_zeros();
+        let step = 1usize << (top - 2);
+        total.checked_next_multiple_of(step)?
+    };
+    if size > (isize::MAX as usize) - (CSTRING_ALIGN - 1) {
+        return None;
     }
-    let top = usize::BITS - 1 - (total - 1).leading_zeros();
-    let step = 1usize << (top - 2);
-    total.div_ceil(step) * step
+    Some(size)
+}
+
+pub(crate) fn cstring_len_valid(data_len: usize) -> bool {
+    cstring_alloc_size_checked(data_len).is_some()
+}
+
+fn cstring_alloc_size(data_len: usize) -> usize {
+    match cstring_alloc_size_checked(data_len) {
+        Some(size) => size,
+        None => {
+            eprintln!("pith runtime error: invalid allocation layout");
+            // panic-guard: requested string size exceeds the maximum valid allocation layout.
+            std::process::exit(1);
+        }
+    }
 }
 
 fn cstring_layout(data_len: usize) -> Layout {
@@ -1277,6 +1297,11 @@ mod tests {
                 assert!(size * 4 <= (CSTRING_HEADER_SIZE + len + 1) * 5);
             }
         }
+        assert_eq!(cstring_alloc_size_checked(usize::MAX), None);
+        assert_eq!(cstring_alloc_size_checked(usize::MAX - 1), None);
+        assert_eq!(cstring_alloc_size_checked(usize::MAX - CSTRING_HEADER_SIZE), None);
+        assert_eq!(cstring_alloc_size_checked(isize::MAX as usize), None);
+        assert_eq!(cstring_alloc_size_checked((isize::MAX as usize) - CSTRING_HEADER_SIZE), None);
     }
 
     #[test]
@@ -1970,7 +1995,11 @@ pub unsafe extern "C" fn pith_cstring_append_many(
     };
     // SAFETY: `header` is a validated sole-owned heap cstring header.
     let len = unsafe { cstring_data_len(header) };
-    let new_len = len + added;
+    let Some(new_len) = len.checked_add(added) else {
+        eprintln!("pith runtime error: invalid allocation layout");
+        // panic-guard: concatenated string length overflows usize.
+        std::process::exit(1);
+    };
     let new_size = cstring_alloc_size(new_len);
     if new_size != cstring_alloc_size(len) {
         let old_layout = cstring_layout(len);
@@ -3997,7 +4026,11 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     if crate::switches::any(crate::switches::PERF_STATS | crate::switches::ALLOC_SITES) {
         struct_alloc_diagnostics(num_fields);
     }
-    let size = (num_fields.max(0) as usize) * 8;
+    let Some(size) = (num_fields.max(0) as usize).checked_mul(8) else {
+        eprintln!("pith runtime error: invalid allocation layout");
+        // panic-guard: struct byte size overflows usize.
+        std::process::exit(1);
+    };
     if size == 0 {
         return 0;
     }
@@ -4013,7 +4046,11 @@ pub unsafe extern "C" fn pith_struct_alloc(num_fields: i64) -> i64 {
     // also hits 0, so a weak reference can always safely read the header to see
     // whether the target is still alive. dtor is a compiled destructor's
     // address (0 = none).
-    let total = size + STRUCT_HEADER;
+    let Some(total) = size.checked_add(STRUCT_HEADER) else {
+        eprintln!("pith runtime error: invalid allocation layout");
+        // panic-guard: struct total allocation size overflows usize.
+        std::process::exit(1);
+    };
     let base = struct_pool_take(total);
     let base = if base.is_null() {
         let layout = pith_layout(total, 8);

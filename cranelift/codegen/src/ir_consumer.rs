@@ -97,6 +97,13 @@ fn exit_unless<const N: usize>(
     builder.switch_to_block(next);
 }
 
+/// The shared mark of the struct `obj` points into: nonzero once another
+/// task can reach it. `obj` must be a live struct, never null.
+fn struct_shared_mark(builder: &mut FunctionBuilder<'_>, obj: Value) -> Value {
+    let word = builder.ins().load(types::I32, MemFlags::new(), obj, STRUCT_FLAGS_FROM_DATA);
+    builder.ins().band_imm(word, STRUCT_SHARED_MASK as i64)
+}
+
 /// The slow side of a fast path: fill `slow` with a call to `fallback` on
 /// `args` that joins `done` with its result, and leave the builder in
 /// `done` on the merged value.
@@ -1392,14 +1399,56 @@ fn inline_runtime_call(
         // struct the emitter is storing into, never null.
         ("pith_share_into", 3) => {
             let fallback = runtime_ref(builder, "pith_share_into")?;
-            let word = builder.ins().load(types::I32, MemFlags::new(), args[0], STRUCT_FLAGS_FROM_DATA);
-            let shared = builder.ins().band_imm(word, STRUCT_SHARED_MASK as i64);
+            let shared = struct_shared_mark(builder, args[0]);
             let call_block = builder.create_block();
             let done = builder.create_block();
             builder.set_cold_block(call_block);
             builder.ins().brif(shared, call_block, &[], done, &[]);
             builder.switch_to_block(call_block);
             builder.ins().call(fallback, &[args[0], args[1], args[2]]);
+            builder.ins().jump(done, &[]);
+            builder.switch_to_block(done);
+            builder.ins().iconst(types::I64, 0)
+        }
+        // a weak field read or store takes the runtime's weak field lock
+        // only when its holder is shared, since only a shared holder is
+        // reachable from another task (see `weak_holder_is_local` in the
+        // runtime). for a local holder, the read loads and upgrades the field
+        // here, and the store swaps it and drops the old target's weak count.
+        ("pith_struct_weak_load_field", 2) => {
+            let locked = runtime_ref(builder, fname)?;
+            let upgrade = runtime_ref(builder, "pith_struct_weak_upgrade")?;
+            let shared = struct_shared_mark(builder, args[0]);
+            let local = builder.create_block();
+            let slow = builder.create_block();
+            let done = builder.create_block();
+            builder.append_block_param(done, types::I64);
+            builder.ins().brif(shared, slow, &[], local, &[]);
+            builder.switch_to_block(local);
+            let slot = builder.ins().iadd(args[0], args[1]);
+            let target = builder.ins().load(types::I64, MemFlags::new(), slot, 0);
+            let call = builder.ins().call(upgrade, &[target]);
+            let upgraded = builder.func.dfg.first_result(call);
+            jump_with_i64_arg(builder, done, upgraded);
+            join_with_fallback_call(builder, slow, done, locked, &[args[0], args[1]])
+        }
+        ("pith_struct_weak_store_field", 3) => {
+            let locked = runtime_ref(builder, fname)?;
+            let release = runtime_ref(builder, "pith_struct_weak_release")?;
+            let shared = struct_shared_mark(builder, args[0]);
+            let local = builder.create_block();
+            let slow = builder.create_block();
+            let done = builder.create_block();
+            builder.set_cold_block(slow);
+            builder.ins().brif(shared, slow, &[], local, &[]);
+            builder.switch_to_block(local);
+            let slot = builder.ins().iadd(args[0], args[1]);
+            let old = builder.ins().load(types::I64, MemFlags::new(), slot, 0);
+            builder.ins().store(MemFlags::new(), args[2], slot, 0);
+            builder.ins().call(release, &[old]);
+            builder.ins().jump(done, &[]);
+            builder.switch_to_block(slow);
+            builder.ins().call(locked, &[args[0], args[1], args[2]]);
             builder.ins().jump(done, &[]);
             builder.switch_to_block(done);
             builder.ins().iconst(types::I64, 0)
@@ -5251,50 +5300,54 @@ mod tests {
         assert!(sanitize_hook_names(Some("tsan")).is_err());
     }
 
+    /// Compile the one function in `ir`, `main`, and display its CLIF, with
+    /// the thread sanitizer's hooks when `sanitize`. Also answers the runtime
+    /// functions it was compiled against, by name.
+    fn compile_main(ir: &str, sanitize: bool) -> (String, HashMap<String, FuncId>) {
+        let mut codegen = crate::create_codegen().expect("create codegen");
+        let runtime_funcs = crate::runtime_imports::declare_runtime_functions(&mut codegen.module)
+            .expect("declare runtime functions");
+        let hooks = if sanitize {
+            let mut sig = codegen.module.make_signature();
+            sig.params.push(AbiParam::new(types::I64));
+            let mut declare = |name: &str| {
+                codegen.module.declare_function(name, Linkage::Import, &sig).expect("declare")
+            };
+            Some(SanitizeHooks { read: declare("__tsan_read8"), write: declare("__tsan_write8") })
+        } else {
+            None
+        };
+        let lines: Vec<&str> = ir.lines().skip(1).take_while(|l| *l != "endfunc").collect();
+        let func = compile_ir_function(
+            &mut codegen,
+            "main",
+            "int",
+            &[],
+            &[],
+            &lines,
+            &runtime_funcs,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+            &[],
+            &HashSet::new(),
+            None,
+            hooks,
+            &HashMap::new(),
+        )
+        .expect("compile");
+        (func.display().to_string(), runtime_funcs)
+    }
+
     // with a sanitizer named, field reads and writes report to its checks
     // and the inline fast paths give way to their runtime calls.
     #[test]
     fn sanitized_build_checks_fields_and_calls_the_runtime() {
         let ir = "func main 0 int\niconst 1 0\ncall 2 pith_struct_alloc int 1 1\n\
                   sstore 2 0 1\nfield 3 2 0\ncall 4 pith_list_len int 1 1\nret 3\nendfunc\n";
-        let compiled = |sanitize: bool| {
-            let mut codegen = crate::create_codegen().expect("create codegen");
-            let runtime_funcs = crate::runtime_imports::declare_runtime_functions(&mut codegen.module)
-                .expect("declare runtime functions");
-            let hooks = if sanitize {
-                let mut sig = codegen.module.make_signature();
-                sig.params.push(AbiParam::new(types::I64));
-                let mut declare = |name: &str| {
-                    codegen.module.declare_function(name, Linkage::Import, &sig).expect("declare")
-                };
-                Some(SanitizeHooks { read: declare("__tsan_read8"), write: declare("__tsan_write8") })
-            } else {
-                None
-            };
-            let lines: Vec<&str> = ir.lines().skip(1).take_while(|l| *l != "endfunc").collect();
-            let func = compile_ir_function(
-                &mut codegen,
-                "main",
-                "int",
-                &[],
-                &[],
-                &lines,
-                &runtime_funcs,
-                &HashMap::new(),
-                &HashMap::new(),
-                &HashSet::new(),
-                &HashMap::new(),
-                &[],
-                &HashSet::new(),
-                None,
-                hooks,
-                &HashMap::new(),
-            )
-            .expect("compile");
-            func.display().to_string()
-        };
-        let plain = compiled(false);
-        let sanitized = compiled(true);
+        let plain = compile_main(ir, false).0;
+        let sanitized = compile_main(ir, true).0;
         let calls = |text: &str| text.matches(" call ").count();
         // after main's pith_runtime_start: the alloc and the fast path's
         // cold fallback, against the alloc, the two checks and a plain
@@ -5302,6 +5355,82 @@ mod tests {
         assert_eq!(calls(&plain), 3, "{plain}");
         assert_eq!(calls(&sanitized), 5, "{sanitized}");
         assert!(!sanitized.contains("can_move"), "{sanitized}");
+    }
+
+    /// Each branch `clif` takes on a struct's shared mark, in order: the body
+    /// of the block it goes to when the mark is set, and of the one it goes
+    /// to when it is clear.
+    fn shared_mark_branches(clif: &str) -> Vec<(String, String)> {
+        let mut blocks: HashMap<String, String> = HashMap::new();
+        let mut current = String::new();
+        let mut marks = HashSet::new();
+        let mut branches = Vec::new();
+        let mask = format!(", {STRUCT_SHARED_MASK}");
+        for line in clif.lines().map(str::trim) {
+            if line.starts_with("block") && line.ends_with(':') {
+                current = line.split(['(', ' ', ':']).next().unwrap_or_default().to_string();
+                continue;
+            }
+            blocks.entry(current.clone()).or_default().push_str(&format!("{line}\n"));
+            if let Some((value, op)) = line.split_once(" = ") {
+                if op.starts_with("band_imm") && op.ends_with(&mask) {
+                    marks.insert(value.to_string());
+                }
+            }
+            let parts: Vec<&str> = line.split([' ', ',']).filter(|p| !p.is_empty()).collect();
+            if let ["brif", cond, set, clear] = parts[..] {
+                if marks.contains(cond) {
+                    branches.push((set.to_string(), clear.to_string()));
+                }
+            }
+        }
+        branches
+            .into_iter()
+            .map(|(set, clear)| (blocks[&set].clone(), blocks[&clear].clone()))
+            .collect()
+    }
+
+    /// The `call` of the runtime function `name` as `clif` writes it, up to
+    /// its arguments: `call fn2(`.
+    fn clif_call(clif: &str, funcs: &HashMap<String, FuncId>, name: &str) -> String {
+        let declared = format!(" = u0:{} ", funcs[name].as_u32());
+        let fn_ref = clif
+            .lines()
+            .map(str::trim)
+            .find_map(|line| line.contains(&declared).then(|| line.split(' ').next().unwrap_or_default()))
+            .unwrap_or_else(|| panic!("{name} is never declared in\n{clif}"));
+        format!("call {fn_ref}(")
+    }
+
+    // a weak field read or store takes the runtime's locked call when its
+    // holder is marked shared, and only then: the lock is what keeps a store
+    // in another task from freeing the old target's header between a read's
+    // load and its upgrade. a local holder's field is read and upgraded, or
+    // swapped and its old target's weak count dropped, without the call.
+    #[test]
+    fn weak_field_calls_take_the_lock_on_a_shared_holder() {
+        let ir = "func main 0 int\niconst 1 2\ncall 2 pith_struct_alloc int 1 1\n\
+                  iconst 3 8\ncall 4 pith_struct_weak_store_field void 3 2 3 2\n\
+                  call 5 pith_struct_weak_load_field int 2 2 3\nret 5\nendfunc\n";
+        let (clif, funcs) = compile_main(ir, false);
+        let call = |name: &str| clif_call(&clif, &funcs, name);
+        let branches = shared_mark_branches(&clif);
+        assert_eq!(branches.len(), 2, "{clif}");
+        let (shared_store, local_store) = &branches[0];
+        assert!(shared_store.contains(&call("pith_struct_weak_store_field")), "{clif}");
+        assert!(!local_store.contains(&call("pith_struct_weak_store_field")), "{clif}");
+        assert!(local_store.contains(&call("pith_struct_weak_release")), "{clif}");
+        let (shared_load, local_load) = &branches[1];
+        assert!(shared_load.contains(&call("pith_struct_weak_load_field")), "{clif}");
+        assert!(!local_load.contains(&call("pith_struct_weak_load_field")), "{clif}");
+        assert!(local_load.contains(&call("pith_struct_weak_upgrade")), "{clif}");
+
+        // a build without the fast paths makes the runtime calls, which
+        // test the mark themselves
+        let (sanitized, funcs) = compile_main(ir, true);
+        assert!(shared_mark_branches(&sanitized).is_empty(), "{sanitized}");
+        assert!(sanitized.contains(&clif_call(&sanitized, &funcs, "pith_struct_weak_store_field")), "{sanitized}");
+        assert!(sanitized.contains(&clif_call(&sanitized, &funcs, "pith_struct_weak_load_field")), "{sanitized}");
     }
 
     #[test]

@@ -676,9 +676,9 @@ checker looks at whether some code does.
   for every instance. a settled field keeps the value it was built with, and
   any task may read it, as with a `frozen` field.
 - a field in a `guard` block is reached under its lock and does not count.
-- a `weak` field does not count. its load and its store each run as one step
-  under the runtime's weak lock, so a read never sees a target the store is
-  freeing.
+- a `weak` field does not count. its load and its store each run as one
+  step, under the runtime's weak lock once another task can reach the
+  struct, so a read never sees a target the store is freeing.
 - a field holding a number, a `Bool` or a tag-only enum does not count. two
   tasks writing one race on the value, which is a logic error, but no memory
   is freed.

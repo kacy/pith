@@ -1,0 +1,13 @@
+# an integer literal outside its type's range is reported at the literal, a
+# negated one at its minus sign, a pattern at the pattern, and a format width
+# at the interpolated expression it pads.
+fn small(n: UInt8) -> String:
+    match n:
+        0..=256 => return "range"
+        _ => return "other"
+
+fn main():
+    big := 18446744073709551616
+    low := -9223372036854775809
+    print("{big} {low} {small(UInt8(1))}")
+    print("{\"qty\":99999999999999999999999}")

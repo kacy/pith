@@ -61,7 +61,7 @@ from ir_capture import ir_capture_find_free_vars
 from return_paths import statement_always_leaves
 from ir_result_abi import ir_result_reg_funcs, ir_func_result_ok_kinds, ir_uses_result_abi, ir_set_pair_return, ir_decode_result_value, ir_emit_result_flag_field, ir_emit_result_error_message, ir_emit_result_value_field, ir_result_field_kind
 from ir_optionals import ir_optional_flag_field, ir_optional_value_field, ir_optional_value_as, ir_emit_optional_none_compare, ir_emit_optional_optional_compare, ir_emit_optional_plain_compare, ir_emit_optional_none_value, ir_emit_optional_some_value, ir_emit_optional_owned_some, ir_emit_optional_attach_dtor, ir_emit_weak_read, ir_emit_weak_field_read
-from ir_literals import ir_emit_int_literal, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
+from ir_literals import ir_emit_int_literal, ir_emit_int_literal_text, ir_emit_string_literal, ir_emit_float_literal, ir_emit_bool_literal
 from ir_utils import ir_push_string, ir_push_int, ir_copy_var_regs, ir_copy_var_types, ir_unpack_field_index
 from ir_tree_cache import ir_cached_string_nodes, ir_root_items
 from ir_type_helpers import ir_type_alias_nodes, ir_alias_target_node, ir_type_from_tid, ir_bytes_keyed_type, ir_checked_type, ir_checked_result_kind, ir_checked_index_type, ir_lookup_name_type_with_state, ir_known_scalar_return_type, ir_known_collection_return_type, ir_known_string_method_return_type, ir_known_collection_method_return_type, ir_literal_expr_type, ir_unary_expr_type, ir_list_element_kind, ir_list_element_tid, ir_function_return_kind
@@ -5676,6 +5676,10 @@ fn ir_narrow_sized_result(idx: Int, op: String, r: Int) -> Int:
     return ir_narrow_to_tid(c_get_expr_type(idx), r)
 
 fn ir_emit_unary_expr(node: Node) -> Int:
+    # a negated literal is one constant, which is how `-9223372036854775808`
+    # names the smallest Int though its digits alone do not fit one
+    if node.value == "negate" and node_kind(node.children[0]) == "int_lit":
+        return ir_emit_int_literal_text("-" + node_value(node.children[0]))
     operand_r := ir_expr(node.children[0])
     # `-x` on an Int is `0 - x`, which overflows for the most negative Int
     if node.value == "negate" and ir_int_checks_overflow(c_get_expr_type(node.children[0])) and not ir_is_unsigned_word(c_get_expr_type(node.children[0])):

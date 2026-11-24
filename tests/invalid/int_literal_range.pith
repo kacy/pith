@@ -1,0 +1,49 @@
+# an integer literal outside its type's range used to pass check and then
+# fail the build in the backend, or stop the compiler with its own overflow
+# error when it sat inside a string interpolation. each literal here is
+# refused with E319 instead, in every base and with separators.
+BIG := 99999999999999999999999
+
+fn defaulted(x: Int = 9223372036854775808) -> Int:
+    return x
+
+fn small(n: UInt8) -> String:
+    match n:
+        256 => return "past UInt8"
+        -1 => return "negative UInt8"
+        0..=300 => return "range past UInt8"
+        _ => return "other"
+
+fn signed(n: Int8) -> String:
+    match n:
+        128 => return "past Int8"
+        -129 => return "under Int8"
+        _ => return "other"
+
+fn word(n: UInt) -> String:
+    match n:
+        18446744073709551616 => return "past UInt"
+        -1 => return "negative UInt"
+        _ => return "other"
+
+fn whole(n: Int) -> String:
+    match n:
+        9223372036854775808 => return "past Int"
+        -9223372036854775809 => return "under Int"
+        -0x8000000000000001..=0 => return "range under Int"
+        _ => return "other"
+
+fn main():
+    a := 9223372036854775808
+    b := -9223372036854775809
+    c := 0x8000000000000000
+    d := 0xFFFF_FFFF_FFFF_FFFF
+    e := 0b1000000000000000000000000000000000000000000000000000000000000000
+    f := 0o1000000000000000000000
+    g := 9_223_372_036_854_775_808
+    h := -(9223372036854775808)
+    i := 0 - 9223372036854775808
+    print("{a} {b} {c} {d} {e} {f} {g} {h} {i} {BIG} {defaulted()}")
+    print("{99999999999999999999999}")
+    print("{\"qty\":99999999999999999999999}")
+    print(small(UInt8(1)) + signed(Int8(1)) + word(UInt(1)) + whole(1))

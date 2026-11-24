@@ -520,7 +520,8 @@ more than 1,000 deep. see the compiler input limits in `SECURITY.md`.
 ### E243 — lexer error
 
 the lexer produced an invalid token — an unterminated string literal, a
-stray character that starts no valid token, or a bad indentation change.
+stray character that starts no valid token, a bad indentation change, or a
+`0x`, `0b` or `0o` prefix with no digits after it.
 every lexer error is reported, even one that lands between two otherwise
 valid tokens (`1 € + 2`), so an invalid character can never be silently
 dropped.
@@ -1210,7 +1211,7 @@ error[E276]: 'messages' is guarded, and this returns its value out of the block,
 
 `E300`–`E308` and `E310`–`E312` are lint warnings reported by `pith lint`.
 `pith lint` exits non-zero when any warning is reported, though warnings do not
-block `pith build` or `pith run`. `E309` and `E313`–`E318` are hard checker
+block `pith build` or `pith run`. `E309` and `E313` to `E319` are hard checker
 errors emitted during `pith check` / `build` / `run` / `test` (`E309` is also
 reported by `pith lint`).
 
@@ -1580,4 +1581,31 @@ error[E318]: `self` escapes drop: it is passed to 'remember', where it is passed
   26 |         self.remember()
                ^
   fix: use self only to read and write its fields and to call methods that do the same; copy out the field values that must outlive it
+```
+
+### E319: an integer literal outside its type's range
+
+an integer literal has to name a value of its type, in any base and with any
+`_` grouping. in an expression that type is `Int`. in a `match` arm it is the
+type of the value being matched, so a `UInt` pattern reaches
+`18446744073709551615` and a `UInt8` pattern stops at `255`. without this
+check a literal past its range passed `pith check` and then failed the build
+in the backend.
+
+a minus sign written straight before a literal is checked with it, so
+`-9223372036854775808`, the smallest `Int`, is allowed and
+`9223372036854775808` alone is not. `0 - 9223372036854775808` and
+`-(9223372036854775808)` are refused, because there the literal stands alone.
+
+the width and precision of a format spec (`{x:8.2}`) and the count of a
+sharded guard (`guard m[8]:`) are numbers in the source too, and each has to
+fit in an `Int`. a format spec that large is usually a brace meant to be
+printed: `"{\"qty\":5}"` interpolates `"qty"` padded to a width of 5, and
+`"{{\"qty\":5}}"` prints the braces.
+
+```
+error[E319]: the integer literal 18446744073709551616 is outside the range of Int, -9223372036854775808 to 9223372036854775807
+  10 |     big := 18446744073709551616
+                  ^
+  fix: a whole number past 64 bits needs std.bigint
 ```

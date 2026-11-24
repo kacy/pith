@@ -1,0 +1,78 @@
+# the inner-scope bindings that may reuse an enclosing name, churned with heap
+# values: a `for` variable over a local of another type, a defer written
+# outside the loop that an early return runs inside it, a closure parameter
+# and a closure payload over locals of the same name, and sibling payloads of
+# different types followed by a binding at the function's level. each of those
+# has storage of its own (tests/cases/test_binding_shadow_forms.pith), so a
+# count dropped on the wrong slot or kept on the shadowed one shows up here as
+# growth.
+import leakprobe as probe
+
+struct Item:
+    name: String
+    tags: List[String]
+
+enum Shape:
+    Named(String)
+    Tagged(List[String])
+    Whole(Item)
+
+fn lookup(n: Int) -> String?:
+    if n % 2 == 0:
+        return "found-{n}"
+    return none
+
+fn for_over_other_type(i: Int) -> Int:
+    entry := "entry-{i}"
+    mut count := 0
+    for entry in [Item("a-{i}", ["t-{i}"]), Item("b-{i}", ["u-{i}", "v-{i}"])]:
+        count = count + entry.tags.len()
+    return count + entry.len()
+
+fn touch(s: String):
+    if s.len() == 0:
+        print("empty")
+
+fn defer_outside_loop(i: Int) -> Int:
+    word := ["deferred-{i}"]
+    defer touch(word[0])
+    for word in ["x-{i}", "yy-{i}"]:
+        if word.len() > 4:
+            return word.len()
+    return 0
+
+fn closure_shadows(i: Int) -> Int:
+    name := "outer-{i}"
+    shout := fn(name: String) -> String => name + "!"
+    f := fn(k: Int) -> String:
+        if let name = lookup(k):
+            return name
+        return "none"
+    return shout("in-{i}").len() + f(i).len() + name.len()
+
+fn sibling_payloads(i: Int) -> Int:
+    mut total := 0
+    for s in [Shape.Named("n-{i}"), Shape.Tagged(["a-{i}", "b-{i}"]), Shape.Whole(Item("w-{i}", ["t-{i}"]))]:
+        match s:
+            Shape.Named(v) =>
+                total = total + v.len()
+            Shape.Tagged(v) =>
+                total = total + v.len()
+            Shape.Whole(v) =>
+                total = total + v.tags.len()
+    if let v = lookup(i):
+        total = total + v.len()
+    v := Item("last-{i}", ["z-{i}"])
+    return total + v.name.len()
+
+fn main():
+    n := probe.rounds()
+    mut i := 0
+    mut used := 0
+    while i < n:
+        used = used + for_over_other_type(i) + defer_outside_loop(i) + closure_shadows(i) + sibling_payloads(i)
+        i = i + 1
+    if used < 0:
+        print("unreachable")
+    kb := probe.peak_kb()
+    print("{kb}")

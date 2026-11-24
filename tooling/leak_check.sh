@@ -34,6 +34,7 @@ cases=(
   tests/leaks/leak_direct_store
   tests/leaks/leak_struct_store
   tests/leaks/leak_loop_var_slot
+  tests/leaks/leak_binding_shadow_forms
   tests/leaks/leak_list_transform
   tests/leaks/leak_module_call_string
   tests/leaks/leak_fn_value_optional

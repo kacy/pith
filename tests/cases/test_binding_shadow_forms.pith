@@ -1,0 +1,182 @@
+# the inner-scope bindings that may reuse a name bound outside them, and what
+# each one must leave alone. a function has one slot per name, so a nested
+# binding that reuses an enclosing local's name is refused (E262, pinned in
+# tests/diagnostics/cases/nested_binding_forms.pith). what stays legal is what
+# does get storage of its own:
+#
+# - a `for` variable, which has a slot for the length of the loop. a defer
+#   written outside the loop reads the function's own slot even when an early
+#   return runs it inside the loop body.
+# - a closure parameter, and a binding in a closure body that the closure does
+#   not capture from outside: the closure is a function of its own.
+# - sibling blocks, which never enclose one another.
+#
+# the values are strings, lists and structs, so a slot released twice or not
+# at all shows up under memcheck.
+
+struct Item:
+    name: String
+    tags: List[String]
+
+enum Shape:
+    Named(String)
+    Tagged(List[String])
+    Whole(Item)
+    Blank
+
+fn item(n: Int) -> Item:
+    return Item("item-{n}", ["t{n}", "u{n}"])
+
+fn shapes(n: Int) -> List[Shape]:
+    return [Shape.Named("name-{n}"), Shape.Tagged(["a{n}", "b{n}"]), Shape.Whole(item(n)), Shape.Blank]
+
+fn lookup(n: Int) -> String?:
+    if n % 2 == 0:
+        return "found-{n}"
+    return none
+
+# a `for` variable over a local of the same type and of other types
+fn for_same_type(n: Int) -> String:
+    name := "outer-{n}"
+    mut seen := ""
+    for name in ["x-{n}", "y-{n}"]:
+        seen = seen + name + ";"
+    return seen + name
+
+fn for_other_types(n: Int) -> String:
+    entry := "entry-{n}"
+    tags := ["keep-{n}"]
+    mut count := 0
+    for entry in [item(n), item(n + 1)]:
+        count = count + entry.tags.len()
+    for tags in [n, n + 1, n + 2]:
+        count = count + tags
+    k := item(n)
+    for k in ["s-{n}"]:
+        count = count + k.len()
+    return "{entry} {tags[0]} {k.name} {count}"
+
+# an index variable over a counter the body cannot see
+fn for_index_over_counter(n: Int) -> String:
+    mut i := 100
+    mut out := ""
+    for word, i in ["p-{n}", "q-{n}"]:
+        out = out + "{i}={word},"
+    i = i + 1
+    return out + "{i}"
+
+# nested loops over one name, with different element types
+fn for_nested(n: Int) -> String:
+    mut out := ""
+    for v in [item(n), item(n + 1)]:
+        for v in v.tags:
+            out = out + v
+        out = out + "|" + v.name + ";"
+    return out
+
+# a closure built before the loop reads the local the loop shadows, one built
+# in the loop reads the loop variable, and one built after reads the local again
+fn closures_around_loop(n: Int) -> String:
+    label := "outer-{n}"
+    before := fn() -> String => label
+    mut out := ""
+    for label in ["in-a", "in-b"]:
+        during := fn() -> String => label
+        out = out + before() + "/" + during() + ","
+    after := fn() -> String => label
+    return out + after()
+
+# a spawned call in the loop takes the loop variable; one after takes the local
+fn echo(s: String) -> String:
+    return "echo " + s
+
+fn spawn_around_loop(n: Int) -> String:
+    word := "outer-{n}"
+    mut out := ""
+    for word in ["w1", "w2"]:
+        t := spawn echo(word)
+        out = out + await t + ","
+    t := spawn echo(word)
+    return out + await t
+
+# a defer written outside a loop reads the local, also when an early return
+# runs it inside the body, where the loop variable has the name
+fn deferred_outside(stop: Int) -> Int:
+    word := "deferred-{stop}"
+    defer print("defer sees {word}")
+    for word in [1, 2, 3]:
+        if word == stop:
+            return word
+    return 0
+
+fn deferred_inside(n: Int) -> Int:
+    word := ["kept-{n}"]
+    mut total := 0
+    for word in ["ab", "cde"]:
+        defer print("loop defer sees {word}")
+        total = total + word.len()
+    return total + word.len()
+
+# closure parameters over locals of the same and of other types
+fn closure_params(n: Int) -> String:
+    name := "outer-{n}"
+    tags := ["t-{n}"]
+    shout := fn(name: String) -> String => name + "!"
+    count := fn(tags: Item) -> Int:
+        return tags.tags.len()
+    return shout("inner") + " " + count(item(n)).to_string() + " " + name + " " + tags[0]
+
+# a closure that does not capture the local binds the name in its own frame
+fn closure_own_payload(n: Int) -> String:
+    found := ["outer-{n}"]
+    f := fn(k: Int) -> String:
+        if let found = lookup(k):
+            return found
+        match shapes(k)[1]:
+            Shape.Tagged(found) => return found[0]
+            _ => return "none"
+    return f(n) + " " + f(n + 1) + " " + found[0]
+
+# sibling blocks reuse a name with a different type each time, and a later
+# binding at the function's level takes it after them
+fn siblings(n: Int) -> String:
+    mut out := ""
+    for s in shapes(n):
+        match s:
+            Shape.Named(v) =>
+                out = out + v + ","
+            Shape.Tagged(v) =>
+                out = out + v[1] + ","
+            Shape.Whole(v) =>
+                out = out + v.name + ":" + v.tags[0] + ","
+            Shape.Blank =>
+                out = out + "blank,"
+    if let v = lookup(n):
+        out = out + v + ","
+    v := item(n + 7)
+    return out + v.name
+
+fn main():
+    # many rounds, so a slot freed early is handed out again and read back
+    mut round := 0
+    mut checksum := 0
+    while round < 50:
+        checksum = checksum + for_same_type(round).len() + for_other_types(round).len()
+        checksum = checksum + for_index_over_counter(round).len() + for_nested(round).len()
+        checksum = checksum + closures_around_loop(round).len() + closure_params(round).len()
+        checksum = checksum + closure_own_payload(round).len() + siblings(round).len()
+        round = round + 1
+    print("checksum {checksum}")
+    print(for_same_type(1))
+    print(for_other_types(2))
+    print(for_index_over_counter(3))
+    print(for_nested(4))
+    print(closures_around_loop(5))
+    print(spawn_around_loop(6))
+    print("returned {deferred_outside(2)}")
+    print("returned {deferred_outside(9)}")
+    print("returned {deferred_inside(7)}")
+    print(closure_params(8))
+    print(closure_own_payload(10))
+    print(closure_own_payload(11))
+    print(siblings(12))

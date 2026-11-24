@@ -1553,6 +1553,7 @@ MEMCHECK_CASES := \
 	tests/cases/test_list_optional_element_search \
 	tests/cases/test_loop_iter_early_return \
 	tests/cases/test_loop_var_slot_isolation \
+	tests/cases/test_binding_shadow_forms \
 	tests/cases/test_spawn_in_loop_capture \
 	tests/cases/test_result_ok_reclaim \
 	tests/cases/test_os_thread_spawn_reclaim \

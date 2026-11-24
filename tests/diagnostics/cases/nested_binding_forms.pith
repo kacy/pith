@@ -1,0 +1,143 @@
+# every inner-scope binding form that reuses an enclosing local's name is E262.
+# a function has one slot per name, so each of these used to overwrite the
+# outer local instead of shadowing it, and a read after the block answered with
+# the inner value (or with garbage when the types differ). a `for` variable and
+# a closure parameter have storage of their own and are legal, as are bindings
+# in sibling blocks (tests/cases/test_binding_shadow_forms.pith).
+
+enum Packet:
+    Number(Int)
+    Text(String)
+
+fn maybe(n: Int) -> Int?:
+    if n > 0:
+        return n
+    return none
+
+fn parse(s: String) -> Int!:
+    if s == "":
+        fail "empty"
+    return s.len()
+
+fn if_let_payload() -> Int:
+    x := 5
+    if let x = maybe(3):
+        print("{x}")
+    return x
+
+fn if_let_other_type() -> String:
+    label := "outer"
+    if let label = maybe(3):
+        print("{label}")
+    return label
+
+fn while_let_payload() -> Int:
+    x := 5
+    mut i := 0
+    while let x = maybe(i):
+        i = i + x
+    return x
+
+fn match_variant_payload(p: Packet) -> String:
+    text := "outer"
+    match p:
+        Packet.Text(text) => print(text)
+        Packet.Number(n) => print("{n}")
+    return text
+
+fn match_tuple_payload() -> Int:
+    a := 1
+    match (2, 3):
+        (a, b) => print("{a} {b}")
+    return a
+
+fn match_optional_arm(o: Int?) -> Int:
+    v := 0
+    match o:
+        v => print("{v}")
+        none => print("none")
+    return v
+
+fn nested_if_let() -> Int:
+    if let w = maybe(1):
+        if let w = maybe(2):
+            print("{w}")
+        return w
+    return 0
+
+fn payload_over_for_variable() -> Int:
+    mut total := 0
+    for x in [1, 2]:
+        if let x = maybe(x):
+            total = total + x
+        total = total + x
+    return total
+
+fn select_arm() -> Int!:
+    msg := "outer"
+    ch := Channel[Int](1)
+    ch.send(1)
+    got := select:
+        msg := ch.recv() => msg?
+        default => 0
+    print(msg)
+    return got
+
+fn catch_binding() -> String:
+    err := "outer"
+    v := parse("") catch err:
+        return "{err}"
+    return "{v} {err}"
+
+# the counter shapes the overflow check elision has to treat as writes
+fn counter_rebound_by_if_let(bound: Int) -> Int:
+    mut i := 0
+    while i < bound:
+        if let i = maybe(9):
+            print("{i}")
+        i = i + 1
+    return i
+
+fn counter_rebound_by_match(bound: Int) -> Int:
+    mut i := 0
+    while i < bound:
+        match Packet.Number(9):
+            Packet.Number(i) => print("{i}")
+            Packet.Text(t) => print(t)
+        i = i + 1
+    return i
+
+# a closure is a function of its own: its slots hold its parameters and what it
+# captures, so a nested binding over either overwrites it
+fn closure_capture(k: Int) -> Int:
+    x := 5
+    f := fn(n: Int) -> Int:
+        if n > 0:
+            x := 99
+            print("{x}")
+        if let x = maybe(n):
+            print("{x}")
+        return x
+    return f(k)
+
+fn closure_parameter() -> Int:
+    f := fn(p: Int) -> Int:
+        if p > 0:
+            p := 3
+            print("{p}")
+        return p
+    return f(1)
+
+# the outer closure carries the capture into the inner one
+fn nested_closure_capture(k: Int) -> Int:
+    x := 5
+    f := fn(n: Int) -> Int:
+        if n > 0:
+            x := 7
+            print("{x}")
+        g := fn() -> Int => x
+        return g()
+    return f(k)
+
+fn main():
+    print("unreachable")

@@ -5,7 +5,7 @@
 # a small command-line wrapper around them.
 
 from lexer import Token, lex_all, tok_kind, tok_value, tok_line, tok_col, tok_offset, tok_len, tok_count, load_tokens, load_token_snapshot, unescape_interp_expr, interp_escape_kind, INTERP_ESCAPE_COLLAPSED, INTERP_ESCAPE_KEPT
-from ast import add_node, add_node_with_type_args, add_leaf, get_node, set_node_value, set_node_name_position, node_kind, from_import_alias_receiver
+from ast import add_node, add_node_with_type_args, add_leaf, get_node, node_count, set_node_value, set_node_name_position, node_kind, from_import_alias_receiver
 from errors import Diagnostic
 
 # ---------------------------------------------------------------
@@ -15,6 +15,29 @@ from errors import Diagnostic
 mut current_token_position := 0
 mut recursion_depth := 0
 max_depth := 256
+# set when the input passes one of the limits below. the parser reports
+# that once, skips to the end of the line, and then sees the end of the
+# file until the next statement outside any expression: every construct
+# it is inside unwinds as it does at the end of a file, quietly, since no
+# error is reported while this is set. without it each level reported a
+# missing bracket, and 5,000 open brackets printed 9,000 errors.
+mut nesting_overflow := false
+# blocks are counted apart from expressions. this keeps the parser's own
+# recursion bounded even for a file indented ten thousand levels deep.
+mut block_depth := 0
+max_block_depth := 1000
+# how deep each node sits in its tree, by node index from
+# tree_depth_base, the first node this parse made. the checker and the
+# emitter walk trees recursively, so a deep tree overflows their stacks
+# however flat the parser kept itself. a long operator chain such as
+# `1 + 1 + ...` is the common case: the parser builds it in a loop, but
+# every pass after it recurses once per operator. a call, a method call,
+# a field access or an index counts as three levels, because their frames
+# in the passes after the parser are larger. at the limit every pass uses
+# less than two thirds of an 8 MiB stack.
+mut tree_depth_base := 0
+mut tree_depths: List[Int] := []
+max_tree_depth := 25000
 mut parser_file_path := ""
 mut parser_diag_list: List[Diagnostic] := []
 # the module aliases this file's imports introduce (`import std.json` puts
@@ -30,7 +53,7 @@ mut from_import_renames: Map[String, String] := {}
 
 fn _cur_tok_kind() -> String:
     tc := tok_count()
-    if tc == 0:
+    if tc == 0 or nesting_overflow:
         return "eof"
     mut i := current_token_position
     while i < tc:
@@ -42,7 +65,7 @@ fn _cur_tok_kind() -> String:
 
 fn _cur_tok_value() -> String:
     tc := tok_count()
-    if tc == 0:
+    if tc == 0 or nesting_overflow:
         return ""
     mut i := current_token_position
     while i < tc:
@@ -54,7 +77,7 @@ fn _cur_tok_value() -> String:
 
 fn _peek_ahead_kind(offset: Int) -> String:
     tc := tok_count()
-    if tc == 0:
+    if tc == 0 or nesting_overflow:
         return "eof"
     mut i := current_token_position
     mut skipped := 0
@@ -69,7 +92,7 @@ fn _peek_ahead_kind(offset: Int) -> String:
 
 fn _peek_ahead_value(offset: Int) -> String:
     tc := tok_count()
-    if tc == 0:
+    if tc == 0 or nesting_overflow:
         return ""
     mut i := current_token_position
     mut skipped := 0
@@ -126,6 +149,8 @@ fn get_previous_position() -> (Int, Int):
     return (tok_line(0), tok_col(0))
 
 fn parser_report_error_at(line: Int, col: Int, code: String, message: String, fix: String):
+    if nesting_overflow:
+        return
     parser_diag_list.push(Diagnostic("error", code, message, parser_file_path, line, col, fix))
 
 fn parser_error_position() -> (Int, Int):
@@ -182,7 +207,7 @@ pub fn parser_has_errors() -> Bool:
 # add a node at the position of the token just consumed
 fn add_node_with_position(kind: String, value: String, children: List[Int]) -> Int:
     mut pos := get_current_position()
-    return add_node(kind, value, children, pos.0, pos.1)
+    return track_tree_depth(add_node(kind, value, children, pos.0, pos.1), kind, children)
 
 # add a leaf at the position of the token just consumed
 fn add_leaf_with_position(kind: String, value: String) -> Int:
@@ -212,7 +237,7 @@ fn position_from_mark(mark: Int) -> (Int, Int):
 # lands where the construct is written.
 fn add_node_from_mark(kind: String, value: String, children: List[Int], mark: Int) -> Int:
     pos := position_from_mark(mark)
-    return add_node(kind, value, children, pos.0, pos.1)
+    return track_tree_depth(add_node(kind, value, children, pos.0, pos.1), kind, children)
 
 # add_node_from_mark for a leaf whose text came from more than one token,
 # such as a dotted type name.
@@ -225,7 +250,63 @@ fn add_leaf_from_mark(kind: String, value: String, mark: Int) -> Int:
 # call starts where its callee starts, not at the `(`.
 fn add_node_at_node(kind: String, value: String, children: List[Int], other: Int) -> Int:
     n := get_node(other)
-    return add_node(kind, value, children, n.line, n.col)
+    return track_tree_depth(add_node(kind, value, children, n.line, n.col), kind, children)
+
+# record how deep the new node `idx` sits: the deepest of its children
+# plus its own weight (see max_tree_depth). past the limit it reports
+# E242 and returns an error leaf in its place, so no pass ever sees the
+# deep tree.
+fn track_tree_depth(idx: Int, kind: String, children: List[Int]) -> Int:
+    at := idx - tree_depth_base
+    if at < 0:
+        return idx
+    mut deepest := 0
+    for child in children:
+        c := child - tree_depth_base
+        if c >= 0 and c < tree_depths.len() and tree_depths[c] > deepest:
+            deepest = tree_depths[c]
+    mut depth := deepest + 1
+    if kind == "call" or kind == "method_call" or kind == "field_access" or kind == "index" or kind == "unwrap" or kind == "try" or kind == "struct_init":
+        depth = deepest + 3
+    # a leaf made directly through add_leaf has no entry and counts as 0
+    while tree_depths.len() < at:
+        tree_depths.push(0)
+    if tree_depths.len() == at:
+        tree_depths.push(depth)
+    else:
+        tree_depths[at] = depth
+    if depth > max_tree_depth:
+        report_nesting_overflow("expression too deep: more than {max_tree_depth} levels, as in a chain of more than {max_tree_depth} operators or {max_tree_depth / 3} calls; split it into smaller expressions")
+        return add_leaf_with_position("error", "expression too deep")
+    return idx
+
+# report that the input passed a nesting limit, then skip to the end of
+# the line. only the first report of a statement is kept: see
+# nesting_overflow.
+fn report_nesting_overflow(message: String):
+    if nesting_overflow:
+        return
+    parser_report_error_here("E242", message, "")
+    while not check("newline") and not check("eof"):
+        advance_token()
+    nesting_overflow = true
+
+# enter one more level of expression, type or pattern nesting. false,
+# with the overflow reported, when that would pass max_depth.
+fn enter_nesting() -> Bool:
+    if nesting_overflow:
+        return false
+    if recursion_depth >= max_depth:
+        report_nesting_overflow("expression nesting too deep: more than {max_depth} levels")
+        return false
+    recursion_depth = recursion_depth + 1
+    return true
+
+# a statement that starts outside any expression starts clean: the
+# overflow of an earlier statement no longer silences errors.
+fn begin_statement():
+    if recursion_depth == 0:
+        nesting_overflow = false
 
 fn snapshot_token_kinds() -> List[String]:
     mut snapshot: List[String] := []
@@ -287,7 +368,7 @@ fn snapshot_token_lens() -> List[Int]:
 
 fn advance_token() -> Token:
     tc := tok_count()
-    if tc == 0:
+    if tc == 0 or nesting_overflow:
         return Token("eof", "", 0, 0, 0, 0)
     while current_token_position < tc:
         k := tok_kind(current_token_position)
@@ -334,6 +415,13 @@ fn skip_newlines():
 # ---------------------------------------------------------------
 
 fn parse_type_expr() -> Int:
+    if not enter_nesting():
+        return add_leaf_with_position("type", "")
+    result := parse_type_expr_nested()
+    recursion_depth = recursion_depth - 1
+    return result
+
+fn parse_type_expr_nested() -> Int:
     mark := current_token_position
     mut base := parse_base_type()
 
@@ -462,10 +550,8 @@ fn parse_tuple_type() -> Int:
 # returned index is not proof the expression parsed — check
 # parser_has_errors().
 pub fn parse_expression() -> Int:
-    if recursion_depth >= max_depth:
-        parser_report_error_here("E242", "expression nesting too deep", "")
+    if not enter_nesting():
         return add_leaf_with_position("error", "max recursion_depth exceeded")
-    recursion_depth = recursion_depth + 1
     left := parse_catch_expression()
     recursion_depth = recursion_depth - 1
     return left
@@ -625,7 +711,19 @@ fn parse_multiplicative_expression() -> Int:
             left = add_node_from_mark("binary", op, children, mark)
     return left
 
+# a prefix operator nests like a bracket: `- - - x` is three levels deep,
+# so it counts against max_depth the same way.
 fn parse_unary() -> Int:
+    kind := _cur_tok_kind()
+    if kind != "kw_not" and kind != "kw_spawn" and kind != "kw_await" and kind != "minus":
+        return parse_postfix()
+    if not enter_nesting():
+        return add_leaf_with_position("error", "max recursion_depth exceeded")
+    result := parse_prefix_operator()
+    recursion_depth = recursion_depth - 1
+    return result
+
+fn parse_prefix_operator() -> Int:
     mark := current_token_position
     if check("kw_not"):
         advance_token()
@@ -727,7 +825,7 @@ fn parse_postfix() -> Int:
                     for a in call_args:
                         children.push(a)
                     pos := position_from_mark(mark)
-                    expr = add_node_with_type_args("method_call", name_tok.value, children, type_args, pos.0, pos.1)
+                    expr = track_tree_depth(add_node_with_type_args("method_call", name_tok.value, children, type_args, pos.0, pos.1), "method_call", children)
                     set_node_name_position(expr, name_tok.current_line, name_tok.current_column)
                 else:
                     # field access: expr.name
@@ -1434,7 +1532,8 @@ fn parse_interp_expr(text: String, base_line: Int, base_col: Int) -> Int:
         sub_tokens.push(Token(tok.kind, tok.value, tok_line_out, tok_col_out, tok.offset, tok.len))
     load_tokens(sub_tokens)
     current_token_position = 0
-    recursion_depth = 0
+    # recursion_depth carries on from the enclosing expression, so a string
+    # nested in an interpolation nested in a string counts toward max_depth
 
     result := parse_expression()
 
@@ -1450,6 +1549,13 @@ fn parse_interp_expr(text: String, base_line: Int, base_col: Int) -> Int:
 # ---------------------------------------------------------------
 
 fn parse_pattern() -> Int:
+    if not enter_nesting():
+        return add_leaf_with_position("pat_wildcard", "_")
+    result := parse_pattern_nested()
+    recursion_depth = recursion_depth - 1
+    return result
+
+fn parse_pattern_nested() -> Int:
     # token via _cur_tok_kind/_cur_tok_value
     mark := current_token_position
 
@@ -1555,6 +1661,9 @@ fn parse_block() -> Int:
 
 # a block whose statements follow the given ones
 fn parse_block_after(prefix: List[Int]) -> Int:
+    if block_depth >= max_block_depth:
+        return skip_nested_block()
+    block_depth = block_depth + 1
     expect("newline")
     expect("indent")
     # a block inside a header (a block lambda argument) has statements of
@@ -1570,11 +1679,31 @@ fn parse_block_after(prefix: List[Int]) -> Int:
             parser_report_error_here("E242", "parser stalled in block", "")
             stmts.push(add_leaf_with_position("error", "parser stalled in block"))
             advance_token()
+        begin_statement()
         skip_newlines()
     expect("dedent")
     in_header_expression = saved_header
+    block_depth = block_depth - 1
 
     return add_node_with_position("block", "", stmts)
+
+# a block nested past max_block_depth: report it and skip the block whole,
+# through the dedent that closes it, so parsing resumes after it.
+fn skip_nested_block() -> Int:
+    report_nesting_overflow("blocks nested too deep: more than {max_block_depth} levels")
+    nesting_overflow = false
+    skip_newlines()
+    mut open := 0
+    while not check("eof"):
+        kind := _cur_tok_kind()
+        advance_token()
+        if kind == "indent":
+            open = open + 1
+        elif kind == "dedent":
+            open = open - 1
+            if open <= 0:
+                break
+    return add_leaf_with_position("error", "blocks nested too deep")
 
 fn parse_statement() -> Int:
     # token via _cur_tok_kind/_cur_tok_value
@@ -1879,6 +2008,10 @@ pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
     load_tokens(token_list)
     current_token_position = 0
     recursion_depth = 0
+    nesting_overflow = false
+    block_depth = 0
+    tree_depth_base = node_count()
+    tree_depths = []
     parser_file_path = file_path
     parser_diag_list = []
     import_aliases = {}
@@ -1919,6 +2052,7 @@ pub fn parse_with_file(token_list: List[Token], file_path: String) -> Int:
                 parser_report_error_here("E242", "parser stalled at top level", "")
                 decls.push(add_leaf_with_position("error", "parser stalled at top level"))
                 advance_token()
+            begin_statement()
             skip_newlines()
 
     mut children: List[Int] := []

@@ -27,8 +27,34 @@ pub struct Diagnostic:
     pub col: Int
     pub fix: String
 
+# the most diagnostics one run prints. past it the output ends with a
+# note saying how many were left out: a file that fails in a thousand
+# places gains nothing from a thousand reports, and printing them can
+# take longer than the check did.
+max_printed_diagnostics := 100
+
+# the first max_printed_diagnostics of `diags`
+fn printed_diagnostics(diags: List[Diagnostic]) -> List[Diagnostic]:
+    if diags.len() <= max_printed_diagnostics:
+        return diags
+    mut kept: List[Diagnostic] := []
+    for d in diags:
+        if kept.len() == max_printed_diagnostics:
+            break
+        kept.push(d)
+    return kept
+
+# the closing note when `diags` holds more than one run prints, else ""
+fn omitted_diagnostics_note(diags: List[Diagnostic]) -> String:
+    if diags.len() <= max_printed_diagnostics:
+        return ""
+    return "note: too many errors; {diags.len() - max_printed_diagnostics} more not shown" + chr(10)
+
 # render all diagnostics as human-readable text with source context.
 pub fn render_diagnostics(diags: List[Diagnostic], source: String) -> String:
+    return render_diagnostic_list(printed_diagnostics(diags), source) + omitted_diagnostics_note(diags)
+
+fn render_diagnostic_list(diags: List[Diagnostic], source: String) -> String:
     # split the file once for the whole batch and join the rendered
     # diagnostics once at the end. doing either per diagnostic made
     # rendering cost the square of the count, and a file that fails to
@@ -55,23 +81,25 @@ pub fn render_diagnostics_for_path(diags: List[Diagnostic], primary_path: String
     mut output := ""
     mut current_file := ""
     mut group: List[Diagnostic] := []
-    for d in diags:
+    for d in printed_diagnostics(diags):
         mut diag_file := d.file
         if diag_file == "":
             diag_file = primary_path
         if group.len() > 0 and diag_file != current_file:
-            output = output + render_diagnostics(group, source_for_path(current_file, primary_path, primary_source)!)
+            output = output + render_diagnostic_list(group, source_for_path(current_file, primary_path, primary_source)!)
             group = []
         current_file = diag_file
         group.push(d)
     if group.len() > 0:
-        output = output + render_diagnostics(group, source_for_path(current_file, primary_path, primary_source)!)
-    return output
+        output = output + render_diagnostic_list(group, source_for_path(current_file, primary_path, primary_source)!)
+    return output + omitted_diagnostics_note(diags)
 
+# a file that cannot be read renders its diagnostics without snippets,
+# which is how an import that is not valid utf-8 reports itself.
 fn source_for_path(path: String, primary_path: String, primary_source: String) -> String!:
     if path == primary_path:
         return primary_source
-    return read_file(path)!
+    return read_file(path) catch ""
 
 # render a single diagnostic with source context and underline.
 fn render_single_diagnostic(d: Diagnostic, source_lines: List[String]) -> String:
@@ -96,17 +124,13 @@ fn render_single_diagnostic(d: Diagnostic, source_lines: List[String]) -> String
     if d.line > 0:
         line_idx := d.line - 1
         if line_idx >= 0 and line_idx < source_lines.len():
-            source_line := source_lines[line_idx]
+            shown := snippet_window(source_lines[line_idx], d.col)
             line_num := d.line.to_string()
-            output = output + "  " + line_num + " | " + source_line + chr(10)
+            output = output + "  " + line_num + " | " + shown.0 + chr(10)
 
             # underline: spaces for margin + carets
             margin_width := line_num.len() + 4
-            mut j := 0
-            while j < margin_width + d.col:
-                output = output + " "
-                j = j + 1
-            output = output + "^" + chr(10)
+            output = output + " ".repeat(margin_width + shown.1) + "^" + chr(10)
 
     # fix suggestion
     if d.fix != "":
@@ -114,6 +138,115 @@ fn render_single_diagnostic(d: Diagnostic, source_lines: List[String]) -> String
 
     output = output + chr(10)
     return output
+
+# the longest source line a diagnostic quotes whole. a longer one is cut
+# to snippet_width bytes around the column, so a megabyte line is not
+# printed once per error.
+snippet_max := 240
+snippet_width := 160
+
+# the part of `line` to quote for a diagnostic at byte column `col`, and
+# the caret's column within it. the cut keeps whole utf-8 characters and
+# marks each cut end with "...".
+fn snippet_window(line: String, col: Int) -> (String, Int):
+    if line.len() <= snippet_max:
+        return (line, col)
+    raw := bytes_from_string_utf8(line)
+    mut lo := col - 1 - snippet_width / 2
+    if lo < 0:
+        lo = 0
+    mut hi := lo + snippet_width
+    if hi > raw.len():
+        hi = raw.len()
+    # a byte of the form 10xxxxxx continues a character
+    while lo > 0 and raw[lo] >= 128 and raw[lo] < 192:
+        lo = lo - 1
+    while hi < raw.len() and raw[hi] >= 128 and raw[hi] < 192:
+        hi = hi + 1
+    mut text := line.substring(lo, hi)
+    mut caret := col - lo
+    if lo > 0:
+        text = "..." + text
+        caret = caret + 3
+    if hi < raw.len():
+        text = text + "..."
+    return (text, caret)
+
+# the diagnostic for a source file that could not be read. a file that is
+# there but is not valid utf-8 gets E243 at its first bad byte; anything
+# else gets a plain "cannot read".
+pub fn unreadable_source_diagnostic(path: String) -> Diagnostic:
+    cannot_read := Diagnostic("error", "", "cannot read " + path, "", 0, 0, "")
+    data := read_file_bytes(path) catch:
+        return cannot_read
+    bad := first_invalid_utf8(data)
+    if bad < 0:
+        return cannot_read
+    mut line := 1
+    mut line_start := 0
+    mut i := 0
+    while i < bad:
+        if data[i] == 10:
+            line = line + 1
+            line_start = i + 1
+        i = i + 1
+    return Diagnostic("error", "E243", "the file is not valid utf-8 (invalid byte at offset {bad})", path, line, bad - line_start + 1, "")
+
+# unreadable_source_diagnostic as one line of text. there is no snippet:
+# the line it would quote is the one that does not decode.
+pub fn unreadable_source_message(path: String) -> String:
+    mut no_source: List[String] := []
+    return render_single_diagnostic(unreadable_source_diagnostic(path), no_source).trim()
+
+# the offset of the first byte of `data` that does not begin a valid
+# utf-8 sequence, or -1 when all of it is valid. this is the standard
+# definition: no overlong forms, no surrogates, nothing past U+10FFFF.
+pub fn first_invalid_utf8(data: Bytes) -> Int:
+    n := data.len()
+    mut i := 0
+    while i < n:
+        b := data[i]
+        # the number of continuation bytes, and the range the first of
+        # them must fall in; the rest are always 0x80 to 0xBF
+        mut need := 0
+        mut lo := 128
+        mut hi := 191
+        if b < 128:
+            need = 0
+        elif b >= 194 and b <= 223:
+            need = 1
+        elif b == 224:
+            need = 2
+            lo = 160
+        elif b >= 225 and b <= 236:
+            need = 2
+        elif b == 237:
+            need = 2
+            hi = 159
+        elif b == 238 or b == 239:
+            need = 2
+        elif b == 240:
+            need = 3
+            lo = 144
+        elif b >= 241 and b <= 243:
+            need = 3
+        elif b == 244:
+            need = 3
+            hi = 143
+        else:
+            return i
+        if i + need >= n and need > 0:
+            return i
+        mut k := 1
+        while k <= need:
+            c := data[i + k]
+            if k == 1 and (c < lo or c > hi):
+                return i
+            if c < 128 or c > 191:
+                return i
+            k = k + 1
+        i = i + need + 1
+    return 0 - 1
 
 # render diagnostics as JSON (same format as check_main.pith).
 pub fn render_diagnostics_json(diags: List[Diagnostic]) -> String:

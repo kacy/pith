@@ -325,7 +325,17 @@ fn close_group_lambda(level: Int) -> Bool:
     emit("dedent", "")
     return true
 
+# produce the next token. scan_token() returns false when it consumed input
+# without producing a token, such as a blank or comment-only line or a line
+# break inside a group. this loop then calls it again. scan_token() must not
+# call itself for those cases: a file of a million comment lines would need
+# a million stack frames.
 fn next_token():
+    mut produced := scan_token()
+    while not produced:
+        produced = scan_token()
+
+fn scan_token() -> Bool:
     # synthetic tokens — dedents, queued interpolation pieces, indent,
     # newline, eof — take the position the lexer is sitting at when they
     # are produced
@@ -335,7 +345,7 @@ fn next_token():
     if pending_dedents > 0:
         pending_dedents = pending_dedents - 1
         emit("dedent", "")
-        return
+        return true
 
     # step 2: drain pending interpolation tokens. each carries the
     # position it was cut from, so it reports where it sits in the source
@@ -357,7 +367,7 @@ fn next_token():
         # emit() measures a lexeme from where the scanner is now, which
         # for a queued piece is past the whole string
         current_token_len = length
-        return
+        return true
 
     # step 3: handle EOF
     if current_position >= source.len():
@@ -370,10 +380,10 @@ fn next_token():
                 if remaining > 1:
                     pending_dedents = remaining - 1
                 emit("dedent", "")
-                return
+                return true
             done = true
         emit("eof", "")
-        return
+        return true
 
     # step 4: handle indentation at start of current_line
     if at_line_start:
@@ -383,29 +393,26 @@ fn next_token():
         # indent or dedent bookkeeping applies
         if group_depth > 0:
             skip_spaces()
-            next_token()
-            return
+            return false
 
         if is_blank_line():
             skip_to_next_line()
             at_line_start = true
-            next_token()
-            return
+            return false
 
         level := measure_indent()
         if close_group_lambda(level):
-            return
+            return true
         if group_depth > 0:
             # a block lambda with no indented body; back in the group
             skip_spaces()
-            next_token()
-            return
+            return false
         current_indent := indent_stack[indent_stack.len() - 1]
 
         if level > current_indent:
             indent_stack.push(level)
             emit("indent", "")
-            return
+            return true
         elif level < current_indent:
             mut dedents := 0
             while indent_stack.len() > 1:
@@ -417,19 +424,18 @@ fn next_token():
             # verify the target indentation level exists in the stack
             if indent_stack[indent_stack.len() - 1] != level:
                 emit("err", "invalid dedent: indentation level does not match any outer block")
-                return
+                return true
             if dedents > 0:
                 pending_dedents = dedents - 1
                 emit("dedent", "")
-                return
+                return true
 
     # step 5: skip spaces
     skip_spaces()
 
     # step 6: re-check EOF after skipping spaces
     if current_position >= source.len():
-        next_token()
-        return
+        return false
 
     # the real token starts here, after any leading spaces
     mark_token_start()
@@ -444,10 +450,9 @@ fn next_token():
         current_column = 0
         at_line_start = true
         if group_depth > 0:
-            next_token()
-            return
+            return false
         emit("newline", "")
-        return
+        return true
 
     # comment
     if character == "#":
@@ -458,25 +463,26 @@ fn next_token():
             current_position = current_position + 1
             current_column = current_column + 1
         emit("comment", source.substring(start, current_position))
-        return
+        return true
 
     # string
     if is_quote(character):
         scan_string()
-        return
+        return true
 
     # number
     if is_digit(character):
         scan_number()
-        return
+        return true
 
     # identifier or keyword
     if is_alpha(character):
         scan_identifier()
-        return
+        return true
 
     # operators and punctuation
     scan_operator()
+    return true
 
 fn scan_identifier():
     start := current_position
@@ -1251,6 +1257,12 @@ pub fn load_token_snapshot(kinds: List[String], values: List[String], lines: Lis
     for ln in lens:
         _tok_lens.push(ln)
 
+# the largest source file the compiler reads. the front end holds a few
+# hundred bytes per token, so a 16 MiB file dense with tokens already
+# needs several GiB; the limit turns a larger one into an error instead
+# of an out-of-memory kill.
+max_source_bytes := 16777216
+
 # tokenize a whole source string, from a clean scanner, up to and
 # including the trailing eof token. the same stream is also installed as
 # the loaded token table, so a caller can go straight to parsing without
@@ -1261,7 +1273,19 @@ pub fn load_token_snapshot(kinds: List[String], values: List[String], lines: Lis
 # the stream and scanning carries on. a caller that cares has to scan the
 # result for kind "err" — and note a multi-byte character produces one
 # "err" token per byte, so errors arrive in runs.
+#
+# a source longer than max_source_bytes is not lexed. the stream is one
+# "err" token that says so, then eof.
 pub fn lex_all(src: String) -> List[Token]:
+    if src.len() <= max_source_bytes:
+        return lex_source(src)
+    mut refused: List[Token] := [Token("err", "source file too large: {src.len()} bytes, and the limit is {max_source_bytes} (16 MiB)", 1, 1, 0, 0)]
+    for tok in lex_source(""):
+        refused.push(tok)
+    load_tokens(refused)
+    return refused
+
+fn lex_source(src: String) -> List[Token]:
     init_lexer(src)
     _tok_kinds = []
     _tok_values = []

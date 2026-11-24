@@ -60,16 +60,28 @@ variable must be set at build time and at run time; `pith run` and
 
 | limit | value | error |
 |---|---|---|
-| expression nesting | 256 levels | E242 (`self-host/parser.pith`) |
+| source file size | 16 MiB | E243 (`self-host/lexer.pith`) |
+| expression, type and pattern nesting | 256 levels | E242 (`self-host/parser.pith`) |
+| expression depth | 25,000 levels | E242 (`self-host/parser.pith`) |
+| block nesting | 1,000 levels | E242 (`self-host/parser.pith`) |
 | type nesting | 128 levels | E233 (`self-host/checker.pith`) |
+| diagnostics printed | 100 per run | a closing note gives the number left out |
 
-there is no cap on indentation depth, string interpolation or source
-file size. some pathological inputs still crash the compiler by
-overflowing its stack: about 100,000 nested unary minus signs, a binary
-expression with about 50,000 terms, or a source file of about 20 MB.
-a file that is not valid utf-8 fails with only `read_file failed`
-(or `error: cannot read <path>` in `check`/`fmt`/`lint`/`doc`).
-these are bugs, and reports are welcome.
+nesting counts brackets, prefix operators such as `-` and `not`, and
+strings nested in interpolations. expression depth counts the levels of
+the tree the parser builds; a call, method call, field access or index
+counts as three levels. that allows a chain of 25,000 binary operators
+or about 8,000 calls. every pass after the parser walks the tree
+recursively, and this limit keeps those passes inside an 8 MiB stack.
+the size limit bounds memory: the front end holds a few hundred bytes
+per token, so a 16 MiB file dense with tokens needs about 3.5 GB.
+
+after a nesting error the parser skips to the end of the line and
+reports nothing more until the next statement. a file that is not valid
+utf-8 fails with E243 at the line, column and byte offset of its first
+invalid byte. `make input-limits-check-only` generates inputs at and
+past each limit and checks, under an 8 MiB stack, that each one compiles
+or fails with its diagnostic.
 
 ## runtime failures in servers
 

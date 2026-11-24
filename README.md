@@ -109,7 +109,9 @@ exit or only the failing one. see [docs/errors.md](docs/errors.md) and
 **one bad request does not take down the server.** a runtime error
 inside an http or grpc handler, such as an out-of-range index, a
 missing map key, a division by zero or an integer overflow, fails that
-request with a 500 (`INTERNAL` for grpc) and the server keeps serving
+request with a 500 (`INTERNAL` for grpc) and the server keeps serving.
+a stack overflow still ends the process, and so does a runtime error
+in a task the handler spawned
 ([docs/failure_isolation.md](docs/failure_isolation.md)).
 
 **memory is managed at compile time.** the compiler emits retain and

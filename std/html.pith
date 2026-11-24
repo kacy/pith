@@ -199,8 +199,11 @@ fn is_protocol_relative(input: String) -> Bool:
 # accepted: an absolute url whose scheme is `http`, `https`, `mailto`, or
 # `tel`, and a relative url with no scheme at all. refused: every other scheme,
 # and a protocol-relative url (`//evil.example`, and the backslash spellings
-# browsers also accept) — the latter is not script execution but it is an open
-# redirect, and an attacker-supplied `href` is exactly where that matters.
+# browsers also accept), which leaves the site under the page's own scheme.
+#
+# this keeps a link from running script. it does not keep it on the site:
+# `https://evil.example` passes. for a redirect to a destination the request
+# chose, use `web.local_redirect` from std.web, which accepts only a path.
 #
 # this does not escape. put the result through `escape` before it lands in an
 # attribute, or call `escape_url`, which does both.

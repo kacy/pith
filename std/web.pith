@@ -62,15 +62,23 @@ import std.shutdown as shutdown
 # forever.
 CONNECTION_TIMEOUT_MS := 5000
 
+# how long a request body may take once its head is in. without a total, a
+# client that sends one body byte every few seconds never trips the per-read
+# bound and holds its connection slot for as long as it likes, and
+# max_connections of them shut the server out. 60 s moves the default 10 mb
+# body at about 170 kb/s; an app that takes larger or slower uploads raises it
+# with read_body_timeout_ms.
+BODY_TIMEOUT_MS := 60000
+
 # the ServerConfig a new App starts with: http.server_config() with
-# read_header_timeout_ms and idle_timeout_ms at CONNECTION_TIMEOUT_MS. net/http
-# leaves every timeout off by default, which lets a client that sends one byte
-# at a time hold a connection forever; std.web does not. read_timeout_ms and
-# write_timeout_ms stay off, so a large upload or a slow reader is not cut off
-# at a fixed total, but each read still has to make progress within
-# CONNECTION_TIMEOUT_MS. change any of it with App.with_config.
+# read_header_timeout_ms and idle_timeout_ms at CONNECTION_TIMEOUT_MS and
+# read_body_timeout_ms at BODY_TIMEOUT_MS. net/http leaves every timeout off by
+# default, which lets a client that sends one byte at a time hold a connection
+# forever; std.web does not. read_timeout_ms and write_timeout_ms stay off, and
+# each read still has to make progress within CONNECTION_TIMEOUT_MS. change any
+# of it with App.with_config.
 pub fn server_config() -> http.ServerConfig:
-    return http.server_config().with_read_header_timeout(CONNECTION_TIMEOUT_MS).with_idle_timeout(CONNECTION_TIMEOUT_MS)
+    return http.server_config().with_read_header_timeout(CONNECTION_TIMEOUT_MS).with_idle_timeout(CONNECTION_TIMEOUT_MS).with_read_body_timeout(BODY_TIMEOUT_MS)
 
 # bound each read on a connection by itself: no read may wait longer than
 # CONNECTION_TIMEOUT_MS for its next byte, or the longest read timeout `config`
@@ -537,6 +545,40 @@ pub fn circuit(breaker: resilience.Breaker) -> fn(fn(Request) -> http.HttpRespon
         else:
             breaker.success()
         return resp
+
+# Whether `target` is a path on this site, safe to redirect to when it came
+# from the request (a `next` parameter after login, say).
+#
+# it must start with exactly one `/`. a second `/` or a `\` after it makes a
+# protocol-relative url, which a browser follows to another host, and any other
+# start is a scheme or a relative path. a control byte anywhere refuses it,
+# since a browser drops tab and newline from a url before it parses it, which
+# turns `/<TAB>/evil.example` into `//evil.example`.
+pub fn is_local_path(target: String) -> Bool:
+    if target.len() == 0 or ord(target[0]) != 47:
+        return false
+    if target.len() > 1:
+        second := ord(target[1])
+        if second == 47 or second == 92:
+            return false
+    mut i := 0
+    while i < target.len():
+        byte := ord(target[i])
+        if byte < 32 or byte == 127:
+            return false
+        i = i + 1
+    return true
+
+# A 303 to `target` when `is_local_path` accepts it, and to `fallback`
+# otherwise. this is the redirect for a destination the request chose: an
+# absolute url, or a `//host` one, never leaves the site.
+#
+#   return web.local_redirect(req.query("next"), "/")
+pub fn local_redirect(target: String, fallback: String) -> http.HttpResponse:
+    mut location := fallback
+    if is_local_path(target):
+        location = target
+    return http.response(303).header("Location", location)
 
 # a middleware that answers 413 to a request whose body is longer than
 # `limit` bytes, the per-route counterpart of http.MaxBytesReader. the server
@@ -1069,6 +1111,27 @@ fn bracket_b(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpR
 # middleware can short-circuit the chain.
 fn short_circuit(next: fn(Request) -> http.HttpResponse, req: Request) -> http.HttpResponse:
     return http.text(200, "blocked")
+
+test "is_local_path accepts only a path on this site":
+    assert_eq(is_local_path("/"), true)
+    assert_eq(is_local_path("/account?tab=keys#top"), true)
+    assert_eq(is_local_path("/a//b"), true)
+    assert_eq(is_local_path(""), false)
+    assert_eq(is_local_path("account"), false)
+    assert_eq(is_local_path("https://evil.example"), false)
+    assert_eq(is_local_path("javascript:alert(1)"), false)
+    assert_eq(is_local_path("//evil.example"), false)
+    assert_eq(is_local_path("/\\evil.example"), false)
+    assert_eq(is_local_path("/\t/evil.example"), false)
+    assert_eq(is_local_path("/\n/evil.example"), false)
+    assert_eq(is_local_path("\\\\evil.example"), false)
+
+test "local_redirect falls back for a target off the site":
+    home := local_redirect("https://evil.example/", "/")
+    assert_eq(home.status, 303)
+    assert_eq(home.header_value("Location"), "/")
+    there := local_redirect("/account", "/")
+    assert_eq(there.header_value("Location"), "/account")
 
 test "middleware composes as an onion, first registered outermost":
     handler := fn(req: Request) => http.text(200, "core")
@@ -1679,10 +1742,11 @@ test "a tls connection holds a slot through its handshake and is refused past th
     config.close()
     shutdown.reset()
 
-test "a new app starts with the read-header and idle deadlines on":
+test "a new app starts with the read-header, idle and body deadlines on":
     config := new().config
     assert_eq(config.read_header_timeout_ms, CONNECTION_TIMEOUT_MS)
     assert_eq(config.idle_timeout_ms, CONNECTION_TIMEOUT_MS)
+    assert_eq(config.read_body_timeout_ms, BODY_TIMEOUT_MS)
     assert_eq(config.read_timeout_ms, 0)
     assert_eq(config.max_body_bytes, http.MAX_REQUEST_BODY)
 

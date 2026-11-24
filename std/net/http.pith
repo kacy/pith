@@ -104,6 +104,11 @@ RESPONSE_HEAD_CAPACITY := 256
 HEADER_LIMIT_MESSAGE := "http: request header fields exceed the maximum"
 BODY_LIMIT_MESSAGE := "http: request body exceeds the maximum"
 
+# the failure of a request body read that ran past its deadline (see
+# ServerConfig.read_body_timeout_ms). the server answers it with 408, and a
+# handler reading a streamed body sees it from read_body_part.
+pub BODY_TIMEOUT_MESSAGE := "http: request body timed out"
+
 # how a response's body is framed (rfc 9112 6.3), the `kind` of a ResponseHead:
 # no body, exactly Content-Length bytes, chunked, or everything until the
 # server closes the connection.
@@ -1171,6 +1176,8 @@ fn request_error_status(message: String) -> Int:
         return 505
     if message == EXPECTATION_MESSAGE:
         return 417
+    if message == BODY_TIMEOUT_MESSAGE:
+        return 408
     return 0
 
 # what an Expect field asks for (rfc 9110 10.1.1): nothing, a 100 Continue
@@ -3138,6 +3145,8 @@ struct BodyStream:
     chunk_open: Bool
     done: Bool
     failed: Bool
+    # when the body must have arrived on the mono_millis clock, 0 for never
+    due: Int
 
 threadlocal mut pending_body: BodyStream? := none
 
@@ -3204,6 +3213,8 @@ pub fn read_body_part(max: Int) -> Bytes!:
         got := body.read(max)
         if got.is_err:
             body.failed = true
+            if deadline_passed(body.due):
+                fail BODY_TIMEOUT_MESSAGE
             fail got.err
         return got.ok
     return bytes.empty()
@@ -3369,6 +3380,10 @@ pub fn request_peer_address() -> String:
 #     is 0, read_timeout_ms applies.
 #   * read_timeout_ms: how long the head and the body together may take,
 #     counted from the same point.
+#   * read_body_timeout_ms: how long the body may take, counted from when the
+#     head is in. it covers a sized body, a chunked one, and one a handler
+#     streams with read_body_part. when read_timeout_ms is also set, the
+#     earlier of the two applies.
 #   * write_timeout_ms: how long the response may take, counted from when the
 #     request head has been read, so it covers the handler as well.
 #   * idle_timeout_ms: how long a keep-alive connection may wait for its next
@@ -3397,50 +3412,53 @@ pub struct ServerConfig:
     # when true, an http/1.1 handler reads the request body itself with
     # read_body_part, as it arrives, and max_body_bytes does not apply.
     pub stream_request_bodies: Bool
+    pub read_body_timeout_ms: Int
 
 # the default server configuration (see ServerConfig).
 pub fn server_config() -> ServerConfig:
-    return ServerConfig(0, 0, 0, 0, MAX_HEADER_BYTES, MAX_REQUEST_BODY, true, 0, 0, false)
+    return ServerConfig(0, 0, 0, 0, MAX_HEADER_BYTES, MAX_REQUEST_BODY, true, 0, 0, false, 0)
 
 impl ServerConfig:
     fn with_read_header_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
+        return ServerConfig(ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies, self.read_body_timeout_ms)
 
     fn with_read_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
+        return ServerConfig(self.read_header_timeout_ms, ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies, self.read_body_timeout_ms)
 
     fn with_write_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies, self.read_body_timeout_ms)
 
     fn with_idle_timeout(ms: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies, self.read_body_timeout_ms)
 
     fn with_max_header_bytes(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, limit, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, limit, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies, self.read_body_timeout_ms)
 
     fn with_max_body_bytes(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, limit, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, limit, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies, self.read_body_timeout_ms)
 
     fn with_keep_alives(enabled: Bool) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, enabled, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, enabled, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies, self.read_body_timeout_ms)
 
     fn with_max_requests_per_conn(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, limit, self.max_connections, self.stream_request_bodies)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, limit, self.max_connections, self.stream_request_bodies, self.read_body_timeout_ms)
 
-    # the head's time limit after the read_timeout_ms fallback.
+    fn with_read_body_timeout(ms: Int) -> ServerConfig:
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, self.stream_request_bodies, ms)
 
     # how many connections std.web serves at once. past it a new connection is
     # refused with a 503. 0 means std.web's default.
     fn with_max_connections(limit: Int) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, limit, self.stream_request_bodies)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, limit, self.stream_request_bodies, self.read_body_timeout_ms)
 
     # hand each http/1.1 request's body to its handler as it arrives, through
     # read_body_part, instead of reading it whole first. the handler decides
     # how much to keep, so max_body_bytes does not apply. http/2 requests are
     # read whole as before.
     fn with_stream_request_bodies(enabled: Bool) -> ServerConfig:
-        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, enabled)
+        return ServerConfig(self.read_header_timeout_ms, self.read_timeout_ms, self.write_timeout_ms, self.idle_timeout_ms, self.max_header_bytes, self.max_body_bytes, self.keep_alives, self.max_requests_per_conn, self.max_connections, enabled, self.read_body_timeout_ms)
 
+    # the head's time limit after the read_timeout_ms fallback.
     fn header_timeout() -> Int:
         if self.read_header_timeout_ms > 0:
             return self.read_header_timeout_ms
@@ -3454,7 +3472,7 @@ impl ServerConfig:
 
     # whether any read on the connection has a time limit.
     fn times_reads() -> Bool:
-        return self.read_header_timeout_ms > 0 or self.read_timeout_ms > 0 or self.idle_timeout_ms > 0
+        return self.read_header_timeout_ms > 0 or self.read_timeout_ms > 0 or self.idle_timeout_ms > 0 or self.read_body_timeout_ms > 0
 
 # one http/1.1 server connection: where it reads and writes, the handler, its
 # config, and when it was first served on the mono_millis clock.
@@ -3608,8 +3626,10 @@ CONTINUE_RESPONSE := "HTTP/1.1 100 Continue\r\n\r\n"
 
 # read one request as the server does: the head, checked with the Host rules,
 # then its body, within the connection's limits. `body_due` is when the body
-# must have arrived on the mono_millis clock, or 0 for no deadline; the read
-# deadline is moved to it once the head is in, when a body follows.
+# must have arrived on the mono_millis clock, or 0 for no deadline;
+# read_body_timeout_ms, counted from now, can make it earlier. the read
+# deadline is moved to it once the head is in, when a body follows, and a body
+# read that fails past it fails with BODY_TIMEOUT_MESSAGE.
 # `rearm` says whether a read deadline is armed at all, so a connection that
 # has none skips the call. the write deadline starts once the head is in, as
 # net/http's does, so it covers the 100 Continue, the handler and the
@@ -3639,12 +3659,20 @@ fn read_server_request(conn: ServerConn, body_due: Int, rearm: Bool) -> ServerRe
             fail EXPECTATION_MESSAGE
         if has_body:
             source_write(src, conn.writer, bytes.from_string_utf8(CONTINUE_RESPONSE))!
+    mut due := body_due
+    if has_body and config.read_body_timeout_ms > 0:
+        due = earliest_due(due, time_mod.mono_millis() + config.read_body_timeout_ms)
     if rearm and has_body:
-        arm_deadline_at(src.socket, body_due, true)
+        arm_deadline_at(src.socket, due, true)
     if config.stream_request_bodies and has_body:
-        pending_body = BodyStream(src, parsed.chunked, parsed.content_length, 0, false, false, false)
+        pending_body = BodyStream(src, parsed.chunked, parsed.content_length, 0, false, false, false, due)
         return ServerRequest(request_from_head(parsed, bytes.empty())!, parsed.wants_close)
-    return ServerRequest(request_from_head(parsed, read_request_body(src, parsed, config.max_body_bytes)!)!, parsed.wants_close)
+    body := read_request_body(src, parsed, config.max_body_bytes)
+    if body.is_err:
+        if deadline_passed(due):
+            fail BODY_TIMEOUT_MESSAGE
+        fail body.err
+    return ServerRequest(request_from_head(parsed, body.ok)!, parsed.wants_close)
 
 # like read_request_from, but the body goes to `writer` as it arrives, and the
 # returned request has an empty body. a declared length is held to

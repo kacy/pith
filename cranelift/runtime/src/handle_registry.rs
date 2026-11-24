@@ -16,7 +16,6 @@ pub(crate) enum HandleKind {
     Process,
     ProcessOutput,
     Task,
-    X25519Key,
 }
 
 /// the live handle set, split into independently locked shards. every list

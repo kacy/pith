@@ -528,7 +528,7 @@ fn fetch(jwks_url: String, wait_ms: Int, limit: Int) -> String!:
     if target.query.len() > 0:
         request_path = request_path + "?" + target.query
 
-    resp := send_jwks_request(target, request_path, wait_ms)!
+    resp := send_jwks_request(target, request_path, wait_ms, limit)!
     if resp.status != 200:
         fail "the jwks endpoint answered " + resp.status.to_string()
     body := resp.body_bytes()
@@ -543,9 +543,10 @@ fn fetch(jwks_url: String, wait_ms: Int, limit: Int) -> String!:
 # over an authenticated channel. http is tolerated only for a sidecar on the
 # loopback interface, where there is no network path to tamper with.
 fn is_loopback_host(host: String) -> Bool:
-    if host == "localhost" or host == "::1" or host == "[::1]":
+    lower := host.to_lower()
+    if lower == "localhost" or lower == "::1" or lower == "[::1]":
         return true
-    return is_loopback_ipv4(host)
+    return is_loopback_ipv4(lower)
 
 # a dotted-quad address in 127.0.0.0/8. a prefix test alone accepted a dns name
 # such as `127.example.net`, which resolves wherever its owner points it.
@@ -568,12 +569,18 @@ fn is_loopback_ipv4(host: String) -> Bool:
             return false
     return true
 
-fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int) -> http.HttpResponse!:
+fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int, limit: Int) -> http.HttpResponse!:
+    # bound the network read to limit + 1 bytes so an untrusted server cannot
+    # buffer megabytes before the size check runs, and keep redirects disabled
+    # so an https jwks endpoint can never silently downgrade to plaintext http.
+    mut wire_limit := limit + 1
+    if limit < 0:
+        wire_limit = 1
     if target.scheme == "https":
         port := target.port
         if port <= 0:
-            return http.https_request("GET", target.host, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).send_https()!
-        return http.https_request_port("GET", target.host, port, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).send_https()!
+            return http.https_request("GET", target.host, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).with_max_response_body_bytes(wire_limit).send_https()!
+        return http.https_request_port("GET", target.host, port, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).with_max_response_body_bytes(wire_limit).send_https()!
     if target.scheme != "http":
         fail "a jwks url must be https, or http for a loopback sidecar: " + target.scheme
     # enforce what the http exception is FOR: a loopback sidecar. an http url to
@@ -585,7 +592,7 @@ fn send_jwks_request(target: url.URL, request_path: String, wait_ms: Int) -> htt
     mut plain_port := port
     if plain_port <= 0:
         plain_port = 80
-    return http.get_request(target.host, plain_port, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).send()!
+    return http.get_request(target.host, plain_port, request_path).accept(http.MIME_JSON).with_timeout(wait_ms).with_max_response_body_bytes(wire_limit).send()!
 
 # --- tests ---
 #

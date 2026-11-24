@@ -63,10 +63,20 @@ impl Event:
     fn json_data_or(fallback: Int) -> Int:
         return self.json_data() catch fallback
 
+fn strip_sse_line_breaks(text: String) -> String:
+    return text.replace(chr(13), "").replace(chr(10), "").replace(chr(0), "")
+
 fn encode_comment(text: String) -> String:
     if text == "":
         return ":" + chr(10) + chr(10)
-    return ": " + text + chr(10) + chr(10)
+    mut lines: List[String] := []
+    for line in strings.split_lines(text):
+        clean := line.replace(chr(13), "").replace(chr(0), "")
+        if clean == "":
+            lines.push(":")
+        else:
+            lines.push(": " + clean)
+    return strings.join_lines(lines) + chr(10) + chr(10)
 
 # a frame of only comments parses to an empty event, which parse_all drops.
 fn event_has_content(item: Event) -> Bool:
@@ -87,10 +97,12 @@ fn parse_line_value(line: String) -> List[String]:
 # encodes one event into the wire format.
 pub fn encode(item: Event) -> String:
     mut lines: List[String] := []
-    if item.id != "":
-        lines.push("id: " + item.id)
-    if item.event != "":
-        lines.push("event: " + item.event)
+    safe_id := strip_sse_line_breaks(item.id)
+    if safe_id != "":
+        lines.push("id: " + safe_id)
+    safe_event := strip_sse_line_breaks(item.event)
+    if safe_event != "":
+        lines.push("event: " + safe_event)
     if item.retry_ms >= 0:
         lines.push("retry: " + item.retry_ms.to_string())
     data_lines := strings.split_lines(item.data)
@@ -98,7 +110,7 @@ pub fn encode(item: Event) -> String:
         lines.push("data:")
     else:
         for line in data_lines:
-            lines.push("data: " + line)
+            lines.push("data: " + line.replace(chr(13), ""))
     return strings.join_lines(lines) + chr(10) + chr(10)
 
 # encodes one retry control frame.
@@ -257,3 +269,16 @@ test "sse streams over chunked http":
     assert(body.contains("data: hello"))
     assert(body.contains("retry: 1500"))
     assert(body.contains(":"))
+
+test "sse encode and comments cannot inject extra frames via line breaks":
+    nl := chr(10)
+    cr := chr(13)
+    ev := named_event("msg" + cr + nl + "data: injected", "real").with_id("id1" + nl + nl + "data: evil")
+    wire := encode(ev)
+    items := parse_all(wire)!
+    assert_eq(items.len(), 1)
+    assert_eq(items[0].data, "real")
+    assert_eq(items[0].event, "msgdata: injected")
+    assert_eq(items[0].id, "id1data: evil")
+    comment_wire := encode_comment("note" + nl + "data: injected" + nl + nl + "event: forged")
+    assert_eq(parse_all(comment_wire)!.len(), 0)

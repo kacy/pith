@@ -1489,7 +1489,7 @@ fn native_client_handshake(stream: TcpStream, server_name: String, config: Confi
         cache_key = resume_cache_key(config, server_name)
         cached_session = lookup_resumable_client_session(cache_key)
         if cached_session.ticket.len() > 0:
-            binder_input := tls13.client_hello_psk_binder_input(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, cached_session.ticket, 0)!
+            binder_input := tls13.client_hello_psk_binder_input_for_cipher(cached_session.cipher, server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, cached_session.ticket, 0)!
             binder := tls13.resumption_binder_verify_data_for_cipher(cached_session.cipher, cached_session.psk, binder_input)!
             client_hello := tls13.encode_client_hello_with_options(server_name, client_random, session_id, keypair.public_key, p256pair.public_key, alpn_protocols, cached_session.ticket, 0, binder)!
             native_write_all(stream, tls13.encode_record_with_version(TLS_CONTENT_HANDSHAKE, tls13.INITIAL_RECORD_VERSION, client_hello)!)!
@@ -2024,6 +2024,12 @@ fn native_client_handshake_after_client_hello(stream: TcpStream, server_name: St
     if server_hello.selected_psk_identity >= 0:
         if not offering_psk or server_hello.selected_psk_identity != 0:
             fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server selected an unexpected tls psk identity")
+        # rfc 8446 §4.2.11: the resumed cipher suite must use the same hash as
+        # the PSK's associated cipher suite.
+        server_is_sha384 := server_hello.cipher_suite == tls13.CIPHER_TLS_AES_256_GCM_SHA384
+        cached_is_sha384 := cached_session.cipher == tls13.CIPHER_TLS_AES_256_GCM_SHA384
+        if server_is_sha384 != cached_is_sha384:
+            fail refuse_with(stream, ALERT_ILLEGAL_PARAMETER, "server resumed tls psk with incompatible cipher suite hash")
         did_resume = true
     handshake_secret := handshake_secret_for_resumption(server_hello.cipher_suite, did_resume, cached_session.psk, shared_secret)!
     server_hs_secret := tls13.server_handshake_traffic_secret_for_cipher(server_hello.cipher_suite, handshake_secret, transcript_buf.bytes())!

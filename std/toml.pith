@@ -899,7 +899,10 @@ fn read_int(data: Bytes, pos: Int, stop: Int) -> ScannedInt:
             continue
         if b < 48 or b > 57:
             break
-        value = value * 10 + (b - 48)
+        digit := b - 48
+        if value > (9223372036854775807 - digit) / 10:
+            return ScannedInt(false, 0)
+        value = value * 10 + digit
         digits = digits + 1
         i = i + 1
     if digits == 0 or not value_ends(data, i, stop):
@@ -1402,3 +1405,4 @@ test "toml integers cover the full Int range and reject overflow":
     assert_eq(get_int(root, "max"), 9223372036854775807)
     assert_eq(get_int(root, "min"), 0 - 9223372036854775807 - 1)
     assert_eq(parse("over = 9223372036854775808\n"), 0 - 1)
+    assert(not scan_scalars("over = 9223372036854775808\n").ok)

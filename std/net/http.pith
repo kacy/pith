@@ -238,7 +238,9 @@ fn char_eq(s: String, idx: Int, ch: String) -> Bool:
 fn normalize_path(path: String) -> String:
     if path == "":
         return "/"
-    return path
+    if path == "*" or path.starts_with("/"):
+        return path
+    return "/" + path
 
 fn quoted_filename(name: String) -> String:
     return chr(34) + name + chr(34)
@@ -2331,7 +2333,10 @@ fn response_status_has_no_body(status: Int) -> Bool:
 # the next final response head on `src`, checked by parse_response_head.
 # interim 1xx responses before it are read and dropped (rfc 9110 15.2), except
 # 101, which ends the exchange as http/1.1 knows it.
+MAX_INTERIM_RESPONSES := 16
+
 fn read_response_head_from(src: ByteSource, method: String, head_limit: Int) -> ResponseHead!:
+    mut interim := 0
     while true:
         got := read_request_head(src, head_limit)
         if got.is_err:
@@ -2342,6 +2347,9 @@ fn read_response_head_from(src: ByteSource, method: String, head_limit: Int) -> 
         parsed := parse_response_head(raw, method)!
         if parsed.status >= 200 or parsed.status == 101:
             return parsed
+        interim = interim + 1
+        if interim >= MAX_INTERIM_RESPONSES:
+            fail "http: too many interim responses"
     fail NO_RESPONSE_MESSAGE
 
 # the body a checked response head frames, read from `src`, at most `limit`
@@ -5617,11 +5625,30 @@ fn proxy_from_env(use_tls: Bool, host: String, port: Int) -> String:
         proxy = env_either("HTTPS_PROXY", "https_proxy")
     return proxy_for(proxy, env_either("NO_PROXY", "no_proxy"), host, port)
 
+fn is_loopback_ipv4(name: String) -> Bool:
+    parts := name.split(".")
+    if parts.len() != 4 or parts[0] != "127":
+        return false
+    for part in parts:
+        if part.len() == 0 or part.len() > 3:
+            return false
+        mut value := 0
+        mut i := 0
+        while i < part.len():
+            c := ord(part[i])
+            if c < 48 or c > 57:
+                return false
+            value = value * 10 + (c - 48)
+            i = i + 1
+        if value > 255:
+            return false
+    return true
+
 # whether `host` is localhost or a loopback address, which net/http never
 # sends through a proxy from the environment.
 fn is_loopback_host(host: String) -> Bool:
     name := host.to_lower()
-    return name == "localhost" or name.ends_with(".localhost") or name.starts_with("127.") or name == "::1" or name == "[::1]"
+    return name == "localhost" or name.ends_with(".localhost") or is_loopback_ipv4(name) or name == "::1" or name == "[::1]"
 
 # `proxy` for a request to host:port, or "" when the request goes direct, by
 # net/http's rules for NO_PROXY: localhost and loopback addresses always go
@@ -5923,6 +5950,8 @@ impl Client:
             connection = "close"
         mut target := normalize_path(req.path)
         if route.absolute:
+            if not target.starts_with("/"):
+                target = "/" + target
             target = "http://" + host_header_value(req.host, req.port, false) + target
         wire_req := apply_route_proxy_auth(req, route)
         arm_deadline_at(fd, deadline, false)
@@ -6039,6 +6068,8 @@ impl Client:
                     if n > 0:
                         c = list[n - 1]
                         list.remove(n - 1)
+                        if list.len() == 0:
+                            self.pool.idle.remove(key)
                         found = true
             if not found:
                 return self.dial(req, route, deadline)
@@ -6122,17 +6153,50 @@ impl Client:
             idle = WireConn(c.stream, BufferedBytesReader(0), BufferedBytesWriter(0), c.tls_conn, false, c.key, 0, false)
         idle.idle_since = time_mod.mono_millis()
         key := c.key
+        mut stored := false
+        mut has_evicted := false
+        mut evicted := WireConn(TcpStream(0), BufferedBytesReader(0), BufferedBytesWriter(0), tls.no_conn(), false, "", 0, false)
         # once the connection is in the pool another task may take it, so
-        # nothing here touches it after the push
+        # nothing here touches it after the push. cap total idle sockets across
+        # all hosts (100, matching Go's DefaultTransport.MaxIdleConns) by
+        # evicting the oldest idle connection when full.
         locked self.pool.mu:
             mut list: List[WireConn] := []
             if self.pool.idle.contains_key(key):
                 list = self.pool.idle[key]
             if list.len() < self.max_idle_conns_per_host:
+                mut total := 0
+                mut oldest_key := ""
+                mut oldest_idx := 0
+                mut oldest_since := 9223372036854775807
+                for k in self.pool.idle:
+                    bucket := self.pool.idle[k]
+                    total = total + bucket.len()
+                    mut bi := 0
+                    while bi < bucket.len():
+                        if bucket[bi].idle_since < oldest_since:
+                            oldest_since = bucket[bi].idle_since
+                            oldest_key = k
+                            oldest_idx = bi
+                        bi = bi + 1
+                if total >= 100 and oldest_key != "":
+                    ob := self.pool.idle[oldest_key]
+                    evicted = ob[oldest_idx]
+                    ob.remove(oldest_idx)
+                    if ob.len() == 0:
+                        self.pool.idle.remove(oldest_key)
+                    has_evicted = true
+                if self.pool.idle.contains_key(key):
+                    list = self.pool.idle[key]
+                else:
+                    list = []
                 list.push(idle)
                 self.pool.idle[key] = list
-                return
-        wire_close(idle)
+                stored = true
+        if has_evicted:
+            wire_close(evicted)
+        if not stored:
+            wire_close(idle)
 
     # write `req` on `c` and read its response. the body is streamed into
     # `writer` when `streaming` is set, except a redirect's, which the caller
@@ -6151,6 +6215,8 @@ impl Client:
         accept_gzip := self.compression and not streaming and req.method != "HEAD" and header_lookup(req.headers, "Range") == ""
         mut target := normalize_path(req.path)
         if route.absolute:
+            if not target.starts_with("/"):
+                target = "/" + target
             target = "http://" + host_header_value(req.host, req.port, false) + target
         wire_req := apply_route_proxy_auth(req, route)
         expect := self.expect_continue_timeout_ms > 0 and request_expects_continue(wire_req) and not wire_req.body.is_empty()
@@ -6234,6 +6300,7 @@ impl Client:
         if (arrived!) <= 0:
             fail NO_RESPONSE_MESSAGE
         arm_deadline_at(src.socket, deadline, true)
+        mut interim := 0
         while true:
             got := read_request_head(src, self.max_response_header_bytes)
             if got.is_err:
@@ -6246,6 +6313,9 @@ impl Client:
                 return send_body
             if parsed.status >= 200 or parsed.status == 101:
                 return parsed
+            interim = interim + 1
+            if interim >= MAX_INTERIM_RESPONSES:
+                fail "http: too many interim responses"
         return send_body
 
 # write `data` on a client connection. a failure is the client timeout when
@@ -7845,3 +7915,19 @@ test "multipart parser handles CRLF/LF linearly and enforces MAX_MULTIPART_PARTS
     assert_eq(parsed.len(), 50)
     too_many := bytes.from_string_utf8(part.repeat(MAX_MULTIPART_PARTS + 1) + "--b--" + crlf)
     assert(parse_multipart_parts(too_many, "b").is_err)
+
+test "http normalizes authority-like paths, checks strict loopback, and caps 1xx responses":
+    assert_eq(normalize_path("@evil.example/secret"), "/@evil.example/secret")
+    assert_eq(normalize_path("*"), "*")
+    assert(is_loopback_host("127.0.0.1"))
+    assert(is_loopback_host("127.255.0.1"))
+    assert(not is_loopback_host("127.evil.example"))
+    assert(not is_loopback_host("127.0.0.999"))
+    crlf := chr(13) + chr(10)
+    interim := ("HTTP/1.1 100 Continue" + crlf + crlf).repeat(MAX_INTERIM_RESPONSES + 2) + "HTTP/1.1 200 OK" + crlf + "Content-Length: 0" + crlf + crlf
+    r := io.bytes_reader(bytes.from_string_utf8(interim))
+    br := r.buffered_chunked(64)
+    defer br.free()
+    defer r.close()
+    src := ByteSource(br, tls.no_conn(), false, 0 - 1)
+    assert(read_response_head_from(src, "GET", MAX_RESPONSE_HEADER_BYTES).is_err)

@@ -575,15 +575,20 @@ fn wildcard_matches(pattern: String, host: String) -> Bool:
     # for must be a single label with no embedded dot.
     return not host.substring(0, prefix_len).contains(".")
 
-# match a hostname or ip address against the certificate's san list. legacy
-# certificates without any san entries (auto-generated database certs are the
-# common case) fall back to the subject common name.
+# match a hostname or ip address against the certificate's san list.
 pub fn matches_hostname(cert: Certificate, host: String) -> Bool:
     target := host.to_lower()
-    for ip in cert.ip_addresses:
-        if ip.to_lower() == target:
-            return true
+    target_ip := ip_string_to_bytes(target)
+    if target_ip.len() == 4 or target_ip.len() == 16:
+        for ip in cert.ip_addresses:
+            ip_bytes := ip_string_to_bytes(ip)
+            if ip_bytes.len() == target_ip.len() and bytes.eq(ip_bytes, target_ip):
+                return true
+        return false
     if host_is_ip(target):
+        for ip in cert.ip_addresses:
+            if ip.to_lower() == target:
+                return true
         return false
     for name in cert.dns_names:
         pattern := name.to_lower()
@@ -637,32 +642,141 @@ fn dns_constraint_matches(constraint: String, name: String) -> Bool:
         return true
     return n.ends_with("." + c)
 
-# enforce a ca's dnsname name-constraints against the leaf's dns sans. a leaf
-# name inside an excluded subtree is rejected; when the ca lists permitted
-# subtrees of a name type, every leaf name of that type must fall inside one of
-# them. dnsname and iPAddress constraints are enforced; other name types (rfc
-# 822, directoryName) are not, so a constraint of those types does not
-# restrict the chain.
-# parse an ip san string back to its raw bytes: a dotted-quad to 4 bytes, or
-# the hex form read_ip_address emits for ipv6 to 16. returns empty on anything
-# it cannot parse, which the caller treats as "matches no constraint".
-fn ip_string_to_bytes(text: String) -> Bytes:
-    if text.contains("."):
-        parts := text.split(".")
-        if parts.len() != 4:
-            return bytes.empty()
-        out := bytes.buffer_with_capacity(4)
-        defer out.free()
-        for part in parts:
-            n := parse_int(part)
-            if n.is_err or n.ok < 0 or n.ok > 255:
-                return bytes.empty()
-            out.write_byte(n.ok) catch 0
-        return out.bytes()
-    decoded := encoding.from_hex(text)
-    if decoded.is_err:
+fn dns_excluded_matches(constraint: String, name: String) -> Bool:
+    if dns_constraint_matches(constraint, name):
+        return true
+    c := constraint.to_lower()
+    n := name.to_lower()
+    # a wildcard SAN like `*.example.com` covers `secret.example.com`; reject it
+    # if the excluded constraint falls within the wildcard's covered label.
+    if n.starts_with("*."):
+        suffix := n.substring(1, n.len())
+        if c.len() > suffix.len() and c.ends_with(suffix):
+            prefix := c.substring(0, c.len() - suffix.len())
+            if not prefix.contains("."):
+                return true
+    return false
+
+fn parse_ipv4_bytes(text: String) -> Bytes:
+    parts := text.split(".")
+    if parts.len() != 4:
         return bytes.empty()
-    return decoded.ok
+    out := bytes.buffer_with_capacity(4)
+    defer out.free()
+    for part in parts:
+        if part.len() == 0 or part.len() > 3:
+            return bytes.empty()
+        mut value := 0
+        mut i := 0
+        while i < part.len():
+            c := ord(part[i])
+            if c < 48 or c > 57:
+                return bytes.empty()
+            value = value * 10 + (c - 48)
+            i = i + 1
+        if value > 255:
+            return bytes.empty()
+        out.write_byte(value) catch 0
+    return out.bytes()
+
+fn parse_ipv6_group(text: String) -> Int:
+    if text.len() == 0 or text.len() > 4:
+        return 0 - 1
+    mut value := 0
+    mut i := 0
+    while i < text.len():
+        c := ord(text[i])
+        mut digit := 0 - 1
+        if c >= 48 and c <= 57:
+            digit = c - 48
+        elif c >= 97 and c <= 102:
+            digit = c - 97 + 10
+        elif c >= 65 and c <= 70:
+            digit = c - 65 + 10
+        else:
+            return 0 - 1
+        value = value * 16 + digit
+        i = i + 1
+    return value
+
+fn parse_ipv6_side(text: String, allow_ipv4_tail: Bool) -> List[Int]:
+    mut groups: List[Int] := []
+    if text == "":
+        return groups
+    parts := text.split(":")
+    mut i := 0
+    while i < parts.len():
+        p := parts[i]
+        if allow_ipv4_tail and i == parts.len() - 1 and p.contains("."):
+            v4 := parse_ipv4_bytes(p)
+            if v4.len() != 4:
+                return [-1]
+            groups.push(v4[0] * 256 + v4[1])
+            groups.push(v4[2] * 256 + v4[3])
+        else:
+            g := parse_ipv6_group(p)
+            if g < 0:
+                return [-1]
+            groups.push(g)
+        i = i + 1
+    return groups
+
+fn parse_ipv6_bytes(raw: String) -> Bytes:
+    mut text := raw
+    if text.starts_with("[") and text.ends_with("]") and text.len() >= 2:
+        text = text.substring(1, text.len() - 1)
+    if not text.contains(":"):
+        return bytes.empty()
+    dcolon := text.index_of("::")
+    mut left: List[Int] := []
+    mut right: List[Int] := []
+    if dcolon < 0:
+        left = parse_ipv6_side(text, true)
+        if left.len() != 8 or left[0] < 0:
+            return bytes.empty()
+    else:
+        left_text := text.substring(0, dcolon)
+        right_text := text.substring(dcolon + 2, text.len())
+        if right_text.contains("::"):
+            return bytes.empty()
+        left = parse_ipv6_side(left_text, false)
+        if left.len() > 0 and left[0] < 0:
+            return bytes.empty()
+        right = parse_ipv6_side(right_text, true)
+        if right.len() > 0 and right[0] < 0:
+            return bytes.empty()
+        if left.len() + right.len() >= 8:
+            return bytes.empty()
+    zeros := 8 - left.len() - right.len()
+    out := bytes.buffer_with_capacity(16)
+    defer out.free()
+    for g in left:
+        out.write_byte(bits.shr(g, 8)) catch 0
+        out.write_byte(bits.band(g, 255)) catch 0
+    mut z := 0
+    while z < zeros:
+        out.write_byte(0) catch 0
+        out.write_byte(0) catch 0
+        z = z + 1
+    for g in right:
+        out.write_byte(bits.shr(g, 8)) catch 0
+        out.write_byte(bits.band(g, 255)) catch 0
+    return out.bytes()
+
+# parse an ip san or host string back to its raw bytes: a dotted-quad to 4
+# bytes, colon-hex ipv6 (with optional brackets and :: compression) to 16
+# bytes, or the 32-char hex form read_ip_address emits for ipv6 to 16 bytes.
+# returns empty on anything it cannot parse.
+fn ip_string_to_bytes(text: String) -> Bytes:
+    if text.contains(":"):
+        return parse_ipv6_bytes(text)
+    if text.contains("."):
+        return parse_ipv4_bytes(text)
+    if text.len() == 32:
+        decoded := encoding.from_hex(text)
+        if decoded.is_ok and decoded.ok.len() == 16:
+            return decoded.ok
+    return bytes.empty()
 
 # whether an ip address falls inside a name-constraint subtree base, which is
 # the network address followed by its netmask (rfc 5280 §4.2.1.10). the address
@@ -683,7 +797,7 @@ fn ip_in_subtree(ip: Bytes, base: Bytes) -> Bool:
 fn name_constraints_permit_leaf(leaf: Certificate, ca: Certificate) -> Bool:
     for name in leaf.dns_names:
         for excluded in ca.excluded_dns:
-            if dns_constraint_matches(excluded, name):
+            if dns_excluded_matches(excluded, name):
                 return false
     if ca.permitted_dns.len() > 0:
         for name in leaf.dns_names:
@@ -847,12 +961,6 @@ fn find_issuer_in_chain(cert: Certificate, chain: List[Certificate], start: Int)
         i = i + 1
     fail "issuer not found in chain"
 
-fn find_issuer_in_roots(cert: Certificate, roots: List[Certificate]) -> Certificate!:
-    for root in roots:
-        if issuer_matches(cert, root):
-            return root
-    fail "issuer not found in trusted roots"
-
 fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificate], hostname_ok: Bool) -> VerificationResult:
     # one clock read for the whole walk so every certificate is judged against
     # the same instant.
@@ -899,25 +1007,37 @@ fn verify_chain_issuers(chain: List[Certificate], trusted_roots: List[Certificat
             current = issuer
             next_chain_index = next_chain_index + 1
         else:
-            root_result := find_issuer_in_roots(current, trusted_roots)
-            if root_result.is_err:
+            # try every trusted root whose subject DN matches `current.issuer_dn`:
+            # CA bundles commonly carry two roots with the same DN during root
+            # rotation (an expiring root and its renewed successor with a new key).
+            mut matched_any_root := false
+            mut last_failure := VerificationResult(false, hostname_ok, false, false, false, UNTRUSTED_ISSUER_REASON)
+            for root in trusted_roots:
+                if not issuer_matches(current, root):
+                    continue
+                matched_any_root = true
+                if not validity_contains(root, now_ms):
+                    last_failure = VerificationResult(false, hostname_ok, true, false, false, EXPIRED_REASON)
+                    continue
+                issuer_ok = true
+                root_ca_ok = root.is_ca
+                signature_verified = verify_signature(current, root)
+                if not root_ca_ok or not signature_verified:
+                    last_failure = VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
+                    continue
+                if root.has_key_usage and not root.key_cert_sign:
+                    last_failure = VerificationResult(false, hostname_ok, issuer_ok, false, signature_verified, KEY_USAGE_REASON)
+                    continue
+                if root.has_path_len and next_chain_index - 1 > root.path_len:
+                    last_failure = VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, PATH_LEN_REASON)
+                    continue
+                if not name_constraints_permit_leaf(chain[0], root):
+                    last_failure = VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
+                    continue
+                return VerificationResult(hostname_ok, hostname_ok, true, true, true, verification_reason(hostname_ok, true, true, true))
+            if not matched_any_root:
                 return VerificationResult(false, hostname_ok, false, false, false, UNTRUSTED_ISSUER_REASON)
-            root := root_result.ok
-            # the trust anchor is rejected once it falls outside its window.
-            if not validity_contains(root, now_ms):
-                return VerificationResult(false, hostname_ok, true, false, false, EXPIRED_REASON)
-            issuer_ok = true
-            root_ca_ok = root.is_ca
-            signature_verified = verify_signature(current, root)
-            if root_ca_ok and signature_verified and root.has_key_usage and not root.key_cert_sign:
-                return VerificationResult(false, hostname_ok, issuer_ok, false, signature_verified, KEY_USAGE_REASON)
-            if root_ca_ok and signature_verified and root.has_path_len and next_chain_index - 1 > root.path_len:
-                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, PATH_LEN_REASON)
-            # a name-constrained root may not anchor a chain outside its namespace.
-            if root_ca_ok and signature_verified and not name_constraints_permit_leaf(chain[0], root):
-                return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, NAME_CONSTRAINT_REASON)
-            ok := hostname_ok and issuer_ok and root_ca_ok and signature_verified
-            return VerificationResult(ok, hostname_ok, issuer_ok, root_ca_ok, signature_verified, verification_reason(hostname_ok, issuer_ok, root_ca_ok, signature_verified))
+            return last_failure
         depth = depth + 1
     return VerificationResult(false, hostname_ok, issuer_ok, root_ca_ok, signature_verified, "certificate chain is too deep")
 
@@ -1267,3 +1387,18 @@ test "x509 fixture key signs rsa pss messages":
     sig := signature.sign_rsa_pss_sha256_pkcs8(key.body, message)!
 
     assert(signature.verify_rsa_pss_sha256(cert.subject_public_key, message, sig))
+
+test "x509 wildcard excluded constraints and ipv6 san matching work":
+    assert(dns_excluded_matches("secret.example.com", "*.example.com"))
+    assert(dns_excluded_matches(".example.com", "*.example.com"))
+    assert(dns_excluded_matches("example.com", "*.example.com"))
+    assert(not dns_excluded_matches("secret.example.com", "*.other.example.com"))
+    assert(not dns_excluded_matches("other.net", "*.example.com"))
+    # canonical ipv6 byte parsing matches compressed, bracketed, ipv4-mapped, and 32-char hex
+    loopback := ip_string_to_bytes("::1")
+    assert_eq(loopback.len(), 16)
+    assert(bytes.eq(loopback, ip_string_to_bytes("[::1]")))
+    assert(bytes.eq(loopback, ip_string_to_bytes("00000000000000000000000000000001")))
+    assert(bytes.eq(ip_string_to_bytes("2001:db8::1"), ip_string_to_bytes("2001:0db8:0000:0000:0000:0000:0000:0001")))
+    assert(bytes.eq(ip_string_to_bytes("::ffff:127.0.0.1"), ip_string_to_bytes("00000000000000000000ffff7f000001")))
+    assert_eq(ip_string_to_bytes("not::an::ip").len(), 0)
